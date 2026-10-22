@@ -627,7 +627,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Match the JSON query contract: a data glob with no matches is an empty
 	// result, not a failed query. Keep missing schema anchors as errors because
 	// they invalidate the cached SQL transform.
-	if err != nil && ctx.Err() == nil && isNoFilesFoundError(err) && !h.missingAnchor(err) {
+	if err != nil && ctx.Err() == nil && h.noFilesIsEmpty(err) {
 		reader, err = array.NewRecordReader(arrow.NewSchema([]arrow.Field{}, nil), nil)
 	}
 	if err != nil {

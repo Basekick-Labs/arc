@@ -1393,21 +1393,12 @@ func (h *QueryHandler) missingAnchor(err error) bool {
 	if err == nil || h.fieldSchema == nil {
 		return false
 	}
-	msg := err.Error()
-	start := strings.Index(msg, "No files found that match the pattern \"")
-	if start < 0 {
-		return false
-	}
-	rest := msg[start+len("No files found that match the pattern \""):]
-	end := strings.Index(rest, "\"")
-	if end < 0 {
-		return false
-	}
-	if !h.fieldSchema.IsLocalAnchorPath(rest[:end]) {
+	pattern, ok := noFilesPattern(err)
+	if !ok || !h.fieldSchema.IsLocalAnchorPath(pattern) {
 		return false
 	}
 	h.queryCache.Invalidate()
-	h.logger.Warn().Str("anchor", rest[:end]).Msg("Field schema anchor missing on disk; SQL transform cache dropped so the next query re-materializes it")
+	h.logger.Warn().Str("anchor", pattern).Msg("Field schema anchor missing on disk; SQL transform cache dropped so the next query re-materializes it")
 	return true
 }
 
@@ -2278,7 +2269,7 @@ localProcessing:
 		// Check if this is a "no files found" error — treat as empty result, not an error.
 		// This happens when querying a measurement that has no data on storage yet
 		// (e.g., new measurement, or DuckDB's httpfs cache is stale).
-		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		if h.noFilesIsEmpty(err) {
 			h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
 			m.IncQuerySuccess()
 			if h.queryRegistry != nil && queryID != "" {
@@ -2446,6 +2437,52 @@ localProcessing:
 // httpfs directory cache is stale). We treat it as an empty result.
 func isNoFilesFoundError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "No files found that match the pattern")
+}
+
+// noFilesPattern returns the pattern a DuckDB "No files found" error names.
+func noFilesPattern(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	msg := err.Error()
+	const lead = "No files found that match the pattern \""
+	start := strings.Index(msg, lead)
+	if start < 0 {
+		return "", false
+	}
+	rest := msg[start+len(lead):]
+	end := strings.Index(rest, "\"")
+	if end < 0 {
+		return "", false
+	}
+	return rest[:end], true
+}
+
+// noFilesIsEmpty reports whether a DuckDB error is a data glob that matched
+// nothing, which answers an empty result: a measurement with no data yet.
+//
+// Only the measurement's unpruned "**/*.parquet" glob means that. Every other
+// pattern Arc hands DuckDB (an hour or day partition glob, an explicit file
+// from file-time pruning) was checked to exist when the query was planned, so
+// its absence at execution means files were removed in between: retention,
+// compaction or a DELETE took that hour while the query was in flight, or a
+// cached transform outlived the files. Answering an empty result there
+// dropped every row of the query, not just that hour's, with success:true.
+// The caches are cleared so the next attempt re-plans, and the error stands.
+// A missing schema anchor is an error for the same reason (missingAnchor).
+func (h *QueryHandler) noFilesIsEmpty(err error) bool {
+	if !isNoFilesFoundError(err) || h.missingAnchor(err) {
+		return false
+	}
+	pattern, ok := noFilesPattern(err)
+	if !ok || strings.HasSuffix(pattern, "**/*.parquet") {
+		return true
+	}
+	h.pruner.InvalidateAllCaches()
+	h.queryCache.Invalidate()
+	h.logger.Warn().Str("pattern", pattern).
+		Msg("A pruned partition or file was removed while the query ran (retention, compaction or DELETE); query caches cleared, the query fails rather than answering empty")
+	return false
 }
 
 // SQLValidationError represents an error from SQL validation

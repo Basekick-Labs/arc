@@ -87,7 +87,7 @@ func executeArrowMsgPackQuery(
 		// "no files found" → empty result, not error. Mirrors the JSON
 		// path so a client polling a measurement before its first write
 		// sees the same shape regardless of wire format.
-		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		if h.noFilesIsEmpty(err) {
 			if cancel != nil {
 				cancel()
 			}
