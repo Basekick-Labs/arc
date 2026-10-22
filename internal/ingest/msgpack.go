@@ -59,6 +59,13 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 // the typed row decoder dropped (see tryDecodeRowsTyped), which the caller
 // reports after writing the rest.
 func (d *MessagePackDecoder) DecodeWithDrops(data []byte) (records interface{}, count int, drops []LPDrop, err error) {
+	return d.DecodeWithDropsKnown(data, nil)
+}
+
+// DecodeWithDropsKnown is DecodeWithDrops whose typed row decoder also drops a
+// point with a new column that differs only in letter case from a column
+// known gives for its measurement (#1342). known may be nil.
+func (d *MessagePackDecoder) DecodeWithDropsKnown(data []byte, known KnownColumns) (records interface{}, count int, drops []LPDrop, err error) {
 	// TYPED FAST PATHS: columnar payloads (one map, an array, a batch) and
 	// row-format payloads decode straight into typed column slices, skipping
 	// the per-value interface boxing of the generic path (~12% of write CPU
@@ -70,7 +77,7 @@ func (d *MessagePackDecoder) DecodeWithDrops(data []byte) (records interface{}, 
 			d.totalDecoded.Add(uint64(len(recs)))
 			return recs, len(recs), nil, nil
 		}
-		if recs, rows, dropped, ok := d.tryDecodeRowsTyped(data); ok {
+		if recs, rows, dropped, ok := d.tryDecodeRowsTyped(data, known); ok {
 			d.typedHits.Add(1)
 			d.totalDecoded.Add(uint64(rows))
 			return recs, rows, dropped, nil

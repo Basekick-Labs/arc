@@ -40,7 +40,7 @@ func logPointDrops(logger zerolog.Logger, protocol, database string, drops []ing
 			Int("points_dropped", d.Points).
 			Str("reason", d.Reason)
 		if d.Column != "" {
-			ev = ev.Str("column", d.Column)
+			ev = ev.Str("column", ingest.QuoteColumnName(d.Column))
 		}
 		if d.Reason == ingest.LPDropKind {
 			ev = ev.Str("column_type", d.Kind.String()).Str("value_type", d.ValueType)

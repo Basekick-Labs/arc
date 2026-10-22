@@ -1948,6 +1948,28 @@ type FieldSchemaRegistrar interface {
 	EnsureFile(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string, storageKey string) error
 }
 
+// columnFoldsSource is implemented by a registrar that can tell, without
+// I/O, which column spellings a measurement already has (#1342).
+type columnFoldsSource interface {
+	KnownColumnFolds(database, measurement string) map[string]string
+}
+
+// KnownColumns is, for database, the spelling each stored column of a
+// measurement has (see KnownColumns), from the field schema registry; nil
+// when there is no registry that can answer.
+func (b *ArrowBuffer) KnownColumns(database string) KnownColumns {
+	if b == nil {
+		return nil
+	}
+	src, ok := b.fieldSchema.(columnFoldsSource)
+	if !ok || src == nil {
+		return nil
+	}
+	return func(measurement string) map[string]string {
+		return src.KnownColumnFolds(database, measurement)
+	}
+}
+
 // SetFieldSchema installs the field schema registrar (#914).
 func (b *ArrowBuffer) SetFieldSchema(r FieldSchemaRegistrar) {
 	b.fieldSchema = r

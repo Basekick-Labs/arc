@@ -312,7 +312,14 @@ localProcessing:
 
 	// Decode MessagePack. Typed row-format decoding drops points it cannot
 	// write (line protocol's rules) and reports them; the rest are written.
-	records, recordCount, drops, err := h.decoder.DecodeWithDrops(payload)
+	// The columns a measurement already has, for refusing a case twin (#1342):
+	// keyed by the database the write goes to, as resolved below.
+	knownDB := c.Get("x-arc-database")
+	if knownDB == "" {
+		knownDB = "default"
+	}
+	known := h.arrowBuffer.KnownColumns(strings.Clone(knownDB))
+	records, recordCount, drops, err := h.decoder.DecodeWithDropsKnown(payload, known)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to decode MessagePack")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -360,7 +367,19 @@ localProcessing:
 		})
 	}
 
-	if recordCount == 0 && dropped > 0 {
+	// A record whose tag or field names Arc could not read back is dropped,
+	// the rest written (#1342): a columnar record whole, since its names are
+	// all its rows'. Before the WAL sees any of it.
+	var nameDrops []ingest.LPDrop
+	var removed int
+	records, nameDrops, removed = ingest.FilterRecordNames(records, known)
+	recordCount -= removed // in the decoder's unit: rows, or columnar items
+	for _, d := range nameDrops {
+		drops = append(drops, d)
+		dropped += d.Points
+	}
+
+	if recordCount <= 0 && dropped > 0 {
 		// Every point dropped: nothing to write (as line protocol answers).
 		logPointDrops(h.logger, "MessagePack", database, drops)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})

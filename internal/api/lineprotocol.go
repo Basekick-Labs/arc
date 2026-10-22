@@ -293,21 +293,38 @@ localProcessing:
 	// written, as InfluxDB does: a field would silently replace the
 	// timestamp, a tag would fail the write part-way. The answer is then a
 	// "partial write" 400.
-	droppedTime := 0
+	// So is a point with a name Arc cannot read back (#1342): one that is not
+	// valid UTF-8, "time" in another letter case, or one differing only in
+	// letter case from another column of the measurement.
+	names := ingest.NewRecordNameFilter(h.buffer.KnownColumns(database))
+	var timeDrops map[string]int
 	kept := records[:0]
 	for _, rec := range records {
 		if _, found := ingest.LPRecordTimeKey(rec); found {
-			droppedTime++
+			if timeDrops == nil {
+				timeDrops = map[string]int{}
+			}
+			timeDrops[rec.Measurement]++
+			continue
+		}
+		if !names.Keep(rec) {
 			continue
 		}
 		kept = append(kept, rec)
 	}
 	records = kept
+	drops := names.Drops()
+	for measurement, n := range timeDrops {
+		drops = append(drops, ingest.LPDrop{Measurement: measurement, Reason: ingest.LPDropTime, Points: n})
+	}
+	dropped := 0
+	for _, d := range drops {
+		dropped += d.Points
+	}
 	if len(records) == 0 {
 		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("partial write: %d points dropped: a tag or field named \"time\" (time is the timestamp)", droppedTime),
-		})
+		logPointDrops(h.logger, "Line protocol", database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})
 	}
 
 	h.totalRecords.Add(int64(len(records)))
@@ -398,10 +415,11 @@ localProcessing:
 	m.IncIngestBytes(int64(len(body)))
 	m.IncIngestBatches()
 
-	if droppedTime > 0 {
+	if dropped > 0 {
 		h.totalErrors.Add(1)
+		logPointDrops(h.logger, "Line protocol", database, drops)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("partial write: %d points dropped: a tag or field named \"time\" (time is the timestamp); the other points were written", droppedTime),
+			"error": partialWriteMessage(drops, dropped, true),
 		})
 	}
 
@@ -416,7 +434,7 @@ localProcessing:
 // type) is dropped, the rest are written, and the answer is a "partial write"
 // 400, as InfluxDB does.
 func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, precision string) error {
-	batches, rows, drops, err := h.parser.ParseLPWrite(body, precision)
+	batches, rows, drops, err := h.parser.ParseLPWriteKnown(body, precision, h.buffer.KnownColumns(database))
 	if err != nil {
 		h.totalErrors.Add(1)
 		metrics.Get().IncIngestErrors()

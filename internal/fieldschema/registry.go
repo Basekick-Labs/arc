@@ -116,6 +116,11 @@ type entry struct {
 	nextBootstrap     time.Time
 	refreshing        bool      // background re-read of the stored anchor in flight
 	retryAfter        time.Time // backend error: do not re-issue the lookup before this
+
+	// folds is schema's field names keyed by their ASCII-lowered form, built
+	// for foldsFor (KnownColumnFolds, #1342).
+	folds    map[string]string
+	foldsFor *arrow.Schema
 }
 
 // maxEntries bounds the registry's memory against clients naming measurements
@@ -590,6 +595,52 @@ func (r *Registry) Fields(ctx context.Context, database, measurement string) ([]
 		out = append(out, Field{Name: f.Name, Type: DuckDBTypeName(f.Type)})
 	}
 	return out, true, nil
+}
+
+// KnownColumnFolds is the measurement's registered field names keyed by their
+// ASCII-lowered form (fold -> stored spelling), for ingest to refuse a new
+// column that differs from a known one only in letter case (#1342). It never
+// blocks on I/O and never creates an entry: a measurement whose anchor is not
+// in memory, or whose entry is busy (a load or a bootstrap holds its lock),
+// answers nil, and ingest then checks the write against itself only. The
+// map is shared; callers must not modify it.
+func (r *Registry) KnownColumnFolds(database, measurement string) map[string]string {
+	if !r.Enabled() {
+		return nil
+	}
+	r.mu.Lock()
+	e := r.entries[key(database, measurement)]
+	r.mu.Unlock()
+	if e == nil || !e.mu.TryLock() {
+		return nil
+	}
+	defer e.mu.Unlock()
+	if e.schema == nil {
+		return nil
+	}
+	if e.foldsFor != e.schema {
+		folds := make(map[string]string, e.schema.NumFields())
+		for _, f := range e.schema.Fields() {
+			// An anchor from before #1342 can hold two spellings; the one
+			// listed first is the measurement's.
+			if k := asciiLower(f.Name); folds[k] == "" {
+				folds[k] = f.Name
+			}
+		}
+		e.folds, e.foldsFor = folds, e.schema
+	}
+	return e.folds
+}
+
+// asciiLower lower-cases ASCII letters only, as DuckDB folds identifiers.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // DeleteDatabase removes every stored anchor of a database and forgets them
