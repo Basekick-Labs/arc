@@ -258,7 +258,6 @@ func (c *Coordinator) retiredByDelete(ctx context.Context, path string) (journal
 		if err == nil {
 			c.retiredJournal.paths, c.retiredJournal.known = r, true
 		} else {
-			c.retiredJournal.at = time.Time{}
 			c.logger.Warn().Err(err).Msg("Could not read the DELETE journal; unlisted objects are neither adopted nor treated as orphans until it can be read")
 		}
 		c.retiredJournal.mu.Unlock()

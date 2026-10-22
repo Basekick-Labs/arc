@@ -535,12 +535,16 @@ func (h *DeleteHandler) settlePriorIntent(ctx context.Context, old, new string) 
 	if _, listed := h.coordinator.GetFileEntry(rec.ReplacedBy); listed {
 		return fmt.Errorf("%w: %s (an earlier rewrite of it is registered)", errFileChanged, filepath.Base(old))
 	}
-	if h.firstSeenAge(rec) < rewriteAmbiguityDelay {
+	holder, _ := h.pending.(registrationHolder)
+	owner, _ := h.coordinator.(compactionOwner)
+	busy := (holder != nil && holder.HoldsRegistration(rec.ReplacedBy)) || (owner != nil && owner.CompactionOwns(rec.ReplacedBy))
+	if busy || h.firstSeenAge(rec) < rewriteAmbiguityDelay {
 		return fmt.Errorf("%w: %s (an earlier rewrite of it is still settling)", errNotRegisteredYet, filepath.Base(old))
 	}
 	if err := deleteReplaced(ctx, h.storage, rec.ReplacedBy); err != nil {
 		return fmt.Errorf("%w: %s (remove an earlier rewrite that never took: %v)", errNotRegisteredYet, filepath.Base(old), err)
 	}
+	h.forgetSeen(rec)
 	h.logger.Warn().Str("file", old).Str("removed", rec.ReplacedBy).
 		Msg("Removed an earlier rewrite that never reached the manifest before rewriting the file again")
 	return nil
