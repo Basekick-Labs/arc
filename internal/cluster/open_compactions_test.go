@@ -203,6 +203,14 @@ func TestOpenExcludesALocalCompactionInputOnceTheOutputIsLocal(t *testing.T) {
 	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
 		t.Fatalf("output still staged: excluded %v", got)
 	}
+	// Something else at the output key (not its size): still read.
+	r.write(job.Output.Path, "not the output at all")
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("foreign file at the output key: excluded %v", got)
+	}
+	if err := os.Remove(filepath.Join(r.root, job.Output.Path)); err != nil {
+		t.Fatal(err)
+	}
 	e, _ := r.c.raftNode.FSM().GetFile(job.Output.Path)
 	if ok, err := r.c.adoptStaged(ctx, e); !ok || err != nil {
 		t.Fatalf("adopt: %v %v", ok, err)
@@ -360,6 +368,10 @@ func TestOpenDeleteCallbackRecordsAndWorkerForgets(t *testing.T) {
 	}
 	if err := c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
 		t.Fatal(err)
+	}
+	// The register callback drops it, before any read looks.
+	if c.OpenAny(openPrefix) {
+		t.Fatal("registered again: reads still volatile")
 	}
 	if got := c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
 		t.Fatalf("registered again: excluded %v", got)
