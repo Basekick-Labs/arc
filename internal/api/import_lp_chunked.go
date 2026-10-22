@@ -44,12 +44,19 @@ type lpScan struct {
 // record's tag name is "<name>_value", and tags are string columns. A column
 // isDecimal reports is converted to decimal from any value, so it is not
 // typed here.
-func scanLPImport(upload *importUpload, precision, filter string, isDecimal func(measurement, column string) bool) (*lpScan, *importError) {
+func scanLPImport(upload *importUpload, precision, filter string, isDecimal func(measurement, column string) bool, known ...ingest.KnownColumns) (*lpScan, *importError) {
 	r, err := upload.openMaybeGzip()
 	if err != nil {
 		return nil, &importError{StatusCode: fiber.StatusBadRequest, Message: err.Error()}
 	}
 	scan := &lpScan{kinds: map[string]map[string]lpKind{}}
+	// Every column's spelling, per measurement, across the whole file (#1342).
+	folds := map[string]map[string]string{}
+	var knownCols ingest.KnownColumns
+	if len(known) > 0 {
+		knownCols = known[0]
+	}
+	stored := map[string]map[string]string{}
 	parser := ingest.NewLineProtocolParser()
 	var bad *importError
 	refuse := func(format string, args ...interface{}) error {
@@ -87,6 +94,39 @@ func scanLPImport(upload *importUpload, precision, filter string, isDecimal func
 				columns = map[string]lpKind{}
 				scan.kinds[l.Measurement] = columns
 				scan.measurements = append(scan.measurements, l.Measurement)
+			}
+			mfolds := folds[l.Measurement]
+			if mfolds == nil {
+				mfolds = map[string]string{}
+				folds[l.Measurement] = mfolds
+				if knownCols != nil {
+					stored[l.Measurement] = knownCols(l.Measurement)
+				}
+			}
+			// A column the file has not named yet must be one Arc can read
+			// back (#1342); key is the tag or field key it came from.
+			name := func(key, column string) error {
+				if mfolds[ingest.FoldColumnName(column)] == column {
+					return nil
+				}
+				if p := ingest.ColumnNameProblem(key); p != "" {
+					return refuse("measurement %q has a key %q that cannot be stored: %s", l.Measurement, ingest.QuoteColumnName(key), p)
+				}
+				if other, twin := ingest.ColumnCaseTwin(column, mfolds, stored[l.Measurement]); twin {
+					return refuse("measurement %q has columns %q and %q, which differ only in letter case; rename one of them", l.Measurement, other, column)
+				}
+				mfolds[ingest.FoldColumnName(column)] = column
+				return nil
+			}
+			for _, t := range l.Tags {
+				if err := name(t.Key, t.Key); err != nil {
+					return err
+				}
+			}
+			for _, f := range l.Fields {
+				if err := name(f.Key, ingest.LPFieldColumn(l, f.Key)); err != nil {
+					return err
+				}
 			}
 			observe := func(column string, v interface{}) error {
 				if isDecimal != nil && isDecimal(l.Measurement, column) {
