@@ -48,3 +48,31 @@ func TestBuildEngineSQLLeavesOutExcludedFiles(t *testing.T) {
 		t.Fatalf("engine SQL %q: want the output only", sql)
 	}
 }
+
+// The exclusions are taken before the listing: a job's inputs are named only
+// once its output is in storage, so a listing taken after holds the output.
+// Here the output lands at the moment the exclusions are taken; the other
+// order would list without it and still leave the input out: neither side.
+func TestBuildEngineSQLExcludesBeforeListing(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "db", "m", "2026", "10", "20", "10")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "in.parquet"), []byte("x"), 0o600)
+	be, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := Deps{Storage: be, Logger: zerolog.Nop(), Mode: ModeShadow,
+		Exclude: func(context.Context, string) []string {
+			_ = os.WriteFile(filepath.Join(dir, "out_b1_compacted.parquet"), []byte("x"), 0o600)
+			return []string{"db/m/2026/10/20/10/in.parquet"}
+		}}
+	d := Decision{Eligible: true, Shape: ShapeCountStar,
+		Ctx: arcxengine.Context{Database: "db", Measurement: "m", TimeColumn: "time", AllowedDirs: []string{root + "/"}}}
+	sql, ok := deps.buildEngineSQL(context.Background(), d)
+	if !ok || !strings.Contains(sql, "out_b1_compacted.parquet") {
+		t.Fatalf("engine SQL %q (ok=%v): the output that landed with the exclusions is not read", sql, ok)
+	}
+}
