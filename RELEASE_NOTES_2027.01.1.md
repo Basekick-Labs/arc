@@ -1373,6 +1373,41 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Iceberg export on a local-storage cluster no longer publishes a file next to the one that replaced it
+
+On a cluster with local storage, a node removes its copy of a deleted file
+some time after the cluster manifest drops it. These deletes all leave a
+window where both the deleted file and the file holding its rows are on disk:
+
+- A staged compaction moves its output into place before the inputs are
+  unlinked.
+- A partial DELETE's new file can arrive before the old one is unlinked.
+- An unlink can fail, or be lost to a crash, and stay until the stale-local
+  sweep removes the copy.
+
+An Iceberg export pass inside that window published both files, so external
+readers saw those rows twice. The existing check for in-flight compactions
+never saw staged compactions, which are on by default on clusters. The window
+normally lasts under a second to about 5 seconds. It lasts as long as an
+unlink keeps failing, and the duplicated snapshot stays in the table's history
+until it expires.
+
+The export now leaves out any file the node saw registered that the manifest
+no longer lists. It uses the journal the stale-local sweep keeps, so it also
+covers copies left by a crash. Files a writer has flushed but not yet
+registered are not affected.
+
+In return, a file the cluster deleted can disappear from the table slightly
+before the file holding its rows appears. On the compacting node that gap is
+milliseconds. On a node that has to pull a DELETE's new file, it lasts until
+the pull, and readers see those rows missing for one pass instead of
+duplicated.
+
+The journal runs when `cluster.replication_enabled`,
+`cluster.replication_catchup_enabled` (on by default) and
+`cluster.raft_data_dir` are set. A local-storage cluster exporting to Iceberg
+without them logs a warning at startup.
+
 ### A cluster on `storage.backend = "azblob"` reconciles its container as shared storage
 
 `azblob` is an accepted spelling of the Azure backend. The orphan reconciler
