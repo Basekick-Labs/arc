@@ -132,12 +132,16 @@ func TestCreateApplyAdoptsAnIdenticalRow(t *testing.T) {
 	}
 }
 
-// RBAC: an org the node created locally is not the cluster's to delete.
+// RBAC: once the node has reconciled, an org it created locally is not the
+// cluster's to delete.
 func TestRBACIDKeyedApplyLeavesALocalRowAlone(t *testing.T) {
 	rm, _ := newRBACTestManagerOSS(t)
 	org, err := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "local-org"})
 	if err != nil {
 		t.Fatalf("CreateOrganization: %v", err)
+	}
+	if _, err := rm.db.Exec(`INSERT INTO cluster_auth_reconcile_state (id, raft_term, applied_index) VALUES (1, 1, 10)`); err != nil {
+		t.Fatal(err)
 	}
 	if err := rm.ApplyDeleteOrganization(org.ID); err != nil {
 		t.Fatalf("ApplyDeleteOrganization: %v", err)
@@ -151,5 +155,92 @@ func TestRBACIDKeyedApplyLeavesALocalRowAlone(t *testing.T) {
 	}
 	if name != "local-org" {
 		t.Errorf("local org renamed to %q", name)
+	}
+}
+
+// Before a node's first reconcile its RBAC rows from before the marker are all
+// unmarked; cluster removes, deletes and renames must still reach them, as
+// they did before #1336, and the first reconcile must then adopt them.
+func TestRBACAppliesBeforeTheFirstReconcileStillLand(t *testing.T) {
+	rm, am := newRBACTestManagerOSS(t)
+	mustApplyCreate(t, am, clusterEntry(100, "tok", "h"))
+	org := ClusterOrganizationEntry{ID: 200, Name: "o", Enabled: true, CreatedAtUnixNano: 11, UpdatedAtUnixNano: 11}
+	team := ClusterTeamEntry{ID: 201, OrganizationID: 200, Name: "t1", Enabled: true, CreatedAtUnixNano: 12, UpdatedAtUnixNano: 12}
+	role := ClusterRoleEntry{ID: 202, TeamID: 201, DatabasePattern: "db*", Permissions: "read", CreatedAtUnixNano: 13}
+	member := ClusterTokenMembershipEntry{ID: 203, TokenID: 100, TeamID: 201, CreatedAtUnixNano: 14}
+	for _, err := range []error{rm.ApplyCreateOrganization(org), rm.ApplyCreateTeam(team), rm.ApplyCreateRole(role), rm.ApplyAddTokenToTeam(member)} {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tbl := range []string{"rbac_organizations", "rbac_teams", "rbac_roles", "rbac_token_memberships"} {
+		if _, err := am.db.Exec(`UPDATE ` + tbl + ` SET raft_materialised = 0`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := rm.ApplyRemoveTokenFromTeam(100, 201); err != nil {
+		t.Fatal(err)
+	}
+	if err := rm.ApplyDeleteRole(202); err != nil {
+		t.Fatal(err)
+	}
+	team.Name = "t2"
+	if err := rm.ApplyUpdateTeam(team); err != nil {
+		t.Fatalf("rename before the first reconcile: %v", err)
+	}
+	var n int
+	am.db.QueryRow(`SELECT COUNT(*) FROM rbac_token_memberships`).Scan(&n)
+	if n != 0 {
+		t.Error("a membership removed before the first reconcile still grants access")
+	}
+	am.db.QueryRow(`SELECT COUNT(*) FROM rbac_roles`).Scan(&n)
+	if n != 0 {
+		t.Error("a role deleted before the first reconcile is still present")
+	}
+
+	rep, err := ReconcileClusterState(context.Background(), am.db, ClusterAuthState{
+		Tokens:        []ClusterTokenEntry{clusterEntry(100, "tok", "h")},
+		Organizations: []ClusterOrganizationEntry{org},
+		Teams:         []ClusterTeamEntry{team},
+		IncludeRBAC:   true, AppliedIndex: 1000, Term: 1,
+	}, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tbl := range []string{TableOrganizations, TableTeams} {
+		if tr := rep.Tables[tbl]; tr == nil || tr.Adopted != 1 || tr.Collisions != 0 || tr.Unreplicated != 0 {
+			t.Errorf("%s: %+v, want the pre-marker row adopted", tbl, tr)
+		}
+	}
+}
+
+// A team the cluster renamed before this node had the marker is still that
+// team: it shares the creation instant every cluster apply wrote.
+func TestReconcileAdoptsAnRBACRowRenamedBeforeTheMarker(t *testing.T) {
+	rm, am := newRBACTestManagerOSS(t)
+	org := ClusterOrganizationEntry{ID: 200, Name: "o", Enabled: true, CreatedAtUnixNano: 11, UpdatedAtUnixNano: 11}
+	team := ClusterTeamEntry{ID: 201, OrganizationID: 200, Name: "old", Enabled: true, CreatedAtUnixNano: 12, UpdatedAtUnixNano: 12}
+	if err := rm.ApplyCreateOrganization(org); err != nil {
+		t.Fatal(err)
+	}
+	if err := rm.ApplyCreateTeam(team); err != nil {
+		t.Fatal(err)
+	}
+	am.db.Exec(`UPDATE rbac_teams SET raft_materialised = 0`)
+	team.Name = "new"
+	if _, err := ReconcileClusterState(context.Background(), am.db, ClusterAuthState{
+		Organizations: []ClusterOrganizationEntry{org}, Teams: []ClusterTeamEntry{team},
+		IncludeRBAC: true, AppliedIndex: 1000, Term: 1,
+	}, zerolog.Nop()); err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	var marked int
+	if err := am.db.QueryRow(`SELECT name, raft_materialised FROM rbac_teams WHERE id = 201`).Scan(&name, &marked); err != nil {
+		t.Fatal(err)
+	}
+	if name != "new" || marked != 1 {
+		t.Errorf("team = %q marked=%d, want adopted and renamed", name, marked)
 	}
 }

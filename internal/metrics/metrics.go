@@ -984,13 +984,20 @@ func (m *Metrics) IncClusterHeartbeatUnknownNode() { m.clusterHeartbeatsUnknownN
 
 func (m *Metrics) IncClusterAuthApplyCreate() { m.clusterAuthApplyCreateTotal.Add(1) }
 
+// RecordClusterAuthReconcileFailure counts a reconcile that failed before
+// anything committed; the gauges keep the last run's counts.
+func (m *Metrics) RecordClusterAuthReconcileFailure() {
+	m.clusterAuthReconcileTotal.Add(1)
+	m.clusterAuthReconcileFailedTotal.Add(1)
+}
+
 // RecordClusterAuthReconcile records one reconcile of the local auth and RBAC
-// tables with the cluster FSM (#1336). failed runs leave the gauges alone.
+// tables with the cluster FSM (#1336). failed counts a run that failed or hit
+// statement errors; the gauges take the counts of whatever it did apply.
 func (m *Metrics) RecordClusterAuthReconcile(failed bool, localRows, collisions, keptRows int) {
 	m.clusterAuthReconcileTotal.Add(1)
 	if failed {
 		m.clusterAuthReconcileFailedTotal.Add(1)
-		return
 	}
 	m.clusterAuthReconcileLocalRows.Store(int64(localRows))
 	m.clusterAuthReconcileCollisions.Store(int64(collisions))

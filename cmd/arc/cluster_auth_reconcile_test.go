@@ -30,7 +30,7 @@ type fakeReconcileCluster struct {
 	calls    atomic.Int32
 }
 
-func (c *fakeReconcileCluster) SyncManifest(context.Context) error {
+func (c *fakeReconcileCluster) SyncManifestWithin(context.Context, time.Duration) error {
 	c.calls.Add(1)
 	if c.failures.Add(-1) >= 0 {
 		return errors.New("no leader")

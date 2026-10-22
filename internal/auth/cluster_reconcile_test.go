@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -168,20 +169,83 @@ func TestReconcileKeepsRowsItCannotAccountFor(t *testing.T) {
 func TestReconcileBreakerRefusesMassDelete(t *testing.T) {
 	am := openAuthAt(t, filepath.Join(t.TempDir(), "auth.db"))
 	defer am.Close()
-	for id := int64(10); id < 14; id++ {
-		mustApplyCreate(t, am, clusterEntry(id, "t"+string(rune('a'+id-10)), "h"))
-	}
-	rep := reconcile(t, am, ClusterAuthState{
-		Tokens:       []ClusterTokenEntry{clusterEntry(10, "ta", "h")},
-		AppliedIndex: 1000, Term: 1,
-	})
-	if len(rep.BreakerTripped) != 1 {
-		t.Fatalf("breaker did not trip: %+v", rep)
-	}
-	for id := int64(11); id < 14; id++ {
-		if _, ok := readToken(t, am, id); !ok {
-			t.Errorf("token %d deleted despite the breaker", id)
+	var keep []ClusterTokenEntry
+	for id := int64(10); id < 40; id++ {
+		e := clusterEntry(id, fmt.Sprintf("t%d", id), "h")
+		mustApplyCreate(t, am, e)
+		if id < 15 {
+			keep = append(keep, e)
 		}
+	}
+	rep := reconcile(t, am, ClusterAuthState{Tokens: keep, AppliedIndex: 1000, Term: 1})
+	if len(rep.BreakerTripped) != 1 {
+		t.Fatalf("breaker did not trip on 25 of 30 rows: %+v", rep)
+	}
+	for id := int64(15); id < 40; id++ {
+		if _, ok := readToken(t, am, id); !ok {
+			t.Fatalf("token %d deleted despite the breaker", id)
+		}
+	}
+}
+
+// A small table is below the breaker's floor: deleting two of three service
+// tokens while a node is away is ordinary and must land.
+func TestReconcileBreakerLeavesSmallTablesAlone(t *testing.T) {
+	am := openAuthAt(t, filepath.Join(t.TempDir(), "auth.db"))
+	defer am.Close()
+	admin := clusterEntry(10, "admin", "h")
+	for _, e := range []ClusterTokenEntry{admin, clusterEntry(11, "svc1", "h"), clusterEntry(12, "svc2", "h")} {
+		mustApplyCreate(t, am, e)
+	}
+	rep := reconcile(t, am, ClusterAuthState{Tokens: []ClusterTokenEntry{admin}, AppliedIndex: 1000, Term: 1})
+	if len(rep.BreakerTripped) != 0 {
+		t.Fatalf("breaker tripped on a small table: %v", rep.BreakerTripped)
+	}
+	for _, id := range []int64{11, 12} {
+		if _, ok := readToken(t, am, id); ok {
+			t.Errorf("deleted token %d still authenticates", id)
+		}
+	}
+}
+
+// Organizations and teams carry enabled in their update command, so a
+// re-enable missed while away is applied (unlike a token, #1336 D4).
+func TestReconcileReenablesAnRBACRowTheClusterReenabled(t *testing.T) {
+	rm, am := newRBACTestManagerOSS(t)
+	org := ClusterOrganizationEntry{ID: 200, Name: "o", Enabled: true, CreatedAtUnixNano: 1, UpdatedAtUnixNano: 1}
+	if err := rm.ApplyCreateOrganization(org); err != nil {
+		t.Fatal(err)
+	}
+	am.db.Exec(`UPDATE rbac_organizations SET enabled = 0 WHERE id = 200`)
+	if _, err := ReconcileClusterState(context.Background(), am.db, ClusterAuthState{
+		Organizations: []ClusterOrganizationEntry{org}, IncludeRBAC: true, AppliedIndex: 1000, Term: 1,
+	}, zerolog.Nop()); err != nil {
+		t.Fatal(err)
+	}
+	var enabled int
+	am.db.QueryRow(`SELECT enabled FROM rbac_organizations WHERE id = 200`).Scan(&enabled)
+	if enabled != 1 {
+		t.Error("an organization the cluster re-enabled stays disabled")
+	}
+}
+
+// A snapshot install as the first reconcile records the watermark too, so
+// the RBAC applies are gated from then on.
+func TestReconcileFromASnapshotRecordsTheWatermark(t *testing.T) {
+	am := openAuthAt(t, filepath.Join(t.TempDir(), "auth.db"))
+	defer am.Close()
+	reconcile(t, am, ClusterAuthState{AppliedIndex: 500})
+	var term, idx uint64
+	if err := am.db.QueryRow(`SELECT raft_term, applied_index FROM cluster_auth_reconcile_state WHERE id = 1`).Scan(&term, &idx); err != nil {
+		t.Fatalf("no watermark after a snapshot-install reconcile: %v", err)
+	}
+	if term != 0 || idx != 500 {
+		t.Errorf("watermark (%d, %d), want (0, 500)", term, idx)
+	}
+	reconcile(t, am, ClusterAuthState{AppliedIndex: 600, Term: 2})
+	am.db.QueryRow(`SELECT raft_term, applied_index FROM cluster_auth_reconcile_state WHERE id = 1`).Scan(&term, &idx)
+	if term != 2 || idx != 600 {
+		t.Errorf("watermark (%d, %d) after a boot, want (2, 600)", term, idx)
 	}
 }
 

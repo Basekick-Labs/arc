@@ -108,13 +108,21 @@ the snapshot it booted from would bring back what was revoked since.
   [Upgrading pre-26.06.1 API tokens](operations/pre-26.06.1-token-upgrade.md).
 - A token disabled on this node but enabled in the cluster stays disabled:
   the cluster has no re-enable command, so this only happens after a local
-  revoke while the node ran standalone.
+  revoke while the node ran standalone. A token *deleted* on a node while it
+  ran standalone comes back on its next reconcile if the cluster still has it:
+  revoke or delete it through the cluster instead. Organizations and teams
+  follow the cluster both ways, because their update command carries
+  `enabled`.
 - A Raft wiped and re-bootstrapped with the auth database kept is detected:
   nothing is deleted, the old cluster rows become local-only, and an `Error`
   log says so.
-- Until a node's first reconcile, a cluster update or delete of an RBAC row
-  written before this release does not reach that node's copy. The reconcile
-  then applies it.
+- Until a node's first reconcile, the cluster's RBAC updates and deletes reach
+  any row at the ID, as before. From then on only rows the reconcile has
+  matched to the cluster's state. Team-membership removal always applies: it
+  is keyed by the token and team, which name the same grant whatever the
+  row's ID.
+- The new column is added at startup. A database file Arc cannot write to
+  now fails startup there, not at the first token write.
 - New metrics: `arc_cluster_auth_reconcile_total`,
   `arc_cluster_auth_reconcile_failed_total`,
   `arc_cluster_auth_reconcile_local_rows`,

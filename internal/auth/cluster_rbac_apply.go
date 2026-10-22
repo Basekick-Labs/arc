@@ -381,7 +381,7 @@ func (rm *RBACManager) ApplyUpdateOrganization(entry ClusterOrganizationEntry) e
 	result, err := rm.db.Exec(`
 		UPDATE rbac_organizations
 		SET name = ?, description = ?, updated_at = ?, enabled = ?
-		WHERE id = ? AND raft_materialised = 1
+		WHERE id = ? AND `+rbacClusterOwned+`
 	`, entry.Name, entry.Description, updatedAt, enabled, entry.ID)
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateOrganization: %w", err)
@@ -418,7 +418,7 @@ func (rm *RBACManager) ApplyDeleteOrganization(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteOrganization: id required")
 	}
-	result, err := rm.db.Exec(`DELETE FROM rbac_organizations WHERE id = ? AND raft_materialised = 1`, id)
+	result, err := rm.db.Exec(`DELETE FROM rbac_organizations WHERE id = ? AND `+rbacClusterOwned, id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteOrganization: %w", err)
 	}
@@ -489,7 +489,7 @@ func (rm *RBACManager) ApplyUpdateTeam(entry ClusterTeamEntry) error {
 	result, err := rm.db.Exec(`
 		UPDATE rbac_teams
 		SET name = ?, description = ?, updated_at = ?, enabled = ?
-		WHERE id = ? AND raft_materialised = 1
+		WHERE id = ? AND `+rbacClusterOwned+`
 	`, entry.Name, entry.Description, updatedAt, enabled, entry.ID)
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateTeam: %w", err)
@@ -516,7 +516,7 @@ func (rm *RBACManager) ApplyDeleteTeam(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteTeam: id required")
 	}
-	result, err := rm.db.Exec(`DELETE FROM rbac_teams WHERE id = ? AND raft_materialised = 1`, id)
+	result, err := rm.db.Exec(`DELETE FROM rbac_teams WHERE id = ? AND `+rbacClusterOwned, id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteTeam: %w", err)
 	}
@@ -578,7 +578,7 @@ func (rm *RBACManager) ApplyUpdateRole(entry ClusterRoleEntry) error {
 	result, err := rm.db.Exec(`
 		UPDATE rbac_roles
 		SET database_pattern = ?, permissions = ?
-		WHERE id = ? AND raft_materialised = 1
+		WHERE id = ? AND `+rbacClusterOwned+`
 	`, entry.DatabasePattern, entry.Permissions, entry.ID)
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateRole: %w", err)
@@ -604,7 +604,7 @@ func (rm *RBACManager) ApplyDeleteRole(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteRole: id required")
 	}
-	result, err := rm.db.Exec(`DELETE FROM rbac_roles WHERE id = ? AND raft_materialised = 1`, id)
+	result, err := rm.db.Exec(`DELETE FROM rbac_roles WHERE id = ? AND `+rbacClusterOwned, id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteRole: %w", err)
 	}
@@ -663,7 +663,7 @@ func (rm *RBACManager) ApplyDeleteMeasurementPermission(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteMeasurementPermission: id required")
 	}
-	result, err := rm.db.Exec(`DELETE FROM rbac_measurement_permissions WHERE id = ? AND raft_materialised = 1`, id)
+	result, err := rm.db.Exec(`DELETE FROM rbac_measurement_permissions WHERE id = ? AND `+rbacClusterOwned, id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteMeasurementPermission: %w", err)
 	}
@@ -729,7 +729,7 @@ func (rm *RBACManager) ApplyRemoveTokenFromTeam(tokenID, teamID int64) error {
 		return fmt.Errorf("ApplyRemoveTokenFromTeam: token_id and team_id required")
 	}
 	result, err := rm.db.Exec(`
-		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ? AND raft_materialised = 1
+		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?
 	`, tokenID, teamID)
 	if err != nil {
 		return fmt.Errorf("ApplyRemoveTokenFromTeam: %w", err)
@@ -761,3 +761,14 @@ func (rm *RBACManager) markMaterialised(table string, id int64) error {
 	rm.InvalidateAllCache()
 	return nil
 }
+
+// rbacClusterOwned is the WHERE clause an id-keyed RBAC update or delete
+// apply adds (#1336): the row must be the cluster's. Until this node's first
+// reconcile there is no cluster_auth_reconcile_state row, and RBAC rows
+// written before the marker existed are still unmarked, so until then the
+// applies reach any row at the id, as before #1336. The first reconcile marks
+// every row it can match to the FSM; from then on a local row that merely
+// shares an id is left alone. (Membership removal is keyed by the
+// (token, team) pair, which is the same grant whatever its id, and is not
+// gated at all.)
+const rbacClusterOwned = `(raft_materialised = 1 OR NOT EXISTS (SELECT 1 FROM cluster_auth_reconcile_state))`

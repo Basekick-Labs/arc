@@ -120,12 +120,15 @@ type reconcileOp struct {
 }
 
 // deleteBreakerFraction: a run that would delete more than this share of a
-// table's marked rows (with more than deleteBreakerMinMarked of them) deletes
-// none and reports instead. The rebuilt-history check catches a wiped Raft;
-// this is the second net.
+// table's cluster rows, and more than deleteBreakerMinDeletes of them, deletes
+// none and reports instead. The rebuilt-history check is what catches a wiped
+// Raft; this is the second net, for an FSM that is wrong some other way. The
+// floor keeps it off small tables: deleting two of three service tokens while
+// a node is away is ordinary, and a breaker that tripped on it would leave
+// them authenticating on that node for good.
 const (
-	deleteBreakerFraction  = 0.5
-	deleteBreakerMinMarked = 2
+	deleteBreakerFraction   = 0.5
+	deleteBreakerMinDeletes = 20
 )
 
 type reconciler struct {
@@ -236,7 +239,8 @@ var deleteOrder = allReconcileTables
 
 func (r *reconciler) exec(tx *sql.Tx, ops []reconcileOp) {
 	for _, op := range ops {
-		if _, err := tx.Exec(op.query, op.args...); err != nil {
+		res, err := tx.Exec(op.query, op.args...)
+		if err != nil {
 			if op.onErr == nil || !op.onErr(tx, err) {
 				r.report.table(op.table).Errors++
 				if op.onErr == nil {
@@ -252,7 +256,12 @@ func (r *reconciler) exec(tx *sql.Tx, ops []reconcileOp) {
 		case "updated":
 			t.Updated++
 		case "deleted":
-			t.Deleted++
+			// A cascade from a parent deleted earlier may have got there first.
+			if res == nil {
+				t.Deleted++
+			} else if n, _ := res.RowsAffected(); n > 0 {
+				t.Deleted++
+			}
 		case "adopted":
 			t.Adopted++
 		}
@@ -273,7 +282,7 @@ func (r *reconciler) keepOrDelete(table string, id int64, op reconcileOp) {
 func (r *reconciler) applyBreaker() {
 	for table, ops := range r.deletes {
 		m := r.marked[table]
-		if m > deleteBreakerMinMarked && float64(len(ops)) > deleteBreakerFraction*float64(m) {
+		if len(ops) > deleteBreakerMinDeletes && float64(len(ops)) > deleteBreakerFraction*float64(m) {
 			r.report.BreakerTripped = append(r.report.BreakerTripped, table)
 			r.report.table(table).Protected += len(ops)
 			r.log.Error().Str("table", table).Int("would_delete", len(ops)).Int("cluster_rows", m).
@@ -384,7 +393,11 @@ func recordHistory(tx *sql.Tx, term, index uint64) error {
 		return nil
 	}
 	if term == 0 {
-		_, err := tx.Exec(`UPDATE cluster_auth_reconcile_state SET applied_index = ? WHERE id = 1 AND applied_index < ?`, index, index)
+		// The row's existence also tells the RBAC applies that this node has
+		// reconciled once (rbacClusterOwned), so a first reconcile that is a
+		// snapshot install records one too, with term 0 until a boot sets it.
+		_, err := tx.Exec(`INSERT INTO cluster_auth_reconcile_state (id, raft_term, applied_index) VALUES (1, 0, ?)
+			ON CONFLICT(id) DO UPDATE SET applied_index = MAX(applied_index, excluded.applied_index)`, index)
 		return err
 	}
 	_, err := tx.Exec(`INSERT INTO cluster_auth_reconcile_state (id, raft_term, applied_index) VALUES (1, ?, ?)
@@ -463,7 +476,7 @@ func (r *reconciler) planTokens(tx *sql.Tx) error {
 				query: `UPDATE api_tokens SET token_hash = ?, token_prefix = ?, description = ?, permissions = ?, expires_at = ? WHERE id = ?`,
 				args:  []any{e.TokenHash, e.TokenPrefix, e.Description, e.Permissions, nullableNano(e.ExpiresAtUnixNano), l.id}})
 		}
-		r.planEnabled(TableTokens, "api_tokens", l.id, l.name, e.Enabled, l.enabled)
+		r.planEnabled(TableTokens, "api_tokens", l.id, l.name, e.Enabled, l.enabled, false)
 		if l.name != e.Name {
 			r.rename(TableTokens, l.id, l.name, e.Name)
 		}
@@ -491,15 +504,21 @@ func (r *reconciler) planTokens(tx *sql.Tx) error {
 	return nil
 }
 
-// planEnabled narrows a cluster row the FSM has disabled, and never widens
-// one: the cluster has no command that re-enables, so a disabled local copy
-// of an enabled entry was disabled here while the node ran standalone. Local
-// may be stricter than the cluster, never looser (#1336 D4).
-func (r *reconciler) planEnabled(table, sqlTable string, id int64, name string, want, have bool) {
+// planEnabled narrows a cluster row the FSM has disabled. Whether it widens
+// one depends on the table. Organizations and teams follow the FSM both ways:
+// their update command carries enabled, so a re-enable missed while away is a
+// real cluster change. Tokens never widen: the cluster has no command that
+// re-enables a token, so a disabled local copy of an enabled one was revoked
+// here while the node ran standalone. Local may be stricter than the cluster
+// there, never looser (#1336 D4).
+func (r *reconciler) planEnabled(table, sqlTable string, id int64, name string, want, have, clusterCanEnable bool) {
 	switch {
 	case !want && have:
 		r.tx1 = append(r.tx1, reconcileOp{table: table, kind: "updated",
 			query: `UPDATE ` + sqlTable + ` SET enabled = 0 WHERE id = ?`, args: []any{id}})
+	case want && !have && clusterCanEnable:
+		r.tx1 = append(r.tx1, reconcileOp{table: table, kind: "updated",
+			query: `UPDATE ` + sqlTable + ` SET enabled = 1 WHERE id = ?`, args: []any{id}})
 	case want && !have:
 		r.report.table(table).KeptDisabled++
 		r.log.Warn().Str("table", table).Int64("id", id).Str("name", name).
@@ -514,6 +533,7 @@ func (r *reconciler) planEnabled(table, sqlTable string, id int64, name string, 
 // table has one); vals are the remaining columns, compared as text.
 type rbacLocal struct {
 	id      int64
+	created any // created_at as scanned
 	marked  bool
 	enabled bool
 	name    string
@@ -523,6 +543,7 @@ type rbacLocal struct {
 
 type rbacWant struct {
 	id      int64
+	created int64 // CreatedAtUnixNano
 	enabled bool
 	name    string
 	key     string
@@ -570,47 +591,47 @@ func boolInt(b bool) int {
 func (r *reconciler) rbacSpecs() []rbacSpec {
 	var orgs, teams, roles, perms, members []rbacWant
 	for _, e := range r.st.Organizations {
-		orgs = append(orgs, rbacWant{id: e.ID, enabled: e.Enabled, name: e.Name, key: e.Name,
+		orgs = append(orgs, rbacWant{id: e.ID, created: e.CreatedAtUnixNano, enabled: e.Enabled, name: e.Name, key: e.Name,
 			vals:   []string{e.Description},
 			update: []any{e.Description, utcNano(e.UpdatedAtUnixNano)},
 			insert: []any{e.ID, e.Name, e.Description, utcNano(e.CreatedAtUnixNano), utcNano(e.UpdatedAtUnixNano), boolInt(e.Enabled)}})
 	}
 	for _, e := range r.st.Teams {
 		key := fmt.Sprintf("%d|%s", e.OrganizationID, e.Name)
-		teams = append(teams, rbacWant{id: e.ID, enabled: e.Enabled, name: e.Name, key: key,
+		teams = append(teams, rbacWant{id: e.ID, created: e.CreatedAtUnixNano, enabled: e.Enabled, name: e.Name, key: key,
 			vals:   []string{e.Description},
 			update: []any{e.Description, utcNano(e.UpdatedAtUnixNano)},
 			insert: []any{e.ID, e.OrganizationID, e.Name, e.Description, utcNano(e.CreatedAtUnixNano), utcNano(e.UpdatedAtUnixNano), boolInt(e.Enabled)}})
 	}
 	for _, e := range r.st.Roles {
 		key := fmt.Sprintf("%d|%s", e.TeamID, e.DatabasePattern)
-		roles = append(roles, rbacWant{id: e.ID, enabled: true, key: key,
+		roles = append(roles, rbacWant{id: e.ID, created: e.CreatedAtUnixNano, enabled: true, key: key,
 			vals:   []string{e.DatabasePattern, e.Permissions},
 			update: []any{e.DatabasePattern, e.Permissions},
 			insert: []any{e.ID, e.TeamID, e.DatabasePattern, e.Permissions, utcNano(e.CreatedAtUnixNano)}})
 	}
 	for _, e := range r.st.MeasurementPermissions {
 		key := fmt.Sprintf("%d|%s", e.RoleID, e.MeasurementPattern)
-		perms = append(perms, rbacWant{id: e.ID, enabled: true, key: key,
+		perms = append(perms, rbacWant{id: e.ID, created: e.CreatedAtUnixNano, enabled: true, key: key,
 			vals:   []string{e.Permissions},
 			update: []any{e.Permissions},
 			insert: []any{e.ID, e.RoleID, e.MeasurementPattern, e.Permissions, utcNano(e.CreatedAtUnixNano)}})
 	}
 	for _, e := range r.st.Memberships {
 		key := fmt.Sprintf("%d|%d", e.TokenID, e.TeamID)
-		members = append(members, rbacWant{id: e.ID, enabled: true, key: key,
+		members = append(members, rbacWant{id: e.ID, created: e.CreatedAtUnixNano, enabled: true, key: key,
 			insert: []any{e.ID, e.TokenID, e.TeamID, utcNano(e.CreatedAtUnixNano)}})
 	}
 
 	return []rbacSpec{
 		{
 			table:     TableOrganizations,
-			selectSQL: `SELECT id, raft_materialised, COALESCE(enabled, 1), name, description FROM rbac_organizations`,
+			selectSQL: `SELECT id, raft_materialised, COALESCE(enabled, 1), name, description, created_at FROM rbac_organizations`,
 			scan: func(rows *sql.Rows) (rbacLocal, error) {
 				var l rbacLocal
 				var marked, enabled int64
 				var desc sql.NullString
-				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &desc)
+				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &desc, &l.created)
 				l.marked, l.enabled, l.key, l.vals = marked == 1, enabled != 0, l.name, []string{nullStr(desc)}
 				return l, err
 			},
@@ -619,12 +640,12 @@ func (r *reconciler) rbacSpecs() []rbacSpec {
 		},
 		{
 			table:     TableTeams,
-			selectSQL: `SELECT id, raft_materialised, COALESCE(enabled, 1), name, organization_id, description FROM rbac_teams`,
+			selectSQL: `SELECT id, raft_materialised, COALESCE(enabled, 1), name, organization_id, description, created_at FROM rbac_teams`,
 			scan: func(rows *sql.Rows) (rbacLocal, error) {
 				var l rbacLocal
 				var marked, enabled, org int64
 				var desc sql.NullString
-				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &org, &desc)
+				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &org, &desc, &l.created)
 				l.marked, l.enabled, l.key, l.vals = marked == 1, enabled != 0, fmt.Sprintf("%d|%s", org, l.name), []string{nullStr(desc)}
 				return l, err
 			},
@@ -633,12 +654,12 @@ func (r *reconciler) rbacSpecs() []rbacSpec {
 		},
 		{
 			table:     TableRoles,
-			selectSQL: `SELECT id, raft_materialised, 1, '', team_id, database_pattern, permissions FROM rbac_roles`,
+			selectSQL: `SELECT id, raft_materialised, 1, '', team_id, database_pattern, permissions, created_at FROM rbac_roles`,
 			scan: func(rows *sql.Rows) (rbacLocal, error) {
 				var l rbacLocal
 				var marked, enabled, team int64
 				var pattern, perms string
-				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &team, &pattern, &perms)
+				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &team, &pattern, &perms, &l.created)
 				l.marked, l.enabled, l.key, l.vals = marked == 1, true, fmt.Sprintf("%d|%s", team, pattern), []string{pattern, perms}
 				return l, err
 			},
@@ -647,12 +668,12 @@ func (r *reconciler) rbacSpecs() []rbacSpec {
 		},
 		{
 			table:     TableMeasurementPermissions,
-			selectSQL: `SELECT id, raft_materialised, 1, '', role_id, measurement_pattern, permissions FROM rbac_measurement_permissions`,
+			selectSQL: `SELECT id, raft_materialised, 1, '', role_id, measurement_pattern, permissions, created_at FROM rbac_measurement_permissions`,
 			scan: func(rows *sql.Rows) (rbacLocal, error) {
 				var l rbacLocal
 				var marked, enabled, role int64
 				var pattern, perms string
-				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &role, &pattern, &perms)
+				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &role, &pattern, &perms, &l.created)
 				l.marked, l.enabled, l.key, l.vals = marked == 1, true, fmt.Sprintf("%d|%s", role, pattern), []string{perms}
 				return l, err
 			},
@@ -661,11 +682,11 @@ func (r *reconciler) rbacSpecs() []rbacSpec {
 		},
 		{
 			table:     TableMemberships,
-			selectSQL: `SELECT id, raft_materialised, 1, '', token_id, team_id FROM rbac_token_memberships`,
+			selectSQL: `SELECT id, raft_materialised, 1, '', token_id, team_id, created_at FROM rbac_token_memberships`,
 			scan: func(rows *sql.Rows) (rbacLocal, error) {
 				var l rbacLocal
 				var marked, enabled, tok, team int64
-				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &tok, &team)
+				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &tok, &team, &l.created)
 				l.marked, l.enabled, l.key = marked == 1, true, fmt.Sprintf("%d|%d", tok, team)
 				return l, err
 			},
@@ -725,7 +746,11 @@ func (r *reconciler) planRBACTable(tx *sql.Tx, spec rbacSpec) error {
 			continue
 		}
 		if !l.marked {
-			if l.key != w.key {
+			// The same identity a create apply compares, or the same
+			// creation instant, which every cluster apply wrote from the
+			// FSM's own stamp: a row renamed (or a role re-patterned) by the
+			// cluster before this node had the marker is still this entry.
+			if l.key != w.key && !sameInstant(l.created, w.created) {
 				r.collision(spec.table, l.id, w.key)
 				continue
 			}
@@ -742,7 +767,7 @@ func (r *reconciler) planRBACTable(tx *sql.Tx, spec rbacSpec) error {
 				args:  append(append([]any{}, w.update...), l.id)})
 		}
 		if spec.hasEnabled {
-			r.planEnabled(spec.table, spec.table, l.id, l.name, w.enabled, l.enabled)
+			r.planEnabled(spec.table, spec.table, l.id, l.name, w.enabled, l.enabled, true)
 		}
 		if spec.hasName && l.name != w.name {
 			r.rename(spec.table, l.id, l.name, w.name)

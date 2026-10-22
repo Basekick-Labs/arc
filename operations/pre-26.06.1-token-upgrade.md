@@ -37,9 +37,13 @@ work on that node until the local row is removed. Removing local rows is still
 the offline procedure below.
 
 On upgrade to 27.01.1 a token row is marked when its `created_at` carries a
-UTC offset, which only the replication path ever wrote; legacy rows store
-SQLite's `CURRENT_TIMESTAMP`, which never has one. RBAC rows are marked when
-the node first reconciles them against the replicated state.
+UTC offset. Among Arc's Go releases only the replication path writes one; the
+local paths store SQLite's `CURRENT_TIMESTAMP`, which never has one. An auth
+database first created by the Python version of Arc with timezone-aware
+timestamps would have its rows read as replicated: check
+`SELECT name, created_at FROM api_tokens` before upgrading such a node. RBAC
+rows are marked when the node first reconciles them against the replicated
+state, by ID and either the same identity or the same creation instant.
 
 **A rebuilt Raft.** If the Raft data is wiped and the cluster bootstrapped
 again while `auth.db_path` is kept, the node sees a Raft history older than

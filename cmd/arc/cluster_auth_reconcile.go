@@ -35,13 +35,18 @@ type authReconcileFSM interface {
 
 // authReconcileCluster is the part of *cluster.Coordinator this needs.
 type authReconcileCluster interface {
-	SyncManifest(ctx context.Context) error
+	SyncManifestWithin(ctx context.Context, timeout time.Duration) error
 	RaftTerm() uint64
 }
 
 // authReconcileRetry is how long the boot reconcile waits between attempts
-// to sync with the leader.
-const authReconcileRetry = 15 * time.Second
+// to sync with the leader; authReconcileSyncBudget is how long one attempt may
+// take. Fixed, not replication.catch_up_barrier_timeout_ms: an operator who
+// tunes that down for catch-up must not keep the reconcile from ever running.
+const (
+	authReconcileRetry      = 15 * time.Second
+	authReconcileSyncBudget = 30 * time.Second
+)
 
 // startAuthReconcile wires the reconcile and starts the boot one. rm may be
 // nil (no RBAC manager); the RBAC tables are then left alone. The returned
@@ -61,7 +66,7 @@ func startAuthReconcile(ctx context.Context, fsm authReconcileFSM, coord authRec
 	go func() {
 		defer close(done)
 		for {
-			err := coord.SyncManifest(ctx)
+			err := coord.SyncManifestWithin(ctx, authReconcileSyncBudget)
 			if err == nil {
 				break
 			}
@@ -91,14 +96,17 @@ func runAuthReconcile(db *sql.DB, am *auth.AuthManager, rm *auth.RBACManager, st
 	if rm != nil {
 		rm.InvalidateAllCache()
 	}
-	if err != nil {
-		metrics.Get().RecordClusterAuthReconcile(true, 0, 0, 0)
+	if rep == nil { // failed before anything committed
+		metrics.Get().RecordClusterAuthReconcileFailure()
 		logger.Error().Err(err).
 			Msg("Cluster auth reconcile failed: this node's tokens and RBAC grants may still differ from the cluster's until the next restart or snapshot install")
 		return
 	}
 	var local, collisions, kept int
 	ev := logger.Info()
+	if err != nil || rep.Errors() > 0 {
+		ev = logger.Error().Err(err)
+	}
 	for table, t := range rep.Tables {
 		local += t.Unreplicated
 		collisions += t.Collisions
@@ -108,7 +116,7 @@ func runAuthReconcile(db *sql.DB, am *auth.AuthManager, rm *auth.RBACManager, st
 			Int("adopted", t.Adopted).Int("local_only", t.Unreplicated).Int("collisions", t.Collisions).
 			Int("kept_disabled", t.KeptDisabled).Int("kept", t.Protected).Int("errors", t.Errors))
 	}
-	metrics.Get().RecordClusterAuthReconcile(false, local, collisions, kept)
+	metrics.Get().RecordClusterAuthReconcile(err != nil || rep.Errors() > 0, local, collisions, kept)
 	ev.Uint64("applied_index", st.AppliedIndex).Bool("history_rebuilt", rep.HistoryRebuilt).
 		Strs("delete_breaker_tripped", rep.BreakerTripped).Dur("duration", rep.Duration).
 		Msg("Cluster auth reconciled with the cluster state")
