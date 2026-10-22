@@ -4117,6 +4117,14 @@ func main() {
 		// earlier run still sits in storage, and the reads must be fresh.
 		icebergSource.SetPendingOutputs(compaction.NewManifestManager(storageBackend, logger.Get("compaction")).PendingOutputsUnder)
 		log.Info().Msg("Iceberg export leaves in-flight compaction outputs out of the table until their sources are deleted")
+		// On a local-storage cluster a delete reaches this disk after the
+		// manifest; files the cluster deleted stay out of the table meanwhile.
+		if clusterCoordinator != nil && storageBackend.Type() == "local" {
+			icebergSource.SetDeletedHere(clusterCoordinator.LocalCopyDeleted)
+			if !clusterCoordinator.TracksLocalCopies() {
+				log.Warn().Msg("Iceberg export on a local-storage cluster without local copy tracking (cluster.replication_enabled, cluster.replication_catchup_enabled and cluster.raft_data_dir): a pass that runs between a compaction, DELETE or retention removing a file from the manifest and this node unlinking it publishes the deleted file next to the one holding its rows, so external readers can see those rows twice")
+			}
+		}
 		// On an edge-sync hub, received data lives one level deeper
 		// ({spoke}/{db}/{meas}/…), so the walk must expand spoke namespaces or
 		// it exports {spoke}/{db} as a single table unioning every measurement
