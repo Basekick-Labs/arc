@@ -1373,6 +1373,43 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Time-filtered queries no longer return too few rows, and Grafana panels are pruned again
+
+Arc reads the time range from a query's WHERE clause and reads only the hour
+partitions inside it. The old reader took the first `time >= …` it found
+anywhere in the first WHERE and applied it to every table. With default
+settings, these queries returned too few rows, with `success: true`:
+
+- a bound joined with **OR** or under **NOT**: `time >= X OR host = 'a'` lost
+  the older `host = 'a'` rows, and `NOT (time >= X)` returned nothing;
+- a column whose name merely ends in `time` (`downtime`, `end_time`), or a
+  column named `timestamp`, read as the time column;
+- **arithmetic after the bound**: `time >= '…'::timestamp - INTERVAL '3
+  hours'` and `now() - INTERVAL '1 day' - INTERVAL '6 hours'` read only the
+  first part;
+- an **inclusive end on an hour boundary**: `time <= '10:00:00'` and
+  `BETWEEN … AND '10:00:00'` left out the 10:00 hour;
+- an **end-only** range (`time < '2024-01-01'`) left out everything before
+  2020;
+- a **commented-out** bound (`-- AND time >= …`), or one in **QUALIFY**;
+- **JOINs** (including `FROM a, b`), **UNION**, **CTEs** and **subqueries**:
+  one table's bound was applied to every table, or a subquery's bound to the
+  outer query.
+
+A range is now read only from the query's single WHERE clause, and only from
+its top-level `AND` terms that are exactly a comparison of `time` with a
+literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
+`BETWEEN`. Other terms are ignored, which only widens the range. A top-level
+`OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
+the whole measurement, correctly but without pruning.
+
+Accepted spellings: `time`, `"time"`, `alias.time`, Grafana's `(time)`,
+`'…'::timestamp`, `TIMESTAMP '…'`, and the reversed form `'…' <= time`.
+
+**Grafana panels are pruned again.** Since grafana-arc-datasource 1.4.0,
+`$__timeFilter` writes `(time) >= '…' AND (time) < '…'`. Arc did not recognise
+that form, so every Grafana panel read its whole measurement. It is now
+recognised.
 ### A query no longer answers empty when an hour it reads is removed while it runs
 
 Arc narrows a time-filtered query to the hour partitions that exist and hands
