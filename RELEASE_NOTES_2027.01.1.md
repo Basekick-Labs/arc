@@ -1494,6 +1494,42 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Compaction job metrics count on `/metrics` ([#1343](https://github.com/Basekick-Labs/arc/issues/1343))
+
+`arc_compaction_jobs_total`, `arc_compaction_jobs_success_total` and
+`arc_compaction_jobs_failed_total` always read `0`, whatever
+`/api/v1/compaction/stats` said. They were counted inside the compaction
+subprocess, whose own metrics nothing scrapes. The storage reads, writes and
+bytes the subprocess did were lost the same way.
+
+They are now counted by the server, from each subprocess's result:
+
+- **Attempts, not partitions.** A batch that fails and is retried at half
+  size counts twice, as in `/api/v1/compaction/stats`. A subprocess that
+  crashed or was killed without reporting counts as failed. One cut short by
+  a shutdown or a cancelled cycle counts as interrupted, in the new
+  `arc_compaction_jobs_interrupted_total`. `arc_compaction_jobs_total` is the
+  sum of the three.
+- **Staged jobs** (clusters with compaction commit) count as succeeded once
+  their output is staged, before the cluster commits it.
+- **On `/metrics`:** `arc_compaction_files_compacted_total`,
+  `arc_compaction_bytes_read_total` and `arc_compaction_bytes_written_total`,
+  which existed only in the JSON metrics until now.
+- **Storage:** the subprocess's storage reads, writes, bytes, errors and
+  quarantined paths are added to `arc_storage_*`.
+
+**Alerts.** An alert on `arc_compaction_jobs_failed_total` (for example
+`rate(...[1h]) > 0`) never fired before this fix, and now will. A partition
+that cannot be compacted fails more than once per cycle as its batch is
+halved. An alert on `increase(arc_compaction_jobs_success_total[24h]) == 0`,
+which fired all the time, now means something.
+
+Also, a failed job's `writing_output` record in the compaction completion
+directory is removed once its subprocess exits, unless crash recovery still
+needs it. These records used to stay until a restart. On a node with staged
+compaction, they also kept the failed job's staged output from ever being
+swept.
+
 ### A manifest walk no longer stalls Raft applies during heavy ingest ([#1341](https://github.com/Basekick-Labs/arc/issues/1341))
 
 **Enterprise clusters with file replication.** The periodic manifest walk

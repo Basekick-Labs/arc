@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -393,6 +394,11 @@ func (w *CompletionWatcher) pausedByGate() bool {
 // remove on success. On bridge error leaves the manifest in place.
 func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 	manifest, err := readCompletionManifest(path)
+	if errors.Is(err, os.ErrNotExist) {
+		// Removed since the listing: the parent drops a finished job's
+		// writing_output record (#1343), and this poll raced it.
+		return
+	}
 	if err != nil {
 		w.logger.Warn().Err(err).Str("path", path).Msg("Failed to read completion manifest; leaving in place")
 		w.applyErrors.Add(1)

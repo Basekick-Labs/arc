@@ -96,9 +96,12 @@ type Metrics struct {
 	storageErrorsTotal     atomic.Int64
 
 	// Compaction metrics
-	compactionJobsTotal          atomic.Int64
-	compactionJobsSuccess        atomic.Int64
-	compactionJobsFailed         atomic.Int64
+	compactionJobsTotal   atomic.Int64
+	compactionJobsSuccess atomic.Int64
+	compactionJobsFailed  atomic.Int64
+	// compactionJobsInterrupted: attempts cut short by shutdown or a
+	// cancelled cycle (#1343).
+	compactionJobsInterrupted    atomic.Int64
 	compactionFilesCompacted     atomic.Int64
 	compactionBytesRead          atomic.Int64
 	compactionBytesWritten       atomic.Int64
@@ -550,6 +553,7 @@ func (m *Metrics) IncStorageErrors()                { m.storageErrorsTotal.Add(1
 func (m *Metrics) IncCompactionJobs()                      { m.compactionJobsTotal.Add(1) }
 func (m *Metrics) IncCompactionSuccess()                   { m.compactionJobsSuccess.Add(1) }
 func (m *Metrics) IncCompactionFailed()                    { m.compactionJobsFailed.Add(1) }
+func (m *Metrics) IncCompactionInterrupted()               { m.compactionJobsInterrupted.Add(1) }
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
@@ -889,6 +893,54 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
 
+// Counters a compaction subprocess moves in its own registry, which nothing
+// scrapes (#1343): it returns them with its result and the parent adds them.
+var childCounterKeys = []string{
+	"storage_writes", "storage_write_bytes", "storage_reads", "storage_read_bytes",
+	"storage_errors", "storage_invalid_path_quarantined",
+}
+
+func (m *Metrics) childCounter(key string) *atomic.Int64 {
+	switch key {
+	case "storage_writes":
+		return &m.storageWritesTotal
+	case "storage_write_bytes":
+		return &m.storageWriteBytesTotal
+	case "storage_reads":
+		return &m.storageReadsTotal
+	case "storage_read_bytes":
+		return &m.storageReadBytesTotal
+	case "storage_errors":
+		return &m.storageErrorsTotal
+	case "storage_invalid_path_quarantined":
+		return &m.storageInvalidPathQuarantinedTotal
+	}
+	return nil
+}
+
+// ChildCounters is, in a compaction subprocess, the counters it moved that
+// the parent must add (see AddChildCounters). Zero values are left out.
+func (m *Metrics) ChildCounters() map[string]int64 {
+	out := map[string]int64{}
+	for _, k := range childCounterKeys {
+		if v := m.childCounter(k).Load(); v > 0 {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// AddChildCounters adds a compaction subprocess's ChildCounters. A key this
+// binary does not know (a child from another version) or a negative value is
+// ignored; nil adds nothing.
+func (m *Metrics) AddChildCounters(counts map[string]int64) {
+	for k, v := range counts {
+		if c := m.childCounter(k); c != nil && v > 0 {
+			c.Add(v)
+		}
+	}
+}
+
 // IncFileTimePruningPass records a file-time pruning pass over files listed.
 func (m *Metrics) IncFileTimePruningPass(files int) {
 	m.fileTimePruningPasses.Add(1)
@@ -1137,6 +1189,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_jobs_total":          m.compactionJobsTotal.Load(),
 		"compaction_jobs_success":        m.compactionJobsSuccess.Load(),
 		"compaction_jobs_failed":         m.compactionJobsFailed.Load(),
+		"compaction_jobs_interrupted":    m.compactionJobsInterrupted.Load(),
 		"compaction_files_compacted":     m.compactionFilesCompacted.Load(),
 		"compaction_bytes_read":          m.compactionBytesRead.Load(),
 		"compaction_bytes_written":       m.compactionBytesWritten.Load(),
@@ -1510,17 +1563,35 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetric(b, "arc_storage_errors_total", float64(m.storageErrorsTotal.Load()))
 
 	// Compaction metrics
-	b = append(b, "# HELP arc_compaction_jobs_total Total compaction jobs\n"...)
+	// Compaction job counters count ATTEMPTS (a batch retried at half size is
+	// two), counted by the parent from each subprocess's result (#1343).
+	b = append(b, "# HELP arc_compaction_jobs_total Compaction job attempts that ran (succeeded, failed or interrupted)\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_total", float64(m.compactionJobsTotal.Load()))
 
-	b = append(b, "# HELP arc_compaction_jobs_success_total Successful compaction jobs\n"...)
+	b = append(b, "# HELP arc_compaction_jobs_success_total Compaction job attempts that succeeded (a staged job: its output staged, before the cluster commits it)\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_success_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_success_total", float64(m.compactionJobsSuccess.Load()))
 
-	b = append(b, "# HELP arc_compaction_jobs_failed_total Failed compaction jobs\n"...)
+	b = append(b, "# HELP arc_compaction_jobs_failed_total Compaction job attempts that failed, including a subprocess that crashed or was killed\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_failed_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_failed_total", float64(m.compactionJobsFailed.Load()))
+
+	b = append(b, "# HELP arc_compaction_jobs_interrupted_total Compaction job attempts cut short by shutdown or a cancelled cycle\n"...)
+	b = append(b, "# TYPE arc_compaction_jobs_interrupted_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_jobs_interrupted_total", float64(m.compactionJobsInterrupted.Load()))
+
+	b = append(b, "# HELP arc_compaction_files_compacted_total Input files consumed by successful compaction attempts\n"...)
+	b = append(b, "# TYPE arc_compaction_files_compacted_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_files_compacted_total", float64(m.compactionFilesCompacted.Load()))
+
+	b = append(b, "# HELP arc_compaction_bytes_read_total Bytes of input files of successful compaction attempts\n"...)
+	b = append(b, "# TYPE arc_compaction_bytes_read_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_bytes_read_total", float64(m.compactionBytesRead.Load()))
+
+	b = append(b, "# HELP arc_compaction_bytes_written_total Bytes of output files of successful compaction attempts\n"...)
+	b = append(b, "# TYPE arc_compaction_bytes_written_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_bytes_written_total", float64(m.compactionBytesWritten.Load()))
 
 	b = append(b, "# HELP arc_compaction_manifests_recovered_total Compaction manifests recovered after crash\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
