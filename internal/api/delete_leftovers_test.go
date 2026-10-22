@@ -519,3 +519,26 @@ func TestClusterRemovesOnlyProvablyOlderLeftovers(t *testing.T) {
 		t.Fatalf("removed %d with compaction commit off", n)
 	}
 }
+
+// With compaction commit on, the scan classifies inside scanSet, on the
+// manifest its one sync caught up: the leftover is never scanned, so never
+// adopted again.
+func TestCASScanLeavesTheLeftoverOutAfterItsSync(t *testing.T) {
+	r := newLeftoverRig(t)
+	old := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	rw := leftoverHour + "cpu_20261007_204851_558252000_rewrite_100.parquet"
+	r.parquet(old, "h0", "h1")
+	r.parquet(rw, "h1")
+	coord := &leftoverCoordinator{cas: true, listed: map[string]bool{rw: true}}
+	r.h.coordinator = coord
+	affected, _, n, err := r.h.scanFiles(context.Background(), "db", "cpu", "host = 'h1'", scanOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || len(affected) != 1 || affected[0].relativePath != rw {
+		t.Fatalf("leftovers %d, affected %+v; want only the listed rewrite", n, affected)
+	}
+	if coord.syncs != 1 {
+		t.Fatalf("synced %d times, want 1", coord.syncs)
+	}
+}

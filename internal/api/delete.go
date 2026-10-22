@@ -489,7 +489,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	// Find affected files
-	affected, unlisted, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, where, scan)
+	affected, unlisted, leftovers, err := h.scanFiles(ctx, req.Database, req.Measurement, where, scan)
 	if casActive(h.coordinator) {
 		// The scan checked every manifest file of the measurement: what it
 		// could not find is what is unreachable now.
@@ -511,7 +511,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	if len(affected) == 0 && rec == nil {
-		if !req.DryRun && (h.coordinator == nil || casActive(h.coordinator)) {
+		if !req.DryRun && leftovers > 0 {
 			// Nothing to rewrite, but a leftover the scan left out (it may
 			// hold the only rows that matched) is still removed.
 			h.rewriteMu.Lock()
@@ -600,7 +600,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// Remove what earlier DELETEs replaced and could not remove, before
 	// rewriting anything (the scan left them out; removeLeftovers says
 	// which, per mode).
-	h.removeLeftovers(ctx, req.Database, req.Measurement)
+	if leftovers > 0 {
+		h.removeLeftovers(ctx, req.Database, req.Measurement)
+	}
 	if rec != nil {
 		// Recorded before the rewrite: rows of its scope that reach a file
 		// from now on are rewritten without the matching ones. Then the
@@ -905,13 +907,20 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 
 // findAffectedFiles finds all Parquet files that contain rows matching the WHERE clause
 func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measurement, whereClause string, opts scanOpts) ([]affectedFile, []string, error) {
+	affected, unreachable, _, err := h.scanFiles(ctx, database, measurement, whereClause, opts)
+	return affected, unreachable, err
+}
+
+// scanFiles is findAffectedFiles, also returning how many leftovers of
+// earlier DELETEs it left out (delete_leftovers.go).
+func (h *DeleteHandler) scanFiles(ctx context.Context, database, measurement, whereClause string, opts scanOpts) ([]affectedFile, []string, int, error) {
 	var affected []affectedFile
 
 	// Use storage backend's List method to find parquet files
 	prefix := fmt.Sprintf("%s/%s/", database, measurement)
 	files, err := h.storage.List(ctx, prefix)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to list files: %w", err)
+		return nil, nil, 0, fmt.Errorf("failed to list files: %w", err)
 	}
 
 	// Filter for parquet files and convert to query paths
@@ -925,7 +934,7 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 			// A delete must not silently leave matching rows behind, so an
 			// unusable key aborts rather than being skipped: the caller reports
 			// how many rows it removed, and skipping would make that a lie.
-			return nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", f, err)
+			return nil, nil, 0, fmt.Errorf("listed file %q has no usable storage path: %w", f, err)
 		}
 		parquetFiles = append(parquetFiles, fileInfo{
 			queryPath:    queryPath,
@@ -935,17 +944,16 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 
 	// Files an earlier DELETE replaced and could not remove are never read
 	// into a new file (delete_leftovers.go).
-	parquetFiles, left, err := h.leftoverFiles(ctx, parquetFiles)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(left) > 0 {
-		sample := make([]string, 0, min(len(left), 5))
-		for _, l := range left[:min(len(left), 5)] {
-			sample = append(sample, l.path)
+	// With compaction commit on, scanSet does it right after its own sync.
+	leftovers := 0
+	if !casActive(h.coordinator) {
+		var left []leftover
+		var err error
+		if parquetFiles, left, err = h.leftoverFiles(ctx, parquetFiles); err != nil {
+			return nil, nil, 0, err
 		}
-		h.logger.Warn().Int("files", len(left)).Strs("sample", sample).
-			Msg("Delete leaves out files an earlier DELETE replaced and could not remove; queries read their rows twice until they are removed")
+		h.logLeftovers(left)
+		leftovers = len(left)
 	}
 
 	// With compaction commit on (#1207 d2), the files the cluster lists, or
@@ -956,14 +964,14 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 	var shas map[string]string
 	var unreachable []string
 	if casActive(h.coordinator) {
-		if parquetFiles, shas, unreachable, err = h.scanSet(ctx, database, measurement, parquetFiles, opts); err != nil {
-			return nil, unreachable, err
+		if parquetFiles, shas, unreachable, err = h.scanSet(ctx, database, measurement, parquetFiles, opts, &leftovers); err != nil {
+			return nil, unreachable, 0, err
 		}
 	}
 
 	if len(parquetFiles) == 0 {
 		h.logger.Warn().Str("prefix", prefix).Msg("No parquet files found for measurement")
-		return affected, unreachable, nil
+		return affected, unreachable, leftovers, nil
 	}
 
 	h.logger.Info().Int("file_count", len(parquetFiles)).Msg("Scanning parquet files for matching rows")
@@ -975,13 +983,13 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 		// Fallback to individual queries if batch fails (e.g., schema mismatch)
 		h.logger.Warn().Err(err).Msg("Batch count failed, falling back to individual queries")
 		if affected, err = h.countMatchingRowsIndividually(ctx, parquetFiles, whereClause); err != nil {
-			return affected, unreachable, err
+			return affected, unreachable, leftovers, err
 		}
 	}
 	for i := range affected {
 		affected[i].sha = shas[affected[i].relativePath]
 	}
-	return affected, unreachable, nil
+	return affected, unreachable, leftovers, nil
 }
 
 // fileInfo holds query and relative paths for a parquet file

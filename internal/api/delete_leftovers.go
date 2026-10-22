@@ -187,6 +187,13 @@ func (h *DeleteHandler) clusterLeftovers(ctx context.Context, files []fileInfo) 
 	} else {
 		return files, nil, nil
 	}
+	kept, left := h.clusterClassify(files)
+	return kept, left, nil
+}
+
+// clusterClassify is clusterLeftovers on a manifest the caller just caught
+// up (scanSet classifies right after its own sync).
+func (h *DeleteHandler) clusterClassify(files []fileInfo) ([]fileInfo, []leftover) {
 	holder, _ := h.pending.(registrationHolder)
 	held := func(p string) bool { return holder != nil && holder.HoldsRegistration(p) }
 	registered := func(p string) bool {
@@ -229,7 +236,7 @@ func (h *DeleteHandler) clusterLeftovers(ctx context.Context, files []fileInfo) 
 		}
 		left = append(left, leftover{path: p, keeper: keeper})
 	}
-	return kept, left, nil
+	return kept, left
 }
 
 func (h *DeleteHandler) standaloneLeftovers(ctx context.Context, files []fileInfo) ([]fileInfo, []leftover, error) {
@@ -508,4 +515,17 @@ func (h *DeleteHandler) StartRetiredDrainer(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// logLeftovers warns about the leftovers a scan left out.
+func (h *DeleteHandler) logLeftovers(left []leftover) {
+	if len(left) == 0 {
+		return
+	}
+	sample := make([]string, 0, min(len(left), 5))
+	for _, l := range left[:min(len(left), 5)] {
+		sample = append(sample, l.path)
+	}
+	h.logger.Warn().Int("files", len(left)).Strs("sample", sample).
+		Msg("Delete leaves out files an earlier DELETE replaced and could not remove; queries read their rows twice until they are removed")
 }

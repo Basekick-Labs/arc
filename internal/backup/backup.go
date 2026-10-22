@@ -669,7 +669,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// retired journal) is not data: its replacement holds every row it still
 	// had to keep. Backing it up would bring both back on a restore, with
 	// nothing recording which is the old one.
-	if retired := m.retiredByDelete(ctx, objectLister); len(retired) > 0 {
+	if retired := m.retiredByDelete(ctx, objectLister, objects, sc.empty()); len(retired) > 0 {
 		kept := parquetFiles[:0]
 		for _, obj := range parquetFiles {
 			if !retired[obj.Path] {
@@ -2517,11 +2517,24 @@ func (m *Manager) copyStateFiles(ctx context.Context, leg *backupLeg) (int64, er
 // replaced and has not removed yet.
 const deleteRetiredDir = "_delete_retired"
 
-// retiredByDelete returns the files the retired journal names. A journal
-// that cannot be read leaves them in the backup, as before.
-func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectLister) map[string]bool {
-	objs, err := lister.ListObjects(ctx, deleteRetiredDir+"/")
-	if err != nil || len(objs) == 0 {
+// retiredByDelete returns the files the retired journal names. An unscoped
+// backup's listing already holds the journal; a scoped one lists it. A
+// journal that cannot be read leaves them in the backup, as before.
+func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectLister, listed []storage.ObjectInfo, whole bool) map[string]bool {
+	var objs []storage.ObjectInfo
+	if whole {
+		for _, o := range listed {
+			if strings.HasPrefix(o.Path, deleteRetiredDir+"/") {
+				objs = append(objs, o)
+			}
+		}
+	} else {
+		var err error
+		if objs, err = lister.ListObjects(ctx, deleteRetiredDir+"/"); err != nil {
+			return nil
+		}
+	}
+	if len(objs) == 0 {
 		return nil
 	}
 	out := make(map[string]bool, len(objs))
