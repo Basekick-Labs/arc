@@ -1060,7 +1060,8 @@ type ArrowBuffer struct {
 	// in the flush's own hour, can be left out of a live-hour query by
 	// file-level time pruning until the hour closes (#659).
 	futureStampMargin atomic.Int64
-	// futureStampWarned rate-limits that warning per measurement (UnixNano).
+	// futureStampWarned rate-limits the future-stamp warnings per kind and
+	// measurement (UnixNano; see warnOncePerMinute).
 	futureStampWarned sync.Map
 	config            *config.IngestConfig
 	storage           storage.Backend
@@ -4486,7 +4487,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			Str("buffer_key", bufferKey).
 			Msg("Data timestamp is >7 days old - possible backfill or clock skew")
 	}
-	if maxTime.After(now.Add(time.Hour)) {
+	if maxTime.After(now.Add(time.Hour)) && b.warnOncePerMinute("future-1h", database, measurement, now) {
 		b.logger.Warn().
 			Time("data_time", maxTime).
 			Str("buffer_key", bufferKey).
@@ -5588,16 +5589,11 @@ func sliceColumnsByIndices(columns map[string]interface{}, indices []int) map[st
 // freezes it.
 var flushNameNow = time.Now
 
-// generateStoragePath creates a hierarchical storage path for partition pruning
-// Format: {database}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{measurement}_{timestamp}_{nanos}.parquet
-//
-// This hierarchical structure enables DuckDB to skip entire directories when querying time ranges:
-// - Query all of November: read_parquet('s3://bucket/db/cpu/2025/11/*/*/*.parquet')
-// - Query specific day: read_parquet('s3://bucket/db/cpu/2025/11/25/*/*.parquet')
-// - Query specific hour: read_parquet('s3://bucket/db/cpu/2025/11/25/16/*.parquet')
 // SetFutureStampMargin sets the margin rows may be stamped past their flush
 // before file-level time pruning can hide them (query.
-// file_time_pruning_margin_seconds). Safe while ingest runs.
+// file_time_pruning_margin_seconds). Safe while ingest runs. The pruner
+// keeps its own copy (PartitionPruner.SetFileTimePruning); a configuration
+// reload must set both.
 func (b *ArrowBuffer) SetFutureStampMargin(d time.Duration) {
 	// The pruner raises a margin under a second to one; match it.
 	if d < time.Second {
@@ -5634,12 +5630,9 @@ func (b *ArrowBuffer) countFutureStamped(database, measurement string, times []i
 		return
 	}
 	metrics.Get().AddIngestFutureStampedRows(n)
-	key := database + "/" + measurement
-	nowNano := now.UnixNano()
-	if v, ok := b.futureStampWarned.Load(key); ok && nowNano-v.(int64) < int64(time.Minute) {
+	if !b.warnOncePerMinute("future-margin", database, measurement, now) {
 		return
 	}
-	b.futureStampWarned.Store(key, nowNano)
 	b.logger.Warn().
 		Str("database", database).
 		Str("measurement", measurement).
@@ -5648,6 +5641,25 @@ func (b *ArrowBuffer) countFutureStamped(database, measurement string, times []i
 		Msg("Rows stamped more than query.file_time_pruning_margin_seconds ahead of this node's clock, in the current hour: with file-level time pruning on, a query starting after the flush can miss them until the hour closes. Check the writers' clocks")
 }
 
+// warnOncePerMinute rate-limits a warning per kind and measurement. Two
+// flushes racing past the check may both warn; that is harmless.
+func (b *ArrowBuffer) warnOncePerMinute(kind, database, measurement string, now time.Time) bool {
+	key := kind + "|" + database + "/" + measurement
+	nowNano := now.UnixNano()
+	if v, ok := b.futureStampWarned.Load(key); ok && nowNano-v.(int64) < int64(time.Minute) {
+		return false
+	}
+	b.futureStampWarned.Store(key, nowNano)
+	return true
+}
+
+// generateStoragePath creates a hierarchical storage path for partition pruning
+// Format: {database}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{measurement}_{timestamp}_{nanos}.parquet
+//
+// This hierarchical structure enables DuckDB to skip entire directories when querying time ranges:
+// - Query all of November: read_parquet('s3://bucket/db/cpu/2025/11/*/*/*.parquet')
+// - Query specific day: read_parquet('s3://bucket/db/cpu/2025/11/25/*/*.parquet')
+// - Query specific hour: read_parquet('s3://bucket/db/cpu/2025/11/25/16/*.parquet')
 func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitionTime time.Time) string {
 	// Hierarchical partitioning: year/month/day/hour
 	year := partitionTime.Format("2006")

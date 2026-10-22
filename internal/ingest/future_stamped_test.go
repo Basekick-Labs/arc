@@ -1,10 +1,15 @@
 package ingest
 
 import (
+	"bytes"
+	"context"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -39,5 +44,55 @@ func TestCountFutureStamped(t *testing.T) {
 	b.SetFutureStampMargin(0)
 	if b.futureMargin() != time.Second {
 		t.Fatalf("margin %v, want the 1s floor", b.futureMargin())
+	}
+}
+
+// Through a real flush: the count runs on the flush path, and both future
+// warnings are logged once a minute per measurement, not once per flush.
+// The >1h warning reads the batch's latest row.
+func TestFlushCountsAndRateLimitsFutureStamps(t *testing.T) {
+	now := time.Now().UTC()
+	hourEnd := now.Truncate(time.Hour).Add(time.Hour)
+	if hourEnd.Sub(now) < 30*time.Second {
+		t.Skip("too close to the end of the hour")
+	}
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	b := NewArrowBuffer(&config.IngestConfig{MaxBufferSize: 100000, MaxBufferAgeMS: 600000, Compression: "snappy",
+		FlushWorkers: 1, FlushQueueSize: 4, ShardCount: 1, DataPageVersion: "2.0"}, backend, zerolog.New(&logs))
+	defer b.Close()
+	b.SetFutureStampMargin(time.Second)
+	ahead := now.Add(10 * time.Minute)
+	if ahead.After(hourEnd.Add(-5 * time.Second)) {
+		ahead = hourEnd.Add(-5 * time.Second)
+	}
+	key := "ingest_future_stamped_rows_total"
+	before := metrics.Get().Snapshot()[key].(int64)
+	for i := 0; i < 2; i++ {
+		// One row now, one ahead in this hour, one more than an hour ahead.
+		if err := b.WriteTypedColumnarDirect(context.Background(), "db", "cpu", &TypedColumnBatch{
+			Data: map[string]interface{}{
+				"time": []int64{now.UnixMicro(), ahead.UnixMicro(), now.Add(2 * time.Hour).UnixMicro()},
+				"v":    []float64{1, 2, 3},
+			},
+		}, 3); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.FlushAllAndWait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := metrics.Get().Snapshot()[key].(int64) - before; got != 2 {
+		t.Errorf("counted %d rows over two flushes, want 2", got)
+	}
+	out := logs.String()
+	if n := strings.Count(out, "Data timestamp is >1 hour in future"); n != 1 {
+		t.Errorf(">1h future warning logged %d times over two flushes, want 1 (rate-limited, and read from the latest row)", n)
+	}
+	if n := strings.Count(out, "Rows stamped more than query.file_time_pruning_margin_seconds"); n != 1 {
+		t.Errorf("margin warning logged %d times over two flushes, want 1", n)
 	}
 }

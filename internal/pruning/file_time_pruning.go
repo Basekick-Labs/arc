@@ -2,12 +2,12 @@ package pruning
 
 import (
 	"context"
-	"github.com/basekick-labs/arc/internal/metrics"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -91,8 +91,9 @@ func MarkVolatile(ctx context.Context) { markVolatile(ctx) }
 // SetFileTimePruning enables or disables file-level time pruning.
 // margin widens the keep-window below the query's lower bound to absorb
 // writer clock skew (rows stamped slightly ahead of the server clock).
-// Startup-only: the fields are read unlocked by concurrent queries, so this
-// must not be called while the handler is serving.
+// Safe while queries run (the fields are atomic). Ingest keeps its own copy
+// of the margin for the future-stamped row count (ArrowBuffer.
+// SetFutureStampMargin); a configuration reload must set both.
 func (p *PartitionPruner) SetFileTimePruning(enabled bool, margin time.Duration) {
 	if margin < minFileTimeMargin {
 		// A negative margin would move the cutoff ABOVE the query's lower

@@ -1839,15 +1839,15 @@ func (m *Metrics) PrometheusFormat() string {
 		name, help string
 		v          int64
 	}{
-		{"arc_query_file_time_pruning_passes_total", "Queries whose range starts in the current hour that file-level time pruning looked at (query.file_time_pruning).", m.fileTimePruningPasses.Load()},
+		{"arc_query_file_time_pruning_passes_total", "Table reads whose range starts in the current hour that file-level time pruning listed (query.file_time_pruning); each pass ends as one of expanded, nothing_dropped, cap_fallback, or zero_survivors with a single path.", m.fileTimePruningPasses.Load()},
 		{"arc_query_file_time_pruning_expanded_total", "File-time pruning passes that left files out of the live-hour read.", m.fileTimePruningExpanded.Load()},
 		{"arc_query_file_time_pruning_files_listed_total", "Live-hour files listed by file-time pruning passes.", m.fileTimePruningFilesListed.Load()},
 		{"arc_query_file_time_pruning_files_dropped_total", "Live-hour files left out of reads by file-time pruning.", m.fileTimePruningFilesDropped.Load()},
 		{"arc_query_file_time_pruning_nothing_dropped_total", "File-time pruning passes where every live-hour file was in range (the margin covers the files listed).", m.fileTimePruningNothingDropped.Load()},
 		{"arc_query_file_time_pruning_cap_fallback_total", "File-time pruning passes that kept too many files to list and read the whole hour.", m.fileTimePruningCapFallback.Load()},
-		{"arc_query_file_time_pruning_zero_survivors_total", "File-time pruning passes that kept no live-hour file.", m.fileTimePruningZeroSurvivors.Load()},
+		{"arc_query_file_time_pruning_zero_survivors_total", "File-time pruning passes that kept no live-hour file: with the hour as the only path the glob is kept (fail safe); with other paths the hour is dropped and the pass also counts as expanded.", m.fileTimePruningZeroSurvivors.Load()},
+		{"arc_query_file_time_pruning_anomalous_kept_total", "Live-hour files kept because their name time is before their hour (rows stamped ahead of the flushing node's clock).", m.fileTimePruningAnomalousKept.Load()},
 		{"arc_ingest_future_stamped_rows_total", "Rows stamped more than query.file_time_pruning_margin_seconds past their flush, in the flush's hour: with file-level time pruning on, a query can miss them until the hour closes.", m.ingestFutureStampedRows.Load()},
-		{"arc_query_file_time_pruning_anomalous_kept_total", "Live-hour files kept because their name time is before their hour (rows stamped ahead of the writer's clock).", m.fileTimePruningAnomalousKept.Load()},
 	} {
 		b = append(b, "# HELP "+c.name+" "+c.help+"\n"...)
 		b = append(b, "# TYPE "+c.name+" counter\n"...)
