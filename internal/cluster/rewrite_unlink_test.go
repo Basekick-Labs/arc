@@ -218,3 +218,84 @@ func TestRewriteUnlinksRederivedAtStart(t *testing.T) {
 		t.Fatal("not tracked for reads")
 	}
 }
+
+// Each stale-sweep guard on its own: the candidate list and the unlink both
+// leave a deferred copy alone.
+func TestStaleSweepGuardsADeferredCopy(t *testing.T) {
+	r := staleRig(t)
+	ctx := context.Background()
+	old := staleHour + "cpu_1.parquet"
+	r.register(old, "all the rows")
+	r.pass()
+	r.unregisterAs(old, deleteRewriteReason)
+	r.c.deletePendingMu.Lock()
+	r.c.deferred.add(old, deferredUnlink{reason: deleteRewriteReason, since: time.Now()})
+	r.c.deletePendingMu.Unlock()
+	r.c.stale.confirm = 0
+	seen := r.c.stale.seen.Load()
+	now := time.Now()
+	r.c.staleCandidates(ctx, seen, now)
+	if got := r.c.staleCandidates(ctx, seen, now.Add(time.Second)); len(got) != 0 {
+		t.Fatalf("a deferred copy is a stale candidate: %v", got)
+	}
+	if r.c.unlinkStale(ctx, old) || !r.exists(old) {
+		t.Fatal("the stale unlink removed a deferred copy")
+	}
+}
+
+// Through the real register callback: a path listed again leaves the
+// deferred set.
+func TestRegisterCallbackDropsADeferredUnlink(t *testing.T) {
+	origin := startHangingOrigin(t)
+	c, _ := newManifestDeleteRig(t, origin.addr())
+	key := staleHour + "back.parquet"
+	c.deletePendingMu.Lock()
+	c.deferred.add(key, deferredUnlink{reason: deleteRewriteReason, since: time.Now()})
+	c.deletePendingMu.Unlock()
+	e := raft.FileEntry{Path: key, SHA256: "s", SizeBytes: 4, Database: "testdb", Measurement: "cpu",
+		OriginNodeID: manifestDeleteOrigin, Tier: "hot", CreatedAt: time.Now()}
+	if err := c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if c.unlinkDeferred(key) {
+		t.Fatal("still deferred after the path was registered again")
+	}
+}
+
+// Through the real stale-local start: the journal opens and the copies a
+// previous run left waiting are queued again.
+func TestStaleLocalStartRederivesRewriteUnlinks(t *testing.T) {
+	r := staleRig(t)
+	old := staleHour + "cpu_1.parquet"
+	rw := staleHour + "cpu_1_rewrite_5.parquet"
+	r.register(old, "all the rows")
+	r.pass()
+	e := raft.FileEntry{Path: rw, SHA256: "x", SizeBytes: 5, Database: "testdb", Measurement: "cpu",
+		OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.unregisterAs(old, deleteRewriteReason)
+	r.c.stale.seen.Load().close()
+	r.c.stale.opened = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	r.c.stale.wg.Add(1)
+	go r.c.staleLocalRun(ctx)
+	t.Cleanup(func() {
+		cancel()
+		r.c.stale.wg.Wait()
+		if s := r.c.stale.seen.Load(); s != nil {
+			s.close()
+		}
+	})
+	waitFSM(t, func() bool {
+		r.c.deletePendingMu.Lock()
+		defer r.c.deletePendingMu.Unlock()
+		for _, d := range r.c.deletePending {
+			if d.path == old && d.reason == deleteRewriteReason {
+				return true
+			}
+		}
+		return false
+	})
+}
