@@ -407,6 +407,11 @@ type TimeRange struct {
 // unit: the time unit (e.g., "days", "hours")
 // isAddition: true for NOW() + INTERVAL, false for NOW() - INTERVAL
 func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Time, error) {
+	return evaluateRelativeTimeAt(time.Now().UTC(), amount, unit, isAddition)
+}
+
+// evaluateRelativeTimeAt is evaluateRelativeTime from a given now.
+func evaluateRelativeTimeAt(now time.Time, amount string, unit string, isAddition bool) (time.Time, error) {
 	n, err := strconv.Atoi(amount)
 	if err != nil {
 		return time.Time{}, err
@@ -421,7 +426,6 @@ func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Tim
 		n = -n
 	}
 
-	now := time.Now().UTC()
 	unit = strings.ToLower(strings.TrimSuffix(unit, "s")) // normalize: days -> day
 
 	switch unit {

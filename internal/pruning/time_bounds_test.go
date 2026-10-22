@@ -190,8 +190,8 @@ func TestTimeRangeReviewShapes(t *testing.T) {
 		"literal glued to OR": "SELECT * FROM db.cpu WHERE time >= '2024-06-01' AND host='x'OR host='y'",
 		// DuckDB's TIMESTAMP cast drops an explicit offset; the parser
 		// applies it.
-		"offset under cast":   "SELECT * FROM db.cpu WHERE time < '2024-06-01T10:00:00+02:00'::timestamp",
-		"offset bare literal": "SELECT * FROM db.cpu WHERE time >= '2024-06-01 10:00:00-05'",
+		"offset under cast":   "SELECT * FROM db.cpu WHERE time >= '2024-06-01T10:00:00+02:00'::timestamp",
+		"offset bare literal": "SELECT * FROM db.cpu WHERE time >= '2024-06-01T10:00:00-05:00'",
 		// An interval far past any data.
 		"overflowing interval": "SELECT * FROM db.cpu WHERE time > now() - interval '99999999999 hours'",
 	} {
@@ -259,4 +259,13 @@ func FuzzTimeBounds(f *testing.F) {
 		_, _ = topLevelConjuncts(s)
 		_ = hasTopLevelComma(s)
 	})
+}
+
+// The relative-time path uses the clamp: one month before Mar 31 starts on
+// the last day of February, as in DuckDB.
+func TestRelativeMonthMatchesDuckDB(t *testing.T) {
+	got, err := evaluateRelativeTimeAt(mustT(t, "2026-03-31 10:00:00"), "1", "month", false)
+	if err != nil || !got.Equal(mustT(t, "2026-02-28 10:00:00")) {
+		t.Fatalf("now() - 1 month on Mar 31 = %v (%v), want Feb 28", got, err)
+	}
 }
