@@ -2,10 +2,12 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/rs/zerolog"
 )
@@ -20,11 +22,13 @@ type CQScheduler struct {
 	licenseClient *license.Client
 	clusterGate   WriterGate
 	jobs          map[int64]*cqJob // CQ ID → job info
-	mu            sync.RWMutex
-	wg            sync.WaitGroup
-	stopCh        chan struct{}
-	running       bool
-	logger        zerolog.Logger
+	// pendingForgetter is the handler's ForgetPendingWatermarks (#1324).
+	pendingForgetter interface{ ForgetPendingWatermarks() }
+	mu               sync.RWMutex
+	wg               sync.WaitGroup
+	stopCh           chan struct{}
+	running          bool
+	logger           zerolog.Logger
 }
 
 // cqJob represents a scheduled CQ job
@@ -56,6 +60,9 @@ func NewCQScheduler(cfg *CQSchedulerConfig) (*CQScheduler, error) {
 		logger:        cfg.Logger.With().Str("component", "cq-scheduler").Logger(),
 	}
 
+	if cfg.CQHandler != nil {
+		s.pendingForgetter = cfg.CQHandler
+	}
 	s.logger.Info().Msg("CQ scheduler initialized")
 	return s, nil
 }
@@ -78,11 +85,27 @@ func (s *CQScheduler) Start() error {
 
 	// Load and start all active CQs
 	cqs, err := s.cqHandler.GetActiveCQs()
+	if errors.Is(err, api.ErrCQNotCaughtUp) {
+		// The cluster's CQs (#1324) arrive through SyncJobs once this node
+		// has caught up.
+		s.running = true
+		s.logger.Info().Msg("CQ scheduler started with no jobs: waiting for the cluster's continuous queries")
+		return nil
+	}
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to load active CQs")
 		return err
 	}
 
+	s.startLoadedLocked(cqs)
+	return nil
+}
+
+// startLoadedLocked marks the scheduler running and starts a job per CQ.
+// Running first: startJob starts nothing on a scheduler that is not running.
+// Caller holds s.mu.
+func (s *CQScheduler) startLoadedLocked(cqs []api.ContinuousQuery) {
+	s.running = true
 	for _, cq := range cqs {
 		if err := s.startJob(cq.ID, cq.Name, cq.Interval); err != nil {
 			s.logger.Warn().
@@ -93,13 +116,9 @@ func (s *CQScheduler) Start() error {
 			continue
 		}
 	}
-
-	s.running = true
 	s.logger.Info().
 		Int("active_cqs", len(s.jobs)).
 		Msg("CQ scheduler started")
-
-	return nil
 }
 
 // Stop stops all CQ jobs and the scheduler
@@ -205,6 +224,13 @@ func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive
 
 // ReloadAll reloads all CQ schedules from the database
 func (s *CQScheduler) ReloadAll() error {
+	// Read the CQs first: a node that cannot read them yet (not caught up
+	// with the cluster, #1324) keeps the jobs it has rather than losing all.
+	cqs, err := s.cqHandler.GetActiveCQs()
+	if err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 
 	if !s.running {
@@ -235,12 +261,7 @@ func (s *CQScheduler) ReloadAll() error {
 		return nil
 	}
 
-	// Load and start all active CQs
-	cqs, err := s.cqHandler.GetActiveCQs()
-	if err != nil {
-		return err
-	}
-
+	// Start all active CQs read above
 	for _, cq := range cqs {
 		if err := s.startJob(cq.ID, cq.Name, cq.Interval); err != nil {
 			s.logger.Warn().
@@ -261,6 +282,14 @@ func (s *CQScheduler) ReloadAll() error {
 
 // startJob starts a job for a specific CQ (must be called with lock held)
 func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
+	// A stopped scheduler starts nothing (its WaitGroup may be waiting), and
+	// a job already running for the CQ is replaced, never orphaned: Reload*
+	// and SyncJobs can both reach here for the same CQ.
+	if !s.running {
+		return nil
+	}
+	s.stopJobLocked(cqID)
+
 	// Parse interval using Go duration format
 	interval, err := time.ParseDuration(intervalStr)
 	if err != nil {
@@ -303,32 +332,43 @@ func (s *CQScheduler) runJob(job *cqJob) {
 	for {
 		select {
 		case <-job.ticker.C:
-			// Check license before each execution
-			if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
-				s.logger.Warn().
-					Int64("cq_id", job.cqID).
-					Str("cq_name", job.cqName).
-					Msg("Valid enterprise license required, skipping CQ execution")
-				continue
-			}
-
-			// Cluster gate: checked on every tick so role transitions (failover,
-			// demotion) take effect without a restart. clusterGate is immutable
-			// after construction so no lock is needed here.
-			if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
-				s.logger.Debug().
-					Str("role", s.clusterGate.Role()).
-					Int64("cq_id", job.cqID).
-					Str("cq_name", job.cqName).
-					Msg("CQ tick skipped: node is not primary writer")
-				continue
-			}
-
-			s.executeJob(job)
+			s.tick(job)
 		case <-job.stopCh:
 			return
 		}
 	}
+}
+
+// tick is one tick of a job: primary gate, licence, run.
+func (s *CQScheduler) tick(job *cqJob) {
+	// Cluster gate: checked on every tick so role transitions (failover,
+	// demotion) take effect without a restart. clusterGate is immutable
+	// after construction so no lock is needed here.
+	if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
+		// Not the primary (any more): an unsettled watermark of this node
+		// must never be proposed after a later promotion over what the
+		// cluster did meanwhile (#1324).
+		if s.pendingForgetter != nil {
+			s.pendingForgetter.ForgetPendingWatermarks()
+		}
+		s.logger.Debug().
+			Str("role", s.clusterGate.Role()).
+			Int64("cq_id", job.cqID).
+			Str("cq_name", job.cqName).
+			Msg("CQ tick skipped: node is not primary writer")
+		return
+	}
+
+	// Check license before each execution
+	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
+		s.logger.Warn().
+			Int64("cq_id", job.cqID).
+			Str("cq_name", job.cqName).
+			Msg("Valid enterprise license required, skipping CQ execution")
+		return
+	}
+
+	s.executeJob(job)
 }
 
 // executeJob executes a single CQ
@@ -352,6 +392,13 @@ func (s *CQScheduler) executeJob(job *cqJob) {
 		Msg("Executing scheduled CQ")
 
 	resp, err := s.cqHandler.ExecuteCQ(ctx, job.cqID)
+	if err != nil && ingest.IsWriteRefusal(err) {
+		// Skipped while writes are refused (#676); the handler logs it,
+		// sampled. Not an Error per tick.
+		s.logger.Debug().Err(err).Int64("cq_id", job.cqID).Str("cq_name", job.cqName).
+			Msg("Scheduled CQ skipped: writes are refused")
+		return
+	}
 	if err != nil {
 		s.logger.Error().
 			Err(err).
@@ -408,4 +455,52 @@ func (s *CQScheduler) JobCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.jobs)
+}
+
+// cqJobInterval is the interval a job runs at for intervalStr, as startJob
+// computes it.
+func cqJobInterval(intervalStr string) (time.Duration, error) {
+	d, err := time.ParseDuration(intervalStr)
+	if err != nil {
+		return 0, err
+	}
+	return max(d, 10*time.Second), nil
+}
+
+// SyncJobs makes the running jobs match defs, the cluster's continuous
+// queries (#1324): it starts the missing ones, stops the ones gone or
+// inactive, and replaces only a job whose interval changed. Every other job
+// keeps its ticker, so its phase is not reset. It never waits for a stopped
+// job to exit: a replacement may start while the old goroutine finishes, and
+// the handler's per-CQ run lock keeps the two from running the CQ at once.
+func (s *CQScheduler) SyncJobs(defs []api.CQJobDef) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.running {
+		return
+	}
+	want := make(map[int64]api.CQJobDef, len(defs))
+	for _, d := range defs {
+		if d.IsActive {
+			want[d.ID] = d
+		}
+	}
+	for id, job := range s.jobs {
+		if d, ok := want[id]; ok {
+			// A rename keeps the job (and its old name in its log lines
+			// until it restarts): the job reads nothing else of it.
+			if iv, err := cqJobInterval(d.Interval); err == nil && iv == job.interval {
+				continue
+			}
+		}
+		s.stopJobLocked(id)
+	}
+	for id, d := range want {
+		if _, running := s.jobs[id]; running {
+			continue
+		}
+		if err := s.startJob(d.ID, d.Name, d.Interval); err != nil {
+			s.logger.Warn().Err(err).Int64("cq_id", id).Str("cq_name", d.Name).Msg("Failed to start CQ job")
+		}
+	}
 }

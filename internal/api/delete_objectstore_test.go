@@ -53,7 +53,7 @@ func TestReplaceManifestAfterRewriteDeletesOriginalS3Object(t *testing.T) {
 	h := &DeleteHandler{storage: backend, coordinator: c, logger: zerolog.Nop()}
 	s3 := &s3RewriteResult{newPath: newPath, sizeBytes: 3, sha256: "remote-test"}
 
-	if err := h.replaceManifestAfterRewrite(ctx, oldPath, newPath, s3); err != nil {
+	if err := h.replaceManifestAfterRewrite(ctx, oldPath, newPath, s3, ""); err != nil {
 		t.Fatal(err)
 	}
 

@@ -66,17 +66,17 @@ const arrowStreamTruncatedTrailer = "Arc-Stream-Truncated"
 //
 // A trailer for the same reason the other two are: the cap is only known to
 // have been reached once the last batch has been written, long after the
-// status line and headers went out. Like every fasthttp trailer it is emitted
-// on every response once registered, carrying an empty value when never Set,
-// so the client contract is "non-empty means capped".
+// status line and headers went out. Like every registered trailer it is
+// announced in the Trailer header of every response but sent only when Set
+// (since fasthttp 1.76, Arc 27.01.1; before, it was sent empty), so the
+// client contract is "non-empty means capped".
 const arrowRowsCappedTrailer = "Arc-Rows-Capped"
 
 // transportWriter distinguishes "the socket went away" from "the encoder
 // failed". Both surface as an error out of ipc.Writer.Write, and only the
 // former means nobody is listening. Wrapping the sink is the only way to tell:
-// a real Arrow batch is far larger than the 4KB bufio fasthttp hands the
-// stream callback, so writes go straight through and a hangup lands on Write
-// rather than on the later Flush that used to be the only place it was tagged.
+// a batch larger than the stream's 256 KB buffer writes straight through, so
+// a hangup can land on Write as well as on the later Flush.
 type transportWriter struct {
 	w   *bufio.Writer
 	err error
@@ -128,8 +128,9 @@ func poisonArrowStream(w *bufio.Writer, logger zerolog.Logger) {
 // the pool first would hand another query a connection with an open result.
 //
 // It recovers on its own behalf (#716). Its single caller is a defer inside the
-// Arrow IPC stream writer, so it runs on a bare fasthttp goroutine and, on the
-// panic path, during the unwind with a panic already in flight: a second panic
+// Arrow IPC stream writer, so it runs after the handler returned, outside
+// Fiber's recover, and, on the panic path, during the unwind with a panic
+// already in flight: a second panic
 // raised here would either kill the process or, if caught by the caller's
 // recover, replace the root-cause panic value, since recover() only ever yields
 // the most recent one. Do not remove the recover on the grounds that the happy
@@ -303,10 +304,10 @@ streamLoop:
 			}
 
 			if err := ipcWriter.Write(writeBatch); err != nil {
-				// A hangup surfaces here, not at the Flush below, because a
-				// batch overflows the 4KB bufio and writes straight through.
-				// Tag it so the caller treats it as a client disconnect
-				// rather than a server-side failure worth alerting on.
+				// A hangup can surface here when a batch overflows the
+				// stream's 256 KB buffer and writes straight through. Tag it
+				// so the caller treats it as a client disconnect rather than
+				// a server-side failure worth alerting on.
 				if tw.err != nil {
 					streamErr = fmt.Errorf("stream write failed at row %d: %w: %w", totalRows, errClientDisconnected, err)
 				} else {
@@ -416,7 +417,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	dictEnabled := isTruthyHeader(c.Get("x-arc-arrow-dictionary"))
 	// strings.Clone is REQUIRED: c.Get aliases the fasthttp header buffer,
 	// and ToLower/TrimSpace return the ORIGINAL string when unchanged (e.g.
-	// "zstd"). ipcCompression is captured by the SetBodyStreamWriter closure
+	// "zstd"). ipcCompression is captured by the stream writer closure
 	// and read after the handler returns — same aliasing class as the
 	// x-arc-database wrong-DB corruption bug.
 	ipcCompression := strings.Clone(strings.ToLower(strings.TrimSpace(c.Get("x-arc-arrow-compression"))))
@@ -522,7 +523,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// If headerDB is set, uses optimized path that skips db.table regex patterns
 	//
 	// The rejection must be answered HERE, before the arcx hook and before
-	// ArrowQueryContext: once either commits to SetBodyStreamWriter the status
+	// ArrowQueryContext: once either commits to a body stream the status
 	// code is already on the wire, and the only way left to report a failure is
 	// a trailer the client may not read.
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
@@ -560,7 +561,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	if h.queryRegistry != nil {
 		var queryCtx context.Context
 		queryID, queryCtx = h.queryRegistry.Register(
-			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(), false, 0,
+			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(),
 		)
 		c.Set("X-Arc-Query-ID", queryID)
 		baseCtx = queryCtx
@@ -623,11 +624,27 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
-	// Match the JSON query contract: a data glob with no matches is an empty
-	// result, not a failed query. Keep missing schema anchors as errors because
-	// they invalidate the cached SQL transform.
-	if err != nil && ctx.Err() == nil && isNoFilesFoundError(err) && !h.missingAnchor(err) {
-		reader, err = array.NewRecordReader(arrow.NewSchema([]arrow.Field{}, nil), nil)
+	// Match the JSON query contract (classifyNoFiles): a measurement with no
+	// data yet is an empty result; a partition removed mid-query is a
+	// retryable 503; a missing schema anchor stays an error.
+	if err != nil && ctx.Err() == nil {
+		switch h.classifyNoFiles(err) {
+		case noFilesEmpty:
+			reader, err = array.NewRecordReader(arrow.NewSchema([]arrow.Field{}, nil), nil)
+		case noFilesVanished:
+			if cancel != nil {
+				cancel()
+			}
+			m.IncQueryErrors()
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   vanishedPartitionMessage,
+			})
+		}
 	}
 	if err != nil {
 		// Read the cause before releasing the context: cancel() below turns
@@ -686,8 +703,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	c.Set("Content-Type", "application/vnd.apache.arrow.stream")
 
 	// Capture the fasthttp RequestCtx once. c *fiber.Ctx is pooled and
-	// reset after this handler returns; the SetBodyStreamWriter callback
-	// runs asynchronously after the handler exits, so any call to
+	// reset after this handler returns; the stream writer runs after the
+	// handler exits (when fasthttp writes the body), so any call to
 	// c.Context() inside the closure observes a recycled context (nil
 	// pointer panic in practice — verified by integration test against
 	// clickbench). The fasthttp RequestCtx itself stays valid until the
@@ -695,8 +712,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	fctx := c.Context()
 	respHeader := &fctx.Response.Header
 
-	// Declare the execution-time trailer in the response head before
-	// SetBodyStreamWriter runs so the `Trailer:` response header is
+	// Declare the execution-time trailer in the response head before the
+	// stream writer runs so the `Trailer:` response header is
 	// emitted before the chunked body starts. Clients that don't read
 	// trailers degrade gracefully to wall-clock timing. The Warn is
 	// sync.Once-gated against per-request log spam if a future fasthttp
@@ -753,7 +770,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// through onPanic. That retry is gone. It is not worth restoring, but the
 	// change is not strictly better on every panic path.
 	var streamW *bufio.Writer
-	h.setBodyStreamWithTrailers(fctx, "query_arrow_ipc", trailers, func() {
+	h.setDirectBodyStream(fctx, cancel, trailers, "query_arrow_ipc", func() {
 		// A recovered panic leaves a stream the client would otherwise read as
 		// complete: fasthttp still writes the terminating chunk, and a cut on
 		// a batch boundary decodes without error (#721).
@@ -795,11 +812,11 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// time-until-failure. On a hard client disconnect the trailer is
 		// silently dropped, same as any other post-body byte.
 		//
-		// Recorded on `trailers`, not on the response header: this closure
-		// runs on the stream-writer goroutine, which must not touch the header
-		// at all (#729). The connection goroutine publishes them when the body
-		// ends. fiber.Ctx is pooled and reset before this closure runs, so it
-		// is equally off limits.
+		// Recorded on `trailers`, not on the response header: the header is
+		// fasthttp's while it writes the response (#729), and
+		// directBodyStream publishes them once this writer returns. fiber.Ctx
+		// is pooled and reset before this closure runs, so it is equally off
+		// limits.
 		execMs := time.Since(start).Milliseconds()
 		trailers.set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
 

@@ -9,20 +9,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
-	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
-	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
 
@@ -61,7 +56,7 @@ func TestDeleteRewriteOfAPendingFileAnnouncesTheRewrite(t *testing.T) {
 
 	coordinator := &rewriteManifestCoordinator{}
 	h := &DeleteHandler{storage: backend, coordinator: coordinator, pending: outbox, logger: zerolog.Nop()}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if outbox.IsPending(oldPath) {
@@ -100,7 +95,7 @@ func TestDeleteRewriteOfAJustRegisteredFileReplacesItInTheManifest(t *testing.T)
 		pending: fixedPending{outcome: cluster.ReplaceRegistered, entry: raft.FileEntry{
 			Path: oldPath, Database: "db", Measurement: "cpu", Tier: "hot", CreatedAt: time.Now(),
 		}}}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(coordinator.ops) != 2 || coordinator.ops[0].Type != raft.CommandRegisterFile || coordinator.ops[1].Type != raft.CommandDeleteFile {
@@ -147,7 +142,7 @@ func TestDeleteOfEveryRowWithdrawsAPendingFile(t *testing.T) {
 	outbox.RegisterFile("db", "cpu", oldPath, time.Now(), 1, "x")
 
 	h := &DeleteHandler{db: db, storage: backend, coordinator: &rewriteManifestCoordinator{}, pending: outbox, logger: logger}
-	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'"); err != nil {
+	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'", ""); err != nil {
 		t.Fatal(err)
 	}
 	if outbox.IsPending(oldPath) {
@@ -170,7 +165,7 @@ func (failingPending) Withdraw(context.Context, string) (bool, cluster.ReplaceOu
 func TestDeleteRewriteRemovesTheRewriteWhenTheSwapFails(t *testing.T) {
 	root, backend, oldPath, newPath := rewriteFixture(t)
 	h := &DeleteHandler{storage: backend, coordinator: &rewriteManifestCoordinator{}, pending: failingPending{}, logger: zerolog.Nop()}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err == nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err == nil {
 		t.Fatal("a failed swap was reported as success")
 	}
 	if _, err := os.Stat(filepath.Join(root, newPath)); !os.IsNotExist(err) {
@@ -178,41 +173,5 @@ func TestDeleteRewriteRemovesTheRewriteWhenTheSwapFails(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, oldPath)); err != nil {
 		t.Fatalf("the original was removed although it stays authoritative: %v", err)
-	}
-}
-
-// busyRewriteCoordinator is a primary whose stream takeover is publishing
-// rows of db/cpu (#1207).
-type busyRewriteCoordinator struct{ rewriteManifestCoordinator }
-
-func (busyRewriteCoordinator) StreamTakeoverBusy(db, measurement string) bool {
-	return db == "db" && measurement == "cpu"
-}
-
-func TestRowDeleteWaitsForAStreamTakeover(t *testing.T) {
-	h := &DeleteHandler{config: &config.DeleteConfig{Enabled: true}, coordinator: &busyRewriteCoordinator{}, logger: zerolog.Nop()}
-	app := fiber.New()
-	h.RegisterRoutes(app)
-	send := func(body string) *http.Response {
-		req := httptest.NewRequest("POST", "/api/v1/delete", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := app.Test(req, 5000)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return resp
-	}
-	resp := send(`{"database":"db","measurement":"cpu","where":"time > 0"}`)
-	if resp.StatusCode != fiber.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "30" {
-		t.Fatalf("busy key: %d %q", resp.StatusCode, resp.Header.Get("Retry-After"))
-	}
-	// Past the gate, these stop at the next check (confirmation): 400.
-	resp = send(`{"database":"db","measurement":"mem","where":"time > 0"}`)
-	if resp.StatusCode != fiber.StatusBadRequest {
-		t.Fatalf("a delete of another measurement: %d", resp.StatusCode)
-	}
-	resp = send(`{"database":"db","measurement":"cpu","where":"","dry_run":true}`)
-	if resp.StatusCode != fiber.StatusBadRequest {
-		t.Fatalf("a dry run: %d", resp.StatusCode)
 	}
 }

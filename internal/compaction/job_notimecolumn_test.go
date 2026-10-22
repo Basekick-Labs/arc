@@ -190,6 +190,8 @@ func TestParquetFilesHaveTimeColumn(t *testing.T) {
 	writeFixtureParquet(t, ctx, db, noTime1, `'AAPL' AS symbol, 1.5 AS price, 1723600000000000::BIGINT AS timestamp`)
 	writeFixtureParquet(t, ctx, db, noTime2, `'MSFT' AS symbol, 2.5 AS price, 1723600001000000::BIGINT AS timestamp`)
 	writeFixtureParquet(t, ctx, db, withTime, `now() AS time, 'h1' AS host, 1.0 AS value`)
+	capitalTime := filepath.Join(dir, "capitaltime.parquet")
+	writeFixtureParquet(t, ctx, db, capitalTime, `now() AS "Time", 'h1' AS host, 1.0 AS value`)
 
 	list := func(paths ...string) string {
 		out := "["
@@ -212,6 +214,8 @@ func TestParquetFilesHaveTimeColumn(t *testing.T) {
 		// union_by_name backfills the missing column with NULLs, so a mixed
 		// partition binds and must NOT be skipped.
 		{"mixed: one file has time", list(noTime1, withTime), true},
+		// Matched exactly, as before #1258 widened the probe to every column.
+		{"only a capitalised Time", list(capitalTime), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

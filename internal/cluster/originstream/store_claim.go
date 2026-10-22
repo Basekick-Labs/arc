@@ -328,6 +328,7 @@ func readSegment(path string, off, size int64, fn func(Record, int64) bool) (sto
 // DropInstance removes an instance and its records: a claimant does so once
 // its claim is finished and every file of it is held locally.
 func (s *Store) DropInstance(origin string, instance uint64) error {
+	defer s.drainUnlink() // after the lock below is released
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := instanceID{origin, instance}
@@ -335,6 +336,7 @@ func (s *Store) DropInstance(origin string, instance uint64) error {
 	if d == nil {
 		return nil
 	}
+	s.forgetLocked(d, d.segs...)
 	if d.cur != nil {
 		_ = d.cur.Close()
 		d.cur = nil
@@ -343,11 +345,12 @@ func (s *Store) DropInstance(origin string, instance uint64) error {
 	for _, seg := range d.segs {
 		freed += seg.size
 	}
-	if err := os.RemoveAll(d.dir); err != nil {
+	if err := s.removeLocked(d.dir); err != nil {
 		return fmt.Errorf("standby store: drop instance: %w", err)
 	}
+	delete(s.pendingFloors, d)
 	d.segs = nil // a trim pass holding this dir must not free its bytes again
-	syncDir(filepath.Dir(d.dir))
+	s.dirsToSync[filepath.Dir(d.dir)] = true
 	delete(s.instances, id)
 	s.bytes -= freed
 	s.publishLocked()

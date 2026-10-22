@@ -15,18 +15,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/internal/cluster/filereplication"
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
-	"github.com/basekick-labs/arc/internal/cluster/replication"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/config"
-	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
-	"github.com/basekick-labs/arc/internal/wal"
 	hraft "github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
@@ -65,6 +61,10 @@ type TierRecorder interface {
 	// may come from an operator and so is a hint rather than proof of what
 	// happened to the file.
 	RecordUnlinkedFile(path, reason string, sizeBytes int64)
+	// RecordMissingFile reports a path that left the manifest while this
+	// node no longer had the file (its own compaction or retention removed
+	// it first): a hot row it still holds for the path is stale (#1271).
+	RecordMissingFile(path string)
 }
 
 // deleteWorkerCount is the number of goroutines draining the pending local
@@ -90,6 +90,10 @@ type Coordinator struct {
 	registry      *Registry
 	localNode     *Node
 	healthChecker *HealthChecker
+
+	// walDiskOffPoint is the WAL disk gate's off-point by volume size, for
+	// the standby store's reserve (#676); nil when the gate is off.
+	walDiskOffPoint atomic.Pointer[func(total uint64) uint64]
 
 	// Raft consensus (Phase 3)
 	raftNode *raft.Node
@@ -129,8 +133,6 @@ type Coordinator struct {
 	// and propose the ack once. Lazily allocated; nil until the first pause.
 	compactionPauseAckInFlight map[uint64]struct{}
 
-	// WAL Replication (Phase 3.3)
-	replicationSender *replication.Sender // Writer only: sends entries to readers
 	// ingestFence refuses live writes on a writer that may no longer be the
 	// primary (#1207); nil where it does not apply.
 	ingestFence  atomic.Pointer[ingestFence]
@@ -142,27 +144,36 @@ type Coordinator struct {
 	streamClaimsProposer atomic.Bool // the enable loop runs
 	nodeIDWarn           sync.Once   // stream takeover without an explicit node id, logged once
 	streamClaimsBlockers atomic.Pointer[[]string]
-	walCoverageActive    atomic.Bool // SetWALCoverageActive
+	// compactionCommit: the #1207 d2 flag's join gate and blockers.
+	compactionCommit compactionCommitGate
+	// clusterPolicies: the #1324 flag's join gate and blockers;
+	// policyListers read this node's own rows of each kind for adoption.
+	clusterPolicies clusterPoliciesGate
+	// retentionPolicies: the same for retention's own flag (#1324 stage 2).
+	retentionPolicies clusterPoliciesGate
+	// cqPolicies: the same for the continuous query flag (#1324 stage 3).
+	cqPolicies clusterPoliciesGate
+	// adoptMu serializes adoption passes: the loop's and an admin's nudge.
+	adoptMu         sync.Mutex
+	policyListersMu sync.Mutex
+	policyListers   map[string]LocalPolicyLister
+	// staged: the staged compaction commit, replica side (#1207 d2a2a).
+	staged               stagedReplica
+	repair               manifestRepairState // shared object store manifest repair (#1207)
+	walCoverageActive    atomic.Bool         // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
-	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
-	claimedExit          atomic.Bool                         // another writer claimed this process: refuse writes, exit (#1207)
-	claimant             atomic.Pointer[claimant]            // StartOriginStream with stream takeover (#1207)
-	pauseNotifyMu        sync.Mutex                          // ingestPauseChanged
+	takeoverOrigin       atomic.Pointer[takeoverOriginState]      // SetTakeoverOrigin (#1207 S4b)
+	claimedExit          atomic.Bool                              // another writer claimed this process: refuse writes, exit (#1207)
+	claimant             atomic.Pointer[claimant]                 // StartOriginStream with stream takeover (#1207)
+	deleteRecords        atomic.Pointer[deleteRecordState]        // StartOriginStream with stream takeover (#1207 d1)
+	deleteRewriter       atomic.Pointer[DeleteRewriter]           // SetDeleteRewriter
+	deleteOutbox         atomic.Pointer[RegistrationOutbox]       // the outbox the DELETE hooks are on
+	pendingRegs          atomic.Pointer[PendingRegistrationsFunc] // SetPendingRegistrations (#1214)
+	scopeFlusher         atomic.Pointer[DeleteScopeFlusher]       // SetDeleteScopeFlusher (#1265)
+	leaveGate            atomic.Pointer[func() bool]              // SetLeaveGate (#1214)
+	pauseNotifyMu        sync.Mutex                               // ingestPauseChanged
 	pauseNotified        bool
 	pauseState           bool
-	replicationReceiver  *replication.Receiver // Reader only: receives entries from writer
-	// replicationReceiverStopped is set by StopReplicationReceiver, which
-	// runs from a shutdown hook without cancelling ctx; the retarget loop
-	// checks it so it cannot start a fresh receiver into buffers that are
-	// closing (#853).
-	replicationReceiverStopped bool
-	// replicationRetarget pokes replicationTargetLoop to re-evaluate which
-	// writer this node should stream from. Depth 1: a poke while one is
-	// already pending is dropped, because the pending evaluation will read
-	// the same (latest) registry state anyway.
-	replicationRetarget chan struct{}
-	walWriter           *wal.Writer         // Reference to local WAL for replication hook
-	ingestBuffer        *ingest.ArrowBuffer // Reader only: applies replicated entries to local buffer
 
 	// Peer file replication (Enterprise Phase 2)
 	// storage is the local storage backend — used both by the fetch handler
@@ -172,6 +183,15 @@ type Coordinator struct {
 	// puller is the background worker pool that downloads files from peers.
 	// Nil when peer replication is disabled or the license forbids it.
 	puller *filereplication.Puller
+	// fetcher is the puller's fetch client: the stream claimant probes peers
+	// for a file with it (#1207 S4b1c2b).
+	fetcher filereplication.Fetcher
+	// pendingRegistration reports whether a path waits for registration in
+	// this writer's outbox (nil on other nodes).
+	pendingRegistration atomic.Pointer[func(string) bool]
+	// stale is the stale-local sweep (#1071), on local storage with
+	// replication.
+	stale staleLocalState
 	// catchupOnce guarantees the Phase 3 catch-up walker runs at most once
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
@@ -237,6 +257,9 @@ type Coordinator struct {
 	// treat a nil cache as a construction error rather than a reason to skip
 	// the check.
 	nonceCache *security.NonceCache
+
+	// forwardNonces rejects a replayed forwarded-request identity (#1305).
+	forwardNonces *security.ForwardNonceCache
 
 	// forwardConn caches a single TCP connection to the current Raft
 	// leader for forwarding commands. Reused across calls to avoid
@@ -354,10 +377,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	// Generate node ID if not provided
-	nodeID := cfg.Config.NodeID
-	if nodeID == "" {
-		nodeID = generateNodeID()
-	}
+	nodeID := ResolveNodeID(cfg.Config.NodeID)
 
 	// Create local node
 	localNode := NewNode(nodeID, nodeID, role, cfg.Config.ClusterName)
@@ -424,14 +444,14 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	c := &Coordinator{
-		cfg:                 cfg.Config,
-		licenseClient:       cfg.LicenseClient,
-		registry:            registry,
-		localNode:           localNode,
-		tlsConfig:           tlsCfg,
-		stopCh:              make(chan struct{}),
-		replicationRetarget: make(chan struct{}, 1),
-		logger:              logger,
+		cfg:           cfg.Config,
+		licenseClient: cfg.LicenseClient,
+		registry:      registry,
+		localNode:     localNode,
+		tlsConfig:     tlsCfg,
+		stopCh:        make(chan struct{}),
+		logger:        logger,
+		staged:        stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), finisherWake: make(chan struct{}, 1), finishing: map[string]bool{}, goneSince: map[string]time.Time{}},
 	}
 
 	if tlsCfg != nil {
@@ -483,6 +503,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			HeartbeatTimeout:  time.Duration(cfg.Config.RaftHeartbeatTimeout) * time.Millisecond,
 			SnapshotInterval:  time.Duration(cfg.Config.RaftSnapshotInterval) * time.Second,
 			SnapshotThreshold: uint64(cfg.Config.RaftSnapshotThreshold),
+			PreVoteDisabled:   !cfg.Config.RaftPreVote,
 			Logger:            cfg.Logger,
 			TLSConfig:         tlsCfg,
 			SharedSecret:      cfg.Config.SharedSecret,
@@ -499,6 +520,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			Str("raft_data_dir", cfg.Config.RaftDataDir).
 			Str("raft_bind_addr", cfg.Config.RaftBindAddr).
 			Bool("raft_bootstrap", cfg.Config.RaftBootstrap).
+			Bool("raft_pre_vote", cfg.Config.RaftPreVote).
 			Msg("Raft consensus initialized")
 	}
 
@@ -513,6 +535,9 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// read from disk once at coordinator startup rather than once
 	// per consumer. Scheme is keyed off server.tls_enabled (the Fiber
 	// listener flag), not cluster TLS — the two flags are independent.
+	// Built with the router, before any request can be forwarded here: an
+	// assertion is checked against it from the first one (#1305).
+	c.forwardNonces = security.NewForwardNonceCache(security.ForwardIdentityTolerance)
 	c.router = NewRouter(&RouterConfig{
 		Timeout:   routeTimeout,
 		Retries:   cfg.Config.RouteRetries,
@@ -522,6 +547,20 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		Logger:    cfg.Logger,
 		Transport: security.NewClusterHTTPTransport(tlsCfg),
 		Scheme:    security.SchemeForServer(cfg.ServerTLSEnabled),
+		// Pattern 1 only: in shared storage every writer takes writes and a
+		// designation left over in the state must not pin them to one.
+		Designated: func() string {
+			if c.cfg.SharedStorageMode {
+				return ""
+			}
+			return c.designatedPrimaryWriterID()
+		},
+		StandbyWriteTarget:  c.WriteForwardTarget,
+		WriteTimeout:        time.Duration(cfg.Config.WriteForwardTimeoutMs) * time.Millisecond,
+		ImportTimeout:       time.Duration(max(cfg.Config.ImportForwardTimeoutMs, 0)) * time.Millisecond,
+		SharedSecret:        cfg.Config.SharedSecret,
+		ClusterName:         cfg.Config.ClusterName,
+		PeerForwardIdentity: c.peerForwardIdentity,
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft.
@@ -679,11 +718,9 @@ func (c *Coordinator) Start() error {
 	// Initialize the coordinator-wide context BEFORE anything else that
 	// might need it — notably the accept loop, which hands off connections
 	// to handleFetchFile and handleFetchFile derives its per-request
-	// contexts from c.ctx. Prior to this fix, c.ctx was only assigned
-	// inside StartReplication(), which runs later from main.go and isn't
-	// even called on nodes where WAL replication is disabled. A fetch
-	// request arriving before StartReplication() would panic on the nil
-	// parent context (Phase 4 integration-test discovery).
+	// contexts from c.ctx. It was once assigned only when the WAL
+	// replication stream started, later and not on every node, and a fetch
+	// arriving first panicked on the nil parent context.
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
 	// Initialize the nonce cache for HMAC replay protection.
@@ -770,6 +807,25 @@ func (c *Coordinator) Start() error {
 	go c.streamClaimsMetricsLoop(c.ctx)
 	if proposer {
 		go c.streamClaimsEnableLoop(c.ctx)
+	}
+	if c.raftNode != nil {
+		go c.compactionCommitEnableLoop(c.ctx)
+		go c.clusterPoliciesEnableLoop(c.ctx)
+	}
+	// The staged compaction commit on an object store (#1207 d2a2b): the
+	// leader aborts jobs of a compactor that is gone, and committed jobs are
+	// finished. Replication plays no part (the bucket is shared).
+	if c.raftNode != nil && c.storage != nil && c.stagedObject() {
+		if v := os.Getenv("ARC_TEST_FINISHER_DELAY"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				objectFinisherDelay = d
+			}
+		}
+		go c.stagedLeaderLoop(c.ctx)
+		go c.objectFinisherLoop(c.ctx)
+	}
+	if c.raftNode != nil {
+		go c.manifestRepairLoop(c.ctx)
 	}
 	if c.cfg.StreamTakeover && c.raftNode != nil {
 		go c.departedExpiryLoop(c.ctx)
@@ -892,7 +948,15 @@ func (c *Coordinator) Stop() error {
 		return nil
 	}
 	c.finalTakeoverReport()
-	c.broadcastLeave()
+	if g := c.leaveGate.Load(); g != nil && !(*g)() {
+		// A node that left is no longer asked what it has pending, and its
+		// pending set is in no published list: staying in the cluster keeps
+		// its files from the orphan sweep (#1214), which it holds until this
+		// node returns or is removed.
+		c.logger.Error().Msg("Not leaving the cluster at shutdown: files pending registration here could not be published to the shared store; the orphan-storage sweep is held until this node returns or is removed from the cluster")
+	} else {
+		c.broadcastLeave()
+	}
 	// Before c.mu is taken: stopOriginStream takes it, and joins goroutines
 	// that read coordinator state.
 	c.stopOriginStream()
@@ -921,8 +985,6 @@ func (c *Coordinator) Stop() error {
 	// add to their pending list.
 	puller := c.puller
 	c.puller = nil
-	replicationSender := c.replicationSender
-	replicationReceiver := c.replicationReceiver
 	writerFailover := c.writerFailoverMgr
 	compactorFailover := c.compactorFailoverMgr
 	raftNode := c.raftNode
@@ -956,16 +1018,6 @@ func (c *Coordinator) Stop() error {
 		}
 	}
 
-	// Replication is joined before Raft: the receiver applies entries through
-	// the ingest handler, and its goroutines were previously left running on
-	// the shared context alone, so a receiver still draining could write into
-	// a WAL and an Arrow buffer that shutdown was already closing (#853).
-	// In cmd/arc the receiver is normally already stopped by then — Stop runs
-	// as a shutdown component, after the Arrow buffer and WAL have closed, so
-	// main.go stops the receiver from a hook first (StopReplicationReceiver);
-	// this call then finds it stopped and only takes the sender down.
-	c.stopReplicationSubsystems(replicationSender, replicationReceiver)
-
 	if raftNode != nil {
 		if err := raftNode.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping Raft node")
@@ -993,6 +1045,7 @@ func (c *Coordinator) Stop() error {
 	if deleteStop != nil {
 		c.stopDeleteWorkers(deleteStop, deleteWg)
 	}
+	c.stopStaleLocal()
 
 	if healthChecker != nil {
 		healthChecker.Stop()
@@ -1185,6 +1238,7 @@ func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
 // life, while the recorder is attached later and is absent on a node without
 // tiering, so this return value is what distinguishes the two.
 func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
+	c.noteLocalRegistered(path)
 	r := c.tierRecorderSnapshot()
 	if r == nil {
 		return false
@@ -1209,6 +1263,7 @@ const tierReasonAbandonedPull = "replication:abandoned"
 
 // recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
 func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
+	c.forgetLocal(path)
 	if r := c.tierRecorderSnapshot(); r != nil {
 		r.RecordUnlinkedFile(path, tierReasonAbandonedPull, sizeBytes)
 	}
@@ -1248,18 +1303,28 @@ func (c *Coordinator) logKeptRelistedPath(item deleteRequest, refresh filereplic
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Int64("total_warned", n).
-			Msg("Local delete skipped: the manifest lists the path again, but the file puller queue is full; the local copy may be the previous version until the path's next arrival or the periodic reconciliation (#1182)")
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller queue is full; the local copy may be the previous version until the path's next arrival or the next manifest walk, which finds it stale (#1182)")
 	default:
 		c.logger.Warn().
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Int64("total_warned", n).
-			Msg("Local delete skipped: the manifest lists the path again, but the file puller is stopped; the local copy is kept and may be the previous version (#1182)")
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller is stopped; the local copy is kept and may be the previous version until the next start's walk finds it stale (#1182)")
 	}
 }
 
 func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool, filereplication.RefreshOutcome)) {
 	if relisted != nil {
+		if listed, refresh := relisted(item.path); listed {
+			c.logKeptRelistedPath(item, refresh)
+			return
+		}
+	}
+	// A compaction input stays readable until this node's staged copy of
+	// the output is in place (#1207 d2a2a; bounded).
+	// The wait can last seconds: a path registered again meanwhile keeps its
+	// fresh copy. Read again only after a wait (#1271).
+	if c.waitStagedAdoption(item.reason) && relisted != nil {
 		if listed, refresh := relisted(item.path); listed {
 			c.logKeptRelistedPath(item, refresh)
 			return
@@ -1277,6 +1342,9 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 	var (
 		sizeBytes int64
 		wasLocal  bool
+		// statOK: the stat answered (present or absent), so "absent" can be
+		// reported as such (#1271).
+		statOK bool
 	)
 	recorder := c.tierRecorderSnapshot()
 	if recorder != nil {
@@ -1302,6 +1370,7 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 				n, statErr = si.StagedSize(delCtx, item.path)
 			}
 		}
+		statOK = statErr == nil
 		if statErr == nil && n >= 0 {
 			sizeBytes = n
 			wasLocal = true
@@ -1319,6 +1388,7 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 		// it either, because every path to it addresses the same
 		// unusable key.
 		metrics.Get().IncStorageInvalidPathQuarantined()
+		c.forgetLocal(item.path)
 		c.logger.Error().
 			Err(err).
 			Str("path", item.path).
@@ -1335,11 +1405,21 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Msg("Phase 4 local delete worker: removed local copy")
-		if wasLocal && recorder != nil {
+		c.forgetLocal(item.path)
+		switch {
+		case wasLocal && recorder != nil:
 			// Only for a file this node actually held: the tier row for a
-			// path a node never had is not its to write, and without the stat
-			// above every node would report every manifest delete.
+			// path a node never had is not its to write. Every other node
+			// reports the path as missing below, which only retires a hot row
+			// it may still hold.
 			recorder.RecordUnlinkedFile(item.path, item.reason, sizeBytes)
+		case recorder != nil && statOK:
+			// Not here when the worker came to remove it (the stat said so):
+			// this node's own compaction or retention removed it first. Any
+			// hot row this node holds for the path is stale; a node that
+			// never held it has none, and the event is a no-op there (#1271).
+			// A failed stat reports nothing, as before.
+			recorder.RecordMissingFile(item.path)
 		}
 	}
 }
@@ -1778,6 +1858,12 @@ func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string,
 			node := NewNode(nodeInfo.ID, nodeInfo.Name, ParseRole(nodeInfo.Role), c.cfg.ClusterName)
 			node.SetAddresses(nodeInfo.CoordAddr, nodeInfo.APIAddr)
 			node.UpdateState(NodeState(nodeInfo.State))
+			// The response carries no writer state, and Register replaces the
+			// entry: keep what this node already knows (Raft replay or a
+			// promotion callback may have set it before the join returned),
+			// else take the FSM's. Losing it made a later Raft leader see no
+			// primary and fail over the designated one (#1267).
+			node.SetWriterState(c.knownWriterState(nodeInfo.ID))
 			if err := c.registry.Register(node); err != nil {
 				c.logger.Warn().Err(err).Str("node_id", nodeInfo.ID).Msg("Failed to register peer node")
 			}
@@ -1854,7 +1940,7 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 		Msg("Received peer message")
 
 	// For most message types, we close the connection after handling.
-	// Exception: MsgReplicateSync - the sender takes ownership of the connection.
+	// Exceptions: MsgOriginStreamHello and MsgFetchFile, whose handlers own it.
 	closeConn := true
 
 	switch msg.Type {
@@ -1868,12 +1954,20 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 		c.handleLeaveNotify(msg.Payload.(*protocol.LeaveNotify))
 
 	case protocol.MsgReplicateSync:
-		c.handleReplicateSync(conn, msg.Payload.(*protocol.ReplicateSync))
-		closeConn = false // Sender takes ownership
+		c.refuseReplicateSync(conn, msg.Payload.(*protocol.ReplicateSync))
 
 	case protocol.MsgOriginStreamHello:
 		// The origin stream server owns the connection once it accepts.
 		closeConn = !c.handleOriginStreamHello(conn, msg.Payload.(*protocol.OriginStreamHello))
+
+	case protocol.MsgPendingRegistrationsQuery:
+		c.handlePendingRegistrationsQuery(conn, msg.Payload.(*protocol.PendingRegistrationsQuery))
+
+	case protocol.MsgFlushScopeRequest:
+		c.handleFlushScopeRequest(conn, msg.Payload.(*protocol.FlushScopeRequest))
+
+	case protocol.MsgLocalPoliciesQuery:
+		c.handleLocalPoliciesQuery(conn, msg.Payload.(*protocol.LocalPoliciesQuery))
 
 	case protocol.MsgFetchFile:
 		// The fetch handler streams the body for the lifetime of the
@@ -2068,10 +2162,29 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, why)
 			return
 		}
+		ccWhy, ccRelease := c.compactionCommitJoinGate(req)
+		if ccWhy != "" {
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", ccWhy).
+				Msg("Join refused: the node does not support compaction commit")
+			c.sendJoinError(conn, req, ccWhy)
+			return
+		}
+		cpWhy, cpRelease := c.clusterPoliciesJoinGate(req)
+		if cpWhy != "" {
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", cpWhy).
+				Msg("Join refused: the node does not support cluster policies")
+			c.sendJoinError(conn, req, cpWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				cpRelease()
+				ccRelease()
 				release()
 			}
 		}
@@ -2378,140 +2491,19 @@ func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
 	c.registry.Unregister(leave.NodeID)
 }
 
-// handleReplicateSync handles a replication sync request from a reader node.
-// This is called when a reader connects to start receiving WAL entries.
-// NOTE: We don't close the connection here - the sender takes ownership.
-func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.ReplicateSync) {
-	remoteAddr := conn.RemoteAddr().String()
-
-	// Authentication: validate the HMAC against the cluster shared secret
-	// BEFORE accepting the connection into the replication sender. See
-	// GHSA-wfgr-8x84-22q7 / CVE-2026-48106 (audit X1).
-	//
-	// Refuse-when-unconfigured posture: when cluster.shared_secret is
-	// empty, replication has no legitimate authenticated caller — refuse
-	// every request uniformly so an attacker can't probe to distinguish
-	// "no secret configured" from "wrong MAC". Same shape as the
-	// cache-invalidate endpoint (PR #444).
-	// All rejection paths return the SAME generic "authentication
-	// failed" string so an attacker cannot probe the wire response
-	// to distinguish "no secret configured" from "missing fields"
-	// from "wrong MAC" from "wrong cluster name". The specific
-	// reason is in the server log for operator debugging — see the
-	// .Msg(...) on each branch's logger.Warn().
-	// (Gemini round 8 / PR #449.)
-	if c.cfg.SharedSecret == "" {
-		c.logger.Warn().
-			Str("peer", remoteAddr).
-			Str("reader_id", syncReq.ReaderID).
-			Msg("Replication sync rejected: cluster.shared_secret not configured (peer replication requires it)")
-		c.sendReplicationSyncError(conn, "authentication failed")
-		return
-	}
-	if syncReq.HMAC == "" || syncReq.Nonce == "" || syncReq.ClusterName == "" || syncReq.Timestamp == 0 {
-		c.logger.Warn().
-			Str("peer", remoteAddr).
-			Str("reader_id", syncReq.ReaderID).
-			Msg("Replication sync rejected: missing one or more auth fields (nonce, cluster_name, timestamp, hmac)")
-		c.sendReplicationSyncError(conn, "authentication failed")
-		return
-	}
-	// Reject requests claiming to be from this node itself: replication
-	// sender → receiver is a peer-to-peer flow; a self-addressed request
-	// is either a misconfiguration or a confused attacker.
-	if c.localNode != nil && syncReq.ReaderID == c.localNode.ID {
-		c.logger.Warn().
-			Str("peer", remoteAddr).
-			Str("reader_id", syncReq.ReaderID).
-			Msg("Replication sync rejected: self-addressed request")
-		c.sendReplicationSyncError(conn, "authentication failed")
-		return
-	}
-	// Fast-path cluster name reject before HMAC compute.
-	if syncReq.ClusterName != c.cfg.ClusterName {
-		c.logger.Warn().
-			Str("peer", remoteAddr).
-			Str("reader_id", syncReq.ReaderID).
-			Str("their_cluster", syncReq.ClusterName).
-			Msg("Replication sync rejected: cluster name mismatch")
-		c.sendReplicationSyncError(conn, "authentication failed")
-		return
-	}
-	if err := security.ValidateReplicateSyncHMAC(
-		c.cfg.SharedSecret, syncReq.Nonce, syncReq.ReaderID, syncReq.ClusterName,
-		syncReq.LastKnownSequence, syncReq.SupportsBinaryEntries, syncReq.Timestamp, syncReq.HMAC, security.HMACTimestampTolerance,
-	); err != nil {
-		c.logger.Warn().
-			Err(err).
-			Str("peer", remoteAddr).
-			Str("reader_id", syncReq.ReaderID).
-			Msg("Replication sync rejected: HMAC validation failed")
-		c.sendReplicationSyncError(conn, "authentication failed")
-		return
-	}
-	// Replay check AFTER HMAC validation: don't burn a nonce-cache slot
-	// on an attacker who can't even produce a valid MAC.
-	// Fail closed on a nil cache: Track returns false when the receiver is
-	// nil, so an absent replay guard rejects rather than silently skipping
-	// the check. (The handshake validators enforce the same contract via
-	// validateWithReplay; keeping these two consistent matters because a
-	// future change that registers either handler earlier than Start() would
-	// otherwise reopen a replay hole with every test still passing.)
-	if !c.nonceCache.Track(syncReq.ReaderID, syncReq.Nonce) {
-		c.logger.Warn().
-			Str("peer", remoteAddr).
-			Str("reader_id", syncReq.ReaderID).
-			Msg("Replication sync rejected: replay (nonce already seen)")
-		c.sendReplicationSyncError(conn, "authentication failed")
-		return
-	}
-
-	c.logger.Info().
+// refuseReplicateSync answers a reader of a release before 27.01.1, which
+// still dials writers for the WAL replication stream (#888) until it is
+// upgraded: the stream is gone (#1181), so every request gets the same
+// refusal, authenticated or not, and the connection is closed. Readers get
+// their data from the registered Parquet through the file puller. The
+// refusal says the stream is gone to any dialer, authenticated or not: on
+// the cluster port, which tells no more than the node's release.
+func (c *Coordinator) refuseReplicateSync(conn net.Conn, syncReq *protocol.ReplicateSync) {
+	c.logger.Warn().
+		Str("peer", conn.RemoteAddr().String()).
 		Str("reader_id", syncReq.ReaderID).
-		Uint64("last_known_seq", syncReq.LastKnownSequence).
-		Msg("Received authenticated replication sync request")
-
-	// Check if we have a replication sender (we're a writer with replication enabled)
-	c.mu.RLock()
-	sender := c.replicationSender
-	c.mu.RUnlock()
-
-	if sender == nil {
-		// Not a writer or replication not enabled
-		c.logger.Warn().
-			Str("reader_id", syncReq.ReaderID).
-			Msg("Replication sync rejected: not a writer or replication not enabled")
-
-		syncAck := &protocol.ReplicateSyncAck{
-			CurrentSequence: 0,
-			CanResume:       false,
-			Error:           "this node is not configured as a writer with replication enabled",
-		}
-		protocol.SendMessage(conn, &protocol.Message{
-			Type:    protocol.MsgReplicateSyncAck,
-			Payload: syncAck,
-		}, 5*time.Second)
-		return
-	}
-
-	// Convert protocol types to replication types and accept the reader.
-	// Carry the handshake nonce through so the sender can derive the
-	// same HKDF session key the receiver derived (GHSA-wfgr-8x84-22q7).
-	replSyncReq := &replication.ReplicateSync{
-		ReaderID:              syncReq.ReaderID,
-		LastKnownSequence:     syncReq.LastKnownSequence,
-		HandshakeNonce:        syncReq.Nonce,
-		SupportsBinaryEntries: syncReq.SupportsBinaryEntries,
-	}
-
-	if err := c.AcceptReplicationConnection(conn, replSyncReq); err != nil {
-		c.logger.Error().
-			Err(err).
-			Str("reader_id", syncReq.ReaderID).
-			Msg("Failed to accept replication connection")
-		// Connection was already handled by AcceptReplicationConnection
-	}
-	// NOTE: Connection is now owned by the sender, don't close it
+		Msg("Replication sync rejected: this release has no WAL replication stream; upgrade the reader")
+	c.sendReplicationSyncError(conn, "this release has no WAL replication stream")
 }
 
 // handleFetchFile serves a peer-replication file fetch request. The caller
@@ -2528,8 +2520,8 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 //  7. On any error before or during the ack, send {status=error, error=...}.
 //
 // This handler does NOT honor the 10-second read timeout from the dispatch
-// loop — it holds the connection open for the duration of the body stream,
-// same as MsgReplicateSync. The puller on the other side uses its own
+// loop — it holds the connection open for the duration of the body stream.
+// The puller on the other side uses its own
 // per-fetch timeout (cluster.replication_fetch_timeout_ms).
 func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequest) {
 	defer conn.Close()
@@ -2588,6 +2580,15 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		return
 	}
 	entry, ok := fsm.GetFile(sanitized)
+	if !ok {
+		// A staged compaction output (#1207 d2a2a): served only while its
+		// job is staged, from the key the FSM entry names, with the
+		// output's checksum and size.
+		if st, staged := fsm.StagedCompactionByKey(sanitized); staged {
+			sanitized = raft.StagedCompactionKey(st.Job, st.Output.Path)
+			entry, ok = &raft.FileEntry{Path: sanitized, SHA256: st.Output.SHA256, SizeBytes: st.Output.SizeBytes}, true
+		}
+	}
 	if !ok {
 		c.logger.Debug().
 			Str("peer", remoteAddr).
@@ -2747,12 +2748,8 @@ func (c *Coordinator) sendFetchError(conn net.Conn, code protocol.AckErrorCode, 
 	}
 }
 
-// sendReplicationSyncError writes a uniform ReplicateSyncAck error
-// response on the connection and closes it. Used by handleReplicateSync
-// for every rejection path (missing/bad HMAC, self-addressed, wrong
-// cluster name, replay, shared secret unconfigured) so an attacker
-// cannot probe to distinguish rejection reasons. See
-// GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
+// sendReplicationSyncError writes a ReplicateSyncAck refusal on the
+// connection and closes it (refuseReplicateSync).
 func (c *Coordinator) sendReplicationSyncError(conn net.Conn, reason string) {
 	ack := &protocol.ReplicateSyncAck{
 		CurrentSequence: 0,
@@ -3006,6 +3003,9 @@ func (c *Coordinator) Status() map[string]interface{} {
 			"version":        node.Version,
 			"last_heartbeat": node.GetLastHeartbeat(),
 			"stats":          node.GetStats(),
+			// This node's view of the writer state (#1267: a view that had
+			// lost it was invisible).
+			"writer_state": node.GetWriterState(),
 			// Which node holds the compactor lease was previously visible
 			// only in a log line emitted once, at assignment time. An
 			// operator asking "why is my dedicated compactor idle?" had
@@ -3030,6 +3030,16 @@ func (c *Coordinator) Status() map[string]interface{} {
 	}
 	if puller != nil {
 		status["replication_catchup_status"] = puller.CatchUpStatus()
+		// How the walks judge a same-size local copy (#1182): by what this
+		// node recorded it holds, or by its size alone when that record is
+		// not kept (tracking failed or not open yet).
+		if c.staleLocalEnabled() {
+			trust := "size_only"
+			if seen := c.stale.seen.Load(); seen != nil && seen.err() == nil {
+				trust = "recorded"
+			}
+			status["local_copy_trust"] = trust
+		}
 	}
 
 	// The compactor lease, and specifically whether it sits on a node that
@@ -3042,6 +3052,15 @@ func (c *Coordinator) Status() map[string]interface{} {
 	}
 	status["active_compactor"] = leaseStatus
 
+	// The designated primary writer and this node's failover manager: the
+	// manager acts only on the Raft leader, so read this there (#1267).
+	if c.writerFailoverMgr != nil {
+		if c.raftFSM != nil {
+			status["primary_writer_id"] = c.raftFSM.GetPrimaryWriterID()
+		}
+		status["writer_failover"] = c.writerFailoverMgr.Stats()
+	}
+
 	// The cluster-wide compaction pause a restore takes (#1087): who holds
 	// it, until when, and which nodes have acknowledged it.
 	if c.raftFSM != nil {
@@ -3051,6 +3070,12 @@ func (c *Coordinator) Status() map[string]interface{} {
 	// which nodes keep them off.
 	if c.raftNode != nil {
 		status["stream_claims"] = c.StreamClaimsStatus()
+		status["compaction_commit"] = c.CompactionCommitStatus()
+		status["cluster_policies"] = c.ClusterPoliciesStatus()
+	}
+	// The stale-local sweep's last pass (#1071), where it runs.
+	if st := c.StaleLocalStatus(); st != nil {
+		status["stale_local"] = st
 	}
 
 	// Add Raft status if configured (Phase 3)
@@ -3755,6 +3780,27 @@ func (c *Coordinator) checkConvergeSafety(voters, planned []string, allowSingleV
 	return remaining, nil
 }
 
+// SetLeaveGate makes Stop broadcast the leave only when gate allows it: the
+// registration outbox's CoverForLeave (#1214).
+func (c *Coordinator) SetLeaveGate(gate func() bool) {
+	if gate == nil {
+		c.leaveGate.Store(nil)
+		return
+	}
+	c.leaveGate.Store(&gate)
+}
+
+// ResolveNodeID is the node ID a coordinator configured with cluster.node_id
+// = configured runs under: configured, or generateNodeID's when it is empty.
+// For what must be keyed by the node ID before the coordinator exists (the
+// registration outbox's published pending list, #1214).
+func ResolveNodeID(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return generateNodeID()
+}
+
 // generateNodeID generates a unique node ID with sufficient entropy.
 // Uses 8 bytes (64 bits) of randomness plus timestamp for collision resistance.
 func generateNodeID() string {
@@ -4032,11 +4078,28 @@ func (c *Coordinator) onRaftNodeUpdated(n *raft.NodeInfo) {
 	c.registry.Register(node)
 }
 
+// knownWriterState is the writer state this node knows for id: the FSM's
+// record of the node, which the registry's is derived from and so is never
+// behind, else the registry entry's (#1267). The join can race the replay
+// callbacks either way; the next promotion callback corrects the registry.
+func (c *Coordinator) knownWriterState(id string) WriterState {
+	if c.raftFSM != nil {
+		if n, ok := c.raftFSM.GetNode(id); ok && n != nil && n.WriterState != "" {
+			return WriterState(n.WriterState)
+		}
+	}
+	if existing, ok := c.registry.Get(id); ok {
+		return existing.GetWriterState()
+	}
+	return WriterStateNone
+}
+
 // onWriterPromoted is called when the FSM promotes a new primary writer.
 // It updates the local registry to reflect the new writer states.
 func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
-	// Demote old primary in registry
-	if oldPrimaryID != "" {
+	// Demote old primary in registry. Not when the same node is promoted
+	// again: that would flip it to standby and back (#1267).
+	if oldPrimaryID != "" && oldPrimaryID != newPrimaryID {
 		if oldNode, exists := c.registry.Get(oldPrimaryID); exists {
 			oldNode.SetWriterState(WriterStateStandby)
 			c.registry.Register(oldNode)
@@ -4057,10 +4120,6 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 		Str("old_primary", oldPrimaryID).
 		Msg("Writer promotion applied to registry")
 
-	// The set of writers with live entries to stream just changed. Ask the
-	// replication target loop to re-point. No-op on a writer, which runs a
-	// Sender and no loop.
-	c.pokeReplicationRetarget()
 }
 
 // onWriterDemoted is the FSM callback fired when a CommandDemoteWriter is
@@ -4084,19 +4143,6 @@ func (c *Coordinator) onWriterDemoted(nodeID string) {
 	c.logger.Info().
 		Str("node_id", nodeID).
 		Msg("Writer demotion applied to registry")
-
-	// Demotion is its own trigger, not just the other half of a promotion:
-	// HandOver with no eligible candidate issues DemoteWriter alone, and with
-	// automatic failover off the cluster can then sit with no primary at all.
-	// A replica attached to the node just demoted has to re-evaluate, and only
-	// this callback tells it to.
-	//
-	// Note what it re-evaluates TO in that state: applyDemoteWriter clears the
-	// FSM's primary record, so no node is designated, every writer accepts
-	// again, and the replica settles on the deterministic fallback. That is the
-	// intended outcome — with no primary there is no better answer — not the
-	// accept-side check failing to bite.
-	c.pokeReplicationRetarget()
 }
 
 // onCompactorAssigned is the FSM callback fired when a CommandAssignCompactor
@@ -4152,6 +4198,13 @@ func (c *Coordinator) GetActiveCompactorID() string {
 	return c.raftFSM.GetActiveCompactorID()
 }
 
+// HasCompactorFailover reports whether this node runs the compactor failover
+// manager. Without it nothing assigns a first compactor lease or moves one
+// off a failed node; a lease already in the FSM stays where it is.
+func (c *Coordinator) HasCompactorFailover() bool {
+	return c.compactorFailoverMgr != nil
+}
+
 // CompactorPreemptCooldown reports how long an operator assignment of the
 // compactor lease suppresses automatic preemption. Zero when this cluster has
 // no compactor failover manager, in which case nothing preempts anyway.
@@ -4165,24 +4218,6 @@ func (c *Coordinator) CompactorPreemptCooldown() time.Duration {
 // GetRouter returns the request router.
 func (c *Coordinator) GetRouter() *Router {
 	return c.router
-}
-
-// SetWAL sets the WAL writer reference for replication.
-// This should be called after the WAL is created but before Start().
-func (c *Coordinator) SetWAL(walWriter *wal.Writer) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.walWriter = walWriter
-}
-
-// SetIngestBuffer sets the ArrowBuffer for reader nodes to apply replicated
-// entries. This enables query freshness — readers can query unflushed writer
-// data that arrives via WAL replication.
-func (c *Coordinator) SetIngestBuffer(buffer *ingest.ArrowBuffer) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.ingestBuffer = buffer
-	c.logger.Info().Msg("Ingest buffer set for replication — readers will apply replicated entries")
 }
 
 // SetStorageBackend sets the local storage backend reference. It is required
@@ -4297,6 +4332,9 @@ func (c *Coordinator) startFilePullerLocked() error {
 		CatchUpQueueHighWater:   c.cfg.ReplicationCatchUpQueueHighWater,
 		ReconciliationInterval:  time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
 		ReconciliationGate:      c.canRunFileReconciliation,
+		// A committed compaction output this node holds staged is moved
+		// into place instead of pulled (#1207 d2a2a).
+		AdoptStaged: c.adoptStagedForPull,
 		// Lets the puller stop pulling, and stop counting against the query
 		// gate, an entry that left the manifest while its pull was queued or
 		// in flight (#759, #795), while also identifying superseding versions.
@@ -4316,7 +4354,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// to exist before the thing it reports to does.
 		RecordPulledFile:    c.recordPulledFileInTiering,
 		RecordAbandonedFile: c.recordAbandonedFileInTiering,
-		Logger:              c.logger,
+		ObserveListed:       c.observeListed,
+		// What each local copy holds (#1182): recorded after a pull or a
+		// hash, so a restart never trusts a stale same-size copy.
+		LocalStamp:    c.localStampFor,
+		RecordContent: c.recordLocalContent,
+		Logger:        c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
@@ -4357,6 +4400,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		return true, puller.EnqueueVerifyContent(entry)
 	}
 	c.startDeleteWorkers()
+	c.startStaleLocalLocked()
 
 	// CONTRACT for every FSM callback (#797, #813): they run synchronously
 	// on the Raft apply goroutine. Since #813 neither Coordinator.Stop nor
@@ -4377,9 +4421,11 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// FSM apply goroutine is on the Raft hot path. Enqueue is non-blocking
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
+		c.noteLocalRegistered(entry.Path)
 	}
 	onContentChanged := func(entry *raft.FileEntry) {
 		puller.EnqueueContentChanged(entry)
+		c.noteLocalRegistered(entry.Path)
 	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
@@ -4426,6 +4472,20 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// Start the puller workers.
 	puller.Start(context.Background())
 	c.puller = puller
+	c.fetcher = fetchClient
+	// The staged compaction commit (#1207 d2a2a), once the puller and the
+	// fetch client it uses are in place: pull staged outputs, move committed
+	// ones into place, sweep leftovers; abort orphans as leader. This node
+	// holds staged outputs from here on, and says so at its join.
+	if c.storage.Type() == "local" {
+		fsm.SetCompactionCallbacks(c.onCompactionStaged, c.onCompactionGone, c.onCompactionCommitted)
+		go c.stagedReplicaLoop(c.ctx)
+		c.staged.replicaReady.Store(true)
+		go c.stagedLeaderLoop(c.ctx)
+	}
+	if backend.Type() == "local" {
+		go c.vanishedSweepLoop(c.ctx)
+	}
 
 	c.logger.Info().
 		Int("workers", pullerCfg.Workers).
@@ -4534,6 +4594,9 @@ func (c *Coordinator) runCatchUpOnce() {
 		// stable for the lifetime of the node — hashicorp/raft never
 		// replaces the FSM instance once set. The nil guard above ensures
 		// the capture is safe even if the puller outlives the coordinator.
+		// The walk judges each local copy by the journal of what it holds
+		// (#1182): never walk before it is open.
+		c.waitStaleLocalOpen(ctx)
 		puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
 			return fsm.GetFilesPaginated(cursor, limit)
 		})
@@ -4602,6 +4665,10 @@ func (c *Coordinator) waitForManifestSync(ctx context.Context, raftNode *raft.No
 			break
 		}
 		var rejected *ForwardRejectedError
+		if errors.As(lastErr, &rejected) && rejected.Code == protocol.ForwardCodeInvalidCommand {
+			// A leader that does not know the command at all.
+			return fmt.Errorf("follower barrier not accepted by the leader: %w: %w", raft.ErrBarrierUnsupported, lastErr)
+		}
 		if errors.As(lastErr, &rejected) && rejected.Code != protocol.ForwardCodeApplyFailed {
 			return fmt.Errorf("follower barrier not accepted by the leader: %w", lastErr)
 		}
@@ -4684,109 +4751,6 @@ func (c *Coordinator) ReplicationReady() bool {
 	return puller.FullyCaughtUp()
 }
 
-// StartReplication is where the live WAL replication stream would start. It
-// starts nothing, on every role (#888).
-//
-// The stream reached only readers and compactors, which applied what they
-// received to their own ingest buffer and flushed it to their own Parquet.
-// Queries read every file in storage, so that copy was read alongside the one
-// the node pulled from the primary through the manifest: every replicated row
-// came back twice. A compactor could also register its copy, so every node
-// pulled it and the duplicates were cluster-wide. Neither role can be promoted,
-// so the stream gave failover nothing in exchange.
-//
-// Readers and compactors get their data from the primary's registered Parquet
-// through the file puller, which cluster.replication_enabled still starts in
-// Start. The stream comes back for standby writers only, holding the live
-// window for failover without materialising it (#1207). Until then nothing
-// sends: a not-yet-upgraded reader that still dials in is refused by
-// handleReplicateSync, and by AcceptReplicationConnection behind it, because
-// replicationSender is nil.
-func (c *Coordinator) StartReplication() error {
-	if !c.cfg.ReplicationEnabled {
-		c.logger.Debug().Msg("WAL replication is disabled")
-		return nil
-	}
-	c.logger.Info().Msg("WAL replication stream not started: readers and compactors read registered Parquet from the primary, and the standby-writer stream is not available yet")
-	return nil
-}
-
-// startWALReplicationStream is the stream StartReplication used to start:
-// a Sender on writers, a receiver target loop on every other role.
-//
-// Dormant (#888). Kept for #1207, which reuses the Sender and the
-// primary-tracking target loop for standby writers. That reuse must NOT keep the
-// receiver's ingest handler (buildReplicationIngestHandler): applying received
-// entries to the ArrowBuffer is what materialised the duplicate copy.
-func (c *Coordinator) startWALReplicationStream() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// c.ctx is initialized in Start() — we must NOT overwrite it here,
-	// otherwise handleFetchFile and other goroutines using the original
-	// context would end up with an orphan parent. StartReplication runs
-	// after Start so c.ctx is guaranteed non-nil.
-	if c.ctx == nil {
-		// Defensive: if a caller somehow invokes StartReplication without
-		// Start having run first, fall back to a fresh context so we
-		// don't crash on a nil parent.
-		c.ctx, c.cancel = context.WithCancel(context.Background())
-	}
-
-	if c.localNode.Role == RoleWriter || c.localNode.Role == RoleStandalone {
-		// Writer: start sender to stream entries to readers.
-		// Plumb the cluster shared secret + identity into the sender
-		// for stream authentication (GHSA-wfgr-8x84-22q7). Without
-		// SharedSecret the sender refuses every reader at AcceptReader
-		// time, matching the refuse-when-unconfigured posture of
-		// handleReplicateSync.
-		c.replicationSender = replication.NewSender(&replication.SenderConfig{
-			BufferSize:   c.cfg.ReplicationBufferSize,
-			WriteTimeout: 5 * time.Second,
-			Logger:       c.logger,
-			SharedSecret: c.cfg.SharedSecret,
-			ClusterName:  c.cfg.ClusterName,
-			LocalNodeID:  c.localNode.ID,
-		})
-
-		if err := c.replicationSender.Start(c.ctx); err != nil {
-			return fmt.Errorf("failed to start replication sender: %w", err)
-		}
-
-		// Hook into WAL if available
-		if c.walWriter != nil {
-			c.walWriter.SetReplicationHook(func(entry *wal.ReplicationEntry) {
-				c.replicationSender.Replicate(&replication.ReplicateEntry{
-					Sequence:    entry.Sequence,
-					TimestampUS: entry.TimestampUS,
-					Payload:     entry.Payload,
-				})
-			})
-			c.logger.Info().Msg("WAL replication hook installed")
-		}
-
-		c.logger.Info().
-			Int("buffer_size", c.cfg.ReplicationBufferSize).
-			Msg("Replication sender started (writer mode)")
-
-	} else {
-		// Reader/compactor: replicationTargetLoop owns the receiver's entire
-		// lifecycle. It attaches on its first pass and re-points whenever the
-		// cluster's primary writer changes.
-		//
-		// Making it the single owner is what keeps the invariant simple: one
-		// goroutine decides the target, stops the old receiver and installs
-		// the new one, so "two live receivers" is not a state the code can
-		// reach. The previous shape — an inline start here, or a
-		// wait-for-a-writer goroutine when no writer was visible yet — was not
-		// racy, because the two were mutually exclusive and neither ever
-		// re-targeted. It simply had nowhere to put a re-target.
-		go c.replicationTargetLoop()
-	}
-
-	return nil
-}
-
 // designatedPrimaryWriterID returns the primary writer the CLUSTER has on
 // record, or "" when none has ever been designated.
 //
@@ -4804,635 +4768,6 @@ func (c *Coordinator) designatedPrimaryWriterID() string {
 		return ""
 	}
 	return fsm.GetPrimaryWriterID()
-}
-
-// findWriterAddr returns the coordinator address of the writer this node should
-// replicate from.
-//
-// The designated primary is preferred. In local-storage mode (Pattern 1) only
-// the primary ingests, so a standby writer's Sender has nothing to stream:
-// attaching to one means receiving no live entries at all, which is #885. The
-// old implementation ranged the registry map and took the first healthy writer,
-// so with the three-writer default it picked a standby roughly two times in
-// three.
-//
-// The primary is identified from the FSM's durable record, NOT from
-// Registry.GetPrimaryWriter. That is deliberate, and it is the same
-// discriminator AcceptReplicationConnection uses on the writer side. The
-// registry's view filters on health, so it goes nil the moment the primary
-// looks unhealthy; the FSM's keeps naming whoever was promoted until something
-// demotes them. If the two sides disagreed, a replica whose registry had gone
-// nil would fall back to some other writer — whose FSM still names the old
-// primary, and which therefore refuses it. Replication would be dark for the
-// whole failover window, and permanently on a cluster whose automatic failover
-// is off. Reading the same record on both sides makes that disagreement
-// impossible rather than unlikely.
-//
-// Attaching to a designated primary that is currently unhealthy is the right
-// behaviour, not a bug: there is nowhere else with live entries to get, the
-// dial simply fails and retries, and a promotion re-targets us.
-//
-// The fallback covers the states where no primary is designated at all:
-// Pattern 2, where none ever is, and Pattern 1 before its first election. It is
-// ordered by node ID rather than by map iteration so that repeated calls return
-// the same answer — the target loop compares its choice against the live
-// receiver's address, and a fallback that reshuffled would tear down a working
-// stream on most ticks.
-func (c *Coordinator) findWriterAddr() string {
-	// The self-check is load-bearing for the same reason it always was: a node
-	// must never be handed its own address to dial. Unreachable today, since
-	// writers take the Sender branch in StartReplication, but a future role
-	// change would otherwise make this a self-connect loop.
-	if designated := c.designatedPrimaryWriterID(); designated != "" && designated != c.localNode.ID {
-		if node, ok := c.registry.Get(designated); ok && node.Address != "" {
-			return node.Address
-		}
-		// The registry does not have it. A primary that merely goes unhealthy
-		// stays in the registry, but one that is removed — an eviction, or a
-		// restart this node has not re-discovered yet — is gone from it while
-		// the FSM still designates it. Resolve the address from the FSM, which
-		// is where the designation came from and which keeps the record.
-		//
-		// Falling through to the fallback here is NOT an option: every writer
-		// checks this same designation before accepting, so any other writer
-		// refuses us, and we would reconnect into that refusal every interval.
-		// Observed on a live cluster before this branch existed — a reader that
-		// lost its primary hammered a standby with a rejected handshake every
-		// five seconds while the primary was up and serving.
-		if c.raftNode != nil {
-			if fsm := c.raftNode.FSM(); fsm != nil {
-				if info, ok := fsm.GetNode(designated); ok && info.Address != "" {
-					return info.Address
-				}
-			}
-		}
-		// Designated but unresolvable anywhere. There is no other node with
-		// live entries to stream, so hold rather than attach somewhere that
-		// will refuse.
-		c.logger.Debug().
-			Str("designated_primary", designated).
-			Msg("Designated primary writer has no known address; holding the current replication target")
-		return ""
-	}
-
-	var fallback *Node
-	for _, node := range c.registry.GetByRole(RoleWriter) {
-		if node.State != StateHealthy || node.ID == c.localNode.ID {
-			continue
-		}
-		if fallback == nil || node.ID < fallback.ID {
-			fallback = node
-		}
-	}
-	if fallback != nil {
-		return fallback.Address
-	}
-	return ""
-}
-
-// replicationRetargetInterval is how often a replica re-checks that it is still
-// streaming from the cluster's designated primary writer.
-//
-// The promotion and demotion callbacks cover hand-overs that happen while this
-// node is already attached. The ticker covers the case they cannot: a replica
-// joining a cluster that elected its primary BEFORE it joined never sees a
-// promotion event, and the join response carries no WriterState (see
-// protocol.NodeInfo), so its first selection necessarily falls back to an
-// arbitrary writer. Pod restarts outnumber live hand-overs, which makes this
-// ticker the load-bearing trigger rather than the backstop it looks like.
-//
-// Five seconds, matching the interval the old wait-for-a-writer loop polled at,
-// so a replica that starts before any writer is registered attaches as quickly
-// as it used to. A tick is a registry read and a string compare, so the rate
-// costs nothing; what makes it safe to run this often is that findWriterAddr is
-// deterministic, and a re-target therefore happens only when the answer has
-// genuinely changed.
-const replicationRetargetInterval = 5 * time.Second
-
-// replicationTargetLoop owns the replication receiver on a reader or compactor:
-// it attaches to a writer and re-points when the cluster's primary changes.
-//
-// Single owner by construction. Every trigger — both FSM callbacks and the
-// ticker — is a non-blocking poke on the depth-1 replicationRetarget channel,
-// so a burst of promotions coalesces into one re-evaluation instead of racing
-// several receiver swaps against each other.
-func (c *Coordinator) replicationTargetLoop() {
-	// Snapshot the context under the lock. StartReplication may have
-	// installed it moments ago, and it is never replaced afterwards.
-	c.mu.RLock()
-	ctx := c.ctx
-	c.mu.RUnlock()
-	if ctx == nil {
-		// Unreachable in production: Start() sets c.ctx, and StartReplication
-		// holds c.mu across the `go` that launches this. A coordinator built
-		// by a test without Start would otherwise leak this goroutine forever,
-		// so bail rather than substitute a context that never cancels.
-		c.logger.Warn().Msg("Replication target loop started without a coordinator context; not running")
-		return
-	}
-
-	ticker := time.NewTicker(replicationRetargetInterval)
-	defer ticker.Stop()
-
-	for {
-		c.reevaluateReplicationTarget(ctx)
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		case <-c.replicationRetarget:
-		}
-	}
-}
-
-// pokeReplicationRetarget asks replicationTargetLoop to re-evaluate which
-// writer this node should stream from.
-//
-// Safe to call from an FSM callback: it takes no lock, touches no raft node and
-// never blocks, which is what the registry-only callback contract (#797, #813)
-// requires of anything running on the Raft Apply goroutine. A poke dropped
-// because one is already pending loses nothing — the pending evaluation reads
-// the same latest registry state. A nil channel (a Coordinator built by a test
-// without NewCoordinator) is never ready, so this takes the default and is a
-// no-op rather than a block.
-func (c *Coordinator) pokeReplicationRetarget() {
-	select {
-	case c.replicationRetarget <- struct{}{}:
-	default:
-	}
-}
-
-// reevaluateReplicationTarget points the receiver at the writer this node
-// should be streaming from, replacing the current receiver when it is attached
-// somewhere else.
-func (c *Coordinator) reevaluateReplicationTarget(ctx context.Context) {
-	want := c.findWriterAddr()
-	if want == "" {
-		// Keep whatever we have. A writer that just went unhealthy is usually
-		// about to come back or be replaced, and tearing down a live stream to
-		// attach to nothing helps no one.
-		c.logger.Debug().Msg("No writer available for replication; keeping the current target")
-		return
-	}
-
-	c.mu.RLock()
-	current := c.replicationReceiver
-	c.mu.RUnlock()
-
-	if current != nil && current.WriterAddr() == want {
-		return
-	}
-
-	// Stop the old receiver OUTSIDE c.mu.
-	//
-	// receiveLoop can be parked inside applyEntry -> the replication ingest
-	// handler -> c.mu.RLock(). Receiver.Stop() waits for that goroutine, so
-	// holding c.mu.Lock() across it blocks the RLock the receiver is waiting
-	// on and deadlocks the process. That is the #813/#853 shape that
-	// stop_lock_seam_test.go exists to keep out.
-	//
-	// Note this replaces the Receiver rather than re-pointing the existing one.
-	// The sequence space is per-writer-process, so a receiver carrying its old
-	// high-water mark into a new writer's space rejects every entry that writer
-	// sends (#887). A fresh Receiver starts at zero, which is the only safe
-	// state to meet an unrelated sequence space in.
-	if current != nil {
-		c.logger.Info().
-			Str("from", current.WriterAddr()).
-			Str("to", want).
-			Msg("Re-targeting WAL replication to a new writer")
-		if err := current.Stop(); err != nil {
-			c.logger.Warn().Err(err).Msg("Error stopping the previous replication receiver")
-		}
-	}
-
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// What makes it safe to install a receiver after releasing the lock is not
-	// this pointer comparison — neither Stop() nor StopReplication() ever
-	// writes c.replicationReceiver (stopReplicationSubsystems says so
-	// explicitly: "The fields are deliberately NOT cleared"), so the comparison
-	// cannot fail. It is that Stop() and StopReplication() call c.cancel()
-	// while holding c.mu, so by the time we hold it a shutdown that started
-	// has already cancelled c.ctx and the receiver created below would be
-	// born cancelled; and that StopReplicationReceiver — the shutdown hook
-	// that stops the receiver WITHOUT cancelling ctx, because the coordinator
-	// must keep serving manifest applies after it — sets
-	// replicationReceiverStopped under c.mu, which is checked here. The
-	// comparison stays as a cheap assertion of the single-owner invariant.
-	if c.replicationReceiverStopped || c.replicationReceiver != current {
-		return
-	}
-	c.replicationReceiver = nil
-	if err := c.startReceiverWithAddr(want); err != nil {
-		// startReceiverWithAddr publishes c.replicationReceiver before it
-		// starts, so on error we clear it again: leaving a non-started
-		// receiver whose WriterAddr() already equals `want` would make every
-		// later pass short-circuit as "already attached" and never retry.
-		c.replicationReceiver = nil
-		c.logger.Error().Err(err).
-			Str("writer_addr", want).
-			Msg("Failed to start replication receiver; will retry on the next pass")
-	}
-}
-
-// startReceiverWithAddr starts the replication receiver with the given writer address.
-// Caller must hold c.mu lock.
-func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
-	// Build IngestHandler if ArrowBuffer is available — allows reader to
-	// apply replicated entries to its local buffer for query freshness.
-	var ingestHandler replication.IngestHandler
-	if c.ingestBuffer != nil {
-		ingestHandler = c.buildReplicationIngestHandler()
-	}
-
-	// Stream-auth wiring (GHSA-wfgr-8x84-22q7): the receiver computes
-	// the handshake HMAC from SharedSecret + ClusterName + ReaderID
-	// and derives the per-connection session key for tag verification.
-	// Without SharedSecret the receiver refuses to dial.
-	//
-	// Asymmetry vs. sender wiring: the sender takes a distinct
-	// LocalNodeID because it signs MsgReplicateCheckpoint as the
-	// originating node ID. The receiver's identity in both the
-	// handshake HMAC and per-entry derivation is ReaderID, which is
-	// the same c.localNode.ID — so we do NOT plumb a separate
-	// LocalNodeID field here.
-	c.replicationReceiver = replication.NewReceiver(&replication.ReceiverConfig{
-		ReaderID:          c.localNode.ID,
-		WriterAddr:        writerAddr,
-		LocalWAL:          c.walWriter,
-		IngestHandler:     ingestHandler,
-		ReconnectInterval: 5 * time.Second,
-		AckInterval:       time.Duration(c.cfg.ReplicationAckInterval) * time.Millisecond,
-		Logger:            c.logger,
-		TLSConfig:         c.tlsConfig,
-		SharedSecret:      c.cfg.SharedSecret,
-		ClusterName:       c.cfg.ClusterName,
-	})
-
-	if err := c.replicationReceiver.Start(c.ctx); err != nil {
-		return fmt.Errorf("failed to start replication receiver: %w", err)
-	}
-
-	c.logger.Info().
-		Str("writer_addr", writerAddr).
-		Bool("ingest_handler", ingestHandler != nil).
-		Msg("Replication receiver started (reader mode)")
-
-	return nil
-}
-
-// buildReplicationIngestHandler prepares independently flushable writes before
-// the receiver appends local WAL. It applies received entries to the ArrowBuffer,
-// which flushes them to this node's own Parquet: that is the duplicate copy of
-// #888, so a standby-writer receiver (#1207) must not use it. Each local identity then belongs to one buffer;
-// ignored payloads mint no identity and multi-measurement rows are split first.
-func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler {
-	return replication.PreparingIngestHandlerFunc(func(_ context.Context, payload []byte) ([]replication.PreparedWALIngest, error) {
-		// Safety: read-lock to avoid data race with SetIngestBuffer
-		c.mu.RLock()
-		buf := c.ingestBuffer
-		c.mu.RUnlock()
-		if buf == nil {
-			return nil, nil
-		}
-
-		// Parse WAL envelope to extract database name and msgpack payload
-		database, msgpackData := wal.ParseEnvelope(payload, "default")
-		part := func(localPayload []byte, measurement string, columns map[string][]interface{}) replication.PreparedWALIngest {
-			return replication.PreparedWALIngest{Payload: localPayload,
-				Apply: func(ctx context.Context, hashes []string) error {
-					return buf.WriteColumnarDirectNoWALWithHashes(ctx, database, measurement, columns, hashes)
-				}}
-		}
-
-		// Try columnar format first (map with "m" + "columns" keys)
-		var rawMap map[string]interface{}
-		if err := msgpack.Unmarshal(msgpackData, &rawMap); err == nil {
-			if measurement, ok := wal.MeasurementName(rawMap["m"]); ok && measurement != "" {
-				if columns, ok := rawMap["columns"].(map[string]interface{}); ok && len(columns) > 0 {
-					typedColumns := make(map[string][]interface{}, len(columns))
-					for k, v := range columns {
-						if arr, ok := v.([]interface{}); ok {
-							typedColumns[k] = arr
-						}
-					}
-					if len(typedColumns) > 0 {
-						return []replication.PreparedWALIngest{part(payload, measurement, typedColumns)}, nil
-					}
-				}
-			}
-		}
-
-		// Fall back to row format (array of maps)
-		var records []map[string]interface{}
-		if err := msgpack.Unmarshal(msgpackData, &records); err == nil && len(records) > 0 {
-			byMeasurement := make(map[string][]map[string]interface{})
-			for _, r := range records {
-				m, _ := r["_measurement"].(string)
-				if m == "" {
-					m, _ = r["measurement"].(string)
-				}
-				if m == "" {
-					m, _ = r["m"].(string)
-				}
-				if m != "" {
-					byMeasurement[m] = append(byMeasurement[m], r)
-				}
-			}
-			measurements := make([]string, 0, len(byMeasurement))
-			for measurement := range byMeasurement {
-				measurements = append(measurements, measurement)
-			}
-			sort.Strings(measurements)
-			parts := make([]replication.PreparedWALIngest, 0, len(measurements))
-			for _, measurement := range measurements {
-				rows := byMeasurement[measurement]
-				columns := rowsToColumns(rows)
-				if len(columns) > 0 {
-					localPayload := payload
-					if len(rows) != len(records) {
-						encoded, err := msgpack.Marshal(map[string]interface{}{"m": measurement, "columns": columns})
-						if err != nil {
-							return nil, fmt.Errorf("prepare replicated rows for %s: %w", measurement, err)
-						}
-						// Preserve the database envelope. Columnar recovery carries
-						// that database explicitly, without relying on row metadata.
-						// The normal single-measurement path reuses its bytes.
-						prefix := payload[:len(payload)-len(msgpackData)]
-						localPayload = append(append(make([]byte, 0, len(prefix)+len(encoded)), prefix...), encoded...)
-					}
-					parts = append(parts, part(localPayload, measurement, columns))
-				}
-			}
-			return parts, nil
-		}
-
-		c.logger.Warn().Int("payload_size", len(payload)).Msg("Skipped unrecognized replicated entry format; its rows are not applied on this node")
-		return nil, nil
-	})
-}
-
-// rowsToColumns converts row-format records to columnar format for ArrowBuffer.
-// Metadata keys (_measurement, measurement, m, _database, database) are filtered
-// out to prevent them from being ingested as regular data columns.
-func rowsToColumns(rows []map[string]interface{}) map[string][]interface{} {
-	if len(rows) == 0 {
-		return map[string][]interface{}{}
-	}
-	columns := make(map[string][]interface{})
-	for i, r := range rows {
-		for k, v := range r {
-			if k == "measurement" || k == "m" || k == "_measurement" || k == "database" || k == "_database" {
-				continue
-			}
-			if _, ok := columns[k]; !ok {
-				columns[k] = make([]interface{}, len(rows))
-			}
-			columns[k][i] = v
-		}
-	}
-	return columns
-}
-
-// StopReplication stops WAL replication.
-// replicationStopTimeout bounds how long shutdown waits for the replication
-// receiver. Its connect path does not observe the context, so a Stop that
-// races a dial can otherwise wait for the protocol's own timeouts — the kind
-// of shutdown stall #813 existed to remove.
-const replicationStopTimeout = 5 * time.Second
-
-func (c *Coordinator) StopReplication() {
-	// The joins happen OUTSIDE c.mu. The receiver's goroutines apply entries
-	// through the ingest handler, which takes c.mu.RLock, so joining them
-	// under the write lock deadlocks — the shape #813 removed from Stop.
-	c.mu.Lock()
-	if c.cancel != nil {
-		c.cancel()
-	}
-	sender := c.replicationSender
-	receiver := c.replicationReceiver
-	c.mu.Unlock()
-
-	c.stopReplicationSubsystems(sender, receiver)
-}
-
-// StopReplicationReceiver stops the inbound WAL replication stream and
-// nothing else: no sender, no Raft, and the coordinator context stays live
-// so manifest applies still go through. On a reader the receiver applies
-// entries through the ingest handler, so it must be gone before the Arrow
-// buffer and WAL close (#853); the coordinator as a whole must outlive them,
-// so the final flush can still be registered in the manifest (#1014). The
-// shutdown sequence in cmd/arc calls this from a hook and Stop later as a
-// component; Stop finds the receiver already stopped.
-func (c *Coordinator) StopReplicationReceiver() {
-	c.mu.Lock()
-	c.replicationReceiverStopped = true
-	receiver := c.replicationReceiver
-	c.mu.Unlock()
-	c.stopReplicationReceiver(receiver)
-}
-
-// stopReplicationSubsystems stops the sender and receiver without holding
-// c.mu. The fields are deliberately NOT cleared: the WAL replication hook
-// closes over the coordinator and calls Replicate for every appended entry,
-// so a nil field would be dereferenced by any write still in flight. A
-// stopped sender already refuses the work.
-func (c *Coordinator) stopReplicationSubsystems(sender *replication.Sender, receiver *replication.Receiver) {
-	// Unhook the WAL first, so nothing new is handed to a sender that is on
-	// its way down.
-	if c.walWriter != nil {
-		c.walWriter.SetReplicationHook(nil)
-	}
-	if sender != nil {
-		if err := sender.Stop(); err != nil {
-			c.logger.Error().Err(err).Msg("Error stopping replication sender")
-		}
-	}
-	c.stopReplicationReceiver(receiver)
-}
-
-// stopReplicationReceiver joins the receiver, bounded. Idempotent: a stopped
-// receiver returns from Stop at once.
-func (c *Coordinator) stopReplicationReceiver(receiver *replication.Receiver) {
-	if receiver == nil {
-		return
-	}
-	// The receiver's connect path is not context-aware, so a Stop that races
-	// a dial can wait for the protocol's timeouts. Bound it: a shutdown must
-	// not sit here, and the goroutines exit on their own once the context is
-	// cancelled.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if err := receiver.Stop(); err != nil {
-			c.logger.Error().Err(err).Msg("Error stopping replication receiver")
-		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(replicationStopTimeout):
-		c.logger.Warn().
-			Dur("waited", replicationStopTimeout).
-			Msg("Replication receiver did not stop in time; continuing shutdown without it")
-	}
-}
-
-// GetReplicationStats returns replication statistics.
-func (c *Coordinator) GetReplicationStats() map[string]interface{} {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	stats := map[string]interface{}{
-		"enabled": c.cfg.ReplicationEnabled,
-		"role":    string(c.localNode.Role),
-	}
-
-	if c.replicationSender != nil {
-		stats["sender"] = c.replicationSender.Stats()
-	}
-
-	if c.replicationReceiver != nil {
-		stats["receiver"] = c.replicationReceiver.Stats()
-	}
-
-	return stats
-}
-
-// AcceptReplicationConnection handles a replication connection from a reader.
-// This is called when a reader sends a MsgReplicateSync message.
-//
-// On success the coordinator sends the cluster-protocol-framed
-// MsgReplicateSyncAck *after* the sender has accepted the reader. The
-// ack used to be sent inside replication.Sender.AcceptReader via the
-// replication-package wire format (0x13), but the receiver reads with
-// protocol.ReceiveMessage (cluster-protocol format), which made the
-// handshake silently fail with "unknown message type: 19". Moving the
-// framing here closes that gap and keeps the wire contract symmetric
-// with the rejection paths in handleReplicateSync.
-func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replication.ReplicateSync) error {
-	c.mu.RLock()
-	sender := c.replicationSender
-	c.mu.RUnlock()
-
-	if sender == nil {
-		// Not a writer or replication not enabled. Unreachable in practice —
-		// handleReplicateSync makes the same check first — but it must still
-		// close the connection and answer in the handshake's own message type,
-		// for the reasons spelled out on the primary check below.
-		c.sendReplicationSyncError(conn, "this node is not configured as a writer with replication enabled")
-		return fmt.Errorf("replication connection rejected: not a writer")
-	}
-
-	// Defence in depth for #885: in local-storage mode only the primary writer
-	// ingests, so only it has entries to stream. A reader that reaches a
-	// standby would hold a connection open that never carries an entry, and
-	// look healthy doing it. Refusing makes the wrong attachment
-	// self-correcting — the reader logs the rejection and its target loop
-	// re-evaluates — rather than leaving it parked on a node that went standby
-	// while it was connected.
-	//
-	// The discriminator is the CLUSTER's record of who the primary is, not this
-	// node's view of whether it is the primary. Those differ at exactly the
-	// moment that matters: during bootstrap, before any CommandPromoteWriter
-	// has been applied, every writer fails IsPrimaryWriter, so gating on it
-	// refused the first connection of every cluster start and cost a reconnect
-	// interval of replication before it healed. Asking "has anyone been
-	// designated, and is it someone else?" answers no during bootstrap and
-	// admits the reader.
-	//
-	// Pattern 2 is exempt by construction — every writer ingests there and none
-	// is ever designated primary, so this check would refuse every legitimate
-	// connection.
-	if !c.cfg.SharedStorageMode {
-		if designated := c.designatedPrimaryWriterID(); designated != "" && designated != c.localNode.ID {
-			c.logger.Warn().
-				Str("reader_id", syncReq.ReaderID).
-				Str("designated_primary", designated).
-				Msg("Replication sync rejected: another node is the designated primary writer, so this node has no entries to stream")
-			// Must be sendReplicationSyncError, not replication.WriteError.
-			// handlePeerConnection hands this connection to us
-			// (closeConn = false, "Sender takes ownership"), so a rejection
-			// path that does not close leaks the socket: the reader closes its
-			// end and ours parks in CLOSE_WAIT holding an fd, once per
-			// reconnect interval, for the life of the process. And
-			// WriteError's MsgReplicateError is not a type the handshake
-			// reader decodes — protocol.ReceiveMessage would fail with
-			// "unknown message type" rather than surface the reason, which is
-			// the same defect the success path's two-phase accept was written
-			// to fix.
-			c.sendReplicationSyncError(conn, "this node is not the designated primary writer")
-			return fmt.Errorf("replication connection rejected: not the primary writer")
-		}
-	}
-
-	// Two-phase accept: prepare the reader (validates + derives session
-	// key + builds the connection struct, but does NOT publish it to
-	// the broadcast map), write the handshake ack on the raw conn
-	// while it's still invisible to broadcastEntry, then activate the
-	// reader so the broadcast path can start streaming entries.
-	//
-	// This ordering closes two races caught on PR #449:
-	//   - Write race: the old single-call AcceptReader published the
-	//     reader before returning, so the broadcast path could
-	//     interleave bytes with the coordinator's ack write on the
-	//     same conn.
-	//   - Delivery-order race (Gemini round 4): even with writeMu
-	//     serialisation, the broadcast could acquire the lock first
-	//     and write an entry frame BEFORE the ack — receiver reads
-	//     MsgReplicateEntry as its first message, fails the handshake.
-	//
-	// Failure handling: PrepareReader closes the conn on error, so we
-	// just propagate. If the ack write fails we close the conn manually
-	// and skip Activate — the reader is never published, so no leaked
-	// goroutines or map entries.
-	reader, err := sender.PrepareReader(conn, syncReq.ReaderID, syncReq.HandshakeNonce, syncReq.LastKnownSequence)
-	if err != nil {
-		return err
-	}
-	if syncReq.SupportsBinaryEntries {
-		// The reader understands MsgReplicateEntryBin (#698): stream
-		// entry payloads as raw bytes so entries above ~75MB clear the
-		// frame cap. Must happen before ActivateReader publishes the
-		// connection to the broadcast path.
-		reader.EnableBinaryEntries()
-	}
-
-	currentSeq, canResume := sender.CurrentSequenceAndCanResume(syncReq.LastKnownSequence)
-	ack := &protocol.ReplicateSyncAck{
-		CurrentSequence: currentSeq,
-		CanResume:       canResume,
-	}
-	if err := protocol.SendMessage(conn, &protocol.Message{
-		Type:    protocol.MsgReplicateSyncAck,
-		Payload: ack,
-	}, 5*time.Second); err != nil {
-		c.logger.Warn().
-			Err(err).
-			Str("reader_id", syncReq.ReaderID).
-			Msg("Replication: failed to send success sync ack to reader (connection will be torn down)")
-		// Reader was prepared but never activated, so we own the
-		// cleanup. PrepareReader didn't take s.mu and didn't start
-		// a goroutine — Discard cancels the reader's context and
-		// closes the conn.
-		reader.Discard()
-		return fmt.Errorf("write sync ack: %w", err)
-	}
-
-	// Ack landed on the wire. Now publish the reader to the broadcast
-	// map; any entry that arrives after this point is guaranteed to
-	// be a SECOND message on the wire (after the ack), so the
-	// receiver reads them in protocol-required order.
-	sender.ActivateReader(reader)
-	return nil
 }
 
 // GetRaftNode returns the Raft node (may be nil if Raft is not configured).
@@ -5475,6 +4810,14 @@ func (c *Coordinator) LocalNodeID() string {
 		return ""
 	}
 	return c.localNode.ID
+}
+
+// LeaderID returns the current Raft leader's node ID, empty when unknown.
+func (c *Coordinator) LeaderID() string {
+	if c == nil || c.raftNode == nil {
+		return ""
+	}
+	return c.raftNode.LeaderID()
 }
 
 // LeaderAddr returns the address of the current Raft leader.

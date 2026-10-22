@@ -141,9 +141,14 @@ func TestVerifyRefreshSkipsTheDownloadOnlyWhenTheLocalCopyMatches(t *testing.T) 
 			if got != RefreshQueued {
 				t.Fatalf("outcome = %v, want queued", got)
 			}
-			stats := waitStats(t, p, func(s map[string]int64) bool {
+			waitStats(t, p, func(s map[string]int64) bool {
 				return settled(s) && s["pulled"]+s["refresh_verified"] >= 1
 			})
+			// Stats loads each counter on its own, forced_refresh before
+			// pulled and inflight_count, so the snapshot that settled can
+			// predate the forced_refresh bump. Every counter is bumped before
+			// the entry leaves inflight: a snapshot taken now is complete.
+			stats := p.Stats()
 			if n := fetcher.calls.Load(); n != tc.wantFetches {
 				t.Fatalf("fetches = %d, want %d; stats=%v", n, tc.wantFetches, stats)
 			}
@@ -186,7 +191,7 @@ func TestRefreshPendingGauge(t *testing.T) {
 // on a positive match. No checksum to compare against, or a context that is
 // done (LocalBackend.ReadTo does not watch it; the hasher's writer does),
 // downloads instead.
-func TestLocalCopyMatchesFailsClosed(t *testing.T) {
+func TestVerifyLocalCopyFailsClosed(t *testing.T) {
 	const path = "db/m/2026/10/12/00/closed.parquet"
 	body := []byte("same bytes on disk and in the manifest")
 	p, local, _ := newVerifyPuller(t, body)
@@ -194,16 +199,19 @@ func TestLocalCopyMatchesFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := entryFor(path, body)
-	if !p.localCopyMatches(zerolog.Nop(), entry) {
+	if p.verifyLocalCopy(zerolog.Nop(), entry) != localCopyMatched {
 		t.Fatal("precondition: a matching copy must match")
 	}
 	noSum := *entry
 	noSum.SHA256 = ""
-	if p.localCopyMatches(zerolog.Nop(), &noSum) {
+	if p.verifyLocalCopy(zerolog.Nop(), &noSum) == localCopyMatched {
 		t.Fatal("an entry without a checksum was treated as matching")
 	}
 	p.Stop()
-	if p.localCopyMatches(zerolog.Nop(), entry) {
+	if got := p.verifyLocalCopy(zerolog.Nop(), entry); got != localCopyUnreadable {
+		t.Fatalf("a hash read on a stopped puller = %v, want unreadable", got)
+	}
+	if p.verifyLocalCopy(zerolog.Nop(), entry) == localCopyMatched {
 		t.Fatal("a hash read on a stopped puller was treated as matching")
 	}
 }

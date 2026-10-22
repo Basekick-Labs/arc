@@ -136,6 +136,13 @@ func GetStoragePath(backend Backend, database, measurement string) (string, erro
 	if err := validateReadSegment("database", database); err != nil {
 		return "", err
 	}
+	// A "_" root (compaction state, staged compaction outputs, schema
+	// anchors) is never a database: no write can create one, and reading
+	// one would serve files that are not data (#1207 d2a2a). ("." roots
+	// stay readable: the query rewriter's inert sentinel is one.)
+	if strings.HasPrefix(database, "_") {
+		return "", fmt.Errorf("database: %q is a reserved name", database)
+	}
 	if err := validateReadSegment("measurement", measurement); err != nil {
 		return "", err
 	}

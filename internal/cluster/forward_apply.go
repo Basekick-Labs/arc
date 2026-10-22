@@ -93,32 +93,42 @@ const forwardApplyTimeout = 5 * time.Second
 //   - ErrLeaderUnreachable: leader ID known but not in registry, retry
 //   - any other error: protocol-level rejection (auth, apply failed, etc.)
 func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft.Command) error {
+	_, err := c.forwardApplyToLeaderIndex(ctx, cmd, false)
+	return err
+}
+
+// forwardApplyToLeaderIndex is forwardApplyToLeader, also returning the
+// command's log index when wantIndex is set and the leader reported it (zero
+// otherwise). A caller that must read its own write waits for that index to
+// apply here (waitAppliedHere): the leader acks once the command applied on
+// the leader, not here (#1324).
+func (c *Coordinator) forwardApplyToLeaderIndex(ctx context.Context, cmd *clusterraft.Command, wantIndex bool) (uint64, error) {
 	if c.raftNode == nil {
-		return fmt.Errorf("forward apply: raft not initialized")
+		return 0, fmt.Errorf("forward apply: raft not initialized")
 	}
 	if c.cfg.SharedSecret == "" {
 		// Forward apply requires authenticated transport. The startup
 		// validation already enforces shared_secret when ReplicationEnabled
 		// is true, but we double-check defensively.
-		return fmt.Errorf("forward apply: shared_secret not configured")
+		return 0, fmt.Errorf("forward apply: shared_secret not configured")
 	}
 
 	// Resolve the current leader. LeaderID returns empty when no leader
 	// is currently known (no recent heartbeat / mid-election).
 	leaderID := c.raftNode.LeaderID()
 	if leaderID == "" {
-		return ErrNoLeaderKnown
+		return 0, ErrNoLeaderKnown
 	}
 	if leaderID == c.localNode.ID {
 		// We thought we weren't the leader but we are — caller's IsLeader
 		// check raced with a recent election. Apply locally instead of
 		// dialing ourselves. This is the safe fallback.
-		return c.raftNode.Apply(cmd, manifestApplyTimeout(ctx))
+		return c.raftNode.ApplyIndex(cmd, manifestApplyTimeout(ctx))
 	}
 
 	leaderAddr := c.leaderCoordinatorAddress(leaderID)
 	if leaderAddr == "" {
-		return fmt.Errorf("%w: leader_id=%s", ErrLeaderUnreachable, leaderID)
+		return 0, fmt.Errorf("%w: leader_id=%s", ErrLeaderUnreachable, leaderID)
 	}
 
 	// Marshal the command exactly as Node.Apply would. Embedding the raw
@@ -127,7 +137,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	// duplication.
 	cmdJSON, err := json.Marshal(cmd)
 	if err != nil {
-		return fmt.Errorf("forward apply: marshal command: %w", err)
+		return 0, fmt.Errorf("forward apply: marshal command: %w", err)
 	}
 
 	// Build the HMAC-authenticated request. The HMAC covers the command
@@ -137,7 +147,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	// sha256(cmdJSON), timestamp} into the signed material.
 	nonce, err := security.GenerateNonce()
 	if err != nil {
-		return fmt.Errorf("forward apply: generate nonce: %w", err)
+		return 0, fmt.Errorf("forward apply: generate nonce: %w", err)
 	}
 	ts := time.Now().Unix()
 	mac := security.ComputeForwardHMAC(c.cfg.SharedSecret, nonce, c.localNode.ID, c.cfg.ClusterName, cmdJSON, ts)
@@ -148,6 +158,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		Nonce:       nonce,
 		Timestamp:   ts,
 		HMAC:        mac,
+		WantIndex:   wantIndex,
 	}
 
 	// Acquire or reuse a cached TCP connection to the leader. The
@@ -166,9 +177,9 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	conn, reused, err := c.getOrDialLeader(ctx, leaderID, leaderAddr)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("forward apply: %w", errors.Join(err, ctxErr))
+			return 0, fmt.Errorf("forward apply: %w", errors.Join(err, ctxErr))
 		}
-		return fmt.Errorf("forward apply: %w", err)
+		return 0, fmt.Errorf("forward apply: %w", err)
 	}
 
 	ack, err := c.forwardApplyRoundTrip(ctx, conn, req)
@@ -201,7 +212,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		// deadline keep it, since the round trip clamps to it.
 		fresh, _, dialErr := c.getOrDialLeader(ctx, leaderID, leaderAddr)
 		if dialErr != nil {
-			return fmt.Errorf("%w (redial after a failed send also failed: %v)", err, dialErr)
+			return 0, fmt.Errorf("%w (redial after a failed send also failed: %v)", err, dialErr)
 		}
 		ack, err = c.forwardApplyRoundTrip(ctx, fresh, req)
 		c.logger.Debug().
@@ -210,7 +221,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 			Msg("ForwardApply: the cached leader connection was dead; retried once on a fresh one")
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	if ack.Status != "ok" {
@@ -219,11 +230,11 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		// (CompactionBridge's isTransientLeaderError) recognize it as a
 		// transient retry condition during normal leadership transitions.
 		if ack.Code == protocol.ForwardCodeNotLeader {
-			return fmt.Errorf("forward apply: %w", ErrNoLeaderKnown)
+			return 0, fmt.Errorf("forward apply: %w", ErrNoLeaderKnown)
 		}
-		return &ForwardRejectedError{Code: ack.Code, Message: ack.Error}
+		return 0, &ForwardRejectedError{Code: ack.Code, Message: ack.Error}
 	}
-	return nil
+	return ack.Index, nil
 }
 
 // checkForwardAck verifies a forward-apply ack against the nonce this node
@@ -232,15 +243,23 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 // Pure apart from reading c.cfg, so the auth decision is unit-testable without
 // a leader, a connection, or Raft.
 func (c *Coordinator) checkForwardAck(ack *protocol.ForwardApplyAck, reqNonce string) error {
+	return c.checkForwardAckIndex(ack, reqNonce, false)
+}
+
+// checkForwardAckIndex is checkForwardAck for a request that may have asked
+// for the log index: a success ack to it signs the index too.
+func (c *Coordinator) checkForwardAckIndex(ack *protocol.ForwardApplyAck, reqNonce string, wantIndex bool) error {
 	if c.cfg.SharedSecret == "" {
 		return nil
 	}
 	return security.ValidateForwardAckHMAC(
 		c.cfg.SharedSecret, reqNonce, ack.AuthTimestamp,
 		security.ForwardAckAuthFields{
-			Status: ack.Status,
-			Code:   string(ack.Code),
-			Error:  ack.Error,
+			Status:    ack.Status,
+			Code:      string(ack.Code),
+			Error:     ack.Error,
+			Index:     ack.Index,
+			SignIndex: wantIndex && ack.Status == "ok",
 		},
 		ack.AuthHMAC, security.HMACTimestampTolerance,
 	)
@@ -248,6 +267,12 @@ func (c *Coordinator) checkForwardAck(ack *protocol.ForwardApplyAck, reqNonce st
 
 // signForwardAck signs an ack over the request's nonce, in place.
 func (c *Coordinator) signForwardAck(ack *protocol.ForwardApplyAck, reqNonce string) {
+	c.signForwardAckIndex(ack, reqNonce, false)
+}
+
+// signForwardAckIndex is signForwardAck for a request that may have asked for
+// the log index: a success ack to it signs the index too.
+func (c *Coordinator) signForwardAckIndex(ack *protocol.ForwardApplyAck, reqNonce string, wantIndex bool) {
 	if c.cfg.SharedSecret == "" {
 		return
 	}
@@ -255,9 +280,11 @@ func (c *Coordinator) signForwardAck(ack *protocol.ForwardApplyAck, reqNonce str
 	ack.AuthHMAC = security.ComputeForwardAckHMAC(
 		c.cfg.SharedSecret, reqNonce, ack.AuthTimestamp,
 		security.ForwardAckAuthFields{
-			Status: ack.Status,
-			Code:   string(ack.Code),
-			Error:  ack.Error,
+			Status:    ack.Status,
+			Code:      string(ack.Code),
+			Error:     ack.Error,
+			Index:     ack.Index,
+			SignIndex: wantIndex && ack.Status == "ok",
 		},
 	)
 }
@@ -355,7 +382,7 @@ func (c *Coordinator) forwardApplyRoundTrip(ctx context.Context, conn net.Conn, 
 	// attacker pick either outcome by forging an unsigned ack. A bad MAC also
 	// drops the pooled connection — whoever is on the other end is not the
 	// leader we think it is, so nothing further should be sent over it.
-	if err := c.checkForwardAck(ack, req.Nonce); err != nil {
+	if err := c.checkForwardAckIndex(ack, req.Nonce, req.WantIndex); err != nil {
 		c.closeForwardConn()
 		return nil, fmt.Errorf("forward apply: %w", err)
 	}
@@ -593,7 +620,10 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandClaimDone ||
 		cmd.Type == clusterraft.CommandInstanceSettled ||
 		cmd.Type == clusterraft.CommandExtendStreamClaim ||
-		cmd.Type == clusterraft.CommandReleaseStreamClaim
+		cmd.Type == clusterraft.CommandReleaseStreamClaim ||
+		cmd.Type == clusterraft.CommandRecordDelete ||
+		cmd.Type == clusterraft.CommandRecordDeleteAck ||
+		cmd.Type == clusterraft.CommandSettleDeleted
 	isAuth := cmd.Type == clusterraft.CommandCreateToken ||
 		cmd.Type == clusterraft.CommandUpdateToken ||
 		cmd.Type == clusterraft.CommandRevokeToken ||
@@ -629,7 +659,48 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// compactor, which is exactly the guarantee the restore waits for.
 	isPauseSet := cmd.Type == clusterraft.CommandSetCompactionPause
 	isPauseAck := cmd.Type == clusterraft.CommandAckCompactionPause
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver {
+	// Compaction commit (#1207 d2): a compactor stages, commits, aborts,
+	// claims, finalizes and reverts its jobs (the manifest role rule: the compactor
+	// lease can sit on a writer); any node that pulled a staged output
+	// (readers included) reports holding it. Each names the requesting node.
+	isCompaction := cmd.Type == clusterraft.CommandStageCompaction ||
+		cmd.Type == clusterraft.CommandCommitCompaction ||
+		cmd.Type == clusterraft.CommandAbortCompaction ||
+		cmd.Type == clusterraft.CommandFinalizeCompaction ||
+		cmd.Type == clusterraft.CommandRevertCompaction ||
+		cmd.Type == clusterraft.CommandCleanupCompaction ||
+		cmd.Type == clusterraft.CommandClaimFinisher
+	isCompactionHeld := cmd.Type == clusterraft.CommandCompactionHeld
+	// Policy definitions (#1324): same rule as the auth commands, any known
+	// authenticated peer (the admin check happened on the node that took
+	// the HTTP call). CommandSeedPolicies is leader-only and never accepted
+	// from a peer, and so is CommandChoosePolicyAdoption: an admin's choice
+	// that activates deleting policies is taken on the leader's own HTTP
+	// call only.
+	isPolicy := cmd.Type == clusterraft.CommandSetTieringPolicy ||
+		cmd.Type == clusterraft.CommandDeleteTieringPolicy ||
+		cmd.Type == clusterraft.CommandCreateRetentionPolicy ||
+		cmd.Type == clusterraft.CommandUpdateRetentionPolicy ||
+		cmd.Type == clusterraft.CommandDeleteRetentionPolicy ||
+		cmd.Type == clusterraft.CommandCreateCQ ||
+		cmd.Type == clusterraft.CommandUpdateCQ ||
+		cmd.Type == clusterraft.CommandDeleteCQ
+	// A continuous query's watermark is set by the primary writer, which in
+	// local-storage mode need not be the Raft leader. The FSM decides who
+	// may set it (applySetCQWatermark); refused here early are a watermark
+	// that speaks for another node, one whose shared-storage claim does not
+	// match this cluster's mode (the claim would otherwise open the FSM's
+	// no-designated-primary path in local mode), and any forwarded one in
+	// shared-storage mode, where the primary is the leader itself.
+	isWatermark := cmd.Type == clusterraft.CommandSetCQWatermark
+	if isWatermark {
+		if why := c.watermarkForwardRefusal(&cmd, req.NodeID); why != "" {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: " + why)
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, why)
+			return
+		}
+	}
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -637,7 +708,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
-	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) {
+	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) || (isCompaction && !caps.CanIngest && !caps.CanCompact) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
@@ -659,7 +730,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		}
 	}
 
-	if isManifest || isTakeOver {
+	if isManifest || isTakeOver || isCompaction || isCompactionHeld {
 		if err := manifestCommandSpeaksFor(&cmd, req.NodeID); err != nil {
 			c.logger.Warn().
 				Err(err).
@@ -675,7 +746,8 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// Apply via Node.Apply — this is the same code path local applies
 	// take, so the FSM handler doesn't need to know whether the command
 	// originated locally or via forwarding.
-	if err := c.raftNode.Apply(&cmd, forwardApplyTimeout); err != nil {
+	index, err := c.raftNode.ApplyIndex(&cmd, forwardApplyTimeout)
+	if err != nil {
 		c.logger.Warn().
 			Err(err).
 			Str("requesting_node", req.NodeID).
@@ -697,7 +769,10 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 
 	// Success ack, signed over the request's nonce.
 	successAck := &protocol.ForwardApplyAck{Status: "ok"}
-	c.signForwardAck(successAck, req.Nonce)
+	if req.WantIndex {
+		successAck.Index = index
+	}
+	c.signForwardAckIndex(successAck, req.Nonce, req.WantIndex)
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgForwardApplyAck,
 		Payload: successAck,
@@ -925,6 +1000,161 @@ func manifestCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
 		if p.Origin != nodeID {
 			return fmt.Errorf("instance settlement for %q is not by the requesting node", p.Origin)
 		}
+	case clusterraft.CommandRecordDelete:
+		var p clusterraft.RecordDeletePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("delete record for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandRecordDeleteAck:
+		var p clusterraft.RecordDeleteAckPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("delete record acknowledgement for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandSettleDeleted:
+		var p clusterraft.SettleDeletedPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("deleted batch settlement for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandStageCompaction:
+		var p clusterraft.StageCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("compaction stage for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandCommitCompaction:
+		var p clusterraft.CommitCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("compaction commit for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandCompactionHeld:
+		var p clusterraft.CompactionHeldPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Node != nodeID {
+			return fmt.Errorf("compaction held for %q is not by the requesting node", p.Node)
+		}
+	case clusterraft.CommandAbortCompaction:
+		var p clusterraft.AbortCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("compaction abort for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandFinalizeCompaction:
+		var p clusterraft.FinalizeCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("compaction finalize for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandRevertCompaction:
+		var p clusterraft.RevertCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("compaction revert for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandCleanupCompaction:
+		var p clusterraft.CleanupCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("compaction cleanup for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandClaimFinisher:
+		var p clusterraft.ClaimFinisherPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("compaction finisher claim for %q is not by the requesting node", p.By)
+		}
 	}
 	return nil
+}
+
+// waitAppliedHere blocks until this node's FSM has applied the command at
+// index, or ctx ends. The leader acks a forwarded command once it applied on
+// the leader; a caller that reads its own write back from local state (the
+// SQLite an apply callback writes, or the FSM itself) must wait for its own
+// FSM too (#1324). AppliedDone, not Raft's AppliedIndex, which also counts
+// entries that never reach the FSM. A zero index (an older leader, or no
+// index asked for) does not wait.
+func (c *Coordinator) waitAppliedHere(ctx context.Context, index uint64) error {
+	if index == 0 || c.raftNode == nil {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	delay := time.Millisecond
+	for fsm.AppliedDone() < index {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("applied by the leader at index %d but not yet on this node (applied %d): %w",
+				index, fsm.AppliedDone(), ctx.Err())
+		case <-time.After(delay):
+		}
+		if delay < 20*time.Millisecond {
+			delay *= 2
+		}
+	}
+	return nil
+}
+
+// forwardAndWaitHere forwards cmd to the leader and, once cluster policies
+// are enabled (every node then reports the index), waits until this node's
+// FSM has applied it, so a caller that reads its own write back from local
+// state sees it (#1324). The command is committed once the leader acks: a
+// node that falls behind past ctx logs it rather than reporting a write that
+// happened as failed.
+func (c *Coordinator) forwardAndWaitHere(ctx context.Context, cmd *clusterraft.Command) error {
+	index, err := c.forwardApplyToLeaderIndex(ctx, cmd, c.ClusterPoliciesActive())
+	if err != nil {
+		return err
+	}
+	if err := c.waitAppliedHere(ctx, index); err != nil {
+		c.logger.Warn().Err(err).Int("cmd_type", int(cmd.Type)).
+			Msg("Forwarded command committed but not yet applied on this node")
+	}
+	return nil
+}
+
+// watermarkForwardRefusal says why a forwarded CQ watermark is refused, or "".
+func (c *Coordinator) watermarkForwardRefusal(cmd *clusterraft.Command, sender string) string {
+	shared := c.cfg != nil && c.cfg.SharedStorageMode
+	if shared {
+		return "a continuous query watermark is set by the leader itself in shared-storage mode"
+	}
+	var p clusterraft.SetCQWatermarkPayload
+	if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+		return "unreadable continuous query watermark"
+	}
+	if p.Proposer != sender {
+		return "a continuous query watermark must be proposed by the node that sends it"
+	}
+	if p.Shared != shared {
+		return "the continuous query watermark's storage mode does not match the cluster's"
+	}
+	return ""
 }

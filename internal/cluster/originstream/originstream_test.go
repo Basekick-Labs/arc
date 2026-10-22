@@ -177,6 +177,9 @@ func TestStoreCapStopsAndResumes(t *testing.T) {
 	if err := s.AcceptFloors("p", &Floors{Instance: 1, AppliedIndex: 1, Keys: map[string]KeyFloor{"db/a": {Floor: 20}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if _, err := s.Trim(context.Background(), allReady); err != nil {
 		t.Fatal(err)
 	}
@@ -207,15 +210,18 @@ func TestStoreTrimNeedsFloorsAndLocalFiles(t *testing.T) {
 	if err := s.AcceptFloors("p", f); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if _, _ = s.Trim(context.Background(), noneReady); s.Stats().Segments != 6 {
 		t.Fatalf("trimmed without the files: %+v", s.Stats())
 	}
 	var asked uint64
-	if _, _ = s.Trim(context.Background(), func(_ context.Context, keys []TrimKey) map[TrimKey]bool {
-		out := map[TrimKey]bool{}
-		for _, k := range keys {
+	if _, _ = s.Trim(context.Background(), func(_ context.Context, reqs []TrimRequest) []bool {
+		out := make([]bool, len(reqs))
+		for i, k := range reqs {
 			asked = k.AppliedIndex
-			out[k] = k.Origin == "p" && k.Key == "db/a"
+			out[i] = k.Origin == "p" && k.Key == "db/a"
 		}
 		return out
 	}); s.Stats().Segments != 2 {
@@ -228,6 +234,9 @@ func TestStoreTrimNeedsFloorsAndLocalFiles(t *testing.T) {
 	_ = s.Close()
 	r := openTestStore(t, dir, 0)
 	if err := r.AcceptFloors("p", &Floors{Instance: 1, AppliedIndex: 9, Keys: map[string]KeyFloor{"db/a": {Floor: 6, Lost: []uint64{3}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(); err != nil { // floors apply once durable
 		t.Fatal(err)
 	}
 	_ = r.Close()
@@ -362,6 +371,13 @@ func TestEndToEndEntriesAndFloors(t *testing.T) {
 	waitFor(t, "floors persisted", func() bool {
 		raw, err := os.ReadFile(filepath.Join(store.root, "primary", fmt.Sprintf("%016x", p.instance), floorsFile))
 		return err == nil && bytes.Contains(raw, []byte(`"f":50`))
+	})
+	// Applied once durable (#1287).
+	waitFor(t, "floors applied", func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		d := store.instances[instanceID{"primary", p.instance}]
+		return d != nil && d.floors != nil && d.floors.Keys["db/a"].Floor == 50
 	})
 	if _, err := store.Trim(context.Background(), allReady); err != nil {
 		t.Fatal(err)
@@ -522,15 +538,15 @@ func rawEntryFrame(key []byte, seq uint64, e *Entry) []byte {
 	return buf.Bytes()
 }
 
-func allReady(_ context.Context, keys []TrimKey) map[TrimKey]bool {
-	out := map[TrimKey]bool{}
-	for _, k := range keys {
-		out[k] = true
+func allReady(_ context.Context, reqs []TrimRequest) []bool {
+	out := make([]bool, len(reqs))
+	for i := range reqs {
+		out[i] = true
 	}
 	return out
 }
 
-func noneReady(context.Context, []TrimKey) map[TrimKey]bool { return map[TrimKey]bool{} }
+func noneReady(_ context.Context, reqs []TrimRequest) []bool { return make([]bool, len(reqs)) }
 
 type blockingCloseConn struct {
 	net.Conn
@@ -592,6 +608,9 @@ func TestReopenAfterTrimInventsNoGaps(t *testing.T) {
 	if err := s.AcceptFloors("p", &Floors{Instance: 1, Keys: map[string]KeyFloor{"db/a": {Floor: 2, Settled: [][2]uint64{{4, 5}}}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if _, err := s.Trim(context.Background(), allReady); err != nil {
 		t.Fatal(err)
 	}
@@ -643,6 +662,9 @@ func TestRestartWithEverythingTrimmedContinuesAtTheFloor(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir, 0)
 	if err := s.AcceptFloors("p", &Floors{Instance: 1, Keys: map[string]KeyFloor{"db/a": {Floor: 10}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sync(); err != nil { // floors apply once durable
 		t.Fatal(err)
 	}
 	_ = s.Close()

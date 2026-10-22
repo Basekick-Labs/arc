@@ -1,0 +1,11 @@
+{{- if .Values.arc.config.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "arc.fullname" . }}-config
+  labels:
+    {{- include "arc.labels" . | nindent 4 }}
+data:
+  arc.toml: |
+{{ .Values.arc.config.contents | indent 4 }}
+{{- end }}

@@ -124,7 +124,7 @@ func TestFollowUpsAndReports(t *testing.T) {
 func TestRemovedInstanceIsTombstoned(t *testing.T) {
 	x := takeoverFSM(t)
 	x.announce("w2", 7, Continuity{})
-	x.announce("w2", 8, Continuity{}) // 7 orphaned
+	x.announce("w2", 8, Continuity{WAL: 7, Journal: 7, Storage: 7}) // 7 closed
 	e := x.claim("w1", "w2", 7, "db/cpu", 1, 5)
 	x.ok(CommandClaimDone, ClaimDonePayload{Instance: 7, By: "w1", Epoch: e})
 	if x.inst(7) == nil {

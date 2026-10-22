@@ -63,14 +63,17 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 		// never reached the keyword, table-position or file-I/O gates, while
 		// DuckDB, which ends the comment at the newline, parsed and ran it.
 		//
+		// A line comment ends at `\n` or `\r`, as in DuckDB.
+		//
 		// Block comments are scanned to the FIRST `*/`, which is what the
 		// stripper does. DuckDB nests them, so its comment can only end later
-		// than this one does: the difference is always text this scanner
-		// treats as code and DuckDB does not, which costs a refusal at worst
-		// and can never hide code from a gate.
+		// than this one does: text this scanner treats as code and DuckDB
+		// does not. A denylist only over-refuses on that, but an allowlist
+		// can be fooled by it (`/* /* */ SELECT */ CREATE ...` shows the gate
+		// a SELECT), so ValidateSQLRequest refuses nested block comments.
 		if ch == '-' && i+1 < len(sql) && sql[i+1] == '-' {
 			j := i
-			for j < len(sql) && sql[j] != '\n' {
+			for j < len(sql) && sql[j] != '\n' && sql[j] != '\r' {
 				j++
 			}
 			result.WriteString(sql[i:j])
@@ -336,7 +339,7 @@ func skipWhitespaceAndCommentsForward(sql string, i int) int {
 			continue
 		}
 		if c == '-' && i+1 < len(sql) && sql[i+1] == '-' {
-			for i < len(sql) && sql[i] != '\n' {
+			for i < len(sql) && sql[i] != '\n' && sql[i] != '\r' {
 				i++
 			}
 			continue
@@ -550,7 +553,7 @@ func skipWhitespaceAndCommentsBack(sql string, i int) int {
 // start-of-string or `\n` and then forward looking for `--` on that line.
 func findDashCommentStartBackward(sql string, i int) (int, bool) {
 	lineStart := i
-	for lineStart > 0 && sql[lineStart-1] != '\n' {
+	for lineStart > 0 && sql[lineStart-1] != '\n' && sql[lineStart-1] != '\r' {
 		lineStart--
 	}
 	for k := lineStart; k < i; k++ {
@@ -674,8 +677,15 @@ func dollarQuoteTag(sql string, i int) (string, bool) {
 }
 
 // isIdentifierByte reports whether c can appear inside an unquoted SQL identifier.
+//
+// SECURITY: every byte of a multi-byte UTF-8 character counts. DuckDB accepts
+// Unicode letters in unquoted identifiers, so in `é$$` the `$$` continues the
+// identifier `é$$`; judging by the continuation byte alone read it as a
+// dollar-quote opener that masked everything up to the next `$$` (another
+// statement, a file read) from every gate while DuckDB ran it. The same holds
+// for the `E'` escape-string prefix.
 func isIdentifierByte(c byte) bool {
-	return c == '_' ||
+	return c >= 0x80 || c == '_' ||
 		(c >= 'a' && c <= 'z') ||
 		(c >= 'A' && c <= 'Z') ||
 		(c >= '0' && c <= '9')

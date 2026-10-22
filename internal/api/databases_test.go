@@ -499,10 +499,44 @@ func TestDatabasesHandler_ListMeasurementsEmpty(t *testing.T) {
 	}
 }
 
+func TestDatabasesHandler_ListMeasurementsReservedRoots(t *testing.T) {
+	_, app, tmpDir := setupTestDatabasesHandler(t, false)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("failed to create LocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	for _, root := range []string{"_schema", "_compaction_state"} {
+		t.Run(root, func(t *testing.T) {
+			if err := backend.Write(ctx, root+"/database/measurement.parquet", []byte("reserved data")); err != nil {
+				t.Fatalf("failed to seed reserved root: %v", err)
+			}
+
+			req := httptest.NewRequest("GET", "/api/v1/databases/"+root+"/measurements", nil)
+			resp, err := app.Test(req, testRequestTimeoutMS)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusNotFound {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("expected status 404, got %d: %s", resp.StatusCode, body)
+			}
+		})
+	}
+}
+
 // TestDatabasesHandler_Delete tests deleting a database
 func TestDatabasesHandler_Delete(t *testing.T) {
-	_, app, tmpDir := setupTestDatabasesHandler(t, true) // delete enabled
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true) // delete enabled
 	defer os.RemoveAll(tmpDir)
+	invalidated := 0
+	handler.SetOnFilesRemoved(func() { invalidated++ })
 
 	// Create a database with data
 	ctx := context.Background()
@@ -538,6 +572,10 @@ func TestDatabasesHandler_Delete(t *testing.T) {
 		exists, _ := backend.Exists(ctx, "deletedb/measurement1/data1.parquet")
 		if exists {
 			t.Error("Expected database files to be deleted")
+		}
+		// Cached pruned lists naming the removed files are dropped.
+		if invalidated != 1 {
+			t.Errorf("query caches invalidated %d times, want 1", invalidated)
 		}
 	})
 }
@@ -701,6 +739,8 @@ func TestDatabasesHandler_DeleteKeepsMarkerWhenTierCleanupFails(t *testing.T) {
 		events:      &events,
 		cleanupErrs: []error{fmt.Errorf("cold object could not be deleted")},
 	})
+	invalidated := 0
+	handler.SetOnFilesRemoved(func() { invalidated++ })
 
 	req := httptest.NewRequest("DELETE", "/api/v1/databases/deletedb?confirm=true", nil)
 	resp, err := app.Test(req, testRequestTimeoutMS)
@@ -714,6 +754,10 @@ func TestDatabasesHandler_DeleteKeepsMarkerWhenTierCleanupFails(t *testing.T) {
 	if exists, err := backend.Exists(ctx, marker); err != nil || !exists {
 		t.Fatalf("marker after tier cleanup failure: exists=%v err=%v, want retained for retry", exists, err)
 	}
+	// A partial deletion removed files too: the query caches go.
+	if invalidated != 1 {
+		t.Fatalf("query caches invalidated %d times, want 1", invalidated)
+	}
 }
 
 func equalStrings(got, want []string) bool {
@@ -726,6 +770,47 @@ func equalStrings(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+func TestDatabasesHandler_DeleteReservedRoots(t *testing.T) {
+	_, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("failed to create LocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	for _, root := range []string{"_schema", "_compaction_state"} {
+		t.Run(root, func(t *testing.T) {
+			path := root + "/database/measurement.parquet"
+			if err := backend.Write(ctx, path, []byte("reserved data")); err != nil {
+				t.Fatalf("failed to seed reserved root: %v", err)
+			}
+
+			req := httptest.NewRequest("DELETE", "/api/v1/databases/"+root+"?confirm=true", nil)
+			resp, err := app.Test(req, testRequestTimeoutMS)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusForbidden {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("expected status 403, got %d: %s", resp.StatusCode, body)
+			}
+
+			exists, err := backend.Exists(ctx, path)
+			if err != nil {
+				t.Fatalf("failed to check reserved data: %v", err)
+			}
+			if !exists {
+				t.Fatalf("reserved data at %q was deleted", path)
+			}
+		})
+	}
 }
 
 // TestDatabasesHandler_DeleteDisabled tests deleting when delete is disabled

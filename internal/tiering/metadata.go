@@ -791,6 +791,22 @@ func (s *MetadataStore) CountFilesInTierByDatabase(ctx context.Context, tier Tie
 	return counts, nil
 }
 
+// CountFilesInTierForDatabase counts the non-quarantined rows for one database
+// and tier. Unlike CountFilesInTierByDatabase, this avoids scanning and
+// grouping every database when a caller only needs one database's count.
+func (s *MetadataStore) CountFilesInTierForDatabase(ctx context.Context, database string, tier Tier) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM tier_files
+		WHERE database = ? AND tier = ? AND quarantined_at IS NULL
+	`, database, string(tier)).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count files in tier for database: %w", err)
+	}
+	return count, nil
+}
+
 // GetFilesOlderThan retrieves files in a tier older than the specified age.
 // Quarantined rows are excluded: this is the migration candidate query, and a
 // quarantined file is one tiering has established it can never act on (#758).
@@ -807,6 +823,27 @@ func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge
 	rows, err := s.db.QueryContext(ctx, query, string(tier), cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query old files: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanFiles(rows)
+}
+
+// GetColdFilesForRetention returns one database's cold rows whose partition
+// starts before partitionBefore, quarantined rows included (retention counts
+// them and leaves them alone). Filtered in SQL: the table holds every
+// database's rows, and this runs once per retention execution.
+func (s *MetadataStore) GetColdFilesForRetention(ctx context.Context, database string, partitionBefore time.Time) ([]FileMetadata, error) {
+	query := `
+		SELECT ` + tierFileColumns + `
+		FROM tier_files
+		WHERE tier = ? AND database = ? AND partition_time < ?
+		ORDER BY measurement ASC, partition_time ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, string(TierCold), database, partitionBefore.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("failed to query cold files for retention: %w", err)
 	}
 	defer rows.Close()
 
@@ -999,6 +1036,43 @@ func (s *MetadataStore) UpdateTier(ctx context.Context, path string, newTier Tie
 	}
 
 	return nil
+}
+
+// UpdateTierIfCurrent changes a row only if it still has expectedTier. It is
+// used by cleanup paths whose object-store action is based on a metadata
+// snapshot; a concurrent migration must be able to invalidate that decision.
+func (s *MetadataStore) UpdateTierIfCurrent(ctx context.Context, path string, expectedTier, newTier Tier) (bool, error) {
+	var database, measurement string
+	lookupQuery := `SELECT database, measurement FROM tier_files WHERE path = ?`
+	err := s.db.QueryRowContext(ctx, lookupQuery, path).Scan(&database, &measurement)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("failed to load file metadata before conditional tier update: %w", err)
+	}
+
+	var migratedAt any
+	if newTier == TierCold {
+		migratedAt = time.Now().UTC()
+	}
+	query := `
+		UPDATE tier_files
+		SET tier = ?, migrated_at = ?
+		WHERE path = ? AND tier = ? AND quarantined_at IS NULL
+	`
+	result, err := s.db.ExecContext(ctx, query, string(newTier), migratedAt, path, string(expectedTier))
+	if err != nil {
+		return false, fmt.Errorf("failed to conditionally update tier: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read conditional tier update result: %w", err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if database != "" && measurement != "" {
+		s.invalidateTierCache(database, measurement)
+	}
+	return true, nil
 }
 
 // DeleteFile removes a file from the metadata store

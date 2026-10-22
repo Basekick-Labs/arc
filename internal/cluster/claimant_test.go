@@ -6,6 +6,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ type claimantRigT struct {
 	outbox  *RegistrationOutbox
 	buffer  *ingest.ArrowBuffer
 	backend storage.Backend
+	wal     *wal.Writer
 	hour    time.Time
 }
 
@@ -68,23 +70,11 @@ func newClaimantRig(t *testing.T) *claimantRigT {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	st := &originStream{present: map[string]int64{}}
-	cl := newClaimant(c, store, outbox, buffer, func(ctx context.Context, origin string, keys []string) bool {
-		tk := make([]originstream.TrimKey, len(keys))
-		for i, k := range keys {
-			tk[i] = originstream.TrimKey{Origin: origin, Key: k}
-		}
-		got := st.keysLocal(ctx, c, tk, func(originstream.TrimKey) bool { return false })
-		for _, k := range tk {
-			if !got[k] {
-				return false
-			}
-		}
-		return true
-	})
+	st := &originStream{}
+	cl := newClaimant(c, store, outbox, buffer, st.instanceFilesLocal(c))
 	cl.grace = time.Minute
 	c.claimant.Store(cl)
-	return &claimantRigT{c: c, cl: cl, store: store, outbox: outbox, buffer: buffer, backend: backend,
+	return &claimantRigT{c: c, cl: cl, store: store, outbox: outbox, buffer: buffer, backend: backend, wal: w,
 		hour: time.Date(2026, 10, 12, 10, 0, 0, 0, time.UTC)}
 }
 
@@ -127,16 +117,10 @@ func TestClaimantPublishesADeadPrimarysBatchesOnce(t *testing.T) {
 	r.stored(t, 1, 3)
 	r.stored(t, 2, 2)
 
-	// Within the grace: nothing is claimed, but a DELETE of the key waits.
+	// Within the grace: nothing is claimed.
 	r.cl.pass(ctx)
 	if _, ok := r.claim(t); ok {
 		t.Fatal("claimed within the grace")
-	}
-	if !r.c.StreamTakeoverBusy("db", "cpu") || !r.c.StreamTakeoverBusy("db", "") {
-		t.Fatal("a DELETE of a key about to be claimed is not gated")
-	}
-	if r.c.StreamTakeoverBusy("db", "mem") || r.c.StreamTakeoverBusy("other", "") {
-		t.Fatal("a DELETE of another key is gated")
 	}
 
 	r.afterGrace()
@@ -163,13 +147,10 @@ func TestClaimantPublishesADeadPrimarysBatchesOnce(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no file registered")
 	}
-	// Finished: the store copy goes (every file is local), and DELETEs pass.
+	// Finished: the store copy goes (every file is local).
 	r.cl.pass(ctx)
 	if r.store.Held(clOrigin, clInst) != nil {
 		t.Fatal("store copy of a finished claim kept")
-	}
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("DELETE still gated after the claim finished")
 	}
 	// Nothing is published twice.
 	before := len(fsm.GetFilesByDatabase("db"))
@@ -184,6 +165,10 @@ func TestClaimantSkipsRowsTheOriginRegistered(t *testing.T) {
 	r := newClaimantRig(t)
 	ctx := context.Background()
 	r.stored(t, 1, 2)
+	// Pulled here: a claim finishes only once every file of the instance is.
+	if err := r.backend.Write(ctx, "db/cpu/origin.parquet", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
 	propose(t, r.c, raft.CommandRegisterFile, raft.RegisterFilePayload{
 		File: raft.FileEntry{Path: "db/cpu/origin.parquet", SHA256: "x", SizeBytes: 1, Database: "db", Measurement: "cpu",
 			PartitionTime: r.hour, OriginNodeID: clOrigin, CreatedAt: time.Now()},
@@ -452,8 +437,12 @@ func TestDesignationGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFSM(t, func() bool { return c.designatedPrimaryWriterID() == "writer-2" })
+	before := metrics.Get().IngestFencedWritesFor(RefusalNotDesignated)
 	if err := c.IngestGate()(); !errors.Is(err, errNotDesignated) {
 		t.Fatalf("a standby accepted a write: %v", err)
+	}
+	if d := metrics.Get().IngestFencedWritesFor(RefusalNotDesignated) - before; d != 1 {
+		t.Fatalf("the designation refusal counted %d times (#1268)", d)
 	}
 	// Takeover not known on here: the gate is the fence's business.
 	off, d2 := takeoverOriginRig(t, false)
@@ -464,36 +453,6 @@ func TestDesignationGate(t *testing.T) {
 	waitFSM(t, func() bool { return off.designatedPrimaryWriterID() == "writer-2" })
 	if err := off.IngestGate()(); err != nil {
 		t.Fatalf("flag off: %v", err)
-	}
-}
-
-// The DELETE gate reads the manifest and the store at request time: no
-// claimant pass is needed for a just-designated primary to hold DELETEs.
-func TestStreamTakeoverBusyAtRequestTime(t *testing.T) {
-	r := newClaimantRig(t)
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("nothing stored, nothing claimed: busy")
-	}
-	r.stored(t, 1, 1)
-	if !r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("a dead writer's batches stored here, no pass yet: a DELETE was let through")
-	}
-	// The writer is back: nothing to claim.
-	peer := NewNode(clOrigin, clOrigin, RoleWriter, "test-cluster")
-	peer.UpdateState(StateHealthy)
-	if err := r.c.registry.Register(peer); err != nil {
-		t.Fatal(err)
-	}
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("a live writer's batches block DELETEs")
-	}
-	off, _ := takeoverOriginRig(t, false)
-	if off.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("flag off: busy")
-	}
-	var nilCoord *Coordinator
-	if nilCoord.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("nil coordinator: busy")
 	}
 }
 
@@ -640,6 +599,9 @@ func TestClaimantAbsentBatches(t *testing.T) {
 		Keys: map[string]originstream.KeyFloor{clKey: {Settled: [][2]uint64{{3, 3}}}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.store.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
 		Claims: []raft.ClaimSet{{Instance: clInst, Keys: map[string]raft.Intervals{clKey: {{1, 3}}}}}})
 	r.cl.pass(ctx)
@@ -659,6 +621,11 @@ func TestClaimantDropsAFrozenCopy(t *testing.T) {
 	r := newClaimantRig(t)
 	ctx := context.Background()
 	r.stored(t, 1, 1)
+	// The batch's file, registered as the origin registers it, then settled;
+	// it is not here yet.
+	propose(t, r.c, raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{Path: "db/cpu/remote.parquet", SHA256: "x",
+		SizeBytes: 3, Database: "db", Measurement: "cpu", PartitionTime: r.hour, OriginNodeID: clOrigin, CreatedAt: time.Now()},
+		Cov2: []raft.InstanceCoverage{{Instance: clInst, Key: clKey, Ranges: [][2]uint64{{1, 1}}}}})
 	propose(t, r.c, raft.CommandSettleCoverage, raft.SettleCoveragePayload{Origin: clOrigin, Instance: clInst,
 		Keys: map[string]raft.KeySettlement{clKey: {Floor: 1}}})
 	r.cl.pass(ctx)
@@ -670,12 +637,13 @@ func TestClaimantDropsAFrozenCopy(t *testing.T) {
 	if err := r.c.registry.Register(peer); err != nil {
 		t.Fatal(err)
 	}
-	// A current file of the key is not here yet: the copy waits.
-	propose(t, r.c, raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{Path: "db/cpu/remote.parquet", SHA256: "x",
-		SizeBytes: 3, Database: "db", Measurement: "cpu", PartitionTime: r.hour, OriginNodeID: clOrigin, CreatedAt: time.Now()}})
+	// A compaction output of the key, not here either, does not matter.
+	propose(t, r.c, raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{Path: "db/cpu/compacted.parquet", SHA256: "y",
+		SizeBytes: 5, Database: "db", Measurement: "cpu", PartitionTime: r.hour, OriginNodeID: "compactor-1", CreatedAt: time.Now()}})
+	// The file holding the batch's rows is not here yet: the copy waits.
 	r.cl.pass(ctx)
 	if r.store.Held(clOrigin, clInst) == nil {
-		t.Fatal("dropped a copy while a file of its key is not here")
+		t.Fatal("dropped a copy while the file holding its batch is not here")
 	}
 	if err := r.backend.Write(ctx, "db/cpu/remote.parquet", []byte("abc")); err != nil {
 		t.Fatal(err)
@@ -683,18 +651,6 @@ func TestClaimantDropsAFrozenCopy(t *testing.T) {
 	r.cl.pass(ctx)
 	if r.store.Held(clOrigin, clInst) != nil {
 		t.Fatal("kept a frozen copy with nothing claimable")
-	}
-}
-
-// Another writer's unfinished claim holds DELETEs of its keys, whatever
-// this node's store holds.
-func TestStreamTakeoverBusyForAnotherClaimant(t *testing.T) {
-	r := newClaimantRig(t)
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x600, FreshStart: true})
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: clInst, Keys: map[string]raft.Intervals{"db/mem": {{1, 2}}}}}})
-	if !r.c.StreamTakeoverBusy("db", "mem") || r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("an unfinished claim does not hold DELETEs of its key alone")
 	}
 }
 
@@ -738,61 +694,16 @@ func TestClaimantParkedFileOfItsClaim(t *testing.T) {
 	}
 }
 
-// DELETEs wait for every writer this node hears from to answer an ended
-// claim (a follow-up claim, or a report of holding nothing), within a
-// window after it ended.
-func TestStreamTakeoverBusyWaitsForFollowUps(t *testing.T) {
-	r := newClaimantRig(t)
-	ctx := context.Background()
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: clInst, Keys: map[string]raft.Intervals{clKey: {{1, 1}}}}}})
-	k, _ := r.claim(t)
-	propose(t, r.c, raft.CommandClaimDone, raft.ClaimDonePayload{Instance: clInst, By: "writer-1", Epoch: k.Epoch, Now: time.Now().UTC()})
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("no other writer heard from: busy")
-	}
-	w3 := NewNode("writer-3", "writer-3", RoleWriter, "test-cluster")
-	w3.UpdateState(StateHealthy)
-	if err := r.c.registry.Register(w3); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.c.raftNode.AddNode(&raft.NodeInfo{ID: "writer-3", Name: "writer-3", Role: string(RoleWriter), ClusterName: "test-cluster", Address: "writer-3:9100", State: string(StateHealthy)}, 5*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	if !r.c.StreamTakeoverBusy("db", "cpu") || r.c.StreamTakeoverBusy("db", "mem") {
-		t.Fatal("a writer that may follow up does not hold DELETEs of the claim's key alone")
-	}
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-3", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: clInst}}})
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("every writer answered: still busy")
-	}
-	// Past the window, an unanswered writer no longer holds DELETEs.
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x700, FreshStart: true})
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x701, FreshStart: true})
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: 0x700, Keys: map[string]raft.Intervals{"db/mem": {{1, 1}}}}}})
-	var e uint64
-	for _, x := range r.c.raftNode.FSM().StreamClaims() {
-		if x.Instance == 0x700 {
-			e = x.Epoch
-		}
-	}
-	propose(t, r.c, raft.CommandClaimDone, raft.ClaimDonePayload{Instance: 0x700, By: "writer-1", Epoch: e, Now: time.Now().Add(-time.Hour).UTC()})
-	if r.c.StreamTakeoverBusy("db", "mem") {
-		t.Fatal("busy past the follow-up window")
-	}
-	_ = ctx
-}
-
 // The copy of an instance removed with its claim (every writer answered)
 // goes once its files are here.
 func TestClaimantDropsATombstonedCopy(t *testing.T) {
 	r := newClaimantRig(t)
 	ctx := context.Background()
 	r.stored(t, 1, 1)
-	// writer-2 restarts without it: orphaned; writer-1 claims, publishes.
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x600, FreshStart: true})
+	// writer-2 restarts on the same disks without it: closed; writer-1
+	// claims, publishes.
+	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x600, FreshStart: true,
+		Continuity: raft.Continuity{WAL: clInst, Journal: clInst, Storage: clInst}})
 	r.cl.pass(ctx)
 	waitFSM(t, func() bool { return r.outbox.Pending() == 0 })
 	r.cl.pass(ctx)

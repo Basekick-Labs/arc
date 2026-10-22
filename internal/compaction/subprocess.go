@@ -56,8 +56,18 @@ type SubprocessJobConfig struct {
 	Threads int `json:"threads,omitempty"`
 
 	// Storage configuration
-	StorageType   string `json:"storage_type"`   // "local" or "s3"
-	StorageConfig string `json:"storage_config"` // JSON-encoded storage-specific config
+	StorageType   string `json:"storage_type"`   // Backend.Type(): "local", "s3" or "azure"
+	StorageConfig string `json:"storage_config"` // Backend.ConfigJSON(): no secrets
+	// Credentials authenticate the subprocess's storage backend the way the
+	// parent's was authenticated (#1104). It travels only in this job, which
+	// the parent pipes over stdin and never logs or writes to disk, so the
+	// secrets stay out of the subprocess's environment and argv.
+	//
+	// nil means a parent from before this field: after a package upgrade a
+	// running parent can start the NEW binary as its subprocess (os.Executable
+	// resolves to the replaced file). That parent passes credentials the old
+	// way, in the environment, and backendSpecFromJob reads them from there.
+	Credentials *SubprocessCredentials `json:"credentials,omitempty"`
 
 	// Phase 4: cluster-mode completion-manifest handoff. When CompletionDir
 	// is non-empty, the job writes a local-disk CompletionManifest that the
@@ -74,6 +84,9 @@ type SubprocessJobConfig struct {
 	// sentinel checked via IsZero, and this is internal parent↔subprocess IPC,
 	// not a user-facing field — matches the plain tag on completion.go's twin.
 	PartitionTime time.Time `json:"partition_time"`
+	// Staged commit (#1207 d2a2a): see JobConfig.Staged.
+	Staged bool                   `json:"staged,omitempty"`
+	Inputs map[string]StagedInput `json:"inputs,omitempty"`
 }
 
 // SubprocessJobResult is returned by the subprocess via stdout as JSON.
@@ -94,6 +107,45 @@ type SubprocessJobResult struct {
 	// left in place under ParentFinalizesManifest; empty otherwise. The
 	// parent deletes it after receipt marking commits.
 	ManifestPath string `json:"manifest_path,omitempty"`
+}
+
+// SubprocessCredentials are the storage secrets a compaction subprocess needs
+// to rebuild its parent's backend. Only the fields for the parent's backend
+// type are set. Plaintext: never log this struct.
+type SubprocessCredentials struct {
+	S3AccessKey string `json:"s3_access_key,omitempty"`
+	S3SecretKey string `json:"s3_secret_key,omitempty"`
+
+	AzureConnectionString   string `json:"azure_connection_string,omitempty"`
+	AzureAccountKey         string `json:"azure_account_key,omitempty"`
+	AzureSASToken           string `json:"azure_sas_token,omitempty"`
+	AzureUseManagedIdentity bool   `json:"azure_use_managed_identity,omitempty"`
+}
+
+// String and GoString keep the secrets out of any %v, %+v or %#v that ever
+// reaches a log; the job JSON is the only place they are written.
+func (SubprocessCredentials) String() string   { return "SubprocessCredentials{redacted}" }
+func (SubprocessCredentials) GoString() string { return "SubprocessCredentials{redacted}" }
+
+// subprocessCredentials collects the credentials of the parent's backend.
+// Never nil: an empty value tells the subprocess this parent passes
+// credentials in the job, and that there are none (local storage, or S3 on
+// instance or IRSA credentials, which the subprocess resolves from the
+// environment it inherits, exactly as the parent did).
+func subprocessCredentials(backend storage.Backend) *SubprocessCredentials {
+	creds := &SubprocessCredentials{}
+	switch b := backend.(type) {
+	case *storage.S3Backend:
+		creds.S3AccessKey = b.GetAccessKey()
+		creds.S3SecretKey = b.GetSecretKey()
+	case *storage.AzureBlobBackend:
+		auth := b.Credentials()
+		creds.AzureConnectionString = auth.ConnectionString
+		creds.AzureAccountKey = auth.AccountKey
+		creds.AzureSASToken = auth.SASToken
+		creds.AzureUseManagedIdentity = auth.UseManagedIdentity
+	}
+	return creds
 }
 
 // RunSubprocessJob is called from the subprocess to execute compaction.
@@ -207,6 +259,8 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		CompletionDir:           config.CompletionDir,
 		PartitionTime:           config.PartitionTime,
 		ParentFinalizesManifest: config.ParentFinalizesManifest,
+		Staged:                  config.Staged,
+		Inputs:                  config.Inputs,
 	})
 
 	// Use signal-aware context so the subprocess can cancel DuckDB queries
@@ -285,8 +339,9 @@ func writeHeapProfile(logger zerolog.Logger, path string) {
 // RunJobInSubprocess executes compaction in a subprocess for memory isolation.
 // The subprocess runs the same binary with the "compact" subcommand.
 // When the subprocess exits, all DuckDB memory (including jemalloc arenas) is released.
-// extraEnv can be used to pass additional environment variables (e.g., credentials).
-func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger zerolog.Logger, extraEnv ...string) (*SubprocessJobResult, error) {
+// Storage credentials travel in config.Credentials; the subprocess inherits
+// this process's environment unchanged.
+func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger zerolog.Logger) (*SubprocessJobResult, error) {
 	// Serialize config to JSON
 	configJSON, err := json.Marshal(config)
 	if err != nil {
@@ -305,11 +360,6 @@ func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger
 
 	// Pass config via stdin
 	cmd.Stdin = bytes.NewReader(configJSON)
-
-	// Set extra environment variables (e.g., Azure credentials)
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
-	}
 
 	// Capture stdout and stderr separately
 	var stdout, stderr bytes.Buffer
@@ -380,38 +430,44 @@ func forwardSubprocessLine(logger zerolog.Logger, line string) {
 		Msg(line)
 }
 
-// createStorageBackendFromConfig creates a storage backend from subprocess config.
-//
-// This deliberately does NOT go through the shared storage.NewBackend factory
-// (internal/storage/factory.go) that primary storage, the tiering cold tier and
-// the backup manager use. The subprocess has a credential model of its own, on
-// purpose: credentials are never serialised into the job config, so it MUST
-// read them from the environment the parent set. The S3 case passes none at all
-// and lets the SDK chain pick them up, and the Azure case derives
-// UseManagedIdentity from whether AZURE_STORAGE_KEY is present. The factory
-// itself is indifferent to credentials and its other callers simply forward
-// whatever the operator configured; here the empty credential set IS the
-// contract, and a regression in it surfaces as a failed compaction job in a
-// separate process rather than a failed startup - the hardest place to notice
-// one.
+// createStorageBackendFromConfig creates the subprocess's storage backend
+// through the same constructor as primary storage, the cold tier and backup
+// (storage.NewBackend, #1104). Only the inputs differ: backendSpecFromJob
+// reads them from the job and, for an older parent, the environment.
 func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.Logger) (storage.Backend, error) {
+	spec, err := backendSpecFromJob(config, os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewBackend(spec, logger)
+}
+
+// backendSpecFromJob turns a job's storage fields into a BackendSpec. Every
+// field a backend's ConfigJSON emits must be read here: prefix in particular
+// is applied to every key the backend touches, so dropping it silently
+// reroots the subprocess at the bucket or container root and compaction
+// reads and writes the wrong location.
+//
+// Credentials come from the job (config.Credentials). When that is nil the
+// job came from a parent that predates the field and put them in the
+// environment instead: S3 keys in AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
+// which NewS3Backend reads itself, and the Azure account key in
+// AZURE_STORAGE_KEY, with managed identity inferred from its absence.
+func backendSpecFromJob(config *SubprocessJobConfig, getenv func(string) string) (storage.BackendSpec, error) {
+	spec := storage.BackendSpec{Type: config.StorageType}
+	creds := config.Credentials
 	switch config.StorageType {
 	case "local":
-		var localConfig struct {
+		var c struct {
 			BasePath string `json:"base_path"`
 		}
-		if err := json.Unmarshal([]byte(config.StorageConfig), &localConfig); err != nil {
-			return nil, fmt.Errorf("failed to parse local storage config: %w", err)
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse local storage config: %w", err)
 		}
-		return storage.NewLocalBackend(localConfig.BasePath, logger)
+		spec.LocalPath = c.BasePath
 
 	case "s3":
-		// Every field S3Backend.ConfigJSON emits must be parsed and forwarded
-		// here. Prefix in particular: it is applied to every key the backend
-		// touches (prefixedKey), so dropping it silently reroots the subprocess
-		// at the bucket root and compaction reads and writes the wrong location.
-		// It defaults to empty, which is why the omission went unnoticed.
-		var s3Config struct {
+		var c struct {
 			Bucket    string `json:"bucket"`
 			Prefix    string `json:"prefix"`
 			Region    string `json:"region"`
@@ -419,50 +475,61 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 			PathStyle bool   `json:"path_style"`
 			UseSSL    bool   `json:"use_ssl"`
 		}
-		if err := json.Unmarshal([]byte(config.StorageConfig), &s3Config); err != nil {
-			return nil, fmt.Errorf("failed to parse S3 storage config: %w", err)
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse S3 storage config: %w", err)
 		}
-		return storage.NewS3Backend(&storage.S3Config{
-			Bucket:    s3Config.Bucket,
-			Prefix:    s3Config.Prefix,
-			Region:    s3Config.Region,
-			Endpoint:  s3Config.Endpoint,
-			PathStyle: s3Config.PathStyle,
-			UseSSL:    s3Config.UseSSL,
-			// Credentials come from environment variables
-		}, logger)
+		spec.S3 = storage.S3Config{
+			Bucket:    c.Bucket,
+			Prefix:    c.Prefix,
+			Region:    c.Region,
+			Endpoint:  c.Endpoint,
+			PathStyle: c.PathStyle,
+			UseSSL:    c.UseSSL,
+		}
+		// With no keys, NewS3Backend falls back to the AWS_* environment and
+		// the SDK chain, as the parent did: the subprocess inherits its
+		// environment (IRSA, instance roles, profiles).
+		if creds != nil {
+			spec.S3.AccessKey = creds.S3AccessKey
+			spec.S3.SecretKey = creds.S3SecretKey
+		}
 
 	case "azure":
-		// Same rule as the S3 case above, and for the same reason: every field
-		// AzureBlobBackend.ConfigJSON emits must be parsed and forwarded here.
-		// Prefix in particular is applied to every key the backend touches
-		// (prefixedKey), so dropping it silently reroots the subprocess at the
-		// container root and compaction reads and writes the wrong location.
-		// It defaults to empty, which is why the same omission on the S3 side
-		// went unnoticed.
-		var azureConfig struct {
+		var c struct {
 			Container   string `json:"container"`
 			Prefix      string `json:"prefix"`
 			AccountName string `json:"account_name"`
 			Endpoint    string `json:"endpoint"`
 		}
-		if err := json.Unmarshal([]byte(config.StorageConfig), &azureConfig); err != nil {
-			return nil, fmt.Errorf("failed to parse Azure storage config: %w", err)
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse Azure storage config: %w", err)
 		}
-		// Read credentials from environment variables (set by parent process)
-		accountKey := os.Getenv("AZURE_STORAGE_KEY")
-		return storage.NewAzureBlobBackend(&storage.AzureBlobConfig{
-			ContainerName:      azureConfig.Container,
-			Prefix:             azureConfig.Prefix,
-			AccountName:        azureConfig.AccountName,
-			AccountKey:         accountKey,
-			Endpoint:           azureConfig.Endpoint,
-			UseManagedIdentity: accountKey == "", // Only use managed identity if no key provided
-		}, logger)
+		spec.Azure = storage.AzureBlobConfig{
+			ContainerName: c.Container,
+			Prefix:        c.Prefix,
+			AccountName:   c.AccountName,
+			Endpoint:      c.Endpoint,
+		}
+		if creds != nil {
+			// All of them, so NewAzureBlobBackend applies the same precedence
+			// it applied in the parent. A connection string carries its own
+			// endpoint, which ConfigJSON does not.
+			spec.Azure.ConnectionString = creds.AzureConnectionString
+			spec.Azure.AccountKey = creds.AzureAccountKey
+			spec.Azure.SASToken = creds.AzureSASToken
+			spec.Azure.UseManagedIdentity = creds.AzureUseManagedIdentity
+		} else {
+			key := getenv("AZURE_STORAGE_KEY")
+			spec.Azure.AccountKey = key
+			spec.Azure.UseManagedIdentity = key == ""
+		}
 
 	default:
-		return nil, fmt.Errorf("unsupported storage type: %s", config.StorageType)
+		// NewBackend accepts aliases (minio, azblob) that Backend.Type() never
+		// emits; the job only ever carries these three.
+		return spec, fmt.Errorf("unsupported storage type: %s", config.StorageType)
 	}
+	return spec, nil
 }
 
 // sqlErrorMarkers are deterministic DuckDB SQL failure classes: a query that

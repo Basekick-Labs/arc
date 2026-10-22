@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -315,9 +316,9 @@ func TestMidMigrationDedupPrefersTheColdCopy(t *testing.T) {
 }
 
 // An unreachable cold store FAILS the run. It must never become N skips and a
-// green status: nothing in Arc deletes a cold object, so a read failure is an
-// availability failure and not the "compaction raced us" case the hot path
-// tolerates.
+// green status. A cold object only vanishes when retention deletes it (#168),
+// and that case is checked by type (TestColdObjectRetentionDeletedMidBackupIsSkipped);
+// a read failure on an object that is still there is an availability failure.
 func TestUnreachableColdStoreFailsTheBackup(t *testing.T) {
 	ctx := context.Background()
 	rig := newColdRig(t, nil)
@@ -704,8 +705,8 @@ func TestClusterColdFilesSurviveTheEndOfRunRecheck(t *testing.T) {
 // while genuinely being absent from the backup.
 //
 // Tested on the tally directly rather than through a backup run: the only
-// skippable cold case is an overlong destination key (a cold READ failure is
-// fatal), and a key long enough to trigger it is longer than a real
+// skippable cold cases are an overlong destination key and an object deleted
+// mid-run (any other cold READ failure is fatal), and a key long enough to trigger it is longer than a real
 // filesystem will store, so a rig-level test would be fighting the OS instead
 // of the logic.
 func TestSkippedColdFileStaysOutOfTheReconciledPass(t *testing.T) {
@@ -930,5 +931,63 @@ func TestCorruptSidecarDoesNotFailAStandaloneRestore(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(rig.dataDir, "prod/cpu/2026/10/07/00/hot.parquet")); err != nil {
 		t.Errorf("the data was not restored: %v", err)
+	}
+}
+
+// vanishingBackend deletes an object the moment the backup reads it, as a
+// retention run deleting an expired cold file between the backup's listing and
+// its copy would.
+type vanishingBackend struct {
+	*storage.LocalBackend
+	vanish map[string]bool
+}
+
+func (b *vanishingBackend) ReadTo(ctx context.Context, path string, w io.Writer) error {
+	if b.vanish[path] {
+		if err := b.LocalBackend.Delete(ctx, path); err != nil {
+			return err
+		}
+	}
+	return b.LocalBackend.ReadTo(ctx, path, w)
+}
+
+// Retention deletes expired cold objects (#168), so one can be listed by the
+// backup and gone by the time it is copied. That is the hot path's "compaction
+// raced us" case and is skipped the same way, counted, while the run carries
+// everything else. The check is by type: the object must be verifiably gone.
+func TestColdObjectRetentionDeletedMidBackupIsSkipped(t *testing.T) {
+	ctx := context.Background()
+	rig := newColdRig(t, nil)
+	for i := 0; i < 30; i++ {
+		rig.write(t, fmt.Sprintf("prod/cpu/2026/10/07/00/hot%d.parquet", i), "PAR1hot")
+	}
+	const expired = "prod/cpu/2025/01/01/00/expired.parquet"
+	const kept = "prod/cpu/2026/01/01/00/kept.parquet"
+	rig.writeCold(t, expired, "PAR1cold")
+	rig.writeCold(t, kept, "PAR1cold")
+	local, ok := rig.cold.backend.(*storage.LocalBackend)
+	if !ok {
+		t.Fatalf("cold backend is %T, want *storage.LocalBackend for this test", rig.cold.backend)
+	}
+	rig.cold.backend = &vanishingBackend{LocalBackend: local, vanish: map[string]bool{expired: true}}
+
+	result, err := rig.m.CreateBackup(ctx, BackupOptions{})
+	if err != nil {
+		t.Fatalf("CreateBackup failed on a cold object retention deleted mid-run: %v", err)
+	}
+	if p := rig.m.GetProgress(); p == nil || p.SkippedFiles != 1 {
+		t.Fatalf("progress = %+v, want exactly the vanished cold file skipped", p)
+	}
+	// The manifest inventories both and records the skip, as for a hot file
+	// that vanished; the restore subtracts skipped files.
+	m := readManifestFile(t, rig.mainDir, result.Manifest.BackupID)
+	if m.ColdFiles != 2 || m.SkippedFiles != 1 {
+		t.Errorf("cold_files = %d, skipped_files = %d, want 2 inventoried and 1 skipped", m.ColdFiles, m.SkippedFiles)
+	}
+	for path, want := range map[string]bool{kept: true, expired: false} {
+		_, statErr := os.Stat(filepath.Join(rig.mainDir, result.Manifest.BackupID, "data", path))
+		if got := statErr == nil; got != want {
+			t.Errorf("%s in the backup = %v, want %v", path, got, want)
+		}
 	}
 }

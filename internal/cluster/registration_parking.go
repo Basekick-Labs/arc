@@ -47,6 +47,7 @@ const refusedDir = "_refused"
 
 const (
 	parkOpPark      = "park"
+	parkOpDeleting  = "deleting"
 	parkOpResolved  = "resolved"
 	parkResolveTick = 30 * time.Second
 	parkAlarmEvery  = 10 * time.Minute
@@ -54,11 +55,15 @@ const (
 
 // parkedRecord is one line of the refused journal.
 type parkedRecord struct {
-	Op       string        `json:"op"`
-	Rec      journalRecord `json:"rec"`
-	Kind     string        `json:"kind,omitempty"`
-	Instance uint64        `json:"instance,omitempty"`
-	Epoch    uint64        `json:"epoch,omitempty"`
+	Op  string        `json:"op"`
+	Rec journalRecord `json:"rec"`
+	// DeleteRecord is a durable database-delete decision. Once written, a
+	// restart can finish unlinking the parked copy without treating it as
+	// recoverable data again.
+	DeleteRecord uint64 `json:"delete_record,omitempty"`
+	Kind         string `json:"kind,omitempty"`
+	Instance     uint64 `json:"instance,omitempty"`
+	Epoch        uint64 `json:"epoch,omitempty"`
 	// Held is the parked file's path relative to the storage root; empty
 	// when the file could not be moved (it is left where it was).
 	Held string    `json:"held,omitempty"`
@@ -128,7 +133,7 @@ func loadRefused(path, clusterName string) (map[string]*parkedEntry, error) {
 			var pr parkedRecord
 			if json.Unmarshal(line, &pr) == nil && pr.Rec.Path != "" && pr.Rec.ClusterName == clusterName {
 				switch pr.Op {
-				case parkOpPark:
+				case parkOpPark, parkOpDeleting:
 					out[pr.Rec.Path] = &parkedEntry{rec: pr, parked: pr.At}
 				case parkOpResolved:
 					delete(out, pr.Rec.Path)
@@ -295,6 +300,15 @@ func (r *RegistrationOutbox) moveParked(e *parkedEntry) error {
 	case dstErr == nil:
 		// Already moved.
 	default:
+		if e.rec.DeleteRecord != 0 {
+			// A durable database-delete intent may have unlinked the file just
+			// before a crash. Keep the journal entry until the delete hooks are
+			// installed and the outbox can finish its WAL settlement.
+			r.mu.Lock()
+			e.moved = true
+			r.mu.Unlock()
+			return nil
+		}
 		// Removed after its rows were found registered elsewhere, before the
 		// resolved record was written: drop the record.
 		r.logger.Error().Str("path", e.rec.Rec.Path).Str("held", e.rec.Held).
@@ -495,6 +509,13 @@ func (r *RegistrationOutbox) resolveParked(ctx context.Context, manifest OutboxM
 		if pending {
 			continue
 		}
+		if e.rec.DeleteRecord != 0 {
+			if err := r.withdrawParkedForDelete(ctx, e.rec.Rec.Path, e.rec.DeleteRecord); err != nil {
+				r.logger.Warn().Err(err).Str("path", e.rec.Rec.Path).
+					Msg("Could not finish a parked file withdrawal for a database delete; retrying")
+			}
+			continue
+		}
 		if !moved && e.rec.Held != "" {
 			// A move that failed when parking: retry it, so the file leaves
 			// the query path before the next start.
@@ -527,15 +548,20 @@ func (r *RegistrationOutbox) parkedResolvable(ctx context.Context, e *parkedEntr
 	if !exact {
 		return false
 	}
+	covered := r.parkedCoveredFunc()
 	sets := map[uint64]raft.Intervals{}
 	for _, rg := range ranges {
-		if len(tk.UncoveredBatches(rg.Instance, rec.Cov.Key, rg.Lo, rg.Hi, rec.PartitionTime)) > 0 {
-			return false
+		for _, iv := range tk.UncoveredBatches(rg.Instance, rec.Cov.Key, rg.Lo, rg.Hi, rec.PartitionTime) {
+			for c := iv[0]; c <= iv[1]; c++ {
+				if !covered(rg.Instance, rec.Cov.Key, c, rec.PartitionTime) {
+					return false
+				}
+			}
 		}
 		sets[rg.Instance] = append(sets[rg.Instance], [2]uint64{rg.Lo, rg.Hi})
 	}
 	for _, p := range partial {
-		if !tk.CoverageCovered(p.Instance, rec.Cov.Key, rawPiece(p), rec.PartitionTime) {
+		if !tk.CoverageCovered(p.Instance, rec.Cov.Key, rawPiece(p), rec.PartitionTime) && !covered(p.Instance, rec.Cov.Key, p.CSeq, rec.PartitionTime) {
 			return false
 		}
 		sets[p.Instance] = append(sets[p.Instance], [2]uint64{p.CSeq, p.CSeq})
@@ -596,6 +622,27 @@ func (r *RegistrationOutbox) resolve(e *parkedEntry, p *LocalParking) error {
 	metrics.Get().SetWALParked(r.parkedStats())
 	r.logger.Info().Str("path", e.rec.Rec.Path).Msg("Parked file removed: every one of its rows is in a registered file this node holds")
 	return nil
+}
+
+// ParkedCoveredFunc reports whether every parked row of a batch in an hour
+// is registered, where the manifest cannot tell (a whole batch republished
+// in chunks or row ranges, #1207 S4b1c2b).
+type ParkedCoveredFunc func(inst uint64, key string, cseq uint64, hour time.Time) bool
+
+// SetParkedCovered installs the republisher's verdicts for the resolution.
+func (r *RegistrationOutbox) SetParkedCovered(fn ParkedCoveredFunc) {
+	if fn == nil {
+		r.parkedCovered.Store(nil)
+		return
+	}
+	r.parkedCovered.Store(&fn)
+}
+
+func (r *RegistrationOutbox) parkedCoveredFunc() ParkedCoveredFunc {
+	if p := r.parkedCovered.Load(); p != nil {
+		return *p
+	}
+	return func(uint64, string, uint64, time.Time) bool { return false }
 }
 
 // IsParked reports whether path is a parked registration.

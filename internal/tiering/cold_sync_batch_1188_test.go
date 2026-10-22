@@ -79,16 +79,12 @@ func TestSyncColdTierMetadataBatchesCacheInvalidationAndKeepsObjectTimestamps(t 
 	before := m.metadata.tierCacheGen
 	m.metadata.tierCacheMu.RUnlock()
 
-	synced, err := m.syncColdTierMetadata(ctx)
+	synced, rows, err := m.syncColdTierMetadata(ctx)
 	if err != nil {
 		t.Fatalf("syncColdTierMetadata: %v", err)
 	}
 	if synced != len(objects) {
 		t.Fatalf("synced = %d, want %d", synced, len(objects))
-	}
-	rows, err := m.metadata.GetFilesInTier(ctx, TierCold)
-	if err != nil {
-		t.Fatalf("GetFilesInTier: %v", err)
 	}
 	if len(rows) != len(objects) {
 		t.Fatalf("cold rows = %d, want %d", len(rows), len(objects))
@@ -163,16 +159,12 @@ func TestSyncColdTierMetadataContinuesAfterABatchWriteErrorAndInvalidatesOncePer
 		t.Fatalf("create test trigger: %v", err)
 	}
 
-	synced, err := m.syncColdTierMetadata(ctx)
+	synced, rows, err := m.syncColdTierMetadata(ctx)
 	if err != nil {
 		t.Fatalf("syncColdTierMetadata: %v", err)
 	}
 	if synced != len(objects)-1 {
 		t.Fatalf("syncColdTierMetadata synced = %d, want %d valid rows", synced, len(objects)-1)
-	}
-	rows, err := m.metadata.GetFilesInTier(ctx, TierCold)
-	if err != nil {
-		t.Fatalf("GetFilesInTier: %v", err)
 	}
 	if len(rows) != len(objects)-1 {
 		t.Fatalf("cold rows = %d, want %d valid rows", len(rows), len(objects)-1)
@@ -233,12 +225,13 @@ func TestSyncColdTierMetadataCancellationInvalidatesCommittedAndFallbackWrites(t
 
 	type syncResult struct {
 		synced int
+		rows   []FileMetadata
 		err    error
 	}
 	done := make(chan syncResult, 1)
 	go func() {
-		synced, err := m.syncColdTierMetadata(ctx)
-		done <- syncResult{synced: synced, err: err}
+		synced, rows, err := m.syncColdTierMetadata(ctx)
+		done <- syncResult{synced: synced, rows: rows, err: err}
 	}()
 
 	firstFallbackPath := objects[coldTierMetadataBatchSize].Path
@@ -273,6 +266,9 @@ func TestSyncColdTierMetadataCancellationInvalidatesCommittedAndFallbackWrites(t
 	result := <-done
 	if !errors.Is(result.err, context.Canceled) {
 		t.Fatalf("sync error = %v, want context.Canceled", result.err)
+	}
+	if len(result.rows) == 0 {
+		t.Fatal("cancelled sync returned no rows for the manifest sweep")
 	}
 	if row, err := m.metadata.GetFile(context.Background(), firstFallbackPath); err != nil || row == nil || row.Tier != TierCold {
 		t.Fatalf("first fallback row = (%+v, %v), want a persisted cold row", row, err)
