@@ -162,3 +162,12 @@ func TestExactShapeIgnoresCommentsAndQualify(t *testing.T) {
 		}
 	}
 }
+
+// Several bounds on one end: the narrowest holds for every row.
+func TestTimeRangeIntersectsBounds(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	tr := p.ExtractTimeRange("SELECT * FROM db.cpu WHERE time >= '2026-10-20 08:00:00' AND time >= '2026-10-20 10:00:00' AND time < '2026-10-20 12:00:00' AND time < '2026-10-20 11:00:00'")
+	if tr == nil || !tr.Start.Equal(mustT(t, "2026-10-20 10:00:00")) || !tr.End.Equal(mustT(t, "2026-10-20 11:00:00")) {
+		t.Fatalf("range %+v, want 10:00..11:00", tr)
+	}
+}
