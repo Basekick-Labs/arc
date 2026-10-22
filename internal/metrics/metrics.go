@@ -350,11 +350,18 @@ type Metrics struct {
 	clusterHeartbeatsUnknownNodeTotal atomic.Int64
 
 	clusterAuthApplyCreateTotal atomic.Int64
-	clusterAuthApplyUpdateTotal atomic.Int64
-	clusterAuthApplyRevokeTotal atomic.Int64
-	clusterAuthApplyDeleteTotal atomic.Int64
-	clusterAuthApplyRotateTotal atomic.Int64
-	clusterAuthRejectedTotal    atomic.Int64
+	// Reconcile of the local auth/RBAC SQLite with the cluster FSM (#1336).
+	// The three gauges hold the last run's counts across all six tables.
+	clusterAuthReconcileTotal       atomic.Int64
+	clusterAuthReconcileFailedTotal atomic.Int64
+	clusterAuthReconcileLocalRows   atomic.Int64
+	clusterAuthReconcileCollisions  atomic.Int64
+	clusterAuthReconcileKeptRows    atomic.Int64
+	clusterAuthApplyUpdateTotal     atomic.Int64
+	clusterAuthApplyRevokeTotal     atomic.Int64
+	clusterAuthApplyDeleteTotal     atomic.Int64
+	clusterAuthApplyRotateTotal     atomic.Int64
+	clusterAuthRejectedTotal        atomic.Int64
 
 	// Cluster RBAC metrics (Enterprise only — mutated on every FSM apply
 	// of an RBAC command). Same shape as the auth metrics above: one
@@ -976,6 +983,26 @@ func (m *Metrics) SetBackupSkippedFiles(n int64) {
 func (m *Metrics) IncClusterHeartbeatUnknownNode() { m.clusterHeartbeatsUnknownNodeTotal.Add(1) }
 
 func (m *Metrics) IncClusterAuthApplyCreate() { m.clusterAuthApplyCreateTotal.Add(1) }
+
+// RecordClusterAuthReconcileFailure counts a reconcile that failed before
+// anything committed; the gauges keep the last run's counts.
+func (m *Metrics) RecordClusterAuthReconcileFailure() {
+	m.clusterAuthReconcileTotal.Add(1)
+	m.clusterAuthReconcileFailedTotal.Add(1)
+}
+
+// RecordClusterAuthReconcile records one reconcile of the local auth and RBAC
+// tables with the cluster FSM (#1336). failed counts a run that failed or hit
+// statement errors; the gauges take the counts of whatever it did apply.
+func (m *Metrics) RecordClusterAuthReconcile(failed bool, localRows, collisions, keptRows int) {
+	m.clusterAuthReconcileTotal.Add(1)
+	if failed {
+		m.clusterAuthReconcileFailedTotal.Add(1)
+	}
+	m.clusterAuthReconcileLocalRows.Store(int64(localRows))
+	m.clusterAuthReconcileCollisions.Store(int64(collisions))
+	m.clusterAuthReconcileKeptRows.Store(int64(keptRows))
+}
 func (m *Metrics) IncClusterAuthApplyUpdate() { m.clusterAuthApplyUpdateTotal.Add(1) }
 func (m *Metrics) IncClusterAuthApplyRevoke() { m.clusterAuthApplyRevokeTotal.Add(1) }
 func (m *Metrics) IncClusterAuthApplyDelete() { m.clusterAuthApplyDeleteTotal.Add(1) }
@@ -1242,12 +1269,17 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
 
-		"cluster_auth_apply_create_total": m.clusterAuthApplyCreateTotal.Load(),
-		"cluster_auth_apply_update_total": m.clusterAuthApplyUpdateTotal.Load(),
-		"cluster_auth_apply_revoke_total": m.clusterAuthApplyRevokeTotal.Load(),
-		"cluster_auth_apply_delete_total": m.clusterAuthApplyDeleteTotal.Load(),
-		"cluster_auth_apply_rotate_total": m.clusterAuthApplyRotateTotal.Load(),
-		"cluster_auth_rejected_total":     m.clusterAuthRejectedTotal.Load(),
+		"cluster_auth_apply_create_total":     m.clusterAuthApplyCreateTotal.Load(),
+		"cluster_auth_reconcile_total":        m.clusterAuthReconcileTotal.Load(),
+		"cluster_auth_reconcile_failed_total": m.clusterAuthReconcileFailedTotal.Load(),
+		"cluster_auth_reconcile_local_rows":   m.clusterAuthReconcileLocalRows.Load(),
+		"cluster_auth_reconcile_collisions":   m.clusterAuthReconcileCollisions.Load(),
+		"cluster_auth_reconcile_kept_rows":    m.clusterAuthReconcileKeptRows.Load(),
+		"cluster_auth_apply_update_total":     m.clusterAuthApplyUpdateTotal.Load(),
+		"cluster_auth_apply_revoke_total":     m.clusterAuthApplyRevokeTotal.Load(),
+		"cluster_auth_apply_delete_total":     m.clusterAuthApplyDeleteTotal.Load(),
+		"cluster_auth_apply_rotate_total":     m.clusterAuthApplyRotateTotal.Load(),
+		"cluster_auth_rejected_total":         m.clusterAuthRejectedTotal.Load(),
 
 		// Cluster RBAC (Enterprise, Phase A.1)
 		"cluster_rbac_apply_create_organization_total":           m.clusterRBACApplyCreateOrganizationTotal.Load(),
@@ -1904,6 +1936,21 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_heartbeats_unknown_node_total Heartbeats received from a node absent from this node's registry.\n"...)
 	b = append(b, "# TYPE arc_cluster_heartbeats_unknown_node_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_heartbeats_unknown_node_total", float64(m.clusterHeartbeatsUnknownNodeTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_total Reconciles of this node's auth and RBAC tables with the cluster state (#1336).\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_total", float64(m.clusterAuthReconcileTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_failed_total Reconciles that failed; the local tables may still differ from the cluster.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_failed_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_failed_total", float64(m.clusterAuthReconcileFailedTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_local_rows Local auth/RBAC rows the cluster does not know, at the last reconcile (valid only on this node).\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_local_rows gauge\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_local_rows", float64(m.clusterAuthReconcileLocalRows.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_collisions Cluster auth/RBAC entries blocked by a local row at the last reconcile (unusable on this node).\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_collisions gauge\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_collisions", float64(m.clusterAuthReconcileCollisions.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_kept_rows Cluster rows the FSM lacks that the last reconcile kept instead of deleting.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_kept_rows gauge\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_kept_rows", float64(m.clusterAuthReconcileKeptRows.Load()))
 	b = append(b, "# HELP arc_cluster_auth_apply_create_total Total CommandCreateToken applies on this node.\n"...)
 	b = append(b, "# TYPE arc_cluster_auth_apply_create_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_auth_apply_create_total", float64(m.clusterAuthApplyCreateTotal.Load()))

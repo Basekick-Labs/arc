@@ -2764,6 +2764,17 @@ func main() {
 						}
 					},
 				)
+				// Both callback sets are wired: from here a snapshot install
+				// reconciles the local tables, and once this node has caught
+				// up with the leader they are reconciled for everything
+				// applied before the callbacks existed (#1336).
+				authReconcileCtx, authReconcileCancel := context.WithCancel(context.Background())
+				shutdownCoordinator.RegisterHook("cluster-auth-reconcile-cancel", func(context.Context) error {
+					authReconcileCancel()
+					return nil
+				}, 5)
+				startAuthReconcile(authReconcileCtx, fsm, clusterCoordinator, authManager.GetDB(), authManager, rbacManager,
+					authReconcileRetry, logger.Get("auth-reconcile"))
 				rbacProposer := cluster.NewCoordinatorAuthProposer(clusterCoordinator)
 				if rbacProposer != nil {
 					rbacManager.SetRaftProposer(rbacProposer)
@@ -3660,6 +3671,20 @@ func main() {
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}
+	if compactionManager != nil {
+		// Reads count each compaction's rows once while its output and inputs
+		// are both in storage; seeded from surviving manifests before any
+		// query is served.
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		compactionManager.SyncOpenJobs(syncCtx)
+		syncCancel()
+		queryHandler.SetOpenCompactions(compactionManager.OpenJobs)
+		if cfg.Query.EnableS3Cache {
+			// A listing cached before a job's output appeared would lack it
+			// while its inputs are already left out of reads.
+			compactionManager.OpenJobs.SetOnOutputSeen(db.ClearHTTPCache)
+		}
+	}
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
 	// pruner cache janitor — sweeps expired globCache / partitionCache
@@ -4176,6 +4201,9 @@ func main() {
 		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
 		if err == nil {
 			cqHandler.SetFieldSchema(fieldSchemaRegistry)
+			if compactionManager != nil {
+				cqHandler.SetOpenCompactions(compactionManager.OpenJobs)
+			}
 		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")

@@ -359,6 +359,16 @@ func (am *AuthManager) initDB() error {
 	// This is a one-time migration that will be skipped if all tokens have prefixes
 	am.backfillTokenPrefixes()
 
+	// raft_materialised marks a row this node wrote from the cluster's Raft
+	// state (#1336). Only a marked row may be changed or removed by a cluster
+	// apply or by the reconcile against the FSM; an unmarked row is local —
+	// a pre-26.06.1 token, or one created while the node ran standalone after
+	// a failed coordinator start — and nothing replicated may touch it.
+	if err := addRaftMaterialisedColumn(am.db, "api_tokens"); err != nil {
+		return err
+	}
+	am.backfillRaftMaterialisedTokens()
+
 	// Initialize RBAC tables (Enterprise feature)
 	if err := am.initRBACTables(); err != nil {
 		return fmt.Errorf("failed to initialize RBAC tables: %w", err)
@@ -448,6 +458,26 @@ func (am *AuthManager) initRBACTables() error {
 		return fmt.Errorf("failed to create rbac_token_memberships table: %w", err)
 	}
 
+	// raft_materialised on every RBAC table: see initDB (#1336).
+	for _, table := range []string{"rbac_organizations", "rbac_teams", "rbac_roles", "rbac_measurement_permissions", "rbac_token_memberships"} {
+		if err := addRaftMaterialisedColumn(am.db, table); err != nil {
+			return err
+		}
+	}
+
+	// Where the last reconcile against the cluster FSM left off (#1336): a
+	// single row holding the Raft term and the FSM's applied index. A later
+	// boot whose history is BELOW it is running on a rebuilt Raft.
+	if _, err := am.db.Exec(`
+		CREATE TABLE IF NOT EXISTS cluster_auth_reconcile_state (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			raft_term INTEGER NOT NULL,
+			applied_index INTEGER NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("failed to create cluster_auth_reconcile_state table: %w", err)
+	}
+
 	// Create indexes for performance
 	indexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_rbac_teams_org ON rbac_teams(organization_id)`,
@@ -465,6 +495,42 @@ func (am *AuthManager) initRBACTables() error {
 
 	am.logger.Debug().Msg("RBAC tables initialized")
 	return nil
+}
+
+// addRaftMaterialisedColumn adds the #1336 marker column to table. A
+// "duplicate column" error means an earlier start already added it.
+func addRaftMaterialisedColumn(db *sql.DB, table string) error {
+	_, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN raft_materialised INTEGER NOT NULL DEFAULT 0`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("add raft_materialised to %s: %w", table, err)
+	}
+	return nil
+}
+
+// clusterCreatedAtGlob matches the created_at text only a cluster apply
+// writes. ApplyCreateToken binds a Go time.Time, which go-sqlite3 stores as
+// "2006-01-02 15:04:05.999999999-07:00": always with a UTC offset. Every
+// local path leaves created_at to CURRENT_TIMESTAMP, which never carries one
+// ("2026-09-10 21:32:45").
+const clusterCreatedAtGlob = `[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]*[+-][0-9][0-9]:[0-9][0-9]`
+
+// backfillRaftMaterialisedTokens marks the token rows a cluster apply wrote
+// before the marker existed (#1336). Without it, a replicated token deleted
+// while this node was away before the upgrade would be indistinguishable
+// from a local one and keep authenticating. Idempotent; a failure leaves the
+// rows unmarked, which only means they are reported instead of reconciled.
+func (am *AuthManager) backfillRaftMaterialisedTokens() {
+	result, err := am.db.Exec(
+		`UPDATE api_tokens SET raft_materialised = 1 WHERE raft_materialised = 0 AND created_at GLOB ?`,
+		clusterCreatedAtGlob,
+	)
+	if err != nil {
+		am.logger.Error().Err(err).Msg("Failed to mark cluster-written api_tokens rows; they are reported instead of reconciled")
+		return
+	}
+	if n, _ := result.RowsAffected(); n > 0 {
+		am.logger.Info().Int64("rows", n).Msg("Marked api_tokens rows written by the cluster before #1336")
+	}
 }
 
 // backfillTokenPrefixes populates token_prefix for tokens that don't have it
