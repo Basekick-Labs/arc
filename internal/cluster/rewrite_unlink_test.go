@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 )
 
 // The unlink of a DELETE rewrite's old file waits until the rewrite is on
@@ -397,5 +399,58 @@ func TestDeferredCopyLeftOutOnceTheRewriteLands(t *testing.T) {
 	r.c.open.mu.Unlock()
 	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 1 || got[0] != old {
 		t.Fatalf("rewrite landed before its wake: excluded %v", got)
+	}
+}
+
+// Through the real delete callback (local storage): a rewrite leaving the
+// manifest wakes the unlinks waiting for it.
+func TestDeleteCallbackWakesADeferredFamily(t *testing.T) {
+	origin := startHangingOrigin(t)
+	root := t.TempDir()
+	b, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	c := newManifestDeleteRigWithBackend(t, origin.addr(), b, zerolog.Nop())
+	old := staleHour + "cpu_1.parquet"
+	rw := staleHour + "cpu_1_rewrite_5.parquet"
+	e := raft.FileEntry{Path: rw, SHA256: "x", SizeBytes: 5, Database: "testdb", Measurement: "cpu",
+		OriginNodeID: manifestDeleteOrigin, Tier: "hot", CreatedAt: time.Now()}
+	if err := c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	c.deletePendingMu.Lock()
+	c.deferred.add(old, deferredUnlink{reason: deleteRewriteReason, since: time.Now()})
+	c.deletePendingMu.Unlock()
+	if err := c.raftNode.DeleteFile(rw, "compaction:j1", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	waitFSM(t, func() bool { return !c.unlinkDeferred(old) })
+}
+
+// The stale-local pass runs the re-derivation until it has run once.
+func TestStaleLocalPassRetriesTheRederivation(t *testing.T) {
+	r := staleRig(t)
+	old := staleHour + "cpu_1.parquet"
+	rw := staleHour + "cpu_1_rewrite_5.parquet"
+	r.register(old, "all the rows")
+	r.pass()
+	e := raft.FileEntry{Path: rw, SHA256: "x", SizeBytes: 5, Database: "testdb", Measurement: "cpu",
+		OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.unregisterAs(old, deleteRewriteReason)
+	r.c.stale.rederived.Store(false)
+	r.c.staleLocalPass(context.Background())
+	if !r.c.stale.rederived.Load() {
+		t.Fatal("the pass did not run the re-derivation")
+	}
+	r.c.deletePendingMu.Lock()
+	n := len(r.c.deletePending)
+	r.c.deletePendingMu.Unlock()
+	if n != 1 {
+		t.Fatalf("queued %d", n)
 	}
 }
