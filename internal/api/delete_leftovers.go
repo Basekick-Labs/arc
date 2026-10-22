@@ -48,6 +48,10 @@ const deleteRetiredRoot = "_delete_retired"
 // retiredRecordVersion is written on every record.
 const retiredRecordVersion = 1
 
+// deleteReplaced removes a file a DELETE replaced (a variable so tests can
+// make it fail).
+var deleteReplaced = storage.DeleteWithRetry
+
 // retiredDrainEvery spaces the standalone drainer's passes.
 var retiredDrainEvery = time.Minute
 
@@ -330,7 +334,7 @@ func (h *DeleteHandler) removeLeftovers(ctx context.Context, database, measureme
 				continue
 			}
 		}
-		if err := storage.DeleteWithRetry(ctx, h.storage, l.path); err != nil {
+		if err := deleteReplaced(ctx, h.storage, l.path); err != nil {
 			h.logger.Warn().Err(err).Str("file", l.path).
 				Msg("Could not remove a file an earlier DELETE replaced; it stays out of DELETEs, and queries read its rows twice until it is removed")
 			continue
@@ -381,7 +385,7 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 	}
 	removed := 0
 	for _, r := range recs {
-		if err := storage.DeleteWithRetry(ctx, h.storage, r.Path); err != nil {
+		if err := deleteReplaced(ctx, h.storage, r.Path); err != nil {
 			h.logger.Warn().Err(err).Str("file", r.Path).Str("replaced_by", r.ReplacedBy).
 				Msg("Still cannot remove a file a DELETE replaced; queries read its rows twice until it is removed")
 			continue
