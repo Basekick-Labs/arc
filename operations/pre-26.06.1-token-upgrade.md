@@ -74,7 +74,8 @@ name with the old one on that node until the old row is removed.
 7. Remove the old token **locally on every node that holds it**. Stop the node,
    take a fresh backup, and remove only the positively identified legacy rows
    from its local auth database. (Marked, replicated rows need no manual
-   step: the node rebuilds them from replicated FSM state on every restart.) Do not select rows by ID alone or remove a replicated replacement.
+   step: the node rebuilds them from replicated FSM state on every restart.)
+   Do not select rows by ID alone or remove a replicated replacement.
    If identity cannot be established, stop and seek operator support rather than
    guessing. Restart and verify that replacement tokens still authenticate and
    legacy tokens do not. Keep quorum available during node maintenance, or use
