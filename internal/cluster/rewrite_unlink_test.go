@@ -454,3 +454,31 @@ func TestStaleLocalPassRetriesTheRederivation(t *testing.T) {
 		t.Fatalf("queued %d", n)
 	}
 }
+
+// A copy whose registration this node has not applied yet (the journal ahead
+// of the FSM) is not re-derived.
+func TestRederiveWaitsForTheRegistrationToApply(t *testing.T) {
+	r := staleRig(t)
+	old := staleHour + "cpu_1.parquet"
+	rw := staleHour + "cpu_1_rewrite_5.parquet"
+	r.register(old, "all the rows")
+	r.pass()
+	e := raft.FileEntry{Path: rw, SHA256: "x", SizeBytes: 5, Database: "testdb", Measurement: "cpu",
+		OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.unregisterAs(old, deleteRewriteReason)
+	seen := r.c.stale.seen.Load()
+	seen.update(old, func(rec seenRecord, _ bool) (seenRecord, bool) {
+		rec.lsn = r.c.raftNode.FSM().AppliedDone() + 100
+		return rec, true
+	})
+	r.c.rederiveRewriteUnlinks(context.Background(), seen)
+	r.c.deletePendingMu.Lock()
+	n := len(r.c.deletePending)
+	r.c.deletePendingMu.Unlock()
+	if n != 0 {
+		t.Fatalf("re-derived a copy whose registration is not applied: %d", n)
+	}
+}
