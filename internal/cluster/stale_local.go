@@ -58,7 +58,7 @@ var staleLocalMaxPerPass = 10000
 var staleLocalBreakerMin = 1000
 
 const (
-	staleLocalFeedQueue  = 4096
+	staleLocalFeedQueue = 4096
 	// staleLocalAsideDir is the reserved root a copy is moved to before it is
 	// removed; startup empties it, except copies kept for an operator.
 	staleLocalAsideDir  = "_stale_local"
