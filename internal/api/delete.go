@@ -1638,7 +1638,7 @@ func respondDeleteUnavailable(c *fiber.Ctx, resp DeleteResponse) error {
 // SetOnFilesRemoved sets the function called after this handler removed or
 // rewrote parquet files: the query caches hold pruned partition lists, and one
 // naming a removed hour makes DuckDB report "No files found", which a query
-// answers as an empty result until the cache expires.
+// answers with a retryable 503 (classifyNoFiles) until the cache is cleared.
 func (h *DeleteHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
 }

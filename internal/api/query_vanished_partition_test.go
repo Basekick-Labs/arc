@@ -64,6 +64,12 @@ func newVanishedRig(t *testing.T) *vanishedRig {
 // count runs sql on route and returns the HTTP status, success, and the
 // single count it answered (-1 when there is no row).
 func (r *vanishedRig) count(route, sql string) (int, bool, float64) {
+	status, ok, n, _, _ := r.query(route, sql)
+	return status, ok, n
+}
+
+// query is count plus the error text and the Retry-After header.
+func (r *vanishedRig) query(route, sql string) (int, bool, float64, string, string) {
 	r.t.Helper()
 	body, _ := json.Marshal(map[string]string{"sql": sql})
 	resp, err := r.client.Post(r.base+route, "application/json", bytes.NewReader(body))
@@ -73,13 +79,15 @@ func (r *vanishedRig) count(route, sql string) (int, bool, float64) {
 	var res struct {
 		Success bool            `json:"success"`
 		Data    [][]interface{} `json:"data"`
+		Error   string          `json:"error"`
 	}
 	_ = json.Unmarshal(out, &res)
+	retry := resp.Header.Get("Retry-After")
 	if len(res.Data) == 0 || len(res.Data[0]) == 0 {
-		return resp.StatusCode, res.Success, -1
+		return resp.StatusCode, res.Success, -1, res.Error, retry
 	}
 	n, _ := res.Data[0][0].(float64)
-	return resp.StatusCode, res.Success, n
+	return resp.StatusCode, res.Success, n, res.Error, retry
 }
 
 func (r *vanishedRig) removeHour(hour string) {
@@ -102,10 +110,11 @@ func TestQueryVanishedPartitionIsNotAnEmptyResult(t *testing.T) {
 	require.Equal(t, float64(3), n)
 
 	r.removeHour("11") // the cached transform still names hour 11
-	status, ok, n = r.count("/api/v1/query", q)
-	if status == 200 && ok {
-		t.Fatalf("a query whose pruned hour vanished answered success with count %v; want a failure, never an empty result", n)
-	}
+	status, ok, n, msg, retry := r.query("/api/v1/query", q)
+	require.Equal(t, 503, status, "a query whose pruned hour vanished answered %v (count %v); want a retryable 503, never an empty result", ok, n)
+	require.False(t, ok)
+	require.Equal(t, vanishedPartitionMessage, msg)
+	require.Equal(t, "1", retry)
 	status, ok, n = r.count("/api/v1/query", q)
 	require.Equal(t, 200, status, "the next query re-plans without the removed hour")
 	require.True(t, ok)
@@ -120,7 +129,20 @@ func TestQueryArrowVanishedPartitionIsNotAnEmptyResult(t *testing.T) {
 	require.Equal(t, 200, status)
 	r.removeHour("10")
 	status, _, _ = r.count("/api/v1/query/arrow", q)
-	require.NotEqual(t, 200, status, "an Arrow query whose pruned hour vanished must fail, not stream an empty result")
+	require.Equal(t, 503, status, "an Arrow query whose pruned hour vanished must fail, not stream an empty result")
+}
+
+// The same on the msgpack route.
+func TestQueryMsgPackVanishedPartitionIsNotAnEmptyResult(t *testing.T) {
+	r := newVanishedRig(t)
+	q := "SELECT COUNT(*) FROM db1.cpu WHERE time >= '2026-10-20 08:00:00' AND time < '2026-10-20 12:00:00'"
+	status, _, _ := r.count("/api/v1/query/msgpack", q)
+	require.Equal(t, 200, status)
+	r.removeHour("10")
+	status, _, _ = r.count("/api/v1/query/msgpack", q)
+	require.Equal(t, 503, status, "a msgpack query whose pruned hour vanished must fail, not answer empty")
+	status, _, _ = r.count("/api/v1/query/msgpack", "SELECT COUNT(*) FROM db1.nothing_here")
+	require.Equal(t, 200, status, "a measurement with no data still answers empty on msgpack")
 }
 
 // A measurement with no data at all is still an empty result: its unpruned

@@ -675,12 +675,15 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db                      *database.DuckDB
-	storage                 storage.Backend
-	pruner                  *pruning.PartitionPruner
-	fieldSchema             *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
-	emptyRangeAnchor        bool                  // #928: answer a proven-empty range from a complete anchor alone
-	queryCache              *database.QueryCache
+	db               *database.DuckDB
+	storage          storage.Backend
+	pruner           *pruning.PartitionPruner
+	fieldSchema      *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
+	emptyRangeAnchor bool                  // #928: answer a proven-empty range from a complete anchor alone
+	queryCache       *database.QueryCache
+	// vanishedInvalidatedAt rate-limits the cache wipe after a partition
+	// removed mid-query (UnixNano; see invalidateAfterVanished).
+	vanishedInvalidatedAt   atomic.Int64
 	logger                  zerolog.Logger
 	authManager             *auth.AuthManager
 	rbacManager             RBACChecker
@@ -1383,9 +1386,9 @@ func (h *QueryHandler) schemaRouteParams(c *fiber.Ctx) (string, string, bool) {
 }
 
 // missingAnchor reports whether a "No files found" error names one of this
-// process's materialized field schema anchors rather than a data glob. A
-// data glob matching nothing is an empty measurement and answers an empty
-// result; a missing anchor is a local file that was removed under a cached
+// process's materialized field schema anchors rather than a data glob. The
+// measurement's unpruned glob matching nothing answers an empty result (see
+// classifyNoFiles); a missing anchor is a local file that was removed under a cached
 // SQL transform, and answering an empty result for it would be a wrong
 // answer. The transform cache is dropped so the next attempt re-resolves
 // (and re-materializes) the anchor, and the error is surfaced.
@@ -2266,10 +2269,24 @@ localProcessing:
 		if cancel != nil {
 			cancel()
 		}
-		// Check if this is a "no files found" error — treat as empty result, not an error.
-		// This happens when querying a measurement that has no data on storage yet
-		// (e.g., new measurement, or DuckDB's httpfs cache is stale).
-		if h.noFilesIsEmpty(err) {
+		// "No files found": an empty result for a measurement with no data
+		// yet, a retryable 503 for a partition removed mid-query
+		// (classifyNoFiles).
+		kind := h.classifyNoFiles(err)
+		if kind == noFilesVanished {
+			m.IncQueryErrors()
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           vanishedPartitionMessage,
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
+		if kind == noFilesEmpty {
 			h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
 			m.IncQuerySuccess()
 			if h.queryRegistry != nil && queryID != "" {
@@ -2458,31 +2475,64 @@ func noFilesPattern(err error) (string, bool) {
 	return rest[:end], true
 }
 
-// noFilesIsEmpty reports whether a DuckDB error is a data glob that matched
-// nothing, which answers an empty result: a measurement with no data yet.
+// noFilesKind classifies a DuckDB "No files found" error.
+type noFilesKind int
+
+const (
+	// noFilesOther: not that error, or a missing schema anchor; an error.
+	noFilesOther noFilesKind = iota
+	// noFilesEmpty: the measurement's unpruned glob matched nothing, which
+	// answers an empty result (a measurement with no data yet).
+	noFilesEmpty
+	// noFilesVanished: a pruned partition or file disappeared after the
+	// query was planned. The answer is unknown, never empty.
+	noFilesVanished
+)
+
+// vanishedPartitionMessage is what a client sees for noFilesVanished: the
+// condition is transient and a retry re-plans, so it is a 503 with
+// Retry-After rather than DuckDB's text (which names storage paths).
+const vanishedPartitionMessage = "data read by this query was removed while it ran (retention, compaction or a delete); retry the query"
+
+// classifyNoFiles reports how a query error is answered.
 //
-// Only the measurement's unpruned "**/*.parquet" glob means that. Every other
-// pattern Arc hands DuckDB (an hour or day partition glob, an explicit file
-// from file-time pruning) was checked to exist when the query was planned, so
-// its absence at execution means files were removed in between: retention,
-// compaction or a DELETE took that hour while the query was in flight, or a
-// cached transform outlived the files. Answering an empty result there
-// dropped every row of the query, not just that hour's, with success:true.
-// The caches are cleared so the next attempt re-plans, and the error stands.
-// A missing schema anchor is an error for the same reason (missingAnchor).
-func (h *QueryHandler) noFilesIsEmpty(err error) bool {
+// Only the measurement's unpruned "**/*.parquet" glob matching nothing means
+// "no rows". Every other pattern Arc hands DuckDB (an hour or day partition
+// glob, an explicit file from file-time pruning) was checked to exist when
+// the query was planned, so its absence at execution means files were removed
+// in between: retention, compaction or a DELETE took that hour while the
+// query was in flight, or a cached transform outlived the files. Answering an
+// empty result there dropped every row of the query, not just that hour's,
+// with success:true. The caches are cleared so the next attempt re-plans.
+//
+// A "**" glob can still be one of several patterns a tiered read combines,
+// so an empty answer for it is only as right as it was before this check.
+func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 	if !isNoFilesFoundError(err) || h.missingAnchor(err) {
-		return false
+		return noFilesOther
 	}
 	pattern, ok := noFilesPattern(err)
 	if !ok || strings.HasSuffix(pattern, "**/*.parquet") {
-		return true
+		return noFilesEmpty
+	}
+	h.invalidateAfterVanished(pattern)
+	return noFilesVanished
+}
+
+// invalidateAfterVanished clears the query caches after a vanished partition,
+// at most once per second: an object-store listing that keeps failing keeps
+// unverified paths in every plan, and a node-wide wipe per query would
+// defeat the caches for everyone else.
+func (h *QueryHandler) invalidateAfterVanished(pattern string) {
+	now := time.Now().UnixNano()
+	last := h.vanishedInvalidatedAt.Load()
+	if now-last < int64(time.Second) || !h.vanishedInvalidatedAt.CompareAndSwap(last, now) {
+		return
 	}
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
 	h.logger.Warn().Str("pattern", pattern).
-		Msg("A pruned partition or file was removed while the query ran (retention, compaction or DELETE); query caches cleared, the query fails rather than answering empty")
-	return false
+		Msg("A pruned partition or file was removed while a query ran (retention, compaction or DELETE); query caches cleared, the query answers 503 rather than an empty result")
 }
 
 // SQLValidationError represents an error from SQL validation

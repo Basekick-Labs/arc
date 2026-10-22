@@ -1383,9 +1383,16 @@ with default settings. The usual causes are retention, compaction or a DELETE
 removing the hour while the query was in flight, or a cached plan (kept up to
 60 seconds) that still named it.
 
-Such a query now fails with an error and clears the query caches, so the next
-attempt re-plans without the removed hour. A measurement with no data at all
-still answers an empty result, as before.
+Such a query now answers **503 with `Retry-After: 1`** and the message "data
+read by this query was removed while it ran". The query caches are cleared,
+so a retry re-plans without the removed hour and returns the remaining rows.
+A measurement with no data at all still answers an empty result, as before.
+
+**S3 or Azure primary storage, or a cold tier:** when the object store cannot
+list a partition folder, Arc keeps that folder in the plan without checking
+it. If a kept folder turns out to hold no files, the query now gets the 503
+instead of an empty, incomplete answer, for as long as the listing keeps
+failing.
 
 ### Iceberg export on a local-storage cluster no longer publishes a file next to the one that replaced it
 

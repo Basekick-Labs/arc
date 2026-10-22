@@ -65,8 +65,26 @@ func executeArrowJSONQuery(
 	}
 
 	if err != nil {
-		// Check for "no files found" — return empty result, not error
-		if h.noFilesIsEmpty(err) {
+		kind := h.classifyNoFiles(err)
+		if kind == noFilesVanished {
+			if cancel != nil {
+				cancel()
+			}
+			m.IncQueryErrors()
+			if onFail != nil {
+				onFail(vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           vanishedPartitionMessage,
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+			return -1, true
+		}
+		// A measurement with no data yet: an empty result (classifyNoFiles).
+		if kind == noFilesEmpty {
 			if cancel != nil {
 				cancel()
 			}
