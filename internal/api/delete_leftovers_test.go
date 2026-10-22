@@ -275,7 +275,6 @@ func TestRewriteMatchingNothingKeepsTheFile(t *testing.T) {
 	}
 }
 
-
 // Cluster: an unlisted member is left out (never rewritten, never adopted)
 // while another member of its family is listed in the manifest or held by
 // the outbox; it is not removed (the manifest decides).

@@ -346,12 +346,12 @@ type Manager struct {
 	// and storage is local); inputLookup describes a candidate as the
 	// cluster manifest lists it; locallyStaged reports an input of a job this
 	// node staged and the cluster has not seen yet.
-	stagedMode    func() bool
+	stagedMode func() bool
 	// retired: the standalone DELETE journal's files (storage.ReadRetired),
 	// read at most every retiredTTL (filterRewriteLeftovers).
-	retiredMu sync.Mutex
-	retired   map[string]bool
-	retiredAt time.Time
+	retiredMu     sync.Mutex
+	retired       map[string]bool
+	retiredAt     time.Time
 	inputLookup   InputLookup
 	locallyStaged func(path string) bool
 
