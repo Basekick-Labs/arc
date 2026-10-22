@@ -248,30 +248,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	manifestManager := NewManifestManager(backend, logger)
 
 	// Create and run job
-	job := NewJob(&JobConfig{
-		Database:        config.Database,
-		Measurement:     config.Measurement,
-		PartitionPath:   config.PartitionPath,
-		Files:           config.Files,
-		StorageBackend:  backend,
-		Tier:            config.Tier,
-		BatchNumber:     config.BatchNumber,
-		TempDirectory:   config.TempDirectory,
-		SortKeys:        config.SortKeys,
-		Logger:          logger,
-		DB:              db,
-		ManifestManager: manifestManager,
-		// Phase 4: thread cluster-mode fields through to the job. When
-		// CompletionDir is empty (OSS / standalone), clusterMode() is
-		// false and the completion-manifest writes are no-ops.
-		JobID:                   config.JobID,
-		CompletionDir:           config.CompletionDir,
-		PartitionTime:           config.PartitionTime,
-		ParentFinalizesManifest: config.ParentFinalizesManifest,
-		Staged:                  config.Staged,
-		Inputs:                  config.Inputs,
-		OutputName:              config.OutputName,
-	})
+	job := NewJob(subprocessJobConfig(config, backend, logger, db, manifestManager))
 
 	// Use signal-aware context so the subprocess can cancel DuckDB queries
 	// when the parent kills it via SIGTERM (from exec.CommandContext).
@@ -279,22 +256,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	defer stop()
 	err = job.Run(ctx)
 
-	result := &SubprocessJobResult{
-		Success:        err == nil,
-		FilesCompacted: job.FilesCompacted,
-		BytesBefore:    job.BytesBefore,
-		BytesAfter:     job.BytesAfter,
-		// The storage key of the output (empty when the job produced none).
-		// The parent's compacted-output observer keys the edge sync ledger
-		// on this; the temp path would never match a storage listing.
-		OutputFile:      job.OutputStorageKey,
-		CompactedInputs: job.CompactedInputKeys(),
-		ManifestPath:    job.RetainedManifestPath(),
-		SourcesDeleted:  job.sourcesDeleted,
-	}
-	if err != nil {
-		result.Error = err.Error()
-	}
+	result := subprocessResult(job, err)
 
 	logger.Info().
 		Bool("success", result.Success).
@@ -648,4 +610,55 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	// Default: treat unknown errors as potentially recoverable once
 	// This allows one retry for transient issues
 	return true, "unknown"
+}
+
+// subprocessJobConfig is the Job a subprocess runs for config. Every field
+// the parent sends is carried here, OutputName included (OpenJobs relies on
+// the job writing the output under the name the parent registered).
+func subprocessJobConfig(config *SubprocessJobConfig, backend storage.Backend, logger zerolog.Logger, db *sql.DB, manifestManager *ManifestManager) *JobConfig {
+	return &JobConfig{
+		Database:        config.Database,
+		Measurement:     config.Measurement,
+		PartitionPath:   config.PartitionPath,
+		Files:           config.Files,
+		StorageBackend:  backend,
+		Tier:            config.Tier,
+		BatchNumber:     config.BatchNumber,
+		TempDirectory:   config.TempDirectory,
+		SortKeys:        config.SortKeys,
+		Logger:          logger,
+		DB:              db,
+		ManifestManager: manifestManager,
+		// Phase 4: thread cluster-mode fields through to the job. When
+		// CompletionDir is empty (OSS / standalone), clusterMode() is
+		// false and the completion-manifest writes are no-ops.
+		JobID:                   config.JobID,
+		CompletionDir:           config.CompletionDir,
+		PartitionTime:           config.PartitionTime,
+		ParentFinalizesManifest: config.ParentFinalizesManifest,
+		Staged:                  config.Staged,
+		Inputs:                  config.Inputs,
+		OutputName:              config.OutputName,
+	}
+}
+
+// subprocessResult is what the subprocess reports for job after Run.
+func subprocessResult(job *Job, err error) *SubprocessJobResult {
+	result := &SubprocessJobResult{
+		Success:        err == nil,
+		FilesCompacted: job.FilesCompacted,
+		BytesBefore:    job.BytesBefore,
+		BytesAfter:     job.BytesAfter,
+		// The storage key of the output (empty when the job produced none).
+		// The parent's compacted-output observer keys the edge sync ledger
+		// on this; the temp path would never match a storage listing.
+		OutputFile:      job.OutputStorageKey,
+		CompactedInputs: job.CompactedInputKeys(),
+		ManifestPath:    job.RetainedManifestPath(),
+		SourcesDeleted:  job.sourcesDeleted,
+	}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	return result
 }

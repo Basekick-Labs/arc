@@ -750,11 +750,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// on the clock alone. The uploaded storage key derives from this basename
 	// (see Job.Run), so a collision here would silently overwrite a sibling
 	// batch's compacted output.
-	name := j.outputName
-	if name == "" {
-		name = CompactionOutputName(j.Measurement, j.Tier, j.BatchNumber, time.Now())
-	}
-	outputFile := filepath.Join(tempDir, name)
+	outputFile := filepath.Join(tempDir, j.outputFileName())
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
@@ -1432,6 +1428,13 @@ func (j *Job) RetainedManifestPath() string {
 // canonicalManifestDatabase maps a spoke-namespace pseudo-database
 // ("{spoke}/{db}") to the database name its files were registered under at
 // receive time ({db}); plain names pass through.
+func canonicalManifestDatabase(database string) string {
+	if _, rest, found := strings.Cut(database, "/"); found && rest != "" {
+		return rest
+	}
+	return database
+}
+
 // CompactionOutputName is a compaction output's file name:
 // {measurement}_{YYYYMMDD}_{HHMMSS}_{unixnano}_b{batch}_{suffix}.parquet, the
 // suffix "compacted" for the hourly tier and the tier name otherwise.
@@ -1445,9 +1448,11 @@ func CompactionOutputName(measurement, tier string, batch int, at time.Time) str
 		measurement, now.Format("20060102_150405"), now.UnixNano(), batch, suffix)
 }
 
-func canonicalManifestDatabase(database string) string {
-	if _, rest, found := strings.Cut(database, "/"); found && rest != "" {
-		return rest
+// outputFileName is the output's file name: the parent's choice when it made
+// one (OpenJobs registered it), else named here.
+func (j *Job) outputFileName() string {
+	if j.outputName != "" {
+		return j.outputName
 	}
-	return database
+	return CompactionOutputName(j.Measurement, j.Tier, j.BatchNumber, time.Now())
 }

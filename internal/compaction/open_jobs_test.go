@@ -42,8 +42,8 @@ func TestOpenJobsExcludesOneSide(t *testing.T) {
 		t.Fatal("registering a job did not change the generation; a cached read would miss it")
 	}
 
-	if got := excluded(o, "db/m/"); len(got) != 1 || got[0] != out {
-		t.Fatalf("output absent: excluded %v, want the output", got)
+	if got := excluded(o, "db/m/"); len(got) != 0 {
+		t.Fatalf("output absent: excluded %v, want none (read as main does)", got)
 	}
 	if got := excluded(o, "db/other/"); len(got) != 0 {
 		t.Fatalf("another measurement: excluded %v, want none", got)
@@ -99,8 +99,8 @@ func TestOpenJobsSync(t *testing.T) {
 	o3, _ := openJobsRig(t)
 	o3.register(out, man, []string{in})
 	o3.sync(map[string]*Manifest{})
-	if got := excluded(o3, "db/m/"); len(got) != 1 || got[0] != out {
-		t.Fatalf("running job dropped by sync: excluded %v", got)
+	if _, ok := o3.jobs[out]; !ok {
+		t.Fatal("running job dropped by sync")
 	}
 }
 
@@ -144,12 +144,80 @@ func TestOpenJobsPruneFinished(t *testing.T) {
 	if got := excluded(o, "db/m/"); len(got) != 0 {
 		t.Fatalf("manifest gone: excluded %v, want none", got)
 	}
-	// A running job is never pruned (its manifest may not be written yet):
-	// with its output not written either, the output is left out.
-	_ = b.Delete(ctx, out)
+	// A running job is never pruned (its manifest may not be written yet).
 	o.register(out, man, []string{in})
 	o.pruneFinished(ctx)
-	if got := excluded(o, "db/m/"); len(got) != 1 || got[0] != out {
-		t.Fatalf("running job pruned: excluded %v", got)
+	if _, ok := o.jobs[out]; !ok {
+		t.Fatal("running job pruned")
+	}
+}
+
+// With the output in place and its manifest gone the inputs were deleted:
+// nothing is left out and the entry goes, on any node (one that never runs a
+// cycle included).
+func TestOpenJobsDropsAnEntryWhoseManifestIsGone(t *testing.T) {
+	o, b := openJobsRig(t)
+	ctx := context.Background()
+	out := "db/m/2026/10/20/10/m_w_b1_compacted.parquet"
+	_ = b.Write(ctx, out, []byte("parquet"))
+	o.sync(map[string]*Manifest{"_compaction_state/hourly/db/job4.json": {OutputPath: out}})
+	o.jobs[out].inputs = nil // force a manifest read
+	g := o.Generation()
+	if got := excluded(o, "db/m/"); len(got) != 0 {
+		t.Fatalf("excluded %v, want none", got)
+	}
+	if _, ok := o.jobs[out]; ok || o.Generation() == g {
+		t.Fatal("the entry for a job whose manifest is gone was kept")
+	}
+}
+
+// A result with its inputs deleted, or a success that wrote nothing, ends a
+// job; a failure does not.
+func TestJobOver(t *testing.T) {
+	for _, tc := range []struct {
+		r    *SubprocessJobResult
+		want bool
+	}{
+		{nil, false},
+		{&SubprocessJobResult{Success: true, OutputFile: "x", SourcesDeleted: true}, true},
+		{&SubprocessJobResult{Success: true, OutputFile: "x"}, false},
+		{&SubprocessJobResult{Success: true}, true},
+		{&SubprocessJobResult{Success: false}, false},
+	} {
+		if got := jobOver(tc.r); got != tc.want {
+			t.Errorf("jobOver(%+v) = %v, want %v", tc.r, got, tc.want)
+		}
+	}
+}
+
+// The parent's chosen name reaches the job, and the job reports its deletes.
+func TestSubprocessCarriesOutputNameAndSourcesDeleted(t *testing.T) {
+	cfg := subprocessJobConfig(&SubprocessJobConfig{Measurement: "cpu", Tier: "hourly", OutputName: "cpu_x_b1_compacted.parquet"}, nil, zerolog.Nop(), nil, nil)
+	if cfg.OutputName != "cpu_x_b1_compacted.parquet" {
+		t.Fatalf("OutputName %q not carried to the job", cfg.OutputName)
+	}
+	j := NewJob(cfg)
+	if got := j.outputFileName(); got != "cpu_x_b1_compacted.parquet" {
+		t.Fatalf("job names its output %q, want the parent's", got)
+	}
+	j.sourcesDeleted = true
+	if r := subprocessResult(j, nil); !r.SourcesDeleted {
+		t.Fatal("SourcesDeleted not reported")
+	}
+}
+
+// An edge-sync hub's spoke partition: the registered manifest is the one the
+// job writes (its Manifest.Database keeps the spoke prefix).
+func TestRegisterOpenJobUsesTheJobsManifestPath(t *testing.T) {
+	b, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{OpenJobs: NewOpenJobs(b), ManifestManager: NewManifestManager(b, zerolog.Nop())}
+	c := Candidate{Database: "spoke1/db", Measurement: "m", Tier: "hourly", PartitionPath: "spoke1/db/m/2026/10/20/10"}
+	out := m.registerOpenJob(c, "job5", "m_x_b1_compacted.parquet")
+	want := m.ManifestManager.GenerateManifestPath("hourly", "spoke1/db", c.PartitionPath, "job5")
+	if got := m.OpenJobs.jobs[out].manifestPath; got != want {
+		t.Fatalf("registered manifest %q, the job writes %q", got, want)
 	}
 }

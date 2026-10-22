@@ -1171,12 +1171,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	var activeOutput string
 	if !config.Staged {
 		config.OutputName = CompactionOutputName(candidate.Measurement, candidate.Tier, candidate.BatchNumber, time.Now())
-		activeOutput = path.Join(filepath.ToSlash(candidate.PartitionPath), config.OutputName)
-		manifestPath := ""
-		if m.ManifestManager != nil {
-			manifestPath = m.ManifestManager.GenerateManifestPath(candidate.Tier, canonicalManifestDatabase(candidate.Database), candidate.PartitionPath, jobID)
-		}
-		m.OpenJobs.register(activeOutput, manifestPath, candidate.Files)
+		activeOutput = m.registerOpenJob(candidate, jobID, config.OutputName)
 	}
 
 	// Run compaction in subprocess for memory isolation
@@ -1299,7 +1294,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// After the caches are dropped: a query planned from here reads the
 	// partition as it now is.
 	if activeOutput != "" {
-		m.OpenJobs.finish(activeOutput, result != nil && result.SourcesDeleted)
+		m.OpenJobs.finish(activeOutput, jobOver(result))
 	}
 
 	// Return error if subprocess failed
@@ -2891,4 +2886,29 @@ func (m *Manager) SyncOpenJobs(ctx context.Context) {
 		manifests[p] = man
 	}
 	m.OpenJobs.sync(manifests)
+}
+
+// jobOver reports a subprocess result after which a job's output and inputs
+// cannot both be in storage: its inputs were deleted, or it succeeded without
+// writing an output (nothing to compact). A failure keeps the entry until its
+// manifest is gone.
+func jobOver(result *SubprocessJobResult) bool {
+	if result == nil {
+		return false
+	}
+	return result.SourcesDeleted || (result.Success && result.OutputFile == "")
+}
+
+// registerOpenJob records a legacy job before its subprocess can write the
+// output, and returns the output's storage key.
+func (m *Manager) registerOpenJob(candidate Candidate, jobID, outputName string) string {
+	output := path.Join(filepath.ToSlash(candidate.PartitionPath), outputName)
+	manifestPath := ""
+	if m.ManifestManager != nil {
+		// The database as the job writes it (Job.Run's Manifest.Database),
+		// spoke prefix included on an edge-sync hub.
+		manifestPath = m.ManifestManager.GenerateManifestPath(candidate.Tier, candidate.Database, candidate.PartitionPath, jobID)
+	}
+	m.OpenJobs.register(output, manifestPath, candidate.Files)
+	return output
 }

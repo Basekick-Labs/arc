@@ -1458,10 +1458,9 @@ func (h *QueryHandler) openCompactionExclusions(ctx context.Context, prefix stri
 // wrapOpenCompactions makes a read count a compaction's rows once. A legacy
 // compaction puts its output in the partition before deleting its inputs, so
 // a read between the two sees both; a continuous query in that window writes
-// the doubled aggregate back. For each such job on this measurement,
-// compaction.OpenJobs names the side to leave out: the output while it is
-// absent (it may appear before DuckDB lists the directory), the inputs once
-// it is there. expr contains one read_parquet(...) call and ends with it.
+// the doubled aggregate back. For each such job on this measurement whose
+// output is in storage, compaction.OpenJobs names its inputs. expr contains
+// one read_parquet(...) call and ends with it.
 // The excluded files are still opened: DuckDB does not skip a file by its
 // name column. The result is volatile.
 func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storage.Backend, expr, database, measurement string) string {

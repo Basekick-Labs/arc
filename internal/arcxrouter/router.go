@@ -275,11 +275,8 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	basePath := local.GetBasePath()
 
 	prefix := d.Ctx.Database + "/" + d.Ctx.Measurement + "/"
-	entries, err := h.Storage.List(ctx, prefix)
-	if err != nil {
-		h.Logger.Warn().Err(err).Str("prefix", prefix).Msg("arcx: storage list failed; declining")
-		return "", false
-	}
+	// Before the listing: a job's inputs are named only once its output is in
+	// storage, so a listing taken after always holds that output.
 	var skip map[string]struct{}
 	if h.Exclude != nil {
 		for _, k := range h.Exclude(ctx, prefix) {
@@ -288,6 +285,11 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 			}
 			skip[k] = struct{}{}
 		}
+	}
+	entries, err := h.Storage.List(ctx, prefix)
+	if err != nil {
+		h.Logger.Warn().Err(err).Str("prefix", prefix).Msg("arcx: storage list failed; declining")
+		return "", false
 	}
 	var arr strings.Builder
 	arr.WriteByte('[')

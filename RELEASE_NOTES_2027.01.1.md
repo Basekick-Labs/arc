@@ -1391,17 +1391,21 @@ standalone, on JSON, Arrow and msgpack queries.
   storage. It does so from before the output is written until its inputs are
   known to be gone. After a restart, the jobs are rebuilt from the
   compaction's recovery manifests before any query is served.
-- Queries, continuous queries and the arcx engine read exactly one side of
-  each such job. Before the output exists they read the inputs; once it
-  exists, they read the output.
+- Once a compaction's output is in storage, queries, continuous queries and
+  the arcx engine leave its inputs out, because the output holds their rows.
+  This holds until the inputs are deleted, including after a failed delete
+  or a restart.
 - Outside those windows nothing changes.
 
 **Limitations:**
 - With shared storage (several nodes, one bucket), only the node running the
   compaction knows about it. Queries on other nodes can still see the window.
   A follow-up release covers them.
-- A query planned just before a compaction started and executed after its
-  output appeared can still see the window once.
+- One short race remains, as before: a query planned just before the output
+  is written can still read both sides, if its read lists the files after
+  the upload and before the inputs are deleted (normally milliseconds).
+  Leaving the output out of such a query would instead lose the job's rows
+  when the inputs are deleted first, which is worse.
 
 ### A cached query no longer misses an hour its relative end has just reached
 

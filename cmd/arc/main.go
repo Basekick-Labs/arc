@@ -3664,7 +3664,9 @@ func main() {
 		// Reads count each compaction's rows once while its output and inputs
 		// are both in storage; seeded from surviving manifests before any
 		// query is served.
-		compactionManager.SyncOpenJobs(context.Background())
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		compactionManager.SyncOpenJobs(syncCtx)
+		syncCancel()
 		queryHandler.SetOpenCompactions(compactionManager.OpenJobs)
 	}
 	queryHandler.RegisterRoutes(server.GetApp())

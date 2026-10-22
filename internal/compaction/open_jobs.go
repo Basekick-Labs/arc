@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,11 +23,14 @@ import (
 // until the inputs are known to be gone: the subprocess reports
 // SourcesDeleted, or the job's crash-recovery manifest no longer exists.
 //
-// For each entry a query reads one side only (ExcludedFor): while the output
-// is absent, the output (it may appear before the read lists the directory);
-// once it is present, the inputs the manifest says it holds. Either is exact
-// whatever the read lists, because the output never disappears while its
-// inputs exist.
+// Once a job's output is in storage, a query leaves its inputs out
+// (ExcludedFor): the output holds their rows, and it never disappears while
+// they exist. Before the output exists nothing is left out. That keeps one
+// race of the original bug: a query planned before the upload whose read
+// lists the partition after it and before the inputs are deleted still sees
+// both (milliseconds normally). Leaving the output out instead would drop the
+// job's rows for a query whose read lands after the inputs are gone, which is
+// worse than the original.
 type OpenJobs struct {
 	backend storage.Backend
 	mu      sync.Mutex
@@ -92,11 +96,12 @@ func (a *OpenJobs) sync(manifests map[string]*Manifest) {
 		if man == nil || man.OutputPath == "" {
 			continue
 		}
-		if j, ok := a.jobs[man.OutputPath]; ok {
+		out := filepath.ToSlash(man.OutputPath)
+		if j, ok := a.jobs[out]; ok {
 			j.inputs, j.manifestPath = man.InputFiles, path
 			continue
 		}
-		a.jobs[man.OutputPath] = &openJob{output: man.OutputPath, manifestPath: path, inputs: man.InputFiles}
+		a.jobs[out] = &openJob{output: out, manifestPath: path, inputs: man.InputFiles}
 		changed = true
 	}
 	for out, j := range a.jobs {
@@ -126,7 +131,6 @@ func (a *OpenJobs) pruneFinished(ctx context.Context) {
 		}
 	}
 	a.mu.Unlock()
-	changed := false
 	for _, j := range check {
 		if j.manifestPath == "" {
 			continue
@@ -135,21 +139,13 @@ func (a *OpenJobs) pruneFinished(ctx context.Context) {
 		if err != nil || exists {
 			continue
 		}
-		a.mu.Lock()
-		if cur, ok := a.jobs[j.output]; ok && cur == j && !cur.running {
-			delete(a.jobs, j.output)
-			changed = true
-		}
-		a.mu.Unlock()
-	}
-	if changed {
-		a.gen.Add(1)
+		a.drop(j)
 	}
 }
 
 // ExcludedFor returns the storage keys under prefix ("db/measurement/") that
-// a read must leave out, so it sees each active job's rows once. Empty in the
-// common case of no job on that measurement.
+// a read must leave out so it sees each open job's rows once: the inputs of
+// every job whose output is in storage. Empty in the common case.
 func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
 	if a == nil {
 		return nil
@@ -166,9 +162,7 @@ func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
 	for _, j := range jobs {
 		size, err := a.backend.StatFile(ctx, j.output)
 		if err != nil || size < 0 {
-			// Absent (or unknown): leave the output out; it may appear
-			// before the read lists the directory.
-			out = append(out, j.output)
+			// Absent (or unknown): read as main does; see the type comment.
 			continue
 		}
 		out = append(out, a.inputsOf(ctx, j)...)
@@ -177,8 +171,9 @@ func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
 }
 
 // inputsOf is the job's input list from its manifest, read once. A manifest
-// gone with the output in place means the inputs were deleted: nothing to
-// leave out. An unreadable manifest falls back to the parent's candidates.
+// gone with the output in place means the inputs were deleted: the job is
+// over and its entry goes. An unreadable manifest falls back to the parent's
+// candidates.
 func (a *OpenJobs) inputsOf(ctx context.Context, j *openJob) []string {
 	a.mu.Lock()
 	if j.inputs != nil {
@@ -191,6 +186,7 @@ func (a *OpenJobs) inputsOf(ctx context.Context, j *openJob) []string {
 	data, err := a.backend.Read(ctx, path)
 	if err != nil {
 		if storage.IsNotFound(err) {
+			a.drop(j)
 			return nil
 		}
 		return cand
@@ -203,4 +199,18 @@ func (a *OpenJobs) inputsOf(ctx context.Context, j *openJob) []string {
 	j.inputs = man.InputFiles
 	a.mu.Unlock()
 	return man.InputFiles
+}
+
+// drop removes j if it is still the entry for its output and not running.
+func (a *OpenJobs) drop(j *openJob) {
+	a.mu.Lock()
+	cur, ok := a.jobs[j.output]
+	removed := ok && cur == j && !cur.running
+	if removed {
+		delete(a.jobs, j.output)
+	}
+	a.mu.Unlock()
+	if removed {
+		a.gen.Add(1)
+	}
 }
