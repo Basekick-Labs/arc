@@ -1373,6 +1373,20 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A query no longer answers empty when an hour it reads is removed while it runs
+
+Arc narrows a time-filtered query to the hour partitions that exist and hands
+DuckDB that list. If one of those hours was removed before DuckDB read it, the
+query answered `success: true` with **no rows at all**. Every row was lost,
+not just the removed hour's. This happened on JSON, Arrow and msgpack queries
+with default settings. The usual causes are retention, compaction or a DELETE
+removing the hour while the query was in flight, or a cached plan (kept up to
+60 seconds) that still named it.
+
+Such a query now fails with an error and clears the query caches, so the next
+attempt re-plans without the removed hour. A measurement with no data at all
+still answers an empty result, as before.
+
 ### Iceberg export on a local-storage cluster no longer publishes a file next to the one that replaced it
 
 On a cluster with local storage, a node removes its copy of a deleted file
