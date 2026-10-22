@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -392,4 +393,35 @@ func TestOpenNilCoordinator(t *testing.T) {
 		t.Fatal("nil coordinator answered")
 	}
 	c.SetOnObjectOutputSeen(func() {})
+}
+
+// A staged job does not make reads volatile (its output cannot be at its key
+// before the commit), so the commit must move the generation: a plan cached
+// while it was only staged is not served once the output can appear.
+func TestOpenCommitMovesTheGeneration(t *testing.T) {
+	r := objectRig(t)
+	ctx := context.Background()
+	job := r.job("j1")
+	job.Object = true
+	r.store.mu.Lock()
+	r.store.meta[job.StagedKey] = job.Output.SHA256
+	r.store.mu.Unlock()
+	sc := r.c.StagedCommitter()
+	g0 := r.c.OpenGeneration()
+	if out, err := sc.Stage(ctx, job); out != compaction.StagedOK {
+		t.Fatalf("stage: %v %v", out, err)
+	}
+	if r.c.OpenAny(openPrefix) {
+		t.Fatal("a staged, uncommitted job made reads volatile")
+	}
+	g1 := r.c.OpenGeneration()
+	if g1 == g0 {
+		t.Fatal("staging did not move the generation")
+	}
+	if out, err := sc.Commit(ctx, job); out != compaction.StagedOK {
+		t.Fatalf("commit: %v %v", out, err)
+	}
+	if !r.c.OpenAny(openPrefix) || r.c.OpenGeneration() == g1 {
+		t.Fatal("the commit did not make reads volatile and move the generation")
+	}
 }
