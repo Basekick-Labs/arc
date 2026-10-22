@@ -3656,6 +3656,9 @@ func main() {
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}
+	// Ingest counts rows stamped past this margin whether or not the
+	// feature is on, so the risk is visible before it is enabled.
+	arrowBuffer.SetFutureStampMargin(time.Duration(cfg.Query.FileTimePruningMarginSeconds) * time.Second)
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
 	// pruner cache janitor — sweeps expired globCache / partitionCache

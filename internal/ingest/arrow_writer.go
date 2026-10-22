@@ -1055,9 +1055,16 @@ type fileRegistrarRef struct{ FileRegistrar }
 // ArrowBuffer manages buffering and periodic flushing of Arrow data
 // Uses lock sharding to reduce contention across concurrent writes
 type ArrowBuffer struct {
-	config  *config.IngestConfig
-	storage storage.Backend
-	writer  *ArrowWriter
+	// futureStampMargin is query.file_time_pruning_margin_seconds (nanoseconds;
+	// 0 means the 300 s default): rows stamped more than this past a flush,
+	// in the flush's own hour, can be left out of a live-hour query by
+	// file-level time pruning until the hour closes (#659).
+	futureStampMargin atomic.Int64
+	// futureStampWarned rate-limits that warning per measurement (UnixNano).
+	futureStampWarned sync.Map
+	config            *config.IngestConfig
+	storage           storage.Backend
+	writer            *ArrowWriter
 
 	// Optional WAL for durability
 	wal WALWriter
@@ -4469,18 +4476,24 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// names as sent, for column ordering.
 	fileTags := b.fileTagColumns(database, measurement, merged)
 
-	// Log warning if data is significantly old or in the future
+	// Log warning if data is significantly old or in the future. Separate
+	// checks on the matching end: a batch can hold both, and a future row is
+	// the latest one, not the earliest.
 	now := time.Now().UTC()
 	if minTime.Before(now.AddDate(0, 0, -7)) {
 		b.logger.Warn().
 			Time("data_time", minTime).
 			Str("buffer_key", bufferKey).
 			Msg("Data timestamp is >7 days old - possible backfill or clock skew")
-	} else if minTime.After(now.Add(time.Hour)) {
+	}
+	if maxTime.After(now.Add(time.Hour)) {
 		b.logger.Warn().
-			Time("data_time", minTime).
+			Time("data_time", maxTime).
 			Str("buffer_key", bufferKey).
 			Msg("Data timestamp is >1 hour in future - possible clock skew")
+	}
+	if maxTime.After(now.Add(b.futureMargin())) {
+		b.countFutureStamped(database, measurement, times, now)
 	}
 
 	// OPTIMIZATION: If batch fits within single hour, skip splitting
@@ -5582,6 +5595,59 @@ var flushNameNow = time.Now
 // - Query all of November: read_parquet('s3://bucket/db/cpu/2025/11/*/*/*.parquet')
 // - Query specific day: read_parquet('s3://bucket/db/cpu/2025/11/25/*/*.parquet')
 // - Query specific hour: read_parquet('s3://bucket/db/cpu/2025/11/25/16/*.parquet')
+// SetFutureStampMargin sets the margin rows may be stamped past their flush
+// before file-level time pruning can hide them (query.
+// file_time_pruning_margin_seconds). Safe while ingest runs.
+func (b *ArrowBuffer) SetFutureStampMargin(d time.Duration) {
+	// The pruner raises a margin under a second to one; match it.
+	if d < time.Second {
+		d = time.Second
+	}
+	b.futureStampMargin.Store(int64(d))
+}
+
+func (b *ArrowBuffer) futureMargin() time.Duration {
+	if d := time.Duration(b.futureStampMargin.Load()); d > 0 {
+		return d
+	}
+	return 300 * time.Second
+}
+
+// countFutureStamped counts the rows a live-hour query can miss with
+// file-level time pruning on: stamped more than the margin past this flush
+// and still in the flush's hour. A row in a later hour lands in that hour's
+// directory, where its file is kept as anomalous, so it is not counted. now
+// is taken before the file is named, so the count errs high.
+func (b *ArrowBuffer) countFutureStamped(database, measurement string, times []int64, now time.Time) {
+	lo := now.Add(b.futureMargin()).UnixMicro()
+	hi := now.Truncate(time.Hour).Add(time.Hour).UnixMicro()
+	if lo >= hi {
+		return
+	}
+	n := 0
+	for _, t := range times {
+		if t > lo && t < hi {
+			n++
+		}
+	}
+	if n == 0 {
+		return
+	}
+	metrics.Get().AddIngestFutureStampedRows(n)
+	key := database + "/" + measurement
+	nowNano := now.UnixNano()
+	if v, ok := b.futureStampWarned.Load(key); ok && nowNano-v.(int64) < int64(time.Minute) {
+		return
+	}
+	b.futureStampWarned.Store(key, nowNano)
+	b.logger.Warn().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("rows", n).
+		Dur("margin", b.futureMargin()).
+		Msg("Rows stamped more than query.file_time_pruning_margin_seconds ahead of this node's clock, in the current hour: with file-level time pruning on, a query starting after the flush can miss them until the hour closes. Check the writers' clocks")
+}
+
 func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitionTime time.Time) string {
 	// Hierarchical partitioning: year/month/day/hour
 	year := partitionTime.Format("2006")

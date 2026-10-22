@@ -272,6 +272,9 @@ type Metrics struct {
 	fileTimePruningCapFallback    atomic.Int64
 	fileTimePruningZeroSurvivors  atomic.Int64
 	fileTimePruningAnomalousKept  atomic.Int64
+	// ingestFutureStampedRows: rows stamped more than the file-time pruning
+	// margin past their flush, in its hour.
+	ingestFutureStampedRows atomic.Int64
 	// compactionCopyFallbackTotal counts compaction outputs an object store
 	// refused to copy server-side, copied through the node instead;
 	// compactionFinishedTotal, committed object-store compactions their
@@ -900,6 +903,10 @@ func (m *Metrics) IncFileTimePruningCapFallback() { m.fileTimePruningCapFallback
 // IncFileTimePruningZeroSurvivors records a pass that kept no file.
 func (m *Metrics) IncFileTimePruningZeroSurvivors() { m.fileTimePruningZeroSurvivors.Add(1) }
 
+// AddIngestFutureStampedRows records rows stamped more than the file-time
+// pruning margin past their flush, in its hour.
+func (m *Metrics) AddIngestFutureStampedRows(n int) { m.ingestFutureStampedRows.Add(int64(n)) }
+
 // AddFileTimePruningAnomalousKept records files kept because their name time
 // is before their directory's hour (future-stamped rows).
 func (m *Metrics) AddFileTimePruningAnomalousKept(n int) {
@@ -1215,6 +1222,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"file_time_pruning_cap_fallback_total":    m.fileTimePruningCapFallback.Load(),
 		"file_time_pruning_zero_survivors_total":  m.fileTimePruningZeroSurvivors.Load(),
 		"file_time_pruning_anomalous_kept_total":  m.fileTimePruningAnomalousKept.Load(),
+		"ingest_future_stamped_rows_total":        m.ingestFutureStampedRows.Load(),
 		"compaction_copy_fallback_total":          m.compactionCopyFallbackTotal.Load(),
 		"compaction_finished_total":               m.compactionFinishedTotal.Load(),
 		"compaction_wedged_total":                 m.compactionWedgedTotal.Load(),
@@ -1838,6 +1846,7 @@ func (m *Metrics) PrometheusFormat() string {
 		{"arc_query_file_time_pruning_nothing_dropped_total", "File-time pruning passes where every live-hour file was in range (the margin covers the files listed).", m.fileTimePruningNothingDropped.Load()},
 		{"arc_query_file_time_pruning_cap_fallback_total", "File-time pruning passes that kept too many files to list and read the whole hour.", m.fileTimePruningCapFallback.Load()},
 		{"arc_query_file_time_pruning_zero_survivors_total", "File-time pruning passes that kept no live-hour file.", m.fileTimePruningZeroSurvivors.Load()},
+		{"arc_ingest_future_stamped_rows_total", "Rows stamped more than query.file_time_pruning_margin_seconds past their flush, in the flush's hour: with file-level time pruning on, a query can miss them until the hour closes.", m.ingestFutureStampedRows.Load()},
 		{"arc_query_file_time_pruning_anomalous_kept_total", "Live-hour files kept because their name time is before their hour (rows stamped ahead of the writer's clock).", m.fileTimePruningAnomalousKept.Load()},
 	} {
 		b = append(b, "# HELP "+c.name+" "+c.help+"\n"...)
