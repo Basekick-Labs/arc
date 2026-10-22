@@ -3660,6 +3660,13 @@ func main() {
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}
+	if compactionManager != nil {
+		// Reads count each compaction's rows once while its output and inputs
+		// are both in storage; seeded from surviving manifests before any
+		// query is served.
+		compactionManager.SyncOpenJobs(context.Background())
+		queryHandler.SetOpenCompactions(compactionManager.OpenJobs)
+	}
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
 	// pruner cache janitor — sweeps expired globCache / partitionCache

@@ -85,8 +85,12 @@ type SubprocessJobConfig struct {
 	// not a user-facing field — matches the plain tag on completion.go's twin.
 	PartitionTime time.Time `json:"partition_time"`
 	// Staged commit (#1207 d2a2a): see JobConfig.Staged.
-	Staged bool                   `json:"staged,omitempty"`
-	Inputs map[string]StagedInput `json:"inputs,omitempty"`
+	// OutputName is the output's file name, chosen by the parent so it can
+	// register the job (OpenJobs) before the output can exist. Empty from
+	// an older parent: the job names it as before.
+	OutputName string                 `json:"output_name,omitempty"`
+	Staged     bool                   `json:"staged,omitempty"`
+	Inputs     map[string]StagedInput `json:"inputs,omitempty"`
 }
 
 // SubprocessJobResult is returned by the subprocess via stdout as JSON.
@@ -107,6 +111,11 @@ type SubprocessJobResult struct {
 	// left in place under ParentFinalizesManifest; empty otherwise. The
 	// parent deletes it after receipt marking commits.
 	ManifestPath string `json:"manifest_path,omitempty"`
+	// SourcesDeleted: every consumed input was deleted. Until then queries
+	// must not read the output and the inputs together (OpenJobs). False
+	// from an older subprocess, which keeps the parent's entry until the
+	// manifest is gone.
+	SourcesDeleted bool `json:"sources_deleted,omitempty"`
 }
 
 // SubprocessCredentials are the storage secrets a compaction subprocess needs
@@ -261,6 +270,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		ParentFinalizesManifest: config.ParentFinalizesManifest,
 		Staged:                  config.Staged,
 		Inputs:                  config.Inputs,
+		OutputName:              config.OutputName,
 	})
 
 	// Use signal-aware context so the subprocess can cancel DuckDB queries
@@ -280,6 +290,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		OutputFile:      job.OutputStorageKey,
 		CompactedInputs: job.CompactedInputKeys(),
 		ManifestPath:    job.RetainedManifestPath(),
+		SourcesDeleted:  job.sourcesDeleted,
 	}
 	if err != nil {
 		result.Error = err.Error()

@@ -681,6 +681,9 @@ type QueryHandler struct {
 	fieldSchema      *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
 	emptyRangeAnchor bool                  // #928: answer a proven-empty range from a complete anchor alone
 	queryCache       *database.QueryCache
+	// openCompactions lists compaction jobs whose output and inputs can both
+	// be in storage (compaction.OpenJobs); nil without a compaction manager.
+	openCompactions OpenCompactions
 	// vanishedInvalidatedAt rate-limits the cache wipe after a partition
 	// removed mid-query (UnixNano; see invalidateAfterVanished).
 	vanishedInvalidatedAt   atomic.Int64
@@ -1414,6 +1417,63 @@ func (h *QueryHandler) SetGovernance(manager *governance.Manager, lc *license.Cl
 // SetQueryRegistry sets the query registry for long-running query management.
 func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
+}
+
+// OpenCompactions is what the query layer needs from compaction.OpenJobs.
+type OpenCompactions interface {
+	ExcludedFor(ctx context.Context, prefix string) []string
+	Generation() uint64
+}
+
+// SetOpenCompactions wires the compaction jobs a read must account for.
+func (h *QueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
+
+func (h *QueryHandler) openCompactionsGeneration() uint64 {
+	if h.openCompactions == nil {
+		return 0
+	}
+	return h.openCompactions.Generation()
+}
+
+// openCompactionFileColumn names the file column the exclusion reads. Not
+// "filename": DuckDB refuses that option on a file that has such a column.
+const openCompactionFileColumn = "__arc_file"
+
+// excludeOpenCompactions makes a read count a compaction's rows once. A
+// legacy compaction puts its output in the partition before deleting its
+// inputs, so a read between the two sees both; a continuous query in that
+// window writes the doubled aggregate back. For each such job on this
+// measurement, compaction.OpenJobs names the side to leave out: the output
+// while it is absent (it may appear before DuckDB lists the directory), the
+// inputs once it is there. The excluded files are still opened: DuckDB does
+// not skip a file by its name column. The result is volatile.
+func (h *QueryHandler) excludeOpenCompactions(ctx context.Context, expr, database, measurement string) string {
+	if h.openCompactions == nil || database == "" || measurement == "" {
+		return expr
+	}
+	keys := h.openCompactions.ExcludedFor(ctx, database+"/"+measurement+"/")
+	if len(keys) == 0 {
+		return expr
+	}
+	i := strings.Index(expr, "read_parquet(")
+	if i < 0 || !strings.HasSuffix(expr, ")") {
+		return expr
+	}
+	quoted := make([]string, 0, len(keys))
+	for _, k := range keys {
+		uri, err := storage.ObjectURI(h.storage, k)
+		if err != nil {
+			continue
+		}
+		quoted = append(quoted, sqlutil.QuoteStringLiteral(uri))
+	}
+	if len(quoted) == 0 {
+		return expr
+	}
+	pruning.MarkVolatile(ctx)
+	return expr[:i] + "(SELECT * EXCLUDE (" + openCompactionFileColumn + ") FROM " +
+		expr[i:len(expr)-1] + ", filename='" + openCompactionFileColumn + "') WHERE " +
+		openCompactionFileColumn + " NOT IN (" + strings.Join(quoted, ", ") + "))"
 }
 
 // SetFileTimePruning enables file-level time pruning on the partition pruner
@@ -2988,7 +3048,7 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	// before an hour started is never served after it (the pruner leaves out
 	// hours that have not started and have no files), including an hour a
 	// relative end has just reached (CacheEpoch).
-	cacheKey := h.pruner.CacheEpoch(sql) + ":" + sql
+	cacheKey := h.pruner.CacheEpoch(sql) + ":" + strconv.FormatUint(h.openCompactionsGeneration(), 10) + ":" + sql
 	if headerDB != "" {
 		cacheKey = headerDB + ":" + cacheKey
 	}
@@ -3482,6 +3542,13 @@ func joinKeyword(prefix string) string {
 // for join clauses.
 // If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
 func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalSQL, keyword string) string {
+	db, meas := h.extractDBMeasurementFromPath(path)
+	return h.excludeOpenCompactions(ctx, h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword), db, meas)
+}
+
+// buildReadParquetExprRaw is buildReadParquetExpr without the open
+// compaction exclusions.
+func (h *QueryHandler) buildReadParquetExprRaw(ctx context.Context, path, originalSQL, keyword string) string {
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -3547,7 +3614,7 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 					Str("database", database).
 					Str("measurement", measurement).
 					Msg("Tiering enabled: building multi-tier query (fast path)")
-				return h.buildMultiTierReadParquet(ctx, database, measurement, originalSQL, tieredPaths, keyword)
+				return h.excludeOpenCompactions(ctx, h.buildMultiTierReadParquet(ctx, database, measurement, originalSQL, tieredPaths, keyword), database, measurement)
 			}
 		}
 	}

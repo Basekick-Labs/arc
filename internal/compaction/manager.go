@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -217,6 +218,9 @@ func (o CycleRecord) clone() CycleRecord {
 
 // Manager orchestrates compaction jobs across all measurements
 type Manager struct {
+	// OpenJobs is the legacy jobs whose output and inputs can both be in
+	// storage; queries read one side of each (never nil).
+	OpenJobs        *OpenJobs
 	StorageBackend  storage.Backend
 	LockManager     *LockManager
 	ManifestManager *ManifestManager
@@ -458,6 +462,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 
 	m := &Manager{
+		OpenJobs:         NewOpenJobs(cfg.StorageBackend),
 		StorageBackend:   cfg.StorageBackend,
 		LockManager:      cfg.LockManager,
 		ManifestManager:  NewManifestManager(cfg.StorageBackend, logger),
@@ -1159,6 +1164,20 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		// the receipts at its commit.
 		config.ParentFinalizesManifest = false
 	}
+	// A legacy job writes its output into the partition before deleting its
+	// inputs: register it before the output can exist, so queries read one
+	// side only (OpenJobs). A staged job's output waits under its staged
+	// key until the cluster commits it.
+	var activeOutput string
+	if !config.Staged {
+		config.OutputName = CompactionOutputName(candidate.Measurement, candidate.Tier, candidate.BatchNumber, time.Now())
+		activeOutput = path.Join(filepath.ToSlash(candidate.PartitionPath), config.OutputName)
+		manifestPath := ""
+		if m.ManifestManager != nil {
+			manifestPath = m.ManifestManager.GenerateManifestPath(candidate.Tier, canonicalManifestDatabase(candidate.Database), candidate.PartitionPath, jobID)
+		}
+		m.OpenJobs.register(activeOutput, manifestPath, candidate.Files)
+	}
 
 	// Run compaction in subprocess for memory isolation
 	result, err := runJobInSubprocess(ctx, config, m.logger)
@@ -1276,6 +1295,11 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 
 	if shouldInvalidateCache && onComplete != nil {
 		onComplete()
+	}
+	// After the caches are dropped: a query planned from here reads the
+	// partition as it now is.
+	if activeOutput != "" {
+		m.OpenJobs.finish(activeOutput, result != nil && result.SourcesDeleted)
 	}
 
 	// Return error if subprocess failed
@@ -1802,6 +1826,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// single-tier schedulers.
 	if m.ManifestManager != nil {
 		recovered, err := m.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
+		m.SyncOpenJobs(ctx)
 		if recovered > 0 {
 			m.mu.Lock()
 			m.totalManifestsRecov += recovered
@@ -2838,4 +2863,29 @@ func (m *Manager) JobHistory(limit int, cycleID int64) (page JobHistoryPage) {
 		page.Jobs = append(page.Jobs, copied)
 	}
 	return page
+}
+
+// SyncOpenJobs makes OpenJobs agree with the crash-recovery manifests in
+// storage: a job whose manifest survived (a failed delete, a crash, an
+// earlier process) still has inputs beside its output; a finished one whose
+// manifest is gone is over. Called at startup before queries are served, and
+// after each cycle's recovery.
+func (m *Manager) SyncOpenJobs(ctx context.Context) {
+	if m == nil || m.ManifestManager == nil {
+		return
+	}
+	paths, err := m.ManifestManager.ListManifests(ctx)
+	if err != nil {
+		m.logger.Warn().Err(err).Msg("Could not list compaction manifests; in-progress compaction outputs are not reconciled this time")
+		return
+	}
+	manifests := make(map[string]*Manifest, len(paths))
+	for _, p := range paths {
+		man, err := m.ManifestManager.ReadManifest(ctx, p)
+		if err != nil {
+			continue
+		}
+		manifests[p] = man
+	}
+	m.OpenJobs.sync(manifests)
 }
