@@ -78,11 +78,18 @@ func TestFileTimePruningDeclinedPassIsNotCachedAndIsCounted(t *testing.T) {
 
 // An end-only range assumes its start and never reaches the live hour.
 func TestFileTimePruningNeverActsOnAnAssumedStart(t *testing.T) {
-	now := time.Now().UTC()
-	p := NewPartitionPruner(zerolog.Nop())
-	p.SetFileTimePruning(true, time.Second)
-	tr := &TimeRange{Start: now.Truncate(time.Hour), End: now, StartAssumed: true}
-	if _, _, eligible := p.fileTimePass(context.Background(), []string{"/x/2026/01/01/00/*.parquet"}, tr); eligible {
+	now := time.Date(2026, 8, 28, 20, 40, 0, 0, time.UTC)
+	hour := now.Truncate(time.Hour)
+	dir, glob := buildHourDir(t, t.TempDir(), hour)
+	mkfile(t, dir, fnameNanos("m", hour.Add(time.Minute)))
+	mkfile(t, dir, fnameNanos("m", now.Add(-time.Second)))
+	p := newTestPruner(now)
+	// Same range with the start real: the pass runs and drops the 20:01 file.
+	if _, expanded, _ := p.fileTimePass(context.Background(), []string{glob}, &TimeRange{Start: now.Add(-time.Minute), End: now}); !expanded {
+		t.Fatal("precondition: a real start in the live hour should expand")
+	}
+	tr := &TimeRange{Start: now.Add(-time.Minute), End: now, StartAssumed: true}
+	if _, _, eligible := p.fileTimePass(context.Background(), []string{glob}, tr); eligible {
 		t.Fatal("an assumed start was treated as a real lower bound")
 	}
 }
