@@ -29,6 +29,7 @@ import (
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -2562,31 +2563,53 @@ localProcessing:
 	return nil
 }
 
+// duckdbMessage returns the message of a DuckDB error of type t, as DuckDB
+// wrote it ("<Type> Error: ..."), unwrapping Arc's own wrapping.
+//
+// The classifiers below match on DuckDB's text, so they must read only an
+// error DuckDB raised, and only from its start: DuckDB echoes user text in
+// other errors (a failed CAST quotes the literal, error() its argument, a
+// Binder error the SQL), and a query could otherwise forge "a file vanished"
+// to get a 503 and wipe the node's caches, or forge "no files" to get an
+// empty success (#1355 review).
+func duckdbMessage(err error, t duckdb.ErrorType) (string, bool) {
+	var de *duckdb.Error
+	if !errors.As(err, &de) || de.Type != t {
+		return "", false
+	}
+	return de.Msg, true
+}
+
+// quotedAfter returns the text between quote and the next quote when msg
+// starts with lead+quote, and that text is followed by tail.
+func quotedAfter(msg, lead, quote, tail string) (string, bool) {
+	rest, ok := strings.CutPrefix(msg, lead+quote)
+	if !ok {
+		return "", false
+	}
+	end := strings.Index(rest, quote)
+	if end <= 0 || !strings.HasPrefix(rest[end+len(quote):], tail) {
+		return "", false
+	}
+	return rest[:end], true
+}
+
 // isNoFilesFoundError checks if a DuckDB error is the "No files found" IO error.
 // This occurs when read_parquet glob pattern matches zero files on S3/Azure/local storage.
-// This is NOT a real error — it means the measurement has no data yet (or DuckDB's
-// httpfs directory cache is stale). We treat it as an empty result.
+// What it means is classifyNoFiles's call: no data yet, or a pattern that
+// vanished.
 func isNoFilesFoundError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "No files found that match the pattern")
+	_, ok := noFilesPattern(err)
+	return ok
 }
 
 // noFilesPattern returns the pattern a DuckDB "No files found" error names.
 func noFilesPattern(err error) (string, bool) {
-	if err == nil {
+	msg, ok := duckdbMessage(err, duckdb.ErrorTypeIO)
+	if !ok {
 		return "", false
 	}
-	msg := err.Error()
-	const lead = "No files found that match the pattern \""
-	start := strings.Index(msg, lead)
-	if start < 0 {
-		return "", false
-	}
-	rest := msg[start+len(lead):]
-	end := strings.Index(rest, "\"")
-	if end < 0 {
-		return "", false
-	}
-	return rest[:end], true
+	return quotedAfter(msg, "IO Error: No files found that match the pattern ", `"`, "")
 }
 
 // noFilesKind classifies a DuckDB "No files found" error.
@@ -2650,61 +2673,63 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 
 // vanishedFile returns the file a DuckDB scan could not open because it no
 // longer existed, and whether it is an object-store URL. The texts were
-// measured with the duckdb-go Arc ships (TestVanishedFileTexts pins them):
+// measured with the duckdb-go Arc ships; the local one is pinned by
+// TestVanishedFileTexts, and the S3 and Azure ones were recorded against
+// SeaweedFS 4.47 and Azurite 3.35 (TestClassifyVanishedFile):
 //
-//	local: Cannot open file "<path>": No such file or directory
-//	S3:    HTTP GET error reading '<url>' in region '<r>' (HTTP 404 Not Found)
-//	Azure: AzureStorageFileSystem open file '<url>' failed with code 'BlobNotFound', ...
+//	local: IO Error: Cannot open file "<path>": No such file or directory
+//	S3:    HTTP Error: HTTP GET error reading '<url>' in region '<r>' (HTTP 404 Not Found)
+//	Azure: IO Error: AzureStorageFileSystem open file '<url>' failed with code 'BlobNotFound', ...
 //
-// Only the fragments DuckDB writes are matched: the S3 reason phrase after
-// the status code comes from the server, so it is not.
+// Each must be a DuckDB error of that type and start with that text
+// (duckdbMessage). The S3 reason phrase after the status code comes from the
+// server, so it is not matched.
 func vanishedFile(err error) (path string, remote bool, ok bool) {
-	if err == nil {
-		return "", false, false
-	}
-	msg := err.Error()
-	between := func(lead, quote, tail string) (string, bool) {
-		i := strings.Index(msg, lead)
-		if i < 0 {
-			return "", false
+	if msg, ok := duckdbMessage(err, duckdb.ErrorTypeIO); ok {
+		if p, ok := quotedAfter(msg, "IO Error: Cannot open file ", `"`, ": No such file or directory"); ok {
+			return p, false, true
 		}
-		rest := msg[i+len(lead):]
-		end := strings.Index(rest, quote)
-		if end <= 0 || !strings.HasPrefix(rest[end+len(quote):], tail) {
-			return "", false
-		}
-		return rest[:end], true
-	}
-	if p, ok := between(`Cannot open file "`, `"`, ": No such file or directory"); ok {
-		return p, false, true
-	}
-	if p, ok := between("HTTP GET error reading '", "'", ""); ok {
-		if i := strings.Index(msg, p); i >= 0 && strings.Contains(msg[i:], "(HTTP 404") {
+		if p, ok := quotedAfter(msg, "IO Error: AzureStorageFileSystem open file ", "'", " failed with code 'BlobNotFound'"); ok {
 			return p, true, true
 		}
 	}
-	if p, ok := between("AzureStorageFileSystem open file '", "'", " failed with code 'BlobNotFound'"); ok {
-		return p, true, true
+	if msg, ok := duckdbMessage(err, duckdb.ErrorTypeHTTP); ok {
+		if p, ok := quotedAfter(msg, "HTTP Error: HTTP GET error reading ", "'", ""); ok {
+			tail := strings.TrimPrefix(msg, "HTTP Error: HTTP GET error reading '"+p+"'")
+			if i := strings.Index(tail, "(HTTP "); i >= 0 && strings.HasPrefix(tail[i:], "(HTTP 404") {
+				return p, true, true
+			}
+		}
 	}
 	return "", false, false
 }
 
 // plannedFile reports whether a file a scan could not open is one Arc's
-// patterns matched: a Parquet file under the local storage root, or a
-// Parquet object (Arc writes every object path DuckDB reads; a client cannot
-// name one). A missing schema anchor is not: it keeps #1333's handling
-// (missingAnchorPath).
+// patterns matched: a Parquet file under the local storage root, or, on a
+// node that reads an object store (primary storage or a cold tier), a
+// Parquet object. Arc builds every object path DuckDB reads. A missing
+// schema anchor is not one: it keeps #1333's handling (missingAnchorPath).
 func (h *QueryHandler) plannedFile(path string, remote bool) bool {
 	if !strings.HasSuffix(path, ".parquet") {
 		return false
 	}
 	if remote {
-		return true
+		return h.readsObjectStore()
 	}
 	if !underRoot(path, h.getStorageBasePath()) {
 		return false
 	}
 	return !h.missingAnchorPath(path)
+}
+
+// readsObjectStore reports whether this node's queries read S3 or Azure:
+// its primary storage, or a tiering cold tier.
+func (h *QueryHandler) readsObjectStore() bool {
+	switch h.storage.(type) {
+	case *storage.S3Backend, *storage.AzureBlobBackend:
+		return true
+	}
+	return h.tieringManager != nil
 }
 
 // underRoot reports whether path is inside root, matching at a separator so
@@ -2719,8 +2744,10 @@ func underRoot(path, root string) bool {
 // failing keeps unverified paths in every plan, and a node-wide wipe per
 // query would defeat the caches for everyone else. For an object it also
 // clears cache_httpfs, on its own once-per-second gate: a cached listing
-// still names the removed object, and until it expired (10 s) every retry
-// failed the same way while Retry-After said 1 s.
+// still names the removed object, and until the entry expired every retry
+// failed the same way while Retry-After said 1 s. The clear runs in the
+// background: it takes a pooled connection, and this request's 503 must not
+// wait behind running queries for one.
 func (h *QueryHandler) invalidateAfterVanished(path string, remote bool) {
 	now := time.Now().UnixNano()
 	if remote {
@@ -2728,7 +2755,7 @@ func (h *QueryHandler) invalidateAfterVanished(path string, remote bool) {
 			if h.clearHTTPCache != nil {
 				h.clearHTTPCache()
 			} else {
-				h.db.ClearHTTPCache()
+				go h.db.ClearHTTPCacheQuietly()
 			}
 		}
 	}

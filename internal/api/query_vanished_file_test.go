@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -186,11 +187,12 @@ func TestQueryFileRemovedMidScanIsRetryable(t *testing.T) {
 	}
 }
 
-// DuckDB's text for a file removed mid-scan, as it is today: if an upgrade
-// rewords it, vanishedFile stops recognising it and this fails, instead of
-// the 500 quietly coming back. The S3 and Azure texts were measured against
-// SeaweedFS 4.47 and Azurite 3.35 and are pinned in
-// TestClassifyVanishedFile.
+// DuckDB's text for a local file removed mid-scan, as it is today: if an
+// upgrade rewords it, vanishedFile stops recognising it and this fails,
+// instead of the 500 quietly coming back. The S3 and Azure texts were
+// measured against SeaweedFS 4.47 and Azurite 3.35 and are recorded, not
+// pinned, in TestClassifyVanishedFile: no CI job runs either service against
+// DuckDB.
 func TestVanishedFileTexts(t *testing.T) {
 	_, h, arm := newVanishedFileRig(t)
 	victim := arm("11")
@@ -207,42 +209,56 @@ func TestVanishedFileTexts(t *testing.T) {
 func TestClassifyVanishedFile(t *testing.T) {
 	_, h, _ := newVanishedFileRig(t)
 	root := h.getStorageBasePath()
+	local := h.storage
 	clears := 0
 	h.clearHTTPCache = func() { clears++ }
 	anchorDir := filepath.Join(root, "_anchors")
 	h.SetFieldSchema(fieldschema.New(h.storage, nil, fieldschema.Options{Enabled: true, LocalDir: anchorDir}, zerolog.Nop()))
 
-	local := func(p string) error {
-		return errors.New(`arrow query failed: IO Error: Cannot open file "` + p + `": No such file or directory`)
+	io := func(msg string) error {
+		return fmt.Errorf("arrow query failed: %w", &duckdb.Error{Type: duckdb.ErrorTypeIO, Msg: msg})
 	}
+	httpErr := func(msg string) error { return &duckdb.Error{Type: duckdb.ErrorTypeHTTP, Msg: msg} }
+	missing := func(p string) error { return io(`IO Error: Cannot open file "` + p + `": No such file or directory`) }
 	file := filepath.Join(root, "db1", "cpu", "2026", "10", "20", "11", "x.parquet")
+	s3 := httpErr(`HTTP Error: HTTP GET error reading 'http://127.0.0.1:18333/arc/db1/cpu/2026/10/20/11/x.parquet' in region 'us-east-1' (HTTP 404 Not Found)`)
+	azure := io(`IO Error: AzureStorageFileSystem open file 'azure://arc/db1/cpu/2026/10/20/11/x.parquet' failed with code 'BlobNotFound', Reason Phrase: 'The specified blob does not exist.', Message: ''`)
 	for _, c := range []struct {
-		name   string
-		err    error
-		want   noFilesKind
-		remote bool
+		name        string
+		err         error
+		objectStore bool // the node reads S3 or Azure
+		want        noFilesKind
+		clears      int
 	}{
-		{"local file under the root", local(file), noFilesVanished, false},
-		{"S3 object", errors.New(`HTTP Error: HTTP GET error reading 'http://127.0.0.1:18333/arc/db1/cpu/2026/10/20/11/x.parquet' in region 'us-east-1' (HTTP 404 Not Found)`), noFilesVanished, true},
-		{"S3 object, another reason phrase", errors.New(`HTTP Error: HTTP GET error reading 'https://s3.amazonaws.com/arc/db1/cpu/x.parquet' in region 'eu-west-1' (HTTP 404 NoSuchKey)`), noFilesVanished, true},
-		{"Azure blob", errors.New(`IO Error: AzureStorageFileSystem open file 'azure://arc/db1/cpu/2026/10/20/11/x.parquet' failed with code 'BlobNotFound', Reason Phrase: 'The specified blob does not exist.', Message: ''`), noFilesVanished, true},
-		{"S3 403 is not a removal", errors.New(`HTTP Error: HTTP GET error reading 'http://h/arc/db1/cpu/x.parquet' in region 'r' (HTTP 403 Forbidden)`), noFilesOther, false},
-		{"Azure other code", errors.New(`IO Error: AzureStorageFileSystem open file 'azure://arc/x.parquet' failed with code 'AuthorizationFailure', Reason Phrase: ''`), noFilesOther, false},
-		{"permission denied", errors.New(`IO Error: Cannot open file "` + file + `": Permission denied`), noFilesOther, false},
-		{"outside the root", local("/elsewhere/x.parquet"), noFilesOther, false},
-		{"a sibling of the root", local(root + "-other/db1/cpu/x.parquet"), noFilesOther, false},
-		{"not Parquet", local(filepath.Join(root, "db1", "cpu", "x.json")), noFilesOther, false},
-		{"a schema anchor", local(filepath.Join(anchorDir, "schema", "db1", "cpu", "a.parquet")), noFilesOther, false},
+		{"local file under the root", missing(file), false, noFilesVanished, 0},
+		{"S3 object", s3, true, noFilesVanished, 1},
+		{"S3 object, another reason phrase", httpErr(`HTTP Error: HTTP GET error reading 'https://s3.amazonaws.com/arc/db1/cpu/x.parquet' in region 'eu-west-1' (HTTP 404 NoSuchKey)`), true, noFilesVanished, 1},
+		{"Azure blob", azure, true, noFilesVanished, 1},
+		{"S3 text on a node with no object store", s3, false, noFilesOther, 0},
+		{"Azure text on a node with no object store", azure, false, noFilesOther, 0},
+		{"S3 403 is not a removal", httpErr(`HTTP Error: HTTP GET error reading 'http://h/arc/db1/cpu/x.parquet' in region 'r' (HTTP 403 Forbidden)`), true, noFilesOther, 0},
+		{"Azure other code", io(`IO Error: AzureStorageFileSystem open file 'azure://arc/x.parquet' failed with code 'AuthorizationFailure', Reason Phrase: ''`), true, noFilesOther, 0},
+		{"permission denied", io(`IO Error: Cannot open file "` + file + `": Permission denied`), false, noFilesOther, 0},
+		{"outside the root", missing("/elsewhere/x.parquet"), false, noFilesOther, 0},
+		{"a sibling of the root", missing(root + "-other/db1/cpu/x.parquet"), false, noFilesOther, 0},
+		{"not Parquet", missing(filepath.Join(root, "db1", "cpu", "x.json")), false, noFilesOther, 0},
+		{"a schema anchor", missing(filepath.Join(anchorDir, "schema", "db1", "cpu", "a.parquet")), false, noFilesOther, 0},
+		// The texts only count from a DuckDB error of that type, from its
+		// start: DuckDB quotes user text in other errors (#1355 review).
+		{"the local text, untyped", errors.New(`IO Error: Cannot open file "` + file + `": No such file or directory`), false, noFilesOther, 0},
+		{"the local text inside a Conversion error", &duckdb.Error{Type: duckdb.ErrorTypeConversion, Msg: `Conversion Error: Could not convert string 'Cannot open file "` + file + `": No such file or directory' to INT32`}, false, noFilesOther, 0},
+		{"the local text after an IO error's start", io(`IO Error: something else: Cannot open file "` + file + `": No such file or directory`), false, noFilesOther, 0},
+		{"the S3 text inside an Invalid Input error", &duckdb.Error{Type: duckdb.ErrorTypeInvalidInput, Msg: `Invalid Input Error: HTTP GET error reading 'a.parquet' (HTTP 404`}, true, noFilesOther, 0},
 	} {
+		h.storage = local
+		if c.objectStore {
+			h.storage = &storage.S3Backend{}
+		}
 		h.vanishedInvalidatedAt.Store(0)
 		h.vanishedHTTPClearedAt.Store(0)
 		before := clears
 		require.Equal(t, c.want, h.classifyNoFiles(c.err), c.name)
-		wantClears := 0
-		if c.remote {
-			wantClears = 1
-		}
-		require.Equal(t, wantClears, clears-before, "%s: HTTP cache clears", c.name)
+		require.Equal(t, c.clears, clears-before, "%s: HTTP cache clears", c.name)
 	}
 
 	// The HTTP clear has its own gate: a local vanish just before does not
@@ -250,9 +266,40 @@ func TestClassifyVanishedFile(t *testing.T) {
 	h.vanishedInvalidatedAt.Store(0)
 	h.vanishedHTTPClearedAt.Store(0)
 	before := clears
-	require.Equal(t, noFilesVanished, h.classifyNoFiles(local(file)))
-	require.Equal(t, noFilesVanished, h.classifyNoFiles(errors.New(`IO Error: AzureStorageFileSystem open file 'azure://arc/x.parquet' failed with code 'BlobNotFound', Reason Phrase: ''`)))
+	h.storage = local
+	require.Equal(t, noFilesVanished, h.classifyNoFiles(missing(file)))
+	h.storage = &storage.S3Backend{}
+	require.Equal(t, noFilesVanished, h.classifyNoFiles(azure))
 	require.Equal(t, 1, clears-before)
+	h.storage = local
+}
+
+// A query cannot forge either error through text DuckDB echoes back: a
+// forged "file vanished" would get a 503 and wipe the node's caches once a
+// second, a forged "no files" an empty success (#1355 review).
+func TestQueryCannotForgeAVanishedOrEmptyAnswer(t *testing.T) {
+	r, h, _ := newVanishedFileRig(t)
+	clears := 0
+	h.clearHTTPCache = func() { clears++ }
+	root := h.getStorageBasePath()
+	for _, sql := range []string{
+		`SELECT CAST('HTTP GET error reading ''a.parquet'' (HTTP 404' AS INTEGER)`,
+		`SELECT CAST('Cannot open file "` + root + `/x.parquet": No such file or directory' AS INTEGER)`,
+		`SELECT error('AzureStorageFileSystem open file ''a.parquet'' failed with code ''BlobNotFound''')`,
+		`SELECT "HTTP GET error reading 'b.parquet' (HTTP 404" FROM db1.cpu`,
+		`SELECT CAST('No files found that match the pattern "x/2026/10/20/11/*.parquet"' AS INTEGER)`,
+		`SELECT CAST('No files found that match the pattern "x/**/*.parquet"' AS INTEGER)`,
+	} {
+		for _, route := range []string{"/api/v1/query", "/api/v1/query/msgpack"} {
+			if route == "/api/v1/query/msgpack" && !database.ArrowEnabled {
+				continue
+			}
+			status, ok, _, msg, _ := r.query(route, sql)
+			require.NotEqual(t, 503, status, "%s %s answered the vanished 503: %q", route, sql, msg)
+			require.NotEqual(t, 200, status, "%s %s answered success (ok=%v): a forged error must stay an error", route, sql, ok)
+		}
+	}
+	require.Equal(t, 0, clears, "a forged error cleared the HTTP cache")
 }
 
 // The root boundary for a root of "/" and a root with a trailing slash.
