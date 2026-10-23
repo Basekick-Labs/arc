@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -210,8 +212,18 @@ func TestClassifyVanishedFile(t *testing.T) {
 	_, h, _ := newVanishedFileRig(t)
 	root := h.getStorageBasePath()
 	local := h.storage
-	clears := 0
-	h.clearHTTPCache = func() { clears++ }
+	var clearCount atomic.Int64
+	h.clearHTTPCache = func() { clearCount.Add(1) }
+	// The clear runs in the background; a vanish's clears have landed (or
+	// not) once this settles.
+	clearsSince := func(before int64, want int) int {
+		if want > 0 {
+			require.Eventually(t, func() bool { return clearCount.Load()-before >= int64(want) }, 2*time.Second, 5*time.Millisecond)
+		} else {
+			time.Sleep(20 * time.Millisecond)
+		}
+		return int(clearCount.Load() - before)
+	}
 	anchorDir := filepath.Join(root, "_anchors")
 	h.SetFieldSchema(fieldschema.New(h.storage, nil, fieldschema.Options{Enabled: true, LocalDir: anchorDir}, zerolog.Nop()))
 
@@ -226,51 +238,71 @@ func TestClassifyVanishedFile(t *testing.T) {
 	for _, c := range []struct {
 		name        string
 		err         error
-		objectStore bool // the node reads S3 or Azure
+		objectStore string // "s3", "tiering" (local primary, cold tier) or "" (local only)
 		want        noFilesKind
 		clears      int
 	}{
-		{"local file under the root", missing(file), false, noFilesVanished, 0},
-		{"S3 object", s3, true, noFilesVanished, 1},
-		{"S3 object, another reason phrase", httpErr(`HTTP Error: HTTP GET error reading 'https://s3.amazonaws.com/arc/db1/cpu/x.parquet' in region 'eu-west-1' (HTTP 404 NoSuchKey)`), true, noFilesVanished, 1},
-		{"Azure blob", azure, true, noFilesVanished, 1},
-		{"S3 text on a node with no object store", s3, false, noFilesOther, 0},
-		{"Azure text on a node with no object store", azure, false, noFilesOther, 0},
-		{"S3 403 is not a removal", httpErr(`HTTP Error: HTTP GET error reading 'http://h/arc/db1/cpu/x.parquet' in region 'r' (HTTP 403 Forbidden)`), true, noFilesOther, 0},
-		{"Azure other code", io(`IO Error: AzureStorageFileSystem open file 'azure://arc/x.parquet' failed with code 'AuthorizationFailure', Reason Phrase: ''`), true, noFilesOther, 0},
-		{"permission denied", io(`IO Error: Cannot open file "` + file + `": Permission denied`), false, noFilesOther, 0},
-		{"outside the root", missing("/elsewhere/x.parquet"), false, noFilesOther, 0},
-		{"a sibling of the root", missing(root + "-other/db1/cpu/x.parquet"), false, noFilesOther, 0},
-		{"not Parquet", missing(filepath.Join(root, "db1", "cpu", "x.json")), false, noFilesOther, 0},
-		{"a schema anchor", missing(filepath.Join(anchorDir, "schema", "db1", "cpu", "a.parquet")), false, noFilesOther, 0},
+		{"local file under the root", missing(file), "", noFilesVanished, 0},
+		{"S3 object", s3, "s3", noFilesVanished, 1},
+		{"S3 object, another reason phrase", httpErr(`HTTP Error: HTTP GET error reading 'https://s3.amazonaws.com/arc/db1/cpu/x.parquet' in region 'eu-west-1' (HTTP 404 NoSuchKey)`), "s3", noFilesVanished, 1},
+		{"Azure blob", azure, "s3", noFilesVanished, 1},
+		{"S3 object, local primary with a cold tier", s3, "tiering", noFilesVanished, 1},
+		{"S3 text on a node with no object store", s3, "", noFilesOther, 0},
+		{"Azure text on a node with no object store", azure, "", noFilesOther, 0},
+		{"S3 403 is not a removal", httpErr(`HTTP Error: HTTP GET error reading 'http://h/arc/db1/cpu/x.parquet' in region 'r' (HTTP 403 Forbidden)`), "s3", noFilesOther, 0},
+		{"S3 403 whose detail mentions a 404", httpErr(`HTTP Error: HTTP GET error reading 'http://h/arc/db1/cpu/x.parquet' in region 'r' (HTTP 403 Forbidden) after a (HTTP 404 retry`), "s3", noFilesOther, 0},
+		{"Azure other code", io(`IO Error: AzureStorageFileSystem open file 'azure://arc/x.parquet' failed with code 'AuthorizationFailure', Reason Phrase: ''`), "s3", noFilesOther, 0},
+		{"permission denied", io(`IO Error: Cannot open file "` + file + `": Permission denied`), "", noFilesOther, 0},
+		{"outside the root", missing("/elsewhere/x.parquet"), "", noFilesOther, 0},
+		{"a sibling of the root", missing(root + "-other/db1/cpu/x.parquet"), "", noFilesOther, 0},
+		{"not Parquet", missing(filepath.Join(root, "db1", "cpu", "x.json")), "", noFilesOther, 0},
+		{"a schema anchor", missing(filepath.Join(anchorDir, "schema", "db1", "cpu", "a.parquet")), "", noFilesOther, 0},
 		// The texts only count from a DuckDB error of that type, from its
 		// start: DuckDB quotes user text in other errors (#1355 review).
-		{"the local text, untyped", errors.New(`IO Error: Cannot open file "` + file + `": No such file or directory`), false, noFilesOther, 0},
-		{"the local text inside a Conversion error", &duckdb.Error{Type: duckdb.ErrorTypeConversion, Msg: `Conversion Error: Could not convert string 'Cannot open file "` + file + `": No such file or directory' to INT32`}, false, noFilesOther, 0},
-		{"the local text after an IO error's start", io(`IO Error: something else: Cannot open file "` + file + `": No such file or directory`), false, noFilesOther, 0},
-		{"the S3 text inside an Invalid Input error", &duckdb.Error{Type: duckdb.ErrorTypeInvalidInput, Msg: `Invalid Input Error: HTTP GET error reading 'a.parquet' (HTTP 404`}, true, noFilesOther, 0},
+		{"the local text, untyped", errors.New(`IO Error: Cannot open file "` + file + `": No such file or directory`), "", noFilesOther, 0},
+		{"the local text inside a Conversion error", &duckdb.Error{Type: duckdb.ErrorTypeConversion, Msg: `Conversion Error: Could not convert string 'Cannot open file "` + file + `": No such file or directory' to INT32`}, "", noFilesOther, 0},
+		{"the local text after an IO error's start", io(`IO Error: something else: Cannot open file "` + file + `": No such file or directory`), "", noFilesOther, 0},
+		{"the S3 text inside an Invalid Input error", &duckdb.Error{Type: duckdb.ErrorTypeInvalidInput, Msg: `Invalid Input Error: HTTP GET error reading 'a.parquet' (HTTP 404`}, "s3", noFilesOther, 0},
 	} {
-		h.storage = local
-		if c.objectStore {
+		h.storage, h.tieringManager = local, nil
+		switch c.objectStore {
+		case "s3":
 			h.storage = &storage.S3Backend{}
+		case "tiering":
+			h.tieringManager = &tiering.Manager{}
 		}
 		h.vanishedInvalidatedAt.Store(0)
 		h.vanishedHTTPClearedAt.Store(0)
-		before := clears
+		before := clearCount.Load()
 		require.Equal(t, c.want, h.classifyNoFiles(c.err), c.name)
-		require.Equal(t, c.clears, clears-before, "%s: HTTP cache clears", c.name)
+		require.Equal(t, c.clears, clearsSince(before, c.clears), "%s: HTTP cache clears", c.name)
 	}
+	h.tieringManager = nil
 
 	// The HTTP clear has its own gate: a local vanish just before does not
 	// use up the remote one's slot.
 	h.vanishedInvalidatedAt.Store(0)
 	h.vanishedHTTPClearedAt.Store(0)
-	before := clears
+	before := clearCount.Load()
 	h.storage = local
 	require.Equal(t, noFilesVanished, h.classifyNoFiles(missing(file)))
 	h.storage = &storage.S3Backend{}
 	require.Equal(t, noFilesVanished, h.classifyNoFiles(azure))
-	require.Equal(t, 1, clears-before)
+	require.Equal(t, 1, clearsSince(before, 1))
+
+	// The clear takes a pooled connection; the 503 must not wait for it.
+	release := make(chan struct{})
+	h.clearHTTPCache = func() { <-release }
+	h.vanishedHTTPClearedAt.Store(0)
+	done := make(chan noFilesKind, 1)
+	go func() { done <- h.classifyNoFiles(azure) }()
+	select {
+	case k := <-done:
+		require.Equal(t, noFilesVanished, k)
+	case <-time.After(2 * time.Second):
+		t.Fatal("classifyNoFiles waited for the HTTP cache clear")
+	}
+	close(release)
 	h.storage = local
 }
 
@@ -279,8 +311,8 @@ func TestClassifyVanishedFile(t *testing.T) {
 // second, a forged "no files" an empty success (#1355 review).
 func TestQueryCannotForgeAVanishedOrEmptyAnswer(t *testing.T) {
 	r, h, _ := newVanishedFileRig(t)
-	clears := 0
-	h.clearHTTPCache = func() { clears++ }
+	var clears atomic.Int64
+	h.clearHTTPCache = func() { clears.Add(1) }
 	root := h.getStorageBasePath()
 	for _, sql := range []string{
 		`SELECT CAST('HTTP GET error reading ''a.parquet'' (HTTP 404' AS INTEGER)`,
@@ -299,7 +331,8 @@ func TestQueryCannotForgeAVanishedOrEmptyAnswer(t *testing.T) {
 			require.NotEqual(t, 200, status, "%s %s answered success (ok=%v): a forged error must stay an error", route, sql, ok)
 		}
 	}
-	require.Equal(t, 0, clears, "a forged error cleared the HTTP cache")
+	time.Sleep(20 * time.Millisecond)
+	require.Zero(t, clears.Load(), "a forged error cleared the HTTP cache")
 }
 
 // The root boundary for a root of "/" and a root with a trailing slash.

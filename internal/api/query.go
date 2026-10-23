@@ -2752,11 +2752,11 @@ func (h *QueryHandler) invalidateAfterVanished(path string, remote bool) {
 	now := time.Now().UnixNano()
 	if remote {
 		if last := h.vanishedHTTPClearedAt.Load(); now-last >= int64(time.Second) && h.vanishedHTTPClearedAt.CompareAndSwap(last, now) {
-			if h.clearHTTPCache != nil {
-				h.clearHTTPCache()
-			} else {
-				go h.db.ClearHTTPCacheQuietly()
+			clear := h.clearHTTPCache
+			if clear == nil {
+				clear = h.db.ClearHTTPCacheQuietly
 			}
+			go clear()
 		}
 	}
 	last := h.vanishedInvalidatedAt.Load()
