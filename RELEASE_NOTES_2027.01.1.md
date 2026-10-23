@@ -1521,12 +1521,33 @@ Instants before the origin (before 1970 or 2000) floor correctly, a
 in integer microseconds, so it is exact for every timestamp. Continuous
 queries were not affected: they never used this rewrite.
 
-### First migrated cold files become visible on peer nodes ([#1349](https://github.com/Basekick-Labs/arc/issues/1349))
+### A measurement's first files moved to cold storage are read on every node ([#1349](https://github.com/Basekick-Labs/arc/issues/1349))
 
-When the first files in a measurement moved to cold storage, other nodes could
-read from the hot tier only until their next cold metadata sync. Shared-store
-migration deletes now update each node's tier metadata, and transient cold-tier
-check failures are retried instead of waiting for that sync.
+A node reads a measurement from cold storage only once it has a cold row for
+it. When tiering moved a measurement's first files to cold, other nodes could
+miss those rows until their own next cold metadata sync (about 24 hours with
+the default schedule), and read the files from neither tier until then:
+
+- **Shared object store:** other nodes were never told about the move.
+  Now every node records the cold copy when the migrating node releases the
+  hot one. A node that installs a Raft snapshot after missing migrations
+  checks the cold tier for each path the snapshot dropped, as nodes with
+  local storage already did.
+- **Both storage modes:** if the cold-tier check failed, the node waited for
+  the next sync. It now checks again after 1, 2 and 4 seconds. A cold tier
+  unreachable for longer than that still waits for the sync, or for the
+  startup scan at the next restart. A retry skips a path that has since been
+  written and registered again.
+
+Before recording a cold row, a node always checks that the cold copy exists.
+On a shared store the size comes from the same request, so each node makes
+one cold-tier request per moved file it has no row for yet.
+
+**Limitations:**
+- On a shared object store, other nodes now count a moved file twice until
+  the migrating node deletes its hot object. That node deletes them one at a
+  time, up to 200 per manifest release, so this can last a few seconds.
+  Before this fix, those nodes did not count the file at all.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#1354](https://github.com/Basekick-Labs/arc/pull/1354).
@@ -1906,6 +1927,9 @@ removes the hot copy. Three problems, all fixed:
   release of up to 200 files a second).
 - On a cluster with local storage, the other nodes count a moved file twice
   until they remove their own copy.
+- On a cluster with a shared object store, the other nodes count a moved
+  file twice until the migrating node deletes the hot object (see #1349
+  above).
 - While a migration runs, the migrating node drops its query caches up to
   twice a second.
 - A DELETE arriving on a new primary writer while the old one is still

@@ -495,6 +495,18 @@ func TestManifestDelete_SharedBackendReportsTieringMigration(t *testing.T) {
 	if reports[0].size != -1 {
 		t.Fatalf("size = %d, want unknown size for a shared-store manifest delete", reports[0].size)
 	}
+
+	// A snapshot restore drops paths the cluster deleted while this node was
+	// away, for a reason the snapshot does not carry — a migration among
+	// them — so it is reported too (#1354 review). Driven through the same
+	// onDelete callback Restore calls with this reason.
+	if err := r.c.raftNode.DeleteFile(r.unrelated.Path, raft.UnlinkReasonSnapshotRemoved, 5*time.Second); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	reports = recorder.unlinkReports()
+	if len(reports) != 2 || reports[1].path != r.unrelated.Path || reports[1].reason != raft.UnlinkReasonSnapshotRemoved {
+		t.Fatalf("tier unlink reports = %+v, want the snapshot-restore drop reported second", reports)
+	}
 }
 
 // Coordinator.Stop stops the puller before it drains the delete workers, so

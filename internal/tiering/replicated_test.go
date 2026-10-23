@@ -303,7 +303,8 @@ func TestRecordManifestUnlinkedFile_RetriesColdSizeLookup(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatalf("cold size lookup was not retried; calls=%d", cold.calls.Load())
 	}
-	waitTierEvents(t, m, 2)
+	// One event: a retried event counts as processed once, at its last attempt.
+	waitTierEvents(t, m, 1)
 
 	var tier string
 	var size int64
@@ -442,22 +443,27 @@ func TestRecordUnlinkedFile_RetriesColdCheckAfterTransientFailure(t *testing.T) 
 	case <-time.After(3 * time.Second):
 		t.Fatalf("cold existence check ran %d time(s), want a scheduled retry after the transient failure", cold.calls.Load())
 	}
-	waitTierEvents(t, m, 3)
+	waitTierEvents(t, m, 2)
 
 	if tier, ok := rowTier(t, m, path); !ok || tier != string(TierCold) {
 		t.Fatalf("row = (%q, %v), want cold after the retry", tier, ok)
 	}
 }
 
-func TestRecordUnlinkedFile_RetryKeepsReregisteredHotFile(t *testing.T) {
+// A retry asks the manifest whether the path is registered again, not the hot
+// backend: a path written and registered again after the unlink is no longer
+// this event's to mark cold, and its own pull records it hot.
+func TestRecordUnlinkedFile_RetryLeavesAReregisteredPathToItsRegistration(t *testing.T) {
 	const path = "db1/cpu/2026/10/03/14/a.parquet"
 	coldStore := newMockBackend("s3")
 	coldStore.seedRaw(path, []byte("old cold copy"))
 	cold := &failFirstExistsBackend{mockBackend: coldStore}
 	hot := newMockBackend("local")
+	manifest := &fakeManifest{hot: hot, entries: map[string]int64{}}
 	m := newTierEventManager(t, nil, true)
 	m.coldBackend = cold
 	m.hotBackend = hot
+	m.manifest = manifest
 
 	ctx := context.Background()
 	if _, err := m.metadata.recordHotFileIfNotCold(ctx, replicatedTestFile(path, int64(len("old cold copy")))); err != nil {
@@ -477,6 +483,8 @@ func TestRecordUnlinkedFile_RetryKeepsReregisteredHotFile(t *testing.T) {
 		t.Fatal("failed cold check should retire the old hot row before re-registration")
 	}
 
+	// Registered again and pulled.
+	manifest.entries[path] = int64(len("new hot copy"))
 	hot.seedRaw(path, []byte("new hot copy"))
 	pulled := tierEvent{kind: tierEventPulled, path: path, sizeBytes: int64(len("new hot copy")), sizeKnown: true}
 	if got := m.applyTierEventBatch([]tierEvent{pulled}); len(got) != 0 {
@@ -490,7 +498,53 @@ func TestRecordUnlinkedFile_RetryKeepsReregisteredHotFile(t *testing.T) {
 		t.Fatalf("row = (%q, %v), want hot after the path was re-registered", tier, ok)
 	}
 	if calls := cold.calls.Load(); calls != 1 {
-		t.Fatalf("cold existence check ran %d times; retry should stop after finding the hot copy", calls)
+		t.Fatalf("cold existence check ran %d times; a re-registered path needs no recheck", calls)
+	}
+}
+
+// #1354 review: on a shared object store the hot backend is the shared bucket,
+// and the migrating node deletes a chunk's hot objects one by one AFTER their
+// manifest entries are gone (releaseHotCopies), or never, when a delete fails.
+// A retry that took "the hot object still exists" for "registered again"
+// recorded a HOT row for an unregistered path and never asked cold again: the
+// migrated file stayed invisible on this node until its next cold sync, which
+// is #1349 itself.
+func TestRecordManifestUnlinkedFile_RetryMarksColdWhileTheSharedHotObjectLingers(t *testing.T) {
+	const path = "db1/cpu/2026/10/03/14/a.parquet"
+	body := []byte("cold copy")
+	coldStore := newMockBackend("s3")
+	coldStore.seedRaw(path, body)
+	cold := &failFirstStatBackend{mockBackend: coldStore}
+	hot := newMockBackend("s3")
+	hot.seedRaw(path, body) // not deleted yet by the migrating node
+	m := newTierEventManager(t, nil, true)
+	m.coldBackend = cold
+	m.hotBackend = hot
+	m.manifest = &fakeManifest{hot: hot, entries: map[string]int64{}} // entry already gone
+
+	retries := m.applyTierEventBatch([]tierEvent{{kind: tierEventUnlinked, path: path, reason: "tiering:migrated"}})
+	if len(retries) != 1 {
+		t.Fatalf("got %d retries after the cold check failed, want one", len(retries))
+	}
+	if got := m.applyTierEventBatch(retries); len(got) != 0 {
+		t.Fatalf("retry returned more retries: %+v", got)
+	}
+
+	var tier string
+	var size int64
+	if err := m.metadata.db.QueryRow(`SELECT tier, size_bytes FROM tier_files WHERE path = ?`, path).Scan(&tier, &size); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if tier != string(TierCold) || size != int64(len(body)) {
+		t.Fatalf("row = (%q, %d), want cold with size %d", tier, size, len(body))
+	}
+	tiers, err := m.metadata.GetTiersForMeasurement(context.Background(), "db1", "cpu")
+	if err != nil || !tiers[TierCold] || tiers[TierHot] {
+		t.Fatalf("measurement tiers = %v, err=%v; want cold only", tiers, err)
+	}
+	// One stat per attempt: the existence check and the size are one round trip.
+	if calls := cold.calls.Load(); calls != 2 {
+		t.Fatalf("cold StatFile ran %d times, want 2 (one per attempt)", calls)
 	}
 }
 

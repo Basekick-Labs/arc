@@ -62,9 +62,10 @@ type TierRecorder interface {
 	// may come from an operator and so is a hint rather than proof of what
 	// happened to the file.
 	RecordUnlinkedFile(path, reason string, sizeBytes int64)
-	// RecordManifestUnlinkedFile reports a migration unlink observed through
-	// Raft when the object store is shared and this node did not perform the
-	// delete itself. Its size is not available at the callback boundary.
+	// RecordManifestUnlinkedFile reports a manifest delete on a shared object
+	// store that may be a migration (sharedDeleteChangesTier): this node
+	// unlinks nothing, but its tier rows must learn the cold copy. Its size is
+	// not available at the callback boundary.
 	RecordManifestUnlinkedFile(path, reason string)
 	// RecordMissingFile reports a path that left the manifest while this
 	// node no longer had the file (its own compaction or retention removed
@@ -1304,6 +1305,23 @@ func (c *Coordinator) recordManifestUnlinkedFileInTiering(path, reason string) {
 // one as possibly a migration. Shared literal with
 // tiering.unlinkReasonAbandonedPull; the packages do not import each other.
 const tierReasonAbandonedPull = "replication:abandoned"
+
+// tierReasonPrefix starts every reason tiering itself proposes. Shared
+// literal with tiering.manifestReasonPrefix; the packages do not import each
+// other.
+const tierReasonPrefix = "tiering:"
+
+// sharedDeleteChangesTier reports a manifest delete that a node on a shared
+// object store must tell tiering about although it unlinks nothing: a
+// tiering reason (the hot object is released and the cold copy is now the
+// one to read), or a snapshot restore dropping a path the cluster deleted
+// while this node was away, for a reason the snapshot does not carry — a
+// migration among them (#962, #1349). The recorder asks the cold tier before
+// recording anything. The same set as tiering's reasonMayBeMigration, less
+// the two reasons only the local-storage puller and stale-local sweep send.
+func sharedDeleteChangesTier(reason string) bool {
+	return strings.HasPrefix(reason, tierReasonPrefix) || reason == raft.UnlinkReasonSnapshotRemoved
+}
 
 // recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
 func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
@@ -4502,11 +4520,10 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// deleteOldFiles. Shared tiering deletes still update each node's
 		// tier metadata below.
 		if backend.Type() != "local" {
-			// A tiering migration is the one shared-backend delete that changes
-			// this node's tier metadata: the hot object is gone, and the cold
-			// copy should now be queryable here too. The recorder checks the
-			// cold backend before recording that transition.
-			if strings.HasPrefix(reason, "tiering:") {
+			// A migration changes this node's tier metadata although it
+			// unlinks nothing here: the hot object is going, and the cold
+			// copy must now be read here too (#1349).
+			if sharedDeleteChangesTier(reason) {
 				c.recordManifestUnlinkedFileInTiering(path, reason)
 			}
 			// Every node reads the shared object, so every node leaves a

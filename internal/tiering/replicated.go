@@ -427,10 +427,12 @@ func (m *Manager) RecordUnlinkedFile(path, reason string, sizeBytes int64) {
 	m.enqueueTierEvent(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes, sizeKnown: true})
 }
 
-// RecordManifestUnlinkedFile reports a migration delete observed through the
-// shared manifest. The coordinator cannot measure the object at its callback
-// boundary, so the drainer uses an existing row's size or stats the cold copy
-// before inserting one.
+// RecordManifestUnlinkedFile reports a manifest delete, on a shared object
+// store, whose reason may be a migration: a tiering reason or a snapshot
+// restore's drop. This node unlinked nothing, so there is no size to report;
+// the drainer keeps an existing row's size, or asks cold with StatFile rather
+// than Exists when it has to insert one. Never blocks: it runs on the Raft
+// apply path.
 func (m *Manager) RecordManifestUnlinkedFile(path, reason string) {
 	if m == nil {
 		return
@@ -594,6 +596,7 @@ func (m *Manager) tierEventLoop() {
 		if room < len(events) {
 			dropped := len(events) - max(room, 0)
 			m.tierEventsDropped.Add(int64(dropped))
+			m.tierEventsProcessed.Add(int64(dropped))
 			if m.tierEvents.warnOnce() {
 				m.logger.Warn().Int("dropped", dropped).
 					Msg("Delayed tier metadata rechecks exceeded the queue bound; the next cold sync will reconcile")
@@ -604,6 +607,7 @@ func (m *Manager) tierEventLoop() {
 			}
 		}
 		now := time.Now()
+		added := make([]scheduledEvent, 0, len(events))
 		for _, event := range events {
 			delay := tierEventRetryBaseDelay
 			for attempt := 1; attempt < event.retryCount && delay < 30*time.Second; attempt++ {
@@ -612,9 +616,24 @@ func (m *Manager) tierEventLoop() {
 			if delay > 30*time.Second {
 				delay = 30 * time.Second
 			}
-			retries = append(retries, scheduledEvent{event: event, due: now.Add(delay)})
+			added = append(added, scheduledEvent{event: event, due: now.Add(delay)})
 		}
-		sort.Slice(retries, func(i, j int) bool { return retries[i].due.Before(retries[j].due) })
+		// Merge rather than re-sort everything pending: the pending list is
+		// already in due order and can hold up to the queue bound.
+		sort.SliceStable(added, func(i, j int) bool { return added[i].due.Before(added[j].due) })
+		merged := make([]scheduledEvent, 0, len(retries)+len(added))
+		i, j := 0, 0
+		for i < len(retries) && j < len(added) {
+			if added[j].due.Before(retries[i].due) {
+				merged = append(merged, added[j])
+				j++
+			} else {
+				merged = append(merged, retries[i])
+				i++
+			}
+		}
+		merged = append(merged, retries[i:]...)
+		retries = append(merged, added[j:]...)
 		resetRetryTimer()
 	}
 
@@ -634,6 +653,7 @@ func (m *Manager) tierEventLoop() {
 			for ready < len(retries) && !retries[ready].due.After(now) {
 				if !m.tierEvents.push(retries[ready].event, tierEventQueueMax) {
 					m.tierEventsDropped.Add(1)
+					m.tierEventsProcessed.Add(1)
 				}
 				ready++
 			}
@@ -647,6 +667,7 @@ func (m *Manager) tierEventLoop() {
 			}
 			if len(retries) > 0 {
 				m.tierEventsDropped.Add(int64(len(retries)))
+				m.tierEventsProcessed.Add(int64(len(retries)))
 				m.logger.Warn().
 					Int("unapplied", len(retries)).
 					Msg("Delayed tier metadata rechecks were not run during shutdown; the startup scan will reconcile")
@@ -914,10 +935,11 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 			if ev.retryCount < tierEventMaxRetries {
 				ev.retryCount++
 				*retries = append(*retries, ev)
-			} else {
-				m.logger.Warn().Str("path", ev.path).
-					Msg("Cold-tier check retries exhausted; the next cold sync will reconcile")
+				// Not processed yet: counted once, by its last attempt.
+				continue
 			}
+			m.logger.Warn().Str("path", ev.path).
+				Msg("Cold-tier check retries exhausted; the next cold sync will reconcile")
 		}
 		m.tierEventsProcessed.Add(1)
 	}
@@ -937,7 +959,46 @@ func reasonMayBeMigration(reason string) bool {
 // coldProbe is the answer of one cold-tier existence check.
 type coldProbe struct {
 	inCold bool
-	err    error
+	// size is the cold object's size, set only by a probe that asked for it
+	// (sized): an event whose sender could not measure the file and whose
+	// path has no row yet, so the row inserted for it needs one.
+	size  int64
+	sized bool
+	err   error
+}
+
+// checkCold answers whether path is in cold. wantSize asks with StatFile
+// instead of Exists, so an event that needs the object's size pays one round
+// trip rather than an existence check and then a stat.
+func checkCold(ctx context.Context, cold storage.Backend, path string, wantSize bool) coldProbe {
+	if !wantSize {
+		inCold, err := cold.Exists(ctx, path)
+		return coldProbe{inCold: inCold, err: err}
+	}
+	size, err := cold.StatFile(ctx, path)
+	if err != nil {
+		return coldProbe{err: err}
+	}
+	return coldProbe{inCold: size >= 0, size: size, sized: true}
+}
+
+// registeredAgain reports a path that is back in the cluster manifest. A
+// retried unlink asks this before anything else: the path left the manifest
+// seconds ago, and if it is listed again it has been written and registered
+// again, so it is no longer this event's to mark cold. Its own registration
+// records its row. The manifest is the authority here, not the hot backend:
+// on a shared store the migrating node deletes a chunk's hot objects one by
+// one after their manifest entries are gone, so an object still in the
+// bucket at retry time says nothing about registration (#1354).
+//
+// The manifest is wired whenever a coordinator exists (cmd/arc/main.go),
+// and only the coordinator sends unlink events, so nil means a unit test.
+func (m *Manager) registeredAgain(path string) bool {
+	if m.manifest == nil {
+		return false
+	}
+	_, ok := m.manifest.ManifestEntry(path)
+	return ok
 }
 
 // probeColdForChunk runs the cold-tier existence checks a chunk's unlinks
@@ -955,23 +1016,29 @@ func (m *Manager) probeColdForChunk(ctx context.Context, chunk []tierEvent, info
 	}
 
 	var paths []string
+	wantSize := make(map[string]bool)
 	seen := make(map[string]struct{})
 	for i, ev := range chunk {
-		// A retry checks the hot backend first in applyUnlinked so a path that
-		// has since been registered again is not marked cold. Do not probe cold
-		// here before that guard; applyUnlinked performs the cold check directly
-		// if the hot path is still absent.
-		if infos[i] == nil || ev.kind != tierEventUnlinked || ev.retryCount > 0 || !reasonMayBeMigration(ev.reason) {
+		if infos[i] == nil || ev.kind != tierEventUnlinked || !reasonMayBeMigration(ev.reason) {
 			continue
 		}
 		if _, dup := seen[ev.path]; dup {
 			continue
 		}
 		seen[ev.path] = struct{}{}
-		if existing, err := m.metadata.GetFile(ctx, ev.path); err == nil && existing != nil && existing.Tier == TierCold {
+		// Same order as applyUnlinked: a retry whose path is registered
+		// again needs no probe, and neither does a row already cold.
+		if ev.retryCount > 0 && m.registeredAgain(ev.path) {
+			continue
+		}
+		existing, err := m.metadata.GetFile(ctx, ev.path)
+		if err == nil && existing != nil && existing.Tier == TierCold {
 			continue
 		}
 		paths = append(paths, ev.path)
+		if !ev.sizeKnown && existing == nil {
+			wantSize[ev.path] = true
+		}
 	}
 	if len(paths) == 0 {
 		return nil
@@ -996,9 +1063,9 @@ func (m *Manager) probeColdForChunk(ctx context.Context, chunk []tierEvent, info
 		go func(p string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			inCold, err := cold.Exists(ctx, p)
+			probe := checkCold(ctx, cold, p, wantSize[p])
 			mu.Lock()
-			results[p] = coldProbe{inCold: inCold, err: err}
+			results[p] = probe
 			mu.Unlock()
 		}(p)
 	}
@@ -1103,23 +1170,35 @@ func (m *Manager) logRefusedHotRegistration(ctx context.Context, path string) {
 // and any metadata error.
 func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string, probe *coldProbe, sizeKnown, retrying bool) (bool, bool, error) {
 	cold := m.GetBackendForTier(TierCold)
-	if retrying && !m.draining.Load() && m.hotBackend != nil {
-		size, err := m.hotBackend.StatFile(ctx, info.Path)
-		if err != nil {
-			return false, true, fmt.Errorf("check hot file before retrying migration event: %w", err)
-		}
-		if size >= 0 {
-			info.SizeBytes = size
-			wrote, err := m.applyPulled(ctx, info)
-			return wrote, false, err
-		}
+	if retrying && m.registeredAgain(info.Path) {
+		// The first attempt already retired the hot row; the path's new
+		// registration records its own.
+		return false, false, nil
 	}
 	retry := false
 	if reasonMayBeMigration(reason) && cold != nil {
-		existing, _ := m.metadata.GetFile(ctx, info.Path)
+		// A row that already says cold needs no probe and no write, and
+		// skipping it here is what keeps the existence check off the
+		// high-volume tiering reasons: the manifest sweep and orphan
+		// reconciliation both act on paths this node has already recorded as
+		// cold, and they arrive in chunks of up to a thousand — on a shared
+		// store, at every node (#1349). Only a path whose row is missing or
+		// hot is worth a round trip. The read is confined to this branch: for
+		// every other reason the tier-conditional DELETE below already
+		// refuses a cold row, so a SELECT first would be a second statement
+		// per compaction or retention unlink for nothing.
+		existing, err := m.metadata.GetFile(ctx, info.Path)
+		if err != nil {
+			// Treated as no row: the insert below asks cold for the size,
+			// and ON CONFLICT keeps an existing row's own size anyway.
+			m.logger.Debug().Err(err).Str("path", info.Path).
+				Msg("Could not read the tier row for an unlinked file")
+			existing = nil
+		}
 		if existing != nil && existing.Tier == TierCold {
 			return false, false, nil
 		}
+		wantSize := !sizeKnown && existing == nil
 
 		// Keyed on the backend that was actually constructed, not on
 		// Cold.Enabled alone: a cold backend whose construction failed leaves
@@ -1132,44 +1211,40 @@ func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason 
 		// cold-tier metadata sync records the cold row on the next boot
 		// either way. An answer the pre-pass already has is used regardless.
 		var (
-			inCold  bool
-			err     error
+			answer  coldProbe
 			decided bool
 		)
 		switch {
-		case probe != nil:
-			inCold, err, decided = probe.inCold, probe.err, true
+		case probe != nil && (probe.err != nil || probe.sized || !wantSize):
+			// The pre-pass answer, unless it was an existence check where
+			// this insert needs a size (a row that vanished in between).
+			answer, decided = *probe, true
 		case !m.draining.Load():
-			inCold, err = cold.Exists(ctx, info.Path)
-			decided = true
+			answer, decided = checkCold(ctx, cold, info.Path, wantSize), true
 		}
 		if decided {
-			if err != nil {
-				m.logger.Warn().Err(err).
+			switch {
+			case answer.err != nil:
+				// Unreachable cold backend: this node cannot tell whether the
+				// file moved or vanished, but it does know the hot copy is
+				// gone, so the one thing the row must not keep saying is "hot
+				// here". Retire it and ask again shortly; if cold stays
+				// unreachable past the retries, the next cold-tier metadata
+				// sync records the row. The opposite choice — keeping the hot
+				// row — would leave it contradicting storage.
+				m.logger.Warn().Err(answer.err).
 					Str("path", info.Path).
 					Msg("Could not check the cold tier for an unlinked file; retiring the hot row and scheduling a recheck")
 				retry = true
-			} else if inCold {
-				if !sizeKnown && existing == nil {
-					size, statErr := cold.StatFile(ctx, info.Path)
-					if statErr != nil {
-						m.logger.Warn().Err(statErr).
-							Str("path", info.Path).
-							Msg("Could not read cold file size for tier metadata; scheduling a recheck")
-						retry = true
-					} else if size < 0 {
-						inCold = false
-					} else {
-						info.SizeBytes = size
-					}
+			case answer.inCold:
+				if answer.sized {
+					info.SizeBytes = answer.size
 				}
-				if !retry && inCold {
-					wrote, err := m.metadata.markFileCold(ctx, info)
-					if wrote {
-						m.coldMarked.Store(true)
-					}
-					return wrote, false, err
+				wrote, err := m.metadata.markFileCold(ctx, info)
+				if wrote {
+					m.coldMarked.Store(true)
 				}
+				return wrote, false, err
 			}
 		}
 	}
