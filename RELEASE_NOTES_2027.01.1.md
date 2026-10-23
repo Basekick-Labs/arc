@@ -2082,6 +2082,20 @@ it. If a kept folder turns out to hold no files, the query now gets the 503
 instead of an empty, incomplete answer, for as long as the listing keeps
 failing.
 
+**A file removed while DuckDB is reading the hour gets the same answer
+(#1355).** Compaction removes an hour's input files in batches as it merges
+them. A query can already have listed the hour's files, and then go to open
+one that is no longer there. That query failed with HTTP 500 (`Cannot open
+file … No such file or directory`, or the S3 404 / Azure `BlobNotFound`
+equivalent). It now gets the same retryable 503, on every query route.
+
+- On S3 with `query.enable_s3_cache`, the S3 cache is cleared as well, so the
+  retry lists the hour again. Before, the cached listing kept naming the
+  removed file for up to 10 seconds.
+- A file that is missing for good, such as a broken symlink under the storage
+  root, also answers the 503, every time. Arc logs a warning that names the
+  path.
+
 ### Iceberg export on a local-storage cluster no longer publishes a file next to the one that replaced it
 
 On a cluster with local storage, a node removes its copy of a deleted file
