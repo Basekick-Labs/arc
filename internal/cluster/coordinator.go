@@ -86,6 +86,16 @@ var deleteStopDrainBound = 10 * time.Second
 const deletePendingWarnAt = 10_000
 
 type Coordinator struct {
+	// open is what reads must leave out while a compaction's output and
+	// inputs are both readable (open_compactions.go).
+	open openState
+	// retiredJournal caches the DELETE journal for adoption (manifest_repair.go).
+	retiredJournal struct {
+		mu    sync.Mutex
+		at    time.Time
+		paths map[string]bool
+		known bool
+	}
 	cfg           *config.ClusterConfig
 	licenseClient *license.Client
 	registry      *Registry
@@ -206,15 +216,27 @@ type Coordinator struct {
 	// at most the manifest churn of the time the workers are stuck; the
 	// Warn at deletePendingWarnAt makes that visible. deleteWake (one slot)
 	// nudges a parked worker; deleteStop, closed by Stop, is the only way a
-	// worker exits, so a stop drains everything that is pending.
+	// worker exits, so a stop drains everything that is pending (a DELETE
+	// rewrite's old file waiting for its rewrite is not pending: it stays on
+	// disk and the next start re-derives it from the stale-local journal,
+	// without which nothing waits, rewrite_unlink.go).
 	// deleteInFlight counts the entries a worker has taken and not yet
 	// unlinked, so the gauge and the stop-bound Error report what is still
 	// on disk, not just what is still untaken.
 	deletePending   []deleteRequest
 	deletePendingMu sync.Mutex
 	deleteInFlight  atomic.Int64
-	deleteWake      chan struct{}
-	deleteStop      chan struct{}
+	// deferred: unlinks of a DELETE rewrite's old file waiting for the
+	// rewrite to arrive (rewrite_unlink.go), under deletePendingMu.
+	deferred deferredUnlinks
+	// deleteStopping: the workers are draining; nothing is deferred (a
+	// rewrite's old file whose rewrite is not here is kept on disk instead).
+	deleteStopping atomic.Bool
+	// deferredLoggedAt rate-limits the long-deferred summary, under
+	// deletePendingMu.
+	deferredLoggedAt time.Time
+	deleteWake       chan struct{}
+	deleteStop       chan struct{}
 	// deleteWg is per Start: Stop's wait is bounded, and a WaitGroup that a
 	// later Start reused while that wait was still parked would panic.
 	deleteWg *sync.WaitGroup
@@ -1135,6 +1157,12 @@ func (c *Coordinator) startDeleteWorkers() {
 	c.deletePendingMu.Unlock()
 	c.deleteStop = stop
 	c.deleteWg = wg
+	c.deleteStopping.Store(false)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.sweepDeferredUnlinks(stop)
+	}()
 	for i := 0; i < deleteWorkerCount; i++ {
 		wg.Add(1)
 		go c.runDeleteWorker(stop, wake, wg, relisted)
@@ -1148,6 +1176,9 @@ func (c *Coordinator) startDeleteWorkers() {
 // when the disk itself is not answering. The waiting goroutine and the
 // stuck worker outlive the return until that Delete comes back.
 func (c *Coordinator) stopDeleteWorkers(stop chan struct{}, wg *sync.WaitGroup) {
+	// The drain unlinks what is pending and defers nothing; deferred copies
+	// stay on disk and the next start re-derives them (rewrite_unlink.go).
+	c.deleteStopping.Store(true)
 	close(stop)
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -1240,6 +1271,8 @@ func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
 // tiering, so this return value is what distinguishes the two.
 func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
 	c.noteLocalRegistered(path)
+	// A DELETE rewrite landing lets its old file's unlink go ahead.
+	c.wakeDeferredFamily(path)
 	r := c.tierRecorderSnapshot()
 	if r == nil {
 		return false
@@ -1320,6 +1353,11 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			c.logKeptRelistedPath(item, refresh)
 			return
 		}
+	}
+	// A DELETE rewrite's old file stays until its rewrite is here, or this
+	// node would read neither (rewrite_unlink.go).
+	if c.deferRewriteUnlink(context.Background(), item) {
+		return
 	}
 	// A compaction input stays readable until this node's staged copy of
 	// the output is in place (#1207 d2a2a; bounded).
@@ -4423,10 +4461,14 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
 		c.noteLocalRegistered(entry.Path)
+		c.forgetLocalDeleted(entry.Path)
+		c.dropDeferred(entry.Path)
 	}
 	onContentChanged := func(entry *raft.FileEntry) {
 		puller.EnqueueContentChanged(entry)
 		c.noteLocalRegistered(entry.Path)
+		c.forgetLocalDeleted(entry.Path)
+		c.dropDeferred(entry.Path)
 	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
@@ -4449,6 +4491,13 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// don't — they're already deleted cluster-wide by the compactor's
 		// StorageBackend.Delete in deleteOldFiles.
 		if backend.Type() != "local" {
+			// Every node reads the shared object, so every node leaves a
+			// DELETE rewrite's old file out of reads once its rewrite is
+			// there (open_compactions.go), until the handler removes it.
+			// Only that reason: others are removed at once, by their caller.
+			if reason == deleteRewriteReason {
+				c.noteLocalDeleted(path, reason)
+			}
 			c.logger.Debug().
 				Str("path", path).
 				Str("reason", reason).
@@ -4461,7 +4510,13 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// catch-up walk, but a local delete that is dropped is a replica
 		// the manifest no longer lists and nothing walks — it stayed on
 		// disk forever, and every read here read the file twice.
+		// Until the unlink, reads leave the copy out once that is safe
+		// (open_compactions.go).
+		c.noteLocalDeleted(path, reason)
 		c.enqueueLocalDelete(path, reason)
+		// A rewrite leaving the manifest (compacted, removed) lets the
+		// unlinks waiting for it go ahead (rewrite_unlink.go).
+		c.wakeDeferredFamilyAsync(path)
 	}
 
 	// The content-change callback goes in first: the FSM fires it right after

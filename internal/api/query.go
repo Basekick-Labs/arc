@@ -1419,7 +1419,10 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
 }
 
-// OpenCompactions is what the query layer needs from compaction.OpenJobs.
+// OpenCompactions is what the query layer needs from the compactions a read
+// must account for: compaction.OpenJobs on this node, and in a cluster the
+// coordinator's committed jobs and pending local deletes
+// (CombineOpenCompactions).
 type OpenCompactions interface {
 	ExcludedFor(ctx context.Context, prefix string) []string
 	Open(prefix string) bool
@@ -1459,9 +1462,10 @@ func (h *QueryHandler) openCompactionExclusions(ctx context.Context, prefix stri
 // wrapOpenCompactions makes a read count a compaction's rows once. A legacy
 // compaction puts its output in the partition before deleting its inputs, so
 // a read between the two sees both; a continuous query in that window writes
-// the doubled aggregate back. For each such job on this measurement whose
-// output is in storage, compaction.OpenJobs names its inputs. expr contains
-// one read_parquet(...) call and ends with it.
+// the doubled aggregate back; a cluster's staged compaction has the same
+// window between its output's move and its inputs' deletes. For each such job
+// on this measurement whose output is in storage, oc names its inputs. expr
+// contains one read_parquet(...) call and ends with it.
 // The excluded files are still opened: DuckDB does not skip a file by its
 // name column. The result is volatile.
 func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storage.Backend, expr, database, measurement string) string {
@@ -1503,6 +1507,13 @@ func (h *QueryHandler) InvalidateCaches() {
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
 	h.logger.Info().Msg("Query caches invalidated (files removed or rewritten)")
+}
+
+// InvalidateCachesQuiet is InvalidateCaches without the Info line, for a
+// caller that invalidates around every chunk of a long operation.
+func (h *QueryHandler) InvalidateCachesQuiet() {
+	h.pruner.InvalidateAllCachesQuiet()
+	h.queryCache.Invalidate()
 }
 
 // StartBackgroundWorkers spawns the long-lived goroutines the handler

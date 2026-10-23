@@ -79,7 +79,11 @@ type staleLocalState struct {
 	// failed to: the startup walk waits for it, so it never runs without the
 	// evidence it judges local copies by (#1182).
 	opened chan struct{}
-	wg     sync.WaitGroup
+	// rederived: rederiveRewriteUnlinks has run since the journal opened;
+	// rederiving: one is running (tryRederiveRewriteUnlinks).
+	rederived  atomic.Bool
+	rederiving atomic.Bool
+	wg         sync.WaitGroup
 
 	// exportBreaker is LocalCopyDeleted's breaker state, recomputed at
 	// exportBreakerAt (UnixNano) at most every staleExportBreakerEvery.
@@ -300,7 +304,17 @@ func (c *Coordinator) staleLocalRun(ctx context.Context) {
 		return
 	}
 	s.seen.Store(seen)
+	s.rederived.Store(false)
 	s.markOpened()
+	// Unlinks of DELETE rewrites' old files a previous run kept. Off this
+	// goroutine (it waits for the manifest to catch up with the leader,
+	// which must not hold the journal's open or its feed); the passes retry
+	// until it runs.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		c.tryRederiveRewriteUnlinks(ctx, seen)
+	}()
 	t := time.NewTicker(s.every)
 	defer t.Stop()
 	syncT := time.NewTicker(time.Second)
@@ -353,7 +367,9 @@ func (c *Coordinator) LocalCopyDeleted(path string) bool {
 		return false
 	}
 	fsm := c.raftNode.FSM()
-	if fsm == nil || r.lsn > fsm.AppliedDone() || fsm.HasFile(path) {
+	// A copy whose unlink waits for its rewrite is still this node's only
+	// copy of the rows (rewrite_unlink.go).
+	if fsm == nil || r.lsn > fsm.AppliedDone() || fsm.HasFile(path) || c.unlinkDeferred(path) {
 		return false
 	}
 	// The sweep's own rule: only the file seen registered, never another one
@@ -394,7 +410,7 @@ func (c *Coordinator) deletedCopiesImplausible(seen *seenLocal, fsm *raft.Cluste
 	tripped := deleted >= staleLocalBreakerMin && float64(deleted) > frac*float64(tracked)
 	if s.exportBreaker.Swap(tripped) != tripped && tripped {
 		c.logger.Error().Int("deleted", deleted).Int("tracked", tracked).Float64("max_fraction", frac).
-			Msg("Iceberg export keeps this node's files the manifest no longer lists: there are more than cluster.stale_local_sweep_max_fraction allows, which a manifest rolled back by a recovery looks like. Copies left behind by deletes can be published next to the files holding their rows until this clears")
+			Msg("Iceberg export and queries keep this node's files the manifest no longer lists: there are more than cluster.stale_local_sweep_max_fraction allows, which a manifest rolled back by a recovery looks like. Copies left behind by deletes can be published, and read, next to the files holding their rows until this clears")
 	}
 	s.exportBreakerAt.Store(now)
 	return tripped
@@ -409,6 +425,7 @@ func (c *Coordinator) TracksLocalCopies() bool {
 
 // forgetLocal drops path from the set (its copy was removed).
 func (c *Coordinator) forgetLocal(path string) {
+	c.forgetLocalDeleted(path)
 	if seen := c.stale.seen.Load(); seen != nil {
 		seen.remove(path)
 	}
@@ -630,6 +647,7 @@ func (c *Coordinator) staleLocalPass(ctx context.Context) {
 		return
 	}
 	c.expireWritten(now)
+	c.tryRederiveRewriteUnlinks(ctx, seen)
 	if !c.cfg.StaleLocalSweep {
 		// Removals off: still drop the records of files gone from the disk,
 		// which the candidate scan below would have done.
@@ -708,7 +726,7 @@ func (c *Coordinator) staleCandidates(ctx context.Context, seen *seenLocal, now 
 			delete(s.firstUnlisted, p)
 			continue
 		}
-		if r.lsn > applied || (pending != nil && pending(p)) || c.CompactionOwns(p) ||
+		if r.lsn > applied || (pending != nil && pending(p)) || c.CompactionOwns(p) || c.unlinkDeferred(p) ||
 			(cold != nil && cold(ctx, p)) {
 			delete(s.firstUnlisted, p)
 			continue
@@ -757,7 +775,7 @@ func (c *Coordinator) unlinkStale(ctx context.Context, path string) bool {
 			s.endUnlink(path)
 		}
 	}()
-	if c.raftNode.FSM().HasFile(path) || c.CompactionOwns(path) {
+	if c.raftNode.FSM().HasFile(path) || c.CompactionOwns(path) || c.unlinkDeferred(path) {
 		return false
 	}
 	if fn := s.pending.Load(); fn != nil && (*fn)(path) {

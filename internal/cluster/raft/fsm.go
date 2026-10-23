@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
@@ -669,11 +670,30 @@ type ClusterFSM struct {
 	// the primary `files` map on register/delete to avoid O(N) scans when
 	// filtering by database.
 	filesByDB map[string]map[string]struct{}
-	// keysCache is a sorted snapshot of f.files keys, used by
-	// GetFilesPaginated to avoid sorting the full key set on every page.
-	// Set to nil on any manifest mutation to trigger a rebuild on the
-	// next paginated call. Guarded by mu.
-	keysCache []string
+	// rewritesByFamily: registered row-DELETE rewrites by their family
+	// (storage.RewriteFamily), for HasRewriteSibling. Added on every insert
+	// and dropped on delete; a stale member is harmless (checked against
+	// files).
+	rewritesByFamily map[string]map[string]struct{}
+	// keysGen counts changes to the SET of manifest keys: a path registered
+	// that was not there, a path deleted, a Restore. A content update of a
+	// path already present does not count, because pages read entries live.
+	// keysRestoreGen counts Restores alone. Both guarded by mu (#1341).
+	keysGen        uint64
+	keysRestoreGen uint64
+	// The sorted snapshot of f.files keys GetFilesPaginated pages through,
+	// guarded by keysMu, never by mu: building it must not hold the FSM
+	// write lock every apply needs (#1341). No apply takes keysMu, and it is
+	// always taken before mu, never while holding it. A slice, once
+	// installed, is never modified; a rebuild allocates a new one.
+	keysMu              sync.Mutex
+	keysCache           []string
+	keysCacheValid      bool
+	keysCacheGen        uint64
+	keysCacheRestoreGen uint64
+	// sortKeys sorts a key snapshot; nil means sort.Strings. A field so a
+	// test can park the sort and prove no FSM lock is held across it.
+	sortKeys func([]string)
 	// tokens holds the cluster-wide API-token state (Phase A: Cluster Auth
 	// Convergence). The map is the source of truth in memory; each node's
 	// local SQLite `api_tokens` is a materialised cache rebuilt from
@@ -1565,7 +1585,7 @@ func (f *ClusterFSM) applyAckCompactionPause(payload []byte) interface{} {
 }
 
 // applyBarrier records the barrier token at the index it was applied. No
-// callbacks, no manifest change, keysCache untouched.
+// callbacks, no manifest change, keysGen untouched.
 func (f *ClusterFSM) applyBarrier(payload []byte, logIndex uint64) interface{} {
 	var p BarrierPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
@@ -1946,6 +1966,7 @@ func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uin
 		}
 	}
 	f.files[entry.Path] = &entry
+	f.indexRewriteLocked(entry.Path)
 	// Maintain the database → files secondary index
 	idx, ok := f.filesByDB[entry.Database]
 	if !ok {
@@ -1953,7 +1974,9 @@ func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uin
 		f.filesByDB[entry.Database] = idx
 	}
 	idx[entry.Path] = struct{}{}
-	f.keysCache = nil // invalidate sorted-key cache
+	if !existed {
+		f.keysGen++ // a new key for GetFilesPaginated
+	}
 	callback := f.onFileRegistered
 	contentCallback := f.onFileContentChanged
 	return func() {
@@ -2022,6 +2045,7 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 		f.takeoverNoteVanishedLocked(*existing)
 	}
 	delete(f.files, p.Path)
+	f.unindexRewriteLocked(p.Path)
 	if existed {
 		f.noteStagedOutputGoneLocked(p.Path, p.Reason)
 		// Remove from the database → files secondary index
@@ -2032,7 +2056,9 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 			}
 		}
 	}
-	f.keysCache = nil // invalidate sorted-key cache
+	if existed {
+		f.keysGen++ // a key gone for GetFilesPaginated
+	}
 	if !existed {
 		// Idempotent — deletion of a non-existent file is a no-op, and
 		// there is nothing to announce.
@@ -2135,6 +2161,7 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 		}
 	}
 	f.files[entry.Path] = &entry
+	f.indexRewriteLocked(entry.Path)
 	if entry.Database != "" {
 		idx, ok := f.filesByDB[entry.Database]
 		if !ok {
@@ -2143,7 +2170,9 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 		}
 		idx[entry.Path] = struct{}{}
 	}
-	f.keysCache = nil // invalidate sorted-key cache
+	if !existed {
+		f.keysGen++ // a new key for GetFilesPaginated
+	}
 	callback := f.onFileRegistered
 	contentCallback := f.onFileContentChanged
 	return func() {
@@ -3277,7 +3306,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.files = restoredFiles
 	// Rebuild the database → files secondary index from the restored files
 	f.filesByDB = make(map[string]map[string]struct{}, len(f.files))
+	f.rewritesByFamily = nil
 	for path, entry := range f.files {
+		f.indexRewriteLocked(path)
 		idx, ok := f.filesByDB[entry.Database]
 		if !ok {
 			idx = make(map[string]struct{})
@@ -3358,7 +3389,13 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		}
 		teamSet[id] = struct{}{}
 	}
-	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
+	// A restore replaces the key set wholesale and announces none of the
+	// keys it adds through onFileRegistered: only a manifest walk finds
+	// them. keysRestoreGen makes a walk in progress rebuild on its next
+	// page, so it reaches the restored keys that sort after its cursor; the
+	// ones before it wait for the next walk, as they always did.
+	f.keysGen++
+	f.keysRestoreGen++
 	f.authQuarantined = quarantinedAuthIDs(&snapshot, restoredTokens, restoredOrgs, restoredTeams, restoredRoles, restoredMPerms, restoredMemberships)
 	// A snapshot install never fires the per-command auth callbacks, so the
 	// local SQLite would keep every token and grant the snapshot changed
@@ -3568,6 +3605,75 @@ func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
 	return files
 }
 
+// HasRewriteSibling reports whether the manifest lists another member of
+// path's rewrite family (storage.RewriteFamily): a file a row DELETE
+// rewrote, or rewrote from.
+func (f *ClusterFSM) HasRewriteSibling(path string) bool {
+	family := storage.RewriteFamily(path)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if family != path {
+		if _, ok := f.files[family]; ok {
+			return true
+		}
+	}
+	for p := range f.rewritesByFamily[family] {
+		if _, ok := f.files[p]; ok && p != path {
+			return true
+		}
+	}
+	return false
+}
+
+// RewriteSiblings returns the registered members of path's rewrite family
+// other than path, with their entries.
+func (f *ClusterFSM) RewriteSiblings(path string) []FileEntry {
+	family := storage.RewriteFamily(path)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var out []FileEntry
+	if family != path {
+		if e, ok := f.files[family]; ok {
+			out = append(out, *e)
+		}
+	}
+	for p := range f.rewritesByFamily[family] {
+		if e, ok := f.files[p]; ok && p != path {
+			out = append(out, *e)
+		}
+	}
+	return out
+}
+
+// indexRewriteLocked adds path to rewritesByFamily if it is a rewrite.
+// Caller holds f.mu.
+func (f *ClusterFSM) indexRewriteLocked(path string) {
+	family := storage.RewriteFamily(path)
+	if family == path {
+		return
+	}
+	if f.rewritesByFamily == nil {
+		f.rewritesByFamily = make(map[string]map[string]struct{})
+	}
+	m := f.rewritesByFamily[family]
+	if m == nil {
+		m = make(map[string]struct{})
+		f.rewritesByFamily[family] = m
+	}
+	m[path] = struct{}{}
+}
+
+// unindexRewriteLocked drops path from rewritesByFamily. Caller holds f.mu.
+func (f *ClusterFSM) unindexRewriteLocked(path string) {
+	family := storage.RewriteFamily(path)
+	if m := f.rewritesByFamily[family]; m != nil {
+		delete(m, path)
+		if len(m) == 0 {
+			delete(f.rewritesByFamily, family)
+		}
+	}
+}
+
 // FileDatabases returns the databases the manifest lists files of, sorted.
 func (f *ClusterFSM) FileDatabases() []string {
 	f.mu.RLock()
@@ -3587,33 +3693,29 @@ func (f *ClusterFSM) FileDatabases() []string {
 // there are no more pages), and an error.
 //
 // This avoids the O(N) allocation of GetAllFiles() for large manifests.
-// Between pages the RLock is released so Raft apply-path latency is not
-// affected by long-running manifest walks. The sorted-key cache is
-// rebuilt on first call after any manifest mutation.
+// The FSM write lock is never held here (#1341): the key snapshot is copied
+// under the read lock and sorted with no FSM lock held, and each page's
+// entries are read under the read lock.
+//
+// Snapshot lifetime: a walk's first page (cursor "") rebuilds the snapshot
+// when the key set changed since it was built; a continuation page keeps
+// the snapshot it finds, so a walk sorts the manifest at most once instead
+// of on nearly every page under ingest. A Restore forces a rebuild on any
+// page, because the keys a snapshot install adds are announced to no
+// callback and only a walk finds them (those after the cursor; the rest
+// wait for the next walk).
 //
 // Cursor stability: the cursor is the last path string of the previous
-// page. If the cursor path is deleted between pages, pagination resumes
-// from the next key in sort order — no existing entries are skipped.
-// Newly added entries that sort before the cursor may be missed (the
-// cache is rebuilt and cursor is relative to the new key order); this
-// is acceptable because catch-up also receives reactive FSM callbacks
-// for new entries.
+// page. A key deleted since the snapshot is skipped (entries are read
+// live), so a page can be empty with a non-empty next cursor. Keys added
+// since the walk's first page are not in it; the event-driven path
+// (onFileRegistered) announces them, and the next walk lists them. Nothing
+// infers a file's absence from a walk (the stale-local sweep asks HasFile).
 func (f *ClusterFSM) GetFilesPaginated(cursor string, limit int) ([]*FileEntry, string, error) {
 	if limit <= 0 {
 		limit = 1000
 	}
-
-	f.mu.Lock()
-	// Rebuild the sorted-key cache if invalidated
-	if f.keysCache == nil {
-		f.keysCache = make([]string, 0, len(f.files))
-		for k := range f.files {
-			f.keysCache = append(f.keysCache, k)
-		}
-		sort.Strings(f.keysCache)
-	}
-	keys := f.keysCache
-	f.mu.Unlock()
+	keys := f.sortedKeys(cursor == "")
 
 	// Find start position from cursor
 	start := 0
@@ -3653,6 +3755,36 @@ func (f *ClusterFSM) GetFilesPaginated(cursor string, limit int) ([]*FileEntry, 
 	}
 
 	return result, nextCursor, nil
+}
+
+// sortedKeys returns the sorted key snapshot for GetFilesPaginated,
+// rebuilding it when a walk starts on a changed key set or a Restore has run.
+// keysMu is held throughout so concurrent walks do not each sort; it is never
+// taken by an apply. The read lock covers only the gen check and the key
+// copy, and that section calls no FSM method: a nested RLock behind a waiting
+// writer would deadlock.
+func (f *ClusterFSM) sortedKeys(walkStart bool) []string {
+	f.keysMu.Lock()
+	defer f.keysMu.Unlock()
+	f.mu.RLock()
+	gen, restoreGen := f.keysGen, f.keysRestoreGen
+	if f.keysCacheValid && f.keysCacheRestoreGen == restoreGen && (!walkStart || f.keysCacheGen == gen) {
+		f.mu.RUnlock()
+		return f.keysCache
+	}
+	keys := make([]string, 0, len(f.files))
+	for k := range f.files {
+		keys = append(keys, k)
+	}
+	f.mu.RUnlock()
+	sorter := f.sortKeys
+	if sorter == nil {
+		sorter = sort.Strings
+	}
+	sorter(keys)
+	f.keysCache, f.keysCacheValid = keys, true
+	f.keysCacheGen, f.keysCacheRestoreGen = gen, restoreGen
+	return keys
 }
 
 // FileCount returns the number of files in the manifest.

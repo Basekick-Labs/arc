@@ -129,6 +129,67 @@ the snapshot it booted from would bring back what was revoked since.
   `arc_cluster_auth_reconcile_collisions` and
   `arc_cluster_auth_reconcile_kept_rows`.
 
+## Upgrade note: tag and field names Arc cannot read back are refused ([#1342](https://github.com/Basekick-Labs/arc/issues/1342))
+
+Ingest used to store three kinds of names that Arc could not read back.
+Once one reached a measurement, compaction of the measurement failed (`no
+'time' column`), `SELECT *` failed with `Invalid unicode`, the DELETE API
+failed with `Unimplemented type for cast (DOUBLE -> TIMESTAMP WITH TIME
+ZONE)`, and pyarrow and other external readers failed too:
+
+- **A name that is not valid UTF-8**, such as a Latin-1 `°` (`0xB0`) from a
+  migration tool.
+- **A name equal to `time` ignoring case**, such as a field `Time` or a tag
+  `TIME`. DuckDB matches column names without regard to case. In files where
+  that column came before Arc's own `time` column, `time` resolved to it.
+- **Two names of one measurement that differ only in case**, such as `Temp`
+  and `temp`. DuckDB reads them as one column, so one spelling's data shows up
+  under the other.
+
+These names are now refused everywhere a write enters Arc:
+
+| Path | What happens |
+|---|---|
+| Line protocol (`/write`, `/api/v2/write`, `/api/v1/write/line-protocol`) and msgpack rows | The point is dropped and the rest are written, as for a key named exactly `time` today. The answer is a partial-write `400` naming the measurement, the name and the reason. |
+| msgpack columnar | The item is dropped whole (its names belong to all its rows) and the other items are written. Partial-write `400`. |
+| CSV, Parquet and LP imports | The file is refused with a `400` before anything is written. A CSV's own time column may be called `Time` (as in Grafana's CSV export); it is renamed to `time`. |
+| MQTT | The reading is kept and only the offending key is dropped, with a warning at most once every 10 minutes per name. Tasmota's `SENSOR` messages carry a `"Time"` key, which is now dropped while the rest of the reading is stored. |
+| Continuous queries | A run whose output has such a column fails with an error naming it. A query that aliases a column `AS Time` now fails every run; rename the alias. |
+| WAL replay and standby or stream replay | A column an older binary accepted under such a name is dropped, and the rows and their other columns are written. Logged at `Error`. |
+
+For two names that differ only in case, the check covers both the write
+itself and the measurement's existing columns, as recorded in its field
+schema (`query.stable_schema`). The spelling the measurement already has
+wins. The comparison against existing columns uses the schema in memory, so
+right after a restart, until the measurement's schema is loaded, only the
+write is checked.
+
+**What clients see.** A client that has been sending, say, a field `Time`
+(pandas DataFrames often have one) got its writes accepted until now. They
+were accepted, and they broke the measurement later. Now those points are
+dropped with a `400`. The answer is the same partial-write answer line protocol
+gives for a key named exactly `time`.
+
+A case-twin refusal is answered only for measurements the token may
+write. For any other measurement, the check looks at the request alone, so
+an answer cannot reveal which columns that measurement already has.
+
+**Existing measurements.**
+- **Field schema:** the measurement's field schema no longer lists these
+  names, so reads of time ranges without such files work again. The stored
+  schema is rewritten on the next flush.
+- **Mixed versions:** during a rolling upgrade, a node still on an older
+  release can write the old names back. The upgraded nodes then rewrite the
+  schema again, every few minutes, until every node is upgraded.
+- **Files already on disk:** files written with such a column are not
+  rewritten. Reads and compaction of the hours they hold still fail. Arc
+  cannot export them either, because the bad column breaks every query that
+  touches those files. They leave with retention, or with the database when
+  it is deleted. Before that, rewriting them takes a tool that reads the
+  Parquet files directly and renames the column, then an import of the result.
+- **Edge sync:** a spoke on an older release can still send such files to
+  its hub; upgrade spokes first.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
@@ -1442,16 +1503,101 @@ batched, and cache invalidation is once per affected database/measurement.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1197](https://github.com/Basekick-Labs/arc/pull/1197).
 
+### Compaction job metrics count on `/metrics` ([#1343](https://github.com/Basekick-Labs/arc/issues/1343))
+
+`arc_compaction_jobs_total`, `arc_compaction_jobs_success_total` and
+`arc_compaction_jobs_failed_total` always read `0`, whatever
+`/api/v1/compaction/stats` said. They were counted inside the compaction
+subprocess, whose own metrics nothing scrapes. The storage reads, writes and
+bytes the subprocess did were lost the same way.
+
+They are now counted by the server, from each subprocess's result:
+
+- **Attempts, not partitions.** A batch that fails and is retried at half
+  size counts twice, as in `/api/v1/compaction/stats`. A subprocess that
+  crashed or was killed without reporting counts as failed. One cut short by
+  a shutdown or a cancelled cycle counts as interrupted, in the new
+  `arc_compaction_jobs_interrupted_total`. `arc_compaction_jobs_total` is the
+  sum of the three.
+- **Staged jobs** (clusters with compaction commit) count as succeeded once
+  their output is staged, before the cluster commits it.
+- **On `/metrics`:** `arc_compaction_files_compacted_total`,
+  `arc_compaction_bytes_read_total` and `arc_compaction_bytes_written_total`,
+  which existed only in the JSON metrics until now.
+- **Storage:** the subprocess's storage reads, writes, bytes, errors and
+  quarantined paths are added to `arc_storage_*`.
+
+**Alerts.** An alert on `arc_compaction_jobs_failed_total` (for example
+`rate(...[1h]) > 0`) never fired before this fix, and now will. A partition
+that cannot be compacted fails more than once per cycle as its batch is
+halved. An alert on `increase(arc_compaction_jobs_success_total[24h]) == 0`,
+which fired all the time, now means something.
+
+Also, a failed job's `writing_output` record in the compaction completion
+directory is removed once its subprocess exits, unless crash recovery still
+needs it. These records used to stay until a restart. On a node with staged
+compaction on local storage, they also kept the failed job's staged output
+from ever being swept. The JSON metrics (`/api/v1/metrics`) also gain
+`jobs_interrupted`. A subprocess that is killed reports nothing, so the
+storage I/O it did before it died is not counted.
+
+### A manifest walk no longer stalls Raft applies during heavy ingest ([#1341](https://github.com/Basekick-Labs/arc/issues/1341))
+
+**Enterprise clusters with file replication.** The periodic manifest walk
+(`cluster.replication_reconciliation_interval_seconds`, default 5 minutes),
+the startup catch-up and the paginated `GET /api/v1/cluster/files` read the
+manifest in 1,000-entry pages over a sorted list of every file path. Two things
+made that expensive under ingest:
+
+- The sorted list was rebuilt whenever any file was registered, updated or
+  deleted, so a walk re-sorted it on nearly every page.
+- Each rebuild ran under the Raft FSM's write lock: about 260 ms at 1.07M files,
+  on each of roughly 1,070 pages.
+
+Every Raft apply waited behind it: file registrations, compaction commits,
+deletes, token and RBAC changes. Under sustained heavy ingest the walk held
+that lock for minutes at a time. On 26.09.x, registrations failed outright
+in those windows, and their files were never replicated. On main the outbox
+retried them, but ingest registration and compaction commits still stalled,
+and compaction batches logged `raft: manifest apply failed`.
+
+The walk now never takes the write lock:
+
+- It copies the paths under the read lock: about 9 ms at 1.07M files.
+- It sorts them with no lock held.
+- It does this once per walk, and only when files were added or removed since
+  the last sort. A content update of an existing file triggers no re-sort.
+- In the measurement, an apply arriving mid-sort waited under a microsecond.
+
+Files registered during a walk are listed by the next walk. Replication picks
+them up from the registration as before. Files a Raft snapshot install brings
+in are listed by the walk in progress if they sort after its position, and
+otherwise by the next walk.
+
+A page of `GET /api/v1/cluster/files?cursor=…` can now be empty while
+`next_cursor` is not: its files were deleted after the walk's first page.
+Keep paging until `next_cursor` is empty; an empty page does not mean the
+end.
+
+The workaround of raising `replication_reconciliation_interval_seconds` during
+heavy loads is no longer needed.
+
 ### Queries no longer count a compaction's rows twice
 
 Compaction writes its output into the partition and then deletes the files
 it merged. A query that ran in between read both, so it counted every row of
 that compaction twice. This happened with default settings, including OSS
-standalone, on JSON, Arrow and msgpack queries.
+standalone and every cluster node, on JSON, Arrow and msgpack queries.
 - **How long:** normally milliseconds to seconds (longer on S3 with many
   inputs). If deleting an input failed, it lasted until the next compaction
   cycle recovered the job, up to an hour, or until the first cycle after a
   restart.
+- **Clusters:** a staged compaction has the same window on every node.
+  - With shared storage, it runs from the output's copy to the deletion of
+    its inputs; a failing delete or a dead finisher held it open.
+  - With local storage, each node read the inputs it still had on disk
+    until its own delete of them ran. A delete that failed on a node left
+    that node reading both sides until the file was removed by hand.
 - **Permanent through continuous queries:** a continuous query that ran
   inside the window wrote the doubled aggregate back to storage.
 
@@ -1464,20 +1610,293 @@ standalone, on JSON, Arrow and msgpack queries.
   the arcx engine leave its inputs out, because the output holds their rows.
   This holds until the inputs are deleted, including after a failed delete
   or a restart.
+- In a cluster, every node does the same for staged compactions, whether
+  or not it compacts:
+  - With shared storage, a committed job's inputs are left out once its
+    output is at its final key, until the job ends. Once the output is
+    removed from the cluster manifest, nothing is left out: the job is then
+    either undone, with its inputs registered again, or its inputs are
+    deleted too.
+  - With local storage, a node leaves out an input it still has on disk once
+    the job's output is on the same disk.
+  - With local storage, files that retention or a whole-file DELETE removed
+    are left out as soon as the manifest drops them, rather than when each
+    node's delete runs.
+  - A path the manifest lists again is always read.
+  - If the node's deleted-file counts look like a rolled-back manifest
+    (`cluster.stale_local_sweep_max_fraction`), it leaves nothing out.
 - Outside those windows nothing changes. While a compaction is open, queries
   on that measurement are not cached, so a read planned before the output
   appeared is never served after it. With `query.enable_s3_cache` on, DuckDB's
   object-store listing cache is dropped when an output is first seen.
 
 **Limitations:**
-- With shared storage (several nodes, one bucket), only the node running the
-  compaction knows about it. Queries on other nodes can still see the window.
-  A follow-up release covers them.
+- A DELETE that rewrites a file, and tiering moves, still have their own
+  short windows in a cluster; they are not covered here.
 - One short race remains, as before: a query planned just before the output
   is written can still read both sides, if its read lists the files after
   the upload and before the inputs are deleted (normally milliseconds).
   Leaving the output out of such a query would instead lose the job's rows
   when the inputs are deleted first, which is worse.
+
+### A retried DELETE no longer leaves the surviving rows in two files
+
+A row DELETE writes each affected file again without the deleted rows, then
+removes the old file. If removing the old file failed, it stayed in storage
+next to the new one, and queries counted its rows twice. That much is a
+window (see the limitations). What made it permanent:
+- **Retrying the DELETE:** the old file still had the matching rows, so the
+  retry wrote it again. Two files then held the surviving rows, and every
+  later DELETE rewrote both. On a shared object store cluster, the retry also
+  registered the second copy in the cluster manifest.
+- **Compaction:** standalone compaction, and cluster compaction with
+  compaction commit off, merged the old file and its replacement into one
+  output with the rows twice.
+- **The manifest repair** (shared object store clusters) registered a
+  compaction output a DELETE had rewritten whose old copy was still in the
+  bucket, so nothing ever removed it.
+
+**The fix:**
+- A DELETE retries removing the file it replaced a few times before giving
+  up, and so does the registration outbox when it rewrites a pending file.
+- Every rewrite of a file is named after it, so the DELETE can find the old
+  copy: of the copies of one file, the one with the fewest rows is the
+  current one (each rewrite only removes rows).
+- **Standalone:**
+  - Before removing the replaced file, the DELETE records it in the storage
+    backend (`_delete_retired/`). Arc removes recorded files at start and
+    every minute, so a failed removal is finished without a retry, after a
+    restart too.
+  - A later DELETE on the measurement leaves out and removes any older copy
+    it finds, recorded or not.
+  - A backup leaves out recorded files, so a restore does not bring both
+    copies back.
+- **Clusters:** the DELETE first catches up with the cluster manifest. It
+  then leaves out a file the manifest does not list while another copy of
+  the same file is listed or still being registered.
+  - With compaction commit on (a cluster turns it on once every node
+    supports it), the DELETE also
+    removes such a file when it is provably the older copy: the listed copy
+    is in storage at its registered size and has fewer rows.
+  - The manifest repair no longer registers such a file. When the
+    reconciler is enabled and acting (`reconciliation.enabled`, with
+    `reconciliation.manifest_only_dry_run = false`), it removes the file as
+    an orphan.
+- Compaction (outside staged compaction, which compacts only files the
+  cluster manifest lists) skips every copy of a file while more than one is
+  in storage, and any file the standalone record names.
+- A DELETE whose clause no longer matches anything when it rewrites a file
+  (a clause on `now()`) leaves the file as it is instead of writing the same
+  rows under a new name.
+
+**Limitations:**
+- While both copies are in storage, compaction skips that file.
+- Pairs of copies left by earlier versions (both rewrites of the bug above)
+  hold the same rows: neither can be told apart, so both are kept, read and
+  rewritten together. A DELETE on them warns. Remove one by hand.
+- Standalone with tiering: if a recorded copy moves to the cold tier before
+  it is removed, it stays there.
+- On a shared object store cluster, an old copy whose replacement was later
+  compacted, tiered or deleted away while the copy was still in the bucket:
+  - is never registered again or rewritten (the record keeps it out);
+  - is not removed either, since nothing proves it is old any more;
+  - is read until removed by hand.
+- On a shared object store cluster with tiering, an old copy whose
+  replacement is only in the cold tier is left out of every DELETE and not
+  removed: a DELETE leaves its matching rows in place (and logs a warning)
+  until it is removed by hand or by the reconciler.
+
+### Queries no longer count a DELETE's surviving rows twice while it rewrites a file
+
+A row DELETE writes each affected file again without the deleted rows, then
+removes the old file. Between the two, every query read both: the surviving
+rows twice, and the deleted rows again. Normally this lasts milliseconds; if
+removing the old file failed, it lasted until something removed it. Reads
+now leave the old file out once its replacement is in storage.
+- **Standalone:** from the moment the replacement is written. After a
+  restart, reads start from the DELETE's record of the file.
+- **Clusters (both storage patterns):** every node does the same once the
+  cluster manifest has dropped the old file and a registered copy of the
+  same file is in storage at its registered size.
+- With `query.enable_s3_cache` on, DuckDB's object-store listing cache is
+  dropped the first time the replacement is seen.
+
+**The DELETE's record of a replaced file, on clusters too:**
+- The DELETE writes the record before it changes the cluster manifest. It
+  lives in the storage backend (`_delete_retired/`, in the shared bucket on
+  an object store).
+- Each node settles its own records every minute. On a shared object store
+  only the primary writer does, checked every time.
+- A record is only acted on when it is safe:
+  - The old file is removed once the manifest no longer lists it and a
+    listed copy of it is in storage at its registered size (standalone: once
+    its replacement is in storage).
+  - A rewrite the manifest still does not list about 5 minutes after the
+    settling node first saw its record is removed (its change never
+    applied or was refused); the original is kept.
+  - If the rewrite took and has since moved on (compacted, rewritten
+    again) while the old file was still in storage, the record stays, so
+    the old file is never scanned or registered again.
+- A DELETE that cannot write its record first does not change the manifest
+  (it answers with an error). A DELETE retried while an earlier rewrite of
+  the same file is still settling answers 503 until it is settled.
+- The manifest repair never registers a file a record names, and the
+  reconciler does not treat one as an orphan.
+- A restore clears the record of every file it restores, and a backup leaves
+  a recorded file out only while its replacement is in the same backup.
+
+**Two ways a cluster DELETE could lose rows, fixed:**
+- When the manifest change returned an error whose outcome is unknown (a
+  forwarded change that timed out, leadership lost after it was proposed),
+  the DELETE removed its rewrite. If the change applied anyway, the manifest
+  listed a file that no longer existed and the old file was gone too. The
+  DELETE now keeps both files and its record (it still answers with an
+  error), and the record is settled once the manifest shows the outcome.
+- A file the node's own manifest did not list (with compaction commit off)
+  was removed with its rewrite left unregistered, even when the node's
+  manifest was only behind. The DELETE now catches up with the cluster
+  manifest first, and treats the file as unlisted only if it still is.
+
+**Limitations:**
+- The window between a replacement's upload and the manifest change that
+  registers it remains, on every node of a cluster: for that moment reads
+  see both files. Normally milliseconds.
+- A node whose manifest lags behind the cluster reads both copies until it
+  catches up.
+- On a shared object store cluster, a node that restarts reads both copies
+  of a file whose old copy is still in the bucket, until the primary
+  writer's drainer removes it (about a minute).
+- Standalone: if writing the record failed too (likely in the same storage
+  outage that stopped the removal), reads after a restart see both copies
+  until a DELETE runs on that measurement.
+- When compaction takes the replacement, the old file, if still in storage,
+  is read again until removed (its rows are not lost).
+
+### A cluster node no longer loses a DELETE rewrite's rows while the rewrite is on its way
+
+On a cluster with local storage, every node removes its copy of a file a
+row DELETE rewrote 500 ms after the cluster manifest drops it. The node
+receives the rewrite only when its pull completes, which can take seconds,
+or until the next reconciliation walk (5 minutes) when the pull queue was
+full. Until then that node had neither copy, so its queries were missing
+every row the DELETE kept from that file. A continuous query that ran
+there in that window stored the shortfall.
+
+**The fix:**
+- A node now keeps its copy of the old file until a registered copy of the
+  rewrite is on its disk at its registered size. The removal waits on the
+  side: the delete workers are never blocked by it.
+- Reads on that node keep counting the old file while it waits: the
+  node answers as before the DELETE (the deleted rows included) until the
+  rewrite arrives, rather than missing the file's rows. Once the rewrite
+  lands, the old file is left out of reads and removed. Queries on that
+  measurement are not cached while a file waits.
+- The old file is removed at once if the manifest no longer lists any
+  rewrite of it (its rows went elsewhere or were deleted), and kept if the
+  manifest lists the file itself again.
+- There is no time limit. A copy waits as long as its rewrite has not
+  arrived; removing it earlier would trade correct answers for disk space.
+- A node that stops keeps such copies on disk. After the restart, once
+  the node has caught up with the cluster manifest, they are found again
+  from its record of the files it has seen registered.
+- The stale-local sweep and the Iceberg export treat a waiting copy as the
+  node's own data.
+- New gauge `arc_cluster_local_delete_deferred`: removals waiting for their
+  rewrite. It rises while pulls are slow; a value that never falls means the
+  rewrites are not arriving.
+
+**Limitations:**
+- If the rewrite is compacted before it reaches the node, the old file is
+  removed when the rewrite leaves the manifest, even if the node does not
+  hold the compaction's output yet.
+- A node that catches up through a snapshot install removes the files the
+  snapshot dropped without waiting.
+- A node without that record does not keep copies waiting, and removes
+  the old file as before. That covers `cluster.replication_catchup_enabled
+  = false`, no Raft data directory, or a record that cannot be opened.
+
+### Tiering: a migration no longer brings deleted rows back, and reads count its files once
+
+Moving a file to cold storage copies it, marks it cold, and only then
+removes the hot copy. Three problems, all fixed:
+
+- **A DELETE during the move brought its rows back for good.** A row DELETE
+  that rewrote a file while it was being copied left the cold copy with the
+  deleted rows. The cold sync then recorded that copy as a cold file, so the
+  deleted rows came back and the file's other rows were counted twice, for
+  good.
+  - A DELETE and a migration now never work on the same file at once.
+  - A DELETE leaves alone a file that is being moved, or one that already
+    has a copy in cold storage (a move that was interrupted). Its response
+    is 207 and names the files and why. A DELETE does not reach files in
+    cold storage ([#1350](https://github.com/Basekick-Labs/arc/issues/1350)),
+    so once the move completes those rows stay; delete them before the file
+    ages into cold storage.
+  - When cold storage cannot be checked for such a copy, the DELETE answers
+    503 and the file is left as it is; retry.
+  - Only daily compacted files old enough for their database's tiering
+    policy are checked, so a DELETE of recent data does not touch cold
+    storage.
+  - Removing the leftover of an earlier DELETE also waits for a file being
+    moved.
+- **A file an earlier DELETE replaced could be moved to cold storage.**
+  Copied there, the leftover still held the deleted rows. A migration now
+  skips such a file:
+  - when the DELETE's record names it;
+  - in a cluster, when the manifest no longer lists it but lists its
+    replacement;
+  - standalone, when its hot copy disappears during the copy.
+  The check runs again just before the file is marked cold, and a copy
+  already made is deleted.
+- **Reads counted migrated files twice until the whole batch was done.**
+  The hot copies were removed only after every file in the batch (up to
+  `migration_batch_size`, default 100) had been copied. Until then a query
+  read both copies of every file already moved. Hot copies are now released
+  as files are moved, at least once a second, and the query caches are
+  dropped around each release. Measured on a standalone node with one copy
+  held mid-migration: 7,200 rows instead of 6,000 before, 6,000 after.
+
+**Also:**
+- A file is marked cold only if its tier row still says hot. If the row
+  changed during the copy (another node moved it), the cold copy is kept,
+  since it may be the only one.
+- A node that stops being the primary writer during a copy leaves the file
+  for the new primary instead of marking it cold.
+- A manifest failure stops the whole migration cycle, not just the current
+  batch. Files already marked cold keep their hot copies until
+  reconciliation removes them.
+- A copy that has finished is still marked cold when the cycle is cancelled
+  (for example at shutdown).
+- On a cluster with local storage, a node that records another node's
+  moved file as cold drops its query caches. Before, it could keep serving
+  a cached listing without the file for up to 30 seconds.
+
+**Limitations:**
+- Between a file being marked cold and its hot copy being released, reads
+  on that node still count it twice. This lasts about a second, or longer
+  when files are moved faster than the cluster manifest releases them (one
+  release of up to 200 files a second).
+- On a cluster with local storage, the other nodes count a moved file twice
+  until they remove their own copy.
+- While a migration runs, the migrating node drops its query caches up to
+  twice a second.
+- A DELETE arriving on a new primary writer while the old one is still
+  copying the same file (during a failover) is not covered: the claim
+  between DELETE and migration only holds within one process.
+- The age check uses the database's current tiering policy. A file moved
+  under a shorter `hot_max_age_days`, with the policy raised since, is not
+  checked for a cold copy.
+- Continuous queries read the hot tier only and were never affected.
+
+### A DELETE no longer drops rows its clause cannot decide
+
+A row DELETE rewrote each file keeping the rows where `NOT (clause)` held. A
+row where the clause is NULL (for example `host <> 'a'` on a row with no
+`host`) fails that test too, so it was dropped from the rewritten file
+without being counted or matched: rows nobody asked to delete were lost. The
+rewrite now keeps every row the clause does not match, the same rows the
+DELETE counts as matched, on standalone and clusters, and for DELETE records
+applied to pending files.
 
 ### A cached query no longer misses an hour its relative end has just reached
 

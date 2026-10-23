@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 
@@ -116,6 +117,13 @@ type SubprocessJobResult struct {
 	// from an older subprocess, which keeps the parent's entry until the
 	// manifest is gone.
 	SourcesDeleted bool `json:"sources_deleted,omitempty"`
+	// Metrics are the counters this subprocess moved in its own registry
+	// (metrics.ChildCounters: storage reads, writes, bytes, errors), which
+	// nothing scrapes; the parent adds them to its own (#1343). The parent
+	// may run another binary version (subprocess.go starts os.Executable()):
+	// an older child sends none, and a key the parent does not know is
+	// ignored.
+	Metrics map[string]int64 `json:"metrics,omitempty"`
 }
 
 // SubprocessCredentials are the storage secrets a compaction subprocess needs
@@ -250,8 +258,11 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// Create and run job
 	job := NewJob(subprocessJobConfig(config, backend, logger, db, manifestManager))
 
-	// Use signal-aware context so the subprocess can cancel DuckDB queries
-	// when the parent kills it via SIGTERM (from exec.CommandContext).
+	// Signal-aware, so the subprocess can cancel DuckDB queries on SIGTERM or
+	// SIGINT sent to it directly: a service manager stopping the whole
+	// process group (systemd's KillMode=control-group), or Ctrl-C in a
+	// terminal. The parent's own cancellation does not come through here:
+	// exec.CommandContext kills the child outright (SIGKILL).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	err = job.Run(ctx)
@@ -656,6 +667,9 @@ func subprocessResult(job *Job, err error) *SubprocessJobResult {
 		CompactedInputs: job.CompactedInputKeys(),
 		ManifestPath:    job.RetainedManifestPath(),
 		SourcesDeleted:  job.sourcesDeleted,
+		// Taken after Run: every count is I/O this job did (backend
+		// constructors move none).
+		Metrics: metrics.Get().ChildCounters(),
 	}
 	if err != nil {
 		result.Error = err.Error()

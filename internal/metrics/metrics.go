@@ -96,9 +96,12 @@ type Metrics struct {
 	storageErrorsTotal     atomic.Int64
 
 	// Compaction metrics
-	compactionJobsTotal          atomic.Int64
-	compactionJobsSuccess        atomic.Int64
-	compactionJobsFailed         atomic.Int64
+	compactionJobsTotal   atomic.Int64
+	compactionJobsSuccess atomic.Int64
+	compactionJobsFailed  atomic.Int64
+	// compactionJobsInterrupted: attempts cut short by shutdown or a
+	// cancelled cycle (#1343).
+	compactionJobsInterrupted    atomic.Int64
 	compactionFilesCompacted     atomic.Int64
 	compactionBytesRead          atomic.Int64
 	compactionBytesWritten       atomic.Int64
@@ -302,6 +305,11 @@ type Metrics struct {
 	// period of every burst; a value that keeps climbing means the delete
 	// workers cannot keep up with retention or a compaction backlog.
 	clusterLocalDeletePending atomic.Int64
+	// clusterLocalDeleteDeferred is the number of local unlinks of a file a
+	// row DELETE rewrote that wait for the rewrite to arrive on this node
+	// (normal while pulls are slow; a value that never falls means the
+	// rewrites are not arriving).
+	clusterLocalDeleteDeferred atomic.Int64
 
 	// compactionManifestsParkedUnparseableTotal counts crash-recovery
 	// manifests recovery parked because their body did not decode (#926): a
@@ -550,6 +558,7 @@ func (m *Metrics) IncStorageErrors()                { m.storageErrorsTotal.Add(1
 func (m *Metrics) IncCompactionJobs()                      { m.compactionJobsTotal.Add(1) }
 func (m *Metrics) IncCompactionSuccess()                   { m.compactionJobsSuccess.Add(1) }
 func (m *Metrics) IncCompactionFailed()                    { m.compactionJobsFailed.Add(1) }
+func (m *Metrics) IncCompactionInterrupted()               { m.compactionJobsInterrupted.Add(1) }
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
@@ -889,6 +898,54 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
 
+// Counters a compaction subprocess moves in its own registry, which nothing
+// scrapes (#1343): it returns them with its result and the parent adds them.
+var childCounterKeys = []string{
+	"storage_writes", "storage_write_bytes", "storage_reads", "storage_read_bytes",
+	"storage_errors", "storage_invalid_path_quarantined",
+}
+
+func (m *Metrics) childCounter(key string) *atomic.Int64 {
+	switch key {
+	case "storage_writes":
+		return &m.storageWritesTotal
+	case "storage_write_bytes":
+		return &m.storageWriteBytesTotal
+	case "storage_reads":
+		return &m.storageReadsTotal
+	case "storage_read_bytes":
+		return &m.storageReadBytesTotal
+	case "storage_errors":
+		return &m.storageErrorsTotal
+	case "storage_invalid_path_quarantined":
+		return &m.storageInvalidPathQuarantinedTotal
+	}
+	return nil
+}
+
+// ChildCounters is, in a compaction subprocess, the counters it moved that
+// the parent must add (see AddChildCounters). Zero values are left out.
+func (m *Metrics) ChildCounters() map[string]int64 {
+	out := map[string]int64{}
+	for _, k := range childCounterKeys {
+		if v := m.childCounter(k).Load(); v > 0 {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// AddChildCounters adds a compaction subprocess's ChildCounters. A key this
+// binary does not know (a child from another version) or a negative value is
+// ignored; nil adds nothing.
+func (m *Metrics) AddChildCounters(counts map[string]int64) {
+	for k, v := range counts {
+		if c := m.childCounter(k); c != nil && v > 0 {
+			c.Add(v)
+		}
+	}
+}
+
 // IncFileTimePruningPass records a file-time pruning pass over files listed.
 func (m *Metrics) IncFileTimePruningPass(files int) {
 	m.fileTimePruningPasses.Add(1)
@@ -953,6 +1010,10 @@ func (m *Metrics) SetStaleLocalTrackingFailed(n int64) { m.staleLocalTrackingFai
 // SetClusterLocalDeletePending publishes how many manifest deletes are still
 // waiting for a local unlink on this node.
 func (m *Metrics) SetClusterLocalDeletePending(n int64) { m.clusterLocalDeletePending.Store(n) }
+
+// SetClusterLocalDeleteDeferred publishes how many local unlinks wait for a
+// DELETE rewrite to arrive on this node.
+func (m *Metrics) SetClusterLocalDeleteDeferred(n int64) { m.clusterLocalDeleteDeferred.Store(n) }
 
 // IncCompactionManifestParkedUnparseable records one crash-recovery manifest
 // parked because its body could not be decoded (#926). Call it after the
@@ -1137,6 +1198,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_jobs_total":          m.compactionJobsTotal.Load(),
 		"compaction_jobs_success":        m.compactionJobsSuccess.Load(),
 		"compaction_jobs_failed":         m.compactionJobsFailed.Load(),
+		"compaction_jobs_interrupted":    m.compactionJobsInterrupted.Load(),
 		"compaction_files_compacted":     m.compactionFilesCompacted.Load(),
 		"compaction_bytes_read":          m.compactionBytesRead.Load(),
 		"compaction_bytes_written":       m.compactionBytesWritten.Load(),
@@ -1262,6 +1324,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"stale_local_tracking_failed":             m.staleLocalTrackingFail.Load(),
 		// Cluster local delete workers (per-node storage with replication)
 		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
+		"cluster_local_delete_deferred":                 m.clusterLocalDeleteDeferred.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
 		"storage_unaddressable_files":                   m.storageUnaddressableFiles.Load(),
 		"backup_skipped_files":                          m.backupSkippedFiles.Load(),
@@ -1510,17 +1573,35 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetric(b, "arc_storage_errors_total", float64(m.storageErrorsTotal.Load()))
 
 	// Compaction metrics
-	b = append(b, "# HELP arc_compaction_jobs_total Total compaction jobs\n"...)
+	// Compaction job counters count ATTEMPTS (a batch retried at half size is
+	// two), counted by the parent from each subprocess's result (#1343).
+	b = append(b, "# HELP arc_compaction_jobs_total Compaction job attempts that ran (succeeded, failed or interrupted)\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_total", float64(m.compactionJobsTotal.Load()))
 
-	b = append(b, "# HELP arc_compaction_jobs_success_total Successful compaction jobs\n"...)
+	b = append(b, "# HELP arc_compaction_jobs_success_total Compaction job attempts that succeeded (a staged job: its output staged, before the cluster commits it)\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_success_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_success_total", float64(m.compactionJobsSuccess.Load()))
 
-	b = append(b, "# HELP arc_compaction_jobs_failed_total Failed compaction jobs\n"...)
+	b = append(b, "# HELP arc_compaction_jobs_failed_total Compaction job attempts that failed, including a subprocess that crashed or was killed\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_failed_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_failed_total", float64(m.compactionJobsFailed.Load()))
+
+	b = append(b, "# HELP arc_compaction_jobs_interrupted_total Compaction job attempts cut short by shutdown or a cancelled cycle\n"...)
+	b = append(b, "# TYPE arc_compaction_jobs_interrupted_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_jobs_interrupted_total", float64(m.compactionJobsInterrupted.Load()))
+
+	b = append(b, "# HELP arc_compaction_files_compacted_total Input files compacted by successful compaction attempts (a staged job: before the cluster commits it)\n"...)
+	b = append(b, "# TYPE arc_compaction_files_compacted_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_files_compacted_total", float64(m.compactionFilesCompacted.Load()))
+
+	b = append(b, "# HELP arc_compaction_bytes_read_total Bytes of input files of successful compaction attempts\n"...)
+	b = append(b, "# TYPE arc_compaction_bytes_read_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_bytes_read_total", float64(m.compactionBytesRead.Load()))
+
+	b = append(b, "# HELP arc_compaction_bytes_written_total Bytes of output files of successful compaction attempts\n"...)
+	b = append(b, "# TYPE arc_compaction_bytes_written_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_bytes_written_total", float64(m.compactionBytesWritten.Load()))
 
 	b = append(b, "# HELP arc_compaction_manifests_recovered_total Compaction manifests recovered after crash\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
@@ -1914,6 +1995,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_local_delete_pending Manifest deletes this per-node-storage cluster node has been told about and has not yet unlinked locally. Returns to zero within a grace period of every burst; a value that keeps climbing means the delete workers cannot keep up with retention or a compaction backlog.\n"...)
 	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)
 	b = appendMetric(b, "arc_cluster_local_delete_pending", float64(m.clusterLocalDeletePending.Load()))
+
+	b = append(b, "# HELP arc_cluster_local_delete_deferred Local unlinks of files a row DELETE rewrote that wait for the rewrite to arrive on this node, so reads here never miss its rows. Rises while pulls are slow and returns to zero as they land; a value that never falls means the rewrites are not arriving.\n"...)
+	b = append(b, "# TYPE arc_cluster_local_delete_deferred gauge\n"...)
+	b = appendMetric(b, "arc_cluster_local_delete_deferred", float64(m.clusterLocalDeleteDeferred.Load()))
 
 	b = append(b, "# HELP arc_compaction_manifests_parked_unparseable_total Total compaction crash-recovery manifests parked under the .quarantined suffix because their body could not be decoded. Growth means a manifest stopped blocking compaction without being completed; the parked file name gives the tier, database and job, and that partition should be checked for a zero-length _compacted output or for duplicate rows.\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_parked_unparseable_total counter\n"...)

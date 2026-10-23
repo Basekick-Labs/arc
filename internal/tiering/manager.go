@@ -33,6 +33,17 @@ type Manager struct {
 	// goroutine already runs.
 	callbackMu          sync.Mutex
 	onMigrationComplete func()
+	// onReadCachesStale clears the query paths' caches without the cycle-end
+	// log line: the migrator calls it around every released chunk, so a
+	// cached cold listing from before the copy, or a cached hot glob emptied
+	// by the release, is not served for a TTL.
+	onReadCachesStale func()
+
+	// claims keeps a migration and a DELETE off the same hot file.
+	claims moveClaims
+	// coldMarked: the replication drainer recorded a pulled file's move to
+	// cold since its last batch ended.
+	coldMarked atomic.Bool
 
 	// onHotFilesRemoved, when set, runs with the storage paths of hot files
 	// the tiering subsystem is about to permanently remove (migration source
@@ -601,6 +612,23 @@ func (m *Manager) SetOnMigrationComplete(fn func()) {
 	m.callbackMu.Lock()
 	m.onMigrationComplete = fn
 	m.callbackMu.Unlock()
+}
+
+// SetOnReadCachesStale registers the callback the migrator calls around
+// every chunk of hot copies it releases. Safe to call after Start.
+func (m *Manager) SetOnReadCachesStale(fn func()) {
+	m.callbackMu.Lock()
+	m.onReadCachesStale = fn
+	m.callbackMu.Unlock()
+}
+
+func (m *Manager) notifyReadCachesStale() {
+	m.callbackMu.Lock()
+	fn := m.onReadCachesStale
+	m.callbackMu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // cleanupOldMigrations deletes migration history records older than the configured retention.

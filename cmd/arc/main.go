@@ -3671,20 +3671,48 @@ func main() {
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}
+	// Reads count each compaction's rows once while its output and inputs are
+	// both readable: this node's own legacy jobs (seeded from surviving
+	// manifests before any query is served), and in a cluster the staged jobs
+	// and this node's pending local deletes, on every node whether or not it
+	// compacts.
+	var compactionJobs, clusterOpen api.OpenCompactions
 	if compactionManager != nil {
-		// Reads count each compaction's rows once while its output and inputs
-		// are both in storage; seeded from surviving manifests before any
-		// query is served.
 		syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		compactionManager.SyncOpenJobs(syncCtx)
 		syncCancel()
-		queryHandler.SetOpenCompactions(compactionManager.OpenJobs)
+		compactionJobs = compactionManager.OpenJobs
 		if cfg.Query.EnableS3Cache {
 			// A listing cached before a job's output appeared would lack it
 			// while its inputs are already left out of reads.
 			compactionManager.OpenJobs.SetOnOutputSeen(db.ClearHTTPCache)
 		}
 	}
+	if clusterCoordinator != nil {
+		clusterOpen = clusterOpenCompactions{clusterCoordinator}
+		if cfg.Query.EnableS3Cache {
+			clusterCoordinator.SetOnObjectOutputSeen(db.ClearHTTPCache)
+		}
+	}
+	// Standalone: a file a row DELETE replaced is left out of reads while it
+	// is still in storage next to its replacement (seeded from the DELETE
+	// journal before any query is served).
+	var retiredReads *api.RetiredReads
+	var retiredOpen api.OpenCompactions
+	if clusterCoordinator == nil {
+		retiredReads = api.NewRetiredReads(storageBackend)
+		seedCtx, seedCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := retiredReads.Seed(seedCtx); err != nil {
+			log.Warn().Err(err).Msg("Could not read the DELETE journal at start; files it names are read until removed")
+		}
+		seedCancel()
+		if cfg.Query.EnableS3Cache {
+			retiredReads.SetOnSeen(db.ClearHTTPCache)
+		}
+		retiredOpen = retiredReads
+	}
+	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
+	queryHandler.SetOpenCompactions(openCompactions)
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
 	// pruner cache janitor — sweeps expired globCache / partitionCache
@@ -4021,7 +4049,19 @@ func main() {
 		// DELETE records are applied to pending files with the DELETE's own
 		// rewrite (#1207 d1).
 		clusterCoordinator.SetDeleteRewriter(deleteHandler.RewriteForRecords)
+	} else {
+		deleteHandler.SetRetiredReads(retiredReads)
 	}
+	// Settle the DELETE journal (files a DELETE replaced and could not
+	// remove, rewrites whose manifest change had an unknown outcome) at start
+	// and every minute, whether or not DELETE is enabled now. On a shared
+	// object store only the primary writer acts, decided at every tick.
+	retiredCtx, retiredCancel := context.WithCancel(context.Background())
+	shutdownCoordinator.RegisterHook("delete-retired-drainer", func(_ context.Context) error {
+		retiredCancel()
+		return nil
+	}, shutdown.PriorityHTTPServer)
+	deleteHandler.StartRetiredDrainer(retiredCtx)
 	if cfg.Delete.Enabled {
 		log.Info().
 			Int("confirmation_threshold", cfg.Delete.ConfirmationThreshold).
@@ -4201,9 +4241,7 @@ func main() {
 		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
 		if err == nil {
 			cqHandler.SetFieldSchema(fieldSchemaRegistry)
-			if compactionManager != nil {
-				cqHandler.SetOpenCompactions(compactionManager.OpenJobs)
-			}
+			cqHandler.SetOpenCompactions(openCompactions)
 		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
@@ -4385,7 +4423,7 @@ func main() {
 			})
 			// A compaction output manifest repair adopts is not an orphan
 			// either, whichever of the two gets to it first (#1214).
-			reconciler.SetAdoptableFilter(clusterCoordinator.AdoptableObject)
+			reconciler.SetAdoptableFilter(clusterCoordinator.ReconcilerKeeps)
 		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")
@@ -4818,6 +4856,16 @@ func main() {
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
+		// Around every chunk of hot copies a migration releases, and when a
+		// replica records a pulled file's move to cold: a cold listing cached
+		// before the copy, or a hot glob cached before the release, would
+		// otherwise answer for a TTL without the moved file.
+		tieringManager.SetOnReadCachesStale(func() {
+			queryHandler.InvalidateCachesQuiet()
+			if cfg.Query.EnableS3Cache {
+				db.ClearHTTPCache()
+			}
+		})
 		// #687: on an edge-sync hub, tiering deletes of hot spoke files must
 		// mark their sync receipts first, or the spoke re-uploads duplicates.
 		// Wiring this also lifts the migrator's spoke-namespace gate.
@@ -5655,6 +5703,14 @@ func (a *tieringManifestAdapter) ManifestEntriesByDatabase(database string) []st
 	return paths
 }
 
+// HasRewriteSibling: the migrator leaves a file a DELETE replaced (the
+// manifest lists another member of its rewrite family instead) out of cold.
+func (a *tieringManifestAdapter) HasRewriteSibling(path string) bool {
+	return a.coordinator.HasRewriteSibling(path)
+}
+
+var _ tiering.RewriteSiblingChecker = (*tieringManifestAdapter)(nil)
+
 func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
 	return a.coordinator.CompactionOwns(path)
 }
@@ -6185,3 +6241,12 @@ func tierColdCheck(get func(ctx context.Context, path string) (*tiering.FileMeta
 		return err != nil || (f != nil && f.Tier == tiering.TierCold)
 	}
 }
+
+// clusterOpenCompactions adapts the cluster coordinator to api.OpenCompactions.
+type clusterOpenCompactions struct{ c *cluster.Coordinator }
+
+func (o clusterOpenCompactions) ExcludedFor(ctx context.Context, prefix string) []string {
+	return o.c.OpenExcludedFor(ctx, prefix)
+}
+func (o clusterOpenCompactions) Open(prefix string) bool { return o.c.OpenAny(prefix) }
+func (o clusterOpenCompactions) Generation() uint64      { return o.c.OpenGeneration() }
