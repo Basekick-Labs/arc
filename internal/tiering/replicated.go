@@ -269,6 +269,32 @@ func (m *Manager) ColdRows(ctx context.Context) (map[string]int64, error) {
 	return m.metadata.ColdFilePathsAndSizes(ctx, TierCold)
 }
 
+// ColdConfigured reports cold storage enabled in this node's configuration,
+// whether or not its backend could be built: a DELETE that cannot look at cold
+// storage says so rather than answer as if nothing were there (#1350).
+func (m *Manager) ColdConfigured() bool {
+	return m != nil && m.config != nil && m.config.Cold.Enabled
+}
+
+// ColdFilesForMeasurement is this node's cold rows of one measurement,
+// quarantined ones excluded (their keys are unusable, #758).
+func (m *Manager) ColdFilesForMeasurement(ctx context.Context, database, measurement string) ([]FileMetadata, error) {
+	if m == nil || m.metadata == nil {
+		return nil, nil
+	}
+	rows, err := m.metadata.GetFilesForQuery(ctx, database, measurement, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	out := rows[:0]
+	for _, r := range rows {
+		if r.Tier == TierCold && r.QuarantinedAt == nil {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
 // RecordRestoredColdFiles records a batch of files a restore has just written
 // to this node's cold tier (#1086 stage C, batched in #1141), so the query
 // path can route to them: tier routing reads these rows, so the row is what
