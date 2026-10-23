@@ -98,9 +98,9 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 	}
 	f := fromWord.FindStringIndex(shape)
 	loc := whereWord.FindStringIndex(wheres)
-	// The WHERE must follow the FROM (a FILTER (WHERE …) before it is a
-	// second WHERE and refused above, but never slice on that assumption),
-	// and a comma join (FROM a, b) is a second table without a JOIN keyword.
+	// The WHERE must follow the FROM (never slice on the assumption that the
+	// one WHERE left after blanking aggregate FILTERs is the query's), and a
+	// comma join (FROM a, b) is a second table without a JOIN keyword.
 	if f == nil || loc == nil || f[1] > loc[0] || hasTopLevelComma(shape[f[1]:loc[0]]) {
 		return timeBounds{}, false
 	}
