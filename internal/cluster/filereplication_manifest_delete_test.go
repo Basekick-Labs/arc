@@ -453,6 +453,8 @@ func TestManifestDelete_ReregisterAfterUnlinkStillConverges(t *testing.T) {
 // asked for.
 func TestManifestDelete_SharedBackendNeverUnlinksOrRefreshes(t *testing.T) {
 	r := newReregisterRig(t, "shared", reregisterOpts{shared: true, logger: zerolog.Nop()})
+	recorder := &fakeTierRecorder{}
+	r.c.SetTierRecorder(recorder)
 	ctx := context.Background()
 
 	if err := r.c.raftNode.DeleteFile(r.unrelated.Path, "test: delete", 5*time.Second); err != nil {
@@ -468,6 +470,30 @@ func TestManifestDelete_SharedBackendNeverUnlinksOrRefreshes(t *testing.T) {
 	s := r.c.puller.Stats()
 	if r.c.deletesPending() != 0 || r.c.deleteRelistedLogged.Load() != 0 || s["forced_refresh"] != 0 || s["refresh_verified"] != 0 {
 		t.Fatalf("pending=%d relisted=%d stats=%v, want no delete-worker activity", r.c.deletesPending(), r.c.deleteRelistedLogged.Load(), s)
+	}
+	if reports := recorder.unlinkReports(); len(reports) != 0 {
+		t.Fatalf("non-tiering shared delete reported to tier metadata: %+v", reports)
+	}
+}
+
+func TestManifestDelete_SharedBackendReportsTieringMigration(t *testing.T) {
+	r := newReregisterRig(t, "shared-tiering", reregisterOpts{shared: true, logger: zerolog.Nop()})
+	recorder := &fakeTierRecorder{}
+	r.c.SetTierRecorder(recorder)
+
+	if err := r.c.raftNode.DeleteFile(r.path, "tiering:migrated", 5*time.Second); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+
+	reports := recorder.unlinkReports()
+	if len(reports) != 1 {
+		t.Fatalf("got %d tier unlink reports, want one: %+v", len(reports), reports)
+	}
+	if reports[0].path != r.path || reports[0].reason != "tiering:migrated" {
+		t.Fatalf("tier unlink report = %+v, want path %q and migration reason", reports[0], r.path)
+	}
+	if reports[0].size != -1 {
+		t.Fatalf("size = %d, want unknown size for a shared-store manifest delete", reports[0].size)
 	}
 }
 

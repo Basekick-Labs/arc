@@ -232,6 +232,89 @@ func TestRecordUnlinkedFile_MigratedWithNoHotRowStillInsertsCold(t *testing.T) {
 	}
 }
 
+func TestRecordManifestUnlinkedFile_UsesColdObjectSizeWhenRowIsMissing(t *testing.T) {
+	const path = "db1/cpu/2026/10/03/a_daily.parquet"
+	body := []byte("cold copy with its actual size")
+	cold := newMockBackend("s3")
+	cold.seedRaw(path, body)
+	m := newTierEventManager(t, nil, true)
+	m.coldBackend = cold
+
+	m.RecordManifestUnlinkedFile(path, "tiering:migrated")
+	waitTierEvents(t, m, 1)
+
+	var tier string
+	var size int64
+	if err := m.metadata.db.QueryRow(`SELECT tier, size_bytes FROM tier_files WHERE path = ?`, path).Scan(&tier, &size); err != nil {
+		t.Fatalf("read cold row: %v", err)
+	}
+	if tier != string(TierCold) || size != int64(len(body)) {
+		t.Fatalf("row = (%q, %d), want cold with size %d", tier, size, len(body))
+	}
+	tiers, err := m.metadata.GetTiersForMeasurement(context.Background(), "db1", "cpu")
+	if err != nil || !tiers[TierCold] {
+		t.Fatalf("measurement tiers = %v, err=%v; want cold so queries include the migrated object", tiers, err)
+	}
+}
+
+type failFirstStatBackend struct {
+	*mockBackend
+	calls      atomic.Int64
+	firstCall  chan struct{}
+	secondCall chan struct{}
+}
+
+func (b *failFirstStatBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	switch call := b.calls.Add(1); call {
+	case 1:
+		if b.firstCall != nil {
+			close(b.firstCall)
+		}
+		return 0, errors.New("temporary cold-tier stat failure")
+	case 2:
+		if b.secondCall != nil {
+			close(b.secondCall)
+		}
+	}
+	return b.mockBackend.StatFile(ctx, path)
+}
+
+func TestRecordManifestUnlinkedFile_RetriesColdSizeLookup(t *testing.T) {
+	const path = "db1/cpu/2026/10/03/a_daily.parquet"
+	body := []byte("cold copy with its actual size")
+	coldStore := newMockBackend("s3")
+	coldStore.seedRaw(path, body)
+	cold := &failFirstStatBackend{
+		mockBackend: coldStore,
+		firstCall:   make(chan struct{}),
+		secondCall:  make(chan struct{}),
+	}
+	m := newTierEventManager(t, nil, true)
+	m.coldBackend = cold
+
+	m.RecordManifestUnlinkedFile(path, "tiering:migrated")
+	select {
+	case <-cold.firstCall:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("cold size lookup did not run; calls=%d", cold.calls.Load())
+	}
+	select {
+	case <-cold.secondCall:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("cold size lookup was not retried; calls=%d", cold.calls.Load())
+	}
+	waitTierEvents(t, m, 2)
+
+	var tier string
+	var size int64
+	if err := m.metadata.db.QueryRow(`SELECT tier, size_bytes FROM tier_files WHERE path = ?`, path).Scan(&tier, &size); err != nil {
+		t.Fatalf("read cold row: %v", err)
+	}
+	if tier != string(TierCold) || size != int64(len(body)) {
+		t.Fatalf("row = (%q, %d), want cold with size %d", tier, size, len(body))
+	}
+}
+
 // The operator manifest-delete endpoint passes an arbitrary ?reason=, so a
 // migration-shaped reason is not proof of a migration. Trusting it would
 // insert a cold row for a path with no cold object — and nothing retires such
@@ -317,6 +400,97 @@ func TestRecordUnlinkedFile_ColdCheckFailureRetiresTheHotRow(t *testing.T) {
 
 	if tier, ok := rowTier(t, m, path); ok {
 		t.Fatalf("row left at tier %q; an unreachable cold tier must not leave a hot row for a file that is gone", tier)
+	}
+}
+
+type failFirstExistsBackend struct {
+	*mockBackend
+	calls      atomic.Int64
+	firstCall  chan struct{}
+	secondCall chan struct{}
+}
+
+func (b *failFirstExistsBackend) Exists(ctx context.Context, path string) (bool, error) {
+	switch call := b.calls.Add(1); call {
+	case 1:
+		if b.firstCall != nil {
+			close(b.firstCall)
+		}
+		return false, errors.New("temporary cold-tier failure")
+	case 2:
+		if b.secondCall != nil {
+			close(b.secondCall)
+		}
+	}
+	return b.mockBackend.Exists(ctx, path)
+}
+
+func TestRecordUnlinkedFile_RetriesColdCheckAfterTransientFailure(t *testing.T) {
+	const path = "db1/cpu/2026/10/03/14/a.parquet"
+	coldStore := newMockBackend("s3")
+	coldStore.seedRaw(path, []byte("cold copy"))
+	cold := &failFirstExistsBackend{mockBackend: coldStore, secondCall: make(chan struct{})}
+	m := newTierEventManager(t, nil, true)
+	m.coldBackend = cold
+
+	m.RecordReplicatedFile(path, 9)
+	waitTierEvents(t, m, 1)
+	m.RecordUnlinkedFile(path, "tiering:migrated", 9)
+
+	select {
+	case <-cold.secondCall:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("cold existence check ran %d time(s), want a scheduled retry after the transient failure", cold.calls.Load())
+	}
+	waitTierEvents(t, m, 3)
+
+	if tier, ok := rowTier(t, m, path); !ok || tier != string(TierCold) {
+		t.Fatalf("row = (%q, %v), want cold after the retry", tier, ok)
+	}
+}
+
+func TestRecordUnlinkedFile_RetryKeepsReregisteredHotFile(t *testing.T) {
+	const path = "db1/cpu/2026/10/03/14/a.parquet"
+	coldStore := newMockBackend("s3")
+	coldStore.seedRaw(path, []byte("old cold copy"))
+	cold := &failFirstExistsBackend{mockBackend: coldStore}
+	hot := newMockBackend("local")
+	m := newTierEventManager(t, nil, true)
+	m.coldBackend = cold
+	m.hotBackend = hot
+
+	ctx := context.Background()
+	if _, err := m.metadata.recordHotFileIfNotCold(ctx, replicatedTestFile(path, int64(len("old cold copy")))); err != nil {
+		t.Fatalf("seed hot metadata row: %v", err)
+	}
+	retries := m.applyTierEventBatch([]tierEvent{{
+		kind:      tierEventUnlinked,
+		path:      path,
+		reason:    "tiering:migrated",
+		sizeBytes: int64(len("old cold copy")),
+		sizeKnown: true,
+	}})
+	if len(retries) != 1 {
+		t.Fatalf("got %d retries after the cold check failed, want one", len(retries))
+	}
+	if _, ok := rowTier(t, m, path); ok {
+		t.Fatal("failed cold check should retire the old hot row before re-registration")
+	}
+
+	hot.seedRaw(path, []byte("new hot copy"))
+	pulled := tierEvent{kind: tierEventPulled, path: path, sizeBytes: int64(len("new hot copy")), sizeKnown: true}
+	if got := m.applyTierEventBatch([]tierEvent{pulled}); len(got) != 0 {
+		t.Fatalf("pull event returned unexpected retries: %+v", got)
+	}
+	if got := m.applyTierEventBatch(retries); len(got) != 0 {
+		t.Fatalf("re-registered path returned unexpected retries: %+v", got)
+	}
+
+	if tier, ok := rowTier(t, m, path); !ok || tier != string(TierHot) {
+		t.Fatalf("row = (%q, %v), want hot after the path was re-registered", tier, ok)
+	}
+	if calls := cold.calls.Load(); calls != 1 {
+		t.Fatalf("cold existence check ran %d times; retry should stop after finding the hot copy", calls)
 	}
 }
 

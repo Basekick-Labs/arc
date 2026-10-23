@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,10 +49,9 @@ type deleteRequest struct {
 //
 // Implemented by *tiering.Manager. Declared here, consumer-side, for the same
 // reason tiering declares ManifestCoordinator rather than importing this
-// package: neither side needs the other's types. Both methods are
-// fire-and-forget — they are called from the replication pull workers and the
-// local-delete workers, never block, and the implementation queues rather than
-// writing through to SQLite on the caller's goroutine.
+// package: neither side needs the other's types. Its methods are
+// fire-and-forget: they run on replication workers, local-delete workers or
+// the Raft callback and queue work instead of writing through to SQLite.
 type TierRecorder interface {
 	// RecordReplicatedFile reports a file pulled from a peer and kept, which
 	// is now on this node's hot storage.
@@ -62,6 +62,10 @@ type TierRecorder interface {
 	// may come from an operator and so is a hint rather than proof of what
 	// happened to the file.
 	RecordUnlinkedFile(path, reason string, sizeBytes int64)
+	// RecordManifestUnlinkedFile reports a migration unlink observed through
+	// Raft when the object store is shared and this node did not perform the
+	// delete itself. Its size is not available at the callback boundary.
+	RecordManifestUnlinkedFile(path, reason string)
 	// RecordMissingFile reports a path that left the manifest while this
 	// node no longer had the file (its own compaction or retention removed
 	// it first): a hot row it still holds for the path is stale (#1271).
@@ -1285,6 +1289,12 @@ func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bo
 func (c *Coordinator) recordUnlinkedFileInTiering(path, reason string, sizeBytes int64) {
 	if r := c.tierRecorderSnapshot(); r != nil {
 		r.RecordUnlinkedFile(path, reason, sizeBytes)
+	}
+}
+
+func (c *Coordinator) recordManifestUnlinkedFileInTiering(path, reason string) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordManifestUnlinkedFile(path, reason)
 	}
 }
 
@@ -4487,10 +4497,18 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// the puller's own lock; puller is non-nil by construction above.
 		puller.OnManifestDelete(path)
 
-		// Local backends need an actual local unlink; shared backends
-		// don't — they're already deleted cluster-wide by the compactor's
-		// StorageBackend.Delete in deleteOldFiles.
+		// Local backends need an actual local unlink; shared backends are
+		// already deleted cluster-wide by StorageBackend.Delete in
+		// deleteOldFiles. Shared tiering deletes still update each node's
+		// tier metadata below.
 		if backend.Type() != "local" {
+			// A tiering migration is the one shared-backend delete that changes
+			// this node's tier metadata: the hot object is gone, and the cold
+			// copy should now be queryable here too. The recorder checks the
+			// cold backend before recording that transition.
+			if strings.HasPrefix(reason, "tiering:") {
+				c.recordManifestUnlinkedFileInTiering(path, reason)
+			}
 			// Every node reads the shared object, so every node leaves a
 			// DELETE rewrite's old file out of reads once its rewrite is
 			// there (open_compactions.go), until the handler removes it.

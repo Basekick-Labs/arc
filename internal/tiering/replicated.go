@@ -36,6 +36,7 @@ package tiering
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -100,6 +101,12 @@ var tierEventDrainTimeout = 30 * time.Second
 // the batch's size rather than by whether anything is stuck.
 const tierEventChunk = 256
 
+// tierEventMaxRetries bounds delayed cold-tier rechecks after a transient
+// backend failure. A later cold sync reconciles anything still unavailable.
+const tierEventMaxRetries = 3
+
+const tierEventRetryBaseDelay = time.Second
+
 // tierEventProbeParallelism bounds the concurrent cold-tier existence checks
 // per chunk. Sequential HEADs at tens of milliseconds each cannot keep up with
 // the delete workers unlinking a migration's files at disk speed: a nightly
@@ -131,10 +138,12 @@ const (
 
 // tierEvent is one queued report.
 type tierEvent struct {
-	kind      tierEventKind
-	path      string
-	reason    string
-	sizeBytes int64
+	kind       tierEventKind
+	path       string
+	reason     string
+	sizeBytes  int64
+	sizeKnown  bool
+	retryCount int
 }
 
 // RecordReplicatedFile reports a file this node pulled from a peer and kept,
@@ -415,7 +424,18 @@ func (m *Manager) RecordUnlinkedFile(path, reason string, sizeBytes int64) {
 	if m == nil {
 		return
 	}
-	m.enqueueTierEvent(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes})
+	m.enqueueTierEvent(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes, sizeKnown: true})
+}
+
+// RecordManifestUnlinkedFile reports a migration delete observed through the
+// shared manifest. The coordinator cannot measure the object at its callback
+// boundary, so the drainer uses an existing row's size or stats the cold copy
+// before inserting one.
+func (m *Manager) RecordManifestUnlinkedFile(path, reason string) {
+	if m == nil {
+		return
+	}
+	m.enqueueTierEvent(tierEvent{kind: tierEventUnlinked, path: path, reason: reason})
 }
 
 // RecordMissingFile reports a path that left the cluster manifest while this
@@ -532,6 +552,72 @@ func (m *Manager) TierEventStats() (applied, dropped, failed int64) {
 func (m *Manager) tierEventLoop() {
 	defer m.tierEventWG.Done()
 
+	type scheduledEvent struct {
+		event tierEvent
+		due   time.Time
+	}
+	var (
+		retries    []scheduledEvent
+		retryTimer *time.Timer
+		retryC     <-chan time.Time
+	)
+	resetRetryTimer := func() {
+		if len(retries) == 0 {
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
+			retryC = nil
+			return
+		}
+		delay := time.Until(retries[0].due)
+		if delay < 0 {
+			delay = 0
+		}
+		if retryTimer == nil {
+			retryTimer = time.NewTimer(delay)
+		} else {
+			if !retryTimer.Stop() {
+				select {
+				case <-retryTimer.C:
+				default:
+				}
+			}
+			retryTimer.Reset(delay)
+		}
+		retryC = retryTimer.C
+	}
+	scheduleRetries := func(events []tierEvent) {
+		if len(events) == 0 {
+			return
+		}
+		room := tierEventQueueMax - len(retries)
+		if room < len(events) {
+			dropped := len(events) - max(room, 0)
+			m.tierEventsDropped.Add(int64(dropped))
+			if m.tierEvents.warnOnce() {
+				m.logger.Warn().Int("dropped", dropped).
+					Msg("Delayed tier metadata rechecks exceeded the queue bound; the next cold sync will reconcile")
+			}
+			events = events[:max(room, 0)]
+			if len(events) == 0 {
+				return
+			}
+		}
+		now := time.Now()
+		for _, event := range events {
+			delay := tierEventRetryBaseDelay
+			for attempt := 1; attempt < event.retryCount && delay < 30*time.Second; attempt++ {
+				delay *= 2
+			}
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+			retries = append(retries, scheduledEvent{event: event, due: now.Add(delay)})
+		}
+		sort.Slice(retries, func(i, j int) bool { return retries[i].due.Before(retries[j].due) })
+		resetRetryTimer()
+	}
+
 	for {
 		select {
 		case <-m.tierEvents.wake:
@@ -540,9 +626,32 @@ func (m *Manager) tierEventLoop() {
 				if len(batch) == 0 {
 					break
 				}
-				m.applyTierEventBatch(batch)
+				scheduleRetries(m.applyTierEventBatch(batch))
 			}
+		case <-retryC:
+			now := time.Now()
+			ready := 0
+			for ready < len(retries) && !retries[ready].due.After(now) {
+				if !m.tierEvents.push(retries[ready].event, tierEventQueueMax) {
+					m.tierEventsDropped.Add(1)
+				}
+				ready++
+			}
+			if ready > 0 {
+				retries = append(retries[:0], retries[ready:]...)
+			}
+			resetRetryTimer()
 		case <-m.tierEventStop:
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
+			if len(retries) > 0 {
+				m.tierEventsDropped.Add(int64(len(retries)))
+				m.logger.Warn().
+					Int("unapplied", len(retries)).
+					Msg("Delayed tier metadata rechecks were not run during shutdown; the startup scan will reconcile")
+				retries = nil
+			}
 			// Drain what is queued, within one budget, then stop. Stop is on
 			// the shutdown timeout that every remaining hook and component
 			// shares, so the drain writes rows but starts no network probe
@@ -574,9 +683,9 @@ func (m *Manager) tierEventLoop() {
 // applyTierEventBatch applies one batch in chunks, invalidates the tier cache
 // once per distinct database/measurement the batch changed, and drops the
 // query layer's caches only if some measurement's SET of tiers changed.
-func (m *Manager) applyTierEventBatch(batch []tierEvent) {
+func (m *Manager) applyTierEventBatch(batch []tierEvent) []tierEvent {
 	if len(batch) == 0 {
-		return
+		return nil
 	}
 
 	// Re-checked per batch rather than at startup: a license can expire while
@@ -593,7 +702,7 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 		// healthy drainer while every event was being discarded.
 		m.tierEventsDropped.Add(int64(len(batch)))
 		m.tierEventsProcessed.Add(int64(len(batch)))
-		return
+		return nil
 	}
 
 	// Keyed by database/measurement only, not by tier: invalidateTierCache
@@ -615,10 +724,11 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 	// set, and in steady state that is every event, so those skip the
 	// after-read too.
 	mayChange := make(map[tierEventKey]bool, 4)
+	var retries []tierEvent
 
 	for start := 0; start < len(batch); start += tierEventChunk {
 		end := min(start+tierEventChunk, len(batch))
-		if unapplied := m.applyTierEventChunk(batch[start:end], touched, before, mayChange); unapplied > 0 {
+		if unapplied := m.applyTierEventChunk(batch[start:end], touched, before, mayChange, &retries); unapplied > 0 {
 			// The chunk ran out of its deadline: the SQLite handle is stalled,
 			// the cold tier is, or the shutdown drain budget is spent. Each
 			// remaining chunk would burn a full deadline against the same
@@ -644,7 +754,7 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 	}
 
 	if len(touched) == 0 {
-		return
+		return retries
 	}
 	for k := range touched {
 		m.metadata.invalidateTierCache(k.database, k.measurement)
@@ -683,6 +793,7 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 	if changed > 0 {
 		m.notifyMigrationComplete(changed, 0)
 	}
+	return retries
 }
 
 // tierEventKey identifies a measurement for the drainer's cache bookkeeping.
@@ -717,7 +828,7 @@ func sameTierSet(a, b map[Tier]bool) bool {
 // and then writes sequentially, so the single SQLite connection never waits on
 // the network. Returns how many of the chunk's events went unapplied because
 // the deadline ran out; zero means the chunk completed.
-func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool) int {
+func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool, retries *[]tierEvent) int {
 	budget := tierEventDrainTimeout
 	if m.draining.Load() {
 		// What is left of the whole drain's budget, not a fresh one per
@@ -767,6 +878,7 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 
 		var (
 			wrote bool
+			retry bool
 			err   error
 		)
 		switch ev.kind {
@@ -777,7 +889,7 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 			if p, ok := probes[ev.path]; ok {
 				probe = &p
 			}
-			wrote, err = m.applyUnlinked(ctx, info, ev.reason, probe)
+			wrote, retry, err = m.applyUnlinked(ctx, info, ev.reason, probe, ev.sizeKnown, ev.retryCount > 0)
 		case tierEventMissing:
 			wrote, err = m.applyMissing(ctx, info)
 		}
@@ -796,6 +908,15 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 			touched[k] = struct{}{}
 			if prev, ok := before[k]; ev.kind != tierEventPulled || !ok || !prev.ok || !prev.tiers[TierHot] {
 				mayChange[k] = true
+			}
+		}
+		if retry {
+			if ev.retryCount < tierEventMaxRetries {
+				ev.retryCount++
+				*retries = append(*retries, ev)
+			} else {
+				m.logger.Warn().Str("path", ev.path).
+					Msg("Cold-tier check retries exhausted; the next cold sync will reconcile")
 			}
 		}
 		m.tierEventsProcessed.Add(1)
@@ -836,7 +957,11 @@ func (m *Manager) probeColdForChunk(ctx context.Context, chunk []tierEvent, info
 	var paths []string
 	seen := make(map[string]struct{})
 	for i, ev := range chunk {
-		if infos[i] == nil || ev.kind != tierEventUnlinked || !reasonMayBeMigration(ev.reason) {
+		// A retry checks the hot backend first in applyUnlinked so a path that
+		// has since been registered again is not marked cold. Do not probe cold
+		// here before that guard; applyUnlinked performs the cold check directly
+		// if the hot path is still absent.
+		if infos[i] == nil || ev.kind != tierEventUnlinked || ev.retryCount > 0 || !reasonMayBeMigration(ev.reason) {
 			continue
 		}
 		if _, dup := seen[ev.path]; dup {
@@ -966,31 +1091,34 @@ func (m *Manager) logRefusedHotRegistration(ctx context.Context, path string) {
 // because the delete worker re-checks the manifest before unlinking at all and
 // skips a path that is back.
 //
-// There are three outcomes, not two: the cold check can also FAIL, and it
-// then retires the hot row like the absent case — see the comment at that
-// branch for why. Note the event is counted as applied in that case, because
-// a row was written; the Warn is the signal that the cold tier was
-// unreachable.
+// A failed cold check retires the hot row so it no longer claims the local
+// copy exists, then schedules bounded rechecks. If the backend remains
+// unavailable throughout that window, the next cold sync is the fallback.
 //
 // probe is the chunk's pre-pass answer for this path when it ran one, and
 // nil otherwise; a nil probe means a direct check here, unless the drainer is
 // stopping.
 //
-// Returns whether a row was written.
-func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string, probe *coldProbe) (bool, error) {
+// Returns whether a row was written, whether a cold check should be retried,
+// and any metadata error.
+func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string, probe *coldProbe, sizeKnown, retrying bool) (bool, bool, error) {
 	cold := m.GetBackendForTier(TierCold)
+	if retrying && !m.draining.Load() && m.hotBackend != nil {
+		size, err := m.hotBackend.StatFile(ctx, info.Path)
+		if err != nil {
+			return false, true, fmt.Errorf("check hot file before retrying migration event: %w", err)
+		}
+		if size >= 0 {
+			info.SizeBytes = size
+			wrote, err := m.applyPulled(ctx, info)
+			return wrote, false, err
+		}
+	}
+	retry := false
 	if reasonMayBeMigration(reason) && cold != nil {
-		// A row that already says cold needs no probe and no write, and
-		// skipping it here is what keeps the existence check off the
-		// high-volume tiering reasons: the manifest sweep and orphan
-		// reconciliation both act on paths this node has already recorded as
-		// cold, and they arrive in chunks of up to a thousand. Only a path
-		// whose row is missing or hot is worth a round trip. The read is
-		// confined to this branch: for every other reason the tier-conditional
-		// DELETE below already refuses a cold row, so a SELECT first would be
-		// a second statement per compaction or retention unlink for nothing.
-		if existing, err := m.metadata.GetFile(ctx, info.Path); err == nil && existing != nil && existing.Tier == TierCold {
-			return false, nil
+		existing, _ := m.metadata.GetFile(ctx, info.Path)
+		if existing != nil && existing.Tier == TierCold {
+			return false, false, nil
 		}
 
 		// Keyed on the backend that was actually constructed, not on
@@ -1017,23 +1145,31 @@ func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason 
 		}
 		if decided {
 			if err != nil {
-				// Unreachable cold backend: this node cannot tell whether the
-				// file moved or vanished, but it does know the local copy is
-				// gone, so the one thing the row must not keep saying is "hot
-				// here". Retire it and fall through. If the object really is
-				// in cold, the cold-tier metadata sync records it on the next
-				// cycle; the opposite choice — keeping the hot row — would
-				// leave the row contradicting the disk with nothing but the
-				// next scan to fix it.
 				m.logger.Warn().Err(err).
 					Str("path", info.Path).
-					Msg("Could not check the cold tier for an unlinked file; retiring the hot row")
+					Msg("Could not check the cold tier for an unlinked file; retiring the hot row and scheduling a recheck")
+				retry = true
 			} else if inCold {
-				wrote, err := m.metadata.markFileCold(ctx, info)
-				if wrote {
-					m.coldMarked.Store(true)
+				if !sizeKnown && existing == nil {
+					size, statErr := cold.StatFile(ctx, info.Path)
+					if statErr != nil {
+						m.logger.Warn().Err(statErr).
+							Str("path", info.Path).
+							Msg("Could not read cold file size for tier metadata; scheduling a recheck")
+						retry = true
+					} else if size < 0 {
+						inCold = false
+					} else {
+						info.SizeBytes = size
+					}
 				}
-				return wrote, err
+				if !retry && inCold {
+					wrote, err := m.metadata.markFileCold(ctx, info)
+					if wrote {
+						m.coldMarked.Store(true)
+					}
+					return wrote, false, err
+				}
 			}
 		}
 	}
@@ -1045,7 +1181,7 @@ func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason 
 		info.Database = database
 		info.Measurement = measurement
 	}
-	return wrote, err
+	return wrote, retry, err
 }
 
 // applyMissing retires the hot row of a path this node no longer holds. The
