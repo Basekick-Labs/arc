@@ -25,17 +25,21 @@ type TieringHandler struct {
 	// standing up a Manager, a SQLite file and a licence client.
 	scanTiers  func(context.Context) (*tiering.ScanResult, error)
 	scanBudget func() time.Duration
+	// previewMigration is indirected so the dry_run HTTP contract (filter
+	// propagation and response shape) can be tested without a Manager.
+	previewMigration func(ctx context.Context, from, to tiering.Tier, database, measurement string) ([]tiering.MigrationCandidate, error)
 }
 
 // NewTieringHandler creates a new tiering handler
 func NewTieringHandler(manager *tiering.Manager, authManager *auth.AuthManager, licenseClient *license.Client, logger zerolog.Logger) *TieringHandler {
 	return &TieringHandler{
-		manager:       manager,
-		authManager:   authManager,
-		licenseClient: licenseClient,
-		logger:        logger.With().Str("component", "tiering-api").Logger(),
-		scanTiers:     manager.ScanTiers,
-		scanBudget:    manager.ScanBudget,
+		manager:          manager,
+		authManager:      authManager,
+		licenseClient:    licenseClient,
+		logger:           logger.With().Str("component", "tiering-api").Logger(),
+		scanTiers:        manager.ScanTiers,
+		scanBudget:       manager.ScanBudget,
+		previewMigration: manager.PreviewMigration,
 		getFiles: func(ctx context.Context, tierParam, database string) ([]tiering.FileMetadata, error) {
 			var files []tiering.FileMetadata
 			if database != "" {
@@ -135,8 +139,26 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 		// Empty body is OK - run full migration cycle
 	}
 
-	// For now, just run a full migration cycle
-	// TODO: Support filtered migrations based on request params
+	fromTier := tiering.TierHot
+	if req.FromTier != "" {
+		fromTier = tiering.TierFromString(req.FromTier)
+		if fromTier.String() != req.FromTier || !fromTier.IsValid() {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid from_tier"})
+		}
+	}
+
+	toTier := tiering.TierCold
+	if req.ToTier != "" {
+		toTier = tiering.TierFromString(req.ToTier)
+		if toTier.String() != req.ToTier || !toTier.IsValid() {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid to_tier"})
+		}
+	}
+	if fromTier != tiering.TierHot || toTier != tiering.TierCold {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "unsupported migration: only hot to cold is supported",
+		})
+	}
 
 	h.logger.Info().
 		Str("from_tier", req.FromTier).
@@ -145,7 +167,35 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 		Bool("dry_run", req.DryRun).
 		Msg("Manual migration triggered")
 
-	if err := h.manager.TriggerMigration(ctx); err != nil {
+	if req.DryRun {
+		candidates, err := h.previewMigration(ctx, fromTier, toTier, req.Database, req.Measurement)
+		if err != nil {
+			if errors.Is(err, tiering.ErrMigrationRoleGated) {
+				_, role := h.manager.MigrationGate()
+				h.logger.Info().Str("role", role).Msg("Manual migration preview rejected: node is not the primary writer")
+				status, body := migrationRoleGatedResponse(role)
+				return c.Status(status).JSON(body)
+			}
+			h.logger.Error().Err(err).Msg("Failed to preview migration")
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
+		var totalBytes int64
+		for _, candidate := range candidates {
+			totalBytes += candidate.SizeBytes
+		}
+		return c.JSON(fiber.Map{
+			"status":        "dry_run",
+			"would_migrate": len(candidates),
+			"total_bytes":   totalBytes,
+			"from_tier":     fromTier,
+			"to_tier":       toTier,
+		})
+	}
+
+	migrated, failed, err := h.manager.TriggerFilteredMigration(ctx, fromTier, toTier, req.Database, req.Measurement)
+	if err != nil {
 		if errors.Is(err, tiering.ErrMigrationRoleGated) {
 			_, role := h.manager.MigrationGate()
 			h.logger.Info().Str("role", role).Msg("Manual migration rejected: node is not the primary writer")
@@ -165,8 +215,10 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"message": "Migration completed successfully",
-		"status":  "completed",
+		"message":  "Migration completed successfully",
+		"status":   "completed",
+		"migrated": migrated,
+		"errors":   failed,
 	})
 }
 
