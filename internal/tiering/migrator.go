@@ -347,21 +347,19 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 	}()
 
 	for _, candidate := range candidates {
-		if stop.Load() {
-			break
-		}
-		if m.manager.roleGated() {
-			m.logger.Warn().Msg("This node is no longer the primary writer; no further files are copied this cycle")
-			break
-		}
 		if err := sem.Acquire(ctx, 1); err != nil {
 			m.logger.Error().Err(err).Msg("Failed to acquire semaphore")
 			break
 		}
-		// Asked again: the wait for a slot can outlast a manifest failure
-		// or the writer role.
-		if stop.Load() || m.manager.roleGated() {
+		// Asked once a slot is free: the wait for it can outlast a manifest
+		// failure or the writer role.
+		if stop.Load() {
 			sem.Release(1)
+			break
+		}
+		if m.manager.roleGated() {
+			sem.Release(1)
+			m.logger.Warn().Msg("This node is no longer the primary writer; no further files are copied this cycle")
 			break
 		}
 		if !m.manager.claims.claimMove(candidate.Path) {

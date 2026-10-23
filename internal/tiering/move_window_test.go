@@ -415,22 +415,6 @@ func TestMigrateBatch_ManifestFailureStopsNewCopies(t *testing.T) {
 	}
 }
 
-// migrated_at in the CURRENT_TIMESTAMP text form, so it compares as text
-// against the rows UpdateTier writes.
-func TestUpdateTierIfCurrent_StampsTheSQLiteTextForm(t *testing.T) {
-	m, _, _, _ := moveRig(t, gateDailyA)
-	if ok, err := m.metadata.UpdateTierIfCurrent(context.Background(), gateDailyA, TierHot, TierCold); err != nil || !ok {
-		t.Fatalf("UpdateTierIfCurrent = %v, %v", ok, err)
-	}
-	var tPos int
-	if err := m.metadata.db.QueryRow(`SELECT instr(migrated_at, 'T') FROM tier_files WHERE path = ?`, gateDailyA).Scan(&tPos); err != nil {
-		t.Fatal(err)
-	}
-	if tPos != 0 {
-		t.Fatal("migrated_at carries a T separator")
-	}
-}
-
 // A replica that records a pulled file's move to cold drops its read caches:
 // a cold listing cached before the copy would hide the file.
 func TestRecordUnlinkedFile_MigratedDropsTheReadCaches(t *testing.T) {

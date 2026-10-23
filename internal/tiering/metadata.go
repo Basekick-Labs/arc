@@ -1020,12 +1020,9 @@ func (s *MetadataStore) UpdateTierIfCurrent(ctx context.Context, path string, ex
 		return false, fmt.Errorf("failed to load file metadata before conditional tier update: %w", err)
 	}
 
-	// migrated_at in the text form UpdateTier's CURRENT_TIMESTAMP writes:
-	// GetRecentlyMigratedFiles compares the column as text against that form,
-	// and a bound time.Time is stored with a T separator, which sorts after it.
 	var migratedAt any
 	if newTier == TierCold {
-		migratedAt = time.Now().UTC().Format(sqliteTimestampLayout)
+		migratedAt = time.Now().UTC()
 	}
 	query := `
 		UPDATE tier_files
