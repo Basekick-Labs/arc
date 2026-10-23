@@ -4103,12 +4103,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	}
 
 	if len(paths) == 0 {
-		// No paths found, return empty result
-		h.logger.Warn().
-			Str("database", database).
-			Str("measurement", measurement).
-			Msg("No tier paths found despite having metadata")
-		return keyword + " (SELECT * WHERE 1=0)"
+		return h.noTierRead(ctx, database, measurement, keyword, options)
 	}
 
 	anchor := h.anchorFor(ctx, database, measurement)
@@ -4131,6 +4126,29 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		Msg("Building multi-tier query")
 
 	return readParquetExpr(keyword, anchor, paths, options)
+}
+
+// noTierRead is the read of a measurement no tier holds a file of any more:
+// every one was deleted, retired or moved out while its tier rows stayed
+// (#1364). It used to be "(SELECT * WHERE 1=0)", which DuckDB refuses to bind
+// ("* expression without FROM clause"), so even count(*) failed.
+//
+// With the measurement's schema anchor, the anchor alone: zero rows with
+// every column the measurement has had, so count(*) answers 0 and a query
+// naming a column binds. Without one, the hot tier's glob, which is how a
+// measurement with no files at all reads: DuckDB reports "No files found" and
+// the handler answers an empty result (classifyNoFiles). Not cached either
+// way: the next flush gives the measurement files again.
+func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, keyword, options string) string {
+	pruning.MarkVolatile(ctx)
+	h.logger.Debug().
+		Str("database", database).
+		Str("measurement", measurement).
+		Msg("No tier holds a file of this measurement; reading it as empty")
+	if anchor := h.anchorFor(ctx, database, measurement); anchor != "" {
+		return readParquetExpr(keyword, anchor, nil, options)
+	}
+	return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, measurement)}, options)
 }
 
 // convertSingleTableQuery is a fast path for simple single-table queries.
