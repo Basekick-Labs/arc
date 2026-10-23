@@ -80,3 +80,51 @@ func TestRetriedDeleteThroughTheRoute(t *testing.T) {
 		}
 	}
 }
+
+// Through the route: a DELETE that reaches a file the tiering migrator is
+// moving answers 207 naming why (a retry cannot reach it once it is in cold
+// storage), one whose cold copy could not be checked 503, and the other
+// file's rows are deleted either way.
+func TestDeleteOfAMovingFileThroughTheRoute(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		claims   func(path string) *fakeMoveClaims
+		code     int
+		contains string
+	}{
+		{"moving", func(p string) *fakeMoveClaims { return &fakeMoveClaims{moving: map[string]bool{p: true}} }, 207, "being moved to cold storage"},
+		{"unchecked", func(p string) *fakeMoveClaims { return &fakeMoveClaims{unchecked: map[string]bool{p: true}} }, 503, "cold storage could not be checked"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newLeftoverRig(t)
+			h := NewDeleteHandler(r.db, r.backend, &config.DeleteConfig{Enabled: true, MaxRowsPerDelete: 1000, ConfirmationThreshold: 1000}, nil, t.TempDir(), zerolog.Nop())
+			r.h = h
+			moving := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+			other := leftoverHour + "cpu_20261007_205000_000000000.parquet"
+			r.parquet(moving, "h0", "h1")
+			r.parquet(other, "h0", "h5")
+			h.moveClaims = tc.claims(moving)
+			app := fiber.New()
+			h.RegisterRoutes(app)
+
+			req := httptest.NewRequest("POST", "/api/v1/delete", strings.NewReader(`{"database":"db","measurement":"cpu","where":"host = 'h0'","confirm":true}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req, 20000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, _ := io.ReadAll(resp.Body)
+			var out DeleteResponse
+			_ = json.Unmarshal(raw, &out)
+			if resp.StatusCode != tc.code || !strings.Contains(out.Error, tc.contains) || strings.Contains(out.Error, "cluster manifest") {
+				t.Fatalf("got %d %q, want %d naming %q", resp.StatusCode, out.Error, tc.code, tc.contains)
+			}
+			if out.DeletedCount != 1 {
+				t.Fatalf("deleted %d rows, want 1 (the other file)", out.DeletedCount)
+			}
+			if !r.exists(moving) {
+				t.Fatal("the moving file was touched")
+			}
+		})
+	}
+}

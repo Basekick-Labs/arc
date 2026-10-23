@@ -634,6 +634,15 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 		}
 	}
 
+	// A file the primary migrated left this node's hot glob and went to
+	// cold. The tier set below rarely changes for it (another day of the
+	// same measurement), but a cold listing this node cached before the
+	// copy says that day has no cold file, and would hide the file now
+	// that the hot copy is gone. At most once per batch.
+	if m.coldMarked.Swap(false) {
+		m.notifyReadCachesStale()
+	}
+
 	if len(touched) == 0 {
 		return
 	}
@@ -1021,6 +1030,9 @@ func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason 
 					Msg("Could not check the cold tier for an unlinked file; retiring the hot row")
 			} else if inCold {
 				wrote, err := m.metadata.markFileCold(ctx, info)
+				if wrote {
+					m.coldMarked.Store(true)
+				}
 				return wrote, err
 			}
 		}

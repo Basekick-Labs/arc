@@ -15,6 +15,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/rs/zerolog"
 )
 
@@ -573,5 +574,93 @@ func TestRewriteKeepsRowsTheClauseCannotDecide(t *testing.T) {
 	}
 	if rows != 2 {
 		t.Fatalf("rewrite holds %d rows, want 2 (the NULL host is not deleted)", rows)
+	}
+}
+
+// fakeMoveClaims refuses the paths in moving (or unchecked) and counts
+// releases.
+type fakeMoveClaims struct {
+	moving    map[string]bool
+	unchecked map[string]bool
+	claims    int
+	releases  int
+}
+
+func (f *fakeMoveClaims) ClaimForDelete(_ context.Context, path string) (func(), error) {
+	if f.moving[path] {
+		return nil, fmt.Errorf("%w: %s", tiering.ErrFileMoving, path)
+	}
+	if f.unchecked[path] {
+		return nil, fmt.Errorf("%w: %s: cold unreachable", tiering.ErrColdCheckFailed, path)
+	}
+	f.claims++
+	return func() { f.releases++ }, nil
+}
+
+// A file the tiering migrator is moving is left as it is: a rewrite would
+// leave the cold copy holding the rows this DELETE removes.
+func TestRewrite_LeavesAFileTheMigratorIsMoving(t *testing.T) {
+	r := newLeftoverRig(t)
+	key := leftoverHour + "cpu_a.parquet"
+	r.parquet(key, "h1", "h2")
+	claims := &fakeMoveClaims{moving: map[string]bool{key: true}}
+	r.h.moveClaims = claims
+
+	if err := r.rewrite(key, "host = 'h1'"); !errors.Is(err, tiering.ErrFileMoving) {
+		t.Fatalf("rewrite = %v, want ErrFileMoving", err)
+	}
+	if got := r.files(); len(got) != 1 || got[0] != key {
+		t.Fatalf("files = %v, want only the untouched %s", got, key)
+	}
+
+	delete(claims.moving, key)
+	if err := r.rewrite(key, "host = 'h1'"); err != nil {
+		t.Fatal(err)
+	}
+	if claims.claims != 1 || claims.releases != 1 {
+		t.Fatalf("claims/releases = %d/%d, want 1/1", claims.claims, claims.releases)
+	}
+}
+
+// The passes that remove a file an earlier DELETE replaced leave one the
+// tiering migrator is copying: removed and unjournaled mid-copy, the copy
+// would reach cold holding the rows the DELETE took out.
+func TestLeftoverRemovalsLeaveAFileTheMigratorIsMoving(t *testing.T) {
+	r := newLeftoverRig(t)
+	old := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	r.parquet(old, "h0", "h1")
+	failReplacedDeletes(t, old)
+	_ = r.rewrite(old, "host = 'h0'")
+	deleteReplaced = storage.DeleteWithRetry
+	claims := &fakeMoveClaims{moving: map[string]bool{old: true}}
+	r.h.moveClaims = claims
+
+	if n := r.h.DrainRetired(context.Background()); n != 0 || !r.exists(old) || len(r.retired()) != 1 {
+		t.Fatalf("drainer removed a moving file: n=%d exists=%v journal=%v", n, r.exists(old), r.retired())
+	}
+	if n := r.h.removeLeftovers(context.Background(), "db", "cpu"); n != 0 || !r.exists(old) || len(r.retired()) != 1 {
+		t.Fatalf("removeLeftovers removed a moving file: n=%d exists=%v journal=%v", n, r.exists(old), r.retired())
+	}
+
+	delete(claims.moving, old)
+	if n := r.h.DrainRetired(context.Background()); n != 1 || r.exists(old) {
+		t.Fatalf("drained %d once free, want 1", n)
+	}
+	if claims.claims != claims.releases || claims.claims == 0 {
+		t.Fatalf("claims/releases = %d/%d", claims.claims, claims.releases)
+	}
+}
+
+// SetTieringManager is what wires the claim into DELETE in production.
+func TestSetTieringManagerWiresTheMoveClaims(t *testing.T) {
+	h := &DeleteHandler{}
+	h.SetTieringManager(nil)
+	if h.moveClaims != nil {
+		t.Fatal("a nil tiering manager set the claims")
+	}
+	tm := &tiering.Manager{}
+	h.SetTieringManager(tm)
+	if got, ok := h.moveClaims.(*tiering.Manager); !ok || got != tm {
+		t.Fatalf("moveClaims = %#v, want the tiering manager", h.moveClaims)
 	}
 }

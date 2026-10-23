@@ -74,6 +74,24 @@ func TestDrainerRevertsARewriteThatNeverTook(t *testing.T) {
 	}
 }
 
+// A rewrite the tiering migrator is copying is left for a later pass.
+func TestDrainerRevertLeavesARewriteTheMigratorIsMoving(t *testing.T) {
+	r := newJournalRig(t)
+	setAmbiguityDelay(t, 0)
+	r.record(rewriteAmbiguityDelay + time.Minute)
+	claims := &fakeMoveClaims{moving: map[string]bool{r.new: true}}
+	r.h.moveClaims = claims
+	r.h.DrainRetired(context.Background())
+	if !r.exists(r.new) || len(r.retired()) != 1 {
+		t.Fatalf("new exists %v, journal %v: a moving rewrite was reverted", r.exists(r.new), r.retired())
+	}
+	delete(claims.moving, r.new)
+	r.h.DrainRetired(context.Background())
+	if r.exists(r.new) || len(r.retired()) != 0 {
+		t.Fatalf("new exists %v, journal %v once free", r.exists(r.new), r.retired())
+	}
+}
+
 // Standalone: the handler adds the old file to the read source when the
 // rewrite is published, and drops it once removed.
 func TestStandaloneRewriteFeedsTheReadSource(t *testing.T) {
