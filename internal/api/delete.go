@@ -700,7 +700,12 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				// returns zero only when the manifest was not committed and the old
 				// file remains authoritative.
 				totalDeleted += deleted
-				h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
+				if errors.Is(err, tiering.ErrFileMoving) {
+					// Expected while a migration runs; the response says so.
+					h.logger.Warn().Err(err).Str("file", f.path).Msg("File left as it is: it is being moved to cold storage")
+				} else {
+					h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
+				}
 				// Manifest failures are non-transient (Raft quorum loss) — abort the
 				// entire operation to avoid deleting files from storage without a
 				// corresponding manifest record.
