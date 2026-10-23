@@ -1820,8 +1820,9 @@ removes the hot copy. Three problems, all fixed:
   - A DELETE leaves alone a file that is being moved, or one that already
     has a copy in cold storage (a move that was interrupted). Its response
     is 207 and names the files and why. A DELETE does not reach files in
-    cold storage, so once the move completes those rows stay; delete them
-    before the file ages into cold storage.
+    cold storage ([#1350](https://github.com/Basekick-Labs/arc/issues/1350)),
+    so once the move completes those rows stay; delete them before the file
+    ages into cold storage.
   - When cold storage cannot be checked for such a copy, the DELETE answers
     503 and the file is left as it is; retry.
   - Only daily compacted files old enough for their database's tiering
