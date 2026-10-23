@@ -102,9 +102,14 @@ func (m *Migrator) MigrateTier(ctx context.Context, fromTier, toTier Tier) (int,
 		}
 
 		batch := candidates[i:end]
-		batchMigrated, batchFailed := m.MigrateBatch(ctx, batch)
+		batchMigrated, batchFailed, releaseErr := m.migrateBatch(ctx, batch)
 		migrated += batchMigrated
 		failed += batchFailed
+		if releaseErr != nil {
+			// A manifest failure is not transient (Cluster Operations
+			// Checklist item 3): no further batch is copied this cycle.
+			break
+		}
 	}
 
 	return migrated, failed
@@ -240,6 +245,18 @@ func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate
 // errHeldByCompaction: a compaction took the file over during its migration.
 var errHeldByCompaction = errors.New("a compaction took the file over during its migration")
 
+// dropSupersededCopy deletes the cold copy of a file whose rows a DELETE took
+// out. If it stays, the next cold sync records it as a cold file and the
+// deleted rows are read again; nothing else removes it.
+func (m *Migrator) dropSupersededCopy(ctx context.Context, cold storage.Backend, path, why string) {
+	if err := cold.Delete(ctx, path); err != nil && !storage.IsNotFound(err) {
+		m.logger.Error().Err(err).Str("path", path).Str("why", why).
+			Msg("Could not remove the cold copy of a file whose rows a DELETE removed; the next cold sync will record it and those rows will be read again until it is deleted by hand")
+		return
+	}
+	m.logger.Warn().Str("path", path).Str("why", why).Msg("Removed the cold copy of a file whose rows a DELETE removed")
+}
+
 // errNotPrimary: this node lost the writer role during the copy.
 var errNotPrimary = errors.New("this node is no longer the primary writer; the flip is left to the new one")
 
@@ -296,8 +313,15 @@ func (m *Migrator) supersededNow(ctx context.Context, path string) (bool, error)
 
 // MigrateBatch migrates a batch of files concurrently
 func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandidate) (int, int) {
+	migrated, failed, _ := m.migrateBatch(ctx, candidates)
+	return migrated, failed
+}
+
+// migrateBatch is MigrateBatch, also returning the release's manifest
+// failure, which stops the cycle.
+func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandidate) (int, int, error) {
 	if len(candidates) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 	// Mark sync receipts for the WHOLE batch before any file work (#687):
 	// one chunked UPDATE on the shared sync DB instead of per-file calls
@@ -313,11 +337,11 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 	if err := m.manager.notifyHotFilesRemoved(paths); err != nil {
 		m.logger.Warn().Err(err).Int("candidates", len(candidates)).
 			Msg("Could not mark sync receipts; aborting migration batch")
-		return 0, len(candidates)
+		return 0, len(candidates), nil
 	}
 
 	if len(candidates) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 
 	// Each file is claimed before its copy so a DELETE cannot rewrite it
@@ -381,7 +405,15 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 				// failure of the same file. It still counts as failed for this
 				// cycle: nothing was migrated, and the cycle summary should
 				// say so the one time it happens.
-				if !errors.Is(err, ErrCandidateQuarantined) && !errors.Is(err, errNotPrimary) {
+				// Not-primary, replaced and changed-row outcomes logged their
+				// own Warn; they are not failures of the copy.
+				if errors.Is(err, errNotPrimary) || errors.Is(err, errReplacedByDelete) || errors.Is(err, errTierChanged) {
+					mu.Lock()
+					failed++
+					mu.Unlock()
+					return
+				}
+				if !errors.Is(err, ErrCandidateQuarantined) {
 					m.logger.Error().
 						Err(err).
 						Str("path", c.Path).
@@ -406,15 +438,23 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 	close(flippedCh)
 	// A manifest failure counts once for the cycle; the files are migrated
 	// regardless and reconciliation finishes the hot cleanup.
-	if err := <-releaseErr; err != nil {
+	err := <-releaseErr
+	if err != nil {
 		failed++
 	}
-	return migrated, failed
+	return migrated, failed, err
 }
 
-// releaseWindow bounds how long a flipped file waits for its chunk to fill:
-// the double-read window of a migration is about this long per file.
+// releaseWindow bounds how long a flipped file waits for its chunk to start
+// releasing. The double-read window of a file is this plus its chunk's
+// release, which the manager paces at one manifest proposal per second
+// (manifestChunkPause): when copies outrun the releases, files queue for a
+// second per 200.
 const releaseWindow = time.Second
+
+// onReleaseStopped is a test seam: called once a manifest failure has
+// stopped new copies.
+var onReleaseStopped = func() {}
 
 // streamRelease releases hot copies as files arrive on flipped, in chunks of
 // manifestChunk or every releaseWindow, whichever comes first. A manifest
@@ -433,12 +473,16 @@ func (m *Migrator) streamRelease(ctx context.Context, flipped <-chan MigrationCa
 		chunk := pending
 		pending = nil
 		if failure != nil {
-			kept += len(chunk)
+			// Kept hot for reconciliation, but a file a compaction took over
+			// since its flip still loses its cold copy, as releaseHotCopies
+			// would have done: the compaction's output holds its rows.
+			kept += len(m.dropTakenOver(ctx, chunk))
 			return
 		}
 		if err := m.releaseHotCopies(ctx, chunk, manifestReasonMigrated); err != nil {
 			failure = err
 			stop.Store(true)
+			onReleaseStopped()
 		}
 	}
 	for {
@@ -485,7 +529,7 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 // are deleted. On a local-storage cluster the manifest delete is what
 // unlinks the replicas on every other node; on a shared bucket it is
 // bookkeeping and the delete here removes the object. A manifest failure
-// stops the batch with the remaining hot copies in place — their rows
+// returns with the remaining hot copies in place — their rows
 // already say cold, and reconciliation finishes them, manifest-first,
 // within its window.
 func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandidate, reason string) error {
@@ -639,20 +683,35 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		return fail(fmt.Errorf("check the DELETE journal: %w", err))
 	}
 	if superseded {
-		if err := dstBackend.Delete(bctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
-			m.logger.Error().Err(err).Str("path", candidate.Path).Msg("Could not remove the cold copy of a file a DELETE replaced; it holds rows the DELETE removed")
-		}
+		m.dropSupersededCopy(bctx, dstBackend, candidate.Path, "a DELETE replaced the file")
 		return fail(fmt.Errorf("%s: %w", candidate.Path, errReplacedByDelete))
+	}
+	// Standalone, nothing but this node's DELETE (or its retention) removes
+	// a hot file, so a source gone during the copy means its rows were
+	// deleted: a leftover whose journal record was cleared mid-copy, or a
+	// file retention removed. Clusters cannot tell that from another node's
+	// move, so there only the evidence above counts.
+	if m.manager.manifest == nil && m.manager.clusterGate == nil {
+		size, err := m.manager.hotBackend.StatFile(bctx, candidate.Path)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("path", candidate.Path).Msg("Could not check the hot copy before the flip; the cold copy stays and the file is retried next cycle")
+			return fail(fmt.Errorf("check the hot copy: %w", err))
+		}
+		if size < 0 {
+			m.dropSupersededCopy(bctx, dstBackend, candidate.Path, "the hot copy was removed during the copy")
+			return fail(fmt.Errorf("%s: %w", candidate.Path, errReplacedByDelete))
+		}
 	}
 	flippedNow, err := m.manager.metadata.UpdateTierIfCurrent(bctx, candidate.Path, candidate.CurrentTier, candidate.TargetTier)
 	if err != nil {
 		// The cold copy stays. Another node's metadata sync may already have
 		// recorded it as cold, and that node's reconciliation would then
 		// remove the hot copy on the strength of it — deleting the cold copy
-		// here could leave no copy anywhere. Left in place it is harmless:
-		// this row still says hot, so the next cycle copies over it and
-		// flips again, and a DELETE refuses the file meanwhile
-		// (ClaimForDelete finds the cold copy).
+		// here could leave no copy anywhere. Left in place it finishes the
+		// move later: the next cold sync records it (RecordColdFile flips
+		// this row to cold) and reconciliation then removes the hot copy, or
+		// the next cycle copies over it and flips. A DELETE refuses the file
+		// meanwhile (ClaimForDelete finds the cold copy).
 		m.logger.Warn().Err(err).Str("path", candidate.Path).
 			Msg("Failed to update tier metadata after copy; cold copy left in place for the next cycle")
 		return fail(fmt.Errorf("failed to update tier metadata: %w", err))

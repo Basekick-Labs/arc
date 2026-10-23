@@ -46,6 +46,12 @@ type DeleteCoordinator interface {
 // This is non-transient (e.g. Raft quorum loss) and aborts the delete operation.
 var errManifestFailure = errors.New("cluster manifest update failed")
 
+// Why a DELETE left a file alone for tiering, in its response.
+const (
+	movingWhy        = "are being moved to cold storage and were left as they are (a DELETE does not reach files in cold storage, so their rows stay once the move completes)"
+	coldUncheckedWhy = "were left as they are because cold storage could not be checked for a copy of them"
+)
+
 // errNotRegisteredYet reports a file on a shared object store that the cluster
 // manifest does not list and this node is not registering (#1214): another
 // writer's file waiting for its registration, as a rule. The DELETE leaves it
@@ -679,6 +685,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// retryable, so the answer is 503 rather than 207.
 	var notRegistered []string
 	var moving []string
+	var coldUnchecked []string
 
 	for round := 0; ; round++ {
 		var changed []string
@@ -700,7 +707,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				// returns zero only when the manifest was not committed and the old
 				// file remains authoritative.
 				totalDeleted += deleted
-				if errors.Is(err, tiering.ErrFileMoving) {
+				if errors.Is(err, tiering.ErrFileMoving) || errors.Is(err, tiering.ErrColdCheckFailed) {
 					// Expected while a migration runs; the response says so.
 					h.logger.Warn().Err(err).Str("file", f.path).Msg("File left as it is: it is being moved to cold storage")
 				} else {
@@ -731,6 +738,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				}
 				if errors.Is(err, tiering.ErrFileMoving) {
 					moving = append(moving, f.relativePath)
+				}
+				if errors.Is(err, tiering.ErrColdCheckFailed) {
+					coldUnchecked = append(coldUnchecked, f.relativePath)
 				}
 				continue
 			}
@@ -803,7 +813,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		UnflushedNodes:   unflushed,
 	}
 
-	if !onlyNotRegistered(len(failedFiles), len(notRegistered)+len(moving)) {
+	// A file left for tiering's move is not "retry later": once moved it is in
+	// cold storage, which a DELETE does not reach. It answers 207 with the
+	// reason, like any other file that failed.
+	if !onlyNotRegistered(len(failedFiles), len(notRegistered)+len(coldUnchecked)) {
 		// A failure that is not only "retry later" is the more general one:
 		// 207, naming both.
 		resp.Error = fmt.Sprintf("%d of %d files failed to process", len(failedFiles), len(seen))
@@ -811,19 +824,22 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			resp.Error += fmt.Sprintf(" (%d of them are not registered in the cluster manifest yet and were left as they are; retry for those)", len(notRegistered))
 		}
 		if len(moving) > 0 {
-			resp.Error += fmt.Sprintf(" (%d of them are being moved to cold storage and were left as they are; retry for those after the next tiering cycle)", len(moving))
+			resp.Error += fmt.Sprintf(" (%d of them %s)", len(moving), movingWhy)
+		}
+		if len(coldUnchecked) > 0 {
+			resp.Error += fmt.Sprintf(" (%d of them %s; retry for those)", len(coldUnchecked), coldUncheckedWhy)
 		}
 		return c.Status(fiber.StatusMultiStatus).JSON(resp)
 	}
-	if len(notRegistered) > 0 || len(moving) > 0 {
+	if len(notRegistered) > 0 || len(coldUnchecked) > 0 {
 		var why []string
 		if len(notRegistered) > 0 {
-			why = append(why, fmt.Sprintf("%d of %d files are not registered in the cluster manifest yet (another writer may still be registering them)", len(notRegistered), len(seen)))
+			why = append(why, fmt.Sprintf("%d of %d files are not registered in the cluster manifest yet (another writer may still be registering them) and were left as they are", len(notRegistered), len(seen)))
 		}
-		if len(moving) > 0 {
-			why = append(why, fmt.Sprintf("%d of %d files are being moved to cold storage (retry after the next tiering cycle)", len(moving), len(seen)))
+		if len(coldUnchecked) > 0 {
+			why = append(why, fmt.Sprintf("%d of %d files %s", len(coldUnchecked), len(seen), coldUncheckedWhy))
 		}
-		resp.Error = "Delete incomplete: " + strings.Join(why, "; ") + " and were left as they are; the rows of the other files are deleted; retry to finish"
+		resp.Error = "Delete incomplete: " + strings.Join(why, "; ") + "; the rows of the other files are deleted; retry to finish"
 		return respondDeleteUnavailable(c, resp)
 	}
 

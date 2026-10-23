@@ -392,7 +392,12 @@ func (h *DeleteHandler) removeLeftovers(ctx context.Context, database, measureme
 				continue
 			}
 		}
+		release, ok := h.claimForRemoval(ctx, l.path)
+		if !ok {
+			continue
+		}
 		if err := deleteReplaced(ctx, h.storage, l.path); err != nil {
+			release()
 			h.logger.Warn().Err(err).Str("file", l.path).
 				Msg("Could not remove a file an earlier DELETE replaced; it stays out of DELETEs, and queries read its rows twice until it is removed")
 			continue
@@ -400,11 +405,28 @@ func (h *DeleteHandler) removeLeftovers(ctx context.Context, database, measureme
 		if l.journaled {
 			h.clearRetired(ctx, l.path)
 		}
+		release()
 		removed++
 		h.logger.Warn().Str("file", l.path).Str("kept", l.keeper).Bool("journaled", l.journaled).
 			Msg("Removed a file an earlier DELETE replaced and could not remove")
 	}
 	return removed
+}
+
+// claimForRemoval keeps the tiering migrator off a file this pass removes.
+// A file the migrator is copying (or has a cold copy of) is left for a later
+// pass: removed and unjournaled mid-copy, its copy would reach cold holding
+// the rows a DELETE took out, with nothing left to say so.
+func (h *DeleteHandler) claimForRemoval(ctx context.Context, path string) (func(), bool) {
+	if h.moveClaims == nil {
+		return func() {}, true
+	}
+	release, err := h.moveClaims.ClaimForDelete(ctx, path)
+	if err != nil {
+		h.logger.Debug().Err(err).Str("file", path).Msg("Left for a later pass: the tiering migrator has it")
+		return nil, false
+	}
+	return release, true
 }
 
 // provablyOlder keeps the cluster leftovers removeLeftovers may remove (see
@@ -710,17 +732,27 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 		act := h.retiredAction(ctx, r)
 		switch act {
 		case retiredRemoveOld:
+			release, ok := h.claimForRemoval(ctx, r.Path)
+			if !ok {
+				break
+			}
 			if derr = deleteReplaced(ctx, h.storage, r.Path); derr == nil {
 				h.clearRetired(ctx, r.Path)
 				h.reads.remove(r.Path)
 				h.forgetSeen(r)
 				removed++
 			}
+			release()
 		case retiredRevert:
+			release, ok := h.claimForRemoval(ctx, r.ReplacedBy)
+			if !ok {
+				break
+			}
 			if derr = deleteReplaced(ctx, h.storage, r.ReplacedBy); derr == nil {
 				h.clearRetired(ctx, r.Path)
 				h.forgetSeen(r)
 			}
+			release()
 		case retiredClear:
 			h.clearRetired(ctx, r.Path)
 			h.reads.remove(r.Path)

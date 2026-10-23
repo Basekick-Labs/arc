@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // moveClaims keeps a migration and a DELETE off the same hot file at once.
@@ -63,12 +64,17 @@ func (c *moveClaims) releaseDelete(path string) {
 	c.mu.Unlock()
 }
 
-// ErrFileMoving reports a hot file a DELETE must not touch yet: it is being
+// ErrFileMoving reports a hot file a DELETE must not touch: it is being
 // copied to cold storage, or a cold copy of it already exists (a move that
-// flipped and has not released the hot copy, or one whose flip failed). The
-// DELETE is retried; the file is out of the way once the next migration
-// cycle finishes the move.
+// flipped and has not released the hot copy, or one whose flip failed). A
+// rewrite of the hot copy would leave the cold one holding the deleted rows.
+// Once the move finishes the file is in cold storage, which a DELETE does not
+// reach; until then a retry meets the same answer.
 var ErrFileMoving = errors.New("file is being moved to cold storage")
+
+// ErrColdCheckFailed reports a hot file a DELETE left alone because whether
+// cold storage holds a copy of it could not be checked.
+var ErrColdCheckFailed = errors.New("could not check cold storage for a copy of the file")
 
 // ClaimForDelete keeps the migrator off a hot file while a DELETE rewrites or
 // removes it, and refuses one the migrator has already started on, or one
@@ -88,7 +94,7 @@ func (m *Manager) ClaimForDelete(ctx context.Context, path string) (release func
 	if has, cerr := m.hasColdCopy(ctx, path); cerr != nil || has {
 		release()
 		if cerr != nil {
-			return nil, fmt.Errorf("%w: %s (could not check cold storage: %v)", ErrFileMoving, path, cerr)
+			return nil, fmt.Errorf("%w: %s: %v", ErrColdCheckFailed, path, cerr)
 		}
 		return nil, fmt.Errorf("%w: %s", ErrFileMoving, path)
 	}
@@ -97,7 +103,8 @@ func (m *Manager) ClaimForDelete(ctx context.Context, path string) (release func
 
 // hasColdCopy reports an object in cold storage at a hot file's path. Only a
 // file the migrator could have copied is asked about: a daily compaction
-// output (or a rewrite of one) in a database that tiers.
+// output (or a rewrite of one), old enough for its database's policy, in a
+// database that tiers. A DELETE of recent data asks cold storage nothing.
 func (m *Manager) hasColdCopy(ctx context.Context, path string) (bool, error) {
 	if !isDailyCompactedPath(path) {
 		return false, nil
@@ -107,6 +114,10 @@ func (m *Manager) hasColdCopy(ctx context.Context, path string) (bool, error) {
 		return false, nil
 	}
 	if m.IsHotOnly(ctx, info.Database) {
+		return false, nil
+	}
+	if policy := m.GetEffectivePolicy(ctx, info.Database); policy != nil &&
+		time.Since(info.PartitionTime) < time.Duration(policy.HotMaxAgeDays)*24*time.Hour {
 		return false, nil
 	}
 	cold := m.GetBackendForTier(TierCold)

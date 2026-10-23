@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,8 +139,8 @@ func TestClaimForDelete_RefusesAFileWithAColdCopy(t *testing.T) {
 	if err := cold.mockBackend.Delete(ctx, gateDailyA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.ClaimForDelete(ctx, gateDailyA); !errors.Is(err, ErrFileMoving) {
-		t.Fatalf("ClaimForDelete with cold unreachable = %v, want ErrFileMoving (fail closed)", err)
+	if _, err := m.ClaimForDelete(ctx, gateDailyA); !errors.Is(err, ErrColdCheckFailed) {
+		t.Fatalf("ClaimForDelete with cold unreachable = %v, want ErrColdCheckFailed (fail closed)", err)
 	}
 }
 
@@ -273,9 +274,9 @@ func TestCopyAndFlip_DemotedDuringTheCopyDoesNotFlip(t *testing.T) {
 	m.migrator.maxConcurrent = 1
 	cold.onWrite = func(string) { gate.primary.Store(false) }
 
-	migrated, _ := m.migrator.MigrateBatch(context.Background(), []MigrationCandidate{candidateFor(gateDailyA), candidateFor(gateDailyB)})
-	if migrated != 0 {
-		t.Fatalf("migrated = %d, want 0", migrated)
+	migrated, failed := m.migrator.MigrateBatch(context.Background(), []MigrationCandidate{candidateFor(gateDailyA), candidateFor(gateDailyB)})
+	if migrated != 0 || failed != 1 {
+		t.Fatalf("MigrateBatch = (%d, %d), want (0, 1)", migrated, failed)
 	}
 	if got := fileMeta(t, m, gateDailyA).Tier; got != TierHot {
 		t.Fatalf("tier = %s, want hot", got)
@@ -388,8 +389,11 @@ func TestMigrateBatch_ManifestFailureStopsNewCopies(t *testing.T) {
 	failedOnce := make(chan struct{})
 	var once sync.Once
 	om := &orderManifest{fakeManifest: &fakeManifest{hot: hot.mockBackend, entries: map[string]int64{gateDailyA: 7, gateDailyB: 7, gateDailyC: 7}}, log: &events, mu: &mu, fail: errors.New("quorum lost")}
-	om.after = func() { once.Do(func() { close(failedOnce) }) }
 	m.manifest = om
+	// Released once stop is set, not when the manifest call returns.
+	prev := onReleaseStopped
+	onReleaseStopped = func() { once.Do(func() { close(failedOnce) }) }
+	t.Cleanup(func() { onReleaseStopped = prev })
 	cold.onWrite = func(p string) {
 		if p == gateDailyB {
 			select {
@@ -439,4 +443,128 @@ func TestRecordUnlinkedFile_MigratedDropsTheReadCaches(t *testing.T) {
 	if calls != before+1 {
 		t.Fatalf("read-cache invalidations for the move = %d, want 1", calls-before)
 	}
+}
+
+// takeoverManifest fails every manifest delete and reports the files a
+// compaction owns.
+type takeoverManifest struct {
+	*fakeManifest
+	mu   sync.Mutex
+	owns map[string]bool
+}
+
+func (t *takeoverManifest) DeleteFilesFromManifest(context.Context, []string, string) error {
+	return errors.New("quorum lost")
+}
+
+func (t *takeoverManifest) CompactionOwns(path string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.owns[path]
+}
+
+// After a manifest failure the flipped files keep their hot copies, but one a
+// compaction took over since its flip still loses its cold copy: the
+// compaction's output holds its rows.
+func TestStreamRelease_KeptFilesACompactionTookOverLoseTheirColdCopy(t *testing.T) {
+	m, hot, cold, _ := moveRig(t, gateDailyA, gateDailyB)
+	ctx := context.Background()
+	for _, p := range []string{gateDailyA, gateDailyB} {
+		mustWrite(t, cold.mockBackend, p)
+		if err := m.metadata.UpdateTier(ctx, p, TierCold); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tm := &takeoverManifest{fakeManifest: &fakeManifest{hot: hot.mockBackend, entries: map[string]int64{gateDailyA: 7, gateDailyB: 7}}, owns: map[string]bool{}}
+	m.manifest = tm
+	stopped := make(chan struct{})
+	prev := onReleaseStopped
+	onReleaseStopped = func() { close(stopped) }
+	t.Cleanup(func() { onReleaseStopped = prev })
+
+	ch := make(chan MigrationCandidate, 2)
+	var stop atomic.Bool
+	errc := make(chan error, 1)
+	go func() { errc <- m.migrator.streamRelease(ctx, ch, &stop) }()
+	ch <- candidateFor(gateDailyA)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first release never failed")
+	}
+	tm.mu.Lock()
+	tm.owns[gateDailyB] = true
+	tm.mu.Unlock()
+	ch <- candidateFor(gateDailyB)
+	close(ch)
+	if err := <-errc; err == nil {
+		t.Fatal("streamRelease reported no failure")
+	}
+	if coldHas(t, cold, gateDailyB) {
+		t.Fatal("a kept file a compaction took over kept its cold copy")
+	}
+	if got := fileMeta(t, m, gateDailyB).Tier; got != TierHot {
+		t.Fatalf("taken-over file tier = %s, want hot", got)
+	}
+	if ok, _ := hot.Exists(ctx, gateDailyA); !ok {
+		t.Fatal("a hot copy was deleted after its manifest delete failed")
+	}
+}
+
+// A manifest failure stops the cycle, not just its batch.
+func TestMigrateTier_ManifestFailureStopsTheCycle(t *testing.T) {
+	m, hot, cold, _ := moveRig(t, gateDailyA, gateDailyB, gateDailyC)
+	m.migrator.batchSize = 1
+	m.migrator.maxConcurrent = 1
+	var mu sync.Mutex
+	var events []string
+	m.manifest = &orderManifest{fakeManifest: &fakeManifest{hot: hot.mockBackend, entries: map[string]int64{gateDailyA: 7, gateDailyB: 7, gateDailyC: 7}}, log: &events, mu: &mu, fail: errors.New("quorum lost")}
+
+	m.migrator.MigrateTier(context.Background(), TierHot, TierCold)
+	copied := 0
+	for _, p := range []string{gateDailyA, gateDailyB, gateDailyC} {
+		if coldHas(t, cold, p) {
+			copied++
+		}
+	}
+	if copied != 1 {
+		t.Fatalf("copied %d files, want 1: the batches after the manifest failure ran", copied)
+	}
+}
+
+// Standalone, a hot copy gone during the copy means a DELETE (or retention)
+// removed its rows: the cold copy goes, nothing is flipped.
+func TestCopyAndFlip_StandaloneDropsTheCopyOfAVanishedSource(t *testing.T) {
+	m, hot, cold, _ := moveRig(t, gateDailyA, gateDailyB)
+	m.clusterGate = nil
+	cold.onWrite = func(p string) {
+		if p == gateDailyA {
+			_ = hot.mockBackend.Delete(context.Background(), p)
+		}
+	}
+
+	migrated, failed := m.migrator.MigrateBatch(context.Background(), []MigrationCandidate{candidateFor(gateDailyA), candidateFor(gateDailyB)})
+	if migrated != 1 || failed != 1 {
+		t.Fatalf("MigrateBatch = (%d, %d), want (1, 1)", migrated, failed)
+	}
+	if coldHas(t, cold, gateDailyA) {
+		t.Fatal("the cold copy of a vanished source was kept")
+	}
+	if got := fileMeta(t, m, gateDailyB).Tier; got != TierCold {
+		t.Fatalf("the other file's tier = %s, want cold", got)
+	}
+}
+
+// A DELETE of data too young to migrate asks cold storage nothing.
+func TestClaimForDelete_RecentFilesSkipTheColdCheck(t *testing.T) {
+	m, _, cold, _ := moveRig(t)
+	day := time.Now().UTC()
+	recent := "db1/cpu/" + day.Format("2006/01/02") + "/cpu_" + day.Format("20060102") + "_daily.parquet"
+	mustWrite(t, cold.mockBackend, recent)
+	cold.statErr = errors.New("cold unreachable")
+	release, err := m.ClaimForDelete(context.Background(), recent)
+	if err != nil {
+		t.Fatalf("ClaimForDelete on a recent file = %v, want nil", err)
+	}
+	release()
 }
