@@ -563,16 +563,49 @@ func TestCopyAndFlip_StandaloneDropsTheCopyOfAVanishedSource(t *testing.T) {
 	}
 }
 
-// A DELETE of data too young to migrate asks cold storage nothing.
-func TestClaimForDelete_RecentFilesSkipTheColdCheck(t *testing.T) {
+// A daily file younger than its database's policy is checked too (#1350
+// review): a policy raised after the copy landed does not remove the copy. An
+// unreachable cold tier therefore refuses the DELETE of it, retryably, rather
+// than let a rewrite leave a cold copy holding the deleted rows.
+func TestClaimForDelete_RecentDailyFilesAreCheckedToo(t *testing.T) {
 	m, _, cold, _ := moveRig(t)
 	day := time.Now().UTC()
 	recent := "db1/cpu/" + day.Format("2006/01/02") + "/cpu_" + day.Format("20060102") + "_daily.parquet"
 	mustWrite(t, cold.mockBackend, recent)
 	cold.statErr = errors.New("cold unreachable")
-	release, err := m.ClaimForDelete(context.Background(), recent)
+	if _, err := m.ClaimForDelete(context.Background(), recent); !errors.Is(err, ErrColdCheckFailed) {
+		t.Fatalf("ClaimForDelete on a recent daily file with cold unreachable = %v, want ErrColdCheckFailed", err)
+	}
+	cold.statErr = nil
+	if _, err := m.ClaimForDelete(context.Background(), recent); !errors.Is(err, ErrFileMoving) {
+		t.Fatalf("ClaimForDelete on a recent daily file with a cold copy = %v, want ErrFileMoving", err)
+	}
+}
+
+// A database made hot_only after a copy landed in cold (#1350 review): the
+// copy is still there, and cold sync records it once the hot file is
+// rewritten away, bringing the deleted rows back. The DELETE refuses the file
+// until the hot_only cleanup removes the copy.
+func TestClaimForDelete_HotOnlyDatabaseWithAColdCopyIsRefused(t *testing.T) {
+	m, _, cold, _ := moveRig(t)
+	ctx := context.Background()
+	if err := m.policies.Set(ctx, &DatabasePolicy{Database: "db1", HotOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, cold.mockBackend, gateDailyA)
+	if _, err := m.ClaimForDelete(ctx, gateDailyA); !errors.Is(err, ErrFileMoving) {
+		t.Fatalf("ClaimForDelete in a hot_only database with a cold copy = %v, want ErrFileMoving", err)
+	}
+}
+
+// Hourly files are never copied to cold: they ask cold storage nothing.
+func TestClaimForDelete_HourlyFilesSkipTheColdCheck(t *testing.T) {
+	m, _, cold, _ := moveRig(t)
+	hourly := "db1/cpu/2026/10/23/10/cpu_20261023_100000_1.parquet"
+	cold.statErr = errors.New("cold unreachable")
+	release, err := m.ClaimForDelete(context.Background(), hourly)
 	if err != nil {
-		t.Fatalf("ClaimForDelete on a recent file = %v, want nil", err)
+		t.Fatalf("ClaimForDelete on an hourly file = %v, want nil", err)
 	}
 	release()
 }

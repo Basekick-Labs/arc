@@ -82,9 +82,10 @@ func TestRetriedDeleteThroughTheRoute(t *testing.T) {
 }
 
 // Through the route: a DELETE that reaches a file the tiering migrator is
-// moving answers 207 naming why (a retry cannot reach it once it is in cold
-// storage), one whose cold copy could not be checked 503, and the other
-// file's rows are deleted either way.
+// moving answers 207 naming why (once it is in cold storage only, a DELETE
+// removes it if all its rows match and reports it otherwise, #1350), one whose
+// cold copy could not be checked 503, and the other file's rows are deleted
+// either way.
 func TestDeleteOfAMovingFileThroughTheRoute(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

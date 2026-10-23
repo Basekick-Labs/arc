@@ -52,8 +52,12 @@ type Deps struct {
 	Logger  zerolog.Logger
 	Metrics Metrics
 	Mode    Mode
-	// ConvertedSQL is the DuckDB-correct rewrite the caller already computed for
-	// this query (the oracle SQL for shadow compare). date_trunc intact per DuckDB.
+	// ConvertedSQL is the rewrite the caller already computed for this query
+	// (the oracle SQL for shadow compare). time_bucket and date_trunc arrive in
+	// it as epoch arithmetic, not as the functions; before #1352 that
+	// arithmetic rounded sub-second rows into the next bucket, so a shadow
+	// mismatch on minute or second buckets over sub-second data was the
+	// oracle's error, not arcx's.
 	ConvertedSQL string
 	// ServeStream writes an arcx result to the response in the request's wire
 	// format (JSON or msgpack), reusing Arc's existing Arrow→wire streamers. It

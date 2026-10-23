@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 )
 
 // moveClaims keeps a migration and a DELETE off the same hot file at once.
@@ -66,10 +65,12 @@ func (c *moveClaims) releaseDelete(path string) {
 
 // ErrFileMoving reports a hot file a DELETE must not touch: it is being
 // copied to cold storage, or a cold copy of it already exists (a move that
-// flipped and has not released the hot copy, or one whose flip failed). A
-// rewrite of the hot copy would leave the cold one holding the deleted rows.
-// Once the move finishes the file is in cold storage, which a DELETE does not
-// reach; until then a retry meets the same answer.
+// flipped and has not released the hot copy, one whose flip failed, or a copy
+// left over in a database that has since stopped tiering). A rewrite of the
+// hot copy would leave the cold one holding the deleted rows. Once the move
+// finishes, the file is in cold storage only: a DELETE then removes it if all
+// of its rows match and reports it otherwise (#1350); until then a retry meets
+// the same answer.
 var ErrFileMoving = errors.New("file is being moved to cold storage")
 
 // ErrColdCheckFailed reports a hot file a DELETE left alone because whether
@@ -103,21 +104,16 @@ func (m *Manager) ClaimForDelete(ctx context.Context, path string) (release func
 
 // hasColdCopy reports an object in cold storage at a hot file's path. Only a
 // file the migrator could have copied is asked about: a daily compaction
-// output (or a rewrite of one), old enough for its database's policy, in a
-// database that tiers. A DELETE of recent data asks cold storage nothing.
+// output (or a rewrite of one). A DELETE of recent hourly data asks cold
+// storage nothing.
+//
+// Not by the database's CURRENT policy (#1350 review): a database made
+// hot_only, or given a longer hot age, after a copy landed in cold still has
+// that copy, and cold sync records it as soon as the hot file is rewritten
+// away. The rewrite would then bring the deleted rows back and count the kept
+// ones twice. One HEAD per rewritten daily file is the price.
 func (m *Manager) hasColdCopy(ctx context.Context, path string) (bool, error) {
 	if !isDailyCompactedPath(path) {
-		return false, nil
-	}
-	info, err := m.parseFilePath(path)
-	if err != nil {
-		return false, nil
-	}
-	if m.IsHotOnly(ctx, info.Database) {
-		return false, nil
-	}
-	if policy := m.GetEffectivePolicy(ctx, info.Database); policy != nil &&
-		time.Since(info.PartitionTime) < time.Duration(policy.HotMaxAgeDays)*24*time.Hour {
 		return false, nil
 	}
 	cold := m.GetBackendForTier(TierCold)

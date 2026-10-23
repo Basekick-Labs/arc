@@ -926,6 +926,22 @@ func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurem
 	return s.scanFiles(rows)
 }
 
+// coldFilesForMeasurement is one measurement's cold rows, quarantined ones
+// excluded, in SQL: a DELETE asks for them, and the measurement's hot rows
+// (hourly files, the many) are no use to it (#1350).
+func (s *MetadataStore) coldFilesForMeasurement(ctx context.Context, database, measurement string) ([]FileMetadata, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+tierFileColumns+`
+		FROM tier_files
+		WHERE database = ? AND measurement = ? AND tier = ? AND quarantined_at IS NULL`,
+		database, measurement, string(TierCold))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query cold files: %w", err)
+	}
+	defer rows.Close()
+	return s.scanFiles(rows)
+}
+
 // GetAllDatabases returns all unique database names from the tier metadata.
 // This includes databases that may only have data in cold storage.
 func (s *MetadataStore) GetAllDatabases(ctx context.Context) ([]string, error) {

@@ -32,9 +32,15 @@ import (
 // told to delete that are still on its disk. The same set covers retention's
 // and DELETE's whole-file removals still waiting for their unlink.
 //
-// Nothing is kept once an object job leaves the FSM: its inputs are deleted
-// by then, and a listing DuckDB cached before the deletes (query.
-// enable_s3_cache) fails on a missing file whether or not it is left out.
+// Nothing is kept once an object job leaves the FSM: the finisher ends a job
+// only once every input it is to remove is deleted (#1358; before, an input
+// confirmed by this node's outbox in the minute before the commit was kept
+// and the job ended anyway, so its rows were read twice for good). An input
+// the manifest lists again stays, and so does one this node parked as
+// refused (logged at Warn): a parked file's rows are read until an operator
+// resolves it. A listing DuckDB cached before the deletes
+// (query.enable_s3_cache) fails on a missing file whether or not it is left
+// out.
 
 // openState is the coordinator's view of open compactions.
 type openState struct {
@@ -219,8 +225,12 @@ func (c *Coordinator) OpenGeneration() uint64 {
 // commit on every node, so a reader whose FSM lags the finisher still knows
 // the job. A job whose output left the manifest (it is being reverted, or
 // its remover deletes the inputs too) leaves nothing out; nor does an input
-// the manifest lists again or this node's outbox holds, as the finisher
-// keeps those (deleteObjectInputs).
+// the manifest lists again or this node's outbox holds (HoldsRegistration:
+// pending, parked, or confirmed in the last minute). The finisher keeps the
+// first and the parked, and deletes the others once their registration here
+// settles (deleteObjectInputs, #1358); until then this node counts such an
+// input next to the output, for at most about a minute — the safe direction
+// when the hold may be a registration this FSM has not applied yet.
 func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, prefix string) []string {
 	jobs := fsm.FinalizingObjectJobsUnder(prefix)
 	c.open.mu.Lock()

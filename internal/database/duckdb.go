@@ -1338,10 +1338,21 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 // release native-heap pages — debug.FreeOSMemory only covers Go-managed memory;
 // CGo allocations from the DuckDB httpfs extension live outside it.
 func (d *DuckDB) ClearHTTPCache() {
+	d.clearHTTPCache(zerolog.InfoLevel)
+}
+
+// ClearHTTPCacheQuietly is ClearHTTPCache logging its steps at Debug: the
+// query path calls it after an object vanished mid-query, up to once a
+// second while compaction runs, and its caller logs the reason.
+func (d *DuckDB) ClearHTTPCacheQuietly() {
+	d.clearHTTPCache(zerolog.DebugLevel)
+}
+
+func (d *DuckDB) clearHTTPCache(level zerolog.Level) {
 	if _, err := d.db.Exec("SELECT cache_httpfs_clear_cache()"); err != nil {
 		d.logger.Debug().Err(err).Msg("cache_httpfs_clear_cache not available (extension may not be loaded)")
 	} else {
-		d.logger.Info().Msg("Cleared cache_httpfs cache")
+		d.logger.WithLevel(level).Msg("Cleared cache_httpfs cache")
 	}
 
 	// Toggle disable then re-enable — always attempt the re-enable even if
@@ -1353,11 +1364,11 @@ func (d *DuckDB) ClearHTTPCache() {
 	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
 	} else {
-		d.logger.Info().Msg("Reset parquet_metadata_cache")
+		d.logger.WithLevel(level).Msg("Reset parquet_metadata_cache")
 	}
 
 	if memtrim.ReleaseToOS() {
-		d.logger.Info().Str("source", "clear_http_cache").Msg("Released glibc heap pages to OS")
+		d.logger.WithLevel(level).Str("source", "clear_http_cache").Msg("Released glibc heap pages to OS")
 	}
 }
 

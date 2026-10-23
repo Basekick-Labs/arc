@@ -1502,7 +1502,194 @@ needed by the manifest sweep after releasing the object listing. Writes remain
 batched, and cache invalidation is once per affected database/measurement.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1197](https://github.com/Basekick-Labs/arc/pull/1197).
+### A query on a measurement whose files are all gone no longer fails ([#1364](https://github.com/Basekick-Labs/arc/issues/1364))
 
+With tiered storage, a node whose tier metadata still listed a measurement
+with no file left in any tier answered `Binder Error: * expression without
+FROM clause!`, even for `SELECT count(*)`. This happened after a DELETE,
+retention or tiering removed every file of the measurement. Such a
+measurement now reads as empty:
+- **With a field schema anchor** (`query.stable_schema`, on by default):
+  zero rows with the columns the anchor records, so `count(*)` answers `0`
+  and queries naming those columns run.
+- **Without an anchor:** the empty result (no rows at all, not even a
+  `count(*)` row) that a measurement with no files already gets. As for such
+  a measurement, a JOIN or UNION that includes it then answers empty too.
+
+**Limitations:**
+- A node with no tier metadata for the measurement, an Arc without tiering,
+  or a query made before the anchor is first built answers the empty result
+  (no rows) rather than `0`. The answer can therefore differ by node: `0` on
+  one, no rows on another.
+- The read never falls back to local files the tier metadata leaves out.
+
+### A row DELETE reaches cold storage ([#1350](https://github.com/Basekick-Labs/arc/issues/1350))
+
+A row DELETE (`POST /api/v1/delete`) read and rewrote hot-tier files only.
+Rows in files that tiering had moved to cold storage were never matched, and
+the response gave no sign: a clause whose rows were all in cold storage
+answered 200 with `affected_files: 0`, and queries kept returning those rows.
+
+A DELETE now looks at cold storage too:
+- **A cold file whose rows all match is deleted**, the way retention deletes
+  cold files, and its rows are counted in `deleted_count`. The response
+  lists these files in `cold_deleted_files`.
+- **A cold file where only some rows match is left as it is.** The answer is
+  207: `cold_files` and `failed_files` name the file, and
+  `cold_rows_not_deleted` counts its matching rows. Arc does not rewrite part
+  of a cold file: cold storage has nothing that keeps readers from counting
+  the kept rows twice while the old file is replaced. Narrow the clause, or
+  delete the whole file's rows, or let retention remove it.
+- **A dry run reports both kinds.** `deleted_count` includes only the rows
+  the real run would delete.
+- **Cold rows that would be deleted count against `max_rows_per_delete` and
+  the confirmation threshold.**
+- If cold storage is configured but could not be examined (its backend is
+  unusable on this node, or listing it failed), the response says so in
+  `cold_not_examined` and answers 207 instead of 200.
+- A cold file whose hot copy still exists (a move that has not finished) is
+  never deleted from cold storage. It is reported, and a retry once the move
+  completes handles it.
+- A cold file that does not have a column the clause names (an older file,
+  from before the column existed) matches nothing, as for hot files.
+- A cold tier row whose object is gone is retired, or pointed back at the
+  file's hot copy if one exists. Both storage tiers are checked again at
+  that moment, as retention does, so a file a migration has just copied
+  keeps its row.
+
+Every cold file of the measurement is read to count its matching rows, so a
+DELETE on a measurement with many files in cold storage costs one read of
+each file's footer and the columns the clause uses.
+
+Also fixed: in a database made `hot_only` (or given a longer hot age) after
+some of its files reached cold storage, a DELETE could rewrite a file that
+still had a cold copy. The next cold sync then recorded the old copy, and
+queries returned the deleted rows again and counted the kept ones twice. A
+DELETE now checks cold storage for a copy of every daily file, whatever the
+database's current policy, and leaves such a file as it is. In a `hot_only`
+database the hot-only cleanup then removes the copy; with a longer hot age,
+the file stays until it is moved to cold storage again under the new
+policy. As a consequence, while cold storage is unreachable, a DELETE that
+touches a daily file answers the retryable 503, even for recent data.
+
+### A compaction run within a minute of its files' registration no longer leaves them behind, counted twice ([#1358](https://github.com/Basekick-Labs/arc/issues/1358))
+
+On a cluster with a shared object store, a compaction finishes by deleting
+its input files. The finisher kept any input this node had confirmed as
+registered in the previous minute, and ended the job anyway. Once the job
+ended, nothing deleted those inputs or left them out of reads, so every node
+counted their rows twice, alongside the compaction's output. This happened
+when a compaction ran less than a minute after the inputs were registered.
+Examples:
+- a manual or backfill compaction right after a flush or an import;
+- a scheduled hourly run (by default at :05) catching an hour that had
+  ended minutes earlier, while its last flush was still being registered;
+- a daily run over old days, which skips the file-age check
+  (`daily_skip_file_age_check_days`), right after an import into them;
+- a registration backlog drained after a Raft outage.
+
+**The fix:**
+- The finisher syncs with the leader before it decides. A confirmation
+  recorded before that sync belongs to a registration the compaction has
+  since removed, so the input is deleted.
+- If an input's registration is still pending on this node, or was
+  confirmed after the sync started, the finisher waits and retries rather
+  than ending the job with the file left behind. The input is then either
+  registered again (kept) or not (deleted). A job that keeps waiting is
+  logged at Warn every 5 minutes.
+- An input parked as refused is kept, logged at Warn naming the job and
+  the file, and the job ends as before.
+- The finisher sorts every input into keep, wait or delete before it
+  deletes any.
+- A node no longer registers a file again if a compaction that has not
+  ended took it as an input. This can happen after a registration whose
+  reply was lost, or one replayed from the journal. The file's rows are in
+  the compaction's output, so it is treated as registered. Before checking
+  a replayed or retried file, the node syncs with the leader.
+
+**Limitations:**
+- Inputs left behind by an older version, from jobs that have already
+  ended, are not removed. They are not in the cluster manifest. The opt-in
+  reconciliation sweep (`reconciliation.enabled`, then
+  `reconciliation.manifest_only_dry_run=false`) deletes them after its grace
+  window.
+- The check that keeps a consumed input from being registered again only
+  runs while the compaction's job is open. If another node's finisher
+  deletes the file and ends the job just after this node has checked it is
+  still in storage, the manifest gets an entry for a file that is gone. The
+  same happened before this fix. Queries list the bucket, so they are not
+  affected; the reconciliation sweep removes such an entry when it is
+  enabled.
+- While a finished compaction waits for an input's registration to settle
+  (at most about a minute for a recent confirmation), the node that made
+  that registration counts the input next to the output.
+
+### `time_bucket` and `date_trunc` put rows in the right bucket ([#1352](https://github.com/Basekick-Labs/arc/issues/1352))
+
+Arc runs `time_bucket(INTERVAL …, time)` and `date_trunc('…', time)` as epoch
+arithmetic, for speed. That arithmetic had two errors; both affected every
+query API answer (JSON, Arrow, msgpack, Grafana), and totals over a window
+were never affected:
+
+- **The last half second of every bucket was counted in the next one.** A row
+  at `03:29:59.7` was in the `03:30` minute. Any per-second, per-minute or
+  per-hour series over sub-second data had rows in the wrong bucket at every
+  edge.
+- **Some bucket widths did not line up with DuckDB's.** Arc aligned buckets
+  on 1970-01-01 (a Thursday); DuckDB aligns them on 2000-01-03 (a Monday),
+  which is also where ISO weeks start. Weekly buckets started on Thursdays,
+  `date_trunc('week', time)` was not the ISO week, and widths such as
+  `2 days`, `5 days` or `7 hours` started at different instants than
+  DuckDB's. Widths that divide the gap between the two dates evenly were
+  already the same: the common dashboard widths (1, 5, 10, 15 or 30 minutes,
+  1, 2, 3, 4, 6, 12 or 24 hours, `1 day`) did not move. Others (`7 minutes`,
+  `5 hours`, `2 days`, weeks) now match DuckDB, so those panels show
+  different bucket starts after the upgrade.
+
+Instants before the origin (before 1970 or 2000) floor correctly, a
+`time_bucket` origin with a fractional second keeps it, and the arithmetic is
+in integer microseconds, so it is exact for every timestamp. Continuous
+queries were not affected: they never used this rewrite.
+
+### A measurement's first files moved to cold storage are read on every node ([#1349](https://github.com/Basekick-Labs/arc/issues/1349))
+
+A node reads a measurement from cold storage only once it has a cold row for
+it. When tiering moved a measurement's first files to cold, other nodes could
+miss those rows until their own next cold metadata sync (about 24 hours with
+the default schedule), and read the files from neither tier until then:
+
+- **Shared object store:** other nodes were never told about the move.
+  Now every node records the cold copy when the migrating node releases the
+  hot one. A node that installs a Raft snapshot after missing migrations
+  checks the cold tier for each path the snapshot dropped, as nodes with
+  local storage already did. This works with `cluster.replication_enabled`
+  off, which is how the Helm chart runs shared storage. Before, a node
+  learned of manifest deletes only through the peer puller, which runs only
+  with replication on.
+- **Shared object store, DELETE rewrites:** for the same reason, a node
+  with replication off kept reading a file that a row DELETE had rewritten,
+  next to its rewrite, until the old object was removed. In that window it
+  counted the rows the DELETE kept twice. It now leaves the old file out of
+  reads once the rewrite is in the bucket, as nodes with replication on
+  already did.
+- **Both storage modes:** if the cold-tier check failed, the node waited for
+  the next sync. It now checks again after 1, 2 and 4 seconds. A cold tier
+  unreachable for longer than that still waits for the sync, or for the
+  startup scan at the next restart. A retry skips a path that has since been
+  written and registered again.
+
+Before recording a cold row, a node always checks that the cold copy exists.
+On a shared store the size comes from the same request, so each node makes
+one cold-tier request per moved file it has no row for yet.
+
+**Limitations:**
+- On a shared object store, other nodes now count a moved file twice until
+  the migrating node deletes its hot object. That node deletes them one at a
+  time, up to 200 per manifest release, so this can last a few seconds.
+  Before this fix, those nodes did not count the file at all.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+in [#1354](https://github.com/Basekick-Labs/arc/pull/1354).
 ### Compaction job metrics count on `/metrics` ([#1343](https://github.com/Basekick-Labs/arc/issues/1343))
 
 `arc_compaction_jobs_total`, `arc_compaction_jobs_success_total` and
@@ -1878,6 +2065,9 @@ removes the hot copy. Three problems, all fixed:
   release of up to 200 files a second).
 - On a cluster with local storage, the other nodes count a moved file twice
   until they remove their own copy.
+- On a cluster with a shared object store, the other nodes count a moved
+  file twice until the migrating node deletes the hot object (see #1349
+  above).
 - While a migration runs, the migrating node drops its query caches up to
   twice a second.
 - A DELETE arriving on a new primary writer while the old one is still
@@ -1983,6 +2173,11 @@ literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
 `OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
 the whole measurement, correctly but without pruning.
 
+An aggregate's `FILTER (WHERE …)` clause, such as `count(*) FILTER (WHERE
+status = 500)`, is not a second WHERE. The query's own WHERE still prunes
+(#1360). A time bound inside a FILTER never narrows what the query reads. A
+subquery, or a FROM or JOIN, inside a FILTER still means no range.
+
 Accepted spellings:
 - the column as `time`, `"time"`, `alias.time` or Grafana's `(time)`;
 - the literal as `'…'`, `'…'::timestamp` or `TIMESTAMP '…'`;
@@ -2020,6 +2215,26 @@ list a partition folder, Arc keeps that folder in the plan without checking
 it. If a kept folder turns out to hold no files, the query now gets the 503
 instead of an empty, incomplete answer, for as long as the listing keeps
 failing.
+
+**A file removed while DuckDB is reading the hour gets the same answer
+(#1355).** Compaction removes an hour's input files in batches as it merges
+them. A query can already have listed the hour's files, and then go to open
+one that is no longer there. That query failed with HTTP 500 (`Cannot open
+file … No such file or directory`, or the S3 404 / Azure `BlobNotFound`
+equivalent). It now gets the same retryable 503, on every query route.
+
+- On S3 or Azure, Arc also clears its object-store cache (at most once a
+  second), so the retry lists the hour again. Before, with
+  `query.enable_s3_cache`, a cached listing kept naming the removed object
+  until its entry expired, and every retry failed the same way. While
+  compaction keeps removing files that queries are reading, this clear can
+  repeat once a second.
+- A file that is missing for good also answers the 503, every time. Examples
+  are a broken symlink under the storage root, or a cold-tier object that a
+  stale tiering record still lists. Arc logs a warning that names the path.
+- Only DuckDB's own error counts. Text that a query puts in a string, and
+  DuckDB quotes back in another error, gets neither this answer nor #1333's
+  empty result.
 
 ### Iceberg export on a local-storage cluster no longer publishes a file next to the one that replaced it
 
