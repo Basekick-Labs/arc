@@ -695,11 +695,14 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db               *database.DuckDB
-	storage          storage.Backend
-	pruner           *pruning.PartitionPruner
-	fieldSchema      *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
-	emptyRangeAnchor bool                  // #928: answer a proven-empty range from a complete anchor alone
+	db          *database.DuckDB
+	storage     storage.Backend
+	pruner      *pruning.PartitionPruner
+	fieldSchema *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
+	// tierView replaces tieringManager's view in buildMultiTierReadParquet
+	// (tests: a tiering.Manager needs a license).
+	tierView         multiTierView
+	emptyRangeAnchor bool // #928: answer a proven-empty range from a complete anchor alone
 	queryCache       *database.QueryCache
 	// openCompactions lists compaction jobs whose output and inputs can both
 	// be in storage (compaction.OpenJobs); nil without a compaction manager.
@@ -3978,7 +3981,8 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	options := buildReadParquetOptions()
 
 	// Query metadata to find which tiers actually have data for this measurement
-	actualTiers, err := h.tieringManager.GetMetadata().GetTiersForMeasurement(ctx, database, measurement)
+	tiers := h.multiTierView()
+	actualTiers, err := tiers.TiersForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Warn().Err(err).
 			Str("database", database).
@@ -4036,7 +4040,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// Cold tier (S3/Azure) - only if metadata says there's cold data
 	if actualTiers[tiering.TierCold] {
 		if _, ok := tieredPaths[tiering.TierCold]; ok {
-			coldBackend := h.tieringManager.GetBackendForTier(tiering.TierCold)
+			coldBackend := tiers.GetBackendForTier(tiering.TierCold)
 			if coldBackend != nil {
 				sources = append(sources, tierSource{tiering.TierCold, h.storagePathForBackend(ctx, coldBackend, database, measurement), coldBackend})
 			}
@@ -4103,7 +4107,13 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	}
 
 	if len(paths) == 0 {
-		return h.noTierRead(ctx, database, measurement, keyword, options)
+		hotWasSource := false
+		for _, src := range sources {
+			if src.tier == tiering.TierHot {
+				hotWasSource = true
+			}
+		}
+		return h.noTierRead(ctx, database, measurement, keyword, options, hotWasSource)
 	}
 
 	anchor := h.anchorFor(ctx, database, measurement)
@@ -4131,15 +4141,20 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 // noTierRead is the read of a measurement no tier holds a file of any more:
 // every one was deleted, retired or moved out while its tier rows stayed
 // (#1364). It used to be "(SELECT * WHERE 1=0)", which DuckDB refuses to bind
-// ("* expression without FROM clause"), so even count(*) failed.
+// ("* expression without FROM clause"), so even count(*) failed; it also
+// broke the read_parquet(...) shape the open-compaction wrapper expects.
 //
 // With the measurement's schema anchor, the anchor alone: zero rows with
-// every column the measurement has had, so count(*) answers 0 and a query
-// naming a column binds. Without one, the hot tier's glob, which is how a
-// measurement with no files at all reads: DuckDB reports "No files found" and
-// the handler answers an empty result (classifyNoFiles). Not cached either
-// way: the next flush gives the measurement files again.
-func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, keyword, options string) string {
+// every column the anchor knows, so count(*) answers 0 and a query naming
+// those columns binds. Without one, a glob DuckDB reports "No files found"
+// for, which the handler answers with an empty result (classifyNoFiles), as
+// for a measurement that never had a file. That glob is the hot tier's only
+// when the hot tier was one of the read's sources (verified empty); a read
+// the tier rows kept off hot storage must not start reading local files they
+// left out (stale copies of deleted files, say), so it gets one that matches
+// nothing. Not cached either way: a later flush or tier scan changes which
+// tiers hold files.
+func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, keyword, options string, hotWasSource bool) string {
 	pruning.MarkVolatile(ctx)
 	h.logger.Debug().
 		Str("database", database).
@@ -4148,7 +4163,35 @@ func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, ke
 	if anchor := h.anchorFor(ctx, database, measurement); anchor != "" {
 		return readParquetExpr(keyword, anchor, nil, options)
 	}
-	return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, measurement)}, options)
+	if hotWasSource {
+		return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, measurement)}, options)
+	}
+	return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, arcInvalidIdentifierSentinel)}, options)
+}
+
+// multiTierView is what buildMultiTierReadParquet reads from tiering: which
+// tiers hold rows of a measurement, and the cold backend. *tiering.Manager
+// through tieringTierView; a test sets QueryHandler.tierView.
+type multiTierView interface {
+	TiersForMeasurement(ctx context.Context, database, measurement string) (map[tiering.Tier]bool, error)
+	GetBackendForTier(tier tiering.Tier) storage.Backend
+}
+
+type tieringTierView struct{ m *tiering.Manager }
+
+func (v tieringTierView) TiersForMeasurement(ctx context.Context, database, measurement string) (map[tiering.Tier]bool, error) {
+	return v.m.GetMetadata().GetTiersForMeasurement(ctx, database, measurement)
+}
+
+func (v tieringTierView) GetBackendForTier(tier tiering.Tier) storage.Backend {
+	return v.m.GetBackendForTier(tier)
+}
+
+func (h *QueryHandler) multiTierView() multiTierView {
+	if h.tierView != nil {
+		return h.tierView
+	}
+	return tieringTierView{h.tieringManager}
 }
 
 // convertSingleTableQuery is a fast path for simple single-table queries.
