@@ -1,6 +1,7 @@
 package pruning
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -248,6 +249,9 @@ func FuzzTimeBounds(f *testing.F) {
 		"SELECT * FROM t WHERE (time) >= 'a' AND ((b) AND c)) OR (",
 		"SELECT * FROM t WHERE CASE WHEN a THEN b END AND time > now() - INTERVAL 5 MINUTE",
 		"SELECT * FROM t WHERE time BETWEEN '1' AND",
+		"SELECT count(*) FILTER (WHERE (a) FROM t WHERE time > 'x'",
+		"SELECT x) filter ( FROM t WHERE time > 'x'",
+		"SELECT count(*) FILTER (WHERE h IN (SELECT h FROM t)) FROM t WHERE time >= 'x'",
 	} {
 		f.Add(s)
 	}
@@ -267,5 +271,85 @@ func TestRelativeMonthMatchesDuckDB(t *testing.T) {
 	got, err := evaluateRelativeTimeAt(mustT(t, "2026-03-31 10:00:00"), "1", "month", false)
 	if err != nil || !got.Equal(mustT(t, "2026-02-28 10:00:00")) {
 		t.Fatalf("now() - 1 month on Mar 31 = %v (%v), want Feb 28", got, err)
+	}
+}
+
+// #1360: an aggregate's FILTER (WHERE …) filters that aggregate's input, not
+// the query's rows. It must neither stop the outer WHERE from being read
+// (every such query read the whole measurement) nor ever be read as a bound.
+func TestAggregateFilterKeepsTheOuterRange(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	const where = " FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND time < '2026-10-20 11:00:00'"
+	for _, sel := range []string{
+		"SELECT count(*) FILTER (WHERE status = 500)",
+		"SELECT count(*), count(*) filter (where status = 500)",
+		"SELECT count(*) FILTER\n  (WHERE status = 500), sum(v) FILTER(WHERE (a > 1) AND (b IN (1, 2)))",
+		"SELECT count(*) FILTER (status = 500)",
+		"SELECT count(*) FILTER (WHERE time < '2026-10-20 10:30:00')",
+		"SELECT count(*) FILTER (WHERE status = 500) OVER (PARTITION BY host)",
+		"SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE v > 0)",
+		"SELECT host, count(*) FILTER (WHERE v > 1) AS c",
+	} {
+		q := sel + where + " GROUP BY ALL"
+		tr := p.ExtractTimeRange(q)
+		if tr == nil {
+			t.Errorf("no range for %q", q)
+			continue
+		}
+		if !tr.Start.Equal(mustT(t, "2026-10-20T10:00:00Z")) || !tr.End.Equal(mustT(t, "2026-10-20T11:00:00Z")) {
+			t.Errorf("range %v..%v for %q, want the outer WHERE's 10:00..11:00", tr.Start, tr.End, q)
+		}
+	}
+	for _, q := range []string{
+		// A bound only inside a FILTER bounds nothing the query reads.
+		"SELECT count(*), count(*) FILTER (WHERE time >= '2026-10-20 10:00:00') FROM db.cpu",
+		"SELECT count(*) FILTER (WHERE time >= '2026-10-20 10:00:00') FROM db.cpu WHERE host = 'a'",
+		// A FILTER body that reads another table or the same one again: the
+		// outer range would be applied to that read too and drop its rows.
+		"SELECT count(*) FILTER (WHERE host IN (SELECT host FROM db.cpu WHERE time < '2024-01-01')), count(*) FROM db.cpu WHERE time >= '2024-06-01'",
+		"SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM db.mem m JOIN db.disk d USING (host))) FROM db.cpu WHERE time >= '2024-06-01'",
+		"SELECT count(*) FILTER (WHERE host IN (WITH x AS (SELECT 1) SELECT * FROM x)) FROM db.cpu WHERE time >= '2024-06-01'",
+		"SELECT count(*) FILTER (WHERE host IN (FROM db.mem SELECT host)) FROM db.cpu WHERE time >= '2024-06-01'",
+		// filter() the list function is not an aggregate filter.
+		"SELECT * FROM db.cpu WHERE time >= '2024-06-01' AND len(filter(l, x -> x IN (SELECT 1))) > 0",
+		// An unbalanced FILTER body.
+		"SELECT count(*) FILTER (WHERE (a > 1) FROM db.cpu WHERE time >= '2024-06-01'",
+	} {
+		if tr := p.ExtractTimeRange(q); tr != nil {
+			t.Errorf("range %v..%v for %q, want none", tr.Start, tr.End, q)
+		}
+	}
+}
+
+// A query with FILTER clauses reads exactly the range of the same query with
+// the clauses removed.
+func TestAggregateFilterRangeEqualsTheQueryWithout(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	for _, tail := range []string{
+		" FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND time < '2026-10-20 11:00:00' AND host = 'a'",
+		" FROM db.cpu WHERE time > now() - INTERVAL '1 hour' GROUP BY host HAVING count(*) FILTER (WHERE v > 1) > 0",
+		" FROM db.cpu WHERE time BETWEEN '2026-10-20 10:00:00' AND '2026-10-20 10:59:59' QUALIFY count(*) FILTER (WHERE time < '2026-10-20 10:30:00') OVER () > 0",
+		" FROM db.cpu WHERE host = 'a' AND time >= '2026-10-20 10:00:00' ORDER BY count(*) FILTER (WHERE v > 1)",
+	} {
+		with := p.ExtractTimeRange("SELECT count(*) FILTER (WHERE (v > 1) AND status IN (1, 2)), sum(v) FILTER (WHERE time > '2000-01-01')" + tail)
+		without := p.ExtractTimeRange("SELECT count(*), sum(v)" + tail)
+		if (with == nil) != (without == nil) || (with != nil && (!with.Start.Truncate(time.Minute).Equal(without.Start.Truncate(time.Minute)) || !with.End.Truncate(time.Minute).Equal(without.End.Truncate(time.Minute)))) {
+			t.Errorf("tail %q: with FILTER %+v, without %+v", tail, with, without)
+		}
+	}
+}
+
+func TestBlankAggregateFiltersKeepsPositions(t *testing.T) {
+	in := "select count(*) filter (where (a) > 1), f(x) filter (b) from t where c"
+	out := blankAggregateFilters(in)
+	if len(out) != len(in) {
+		t.Fatalf("length %d, want %d", len(out), len(in))
+	}
+	want := strings.Replace(strings.Replace(in, "filter (where (a) > 1)", strings.Repeat(" ", len("filter (where (a) > 1)")), 1), "filter (b)", strings.Repeat(" ", len("filter (b)")), 1)
+	if out != want {
+		t.Fatalf("got  %q\nwant %q", out, want)
+	}
+	if got := blankAggregateFilters("select filter(l, x -> x > 1) from t"); got != "select filter(l, x -> x > 1) from t" {
+		t.Fatalf("the filter() function was blanked: %q", got)
 	}
 }

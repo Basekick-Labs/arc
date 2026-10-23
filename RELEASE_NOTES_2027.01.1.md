@@ -2096,6 +2096,11 @@ literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
 `OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
 the whole measurement, correctly but without pruning.
 
+An aggregate's `FILTER (WHERE …)` clause, such as `count(*) FILTER (WHERE
+status = 500)`, is not a second WHERE. The query's own WHERE still prunes
+(#1360). A time bound inside a FILTER never narrows what the query reads. A
+FILTER whose body is a subquery or reads another table still means no range.
+
 Accepted spellings:
 - the column as `time`, `"time"`, `alias.time` or Grafana's `(time)`;
 - the literal as `'…'`, `'…'::timestamp` or `TIMESTAMP '…'`;
