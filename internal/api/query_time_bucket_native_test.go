@@ -26,6 +26,8 @@ func TestTimeBucketRewritesMatchNativeDuckDB(t *testing.T) {
 		"2026-10-23 03:30:00", "2026-10-23 03:30:00.000001", "2026-10-19 00:00:00", "2026-10-18 23:59:59.6",
 		"2000-01-03 00:00:00", "2000-01-02 23:59:59.9", "1999-12-31 12:00:00.5", "1970-01-01 00:00:00.5",
 		"1969-12-31 23:59:59.5", "1950-06-01 12:00:00.4", "2100-02-28 23:59:59.999999", "2024-02-29 11:59:59.75",
+		// Centuries from the origin: a double quotient loses the microsecond here.
+		"1500-03-01 11:59:59.999999", "1700-06-15 00:00:00.5", "2600-12-31 23:59:59.999999", "2300-01-01 00:00:00.000001",
 	}
 	vals := make([]string, len(instants))
 	for i, s := range instants {
@@ -53,8 +55,12 @@ func TestTimeBucketRewritesMatchNativeDuckDB(t *testing.T) {
 	for _, iv := range []string{"1 second", "30 seconds", "1 minute", "15 minutes", "1 hour", "7 hours", "1 day", "2 days", "5 days", "1 week", "3 weeks"} {
 		native := fmt.Sprintf("time_bucket(INTERVAL '%s', time)", iv)
 		check(native, rewriteTimeBucket(native))
-		withOrigin := fmt.Sprintf("time_bucket(INTERVAL '%s', time, TIMESTAMPTZ '2024-01-01 00:30:00+00')", iv)
-		check(withOrigin, rewriteTimeBucket(fmt.Sprintf("time_bucket(INTERVAL '%s', time, TIMESTAMP '2024-01-01 00:30:00')", iv)))
+		// Origins: a usual one, one with a fractional second, one centuries
+		// after the data.
+		for _, o := range []string{"2024-01-01 00:30:00", "2024-01-01 00:30:00.5", "2400-01-01 00:00:00"} {
+			withOrigin := fmt.Sprintf("time_bucket(INTERVAL '%s', time, TIMESTAMPTZ '%s+00')", iv, o)
+			check(withOrigin, rewriteTimeBucket(fmt.Sprintf("time_bucket(INTERVAL '%s', time, TIMESTAMP '%s')", iv, o)))
+		}
 	}
 	for _, unit := range []string{"second", "minute", "hour", "day", "week"} {
 		native := fmt.Sprintf("date_trunc('%s', time)", unit)

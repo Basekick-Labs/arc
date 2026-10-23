@@ -1505,17 +1505,21 @@ were never affected:
   at `03:29:59.7` was in the `03:30` minute. Any per-second, per-minute or
   per-hour series over sub-second data had rows in the wrong bucket at every
   edge.
-- **Buckets wider than a day, and some narrower ones, did not line up with
-  DuckDB's.** Arc aligned them on 1970-01-01 (a Thursday); DuckDB aligns them
-  on 2000-01-03 (a Monday), which is also where ISO weeks start. Weekly
-  buckets started on Thursdays, `date_trunc('week', time)` was not the ISO
-  week, and widths such as `2 days`, `5 days` or `7 hours` started at
-  different instants than DuckDB's. These now match DuckDB, so weekly and
-  multi-day panels show different bucket starts after the upgrade.
+- **Some bucket widths did not line up with DuckDB's.** Arc aligned buckets
+  on 1970-01-01 (a Thursday); DuckDB aligns them on 2000-01-03 (a Monday),
+  which is also where ISO weeks start. Weekly buckets started on Thursdays,
+  `date_trunc('week', time)` was not the ISO week, and widths such as
+  `2 days`, `5 days` or `7 hours` started at different instants than
+  DuckDB's. Widths that divide the gap between the two dates evenly (every
+  width up to an hour, `1 day`, `3 days`, `2`/`3`/`4`/`6`/`8`/`12` hours) were
+  already the same. The others now match DuckDB, so weekly and some
+  multi-hour or multi-day panels show different bucket starts after the
+  upgrade.
 
-Instants before 1970 floor correctly now too. Continuous queries were not
-affected: they never used this rewrite. The bucketing is now exact for
-timestamps between 1697 and 2242.
+Instants before the origin (before 1970 or 2000) floor correctly, a
+`time_bucket` origin with a fractional second keeps it, and the arithmetic is
+in integer microseconds, so it is exact for every timestamp. Continuous
+queries were not affected: they never used this rewrite.
 
 ### Compaction job metrics count on `/metrics` ([#1343](https://github.com/Basekick-Labs/arc/issues/1343))
 
