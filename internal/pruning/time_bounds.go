@@ -86,11 +86,15 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 	shape, _ := sql.MaskFromKeywordsInFunctionBodies(masked)
 	// An aggregate's FILTER (WHERE …) filters that aggregate's input, not
 	// the query's rows, so its WHERE is not a second WHERE (#1360). It is
-	// blanked only to count and find the query's WHERE: the FROM count and
-	// the JOIN/UNION/WITH/subquery checks still read the whole query, so a
-	// FILTER body holding a subquery or another table keeps the query
-	// refused. A range read from the outer WHERE would be applied to that
-	// table too and drop its rows.
+	// blanked only to count and find the query's WHERE. Why that is safe:
+	// the range is applied to every table reference Arc rewrites into a
+	// read_parquet, and Arc rewrites only references after FROM, after JOIN
+	// and in comma joins. The FROM count and the JOIN/UNION/WITH/subquery
+	// checks below still read the whole query, FILTER bodies included, so
+	// the outer table stays the only reference that gets the range. A table
+	// read some other way inside a FILTER (TABLE t, PIVOT t …) is never
+	// rewritten, so it is never pruned either (it fails as an unknown
+	// table). Do not move those checks onto the blanked string.
 	wheres := blankAggregateFilters(shape)
 	if len(fromWord.FindAllStringIndex(shape, -1)) != 1 || structuralWord.MatchString(shape) ||
 		subSelect.MatchString(shape) || len(whereWord.FindAllStringIndex(wheres, -1)) != 1 {
@@ -119,8 +123,10 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 
 // aggregateFilter finds the FILTER keyword of an aggregate's filter clause:
 // the whole word followed by "(", right after the ")" that closes the
-// aggregate call (or its WITHIN GROUP (…)). DuckDB's filter(list, lambda)
-// function never follows a ")".
+// aggregate call (or its WITHIN GROUP (…)). The ")" keeps DuckDB's
+// filter(list, lambda) function out of the blanking. That is tidiness, not
+// safety: a lambda holds no WHERE unless it holds a subquery, which the
+// unblanked checks refuse.
 var aggregateFilter = regexp.MustCompile(`(?i)\)\s*(filter)\s*\(`)
 
 // blankAggregateFilters returns s with every aggregate FILTER clause, keyword

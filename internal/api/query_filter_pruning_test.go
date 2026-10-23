@@ -13,7 +13,7 @@ import (
 // 10:00-12:00 does not.
 func TestAggregateFilterQueryIsPruned(t *testing.T) {
 	r, _, arm := newVanishedFileRig(t)
-	require.NoError(t, os.WriteFile(arm("08"), []byte("not parquet"), 0o644))
+	require.NoError(t, os.WriteFile(arm("08"), []byte("not parquet"), 0o600))
 
 	const window = " FROM db1.cpu WHERE time >= '2026-10-20 10:00:00' AND time < '2026-10-20 12:00:00'"
 	for _, sql := range []string{

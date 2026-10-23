@@ -310,7 +310,8 @@ func TestAggregateFilterKeepsTheOuterRange(t *testing.T) {
 		"SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM db.mem m JOIN db.disk d USING (host))) FROM db.cpu WHERE time >= '2024-06-01'",
 		"SELECT count(*) FILTER (WHERE host IN (WITH x AS (SELECT 1) SELECT * FROM x)) FROM db.cpu WHERE time >= '2024-06-01'",
 		"SELECT count(*) FILTER (WHERE host IN (FROM db.mem SELECT host)) FROM db.cpu WHERE time >= '2024-06-01'",
-		// filter() the list function is not an aggregate filter.
+		// A subquery inside filter() the list function (refused by the
+		// unblanked subquery check, whatever the blanking does).
 		"SELECT * FROM db.cpu WHERE time >= '2024-06-01' AND len(filter(l, x -> x IN (SELECT 1))) > 0",
 		// An unbalanced FILTER body.
 		"SELECT count(*) FILTER (WHERE (a > 1) FROM db.cpu WHERE time >= '2024-06-01'",
@@ -331,6 +332,7 @@ func TestAggregateFilterRangeEqualsTheQueryWithout(t *testing.T) {
 		" FROM db.cpu WHERE time BETWEEN '2026-10-20 10:00:00' AND '2026-10-20 10:59:59' QUALIFY count(*) FILTER (WHERE time < '2026-10-20 10:30:00') OVER () > 0",
 		" FROM db.cpu WHERE host = 'a' AND time >= '2026-10-20 10:00:00' ORDER BY count(*) FILTER (WHERE v > 1)",
 	} {
+		// Minutes, not instants: the now() tail is evaluated once per call.
 		with := p.ExtractTimeRange("SELECT count(*) FILTER (WHERE (v > 1) AND status IN (1, 2)), sum(v) FILTER (WHERE time > '2000-01-01')" + tail)
 		without := p.ExtractTimeRange("SELECT count(*), sum(v)" + tail)
 		if (with == nil) != (without == nil) || (with != nil && (!with.Start.Truncate(time.Minute).Equal(without.Start.Truncate(time.Minute)) || !with.End.Truncate(time.Minute).Equal(without.End.Truncate(time.Minute)))) {
