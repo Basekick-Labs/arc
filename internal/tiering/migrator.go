@@ -249,9 +249,10 @@ var errReplacedByDelete = errors.New("a DELETE replaced the file during its migr
 // errTierChanged: the file's tier row stopped saying hot during the copy.
 var errTierChanged = errors.New("the file's tier row changed during its migration")
 
-// rewriteSiblingChecker is a ManifestCoordinator that can tell a registered
-// member of a file's rewrite family (#1340).
-type rewriteSiblingChecker interface {
+// RewriteSiblingChecker is a ManifestCoordinator that can tell a registered
+// member of a file's rewrite family (#1340). Without it a cluster's DELETE
+// leftovers are known to the migrator only through the journal.
+type RewriteSiblingChecker interface {
 	HasRewriteSibling(path string) bool
 }
 
@@ -267,7 +268,7 @@ func (m *Migrator) supersededByDelete(path string, journaled bool) bool {
 	if mc == nil {
 		return false
 	}
-	sc, ok := mc.(rewriteSiblingChecker)
+	sc, ok := mc.(RewriteSiblingChecker)
 	if !ok {
 		return false
 	}

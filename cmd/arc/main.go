@@ -5703,6 +5703,14 @@ func (a *tieringManifestAdapter) ManifestEntriesByDatabase(database string) []st
 	return paths
 }
 
+// HasRewriteSibling: the migrator leaves a file a DELETE replaced (the
+// manifest lists another member of its rewrite family instead) out of cold.
+func (a *tieringManifestAdapter) HasRewriteSibling(path string) bool {
+	return a.coordinator.HasRewriteSibling(path)
+}
+
+var _ tiering.RewriteSiblingChecker = (*tieringManifestAdapter)(nil)
+
 func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
 	return a.coordinator.CompactionOwns(path)
 }
