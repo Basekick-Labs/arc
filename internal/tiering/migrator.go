@@ -708,7 +708,7 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		// recorded it as cold, and that node's reconciliation would then
 		// remove the hot copy on the strength of it — deleting the cold copy
 		// here could leave no copy anywhere. Left in place it finishes the
-		// move later: the next cold sync records it (RecordColdFile flips
+		// move later: the next cold sync records it (its upsert flips
 		// this row to cold) and reconciliation then removes the hot copy, or
 		// the next cycle copies over it and flips. A DELETE refuses the file
 		// meanwhile (ClaimForDelete finds the cold copy).

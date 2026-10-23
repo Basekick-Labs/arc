@@ -67,6 +67,11 @@ type Manager struct {
 	// scan, or it would migrate from stale hot rows.
 	scanRunning atomic.Bool
 
+	// sweepColdRows loads the cold rows the manifest sweep works from. Nil
+	// in production, which reads them from the metadata store; a test sets
+	// it to see where and how often the cycle loads them.
+	sweepColdRows func(context.Context) ([]FileMetadata, error)
+
 	// lastScan is a copy of the most recent scan result and when it
 	// finished, written by scanTiers on every path including truncation.
 	// The startup scan has no HTTP response to carry its result, and a
@@ -370,7 +375,7 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	// replacing it: whichever is shorter bounds the scan, and migration — the
 	// step that actually moves files — keeps the remainder of the cycle. A
 	// scan_timeout larger than the cycle budget is capped by this parent.
-	scanResult, coldRows, err := func() (*ScanResult, []FileMetadata, error) {
+	scanResult, err := func() (*ScanResult, error) {
 		scanCtx, cancelScan := context.WithTimeout(ctx, m.scanBudget())
 		defer cancelScan()
 		return m.scanTiers(scanCtx)
@@ -486,10 +491,24 @@ func (m *Manager) runCycle(ctx context.Context) error {
 
 			// Manifest entries for files already in cold — migrated before the
 			// manifest was kept in step, or whose manifest step failed — keep
-			// peer replication pulling their replicas back. coldRows (every
-			// cold row this node knows) is held across the whole cycle for
-			// this; a few hundred bytes a row.
-			if _, err := m.migrator.ReconcileManifest(ctx, coldRows); err != nil {
+			// peer replication pulling their replicas back.
+			//
+			// The rows are read here, once, on the only node and the only path
+			// that sweeps (#1188). The cold sync used to hand them over, which
+			// made every sync — on readers, at startup, from the API, and on
+			// cycles that never get this far — load every cold row a second
+			// time. Read after this cycle's migration and orphan sweep, so the
+			// set can differ from what the sync saw; every difference is one
+			// ReconcileManifest's own guards decide (tier still cold, not
+			// quarantined, migrated_at settled, cold object stat'd against the
+			// manifest size). A row this cycle migrated is stamped now and is
+			// unsettled, unless MigrateTier ran past manifestSettle; the sweep
+			// then still sends its receipts first and stats the cold object.
+			coldRows, err := m.loadSweepColdRows(ctx)
+			if err != nil {
+				m.logger.Warn().Err(err).Msg("Manifest reconciliation skipped: could not load the cold rows; retried next cycle")
+				totalErrors++
+			} else if _, err := m.migrator.ReconcileManifest(ctx, coldRows); err != nil {
 				m.logger.Warn().Err(err).Msg("Manifest reconciliation stopped; remaining entries are retried next cycle")
 				totalErrors++
 			}
@@ -919,9 +938,10 @@ type ScanResult struct {
 	// ColdSynced counts cold-tier metadata changes and redundant cold objects removed.
 	// Always zero without a usable cold tier (see ScanTiers).
 	ColdSynced int `json:"cold_synced"`
-	// ColdSyncFailed is set when the cold tier could not be listed; the
-	// hot scan still ran, but this node's tier metadata may be stale until
-	// a listing succeeds.
+	// ColdSyncFailed is set when the cold sync did not finish: the cold tier
+	// could not be listed, its rows could not be loaded, or the scan budget
+	// ran out part way through. The hot scan still ran, but this node's tier
+	// metadata may be stale until a sync completes.
 	ColdSyncFailed bool `json:"cold_sync_failed,omitempty"`
 	// HotRetired counts hot rows removed because their file is no longer
 	// in hot storage.
@@ -953,8 +973,7 @@ func (m *Manager) ScanTiers(ctx context.Context) (*ScanResult, error) {
 	}
 	defer m.scanRunning.Store(false)
 
-	result, _, err := m.scanTiers(ctx)
-	return result, err
+	return m.scanTiers(ctx)
 }
 
 // defaultScanTimeout is the budget for one tier scan when no configuration
@@ -1007,17 +1026,23 @@ func (m *Manager) LastScan() (*ScanResult, time.Time) {
 	return &snapshot, m.lastScanAt
 }
 
-// scanTiers is ScanTiers that also hands back the cold rows the sync worked
-// from (those it loaded plus those it recorded), so the primary's manifest
-// sweep in the same cycle does not load them a third time.
-func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, error) {
+// loadSweepColdRows is the manifest sweep's row set; see sweepColdRows.
+func (m *Manager) loadSweepColdRows(ctx context.Context) ([]FileMetadata, error) {
+	if m.sweepColdRows != nil {
+		return m.sweepColdRows(ctx)
+	}
+	return m.metadata.GetFilesInTier(ctx, TierCold)
+}
+
+// scanTiers is ScanTiers without the single-flight guard; runCycle holds its
+// own. It no longer hands back cold rows: the manifest sweep loads its own,
+// where it runs (#1188).
+func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, error) {
 	result := &ScanResult{}
-	var coldRows []FileMetadata
 	var coldSyncErr error
 	if m.coldTierUsable() {
-		synced, rows, err := m.syncColdTierMetadata(ctx)
+		synced, err := m.syncColdTierMetadata(ctx)
 		result.ColdSynced = synced
-		coldRows = rows
 		coldSyncErr = err
 		if err != nil {
 			// The hot scan still matters on its own: the primary migrates
@@ -1052,9 +1077,9 @@ func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, e
 	}
 	m.recordScan(result)
 	if err != nil {
-		return result, coldRows, err
+		return result, err
 	}
-	return result, coldRows, nil
+	return result, nil
 }
 
 // isBudgetExpiry reports whether err is a scan that ran out of time or was
@@ -1062,6 +1087,8 @@ func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, e
 func isBudgetExpiry(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
+
+const coldTierMetadataBatchSize = 1000
 
 // syncColdTierMetadata makes this node's metadata reflect what is in cold
 // storage. In a gated cluster — shared storage, or per-node storage with
@@ -1078,46 +1105,122 @@ func isBudgetExpiry(err error) bool {
 // downgrades (#683): the object may be mid-move, and a hot copy is still
 // read through the hot glob. Redundant cold objects are removed only when
 // this node is the primary and the metadata row is still hot.
-// Returns how many rows changed and the cold rows it worked from — those
-// loaded plus those recorded — for the manifest sweep.
-func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata, error) {
+// Returns how many rows changed.
+//
+// Rows are written in transactions of coldTierMetadataBatchSize, and the tier
+// cache is invalidated once per database/measurement per committed batch
+// (#1188). One write — and one invalidation — per object was a burst on
+// exactly the case this sync exists for, a restored or lost arc.db, where
+// every object in the bucket is unseen: each invalidation bumps the
+// process-wide generation and discards every concurrent tier-cache fill.
+func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	lister, ok := m.coldBackend.(storage.ObjectLister)
 	if !ok {
-		return 0, nil, fmt.Errorf("cold backend does not support ListObjects")
+		return 0, fmt.Errorf("cold backend does not support ListObjects")
 	}
 	objects, err := lister.ListObjects(ctx, "")
 	if err != nil {
-		return 0, nil, fmt.Errorf("failed to list cold objects: %w", err)
+		return 0, fmt.Errorf("failed to list cold objects: %w", err)
 	}
 
 	// One query for the cold row set, as the hot scan does. Skipping rows
 	// that are already cold is what keeps this pass from writing at all in
 	// steady state: every write invalidates the tier cache a query-serving
-	// node is using.
-	coldRows, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	// node is using. Paths and sizes only, and without quarantined rows: a
+	// quarantined row's key is one no backend will list (#758), so it would
+	// show up as "missing" on every node, every cycle.
+	unseen, err := m.metadata.ColdFilePathsAndSizes(ctx, TierCold)
 	if err != nil {
-		return 0, nil, fmt.Errorf("failed to load cold tier paths: %w", err)
-	}
-	unseen := make(map[string]bool, len(coldRows))
-	for _, f := range coldRows {
-		// A quarantined row's key is one no backend will list (#758), so
-		// it would show up as "missing" on every node, every cycle.
-		if f.QuarantinedAt != nil {
-			continue
-		}
-		unseen[f.Path] = true
+		return 0, fmt.Errorf("failed to load cold tier paths: %w", err)
 	}
 	cleaned := m.cleanupHotOnlyColdCopies(ctx, objects, unseen)
 	for path := range cleaned {
 		delete(unseen, path)
 	}
 
-	synced, unparseable, quarantined := 0, 0, 0
+	synced := 0
+	quarantined := 0
+	batch := make([]FileMetadata, 0, coldTierMetadataBatchSize)
+	// flushBatch writes the staged rows in one transaction and invalidates
+	// the tier cache for what it wrote before returning, on every path —
+	// including a context error part way through the per-row fallback.
+	// Per flush rather than once at the end: a query whose tier-cache fill
+	// read before this batch committed and stored after it would otherwise
+	// keep the pre-sync tier set until the whole walk finished.
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		touched := make(map[tierCacheScope]struct{})
+		defer m.metadata.invalidateTierCacheScopes(touched)
+		defer func() { batch = batch[:0] }()
+
+		notWritten, batchScopes, err := m.metadata.recordColdFilesBatch(ctx, batch, time.Time{})
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			// Preserve the former per-file error handling if one bad row makes
+			// an atomic batch fail: record the rest and report only that row.
+			// A failed row is logged and skipped, as before batching; it does
+			// not fail the sync, which would halt this cycle's migration.
+			m.logger.Warn().Int("files", len(batch)).Err(err).Msg("Failed to record cold file batch, retrying files individually")
+			for _, file := range batch {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				migratedAt := time.Time{}
+				if file.MigratedAt != nil {
+					migratedAt = *file.MigratedAt
+				}
+				wrote, err := m.metadata.recordColdFile(ctx, &file, migratedAt)
+				if err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					m.logger.Warn().Str("path", file.Path).Err(err).Msg("Failed to record cold file, skipping")
+					continue
+				}
+				if !wrote {
+					quarantined++
+					continue
+				}
+				touched[tierCacheScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
+				synced++
+			}
+			return nil
+		}
+		for scope := range batchScopes {
+			touched[scope] = struct{}{}
+		}
+		var quarantinedPaths map[string]struct{}
+		if len(notWritten) > 0 {
+			quarantinedPaths = make(map[string]struct{}, len(notWritten))
+			for _, path := range notWritten {
+				quarantinedPaths[path] = struct{}{}
+			}
+		}
+		for _, file := range batch {
+			if _, ok := quarantinedPaths[file.Path]; ok {
+				// Quarantined (#1086 stage C added that guard). The row is
+				// already the record that this key is unusable, and before the
+				// guard every cycle re-upserted it for as long as the listing
+				// kept returning the object. Not counted as synced.
+				quarantined++
+				continue
+			}
+			synced++
+		}
+		return nil
+	}
+
+	unparseable := 0
 	for _, obj := range objects {
-		// Past the deadline every remaining upsert would fail and log; stop
-		// with what was recorded — the next cycle continues from there.
+		// Past the deadline every remaining upsert would fail; stop with what
+		// was recorded — at most one staged batch is dropped, and the next
+		// cycle re-discovers it.
 		if err := ctx.Err(); err != nil {
-			return synced, coldRows, err
+			return synced, err
 		}
 		if _, ok := cleaned[obj.Path]; ok {
 			synced++
@@ -1129,7 +1232,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		if first, _, _ := strings.Cut(obj.Path, "/"); storage.IsReservedRootDir(first) {
 			continue
 		}
-		if unseen[obj.Path] {
+		if _, ok := unseen[obj.Path]; ok {
 			delete(unseen, obj.Path)
 			continue
 		}
@@ -1162,61 +1265,57 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 			SizeBytes:     obj.Size,
 			CreatedAt:     obj.LastModified,
 		}
-		wrote, err := m.metadata.RecordColdFile(ctx, file, obj.LastModified)
-		if err != nil {
-			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to record cold file, skipping")
-			continue
-		}
-		if !wrote {
-			// Quarantined (#1086 stage C added that guard). The row is
-			// already the record that this key is unusable, and before the
-			// guard every cycle re-upserted it for as long as the listing
-			// kept returning the object. Not counted as synced and not
-			// appended to coldRows: the sweep must not act on it either.
-			quarantined++
-			continue
-		}
-		synced++
-		// As recorded: the sweep needs the tier and the migration stamp.
 		migratedAt := obj.LastModified
 		if migratedAt.IsZero() {
 			migratedAt = time.Now()
 		}
 		file.Tier = TierCold
 		file.MigratedAt = &migratedAt
-		coldRows = append(coldRows, *file)
+		batch = append(batch, *file)
+		if len(batch) == coldTierMetadataBatchSize {
+			if err := flushBatch(); err != nil {
+				return synced, err
+			}
+		}
 	}
+	if err := flushBatch(); err != nil {
+		return synced, err
+	}
+	objectCount := len(objects)
+	objects = nil
+	cleaned = nil
 
 	// A reader may have recorded a listed cold object before the primary
 	// removed it. Revert that stale row only after this node has the hot copy;
 	// checking only missing cold objects avoids HEADs for steady-state rows.
-	for i := range coldRows {
-		file := &coldRows[i]
-		if !unseen[file.Path] || file.QuarantinedAt != nil || !m.IsHotOnly(ctx, file.Database) {
+	// unseen now holds exactly those: every listed path was deleted from it
+	// above, and it never held a quarantined row. The database is the key's
+	// first segment, as every writer of a tier row lays it out.
+	for path, size := range unseen {
+		database, _, _ := strings.Cut(path, "/")
+		if !m.IsHotOnly(ctx, database) {
 			continue
 		}
 		if m.manifest != nil {
-			if size, ok := m.manifest.ManifestEntry(file.Path); !ok || size != file.SizeBytes {
+			if want, ok := m.manifest.ManifestEntry(path); !ok || want != size {
 				continue
 			}
 		}
-		hotExists, err := m.hotBackend.Exists(ctx, file.Path)
+		hotExists, err := m.hotBackend.Exists(ctx, path)
 		if err != nil {
-			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Could not verify hot replica for missing hot-only cold object")
+			m.logger.Warn().Err(err).Str("path", path).Msg("Could not verify hot replica for missing hot-only cold object")
 			continue
 		}
 		if !hotExists {
 			continue
 		}
-		updated, err := m.metadata.UpdateTierIfCurrent(ctx, file.Path, TierCold, TierHot)
+		updated, err := m.metadata.UpdateTierIfCurrent(ctx, path, TierCold, TierHot)
 		if err != nil {
-			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Could not restore hot-only metadata for replicated file")
+			m.logger.Warn().Err(err).Str("path", path).Msg("Could not restore hot-only metadata for replicated file")
 			continue
 		}
 		if updated {
-			file.Tier = TierHot
-			file.MigratedAt = nil
-			delete(unseen, file.Path)
+			delete(unseen, path)
 			synced++
 		}
 	}
@@ -1237,18 +1336,18 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 
 	// Debug: the cycle summary already reports cold_synced.
 	m.logger.Debug().
-		Int("objects", len(objects)).
+		Int("objects", objectCount).
 		Int("synced", synced).
 		Int("unparseable", unparseable).
 		Int("quarantined_skipped", quarantined).
 		Msg("Cold tier metadata sync completed")
-	return synced, coldRows, nil
+	return synced, nil
 }
 
 // cleanupHotOnlyColdCopies removes cold objects only when the primary still
 // has a hot metadata row and copy. It uses the already-fetched cold listing,
 // so recovery does not depend on migration history surviving a failover.
-func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storage.ObjectInfo, coldRows map[string]bool) map[string]struct{} {
+func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storage.ObjectInfo, coldRows map[string]int64) map[string]struct{} {
 	cleaned := make(map[string]struct{})
 	if m.roleGated() || m.coldBackend == nil {
 		return cleaned
@@ -1262,7 +1361,7 @@ func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storag
 		}
 		// A cold row belongs to the orphan/reconciliation paths. Avoid a hot
 		// store HEAD for it; only the failed-flip state is eligible here.
-		if coldRows[object.Path] || !strings.HasSuffix(object.Path, ".parquet") {
+		if _, exists := coldRows[object.Path]; exists || !strings.HasSuffix(object.Path, ".parquet") {
 			continue
 		}
 		info, err := m.parseFilePath(object.Path)

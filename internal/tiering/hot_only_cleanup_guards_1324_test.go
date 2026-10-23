@@ -32,7 +32,7 @@ func TestHotOnlyCleanupSkipsColdRowsWithoutManifest(t *testing.T) {
 	}
 	m.manifest = nil
 
-	cleaned := m.cleanupHotOnlyColdCopies(ctx, []storage.ObjectInfo{{Path: gateDailyA, Size: 7}}, map[string]bool{gateDailyA: true})
+	cleaned := m.cleanupHotOnlyColdCopies(ctx, []storage.ObjectInfo{{Path: gateDailyA, Size: 7}}, map[string]int64{gateDailyA: 7})
 	if len(cleaned) != 0 {
 		t.Fatalf("cleaned = %v, want no cleanup for a cold metadata row", cleaned)
 	}
@@ -58,7 +58,7 @@ func TestHotOnlyCleanupRequiresMatchingManifestEntry(t *testing.T) {
 			}
 			m.manifest = &fakeManifest{hot: m.hotBackend, entries: entries}
 
-			cleaned := m.cleanupHotOnlyColdCopies(context.Background(), []storage.ObjectInfo{{Path: gateDailyA, Size: 7}}, map[string]bool{})
+			cleaned := m.cleanupHotOnlyColdCopies(context.Background(), []storage.ObjectInfo{{Path: gateDailyA, Size: 7}}, map[string]int64{})
 			if len(cleaned) != 0 {
 				t.Fatalf("cleaned = %v, want cold object preserved", cleaned)
 			}
@@ -74,7 +74,7 @@ func TestHotOnlyCleanupRequiresMatchingObjectSize(t *testing.T) {
 	defer cleanup()
 	m.manifest = nil
 
-	cleaned := m.cleanupHotOnlyColdCopies(context.Background(), []storage.ObjectInfo{{Path: gateDailyA, Size: 8}}, map[string]bool{})
+	cleaned := m.cleanupHotOnlyColdCopies(context.Background(), []storage.ObjectInfo{{Path: gateDailyA, Size: 8}}, map[string]int64{})
 	if len(cleaned) != 0 {
 		t.Fatalf("cleaned = %v, want cold object preserved for size mismatch", cleaned)
 	}
@@ -89,7 +89,7 @@ func TestHotOnlyCleanupSkipsRoleGatedNode(t *testing.T) {
 	m.manifest = nil
 	m.clusterGate = &mockGate{role: "reader"}
 
-	cleaned := m.cleanupHotOnlyColdCopies(context.Background(), []storage.ObjectInfo{{Path: gateDailyA, Size: 7}}, map[string]bool{})
+	cleaned := m.cleanupHotOnlyColdCopies(context.Background(), []storage.ObjectInfo{{Path: gateDailyA, Size: 7}}, map[string]int64{})
 	if len(cleaned) != 0 {
 		t.Fatalf("cleaned = %v, want no cleanup on a reader", cleaned)
 	}
@@ -111,7 +111,7 @@ func TestHotOnlyCleanupContinuesAfterDeleteFailure(t *testing.T) {
 	m.coldBackend = coldWithFailure
 	objects := []storage.ObjectInfo{{Path: gateDailyA, Size: 7}, {Path: second, Size: 7}}
 
-	cleaned := m.cleanupHotOnlyColdCopies(ctx, objects, map[string]bool{})
+	cleaned := m.cleanupHotOnlyColdCopies(ctx, objects, map[string]int64{})
 	if _, ok := cleaned[gateDailyA]; ok {
 		t.Fatal("failed first delete was reported as cleaned")
 	}
@@ -138,7 +138,7 @@ func TestHotOnlyCleanupDoesNotCountObjectStillReportedByStat(t *testing.T) {
 	m.manifest = nil
 	m.coldBackend = &staleStatBackend{mockBackend: cold}
 
-	cleaned := m.cleanupHotOnlyColdCopies(context.Background(), []storage.ObjectInfo{{Path: gateDailyA, Size: 7}}, map[string]bool{})
+	cleaned := m.cleanupHotOnlyColdCopies(context.Background(), []storage.ObjectInfo{{Path: gateDailyA, Size: 7}}, map[string]int64{})
 	if len(cleaned) != 0 {
 		t.Fatalf("cleaned = %v, want object still present in stale stat", cleaned)
 	}
@@ -160,7 +160,7 @@ func TestHotOnlyColdRowWithoutManifestEntryIsNotReverted(t *testing.T) {
 	m.coldBackend = &coldLister{mockBackend: cold, lastModified: time.Now().Add(-time.Hour)}
 	m.manifest = &fakeManifest{hot: hot, entries: map[string]int64{}}
 
-	if _, _, err := m.syncColdTierMetadata(ctx); err != nil {
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
 		t.Fatalf("syncColdTierMetadata: %v", err)
 	}
 	if got := fileMeta(t, m, gateDailyA).Tier; got != TierCold {
