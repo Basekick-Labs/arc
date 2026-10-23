@@ -138,12 +138,14 @@ func newManifestDeleteRigWithBackend(t *testing.T, peerAddr string, backend stor
 		logger:    logger,
 		ctx:       ctx,
 	}
+	// Through the same decision Start makes (#1354), so these puller tests
+	// also pin that replication on keeps the puller's callbacks.
 	c.mu.Lock()
-	err := c.startFilePullerLocked()
+	c.startManifestCallbacksLocked()
 	c.mu.Unlock()
-	if err != nil {
+	if c.puller == nil {
 		cancel()
-		t.Fatalf("startFilePullerLocked: %v", err)
+		t.Fatal("startManifestCallbacksLocked did not start the puller")
 	}
 	t.Cleanup(func() {
 		c.puller.Stop()

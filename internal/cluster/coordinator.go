@@ -787,13 +787,12 @@ func (c *Coordinator) Start() error {
 		go c.ackCompactionPauseIfActive()
 	}
 
-	// Wire the peer file replication puller (Enterprise Phase 2). This runs
-	// on every cluster node (not just readers) because nodes of any role may
-	// need to pull files they didn't originate — the Raft manifest is the
-	// source of truth for who has what, regardless of role.
-	//
-	// Gated on ReplicationEnabled so OSS and standalone deployments never
-	// pay any cost. The FeatureClustering license check already ran in
+	// Wire what this node does on manifest changes: the peer file
+	// replication puller (Enterprise Phase 2) when ReplicationEnabled — on
+	// every role, since any node may need files it didn't originate — and
+	// otherwise, on a shared object store, the delete-only callbacks every
+	// such node needs (#1354). OSS and standalone never reach this. The
+	// FeatureClustering license check already ran in
 	// validateClusteringLicense above.
 	c.startManifestCallbacksLocked()
 
@@ -1368,6 +1367,7 @@ func (c *Coordinator) observeSharedManifestDelete(path, reason string) {
 	c.logger.Debug().
 		Str("path", path).
 		Str("reason", reason).
+		Str("backend", c.storage.Type()).
 		Msg("FSM delete observed; shared backend, no local action needed")
 }
 

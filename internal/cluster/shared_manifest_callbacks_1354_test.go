@@ -15,6 +15,10 @@ import (
 // a shared-object-store cluster: replication off, so no puller, through the
 // same callback decision Start makes.
 func newSharedNoReplicationRig(t *testing.T, backend storage.Backend) (*Coordinator, *fakeTierRecorder) {
+	return newSharedRig(t, backend, &config.ClusterConfig{ClusterName: "shared", SharedSecret: "shared-secret", ReplicationEnabled: false})
+}
+
+func newSharedRig(t *testing.T, backend storage.Backend, cfg *config.ClusterConfig) (*Coordinator, *fakeTierRecorder) {
 	t.Helper()
 	raftNode := startRaftNode(t, "shared-node", allocFreePort(t), true)
 	t.Cleanup(func() { _ = raftNode.Stop() })
@@ -24,7 +28,7 @@ func newSharedNoReplicationRig(t *testing.T, backend storage.Backend) (*Coordina
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	c := &Coordinator{
-		cfg:       &config.ClusterConfig{ClusterName: "shared", SharedSecret: "shared-secret", ReplicationEnabled: false},
+		cfg:       cfg,
 		storage:   backend,
 		raftNode:  raftNode,
 		localNode: NewNode("shared-node", "shared-node", RoleWriter, "shared"),
@@ -106,5 +110,19 @@ func TestLocalStoreWithoutReplication_RegistersNoManifestCallbacks(t *testing.T)
 	registerAndDelete(t, c, "testdb/cpu/2026/10/08/m_daily.parquet", "tiering:migrated")
 	if reports := recorder.unlinkReports(); len(reports) != 0 {
 		t.Fatalf("tier reports = %+v, want none on local storage without replication", reports)
+	}
+}
+
+// Replication on but the puller cannot start (here: no shared secret): the
+// node is still on a shared store, so it registers the shared callbacks
+// rather than none.
+func TestSharedStorePullerStartFailure_FallsBackToSharedCallbacks(t *testing.T) {
+	c, recorder := newSharedRig(t, newMemBackend(), &config.ClusterConfig{ClusterName: "shared", ReplicationEnabled: true})
+	if c.puller != nil {
+		t.Fatal("puller started without a shared secret")
+	}
+	registerAndDelete(t, c, "testdb/cpu/2026/10/08/m_daily.parquet", "tiering:migrated")
+	if reports := recorder.unlinkReports(); len(reports) != 1 {
+		t.Fatalf("tier reports = %+v, want the migration reported", reports)
 	}
 }
