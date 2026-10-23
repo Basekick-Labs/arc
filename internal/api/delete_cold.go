@@ -2,14 +2,18 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // A row DELETE and the cold tier (#1350). Files tiering moved to cold storage
@@ -37,7 +41,7 @@ const coldPartialWhy = "are in cold storage and only some of their rows match; a
 
 // coldHotCopyWhy says why a cold file with matching rows was left because its
 // hot copy is still there.
-const coldHotCopyWhy = "are in cold storage while a copy is still in hot storage (a move that has not finished, or a copy left in hot storage) and were left as they are; retry once the move completes"
+const coldHotCopyWhy = "are in cold storage while a copy is still in hot storage and were left as they are; a retry handles them once the move completes (a copy a policy change left in cold storage stays until the hot-only cleanup removes it, or until the file is moved again under the new policy)"
 
 // deleteColdTier is what a DELETE needs from tiering. *tiering.Manager.
 type deleteColdTier interface {
@@ -75,9 +79,8 @@ type coldPass struct {
 	// failed: objects whose rows could not be counted, or deleted.
 	failed []string
 	// missingRows: tier rows of this measurement whose object the listing
-	// does not show; hotCopies says which of them still have a hot file.
+	// does not show (checked again before anything is done with them).
 	missingRows []string
-	hotCopies   map[string]bool
 	// notExamined says why cold storage was not looked at, "" when it was or
 	// when this node has no cold storage configured.
 	notExamined string
@@ -181,7 +184,9 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 		if !hot && h.coordinator != nil {
 			// A manifest entry is a hot file the cluster still lists, here
 			// or on a peer that may pull it back.
-			_, hot = h.coordinator.GetFileEntry(f.path)
+			if e, ok := h.coordinator.GetFileEntry(f.path); ok && e != nil {
+				hot = raft.HotTier(e.Tier)
+			}
 		}
 		switch {
 		case hot:
@@ -202,12 +207,6 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 	for _, r := range rows {
 		if !listed[r.Path] {
 			c.missingRows = append(c.missingRows, r.Path)
-			if inHot[r.Path] {
-				if c.hotCopies == nil {
-					c.hotCopies = map[string]bool{}
-				}
-				c.hotCopies[r.Path] = true
-			}
 		}
 	}
 	return c
@@ -215,9 +214,10 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 
 // countCold counts each file's rows and the rows where does not match, in
 // chunks with union_by_name (a file older than a column the clause names
-// reads it as NULL, so its rows are not matched). A chunk that fails is
-// counted file by file; a file that still fails is returned in failed — never
-// skipped as "no match".
+// reads it as NULL when another file in the chunk has it, so its rows are not
+// matched). A chunk that fails is counted file by file: a file the clause
+// cannot bind (none of the chunk had the column) matches nothing; one that
+// fails otherwise is returned in failed — never skipped as "no match".
 func (h *DeleteHandler) countCold(ctx context.Context, files []coldFile, where string) ([]coldFile, []string) {
 	var out []coldFile
 	var failed []string
@@ -231,6 +231,14 @@ func (h *DeleteHandler) countCold(ctx context.Context, files []coldFile, where s
 		h.logger.Warn().Err(err).Int("files", len(chunk)).Msg("Counting cold files in one query failed; counting them one by one")
 		for _, f := range chunk {
 			one, err := h.countColdChunk(ctx, []coldFile{f}, where)
+			var de *duckdb.Error
+			if errors.As(err, &de) && de.Type == duckdb.ErrorTypeBinder {
+				// The clause names a column this file does not have (an
+				// older file): it matches nothing here, as a DELETE record
+				// that cannot bind does (delete_records.go). Not a failure,
+				// or every DELETE naming a newer column would answer 207.
+				continue
+			}
 			if err != nil {
 				h.logger.Warn().Err(err).Str("file", f.path).Msg("Could not count the rows of a cold file; it is reported as failed")
 				failed = append(failed, f.path)
@@ -351,16 +359,29 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 		c.deletedRows += f.total
 		retire = append(retire, f.path)
 	}
-	// Rows whose object is gone: pointed back at a hot copy that still
-	// exists, as retention does, or retired.
+	// Rows whose object the listing did not show: checked again now, as
+	// retention checks at the moment it acts (#1350 review H1). A migration
+	// may have copied the object since the listing; its row must stay. Then
+	// pointed back at a hot copy that still exists, or retired.
 	for _, p := range c.missingRows {
-		if c.hotCopies[p] {
+		if ctx.Err() != nil {
+			break
+		}
+		coldSize, err := c.backend.StatFile(ctx, p)
+		if err != nil || coldSize >= 0 {
+			continue
+		}
+		hotSize, err := h.storage.StatFile(ctx, p)
+		switch {
+		case err != nil:
+			continue
+		case hotSize >= 0:
 			if err := h.coldTier.RevertColdRowToHot(context.WithoutCancel(ctx), p); err != nil {
 				h.logger.Warn().Err(err).Str("file", p).Msg("Could not point a cold row whose object is gone back at its hot copy")
 			}
-			continue
+		default:
+			retire = append(retire, p)
 		}
-		retire = append(retire, p)
 	}
 	if len(retire) > 0 {
 		// Detached: the objects are gone whatever happens to the request.
@@ -405,12 +426,11 @@ func (c *coldPass) applyCold(resp *DeleteResponse, dryRun bool) bool {
 		resp.DeletedCount += c.deletedRows
 		resp.ColdDeletedFiles = baseNames(c.deleted)
 	}
-	resp.AffectedFiles += len(resp.ColdDeletedFiles) + len(c.partial) + len(c.hotCopy)
+	// A file with a hot copy is the hot side's: already counted (and, when
+	// refused, reported) there.
+	resp.AffectedFiles += len(resp.ColdDeletedFiles) + len(c.partial)
 	resp.ColdFiles = coldBases(c.partial)
 	resp.ColdRowsNotDeleted = c.partialRows()
-	for _, f := range c.hotCopy {
-		resp.ColdRowsNotDeleted += f.matched()
-	}
 	resp.ColdNotExamined = c.notExamined
 
 	var why []string
@@ -437,9 +457,14 @@ func (c *coldPass) applyCold(resp *DeleteResponse, dryRun bool) bool {
 	}
 	if !dryRun {
 		resp.FailedFiles = append(resp.FailedFiles, coldBases(c.partial)...)
-		resp.FailedFiles = append(resp.FailedFiles, coldBases(c.hotCopy)...)
+		for _, b := range coldBases(c.hotCopy) {
+			if !slices.Contains(resp.FailedFiles, b) {
+				resp.FailedFiles = append(resp.FailedFiles, b)
+			}
+		}
 		resp.FailedFiles = append(resp.FailedFiles, baseNames(c.failed)...)
 	}
+	resp.Success = false
 	msg := "Cold storage: " + strings.Join(why, "; ")
 	if resp.Error != "" {
 		resp.Error += "; " + msg

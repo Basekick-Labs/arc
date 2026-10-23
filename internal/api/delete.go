@@ -48,7 +48,7 @@ var errManifestFailure = errors.New("cluster manifest update failed")
 
 // Why a DELETE left a file alone for tiering, in its response.
 const (
-	movingWhy        = "are being moved to cold storage, or have a copy there, and were left as they are; retry once the move completes (in cold storage a DELETE removes a file whose rows all match, and reports one whose rows only partly match)"
+	movingWhy        = "are being moved to cold storage, or have a copy there, and were left as they are; a retry handles them once the move completes (in cold storage a DELETE removes a file whose rows all match, and reports one whose rows only partly match; a copy a policy change left in cold storage stays until the hot-only cleanup removes it, or until the file is moved again under the new policy)"
 	coldUncheckedWhy = "were left as they are because cold storage could not be checked for a copy of them"
 )
 

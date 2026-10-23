@@ -282,17 +282,7 @@ func (m *Manager) ColdFilesForMeasurement(ctx context.Context, database, measure
 	if m == nil || m.metadata == nil {
 		return nil, nil
 	}
-	rows, err := m.metadata.GetFilesForQuery(ctx, database, measurement, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	out := rows[:0]
-	for _, r := range rows {
-		if r.Tier == TierCold && r.QuarantinedAt == nil {
-			out = append(out, r)
-		}
-	}
-	return out, nil
+	return m.metadata.coldFilesForMeasurement(ctx, database, measurement)
 }
 
 // RecordRestoredColdFiles records a batch of files a restore has just written

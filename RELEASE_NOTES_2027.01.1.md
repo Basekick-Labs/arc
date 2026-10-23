@@ -1521,8 +1521,12 @@ A DELETE now looks at cold storage too:
 - A cold file whose hot copy still exists (a move that has not finished) is
   never deleted from cold storage. It is reported, and a retry once the move
   completes handles it.
+- A cold file that does not have a column the clause names (an older file,
+  from before the column existed) matches nothing, as for hot files.
 - A cold tier row whose object is gone is retired, or pointed back at the
-  file's hot copy if one exists, as retention does.
+  file's hot copy if one exists. Both storage tiers are checked again at
+  that moment, as retention does, so a file a migration has just copied
+  keeps its row.
 
 Every cold file of the measurement is read to count its matching rows, so a
 DELETE on a measurement with many files in cold storage costs one read of
@@ -1533,10 +1537,11 @@ some of its files reached cold storage, a DELETE could rewrite a file that
 still had a cold copy. The next cold sync then recorded the old copy, and
 queries returned the deleted rows again and counted the kept ones twice. A
 DELETE now checks cold storage for a copy of every daily file, whatever the
-database's current policy, and leaves such a file until the hot-only cleanup
-removes the copy. As a consequence, while cold storage is unreachable, a
-DELETE that touches a daily file answers the retryable 503, even for recent
-data.
+database's current policy, and leaves such a file as it is. In a `hot_only`
+database the hot-only cleanup then removes the copy; with a longer hot age,
+the file stays until it is moved to cold storage again under the new
+policy. As a consequence, while cold storage is unreachable, a DELETE that
+touches a daily file answers the retryable 503, even for recent data.
 
 ### A compaction run within a minute of its files' registration no longer leaves them behind, counted twice ([#1358](https://github.com/Basekick-Labs/arc/issues/1358))
 

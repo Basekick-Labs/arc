@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -215,22 +217,109 @@ func TestDeleteDryRunReportsColdFiles(t *testing.T) {
 }
 
 // A file both in hot storage and in cold (a move that has not released the
-// hot copy) is the hot side's: its cold copy is never deleted, and it is not
-// counted twice.
+// hot copy) is the hot side's: the claim refuses the hot copy, the cold copy
+// is never deleted, and the file is reported once.
 func TestDeleteLeavesTheColdCopyOfAFileStillInHotStorage(t *testing.T) {
 	r := newColdDeleteRig(t)
 	r.parquet(coldWhole, "h0")
 	r.coldFile(coldWhole, "h0")
+	r.h.moveClaims = &fakeMoveClaims{moving: map[string]bool{coldWhole: true}}
 
 	code, out := r.delete(`{"database":"db","measurement":"cpu","where":"host = 'h0'","confirm":true}`)
-	if !r.coldExists(coldWhole) {
-		t.Fatal("deleted the cold copy of a file still in hot storage")
+	if !r.coldExists(coldWhole) || !r.exists(coldWhole) {
+		t.Fatal("a copy of a file in both tiers was deleted")
 	}
 	if code != 207 || !strings.Contains(out.Error, "copy is still in hot storage") {
 		t.Fatalf("got %d %q, want 207 naming the hot copy", code, out.Error)
 	}
-	if out.DeletedCount != 1 {
-		t.Fatalf("deleted_count %d, want 1 (the hot copy's row, once)", out.DeletedCount)
+	if out.DeletedCount != 0 || out.ColdRowsNotDeleted != 0 || len(out.FailedFiles) != 1 || out.AffectedFiles != 1 {
+		t.Fatalf("got %+v, want nothing deleted and the file reported once", out)
+	}
+}
+
+// fakeColdDeleteCoordinator is a cluster as the cold pass sees it: a manifest
+// entry for a path means the cluster still has it in hot storage.
+type fakeColdDeleteCoordinator struct {
+	entries map[string]raft.FileEntry
+}
+
+func (f *fakeColdDeleteCoordinator) BatchFileOpsInManifest([]raft.BatchFileOp) error { return nil }
+func (f *fakeColdDeleteCoordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
+	e, ok := f.entries[path]
+	return &e, ok
+}
+func (f *fakeColdDeleteCoordinator) IsPrimaryWriter() bool { return true }
+func (f *fakeColdDeleteCoordinator) Role() string          { return "writer" }
+func (f *fakeColdDeleteCoordinator) LocalNodeID() string   { return "w1" }
+
+// On a cluster, a cold object the manifest still lists in hot storage (on
+// another node, which could pull it back) is never deleted.
+func TestDeleteLeavesAColdFileTheManifestStillLists(t *testing.T) {
+	r := newColdDeleteRig(t)
+	r.coldFile(coldWhole, "h0")
+	r.h.coordinator = &fakeColdDeleteCoordinator{entries: map[string]raft.FileEntry{coldWhole: {Path: coldWhole, Tier: "hot"}}}
+	h := r.h
+	c := h.scanCold(context.Background(), "db", "cpu", "host = 'h0'")
+	if c == nil || len(c.hotCopy) != 1 || len(c.whole) != 0 {
+		t.Fatalf("scan %+v, want the file held as the hot side's", c)
+	}
+	// A manifest entry recorded as cold (older manifests) is not a hot copy.
+	r.h.coordinator = &fakeColdDeleteCoordinator{entries: map[string]raft.FileEntry{coldWhole: {Path: coldWhole, Tier: "cold"}}}
+	if c := h.scanCold(context.Background(), "db", "cpu", "host = 'h0'"); c == nil || len(c.whole) != 1 {
+		t.Fatalf("scan %+v, want a cold manifest entry not to count as a hot copy", c)
+	}
+}
+
+// listFailingBackend is a cold store whose listing fails.
+type listFailingBackend struct{ storage.Backend }
+
+func (b listFailingBackend) ListObjects(context.Context, string) ([]storage.ObjectInfo, error) {
+	return nil, errors.New("bucket unreachable")
+}
+
+// A cold listing that fails is reported, never taken as an empty cold tier.
+func TestDeleteSaysWhenTheColdListingFails(t *testing.T) {
+	r := newColdDeleteRig(t)
+	r.tier.backend = listFailingBackend{r.cold}
+	code, out := r.delete(`{"database":"db","measurement":"cpu","where":"host = 'h0'","confirm":true}`)
+	if code != 207 || !strings.Contains(out.ColdNotExamined, "bucket unreachable") {
+		t.Fatalf("got %d %+v, want 207 naming the listing failure", code, out)
+	}
+}
+
+// A cold file older than a column the clause names matches nothing there: not
+// a failure, or every DELETE naming a newer column would answer 207.
+func TestDeleteOfANewerColumnSkipsOlderColdFiles(t *testing.T) {
+	r := newColdDeleteRig(t)
+	r.coldFile(coldWhole, "h0")
+	code, out := r.delete(`{"database":"db","measurement":"cpu","where":"region = 'eu'","confirm":true}`)
+	if code != 200 || len(out.FailedFiles) != 0 || !r.coldExists(coldWhole) {
+		t.Fatalf("got %d %+v, want 200 with the older cold file untouched", code, out)
+	}
+}
+
+// #1350 review H1: a row the listing did not show is checked again before
+// it is retired. A migration may have copied its object since.
+func TestRunColdKeepsARowWhoseObjectAppearedSinceTheListing(t *testing.T) {
+	r := newColdDeleteRig(t)
+	r.coldFile(coldWhole, "h0") // the object is there now
+	c := &coldPass{backend: r.cold, missingRows: []string{coldWhole}}
+	r.h.runCold(context.Background(), c, "host = 'h0'")
+	if len(r.tier.retired) != 0 || len(r.tier.reverted) != 0 {
+		t.Fatalf("retired %v reverted %v, want the row of an object that exists left alone", r.tier.retired, r.tier.reverted)
+	}
+}
+
+// A whole-match file that no longer matches whole when it is deleted (it
+// changed between the count and the delete) is reported, not deleted.
+func TestRunColdRecountsBeforeDeleting(t *testing.T) {
+	r := newColdDeleteRig(t)
+	r.coldFile(coldWhole, "h0", "h1")
+	size, _ := r.cold.StatFile(context.Background(), coldWhole)
+	c := &coldPass{backend: r.cold, whole: []coldFile{{path: coldWhole, queryPath: filepath.Join(r.coldRoot, coldWhole), size: size, total: 2}}}
+	r.h.runCold(context.Background(), c, "host = 'h0'")
+	if !r.coldExists(coldWhole) || len(c.partial) != 1 || len(c.deleted) != 0 {
+		t.Fatalf("pass %+v, want the file kept and reported partial", c)
 	}
 }
 
