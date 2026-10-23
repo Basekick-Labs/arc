@@ -1494,6 +1494,55 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A row DELETE reaches cold storage ([#1350](https://github.com/Basekick-Labs/arc/issues/1350))
+
+A row DELETE (`POST /api/v1/delete`) read and rewrote hot-tier files only.
+Rows in files that tiering had moved to cold storage were never matched, and
+the response gave no sign: a clause whose rows were all in cold storage
+answered 200 with `affected_files: 0`, and queries kept returning those rows.
+
+A DELETE now looks at cold storage too:
+- **A cold file whose rows all match is deleted**, the way retention deletes
+  cold files, and its rows are counted in `deleted_count`. The response
+  lists these files in `cold_deleted_files`.
+- **A cold file where only some rows match is left as it is.** The answer is
+  207: `cold_files` and `failed_files` name the file, and
+  `cold_rows_not_deleted` counts its matching rows. Arc does not rewrite part
+  of a cold file: cold storage has nothing that keeps readers from counting
+  the kept rows twice while the old file is replaced. Narrow the clause, or
+  delete the whole file's rows, or let retention remove it.
+- **A dry run reports both kinds.** `deleted_count` includes only the rows
+  the real run would delete.
+- **Cold rows that would be deleted count against `max_rows_per_delete` and
+  the confirmation threshold.**
+- If cold storage is configured but could not be examined (its backend is
+  unusable on this node, or listing it failed), the response says so in
+  `cold_not_examined` and answers 207 instead of 200.
+- A cold file whose hot copy still exists (a move that has not finished) is
+  never deleted from cold storage. It is reported, and a retry once the move
+  completes handles it.
+- A cold file that does not have a column the clause names (an older file,
+  from before the column existed) matches nothing, as for hot files.
+- A cold tier row whose object is gone is retired, or pointed back at the
+  file's hot copy if one exists. Both storage tiers are checked again at
+  that moment, as retention does, so a file a migration has just copied
+  keeps its row.
+
+Every cold file of the measurement is read to count its matching rows, so a
+DELETE on a measurement with many files in cold storage costs one read of
+each file's footer and the columns the clause uses.
+
+Also fixed: in a database made `hot_only` (or given a longer hot age) after
+some of its files reached cold storage, a DELETE could rewrite a file that
+still had a cold copy. The next cold sync then recorded the old copy, and
+queries returned the deleted rows again and counted the kept ones twice. A
+DELETE now checks cold storage for a copy of every daily file, whatever the
+database's current policy, and leaves such a file as it is. In a `hot_only`
+database the hot-only cleanup then removes the copy; with a longer hot age,
+the file stays until it is moved to cold storage again under the new
+policy. As a consequence, while cold storage is unreachable, a DELETE that
+touches a daily file answers the retryable 503, even for recent data.
+
 ### A compaction run within a minute of its files' registration no longer leaves them behind, counted twice ([#1358](https://github.com/Basekick-Labs/arc/issues/1358))
 
 On a cluster with a shared object store, a compaction finishes by deleting
