@@ -48,7 +48,7 @@ var errManifestFailure = errors.New("cluster manifest update failed")
 
 // Why a DELETE left a file alone for tiering, in its response.
 const (
-	movingWhy        = "are being moved to cold storage and were left as they are (a DELETE does not reach files in cold storage, so their rows stay once the move completes)"
+	movingWhy        = "are being moved to cold storage, or have a copy there, and were left as they are; retry once the move completes (in cold storage a DELETE removes a file whose rows all match, and reports one whose rows only partly match)"
 	coldUncheckedWhy = "were left as they are because cold storage could not be checked for a copy of them"
 )
 
@@ -179,6 +179,9 @@ type DeleteHandler struct {
 	// flushed may not be in the manifest yet. nil off ingest nodes.
 	pending        PendingRegistrations
 	tieringManager *tiering.Manager
+	// coldTier is tiering as a DELETE of cold files sees it (#1350); nil
+	// without tiering.
+	coldTier deleteColdTier
 	// moveClaims keeps the tiering migrator off a file this DELETE rewrites
 	// (the tiering manager, when tiering is on).
 	moveClaims moveClaimer
@@ -237,7 +240,17 @@ type DeleteResponse struct {
 	// not be flushed first (shared storage, #1265): with allow_unreachable,
 	// the rows they hold are left; without it, why the DELETE was refused.
 	UnflushedNodes []string `json:"unflushed_nodes,omitempty"`
-	Error          string   `json:"error,omitempty"`
+	// Cold storage (#1350). ColdDeletedFiles: cold files whose rows all
+	// matched, deleted (or, in a dry run, to be deleted); their rows are in
+	// deleted_count. ColdFiles: cold files with only some matching rows, left
+	// as they are; ColdRowsNotDeleted counts the matching rows left in cold
+	// storage (never in deleted_count). ColdNotExamined: why cold storage was
+	// not looked at, when it is configured but could not be.
+	ColdDeletedFiles   []string `json:"cold_deleted_files,omitempty"`
+	ColdFiles          []string `json:"cold_files,omitempty"`
+	ColdRowsNotDeleted int64    `json:"cold_rows_not_deleted,omitempty"`
+	ColdNotExamined    string   `json:"cold_not_examined,omitempty"`
+	Error              string   `json:"error,omitempty"`
 }
 
 // DeleteConfigResponse represents delete configuration info
@@ -339,8 +352,10 @@ func (h *DeleteHandler) SetPendingRegistrations(p PendingRegistrations) {
 // SetTieringManager wires rewrite/delete metadata updates into tiering.
 func (h *DeleteHandler) SetTieringManager(tm *tiering.Manager) {
 	h.tieringManager = tm
+	h.coldTier = nil
 	if tm != nil {
 		h.moveClaims = tm
+		h.coldTier = tm
 	}
 }
 
@@ -537,7 +552,11 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	if len(affected) == 0 && rec == nil {
+	// Cold storage (#1350): files tiering moved there, which the scan above
+	// never lists.
+	cold := h.scanCold(ctx, req.Database, req.Measurement, where)
+
+	if len(affected) == 0 && rec == nil && !cold.matters() {
 		if !req.DryRun && leftovers > 0 {
 			// Nothing to rewrite, but a leftover the scan left out (it may
 			// hold the only rows that matched) is still removed.
@@ -564,11 +583,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Calculate total rows to delete
-	var totalToDelete int64
+	// Calculate total rows to delete. Cold files whose rows all match are
+	// deleted too, so their rows count against the limits; matching rows left
+	// in cold storage do not (the DELETE does not remove them).
+	var hotToDelete int64
 	for _, f := range affected {
-		totalToDelete += f.matchCount
+		hotToDelete += f.matchCount
 	}
+	totalToDelete := hotToDelete + cold.wholeRows()
 
 	// Check max rows limit
 	if totalToDelete > int64(h.config.MaxRowsPerDelete) {
@@ -601,9 +623,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			fileNames[i] = filepath.Base(f.path)
 		}
 
-		return c.JSON(DeleteResponse{
+		resp := DeleteResponse{
 			Success:          true,
-			DeletedCount:     totalToDelete,
+			DeletedCount:     hotToDelete,
 			AffectedFiles:    len(affected),
 			RewrittenFiles:   0,
 			ExecutionTimeMs:  float64(time.Since(start).Milliseconds()),
@@ -611,7 +633,11 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			FilesProcessed:   fileNames,
 			UnreachableFiles: unreachable,
 			UnflushedNodes:   unflushed,
-		})
+		}
+		if cold.applyCold(&resp, true) {
+			return c.Status(fiber.StatusMultiStatus).JSON(resp)
+		}
+		return c.JSON(resp)
 	}
 
 	// Execute actual deletion (rewrite files). Partial rewrites publish a new
@@ -660,7 +686,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		for _, f := range affected {
 			again += f.matchCount
 		}
-		if again > totalToDelete {
+		if again > hotToDelete {
 			// Files that arrived since the first count; the DELETE is
 			// recorded already, so it runs on them too.
 			h.logger.Warn().Int64("counted", totalToDelete).Int64("now", again).
@@ -786,6 +812,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 	}
 
+	// Cold files whose rows all match (#1350), before the caches are
+	// dropped below: a cache refilled in between would name deleted objects.
+	h.runCold(ctx, cold, where)
+
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
 	h.db.ClearHTTPCache()
 	h.filesRemoved()
@@ -814,8 +844,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	// A file left for tiering's move is not "retry later": once moved it is in
-	// cold storage, which a DELETE does not reach. It answers 207 with the
-	// reason, like any other file that failed.
+	// cold storage, where only a file whose rows all match is deleted. It
+	// answers 207 with the reason, like any other file that failed.
+	status := fiber.StatusOK
 	if !onlyNotRegistered(len(failedFiles), len(notRegistered)+len(coldUnchecked)) {
 		// A failure that is not only "retry later" is the more general one:
 		// 207, naming both.
@@ -829,9 +860,8 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		if len(coldUnchecked) > 0 {
 			resp.Error += fmt.Sprintf(" (%d of them %s; retry for those)", len(coldUnchecked), coldUncheckedWhy)
 		}
-		return c.Status(fiber.StatusMultiStatus).JSON(resp)
-	}
-	if len(notRegistered) > 0 || len(coldUnchecked) > 0 {
+		status = fiber.StatusMultiStatus
+	} else if len(notRegistered) > 0 || len(coldUnchecked) > 0 {
 		var why []string
 		if len(notRegistered) > 0 {
 			why = append(why, fmt.Sprintf("%d of %d files are not registered in the cluster manifest yet (another writer may still be registering them) and were left as they are", len(notRegistered), len(seen)))
@@ -840,9 +870,20 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			why = append(why, fmt.Sprintf("%d of %d files %s", len(coldUnchecked), len(seen), coldUncheckedWhy))
 		}
 		resp.Error = "Delete incomplete: " + strings.Join(why, "; ") + "; the rows of the other files are deleted; retry to finish"
-		return respondDeleteUnavailable(c, resp)
+		status = fiber.StatusServiceUnavailable
 	}
-
+	// Cold storage last: a matching row left there is not fixed by a retry,
+	// so it turns a 503 "retry to finish" into a 207 (#1350).
+	if cold.applyCold(&resp, false) {
+		status = fiber.StatusMultiStatus
+	}
+	switch status {
+	case fiber.StatusServiceUnavailable:
+		return respondDeleteUnavailable(c, resp)
+	case fiber.StatusMultiStatus:
+		resp.Success = false
+		return c.Status(status).JSON(resp)
+	}
 	return c.JSON(resp)
 }
 
