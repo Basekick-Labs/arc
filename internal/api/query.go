@@ -468,8 +468,7 @@ func rewriteTimeBucket(sql string) string {
 		originEpoch := originTime.Unix()
 
 		// Formula: origin + floor((epoch(col) - origin_epoch) / interval) * interval
-		return fmt.Sprintf("to_timestamp(%d + ((epoch(%s)::BIGINT - %d) // %d) * %d)",
-			originEpoch, column, originEpoch, seconds, seconds)
+		return epochBucket(column, seconds, originEpoch)
 	})
 
 	// Then handle 2-argument form (no origin)
@@ -495,10 +494,28 @@ func rewriteTimeBucket(sql string) string {
 			return match // Keep original for months (variable length)
 		}
 
-		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT // %d) * %d)", column, seconds, seconds)
+		return epochBucket(column, seconds, defaultBucketOrigin)
 	})
 
 	return sql
+}
+
+// defaultBucketOrigin is DuckDB's default time_bucket origin, 2000-01-03
+// 00:00:00 UTC (a Monday), in epoch seconds. Buckets wider than the gap to it
+// (weeks, 2 days, 7 hours...) line up on it, not on 1970-01-01 (a Thursday);
+// it is also where ISO weeks start, so date_trunc('week') agrees (#1352).
+const defaultBucketOrigin = 946857600
+
+// epochBucket is the epoch-arithmetic form of time_bucket: the start of the
+// bucket of width seconds, aligned on origin, that holds column.
+//
+// floor() of a fractional quotient, not an integer cast: DuckDB rounds a
+// DOUBLE to the nearest BIGINT, which put the last half second of every bucket
+// in the next one, and its // truncates toward zero, which is wrong before
+// the origin (#1352). The quotient is a double; it is exact to the
+// microsecond for timestamps between 1697 and 2242 (|epoch| < 2^33 s).
+func epochBucket(column string, seconds int, origin int64) string {
+	return fmt.Sprintf("to_timestamp(%d + floor((epoch(%s) - %d) / %d) * %d)", origin, column, origin, seconds, seconds)
 }
 
 // rewriteDateTrunc converts date_trunc() to epoch-based arithmetic for 2.5x performance improvement.
@@ -538,8 +555,9 @@ func rewriteDateTrunc(sql string) string {
 			return match // Keep original for months (variable length)
 		}
 
-		// Convert to epoch-based arithmetic: to_timestamp((epoch(col) // interval) * interval)
-		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT // %d) * %d)", column, seconds, seconds)
+		// Epoch arithmetic on DuckDB's default origin: a Monday, so 'week'
+		// truncates to the ISO week like date_trunc does.
+		return epochBucket(column, seconds, defaultBucketOrigin)
 	})
 }
 
