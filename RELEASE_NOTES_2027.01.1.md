@@ -1521,6 +1521,16 @@ Instants before the origin (before 1970 or 2000) floor correctly, a
 in integer microseconds, so it is exact for every timestamp. Continuous
 queries were not affected: they never used this rewrite.
 
+### First migrated cold files become visible on peer nodes ([#1349](https://github.com/Basekick-Labs/arc/issues/1349))
+
+When the first files in a measurement moved to cold storage, other nodes could
+read from the hot tier only until their next cold metadata sync. Shared-store
+migration deletes now update each node's tier metadata, and transient cold-tier
+check failures are retried instead of waiting for that sync.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+in [#1354](https://github.com/Basekick-Labs/arc/pull/1354).
+
 ### Compaction job metrics count on `/metrics` ([#1343](https://github.com/Basekick-Labs/arc/issues/1343))
 
 `arc_compaction_jobs_total`, `arc_compaction_jobs_success_total` and
