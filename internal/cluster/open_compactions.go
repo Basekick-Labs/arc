@@ -66,6 +66,9 @@ type localDelete struct {
 	siblingSize int64
 	// goneCheckedAt rate-limits the "copy already gone" stat.
 	goneCheckedAt time.Time
+	// siblingCheckedAt rate-limits the rewrite stat of a copy whose unlink
+	// is deferred.
+	siblingCheckedAt time.Time
 }
 
 // deleteRewriteReason is the manifest delete reason of the file a row
@@ -329,6 +332,15 @@ func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, p
 // cache: a listing cached before the member landed would have path without
 // it.
 func (c *Coordinator) rewriteSiblingReadable(ctx context.Context, fsm *raft.ClusterFSM, path string, d localDelete) (localDelete, bool) {
+	// Its unlink waits for the rewrite, which was not here (rewrite_unlink.go):
+	// read it, looking for the rewrite at most every goneCheckEvery (the
+	// rewrite may land just before its wake).
+	if c.unlinkDeferred(path) {
+		if time.Since(d.siblingCheckedAt) < goneCheckEvery {
+			return d, false
+		}
+		d.siblingCheckedAt = time.Now()
+	}
 	sibs := fsm.RewriteSiblings(path)
 	if d.sibling != "" {
 		for _, e := range sibs {
