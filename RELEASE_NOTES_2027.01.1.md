@@ -1494,6 +1494,18 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A query on a measurement whose files are all gone no longer fails ([#1364](https://github.com/Basekick-Labs/arc/issues/1364))
+
+With tiered storage, a query on a measurement that still had tier metadata but
+no file in any tier answered `Binder Error: * expression without FROM
+clause!`, even for `SELECT count(*)`. This happened after a DELETE, retention
+or tiering removed every file of the measurement. Such a measurement now reads
+as empty:
+- **With a field schema anchor** (`query.stable_schema`): zero rows with the
+  measurement's columns, so `count(*)` answers `0` and queries naming its
+  columns run.
+- **Without an anchor:** the empty result a measurement with no files already
+  gets.
 ### A row DELETE reaches cold storage ([#1350](https://github.com/Basekick-Labs/arc/issues/1350))
 
 A row DELETE (`POST /api/v1/delete`) read and rewrote hot-tier files only.
