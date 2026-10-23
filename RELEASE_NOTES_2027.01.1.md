@@ -1510,11 +1510,11 @@ were never affected:
   which is also where ISO weeks start. Weekly buckets started on Thursdays,
   `date_trunc('week', time)` was not the ISO week, and widths such as
   `2 days`, `5 days` or `7 hours` started at different instants than
-  DuckDB's. Widths that divide the gap between the two dates evenly (every
-  width up to an hour, `1 day`, `3 days`, `2`/`3`/`4`/`6`/`8`/`12` hours) were
-  already the same. The others now match DuckDB, so weekly and some
-  multi-hour or multi-day panels show different bucket starts after the
-  upgrade.
+  DuckDB's. Widths that divide the gap between the two dates evenly were
+  already the same: the common dashboard widths (1, 5, 10, 15 or 30 minutes,
+  1, 2, 3, 4, 6, 12 or 24 hours, `1 day`) did not move. Others (`7 minutes`,
+  `5 hours`, `2 days`, weeks) now match DuckDB, so those panels show
+  different bucket starts after the upgrade.
 
 Instants before the origin (before 1970 or 2000) floor correctly, a
 `time_bucket` origin with a fractional second keeps it, and the arithmetic is
