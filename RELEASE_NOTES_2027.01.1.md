@@ -1533,10 +1533,10 @@ compaction, which waits at least an hour, was rarely affected.
 - A node does not register a consumed input again only while the
   compaction's job is open. If another node's finisher deletes the file and
   ends the job between this node's check and its registration, the manifest
-  gets an entry for a file that is gone. Queries then get the retryable
-  error for a file removed during a query. This window is narrow; before
-  this fix, the same case registered the file and its rows were counted
-  twice for good.
+  gets an entry for a file that is gone. Queries list the bucket, so they
+  are not affected; the reconciliation sweep removes such an entry when it is
+  enabled. This window is narrow; before this fix, the same case registered
+  the file and its rows were counted twice for good.
 
 ### `time_bucket` and `date_trunc` put rows in the right bucket ([#1352](https://github.com/Basekick-Labs/arc/issues/1352))
 
