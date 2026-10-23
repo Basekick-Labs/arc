@@ -1067,6 +1067,28 @@ func (f *ClusterFSM) StagedCompactionOwns(path string) bool {
 	return ok
 }
 
+// StagedInputFor returns path as an input of the staged job that owns it, if
+// it is one (an output is not). A map lookup: the registration outbox asks for
+// every file it registers (#1358).
+func (f *ClusterFSM) StagedInputFor(path string) (CompactionInput, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	job, ok := f.stagedPaths[path]
+	if !ok {
+		return CompactionInput{}, false
+	}
+	s := f.staged[job]
+	if s == nil {
+		return CompactionInput{}, false
+	}
+	for _, in := range s.Inputs {
+		if in.Path == path {
+			return CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256}, true
+		}
+	}
+	return CompactionInput{}, false
+}
+
 // FileByCompactionJob returns the registered file a compaction job's commit
 // registered. A scan of the manifest: callers on a hot path memoise it (the
 // coordinator's pending local deletes resolve it at most every few seconds).
