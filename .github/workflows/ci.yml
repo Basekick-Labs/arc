@@ -63,8 +63,12 @@ jobs:
       - name: Vet
         run: go vet -tags=duckdb_arrow ./...
 
+      # -timeout is per package binary; Go's default is 10 minutes, and
+      # internal/cluster alone takes about 520 s under -race on these
+      # runners (650 s on a laptop). A package that hits the default panics
+      # with a goroutine dump that reads like a hang, not a slow suite.
       - name: Test (race)
-        run: go test -tags=duckdb_arrow -race ./...
+        run: go test -tags=duckdb_arrow -race -timeout 30m ./...
 
       # The storage key contract (#743) is a property of real object stores,
       # not of a mock: the behaviours that motivated it (MinIO folding a
