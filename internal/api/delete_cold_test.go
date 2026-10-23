@@ -56,6 +56,9 @@ type coldDeleteRig struct {
 	tier     *fakeDeleteColdTier
 	app      *fiber.App
 	removed  int
+	// onRemoved runs inside the cache-drop hook: what it sees is what a
+	// cache refilled right after the drop would see.
+	onRemoved func()
 }
 
 const coldDay = "db/cpu/2026/01/05/"
@@ -78,7 +81,12 @@ func newColdDeleteRig(t *testing.T) *coldDeleteRig {
 	tier := &fakeDeleteColdTier{backend: cold, configured: true}
 	h.coldTier = tier
 	rig := &coldDeleteRig{leftoverRig: r, coldRoot: coldRoot, cold: cold, tier: tier}
-	h.SetOnFilesRemoved(func() { rig.removed++ })
+	h.SetOnFilesRemoved(func() {
+		rig.removed++
+		if rig.onRemoved != nil {
+			rig.onRemoved()
+		}
+	})
 	rig.app = fiber.New()
 	h.RegisterRoutes(rig.app)
 	return rig
@@ -137,6 +145,8 @@ const (
 func TestDeleteRemovesAColdFileWhoseRowsAllMatch(t *testing.T) {
 	r := newColdDeleteRig(t)
 	r.coldFile(coldWhole, "h0", "h0")
+	stillThere := false
+	r.onRemoved = func() { stillThere = stillThere || r.coldExists(coldWhole) }
 
 	code, out := r.delete(`{"database":"db","measurement":"cpu","where":"host = 'h0'","confirm":true}`)
 	if code != 200 || !out.Success {
@@ -153,6 +163,9 @@ func TestDeleteRemovesAColdFileWhoseRowsAllMatch(t *testing.T) {
 	}
 	if r.removed == 0 {
 		t.Fatal("the query caches were not dropped after a cold file was deleted")
+	}
+	if stillThere {
+		t.Fatal("the query caches were dropped before the cold file was deleted: a read in between caches the deleted object")
 	}
 }
 
