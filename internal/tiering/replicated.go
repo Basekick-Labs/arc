@@ -316,7 +316,7 @@ func (m *Manager) ColdFilesForMeasurement(ctx context.Context, database, measure
 // window, so a stale hot copy at the same key would never be cleaned up and
 // would keep peers replicating it. The cost is that a large cold restore puts
 // its rows inside that window and each costs one hot-side existence check per
-// cycle until they age out. See RecordColdFile.
+// cycle until they age out. See recordColdFile.
 //
 // One cost this still deliberately accepts: the cleanup it relies on is ROLE
 // GATED. ReconcileOrphanedFiles removes the stale hot copy, but it runs past

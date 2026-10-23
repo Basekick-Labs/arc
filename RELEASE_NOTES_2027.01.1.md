@@ -1494,14 +1494,29 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Cold metadata recovery does not retain a second full slice ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
+### Rebuilding cold metadata no longer restarts every tier lookup ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
 
-When rebuilding metadata from a large cold bucket, the sync now keeps only
-paths and sizes while reconciling objects, then loads the full metadata rows
-needed by the manifest sweep after releasing the object listing. Writes remain
-batched, and cache invalidation is once per affected database/measurement.
+When a node rebuilds its cold tier metadata — after a restored or lost
+`arc.db`, where every object in the cold bucket is new to it — the sync wrote
+one row per object, and each write cleared the tier cache for the whole
+process. A node serving queries during that first sync re-ran the tier
+lookup for every query, on the single shared SQLite connection, for as long
+as the walk took.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1197](https://github.com/Basekick-Labs/arc/pull/1197).
+The sync now writes in transactions of 1,000 rows and clears the cache once
+per database/measurement per transaction. Each row keeps the cold object's
+own timestamp. If a transaction fails, its rows are retried one at a time and
+a row that still fails is logged and skipped, as before.
+
+The cold rows the manifest sweep works from are now read only where the sweep
+runs — on the primary, after migration — rather than by every sync on every
+node, which also lowers the sync's peak memory on a large bucket.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1197](https://github.com/Basekick-Labs/arc/pull/1197), with review and fixes
+from [@jallegri](https://github.com/jallegri) in
+[#1309](https://github.com/Basekick-Labs/arc/pull/1309).
+
 ### A query on a measurement whose files are all gone no longer fails ([#1364](https://github.com/Basekick-Labs/arc/issues/1364))
 
 With tiered storage, a node whose tier metadata still listed a measurement
@@ -1690,6 +1705,7 @@ one cold-tier request per moved file it has no row for yet.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#1354](https://github.com/Basekick-Labs/arc/pull/1354).
+
 ### Compaction job metrics count on `/metrics` ([#1343](https://github.com/Basekick-Labs/arc/issues/1343))
 
 `arc_compaction_jobs_total`, `arc_compaction_jobs_success_total` and

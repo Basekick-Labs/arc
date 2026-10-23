@@ -160,7 +160,7 @@ func TestHotOnlyColdRowWithoutManifestEntryIsNotReverted(t *testing.T) {
 	m.coldBackend = &coldLister{mockBackend: cold, lastModified: time.Now().Add(-time.Hour)}
 	m.manifest = &fakeManifest{hot: hot, entries: map[string]int64{}}
 
-	if _, _, err := m.syncColdTierMetadata(ctx); err != nil {
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
 		t.Fatalf("syncColdTierMetadata: %v", err)
 	}
 	if got := fileMeta(t, m, gateDailyA).Tier; got != TierCold {

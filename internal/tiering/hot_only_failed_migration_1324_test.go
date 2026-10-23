@@ -123,7 +123,7 @@ func TestHotOnlyCleanupPreservesColdMetadataRowsAfterFailedFlip(t *testing.T) {
 	}
 	manifest := &fakeManifest{hot: hot, entries: map[string]int64{path: coldSize}}
 	m.manifest = manifest
-	if _, _, err := m.syncColdTierMetadata(ctx); err != nil {
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
 		t.Fatalf("sync failed migration before hot-only pin: %v", err)
 	}
 	if got := fileMeta(t, m, path).Tier; got != TierCold {
@@ -138,7 +138,7 @@ func TestHotOnlyCleanupPreservesColdMetadataRowsAfterFailedFlip(t *testing.T) {
 	faultyHot := &hotOnlyExistsErrorBackend{mockBackend: hot}
 	m.hotBackend = faultyHot
 
-	if _, _, err := m.syncColdTierMetadata(ctx); err != nil {
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
 		t.Fatalf("syncColdTierMetadata: %v", err)
 	}
 	if exists, err := cold.Exists(ctx, path); err != nil || !exists {
@@ -174,7 +174,7 @@ func TestHotOnlyMissingColdRowWaitsForLocalHotReplica(t *testing.T) {
 		t.Fatalf("set hot-only policy: %v", err)
 	}
 
-	if _, _, err := m.syncColdTierMetadata(ctx); err != nil {
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
 		t.Fatalf("sync while the local hot replica is missing: %v", err)
 	}
 	if got := fileMeta(t, m, path).Tier; got != TierCold {
@@ -184,41 +184,53 @@ func TestHotOnlyMissingColdRowWaitsForLocalHotReplica(t *testing.T) {
 	if err := cold.Delete(ctx, path); err != nil {
 		t.Fatalf("remove cold object: %v", err)
 	}
-	if _, _, err := m.syncColdTierMetadata(ctx); err != nil {
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
 		t.Fatalf("sync while both local copies are missing: %v", err)
 	}
 	if got := fileMeta(t, m, path).Tier; got != TierCold {
 		t.Fatalf("tier while both local copies are missing = %s, want cold until hot replica arrives", got)
 	}
-	if _, err := m.metadata.db.ExecContext(ctx, `UPDATE tier_files SET migrated_at = ? WHERE path = ?`, time.Now().UTC().Add(-time.Hour), path); err != nil {
+	if _, err := m.metadata.db.ExecContext(ctx, `UPDATE tier_files SET migrated_at = ? WHERE path = ?`, time.Now().UTC().Add(-2*time.Hour), path); err != nil {
 		t.Fatalf("age cold row for manifest reconciliation: %v", err)
 	}
 
 	mustWrite(t, hot, path)
-	_, rows, err := m.syncColdTierMetadata(ctx)
-	if err != nil {
-		t.Fatalf("sync after local hot replica arrives: %v", err)
+	// A listing can lag the direct stat once the hot copy arrives: the cold
+	// object reappears after the sync listed the bucket, while it checks the
+	// hot replica. The cycle's manifest sweep must not treat the reverted row
+	// as cold and unlink the manifest's hot replica. The sweep loads its own
+	// rows after the sync (#1188), so it sees the row as hot.
+	m.hotBackend = &lagListingHotBackend{mockBackend: hot, onExists: func(p string) {
+		if p == path {
+			mustWrite(t, cold, path)
+		}
+	}}
+	if err := m.runCycle(ctx); err != nil {
+		t.Fatalf("runCycle after local hot replica arrives: %v", err)
 	}
 	if got := fileMeta(t, m, path).Tier; got != TierHot {
 		t.Fatalf("tier after local hot replica arrives = %s, want hot", got)
 	}
-	foundHotRow := false
-	for _, row := range rows {
-		if row.Path == path {
-			foundHotRow = row.Tier == TierHot && row.MigratedAt == nil
+	for _, c := range manifest.calls {
+		if c.reason == manifestReasonSweep {
+			t.Fatalf("manifest sweep acted on the reverted row: %+v", manifest.calls)
 		}
 	}
-	if !foundHotRow {
-		t.Fatalf("rows returned to manifest reconciliation = %+v; want the restored row marked hot", rows)
+	if _, ok := manifest.entries[path]; !ok {
+		t.Fatal("manifest entry for the hot replica was removed")
 	}
-	// A listing can lag the direct stat once the hot copy arrives. The stale
-	// cold-row snapshot must not unlink the manifest's hot replica.
-	mustWrite(t, cold, path)
-	removed, err := m.migrator.ReconcileManifest(ctx, rows)
-	if err != nil {
-		t.Fatalf("reconcile manifest from returned rows: %v", err)
+}
+
+// lagListingHotBackend runs onExists before answering, so a test can change
+// cold storage between the sync's listing and its hot-replica check.
+type lagListingHotBackend struct {
+	*mockBackend
+	onExists func(path string)
+}
+
+func (b *lagListingHotBackend) Exists(ctx context.Context, path string) (bool, error) {
+	if b.onExists != nil {
+		b.onExists(path)
 	}
-	if removed != 0 || len(manifest.calls) != 0 {
-		t.Fatalf("manifest reconciliation removed %d entries with calls %+v; want none", removed, manifest.calls)
-	}
+	return b.mockBackend.Exists(ctx, path)
 }

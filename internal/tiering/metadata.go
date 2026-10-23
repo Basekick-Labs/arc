@@ -249,12 +249,12 @@ func (s *MetadataStore) recordHotFileIfNotCold(ctx context.Context, file *FileMe
 // migrated_at is deliberately left NULL on insert and untouched on update.
 // Stamping it would put every path this node unlinks into orphan
 // reconciliation's recently-migrated window, which HEADs each row — see
-// RecordColdFile, which stamps from the cold object's own timestamp for that
+// recordColdFile, which stamps from the cold object's own timestamp for that
 // reason.
 //
 // It stays NULL for good, and that is the intent rather than an oversight:
 // syncColdTierMetadata skips any path it already holds a cold row for, so it
-// never reaches RecordColdFile for one of these, and RecordColdFile keeps an
+// never writes a row for one of these, and its upsert keeps an
 // existing stamp when the tier is unchanged in any case. Nothing needs it.
 // Both readers of migrated_at — GetRecentlyMigratedFiles, for orphan
 // reconciliation, and the manifest sweep — look for work on a file whose hot
@@ -363,8 +363,24 @@ func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) erro
 // layout or the two formats sort against each other ('T' vs ' ').
 const sqliteTimestampLayout = "2006-01-02 15:04:05"
 
-// RecordColdFile records a file that is present in cold storage: found by the
-// cold-tier metadata sync, or written there by a restore (#1086 stage C).
+// RecordColdFile is recordColdFile plus the tier-cache invalidation for the
+// row's database/measurement. No production path calls it since #1188 — the
+// sync and the restore both write in batches — and it stays as the
+// single-file form tests seed cold rows with.
+func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) (bool, error) {
+	wrote, err := s.recordColdFile(ctx, file, migratedAt)
+	if wrote {
+		s.invalidateTierCache(file.Database, file.Measurement)
+	}
+	return wrote, err
+}
+
+// recordColdFile records a file that is present in cold storage (#1086 stage
+// C), without invalidating the tier cache: the caller does that, once per
+// database/measurement. The cold-tier metadata sync writes the same row
+// through recordColdFilesBatch, in batches, and falls back to this per row
+// when a batch fails (#1188); a restore writes it through
+// RecordColdFilesBatch.
 //
 // Unlike RecordFile it stamps migrated_at from the value the caller passes
 // rather than now, because the sync discovers moves after the fact, on every
@@ -391,17 +407,6 @@ const sqliteTimestampLayout = "2006-01-02 15:04:05"
 // guard matters because stage C added a SECOND caller: a restore writing a row
 // for a file it just put in the cold store, where silently acting on a
 // quarantined path would be a new way to lose the record of an unusable key.
-func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) (bool, error) {
-	wrote, err := s.recordColdFile(ctx, file, migratedAt)
-	if wrote {
-		s.invalidateTierCache(file.Database, file.Measurement)
-	}
-	return wrote, err
-}
-
-// recordColdFile writes one cold row without invalidating the tier cache. The
-// caller must invalidate the row's database/measurement after it has finished
-// recording a batch of files.
 func (s *MetadataStore) recordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) (bool, error) {
 	if migratedAt.IsZero() {
 		migratedAt = time.Now()
@@ -443,7 +448,7 @@ func (s *MetadataStore) recordColdFile(ctx context.Context, file *FileMetadata, 
 }
 
 // RecordColdFilesBatch records files present in cold storage with the semantics
-// RecordColdFile gives one: migrated_at is kept unchanged on a same-tier
+// recordColdFile gives one: migrated_at is kept unchanged on a same-tier
 // conflict, and a QUARANTINED row is left exactly as it is. When a file carries
 // MigratedAt, that timestamp is used; otherwise migratedAt is the fallback.
 //
@@ -453,9 +458,13 @@ func (s *MetadataStore) recordColdFile(ctx context.Context, file *FileMetadata, 
 // tiering has established it can never act on this path (#758), the other says
 // Arc does not know yet.
 //
-// This batches both restore writes and cold metadata sync. The sync can discover
-// an entire bucket after a database restore, so writing each row separately
-// would repeatedly invalidate the process-wide tier cache while queries are
+// Replaces the per-file RecordRestoredColdFile the restore used to call in a
+// loop (#1141): one implicit transaction — one fsync — per file on a handle
+// limited to a single connection and shared with auth, audit, MQTT and the
+// ingest path's own tier registration. The cold-tier metadata sync writes
+// through recordColdFilesBatch as well (#1188): after a restored or lost
+// arc.db every object in the bucket is unseen, and one write per object was
+// one process-wide tier-cache invalidation per object while queries were
 // trying to fill it.
 func (s *MetadataStore) RecordColdFilesBatch(ctx context.Context, files []FileMetadata, migratedAt time.Time) ([]string, error) {
 	notWritten, touched, err := s.recordColdFilesBatch(ctx, files, migratedAt)
@@ -490,6 +499,10 @@ func (s *MetadataStore) recordColdFilesBatch(ctx context.Context, files []FileMe
 		if createdAt.IsZero() {
 			createdAt = fileMigratedAt
 		}
+		// migrated_at as TEXT, exactly as the single-file version writes it:
+		// it is compared as a string against every other row, and go-sqlite3
+		// binds a time.Time with its offset appended, which sorts against the
+		// layout every existing row was written in.
 		return []any{
 			file.Path,
 			file.Database,
@@ -610,9 +623,10 @@ func (s *MetadataStore) recordTierFilesBatch(ctx context.Context, files []FileMe
 	}
 	defer stmt.Close()
 
-	// The cache is keyed by database/measurement and a restore writes many
-	// files under each pair, so the invalidation is collected here and done
-	// once per pair after the commit — not once per row.
+	// The cache is keyed by database/measurement and a batch writes many
+	// files under each pair, so the scopes are collected here and returned;
+	// the caller invalidates once per pair after the commit — not once per
+	// row.
 	touched := make(map[tierCacheScope]struct{}, len(files))
 
 	var notWritten []string
@@ -669,7 +683,8 @@ func (s *MetadataStore) GetFilesInTier(ctx context.Context, tier Tier) ([]FileMe
 // ColdFilePathsAndSizes returns every non-quarantined row of a tier as
 // path -> size_bytes (#1086 stage C). It backs the backup's cold walk, which
 // reconciles the cold listing against the rows in both directions and so needs
-// exactly these two columns, keyed for lookup.
+// exactly these two columns, keyed for lookup, and the cold-tier metadata
+// sync's skip set, for the same reason (#1188).
 //
 // Deliberately NOT GetFilesInTier plus a filter in Go. That one selects all
 // eleven columns, allocates a full FileMetadata per row, and sorts by
