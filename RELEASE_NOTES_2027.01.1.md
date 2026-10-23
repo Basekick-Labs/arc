@@ -1494,6 +1494,50 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A compaction run within a minute of its files' registration no longer leaves them behind, counted twice ([#1358](https://github.com/Basekick-Labs/arc/issues/1358))
+
+On a cluster with a shared object store, a compaction finishes by deleting
+its input files. The finisher kept any input this node had confirmed as
+registered in the previous minute, and ended the job anyway. Once the job
+ended, nothing deleted those inputs or left them out of reads, so every node
+counted their rows twice, alongside the compaction's output. This happened
+when a compaction ran less than a minute after the inputs were registered:
+a manual or backfill compaction right after a flush or an import, or a
+registration backlog drained after a Raft outage. Scheduled hourly
+compaction, which waits at least an hour, was rarely affected.
+
+**The fix:**
+- The finisher syncs with the leader before it decides. A confirmation
+  recorded before that sync belongs to a registration the compaction has
+  since removed, so the input is deleted.
+- If an input's registration is still pending on this node, or was
+  confirmed after the sync started, the finisher waits and retries rather
+  than ending the job with the file left behind. The input is then either
+  registered again (kept) or not (deleted). A job that keeps waiting is
+  logged at Warn every 5 minutes.
+- An input parked as refused is kept, logged at Warn naming the job and
+  the file, and the job ends as before.
+- The finisher sorts every input into keep, wait or delete before it
+  deletes any.
+- A node no longer registers again a file that a compaction it has not
+  finished took as an input. This can happen after a registration whose
+  reply was lost, or one replayed from the journal. The file's rows are in
+  the compaction's output, so it is treated as registered.
+
+**Limitations:**
+- Inputs left behind by an older version, from jobs that have already
+  ended, are not removed. They are not in the cluster manifest. The opt-in
+  reconciliation sweep (`reconciliation.enabled`, then
+  `reconciliation.manifest_only_dry_run=false`) deletes them after its grace
+  window.
+- A node does not register a consumed input again only while the
+  compaction's job is open. If another node's finisher deletes the file and
+  ends the job between this node's check and its registration, the manifest
+  gets an entry for a file that is gone. Queries then get the retryable
+  error for a file removed during a query. This window is narrow; before
+  this fix, the same case registered the file and its rows were counted
+  twice for good.
+
 ### `time_bucket` and `date_trunc` put rows in the right bucket ([#1352](https://github.com/Basekick-Labs/arc/issues/1352))
 
 Arc runs `time_bucket(INTERVAL …, time)` and `date_trunc('…', time)` as epoch
