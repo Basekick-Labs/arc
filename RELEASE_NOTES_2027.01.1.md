@@ -1494,6 +1494,29 @@ an unbounded operation.
 
 ## Bug fixes
 
+### `time_bucket` and `date_trunc` put rows in the right bucket ([#1352](https://github.com/Basekick-Labs/arc/issues/1352))
+
+Arc runs `time_bucket(INTERVAL …, time)` and `date_trunc('…', time)` as epoch
+arithmetic, for speed. That arithmetic had two errors; both affected every
+query API answer (JSON, Arrow, msgpack, Grafana), and totals over a window
+were never affected:
+
+- **The last half second of every bucket was counted in the next one.** A row
+  at `03:29:59.7` was in the `03:30` minute. Any per-second, per-minute or
+  per-hour series over sub-second data had rows in the wrong bucket at every
+  edge.
+- **Buckets wider than a day, and some narrower ones, did not line up with
+  DuckDB's.** Arc aligned them on 1970-01-01 (a Thursday); DuckDB aligns them
+  on 2000-01-03 (a Monday), which is also where ISO weeks start. Weekly
+  buckets started on Thursdays, `date_trunc('week', time)` was not the ISO
+  week, and widths such as `2 days`, `5 days` or `7 hours` started at
+  different instants than DuckDB's. These now match DuckDB, so weekly and
+  multi-day panels show different bucket starts after the upgrade.
+
+Instants before 1970 floor correctly now too. Continuous queries were not
+affected: they never used this rewrite. The bucketing is now exact for
+timestamps between 1697 and 2242.
+
 ### Compaction job metrics count on `/metrics` ([#1343](https://github.com/Basekick-Labs/arc/issues/1343))
 
 `arc_compaction_jobs_total`, `arc_compaction_jobs_success_total` and
