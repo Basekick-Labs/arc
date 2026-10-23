@@ -1532,7 +1532,16 @@ the default schedule), and read the files from neither tier until then:
   Now every node records the cold copy when the migrating node releases the
   hot one. A node that installs a Raft snapshot after missing migrations
   checks the cold tier for each path the snapshot dropped, as nodes with
-  local storage already did.
+  local storage already did. This works with `cluster.replication_enabled`
+  off, which is how the Helm chart runs shared storage. Before, a node
+  learned of manifest deletes only through the peer puller, which runs only
+  with replication on.
+- **Shared object store, DELETE rewrites:** for the same reason, a node
+  with replication off kept reading a file that a row DELETE had rewritten,
+  next to its rewrite, until the old object was removed. In that window it
+  counted the rows the DELETE kept twice. It now leaves the old file out of
+  reads once the rewrite is in the bucket, as nodes with replication on
+  already did.
 - **Both storage modes:** if the cold-tier check failed, the node waited for
   the next sync. It now checks again after 1, 2 and 4 seconds. A cold tier
   unreachable for longer than that still waits for the sync, or for the
