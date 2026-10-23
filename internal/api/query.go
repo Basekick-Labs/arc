@@ -464,12 +464,8 @@ func rewriteTimeBucket(sql string) string {
 			return match // Keep original for months or invalid units
 		}
 
-		// Calculate origin offset (seconds since epoch)
-		originEpoch := originTime.Unix()
-
-		// Formula: origin + floor((epoch(col) - origin_epoch) / interval) * interval
-		return fmt.Sprintf("to_timestamp(%d + ((epoch(%s)::BIGINT - %d) // %d) * %d)",
-			originEpoch, column, originEpoch, seconds, seconds)
+		// Microseconds: an origin with a fractional second keeps it.
+		return epochBucket(column, seconds, originTime.UnixMicro())
 	})
 
 	// Then handle 2-argument form (no origin)
@@ -495,10 +491,31 @@ func rewriteTimeBucket(sql string) string {
 			return match // Keep original for months (variable length)
 		}
 
-		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT // %d) * %d)", column, seconds, seconds)
+		return epochBucket(column, seconds, defaultBucketOriginUs)
 	})
 
 	return sql
+}
+
+// defaultBucketOriginUs is DuckDB's default time_bucket origin, 2000-01-03
+// 00:00:00 UTC (a Monday), in epoch microseconds. Buckets line up on it, not
+// on 1970-01-01 (a Thursday), so weeks and widths such as 2 days or 7 hours
+// start where DuckDB's do, and date_trunc('week') is the ISO week (#1352).
+const defaultBucketOriginUs = 946857600 * 1_000_000
+
+// epochBucket is the epoch-arithmetic form of time_bucket: the start of the
+// bucket of width seconds, aligned on originUs, that holds column.
+//
+// Integer microseconds throughout, with floor division: DuckDB's // truncates
+// toward zero, so a negative offset (a row before the origin) steps down one
+// more bucket when it has a remainder. The earlier form cast epoch() (a
+// DOUBLE) to BIGINT, which rounds, and put the last half second of every
+// bucket in the next one; a double quotient is also only exact within about
+// 272 years of the origin. This is exact for every timestamp (#1352).
+func epochBucket(column string, seconds int, originUs int64) string {
+	n := int64(seconds) * 1_000_000
+	d := fmt.Sprintf("(epoch_us(%s) - %d)", column, originUs)
+	return fmt.Sprintf("make_timestamptz(%d + (%s // %d - CASE WHEN %s %% %d < 0 THEN 1 ELSE 0 END) * %d)", originUs, d, n, d, n, n)
 }
 
 // rewriteDateTrunc converts date_trunc() to epoch-based arithmetic for 2.5x performance improvement.
@@ -522,10 +539,11 @@ func rewriteDateTrunc(sql string) string {
 		// Paren-blind guard (#535): the column capture uses [^)]+, which stops
 		// at the FIRST ')' rather than the matching one. When the column arg
 		// itself contains parentheses — coalesce(time, a), (time), CAST(...),
-		// nested calls — the capture is truncated and splicing ::BIGINT onto it
-		// would corrupt the query (e.g. epoch(coalesce(time, a)::BIGINT // 3600)
-		// swallows the arithmetic inside epoch's arg list, producing a binder
-		// error on SQL DuckDB would have run fine). Detect a '(' in the captured
+		// nested calls — the capture is truncated and splicing the epoch
+		// arithmetic onto it would corrupt the query (e.g. coalesce(time, a)
+		// captured as "coalesce(time, a" puts the subtraction inside
+		// coalesce's argument list, producing a binder error on SQL DuckDB
+		// would have run fine). Detect a '(' in the captured
 		// column and leave the call unrewritten — DuckDB runs date_trunc()
 		// natively (correct, just without the epoch optimization).
 		if strings.Contains(column, "(") {
@@ -538,8 +556,9 @@ func rewriteDateTrunc(sql string) string {
 			return match // Keep original for months (variable length)
 		}
 
-		// Convert to epoch-based arithmetic: to_timestamp((epoch(col) // interval) * interval)
-		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT // %d) * %d)", column, seconds, seconds)
+		// Epoch arithmetic on DuckDB's default origin: a Monday, so 'week'
+		// truncates to the ISO week like date_trunc does.
+		return epochBucket(column, seconds, defaultBucketOriginUs)
 	})
 }
 
