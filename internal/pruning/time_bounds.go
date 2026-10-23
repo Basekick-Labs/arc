@@ -84,15 +84,27 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 	// Every position below is taken in this one string: the FROM inside
 	// EXTRACT(… FROM …) and similar is masked here, and changes its length.
 	shape, _ := sql.MaskFromKeywordsInFunctionBodies(masked)
+	// An aggregate's FILTER (WHERE …) filters that aggregate's input, not
+	// the query's rows, so its WHERE is not a second WHERE (#1360). It is
+	// blanked only to count and find the query's WHERE. Why that is safe:
+	// the range is applied to every table reference Arc rewrites into a
+	// read_parquet, and Arc rewrites only references after FROM, after JOIN
+	// and in comma joins. The FROM count and the JOIN/UNION/WITH/subquery
+	// checks below still read the whole query, FILTER bodies included, so
+	// the outer table stays the only reference that gets the range. A table
+	// read some other way inside a FILTER (TABLE t, PIVOT t …) is never
+	// rewritten, so it is never pruned either (it fails as an unknown
+	// table). Do not move those checks onto the blanked string.
+	wheres := blankAggregateFilters(shape)
 	if len(fromWord.FindAllStringIndex(shape, -1)) != 1 || structuralWord.MatchString(shape) ||
-		subSelect.MatchString(shape) || len(whereWord.FindAllStringIndex(shape, -1)) != 1 {
+		subSelect.MatchString(shape) || len(whereWord.FindAllStringIndex(wheres, -1)) != 1 {
 		return timeBounds{}, false
 	}
 	f := fromWord.FindStringIndex(shape)
-	loc := whereWord.FindStringIndex(shape)
-	// The WHERE must follow the FROM (a FILTER (WHERE …) before it is a
-	// second WHERE and refused above, but never slice on that assumption),
-	// and a comma join (FROM a, b) is a second table without a JOIN keyword.
+	loc := whereWord.FindStringIndex(wheres)
+	// The WHERE must follow the FROM (never slice on the assumption that the
+	// one WHERE left after blanking aggregate FILTERs is the query's), and a
+	// comma join (FROM a, b) is a second table without a JOIN keyword.
 	if f == nil || loc == nil || f[1] > loc[0] || hasTopLevelComma(shape[f[1]:loc[0]]) {
 		return timeBounds{}, false
 	}
@@ -107,6 +119,48 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 		return timeBounds{}, false
 	}
 	return b, true
+}
+
+// aggregateFilter finds the FILTER keyword of an aggregate's filter clause:
+// the whole word followed by "(", right after the ")" that closes the
+// aggregate call (or its WITHIN GROUP (…)). The ")" keeps DuckDB's
+// filter(list, lambda) function out of the blanking. That is tidiness, not
+// safety: a lambda holds no WHERE unless it holds a subquery, which the
+// unblanked checks refuse.
+var aggregateFilter = regexp.MustCompile(`(?i)\)\s*(filter)\s*\(`)
+
+// blankAggregateFilters returns s with every aggregate FILTER clause, keyword
+// and parenthesised body, replaced by spaces of the same length, so every
+// index into s still lines up. Literals are already masked, so the body's
+// parens balance; an unbalanced body is left as it is.
+func blankAggregateFilters(s string) string {
+	locs := aggregateFilter.FindAllStringSubmatchIndex(s, -1)
+	if len(locs) == 0 {
+		return s
+	}
+	b := []byte(s)
+	for _, l := range locs {
+		kw, open := l[2], l[1]-1 // the keyword's start, the "(" after it
+		depth, end := 0, -1
+		for i := open; i < len(b); i++ {
+			if b[i] == '(' {
+				depth++
+			} else if b[i] == ')' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
+		if end < 0 {
+			continue
+		}
+		for i := kw; i <= end; i++ {
+			b[i] = ' '
+		}
+	}
+	return string(b)
 }
 
 // addTerms reads each AND term; a parenthesised group that is itself an
