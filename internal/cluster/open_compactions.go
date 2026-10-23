@@ -32,9 +32,15 @@ import (
 // told to delete that are still on its disk. The same set covers retention's
 // and DELETE's whole-file removals still waiting for their unlink.
 //
-// Nothing is kept once an object job leaves the FSM: its inputs are deleted
-// by then, and a listing DuckDB cached before the deletes (query.
-// enable_s3_cache) fails on a missing file whether or not it is left out.
+// Nothing is kept once an object job leaves the FSM: the finisher ends a job
+// only once every input it is to remove is deleted (#1358; before, an input
+// confirmed by this node's outbox in the minute before the commit was kept
+// and the job ended anyway, so its rows were read twice for good). An input
+// the manifest lists again stays, and so does one this node parked as
+// refused (logged at Warn): a parked file's rows are read until an operator
+// resolves it. A listing DuckDB cached before the deletes
+// (query.enable_s3_cache) fails on a missing file whether or not it is left
+// out.
 
 // openState is the coordinator's view of open compactions.
 type openState struct {

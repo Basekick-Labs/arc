@@ -300,19 +300,86 @@ func (c *Coordinator) objectAt(ctx context.Context, copier storage.ObjectCopier,
 	return hex.EncodeToString(h.Sum(nil)) == sha, nil
 }
 
+// errInputsSettling defers a finish: an input's registration here is not
+// settled yet (#1358). The loop retries on its next tick.
+var errInputsSettling = errors.New("an input's registration on this node has not settled")
+
+// inputsSettlingWarnAfter: a job deferred this long is logged at Warn. A
+// confirmation settles within outboxRecentWindow; a pending registration
+// waits for its file's next registration attempt.
+const inputsSettlingWarnAfter = 5 * time.Minute
+
+// settlingWarnDue rate-limits the settling Warn to once per
+// inputsSettlingWarnAfter per job (the loop retries every few seconds).
+func (c *Coordinator) settlingWarnDue(job string) bool {
+	now := time.Now()
+	if last, ok := c.staged.settlingWarned.Load(job); ok && now.Sub(last.(time.Time)) < inputsSettlingWarnAfter {
+		return false
+	}
+	c.staged.settlingWarned.Store(job, now)
+	return true
+}
+
+// finisherSync is the sync deleteObjectInputs anchors on (a test seam).
+var finisherSync = func(ctx context.Context, c *Coordinator) error { return c.SyncManifest(ctx) }
+
 // deleteObjectInputs deletes the job's input objects, except a path the
-// manifest lists again or this node's outbox owns (a restore or a new write
-// reused it). Every delete must succeed.
+// manifest lists again or this node's outbox still owns (a restore or a new
+// write reused it). Every delete must succeed.
+//
+// It decides with a time taken BEFORE a sync with the leader (#1358). A
+// confirmation this node's outbox recorded before then is of a registration
+// the sync has applied here; if the manifest does not list the path, the
+// commit (or a later entry) removed it, and the object goes. Before #1358 any
+// confirmation of the last minute kept its input and the job ended anyway:
+// an input registered less than a minute before the commit was never deleted,
+// and every node read its rows twice for good. Taking the time after the
+// sync would let a registration confirmed during the sync, not yet applied
+// here, delete a live file.
+//
+// A registration still pending here, or confirmed after that time, defers
+// the whole job (errInputsSettling) rather than ending it with the object
+// left: it settles as registered (kept) or not (deleted) on a later attempt.
+// A parked one waits for an operator: its object is kept and the job ends, as
+// before. Every input is classified before any is deleted.
 func (c *Coordinator) deleteObjectInputs(ctx context.Context, s raft.StagedCompaction) error {
+	t0 := time.Now()
+	if err := finisherSync(ctx, c); err != nil {
+		return err
+	}
 	fsm := c.raftNode.FSM()
 	c.staged.mu.Lock()
-	holds := c.staged.holds
+	holdAt := c.staged.holdAt
 	c.staged.mu.Unlock()
+	var del []string
+	settling := ""
 	for _, in := range s.Inputs {
-		if _, reg := fsm.GetFile(in.Path); reg || (holds != nil && holds(in.Path)) {
+		if _, reg := fsm.GetFile(in.Path); reg {
 			continue
 		}
-		if err := c.storage.Delete(ctx, in.Path); err != nil && !storage.IsNotFound(err) {
+		hold := HoldNone
+		if holdAt != nil {
+			hold = holdAt(in.Path, t0)
+		}
+		switch hold {
+		case HoldParked:
+			c.logger.Warn().Str("job", s.Job).Str("input", in.Path).
+				Msg("Committed compaction keeps an input this node parked as refused: its object stays until an operator resolves the parked file")
+		case HoldPending, HoldRecent:
+			settling = in.Path
+		default:
+			del = append(del, in.Path)
+		}
+	}
+	if settling != "" {
+		if !s.FinalizingAt.IsZero() && time.Since(s.FinalizingAt) > inputsSettlingWarnAfter && c.settlingWarnDue(s.Job) {
+			c.logger.Warn().Str("job", s.Job).Str("input", settling).Dur("since_commit", time.Since(s.FinalizingAt)).
+				Msg("Committed compaction is still waiting for an input's registration on this node to settle; its input objects are not deleted until it does")
+		}
+		return fmt.Errorf("%w: %s", errInputsSettling, settling)
+	}
+	for _, p := range del {
+		if err := c.storage.Delete(ctx, p); err != nil && !storage.IsNotFound(err) {
 			return err
 		}
 	}
@@ -377,6 +444,7 @@ func (c *Coordinator) endObjectJob(ctx context.Context, s raft.StagedCompaction,
 	if err := c.applyOrForward(ctx, &raft.Command{Type: raft.CommandCleanupCompaction, Payload: raw}); err != nil {
 		return err
 	}
+	c.staged.settlingWarned.Delete(s.Job)
 	metrics.Get().IncCompactionFinished()
 	c.logger.Info().Str("job", s.Job).Str("output", s.Output.Path).Bool("output_removed", inputsDeleted).
 		Msg("Committed compaction finished")
@@ -484,6 +552,45 @@ func (c *Coordinator) FinalizingObjectInputs(path string) []string {
 		return out
 	}
 	return nil
+}
+
+// ConsumedByCompaction reports a path that a compaction not yet ended took
+// as an input, with this content (the SHA when both sides have one, else the
+// size), and that the manifest no longer lists: its rows are in that job's
+// output. The registration outbox asks it before registering a path again
+// (#1358).
+func (c *Coordinator) ConsumedByCompaction(path string, size int64, sha256 string) bool {
+	if c == nil || c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	// The map lookup first: the outbox asks for every file it registers.
+	if !fsm.StagedCompactionOwns(path) {
+		return false
+	}
+	if _, reg := fsm.GetFile(path); reg {
+		return false
+	}
+	for _, s := range fsm.StagedCompactions() {
+		for _, in := range s.Inputs {
+			if in.Path != path {
+				continue
+			}
+			if in.SHA256 != "" && sha256 != "" {
+				if in.SHA256 == sha256 {
+					return true
+				}
+				continue
+			}
+			if in.SizeBytes == size {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // CompactionOwns reports a file a staged compaction owns (an input or the

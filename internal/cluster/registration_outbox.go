@@ -47,6 +47,13 @@ type OutboxManifest interface {
 	StreamClaimsEnabled() bool
 }
 
+// consumedInputChecker is the optional part of OutboxManifest that knows the
+// inputs of the compactions it has not finished (#1358). The coordinator
+// implements it.
+type consumedInputChecker interface {
+	ConsumedByCompaction(path string, size int64, sha256 string) bool
+}
+
 // OutboxStorage reports a file's size, -1 when it does not exist.
 type OutboxStorage interface {
 	StatFile(ctx context.Context, path string) (int64, error)
@@ -1023,9 +1030,24 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	var sent []*outboxEntry
 	opEntry := map[int]*outboxEntry{} // register op index -> entry
 	bytes := 0
+	consumed, _ := manifest.(consumedInputChecker)
 	for _, e := range candidates {
 		if bytes >= registrarDrainChunkBytes {
 			break
+		}
+		// Registered once already (an apply that timed out but committed, an
+		// ack lost and replayed from the journal) and since consumed by a
+		// compaction the manifest still knows: its rows are in that output,
+		// so registering it again would count them twice for good — and its
+		// committed job's finisher keeps the object while it is pending here
+		// (#1358). It settles as registered, as the committed-and-removed
+		// case above does.
+		if consumed != nil && consumed.ConsumedByCompaction(e.rec.Path, e.rec.SizeBytes, e.rec.SHA256) {
+			r.markInManifest(e)
+			r.logger.Info().Str("path", e.rec.Path).
+				Msg("Pending file is an input of a committed compaction; its rows are in that compaction's output, so it is not registered again")
+			settled = append(settled, e)
+			continue
 		}
 		if checked[e] {
 			if statErrs[e] != nil {
@@ -1333,6 +1355,46 @@ func (r *RegistrationOutbox) HoldsRegistration(path string) bool {
 	}
 	rc, ok := r.recent[path]
 	return ok && time.Since(rc.at) < outboxRecentWindow
+}
+
+// RegistrationHold is what this node's outbox says about one path, for a
+// caller that has just synced with the leader and must tell a registration
+// the manifest has since dropped from one it has not applied yet (#1358).
+type RegistrationHold int
+
+const (
+	// HoldNone: nothing pending or parked, and no confirmation at or after
+	// the caller's time.
+	HoldNone RegistrationHold = iota
+	// HoldPending: waiting to register here; it may still register, be
+	// withdrawn, or settle as gone.
+	HoldPending
+	// HoldParked: refused and parked; it waits for an operator.
+	HoldParked
+	// HoldRecent: confirmed at or after the caller's time, so this node's
+	// FSM may not show it yet.
+	HoldRecent
+)
+
+// RegistrationHoldAt is HoldsRegistration for a caller that took since
+// BEFORE a successful SyncManifest. A confirmation recorded before since is of
+// a registration the sync has applied here, so if the FSM does not list the
+// path, a later entry removed it: it holds nothing. HoldsRegistration cannot
+// tell, so it holds every confirmation for outboxRecentWindow, which kept a
+// committed compaction's inputs forever (#1358).
+func (r *RegistrationOutbox) RegistrationHoldAt(path string, since time.Time) RegistrationHold {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.byPath[path]; ok && !e.done {
+		return HoldPending
+	}
+	if _, ok := r.parked[path]; ok {
+		return HoldParked
+	}
+	if rc, ok := r.recent[path]; ok && time.Since(rc.at) < outboxRecentWindow && !rc.at.Before(since) {
+		return HoldRecent
+	}
+	return HoldNone
 }
 
 // statAll checks entries in storage with bounded parallelism, each under its

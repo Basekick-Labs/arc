@@ -2175,11 +2175,12 @@ func main() {
 								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
 									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
 							}
-							var holds func(string) bool
+							// A typed nil would be a non-nil interface.
+							var holder cluster.StagedRegistrationHolder
 							if registrationOutbox != nil {
-								holds = registrationOutbox.HoldsRegistration
+								holder = registrationOutbox
 							}
-							clusterCoordinator.SetStagedCompactionHooks(watcher.HasStagedJob, holds)
+							clusterCoordinator.SetStagedCompactionHooks(watcher.HasStagedJob, holder)
 						}
 					}
 					clusterCoordinator.SetCompactionQuiescer(newCompactionQuiescer(
