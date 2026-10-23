@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,10 +49,9 @@ type deleteRequest struct {
 //
 // Implemented by *tiering.Manager. Declared here, consumer-side, for the same
 // reason tiering declares ManifestCoordinator rather than importing this
-// package: neither side needs the other's types. Both methods are
-// fire-and-forget — they are called from the replication pull workers and the
-// local-delete workers, never block, and the implementation queues rather than
-// writing through to SQLite on the caller's goroutine.
+// package: neither side needs the other's types. Its methods are
+// fire-and-forget: they run on replication workers, local-delete workers or
+// the Raft callback and queue work instead of writing through to SQLite.
 type TierRecorder interface {
 	// RecordReplicatedFile reports a file pulled from a peer and kept, which
 	// is now on this node's hot storage.
@@ -62,6 +62,11 @@ type TierRecorder interface {
 	// may come from an operator and so is a hint rather than proof of what
 	// happened to the file.
 	RecordUnlinkedFile(path, reason string, sizeBytes int64)
+	// RecordManifestUnlinkedFile reports a manifest delete on a shared object
+	// store that may be a migration (sharedDeleteChangesTier): this node
+	// unlinks nothing, but its tier rows must learn the cold copy. Its size is
+	// not available at the callback boundary.
+	RecordManifestUnlinkedFile(path, reason string)
 	// RecordMissingFile reports a path that left the manifest while this
 	// node no longer had the file (its own compaction or retention removed
 	// it first): a hot row it still holds for the path is stale (#1271).
@@ -782,23 +787,14 @@ func (c *Coordinator) Start() error {
 		go c.ackCompactionPauseIfActive()
 	}
 
-	// Wire the peer file replication puller (Enterprise Phase 2). This runs
-	// on every cluster node (not just readers) because nodes of any role may
-	// need to pull files they didn't originate — the Raft manifest is the
-	// source of truth for who has what, regardless of role.
-	//
-	// Gated on ReplicationEnabled so OSS and standalone deployments never
-	// pay any cost. The FeatureClustering license check already ran in
+	// Wire what this node does on manifest changes: the peer file
+	// replication puller (Enterprise Phase 2) when ReplicationEnabled — on
+	// every role, since any node may need files it didn't originate — and
+	// otherwise, on a shared object store, the delete-only callbacks every
+	// such node needs (#1354). OSS and standalone never reach this. The
+	// FeatureClustering license check already ran in
 	// validateClusteringLicense above.
-	if c.cfg.ReplicationEnabled && c.raftNode != nil {
-		if err := c.startFilePullerLocked(); err != nil {
-			// Do not fail cluster startup if the puller can't start —
-			// replication is best-effort and the rest of the cluster can
-			// still make progress. The cause is logged; operators can
-			// correct config and restart.
-			c.logger.Error().Err(err).Msg("Failed to start peer file puller — continuing without peer replication")
-		}
-	}
+	c.startManifestCallbacksLocked()
 
 	// Start listening for peer connections if we have a coordinator address
 	if c.cfg.CoordinatorAddr != "" {
@@ -1288,12 +1284,109 @@ func (c *Coordinator) recordUnlinkedFileInTiering(path, reason string, sizeBytes
 	}
 }
 
+func (c *Coordinator) recordManifestUnlinkedFileInTiering(path, reason string) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordManifestUnlinkedFile(path, reason)
+	}
+}
+
 // tierReasonAbandonedPull is the reason reported for a copy the puller removed
 // because its path left the manifest while the pull was in transit. The puller
 // never learns the manifest delete's own reason, so the recorder treats this
 // one as possibly a migration. Shared literal with
 // tiering.unlinkReasonAbandonedPull; the packages do not import each other.
 const tierReasonAbandonedPull = "replication:abandoned"
+
+// startManifestCallbacksLocked wires what this node does when the manifest
+// changes: the peer file puller when replication is on (it registers the FSM
+// file callbacks itself), and otherwise, on a shared object store, the
+// delete-only callbacks every such node needs. Split out of Start so a test
+// drives the same decision Start makes.
+func (c *Coordinator) startManifestCallbacksLocked() {
+	if c.cfg.ReplicationEnabled && c.raftNode != nil {
+		if err := c.startFilePullerLocked(); err != nil {
+			// Do not fail cluster startup if the puller can't start —
+			// replication is best-effort and the rest of the cluster can
+			// still make progress. The cause is logged; operators can
+			// correct config and restart.
+			c.logger.Error().Err(err).Msg("Failed to start peer file puller — continuing without peer replication")
+		} else {
+			return
+		}
+	}
+	// A shared object store needs no puller (shared-storage deployments run
+	// with replication off: the Helm chart sets it), but every node still has
+	// to hear the manifest's deletes: tiering's cold rows (#1349) and a DELETE
+	// rewrite's old file left out of reads (#1348) are per-node state. Both
+	// used to live only in the puller's callback, so they never ran there.
+	c.startSharedManifestCallbacks()
+}
+
+// startSharedManifestCallbacks registers the FSM file callbacks a
+// shared-object-store node needs when the puller, which registers its own,
+// is not running. Nothing for local storage: without replication no node
+// reads another's disk. Raft is already running, so a delete applied during
+// startup replay can precede this; the startup tier scan's cold sync covers
+// the tier rows, and a read leaves a rewrite's old file in until then, which
+// over-counts rather than drops.
+func (c *Coordinator) startSharedManifestCallbacks() {
+	if c.raftNode == nil || c.storage == nil || c.storage.Type() == "local" {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return
+	}
+	// A path the manifest lists again is no longer a pending delete here.
+	fsm.SetFileCallbacks(func(entry *raft.FileEntry) {
+		c.forgetLocalDeleted(entry.Path)
+	}, c.observeSharedManifestDelete)
+	c.logger.Info().Str("backend", c.storage.Type()).
+		Msg("Shared-storage manifest delete callback registered (no peer puller)")
+}
+
+// observeSharedManifestDelete is the work a node on a shared object store
+// does for a manifest delete. It unlinks nothing: the object is shared, and
+// whoever proposed the delete removes it. Runs on the Raft apply path and
+// from a snapshot Restore, so it must not block: both calls are map work or a
+// non-blocking enqueue.
+func (c *Coordinator) observeSharedManifestDelete(path, reason string) {
+	// A migration changes this node's tier metadata although it unlinks
+	// nothing here: the hot object is going, and the cold copy must now be
+	// read here too (#1349).
+	if sharedDeleteChangesTier(reason) {
+		c.recordManifestUnlinkedFileInTiering(path, reason)
+	}
+	// Every node reads the shared object, so every node leaves a DELETE
+	// rewrite's old file out of reads once its rewrite is there
+	// (open_compactions.go), until the handler removes it. Only that reason:
+	// others are removed at once, by their caller.
+	if reason == deleteRewriteReason {
+		c.noteLocalDeleted(path, reason)
+	}
+	c.logger.Debug().
+		Str("path", path).
+		Str("reason", reason).
+		Str("backend", c.storage.Type()).
+		Msg("FSM delete observed; shared backend, no local action needed")
+}
+
+// tierReasonPrefix starts every reason tiering itself proposes. Shared
+// literal with tiering.manifestReasonPrefix; the packages do not import each
+// other.
+const tierReasonPrefix = "tiering:"
+
+// sharedDeleteChangesTier reports a manifest delete that a node on a shared
+// object store must tell tiering about although it unlinks nothing: a
+// tiering reason (the hot object is released and the cold copy is now the
+// one to read), or a snapshot restore dropping a path the cluster deleted
+// while this node was away, for a reason the snapshot does not carry — a
+// migration among them (#962, #1349). The recorder asks the cold tier before
+// recording anything. The same set as tiering's reasonMayBeMigration, less
+// the two reasons only the local-storage puller and stale-local sweep send.
+func sharedDeleteChangesTier(reason string) bool {
+	return strings.HasPrefix(reason, tierReasonPrefix) || reason == raft.UnlinkReasonSnapshotRemoved
+}
 
 // recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
 func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
@@ -4487,22 +4580,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// the puller's own lock; puller is non-nil by construction above.
 		puller.OnManifestDelete(path)
 
-		// Local backends need an actual local unlink; shared backends
-		// don't — they're already deleted cluster-wide by the compactor's
-		// StorageBackend.Delete in deleteOldFiles.
+		// Local backends need an actual local unlink; shared backends are
+		// already deleted cluster-wide by StorageBackend.Delete in
+		// deleteOldFiles, and only need the bookkeeping every shared-store
+		// node does with or without the puller.
 		if backend.Type() != "local" {
-			// Every node reads the shared object, so every node leaves a
-			// DELETE rewrite's old file out of reads once its rewrite is
-			// there (open_compactions.go), until the handler removes it.
-			// Only that reason: others are removed at once, by their caller.
-			if reason == deleteRewriteReason {
-				c.noteLocalDeleted(path, reason)
-			}
-			c.logger.Debug().
-				Str("path", path).
-				Str("reason", reason).
-				Str("backend", backend.Type()).
-				Msg("FSM delete observed; shared backend, no local action needed")
+			c.observeSharedManifestDelete(path, reason)
 			return
 		}
 		// Hand it to the delete workers. Unlike the puller's Enqueue, this
