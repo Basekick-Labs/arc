@@ -1873,6 +1873,9 @@ removes the hot copy. Three problems, all fixed:
 - A DELETE arriving on a new primary writer while the old one is still
   copying the same file (during a failover) is not covered: the claim
   between DELETE and migration only holds within one process.
+- The age check uses the database's current tiering policy. A file moved
+  under a shorter `hot_max_age_days`, with the policy raised since, is not
+  checked for a cold copy.
 - Continuous queries read the hot tier only and were never affected.
 
 ### A DELETE no longer drops rows its clause cannot decide

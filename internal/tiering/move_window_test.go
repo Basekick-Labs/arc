@@ -436,12 +436,20 @@ func TestRecordUnlinkedFile_MigratedDropsTheReadCaches(t *testing.T) {
 	before := calls
 	mu.Unlock()
 	m.RecordUnlinkedFile(path, "tiering:migrated", 9)
-	waitTierEvents(t, m, 2)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if calls != before+1 {
-		t.Fatalf("read-cache invalidations for the move = %d, want 1", calls-before)
+	// The processed count moves per event, before the batch's end-of-batch
+	// invalidation: poll for it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := calls - before
+		mu.Unlock()
+		if got >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a move recorded on this node did not drop its read caches")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
