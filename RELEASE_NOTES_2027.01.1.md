@@ -1806,6 +1806,75 @@ there in that window stored the shortfall.
   the old file as before. That covers `cluster.replication_catchup_enabled
   = false`, no Raft data directory, or a record that cannot be opened.
 
+### Tiering: a migration no longer brings deleted rows back, and reads count its files once
+
+Moving a file to cold storage copies it, marks it cold, and only then
+removes the hot copy. Three problems, all fixed:
+
+- **A DELETE during the move brought its rows back for good.** A row DELETE
+  that rewrote a file while it was being copied left the cold copy with the
+  deleted rows. The cold sync then recorded that copy as a cold file, so the
+  deleted rows came back and the file's other rows were counted twice, for
+  good.
+  - A DELETE and a migration now never work on the same file at once.
+  - A DELETE leaves alone a file that is being moved, or one that already
+    has a copy in cold storage (a move that was interrupted). Its response
+    is 207 and names the files and why. A DELETE does not reach files in
+    cold storage, so once the move completes those rows stay; delete them
+    before the file ages into cold storage.
+  - When cold storage cannot be checked for such a copy, the DELETE answers
+    503 and the file is left as it is; retry.
+  - Only daily compacted files old enough for their database's tiering
+    policy are checked, so a DELETE of recent data does not touch cold
+    storage.
+  - Removing the leftover of an earlier DELETE also waits for a file being
+    moved.
+- **A file an earlier DELETE replaced could be moved to cold storage.**
+  Copied there, the leftover still held the deleted rows. A migration now
+  skips such a file:
+  - when the DELETE's record names it;
+  - in a cluster, when the manifest no longer lists it but lists its
+    replacement;
+  - standalone, when its hot copy disappears during the copy.
+  The check runs again just before the file is marked cold, and a copy
+  already made is deleted.
+- **Reads counted migrated files twice until the whole batch was done.**
+  The hot copies were removed only after every file in the batch (up to
+  `migration_batch_size`, default 100) had been copied. Until then a query
+  read both copies of every file already moved. Hot copies are now released
+  as files are moved, at least once a second, and the query caches are
+  dropped around each release. Measured on a standalone node with one copy
+  held mid-migration: 7,200 rows instead of 6,000 before, 6,000 after.
+
+**Also:**
+- A file is marked cold only if its tier row still says hot. If the row
+  changed during the copy (another node moved it), the cold copy is kept,
+  since it may be the only one.
+- A node that stops being the primary writer during a copy leaves the file
+  for the new primary instead of marking it cold.
+- A manifest failure stops the whole migration cycle, not just the current
+  batch. Files already marked cold keep their hot copies until
+  reconciliation removes them.
+- A copy that has finished is still marked cold when the cycle is cancelled
+  (for example at shutdown).
+- On a cluster with local storage, a node that records another node's
+  moved file as cold drops its query caches. Before, it could keep serving
+  a cached listing without the file for up to 30 seconds.
+
+**Limitations:**
+- Between a file being marked cold and its hot copy being released, reads
+  on that node still count it twice. This lasts about a second, or longer
+  when files are moved faster than the cluster manifest releases them (one
+  release of up to 200 files a second).
+- On a cluster with local storage, the other nodes count a moved file twice
+  until they remove their own copy.
+- While a migration runs, the migrating node drops its query caches up to
+  twice a second.
+- A DELETE arriving on a new primary writer while the old one is still
+  copying the same file (during a failover) is not covered: the claim
+  between DELETE and migration only holds within one process.
+- Continuous queries read the hot tier only and were never affected.
+
 ### A DELETE no longer drops rows its clause cannot decide
 
 A row DELETE rewrote each file keeping the rows where `NOT (clause)` held. A
