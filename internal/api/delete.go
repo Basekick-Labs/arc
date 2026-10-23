@@ -173,6 +173,9 @@ type DeleteHandler struct {
 	// flushed may not be in the manifest yet. nil off ingest nodes.
 	pending        PendingRegistrations
 	tieringManager *tiering.Manager
+	// moveClaims keeps the tiering migrator off a file this DELETE rewrites
+	// (the tiering manager, when tiering is on).
+	moveClaims moveClaimer
 	// tempDir is the absolute, sandbox-allowlisted directory used by
 	// rewriteS3File to stage the COPY-rewritten parquet locally before
 	// uploading. MUST match one of the prefixes added to DuckDB's
@@ -330,6 +333,14 @@ func (h *DeleteHandler) SetPendingRegistrations(p PendingRegistrations) {
 // SetTieringManager wires rewrite/delete metadata updates into tiering.
 func (h *DeleteHandler) SetTieringManager(tm *tiering.Manager) {
 	h.tieringManager = tm
+	if tm != nil {
+		h.moveClaims = tm
+	}
+}
+
+// moveClaimer is tiering.Manager.ClaimForDelete.
+type moveClaimer interface {
+	ClaimForDelete(ctx context.Context, path string) (release func(), err error)
 }
 
 // RegisterRoutes registers delete endpoints
@@ -1145,11 +1156,13 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	// copy already: a rewrite here would leave that copy holding the rows
 	// this DELETE removes, and the cold sync would serve them again for
 	// good. Claimed for the whole rewrite, tier metadata included.
-	release, err := h.tieringManager.ClaimForDelete(ctx, relativePath)
-	if err != nil {
-		return 0, err
+	if h.moveClaims != nil {
+		release, err := h.moveClaims.ClaimForDelete(ctx, relativePath)
+		if err != nil {
+			return 0, err
+		}
+		defer release()
 	}
-	defer release()
 	if scanSHA == unmanagedSHA && peerFlushOn(h.coordinator) && h.freshUnregistered(ctx, relativePath) {
 		// A writer's flush still on its way to the manifest (#1265): left
 		// as it is, and the DELETE retried, which finds it registered.

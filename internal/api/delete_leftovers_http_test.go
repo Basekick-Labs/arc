@@ -80,3 +80,37 @@ func TestRetriedDeleteThroughTheRoute(t *testing.T) {
 		}
 	}
 }
+
+// Through the route: a DELETE that reaches a file the tiering migrator is
+// moving answers 503 and names why, and the other file's rows are deleted.
+func TestDeleteOfAMovingFileThroughTheRoute(t *testing.T) {
+	r := newLeftoverRig(t)
+	h := NewDeleteHandler(r.db, r.backend, &config.DeleteConfig{Enabled: true, MaxRowsPerDelete: 1000, ConfirmationThreshold: 1000}, nil, t.TempDir(), zerolog.Nop())
+	r.h = h
+	moving := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	other := leftoverHour + "cpu_20261007_205000_000000000.parquet"
+	r.parquet(moving, "h0", "h1")
+	r.parquet(other, "h0", "h5")
+	h.moveClaims = &fakeMoveClaims{moving: map[string]bool{moving: true}}
+	app := fiber.New()
+	h.RegisterRoutes(app)
+
+	req := httptest.NewRequest("POST", "/api/v1/delete", strings.NewReader(`{"database":"db","measurement":"cpu","where":"host = 'h0'","confirm":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, 20000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var out DeleteResponse
+	_ = json.Unmarshal(raw, &out)
+	if resp.StatusCode != 503 || !strings.Contains(out.Error, "being moved to cold storage") || strings.Contains(out.Error, "cluster manifest") {
+		t.Fatalf("got %d %q, want 503 naming the move", resp.StatusCode, out.Error)
+	}
+	if out.DeletedCount != 1 {
+		t.Fatalf("deleted %d rows, want 1 (the other file)", out.DeletedCount)
+	}
+	if !r.exists(moving) {
+		t.Fatal("the moving file was touched")
+	}
+}

@@ -358,6 +358,12 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 			m.logger.Error().Err(err).Msg("Failed to acquire semaphore")
 			break
 		}
+		// Asked again: the wait for a slot can outlast a manifest failure
+		// or the writer role.
+		if stop.Load() || m.manager.roleGated() {
+			sem.Release(1)
+			break
+		}
 		if !m.manager.claims.claimMove(candidate.Path) {
 			// A DELETE is rewriting it; the next cycle sees the result.
 			sem.Release(1)

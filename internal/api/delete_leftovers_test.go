@@ -15,6 +15,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/rs/zerolog"
 )
 
@@ -573,5 +574,45 @@ func TestRewriteKeepsRowsTheClauseCannotDecide(t *testing.T) {
 	}
 	if rows != 2 {
 		t.Fatalf("rewrite holds %d rows, want 2 (the NULL host is not deleted)", rows)
+	}
+}
+
+// fakeMoveClaims refuses the paths in moving and counts releases.
+type fakeMoveClaims struct {
+	moving   map[string]bool
+	claims   int
+	releases int
+}
+
+func (f *fakeMoveClaims) ClaimForDelete(_ context.Context, path string) (func(), error) {
+	if f.moving[path] {
+		return nil, fmt.Errorf("%w: %s", tiering.ErrFileMoving, path)
+	}
+	f.claims++
+	return func() { f.releases++ }, nil
+}
+
+// A file the tiering migrator is moving is left as it is: a rewrite would
+// leave the cold copy holding the rows this DELETE removes.
+func TestRewrite_LeavesAFileTheMigratorIsMoving(t *testing.T) {
+	r := newLeftoverRig(t)
+	key := leftoverHour + "cpu_a.parquet"
+	r.parquet(key, "h1", "h2")
+	claims := &fakeMoveClaims{moving: map[string]bool{key: true}}
+	r.h.moveClaims = claims
+
+	if err := r.rewrite(key, "host = 'h1'"); !errors.Is(err, tiering.ErrFileMoving) {
+		t.Fatalf("rewrite = %v, want ErrFileMoving", err)
+	}
+	if got := r.files(); len(got) != 1 || got[0] != key {
+		t.Fatalf("files = %v, want only the untouched %s", got, key)
+	}
+
+	delete(claims.moving, key)
+	if err := r.rewrite(key, "host = 'h1'"); err != nil {
+		t.Fatal(err)
+	}
+	if claims.claims != 1 || claims.releases != 1 {
+		t.Fatalf("claims/releases = %d/%d, want 1/1", claims.claims, claims.releases)
 	}
 }
