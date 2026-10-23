@@ -236,3 +236,68 @@ func TestOutboxDoesNotRegisterAConsumedInputAgain(t *testing.T) {
 		t.Fatal("an unrelated file was not registered")
 	}
 }
+
+// The real outbox through the real setter, not a copy of its rule: a
+// confirmation recorded before the finish deletes the input; a pending entry
+// defers the job.
+func TestFinishObjectJobWithTheRealOutbox(t *testing.T) {
+	r := objectRig(t)
+	job := r.objectJob("j1")
+	ob := newTestOutbox(t, t.TempDir())
+	r.c.SetStagedCompactionHooks(nil, ob)
+
+	ob.mu.Lock()
+	ob.byPath[job.Inputs[1].Path] = &outboxEntry{}
+	ob.mu.Unlock()
+	if err := r.c.finishObjectJob(context.Background(), "j1"); !errors.Is(err, errInputsSettling) {
+		t.Fatalf("finish with a pending input = %v, want errInputsSettling", err)
+	}
+
+	ob.mu.Lock()
+	delete(ob.byPath, job.Inputs[1].Path)
+	ob.recent[job.Inputs[0].Path] = recentConfirm{at: time.Now()}
+	ob.mu.Unlock()
+	if err := r.c.finishObjectJob(context.Background(), "j1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range job.Inputs {
+		if r.exists(in.Path) {
+			t.Fatalf("input %s left after its job ended", in.Path)
+		}
+	}
+}
+
+// syncingConsumedManifest: this FSM learns of the compaction only once it
+// syncs, as a node replaying its journal right after a restart does.
+type syncingConsumedManifest struct {
+	*fakeOutboxManifest
+	consumed string
+	mu       sync.Mutex
+	synced   bool
+}
+
+func (m *syncingConsumedManifest) SyncManifest(context.Context) error {
+	m.mu.Lock()
+	m.synced = true
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *syncingConsumedManifest) ConsumedByCompaction(path string, _ int64, _ string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.synced && path == m.consumed
+}
+
+// #1358 review: a journal-replayed entry is checked against a synced FSM; an
+// FSM still catching up would not know the compaction and the file would be
+// registered again next to its output.
+func TestOutboxSyncsBeforeTheConsumedCheckOnAReplayedEntry(t *testing.T) {
+	r := loadPending(t, t.TempDir(), map[string]int64{outPathA: 10})
+	m := &syncingConsumedManifest{fakeOutboxManifest: newFakeOutboxManifest(), consumed: outPathA}
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	waitOutbox(t, "settled", func() bool { return r.Pending() == 0 })
+	if m.isRegistered(outPathA) {
+		t.Fatal("a replayed input was registered again: the consumed check ran before a sync")
+	}
+}

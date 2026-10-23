@@ -225,8 +225,12 @@ func (c *Coordinator) OpenGeneration() uint64 {
 // commit on every node, so a reader whose FSM lags the finisher still knows
 // the job. A job whose output left the manifest (it is being reverted, or
 // its remover deletes the inputs too) leaves nothing out; nor does an input
-// the manifest lists again or this node's outbox holds, as the finisher
-// keeps those (deleteObjectInputs).
+// the manifest lists again or this node's outbox holds (HoldsRegistration:
+// pending, parked, or confirmed in the last minute). The finisher keeps the
+// first and the parked, and deletes the others once their registration here
+// settles (deleteObjectInputs, #1358); until then this node counts such an
+// input next to the output, for at most about a minute — the safe direction
+// when the hold may be a registration this FSM has not applied yet.
 func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, prefix string) []string {
 	jobs := fsm.FinalizingObjectJobsUnder(prefix)
 	c.open.mu.Lock()

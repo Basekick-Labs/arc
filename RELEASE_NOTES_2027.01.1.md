@@ -1501,10 +1501,14 @@ its input files. The finisher kept any input this node had confirmed as
 registered in the previous minute, and ended the job anyway. Once the job
 ended, nothing deleted those inputs or left them out of reads, so every node
 counted their rows twice, alongside the compaction's output. This happened
-when a compaction ran less than a minute after the inputs were registered:
-a manual or backfill compaction right after a flush or an import, or a
-registration backlog drained after a Raft outage. Scheduled hourly
-compaction, which waits at least an hour, was rarely affected.
+when a compaction ran less than a minute after the inputs were registered.
+Examples:
+- a manual or backfill compaction right after a flush or an import;
+- a scheduled hourly run (by default at :05) catching an hour that had
+  ended minutes earlier, while its last flush was still being registered;
+- a daily run over old days, which skips the file-age check
+  (`daily_skip_file_age_check_days`), right after an import into them;
+- a registration backlog drained after a Raft outage.
 
 **The fix:**
 - The finisher syncs with the leader before it decides. A confirmation
@@ -1519,10 +1523,11 @@ compaction, which waits at least an hour, was rarely affected.
   the file, and the job ends as before.
 - The finisher sorts every input into keep, wait or delete before it
   deletes any.
-- A node no longer registers again a file that a compaction it has not
-  finished took as an input. This can happen after a registration whose
+- A node no longer registers a file again if a compaction that has not
+  ended took it as an input. This can happen after a registration whose
   reply was lost, or one replayed from the journal. The file's rows are in
-  the compaction's output, so it is treated as registered.
+  the compaction's output, so it is treated as registered. Before checking
+  a replayed or retried file, the node syncs with the leader.
 
 **Limitations:**
 - Inputs left behind by an older version, from jobs that have already
@@ -1530,13 +1535,16 @@ compaction, which waits at least an hour, was rarely affected.
   reconciliation sweep (`reconciliation.enabled`, then
   `reconciliation.manifest_only_dry_run=false`) deletes them after its grace
   window.
-- A node does not register a consumed input again only while the
-  compaction's job is open. If another node's finisher deletes the file and
-  ends the job between this node's check and its registration, the manifest
-  gets an entry for a file that is gone. Queries list the bucket, so they
-  are not affected; the reconciliation sweep removes such an entry when it is
-  enabled. This window is narrow; before this fix, the same case registered
-  the file and its rows were counted twice for good.
+- The check that keeps a consumed input from being registered again only
+  runs while the compaction's job is open. If another node's finisher
+  deletes the file and ends the job just after this node has checked it is
+  still in storage, the manifest gets an entry for a file that is gone. The
+  same happened before this fix. Queries list the bucket, so they are not
+  affected; the reconciliation sweep removes such an entry when it is
+  enabled.
+- While a finished compaction waits for an input's registration to settle
+  (at most about a minute for a recent confirmation), the node that made
+  that registration counts the input next to the output.
 
 ### `time_bucket` and `date_trunc` put rows in the right bucket ([#1352](https://github.com/Basekick-Labs/arc/issues/1352))
 

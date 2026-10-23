@@ -95,6 +95,14 @@ func (c *Coordinator) objectFinisherLoop(ctx context.Context) {
 				}
 			}(s.Job)
 		}
+		// A job ended any other way (a revert, an abort, another node's
+		// finisher) leaves its settling-Warn time behind.
+		c.staged.settlingWarned.Range(func(k, _ any) bool {
+			if _, ok := fsm.StagedCompactionByJob(k.(string)); !ok {
+				c.staged.settlingWarned.Delete(k)
+			}
+			return true
+		})
 		if leader && time.Since(lastSweep) > objectStagedSweepEvery {
 			lastSweep = time.Now()
 			c.sweepStagedObjects(ctx)
@@ -342,6 +350,11 @@ var finisherSync = func(ctx context.Context, c *Coordinator) error { return c.Sy
 // left: it settles as registered (kept) or not (deleted) on a later attempt.
 // A parked one waits for an operator: its object is kept and the job ends, as
 // before. Every input is classified before any is deleted.
+//
+// What the sync cannot see: another node registering NEW content at an input's
+// path after the barrier. Paths are unique per flush (#1282), so that needs a
+// reuse this node did not take part in; the sync narrows it, it does not
+// close it.
 func (c *Coordinator) deleteObjectInputs(ctx context.Context, s raft.StagedCompaction) error {
 	t0 := time.Now()
 	if err := finisherSync(ctx, c); err != nil {
@@ -554,11 +567,18 @@ func (c *Coordinator) FinalizingObjectInputs(path string) []string {
 	return nil
 }
 
-// ConsumedByCompaction reports a path that a compaction not yet ended took
-// as an input, with this content (the SHA when both sides have one, else the
-// size), and that the manifest no longer lists: its rows are in that job's
-// output. The registration outbox asks it before registering a path again
-// (#1358).
+// ConsumedByCompaction reports a path a compaction not yet ended took as an
+// input, with this content (the SHA when both sides have one, else the size),
+// that the manifest no longer lists. The registration outbox asks it before
+// registering a path again (#1358): if the job committed, the rows are in its
+// output and registering the file again would count them twice for good; if
+// it has not, a remover (a DELETE rewrite, retention) unlisted the input, the
+// commit will refuse on that, and registering it again would undo the
+// removal. Either way it is not registered.
+//
+// Reads this node's FSM: the outbox syncs before asking for any entry that
+// is not freshly flushed (a journal replay, a retry), the ones that can be
+// an input already.
 func (c *Coordinator) ConsumedByCompaction(path string, size int64, sha256 string) bool {
 	if c == nil || c.raftNode == nil {
 		return false
@@ -567,31 +587,20 @@ func (c *Coordinator) ConsumedByCompaction(path string, size int64, sha256 strin
 	if fsm == nil {
 		return false
 	}
-	// The map lookup first: the outbox asks for every file it registers.
-	if !fsm.StagedCompactionOwns(path) {
+	in, ok := fsm.StagedInputFor(path)
+	if !ok {
 		return false
 	}
 	if _, reg := fsm.GetFile(path); reg {
 		return false
 	}
-	for _, s := range fsm.StagedCompactions() {
-		for _, in := range s.Inputs {
-			if in.Path != path {
-				continue
-			}
-			if in.SHA256 != "" && sha256 != "" {
-				if in.SHA256 == sha256 {
-					return true
-				}
-				continue
-			}
-			if in.SizeBytes == size {
-				return true
-			}
-		}
+	if in.SHA256 != "" && sha256 != "" {
+		return in.SHA256 == sha256
 	}
-	return false
+	return in.SizeBytes == size
 }
+
+var _ consumedInputChecker = (*Coordinator)(nil)
 
 // CompactionOwns reports a file a staged compaction owns (an input or the
 // output of a job not yet ended).

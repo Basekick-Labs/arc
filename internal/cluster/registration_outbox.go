@@ -1011,10 +1011,12 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	// A committed file this FSM still does not show after a successful
 	// barrier was committed and then removed (compaction or a DELETE got to
 	// it first): it was registered, so it settles as such.
+	synced := false
 	if len(waiting) > 0 {
 		bctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
 		berr := manifest.SyncManifest(bctx)
 		cancel()
+		synced = berr == nil
 		for _, e := range waiting {
 			if _, ok := manifest.GetFileEntry(e.rec.Path); ok || berr == nil {
 				r.markInManifest(e)
@@ -1030,22 +1032,35 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	var sent []*outboxEntry
 	opEntry := map[int]*outboxEntry{} // register op index -> entry
 	bytes := 0
+	// The consumed check reads this node's FSM. An entry that is not freshly
+	// flushed (replayed from the journal after a restart, or retried) may be
+	// an input of a compaction this FSM has not caught up with yet, so sync
+	// first, once per attempt; a fresh entry costs no barrier (#1358 review).
 	consumed, _ := manifest.(consumedInputChecker)
+	if consumed != nil && len(toCheck) > 0 && !synced {
+		bctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
+		synced = manifest.SyncManifest(bctx) == nil
+		cancel()
+	}
 	for _, e := range candidates {
 		if bytes >= registrarDrainChunkBytes {
 			break
 		}
 		// Registered once already (an apply that timed out but committed, an
-		// ack lost and replayed from the journal) and since consumed by a
-		// compaction the manifest still knows: its rows are in that output,
-		// so registering it again would count them twice for good — and its
-		// committed job's finisher keeps the object while it is pending here
-		// (#1358). It settles as registered, as the committed-and-removed
-		// case above does.
+		// ack lost and replayed from the journal) and since taken by a
+		// compaction the manifest still knows (ConsumedByCompaction says why
+		// it must not register again) — and that job's finisher waits while
+		// it is pending here (#1358). It settles as registered, as the
+		// committed-and-removed case above does.
+		if consumed != nil && checked[e] && !synced {
+			// Unsynced, the check could miss a compaction that consumed it.
+			deferred = append(deferred, e)
+			continue
+		}
 		if consumed != nil && consumed.ConsumedByCompaction(e.rec.Path, e.rec.SizeBytes, e.rec.SHA256) {
 			r.markInManifest(e)
 			r.logger.Info().Str("path", e.rec.Path).
-				Msg("Pending file is an input of a committed compaction; its rows are in that compaction's output, so it is not registered again")
+				Msg("Pending file was taken as an input by a compaction that has not ended; not registered again (its rows are in the compaction's output, or a DELETE or retention removed it)")
 			settled = append(settled, e)
 			continue
 		}
