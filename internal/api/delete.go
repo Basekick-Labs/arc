@@ -667,6 +667,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// Files left alone because the manifest does not list them yet (#1214):
 	// retryable, so the answer is 503 rather than 207.
 	var notRegistered []string
+	var moving []string
 
 	for round := 0; ; round++ {
 		var changed []string
@@ -711,6 +712,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				failedFiles = append(failedFiles, filepath.Base(f.path))
 				if errors.Is(err, errNotRegisteredYet) {
 					notRegistered = append(notRegistered, f.relativePath)
+				}
+				if errors.Is(err, tiering.ErrFileMoving) {
+					moving = append(moving, f.relativePath)
 				}
 				continue
 			}
@@ -783,17 +787,27 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		UnflushedNodes:   unflushed,
 	}
 
-	if !onlyNotRegistered(len(failedFiles), len(notRegistered)) {
+	if !onlyNotRegistered(len(failedFiles), len(notRegistered)+len(moving)) {
 		// A failure that is not only "retry later" is the more general one:
 		// 207, naming both.
 		resp.Error = fmt.Sprintf("%d of %d files failed to process", len(failedFiles), len(seen))
 		if len(notRegistered) > 0 {
 			resp.Error += fmt.Sprintf(" (%d of them are not registered in the cluster manifest yet and were left as they are; retry for those)", len(notRegistered))
 		}
+		if len(moving) > 0 {
+			resp.Error += fmt.Sprintf(" (%d of them are being moved to cold storage and were left as they are; retry for those after the next tiering cycle)", len(moving))
+		}
 		return c.Status(fiber.StatusMultiStatus).JSON(resp)
 	}
-	if len(notRegistered) > 0 {
-		resp.Error = fmt.Sprintf("Delete incomplete: %d of %d files are not registered in the cluster manifest yet (another writer may still be registering them) and were left as they are; the rows of the other files are deleted; retry to finish", len(notRegistered), len(seen))
+	if len(notRegistered) > 0 || len(moving) > 0 {
+		var why []string
+		if len(notRegistered) > 0 {
+			why = append(why, fmt.Sprintf("%d of %d files are not registered in the cluster manifest yet (another writer may still be registering them)", len(notRegistered), len(seen)))
+		}
+		if len(moving) > 0 {
+			why = append(why, fmt.Sprintf("%d of %d files are being moved to cold storage (retry after the next tiering cycle)", len(moving), len(seen)))
+		}
+		resp.Error = "Delete incomplete: " + strings.Join(why, "; ") + " and were left as they are; the rows of the other files are deleted; retry to finish"
 		return respondDeleteUnavailable(c, resp)
 	}
 
@@ -1127,6 +1141,15 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
 		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
 	}
+	// Kept off a file the tiering migrator is copying, or one with a cold
+	// copy already: a rewrite here would leave that copy holding the rows
+	// this DELETE removes, and the cold sync would serve them again for
+	// good. Claimed for the whole rewrite, tier metadata included.
+	release, err := h.tieringManager.ClaimForDelete(ctx, relativePath)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	if scanSHA == unmanagedSHA && peerFlushOn(h.coordinator) && h.freshUnregistered(ctx, relativePath) {
 		// A writer's flush still on its way to the manifest (#1265): left
 		// as it is, and the DELETE retried, which finds it registered.

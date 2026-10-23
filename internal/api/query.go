@@ -1509,6 +1509,13 @@ func (h *QueryHandler) InvalidateCaches() {
 	h.logger.Info().Msg("Query caches invalidated (files removed or rewritten)")
 }
 
+// InvalidateCachesQuiet is InvalidateCaches without the Info line, for a
+// caller that invalidates around every chunk of a long operation.
+func (h *QueryHandler) InvalidateCachesQuiet() {
+	h.pruner.InvalidateAllCachesQuiet()
+	h.queryCache.Invalidate()
+}
+
 // StartBackgroundWorkers spawns the long-lived goroutines the handler
 // needs: today this is the partition pruner cache janitor, which
 // sweeps expired entries from globCache + partitionCache so they don't

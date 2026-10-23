@@ -4856,6 +4856,16 @@ func main() {
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
+		// Around every chunk of hot copies a migration releases, and when a
+		// replica records a pulled file's move to cold: a cold listing cached
+		// before the copy, or a hot glob cached before the release, would
+		// otherwise answer for a TTL without the moved file.
+		tieringManager.SetOnReadCachesStale(func() {
+			queryHandler.InvalidateCachesQuiet()
+			if cfg.Query.EnableS3Cache {
+				db.ClearHTTPCache()
+			}
+		})
 		// #687: on an edge-sync hub, tiering deletes of hot spoke files must
 		// mark their sync receipts first, or the spoke re-uploads duplicates.
 		// Wiring this also lifts the migrator's spoke-namespace gate.

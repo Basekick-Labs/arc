@@ -1212,6 +1212,13 @@ func (p *PartitionPruner) InvalidateAllCaches() {
 	p.logger.Info().Msg("All caches invalidated")
 }
 
+// InvalidateAllCachesQuiet is InvalidateAllCaches without the Info line, for
+// a caller that invalidates around every chunk of a long operation.
+func (p *PartitionPruner) InvalidateAllCachesQuiet() {
+	p.globCache.invalidate()
+	p.partitionCache.invalidate()
+}
+
 // CleanupGlobCache removes expired entries from the glob cache
 func (p *PartitionPruner) CleanupGlobCache() int {
 	removed := p.globCache.cleanup()
