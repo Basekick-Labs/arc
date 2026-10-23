@@ -346,8 +346,12 @@ func TestDeleteSaysWhenColdStorageWasNotExamined(t *testing.T) {
 	r.tier.backend = nil
 	r.parquet(leftoverHour+"cpu_20261007_205000_000000000.parquet", "h0", "h5")
 
-	code, out := r.delete(`{"database":"db","measurement":"cpu","where":"host = 'h0'","confirm":true}`)
-	if code != 207 || out.ColdNotExamined == "" || out.DeletedCount != 1 {
+	code, out := r.delete(`{"database":"db","measurement":"cpu","where":"host = 'h5'","dry_run":true}`)
+	if code != 207 || out.Success || out.ColdNotExamined == "" {
+		t.Fatalf("dry run got %d %+v, want 207 with success false", code, out)
+	}
+	code, out = r.delete(`{"database":"db","measurement":"cpu","where":"host = 'h0'","confirm":true}`)
+	if code != 207 || out.Success || out.ColdNotExamined == "" || out.DeletedCount != 1 {
 		t.Fatalf("got %d %+v, want 207 naming cold storage as not examined, the hot row deleted", code, out)
 	}
 }
