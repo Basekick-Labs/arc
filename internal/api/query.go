@@ -29,6 +29,7 @@ import (
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -705,7 +706,14 @@ type QueryHandler struct {
 	openCompactions OpenCompactions
 	// vanishedInvalidatedAt rate-limits the cache wipe after a partition
 	// removed mid-query (UnixNano; see invalidateAfterVanished).
-	vanishedInvalidatedAt   atomic.Int64
+	vanishedInvalidatedAt atomic.Int64
+	// vanishedHTTPClearedAt rate-limits the HTTP cache clear after an object
+	// removed mid-query, separately, so a local vanish cannot use up the
+	// slot a remote one needs (UnixNano).
+	vanishedHTTPClearedAt atomic.Int64
+	// clearHTTPCache drops cache_httpfs's listings and blocks; nil means
+	// h.db.ClearHTTPCache (tests replace it).
+	clearHTTPCache          func()
 	logger                  zerolog.Logger
 	authManager             *auth.AuthManager
 	rbacManager             RBACChecker
@@ -1415,15 +1423,18 @@ func (h *QueryHandler) schemaRouteParams(c *fiber.Ctx) (string, string, bool) {
 // answer. The transform cache is dropped so the next attempt re-resolves
 // (and re-materializes) the anchor, and the error is surfaced.
 func (h *QueryHandler) missingAnchor(err error) bool {
-	if err == nil || h.fieldSchema == nil {
-		return false
-	}
 	pattern, ok := noFilesPattern(err)
-	if !ok || !h.fieldSchema.IsLocalAnchorPath(pattern) {
+	return ok && h.missingAnchorPath(pattern)
+}
+
+// missingAnchorPath is missingAnchor for a path, whichever error named it:
+// an anchor removed while a scan reads it is the same case (plannedFile).
+func (h *QueryHandler) missingAnchorPath(path string) bool {
+	if h.fieldSchema == nil || !h.fieldSchema.IsLocalAnchorPath(path) {
 		return false
 	}
 	h.queryCache.Invalidate()
-	h.logger.Warn().Str("anchor", pattern).Msg("Field schema anchor missing on disk; SQL transform cache dropped so the next query re-materializes it")
+	h.logger.Warn().Str("anchor", path).Msg("Field schema anchor missing on disk; SQL transform cache dropped so the next query re-materializes it")
 	return true
 }
 
@@ -2552,31 +2563,53 @@ localProcessing:
 	return nil
 }
 
+// duckdbMessage returns the message of a DuckDB error of type t, as DuckDB
+// wrote it ("<Type> Error: ..."), unwrapping Arc's own wrapping.
+//
+// The classifiers below match on DuckDB's text, so they must read only an
+// error DuckDB raised, and only from its start: DuckDB echoes user text in
+// other errors (a failed CAST quotes the literal, error() its argument, a
+// Binder error the SQL), and a query could otherwise forge "a file vanished"
+// to get a 503 and wipe the node's caches, or forge "no files" to get an
+// empty success (#1355 review).
+func duckdbMessage(err error, t duckdb.ErrorType) (string, bool) {
+	var de *duckdb.Error
+	if !errors.As(err, &de) || de.Type != t {
+		return "", false
+	}
+	return de.Msg, true
+}
+
+// quotedAfter returns the text between quote and the next quote when msg
+// starts with lead+quote, and that text is followed by tail.
+func quotedAfter(msg, lead, quote, tail string) (string, bool) {
+	rest, ok := strings.CutPrefix(msg, lead+quote)
+	if !ok {
+		return "", false
+	}
+	end := strings.Index(rest, quote)
+	if end <= 0 || !strings.HasPrefix(rest[end+len(quote):], tail) {
+		return "", false
+	}
+	return rest[:end], true
+}
+
 // isNoFilesFoundError checks if a DuckDB error is the "No files found" IO error.
 // This occurs when read_parquet glob pattern matches zero files on S3/Azure/local storage.
-// This is NOT a real error — it means the measurement has no data yet (or DuckDB's
-// httpfs directory cache is stale). We treat it as an empty result.
+// What it means is classifyNoFiles's call: no data yet, or a pattern that
+// vanished.
 func isNoFilesFoundError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "No files found that match the pattern")
+	_, ok := noFilesPattern(err)
+	return ok
 }
 
 // noFilesPattern returns the pattern a DuckDB "No files found" error names.
 func noFilesPattern(err error) (string, bool) {
-	if err == nil {
+	msg, ok := duckdbMessage(err, duckdb.ErrorTypeIO)
+	if !ok {
 		return "", false
 	}
-	msg := err.Error()
-	const lead = "No files found that match the pattern \""
-	start := strings.Index(msg, lead)
-	if start < 0 {
-		return "", false
-	}
-	rest := msg[start+len(lead):]
-	end := strings.Index(rest, "\"")
-	if end < 0 {
-		return "", false
-	}
-	return rest[:end], true
+	return quotedAfter(msg, "IO Error: No files found that match the pattern ", `"`, "")
 }
 
 // noFilesKind classifies a DuckDB "No files found" error.
@@ -2588,8 +2621,9 @@ const (
 	// noFilesEmpty: the measurement's unpruned glob matched nothing, which
 	// answers an empty result (a measurement with no data yet).
 	noFilesEmpty
-	// noFilesVanished: a pruned partition or file disappeared after the
-	// query was planned. The answer is unknown, never empty.
+	// noFilesVanished: a pruned partition, or a file one of Arc's patterns
+	// matched, disappeared after the query was planned or while it was
+	// scanned. The answer is unknown, never empty.
 	noFilesVanished
 )
 
@@ -2602,16 +2636,30 @@ const vanishedPartitionMessage = "data read by this query was removed while it r
 //
 // Only the measurement's unpruned "**/*.parquet" glob matching nothing means
 // "no rows". Every other pattern Arc hands DuckDB (an hour or day partition
-// glob, an explicit file from file-time pruning) was checked to exist when
-// the query was planned, so its absence at execution means files were removed
-// in between: retention, compaction or a DELETE took that hour while the
-// query was in flight, or a cached transform outlived the files. Answering an
-// empty result there dropped every row of the query, not just that hour's,
-// with success:true. The caches are cleared so the next attempt re-plans.
+// glob, an explicit file from file-time pruning) was listed when the query
+// was planned, so its absence at execution means files were removed in
+// between: retention, compaction or a DELETE took that hour while the query
+// was in flight, or a cached transform outlived the files. Answering an empty
+// result there dropped every row of the query, not just that hour's, with
+// success:true. The caches are cleared so the next attempt re-plans. (A tiered
+// read keeps a remote path it could not verify when its listing fails, so
+// "listed" is not always "checked".)
+//
+// DuckDB expands a glob at bind and opens each file as the scan reaches it,
+// so a file removed in between fails with a different text (vanishedFile):
+// compaction deleting a batch's inputs while a query reads the hour (#1355).
+// That is the same condition and gets the same answer.
 //
 // A "**" glob can still be one of several patterns a tiered read combines,
 // so an empty answer for it is only as right as it was before this check.
 func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
+	if path, remote, ok := vanishedFile(err); ok {
+		if !h.plannedFile(path, remote) {
+			return noFilesOther
+		}
+		h.invalidateAfterVanished(path, remote)
+		return noFilesVanished
+	}
 	if !isNoFilesFoundError(err) || h.missingAnchor(err) {
 		return noFilesOther
 	}
@@ -2619,24 +2667,106 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 	if !ok || strings.HasSuffix(pattern, "**/*.parquet") {
 		return noFilesEmpty
 	}
-	h.invalidateAfterVanished(pattern)
+	h.invalidateAfterVanished(pattern, false)
 	return noFilesVanished
 }
 
-// invalidateAfterVanished clears the query caches after a vanished partition,
-// at most once per second: an object-store listing that keeps failing keeps
-// unverified paths in every plan, and a node-wide wipe per query would
-// defeat the caches for everyone else.
-func (h *QueryHandler) invalidateAfterVanished(pattern string) {
+// vanishedFile returns the file a DuckDB scan could not open because it no
+// longer existed, and whether it is an object-store URL. The texts were
+// measured with the duckdb-go Arc ships; the local one is pinned by
+// TestVanishedFileTexts, and the S3 and Azure ones were recorded against
+// SeaweedFS 4.47 and Azurite 3.35 (TestClassifyVanishedFile):
+//
+//	local: IO Error: Cannot open file "<path>": No such file or directory
+//	S3:    HTTP Error: HTTP GET error reading '<url>' in region '<r>' (HTTP 404 Not Found)
+//	Azure: IO Error: AzureStorageFileSystem open file '<url>' failed with code 'BlobNotFound', ...
+//
+// Each must be a DuckDB error of that type and start with that text
+// (duckdbMessage). The S3 reason phrase after the status code comes from the
+// server, so it is not matched.
+func vanishedFile(err error) (path string, remote bool, ok bool) {
+	if msg, ok := duckdbMessage(err, duckdb.ErrorTypeIO); ok {
+		if p, ok := quotedAfter(msg, "IO Error: Cannot open file ", `"`, ": No such file or directory"); ok {
+			return p, false, true
+		}
+		if p, ok := quotedAfter(msg, "IO Error: AzureStorageFileSystem open file ", "'", " failed with code 'BlobNotFound'"); ok {
+			return p, true, true
+		}
+	}
+	if msg, ok := duckdbMessage(err, duckdb.ErrorTypeHTTP); ok {
+		if p, ok := quotedAfter(msg, "HTTP Error: HTTP GET error reading ", "'", ""); ok {
+			tail := strings.TrimPrefix(msg, "HTTP Error: HTTP GET error reading '"+p+"'")
+			if i := strings.Index(tail, "(HTTP "); i >= 0 && strings.HasPrefix(tail[i:], "(HTTP 404") {
+				return p, true, true
+			}
+		}
+	}
+	return "", false, false
+}
+
+// plannedFile reports whether a file a scan could not open is one Arc's
+// patterns matched: a Parquet file under the local storage root, or, on a
+// node that reads an object store (primary storage or a cold tier), a
+// Parquet object. Arc builds every object path DuckDB reads. A missing
+// schema anchor is not one: it keeps #1333's handling (missingAnchorPath).
+func (h *QueryHandler) plannedFile(path string, remote bool) bool {
+	if !strings.HasSuffix(path, ".parquet") {
+		return false
+	}
+	if remote {
+		return h.readsObjectStore()
+	}
+	if !underRoot(path, h.getStorageBasePath()) {
+		return false
+	}
+	return !h.missingAnchorPath(path)
+}
+
+// readsObjectStore reports whether this node's queries read S3 or Azure:
+// its primary storage, or a tiering cold tier.
+func (h *QueryHandler) readsObjectStore() bool {
+	switch h.storage.(type) {
+	case *storage.S3Backend, *storage.AzureBlobBackend:
+		return true
+	}
+	return h.tieringManager != nil
+}
+
+// underRoot reports whether path is inside root, matching at a separator so
+// /data-other is not inside /data, and a root of "/" or with a trailing slash
+// still works. An empty root (an object-store primary) holds nothing local.
+func underRoot(path, root string) bool {
+	return root != "" && strings.HasPrefix(path, strings.TrimSuffix(root, "/")+"/")
+}
+
+// invalidateAfterVanished clears the query caches after a vanished partition
+// or file, at most once per second: an object-store listing that keeps
+// failing keeps unverified paths in every plan, and a node-wide wipe per
+// query would defeat the caches for everyone else. For an object it also
+// clears cache_httpfs, on its own once-per-second gate: a cached listing
+// still names the removed object, and until the entry expired every retry
+// failed the same way while Retry-After said 1 s. The clear runs in the
+// background: it takes a pooled connection, and this request's 503 must not
+// wait behind running queries for one.
+func (h *QueryHandler) invalidateAfterVanished(path string, remote bool) {
 	now := time.Now().UnixNano()
+	if remote {
+		if last := h.vanishedHTTPClearedAt.Load(); now-last >= int64(time.Second) && h.vanishedHTTPClearedAt.CompareAndSwap(last, now) {
+			clear := h.clearHTTPCache
+			if clear == nil {
+				clear = h.db.ClearHTTPCacheQuietly
+			}
+			go clear()
+		}
+	}
 	last := h.vanishedInvalidatedAt.Load()
 	if now-last < int64(time.Second) || !h.vanishedInvalidatedAt.CompareAndSwap(last, now) {
 		return
 	}
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
-	h.logger.Warn().Str("pattern", pattern).
-		Msg("A pruned partition or file was removed while a query ran (retention, compaction or DELETE); query caches cleared, the query answers 503 rather than an empty result")
+	h.logger.Warn().Str("path", path).
+		Msg("Data a query read was removed while it ran (retention, compaction or DELETE); query caches cleared, the query answers 503 rather than an error or an empty result. If this path keeps appearing, it is missing for good (e.g. a dangling link under the storage root), not in flight")
 }
 
 // SQLValidationError represents an error from SQL validation
@@ -5421,6 +5551,20 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			cancel()
 		}
 		m.IncQueryErrors()
+		// A partition or file removed mid-query: retryable, as on the other
+		// routes (classifyNoFiles).
+		if h.classifyNoFiles(err) == noFilesVanished {
+			if onFail != nil {
+				onFail(vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           vanishedPartitionMessage,
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
 		if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
 			if onTimeout != nil {
