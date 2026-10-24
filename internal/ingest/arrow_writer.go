@@ -4355,6 +4355,10 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 // WAL-only. markFlushFailure alone cannot say — hasFlushFailure is a
 // process-wide latch with no per-task attribution.
 func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string, group *flushGroup) error {
+	return b.flushRecordsAsyncWithStringLimit(ctx, bufferKey, database, measurement, records, recordCount, walHashes, group, maxParquetStringColumnBytes)
+}
+
+func (b *ArrowBuffer) flushRecordsAsyncWithStringLimit(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string, group *flushGroup, maxStringBytes int64) error {
 	if parts := b.splitForCoverage(bufferKey, records); parts != nil {
 		// Each class is its own group and file set (flush_split.go); the
 		// group built for the whole buffer is never announced.
@@ -4363,8 +4367,27 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		}
 		var first error
 		for _, p := range parts {
-			if err := b.flushRecordsAsync(ctx, bufferKey, database, measurement, p.records, p.rows, p.walHashes, p.group); err != nil && first == nil {
+			if err := b.flushRecordsAsyncWithStringLimit(ctx, bufferKey, database, measurement, p.records, p.rows, p.walHashes, p.group, maxStringBytes); err != nil && first == nil {
 				first = err
+			}
+		}
+		return first
+	}
+	if parts := b.splitFlushRecordsByStringBytes(bufferKey, records, maxStringBytes); parts != nil {
+		// A buffer can grow past Arrow's string-offset limit while flush-queue
+		// backpressure keeps it in memory. Flush bounded groups independently;
+		// each group's WAL identities are checkpointed only after its own files
+		// have been written and registered.
+		for i := range records {
+			records[i] = nil
+		}
+		var first error
+		for i := range parts {
+			if err := b.flushRecordsAsyncWithStringLimit(ctx, bufferKey, database, measurement, parts[i].records, parts[i].rows, parts[i].walHashes, parts[i].group, maxStringBytes); err != nil && first == nil {
+				first = err
+			}
+			for j := range parts[i].records {
+				parts[i].records[j] = nil
 			}
 		}
 		return first
@@ -4716,6 +4739,10 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 // flushBufferLocked writes buffered data to Parquet and storage (synchronous version for periodic flush)
 // Note: Caller must hold shard.mu lock
 func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string) error {
+	return b.flushBufferLockedWithStringLimit(ctx, shard, bufferKey, database, measurement, maxParquetStringColumnBytes)
+}
+
+func (b *ArrowBuffer) flushBufferLockedWithStringLimit(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string, maxStringBytes int64) error {
 	batches, exists := shard.buffers[bufferKey]
 	if !exists || len(batches) == 0 {
 		// Clean up stale tracking entries even if buffer is empty.
@@ -4771,12 +4798,42 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// Release lock before expensive operations
 	shard.mu.Unlock()
 
-	if parts := b.splitForCoverage(bufferKey, recordsToFlush); parts != nil {
-		// Each class is its own group and file set (flush_split.go).
+	coverageParts := b.splitForCoverage(bufferKey, recordsToFlush)
+	baseParts := coverageParts
+	if baseParts == nil {
+		baseParts = []flushPart{{records: recordsToFlush, walHashes: walHashes, group: group, rows: recordCount}}
+	}
+	parts := make([]flushPart, 0, len(baseParts))
+	needsSplit := coverageParts != nil
+	for i := range baseParts {
+		stringBounded := b.splitFlushRecordsByStringBytes(bufferKey, baseParts[i].records, maxStringBytes)
+		if stringBounded == nil {
+			parts = append(parts, baseParts[i])
+			continue
+		}
+		needsSplit = true
+		for j := range baseParts[i].records {
+			baseParts[i].records[j] = nil
+		}
+		parts = append(parts, stringBounded...)
+	}
+	if needsSplit {
+		// Each coverage class and size-bounded group has its own WAL/coverage
+		// lifecycle. Keep attempting later groups if one fails, as in the
+		// existing coverage split path.
+		for i := range batches {
+			batches[i] = nil
+		}
+		for i := range recordsToFlush {
+			recordsToFlush[i] = nil
+		}
 		var first error
-		for _, p := range parts {
-			if err := b.flushPartSync(ctx, bufferKey, database, measurement, p); err != nil && first == nil {
+		for i := range parts {
+			if err := b.flushPartSync(ctx, bufferKey, database, measurement, parts[i]); err != nil && first == nil {
 				first = err
+			}
+			for j := range parts[i].records {
+				parts[i].records[j] = nil
 			}
 		}
 		completeTask()
