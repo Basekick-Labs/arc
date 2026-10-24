@@ -506,9 +506,13 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	var marks map[string]uint64
 	var unflushed []string
 	where := req.Where
+	// The time range the scans read only the files of (delete_window.go):
+	// from the WHERE as written, with now() pinned as the record pins it.
+	scan := scanOpts{wait: !req.DryRun, allowUnreachable: req.AllowUnreachable, windowWhere: req.Where}
 	if !req.DryRun {
 		if rec = recorderOf(h.coordinator); rec != nil {
-			if where, err = pinDeleteTime(req.Where, deleteNow()); err != nil {
+			scan.windowNow = deleteNow().UTC()
+			if where, err = pinDeleteTime(req.Where, scan.windowNow); err != nil {
 				return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: err.Error()})
 			}
 		}
@@ -523,9 +527,8 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// With compaction commit on, the scan set is the manifest's (#1207 d2):
 	// a file it lists that is not here yet (a compaction output on its way)
 	// is waited for.
-	scan := scanOpts{wait: !req.DryRun, allowUnreachable: req.AllowUnreachable}
 	if rec != nil {
-		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow())); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
 	}
@@ -533,12 +536,17 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// Find affected files
 	affected, unlisted, leftovers, err := h.scanFiles(ctx, req.Database, req.Measurement, where, scan)
 	if casActive(h.coordinator) {
-		// The scan checked every manifest file of the measurement: what it
-		// could not find is what is unreachable now.
+		// The scan checked every manifest file of the measurement in the
+		// DELETE's time range (all of them without one): what it could not
+		// find is what is unreachable now. One outside the range holds no
+		// row the DELETE matches, and is not reported.
 		unreachable = unlisted
 	}
-	if errors.Is(err, errManifestNotSynced) || isContextErr(err) {
+	if errors.Is(err, errManifestNotSynced) || errors.Is(err, errScanFileChanged) || isContextErr(err) {
 		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry shortly"})
+	}
+	if bindErr := (*whereBindError)(nil); errors.As(err, &bindErr) {
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete rejected: " + err.Error()})
 	}
 	if errors.Is(err, errUnreachableFiles) {
 		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
@@ -554,7 +562,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 
 	// Cold storage (#1350): files tiering moved there, which the scan above
 	// never lists.
-	cold := h.scanCold(ctx, req.Database, req.Measurement, where)
+	cold := h.scanCold(ctx, req.Database, req.Measurement, where, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow()))
 
 	if len(affected) == 0 && rec == nil && !cold.matters() {
 		if !req.DryRun && leftovers > 0 {
@@ -665,17 +673,19 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete not run: recording it in the cluster failed or could not be confirmed (" + err.Error() + "); it may already apply to rows replayed later; retry to run it"})
 		}
 		h.recordID = id
-		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow())); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
 		affected, unlisted, err = h.findAffectedFiles(ctx, req.Database, req.Measurement, where, scan)
 		if casActive(h.coordinator) {
 			unreachable = unlisted
 		}
-		if errors.Is(err, errManifestNotSynced) || isContextErr(err) {
+		if errors.Is(err, errManifestNotSynced) || errors.Is(err, errScanFileChanged) || isContextErr(err) {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; retry shortly"})
 		} else if errors.Is(err, errUnreachableFiles) {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
+		} else if bindErr := (*whereBindError)(nil); errors.As(err, &bindErr) {
+			return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete recorded, not run: " + err.Error()})
 		} else if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + err.Error(),
@@ -807,6 +817,32 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		var missing []string
 		affected, missing, err = h.rescanAfterChange(ctx, req.Database, req.Measurement, where, scan)
 		unreachable = missing
+		var fileErr *scanFileError
+		var bindErr *whereBindError
+		if errors.As(err, &fileErr) || errors.As(err, &bindErr) {
+			// Not "retry to finish": the file fails the same way next time.
+			failedPath := ""
+			if fileErr != nil {
+				failedPath = fileErr.path
+			} else {
+				failedPath = bindErr.path
+			}
+			h.db.ClearHTTPCache()
+			h.filesRemoved()
+			freeOSMemoryThrottled()
+			return c.Status(fiber.StatusMultiStatus).JSON(DeleteResponse{
+				Success:          false,
+				Error:            "Delete incomplete: " + err.Error() + "; the rows of the other files are deleted",
+				DeletedCount:     totalDeleted,
+				AffectedFiles:    len(seen),
+				RewrittenFiles:   rewrittenCount,
+				FilesProcessed:   processedFiles,
+				FailedFiles:      append(failedFiles, filepath.Base(failedPath)),
+				UnreachableFiles: unreachable,
+				UnflushedNodes:   unflushed,
+				ExecutionTimeMs:  float64(time.Since(start).Milliseconds()),
+			})
+		}
 		if err != nil {
 			return incomplete(err.Error())
 		}
@@ -1039,6 +1075,24 @@ func (h *DeleteHandler) scanFiles(ctx context.Context, database, measurement, wh
 		})
 	}
 
+	// Only the files the WHERE's time range can touch, before the leftovers
+	// and the scan set judge them: a file left out here is left out of both
+	// (delete_window.go).
+	window := h.windowFor(database, measurement, opts.whereForWindow(whereClause), opts.nowForWindow())
+	opts.window = window
+	if window != nil {
+		listed := len(parquetFiles)
+		inWindow := make([]fileInfo, 0, len(parquetFiles))
+		for _, f := range parquetFiles {
+			if window.keeps(f.relativePath) {
+				inWindow = append(inWindow, f)
+			}
+		}
+		parquetFiles = inWindow
+		h.logger.Info().Int("listed", listed).Int("in_time_range", len(parquetFiles)).
+			Msg("Delete reads only the files its time range can touch")
+	}
+
 	// Files an earlier DELETE replaced and could not remove are never read
 	// into a new file (delete_leftovers.go).
 	// With compaction commit on, scanSet does it right after its own sync.
@@ -1073,15 +1127,9 @@ func (h *DeleteHandler) scanFiles(ctx context.Context, database, measurement, wh
 
 	h.logger.Info().Int("file_count", len(parquetFiles)).Msg("Scanning parquet files for matching rows")
 
-	// Optimized: Use batch query to count matching rows across all files in one query
-	// This replaces N individual queries with a single query using read_parquet with file list
-	affected, err = h.countMatchingRowsInFiles(ctx, parquetFiles, whereClause)
+	affected, err = countFiles(h, ctx, parquetFiles, whereClause)
 	if err != nil {
-		// Fallback to individual queries if batch fails (e.g., schema mismatch)
-		h.logger.Warn().Err(err).Msg("Batch count failed, falling back to individual queries")
-		if affected, err = h.countMatchingRowsIndividually(ctx, parquetFiles, whereClause); err != nil {
-			return affected, unreachable, leftovers, err
-		}
+		return nil, unreachable, leftovers, err
 	}
 	for i := range affected {
 		affected[i].sha = shas[affected[i].relativePath]
@@ -1095,110 +1143,98 @@ type fileInfo struct {
 	relativePath string
 }
 
-// countMatchingRowsInFiles counts matching rows across multiple files in a single query
+// countMatchingRowsInFiles counts the rows where matches in each file, in
+// chunks (countInChunks). A file that cannot be counted stops the scan: gone
+// since the listing is errScanFileChanged (retryable, the next scan lists what
+// replaced it), anything else a scanFileError. Neither is read as "no
+// match", which would leave the file's matching rows and report success.
 func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fileInfo, whereClause string) ([]affectedFile, error) {
 	if len(files) == 0 {
 		return nil, nil
 	}
-
-	db := h.db.DB()
-
-	// Build array of file paths for DuckDB, escaping single quotes in paths.
-	var pathList strings.Builder
-	pathList.WriteString("[")
-	for i, f := range files {
-		if i > 0 {
-			pathList.WriteString(", ")
-		}
-		pathList.WriteString(sqlutil.QuoteStringLiteral(f.queryPath))
+	db, release, err := h.countConn(ctx)
+	if err != nil {
+		return nil, err
 	}
-	pathList.WriteString("]")
-
-	// Single query to get counts per file using filename column
-	query := fmt.Sprintf(`
+	defer release()
+	count := func(ctx context.Context, idx []int) (map[int]affectedFile, error) {
+		if onDeleteCountQuery != nil {
+			onDeleteCountQuery(len(idx))
+		}
+		var pathList strings.Builder
+		pathList.WriteString("[")
+		byQuery := make(map[string]int, len(idx))
+		for n, i := range idx {
+			if n > 0 {
+				pathList.WriteString(", ")
+			}
+			pathList.WriteString(sqlutil.QuoteStringLiteral(files[i].queryPath))
+			byQuery[files[i].queryPath] = i
+		}
+		pathList.WriteString("]")
+		query := fmt.Sprintf(`
 		SELECT filename, COUNT(*) as match_count
 		FROM %s
 		WHERE %s
 		GROUP BY filename
 		HAVING COUNT(*) > 0`,
-		sqlutil.ReadParquet(pathList.String(), "filename=true", "union_by_name=true"), whereClause)
-
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("batch count query failed: %w", err)
-	}
-	defer rows.Close()
-
-	// Build map of query path -> relative path for lookup
-	pathMap := make(map[string]string)
-	for _, f := range files {
-		pathMap[f.queryPath] = f.relativePath
-	}
-
-	var affected []affectedFile
-	for rows.Next() {
-		var filename string
-		var count int64
-		if err := rows.Scan(&filename, &count); err != nil {
-			return nil, fmt.Errorf("failed to scan row: %w", err)
+			sqlutil.ReadParquet(pathList.String(), "filename=true", "union_by_name=true"), whereClause)
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			return nil, err
 		}
-
-		relativePath, ok := pathMap[filename]
-		if !ok {
-			// Try to find by suffix match (DuckDB may return absolute paths)
-			for qp, rp := range pathMap {
-				if strings.HasSuffix(filename, filepath.Base(qp)) {
-					relativePath = rp
-					ok = true
-					break
+		defer rows.Close()
+		out := make(map[int]affectedFile)
+		for rows.Next() {
+			var filename string
+			var n int64
+			if err := rows.Scan(&filename, &n); err != nil {
+				return nil, fmt.Errorf("failed to scan row: %w", err)
+			}
+			i, ok := byQuery[filename]
+			if !ok {
+				// DuckDB may hand back another spelling of the path.
+				for qp, j := range byQuery {
+					if strings.HasSuffix(filename, filepath.Base(qp)) {
+						i, ok = j, true
+						break
+					}
 				}
 			}
+			if !ok {
+				return nil, fmt.Errorf("count returned an unknown file %q", filename)
+			}
+			out[i] = affectedFile{path: filename, matchCount: n, relativePath: files[i].relativePath}
 		}
-		if !ok {
-			h.logger.Warn().Str("filename", filename).Msg("Could not map filename to relative path")
-			continue
+		return out, rows.Err()
+	}
+	fail := func(i int, err error) error {
+		if size, serr := h.storage.StatFile(ctx, files[i].relativePath); serr == nil && size < 0 {
+			return fmt.Errorf("%w: %s", errScanFileChanged, files[i].relativePath)
 		}
-
-		affected = append(affected, affectedFile{
-			path:         filename,
-			matchCount:   count,
-			relativePath: relativePath,
-		})
-		h.logger.Debug().Str("file", filepath.Base(relativePath)).Int64("matches", count).Msg("Found matching rows")
+		return &scanFileError{path: files[i].relativePath, err: err}
 	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
+	got, _, err := countInChunks(ctx, len(files), func(i int) string { return files[i].relativePath }, count, fail)
+	if err != nil {
+		return nil, err
 	}
-
+	affected := make([]affectedFile, 0, len(got))
+	for i := range files {
+		if f, ok := got[i]; ok {
+			affected = append(affected, f)
+			h.logger.Debug().Str("file", filepath.Base(f.relativePath)).Int64("matches", f.matchCount).Msg("Found matching rows")
+		}
+	}
 	return affected, nil
 }
 
-// countMatchingRowsIndividually is the fallback when batch query fails
-func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files []fileInfo, whereClause string) ([]affectedFile, error) {
-	var affected []affectedFile
-	db := h.db.DB()
+// countFiles is countMatchingRowsInFiles; a var so a test can make one scan
+// of a DELETE fail.
+var countFiles = (*DeleteHandler).countMatchingRowsInFiles
 
-	for _, f := range files {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(f.queryPath)), whereClause)
-		var count int64
-		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
-			h.logger.Warn().Err(err).Str("file", f.relativePath).Msg("Failed to count matching rows, skipping file")
-			continue
-		}
-
-		if count > 0 {
-			affected = append(affected, affectedFile{
-				path:         f.queryPath,
-				matchCount:   count,
-				relativePath: f.relativePath,
-			})
-			h.logger.Debug().Str("file", filepath.Base(f.relativePath)).Int64("matches", count).Msg("Found matching rows")
-		}
-	}
-
-	return affected, nil
-}
+// onDeleteCountQuery, when set (tests), is called with the number of files
+// each counting query reads.
+var onDeleteCountQuery func(files int)
 
 // rewriteFileWithoutDeletedRows rewrites a Parquet file excluding rows that match the WHERE clause
 // For local storage: uses atomic rename

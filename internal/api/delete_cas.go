@@ -31,7 +31,7 @@ const deleteChangedRounds = 3
 // compactionCommitter is the coordinator's compaction commit side.
 type compactionCommitter interface {
 	CompactionCommitActive() bool
-	WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration) ([]string, error)
+	WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration, keep func(path string) bool) ([]string, error)
 	// SyncManifest returns once this node applied everything the leader
 	// had committed.
 	SyncManifest(ctx context.Context) error
@@ -46,6 +46,43 @@ type scanOpts struct {
 	wait bool
 	// allowUnreachable: scan without the ones still missing then.
 	allowUnreachable bool
+	// windowWhere and windowNow are what the time range is read from: the
+	// WHERE as the caller wrote it and the now its now() means. Empty: the
+	// WHERE scanned, at the time of the scan. A recorded DELETE scans a WHERE
+	// with now() pinned to a literal the extractor does not read, so it
+	// passes the original and the pinned instant.
+	windowWhere string
+	windowNow   time.Time
+	// window is the range scanFiles read, for scanSet.
+	window *deleteWindow
+}
+
+func (o scanOpts) whereForWindow(scanned string) string {
+	if o.windowWhere != "" {
+		return o.windowWhere
+	}
+	return scanned
+}
+
+func (o scanOpts) nowForWindow() time.Time {
+	if !o.windowNow.IsZero() {
+		return o.windowNow
+	}
+	return time.Now().UTC()
+}
+
+// inWindow drops the manifest entries outside the window: the scan neither
+// reads nor waits for them.
+func inWindow(m map[string]raft.FileEntry, w *deleteWindow) map[string]raft.FileEntry {
+	if w == nil {
+		return m
+	}
+	for p := range m {
+		if !w.keeps(p) {
+			delete(m, p)
+		}
+	}
+	return m
 }
 
 // errManifestNotSynced: this node could not catch up with the cluster
@@ -92,7 +129,7 @@ func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement strin
 	if leftovers != nil {
 		*leftovers = len(left)
 	}
-	manifest := hotByPath(c.ManifestHotFiles(database, measurement))
+	manifest := inWindow(hotByPath(c.ManifestHotFiles(database, measurement)), opts.window)
 	// A listed file is complete (local storage stages writes under a name
 	// List omits; an object appears whole), but on local storage a size check
 	// is a cheap guard against reading other content than the registered.
@@ -194,7 +231,7 @@ func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement strin
 		}
 		// The manifest again: a file it no longer lists (replaced, moved to
 		// the cold tier, removed) is not waited for.
-		manifest = hotByPath(c.ManifestHotFiles(database, measurement))
+		manifest = inWindow(hotByPath(c.ManifestHotFiles(database, measurement)), opts.window)
 	}
 	unreachable := append([]string(nil), absent...)
 	if len(unreachable) > 0 && opts.wait && !opts.allowUnreachable {

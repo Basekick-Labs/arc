@@ -4070,6 +4070,7 @@ func main() {
 		log.Info().
 			Int("confirmation_threshold", cfg.Delete.ConfirmationThreshold).
 			Int("max_rows_per_delete", cfg.Delete.MaxRowsPerDelete).
+			Bool("time_pruning", cfg.Delete.TimePruning).
 			Msg("Delete operations enabled")
 	} else {
 		log.Info().Msg("Delete operations DISABLED (set delete.enabled=true in arc.toml to enable)")

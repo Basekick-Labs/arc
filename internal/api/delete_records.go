@@ -36,7 +36,7 @@ func (h *DeleteHandler) SetFlusher(f DeleteFlusher) { h.flusher = f }
 type deleteRecorder interface {
 	DeleteRecordsActive() bool
 	RecordDelete(ctx context.Context, database, measurement, where string, marks map[string]uint64) (uint64, error)
-	WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration) ([]string, error)
+	WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration, keep func(path string) bool) ([]string, error)
 }
 
 func recorderOf(coord any) deleteRecorder {
@@ -224,11 +224,15 @@ func (h *DeleteHandler) RewriteForRecords(ctx context.Context, relativePath stri
 // this node: the DELETE recorder (stream takeover) or the compaction commit
 // side of the coordinator.
 type localFileWaiter interface {
-	WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration) ([]string, error)
+	WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration, keep func(path string) bool) ([]string, error)
 }
 
-func (h *DeleteHandler) waitLocalFiles(ctx context.Context, w localFileWaiter, database, measurement string, allowUnreachable bool) (missing []string, err error) {
-	missing, err = w.WaitLocalFiles(ctx, database, measurement, deleteLocalWait)
+func (h *DeleteHandler) waitLocalFiles(ctx context.Context, w localFileWaiter, database, measurement string, allowUnreachable bool, window *deleteWindow) (missing []string, err error) {
+	var keep func(string) bool
+	if window != nil {
+		keep = window.keeps
+	}
+	missing, err = w.WaitLocalFiles(ctx, database, measurement, deleteLocalWait, keep)
 	if err != nil {
 		return nil, err
 	}

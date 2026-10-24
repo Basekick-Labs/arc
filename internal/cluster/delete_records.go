@@ -187,6 +187,13 @@ func (c *Coordinator) RecordDelete(ctx context.Context, database, measurement, w
 // missing, it is gone: no node will ever have it (an output a finalizing
 // staged job still copies into place excepted) (#1207).
 func (c *Coordinator) MissingLocalFiles(ctx context.Context, database, measurement string) ([]string, error) {
+	return c.missingLocalFiles(ctx, database, measurement, nil)
+}
+
+// missingLocalFiles is MissingLocalFiles over the files keep accepts (nil:
+// all of them), left out before they are stat'ed: on an object store a stat
+// is a request, and an error on a file the caller does not read would fail it.
+func (c *Coordinator) missingLocalFiles(ctx context.Context, database, measurement string, keep func(path string) bool) ([]string, error) {
 	if c == nil || c.raftNode == nil || c.storage == nil {
 		return nil, nil
 	}
@@ -197,7 +204,7 @@ func (c *Coordinator) MissingLocalFiles(ctx context.Context, database, measureme
 	shared := c.SharedObjectStore()
 	var missing []string
 	for _, f := range c.raftNode.FSM().GetFilesByDatabase(database) {
-		if !raft.HotTier(f.Tier) || !strings.HasPrefix(f.Path, prefix) {
+		if !raft.HotTier(f.Tier) || !strings.HasPrefix(f.Path, prefix) || (keep != nil && !keep(f.Path)) {
 			continue
 		}
 		// Held first: an output copied into place and ended between a stat
@@ -236,11 +243,12 @@ func (c *Coordinator) ManifestHotFiles(database, measurement string) []raft.File
 }
 
 // WaitLocalFiles waits, up to budget, until MissingLocalFiles is empty, and
-// returns what is still missing.
-func (c *Coordinator) WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration) ([]string, error) {
+// returns what is still missing. keep, when set, limits it to the files a
+// DELETE's time range can touch: a file it does not read is not waited for.
+func (c *Coordinator) WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration, keep func(path string) bool) ([]string, error) {
 	deadline := time.Now().Add(budget)
 	for {
-		missing, err := c.MissingLocalFiles(ctx, database, measurement)
+		missing, err := c.missingLocalFiles(ctx, database, measurement, keep)
 		if err != nil || len(missing) == 0 || time.Now().After(deadline) {
 			return missing, err
 		}

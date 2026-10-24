@@ -495,6 +495,13 @@ type DeleteConfig struct {
 	Enabled               bool // Enable delete operations (default: false for safety)
 	ConfirmationThreshold int  // Require confirm=true for deletes affecting more than this many rows
 	MaxRowsPerDelete      int  // Maximum rows that can be deleted in a single operation
+	// TimePruning: a DELETE whose WHERE bounds time reads only the partition
+	// directories that range can touch (default true). It relies on a file's
+	// directory holding only rows of that hour or day, which holds for every
+	// file written since 26.01.1; Arc 25.12 and earlier placed a file by the
+	// hour it was flushed, so a deployment still holding such data sets it
+	// false, and every DELETE reads every file again.
+	TimePruning bool
 }
 
 type RetentionConfig struct {
@@ -1187,6 +1194,7 @@ func Load() (*Config, error) {
 			Enabled:               v.GetBool("delete.enabled"),
 			ConfirmationThreshold: v.GetInt("delete.confirmation_threshold"),
 			MaxRowsPerDelete:      v.GetInt("delete.max_rows_per_delete"),
+			TimePruning:           v.GetBool("delete.time_pruning"),
 		},
 		Retention: RetentionConfig{
 			Enabled: v.GetBool("retention.enabled"),
@@ -1996,6 +2004,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("delete.enabled", false)                // Disabled by default for safety
 	v.SetDefault("delete.confirmation_threshold", 10000) // Require confirm=true for > 10k rows
 	v.SetDefault("delete.max_rows_per_delete", 1000000)  // Max 1M rows per delete
+	v.SetDefault("delete.time_pruning", true)            // Read only the time range's partitions
 
 	// Retention policy defaults
 	v.SetDefault("retention.enabled", true)            // Enable policy management by default

@@ -488,7 +488,14 @@ func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
 // plus or minus one interval, or a BETWEEN; either operand order. An
 // inclusive end is returned one microsecond past its literal.
 func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
-	b, ok := scanTimeBounds(sqlStr)
+	return ExtractTimeRangeAt(sqlStr, time.Now().UTC())
+}
+
+// ExtractTimeRangeAt is ExtractTimeRange with now() and current_timestamp
+// read as now, and an assumed end taken from it. A DELETE pins its own now
+// (delete_records.go), and reads its window here at that same instant.
+func ExtractTimeRangeAt(sqlStr string, now time.Time) *TimeRange {
+	b, ok := scanTimeBoundsAt(sqlStr, now)
 	if !ok {
 		return nil
 	}
@@ -497,7 +504,7 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 		return &TimeRange{Start: *b.start, End: *b.end}
 	case b.start != nil:
 		// Only start time - assume query up to "now + 1 day"
-		end := time.Now().UTC().Add(24 * time.Hour)
+		end := now.UTC().Add(24 * time.Hour)
 		return &TimeRange{Start: *b.start, End: end, EndAssumed: true}
 	default:
 		// Only an end: the data may start at the partition floor. A range

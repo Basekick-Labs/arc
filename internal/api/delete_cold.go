@@ -2,7 +2,7 @@ package api
 
 import (
 	"context"
-	"errors"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -13,7 +13,6 @@ import (
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
-	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // A row DELETE and the cold tier (#1350). Files tiering moved to cold storage
@@ -32,9 +31,6 @@ import (
 // Candidates come from listing the cold prefix, not from tier rows: queries
 // read every object under the cold glob once a node has any cold row for the
 // measurement, so an object without a row here is still read.
-
-// coldDeleteChunk bounds the files one counting query reads.
-const coldDeleteChunk = 100
 
 // coldPartialWhy says why a cold file with matching rows was left.
 const coldPartialWhy = "are in cold storage and only some of their rows match; a DELETE removes a cold file only when every row in it matches, and does not rewrite part of one"
@@ -76,6 +72,9 @@ type coldPass struct {
 	// hotCopy: matching rows, but a hot copy of the file exists (a move not
 	// finished, or a leftover): the hot side decides, the cold copy is left.
 	hotCopy []coldFile
+	// donor is the files a file that cannot bind the clause alone is counted
+	// with (countInChunks).
+	donor []coldFile
 	// failed: objects whose rows could not be counted, or deleted.
 	failed []string
 	// missingRows: tier rows of this measurement whose object the listing
@@ -87,6 +86,21 @@ type coldPass struct {
 	// After run:
 	deleted     []string
 	deletedRows int64
+}
+
+// liveDonor is the donor less the files this run deleted.
+func (c *coldPass) liveDonor() []coldFile {
+	gone := make(map[string]bool, len(c.deleted))
+	for _, p := range c.deleted {
+		gone[p] = true
+	}
+	out := make([]coldFile, 0, len(c.donor))
+	for _, f := range c.donor {
+		if !gone[f.path] {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // wholeRows is the rows a run would delete from cold storage.
@@ -123,7 +137,10 @@ func (c *coldPass) matters() bool {
 // match where. nil when this node has no cold storage configured. Errors that
 // make cold storage unreadable are reported in notExamined, never as "no
 // match": the caller answers 207 rather than 200 for them.
-func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, where string) *coldPass {
+//
+// window limits the count to the files the WHERE's time range can touch
+// (delete_window.go); nil counts them all.
+func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, where string, window *deleteWindow) *coldPass {
 	tier := h.coldTier
 	if tier == nil || !tier.ColdConfigured() {
 		return nil
@@ -165,7 +182,12 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 		if first, _, _ := strings.Cut(o.Path, "/"); storage.IsReservedRootDir(first) {
 			continue
 		}
+		// Listed whatever the window: missingRows below is the cold rows
+		// whose object is not here, and an object outside the window is.
 		listed[o.Path] = true
+		if !window.keeps(o.Path) {
+			continue
+		}
 		qp, err := readParquetPath(c.backend, o.Path)
 		if err != nil {
 			c.failed = append(c.failed, o.Path)
@@ -174,7 +196,12 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 		files = append(files, coldFile{path: o.Path, queryPath: qp, size: o.Size})
 	}
 
-	counted, failed := h.countCold(ctx, files, where)
+	counted, donor, failed, err := h.countCold(ctx, files, where)
+	if err != nil {
+		c.notExamined = "counting cold files failed: " + err.Error()
+		return c
+	}
+	c.donor = donor
 	c.failed = append(c.failed, failed...)
 	for _, f := range counted {
 		if f.matched() <= 0 {
@@ -213,44 +240,68 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 }
 
 // countCold counts each file's rows and the rows where does not match, in
-// chunks with union_by_name (a file older than a column the clause names
-// reads it as NULL when another file in the chunk has it, so its rows are not
-// matched). A chunk that fails is counted file by file: a file the clause
-// cannot bind (none of the chunk had the column) matches nothing; one that
-// fails otherwise is returned in failed — never skipped as "no match".
-func (h *DeleteHandler) countCold(ctx context.Context, files []coldFile, where string) ([]coldFile, []string) {
-	var out []coldFile
+// chunks (countInChunks), with union_by_name. A file that cannot bind the
+// clause on its own (an older file without a column it names, or with the
+// column at another type) is counted with a schema donor, as one query over
+// every file would have read it. It returns the donor, for the recount
+// before a delete. A file that fails otherwise is returned in failed, never
+// skipped as "no match"; err is a count that could not run at all.
+func (h *DeleteHandler) countCold(ctx context.Context, files []coldFile, where string) ([]coldFile, []coldFile, []string, error) {
 	var failed []string
-	for start := 0; start < len(files); start += coldDeleteChunk {
-		chunk := files[start:min(start+coldDeleteChunk, len(files))]
-		got, err := h.countColdChunk(ctx, chunk, where)
-		if err == nil {
-			out = append(out, got...)
-			continue
+	db, release, err := h.countConn(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer release()
+	count := func(ctx context.Context, idx []int) (map[int]coldFile, error) {
+		chunk := make([]coldFile, len(idx))
+		for n, i := range idx {
+			chunk[n] = files[i]
 		}
-		h.logger.Warn().Err(err).Int("files", len(chunk)).Msg("Counting cold files in one query failed; counting them one by one")
-		for _, f := range chunk {
-			one, err := h.countColdChunk(ctx, []coldFile{f}, where)
-			var de *duckdb.Error
-			if errors.As(err, &de) && de.Type == duckdb.ErrorTypeBinder {
-				// The clause names a column this file does not have (an
-				// older file): it matches nothing here, as a DELETE record
-				// that cannot bind does (delete_records.go). Not a failure,
-				// or every DELETE naming a newer column would answer 207.
-				continue
+		got, err := countColdChunk(ctx, db, chunk, where)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[int]coldFile, len(got))
+		for _, g := range got {
+			for _, i := range idx {
+				if files[i].path == g.path {
+					out[i] = g
+					break
+				}
 			}
-			if err != nil {
-				h.logger.Warn().Err(err).Str("file", f.path).Msg("Could not count the rows of a cold file; it is reported as failed")
-				failed = append(failed, f.path)
-				continue
-			}
-			out = append(out, one...)
+		}
+		return out, nil
+	}
+	fail := func(i int, err error) error {
+		h.logger.Warn().Err(err).Str("file", files[i].path).Msg("Could not count the rows of a cold file; it is reported as failed")
+		failed = append(failed, files[i].path)
+		return nil
+	}
+	got, donorIdx, err := countInChunks(ctx, len(files), func(i int) string { return files[i].path }, count, fail)
+	if err != nil {
+		return nil, nil, failed, err
+	}
+	donor := make([]coldFile, len(donorIdx))
+	for n, i := range donorIdx {
+		donor[n] = files[i]
+	}
+	out := make([]coldFile, 0, len(got))
+	for i := range files {
+		if g, ok := got[i]; ok {
+			out = append(out, g)
 		}
 	}
-	return out, failed
+	return out, donor, failed, nil
 }
 
-func (h *DeleteHandler) countColdChunk(ctx context.Context, files []coldFile, where string) ([]coldFile, error) {
+// coldQueryer is what countColdChunk reads with: the DELETE's counting
+// connection (countConn), or the pool.
+type coldQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func countColdChunk(ctx context.Context, db coldQueryer, files []coldFile, where string) ([]coldFile, error) {
 	if len(files) == 0 {
 		return nil, nil
 	}
@@ -272,7 +323,7 @@ func (h *DeleteHandler) countColdChunk(ctx context.Context, files []coldFile, wh
 		FROM %s
 		GROUP BY filename`,
 		where, sqlutil.ReadParquet(list.String(), "filename=true", "union_by_name=true"))
-	rows, err := h.db.DB().QueryContext(ctx, query)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -335,12 +386,26 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			c.failed = append(c.failed, f.path)
 			continue
 		}
-		again, err := h.countColdChunk(ctx, []coldFile{f}, where)
-		if err != nil || len(again) != 1 {
+		again, err := countColdChunk(ctx, h.db.DB(), []coldFile{f}, where)
+		if isBinderErr(err) {
+			// Counted with the donor at the scan: counted with it again,
+			// less the donor files this run has deleted already.
+			if donor := c.liveDonor(); len(donor) > 0 {
+				again, err = countColdChunk(ctx, h.db.DB(), append([]coldFile{f}, donor...), where)
+			}
+		}
+		var g coldFile
+		found := false
+		for _, a := range again {
+			if a.path == f.path {
+				g, found = a, true
+			}
+		}
+		if err != nil || !found {
 			c.failed = append(c.failed, f.path)
 			continue
 		}
-		if g := again[0]; g.remaining != 0 || g.total == 0 {
+		if g.remaining != 0 || g.total == 0 {
 			if g.matched() > 0 {
 				c.partial = append(c.partial, g)
 			}
