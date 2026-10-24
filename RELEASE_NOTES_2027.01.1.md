@@ -600,6 +600,39 @@ encodes snappy on arm64 with new assembly that cut line-protocol ingest by
 about 14% and msgpack+gzip ingest by about 11% on Apple silicon, because every
 Parquet file Arc writes is snappy-compressed.
 
+## Upgrade note: file-level time pruning is on by default ([#659](https://github.com/Basekick-Labs/arc/issues/659))
+
+`query.file_time_pruning` now defaults to `true`. It was added in 26.09.2 as
+an opt-in.
+
+**What it does.** Under high-frequency ingest, the current hour holds one
+small Parquet file per buffer flush, often thousands. A query whose range
+starts in the current UTC hour used to read every one of them. It now skips
+the files in that hour flushed before the query's start minus
+`query.file_time_pruning_margin_seconds` (default 300). Only local storage is
+affected; files on S3 or Azure are read as before.
+
+**Which queries gain.** Only those whose range starts in the current UTC hour,
+such as "last 5 minutes" at 10:40. A "last 1 hour" panel starts in the
+previous hour at every minute except :00 and reads as before. The previous
+hour is not compacted until the first compaction run more than an
+hour after it ends, so it also still holds every per-flush file. A query that
+starts in the current hour now lists that hour's directory and is not served
+from the query plan cache.
+
+**What it can hide.** A row stamped more than the margin ahead of the clock of
+the node that flushed it, and still within the current hour, can be missing
+from such a query until the hour closes. Rows stamped that far ahead in a
+later hour are not affected. `arc_ingest_future_stamped_rows_total` counts
+these rows on the node that flushed them: a writer, or an edge spoke whose
+files a hub receives. A cluster reader or hub that misses them counts
+nothing, so check the counter on the writers and spokes. Size the margin to
+the worst clock skew among them.
+
+**To turn it off,** set `query.file_time_pruning = false` (or
+`ARC_QUERY_FILE_TIME_PRUNING=false`) and restart. The node logs "File-level
+time pruning disabled" at startup.
+
 ## New features
 
 ### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
@@ -2115,8 +2148,8 @@ query's range starts and ends in, as well as the current hour.
 
 ### File-level time pruning: sub-second flushes, margin minimum, and metrics
 
-These changes apply to `query.file_time_pruning`, which is still experimental
-and off by default.
+These changes apply to `query.file_time_pruning`, which is now on by default
+(see the upgrade note above).
 
 - **Sub-second flushes are no longer dropped.** File name times were read to
   the second, so with a margin under one second, a file flushed late in a
@@ -2127,9 +2160,8 @@ and off by default.
 - **A live-hour plan is no longer cached when file pruning declines to act.**
   This covers the cases where every file is in range or too many are kept.
   Before, such a plan stayed cached for 60 seconds and the next queries
-  skipped the pruning. With the feature on, every query whose range starts
-  in the current hour now lists that hour's directory, which takes a few
-  milliseconds. When more than 1000 files are in range, the query lists them
+  skipped the pruning. Every query whose range starts in the current hour
+  now lists that hour's directory, which takes a few milliseconds. When more than 1000 files are in range, the query lists them
   and then reads the whole hour anyway. The `cap_fallback` counter shows how
   often that happens.
 - **New counters** on `/metrics` (and in the JSON snapshot) show what the
@@ -2152,7 +2184,6 @@ and off by default.
   batch holds data more than 7 days old, and at most once a minute per
   measurement.
 
-To turn the feature off, set `query.file_time_pruning = false` and restart.
 
 ### Time-filtered queries no longer return too few rows, and Grafana panels are pruned again
 
