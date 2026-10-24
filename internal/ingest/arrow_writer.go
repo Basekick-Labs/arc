@@ -5684,7 +5684,7 @@ func (b *ArrowBuffer) countFutureStamped(database, measurement string, times []i
 		Str("measurement", measurement).
 		Int("rows", n).
 		Dur("margin", b.futureMargin()).
-		Msg("Rows stamped more than query.file_time_pruning_margin_seconds ahead of this node's clock, in the current hour: with file-level time pruning on, a query starting after the flush can miss them until the hour closes. Check the writers' clocks")
+		Msg("Rows stamped more than query.file_time_pruning_margin_seconds ahead of this node's clock, in the current hour: with file-level time pruning on (the default), a query starting after the flush can miss them until the hour closes. Check the writers' clocks")
 }
 
 // warnOncePerMinute rate-limits a warning per kind and measurement. Two

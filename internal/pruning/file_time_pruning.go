@@ -47,12 +47,15 @@ import (
 //     (arc_ingest_future_stamped_rows_total); a reader or hub that misses
 //     them counts nothing.
 //
-// Expansion is restricted to the current UTC hour because hourly compaction
-// never touches it (min age is clamped to >= 1h), so an expanded explicit
-// list can never race a compaction delete. The previous hour holds per-flush
-// files too: compaction waits until a partition's newest file is older than
-// the min age, so hour H folds at the first run after H+2:00. Expanding it
-// would need its own race argument and is not done.
+// Expansion is restricted to the current UTC hour because compaction never
+// touches it (the hourly and daily min ages are both clamped to >= 1h), so
+// an expanded explicit list can never race a compaction delete. A row DELETE
+// rewriting a listed file can still make it vanish before the read; that
+// window exists with the glob too and answers 503 (#1356). The previous hour
+// holds per-flush files as well: compaction waits until a partition's newest
+// file is older than the min age, so at the default min age of 1h hour H
+// folds at the first run after H+2:00 (H + min age + 1h in general). Expanding
+// it would need its own race argument and is not done.
 //
 // Expanded results are volatile: they must never be served from a cache,
 // because a cached list hides every file flushed since it was built. The

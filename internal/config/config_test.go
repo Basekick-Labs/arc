@@ -1401,6 +1401,10 @@ func TestLoad_ImportForwardTimeout(t *testing.T) {
 // TestFileTimePruningDefaultsOn pins the 27.01.1 default (#659) and that both
 // ways an operator turns it off still work.
 func TestFileTimePruningDefaultsOn(t *testing.T) {
+	// A developer shell's value must not decide the default case; t.Setenv
+	// restores it afterwards.
+	t.Setenv("ARC_QUERY_FILE_TIME_PRUNING", "")
+	os.Unsetenv("ARC_QUERY_FILE_TIME_PRUNING")
 	v := viper.New()
 	setDefaults(v)
 	if !v.GetBool("query.file_time_pruning") {

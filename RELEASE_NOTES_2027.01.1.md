@@ -613,12 +613,13 @@ the files in that hour flushed before the query's start minus
 affected; files on S3 or Azure are read as before.
 
 **Which queries gain.** Only those whose range starts in the current UTC hour,
-such as "last 5 minutes" at 10:40. A "last 1 hour" panel starts in the
-previous hour at every minute except :00 and reads as before. The previous
-hour is not compacted until the first compaction run more than an
-hour after it ends, so it also still holds every per-flush file. A query that
-starts in the current hour now lists that hour's directory and is not served
-from the query plan cache.
+such as "last 5 minutes" at 10:40. A "last 1 hour" panel always starts in the
+previous hour and never gains. At the default
+`compaction.hourly_min_age_hours = 1`, the previous hour is not compacted until
+the first compaction run more than an hour after it ends (later with a larger
+min age), so it also still holds every per-flush file. On local storage, a
+query that starts in the current hour now lists that hour's directory and is
+not served from the query plan cache.
 
 **What it can hide.** A row stamped more than the margin ahead of the clock of
 the node that flushed it, and still within the current hour, can be missing
@@ -632,6 +633,10 @@ the worst clock skew among them.
 **To turn it off,** set `query.file_time_pruning = false` (or
 `ARC_QUERY_FILE_TIME_PRUNING=false`) and restart. The node logs "File-level
 time pruning disabled" at startup.
+
+A negative `compaction.daily_min_age_hours` now reads as 24, as 0 already did.
+Before, it put the cutoff in the future, and daily compaction could fold the
+current hour while ingest was still writing it.
 
 ## New features
 
@@ -2161,7 +2166,8 @@ These changes apply to `query.file_time_pruning`, which is now on by default
   This covers the cases where every file is in range or too many are kept.
   Before, such a plan stayed cached for 60 seconds and the next queries
   skipped the pruning. Every query whose range starts in the current hour
-  now lists that hour's directory, which takes a few milliseconds. When more than 1000 files are in range, the query lists them
+  now lists that hour's directory, which takes a few milliseconds. When more
+  than 1000 files are in range, the query lists them
   and then reads the whole hour anyway. The `cap_fallback` counter shows how
   often that happens.
 - **New counters** on `/metrics` (and in the JSON snapshot) show what the
@@ -2183,7 +2189,6 @@ These changes apply to `query.file_time_pruning`, which is now on by default
   latest timestamp, not its earliest.** It is also logged even when the same
   batch holds data more than 7 days old, and at most once a minute per
   measurement.
-
 
 ### Time-filtered queries no longer return too few rows, and Grafana panels are pruned again
 
