@@ -1494,6 +1494,18 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Cgroup memory defaults leave headroom for Go allocations (#1367)
+
+When Arc detects a Linux cgroup limit and `database.memory_limit` is unset,
+the main DuckDB database now uses 60% of that limit when the derived value is
+at least 128 MiB. If `compaction.memory_limit` is also automatic,
+compaction subprocesses share 20%. Explicit limits and existing defaults
+without an applicable cgroup limit are unchanged. DuckDB's memory limit is a
+budget, not a cap on total process memory.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1369](https://github.com/Basekick-Labs/arc/pull/1369).
+
 ### Rebuilding cold metadata no longer restarts every tier lookup ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
 
 When a node rebuilds its cold tier metadata — after a restored or lost

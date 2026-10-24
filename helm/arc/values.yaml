@@ -60,10 +60,11 @@ ingress:
           pathType: Prefix
   tls: []
 
-# Leaving this empty means no container memory limit, and the query engine then
-# sizes itself from the NODE's total memory — 80% of it. On a large node that is a
-# lot more than Arc's pre-26.09.3 default of min(cores, 32) GB. Set limits here,
-# or set database.memory_limit explicitly, if you want a smaller ceiling.
+# When a container memory limit is set, Arc defaults database.memory_limit to
+# 60% of the detected cgroup limit when that is at least 128 MiB, leaving more
+# room for Go and other allocations. Below that threshold, DuckDB keeps its own
+# default. Without a container limit, DuckDB uses 80% of node memory. Explicit
+# database.memory_limit values still override the default.
 resources: {}
   # limits:
   #   cpu: 2000m
