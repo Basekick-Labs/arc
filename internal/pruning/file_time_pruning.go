@@ -11,9 +11,9 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
-// File-level time pruning. EXPERIMENTAL in 26.09.2 (opt-in via
-// query.file_time_pruning); promotion to stable + default-on is tracked in
-// #659, targeting 27.01.1.
+// File-level time pruning (query.file_time_pruning). Added in 26.09.2 as an
+// opt-in; on by default since 27.01.1 (#659), validated by the prune_diff
+// harness in arc-benchmarks.
 //
 // Partition pruning stops at hour-directory globs; the current (live) hour of
 // a high-frequency ingest workload can accumulate thousands of small parquet
@@ -41,12 +41,18 @@ import (
 //     margin but still WITHIN the same hour are indistinguishable from
 //     normal ingest and may be invisible until their hour closes (the hour
 //     rollover self-heals; plain partition pruning has no such window).
-//     Size the margin to the worst writer clock skew you expect.
+//     Size the margin to the worst clock skew of any node that flushes the
+//     files: writers, and edge spokes whose files a hub receives with their
+//     names unchanged. The flushing node counts the rows at risk
+//     (arc_ingest_future_stamped_rows_total); a reader or hub that misses
+//     them counts nothing.
 //
-// Restricting expansion to the current UTC hour has two purposes: it is the
-// only hour that accumulates uncompacted per-flush files (older hours fold at
-// :05), and hourly compaction never touches it (min age is clamped to >= 1h),
-// so an expanded explicit list can never race a compaction delete.
+// Expansion is restricted to the current UTC hour because hourly compaction
+// never touches it (min age is clamped to >= 1h), so an expanded explicit
+// list can never race a compaction delete. The previous hour holds per-flush
+// files too: compaction waits until a partition's newest file is older than
+// the min age, so hour H folds at the first run after H+2:00. Expanding it
+// would need its own race argument and is not done.
 //
 // Expanded results are volatile: they must never be served from a cache,
 // because a cached list hides every file flushed since it was built. The

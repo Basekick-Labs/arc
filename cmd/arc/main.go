@@ -3671,6 +3671,8 @@ func main() {
 	}
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
+	} else {
+		log.Info().Msg("File-level time pruning disabled (query.file_time_pruning = false)")
 	}
 	// Reads count each compaction's rows once while its output and inputs are
 	// both readable: this node's own legacy jobs (seeded from surviving
