@@ -638,7 +638,7 @@ A negative `compaction.daily_min_age_hours` now reads as 24, as 0 already did.
 Before, it put the cutoff in the future, and daily compaction could fold the
 current hour while ingest was still writing it.
 
-## Upgrade note: a DELETE reads only the partitions of its time range (`delete.time_pruning`)
+## Upgrade note: a DELETE reads only the partitions of its time range (`delete.time_pruning`, [#1371](https://github.com/Basekick-Labs/arc/pull/1371))
 
 `delete.time_pruning` is new and defaults to `true`. A row DELETE whose WHERE
 bounds `time` now reads only the hour and day directories that range can
@@ -1649,7 +1649,7 @@ the file stays until it is moved to cold storage again under the new
 policy. As a consequence, while cold storage is unreachable, a DELETE that
 touches a daily file answers the retryable 503, even for recent data.
 
-### A DELETE reads only the files its time range can touch
+### A DELETE reads only the files its time range can touch ([#1371](https://github.com/Basekick-Labs/arc/pull/1371))
 
 A row DELETE (`POST /api/v1/delete`) listed every file of the measurement and
 counted its matches with one read across all of them, whatever its WHERE. Its
