@@ -250,6 +250,10 @@ enabled = true
 enabled = true
 confirmation_threshold = 10000
 max_rows_per_delete = 1000000
+# Read only the partitions the WHERE's time range can touch. Set false on a
+# deployment still holding data written by Arc 25.12 or earlier, which placed
+# files by flush hour (see the 27.01.1 release notes).
+time_pruning = true
 
 # -----------------------------------------------------------------------------
 # Retention

@@ -638,6 +638,27 @@ A negative `compaction.daily_min_age_hours` now reads as 24, as 0 already did.
 Before, it put the cutoff in the future, and daily compaction could fold the
 current hour while ingest was still writing it.
 
+## Upgrade note: a DELETE reads only the partitions of its time range (`delete.time_pruning`)
+
+`delete.time_pruning` is new and defaults to `true`. A row DELETE whose WHERE
+bounds `time` now reads only the hour and day directories that range can
+touch (see the bug fix "A DELETE reads only the files its time range can
+touch" below).
+
+It relies on every file under an hour (or day) directory holding only rows
+of that hour (or day). The query path's partition pruning has always relied
+on the same thing. Every Arc release since 26.01.1 writes files that way.
+Arc 25.12 and earlier put a file in the directory of the hour it was
+flushed, and compaction and cold migration keep a file's directory. On a
+deployment that still holds data written by those versions, a row that
+arrived late sits in a later hour's directory, and a DELETE of its hour
+would not read it.
+
+**To turn it off,** set `delete.time_pruning = false` (or
+`ARC_DELETE_TIME_PRUNING=false`) and restart. Every DELETE then reads every
+file of the measurement again. The startup line "Delete operations enabled"
+shows the setting.
+
 ## New features
 
 ### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
@@ -1604,14 +1625,17 @@ A DELETE now looks at cold storage too:
   never deleted from cold storage. It is reported, and a retry once the move
   completes handles it.
 - A cold file that does not have a column the clause names (an older file,
-  from before the column existed) matches nothing, as for hot files.
+  from before the column existed) is counted together with files that have
+  it, as one read across every file would count it. When no file in the
+  DELETE's time range has the column, it matches nothing, as for hot files.
 - A cold tier row whose object is gone is retired, or pointed back at the
   file's hot copy if one exists. Both storage tiers are checked again at
   that moment, as retention does, so a file a migration has just copied
   keeps its row.
 
-Every cold file of the measurement is read to count its matching rows, so a
-DELETE on a measurement with many files in cold storage costs one read of
+Every cold file in the DELETE's time range (every cold file of the
+measurement, when the clause bounds no time range) is read to count its
+matching rows, so a DELETE over many files in cold storage costs one read of
 each file's footer and the columns the clause uses.
 
 Also fixed: in a database made `hot_only` (or given a longer hot age) after
@@ -1624,6 +1648,49 @@ database the hot-only cleanup then removes the copy; with a longer hot age,
 the file stays until it is moved to cold storage again under the new
 policy. As a consequence, while cold storage is unreachable, a DELETE that
 touches a daily file answers the retryable 503, even for recent data.
+
+### A DELETE reads only the files its time range can touch
+
+A row DELETE (`POST /api/v1/delete`) listed every file of the measurement and
+counted its matches with one read across all of them, whatever its WHERE. Its
+memory grew with the table's file count times its width, not with the
+window: on a wide table (thousands of columns), a DELETE of one minute could
+need hundreds of GiB, and `database.memory_limit` did not bound it.
+
+- **Only the partitions in the time range are read.** When the WHERE bounds
+  `time` (`time >= … AND time < …`, `BETWEEN`, or `now()` plus or minus an
+  interval), the DELETE reads only the hour and day directories that range
+  can touch, plus one hour on each side. This applies to hot files, to the
+  files the cluster manifest lists (a DELETE no longer waits for, checks, or
+  answers 503 over a file outside its range), and to cold storage. A WHERE
+  without such a range (an `OR` at the top level, `time = …`, `time IN (…)`)
+  reads every file, as before.
+- **Matches are counted 64 files at a time, without keeping the files'
+  metadata.** Arc keeps Parquet footers in memory for queries; a DELETE kept
+  every footer it read until it finished, and on wide files the footers are
+  most of the cost. It now counts with that cache off. Measured on 1,416
+  files of 1,000 columns: +2.7 GB before, +0.4 GB now for a DELETE over all
+  of them, and +2 MB for one of a minute.
+- **A hot file that cannot be counted stops the DELETE** before anything is
+  rewritten. Before, the per-file fallback logged "skipping file" and went
+  on: the file's matching rows stayed and the DELETE answered success. A file
+  replaced since the listing (a compaction) answers 503, retry. A file that
+  cannot be read answers 500 and names it, on every DELETE whose range
+  includes it, until it is repaired or removed; there is no option to skip
+  it. A clause that binds but fails on a file's values (comparing a column
+  that is text in some files with a number) also answers 500 now, where it
+  used to be skipped. A cold file that cannot be counted is reported as
+  before (207, `cold_files`).
+- **A file that does not have a column the WHERE names, or has it with
+  another type, is counted together with files that do,** as the single
+  read across every file counted it. Before, a cold file that could not bind
+  the clause on its own counted as no match. For cold files whose rows all
+  match, the file is now deleted. A hot file counted this way is still
+  rewritten on its own, which fails to bind as it did before this change: it
+  is reported in `failed_files` (207), not left out silently. A column that
+  no file in the range has still matches nothing there.
+
+`delete.time_pruning` turns the first point off (see the upgrade note above).
 
 ### A compaction run within a minute of its files' registration no longer leaves them behind, counted twice ([#1358](https://github.com/Basekick-Labs/arc/issues/1358))
 

@@ -259,13 +259,13 @@ func TestDeleteLeavesAColdFileTheManifestStillLists(t *testing.T) {
 	r.coldFile(coldWhole, "h0")
 	r.h.coordinator = &fakeColdDeleteCoordinator{entries: map[string]raft.FileEntry{coldWhole: {Path: coldWhole, Tier: "hot"}}}
 	h := r.h
-	c := h.scanCold(context.Background(), "db", "cpu", "host = 'h0'")
+	c := h.scanCold(context.Background(), "db", "cpu", "host = 'h0'", nil)
 	if c == nil || len(c.hotCopy) != 1 || len(c.whole) != 0 {
 		t.Fatalf("scan %+v, want the file held as the hot side's", c)
 	}
 	// A manifest entry recorded as cold (older manifests) is not a hot copy.
 	r.h.coordinator = &fakeColdDeleteCoordinator{entries: map[string]raft.FileEntry{coldWhole: {Path: coldWhole, Tier: "cold"}}}
-	if c := h.scanCold(context.Background(), "db", "cpu", "host = 'h0'"); c == nil || len(c.whole) != 1 {
+	if c := h.scanCold(context.Background(), "db", "cpu", "host = 'h0'", nil); c == nil || len(c.whole) != 1 {
 		t.Fatalf("scan %+v, want a cold manifest entry not to count as a hot copy", c)
 	}
 }
