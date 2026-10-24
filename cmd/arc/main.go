@@ -1056,8 +1056,9 @@ func main() {
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
 	// Ingest counts rows stamped past file-level time pruning's margin
-	// whether or not the feature is on, so the risk is visible before it is
-	// enabled. Set before WAL recovery and the first flushes.
+	// whether or not the feature is on (it is by default), so the risk is
+	// visible on every node that flushes. Set before WAL recovery and the
+	// first flushes.
 	arrowBuffer.SetFutureStampMargin(time.Duration(cfg.Query.FileTimePruningMarginSeconds) * time.Second)
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
@@ -3671,6 +3672,8 @@ func main() {
 	}
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
+	} else {
+		log.Info().Msg("File-level time pruning disabled (query.file_time_pruning = false)")
 	}
 	// Reads count each compaction's rows once while its output and inputs are
 	// both readable: this node's own legacy jobs (seeded from surviving

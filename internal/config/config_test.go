@@ -1397,3 +1397,56 @@ func TestLoad_ImportForwardTimeout(t *testing.T) {
 		t.Fatalf("ARC_CLUSTER_IMPORT_FORWARD_TIMEOUT_MS=0 gave %d", cfg.Cluster.ImportForwardTimeoutMs)
 	}
 }
+
+// TestFileTimePruningDefaultsOn pins the 27.01.1 default (#659) and that both
+// ways an operator turns it off still work.
+func TestFileTimePruningDefaultsOn(t *testing.T) {
+	// A developer shell's value must not decide the default case; t.Setenv
+	// restores it afterwards.
+	t.Setenv("ARC_QUERY_FILE_TIME_PRUNING", "")
+	os.Unsetenv("ARC_QUERY_FILE_TIME_PRUNING")
+	v := viper.New()
+	setDefaults(v)
+	if !v.GetBool("query.file_time_pruning") {
+		t.Fatal("query.file_time_pruning default = false, want true (#659)")
+	}
+	if got := v.GetInt("query.file_time_pruning_margin_seconds"); got != 300 {
+		t.Errorf("query.file_time_pruning_margin_seconds default = %d, want 300", got)
+	}
+
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Query.FileTimePruning {
+		t.Error("Load() with no config: Query.FileTimePruning = false, want true")
+	}
+
+	t.Setenv("ARC_QUERY_FILE_TIME_PRUNING", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Query.FileTimePruning {
+		t.Error("ARC_QUERY_FILE_TIME_PRUNING=false: Query.FileTimePruning = true, want false")
+	}
+	os.Unsetenv("ARC_QUERY_FILE_TIME_PRUNING")
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte("[query]\nfile_time_pruning = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Query.FileTimePruning {
+		t.Error("arc.toml file_time_pruning = false: Query.FileTimePruning = true, want false")
+	}
+}

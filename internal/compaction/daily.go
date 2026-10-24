@@ -31,7 +31,9 @@ type DailyTierConfig struct {
 // NewDailyTier creates a new daily compaction tier
 func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 	// Set defaults
-	if cfg.MinAgeHours == 0 {
+	// A negative min age would put the cutoff in the future and compact the
+	// current hour while ingest and file-level time pruning still use it.
+	if cfg.MinAgeHours <= 0 {
 		cfg.MinAgeHours = 24 // Full day must pass
 	}
 	if cfg.MinFiles == 0 {

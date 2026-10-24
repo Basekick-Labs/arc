@@ -547,12 +547,11 @@ type QueryConfig struct {
 	EnableS3Cache            bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
 	S3CacheSize              int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
 	S3CacheTTLSeconds        int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
-	// FileTimePruning (EXPERIMENTAL, 26.09.2) expands the current-hour
-	// partition glob and drops files whose filename flush-timestamp proves
-	// they cannot contain rows in the query's time range. Big win for
-	// high-frequency ingest where the live hour holds thousands of small
-	// files (local backend only). Opt-in while experimental; planned to
-	// become the default in 27.01.1 (#659).
+	// FileTimePruning (26.09.2, on by default since 27.01.1, #659) expands
+	// the current-hour partition glob and drops files whose filename
+	// flush-timestamp proves they cannot contain rows in the query's time
+	// range. It helps high-frequency ingest, where the live hour holds
+	// thousands of small files (local backend only). false turns it off.
 	FileTimePruning bool
 	// FileTimePruningMarginSeconds widens the keep-window below the query's
 	// lower bound to absorb writer clock skew (default 300).
@@ -2027,7 +2026,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.timeout", 300)                           // 5 minute query timeout (0 = no timeout)
 	v.SetDefault("query.cancel_on_client_disconnect", true)      // Can be disabled for clients that half-close their write side
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
-	v.SetDefault("query.file_time_pruning", false)               // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
+	v.SetDefault("query.file_time_pruning", true)                // On by default since 27.01.1 (#659); false turns it off
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
 	v.SetDefault("query.stable_schema_bootstrap", true)          // Build anchors for pre-26.09.2 measurements on first query

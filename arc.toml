@@ -291,6 +291,14 @@ enabled = false
 # days, on measurements whose anchor is complete; everything else keeps the
 # full scan. Requires stable_schema. Opt-in while experimental.
 # empty_range_anchor_scan = false
+# File-level time pruning (on by default since 27.01.1, #659). A query whose
+# range starts in the current UTC hour skips that hour's files flushed before
+# the start minus the margin. Local storage only. Rows stamped more than the
+# margin ahead of the flushing node's clock, within the current hour, can be
+# missing until the hour closes; size the margin to the worst clock skew of
+# your writers and edge spokes. Set false to turn it off.
+# file_time_pruning = true
+# file_time_pruning_margin_seconds = 300
 
 # Slow query logging threshold in milliseconds (0 = disabled)
 # Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
