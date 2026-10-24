@@ -173,7 +173,7 @@ type CompactionConfig struct {
 	HourlyEnabled             bool          // Enable hourly tier
 	DailyEnabled              bool          // Enable daily tier
 	HourlyMinAgeHours         int           // Minimum age for hourly compaction (default: 1)
-	HourlyMinFiles            int           // Minimum files for hourly compaction (default: 10)
+	HourlyMinFiles            int           // Per-hour uncompacted-file floor (default: 10; independent of flush cadence)
 	DailyMinAgeHours          int           // Minimum age for daily compaction (default: 24)
 	DailyMinFiles             int           // Minimum files for daily compaction (default: 12)
 	DailySkipFileAgeCheckDays int           // Skip file creation time check for partitions older than N days (default: 7)

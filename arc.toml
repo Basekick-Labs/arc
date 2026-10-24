@@ -103,7 +103,7 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # Arc exports approximate buffered-byte and oldest-unflushed-age gauges, and
 # warns when buffered bytes reach 50% of the detected process memory limit.
 max_buffer_size = 5000000   # Records before flush (default: 50000)
-max_buffer_age_ms = 100   # Max buffer age before flush
+max_buffer_age_ms = 100   # Sample override; built-in default is 5000
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
@@ -229,7 +229,7 @@ enabled = true
 hourly_enabled = true
 hourly_schedule = "5 * * * *"
 hourly_min_age_hours = 1
-hourly_min_files = 10
+hourly_min_files = 10 # Minimum uncompacted input files per hour partition; tune for workload
 
 # Daily
 daily_enabled = true
