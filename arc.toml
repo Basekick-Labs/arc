@@ -44,8 +44,9 @@ format = "console"  # json or console
 #                         # compaction.threads follows the quota too since
 #                         # 26.09.3; see the [compaction] section below.
 enable_wal = true
-# DuckDB community extensions to install and load at startup (e.g. ["spatial"]).
-# This setting does not enable unsigned extensions; the default is empty.
+# DuckDB extensions to load at startup. Supported: "spatial" (ST_* functions).
+# Any other name, a path or a URL refuses to start. The image ships them, so
+# no network is needed. Set the same list on every node of a cluster.
 extensions = []
 
 # Allow DuckDB to reorder results of queries WITHOUT an ORDER BY (queries

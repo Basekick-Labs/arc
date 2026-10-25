@@ -747,12 +747,31 @@ extension is available.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#916](https://github.com/Basekick-Labs/arc/pull/916).
 
-### DuckDB extensions can be configured per deployment ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+### Spatial SQL functions with `database.extensions = ["spatial"]` ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
-Operators can set `database.extensions` or the `ARC_DATABASE_EXTENSIONS`
-environment variable to install and load DuckDB extensions at startup. Arc
-loads them before enabling its DuckDB external-access lockdown; the setting
-does not enable unsigned extensions.
+`database.extensions` (or `ARC_DATABASE_EXTENSIONS`, comma-separated) loads
+DuckDB extensions at startup. The one supported today is `spatial`: its
+`ST_*` functions work in queries, continuous queries and DELETE predicates,
+over DOUBLE longitude/latitude columns (`ST_Point(lon, lat)`) or over WKB
+stored in a binary column (`ST_GeomFromWKB(geom)`). The default is empty.
+
+- **Only supported extensions load.** An extension adds SQL functions Arc's
+  query validators have to know about, so each one is reviewed before it is
+  supported. Any other name, a file path or a URL stops Arc at startup with
+  an error naming the entry. Community extensions are not supported.
+- **The spatial file readers are refused.** `ST_Read`, `ST_Read_Meta`,
+  `ST_ReadOSM`, `ST_ReadSHP`, `shapefile_meta` and `ST_Drivers` are rejected
+  by the query, continuous query and DELETE validators, like `read_csv` and
+  the other file readers. Data comes into Arc through its write endpoints.
+- **No network needed.** The container image ships the extension; on a
+  binary install the first start downloads it into DuckDB's extension
+  directory (`~/.duckdb/extensions`), which an air-gapped host must
+  pre-populate.
+- **Set the same list on every node.** Each node loads its own; a query
+  routed to a node without the extension fails with an unknown-function
+  error.
+- A JSON query result holding a geometry shows it as base64 WKB; use
+  `ST_AsText(...)` or `ST_AsGeoJSON(...)` for a readable value.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1082](https://github.com/Basekick-Labs/arc/pull/1082).
 
