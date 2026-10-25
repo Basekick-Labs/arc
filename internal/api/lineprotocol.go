@@ -356,6 +356,15 @@ localProcessing:
 		}
 	}
 
+	// A column changed between string and binary refuses the whole request
+	// (#440), not the measurement it is in after the others were written.
+	for _, record := range columnarByMeasurement {
+		if err := h.buffer.CheckColumnsTextBinary(database, record.Measurement, record.Columns); err != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
 	// Refuse the whole request up front if writes are fenced (#1207) or the
 	// WAL volume is under disk pressure (#676), rather than part-way through
 	// the measurements below. The admitted context skips the per-call disk
@@ -376,6 +385,10 @@ localProcessing:
 			if ingest.IsWriteRefusal(err) {
 				return respondWriteRefused(c, err)
 			}
+			// A client error (#440), refused before the WAL.
+			if errors.Is(err, ingest.ErrColumnTypeChange) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+			}
 			metrics.Get().IncIngestErrors()
 			h.logger.Error().
 				Err(err).
@@ -394,9 +407,6 @@ localProcessing:
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": "Write rejected (server shutting down): " + err.Error(),
 				})
-			}
-			if errors.Is(err, ingest.ErrColumnTypeChange) {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 			}
 			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -483,6 +493,14 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 		}
 	}
 
+	// See the record path above (#440).
+	for _, m := range measurements {
+		if err := h.buffer.CheckTypedTextBinary(database, m, batches[m]); err != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
 	// Refuse the whole request up front if writes are fenced (#1207) or the
 	// WAL volume is under disk pressure (#676); see the record path above.
 	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
@@ -498,13 +516,13 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 			if ingest.IsWriteRefusal(err) {
 				return respondWriteRefused(c, err)
 			}
+			if errors.Is(err, ingest.ErrColumnTypeChange) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+			}
 			metrics.Get().IncIngestErrors()
 			h.logger.Error().Err(err).Str("database", database).Str("measurement", m).Int("records", rows[m]).Msg("Failed to write to Arrow buffer")
 			if errors.Is(err, ingest.ErrBufferClosing) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (server shutting down): " + err.Error()})
-			}
-			if errors.Is(err, ingest.ErrColumnTypeChange) {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 			}
 			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (schema churn): " + err.Error()})

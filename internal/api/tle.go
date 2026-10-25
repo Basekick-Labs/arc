@@ -231,6 +231,10 @@ localProcessing:
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err)
 		}
+		// A client error (#440), refused before the WAL.
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		metrics.Get().IncIngestErrors()
 		h.logger.Error().
 			Err(err).
@@ -246,9 +250,6 @@ localProcessing:
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (server shutting down): " + err.Error(),
 			})
-		}
-		if errors.Is(err, ingest.ErrColumnTypeChange) {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
 		// See lineprotocol.go for ErrSchemaChurnExceeded → 503 rationale.
 		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {

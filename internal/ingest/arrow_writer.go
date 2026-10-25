@@ -2258,29 +2258,12 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 	if !ok {
 		return fmt.Errorf("expected []interface{}, got %T", records)
 	}
-	if err := b.checkBatchTextBinary(database, recordList); err != nil {
-		return err
-	}
-
-	// OPTIMIZATION: Lazy initialization - avoid map allocation for pure columnar writes (common path)
+	// Every record is dispatched, and row records converted, before any is
+	// written: a write refused for its content (#440) then writes nothing.
 	var rowRecordsByMeasurement map[string][]*models.Record
-
 	for _, record := range recordList {
 		switch r := record.(type) {
-		case *models.ColumnarRecord:
-			if err := b.writeColumnar(ctx, database, r); err != nil {
-				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write columnar record")
-				b.totalErrors.Add(1)
-				return err
-			}
-		case *TypedColumnarRecord:
-			// Typed msgpack decode fast path: already converted, carries the
-			// raw client bytes for the zero-copy WAL branch.
-			if err := b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false); err != nil {
-				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
-				b.totalErrors.Add(1)
-				return err
-			}
+		case *models.ColumnarRecord, *TypedColumnarRecord:
 		case *models.Record:
 			// Lazy init: only allocate map when we actually have row records
 			if rowRecordsByMeasurement == nil {
@@ -2298,17 +2281,43 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 			return fmt.Errorf("unknown record type %T in write dispatch (unwired decoder output)", record)
 		}
 	}
-
-	// Convert grouped row records to columnar format and write
+	// Convert grouped row records to columnar format. The conversion renames
+	// a field named like a tag, so the type check below reads its output.
 	var drops []LPDrop
+	var converted []*models.ColumnarRecord
 	for measurement, rowRecords := range rowRecordsByMeasurement {
 		columnar, dropped := b.rowsToColumnar(measurement, rowRecords)
 		drops = append(drops, dropped...)
 		if len(columnar.Columns["time"]) == 0 {
 			continue // every row was dropped
 		}
+		converted = append(converted, columnar)
+	}
+	if err := b.checkBatchTextBinary(database, recordList, converted); err != nil {
+		return err
+	}
+
+	for _, record := range recordList {
+		switch r := record.(type) {
+		case *models.ColumnarRecord:
+			if err := b.writeColumnar(ctx, database, r); err != nil {
+				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write columnar record")
+				b.totalErrors.Add(1)
+				return err
+			}
+		case *TypedColumnarRecord:
+			// Typed msgpack decode fast path: already converted, carries the
+			// raw client bytes for the zero-copy WAL branch.
+			if err := b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false); err != nil {
+				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
+				b.totalErrors.Add(1)
+				return err
+			}
+		}
+	}
+	for _, columnar := range converted {
 		if err := b.writeColumnar(ctx, database, columnar); err != nil {
-			b.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to write converted row records")
+			b.logger.Error().Err(err).Str("measurement", columnar.Measurement).Msg("Failed to write converted row records")
 			b.totalErrors.Add(1)
 			return err
 		}

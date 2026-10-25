@@ -241,3 +241,52 @@ func TestSortedMergeKeepsBinaryColumns(t *testing.T) {
 	require.Equal(t, [][]byte{{1}, {2}, nil}, merged.Data["geom"])
 	require.Equal(t, []bool{true, true, false}, merged.Validity["geom"])
 }
+
+// A row field named like a tag is stored as "<name>_value": the check reads
+// the column the field lands in, not the field's name. Wrongly refusing the
+// first case and missing the second (after writing the batch's first record)
+// were both possible when the raw rows were checked.
+func TestColumnTypeChangeChecksTheRenamedRowField(t *testing.T) {
+	ctx := context.Background()
+	r := newFlushRig(t, nil)
+	r.buf.SetFieldSchema(textBinaryRegistrar{"d/m": {"host": false, "host_value": true}})
+	tagged := func(v interface{}) *models.Record {
+		return &models.Record{Measurement: "m", Timestamp: ts440, Tags: map[string]string{"host": "a"}, Fields: map[string]interface{}{"host": v}}
+	}
+	good := &models.ColumnarRecord{Measurement: "good", Columnar: true, Columns: map[string][]interface{}{"time": {ts440}, "v": {1.0}}}
+
+	// Bytes in field "host" go to binary "host_value": accepted.
+	require.NoError(t, r.buf.Write(ctx, "d", []interface{}{tagged([]byte{1})}))
+	// A string in field "host" would go to binary "host_value": refused, and
+	// the batch's first record is not written either.
+	err := r.buf.Write(ctx, "d", []interface{}{good, tagged("x")})
+	require.True(t, errors.Is(err, ErrColumnTypeChange), "err = %v", err)
+	for _, f := range r.files(t) {
+		require.NotContains(t, f.path, "/good/", "a refused batch wrote its first record")
+	}
+}
+
+// A refused typed write never reaches the WAL either.
+func TestTypedColumnTypeChangeRefusedBeforeTheWAL(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	walDir := filepath.Join(tmp, "wal")
+	writer, err := wal.NewWriter(&wal.WriterConfig{WALDir: walDir, SyncMode: wal.SyncModeFsync, Logger: zerolog.Nop()})
+	require.NoError(t, err)
+	live := newReplayTestBuffer(t, filepath.Join(tmp, "live"))
+	live.SetWAL(writer)
+	t.Cleanup(func() { _ = live.Close() })
+	live.SetFieldSchema(textBinaryRegistrar{"d/m": {"geom": true}})
+	batch := &TypedColumnBatch{Data: map[string]interface{}{"time": []int64{ts440}, "geom": []string{"x"}}}
+	err = live.WriteTypedColumnarDirect(ctx, "d", "m", batch, 1)
+	require.True(t, errors.Is(err, ErrColumnTypeChange), "err = %v", err)
+	require.NoError(t, writer.Close())
+	entries := 0
+	_, err = wal.NewRecovery(walDir, zerolog.Nop()).RecoverWithOptions(ctx, func(context.Context, []map[string]interface{}) error { entries++; return nil },
+		&wal.RecoveryOptions{ColumnarCallbackWithTagColumns: func(context.Context, string, string, map[string][]interface{}, string, []string) error {
+			entries++
+			return nil
+		}})
+	require.NoError(t, err)
+	require.Zero(t, entries, "the refused typed write is in the WAL")
+}
