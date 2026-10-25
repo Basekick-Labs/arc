@@ -3,6 +3,8 @@ package pruning
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -94,13 +96,37 @@ func TestEveryObjectSchemeFindsOpenEndPartitionsLikeS3(t *testing.T) {
 		p := livePruner(now)
 		p.SetStorageBackend(&countingRemote{mockS3Backend: mockS3Backend{existingDirs: dirs}, dayFiles: map[string][]string{}})
 		r, ok := p.OptimizeTablePath(context.Background(), scheme+"://bucket/db/cpu/**/*.parquet", sql)
-		if !ok || !hasRemoteHour(asList(r), future.Format("15")) {
+		if !ok || !hasRemotePartition(asList(r), future) {
 			t.Errorf("%s: open-end partition missing: %v %v", scheme, ok, r)
 		}
 		for _, path := range asList(r) {
 			if !strings.HasPrefix(path, scheme+"://bucket/") {
 				t.Errorf("%s: path %q lost its scheme (built with filepath.Join?)", scheme, path)
 			}
+		}
+	}
+}
+
+// A tier on any object-store scheme finds its partitions past the assumed end
+// through the backend, as an s3:// tier does.
+func TestEveryObjectSchemeTierFindsOpenEndPartitionsLikeS3(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(5 * 24 * time.Hour)
+	dirs := map[string][]string{}
+	for _, h := range []time.Time{now, future} {
+		y, m, d := h.Format("2006"), h.Format("01"), h.Format("02")
+		dirs["db/cpu/"] = appendOnce(dirs["db/cpu/"], y)
+		dirs["db/cpu/"+y+"/"] = appendOnce(dirs["db/cpu/"+y+"/"], m)
+		dirs["db/cpu/"+y+"/"+m+"/"] = appendOnce(dirs["db/cpu/"+y+"/"+m+"/"], d)
+		dirs["db/cpu/"+y+"/"+m+"/"+d+"/"] = appendOnce(dirs["db/cpu/"+y+"/"+m+"/"+d+"/"], h.Format("15"))
+	}
+	for _, scheme := range append([]string{"s3"}, objectURLSchemes...) {
+		backend := &tierMock{mockS3Backend: &mockS3Backend{existingDirs: dirs}, files: map[string][]string{}}
+		p := livePruner(now)
+		tr := p.ExtractTimeRange("SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'")
+		paths, outcome := p.PruneTierPaths(context.Background(), scheme+"://bucket/tenant1/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false)
+		if outcome != TierPrunePruned || !hasRemotePartition(paths, future) {
+			t.Errorf("%s: outcome %v paths %v, want the partition past the assumed end", scheme, outcome, paths)
 		}
 	}
 }
@@ -129,12 +155,26 @@ func TestEveryObjectSchemeProvesAnEmptyRangeLikeS3(t *testing.T) {
 	}
 }
 
+// File-time pruning reads the live hour's files from the local filesystem, so
+// it must skip an object URL outright. Taken as a local path, "gs://bucket/…"
+// is the RELATIVE directory "gs:/bucket/…" under the working directory; the
+// test plants exactly that directory, with files the pass would expand, so a
+// pass that does not skip the URL changes the answer rather than failing safe
+// by accident.
 func TestFileTimePruningNeverTouchesAnObjectURL(t *testing.T) {
 	now := time.Date(2026, 8, 28, 20, 40, 0, 0, time.UTC)
+	hour := now.Truncate(time.Hour)
+	t.Chdir(t.TempDir())
 	p := newTestPruner(now)
 	tr := &TimeRange{Start: now.Add(-10 * time.Minute), End: now}
 	for _, scheme := range append([]string{"s3"}, objectURLSchemes...) {
-		remote := fmt.Sprintf("%s://bucket/db/m/%s/*.parquet", scheme, now.Truncate(time.Hour).Format("2006/01/02/15"))
+		dir := filepath.Join(scheme+":", "bucket", "db", "m", hour.Format("2006"), hour.Format("01"), hour.Format("02"), hour.Format("15"))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mkfile(t, dir, fname("m", hour.Add(1*time.Minute)))
+		mkfile(t, dir, fname("m", now.Add(-5*time.Minute)))
+		remote := fmt.Sprintf("%s://bucket/db/m/%s/*.parquet", scheme, hour.Format("2006/01/02/15"))
 		out, changed := p.applyFileTimePruning(context.Background(), []string{remote}, tr)
 		if changed || len(out) != 1 || out[0] != remote {
 			t.Errorf("%s: remote path changed to %v", scheme, out)
