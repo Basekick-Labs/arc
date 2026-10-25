@@ -1718,6 +1718,44 @@ the file stays until it is moved to cold storage again under the new
 policy. As a consequence, while cold storage is unreachable, a DELETE that
 touches a daily file answers the retryable 503, even for recent data.
 
+### A DELETE rewrites wide files in bounded memory, and keeps Arc's file metadata (PRNUM)
+
+A row DELETE rewrites each file it removes rows from by copying the rows it
+keeps to a new file. That copy ran on every DuckDB thread, and each thread held
+a whole decoded row group of the file plus the Parquet writer's state for every
+column, most of it outside `database.memory_limit`. On wide files and many-core
+nodes it spilled for a long time and then ran out of memory: a customer
+measured 8 minutes per file at 905 columns and 39 minutes per row group at
+3,100 columns (46 cores, 4 GB limit).
+
+- **A file too wide for the main DuckDB is rewritten on a private
+  single-threaded one.** Before each rewrite Arc reads the file's footer and
+  estimates what the copy holds per thread (columns × rows per row group, plus
+  the writer's per-column state) times the threads it would use. Above half of
+  DuckDB's memory limit, the file goes to a private DuckDB instance: one
+  thread, half the main memory limit, its own spill directory, smaller row
+  groups, sandboxed to the file's own directories. The row order is kept. On
+  object storage the file is downloaded first. Measured on DuckDB 1.5.6 with a
+  4 GB limit:
+
+  | File | Before | Now |
+  |---|---|---|
+  | 3,100 columns, 8 row groups | out of memory | 36 s, 2.0 GB |
+  | 905 columns, 16 row groups | 32 s, 5.0 GB | 20 s, 0.9 GB |
+  | 10,000 columns, 1 row group | stopped after 15 min | 23 s, 2.6 GB |
+
+  Narrower files are rewritten as before. Rewrites of wide files run one at
+  a time (they already did), and their output has smaller row groups, so it is
+  larger (1.3–7× at 3,100–10,000 columns) until compaction merges it. If the
+  private instance cannot be opened, that file's rewrite fails; it does not
+  fall back to the main DuckDB. No setting.
+- **A rewritten file keeps Arc's metadata.** Every DELETE rewrite dropped the
+  file's `arc:tags`, `arc:dedup_exact` and `arc:decimals` entries, so a
+  rewritten continuous-query file lost its exact-duplicate marker at
+  compaction. They are now carried over, along with the legacy
+  `arc:dedup_time`. Other entries (`ARROW:schema`) are not: they describe the
+  file as it was first written.
+
 ### A DELETE reads only the files its time range can touch ([#1371](https://github.com/Basekick-Labs/arc/pull/1371))
 
 A row DELETE (`POST /api/v1/delete`) listed every file of the measurement and
