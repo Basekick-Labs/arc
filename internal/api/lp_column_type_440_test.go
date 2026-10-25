@@ -26,7 +26,7 @@ func (r lpTextBinary) KnownTextBinaryColumns(database, measurement string) map[s
 func TestLPWriteColumnTypeChangeRefusesTheWholeRequest(t *testing.T) {
 	for name, cfg := range map[string]*config.IngestConfig{
 		"typed":  nil,
-		"record": {DecimalColumns: []string{"other.price:18:4"}},
+		"record": {DecimalColumns: []string{"other:price=18,4"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newLPWriteRig(t, cfg)
