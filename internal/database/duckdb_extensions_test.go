@@ -2,15 +2,20 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/rs/zerolog"
 )
 
 func TestConfiguredDuckDBExtensionsLoadBeforeSandboxLockdown(t *testing.T) {
-	// Keep DuckDB's downloaded extension cache inside the test's temporary
-	// directory rather than the developer's home directory.
-	t.Setenv("HOME", t.TempDir())
+	// From the local extension cache: skipped without it, installed in CI.
+	probe, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadTestExtension(t, probe, "spatial")
+	probe.Close()
 
 	root := t.TempDir()
 	db, err := New(&Config{

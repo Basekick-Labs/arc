@@ -3146,10 +3146,12 @@ func isBareIdentifier(name string) bool {
 // bare identifier. Anchored matching (`\b`) avoids matching these as a
 // substring of a longer identifier.
 //
-// Maintenance: when DuckDB adds a new path-taking table function (or Arc loads
-// an extension that exposes one), add it here. TestIOTableFunctionPattern_Family
-// documents the set we verified against the pinned DuckDB release.
-var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
+// Maintenance: when DuckDB adds a new path-taking table function, add it here.
+// TestIOTableFunctionPattern_Family documents the set we verified against the
+// pinned DuckDB release. An extension's functions are not listed here: they
+// come from database.DeniedExtensionFunctions, and an extension is loadable
+// only once its function surface is reviewed there (#440).
+var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
 	"read_parquet",
 	"parquet_scan",
 	"parquet_metadata",
@@ -3176,7 +3178,9 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]strin
 	"iceberg_metadata",
 	"iceberg_snapshots",
 	"arc_partition_agg",
-}, "|") + `)\s*\(`)
+	// The file readers of the DuckDB extensions database.extensions may load
+	// (#440), denied whether or not this node loads them.
+}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
 
 // dynamicSQLFunctionPattern matches DuckDB table functions that evaluate a
 // string as SQL (or resolve a string to a relation). They are the I/O
