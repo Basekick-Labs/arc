@@ -1718,6 +1718,52 @@ the file stays until it is moved to cold storage again under the new
 policy. As a consequence, while cold storage is unreachable, a DELETE that
 touches a daily file answers the retryable 503, even for recent data.
 
+### Compaction leaves alone a partition too wide to compact, instead of failing it every cycle (PRNUM)
+
+Compaction sorts a batch's rows by time in one DuckDB job, and a sort holds
+whole rows. On a table of thousands of columns that does not fit the memory a
+job has (`compaction.memory_limit`, by default `database.memory_limit` divided
+by `compaction.max_concurrent`): measured on DuckDB 1.5.6, two files of 3,100
+columns ran out of memory at 2 GB on one thread, and 905 columns at 2 GB on
+any thread count. The batch splitter halved the batch down to two files, failed
+again, and the next cycle started over, downloading the files each time, for
+good.
+
+- **A partition that fails at the smallest batch is remembered and left
+  alone** while its files and the job sizing stay the same. "Fails" means
+  DuckDB's out-of-memory error (once is enough), or a kill, crash or
+  unclassified failure twice in a row (a kill can hit another job running
+  alongside), or a cycle deadline that cut an attempt off after half the
+  cycle's budget (twice). A SQL error or a missing file never counts. A new
+  input file in the partition, or a change of `compaction.memory_limit`,
+  `compaction.threads`, `compaction.max_files_per_batch` or
+  `compaction.cycle_timeout`, tries it again; a partition that then compacts
+  is forgotten.
+- **What is remembered survives a restart**: it is kept per node in
+  `too_wide.json` under `compaction.temp_directory`. A compactor failover
+  tries each such partition once more on the new node.
+- **Seeing and clearing it**: `GET /api/v1/compaction/too-wide` lists the
+  partitions (with the settings each failed under and the current ones),
+  `DELETE /api/v1/compaction/too-wide` (optionally `?tier=` and
+  `?partition=`) forgets them so the next cycle tries again; both admin-only.
+  `/api/v1/compaction/candidates` marks them `too_wide`, each cycle record and
+  `/api/v1/compaction/stats` count `skipped_too_wide`, and the metrics are
+  `arc_compaction_partitions_skipped_too_wide_total` and
+  `arc_compaction_partitions_too_wide`. A Warn names each partition when it is
+  first remembered.
+- **What it means for that table:** its files stay as written. Queries read
+  them as before. Tiering moves only daily-compacted files to cold storage, so
+  the table stays on hot storage until retention removes it (as it did while
+  compaction kept failing). The remedy is more memory per job: a higher
+  `compaction.memory_limit` or a lower `compaction.max_concurrent` (906
+  columns × 2 files × 3.93M rows compacted in 72 s with 4 GB on one thread).
+- **The splitter no longer makes a batch it refuses.** A 3-file batch was split
+  into 1 and 2 files, and the 1-file half was refused unattempted, losing the
+  real error; a batch under twice the minimum is now the smallest. A child
+  that died of memory (a Go runtime "out of memory", a C++ `std::bad_alloc`)
+  is classified as a memory error even when its earlier log lines quote SQL
+  error text; before, it read as a permanent SQL error.
+
 ### A DELETE rewrites wide files in bounded memory, and keeps Arc's file metadata ([#1380](https://github.com/Basekick-Labs/arc/pull/1380))
 
 A row DELETE rewrites each file it removes rows from by copying the rows it
