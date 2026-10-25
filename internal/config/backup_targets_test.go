@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // writeArcToml drops an arc.toml in a fresh working directory so Load() reads
@@ -796,8 +798,23 @@ func TestBackupTargetRequiredFields(t *testing.T) {
 		},
 		{
 			name:   "unknown type",
+			stanza: "type = \"gcp\"",
+			want:   "backup.targets.audit.type \"gcp\" is invalid",
+		},
+		{
+			name:   "gcs with no bucket",
 			stanza: "type = \"gcs\"",
-			want:   "backup.targets.audit.type \"gcs\" is invalid",
+			want:   "backup.targets.audit.gcs_bucket is empty",
+		},
+		{
+			name:   "gcs with an unusable prefix",
+			stanza: "type = \"gcs\"\ngcs_bucket = \"acme\"\ngcs_prefix = \"../x\"",
+			want:   "backup.targets.audit.gcs_prefix",
+		},
+		{
+			name:   "gcs with an http endpoint",
+			stanza: "type = \"gcs\"\ngcs_bucket = \"acme\"\ngcs_endpoint = \"http://x\"",
+			want:   "backup.targets.audit.gcs_endpoint",
 		},
 		{
 			name:   "local with no path",
@@ -1100,6 +1117,96 @@ default_target = "audit"
 type = "s3"
 s3_bucket = "acme-backups"
 s3_endpoint = "https://storage.googleapis.com"
+`)
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() = %v", err)
+		}
+	})
+}
+
+// #1105 part 3: a GCS backup target is remote, reserves key headroom for its
+// prefix, renders a GCS backend spec in the backup role, and is refused when
+// it overlaps a GCS cold tier or primary; a sibling prefix is allowed.
+func TestGCSBackupTarget(t *testing.T) {
+	writeArcToml(t, `
+[backup]
+default_target = "audit"
+[backup.targets.audit]
+type = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "backups/arc"
+gcs_credentials_file = " /etc/arc/backup.json "
+gcs_endpoint = "https://storage.googleapis.com"
+`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	tg := cfg.Backup.Targets["audit"]
+	if !tg.IsRemote() {
+		t.Fatal("a gcs target must be remote")
+	}
+	if p, err := tg.KeyPrefix(); err != nil || p != "backups/arc/" {
+		t.Fatalf("KeyPrefix = %q, %v; want backups/arc/ (key headroom is reserved for it)", p, err)
+	}
+	spec := tg.BackendSpec()
+	if spec.Type != "gcs" || spec.GCS.Bucket != "acme" || spec.GCS.Prefix != "backups/arc" ||
+		spec.GCS.CredentialsFile != "/etc/arc/backup.json" || spec.GCS.Endpoint != "https://storage.googleapis.com" ||
+		spec.GCS.Role != storage.GCSRoleBackup {
+		t.Fatalf("spec = %+v", spec.GCS)
+	}
+	if cfg.Backup.DefaultIncludeConfig() {
+		t.Fatal("a remote default target must not include the config by default")
+	}
+
+	t.Run("overlapping a gcs cold tier is refused", func(t *testing.T) {
+		writeArcToml(t, `
+[tiered_storage]
+enabled = true
+[tiered_storage.cold]
+enabled = true
+backend = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "cold"
+[backup]
+default_target = "audit"
+[backup.targets.audit]
+type = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "cold/backups"
+`)
+		mustLoadError(t, "overlaps the tiered-storage cold tier")
+	})
+	t.Run("overlapping a gcs primary is refused", func(t *testing.T) {
+		writeArcToml(t, `
+[storage]
+backend = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "hot"
+[backup]
+default_target = "audit"
+[backup.targets.audit]
+type = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "hot/backups"
+`)
+		mustLoadError(t, "overlaps primary storage")
+	})
+	t.Run("a sibling of a gcs cold tier is allowed", func(t *testing.T) {
+		writeArcToml(t, `
+[tiered_storage]
+enabled = true
+[tiered_storage.cold]
+enabled = true
+backend = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "cold"
+[backup]
+default_target = "audit"
+[backup.targets.audit]
+type = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "cold-backups"
 `)
 		if _, err := Load(); err != nil {
 			t.Fatalf("Load() = %v", err)

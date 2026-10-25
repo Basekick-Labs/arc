@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -582,5 +583,81 @@ func TestGCSSkipProbeReadsNoBucketMetadata(t *testing.T) {
 	t.Cleanup(func() { _ = b.Close() })
 	if s.bucketReads != 0 {
 		t.Fatalf("SkipProbe read bucket metadata %d times", s.bucketReads)
+	}
+}
+
+// stubGCSBackendRole is stubGCSBackend for a bucket in another role.
+func stubGCSBackendRole(t *testing.T, s *gcsStub, role GCSRole, logger zerolog.Logger) (*GCSBackend, error) {
+	t.Helper()
+	srv := httptest.NewServer(s.handler(t))
+	t.Cleanup(srv.Close)
+	b, err := newGCSBackend(&GCSConfig{Bucket: "bkt", Endpoint: srv.URL, Role: role}, logger, option.WithoutAuthentication())
+	if err == nil {
+		t.Cleanup(func() { _ = b.Close() })
+	}
+	return b, err
+}
+
+// #1105 part 3: the startup warnings depend on what the bucket is for. A
+// colder class is the cold tier's retrieval cost and a backup's choice; soft
+// delete matters where compaction deletes continuously, i.e. primary only.
+func TestGCSStartupWarningsDependOnRole(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		stub    *gcsStub
+		role    GCSRole
+		want    string // "" = no warning at all
+		wantNot string
+	}{
+		{"primary NEARLINE", &gcsStub{storageClass: "NEARLINE"}, GCSRolePrimary, "use STANDARD for Arc's primary storage", ""},
+		{"cold NEARLINE", &gcsStub{storageClass: "NEARLINE"}, GCSRoleCold, "Autoclass", "primary storage"},
+		{"backup NEARLINE", &gcsStub{storageClass: "NEARLINE"}, GCSRoleBackup, "", ""},
+		{"backup soft delete", &gcsStub{softDeleteSeconds: 604800}, GCSRoleBackup, "", ""},
+		{"cold soft delete", &gcsStub{softDeleteSeconds: 604800}, GCSRoleCold, "", ""},
+		{"backup retention", &gcsStub{retentionSeconds: 86400}, GCSRoleBackup, "deleting a backup", "compaction"},
+		{"cold retention", &gcsStub{retentionSeconds: 86400}, GCSRoleCold, "cold-tier files", "compaction"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			if _, err := stubGCSBackendRole(t, c.stub, c.role, zerolog.New(&logs)); err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			out := logs.String()
+			if c.want == "" {
+				if strings.Contains(out, `"level":"warn"`) {
+					t.Fatalf("unexpected warning: %s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, c.want) || (c.wantNot != "" && strings.Contains(out, c.wantNot)) {
+				t.Fatalf("log %s: want %q, not %q", out, c.want, c.wantNot)
+			}
+		})
+	}
+	t.Run("requester pays is refused in every role", func(t *testing.T) {
+		for _, r := range []GCSRole{GCSRolePrimary, GCSRoleCold, GCSRoleBackup} {
+			if _, err := stubGCSBackendRole(t, &gcsStub{requesterPays: true}, r, zerolog.Nop()); err == nil {
+				t.Fatalf("role %q accepted a requester-pays bucket", r)
+			}
+		}
+	})
+}
+
+// With no credentials anywhere, a primary fails construction (a failed start)
+// while a cold tier or backup target builds and fails on first use, as S3 and
+// Azure do. Built eagerly, a cold tier left the node without its cold backend.
+func TestGCSCredentialsLazyOutsidePrimary(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "absent.json"))
+	if _, err := GCSCredentials(&GCSConfig{Bucket: "b"}); err == nil {
+		t.Fatal("primary with no credentials must fail at construction")
+	}
+	for _, r := range []GCSRole{GCSRoleCold, GCSRoleBackup} {
+		creds, err := GCSCredentials(&GCSConfig{Bucket: "b", Role: r})
+		if err != nil || creds == nil {
+			t.Fatalf("role %q: %v", r, err)
+		}
+		if _, err := creds.Token(context.Background()); err == nil || !strings.Contains(err.Error(), "no GCS credentials") {
+			t.Fatalf("role %q: first token error %v", r, err)
+		}
 	}
 }

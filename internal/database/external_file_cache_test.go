@@ -28,6 +28,7 @@ func TestMayReadRemoteStorage(t *testing.T) {
 		{"cold Azure container", Config{ColdAzureContainer: "cold"}, true},
 		{"GCS primary", Config{GCSIsPrimaryBackend: true}, true},
 		{"GCS bucket named, backend local", Config{GCSBucket: "arc"}, false},
+		{"cold GCS bucket", Config{ColdGCSBucket: "cold"}, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if got := mayReadRemoteStorage(&c.cfg); got != c.want {

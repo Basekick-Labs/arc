@@ -964,6 +964,34 @@ func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurem
 	return s.scanFiles(rows)
 }
 
+// HasColdFilesInRange reports whether a measurement has a cold row (not
+// quarantined) whose partition may hold data in [start, end]; nil bounds are
+// open. A cold file is a daily partition (partition_time at the start of its
+// day), so the lower bound is widened by a day: a range starting mid-day
+// still needs that day's file.
+func (s *MetadataStore) HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	query := `SELECT 1 FROM tier_files
+		WHERE database = ? AND measurement = ? AND tier = ? AND quarantined_at IS NULL`
+	args := []any{database, measurement, string(TierCold)}
+	if start != nil {
+		query += " AND partition_time >= ?"
+		args = append(args, start.UTC().Add(-24*time.Hour))
+	}
+	if end != nil {
+		query += " AND partition_time <= ?"
+		args = append(args, end.UTC())
+	}
+	query += " LIMIT 1"
+	var one int
+	switch err := s.db.QueryRowContext(ctx, query, args...).Scan(&one); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("failed to query cold files: %w", err)
+	}
+	return true, nil
+}
+
 // coldFilesForMeasurement is one measurement's cold rows, quarantined ones
 // excluded, in SQL: a DELETE asks for them, and the measurement's hot rows
 // (hourly files, the many) are no use to it (#1350).

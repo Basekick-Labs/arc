@@ -168,6 +168,10 @@ func (d *DuckDB) StorageCredentialStatus() map[string]StorageTierStatus {
 			if r := refreshers[cold.secretName]; r != nil {
 				st = r.status(now)
 				st.Backend, st.Credentials = cold.backend, s3ModeSDKManaged
+			} else if cold.backend == "gcs" {
+				// GCS has no fallback secret (gcsrefresh.go): no refresher
+				// means no credentials at all.
+				st.State = CredStateUnavailable
 			} else {
 				// Provider construction failed at configure time: running on
 				// the CREDENTIAL_CHAIN fallback with no refresher.
@@ -534,6 +538,12 @@ type Config struct {
 	GCSPrefix           string
 	GCSEndpoint         string
 	GCSCredentialsFile  string
+	// ColdGCSBucket / ColdGCSPrefix: a GCS cold tier (#1105). Set only when
+	// tiered_storage.cold.backend is "gcs"; they load httpfs before the
+	// lockdown and allowlist gs://bucket/prefix/. The secret comes later from
+	// ConfigureGCS.
+	ColdGCSBucket string
+	ColdGCSPrefix string
 	// Cold-tier sandbox allowlist entries. Independent from S3Bucket /
 	// AzureContainer (which describe Arc's primary/hot storage) because
 	// Enterprise tiered storage routinely combines hot=local with cold=S3 —
@@ -675,7 +685,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		// GCS, so a bearer token is the only way its reads authenticate.
 		params, err := primaryGCSSecretParams(cfg)
 		if err == nil {
-			err = d.startGCSRefresher(params, cfg)
+			err = d.startGCSRefresher(params, primaryGCSIdentity(cfg))
 		}
 		if err != nil {
 			db.Close()
@@ -1090,7 +1100,7 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// must be loaded before the lockdown below blocks LOAD. The secret itself
 	// is emitted later by the GCS refresher in New, after this returns: CREATE
 	// SECRET works after the lockdown (see buildDSN).
-	if cfg.GCSIsPrimaryBackend {
+	if cfg.GCSIsPrimaryBackend || cfg.ColdGCSBucket != "" {
 		if err := ensureHTTPFSLoaded(db); err != nil {
 			return fmt.Errorf("failed to load httpfs for GCS: %w", err)
 		}
@@ -2098,7 +2108,8 @@ func logEffectiveResourceSettings(db *sql.DB, logger zerolog.Logger) {
 // or GCS. It is true exactly when configureDatabase loads httpfs or azure for
 // storage: the S3 gate (S3IsPrimaryBackend or either S3 key, else
 // ColdS3Bucket), the Azure gate (AzureIsPrimaryBackend, else
-// ColdAzureContainer) and the GCS gate (GCSIsPrimaryBackend, #1105). It over-classifies on purpose: a cold bucket left in
+// ColdAzureContainer) and the GCS gate (GCSIsPrimaryBackend or
+// ColdGCSBucket, #1105). It over-classifies on purpose: a cold bucket left in
 // the config with tiering off or unlicensed, or S3 keys with no bucket, still
 // counts, which keeps today's behaviour on such a node. Under-classifying
 // would cost remote reads their only cache (query.enable_s3_cache is off by
@@ -2109,7 +2120,7 @@ func logEffectiveResourceSettings(db *sql.DB, logger zerolog.Logger) {
 func mayReadRemoteStorage(cfg *Config) bool {
 	return cfg.S3IsPrimaryBackend || cfg.S3AccessKey != "" || cfg.S3SecretKey != "" ||
 		cfg.ColdS3Bucket != "" || cfg.AzureIsPrimaryBackend || cfg.ColdAzureContainer != "" ||
-		cfg.GCSIsPrimaryBackend
+		cfg.GCSIsPrimaryBackend || cfg.ColdGCSBucket != ""
 }
 
 // externalFileCacheMode is cfg.ExternalFileCache with empty read as "auto", so

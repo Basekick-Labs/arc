@@ -190,6 +190,32 @@ an answer cannot reveal which columns that measurement already has.
 - **Edge sync:** a spoke on an older release can still send such files to
   its hub; upgrade spokes first.
 
+## Upgrade note: a cold tier that overlaps primary storage refuses to start ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+With `tiered_storage.enabled` and `tiered_storage.cold.enabled`, Arc now
+refuses to start when the cold tier is the same location as primary
+storage, or one is inside the other (the same bucket with equal or nested
+prefixes), for every backend. This is a new check; nothing compared the two
+before. At the same location a file and its cold copy have one key, so
+migration copied the file onto itself and then deleted it: data loss.
+Nested, each tier's listing took in the other's objects and registered
+them as files of a database that does not exist. Move the cold tier to
+another bucket or to a prefix that is not a parent or child of the
+primary's.
+
+## Upgrade note: a query that needs an unavailable cold tier answers 503 ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+When the cold tier is enabled but its backend failed to start (a bad
+endpoint or credentials file, for any backend), a query whose time range
+reaches cold-tier files that this node's tier metadata records now answers
+HTTP 503 naming the cold tier. A node whose tier metadata holds no cold
+rows (a fresh or rebuilt one, which cannot rebuild them while the cold tier
+is down) still answers from the hot tier alone. It used
+to leave the cold files out and answer with the hot rows alone, as a
+success. Queries that need no cold data are served as before, and the
+failed cold tier is absent from `/health` (it was reported from a secret
+nothing read through).
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
@@ -706,11 +732,16 @@ proxied query is encoded by the node that answers it.
 
 ## New features
 
-### Google Cloud Storage as primary storage ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
 `storage.backend = "gcs"` stores a standalone node's data in a Google Cloud
 Storage bucket, through GCS's own API rather than its S3 interoperability
 endpoint, so it authenticates the way Google workloads do: no HMAC keys.
+GCS also serves as the tiered-storage cold tier
+(`tiered_storage.cold.backend = "gcs"`) and as a backup target
+(`backup.targets.<name>.type = "gcs"`), each taking the same four keys
+(`gcs_bucket`, `gcs_prefix`, `gcs_credentials_file`, `gcs_endpoint`) and
+its own identity.
 
 ```toml
 [storage]
@@ -747,25 +778,45 @@ gcs_bucket = "my-arc-data"
 - **Refused at startup** (the bucket checks need `storage.buckets.get`): a
   bucket with hierarchical namespace or with requester pays; an `http://` `gcs_endpoint`; a node that will run as a
   licensed cluster node (GCS clusters come later; `cluster.enabled` without a
-  clustering licence runs standalone and is fine); a cold tier
-  (`tiered_storage.cold.enabled` with tiering on); and Iceberg export, which
-  is local-only.
-- **Warned at startup:** soft delete (on by default for new buckets, 7 days),
-  a retention policy and a default storage class other than STANDARD.
-  Compaction and retention delete objects continuously: soft delete keeps
-  every deleted byte billed for its period, a retention policy makes those
-  deletes fail until objects are old enough, and colder classes charge a
-  minimum storage duration on each. Turn soft delete off on a bucket used
-  only by Arc.
+  clustering licence runs standalone and is fine), whether GCS is the
+  primary or the cold tier (a GCS backup target is allowed on a cluster);
+  and Iceberg export, which is local-only.
+- **Warned at startup**, by what the bucket is for. Primary: soft delete
+  (on by default for new buckets, 7 days), a retention policy and a default
+  storage class other than STANDARD — compaction and retention delete
+  objects continuously, so soft delete keeps every deleted byte billed for
+  its period, a retention policy makes those deletes fail until objects are
+  old enough, and colder classes charge a minimum storage duration on each;
+  turn soft delete off on a bucket used only by Arc. Cold tier: a retention
+  policy, and a class other than STANDARD, which charges retrieval on every
+  query read of cold data — use STANDARD, or Autoclass, which charges
+  neither retrieval nor early deletion (a lifecycle rule that changes the
+  class of cold objects is not visible to this check). Backup target: a
+  retention policy only, since it stops a backup from being deleted or a
+  partial one from being cleaned up; a colder class is a reasonable choice
+  there.
 - **Endpoint.** DuckDB uses only the host of `gcs_endpoint` and speaks GCS's
   XML API on it, so the endpoint must serve both the JSON API (ingest,
   compaction) and the XML API (queries) on one host. Verified with
   `https://storage.googleapis.com`; a Private Service Connect endpoint has
   not been tested yet. An emulator that serves only the JSON API cannot
   serve queries.
-- A backup target on GCS is not available yet. An S3-typed backup target
-  pointed at the same bucket through `storage.googleapis.com` is refused as
-  overlapping primary storage, as for any other backend.
+- **Cold tier.** Files migrate to a GCS cold tier from any primary, and a
+  GCS primary takes a cold tier of any backend (verified with local → GCS
+  and GCS → GCS; the other pairs use the same generic migration path). The cold tier has its
+  own query secret and identity; `/health` reports it under `"cold"`, and a
+  cold tier whose credentials never resolved is `unavailable`, which drains
+  `/ready` when `server.storage_credentials_fail_ready` is on (an S3 cold
+  tier in the same state reports `fallback` and stays ready). With no credentials at
+  boot the cold tier still starts and its reads fail until they resolve, as
+  for S3 and Azure.
+- **Backup target.** Every #1085 behaviour applies: per-database routing,
+  key headroom for the prefix, cold-tier files carried once, restore into a
+  node with a cold tier at another prefix (files go to that cold tier) or
+  without one (they are restored hot). A target whose bucket does not exist
+  fails the backup rather than completing it.
+- An S3-typed target or cold tier pointed at the same bucket through
+  `storage.googleapis.com` is the same storage for the overlap checks.
 
 ### MessagePack binary values are stored as binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 

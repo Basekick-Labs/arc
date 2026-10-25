@@ -234,3 +234,135 @@ func TestNewWithGCSPrimaryUnresolvable(t *testing.T) {
 		t.Fatalf("secret count %d, %v; want none emitted", n, err)
 	}
 }
+
+// #1105 part 3: a cold-tier GCS secret is its own scoped secret, resolved
+// from the cold tier's identity, beside the primary's; /health reports the
+// cold tier from its own refresher.
+func TestConfigureGCSColdTier(t *testing.T) {
+	var mu sync.Mutex
+	var identities []storage.GCSConfig
+	orig := newGCSTokenSource
+	newGCSTokenSource = func(cfg *storage.GCSConfig) (gcsTokenSource, error) {
+		mu.Lock()
+		identities = append(identities, *cfg)
+		mu.Unlock()
+		return &fakeGCSSource{tok: &auth.Token{Value: "ya29." + cfg.Bucket, Expiry: time.Now().Add(time.Hour)}}, nil
+	}
+	t.Cleanup(func() { newGCSTokenSource = orig })
+
+	tmp := t.TempDir()
+	db, err := New(&Config{
+		MaxConnections: 2, MemoryLimit: "256MB", TempDirectory: tmp, LocalStorageRoot: filepath.Join(tmp, "d"),
+		GCSIsPrimaryBackend: true, GCSBucket: "hotb", GCSPrefix: "hot/",
+		ColdGCSBucket: "coldb", ColdGCSPrefix: "cold/",
+	}, zerolog.Nop())
+	if err != nil {
+		t.Skipf("New: %v", err)
+	}
+	defer db.Close()
+	if err := db.ConfigureGCS(&GCSConfig{Bucket: "coldb", Prefix: "cold/", CredentialsFile: "/etc/arc/cold.json", Endpoint: "https://storage.googleapis.com"}); err != nil {
+		t.Fatalf("ConfigureGCS: %v", err)
+	}
+
+	scopes := map[string]string{}
+	rows, err := db.db.Query("SELECT name, type, scope::VARCHAR FROM duckdb_secrets() WHERE type = 'gcs'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var name, typ, scope string
+		if err := rows.Scan(&name, &typ, &scope); err != nil {
+			t.Fatal(err)
+		}
+		scopes[name] = scope
+	}
+	rows.Close()
+	if !strings.Contains(scopes[arcGCSPrimarySecretName], "gs://hotb/hot/") || !strings.Contains(scopes[arcGCSColdSecretName], "gs://coldb/cold/") {
+		t.Fatalf("secret scopes %v", scopes)
+	}
+
+	mu.Lock()
+	var coldIdentity *storage.GCSConfig
+	for i := range identities {
+		if identities[i].Bucket == "coldb" {
+			coldIdentity = &identities[i]
+		}
+	}
+	mu.Unlock()
+	if coldIdentity == nil || coldIdentity.CredentialsFile != "/etc/arc/cold.json" || coldIdentity.Prefix != "cold/" {
+		t.Fatalf("cold secret not resolved from the cold identity: %+v", coldIdentity)
+	}
+
+	st := db.StorageCredentialStatus()
+	if st["hot"].Backend != "gcs" || st["hot"].Source != "application_default_credentials" {
+		t.Fatalf("hot = %+v", st["hot"])
+	}
+	if c := st["cold"]; c.Backend != "gcs" || c.State != CredStateOK || c.Source != "service_account_key" || c.ExpiresAt == nil {
+		t.Fatalf("cold = %+v", c)
+	}
+	dirs := strings.Join(db.AllowedDirectories(), ",")
+	if !strings.Contains(dirs, "gs://hotb/hot/") || !strings.Contains(dirs, "gs://coldb/cold/") {
+		t.Fatalf("allowlist %s", dirs)
+	}
+}
+
+// Local primary + GCS cold: httpfs is loaded before the lockdown for the cold
+// tier alone, so the post-lockdown TYPE GCS cold secret can be created (it
+// needs httpfs); an unresolvable cold identity reports "unavailable", not
+// "fallback", and an http endpoint is refused.
+func TestConfigureGCSColdTierLocalPrimary(t *testing.T) {
+	orig := newGCSTokenSource
+	newGCSTokenSource = func(cfg *storage.GCSConfig) (gcsTokenSource, error) {
+		if cfg.Bucket == "deadb" {
+			return &fakeGCSSource{err: errors.New("metadata server unreachable")}, nil
+		}
+		return &fakeGCSSource{tok: &auth.Token{Value: "ya29.c", Expiry: time.Now().Add(time.Hour)}}, nil
+	}
+	t.Cleanup(func() { newGCSTokenSource = orig })
+	tmp := t.TempDir()
+	db, err := New(&Config{
+		MaxConnections: 2, MemoryLimit: "256MB", TempDirectory: tmp, LocalStorageRoot: filepath.Join(tmp, "d"),
+		ColdGCSBucket: "coldb",
+	}, zerolog.Nop())
+	if err != nil {
+		t.Skipf("New: %v", err)
+	}
+	defer db.Close()
+	if err := db.ConfigureGCS(&GCSConfig{Bucket: "coldb"}); err != nil {
+		t.Fatalf("ConfigureGCS: %v", err)
+	}
+	var n int
+	if err := db.db.QueryRow("SELECT count(*) FROM duckdb_secrets() WHERE name = '" + arcGCSColdSecretName + "'").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("cold secret count %d, %v (httpfs not loaded before the lockdown?)", n, err)
+	}
+	if st := db.StorageCredentialStatus(); st["hot"].Backend != "local" || st["cold"].State != CredStateOK {
+		t.Fatalf("status %+v", st)
+	}
+	if err := db.ConfigureGCS(&GCSConfig{Bucket: "deadb"}); err != nil {
+		t.Fatalf("ConfigureGCS: %v", err)
+	}
+	if c := db.StorageCredentialStatus()["cold"]; c.Backend != "gcs" || c.State != CredStateUnavailable {
+		t.Fatalf("unresolvable cold = %+v, want unavailable", c)
+	}
+	if err := db.ConfigureGCS(&GCSConfig{Bucket: "coldb", Endpoint: "http://x"}); err == nil {
+		t.Fatal("an http cold endpoint must be refused")
+	}
+}
+
+// A GCS cold tier recorded without a refresher (unreachable through
+// ConfigureGCS, which registers one before recording) must still report
+// "unavailable": GCS has no fallback secret, so "fallback" would claim
+// credentials that do not exist.
+func TestColdGCSWithoutRefresherIsUnavailable(t *testing.T) {
+	db, err := New(&Config{MaxConnections: 2, MemoryLimit: "256MB", TempDirectory: t.TempDir()}, zerolog.Nop())
+	if err != nil {
+		t.Skipf("New: %v", err)
+	}
+	defer db.Close()
+	db.refresherMu.Lock()
+	db.coldTier = &storageTierConfig{backend: "gcs", credentials: s3ModeSDKManaged, secretName: arcGCSColdSecretName}
+	db.refresherMu.Unlock()
+	if c := db.StorageCredentialStatus()["cold"]; c.State != CredStateUnavailable {
+		t.Fatalf("cold = %+v, want unavailable", c)
+	}
+}

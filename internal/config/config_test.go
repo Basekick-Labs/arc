@@ -1176,7 +1176,7 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 		},
 		{
 			name:      "cold tier enabled invalid backend -> error",
-			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcp"},
 			wantError: true,
 		},
 		{
@@ -1184,7 +1184,7 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 			// disabled, the runtime ignores the cold tier entirely, so an invalid
 			// cold config must NOT block startup (previously it did).
 			name:      "parent tiering disabled + bad cold config -> ok (runtime ignores it)",
-			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcp"},
 			wantError: false,
 		},
 	}
@@ -1552,10 +1552,11 @@ func TestLoad_GCSPrimaryValidation(t *testing.T) {
 		{"gcs bad prefix", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_PREFIX": "../x"}, "storage.gcs_prefix"},
 		{"gcs http endpoint", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_ENDPOINT": "http://localhost:4443"}, "must be an https URL"},
 		{"gcs unusable endpoint", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_ENDPOINT": "ftp://x"}, "storage.gcs_endpoint"},
-		{"gcs with a cold tier", map[string]string{
+		// Lifted in part 3: a GCS primary takes a cold tier.
+		{"gcs with an S3 cold tier", map[string]string{
 			"ARC_STORAGE_GCS_BUCKET": "b", "ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
 			"ARC_TIERED_STORAGE_COLD_BACKEND": "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET": "c",
-		}, "does not support a cold tier"},
+		}, ""},
 		{"gcs with a leftover cold tier, tiering off", map[string]string{
 			"ARC_STORAGE_GCS_BUCKET": "b", "ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
 		}, ""},
@@ -1575,6 +1576,92 @@ func TestLoad_GCSPrimaryValidation(t *testing.T) {
 				}
 				if cfg.Storage.GCSBucket != "b" {
 					t.Fatalf("bucket = %q, want trimmed \"b\"", cfg.Storage.GCSBucket)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load() error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoad_GCSColdTierValidation (#1105 part 3): tiered_storage.cold.backend
+// "gcs" with every key, its refusals naming the key, and the overlap refusal
+// between cold and primary storage, which applies to every backend.
+func TestLoad_GCSColdTierValidation(t *testing.T) {
+	cold := func(kv ...string) map[string]string {
+		m := map[string]string{
+			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND": "gcs",
+		}
+		for i := 0; i < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{"local hot, gcs cold, every key non-default", cold(
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", " c ", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "cold/a",
+			"ARC_TIERED_STORAGE_COLD_GCS_CREDENTIALS_FILE", "/etc/arc/cold.json",
+			"ARC_TIERED_STORAGE_COLD_GCS_ENDPOINT", "https://storage.googleapis.com"), ""},
+		{"gcs cold without bucket", cold(), "tiered_storage.cold.gcs_bucket is empty"},
+		{"gcs cold bad prefix", cold("ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "c", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "../x"), "tiered_storage.cold.gcs_prefix"},
+		{"gcs cold http endpoint", cold("ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "c", "ARC_TIERED_STORAGE_COLD_GCS_ENDPOINT", "http://x"), "tiered_storage.cold.gcs_endpoint"},
+		{"gcs hot + gcs cold, sibling prefixes", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "hot",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "hot-other"), ""},
+		{"gcs hot + gcs cold, same prefix", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "p",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "p"), "overlaps primary storage"},
+		{"gcs hot at the bucket root, cold nested", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "cold"), "overlaps primary storage"},
+		{"gcs hot nested in the cold prefix", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "c/hot",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "c"), "overlaps primary storage"},
+		{"gcs hot vs S3-interop cold on the same bucket", map[string]string{
+			"ARC_STORAGE_BACKEND": "gcs", "ARC_STORAGE_GCS_BUCKET": "b",
+			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3",
+			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b", "ARC_TIERED_STORAGE_COLD_S3_PREFIX": "cold",
+			"ARC_TIERED_STORAGE_COLD_S3_ENDPOINT": "https://storage.googleapis.com",
+		}, "overlaps primary storage"},
+		// The cold endpoint is part of its identity: the same bucket name on
+		// a store that is not Google's is another bucket.
+		{"gcs hot + gcs cold on another store, same bucket and prefix", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "p",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "p",
+			"ARC_TIERED_STORAGE_COLD_GCS_ENDPOINT", "https://gcs.example.internal"), ""},
+		// Every backend, not only GCS: an S3 hot and S3 cold in one prefix.
+		{"s3 hot + s3 cold, same prefix", map[string]string{
+			"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b", "ARC_STORAGE_S3_PREFIX": "p",
+			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3",
+			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b", "ARC_TIERED_STORAGE_COLD_S3_PREFIX": "p",
+		}, "overlaps primary storage"},
+		{"s3 hot + s3 cold, other bucket", map[string]string{
+			"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b",
+			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3",
+			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "c",
+		}, ""},
+		// Gated like the cold validation: tiering off ignores the cold block.
+		{"overlap with tiering off is ignored", map[string]string{
+			"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b",
+			"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3",
+			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b",
+		}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.TieredStorage.Cold.Backend == "gcs" && cfg.TieredStorage.Cold.GCSBucket != strings.TrimSpace(tc.env["ARC_TIERED_STORAGE_COLD_GCS_BUCKET"]) {
+					t.Fatalf("cold bucket = %q", cfg.TieredStorage.Cold.GCSBucket)
 				}
 				return
 			}

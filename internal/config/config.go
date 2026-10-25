@@ -647,7 +647,7 @@ type ReconciliationConfig struct {
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
 // Tiered storage enables automatic data lifecycle management with hot/cold tiers.
 // - Hot tier: Local storage for recent data (fast access)
-// - Cold tier: S3/Azure for archived data (cost-effective archival storage)
+// - Cold tier: S3/Azure/GCS for archived data (cost-effective archival storage)
 //
 // Data older than DefaultHotMaxAgeDays is automatically migrated to cold storage.
 type TieredStorageConfig struct {
@@ -675,11 +675,11 @@ type TieredStorageConfig struct {
 	// truncates never retires a stale row.
 	ScanTimeout time.Duration
 
-	// Cold tier configuration (remote S3/Azure storage)
+	// Cold tier configuration (remote S3/Azure/GCS storage)
 	Cold ColdTierConfig
 }
 
-// ColdTierConfig holds configuration for the cold storage tier (S3/Azure).
+// ColdTierConfig holds configuration for the cold storage tier (S3/Azure/GCS).
 // This is the only remote tier - data moves directly from hot (local) to cold (remote).
 // Cold objects are written with no storage class or access tier set — S3
 // STANDARD, and on Azure the storage account's default tier — and queried in
@@ -689,7 +689,7 @@ type TieredStorageConfig struct {
 // preserve for a saving that is small next to block storage versus S3.
 type ColdTierConfig struct {
 	Enabled bool   // Enable cold tier
-	Backend string // "s3" or "azure"
+	Backend string // "s3", "azure" or "gcs"
 
 	// S3 settings
 	S3Bucket    string // S3 bucket for cold-tier data
@@ -710,6 +710,13 @@ type ColdTierConfig struct {
 	AzureSASToken           string // SAS token for scoped access
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
+
+	// GCS settings (#1105). Credentials as for storage.gcs_*: a
+	// service-account key file, else Application Default Credentials.
+	GCSBucket          string // Bucket for cold-tier data
+	GCSPrefix          string // Object-name prefix within the bucket
+	GCSCredentialsFile string // Service-account key file path (optional)
+	GCSEndpoint        string // https endpoint override (optional)
 }
 
 // AuditLogConfig holds configuration for enterprise audit logging.
@@ -1395,6 +1402,10 @@ func Load() (*Config, error) {
 				AzureSASToken:           v.GetString("tiered_storage.cold.azure_sas_token"),
 				AzureEndpoint:           v.GetString("tiered_storage.cold.azure_endpoint"),
 				AzureUseManagedIdentity: v.GetBool("tiered_storage.cold.azure_use_managed_identity"),
+				GCSBucket:               v.GetString("tiered_storage.cold.gcs_bucket"),
+				GCSPrefix:               v.GetString("tiered_storage.cold.gcs_prefix"),
+				GCSCredentialsFile:      v.GetString("tiered_storage.cold.gcs_credentials_file"),
+				GCSEndpoint:             v.GetString("tiered_storage.cold.gcs_endpoint"),
 			},
 		},
 		AuditLog: AuditLogConfig{
@@ -1534,15 +1545,6 @@ func Load() (*Config, error) {
 		if err := checkGCSEndpoint("storage.gcs_endpoint", cfg.Storage.GCSEndpoint); err != nil {
 			return nil, err
 		}
-		// GCS as the hot tier with a cold tier is not supported yet (#1105
-		// part 3): the tier mover and the cold query router have not been
-		// verified against a GCS hot tier. Same gate as the cold-tier
-		// validation below, so a leftover cold.enabled on a node without
-		// tiering still boots.
-		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
-			return nil, fmt.Errorf("storage.backend \"gcs\" does not support a cold tier yet " +
-				"(tiered_storage.cold.enabled); disable the cold tier or use another primary backend")
-		}
 	default:
 		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", \"azblob\", or \"gcs\"", cfg.Storage.Backend)
 	}
@@ -1550,8 +1552,8 @@ func Load() (*Config, error) {
 	// Cold tier (Enterprise tiered storage). Validate its backend and required
 	// fields at startup — same rationale as the primary guards above: a missing
 	// bucket/container surfaces only as an opaque tiering / query-time error
-	// otherwise. The cold runtime switch (cmd/arc/main.go) handles exactly "s3"
-	// and "azure"; reject anything else loudly. Backend is normalized at load.
+	// otherwise. The cold runtime switch (cmd/arc/main.go) handles exactly "s3",
+	// "azure" and "gcs"; reject anything else loudly. Backend is normalized at load.
 	// cold is a POINTER so the in-place trims persist to the real config struct,
 	// not a copy.
 	//
@@ -1572,6 +1574,10 @@ func Load() (*Config, error) {
 		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
 		cold.AzurePrefix = strings.TrimSpace(cold.AzurePrefix)
 		cold.AzureEndpoint = strings.TrimSpace(cold.AzureEndpoint)
+		cold.GCSBucket = strings.TrimSpace(cold.GCSBucket)
+		cold.GCSPrefix = strings.TrimSpace(cold.GCSPrefix)
+		cold.GCSCredentialsFile = strings.TrimSpace(cold.GCSCredentialsFile)
+		cold.GCSEndpoint = strings.TrimSpace(cold.GCSEndpoint)
 		switch cold.Backend {
 		case "s3":
 			if cold.S3Bucket == "" {
@@ -1596,8 +1602,22 @@ func Load() (*Config, error) {
 			if err := cfg.checkObjectPrefix("tiered_storage.cold.azure_prefix", cold.AzurePrefix); err != nil {
 				return nil, err
 			}
+		case "gcs":
+			if cold.GCSBucket == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"gcs\" but tiered_storage.cold.gcs_bucket is empty; set tiered_storage.cold.gcs_bucket")
+			}
+			// Same reason as the cold S3 prefix above.
+			if err := cfg.checkObjectPrefix("tiered_storage.cold.gcs_prefix", cold.GCSPrefix); err != nil {
+				return nil, err
+			}
+			if err := checkGCSEndpoint("tiered_storage.cold.gcs_endpoint", cold.GCSEndpoint); err != nil {
+				return nil, err
+			}
 		default:
-			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\" or \"azure\"", cold.Backend)
+			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\", \"azure\" or \"gcs\"", cold.Backend)
+		}
+		if err := cfg.checkColdPrimaryOverlap(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -2231,7 +2251,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.shared_storage_mode", false)
 
 	// Tiered storage defaults (Enterprise feature)
-	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
+	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure/GCS archive)
 	v.SetDefault("tiered_storage.enabled", false)                       // Disabled by default
 	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *")      // 2am daily
 	v.SetDefault("tiered_storage.migration_max_concurrent", 4)          // 4 concurrent migrations
@@ -2240,7 +2260,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
 
-	// Cold tier defaults (S3/Azure). Objects are written in the bucket's
+	// Cold tier defaults (S3/Azure/GCS). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.
 	v.SetDefault("tiered_storage.cold.enabled", false)         // Disabled by default
 	v.SetDefault("tiered_storage.cold.backend", "s3")          // S3 by default
@@ -2259,6 +2279,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.cold.azure_sas_token", "")
 	v.SetDefault("tiered_storage.cold.azure_endpoint", "")
 	v.SetDefault("tiered_storage.cold.azure_use_managed_identity", false)
+	v.SetDefault("tiered_storage.cold.gcs_bucket", "")           // Must be configured for GCS
+	v.SetDefault("tiered_storage.cold.gcs_prefix", "")           // Bucket root by default
+	v.SetDefault("tiered_storage.cold.gcs_credentials_file", "") // Empty = Application Default Credentials
+	v.SetDefault("tiered_storage.cold.gcs_endpoint", "")         // Empty = storage.googleapis.com
 
 	// Audit log defaults (Enterprise feature)
 	v.SetDefault("audit_log.enabled", false)

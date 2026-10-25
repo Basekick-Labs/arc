@@ -60,7 +60,7 @@ func lockdownDirs(ctx context.Context, db *sql.DB, dirs []string, logger zerolog
 	// Config field that contributes to the allowlist so operators see exactly
 	// which knob is unset.
 	if len(dirs) == 0 {
-		componentLogger.Warn().Msg("sandbox allowlist is empty — every file-touching query will fail; check Config.LocalStorageRoot / TempDirectory / UploadDir / CompactionTempDirectory / S3Bucket / ColdS3Bucket / AzureContainer / ColdAzureContainer wiring")
+		componentLogger.Warn().Msg("sandbox allowlist is empty — every file-touching query will fail; check Config.LocalStorageRoot / TempDirectory / UploadDir / CompactionTempDirectory / S3Bucket / ColdS3Bucket / AzureContainer / ColdAzureContainer / GCSBucket / ColdGCSBucket wiring")
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, sandboxLockdownTimeout)
@@ -161,8 +161,18 @@ func buildAllowedDirectories(cfg *Config) []string {
 	// Primary GCS backend (when storage.backend = "gcs", #1105). The query
 	// path reads gs://<bucket>/<prefix>/... (storage.backendRoot); the GCS
 	// secret's SCOPE is built by the same gcsPrefixURI.
+	var hotGCS string
 	if cfg.GCSIsPrimaryBackend && cfg.GCSBucket != "" {
-		dirs = append(dirs, gcsPrefixURI(cfg.GCSBucket, cfg.GCSPrefix))
+		hotGCS = gcsPrefixURI(cfg.GCSBucket, cfg.GCSPrefix)
+		dirs = append(dirs, hotGCS)
+	}
+	// Cold-tier GCS: its own entry unless it is byte-identical to the hot
+	// one (config.Load refuses an overlapping cold tier, so this dedupe only
+	// matters to a caller that skipped it).
+	if cfg.ColdGCSBucket != "" {
+		if coldGCS := gcsPrefixURI(cfg.ColdGCSBucket, cfg.ColdGCSPrefix); coldGCS != hotGCS {
+			dirs = append(dirs, coldGCS)
+		}
 	}
 	// Primary Azure backend (when storage.backend = "azure"). Azure has a key
 	// prefix since #1102, so this narrows to it exactly as the S3 entry above

@@ -529,7 +529,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+		return c.Status(transformErrorStatus(err)).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
 		})

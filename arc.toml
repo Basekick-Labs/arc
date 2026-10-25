@@ -444,7 +444,7 @@ migration_history_retention_days = 90
 
 [tiered_storage.cold]
 enabled = false
-backend = "s3"              # "s3" or "azure"
+backend = "s3"              # "s3", "azure" or "gcs"
 
 # S3 — nothing below is set, on purpose. Arc's built-in defaults are already
 # the AWS-correct ones (no endpoint, HTTPS, virtual-hosted addressing, and
@@ -478,6 +478,15 @@ azure_use_managed_identity = false
 # commented for the same reason as the connection values above: a shipped value
 # cannot be cleared by an empty environment variable.
 # azure_prefix = "cold"
+
+# GCS (when backend = "gcs"). Standalone nodes only for now. Credentials as for
+# [storage] gcs_*: a service-account key file, else Application Default
+# Credentials. Use a STANDARD (or Autoclass) bucket: colder classes charge
+# retrieval on every query read of cold data. Must not overlap [storage].
+# gcs_bucket = ""
+# gcs_prefix = "cold"
+# gcs_credentials_file = ""
+# gcs_endpoint = ""
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)
@@ -576,7 +585,7 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # default_target = "main"
 #
 # [backup.targets.main]                  # the DEFAULT: everything unrouted goes here
-# type = "local"                         # local, s3, minio, azure or azblob
+# type = "local"                         # local, s3, minio, azure, azblob or gcs
 # local_path = "/srv/arc-backups"
 #
 # [backup.targets.audit]                 # a ROUTED target: it carries `databases`
@@ -593,6 +602,10 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # s3_path_style = false                  # required for MinIO
 # s3_access_key = ""                     # prefer ARC_BACKUP_TARGETS_AUDIT_S3_ACCESS_KEY
 # s3_secret_key = ""                     # prefer ARC_BACKUP_TARGETS_AUDIT_S3_SECRET_KEY
+#
+# A GCS target (type = "gcs") takes gcs_bucket, gcs_prefix, gcs_credentials_file
+# (a service-account key file; empty = Application Default Credentials) and
+# gcs_endpoint (https only).
 #
 # From the environment ALONE, with nothing in this file, a target takes an extra
 # variable, because a name cannot be discovered from a map that does not exist:
