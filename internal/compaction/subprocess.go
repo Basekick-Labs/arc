@@ -57,7 +57,7 @@ type SubprocessJobConfig struct {
 	Threads int `json:"threads,omitempty"`
 
 	// Storage configuration
-	StorageType   string `json:"storage_type"`   // Backend.Type(): "local", "s3" or "azure"
+	StorageType   string `json:"storage_type"`   // Backend.Type(): "local", "s3", "azure" or "gcs"
 	StorageConfig string `json:"storage_config"` // Backend.ConfigJSON(): no secrets
 	// Credentials authenticate the subprocess's storage backend the way the
 	// parent's was authenticated (#1104). It travels only in this job, which
@@ -137,6 +137,12 @@ type SubprocessCredentials struct {
 	AzureAccountKey         string `json:"azure_account_key,omitempty"`
 	AzureSASToken           string `json:"azure_sas_token,omitempty"`
 	AzureUseManagedIdentity bool   `json:"azure_use_managed_identity,omitempty"`
+
+	// GCS (#1105): a service-account key, as its contents or its path. Both
+	// empty means Application Default Credentials, which the subprocess
+	// resolves from the environment and metadata server it inherits.
+	GCSCredentialsJSON string `json:"gcs_credentials_json,omitempty"`
+	GCSCredentialsFile string `json:"gcs_credentials_file,omitempty"`
 }
 
 // String and GoString keep the secrets out of any %v, %+v or %#v that ever
@@ -161,6 +167,10 @@ func subprocessCredentials(backend storage.Backend) *SubprocessCredentials {
 		creds.AzureAccountKey = auth.AccountKey
 		creds.AzureSASToken = auth.SASToken
 		creds.AzureUseManagedIdentity = auth.UseManagedIdentity
+	case *storage.GCSBackend:
+		auth := b.Credentials()
+		creds.GCSCredentialsJSON = auth.CredentialsJSON
+		creds.GCSCredentialsFile = auth.CredentialsFile
 	}
 	return creds
 }
@@ -508,9 +518,34 @@ func backendSpecFromJob(config *SubprocessJobConfig, getenv func(string) string)
 			spec.Azure.UseManagedIdentity = key == ""
 		}
 
+	case "gcs":
+		var c struct {
+			Bucket   string `json:"bucket"`
+			Prefix   string `json:"prefix"`
+			Endpoint string `json:"endpoint"`
+		}
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse GCS storage config: %w", err)
+		}
+		spec.GCS = storage.GCSConfig{
+			Bucket:   c.Bucket,
+			Prefix:   c.Prefix,
+			Endpoint: c.Endpoint,
+			// The parent probed the bucket and proved the key at startup;
+			// repeating both per job would add requests and failure points
+			// to every compaction.
+			SkipProbe: true,
+		}
+		// With neither set, the subprocess uses Application Default
+		// Credentials from the environment it inherits, as the parent did.
+		if creds != nil {
+			spec.GCS.CredentialsJSON = creds.GCSCredentialsJSON
+			spec.GCS.CredentialsFile = creds.GCSCredentialsFile
+		}
+
 	default:
 		// NewBackend accepts aliases (minio, azblob) that Backend.Type() never
-		// emits; the job only ever carries these three.
+		// emits; the job only ever carries these four.
 		return spec, fmt.Errorf("unsupported storage type: %s", config.StorageType)
 	}
 	return spec, nil

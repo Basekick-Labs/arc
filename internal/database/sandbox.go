@@ -158,6 +158,12 @@ func buildAllowedDirectories(cfg *Config) []string {
 			dirs = append(dirs, coldS3)
 		}
 	}
+	// Primary GCS backend (when storage.backend = "gcs", #1105). The query
+	// path reads gs://<bucket>/<prefix>/... (storage.backendRoot); the GCS
+	// secret's SCOPE is built by the same gcsPrefixURI.
+	if cfg.GCSIsPrimaryBackend && cfg.GCSBucket != "" {
+		dirs = append(dirs, gcsPrefixURI(cfg.GCSBucket, cfg.GCSPrefix))
+	}
 	// Primary Azure backend (when storage.backend = "azure"). Azure has a key
 	// prefix since #1102, so this narrows to it exactly as the S3 entry above
 	// does. At the default (no prefix) the entry is byte-identical to the

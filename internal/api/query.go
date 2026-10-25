@@ -2682,6 +2682,8 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 //
 //	local: IO Error: Cannot open file "<path>": No such file or directory
 //	S3:    HTTP Error: HTTP GET error reading '<url>' in region '<r>' (HTTP 404 Not Found)
+//	GCS:   the S3 form, '<url>' the gs:// URL and region '' (recorded against
+//	       real GCS, #1105)
 //	Azure: IO Error: AzureStorageFileSystem open file '<url>' failed with code 'BlobNotFound', ...
 //
 // Each must be a DuckDB error of that type and start with that text

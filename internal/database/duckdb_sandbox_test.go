@@ -56,6 +56,16 @@ func TestBuildAllowedDirectories(t *testing.T) {
 			want: []string{"s3://my-bucket/tenant-a/"},
 		},
 		{
+			name: "hot gcs bucket + prefix",
+			cfg:  &Config{GCSIsPrimaryBackend: true, GCSBucket: "g", GCSPrefix: "inst/"},
+			want: []string{"gs://g/inst/"},
+		},
+		{
+			name: "gcs bucket named but backend not gcs",
+			cfg:  &Config{GCSBucket: "g"},
+			want: nil,
+		},
+		{
 			name: "hot s3 bucket without prefix",
 			cfg:  &Config{S3Bucket: "warehouse"},
 			want: []string{"s3://warehouse/"},

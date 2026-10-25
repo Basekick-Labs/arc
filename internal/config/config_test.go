@@ -1121,7 +1121,7 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 	}{
 		{
 			name:      "invalid primary backend -> error",
-			env:       map[string]string{"ARC_STORAGE_BACKEND": "gcs"},
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "gcp"},
 			wantError: true,
 		},
 		{
@@ -1530,5 +1530,57 @@ func TestLoad_DatabaseExtensionsTOMLArray(t *testing.T) {
 	}
 	if got, want := cfg.Database.Extensions, []string{"spatial", "vss"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Database.Extensions = %q, want %q", got, want)
+	}
+}
+
+// TestLoad_GCSPrimaryValidation (#1105): storage.backend="gcs" is accepted with
+// a bucket, and each refusal names the key at fault.
+func TestLoad_GCSPrimaryValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantErr string // "" = must load
+	}{
+		{"gcs with bucket", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b"}, ""},
+		{"gcs with every key at a non-default value", map[string]string{
+			"ARC_STORAGE_GCS_BUCKET": " b ", "ARC_STORAGE_GCS_PREFIX": "inst/a/",
+			"ARC_STORAGE_GCS_CREDENTIALS_FILE": "/etc/arc/key.json",
+			"ARC_STORAGE_GCS_ENDPOINT":         "https://storage-psc.p.googleapis.com",
+		}, ""},
+		{"gcs endpoint as a bare host", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_ENDPOINT": "storage.googleapis.com"}, ""},
+		{"gcs without bucket", map[string]string{}, "storage.gcs_bucket is empty"},
+		{"gcs bad prefix", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_PREFIX": "../x"}, "storage.gcs_prefix"},
+		{"gcs http endpoint", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_ENDPOINT": "http://localhost:4443"}, "must be an https URL"},
+		{"gcs unusable endpoint", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_ENDPOINT": "ftp://x"}, "storage.gcs_endpoint"},
+		{"gcs with a cold tier", map[string]string{
+			"ARC_STORAGE_GCS_BUCKET": "b", "ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND": "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET": "c",
+		}, "does not support a cold tier"},
+		{"gcs with a leftover cold tier, tiering off", map[string]string{
+			"ARC_STORAGE_GCS_BUCKET": "b", "ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
+		}, ""},
+		{"gcs with iceberg", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_ICEBERG_ENABLED": "true"}, "iceberg.enabled=true requires storage.backend=\"local\""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("ARC_STORAGE_BACKEND", "gcs")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.Storage.GCSBucket != "b" {
+					t.Fatalf("bucket = %q, want trimmed \"b\"", cfg.Storage.GCSBucket)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load() error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
 	}
 }
