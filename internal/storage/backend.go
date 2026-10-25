@@ -55,18 +55,18 @@ func IsStoreNotFound(err error) bool {
 // Each backend wraps it from its own not-found shape; IsNotFound is the
 // predicate to use rather than string-matching, because the shapes differ
 // (an *fs.PathError locally, NoSuchKey or a HEAD's NotFound on S3, a
-// BlobNotFound ResponseError on Azure).
+// BlobNotFound ResponseError on Azure, ErrObjectNotExist on GCS).
 var ErrObjectNotFound = errors.New("file not found")
 
 // IsNotFound reports whether err is a backend saying the key names no object.
 //
 // It accepts the wrapped sentinel, a wrapped fs not-exist, and the typed
-// shapes the two SDKs produce (NoSuchKey/NotFound on S3, a non-container 404
-// ResponseError on Azure). It never reads an error's text (#1238): S3 and
-// Azure errors carry the request URL, the request ID and the local port, so a
-// transport failure could contain "404" or "NotFound" and read as an absent
-// object. A missing bucket or container is not a missing object either: it
-// reads as ErrStoreNotFound (IsStoreNotFound).
+// shapes the SDKs produce (NoSuchKey/NotFound on S3, a non-container 404
+// ResponseError on Azure, ErrObjectNotExist on GCS). It never reads an error's
+// text (#1238): S3 and Azure errors carry the request URL, the request ID and
+// the local port, so a transport failure could contain "404" or "NotFound" and
+// read as an absent object. A missing bucket or container is not a missing
+// object either: it reads as ErrStoreNotFound (IsStoreNotFound).
 func IsNotFound(err error) bool {
 	if err == nil {
 		return false
@@ -74,7 +74,7 @@ func IsNotFound(err error) bool {
 	if errors.Is(err, ErrObjectNotFound) || errors.Is(err, fs.ErrNotExist) {
 		return true
 	}
-	return isNotFoundError(err) || isAzureNotFoundError(err)
+	return isNotFoundError(err) || isAzureNotFoundError(err) || isGCSNotFoundError(err)
 }
 
 // Backend defines the interface for storage backends (local, S3, MinIO)

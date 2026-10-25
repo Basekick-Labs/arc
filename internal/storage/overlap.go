@@ -30,9 +30,12 @@ import (
 // calls of a two-argument function is the shape that extends without
 // rewriting.
 type Destination struct {
-	// Kind is "local", "s3" or "azure". The spelling aliases (minio for s3,
-	// azblob for azure) are normalised away, so two differently-spelled
-	// configurations of one store compare equal.
+	// Kind is "local", "s3", "azure" or "gcs". The spelling aliases (minio
+	// for s3, azblob for azure) are normalised away, so two differently-spelled
+	// configurations of one store compare equal. So is the S3 spelling of a
+	// GCS bucket: an s3 block whose endpoint is a Google Cloud Storage host
+	// (the XML interoperability API) is kind gcs, because it addresses the same
+	// bucket a gcs block of that name does (#1105).
 	Kind string
 
 	// Store identifies the object store instance, CANONICALISED so that two
@@ -112,6 +115,13 @@ func DestinationFromSpec(spec BackendSpec) (Destination, error) {
 			return Destination{}, err
 		}
 		bucket := strings.TrimSpace(spec.S3.Bucket)
+		if isGoogleStorageEndpoint(spec.S3.Endpoint, bucket) {
+			return Destination{
+				Kind:   "gcs",
+				Bucket: bucket,
+				Prefix: strings.Trim(prefix, "/"),
+			}, nil
+		}
 		return Destination{
 			Kind:   "s3",
 			Store:  canonicalS3Endpoint(spec.S3.Endpoint, bucket),
@@ -133,8 +143,21 @@ func DestinationFromSpec(spec BackendSpec) (Destination, error) {
 			Prefix:       strings.Trim(prefix, "/"),
 		}, nil
 
+	case "gcs":
+		prefix, err := ValidateObjectPrefix(spec.GCS.Prefix)
+		if err != nil {
+			return Destination{}, err
+		}
+		bucket := strings.TrimSpace(spec.GCS.Bucket)
+		return Destination{
+			Kind:   "gcs",
+			Store:  canonicalGCSEndpoint(spec.GCS.Endpoint, bucket),
+			Bucket: bucket,
+			Prefix: strings.Trim(prefix, "/"),
+		}, nil
+
 	default:
-		return Destination{}, fmt.Errorf("unsupported storage backend %q (use local, s3, minio, azure or azblob)", spec.Type)
+		return Destination{}, fmt.Errorf("unsupported storage backend %q (use local, s3, minio, azure, azblob or gcs)", spec.Type)
 	}
 }
 
@@ -253,6 +276,58 @@ func canonicalS3Endpoint(endpoint, bucket string) string {
 		return ""
 	}
 	return e
+}
+
+// googleStorageHost matches every host that serves Google Cloud Storage's one
+// global bucket namespace, with any virtual-hosted bucket label already
+// removed: the JSON and XML API host, the legacy JSON host, mTLS, regional
+// endpoints ("storage.<region>.rep.googleapis.com"), the VPC Service Controls
+// VIPs ("private."/"restricted.googleapis.com") and Private Service Connect
+// endpoints ("<name>.p.googleapis.com").
+//
+// GCS bucket names are global, so every one of these reaches the same bucket
+// under the same name, and folding them is what lets the overlap refusal see a
+// gcs block and an S3-interop block naming one bucket (#1105). Anything else
+// (an emulator, a proxy) is kept as its own identity: nothing can be assumed
+// about it, the rule canonicalS3Endpoint follows for a non-AWS host.
+var googleStorageHost = regexp.MustCompile(`^(?:storage(?:\.[a-z0-9-]+\.rep)?|storage\.mtls|www|private|restricted|[a-z0-9-]+\.p)\.googleapis\.com$`)
+
+// googleHostOf reduces an endpoint to its host (normalizeEndpoint, then any
+// path, such as the JSON API's "/storage/v1/", removed) with a leading
+// "<bucket>." virtual-host label stripped.
+func googleHostOf(endpoint, bucket string) string {
+	e := normalizeEndpoint(endpoint)
+	if i := strings.IndexByte(e, '/'); i >= 0 {
+		e = e[:i]
+	}
+	e = strings.TrimSuffix(e, ":443")
+	if b := strings.ToLower(strings.TrimSpace(bucket)); b != "" {
+		e = strings.TrimPrefix(e, b+".")
+	}
+	return e
+}
+
+// isGoogleStorageEndpoint reports whether an S3 endpoint is Google Cloud
+// Storage's XML interoperability API. "" is AWS, never Google.
+func isGoogleStorageEndpoint(endpoint, bucket string) bool {
+	if strings.TrimSpace(endpoint) == "" {
+		return false
+	}
+	return googleStorageHost.MatchString(googleHostOf(endpoint, bucket))
+}
+
+// canonicalGCSEndpoint is a gcs block's store identity: "" for Google (the
+// default, and every googleStorageHost spelling), the normalised endpoint for
+// anything else.
+func canonicalGCSEndpoint(endpoint, bucket string) string {
+	if strings.TrimSpace(endpoint) == "" {
+		return ""
+	}
+	h := googleHostOf(endpoint, bucket)
+	if googleStorageHost.MatchString(h) {
+		return ""
+	}
+	return h
 }
 
 // azureBlobHost matches "<account>.blob.core.windows.net", capturing the
