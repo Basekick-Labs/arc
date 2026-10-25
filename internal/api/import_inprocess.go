@@ -575,6 +575,10 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 	if herr != nil {
 		return nil, herr
 	}
+	binaryKinds, berr := parquetBinaryKinds(fr, schema)
+	if berr != nil {
+		return nil, berr
+	}
 
 	timeColumn := func(rec arrow.RecordBatch, idx, firstRow int) ([]int64, error) {
 		col := arrow.NewColumnFromArr(rec.Schema().Field(idx), rec.Column(idx))
@@ -630,7 +634,19 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 				continue
 			}
 			col := arrow.NewColumnFromArr(rec.Schema().Field(i), rec.Column(i))
-			vals, valid, conv := arrowColumnToTyped(&col)
+			var vals interface{}
+			var valid []bool
+			var conv error
+			if kind, ok := binaryKinds[name]; ok {
+				vals, valid, conv = binaryColumnToTyped(&col, &kind)
+				binaryKinds[name] = kind
+				if conv == nil && vals == nil {
+					col.Release()
+					continue // all NULL in this batch: left out, reads NULL
+				}
+			} else {
+				vals, valid, conv = arrowColumnToTyped(&col)
+			}
 			col.Release()
 			if conv != nil {
 				if w.started() {
@@ -1174,34 +1190,9 @@ func arrowColumnToTyped(col *arrow.Column) (interface{}, []bool, error) {
 			}
 		}
 		return res, validity, nil
-	case *array.Binary:
-		// BYTE_ARRAY without a UTF8 logical annotation reads as Binary, not
-		// String (common from Spark and some writers). Treat as string.
-		res := make([]string, length)
-		idx := 0
-		for _, chunk := range chunks {
-			a := chunk.(*array.Binary)
-			for i := 0; i < a.Len(); i++ {
-				if !a.IsNull(i) {
-					res[idx] = string(a.Value(i))
-				}
-				idx++
-			}
-		}
-		return res, validity, nil
-	case *array.FixedSizeBinary:
-		res := make([]string, length)
-		idx := 0
-		for _, chunk := range chunks {
-			a := chunk.(*array.FixedSizeBinary)
-			for i := 0; i < a.Len(); i++ {
-				if !a.IsNull(i) {
-					res[idx] = string(a.Value(i))
-				}
-				idx++
-			}
-		}
-		return res, validity, nil
+	// Binary, LargeBinary and FixedSizeBinary columns never reach here:
+	// parquetBinaryKinds and binaryColumnToTyped decide whether each is text
+	// or bytes (#440).
 	case *array.Boolean:
 		res := make([]bool, length)
 		idx := 0
