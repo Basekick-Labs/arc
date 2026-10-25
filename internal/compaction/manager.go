@@ -369,6 +369,9 @@ type Manager struct {
 	// Nil in production. Deterministic cycle tests may inject a batch
 	// runner without starting an external compaction subprocess.
 	compactBatchForTest func(context.Context, Candidate) error
+	// attemptForTest replaces one compactPartition attempt inside
+	// compactFilesAdaptively (the splitter's ladder).
+	attemptForTest func(context.Context, Candidate) error
 
 	// pauseGate, when set, reports whether compaction is paused cluster-wide
 	// (#1087); main.go wires it to the cluster coordinator. Consulted at
@@ -1468,7 +1471,12 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 
 	// Attempt compaction
 	attemptStart := time.Now()
-	err := m.compactPartition(ctx, batchCandidate, jobAttribution{CycleID: cycleID, AttemptDepth: depth})
+	var err error
+	if m.attemptForTest != nil {
+		err = m.attemptForTest(ctx, batchCandidate)
+	} else {
+		err = m.compactPartition(ctx, batchCandidate, jobAttribution{CycleID: cycleID, AttemptDepth: depth})
+	}
 	if err == nil {
 		// Success!
 		if depth > 0 {
@@ -1745,7 +1753,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// tooWideSeen is every (tier, partition) this cycle discovered, for
 	// pruning the too-wide memo after a full-scope cycle.
 	tooWideSeen := map[string]bool{}
-	tooWideSettings := m.tooWideSettings()
+	tooWideSettings := m.TooWideSettings()
 	tooWideTiers := map[string]bool{}
 
 	// The cycle is recorded as "running" before it starts, carrying its scope
@@ -2310,14 +2318,14 @@ func (m *Manager) tooWideStrike(tier, partition string, files []string, err erro
 	if reason == "" {
 		return
 	}
-	if m.tooWide.strike(tier, partition, files, reason, m.tooWideSettings()) {
+	if m.tooWide.strike(tier, partition, files, reason, m.TooWideSettings()) {
 		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
 		m.logger.Warn().
 			Str("tier", tier).
 			Str("partition", partition).
 			Int("files", len(files)).
 			Str("reason", reason).
-			Str("settings", m.tooWideSettings()).
+			Str("settings", m.TooWideSettings()).
 			Msg("Partition is too wide to compact in a job's memory: it fails at the smallest batch; left uncompacted until its files or the job sizing change (more memory per job: compaction.memory_limit or a lower compaction.max_concurrent). Uncompacted files are not moved to cold storage")
 	}
 }
@@ -3169,10 +3177,10 @@ func (m *Manager) dropDeadCompletionRecord(ctx context.Context, candidate Candid
 	m.logger.Debug().Str("job_id", config.JobID).Msg("Removed the completion record of a job that ended before writing its output")
 }
 
-// tooWideSettings is the job sizing a too-wide failure is remembered under.
+// TooWideSettings is the job sizing a too-wide failure is remembered under.
 // Any change retries the memoized partitions: the operator's remedy for one is
 // more memory per job or fewer files per batch.
-func (m *Manager) tooWideSettings() string {
+func (m *Manager) TooWideSettings() string {
 	return fmt.Sprintf("memory_limit=%s threads=%d max_files_per_batch=%d cycle_timeout=%s",
 		m.MemoryLimit, m.Threads, m.MaxFilesPerBatch, m.CycleTimeout)
 }

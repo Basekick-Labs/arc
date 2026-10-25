@@ -183,7 +183,9 @@ func (h *CompactionHandler) listTooWide(c *fiber.Ctx) error {
 			"last_failure":  e.LastFailure,
 		})
 	}
-	return c.JSON(fiber.Map{"partitions": out, "count": len(out)})
+	// current_settings is what a remembered partition's settings are compared
+	// with: one remembered under other settings is tried again.
+	return c.JSON(fiber.Map{"partitions": out, "count": len(out), "current_settings": h.manager.TooWideSettings()})
 }
 
 // clearTooWide handles DELETE /api/v1/compaction/too-wide: every remembered
