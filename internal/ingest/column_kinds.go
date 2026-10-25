@@ -147,6 +147,15 @@ func (b *ArrowBuffer) checkBatchTextBinary(database string, records []interface{
 	return nil
 }
 
+// KnownTextBinaryColumns is, for the measurement's stored STRING and BINARY
+// columns, whether each is BINARY; nil when unknown (see knownTextBinary).
+func (b *ArrowBuffer) KnownTextBinaryColumns(database, measurement string) map[string]bool {
+	if b == nil {
+		return nil
+	}
+	return b.knownTextBinary(database, measurement)
+}
+
 // CheckTypedTextBinary is CheckColumnsTextBinary for a typed batch.
 func (b *ArrowBuffer) CheckTypedTextBinary(database, measurement string, batch *TypedColumnBatch) error {
 	if b == nil {

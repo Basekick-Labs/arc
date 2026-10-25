@@ -31,22 +31,29 @@ func writeGeoParquetPair(t *testing.T, exec func(string) error, dir string) []st
 // after a pool reconnect too, so it unions with Arc's BLOB files (#440).
 func TestMainEngineReadsGeoParquetAsBlob(t *testing.T) {
 	root := t.TempDir()
-	db, err := New(&Config{MaxConnections: 2, MemoryLimit: "256MB", ThreadCount: 1, TempDirectory: root, LocalStorageRoot: root}, zerolog.Nop())
+	db, err := New(&Config{MaxConnections: 4, MemoryLimit: "256MB", ThreadCount: 1, TempDirectory: root, LocalStorageRoot: root}, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	files := writeGeoParquetPair(t, func(q string) error { _, err := db.db.Exec(q); return err }, root)
 	ctx := context.Background()
-	for i := 0; i < 3; i++ { // several pool connections
+	// Connections held at once, so each is a different one: a session-scoped
+	// SET would leave all but the first with conversion on.
+	q := fmt.Sprintf("SELECT any_value(typeof(geom)), count(DISTINCT geom) FROM read_parquet(['%s','%s'], union_by_name=true)", files[0], files[1])
+	for i := 0; i < 4; i++ {
+		conn, err := db.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
 		var typ string
 		var n int
-		q := fmt.Sprintf("SELECT any_value(typeof(geom)), count(DISTINCT geom) FROM read_parquet(['%s','%s'], union_by_name=true)", files[0], files[1])
-		if err := db.db.QueryRowContext(ctx, q).Scan(&typ, &n); err != nil {
-			t.Fatalf("query over a BLOB and a GeoParquet file: %v", err)
+		if err := conn.QueryRowContext(ctx, q).Scan(&typ, &n); err != nil {
+			t.Fatalf("connection %d: query over a BLOB and a GeoParquet file: %v", i, err)
 		}
 		if typ != "BLOB" || n != 1 {
-			t.Fatalf("geom read as %s (%d distinct), want BLOB (1)", typ, n)
+			t.Fatalf("connection %d: geom read as %s (%d distinct), want BLOB (1)", i, typ, n)
 		}
 	}
 }

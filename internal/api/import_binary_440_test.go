@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/stretchr/testify/require"
@@ -117,19 +118,98 @@ func TestParquetImportGeoParquetPointAtOriginIsBinary(t *testing.T) {
 	require.Equal(t, map[string]bool{"binary": true}, types)
 }
 
-// Without "geo": bytes that are not UTF-8 are binary; a column whose values
-// are all text stays a string (Spark and Hive write strings that way).
-func TestParquetImportDecidesTextOrBinary(t *testing.T) {
+// unmarkedParquet writes a Parquet file the way Spark does: no ARROW:schema,
+// strings as BYTE_ARRAY without a UTF8 annotation (written here as Binary),
+// and a created_by Arc does not know to mark its strings. rows of raw are
+// given per row; nil is NULL. Row groups of rg rows.
+func unmarkedParquet(t *testing.T, raw [][]byte, rg int) []byte {
+	t.Helper()
+	sc := arrow.NewSchema([]arrow.Field{{Name: "time", Type: arrow.FixedWidthTypes.Timestamp_us}, {Name: "raw", Type: arrow.BinaryTypes.Binary, Nullable: true}}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, sc)
+	defer b.Release()
+	for i, v := range raw {
+		b.Field(0).(*array.TimestampBuilder).Append(arrow.Timestamp(1761386400000000 + int64(i)*1e6))
+		if v == nil {
+			b.Field(1).(*array.BinaryBuilder).AppendNull()
+		} else {
+			b.Field(1).(*array.BinaryBuilder).Append(v)
+		}
+	}
+	rec := b.NewRecord()
+	defer rec.Release()
+	var out bytes.Buffer
+	props := parquet.NewWriterProperties(parquet.WithCreatedBy("parquet-mr version 1.13.1 (build abc)"), parquet.WithMaxRowGroupLength(int64(rg)))
+	w, err := pqarrow.NewFileWriter(sc, &out, props, pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+	require.NoError(t, w.Write(rec))
+	require.NoError(t, w.Close())
+	return out.Bytes()
+}
+
+// From a writer that does not mark its strings (Spark, Hive), a binary
+// column of text throughout is a string, as before; one value that is not
+// UTF-8 anywhere in the file makes it binary, decided before anything is
+// written so no batch is refused part-way. All NULLs stays a string column.
+func TestParquetImportDecidesTextOrBinaryOverTheFile(t *testing.T) {
+	setVar(t, &parquetBatchRows, 2)
+	cases := []struct {
+		name string
+		raw  [][]byte
+		want string
+	}{
+		{"text", [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d")}, "utf8"},
+		{"text then bytes", [][]byte{[]byte("a"), []byte("b"), []byte("c"), {0x00, 0xff}}, "binary"},
+		{"nulls then bytes", [][]byte{nil, nil, {0x00, 0xff}, {0x80}}, "binary"},
+		{"nulls only", [][]byte{nil, nil, nil, nil}, "utf8"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ci := newChunkedImport(t, 1)
+			status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=m", unmarkedParquet(t, tc.raw, 2))
+			require.Equal(t, http.StatusOK, status, body)
+			vals, types := ci.storedColumn(t, "raw")
+			require.Equal(t, map[string]bool{tc.want: true}, types)
+			require.Len(t, vals, len(tc.raw))
+		})
+	}
+}
+
+// A measurement that already stores the column as binary keeps it binary,
+// even when the file's values happen to be text.
+func TestParquetImportFollowsAStoredBinaryColumn(t *testing.T) {
 	ci := newChunkedImport(t, 1000)
-	data := duckdbParquet(t, "SELECT TIMESTAMP '2026-10-25 10:00:00' AS time, from_hex('00FF80') AS raw, 'plain text'::BLOB AS label", "")
+	ci.buf.SetFieldSchema(lpTextBinary{"d/m": {"raw": true}})
+	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=m", unmarkedParquet(t, [][]byte{[]byte("text")}, 10))
+	require.Equal(t, http.StatusOK, status, body)
+	_, types := ci.storedColumn(t, "raw")
+	require.Equal(t, map[string]bool{"binary": true}, types)
+}
+
+// Files Arc writes at compaction and DELETE rewrites come from DuckDB and
+// carry no ARROW:schema; DuckDB marks its strings, so an unmarked column of
+// text-like bytes in them is binary, and Arc's files round-trip.
+func TestParquetImportOfADuckDBFileKeepsBinary(t *testing.T) {
+	ci := newChunkedImport(t, 1000)
+	data := duckdbParquet(t, "SELECT TIMESTAMP '2026-10-25 10:00:00' AS time, 'plain text'::BLOB AS raw, 'label' AS label", "")
 	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=m", data)
 	require.Equal(t, http.StatusOK, status, body)
 	raw, rawTypes := ci.storedColumn(t, "raw")
 	require.Equal(t, map[string]bool{"binary": true}, rawTypes)
-	require.Equal(t, []byte{0x00, 0xff, 0x80}, raw[0])
-	label, labelTypes := ci.storedColumn(t, "label")
+	require.Equal(t, []byte("plain text"), raw[0])
+	_, labelTypes := ci.storedColumn(t, "label")
 	require.Equal(t, map[string]bool{"utf8": true}, labelTypes)
-	require.Equal(t, "plain text", label[0])
+}
+
+// A Parquet UUID column is imported as canonical text, as Arc shows a UUID
+// everywhere else (it was refused as an unsupported type).
+func TestParquetImportOfAUUIDColumnIsText(t *testing.T) {
+	ci := newChunkedImport(t, 1000)
+	data := duckdbParquet(t, "SELECT TIMESTAMP '2026-10-25 10:00:00' AS time, '6f1c2c1e-8a3b-4d2e-9f00-1234567890ab'::UUID AS id", "")
+	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=m", data)
+	require.Equal(t, http.StatusOK, status, body)
+	vals, types := ci.storedColumn(t, "id")
+	require.Equal(t, map[string]bool{"utf8": true}, types)
+	require.Equal(t, "6f1c2c1e-8a3b-4d2e-9f00-1234567890ab", vals[0])
 }
 
 // A file Arc (or pyarrow) wrote carries ARROW:schema, which types its string
@@ -176,59 +256,29 @@ func TestParquetImportRefusesNonWKBGeoParquet(t *testing.T) {
 	require.Empty(t, ci.writes)
 }
 
-// The kind is fixed by the first batch with a value: a batch of NULLs leaves
-// it open, and a later value that is not text in a column decided as text is
-// refused (written as a string it could not be read), reporting what was
-// written.
-func TestParquetImportBinaryKindAcrossBatches(t *testing.T) {
-	setVar(t, &parquetBatchRows, 2)
-	t.Run("nulls first", func(t *testing.T) {
-		ci := newChunkedImport(t, 1)
-		data := duckdbParquet(t, `SELECT TIMESTAMP '2026-10-25 10:00:00' + to_seconds(i) AS time,
-			CASE WHEN i < 2 THEN NULL ELSE from_hex('00FF') END AS raw FROM range(4) t(i) ORDER BY i`, "")
-		status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=m", data)
-		require.Equal(t, http.StatusOK, status, body)
-		vals, types := ci.storedColumn(t, "raw")
-		require.Equal(t, map[string]bool{"binary": true}, types)
-		nonNull := 0
-		for _, v := range vals {
-			if v != nil {
-				nonNull++
-				require.Equal(t, []byte{0x00, 0xff}, v)
-			}
-		}
-		require.Equal(t, 2, nonNull)
-	})
-	t.Run("text then bytes", func(t *testing.T) {
-		ci := newChunkedImport(t, 1)
-		data := duckdbParquet(t, `SELECT TIMESTAMP '2026-10-25 10:00:00' + to_seconds(i) AS time,
-			CASE WHEN i < 2 THEN 'text'::BLOB ELSE from_hex('00FF') END AS raw FROM range(4) t(i) ORDER BY i`, "")
-		status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=m", data)
-		require.NotEqual(t, http.StatusOK, status, body)
-		require.Contains(t, fmt.Sprint(body), "not valid UTF-8")
-	})
-}
-
 // A file that uses Parquet's own GEOMETRY type (written by pyarrow, GDAL,
-// DuckDB's GeoParquet V2) is imported as plain binary: read through the
-// import API it does not carry that type into Arc's files, where it would
-// read as GEOMETRY next to BLOB files of the column and fail.
+// DuckDB) is imported as plain binary even without "geo" metadata and from a
+// writer Arc does not know: the logical type decides, not the bytes. WKB for
+// POINT(100 200) is valid UTF-8 and would otherwise import as text. The
+// stored file reads back as BLOB in DuckDB.
 func TestParquetImportOfParquetGeometryTypeIsPlainBinary(t *testing.T) {
 	ci := newChunkedImport(t, 1000)
 	db, err := sql.Open("duckdb", "")
 	require.NoError(t, err)
 	defer db.Close()
-	p := filepath.Join(t.TempDir(), "v2.parquet")
-	_, err = db.Exec(fmt.Sprintf(`COPY (SELECT TIMESTAMP '2026-10-25 10:00:00' AS time, 'POINT(1 2)'::GEOMETRY AS geom) TO '%s' (FORMAT PARQUET, GEOPARQUET_VERSION 'V2')`, p))
+	p := filepath.Join(t.TempDir(), "none.parquet")
+	_, err = db.Exec(fmt.Sprintf(`COPY (SELECT TIMESTAMP '2026-10-25 10:00:00' AS time, 'POINT(100 200)'::GEOMETRY AS geom) TO '%s' (FORMAT PARQUET, GEOPARQUET_VERSION 'NONE')`, p))
 	require.NoError(t, err)
 	data, err := os.ReadFile(p)
 	require.NoError(t, err)
+	// A writer Arc does not know marks its strings: same length, so the
+	// footer stays valid.
+	require.Equal(t, 1, bytes.Count(data, []byte("DuckDB version")))
+	data = bytes.Replace(data, []byte("DuckDB version"), []byte("GDALxx version"), 1)
 	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=places", data)
 	require.Equal(t, http.StatusOK, status, body)
-	vals, types := ci.storedColumn(t, "geom")
+	_, types := ci.storedColumn(t, "geom")
 	require.Equal(t, map[string]bool{"binary": true}, types)
-	require.Len(t, vals, 1)
-	// The stored file reads back as BLOB in DuckDB, conversion on or off.
 	require.NoError(t, ci.buf.FlushAllAndWait(context.Background()))
 	var files []string
 	require.NoError(t, filepath.WalkDir(ci.dir, func(p string, d fs.DirEntry, err error) error {

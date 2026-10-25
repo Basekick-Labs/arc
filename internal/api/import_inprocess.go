@@ -575,9 +575,15 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 	if herr != nil {
 		return nil, herr
 	}
-	binaryKinds, berr := parquetBinaryKinds(fr, schema)
+	binaryKinds, berr := parquetBinaryKinds(fr, schema, h.arrowBuffer.KnownTextBinaryColumns(database, measurement))
 	if berr != nil {
 		return nil, berr
+	}
+	var undecided []string
+	for name, kind := range binaryKinds {
+		if kind == binaryUndecided {
+			undecided = append(undecided, name)
+		}
 	}
 
 	timeColumn := func(rec arrow.RecordBatch, idx, firstRow int) ([]int64, error) {
@@ -590,23 +596,54 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 		return tm, nil
 	}
 
-	// Validation pass: the time column alone (the leaf column of a flat
-	// schema; every column when it cannot be told apart).
-	var timeOnly []int
-	timeIdxInBatch := timeFieldIdx
-	if leaf := fr.ParquetReader().MetaData().Schema.ColumnIndexByName(opts.timeColumn); leaf >= 0 {
-		timeOnly, timeIdxInBatch = []int{leaf}, 0
+	// Validation pass: the time column, and the binary columns whose kind
+	// only their values can tell (#440), so a column is text or binary for
+	// the whole file before anything is written: the leaf columns of a flat
+	// schema, every column when they cannot be told apart.
+	var readCols []int
+	md := fr.ParquetReader().MetaData()
+	if leaf := md.Schema.ColumnIndexByName(opts.timeColumn); leaf >= 0 {
+		readCols = []int{leaf}
+		for _, name := range undecided {
+			if l := md.Schema.ColumnIndexByName(name); l >= 0 {
+				readCols = append(readCols, l)
+			} else {
+				readCols = nil // read everything
+				break
+			}
+		}
 	}
+	nonText := map[string]bool{}
 	var stats importStats
-	if err := forEachParquetBatch(ctx, fr, timeOnly, func(rec arrow.RecordBatch, firstRow int) error {
-		tm, err := timeColumn(rec, timeIdxInBatch, firstRow)
+	if err := forEachParquetBatch(ctx, fr, readCols, func(rec arrow.RecordBatch, firstRow int) error {
+		idx := rec.Schema().FieldIndices(opts.timeColumn)
+		if len(idx) == 0 {
+			return &importError{StatusCode: fiber.StatusBadRequest, Message: fmt.Sprintf("time column %q not found", opts.timeColumn)}
+		}
+		tm, err := timeColumn(rec, idx[0], firstRow)
 		if err != nil {
 			return &importError{StatusCode: fiber.StatusBadRequest, Message: fmt.Sprintf("failed to parse time column %q", opts.timeColumn), Err: err}
 		}
 		stats.add(tm)
+		for _, name := range undecided {
+			if nonText[name] {
+				continue
+			}
+			if ci := rec.Schema().FieldIndices(name); len(ci) > 0 && binaryColumnHasNonText(rec, ci[0]) {
+				nonText[name] = true
+			}
+		}
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	// A column of text throughout (or only NULLs) is a string, as before.
+	for _, name := range undecided {
+		if nonText[name] {
+			binaryKinds[name] = binaryAsBytes
+		} else {
+			binaryKinds[name] = binaryAsString
+		}
 	}
 	if stats.rows == 0 {
 		return nil, &importError{StatusCode: fiber.StatusBadRequest, Message: "file contains no rows"}
@@ -638,12 +675,7 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 			var valid []bool
 			var conv error
 			if kind, ok := binaryKinds[name]; ok {
-				vals, valid, conv = binaryColumnToTyped(&col, &kind)
-				binaryKinds[name] = kind
-				if conv == nil && vals == nil {
-					col.Release()
-					continue // all NULL in this batch: left out, reads NULL
-				}
+				vals, valid, conv = binaryColumnToTyped(&col, kind)
 			} else {
 				vals, valid, conv = arrowColumnToTyped(&col)
 			}
