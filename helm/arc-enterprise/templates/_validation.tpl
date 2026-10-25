@@ -116,6 +116,10 @@ Only enforced when shared storage is explicitly external.
 {{- $shared := .Values.storage.shared | default dict -}}
 {{- $creds := $shared.credentials | default dict -}}
 {{- $backend := include "arc-enterprise.sharedBackend" . -}}
+{{- $gcsCfg := $shared.gcs | default dict -}}
+{{- if and (ne .Values.storage.mode "shared") $gcsCfg.credentialsSecret -}}
+{{- fail "storage.shared.gcs.credentialsSecret applies to storage.mode=shared only; for a GCS cold tier in local mode use Workload Identity (serviceAccount annotations) or writer/reader/compactor extraEnv" -}}
+{{- end -}}
 {{- if and (eq .Values.storage.mode "shared") (not (has $backend (list "s3" "gcs"))) -}}
 {{- fail (printf "storage.shared.backend %q is invalid; must be \"s3\" or \"gcs\"" $backend) -}}
 {{- end -}}
@@ -133,6 +137,9 @@ Only enforced when shared storage is explicitly external.
 {{- end -}}
 {{- if or $creds.useIRSA $creds.existingSecret $creds.accessKey $creds.secretKey -}}
 {{- fail "storage.shared.credentials apply to backend=s3 only; for gcs use storage.shared.gcs.credentialsSecret or Workload Identity" -}}
+{{- end -}}
+{{- if $shared.endpoint -}}
+{{- fail "storage.shared.endpoint is the S3 endpoint; for gcs set storage.shared.gcs.endpoint" -}}
 {{- end -}}
 {{- else if eq .Values.storage.mode "shared" -}}
 {{/*

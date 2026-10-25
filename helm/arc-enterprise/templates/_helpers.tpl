@@ -194,6 +194,11 @@ GCS key volume and mount, included by every role's StatefulSet.
 - name: gcs-credentials
   secret:
     secretName: {{ .Values.storage.shared.gcs.credentialsSecret | quote }}
+    defaultMode: 0400
+    items:
+      # Named so a wrong key fails the mount, not Arc's startup.
+      - key: {{ .Values.storage.shared.gcs.credentialsKey | default "key.json" | quote }}
+        path: {{ .Values.storage.shared.gcs.credentialsKey | default "key.json" | quote }}
 {{- end }}
 {{- end }}
 

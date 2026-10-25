@@ -806,13 +806,16 @@ gcs_bucket = "my-arc-data"
   writers with unflushed rows, leader and compactor loss, writer failover
   with migration continuing on the new primary, reconciliation dry-run.
   The enterprise Helm chart deploys it with
-  `storage.shared.backend: gcs` and either Workload Identity
-  (`serviceAccount.annotations`) or a service-account key Secret
-  (`storage.shared.gcs.credentialsSecret`).
+  `storage.shared.backend: gcs` and either Workload Identity (a
+  chart-created ServiceAccount, `serviceAccount.create: true`, carrying the
+  `iam.gke.io/gcp-service-account` annotation) or a service-account key
+  Secret (`storage.shared.gcs.credentialsSecret`, shared storage only).
 - **Rate limits.** GCS allows about one write per second to one object name
-  and ramps a new bucket's request rate up. A rate-limited (429) request now
-  waits at least a second and is retried for about a minute, where other
-  transient errors keep their short schedule.
+  and ramps a new bucket's request rate up. A rate-limited (429) read,
+  listing, copy or delete now waits at least half a second (a second on
+  average) and is retried for up to a minute and a half, where other
+  transient errors keep their short schedule; uploads back off from one
+  second up to 16 s across their 12 retries.
 - **Warned at startup**, by what the bucket is for. Primary: soft delete
   (on by default for new buckets, 7 days), a retention policy and a default
   storage class other than STANDARD — compaction and retention delete

@@ -136,9 +136,13 @@ storage:
     bucket: my-arc-data
     prefix: prod/               # optional
 serviceAccount:
+  create: true                  # the annotation only lands on a chart-created ServiceAccount
   annotations:
     iam.gke.io/gcp-service-account: arc@my-project.iam.gserviceaccount.com
 ```
+
+Bind it on the Google side: grant the Kubernetes ServiceAccount
+`roles/iam.workloadIdentityUser` on that Google service account.
 
 Elsewhere, put a service-account key in a Secret and name it; it is mounted
 read-only on every role:
@@ -156,6 +160,10 @@ storage:
     gcs:
       credentialsSecret: arc-gcs-key   # key inside it: gcs.credentialsKey (default key.json)
 ```
+
+A GCS **cold tier** with local storage (Pattern 1) is configured through the
+Arc settings (`tiered_storage.cold.*` via `extraEnv`); the key Secret above is
+for shared storage only, so use Workload Identity there.
 
 The identity needs `roles/storage.objectAdmin` on the bucket, plus
 `storage.buckets.get` for Arc's startup checks of the bucket's settings. Use a

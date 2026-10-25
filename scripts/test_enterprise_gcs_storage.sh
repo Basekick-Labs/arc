@@ -32,10 +32,19 @@ grep -q 'name: ARC_STORAGE_GCS_ENDPOINT' <<<"$out" || fail "endpoint not rendere
 grep -q 'ARC_STORAGE_S3_' <<<"$out" && fail "S3 settings rendered for a GCS cluster"
 grep -qi 'seaweedfs' <<<"$out" && fail "bundled SeaweedFS rendered for a GCS cluster"
 
-# Workload Identity: no key Secret, no mount, no credentials file.
-out=$(render "${gcs[@]}" --set-string 'serviceAccount.annotations.iam\.gke\.io/gcp-service-account=arc@p.iam.gserviceaccount.com')
+# Workload Identity: a chart-created ServiceAccount carries the annotation,
+# and there is no key Secret, mount or credentials file.
+out=$(render "${gcs[@]}" --set serviceAccount.create=true \
+  --set-string 'serviceAccount.annotations.iam\.gke\.io/gcp-service-account=arc@p.iam.gserviceaccount.com')
+grep -q 'kind: ServiceAccount' <<<"$out" || fail "no ServiceAccount rendered for Workload Identity"
+grep -q 'iam.gke.io/gcp-service-account: arc@p.iam.gserviceaccount.com' <<<"$out" || fail "Workload Identity annotation not on the ServiceAccount"
 grep -q 'ARC_STORAGE_GCS_CREDENTIALS_FILE' <<<"$out" && fail "credentials file rendered without a key Secret"
 grep -q '/etc/arc/gcs' <<<"$out" && fail "key mounted without a key Secret"
+
+# A non-default key name is mounted under that name and named in the env.
+out=$(render "${gcs[@]}" --set storage.shared.gcs.credentialsSecret=k --set storage.shared.gcs.credentialsKey=sa.json)
+[ "$(grep -c 'value: "/etc/arc/gcs/sa.json"' <<<"$out")" -eq 3 ] || fail "custom key name not in the env on all roles"
+grep -q 'key: "sa.json"' <<<"$out" || fail "custom key name not projected"
 
 # Refusals.
 expect_refusal() {
@@ -46,6 +55,8 @@ expect_refusal() {
 expect_refusal "requires storage.shared.external=true" --set storage.shared.backend=gcs --set storage.shared.bucket=b
 expect_refusal "apply to backend=s3 only" "${gcs[@]}" --set storage.shared.credentials.accessKey=k
 expect_refusal "backend" --set storage.shared.backend=azure
+expect_refusal "storage.shared.gcs.endpoint" "${gcs[@]}" --set storage.shared.endpoint=https://s3.example
+expect_refusal "applies to storage.mode=shared only" --set storage.mode=local --set storage.shared.gcs.credentialsSecret=k
 
 # The default (s3) is unchanged.
 out=$(render)

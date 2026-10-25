@@ -133,8 +133,10 @@ storage:
       accessKey: ""
       secretKey: ""
     # backend=gcs only. With credentialsSecret empty, Arc uses Application
-    # Default Credentials: on GKE, Workload Identity through
-    # serviceAccount.annotations ("iam.gke.io/gcp-service-account"). Otherwise
+    # Default Credentials: on GKE, Workload Identity through a chart-created
+    # ServiceAccount (serviceAccount.create=true plus the annotation
+    # "iam.gke.io/gcp-service-account"; with create=false the annotation is
+    # never applied) or one you name in serviceAccount.name. Otherwise
     # name a Secret holding a service-account key; it is mounted read-only
     # and passed as storage.gcs_credentials_file.
     gcs:
