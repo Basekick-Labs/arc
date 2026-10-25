@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/google/uuid"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
@@ -84,7 +85,11 @@ func TestMapColumnType(t *testing.T) {
 		{"DATE", colTimestamp},
 		{"VARCHAR", colString},
 		{"TEXT", colString},
-		{"BLOB", colString},
+		{"BLOB", colBinary},
+		{"blob", colBinary},
+		{"GEOMETRY", colBinary},
+		{"UUID", colUUID},
+		{"BLOB[]", colString},
 		{"", colString},
 	}
 
@@ -556,4 +561,32 @@ func BenchmarkStreamTypedJSON(b *testing.B) {
 			json.Marshal(resp)
 		}
 	})
+}
+
+// On the database/sql path duckdb-go scans BLOB, GEOMETRY and UUID all as
+// []byte; the DuckDB type decides the encoding (#440).
+func TestWriteJSONValueBinaryAndUUID(t *testing.T) {
+	u := uuid.MustParse("6f1c2c1e-8a3b-4d2e-9f00-1234567890ab")
+	cases := []struct {
+		val  interface{}
+		ct   colType
+		want string
+	}{
+		{[]byte{0x00, 0xff, 0x80}, colBinary, `"AP+A"`},
+		{[]byte{}, colBinary, `""`},
+		{u[:], colUUID, `"6f1c2c1e-8a3b-4d2e-9f00-1234567890ab"`},
+		{nil, colBinary, `null`},
+	}
+	for _, tc := range cases {
+		var buf bytes.Buffer
+		w := bufio.NewWriter(&buf)
+		writeJSONValue(w, make([]byte, 0, 64), tc.val, tc.ct)
+		_ = w.Flush()
+		if buf.String() != tc.want {
+			t.Errorf("writeJSONValue(%v, %d) = %s, want %s", tc.val, tc.ct, buf.String(), tc.want)
+		}
+		if !json.Valid(buf.Bytes()) {
+			t.Errorf("writeJSONValue(%v) = %q is not valid JSON", tc.val, buf.String())
+		}
+	}
 }
