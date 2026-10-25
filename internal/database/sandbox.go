@@ -45,8 +45,13 @@ const sandboxLockdownTimeout = 5 * time.Second
 // Called once at the end of configureDatabase, after every INSTALL/LOAD
 // and every SET GLOBAL Arc needs to perform.
 func lockdownExternalAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	return lockdownDirs(context.Background(), db, buildAllowedDirectories(cfg), logger)
+}
+
+// lockdownDirs is lockdownExternalAccess for an explicit allowlist: the main
+// instance's from Config, or a private rewrite instance's (rewrite_db.go).
+func lockdownDirs(ctx context.Context, db *sql.DB, dirs []string, logger zerolog.Logger) error {
 	componentLogger := logger.With().Str("component", "duckdb-sandbox").Logger()
-	dirs := buildAllowedDirectories(cfg)
 
 	// Empty allowlist + enable_external_access=false locks DuckDB out of
 	// every file it might legitimately need (spill, profile output, manifest
@@ -58,7 +63,7 @@ func lockdownExternalAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) erro
 		componentLogger.Warn().Msg("sandbox allowlist is empty — every file-touching query will fail; check Config.LocalStorageRoot / TempDirectory / UploadDir / CompactionTempDirectory / S3Bucket / ColdS3Bucket / AzureContainer / ColdAzureContainer wiring")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), sandboxLockdownTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sandboxLockdownTimeout)
 	defer cancel()
 
 	// Compose the allowed_directories SET. DuckDB accepts a list literal.
