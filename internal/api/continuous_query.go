@@ -1267,6 +1267,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	if err != nil {
 		return 0, fmt.Errorf("failed to get columns: %w", err)
 	}
+	uuidCol := cqUUIDColumns(rows, len(columns))
 
 	// Read all results
 	var records []map[string]interface{}
@@ -1285,6 +1286,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		// Convert to map
 		record := make(map[string]interface{})
 		for i, col := range columns {
+			if uuidCol[i] {
+				values[i] = cqUUIDText(values[i])
+			}
 			record[col] = values[i]
 		}
 		records = append(records, record)
@@ -1730,4 +1734,28 @@ func validateCQQuery(query string) error {
 		return fmt.Errorf("invalid query: %w", err)
 	}
 	return nil
+}
+
+// cqUUIDColumns reports which result columns are UUID. duckdb-go scans UUID,
+// BLOB and GEOMETRY all as []byte, and ingest stores a []byte as a binary
+// column (#440); only the DuckDB type tells them apart.
+func cqUUIDColumns(rows *sql.Rows, n int) []bool {
+	out := make([]bool, n)
+	cts, err := rows.ColumnTypes()
+	if err != nil || len(cts) != n {
+		return out
+	}
+	for i, ct := range cts {
+		out[i] = strings.EqualFold(ct.DatabaseTypeName(), "UUID")
+	}
+	return out
+}
+
+// cqUUIDText writes a UUID as its text, as every other Arc output shows it;
+// BLOB and GEOMETRY (WKB) stay bytes.
+func cqUUIDText(v interface{}) interface{} {
+	if b, ok := v.([]byte); ok && len(b) == 16 {
+		return uuid.UUID(b).String()
+	}
+	return v
 }
