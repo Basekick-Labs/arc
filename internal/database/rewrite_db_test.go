@@ -126,3 +126,18 @@ func TestOpenRewriteDBRefusesWithoutSpillOrAllowlist(t *testing.T) {
 		}
 	}
 }
+
+// The rewrite instance loads only a supported extension's bare name, the
+// same rule as the main instance (#440): never a path.
+func TestOpenRewriteDBRefusesAnUnsupportedExtension(t *testing.T) {
+	dir := t.TempDir()
+	o := RewriteDBOptions{SpillDir: dir, AllowedDirs: []string{dir}, Extensions: []string{filepath.Join(dir, "x.duckdb_extension")}}
+	db, err := OpenRewriteDB(context.Background(), o, zerolog.Nop())
+	if err == nil {
+		db.Close()
+		t.Fatal("opened with an extension path")
+	}
+	if !strings.Contains(err.Error(), "not a supported DuckDB extension") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+}
