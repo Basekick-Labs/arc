@@ -160,7 +160,7 @@ Only true when storage.mode=shared AND storage.shared.external=false AND seaweed
 Always compare with `eq (include ...) "true"` — Helm returns the string "true".
 */}}
 {{- define "arc-enterprise.seaweedfsBundled" -}}
-{{- and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) .Values.seaweedfs.enabled (ne (include "arc-enterprise.sharedBackend" .) "gcs") -}}
+{{- and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) .Values.seaweedfs.enabled -}}
 {{- end }}
 
 {{/*

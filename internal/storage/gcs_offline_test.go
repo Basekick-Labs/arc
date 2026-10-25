@@ -668,9 +668,11 @@ func TestGCSCredentialsLazyOutsidePrimary(t *testing.T) {
 // attempts than other transient errors, and every retry waits at least half
 // the rate-limit minimum, never close to zero.
 func TestGCSRetryRateLimit(t *testing.T) {
-	oldMin, oldMax := gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff
-	gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff = 20*time.Millisecond, 40*time.Millisecond
-	t.Cleanup(func() { gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff = oldMin, oldMax })
+	// The minimum is set above gcsRetry's 100 ms opening backoff so the
+	// test can tell "at least the rate-limit minimum" from the plain start.
+	oldMin, oldMax, oldN := gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff, gcsRateLimitAttempts
+	gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff, gcsRateLimitAttempts = 300*time.Millisecond, 300*time.Millisecond, 4
+	t.Cleanup(func() { gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff, gcsRateLimitAttempts = oldMin, oldMax, oldN })
 
 	tooMany := &googleapi.Error{Code: http.StatusTooManyRequests}
 	calls := 0
@@ -692,12 +694,12 @@ func TestGCSRetryRateLimit(t *testing.T) {
 	calls = 0
 	if err := gcsRetry(context.Background(), func() error {
 		calls++
-		if calls < 8 {
+		if calls < 3 {
 			return tooMany
 		}
 		return nil
-	}); err != nil || calls != 8 {
-		t.Fatalf("429 seven times then success: %d calls, %v", calls, err)
+	}); err != nil || calls != 3 {
+		t.Fatalf("429 twice then success: %d calls, %v", calls, err)
 	}
 
 	calls = 0
