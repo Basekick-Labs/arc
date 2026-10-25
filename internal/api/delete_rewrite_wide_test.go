@@ -226,6 +226,9 @@ func TestNeedsSingleThread(t *testing.T) {
 		{"64 columns, 40 row groups, 46 threads, 4 GB", many, 4 * gb, 46, true},
 		{"64 columns, 40 row groups, 4 threads, 4 GB", many, 4 * gb, 4, false},
 		{"no row groups", rewriteShape{leafColumns: 1, bytesPerRow: 9}, 4 * gb, 46, false},
+		// Half the limit is the line: 600 MB in flight against 1 GB.
+		{"600 MB of a 1 GB limit", rewriteShape{bytesPerRow: 1, maxRowGroupRows: 600 << 20, rowGroups: 1}, gb, 8, true},
+		{"400 MB of a 1 GB limit", rewriteShape{bytesPerRow: 1, maxRowGroupRows: 400 << 20, rowGroups: 1}, gb, 8, false},
 	} {
 		if got := needsSingleThread(c.s, c.mem, c.threads); got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
@@ -249,6 +252,18 @@ func TestSingleThreadRowGroupRows(t *testing.T) {
 		if got := (rewriteShape{bytesPerRow: c.perRow}).singleThreadRowGroupRows(c.limit); got != c.want {
 			t.Errorf("%d B/row: %d rows, want %d", c.perRow, got, c.want)
 		}
+	}
+}
+
+func TestNewDeleteHandlerRemovesRewriteScratchLeftBehind(t *testing.T) {
+	dir := t.TempDir()
+	left := filepath.Join(dir, rewriteScratchPrefix+"42", "spill")
+	if err := os.MkdirAll(left, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	NewDeleteHandler(nil, nil, nil, nil, dir, zerolog.Nop())
+	if _, err := os.Stat(filepath.Dir(left)); !os.IsNotExist(err) {
+		t.Fatalf("scratch left by a stopped process still there: %v", err)
 	}
 }
 
