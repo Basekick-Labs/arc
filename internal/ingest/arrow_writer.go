@@ -2258,6 +2258,9 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 	if !ok {
 		return fmt.Errorf("expected []interface{}, got %T", records)
 	}
+	if err := b.checkBatchTextBinary(database, recordList); err != nil {
+		return err
+	}
 
 	// OPTIMIZATION: Lazy initialization - avoid map allocation for pure columnar writes (common path)
 	var rowRecordsByMeasurement map[string][]*models.Record
@@ -3143,6 +3146,13 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 			return err
 		}
 	}
+	// #440: a replayed entry was accepted when it was written; only a live
+	// write is refused for changing a column between string and binary.
+	if !skipWAL {
+		if err := checkColumnsTextBinary(b.knownTextBinary(database, record.Measurement), record.Measurement, record.Columns); err != nil {
+			return err
+		}
+	}
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
@@ -3434,6 +3444,11 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	// The #1342 backstop; see writeColumnarInternalWithWALHashes.
 	for name := range typedColumns.Data {
 		if err := unstorableColumnError(measurement, name); err != nil {
+			return err
+		}
+	}
+	if !skipWAL {
+		if err := checkTypedTextBinary(b.knownTextBinary(database, measurement), measurement, typedColumns); err != nil {
 			return err
 		}
 	}

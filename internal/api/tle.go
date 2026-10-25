@@ -247,6 +247,9 @@ localProcessing:
 				"error": "Write rejected (server shutting down): " + err.Error(),
 			})
 		}
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		// See lineprotocol.go for ErrSchemaChurnExceeded → 503 rationale.
 		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{

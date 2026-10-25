@@ -434,6 +434,10 @@ localProcessing:
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err)
 		}
+		// #440: a client error, refused before the WAL; nothing was written.
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
 		metrics.Get().IncIngestErrors()
 		// Schema-churn rejection is retryable — surface as 503 so

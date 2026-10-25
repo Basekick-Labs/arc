@@ -291,6 +291,9 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 			return respondWriteRefused(c, err) // logged by reason (#1268)
 		}
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: failed to write to buffer")
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		// 503 for the two retryable buffer states: nothing of this import
 		// was written (a partial import answered above).
 		if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {

@@ -395,6 +395,9 @@ localProcessing:
 					"error": "Write rejected (server shutting down): " + err.Error(),
 				})
 			}
+			if errors.Is(err, ingest.ErrColumnTypeChange) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+			}
 			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": "Write rejected (schema churn): " + err.Error(),
@@ -499,6 +502,9 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 			h.logger.Error().Err(err).Str("database", database).Str("measurement", m).Int("records", rows[m]).Msg("Failed to write to Arrow buffer")
 			if errors.Is(err, ingest.ErrBufferClosing) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (server shutting down): " + err.Error()})
+			}
+			if errors.Is(err, ingest.ErrColumnTypeChange) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 			}
 			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (schema churn): " + err.Error()})
