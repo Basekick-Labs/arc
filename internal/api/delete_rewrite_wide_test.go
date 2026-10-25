@@ -284,7 +284,8 @@ func TestSingleThreadRowGroupRows(t *testing.T) {
 	for _, c := range []struct {
 		perRow, limit, want int64
 	}{
-		{3100 * 9, 2 * gb, 4096},
+		{3100 * 9, 2 * gb, 8192},
+		{905 * 9, 2 * gb, 32768},
 		{10000 * 9, 2 * gb, 2048},
 		{200000 * 9, 2 * gb, 2048},
 		{8, 2 * gb, parquetRowGroupSize},
