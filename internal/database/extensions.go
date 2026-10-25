@@ -87,11 +87,19 @@ func (d *DuckDB) Extensions() []string {
 // arcx configured the engine allows unsigned extensions, so an unchecked
 // entry would load arbitrary native code.
 func validateExtensions(names []string) error {
-	for _, name := range names {
-		if _, ok := supportedExtensions[name]; !ok {
-			return fmt.Errorf("database.extensions: %q is not a supported DuckDB extension (supported: %s)",
-				name, strings.Join(SupportedExtensionNames(), ", "))
-		}
+	if name, ok := unsupportedExtension(names); ok {
+		return fmt.Errorf("database.extensions: %q is not a supported DuckDB extension (supported: %s)",
+			name, strings.Join(SupportedExtensionNames(), ", "))
 	}
 	return nil
+}
+
+// unsupportedExtension is the first entry of names that is not supported.
+func unsupportedExtension(names []string) (string, bool) {
+	for _, name := range names {
+		if _, ok := supportedExtensions[name]; !ok {
+			return name, true
+		}
+	}
+	return "", false
 }

@@ -847,6 +847,10 @@ func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 // (#440).
 func loadConfiguredExtensions(db *sql.DB, extensions []string, logger zerolog.Logger) error {
 	if err := validateExtensions(extensions); err != nil {
+		// The entry is a log field: the error sanitizer blanks quoted
+		// strings, which would hide which one in the startup error.
+		bad, _ := unsupportedExtension(extensions)
+		logger.Error().Str("extension", bad).Strs("supported", SupportedExtensionNames()).Msg("database.extensions names an unsupported DuckDB extension")
 		return err
 	}
 	for _, name := range extensions {
