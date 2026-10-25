@@ -84,17 +84,18 @@ func TestColumnTypeChangeRefusesTheWholeBatch(t *testing.T) {
 	require.True(t, errors.Is(err, ErrColumnTypeChange), "err = %v", err)
 	require.Empty(t, r.files(t), "a refused batch wrote some of its records")
 
-	// Row records are grouped per measurement and written one measurement at
-	// a time, so without the pre-check the good measurement would be written.
+	// Columnar records are written before row records, so without the
+	// pre-check the good one would be written before the bad row is refused.
+	good := &models.ColumnarRecord{Measurement: "good", Columnar: true, Columns: map[string][]interface{}{"time": {ts440}, "v": {1.0}}}
 	rows := []interface{}{
-		&models.Record{Measurement: "good", Timestamp: ts440, Fields: map[string]interface{}{"v": 1.0}},
+		good,
 		&models.Record{Measurement: "bad", Timestamp: ts440, Fields: map[string]interface{}{"name": []byte{1}}},
 	}
 	err = r.buf.Write(ctx, "d", rows)
 	require.True(t, errors.Is(err, ErrColumnTypeChange), "rows: err = %v", err)
 	require.Empty(t, r.files(t), "a refused row batch wrote some of its records")
 	r.buf.SetFieldSchema(textBinaryRegistrar{"d/bad": {"tagged": true}})
-	err = r.buf.Write(ctx, "d", []interface{}{rows[0],
+	err = r.buf.Write(ctx, "d", []interface{}{good,
 		&models.Record{Measurement: "bad", Timestamp: ts440, Fields: map[string]interface{}{"v": 1.0}, Tags: map[string]string{"tagged": "x"}}})
 	require.True(t, errors.Is(err, ErrColumnTypeChange), "string tag into a binary column: err = %v", err)
 	require.Empty(t, r.files(t))
