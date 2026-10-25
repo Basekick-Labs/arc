@@ -138,6 +138,14 @@ type StorageConfig struct {
 	AzurePrefix             string // Blob-name prefix within the container (e.g., "instances/abc123/")
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
+	// Google Cloud Storage (#1105). Authenticates with a service-account key
+	// file when GCSCredentialsFile is set, else Application Default
+	// Credentials (GOOGLE_APPLICATION_CREDENTIALS, gcloud ADC, or the metadata
+	// server: GCE, GKE Workload Identity, Cloud Run).
+	GCSBucket          string // Bucket name
+	GCSPrefix          string // Object-name prefix within the bucket (e.g., "instances/abc123/")
+	GCSCredentialsFile string // Service-account key file path (optional)
+	GCSEndpoint        string // https endpoint override, e.g. Private Service Connect (optional)
 }
 
 type IngestConfig struct {
@@ -1094,6 +1102,11 @@ func Load() (*Config, error) {
 			AzurePrefix:             v.GetString("storage.azure_prefix"),
 			AzureEndpoint:           v.GetString("storage.azure_endpoint"),
 			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
+			// Google Cloud Storage
+			GCSBucket:          v.GetString("storage.gcs_bucket"),
+			GCSPrefix:          v.GetString("storage.gcs_prefix"),
+			GCSCredentialsFile: v.GetString("storage.gcs_credentials_file"),
+			GCSEndpoint:        v.GetString("storage.gcs_endpoint"),
 		},
 		Ingest: IngestConfig{
 			MaxBufferSize:         v.GetInt("ingest.max_buffer_size"),
@@ -1466,11 +1479,15 @@ func Load() (*Config, error) {
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
 	cfg.Storage.AzurePrefix = strings.TrimSpace(cfg.Storage.AzurePrefix)
 	cfg.Storage.AzureEndpoint = strings.TrimSpace(cfg.Storage.AzureEndpoint)
+	cfg.Storage.GCSBucket = strings.TrimSpace(cfg.Storage.GCSBucket)
+	cfg.Storage.GCSPrefix = strings.TrimSpace(cfg.Storage.GCSPrefix)
+	cfg.Storage.GCSCredentialsFile = strings.TrimSpace(cfg.Storage.GCSCredentialsFile)
+	cfg.Storage.GCSEndpoint = strings.TrimSpace(cfg.Storage.GCSEndpoint)
 
 	// Validate the primary storage backend against the supported set and check
 	// its required fields — fail fast at load rather than late in main.go's
 	// backend switch. The supported set must match that switch
-	// (cmd/arc/main.go): local / s3 / minio / azure / azblob.
+	// (cmd/arc/main.go): local / s3 / minio / azure / azblob / gcs.
 	switch cfg.Storage.Backend {
 	case "local":
 		// No object-storage fields to validate.
@@ -1504,8 +1521,29 @@ func Load() (*Config, error) {
 		if err := cfg.checkObjectPrefix("storage.azure_prefix", cfg.Storage.AzurePrefix); err != nil {
 			return nil, err
 		}
+	case "gcs":
+		// Same reasons as the S3 bucket guard: an empty bucket would build an
+		// empty gs:// allowlist entry and a secret scoped to nothing.
+		if cfg.Storage.GCSBucket == "" {
+			return nil, fmt.Errorf("storage.backend is \"gcs\" but storage.gcs_bucket is empty; set storage.gcs_bucket")
+		}
+		if err := cfg.checkObjectPrefix("storage.gcs_prefix", cfg.Storage.GCSPrefix); err != nil {
+			return nil, err
+		}
+		if err := checkGCSEndpoint("storage.gcs_endpoint", cfg.Storage.GCSEndpoint); err != nil {
+			return nil, err
+		}
+		// GCS as the hot tier with a cold tier is not supported yet (#1105
+		// part 3): the tier mover and the cold query router have not been
+		// verified against a GCS hot tier. Same gate as the cold-tier
+		// validation below, so a leftover cold.enabled on a node without
+		// tiering still boots.
+		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
+			return nil, fmt.Errorf("storage.backend \"gcs\" does not support a cold tier yet " +
+				"(tiered_storage.cold.enabled); disable the cold tier or use another primary backend")
+		}
 	default:
-		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", or \"azblob\"", cfg.Storage.Backend)
+		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", \"azblob\", or \"gcs\"", cfg.Storage.Backend)
 	}
 
 	// Cold tier (Enterprise tiered storage). Validate its backend and required
@@ -1886,6 +1924,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("storage.s3_use_ssl", true)
 	v.SetDefault("storage.s3_path_style", false) // Use virtual-hosted style by default (set true for MinIO)
 	v.SetDefault("storage.azure_prefix", "")     // Container root by default (#1102)
+	v.SetDefault("storage.gcs_bucket", "")
+	v.SetDefault("storage.gcs_prefix", "")           // Bucket root by default
+	v.SetDefault("storage.gcs_credentials_file", "") // Empty = Application Default Credentials
+	v.SetDefault("storage.gcs_endpoint", "")         // Empty = storage.googleapis.com
 
 	// Cache defaults
 	v.SetDefault("cache.enabled", true)
@@ -2249,6 +2291,26 @@ func setDefaults(v *viper.Viper) {
 	// The value both backup and restore were hardcoded to before #1085, so
 	// leaving it unset changes nothing.
 	v.SetDefault("backup.operation_timeout", "2h")
+}
+
+// checkGCSEndpoint validates storage.gcs_endpoint at load, so a bad value is
+// reported before the logger exists rather than as a failed boot. https only:
+// DuckDB reads GCS over https on the endpoint's host whatever the scheme
+// given here (it takes a bare host, #1105), so an http endpoint would send
+// the storage backend and query reads to different places, and an emulator
+// that serves only http cannot serve DuckDB at all.
+func checkGCSEndpoint(key, endpoint string) error {
+	if endpoint == "" {
+		return nil
+	}
+	u, err := storage.GCSEndpointURL(endpoint)
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	if !strings.HasPrefix(u, "https://") {
+		return fmt.Errorf("%s %q must be an https URL", key, endpoint)
+	}
+	return nil
 }
 
 // checkObjectPrefix validates one configured object-store key prefix. key is

@@ -777,6 +777,14 @@ func (c *Config) primaryStorageDestination() (storage.Destination, error) {
 			Prefix:           c.Storage.AzurePrefix,
 			Endpoint:         c.Storage.AzureEndpoint,
 		},
+		// A GCS primary must be visible to the overlap check (#1105), or a
+		// backup target writing into the same bucket over GCS's S3 interop
+		// API would pass it.
+		GCS: storage.GCSConfig{
+			Bucket:   c.Storage.GCSBucket,
+			Prefix:   c.Storage.GCSPrefix,
+			Endpoint: c.Storage.GCSEndpoint,
+		},
 	})
 }
 

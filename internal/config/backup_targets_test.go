@@ -1041,3 +1041,47 @@ local_path = "./data/backups"
 		t.Errorf("refusal = %q, want it to report the empty value rather than an overlap against the working directory", got)
 	}
 }
+
+// TestBackupTargetOverS3InteropIntoAGCSPrimaryIsRefused (#1105): a GCS primary
+// is visible to the overlap check, so an S3-typed backup target pointed at the
+// same bucket through GCS's S3 interoperability endpoint is refused — at the
+// default prefix and at a non-default one — while another bucket is allowed.
+func TestBackupTargetOverS3InteropIntoAGCSPrimaryIsRefused(t *testing.T) {
+	for _, c := range []struct{ gcsPrefix, targetPrefix string }{
+		{"", "backups"},
+		{"inst/a", "inst/a/backups"},
+	} {
+		t.Run("prefix="+c.gcsPrefix, func(t *testing.T) {
+			writeArcToml(t, `
+[storage]
+backend = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "`+c.gcsPrefix+`"
+[backup]
+default_target = "audit"
+[backup.targets.audit]
+type = "s3"
+s3_bucket = "acme"
+s3_prefix = "`+c.targetPrefix+`"
+s3_endpoint = "https://storage.googleapis.com"
+`)
+			mustLoadError(t, "overlaps primary storage")
+		})
+	}
+	t.Run("another bucket is allowed", func(t *testing.T) {
+		writeArcToml(t, `
+[storage]
+backend = "gcs"
+gcs_bucket = "acme"
+[backup]
+default_target = "audit"
+[backup.targets.audit]
+type = "s3"
+s3_bucket = "acme-backups"
+s3_endpoint = "https://storage.googleapis.com"
+`)
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() = %v", err)
+		}
+	})
+}

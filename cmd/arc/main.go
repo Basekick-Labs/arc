@@ -416,6 +416,16 @@ func main() {
 	// (GHSA-j93g-rp6m-j32m) from 2026-05-19.
 	startDebugPprofIfEnabled(shutdownCoordinator, logger.Get("debug-pprof"))
 
+	// GCS primary storage is standalone-only until #1105 part 4. Refused HERE,
+	// where it is known whether this node will actually run as a cluster
+	// node, not at config load: an unlicensed cluster.enabled=true runs
+	// standalone (see the cluster block), and refusing that at load would
+	// stop a node the runtime would have served. Before database.New so no
+	// credential refresher starts on a node that is about to exit.
+	if err := gcsClusterModeRefusal(cfg, licenseHasClustering(licenseClient)); err != nil {
+		log.Fatal().Err(err).Msg("Unsupported storage configuration")
+	}
+
 	// arcx (Arc Enterprise DuckDB extension): gate via license before
 	// passing the path down to the DB layer. The extension binary is the
 	// licensing perimeter, but having Arc refuse to LOAD without a valid
@@ -478,6 +488,13 @@ func main() {
 		// Primary-backend signal for Azure (mirrors S3IsPrimaryBackend): only an
 		// azure/azblob primary backend provisions a primary Azure secret.
 		AzureIsPrimaryBackend: cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob",
+		// GCS primary (#1105): DuckDB reads gs:// with an Arc-managed bearer
+		// token resolved from the same identity as the storage backend.
+		GCSIsPrimaryBackend: cfg.Storage.Backend == "gcs",
+		GCSBucket:           cfg.Storage.GCSBucket,
+		GCSPrefix:           cfg.Storage.GCSPrefix,
+		GCSEndpoint:         cfg.Storage.GCSEndpoint,
+		GCSCredentialsFile:  cfg.Storage.GCSCredentialsFile,
 		// Cold-tier sandbox allowlist entries. The cold tier may use a
 		// different bucket/container from the primary backend (commonly
 		// hot=local + cold=S3 on Enterprise); the sandbox must allow both.
@@ -825,7 +842,7 @@ func main() {
 	// The switch is on the raw cfg.Storage.Backend so the accepted set is
 	// exactly what it has always been: config.Load lowercases and trims
 	// storage.backend before anything reads it, and already refuses anything
-	// outside the five aliases with "storage.backend %q is invalid". The
+	// outside the six aliases with "storage.backend %q is invalid". The
 	// default below is therefore unreachable through config today; it keeps its
 	// wording so a caller that ever bypasses that validation still Fatals here,
 	// before a backend is built.
@@ -937,12 +954,38 @@ func main() {
 				Msg("Storage backend initialized")
 		}
 
+	case "gcs":
+		// Credentials are never logged: only whether a key file is in use.
+		storageSpec.GCS = storage.GCSConfig{
+			Bucket:          cfg.Storage.GCSBucket,
+			Prefix:          cfg.Storage.GCSPrefix,
+			CredentialsFile: cfg.Storage.GCSCredentialsFile,
+			Endpoint:        cfg.Storage.GCSEndpoint,
+		}
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", "gcs").
+				Str("bucket", cfg.Storage.GCSBucket).
+				Str("prefix", cfg.Storage.GCSPrefix).
+				Str("endpoint", cfg.Storage.GCSEndpoint).
+				Msg("Failed to initialize Google Cloud Storage backend")
+		}
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", "gcs").
+				Str("bucket", cfg.Storage.GCSBucket).
+				Str("prefix", cfg.Storage.GCSPrefix).
+				Str("endpoint", cfg.Storage.GCSEndpoint).
+				Bool("credentials_file", cfg.Storage.GCSCredentialsFile != "").
+				Msg("Storage backend initialized")
+		}
+
 	default:
-		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
+		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', 'azblob', or 'gcs')")
 	}
 
 	// log.Fatal in the default case exits the process, so by here the backend
-	// type is one of the five aliases and both logStorageFatal and
+	// type is one of the six aliases and both logStorageFatal and
 	// logStorageReady carry that case's wording rather than the generic
 	// fallbacks they were declared with.
 	storageBackend, err = storage.NewBackend(storageSpec, logger.Get("storage"))
@@ -5522,6 +5565,18 @@ func runCompactSubcommand(args []string) {
 type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
+
+// gcsClusterModeRefusal refuses a GCS primary on a node that will run as a
+// cluster node (#1105: clusters on GCS land in part 4). clustering is
+// licenseHasClustering's answer; with cluster.enabled but no clustering
+// licence the node runs standalone, which GCS supports.
+func gcsClusterModeRefusal(cfg *config.Config, clustering bool) error {
+	if cfg.Storage.Backend == "gcs" && cfg.Cluster.Enabled && clustering {
+		return fmt.Errorf("storage.backend \"gcs\" is not supported in cluster mode yet; " +
+			"run this node standalone (cluster.enabled=false) or use another storage backend")
+	}
+	return nil
+}
 
 // licenseHasClustering mirrors the cluster block's licence gate.
 func licenseHasClustering(lc *license.Client) bool {
