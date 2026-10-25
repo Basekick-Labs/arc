@@ -717,7 +717,7 @@ func TestAzureCredentialChainStartup(t *testing.T) {
 // TestPostLockdownSecretCreationSucceeds is a regression test for the DuckDB
 // secrets-manager behavior change found while bumping 1.5.1 -> 1.5.5.
 //
-// In 1.5.5 (verified; 1.5.1 did not) the secrets manager stats
+// In 1.5.5 and 1.5.6 (verified; 1.5.1 did not) the secrets manager stats
 // `secret_directory` on EVERY CREATE SECRET — including the TEMPORARY secrets
 // Arc exclusively creates, which are never written to disk. The default
 // directory (~/.duckdb/stored_secrets) is outside every entry

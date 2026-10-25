@@ -326,7 +326,8 @@ func TestLockConfigurationStillBlocksCacheInvalidation(t *testing.T) {
 // known because the sandbox still gates that write after lockdown, which the
 // subtest below verifies rather than assumes.
 func TestNoLocalScopeSettingAffectsFileAccess(t *testing.T) {
-	// The complete LOCAL-scope set in DuckDB 1.5.5, read from duckdb_settings().
+	// The complete LOCAL-scope set in DuckDB 1.5.5, read from duckdb_settings();
+	// 1.5.6 adds none.
 	// Three of these name a file DuckDB writes (profile_output,
 	// profiling_output, http_logging_output); the rest are profiling, progress
 	// bar, schema resolution, buffer sizing, and optimiser toggles. None opens

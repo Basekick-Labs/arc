@@ -726,8 +726,9 @@ func buildDSN(cfg *Config) string {
 	// buildAzureSecretSQL never emit PERSISTENT — so nothing is lost. Two reasons
 	// it is set here rather than left at the default:
 	//
-	//  1. As of DuckDB 1.5.5 the secrets manager stats its secret_directory on
-	//     EVERY CREATE SECRET, including temporary ones. That directory defaults
+	//  1. In DuckDB 1.5.5 and 1.5.6 (re-verified 2026-10-25, #1372) the secrets
+	//     manager stats its secret_directory on EVERY CREATE SECRET, including
+	//     temporary ones. That directory defaults
 	//     to ~/.duckdb/stored_secrets, outside the sandbox allowlist, so any
 	//     secret created after lockdownExternalAccess (the runtime cold-tier
 	//     ConfigureS3 / ConfigureAzure path) failed with "Permission Error:
@@ -1112,7 +1113,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Store S3 credentials + endpoint config in the secrets manager. Must run
 	// after LOAD httpfs (which registers the S3 secret type). Order relative to
 	// the sandbox lockdown is immaterial here because this runs at startup,
-	// before it — but see ConfigureS3 for the runtime path, where DuckDB 1.5.5's
+	// before it — but see ConfigureS3 for the runtime path, where DuckDB 1.5.5's and 1.5.6's
 	// secrets-manager behavior makes the DSN's allow_persistent_secrets=false
 	// load-bearing.
 	//
@@ -1264,8 +1265,8 @@ type S3Config struct {
 // primary's. With distinct scoped secrets, DuckDB resolves the right credentials
 // per read_parquet() path.
 //
-// This runs AFTER the sandbox lockdown (enable_external_access=false). As of
-// DuckDB 1.5.5 that is only safe because buildDSN sets
+// This runs AFTER the sandbox lockdown (enable_external_access=false). In
+// DuckDB 1.5.5 and 1.5.6 that is only safe because buildDSN sets
 // allow_persistent_secrets=false: with on-disk secret storage enabled the
 // secrets manager stats its secret_directory on every CREATE SECRET — including
 // the TEMPORARY secrets Arc creates — and that directory (~/.duckdb/
@@ -1586,7 +1587,7 @@ type AzureConfig struct {
 // cold storage uses Azure, before the sandbox lockdown).
 //
 // Like ConfigureS3, this creates a secret AFTER the sandbox lockdown and so
-// depends on buildDSN's allow_persistent_secrets=false — otherwise DuckDB 1.5.5's
+// depends on buildDSN's allow_persistent_secrets=false — otherwise DuckDB 1.5.5's and 1.5.6's
 // secrets manager stats an unallowlisted secret_directory and fails the call.
 func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
 	if azcfg == nil {
