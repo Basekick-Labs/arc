@@ -505,6 +505,12 @@ func main() {
 		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
 		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
 		ColdAzurePrefix:    cfg.TieredStorage.Cold.AzurePrefix,
+		// GCS cold (#1105): only when the cold backend IS gcs, unlike the
+		// S3/Azure fields above, so a leftover tiered_storage.cold.gcs_bucket
+		// after switching backend neither widens the allowlist nor loads
+		// httpfs.
+		ColdGCSBucket: coldGCSField(cfg, cfg.TieredStorage.Cold.GCSBucket),
+		ColdGCSPrefix: coldGCSField(cfg, cfg.TieredStorage.Cold.GCSPrefix),
 		// Local storage root used by the DuckDB sandbox to whitelist
 		// Arc-managed file paths in allowed_directories. Always populated
 		// regardless of the configured backend; on S3/Azure-only deployments
@@ -724,7 +730,9 @@ func main() {
 		dbConfig.S3Bucket == "" &&
 		dbConfig.ColdS3Bucket == "" &&
 		dbConfig.AzureContainer == "" &&
-		dbConfig.ColdAzureContainer == "" {
+		dbConfig.ColdAzureContainer == "" &&
+		dbConfig.GCSBucket == "" &&
+		dbConfig.ColdGCSBucket == "" {
 		log.Fatal().Msg("sandbox allowlist would be empty — every file-touching query would fail; check arc.toml [storage] and [database] config")
 	}
 
@@ -4558,7 +4566,7 @@ func main() {
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
 			} else {
-				// Create cold tier backend (S3 or Azure)
+				// Create cold tier backend (S3, Azure or GCS)
 				//
 				// coldBackend is only ever assigned from a successful
 				// storage.NewBackend, which never returns a typed nil inside a
@@ -4569,7 +4577,7 @@ func main() {
 				// query router's cold glob — would otherwise pass and then
 				// dereference a nil receiver.
 				//
-				// Only s3 and azure are accepted, each with its own logger name
+				// Only s3, azure and gcs are accepted, each with its own logger name
 				// and its own error wording. There is no default case, and what
 				// makes that safe is a CONJUNCTION, not one flag: config.Load
 				// refuses an invalid value with "tiered_storage.cold.backend %q
@@ -4636,6 +4644,32 @@ func main() {
 								Str("container", cold.AzureContainer).
 								Str("prefix", cold.AzurePrefix).
 								Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						} else {
+							coldBackend = b
+						}
+
+					case "gcs":
+						// Role cold: Application Default Credentials resolve
+						// on first use, as the S3 and Azure chains do, so a
+						// node without credentials yet still builds the tier
+						// and its reads fail loudly rather than skip it.
+						coldSpec := storage.BackendSpec{
+							Type: "gcs",
+							GCS: storage.GCSConfig{
+								Bucket:          cold.GCSBucket,
+								Prefix:          cold.GCSPrefix,
+								CredentialsFile: cold.GCSCredentialsFile,
+								Endpoint:        cold.GCSEndpoint,
+								Role:            storage.GCSRoleCold,
+							},
+						}
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-gcs")); err != nil {
+							// Same reason as the cold S3 site above.
+							log.Error().Err(err).
+								Str("bucket", cold.GCSBucket).
+								Str("prefix", cold.GCSPrefix).
+								Str("endpoint", cold.GCSEndpoint).
+								Msg("Failed to create cold tier GCS backend for tiering: the cold tier is unusable on this node until the configuration is fixed, and queries that need cold data answer 503")
 						} else {
 							coldBackend = b
 						}
@@ -4943,11 +4977,16 @@ func main() {
 		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
 		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly
 		cold := cfg.TieredStorage.Cold
+		// Only when the cold backend was built (all three): a cold tier whose
+		// construction failed is unusable, and #603's rule is that it is then
+		// ABSENT from /health rather than reported by a secret nothing reads
+		// through. Queries that need it answer 503 (refuseReadWithoutColdTier).
+		coldBuilt := tieringManager.ColdBackend() != nil
 		// Configure DuckDB for cold-tier S3 whenever cold tiering targets S3.
 		// Empty access/secret keys are valid: ConfigureS3 then provisions a
 		// CREDENTIAL_CHAIN secret so IAM roles / IRSA / env credentials work for
 		// tiered queries. A half-supplied key pair is rejected by ConfigureS3.
-		if cold.Enabled && cold.Backend == "s3" {
+		if coldBuilt && cold.Enabled && cold.Backend == "s3" {
 			if err := db.ConfigureS3(&database.S3Config{
 				Region:    cold.S3Region,
 				Endpoint:  cold.S3Endpoint,
@@ -4967,7 +5006,7 @@ func main() {
 		// Configure DuckDB for cold-tier Azure (scoped secret, separate from the
 		// primary Azure secret). Empty account key → credential chain (managed
 		// identity / env). Mirrors the cold-tier S3 path above.
-		if cold.Enabled && cold.Backend == "azure" {
+		if coldBuilt && cold.Enabled && cold.Backend == "azure" {
 			if err := db.ConfigureAzure(&database.AzureConfig{
 				ConnectionString: cold.AzureConnectionString,
 				AccountName:      cold.AzureAccountName,
@@ -4980,6 +5019,21 @@ func main() {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
 			} else {
 				log.Info().Msg("DuckDB configured with cold tier Azure credentials for multi-tier queries")
+			}
+		}
+
+		// Cold-tier GCS (#1105): an Arc-managed bearer-token secret from the
+		// cold tier's own identity, scoped to its bucket and prefix.
+		if coldBuilt && cold.Enabled && cold.Backend == "gcs" {
+			if err := db.ConfigureGCS(&database.GCSConfig{
+				Bucket:          cold.GCSBucket,
+				Prefix:          cold.GCSPrefix,
+				CredentialsFile: cold.GCSCredentialsFile,
+				Endpoint:        cold.GCSEndpoint,
+			}); err != nil {
+				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier GCS credentials")
+			} else {
+				log.Info().Msg("DuckDB configured with cold tier GCS credentials for multi-tier queries")
 			}
 		}
 	}
@@ -5571,11 +5625,31 @@ func (f shutdownFunc) Close() error { return f() }
 // licenseHasClustering's answer; with cluster.enabled but no clustering
 // licence the node runs standalone, which GCS supports.
 func gcsClusterModeRefusal(cfg *config.Config, clustering bool) error {
-	if cfg.Storage.Backend == "gcs" && cfg.Cluster.Enabled && clustering {
+	if !cfg.Cluster.Enabled || !clustering {
+		return nil
+	}
+	if cfg.Storage.Backend == "gcs" {
 		return fmt.Errorf("storage.backend \"gcs\" is not supported in cluster mode yet; " +
 			"run this node standalone (cluster.enabled=false) or use another storage backend")
 	}
+	// A GCS cold tier on a cluster node waits for the same release: it has
+	// not been run on a cluster rig yet (scheduled with GCS clusters), and a
+	// cold tier that fails to start costs every node's queries their cold
+	// data. Gated like the cold tier itself. A GCS backup target is allowed:
+	// cluster backups use it as any other destination.
+	if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled && cfg.TieredStorage.Cold.Backend == "gcs" {
+		return fmt.Errorf("tiered_storage.cold.backend \"gcs\" is not supported in cluster mode yet; " +
+			"run this node standalone (cluster.enabled=false) or use an S3 or Azure cold tier")
+	}
 	return nil
+}
+
+// coldGCSField returns v when the cold tier's backend is gcs, else "".
+func coldGCSField(cfg *config.Config, v string) string {
+	if cfg.TieredStorage.Cold.Backend != "gcs" {
+		return ""
+	}
+	return v
 }
 
 // licenseHasClustering mirrors the cluster block's licence gate.

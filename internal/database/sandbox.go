@@ -60,7 +60,7 @@ func lockdownDirs(ctx context.Context, db *sql.DB, dirs []string, logger zerolog
 	// Config field that contributes to the allowlist so operators see exactly
 	// which knob is unset.
 	if len(dirs) == 0 {
-		componentLogger.Warn().Msg("sandbox allowlist is empty — every file-touching query will fail; check Config.LocalStorageRoot / TempDirectory / UploadDir / CompactionTempDirectory / S3Bucket / ColdS3Bucket / AzureContainer / ColdAzureContainer wiring")
+		componentLogger.Warn().Msg("sandbox allowlist is empty — every file-touching query will fail; check Config.LocalStorageRoot / TempDirectory / UploadDir / CompactionTempDirectory / S3Bucket / ColdS3Bucket / AzureContainer / ColdAzureContainer / GCSBucket / ColdGCSBucket wiring")
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, sandboxLockdownTimeout)
