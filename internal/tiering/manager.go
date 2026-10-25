@@ -718,6 +718,24 @@ func (m *Manager) coldTierUsable() bool {
 	return m != nil && m.coldBackend != nil && m.config != nil && m.config.Cold.Enabled
 }
 
+// ColdTierMissing reports a cold tier that is configured on but has no
+// backend on this node: its construction failed at startup (a bad endpoint,
+// credentials that could not be resolved). Every cold accessor then answers
+// "no cold tier", so a read would silently leave out every cold file and
+// answer with the hot rows alone (#1105). The query path asks this to fail
+// such a read instead.
+func (m *Manager) ColdTierMissing() bool {
+	return m != nil && m.config != nil && m.config.Cold.Enabled && m.coldBackend == nil
+}
+
+// HasColdFilesInRange reports whether the measurement has cold tier rows
+// whose partition may hold data in [start, end]. A nil bound is open. Used
+// only by the query path when ColdTierMissing, to fail exactly the reads
+// that would have needed the cold tier.
+func (m *Manager) HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	return m.metadata.HasColdFilesInRange(ctx, database, measurement, start, end)
+}
+
 // GetBackendForTier returns the storage backend for a tier, or nil when this
 // node has no usable one.
 //
