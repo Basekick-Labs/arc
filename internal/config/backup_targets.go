@@ -101,13 +101,20 @@ type BackupTargetConfig struct {
 	AzureSASToken           string
 	AzureEndpoint           string
 	AzureUseManagedIdentity bool
+
+	// GCS (#1105): a service-account key file, else Application Default
+	// Credentials, as for storage.gcs_*.
+	GCSBucket          string
+	GCSPrefix          string
+	GCSCredentialsFile string
+	GCSEndpoint        string
 }
 
 // IsRemote reports whether the target is an object store rather than a
 // directory on this machine.
 func (t BackupTargetConfig) IsRemote() bool {
 	switch strings.ToLower(strings.TrimSpace(t.Type)) {
-	case "s3", "minio", "azure", "azblob":
+	case "s3", "minio", "azure", "azblob", "gcs":
 		return true
 	}
 	return false
@@ -140,6 +147,13 @@ func (t BackupTargetConfig) BackendSpec() storage.BackendSpec {
 			Endpoint:           t.AzureEndpoint,
 			UseManagedIdentity: t.AzureUseManagedIdentity,
 		},
+		GCS: storage.GCSConfig{
+			Bucket:          t.GCSBucket,
+			Prefix:          t.GCSPrefix,
+			CredentialsFile: t.GCSCredentialsFile,
+			Endpoint:        t.GCSEndpoint,
+			Role:            storage.GCSRoleBackup,
+		},
 	}
 }
 
@@ -157,6 +171,8 @@ func (t BackupTargetConfig) KeyPrefix() (string, error) {
 		return storage.ValidateObjectPrefix(t.S3Prefix)
 	case "azure", "azblob":
 		return storage.ValidateObjectPrefix(t.AzurePrefix)
+	case "gcs":
+		return storage.ValidateObjectPrefix(t.GCSPrefix)
 	default:
 		return "", nil
 	}
@@ -247,6 +263,10 @@ func setBackupTargetDefaults(v *viper.Viper, name string) {
 	v.SetDefault(k+"azure_sas_token", "")
 	v.SetDefault(k+"azure_endpoint", "")
 	v.SetDefault(k+"azure_use_managed_identity", false)
+	v.SetDefault(k+"gcs_bucket", "")
+	v.SetDefault(k+"gcs_prefix", "")
+	v.SetDefault(k+"gcs_credentials_file", "")
+	v.SetDefault(k+"gcs_endpoint", "")
 	// A string default rather than an empty []string, so an unset key reads
 	// back as the scalar spelling rather than as an empty array, which is the
 	// shape parseTargetDatabases treats as "nothing routed" without having to
@@ -370,6 +390,10 @@ func loadBackupTargets(v *viper.Viper) (map[string]BackupTargetConfig, error) {
 			AzureSASToken:           v.GetString(k + "azure_sas_token"),
 			AzureEndpoint:           get("azure_endpoint"),
 			AzureUseManagedIdentity: v.GetBool(k + "azure_use_managed_identity"),
+			GCSBucket:               get("gcs_bucket"),
+			GCSPrefix:               get("gcs_prefix"),
+			GCSCredentialsFile:      get("gcs_credentials_file"),
+			GCSEndpoint:             get("gcs_endpoint"),
 			Databases:               parseTargetDatabases(v.Get(k + "databases")),
 		}
 	}
@@ -382,6 +406,8 @@ func prefixKeyName(targetType string) string {
 	switch strings.ToLower(strings.TrimSpace(targetType)) {
 	case "azure", "azblob":
 		return "azure_prefix"
+	case "gcs":
+		return "gcs_prefix"
 	default:
 		return "s3_prefix"
 	}
@@ -428,7 +454,7 @@ func (c *Config) validateBackupTargets() error {
 		key := "backup.targets." + name + "."
 		switch t.Type {
 		case "":
-			return fmt.Errorf("%stype is not set; set it to \"local\", \"s3\", \"minio\", \"azure\" or \"azblob\"", key)
+			return fmt.Errorf("%stype is not set; set it to \"local\", \"s3\", \"minio\", \"azure\", \"azblob\" or \"gcs\"", key)
 		case "local":
 			if t.LocalPath == "" {
 				return fmt.Errorf("%stype is \"local\" but %slocal_path is empty; set %slocal_path", key, key, key)
@@ -450,8 +476,18 @@ func (c *Config) validateBackupTargets() error {
 			if err := c.checkObjectPrefix(key+"azure_prefix", t.AzurePrefix); err != nil {
 				return err
 			}
+		case "gcs":
+			if t.GCSBucket == "" {
+				return fmt.Errorf("%stype is \"gcs\" but %sgcs_bucket is empty; set %sgcs_bucket", key, key, key)
+			}
+			if err := c.checkObjectPrefix(key+"gcs_prefix", t.GCSPrefix); err != nil {
+				return err
+			}
+			if err := checkGCSEndpoint(key+"gcs_endpoint", t.GCSEndpoint); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("%stype %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\" or \"azblob\"", key, t.Type)
+			return fmt.Errorf("%stype %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", \"azblob\" or \"gcs\"", key, t.Type)
 		}
 		// The prefix has to leave room for the keys a backup writes under it,
 		// and that is a LOAD-TIME refusal rather than a NewManager error.
@@ -695,6 +731,34 @@ func (c *Config) checkBackupDestinationOverlap() error {
 	return nil
 }
 
+// checkColdPrimaryOverlap refuses a cold tier that shares storage with the
+// primary: the same location, or one inside the other. Called only when the
+// cold tier would be built (tiered_storage.enabled and cold.enabled), and for
+// every backend, whatever backup.enabled says (#1105).
+//
+// Both shapes lose data. At the same location a hot file and its cold copy
+// have one key, so migration copies the file onto itself and then deletes
+// the hot copy, which was the only one. Nested, the hot tier's scan lists
+// the cold objects as hot files of a database named after the cold prefix
+// and migrates them again, and the hot query secret and allowlist cover cold
+// data.
+func (c *Config) checkColdPrimaryOverlap() error {
+	primary, err := c.primaryStorageDestination()
+	if err != nil {
+		return fmt.Errorf("cannot resolve the primary storage location to check it against the cold tier: %w", err)
+	}
+	cold, err := c.coldTierDestination()
+	if err != nil {
+		return fmt.Errorf("cannot resolve the tiered-storage cold tier location to check it against primary storage: %w", err)
+	}
+	if cold.Overlaps(primary) {
+		return fmt.Errorf(
+			"tiered_storage.cold is %s, which overlaps primary storage at %s; migration would copy a file onto itself and delete the only copy, or the hot tier would list cold objects as its own. Use a different bucket or a prefix that is not a parent of the other",
+			cold.String(), primary.String())
+	}
+	return nil
+}
+
 // backupDestinationRef is one place a backup can be written, with the
 // configuration key that names it so a refusal tells the operator which line
 // to edit.
@@ -805,6 +869,13 @@ func (c *Config) coldTierDestination() (storage.Destination, error) {
 			ContainerName:    cold.AzureContainer,
 			Prefix:           cold.AzurePrefix,
 			Endpoint:         cold.AzureEndpoint,
+		},
+		// Without this a GCS cold tier resolves to a bucketless destination
+		// that overlaps nothing, and both overlap checks pass it (#1105).
+		GCS: storage.GCSConfig{
+			Bucket:   cold.GCSBucket,
+			Prefix:   cold.GCSPrefix,
+			Endpoint: cold.GCSEndpoint,
 		},
 	})
 }
