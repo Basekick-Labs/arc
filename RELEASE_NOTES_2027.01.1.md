@@ -600,6 +600,27 @@ encodes snappy on arm64 with new assembly that cut line-protocol ingest by
 about 14% and msgpack+gzip ingest by about 11% on Apple silicon, because every
 Parquet file Arc writes is snappy-compressed.
 
+## Upgrade note: DuckDB 1.5.6 ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
+
+Arc's query engine moved from DuckDB 1.5.5 to 1.5.6, a bug-fix release.
+Among its fixes are queries that could return wrong results:
+
+- a `UNION ALL` whose branches share a join;
+- Top-N over a window function (`row_number() … WHERE rn <= N`), including
+  ordering expressions that can be NULL;
+- `MAX` over a hive partition column after file pruning.
+
+Nothing in Arc's configuration or API changes. DuckDB extensions are built per
+DuckDB version, so Arc uses the 1.5.6 builds:
+
+- The Docker image carries httpfs and aws for 1.5.6.
+- Arc downloads azure (for Azure storage) and cache_httpfs (with
+  `query.enable_s3_cache`) on first start, in the image too.
+- Outside the image, Arc downloads all four on first start.
+
+An air-gapped host needs the 1.5.6 builds of the ones it uses copied in, as
+for any DuckDB upgrade.
+
 ## Upgrade note: file-level time pruning is on by default ([#659](https://github.com/Basekick-Labs/arc/issues/659))
 
 `query.file_time_pruning` now defaults to `true`. It was added in 26.09.2 as
