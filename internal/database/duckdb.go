@@ -2052,8 +2052,9 @@ func externalFileCacheMode(cfg *Config) string {
 // so on a busy node most of the cache belongs to files that no longer exist,
 // and memory_limit defaults to 80% of RAM. For local files the OS page cache
 // already holds the same blocks: turning DuckDB's copy off measured no
-// latency difference (warm, hot and 8 concurrent clients), and DuckDB 2.0
-// stopped caching local files. On a node that may read S3 or Azure it stays
+// latency cost on macOS or Linux (warm, hot and 8 concurrent clients; Linux
+// small-file queries were 5-7% faster), and DuckDB 2.0 stopped caching local
+// files. On a node that may read S3 or Azure it stays
 // on, because there it is the remote read cache.
 //
 // "auto" turns it off when mayReadRemoteStorage is false and otherwise leaves

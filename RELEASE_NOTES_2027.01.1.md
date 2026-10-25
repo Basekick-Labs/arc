@@ -1578,37 +1578,44 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Arc's memory no longer climbs toward DuckDB's memory limit on local storage ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
+### DuckDB no longer caches blocks of deleted files on local storage ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
 
-DuckDB keeps a cache of blocks from the Parquet files it reads and frees it
-only when it reaches its memory limit, which defaults to 80% of RAM or of the
-container. Compaction deletes and replaces files all day, so on a busy node
-most of that cache belonged to files that no longer existed, and the process
-grew for as long as it ran. An overnight soak reached about 5 GB, with 206 MB
-of live data on disk.
+DuckDB keeps a file cache of blocks from the Parquet files it reads. It frees
+that cache only when it reaches its memory limit, which defaults to 80% of RAM
+or of the container. Compaction deletes and replaces files all day, so on a
+busy node most of the cache belonged to files that no longer existed, and the
+process kept growing.
 
 On a node whose data is all on local disk, Arc now turns that cache off. The
-operating system's page cache already holds the same blocks, and query
-latency with it off was within ±2% (warm and hot), with the same throughput
-from 8 concurrent clients. A node that may read S3 or Azure, as primary storage
-or as a cold tier, keeps it: there it is the cache for remote reads.
+operating system's page cache already holds the same blocks. Measured on the
+same workload (ingest, compaction every minute, continuous queries, 73
+minutes), main grew to 1.6 GB physical footprint and this release to 760 MB,
+with no file cache at all. Turning it off did not slow queries:
+
+- **macOS:** compacted and small-file queries within ±2%, warm and hot.
+- **Linux (EC2 c7i.xlarge):** compacted-data queries within ±2%, and
+  small-file queries 5–7% faster.
+- **8 concurrent clients:** the same throughput on both platforms.
+
+A node that may read S3 or Azure, as primary storage or as a cold tier, keeps
+the cache: there it is the cache for remote reads.
 
 `database.external_file_cache` (`ARC_DATABASE_EXTERNAL_FILE_CACHE`) controls
 it:
 
 - `"auto"`, the default, applies the rule above.
-- `"true"` keeps the cache on everywhere.
+- `"true"` turns the cache on everywhere.
 - `"false"` turns it off everywhere, including on a node that reads S3 or
   Azure.
 
 Arc logs the value in effect at startup ("DuckDB file cache"), and
 `/api/v1/debug/duckdb-memory` reports it as `external_file_cache`.
 
-DuckDB's Parquet metadata cache is not affected. It also keeps entries for
-deleted files, but it is smaller, it is freed under memory pressure, and
-DuckDB offers no way to empty it. The step Arc ran after every compaction,
-DELETE and retention pass to "reset" it freed nothing, and it has been
-removed.
+**DuckDB's Parquet metadata cache still grows.** It also keeps entries for
+deleted files, and DuckDB offers no way to empty it. It is smaller (about 220 MB
+after the same 73 minutes) and is freed under memory pressure, so it stays
+within DuckDB's memory limit. The step Arc ran after every compaction, DELETE
+and retention pass to "reset" it freed nothing, and has been removed.
 
 ### Rebuilding cold metadata no longer restarts every tier lookup ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
 
