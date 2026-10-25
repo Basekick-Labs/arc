@@ -1749,9 +1749,13 @@ measured 8 minutes per file at 905 columns and 39 minutes per row group at
   Narrower files are rewritten as before. A long narrow file can cross the
   line too on a many-core node (50 columns and 33 full row groups at 46
   threads and 4 GB), and is then rewritten on one thread. Rewrites run one at
-  a time (they already did). Wide output has smaller row groups, so it is
-  larger (1.4× at 3,100 columns, 7× at 10,000) until compaction merges it; a
-  second DELETE on such a file goes to the private instance again. The private
+  a time (they already did). Wide output has smaller row groups (32,768 rows at
+  905 columns, 8,192 at 3,100, 2,048 at 10,000), so it is larger (1.35× at
+  3,100 columns, 7× at 10,000) and its footer is bigger, which costs reads: a
+  one-second query on a rewritten 3,100-column file took 240 ms and 330 MB
+  instead of 30 ms and 50 MB on the original (17 MB larger row groups would
+  have halved that, but went past the memory limit). A second DELETE on such
+  a file goes to the private instance again. The private
   instance's memory limit is on top of the main one's, not part of it: with the
   default limit (80% of the machine) the two together can exceed the machine
   while queries run. A WHERE that calls a function from an extension (arcx,

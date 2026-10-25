@@ -36,9 +36,14 @@ const (
 	// group byte cap.
 	writerStatePerColumn = 150 << 10
 	// The single-threaded rewrite sizes row groups so one decodes to about
-	// this much, in whole vectors (2,048 rows at 10,000 columns, 4,096 at
-	// 3,100), less under a small memory limit.
-	wideRewriteRowGroupBytes = 128 << 20
+	// this much, in whole vectors (2,048 rows at 10,000 columns, 8,192 at
+	// 3,100, 32,768 at 905), less under a small memory limit. Smaller row
+	// groups cost reads: every one adds its column chunks to the footer.
+	// Measured on DuckDB 1.5.6, 1 thread, 2 GB limit, 3,100 columns: 4,096
+	// rows = 1.83 GB RSS, 68 MB footer, 480 ms for a 1 s window; 8,192 rows =
+	// 1.81 GB, 34 MB, 240 ms; 16,384 rows went past the limit (2.47 GB).
+	// 905 columns at 32,768 rows: 1.27 GB, 5 MB footer.
+	wideRewriteRowGroupBytes = 256 << 20
 	// DuckDB fills row groups in whole vectors of 2,048 rows, so a smaller
 	// or uneven ROW_GROUP_SIZE is rounded up when written.
 	duckdbVectorRows = 2048
