@@ -19,6 +19,11 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/stretchr/testify/require"
+
+	// Linked into cmd/arc through iceberg-go: it registers the geoarrow
+	// extension types, which changes how pqarrow reads a file declaring them.
+	// Imported here so these tests read files as the server does.
+	_ "github.com/geoarrow/geoarrow-go"
 )
 
 // duckdbParquet writes the result of a SELECT to a Parquet file with DuckDB:

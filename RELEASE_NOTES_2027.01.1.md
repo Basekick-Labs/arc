@@ -719,6 +719,8 @@ used to read its geometry as `GEOMETRY` (`ST_X(geom)` worked); it now reads as
 file that uses Parquet's own `GEOMETRY` type (written by pyarrow, GDAL, DuckDB's
 GeoParquet V2) still reads as `GEOMETRY` when placed into storage directly;
 import it through the Parquet import API instead, which stores it as binary.
+During a rolling upgrade, a node still on an earlier release reads a
+GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
 
@@ -1759,19 +1761,21 @@ annotation) as a string. When the bytes were not text, such as a GeoParquet
 file's WKB geometries, every query that read the column failed with "Invalid
 string encoding". A binary column is now stored as binary when:
 
-- the file's GeoParquet `geo` metadata names it with WKB encoding (another
-  encoding, such as GeoArrow's native point/line types, is refused with 422
-  before anything is written),
-- the file carries an Arrow schema, as every file Arc and pyarrow write do,
-  so Arc's own files keep their types when imported into another Arc, or
-- its values are not valid UTF-8.
+- it has Parquet's `GEOMETRY` or `GEOGRAPHY` type, or the file's GeoParquet
+  `geo` metadata names it with WKB encoding (another encoding is refused with
+  422 before anything is written),
+- the file was written by a writer that marks its string columns: Arc itself
+  (ingest and compaction), DuckDB, pyarrow, or any file carrying an Arrow
+  schema, so Arc's own files keep their types when imported into another Arc,
+- the measurement already stores the column as binary, or
+- any of its values in the file is not valid UTF-8.
 
-A column whose values are all text is still a string, as Spark and Hive write
-string columns that way. The first batch with a value decides; a later value
-that is not text in a column decided as text is refused. `LargeBinary` columns
-are imported too (they were refused as unsupported), and a fixed-length binary
-column (such as a 16-byte UUID) follows the same rules instead of always
-becoming a string.
+Otherwise (Spark and Hive write string columns without the annotation) a
+column of text throughout is a string, as before. The whole file is checked
+before anything is written, so an import is never refused part-way for this.
+Two column types that were refused as unsupported now import: `LargeBinary`,
+and Parquet `UUID`, stored as its canonical text as Arc shows a UUID
+everywhere else. A GeoArrow column stored as `large_binary` is still refused.
 
 A column an earlier import already stored as a string holding binary data
 cannot be read. Import the binary values into a new column: writing bytes to

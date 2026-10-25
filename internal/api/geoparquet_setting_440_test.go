@@ -11,6 +11,7 @@ func TestGeoParquetConversionCannotBeTurnedOn(t *testing.T) {
 		"SET GLOBAL enable_geoparquet_conversion = true",
 		"SET enable_geoparquet_conversion = true",
 		"RESET enable_geoparquet_conversion",
+		"PRAGMA enable_geoparquet_conversion = true",
 		"SELECT 1; SET enable_geoparquet_conversion = true",
 	} {
 		if err := ValidateSQLRequest(sql); err == nil {

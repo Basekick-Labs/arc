@@ -17,8 +17,9 @@ import (
 // so does compaction of the partition. Queries written for the BLOB column
 // (ST_GeomFromWKB(geom), octet_length) would fail on GEOMETRY too.
 //
-// GLOBAL: a plain SET is per session, and a pool reconnect would read with
-// conversion on. A file that uses Parquet's own GEOMETRY type (not the "geo"
+// GLOBAL: a plain SET is per connection (the setting is LOCAL scope), and
+// every other connection of the pool would read with conversion on. A file
+// that uses Parquet's own GEOMETRY type (not the "geo"
 // metadata) still reads as GEOMETRY; such files must come in through the
 // import API, which stores them as BLOB.
 func DisableGeoParquetConversion(ctx context.Context, db *sql.DB) error {
