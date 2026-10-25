@@ -209,6 +209,25 @@ func TestDeleteRewriteGateUsesTheRealWidthByDefault(t *testing.T) {
 	}
 }
 
+func TestProbeRewriteShapeReadsTheFooter(t *testing.T) {
+	r := newWideRig(t, nil)
+	full := r.fileRG(10000, 30, 4096)
+	s, err := probeRewriteShape(context.Background(), r.db.DB(), full, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// time (INT64) + host (BYTE_ARRAY) + 30 DOUBLE columns.
+	if s.leafColumns != 32 || s.bytesPerRow != 9+16+30*9 || s.rowGroups != 3 || s.maxRowGroupRows != 4096 {
+		t.Fatalf("shape %+v", s)
+	}
+	if want := int64(9+16+30*9)*4096 + 32*writerStatePerColumn; s.perThreadBytes() != want {
+		t.Fatalf("per-thread bytes %d, want %d", s.perThreadBytes(), want)
+	}
+	if len(s.kv) != 2 || s.kv[0] != [2]string{"arc:dedup_exact", "true"} || s.kv[1] != [2]string{"arc:tags", "host,o'brien"} {
+		t.Fatalf("metadata %q", s.kv)
+	}
+}
+
 func TestNeedsSingleThread(t *testing.T) {
 	const gb = int64(1) << 30
 	wide := rewriteShape{leafColumns: 3100, bytesPerRow: 3100 * 9, maxRowGroupRows: 122880, rowGroups: 8}
