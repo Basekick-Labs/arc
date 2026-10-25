@@ -1027,7 +1027,7 @@ func main() {
 		if cfg.Storage.Backend == "local" {
 			log.Fatal().
 				Str("backend", cfg.Storage.Backend).
-				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, or azblob); local-filesystem backend cannot be shared across writers")
+				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, azblob or gcs); local-filesystem backend cannot be shared across writers")
 		}
 		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone {
 			log.Fatal().
