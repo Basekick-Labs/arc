@@ -86,6 +86,9 @@ type cycleProgress struct {
 	failed          atomic.Int64
 	interrupted     atomic.Int64
 	discoveryErrors atomic.Int64
+	// skippedTooWide counts candidates left alone as too wide to compact
+	// (too_wide.go). Not part of discovered: they are not batches.
+	skippedTooWide atomic.Int64
 
 	mu sync.Mutex
 	// failedPartitions maps a partition path to how many of its batches
@@ -156,6 +159,9 @@ type CycleRecord struct {
 	Interrupted     int64
 	Unstarted       int64
 	DiscoveryErrors int64
+	// SkippedTooWide counts partitions the cycle left alone because they are
+	// remembered as too wide to compact (too_wide.go).
+	SkippedTooWide int64
 
 	// Err is the cycle error, truncated. A discovery-error count with no
 	// reason attached is a dead end for whoever has to act on it.
@@ -195,6 +201,7 @@ func (o CycleRecord) counters() CycleRecord {
 	o.Failed = p.failed.Load()
 	o.Interrupted = p.interrupted.Load()
 	o.DiscoveryErrors = p.discoveryErrors.Load()
+	o.SkippedTooWide = p.skippedTooWide.Load()
 	o.Unstarted = o.Discovered - o.Started
 	o.FailedPartitions, o.FailedPartitionsTruncated = p.snapshotFailedPartitions()
 	return o
@@ -263,6 +270,9 @@ type Manager struct {
 
 	// Job history. Each entry is one ATTEMPT (one subprocess invocation), not
 	// one batch: a batch rescued by the adaptive splitter contributes several.
+	// tooWide remembers partitions too wide to compact in a job's memory
+	// (too_wide.go). Persisted under TempDirectory; per node.
+	tooWide    *tooWideMemo
 	jobHistory []map[string]interface{}
 
 	// activeJobs counts attempts currently in flight -- incremented once
@@ -489,6 +499,8 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		jobHistory:       make([]map[string]interface{}, 0),
 		logger:           logger,
 	}
+	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
+	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
 
 	if len(excludeList) > 0 {
 		m.logger.Info().
@@ -1455,6 +1467,7 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 	}
 
 	// Attempt compaction
+	attemptStart := time.Now()
 	err := m.compactPartition(ctx, batchCandidate, jobAttribution{CycleID: cycleID, AttemptDepth: depth})
 	if err == nil {
 		// Success!
@@ -1469,8 +1482,14 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 	}
 
 	// Cancellation is not a recoverable resource failure. Preserve the
-	// cause without logging a failed batch or allocating split retries.
+	// cause without logging a failed batch or allocating split retries. An
+	// attempt the cycle deadline cut off after running half the budget is
+	// marked for the too-wide memo (too_wide.go): a partition that spills
+	// instead of failing is cut off here at every size.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if ran := time.Since(attemptStart); errors.Is(err, context.DeadlineExceeded) && m.CycleTimeout > 0 && ran >= m.CycleTimeout/2 {
+			return &errSlowAttempt{ran: ran, err: err}
+		}
 		return err
 	}
 
@@ -1496,15 +1515,19 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 		return err
 	}
 
-	// Check if we can split further
-	if len(files) <= minBatchSize {
+	// Check if we can split further. A half below minBatchSize is refused
+	// unattempted, so a batch under twice the minimum, or one at the deepest
+	// level, is as small as the splitter gets: its failure is the partition's
+	// (too_wide.go).
+	if len(files) < 2*minBatchSize || depth >= maxDepth {
 		m.logger.Error().
 			Err(err).
 			Str("reason", reason).
 			Int("batch_size", len(files)).
+			Int("depth", depth).
 			Str("partition", candidate.PartitionPath).
-			Msg("Compaction failed at minimum batch size, cannot split further")
-		return err
+			Msg("Compaction failed at the smallest batch the splitter can make, cannot split further")
+		return &errUnsplittable{reason: reason, err: err}
 	}
 
 	// Split batch in half and try each half (copy to independent backing arrays)
@@ -1719,6 +1742,11 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// cannot set runErr, and the dispatch loop may already be waiting at the
 	// end of the tier, so it is checked there.
 	var pausedSkipped atomic.Bool
+	// tooWideSeen is every (tier, partition) this cycle discovered, for
+	// pruning the too-wide memo after a full-scope cycle.
+	tooWideSeen := map[string]bool{}
+	tooWideSettings := m.tooWideSettings()
+	tooWideTiers := map[string]bool{}
 
 	// The cycle is recorded as "running" before it starts, carrying its scope
 	// and a pointer to the live counters (#1162). Recording only at completion
@@ -1787,6 +1815,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			Failed:          failed.Load(),
 			Interrupted:     interrupted.Load(),
 			DiscoveryErrors: discoveryErrors.Load(),
+			SkippedTooWide:  progress.skippedTooWide.Load(),
 		}
 		outcome.FailedPartitions, outcome.FailedPartitionsTruncated = progress.snapshotFailedPartitions()
 		outcome.Unstarted = outcome.Discovered - outcome.Started
@@ -1835,6 +1864,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			Int64("interrupted_batches", outcome.Interrupted).
 			Int64("unstarted_batches", outcome.Unstarted).
 			Int64("discovery_errors", outcome.DiscoveryErrors).
+			Int64("skipped_too_wide", outcome.SkippedTooWide).
 			Msg("Compaction cycle finished")
 	}()
 	if err := ctx.Err(); err != nil {
@@ -1983,6 +2013,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			Int64("cycle_id", cycleID).
 			Str("tier", tierName).
 			Msg("Processing tier")
+		tooWideTiers[tierName] = true
 
 		// MEMORY OPTIMIZATION: Process candidates as they're found instead of accumulating all.
 		// This prevents unbounded memory growth when there are millions of files.
@@ -2045,6 +2076,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						wg.Wait()
 						return err
 					}
+					tooWideSeen[tooWideKey(tierName, candidate.PartitionPath)] = true
 					// A slash-carrying database is by construction a
 					// pseudo-database from the namespace expander — received
 					// data the delivery gate must not defer (#619 F2).
@@ -2099,6 +2131,19 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						return err
 					}
 					if !shouldProcess {
+						continue
+					}
+
+					// A partition that failed at the smallest batch is left
+					// alone while its files and the job sizing stay the same
+					// (too_wide.go): retrying downloads it and fails again.
+					if m.tooWide.skip(tier, filteredCandidate.PartitionPath, filteredCandidate.Files, tooWideSettings) {
+						progress.skippedTooWide.Add(1)
+						metrics.Get().IncCompactionPartitionsSkippedTooWide()
+						m.logger.Debug().
+							Str("partition", filteredCandidate.PartitionPath).
+							Str("tier", tierName).
+							Msg("Skipping candidate: remembered as too wide to compact")
 						continue
 					}
 
@@ -2157,7 +2202,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 					// Run all batches for the same partition sequentially within a single goroutine.
 					// This prevents race conditions where batch N tries to compact files that were
 					// already deleted by batch N-1. Different partitions can still run in parallel.
-					go func(partitionBatches []Candidate, partition string) {
+					go func(partitionBatches []Candidate, partition string, partitionFiles []string) {
 						defer wg.Done()
 						defer active.Done()
 						defer func() { <-sem }() // Release semaphore
@@ -2185,6 +2230,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 							}
 
 							if err != nil {
+								m.tooWideStrike(tierName, partition, partitionFiles, err)
 								if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 									interrupted.Add(1)
 									return
@@ -2202,9 +2248,10 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 								// per-partition batch behavior.
 							} else {
 								succeeded.Add(1)
+								m.tooWide.clear(tierName, partition)
 							}
 						}
-					}(batches, candidate.PartitionPath)
+					}(batches, candidate.PartitionPath, filteredCandidate.Files)
 				}
 				// candidates slice is now eligible for GC after this iteration
 			}
@@ -2245,8 +2292,34 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			Msg("Tier processing complete")
 	}
 
+	// A cycle over every database and measurement that discovered without
+	// error saw every partition that still has candidates: the memo forgets
+	// the others (their files are gone).
+	if filterDatabases == nil && filterMeasurement == "" && discoveryErrors.Load() == 0 {
+		m.tooWide.prune(tooWideTiers, tooWideSeen)
+		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
+	}
+
 	// The finalizer records the terminal outcome and complete counters.
 	return nil
+}
+
+// tooWideStrike records a batch failure that counts toward the too-wide memo.
+func (m *Manager) tooWideStrike(tier, partition string, files []string, err error) {
+	reason := tooWideReason(err)
+	if reason == "" {
+		return
+	}
+	if m.tooWide.strike(tier, partition, files, reason, m.tooWideSettings()) {
+		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
+		m.logger.Warn().
+			Str("tier", tier).
+			Str("partition", partition).
+			Int("files", len(files)).
+			Str("reason", reason).
+			Str("settings", m.tooWideSettings()).
+			Msg("Partition is too wide to compact in a job's memory: it fails at the smallest batch; left uncompacted until its files or the job sizing change (more memory per job: compaction.memory_limit or a lower compaction.max_concurrent). Uncompacted files are not moved to cold storage")
+	}
 }
 
 // IsCycleRunning returns true if a compaction cycle is currently in progress
@@ -2507,7 +2580,9 @@ func (m *Manager) Stats() map[string]interface{} {
 			"interrupted_batches": m.lastCycle.Interrupted,
 			"unstarted_batches":   m.lastCycle.Unstarted,
 			"discovery_errors":    m.lastCycle.DiscoveryErrors,
+			"skipped_too_wide":    m.lastCycle.SkippedTooWide,
 		},
+		"partitions_too_wide": m.tooWide.memoized(),
 	}
 
 	// Add recent jobs (last 10). Copied into fresh storage rather than handed
@@ -3092,4 +3167,32 @@ func (m *Manager) dropDeadCompletionRecord(ctx context.Context, candidate Candid
 		return
 	}
 	m.logger.Debug().Str("job_id", config.JobID).Msg("Removed the completion record of a job that ended before writing its output")
+}
+
+// tooWideSettings is the job sizing a too-wide failure is remembered under.
+// Any change retries the memoized partitions: the operator's remedy for one is
+// more memory per job or fewer files per batch.
+func (m *Manager) tooWideSettings() string {
+	return fmt.Sprintf("memory_limit=%s threads=%d max_files_per_batch=%d cycle_timeout=%s",
+		m.MemoryLimit, m.Threads, m.MaxFilesPerBatch, m.CycleTimeout)
+}
+
+// TooWidePartitions lists the partitions remembered as too wide to compact,
+// with the ones still collecting strikes.
+func (m *Manager) TooWidePartitions() []TooWideEntry {
+	if m.tooWide == nil {
+		return nil
+	}
+	return m.tooWide.list()
+}
+
+// ClearTooWide forgets remembered partitions (all, or one tier and partition
+// path), so the next cycle tries them again; it returns how many it removed.
+func (m *Manager) ClearTooWide(tier, partition string) int {
+	if m.tooWide == nil {
+		return 0
+	}
+	n := m.tooWide.clearAll(tier, partition)
+	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
+	return n
 }

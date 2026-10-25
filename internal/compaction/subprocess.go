@@ -523,7 +523,7 @@ var sqlErrorMarkers = []string{"binder error", "catalog error", "parser error"}
 
 // memoryErrorMarkers indicate memory pressure; retrying with a smaller batch
 // is exactly the right response.
-var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed"}
+var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed", "bad_alloc"}
 
 // permanentErrorMarkers are failures no retry can fix: the input is gone or
 // unreadable. Both streams are searched for each one - see ClassifySubprocessError.
@@ -574,6 +574,11 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		if strings.Contains(errStr, "killed") {
 			return true, "killed"
 		}
+		// A C++ abort: DuckDB's std::bad_alloc when stderr says so (the
+		// memory markers below), otherwise an unknown crash.
+		if strings.Contains(errStr, "aborted") && !containsAny(strings.ToLower(errStr)+stderrLower, memoryErrorMarkers) {
+			return true, "aborted"
+		}
 	}
 
 	// Check exit codes for OOM (137 = SIGKILL, often OOM killer)
@@ -588,6 +593,18 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 	}
 
+	// Memory errors before SQL errors: a child that died of memory (a Go
+	// runtime "out of memory", a std::bad_alloc abort) embeds its whole stderr,
+	// whose earlier warn lines may quote SQL error text, and classifying that
+	// as a permanent SQL error left a too-wide partition failing every cycle.
+	// A real SQL error arrives alone through the JSON result and carries no
+	// memory marker.
+	for _, marker := range memoryErrorMarkers {
+		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
+			return true, "memory_error"
+		}
+	}
+
 	// Deterministic DuckDB SQL errors — permanent at any batch size, so the
 	// splitter's retry ladder (each rung re-downloads the whole batch) is pure
 	// waste. These arrive via the JSON result path, so they appear in err
@@ -595,13 +612,6 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	for _, marker := range sqlErrorMarkers {
 		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
 			return false, "sql_error"
-		}
-	}
-
-	// Check for memory-related errors in either stream.
-	for _, marker := range memoryErrorMarkers {
-		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
-			return true, "memory_error"
 		}
 	}
 
@@ -675,4 +685,13 @@ func subprocessResult(job *Job, err error) *SubprocessJobResult {
 		result.Error = err.Error()
 	}
 	return result
+}
+
+func containsAny(s string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }

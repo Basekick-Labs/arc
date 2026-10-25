@@ -146,6 +146,10 @@ func (h *CompactionHandler) RegisterRoutes(app *fiber.App) {
 	// segment count anyway.
 	group.Get("/cycles", adminOnly, h.listCycles)
 	group.Get("/cycles/:id", adminOnly, h.getCycle)
+	// Partitions remembered as too wide to compact, and forgetting them so
+	// the next cycle tries again (after giving jobs more memory).
+	group.Get("/too-wide", adminOnly, h.listTooWide)
+	group.Delete("/too-wide", adminOnly, h.clearTooWide)
 
 	// Admin route — trigger compaction requires admin permission
 	if h.authManager != nil {
@@ -155,6 +159,43 @@ func (h *CompactionHandler) RegisterRoutes(app *fiber.App) {
 	}
 
 	h.logger.Info().Msg("Compaction routes registered")
+}
+
+// listTooWide handles GET /api/v1/compaction/too-wide
+func (h *CompactionHandler) listTooWide(c *fiber.Ctx) error {
+	if h.manager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Compaction not initialized",
+		})
+	}
+	entries := h.manager.TooWidePartitions()
+	out := make([]fiber.Map, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, fiber.Map{
+			"tier":          e.Tier,
+			"partition":     e.Partition,
+			"files":         len(e.Files),
+			"reason":        e.Reason,
+			"failures":      e.Strikes,
+			"skipped":       e.Memoized(),
+			"settings":      e.Settings,
+			"first_failure": e.FirstFailure,
+			"last_failure":  e.LastFailure,
+		})
+	}
+	return c.JSON(fiber.Map{"partitions": out, "count": len(out)})
+}
+
+// clearTooWide handles DELETE /api/v1/compaction/too-wide: every remembered
+// partition, or only ?tier= and/or ?partition=.
+func (h *CompactionHandler) clearTooWide(c *fiber.Ctx) error {
+	if h.manager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Compaction not initialized",
+		})
+	}
+	n := h.manager.ClearTooWide(c.Query("tier"), c.Query("partition"))
+	return c.JSON(fiber.Map{"cleared": n})
 }
 
 // getStatus handles GET /api/v1/compaction/status
@@ -220,6 +261,15 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 		})
 	}
 
+	// Partitions remembered as too wide to compact: a cycle leaves them
+	// alone while they have no new input file.
+	tooWide := map[string]bool{}
+	for _, e := range h.manager.TooWidePartitions() {
+		if e.Memoized() {
+			tooWide[e.Tier+"\x00"+e.Partition] = true
+		}
+	}
+
 	// Convert candidates to JSON-friendly format
 	candidateList := make([]fiber.Map, len(candidates))
 	for i, cand := range candidates {
@@ -229,6 +279,7 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 			"partition_path": cand.PartitionPath,
 			"file_count":     cand.FileCount,
 			"tier":           cand.Tier,
+			"too_wide":       tooWide[cand.Tier+"\x00"+cand.PartitionPath],
 		}
 	}
 
@@ -609,6 +660,7 @@ func cycleResponseWithPartitions(rec compaction.CycleRecord, includePartitions b
 		"interrupted_batches": rec.Interrupted,
 		"unstarted_batches":   rec.Unstarted,
 		"discovery_errors":    rec.DiscoveryErrors,
+		"skipped_too_wide":    rec.SkippedTooWide,
 	}
 
 	if rec.FinishedAt.IsZero() {
