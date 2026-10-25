@@ -706,6 +706,57 @@ proxied query is encoded by the node that answers it.
 
 ## New features
 
+### Google Cloud Storage as primary storage ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+`storage.backend = "gcs"` stores a standalone node's data in a Google Cloud
+Storage bucket, through GCS's own API rather than its S3 interoperability
+endpoint, so it authenticates the way Google workloads do: no HMAC keys.
+
+```toml
+[storage]
+backend = "gcs"
+gcs_bucket = "my-arc-data"
+# gcs_prefix = "instances/abc123/"          # default: the bucket root
+# gcs_credentials_file = "/etc/arc/key.json" # default: Application Default Credentials
+# gcs_endpoint = "https://storage-x.p.googleapis.com" # https only, e.g. Private Service Connect
+```
+
+- **Authentication.** Application Default Credentials by default: GKE
+  Workload Identity, the GCE or Cloud Run metadata server, or
+  `GOOGLE_APPLICATION_CREDENTIALS`. `gcs_credentials_file` names a
+  service-account key instead; only that key type is accepted. Ingest,
+  compaction and queries use the same identity.
+- **IAM.** `roles/storage.objectAdmin` on the bucket is enough to run.
+  Granting `storage.buckets.get` as well lets Arc check the bucket's settings
+  at startup (below); without it Arc logs that they were not checked.
+- **Queries.** DuckDB reads `gs://` with a bearer token Arc resolves from that
+  identity and replaces 10 minutes before it expires. `/health` reports the
+  hot tier as `"backend": "gcs"`. A new credential state, **`unavailable`**,
+  means no token has been resolved yet, so every query read of the bucket
+  fails (GCS has no fallback the way S3 and Azure do); Arc keeps retrying and
+  logs each failure at error level. With
+  `server.storage_credentials_fail_ready = true`, `/ready` answers 503 with
+  `storage_credentials_unavailable` in that state, as it does for `expired`.
+- **Refused at startup:** a bucket with hierarchical namespace or with
+  requester pays; an `http://` `gcs_endpoint`; a node that will run as a
+  licensed cluster node (GCS clusters come later; `cluster.enabled` without a
+  clustering licence runs standalone and is fine); a cold tier
+  (`tiered_storage.cold.enabled` with tiering on); and Iceberg export, which
+  is local-only.
+- **Warned at startup:** soft delete (on by default for new buckets, 7 days),
+  a retention policy and a default storage class other than STANDARD.
+  Compaction and retention delete objects continuously: soft delete keeps
+  every deleted byte billed for its period, a retention policy makes those
+  deletes fail until objects are old enough, and colder classes charge a
+  minimum storage duration on each. Turn soft delete off on a bucket used
+  only by Arc.
+- **Endpoint.** DuckDB uses only the host of `gcs_endpoint` and speaks the
+  XML API on it. Private Service Connect endpoints serve both APIs on one
+  host; an emulator that serves only the JSON API cannot serve queries.
+- A backup target on GCS is not available yet. An S3-typed backup target
+  pointed at the same bucket through `storage.googleapis.com` is refused as
+  overlapping primary storage, as for any other backend.
+
 ### MessagePack binary values are stored as binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
 A MessagePack `bin` value is now stored as a Parquet BYTE_ARRAY column

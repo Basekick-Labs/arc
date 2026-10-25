@@ -240,15 +240,18 @@ func (d *DuckDB) startGCSRefresher(params gcsSecretParams, cfg *Config) error {
 			Msg("GCS credentials not resolvable yet; queries of GCS storage fail until they are (retrying in the background)")
 	}
 
+	// Logged before the first resolve, so it describes the configuration
+	// whatever that resolve's outcome; the outcome is logged by the core.
+	d.logger.Info().Str("secret", params.name).Str("scope", params.scope).
+		Str("endpoint_host", params.endpointHost).Str("source", resolver.source).
+		Msg("GCS query secret is Arc-managed: a bearer token from the storage identity, replaced before it expires")
+
 	d.refresherMu.Lock()
 	defer d.refresherMu.Unlock()
 	if old := d.s3Refreshers[params.name]; old != nil {
 		old.stop()
 	}
 	d.s3Refreshers[params.name] = startCredentialRefresher(resolver, params.name, d.logger, gcsDemotionHint, true, firstFailure)
-	d.logger.Info().Str("secret", params.name).Str("scope", params.scope).
-		Str("endpoint_host", params.endpointHost).
-		Msg("GCS query secret managed by Arc (bearer token, refreshed before expiry)")
 	return nil
 }
 

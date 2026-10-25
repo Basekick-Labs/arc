@@ -66,7 +66,7 @@ extensions = []
 # Storage
 # -----------------------------------------------------------------------------
 [storage]
-backend = "local"           # "local" or "s3"
+backend = "local"           # "local", "s3", "azure" or "gcs"
 # Arc REFUSES TO START when the backup destination overlaps this root — see the
 # note on [backup].local_path. Setting this to a PARENT of the backup directory
 # (for example "./data" beside the default backup path "./data/backups") is the
@@ -103,6 +103,15 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # ARC_STORAGE_AZURE_CONNECTION_STRING).
 # azure_container = ""
 # azure_prefix = "instances/abc123"
+#
+# Google Cloud Storage (when backend = "gcs"). Standalone nodes only for now.
+# Authenticates with Application Default Credentials (GKE Workload Identity,
+# the GCE/Cloud Run metadata server, GOOGLE_APPLICATION_CREDENTIALS) unless a
+# service-account key file is set.
+# gcs_bucket = ""
+# gcs_prefix = "instances/abc123"
+# gcs_credentials_file = "/etc/arc/gcs-key.json"
+# gcs_endpoint = "https://storage-myendpoint.p.googleapis.com"   # https only; e.g. Private Service Connect
 
 # -----------------------------------------------------------------------------
 # Ingestion
