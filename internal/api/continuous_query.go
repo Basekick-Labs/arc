@@ -1262,40 +1262,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	}
 	defer rows.Close()
 
-	// Get column names
-	columns, err := rows.Columns()
+	records, err := scanCQRecords(rows)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get columns: %w", err)
-	}
-	uuidCol := cqUUIDColumns(rows, len(columns))
-
-	// Read all results
-	var records []map[string]interface{}
-	for rows.Next() {
-		// Create slice of interface{} to scan into
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return 0, fmt.Errorf("failed to scan row: %w", err)
-		}
-
-		// Convert to map
-		record := make(map[string]interface{})
-		for i, col := range columns {
-			if uuidCol[i] {
-				values[i] = cqUUIDText(values[i])
-			}
-			record[col] = values[i]
-		}
-		records = append(records, record)
-	}
-
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("row iteration error: %w", err)
+		return 0, err
 	}
 
 	h.logger.Info().Int("record_count", len(records)).Msg("Aggregation query returned records")
@@ -1758,4 +1727,46 @@ func cqUUIDText(v interface{}) interface{} {
 		return uuid.UUID(b).String()
 	}
 	return v
+}
+
+// scanCQRecords reads a continuous query's result rows into records keyed
+// by column name. A UUID column is written as its text (#440).
+func scanCQRecords(rows *sql.Rows) ([]map[string]interface{}, error) {
+	// Get column names
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns: %w", err)
+	}
+	uuidCol := cqUUIDColumns(rows, len(columns))
+
+	// Read all results
+	var records []map[string]interface{}
+	for rows.Next() {
+		// Create slice of interface{} to scan into
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		// Convert to map
+		record := make(map[string]interface{})
+		for i, col := range columns {
+			if uuidCol[i] {
+				values[i] = cqUUIDText(values[i])
+			}
+			record[col] = values[i]
+		}
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %w", err)
+	}
+
+	return records, nil
 }

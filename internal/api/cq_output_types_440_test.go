@@ -10,6 +10,7 @@ import (
 
 // A continuous query's UUID output is written as text and its BLOB output as
 // bytes: duckdb-go scans both as []byte, so the column type decides (#440).
+// Through scanCQRecords, the scan executeAggregation runs.
 func TestCQOutputUUIDAsTextBlobAsBytes(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -21,26 +22,21 @@ func TestCQOutputUUIDAsTextBlobAsBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	isUUID := cqUUIDColumns(rows, 3)
-	if !isUUID[0] || isUUID[1] || isUUID[2] {
-		t.Fatalf("UUID columns = %v, want [true false false]", isUUID)
-	}
-	if !rows.Next() {
-		t.Fatal(rows.Err())
-	}
-	vals := make([]interface{}, 3)
-	if err := rows.Scan(&vals[0], &vals[1], &vals[2]); err != nil {
+	records, err := scanCQRecords(rows)
+	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range vals {
-		if isUUID[i] {
-			vals[i] = cqUUIDText(vals[i])
-		}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
 	}
-	if vals[0] != "6f1c2c1e-8a3b-4d2e-9f00-1234567890ab" {
-		t.Errorf("UUID = %#v, want its text", vals[0])
+	rec := records[0]
+	if rec["u"] != "6f1c2c1e-8a3b-4d2e-9f00-1234567890ab" {
+		t.Errorf("UUID = %#v, want its text", rec["u"])
 	}
-	if b, ok := vals[1].([]byte); !ok || !bytes.Equal(b, []byte{0xff, 0x00}) {
-		t.Errorf("BLOB = %#v, want bytes ff00", vals[1])
+	if b, ok := rec["b"].([]byte); !ok || !bytes.Equal(b, []byte{0xff, 0x00}) {
+		t.Errorf("BLOB = %#v, want bytes ff00", rec["b"])
+	}
+	if rec["s"] != "x" {
+		t.Errorf("VARCHAR = %#v", rec["s"])
 	}
 }
