@@ -1722,19 +1722,21 @@ touches a daily file answers the retryable 503, even for recent data.
 
 A row DELETE rewrites each file it removes rows from by copying the rows it
 keeps to a new file. That copy ran on every DuckDB thread, and each thread held
-a whole decoded row group of the file plus the Parquet writer's state for every
-column, most of it outside `database.memory_limit`. On wide files and many-core
+a decoded row group (the one it read and the 122,880-row one it wrote, about
+9 bytes per value however sparse the data) plus the Parquet writer's state for
+every column, part of it outside `database.memory_limit`. On wide files and many-core
 nodes it spilled for a long time and then ran out of memory: a customer
 measured 8 minutes per file at 905 columns and 39 minutes per row group at
 3,100 columns (46 cores, 4 GB limit).
 
 - **A file too wide for the main DuckDB is rewritten on a private
   single-threaded one.** Before each rewrite Arc reads the file's footer and
-  estimates what the copy holds per thread (columns × rows per row group, plus
-  the writer's per-column state) times the threads it would use. Above half of
-  DuckDB's memory limit, the file goes to a private DuckDB instance: one
-  thread, half the main memory limit, its own spill directory, smaller row
-  groups, sandboxed to the file's own directories. The row order is kept. On
+  estimates what the copy holds per thread (columns × rows per row group read
+  or written, plus the writer's per-column state) times the threads it would
+  use. Above half of DuckDB's effective memory limit, the file goes to a
+  private DuckDB instance: one thread, half the main memory limit, its own
+  spill directory, smaller row groups, sandboxed to the file's own directories,
+  with no extensions. The row order is kept. On
   object storage the file is downloaded first. Measured on DuckDB 1.5.6 with a
   4 GB limit on a 14-core machine:
 
@@ -1744,11 +1746,20 @@ measured 8 minutes per file at 905 columns and 39 minutes per row group at
   | 905 columns, 16 row groups | 32 s, 5.0 GB | 20 s, 0.9 GB |
   | 10,000 columns, 1 row group | stopped after 15 min | 23 s, 2.6 GB |
 
-  Narrower files are rewritten as before. Rewrites of wide files run one at
-  a time (they already did), and their output has smaller row groups, so it is
-  larger (1.4× at 3,100 columns, 7× at 10,000) until compaction merges it. If the
-  private instance cannot be opened, that file's rewrite fails; it does not
-  fall back to the main DuckDB. No setting.
+  Narrower files are rewritten as before. A long narrow file can cross the
+  line too on a many-core node (50 columns and 33 full row groups at 46
+  threads and 4 GB), and is then rewritten on one thread. Rewrites run one at
+  a time (they already did). Wide output has smaller row groups, so it is
+  larger (1.4× at 3,100 columns, 7× at 10,000) until compaction merges it; a
+  second DELETE on such a file goes to the private instance again. The private
+  instance's memory limit is on top of the main one's, not part of it: with the
+  default limit (80% of the machine) the two together can exceed the machine
+  while queries run. A WHERE that calls a function from an extension (arcx,
+  httpfs) fails on a wide file. No setting.
+- **A file that cannot be sized is not rewritten.** If its footer cannot be
+  read, or the private instance cannot be opened, that file's rewrite fails
+  (`failed_files`, 207) and the DELETE can be retried; it does not go to the
+  main DuckDB unsized.
 - **A rewritten file keeps Arc's metadata.** Every DELETE rewrite dropped the
   file's `arc:tags`, `arc:dedup_exact` and `arc:decimals` entries, so a
   rewritten continuous-query file lost its exact-duplicate marker at
