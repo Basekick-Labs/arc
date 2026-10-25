@@ -156,9 +156,16 @@ func TestRewriteUnlinkSweep(t *testing.T) {
 		t.Fatal("the sweep re-queued an unready unlink")
 	}
 	r.write(r.rw, r.rwBody)
+	// Poll the outcome, not the deferred set: requeueDeferred leaves the
+	// deferred set and enters the pending queue under two separate locks, so
+	// "no longer deferred" can be seen a moment before the path is queued
+	// (it failed CI under -race that way).
 	deadline := time.Now().Add(5 * time.Second)
-	for r.c.unlinkDeferred(r.old) && time.Now().Before(deadline) {
+	for len(r.pending()) == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
+	}
+	if r.c.unlinkDeferred(r.old) {
+		t.Fatal("still deferred after the rewrite arrived")
 	}
 	if got := r.pending(); len(got) != 1 || got[0] != r.old {
 		t.Fatalf("pending after the sweep: %v", got)
