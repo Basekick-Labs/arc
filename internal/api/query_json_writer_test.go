@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/database"
-	"github.com/google/uuid"
 	duckdb "github.com/duckdb/duckdb-go/v2"
+	"github.com/google/uuid"
 )
 
 // mockRowScanner simulates *sql.Rows for testing streamTypedJSON.
