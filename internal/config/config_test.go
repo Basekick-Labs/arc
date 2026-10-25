@@ -1626,6 +1626,11 @@ func TestLoad_GCSColdTierValidation(t *testing.T) {
 			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b", "ARC_TIERED_STORAGE_COLD_S3_PREFIX": "cold",
 			"ARC_TIERED_STORAGE_COLD_S3_ENDPOINT": "https://storage.googleapis.com",
 		}, "overlaps primary storage"},
+		// The cold endpoint is part of its identity: the same bucket name on
+		// a store that is not Google's is another bucket.
+		{"gcs hot + gcs cold on another store, same bucket and prefix", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "p",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "p",
+			"ARC_TIERED_STORAGE_COLD_GCS_ENDPOINT", "https://gcs.example.internal"), ""},
 		// Every backend, not only GCS: an S3 hot and S3 cold in one prefix.
 		{"s3 hot + s3 cold, same prefix", map[string]string{
 			"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b", "ARC_STORAGE_S3_PREFIX": "p",

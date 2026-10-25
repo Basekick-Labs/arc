@@ -348,3 +348,21 @@ func TestConfigureGCSColdTierLocalPrimary(t *testing.T) {
 		t.Fatal("an http cold endpoint must be refused")
 	}
 }
+
+// A GCS cold tier recorded without a refresher (unreachable through
+// ConfigureGCS, which registers one before recording) must still report
+// "unavailable": GCS has no fallback secret, so "fallback" would claim
+// credentials that do not exist.
+func TestColdGCSWithoutRefresherIsUnavailable(t *testing.T) {
+	db, err := New(&Config{MaxConnections: 2, MemoryLimit: "256MB", TempDirectory: t.TempDir()}, zerolog.Nop())
+	if err != nil {
+		t.Skipf("New: %v", err)
+	}
+	defer db.Close()
+	db.refresherMu.Lock()
+	db.coldTier = &storageTierConfig{backend: "gcs", credentials: s3ModeSDKManaged, secretName: arcGCSColdSecretName}
+	db.refresherMu.Unlock()
+	if c := db.StorageCredentialStatus()["cold"]; c.State != CredStateUnavailable {
+		t.Fatalf("cold = %+v, want unavailable", c)
+	}
+}
