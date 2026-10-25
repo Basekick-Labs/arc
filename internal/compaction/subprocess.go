@@ -531,8 +531,9 @@ func backendSpecFromJob(config *SubprocessJobConfig, getenv func(string) string)
 			Bucket:   c.Bucket,
 			Prefix:   c.Prefix,
 			Endpoint: c.Endpoint,
-			// The parent probed the bucket at startup; a probe per job would
-			// add a billed request and a failure point to every compaction.
+			// The parent probed the bucket and proved the key at startup;
+			// repeating both per job would add requests and failure points
+			// to every compaction.
 			SkipProbe: true,
 		}
 		// With neither set, the subprocess uses Application Default

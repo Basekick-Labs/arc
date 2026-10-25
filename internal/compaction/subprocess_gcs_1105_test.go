@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -19,9 +20,11 @@ import (
 
 // gcsKeyFile writes a service-account key whose token endpoint is a local
 // stub, so a GCS backend built from it mints its token offline.
-func gcsKeyFile(t *testing.T) string {
+func gcsKeyFile(t *testing.T) (string, *atomic.Int32) {
 	t.Helper()
+	var mints atomic.Int32
 	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mints.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"ya29.stub","expires_in":3600,"token_type":"Bearer"}`))
 	}))
@@ -47,7 +50,7 @@ func gcsKeyFile(t *testing.T) string {
 	if err := os.WriteFile(p, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return p
+	return p, &mints
 }
 
 // #1105: the compaction subprocess rebuilds a GCS parent's backend with the
@@ -56,7 +59,7 @@ func gcsKeyFile(t *testing.T) string {
 // root (the #1102 class); a dropped key would silently switch identity to ADC.
 func TestSubprocessGetsTheParentsGCSBackend(t *testing.T) {
 	endpoint := "https://storage-psc.p.googleapis.com"
-	keyPath := gcsKeyFile(t)
+	keyPath, mints := gcsKeyFile(t)
 	adc := filepath.Join(t.TempDir(), "adc.json")
 	if err := os.WriteFile(adc, []byte(`{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -73,6 +76,7 @@ func TestSubprocessGetsTheParentsGCSBackend(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := tc.cfg
+			// SkipProbe keeps the parent offline (no bucket read).
 			cfg.Bucket, cfg.Prefix, cfg.Endpoint, cfg.SkipProbe = "arc-b", "inst/a", endpoint, true
 			parent, err := storage.NewGCSBackend(&cfg, zerolog.Nop())
 			if err != nil {
@@ -91,9 +95,13 @@ func TestSubprocessGetsTheParentsGCSBackend(t *testing.T) {
 			if !got.SkipProbe {
 				t.Fatal("the subprocess must skip the per-job bucket probe")
 			}
+			before := mints.Load()
 			child, err := storage.NewBackend(spec, zerolog.Nop())
 			if err != nil {
 				t.Fatalf("child: %v", err)
+			}
+			if n := mints.Load() - before; n != 0 {
+				t.Fatalf("the child minted %d tokens at construction; the parent already proved the key", n)
 			}
 			defer child.Close()
 			if child.ConfigJSON() != parent.ConfigJSON() {

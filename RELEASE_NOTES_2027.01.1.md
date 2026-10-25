@@ -726,19 +726,26 @@ gcs_bucket = "my-arc-data"
   `GOOGLE_APPLICATION_CREDENTIALS`. `gcs_credentials_file` names a
   service-account key instead; only that key type is accepted. Ingest,
   compaction and queries use the same identity.
-- **IAM.** `roles/storage.objectAdmin` on the bucket is enough to run.
-  Granting `storage.buckets.get` as well lets Arc check the bucket's settings
-  at startup (below); without it Arc logs that they were not checked.
+- **IAM.** `roles/storage.objectAdmin` on the bucket is enough to run. It
+  does not include `storage.buckets.get`, which the startup checks below
+  need; without it Arc logs a warning that the bucket's settings were not
+  checked and starts anyway, so a requester-pays bucket then fails at its
+  first query rather than at startup. Grant `storage.buckets.get` too.
 - **Queries.** DuckDB reads `gs://` with a bearer token Arc resolves from that
-  identity and replaces 10 minutes before it expires. `/health` reports the
+  identity. Arc starts replacing it 10 minutes before it expires; with a key
+  file or user credentials the new token arrives then, while the GCE/GKE
+  metadata server keeps returning its current token until close to expiry,
+  so there the token is replaced when the server issues a new one (Arc polls
+  each minute meanwhile and warns if fewer than 5 minutes remain). `query.enable_s3_cache` does not
+  apply to GCS. `/health` reports the
   hot tier as `"backend": "gcs"`. A new credential state, **`unavailable`**,
   means no token has been resolved yet, so every query read of the bucket
   fails (GCS has no fallback the way S3 and Azure do); Arc keeps retrying and
   logs each failure at error level. With
   `server.storage_credentials_fail_ready = true`, `/ready` answers 503 with
   `storage_credentials_unavailable` in that state, as it does for `expired`.
-- **Refused at startup:** a bucket with hierarchical namespace or with
-  requester pays; an `http://` `gcs_endpoint`; a node that will run as a
+- **Refused at startup** (the bucket checks need `storage.buckets.get`): a
+  bucket with hierarchical namespace or with requester pays; an `http://` `gcs_endpoint`; a node that will run as a
   licensed cluster node (GCS clusters come later; `cluster.enabled` without a
   clustering licence runs standalone and is fine); a cold tier
   (`tiered_storage.cold.enabled` with tiering on); and Iceberg export, which
@@ -750,9 +757,12 @@ gcs_bucket = "my-arc-data"
   deletes fail until objects are old enough, and colder classes charge a
   minimum storage duration on each. Turn soft delete off on a bucket used
   only by Arc.
-- **Endpoint.** DuckDB uses only the host of `gcs_endpoint` and speaks the
-  XML API on it. Private Service Connect endpoints serve both APIs on one
-  host; an emulator that serves only the JSON API cannot serve queries.
+- **Endpoint.** DuckDB uses only the host of `gcs_endpoint` and speaks GCS's
+  XML API on it, so the endpoint must serve both the JSON API (ingest,
+  compaction) and the XML API (queries) on one host. Verified with
+  `https://storage.googleapis.com`; a Private Service Connect endpoint has
+  not been tested yet. An emulator that serves only the JSON API cannot
+  serve queries.
 - A backup target on GCS is not available yet. An S3-typed backup target
   pointed at the same bucket through `storage.googleapis.com` is refused as
   overlapping primary storage, as for any other backend.

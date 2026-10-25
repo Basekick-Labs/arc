@@ -193,7 +193,7 @@ func TestNewWithGCSPrimary(t *testing.T) {
 	defer db.Close()
 
 	var typ, scope string
-	if err := db.db.QueryRow("SELECT type, scope::VARCHAR FROM duckdb_secrets() WHERE name = '" + arcGCSPrimarySecretName + "'").Scan(&typ, &scope); err != nil {
+	if err := db.db.QueryRow("SELECT type, scope::VARCHAR FROM duckdb_secrets() WHERE name = '"+arcGCSPrimarySecretName+"'").Scan(&typ, &scope); err != nil {
 		t.Fatalf("GCS secret not created: %v", err)
 	}
 	if typ != "gcs" || !strings.Contains(scope, "gs://arc-b/inst/") {

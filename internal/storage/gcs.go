@@ -106,10 +106,11 @@ type GCSConfig struct {
 	// See GCSEndpointURL.
 	Endpoint string
 
-	// SkipProbe skips the bucket metadata read at construction. The
-	// compaction subprocess sets it: its parent already ran the probe at
-	// startup, and one Buckets.Get per compaction job would add a billed
-	// request and a failure point to every job for no new information.
+	// SkipProbe skips the construction-time checks: the bucket metadata read,
+	// and minting a token to prove an explicit key. The compaction subprocess
+	// sets it: its parent already ran both at startup, and repeating them per
+	// job would add requests and failure points to every job for no new
+	// information.
 	SkipProbe bool
 }
 
@@ -164,7 +165,7 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 		opts = append(opts, option.WithEndpoint(endpoint))
 	}
 
-	if creds != nil && (cfg.CredentialsJSON != "" || cfg.CredentialsFile != "") {
+	if creds != nil && !cfg.SkipProbe && (cfg.CredentialsJSON != "" || cfg.CredentialsFile != "") {
 		// A key file is only parsed for its JSON shape; a damaged private key
 		// would pass and every request would then fail, with the probe below
 		// reporting it as a warning. Minting one token signs with the key, so
@@ -369,7 +370,7 @@ func (b *GCSBackend) probeBucket() error {
 		return nil
 	case err != nil:
 		b.logger.Warn().Err(err).Str("bucket", b.bucket).
-			Msg("Could not read GCS bucket metadata (storage.buckets.get); hierarchical namespace, which Arc does not support, and soft delete were NOT checked")
+			Msg("Could not read GCS bucket metadata (storage.buckets.get); hierarchical namespace and requester pays, which Arc does not support, and soft delete, retention policy and storage class were NOT checked")
 		return nil
 	}
 	if attrs.HierarchicalNamespace != nil && attrs.HierarchicalNamespace.Enabled {
@@ -838,8 +839,8 @@ func (b *GCSBackend) GetEndpoint() string { return b.endpoint }
 
 // Credentials returns the credential configuration the backend was built with
 // (the key file path and key contents, nothing else), so the compaction
-// subprocess will be able to rebuild it with the SAME identity (wired in the
-// primary-storage stage of #1105; subprocess.go refuses gcs until then). Empty fields mean
+// subprocess rebuilds it with the SAME identity (see subprocessCredentials in
+// internal/compaction). Empty fields mean
 // Application Default Credentials, which the subprocess inherits through its
 // environment and the metadata server.
 //
@@ -851,9 +852,8 @@ func (b *GCSBackend) Credentials() GCSConfig { return b.auth }
 func (b *GCSBackend) Type() string { return "gcs" }
 
 // ConfigJSON returns the configuration as JSON for subprocess recreation.
-// Every field must be parsed by the compaction subprocess once it accepts gcs
-// (the primary-storage stage of #1105); the prefix above
-// all, or the subprocess reroots at the bucket root (see
+// Every field must be parsed by the compaction subprocess (backendSpecFromJob
+// in internal/compaction); the prefix above all, or the subprocess reroots at the bucket root (see
 // AzureBlobBackend.ConfigJSON). It carries no credentials and must not start
 // to.
 func (b *GCSBackend) ConfigJSON() string {

@@ -249,7 +249,7 @@ func (r *credentialRefresher) status(now time.Time) StorageTierStatus {
 // emit can replace it (#601 review M1).
 //
 // noFallback says no fallback secret exists behind this refresher (see the
-// field); onFirstFailure is then typically nil.
+// field); onFirstFailure then only reports the failure.
 func startCredentialRefresher(resolver credentialResolver, secretName string, logger zerolog.Logger, demotionHint string, noFallback bool, onFirstFailure func(error)) *credentialRefresher {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &credentialRefresher{

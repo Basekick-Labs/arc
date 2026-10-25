@@ -1094,6 +1094,11 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		if err := ensureHTTPFSLoaded(db); err != nil {
 			return fmt.Errorf("failed to load httpfs for GCS: %w", err)
 		}
+		// As for an S3 primary (configureS3Access). query.enable_s3_cache
+		// (cache_httpfs) is NOT applied: it has not been verified on gs://.
+		if _, err := db.Exec("SET GLOBAL prefetch_all_parquet_files=true"); err != nil {
+			logger.Warn().Err(err).Msg("Failed to set prefetch_all_parquet_files")
+		}
 	}
 
 	if err := loadConfiguredExtensions(db, cfg.Extensions, logger); err != nil {

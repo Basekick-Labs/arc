@@ -67,9 +67,9 @@ type Server struct {
 
 	// storageCredsFailReady: when true (server.storage_credentials_fail_ready,
 	// default false), /ready returns 503 while any tier's credential state is
-	// "expired". Applied AND-ed after the ready flag — it can only remove
+	// "expired" or "unavailable" (#1105). Applied AND-ed after the ready flag — it can only remove
 	// readiness, never grant it, so WAL-recovery gating and shutdown drain are
-	// untouched. Only "expired" fails ready: "fallback"/"unknown"/"degraded"
+	// untouched. Only those two fail ready: "fallback"/"unknown"/"degraded"
 	// deployments may be healthy or permanently credential-less by design and
 	// must not flap the LB.
 	storageCredsFailReady bool

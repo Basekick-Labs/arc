@@ -71,7 +71,8 @@ type ServerConfig struct {
 	IdleTimeout     int // Connection idle timeout in seconds
 	ShutdownTimeout int // Graceful shutdown timeout in seconds
 	// StorageCredentialsFailReady: /ready returns 503 while any storage tier's
-	// credential state is "expired" (#603). Default false — recycling on
+	// credential state is "expired" (#603) or "unavailable" (a GCS tier whose
+	// credentials were never resolved, #1105). Default false — recycling on
 	// credential expiry is an operator policy; recommended for reader pools.
 	StorageCredentialsFailReady bool
 	MaxPayloadSize              int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
