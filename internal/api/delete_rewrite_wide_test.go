@@ -186,6 +186,23 @@ func TestDeleteRewriteOfAWideFileFailsWhenTheSingleThreadInstanceCannotOpen(t *t
 	}
 }
 
+func TestDeleteRewriteOfAFileThatCannotBeSizedFails(t *testing.T) {
+	r := newWideRig(t, nil)
+	full := filepath.Join(r.root, wideKey)
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("not parquet"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.rewrite(full, 10); err == nil || !strings.Contains(err.Error(), "size its rewrite") {
+		t.Fatalf("rewrite of an unreadable footer: %v", err)
+	}
+	if r.opened != 0 {
+		t.Fatalf("opened %d private instances", r.opened)
+	}
+}
+
 func TestDeleteRewriteGateUsesTheRealWidthByDefault(t *testing.T) {
 	r := newWideRig(t, nil)
 	// 2,000 columns in one 16,384-row group: ~295 MB decoded + 300 MB of
@@ -217,10 +234,11 @@ func TestProbeRewriteShapeReadsTheFooter(t *testing.T) {
 		t.Fatal(err)
 	}
 	// time (INT64) + host (BYTE_ARRAY) + 30 DOUBLE columns.
-	if s.leafColumns != 32 || s.bytesPerRow != 9+16+30*9 || s.rowGroups != 3 || s.maxRowGroupRows != 4096 {
+	if s.leafColumns != 32 || s.bytesPerRow != 9+16+30*9 || s.rowGroups != 3 || s.maxRowGroupRows != 4096 || s.totalRows != 10000 {
 		t.Fatalf("shape %+v", s)
 	}
-	if want := int64(9+16+30*9)*4096 + 32*writerStatePerColumn; s.perThreadBytes() != want {
+	// The main instance writes the whole 10,000 rows as one row group.
+	if want := int64(9+16+30*9)*10000 + 32*writerStatePerColumn; s.perThreadBytes() != want {
 		t.Fatalf("per-thread bytes %d, want %d", s.perThreadBytes(), want)
 	}
 	if len(s.kv) != 2 || s.kv[0] != [2]string{"arc:dedup_exact", "true"} || s.kv[1] != [2]string{"arc:tags", "host,o'brien"} {
@@ -245,6 +263,12 @@ func TestNeedsSingleThread(t *testing.T) {
 		{"64 columns, 40 row groups, 46 threads, 4 GB", many, 4 * gb, 46, true},
 		{"64 columns, 40 row groups, 4 threads, 4 GB", many, 4 * gb, 4, false},
 		{"no row groups", rewriteShape{leafColumns: 1, bytesPerRow: 9}, 4 * gb, 46, false},
+		// A file in small row groups (one this path rewrote) is priced at the
+		// 122,880-row group the main instance would write.
+		{"1,000 columns in 120 x 4,096-row groups, 2 threads, 1 GB",
+			rewriteShape{leafColumns: 1000, bytesPerRow: 1000 * 9, maxRowGroupRows: 4096, totalRows: 491520, rowGroups: 120}, gb, 2, true},
+		{"3,100 columns in 4,096-row groups, 2 threads, 4 GB",
+			rewriteShape{leafColumns: 3100, bytesPerRow: 3100 * 9, maxRowGroupRows: 4096, totalRows: 983040, rowGroups: 240}, 4 * gb, 2, true},
 		// Half the limit is the line: 600 MB in flight against 1 GB.
 		{"600 MB of a 1 GB limit", rewriteShape{bytesPerRow: 1, maxRowGroupRows: 600 << 20, rowGroups: 1}, gb, 8, true},
 		{"400 MB of a 1 GB limit", rewriteShape{bytesPerRow: 1, maxRowGroupRows: 400 << 20, rowGroups: 1}, gb, 8, false},

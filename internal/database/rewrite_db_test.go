@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -88,6 +89,20 @@ func TestOpenRewriteDBIsPrivateSingleThreadedAndSandboxed(t *testing.T) {
 	}
 	if got, _ := ParseDuckDBSize(mem); got != 300<<20 {
 		t.Fatalf("memory_limit %q", mem)
+	}
+	var autoload, autoinstall bool
+	if err := db.QueryRow("SELECT current_setting('autoload_known_extensions'), current_setting('autoinstall_known_extensions')").Scan(&autoload, &autoinstall); err != nil || autoload || autoinstall {
+		t.Fatalf("autoload %v, autoinstall %v, %v", autoload, autoinstall, err)
+	}
+	// The zone holds on a new connection too, not only the one configured.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	conn.Close()
+	if err := db.QueryRow("SELECT current_setting('TimeZone')").Scan(&tz); err != nil || tz != "UTC" {
+		t.Fatalf("TimeZone on a new connection %q, %v", tz, err)
 	}
 
 	var n int

@@ -16,8 +16,9 @@ import (
 )
 
 // A DELETE rewrite COPYs a file's surviving rows to a new file. Per thread in
-// flight that COPY holds one decoded source row group plus the parquet
-// writer's per-column state, and most of it is outside DuckDB's
+// flight that COPY holds a decoded row group (the source's being read, and
+// the output's being built: 122,880 rows on the main instance) plus the
+// parquet writer's per-column state, part of it outside DuckDB's
 // memory_limit. On a wide file and a many-core node the main instance runs the
 // process out of memory: 3,100 columns, 46 cores and a 4 GB limit took 39
 // minutes per row group of spilling, then failed. Such a file is rewritten on
@@ -49,10 +50,10 @@ const (
 )
 
 // rewriteKVKeys are the parquet key/value metadata entries a rewrite carries
-// over. Arc reads them back: arc:tags (dedup columns, tag-first schema order),
-// arc:dedup_exact (exact-row dedup at compaction; still true after rows are
-// removed), arc:decimals (decimal column specs), and the legacy
-// arc:dedup_time, kept as the file had it. Never ARROW:schema: it describes
+// over, as ingest wrote them: arc:tags (dedup columns, tag-first schema
+// order), arc:dedup_exact (exact-row dedup at compaction; still true after
+// rows are removed), arc:decimals (decimal column specs, which nothing reads
+// back today) and the legacy arc:dedup_time, kept as the file had it. Never ARROW:schema: it describes
 // the ingest writer's Arrow schema, not the file DuckDB writes.
 var rewriteKVKeys = map[string]bool{
 	"arc:tags":        true,
@@ -66,12 +67,15 @@ type rewriteShape struct {
 	leafColumns     int
 	bytesPerRow     int64 // decoded, summed over leaf columns
 	maxRowGroupRows int64
+	totalRows       int64
 	rowGroups       int
 	kv              [][2]string // allowlisted entries, sorted by key
 }
 
-// probeRewriteShape reads the source's footer through db: its leaf columns,
-// row groups and key/value metadata. Footer only (a ranged read on S3).
+// probeRewriteShape reads the source's footer through db: its leaf columns
+// and row groups, then its key/value metadata. Footer only (a ranged read on
+// S3). A failure to read the metadata is logged and carries none over: the
+// file can still be sized.
 func probeRewriteShape(ctx context.Context, db *sql.DB, path string, logger zerolog.Logger) (rewriteShape, error) {
 	var s rewriteShape
 	src := sqlutil.QuoteStringLiteral(path)
@@ -102,42 +106,74 @@ func probeRewriteShape(ctx context.Context, db *sql.DB, path string, logger zero
 	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(DISTINCT row_group_id), coalesce(max(row_group_num_rows), 0) FROM parquet_metadata(%s)`, src)).Scan(&s.rowGroups, &s.maxRowGroupRows); err != nil {
 		return s, fmt.Errorf("read row groups: %w", err)
 	}
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT num_rows FROM parquet_file_metadata(%s)`, src)).Scan(&s.totalRows); err != nil {
+		return s, fmt.Errorf("read row count: %w", err)
+	}
+	kv, err := readRewriteKV(ctx, db, src, path, logger)
+	if err != nil {
+		logger.Warn().Err(err).Str("file", filepath.Base(path)).Msg("Could not read the file's parquet metadata; the rewritten file carries none")
+	}
+	s.kv = kv
+	return s, nil
+}
+
+// readRewriteKV returns src's allowlisted key/value metadata, sorted by key.
+func readRewriteKV(ctx context.Context, db *sql.DB, src, path string, logger zerolog.Logger) ([][2]string, error) {
 	kvRows, err := db.QueryContext(ctx, fmt.Sprintf(`SELECT key, value FROM parquet_kv_metadata(%s)`, src))
 	if err != nil {
-		return s, fmt.Errorf("read key/value metadata: %w", err)
+		return nil, err
 	}
 	defer kvRows.Close()
+	var kv [][2]string
+	seen := map[string]bool{}
 	for kvRows.Next() {
 		// BLOBs scanned raw: a ::VARCHAR cast would turn a quote in a tag
 		// name into the escape \x27.
 		var k, v []byte
 		if err := kvRows.Scan(&k, &v); err != nil {
-			return s, fmt.Errorf("read key/value metadata: %w", err)
+			return nil, err
 		}
-		if !rewriteKVKeys[string(k)] {
+		// A key twice would make KV_METADATA fail to bind, on every DELETE
+		// of the file: the first is kept.
+		if !rewriteKVKeys[string(k)] || seen[string(k)] {
 			continue
 		}
 		if !utf8.Valid(v) {
 			logger.Warn().Str("file", filepath.Base(path)).Str("key", string(k)).Msg("Not carrying a parquet metadata entry that is not valid UTF-8 into the rewritten file")
 			continue
 		}
-		s.kv = append(s.kv, [2]string{string(k), string(v)})
+		seen[string(k)] = true
+		kv = append(kv, [2]string{string(k), string(v)})
 	}
 	if err := kvRows.Err(); err != nil {
-		return s, fmt.Errorf("read key/value metadata: %w", err)
+		return nil, err
 	}
-	sort.Slice(s.kv, func(i, j int) bool { return s.kv[i][0] < s.kv[j][0] })
-	return s, nil
+	sort.Slice(kv, func(i, j int) bool { return kv[i][0] < kv[j][0] })
+	return kv, nil
 }
 
-// perThreadBytes estimates what one COPY thread holds for this source.
+// perThreadBytes estimates what one thread of the main instance's COPY holds
+// for this source: the larger of a source row group and the 122,880-row
+// output row group (or the whole file, if smaller), plus the writer's state.
+// Pricing the source alone would send a file this path already rewrote into
+// small row groups back to the main instance.
 func (s rewriteShape) perThreadBytes() int64 {
-	return s.bytesPerRow*s.maxRowGroupRows + writerStatePerColumn*int64(s.leafColumns)
+	rows := s.totalRows
+	if rows > parquetRowGroupSize {
+		rows = parquetRowGroupSize
+	}
+	if s.maxRowGroupRows > rows {
+		rows = s.maxRowGroupRows
+	}
+	return s.bytesPerRow*rows + writerStatePerColumn*int64(s.leafColumns)
 }
 
 // needsSingleThread reports whether rewriting s on the main instance could
-// exceed half its memory limit: one source row group in flight per thread, up
-// to the number of row groups. A package variable so tests choose the path.
+// exceed half its memory limit: one row group in flight per thread, up to the
+// number of source row groups. Wide files cross it, and so can a long narrow
+// one on a many-core node (50 columns, 33 full row groups, 46 threads and
+// 4 GB), which then rewrites on one thread. A package variable so tests
+// choose the path.
 var needsSingleThread = func(s rewriteShape, memoryBytes int64, threads int) bool {
 	inFlight := int64(threads)
 	if int64(s.rowGroups) < inFlight {
@@ -210,25 +246,25 @@ var openRewriteDB = database.OpenRewriteDB
 // process.
 func (h *DeleteHandler) copySurvivors(ctx context.Context, src, whereClause, dst string, fetch func(ctx context.Context, localPath string) error) (bool, error) {
 	db := h.db.DB()
+	// A file that cannot be sized is not rewritten: on the main instance an
+	// unsized wide file is the out-of-memory path, which takes the node down
+	// rather than failing this file. The DELETE reports it and can be retried.
 	shape, err := probeRewriteShape(ctx, db, src, h.logger)
 	if err != nil {
-		// Without the footer the file cannot be sized; the main instance
-		// rewrites it as before this check existed. The COPY reports the
-		// file's own read errors.
-		h.logger.Warn().Err(err).Str("file", filepath.Base(src)).Msg("Could not read the file's footer before rewriting it; rewriting on the main database")
-		return false, database.ExecPreservingInsertionOrder(ctx, db, survivorsCopy(src, whereClause, dst, parquetRowGroupSize, nil))
+		return false, fmt.Errorf("read the file's footer to size its rewrite: %w", err)
 	}
 	memoryBytes, threads, err := h.db.EffectiveLimits(ctx)
 	if err != nil {
-		h.logger.Warn().Err(err).Msg("Could not read DuckDB's memory limit and threads before a rewrite; rewriting on the main database")
-		return false, database.ExecPreservingInsertionOrder(ctx, db, survivorsCopy(src, whereClause, dst, parquetRowGroupSize, shape.kv))
+		return false, fmt.Errorf("size the rewrite: %w", err)
 	}
 	if !needsSingleThread(shape, memoryBytes, threads) {
 		return false, database.ExecPreservingInsertionOrder(ctx, db, survivorsCopy(src, whereClause, dst, parquetRowGroupSize, shape.kv))
 	}
 
 	// From here a failure fails this file's rewrite: the main instance is
-	// the path that runs out of memory.
+	// the path that runs out of memory. The private instance has none of the
+	// main one's extensions (arcx, httpfs): a WHERE that needs one fails here,
+	// loudly, as it would on the count.
 	parent := h.tempDir
 	if parent == "" {
 		parent = filepath.Dir(dst)

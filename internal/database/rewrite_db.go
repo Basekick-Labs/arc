@@ -70,9 +70,9 @@ type RewriteDBOptions struct {
 // memory-heavy parquet rewrite (a DELETE of a very wide file).
 //
 // Why a separate instance: a parquet COPY holds, per thread in flight, a
-// decoded source row group (columns x rows x ~9 B, however sparse) and the
-// writer's per-column state (~150 KB per column), and DuckDB's memory_limit
-// does not account for most of it. On a 46-core node a 3,100-column file
+// decoded row group (columns x rows x ~9 B, however sparse; the source's and
+// the one being written) and the writer's per-column state (~150 KB per
+// column), part of it outside DuckDB's memory_limit. On a 46-core node a 3,100-column file
 // therefore runs the process out of memory. The only lever is the thread
 // count, which DuckDB sets per instance, never per session.
 //
@@ -90,8 +90,10 @@ func OpenRewriteDB(ctx context.Context, opts RewriteDBOptions, logger zerolog.Lo
 	db.SetMaxOpenConns(1)
 	settings := []string{
 		// Same UTC contract as the main instance (#682): the DELETE WHERE
-		// compares naive literals against time.
-		"SET TimeZone='UTC'",
+		// compares naive literals against time, and the main instance counted
+		// the rows it removes in UTC. GLOBAL: a plain SET is session-scoped
+		// and a reconnect would read in the host's zone.
+		"SET GLOBAL TimeZone='UTC'",
 		"SET threads=1",
 		fmt.Sprintf("SET memory_limit='%dB'", opts.MemoryLimitBytes),
 		fmt.Sprintf("SET temp_directory='%s'", escapeSQLString(opts.SpillDir)),
@@ -100,6 +102,11 @@ func OpenRewriteDB(ctx context.Context, opts RewriteDBOptions, logger zerolog.Lo
 		"SET preserve_insertion_order=true",
 		// The file is read once; caching its blocks only costs memory.
 		"SET enable_external_file_cache=false",
+		// No extension is loaded or installed on demand: the WHERE is the
+		// user's, and the sandbox should not rest on the extension directory
+		// being outside the allowlist.
+		"SET autoload_known_extensions=false",
+		"SET autoinstall_known_extensions=false",
 	}
 	for _, s := range settings {
 		if _, err := db.ExecContext(ctx, s); err != nil {
