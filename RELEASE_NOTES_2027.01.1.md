@@ -1692,6 +1692,32 @@ need hundreds of GiB, and `database.memory_limit` did not bound it.
 
 `delete.time_pruning` turns the first point off (see the upgrade note above).
 
+### Retiring tier rows no longer grows the tier metadata WAL without bound ([#1373](https://github.com/Basekick-Labs/arc/pull/1373))
+
+Removing tier rows one at a time grew the WAL of the shared SQLite database
+(`arc.db-wal`) by tens of KB per row, and nothing shrank it. A startup tier
+scan that retired 6.2 million stale hot rows took one customer's WAL to
+99.6 GB. Each removal ended in a way that skipped SQLite's automatic WAL
+checkpoint. Measured on 200,000 rows: 5.9 GB of WAL before, 3 MB now.
+
+The same removal is used when a file is compacted or deleted on a node with
+replication on, and when cold rows are retired by retention or a DELETE. All
+of those are fixed.
+
+Also:
+- The scan reads hot rows 10,000 at a time instead of all at once. A single
+  read held the database's only connection, which auth, audit and file
+  registration share, for the whole read. A file flushed during that read
+  could fail to record its tier row (`failed to record file: context
+  deadline exceeded`). Such a row was, and still is, written by the next
+  complete scan.
+- After each tier scan, a WAL file larger than 64 MB (one an earlier version
+  grew) is truncated back to its minimum size. Before, a WAL that had grown
+  stayed that size on disk even after its contents were checkpointed. The
+  truncation can make auth, audit and file registration wait for up to a few
+  seconds once, on the first scan after the upgrade; a WAL kept small by the
+  fix is never truncated.
+
 ### A compaction run within a minute of its files' registration no longer leaves them behind, counted twice ([#1358](https://github.com/Basekick-Labs/arc/issues/1358))
 
 On a cluster with a shared object store, a compaction finishes by deleting

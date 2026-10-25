@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -306,21 +307,43 @@ func (s *MetadataStore) retireHotRow(ctx context.Context, path string) (bool, st
 	// leaves a window in which a row inserted between them is deleted while
 	// the cache key reads empty, and it would have to discard the SELECT's
 	// error to stay readable.
-	var database, measurement string
-	err := s.db.QueryRowContext(ctx,
+	database, measurement, found, err := s.deleteReturningScope(ctx,
 		`DELETE FROM tier_files WHERE path = ? AND tier = ?
 		 RETURNING database, measurement`,
-		path, string(TierHot),
-	).Scan(&database, &measurement)
-	if errors.Is(err, sql.ErrNoRows) {
-		// No hot row for this path: already cold, quarantined away, or never
-		// registered. Not an error.
-		return false, "", "", nil
-	}
+		path, string(TierHot))
 	if err != nil {
 		return false, "", "", fmt.Errorf("failed to retire hot row: %w", err)
 	}
-	return true, database, measurement, nil
+	// No row: already cold, quarantined away, or never registered. Not an
+	// error.
+	return found, database, measurement, nil
+}
+
+// deleteReturningScope runs a DELETE ... RETURNING database, measurement on
+// one path and reads every row it returns.
+//
+// Never QueryRow for a write: it reads one row and resets the statement, so
+// the autocommit happens on the reset, and SQLite runs its WAL autocheckpoint
+// only when a step returns DONE. A run of such deletes never checkpointed: the
+// WAL grew by every page each one touched, tens of KB a row, to 99.6 GB on a
+// node whose startup tier scan retired 6.2M stale rows. Reading to the end steps to
+// DONE, and the autocheckpoint runs as for any other write.
+func (s *MetadataStore) deleteReturningScope(ctx context.Context, query string, args ...any) (database, measurement string, found bool, err error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return "", "", false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := rows.Scan(&database, &measurement); err != nil {
+			return "", "", false, err
+		}
+		found = true
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", false, err
+	}
+	return database, measurement, found, nil
 }
 
 // RecordFile records a new file in the metadata store
@@ -1153,18 +1176,82 @@ func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier 
 	}
 	query += ` RETURNING database, measurement`
 
-	var database, measurement string
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(&database, &measurement)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	// Every row read (deleteReturningScope): QueryRow would leave the WAL
+	// unchecked.
+	database, measurement, found, err := s.deleteReturningScope(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("failed to delete file: %w", err)
+	}
+	if !found {
+		return false, nil
 	}
 	if database != "" && measurement != "" {
 		s.invalidateTierCache(database, measurement)
 	}
 	return true, nil
+}
+
+// hotRowsPage returns up to limit hot rows that are not quarantined, with an
+// id above afterID, in id order: the stale-row walk reads them a page at a
+// time rather than every hot row in one statement, which held the store's
+// only connection for the whole read (flushes registering files waited on
+// it) and every row in memory at once.
+func (s *MetadataStore) hotRowsPage(ctx context.Context, afterID int64, limit int) ([]FileMetadata, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+tierFileColumns+`
+		FROM tier_files
+		WHERE tier = ? AND quarantined_at IS NULL AND id > ?
+		ORDER BY id
+		LIMIT ?`, string(TierHot), afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query hot rows: %w", err)
+	}
+	defer rows.Close()
+	return s.scanFiles(rows)
+}
+
+// walFileBytes is the size of the store's WAL file on disk, 0 when there is
+// none (an in-memory database, or no WAL yet).
+func (s *MetadataStore) walFileBytes(ctx context.Context) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA database_list")
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var file string
+	for rows.Next() {
+		var seq int
+		var name, f string
+		if err := rows.Scan(&seq, &name, &f); err != nil {
+			return 0, err
+		}
+		if name == "main" {
+			file = f
+		}
+	}
+	if err := rows.Err(); err != nil || file == "" {
+		return 0, err
+	}
+	fi, err := os.Stat(file + "-wal")
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// truncateWAL checkpoints the store's WAL and truncates the file. A WAL file
+// never shrinks on its own (journal_size_limit is unset), so one a run of
+// writes grew stays that size on disk after its frames are folded in. It
+// reports SQLite's result: busy is 1 when a reader kept it from finishing.
+// It can wait on the busy handler twice, holding the store's only connection,
+// so it runs only for a WAL file far larger than the autocheckpoint keeps it
+// (retireVanishedHotRows).
+func (s *MetadataStore) truncateWAL(ctx context.Context) (busy, logFrames, checkpointed int, err error) {
+	err = s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed)
+	return busy, logFrames, checkpointed, err
 }
 
 // QuarantineFile marks a file index row as one tiering must never act on
