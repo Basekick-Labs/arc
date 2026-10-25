@@ -50,6 +50,13 @@ func GetLocalBasePath(backend Backend, logger *zerolog.Logger, feature string, f
 			logger.Warn().Msgf("%s not fully supported for Azure backend yet", feature)
 		}
 		return ""
+	case *GCSBackend:
+		// Explicit, because the default arm returns the caller's fallback,
+		// a LOCAL path: on a GCS node that is a location nothing was written to.
+		if logger != nil {
+			logger.Warn().Msgf("%s not fully supported for GCS backend yet", feature)
+		}
+		return ""
 	default:
 		return fallback
 	}
@@ -89,6 +96,11 @@ func backendRoot(backend Backend) string {
 		// written to. Same expression as the S3 arm above, because the prefix
 		// is either empty or already trailing-slashed.
 		return "azure://" + b.containerName + "/" + b.prefix
+	case *GCSBackend:
+		// gs://, not s3:// over the interoperability API: DuckDB applies a
+		// GCS secret (and the bearer token it carries) only to gs:// and
+		// gcs:// paths (#1105).
+		return "gs://" + b.bucket + "/" + b.prefix
 	case *LocalBackend:
 		return b.pathPrefix
 	default:
