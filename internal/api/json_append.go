@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"math"
 	"strconv"
 	"time"
@@ -90,7 +91,11 @@ func (e *jsonValueEncoder) appendValue(dst []byte, col arrow.Array, row int) []b
 	case *array.LargeString:
 		return appendJSONString(dst, c.Value(row))
 	case *array.Binary:
-		return appendJSONString(dst, string(c.Value(row)))
+		// BLOB and GEOMETRY (WKB). Raw bytes are not JSON text; base64 is
+		// what ValueStr and the Grafana plugin use for binary (#440).
+		dst = append(dst, '"')
+		dst = base64.StdEncoding.AppendEncode(dst, c.Value(row))
+		return append(dst, '"')
 	default:
 		return appendJSONString(dst, col.ValueStr(row))
 	}

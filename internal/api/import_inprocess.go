@@ -1457,6 +1457,9 @@ func (lr *limitedReader) Read(p []byte) (int, error) {
 // import that raced a shutdown, or hit sustained schema churn, is not reported
 // as a permanent server error.
 func importBufferStatus(err error) int {
+	if errors.Is(err, ingest.ErrColumnTypeChange) {
+		return fiber.StatusBadRequest // #440
+	}
 	if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) || ingest.IsWriteRefusal(err) {
 		return fiber.StatusServiceUnavailable
 	}

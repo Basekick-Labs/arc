@@ -126,6 +126,9 @@ type entry struct {
 	// waited for, or gave up on, a busy entry would cost or skip the check.
 	folds    atomic.Pointer[map[string]string]
 	foldsFor *arrow.Schema
+	// textBinary is, for schema's STRING and BINARY fields, whether the field
+	// is BINARY (KnownTextBinaryColumns, #440); published with folds.
+	textBinary atomic.Pointer[map[string]bool]
 	// dirty: the stored anchor holds fields Clean drops (#1342); the next
 	// publish rewrites it even when nothing else changed.
 	dirty bool
@@ -648,7 +651,32 @@ func (r *Registry) KnownColumnFolds(database, measurement string) map[string]str
 	return nil
 }
 
-// publishFolds republishes e.folds for e.schema. Caller holds e.mu.
+// KnownTextBinaryColumns is, for the measurement's registered STRING and
+// BINARY fields, whether the field is BINARY (#440). Ingest refuses a write
+// that would change a column between the two: DuckDB binds VARCHAR and BLOB
+// across files as BLOB, so the stored strings would stop answering string
+// functions. Same contract as KnownColumnFolds: no I/O, no entry lock, never
+// creates an entry; nil when the anchor is not in memory, and the check is
+// then not made. A field with any other type (including the bottom type a
+// conflicting merge records) is absent: no opinion.
+func (r *Registry) KnownTextBinaryColumns(database, measurement string) map[string]bool {
+	if !r.Enabled() {
+		return nil
+	}
+	r.mu.RLock()
+	e := r.entries[key(database, measurement)]
+	r.mu.RUnlock()
+	if e == nil {
+		return nil
+	}
+	if m := e.textBinary.Load(); m != nil {
+		return *m
+	}
+	return nil
+}
+
+// publishFolds republishes e.folds and e.textBinary for e.schema. Caller
+// holds e.mu.
 func (e *entry) publishFolds() {
 	if e.foldsFor == e.schema {
 		return
@@ -656,8 +684,19 @@ func (e *entry) publishFolds() {
 	e.foldsFor = e.schema
 	if e.schema == nil {
 		e.folds.Store(nil)
+		e.textBinary.Store(nil)
 		return
 	}
+	textBinary := make(map[string]bool)
+	for _, f := range e.schema.Fields() {
+		switch f.Type.ID() {
+		case arrow.STRING, arrow.LARGE_STRING:
+			textBinary[f.Name] = false
+		case arrow.BINARY, arrow.LARGE_BINARY:
+			textBinary[f.Name] = true
+		}
+	}
+	e.textBinary.Store(&textBinary)
 	folds := make(map[string]string, e.schema.NumFields())
 	for _, f := range e.schema.Fields() {
 		// An anchor from before #1342 can hold two spellings; the one listed

@@ -1262,36 +1262,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	}
 	defer rows.Close()
 
-	// Get column names
-	columns, err := rows.Columns()
+	records, err := scanCQRecords(rows)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get columns: %w", err)
-	}
-
-	// Read all results
-	var records []map[string]interface{}
-	for rows.Next() {
-		// Create slice of interface{} to scan into
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return 0, fmt.Errorf("failed to scan row: %w", err)
-		}
-
-		// Convert to map
-		record := make(map[string]interface{})
-		for i, col := range columns {
-			record[col] = values[i]
-		}
-		records = append(records, record)
-	}
-
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("row iteration error: %w", err)
+		return 0, err
 	}
 
 	h.logger.Info().Int("record_count", len(records)).Msg("Aggregation query returned records")
@@ -1730,4 +1703,70 @@ func validateCQQuery(query string) error {
 		return fmt.Errorf("invalid query: %w", err)
 	}
 	return nil
+}
+
+// cqUUIDColumns reports which result columns are UUID. duckdb-go scans UUID,
+// BLOB and GEOMETRY all as []byte, and ingest stores a []byte as a binary
+// column (#440); only the DuckDB type tells them apart.
+func cqUUIDColumns(rows *sql.Rows, n int) []bool {
+	out := make([]bool, n)
+	cts, err := rows.ColumnTypes()
+	if err != nil || len(cts) != n {
+		return out
+	}
+	for i, ct := range cts {
+		out[i] = strings.EqualFold(ct.DatabaseTypeName(), "UUID")
+	}
+	return out
+}
+
+// cqUUIDText writes a UUID as its text, as every other Arc output shows it;
+// BLOB and GEOMETRY (WKB) stay bytes.
+func cqUUIDText(v interface{}) interface{} {
+	if b, ok := v.([]byte); ok && len(b) == 16 {
+		return uuid.UUID(b).String()
+	}
+	return v
+}
+
+// scanCQRecords reads a continuous query's result rows into records keyed
+// by column name. A UUID column is written as its text (#440).
+func scanCQRecords(rows *sql.Rows) ([]map[string]interface{}, error) {
+	// Get column names
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns: %w", err)
+	}
+	uuidCol := cqUUIDColumns(rows, len(columns))
+
+	// Read all results
+	var records []map[string]interface{}
+	for rows.Next() {
+		// Create slice of interface{} to scan into
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		// Convert to map
+		record := make(map[string]interface{})
+		for i, col := range columns {
+			if uuidCol[i] {
+				values[i] = cqUUIDText(values[i])
+			}
+			record[col] = values[i]
+		}
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %w", err)
+	}
+
+	return records, nil
 }
