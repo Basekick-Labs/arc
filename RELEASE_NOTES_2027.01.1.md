@@ -1718,7 +1718,7 @@ the file stays until it is moved to cold storage again under the new
 policy. As a consequence, while cold storage is unreachable, a DELETE that
 touches a daily file answers the retryable 503, even for recent data.
 
-### Compaction leaves alone a partition too wide to compact, instead of failing it every cycle (PRNUM)
+### Compaction leaves alone a partition too wide to compact, instead of failing it every cycle ([#1388](https://github.com/Basekick-Labs/arc/pull/1388))
 
 Compaction sorts a batch's rows by time in one DuckDB job, and a sort holds
 whole rows. On a table of thousands of columns that does not fit the memory a
