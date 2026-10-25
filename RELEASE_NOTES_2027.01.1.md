@@ -1578,6 +1578,15 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Failed flushes report rows without a WAL copy ([#1377](https://github.com/Basekick-Labs/arc/issues/1377))
+
+A failed flush now logs how many rows had no complete WAL copy and increments
+`arc_buffer_records_dropped_total`, so rows lost with the WAL disabled are
+reported rather than incorrectly described as recoverable.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1379](https://github.com/Basekick-Labs/arc/pull/1379).
+
 ### DuckDB no longer caches blocks of deleted files on local storage ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
 
 DuckDB keeps a file cache of blocks from the Parquet files it reads. It frees
