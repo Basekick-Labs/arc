@@ -1736,7 +1736,7 @@ measured 8 minutes per file at 905 columns and 39 minutes per row group at
   thread, half the main memory limit, its own spill directory, smaller row
   groups, sandboxed to the file's own directories. The row order is kept. On
   object storage the file is downloaded first. Measured on DuckDB 1.5.6 with a
-  4 GB limit:
+  4 GB limit on a 14-core machine:
 
   | File | Before | Now |
   |---|---|---|
@@ -1746,7 +1746,7 @@ measured 8 minutes per file at 905 columns and 39 minutes per row group at
 
   Narrower files are rewritten as before. Rewrites of wide files run one at
   a time (they already did), and their output has smaller row groups, so it is
-  larger (1.3–7× at 3,100–10,000 columns) until compaction merges it. If the
+  larger (1.4× at 3,100 columns, 7× at 10,000) until compaction merges it. If the
   private instance cannot be opened, that file's rewrite fails; it does not
   fall back to the main DuckDB. No setting.
 - **A rewritten file keeps Arc's metadata.** Every DELETE rewrite dropped the
