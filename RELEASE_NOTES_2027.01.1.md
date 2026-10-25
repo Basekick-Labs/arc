@@ -1718,7 +1718,7 @@ the file stays until it is moved to cold storage again under the new
 policy. As a consequence, while cold storage is unreachable, a DELETE that
 touches a daily file answers the retryable 503, even for recent data.
 
-### A DELETE rewrites wide files in bounded memory, and keeps Arc's file metadata (PRNUM)
+### A DELETE rewrites wide files in bounded memory, and keeps Arc's file metadata ([#1380](https://github.com/Basekick-Labs/arc/pull/1380))
 
 A row DELETE rewrites each file it removes rows from by copying the rows it
 keeps to a new file. That copy ran on every DuckDB thread, and each thread held
