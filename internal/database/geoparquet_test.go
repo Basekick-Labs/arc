@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -36,17 +37,22 @@ func TestMainEngineReadsGeoParquetAsBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	files := writeGeoParquetPair(t, func(q string) error { _, err := db.db.Exec(q); return err }, root)
 	ctx := context.Background()
 	// Connections held at once, so each is a different one: a session-scoped
-	// SET would leave all but the first with conversion on.
-	q := fmt.Sprintf("SELECT any_value(typeof(geom)), count(DISTINCT geom) FROM read_parquet(['%s','%s'], union_by_name=true)", files[0], files[1])
+	// SET would leave all but the first with conversion on. Each reads files
+	// of its own, so none is answered from another's cached file metadata.
 	for i := 0; i < 4; i++ {
 		conn, err := db.db.Conn(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer conn.Close()
+		dir := filepath.Join(root, fmt.Sprintf("c%d", i))
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		files := writeGeoParquetPair(t, func(q string) error { _, err := conn.ExecContext(ctx, q); return err }, dir)
+		q := fmt.Sprintf("SELECT any_value(typeof(geom)), count(DISTINCT geom) FROM read_parquet(['%s','%s'], union_by_name=true)", files[0], files[1])
 		var typ string
 		var n int
 		if err := conn.QueryRowContext(ctx, q).Scan(&typ, &n); err != nil {
