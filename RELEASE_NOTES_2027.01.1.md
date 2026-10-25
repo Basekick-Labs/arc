@@ -752,8 +752,8 @@ GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
-`storage.backend = "gcs"` stores a standalone node's data in a Google Cloud
-Storage bucket, through GCS's own API rather than its S3 interoperability
+`storage.backend = "gcs"` stores Arc's data in a Google Cloud
+Storage bucket, standalone or as the shared storage of a cluster, through GCS's own API rather than its S3 interoperability
 endpoint, so it authenticates the way Google workloads do: no HMAC keys.
 GCS also serves as the tiered-storage cold tier
 (`tiered_storage.cold.backend = "gcs"`) and as a backup target
@@ -794,11 +794,25 @@ gcs_bucket = "my-arc-data"
   `server.storage_credentials_fail_ready = true`, `/ready` answers 503 with
   `storage_credentials_unavailable` in that state, as it does for `expired`.
 - **Refused at startup** (the bucket checks need `storage.buckets.get`): a
-  bucket with hierarchical namespace or with requester pays; an `http://` `gcs_endpoint`; a node that will run as a
-  licensed cluster node (GCS clusters come later; `cluster.enabled` without a
-  clustering licence runs standalone and is fine), whether GCS is the
-  primary or the cold tier (a GCS backup target is allowed on a cluster);
-  and Iceberg export, which is local-only.
+  bucket with hierarchical namespace or with requester pays; an `http://`
+  `gcs_endpoint`; and Iceberg export, which is local-only.
+- **Clusters.** GCS is the shared storage of a Pattern 2 cluster
+  (`cluster.shared_storage_mode`: every writer writes the bucket, staged
+  compaction commits through the compactor), and the cold tier of a
+  Pattern 1 cluster. Each node resolves its own query token from its own
+  identity. Verified on a 5-node Pattern 2 cluster (3 writers, reader,
+  compactor) and a 4-node Pattern 1 cluster with a GCS cold tier, both on
+  real GCS: ingest on every writer, staged compaction, DELETE across
+  writers with unflushed rows, leader and compactor loss, writer failover
+  with migration continuing on the new primary, reconciliation dry-run.
+  The enterprise Helm chart deploys it with
+  `storage.shared.backend: gcs` and either Workload Identity
+  (`serviceAccount.annotations`) or a service-account key Secret
+  (`storage.shared.gcs.credentialsSecret`).
+- **Rate limits.** GCS allows about one write per second to one object name
+  and ramps a new bucket's request rate up. A rate-limited (429) request now
+  waits at least a second and is retried for about a minute, where other
+  transient errors keep their short schedule.
 - **Warned at startup**, by what the bucket is for. Primary: soft delete
   (on by default for new buckets, 7 days), a retention policy and a default
   storage class other than STANDARD — compaction and retention delete
