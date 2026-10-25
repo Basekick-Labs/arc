@@ -730,6 +730,24 @@ output of a query only where the query itself produced a BLOB, GEOMETRY or
 UUID (a cast, `uuid()`, a spatial function). During a rolling upgrade a
 proxied query is encoded by the node that answers it.
 
+## Upgrade note: GeoParquet columns read as binary ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+Arc's query, compaction and DELETE engines now read a GeoParquet column (one
+a file's `geo` metadata names) as the `BLOB` it is stored as, not as
+`GEOMETRY`. With the engine default, one GeoParquet file in a measurement
+turned that column into `GEOMETRY` for every file read with it; the other
+files' `BLOB` values cannot be cast to it, so every query that read the
+column failed, and so did compaction of the partition, on every cycle.
+
+What changes: a GeoParquet file placed straight into a measurement's storage
+used to read its geometry as `GEOMETRY` (`ST_X(geom)` worked); it now reads as
+`BLOB` like every geometry Arc stores, so use `ST_X(ST_GeomFromWKB(geom))`. A
+file that uses Parquet's own `GEOMETRY` type (written by pyarrow, GDAL, DuckDB's
+GeoParquet V2) still reads as `GEOMETRY` when placed into storage directly;
+import it through the Parquet import API instead, which stores it as binary.
+During a rolling upgrade, a node still on an earlier release reads a
+GeoParquet file placed into storage as `GEOMETRY`, as before.
+
 ## New features
 
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
@@ -1786,6 +1804,33 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+The Parquet import stored every binary column (a BYTE_ARRAY without a string
+annotation) as a string. When the bytes were not text, such as a GeoParquet
+file's WKB geometries, every query that read the column failed with "Invalid
+string encoding". A binary column is now stored as binary when:
+
+- it has Parquet's `GEOMETRY` or `GEOGRAPHY` type, or the file's GeoParquet
+  `geo` metadata names it with WKB encoding (another encoding is refused with
+  422 before anything is written),
+- the file was written by a writer that marks its string columns: Arc itself
+  (ingest and compaction), DuckDB, pyarrow, or any file carrying an Arrow
+  schema, so Arc's own files keep their types when imported into another Arc,
+- the measurement already stores the column as binary, or
+- any of its values in the file is not valid UTF-8.
+
+Otherwise (Spark and Hive write string columns without the annotation) a
+column of text throughout is a string, as before. The whole file is checked
+before anything is written, so an import is never refused part-way for this.
+Two column types that were refused as unsupported now import: `LargeBinary`,
+and Parquet `UUID`, stored as its canonical text as Arc shows a UUID
+everywhere else. A GeoArrow column stored as `large_binary` is still refused.
+
+A column an earlier import already stored as a string holding binary data
+cannot be read. Import the binary values into a new column: writing bytes to
+the existing string column is refused, and the refusal says so.
 
 ### DuckDB no longer caches blocks of deleted files on local storage ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
 

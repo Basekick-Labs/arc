@@ -290,3 +290,12 @@ func TestTypedColumnTypeChangeRefusedBeforeTheWAL(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, entries, "the refused typed write is in the WAL")
 }
+
+// Bytes refused for a string column say how to recover data that is binary
+// stored as text (what Parquet import made of binary columns before
+// 27.01.1); a string refused for a binary column does not.
+func TestColumnTypeChangeMessageNamesTheRecovery(t *testing.T) {
+	require.Contains(t, columnTypeChangeError("m", "geom", false).Error(), "write the binary values to a new column")
+	require.NotContains(t, columnTypeChangeError("m", "geom", true).Error(), "new column")
+	require.True(t, errors.Is(columnTypeChangeError("m", "geom", false), ErrColumnTypeChange))
+}

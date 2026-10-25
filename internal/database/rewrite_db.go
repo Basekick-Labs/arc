@@ -119,6 +119,11 @@ func OpenRewriteDB(ctx context.Context, opts RewriteDBOptions, logger zerolog.Lo
 			return nil, fmt.Errorf("configure rewrite database (%s): %w", s, err)
 		}
 	}
+	// Like the main instance: the file it rewrites reads as BLOB (#440).
+	if err := DisableGeoParquetConversion(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := validateExtensions(opts.Extensions); err != nil {
 		db.Close()
 		return nil, err
