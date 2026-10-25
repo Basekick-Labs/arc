@@ -267,9 +267,10 @@ func (h *DeleteHandler) copySurvivors(ctx context.Context, src, whereClause, dst
 	}
 
 	// From here a failure fails this file's rewrite: the main instance is
-	// the path that runs out of memory. The private instance has none of the
-	// main one's extensions (arcx, httpfs): a WHERE that needs one fails here,
-	// loudly, as it would on the count.
+	// the path that runs out of memory. The private instance loads the
+	// operator's database.extensions but not arcx or httpfs: a WHERE that
+	// needs one of those fails here, loudly, though the count ran on the main
+	// instance, which has them (#440).
 	parent := h.tempDir
 	if parent == "" {
 		parent = filepath.Dir(dst)
@@ -298,6 +299,7 @@ func (h *DeleteHandler) copySurvivors(ctx context.Context, src, whereClause, dst
 		MemoryLimitBytes: limit,
 		SpillDir:         spill,
 		AllowedDirs:      []string{filepath.Dir(local), filepath.Dir(dst), spill},
+		Extensions:       h.db.Extensions(),
 	}, h.logger)
 	if err != nil {
 		return true, err

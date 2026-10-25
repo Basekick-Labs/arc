@@ -73,6 +73,15 @@ func DeniedExtensionFunctions() []string {
 	return out
 }
 
+// Extensions is the DuckDB extensions this engine loaded from
+// database.extensions (#440). Read-only after New.
+func (d *DuckDB) Extensions() []string {
+	if d == nil || d.config == nil {
+		return nil
+	}
+	return d.config.Extensions
+}
+
 // validateExtensions refuses any entry that is not a supported extension's
 // bare name. INSTALL "<entry>" also accepts a local path or a URL, and with
 // arcx configured the engine allows unsigned extensions, so an unchecked
