@@ -699,6 +699,7 @@ func TestIsObjectURL(t *testing.T) {
 		"data/db":                         false,
 		`C:\data\db`:                      false,
 		"C:/data/db":                      false,
+		"C://data/db":                     false,
 		"":                                false,
 		"://bucket/k":                     false,
 		"1s3://bucket/k":                  false,

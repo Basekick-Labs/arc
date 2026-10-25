@@ -190,7 +190,7 @@ func localDirLister(basePath string) dirLister {
 }
 
 // remoteDirLister lists directories of the pruner's object store below
-// basePath (s3:// or azure://), through the same cached parent listings as
+// basePath (any object-store URL), through the same cached parent listings as
 // the existence filter.
 func (p *PartitionPruner) remoteDirLister(basePath string) dirLister {
 	return func(ctx context.Context, rel string) ([]string, error) {

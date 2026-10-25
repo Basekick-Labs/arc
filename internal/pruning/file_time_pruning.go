@@ -177,7 +177,7 @@ func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []stri
 // list with provably-out-of-range files removed. Returns the (possibly
 // modified) path list and whether it was modified; when modified, the result
 // is volatile (never cache it) and the context is marked accordingly.
-// Remote (s3://, azure://) paths are never touched.
+// Object-store URLs (storage.IsObjectURL) are never touched.
 //
 // eligible reports a pass that looked at the live hour's files, whether or
 // not it changed the list. Its result is volatile either way: a declined pass
