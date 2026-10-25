@@ -1364,7 +1364,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		return deleted, nil
 	}
 
-	// For remote backends (S3, Azure), write to a local temp file then upload.
+	// For remote backends (every object store), write to a local temp file then upload.
 	var rewroteDeleted int64
 	var rewrittenPath string
 	var s3Result *s3RewriteResult
@@ -1488,8 +1488,10 @@ func rewritePath(relativePath string) string {
 	return fmt.Sprintf("%s_rewrite_%d.parquet", base, storage.NameTime(time.Now()).UnixNano())
 }
 
-// rewriteS3File handles file rewrite for S3 storage
-// DuckDB can read from S3 directly, then we write to a temp file and upload
+// rewriteS3File rewrites a file on any object store (named for the first one):
+// DuckDB reads the object URL directly, writes the survivors to a local temp
+// file, and the Backend uploads it. So it needs the DuckDB secret for the
+// store's scheme as well as the Backend.
 func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, *s3RewriteResult, error) {
 	// Fail-closed when the handler was constructed without a sandbox-
 	// allowlisted tempDir. Without this guard, os.CreateTemp("", ...) would
@@ -1581,19 +1583,25 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		Int64("rows_after", rowsAfter).
 		Int64("deleted", deleted).
 		Bool("single_thread", singleThread).
-		Msg("Rewrote S3 file")
+		Msg("Rewrote object-store file")
 
 	return deleted, &s3RewriteResult{newPath: newRelativePath, sizeBytes: sizeBytes, sha256: sha256hex}, nil
 }
 
 // isRemoteBackend returns true if the storage backend requires a remote rewrite
-// (download to local temp file, then re-upload). Covers S3 and Azure Blob.
+// (download to local temp file, then re-upload): every backend that is not
+// local, by Type().
+//
+// It used to list *S3Backend and *AzureBlobBackend, and any other backend fell
+// through to rewriteLocalFile, which treats the object URL as a directory
+// path: filepath.Dir("gs://b/k") is the relative "gs:/b", MkdirAll creates it,
+// the surviving rows land on this node's disk, and the original object is then
+// deleted from the bucket. A data-loss path for the next backend, not a
+// refusal (#1105). The remote rewrite (rewriteS3File) is not S3-specific: DuckDB
+// reads the object URL over its secret for that scheme, and the Backend
+// uploads the result, so it is right for any object store DuckDB can read.
 func (h *DeleteHandler) isRemoteBackend() bool {
-	switch h.storage.(type) {
-	case *storage.S3Backend, *storage.AzureBlobBackend:
-		return true
-	}
-	return false
+	return h.storage != nil && h.storage.Type() != "local"
 }
 
 func (h *DeleteHandler) recordRewriteTiering(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult) error {

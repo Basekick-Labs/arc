@@ -108,6 +108,37 @@ func backendRoot(backend Backend) string {
 	}
 }
 
+// IsObjectURL reports whether path is an object-store URL ("s3://bucket/...",
+// "azure://container/...", "gs://bucket/...") rather than a local filesystem
+// path: any "<scheme>://" prefix of two or more characters, not a list of
+// known schemes. ("file:///..." is one too; only Iceberg export builds those,
+// and it does not ask this.)
+//
+// It is deliberately scheme-agnostic. The read paths that ask it (partition
+// pruning, open-end discovery, tier pruning) used to test for "s3://" and
+// "azure://" by name, so a path in any other scheme took the LOCAL branch:
+// filepath.Join folded "gs://b" into "gs:/b", filepath.Glob matched nothing,
+// and an existing partition read as absent, which is an empty answer with
+// success:true (#1105). Their remote branches list through the Backend, which
+// works for any object store, so the safe default for an unrecognised scheme
+// is remote. A local path never contains "://", and a one-letter scheme is a
+// Windows drive ("C://data" as easily as "C:\data"), so it is not one.
+func IsObjectURL(path string) bool {
+	i := strings.Index(path, "://")
+	if i < 2 {
+		return false
+	}
+	for j, c := range path[:i] {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case j > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // ObjectURI returns the fully-qualified location of key for engines that read
 // the object store DIRECTLY rather than through Backend: DuckDB's read_parquet
 // over httpfs, and iceberg-go's FileIO.

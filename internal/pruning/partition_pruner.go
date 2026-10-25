@@ -366,7 +366,7 @@ type PartitionPruner struct {
 	stats          PrunerStats
 	globCache      *globCache
 	partitionCache *partitionCache
-	storage        storage.Backend // Optional storage backend for S3/Azure path validation
+	storage        storage.Backend // Optional storage backend for object-store path validation
 
 	// File-level time pruning (see file_time_pruning.go). nowFn is
 	// injectable for tests; production always uses time.Now.
@@ -474,7 +474,7 @@ func NewPartitionPruner(logger zerolog.Logger) *PartitionPruner {
 	}
 }
 
-// SetStorageBackend sets the storage backend for remote path validation (S3/Azure).
+// SetStorageBackend sets the storage backend for remote (object-store) path validation.
 // When set, the pruner will filter out non-existent partition paths before returning them.
 func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
 	p.storage = backend
@@ -542,9 +542,10 @@ func (p *PartitionPruner) GeneratePartitionPaths(ctx context.Context, basePath, 
 		return nil
 	}
 
-	// Detect if this is a remote path (S3/Azure) - use string concatenation instead of filepath.Join
-	// because filepath.Join will mangle URLs like s3://bucket to s3:/bucket
-	isRemote := strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://")
+	// Detect a remote path (any object-store URL, storage.IsObjectURL) - use
+	// string concatenation instead of filepath.Join, because filepath.Join
+	// mangles URLs like s3://bucket to s3:/bucket
+	isRemote := storage.IsObjectURL(basePath)
 
 	// Generate hour-by-hour paths
 	current := timeRange.Start.Truncate(time.Hour)
@@ -723,7 +724,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	var newestGlob string
 	if timeRange.EndAssumed {
 		var lister dirLister
-		if strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://") {
+		if storage.IsObjectURL(basePath) {
 			lister = p.remoteDirLister(basePath)
 		} else {
 			lister = localDirLister(basePath)
@@ -746,7 +747,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		}
 	}
 
-	// Filter out non-existent paths (works for both local and S3/Azure storage)
+	// Filter out non-existent paths (works for both local and object storage)
 	generated := partitionPaths
 	existing, verified, hits := p.filterExistingPathsOpts(ctx, partitionPaths, basePath, 0)
 	partitionPaths = existing
@@ -856,7 +857,7 @@ func parseDateTime(timeStr string) (time.Time, error) {
 
 // filterExistingPaths filters out paths that don't have any matching files
 // Uses a TTL cache to avoid repeated expensive filesystem operations
-// Handles both local and remote (S3/Azure) paths
+// Handles both local and remote (object-store) paths
 func (p *PartitionPruner) filterExistingPaths(paths []string, basePath string) []string {
 	existing, _, _ := p.filterExistingPathsOpts(context.Background(), paths, basePath, 0)
 	return existing
@@ -872,9 +873,9 @@ func (p *PartitionPruner) filterExistingPathsOpts(ctx context.Context, paths []s
 		return paths, true, 0
 	}
 
-	// Check if this is remote storage (S3/Azure)
+	// Remote storage: any object-store URL (storage.IsObjectURL)
 	firstPath := paths[0]
-	if strings.HasPrefix(firstPath, "s3://") || strings.HasPrefix(firstPath, "azure://") {
+	if storage.IsObjectURL(firstPath) {
 		return p.filterExistingRemotePathsOpts(ctx, paths, basePath, maxAge)
 	}
 
@@ -936,7 +937,7 @@ func (p *PartitionPruner) filterExistingLocalPathsOpts(paths []string, maxAge ti
 	return existingPaths, true, hits
 }
 
-// filterExistingRemotePaths filters S3/Azure paths by checking which directories exist.
+// filterExistingRemotePaths filters object-store paths by checking which directories exist.
 //
 // basePath is the storage root the paths were generated against
 // ("s3://bucket/prefix"), and is what turns a full URL back into the
@@ -1154,7 +1155,7 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 	return existingPaths, verified, hits
 }
 
-// extractStoragePrefix converts a full S3/Azure URL into the backend-relative
+// extractStoragePrefix converts a full object-store URL into the backend-relative
 // prefix a listing call needs, given the storage root those URLs were built
 // against.
 //
