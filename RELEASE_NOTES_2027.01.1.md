@@ -725,15 +725,22 @@ extension is available.
   run used to fail); a BLOB or GEOMETRY output column is written as binary.
 - **A column cannot change between string and binary.** A write that sends
   bytes to a column stored as a string, or a string to a column stored as
-  binary, is refused with HTTP 400 and nothing of it is written. DuckDB reads
+  binary, is refused with HTTP 400 and nothing of the request is written (an
+  import already part-way through answers as a partial import, naming what
+  it wrote, as for any other failure). DuckDB reads
   a column that is a string in some files and binary in others as binary, so
   one such write would turn every stored string of that column into bytes for
   every query. The check uses the field schema Arc keeps per measurement
-  (`query.stable_schema`, on by default) and is best-effort: it is not made
-  with `query.stable_schema = false`, on a writer that has not yet flushed or
-  queried the measurement since it started, or between two writers changing
-  the same column at the same time. A change that gets through leaves the
-  column mixed, and its string rows read back as binary.
+  (`query.stable_schema`, on by default) and knows a column once a file
+  holding it has been flushed or the measurement queried on that node. So it
+  is best-effort: it is not made with `query.stable_schema = false`, for a
+  column whose first values are still in the buffer (up to
+  `ingest.max_buffer_age_ms` after it first appears), on a writer that has
+  not flushed or queried the measurement since it started, for a
+  measurement whose schema was evicted from memory (more than 10,000
+  measurements in use), or between two writers changing the same column at
+  the same time. A change that gets through leaves the column mixed for
+  good, and its string rows read back as binary.
 - Parquet import is unchanged: a BYTE_ARRAY column without a string
   annotation is still imported as a string, as Spark and Hive write string
   columns that way.

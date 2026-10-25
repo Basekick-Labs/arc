@@ -787,6 +787,13 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 				)
 			}
 
+			// Sized once, as the string path is.
+			size := 0
+			for _, v := range binaryCol {
+				size += len(v)
+			}
+			builder.Reserve(len(binaryCol))
+			builder.ReserveData(size)
 			builder.AppendValues(binaryCol, colValidity)
 			arrays[i] = builder.NewArray()
 
