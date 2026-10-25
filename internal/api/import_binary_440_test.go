@@ -117,6 +117,9 @@ func TestParquetImportGeoParquetPointAtOriginIsBinary(t *testing.T) {
 	ci := newChunkedImport(t, 1000)
 	data := duckdbParquet(t, "SELECT TIMESTAMP '2026-10-25 10:00:00' AS time, from_hex('010100000000000000000000000000000000000000') AS geom",
 		`'geo': '{"version":"1.1.0","primary_column":"geom","columns":{"geom":{"encoding":"WKB","geometry_types":[]}}}'`)
+	// A writer Arc does not know (same length, the footer stays valid): the
+	// "geo" metadata alone decides.
+	data = bytes.Replace(data, []byte("DuckDB version"), []byte("GDALxx version"), 1)
 	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=places", data)
 	require.Equal(t, http.StatusOK, status, body)
 	_, types := ci.storedColumn(t, "geom")
@@ -236,7 +239,9 @@ func TestParquetImportOfAnArrowSchemaFileKeepsBinary(t *testing.T) {
 			rec := b.NewRecord()
 			defer rec.Release()
 			var out bytes.Buffer
-			w, err := pqarrow.NewFileWriter(sc, &out, nil, pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()))
+			// A writer Arc does not know: the Arrow schema alone decides.
+			props := parquet.NewWriterProperties(parquet.WithCreatedBy("parquet-mr version 1.13.1 (build abc)"))
+			w, err := pqarrow.NewFileWriter(sc, &out, props, pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()))
 			require.NoError(t, err)
 			require.NoError(t, w.Write(rec))
 			require.NoError(t, w.Close())
