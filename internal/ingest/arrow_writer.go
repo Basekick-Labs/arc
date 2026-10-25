@@ -1657,6 +1657,11 @@ func estimateTypedColumnBatchBytes(batch *TypedColumnBatch) int64 {
 			for _, value := range values {
 				total += int64(len(value))
 			}
+		case [][]byte:
+			total += int64(len(values)) * int64(unsafe.Sizeof([]byte(nil)))
+			for _, value := range values {
+				total += int64(len(value))
+			}
 		case []interface{}:
 			total += int64(len(values)) * int64(unsafe.Sizeof(interface{}(nil)))
 			for _, value := range values {
@@ -3729,6 +3734,8 @@ func encodeTypedWALRows(database, measurement string, batch *TypedColumnBatch, n
 			return i < len(arr)
 		case []decimal128.Num:
 			return i < len(arr)
+		case [][]byte:
+			return i < len(arr)
 		}
 		return false
 	}
@@ -3766,6 +3773,15 @@ func encodeTypedWALRows(database, measurement string, batch *TypedColumnBatch, n
 				err = enc.EncodeString(arr[i])
 			case []bool:
 				err = enc.EncodeBool(arr[i])
+			case [][]byte:
+				// msgpack bin, which recovery decodes back to []byte. A
+				// present value is never NULL: EncodeBytes(nil) would write
+				// nil, so an empty value is written as a zero-length bin.
+				if arr[i] == nil {
+					err = enc.EncodeBytesLen(0)
+				} else {
+					err = enc.EncodeBytes(arr[i])
+				}
 			case []decimal128.Num:
 				// WAL stores decimals as float64 (lossy but WAL is recovery-only)
 				f, _ := arr[i].ToBigFloat(c.scale).Float64()
