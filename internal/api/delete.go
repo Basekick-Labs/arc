@@ -317,6 +317,7 @@ func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.
 	if tempDir == "" {
 		componentLogger.Warn().Msg("NewDeleteHandler called with empty tempDir — DELETE on S3 backends will fail under the DuckDB sandbox; cmd/arc/main.go should pass the sandbox-allowlisted upload directory")
 	}
+	removeRewriteScratch(tempDir, componentLogger)
 	return &DeleteHandler{
 		db:          db,
 		storage:     storage,
@@ -1427,7 +1428,6 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 
 // rewriteLocalFile handles file rewrite for local storage by publishing a fresh immutable path
 func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, string, error) {
-	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
 	newRelativePath := rewritePath(relativePath)
 	newFilePath := filepath.Join(filepath.Dir(filePath), filepath.Base(newRelativePath))
@@ -1442,21 +1442,11 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 
 	tempFile := filepath.Join(tempDir, filepath.Base(newRelativePath)+".new")
 
-	// Write filtered data to temp file using DuckDB COPY. Run with
-	// preserve_insertion_order forced on so the rewritten file keeps the
-	// source's row order (typically time-sorted) even when the
-	// database-wide setting is false.
-	copyQuery := fmt.Sprintf(`
-		COPY (
-			SELECT * FROM %s WHERE NOT COALESCE((%s), false)
-		) TO %s (
-			FORMAT PARQUET,
-			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE %d
-		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(filePath)), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
-
-	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
+	// Write the surviving rows to the temp file in the source's row order
+	// (typically time-sorted), with Arc's parquet metadata; a file too wide
+	// for the main DuckDB is rewritten single-threaded (delete_rewrite_wide.go).
+	singleThread, err := h.copySurvivors(ctx, filePath, whereClause, tempFile, nil)
+	if err != nil {
 		os.Remove(tempFile)
 		return 0, "", fmt.Errorf("failed to write filtered data: %w", err)
 	}
@@ -1476,6 +1466,7 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 		Int64("rows_before", rowsBefore).
 		Int64("rows_after", rowsAfter).
 		Int64("deleted", deleted).
+		Bool("single_thread", singleThread).
 		Msg("Rewrote file")
 
 	return deleted, newRelativePath, nil
@@ -1510,7 +1501,6 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	if h.tempDir == "" {
 		return 0, nil, fmt.Errorf("delete handler is misconfigured: tempDir is empty; the DELETE-on-S3 staging directory must be allowlisted in the DuckDB sandbox (see cmd/arc/main.go uploadDir wiring)")
 	}
-	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
 	newRelativePath := rewritePath(relativePath)
 
@@ -1530,21 +1520,23 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	tempFile.Close()
 	defer os.Remove(tempPath)
 
-	// DuckDB reads from S3 and writes to local temp file. Run with
-	// preserve_insertion_order forced on so the rewritten file keeps the
-	// source's row order (typically time-sorted) even when the
-	// database-wide setting is false.
-	copyQuery := fmt.Sprintf(`
-		COPY (
-			SELECT * FROM %s WHERE NOT COALESCE((%s), false)
-		) TO %s (
-			FORMAT PARQUET,
-			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE %d
-		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(s3Path)), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
-
-	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
+	// DuckDB reads from S3 and writes to the local temp file, in the source's
+	// row order and with Arc's parquet metadata. A file too wide for the main
+	// DuckDB is downloaded first and rewritten single-threaded by a private
+	// instance with no remote access (delete_rewrite_wide.go).
+	fetch := func(ctx context.Context, localPath string) error {
+		f, err := os.OpenFile(localPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		if err := h.storage.ReadTo(ctx, relativePath, f); err != nil {
+			f.Close()
+			return err
+		}
+		return f.Close()
+	}
+	singleThread, err := h.copySurvivors(ctx, s3Path, whereClause, tempPath, fetch)
+	if err != nil {
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
 	}
 
@@ -1588,6 +1580,7 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		Int64("rows_before", rowsBefore).
 		Int64("rows_after", rowsAfter).
 		Int64("deleted", deleted).
+		Bool("single_thread", singleThread).
 		Msg("Rewrote S3 file")
 
 	return deleted, &s3RewriteResult{newPath: newRelativePath, sizeBytes: sizeBytes, sha256: sha256hex}, nil
