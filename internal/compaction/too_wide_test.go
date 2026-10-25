@@ -361,3 +361,60 @@ func TestTooWideMarkOnAKillExpires(t *testing.T) {
 		t.Fatal("an out-of-memory mark expired")
 	}
 }
+
+func TestSplitterDoesNotMarkAnAttemptThatHadLessThanNineTenthsOfTheBudget(t *testing.T) {
+	m, _, cleanup := setupTestManager(t)
+	defer cleanup()
+	m.CycleTimeout = 200 * time.Millisecond
+	m.attemptForTest = func(ctx context.Context, _ Candidate) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	// Cut off after ~120 ms: more than half the budget, less than 9/10.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	files := []string{"a", "b"}
+	if err := m.compactFilesAdaptively(ctx, wideCandidate(files...), files, 0, "", 1); tooWideReason(err) != "" {
+		t.Fatalf("marked after %v of %v: %v", 120*time.Millisecond, m.CycleTimeout, err)
+	}
+}
+
+func TestCompactionRetriesARememberedPartitionWhenMaxConcurrentChanges(t *testing.T) {
+	files := []string{"a.parquet", "b.parquet"}
+	m, attempts := wideManager(t, &files, func(Candidate) error { return errMemory() })
+	wideCycle(t, m)
+	m.MaxConcurrent = 2 // with an explicit memory_limit, still a different job sizing
+	if rec := wideCycle(t, m); rec.SkippedTooWide != 0 || attempts.Load() != 2 {
+		t.Fatalf("a max_concurrent change did not retry: %+v", rec)
+	}
+}
+
+// A full-scope cycle forgets a partition it did not discover, unless a spoke
+// namespace could not be listed (its partitions were not looked at).
+func TestFullCyclePrunesTheMemoOnlyWhenDiscoveryWasComplete(t *testing.T) {
+	for _, expanderFails := range []bool{false, true} {
+		t.Run(fmt.Sprint("expander fails ", expanderFails), func(t *testing.T) {
+			m, backend, cleanup := setupTestManager(t)
+			defer cleanup()
+			m.ManifestManager = nil
+			if err := backend.Write(context.Background(), "db/wide/2026/10/25/09/x.parquet", []byte("PAR1")); err != nil {
+				t.Fatal(err)
+			}
+			m.Tiers = []Tier{wideTier{candidates: func() []Candidate { return nil }}}
+			m.SetNamespaceExpander(func(context.Context) (map[string]struct{}, error) {
+				if expanderFails {
+					return nil, errors.New("lookup failed")
+				}
+				return nil, nil
+			})
+			m.tooWide.strike("hourly", "spoke/wide/2026/10/25/09", []string{"a"}, "memory_error", m.TooWideSettings())
+			if _, err := m.RunCompactionCycle(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			kept := len(m.TooWidePartitions()) == 1
+			if kept != expanderFails {
+				t.Fatalf("entry kept %v with the expander failing %v", kept, expanderFails)
+			}
+		})
+	}
+}
