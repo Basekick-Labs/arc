@@ -1329,8 +1329,10 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 
 	// Invalidate caches outside the lock — the callback performs IO (DuckDB Exec)
 	// and should not block stat reads or other concurrent compaction goroutines.
-	// The subprocess deleted old parquet files from storage, but DuckDB's
-	// cache_httpfs and parquet_metadata_cache still reference them.
+	// The subprocess deleted old parquet files from storage, but cache_httpfs
+	// and Arc's file-list caches still name them. (DuckDB's Parquet metadata
+	// cache keeps their footers until memory_limit evicts them; nothing frees
+	// it, #1372.)
 	// Edge sync compacted-output observer (issue #610): record the output
 	// in the sync ledger before anything can discover it as a new file.
 	// A staged job's output is not in place and its inputs are not consumed

@@ -1633,8 +1633,8 @@ func (h *RetentionHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
 }
 
-// clearCachesAfterRun clears DuckDB's parquet cache and, unless the run was
-// a dry run (it removed nothing), the query caches.
+// clearCachesAfterRun clears DuckDB's cache_httpfs cache (ClearHTTPCache) and,
+// unless the run was a dry run (it removed nothing), the query caches.
 func (h *RetentionHandler) clearCachesAfterRun(dryRun bool) {
 	h.duckdb.ClearHTTPCache()
 	if !dryRun && h.onFilesRemoved != nil {

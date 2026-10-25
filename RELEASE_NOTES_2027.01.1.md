@@ -1578,6 +1578,50 @@ an unbounded operation.
 
 ## Bug fixes
 
+### DuckDB no longer caches blocks of deleted files on local storage ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
+
+DuckDB keeps a file cache of blocks from the Parquet files it reads. It frees
+that cache only when it reaches its memory limit, which defaults to 80% of RAM
+or of the container. Compaction deletes and replaces files all day, so on a
+busy node most of the cache belonged to files that no longer existed, and the
+process kept growing.
+
+On a node whose data is all on local disk, Arc now turns that cache off. The
+operating system's page cache already holds the same blocks. Measured on the
+same workload (ingest, compaction every minute, continuous queries):
+
+- **macOS, 73 minutes:** 1.6 GB physical footprint before, 760 MB after.
+- **Linux (EC2 c7i.xlarge), 80 minutes:** 1.6 GB resident before, 785 MB
+  after. Neither process gave any of it back over the next 8 idle hours, so
+  the old figure is not a peak but where a node stays.
+
+Turning it off did not slow queries:
+
+- **macOS:** compacted and small-file queries within ±2%, warm and hot.
+- **Linux (EC2 c7i.xlarge):** compacted-data queries within ±2%, and
+  small-file queries 5–7% faster.
+- **8 concurrent clients:** the same throughput on both platforms.
+
+A node that may read S3 or Azure, as primary storage or as a cold tier, keeps
+the cache: there it is the cache for remote reads.
+
+`database.external_file_cache` (`ARC_DATABASE_EXTERNAL_FILE_CACHE`) controls
+it:
+
+- `"auto"`, the default, applies the rule above.
+- `"true"` turns the cache on everywhere.
+- `"false"` turns it off everywhere, including on a node that reads S3 or
+  Azure.
+
+Arc logs the value in effect at startup ("DuckDB file cache"), and
+`/api/v1/debug/duckdb-memory` reports it as `external_file_cache`.
+
+**DuckDB's Parquet metadata cache still grows.** It also keeps entries for
+deleted files, and DuckDB offers no way to empty it. It is smaller (220–285 MB
+after the same runs) and is freed under memory pressure, so it stays
+within DuckDB's memory limit. The step Arc ran after every compaction, DELETE
+and retention pass to "reset" it freed nothing, and has been removed.
+
 ### Rebuilding cold metadata no longer restarts every tier lookup ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
 
 When a node rebuilds its cold tier metadata — after a restored or lost

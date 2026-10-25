@@ -103,6 +103,14 @@ type DatabaseConfig struct {
 	// pre-26.09.1 behavior where un-ordered SELECTs return rows in
 	// file/insertion order.
 	PreserveInsertionOrder bool
+	// ExternalFileCache controls DuckDB's file cache
+	// (enable_external_file_cache), which keeps blocks of every file DuckDB
+	// has read, including files compaction has since deleted, until
+	// memory_limit forces them out (#1372). "auto" (the default) turns it off
+	// on a node whose data is all on local disk, where the OS page cache
+	// already holds those blocks, and keeps it on a node that may read S3 or
+	// Azure, where it is the remote read cache. "true" and "false" force it.
+	ExternalFileCache string
 }
 
 type StorageConfig struct {
@@ -1055,6 +1063,7 @@ func Load() (*Config, error) {
 			TempDirectory:          v.GetString("database.temp_directory"),
 			ArcxExtensionPath:      v.GetString("database.arcx_extension_path"),
 			PreserveInsertionOrder: v.GetBool("database.preserve_insertion_order"),
+			ExternalFileCache:      strings.ToLower(strings.TrimSpace(v.GetString("database.external_file_cache"))),
 		},
 		Storage: StorageConfig{
 			// Normalize once at load so the backend switch, the DuckDB
@@ -1390,6 +1399,11 @@ func Load() (*Config, error) {
 
 	if err := validateDuckDBMemoryLimit("database.memory_limit", cfg.Database.MemoryLimit); err != nil {
 		return nil, err
+	}
+	switch cfg.Database.ExternalFileCache {
+	case "auto", "true", "false":
+	default:
+		return nil, fmt.Errorf("database.external_file_cache must be auto, true or false, got %q", cfg.Database.ExternalFileCache)
 	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
@@ -1857,6 +1871,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.temp_directory", "./.tmp")        // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
 	v.SetDefault("database.arcx_extension_path", "")         // Enterprise-only; gated by licenseClient.CanUseArcx()
 	v.SetDefault("database.preserve_insertion_order", false) // false = SQL-standard unordered results; ORDER BY queries unaffected
+	v.SetDefault("database.external_file_cache", "auto")     // auto = off when all data is local, on when S3/Azure may be read (#1372)
 
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")

@@ -248,69 +248,47 @@ func TestSandboxScopingConstraints(t *testing.T) {
 	})
 }
 
-// TestLockConfigurationStillBlocksCacheInvalidation pins the reason
-// lock_configuration is not enabled in lockdownExternalAccess: it would block
-// the parquet_metadata_cache toggle that ClearHTTPCache performs after every
-// delete, compaction and retention pass, and 1.5.5 offers no lock-immune
-// substitute. If this test fails, the trade-off recorded in the design note has
-// changed and lock_configuration becomes cheap hardening worth adopting.
-func TestLockConfigurationStillBlocksCacheInvalidation(t *testing.T) {
+// TestLockConfigurationStillBlocksRuntimeSettings pins the reason
+// lock_configuration is not enabled in lockdownExternalAccess: Arc changes
+// settings after the lockdown, and lock_configuration refuses SESSION changes
+// too. Among them (also SET custom_profiling_settings and arcx.storage_root):
+//   - Ordered queries run with SET SESSION preserve_insertion_order=true and
+//     RESET it after (ForcePreserveInsertionOrder, internal/database/duckdb.go).
+//   - A DELETE's counting reads run with SET SESSION
+//     parquet_metadata_cache=false (countConn, internal/api/delete_window.go).
+//
+// Until #1372 the reason was the parquet_metadata_cache false/true toggle in
+// ClearHTTPCache, which was removed because it freed nothing. If this test
+// fails, lock_configuration no longer conflicts with these paths and becomes
+// cheap hardening worth adopting
+// (docs/progress/2026-09-12-duckdb-sandbox-scoping.md).
+func TestLockConfigurationStillBlocksRuntimeSettings(t *testing.T) {
 	db := openRawDuckDB(t)
+	// One connection, so every statement below runs on the session that holds
+	// the lock's view.
+	db.SetMaxOpenConns(1)
 
-	// Match Arc: configureDatabase sets parquet_metadata_cache=true
-	// (internal/database/duckdb.go). A raw instance defaults to false, and
-	// starting from false hides a regression in the disable direction, which is
-	// the direction ClearHTTPCache actually needs for invalidation.
+	// Match Arc: configureDatabase sets parquet_metadata_cache=true, so the
+	// SESSION false below is a real change, not a no-op.
 	if _, err := db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
 		t.Fatalf("seed parquet_metadata_cache: %v", err)
 	}
-
 	if _, err := db.Exec("SET GLOBAL lock_configuration = true"); err != nil {
 		t.Fatalf("lock_configuration is unavailable (%v); the design note assumes it exists", err)
 	}
 
-	// The exact pair ClearHTTPCache issues.
 	for _, stmt := range []string{
-		"SET GLOBAL parquet_metadata_cache=false",
-		"SET GLOBAL parquet_metadata_cache=true",
+		"SET SESSION preserve_insertion_order=true",
+		"RESET SESSION preserve_insertion_order",
+		"SET SESSION parquet_metadata_cache=false",
 	} {
 		if _, err := db.Exec(stmt); err == nil {
-			t.Errorf("%q succeeded under lock_configuration; lock_configuration no longer "+
-				"conflicts with ClearHTTPCache, so revisit enabling it in lockdownExternalAccess "+
+			t.Errorf("%q succeeded under lock_configuration; it no longer conflicts with Arc's "+
+				"per-connection settings, so revisit enabling it in lockdownExternalAccess "+
 				"(docs/progress/2026-09-12-duckdb-sandbox-scoping.md)", stmt)
 		} else if !strings.Contains(err.Error(), "locked") {
 			t.Errorf("%q failed for an unexpected reason: %v", stmt, err)
 		}
-	}
-
-	// The object-cache pragmas survive the lock but are inert, so they are not
-	// a substitute. Pinned because "use the pragma instead" is the obvious
-	// wrong fix for someone revisiting this.
-	// Sample BETWEEN the two pragmas, not just around the pair. Running both and
-	// comparing only the endpoints cannot see a wired disable_object_cache that
-	// a following enable_object_cache puts back, and disable is the half that
-	// would matter.
-	before := currentSetting(t, db, "parquet_metadata_cache")
-	if _, err := db.Exec("PRAGMA disable_object_cache"); err != nil {
-		t.Fatalf("PRAGMA disable_object_cache failed: %v", err)
-	}
-	mid := currentSetting(t, db, "parquet_metadata_cache")
-	if _, err := db.Exec("PRAGMA enable_object_cache"); err != nil {
-		t.Fatalf("PRAGMA enable_object_cache failed: %v", err)
-	}
-	after := currentSetting(t, db, "parquet_metadata_cache")
-
-	const pragmaNowWorks = "object-cache pragmas now move parquet_metadata_cache under " +
-		"lock_configuration, so they may be the lock-immune substitute for the ClearHTTPCache " +
-		"toggle that 1.5.5 lacked; revisit enabling lock_configuration " +
-		"(docs/progress/2026-09-12-duckdb-sandbox-scoping.md)"
-	if mid != before {
-		t.Errorf("PRAGMA disable_object_cache changed parquet_metadata_cache (%s -> %s): %s",
-			before, mid, pragmaNowWorks)
-	}
-	if after != before {
-		t.Errorf("PRAGMA enable_object_cache changed parquet_metadata_cache (%s -> %s): %s",
-			mid, after, pragmaNowWorks)
 	}
 }
 
@@ -402,13 +380,4 @@ func TestNoLocalScopeSettingAffectsFileAccess(t *testing.T) {
 				"setting is now a post-lockdown write primitive: %s", outside, err, reopen641)
 		}
 	})
-}
-
-func currentSetting(t *testing.T, db *sql.DB, name string) string {
-	t.Helper()
-	var v string
-	if err := db.QueryRow(fmt.Sprintf("SELECT current_setting('%s')", escapeSQLString(name))).Scan(&v); err != nil {
-		t.Fatalf("read setting %s: %v", name, err)
-	}
-	return v
 }

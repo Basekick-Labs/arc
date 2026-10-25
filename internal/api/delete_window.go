@@ -329,9 +329,10 @@ func countInChunks[T any](ctx context.Context, n int, name func(int) string, cou
 
 // countConn is a connection for a DELETE's counting queries with DuckDB's
 // Parquet metadata cache off. Arc turns that cache on for the whole database
-// (internal/database/duckdb.go), so every footer a count read stayed in memory until the
-// DELETE ended: on wide files the footers are most of the cost, and a DELETE
-// over many files held them all however small its chunks (measured: 1,416
+// (internal/database/duckdb.go), and nothing empties it short of memory_limit
+// pressure (#1372), so every footer a count read stayed in memory: on wide files
+// the footers are most of the cost, and a DELETE over many files held them all
+// however small its chunks (measured: 1,416
 // files of 1,000 columns, +1.8 GB with the cache, +0.4 GB without). The
 // release discards the connection rather than handing it back with the
 // override (RESET reads DuckDB's default, false, not Arc's), so the pool

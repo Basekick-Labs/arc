@@ -50,6 +50,13 @@ enable_wal = true
 # un-ordered SELECTs return rows in file/insertion order.
 # preserve_insertion_order = false
 
+# DuckDB's file cache keeps blocks of every file it reads, including files
+# compaction has since deleted, until memory_limit forces them out. "auto"
+# turns it off when all data is on local disk (the OS page cache already holds
+# those blocks) and keeps it on when S3 or Azure may be read (primary storage
+# or a cold tier), where it is the remote read cache. "true" or "false" forces it.
+# external_file_cache = "auto"
+
 # -----------------------------------------------------------------------------
 # Storage
 # -----------------------------------------------------------------------------

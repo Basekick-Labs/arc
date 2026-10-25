@@ -501,6 +501,7 @@ func main() {
 		EnableS3Cache:     cfg.Query.EnableS3Cache,
 		S3CacheSize:       cfg.Query.S3CacheSize,
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
+		ExternalFileCache: cfg.Database.ExternalFileCache,
 		// arcx loader (cleared above when license does not permit)
 		ArcxExtensionPath: arcxPath,
 		// arcx storage root for the partition_agg table function. Only set

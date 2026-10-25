@@ -1450,3 +1450,51 @@ func TestFileTimePruningDefaultsOn(t *testing.T) {
 		t.Error("arc.toml file_time_pruning = false: Query.FileTimePruning = true, want false")
 	}
 }
+
+// database.external_file_cache defaults to auto, takes true/false (any case,
+// surrounding space) from the environment, and refuses anything else (#1372).
+func TestExternalFileCacheKey(t *testing.T) {
+	t.Setenv("ARC_DATABASE_EXTERNAL_FILE_CACHE", "")
+	os.Unsetenv("ARC_DATABASE_EXTERNAL_FILE_CACHE")
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Database.ExternalFileCache != "auto" {
+		t.Fatalf("default database.external_file_cache = %q, want auto", cfg.Database.ExternalFileCache)
+	}
+	for env, want := range map[string]string{"false": "false", " TRUE ": "true", "Auto": "auto"} {
+		t.Setenv("ARC_DATABASE_EXTERNAL_FILE_CACHE", env)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("ARC_DATABASE_EXTERNAL_FILE_CACHE=%q: Load() error = %v", env, err)
+		}
+		if cfg.Database.ExternalFileCache != want {
+			t.Errorf("ARC_DATABASE_EXTERNAL_FILE_CACHE=%q: got %q, want %q", env, cfg.Database.ExternalFileCache, want)
+		}
+	}
+	for _, bad := range []string{"off", "yes", "0"} {
+		t.Setenv("ARC_DATABASE_EXTERNAL_FILE_CACHE", bad)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "database.external_file_cache") {
+			t.Errorf("ARC_DATABASE_EXTERNAL_FILE_CACHE=%q: Load() error = %v, want a database.external_file_cache error", bad, err)
+		}
+	}
+	os.Unsetenv("ARC_DATABASE_EXTERNAL_FILE_CACHE")
+	if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte("[database]\nexternal_file_cache = \"false\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with arc.toml error = %v", err)
+	}
+	if cfg.Database.ExternalFileCache != "false" {
+		t.Errorf("arc.toml external_file_cache = \"false\": got %q", cfg.Database.ExternalFileCache)
+	}
+}
