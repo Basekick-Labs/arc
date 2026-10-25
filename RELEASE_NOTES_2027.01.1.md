@@ -1588,9 +1588,14 @@ process kept growing.
 
 On a node whose data is all on local disk, Arc now turns that cache off. The
 operating system's page cache already holds the same blocks. Measured on the
-same workload (ingest, compaction every minute, continuous queries, 73
-minutes), main grew to 1.6 GB physical footprint and this release to 760 MB,
-with no file cache at all. Turning it off did not slow queries:
+same workload (ingest, compaction every minute, continuous queries):
+
+- **macOS, 73 minutes:** 1.6 GB physical footprint before, 760 MB after.
+- **Linux (EC2 c7i.xlarge), 80 minutes:** 1.6 GB resident before, 785 MB
+  after. Neither process gave any of it back over the next 8 idle hours, so
+  the old figure is not a peak but where a node stays.
+
+Turning it off did not slow queries:
 
 - **macOS:** compacted and small-file queries within ±2%, warm and hot.
 - **Linux (EC2 c7i.xlarge):** compacted-data queries within ±2%, and
@@ -1612,8 +1617,8 @@ Arc logs the value in effect at startup ("DuckDB file cache"), and
 `/api/v1/debug/duckdb-memory` reports it as `external_file_cache`.
 
 **DuckDB's Parquet metadata cache still grows.** It also keeps entries for
-deleted files, and DuckDB offers no way to empty it. It is smaller (about 220 MB
-after the same 73 minutes) and is freed under memory pressure, so it stays
+deleted files, and DuckDB offers no way to empty it. It is smaller (220–285 MB
+after the same runs) and is freed under memory pressure, so it stays
 within DuckDB's memory limit. The step Arc ran after every compaction, DELETE
 and retention pass to "reset" it freed nothing, and has been removed.
 
