@@ -471,6 +471,7 @@ type Config struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	Extensions     []string
 	// PreserveInsertionOrder maps to DuckDB's preserve_insertion_order.
 	// false allows DuckDB to reorder results of queries without an ORDER BY,
 	// enabling faster parallel scans/aggregations. Explicit ORDER BY clauses
@@ -839,6 +840,36 @@ func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
+// loadConfiguredExtensions installs and loads operator-selected DuckDB
+// extensions before lockdownExternalAccess disables future INSTALL/LOAD.
+// DuckDB registers extensions per database, so one load covers the pool.
+// Every name is checked against supportedExtensions before the first INSTALL
+// (#440).
+func loadConfiguredExtensions(db *sql.DB, extensions []string, logger zerolog.Logger) error {
+	if err := validateExtensions(extensions); err != nil {
+		// The entry is a log field: the error sanitizer blanks quoted
+		// strings, which would hide which one in the startup error.
+		bad, _ := unsupportedExtension(extensions)
+		logger.Error().Str("extension", bad).Strs("supported", SupportedExtensionNames()).Msg("database.extensions names an unsupported DuckDB extension")
+		return err
+	}
+	for _, name := range extensions {
+		quotedName := quoteDuckDBIdent(name)
+		if _, err := db.Exec("INSTALL " + quotedName); err != nil {
+			// The extension is a log field: the error sanitizer blanks
+			// quoted strings, which would hide the name in the error.
+			logger.Error().Str("extension", name).Err(err).Msg("DuckDB extension install failed")
+			return fmt.Errorf("install DuckDB extension %q: %w", name, err)
+		}
+		if _, err := db.Exec("LOAD " + quotedName); err != nil {
+			logger.Error().Str("extension", name).Err(err).Msg("DuckDB extension load failed")
+			return fmt.Errorf("load DuckDB extension %q: %w", name, err)
+		}
+		logger.Info().Str("extension", name).Msg("DuckDB extension loaded")
+	}
+	return nil
+}
+
 // ForcePreserveInsertionOrder forces preserve_insertion_order=true for the
 // session of the pinned connection, so statements that rebuild parquet files
 // (DELETE rewrites, sort-keys-less compaction) keep the source's row order
@@ -1027,6 +1058,10 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		if err := ensureAzureLoaded(db, logger); err != nil {
 			return fmt.Errorf("failed to load azure extension for cold-tier Azure: %w", err)
 		}
+	}
+
+	if err := loadConfiguredExtensions(db, cfg.Extensions, logger); err != nil {
+		return fmt.Errorf("failed to load configured DuckDB extensions: %w", err)
 	}
 
 	// Load the proprietary arcx extension once for the whole pool. Extension

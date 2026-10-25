@@ -297,7 +297,7 @@ var dangerousKeywordPattern = regexp.MustCompile(`(?i)\b(DROP|DELETE|INSERT|UPDA
 // Matches the function NAME anywhere in the clause, not anchored to a FROM/JOIN
 // position — these can sit in any scalar expression. Kept as a separate pattern
 // from the keyword list so the error message can name the offending function.
-var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
+var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
 	"read_parquet", "parquet_scan", "read_csv", "read_csv_auto",
 	"read_json", "read_json_auto", "read_ndjson", "read_ndjson_auto",
 	"read_text", "read_blob", "read_xlsx", "glob",
@@ -305,7 +305,7 @@ var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]s
 	"parquet_kv_metadata", "parquet_bloom_probe",
 	"delta_scan", "iceberg_scan", "iceberg_metadata", "iceberg_snapshots",
 	"arc_partition_agg",
-}, "|") + `)\s*\(`)
+}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
 
 // NewDeleteHandler creates a new delete handler. tempDir MUST be the same
 // path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
@@ -980,6 +980,9 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		}
 	}
 	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
+	if unicodeEscapePattern.MatchString(maskedWhere) {
+		return false, fmt.Errorf(`WHERE clause contains a unicode-escaped identifier or string (U&"...")`)
+	}
 	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
 	}

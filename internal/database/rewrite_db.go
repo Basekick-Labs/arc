@@ -64,6 +64,10 @@ type RewriteDBOptions struct {
 	// AllowedDirs are the only directories the private instance can read or
 	// write once locked down: the source file's, the output's and SpillDir.
 	AllowedDirs []string
+	// Extensions are loaded, never installed, before the lockdown: the
+	// main instance's database.extensions (#440), so a WHERE that uses one
+	// runs on both instances. The main instance installed them.
+	Extensions []string
 }
 
 // OpenRewriteDB opens a private, single-threaded, sandboxed DuckDB for one
@@ -76,8 +80,9 @@ type RewriteDBOptions struct {
 // therefore runs the process out of memory. The only lever is the thread
 // count, which DuckDB sets per instance, never per session.
 //
-// The instance has no extensions, no secrets and no remote access: the caller
-// brings the source to local disk. The user's WHERE clause runs in it, so the
+// The instance has no secrets and no remote access: the caller brings the
+// source to local disk. Of the main instance's extensions it loads only the
+// operator's database.extensions (not arcx, not httpfs). The user's WHERE clause runs in it, so the
 // same lockdown as the main instance applies, with a narrower allowlist.
 func OpenRewriteDB(ctx context.Context, opts RewriteDBOptions, logger zerolog.Logger) (*sql.DB, error) {
 	if opts.SpillDir == "" || len(opts.AllowedDirs) == 0 {
@@ -112,6 +117,18 @@ func OpenRewriteDB(ctx context.Context, opts RewriteDBOptions, logger zerolog.Lo
 		if _, err := db.ExecContext(ctx, s); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("configure rewrite database (%s): %w", s, err)
+		}
+	}
+	if err := validateExtensions(opts.Extensions); err != nil {
+		db.Close()
+		return nil, err
+	}
+	for _, name := range opts.Extensions {
+		if _, err := db.ExecContext(ctx, "LOAD "+quoteDuckDBIdent(name)); err != nil {
+			db.Close()
+			// Every wide-file DELETE fails while this does, whether or not
+			// its WHERE uses the extension: it fails closed.
+			return nil, fmt.Errorf("load DuckDB extension %q (database.extensions) in the single-thread rewrite database; wide-file DELETEs fail until it loads: %w", name, err)
 		}
 	}
 	// lockdownDirs logs the allowlist at Info, which reads like a database

@@ -30,6 +30,12 @@ type wideRig struct {
 // path; nil leaves the real gate.
 func newWideRig(t *testing.T, single *bool) *wideRig {
 	t.Helper()
+	return newWideRigWith(t, single, nil)
+}
+
+// newWideRigWith is newWideRig with database.extensions set.
+func newWideRigWith(t *testing.T, single *bool, extensions []string) *wideRig {
+	t.Helper()
 	root := t.TempDir()
 	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
 	if err != nil {
@@ -37,7 +43,7 @@ func newWideRig(t *testing.T, single *bool) *wideRig {
 	}
 	t.Cleanup(func() { _ = backend.Close() })
 	tempDir := t.TempDir()
-	db, err := database.New(&database.Config{MemoryLimit: "512MB", ThreadCount: 2, MaxConnections: 2, LocalStorageRoot: root, UploadDir: tempDir}, zerolog.Nop())
+	db, err := database.New(&database.Config{MemoryLimit: "512MB", ThreadCount: 2, MaxConnections: 2, LocalStorageRoot: root, UploadDir: tempDir, Extensions: extensions}, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +159,42 @@ func TestDeleteRewriteOfAWideFileRunsOnASingleThreadInstance(t *testing.T) {
 	left, _ := filepath.Glob(filepath.Join(r.tempDir, rewriteScratchPrefix+"*"))
 	if len(left) != 0 {
 		t.Fatalf("scratch directories left behind: %v", left)
+	}
+}
+
+// A DELETE whose WHERE uses an extension's function runs on the private
+// instance too: it loads the operator's database.extensions (#440).
+func TestDeleteRewriteOfAWideFileWithAnExtensionFunction(t *testing.T) {
+	requireSpatialCached(t)
+	single := true
+	r := newWideRigWith(t, &single, []string{"spatial"})
+	const rows = 20000
+	full := r.file(rows, 40)
+	// Selects host b exactly, through a spatial function: ST_X(ST_Point(x, 0)) = x.
+	_, rel, err := r.h.rewriteLocalFile(context.Background(), full, wideKey, "ST_X(ST_Point(CASE WHEN host = 'b' THEN 1 ELSE 0 END, 0)) = 1", rows, rows/2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.opened != 1 {
+		t.Fatalf("private rewrite instances opened: %d, want 1", r.opened)
+	}
+	assertRewritten(t, r, filepath.Join(r.root, rel), rows)
+}
+
+// requireSpatialCached skips unless DuckDB's spatial extension is in the
+// local cache; with ARC_TEST_EXTENSIONS=1 (CI, which seeds it) it fails.
+func requireSpatialCached(t *testing.T) {
+	t.Helper()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("LOAD spatial"); err != nil {
+		if os.Getenv("ARC_TEST_EXTENSIONS") == "1" {
+			t.Fatalf("spatial is not in the DuckDB extension cache (CI seeds it): %v", err)
+		}
+		t.Skipf("spatial is not in the DuckDB extension cache: %v", err)
 	}
 }
 

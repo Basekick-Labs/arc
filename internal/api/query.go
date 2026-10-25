@@ -2836,6 +2836,9 @@ func ValidateSQLRequest(sql string) error {
 	if dangerousSQLPattern.MatchString(normalised) {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
 	}
+	if unicodeEscapePattern.MatchString(normalised) {
+		return &SQLValidationError{Message: `Unicode-escaped identifiers and strings (U&"...") are not allowed`}
+	}
 
 	// SECURITY: read statements only (read_statements.go). The denylist above
 	// refuses the statements it names; this refuses every other statement
@@ -3137,6 +3140,14 @@ func isBareIdentifier(name string) bool {
 	return true
 }
 
+// unicodeEscapePattern matches a U&"..." identifier or U&'...' string in
+// literal-masked SQL (the masker leaves the U& prefix outside its
+// placeholder). Its escapes spell a name the denylists cannot see:
+// U&"\0073t_read" is st_read. The DuckDB release Arc pins does not execute
+// them, so refusing them outright costs nothing and keeps a parser upgrade
+// from opening the I/O denylist (#440).
+var unicodeEscapePattern = regexp.MustCompile(`(?i)\bu&__(?:STR|IDENT)_\d+__`)
+
 // ioTableFunctionPattern matches a call to any DuckDB function that reads from
 // the filesystem (or an attached storage scanner), by name, in any position of
 // the masked/comment-stripped SQL. This is an intentionally comprehensive
@@ -3146,10 +3157,12 @@ func isBareIdentifier(name string) bool {
 // bare identifier. Anchored matching (`\b`) avoids matching these as a
 // substring of a longer identifier.
 //
-// Maintenance: when DuckDB adds a new path-taking table function (or Arc loads
-// an extension that exposes one), add it here. TestIOTableFunctionPattern_Family
-// documents the set we verified against the pinned DuckDB release.
-var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
+// Maintenance: when DuckDB adds a new path-taking table function, add it here.
+// TestIOTableFunctionPattern_Family documents the set we verified against the
+// pinned DuckDB release. An extension's functions are not listed here: they
+// come from database.DeniedExtensionFunctions, and an extension is loadable
+// only once its function surface is reviewed there (#440).
+var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
 	"read_parquet",
 	"parquet_scan",
 	"parquet_metadata",
@@ -3176,7 +3189,9 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]strin
 	"iceberg_metadata",
 	"iceberg_snapshots",
 	"arc_partition_agg",
-}, "|") + `)\s*\(`)
+	// The file readers of the DuckDB extensions database.extensions may load
+	// (#440), denied whether or not this node loads them.
+}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
 
 // dynamicSQLFunctionPattern matches DuckDB table functions that evaluate a
 // string as SQL (or resolve a string to a relation). They are the I/O

@@ -184,6 +184,12 @@ func (h *DeleteHandler) RewriteForRecords(ctx context.Context, relativePath stri
 				bound = append(bound, w)
 			}
 		case errors.As(err, &de) && de.Type == duckdb.ErrorTypeBinder:
+		case errors.As(err, &de) && de.Type == duckdb.ErrorTypeCatalog:
+			// The node that ran the DELETE had a function this one does not:
+			// a DuckDB extension in its database.extensions that is not in
+			// this node's (#440). The record cannot be applied here, and the
+			// file cannot be registered without it, so it waits; say why.
+			return cluster.DeleteRewriteResult{}, fmt.Errorf("a DELETE record uses a function this node does not have; set database.extensions as on the node that ran the DELETE, and restart: %w", err)
 		default:
 			return cluster.DeleteRewriteResult{}, fmt.Errorf("count rows matching a DELETE record: %w", err)
 		}
