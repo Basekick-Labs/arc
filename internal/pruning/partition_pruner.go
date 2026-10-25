@@ -542,9 +542,10 @@ func (p *PartitionPruner) GeneratePartitionPaths(ctx context.Context, basePath, 
 		return nil
 	}
 
-	// Detect if this is a remote path (S3/Azure) - use string concatenation instead of filepath.Join
-	// because filepath.Join will mangle URLs like s3://bucket to s3:/bucket
-	isRemote := strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://")
+	// Detect a remote path (any object-store URL, storage.IsObjectURL) - use
+	// string concatenation instead of filepath.Join, because filepath.Join
+	// mangles URLs like s3://bucket to s3:/bucket
+	isRemote := storage.IsObjectURL(basePath)
 
 	// Generate hour-by-hour paths
 	current := timeRange.Start.Truncate(time.Hour)
@@ -723,7 +724,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	var newestGlob string
 	if timeRange.EndAssumed {
 		var lister dirLister
-		if strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://") {
+		if storage.IsObjectURL(basePath) {
 			lister = p.remoteDirLister(basePath)
 		} else {
 			lister = localDirLister(basePath)
@@ -872,9 +873,9 @@ func (p *PartitionPruner) filterExistingPathsOpts(ctx context.Context, paths []s
 		return paths, true, 0
 	}
 
-	// Check if this is remote storage (S3/Azure)
+	// Remote storage: any object-store URL (storage.IsObjectURL)
 	firstPath := paths[0]
-	if strings.HasPrefix(firstPath, "s3://") || strings.HasPrefix(firstPath, "azure://") {
+	if storage.IsObjectURL(firstPath) {
 		return p.filterExistingRemotePathsOpts(ctx, paths, basePath, maxAge)
 	}
 

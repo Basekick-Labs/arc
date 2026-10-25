@@ -2725,11 +2725,12 @@ func (h *QueryHandler) plannedFile(path string, remote bool) bool {
 	return !h.missingAnchorPath(path)
 }
 
-// readsObjectStore reports whether this node's queries read S3 or Azure:
-// its primary storage, or a tiering cold tier.
+// readsObjectStore reports whether this node's queries read an object store:
+// its primary storage, or a tiering cold tier. Any non-local primary, by
+// Type() rather than by a list of concrete types, which missed every backend
+// added after it (#1105).
 func (h *QueryHandler) readsObjectStore() bool {
-	switch h.storage.(type) {
-	case *storage.S3Backend, *storage.AzureBlobBackend:
+	if h.storage != nil && h.storage.Type() != "local" {
 		return true
 	}
 	return h.tieringManager != nil

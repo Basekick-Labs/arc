@@ -201,7 +201,7 @@ func (p *PartitionPruner) fileTimePass(ctx context.Context, paths []string, time
 
 	idx := -1
 	for i, pth := range paths {
-		if strings.HasPrefix(pth, "s3://") || strings.HasPrefix(pth, "azure://") {
+		if storage.IsObjectURL(pth) {
 			continue
 		}
 		if strings.HasSuffix(pth, suffix) {

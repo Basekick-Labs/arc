@@ -1587,13 +1587,18 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 }
 
 // isRemoteBackend returns true if the storage backend requires a remote rewrite
-// (download to local temp file, then re-upload). Covers S3 and Azure Blob.
+// (download to local temp file, then re-upload): every backend that is not
+// local, by Type().
+//
+// It used to list *S3Backend and *AzureBlobBackend, and any other backend fell
+// through to rewriteLocalFile, which treats the object URL as a directory
+// path: filepath.Dir("gs://b/k") is the relative "gs:/b", MkdirAll creates it,
+// the surviving rows land on this node's disk, and the original object is then
+// deleted from the bucket. A data-loss path for the next backend, not a
+// refusal (#1105). The remote rewrite only uses Backend methods (StatFile,
+// ReadTo, WriteReader, Delete), so it is right for any object store.
 func (h *DeleteHandler) isRemoteBackend() bool {
-	switch h.storage.(type) {
-	case *storage.S3Backend, *storage.AzureBlobBackend:
-		return true
-	}
-	return false
+	return h.storage != nil && h.storage.Type() != "local"
 }
 
 func (h *DeleteHandler) recordRewriteTiering(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult) error {

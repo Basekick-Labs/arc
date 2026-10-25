@@ -76,7 +76,7 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 	// is not changed.
 	if timeRange.EndAssumed {
 		var lister dirLister
-		if strings.HasPrefix(tierGlob, "s3://") || strings.HasPrefix(tierGlob, "azure://") {
+		if storage.IsObjectURL(tierGlob) {
 			lister = p.tierDirLister(backend, rootURL)
 		} else {
 			lister = localDirLister(basePath)
@@ -92,7 +92,7 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 
 	verified := true
 	generated := paths
-	if strings.HasPrefix(tierGlob, "s3://") || strings.HasPrefix(tierGlob, "azure://") {
+	if storage.IsObjectURL(tierGlob) {
 		paths, verified = p.filterTierRemotePaths(ctx, paths, backend, rootURL)
 	} else {
 		paths = p.filterExistingLocalPaths(paths)

@@ -155,7 +155,7 @@ func discoverOpenEnd(ctx context.Context, list dirLister, database, measurement 
 
 // partGlob is a partition's glob in the format GeneratePartitionPaths uses.
 func partGlob(basePath, database, measurement string, k partKey) string {
-	if strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://") {
+	if storage.IsObjectURL(basePath) {
 		p := basePath + "/" + database + "/" + measurement + "/" + k.year + "/" + k.month + "/" + k.day
 		if k.hour != "" {
 			p += "/" + k.hour

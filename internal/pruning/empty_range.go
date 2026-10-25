@@ -89,7 +89,7 @@ func (p *PartitionPruner) layoutIsStandard(ctx context.Context, basePath, databa
 		return len(cached) == 1 && cached[0] == "standard"
 	}
 	var children []string
-	isRemote := strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://")
+	isRemote := storage.IsObjectURL(basePath)
 	if isRemote {
 		lister, ok := p.storage.(storage.DirectoryLister)
 		if p.storage == nil || !ok {
