@@ -1068,6 +1068,27 @@ s3_endpoint = "https://storage.googleapis.com"
 			mustLoadError(t, "overlaps primary storage")
 		})
 	}
+	// The primary's prefix is part of its destination: a sibling prefix in
+	// the same bucket does not overlap. Dropping the prefix would make the
+	// primary the whole bucket and refuse this.
+	t.Run("a sibling prefix in the same bucket is allowed", func(t *testing.T) {
+		writeArcToml(t, `
+[storage]
+backend = "gcs"
+gcs_bucket = "acme"
+gcs_prefix = "inst/a"
+[backup]
+default_target = "audit"
+[backup.targets.audit]
+type = "s3"
+s3_bucket = "acme"
+s3_prefix = "inst/b"
+s3_endpoint = "https://storage.googleapis.com"
+`)
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() = %v", err)
+		}
+	})
 	t.Run("another bucket is allowed", func(t *testing.T) {
 		writeArcToml(t, `
 [storage]
