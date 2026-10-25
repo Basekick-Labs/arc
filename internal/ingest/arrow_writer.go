@@ -781,7 +781,7 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 
 			binaryCol, ok := col.([][]byte)
 			if !ok {
-				return nil, fmt.Errorf(
+				return nil, nil, fmt.Errorf(
 					"column %s: expected [][]byte, got %T",
 					field.Name, col,
 				)
