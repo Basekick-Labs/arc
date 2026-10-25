@@ -1753,8 +1753,8 @@ measured 8 minutes per file at 905 columns and 39 minutes per row group at
   905 columns, 8,192 at 3,100, 2,048 at 10,000), so it is larger (1.35× at
   3,100 columns, 7× at 10,000) and its footer is bigger, which costs reads: a
   one-second query on a rewritten 3,100-column file took 240 ms and 330 MB
-  instead of 30 ms and 50 MB on the original (17 MB larger row groups would
-  have halved that, but went past the memory limit). A second DELETE on such
+  instead of 30 ms and 50 MB on the original (16,384-row groups would have
+  halved that again, but went past the memory limit). A second DELETE on such
   a file goes to the private instance again. The private
   instance's memory limit is on top of the main one's, not part of it: with the
   default limit (80% of the machine) the two together can exceed the machine
