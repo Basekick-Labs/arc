@@ -83,6 +83,21 @@ func TestColumnTypeChangeRefusesTheWholeBatch(t *testing.T) {
 	err := r.buf.Write(ctx, "d", batch)
 	require.True(t, errors.Is(err, ErrColumnTypeChange), "err = %v", err)
 	require.Empty(t, r.files(t), "a refused batch wrote some of its records")
+
+	// Row records are grouped per measurement and written one measurement at
+	// a time, so without the pre-check the good measurement would be written.
+	rows := []interface{}{
+		&models.Record{Measurement: "good", Timestamp: ts440, Fields: map[string]interface{}{"v": 1.0}},
+		&models.Record{Measurement: "bad", Timestamp: ts440, Fields: map[string]interface{}{"name": []byte{1}}},
+	}
+	err = r.buf.Write(ctx, "d", rows)
+	require.True(t, errors.Is(err, ErrColumnTypeChange), "rows: err = %v", err)
+	require.Empty(t, r.files(t), "a refused row batch wrote some of its records")
+	r.buf.SetFieldSchema(textBinaryRegistrar{"d/bad": {"tagged": true}})
+	err = r.buf.Write(ctx, "d", []interface{}{rows[0],
+		&models.Record{Measurement: "bad", Timestamp: ts440, Fields: map[string]interface{}{"v": 1.0}, Tags: map[string]string{"tagged": "x"}}})
+	require.True(t, errors.Is(err, ErrColumnTypeChange), "string tag into a binary column: err = %v", err)
+	require.Empty(t, r.files(t))
 }
 
 // A refused write never reaches the WAL, so a crash before the purge does not
