@@ -195,18 +195,22 @@ an answer cannot reveal which columns that measurement already has.
 With `tiered_storage.enabled` and `tiered_storage.cold.enabled`, Arc now
 refuses to start when the cold tier is the same location as primary
 storage, or one is inside the other (the same bucket with equal or nested
-prefixes), for every backend. Such a node was losing data: at the same
-location a file and its cold copy have one key, so migration copied the
-file onto itself and then deleted it; nested, the hot tier listed the cold
-objects as its own and migrated them again. The check used to run only as
-part of the backup destination check. Move the cold tier to another bucket
-or to a prefix that is not a parent or child of the primary's.
+prefixes), for every backend. This is a new check; nothing compared the two
+before. At the same location a file and its cold copy have one key, so
+migration copied the file onto itself and then deleted it: data loss.
+Nested, each tier's listing took in the other's objects and registered
+them as files of a database that does not exist. Move the cold tier to
+another bucket or to a prefix that is not a parent or child of the
+primary's.
 
 ## Upgrade note: a query that needs an unavailable cold tier answers 503 ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
 When the cold tier is enabled but its backend failed to start (a bad
 endpoint or credentials file, for any backend), a query whose time range
-reaches cold-tier files now answers HTTP 503 naming the cold tier. It used
+reaches cold-tier files that this node's tier metadata records now answers
+HTTP 503 naming the cold tier. A node whose tier metadata holds no cold
+rows (a fresh or rebuilt one, which cannot rebuild them while the cold tier
+is down) still answers from the hot tier alone. It used
 to leave the cold files out and answer with the hot rows alone, as a
 success. Queries that need no cold data are served as before, and the
 failed cold tier is absent from `/health` (it was reported from a secret
@@ -797,12 +801,13 @@ gcs_bucket = "my-arc-data"
   `https://storage.googleapis.com`; a Private Service Connect endpoint has
   not been tested yet. An emulator that serves only the JSON API cannot
   serve queries.
-- **Cold tier.** Files migrate from any primary (local, S3, Azure or GCS)
-  to GCS, and from a GCS primary to any cold tier. The cold tier has its
+- **Cold tier.** Files migrate to a GCS cold tier from any primary, and a
+  GCS primary takes a cold tier of any backend (verified with local → GCS
+  and GCS → GCS; the other pairs use the same generic migration path). The cold tier has its
   own query secret and identity; `/health` reports it under `"cold"`, and a
   cold tier whose credentials never resolved is `unavailable`, which drains
-  `/ready` with `storage_credentials_fail_ready` (an S3 cold tier in the
-  same state reports `fallback` and stays ready). With no credentials at
+  `/ready` when `server.storage_credentials_fail_ready` is on (an S3 cold
+  tier in the same state reports `fallback` and stays ready). With no credentials at
   boot the cold tier still starts and its reads fail until they resolve, as
   for S3 and Azure.
 - **Backup target.** Every #1085 behaviour applies: per-database routing,
