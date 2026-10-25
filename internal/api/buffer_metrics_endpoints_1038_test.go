@@ -36,4 +36,7 @@ func TestEndpointMetricsBufferIncludesQueuedAndInflight(t *testing.T) {
 	if body.Buffer["records_queued"] != float64(1234) || body.Buffer["records_inflight"] != float64(567) {
 		t.Fatalf("buffer = %v, want records_queued 1234 and records_inflight 567", body.Buffer)
 	}
+	if _, ok := body.Buffer["records_dropped_total"].(float64); !ok {
+		t.Fatalf("buffer records_dropped_total = %v, want numeric counter", body.Buffer["records_dropped_total"])
+	}
 }

@@ -188,6 +188,7 @@ func TestTimeSeriesCollector_CollectedMetrics(t *testing.T) {
 			"buffer_oldest_unflushed_ms",
 			"buffer_flushes_total",
 			"buffer_flush_failures_total",
+			"buffer_records_dropped_total",
 			"storage_writes_total",
 			"storage_write_bytes_total",
 			"storage_reads_total",

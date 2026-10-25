@@ -968,6 +968,7 @@ func groupCoverage(g *flushGroup, files int) *GroupCoverage {
 func (b *ArrowBuffer) commitCoverageLocked(cs *coverageState, covered bool, prep *wal.PreparedAppend, shard *bufferShard, key string, batch *TypedColumnBatch, replay []CoveragePiece) error {
 	if replay != nil {
 		batch.Coverage = replay
+		batch.hasWALCopy = true
 		return nil
 	}
 	if !covered {
@@ -982,6 +983,7 @@ func (b *ArrowBuffer) commitCoverageLocked(cs *coverageState, covered bool, prep
 		batch.WALHashes = tokens
 		piece.replayable = err == nil
 	}
+	batch.hasWALCopy = prep != nil && err == nil
 	batch.Coverage = []CoveragePiece{piece}
 	return err
 }
