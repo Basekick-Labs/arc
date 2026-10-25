@@ -30,6 +30,10 @@ type gcsStub struct {
 	missing, forbidden bool
 	hns                bool
 	softDeleteSeconds  int
+	requesterPays      bool
+	retentionSeconds   int
+	retentionLocked    bool
+	storageClass       string
 	// objects are the full (prefixed) object names in the bucket.
 	objects []string
 	// deleteStatus answers DELETE for a full name; absent means 204.
@@ -79,6 +83,15 @@ func (s *gcsStub) handler(t *testing.T) http.HandlerFunc {
 			}
 			if s.softDeleteSeconds > 0 {
 				attrs["softDeletePolicy"] = map[string]any{"retentionDurationSeconds": strconv.Itoa(s.softDeleteSeconds)}
+			}
+			if s.requesterPays {
+				attrs["billing"] = map[string]any{"requesterPays": true}
+			}
+			if s.retentionSeconds > 0 {
+				attrs["retentionPolicy"] = map[string]any{"retentionPeriod": strconv.Itoa(s.retentionSeconds), "isLocked": s.retentionLocked}
+			}
+			if s.storageClass != "" {
+				attrs["storageClass"] = s.storageClass
 			}
 			_ = json.NewEncoder(w).Encode(attrs)
 		case rest == "o" && r.Method == http.MethodGet: // list
@@ -185,7 +198,7 @@ func stubGCSBackend(t *testing.T, s *gcsStub, prefix string, logger zerolog.Logg
 	t.Helper()
 	srv := httptest.NewServer(s.handler(t))
 	t.Cleanup(srv.Close)
-	// The bare server URL, no "/storage/v1/": gcsEndpointURL has to supply it,
+	// The bare server URL, no "/storage/v1/": GCSEndpointURL has to supply it,
 	// as it does for an operator's endpoint.
 	b, err := newGCSBackend(&GCSConfig{Bucket: "bkt", Prefix: prefix, Endpoint: srv.URL}, logger,
 		option.WithoutAuthentication())
@@ -211,6 +224,21 @@ func TestGCSStartupProbe(t *testing.T) {
 			t.Fatalf("no soft-delete warning in %s", logs.String())
 		}
 	})
+	t.Run("requester pays is refused", func(t *testing.T) {
+		b, err := stubGCSBackend(t, &gcsStub{requesterPays: true}, "", zerolog.Nop())
+		if err == nil || !strings.Contains(err.Error(), "requester pays") {
+			t.Fatalf("requester-pays bucket: backend %v, err %v", b, err)
+		}
+	})
+	t.Run("a STANDARD bucket logs no warning", func(t *testing.T) {
+		var logs bytes.Buffer
+		if _, err := stubGCSBackend(t, &gcsStub{storageClass: "STANDARD"}, "", zerolog.New(&logs)); err != nil {
+			t.Fatalf("refused: %v", err)
+		}
+		if strings.Contains(logs.String(), `"level":"warn"`) {
+			t.Fatalf("unexpected warning: %s", logs.String())
+		}
+	})
 	for _, c := range []struct {
 		name string
 		stub *gcsStub
@@ -218,6 +246,9 @@ func TestGCSStartupProbe(t *testing.T) {
 	}{
 		{"missing bucket is a warning", &gcsStub{missing: true}, "does not exist"},
 		{"forbidden bucket metadata is a warning", &gcsStub{forbidden: true}, "NOT checked"},
+		{"retention policy is a warning", &gcsStub{retentionSeconds: 86400}, "has a retention policy"},
+		{"locked retention policy is a louder warning", &gcsStub{retentionSeconds: 86400, retentionLocked: true}, "LOCKED retention policy"},
+		{"non-STANDARD class is a warning", &gcsStub{storageClass: "NEARLINE"}, `"storage_class":"NEARLINE"`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var logs bytes.Buffer
@@ -465,13 +496,13 @@ func TestGCSEndpointURL(t *testing.T) {
 		"http://localhost:4443":                        "http://localhost:4443/storage/v1/",
 		" https://storage.googleapis.com/storage/v1/ ": "https://storage.googleapis.com/storage/v1/",
 	} {
-		if got, err := gcsEndpointURL(in); err != nil || got != want {
-			t.Errorf("gcsEndpointURL(%q) = %q, %v; want %q", in, got, err, want)
+		if got, err := GCSEndpointURL(in); err != nil || got != want {
+			t.Errorf("GCSEndpointURL(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
 	for _, bad := range []string{"https://h/%zz/", "ftp://h", "https://", "https://h/?x=1"} {
-		if got, err := gcsEndpointURL(bad); err == nil {
-			t.Errorf("gcsEndpointURL(%q) = %q, want an error", bad, got)
+		if got, err := GCSEndpointURL(bad); err == nil {
+			t.Errorf("GCSEndpointURL(%q) = %q, want an error", bad, got)
 		}
 		if b, err := newGCSBackend(&GCSConfig{Bucket: "b", Endpoint: bad}, zerolog.Nop(), option.WithoutAuthentication()); err == nil || b != nil {
 			t.Errorf("newGCSBackend with endpoint %q = %v, %v; want a refusal, not a backend", bad, b, err)
@@ -533,5 +564,23 @@ func TestGCSCopyFollowsTheRewriteToken(t *testing.T) {
 	}
 	if err := b2.CopyObject(context.Background(), "a/src.parquet", "a/dst.parquet", 3, "sha"); err == nil || s2.rewrites != 1 {
 		t.Fatalf("CopyObject without a token: %v after %d calls, want an error after 1", err, s2.rewrites)
+	}
+}
+
+// The compaction subprocess builds its backend with SkipProbe: no bucket
+// metadata read, so a requester-pays refusal (already applied by the parent)
+// cannot fire and no billed request is added per job.
+func TestGCSSkipProbeReadsNoBucketMetadata(t *testing.T) {
+	s := &gcsStub{requesterPays: true}
+	srv := httptest.NewServer(s.handler(t))
+	t.Cleanup(srv.Close)
+	b, err := newGCSBackend(&GCSConfig{Bucket: "bkt", Endpoint: srv.URL, SkipProbe: true}, zerolog.Nop(),
+		option.WithoutAuthentication())
+	if err != nil {
+		t.Fatalf("SkipProbe backend: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if s.bucketReads != 0 {
+		t.Fatalf("SkipProbe read bucket metadata %d times", s.bucketReads)
 	}
 }

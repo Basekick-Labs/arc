@@ -401,14 +401,21 @@ func (s *Server) readinessProblem() *notReady {
 	}
 	// Opt-in (#603): drain this node while storage credentials are expired.
 	// Checked after the ready flag — this can only remove readiness. Only
-	// "expired" qualifies; see SetStorageStatus.
+	// "expired" and "unavailable" qualify: in both no query can read the tier.
+	// "unavailable" is a tier with no fallback secret whose credentials were
+	// never resolved (GCS, #1105); "fallback" still has DuckDB's own chain.
 	if s.storageCredsFailReady && s.storageStatus != nil {
 		st := s.storageStatus()
 		// Deterministic order so incident logs are stable when both tiers are
 		// expired.
 		for _, tier := range []string{"hot", "cold"} {
-			if ts, ok := st[tier]; ok && ts.State == database.CredStateExpired {
+			ts, ok := st[tier]
+			switch {
+			case !ok:
+			case ts.State == database.CredStateExpired:
 				return &notReady{reason: "storage_credentials_expired", tier: tier}
+			case ts.State == database.CredStateUnavailable:
+				return &notReady{reason: "storage_credentials_unavailable", tier: tier}
 			}
 		}
 	}

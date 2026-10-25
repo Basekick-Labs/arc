@@ -1877,7 +1877,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.temp_directory", "./.tmp")        // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
 	v.SetDefault("database.arcx_extension_path", "")         // Enterprise-only; gated by licenseClient.CanUseArcx()
 	v.SetDefault("database.preserve_insertion_order", false) // false = SQL-standard unordered results; ORDER BY queries unaffected
-	v.SetDefault("database.external_file_cache", "auto")     // auto = off when all data is local, on when S3/Azure may be read (#1372)
+	v.SetDefault("database.external_file_cache", "auto")     // auto = off when all data is local, on when S3/Azure/GCS may be read (#1372)
 
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")

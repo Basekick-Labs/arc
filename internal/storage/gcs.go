@@ -103,8 +103,14 @@ type GCSConfig struct {
 	// Endpoint overrides the JSON API endpoint (Private Service Connect, an
 	// emulator): a host ("https://storage-psc.p.googleapis.com", which gets
 	// the JSON API path) or the full base URL. Empty means Google's default.
-	// See gcsEndpointURL.
+	// See GCSEndpointURL.
 	Endpoint string
+
+	// SkipProbe skips the bucket metadata read at construction. The
+	// compaction subprocess sets it: its parent already ran the probe at
+	// startup, and one Buckets.Get per compaction job would add a billed
+	// request and a failure point to every job for no new information.
+	SkipProbe bool
 }
 
 // NewGCSBackend creates a new Google Cloud Storage backend.
@@ -112,7 +118,11 @@ type GCSConfig struct {
 // It probes the bucket's metadata once. A bucket with hierarchical namespace
 // is refused: listing and deletes behave differently there (folders are
 // resources of their own, and deleting the last object leaves them behind),
-// and Arc has not been verified against them. A missing bucket, or a principal
+// and Arc has not been verified against them. So is a requester-pays bucket,
+// which DuckDB's query reads cannot bill. A retention policy, a default
+// storage class other than STANDARD and soft delete are warnings: each makes
+// compaction's continuous deletes fail or cost more, but none breaks a read.
+// A missing bucket, or a principal
 // that may not read bucket metadata, is a warning rather than a failure, as on
 // Azure: object-only IAM roles are a legitimate deployment, and they cannot
 // read the bucket's attributes.
@@ -140,14 +150,14 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 	var creds *auth.Credentials
 	opts := testOpts
 	if len(opts) == 0 {
-		creds, err = gcsCredentials(cfg)
+		creds, err = GCSCredentials(cfg)
 		if err != nil {
 			return nil, err
 		}
 		opts = []option.ClientOption{option.WithAuthCredentials(creds)}
 	}
 	if cfg.Endpoint != "" {
-		endpoint, err := gcsEndpointURL(cfg.Endpoint)
+		endpoint, err := GCSEndpointURL(cfg.Endpoint)
 		if err != nil {
 			return nil, err
 		}
@@ -187,13 +197,16 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 		logger: log,
 	}
 
+	if cfg.SkipProbe {
+		return b, nil
+	}
 	if err := b.probeBucket(); err != nil {
 		return nil, err
 	}
 	return b, nil
 }
 
-// gcsEndpointURL turns a configured endpoint into the base URL the JSON API
+// GCSEndpointURL turns a configured endpoint into the base URL the JSON API
 // client resolves every call against.
 //
 // The client uses the string as given and resolves "b/{bucket}/o" against it,
@@ -203,7 +216,7 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 // the client cannot parse panicked inside the first call instead of failing
 // construction. So: a scheme is required, a bare host gets the JSON API path,
 // and the result always ends in a separator.
-func gcsEndpointURL(endpoint string) (string, error) {
+func GCSEndpointURL(endpoint string) (string, error) {
 	e := strings.TrimSpace(endpoint)
 	if !strings.Contains(e, "://") {
 		e = "https://" + e
@@ -221,9 +234,11 @@ func gcsEndpointURL(endpoint string) (string, error) {
 	return u.String(), nil
 }
 
-// gcsCredentials resolves the identity cfg names: an explicit service-account
-// key, or Application Default Credentials.
-func gcsCredentials(cfg *GCSConfig) (*auth.Credentials, error) {
+// GCSCredentials resolves the identity cfg names: an explicit service-account
+// key, or Application Default Credentials. The backend and DuckDB's query
+// secret (internal/database) both resolve through it, so the identity that
+// writes the bucket is the identity that reads it.
+func GCSCredentials(cfg *GCSConfig) (*auth.Credentials, error) {
 	opts := &credentials.DetectOptions{Scopes: []string{gcsScope}}
 	key := []byte(cfg.CredentialsJSON)
 	if len(key) == 0 && cfg.CredentialsFile != "" {
@@ -343,7 +358,9 @@ func (b *GCSBackend) probeBucket() error {
 	defer cancel()
 	var attrs *gcs.Bucket
 	err := gcsRetry(ctx, func() (err error) {
-		attrs, err = b.svc.Buckets.Get(b.bucket).Fields("hierarchicalNamespace", "softDeletePolicy").Context(ctx).Do()
+		attrs, err = b.svc.Buckets.Get(b.bucket).
+			Fields("hierarchicalNamespace", "softDeletePolicy", "billing", "retentionPolicy", "storageClass").
+			Context(ctx).Do()
 		return err
 	})
 	switch {
@@ -357,6 +374,26 @@ func (b *GCSBackend) probeBucket() error {
 	}
 	if attrs.HierarchicalNamespace != nil && attrs.HierarchicalNamespace.Enabled {
 		return fmt.Errorf("GCS bucket %q has hierarchical namespace enabled, which Arc does not support; use a bucket without it", b.bucket)
+	}
+	if attrs.Billing != nil && attrs.Billing.RequesterPays {
+		// Every request against a requester-pays bucket must name a project to
+		// bill. DuckDB's query reads cannot (its GCS secret carries a token,
+		// not a billing project), so ingest would work and every query fail.
+		return fmt.Errorf("GCS bucket %q has requester pays enabled, which Arc does not support; disable it or use another bucket", b.bucket)
+	}
+	if rp := attrs.RetentionPolicy; rp != nil && rp.RetentionPeriod > 0 {
+		ev := b.logger.Warn().Str("bucket", b.bucket).
+			Dur("retention", time.Duration(rp.RetentionPeriod)*time.Second).
+			Bool("locked", rp.IsLocked)
+		if rp.IsLocked {
+			ev.Msg("GCS bucket has a LOCKED retention policy: compaction, retention and DELETE cannot remove an object until it is older than the period, and the policy can never be shortened or removed")
+		} else {
+			ev.Msg("GCS bucket has a retention policy: compaction, retention and DELETE cannot remove an object until it is older than the period, so their deletes fail and the old objects stay readable")
+		}
+	}
+	if class := attrs.StorageClass; class != "" && class != "STANDARD" {
+		b.logger.Warn().Str("bucket", b.bucket).Str("storage_class", class).
+			Msg("GCS bucket's default storage class is not STANDARD: compaction rewrites and deletes recent objects all day, which pays that class's minimum storage duration and retrieval fees on every one; use STANDARD for Arc's primary storage")
 	}
 	if attrs.SoftDeletePolicy != nil && attrs.SoftDeletePolicy.RetentionDurationSeconds > 0 {
 		b.logger.Warn().Str("bucket", b.bucket).

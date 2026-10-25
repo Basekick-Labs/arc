@@ -108,6 +108,13 @@ type credentialRefresher struct {
 	// never-succeeded retry loop (see planError).
 	demotionHint string
 
+	// noFallback marks a backend with no fallback secret behind the refresher
+	// (GCS: DuckDB has no credential chain for it). Until the first success
+	// there is NO usable secret, so every query read fails: the never-succeeded
+	// loop is not demoted (planError), keeps the 5-minute cap, and the state is
+	// "unavailable" rather than "fallback" (deriveState).
+	noFallback bool
+
 	// lastExpiry drives the non-advancing check: every successful refresh must
 	// advance the expiry, else the upstream source has not rotated yet.
 	// Core-owned: resolvers never track expiry state.
@@ -137,6 +144,7 @@ type credentialRefresher struct {
 // becomes visible within one probe interval, not one refresh interval.
 type storageCredSnapshot struct {
 	everSucceeded     bool
+	noFallback        bool
 	canExpire         bool
 	consecutiveErrors int
 	lastExpiry        time.Time
@@ -152,6 +160,7 @@ type storageCredSnapshot struct {
 func (r *credentialRefresher) publishStatus(canExpire bool) {
 	r.snap.Store(&storageCredSnapshot{
 		everSucceeded:     r.everSucceeded,
+		noFallback:        r.noFallback,
 		canExpire:         canExpire,
 		consecutiveErrors: r.consecutiveErrors,
 		lastExpiry:        r.lastExpiry,
@@ -170,6 +179,10 @@ const (
 	CredStateExpired  = "expired"
 	CredStateFallback = "fallback"
 	CredStateUnknown  = "unknown"
+	// CredStateUnavailable: a refresher with no fallback secret has never
+	// produced credentials, so no query can read the tier. Distinct from
+	// "fallback", where DuckDB's own credential chain is still serving.
+	CredStateUnavailable = "unavailable"
 )
 
 // deriveState maps a snapshot to a state at time `now`. Pure so the full grid
@@ -177,7 +190,8 @@ const (
 // is unit-testable.
 //
 // Precedence (#603 review F4): fallback (never succeeded — cannot be expired,
-// lastExpiry is only ever set by a successful emit) > non-expiring ok >
+// lastExpiry is only ever set by a successful emit; "unavailable" instead when
+// there is no fallback secret, #1105) > non-expiring ok >
 // expired (EVEN with a concurrent error streak: in the field incident both
 // held at once and expired is the actionable truth) > degraded > ok.
 // Non-advancing rotation-waits stay "ok" deliberately: they occur in the tail
@@ -188,6 +202,8 @@ const (
 // (vs ~10 for S3) — #605 review M3.
 func deriveState(snap *storageCredSnapshot, now time.Time) string {
 	switch {
+	case snap != nil && !snap.everSucceeded && snap.noFallback:
+		return CredStateUnavailable
 	case snap == nil || !snap.everSucceeded:
 		return CredStateFallback
 	case !snap.canExpire:
@@ -231,7 +247,10 @@ func (r *credentialRefresher) status(now time.Time) StorageTierStatus {
 // resolve and BEFORE the retry loop starts — so a caller-emitted fallback
 // secret is structurally guaranteed to land before the loop's first managed
 // emit can replace it (#601 review M1).
-func startCredentialRefresher(resolver credentialResolver, secretName string, logger zerolog.Logger, demotionHint string, onFirstFailure func(error)) *credentialRefresher {
+//
+// noFallback says no fallback secret exists behind this refresher (see the
+// field); onFirstFailure is then typically nil.
+func startCredentialRefresher(resolver credentialResolver, secretName string, logger zerolog.Logger, demotionHint string, noFallback bool, onFirstFailure func(error)) *credentialRefresher {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &credentialRefresher{
 		resolver: resolver,
@@ -241,6 +260,7 @@ func startCredentialRefresher(resolver credentialResolver, secretName string, lo
 		cancel:       cancel,
 		done:         make(chan struct{}),
 		demotionHint: demotionHint,
+		noFallback:   noFallback,
 	}
 
 	fctx, fcancel := context.WithTimeout(ctx, s3FirstResolveTimeout)
@@ -360,13 +380,18 @@ func (r *credentialRefresher) planNonAdvancing() time.Duration {
 // marks the demotion so the state is diagnosable from logs. It never gives
 // up: a host whose metadata service was down at boot is picked up by a later
 // retry.
+//
+// A noFallback refresher (GCS) is never demoted and keeps the 5-minute cap:
+// with no fallback secret, a never-succeeded refresher means every query read
+// of the tier is failing, which is not the healthy-deployment case the
+// demotion exists for.
 func (r *credentialRefresher) planError(err error) time.Duration {
 	r.consecutiveErrors++
 	r.publishStatus(true)
 	n := r.consecutiveErrors
 	backoffCap := s3RefreshBackoffMax
 	ev := r.logger.Error()
-	if !r.everSucceeded {
+	if !r.everSucceeded && !r.noFallback {
 		backoffCap = s3RefreshBackoffMaxUnproven
 		switch {
 		case n == s3RefreshErrorsBeforeDemotion+1:
