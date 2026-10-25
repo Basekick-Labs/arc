@@ -576,7 +576,7 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 		// A C++ abort: DuckDB's std::bad_alloc when stderr says so (the
 		// memory markers below), otherwise an unknown crash.
-		if strings.Contains(errStr, "aborted") && !containsAny(strings.ToLower(errStr)+stderrLower, memoryErrorMarkers) {
+		if strings.Contains(errStr, "aborted") && !containsAny(errLower+stderrLower, memoryErrorMarkers) {
 			return true, "aborted"
 		}
 	}

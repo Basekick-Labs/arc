@@ -216,7 +216,7 @@ func TestTooWideMemoPrunesPartitionsAFullCycleNoLongerSees(t *testing.T) {
 
 func TestTooWideMemoIsSafeWhenNil(t *testing.T) {
 	var m *tooWideMemo
-	if m.skip(wideTier{}, "p", nil, "") || m.strike("hourly", "p", nil, "memory_error", "") || m.memoized() != 0 || m.clearAll("", "") != 0 || m.list() != nil {
+	if m.skip(wideTier{}, "p", nil, "") || m.strike("hourly", "p", nil, "memory_error", "") || m.memoized("") != 0 || m.clearAll("", "") != 0 || m.list() != nil {
 		t.Fatal("nil memo remembered something")
 	}
 	m.clear("hourly", "p")
@@ -301,5 +301,63 @@ func TestClassifyMemoryBeforeSQLErrors(t *testing.T) {
 		if reason != c.reason {
 			t.Errorf("%q / %q: %s, want %s", c.err, c.stderr, reason, c.reason)
 		}
+	}
+}
+
+func TestCompactionDoesNotRememberAnUnclassifiedFailure(t *testing.T) {
+	// A full disk, object-store throttling or an expired credential ends as
+	// "unknown": a healthy partition must not be left uncompacted for it.
+	files := []string{"a.parquet", "b.parquet"}
+	m, _ := wideManager(t, &files, func(Candidate) error {
+		return errors.New("write /data/compaction/x: no space left on device")
+	})
+	for i := 0; i < 3; i++ {
+		wideCycle(t, m)
+	}
+	if e := m.TooWidePartitions(); len(e) != 0 {
+		t.Fatalf("an unclassified failure was remembered: %+v", e)
+	}
+}
+
+func TestCompactionCountsOneStrikePerPartitionPerCycle(t *testing.T) {
+	files := []string{"a.parquet", "b.parquet", "c.parquet", "d.parquet"}
+	m, _ := wideManager(t, &files, func(Candidate) error {
+		return errors.New("subprocess failed: signal: killed")
+	})
+	m.MaxFilesPerBatch = 2 // two batches, both killed
+	wideCycle(t, m)
+	if e := m.TooWidePartitions(); len(e) != 1 || e[0].Strikes != 1 || e[0].Memoized() {
+		t.Fatalf("one cycle of two killed batches: %+v", e)
+	}
+}
+
+func TestCompactionKeepsTheMarkWhenAnotherBatchCompacts(t *testing.T) {
+	files := []string{"a.parquet", "b.parquet", "c.parquet", "d.parquet"}
+	m, _ := wideManager(t, &files, func(c Candidate) error {
+		if c.Files[0] == "a.parquet" {
+			return nil // the first batch compacts
+		}
+		return errMemory()
+	})
+	m.MaxFilesPerBatch = 2
+	wideCycle(t, m)
+	if e := m.TooWidePartitions(); len(e) != 1 || !e[0].Memoized() {
+		t.Fatalf("a compacted sibling batch cleared the mark: %+v", e)
+	}
+}
+
+func TestTooWideMarkOnAKillExpires(t *testing.T) {
+	now := time.Now()
+	killed := TooWideEntry{Reason: "killed", Strikes: 2, Settings: "s", LastFailure: now.Add(-tooWideRetryAfter - time.Minute)}
+	if killed.Skips("s", now) {
+		t.Fatal("a day-old mark on a kill still skips")
+	}
+	killed.LastFailure = now.Add(-time.Hour)
+	if !killed.Skips("s", now) || killed.Skips("other", now) {
+		t.Fatal("a fresh mark on a kill")
+	}
+	oom := TooWideEntry{Reason: "memory_error", Strikes: 1, Settings: "s", LastFailure: now.Add(-30 * 24 * time.Hour)}
+	if !oom.Skips("s", now) {
+		t.Fatal("an out-of-memory mark expired")
 	}
 }

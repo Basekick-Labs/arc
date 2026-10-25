@@ -503,7 +503,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		logger:           logger,
 	}
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
-	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
+	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
 	if len(excludeList) > 0 {
 		m.logger.Info().
@@ -886,22 +886,31 @@ func (m *Manager) notifyConsumedInputs(inputs []string) error {
 // fail-safe: spoke top-level dirs are SKIPPED for this cycle (never
 // compacted unexpanded) and everything else proceeds.
 func (m *Manager) expandNamespaces(ctx context.Context, databases []string) []string {
+	out, _ := m.expandNamespacesChecked(ctx, databases)
+	return out
+}
+
+// expandNamespacesChecked is expandNamespaces, also reporting whether every
+// spoke namespace was listed (a skipped one is no discovery error, but the
+// cycle did not see its partitions).
+func (m *Manager) expandNamespacesChecked(ctx context.Context, databases []string) ([]string, bool) {
 	m.mu.Lock()
 	fn := m.namespaceExpander
 	m.mu.Unlock()
 	if fn == nil {
-		return databases
+		return databases, true
 	}
 
 	spokes, err := fn(ctx)
 	if err != nil {
 		m.logger.Warn().Err(err).
 			Msg("Spoke-namespace lookup failed; skipping received namespaces this cycle (fail-safe)")
-		spokes = nil // fall through: unknown set, treat nothing as a spoke
+		return databases, false
 	}
 	if len(spokes) == 0 {
-		return databases
+		return databases, true
 	}
+	complete := true
 
 	out := make([]string, 0, len(databases))
 	for _, db := range databases {
@@ -913,13 +922,14 @@ func (m *Manager) expandNamespaces(ctx context.Context, databases []string) []st
 		if err != nil {
 			m.logger.Warn().Err(err).Str("spoke", db).
 				Msg("Could not list a spoke namespace; skipping it this cycle")
+			complete = false
 			continue
 		}
 		for _, child := range children {
 			out = append(out, db+"/"+child)
 		}
 	}
-	return out
+	return out, complete
 }
 
 // normalizeExcludeDatabases canonicalizes compaction.exclude_databases:
@@ -1491,11 +1501,12 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 
 	// Cancellation is not a recoverable resource failure. Preserve the
 	// cause without logging a failed batch or allocating split retries. An
-	// attempt the cycle deadline cut off after running half the budget is
-	// marked for the too-wide memo (too_wide.go): a partition that spills
-	// instead of failing is cut off here at every size.
+	// attempt the cycle deadline cut off after it had nine tenths of the
+	// budget is marked for the too-wide memo (too_wide.go): a partition that
+	// spills instead of failing never reaches the smallest batch. One that
+	// started late in the cycle had no fair chance and is not marked.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		if ran := time.Since(attemptStart); errors.Is(err, context.DeadlineExceeded) && m.CycleTimeout > 0 && ran >= m.CycleTimeout/2 {
+		if ran := time.Since(attemptStart); errors.Is(err, context.DeadlineExceeded) && m.CycleTimeout > 0 && ran >= m.CycleTimeout*9/10 {
 			return &errSlowAttempt{ran: ran, err: err}
 		}
 		return err
@@ -1931,7 +1942,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 		databases = m.filterExcludedDatabases(databases)
 	}
 
-	databases = m.expandNamespaces(ctx, databases)
+	databases, namespacesComplete := m.expandNamespacesChecked(ctx, databases)
 	if filterDatabases == nil {
 		databases = m.filterExcludedDatabases(databases)
 	}
@@ -2215,6 +2226,17 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						defer active.Done()
 						defer func() { <-sem }() // Release semaphore
 
+						// One strike per partition per cycle: its batches fail
+						// for the same reason, and a blip must not count twice.
+						// Cleared only when no batch struck: a batch that
+						// returned without compacting (the lock was busy, too
+						// few staged inputs) is no evidence it fits.
+						struck, compacted := false, false
+						defer func() {
+							if compacted && !struck {
+								m.tooWide.clear(tierName, partition)
+							}
+						}()
 						for _, batch := range partitionBatches {
 							if ctx.Err() != nil {
 								return
@@ -2238,7 +2260,12 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 							}
 
 							if err != nil {
-								m.tooWideStrike(tierName, partition, partitionFiles, err)
+								// Before the interrupted check: errSlowAttempt
+								// wraps the cycle's context error.
+								if !struck && tooWideReason(err) != "" {
+									struck = true
+									m.tooWideStrike(tierName, partition, partitionFiles, err)
+								}
 								if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 									interrupted.Add(1)
 									return
@@ -2256,7 +2283,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 								// per-partition batch behavior.
 							} else {
 								succeeded.Add(1)
-								m.tooWide.clear(tierName, partition)
+								compacted = true
 							}
 						}
 					}(batches, candidate.PartitionPath, filteredCandidate.Files)
@@ -2303,9 +2330,9 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// A cycle over every database and measurement that discovered without
 	// error saw every partition that still has candidates: the memo forgets
 	// the others (their files are gone).
-	if filterDatabases == nil && filterMeasurement == "" && discoveryErrors.Load() == 0 {
+	if filterDatabases == nil && filterMeasurement == "" && discoveryErrors.Load() == 0 && namespacesComplete {
 		m.tooWide.prune(tooWideTiers, tooWideSeen)
-		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
+		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 	}
 
 	// The finalizer records the terminal outcome and complete counters.
@@ -2319,7 +2346,7 @@ func (m *Manager) tooWideStrike(tier, partition string, files []string, err erro
 		return
 	}
 	if m.tooWide.strike(tier, partition, files, reason, m.TooWideSettings()) {
-		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
+		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 		m.logger.Warn().
 			Str("tier", tier).
 			Str("partition", partition).
@@ -2590,7 +2617,7 @@ func (m *Manager) Stats() map[string]interface{} {
 			"discovery_errors":    m.lastCycle.DiscoveryErrors,
 			"skipped_too_wide":    m.lastCycle.SkippedTooWide,
 		},
-		"partitions_too_wide": m.tooWide.memoized(),
+		"partitions_too_wide": m.tooWide.memoized(m.TooWideSettings()),
 	}
 
 	// Add recent jobs (last 10). Copied into fresh storage rather than handed
@@ -3181,8 +3208,14 @@ func (m *Manager) dropDeadCompletionRecord(ctx context.Context, candidate Candid
 // Any change retries the memoized partitions: the operator's remedy for one is
 // more memory per job or fewer files per batch.
 func (m *Manager) TooWideSettings() string {
-	return fmt.Sprintf("memory_limit=%s threads=%d max_files_per_batch=%d cycle_timeout=%s",
-		m.MemoryLimit, m.Threads, m.MaxFilesPerBatch, m.CycleTimeout)
+	return fmt.Sprintf("memory_limit=%s threads=%d max_concurrent=%d max_files_per_batch=%d cycle_timeout=%s",
+		m.MemoryLimit, m.Threads, m.MaxConcurrent, m.MaxFilesPerBatch, m.CycleTimeout)
+}
+
+// TooWideSkipped reports whether the next cycle leaves a partition alone as
+// too wide (files aside: a new input file would still retry it).
+func (m *Manager) TooWideSkipped(e TooWideEntry) bool {
+	return e.Skips(m.TooWideSettings(), time.Now())
 }
 
 // TooWidePartitions lists the partitions remembered as too wide to compact,
@@ -3201,6 +3234,6 @@ func (m *Manager) ClearTooWide(tier, partition string) int {
 		return 0
 	}
 	n := m.tooWide.clearAll(tier, partition)
-	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized()))
+	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 	return n
 }

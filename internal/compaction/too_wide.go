@@ -58,12 +58,21 @@ func (e *errSlowAttempt) Error() string {
 
 func (e *errSlowAttempt) Unwrap() error { return e.err }
 
+// memoryEvidence are the classifier reasons that point at the job's memory.
+// "unknown" is not among them: a full disk, object-store throttling or an
+// expired credential falls there, and must not leave a healthy partition
+// uncompacted.
+var memoryEvidence = map[string]bool{"memory_error": true, "oom_killed": true, "killed": true, "segfault": true, "aborted": true}
+
 // tooWideReason is the memo's reason for a failure, "" when the failure does
 // not count toward it.
 func tooWideReason(err error) string {
 	var u *errUnsplittable
 	if errors.As(err, &u) {
-		return u.reason
+		if memoryEvidence[u.reason] {
+			return u.reason
+		}
+		return ""
 	}
 	var s *errSlowAttempt
 	if errors.As(err, &s) {
@@ -72,16 +81,23 @@ func tooWideReason(err error) string {
 	return ""
 }
 
-// strikesNeeded is how many failures in a row mark a partition. DuckDB's own
-// out-of-memory error is that job's limit: one is enough. A kill may have hit
-// another job running alongside (the kernel picks the largest process), and a
-// crash or an unclassified failure can be transient: two.
+// strikesNeeded is how many cycles in a row must fail to mark a partition
+// (one strike per partition per cycle). DuckDB's own out-of-memory error is
+// that job's limit: one is enough, and it holds until the files or the job
+// sizing change. A kill may have hit another job running alongside (the
+// kernel picks the largest process), a crash can be transient, and a cycle
+// deadline depends on what else the cycle ran: two, and the mark expires
+// after tooWideRetryAfter so the partition is tried again once a day.
 func strikesNeeded(reason string) int {
 	if reason == "memory_error" {
 		return 1
 	}
 	return 2
 }
+
+// tooWideRetryAfter is how long a mark on weaker evidence than DuckDB's
+// out-of-memory error holds.
+const tooWideRetryAfter = 24 * time.Hour
 
 // TooWideEntry is one memoized partition.
 type TooWideEntry struct {
@@ -100,8 +116,18 @@ type TooWideEntry struct {
 	LastFailure  time.Time `json:"last_failure"`
 }
 
-// Memoized reports whether the entry has enough strikes to skip.
+// Memoized reports whether the entry has enough strikes to skip, under any
+// settings and with any files.
 func (e TooWideEntry) Memoized() bool { return e.Strikes >= strikesNeeded(e.Reason) }
+
+// Skips reports whether a cycle running with settings at now leaves the
+// partition alone (files aside).
+func (e TooWideEntry) Skips(settings string, now time.Time) bool {
+	if !e.Memoized() || e.Settings != settings {
+		return false
+	}
+	return e.Reason == "memory_error" || now.Sub(e.LastFailure) < tooWideRetryAfter
+}
 
 // tooWideMemo is safe to use as nil (a Manager not built by NewManager): it
 // then remembers nothing.
@@ -149,7 +175,7 @@ func (m *tooWideMemo) skip(tier Tier, partition string, files []string, settings
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.entries[tooWideKey(tier.GetTierName(), partition)]
-	if !ok || !e.Memoized() || e.Settings != settings {
+	if !ok || !e.Skips(settings, time.Now()) {
 		return false
 	}
 	known := make(map[string]struct{}, len(e.Files))
@@ -281,16 +307,17 @@ func (m *tooWideMemo) listLocked() []TooWideEntry {
 	return out
 }
 
-// memoized counts the entries that skip.
-func (m *tooWideMemo) memoized() int {
+// memoized counts the entries a cycle with settings would skip.
+func (m *tooWideMemo) memoized(settings string) int {
 	if m == nil {
 		return 0
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := 0
+	now := time.Now()
 	for _, e := range m.entries {
-		if e.Memoized() {
+		if e.Skips(settings, now) {
 			n++
 		}
 	}

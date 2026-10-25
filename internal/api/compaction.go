@@ -177,7 +177,7 @@ func (h *CompactionHandler) listTooWide(c *fiber.Ctx) error {
 			"files":         len(e.Files),
 			"reason":        e.Reason,
 			"failures":      e.Strikes,
-			"skipped":       e.Memoized(),
+			"skipped":       h.manager.TooWideSkipped(e),
 			"settings":      e.Settings,
 			"first_failure": e.FirstFailure,
 			"last_failure":  e.LastFailure,
@@ -185,7 +185,9 @@ func (h *CompactionHandler) listTooWide(c *fiber.Ctx) error {
 	}
 	// current_settings is what a remembered partition's settings are compared
 	// with: one remembered under other settings is tried again.
-	return c.JSON(fiber.Map{"partitions": out, "count": len(out), "current_settings": h.manager.TooWideSettings()})
+	// The memo is this node's: on a cluster, the compactor node's list is the
+	// one cycles use.
+	return c.JSON(fiber.Map{"partitions": out, "count": len(out), "current_settings": h.manager.TooWideSettings(), "scope": "this node"})
 }
 
 // clearTooWide handles DELETE /api/v1/compaction/too-wide: every remembered
@@ -267,8 +269,8 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 	// alone while they have no new input file.
 	tooWide := map[string]bool{}
 	for _, e := range h.manager.TooWidePartitions() {
-		if e.Memoized() {
-			tooWide[e.Tier+"\x00"+e.Partition] = true
+		if h.manager.TooWideSkipped(e) {
+			tooWide[e.Tier+"/"+e.Partition] = true
 		}
 	}
 
@@ -281,7 +283,7 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 			"partition_path": cand.PartitionPath,
 			"file_count":     cand.FileCount,
 			"tier":           cand.Tier,
-			"too_wide":       tooWide[cand.Tier+"\x00"+cand.PartitionPath],
+			"too_wide":       tooWide[cand.Tier+"/"+cand.PartitionPath],
 		}
 	}
 

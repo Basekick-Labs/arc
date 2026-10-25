@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,6 +93,22 @@ func TestCompactionTooWideRoutes(t *testing.T) {
 	cands := do("GET", "/api/v1/compaction/candidates")["candidates"].([]interface{})
 	if len(cands) != 1 || cands[0].(map[string]interface{})["too_wide"] != true {
 		t.Fatalf("candidates %v", cands)
+	}
+
+	// Under other settings it is no longer skipped, and every surface says so.
+	other := compaction.NewManager(&compaction.ManagerConfig{
+		StorageBackend: cfg.StorageBackend, LockManager: compaction.NewLockManager(), TempDirectory: temp,
+		CycleTimeout: time.Minute, Logger: zerolog.Nop(), MemoryLimit: "16GB", Tiers: cfg.Tiers,
+	})
+	app2 := fiber.New()
+	NewCompactionHandler(other, nil, nil, nil, nil, zerolog.Nop()).RegisterRoutes(app2)
+	resp, err := app2.Test(httptest.NewRequest("GET", "/api/v1/compaction/too-wide", nil), -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"skipped":false`) {
+		t.Fatalf("under other settings: %s", body)
 	}
 
 	if got := do("DELETE", "/api/v1/compaction/too-wide?tier=daily")["cleared"]; got != float64(0) {

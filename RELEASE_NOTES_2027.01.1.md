@@ -1725,28 +1725,33 @@ whole rows. On a table of thousands of columns that does not fit the memory a
 job has (`compaction.memory_limit`, by default `database.memory_limit` divided
 by `compaction.max_concurrent`): measured on DuckDB 1.5.6, two files of 3,100
 columns ran out of memory at 2 GB on one thread, and 905 columns at 2 GB on
-any thread count. The batch splitter halved the batch down to two files, failed
-again, and the next cycle started over, downloading the files each time, for
-good.
+any thread count. The batch splitter halved the batch until it could not
+split further (3 files at the default 30 per batch), failed again, and the next
+cycle started over, downloading the files each time, for good.
 
 - **A partition that fails at the smallest batch is remembered and left
-  alone** while its files and the job sizing stay the same. "Fails" means
-  DuckDB's out-of-memory error (once is enough), or a kill, crash or
-  unclassified failure twice in a row (a kill can hit another job running
-  alongside), or a cycle deadline that cut an attempt off after half the
-  cycle's budget (twice). A SQL error or a missing file never counts. A new
-  input file in the partition, or a change of `compaction.memory_limit`,
-  `compaction.threads`, `compaction.max_files_per_batch` or
+  alone** while its files and the job sizing stay the same. Only memory
+  evidence counts, at most once per partition per cycle: DuckDB's
+  out-of-memory error marks it after one cycle and holds; a kill, a crash or a
+  cycle deadline that cut off an attempt which had nine tenths of the cycle's
+  budget marks it after two cycles in a row (a kill can hit another job
+  running alongside), and that mark expires after a day, so the partition is
+  tried once a day. Any other failure (a SQL error, a missing file, a full
+  disk, object-store errors) never counts. A new input file in the partition,
+  or a change of `compaction.memory_limit`, `compaction.threads`,
+  `compaction.max_concurrent`, `compaction.max_files_per_batch` or
   `compaction.cycle_timeout`, tries it again; a partition that then compacts
   is forgotten.
 - **What is remembered survives a restart**: it is kept per node in
   `too_wide.json` under `compaction.temp_directory`. A compactor failover
-  tries each such partition once more on the new node.
+  starts the new node with its own list: each partition fails there again
+  (once or twice, as above) before it is left alone.
 - **Seeing and clearing it**: `GET /api/v1/compaction/too-wide` lists the
-  partitions (with the settings each failed under and the current ones),
+  partitions on the node that answers (with the settings each failed under
+  and the current ones; on a cluster, ask the compactor node),
   `DELETE /api/v1/compaction/too-wide` (optionally `?tier=` and
   `?partition=`) forgets them so the next cycle tries again; both admin-only.
-  `/api/v1/compaction/candidates` marks them `too_wide`, each cycle record and
+  `/api/v1/compaction/candidates` marks those the next cycle skips `too_wide`, each cycle record and
   `/api/v1/compaction/stats` count `skipped_too_wide`, and the metrics are
   `arc_compaction_partitions_skipped_too_wide_total` and
   `arc_compaction_partitions_too_wide`. A Warn names each partition when it is
@@ -1755,11 +1760,13 @@ good.
   them as before. Tiering moves only daily-compacted files to cold storage, so
   the table stays on hot storage until retention removes it (as it did while
   compaction kept failing). The remedy is more memory per job: a higher
-  `compaction.memory_limit` or a lower `compaction.max_concurrent` (906
-  columns × 2 files × 3.93M rows compacted in 72 s with 4 GB on one thread).
+  `compaction.memory_limit` or a lower `compaction.max_concurrent` (measured
+  on DuckDB 1.5.6: two files of 906 columns and 3.93M rows compacted in 72 s
+  with 4 GB on one thread, and ran out of memory at 2 GB).
 - **The splitter no longer makes a batch it refuses.** A 3-file batch was split
   into 1 and 2 files, and the 1-file half was refused unattempted, losing the
-  real error; a batch under twice the minimum is now the smallest. A child
+  real error; a batch under twice the minimum, or one at the splitter's
+  deepest level (4 halvings), is now the smallest. A child
   that died of memory (a Go runtime "out of memory", a C++ `std::bad_alloc`)
   is classified as a memory error even when its earlier log lines quote SQL
   error text; before, it read as a permanent SQL error.
