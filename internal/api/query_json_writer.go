@@ -62,7 +62,8 @@ func mapColumnTypes(cts []*sql.ColumnType) []colType {
 }
 
 // mapColumnType converts a DuckDB type name to our serialization enum.
-// Mirrors sqlTypeToArrowType in query_arrow.go.
+// BLOB, GEOMETRY and UUID are matched exactly: duckdb-go scans all three as
+// []byte, and only the type name tells them apart (#440).
 func mapColumnType(dbType string) colType {
 	dbType = strings.ToUpper(dbType)
 	switch dbType {
