@@ -68,6 +68,7 @@ type GCSBackend struct {
 	// creds is the resolved identity. One identity serves the backend's own
 	// requests and, through the token it mints, DuckDB's reads.
 	creds  *auth.Credentials
+	role   GCSRole
 	logger zerolog.Logger
 	// bucketCheckedAt / bucketMissing cache the bucket probe that tells a
 	// missing object from a missing bucket. See confirmObjectAbsent.
@@ -106,6 +107,14 @@ type GCSConfig struct {
 	// See GCSEndpointURL.
 	Endpoint string
 
+	// Role is what Arc uses this bucket for. It picks the wording of the
+	// startup warnings (a colder storage class is a mistake for primary data
+	// and often the point for a backup) and how Application Default
+	// Credentials are resolved: eagerly for the primary, whose failure is a
+	// failed start, lazily for a cold tier or backup target, as the S3 and
+	// Azure SDK chains do. Empty means GCSRolePrimary.
+	Role GCSRole
+
 	// SkipProbe skips the construction-time checks: the bucket metadata read,
 	// and minting a token to prove an explicit key. The compaction subprocess
 	// sets it: its parent already ran both at startup, and repeating them per
@@ -113,6 +122,15 @@ type GCSConfig struct {
 	// information.
 	SkipProbe bool
 }
+
+// GCSRole is what Arc uses a GCS bucket for; see GCSConfig.Role.
+type GCSRole string
+
+const (
+	GCSRolePrimary GCSRole = ""
+	GCSRoleCold    GCSRole = "cold"
+	GCSRoleBackup  GCSRole = "backup"
+)
 
 // NewGCSBackend creates a new Google Cloud Storage backend.
 //
@@ -195,6 +213,7 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 			CredentialsJSON: cfg.CredentialsJSON,
 		},
 		creds:  creds,
+		role:   cfg.Role,
 		logger: log,
 	}
 
@@ -258,11 +277,47 @@ func GCSCredentials(cfg *GCSConfig) (*auth.Credentials, error) {
 		}
 		return creds, nil
 	}
+	if cfg.Role != GCSRolePrimary {
+		// A cold tier or backup target that cannot find credentials at boot
+		// still builds, as an S3 or Azure one does; its first request then
+		// fails loudly. Built eagerly instead, it failed construction and
+		// left the node without that backend at all, which for a cold tier
+		// meant reads answered without the cold data (#1105).
+		return auth.NewCredentials(&auth.CredentialsOptions{
+			TokenProvider: &lazyADC{opts: opts},
+		}), nil
+	}
 	creds, err := credentials.DetectDefault(opts)
 	if err != nil {
 		return nil, fmt.Errorf("no GCS credentials: set a service-account key or configure Application Default Credentials: %w", err)
 	}
 	return creds, nil
+}
+
+// lazyADC resolves Application Default Credentials on the first token
+// request, then delegates to them (they cache and refresh their own token).
+// A failed detection is retried on the next request.
+type lazyADC struct {
+	opts *credentials.DetectOptions
+	mu   sync.Mutex
+	tp   auth.TokenProvider
+}
+
+func (l *lazyADC) Token(ctx context.Context) (*auth.Token, error) {
+	l.mu.Lock()
+	if l.tp == nil {
+		creds, err := credentials.DetectDefault(l.opts)
+		if err != nil {
+			l.mu.Unlock()
+			return nil, fmt.Errorf("no GCS credentials: set a service-account key or configure Application Default Credentials: %w", err)
+		}
+		l.tp = creds
+	}
+	tp := l.tp
+	l.mu.Unlock()
+	// Outside the lock: the credentials serialise their own refresh, and a
+	// slow token fetch must not queue every other request behind it.
+	return tp.Token(ctx)
 }
 
 // Every call is retried on a transient failure, including writes and deletes
@@ -378,26 +433,46 @@ func (b *GCSBackend) probeBucket() error {
 	}
 	if attrs.Billing != nil && attrs.Billing.RequesterPays {
 		// Every request against a requester-pays bucket must name a project to
-		// bill. DuckDB's query reads cannot (its GCS secret carries a token,
-		// not a billing project), so ingest would work and every query fail.
+		// bill. Neither this backend nor DuckDB's query reads (whose GCS
+		// secret carries a token, not a billing project) send one.
 		return fmt.Errorf("GCS bucket %q has requester pays enabled, which Arc does not support; disable it or use another bucket", b.bucket)
 	}
 	if rp := attrs.RetentionPolicy; rp != nil && rp.RetentionPeriod > 0 {
-		ev := b.logger.Warn().Str("bucket", b.bucket).
+		ev := b.logger.Warn().Str("bucket", b.bucket).Str("role", b.roleName()).
 			Dur("retention", time.Duration(rp.RetentionPeriod)*time.Second).
 			Bool("locked", rp.IsLocked)
+		var what string
+		switch b.role {
+		case GCSRoleBackup:
+			what = "deleting a backup and cleaning up a partial one"
+		case GCSRoleCold:
+			what = "retention and DELETE of cold-tier files"
+		default:
+			what = "compaction, retention and DELETE"
+		}
 		if rp.IsLocked {
-			ev.Msg("GCS bucket has a LOCKED retention policy: compaction, retention and DELETE cannot remove an object until it is older than the period, and the policy can never be shortened or removed")
+			ev.Msg("GCS bucket has a LOCKED retention policy: " + what + " cannot remove an object until it is older than the period, and the policy can never be shortened or removed")
 		} else {
-			ev.Msg("GCS bucket has a retention policy: compaction, retention and DELETE cannot remove an object until it is older than the period, so their deletes fail and the old objects stay readable")
+			ev.Msg("GCS bucket has a retention policy: " + what + " cannot remove an object until it is older than the period, so those deletes fail and the objects stay")
 		}
 	}
 	if class := attrs.StorageClass; class != "" && class != "STANDARD" {
-		b.logger.Warn().Str("bucket", b.bucket).Str("storage_class", class).
-			Msg("GCS bucket's default storage class is not STANDARD: compaction rewrites and deletes recent objects all day, which pays that class's minimum storage duration and retrieval fees on every one; use STANDARD for Arc's primary storage")
+		switch b.role {
+		case GCSRoleBackup:
+			// A colder class is often the point of a backup bucket.
+		case GCSRoleCold:
+			b.logger.Warn().Str("bucket", b.bucket).Str("role", b.roleName()).Str("storage_class", class).
+				Msg("GCS cold-tier bucket's default storage class is not STANDARD: every query of cold data pays that class's retrieval fee on each range read, and retention or DELETE of a cold file pays its minimum storage duration; use STANDARD, or Autoclass, which charges neither")
+		default:
+			b.logger.Warn().Str("bucket", b.bucket).Str("role", b.roleName()).Str("storage_class", class).
+				Msg("GCS bucket's default storage class is not STANDARD: compaction rewrites and deletes recent objects all day, which pays that class's minimum storage duration and retrieval fees on every one; use STANDARD for Arc's primary storage")
+		}
 	}
-	if attrs.SoftDeletePolicy != nil && attrs.SoftDeletePolicy.RetentionDurationSeconds > 0 {
-		b.logger.Warn().Str("bucket", b.bucket).
+	if attrs.SoftDeletePolicy != nil && attrs.SoftDeletePolicy.RetentionDurationSeconds > 0 && b.role == GCSRolePrimary {
+		// Primary only: compaction is what makes deletes continuous. A cold
+		// tier or backup bucket deletes rarely, so soft delete costs little
+		// there and may be wanted.
+		b.logger.Warn().Str("bucket", b.bucket).Str("role", b.roleName()).
 			Dur("retention", time.Duration(attrs.SoftDeletePolicy.RetentionDurationSeconds)*time.Second).
 			Msg("GCS bucket has soft delete on: compaction and retention delete objects continuously, and deleted bytes stay billed for the retention period")
 	}
@@ -850,6 +925,14 @@ func (b *GCSBackend) Credentials() GCSConfig { return b.auth }
 
 // Type returns the storage type identifier.
 func (b *GCSBackend) Type() string { return "gcs" }
+
+// roleName is the role as logged.
+func (b *GCSBackend) roleName() string {
+	if b.role == GCSRolePrimary {
+		return "primary"
+	}
+	return string(b.role)
+}
 
 // ConfigJSON returns the configuration as JSON for subprocess recreation.
 // Every field must be parsed by the compaction subprocess (backendSpecFromJob
