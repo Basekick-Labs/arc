@@ -126,6 +126,60 @@ func gcsEndpointHost(endpoint string) (string, error) {
 	return parsed.Host, nil
 }
 
+// arcGCSColdSecretName names the cold-tier GCS secret; a separate, scoped
+// secret from the primary's so each tier reads with its own identity.
+const arcGCSColdSecretName = "gcs_secret_cold"
+
+// GCSConfig describes a runtime (cold-tier) GCS secret.
+type GCSConfig struct {
+	Bucket          string
+	Prefix          string
+	CredentialsFile string
+	Endpoint        string // https; DuckDB uses its host
+}
+
+// ConfigureGCS provisions the cold-tier GCS secret: an Arc-managed bearer
+// token for gs://bucket/prefix/, from the cold tier's own identity. Called
+// after the sandbox lockdown (as ConfigureS3 / ConfigureAzure); httpfs was
+// loaded before it (configureDatabase, ColdGCSBucket). The tier is recorded
+// for /health only once the refresher is in place.
+func (d *DuckDB) ConfigureGCS(gcfg *GCSConfig) error {
+	if gcfg == nil {
+		return fmt.Errorf("ConfigureGCS: gcfg must not be nil")
+	}
+	host, err := gcsEndpointHost(gcfg.Endpoint)
+	if err != nil {
+		return err
+	}
+	params := gcsSecretParams{
+		name:         arcGCSColdSecretName,
+		scope:        gcsPrefixURI(gcfg.Bucket, gcfg.Prefix),
+		endpointHost: host,
+	}
+	if err := d.startGCSRefresher(params, storage.GCSConfig{
+		Bucket:          gcfg.Bucket,
+		Prefix:          gcfg.Prefix,
+		CredentialsFile: gcfg.CredentialsFile,
+	}); err != nil {
+		return err
+	}
+	d.refresherMu.Lock()
+	d.coldTier = &storageTierConfig{backend: "gcs", credentials: s3ModeSDKManaged, secretName: arcGCSColdSecretName}
+	d.refresherMu.Unlock()
+	d.logger.Info().Str("bucket", gcfg.Bucket).Str("prefix", gcfg.Prefix).
+		Msg("DuckDB cold-tier GCS secret configured")
+	return nil
+}
+
+// primaryGCSIdentity is the primary storage's credential configuration.
+func primaryGCSIdentity(cfg *Config) storage.GCSConfig {
+	return storage.GCSConfig{
+		Bucket:          cfg.GCSBucket,
+		Prefix:          cfg.GCSPrefix,
+		CredentialsFile: cfg.GCSCredentialsFile,
+	}
+}
+
 // primaryGCSSecretParams builds the primary-storage secret template.
 func primaryGCSSecretParams(cfg *Config) (gcsSecretParams, error) {
 	host, err := gcsEndpointHost(cfg.GCSEndpoint)
@@ -205,8 +259,8 @@ func (g *gcsResolver) Emit(ctx context.Context, m credMaterial) error {
 
 // gcsCredentialSource labels the identity for logs and /health. Never the
 // key's path or contents.
-func gcsCredentialSource(cfg *Config) string {
-	if cfg.GCSCredentialsFile != "" {
+func gcsCredentialSource(credentialsFile string) string {
+	if credentialsFile != "" {
 		return "service_account_key"
 	}
 	return "application_default_credentials"
@@ -217,7 +271,10 @@ func gcsCredentialSource(cfg *Config) string {
 // returned (startup-fatal, as for S3 and Azure). A credential that cannot be
 // resolved yet is logged at Error and retried in the background; there is no
 // fallback secret, so gs:// reads fail until it resolves.
-func (d *DuckDB) startGCSRefresher(params gcsSecretParams, cfg *Config) error {
+//
+// identity is the tier's own credential configuration (primary or cold), so
+// each secret is resolved from the identity its backend uses.
+func (d *DuckDB) startGCSRefresher(params gcsSecretParams, identity storage.GCSConfig) error {
 	probe := params
 	probe.bearerToken = "VALIDATE"
 	if _, err := buildGCSSecretSQL(probe); err != nil {
@@ -226,12 +283,8 @@ func (d *DuckDB) startGCSRefresher(params gcsSecretParams, cfg *Config) error {
 	resolver := &gcsResolver{
 		db:     d.db,
 		params: params,
-		cfg: storage.GCSConfig{
-			Bucket:          cfg.GCSBucket,
-			Prefix:          cfg.GCSPrefix,
-			CredentialsFile: cfg.GCSCredentialsFile,
-		},
-		source: gcsCredentialSource(cfg),
+		cfg:    identity,
+		source: gcsCredentialSource(identity.CredentialsFile),
 	}
 	firstFailure := func(err error) {
 		d.logger.Error().Err(err).
