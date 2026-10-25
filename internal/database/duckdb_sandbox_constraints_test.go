@@ -250,8 +250,8 @@ func TestSandboxScopingConstraints(t *testing.T) {
 
 // TestLockConfigurationStillBlocksRuntimeSettings pins the reason
 // lock_configuration is not enabled in lockdownExternalAccess: Arc changes
-// settings per connection after the lockdown, and lock_configuration refuses
-// SESSION changes too.
+// settings after the lockdown, and lock_configuration refuses SESSION changes
+// too. Among them (also SET custom_profiling_settings and arcx.storage_root):
 //   - Ordered queries run with SET SESSION preserve_insertion_order=true and
 //     RESET it after (ForcePreserveInsertionOrder, internal/database/duckdb.go).
 //   - A DELETE's counting reads run with SET SESSION

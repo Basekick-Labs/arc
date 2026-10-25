@@ -62,14 +62,16 @@ func TestExternalFileCacheSetting(t *testing.T) {
 		{"auto (empty), local only", Config{}, false},
 		{"auto, local only", Config{ExternalFileCache: "auto"}, false},
 		{"auto, cold S3 bucket", Config{ExternalFileCache: "auto", ColdS3Bucket: "cold"}, true},
+		{"auto, S3 primary", Config{ExternalFileCache: "auto", S3IsPrimaryBackend: true, S3Bucket: "arc", S3Region: "us-east-1", S3AccessKey: "k", S3SecretKey: "s"}, true},
+		{"auto, Azure primary", Config{ExternalFileCache: "auto", AzureIsPrimaryBackend: true, AzureContainer: "arc", AzureAccountName: "acct", AzureAccountKey: "a2V5"}, true},
 		{"true, local only", Config{ExternalFileCache: "true"}, true},
 		{"false, cold S3 bucket", Config{ExternalFileCache: "false", ColdS3Bucket: "cold"}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			db, err := newFileCacheDB(t, c.cfg)
 			if err != nil {
-				if c.cfg.ColdS3Bucket != "" && strings.Contains(err.Error(), "httpfs") {
-					t.Skipf("httpfs unavailable (offline?): %v", err)
+				if mayReadRemoteStorage(&c.cfg) && (strings.Contains(err.Error(), "httpfs") || strings.Contains(err.Error(), "azure")) {
+					t.Skipf("extension unavailable (offline?): %v", err)
 				}
 				t.Fatalf("New: %v", err)
 			}
@@ -80,8 +82,8 @@ func TestExternalFileCacheSetting(t *testing.T) {
 			if got != c.want {
 				t.Fatalf("enable_external_file_cache = %v, want %v", got, c.want)
 			}
-			if db.ExternalFileCacheEnabled() != got {
-				t.Fatalf("ExternalFileCacheEnabled() = %v, DuckDB says %v", db.ExternalFileCacheEnabled(), got)
+			if on, known := db.ExternalFileCacheEnabled(); !known || on != got {
+				t.Fatalf("ExternalFileCacheEnabled() = %v (known %v), DuckDB says %v", on, known, got)
 			}
 		})
 	}
@@ -95,16 +97,38 @@ func TestExternalFileCacheRejectsUnknownMode(t *testing.T) {
 }
 
 // ClearHTTPCache runs after every compaction job on every node, so it must
-// leave the file cache as configured: on where it is the remote read cache,
-// off where configureExternalFileCache turned it off.
-func TestClearHTTPCacheLeavesTheFileCacheSetting(t *testing.T) {
+// leave the file cache alone: on a node that may read S3 or Azure it is the
+// remote read cache. A flush (SET false, then true) would end with the same
+// setting, so the test reads the cache's bytes, not only the setting.
+func TestClearHTTPCacheLeavesTheFileCache(t *testing.T) {
 	for _, mode := range []string{"true", "false"} {
 		t.Run(mode, func(t *testing.T) {
 			db, err := newFileCacheDB(t, Config{ExternalFileCache: mode})
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
+			f := filepath.Join(db.config.LocalStorageRoot, "x.parquet")
+			if _, err := db.DB().Exec("COPY (SELECT range AS v FROM range(100000)) TO '" + escapeSQLString(f) + "' (FORMAT parquet)"); err != nil {
+				t.Fatalf("write parquet: %v", err)
+			}
+			if _, err := db.DB().Exec("SELECT sum(v) FROM read_parquet('" + escapeSQLString(f) + "')"); err != nil {
+				t.Fatalf("read parquet: %v", err)
+			}
+			cached := func() int64 {
+				var b int64
+				if err := db.DB().QueryRow("SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory() WHERE tag = 'EXTERNAL_FILE_CACHE'").Scan(&b); err != nil {
+					t.Fatalf("duckdb_memory: %v", err)
+				}
+				return b
+			}
+			before := cached()
+			if (mode == "true") != (before > 0) {
+				t.Fatalf("EXTERNAL_FILE_CACHE before ClearHTTPCache = %d bytes with mode %s", before, mode)
+			}
 			db.ClearHTTPCache()
+			if after := cached(); after < before {
+				t.Fatalf("ClearHTTPCache freed the file cache: %d -> %d bytes", before, after)
+			}
 			var got bool
 			if err := db.DB().QueryRow("SELECT current_setting('enable_external_file_cache')::BOOLEAN").Scan(&got); err != nil {
 				t.Fatalf("read setting: %v", err)

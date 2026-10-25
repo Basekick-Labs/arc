@@ -92,8 +92,9 @@ type duckdbMemSummary struct {
 	TotalBytes uint64              `json:"total_bytes"`
 	ByTag      []duckdbMemTagEntry `json:"by_tag"`
 	// ExternalFileCache is whether DuckDB's file cache is on (#1372); when
-	// off, the EXTERNAL_FILE_CACHE tag stays at 0.
-	ExternalFileCache bool   `json:"external_file_cache"`
+	// off, the EXTERNAL_FILE_CACHE tag stays at 0. Null when DuckDB could not
+	// report it at startup.
+	ExternalFileCache *bool  `json:"external_file_cache"`
 	Error             string `json:"error,omitempty"`
 }
 
@@ -230,11 +231,11 @@ func (h *DebugHandler) duckdbMemSummary(parent context.Context) *duckdbMemSummar
 			return nil
 		}
 		h.logger.Error().Err(err).Msg("duckdb_memory query failed")
-		return &duckdbMemSummary{Error: "query failed", ExternalFileCache: h.db.ExternalFileCacheEnabled()}
+		return &duckdbMemSummary{Error: "query failed", ExternalFileCache: h.externalFileCache()}
 	}
 	defer rows.Close()
 
-	out := &duckdbMemSummary{ByTag: make([]duckdbMemTagEntry, 0, 32), ExternalFileCache: h.db.ExternalFileCacheEnabled()}
+	out := &duckdbMemSummary{ByTag: make([]duckdbMemTagEntry, 0, 32), ExternalFileCache: h.externalFileCache()}
 	for rows.Next() {
 		var e duckdbMemTagEntry
 		if err := rows.Scan(&e.Tag, &e.MemoryBytes, &e.TempBytes); err != nil {
@@ -267,4 +268,14 @@ func parseKBLine(v string) uint64 {
 		return 0
 	}
 	return n * 1024
+}
+
+// externalFileCache is the debug view of DuckDB's file cache state: nil when
+// unknown.
+func (h *DebugHandler) externalFileCache() *bool {
+	on, known := h.db.ExternalFileCacheEnabled()
+	if !known {
+		return nil
+	}
+	return &on
 }

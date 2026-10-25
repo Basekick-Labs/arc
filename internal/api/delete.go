@@ -574,8 +574,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			}
 			h.rewriteMu.Unlock()
 		}
-		// findAffectedFiles scanned parquet files via read_parquet — clear the cache even though
-		// no rows matched, to avoid accumulating metadata for files that may later be deleted.
+		// findAffectedFiles scanned parquet files via read_parquet: clear cache_httpfs and
+		// release native heap even though no rows matched. DuckDB's Parquet metadata cache
+		// cannot be emptied (#1372); the counting reads kept their footers out of it (countConn).
 		h.db.ClearHTTPCache()
 		freeOSMemoryThrottled()
 		return c.JSON(DeleteResponse{
@@ -852,7 +853,8 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// dropped below: a cache refilled in between would name deleted objects.
 	h.runCold(ctx, cold, where)
 
-	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
+	// Clear cache_httpfs and release memory back to the OS. DuckDB's Parquet metadata
+	// cache cannot be emptied (#1372); entries for removed files leave under memory_limit.
 	h.db.ClearHTTPCache()
 	h.filesRemoved()
 	freeOSMemoryThrottled()

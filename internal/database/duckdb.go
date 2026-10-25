@@ -47,10 +47,10 @@ type DuckDB struct {
 	refresherMu  sync.Mutex
 	s3Refreshers map[string]*credentialRefresher
 
-	// externalFileCache is enable_external_file_cache as DuckDB reports it
-	// after configureDatabase: the effective value, not the intended one.
-	// Read-only after New.
-	externalFileCache bool
+	// externalFileCache is enable_external_file_cache as DuckDB reported it
+	// after configureDatabase: the effective value, not the intended one. Nil
+	// when DuckDB could not report it. Read-only after New.
+	externalFileCache *bool
 
 	// coldTier records the cold tier's backend + credential mode for the
 	// /health storage payload (#603). Set by ConfigureS3/ConfigureAzure at
@@ -626,12 +626,18 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		config:       cfg,
 		s3Refreshers: make(map[string]*credentialRefresher),
 	}
-	if d.externalFileCache, err = readExternalFileCache(db); err != nil {
+	if on, err := readExternalFileCache(db); err == nil {
+		d.externalFileCache = &on
+		logger.Info().Bool("enabled", on).Str("configured", externalFileCacheMode(cfg)).
+			Bool("may_read_remote_storage", mayReadRemoteStorage(cfg)).Msg("DuckDB file cache")
+	} else if externalFileCacheMode(cfg) != "auto" {
+		// The operator asked for a value and DuckDB cannot confirm it.
 		db.Close()
 		return nil, err
+	} else {
+		// auto tolerates a DuckDB without the setting, as the SET does.
+		logger.Warn().Err(err).Msg("DuckDB file cache state unknown (continuing)")
 	}
-	logger.Info().Bool("enabled", d.externalFileCache).Str("configured", externalFileCacheMode(cfg)).
-		Bool("may_read_remote_storage", mayReadRemoteStorage(cfg)).Msg("DuckDB file cache")
 
 	// IRSA (web identity): the primary S3 secret is Arc-managed. configureS3Access
 	// deliberately skipped emission for this mode; start the refresher here so the
@@ -2050,15 +2056,17 @@ func externalFileCacheMode(cfg *Config) string {
 // stopped caching local files. On a node that may read S3 or Azure it stays
 // on, because there it is the remote read cache.
 //
-// "auto" turns it off when mayReadRemoteStorage is false. "true" leaves
-// DuckDB's default (on). "false" turns it off everywhere. A failed SET on
-// auto keeps the cache on (the old behaviour) with a warning; on an explicit
-// "false" it fails startup, because the operator asked for it.
+// "auto" turns it off when mayReadRemoteStorage is false and otherwise leaves
+// DuckDB's default (on in 1.5.x). "true" and "false" set it explicitly, so
+// neither depends on DuckDB's default. A failed SET on auto keeps DuckDB's
+// default with a warning; on an explicit value it fails startup, because the
+// operator asked for it.
 func configureExternalFileCache(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	mode := externalFileCacheMode(cfg)
+	value := "false"
 	switch mode {
 	case "true":
-		return nil
+		value = "true"
 	case "false":
 	case "auto":
 		if mayReadRemoteStorage(cfg) {
@@ -2067,11 +2075,11 @@ func configureExternalFileCache(db *sql.DB, cfg *Config, logger zerolog.Logger) 
 	default:
 		return fmt.Errorf("database.external_file_cache must be auto, true or false, got %q", cfg.ExternalFileCache)
 	}
-	if _, err := db.Exec("SET GLOBAL enable_external_file_cache=false"); err != nil {
-		if mode == "false" {
-			return fmt.Errorf("failed to turn off DuckDB's file cache (database.external_file_cache=false): %w", err)
+	if _, err := db.Exec("SET GLOBAL enable_external_file_cache=" + value); err != nil {
+		if mode != "auto" {
+			return fmt.Errorf("failed to set DuckDB's file cache (database.external_file_cache=%s): %w", mode, err)
 		}
-		logger.Warn().Err(err).Msg("Failed to turn off DuckDB's file cache on a local-only node (continuing with it on)")
+		logger.Warn().Err(err).Msg("Failed to turn off DuckDB's file cache on a local-only node (continuing with DuckDB's default)")
 	}
 	return nil
 }
@@ -2086,7 +2094,10 @@ func readExternalFileCache(db *sql.DB) (bool, error) {
 }
 
 // ExternalFileCacheEnabled reports whether DuckDB's file cache is on, as
-// DuckDB reported it at startup.
-func (d *DuckDB) ExternalFileCacheEnabled() bool {
-	return d.externalFileCache
+// DuckDB reported it at startup, and whether DuckDB could report it at all.
+func (d *DuckDB) ExternalFileCacheEnabled() (on, known bool) {
+	if d.externalFileCache == nil {
+		return false, false
+	}
+	return *d.externalFileCache, true
 }
