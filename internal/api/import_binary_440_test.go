@@ -208,3 +208,37 @@ func TestParquetImportBinaryKindAcrossBatches(t *testing.T) {
 		require.Contains(t, fmt.Sprint(body), "not valid UTF-8")
 	})
 }
+
+// A file that uses Parquet's own GEOMETRY type (written by pyarrow, GDAL,
+// DuckDB's GeoParquet V2) is imported as plain binary: read through the
+// import API it does not carry that type into Arc's files, where it would
+// read as GEOMETRY next to BLOB files of the column and fail.
+func TestParquetImportOfParquetGeometryTypeIsPlainBinary(t *testing.T) {
+	ci := newChunkedImport(t, 1000)
+	db, err := sql.Open("duckdb", "")
+	require.NoError(t, err)
+	defer db.Close()
+	p := filepath.Join(t.TempDir(), "v2.parquet")
+	_, err = db.Exec(fmt.Sprintf(`COPY (SELECT TIMESTAMP '2026-10-25 10:00:00' AS time, 'POINT(1 2)'::GEOMETRY AS geom) TO '%s' (FORMAT PARQUET, GEOPARQUET_VERSION 'V2')`, p))
+	require.NoError(t, err)
+	data, err := os.ReadFile(p)
+	require.NoError(t, err)
+	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=places", data)
+	require.Equal(t, http.StatusOK, status, body)
+	vals, types := ci.storedColumn(t, "geom")
+	require.Equal(t, map[string]bool{"binary": true}, types)
+	require.Len(t, vals, 1)
+	// The stored file reads back as BLOB in DuckDB, conversion on or off.
+	require.NoError(t, ci.buf.FlushAllAndWait(context.Background()))
+	var files []string
+	require.NoError(t, filepath.WalkDir(ci.dir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".parquet") {
+			files = append(files, p)
+		}
+		return err
+	}))
+	require.NotEmpty(t, files)
+	var typ string
+	require.NoError(t, db.QueryRow(fmt.Sprintf("SELECT typeof(geom) FROM read_parquet('%s')", files[0])).Scan(&typ))
+	require.Equal(t, "BLOB", typ)
+}
