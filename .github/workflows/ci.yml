@@ -212,6 +212,9 @@ jobs:
       - name: Enterprise chart refuses a short bootstrap token
         run: bash scripts/test_enterprise_bootstrap_token.sh helm/arc-enterprise
 
+      - name: Enterprise chart deploys shared storage on GCS
+        run: bash scripts/test_enterprise_gcs_storage.sh helm/arc-enterprise
+
       # Every Arc pod joins Raft, whatever its role. A role whose pod has no
       # advertisable Raft address falls back to standalone mode and is
       # invisible to the cluster while looking healthy. Readers shipped that

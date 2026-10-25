@@ -107,10 +107,13 @@ cluster:
 storage:
   mode: shared                     # "shared" or "local"
 
-  # Settings for shared mode (S3-compatible object storage). The chart emits S3
-  # config only (ARC_STORAGE_BACKEND=s3); use an S3-compatible endpoint.
+  # Settings for shared mode (one object store every node reads and writes).
   shared:
-    external: false                # true = use existing S3-compatible store; false = bundled SeaweedFS
+    # backend: "s3" (any S3-compatible store, or the bundled SeaweedFS) or
+    # "gcs" (Google Cloud Storage, through its own API; requires
+    # external=true). bucket and prefix below apply to both.
+    backend: s3
+    external: false                # true = use existing object store; false = bundled SeaweedFS (s3 only)
     bucket: arc-data
     region: us-east-1
     endpoint: ""                   # auto-populated when bundled SeaweedFS; set for external S3
@@ -129,6 +132,15 @@ storage:
       existingSecret: ""
       accessKey: ""
       secretKey: ""
+    # backend=gcs only. With credentialsSecret empty, Arc uses Application
+    # Default Credentials: on GKE, Workload Identity through
+    # serviceAccount.annotations ("iam.gke.io/gcp-service-account"). Otherwise
+    # name a Secret holding a service-account key; it is mounted read-only
+    # and passed as storage.gcs_credentials_file.
+    gcs:
+      endpoint: ""                 # optional https endpoint (e.g. Private Service Connect)
+      credentialsSecret: ""        # Secret with a service-account key
+      credentialsKey: key.json     # key inside that Secret
 
   # Settings for local mode (peer replication). `storageClass` here is a
   # fallback used by any role that does not set its own persistence.storageClass.

@@ -115,7 +115,26 @@ Only enforced when shared storage is explicitly external.
 */}}
 {{- $shared := .Values.storage.shared | default dict -}}
 {{- $creds := $shared.credentials | default dict -}}
-{{- if eq .Values.storage.mode "shared" -}}
+{{- $backend := include "arc-enterprise.sharedBackend" . -}}
+{{- if and (eq .Values.storage.mode "shared") (not (has $backend (list "s3" "gcs"))) -}}
+{{- fail (printf "storage.shared.backend %q is invalid; must be \"s3\" or \"gcs\"" $backend) -}}
+{{- end -}}
+{{- if and (eq .Values.storage.mode "shared") (eq $backend "gcs") -}}
+{{/*
+  GCS (#1105): there is no bundled GCS, and the S3 credential settings do not
+  apply. Credentials come from Workload Identity (serviceAccount annotations)
+  or the key Secret in storage.shared.gcs.credentialsSecret.
+*/}}
+{{- if not $shared.external -}}
+{{- fail "storage.shared.backend=gcs requires storage.shared.external=true (there is no bundled GCS)" -}}
+{{- end -}}
+{{- if not $shared.bucket -}}
+{{- fail "storage.shared.backend=gcs requires storage.shared.bucket" -}}
+{{- end -}}
+{{- if or $creds.useIRSA $creds.existingSecret $creds.accessKey $creds.secretKey -}}
+{{- fail "storage.shared.credentials apply to backend=s3 only; for gcs use storage.shared.gcs.credentialsSecret or Workload Identity" -}}
+{{- end -}}
+{{- else if eq .Values.storage.mode "shared" -}}
 {{/*
   IRSA makes sense only for external S3. With bundled SeaweedFS (external=false)
   the chart would omit the S3 cred env vars and Arc would fall back to the AWS
