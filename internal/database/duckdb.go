@@ -47,6 +47,11 @@ type DuckDB struct {
 	refresherMu  sync.Mutex
 	s3Refreshers map[string]*credentialRefresher
 
+	// externalFileCache is enable_external_file_cache as DuckDB reports it
+	// after configureDatabase: the effective value, not the intended one.
+	// Read-only after New.
+	externalFileCache bool
+
 	// coldTier records the cold tier's backend + credential mode for the
 	// /health storage payload (#603). Set by ConfigureS3/ConfigureAzure at
 	// startup (the hot tier is derived live from d.config and needs no
@@ -554,6 +559,9 @@ type Config struct {
 	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
 	S3CacheSize       int64 // Cache size in bytes
 	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600)
+	// ExternalFileCache is database.external_file_cache: "auto" (or empty),
+	// "true" or "false". See configureExternalFileCache.
+	ExternalFileCache string
 	// ArcxExtensionPath is the absolute path to arcx.duckdb_extension.
 	// Empty disables the loader. Arc Enterprise only — the caller
 	// (cmd/arc/main.go) clears this field when the license does not
@@ -618,6 +626,12 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		config:       cfg,
 		s3Refreshers: make(map[string]*credentialRefresher),
 	}
+	if d.externalFileCache, err = readExternalFileCache(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	logger.Info().Bool("enabled", d.externalFileCache).Str("configured", externalFileCacheMode(cfg)).
+		Bool("may_read_remote_storage", mayReadRemoteStorage(cfg)).Msg("DuckDB file cache")
 
 	// IRSA (web identity): the primary S3 secret is Arc-managed. configureS3Access
 	// deliberately skipped emission for this mode; start the refresher here so the
@@ -945,6 +959,10 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Cache Parquet file metadata (schema, row group info) to reduce I/O on repeated access
 	if _, err := db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to enable parquet metadata cache (continuing without it)")
+	}
+
+	if err := configureExternalFileCache(db, cfg, logger); err != nil {
+		return err
 	}
 
 	// preserve_insertion_order=false (the default) lets DuckDB reorder
@@ -1333,11 +1351,30 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 	return nil
 }
 
-// ClearHTTPCache clears DuckDB's cache_httpfs and parquet_metadata_cache.
-// Call after compaction/delete/retention so subsequent queries don't hit stale
-// cache entries pointing to files that no longer exist. Also asks glibc to
-// release native-heap pages — debug.FreeOSMemory only covers Go-managed memory;
-// CGo allocations from the DuckDB httpfs extension live outside it.
+// ClearHTTPCache clears DuckDB's cache_httpfs cache and asks glibc to return
+// freed native-heap pages to the OS. invalidateQueryCaches (cmd/arc/main.go)
+// calls it after every compaction job, DELETE, database delete and retention
+// pass, and every peer re-runs it; tiering calls it around a migration, and
+// the query path after a remote object vanished mid-query.
+//
+// What it does not do (#1372, measured on DuckDB 1.5.5, 1.5.6 and 2.0.0):
+//   - Free the Parquet metadata cache. Nothing does: SET GLOBAL
+//     parquet_metadata_cache=false then true, which this function used to
+//     run, frees nothing. The cache stays within memory_limit and is evicted
+//     under pressure. Staleness is not a concern: DuckDB validates cached
+//     entries against the file, so a file rewritten at the same path reads
+//     back fresh with or without that toggle, and Arc never rewrites a file
+//     in place anyway (DELETE and compaction write new paths). The one way to
+//     keep footers out of it is per connection: a DELETE's counting reads run
+//     with SET SESSION parquet_metadata_cache=false on a connection that is
+//     then discarded (countConn, internal/api/delete_window.go).
+//   - Flush DuckDB's file cache (enable_external_file_cache). On a node that
+//     may read S3 or Azure it is the remote read cache, and this runs after
+//     every compaction job on every node; on a local-only node it is off
+//     (configureExternalFileCache).
+//
+// debug.FreeOSMemory only covers Go-managed memory; the glibc release covers
+// CGo allocations from DuckDB and its extensions.
 func (d *DuckDB) ClearHTTPCache() {
 	d.clearHTTPCache(zerolog.InfoLevel)
 }
@@ -1354,18 +1391,6 @@ func (d *DuckDB) clearHTTPCache(level zerolog.Level) {
 		d.logger.Debug().Err(err).Msg("cache_httpfs_clear_cache not available (extension may not be loaded)")
 	} else {
 		d.logger.WithLevel(level).Msg("Cleared cache_httpfs cache")
-	}
-
-	// Toggle disable then re-enable — always attempt the re-enable even if
-	// disable failed, so a transient disable error doesn't leave the cache
-	// in an unintended off state on a connection.
-	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=false"); err != nil {
-		d.logger.Debug().Err(err).Msg("Failed to disable parquet_metadata_cache")
-	}
-	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
-		d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
-	} else {
-		d.logger.WithLevel(level).Msg("Reset parquet_metadata_cache")
 	}
 
 	if memtrim.ReleaseToOS() {
@@ -1985,4 +2010,83 @@ func logEffectiveResourceSettings(db *sql.DB, logger zerolog.Logger) {
 		Str("memory_limit", memLimit).
 		Str("threads", threads).
 		Msg("DuckDB effective resource settings (empty config values mean DuckDB's own cgroup-aware defaults)")
+}
+
+// mayReadRemoteStorage reports whether this node's DuckDB may read S3 or
+// Azure. It is true exactly when configureDatabase loads httpfs or azure for
+// storage: the S3 gate (S3IsPrimaryBackend or either S3 key, else
+// ColdS3Bucket) and the Azure gate (AzureIsPrimaryBackend, else
+// ColdAzureContainer). It over-classifies on purpose: a cold bucket left in
+// the config with tiering off or unlicensed, or S3 keys with no bucket, still
+// counts, which keeps today's behaviour on such a node. Under-classifying
+// would cost remote reads their only cache (query.enable_s3_cache is off by
+// default and only covers primary S3), not correctness.
+//
+// Not the same question as the query path's readsObjectStore, which asks at
+// run time whether a vanished file can be an object (#1355).
+func mayReadRemoteStorage(cfg *Config) bool {
+	return cfg.S3IsPrimaryBackend || cfg.S3AccessKey != "" || cfg.S3SecretKey != "" ||
+		cfg.ColdS3Bucket != "" || cfg.AzureIsPrimaryBackend || cfg.ColdAzureContainer != ""
+}
+
+// externalFileCacheMode is cfg.ExternalFileCache with empty read as "auto", so
+// a Config built without the field (tests, embeddings) behaves like the
+// shipped default.
+func externalFileCacheMode(cfg *Config) string {
+	if cfg.ExternalFileCache == "" {
+		return "auto"
+	}
+	return cfg.ExternalFileCache
+}
+
+// configureExternalFileCache applies database.external_file_cache (#1372).
+//
+// DuckDB's file cache keeps blocks of every file it reads and drops them only
+// under memory_limit pressure. Compaction deletes and replaces files all day,
+// so on a busy node most of the cache belongs to files that no longer exist,
+// and memory_limit defaults to 80% of RAM. For local files the OS page cache
+// already holds the same blocks: turning DuckDB's copy off measured no
+// latency difference (warm, hot and 8 concurrent clients), and DuckDB 2.0
+// stopped caching local files. On a node that may read S3 or Azure it stays
+// on, because there it is the remote read cache.
+//
+// "auto" turns it off when mayReadRemoteStorage is false. "true" leaves
+// DuckDB's default (on). "false" turns it off everywhere. A failed SET on
+// auto keeps the cache on (the old behaviour) with a warning; on an explicit
+// "false" it fails startup, because the operator asked for it.
+func configureExternalFileCache(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	mode := externalFileCacheMode(cfg)
+	switch mode {
+	case "true":
+		return nil
+	case "false":
+	case "auto":
+		if mayReadRemoteStorage(cfg) {
+			return nil
+		}
+	default:
+		return fmt.Errorf("database.external_file_cache must be auto, true or false, got %q", cfg.ExternalFileCache)
+	}
+	if _, err := db.Exec("SET GLOBAL enable_external_file_cache=false"); err != nil {
+		if mode == "false" {
+			return fmt.Errorf("failed to turn off DuckDB's file cache (database.external_file_cache=false): %w", err)
+		}
+		logger.Warn().Err(err).Msg("Failed to turn off DuckDB's file cache on a local-only node (continuing with it on)")
+	}
+	return nil
+}
+
+// readExternalFileCache reads enable_external_file_cache back from DuckDB.
+func readExternalFileCache(db *sql.DB) (bool, error) {
+	var on bool
+	if err := db.QueryRow("SELECT current_setting('enable_external_file_cache')::BOOLEAN").Scan(&on); err != nil {
+		return false, fmt.Errorf("failed to read enable_external_file_cache: %w", err)
+	}
+	return on, nil
+}
+
+// ExternalFileCacheEnabled reports whether DuckDB's file cache is on, as
+// DuckDB reported it at startup.
+func (d *DuckDB) ExternalFileCacheEnabled() bool {
+	return d.externalFileCache
 }

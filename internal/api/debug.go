@@ -91,7 +91,10 @@ type glibcHeapStats struct {
 type duckdbMemSummary struct {
 	TotalBytes uint64              `json:"total_bytes"`
 	ByTag      []duckdbMemTagEntry `json:"by_tag"`
-	Error      string              `json:"error,omitempty"`
+	// ExternalFileCache is whether DuckDB's file cache is on (#1372); when
+	// off, the EXTERNAL_FILE_CACHE tag stays at 0.
+	ExternalFileCache bool   `json:"external_file_cache"`
+	Error             string `json:"error,omitempty"`
 }
 
 type duckdbMemTagEntry struct {
@@ -226,11 +229,11 @@ func (h *DebugHandler) duckdbMemSummary(parent context.Context) *duckdbMemSummar
 			return nil
 		}
 		h.logger.Error().Err(err).Msg("duckdb_memory query failed")
-		return &duckdbMemSummary{Error: "query failed"}
+		return &duckdbMemSummary{Error: "query failed", ExternalFileCache: h.db.ExternalFileCacheEnabled()}
 	}
 	defer rows.Close()
 
-	out := &duckdbMemSummary{ByTag: make([]duckdbMemTagEntry, 0, 32)}
+	out := &duckdbMemSummary{ByTag: make([]duckdbMemTagEntry, 0, 32), ExternalFileCache: h.db.ExternalFileCacheEnabled()}
 	for rows.Next() {
 		var e duckdbMemTagEntry
 		if err := rows.Scan(&e.Tag, &e.MemoryBytes, &e.TempBytes); err != nil {
