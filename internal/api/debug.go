@@ -152,9 +152,10 @@ func (h *DebugHandler) handleDuckDBMemory(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"timestamp":   time.Now().UTC().Format(time.RFC3339Nano),
-		"total_bytes": summary.TotalBytes,
-		"by_tag":      summary.ByTag,
+		"timestamp":           time.Now().UTC().Format(time.RFC3339Nano),
+		"total_bytes":         summary.TotalBytes,
+		"by_tag":              summary.ByTag,
+		"external_file_cache": summary.ExternalFileCache,
 	})
 }
 
