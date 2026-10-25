@@ -684,7 +684,61 @@ would not read it.
 file of the measurement again. The startup line "Delete operations enabled"
 shows the setting.
 
+## Upgrade note: JSON query results encode BLOB as base64 and UUID as text ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+The JSON query output (`/api/v1/query` without a `format`, and every
+endpoint that answers in the same shape) now writes:
+
+- **BLOB and GEOMETRY** values as standard base64 strings (RFC 4648, padded).
+  They used to be the raw bytes inside a JSON string, which is invalid JSON
+  for any value holding a byte of 0x80 or above. The Arrow and MessagePack
+  outputs are unchanged: they already carry real bytes, and the Grafana
+  plugin already shows binary values as base64 on both, so all three agree.
+  A spatial query's geometry therefore reads back as base64 WKB; use
+  `ST_AsText(...)` or `ST_AsGeoJSON(...)` for a readable value.
+- **UUID** values as their canonical text (`6f1c2c1e-8a3b-...`). They used
+  to come out as 16 raw bytes.
+
+Before this release no column Arc stored was a BLOB, so this changes the
+output of a query only where the query itself produced a BLOB, GEOMETRY or
+UUID (a cast, `uuid()`, a spatial function). During a rolling upgrade a
+proxied query is encoded by the node that answers it.
+
 ## New features
+
+### MessagePack binary values are stored as binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+A MessagePack `bin` value is now stored as a Parquet BYTE_ARRAY column
+(DuckDB `BLOB`), byte for byte. It used to be refused ("unsupported column
+type"). This is the first step of spatial support: a geometry sent as WKB
+bytes is stored as-is, and `ST_GeomFromWKB(geom)` reads it once the `spatial`
+extension is available.
+
+- Every MessagePack shape (columnar, row, batch) and MQTT payloads accept
+  it. A NULL stays NULL and an empty value stays an empty value, through the
+  WAL and its recovery as well.
+- JSON query results show it as base64 (see the upgrade note above); Arrow
+  and MessagePack results carry the bytes.
+- Iceberg export maps it to the Iceberg `binary` type. It used to stop the
+  measurement's export with "unsupported Arrow type".
+- A continuous query whose output has a UUID column writes it as text (the
+  run used to fail); a BLOB or GEOMETRY output column is written as binary.
+- **A column cannot change between string and binary.** A write that sends
+  bytes to a column stored as a string, or a string to a column stored as
+  binary, is refused with HTTP 400 and nothing of it is written. DuckDB reads
+  a column that is a string in some files and binary in others as binary, so
+  one such write would turn every stored string of that column into bytes for
+  every query. The check uses the field schema Arc keeps per measurement
+  (`query.stable_schema`, on by default) and is best-effort: it is not made
+  with `query.stable_schema = false`, on a writer that has not yet flushed or
+  queried the measurement since it started, or between two writers changing
+  the same column at the same time. A change that gets through leaves the
+  column mixed, and its string rows read back as binary.
+- Parquet import is unchanged: a BYTE_ARRAY column without a string
+  annotation is still imported as a string, as Spark and Hive write string
+  columns that way.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#916](https://github.com/Basekick-Labs/arc/pull/916).
 
 ### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
