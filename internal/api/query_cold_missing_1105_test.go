@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -82,5 +84,36 @@ func TestTransformErrorStatus(t *testing.T) {
 	}
 	if transformErrorStatus(errors.New("bad name")) != 400 {
 		t.Fatal("other transform errors stay 400")
+	}
+}
+
+// Every handler that runs the SQL transform answers the missing cold tier
+// with 503, not 400 (#1105 part 3): arrow, estimate and the per-measurement
+// GET, beside /api/v1/query above.
+func TestEveryTransformCallSiteAnswers503ForAMissingColdTier(t *testing.T) {
+	e := newFieldSchemaEnv(t, fieldschema.Options{}, true)
+	at := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	e.write("sch", "archived", at, map[string]interface{}{"host": []string{"a"}, "v": []int64{1}})
+	e.h.coldGuard = &fakeColdGuard{missing: true, cold: map[string]bool{"archived": true}}
+
+	body := `{"sql":"SELECT count(*) FROM sch.archived"}`
+	for _, c := range []struct {
+		name, method, path, body string
+	}{
+		{"arrow", "POST", "/api/v1/query/arrow", body},
+		{"estimate", "POST", "/api/v1/query/estimate", body},
+		{"measurement", "GET", "/api/v1/query/archived?database=sch", ""},
+	} {
+		req := httptest.NewRequest(c.method, c.path, strings.NewReader(c.body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := e.app.Test(req, 30000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 503 || !strings.Contains(string(raw), "cold storage tier") || strings.Contains(string(raw), "Invalid query") {
+			t.Errorf("%s: %d %s, want 503 naming the cold tier", c.name, resp.StatusCode, raw)
+		}
 	}
 }

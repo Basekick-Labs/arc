@@ -8,7 +8,7 @@ type Tier string
 const (
 	// TierHot represents local/fast storage for recent data
 	TierHot Tier = "hot"
-	// TierCold represents S3/Azure archive storage for historical data
+	// TierCold represents S3/Azure/GCS archive storage for historical data
 	TierCold Tier = "cold"
 )
 

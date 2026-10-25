@@ -505,10 +505,10 @@ func main() {
 		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
 		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
 		ColdAzurePrefix:    cfg.TieredStorage.Cold.AzurePrefix,
-		// GCS cold (#1105): only when the cold backend IS gcs, unlike the
-		// S3/Azure fields above, so a leftover tiered_storage.cold.gcs_bucket
-		// after switching backend neither widens the allowlist nor loads
-		// httpfs.
+		// GCS cold (#1105): only when this node builds a GCS cold tier
+		// (tiering on, cold on, backend gcs), unlike the S3/Azure fields
+		// above, so a leftover tiered_storage.cold.gcs_bucket neither widens
+		// the allowlist nor loads httpfs at boot.
 		ColdGCSBucket: coldGCSField(cfg, cfg.TieredStorage.Cold.GCSBucket),
 		ColdGCSPrefix: coldGCSField(cfg, cfg.TieredStorage.Cold.GCSPrefix),
 		// Local storage root used by the DuckDB sandbox to whitelist
@@ -5635,7 +5635,9 @@ func gcsClusterModeRefusal(cfg *config.Config, clustering bool) error {
 	// A GCS cold tier on a cluster node waits for the same release: it has
 	// not been run on a cluster rig yet (scheduled with GCS clusters), and a
 	// cold tier that fails to start costs every node's queries their cold
-	// data. Gated like the cold tier itself. A GCS backup target is allowed:
+	// data. Gated on the cold tier's config (tiering and cold on), not on a
+	// tiering licence: refusing where the tier would not be built errs safe
+	// and is fixed by the same edit. A GCS backup target is allowed:
 	// cluster backups use it as any other destination.
 	if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled && cfg.TieredStorage.Cold.Backend == "gcs" {
 		return fmt.Errorf("tiered_storage.cold.backend \"gcs\" is not supported in cluster mode yet; " +
@@ -5644,9 +5646,13 @@ func gcsClusterModeRefusal(cfg *config.Config, clustering bool) error {
 	return nil
 }
 
-// coldGCSField returns v when the cold tier's backend is gcs, else "".
+// coldGCSField returns v when this node will build a GCS cold tier
+// (tiering on, cold on, backend gcs), else "". A leftover gcs_bucket must not
+// load httpfs at boot (an air-gapped host may not have it cached), widen the
+// allowlist or turn the file cache on.
 func coldGCSField(cfg *config.Config, v string) string {
-	if cfg.TieredStorage.Cold.Backend != "gcs" {
+	ts := cfg.TieredStorage
+	if !ts.Enabled || !ts.Cold.Enabled || ts.Cold.Backend != "gcs" {
 		return ""
 	}
 	return v

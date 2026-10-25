@@ -3803,8 +3803,11 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 func (h *QueryHandler) buildReadParquetExprRaw(ctx context.Context, path, originalSQL, keyword string) string {
 	// A cold tier that is on but failed to start offers no cold glob below,
 	// so this is the one place every read of such a node passes (#1105).
-	if db, meas := h.extractDBMeasurementFromPath(path); db != "" && meas != "" && h.refuseReadWithoutColdTier(ctx, db, meas, originalSQL) {
-		return ""
+	// The guard is asked first so a node without tiering parses nothing.
+	if guard := h.coldTierGuard(); guard != nil && guard.ColdTierMissing() {
+		if db, meas := h.extractDBMeasurementFromPath(path); db != "" && meas != "" && h.refuseReadWithoutColdTier(ctx, db, meas, originalSQL) {
+			return ""
+		}
 	}
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
@@ -4119,7 +4122,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Msg("No hot tier metadata for this measurement; local files are excluded from this read")
 	}
 
-	// Cold tier (S3/Azure) - only if metadata says there's cold data
+	// Cold tier (S3/Azure/GCS) - only if metadata says there's cold data
 	if actualTiers[tiering.TierCold] {
 		if _, ok := tieredPaths[tiering.TierCold]; ok {
 			coldBackend := tiers.GetBackendForTier(tiering.TierCold)
@@ -5598,9 +5601,13 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), sql, "")
 	if err != nil {
 		m.IncQueryErrors()
+		msg := "Invalid query: " + err.Error()
+		if errors.Is(err, errColdTierUnavailable) {
+			msg = err.Error()
+		}
 		return c.Status(transformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,
-			Error:     "Invalid query: " + err.Error(),
+			Error:     msg,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}

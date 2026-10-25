@@ -647,7 +647,7 @@ type ReconciliationConfig struct {
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
 // Tiered storage enables automatic data lifecycle management with hot/cold tiers.
 // - Hot tier: Local storage for recent data (fast access)
-// - Cold tier: S3/Azure for archived data (cost-effective archival storage)
+// - Cold tier: S3/Azure/GCS for archived data (cost-effective archival storage)
 //
 // Data older than DefaultHotMaxAgeDays is automatically migrated to cold storage.
 type TieredStorageConfig struct {
@@ -675,11 +675,11 @@ type TieredStorageConfig struct {
 	// truncates never retires a stale row.
 	ScanTimeout time.Duration
 
-	// Cold tier configuration (remote S3/Azure storage)
+	// Cold tier configuration (remote S3/Azure/GCS storage)
 	Cold ColdTierConfig
 }
 
-// ColdTierConfig holds configuration for the cold storage tier (S3/Azure).
+// ColdTierConfig holds configuration for the cold storage tier (S3/Azure/GCS).
 // This is the only remote tier - data moves directly from hot (local) to cold (remote).
 // Cold objects are written with no storage class or access tier set — S3
 // STANDARD, and on Azure the storage account's default tier — and queried in
@@ -2251,7 +2251,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.shared_storage_mode", false)
 
 	// Tiered storage defaults (Enterprise feature)
-	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
+	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure/GCS archive)
 	v.SetDefault("tiered_storage.enabled", false)                       // Disabled by default
 	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *")      // 2am daily
 	v.SetDefault("tiered_storage.migration_max_concurrent", 4)          // 4 concurrent migrations
@@ -2260,7 +2260,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
 
-	// Cold tier defaults (S3/Azure). Objects are written in the bucket's
+	// Cold tier defaults (S3/Azure/GCS). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.
 	v.SetDefault("tiered_storage.cold.enabled", false)         // Disabled by default
 	v.SetDefault("tiered_storage.cold.backend", "s3")          // S3 by default
