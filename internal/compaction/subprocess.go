@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -219,6 +220,12 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// compacting with a wrong zone corrupts data, not just query results.
 	if _, err := db.Exec("SET TimeZone='UTC'"); err != nil {
 		return nil, fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
+	}
+	// Read a GeoParquet file's geometry column as BLOB, as the query engine
+	// does (#440): with conversion on, a partition holding one such file next
+	// to Arc's BLOB files fails to compact on every cycle.
+	if err := database.DisableGeoParquetConversion(context.Background(), db); err != nil {
+		return nil, err
 	}
 
 	// Set DuckDB memory limit from config. Exceeding it makes DuckDB spill to

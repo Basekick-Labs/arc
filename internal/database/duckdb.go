@@ -1119,6 +1119,10 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
+	if err := DisableGeoParquetConversion(context.Background(), db); err != nil {
+		return err
+	}
+
 	// Final step: lock down DuckDB's file-access surface so user-supplied SQL
 	// cannot reach arbitrary local files or remote URLs. Must run AFTER every
 	// INSTALL/LOAD above (enable_external_access=false blocks future LOADs).
