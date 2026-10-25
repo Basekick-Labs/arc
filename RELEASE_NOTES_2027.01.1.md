@@ -1692,7 +1692,7 @@ need hundreds of GiB, and `database.memory_limit` did not bound it.
 
 `delete.time_pruning` turns the first point off (see the upgrade note above).
 
-### Retiring tier rows no longer grows the tier metadata WAL without bound
+### Retiring tier rows no longer grows the tier metadata WAL without bound ([#1373](https://github.com/Basekick-Labs/arc/pull/1373))
 
 Removing tier rows one at a time grew the WAL of the shared SQLite database
 (`arc.db-wal`) by tens of KB per row, and nothing shrank it. A startup tier
