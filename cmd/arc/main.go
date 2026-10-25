@@ -416,16 +416,6 @@ func main() {
 	// (GHSA-j93g-rp6m-j32m) from 2026-05-19.
 	startDebugPprofIfEnabled(shutdownCoordinator, logger.Get("debug-pprof"))
 
-	// GCS primary storage is standalone-only until #1105 part 4. Refused HERE,
-	// where it is known whether this node will actually run as a cluster
-	// node, not at config load: an unlicensed cluster.enabled=true runs
-	// standalone (see the cluster block), and refusing that at load would
-	// stop a node the runtime would have served. Before database.New so no
-	// credential refresher starts on a node that is about to exit.
-	if err := gcsClusterModeRefusal(cfg, licenseHasClustering(licenseClient)); err != nil {
-		log.Fatal().Err(err).Msg("Unsupported storage configuration")
-	}
-
 	// arcx (Arc Enterprise DuckDB extension): gate via license before
 	// passing the path down to the DB layer. The extension binary is the
 	// licensing perimeter, but having Arc refuse to LOAD without a valid
@@ -1037,7 +1027,7 @@ func main() {
 		if cfg.Storage.Backend == "local" {
 			log.Fatal().
 				Str("backend", cfg.Storage.Backend).
-				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, or azblob); local-filesystem backend cannot be shared across writers")
+				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, azblob or gcs); local-filesystem backend cannot be shared across writers")
 		}
 		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone {
 			log.Fatal().
@@ -5619,32 +5609,6 @@ func runCompactSubcommand(args []string) {
 type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
-
-// gcsClusterModeRefusal refuses a GCS primary on a node that will run as a
-// cluster node (#1105: clusters on GCS land in part 4). clustering is
-// licenseHasClustering's answer; with cluster.enabled but no clustering
-// licence the node runs standalone, which GCS supports.
-func gcsClusterModeRefusal(cfg *config.Config, clustering bool) error {
-	if !cfg.Cluster.Enabled || !clustering {
-		return nil
-	}
-	if cfg.Storage.Backend == "gcs" {
-		return fmt.Errorf("storage.backend \"gcs\" is not supported in cluster mode yet; " +
-			"run this node standalone (cluster.enabled=false) or use another storage backend")
-	}
-	// A GCS cold tier on a cluster node waits for the same release: it has
-	// not been run on a cluster rig yet (scheduled with GCS clusters), and a
-	// cold tier that fails to start costs every node's queries their cold
-	// data. Gated on the cold tier's config (tiering and cold on), not on a
-	// tiering licence: refusing where the tier would not be built errs safe
-	// and is fixed by the same edit. A GCS backup target is allowed:
-	// cluster backups use it as any other destination.
-	if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled && cfg.TieredStorage.Cold.Backend == "gcs" {
-		return fmt.Errorf("tiered_storage.cold.backend \"gcs\" is not supported in cluster mode yet; " +
-			"run this node standalone (cluster.enabled=false) or use an S3 or Azure cold tier")
-	}
-	return nil
-}
 
 // coldGCSField returns v when this node will build a GCS cold tier
 // (tiering on, cold on, backend gcs), else "". A leftover gcs_bucket must not

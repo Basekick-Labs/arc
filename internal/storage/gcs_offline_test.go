@@ -14,8 +14,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -659,5 +661,50 @@ func TestGCSCredentialsLazyOutsidePrimary(t *testing.T) {
 		if _, err := creds.Token(context.Background()); err == nil || !strings.Contains(err.Error(), "no GCS credentials") {
 			t.Fatalf("role %q: first token error %v", r, err)
 		}
+	}
+}
+
+// #1105 part 4: a 429 (GCS's per-object write rate, bucket ramp-up) gets more
+// attempts than other transient errors, and every retry waits at least half
+// the rate-limit minimum, never close to zero.
+func TestGCSRetryRateLimit(t *testing.T) {
+	// The minimum is set above gcsRetry's 100 ms opening backoff so the
+	// test can tell "at least the rate-limit minimum" from the plain start.
+	oldMin, oldMax, oldN := gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff, gcsRateLimitAttempts
+	gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff, gcsRateLimitAttempts = 300*time.Millisecond, 300*time.Millisecond, 4
+	t.Cleanup(func() { gcsRateLimitMinBackoff, gcsRateLimitMaxBackoff, gcsRateLimitAttempts = oldMin, oldMax, oldN })
+
+	tooMany := &googleapi.Error{Code: http.StatusTooManyRequests}
+	calls := 0
+	var at []time.Time
+	err := gcsRetry(context.Background(), func() error {
+		calls++
+		at = append(at, time.Now())
+		return tooMany
+	})
+	if err == nil || calls != gcsRateLimitAttempts {
+		t.Fatalf("429 forever: %d calls, err %v; want %d calls then the error", calls, err, gcsRateLimitAttempts)
+	}
+	for i := 1; i < len(at); i++ {
+		if gap := at[i].Sub(at[i-1]); gap < gcsRateLimitMinBackoff/2 {
+			t.Fatalf("retry %d came after %v, under half the rate-limit minimum", i, gap)
+		}
+	}
+
+	calls = 0
+	if err := gcsRetry(context.Background(), func() error {
+		calls++
+		if calls < 3 {
+			return tooMany
+		}
+		return nil
+	}); err != nil || calls != 3 {
+		t.Fatalf("429 twice then success: %d calls, %v", calls, err)
+	}
+
+	calls = 0
+	unavailable := &googleapi.Error{Code: http.StatusServiceUnavailable}
+	if err := gcsRetry(context.Background(), func() error { calls++; return unavailable }); err == nil || calls != gcsRetryAttempts {
+		t.Fatalf("503 forever: %d calls; want the plain %d", calls, gcsRetryAttempts)
 	}
 }

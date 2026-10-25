@@ -21,6 +21,7 @@ import (
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
 	"github.com/basekick-labs/arc/internal/metrics"
+	gax "github.com/googleapis/gax-go/v2"
 	"github.com/rs/zerolog"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
@@ -348,6 +349,14 @@ var (
 // client's own 32 s per-chunk deadline.
 var gcsUploadRetries = 12
 
+// gcsUploadBackoff is the client's backoff for uploads: from 1 s, doubling to
+// 16 s. The client jitters it fully, so a single wait can still be short, but
+// the schedule is ten times slower than its 100 ms default, which a
+// rate-limited (429) write to one object name needs.
+func gcsUploadBackoff() *gax.Backoff {
+	return &gax.Backoff{Initial: time.Second, Max: 16 * time.Second, Multiplier: 2}
+}
+
 // gcsUploadRetry is the retry predicate for one upload call.
 func gcsUploadRetry() func(error) bool {
 	var n atomic.Int32
@@ -356,24 +365,59 @@ func gcsUploadRetry() func(error) bool {
 	}
 }
 
+// gcsRateLimit* bound gcsRetry once GCS answers 429. GCS limits writes to
+// one object name to about one per second, and a new bucket ramps up its
+// request rate, so a rate-limited call waits at least half a second and on
+// average more, with equal jitter (never close to zero), and gets more
+// attempts: ten, with backoff doubling to 16 s, roughly 45-95 s in all.
+// Cluster paths write and then delete the same name in quick succession (a
+// compaction manifest, a pending list), and the plain schedule above could
+// give up on such a pair in under two seconds (#1105). gcsRetry covers every
+// call but uploads; uploads retry through the client (gcsUploadRetry) with
+// gcsUploadBackoff.
+var (
+	gcsRateLimitAttempts   = 10
+	gcsRateLimitMinBackoff = time.Second
+	gcsRateLimitMaxBackoff = 16 * time.Second
+)
+
 // gcsRetry runs fn until it succeeds, fails with an error that is not
 // transient, runs out of attempts, or ctx ends.
 func gcsRetry(ctx context.Context, fn func() error) error {
 	wait := 100 * time.Millisecond
 	for attempt := 1; ; attempt++ {
 		err := fn()
-		if err == nil || attempt >= gcsRetryAttempts || !gcsTransient(err) {
+		if err == nil || !gcsTransient(err) {
 			return err
 		}
-		// Full jitter, so concurrent deletes in a batch do not retry in step.
-		t := time.NewTimer(time.Duration(rand.Int64N(int64(wait)) + 1))
+		var sleep time.Duration
+		if gcsHTTPCode(err) == http.StatusTooManyRequests {
+			if attempt >= gcsRateLimitAttempts {
+				return err
+			}
+			wait = min(max(wait, gcsRateLimitMinBackoff), gcsRateLimitMaxBackoff)
+			// Equal jitter: at least half the backoff, so a rate-limited
+			// retry never fires immediately.
+			sleep = wait/2 + time.Duration(rand.Int64N(int64(wait/2)+1))
+			wait = min(wait*2, gcsRateLimitMaxBackoff)
+		} else {
+			if attempt >= gcsRetryAttempts {
+				return err
+			}
+			// Full jitter, so concurrent deletes in a batch do not retry in
+			// step. Clamped first: a 429 earlier in this call may have left
+			// wait at the rate-limit maximum.
+			wait = min(wait, gcsRetryMaxBackoff)
+			sleep = time.Duration(rand.Int64N(int64(wait)) + 1)
+			wait = min(wait*2, gcsRetryMaxBackoff)
+		}
+		t := time.NewTimer(sleep)
 		select {
 		case <-ctx.Done():
 			t.Stop()
 			return err
 		case <-t.C:
 		}
-		wait = min(wait*2, gcsRetryMaxBackoff)
 	}
 }
 
@@ -570,7 +614,7 @@ func (b *GCSBackend) writeReader(ctx context.Context, path string, reader io.Rea
 	body := &sizedReader{r: reader, want: size}
 	_, err = b.svc.Objects.Insert(b.bucket, &gcs.Object{Name: key, ContentType: ct, Metadata: meta}).
 		Media(body, googleapi.ChunkSize(gcsUploadChunk(size)), googleapi.ContentType(ct), googleapi.EnableAutoChecksum()).
-		Fields("name").Context(ctx).WithRetry(nil, gcsUploadRetry()).Do()
+		Fields("name").Context(ctx).WithRetry(gcsUploadBackoff(), gcsUploadRetry()).Do()
 	if err != nil {
 		recordStorageError(ctx, err)
 		b.logger.Error().Err(err).Str("path", path).Int64("size", size).Msg("Failed to write to Google Cloud Storage")

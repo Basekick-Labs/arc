@@ -122,6 +122,54 @@ you manage the ServiceAccount externally (`serviceAccount.create=false`, set
 `serviceAccount.name`) — or authenticate via an EC2 instance profile — the chart
 does not require the annotation in values; attach the role to the SA out-of-band.
 
+### Google Cloud Storage (27.01.1+)
+
+Shared storage on GCS uses GCS's own API, so no HMAC keys. On GKE, Workload
+Identity needs no Secret:
+
+```yaml
+storage:
+  mode: shared
+  shared:
+    backend: gcs
+    external: true
+    bucket: my-arc-data
+    prefix: prod/               # optional
+serviceAccount:
+  create: true                  # the annotation only lands on a chart-created ServiceAccount
+  annotations:
+    iam.gke.io/gcp-service-account: arc@my-project.iam.gserviceaccount.com
+```
+
+Bind it on the Google side: grant the Kubernetes ServiceAccount
+`roles/iam.workloadIdentityUser` on that Google service account.
+
+Elsewhere, put a service-account key in a Secret and name it; it is mounted
+read-only on every role:
+
+```bash
+kubectl create secret generic arc-gcs-key --from-file=key.json=./key.json
+```
+
+```yaml
+storage:
+  shared:
+    backend: gcs
+    external: true
+    bucket: my-arc-data
+    gcs:
+      credentialsSecret: arc-gcs-key   # key inside it: gcs.credentialsKey (default key.json)
+```
+
+A GCS **cold tier** with local storage (Pattern 1) is configured through the
+Arc settings (`tiered_storage.cold.*` via `extraEnv`); the key Secret above is
+for shared storage only, so use Workload Identity there.
+
+The identity needs `roles/storage.objectAdmin` on the bucket, plus
+`storage.buckets.get` for Arc's startup checks of the bucket's settings. Use a
+bucket without hierarchical namespace or requester pays, and turn soft delete
+off: compaction deletes continuously.
+
 ### Authentication (admin token + cluster replication)
 
 ```yaml

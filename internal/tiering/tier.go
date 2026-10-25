@@ -86,7 +86,7 @@ type MigrationRecord struct {
 type TieredPath struct {
 	Path    string `json:"path"`
 	Tier    Tier   `json:"tier"`
-	Backend string `json:"backend"` // "local", "s3", "azure"
+	Backend string `json:"backend"` // "local", "s3", "azure", "gcs"
 }
 
 // TierStats holds statistics for a single tier

@@ -38,6 +38,7 @@ require (
 	github.com/apache/iceberg-go v0.7.0
 	github.com/aws/smithy-go v1.28.1
 	github.com/geoarrow/geoarrow-go v0.0.0-20260403143023-f54751c3e3a1
+	github.com/googleapis/gax-go/v2 v2.24.0
 	github.com/hashicorp/go-msgpack/v2 v2.1.2
 	github.com/spf13/cast v1.6.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
@@ -95,7 +96,6 @@ require (
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.20 // indirect
-	github.com/googleapis/gax-go/v2 v2.24.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/go-metrics v0.5.4 // indirect

@@ -104,7 +104,7 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # azure_container = ""
 # azure_prefix = "instances/abc123"
 #
-# Google Cloud Storage (when backend = "gcs"). Standalone nodes only for now.
+# Google Cloud Storage (when backend = "gcs"). Standalone or cluster shared storage.
 # Authenticates with Application Default Credentials (GKE Workload Identity,
 # the GCE/Cloud Run metadata server, GOOGLE_APPLICATION_CREDENTIALS) unless a
 # service-account key file is set.
@@ -479,7 +479,7 @@ azure_use_managed_identity = false
 # cannot be cleared by an empty environment variable.
 # azure_prefix = "cold"
 
-# GCS (when backend = "gcs"). Standalone nodes only for now. Credentials as for
+# GCS (when backend = "gcs"). Credentials as for
 # [storage] gcs_*: a service-account key file, else Application Default
 # Credentials. Use a STANDARD (or Autoclass) bucket: colder classes charge
 # retrieval on every query read of cold data. Must not overlap [storage].

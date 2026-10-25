@@ -4569,7 +4569,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// the snapshot dropped (#962). It MUST NOT block. It hands the path to
 		// the delete-worker pool, which waits a short grace period so
 		// in-flight queries scanning the old file can finish and then calls
-		// backend.Delete. On non-local backends (S3, Azure) the compactor
+		// backend.Delete. On non-local backends (S3, Azure, GCS) the compactor
 		// that issued DeleteFile has already removed the shared object, so
 		// there is no local-side action.
 		//
