@@ -1769,7 +1769,9 @@ string encoding". A binary column is now stored as binary when:
 A column whose values are all text is still a string, as Spark and Hive write
 string columns that way. The first batch with a value decides; a later value
 that is not text in a column decided as text is refused. `LargeBinary` columns
-are imported too (they were refused as unsupported).
+are imported too (they were refused as unsupported), and a fixed-length binary
+column (such as a 16-byte UUID) follows the same rules instead of always
+becoming a string.
 
 A column an earlier import already stored as a string holding binary data
 cannot be read. Import the binary values into a new column: writing bytes to
