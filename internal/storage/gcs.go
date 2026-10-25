@@ -7,35 +7,48 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
-	"cloud.google.com/go/storage"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 	"google.golang.org/api/googleapi"
-	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	gcs "google.golang.org/api/storage/v1"
 )
 
 // gcsScope is the OAuth scope every GCS credential is minted for: object
 // reads, writes and deletes, and the bucket metadata read of the startup probe.
 const gcsScope = "https://www.googleapis.com/auth/devstorage.read_write"
 
-// gcsDeleteConcurrency bounds DeleteBatch. The JSON API has no batch delete
-// the Go client exposes, so a batch is single deletes run side by side.
+// gcsDeleteConcurrency bounds DeleteBatch. The JSON API's batch endpoint takes
+// a hand-built multipart body; single deletes side by side are simpler and
+// carry the same per-key retry and error handling as Delete.
 const gcsDeleteConcurrency = 16
+
+// gcsChunkSize is the resumable-upload chunk: the upload buffers this much per
+// write, and an object no larger goes in one request.
+const gcsChunkSize = 16 << 20
 
 // GCSBackend implements the Backend interface for Google Cloud Storage over
 // the native JSON API (#1105). It is not the S3 backend pointed at GCS's XML
 // interoperability endpoint: that needs HMAC keys, cannot use Application
 // Default Credentials or GKE Workload Identity, and classes the bucket as S3.
+//
+// It uses the generated JSON API package, not cloud.google.com/go/storage.
+// That client links gRPC, xDS and an OpenTelemetry metrics exporter whether or
+// not they are used, which added 28.6 MB to the Arc binary against 3.6 MB for
+// this package (measured on #1105). Every Arc user would carry that, most of
+// them without ever configuring GCS.
 //
 // It implements ObjectCopier, so cluster mode can stage compaction outputs and
 // copy them into place. It deliberately does NOT implement ObjectMover,
@@ -44,7 +57,7 @@ const gcsDeleteConcurrency = 16
 // writes (#744). A GCS upload is invisible until it is finalised, so there is
 // never a partial to inspect, and an object store takes the copier branch.
 type GCSBackend struct {
-	client   *storage.Client
+	svc      *gcs.Service
 	bucket   string
 	prefix   string // object-name prefix within the bucket (validated, with trailing /)
 	endpoint string
@@ -87,7 +100,8 @@ type GCSConfig struct {
 	// metadata server (GCE, GKE Workload Identity, Cloud Run).
 
 	// Endpoint overrides the JSON API endpoint (Private Service Connect, an
-	// emulator). Empty means Google's default.
+	// emulator), e.g. "https://storage-psc.p.googleapis.com/storage/v1/".
+	// Empty means Google's default.
 	Endpoint string
 }
 
@@ -133,20 +147,13 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 		}
 	}
 
-	ctx := context.Background()
-	client, err := storage.NewClient(ctx, opts...)
+	svc, err := gcs.NewService(context.Background(), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCS client: %w", err)
 	}
-	// Retry every operation, not only the ones the client deems idempotent.
-	// The default leaves precondition-less writes and deletes unretried, and
-	// Arc sets no preconditions. That is safe here: output keys are unique per
-	// flush and per compaction (#1282), CopyObject replaces its destination by
-	// contract, and Delete treats "already gone" as success.
-	client.SetRetry(storage.WithPolicy(storage.RetryAlways))
 
 	b := &GCSBackend{
-		client:   client,
+		svc:      svc,
 		bucket:   strings.TrimSpace(cfg.Bucket),
 		prefix:   prefix,
 		endpoint: cfg.Endpoint,
@@ -159,7 +166,6 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 	}
 
 	if err := b.probeBucket(); err != nil {
-		client.Close()
 		return nil, err
 	}
 	return b, nil
@@ -193,14 +199,85 @@ func gcsCredentials(cfg *GCSConfig) (*auth.Credentials, error) {
 	return creds, nil
 }
 
+// Every call is retried, not only the ones the API deems idempotent. Arc sets
+// no preconditions, and that is safe here: output keys are unique per flush
+// and per compaction (#1282), CopyObject replaces its destination by contract,
+// and Delete treats "already gone" as success.
+//
+// Uploads use the client's own retry (WithRetry(nil, nil): its backoff and its
+// retryable set), which also retries each chunk of a resumable upload. The
+// generated client offers WithRetry on uploads only, so every other call goes
+// through gcsRetry, which retries the same set.
+
+// gcsRetryAttempts and gcsRetryMaxBackoff bound gcsRetry: six attempts with
+// backoff doubling from 100 ms, under 4 s of waiting in all.
+var (
+	gcsRetryAttempts   = 6
+	gcsRetryMaxBackoff = 2 * time.Second
+)
+
+// gcsRetry runs fn until it succeeds, fails with an error that is not
+// transient, runs out of attempts, or ctx ends.
+func gcsRetry(ctx context.Context, fn func() error) error {
+	wait := 100 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		err := fn()
+		if err == nil || attempt >= gcsRetryAttempts || !gcsTransient(err) {
+			return err
+		}
+		// Full jitter, so concurrent deletes in a batch do not retry in step.
+		t := time.NewTimer(time.Duration(rand.Int64N(int64(wait)) + 1))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return err
+		case <-t.C:
+		}
+		wait = min(wait*2, gcsRetryMaxBackoff)
+	}
+}
+
+// gcsTransient reports an error worth retrying: a 408, 429 or 5xx from the
+// API, or a transport failure that is not the caller's own cancellation. By
+// status code and error type, never by text (#1238).
+func gcsTransient(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	switch code := gcsHTTPCode(err); {
+	case code == http.StatusRequestTimeout, code == http.StatusTooManyRequests, code >= 500:
+		return true
+	case code != 0:
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// gcsHTTPCode is the HTTP status of a JSON API error, or 0.
+func gcsHTTPCode(err error) int {
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) {
+		return gerr.Code
+	}
+	return 0
+}
+
 // probeBucket reads the bucket's attributes once at construction. See
 // NewGCSBackend for what it refuses and what it only reports.
 func (b *GCSBackend) probeBucket() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	attrs, err := b.client.Bucket(b.bucket).Attrs(ctx)
+	var attrs *gcs.Bucket
+	err := gcsRetry(ctx, func() (err error) {
+		attrs, err = b.svc.Buckets.Get(b.bucket).Fields("hierarchicalNamespace", "softDeletePolicy").Context(ctx).Do()
+		return err
+	})
 	switch {
-	case errors.Is(err, storage.ErrBucketNotExist):
+	case gcsHTTPCode(err) == http.StatusNotFound:
 		b.logger.Warn().Str("bucket", b.bucket).Msg("GCS bucket does not exist (create it before writing)")
 		return nil
 	case err != nil:
@@ -211,8 +288,9 @@ func (b *GCSBackend) probeBucket() error {
 	if attrs.HierarchicalNamespace != nil && attrs.HierarchicalNamespace.Enabled {
 		return fmt.Errorf("GCS bucket %q has hierarchical namespace enabled, which Arc does not support; use a bucket without it", b.bucket)
 	}
-	if attrs.SoftDeletePolicy != nil && attrs.SoftDeletePolicy.RetentionDuration > 0 {
-		b.logger.Warn().Str("bucket", b.bucket).Dur("retention", attrs.SoftDeletePolicy.RetentionDuration).
+	if attrs.SoftDeletePolicy != nil && attrs.SoftDeletePolicy.RetentionDurationSeconds > 0 {
+		b.logger.Warn().Str("bucket", b.bucket).
+			Dur("retention", time.Duration(attrs.SoftDeletePolicy.RetentionDurationSeconds)*time.Second).
 			Msg("GCS bucket has soft delete on: compaction and retention delete objects continuously, and deleted bytes stay billed for the retention period")
 	}
 	b.logger.Info().Str("bucket", b.bucket).Msg("Successfully connected to Google Cloud Storage bucket")
@@ -235,10 +313,6 @@ func (b *GCSBackend) prefixedListPrefix(prefix string) (string, error) {
 	return b.prefix + prefix, nil
 }
 
-func (b *GCSBackend) object(name string) *storage.ObjectHandle {
-	return b.client.Bucket(b.bucket).Object(name)
-}
-
 func gcsContentType(path string) string {
 	if strings.HasSuffix(path, ".parquet") {
 		return "application/vnd.apache.parquet"
@@ -256,42 +330,49 @@ func (b *GCSBackend) WriteReader(ctx context.Context, path string, reader io.Rea
 	return b.writeReader(ctx, path, reader, size, nil)
 }
 
+// sizedReader passes r through and fails instead of reaching EOF when the
+// bytes it delivered differ from want (when want > 0).
+type sizedReader struct {
+	r    io.Reader
+	want int64
+	n    int64
+}
+
+func (s *sizedReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	s.n += int64(n)
+	if s.want > 0 && s.n > s.want {
+		return n, fmt.Errorf("source supplied more than the %d bytes declared", s.want)
+	}
+	if err == io.EOF && s.want > 0 && s.n != s.want {
+		return n, fmt.Errorf("source supplied %d bytes, expected %d", s.n, s.want)
+	}
+	return n, err
+}
+
 // writeReader is WriteReader with custom metadata on the object (nil: none).
 //
-// An object appears only when the upload is finalised, which Writer.Close
-// does. So the one thing this must never do is call Close on an upload that
-// went wrong: Close after a failed source reader commits whatever arrived, a
-// truncated object under a valid name. Every failure cancels the writer's
-// context instead, which abandons the upload. A declared size that the reader
-// does not match is such a failure, as it is on S3, whose PutObject refuses a
-// body of the wrong length.
+// An object appears only when the upload is finalised, and the upload is
+// finalised only by the request that carries the reader's EOF. So any failure
+// of the reader, including a body that does not match the declared size (as on
+// S3, whose PutObject refuses a body of the wrong length), surfaces before
+// that request and abandons the upload: a failed write never commits a
+// truncated object under a valid name.
 //
-// The client checksums the upload (CRC32C) and, with the default chunking,
-// sends the checksum with the final request, so GCS refuses to finalise bytes
-// that were corrupted in transit.
+// The upload is checksummed (CRC32C, computed while streaming and sent with
+// the final request), so GCS also refuses to finalise bytes corrupted in
+// transit.
 func (b *GCSBackend) writeReader(ctx context.Context, path string, reader io.Reader, size int64, meta map[string]string) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
 	}
 	start := time.Now()
-
-	wctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	w := b.object(key).NewWriter(wctx)
-	w.ContentType = gcsContentType(path)
-	w.Metadata = meta
-
-	n, err := io.Copy(w, reader)
-	if err == nil && size > 0 && n != size {
-		err = fmt.Errorf("source supplied %d bytes, expected %d", n, size)
-	}
-	if err == nil {
-		err = w.Close()
-	} else {
-		cancel()
-		_ = w.Close()
-	}
+	ct := gcsContentType(path)
+	body := &sizedReader{r: reader, want: size}
+	_, err = b.svc.Objects.Insert(b.bucket, &gcs.Object{Name: key, ContentType: ct, Metadata: meta}).
+		Media(body, googleapi.ChunkSize(gcsChunkSize), googleapi.ContentType(ct), googleapi.EnableAutoChecksum()).
+		Fields("name").Context(ctx).WithRetry(nil, nil).Do()
 	if err != nil {
 		recordStorageError(ctx, err)
 		b.logger.Error().Err(err).Str("path", path).Int64("size", size).Msg("Failed to write to Google Cloud Storage")
@@ -299,10 +380,10 @@ func (b *GCSBackend) writeReader(ctx context.Context, path string, reader io.Rea
 	}
 
 	metrics.Get().IncStorageWrites()
-	if n > 0 {
-		metrics.Get().IncStorageWriteBytes(n)
+	if body.n > 0 {
+		metrics.Get().IncStorageWriteBytes(body.n)
 	}
-	b.logger.Debug().Str("path", path).Int64("size", n).Str("bucket", b.bucket).
+	b.logger.Debug().Str("path", path).Int64("size", body.n).Str("bucket", b.bucket).
 		Dur("duration", time.Since(start)).Msg("Wrote to Google Cloud Storage")
 	return nil
 }
@@ -322,7 +403,7 @@ func (b *GCSBackend) ReadTo(ctx context.Context, path string, writer io.Writer) 
 }
 
 // ReadToAt reads data from Google Cloud Storage starting at offset and writes
-// it to writer. offset=0 reads the whole object.
+// it to writer. offset=0 reads the whole object without a Range header.
 func (b *GCSBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
 	if offset < 0 {
 		return fmt.Errorf("negative offset %d", offset)
@@ -331,14 +412,22 @@ func (b *GCSBackend) ReadToAt(ctx context.Context, path string, writer io.Writer
 	if err != nil {
 		return err
 	}
-	r, err := b.object(key).NewRangeReader(ctx, offset, -1)
+	var resp *http.Response
+	err = gcsRetry(ctx, func() (err error) {
+		call := b.svc.Objects.Get(b.bucket, key).Context(ctx)
+		if offset > 0 {
+			call.Header().Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		}
+		resp, err = call.Download()
+		return err
+	})
 	if err != nil {
 		recordStorageError(ctx, err)
 		return b.objectError(ctx, "failed to read from Google Cloud Storage", err)
 	}
-	defer r.Close()
+	defer resp.Body.Close()
 
-	n, err := io.Copy(writer, r)
+	n, err := io.Copy(writer, resp.Body)
 	// Count bytes delivered even when the copy fails mid-stream: partial
 	// transfers are real network egress.
 	if n > 0 {
@@ -367,15 +456,24 @@ func (b *GCSBackend) Exists(ctx context.Context, path string) (bool, error) {
 	return size >= 0, nil
 }
 
-// Delete deletes an object from Google Cloud Storage. An object that is
-// already gone, or whose bucket is, is what Delete wants: GCS answers both
-// with the same 404, and either way nothing remains to delete.
+// deleteObject deletes one object by its full name. An object that is already
+// gone, or whose bucket is, is what a delete wants: GCS answers both with a
+// 404, and either way nothing remains to delete.
+func (b *GCSBackend) deleteObject(ctx context.Context, name string) error {
+	err := gcsRetry(ctx, func() error { return b.svc.Objects.Delete(b.bucket, name).Context(ctx).Do() })
+	if err != nil && gcsHTTPCode(err) != http.StatusNotFound {
+		return err
+	}
+	return nil
+}
+
+// Delete deletes an object from Google Cloud Storage.
 func (b *GCSBackend) Delete(ctx context.Context, path string) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
 	}
-	if err := b.object(key).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+	if err := b.deleteObject(ctx, key); err != nil {
 		return fmt.Errorf("failed to delete from Google Cloud Storage: %w", err)
 	}
 	b.logger.Debug().Str("path", path).Msg("Deleted from Google Cloud Storage")
@@ -405,8 +503,8 @@ func (b *GCSBackend) DeleteBatch(ctx context.Context, paths []string) error {
 		wg.Add(1)
 		go func(name string) {
 			defer func() { <-sem; wg.Done() }()
-			err := b.object(name).Delete(ctx)
-			if err == nil || errors.Is(err, storage.ErrObjectNotExist) {
+			err := b.deleteObject(ctx, name)
+			if err == nil {
 				return
 			}
 			// Reported on the UNPREFIXED spelling the caller passed (#1111).
@@ -429,27 +527,57 @@ func (b *GCSBackend) DeleteBatch(ctx context.Context, paths []string) error {
 	return nil
 }
 
-// eachObject calls fn for every object under the full (already prefixed)
-// listing prefix, with its key relative to the backend prefix, until fn
-// returns false. A missing bucket is ErrStoreNotFound.
-func (b *GCSBackend) eachObject(ctx context.Context, fullPrefix string, fn func(key string, attrs *storage.ObjectAttrs) bool) error {
-	q := &storage.Query{Prefix: fullPrefix, Projection: storage.ProjectionNoACL}
-	if err := q.SetAttrSelection([]string{"Name", "Size", "Updated"}); err != nil {
-		return err
+// listPages walks the listing of the full (already prefixed) prefix, with an
+// optional delimiter, calling fn per page until it returns false. A missing
+// bucket is ErrStoreNotFound.
+func (b *GCSBackend) listPages(ctx context.Context, fullPrefix, delimiter string, fn func(*gcs.Objects) bool) error {
+	call := b.svc.Objects.List(b.bucket).Prefix(fullPrefix).Projection("noAcl").
+		Fields("items(name,size,updated)", "prefixes", "nextPageToken")
+	if delimiter != "" {
+		call = call.Delimiter(delimiter)
 	}
-	it := b.client.Bucket(b.bucket).Objects(ctx, q)
-	for {
-		attrs, err := it.Next()
-		if err == iterator.Done {
-			return nil
-		}
+	// Paged by hand rather than with Pages, so each page is retried on its
+	// own instead of a transient error restarting the whole walk.
+	var err error
+	for token := ""; ; {
+		var page *gcs.Objects
+		err = gcsRetry(ctx, func() (err error) {
+			page, err = call.PageToken(token).Context(ctx).Do()
+			return err
+		})
 		if err != nil {
-			return gcsListError("failed to list GCS objects", err)
+			break
 		}
-		if !fn(strings.TrimPrefix(attrs.Name, b.prefix), attrs) {
+		if !fn(page) || page.NextPageToken == "" {
 			return nil
 		}
+		token = page.NextPageToken
 	}
+	switch {
+	case gcsHTTPCode(err) == http.StatusNotFound:
+		// A listing addresses the bucket, so its 404 is the bucket's.
+		return fmt.Errorf("failed to list GCS objects: %w: %w", err, ErrStoreNotFound)
+	default:
+		return fmt.Errorf("failed to list GCS objects: %w", err)
+	}
+}
+
+// eachObject calls fn for every object under the full listing prefix, with its
+// key relative to the backend prefix, until fn returns false.
+func (b *GCSBackend) eachObject(ctx context.Context, fullPrefix string, fn func(key string, info ObjectInfo) bool) error {
+	return b.listPages(ctx, fullPrefix, "", func(page *gcs.Objects) bool {
+		for _, o := range page.Items {
+			key := strings.TrimPrefix(o.Name, b.prefix)
+			info := ObjectInfo{Path: key, Size: int64(o.Size)}
+			if t, err := time.Parse(time.RFC3339Nano, o.Updated); err == nil {
+				info.LastModified = t
+			}
+			if !fn(key, info) {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // List lists objects with the given prefix. Like every listing here it never
@@ -460,7 +588,7 @@ func (b *GCSBackend) List(ctx context.Context, prefix string) ([]string, error) 
 		return nil, err
 	}
 	var keys []string
-	err = b.eachObject(ctx, fullPrefix, func(key string, _ *storage.ObjectAttrs) bool {
+	err = b.eachObject(ctx, fullPrefix, func(key string, _ ObjectInfo) bool {
 		if _, err := b.prefixedKey(key); err == nil {
 			keys = append(keys, key)
 		}
@@ -479,9 +607,9 @@ func (b *GCSBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectIn
 		return nil, err
 	}
 	var objects []ObjectInfo
-	err = b.eachObject(ctx, fullPrefix, func(key string, attrs *storage.ObjectAttrs) bool {
+	err = b.eachObject(ctx, fullPrefix, func(key string, info ObjectInfo) bool {
 		if _, err := b.prefixedKey(key); err == nil {
-			objects = append(objects, ObjectInfo{Path: key, Size: attrs.Size, LastModified: attrs.Updated})
+			objects = append(objects, info)
 		}
 		return true
 	})
@@ -499,7 +627,7 @@ func (b *GCSBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (
 		return false, err
 	}
 	found := false
-	err = b.eachObject(ctx, fullPrefix, func(key string, _ *storage.ObjectAttrs) bool {
+	err = b.eachObject(ctx, fullPrefix, func(key string, _ ObjectInfo) bool {
 		_, kerr := b.prefixedKey(key)
 		found = kerr == nil
 		return !found
@@ -520,7 +648,7 @@ func (b *GCSBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusabl
 		return nil, err
 	}
 	var objects []UnusableObject
-	err = b.eachObject(ctx, fullPrefix, func(key string, attrs *storage.ObjectAttrs) bool {
+	err = b.eachObject(ctx, fullPrefix, func(key string, info ObjectInfo) bool {
 		_, reason := b.prefixedKey(key)
 		if reason == nil {
 			return true // ListObjects returns it
@@ -528,10 +656,10 @@ func (b *GCSBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusabl
 		// A zero-length name ending in a separator is a folder placeholder
 		// (the Cloud Console's "Create folder" writes one). Heuristic, as on
 		// S3: the size is part of the test, not the suffix alone.
-		if attrs.Size == 0 && strings.HasSuffix(key, "/") {
+		if info.Size == 0 && strings.HasSuffix(key, "/") {
 			return true
 		}
-		objects = append(objects, UnusableObject{Path: key, Size: attrs.Size, LastModified: attrs.Updated, Err: reason})
+		objects = append(objects, UnusableObject{Path: key, Size: info.Size, LastModified: info.LastModified, Err: reason})
 		return true
 	})
 	if err != nil {
@@ -550,36 +678,29 @@ func (b *GCSBackend) ListDirectories(ctx context.Context, prefix string) ([]stri
 	if err != nil {
 		return nil, err
 	}
-	q := &storage.Query{Prefix: fullPrefix, Delimiter: "/", Projection: storage.ProjectionNoACL}
-	if err := q.SetAttrSelection([]string{"Name"}); err != nil {
+	var dirs []string
+	err = b.listPages(ctx, fullPrefix, "/", func(page *gcs.Objects) bool {
+		for _, p := range page.Prefixes {
+			// Trim fullPrefix, not the caller's prefix: the names come back
+			// with the backend prefix attached (see S3Backend.ListDirectories).
+			dir := strings.TrimSuffix(strings.TrimPrefix(p, fullPrefix), "/")
+			if dir != "" && !strings.HasPrefix(dir, ".") {
+				dirs = append(dirs, dir)
+			}
+		}
+		return true
+	})
+	if err != nil {
 		return nil, err
 	}
-	var dirs []string
-	it := b.client.Bucket(b.bucket).Objects(ctx, q)
-	for {
-		attrs, err := it.Next()
-		if err == iterator.Done {
-			return dirs, nil
-		}
-		if err != nil {
-			return nil, gcsListError("failed to list GCS directories", err)
-		}
-		if attrs.Prefix == "" {
-			continue // an object directly under prefix, not a directory
-		}
-		// Trim fullPrefix, not the caller's prefix: the names come back with
-		// the backend prefix attached (see S3Backend.ListDirectories).
-		dir := strings.TrimSuffix(strings.TrimPrefix(attrs.Prefix, fullPrefix), "/")
-		if dir != "" && !strings.HasPrefix(dir, ".") {
-			dirs = append(dirs, dir)
-		}
-	}
+	return dirs, nil
 }
 
-// Close closes the GCS client.
+// Close closes the GCS backend (no-op: the service holds no connections of
+// its own beyond the shared HTTP transport).
 func (b *GCSBackend) Close() error {
 	b.logger.Info().Msg("Google Cloud Storage backend closed")
-	return b.client.Close()
+	return nil
 }
 
 // GetBucket returns the bucket name.
@@ -627,10 +748,9 @@ const (
 )
 
 // confirmObjectAbsent tells a missing object from a missing bucket. Every
-// object call (read, metadata, delete) answers both with ErrObjectNotExist:
-// verified against real GCS on #1105, where even the JSON API's "The
-// specified bucket does not exist" is classed as an object error by the
-// client. Only the bucket's own metadata and a listing say ErrBucketNotExist.
+// object call (read, metadata, delete) answers both with a 404, and the media
+// download's 404 carries no reason at all (verified against real GCS on
+// #1105). Only the bucket's own metadata and a listing address the bucket.
 //
 // A bucket the probe finds missing is ErrStoreNotFound, which is what a
 // listing of it reports too. Any other answer leaves the object absent: the
@@ -651,46 +771,33 @@ func (b *GCSBackend) confirmObjectAbsent(ctx context.Context) error {
 			return nil
 		}
 	}
-	_, err := b.client.Bucket(b.bucket).Attrs(ctx)
-	missing := errors.Is(err, storage.ErrBucketNotExist)
-	var gerr *googleapi.Error
-	conclusive := err == nil || missing || (errors.As(err, &gerr) && gerr.Code == http.StatusForbidden)
-	if conclusive {
+	err := gcsRetry(ctx, func() error {
+		_, err := b.svc.Buckets.Get(b.bucket).Fields("name").Context(ctx).Do()
+		return err
+	})
+	code := gcsHTTPCode(err)
+	missing := code == http.StatusNotFound
+	if err == nil || missing || code == http.StatusForbidden {
 		b.bucketMissing.Store(missing)
 		b.bucketCheckedAt.Store(time.Now().UnixNano())
 	}
 	if missing {
-		// Wraps the bucket's answer, never the object's: the object's
-		// ErrObjectNotExist would read as a missing object to IsNotFound.
 		return fmt.Errorf("bucket %s: %w: %w", b.bucket, err, ErrStoreNotFound)
 	}
 	return nil
 }
 
-// objectError wraps a failed object call. A not-found becomes
-// ErrStoreNotFound when the bucket is gone (confirmObjectAbsent), and stays a
-// missing object otherwise.
+// objectError wraps a failed object call. A 404 is ErrStoreNotFound when the
+// bucket is gone (confirmObjectAbsent) and ErrObjectNotFound otherwise, which
+// is how IsNotFound recognises a missing GCS object: by the sentinel this
+// wraps, not by the API error's code, because the same 404 from a listing
+// means the bucket.
 func (b *GCSBackend) objectError(ctx context.Context, what string, err error) error {
-	if errors.Is(err, storage.ErrObjectNotExist) {
+	if gcsHTTPCode(err) == http.StatusNotFound {
 		if storeErr := b.confirmObjectAbsent(ctx); storeErr != nil {
 			return fmt.Errorf("%s: %w", what, storeErr)
 		}
+		return fmt.Errorf("%s: %w: %w", what, ErrObjectNotFound, err)
 	}
 	return fmt.Errorf("%s: %w", what, err)
-}
-
-// gcsListError wraps a listing failure, tagging a missing bucket with
-// ErrStoreNotFound while keeping the client's error in the chain.
-func gcsListError(what string, err error) error {
-	if errors.Is(err, storage.ErrBucketNotExist) {
-		return fmt.Errorf("%s: %w: %w", what, err, ErrStoreNotFound)
-	}
-	return fmt.Errorf("%s: %w", what, err)
-}
-
-// isGCSNotFoundError reports the GCS client saying an object does not exist.
-// By sentinel, never by text (#1238). A missing bucket never reaches a caller
-// carrying this sentinel: objectError replaces it with ErrStoreNotFound.
-func isGCSNotFoundError(err error) bool {
-	return errors.Is(err, storage.ErrObjectNotExist)
 }

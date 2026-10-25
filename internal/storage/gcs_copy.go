@@ -2,11 +2,11 @@ package storage
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
+	"net/http"
 
-	"cloud.google.com/go/storage"
+	gcs "google.golang.org/api/storage/v1"
 )
 
 // WriteReaderWithSHA is WriteReader recording sha as custom object metadata.
@@ -22,9 +22,13 @@ func (b *GCSBackend) ObjectSHA(ctx context.Context, path string) (int64, string,
 	if err != nil {
 		return 0, "", err
 	}
-	attrs, err := b.object(key).Attrs(ctx)
+	var obj *gcs.Object
+	err = gcsRetry(ctx, func() (err error) {
+		obj, err = b.svc.Objects.Get(b.bucket, key).Fields("size", "metadata").Context(ctx).Do()
+		return err
+	})
 	if err != nil {
-		if errors.Is(err, storage.ErrObjectNotExist) {
+		if gcsHTTPCode(err) == http.StatusNotFound {
 			if storeErr := b.confirmObjectAbsent(ctx); storeErr != nil {
 				return -1, "", fmt.Errorf("stat %s: %w", path, storeErr)
 			}
@@ -32,17 +36,17 @@ func (b *GCSBackend) ObjectSHA(ctx context.Context, path string) (int64, string,
 		}
 		return -1, "", fmt.Errorf("stat %s: %w", path, err)
 	}
-	return attrs.Size, objectSHA(attrs.Metadata), nil
+	return int64(obj.Size), objectSHA(obj.Metadata), nil
 }
 
-// CopyObject copies src to dst inside the bucket with the rewrite API. The
-// client's Copier.Run repeats the rewrite call until GCS reports it done, so
-// an object of any size copies server side, and dst appears only once the
-// copy is complete. An existing dst is replaced.
+// CopyObject copies src to dst inside the bucket with the rewrite API,
+// repeating the call with its rewrite token until GCS reports it done, so an
+// object of any size copies server side. dst appears only once the copy is
+// complete; an existing dst is replaced.
 //
-// Metadata is set explicitly rather than carried from src: when the copier
-// names any metadata it replaces the source's, so dst records exactly sha.
-// The content type is set for the same reason.
+// The destination resource names its metadata and content type: a rewrite
+// given a resource takes the destination's metadata from it, not from src, so
+// dst records exactly sha.
 func (b *GCSBackend) CopyObject(ctx context.Context, src, dst string, size int64, sha string) error {
 	srcKey, err := b.prefixedKey(src)
 	if err != nil {
@@ -52,12 +56,22 @@ func (b *GCSBackend) CopyObject(ctx context.Context, src, dst string, size int64
 	if err != nil {
 		return err
 	}
-	c := b.object(dstKey).CopierFrom(b.object(srcKey))
-	c.ContentType = gcsContentType(dst)
-	c.Metadata = shaMetadata(sha)
-	if _, err := c.Run(ctx); err != nil {
-		recordStorageError(ctx, err)
-		return b.objectError(ctx, fmt.Sprintf("copy %s -> %s", src, dst), err)
+	call := b.svc.Objects.Rewrite(b.bucket, srcKey, b.bucket, dstKey,
+		&gcs.Object{ContentType: gcsContentType(dst), Metadata: shaMetadata(sha)}).
+		Fields("done", "rewriteToken")
+	for {
+		var resp *gcs.RewriteResponse
+		err := gcsRetry(ctx, func() (err error) {
+			resp, err = call.Context(ctx).Do()
+			return err
+		})
+		if err != nil {
+			recordStorageError(ctx, err)
+			return b.objectError(ctx, fmt.Sprintf("copy %s -> %s", src, dst), err)
+		}
+		if resp.Done {
+			return nil
+		}
+		call = call.RewriteToken(resp.RewriteToken)
 	}
-	return nil
 }

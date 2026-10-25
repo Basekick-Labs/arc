@@ -29,6 +29,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/rs/zerolog"
+	gcs "google.golang.org/api/storage/v1"
 )
 
 // gcsBackend builds a backend against ARC_TEST_GCS_BUCKET rooted at prefix
@@ -233,14 +234,12 @@ func TestGCSListUnusablePartitionsTheBucket(t *testing.T) {
 	b := gcsBackend(t, prefix)
 	put := func(name string, body []byte) {
 		t.Helper()
-		w := b.client.Bucket(b.bucket).Object(b.prefix + name).NewWriter(ctx)
-		if _, err := w.Write(body); err != nil {
-			t.Fatal(err)
-		}
-		if err := w.Close(); err != nil {
+		_, err := b.svc.Objects.Insert(b.bucket, &gcs.Object{Name: b.prefix + name}).
+			Media(bytes.NewReader(body)).Context(ctx).Do()
+		if err != nil {
 			t.Fatalf("raw put %s: %v", name, err)
 		}
-		t.Cleanup(func() { _ = b.client.Bucket(b.bucket).Object(b.prefix + name).Delete(context.Background()) })
+		t.Cleanup(func() { _ = b.deleteObject(context.Background(), b.prefix+name) })
 	}
 	put("db/m/good.parquet", []byte("x"))
 	put("db/m/bad.parquet.part", []byte("committed bytes"))

@@ -34,6 +34,10 @@ type gcsStub struct {
 	objects []string
 	// deleteStatus answers DELETE for a full name; absent means 204.
 	deleteStatus map[string]int
+	// flaky answers 503 to that many DELETEs of a full name before
+	// deleteStatus applies; deletes counts every DELETE per name.
+	flaky   map[string]int
+	deletes map[string]int
 	// seen records the prefix query of every list call and the number of
 	// bucket metadata reads.
 	seenPrefixes []string
@@ -94,6 +98,16 @@ func (s *gcsStub) handler(t *testing.T) http.HandlerFunc {
 			notFound("No such object")
 		case strings.HasPrefix(rest, "o/") && r.Method == http.MethodDelete:
 			name, _ := url.PathUnescape(strings.TrimPrefix(rest, "o/"))
+			if s.deletes == nil {
+				s.deletes = map[string]int{}
+			}
+			s.deletes[name]++
+			if s.flaky[name] > 0 {
+				s.flaky[name]--
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":{"code":503,"message":"try again"}}`))
+				return
+			}
 			if code, ok := s.deleteStatus[name]; ok {
 				w.WriteHeader(code)
 				_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"stub"}}`, code)
@@ -388,5 +402,32 @@ func TestGCSDestinationIdentity(t *testing.T) {
 	}
 	if native.Overlaps(gcs("", "arcx")) {
 		t.Error("prefix arcx overlaps arc")
+	}
+}
+
+// A transient answer (503) is retried until it clears; a definitive one (403,
+// 404) is not retried at all.
+func TestGCSRetriesTransientErrorsOnly(t *testing.T) {
+	s := &gcsStub{
+		flaky:        map[string]int{"db/busy.parquet": 2},
+		deleteStatus: map[string]int{"db/locked.parquet": http.StatusForbidden, "db/gone.parquet": http.StatusNotFound},
+	}
+	b, err := stubGCSBackend(t, s, "", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := b.Delete(ctx, "db/busy.parquet"); err != nil || s.deletes["db/busy.parquet"] != 3 {
+		t.Fatalf("Delete through two 503s: %v after %d requests, want success after 3", err, s.deletes["db/busy.parquet"])
+	}
+	if err := b.Delete(ctx, "db/locked.parquet"); err == nil || s.deletes["db/locked.parquet"] != 1 {
+		t.Fatalf("Delete answered 403: %v after %d requests, want an error after 1", err, s.deletes["db/locked.parquet"])
+	}
+	if err := b.Delete(ctx, "db/gone.parquet"); err != nil || s.deletes["db/gone.parquet"] != 1 {
+		t.Fatalf("Delete answered 404: %v after %d requests, want success after 1", err, s.deletes["db/gone.parquet"])
+	}
+	s.flaky["db/hopeless.parquet"] = 100
+	if err := b.Delete(ctx, "db/hopeless.parquet"); err == nil || s.deletes["db/hopeless.parquet"] != gcsRetryAttempts {
+		t.Fatalf("Delete answered 503 forever: %v after %d requests, want an error after %d", err, s.deletes["db/hopeless.parquet"], gcsRetryAttempts)
 	}
 }
