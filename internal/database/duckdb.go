@@ -843,17 +843,22 @@ func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 // loadConfiguredExtensions installs and loads operator-selected DuckDB
 // extensions before lockdownExternalAccess disables future INSTALL/LOAD.
 // DuckDB registers extensions per database, so one load covers the pool.
+// Every name is checked against supportedExtensions before the first INSTALL
+// (#440).
 func loadConfiguredExtensions(db *sql.DB, extensions []string, logger zerolog.Logger) error {
+	if err := validateExtensions(extensions); err != nil {
+		return err
+	}
 	for _, name := range extensions {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			return fmt.Errorf("DuckDB extension name must not be empty")
-		}
 		quotedName := quoteDuckDBIdent(name)
 		if _, err := db.Exec("INSTALL " + quotedName); err != nil {
+			// The extension is a log field: the error sanitizer blanks
+			// quoted strings, which would hide the name in the error.
+			logger.Error().Str("extension", name).Err(err).Msg("DuckDB extension install failed")
 			return fmt.Errorf("install DuckDB extension %q: %w", name, err)
 		}
 		if _, err := db.Exec("LOAD " + quotedName); err != nil {
+			logger.Error().Str("extension", name).Err(err).Msg("DuckDB extension load failed")
 			return fmt.Errorf("load DuckDB extension %q: %w", name, err)
 		}
 		logger.Info().Str("extension", name).Msg("DuckDB extension loaded")

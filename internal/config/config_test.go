@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -422,7 +423,7 @@ func TestLoad_EnvOverride(t *testing.T) {
 	os.Setenv("ARC_DATABASE_MAX_CONNECTIONS", "42")
 	os.Setenv("ARC_DATABASE_MEMORY_LIMIT", "16GB")
 	os.Setenv("ARC_DATABASE_THREAD_COUNT", "8")
-	os.Setenv("ARC_DATABASE_EXTENSIONS", "spatial,vss")
+	os.Setenv("ARC_DATABASE_EXTENSIONS", " Spatial ,vss,,spatial")
 	defer func() {
 		os.Unsetenv("ARC_DATABASE_MAX_CONNECTIONS")
 		os.Unsetenv("ARC_DATABASE_MEMORY_LIMIT")
@@ -444,7 +445,11 @@ func TestLoad_EnvOverride(t *testing.T) {
 	if cfg.Database.ThreadCount != 8 {
 		t.Errorf("Database.ThreadCount = %d, want 8 (from env)", cfg.Database.ThreadCount)
 	}
-	if got, want := strings.Join(cfg.Database.Extensions, ","), "spatial,vss"; got != want {
+	// Split on commas (GetStringSlice kept the whole value as ONE entry),
+	// trimmed, lower-cased, empties and repeats dropped. Compared as a
+	// slice: a joined string cannot tell ["spatial","vss"] from
+	// ["spatial,vss"].
+	if got, want := cfg.Database.Extensions, []string{"spatial", "vss"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Database.Extensions = %q, want %q (from env)", got, want)
 	}
 }
@@ -1504,5 +1509,26 @@ func TestExternalFileCacheKey(t *testing.T) {
 	}
 	if cfg.Database.ExternalFileCache != "false" {
 		t.Errorf("arc.toml external_file_cache = \"false\": got %q", cfg.Database.ExternalFileCache)
+	}
+}
+
+// The TOML array spelling of database.extensions keeps each element whole
+// and is normalised like the environment spelling (#440).
+func TestLoad_DatabaseExtensionsTOMLArray(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+	if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte("[database]\nextensions = [\"Spatial\", \"spatial\", \" vss \"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got, want := cfg.Database.Extensions, []string{"spatial", "vss"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Database.Extensions = %q, want %q", got, want)
 	}
 }

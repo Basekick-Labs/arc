@@ -1063,7 +1063,7 @@ func Load() (*Config, error) {
 			MemoryLimit:            v.GetString("database.memory_limit"),
 			ThreadCount:            v.GetInt("database.thread_count"),
 			EnableWAL:              v.GetBool("database.enable_wal"),
-			Extensions:             v.GetStringSlice("database.extensions"),
+			Extensions:             normalizeExtensionNames(parseTargetDatabases(v.Get("database.extensions"))),
 			TempDirectory:          v.GetString("database.temp_directory"),
 			ArcxExtensionPath:      v.GetString("database.arcx_extension_path"),
 			PreserveInsertionOrder: v.GetBool("database.preserve_insertion_order"),
@@ -2279,6 +2279,24 @@ func (c *Config) checkObjectPrefix(key, value string) error {
 		return fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return nil
+}
+
+// normalizeExtensionNames lower-cases and de-duplicates database.extensions,
+// keeping first-seen order. The list arrives through parseTargetDatabases,
+// the accessor that reads both the TOML array and the comma-separated
+// ARC_DATABASE_EXTENSIONS spelling (GetStringSlice keeps "spatial,vss" as one
+// entry). Whether a name is supported is database.New's to decide (#440).
+func normalizeExtensionNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		n = strings.ToLower(n)
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // parseStringSlice parses a comma-separated string into a slice of strings.
