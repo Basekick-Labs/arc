@@ -126,7 +126,9 @@ func OpenRewriteDB(ctx context.Context, opts RewriteDBOptions, logger zerolog.Lo
 	for _, name := range opts.Extensions {
 		if _, err := db.ExecContext(ctx, "LOAD "+quoteDuckDBIdent(name)); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("load DuckDB extension %q in the rewrite database: %w", name, err)
+			// Every wide-file DELETE fails while this does, whether or not
+			// its WHERE uses the extension: it fails closed.
+			return nil, fmt.Errorf("load DuckDB extension %q (database.extensions) in the single-thread rewrite database; wide-file DELETEs fail until it loads: %w", name, err)
 		}
 	}
 	// lockdownDirs logs the allowlist at Info, which reads like a database

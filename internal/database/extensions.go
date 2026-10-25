@@ -11,11 +11,18 @@ import (
 // An extension adds SQL functions the query and DELETE validators were never
 // checked against, and the validators are denylists. So an extension is
 // supported only once its function surface has been reviewed: every table
-// function (and every function taking text, which can name a file or URL) is
-// either denied — refused by both validators — or recorded as reviewed safe.
-// TestSupportedExtensionFunctionsReviewed loads each one and fails on any
-// function it adds that is in neither list, so a newer build of the extension
-// cannot widen the surface unreviewed.
+// function, pragma and macro it adds, and every function taking text (which
+// can name a file or URL), is either denied — refused by both validators —
+// or recorded as reviewed safe. TestSupportedExtensionFunctionsReviewed loads
+// each one and fails on any such signature it adds, including a new overload
+// of an existing name, that is in neither list, and on any macro whose body
+// names a denied function; a newer build of the extension cannot widen the
+// surface unreviewed.
+//
+// A denied function is refused by name only. Arc's DuckDB sandbox does not
+// bound what an extension's own I/O opens (spatial's GDAL and PROJ open files
+// themselves), so for these the validators are the only control: never move
+// one to reviewed without proving the library cannot open a path.
 type supportedExtension struct {
 	// denied are refused by the query, continuous query and DELETE
 	// validators whether or not the extension is loaded.
@@ -35,16 +42,19 @@ var supportedExtensions = map[string]supportedExtension{
 			"st_read", "st_read_meta", "st_readosm", "st_readshp", "shapefile_meta",
 			// Lists the GDAL drivers of the build.
 			"st_drivers",
+			// A CRS argument such as '+init=<path>:<id>' makes PROJ open a
+			// file at any host path, outside the sandbox (#440).
+			"st_transform",
 		},
 		reviewed: []string{
 			"st_generatepoints", "rtree_index_scan", "rtree_index_dump", "pragma_rtree_index_info",
-			// Parse their text argument inline; ST_Transform resolves a CRS
-			// through PROJ's built-in database, with no file or network
-			// access observed for paths, init files or grid URLs.
-			"st_transform", "st_makevalid", "st_assvg", "st_quadkey", "st_buffer",
+			// Parse their text argument inline.
+			"st_makevalid", "st_assvg", "st_quadkey", "st_buffer",
 			"st_ashexwkb", "st_geomfromgeojson", "st_geomfromhexewkb", "st_geomfromhexwkb",
 			"st_geomfromtext", "st_geometrytype", "st_asmvt",
 			"duckdb_proj_version", "duckdb_proj_compiled_version",
+			// Macros over ST_Affine.
+			"st_rotate", "st_rotatex", "st_rotatey", "st_rotatez", "st_scale", "st_translate", "st_transscale",
 		},
 	},
 }

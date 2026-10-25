@@ -29,28 +29,26 @@ func loadTestExtension(t *testing.T, db *sql.DB, name string) {
 	}
 }
 
-type duckdbFunction struct {
-	name, kind string
-	textArg    bool
+// duckdbSignature is one overload of a function: its name, type and
+// parameter types, and a macro's body.
+type duckdbSignature struct {
+	name, kind, params, macro string
 }
 
-func listFunctions(t *testing.T, db *sql.DB) map[string]duckdbFunction {
+func listSignatures(t *testing.T, db *sql.DB) map[duckdbSignature]bool {
 	t.Helper()
-	rows, err := db.Query(`SELECT lower(function_name), function_type, parameter_types::VARCHAR FROM duckdb_functions()`)
+	rows, err := db.Query(`SELECT lower(function_name), function_type, parameter_types::VARCHAR, coalesce(macro_definition, '') FROM duckdb_functions()`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	out := map[string]duckdbFunction{}
+	out := map[duckdbSignature]bool{}
 	for rows.Next() {
-		var name, kind, params string
-		if err := rows.Scan(&name, &kind, &params); err != nil {
+		var sig duckdbSignature
+		if err := rows.Scan(&sig.name, &sig.kind, &sig.params, &sig.macro); err != nil {
 			t.Fatal(err)
 		}
-		f := out[name]
-		f.name, f.kind = name, kind
-		f.textArg = f.textArg || strings.Contains(params, "VARCHAR") || strings.Contains(params, "ANY")
-		out[name] = f
+		out[sig] = true
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -58,10 +56,14 @@ func listFunctions(t *testing.T, db *sql.DB) map[string]duckdbFunction {
 	return out
 }
 
-// Every function a supported extension adds that is a table function, a
-// pragma, or takes text (which can name a file or a URL) is either denied by
-// the validators or recorded as reviewed (#440). A newer build of the
-// extension that adds one fails here until someone has looked at it.
+// Every signature a supported extension adds that is a table function, a
+// pragma, a macro, or takes text (which can name a file or a URL) belongs to
+// a function that is either denied by the validators or recorded as
+// reviewed (#440). Signatures, not names: a new overload of a reviewed name
+// (or of a core one) is reviewed again. A macro whose body calls a denied
+// function fails too, since the validators see only the macro's name. A
+// newer build of the extension that adds any of these fails here until
+// someone has looked at it.
 //
 // Runs on a raw engine: after Arc's lockdown the extension catalog is not
 // readable.
@@ -74,24 +76,33 @@ func TestSupportedExtensionFunctionsReviewed(t *testing.T) {
 			}
 			defer db.Close()
 			db.SetMaxOpenConns(1)
-			before := listFunctions(t, db)
+			before := listSignatures(t, db)
 			loadTestExtension(t, db, name)
-			after := listFunctions(t, db)
+			after := listSignatures(t, db)
 			ext := supportedExtensions[name]
 			known := map[string]bool{}
 			for _, n := range append(append([]string{}, ext.denied...), ext.reviewed...) {
 				known[n] = true
 			}
+			deniedNames := DeniedExtensionFunctions()
 			var unreviewed []string
+			names := map[string]bool{}
 			added := 0
-			for fn, f := range after {
-				if _, ok := before[fn]; ok {
+			for sig := range after {
+				names[sig.name] = true
+				if before[sig] {
 					continue
 				}
 				added++
-				needsReview := f.textArg || (f.kind != "scalar" && f.kind != "aggregate" && f.kind != "macro")
-				if needsReview && !known[fn] {
-					unreviewed = append(unreviewed, fn+" ("+f.kind+")")
+				text := strings.Contains(sig.params, "VARCHAR") || strings.Contains(sig.params, "ANY")
+				needsReview := text || (sig.kind != "scalar" && sig.kind != "aggregate")
+				if needsReview && !known[sig.name] {
+					unreviewed = append(unreviewed, sig.name+" ("+sig.kind+" "+sig.params+")")
+				}
+				for _, d := range deniedNames {
+					if sig.macro != "" && strings.Contains(strings.ToLower(sig.macro), d+"(") {
+						unreviewed = append(unreviewed, sig.name+" (macro calling denied "+d+")")
+					}
 				}
 			}
 			if added == 0 {
@@ -99,11 +110,11 @@ func TestSupportedExtensionFunctionsReviewed(t *testing.T) {
 			}
 			sort.Strings(unreviewed)
 			if len(unreviewed) > 0 {
-				t.Errorf("%s adds functions nobody has reviewed; add each to supportedExtensions[%q].denied (refused by the validators) or .reviewed:\n  %s",
+				t.Errorf("%s adds signatures nobody has reviewed; add each function to supportedExtensions[%q].denied (refused by the validators) or .reviewed:\n  %s",
 					name, name, strings.Join(unreviewed, "\n  "))
 			}
 			for _, fn := range ext.denied {
-				if _, ok := after[fn]; !ok {
+				if !names[fn] {
 					t.Errorf("denied function %s does not exist in %s any more; check what replaced it", fn, name)
 				}
 			}

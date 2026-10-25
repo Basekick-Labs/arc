@@ -2836,6 +2836,9 @@ func ValidateSQLRequest(sql string) error {
 	if dangerousSQLPattern.MatchString(normalised) {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
 	}
+	if unicodeEscapePattern.MatchString(normalised) {
+		return &SQLValidationError{Message: `Unicode-escaped identifiers and strings (U&"...") are not allowed`}
+	}
 
 	// SECURITY: read statements only (read_statements.go). The denylist above
 	// refuses the statements it names; this refuses every other statement
@@ -3136,6 +3139,14 @@ func isBareIdentifier(name string) bool {
 	}
 	return true
 }
+
+// unicodeEscapePattern matches a U&"..." identifier or U&'...' string in
+// literal-masked SQL (the masker leaves the U& prefix outside its
+// placeholder). Its escapes spell a name the denylists cannot see:
+// U&"\0073t_read" is st_read. The DuckDB release Arc pins does not execute
+// them, so refusing them outright costs nothing and keeps a parser upgrade
+// from opening the I/O denylist (#440).
+var unicodeEscapePattern = regexp.MustCompile(`(?i)\bu&__(?:STR|IDENT)_\d+__`)
 
 // ioTableFunctionPattern matches a call to any DuckDB function that reads from
 // the filesystem (or an attached storage scanner), by name, in any position of

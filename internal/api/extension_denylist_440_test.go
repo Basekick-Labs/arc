@@ -12,7 +12,7 @@ import (
 // spelling DuckDB executes (#440).
 func TestExtensionFileFunctionsRefused(t *testing.T) {
 	denied := database.DeniedExtensionFunctions()
-	for _, want := range []string{"st_read", "st_read_meta", "st_readosm", "st_readshp", "shapefile_meta", "st_drivers"} {
+	for _, want := range []string{"st_read", "st_read_meta", "st_readosm", "st_readshp", "shapefile_meta", "st_drivers", "st_transform"} {
 		if !containsString(denied, want) {
 			t.Fatalf("%s is not denied", want)
 		}
@@ -25,6 +25,8 @@ func TestExtensionFileFunctionsRefused(t *testing.T) {
 			"SELECT * FROM cpu, " + upper + "  ('x')",
 			`SELECT * FROM "` + upper + `"('x')`,
 			"SELECT * FROM main." + fn + "('x')",
+			"SELECT * FROM system.main." + fn + "('x')",
+			`SELECT * FROM "system"."main"."` + fn + `"('x')`,
 			"SELECT * FROM " + fn + "/* c */('x')",
 			"SELECT * FROM cpu WHERE EXISTS (FROM " + fn + "('x'))",
 			"SELECT (SELECT count(*) FROM " + fn + "('x'))",
@@ -58,6 +60,28 @@ func TestExtensionFileFunctionsPrefixes(t *testing.T) {
 	for _, sql := range []string{"SELECT * FROM st_read_meta('x')", "SELECT * FROM st_read('x')", "SELECT * FROM st_readshp('x')"} {
 		if err := ValidateSQLRequest(sql); err == nil {
 			t.Errorf("%q was accepted", sql)
+		}
+	}
+}
+
+// A unicode-escaped identifier can spell a denied name the denylist cannot
+// read (U&"\0073t_read" is st_read); it is refused outright, in queries and
+// DELETE predicates. The pinned DuckDB does not execute it, so this pins the
+// refusal against a parser upgrade.
+func TestUnicodeEscapedIdentifiersRefused(t *testing.T) {
+	h := &DeleteHandler{}
+	for _, sql := range []string{`SELECT * FROM U&"\0073t_read"('x')`, `SELECT * FROM u&"st\005Fread"('x')`, `SELECT U&'\0061' AS a`} {
+		if err := ValidateSQLRequest(sql); err == nil {
+			t.Errorf("query: %q was accepted", sql)
+		}
+	}
+	if _, err := h.validateWhereClause(`u&"st\005Fread"('x') IS NOT NULL`); err == nil {
+		t.Error("DELETE WHERE: a unicode-escaped call was accepted")
+	}
+	// Not an escape: U& inside a string, and a bitwise AND.
+	for _, sql := range []string{`SELECT 'U&"x"' AS s`, "SELECT a & b FROM cpu"} {
+		if err := ValidateSQLRequest(sql); err != nil {
+			t.Errorf("%q refused: %v", sql, err)
 		}
 	}
 }

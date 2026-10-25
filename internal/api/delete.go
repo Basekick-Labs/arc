@@ -980,6 +980,9 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		}
 	}
 	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
+	if unicodeEscapePattern.MatchString(maskedWhere) {
+		return false, fmt.Errorf(`WHERE clause contains a unicode-escaped identifier or string (U&"...")`)
+	}
 	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
 	}

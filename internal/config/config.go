@@ -87,7 +87,8 @@ type DatabaseConfig struct {
 	ThreadCount    int
 	EnableWAL      bool
 	// Extensions are DuckDB extensions to install and load before external
-	// access is locked down. Only signed extensions are accepted by default.
+	// access is locked down. database.New accepts only the names in
+	// database.SupportedExtensionNames (#440).
 	Extensions []string
 	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
 	// overflow, large sorts, joins). Should be on local fast storage. Files

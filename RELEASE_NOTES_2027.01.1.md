@@ -759,17 +759,25 @@ stored in a binary column (`ST_GeomFromWKB(geom)`). The default is empty.
   query validators have to know about, so each one is reviewed before it is
   supported. Any other name, a file path or a URL stops Arc at startup with
   an error naming the entry. Community extensions are not supported.
-- **The spatial file readers are refused.** `ST_Read`, `ST_Read_Meta`,
-  `ST_ReadOSM`, `ST_ReadSHP`, `shapefile_meta` and `ST_Drivers` are rejected
-  by the query, continuous query and DELETE validators, like `read_csv` and
-  the other file readers. Data comes into Arc through its write endpoints.
-- **No network needed.** The container image ships the extension; on a
+- **Functions that open files are refused.** `ST_Read`, `ST_Read_Meta`,
+  `ST_ReadOSM`, `ST_ReadSHP`, `shapefile_meta`, `ST_Drivers` and
+  `ST_Transform` are rejected by the query, continuous query and DELETE
+  validators, like `read_csv` and the other file readers. Data comes into
+  Arc through its write endpoints. `ST_Transform` is among them because a
+  coordinate reference system can name a file; data stays in the reference
+  system it was written in. For distances in metres over longitude/latitude
+  use `ST_Distance_Sphere` or `ST_Distance_Spheroid`.
+- **No network needed.** The container image ships the extension (about
+  60 MB of the image, whether or not it is enabled); on a
   binary install the first start downloads it into DuckDB's extension
   directory (`~/.duckdb/extensions`), which an air-gapped host must
   pre-populate.
 - **Set the same list on every node.** Each node loads its own; a query
   routed to a node without the extension fails with an unknown-function
-  error.
+  error. On a cluster, a DELETE whose WHERE uses a spatial function cannot
+  be applied by a node without the extension to the files it has not
+  registered yet; those files wait, and the node logs a warning naming
+  `database.extensions`, until the setting matches.
 - A JSON query result holding a geometry shows it as base64 WKB; use
   `ST_AsText(...)` or `ST_AsGeoJSON(...)` for a readable value.
 
