@@ -82,6 +82,11 @@ type Destination struct {
 	// other prefix in that bucket.
 	Prefix string
 
+	// S3Interop marks a gcs destination configured as an s3 block on a Google
+	// endpoint, so a refusal names it the way the operator wrote it. It plays
+	// no part in Overlaps.
+	S3Interop bool
+
 	// Path is the resolved absolute local directory (symlinks resolved
 	// through the deepest existing ancestor). Empty on an object destination.
 	Path string
@@ -117,9 +122,10 @@ func DestinationFromSpec(spec BackendSpec) (Destination, error) {
 		bucket := strings.TrimSpace(spec.S3.Bucket)
 		if isGoogleStorageEndpoint(spec.S3.Endpoint, bucket) {
 			return Destination{
-				Kind:   "gcs",
-				Bucket: bucket,
-				Prefix: strings.Trim(prefix, "/"),
+				Kind:      "gcs",
+				Bucket:    bucket,
+				Prefix:    strings.Trim(prefix, "/"),
+				S3Interop: true,
 			}, nil
 		}
 		return Destination{
@@ -216,6 +222,9 @@ func (d Destination) String() string {
 	if d.Store != "" {
 		loc += " at " + d.Store
 	}
+	if d.S3Interop {
+		loc += " (an s3 block on a Google Cloud Storage endpoint)"
+	}
 	return loc
 }
 
@@ -280,7 +289,8 @@ func canonicalS3Endpoint(endpoint, bucket string) string {
 
 // googleStorageHost matches every host that serves Google Cloud Storage's one
 // global bucket namespace, with any virtual-hosted bucket label already
-// removed: the JSON and XML API host, the legacy JSON host, mTLS, regional
+// removed: the JSON and XML API host, the legacy JSON and XML hosts
+// ("www.", "commondatastorage."), mTLS, regional
 // endpoints ("storage.<region>.rep.googleapis.com"), the VPC Service Controls
 // VIPs ("private."/"restricted.googleapis.com") and Private Service Connect
 // endpoints ("<name>.p.googleapis.com").
@@ -290,7 +300,7 @@ func canonicalS3Endpoint(endpoint, bucket string) string {
 // gcs block and an S3-interop block naming one bucket (#1105). Anything else
 // (an emulator, a proxy) is kept as its own identity: nothing can be assumed
 // about it, the rule canonicalS3Endpoint follows for a non-AWS host.
-var googleStorageHost = regexp.MustCompile(`^(?:storage(?:\.[a-z0-9-]+\.rep)?|storage\.mtls|www|private|restricted|[a-z0-9-]+\.p)\.googleapis\.com$`)
+var googleStorageHost = regexp.MustCompile(`^(?:storage(?:\.[a-z0-9-]+\.rep)?|storage\.mtls|commondatastorage|www|private|restricted|[a-z0-9-]+\.p)\.googleapis\.com$`)
 
 // googleHostOf reduces an endpoint to its host (normalizeEndpoint, then any
 // path, such as the JSON API's "/storage/v1/", removed) with a leading

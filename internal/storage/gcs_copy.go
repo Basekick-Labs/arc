@@ -72,6 +72,10 @@ func (b *GCSBackend) CopyObject(ctx context.Context, src, dst string, size int64
 		if resp.Done {
 			return nil
 		}
+		if resp.RewriteToken == "" {
+			// Without a token the next call would restart the copy, forever.
+			return fmt.Errorf("copy %s -> %s: GCS reported the rewrite unfinished without a token to resume it", src, dst)
+		}
 		call = call.RewriteToken(resp.RewriteToken)
 	}
 }

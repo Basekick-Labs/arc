@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -100,8 +101,9 @@ type GCSConfig struct {
 	// metadata server (GCE, GKE Workload Identity, Cloud Run).
 
 	// Endpoint overrides the JSON API endpoint (Private Service Connect, an
-	// emulator), e.g. "https://storage-psc.p.googleapis.com/storage/v1/".
-	// Empty means Google's default.
+	// emulator): a host ("https://storage-psc.p.googleapis.com", which gets
+	// the JSON API path) or the full base URL. Empty means Google's default.
+	// See gcsEndpointURL.
 	Endpoint string
 }
 
@@ -119,8 +121,9 @@ func NewGCSBackend(cfg *GCSConfig, logger zerolog.Logger) (*GCSBackend, error) {
 }
 
 // newGCSBackend is NewGCSBackend with client options for tests: when any are
-// passed they replace credential resolution entirely, so an offline test can
-// point the client at an httptest server with option.WithoutAuthentication.
+// passed they replace credential resolution, so an offline test can point the
+// client (through cfg.Endpoint, the production path) at an httptest server
+// with option.WithoutAuthentication.
 func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.ClientOption) (*GCSBackend, error) {
 	if strings.TrimSpace(cfg.Bucket) == "" {
 		return nil, fmt.Errorf("GCS bucket name is required")
@@ -142,8 +145,27 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 			return nil, err
 		}
 		opts = []option.ClientOption{option.WithAuthCredentials(creds)}
-		if cfg.Endpoint != "" {
-			opts = append(opts, option.WithEndpoint(cfg.Endpoint))
+	}
+	if cfg.Endpoint != "" {
+		endpoint, err := gcsEndpointURL(cfg.Endpoint)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, option.WithEndpoint(endpoint))
+	}
+
+	if creds != nil && (cfg.CredentialsJSON != "" || cfg.CredentialsFile != "") {
+		// A key file is only parsed for its JSON shape; a damaged private key
+		// would pass and every request would then fail, with the probe below
+		// reporting it as a warning. Minting one token signs with the key, so
+		// this refuses it here. Not for Application Default Credentials: on a
+		// node whose metadata server is briefly unreachable at boot that would
+		// turn a transient into a failed start.
+		tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, terr := creds.Token(tctx)
+		cancel()
+		if terr != nil {
+			return nil, fmt.Errorf("GCS service-account key cannot mint a token: %w", terr)
 		}
 	}
 
@@ -169,6 +191,34 @@ func newGCSBackend(cfg *GCSConfig, logger zerolog.Logger, testOpts ...option.Cli
 		return nil, err
 	}
 	return b, nil
+}
+
+// gcsEndpointURL turns a configured endpoint into the base URL the JSON API
+// client resolves every call against.
+//
+// The client uses the string as given and resolves "b/{bucket}/o" against it,
+// while uploads go to the absolute "/upload/storage/v1/...". So a spelling
+// without the trailing "/storage/v1/" left uploads working and sent every other
+// call to the wrong path, where the 404 read as a missing bucket. And a URL
+// the client cannot parse panicked inside the first call instead of failing
+// construction. So: a scheme is required, a bare host gets the JSON API path,
+// and the result always ends in a separator.
+func gcsEndpointURL(endpoint string) (string, error) {
+	e := strings.TrimSpace(endpoint)
+	if !strings.Contains(e, "://") {
+		e = "https://" + e
+	}
+	u, err := url.Parse(e)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("GCS endpoint %q is not a usable http(s) URL", endpoint)
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/storage/v1/"
+	}
+	if !strings.HasSuffix(u.Path, "/") {
+		u.Path += "/"
+	}
+	return u.String(), nil
 }
 
 // gcsCredentials resolves the identity cfg names: an explicit service-account
@@ -199,15 +249,20 @@ func gcsCredentials(cfg *GCSConfig) (*auth.Credentials, error) {
 	return creds, nil
 }
 
-// Every call is retried, not only the ones the API deems idempotent. Arc sets
-// no preconditions, and that is safe here: output keys are unique per flush
-// and per compaction (#1282), CopyObject replaces its destination by contract,
-// and Delete treats "already gone" as success.
+// Every call is retried on a transient failure, including writes and deletes
+// that carry no precondition. That is the same exposure the S3 and Azure SDKs
+// already have for the same calls, and it is safe for what Arc does with
+// them: a retried upload writes the same bytes again (most keys are unique
+// per flush, #1282; the fixed ones, such as manifests, version-hint.text and
+// the field-schema registry, are whole-object replacements), the client sends
+// one idempotency token for every attempt of an upload, CopyObject replaces
+// its destination by contract, and a retried delete that finds the object
+// gone is a success.
 //
-// Uploads use the client's own retry (WithRetry(nil, nil): its backoff and its
-// retryable set), which also retries each chunk of a resumable upload. The
-// generated client offers WithRetry on uploads only, so every other call goes
-// through gcsRetry, which retries the same set.
+// The generated client offers WithRetry on uploads only. Uploads pass
+// gcsUploadRetry (bounded: the client's own loop runs until the context ends),
+// which also covers each chunk of a resumable upload; every other call goes
+// through gcsRetry. Both retry gcsTransient errors.
 
 // gcsRetryAttempts and gcsRetryMaxBackoff bound gcsRetry: six attempts with
 // backoff doubling from 100 ms, under 4 s of waiting in all.
@@ -215,6 +270,20 @@ var (
 	gcsRetryAttempts   = 6
 	gcsRetryMaxBackoff = 2 * time.Second
 )
+
+// gcsUploadRetries bounds the transient failures one upload absorbs across its
+// requests: the opening request, or the single request of a small upload, and
+// every chunk of a resumable one. Each resumable chunk is also bounded by the
+// client's own 32 s per-chunk deadline.
+var gcsUploadRetries = 12
+
+// gcsUploadRetry is the retry predicate for one upload call.
+func gcsUploadRetry() func(error) bool {
+	var n atomic.Int32
+	return func(err error) bool {
+		return gcsTransient(err) && int(n.Add(1)) <= gcsUploadRetries
+	}
+}
 
 // gcsRetry runs fn until it succeeds, fails with an error that is not
 // transient, runs out of attempts, or ctx ends.
@@ -250,7 +319,8 @@ func gcsTransient(err error) bool {
 	case code != 0:
 		return false
 	}
-	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE) {
 		return true
 	}
 	var netErr net.Error
@@ -282,7 +352,7 @@ func (b *GCSBackend) probeBucket() error {
 		return nil
 	case err != nil:
 		b.logger.Warn().Err(err).Str("bucket", b.bucket).
-			Msg("Could not read GCS bucket metadata; hierarchical-namespace and soft-delete settings were not checked")
+			Msg("Could not read GCS bucket metadata (storage.buckets.get); hierarchical namespace, which Arc does not support, and soft delete were NOT checked")
 		return nil
 	}
 	if attrs.HierarchicalNamespace != nil && attrs.HierarchicalNamespace.Enabled {
@@ -330,6 +400,20 @@ func (b *GCSBackend) WriteReader(ctx context.Context, path string, reader io.Rea
 	return b.writeReader(ctx, path, reader, size, nil)
 }
 
+// gcsUploadChunk is the chunk for an upload of size bytes: gcsChunkSize, or
+// less for a small object, because the client allocates a buffer of the whole
+// chunk for every upload and a 2 KB manifest should not cost 16 MiB. One byte
+// over the size, rounded up to the client's 256 KiB granule: a chunk exactly
+// the object's size never sees EOF and would open a resumable session where
+// one request does.
+func gcsUploadChunk(size int64) int {
+	if size <= 0 || size >= gcsChunkSize {
+		return gcsChunkSize
+	}
+	g := int64(googleapi.MinUploadChunkSize)
+	return int(min((size+1+g-1)/g*g, gcsChunkSize))
+}
+
 // sizedReader passes r through and fails instead of reaching EOF when the
 // bytes it delivered differ from want (when want > 0).
 type sizedReader struct {
@@ -359,8 +443,9 @@ func (s *sizedReader) Read(p []byte) (int, error) {
 // that request and abandons the upload: a failed write never commits a
 // truncated object under a valid name.
 //
-// The upload is checksummed (CRC32C, computed while streaming and sent with
-// the final request), so GCS also refuses to finalise bytes corrupted in
+// The upload is checksummed (CRC32C, computed while streaming; a resumable
+// upload sends it with its final request, a single-request upload in the
+// object resource), so GCS also refuses to finalise bytes corrupted in
 // transit.
 func (b *GCSBackend) writeReader(ctx context.Context, path string, reader io.Reader, size int64, meta map[string]string) error {
 	key, err := b.prefixedKey(path)
@@ -371,8 +456,8 @@ func (b *GCSBackend) writeReader(ctx context.Context, path string, reader io.Rea
 	ct := gcsContentType(path)
 	body := &sizedReader{r: reader, want: size}
 	_, err = b.svc.Objects.Insert(b.bucket, &gcs.Object{Name: key, ContentType: ct, Metadata: meta}).
-		Media(body, googleapi.ChunkSize(gcsChunkSize), googleapi.ContentType(ct), googleapi.EnableAutoChecksum()).
-		Fields("name").Context(ctx).WithRetry(nil, nil).Do()
+		Media(body, googleapi.ChunkSize(gcsUploadChunk(size)), googleapi.ContentType(ct), googleapi.EnableAutoChecksum()).
+		Fields("name").Context(ctx).WithRetry(nil, gcsUploadRetry()).Do()
 	if err != nil {
 		recordStorageError(ctx, err)
 		b.logger.Error().Err(err).Str("path", path).Int64("size", size).Msg("Failed to write to Google Cloud Storage")
@@ -516,10 +601,10 @@ func (b *GCSBackend) DeleteBatch(ctx context.Context, paths []string) error {
 		}(name)
 	}
 	wg.Wait()
-	if err := ctx.Err(); err != nil {
-		errs = append(errs, err)
-	}
 
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("GCS batch delete interrupted (%d object(s) failed before): %w", len(errs), errors.Join(append([]error{err}, errs...)...))
+	}
 	if len(errs) > 0 {
 		return fmt.Errorf("GCS batch delete: %d object(s) failed: %w", len(errs), errors.Join(errs...))
 	}
@@ -716,7 +801,8 @@ func (b *GCSBackend) GetEndpoint() string { return b.endpoint }
 
 // Credentials returns the credential configuration the backend was built with
 // (the key file path and key contents, nothing else), so the compaction
-// subprocess can rebuild it with the SAME identity. Empty fields mean
+// subprocess will be able to rebuild it with the SAME identity (wired in the
+// primary-storage stage of #1105; subprocess.go refuses gcs until then). Empty fields mean
 // Application Default Credentials, which the subprocess inherits through its
 // environment and the metadata server.
 //
@@ -728,7 +814,8 @@ func (b *GCSBackend) Credentials() GCSConfig { return b.auth }
 func (b *GCSBackend) Type() string { return "gcs" }
 
 // ConfigJSON returns the configuration as JSON for subprocess recreation.
-// Every field must be parsed by the compaction subprocess; the prefix above
+// Every field must be parsed by the compaction subprocess once it accepts gcs
+// (the primary-storage stage of #1105); the prefix above
 // all, or the subprocess reroots at the bucket root (see
 // AzureBlobBackend.ConfigJSON). It carries no credentials and must not start
 // to.

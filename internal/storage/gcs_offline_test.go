@@ -42,6 +42,12 @@ type gcsStub struct {
 	// bucket metadata reads.
 	seenPrefixes []string
 	bucketReads  int
+	// rewriteCalls is how many rewrite calls a copy takes; noToken answers an
+	// unfinished rewrite without a token. uploads counts upload requests,
+	// every one of which answers 503.
+	rewriteCalls, rewrites, uploads int
+	rewriteTokens                   []string
+	noToken                         bool
 }
 
 func (s *gcsStub) handler(t *testing.T) http.HandlerFunc {
@@ -114,6 +120,18 @@ func (s *gcsStub) handler(t *testing.T) http.HandlerFunc {
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
+		case strings.Contains(rest, "/rewriteTo/") && r.Method == http.MethodPost:
+			s.rewrites++
+			s.rewriteTokens = append(s.rewriteTokens, r.URL.Query().Get("rewriteToken"))
+			resp := map[string]any{"done": s.rewrites >= s.rewriteCalls}
+			if s.rewrites < s.rewriteCalls && !s.noToken {
+				resp["rewriteToken"] = fmt.Sprintf("t%d", s.rewrites)
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case strings.HasPrefix(r.URL.Path, "/upload/storage/v1/b/") && r.Method == http.MethodPost:
+			s.uploads++
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":503,"message":"try again"}}`))
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL)
 			w.WriteHeader(http.StatusTeapot)
@@ -167,8 +185,10 @@ func stubGCSBackend(t *testing.T, s *gcsStub, prefix string, logger zerolog.Logg
 	t.Helper()
 	srv := httptest.NewServer(s.handler(t))
 	t.Cleanup(srv.Close)
-	b, err := newGCSBackend(&GCSConfig{Bucket: "bkt", Prefix: prefix}, logger,
-		option.WithEndpoint(srv.URL+"/storage/v1/"), option.WithoutAuthentication())
+	// The bare server URL, no "/storage/v1/": gcsEndpointURL has to supply it,
+	// as it does for an operator's endpoint.
+	b, err := newGCSBackend(&GCSConfig{Bucket: "bkt", Prefix: prefix, Endpoint: srv.URL}, logger,
+		option.WithoutAuthentication())
 	if err == nil {
 		t.Cleanup(func() { _ = b.Close() })
 	}
@@ -197,7 +217,7 @@ func TestGCSStartupProbe(t *testing.T) {
 		want string
 	}{
 		{"missing bucket is a warning", &gcsStub{missing: true}, "does not exist"},
-		{"forbidden bucket metadata is a warning", &gcsStub{forbidden: true}, "not checked"},
+		{"forbidden bucket metadata is a warning", &gcsStub{forbidden: true}, "NOT checked"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var logs bytes.Buffer
@@ -397,6 +417,9 @@ func TestGCSDestinationIdentity(t *testing.T) {
 			t.Errorf("gcs at %s folded onto Google", e)
 		}
 	}
+	if d := interop("https://commondatastorage.googleapis.com", "arc"); !native.Overlaps(d) || !strings.Contains(d.String(), "s3 block") {
+		t.Errorf("S3 interop on the legacy XML host = %+v (%s)", d, d.String())
+	}
 	if d := interop("", "arc"); d.Kind != "s3" {
 		t.Errorf("an S3 block with no endpoint is AWS, got %+v", d)
 	}
@@ -429,5 +452,86 @@ func TestGCSRetriesTransientErrorsOnly(t *testing.T) {
 	s.flaky["db/hopeless.parquet"] = 100
 	if err := b.Delete(ctx, "db/hopeless.parquet"); err == nil || s.deletes["db/hopeless.parquet"] != gcsRetryAttempts {
 		t.Fatalf("Delete answered 503 forever: %v after %d requests, want an error after %d", err, s.deletes["db/hopeless.parquet"], gcsRetryAttempts)
+	}
+}
+
+func TestGCSEndpointURL(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://storage-psc.p.googleapis.com":             "https://storage-psc.p.googleapis.com/storage/v1/",
+		"https://storage-psc.p.googleapis.com/":            "https://storage-psc.p.googleapis.com/storage/v1/",
+		"https://storage-psc.p.googleapis.com/storage/v1":  "https://storage-psc.p.googleapis.com/storage/v1/",
+		"https://storage-psc.p.googleapis.com/storage/v1/": "https://storage-psc.p.googleapis.com/storage/v1/",
+		"localhost:4443":                               "https://localhost:4443/storage/v1/",
+		"http://localhost:4443":                        "http://localhost:4443/storage/v1/",
+		" https://storage.googleapis.com/storage/v1/ ": "https://storage.googleapis.com/storage/v1/",
+	} {
+		if got, err := gcsEndpointURL(in); err != nil || got != want {
+			t.Errorf("gcsEndpointURL(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"https://h/%zz/", "ftp://h", "https://", "https://h/?x=1"} {
+		if got, err := gcsEndpointURL(bad); err == nil {
+			t.Errorf("gcsEndpointURL(%q) = %q, want an error", bad, got)
+		}
+		if b, err := newGCSBackend(&GCSConfig{Bucket: "b", Endpoint: bad}, zerolog.Nop(), option.WithoutAuthentication()); err == nil || b != nil {
+			t.Errorf("newGCSBackend with endpoint %q = %v, %v; want a refusal, not a backend", bad, b, err)
+		}
+	}
+}
+
+func TestGCSUploadChunk(t *testing.T) {
+	const g = 256 << 10
+	for size, want := range map[int64]int{
+		-1: gcsChunkSize, 0: gcsChunkSize, 1: g, g - 1: g, g: 2 * g,
+		gcsChunkSize - 1: gcsChunkSize, gcsChunkSize: gcsChunkSize, 1 << 30: gcsChunkSize,
+	} {
+		if got := gcsUploadChunk(size); got != want {
+			t.Errorf("gcsUploadChunk(%d) = %d, want %d", size, got, want)
+		}
+		// One request when the object fits: the chunk must exceed the size.
+		if size > 0 && size < gcsChunkSize && int64(gcsUploadChunk(size)) <= size {
+			t.Errorf("gcsUploadChunk(%d) does not exceed the size", size)
+		}
+	}
+}
+
+// An upload stops retrying after gcsUploadRetries transient failures instead
+// of running until its context ends.
+func TestGCSUploadRetriesAreBounded(t *testing.T) {
+	old := gcsUploadRetries
+	gcsUploadRetries = 2
+	t.Cleanup(func() { gcsUploadRetries = old })
+	s := &gcsStub{}
+	b, err := stubGCSBackend(t, s, "", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Write(context.Background(), "db/x.parquet", []byte("abc")); err == nil || s.uploads != 3 {
+		t.Fatalf("Write against a store answering 503: %v after %d requests, want an error after 3", err, s.uploads)
+	}
+}
+
+// A copy that GCS finishes in several rewrite calls passes each call's token
+// to the next; one reported unfinished without a token fails rather than
+// restarting forever.
+func TestGCSCopyFollowsTheRewriteToken(t *testing.T) {
+	s := &gcsStub{rewriteCalls: 3}
+	b, err := stubGCSBackend(t, s, "inst", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CopyObject(context.Background(), "a/src.parquet", "a/dst.parquet", 3, "sha"); err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+	if strings.Join(s.rewriteTokens, ",") != ",t1,t2" {
+		t.Fatalf("rewrite tokens sent = %q, want \"\", t1, t2", s.rewriteTokens)
+	}
+	s2 := &gcsStub{rewriteCalls: 3, noToken: true}
+	b2, err := stubGCSBackend(t, s2, "", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b2.CopyObject(context.Background(), "a/src.parquet", "a/dst.parquet", 3, "sha"); err == nil || s2.rewrites != 1 {
+		t.Fatalf("CopyObject without a token: %v after %d calls, want an error after 1", err, s2.rewrites)
 	}
 }

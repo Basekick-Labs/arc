@@ -323,3 +323,26 @@ func TestGCSObjectURIReadsThroughDuckDB(t *testing.T) {
 		t.Fatalf("read_parquet(%s) = %d, %v", uri, n, err)
 	}
 }
+
+// An object over the 16 MiB chunk goes up as a resumable upload in several
+// chunks with its checksum on the final one, and reads back byte for byte,
+// whole and from an offset.
+func TestGCSLargeObjectRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	b := gcsBackend(t, gcsRunPrefix("large"))
+	body := make([]byte, 40<<20)
+	_, _ = rand.Read(body)
+	key := "db/m/large.parquet"
+	if err := b.WriteReader(ctx, key, bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("WriteReader: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Delete(context.Background(), key) })
+	got, err := b.Read(ctx, key)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("Read: %d bytes, equal %v, %v", len(got), bytes.Equal(got, body), err)
+	}
+	var tail bytes.Buffer
+	if err := b.ReadToAt(ctx, key, &tail, 30<<20); err != nil || !bytes.Equal(tail.Bytes(), body[30<<20:]) {
+		t.Fatalf("ReadToAt: %d bytes, %v", tail.Len(), err)
+	}
+}
