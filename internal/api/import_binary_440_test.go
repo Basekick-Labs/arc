@@ -105,6 +105,18 @@ func TestParquetImportKeepsGeoParquetGeometryAsBinary(t *testing.T) {
 	require.Equal(t, map[string]bool{"utf8": true}, nameTypes)
 }
 
+// The "geo" metadata decides, not the bytes: WKB for POINT(0 0) is all bytes
+// below 0x80, valid UTF-8, and without the metadata would import as text.
+func TestParquetImportGeoParquetPointAtOriginIsBinary(t *testing.T) {
+	ci := newChunkedImport(t, 1000)
+	data := duckdbParquet(t, "SELECT TIMESTAMP '2026-10-25 10:00:00' AS time, from_hex('010100000000000000000000000000000000000000') AS geom",
+		`'geo': '{"version":"1.1.0","primary_column":"geom","columns":{"geom":{"encoding":"WKB","geometry_types":[]}}}'`)
+	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=places", data)
+	require.Equal(t, http.StatusOK, status, body)
+	_, types := ci.storedColumn(t, "geom")
+	require.Equal(t, map[string]bool{"binary": true}, types)
+}
+
 // Without "geo": bytes that are not UTF-8 are binary; a column whose values
 // are all text stays a string (Spark and Hive write strings that way).
 func TestParquetImportDecidesTextOrBinary(t *testing.T) {
