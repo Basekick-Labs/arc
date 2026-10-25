@@ -603,23 +603,27 @@ Parquet file Arc writes is snappy-compressed.
 ## Upgrade note: DuckDB 1.5.6 ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
 
 Arc's query engine moved from DuckDB 1.5.5 to 1.5.6, a bug-fix release.
-Among its fixes are queries that could return wrong results:
+Among its fixes are queries that could return wrong results, if the SQL sent
+to Arc has these shapes:
 
 - a `UNION ALL` whose branches share a join;
 - Top-N over a window function (`row_number() … WHERE rn <= N`), including
-  ordering expressions that can be NULL;
-- `MAX` over a hive partition column after file pruning.
+  ordering expressions that can be NULL.
 
-Nothing in Arc's configuration or API changes. DuckDB extensions are built per
-DuckDB version, so Arc uses the 1.5.6 builds:
+Arc's configuration and API do not change. Two things are visible:
 
-- The Docker image carries httpfs and aws for 1.5.6.
-- Arc downloads azure (for Azure storage) and cache_httpfs (with
-  `query.enable_s3_cache`) on first start, in the image too.
-- Outside the image, Arc downloads all four on first start.
-
-An air-gapped host needs the 1.5.6 builds of the ones it uses copied in, as
-for any DuckDB upgrade.
+- **Error text quotes identifiers.** DuckDB now quotes table and column names
+  in its error messages, so the text of a query error can differ from 1.5.5.
+- **Extensions are rebuilt.** DuckDB extensions are built per DuckDB version,
+  so Arc uses the 1.5.6 builds. The Docker image carries httpfs and aws.
+  Arc downloads azure (for Azure storage) and cache_httpfs (with
+  `query.enable_s3_cache` with S3 primary storage) on first start when the configuration uses
+  them, and outside the image it downloads whichever of the four the storage
+  configuration uses.
+  - An air-gapped host needs the 1.5.6 builds of the ones it uses copied in,
+    as for any DuckDB upgrade.
+  - An arcx extension loaded with `database.arcx_extension_path` must be a
+    build for DuckDB 1.5.6.
 
 ## Upgrade note: file-level time pruning is on by default ([#659](https://github.com/Basekick-Labs/arc/issues/659))
 

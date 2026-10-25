@@ -1113,7 +1113,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Store S3 credentials + endpoint config in the secrets manager. Must run
 	// after LOAD httpfs (which registers the S3 secret type). Order relative to
 	// the sandbox lockdown is immaterial here because this runs at startup,
-	// before it — but see ConfigureS3 for the runtime path, where DuckDB 1.5.5–1.5.6's
+	// before it — but see ConfigureS3 for the runtime path, where DuckDB 1.5.5's and 1.5.6's
 	// secrets-manager behavior makes the DSN's allow_persistent_secrets=false
 	// load-bearing.
 	//
@@ -1587,7 +1587,7 @@ type AzureConfig struct {
 // cold storage uses Azure, before the sandbox lockdown).
 //
 // Like ConfigureS3, this creates a secret AFTER the sandbox lockdown and so
-// depends on buildDSN's allow_persistent_secrets=false — otherwise DuckDB 1.5.5–1.5.6's
+// depends on buildDSN's allow_persistent_secrets=false — otherwise DuckDB 1.5.5's and 1.5.6's
 // secrets manager stats an unallowlisted secret_directory and fails the call.
 func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
 	if azcfg == nil {
