@@ -37,8 +37,15 @@ func columnTypeChangeError(measurement, name string, storedBinary bool) error {
 	if storedBinary {
 		stored, incoming = "binary", "string"
 	}
-	return fmt.Errorf("%w: measurement %q column %s is stored as %s; a %s value would change it for every row already written",
-		ErrColumnTypeChange, measurement, strconv.Quote(name), stored, incoming)
+	hint := ""
+	if !storedBinary {
+		// Before 27.01.1 a Parquet import stored binary columns as strings,
+		// which no query can read when the bytes are not text (#440): the
+		// one way forward for that data is a new column.
+		hint = "; if the column holds binary data stored as text it cannot be read, so write the binary values to a new column"
+	}
+	return fmt.Errorf("%w: measurement %q column %s is stored as %s; a %s value would change it for every row already written%s",
+		ErrColumnTypeChange, measurement, strconv.Quote(name), stored, incoming, hint)
 }
 
 // valueTextBinary is a value's kind: isBinary, and ok when it is a string
