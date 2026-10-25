@@ -183,14 +183,18 @@ func TestBinaryColumnSurvivesWALRecovery(t *testing.T) {
 // as a zero-length bin and a NULL as an absent cell.
 func TestEncodeTypedWALRowsBinary(t *testing.T) {
 	batch := &TypedColumnBatch{
-		Data:     map[string]interface{}{"time": []int64{1, 2, 3}, "geom": [][]byte{{0xff}, nil, {}}},
-		Validity: map[string][]bool{"geom": {true, false, true}},
+		// Row 3 is a valid value held as a nil slice, which merging and
+		// slicing can produce: still an empty value, not a NULL.
+		Data:     map[string]interface{}{"time": []int64{1, 2, 3, 4}, "geom": [][]byte{{0xff}, nil, {}, nil}},
+		Validity: map[string][]bool{"geom": {true, false, true, true}},
 	}
-	payload, err := encodeTypedWALRows("d", "m", batch, 3, nil)
+	payload, err := encodeTypedWALRows("d", "m", batch, 4, nil)
 	require.NoError(t, err)
 	var rows []map[string]interface{}
 	require.NoError(t, msgpack.Unmarshal(payload, &rows))
-	require.Len(t, rows, 3)
+	require.Len(t, rows, 4)
+	b3, ok3 := rows[3]["geom"].([]byte)
+	require.True(t, ok3 && len(b3) == 0, "valid nil slice = %#v, want an empty value", rows[3]["geom"])
 	require.Equal(t, []byte{0xff}, rows[0]["geom"])
 	_, present := rows[1]["geom"]
 	require.False(t, present, "a NULL cell was written")
