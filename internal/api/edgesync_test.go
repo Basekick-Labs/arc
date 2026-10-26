@@ -46,6 +46,10 @@ type syncTestRig struct {
 }
 
 func newSyncTestRig(t *testing.T) *syncTestRig {
+	return newSyncTestRigWithSecrets(t, StaticSpokeSecrets(map[string]string{testSpokeID: testSecret}))
+}
+
+func newSyncTestRigWithSecrets(t *testing.T, spokeSecrets SpokeSecretLookup) *syncTestRig {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("", "api-sync-*")
@@ -73,7 +77,7 @@ func newSyncTestRig(t *testing.T) *syncTestRig {
 	h, err := NewEdgeSyncHandler(EdgeSyncHandlerConfig{
 		Receiver:     recv,
 		Reconciler:   rec,
-		SpokeSecrets: StaticSpokeSecrets(map[string]string{testSpokeID: testSecret}),
+		SpokeSecrets: spokeSecrets,
 		Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
 		HubID:        testHubID,
 		MaxFileBytes: 8 << 20,
@@ -273,6 +277,74 @@ func TestEdgeSyncHandler_RejectsUnauthenticated(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEdgeSyncHandler_RefusesLegacyFilesystemCollision(t *testing.T) {
+	file, err := os.CreateTemp("", "api-colliding-spokes-*.db")
+	if err != nil {
+		t.Fatalf("temp database: %v", err)
+	}
+	databasePath := file.Name()
+	if err := file.Close(); err != nil {
+		t.Fatalf("close temp database: %v", err)
+	}
+	db, err := sql.Open("sqlite3", databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close(); _ = os.Remove(databasePath) })
+
+	cipher := newAdminTestCipher(t)
+	_, err = edgesync.NewRegistry(db, cipher, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	encrypted, err := cipher.Encrypt(testSecret)
+	if err != nil {
+		t.Fatalf("encrypt secret: %v", err)
+	}
+	for _, id := range []string{"rocket_01", "ROCKET_01", "rocket_02"} {
+		if _, err := db.Exec(`
+			INSERT INTO sync_spokes (spoke_id, name, secret_encrypted, enabled, registered_at)
+			VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`, id, id, encrypted); err != nil {
+			t.Fatalf("insert legacy spoke %q: %v", id, err)
+		}
+	}
+
+	// The second registry models startup with rows left by an older version.
+	registry, err := edgesync.NewRegistry(db, cipher, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen registry: %v", err)
+	}
+	rig := newSyncTestRigWithSecrets(t, RegistrySpokeSecrets(registry, zerolog.Nop()))
+
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		req := defaultReq([]byte("payload"))
+		req.spokeID = id
+		req.secret = testSecret
+		resp := req.do(t, rig)
+		if resp.StatusCode != fiber.StatusUnauthorized {
+			t.Errorf("sync for colliding ID %q returned %d, want 401", id, resp.StatusCode)
+		}
+		resp.Body.Close()
+		exists, err := rig.backend.Exists(context.Background(), edgesync.NamespacedPath(id, req.path))
+		if err != nil {
+			t.Fatalf("check colliding spoke path %q: %v", id, err)
+		}
+		if exists {
+			t.Errorf("sync for colliding ID %q wrote a file", id)
+		}
+	}
+
+	// Existing registrations outside the collision group keep working.
+	req := defaultReq([]byte("payload"))
+	req.spokeID = "rocket_02"
+	req.secret = testSecret
+	resp := req.do(t, rig)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("sync for unrelated ID returned %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
 }
 
 func TestEdgeSyncHandler_RejectsReplay(t *testing.T) {
