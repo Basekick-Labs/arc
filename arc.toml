@@ -35,10 +35,11 @@ format = "console"  # json or console
 #                         # though — this pool is the only global limit on
 #                         # concurrent queries, and the Go-side memory of an
 #                         # in-flight result is not covered by memory_limit.
-# memory_limit = "8GB"    # Default: unset — DuckDB uses 80% of the container's
-#                         # cgroup limit, or of host memory when unlimited.
-#                         # Set this only to override that. Percent and unit-less
-#                         # forms are rejected: DuckDB needs an absolute size.
+# memory_limit = "8GB"    # Default: 60% of a detected cgroup memory limit,
+#                         # when that is at least 128 MiB. Otherwise DuckDB
+#                         # keeps its own default (80% of detected memory).
+#                         # Explicit values override this.
+#                         # Percent and unit-less forms are rejected.
 # thread_count = 14       # Default: unset — DuckDB uses the container's CPU
 #                         # quota (cpu.max), not the host's core count.
 #                         # compaction.threads follows the quota too since

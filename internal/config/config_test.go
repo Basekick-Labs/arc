@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/syscpu"
+	"github.com/basekick-labs/arc/internal/sysmem"
 	"github.com/spf13/viper"
 )
 
@@ -93,14 +94,8 @@ func TestGetDefaultMaxConnections_StaysMachineDerived(t *testing.T) {
 	}
 }
 
-// TestDatabaseMemoryLimitDefaultsToEmpty pins that Arc does not set DuckDB's
-// memory limit either.
-//
-// Empty does NOT mean unlimited: DuckDB performs its own cgroup-aware detection
-// and defaults to 80% of what it finds (measured — 28.7 GiB on a 36 GiB host,
-// 409.5 MiB in a --memory=512m container). Arc used to overwrite that with
-// min(NumCPU, 32) GB, which is 32 GB inside a 2Gi pod on a big host and 14 GB on
-// a 36 GiB workstation: wrong in both directions depending on memory-per-core.
+// TestDatabaseMemoryLimitDefaultsToEmpty pins the Viper sentinel. Load resolves
+// it to a lower value only when sysmem finds a cgroup limit.
 func TestDatabaseMemoryLimitDefaultsToEmpty(t *testing.T) {
 	v := viper.New()
 	setDefaults(v)
@@ -162,6 +157,13 @@ func TestDefaultFlushQueueSize(t *testing.T) {
 }
 
 func TestLoad_DefaultsFromSystem(t *testing.T) {
+	original := systemMemoryLimitFn
+	t.Cleanup(func() { systemMemoryLimitFn = original })
+	const cgroupLimit = uint64(3 << 30)
+	systemMemoryLimitFn = func() (uint64, sysmem.Source, bool) {
+		return cgroupLimit, sysmem.SourceCgroupV2, true
+	}
+
 	// Create a temp dir without config file to test defaults
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")
 	if err != nil {
@@ -173,6 +175,10 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	oldWd, _ := os.Getwd()
 	os.Chdir(tmpDir)
 	defer os.Chdir(oldWd)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ARC_DATABASE_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MAX_CONCURRENT", "2")
 
 	cfg, err := Load()
 	if err != nil {
@@ -189,8 +195,9 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 		t.Errorf("Database.MaxConnections = %d, want %d", cfg.Database.MaxConnections, expectedConns)
 	}
 
-	if cfg.Database.MemoryLimit != "" {
-		t.Errorf("Database.MemoryLimit = %q, want \"\" (DuckDB's own cgroup-aware value, #1026)", cfg.Database.MemoryLimit)
+	wantMemoryLimit := formatDuckDBBytes(cgroupLimit * 3 / 5)
+	if cfg.Database.MemoryLimit != wantMemoryLimit {
+		t.Errorf("Database.MemoryLimit = %q, want %q (60%% of the cgroup limit)", cfg.Database.MemoryLimit, wantMemoryLimit)
 	}
 
 	// Ingest dictionary defaults (26.09.1): no dictionary encoding at ingest —
