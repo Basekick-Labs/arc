@@ -47,6 +47,11 @@ type DuckDB struct {
 	refresherMu  sync.Mutex
 	s3Refreshers map[string]*credentialRefresher
 
+	// externalFileCache is enable_external_file_cache as DuckDB reported it
+	// after configureDatabase: the effective value, not the intended one. Nil
+	// when DuckDB could not report it. Read-only after New.
+	externalFileCache *bool
+
 	// coldTier records the cold tier's backend + credential mode for the
 	// /health storage payload (#603). Set by ConfigureS3/ConfigureAzure at
 	// startup (the hot tier is derived live from d.config and needs no
@@ -148,6 +153,8 @@ func (d *DuckDB) StorageCredentialStatus() map[string]StorageTierStatus {
 		out["hot"] = d.azureTierStatus(
 			d.config.AzureConnectionString, d.config.AzureAccountKey, d.config.AzureSASToken,
 			arcAzurePrimarySecretName, refreshers, now)
+	case d.config.GCSIsPrimaryBackend:
+		out["hot"] = gcsTierStatus(arcGCSPrimarySecretName, refreshers, now)
 	default:
 		out["hot"] = StorageTierStatus{Backend: "local", Credentials: credModeNone, State: CredStateOK}
 	}
@@ -161,6 +168,10 @@ func (d *DuckDB) StorageCredentialStatus() map[string]StorageTierStatus {
 			if r := refreshers[cold.secretName]; r != nil {
 				st = r.status(now)
 				st.Backend, st.Credentials = cold.backend, s3ModeSDKManaged
+			} else if cold.backend == "gcs" {
+				// GCS has no fallback secret (gcsrefresh.go): no refresher
+				// means no credentials at all.
+				st.State = CredStateUnavailable
 			} else {
 				// Provider construction failed at configure time: running on
 				// the CREDENTIAL_CHAIN fallback with no refresher.
@@ -466,6 +477,7 @@ type Config struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	Extensions     []string
 	// PreserveInsertionOrder maps to DuckDB's preserve_insertion_order.
 	// false allows DuckDB to reorder results of queries without an ORDER BY,
 	// enabling faster parallel scans/aggregations. Explicit ORDER BY clauses
@@ -516,6 +528,22 @@ type Config struct {
 	// so a stray storage.azure_* value on a non-Azure-primary deployment does
 	// not provision a spurious primary secret (mirrors S3IsPrimaryBackend).
 	AzureIsPrimaryBackend bool
+	// GCS primary storage (#1105). GCSIsPrimaryBackend is true when
+	// storage.backend is "gcs"; it gates the Arc-managed bearer-token secret
+	// (gcsrefresh.go) and the httpfs load. GCSCredentialsFile is the optional
+	// service-account key path (empty = Application Default Credentials);
+	// GCSEndpoint the optional https JSON API endpoint, whose host DuckDB uses.
+	GCSIsPrimaryBackend bool
+	GCSBucket           string
+	GCSPrefix           string
+	GCSEndpoint         string
+	GCSCredentialsFile  string
+	// ColdGCSBucket / ColdGCSPrefix: a GCS cold tier (#1105). Set only when
+	// tiered_storage.cold.backend is "gcs"; they load httpfs before the
+	// lockdown and allowlist gs://bucket/prefix/. The secret comes later from
+	// ConfigureGCS.
+	ColdGCSBucket string
+	ColdGCSPrefix string
 	// Cold-tier sandbox allowlist entries. Independent from S3Bucket /
 	// AzureContainer (which describe Arc's primary/hot storage) because
 	// Enterprise tiered storage routinely combines hot=local with cold=S3 —
@@ -554,6 +582,9 @@ type Config struct {
 	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
 	S3CacheSize       int64 // Cache size in bytes
 	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600)
+	// ExternalFileCache is database.external_file_cache: "auto" (or empty),
+	// "true" or "false". See configureExternalFileCache.
+	ExternalFileCache string
 	// ArcxExtensionPath is the absolute path to arcx.duckdb_extension.
 	// Empty disables the loader. Arc Enterprise only — the caller
 	// (cmd/arc/main.go) clears this field when the license does not
@@ -610,6 +641,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		Bool("s3_cache_enabled", cfg.EnableS3Cache).
 		Bool("azure_enabled", azureEnabled).
 		Str("azure_account", cfg.AzureAccountName).
+		Bool("gcs_enabled", cfg.GCSIsPrimaryBackend).
 		Msg("DuckDB initialized")
 
 	d := &DuckDB{
@@ -617,6 +649,18 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		logger:       logger,
 		config:       cfg,
 		s3Refreshers: make(map[string]*credentialRefresher),
+	}
+	if on, err := readExternalFileCache(db); err == nil {
+		d.externalFileCache = &on
+		logger.Info().Bool("enabled", on).Str("configured", externalFileCacheMode(cfg)).
+			Bool("may_read_remote_storage", mayReadRemoteStorage(cfg)).Msg("DuckDB file cache")
+	} else if externalFileCacheMode(cfg) != "auto" {
+		// The operator asked for a value and DuckDB cannot confirm it.
+		db.Close()
+		return nil, err
+	} else {
+		// auto tolerates a DuckDB without the setting, as the SET does.
+		logger.Warn().Err(err).Msg("DuckDB file cache state unknown (continuing)")
 	}
 
 	// IRSA (web identity): the primary S3 secret is Arc-managed. configureS3Access
@@ -633,6 +677,19 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 				db.Close()
 				return nil, fmt.Errorf("failed to configure azure credential refresher: %w", err)
 			}
+		}
+	}
+
+	if cfg.GCSIsPrimaryBackend {
+		// GCS (#1105): always Arc-managed — DuckDB has no credential chain for
+		// GCS, so a bearer token is the only way its reads authenticate.
+		params, err := primaryGCSSecretParams(cfg)
+		if err == nil {
+			err = d.startGCSRefresher(params, primaryGCSIdentity(cfg))
+		}
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to configure GCS credential refresher: %w", err)
 		}
 	}
 
@@ -726,8 +783,9 @@ func buildDSN(cfg *Config) string {
 	// buildAzureSecretSQL never emit PERSISTENT — so nothing is lost. Two reasons
 	// it is set here rather than left at the default:
 	//
-	//  1. As of DuckDB 1.5.5 the secrets manager stats its secret_directory on
-	//     EVERY CREATE SECRET, including temporary ones. That directory defaults
+	//  1. In DuckDB 1.5.5 and 1.5.6 (re-verified 2026-10-25, #1372) the secrets
+	//     manager stats its secret_directory on EVERY CREATE SECRET, including
+	//     temporary ones. That directory defaults
 	//     to ~/.duckdb/stored_secrets, outside the sandbox allowlist, so any
 	//     secret created after lockdownExternalAccess (the runtime cold-tier
 	//     ConfigureS3 / ConfigureAzure path) failed with "Permission Error:
@@ -815,6 +873,36 @@ func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 	componentLogger.Info().Str("path", path).Msg("arcx extension loaded (database-wide)")
+	return nil
+}
+
+// loadConfiguredExtensions installs and loads operator-selected DuckDB
+// extensions before lockdownExternalAccess disables future INSTALL/LOAD.
+// DuckDB registers extensions per database, so one load covers the pool.
+// Every name is checked against supportedExtensions before the first INSTALL
+// (#440).
+func loadConfiguredExtensions(db *sql.DB, extensions []string, logger zerolog.Logger) error {
+	if err := validateExtensions(extensions); err != nil {
+		// The entry is a log field: the error sanitizer blanks quoted
+		// strings, which would hide which one in the startup error.
+		bad, _ := unsupportedExtension(extensions)
+		logger.Error().Str("extension", bad).Strs("supported", SupportedExtensionNames()).Msg("database.extensions names an unsupported DuckDB extension")
+		return err
+	}
+	for _, name := range extensions {
+		quotedName := quoteDuckDBIdent(name)
+		if _, err := db.Exec("INSTALL " + quotedName); err != nil {
+			// The extension is a log field: the error sanitizer blanks
+			// quoted strings, which would hide the name in the error.
+			logger.Error().Str("extension", name).Err(err).Msg("DuckDB extension install failed")
+			return fmt.Errorf("install DuckDB extension %q: %w", name, err)
+		}
+		if _, err := db.Exec("LOAD " + quotedName); err != nil {
+			logger.Error().Str("extension", name).Err(err).Msg("DuckDB extension load failed")
+			return fmt.Errorf("load DuckDB extension %q: %w", name, err)
+		}
+		logger.Info().Str("extension", name).Msg("DuckDB extension loaded")
+	}
 	return nil
 }
 
@@ -946,6 +1034,10 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to enable parquet metadata cache (continuing without it)")
 	}
 
+	if err := configureExternalFileCache(db, cfg, logger); err != nil {
+		return err
+	}
+
 	// preserve_insertion_order=false (the default) lets DuckDB reorder
 	// results of queries without an ORDER BY, which per DuckDB guidance can
 	// reduce memory usage and unlock parallelism on large un-ordered
@@ -1004,6 +1096,25 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
+	// GCS primary (#1105): httpfs serves gs:// reads (TYPE GCS secrets) and
+	// must be loaded before the lockdown below blocks LOAD. The secret itself
+	// is emitted later by the GCS refresher in New, after this returns: CREATE
+	// SECRET works after the lockdown (see buildDSN).
+	if cfg.GCSIsPrimaryBackend || cfg.ColdGCSBucket != "" {
+		if err := ensureHTTPFSLoaded(db); err != nil {
+			return fmt.Errorf("failed to load httpfs for GCS: %w", err)
+		}
+		// As for an S3 primary (configureS3Access). query.enable_s3_cache
+		// (cache_httpfs) is NOT applied: it has not been verified on gs://.
+		if _, err := db.Exec("SET GLOBAL prefetch_all_parquet_files=true"); err != nil {
+			logger.Warn().Err(err).Msg("Failed to set prefetch_all_parquet_files")
+		}
+	}
+
+	if err := loadConfiguredExtensions(db, cfg.Extensions, logger); err != nil {
+		return fmt.Errorf("failed to load configured DuckDB extensions: %w", err)
+	}
+
 	// Load the proprietary arcx extension once for the whole pool. Extension
 	// registration is database-wide, so a single LOAD covers every connection.
 	// License gating happens upstream (cmd/arc/main.go clears
@@ -1016,6 +1127,10 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		if err := verifyArcxLoaded(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to verify arcx extension: %w", err)
 		}
+	}
+
+	if err := DisableGeoParquetConversion(context.Background(), db); err != nil {
+		return err
 	}
 
 	// Final step: lock down DuckDB's file-access surface so user-supplied SQL
@@ -1112,7 +1227,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Store S3 credentials + endpoint config in the secrets manager. Must run
 	// after LOAD httpfs (which registers the S3 secret type). Order relative to
 	// the sandbox lockdown is immaterial here because this runs at startup,
-	// before it — but see ConfigureS3 for the runtime path, where DuckDB 1.5.5's
+	// before it — but see ConfigureS3 for the runtime path, where DuckDB 1.5.5's and 1.5.6's
 	// secrets-manager behavior makes the DSN's allow_persistent_secrets=false
 	// load-bearing.
 	//
@@ -1264,8 +1379,8 @@ type S3Config struct {
 // primary's. With distinct scoped secrets, DuckDB resolves the right credentials
 // per read_parquet() path.
 //
-// This runs AFTER the sandbox lockdown (enable_external_access=false). As of
-// DuckDB 1.5.5 that is only safe because buildDSN sets
+// This runs AFTER the sandbox lockdown (enable_external_access=false). In
+// DuckDB 1.5.5 and 1.5.6 that is only safe because buildDSN sets
 // allow_persistent_secrets=false: with on-disk secret storage enabled the
 // secrets manager stats its secret_directory on every CREATE SECRET — including
 // the TEMPORARY secrets Arc creates — and that directory (~/.duckdb/
@@ -1332,11 +1447,30 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 	return nil
 }
 
-// ClearHTTPCache clears DuckDB's cache_httpfs and parquet_metadata_cache.
-// Call after compaction/delete/retention so subsequent queries don't hit stale
-// cache entries pointing to files that no longer exist. Also asks glibc to
-// release native-heap pages — debug.FreeOSMemory only covers Go-managed memory;
-// CGo allocations from the DuckDB httpfs extension live outside it.
+// ClearHTTPCache clears DuckDB's cache_httpfs cache and asks glibc to return
+// freed native-heap pages to the OS. invalidateQueryCaches (cmd/arc/main.go)
+// calls it after every compaction job, DELETE, database delete and retention
+// pass, and every peer re-runs it; tiering calls it around a migration, and
+// the query path after a remote object vanished mid-query.
+//
+// What it does not do (#1372, measured on DuckDB 1.5.5, 1.5.6 and 2.0.0):
+//   - Free the Parquet metadata cache. Nothing does: SET GLOBAL
+//     parquet_metadata_cache=false then true, which this function used to
+//     run, frees nothing. The cache stays within memory_limit and is evicted
+//     under pressure. Staleness is not a concern: DuckDB validates cached
+//     entries against the file, so a file rewritten at the same path reads
+//     back fresh with or without that toggle, and Arc never rewrites a file
+//     in place anyway (DELETE and compaction write new paths). The one way to
+//     keep footers out of it is per connection: a DELETE's counting reads run
+//     with SET SESSION parquet_metadata_cache=false on a connection that is
+//     then discarded (countConn, internal/api/delete_window.go).
+//   - Flush DuckDB's file cache (enable_external_file_cache). On a node that
+//     may read S3 or Azure it is the remote read cache, and this runs after
+//     every compaction job on every node; on a local-only node it is off
+//     (configureExternalFileCache).
+//
+// debug.FreeOSMemory only covers Go-managed memory; the glibc release covers
+// CGo allocations from DuckDB and its extensions.
 func (d *DuckDB) ClearHTTPCache() {
 	d.clearHTTPCache(zerolog.InfoLevel)
 }
@@ -1353,18 +1487,6 @@ func (d *DuckDB) clearHTTPCache(level zerolog.Level) {
 		d.logger.Debug().Err(err).Msg("cache_httpfs_clear_cache not available (extension may not be loaded)")
 	} else {
 		d.logger.WithLevel(level).Msg("Cleared cache_httpfs cache")
-	}
-
-	// Toggle disable then re-enable — always attempt the re-enable even if
-	// disable failed, so a transient disable error doesn't leave the cache
-	// in an unintended off state on a connection.
-	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=false"); err != nil {
-		d.logger.Debug().Err(err).Msg("Failed to disable parquet_metadata_cache")
-	}
-	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
-		d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
-	} else {
-		d.logger.WithLevel(level).Msg("Reset parquet_metadata_cache")
 	}
 
 	if memtrim.ReleaseToOS() {
@@ -1586,7 +1708,7 @@ type AzureConfig struct {
 // cold storage uses Azure, before the sandbox lockdown).
 //
 // Like ConfigureS3, this creates a secret AFTER the sandbox lockdown and so
-// depends on buildDSN's allow_persistent_secrets=false — otherwise DuckDB 1.5.5's
+// depends on buildDSN's allow_persistent_secrets=false — otherwise DuckDB 1.5.5's and 1.5.6's
 // secrets manager stats an unallowlisted secret_directory and fails the call.
 func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
 	if azcfg == nil {
@@ -1984,4 +2106,91 @@ func logEffectiveResourceSettings(db *sql.DB, logger zerolog.Logger) {
 		Str("memory_limit", memLimit).
 		Str("threads", threads).
 		Msg("DuckDB effective resource settings (empty config values mean DuckDB's own cgroup-aware defaults)")
+}
+
+// mayReadRemoteStorage reports whether this node's DuckDB may read S3, Azure
+// or GCS. It is true exactly when configureDatabase loads httpfs or azure for
+// storage: the S3 gate (S3IsPrimaryBackend or either S3 key, else
+// ColdS3Bucket), the Azure gate (AzureIsPrimaryBackend, else
+// ColdAzureContainer) and the GCS gate (GCSIsPrimaryBackend or
+// ColdGCSBucket, #1105). It over-classifies on purpose: a cold bucket left in
+// the config with tiering off or unlicensed, or S3 keys with no bucket, still
+// counts, which keeps today's behaviour on such a node. Under-classifying
+// would cost remote reads their only cache (query.enable_s3_cache is off by
+// default and only covers primary S3), not correctness.
+//
+// Not the same question as the query path's readsObjectStore, which asks at
+// run time whether a vanished file can be an object (#1355).
+func mayReadRemoteStorage(cfg *Config) bool {
+	return cfg.S3IsPrimaryBackend || cfg.S3AccessKey != "" || cfg.S3SecretKey != "" ||
+		cfg.ColdS3Bucket != "" || cfg.AzureIsPrimaryBackend || cfg.ColdAzureContainer != "" ||
+		cfg.GCSIsPrimaryBackend || cfg.ColdGCSBucket != ""
+}
+
+// externalFileCacheMode is cfg.ExternalFileCache with empty read as "auto", so
+// a Config built without the field (tests, embeddings) behaves like the
+// shipped default.
+func externalFileCacheMode(cfg *Config) string {
+	if cfg.ExternalFileCache == "" {
+		return "auto"
+	}
+	return cfg.ExternalFileCache
+}
+
+// configureExternalFileCache applies database.external_file_cache (#1372).
+//
+// DuckDB's file cache keeps blocks of every file it reads and drops them only
+// under memory_limit pressure. Compaction deletes and replaces files all day,
+// so on a busy node most of the cache belongs to files that no longer exist,
+// and memory_limit defaults to 80% of RAM. For local files the OS page cache
+// already holds the same blocks: turning DuckDB's copy off measured no
+// latency cost on macOS or Linux (warm, hot and 8 concurrent clients; Linux
+// small-file queries were 5-7% faster), and DuckDB 2.0 stopped caching local
+// files. On a node that may read S3, Azure or GCS it stays
+// on, because there it is the remote read cache.
+//
+// "auto" turns it off when mayReadRemoteStorage is false and otherwise leaves
+// DuckDB's default (on in 1.5.x). "true" and "false" set it explicitly, so
+// neither depends on DuckDB's default. A failed SET on auto keeps DuckDB's
+// default with a warning; on an explicit value it fails startup, because the
+// operator asked for it.
+func configureExternalFileCache(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	mode := externalFileCacheMode(cfg)
+	value := "false"
+	switch mode {
+	case "true":
+		value = "true"
+	case "false":
+	case "auto":
+		if mayReadRemoteStorage(cfg) {
+			return nil
+		}
+	default:
+		return fmt.Errorf("database.external_file_cache must be auto, true or false, got %q", cfg.ExternalFileCache)
+	}
+	if _, err := db.Exec("SET GLOBAL enable_external_file_cache=" + value); err != nil {
+		if mode != "auto" {
+			return fmt.Errorf("failed to set DuckDB's file cache (database.external_file_cache=%s): %w", mode, err)
+		}
+		logger.Warn().Err(err).Msg("Failed to turn off DuckDB's file cache on a local-only node (continuing with DuckDB's default)")
+	}
+	return nil
+}
+
+// readExternalFileCache reads enable_external_file_cache back from DuckDB.
+func readExternalFileCache(db *sql.DB) (bool, error) {
+	var on bool
+	if err := db.QueryRow("SELECT current_setting('enable_external_file_cache')::BOOLEAN").Scan(&on); err != nil {
+		return false, fmt.Errorf("failed to read enable_external_file_cache: %w", err)
+	}
+	return on, nil
+}
+
+// ExternalFileCacheEnabled reports whether DuckDB's file cache is on, as
+// DuckDB reported it at startup, and whether DuckDB could report it at all.
+func (d *DuckDB) ExternalFileCacheEnabled() (on, known bool) {
+	if d.externalFileCache == nil {
+		return false, false
+	}
+	return *d.externalFileCache, true
 }

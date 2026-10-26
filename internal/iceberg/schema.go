@@ -25,6 +25,7 @@ import (
 //	TIMESTAMP (no tz)             -> timestamp
 //	FLOAT64                       -> double
 //	STRING                        -> string
+//	BINARY (msgpack bin, #440)    -> binary
 //	BOOL                          -> boolean
 //	DECIMAL128(p,s)               -> decimal(p,s)
 func SchemaFromParquet(localPath string) (ArcSchema, error) {
@@ -175,6 +176,8 @@ func arrowToIceberg(t arrow.DataType) (iceberg.Type, error) {
 		return iceberg.Float32Type{}, nil
 	case *arrow.StringType:
 		return iceberg.StringType{}, nil
+	case *arrow.BinaryType:
+		return iceberg.BinaryType{}, nil
 	case *arrow.BooleanType:
 		return iceberg.BooleanType{}, nil
 	case *arrow.TimestampType:

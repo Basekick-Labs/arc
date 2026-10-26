@@ -404,7 +404,7 @@ func (m *Manager) runCycle(ctx context.Context) error {
 			Dur("scan_timeout", m.scanBudget()).
 			Int("scanned", scanResult.FilesScanned).
 			Int("registered", scanResult.FilesRegistered).
-			Msg("Pre-migration scan ran out of budget and stopped part way; no hot rows were retired this cycle. Raise tiered_storage.scan_timeout above the time a full scan takes")
+			Msg("Pre-migration scan ran out of budget and stopped part way; stale hot rows were not all retired this cycle (none if the walk itself stopped). Raise tiered_storage.scan_timeout above the time a full scan takes")
 	default:
 		m.logger.Info().
 			Int("scanned", scanResult.FilesScanned).
@@ -718,6 +718,24 @@ func (m *Manager) coldTierUsable() bool {
 	return m != nil && m.coldBackend != nil && m.config != nil && m.config.Cold.Enabled
 }
 
+// ColdTierMissing reports a cold tier that is configured on but has no
+// backend on this node: its construction failed at startup (a bad endpoint,
+// credentials that could not be resolved). Every cold accessor then answers
+// "no cold tier", so a read would silently leave out every cold file and
+// answer with the hot rows alone (#1105). The query path asks this to fail
+// such a read instead.
+func (m *Manager) ColdTierMissing() bool {
+	return m != nil && m.config != nil && m.config.Cold.Enabled && m.coldBackend == nil
+}
+
+// HasColdFilesInRange reports whether the measurement has cold tier rows
+// whose partition may hold data in [start, end]. A nil bound is open. Used
+// only by the query path when ColdTierMissing, to fail exactly the reads
+// that would have needed the cold tier.
+func (m *Manager) HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	return m.metadata.HasColdFilesInRange(ctx, database, measurement, start, end)
+}
+
 // GetBackendForTier returns the storage backend for a tier, or nil when this
 // node has no usable one.
 //
@@ -953,9 +971,10 @@ type ScanResult struct {
 	HotRowsWritten int `json:"hot_rows_written"`
 	// Truncated reports that the scan ran out of budget and stopped part
 	// way. The counts beside it are real but incomplete, and in particular
-	// hot-row retirement runs only after the whole walk, so a truncated
-	// scan has retired nothing: stale rows for files that are gone from hot
-	// storage survive to the next complete scan.
+	// hot-row retirement runs only after the whole walk, so a scan truncated
+	// in the walk has retired nothing, and one truncated in the retirement
+	// itself has retired only part: stale rows for files that are gone from
+	// hot storage survive to the next complete scan.
 	//
 	// Set on every path that can run out of budget — the cold sync, the hot
 	// walk, and the retire tail, which returns no error of its own.
@@ -1565,7 +1584,7 @@ func (m *Manager) logScanOutcome(result *ScanResult) {
 	msg := "File scan completed"
 	if result.Truncated {
 		event = m.logger.Warn()
-		msg = "File scan ran out of budget and stopped part way; stale hot rows were not retired"
+		msg = "File scan ran out of budget and stopped part way; stale hot rows were not all retired"
 	}
 	event.
 		Int("scanned", result.FilesScanned).
@@ -1590,27 +1609,79 @@ const retireVanishedHotRowMargin = 5 * time.Minute
 // FindCandidates select a file that is not there. Cold rows are never
 // touched (#683) and quarantined rows keep their record (#758). Returns
 // how many rows were retired.
+//
+// The hot rows are read a page at a time (hotRowsPage). Afterwards a WAL file
+// far larger than the autocheckpoint keeps it (one an earlier version grew)
+// is truncated (truncateTierWAL).
 func (m *Manager) retireVanishedHotRows(ctx context.Context, objects []storage.ObjectInfo, listStart time.Time, result *ScanResult) int {
-	hotRows, err := m.metadata.GetFilesInTier(ctx, TierHot)
-	if err != nil {
-		// A budget that expired here is a truncation, not a database
-		// failure: without the flag the scan reports Errors++ and still
-		// returns a nil error, so it reads as a complete scan that had a
-		// hiccup rather than one that never retired anything (#1154).
-		if isBudgetExpiry(err) {
-			result.Truncated = true
-		}
-		m.logger.Warn().Err(err).Msg("Failed to load hot rows; stale rows are retried next scan")
-		result.Errors++
-		return 0
-	}
 	seen := make(map[string]bool, len(objects))
 	for _, obj := range objects {
 		seen[obj.Path] = true
 	}
 	cutoff := listStart.Add(-retireVanishedHotRowMargin)
 	retired := 0
-	for _, row := range hotRows {
+	defer m.truncateTierWAL(&retired)
+	var afterID int64
+	for {
+		page, err := m.metadata.hotRowsPage(ctx, afterID, retireHotRowsPage)
+		if err != nil {
+			// A budget that expired here is a truncation, not a database
+			// failure: without the flag the scan reports Errors++ and still
+			// returns a nil error, so it reads as a complete scan that had a
+			// hiccup rather than one that never retired anything (#1154).
+			if isBudgetExpiry(err) {
+				result.Truncated = true
+			}
+			m.logger.Warn().Err(err).Msg("Failed to load hot rows; stale rows are retried next scan")
+			result.Errors++
+			return retired
+		}
+		if len(page) == 0 {
+			return retired
+		}
+		afterID = page[len(page)-1].ID
+		if done := m.retireStaleInPage(ctx, page, seen, cutoff, result, &retired); done {
+			return retired
+		}
+	}
+}
+
+// retireHotRowsPage is how many hot rows the stale-row walk reads at a time.
+var retireHotRowsPage = 10000 // a var for tests only
+
+// truncateWALAboveBytes is the WAL file size above which the stale-row walk
+// truncates it. SQLite's autocheckpoint keeps the file near 4 MB, so only a
+// WAL an earlier version grew (deleteReturningScope) is ever this large.
+var truncateWALAboveBytes int64 = 64 << 20 // a var for tests only
+
+// truncateTierWAL truncates the tier store's WAL file when it is larger than
+// truncateWALAboveBytes. Only logged: the walk already did its work, and a
+// checkpoint a reader blocks (busy) is tried again after the next walk.
+func (m *Manager) truncateTierWAL(retired *int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	size, err := m.metadata.walFileBytes(ctx)
+	if err != nil {
+		m.logger.Debug().Err(err).Msg("Could not read the tier metadata WAL size")
+		return
+	}
+	if size <= truncateWALAboveBytes {
+		return
+	}
+	busy, logFrames, checkpointed, err := m.metadata.truncateWAL(ctx)
+	if err != nil || busy != 0 {
+		m.logger.Warn().Err(err).Int64("wal_bytes", size).Int("busy", busy).Int("log_frames", logFrames).
+			Msg("Could not truncate the tier metadata WAL; tried again after the next tier scan")
+		return
+	}
+	m.logger.Info().Int64("wal_bytes_before", size).Int("checkpointed_frames", checkpointed).Int("retired", *retired).
+		Msg("Truncated the tier metadata WAL")
+}
+
+// retireStaleInPage retires the stale rows of one page. done reports that the
+// walk must stop (the budget ran out).
+func (m *Manager) retireStaleInPage(ctx context.Context, page []FileMetadata, seen map[string]bool, cutoff time.Time, result *ScanResult, retired *int) (done bool) {
+	for _, row := range page {
 		if seen[row.Path] || row.QuarantinedAt != nil || !row.CreatedAt.Before(cutoff) {
 			continue
 		}
@@ -1621,13 +1692,13 @@ func (m *Manager) retireVanishedHotRows(ctx context.Context, objects []storage.O
 			// should have (#1154). result is the same object the caller
 			// reads.
 			//
-			// Reaching here needs the budget to expire BETWEEN the load
-			// above and this check, which no test can arrange without a
-			// seam; the load-failure path above is the covered one. Kept
+			// Reaching here needs the budget to expire BETWEEN this
+			// page's load and this check, which no test can arrange without a
+			// seam; the page-load failure path is the covered one. Kept
 			// because a budget that expires mid-loop is the likelier case
 			// on a node with many stale rows, one StatFile each.
 			result.Truncated = true
-			return retired
+			return true
 		}
 		// Tier-conditional: a row that changed tier since the listing is
 		// not ours to remove.
@@ -1666,10 +1737,10 @@ func (m *Manager) retireVanishedHotRows(ctx context.Context, objects []storage.O
 			continue
 		}
 		if removed {
-			retired++
+			*retired++
 		}
 	}
-	return retired
+	return false
 }
 
 // filePathInfo holds parsed information from a file path

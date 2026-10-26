@@ -2,6 +2,15 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: cluster cache invalidation reaches peers with wildcard API addresses (#1398)
+
+Cache-invalidation fan-out now resolves hostless and wildcard API addresses
+(`:8000`, `0.0.0.0:8000`, `[::]:8000`) using the peer's coordinator host,
+retaining the API port. Previously these requests could reach the sender
+itself and be rejected with 403, leaving peer caches stale after compaction,
+retention, DELETE or database/measurement removal. Explicit API hosts remain
+unchanged. Forwarded requests and invalidation now share the same resolver.
+
 ## New: MessagePack columnar tag keys (#275)
 
 MessagePack columnar payloads now accept an optional `tag_keys` field to
@@ -189,6 +198,32 @@ an answer cannot reveal which columns that measurement already has.
   Parquet files directly and renames the column, then an import of the result.
 - **Edge sync:** a spoke on an older release can still send such files to
   its hub; upgrade spokes first.
+
+## Upgrade note: a cold tier that overlaps primary storage refuses to start ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+With `tiered_storage.enabled` and `tiered_storage.cold.enabled`, Arc now
+refuses to start when the cold tier is the same location as primary
+storage, or one is inside the other (the same bucket with equal or nested
+prefixes), for every backend. This is a new check; nothing compared the two
+before. At the same location a file and its cold copy have one key, so
+migration copied the file onto itself and then deleted it: data loss.
+Nested, each tier's listing took in the other's objects and registered
+them as files of a database that does not exist. Move the cold tier to
+another bucket or to a prefix that is not a parent or child of the
+primary's.
+
+## Upgrade note: a query that needs an unavailable cold tier answers 503 ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+When the cold tier is enabled but its backend failed to start (a bad
+endpoint or credentials file, for any backend), a query whose time range
+reaches cold-tier files that this node's tier metadata records now answers
+HTTP 503 naming the cold tier. A node whose tier metadata holds no cold
+rows (a fresh or rebuilt one, which cannot rebuild them while the cold tier
+is down) still answers from the hot tier alone. It used
+to leave the cold files out and answer with the hot rows alone, as a
+success. Queries that need no cold data are served as before, and the
+failed cold tier is absent from `/health` (it was reported from a secret
+nothing read through).
 
 ## Upgrade note: three configurations now refuse to start
 
@@ -600,7 +635,309 @@ encodes snappy on arm64 with new assembly that cut line-protocol ingest by
 about 14% and msgpack+gzip ingest by about 11% on Apple silicon, because every
 Parquet file Arc writes is snappy-compressed.
 
+## Upgrade note: DuckDB 1.5.6 ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
+
+Arc's query engine moved from DuckDB 1.5.5 to 1.5.6, a bug-fix release.
+Among its fixes are queries that could return wrong results, if the SQL sent
+to Arc has these shapes:
+
+- a `UNION ALL` whose branches share a join;
+- Top-N over a window function (`row_number() … WHERE rn <= N`), including
+  ordering expressions that can be NULL.
+
+Arc's configuration and API do not change. Two things are visible:
+
+- **Error text quotes identifiers.** DuckDB now quotes table and column names
+  in its error messages, so the text of a query error can differ from 1.5.5.
+- **Extensions are rebuilt.** DuckDB extensions are built per DuckDB version,
+  so Arc uses the 1.5.6 builds. The Docker image carries httpfs and aws.
+  Arc downloads azure (for Azure storage) and cache_httpfs (with
+  `query.enable_s3_cache` with S3 primary storage) on first start when the configuration uses
+  them, and outside the image it downloads whichever of the four the storage
+  configuration uses.
+  - An air-gapped host needs the 1.5.6 builds of the ones it uses copied in,
+    as for any DuckDB upgrade.
+  - An arcx extension loaded with `database.arcx_extension_path` must be a
+    build for DuckDB 1.5.6.
+
+## Upgrade note: file-level time pruning is on by default ([#659](https://github.com/Basekick-Labs/arc/issues/659))
+
+`query.file_time_pruning` now defaults to `true`. It was added in 26.09.2 as
+an opt-in.
+
+**What it does.** Under high-frequency ingest, the current hour holds one
+small Parquet file per buffer flush, often thousands. A query whose range
+starts in the current UTC hour used to read every one of them. It now skips
+the files in that hour flushed before the query's start minus
+`query.file_time_pruning_margin_seconds` (default 300). Only local storage is
+affected; files on S3 or Azure are read as before.
+
+**Which queries gain.** Only those whose range starts in the current UTC hour,
+such as "last 5 minutes" at 10:40. A "last 1 hour" panel always starts in the
+previous hour and never gains. At the default
+`compaction.hourly_min_age_hours = 1`, the previous hour is not compacted until
+the first compaction run more than an hour after it ends (later with a larger
+min age), so it also still holds every per-flush file. On local storage, a
+query that starts in the current hour now lists that hour's directory and is
+not served from the query plan cache.
+
+**What it can hide.** A row stamped more than the margin ahead of the clock of
+the node that flushed it, and still within the current hour, can be missing
+from such a query until the hour closes. Rows stamped that far ahead in a
+later hour are not affected. `arc_ingest_future_stamped_rows_total` counts
+these rows on the node that flushed them: a writer, or an edge spoke whose
+files a hub receives. A cluster reader or hub that misses them counts
+nothing, so check the counter on the writers and spokes. Size the margin to
+the worst clock skew among them.
+
+**To turn it off,** set `query.file_time_pruning = false` (or
+`ARC_QUERY_FILE_TIME_PRUNING=false`) and restart. The node logs "File-level
+time pruning disabled" at startup.
+
+A negative `compaction.daily_min_age_hours` now reads as 24, as 0 already did.
+Before, it put the cutoff in the future, and daily compaction could fold the
+current hour while ingest was still writing it.
+
+## Upgrade note: a DELETE reads only the partitions of its time range (`delete.time_pruning`, [#1371](https://github.com/Basekick-Labs/arc/pull/1371))
+
+`delete.time_pruning` is new and defaults to `true`. A row DELETE whose WHERE
+bounds `time` now reads only the hour and day directories that range can
+touch (see the bug fix "A DELETE reads only the files its time range can
+touch" below).
+
+It relies on every file under an hour (or day) directory holding only rows
+of that hour (or day). The query path's partition pruning has always relied
+on the same thing. Every Arc release since 26.01.1 writes files that way.
+Arc 25.12 and earlier put a file in the directory of the hour it was
+flushed, and compaction and cold migration keep a file's directory. On a
+deployment that still holds data written by those versions, a row that
+arrived late sits in a later hour's directory, and a DELETE of its hour
+would not read it.
+
+**To turn it off,** set `delete.time_pruning = false` (or
+`ARC_DELETE_TIME_PRUNING=false`) and restart. Every DELETE then reads every
+file of the measurement again. The startup line "Delete operations enabled"
+shows the setting.
+
+## Upgrade note: JSON query results encode BLOB as base64 and UUID as text ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+The JSON query output (`/api/v1/query` without a `format`, and every
+endpoint that answers in the same shape) now writes:
+
+- **BLOB and GEOMETRY** values as standard base64 strings (RFC 4648, padded).
+  They used to be the raw bytes inside a JSON string, which is invalid JSON
+  for any value holding a byte of 0x80 or above. The Arrow and MessagePack
+  outputs are unchanged: they already carry real bytes, and the Grafana
+  plugin already shows binary values as base64 on both, so all three agree.
+  A spatial query's geometry therefore reads back as base64 WKB; use
+  `ST_AsText(...)` or `ST_AsGeoJSON(...)` for a readable value.
+- **UUID** values as their canonical text (`6f1c2c1e-8a3b-...`). They used
+  to come out as 16 raw bytes.
+
+Before this release no column Arc stored was a BLOB, so this changes the
+output of a query only where the query itself produced a BLOB, GEOMETRY or
+UUID (a cast, `uuid()`, a spatial function). During a rolling upgrade a
+proxied query is encoded by the node that answers it.
+
+## Upgrade note: GeoParquet columns read as binary ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+Arc's query, compaction and DELETE engines now read a GeoParquet column (one
+a file's `geo` metadata names) as the `BLOB` it is stored as, not as
+`GEOMETRY`. With the engine default, one GeoParquet file in a measurement
+turned that column into `GEOMETRY` for every file read with it; the other
+files' `BLOB` values cannot be cast to it, so every query that read the
+column failed, and so did compaction of the partition, on every cycle.
+
+What changes: a GeoParquet file placed straight into a measurement's storage
+used to read its geometry as `GEOMETRY` (`ST_X(geom)` worked); it now reads as
+`BLOB` like every geometry Arc stores, so use `ST_X(ST_GeomFromWKB(geom))`. A
+file that uses Parquet's own `GEOMETRY` type (written by pyarrow, GDAL, DuckDB's
+GeoParquet V2) still reads as `GEOMETRY` when placed into storage directly;
+import it through the Parquet import API instead, which stores it as binary.
+During a rolling upgrade, a node still on an earlier release reads a
+GeoParquet file placed into storage as `GEOMETRY`, as before.
+
 ## New features
+
+### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+`storage.backend = "gcs"` stores Arc's data in a Google Cloud
+Storage bucket, standalone or as the shared storage of a cluster, through GCS's own API rather than its S3 interoperability
+endpoint, so it authenticates the way Google workloads do: no HMAC keys.
+GCS also serves as the tiered-storage cold tier
+(`tiered_storage.cold.backend = "gcs"`) and as a backup target
+(`backup.targets.<name>.type = "gcs"`), each taking the same four keys
+(`gcs_bucket`, `gcs_prefix`, `gcs_credentials_file`, `gcs_endpoint`) and
+its own identity.
+
+```toml
+[storage]
+backend = "gcs"
+gcs_bucket = "my-arc-data"
+# gcs_prefix = "instances/abc123/"          # default: the bucket root
+# gcs_credentials_file = "/etc/arc/key.json" # default: Application Default Credentials
+# gcs_endpoint = "https://storage-x.p.googleapis.com" # https only, e.g. Private Service Connect
+```
+
+- **Authentication.** Application Default Credentials by default: GKE
+  Workload Identity, the GCE or Cloud Run metadata server, or
+  `GOOGLE_APPLICATION_CREDENTIALS`. `gcs_credentials_file` names a
+  service-account key instead; only that key type is accepted. Ingest,
+  compaction and queries use the same identity.
+- **IAM.** `roles/storage.objectAdmin` on the bucket is enough to run. It
+  does not include `storage.buckets.get`, which the startup checks below
+  need; without it Arc logs a warning that the bucket's settings were not
+  checked and starts anyway, so a requester-pays bucket then fails at its
+  first query rather than at startup. Grant `storage.buckets.get` too.
+- **Queries.** DuckDB reads `gs://` with a bearer token Arc resolves from that
+  identity. Arc starts replacing it 10 minutes before it expires; with a key
+  file or user credentials the new token arrives then, while the GCE/GKE
+  metadata server keeps returning its current token until close to expiry,
+  so there the token is replaced when the server issues a new one (Arc polls
+  each minute meanwhile and warns if fewer than 5 minutes remain). `query.enable_s3_cache` does not
+  apply to GCS. `/health` reports the
+  hot tier as `"backend": "gcs"`. A new credential state, **`unavailable`**,
+  means no token has been resolved yet, so every query read of the bucket
+  fails (GCS has no fallback the way S3 and Azure do); Arc keeps retrying and
+  logs each failure at error level. With
+  `server.storage_credentials_fail_ready = true`, `/ready` answers 503 with
+  `storage_credentials_unavailable` in that state, as it does for `expired`.
+- **Refused at startup** (the bucket checks need `storage.buckets.get`): a
+  bucket with hierarchical namespace or with requester pays; an `http://`
+  `gcs_endpoint`; and Iceberg export, which is local-only.
+- **Clusters.** GCS is the shared storage of a Pattern 2 cluster
+  (`cluster.shared_storage_mode`: every writer writes the bucket, staged
+  compaction commits through the compactor), and the cold tier of a
+  Pattern 1 cluster. Each node resolves its own query token from its own
+  identity. Verified on a 5-node Pattern 2 cluster (3 writers, reader,
+  compactor) and a 4-node Pattern 1 cluster with a GCS cold tier, both on
+  real GCS: ingest on every writer, staged compaction, DELETE across
+  writers with unflushed rows, leader and compactor loss, writer failover
+  with migration continuing on the new primary, reconciliation dry-run.
+  The enterprise Helm chart deploys it with
+  `storage.shared.backend: gcs` and either Workload Identity (a
+  chart-created ServiceAccount, `serviceAccount.create: true`, carrying the
+  `iam.gke.io/gcp-service-account` annotation) or a service-account key
+  Secret (`storage.shared.gcs.credentialsSecret`, shared storage only).
+- **Rate limits.** GCS allows about one write per second to one object name
+  and ramps a new bucket's request rate up. A rate-limited (429) read,
+  listing, copy or delete now waits at least half a second (a second on
+  average) and is retried for up to a minute and a half, where other
+  transient errors keep their short schedule; uploads back off from one
+  second up to 16 s across their 12 retries.
+- **Warned at startup**, by what the bucket is for. Primary: soft delete
+  (on by default for new buckets, 7 days), a retention policy and a default
+  storage class other than STANDARD — compaction and retention delete
+  objects continuously, so soft delete keeps every deleted byte billed for
+  its period, a retention policy makes those deletes fail until objects are
+  old enough, and colder classes charge a minimum storage duration on each;
+  turn soft delete off on a bucket used only by Arc. Cold tier: a retention
+  policy, and a class other than STANDARD, which charges retrieval on every
+  query read of cold data — use STANDARD, or Autoclass, which charges
+  neither retrieval nor early deletion (a lifecycle rule that changes the
+  class of cold objects is not visible to this check). Backup target: a
+  retention policy only, since it stops a backup from being deleted or a
+  partial one from being cleaned up; a colder class is a reasonable choice
+  there.
+- **Endpoint.** DuckDB uses only the host of `gcs_endpoint` and speaks GCS's
+  XML API on it, so the endpoint must serve both the JSON API (ingest,
+  compaction) and the XML API (queries) on one host. Verified with
+  `https://storage.googleapis.com`; a Private Service Connect endpoint has
+  not been tested yet. An emulator that serves only the JSON API cannot
+  serve queries.
+- **Cold tier.** Files migrate to a GCS cold tier from any primary, and a
+  GCS primary takes a cold tier of any backend (verified with local → GCS
+  and GCS → GCS; the other pairs use the same generic migration path). The cold tier has its
+  own query secret and identity; `/health` reports it under `"cold"`, and a
+  cold tier whose credentials never resolved is `unavailable`, which drains
+  `/ready` when `server.storage_credentials_fail_ready` is on (an S3 cold
+  tier in the same state reports `fallback` and stays ready). With no credentials at
+  boot the cold tier still starts and its reads fail until they resolve, as
+  for S3 and Azure.
+- **Backup target.** Every #1085 behaviour applies: per-database routing,
+  key headroom for the prefix, cold-tier files carried once, restore into a
+  node with a cold tier at another prefix (files go to that cold tier) or
+  without one (they are restored hot). A target whose bucket does not exist
+  fails the backup rather than completing it.
+- An S3-typed target or cold tier pointed at the same bucket through
+  `storage.googleapis.com` is the same storage for the overlap checks.
+
+### MessagePack binary values are stored as binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+A MessagePack `bin` value is now stored as a Parquet BYTE_ARRAY column
+(DuckDB `BLOB`), byte for byte. It used to be refused ("unsupported column
+type"). This is the first step of spatial support: a geometry sent as WKB
+bytes is stored as-is, and `ST_GeomFromWKB(geom)` reads it once the `spatial`
+extension is available.
+
+- Every MessagePack shape (columnar, row, batch) and MQTT payloads accept
+  it. A NULL stays NULL and an empty value stays an empty value, through the
+  WAL and its recovery as well.
+- JSON query results show it as base64 (see the upgrade note above); Arrow
+  and MessagePack results carry the bytes.
+- Iceberg export maps it to the Iceberg `binary` type. It used to stop the
+  measurement's export with "unsupported Arrow type".
+- A continuous query whose output has a UUID column writes it as text (the
+  run used to fail); a BLOB or GEOMETRY output column is written as binary.
+- **A column cannot change between string and binary.** A write that sends
+  bytes to a column stored as a string, or a string to a column stored as
+  binary, is refused with HTTP 400 and nothing of the request is written (an
+  import already part-way through answers as a partial import, naming what
+  it wrote, as for any other failure). DuckDB reads
+  a column that is a string in some files and binary in others as binary, so
+  one such write would turn every stored string of that column into bytes for
+  every query. The check uses the field schema Arc keeps per measurement
+  (`query.stable_schema`, on by default) and knows a column once a file
+  holding it has been flushed or the measurement queried on that node. So it
+  is best-effort: it is not made with `query.stable_schema = false`, for a
+  column whose first values are still in the buffer (up to
+  `ingest.max_buffer_age_ms` after it first appears), on a writer that has
+  not flushed or queried the measurement since it started, for a
+  measurement whose schema was evicted from memory (more than 10,000
+  measurements in use), or between two writers changing the same column at
+  the same time. A change that gets through leaves the column mixed for
+  good, and its string rows read back as binary.
+- Parquet import is unchanged: a BYTE_ARRAY column without a string
+  annotation is still imported as a string, as Spark and Hive write string
+  columns that way.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#916](https://github.com/Basekick-Labs/arc/pull/916).
+
+### Spatial SQL functions with `database.extensions = ["spatial"]` ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+`database.extensions` (or `ARC_DATABASE_EXTENSIONS`, comma-separated) loads
+DuckDB extensions at startup. The one supported today is `spatial`: its
+`ST_*` functions work in queries, continuous queries and DELETE predicates,
+over DOUBLE longitude/latitude columns (`ST_Point(lon, lat)`) or over WKB
+stored in a binary column (`ST_GeomFromWKB(geom)`). The default is empty.
+
+- **Only supported extensions load.** An extension adds SQL functions Arc's
+  query validators have to know about, so each one is reviewed before it is
+  supported. Any other name, a file path or a URL stops Arc at startup with
+  an error naming the entry. Community extensions are not supported.
+- **Functions that open files are refused.** `ST_Read`, `ST_Read_Meta`,
+  `ST_ReadOSM`, `ST_ReadSHP`, `shapefile_meta`, `ST_Drivers` and
+  `ST_Transform` are rejected by the query, continuous query and DELETE
+  validators, like `read_csv` and the other file readers. Data comes into
+  Arc through its write endpoints. `ST_Transform` is among them because a
+  coordinate reference system can name a file; data stays in the reference
+  system it was written in. For distances in metres over longitude/latitude
+  use `ST_Distance_Sphere` or `ST_Distance_Spheroid`.
+- **No network needed.** The container image ships the extension (about
+  60 MB of the image, whether or not it is enabled); on a
+  binary install the first start downloads it into DuckDB's extension
+  directory (`~/.duckdb/extensions`), which an air-gapped host must
+  pre-populate.
+- **Set the same list on every node.** Each node loads its own; a query
+  routed to a node without the extension fails with an unknown-function
+  error. On a cluster, a DELETE whose WHERE uses a spatial function cannot
+  be applied by a node without the extension to the files it has not
+  registered yet; those files wait, and the node logs a warning naming
+  `database.extensions`, until the setting matches.
+- A JSON query result holding a geometry shows it as base64 WKB; use
+  `ST_AsText(...)` or `ST_AsGeoJSON(...)` for a readable value.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1082](https://github.com/Basekick-Labs/arc/pull/1082).
 
 ### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
@@ -1506,6 +1843,77 @@ budget, not a cap on total process memory.
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1369](https://github.com/Basekick-Labs/arc/pull/1369).
 
+### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+The Parquet import stored every binary column (a BYTE_ARRAY without a string
+annotation) as a string. When the bytes were not text, such as a GeoParquet
+file's WKB geometries, every query that read the column failed with "Invalid
+string encoding". A binary column is now stored as binary when:
+
+- it has Parquet's `GEOMETRY` or `GEOGRAPHY` type, or the file's GeoParquet
+  `geo` metadata names it with WKB encoding (another encoding is refused with
+  422 before anything is written),
+- the file was written by a writer that marks its string columns: Arc itself
+  (ingest and compaction), DuckDB, pyarrow, or any file carrying an Arrow
+  schema, so Arc's own files keep their types when imported into another Arc,
+- the measurement already stores the column as binary, or
+- any of its values in the file is not valid UTF-8.
+
+Otherwise (Spark and Hive write string columns without the annotation) a
+column of text throughout is a string, as before. The whole file is checked
+before anything is written, so an import is never refused part-way for this.
+Two column types that were refused as unsupported now import: `LargeBinary`,
+and Parquet `UUID`, stored as its canonical text as Arc shows a UUID
+everywhere else. A GeoArrow column stored as `large_binary` is still refused.
+
+A column an earlier import already stored as a string holding binary data
+cannot be read. Import the binary values into a new column: writing bytes to
+the existing string column is refused, and the refusal says so.
+
+### DuckDB no longer caches blocks of deleted files on local storage ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
+
+DuckDB keeps a file cache of blocks from the Parquet files it reads. It frees
+that cache only when it reaches its memory limit, which defaults to 80% of RAM
+or of the container. Compaction deletes and replaces files all day, so on a
+busy node most of the cache belonged to files that no longer existed, and the
+process kept growing.
+
+On a node whose data is all on local disk, Arc now turns that cache off. The
+operating system's page cache already holds the same blocks. Measured on the
+same workload (ingest, compaction every minute, continuous queries):
+
+- **macOS, 73 minutes:** 1.6 GB physical footprint before, 760 MB after.
+- **Linux (EC2 c7i.xlarge), 80 minutes:** 1.6 GB resident before, 785 MB
+  after. Neither process gave any of it back over the next 8 idle hours, so
+  the old figure is not a peak but where a node stays.
+
+Turning it off did not slow queries:
+
+- **macOS:** compacted and small-file queries within ±2%, warm and hot.
+- **Linux (EC2 c7i.xlarge):** compacted-data queries within ±2%, and
+  small-file queries 5–7% faster.
+- **8 concurrent clients:** the same throughput on both platforms.
+
+A node that may read S3 or Azure, as primary storage or as a cold tier, keeps
+the cache: there it is the cache for remote reads.
+
+`database.external_file_cache` (`ARC_DATABASE_EXTERNAL_FILE_CACHE`) controls
+it:
+
+- `"auto"`, the default, applies the rule above.
+- `"true"` turns the cache on everywhere.
+- `"false"` turns it off everywhere, including on a node that reads S3 or
+  Azure.
+
+Arc logs the value in effect at startup ("DuckDB file cache"), and
+`/api/v1/debug/duckdb-memory` reports it as `external_file_cache`.
+
+**DuckDB's Parquet metadata cache still grows.** It also keeps entries for
+deleted files, and DuckDB offers no way to empty it. It is smaller (220–285 MB
+after the same runs) and is freed under memory pressure, so it stays
+within DuckDB's memory limit. The step Arc ran after every compaction, DELETE
+and retention pass to "reset" it freed nothing, and has been removed.
+
 ### Rebuilding cold metadata no longer restarts every tier lookup ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
 
 When a node rebuilds its cold tier metadata — after a restored or lost
@@ -1578,14 +1986,17 @@ A DELETE now looks at cold storage too:
   never deleted from cold storage. It is reported, and a retry once the move
   completes handles it.
 - A cold file that does not have a column the clause names (an older file,
-  from before the column existed) matches nothing, as for hot files.
+  from before the column existed) is counted together with files that have
+  it, as one read across every file would count it. When no file in the
+  DELETE's time range has the column, it matches nothing, as for hot files.
 - A cold tier row whose object is gone is retired, or pointed back at the
   file's hot copy if one exists. Both storage tiers are checked again at
   that moment, as retention does, so a file a migration has just copied
   keeps its row.
 
-Every cold file of the measurement is read to count its matching rows, so a
-DELETE on a measurement with many files in cold storage costs one read of
+Every cold file in the DELETE's time range (every cold file of the
+measurement, when the clause bounds no time range) is read to count its
+matching rows, so a DELETE over many files in cold storage costs one read of
 each file's footer and the columns the clause uses.
 
 Also fixed: in a database made `hot_only` (or given a longer hot age) after
@@ -1598,6 +2009,181 @@ database the hot-only cleanup then removes the copy; with a longer hot age,
 the file stays until it is moved to cold storage again under the new
 policy. As a consequence, while cold storage is unreachable, a DELETE that
 touches a daily file answers the retryable 503, even for recent data.
+
+### Compaction leaves alone a partition too wide to compact, instead of failing it every cycle ([#1388](https://github.com/Basekick-Labs/arc/pull/1388))
+
+Compaction sorts a batch's rows by time in one DuckDB job, and a sort holds
+whole rows. On a table of thousands of columns that does not fit the memory a
+job has (`compaction.memory_limit`, by default `database.memory_limit` divided
+by `compaction.max_concurrent`): measured on DuckDB 1.5.6, two files of 3,100
+columns ran out of memory at 2 GB on one thread, and 905 columns at 2 GB on
+any thread count. The batch splitter halved the batch until it could not
+split further (3 files at the default 30 per batch), failed again, and the next
+cycle started over, downloading the files each time, for good.
+
+- **A partition that fails at the smallest batch is remembered and left
+  alone** while its files and the job sizing stay the same. Only memory
+  evidence counts, at most once per partition per cycle: DuckDB's
+  out-of-memory error marks it after one cycle and holds; a kill, a crash or a
+  cycle deadline that cut off an attempt which had nine tenths of the cycle's
+  budget marks it after two cycles in a row (a kill can hit another job
+  running alongside), and that mark expires after a day, so the partition is
+  tried once a day. Any other failure (a SQL error, a missing file, a full
+  disk, object-store errors) never counts. A new input file in the partition,
+  or a change of `compaction.memory_limit`, `compaction.threads`,
+  `compaction.max_concurrent`, `compaction.max_files_per_batch` or
+  `compaction.cycle_timeout`, tries it again; a partition that then compacts
+  is forgotten.
+- **What is remembered survives a restart**: it is kept per node in
+  `too_wide.json` under `compaction.temp_directory`. A compactor failover
+  starts the new node with its own list: each partition fails there again
+  (once or twice, as above) before it is left alone.
+- **Seeing and clearing it**: `GET /api/v1/compaction/too-wide` lists the
+  partitions on the node that answers (with the settings each failed under
+  and the current ones; on a cluster, ask the compactor node),
+  `DELETE /api/v1/compaction/too-wide` (optionally `?tier=` and
+  `?partition=`) forgets them so the next cycle tries again; both admin-only.
+  `/api/v1/compaction/candidates` marks those the next cycle skips `too_wide`, each cycle record and
+  `/api/v1/compaction/stats` count `skipped_too_wide`, and the metrics are
+  `arc_compaction_partitions_skipped_too_wide_total` and
+  `arc_compaction_partitions_too_wide`. A Warn names each partition when it is
+  first remembered.
+- **What it means for that table:** its files stay as written. Queries read
+  them as before. Tiering moves only daily-compacted files to cold storage, so
+  the table stays on hot storage until retention removes it (as it did while
+  compaction kept failing). The remedy is more memory per job: a higher
+  `compaction.memory_limit` or a lower `compaction.max_concurrent` (measured
+  on DuckDB 1.5.6: two files of 906 columns and 3.93M rows compacted in 72 s
+  with 4 GB on one thread, and ran out of memory at 2 GB).
+- **The splitter no longer makes a batch it refuses.** A 3-file batch was split
+  into 1 and 2 files, and the 1-file half was refused unattempted, losing the
+  real error; a batch under twice the minimum, or one at the splitter's
+  deepest level (4 halvings), is now the smallest. A child
+  that died of memory (a Go runtime "out of memory", a C++ `std::bad_alloc`)
+  is classified as a memory error even when its earlier log lines quote SQL
+  error text; before, it read as a permanent SQL error.
+
+### A DELETE rewrites wide files in bounded memory, and keeps Arc's file metadata ([#1380](https://github.com/Basekick-Labs/arc/pull/1380))
+
+A row DELETE rewrites each file it removes rows from by copying the rows it
+keeps to a new file. That copy ran on every DuckDB thread, and each thread held
+a decoded row group (the one it read and the 122,880-row one it wrote, about
+9 bytes per value however sparse the data) plus the Parquet writer's state for
+every column, part of it outside `database.memory_limit`. On wide files and many-core
+nodes it spilled for a long time and then ran out of memory: a customer
+measured 8 minutes per file at 905 columns and 39 minutes per row group at
+3,100 columns (46 cores, 4 GB limit).
+
+- **A file too wide for the main DuckDB is rewritten on a private
+  single-threaded one.** Before each rewrite Arc reads the file's footer and
+  estimates what the copy holds per thread (columns × rows per row group read
+  or written, plus the writer's per-column state) times the threads it would
+  use. Above half of DuckDB's effective memory limit, the file goes to a
+  private DuckDB instance: one thread, half the main memory limit, its own
+  spill directory, smaller row groups, sandboxed to the file's own directories,
+  with no extensions. The row order is kept. On
+  object storage the file is downloaded first. Measured on DuckDB 1.5.6 with a
+  4 GB limit on a 14-core machine:
+
+  | File | Before | Now |
+  |---|---|---|
+  | 3,100 columns, 8 row groups | out of memory | 36 s, 2.0 GB |
+  | 905 columns, 16 row groups | 32 s, 5.0 GB | 20 s, 0.9 GB |
+  | 10,000 columns, 1 row group | stopped after 15 min | 23 s, 2.6 GB |
+
+  Narrower files are rewritten as before. A long narrow file can cross the
+  line too on a many-core node (50 columns and 33 full row groups at 46
+  threads and 4 GB), and is then rewritten on one thread. Rewrites run one at
+  a time (they already did). Wide output has smaller row groups (32,768 rows at
+  905 columns, 8,192 at 3,100, 2,048 at 10,000), so it is larger (1.35× at
+  3,100 columns, 7× at 10,000) and its footer is bigger, which costs reads: a
+  one-second query on a rewritten 3,100-column file took 240 ms and 330 MB
+  instead of 30 ms and 50 MB on the original (16,384-row groups would have
+  halved that again, but went past the memory limit). A second DELETE on such
+  a file goes to the private instance again. The private
+  instance's memory limit is on top of the main one's, not part of it: with the
+  default limit (80% of the machine) the two together can exceed the machine
+  while queries run. A WHERE that calls a function from an extension (arcx,
+  httpfs) fails on a wide file. No setting.
+- **A file that cannot be sized is not rewritten.** If its footer cannot be
+  read, or the private instance cannot be opened, that file's rewrite fails
+  (`failed_files`, 207) and the DELETE can be retried; it does not go to the
+  main DuckDB unsized.
+- **A rewritten file keeps Arc's metadata.** Every DELETE rewrite dropped the
+  file's `arc:tags`, `arc:dedup_exact` and `arc:decimals` entries, so a
+  rewritten continuous-query file lost its exact-duplicate marker at
+  compaction. They are now carried over, along with the legacy
+  `arc:dedup_time`. Other entries (`ARROW:schema`) are not: they describe the
+  file as it was first written.
+
+### A DELETE reads only the files its time range can touch ([#1371](https://github.com/Basekick-Labs/arc/pull/1371))
+
+A row DELETE (`POST /api/v1/delete`) listed every file of the measurement and
+counted its matches with one read across all of them, whatever its WHERE. Its
+memory grew with the table's file count times its width, not with the
+window: on a wide table (thousands of columns), a DELETE of one minute could
+need hundreds of GiB, and `database.memory_limit` did not bound it.
+
+- **Only the partitions in the time range are read.** When the WHERE bounds
+  `time` (`time >= … AND time < …`, `BETWEEN`, or `now()` plus or minus an
+  interval), the DELETE reads only the hour and day directories that range
+  can touch, plus one hour on each side. This applies to hot files, to the
+  files the cluster manifest lists (a DELETE no longer waits for, checks, or
+  answers 503 over a file outside its range), and to cold storage. A WHERE
+  without such a range (an `OR` at the top level, `time = …`, `time IN (…)`)
+  reads every file, as before.
+- **Matches are counted 64 files at a time, without keeping the files'
+  metadata.** Arc keeps Parquet footers in memory for queries; a DELETE kept
+  every footer it read until it finished, and on wide files the footers are
+  most of the cost. It now counts with that cache off. Measured on 1,416
+  files of 1,000 columns: +2.7 GB before, +0.4 GB now for a DELETE over all
+  of them, and +2 MB for one of a minute.
+- **A hot file that cannot be counted stops the DELETE** before anything is
+  rewritten. Before, the per-file fallback logged "skipping file" and went
+  on: the file's matching rows stayed and the DELETE answered success. A file
+  replaced since the listing (a compaction) answers 503, retry. A file that
+  cannot be read answers 500 and names it, on every DELETE whose range
+  includes it, until it is repaired or removed; there is no option to skip
+  it. A clause that binds but fails on a file's values (comparing a column
+  that is text in some files with a number) also answers 500 now, where it
+  used to be skipped. A cold file that cannot be counted is reported as
+  before (207, `cold_files`).
+- **A file that does not have a column the WHERE names, or has it with
+  another type, is counted together with files that do,** as the single
+  read across every file counted it. Before, a cold file that could not bind
+  the clause on its own counted as no match. For cold files whose rows all
+  match, the file is now deleted. A hot file counted this way is still
+  rewritten on its own, which fails to bind as it did before this change: it
+  is reported in `failed_files` (207), not left out silently. A column that
+  no file in the range has still matches nothing there.
+
+`delete.time_pruning` turns the first point off (see the upgrade note above).
+
+### Retiring tier rows no longer grows the tier metadata WAL without bound ([#1373](https://github.com/Basekick-Labs/arc/pull/1373))
+
+Removing tier rows one at a time grew the WAL of the shared SQLite database
+(`arc.db-wal`) by tens of KB per row, and nothing shrank it. A startup tier
+scan that retired 6.2 million stale hot rows took one customer's WAL to
+99.6 GB. Each removal ended in a way that skipped SQLite's automatic WAL
+checkpoint. Measured on 200,000 rows: 5.9 GB of WAL before, 3 MB now.
+
+The same removal is used when a file is compacted or deleted on a node with
+replication on, and when cold rows are retired by retention or a DELETE. All
+of those are fixed.
+
+Also:
+- The scan reads hot rows 10,000 at a time instead of all at once. A single
+  read held the database's only connection, which auth, audit and file
+  registration share, for the whole read. A file flushed during that read
+  could fail to record its tier row (`failed to record file: context
+  deadline exceeded`). Such a row was, and still is, written by the next
+  complete scan.
+- After each tier scan, a WAL file larger than 64 MB (one an earlier version
+  grew) is truncated back to its minimum size. Before, a WAL that had grown
+  stayed that size on disk even after its contents were checkpointed. The
+  truncation can make auth, audit and file registration wait for up to a few
+  seconds once, on the first scan after the upgrade; a WAL kept small by the
+  fix is never truncated.
 
 ### A compaction run within a minute of its files' registration no longer leaves them behind, counted twice ([#1358](https://github.com/Basekick-Labs/arc/issues/1358))
 
@@ -2127,8 +2713,8 @@ query's range starts and ends in, as well as the current hour.
 
 ### File-level time pruning: sub-second flushes, margin minimum, and metrics
 
-These changes apply to `query.file_time_pruning`, which is still experimental
-and off by default.
+These changes apply to `query.file_time_pruning`, which is now on by default
+(see the upgrade note above).
 
 - **Sub-second flushes are no longer dropped.** File name times were read to
   the second, so with a margin under one second, a file flushed late in a
@@ -2139,9 +2725,9 @@ and off by default.
 - **A live-hour plan is no longer cached when file pruning declines to act.**
   This covers the cases where every file is in range or too many are kept.
   Before, such a plan stayed cached for 60 seconds and the next queries
-  skipped the pruning. With the feature on, every query whose range starts
-  in the current hour now lists that hour's directory, which takes a few
-  milliseconds. When more than 1000 files are in range, the query lists them
+  skipped the pruning. Every query whose range starts in the current hour
+  now lists that hour's directory, which takes a few milliseconds. When more
+  than 1000 files are in range, the query lists them
   and then reads the whole hour anyway. The `cap_fallback` counter shows how
   often that happens.
 - **New counters** on `/metrics` (and in the JSON snapshot) show what the
@@ -2163,8 +2749,6 @@ and off by default.
   latest timestamp, not its earliest.** It is also logged even when the same
   batch holds data more than 7 days old, and at most once a minute per
   measurement.
-
-To turn the feature off, set `query.file_time_pruning = false` and restart.
 
 ### Time-filtered queries no longer return too few rows, and Grafana panels are pruned again
 
@@ -6038,6 +6622,16 @@ These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
+
+### Hourly compaction file-count guidance (#793)
+
+Documented `compaction.hourly_min_files` as an independent per-partition floor,
+not a value derived from `ingest.max_buffer_age_ms`. Actual file cadence also
+depends on traffic gaps, row limits, schema changes and flush backpressure; the
+default remains 10.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1370](https://github.com/Basekick-Labs/arc/pull/1370).
 
 ### The unused `license.enabled` setting is removed ([#1195](https://github.com/Basekick-Labs/arc/issues/1195))
 

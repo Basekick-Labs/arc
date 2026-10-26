@@ -418,6 +418,8 @@ func inferArrowType(colName string, firstVal interface{}) (arrow.DataType, error
 		return arrow.PrimitiveTypes.Float64, nil
 	case string:
 		return arrow.BinaryTypes.String, nil
+	case []byte:
+		return arrow.BinaryTypes.Binary, nil
 	case bool:
 		return arrow.FixedWidthTypes.Boolean, nil
 	default:
@@ -479,6 +481,8 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 			typeNames = append(typeNames, "float64")
 		case []string:
 			typeNames = append(typeNames, "string")
+		case [][]byte:
+			typeNames = append(typeNames, "binary")
 		case []bool:
 			typeNames = append(typeNames, "bool")
 		case []decimal128.Num:
@@ -607,6 +611,8 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 			arrowType = arrow.PrimitiveTypes.Float64
 		case []string:
 			arrowType = arrow.BinaryTypes.String
+		case [][]byte:
+			arrowType = arrow.BinaryTypes.Binary
 		case []bool:
 			arrowType = arrow.FixedWidthTypes.Boolean
 		case []decimal128.Num:
@@ -767,6 +773,28 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 			} else {
 				return nil, nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
 			}
+			arrays[i] = builder.NewArray()
+
+		case arrow.BINARY:
+			builder := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+			builders[i] = builder
+
+			binaryCol, ok := col.([][]byte)
+			if !ok {
+				return nil, nil, fmt.Errorf(
+					"column %s: expected [][]byte, got %T",
+					field.Name, col,
+				)
+			}
+
+			// Sized once, as the string path is.
+			size := 0
+			for _, v := range binaryCol {
+				size += len(v)
+			}
+			builder.Reserve(len(binaryCol))
+			builder.ReserveData(size)
+			builder.AppendValues(binaryCol, colValidity)
 			arrays[i] = builder.NewArray()
 
 		case arrow.BOOL:
@@ -1305,6 +1333,8 @@ func getColumnSignature(columns map[string]interface{}) string {
 			typ = "f64"
 		case []string:
 			typ = "str"
+		case [][]byte:
+			typ = "bin"
 		case []bool:
 			typ = "bool"
 		case []decimal128.Num:
@@ -1631,6 +1661,11 @@ func estimateTypedColumnBatchBytes(batch *TypedColumnBatch) int64 {
 			total += int64(len(values)) * 16
 		case []string:
 			total += int64(len(values)) * int64(unsafe.Sizeof(string("")))
+			for _, value := range values {
+				total += int64(len(value))
+			}
+		case [][]byte:
+			total += int64(len(values)) * int64(unsafe.Sizeof([]byte(nil)))
 			for _, value := range values {
 				total += int64(len(value))
 			}
@@ -2230,26 +2265,12 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 	if !ok {
 		return fmt.Errorf("expected []interface{}, got %T", records)
 	}
-
-	// OPTIMIZATION: Lazy initialization - avoid map allocation for pure columnar writes (common path)
+	// Every record is dispatched, and row records converted, before any is
+	// written: a write refused for its content (#440) then writes nothing.
 	var rowRecordsByMeasurement map[string][]*models.Record
-
 	for _, record := range recordList {
 		switch r := record.(type) {
-		case *models.ColumnarRecord:
-			if err := b.writeColumnar(ctx, database, r); err != nil {
-				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write columnar record")
-				b.totalErrors.Add(1)
-				return err
-			}
-		case *TypedColumnarRecord:
-			// Typed msgpack decode fast path: already converted, carries the
-			// raw client bytes for the zero-copy WAL branch.
-			if err := b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false); err != nil {
-				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
-				b.totalErrors.Add(1)
-				return err
-			}
+		case *models.ColumnarRecord, *TypedColumnarRecord:
 		case *models.Record:
 			// Lazy init: only allocate map when we actually have row records
 			if rowRecordsByMeasurement == nil {
@@ -2267,17 +2288,43 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 			return fmt.Errorf("unknown record type %T in write dispatch (unwired decoder output)", record)
 		}
 	}
-
-	// Convert grouped row records to columnar format and write
+	// Convert grouped row records to columnar format. The conversion renames
+	// a field named like a tag, so the type check below reads its output.
 	var drops []LPDrop
+	var converted []*models.ColumnarRecord
 	for measurement, rowRecords := range rowRecordsByMeasurement {
 		columnar, dropped := b.rowsToColumnar(measurement, rowRecords)
 		drops = append(drops, dropped...)
 		if len(columnar.Columns["time"]) == 0 {
 			continue // every row was dropped
 		}
+		converted = append(converted, columnar)
+	}
+	if err := b.checkBatchTextBinary(database, recordList, converted); err != nil {
+		return err
+	}
+
+	for _, record := range recordList {
+		switch r := record.(type) {
+		case *models.ColumnarRecord:
+			if err := b.writeColumnar(ctx, database, r); err != nil {
+				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write columnar record")
+				b.totalErrors.Add(1)
+				return err
+			}
+		case *TypedColumnarRecord:
+			// Typed msgpack decode fast path: already converted, carries the
+			// raw client bytes for the zero-copy WAL branch.
+			if err := b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false); err != nil {
+				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
+				b.totalErrors.Add(1)
+				return err
+			}
+		}
+	}
+	for _, columnar := range converted {
 		if err := b.writeColumnar(ctx, database, columnar); err != nil {
-			b.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to write converted row records")
+			b.logger.Error().Err(err).Str("measurement", columnar.Measurement).Msg("Failed to write converted row records")
 			b.totalErrors.Add(1)
 			return err
 		}
@@ -3115,6 +3162,13 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 			return err
 		}
 	}
+	// #440: a replayed entry was accepted when it was written; only a live
+	// write is refused for changing a column between string and binary.
+	if !skipWAL {
+		if err := checkColumnsTextBinary(b.knownTextBinary(database, record.Measurement), record.Measurement, record.Columns); err != nil {
+			return err
+		}
+	}
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
@@ -3406,6 +3460,11 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	// The #1342 backstop; see writeColumnarInternalWithWALHashes.
 	for name := range typedColumns.Data {
 		if err := unstorableColumnError(measurement, name); err != nil {
+			return err
+		}
+	}
+	if !skipWAL {
+		if err := checkTypedTextBinary(b.knownTextBinary(database, measurement), measurement, typedColumns); err != nil {
 			return err
 		}
 	}
@@ -3706,6 +3765,8 @@ func encodeTypedWALRows(database, measurement string, batch *TypedColumnBatch, n
 			return i < len(arr)
 		case []decimal128.Num:
 			return i < len(arr)
+		case [][]byte:
+			return i < len(arr)
 		}
 		return false
 	}
@@ -3743,6 +3804,15 @@ func encodeTypedWALRows(database, measurement string, batch *TypedColumnBatch, n
 				err = enc.EncodeString(arr[i])
 			case []bool:
 				err = enc.EncodeBool(arr[i])
+			case [][]byte:
+				// msgpack bin, which recovery decodes back to []byte. A
+				// present value is never NULL: EncodeBytes(nil) would write
+				// nil, so an empty value is written as a zero-length bin.
+				if arr[i] == nil {
+					err = enc.EncodeBytesLen(0)
+				} else {
+					err = enc.EncodeBytes(arr[i])
+				}
 			case []decimal128.Num:
 				// WAL stores decimals as float64 (lossy but WAL is recovery-only)
 				f, _ := arr[i].ToBigFloat(c.scale).Float64()
@@ -3928,6 +3998,42 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 			}
 			typed[name] = arr
 			if hasNils {
+				validity[name] = valid
+			}
+
+		case []byte:
+			// Preserve binary bytes exactly. A nil interface is SQL NULL,
+			// while an empty []byte is a valid zero-length binary value.
+			arr := make([][]byte, len(col))
+			var valid []bool
+
+			for i, v := range col {
+				if v == nil {
+					if valid == nil {
+						valid = make([]bool, len(col))
+						for j := 0; j < i; j++ {
+							valid[j] = true
+						}
+					}
+					continue
+				}
+
+				value, ok := v.([]byte)
+				if !ok {
+					return nil, 0, fmt.Errorf(
+						"unexpected type in binary column '%s': %T",
+						name, v,
+					)
+				}
+
+				arr[i] = value
+				if valid != nil {
+					valid[i] = true
+				}
+			}
+
+			typed[name] = arr
+			if valid != nil {
 				validity[name] = valid
 			}
 
@@ -4902,6 +5008,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 					ct = "float64"
 				case []string:
 					ct = "string"
+				case [][]byte:
+					ct = "binary"
 				case []bool:
 					ct = "bool"
 				case []decimal128.Num:
@@ -4954,6 +5062,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 			merged[name] = make([]float64, totalRows)
 		case "string":
 			merged[name] = make([]string, totalRows)
+		case "binary":
+			merged[name] = make([][]byte, totalRows)
 		case "bool":
 			merged[name] = make([]bool, totalRows)
 		case "decimal128":
@@ -4996,6 +5106,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 				copy(merged[name].([]float64)[rowOffset:], v)
 			case []string:
 				copy(merged[name].([]string)[rowOffset:], v)
+			case [][]byte:
+				copy(merged[name].([][]byte)[rowOffset:], v)
 			case []bool:
 				copy(merged[name].([]bool)[rowOffset:], v)
 			case []decimal128.Num:
@@ -5109,6 +5221,8 @@ func sortColumnsByKeysWithPermutation(columns map[string]interface{}, sortKeys [
 		case []float64:
 			n = len(c)
 		case []string:
+			n = len(c)
+		case [][]byte:
 			n = len(c)
 		case []bool:
 			n = len(c)
@@ -5325,6 +5439,15 @@ func compareMultiKeyCached(cachedCols []interface{}, i, j int) bool {
 				return false
 			}
 
+		case [][]byte:
+			cmp := bytes.Compare(c[i], c[j])
+			if cmp < 0 {
+				return true
+			}
+			if cmp > 0 {
+				return false
+			}
+
 		case []bool:
 			if !c[i] && c[j] { // false < true
 				return true
@@ -5366,6 +5489,13 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 
 	case []string:
 		result := make([]string, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case [][]byte:
+		result := make([][]byte, len(indices))
 		for i, idx := range indices {
 			result[i] = col[idx]
 		}
@@ -5601,6 +5731,15 @@ func sliceColumnsByIndices(columns map[string]interface{}, indices []int) map[st
 			}
 			result[colName] = newCol
 
+		case [][]byte:
+			binarySlice := make([][]byte, len(indices))
+			for i, idx := range indices {
+				if idx < len(col) {
+					binarySlice[i] = col[idx]
+				}
+			}
+			result[colName] = binarySlice
+
 		case []bool:
 			newCol := make([]bool, len(indices))
 			colLen := len(col)
@@ -5684,7 +5823,7 @@ func (b *ArrowBuffer) countFutureStamped(database, measurement string, times []i
 		Str("measurement", measurement).
 		Int("rows", n).
 		Dur("margin", b.futureMargin()).
-		Msg("Rows stamped more than query.file_time_pruning_margin_seconds ahead of this node's clock, in the current hour: with file-level time pruning on, a query starting after the flush can miss them until the hour closes. Check the writers' clocks")
+		Msg("Rows stamped more than query.file_time_pruning_margin_seconds ahead of this node's clock, in the current hour: with file-level time pruning on (the default), a query starting after the flush can miss them until the hour closes. Check the writers' clocks")
 }
 
 // warnOncePerMinute rate-limits a warning per kind and measurement. Two

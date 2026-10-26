@@ -67,6 +67,12 @@ var (
 // has no usable range: no WHERE, a shape the WHERE may not belong to one
 // table in, or a top-level OR.
 func scanTimeBounds(sqlStr string) (timeBounds, bool) {
+	return scanTimeBoundsAt(sqlStr, time.Now().UTC())
+}
+
+// scanTimeBoundsAt is scanTimeBounds with now() and current_timestamp read as
+// now.
+func scanTimeBoundsAt(sqlStr string, now time.Time) (timeBounds, bool) {
 	masked, masks := sql.MaskStringLiterals(sqlStr, sql.HasQuotes(sqlStr))
 	masked, ok := stripMaskedComments(masked)
 	if !ok {
@@ -114,7 +120,7 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 	}
 	literals := literalValues(masks)
 	b := timeBounds{exact: true, proofSafe: true}
-	b.addTerms(terms, literals)
+	b.addTerms(terms, literals, now)
 	if b.start == nil && b.end == nil {
 		return timeBounds{}, false
 	}
@@ -165,13 +171,13 @@ func blankAggregateFilters(s string) string {
 
 // addTerms reads each AND term; a parenthesised group that is itself an
 // AND of terms (and nothing else) is read term by term.
-func (b *timeBounds) addTerms(terms []string, literals map[string]string) {
+func (b *timeBounds) addTerms(terms []string, literals map[string]string, now time.Time) {
 	for _, term := range terms {
 		term = trimOuterParens(term)
-		lo, hi, isBound, safe := readBoundTerm(term, literals)
+		lo, hi, isBound, safe := readBoundTerm(term, literals, now)
 		if !isBound {
 			if inner, ok := topLevelConjuncts(term); ok && len(inner) > 1 {
-				b.addTerms(inner, literals)
+				b.addTerms(inner, literals, now)
 				continue
 			}
 			if mentionsTime.MatchString(term) {
@@ -195,10 +201,10 @@ func (b *timeBounds) addTerms(terms []string, literals map[string]string) {
 // it returns is exclusive: an inclusive end (<=, BETWEEN) is moved one
 // microsecond (Arc's timestamp precision) past its literal, so the hour it
 // falls on is read.
-func readBoundTerm(term string, literals map[string]string) (lo, hi *time.Time, ok, proofSafe bool) {
+func readBoundTerm(term string, literals map[string]string, now time.Time) (lo, hi *time.Time, ok, proofSafe bool) {
 	if m := betweenRHS.FindStringSubmatch(term); m != nil {
-		a, okA := operandTime(m[1:6], literals)
-		z, okZ := operandTime(m[6:11], literals)
+		a, okA := operandTime(m[1:6], literals, now)
+		z, okZ := operandTime(m[6:11], literals, now)
 		if !okA || !okZ {
 			return nil, nil, false, false
 		}
@@ -214,7 +220,7 @@ func readBoundTerm(term string, literals map[string]string) (lo, hi *time.Time, 
 	} else {
 		return nil, nil, false, false
 	}
-	t, okT := operandTime(opnd, literals)
+	t, okT := operandTime(opnd, literals, now)
 	if !okT {
 		return nil, nil, false, false
 	}
@@ -255,7 +261,7 @@ func flipOp(op string) string {
 
 // operandTime evaluates one operand capture: [whole, sign, quotedInterval,
 // amount, unit].
-func operandTime(m []string, literals map[string]string) (time.Time, bool) {
+func operandTime(m []string, literals map[string]string, now time.Time) (time.Time, bool) {
 	whole := strings.TrimSpace(m[0])
 	if strings.HasPrefix(whole, "__STR_") || strings.HasPrefix(strings.ToLower(whole), "timestamp") {
 		ph := placeholderIn(whole)
@@ -270,7 +276,7 @@ func operandTime(m []string, literals map[string]string) (time.Time, bool) {
 	}
 	// now() or current_timestamp, with at most one interval.
 	if m[1] == "" {
-		return time.Now().UTC(), true
+		return now, true
 	}
 	amount, unit := m[3], m[4]
 	if m[2] != "" {
@@ -284,7 +290,7 @@ func operandTime(m []string, literals map[string]string) (time.Time, bool) {
 		}
 		amount, unit = q[1], q[2]
 	}
-	t, err := evaluateRelativeTime(amount, unit, m[1] == "+")
+	t, err := evaluateRelativeTimeAt(now, amount, unit, m[1] == "+")
 	return t, err == nil
 }
 

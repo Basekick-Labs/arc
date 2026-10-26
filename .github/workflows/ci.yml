@@ -67,7 +67,15 @@ jobs:
       # internal/cluster alone takes about 520 s under -race on these
       # runners (650 s on a laptop). A package that hits the default panics
       # with a goroutine dump that reads like a hang, not a slow suite.
+      # The extensions database.extensions accepts, from the same seed the
+      # image uses; ARC_TEST_EXTENSIONS=1 makes a test that needs one fail
+      # rather than skip when it is missing (#440).
+      - name: Seed DuckDB extensions
+        run: go run -tags=duckdb_arrow ./scripts/duckdbseed
+
       - name: Test (race)
+        env:
+          ARC_TEST_EXTENSIONS: "1"
         run: go test -tags=duckdb_arrow -race -timeout 30m ./...
 
       # The storage key contract (#743) is a property of real object stores,
@@ -203,6 +211,9 @@ jobs:
 
       - name: Enterprise chart refuses a short bootstrap token
         run: bash scripts/test_enterprise_bootstrap_token.sh helm/arc-enterprise
+
+      - name: Enterprise chart deploys shared storage on GCS
+        run: bash scripts/test_enterprise_gcs_storage.sh helm/arc-enterprise
 
       # Every Arc pod joins Raft, whatever its role. A role whose pod has no
       # advertisable Raft address falls back to standalone mode and is

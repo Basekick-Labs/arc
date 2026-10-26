@@ -294,7 +294,7 @@ func (c *leftoverCoordinator) SyncManifest(context.Context) error {
 	return c.syncErr
 }
 func (c *leftoverCoordinator) CompactionCommitActive() bool { return c.cas }
-func (c *leftoverCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
+func (c *leftoverCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration, func(string) bool) ([]string, error) {
 	return nil, nil
 }
 func (c *leftoverCoordinator) ManifestHotFiles(string, string) []raft.FileEntry { return nil }

@@ -406,6 +406,15 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 			ingest.LogRefusal("mqtt "+msg.Topic(), err)
 			return
 		}
+		// A device's payload changing a column between string and binary
+		// (#440) is refused on every message it sends: logged per topic at
+		// most every nameWarnEvery, like a dropped field name.
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			if s.nameWarnDue("type " + msg.Topic()) {
+				s.logger.Warn().Err(err).Str("topic", msg.Topic()).Msg("MQTT message refused: it changes a column between string and binary")
+			}
+			return
+		}
 		s.logger.Error().
 			Err(err).
 			Str("topic", msg.Topic()).

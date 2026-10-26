@@ -9,11 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -449,6 +447,7 @@ func main() {
 		MemoryLimit:            cfg.Database.MemoryLimit,
 		ThreadCount:            cfg.Database.ThreadCount,
 		EnableWAL:              cfg.Database.EnableWAL,
+		Extensions:             cfg.Database.Extensions,
 		TempDirectory:          cfg.Database.TempDirectory,
 		PreserveInsertionOrder: cfg.Database.PreserveInsertionOrder,
 		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)
@@ -477,6 +476,13 @@ func main() {
 		// Primary-backend signal for Azure (mirrors S3IsPrimaryBackend): only an
 		// azure/azblob primary backend provisions a primary Azure secret.
 		AzureIsPrimaryBackend: cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob",
+		// GCS primary (#1105): DuckDB reads gs:// with an Arc-managed bearer
+		// token resolved from the same identity as the storage backend.
+		GCSIsPrimaryBackend: cfg.Storage.Backend == "gcs",
+		GCSBucket:           cfg.Storage.GCSBucket,
+		GCSPrefix:           cfg.Storage.GCSPrefix,
+		GCSEndpoint:         cfg.Storage.GCSEndpoint,
+		GCSCredentialsFile:  cfg.Storage.GCSCredentialsFile,
 		// Cold-tier sandbox allowlist entries. The cold tier may use a
 		// different bucket/container from the primary backend (commonly
 		// hot=local + cold=S3 on Enterprise); the sandbox must allow both.
@@ -487,6 +493,12 @@ func main() {
 		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
 		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
 		ColdAzurePrefix:    cfg.TieredStorage.Cold.AzurePrefix,
+		// GCS cold (#1105): only when this node builds a GCS cold tier
+		// (tiering on, cold on, backend gcs), unlike the S3/Azure fields
+		// above, so a leftover tiered_storage.cold.gcs_bucket neither widens
+		// the allowlist nor loads httpfs at boot.
+		ColdGCSBucket: coldGCSField(cfg, cfg.TieredStorage.Cold.GCSBucket),
+		ColdGCSPrefix: coldGCSField(cfg, cfg.TieredStorage.Cold.GCSPrefix),
 		// Local storage root used by the DuckDB sandbox to whitelist
 		// Arc-managed file paths in allowed_directories. Always populated
 		// regardless of the configured backend; on S3/Azure-only deployments
@@ -501,6 +513,7 @@ func main() {
 		EnableS3Cache:     cfg.Query.EnableS3Cache,
 		S3CacheSize:       cfg.Query.S3CacheSize,
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
+		ExternalFileCache: cfg.Database.ExternalFileCache,
 		// arcx loader (cleared above when license does not permit)
 		ArcxExtensionPath: arcxPath,
 		// arcx storage root for the partition_agg table function. Only set
@@ -705,7 +718,9 @@ func main() {
 		dbConfig.S3Bucket == "" &&
 		dbConfig.ColdS3Bucket == "" &&
 		dbConfig.AzureContainer == "" &&
-		dbConfig.ColdAzureContainer == "" {
+		dbConfig.ColdAzureContainer == "" &&
+		dbConfig.GCSBucket == "" &&
+		dbConfig.ColdGCSBucket == "" {
 		log.Fatal().Msg("sandbox allowlist would be empty — every file-touching query would fail; check arc.toml [storage] and [database] config")
 	}
 
@@ -823,7 +838,7 @@ func main() {
 	// The switch is on the raw cfg.Storage.Backend so the accepted set is
 	// exactly what it has always been: config.Load lowercases and trims
 	// storage.backend before anything reads it, and already refuses anything
-	// outside the five aliases with "storage.backend %q is invalid". The
+	// outside the six aliases with "storage.backend %q is invalid". The
 	// default below is therefore unreachable through config today; it keeps its
 	// wording so a caller that ever bypasses that validation still Fatals here,
 	// before a backend is built.
@@ -935,12 +950,38 @@ func main() {
 				Msg("Storage backend initialized")
 		}
 
+	case "gcs":
+		// Credentials are never logged: only whether a key file is in use.
+		storageSpec.GCS = storage.GCSConfig{
+			Bucket:          cfg.Storage.GCSBucket,
+			Prefix:          cfg.Storage.GCSPrefix,
+			CredentialsFile: cfg.Storage.GCSCredentialsFile,
+			Endpoint:        cfg.Storage.GCSEndpoint,
+		}
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", "gcs").
+				Str("bucket", cfg.Storage.GCSBucket).
+				Str("prefix", cfg.Storage.GCSPrefix).
+				Str("endpoint", cfg.Storage.GCSEndpoint).
+				Msg("Failed to initialize Google Cloud Storage backend")
+		}
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", "gcs").
+				Str("bucket", cfg.Storage.GCSBucket).
+				Str("prefix", cfg.Storage.GCSPrefix).
+				Str("endpoint", cfg.Storage.GCSEndpoint).
+				Bool("credentials_file", cfg.Storage.GCSCredentialsFile != "").
+				Msg("Storage backend initialized")
+		}
+
 	default:
-		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
+		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', 'azblob', or 'gcs')")
 	}
 
 	// log.Fatal in the default case exits the process, so by here the backend
-	// type is one of the five aliases and both logStorageFatal and
+	// type is one of the six aliases and both logStorageFatal and
 	// logStorageReady carry that case's wording rather than the generic
 	// fallbacks they were declared with.
 	storageBackend, err = storage.NewBackend(storageSpec, logger.Get("storage"))
@@ -984,7 +1025,7 @@ func main() {
 		if cfg.Storage.Backend == "local" {
 			log.Fatal().
 				Str("backend", cfg.Storage.Backend).
-				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, or azblob); local-filesystem backend cannot be shared across writers")
+				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, azblob or gcs); local-filesystem backend cannot be shared across writers")
 		}
 		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone {
 			log.Fatal().
@@ -1056,8 +1097,9 @@ func main() {
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
 	// Ingest counts rows stamped past file-level time pruning's margin
-	// whether or not the feature is on, so the risk is visible before it is
-	// enabled. Set before WAL recovery and the first flushes.
+	// whether or not the feature is on (it is by default), so the risk is
+	// visible on every node that flushes. Set before WAL recovery and the
+	// first flushes.
 	arrowBuffer.SetFutureStampMargin(time.Duration(cfg.Query.FileTimePruningMarginSeconds) * time.Second)
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
@@ -3670,6 +3712,8 @@ func main() {
 	}
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
+	} else {
+		log.Info().Msg("File-level time pruning disabled (query.file_time_pruning = false)")
 	}
 	// Reads count each compaction's rows once while its output and inputs are
 	// both readable: this node's own legacy jobs (seeded from surviving
@@ -3907,7 +3951,7 @@ func main() {
 	// when cluster.tls_enabled is false the getter returns nil
 	// and the transport falls back to plaintext (or system roots
 	// if the URL is https://). No Client.Timeout: the per-request
-	// context.WithTimeout below is the policy bound; an extra
+	// context.WithTimeout in invalidatePeerQueryCaches is the policy bound; an extra
 	// Client.Timeout would be redundant dead config.
 	var clusterHTTPClient *http.Client
 	var clusterScheme string
@@ -3956,60 +4000,8 @@ func main() {
 				if node.ID == localNode.ID {
 					continue
 				}
-				go func(n *cluster.Node) {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-
-					// Compute the HMAC once per request: a fresh nonce
-					// (32 random bytes, hex-encoded) binds the MAC to a
-					// single attempt; the timestamp binds it to a
-					// 5-minute freshness window. Receiver replay-checks
-					// (nonce, sender nodeID) against its NonceCache.
-					nonce, err := security.GenerateNonce()
-					if err != nil {
-						log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to generate nonce for cache invalidation")
-						return
-					}
-					ts := time.Now().Unix()
-					mac := security.ComputeCacheInvalidateHMAC(
-						cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
-					)
-
-					// Build via *url.URL so an IPv6 literal in
-					// n.APIAddress (e.g. "[::1]:8000") survives
-					// unmangled. CacheInvalidatePath is a known-safe
-					// constant path, so we don't need to escape it.
-					peerURL := (&url.URL{
-						Scheme: clusterScheme,
-						Host:   n.APIAddress,
-						Path:   api.CacheInvalidatePath,
-					}).String()
-					req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, nil)
-					if err != nil {
-						log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
-						return
-					}
-					req.Header.Set("X-Arc-Node-ID", localNode.ID)
-					req.Header.Set("X-Arc-Cluster", cfg.Cluster.ClusterName)
-					req.Header.Set("X-Arc-Nonce", nonce)
-					req.Header.Set("X-Arc-Timestamp", strconv.FormatInt(ts, 10))
-					req.Header.Set("X-Arc-HMAC", mac)
-
-					resp, err := clusterHTTPClient.Do(req)
-					if err != nil {
-						log.Warn().Err(err).Str("node_id", n.ID).Str("address", n.APIAddress).
-							Msg("Failed to invalidate cache on remote node")
-						return
-					}
-					defer resp.Body.Close()
-					_, _ = io.Copy(io.Discard, resp.Body)
-					if resp.StatusCode != http.StatusNoContent {
-						log.Warn().Int("status", resp.StatusCode).Str("node_id", n.ID).
-							Msg("Unexpected status from cache invalidation")
-					} else {
-						log.Debug().Str("node_id", n.ID).Msg("Remote query caches invalidated")
-					}
-				}(node)
+				go invalidatePeerQueryCaches(clusterHTTPClient, clusterScheme, node,
+					cfg.Cluster.SharedSecret, localNode.ID, cfg.Cluster.ClusterName, log.Logger)
 			}
 		}
 	}
@@ -4066,6 +4058,7 @@ func main() {
 		log.Info().
 			Int("confirmation_threshold", cfg.Delete.ConfirmationThreshold).
 			Int("max_rows_per_delete", cfg.Delete.MaxRowsPerDelete).
+			Bool("time_pruning", cfg.Delete.TimePruning).
 			Msg("Delete operations enabled")
 	} else {
 		log.Info().Msg("Delete operations DISABLED (set delete.enabled=true in arc.toml to enable)")
@@ -4508,7 +4501,7 @@ func main() {
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
 			} else {
-				// Create cold tier backend (S3 or Azure)
+				// Create cold tier backend (S3, Azure or GCS)
 				//
 				// coldBackend is only ever assigned from a successful
 				// storage.NewBackend, which never returns a typed nil inside a
@@ -4519,7 +4512,7 @@ func main() {
 				// query router's cold glob — would otherwise pass and then
 				// dereference a nil receiver.
 				//
-				// Only s3 and azure are accepted, each with its own logger name
+				// Only s3, azure and gcs are accepted, each with its own logger name
 				// and its own error wording. There is no default case, and what
 				// makes that safe is a CONJUNCTION, not one flag: config.Load
 				// refuses an invalid value with "tiered_storage.cold.backend %q
@@ -4586,6 +4579,32 @@ func main() {
 								Str("container", cold.AzureContainer).
 								Str("prefix", cold.AzurePrefix).
 								Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						} else {
+							coldBackend = b
+						}
+
+					case "gcs":
+						// Role cold: Application Default Credentials resolve
+						// on first use, as the S3 and Azure chains do, so a
+						// node without credentials yet still builds the tier
+						// and its reads fail loudly rather than skip it.
+						coldSpec := storage.BackendSpec{
+							Type: "gcs",
+							GCS: storage.GCSConfig{
+								Bucket:          cold.GCSBucket,
+								Prefix:          cold.GCSPrefix,
+								CredentialsFile: cold.GCSCredentialsFile,
+								Endpoint:        cold.GCSEndpoint,
+								Role:            storage.GCSRoleCold,
+							},
+						}
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-gcs")); err != nil {
+							// Same reason as the cold S3 site above.
+							log.Error().Err(err).
+								Str("bucket", cold.GCSBucket).
+								Str("prefix", cold.GCSPrefix).
+								Str("endpoint", cold.GCSEndpoint).
+								Msg("Failed to create cold tier GCS backend for tiering: the cold tier is unusable on this node until the configuration is fixed, and queries that need cold data answer 503")
 						} else {
 							coldBackend = b
 						}
@@ -4893,11 +4912,16 @@ func main() {
 		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
 		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly
 		cold := cfg.TieredStorage.Cold
+		// Only when the cold backend was built (all three): a cold tier whose
+		// construction failed is unusable, and #603's rule is that it is then
+		// ABSENT from /health rather than reported by a secret nothing reads
+		// through. Queries that need it answer 503 (refuseReadWithoutColdTier).
+		coldBuilt := tieringManager.ColdBackend() != nil
 		// Configure DuckDB for cold-tier S3 whenever cold tiering targets S3.
 		// Empty access/secret keys are valid: ConfigureS3 then provisions a
 		// CREDENTIAL_CHAIN secret so IAM roles / IRSA / env credentials work for
 		// tiered queries. A half-supplied key pair is rejected by ConfigureS3.
-		if cold.Enabled && cold.Backend == "s3" {
+		if coldBuilt && cold.Enabled && cold.Backend == "s3" {
 			if err := db.ConfigureS3(&database.S3Config{
 				Region:    cold.S3Region,
 				Endpoint:  cold.S3Endpoint,
@@ -4917,7 +4941,7 @@ func main() {
 		// Configure DuckDB for cold-tier Azure (scoped secret, separate from the
 		// primary Azure secret). Empty account key → credential chain (managed
 		// identity / env). Mirrors the cold-tier S3 path above.
-		if cold.Enabled && cold.Backend == "azure" {
+		if coldBuilt && cold.Enabled && cold.Backend == "azure" {
 			if err := db.ConfigureAzure(&database.AzureConfig{
 				ConnectionString: cold.AzureConnectionString,
 				AccountName:      cold.AzureAccountName,
@@ -4930,6 +4954,21 @@ func main() {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
 			} else {
 				log.Info().Msg("DuckDB configured with cold tier Azure credentials for multi-tier queries")
+			}
+		}
+
+		// Cold-tier GCS (#1105): an Arc-managed bearer-token secret from the
+		// cold tier's own identity, scoped to its bucket and prefix.
+		if coldBuilt && cold.Enabled && cold.Backend == "gcs" {
+			if err := db.ConfigureGCS(&database.GCSConfig{
+				Bucket:          cold.GCSBucket,
+				Prefix:          cold.GCSPrefix,
+				CredentialsFile: cold.GCSCredentialsFile,
+				Endpoint:        cold.GCSEndpoint,
+			}); err != nil {
+				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier GCS credentials")
+			} else {
+				log.Info().Msg("DuckDB configured with cold tier GCS credentials for multi-tier queries")
 			}
 		}
 	}
@@ -5515,6 +5554,18 @@ func runCompactSubcommand(args []string) {
 type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
+
+// coldGCSField returns v when this node will build a GCS cold tier
+// (tiering on, cold on, backend gcs), else "". A leftover gcs_bucket must not
+// load httpfs at boot (an air-gapped host may not have it cached), widen the
+// allowlist or turn the file cache on.
+func coldGCSField(cfg *config.Config, v string) string {
+	ts := cfg.TieredStorage
+	if !ts.Enabled || !ts.Cold.Enabled || ts.Cold.Backend != "gcs" {
+		return ""
+	}
+	return v
+}
 
 // licenseHasClustering mirrors the cluster block's licence gate.
 func licenseHasClustering(lc *license.Client) bool {

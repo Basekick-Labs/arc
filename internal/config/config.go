@@ -71,7 +71,8 @@ type ServerConfig struct {
 	IdleTimeout     int // Connection idle timeout in seconds
 	ShutdownTimeout int // Graceful shutdown timeout in seconds
 	// StorageCredentialsFailReady: /ready returns 503 while any storage tier's
-	// credential state is "expired" (#603). Default false — recycling on
+	// credential state is "expired" (#603) or "unavailable" (a GCS tier whose
+	// credentials were never resolved, #1105). Default false — recycling on
 	// credential expiry is an operator policy; recommended for reader pools.
 	StorageCredentialsFailReady bool
 	MaxPayloadSize              int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
@@ -86,6 +87,10 @@ type DatabaseConfig struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	// Extensions are DuckDB extensions to install and load before external
+	// access is locked down. database.New accepts only the names in
+	// database.SupportedExtensionNames (#440).
+	Extensions []string
 	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
 	// overflow, large sorts, joins). Should be on local fast storage. Files
 	// here are NOT durable state; orphans from a crashed previous run are
@@ -103,6 +108,14 @@ type DatabaseConfig struct {
 	// pre-26.09.1 behavior where un-ordered SELECTs return rows in
 	// file/insertion order.
 	PreserveInsertionOrder bool
+	// ExternalFileCache controls DuckDB's file cache
+	// (enable_external_file_cache), which keeps blocks of every file DuckDB
+	// has read, including files compaction has since deleted, until
+	// memory_limit forces them out (#1372). "auto" (the default) turns it off
+	// on a node whose data is all on local disk, where the OS page cache
+	// already holds those blocks, and keeps it on a node that may read S3 or
+	// Azure, where it is the remote read cache. "true" and "false" force it.
+	ExternalFileCache string
 }
 
 type StorageConfig struct {
@@ -126,6 +139,14 @@ type StorageConfig struct {
 	AzurePrefix             string // Blob-name prefix within the container (e.g., "instances/abc123/")
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
+	// Google Cloud Storage (#1105). Authenticates with a service-account key
+	// file when GCSCredentialsFile is set, else Application Default
+	// Credentials (GOOGLE_APPLICATION_CREDENTIALS, gcloud ADC, or the metadata
+	// server: GCE, GKE Workload Identity, Cloud Run).
+	GCSBucket          string // Bucket name
+	GCSPrefix          string // Object-name prefix within the bucket (e.g., "instances/abc123/")
+	GCSCredentialsFile string // Service-account key file path (optional)
+	GCSEndpoint        string // https endpoint override, e.g. Private Service Connect (optional)
 }
 
 type IngestConfig struct {
@@ -173,7 +194,7 @@ type CompactionConfig struct {
 	HourlyEnabled             bool          // Enable hourly tier
 	DailyEnabled              bool          // Enable daily tier
 	HourlyMinAgeHours         int           // Minimum age for hourly compaction (default: 1)
-	HourlyMinFiles            int           // Minimum files for hourly compaction (default: 10)
+	HourlyMinFiles            int           // Per-hour uncompacted-file floor (default: 10; independent of flush cadence)
 	DailyMinAgeHours          int           // Minimum age for daily compaction (default: 24)
 	DailyMinFiles             int           // Minimum files for daily compaction (default: 12)
 	DailySkipFileAgeCheckDays int           // Skip file creation time check for partitions older than N days (default: 7)
@@ -495,6 +516,13 @@ type DeleteConfig struct {
 	Enabled               bool // Enable delete operations (default: false for safety)
 	ConfirmationThreshold int  // Require confirm=true for deletes affecting more than this many rows
 	MaxRowsPerDelete      int  // Maximum rows that can be deleted in a single operation
+	// TimePruning: a DELETE whose WHERE bounds time reads only the partition
+	// directories that range can touch (default true). It relies on a file's
+	// directory holding only rows of that hour or day, which holds for every
+	// file written since 26.01.1; Arc 25.12 and earlier placed a file by the
+	// hour it was flushed, so a deployment still holding such data sets it
+	// false, and every DELETE reads every file again.
+	TimePruning bool
 }
 
 type RetentionConfig struct {
@@ -547,12 +575,11 @@ type QueryConfig struct {
 	EnableS3Cache            bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
 	S3CacheSize              int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
 	S3CacheTTLSeconds        int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
-	// FileTimePruning (EXPERIMENTAL, 26.09.2) expands the current-hour
-	// partition glob and drops files whose filename flush-timestamp proves
-	// they cannot contain rows in the query's time range. Big win for
-	// high-frequency ingest where the live hour holds thousands of small
-	// files (local backend only). Opt-in while experimental; planned to
-	// become the default in 27.01.1 (#659).
+	// FileTimePruning (26.09.2, on by default since 27.01.1, #659) expands
+	// the current-hour partition glob and drops files whose filename
+	// flush-timestamp proves they cannot contain rows in the query's time
+	// range. It helps high-frequency ingest, where the live hour holds
+	// thousands of small files (local backend only). false turns it off.
 	FileTimePruning bool
 	// FileTimePruningMarginSeconds widens the keep-window below the query's
 	// lower bound to absorb writer clock skew (default 300).
@@ -620,7 +647,7 @@ type ReconciliationConfig struct {
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
 // Tiered storage enables automatic data lifecycle management with hot/cold tiers.
 // - Hot tier: Local storage for recent data (fast access)
-// - Cold tier: S3/Azure for archived data (cost-effective archival storage)
+// - Cold tier: S3/Azure/GCS for archived data (cost-effective archival storage)
 //
 // Data older than DefaultHotMaxAgeDays is automatically migrated to cold storage.
 type TieredStorageConfig struct {
@@ -648,11 +675,11 @@ type TieredStorageConfig struct {
 	// truncates never retires a stale row.
 	ScanTimeout time.Duration
 
-	// Cold tier configuration (remote S3/Azure storage)
+	// Cold tier configuration (remote S3/Azure/GCS storage)
 	Cold ColdTierConfig
 }
 
-// ColdTierConfig holds configuration for the cold storage tier (S3/Azure).
+// ColdTierConfig holds configuration for the cold storage tier (S3/Azure/GCS).
 // This is the only remote tier - data moves directly from hot (local) to cold (remote).
 // Cold objects are written with no storage class or access tier set — S3
 // STANDARD, and on Azure the storage account's default tier — and queried in
@@ -662,7 +689,7 @@ type TieredStorageConfig struct {
 // preserve for a saving that is small next to block storage versus S3.
 type ColdTierConfig struct {
 	Enabled bool   // Enable cold tier
-	Backend string // "s3" or "azure"
+	Backend string // "s3", "azure" or "gcs"
 
 	// S3 settings
 	S3Bucket    string // S3 bucket for cold-tier data
@@ -683,6 +710,13 @@ type ColdTierConfig struct {
 	AzureSASToken           string // SAS token for scoped access
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
+
+	// GCS settings (#1105). Credentials as for storage.gcs_*: a
+	// service-account key file, else Application Default Credentials.
+	GCSBucket          string // Bucket for cold-tier data
+	GCSPrefix          string // Object-name prefix within the bucket
+	GCSCredentialsFile string // Service-account key file path (optional)
+	GCSEndpoint        string // https endpoint override (optional)
 }
 
 // AuditLogConfig holds configuration for enterprise audit logging.
@@ -1046,9 +1080,11 @@ func Load() (*Config, error) {
 			MemoryLimit:            v.GetString("database.memory_limit"),
 			ThreadCount:            v.GetInt("database.thread_count"),
 			EnableWAL:              v.GetBool("database.enable_wal"),
+			Extensions:             normalizeExtensionNames(parseTargetDatabases(v.Get("database.extensions"))),
 			TempDirectory:          v.GetString("database.temp_directory"),
 			ArcxExtensionPath:      v.GetString("database.arcx_extension_path"),
 			PreserveInsertionOrder: v.GetBool("database.preserve_insertion_order"),
+			ExternalFileCache:      strings.ToLower(strings.TrimSpace(v.GetString("database.external_file_cache"))),
 		},
 		Storage: StorageConfig{
 			// Normalize once at load so the backend switch, the DuckDB
@@ -1074,6 +1110,11 @@ func Load() (*Config, error) {
 			AzurePrefix:             v.GetString("storage.azure_prefix"),
 			AzureEndpoint:           v.GetString("storage.azure_endpoint"),
 			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
+			// Google Cloud Storage
+			GCSBucket:          v.GetString("storage.gcs_bucket"),
+			GCSPrefix:          v.GetString("storage.gcs_prefix"),
+			GCSCredentialsFile: v.GetString("storage.gcs_credentials_file"),
+			GCSEndpoint:        v.GetString("storage.gcs_endpoint"),
 		},
 		Ingest: IngestConfig{
 			MaxBufferSize:         v.GetInt("ingest.max_buffer_size"),
@@ -1188,6 +1229,7 @@ func Load() (*Config, error) {
 			Enabled:               v.GetBool("delete.enabled"),
 			ConfirmationThreshold: v.GetInt("delete.confirmation_threshold"),
 			MaxRowsPerDelete:      v.GetInt("delete.max_rows_per_delete"),
+			TimePruning:           v.GetBool("delete.time_pruning"),
 		},
 		Retention: RetentionConfig{
 			Enabled: v.GetBool("retention.enabled"),
@@ -1360,6 +1402,10 @@ func Load() (*Config, error) {
 				AzureSASToken:           v.GetString("tiered_storage.cold.azure_sas_token"),
 				AzureEndpoint:           v.GetString("tiered_storage.cold.azure_endpoint"),
 				AzureUseManagedIdentity: v.GetBool("tiered_storage.cold.azure_use_managed_identity"),
+				GCSBucket:               v.GetString("tiered_storage.cold.gcs_bucket"),
+				GCSPrefix:               v.GetString("tiered_storage.cold.gcs_prefix"),
+				GCSCredentialsFile:      v.GetString("tiered_storage.cold.gcs_credentials_file"),
+				GCSEndpoint:             v.GetString("tiered_storage.cold.gcs_endpoint"),
 			},
 		},
 		AuditLog: AuditLogConfig{
@@ -1395,6 +1441,11 @@ func Load() (*Config, error) {
 
 	if err := validateDuckDBMemoryLimit("database.memory_limit", cfg.Database.MemoryLimit); err != nil {
 		return nil, err
+	}
+	switch cfg.Database.ExternalFileCache {
+	case "auto", "true", "false":
+	default:
+		return nil, fmt.Errorf("database.external_file_cache must be auto, true or false, got %q", cfg.Database.ExternalFileCache)
 	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
@@ -1459,11 +1510,15 @@ func Load() (*Config, error) {
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
 	cfg.Storage.AzurePrefix = strings.TrimSpace(cfg.Storage.AzurePrefix)
 	cfg.Storage.AzureEndpoint = strings.TrimSpace(cfg.Storage.AzureEndpoint)
+	cfg.Storage.GCSBucket = strings.TrimSpace(cfg.Storage.GCSBucket)
+	cfg.Storage.GCSPrefix = strings.TrimSpace(cfg.Storage.GCSPrefix)
+	cfg.Storage.GCSCredentialsFile = strings.TrimSpace(cfg.Storage.GCSCredentialsFile)
+	cfg.Storage.GCSEndpoint = strings.TrimSpace(cfg.Storage.GCSEndpoint)
 
 	// Validate the primary storage backend against the supported set and check
 	// its required fields — fail fast at load rather than late in main.go's
 	// backend switch. The supported set must match that switch
-	// (cmd/arc/main.go): local / s3 / minio / azure / azblob.
+	// (cmd/arc/main.go): local / s3 / minio / azure / azblob / gcs.
 	switch cfg.Storage.Backend {
 	case "local":
 		// No object-storage fields to validate.
@@ -1497,15 +1552,27 @@ func Load() (*Config, error) {
 		if err := cfg.checkObjectPrefix("storage.azure_prefix", cfg.Storage.AzurePrefix); err != nil {
 			return nil, err
 		}
+	case "gcs":
+		// Same reasons as the S3 bucket guard: an empty bucket would build an
+		// empty gs:// allowlist entry and a secret scoped to nothing.
+		if cfg.Storage.GCSBucket == "" {
+			return nil, fmt.Errorf("storage.backend is \"gcs\" but storage.gcs_bucket is empty; set storage.gcs_bucket")
+		}
+		if err := cfg.checkObjectPrefix("storage.gcs_prefix", cfg.Storage.GCSPrefix); err != nil {
+			return nil, err
+		}
+		if err := checkGCSEndpoint("storage.gcs_endpoint", cfg.Storage.GCSEndpoint); err != nil {
+			return nil, err
+		}
 	default:
-		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", or \"azblob\"", cfg.Storage.Backend)
+		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", \"azblob\", or \"gcs\"", cfg.Storage.Backend)
 	}
 
 	// Cold tier (Enterprise tiered storage). Validate its backend and required
 	// fields at startup — same rationale as the primary guards above: a missing
 	// bucket/container surfaces only as an opaque tiering / query-time error
-	// otherwise. The cold runtime switch (cmd/arc/main.go) handles exactly "s3"
-	// and "azure"; reject anything else loudly. Backend is normalized at load.
+	// otherwise. The cold runtime switch (cmd/arc/main.go) handles exactly "s3",
+	// "azure" and "gcs"; reject anything else loudly. Backend is normalized at load.
 	// cold is a POINTER so the in-place trims persist to the real config struct,
 	// not a copy.
 	//
@@ -1526,6 +1593,10 @@ func Load() (*Config, error) {
 		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
 		cold.AzurePrefix = strings.TrimSpace(cold.AzurePrefix)
 		cold.AzureEndpoint = strings.TrimSpace(cold.AzureEndpoint)
+		cold.GCSBucket = strings.TrimSpace(cold.GCSBucket)
+		cold.GCSPrefix = strings.TrimSpace(cold.GCSPrefix)
+		cold.GCSCredentialsFile = strings.TrimSpace(cold.GCSCredentialsFile)
+		cold.GCSEndpoint = strings.TrimSpace(cold.GCSEndpoint)
 		switch cold.Backend {
 		case "s3":
 			if cold.S3Bucket == "" {
@@ -1550,8 +1621,22 @@ func Load() (*Config, error) {
 			if err := cfg.checkObjectPrefix("tiered_storage.cold.azure_prefix", cold.AzurePrefix); err != nil {
 				return nil, err
 			}
+		case "gcs":
+			if cold.GCSBucket == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"gcs\" but tiered_storage.cold.gcs_bucket is empty; set tiered_storage.cold.gcs_bucket")
+			}
+			// Same reason as the cold S3 prefix above.
+			if err := cfg.checkObjectPrefix("tiered_storage.cold.gcs_prefix", cold.GCSPrefix); err != nil {
+				return nil, err
+			}
+			if err := checkGCSEndpoint("tiered_storage.cold.gcs_endpoint", cold.GCSEndpoint); err != nil {
+				return nil, err
+			}
 		default:
-			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\" or \"azure\"", cold.Backend)
+			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\", \"azure\" or \"gcs\"", cold.Backend)
+		}
+		if err := cfg.checkColdPrimaryOverlap(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1864,9 +1949,11 @@ func setDefaults(v *viper.Viper) {
 	// applyLicenseCoreLimits in cmd/arc/main.go).
 	v.SetDefault("database.thread_count", 0)
 	v.SetDefault("database.enable_wal", true)
+	v.SetDefault("database.extensions", []string{})
 	v.SetDefault("database.temp_directory", "./.tmp")        // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
 	v.SetDefault("database.arcx_extension_path", "")         // Enterprise-only; gated by licenseClient.CanUseArcx()
 	v.SetDefault("database.preserve_insertion_order", false) // false = SQL-standard unordered results; ORDER BY queries unaffected
+	v.SetDefault("database.external_file_cache", "auto")     // auto = off when all data is local, on when S3/Azure/GCS may be read (#1372)
 
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")
@@ -1875,6 +1962,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("storage.s3_use_ssl", true)
 	v.SetDefault("storage.s3_path_style", false) // Use virtual-hosted style by default (set true for MinIO)
 	v.SetDefault("storage.azure_prefix", "")     // Container root by default (#1102)
+	v.SetDefault("storage.gcs_bucket", "")
+	v.SetDefault("storage.gcs_prefix", "")           // Bucket root by default
+	v.SetDefault("storage.gcs_credentials_file", "") // Empty = Application Default Credentials
+	v.SetDefault("storage.gcs_endpoint", "")         // Empty = storage.googleapis.com
 
 	// Cache defaults
 	v.SetDefault("cache.enabled", true)
@@ -2014,6 +2105,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("delete.enabled", false)                // Disabled by default for safety
 	v.SetDefault("delete.confirmation_threshold", 10000) // Require confirm=true for > 10k rows
 	v.SetDefault("delete.max_rows_per_delete", 1000000)  // Max 1M rows per delete
+	v.SetDefault("delete.time_pruning", true)            // Read only the time range's partitions
 
 	// Retention policy defaults
 	v.SetDefault("retention.enabled", true)            // Enable policy management by default
@@ -2044,7 +2136,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.timeout", 300)                           // 5 minute query timeout (0 = no timeout)
 	v.SetDefault("query.cancel_on_client_disconnect", true)      // Can be disabled for clients that half-close their write side
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
-	v.SetDefault("query.file_time_pruning", false)               // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
+	v.SetDefault("query.file_time_pruning", true)                // On by default since 27.01.1 (#659); false turns it off
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
 	v.SetDefault("query.stable_schema_bootstrap", true)          // Build anchors for pre-26.09.2 measurements on first query
@@ -2176,7 +2268,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.shared_storage_mode", false)
 
 	// Tiered storage defaults (Enterprise feature)
-	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
+	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure/GCS archive)
 	v.SetDefault("tiered_storage.enabled", false)                       // Disabled by default
 	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *")      // 2am daily
 	v.SetDefault("tiered_storage.migration_max_concurrent", 4)          // 4 concurrent migrations
@@ -2185,7 +2277,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
 
-	// Cold tier defaults (S3/Azure). Objects are written in the bucket's
+	// Cold tier defaults (S3/Azure/GCS). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.
 	v.SetDefault("tiered_storage.cold.enabled", false)         // Disabled by default
 	v.SetDefault("tiered_storage.cold.backend", "s3")          // S3 by default
@@ -2204,6 +2296,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.cold.azure_sas_token", "")
 	v.SetDefault("tiered_storage.cold.azure_endpoint", "")
 	v.SetDefault("tiered_storage.cold.azure_use_managed_identity", false)
+	v.SetDefault("tiered_storage.cold.gcs_bucket", "")           // Must be configured for GCS
+	v.SetDefault("tiered_storage.cold.gcs_prefix", "")           // Bucket root by default
+	v.SetDefault("tiered_storage.cold.gcs_credentials_file", "") // Empty = Application Default Credentials
+	v.SetDefault("tiered_storage.cold.gcs_endpoint", "")         // Empty = storage.googleapis.com
 
 	// Audit log defaults (Enterprise feature)
 	v.SetDefault("audit_log.enabled", false)
@@ -2239,6 +2335,26 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("backup.operation_timeout", "2h")
 }
 
+// checkGCSEndpoint validates storage.gcs_endpoint at load, so a bad value is
+// reported before the logger exists rather than as a failed boot. https only:
+// DuckDB reads GCS over https on the endpoint's host whatever the scheme
+// given here (it takes a bare host, #1105), so an http endpoint would send
+// the storage backend and query reads to different places, and an emulator
+// that serves only http cannot serve DuckDB at all.
+func checkGCSEndpoint(key, endpoint string) error {
+	if endpoint == "" {
+		return nil
+	}
+	u, err := storage.GCSEndpointURL(endpoint)
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	if !strings.HasPrefix(u, "https://") {
+		return fmt.Errorf("%s %q must be an https URL", key, endpoint)
+	}
+	return nil
+}
+
 // checkObjectPrefix validates one configured object-store key prefix. key is
 // the operator-facing configuration key, so a rejection names the key the
 // operator must change.
@@ -2268,6 +2384,24 @@ func (c *Config) checkObjectPrefix(key, value string) error {
 		return fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return nil
+}
+
+// normalizeExtensionNames lower-cases and de-duplicates database.extensions,
+// keeping first-seen order. The list arrives through parseTargetDatabases,
+// the accessor that reads both the TOML array and the comma-separated
+// ARC_DATABASE_EXTENSIONS spelling (GetStringSlice keeps "spatial,vss" as one
+// entry). Whether a name is supported is database.New's to decide (#440).
+func normalizeExtensionNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		n = strings.ToLower(n)
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // parseStringSlice parses a comma-separated string into a slice of strings.

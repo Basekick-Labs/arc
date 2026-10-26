@@ -24,7 +24,8 @@ format = "console"  # json or console
 # Database (DuckDB)
 # -----------------------------------------------------------------------------
 # Auto-configured based on system resources if not set.
-# Override via: ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT, ARC_DATABASE_THREAD_COUNT
+# Override via ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT,
+# ARC_DATABASE_THREAD_COUNT, ARC_DATABASE_EXTENSIONS (comma-separated).
 [database]
 # max_connections = 28    # Default: 2x the HOST's CPU cores (min 4, max 64).
 #                         # Deliberately not quota-derived: it bounds statements
@@ -44,6 +45,10 @@ format = "console"  # json or console
 #                         # compaction.threads follows the quota too since
 #                         # 26.09.3; see the [compaction] section below.
 enable_wal = true
+# DuckDB extensions to load at startup. Supported: "spatial" (ST_* functions).
+# Any other name, a path or a URL refuses to start. The image ships them, so
+# no network is needed. Set the same list on every node of a cluster.
+extensions = []
 
 # Allow DuckDB to reorder results of queries WITHOUT an ORDER BY (queries
 # with ORDER BY are unaffected); can reduce memory usage on large un-ordered
@@ -51,11 +56,18 @@ enable_wal = true
 # un-ordered SELECTs return rows in file/insertion order.
 # preserve_insertion_order = false
 
+# DuckDB's file cache keeps blocks of every file it reads, including files
+# compaction has since deleted, until memory_limit forces them out. "auto"
+# turns it off when all data is on local disk (the OS page cache already holds
+# those blocks) and keeps it on when S3 or Azure may be read (primary storage
+# or a cold tier), where it is the remote read cache. "true" or "false" forces it.
+# external_file_cache = "auto"
+
 # -----------------------------------------------------------------------------
 # Storage
 # -----------------------------------------------------------------------------
 [storage]
-backend = "local"           # "local" or "s3"
+backend = "local"           # "local", "s3", "azure" or "gcs"
 # Arc REFUSES TO START when the backup destination overlaps this root — see the
 # note on [backup].local_path. Setting this to a PARENT of the backup directory
 # (for example "./data" beside the default backup path "./data/backups") is the
@@ -92,6 +104,15 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # ARC_STORAGE_AZURE_CONNECTION_STRING).
 # azure_container = ""
 # azure_prefix = "instances/abc123"
+#
+# Google Cloud Storage (when backend = "gcs"). Standalone or cluster shared storage.
+# Authenticates with Application Default Credentials (GKE Workload Identity,
+# the GCE/Cloud Run metadata server, GOOGLE_APPLICATION_CREDENTIALS) unless a
+# service-account key file is set.
+# gcs_bucket = ""
+# gcs_prefix = "instances/abc123"
+# gcs_credentials_file = "/etc/arc/gcs-key.json"
+# gcs_endpoint = "https://storage-myendpoint.p.googleapis.com"   # https only; e.g. Private Service Connect
 
 # -----------------------------------------------------------------------------
 # Ingestion
@@ -104,7 +125,7 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # Arc exports approximate buffered-byte and oldest-unflushed-age gauges, and
 # warns when buffered bytes reach 50% of the detected process memory limit.
 max_buffer_size = 5000000   # Records before flush (default: 50000)
-max_buffer_age_ms = 100   # Max buffer age before flush
+max_buffer_age_ms = 100   # Sample override; built-in default is 5000
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
@@ -230,7 +251,7 @@ enabled = true
 hourly_enabled = true
 hourly_schedule = "5 * * * *"
 hourly_min_age_hours = 1
-hourly_min_files = 10
+hourly_min_files = 10 # Minimum uncompacted input files per hour partition; tune for workload
 
 # Daily
 daily_enabled = true
@@ -251,6 +272,10 @@ enabled = true
 enabled = true
 confirmation_threshold = 10000
 max_rows_per_delete = 1000000
+# Read only the partitions the WHERE's time range can touch. Set false on a
+# deployment still holding data written by Arc 25.12 or earlier, which placed
+# files by flush hour (see the 27.01.1 release notes).
+time_pruning = true
 
 # -----------------------------------------------------------------------------
 # Retention
@@ -292,6 +317,14 @@ enabled = false
 # days, on measurements whose anchor is complete; everything else keeps the
 # full scan. Requires stable_schema. Opt-in while experimental.
 # empty_range_anchor_scan = false
+# File-level time pruning (on by default since 27.01.1, #659). A query whose
+# range starts in the current UTC hour skips that hour's files flushed before
+# the start minus the margin. Local storage only. Rows stamped more than the
+# margin ahead of the flushing node's clock, within the current hour, can be
+# missing until the hour closes; size the margin to the worst clock skew of
+# your writers and edge spokes. Set false to turn it off.
+# file_time_pruning = true
+# file_time_pruning_margin_seconds = 300
 
 # Slow query logging threshold in milliseconds (0 = disabled)
 # Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
@@ -412,7 +445,7 @@ migration_history_retention_days = 90
 
 [tiered_storage.cold]
 enabled = false
-backend = "s3"              # "s3" or "azure"
+backend = "s3"              # "s3", "azure" or "gcs"
 
 # S3 — nothing below is set, on purpose. Arc's built-in defaults are already
 # the AWS-correct ones (no endpoint, HTTPS, virtual-hosted addressing, and
@@ -446,6 +479,15 @@ azure_use_managed_identity = false
 # commented for the same reason as the connection values above: a shipped value
 # cannot be cleared by an empty environment variable.
 # azure_prefix = "cold"
+
+# GCS (when backend = "gcs"). Credentials as for
+# [storage] gcs_*: a service-account key file, else Application Default
+# Credentials. Use a STANDARD (or Autoclass) bucket: colder classes charge
+# retrieval on every query read of cold data. Must not overlap [storage].
+# gcs_bucket = ""
+# gcs_prefix = "cold"
+# gcs_credentials_file = ""
+# gcs_endpoint = ""
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)
@@ -544,7 +586,7 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # default_target = "main"
 #
 # [backup.targets.main]                  # the DEFAULT: everything unrouted goes here
-# type = "local"                         # local, s3, minio, azure or azblob
+# type = "local"                         # local, s3, minio, azure, azblob or gcs
 # local_path = "/srv/arc-backups"
 #
 # [backup.targets.audit]                 # a ROUTED target: it carries `databases`
@@ -561,6 +603,10 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # s3_path_style = false                  # required for MinIO
 # s3_access_key = ""                     # prefer ARC_BACKUP_TARGETS_AUDIT_S3_ACCESS_KEY
 # s3_secret_key = ""                     # prefer ARC_BACKUP_TARGETS_AUDIT_S3_SECRET_KEY
+#
+# A GCS target (type = "gcs") takes gcs_bucket, gcs_prefix, gcs_credentials_file
+# (a service-account key file; empty = Application Default Credentials) and
+# gcs_endpoint (https only).
 #
 # From the environment ALONE, with nothing in this file, a target takes an extra
 # variable, because a name cannot be discovered from a map that does not exist:
