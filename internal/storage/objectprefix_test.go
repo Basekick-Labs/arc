@@ -1,6 +1,11 @@
 package storage
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
+)
 
 // The validator is shared by every object-store backend (S3, MinIO, Azure
 // Blob), which is why it no longer carries S3 in its name. Its behaviour is
@@ -32,5 +37,31 @@ func TestValidateObjectPrefix(t *testing.T) {
 		if got, err := ValidateObjectPrefix(in); err == nil {
 			t.Errorf("ValidateObjectPrefix(%q) = %q, want an error", in, got)
 		}
+	}
+}
+
+func TestValidateObjectPrefixDiagnosticSurvivesLogSanitization(t *testing.T) {
+	_, err := ValidateObjectPrefix("tenant/bad*prefix")
+	if err == nil {
+		t.Fatal("ValidateObjectPrefix accepted a prefix with an unsupported character")
+	}
+
+	got := sqlutil.SanitizeErrText(err.Error())
+	for _, want := range []string{
+		"storage prefix",
+		"unsupported character",
+		"ASCII letters",
+		"digits",
+		"slash",
+		"hyphen",
+		"underscore",
+		"period",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("sanitized diagnostic %q does not contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "tenant/bad*prefix") {
+		t.Errorf("sanitized diagnostic exposed the rejected prefix: %q", got)
 	}
 }

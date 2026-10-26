@@ -1831,6 +1831,13 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Invalid object-store prefix diagnostics retain their allowed character set
+
+Validation errors now state the allowed prefix characters explicitly, so
+sanitized logs remain actionable even when the rejected value is masked.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
 The Parquet import stored every binary column (a BYTE_ARRAY without a string
