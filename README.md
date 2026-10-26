@@ -327,7 +327,8 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 
 - **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
 - **Query**: Full analytical SQL; JSON, columnar MessagePack, and Apache Arrow IPC responses
-- **Compaction**: Tiered (hourly/daily) automatic Parquet file merging — 10x storage reduction
+- **Compaction**: Tiered (hourly/daily) automatic Parquet file merging —
+  10x storage reduction; see [hourly compaction tuning](docs/operations/compaction.md)
 - **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
 - **Durability**: Optional write-ahead log (WAL), backup and restore; [WAL recovery monitoring](docs/operations/wal-recovery.md)
 - **Storage**: Local filesystem, S3 and S3-compatible object stores (SeaweedFS, R2, MinIO, ...), Azure Blob

@@ -36,7 +36,8 @@ import (
 func (c *Coordinator) localCapabilities() []string {
 	// Compaction commit (#1207 d2) needs nothing of the node: every build
 	// that applies its rules advertises it.
-	caps := []string{raft.CapabilityCompactionCommit, CapabilityForwardIdentity}
+	// Cluster policies (#1324) likewise.
+	caps := []string{raft.CapabilityCompactionCommit, CapabilityForwardIdentity, raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention, raft.CapabilityClusterCQ}
 	if c.keepsLocalReplicas() {
 		caps = append(caps, CapabilityLocalReplica)
 	}

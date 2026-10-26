@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -207,8 +208,19 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	if cfg.Database.PreserveInsertionOrder {
 		t.Error("Database.PreserveInsertionOrder default = true, want false (26.09.1 default flip)")
 	}
+	if len(cfg.Database.Extensions) != 0 {
+		t.Errorf("Database.Extensions default = %v, want an empty list", cfg.Database.Extensions)
+	}
 
 	// Verify ingest defaults are applied
+	// These settings drive the flush cadence described alongside hourly
+	// compaction's independent file floor.
+	if cfg.Ingest.MaxBufferSize != 50000 {
+		t.Errorf("Ingest.MaxBufferSize = %d, want 50000", cfg.Ingest.MaxBufferSize)
+	}
+	if cfg.Ingest.MaxBufferAgeMS != 5000 {
+		t.Errorf("Ingest.MaxBufferAgeMS = %d, want 5000", cfg.Ingest.MaxBufferAgeMS)
+	}
 	expectedFlushWorkers := getDefaultFlushWorkers()
 	if cfg.Ingest.FlushWorkers != expectedFlushWorkers {
 		t.Errorf("Ingest.FlushWorkers = %d, want %d", cfg.Ingest.FlushWorkers, expectedFlushWorkers)
@@ -221,6 +233,9 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 
 	if cfg.Ingest.ShardCount != 32 {
 		t.Errorf("Ingest.ShardCount = %d, want 32", cfg.Ingest.ShardCount)
+	}
+	if cfg.Compaction.HourlyMinFiles != 10 {
+		t.Errorf("Compaction.HourlyMinFiles = %d, want 10", cfg.Compaction.HourlyMinFiles)
 	}
 }
 
@@ -419,10 +434,12 @@ func TestLoad_EnvOverride(t *testing.T) {
 	os.Setenv("ARC_DATABASE_MAX_CONNECTIONS", "42")
 	os.Setenv("ARC_DATABASE_MEMORY_LIMIT", "16GB")
 	os.Setenv("ARC_DATABASE_THREAD_COUNT", "8")
+	os.Setenv("ARC_DATABASE_EXTENSIONS", " Spatial ,vss,,spatial")
 	defer func() {
 		os.Unsetenv("ARC_DATABASE_MAX_CONNECTIONS")
 		os.Unsetenv("ARC_DATABASE_MEMORY_LIMIT")
 		os.Unsetenv("ARC_DATABASE_THREAD_COUNT")
+		os.Unsetenv("ARC_DATABASE_EXTENSIONS")
 	}()
 
 	cfg, err := Load()
@@ -438,6 +455,13 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 	if cfg.Database.ThreadCount != 8 {
 		t.Errorf("Database.ThreadCount = %d, want 8 (from env)", cfg.Database.ThreadCount)
+	}
+	// Split on commas (GetStringSlice kept the whole value as ONE entry),
+	// trimmed, lower-cased, empties and repeats dropped. Compared as a
+	// slice: a joined string cannot tell ["spatial","vss"] from
+	// ["spatial,vss"].
+	if got, want := cfg.Database.Extensions, []string{"spatial", "vss"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Database.Extensions = %q, want %q (from env)", got, want)
 	}
 }
 
@@ -1108,7 +1132,7 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 	}{
 		{
 			name:      "invalid primary backend -> error",
-			env:       map[string]string{"ARC_STORAGE_BACKEND": "gcs"},
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "gcp"},
 			wantError: true,
 		},
 		{
@@ -1163,7 +1187,7 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 		},
 		{
 			name:      "cold tier enabled invalid backend -> error",
-			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcp"},
 			wantError: true,
 		},
 		{
@@ -1171,7 +1195,7 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 			// disabled, the runtime ignores the cold tier entirely, so an invalid
 			// cold config must NOT block startup (previously it did).
 			name:      "parent tiering disabled + bad cold config -> ok (runtime ignores it)",
-			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcp"},
 			wantError: false,
 		},
 	}
@@ -1395,5 +1419,266 @@ func TestLoad_ImportForwardTimeout(t *testing.T) {
 	}
 	if cfg.Cluster.ImportForwardTimeoutMs != 0 {
 		t.Fatalf("ARC_CLUSTER_IMPORT_FORWARD_TIMEOUT_MS=0 gave %d", cfg.Cluster.ImportForwardTimeoutMs)
+	}
+}
+
+// TestFileTimePruningDefaultsOn pins the 27.01.1 default (#659) and that both
+// ways an operator turns it off still work.
+func TestFileTimePruningDefaultsOn(t *testing.T) {
+	// A developer shell's value must not decide the default case; t.Setenv
+	// restores it afterwards.
+	t.Setenv("ARC_QUERY_FILE_TIME_PRUNING", "")
+	os.Unsetenv("ARC_QUERY_FILE_TIME_PRUNING")
+	v := viper.New()
+	setDefaults(v)
+	if !v.GetBool("query.file_time_pruning") {
+		t.Fatal("query.file_time_pruning default = false, want true (#659)")
+	}
+	if got := v.GetInt("query.file_time_pruning_margin_seconds"); got != 300 {
+		t.Errorf("query.file_time_pruning_margin_seconds default = %d, want 300", got)
+	}
+
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Query.FileTimePruning {
+		t.Error("Load() with no config: Query.FileTimePruning = false, want true")
+	}
+
+	t.Setenv("ARC_QUERY_FILE_TIME_PRUNING", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Query.FileTimePruning {
+		t.Error("ARC_QUERY_FILE_TIME_PRUNING=false: Query.FileTimePruning = true, want false")
+	}
+	os.Unsetenv("ARC_QUERY_FILE_TIME_PRUNING")
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte("[query]\nfile_time_pruning = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Query.FileTimePruning {
+		t.Error("arc.toml file_time_pruning = false: Query.FileTimePruning = true, want false")
+	}
+}
+
+// database.external_file_cache defaults to auto, takes true/false (any case,
+// surrounding space) from the environment, and refuses anything else (#1372).
+func TestExternalFileCacheKey(t *testing.T) {
+	t.Setenv("ARC_DATABASE_EXTERNAL_FILE_CACHE", "")
+	os.Unsetenv("ARC_DATABASE_EXTERNAL_FILE_CACHE")
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Database.ExternalFileCache != "auto" {
+		t.Fatalf("default database.external_file_cache = %q, want auto", cfg.Database.ExternalFileCache)
+	}
+	for env, want := range map[string]string{"false": "false", " TRUE ": "true", "Auto": "auto"} {
+		t.Setenv("ARC_DATABASE_EXTERNAL_FILE_CACHE", env)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("ARC_DATABASE_EXTERNAL_FILE_CACHE=%q: Load() error = %v", env, err)
+		}
+		if cfg.Database.ExternalFileCache != want {
+			t.Errorf("ARC_DATABASE_EXTERNAL_FILE_CACHE=%q: got %q, want %q", env, cfg.Database.ExternalFileCache, want)
+		}
+	}
+	for _, bad := range []string{"off", "yes", "0"} {
+		t.Setenv("ARC_DATABASE_EXTERNAL_FILE_CACHE", bad)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "database.external_file_cache") {
+			t.Errorf("ARC_DATABASE_EXTERNAL_FILE_CACHE=%q: Load() error = %v, want a database.external_file_cache error", bad, err)
+		}
+	}
+	os.Unsetenv("ARC_DATABASE_EXTERNAL_FILE_CACHE")
+	if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte("[database]\nexternal_file_cache = \"false\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with arc.toml error = %v", err)
+	}
+	if cfg.Database.ExternalFileCache != "false" {
+		t.Errorf("arc.toml external_file_cache = \"false\": got %q", cfg.Database.ExternalFileCache)
+	}
+}
+
+// The TOML array spelling of database.extensions keeps each element whole
+// and is normalised like the environment spelling (#440).
+func TestLoad_DatabaseExtensionsTOMLArray(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+	if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte("[database]\nextensions = [\"Spatial\", \"spatial\", \" vss \"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got, want := cfg.Database.Extensions, []string{"spatial", "vss"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Database.Extensions = %q, want %q", got, want)
+	}
+}
+
+// TestLoad_GCSPrimaryValidation (#1105): storage.backend="gcs" is accepted with
+// a bucket, and each refusal names the key at fault.
+func TestLoad_GCSPrimaryValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantErr string // "" = must load
+	}{
+		{"gcs with bucket", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b"}, ""},
+		{"gcs with every key at a non-default value", map[string]string{
+			"ARC_STORAGE_GCS_BUCKET": " b ", "ARC_STORAGE_GCS_PREFIX": "inst/a/",
+			"ARC_STORAGE_GCS_CREDENTIALS_FILE": "/etc/arc/key.json",
+			"ARC_STORAGE_GCS_ENDPOINT":         "https://storage-psc.p.googleapis.com",
+		}, ""},
+		{"gcs endpoint as a bare host", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_ENDPOINT": "storage.googleapis.com"}, ""},
+		{"gcs without bucket", map[string]string{}, "storage.gcs_bucket is empty"},
+		{"gcs bad prefix", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_PREFIX": "../x"}, "storage.gcs_prefix"},
+		{"gcs http endpoint", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_ENDPOINT": "http://localhost:4443"}, "must be an https URL"},
+		{"gcs unusable endpoint", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_STORAGE_GCS_ENDPOINT": "ftp://x"}, "storage.gcs_endpoint"},
+		// Lifted in part 3: a GCS primary takes a cold tier.
+		{"gcs with an S3 cold tier", map[string]string{
+			"ARC_STORAGE_GCS_BUCKET": "b", "ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND": "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET": "c",
+		}, ""},
+		{"gcs with a leftover cold tier, tiering off", map[string]string{
+			"ARC_STORAGE_GCS_BUCKET": "b", "ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
+		}, ""},
+		{"gcs with iceberg", map[string]string{"ARC_STORAGE_GCS_BUCKET": "b", "ARC_ICEBERG_ENABLED": "true"}, "iceberg.enabled=true requires storage.backend=\"local\""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("ARC_STORAGE_BACKEND", "gcs")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.Storage.GCSBucket != "b" {
+					t.Fatalf("bucket = %q, want trimmed \"b\"", cfg.Storage.GCSBucket)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load() error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoad_GCSColdTierValidation (#1105 part 3): tiered_storage.cold.backend
+// "gcs" with every key, its refusals naming the key, and the overlap refusal
+// between cold and primary storage, which applies to every backend.
+func TestLoad_GCSColdTierValidation(t *testing.T) {
+	cold := func(kv ...string) map[string]string {
+		m := map[string]string{
+			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND": "gcs",
+		}
+		for i := 0; i < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{"local hot, gcs cold, every key non-default", cold(
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", " c ", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "cold/a",
+			"ARC_TIERED_STORAGE_COLD_GCS_CREDENTIALS_FILE", "/etc/arc/cold.json",
+			"ARC_TIERED_STORAGE_COLD_GCS_ENDPOINT", "https://storage.googleapis.com"), ""},
+		{"gcs cold without bucket", cold(), "tiered_storage.cold.gcs_bucket is empty"},
+		{"gcs cold bad prefix", cold("ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "c", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "../x"), "tiered_storage.cold.gcs_prefix"},
+		{"gcs cold http endpoint", cold("ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "c", "ARC_TIERED_STORAGE_COLD_GCS_ENDPOINT", "http://x"), "tiered_storage.cold.gcs_endpoint"},
+		{"gcs hot + gcs cold, sibling prefixes", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "hot",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "hot-other"), ""},
+		{"gcs hot + gcs cold, same prefix", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "p",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "p"), "overlaps primary storage"},
+		{"gcs hot at the bucket root, cold nested", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "cold"), "overlaps primary storage"},
+		{"gcs hot nested in the cold prefix", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "c/hot",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "c"), "overlaps primary storage"},
+		{"gcs hot vs S3-interop cold on the same bucket", map[string]string{
+			"ARC_STORAGE_BACKEND": "gcs", "ARC_STORAGE_GCS_BUCKET": "b",
+			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3",
+			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b", "ARC_TIERED_STORAGE_COLD_S3_PREFIX": "cold",
+			"ARC_TIERED_STORAGE_COLD_S3_ENDPOINT": "https://storage.googleapis.com",
+		}, "overlaps primary storage"},
+		// The cold endpoint is part of its identity: the same bucket name on
+		// a store that is not Google's is another bucket.
+		{"gcs hot + gcs cold on another store, same bucket and prefix", cold("ARC_STORAGE_BACKEND", "gcs", "ARC_STORAGE_GCS_BUCKET", "b", "ARC_STORAGE_GCS_PREFIX", "p",
+			"ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "b", "ARC_TIERED_STORAGE_COLD_GCS_PREFIX", "p",
+			"ARC_TIERED_STORAGE_COLD_GCS_ENDPOINT", "https://gcs.example.internal"), ""},
+		// Every backend, not only GCS: an S3 hot and S3 cold in one prefix.
+		{"s3 hot + s3 cold, same prefix", map[string]string{
+			"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b", "ARC_STORAGE_S3_PREFIX": "p",
+			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3",
+			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b", "ARC_TIERED_STORAGE_COLD_S3_PREFIX": "p",
+		}, "overlaps primary storage"},
+		{"s3 hot + s3 cold, other bucket", map[string]string{
+			"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b",
+			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3",
+			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "c",
+		}, ""},
+		// Gated like the cold validation: tiering off ignores the cold block.
+		{"overlap with tiering off is ignored", map[string]string{
+			"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b",
+			"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3",
+			"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b",
+		}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.TieredStorage.Cold.Backend == "gcs" && cfg.TieredStorage.Cold.GCSBucket != strings.TrimSpace(tc.env["ARC_TIERED_STORAGE_COLD_GCS_BUCKET"]) {
+					t.Fatalf("cold bucket = %q", cfg.TieredStorage.Cold.GCSBucket)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load() error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
 	}
 }

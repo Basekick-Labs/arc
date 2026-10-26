@@ -212,10 +212,16 @@ func TestAPIHostPort(t *testing.T) {
 		{"10.0.0.7:8000", "10.0.0.5:9100", "10.0.0.7:8000"},
 		{"[::1]:8000", "x:9100", "[::1]:8000"},
 		{":8000", "", ":8000"},
+		{"[::]:8443", "[2001:db8::2]:9100", "[2001:db8::2]:8443"},
+		{":8443", "[2001:db8::2]:9100", "[2001:db8::2]:8443"},
+		{"api-w2:8443", "w2:9100", "api-w2:8443"},
+		{"bad-address", "w2:9100", "bad-address"},
+		{":8000", "bad-address", ":8000"},
+		{":8000", ":9100", ":8000"},
 	} {
 		n := NewNode("w", "w", RoleWriter, "c")
 		n.SetAddresses(c.coord, c.api)
-		if got := apiHostPort(n); got != c.want {
+		if got := APIHostPort(n); got != c.want {
 			t.Errorf("api %q coord %q -> %q, want %q", c.api, c.coord, got, c.want)
 		}
 	}

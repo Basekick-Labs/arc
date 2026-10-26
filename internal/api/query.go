@@ -29,6 +29,7 @@ import (
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -464,12 +465,8 @@ func rewriteTimeBucket(sql string) string {
 			return match // Keep original for months or invalid units
 		}
 
-		// Calculate origin offset (seconds since epoch)
-		originEpoch := originTime.Unix()
-
-		// Formula: origin + floor((epoch(col) - origin_epoch) / interval) * interval
-		return fmt.Sprintf("to_timestamp(%d + ((epoch(%s)::BIGINT - %d) // %d) * %d)",
-			originEpoch, column, originEpoch, seconds, seconds)
+		// Microseconds: an origin with a fractional second keeps it.
+		return epochBucket(column, seconds, originTime.UnixMicro())
 	})
 
 	// Then handle 2-argument form (no origin)
@@ -495,10 +492,31 @@ func rewriteTimeBucket(sql string) string {
 			return match // Keep original for months (variable length)
 		}
 
-		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT // %d) * %d)", column, seconds, seconds)
+		return epochBucket(column, seconds, defaultBucketOriginUs)
 	})
 
 	return sql
+}
+
+// defaultBucketOriginUs is DuckDB's default time_bucket origin, 2000-01-03
+// 00:00:00 UTC (a Monday), in epoch microseconds. Buckets line up on it, not
+// on 1970-01-01 (a Thursday), so weeks and widths such as 2 days or 7 hours
+// start where DuckDB's do, and date_trunc('week') is the ISO week (#1352).
+const defaultBucketOriginUs = 946857600 * 1_000_000
+
+// epochBucket is the epoch-arithmetic form of time_bucket: the start of the
+// bucket of width seconds, aligned on originUs, that holds column.
+//
+// Integer microseconds throughout, with floor division: DuckDB's // truncates
+// toward zero, so a negative offset (a row before the origin) steps down one
+// more bucket when it has a remainder. The earlier form cast epoch() (a
+// DOUBLE) to BIGINT, which rounds, and put the last half second of every
+// bucket in the next one; a double quotient is also only exact within about
+// 272 years of the origin. This is exact for every timestamp (#1352).
+func epochBucket(column string, seconds int, originUs int64) string {
+	n := int64(seconds) * 1_000_000
+	d := fmt.Sprintf("(epoch_us(%s) - %d)", column, originUs)
+	return fmt.Sprintf("make_timestamptz(%d + (%s // %d - CASE WHEN %s %% %d < 0 THEN 1 ELSE 0 END) * %d)", originUs, d, n, d, n, n)
 }
 
 // rewriteDateTrunc converts date_trunc() to epoch-based arithmetic for 2.5x performance improvement.
@@ -522,10 +540,11 @@ func rewriteDateTrunc(sql string) string {
 		// Paren-blind guard (#535): the column capture uses [^)]+, which stops
 		// at the FIRST ')' rather than the matching one. When the column arg
 		// itself contains parentheses — coalesce(time, a), (time), CAST(...),
-		// nested calls — the capture is truncated and splicing ::BIGINT onto it
-		// would corrupt the query (e.g. epoch(coalesce(time, a)::BIGINT // 3600)
-		// swallows the arithmetic inside epoch's arg list, producing a binder
-		// error on SQL DuckDB would have run fine). Detect a '(' in the captured
+		// nested calls — the capture is truncated and splicing the epoch
+		// arithmetic onto it would corrupt the query (e.g. coalesce(time, a)
+		// captured as "coalesce(time, a" puts the subtraction inside
+		// coalesce's argument list, producing a binder error on SQL DuckDB
+		// would have run fine). Detect a '(' in the captured
 		// column and leave the call unrewritten — DuckDB runs date_trunc()
 		// natively (correct, just without the epoch optimization).
 		if strings.Contains(column, "(") {
@@ -538,8 +557,9 @@ func rewriteDateTrunc(sql string) string {
 			return match // Keep original for months (variable length)
 		}
 
-		// Convert to epoch-based arithmetic: to_timestamp((epoch(col) // interval) * interval)
-		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT // %d) * %d)", column, seconds, seconds)
+		// Epoch arithmetic on DuckDB's default origin: a Monday, so 'week'
+		// truncates to the ISO week like date_trunc does.
+		return epochBucket(column, seconds, defaultBucketOriginUs)
 	})
 }
 
@@ -675,12 +695,29 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db                      *database.DuckDB
-	storage                 storage.Backend
-	pruner                  *pruning.PartitionPruner
-	fieldSchema             *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
-	emptyRangeAnchor        bool                  // #928: answer a proven-empty range from a complete anchor alone
-	queryCache              *database.QueryCache
+	db          *database.DuckDB
+	storage     storage.Backend
+	pruner      *pruning.PartitionPruner
+	fieldSchema *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
+	// tierView replaces tieringManager's view in buildMultiTierReadParquet
+	// (tests: a tiering.Manager needs a license).
+	tierView         multiTierView
+	coldGuard        coldTierGuard // test seam; nil = the tiering manager
+	emptyRangeAnchor bool          // #928: answer a proven-empty range from a complete anchor alone
+	queryCache       *database.QueryCache
+	// openCompactions lists compaction jobs whose output and inputs can both
+	// be in storage (compaction.OpenJobs); nil without a compaction manager.
+	openCompactions OpenCompactions
+	// vanishedInvalidatedAt rate-limits the cache wipe after a partition
+	// removed mid-query (UnixNano; see invalidateAfterVanished).
+	vanishedInvalidatedAt atomic.Int64
+	// vanishedHTTPClearedAt rate-limits the HTTP cache clear after an object
+	// removed mid-query, separately, so a local vanish cannot use up the
+	// slot a remote one needs (UnixNano).
+	vanishedHTTPClearedAt atomic.Int64
+	// clearHTTPCache drops cache_httpfs's listings and blocks; nil means
+	// h.db.ClearHTTPCache (tests replace it).
+	clearHTTPCache          func()
 	logger                  zerolog.Logger
 	authManager             *auth.AuthManager
 	rbacManager             RBACChecker
@@ -1383,31 +1420,25 @@ func (h *QueryHandler) schemaRouteParams(c *fiber.Ctx) (string, string, bool) {
 }
 
 // missingAnchor reports whether a "No files found" error names one of this
-// process's materialized field schema anchors rather than a data glob. A
-// data glob matching nothing is an empty measurement and answers an empty
-// result; a missing anchor is a local file that was removed under a cached
+// process's materialized field schema anchors rather than a data glob. The
+// measurement's unpruned glob matching nothing answers an empty result (see
+// classifyNoFiles); a missing anchor is a local file that was removed under a cached
 // SQL transform, and answering an empty result for it would be a wrong
 // answer. The transform cache is dropped so the next attempt re-resolves
 // (and re-materializes) the anchor, and the error is surfaced.
 func (h *QueryHandler) missingAnchor(err error) bool {
-	if err == nil || h.fieldSchema == nil {
-		return false
-	}
-	msg := err.Error()
-	start := strings.Index(msg, "No files found that match the pattern \"")
-	if start < 0 {
-		return false
-	}
-	rest := msg[start+len("No files found that match the pattern \""):]
-	end := strings.Index(rest, "\"")
-	if end < 0 {
-		return false
-	}
-	if !h.fieldSchema.IsLocalAnchorPath(rest[:end]) {
+	pattern, ok := noFilesPattern(err)
+	return ok && h.missingAnchorPath(pattern)
+}
+
+// missingAnchorPath is missingAnchor for a path, whichever error named it:
+// an anchor removed while a scan reads it is the same case (plannedFile).
+func (h *QueryHandler) missingAnchorPath(path string) bool {
+	if h.fieldSchema == nil || !h.fieldSchema.IsLocalAnchorPath(path) {
 		return false
 	}
 	h.queryCache.Invalidate()
-	h.logger.Warn().Str("anchor", rest[:end]).Msg("Field schema anchor missing on disk; SQL transform cache dropped so the next query re-materializes it")
+	h.logger.Warn().Str("anchor", path).Msg("Field schema anchor missing on disk; SQL transform cache dropped so the next query re-materializes it")
 	return true
 }
 
@@ -1420,6 +1451,81 @@ func (h *QueryHandler) SetGovernance(manager *governance.Manager, lc *license.Cl
 // SetQueryRegistry sets the query registry for long-running query management.
 func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
+}
+
+// OpenCompactions is what the query layer needs from the compactions a read
+// must account for: compaction.OpenJobs on this node, and in a cluster the
+// coordinator's committed jobs and pending local deletes
+// (CombineOpenCompactions).
+type OpenCompactions interface {
+	ExcludedFor(ctx context.Context, prefix string) []string
+	Open(prefix string) bool
+	Generation() uint64
+}
+
+// SetOpenCompactions wires the compaction jobs a read must account for.
+func (h *QueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
+
+func (h *QueryHandler) openCompactionsGeneration() uint64 {
+	if h.openCompactions == nil {
+		return 0
+	}
+	return h.openCompactions.Generation()
+}
+
+// openCompactionFileColumn names the file column the exclusion reads. Not
+// "filename": DuckDB refuses that option on a file that has such a column.
+const openCompactionFileColumn = "__arc_file"
+
+// excludeOpenCompactions is wrapOpenCompactions with this handler's
+// registry and storage.
+func (h *QueryHandler) excludeOpenCompactions(ctx context.Context, expr, database, measurement string) string {
+	return wrapOpenCompactions(ctx, h.openCompactions, h.storage, expr, database, measurement)
+}
+
+// openCompactionExclusions is the storage keys a read of database.measurement
+// must leave out (wrapOpenCompactions), for readers that list files
+// themselves (the arcx router).
+func (h *QueryHandler) openCompactionExclusions(ctx context.Context, prefix string) []string {
+	if h.openCompactions == nil {
+		return nil
+	}
+	return h.openCompactions.ExcludedFor(ctx, prefix)
+}
+
+// wrapOpenCompactions makes a read count a compaction's rows once. A legacy
+// compaction puts its output in the partition before deleting its inputs, so
+// a read between the two sees both; a continuous query in that window writes
+// the doubled aggregate back; a cluster's staged compaction has the same
+// window between its output's move and its inputs' deletes. For each such job
+// on this measurement whose output is in storage, oc names its inputs. expr
+// contains one read_parquet(...) call and ends with it.
+// The excluded files are still opened: DuckDB does not skip a file by its
+// name column. The result is volatile.
+func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storage.Backend, expr, database, measurement string) string {
+	if oc == nil || backend == nil || database == "" || measurement == "" {
+		return expr
+	}
+	prefix := database + "/" + measurement + "/"
+	if !oc.Open(prefix) {
+		return expr
+	}
+	// An open job on this measurement: whatever this read leaves out now,
+	// its output can appear before the next one, so it is never cached.
+	pruning.MarkVolatile(ctx)
+	keys := oc.ExcludedFor(ctx, prefix)
+	if len(keys) == 0 {
+		return expr
+	}
+	quoted := make([]string, 0, len(keys))
+	for _, k := range keys {
+		uri, err := storage.ObjectURI(backend, k)
+		if err != nil {
+			continue
+		}
+		quoted = append(quoted, sqlutil.QuoteStringLiteral(uri))
+	}
+	return sqlutil.ExcludeFiles(expr, openCompactionFileColumn, quoted)
 }
 
 // SetFileTimePruning enables file-level time pruning on the partition pruner
@@ -1435,6 +1541,13 @@ func (h *QueryHandler) InvalidateCaches() {
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
 	h.logger.Info().Msg("Query caches invalidated (files removed or rewritten)")
+}
+
+// InvalidateCachesQuiet is InvalidateCaches without the Info line, for a
+// caller that invalidates around every chunk of a long operation.
+func (h *QueryHandler) InvalidateCachesQuiet() {
+	h.pruner.InvalidateAllCachesQuiet()
+	h.queryCache.Invalidate()
 }
 
 // StartBackgroundWorkers spawns the long-lived goroutines the handler
@@ -2111,7 +2224,7 @@ localProcessing:
 	convertedSQL, cached, err := h.getTransformedSQLForQuery(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		m.IncQueryErrors()
-		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
+		return respondError(c, transformErrorStatus(err), err.Error(), timestamp, start)
 	}
 
 	// arcx decline census (no-op stub in stock builds; no query text is emitted).
@@ -2275,10 +2388,24 @@ localProcessing:
 		if cancel != nil {
 			cancel()
 		}
-		// Check if this is a "no files found" error — treat as empty result, not an error.
-		// This happens when querying a measurement that has no data on storage yet
-		// (e.g., new measurement, or DuckDB's httpfs cache is stale).
-		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		// "No files found": an empty result for a measurement with no data
+		// yet, a retryable 503 for a partition removed mid-query
+		// (classifyNoFiles).
+		kind := h.classifyNoFiles(err)
+		if kind == noFilesVanished {
+			m.IncQueryErrors()
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           vanishedPartitionMessage,
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
+		if kind == noFilesEmpty {
 			h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
 			m.IncQuerySuccess()
 			if h.queryRegistry != nil && queryID != "" {
@@ -2440,12 +2567,213 @@ localProcessing:
 	return nil
 }
 
+// duckdbMessage returns the message of a DuckDB error of type t, as DuckDB
+// wrote it ("<Type> Error: ..."), unwrapping Arc's own wrapping.
+//
+// The classifiers below match on DuckDB's text, so they must read only an
+// error DuckDB raised, and only from its start: DuckDB echoes user text in
+// other errors (a failed CAST quotes the literal, error() its argument, a
+// Binder error the SQL), and a query could otherwise forge "a file vanished"
+// to get a 503 and wipe the node's caches, or forge "no files" to get an
+// empty success (#1355 review).
+func duckdbMessage(err error, t duckdb.ErrorType) (string, bool) {
+	var de *duckdb.Error
+	if !errors.As(err, &de) || de.Type != t {
+		return "", false
+	}
+	return de.Msg, true
+}
+
+// quotedAfter returns the text between quote and the next quote when msg
+// starts with lead+quote, and that text is followed by tail.
+func quotedAfter(msg, lead, quote, tail string) (string, bool) {
+	rest, ok := strings.CutPrefix(msg, lead+quote)
+	if !ok {
+		return "", false
+	}
+	end := strings.Index(rest, quote)
+	if end <= 0 || !strings.HasPrefix(rest[end+len(quote):], tail) {
+		return "", false
+	}
+	return rest[:end], true
+}
+
 // isNoFilesFoundError checks if a DuckDB error is the "No files found" IO error.
 // This occurs when read_parquet glob pattern matches zero files on S3/Azure/local storage.
-// This is NOT a real error — it means the measurement has no data yet (or DuckDB's
-// httpfs directory cache is stale). We treat it as an empty result.
+// What it means is classifyNoFiles's call: no data yet, or a pattern that
+// vanished.
 func isNoFilesFoundError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "No files found that match the pattern")
+	_, ok := noFilesPattern(err)
+	return ok
+}
+
+// noFilesPattern returns the pattern a DuckDB "No files found" error names.
+func noFilesPattern(err error) (string, bool) {
+	msg, ok := duckdbMessage(err, duckdb.ErrorTypeIO)
+	if !ok {
+		return "", false
+	}
+	return quotedAfter(msg, "IO Error: No files found that match the pattern ", `"`, "")
+}
+
+// noFilesKind classifies a DuckDB "No files found" error.
+type noFilesKind int
+
+const (
+	// noFilesOther: not that error, or a missing schema anchor; an error.
+	noFilesOther noFilesKind = iota
+	// noFilesEmpty: the measurement's unpruned glob matched nothing, which
+	// answers an empty result (a measurement with no data yet).
+	noFilesEmpty
+	// noFilesVanished: a pruned partition, or a file one of Arc's patterns
+	// matched, disappeared after the query was planned or while it was
+	// scanned. The answer is unknown, never empty.
+	noFilesVanished
+)
+
+// vanishedPartitionMessage is what a client sees for noFilesVanished: the
+// condition is transient and a retry re-plans, so it is a 503 with
+// Retry-After rather than DuckDB's text (which names storage paths).
+const vanishedPartitionMessage = "data read by this query was removed while it ran (retention, compaction or a delete); retry the query"
+
+// classifyNoFiles reports how a query error is answered.
+//
+// Only the measurement's unpruned "**/*.parquet" glob matching nothing means
+// "no rows". Every other pattern Arc hands DuckDB (an hour or day partition
+// glob, an explicit file from file-time pruning) was listed when the query
+// was planned, so its absence at execution means files were removed in
+// between: retention, compaction or a DELETE took that hour while the query
+// was in flight, or a cached transform outlived the files. Answering an empty
+// result there dropped every row of the query, not just that hour's, with
+// success:true. The caches are cleared so the next attempt re-plans. (A tiered
+// read keeps a remote path it could not verify when its listing fails, so
+// "listed" is not always "checked".)
+//
+// DuckDB expands a glob at bind and opens each file as the scan reaches it,
+// so a file removed in between fails with a different text (vanishedFile):
+// compaction deleting a batch's inputs while a query reads the hour (#1355).
+// That is the same condition and gets the same answer.
+//
+// A "**" glob can still be one of several patterns a tiered read combines,
+// so an empty answer for it is only as right as it was before this check.
+func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
+	if path, remote, ok := vanishedFile(err); ok {
+		if !h.plannedFile(path, remote) {
+			return noFilesOther
+		}
+		h.invalidateAfterVanished(path, remote)
+		return noFilesVanished
+	}
+	if !isNoFilesFoundError(err) || h.missingAnchor(err) {
+		return noFilesOther
+	}
+	pattern, ok := noFilesPattern(err)
+	if !ok || strings.HasSuffix(pattern, "**/*.parquet") {
+		return noFilesEmpty
+	}
+	h.invalidateAfterVanished(pattern, false)
+	return noFilesVanished
+}
+
+// vanishedFile returns the file a DuckDB scan could not open because it no
+// longer existed, and whether it is an object-store URL. The texts were
+// measured with the duckdb-go Arc ships; the local one is pinned by
+// TestVanishedFileTexts, and the S3 and Azure ones were recorded against
+// SeaweedFS 4.47 and Azurite 3.35 (TestClassifyVanishedFile):
+//
+//	local: IO Error: Cannot open file "<path>": No such file or directory
+//	S3:    HTTP Error: HTTP GET error reading '<url>' in region '<r>' (HTTP 404 Not Found)
+//	GCS:   the S3 form, '<url>' the gs:// URL and region '' (recorded against
+//	       real GCS, #1105)
+//	Azure: IO Error: AzureStorageFileSystem open file '<url>' failed with code 'BlobNotFound', ...
+//
+// Each must be a DuckDB error of that type and start with that text
+// (duckdbMessage). The S3 reason phrase after the status code comes from the
+// server, so it is not matched.
+func vanishedFile(err error) (path string, remote bool, ok bool) {
+	if msg, ok := duckdbMessage(err, duckdb.ErrorTypeIO); ok {
+		if p, ok := quotedAfter(msg, "IO Error: Cannot open file ", `"`, ": No such file or directory"); ok {
+			return p, false, true
+		}
+		if p, ok := quotedAfter(msg, "IO Error: AzureStorageFileSystem open file ", "'", " failed with code 'BlobNotFound'"); ok {
+			return p, true, true
+		}
+	}
+	if msg, ok := duckdbMessage(err, duckdb.ErrorTypeHTTP); ok {
+		if p, ok := quotedAfter(msg, "HTTP Error: HTTP GET error reading ", "'", ""); ok {
+			tail := strings.TrimPrefix(msg, "HTTP Error: HTTP GET error reading '"+p+"'")
+			if i := strings.Index(tail, "(HTTP "); i >= 0 && strings.HasPrefix(tail[i:], "(HTTP 404") {
+				return p, true, true
+			}
+		}
+	}
+	return "", false, false
+}
+
+// plannedFile reports whether a file a scan could not open is one Arc's
+// patterns matched: a Parquet file under the local storage root, or, on a
+// node that reads an object store (primary storage or a cold tier), a
+// Parquet object. Arc builds every object path DuckDB reads. A missing
+// schema anchor is not one: it keeps #1333's handling (missingAnchorPath).
+func (h *QueryHandler) plannedFile(path string, remote bool) bool {
+	if !strings.HasSuffix(path, ".parquet") {
+		return false
+	}
+	if remote {
+		return h.readsObjectStore()
+	}
+	if !underRoot(path, h.getStorageBasePath()) {
+		return false
+	}
+	return !h.missingAnchorPath(path)
+}
+
+// readsObjectStore reports whether this node's queries read an object store:
+// its primary storage, or a tiering cold tier. Any non-local primary, by
+// Type() rather than by a list of concrete types, which missed every backend
+// added after it (#1105).
+func (h *QueryHandler) readsObjectStore() bool {
+	if h.storage != nil && h.storage.Type() != "local" {
+		return true
+	}
+	return h.tieringManager != nil
+}
+
+// underRoot reports whether path is inside root, matching at a separator so
+// /data-other is not inside /data, and a root of "/" or with a trailing slash
+// still works. An empty root (an object-store primary) holds nothing local.
+func underRoot(path, root string) bool {
+	return root != "" && strings.HasPrefix(path, strings.TrimSuffix(root, "/")+"/")
+}
+
+// invalidateAfterVanished clears the query caches after a vanished partition
+// or file, at most once per second: an object-store listing that keeps
+// failing keeps unverified paths in every plan, and a node-wide wipe per
+// query would defeat the caches for everyone else. For an object it also
+// clears cache_httpfs, on its own once-per-second gate: a cached listing
+// still names the removed object, and until the entry expired every retry
+// failed the same way while Retry-After said 1 s. The clear runs in the
+// background: it takes a pooled connection, and this request's 503 must not
+// wait behind running queries for one.
+func (h *QueryHandler) invalidateAfterVanished(path string, remote bool) {
+	now := time.Now().UnixNano()
+	if remote {
+		if last := h.vanishedHTTPClearedAt.Load(); now-last >= int64(time.Second) && h.vanishedHTTPClearedAt.CompareAndSwap(last, now) {
+			clear := h.clearHTTPCache
+			if clear == nil {
+				clear = h.db.ClearHTTPCacheQuietly
+			}
+			go clear()
+		}
+	}
+	last := h.vanishedInvalidatedAt.Load()
+	if now-last < int64(time.Second) || !h.vanishedInvalidatedAt.CompareAndSwap(last, now) {
+		return
+	}
+	h.pruner.InvalidateAllCaches()
+	h.queryCache.Invalidate()
+	h.logger.Warn().Str("path", path).
+		Msg("Data a query read was removed while it ran (retention, compaction or DELETE); query caches cleared, the query answers 503 rather than an error or an empty result. If this path keeps appearing, it is missing for good (e.g. a dangling link under the storage root), not in flight")
 }
 
 // SQLValidationError represents an error from SQL validation
@@ -2510,6 +2838,9 @@ func ValidateSQLRequest(sql string) error {
 
 	if dangerousSQLPattern.MatchString(normalised) {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
+	}
+	if unicodeEscapePattern.MatchString(normalised) {
+		return &SQLValidationError{Message: `Unicode-escaped identifiers and strings (U&"...") are not allowed`}
 	}
 
 	// SECURITY: read statements only (read_statements.go). The denylist above
@@ -2812,6 +3143,14 @@ func isBareIdentifier(name string) bool {
 	return true
 }
 
+// unicodeEscapePattern matches a U&"..." identifier or U&'...' string in
+// literal-masked SQL (the masker leaves the U& prefix outside its
+// placeholder). Its escapes spell a name the denylists cannot see:
+// U&"\0073t_read" is st_read. The DuckDB release Arc pins does not execute
+// them, so refusing them outright costs nothing and keeps a parser upgrade
+// from opening the I/O denylist (#440).
+var unicodeEscapePattern = regexp.MustCompile(`(?i)\bu&__(?:STR|IDENT)_\d+__`)
+
 // ioTableFunctionPattern matches a call to any DuckDB function that reads from
 // the filesystem (or an attached storage scanner), by name, in any position of
 // the masked/comment-stripped SQL. This is an intentionally comprehensive
@@ -2821,10 +3160,12 @@ func isBareIdentifier(name string) bool {
 // bare identifier. Anchored matching (`\b`) avoids matching these as a
 // substring of a longer identifier.
 //
-// Maintenance: when DuckDB adds a new path-taking table function (or Arc loads
-// an extension that exposes one), add it here. TestIOTableFunctionPattern_Family
-// documents the set we verified against the pinned DuckDB release.
-var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
+// Maintenance: when DuckDB adds a new path-taking table function, add it here.
+// TestIOTableFunctionPattern_Family documents the set we verified against the
+// pinned DuckDB release. An extension's functions are not listed here: they
+// come from database.DeniedExtensionFunctions, and an extension is loadable
+// only once its function surface is reviewed there (#440).
+var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
 	"read_parquet",
 	"parquet_scan",
 	"parquet_metadata",
@@ -2851,7 +3192,9 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]strin
 	"iceberg_metadata",
 	"iceberg_snapshots",
 	"arc_partition_agg",
-}, "|") + `)\s*\(`)
+	// The file readers of the DuckDB extensions database.extensions may load
+	// (#440), denied whether or not this node loads them.
+}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
 
 // dynamicSQLFunctionPattern matches DuckDB table functions that evaluate a
 // string as SQL (or resolve a string to a relation). They are the I/O
@@ -2896,10 +3239,12 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 		return sql, true, nil
 	}
 
-	// Build cache key - include header database if provided, and the current
-	// hour: SQL pruned before an hour started is never served after it (the
-	// pruner leaves out hours that have not started and have no files).
-	cacheKey := strconv.FormatInt(h.pruner.LiveEpoch(), 10) + ":" + sql
+	// Build cache key - include header database if provided, the current
+	// hour and the hours the query's range starts and ends in: SQL pruned
+	// before an hour started is never served after it (the pruner leaves out
+	// hours that have not started and have no files), including an hour a
+	// relative end has just reached (CacheEpoch).
+	cacheKey := h.pruner.CacheEpoch(sql) + ":" + strconv.FormatUint(h.openCompactionsGeneration(), 10) + ":" + sql
 	if headerDB != "" {
 		cacheKey = headerDB + ":" + cacheKey
 	}
@@ -3233,6 +3578,62 @@ type storagePathFailure struct {
 	err error
 }
 
+// errColdTierUnavailable refuses a read that needs the cold tier on a node
+// where the cold tier is configured on but its backend failed to start
+// (tiering.Manager.ColdTierMissing). Without this the read would leave every
+// cold file out and answer with the hot rows alone, success:true (#1105).
+// Answered with 503 (transformErrorStatus): the query is valid, the node
+// cannot serve it.
+var errColdTierUnavailable = errors.New("this query reads data in the cold storage tier, which is configured but unavailable on this node (its backend failed to start; see the startup log); refused rather than answered without that data")
+
+// transformErrorStatus is the HTTP status for an error from the SQL
+// transform: 503 for a cold tier this node cannot read, 400 otherwise (a name
+// that cannot become a storage path).
+func transformErrorStatus(err error) int {
+	if errors.Is(err, errColdTierUnavailable) {
+		return fiber.StatusServiceUnavailable
+	}
+	return fiber.StatusBadRequest
+}
+
+// refuseReadWithoutColdTier records errColdTierUnavailable on ctx and reports
+// true when the cold tier is configured but missing and this measurement has
+// cold rows in the query's time range. A bound the extractor only assumed is
+// left open, and a metadata error refuses too: neither may turn into a read
+// that silently skips cold data.
+func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, measurement, originalSQL string) bool {
+	guard := h.coldTierGuard()
+	if guard == nil || !guard.ColdTierMissing() {
+		return false
+	}
+	// Never cache a transform built in this state: "no cold rows in range"
+	// is only true now, and cold rows can still arrive (a cluster peer's
+	// migration replicated in, a restore). A cached hot-only read would then
+	// skip them without asking again.
+	pruning.MarkVolatile(ctx)
+	var start, end *time.Time
+	if tr := h.pruner.ExtractTimeRange(originalSQL); tr != nil {
+		if !tr.StartAssumed {
+			s := tr.Start
+			start = &s
+		}
+		if !tr.EndAssumed {
+			e := tr.End
+			end = &e
+		}
+	}
+	has, err := guard.HasColdFilesInRange(ctx, database, measurement, start, end)
+	if err != nil {
+		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Could not check this read against cold tier rows while the cold tier is unavailable; refusing it")
+	}
+	if err == nil && !has {
+		return false
+	}
+	recordStoragePathFailure(ctx, errColdTierUnavailable)
+	return true
+}
+
 type storagePathCtxKey struct{}
 
 // withStoragePathFailure attaches a collector for storage-path rejections.
@@ -3393,6 +3794,21 @@ func joinKeyword(prefix string) string {
 // for join clauses.
 // If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
 func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalSQL, keyword string) string {
+	db, meas := h.extractDBMeasurementFromPath(path)
+	return h.excludeOpenCompactions(ctx, h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword), db, meas)
+}
+
+// buildReadParquetExprRaw is buildReadParquetExpr without the open
+// compaction exclusions.
+func (h *QueryHandler) buildReadParquetExprRaw(ctx context.Context, path, originalSQL, keyword string) string {
+	// A cold tier that is on but failed to start offers no cold glob below,
+	// so this is the one place every read of such a node passes (#1105).
+	// The guard is asked first so a node without tiering parses nothing.
+	if guard := h.coldTierGuard(); guard != nil && guard.ColdTierMissing() {
+		if db, meas := h.extractDBMeasurementFromPath(path); db != "" && meas != "" && h.refuseReadWithoutColdTier(ctx, db, meas, originalSQL) {
+			return ""
+		}
+	}
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -3445,6 +3861,15 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 // This is the tiering-aware version used by the fast path that takes database and measurement
 // separately instead of a pre-constructed path, allowing proper tiering metadata lookup.
 func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, database, measurement, originalSQL, keyword string) string {
+	return h.excludeOpenCompactions(ctx, h.buildReadParquetExprForMeasurementRaw(ctx, database, measurement, originalSQL, keyword), database, measurement)
+}
+
+// buildReadParquetExprForMeasurementRaw is buildReadParquetExprForMeasurement
+// without the open compaction exclusions (applied once, by the caller, to
+// either tier layout).
+func (h *QueryHandler) buildReadParquetExprForMeasurementRaw(ctx context.Context, database, measurement, originalSQL, keyword string) string {
+	// A missing cold tier is refused in buildReadParquetExprRaw, which this
+	// falls through to: with no cold backend the router offers no cold glob.
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -3465,7 +3890,7 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 
 	// Fall back to single-tier behavior (hot tier only)
 	path := h.getStoragePath(ctx, database, measurement)
-	return h.buildReadParquetExpr(ctx, path, originalSQL, keyword)
+	return h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword)
 }
 
 // shouldSkipTableConversion returns true if the table name should not be converted to a storage path
@@ -3641,7 +4066,8 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	options := buildReadParquetOptions()
 
 	// Query metadata to find which tiers actually have data for this measurement
-	actualTiers, err := h.tieringManager.GetMetadata().GetTiersForMeasurement(ctx, database, measurement)
+	tiers := h.multiTierView()
+	actualTiers, err := tiers.TiersForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Warn().Err(err).
 			Str("database", database).
@@ -3696,10 +4122,10 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Msg("No hot tier metadata for this measurement; local files are excluded from this read")
 	}
 
-	// Cold tier (S3/Azure) - only if metadata says there's cold data
+	// Cold tier (S3/Azure/GCS) - only if metadata says there's cold data
 	if actualTiers[tiering.TierCold] {
 		if _, ok := tieredPaths[tiering.TierCold]; ok {
-			coldBackend := h.tieringManager.GetBackendForTier(tiering.TierCold)
+			coldBackend := tiers.GetBackendForTier(tiering.TierCold)
 			if coldBackend != nil {
 				sources = append(sources, tierSource{tiering.TierCold, h.storagePathForBackend(ctx, coldBackend, database, measurement), coldBackend})
 			}
@@ -3715,7 +4141,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	results := make([]tierPruneResult, 0, len(sources))
 	for _, src := range sources {
 		if src.tier == tiering.TierCold && timeRange != nil && timeRange.StartAssumed {
-			// An end-only predicate's assumed start (2020-01-01) must not
+			// An end-only predicate's assumed start (the 1970 floor) must not
 			// exclude cold-archive data that can legitimately be older; scan
 			// the full cold glob instead.
 			results = append(results, tierPruneResult{glob: src.glob, outcome: pruning.TierPruneFallback})
@@ -3766,12 +4192,13 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	}
 
 	if len(paths) == 0 {
-		// No paths found, return empty result
-		h.logger.Warn().
-			Str("database", database).
-			Str("measurement", measurement).
-			Msg("No tier paths found despite having metadata")
-		return keyword + " (SELECT * WHERE 1=0)"
+		hotWasSource := false
+		for _, src := range sources {
+			if src.tier == tiering.TierHot {
+				hotWasSource = true
+			}
+		}
+		return h.noTierRead(ctx, database, measurement, keyword, options, hotWasSource)
 	}
 
 	anchor := h.anchorFor(ctx, database, measurement)
@@ -3794,6 +4221,81 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		Msg("Building multi-tier query")
 
 	return readParquetExpr(keyword, anchor, paths, options)
+}
+
+// noTierRead is the read of a measurement no tier holds a file of any more:
+// every one was deleted, retired or moved out while its tier rows stayed
+// (#1364). It used to be "(SELECT * WHERE 1=0)", which DuckDB refuses to bind
+// ("* expression without FROM clause"), so even count(*) failed; it also
+// broke the read_parquet(...) shape the open-compaction wrapper expects.
+//
+// With the measurement's schema anchor, the anchor alone: zero rows with
+// every column the anchor knows, so count(*) answers 0 and a query naming
+// those columns binds. Without one, a glob DuckDB reports "No files found"
+// for, which the handler answers with an empty result (classifyNoFiles), as
+// for a measurement that never had a file. That glob is the hot tier's only
+// when the hot tier was one of the read's sources (verified empty); a read
+// the tier rows kept off hot storage must not start reading local files they
+// left out (stale copies of deleted files, say), so it gets one that matches
+// nothing. Not cached either way: a later flush or tier scan changes which
+// tiers hold files.
+func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, keyword, options string, hotWasSource bool) string {
+	pruning.MarkVolatile(ctx)
+	h.logger.Debug().
+		Str("database", database).
+		Str("measurement", measurement).
+		Msg("No tier holds a file of this measurement; reading it as empty")
+	if anchor := h.anchorFor(ctx, database, measurement); anchor != "" {
+		return readParquetExpr(keyword, anchor, nil, options)
+	}
+	if hotWasSource {
+		return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, measurement)}, options)
+	}
+	return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, arcInvalidIdentifierSentinel)}, options)
+}
+
+// multiTierView is what buildMultiTierReadParquet reads from tiering: which
+// tiers hold rows of a measurement, and the cold backend. *tiering.Manager
+// through tieringTierView; a test sets QueryHandler.tierView.
+type multiTierView interface {
+	TiersForMeasurement(ctx context.Context, database, measurement string) (map[tiering.Tier]bool, error)
+	GetBackendForTier(tier tiering.Tier) storage.Backend
+}
+
+type tieringTierView struct{ m *tiering.Manager }
+
+func (v tieringTierView) TiersForMeasurement(ctx context.Context, database, measurement string) (map[tiering.Tier]bool, error) {
+	return v.m.GetMetadata().GetTiersForMeasurement(ctx, database, measurement)
+}
+
+func (v tieringTierView) GetBackendForTier(tier tiering.Tier) storage.Backend {
+	return v.m.GetBackendForTier(tier)
+}
+
+// coldTierGuard is what refuseReadWithoutColdTier asks of tiering; a seam so
+// tests can stand in for a node whose cold backend failed to start.
+type coldTierGuard interface {
+	ColdTierMissing() bool
+	HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error)
+}
+
+func (h *QueryHandler) coldTierGuard() coldTierGuard {
+	if h.coldGuard != nil {
+		return h.coldGuard
+	}
+	if h.tieringManager == nil {
+		// Not the typed nil: a nil *Manager in the interface would pass a
+		// nil check and then be called.
+		return nil
+	}
+	return h.tieringManager
+}
+
+func (h *QueryHandler) multiTierView() multiTierView {
+	if h.tierView != nil {
+		return h.tierView
+	}
+	return tieringTierView{h.tieringManager}
 }
 
 // convertSingleTableQuery is a fast path for simple single-table queries.
@@ -4550,7 +5052,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		metrics.Get().IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+		return c.Status(transformErrorStatus(err)).JSON(EstimateResponse{
 			Success:         false,
 			Error:           err.Error(),
 			WarningLevel:    "error",
@@ -5099,9 +5601,13 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), sql, "")
 	if err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+		msg := "Invalid query: " + err.Error()
+		if errors.Is(err, errColdTierUnavailable) {
+			msg = err.Error()
+		}
+		return c.Status(transformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,
-			Error:     "Invalid query: " + err.Error(),
+			Error:     msg,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}
@@ -5214,6 +5720,20 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			cancel()
 		}
 		m.IncQueryErrors()
+		// A partition or file removed mid-query: retryable, as on the other
+		// routes (classifyNoFiles).
+		if h.classifyNoFiles(err) == noFilesVanished {
+			if onFail != nil {
+				onFail(vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           vanishedPartitionMessage,
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
 		if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
 			if onTimeout != nil {

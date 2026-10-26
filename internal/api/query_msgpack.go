@@ -84,10 +84,23 @@ func executeArrowMsgPackQuery(
 	}
 
 	if err != nil {
-		// "no files found" → empty result, not error. Mirrors the JSON
-		// path so a client polling a measurement before its first write
-		// sees the same shape regardless of wire format.
-		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		// "no files found": an empty result for a measurement with no data
+		// yet, a retryable 503 for a partition removed mid-query
+		// (classifyNoFiles). Mirrors the JSON path.
+		kind := h.classifyNoFiles(err)
+		if kind == noFilesVanished {
+			if cancel != nil {
+				cancel()
+			}
+			m.IncQueryErrors()
+			if onFail != nil {
+				onFail(vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			_ = respondError(c, fiber.StatusServiceUnavailable, vanishedPartitionMessage, timestamp, start)
+			return -1, true
+		}
+		if kind == noFilesEmpty {
 			if cancel != nil {
 				cancel()
 			}

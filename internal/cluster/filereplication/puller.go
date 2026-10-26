@@ -237,7 +237,9 @@ type Config struct {
 	// glob altogether.
 	//
 	// Called on a pull worker, so it must not block — the implementation is
-	// expected to queue, as ingest.FileRegistrar does on the flush path.
+	// expected to queue, as ingest.FileRegistrar does on the flush path. The
+	// coordinator's hook also stats the deferred unlinks of the pulled file's
+	// rewrite family (local stats, normally none).
 	// nil means no tiering on this node.
 	//
 	// Returns whether anything accepted the report. The hook itself is wired

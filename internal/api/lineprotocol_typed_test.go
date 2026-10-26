@@ -291,3 +291,15 @@ func TestLPWriteDropLogsBoundedAndOnlyForWrites(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, status, out)
 	require.NotContains(t, r2.log.String(), "points dropped")
 }
+
+// #1342: the record path (decimal deployments) drops a point with a name Arc
+// could not read back, like the typed path.
+func TestLPWriteDecimalDeploymentDropsUnstorableNames(t *testing.T) {
+	r := newLPWriteRig(t, &config.IngestConfig{DecimalColumns: []string{"trades:price=18,8"}})
+	status, out := r.post(t, "trades price=1.25 1700000000000000000\ntrades Time=2,price=2.5 1700000001000000000\ntrades Price=3.5 1700000002000000000\n")
+	require.Equal(t, http.StatusBadRequest, status, out)
+	require.Contains(t, out, "partial write: 2 points dropped")
+	require.Contains(t, out, "the other points were written")
+	rows, _ := r.stored(t)
+	require.Equal(t, map[string]int64{"trades": 1}, rows)
+}

@@ -11,6 +11,8 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,10 +49,9 @@ type deleteRequest struct {
 //
 // Implemented by *tiering.Manager. Declared here, consumer-side, for the same
 // reason tiering declares ManifestCoordinator rather than importing this
-// package: neither side needs the other's types. Both methods are
-// fire-and-forget — they are called from the replication pull workers and the
-// local-delete workers, never block, and the implementation queues rather than
-// writing through to SQLite on the caller's goroutine.
+// package: neither side needs the other's types. Its methods are
+// fire-and-forget: they run on replication workers, local-delete workers or
+// the Raft callback and queue work instead of writing through to SQLite.
 type TierRecorder interface {
 	// RecordReplicatedFile reports a file pulled from a peer and kept, which
 	// is now on this node's hot storage.
@@ -61,6 +62,11 @@ type TierRecorder interface {
 	// may come from an operator and so is a hint rather than proof of what
 	// happened to the file.
 	RecordUnlinkedFile(path, reason string, sizeBytes int64)
+	// RecordManifestUnlinkedFile reports a manifest delete on a shared object
+	// store that may be a migration (sharedDeleteChangesTier): this node
+	// unlinks nothing, but its tier rows must learn the cold copy. Its size is
+	// not available at the callback boundary.
+	RecordManifestUnlinkedFile(path, reason string)
 	// RecordMissingFile reports a path that left the manifest while this
 	// node no longer had the file (its own compaction or retention removed
 	// it first): a hot row it still holds for the path is stale (#1271).
@@ -85,6 +91,16 @@ var deleteStopDrainBound = 10 * time.Second
 const deletePendingWarnAt = 10_000
 
 type Coordinator struct {
+	// open is what reads must leave out while a compaction's output and
+	// inputs are both readable (open_compactions.go).
+	open openState
+	// retiredJournal caches the DELETE journal for adoption (manifest_repair.go).
+	retiredJournal struct {
+		mu    sync.Mutex
+		at    time.Time
+		paths map[string]bool
+		known bool
+	}
 	cfg           *config.ClusterConfig
 	licenseClient *license.Client
 	registry      *Registry
@@ -146,6 +162,17 @@ type Coordinator struct {
 	streamClaimsBlockers atomic.Pointer[[]string]
 	// compactionCommit: the #1207 d2 flag's join gate and blockers.
 	compactionCommit compactionCommitGate
+	// clusterPolicies: the #1324 flag's join gate and blockers;
+	// policyListers read this node's own rows of each kind for adoption.
+	clusterPolicies clusterPoliciesGate
+	// retentionPolicies: the same for retention's own flag (#1324 stage 2).
+	retentionPolicies clusterPoliciesGate
+	// cqPolicies: the same for the continuous query flag (#1324 stage 3).
+	cqPolicies clusterPoliciesGate
+	// adoptMu serializes adoption passes: the loop's and an admin's nudge.
+	adoptMu         sync.Mutex
+	policyListersMu sync.Mutex
+	policyListers   map[string]LocalPolicyLister
 	// staged: the staged compaction commit, replica side (#1207 d2a2a).
 	staged               stagedReplica
 	repair               manifestRepairState // shared object store manifest repair (#1207)
@@ -194,15 +221,27 @@ type Coordinator struct {
 	// at most the manifest churn of the time the workers are stuck; the
 	// Warn at deletePendingWarnAt makes that visible. deleteWake (one slot)
 	// nudges a parked worker; deleteStop, closed by Stop, is the only way a
-	// worker exits, so a stop drains everything that is pending.
+	// worker exits, so a stop drains everything that is pending (a DELETE
+	// rewrite's old file waiting for its rewrite is not pending: it stays on
+	// disk and the next start re-derives it from the stale-local journal,
+	// without which nothing waits, rewrite_unlink.go).
 	// deleteInFlight counts the entries a worker has taken and not yet
 	// unlinked, so the gauge and the stop-bound Error report what is still
 	// on disk, not just what is still untaken.
 	deletePending   []deleteRequest
 	deletePendingMu sync.Mutex
 	deleteInFlight  atomic.Int64
-	deleteWake      chan struct{}
-	deleteStop      chan struct{}
+	// deferred: unlinks of a DELETE rewrite's old file waiting for the
+	// rewrite to arrive (rewrite_unlink.go), under deletePendingMu.
+	deferred deferredUnlinks
+	// deleteStopping: the workers are draining; nothing is deferred (a
+	// rewrite's old file whose rewrite is not here is kept on disk instead).
+	deleteStopping atomic.Bool
+	// deferredLoggedAt rate-limits the long-deferred summary, under
+	// deletePendingMu.
+	deferredLoggedAt time.Time
+	deleteWake       chan struct{}
+	deleteStop       chan struct{}
 	// deleteWg is per Start: Stop's wait is bounded, and a WaitGroup that a
 	// later Start reused while that wait was still parked would panic.
 	deleteWg *sync.WaitGroup
@@ -748,23 +787,14 @@ func (c *Coordinator) Start() error {
 		go c.ackCompactionPauseIfActive()
 	}
 
-	// Wire the peer file replication puller (Enterprise Phase 2). This runs
-	// on every cluster node (not just readers) because nodes of any role may
-	// need to pull files they didn't originate — the Raft manifest is the
-	// source of truth for who has what, regardless of role.
-	//
-	// Gated on ReplicationEnabled so OSS and standalone deployments never
-	// pay any cost. The FeatureClustering license check already ran in
+	// Wire what this node does on manifest changes: the peer file
+	// replication puller (Enterprise Phase 2) when ReplicationEnabled — on
+	// every role, since any node may need files it didn't originate — and
+	// otherwise, on a shared object store, the delete-only callbacks every
+	// such node needs (#1354). OSS and standalone never reach this. The
+	// FeatureClustering license check already ran in
 	// validateClusteringLicense above.
-	if c.cfg.ReplicationEnabled && c.raftNode != nil {
-		if err := c.startFilePullerLocked(); err != nil {
-			// Do not fail cluster startup if the puller can't start —
-			// replication is best-effort and the rest of the cluster can
-			// still make progress. The cause is logged; operators can
-			// correct config and restart.
-			c.logger.Error().Err(err).Msg("Failed to start peer file puller — continuing without peer replication")
-		}
-	}
+	c.startManifestCallbacksLocked()
 
 	// Start listening for peer connections if we have a coordinator address
 	if c.cfg.CoordinatorAddr != "" {
@@ -799,6 +829,7 @@ func (c *Coordinator) Start() error {
 	}
 	if c.raftNode != nil {
 		go c.compactionCommitEnableLoop(c.ctx)
+		go c.clusterPoliciesEnableLoop(c.ctx)
 	}
 	// The staged compaction commit on an object store (#1207 d2a2b): the
 	// leader aborts jobs of a compactor that is gone, and committed jobs are
@@ -1122,6 +1153,12 @@ func (c *Coordinator) startDeleteWorkers() {
 	c.deletePendingMu.Unlock()
 	c.deleteStop = stop
 	c.deleteWg = wg
+	c.deleteStopping.Store(false)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.sweepDeferredUnlinks(stop)
+	}()
 	for i := 0; i < deleteWorkerCount; i++ {
 		wg.Add(1)
 		go c.runDeleteWorker(stop, wake, wg, relisted)
@@ -1135,6 +1172,9 @@ func (c *Coordinator) startDeleteWorkers() {
 // when the disk itself is not answering. The waiting goroutine and the
 // stuck worker outlive the return until that Delete comes back.
 func (c *Coordinator) stopDeleteWorkers(stop chan struct{}, wg *sync.WaitGroup) {
+	// The drain unlinks what is pending and defers nothing; deferred copies
+	// stay on disk and the next start re-derives them (rewrite_unlink.go).
+	c.deleteStopping.Store(true)
 	close(stop)
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -1227,6 +1267,8 @@ func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
 // tiering, so this return value is what distinguishes the two.
 func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
 	c.noteLocalRegistered(path)
+	// A DELETE rewrite landing lets its old file's unlink go ahead.
+	c.wakeDeferredFamily(path)
 	r := c.tierRecorderSnapshot()
 	if r == nil {
 		return false
@@ -1242,12 +1284,109 @@ func (c *Coordinator) recordUnlinkedFileInTiering(path, reason string, sizeBytes
 	}
 }
 
+func (c *Coordinator) recordManifestUnlinkedFileInTiering(path, reason string) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordManifestUnlinkedFile(path, reason)
+	}
+}
+
 // tierReasonAbandonedPull is the reason reported for a copy the puller removed
 // because its path left the manifest while the pull was in transit. The puller
 // never learns the manifest delete's own reason, so the recorder treats this
 // one as possibly a migration. Shared literal with
 // tiering.unlinkReasonAbandonedPull; the packages do not import each other.
 const tierReasonAbandonedPull = "replication:abandoned"
+
+// startManifestCallbacksLocked wires what this node does when the manifest
+// changes: the peer file puller when replication is on (it registers the FSM
+// file callbacks itself), and otherwise, on a shared object store, the
+// delete-only callbacks every such node needs. Split out of Start so a test
+// drives the same decision Start makes.
+func (c *Coordinator) startManifestCallbacksLocked() {
+	if c.cfg.ReplicationEnabled && c.raftNode != nil {
+		if err := c.startFilePullerLocked(); err != nil {
+			// Do not fail cluster startup if the puller can't start —
+			// replication is best-effort and the rest of the cluster can
+			// still make progress. The cause is logged; operators can
+			// correct config and restart.
+			c.logger.Error().Err(err).Msg("Failed to start peer file puller — continuing without peer replication")
+		} else {
+			return
+		}
+	}
+	// A shared object store needs no puller (shared-storage deployments run
+	// with replication off: the Helm chart sets it), but every node still has
+	// to hear the manifest's deletes: tiering's cold rows (#1349) and a DELETE
+	// rewrite's old file left out of reads (#1348) are per-node state. Both
+	// used to live only in the puller's callback, so they never ran there.
+	c.startSharedManifestCallbacks()
+}
+
+// startSharedManifestCallbacks registers the FSM file callbacks a
+// shared-object-store node needs when the puller, which registers its own,
+// is not running. Nothing for local storage: without replication no node
+// reads another's disk. Raft is already running, so a delete applied during
+// startup replay can precede this; the startup tier scan's cold sync covers
+// the tier rows, and a read leaves a rewrite's old file in until then, which
+// over-counts rather than drops.
+func (c *Coordinator) startSharedManifestCallbacks() {
+	if c.raftNode == nil || c.storage == nil || c.storage.Type() == "local" {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return
+	}
+	// A path the manifest lists again is no longer a pending delete here.
+	fsm.SetFileCallbacks(func(entry *raft.FileEntry) {
+		c.forgetLocalDeleted(entry.Path)
+	}, c.observeSharedManifestDelete)
+	c.logger.Info().Str("backend", c.storage.Type()).
+		Msg("Shared-storage manifest delete callback registered (no peer puller)")
+}
+
+// observeSharedManifestDelete is the work a node on a shared object store
+// does for a manifest delete. It unlinks nothing: the object is shared, and
+// whoever proposed the delete removes it. Runs on the Raft apply path and
+// from a snapshot Restore, so it must not block: both calls are map work or a
+// non-blocking enqueue.
+func (c *Coordinator) observeSharedManifestDelete(path, reason string) {
+	// A migration changes this node's tier metadata although it unlinks
+	// nothing here: the hot object is going, and the cold copy must now be
+	// read here too (#1349).
+	if sharedDeleteChangesTier(reason) {
+		c.recordManifestUnlinkedFileInTiering(path, reason)
+	}
+	// Every node reads the shared object, so every node leaves a DELETE
+	// rewrite's old file out of reads once its rewrite is there
+	// (open_compactions.go), until the handler removes it. Only that reason:
+	// others are removed at once, by their caller.
+	if reason == deleteRewriteReason {
+		c.noteLocalDeleted(path, reason)
+	}
+	c.logger.Debug().
+		Str("path", path).
+		Str("reason", reason).
+		Str("backend", c.storage.Type()).
+		Msg("FSM delete observed; shared backend, no local action needed")
+}
+
+// tierReasonPrefix starts every reason tiering itself proposes. Shared
+// literal with tiering.manifestReasonPrefix; the packages do not import each
+// other.
+const tierReasonPrefix = "tiering:"
+
+// sharedDeleteChangesTier reports a manifest delete that a node on a shared
+// object store must tell tiering about although it unlinks nothing: a
+// tiering reason (the hot object is released and the cold copy is now the
+// one to read), or a snapshot restore dropping a path the cluster deleted
+// while this node was away, for a reason the snapshot does not carry — a
+// migration among them (#962, #1349). The recorder asks the cold tier before
+// recording anything. The same set as tiering's reasonMayBeMigration, less
+// the two reasons only the local-storage puller and stale-local sweep send.
+func sharedDeleteChangesTier(reason string) bool {
+	return strings.HasPrefix(reason, tierReasonPrefix) || reason == raft.UnlinkReasonSnapshotRemoved
+}
 
 // recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
 func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
@@ -1307,6 +1446,11 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			c.logKeptRelistedPath(item, refresh)
 			return
 		}
+	}
+	// A DELETE rewrite's old file stays until its rewrite is here, or this
+	// node would read neither (rewrite_unlink.go).
+	if c.deferRewriteUnlink(context.Background(), item) {
+		return
 	}
 	// A compaction input stays readable until this node's staged copy of
 	// the output is in place (#1207 d2a2a; bounded).
@@ -1954,6 +2098,9 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 	case protocol.MsgFlushScopeRequest:
 		c.handleFlushScopeRequest(conn, msg.Payload.(*protocol.FlushScopeRequest))
 
+	case protocol.MsgLocalPoliciesQuery:
+		c.handleLocalPoliciesQuery(conn, msg.Payload.(*protocol.LocalPoliciesQuery))
+
 	case protocol.MsgFetchFile:
 		// The fetch handler streams the body for the lifetime of the
 		// response and closes the connection itself via defer. Hand off
@@ -2155,10 +2302,20 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, ccWhy)
 			return
 		}
+		cpWhy, cpRelease := c.clusterPoliciesJoinGate(req)
+		if cpWhy != "" {
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", cpWhy).
+				Msg("Join refused: the node does not support cluster policies")
+			c.sendJoinError(conn, req, cpWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				cpRelease()
 				ccRelease()
 				release()
 			}
@@ -3046,6 +3203,7 @@ func (c *Coordinator) Status() map[string]interface{} {
 	if c.raftNode != nil {
 		status["stream_claims"] = c.StreamClaimsStatus()
 		status["compaction_commit"] = c.CompactionCommitStatus()
+		status["cluster_policies"] = c.ClusterPoliciesStatus()
 	}
 	// The stale-local sweep's last pass (#1071), where it runs.
 	if st := c.StaleLocalStatus(); st != nil {
@@ -4172,6 +4330,13 @@ func (c *Coordinator) GetActiveCompactorID() string {
 	return c.raftFSM.GetActiveCompactorID()
 }
 
+// HasCompactorFailover reports whether this node runs the compactor failover
+// manager. Without it nothing assigns a first compactor lease or moves one
+// off a failed node; a lease already in the FSM stays where it is.
+func (c *Coordinator) HasCompactorFailover() bool {
+	return c.compactorFailoverMgr != nil
+}
+
 // CompactorPreemptCooldown reports how long an operator assignment of the
 // compactor lease suppresses automatic preemption. Zero when this cluster has
 // no compactor failover manager, in which case nothing preempts anyway.
@@ -4389,10 +4554,14 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
 		c.noteLocalRegistered(entry.Path)
+		c.forgetLocalDeleted(entry.Path)
+		c.dropDeferred(entry.Path)
 	}
 	onContentChanged := func(entry *raft.FileEntry) {
 		puller.EnqueueContentChanged(entry)
 		c.noteLocalRegistered(entry.Path)
+		c.forgetLocalDeleted(entry.Path)
+		c.dropDeferred(entry.Path)
 	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
@@ -4400,7 +4569,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// the snapshot dropped (#962). It MUST NOT block. It hands the path to
 		// the delete-worker pool, which waits a short grace period so
 		// in-flight queries scanning the old file can finish and then calls
-		// backend.Delete. On non-local backends (S3, Azure) the compactor
+		// backend.Delete. On non-local backends (S3, Azure, GCS) the compactor
 		// that issued DeleteFile has already removed the shared object, so
 		// there is no local-side action.
 		//
@@ -4411,15 +4580,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// the puller's own lock; puller is non-nil by construction above.
 		puller.OnManifestDelete(path)
 
-		// Local backends need an actual local unlink; shared backends
-		// don't — they're already deleted cluster-wide by the compactor's
-		// StorageBackend.Delete in deleteOldFiles.
+		// Local backends need an actual local unlink; shared backends are
+		// already deleted cluster-wide by StorageBackend.Delete in
+		// deleteOldFiles, and only need the bookkeeping every shared-store
+		// node does with or without the puller.
 		if backend.Type() != "local" {
-			c.logger.Debug().
-				Str("path", path).
-				Str("reason", reason).
-				Str("backend", backend.Type()).
-				Msg("FSM delete observed; shared backend, no local action needed")
+			c.observeSharedManifestDelete(path, reason)
 			return
 		}
 		// Hand it to the delete workers. Unlike the puller's Enqueue, this
@@ -4427,7 +4593,13 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// catch-up walk, but a local delete that is dropped is a replica
 		// the manifest no longer lists and nothing walks — it stayed on
 		// disk forever, and every read here read the file twice.
+		// Until the unlink, reads leave the copy out once that is safe
+		// (open_compactions.go).
+		c.noteLocalDeleted(path, reason)
 		c.enqueueLocalDelete(path, reason)
+		// A rewrite leaving the manifest (compacted, removed) lets the
+		// unlinks waiting for it go ahead (rewrite_unlink.go).
+		c.wakeDeferredFamilyAsync(path)
 	}
 
 	// The content-change callback goes in first: the FSM fires it right after
@@ -4777,6 +4949,14 @@ func (c *Coordinator) LocalNodeID() string {
 		return ""
 	}
 	return c.localNode.ID
+}
+
+// LeaderID returns the current Raft leader's node ID, empty when unknown.
+func (c *Coordinator) LeaderID() string {
+	if c == nil || c.raftNode == nil {
+		return ""
+	}
+	return c.raftNode.LeaderID()
 }
 
 // LeaderAddr returns the address of the current Raft leader.
@@ -5295,6 +5475,34 @@ func (c *Coordinator) SyncManifest(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	return c.waitForManifestSync(ctx, c.raftNode, timeout)
+}
+
+// SyncManifestWithin is SyncManifest with the caller's budget instead of
+// replication.catch_up_barrier_timeout_ms. The auth reconcile (#1336) retries
+// until it syncs, so a barrier budget an operator tuned down for catch-up
+// must not be able to keep it from ever succeeding.
+func (c *Coordinator) SyncManifestWithin(ctx context.Context, timeout time.Duration) error {
+	if c.raftNode == nil {
+		return errors.New("raft not available")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.waitForManifestSync(ctx, c.raftNode, timeout)
+}
+
+// RaftTerm is the current Raft term, 0 when Raft is not running. A term
+// never decreases within one Raft history, which is what lets the auth
+// reconcile tell a rebuilt cluster from the one it last saw (#1336).
+func (c *Coordinator) RaftTerm() uint64 {
+	if c.raftNode == nil {
+		return 0
+	}
+	term, err := strconv.ParseUint(c.raftNode.Stats()["term"], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return term
 }
 
 // IsTransientLeaderError reports whether a manifest apply failed only because

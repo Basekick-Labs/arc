@@ -529,7 +529,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+		return c.Status(transformErrorStatus(err)).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
 		})
@@ -624,11 +624,27 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
-	// Match the JSON query contract: a data glob with no matches is an empty
-	// result, not a failed query. Keep missing schema anchors as errors because
-	// they invalidate the cached SQL transform.
-	if err != nil && ctx.Err() == nil && isNoFilesFoundError(err) && !h.missingAnchor(err) {
-		reader, err = array.NewRecordReader(arrow.NewSchema([]arrow.Field{}, nil), nil)
+	// Match the JSON query contract (classifyNoFiles): a measurement with no
+	// data yet is an empty result; a partition removed mid-query is a
+	// retryable 503; a missing schema anchor stays an error.
+	if err != nil && ctx.Err() == nil {
+		switch h.classifyNoFiles(err) {
+		case noFilesEmpty:
+			reader, err = array.NewRecordReader(arrow.NewSchema([]arrow.Field{}, nil), nil)
+		case noFilesVanished:
+			if cancel != nil {
+				cancel()
+			}
+			m.IncQueryErrors()
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   vanishedPartitionMessage,
+			})
+		}
 	}
 	if err != nil {
 		// Read the cause before releasing the context: cancel() below turns
