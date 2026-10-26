@@ -63,8 +63,20 @@ jobs:
       - name: Vet
         run: go vet -tags=duckdb_arrow ./...
 
+      # -timeout is per package binary; Go's default is 10 minutes, and
+      # internal/cluster alone takes about 520 s under -race on these
+      # runners (650 s on a laptop). A package that hits the default panics
+      # with a goroutine dump that reads like a hang, not a slow suite.
+      # The extensions database.extensions accepts, from the same seed the
+      # image uses; ARC_TEST_EXTENSIONS=1 makes a test that needs one fail
+      # rather than skip when it is missing (#440).
+      - name: Seed DuckDB extensions
+        run: go run -tags=duckdb_arrow ./scripts/duckdbseed
+
       - name: Test (race)
-        run: go test -tags=duckdb_arrow -race ./...
+        env:
+          ARC_TEST_EXTENSIONS: "1"
+        run: go test -tags=duckdb_arrow -race -timeout 30m ./...
 
       # The storage key contract (#743) is a property of real object stores,
       # not of a mock: the behaviours that motivated it (MinIO folding a
@@ -153,26 +165,27 @@ jobs:
         if: always()
         run: docker rm -f arc-ci-seaweedfs || true
 
-      # fasthttp runs body-stream writers on a bare goroutine with no recovery,
-      # so a panic in one crashes the process rather than failing the request
-      # (#717). Every writer must go through QueryHandler.safeStream, including
-      # the three in arcx_hook.go: that file builds only under the arcx_engine
-      # tag, which no CI or release build uses, so this grep is the only
-      # automated check those writers get.
-      #
-      # NewStreamReader is matched as well as the two setters (#729): it is what
-      # actually spawns the bare goroutine, so SetBodyStream around a raw
-      # NewStreamReader would bypass safeStream while satisfying a setter-only
-      # pattern. Comment lines are dropped so prose describing the API does not
-      # trip the check.
+      # Every response body stream in internal/api is installed by
+      # setDirectBodyStream (stream_direct.go), which wraps the writer in
+      # QueryHandler.safeStream (#717) and runs it on the connection goroutine.
+      # SetBodyStreamWriter and NewStreamReader would bring back the pipe and
+      # the bare goroutine; a SetBodyStream anywhere else could skip safeStream.
+      # That includes arcx_hook.go: it builds only under the arcx_engine tag,
+      # which no CI or release build uses, so this grep is the only automated
+      # check its writers get. Comment lines are dropped so prose describing
+      # the API does not trip the check.
       - name: Body-stream writers are panic-safe
         run: |
-          unwrapped=$(grep -rnE "SetBodyStream(Writer)?\(|NewStreamReader\(" internal/api/*.go \
+          code=$(grep -rnE "SetBodyStream(Writer)?\(|NewStreamReader\(" internal/api/*.go \
             | grep -v "_test.go" \
-            | grep -vE ":[0-9]+:[[:space:]]*//" \
-            | grep -v "safeStream(" || true)
-          if [ -n "$unwrapped" ]; then
-            echo "These body-stream writers bypass safeStream, so a panic in them would crash the process:"
+            | grep -vE ":[0-9]+:[[:space:]]*//" || true)
+          bad=$(echo "$code" | grep -E "SetBodyStreamWriter\(|NewStreamReader\(" || true)
+          outside=$(echo "$code" | grep "SetBodyStream(" | grep -v "^internal/api/stream_direct.go:" || true)
+          unwrapped=$(echo "$code" | grep "SetBodyStream(" | grep -v "safeStream(" || true)
+          if [ -n "$bad$outside$unwrapped" ]; then
+            echo "Body streams must be installed through setDirectBodyStream (stream_direct.go), which applies safeStream:"
+            echo "$bad"
+            echo "$outside"
             echo "$unwrapped"
             exit 1
           fi
@@ -198,6 +211,9 @@ jobs:
 
       - name: Enterprise chart refuses a short bootstrap token
         run: bash scripts/test_enterprise_bootstrap_token.sh helm/arc-enterprise
+
+      - name: Enterprise chart deploys shared storage on GCS
+        run: bash scripts/test_enterprise_gcs_storage.sh helm/arc-enterprise
 
       # Every Arc pod joins Raft, whatever its role. A role whose pod has no
       # advertisable Raft address falls back to standalone mode and is

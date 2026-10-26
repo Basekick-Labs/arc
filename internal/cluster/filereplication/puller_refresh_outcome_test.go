@@ -141,9 +141,14 @@ func TestVerifyRefreshSkipsTheDownloadOnlyWhenTheLocalCopyMatches(t *testing.T) 
 			if got != RefreshQueued {
 				t.Fatalf("outcome = %v, want queued", got)
 			}
-			stats := waitStats(t, p, func(s map[string]int64) bool {
+			waitStats(t, p, func(s map[string]int64) bool {
 				return settled(s) && s["pulled"]+s["refresh_verified"] >= 1
 			})
+			// Stats loads each counter on its own, forced_refresh before
+			// pulled and inflight_count, so the snapshot that settled can
+			// predate the forced_refresh bump. Every counter is bumped before
+			// the entry leaves inflight: a snapshot taken now is complete.
+			stats := p.Stats()
 			if n := fetcher.calls.Load(); n != tc.wantFetches {
 				t.Fatalf("fetches = %d, want %d; stats=%v", n, tc.wantFetches, stats)
 			}

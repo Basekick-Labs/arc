@@ -154,6 +154,9 @@ type Job struct {
 	staged bool
 	inputs map[string]StagedInput
 
+	// outputName, when set, is the output file name the parent chose.
+	outputName string
+
 	// OutputStorageKey is the storage-relative key of the compacted output,
 	// set once the output name is fixed (before upload). Empty for jobs that
 	// produce no output (all sources vanished, or no time column).
@@ -211,6 +214,9 @@ type JobConfig struct {
 	// describes every file of Files as the cluster manifest lists it.
 	Staged bool
 	Inputs map[string]StagedInput
+	// OutputName is the output file name the parent chose (OpenJobs);
+	// empty names it here, as before.
+	OutputName string
 
 	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
 	// so the parent (which spawns the subprocess) and the subprocess agree
@@ -270,6 +276,7 @@ func NewJob(cfg *JobConfig) *Job {
 		logger:                  cfg.Logger.With().Str("job_id", jobID).Logger(),
 		db:                      cfg.DB,
 		manifestManager:         cfg.ManifestManager,
+		outputName:              cfg.OutputName,
 	}
 }
 
@@ -302,7 +309,8 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Phase 4: write an initial completion manifest in writing_output state.
 	// This marks the job as in-progress so CleanupOrphanedCompletionManifests
-	// can sweep it if the subprocess crashes before reaching output_written.
+	// can sweep it if the subprocess crashes before reaching output_written;
+	// the parent also drops it once this process exits (#1343).
 	if j.clusterMode() {
 		m := &CompletionManifest{
 			JobID:         j.JobID,
@@ -743,14 +751,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// on the clock alone. The uploaded storage key derives from this basename
 	// (see Job.Run), so a collision here would silently overwrite a sibling
 	// batch's compacted output.
-	now := storage.NameTime(time.Now())
-	timestamp := now.Format("20060102_150405")
-	suffix := "compacted"
-	if j.Tier != "hourly" {
-		suffix = j.Tier
-	}
-	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%d_b%d_%s.parquet",
-		j.Measurement, timestamp, now.UnixNano(), j.BatchNumber, suffix))
+	outputFile := filepath.Join(tempDir, j.outputFileName())
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
@@ -1270,13 +1271,9 @@ func (j *Job) complete() error {
 		compressionRatio = (1 - float64(j.BytesAfter)/float64(j.BytesBefore)) * 100
 	}
 
-	// Record metrics
-	m := metrics.Get()
-	m.IncCompactionJobs()
-	m.IncCompactionSuccess()
-	m.IncCompactionFilesCompacted(int64(j.FilesCompacted))
-	m.IncCompactionBytesRead(j.BytesBefore)
-	m.IncCompactionBytesWritten(j.BytesAfter)
+	// No metrics here: a Job runs only in the compaction subprocess, whose
+	// registry nothing scrapes. The parent counts the outcome from the
+	// result (Manager.compactPartition, #1343).
 
 	j.logger.Info().
 		Int("files_compacted", j.FilesCompacted).
@@ -1303,10 +1300,7 @@ func (j *Job) fail(err error) error {
 		j.DurationSeconds = now.Sub(*j.StartedAt).Seconds()
 	}
 
-	// Record metrics
-	m := metrics.Get()
-	m.IncCompactionJobs()
-	m.IncCompactionFailed()
+	// Counted by the parent from the result; see complete (#1343).
 
 	j.logger.Error().Err(err).Msg("Compaction job failed")
 
@@ -1433,4 +1427,26 @@ func canonicalManifestDatabase(database string) string {
 		return rest
 	}
 	return database
+}
+
+// CompactionOutputName is a compaction output's file name:
+// {measurement}_{YYYYMMDD}_{HHMMSS}_{unixnano}_b{batch}_{suffix}.parquet, the
+// suffix "compacted" for the hourly tier and the tier name otherwise.
+func CompactionOutputName(measurement, tier string, batch int, at time.Time) string {
+	now := storage.NameTime(at)
+	suffix := "compacted"
+	if tier != "hourly" {
+		suffix = tier
+	}
+	return fmt.Sprintf("%s_%s_%d_b%d_%s.parquet",
+		measurement, now.Format("20060102_150405"), now.UnixNano(), batch, suffix)
+}
+
+// outputFileName is the output's file name: the parent's choice when it made
+// one (OpenJobs registered it), else named here.
+func (j *Job) outputFileName() string {
+	if j.outputName != "" {
+		return j.outputName
+	}
+	return CompactionOutputName(j.Measurement, j.Tier, j.BatchNumber, time.Now())
 }

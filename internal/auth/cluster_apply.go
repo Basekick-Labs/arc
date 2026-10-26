@@ -45,10 +45,12 @@ func (am *AuthManager) getProposer() RaftProposer {
 // onTokenXxx callback on the leader; follower applies happen
 // asynchronously within the usual <50ms Raft replication window).
 //
-// On the proposer node itself (whether leader or follower), the
-// callback has already fired by the time this returns — so the local
-// SQLite materialise is done. The caller can rely on a subsequent
-// VerifyToken on this node seeing the new state.
+// On the leader the callback has fired by the time this returns, so the
+// local SQLite materialise is done. A follower forwards to the leader, whose
+// ack used to arrive before the follower's own FSM applied the command; the
+// proposer now waits for that apply here, once cluster policies are enabled
+// (every node then reports the index, #1324). Before that, a VerifyToken on
+// a follower right after its own write may briefly miss it.
 func (am *AuthManager) proposeCommand(ctx context.Context, cmdType uint8, payload interface{}) error {
 	p := am.getProposer()
 	if p == nil {
@@ -182,6 +184,11 @@ func (am *AuthManager) ApplyCreateToken(entry ClusterTokenEntry) error {
 		// (Log replay re-applies the same CommandCreateToken when the
 		// FSM snapshot is older than the last applied index.)
 		if existingHash == entry.TokenHash && existingName == entry.Name {
+			// The row is this token: mark it as the cluster's, so later
+			// applies and the reconcile may change it (#1336).
+			if _, err := am.db.Exec(`UPDATE api_tokens SET raft_materialised = 1 WHERE id = ?`, entry.ID); err != nil {
+				return am.invalidateAndReturn(fmt.Errorf("ApplyCreateToken: mark id %d: %w", entry.ID, err))
+			}
 			return am.invalidateAndReturn(nil)
 		}
 		// Divergence: pre-existing local row at this ID has different
@@ -200,8 +207,8 @@ func (am *AuthManager) ApplyCreateToken(entry ClusterTokenEntry) error {
 
 	if _, insertErr := am.db.Exec(`
 		INSERT INTO api_tokens
-			(id, name, token_hash, token_prefix, description, permissions, created_at, expires_at, enabled)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(id, name, token_hash, token_prefix, description, permissions, created_at, expires_at, enabled, raft_materialised)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 	`, entry.ID, entry.Name, entry.TokenHash, entry.TokenPrefix, entry.Description, entry.Permissions, createdAt, expiresAt, enabled); insertErr != nil {
 		// A name-collision (UNIQUE(name) constraint) here would mean
 		// the cluster applied a Raft-stamped row whose name conflicts
@@ -230,7 +237,7 @@ func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
 	result, err := am.db.Exec(`
 		UPDATE api_tokens
 		SET name = ?, description = ?, permissions = ?, expires_at = ?
-		WHERE id = ?
+		WHERE id = ? AND raft_materialised = 1
 	`, entry.Name, entry.Description, entry.Permissions, expiresAt, entry.ID)
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateToken: %w", err)
@@ -250,7 +257,7 @@ func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
 		am.logger.Error().
 			Int64("token_id", entry.ID).
 			Str("name", entry.Name).
-			Msg("ApplyUpdateToken: local SQLite row missing — cluster FSM<->local cache divergence")
+			Msg("ApplyUpdateToken: local SQLite row missing or not cluster-materialised — cluster FSM<->local cache divergence")
 		return am.invalidateAndReturn(fmt.Errorf("ApplyUpdateToken: id %d not present in local SQLite cache (cluster<->local divergence)", entry.ID))
 	}
 	return am.invalidateAndReturn(nil)
@@ -267,7 +274,7 @@ func (am *AuthManager) ApplyRevokeToken(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyRevokeToken: id required")
 	}
-	result, err := am.db.Exec("UPDATE api_tokens SET enabled = 0 WHERE id = ?", id)
+	result, err := am.db.Exec("UPDATE api_tokens SET enabled = 0 WHERE id = ? AND raft_materialised = 1", id)
 	if err != nil {
 		return fmt.Errorf("ApplyRevokeToken: %w", err)
 	}
@@ -278,7 +285,7 @@ func (am *AuthManager) ApplyRevokeToken(id int64) error {
 	if rows == 0 {
 		am.logger.Error().
 			Int64("token_id", id).
-			Msg("ApplyRevokeToken: local SQLite row missing — cluster<->local divergence; the token may still authenticate against this node's stale cache")
+			Msg("ApplyRevokeToken: local SQLite row missing or not cluster-materialised — cluster<->local divergence; the token may still authenticate against this node's stale cache")
 		return am.invalidateAndReturn(fmt.Errorf("ApplyRevokeToken: id %d not present in local SQLite cache (cluster<->local divergence)", id))
 	}
 	return am.invalidateAndReturn(nil)
@@ -296,7 +303,7 @@ func (am *AuthManager) ApplyDeleteToken(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteToken: id required")
 	}
-	result, err := am.db.Exec("DELETE FROM api_tokens WHERE id = ?", id)
+	result, err := am.db.Exec("DELETE FROM api_tokens WHERE id = ? AND raft_materialised = 1", id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteToken: %w", err)
 	}
@@ -307,7 +314,7 @@ func (am *AuthManager) ApplyDeleteToken(id int64) error {
 	if rows == 0 {
 		am.logger.Warn().
 			Int64("token_id", id).
-			Msg("ApplyDeleteToken: local SQLite row already missing — cluster<->local divergence (post-state matches, no error)")
+			Msg("ApplyDeleteToken: no cluster-materialised row at this id — already missing, or a local row the cluster does not own, which is left in place (#1336)")
 	}
 	return am.invalidateAndReturn(nil)
 }
@@ -325,7 +332,7 @@ func (am *AuthManager) ApplyRotateToken(id int64, newHash, newPrefix string) err
 	if newHash == "" || newPrefix == "" {
 		return fmt.Errorf("ApplyRotateToken: new_hash and new_prefix required")
 	}
-	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ?", newHash, newPrefix, id)
+	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ? AND raft_materialised = 1", newHash, newPrefix, id)
 	if err != nil {
 		return fmt.Errorf("ApplyRotateToken: %w", err)
 	}
@@ -336,7 +343,7 @@ func (am *AuthManager) ApplyRotateToken(id int64, newHash, newPrefix string) err
 	if rows == 0 {
 		am.logger.Error().
 			Int64("token_id", id).
-			Msg("ApplyRotateToken: local SQLite row missing — cluster<->local divergence; the OLD token may keep authenticating against this node until its cache entry expires")
+			Msg("ApplyRotateToken: local SQLite row missing or not cluster-materialised — cluster<->local divergence; the OLD token may keep authenticating against this node until its cache entry expires")
 		return am.invalidateAndReturn(fmt.Errorf("ApplyRotateToken: id %d not present in local SQLite cache (cluster<->local divergence)", id))
 	}
 	return am.invalidateAndReturn(nil)

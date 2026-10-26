@@ -97,7 +97,8 @@ func TestGetTransformedSQLRejectsCachedPathsWithoutProvenance(t *testing.T) {
 	const query = "SELECT * FROM db1.cpu"
 	for _, metadata := range [][]string{nil, {"invalid"}, {"db1\x00"}} {
 		h := newParityTestHandler()
-		h.queryCache.SetWithMetadata(query, "SELECT * FROM read_parquet('./data/db2/secret/**/*.parquet')", metadata)
+		cacheKey := h.queryTransformCacheKey(query, "")
+		h.queryCache.SetWithMetadata(cacheKey, "SELECT * FROM read_parquet('./data/db2/secret/**/*.parquet')", metadata)
 		if _, cached, _, err := h.getTransformedSQLWithRefs(context.Background(), query, ""); err == nil || !cached {
 			t.Fatalf("metadata %q: cached=%v err=%v, want rejected cache hit", metadata, cached, err)
 		}

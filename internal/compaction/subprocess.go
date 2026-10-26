@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 
@@ -56,7 +58,7 @@ type SubprocessJobConfig struct {
 	Threads int `json:"threads,omitempty"`
 
 	// Storage configuration
-	StorageType   string `json:"storage_type"`   // Backend.Type(): "local", "s3" or "azure"
+	StorageType   string `json:"storage_type"`   // Backend.Type(): "local", "s3", "azure" or "gcs"
 	StorageConfig string `json:"storage_config"` // Backend.ConfigJSON(): no secrets
 	// Credentials authenticate the subprocess's storage backend the way the
 	// parent's was authenticated (#1104). It travels only in this job, which
@@ -85,8 +87,12 @@ type SubprocessJobConfig struct {
 	// not a user-facing field — matches the plain tag on completion.go's twin.
 	PartitionTime time.Time `json:"partition_time"`
 	// Staged commit (#1207 d2a2a): see JobConfig.Staged.
-	Staged bool                   `json:"staged,omitempty"`
-	Inputs map[string]StagedInput `json:"inputs,omitempty"`
+	// OutputName is the output's file name, chosen by the parent so it can
+	// register the job (OpenJobs) before the output can exist. Empty from
+	// an older parent: the job names it as before.
+	OutputName string                 `json:"output_name,omitempty"`
+	Staged     bool                   `json:"staged,omitempty"`
+	Inputs     map[string]StagedInput `json:"inputs,omitempty"`
 }
 
 // SubprocessJobResult is returned by the subprocess via stdout as JSON.
@@ -107,6 +113,18 @@ type SubprocessJobResult struct {
 	// left in place under ParentFinalizesManifest; empty otherwise. The
 	// parent deletes it after receipt marking commits.
 	ManifestPath string `json:"manifest_path,omitempty"`
+	// SourcesDeleted: every consumed input was deleted. Until then queries
+	// must not read the output and the inputs together (OpenJobs). False
+	// from an older subprocess, which keeps the parent's entry until the
+	// manifest is gone.
+	SourcesDeleted bool `json:"sources_deleted,omitempty"`
+	// Metrics are the counters this subprocess moved in its own registry
+	// (metrics.ChildCounters: storage reads, writes, bytes, errors), which
+	// nothing scrapes; the parent adds them to its own (#1343). The parent
+	// may run another binary version (subprocess.go starts os.Executable()):
+	// an older child sends none, and a key the parent does not know is
+	// ignored.
+	Metrics map[string]int64 `json:"metrics,omitempty"`
 }
 
 // SubprocessCredentials are the storage secrets a compaction subprocess needs
@@ -120,6 +138,12 @@ type SubprocessCredentials struct {
 	AzureAccountKey         string `json:"azure_account_key,omitempty"`
 	AzureSASToken           string `json:"azure_sas_token,omitempty"`
 	AzureUseManagedIdentity bool   `json:"azure_use_managed_identity,omitempty"`
+
+	// GCS (#1105): a service-account key, as its contents or its path. Both
+	// empty means Application Default Credentials, which the subprocess
+	// resolves from the environment and metadata server it inherits.
+	GCSCredentialsJSON string `json:"gcs_credentials_json,omitempty"`
+	GCSCredentialsFile string `json:"gcs_credentials_file,omitempty"`
 }
 
 // String and GoString keep the secrets out of any %v, %+v or %#v that ever
@@ -144,6 +168,10 @@ func subprocessCredentials(backend storage.Backend) *SubprocessCredentials {
 		creds.AzureAccountKey = auth.AccountKey
 		creds.AzureSASToken = auth.SASToken
 		creds.AzureUseManagedIdentity = auth.UseManagedIdentity
+	case *storage.GCSBackend:
+		auth := b.Credentials()
+		creds.GCSCredentialsJSON = auth.CredentialsJSON
+		creds.GCSCredentialsFile = auth.CredentialsFile
 	}
 	return creds
 }
@@ -193,6 +221,12 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	if _, err := db.Exec("SET TimeZone='UTC'"); err != nil {
 		return nil, fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
 	}
+	// Read a GeoParquet file's geometry column as BLOB, as the query engine
+	// does (#440): with conversion on, a partition holding one such file next
+	// to Arc's BLOB files fails to compact on every cycle.
+	if err := database.DisableGeoParquetConversion(context.Background(), db); err != nil {
+		return nil, err
+	}
 
 	// Set DuckDB memory limit from config. Exceeding it makes DuckDB spill to
 	// its temp_directory (configured below) instead of OOMing the process.
@@ -239,51 +273,18 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	manifestManager := NewManifestManager(backend, logger)
 
 	// Create and run job
-	job := NewJob(&JobConfig{
-		Database:        config.Database,
-		Measurement:     config.Measurement,
-		PartitionPath:   config.PartitionPath,
-		Files:           config.Files,
-		StorageBackend:  backend,
-		Tier:            config.Tier,
-		BatchNumber:     config.BatchNumber,
-		TempDirectory:   config.TempDirectory,
-		SortKeys:        config.SortKeys,
-		Logger:          logger,
-		DB:              db,
-		ManifestManager: manifestManager,
-		// Phase 4: thread cluster-mode fields through to the job. When
-		// CompletionDir is empty (OSS / standalone), clusterMode() is
-		// false and the completion-manifest writes are no-ops.
-		JobID:                   config.JobID,
-		CompletionDir:           config.CompletionDir,
-		PartitionTime:           config.PartitionTime,
-		ParentFinalizesManifest: config.ParentFinalizesManifest,
-		Staged:                  config.Staged,
-		Inputs:                  config.Inputs,
-	})
+	job := NewJob(subprocessJobConfig(config, backend, logger, db, manifestManager))
 
-	// Use signal-aware context so the subprocess can cancel DuckDB queries
-	// when the parent kills it via SIGTERM (from exec.CommandContext).
+	// Signal-aware, so the subprocess can cancel DuckDB queries on SIGTERM or
+	// SIGINT sent to it directly: a service manager stopping the whole
+	// process group (systemd's KillMode=control-group), or Ctrl-C in a
+	// terminal. The parent's own cancellation does not come through here:
+	// exec.CommandContext kills the child outright (SIGKILL).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	err = job.Run(ctx)
 
-	result := &SubprocessJobResult{
-		Success:        err == nil,
-		FilesCompacted: job.FilesCompacted,
-		BytesBefore:    job.BytesBefore,
-		BytesAfter:     job.BytesAfter,
-		// The storage key of the output (empty when the job produced none).
-		// The parent's compacted-output observer keys the edge sync ledger
-		// on this; the temp path would never match a storage listing.
-		OutputFile:      job.OutputStorageKey,
-		CompactedInputs: job.CompactedInputKeys(),
-		ManifestPath:    job.RetainedManifestPath(),
-	}
-	if err != nil {
-		result.Error = err.Error()
-	}
+	result := subprocessResult(job, err)
 
 	logger.Info().
 		Bool("success", result.Success).
@@ -524,9 +525,34 @@ func backendSpecFromJob(config *SubprocessJobConfig, getenv func(string) string)
 			spec.Azure.UseManagedIdentity = key == ""
 		}
 
+	case "gcs":
+		var c struct {
+			Bucket   string `json:"bucket"`
+			Prefix   string `json:"prefix"`
+			Endpoint string `json:"endpoint"`
+		}
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse GCS storage config: %w", err)
+		}
+		spec.GCS = storage.GCSConfig{
+			Bucket:   c.Bucket,
+			Prefix:   c.Prefix,
+			Endpoint: c.Endpoint,
+			// The parent probed the bucket and proved the key at startup;
+			// repeating both per job would add requests and failure points
+			// to every compaction.
+			SkipProbe: true,
+		}
+		// With neither set, the subprocess uses Application Default
+		// Credentials from the environment it inherits, as the parent did.
+		if creds != nil {
+			spec.GCS.CredentialsJSON = creds.GCSCredentialsJSON
+			spec.GCS.CredentialsFile = creds.GCSCredentialsFile
+		}
+
 	default:
 		// NewBackend accepts aliases (minio, azblob) that Backend.Type() never
-		// emits; the job only ever carries these three.
+		// emits; the job only ever carries these four.
 		return spec, fmt.Errorf("unsupported storage type: %s", config.StorageType)
 	}
 	return spec, nil
@@ -539,7 +565,7 @@ var sqlErrorMarkers = []string{"binder error", "catalog error", "parser error"}
 
 // memoryErrorMarkers indicate memory pressure; retrying with a smaller batch
 // is exactly the right response.
-var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed"}
+var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed", "bad_alloc"}
 
 // permanentErrorMarkers are failures no retry can fix: the input is gone or
 // unreadable. Both streams are searched for each one - see ClassifySubprocessError.
@@ -590,6 +616,11 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		if strings.Contains(errStr, "killed") {
 			return true, "killed"
 		}
+		// A C++ abort: DuckDB's std::bad_alloc when stderr says so (the
+		// memory markers below), otherwise an unknown crash.
+		if strings.Contains(errStr, "aborted") && !containsAny(errLower+stderrLower, memoryErrorMarkers) {
+			return true, "aborted"
+		}
 	}
 
 	// Check exit codes for OOM (137 = SIGKILL, often OOM killer)
@@ -604,6 +635,18 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 	}
 
+	// Memory errors before SQL errors: a child that died of memory (a Go
+	// runtime "out of memory", a std::bad_alloc abort) embeds its whole stderr,
+	// whose earlier warn lines may quote SQL error text, and classifying that
+	// as a permanent SQL error left a too-wide partition failing every cycle.
+	// A real SQL error arrives alone through the JSON result and carries no
+	// memory marker.
+	for _, marker := range memoryErrorMarkers {
+		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
+			return true, "memory_error"
+		}
+	}
+
 	// Deterministic DuckDB SQL errors — permanent at any batch size, so the
 	// splitter's retry ladder (each rung re-downloads the whole batch) is pure
 	// waste. These arrive via the JSON result path, so they appear in err
@@ -611,13 +654,6 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	for _, marker := range sqlErrorMarkers {
 		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
 			return false, "sql_error"
-		}
-	}
-
-	// Check for memory-related errors in either stream.
-	for _, marker := range memoryErrorMarkers {
-		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
-			return true, "memory_error"
 		}
 	}
 
@@ -637,4 +673,67 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	// Default: treat unknown errors as potentially recoverable once
 	// This allows one retry for transient issues
 	return true, "unknown"
+}
+
+// subprocessJobConfig is the Job a subprocess runs for config. Every field
+// the parent sends is carried here, OutputName included (OpenJobs relies on
+// the job writing the output under the name the parent registered).
+func subprocessJobConfig(config *SubprocessJobConfig, backend storage.Backend, logger zerolog.Logger, db *sql.DB, manifestManager *ManifestManager) *JobConfig {
+	return &JobConfig{
+		Database:        config.Database,
+		Measurement:     config.Measurement,
+		PartitionPath:   config.PartitionPath,
+		Files:           config.Files,
+		StorageBackend:  backend,
+		Tier:            config.Tier,
+		BatchNumber:     config.BatchNumber,
+		TempDirectory:   config.TempDirectory,
+		SortKeys:        config.SortKeys,
+		Logger:          logger,
+		DB:              db,
+		ManifestManager: manifestManager,
+		// Phase 4: thread cluster-mode fields through to the job. When
+		// CompletionDir is empty (OSS / standalone), clusterMode() is
+		// false and the completion-manifest writes are no-ops.
+		JobID:                   config.JobID,
+		CompletionDir:           config.CompletionDir,
+		PartitionTime:           config.PartitionTime,
+		ParentFinalizesManifest: config.ParentFinalizesManifest,
+		Staged:                  config.Staged,
+		Inputs:                  config.Inputs,
+		OutputName:              config.OutputName,
+	}
+}
+
+// subprocessResult is what the subprocess reports for job after Run.
+func subprocessResult(job *Job, err error) *SubprocessJobResult {
+	result := &SubprocessJobResult{
+		Success:        err == nil,
+		FilesCompacted: job.FilesCompacted,
+		BytesBefore:    job.BytesBefore,
+		BytesAfter:     job.BytesAfter,
+		// The storage key of the output (empty when the job produced none).
+		// The parent's compacted-output observer keys the edge sync ledger
+		// on this; the temp path would never match a storage listing.
+		OutputFile:      job.OutputStorageKey,
+		CompactedInputs: job.CompactedInputKeys(),
+		ManifestPath:    job.RetainedManifestPath(),
+		SourcesDeleted:  job.sourcesDeleted,
+		// Taken after Run: every count is I/O this job did (backend
+		// constructors move none).
+		Metrics: metrics.Get().ChildCounters(),
+	}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	return result
+}
+
+func containsAny(s string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }

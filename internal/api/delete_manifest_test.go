@@ -305,7 +305,7 @@ type finalizingRewriteCoordinator struct {
 }
 
 func (c *finalizingRewriteCoordinator) CompactionCommitActive() bool { return true }
-func (c *finalizingRewriteCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
+func (c *finalizingRewriteCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration, func(string) bool) ([]string, error) {
 	return nil, nil
 }
 func (c *finalizingRewriteCoordinator) SyncManifest(context.Context) error { return nil }

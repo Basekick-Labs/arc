@@ -295,7 +295,7 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 	if ierr != nil {
 		return nil, ierr
 	}
-	timeIdx, ierr := validateImportHeader(header, opts.timeColumn)
+	timeIdx, ierr := validateImportHeader(header, opts.timeColumn, h.knownFolds(database, measurement))
 	if ierr != nil {
 		return nil, ierr
 	}
@@ -503,8 +503,39 @@ func forEachParquetBatch(ctx context.Context, fr *pqarrow.FileReader, columns []
 		return &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to read parquet table", Err: err}
 	}
 	defer rr.Release()
+	return readParquetBatches(rr, fn)
+}
+
+// parquetBatchReader is the part of pqarrow.RecordReader the import reads.
+type parquetBatchReader interface {
+	Next() bool
+	RecordBatch() arrow.RecordBatch
+	Err() error
+}
+
+// readParquetBatches calls fn for each batch rr decodes. A panic while
+// decoding (rr.Next) is a corrupt file, answered like any other: the
+// uploaded bytes reach arrow-go's page decompressors on this goroutine, and
+// klauspost/compress zstd <= 1.20.1 panics on a crafted frame
+// (GHSA-fpmh-frq8-7rj8). A panic in fn is Arc's own and is not caught here.
+func readParquetBatches(rr parquetBatchReader, fn func(rec arrow.RecordBatch, firstRow int) error) error {
+	next := func() (ok bool, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				ok, err = false, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to read parquet table", Err: fmt.Errorf("corrupt file: %v", r)}
+			}
+		}()
+		return rr.Next(), nil
+	}
 	firstRow := 0
-	for rr.Next() {
+	for {
+		ok, err := next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
 		rec := rr.RecordBatch()
 		if err := fn(rec, firstRow); err != nil {
 			return err
@@ -540,9 +571,19 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 	for i := 0; i < schema.NumFields(); i++ {
 		header[i] = schema.Field(i).Name
 	}
-	timeFieldIdx, herr := validateImportHeader(header, opts.timeColumn)
+	timeFieldIdx, herr := validateImportHeader(header, opts.timeColumn, h.knownFolds(database, measurement))
 	if herr != nil {
 		return nil, herr
+	}
+	binaryKinds, berr := parquetBinaryKinds(fr, schema, h.arrowBuffer.KnownTextBinaryColumns(database, measurement))
+	if berr != nil {
+		return nil, berr
+	}
+	var undecided []string
+	for name, kind := range binaryKinds {
+		if kind == binaryUndecided {
+			undecided = append(undecided, name)
+		}
 	}
 
 	timeColumn := func(rec arrow.RecordBatch, idx, firstRow int) ([]int64, error) {
@@ -555,23 +596,54 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 		return tm, nil
 	}
 
-	// Validation pass: the time column alone (the leaf column of a flat
-	// schema; every column when it cannot be told apart).
-	var timeOnly []int
-	timeIdxInBatch := timeFieldIdx
-	if leaf := fr.ParquetReader().MetaData().Schema.ColumnIndexByName(opts.timeColumn); leaf >= 0 {
-		timeOnly, timeIdxInBatch = []int{leaf}, 0
+	// Validation pass: the time column, and the binary columns whose kind
+	// only their values can tell (#440), so a column is text or binary for
+	// the whole file before anything is written: the leaf columns of a flat
+	// schema, every column when they cannot be told apart.
+	var readCols []int
+	md := fr.ParquetReader().MetaData()
+	if leaf := md.Schema.ColumnIndexByName(opts.timeColumn); leaf >= 0 {
+		readCols = []int{leaf}
+		for _, name := range undecided {
+			if l := md.Schema.ColumnIndexByName(name); l >= 0 {
+				readCols = append(readCols, l)
+			} else {
+				readCols = nil // read everything
+				break
+			}
+		}
 	}
+	nonText := map[string]bool{}
 	var stats importStats
-	if err := forEachParquetBatch(ctx, fr, timeOnly, func(rec arrow.RecordBatch, firstRow int) error {
-		tm, err := timeColumn(rec, timeIdxInBatch, firstRow)
+	if err := forEachParquetBatch(ctx, fr, readCols, func(rec arrow.RecordBatch, firstRow int) error {
+		idx := rec.Schema().FieldIndices(opts.timeColumn)
+		if len(idx) == 0 {
+			return &importError{StatusCode: fiber.StatusBadRequest, Message: fmt.Sprintf("time column %q not found", opts.timeColumn)}
+		}
+		tm, err := timeColumn(rec, idx[0], firstRow)
 		if err != nil {
 			return &importError{StatusCode: fiber.StatusBadRequest, Message: fmt.Sprintf("failed to parse time column %q", opts.timeColumn), Err: err}
 		}
 		stats.add(tm)
+		for _, name := range undecided {
+			if nonText[name] {
+				continue
+			}
+			if ci := rec.Schema().FieldIndices(name); len(ci) > 0 && binaryColumnHasNonText(rec, ci[0]) {
+				nonText[name] = true
+			}
+		}
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	// A column of text throughout (or only NULLs) is a string, as before.
+	for _, name := range undecided {
+		if nonText[name] {
+			binaryKinds[name] = binaryAsBytes
+		} else {
+			binaryKinds[name] = binaryAsString
+		}
 	}
 	if stats.rows == 0 {
 		return nil, &importError{StatusCode: fiber.StatusBadRequest, Message: "file contains no rows"}
@@ -599,7 +671,14 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 				continue
 			}
 			col := arrow.NewColumnFromArr(rec.Schema().Field(i), rec.Column(i))
-			vals, valid, conv := arrowColumnToTyped(&col)
+			var vals interface{}
+			var valid []bool
+			var conv error
+			if kind, ok := binaryKinds[name]; ok {
+				vals, valid, conv = binaryColumnToTyped(&col, kind)
+			} else {
+				vals, valid, conv = arrowColumnToTyped(&col)
+			}
 			col.Release()
 			if conv != nil {
 				if w.started() {
@@ -689,9 +768,14 @@ func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 //   - a literal "time" column colliding with a renamed non-"time" time_column.
 //
 // Returns the index of timeColumn in the header on success.
-func validateImportHeader(header []string, timeColumn string) (int, *importError) {
+func validateImportHeader(header []string, timeColumn string, known ...map[string]string) (int, *importError) {
 	timeIdx := -1
 	seen := make(map[string]struct{}, len(header))
+	folds := make(map[string]string, len(header))
+	var stored map[string]string
+	if len(known) > 0 {
+		stored = known[0]
+	}
 	for i, name := range header {
 		if name == "" {
 			return -1, &importError{
@@ -714,6 +798,8 @@ func validateImportHeader(header []string, timeColumn string) (int, *importError
 		seen[name] = struct{}{}
 		if name == timeColumn {
 			timeIdx = i
+		} else if ierr := importColumnNameError(name, folds, stored); ierr != nil {
+			return -1, ierr
 		}
 	}
 	if timeIdx == -1 {
@@ -733,6 +819,27 @@ func validateImportHeader(header []string, timeColumn string) (int, *importError
 		}
 	}
 	return timeIdx, nil
+}
+
+// importColumnNameError refuses a column Arc could not read back (#1342):
+// not valid UTF-8, "time" in another letter case, or one differing only in
+// letter case from another column of the file (folds) or of the measurement
+// (stored). The file's time column is exempt: it is renamed "time".
+func importColumnNameError(name string, folds, stored map[string]string) *importError {
+	if p := ingest.ColumnNameProblem(name); p != "" && name != "time" {
+		return &importError{
+			StatusCode: fiber.StatusBadRequest,
+			Message:    fmt.Sprintf("column name %q cannot be stored: %s; rename the column", ingest.TruncateColumnName(name), p),
+		}
+	}
+	if other, twin := ingest.ColumnCaseTwin(name, folds, stored); twin {
+		return &importError{
+			StatusCode: fiber.StatusBadRequest,
+			Message:    fmt.Sprintf("column name %q differs only in letter case from %q of this measurement; rename one of them", ingest.TruncateColumnName(name), ingest.TruncateColumnName(other)),
+		}
+	}
+	folds[ingest.FoldColumnName(name)] = name
+	return nil
 }
 
 // csvColumnKind is what a CSV column's cells allow: the narrowest native type
@@ -1115,34 +1222,9 @@ func arrowColumnToTyped(col *arrow.Column) (interface{}, []bool, error) {
 			}
 		}
 		return res, validity, nil
-	case *array.Binary:
-		// BYTE_ARRAY without a UTF8 logical annotation reads as Binary, not
-		// String (common from Spark and some writers). Treat as string.
-		res := make([]string, length)
-		idx := 0
-		for _, chunk := range chunks {
-			a := chunk.(*array.Binary)
-			for i := 0; i < a.Len(); i++ {
-				if !a.IsNull(i) {
-					res[idx] = string(a.Value(i))
-				}
-				idx++
-			}
-		}
-		return res, validity, nil
-	case *array.FixedSizeBinary:
-		res := make([]string, length)
-		idx := 0
-		for _, chunk := range chunks {
-			a := chunk.(*array.FixedSizeBinary)
-			for i := 0; i < a.Len(); i++ {
-				if !a.IsNull(i) {
-					res[idx] = string(a.Value(i))
-				}
-				idx++
-			}
-		}
-		return res, validity, nil
+	// Binary, LargeBinary and FixedSizeBinary columns never reach here:
+	// parquetBinaryKinds and binaryColumnToTyped decide whether each is text
+	// or bytes (#440).
 	case *array.Boolean:
 		res := make([]bool, length)
 		idx := 0
@@ -1398,8 +1480,19 @@ func (lr *limitedReader) Read(p []byte) (int, error) {
 // import that raced a shutdown, or hit sustained schema churn, is not reported
 // as a permanent server error.
 func importBufferStatus(err error) int {
+	if errors.Is(err, ingest.ErrColumnTypeChange) {
+		return fiber.StatusBadRequest // #440
+	}
 	if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) || ingest.IsWriteRefusal(err) {
 		return fiber.StatusServiceUnavailable
 	}
 	return fiber.StatusInternalServerError
+}
+
+// knownFolds is the measurement's stored column spellings (#1342), or nil.
+func (h *ImportHandler) knownFolds(database, measurement string) map[string]string {
+	if known := h.arrowBuffer.KnownColumns(database); known != nil {
+		return known(measurement)
+	}
+	return nil
 }

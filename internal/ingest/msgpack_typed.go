@@ -65,10 +65,10 @@ func isFloatCode(c byte) bool {
 }
 
 func isStrCode(c byte) bool {
-	// Deliberately excludes Bin8/16/32: the generic path boxes bin as []byte
-	// and convertColumnsToTyped rejects it, so the typed path must not
-	// accept bin where today's path errors. Bin falls back to the generic
-	// decoder, which produces today's rejection.
+	// Deliberately excludes Bin8/16/32: the typed path has no binary column
+	// class, so it must not accept bin. Bin falls back to the generic
+	// decoder, which boxes it as []byte; convertColumnsToTyped stores that as
+	// a binary column (#440).
 	return msgpcode.IsFixedString(c) || c == msgpcode.Str8 || c == msgpcode.Str16 || c == msgpcode.Str32
 }
 
@@ -252,12 +252,12 @@ func batchItemSpans(data []byte) ([][2]int, bool) {
 // validity, and inferred types are IDENTICAL to what the generic decode +
 // convertColumnsToTyped would have produced — or it returns ok=false having
 // caused no side effects, and the caller runs the generic path. It never
-// surfaces an error to the user: every reject decision (mixed types, bin
-// columns, string time, uint64 overflow, nested values, batch format, ...)
-// is delegated to the generic path by falling back, which guarantees the
+// surfaces an error to the user: every decision it cannot reproduce
+// (mixed types, bin columns, string time, uint64 overflow, nested values,
+// batch format, ...) is delegated to the generic path by falling back, which guarantees the
 // user-visible accept/reject behavior is byte-identical to the pre-typed
-// decoder. The cost of double-decoding malformed payloads is irrelevant:
-// they are rejected requests, not the hot path.
+// decoder. Double-decoding is the cost of a fallback: irrelevant for
+// rejected requests, and accepted for bin columns (#440), which are rare.
 //
 // Scope (deliberate, per the validated design): top-level single-map payloads
 // only. Batch format, array format, row format, and payloads for deployments
@@ -646,7 +646,8 @@ func (d *MessagePackDecoder) decodeValueColumnTyped(dec *msgpack.Decoder, n int)
 				class = clsBool
 				bools = make([]bool, n)
 			default:
-				// bin, nested array/map, ext — generic path rejects.
+				// bin (generic path stores it as binary, #440), nested
+				// array/map, ext (generic path rejects) — fall back.
 				return nil, nil, 0, false
 			}
 		}
