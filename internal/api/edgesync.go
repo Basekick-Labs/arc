@@ -542,10 +542,10 @@ func (h *EdgeSyncHandler) writeOutcome(c *fiber.Ctx, res *edgesync.PutResult) er
 
 // RegistrySpokeSecrets adapts a spoke registry to the lookup the handler needs.
 //
-// Every failure — unregistered, disabled, or an undecryptable secret — is
-// collapsed into a single `false`. The handler turns that into the same 401 a
-// bad MAC produces, so an attacker cannot use the response to learn which
-// spoke IDs exist. The reason is logged hub-side, where an operator can see it.
+// Every failure — unregistered, disabled, colliding, or an undecryptable
+// secret — is collapsed into a single `false`. The handler turns that into the
+// same 401 a bad MAC produces, so an attacker cannot use the response to learn
+// which spoke IDs exist. The reason is logged hub-side for the operator.
 func RegistrySpokeSecrets(reg *edgesync.Registry, logger zerolog.Logger) SpokeSecretLookup {
 	return func(ctx context.Context, spokeID string) (string, bool) {
 		secret, err := reg.Secret(ctx, spokeID)
@@ -560,7 +560,7 @@ func RegistrySpokeSecrets(reg *edgesync.Registry, logger zerolog.Logger) SpokeSe
 			// endpoints keep returning 200 with a full spoke list because
 			// metadata is not encrypted. Without this branch the hub looks
 			// healthy while nothing can authenticate.
-			if errors.Is(err, edgesync.ErrSpokeNotFound) || errors.Is(err, edgesync.ErrSpokeDisabled) {
+			if errors.Is(err, edgesync.ErrSpokeNotFound) || errors.Is(err, edgesync.ErrSpokeDisabled) || errors.Is(err, edgesync.ErrSpokeIDCollision) {
 				logger.Debug().Err(err).Str("spoke_id", spokeID).Msg("Spoke secret lookup failed")
 			} else {
 				logger.Warn().Err(err).Str("spoke_id", spokeID).

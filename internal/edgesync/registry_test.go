@@ -196,6 +196,69 @@ func TestRegistry_RegisterIsNotAnUpsert(t *testing.T) {
 	}
 }
 
+func TestRegistry_RejectsFilesystemEquivalentSpokeIDs(t *testing.T) {
+	ctx := context.Background()
+	reg, _ := newTestRegistry(t)
+
+	tests := []struct {
+		name  string
+		first string
+		alias string
+	}{
+		{name: "case folding", first: "rocket_01", alias: "ROCKET_01"},
+		{name: "full Unicode case folding", first: "Straße", alias: "STRASSE"},
+		{name: "Unicode normalization", first: "café", alias: "cafe\u0301"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg, _ := newTestRegistry(t)
+			if _, err := reg.Register(ctx, tt.first, "First"); err != nil {
+				t.Fatalf("register first ID: %v", err)
+			}
+			if _, err := reg.Register(ctx, tt.alias, "Alias"); !errors.Is(err, ErrSpokeIDCollision) {
+				t.Fatalf("registering %q alongside filesystem-equivalent ID %q: err = %v, want ErrSpokeIDCollision", tt.alias, tt.first, err)
+			}
+		})
+	}
+
+	// Uppercase IDs are valid on their own; only a collision with an existing
+	// ID should be rejected.
+	if _, err := reg.Register(ctx, "ROCKET_02", "Uppercase"); err != nil {
+		t.Fatalf("registering a distinct uppercase ID: %v", err)
+	}
+}
+
+func TestRegistry_ConcurrentEquivalentRegistrations(t *testing.T) {
+	reg, _ := newTestRegistry(t)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		go func(id string) {
+			<-start
+			_, err := reg.Register(context.Background(), id, id)
+			results <- err
+		}(id)
+	}
+	close(start)
+
+	succeeded, collided := 0, 0
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrSpokeIDCollision):
+			collided++
+		default:
+			t.Errorf("register returned unexpected error: %v", err)
+		}
+	}
+	if succeeded != 1 || collided != 1 {
+		t.Fatalf("registrations succeeded=%d, collided=%d; want one of each", succeeded, collided)
+	}
+}
+
 func TestRegistry_UnknownAndDisabledSpokes(t *testing.T) {
 	ctx := context.Background()
 	reg, _ := newTestRegistry(t)
@@ -721,5 +784,46 @@ func TestRegistry_InvalidStoredIDs(t *testing.T) {
 	}
 	if _, found := bad["rocket-01"]; found {
 		t.Errorf("a valid spoke ID was reported as invalid: %v", bad)
+	}
+}
+
+func TestRegistry_LegacyCollisionsAreReportedAndCannotSync(t *testing.T) {
+	ctx := context.Background()
+	reg, db := newTestRegistry(t)
+	encrypted, err := reg.cipher.Encrypt("legacy-secret")
+	if err != nil {
+		t.Fatalf("encrypt legacy secret: %v", err)
+	}
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO sync_spokes (spoke_id, name, secret_encrypted, enabled, registered_at)
+			 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`, id, id, encrypted); err != nil {
+			t.Fatalf("insert legacy spoke %q: %v", id, err)
+		}
+	}
+
+	// The hub discovers collisions among existing rows when its registry starts.
+	reopened, err := NewRegistry(db, reg.cipher, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen registry: %v", err)
+	}
+	bad, err := reopened.InvalidStoredIDs(ctx)
+	if err != nil {
+		t.Fatalf("InvalidStoredIDs: %v", err)
+	}
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		if !errors.Is(bad[id], ErrSpokeIDCollision) {
+			t.Errorf("startup report for %q = %v, want ErrSpokeIDCollision", id, bad[id])
+		}
+		if _, err := reopened.Secret(ctx, id); !errors.Is(err, ErrSpokeIDCollision) {
+			t.Errorf("Secret(%q) = %v, want ErrSpokeIDCollision", id, err)
+		}
+	}
+
+	if err := reopened.Delete(ctx, "ROCKET_01"); err != nil {
+		t.Fatalf("delete one colliding registration: %v", err)
+	}
+	if got, err := reopened.Secret(ctx, "rocket_01"); err != nil || got != "legacy-secret" {
+		t.Errorf("remaining spoke after collision removal: secret=%q, err=%v", got, err)
 	}
 }

@@ -1831,6 +1831,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Filesystem-equivalent spoke IDs cannot share a sync namespace ([#740](https://github.com/Basekick-Labs/arc/issues/740))
+
+Spoke IDs that differ only by Unicode case folding or canonical normalization
+can map to the same directory on some filesystems. Arc now rejects new
+collisions, refuses sync for every member of an existing collision group, and
+reports those groups at startup. Unrelated IDs and their registrations remain
+available.
+
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
 The Parquet import stored every binary column (a BYTE_ARRAY without a string

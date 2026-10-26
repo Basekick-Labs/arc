@@ -148,6 +148,22 @@ func TestEdgeSyncAdmin_RegisterReturnsTheSecretOnce(t *testing.T) {
 	}
 }
 
+func TestEdgeSyncAdmin_RejectsFilesystemEquivalentSpokeIDs(t *testing.T) {
+	rig := newAdminRig(t)
+
+	first, _ := rig.do(t, http.MethodPost, "/api/v1/sync-spokes/",
+		map[string]string{"spoke_id": "rocket_01", "name": "Rocket 01"})
+	if first.StatusCode != fiber.StatusCreated {
+		t.Fatalf("first registration status = %d, want 201", first.StatusCode)
+	}
+
+	second, body := rig.do(t, http.MethodPost, "/api/v1/sync-spokes/",
+		map[string]string{"spoke_id": "ROCKET_01", "name": "Rocket 01 alias"})
+	if second.StatusCode != fiber.StatusConflict {
+		t.Fatalf("colliding registration status = %d, want 409; body=%v", second.StatusCode, body)
+	}
+}
+
 func toJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
