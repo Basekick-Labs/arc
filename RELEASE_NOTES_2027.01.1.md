@@ -1839,6 +1839,8 @@ collisions, refuses sync for every member of an existing collision group, and
 reports those groups at startup. Unrelated IDs and their registrations remain
 available.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1401](https://github.com/Basekick-Labs/arc/pull/1401).
+
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
 The Parquet import stored every binary column (a BYTE_ARRAY without a string
