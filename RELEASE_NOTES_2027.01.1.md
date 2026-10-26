@@ -2,6 +2,15 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: cluster cache invalidation reaches peers with wildcard API addresses (#1398)
+
+Cache-invalidation fan-out now resolves hostless and wildcard API addresses
+(`:8000`, `0.0.0.0:8000`, `[::]:8000`) using the peer's coordinator host,
+retaining the API port. Previously these requests could reach the sender
+itself and be rejected with 403, leaving peer caches stale after compaction,
+retention, DELETE or database/measurement removal. Explicit API hosts remain
+unchanged. Forwarded requests and invalidation now share the same resolver.
+
 ## New: MessagePack columnar tag keys (#275)
 
 MessagePack columnar payloads now accept an optional `tag_keys` field to
