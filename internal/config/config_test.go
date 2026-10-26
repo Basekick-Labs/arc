@@ -213,6 +213,14 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	}
 
 	// Verify ingest defaults are applied
+	// These settings drive the flush cadence described alongside hourly
+	// compaction's independent file floor.
+	if cfg.Ingest.MaxBufferSize != 50000 {
+		t.Errorf("Ingest.MaxBufferSize = %d, want 50000", cfg.Ingest.MaxBufferSize)
+	}
+	if cfg.Ingest.MaxBufferAgeMS != 5000 {
+		t.Errorf("Ingest.MaxBufferAgeMS = %d, want 5000", cfg.Ingest.MaxBufferAgeMS)
+	}
 	expectedFlushWorkers := getDefaultFlushWorkers()
 	if cfg.Ingest.FlushWorkers != expectedFlushWorkers {
 		t.Errorf("Ingest.FlushWorkers = %d, want %d", cfg.Ingest.FlushWorkers, expectedFlushWorkers)
@@ -225,6 +233,9 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 
 	if cfg.Ingest.ShardCount != 32 {
 		t.Errorf("Ingest.ShardCount = %d, want 32", cfg.Ingest.ShardCount)
+	}
+	if cfg.Compaction.HourlyMinFiles != 10 {
+		t.Errorf("Compaction.HourlyMinFiles = %d, want 10", cfg.Compaction.HourlyMinFiles)
 	}
 }
 

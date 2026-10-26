@@ -6602,6 +6602,16 @@ thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
 
+### Hourly compaction file-count guidance (#793)
+
+Documented `compaction.hourly_min_files` as an independent per-partition floor,
+not a value derived from `ingest.max_buffer_age_ms`. Actual file cadence also
+depends on traffic gaps, row limits, schema changes and flush backpressure; the
+default remains 10.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1370](https://github.com/Basekick-Labs/arc/pull/1370).
+
 ### The unused `license.enabled` setting is removed ([#1195](https://github.com/Basekick-Labs/arc/issues/1195))
 
 `license.enabled` (`ARC_LICENSE_ENABLED`) was read into the config and never
