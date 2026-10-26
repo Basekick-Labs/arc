@@ -457,3 +457,17 @@ func TestDatabaseDeletionStopsWhenWithdrawFails(t *testing.T) {
 		t.Fatal("a file was removed")
 	}
 }
+
+// A DELETE record whose WHERE calls a function this node lacks (an extension
+// the recording node loads, #440) is not applied, and says which setting to
+// fix: unlike a column the file lacks, it is not "matches nothing".
+func TestRewriteForRecordsWithAFunctionThisNodeLacks(t *testing.T) {
+	root, backend, db := recordsDuckDB(t)
+	const rel = "db/cpu/2026/10/11/10/cpu_a.parquet"
+	writeRecordsParquet(t, db, root, rel)
+	h := &DeleteHandler{db: db, storage: backend, logger: zerolog.Nop()}
+	_, err := h.RewriteForRecords(context.Background(), rel, []string{"ST_X(ST_Point(v, 0)) > 1"})
+	if err == nil || !strings.Contains(err.Error(), "database.extensions") {
+		t.Fatalf("err = %v, want one naming database.extensions", err)
+	}
+}

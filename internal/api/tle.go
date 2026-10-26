@@ -231,6 +231,10 @@ localProcessing:
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err)
 		}
+		// A client error (#440), refused before the WAL.
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		metrics.Get().IncIngestErrors()
 		h.logger.Error().
 			Err(err).

@@ -234,11 +234,14 @@ func TestClassifyVanishedFile(t *testing.T) {
 	missing := func(p string) error { return io(`IO Error: Cannot open file "` + p + `": No such file or directory`) }
 	file := filepath.Join(root, "db1", "cpu", "2026", "10", "20", "11", "x.parquet")
 	s3 := httpErr(`HTTP Error: HTTP GET error reading 'http://127.0.0.1:18333/arc/db1/cpu/2026/10/20/11/x.parquet' in region 'us-east-1' (HTTP 404 Not Found)`)
+	// Recorded against real GCS with DuckDB 1.5.6 and a bearer-token secret
+	// (#1105): the S3 form, naming the gs:// URL, with an empty region.
+	gcs := httpErr(`HTTP Error: HTTP GET error reading 'gs://arc-b/inst/db1/cpu/2026/10/20/11/x.parquet' in region '' (HTTP 404 Not Found)`)
 	azure := io(`IO Error: AzureStorageFileSystem open file 'azure://arc/db1/cpu/2026/10/20/11/x.parquet' failed with code 'BlobNotFound', Reason Phrase: 'The specified blob does not exist.', Message: ''`)
 	for _, c := range []struct {
 		name        string
 		err         error
-		objectStore string // "s3", "tiering" (local primary, cold tier) or "" (local only)
+		objectStore string // "s3", "gcs", "tiering" (local primary, cold tier) or "" (local only)
 		want        noFilesKind
 		clears      int
 	}{
@@ -246,6 +249,9 @@ func TestClassifyVanishedFile(t *testing.T) {
 		{"S3 object", s3, "s3", noFilesVanished, 1},
 		{"S3 object, another reason phrase", httpErr(`HTTP Error: HTTP GET error reading 'https://s3.amazonaws.com/arc/db1/cpu/x.parquet' in region 'eu-west-1' (HTTP 404 NoSuchKey)`), "s3", noFilesVanished, 1},
 		{"Azure blob", azure, "s3", noFilesVanished, 1},
+		{"GCS object", gcs, "gcs", noFilesVanished, 1},
+		{"GCS text on a node with no object store", gcs, "", noFilesOther, 0},
+		{"GCS 401 is not a removal", httpErr(`HTTP Error: HTTP GET error reading 'gs://arc-b/x.parquet' in region '' (HTTP 401 Unauthorized)`), "gcs", noFilesOther, 0},
 		{"S3 object, local primary with a cold tier", s3, "tiering", noFilesVanished, 1},
 		{"S3 text on a node with no object store", s3, "", noFilesOther, 0},
 		{"Azure text on a node with no object store", azure, "", noFilesOther, 0},
@@ -268,6 +274,8 @@ func TestClassifyVanishedFile(t *testing.T) {
 		switch c.objectStore {
 		case "s3":
 			h.storage = &storage.S3Backend{}
+		case "gcs":
+			h.storage = &storage.GCSBackend{}
 		case "tiering":
 			h.tieringManager = &tiering.Manager{}
 		}

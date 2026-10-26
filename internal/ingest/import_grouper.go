@@ -228,6 +228,18 @@ func gatherRows(chunks []groupedBatch, cols []string, refs []rowRef) (*TypedColu
 				}
 			}
 			dst = arr
+		case [][]byte:
+			// Parquet import keeps binary columns as bytes (#440).
+			arr := make([][]byte, n)
+			for i, r := range refs {
+				if data, ok := present(r); ok {
+					arr[i] = data.([][]byte)[r.row]
+					setValid(i)
+				} else {
+					setNull(i)
+				}
+			}
+			dst = arr
 		case []decimal128.Num:
 			arr := make([]decimal128.Num, n)
 			for i, r := range refs {

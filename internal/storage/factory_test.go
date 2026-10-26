@@ -188,11 +188,11 @@ func TestNewBackendResolvesEveryAlias(t *testing.T) {
 }
 
 // TestNewBackendUnknownTypeNamesEveryAlias keeps the error actionable. An
-// operator who typed "gcs" needs to be told what IS accepted; the primary call
-// site logs its own five-alias Fatal before it ever asks the factory, so this
-// message is what every OTHER caller shows.
+// operator who typed "gcp" needs to be told what IS accepted; the primary call
+// site logs its own Fatal before it ever asks the factory, so this message is
+// what every OTHER caller shows.
 func TestNewBackendUnknownTypeNamesEveryAlias(t *testing.T) {
-	for _, badType := range []string{"gcs", "", "s3 bucket"} {
+	for _, badType := range []string{"gcp", "", "s3 bucket"} {
 		b, err := NewBackend(BackendSpec{Type: badType}, zerolog.Nop())
 		if err == nil {
 			t.Fatalf("NewBackend(type=%q) succeeded, want an error", badType)
@@ -209,7 +209,7 @@ func TestNewBackendUnknownTypeNamesEveryAlias(t *testing.T) {
 		if i, j := strings.Index(aliasText, `"`), strings.LastIndex(aliasText, `"`); i >= 0 && j > i {
 			aliasText = aliasText[:i] + aliasText[j+1:]
 		}
-		for _, alias := range []string{"local", "s3", "minio", "azure", "azblob"} {
+		for _, alias := range []string{"local", "s3", "minio", "azure", "azblob", "gcs"} {
 			if !strings.Contains(aliasText, alias) {
 				t.Errorf("NewBackend(type=%q) error does not name the %q alias: %s", badType, alias, msg)
 			}
@@ -261,7 +261,7 @@ func TestNewBackendNeverReturnsTypedNilOnError(t *testing.T) {
 		name string
 		spec BackendSpec
 	}{
-		{"unknown type", BackendSpec{Type: "gcs"}},
+		{"unknown type", BackendSpec{Type: "gcp"}},
 		{"local path under a regular file", BackendSpec{Type: "local", LocalPath: filepath.Join(notADir, "root")}},
 		{"s3 with no bucket", BackendSpec{Type: "s3", S3: S3Config{Region: "us-east-1"}}},
 		{"minio with no bucket", BackendSpec{Type: "minio", S3: S3Config{Region: "us-east-1"}}},
@@ -269,6 +269,9 @@ func TestNewBackendNeverReturnsTypedNilOnError(t *testing.T) {
 		{"azure with no container", BackendSpec{Type: "azure", Azure: AzureBlobConfig{AccountName: "acct"}}},
 		{"azblob with no container", BackendSpec{Type: "azblob", Azure: AzureBlobConfig{AccountName: "acct"}}},
 		{"azure with no authentication method", BackendSpec{Type: "azure", Azure: AzureBlobConfig{ContainerName: "c"}}},
+		{"gcs with no bucket", BackendSpec{Type: "gcs"}},
+		{"gcs with an unusable prefix", BackendSpec{Type: "gcs", GCS: GCSConfig{Bucket: "b", Prefix: "a//b"}}},
+		{"gcs with a key that is not a service account", BackendSpec{Type: "gcs", GCS: GCSConfig{Bucket: "b", CredentialsJSON: `{"type":"authorized_user"}`}}},
 	}
 
 	for _, tt := range tests {

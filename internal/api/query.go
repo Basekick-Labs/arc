@@ -702,7 +702,8 @@ type QueryHandler struct {
 	// tierView replaces tieringManager's view in buildMultiTierReadParquet
 	// (tests: a tiering.Manager needs a license).
 	tierView         multiTierView
-	emptyRangeAnchor bool // #928: answer a proven-empty range from a complete anchor alone
+	coldGuard        coldTierGuard // test seam; nil = the tiering manager
+	emptyRangeAnchor bool          // #928: answer a proven-empty range from a complete anchor alone
 	queryCache       *database.QueryCache
 	// openCompactions lists compaction jobs whose output and inputs can both
 	// be in storage (compaction.OpenJobs); nil without a compaction manager.
@@ -2223,7 +2224,7 @@ localProcessing:
 	convertedSQL, cached, err := h.getTransformedSQLForQuery(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		m.IncQueryErrors()
-		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
+		return respondError(c, transformErrorStatus(err), err.Error(), timestamp, start)
 	}
 
 	// arcx decline census (no-op stub in stock builds; no query text is emitted).
@@ -2682,6 +2683,8 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 //
 //	local: IO Error: Cannot open file "<path>": No such file or directory
 //	S3:    HTTP Error: HTTP GET error reading '<url>' in region '<r>' (HTTP 404 Not Found)
+//	GCS:   the S3 form, '<url>' the gs:// URL and region '' (recorded against
+//	       real GCS, #1105)
 //	Azure: IO Error: AzureStorageFileSystem open file '<url>' failed with code 'BlobNotFound', ...
 //
 // Each must be a DuckDB error of that type and start with that text
@@ -2725,11 +2728,12 @@ func (h *QueryHandler) plannedFile(path string, remote bool) bool {
 	return !h.missingAnchorPath(path)
 }
 
-// readsObjectStore reports whether this node's queries read S3 or Azure:
-// its primary storage, or a tiering cold tier.
+// readsObjectStore reports whether this node's queries read an object store:
+// its primary storage, or a tiering cold tier. Any non-local primary, by
+// Type() rather than by a list of concrete types, which missed every backend
+// added after it (#1105).
 func (h *QueryHandler) readsObjectStore() bool {
-	switch h.storage.(type) {
-	case *storage.S3Backend, *storage.AzureBlobBackend:
+	if h.storage != nil && h.storage.Type() != "local" {
 		return true
 	}
 	return h.tieringManager != nil
@@ -2834,6 +2838,9 @@ func ValidateSQLRequest(sql string) error {
 
 	if dangerousSQLPattern.MatchString(normalised) {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
+	}
+	if unicodeEscapePattern.MatchString(normalised) {
+		return &SQLValidationError{Message: `Unicode-escaped identifiers and strings (U&"...") are not allowed`}
 	}
 
 	// SECURITY: read statements only (read_statements.go). The denylist above
@@ -3136,6 +3143,14 @@ func isBareIdentifier(name string) bool {
 	return true
 }
 
+// unicodeEscapePattern matches a U&"..." identifier or U&'...' string in
+// literal-masked SQL (the masker leaves the U& prefix outside its
+// placeholder). Its escapes spell a name the denylists cannot see:
+// U&"\0073t_read" is st_read. The DuckDB release Arc pins does not execute
+// them, so refusing them outright costs nothing and keeps a parser upgrade
+// from opening the I/O denylist (#440).
+var unicodeEscapePattern = regexp.MustCompile(`(?i)\bu&__(?:STR|IDENT)_\d+__`)
+
 // ioTableFunctionPattern matches a call to any DuckDB function that reads from
 // the filesystem (or an attached storage scanner), by name, in any position of
 // the masked/comment-stripped SQL. This is an intentionally comprehensive
@@ -3145,10 +3160,12 @@ func isBareIdentifier(name string) bool {
 // bare identifier. Anchored matching (`\b`) avoids matching these as a
 // substring of a longer identifier.
 //
-// Maintenance: when DuckDB adds a new path-taking table function (or Arc loads
-// an extension that exposes one), add it here. TestIOTableFunctionPattern_Family
-// documents the set we verified against the pinned DuckDB release.
-var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
+// Maintenance: when DuckDB adds a new path-taking table function, add it here.
+// TestIOTableFunctionPattern_Family documents the set we verified against the
+// pinned DuckDB release. An extension's functions are not listed here: they
+// come from database.DeniedExtensionFunctions, and an extension is loadable
+// only once its function surface is reviewed there (#440).
+var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
 	"read_parquet",
 	"parquet_scan",
 	"parquet_metadata",
@@ -3175,7 +3192,9 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]strin
 	"iceberg_metadata",
 	"iceberg_snapshots",
 	"arc_partition_agg",
-}, "|") + `)\s*\(`)
+	// The file readers of the DuckDB extensions database.extensions may load
+	// (#440), denied whether or not this node loads them.
+}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
 
 // dynamicSQLFunctionPattern matches DuckDB table functions that evaluate a
 // string as SQL (or resolve a string to a relation). They are the I/O
@@ -3559,6 +3578,62 @@ type storagePathFailure struct {
 	err error
 }
 
+// errColdTierUnavailable refuses a read that needs the cold tier on a node
+// where the cold tier is configured on but its backend failed to start
+// (tiering.Manager.ColdTierMissing). Without this the read would leave every
+// cold file out and answer with the hot rows alone, success:true (#1105).
+// Answered with 503 (transformErrorStatus): the query is valid, the node
+// cannot serve it.
+var errColdTierUnavailable = errors.New("this query reads data in the cold storage tier, which is configured but unavailable on this node (its backend failed to start; see the startup log); refused rather than answered without that data")
+
+// transformErrorStatus is the HTTP status for an error from the SQL
+// transform: 503 for a cold tier this node cannot read, 400 otherwise (a name
+// that cannot become a storage path).
+func transformErrorStatus(err error) int {
+	if errors.Is(err, errColdTierUnavailable) {
+		return fiber.StatusServiceUnavailable
+	}
+	return fiber.StatusBadRequest
+}
+
+// refuseReadWithoutColdTier records errColdTierUnavailable on ctx and reports
+// true when the cold tier is configured but missing and this measurement has
+// cold rows in the query's time range. A bound the extractor only assumed is
+// left open, and a metadata error refuses too: neither may turn into a read
+// that silently skips cold data.
+func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, measurement, originalSQL string) bool {
+	guard := h.coldTierGuard()
+	if guard == nil || !guard.ColdTierMissing() {
+		return false
+	}
+	// Never cache a transform built in this state: "no cold rows in range"
+	// is only true now, and cold rows can still arrive (a cluster peer's
+	// migration replicated in, a restore). A cached hot-only read would then
+	// skip them without asking again.
+	pruning.MarkVolatile(ctx)
+	var start, end *time.Time
+	if tr := h.pruner.ExtractTimeRange(originalSQL); tr != nil {
+		if !tr.StartAssumed {
+			s := tr.Start
+			start = &s
+		}
+		if !tr.EndAssumed {
+			e := tr.End
+			end = &e
+		}
+	}
+	has, err := guard.HasColdFilesInRange(ctx, database, measurement, start, end)
+	if err != nil {
+		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Could not check this read against cold tier rows while the cold tier is unavailable; refusing it")
+	}
+	if err == nil && !has {
+		return false
+	}
+	recordStoragePathFailure(ctx, errColdTierUnavailable)
+	return true
+}
+
 type storagePathCtxKey struct{}
 
 // withStoragePathFailure attaches a collector for storage-path rejections.
@@ -3726,6 +3801,14 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 // buildReadParquetExprRaw is buildReadParquetExpr without the open
 // compaction exclusions.
 func (h *QueryHandler) buildReadParquetExprRaw(ctx context.Context, path, originalSQL, keyword string) string {
+	// A cold tier that is on but failed to start offers no cold glob below,
+	// so this is the one place every read of such a node passes (#1105).
+	// The guard is asked first so a node without tiering parses nothing.
+	if guard := h.coldTierGuard(); guard != nil && guard.ColdTierMissing() {
+		if db, meas := h.extractDBMeasurementFromPath(path); db != "" && meas != "" && h.refuseReadWithoutColdTier(ctx, db, meas, originalSQL) {
+			return ""
+		}
+	}
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -3785,6 +3868,8 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 // without the open compaction exclusions (applied once, by the caller, to
 // either tier layout).
 func (h *QueryHandler) buildReadParquetExprForMeasurementRaw(ctx context.Context, database, measurement, originalSQL, keyword string) string {
+	// A missing cold tier is refused in buildReadParquetExprRaw, which this
+	// falls through to: with no cold backend the router offers no cold glob.
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -4037,7 +4122,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Msg("No hot tier metadata for this measurement; local files are excluded from this read")
 	}
 
-	// Cold tier (S3/Azure) - only if metadata says there's cold data
+	// Cold tier (S3/Azure/GCS) - only if metadata says there's cold data
 	if actualTiers[tiering.TierCold] {
 		if _, ok := tieredPaths[tiering.TierCold]; ok {
 			coldBackend := tiers.GetBackendForTier(tiering.TierCold)
@@ -4185,6 +4270,25 @@ func (v tieringTierView) TiersForMeasurement(ctx context.Context, database, meas
 
 func (v tieringTierView) GetBackendForTier(tier tiering.Tier) storage.Backend {
 	return v.m.GetBackendForTier(tier)
+}
+
+// coldTierGuard is what refuseReadWithoutColdTier asks of tiering; a seam so
+// tests can stand in for a node whose cold backend failed to start.
+type coldTierGuard interface {
+	ColdTierMissing() bool
+	HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error)
+}
+
+func (h *QueryHandler) coldTierGuard() coldTierGuard {
+	if h.coldGuard != nil {
+		return h.coldGuard
+	}
+	if h.tieringManager == nil {
+		// Not the typed nil: a nil *Manager in the interface would pass a
+		// nil check and then be called.
+		return nil
+	}
+	return h.tieringManager
 }
 
 func (h *QueryHandler) multiTierView() multiTierView {
@@ -4948,7 +5052,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		metrics.Get().IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+		return c.Status(transformErrorStatus(err)).JSON(EstimateResponse{
 			Success:         false,
 			Error:           err.Error(),
 			WarningLevel:    "error",
@@ -5497,9 +5601,13 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), sql, "")
 	if err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+		msg := "Invalid query: " + err.Error()
+		if errors.Is(err, errColdTierUnavailable) {
+			msg = err.Error()
+		}
+		return c.Status(transformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,
-			Error:     "Invalid query: " + err.Error(),
+			Error:     msg,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}

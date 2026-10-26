@@ -297,7 +297,7 @@ var dangerousKeywordPattern = regexp.MustCompile(`(?i)\b(DROP|DELETE|INSERT|UPDA
 // Matches the function NAME anywhere in the clause, not anchored to a FROM/JOIN
 // position — these can sit in any scalar expression. Kept as a separate pattern
 // from the keyword list so the error message can name the offending function.
-var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
+var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
 	"read_parquet", "parquet_scan", "read_csv", "read_csv_auto",
 	"read_json", "read_json_auto", "read_ndjson", "read_ndjson_auto",
 	"read_text", "read_blob", "read_xlsx", "glob",
@@ -305,7 +305,7 @@ var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]s
 	"parquet_kv_metadata", "parquet_bloom_probe",
 	"delta_scan", "iceberg_scan", "iceberg_metadata", "iceberg_snapshots",
 	"arc_partition_agg",
-}, "|") + `)\s*\(`)
+}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
 
 // NewDeleteHandler creates a new delete handler. tempDir MUST be the same
 // path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
@@ -317,6 +317,7 @@ func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.
 	if tempDir == "" {
 		componentLogger.Warn().Msg("NewDeleteHandler called with empty tempDir — DELETE on S3 backends will fail under the DuckDB sandbox; cmd/arc/main.go should pass the sandbox-allowlisted upload directory")
 	}
+	removeRewriteScratch(tempDir, componentLogger)
 	return &DeleteHandler{
 		db:          db,
 		storage:     storage,
@@ -979,6 +980,9 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		}
 	}
 	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
+	if unicodeEscapePattern.MatchString(maskedWhere) {
+		return false, fmt.Errorf(`WHERE clause contains a unicode-escaped identifier or string (U&"...")`)
+	}
 	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
 	}
@@ -1363,7 +1367,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		return deleted, nil
 	}
 
-	// For remote backends (S3, Azure), write to a local temp file then upload.
+	// For remote backends (every object store), write to a local temp file then upload.
 	var rewroteDeleted int64
 	var rewrittenPath string
 	var s3Result *s3RewriteResult
@@ -1427,7 +1431,6 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 
 // rewriteLocalFile handles file rewrite for local storage by publishing a fresh immutable path
 func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, string, error) {
-	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
 	newRelativePath := rewritePath(relativePath)
 	newFilePath := filepath.Join(filepath.Dir(filePath), filepath.Base(newRelativePath))
@@ -1442,21 +1445,11 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 
 	tempFile := filepath.Join(tempDir, filepath.Base(newRelativePath)+".new")
 
-	// Write filtered data to temp file using DuckDB COPY. Run with
-	// preserve_insertion_order forced on so the rewritten file keeps the
-	// source's row order (typically time-sorted) even when the
-	// database-wide setting is false.
-	copyQuery := fmt.Sprintf(`
-		COPY (
-			SELECT * FROM %s WHERE NOT COALESCE((%s), false)
-		) TO %s (
-			FORMAT PARQUET,
-			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE %d
-		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(filePath)), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
-
-	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
+	// Write the surviving rows to the temp file in the source's row order
+	// (typically time-sorted), with Arc's parquet metadata; a file too wide
+	// for the main DuckDB is rewritten single-threaded (delete_rewrite_wide.go).
+	singleThread, err := h.copySurvivors(ctx, filePath, whereClause, tempFile, nil)
+	if err != nil {
 		os.Remove(tempFile)
 		return 0, "", fmt.Errorf("failed to write filtered data: %w", err)
 	}
@@ -1476,6 +1469,7 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 		Int64("rows_before", rowsBefore).
 		Int64("rows_after", rowsAfter).
 		Int64("deleted", deleted).
+		Bool("single_thread", singleThread).
 		Msg("Rewrote file")
 
 	return deleted, newRelativePath, nil
@@ -1497,8 +1491,10 @@ func rewritePath(relativePath string) string {
 	return fmt.Sprintf("%s_rewrite_%d.parquet", base, storage.NameTime(time.Now()).UnixNano())
 }
 
-// rewriteS3File handles file rewrite for S3 storage
-// DuckDB can read from S3 directly, then we write to a temp file and upload
+// rewriteS3File rewrites a file on any object store (named for the first one):
+// DuckDB reads the object URL directly, writes the survivors to a local temp
+// file, and the Backend uploads it. So it needs the DuckDB secret for the
+// store's scheme as well as the Backend.
 func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, *s3RewriteResult, error) {
 	// Fail-closed when the handler was constructed without a sandbox-
 	// allowlisted tempDir. Without this guard, os.CreateTemp("", ...) would
@@ -1510,7 +1506,6 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	if h.tempDir == "" {
 		return 0, nil, fmt.Errorf("delete handler is misconfigured: tempDir is empty; the DELETE-on-S3 staging directory must be allowlisted in the DuckDB sandbox (see cmd/arc/main.go uploadDir wiring)")
 	}
-	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
 	newRelativePath := rewritePath(relativePath)
 
@@ -1530,21 +1525,23 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	tempFile.Close()
 	defer os.Remove(tempPath)
 
-	// DuckDB reads from S3 and writes to local temp file. Run with
-	// preserve_insertion_order forced on so the rewritten file keeps the
-	// source's row order (typically time-sorted) even when the
-	// database-wide setting is false.
-	copyQuery := fmt.Sprintf(`
-		COPY (
-			SELECT * FROM %s WHERE NOT COALESCE((%s), false)
-		) TO %s (
-			FORMAT PARQUET,
-			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE %d
-		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(s3Path)), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
-
-	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
+	// DuckDB reads from S3 and writes to the local temp file, in the source's
+	// row order and with Arc's parquet metadata. A file too wide for the main
+	// DuckDB is downloaded first and rewritten single-threaded by a private
+	// instance with no remote access (delete_rewrite_wide.go).
+	fetch := func(ctx context.Context, localPath string) error {
+		f, err := os.OpenFile(localPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		if err := h.storage.ReadTo(ctx, relativePath, f); err != nil {
+			f.Close()
+			return err
+		}
+		return f.Close()
+	}
+	singleThread, err := h.copySurvivors(ctx, s3Path, whereClause, tempPath, fetch)
+	if err != nil {
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
 	}
 
@@ -1588,19 +1585,26 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		Int64("rows_before", rowsBefore).
 		Int64("rows_after", rowsAfter).
 		Int64("deleted", deleted).
-		Msg("Rewrote S3 file")
+		Bool("single_thread", singleThread).
+		Msg("Rewrote object-store file")
 
 	return deleted, &s3RewriteResult{newPath: newRelativePath, sizeBytes: sizeBytes, sha256: sha256hex}, nil
 }
 
 // isRemoteBackend returns true if the storage backend requires a remote rewrite
-// (download to local temp file, then re-upload). Covers S3 and Azure Blob.
+// (download to local temp file, then re-upload): every backend that is not
+// local, by Type().
+//
+// It used to list *S3Backend and *AzureBlobBackend, and any other backend fell
+// through to rewriteLocalFile, which treats the object URL as a directory
+// path: filepath.Dir("gs://b/k") is the relative "gs:/b", MkdirAll creates it,
+// the surviving rows land on this node's disk, and the original object is then
+// deleted from the bucket. A data-loss path for the next backend, not a
+// refusal (#1105). The remote rewrite (rewriteS3File) is not S3-specific: DuckDB
+// reads the object URL over its secret for that scheme, and the Backend
+// uploads the result, so it is right for any object store DuckDB can read.
 func (h *DeleteHandler) isRemoteBackend() bool {
-	switch h.storage.(type) {
-	case *storage.S3Backend, *storage.AzureBlobBackend:
-		return true
-	}
-	return false
+	return h.storage != nil && h.storage.Type() != "local"
 }
 
 func (h *DeleteHandler) recordRewriteTiering(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult) error {

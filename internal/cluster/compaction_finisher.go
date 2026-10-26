@@ -391,12 +391,18 @@ func (c *Coordinator) deleteObjectInputs(ctx context.Context, s raft.StagedCompa
 		}
 		return fmt.Errorf("%w: %s", errInputsSettling, settling)
 	}
-	for _, p := range del {
-		if err := c.storage.Delete(ctx, p); err != nil && !storage.IsNotFound(err) {
-			return err
+	// Under the lease like the copy: an input delete that a rate-limited
+	// store retries for most of a minute (GCS answers 429 to fast writes to
+	// one name, #1105) would otherwise let the takeover window pass and a
+	// second finisher start on the same job.
+	return c.withLease(ctx, s.Job, func(ctx context.Context) error {
+		for _, p := range del {
+			if err := c.storage.Delete(ctx, p); err != nil && !storage.IsNotFound(err) {
+				return err
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // outputLeft ends a job whose output left the manifest after its commit.

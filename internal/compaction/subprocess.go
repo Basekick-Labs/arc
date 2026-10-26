@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -57,7 +58,7 @@ type SubprocessJobConfig struct {
 	Threads int `json:"threads,omitempty"`
 
 	// Storage configuration
-	StorageType   string `json:"storage_type"`   // Backend.Type(): "local", "s3" or "azure"
+	StorageType   string `json:"storage_type"`   // Backend.Type(): "local", "s3", "azure" or "gcs"
 	StorageConfig string `json:"storage_config"` // Backend.ConfigJSON(): no secrets
 	// Credentials authenticate the subprocess's storage backend the way the
 	// parent's was authenticated (#1104). It travels only in this job, which
@@ -137,6 +138,12 @@ type SubprocessCredentials struct {
 	AzureAccountKey         string `json:"azure_account_key,omitempty"`
 	AzureSASToken           string `json:"azure_sas_token,omitempty"`
 	AzureUseManagedIdentity bool   `json:"azure_use_managed_identity,omitempty"`
+
+	// GCS (#1105): a service-account key, as its contents or its path. Both
+	// empty means Application Default Credentials, which the subprocess
+	// resolves from the environment and metadata server it inherits.
+	GCSCredentialsJSON string `json:"gcs_credentials_json,omitempty"`
+	GCSCredentialsFile string `json:"gcs_credentials_file,omitempty"`
 }
 
 // String and GoString keep the secrets out of any %v, %+v or %#v that ever
@@ -161,6 +168,10 @@ func subprocessCredentials(backend storage.Backend) *SubprocessCredentials {
 		creds.AzureAccountKey = auth.AccountKey
 		creds.AzureSASToken = auth.SASToken
 		creds.AzureUseManagedIdentity = auth.UseManagedIdentity
+	case *storage.GCSBackend:
+		auth := b.Credentials()
+		creds.GCSCredentialsJSON = auth.CredentialsJSON
+		creds.GCSCredentialsFile = auth.CredentialsFile
 	}
 	return creds
 }
@@ -209,6 +220,12 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// compacting with a wrong zone corrupts data, not just query results.
 	if _, err := db.Exec("SET TimeZone='UTC'"); err != nil {
 		return nil, fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
+	}
+	// Read a GeoParquet file's geometry column as BLOB, as the query engine
+	// does (#440): with conversion on, a partition holding one such file next
+	// to Arc's BLOB files fails to compact on every cycle.
+	if err := database.DisableGeoParquetConversion(context.Background(), db); err != nil {
+		return nil, err
 	}
 
 	// Set DuckDB memory limit from config. Exceeding it makes DuckDB spill to
@@ -508,9 +525,34 @@ func backendSpecFromJob(config *SubprocessJobConfig, getenv func(string) string)
 			spec.Azure.UseManagedIdentity = key == ""
 		}
 
+	case "gcs":
+		var c struct {
+			Bucket   string `json:"bucket"`
+			Prefix   string `json:"prefix"`
+			Endpoint string `json:"endpoint"`
+		}
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse GCS storage config: %w", err)
+		}
+		spec.GCS = storage.GCSConfig{
+			Bucket:   c.Bucket,
+			Prefix:   c.Prefix,
+			Endpoint: c.Endpoint,
+			// The parent probed the bucket and proved the key at startup;
+			// repeating both per job would add requests and failure points
+			// to every compaction.
+			SkipProbe: true,
+		}
+		// With neither set, the subprocess uses Application Default
+		// Credentials from the environment it inherits, as the parent did.
+		if creds != nil {
+			spec.GCS.CredentialsJSON = creds.GCSCredentialsJSON
+			spec.GCS.CredentialsFile = creds.GCSCredentialsFile
+		}
+
 	default:
 		// NewBackend accepts aliases (minio, azblob) that Backend.Type() never
-		// emits; the job only ever carries these three.
+		// emits; the job only ever carries these four.
 		return spec, fmt.Errorf("unsupported storage type: %s", config.StorageType)
 	}
 	return spec, nil
@@ -523,7 +565,7 @@ var sqlErrorMarkers = []string{"binder error", "catalog error", "parser error"}
 
 // memoryErrorMarkers indicate memory pressure; retrying with a smaller batch
 // is exactly the right response.
-var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed"}
+var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed", "bad_alloc"}
 
 // permanentErrorMarkers are failures no retry can fix: the input is gone or
 // unreadable. Both streams are searched for each one - see ClassifySubprocessError.
@@ -574,6 +616,11 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		if strings.Contains(errStr, "killed") {
 			return true, "killed"
 		}
+		// A C++ abort: DuckDB's std::bad_alloc when stderr says so (the
+		// memory markers below), otherwise an unknown crash.
+		if strings.Contains(errStr, "aborted") && !containsAny(errLower+stderrLower, memoryErrorMarkers) {
+			return true, "aborted"
+		}
 	}
 
 	// Check exit codes for OOM (137 = SIGKILL, often OOM killer)
@@ -588,6 +635,18 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 	}
 
+	// Memory errors before SQL errors: a child that died of memory (a Go
+	// runtime "out of memory", a std::bad_alloc abort) embeds its whole stderr,
+	// whose earlier warn lines may quote SQL error text, and classifying that
+	// as a permanent SQL error left a too-wide partition failing every cycle.
+	// A real SQL error arrives alone through the JSON result and carries no
+	// memory marker.
+	for _, marker := range memoryErrorMarkers {
+		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
+			return true, "memory_error"
+		}
+	}
+
 	// Deterministic DuckDB SQL errors — permanent at any batch size, so the
 	// splitter's retry ladder (each rung re-downloads the whole batch) is pure
 	// waste. These arrive via the JSON result path, so they appear in err
@@ -595,13 +654,6 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	for _, marker := range sqlErrorMarkers {
 		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
 			return false, "sql_error"
-		}
-	}
-
-	// Check for memory-related errors in either stream.
-	for _, marker := range memoryErrorMarkers {
-		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
-			return true, "memory_error"
 		}
 	}
 
@@ -675,4 +727,13 @@ func subprocessResult(job *Job, err error) *SubprocessJobResult {
 		result.Error = err.Error()
 	}
 	return result
+}
+
+func containsAny(s string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }

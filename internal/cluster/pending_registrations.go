@@ -111,7 +111,7 @@ type PendingStore interface {
 }
 
 // IsSharedObjectStore reports whether b is an object store every node reads
-// and writes (S3, Azure), as opposed to a node's own disk.
+// and writes (S3, Azure, GCS), as opposed to a node's own disk.
 func IsSharedObjectStore(b storage.Backend) bool {
 	if b == nil {
 		return false

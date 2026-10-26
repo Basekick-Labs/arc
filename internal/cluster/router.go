@@ -337,12 +337,13 @@ func (r *Router) forwardWriteOnce(ctx context.Context, client *http.Client, node
 	}
 }
 
-// apiHostPort is the address to reach node's HTTP API at. A node that binds
+// APIHostPort is the address to reach node's HTTP API at. A node that binds
 // every interface advertises its API as ":<port>" (cmd/arc main.go): that
 // has no host, and dialing it reaches this node itself. The host is then the
 // one of its cluster coordinator address, which the cluster already dials
 // (#1270: on the QA rig every forward looped back to the sender).
-func apiHostPort(node *Node) string {
+// The API port is preserved; explicit API hosts are left unchanged.
+func APIHostPort(node *Node) string {
 	host, port, err := net.SplitHostPort(node.APIAddress)
 	if err != nil || (host != "" && host != "0.0.0.0" && host != "::") {
 		return node.APIAddress
@@ -379,7 +380,7 @@ func (r *Router) doForwardOnce(ctx context.Context, client *http.Client, node *N
 	defer r.decrementConns(node.ID)
 	targetURL := (&url.URL{
 		Scheme:   r.cfg.Scheme,
-		Host:     apiHostPort(node),
+		Host:     APIHostPort(node),
 		Path:     originalReq.URL.Path,
 		RawPath:  originalReq.URL.RawPath,
 		RawQuery: originalReq.URL.RawQuery,
@@ -553,7 +554,7 @@ func (r *Router) doForward(ctx context.Context, client *http.Client, node *Node,
 	// containing spaces or non-ASCII bytes are forwarded intact.
 	targetURL := (&url.URL{
 		Scheme:   r.cfg.Scheme,
-		Host:     apiHostPort(node),
+		Host:     APIHostPort(node),
 		Path:     originalReq.URL.Path,
 		RawPath:  originalReq.URL.RawPath,
 		RawQuery: originalReq.URL.RawQuery,
