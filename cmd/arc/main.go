@@ -9,11 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3954,7 +3952,7 @@ func main() {
 	// when cluster.tls_enabled is false the getter returns nil
 	// and the transport falls back to plaintext (or system roots
 	// if the URL is https://). No Client.Timeout: the per-request
-	// context.WithTimeout below is the policy bound; an extra
+	// context.WithTimeout in invalidatePeerQueryCaches is the policy bound; an extra
 	// Client.Timeout would be redundant dead config.
 	var clusterHTTPClient *http.Client
 	var clusterScheme string
@@ -4003,60 +4001,8 @@ func main() {
 				if node.ID == localNode.ID {
 					continue
 				}
-				go func(n *cluster.Node) {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-
-					// Compute the HMAC once per request: a fresh nonce
-					// (32 random bytes, hex-encoded) binds the MAC to a
-					// single attempt; the timestamp binds it to a
-					// 5-minute freshness window. Receiver replay-checks
-					// (nonce, sender nodeID) against its NonceCache.
-					nonce, err := security.GenerateNonce()
-					if err != nil {
-						log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to generate nonce for cache invalidation")
-						return
-					}
-					ts := time.Now().Unix()
-					mac := security.ComputeCacheInvalidateHMAC(
-						cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
-					)
-
-					// Build via *url.URL so an IPv6 literal in
-					// n.APIAddress (e.g. "[::1]:8000") survives
-					// unmangled. CacheInvalidatePath is a known-safe
-					// constant path, so we don't need to escape it.
-					peerURL := (&url.URL{
-						Scheme: clusterScheme,
-						Host:   n.APIAddress,
-						Path:   api.CacheInvalidatePath,
-					}).String()
-					req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, nil)
-					if err != nil {
-						log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
-						return
-					}
-					req.Header.Set("X-Arc-Node-ID", localNode.ID)
-					req.Header.Set("X-Arc-Cluster", cfg.Cluster.ClusterName)
-					req.Header.Set("X-Arc-Nonce", nonce)
-					req.Header.Set("X-Arc-Timestamp", strconv.FormatInt(ts, 10))
-					req.Header.Set("X-Arc-HMAC", mac)
-
-					resp, err := clusterHTTPClient.Do(req)
-					if err != nil {
-						log.Warn().Err(err).Str("node_id", n.ID).Str("address", n.APIAddress).
-							Msg("Failed to invalidate cache on remote node")
-						return
-					}
-					defer resp.Body.Close()
-					_, _ = io.Copy(io.Discard, resp.Body)
-					if resp.StatusCode != http.StatusNoContent {
-						log.Warn().Int("status", resp.StatusCode).Str("node_id", n.ID).
-							Msg("Unexpected status from cache invalidation")
-					} else {
-						log.Debug().Str("node_id", n.ID).Msg("Remote query caches invalidated")
-					}
-				}(node)
+				go invalidatePeerQueryCaches(clusterHTTPClient, clusterScheme, node,
+					cfg.Cluster.SharedSecret, localNode.ID, cfg.Cluster.ClusterName, log.Logger)
 			}
 		}
 	}
