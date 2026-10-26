@@ -1831,6 +1831,15 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Failed flushes report rows without a WAL copy ([#1377](https://github.com/Basekick-Labs/arc/issues/1377))
+
+A failed flush now logs how many rows had no complete WAL copy and increments
+`arc_buffer_records_dropped_total`, so rows lost with the WAL disabled are
+reported rather than incorrectly described as recoverable.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1379](https://github.com/Basekick-Labs/arc/pull/1379).
+
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
 The Parquet import stored every binary column (a BYTE_ARRAY without a string

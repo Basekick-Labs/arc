@@ -81,6 +81,7 @@ type Metrics struct {
 	bufferMemoryLimit     atomic.Int64
 	bufferMemoryPressure  atomic.Int64
 	bufferRecordsWritten  atomic.Int64
+	bufferRecordsDropped  atomic.Int64
 	bufferFlushesTotal    atomic.Int64
 	bufferErrorsTotal     atomic.Int64
 	bufferFlushFailures   atomic.Int64
@@ -548,6 +549,7 @@ func (m *Metrics) SetBufferRecordsWritten(count int64)  { m.bufferRecordsWritten
 func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.Store(count) }
 func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
 func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
+func (m *Metrics) IncBufferRecordsDropped(count int64)  { m.bufferRecordsDropped.Add(count) }
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
 func (m *Metrics) SetBufferRecordsQueued(count int64)   { m.bufferRecordsQueued.Store(count) }
 func (m *Metrics) SetBufferRecordsInflight(count int64) { m.bufferRecordsInflight.Store(count) }
@@ -1189,6 +1191,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"buffer_memory_limit_bytes":       m.bufferMemoryLimit.Load(),
 		"buffer_memory_pressure":          m.bufferMemoryPressure.Load(),
 		"buffer_records_written":          m.bufferRecordsWritten.Load(),
+		"buffer_records_dropped_total":    m.bufferRecordsDropped.Load(),
 		"buffer_flushes_total":            m.bufferFlushesTotal.Load(),
 		"buffer_errors_total":             m.bufferErrorsTotal.Load(),
 		"buffer_flush_failures_total":     m.bufferFlushFailures.Load(),
@@ -1542,11 +1545,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_buffer_records_written_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_records_written_total", float64(m.bufferRecordsWritten.Load()))
 
+	b = append(b, "# HELP arc_buffer_records_dropped_total Records dropped from the buffer after a flush failure when no complete WAL copy was available\n"...)
+	b = append(b, "# TYPE arc_buffer_records_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_records_dropped_total", float64(m.bufferRecordsDropped.Load()))
+
 	b = append(b, "# HELP arc_buffer_flushes_total Total buffer flushes\n"...)
 	b = append(b, "# TYPE arc_buffer_flushes_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_flushes_total", float64(m.bufferFlushesTotal.Load()))
 
-	b = append(b, "# HELP arc_buffer_flush_failures_total Total buffer flush failures preserved for WAL recovery\n"...)
+	b = append(b, "# HELP arc_buffer_flush_failures_total Total buffer flush failures\n"...)
 	b = append(b, "# TYPE arc_buffer_flush_failures_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_flush_failures_total", float64(m.bufferFlushFailures.Load()))
 
