@@ -1831,6 +1831,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Query transformations check emitted storage scopes against RBAC ([#1261](https://github.com/Basekick-Labs/arc/pull/1261))
+
+Queries check database and measurement scopes resolved by the transform before
+execution, including cached transforms and ArcX dispatch. User-supplied file
+readers and replacement scans are also rejected at the transform boundary.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
+
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
 The Parquet import stored every binary column (a BYTE_ARRAY without a string
