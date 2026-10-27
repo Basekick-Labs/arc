@@ -1831,6 +1831,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Azure Blob Storage error messages are shorter
+
+Errors from the Azure Blob Storage backend are shorter. Azure credential
+values (connection string, SAS token, account key) and the endpoint are
+trimmed of surrounding whitespace, so a value read from a file with a trailing
+newline works everywhere it is used; one with another control character is
+refused at startup.
+
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
 The Parquet import stored every binary column (a BYTE_ARRAY without a string

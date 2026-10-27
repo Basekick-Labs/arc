@@ -27,6 +27,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/credscrub"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/edgesync"
 	"github.com/basekick-labs/arc/internal/fieldschema"
@@ -5248,6 +5249,14 @@ func main() {
 		return server.Shutdown(shutdownTimeout)
 	}, shutdown.PriorityHTTPServer)
 
+	// Clear credential material that earlier versions could leave in stored
+	// error messages (tiering, retention, continuous query and MQTT history,
+	// the edge-sync ledger), in every SQLite file that may hold them. After
+	// every subsystem has created its tables and before the node is marked
+	// ready, so no reader sees the old text. Once per column (credscrub
+	// keeps a marker), bounded, never fatal.
+	scrubStoredCredentialText(authManager, []string{cfg.Auth.DBPath, cfg.Retention.DBPath, cfg.ContinuousQuery.DBPath}, logger.Get("credscrub"))
+
 	// Mark /ready=200 so the load balancer (Pattern 2 multi-writer) starts
 	// routing traffic here. By this point WAL recovery has completed
 	// (cmd/arc/main.go:701-724), the Arrow buffer is initialised, the
@@ -5300,6 +5309,51 @@ var exitCode atomic.Int32
 // instance is not claimed. A restart policy that restarts only on failure
 // (systemd Restart=on-failure, Kubernetes) restarts it.
 const exitCodeInstanceClaimed = 3
+
+// scrubStoredCredentialText runs credscrub over each distinct SQLite file in
+// paths. The auth database is reached through the auth manager's handle when
+// there is one; any other file is opened only if it already exists, since a
+// file this node never created holds no old text.
+func scrubStoredCredentialText(authManager *auth.AuthManager, paths []string, logger zerolog.Logger) {
+	seen := map[string]bool{}
+	for _, p := range paths {
+		if p == "" || strings.HasPrefix(p, ":memory:") || strings.HasPrefix(p, "file::memory:") {
+			continue
+		}
+		key := p
+		if abs, err := filepath.Abs(p); err == nil {
+			key = abs
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if authManager.SharesDBPath(p) {
+			_, _ = credscrub.Run(ctx, authManager.GetDB(), logger)
+			cancel()
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			cancel()
+			continue
+		}
+		sep := "?"
+		if strings.Contains(p, "?") {
+			sep = "&"
+		}
+		db, err := sql.Open("sqlite3", p+sep+"_busy_timeout=5000&_journal_mode=WAL")
+		if err != nil {
+			logger.Warn().Err(err).Str("path", p).Msg("Could not open a database to clear stored error text")
+			cancel()
+			continue
+		}
+		db.SetMaxOpenConns(1)
+		_, _ = credscrub.Run(ctx, db, logger)
+		cancel()
+		_ = db.Close()
+	}
+}
 
 // sharedSQLiteHandle returns the SQLite handle a feature should use for the
 // shared metadata database, preferring the auth manager's existing connection.

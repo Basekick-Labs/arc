@@ -1682,3 +1682,21 @@ func TestLoad_GCSColdTierValidation(t *testing.T) {
 		})
 	}
 }
+
+// Azure credentials read from a file usually end in a newline; every consumer
+// must see the same trimmed value.
+func TestLoad_AzureCredentialsTrimmed(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("ARC_STORAGE_BACKEND", "azure")
+	t.Setenv("ARC_STORAGE_AZURE_ACCOUNT_NAME", "acct")
+	t.Setenv("ARC_STORAGE_AZURE_CONTAINER", "c")
+	t.Setenv("ARC_STORAGE_AZURE_SAS_TOKEN", "sv=1&sig=abc\n")
+	t.Setenv("ARC_STORAGE_AZURE_ACCOUNT_KEY", " key== \n")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Storage.AzureSASToken != "sv=1&sig=abc" || cfg.Storage.AzureAccountKey != "key==" {
+		t.Fatalf("not trimmed: %q %q", cfg.Storage.AzureSASToken, cfg.Storage.AzureAccountKey)
+	}
+}
