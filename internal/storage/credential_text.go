@@ -15,7 +15,9 @@ var (
 	// dropped. Stops at whitespace, quotes, angle brackets and a backslash,
 	// which is where Go's error formats, XML bodies and JSON-escaped text end
 	// an address (so a stored JSON document stays valid).
-	credURLWithQuery = regexp.MustCompile(`(https?://[^\s"'<>?\\]*)\?[^\s"'<>\\]*`)
+	// Inside the query, a JSON-escaped "&" (\u0026) is part of it, so
+	// escaped text loses the same query as plain text.
+	credURLWithQuery = regexp.MustCompile(`(https?://[^\s"'<>?\\]*)\?(?:[^\s"'<>\\]|\\u0026)*`)
 	// A connection string's signature field: its value runs to the next ";"
 	// (it contains "&" itself).
 	credSignatureField = regexp.MustCompile(`(?i)(^|[^a-z])(SharedAccessSignature)=[^;\s"'<>\\]+`)

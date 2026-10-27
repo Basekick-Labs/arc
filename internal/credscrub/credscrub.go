@@ -12,24 +12,27 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// column is one stored error-text column.
-type column struct{ table, name string }
+// column is one stored error-text column. where, if set, narrows the rows
+// that can hold error text (and lets an index carry the scan).
+type column struct{ table, name, where string }
 
 // columns are every column that has held storage error text. A table or
 // column this node never created is skipped.
 var columns = []column{
-	{"tier_migrations", "error"},
-	{"tier_files", "quarantine_reason"},
-	{"retention_executions", "error_message"},
-	{"retention_executions_dormant", "error_message"},
-	{"continuous_query_executions", "error_message"},
-	{"continuous_query_executions_dormant", "error_message"},
-	{"mqtt_subscriptions", "error_message"},
-	{"sync_ledger", "last_error"},
+	{"tier_migrations", "error", ""},
+	{"tier_files", "quarantine_reason", ""},
+	{"retention_executions", "error_message", ""},
+	{"retention_executions_dormant", "error_message", ""},
+	{"continuous_query_executions", "error_message", ""},
+	{"continuous_query_executions_dormant", "error_message", ""},
+	{"mqtt_subscriptions", "error_message", ""},
+	{"sync_ledger", "last_error", ""},
 	// Audit details are JSON (a reconciliation abort records its error
 	// there); the redactor keeps JSON escaping intact. Audit rows carry no
 	// integrity chain, so rewriting the text breaks nothing.
-	{"audit_logs", "detail"},
+	// Only aborted reconciliation runs record an error there; the event-type
+	// index keeps a large audit table from being scanned in full.
+	{"audit_logs", "detail", "event_type = 'reconcile.run_aborted'"},
 }
 
 // batchSize bounds each UPDATE transaction, so the scrub never holds the
@@ -127,8 +130,12 @@ func columnExists(ctx context.Context, db *sql.DB, c column) (bool, error) {
 func scrubColumn(ctx context.Context, db *sql.DB, c column) (int, error) {
 	// Identifiers come from the columns table above, never from input.
 	col := fmt.Sprintf("%q", c.name)
+	cond := fmt.Sprintf(candidates, col)
+	if c.where != "" {
+		cond = c.where + " AND " + cond
+	}
 	sel := fmt.Sprintf(`SELECT rowid, %s FROM %q WHERE rowid > ? AND %s ORDER BY rowid LIMIT %d`,
-		col, c.table, fmt.Sprintf(candidates, col), batchSize)
+		col, c.table, cond, batchSize)
 	// Only if the text is still what was read: a subsystem running alongside
 	// (an MQTT subscription clearing its error, a retry recording a new one)
 	// must not have its write replaced by a stale, scrubbed copy.
@@ -171,11 +178,14 @@ func scrubColumn(ctx context.Context, db *sql.DB, c column) (int, error) {
 		}
 		for _, r := range batch {
 			if clean := storage.RedactCredentialText(r.text); clean != r.text {
-				if _, err := tx.ExecContext(ctx, upd, clean, r.id, r.text); err != nil {
+				res, err := tx.ExecContext(ctx, upd, clean, r.id, r.text)
+				if err != nil {
 					_ = tx.Rollback()
 					return changed, err
 				}
-				changed++
+				if n, _ := res.RowsAffected(); n > 0 {
+					changed++
+				}
 			}
 		}
 		if err := tx.Commit(); err != nil {

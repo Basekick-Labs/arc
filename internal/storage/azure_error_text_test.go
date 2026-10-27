@@ -45,7 +45,7 @@ func TestRedactCredentialText(t *testing.T) {
 		{"status 403 for https://h/c/db/m/f.parquet", "status 403 for https://h/c/db/m/f.parquet"},
 		// JSON-escaped (as stored in an audit record's detail): the escaping
 		// survives, so the document stays valid.
-		{`{"abort_message":"Get \"https://h/c?comp=list\u0026sig=abc\": EOF"}`, `{"abort_message":"Get \"https://h/c\u0026sig=REDACTED\": EOF"}`},
+		{`{"abort_message":"Get \"https://h/c?comp=list\u0026sig=abc\": EOF"}`, `{"abort_message":"Get \"https://h/c\": EOF"}`},
 		{`{"m":"x\u0026sig=abc\u0026sp=r"}`, `{"m":"x\u0026sig=REDACTED\u0026sp=r"}`},
 		{"SIG=abc at the start", "SIG=REDACTED at the start"},
 	} {

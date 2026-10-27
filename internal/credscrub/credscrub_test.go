@@ -107,21 +107,23 @@ func TestRunScrubsAuditDetailJSON(t *testing.T) {
 	}
 	db.SetMaxOpenConns(1)
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE audit_logs (id INTEGER PRIMARY KEY, detail TEXT)`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE audit_logs (id INTEGER PRIMARY KEY, event_type TEXT, detail TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	detail, _ := json.Marshal(map[string]string{
 		"run_id":        "r1",
 		"abort_message": `walk failed: Get "https://acct.blob.core.windows.net/c?comp=list&sig=AUDITSECRET1": EOF`,
 	})
-	if _, err := db.Exec(`INSERT INTO audit_logs (detail) VALUES (?)`, string(detail)); err != nil {
+	// Only aborted reconciliation runs record error text; other events are
+	// not read (a large audit table is scanned through the event-type index).
+	if _, err := db.Exec(`INSERT INTO audit_logs (event_type, detail) VALUES ('reconcile.run_aborted', ?), ('http.request', ?)`, string(detail), string(detail)); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := Run(context.Background(), db, zerolog.Nop()); err != nil || n != 1 {
 		t.Fatalf("rewrote %d, %v; want 1", n, err)
 	}
 	var got string
-	if err := db.QueryRow(`SELECT detail FROM audit_logs`).Scan(&got); err != nil {
+	if err := db.QueryRow(`SELECT detail FROM audit_logs WHERE event_type = 'reconcile.run_aborted'`).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	var back map[string]string

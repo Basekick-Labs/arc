@@ -231,7 +231,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	}
 	defer resp.Body.Close()
 
-	if err := checkHTTPStatus(resp); err != nil {
+	if err := checkHTTPStatus(resp, c.licenseKey); err != nil {
 		return nil, fmt.Errorf("license activation failed: %w", err)
 	}
 	var activateResp ActivateResponse
@@ -322,7 +322,7 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	}
 	defer resp.Body.Close()
 
-	if err := checkHTTPStatus(resp); err != nil {
+	if err := checkHTTPStatus(resp, c.licenseKey); err != nil {
 		return nil, fmt.Errorf("license validation failed: %w", err)
 	}
 	var verifyResp VerifyResponse
@@ -616,7 +616,10 @@ func (c *Client) bindFingerprint(signed *SignedLicense) error {
 // protocol's own JSON error shape — a bare/HTML 4xx is an ingress artifact
 // (the field incident: deploy-window 404s crash-looped a cluster). The message
 // embeds a bounded, rune-safe preview of the body for diagnosis.
-func checkHTTPStatus(resp *http.Response) error {
+//
+// secrets are removed from the preview: a proxy's error page can echo the
+// request, whose address carries the licence key on verify.
+func checkHTTPStatus(resp *http.Response, secrets ...string) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
@@ -625,6 +628,11 @@ func checkHTTPStatus(resp *http.Response) error {
 	// certainly an HTML error page from an upstream proxy; truncate.
 	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	previewStr := strings.TrimSpace(string(preview))
+	for _, s := range secrets {
+		if s != "" {
+			previewStr = strings.ReplaceAll(previewStr, s, "REDACTED")
+		}
+	}
 	// Rune-safe truncation: a byte-slice cut can split a multi-byte
 	// UTF-8 sequence and leave the error string invalid (turns the
 	// log line into mojibake). Counting runes preserves character
