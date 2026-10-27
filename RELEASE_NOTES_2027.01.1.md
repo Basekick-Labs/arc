@@ -1837,7 +1837,8 @@ Errors from the Azure Blob Storage backend are shorter. Azure credential
 values (connection string, SAS token, account key) and the endpoint are
 trimmed of surrounding whitespace, so a value read from a file with a trailing
 newline works everywhere it is used; one with another control character is
-refused at startup.
+refused at startup. Errors from the licence server check are shorter in the
+same way.
 
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 

@@ -12,15 +12,19 @@ const redactedMark = "REDACTED"
 
 var (
 	// An http(s) address with anything after "?": the part from "?" on is
-	// dropped. Stops at whitespace and quote characters, which is where
-	// Go's error formats end an address.
-	credURLWithQuery = regexp.MustCompile(`(https?://[^\s"'<>?]*)\?[^\s"'<>]*`)
+	// dropped. Stops at whitespace, quotes, angle brackets and a backslash,
+	// which is where Go's error formats, XML bodies and JSON-escaped text end
+	// an address (so a stored JSON document stays valid).
+	// Inside the query, a JSON-escaped "&" (\u0026) is part of it, so
+	// escaped text loses the same query as plain text.
+	credURLWithQuery = regexp.MustCompile(`(https?://[^\s"'<>?\\]*)\?(?:[^\s"'<>\\]|\\u0026)*`)
 	// A connection string's signature field: its value runs to the next ";"
 	// (it contains "&" itself).
-	credSignatureField = regexp.MustCompile(`(?i)\b(SharedAccessSignature)=[^;\s"'<>]+`)
+	credSignatureField = regexp.MustCompile(`(?i)(^|[^a-z])(SharedAccessSignature)=[^;\s"'<>\\]+`)
 	// Credential fields that can appear outside an address: in a response
-	// body, or in a connection string.
-	credKeyValue = regexp.MustCompile(`(?i)\b(sig|AccountKey)=[^&;\s"'<>]+`)
+	// body, or in a connection string. Preceded by anything but a letter, so
+	// a JSON-escaped "\u0026sig=" matches too.
+	credKeyValue = regexp.MustCompile(`(?i)(^|[^a-z])(sig|AccountKey)=[^&;\s"'<>\\]+`)
 )
 
 // RedactCredentialText removes credential material from text that may reach
@@ -35,8 +39,8 @@ func RedactCredentialText(s string, secrets ...string) string {
 		}
 	}
 	s = credURLWithQuery.ReplaceAllString(s, "$1")
-	s = credSignatureField.ReplaceAllString(s, "$1="+redactedMark)
-	return credKeyValue.ReplaceAllString(s, "$1="+redactedMark)
+	s = credSignatureField.ReplaceAllString(s, "$1$2="+redactedMark)
+	return credKeyValue.ReplaceAllString(s, "$1$2="+redactedMark)
 }
 
 // redactedError is an error whose text has been through RedactCredentialText.

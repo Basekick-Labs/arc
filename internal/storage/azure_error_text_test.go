@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -37,15 +38,26 @@ func noRetries(t *testing.T) {
 func TestRedactCredentialText(t *testing.T) {
 	for _, c := range []struct{ in, want string }{
 		{`Get "https://acct.blob.core.windows.net/c?comp=list&sig=abc": EOF`, `Get "https://acct.blob.core.windows.net/c": EOF`},
-		{`parse "http://h/c/k?sv=1&sig=abc\n": net/url: invalid control character in URL`, `parse "http://h/c/k": net/url: invalid control character in URL`},
+		{`parse "http://h/c/k?sv=1&sig=abc\n": net/url: invalid control character in URL`, `parse "http://h/c/k\n": net/url: invalid control character in URL`},
 		{"body: <Url>https://h/c?x=1&sig=abc</Url>", "body: <Url>https://h/c</Url>"},
 		{"BlobEndpoint=https://h;SharedAccessSignature=sv=1&sig=abc;", "BlobEndpoint=https://h;SharedAccessSignature=REDACTED;"},
 		{"DefaultEndpointsProtocol=https;AccountName=a;AccountKey=abc==", "DefaultEndpointsProtocol=https;AccountName=a;AccountKey=REDACTED"},
 		{"status 403 for https://h/c/db/m/f.parquet", "status 403 for https://h/c/db/m/f.parquet"},
+		// JSON-escaped (as stored in an audit record's detail): the escaping
+		// survives, so the document stays valid.
+		{`{"abort_message":"Get \"https://h/c?comp=list\u0026sig=abc\": EOF"}`, `{"abort_message":"Get \"https://h/c\": EOF"}`},
+		{`{"m":"x\u0026sig=abc\u0026sp=r"}`, `{"m":"x\u0026sig=REDACTED\u0026sp=r"}`},
+		{"SIG=abc at the start", "SIG=REDACTED at the start"},
 	} {
 		if got := RedactCredentialText(c.in); got != c.want {
 			t.Errorf("RedactCredentialText(%q)\n got %q\nwant %q", c.in, got, c.want)
 		}
+	}
+	// A JSON document stays valid after redaction.
+	doc, _ := json.Marshal(map[string]string{"abort_message": `Get "https://h/c?comp=list&sig=SECRETABC": EOF`, "n": `x&sig=SECRETDEF&sp=r`})
+	var back map[string]string
+	if out := RedactCredentialText(string(doc)); strings.Contains(out, "SECRET") || json.Unmarshal([]byte(out), &back) != nil {
+		t.Errorf("JSON document: %s", out)
 	}
 	if got := RedactCredentialText("token secretvalue123 here", "secretvalue123"); strings.Contains(got, "secretvalue123") {
 		t.Errorf("literal secret kept: %q", got)
