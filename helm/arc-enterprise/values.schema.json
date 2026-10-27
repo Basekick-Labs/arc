@@ -157,6 +157,13 @@
         "shared": {
           "type": "object",
           "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "s3",
+                "gcs"
+              ]
+            },
             "external": {
               "type": "boolean"
             },
@@ -193,6 +200,21 @@
                 },
                 "secretKey": {
                   "type": "string"
+                }
+              }
+            },
+            "gcs": {
+              "type": "object",
+              "properties": {
+                "endpoint": {
+                  "type": "string"
+                },
+                "credentialsSecret": {
+                  "type": "string"
+                },
+                "credentialsKey": {
+                  "type": "string",
+                  "minLength": 1
                 }
               }
             }
@@ -304,6 +326,17 @@
                 "fsync",
                 "async"
               ]
+            },
+            "diskPressureEnabled": {
+              "type": "boolean"
+            },
+            "diskMinFreeMB": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxDirectoryMB": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         },

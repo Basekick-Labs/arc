@@ -183,6 +183,48 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 	}
 	takeoverGroup.Get("", h.handleGetStreamClaims)
 	takeoverGroup.Post("/:instance/release", h.handleReleaseStreamClaim)
+
+	// Admin-only: end a compaction job that waits for an operator (#1207
+	// d2a2b; GET /api/v1/cluster lists them as compaction_commit.wedged_jobs).
+	compactionJobsGroup := app.Group("/api/v1/cluster/compaction-jobs")
+	if h.authManager != nil {
+		compactionJobsGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	compactionJobsGroup.Post("/:job/abort", h.handleAbortWedgedCompaction)
+
+	// Admin-only: each node's own retention policies, and choosing the node
+	// whose policies the cluster adopts (#1324). Leader only.
+	policiesGroup := app.Group("/api/v1/cluster/policies")
+	if h.authManager != nil {
+		policiesGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	policiesGroup.Get("", h.handleGetPolicyCandidates)
+	policiesGroup.Post("/adopt", h.handleAdoptPolicies)
+}
+
+// handleAbortWedgedCompaction ends a wedged compaction job.
+func (h *ClusterHandler) handleAbortWedgedCompaction(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node",
+		})
+	}
+	job := c.Params("job")
+	if err := h.coordinator.AbortWedgedCompaction(c.Context(), job); err != nil {
+		status := fiber.StatusInternalServerError
+		switch {
+		case errors.Is(err, cluster.ErrCompactionJobNotFound):
+			status = fiber.StatusNotFound
+		case errors.Is(err, cluster.ErrCompactionJobNotWedged), errors.Is(err, cluster.ErrClusterRaftNotConfigured):
+			status = fiber.StatusConflict
+		}
+		if status == fiber.StatusInternalServerError {
+			h.logger.Error().Err(err).Str("job", job).Msg("Failed to abort a wedged compaction job")
+		}
+		return c.Status(status).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"success": true, "job": job})
 }
 
 // handleGetStreamClaims returns the writer processes, claims and departed

@@ -16,7 +16,7 @@ func newTestRegistry(historySize int) *Registry {
 func TestRegistry_RegisterAndGetActive(t *testing.T) {
 	r := newTestRegistry(10)
 
-	queryID, ctx := r.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, ctx := r.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	if queryID == "" {
 		t.Fatal("expected non-empty query ID")
 	}
@@ -46,7 +46,7 @@ func TestRegistry_RegisterAndGetActive(t *testing.T) {
 func TestRegistry_Complete(t *testing.T) {
 	r := newTestRegistry(10)
 
-	queryID, _ := r.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, _ := r.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	r.Complete(queryID, 42)
 
 	if r.ActiveCount() != 0 {
@@ -71,7 +71,7 @@ func TestRegistry_Complete(t *testing.T) {
 func TestRegistry_Fail(t *testing.T) {
 	r := newTestRegistry(10)
 
-	queryID, _ := r.Register(context.Background(), "SELECT bad", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, _ := r.Register(context.Background(), "SELECT bad", 1, "test-token", "127.0.0.1")
 	r.Fail(queryID, "syntax error")
 
 	if r.ActiveCount() != 0 {
@@ -93,7 +93,7 @@ func TestRegistry_Fail(t *testing.T) {
 func TestRegistry_TimedOut(t *testing.T) {
 	r := newTestRegistry(10)
 
-	queryID, _ := r.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, _ := r.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1")
 	r.TimedOut(queryID)
 
 	history := r.GetHistory(0)
@@ -108,7 +108,7 @@ func TestRegistry_TimedOut(t *testing.T) {
 func TestRegistry_Cancel(t *testing.T) {
 	r := newTestRegistry(10)
 
-	queryID, ctx := r.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, ctx := r.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1")
 
 	// Cancel the query
 	ok := r.Cancel(queryID)
@@ -139,7 +139,7 @@ func TestRegistry_Cancel(t *testing.T) {
 
 func TestRegistry_CancelWithReason(t *testing.T) {
 	r := newTestRegistry(10)
-	queryID, ctx := r.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, ctx := r.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1")
 
 	if !r.CancelWithReason(queryID, "client disconnected") {
 		t.Fatal("expected CancelWithReason to return true")
@@ -170,7 +170,7 @@ func TestRegistry_Cancel_NotFound(t *testing.T) {
 func TestRegistry_GetQuery_Active(t *testing.T) {
 	r := newTestRegistry(10)
 
-	queryID, _ := r.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, _ := r.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 
 	q := r.GetQuery(queryID)
 	if q == nil {
@@ -184,7 +184,7 @@ func TestRegistry_GetQuery_Active(t *testing.T) {
 func TestRegistry_GetQuery_History(t *testing.T) {
 	r := newTestRegistry(10)
 
-	queryID, _ := r.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, _ := r.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	r.Complete(queryID, 5)
 
 	q := r.GetQuery(queryID)
@@ -210,7 +210,7 @@ func TestRegistry_HistoryRingBuffer_Overflow(t *testing.T) {
 
 	// Register and complete 5 queries
 	for i := 0; i < 5; i++ {
-		id, _ := r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1", false, 0)
+		id, _ := r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1")
 		r.Complete(id, i)
 	}
 
@@ -237,7 +237,7 @@ func TestRegistry_HistoryLimit(t *testing.T) {
 	r := newTestRegistry(10)
 
 	for i := 0; i < 5; i++ {
-		id, _ := r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1", false, 0)
+		id, _ := r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1")
 		r.Complete(id, i)
 	}
 
@@ -245,20 +245,6 @@ func TestRegistry_HistoryLimit(t *testing.T) {
 	history := r.GetHistory(2)
 	if len(history) != 2 {
 		t.Fatalf("expected 2 history entries with limit, got %d", len(history))
-	}
-}
-
-func TestRegistry_ParallelQuery(t *testing.T) {
-	r := newTestRegistry(10)
-
-	queryID, _ := r.Register(context.Background(), "SELECT * FROM db.measurement", 1, "tok", "127.0.0.1", true, 24)
-
-	q := r.GetQuery(queryID)
-	if !q.IsParallel {
-		t.Fatal("expected IsParallel=true")
-	}
-	if q.PartitionCount != 24 {
-		t.Fatalf("expected PartitionCount=24, got %d", q.PartitionCount)
 	}
 }
 
@@ -272,7 +258,7 @@ func TestRegistry_DefaultHistorySize(t *testing.T) {
 func TestRegistry_ActiveDurationMs(t *testing.T) {
 	r := newTestRegistry(10)
 
-	r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1", false, 0)
+	r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1")
 	time.Sleep(10 * time.Millisecond)
 
 	active := r.GetActive()
@@ -293,7 +279,7 @@ func TestRegistry_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			id, _ := r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1", false, 0)
+			id, _ := r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1")
 			r.Complete(id, 1)
 		}()
 	}
@@ -303,7 +289,7 @@ func TestRegistry_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			id, _ := r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1", false, 0)
+			id, _ := r.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1")
 			r.Cancel(id)
 		}()
 	}

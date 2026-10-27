@@ -41,6 +41,11 @@ type ClaimedReplay struct {
 	Database, Measurement string
 	Instance, Epoch       uint64
 	Records               []ClaimedRecord
+	// Origin: the origin republishes batches of one of its earlier
+	// instances from its WAL (#1207 S4b1c2b): no claim (Epoch 0), the
+	// batches keep their own identity, and the manifest arbitrates them
+	// like any copy of the origin's.
+	Origin bool
 }
 
 // ReplayOutcome is what became of one record's rows in one hour.
@@ -116,8 +121,8 @@ func (b *ArrowBuffer) ReplayClaimed(ctx context.Context, r ClaimedReplay) ([]Hou
 	if b.closing.Load() {
 		return nil, ErrReplayClosed
 	}
-	if r.Epoch == 0 || r.Instance == 0 || r.Database == "" || r.Measurement == "" {
-		return nil, errors.New("claimed replay: instance, epoch and target are required")
+	if (r.Epoch == 0) != r.Origin || r.Instance == 0 || r.Database == "" || r.Measurement == "" {
+		return nil, errors.New("claimed replay: instance, target and an epoch (none for an origin republish) are required")
 	}
 	if len(r.Records) > maxReplayRecords {
 		return nil, ErrReplayTooLarge
@@ -201,6 +206,16 @@ func (b *ArrowBuffer) claimedRecordSubs(i int, rec ClaimedRecord, r ClaimedRepla
 	total, err := normalizeReplayColumns(columns)
 	if err != nil {
 		return nil, bad(err)
+	}
+	// As WAL replay does (#1342): a column whose name cannot be stored is
+	// dropped and the rows kept, the same on every replica of the record.
+	if dropped := dropUnstorableColumns(columns); len(dropped) > 0 {
+		b.logger.Error().
+			Str("database", r.Database).
+			Str("measurement", r.Measurement).
+			Strs("columns", quoteColumnNames(dropped)).
+			Int("rows", total).
+			Msg("Replayed stream record: dropped columns whose names cannot be stored; the rows are written without them")
 	}
 	typed, _, err := b.convertColumnsToTyped(r.Measurement, columns)
 	if err != nil {
@@ -378,7 +393,7 @@ func (b *ArrowBuffer) flushClaimedGroup(ctx context.Context, cs *coverageState, 
 	}
 	taskID := b.beginAsyncFlushTask()
 	defer b.completeAsyncFlushTask(taskID)
-	merged, err := b.mergeBatches(records)
+	merged, err := b.mergeBatchesForFlush(r.Measurement, records)
 	if err != nil {
 		group.failed()
 		return fmt.Errorf("merge claimed batches: %w", err)

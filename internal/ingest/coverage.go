@@ -249,6 +249,9 @@ const (
 	// Once every refused file of a group is resolved, the group releases its
 	// WAL entries. The floor keeps treating its batches as lost.
 	CoverageResolved
+	// CoverageDeleted: a durable DELETE record removed every row in the
+	// parked file's scope, so its WAL hold can be released without publication.
+	CoverageDeleted
 )
 
 func (o CoverageOutcome) String() string {
@@ -263,6 +266,8 @@ func (o CoverageOutcome) String() string {
 		return "refused"
 	case CoverageResolved:
 		return "resolved"
+	case CoverageDeleted:
+		return "deleted"
 	default:
 		return "abandoned"
 	}
@@ -293,6 +298,9 @@ type coveredWALWriter interface {
 	TrackedInstance() uint64
 	MarkFlushedRetained(hashes []string) error
 	ReleaseRegistered(hashes []string)
+	// CoverageLost reports a batch whose WAL entry the writer failed to write
+	// after it was enqueued (#676): recovery will never replay it.
+	CoverageLost(key string, cseq uint64) bool
 }
 
 // coverageState is installed by EnableCoverage.
@@ -618,7 +626,7 @@ func foldPieces(pieces []CoveragePiece) ([]CoverageRange, []CoveragePiece) {
 }
 
 func (g *flushGroup) settle(path string, outcome CoverageOutcome) {
-	if outcome == CoverageResolved {
+	if outcome == CoverageResolved || outcome == CoverageDeleted {
 		g.resolve(path)
 		return
 	}
@@ -720,14 +728,16 @@ func (g *flushGroup) claimReplay() bool {
 // failed handles a flush that wrote and registered nothing. Pieces whose
 // every WAL entry is in the WAL stay unsettled: recovery replays them and the
 // replay registers them. A piece with no complete WAL copy is gone for good,
-// and its cseq holds the floor.
+// and its cseq holds the floor. That includes a piece whose entries were
+// enqueued (replayable) but which the WAL writer then failed to write (#676):
+// it is in no WAL file, so no replay would ever settle it.
 func (g *flushGroup) failed() {
 	if g == nil {
 		return
 	}
 	var gone []CoveragePiece
 	for _, p := range g.pieces {
-		if !p.replayable {
+		if !p.replayable || (p.Instance == g.cs.instance && g.cs.wal.CoverageLost(g.key, p.CSeq)) {
 			gone = append(gone, p)
 		}
 	}

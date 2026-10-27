@@ -11,21 +11,23 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 )
 
 type databaseDeleteCoordinatorFake struct {
-	synced      int
-	primary     bool
-	role        string
-	entries     []*raft.FileEntry
-	batches     [][]string
-	failOnBatch int
-	events      *[]string
-	backend     storage.Backend
-	probePath   string
+	synced            int
+	primary           bool
+	role              string
+	entries           []*raft.FileEntry
+	batches           [][]string
+	failOnBatch       int
+	transientFailures int
+	events            *[]string
+	backend           storage.Backend
+	probePath         string
 }
 
 func (f *databaseDeleteCoordinatorFake) IsPrimaryWriter() bool { return f.primary }
@@ -69,6 +71,10 @@ func (f *databaseDeleteCoordinatorFake) BatchFileOpsInManifestContext(ctx contex
 			return fmt.Errorf("local copy %q was removed before manifest update: exists=%t err=%v", f.probePath, exists, err)
 		}
 	}
+	if f.transientFailures > 0 {
+		f.transientFailures--
+		return cluster.ErrNoLeaderKnown
+	}
 	if f.failOnBatch > 0 && len(f.batches) == f.failOnBatch {
 		return errors.New("manifest unavailable")
 	}
@@ -87,6 +93,39 @@ func (f *databaseDeleteCoordinatorFake) BatchFileOpsInManifestContext(ctx contex
 	}
 	f.entries = kept
 	return nil
+}
+
+func TestDatabasesHandler_DeleteRetriesTransientLeaderChangeWithoutTiering(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	backend := handler.storage
+	ctx := context.Background()
+	path := "db/cpu/local.parquet"
+	if err := backend.Write(ctx, "db/.arc-database", []byte("marker")); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Write(ctx, path, []byte("hot data")); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := &databaseDeleteCoordinatorFake{
+		primary: true, role: "writer", entries: []*raft.FileEntry{{Path: path, Database: "db"}},
+		backend: backend, probePath: path, transientFailures: 1,
+	}
+	handler.SetCoordinator(coordinator, true)
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(coordinator.batches) != 2 || len(coordinator.entries) != 0 {
+		t.Fatalf("manifest attempts=%d remaining=%d", len(coordinator.batches), len(coordinator.entries))
+	}
+	if exists, err := backend.Exists(ctx, path); err != nil || exists {
+		t.Fatalf("file exists=%t err=%v after retry", exists, err)
+	}
 }
 
 type databaseDeleteRecordingBackend struct {
@@ -393,35 +432,5 @@ func TestDatabasesHandler_Delete1094UngatedWithoutSharedStorageOrReplication(t *
 	defer resp.Body.Close()
 	if resp.StatusCode != fiber.StatusOK {
 		t.Fatalf("status = %d, want 200 on an ungated cluster", resp.StatusCode)
-	}
-}
-
-// takeoverBusyCoordinator is a primary whose stream takeover is publishing
-// rows of database "db" (#1207).
-type takeoverBusyCoordinator struct {
-	databaseDeleteCoordinatorFake
-	asked []string
-}
-
-func (f *takeoverBusyCoordinator) StreamTakeoverBusy(db, measurement string) bool {
-	f.asked = append(f.asked, db+"/"+measurement)
-	return db == "db"
-}
-
-func TestDatabasesHandler_DeleteWaitsForAStreamTakeover(t *testing.T) {
-	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
-	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
-	coordinator := &takeoverBusyCoordinator{databaseDeleteCoordinatorFake: databaseDeleteCoordinatorFake{role: "writer", primary: true}}
-	handler.SetCoordinator(coordinator, true)
-	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != fiber.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "30" {
-		t.Fatalf("status = %d retry-after %q, want 503 with Retry-After 30", resp.StatusCode, resp.Header.Get("Retry-After"))
-	}
-	if len(coordinator.batches) != 0 || strings.Join(coordinator.asked, ",") != "db/" {
-		t.Fatalf("batches %v asked %v", coordinator.batches, coordinator.asked)
 	}
 }

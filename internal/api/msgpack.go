@@ -46,10 +46,19 @@ var gzipReaderPool = sync.Pool{
 	// No New func - we create readers on-demand since gzip.NewReader requires valid data
 }
 
-// Pool for zstd decoders - zstd.Decoder is thread-safe and reusable
-// klauspost zstd is 3-5x faster than gzip for decompression
-var zstdDecoderPool = sync.Pool{
-	// No New func - we create decoders on-demand
+// Pools for zstd decoders, one per size cap: a decoder keeps the
+// WithDecoderMaxMemory it was created with, so a decoder made for a smaller
+// cap would reject a valid payload of a caller with a larger one, and one
+// made for a larger cap would let a smaller caller's limit be exceeded in
+// memory. The caps come from configuration, so there are only a few.
+var zstdDecoderPools sync.Map // int (cap) -> *sync.Pool
+
+func zstdDecoderPool(maxSize int) *sync.Pool {
+	if p, ok := zstdDecoderPools.Load(maxSize); ok {
+		return p.(*sync.Pool)
+	}
+	p, _ := zstdDecoderPools.LoadOrStore(maxSize, &sync.Pool{})
+	return p.(*sync.Pool)
 }
 
 // PooledBuffer wraps a decompression buffer that must be returned to pool after use
@@ -206,14 +215,22 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 			goto localProcessing
 		}
 		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to route write request")
-			return HandleRoutingError(c, err)
+			if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+				h.logger.Error().Err(err).Msg("Failed to route write request")
+			}
+			return respondWriteForwardError(c, err)
 		}
 
 		return CopyResponse(c, resp)
 	}
 
 localProcessing:
+	// A standby writer forwards the write to the primary instead of refusing
+	// it, when the cluster names one it can trust (#1270). Before anything is
+	// read or written here.
+	if handled, err := forwardStandbyWrite(h.router, c); handled {
+		return err
+	}
 	// CRITICAL: Use BodyRaw() instead of Body() to avoid fasthttp's automatic gzip decompression
 	// c.Body() triggers tryDecodeBodyInOrder → gunzipData which is NOT pooled and causes high latency.
 	// rawBody is owned by fasthttp and reused after this handler returns; the
@@ -293,8 +310,19 @@ localProcessing:
 			Msg("Decompressed payload")
 	}
 
-	// Decode MessagePack
-	records, err := h.decoder.Decode(payload)
+	// Decode MessagePack. Typed row-format decoding drops points it cannot
+	// write (line protocol's rules) and reports them; the rest are written.
+	// The columns a measurement already has, for refusing a case twin
+	// (#1342), for the database the write goes to (the header, as read again
+	// and validated below; an invalid name is refused there before any answer
+	// that depends on this), and only for measurements the token may write.
+	knownDB := c.Get("x-arc-database")
+	if knownDB == "" {
+		knownDB = "default"
+	}
+	knownDB = strings.Clone(knownDB)
+	known := writableKnownColumns(c, h.rbacManager, knownDB, h.arrowBuffer.KnownColumns(knownDB))
+	records, recordCount, drops, err := h.decoder.DecodeWithDropsKnown(payload, known)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to decode MessagePack")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -317,14 +345,11 @@ localProcessing:
 	// data-corruption race. Copy at the boundary before it can escape.
 	database := strings.Clone(c.Get("x-arc-database"))
 
-	// Get record count based on type
-	var recordCount int
-	switch v := records.(type) {
-	case []interface{}:
-		recordCount = len(v)
-	default:
-		recordCount = 1
+	dropped := 0
+	for _, d := range drops {
+		dropped += d.Points
 	}
+	recordCount -= dropped // records written
 
 	h.logger.Debug().
 		Int("records", recordCount).
@@ -343,6 +368,24 @@ localProcessing:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+
+	// A record whose tag or field names Arc could not read back is dropped,
+	// the rest written (#1342): a columnar record whole, since its names are
+	// all its rows'. Before the WAL sees any of it.
+	var nameDrops []ingest.LPDrop
+	var removed int
+	records, nameDrops, removed = ingest.FilterRecordNames(records, known)
+	recordCount -= removed // in the decoder's unit: rows, or columnar items
+	for _, d := range nameDrops {
+		drops = append(drops, d)
+		dropped += d.Points
+	}
+
+	if recordCount <= 0 && dropped > 0 {
+		// Every point dropped: nothing to write (as line protocol answers).
+		logPointDrops(h.logger, "MessagePack", database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})
 	}
 
 	// Extract measurements for validation and RBAC
@@ -366,7 +409,35 @@ localProcessing:
 		}
 	}
 
-	if err := h.arrowBuffer.Write(ctx, database, records); err != nil {
+	// Admit the whole request, its size reserved against the WAL volume's
+	// free space (#676); a fence or disk pressure refuses it here.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(ctx, int64(len(payload)))
+	if aerr != nil {
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	err = h.arrowBuffer.Write(writeCtx, database, records)
+	var rowDrops *ingest.PointsDroppedError
+	if errors.As(err, &rowDrops) {
+		// Rows the record path could not write (the others were written):
+		// a partial write, like the typed path's drops.
+		drops = append(drops, rowDrops.Drops...)
+		for _, d := range rowDrops.Drops {
+			dropped += d.Points
+			recordCount -= d.Points
+		}
+		err = nil
+	}
+	if err != nil {
+		// A fence refusal is expected during a failover: logged by reason,
+		// not counted as an ingest error (#1268).
+		if ingest.IsWriteRefusal(err) {
+			return respondWriteRefused(c, err)
+		}
+		// #440: a client error, refused before the WAL; nothing was written.
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
 		metrics.Get().IncIngestErrors()
 		// Schema-churn rejection is retryable — surface as 503 so
@@ -376,9 +447,6 @@ localProcessing:
 		// refused, not lost: the record is still in the WAL. 503 so the client
 		// retries (elsewhere, during a rolling restart) instead of treating a
 		// shutdown race as a permanent server error.
-		if errors.Is(err, ingest.ErrIngestFenced) {
-			return respondIngestFenced(c, err)
-		}
 		if errors.Is(err, ingest.ErrBufferClosing) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (server shutting down): " + err.Error(),
@@ -402,6 +470,11 @@ localProcessing:
 	m.IncIngestRecords(int64(recordCount))
 	m.IncIngestBytes(int64(len(payload)))
 	m.IncIngestBatches()
+
+	if dropped > 0 {
+		logPointDrops(h.logger, "MessagePack", database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
+	}
 
 	// Return 204 No Content (InfluxDB compatible)
 	return c.SendStatus(fiber.StatusNoContent)

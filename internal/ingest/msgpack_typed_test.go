@@ -12,7 +12,7 @@ import (
 )
 
 // mustMarshal encodes a payload with the same msgpack library clients use.
-func mustMarshal(t *testing.T, v interface{}) []byte {
+func mustMarshal(t testing.TB, v interface{}) []byte {
 	t.Helper()
 	b, err := msgpack.Marshal(v)
 	if err != nil {
@@ -345,7 +345,7 @@ func TestTypedDecodeRejectEquivalence(t *testing.T) {
 
 // TestTypedDecodeWriteTimeRejects: payloads that pass Decode today but are
 // rejected later at write time by convertColumnsToTyped (uint64 overflow,
-// bin columns, mid-column type mismatches, nested values). The typed path
+// mid-column type mismatches, nested values). The typed path
 // must FALL BACK on these — never produce a typed record — so the write-time
 // rejection is preserved unchanged.
 func TestTypedDecodeWriteTimeRejects(t *testing.T) {
@@ -357,11 +357,6 @@ func TestTypedDecodeWriteTimeRejects(t *testing.T) {
 			"m": "cpu", "columns": map[string]interface{}{
 				"time": []interface{}{int64(1700000000000000), int64(1700000000000001)},
 				"v":    []interface{}{int64(1), uint64(math.MaxInt64) + 1},
-			}}},
-		{"bin_column", map[string]interface{}{
-			"m": "cpu", "columns": map[string]interface{}{
-				"time": []interface{}{int64(1700000000000000)},
-				"v":    []interface{}{[]byte{0x01, 0x02}},
 			}}},
 		{"string_in_int_column", map[string]interface{}{
 			"m": "cpu", "columns": map[string]interface{}{
@@ -410,35 +405,15 @@ func TestTypedDecodeWriteTimeRejects(t *testing.T) {
 }
 
 // TestTypedDecodeFallbackFormats: formats outside the typed scope must still
-// decode via the generic path (batch, array, row) and produce identical
+// decode via the generic path (compact "f" rows; columnar arrays and batch,
+// and row format, are typed: msgpack_typed_arrays_test.go,
+// msgpack_rows_test.go) and produce identical
 // results with the typed flag on.
 func TestTypedDecodeFallbackFormats(t *testing.T) {
 	payloads := map[string]interface{}{
-		"batch_format": map[string]interface{}{
-			"batch": []interface{}{
-				map[string]interface{}{
-					"m": "cpu", "columns": map[string]interface{}{
-						"time": []interface{}{int64(1700000000000000)},
-						"v":    []interface{}{int64(1)},
-					}},
-			}},
-		"row_format": map[string]interface{}{
+		"row_format_compact_fields": map[string]interface{}{
 			"m": "cpu", "t": int64(1700000000000), "h": "srv",
-			"fields": map[string]interface{}{"v": int64(1)},
-		},
-		"batch_key_wins_over_columns": map[string]interface{}{
-			"batch": []interface{}{
-				map[string]interface{}{
-					"m": "cpu", "columns": map[string]interface{}{
-						"time": []interface{}{int64(1700000000000000)},
-						"v":    []interface{}{int64(1)},
-					}},
-			},
-			"columns": map[string]interface{}{
-				"time":    []interface{}{int64(1700000000000000)},
-				"ignored": []interface{}{int64(9)},
-			},
-			"m": "wrong",
+			"f": []interface{}{int64(1), 2.5},
 		},
 	}
 	for name, p := range payloads {

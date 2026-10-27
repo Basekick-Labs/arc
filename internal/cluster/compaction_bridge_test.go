@@ -133,8 +133,9 @@ func TestCompactionBridge_RegisterSuccessAsLeader(t *testing.T) {
 		Database:      "db",
 		Measurement:   "cpu",
 		PartitionTime: time.Date(2026, 4, 11, 14, 0, 0, 0, time.UTC),
-		Tier:          "hot",
-		CreatedAt:     time.Date(2026, 4, 11, 14, 30, 0, 0, time.UTC),
+		// The compaction tier, as the completion manifest carries it.
+		Tier:      "hourly",
+		CreatedAt: time.Date(2026, 4, 11, 14, 30, 0, 0, time.UTC),
 	}
 	if err := bridge.RegisterCompactedFile(context.Background(), file); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -158,8 +159,10 @@ func TestCompactionBridge_RegisterSuccessAsLeader(t *testing.T) {
 	if !got.PartitionTime.Equal(file.PartitionTime) {
 		t.Errorf("PartitionTime: got %v, want %v", got.PartitionTime, file.PartitionTime)
 	}
-	if got.Tier != file.Tier {
-		t.Errorf("Tier: got %q, want %q", got.Tier, file.Tier)
+	// Registered in the storage tier: the DELETE scan set and the staged
+	// compaction only see hot files (#1207).
+	if got.Tier != "hot" {
+		t.Errorf("Tier: got %q, want hot", got.Tier)
 	}
 }
 
@@ -322,7 +325,7 @@ func TestCompactionBridge_BatchFileOps_HappyPath(t *testing.T) {
 			SHA256:    "deadbeef",
 			SizeBytes: 2048,
 			Database:  "db",
-			Tier:      "hot",
+			Tier:      "daily",
 			CreatedAt: time.Date(2026, 4, 14, 10, 0, 0, 0, time.UTC),
 		},
 	}
@@ -353,6 +356,9 @@ func TestCompactionBridge_BatchFileOps_HappyPath(t *testing.T) {
 	}
 	if regPayload.File.OriginNodeID != "compactor-1" {
 		t.Errorf("OriginNodeID: got %q, want compactor-1", regPayload.File.OriginNodeID)
+	}
+	if regPayload.File.Tier != "hot" {
+		t.Errorf("Tier: got %q, want hot", regPayload.File.Tier)
 	}
 }
 

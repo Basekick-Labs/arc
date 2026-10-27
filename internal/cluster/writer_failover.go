@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -73,6 +74,20 @@ type WriterFailoverManager struct {
 	consecutiveFails int
 	failoverInProg   bool
 	lastFailoverAt   time.Time
+
+	// Failed attempts (#1267): a failed attempt does not start the cooldown;
+	// the next tick tries again. Recorded for Stats, logged at most once per
+	// failureLogEvery per reason.
+	failedAttempts    int64
+	lastFailureReason string
+	lastFailureAt     time.Time
+	lastFailureLogAt  map[string]time.Time
+	// refused holds candidates the FSM refused to promote, skipped until the
+	// time stored, so a deterministic refusal does not append a Raft entry
+	// every tick. Its own lock: selectPrimary runs both under m.mu (HandOver)
+	// and without it (the failover goroutine).
+	refusedMu sync.Mutex
+	refused   map[string]time.Time
 
 	// lastNoFailoverWarnAt throttles the "primary is down and automatic
 	// failover is off" warning, which would otherwise repeat every tick for as
@@ -170,6 +185,12 @@ func (m *WriterFailoverManager) healthCheckLoop() {
 func (m *WriterFailoverManager) checkPrimaryHealth() {
 	// Only the Raft leader coordinates failover
 	if m.cfg.RaftNode == nil || !m.cfg.RaftNode.IsLeader() {
+		// A count gathered in an earlier leadership must not carry over: on
+		// becoming leader again, the first tick without a primary would
+		// trigger at once instead of after the threshold (#1267).
+		m.mu.Lock()
+		m.consecutiveFails = 0
+		m.mu.Unlock()
 		return
 	}
 
@@ -180,53 +201,64 @@ func (m *WriterFailoverManager) checkPrimaryHealth() {
 		return
 	}
 
-	// Find the current primary writer
-	primary := m.cfg.Registry.GetPrimaryWriter()
-	if primary == nil {
-		// No primary — check if there are any writers at all
-		writers := m.cfg.Registry.GetWriters()
-		if len(writers) == 0 {
-			return
-		}
-		// Has a primary EVER been designated? Read that from the FSM, which
-		// records it durably, and not from m.primaryID, which is in-memory and
-		// therefore empty on a freshly started process. Using the in-memory
-		// field made a leader restart or a leadership change look like a
-		// cluster that never had a primary, so it would elect one — which is
-		// a replacement by another name, and on an unlicensed cluster that is
-		// the paid feature given away for free.
-		if m.designatedPrimaryID() == "" {
-			// No primary has ever existed in this cluster: elect one.
-			// Without this the manager deadlocks at boot — the failover
-			// branch below needs a previous primary to fail over FROM, and
-			// nothing else ever issues CommandPromoteWriter, so every node
-			// stayed WriterState-less and IsPrimaryWriter() was false
-			// cluster-wide, silently disabling the retention and CQ
-			// schedulers and the delete/retention/CQ endpoints (#850).
-			//
-			// Never gated on AutoFailover: a cluster with no primary at all
-			// runs no singleton work, and that is not a licensing outcome.
-			m.tryInitialElectionLocked()
-			return
-		}
-
-		// We had a primary and it is gone. Replacing it is the licensed
-		// capability.
-		if !m.cfg.AutoFailover {
-			m.warnNoAutoFailoverLocked()
-			return
-		}
-
-		m.consecutiveFails++
-		if m.consecutiveFails >= m.cfg.UnhealthyThreshold {
-			m.triggerFailoverLocked()
-		}
+	// The primary is the writer the FSM designates, and its health is the
+	// registry's view of that node. Not the registry's writer state: a node
+	// whose process joined after the primary was promoted has no writer
+	// state for it (the join response carries none), so as Raft leader it
+	// saw no primary, counted three ticks and "failed over" — to the dead
+	// primary itself, the lowest healthy id until its heartbeats went stale,
+	// or away from a healthy primary (#1267).
+	designated := m.designatedPrimaryID()
+	if designated != "" && m.nodeHealthyLocked(designated) {
+		m.primaryID = designated
+		m.consecutiveFails = 0
+		return
+	}
+	// No primary — check if there are any writers at all
+	writers := m.cfg.Registry.GetWriters()
+	if len(writers) == 0 {
+		return
+	}
+	// Has a primary EVER been designated? Read that from the FSM, which
+	// records it durably, and not from m.primaryID, which is in-memory and
+	// therefore empty on a freshly started process. Using the in-memory
+	// field made a leader restart or a leadership change look like a
+	// cluster that never had a primary, so it would elect one — which is
+	// a replacement by another name, and on an unlicensed cluster that is
+	// the paid feature given away for free.
+	if designated == "" {
+		// No primary has ever existed in this cluster: elect one.
+		// Without this the manager deadlocks at boot — the failover
+		// branch below needs a previous primary to fail over FROM, and
+		// nothing else ever issues CommandPromoteWriter, so every node
+		// stayed WriterState-less and IsPrimaryWriter() was false
+		// cluster-wide, silently disabling the retention and CQ
+		// schedulers and the delete/retention/CQ endpoints (#850).
+		//
+		// Never gated on AutoFailover: a cluster with no primary at all
+		// runs no singleton work, and that is not a licensing outcome.
+		m.tryInitialElectionLocked()
 		return
 	}
 
-	// Primary exists and is healthy — reset counter
-	m.primaryID = primary.ID
-	m.consecutiveFails = 0
+	// We had a primary and it is gone. Replacing it is the licensed
+	// capability.
+	if !m.cfg.AutoFailover {
+		m.warnNoAutoFailoverLocked()
+		return
+	}
+
+	m.primaryID = designated
+	m.consecutiveFails++
+	if m.consecutiveFails >= m.cfg.UnhealthyThreshold {
+		m.triggerFailoverLocked()
+	}
+}
+
+// nodeHealthyLocked reports whether the registry holds id as a healthy writer.
+func (m *WriterFailoverManager) nodeHealthyLocked(id string) bool {
+	node, ok := m.cfg.Registry.Get(id)
+	return ok && node.Role == RoleWriter && node.IsHealthy()
 }
 
 // designatedPrimaryID returns the primary writer the CLUSTER has on record,
@@ -288,8 +320,9 @@ func (m *WriterFailoverManager) HandleWriterUnhealthy(node *Node) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Only care if it's the primary
-	if node.GetWriterState() != WriterStatePrimary {
+	// Only care if it's the primary: the FSM's designation, not the
+	// registry's writer state, which a join can leave empty (#1267).
+	if node.ID != m.designatedPrimaryID() {
 		return
 	}
 
@@ -380,9 +413,13 @@ func (m *WriterFailoverManager) triggerFailoverLocked() {
 	m.failoverInProg = true
 	oldPrimary := m.primaryID
 
-	m.logger.Info().
-		Str("old_primary", oldPrimary).
-		Msg("Initiating writer failover")
+	// After a failed attempt the next one starts on the next tick; say so once
+	// per failureLogEvery, not every 5 s (#1267).
+	if m.lastFailureAt.IsZero() || time.Since(m.lastFailureAt) >= failureLogEvery {
+		m.logger.Info().
+			Str("old_primary", oldPrimary).
+			Msg("Initiating writer failover")
+	}
 
 	m.wg.Add(1)
 	go func() {
@@ -412,6 +449,9 @@ func (m *WriterFailoverManager) HandOver(nodeID string) (newPrimaryID string, er
 
 	if m.cfg.RaftNode == nil {
 		return "", fmt.Errorf("clustering is not configured with Raft")
+	}
+	if m.failoverInProg {
+		return "", fmt.Errorf("a writer failover is in progress; retry in a few seconds")
 	}
 
 	// Exclude the outgoing node, and do NOT allow self: the whole point is to
@@ -470,10 +510,16 @@ func (m *WriterFailoverManager) executeFailover(oldPrimaryID string, allowSelf b
 	// on it is not a failover.
 	newPrimaryID := m.selectPrimary(oldPrimaryID, allowSelf)
 	if newPrimaryID == "" {
-		m.logger.Error().
-			Str("old_primary", oldPrimaryID).
-			Msg("No healthy writer can take over as primary (none healthy, or each one has its current process claimed by a stream takeover)")
-		m.completeFailover("", false)
+		m.failAttempt("no_candidate", nil,
+			"No healthy writer can take over as primary (none healthy, or each one has its current process claimed by a stream takeover); retrying on the next health check")
+		return
+	}
+	// Re-promoting the node the FSM already designates moves nothing. It is
+	// not a failover and must not start the cooldown (#1267).
+	if newPrimaryID == m.designatedPrimaryID() {
+		m.logger.Info().Str("primary", newPrimaryID).
+			Msg("The designated primary writer is healthy again; no failover")
+		m.completeElection(newPrimaryID, true)
 		return
 	}
 
@@ -492,19 +538,20 @@ func (m *WriterFailoverManager) executeFailover(oldPrimaryID string, allowSelf b
 
 	// Apply via Raft consensus
 	if err := m.cfg.RaftNode.PromoteWriter(newPrimaryID, oldPrimaryID, m.cfg.FailoverTimeout); err != nil {
-		m.logger.Error().Err(err).
-			Str("new_primary", newPrimaryID).
-			Msg("Failed to promote writer via Raft")
-		m.completeFailover(newPrimaryID, false)
+		// Only a refusal by the FSM is about this candidate. A Raft error (not
+		// leader, leadership lost, timeout) says nothing against it, and
+		// skipping it would leave a lone standby unselectable for a minute.
+		if errors.Is(err, arcRaft.ErrCommandRefused) {
+			m.refuseCandidate(newPrimaryID)
+		}
+		m.failAttempt("promote_failed", err, "Failed to promote writer via Raft; retrying on the next health check")
 		return
 	}
 
-	// Brief wait for propagation
+	// Brief wait for propagation. The promotion is committed whatever this
+	// wait sees: a done context (timeout, Stop) does not make it a failure.
 	select {
 	case <-ctx.Done():
-		m.logger.Error().Msg("Failover timeout waiting for propagation")
-		m.completeFailover(newPrimaryID, false)
-		return
 	case <-time.After(500 * time.Millisecond):
 	}
 
@@ -535,7 +582,15 @@ func (m *WriterFailoverManager) selectNewPrimary(excludeNodeID string) string {
 // filters to healthy nodes, so re-selecting the excluded node can never
 // resurrect a dead one.
 func (m *WriterFailoverManager) selectPrimary(excludeNodeID string, allowSelf bool) string {
-	eligible := func(id string) bool { return m.cfg.Eligible == nil || m.cfg.Eligible(id) }
+	eligible := func(id string) bool {
+		m.refusedMu.Lock()
+		until, refused := m.refused[id]
+		m.refusedMu.Unlock()
+		if refused && time.Now().Before(until) {
+			return false
+		}
+		return m.cfg.Eligible == nil || m.cfg.Eligible(id)
+	}
 	// GetStandbyWriters and GetWriters already filter for healthy nodes. In
 	// id order, so every leader picks the same writer.
 	for _, node := range sortedNodes(m.cfg.Registry.GetStandbyWriters()) {
@@ -564,11 +619,16 @@ func sortedNodes(nodes []*Node) []*Node {
 }
 
 // completeFailover marks failover as complete.
+//
+// Only a completed failover starts the cooldown, which exists to damp flapping
+// failovers. A failed attempt moved nothing, and backing off from it kept the
+// cluster without a primary for another minute (#1267); the compactor manager
+// already behaves this way.
 func (m *WriterFailoverManager) completeFailover(newPrimaryID string, success bool) {
 	m.mu.Lock()
 	m.failoverInProg = false
-	m.lastFailoverAt = time.Now()
 	if success {
+		m.lastFailoverAt = time.Now()
 		m.primaryID = newPrimaryID
 		m.consecutiveFails = 0
 	}
@@ -580,6 +640,51 @@ func (m *WriterFailoverManager) completeFailover(newPrimaryID string, success bo
 	}
 }
 
+// failureLogEvery throttles the log of a failover attempt that keeps failing
+// for the same reason; every attempt is still counted in Stats.
+const failureLogEvery = time.Minute
+
+// refusedCandidateBackoff is how long a writer the FSM refused to promote is
+// skipped by selection.
+const refusedCandidateBackoff = time.Minute
+
+// failAttempt records a failed failover attempt and ends it without a
+// cooldown, so the next health check tries again.
+func (m *WriterFailoverManager) failAttempt(reason string, err error, msg string) {
+	now := time.Now()
+	m.mu.Lock()
+	m.failedAttempts++
+	m.lastFailureReason = reason
+	if err != nil {
+		m.lastFailureReason = reason + ": " + err.Error()
+	}
+	m.lastFailureAt = now
+	if m.lastFailureLogAt == nil {
+		m.lastFailureLogAt = map[string]time.Time{}
+	}
+	logIt := now.Sub(m.lastFailureLogAt[reason]) >= failureLogEvery
+	if logIt {
+		m.lastFailureLogAt[reason] = now
+	}
+	attempts := m.failedAttempts
+	m.mu.Unlock()
+	if logIt {
+		m.logger.Error().Err(err).Str("reason", reason).Int64("failed_attempts", attempts).Msg(msg)
+	}
+	m.completeFailover("", false)
+}
+
+// refuseCandidate keeps selection off a writer the FSM refused to promote
+// for refusedCandidateBackoff.
+func (m *WriterFailoverManager) refuseCandidate(id string) {
+	m.refusedMu.Lock()
+	defer m.refusedMu.Unlock()
+	if m.refused == nil {
+		m.refused = map[string]time.Time{}
+	}
+	m.refused[id] = time.Now().Add(refusedCandidateBackoff)
+}
+
 // TriggerManualFailover triggers a manual failover from the current primary.
 func (m *WriterFailoverManager) TriggerManualFailover() error {
 	m.mu.Lock()
@@ -589,25 +694,26 @@ func (m *WriterFailoverManager) TriggerManualFailover() error {
 		return fmt.Errorf("failover already in progress")
 	}
 
-	primary := m.cfg.Registry.GetPrimaryWriter()
-	if primary == nil {
+	// The FSM's designation, not the registry's writer state (#1267).
+	primaryID := m.designatedPrimaryID()
+	if primaryID == "" {
 		m.mu.Unlock()
 		return fmt.Errorf("no primary writer to failover from")
 	}
 
-	m.primaryID = primary.ID
+	m.primaryID = primaryID
 	m.failoverInProg = true
 	m.mu.Unlock()
 
 	m.logger.Info().
-		Str("current_primary", primary.ID).
+		Str("current_primary", primaryID).
 		Msg("Manual writer failover initiated")
 
 	// Tracked on the WaitGroup like the other two, so Stop joins it.
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		m.executeFailover(primary.ID, false)
+		m.executeFailover(primaryID, false)
 	}()
 
 	return nil
@@ -628,6 +734,11 @@ func (m *WriterFailoverManager) Stats() map[string]interface{} {
 
 	if !m.lastFailoverAt.IsZero() {
 		stats["last_failover_at"] = m.lastFailoverAt.Format(time.RFC3339)
+	}
+	if m.failedAttempts > 0 {
+		stats["failed_attempts"] = m.failedAttempts
+		stats["last_failure_reason"] = m.lastFailureReason
+		stats["last_failure_at"] = m.lastFailureAt.Format(time.RFC3339)
 	}
 
 	return stats

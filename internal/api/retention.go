@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -18,6 +20,7 @@ import (
 	"github.com/basekick-labs/arc/internal/license"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
@@ -38,18 +41,35 @@ type RetentionCoordinator interface {
 
 // RetentionHandler handles retention policy operations
 type RetentionHandler struct {
-	storage storage.Backend
-	config  *config.RetentionConfig
-	db      *sql.DB // SQLite for policy metadata
+	// onFilesRemoved invalidates the query caches (and the cluster's) after
+	// files were removed or rewritten: see SetOnFilesRemoved.
+	onFilesRemoved func()
+	storage        storage.Backend
+	config         *config.RetentionConfig
+	db             *sql.DB // SQLite for policy metadata
 	// ownsDB records whether this handler opened db itself. When retention
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
-	ownsDB        bool
-	duckdb        *database.DuckDB     // Shared DuckDB for parquet queries
-	coordinator   RetentionCoordinator // nil in standalone mode
-	licenseClient *license.Client      // nil when auth/licensing is disabled
-	authManager   *auth.AuthManager
-	logger        zerolog.Logger
+	ownsDB      bool
+	duckdb      *database.DuckDB     // Shared DuckDB for parquet queries
+	coordinator RetentionCoordinator // nil in standalone mode
+	coldTier    coldRetentionTier    // nil without tiering: retention is hot-only
+	// coldDeleteHook replaces the cold object delete in tests; nil in production.
+	coldDeleteHook func(ctx context.Context, backend storage.Backend, path string) error
+	licenseClient  *license.Client // nil when auth/licensing is disabled
+	authManager    *auth.AuthManager
+	logger         zerolog.Logger
+
+	// Cluster-wide retention (#1324), see retention_cluster.go. cluster is
+	// the cluster state once wired; localMu serializes this node's own
+	// writes with the cluster's read of them; mirrorMu serializes the mirror.
+	clusterMu sync.RWMutex
+	cluster   RetentionClusterSource
+	localMu   sync.Mutex
+	mirrorMu  sync.Mutex
+	// clusterOwned: this node's table has been the cluster's mirror (the
+	// retention_cluster_state marker), so its own rows are never run again.
+	clusterOwned atomic.Bool
 }
 
 // RetentionPolicy represents a retention policy
@@ -128,6 +148,10 @@ func validateRetentionPolicyRequest(req *RetentionPolicyRequest, create bool) er
 		if !isSafeStoragePathSegment(req.Database.Value) {
 			return fmt.Errorf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database.Value)
 		}
+		// Arc's own state (_schema anchors, _compaction_state), not a database (#1012).
+		if storage.IsReservedRootDir(req.Database.Value) {
+			return fmt.Errorf("database name %q is reserved for Arc's own storage", req.Database.Value)
+		}
 	}
 	if req.Measurement.hasValue() && req.Measurement.Value != "" && !isSafeStoragePathSegment(req.Measurement.Value) {
 		return fmt.Errorf("invalid measurement name %q: may not contain a separator or start with a dot", req.Measurement.Value)
@@ -183,8 +207,15 @@ type ExecuteRetentionResponse struct {
 	// SkippedFiles counts files whose stored key could not be resolved to a
 	// readable path, so they were neither examined nor deleted and never will
 	// be. Omitted when zero, which is every healthy deployment.
-	SkippedFiles         int      `json:"skipped_files,omitempty"`
-	SkippedReason        string   `json:"skipped_reason,omitempty"`
+	SkippedFiles  int    `json:"skipped_files,omitempty"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
+	// Cold tier (#168). DeletedCount and FilesDeleted include these. In a dry
+	// run they are what a real run would delete. ColdFilesSkipped counts cold
+	// files retention could not examine or delete; ColdSkippedReason says why.
+	ColdFilesDeleted     int      `json:"cold_files_deleted,omitempty"`
+	ColdRowsDeleted      int64    `json:"cold_rows_deleted,omitempty"`
+	ColdFilesSkipped     int      `json:"cold_files_skipped,omitempty"`
+	ColdSkippedReason    string   `json:"cold_skipped_reason,omitempty"`
 	ExecutionTimeMs      float64  `json:"execution_time_ms"`
 	DryRun               bool     `json:"dry_run"`
 	CutoffDate           string   `json:"cutoff_date"`
@@ -243,8 +274,14 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 			return nil, fmt.Errorf("failed to create directory for retention DB: %w", err)
 		}
 
-		// Open SQLite database for policy metadata
-		opened, err := sql.Open("sqlite3", cfg.DBPath)
+		// Open SQLite database for policy metadata, with the auth database's
+		// settings: the execution history's foreign key is enforced, and a
+		// writer waits for the lock rather than failing at once (the cluster
+		// mirror writes this database in the background, #1324). Transactions
+		// take the write lock when they begin: a read-then-write transaction
+		// that started deferred would fail outright, not wait, when another
+		// connection wrote in between.
+		opened, err := sql.Open("sqlite3", cfg.DBPath+dsnSep(cfg.DBPath)+"_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON&_txlock=immediate")
 		if err != nil {
 			return nil, fmt.Errorf("failed to open retention database: %w", err)
 		}
@@ -306,6 +343,9 @@ func (h *RetentionHandler) warnUnusablePolicies() {
 		if !isSafeStoragePathSegment(database) {
 			h.logger.Warn().Str("policy", name).Str("database", database).
 				Msg("Retention policy has an unusable database name and will fail every run; update or delete it")
+		} else if storage.IsReservedRootDir(database) {
+			h.logger.Warn().Str("policy", name).Str("database", database).
+				Msg("Retention policy targets a storage root Arc reserves for its own state, not a database; delete it")
 		}
 		if measurement.Valid && measurement.String != "" && !isSafeStoragePathSegment(measurement.String) {
 			h.logger.Warn().Str("policy", name).Str("measurement", measurement.String).
@@ -321,6 +361,26 @@ func (h *RetentionHandler) warnUnusablePolicies() {
 // Called after construction when cluster mode is enabled.
 func (h *RetentionHandler) SetCoordinator(c RetentionCoordinator) {
 	h.coordinator = c
+}
+
+// coldRetentionTier is what retention needs from tiering to apply a policy to
+// the cold tier (#168). *tiering.Manager satisfies it.
+type coldRetentionTier interface {
+	// ColdBackend is nil when this node has no usable cold tier.
+	ColdBackend() storage.Backend
+	GetColdFilesForRetention(ctx context.Context, database string, cutoff time.Time) ([]tiering.FileMetadata, error)
+	RetireColdRows(ctx context.Context, paths []string) (int, error)
+	RevertColdRowToHot(ctx context.Context, path string) error
+	NotifyColdFilesRemoved(n int)
+}
+
+// SetTieringManager makes retention apply its policies to the cold tier too.
+func (h *RetentionHandler) SetTieringManager(m *tiering.Manager) {
+	if m == nil {
+		h.coldTier = nil
+		return
+	}
+	h.coldTier = m
 }
 
 // initTables creates the retention policy tables
@@ -360,6 +420,56 @@ func (h *RetentionHandler) initTables() error {
 	if err != nil {
 		return fmt.Errorf("failed to create retention_executions table: %w", err)
 	}
+
+	// Dormant rows (#1324): this node's own policies the cluster did not
+	// adopt, and their history. Kept, never run.
+	_, err = h.db.Exec(`
+		CREATE TABLE IF NOT EXISTS retention_policies_dormant (
+			dormant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			policy_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			database TEXT NOT NULL,
+			measurement TEXT,
+			retention_days INTEGER NOT NULL,
+			buffer_days INTEGER,
+			is_active BOOLEAN,
+			created_at TIMESTAMP,
+			updated_at TIMESTAMP,
+			dormant_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create retention_policies_dormant table: %w", err)
+	}
+	_, err = h.db.Exec(`
+		CREATE TABLE IF NOT EXISTS retention_executions_dormant (
+			dormant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			execution_id INTEGER NOT NULL,
+			policy_id INTEGER NOT NULL,
+			execution_time TIMESTAMP,
+			status TEXT,
+			deleted_count INTEGER,
+			cutoff_date TIMESTAMP,
+			execution_duration_ms FLOAT,
+			error_message TEXT
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create retention_executions_dormant table: %w", err)
+	}
+	// The cluster mirror's own bookkeeping (#1324): the IDs it holds for the
+	// cluster, and the marker that this table is the cluster's.
+	if _, err = h.db.Exec(`CREATE TABLE IF NOT EXISTS retention_cluster_ids (id INTEGER PRIMARY KEY)`); err != nil {
+		return fmt.Errorf("failed to create retention_cluster_ids table: %w", err)
+	}
+	if _, err = h.db.Exec(`CREATE TABLE IF NOT EXISTS retention_cluster_state (name TEXT PRIMARY KEY, value TEXT)`); err != nil {
+		return fmt.Errorf("failed to create retention_cluster_state table: %w", err)
+	}
+	var owned int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM retention_cluster_state WHERE name = 'owned'`).Scan(&owned); err != nil {
+		return fmt.Errorf("failed to read retention_cluster_state: %w", err)
+	}
+	h.clusterOwned.Store(owned > 0)
 
 	h.logger.Info().Msg("Retention policy tables initialized")
 	return nil
@@ -428,10 +538,20 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 	// defaults this endpoint has always applied (0 and false) rather than the
 	// column defaults: flipping is_active to the schema's TRUE would make a
 	// policy created by an existing client start deleting data.
-	result, err := h.db.Exec(`
+	var result sql.Result
+	adopted, err := h.localWrite(func() (err error) {
+		result, err = h.db.Exec(`
 		INSERT INTO retention_policies (name, database, measurement, retention_days, buffer_days, is_active)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, req.Name.Value, req.Database.Value, measurementColumn(req.Measurement), req.RetentionDays.Value, req.BufferDays.Value, req.IsActive.Value)
+		return err
+	})
+	if adopted != nil {
+		return h.clusterCreate(c, adopted, &req)
+	}
+	if errors.Is(err, errRetentionBeingAdopted) || errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -462,6 +582,9 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 // handleList returns all retention policies
 func (h *RetentionHandler) handleList(c *fiber.Ctx) error {
 	policies, err := h.getPolicies()
+	if errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list retention policies")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -480,6 +603,9 @@ func (h *RetentionHandler) handleGet(c *fiber.Ctx) error {
 	}
 
 	policy, err := h.getPolicy(int64(policyID))
+	if errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
 	}
@@ -521,16 +647,40 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 	if len(args) == 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no fields to update"})
 	}
+	var (
+		result sql.Result
+		rows   int64
+		exists int
+		lookup error
+	)
 
 	// retention_days > buffer_days spans two columns, and a body may carry
 	// either one alone, so it is checked against the values the row will hold
 	// — the body's where it carries one, the stored one where it does not — in
 	// the same statement that writes them, so no concurrent PUT can slip in
 	// between a read and the write. A stored NULL buffer reads as 0.
-	result, err := h.db.Exec(
-		"UPDATE retention_policies SET "+assignments+", updated_at = CURRENT_TIMESTAMP"+
-			" WHERE id = ? AND COALESCE(?, retention_days) > COALESCE(?, buffer_days, 0)",
-		append(args, policyID, req.RetentionDays.ptr(), req.BufferDays.ptr())...)
+	adopted, err := h.localWrite(func() (err error) {
+		result, err = h.db.Exec(
+			"UPDATE retention_policies SET "+assignments+", updated_at = CURRENT_TIMESTAMP"+
+				" WHERE id = ? AND COALESCE(?, retention_days) > COALESCE(?, buffer_days, 0)",
+			append(args, policyID, req.RetentionDays.ptr(), req.BufferDays.ptr())...)
+		if err != nil {
+			return err
+		}
+		if rows, _ = result.RowsAffected(); rows == 0 {
+			// Either no such policy, or the row's values would break the
+			// retention/buffer rule; told apart below, read under the same
+			// lock as the write.
+			lookup = h.db.QueryRow("SELECT 1 FROM retention_policies WHERE id = ?", policyID).Scan(&exists)
+		}
+		return nil
+	})
+	if adopted != nil {
+		return h.clusterUpdate(c, adopted, int64(policyID), &req)
+	}
+	if errors.Is(err, errRetentionBeingAdopted) || errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -544,13 +694,8 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		// Either no such policy, or the row's values would break the
-		// retention/buffer rule; tell them apart.
-		var exists int
-		err := h.db.QueryRow("SELECT 1 FROM retention_policies WHERE id = ?", policyID).Scan(&exists)
-		switch {
+		switch err := lookup; {
 		case errors.Is(err, sql.ErrNoRows):
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
 		case err != nil:
@@ -577,11 +722,20 @@ func (h *RetentionHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid policy ID"})
 	}
 
-	// Delete execution history first
-	_, _ = h.db.Exec("DELETE FROM retention_executions WHERE policy_id = ?", policyID)
-
-	// Delete policy
-	result, err := h.db.Exec("DELETE FROM retention_policies WHERE id = ?", policyID)
+	var result sql.Result
+	adopted, err := h.localWrite(func() (err error) {
+		// Delete execution history first
+		_, _ = h.db.Exec("DELETE FROM retention_executions WHERE policy_id = ?", policyID)
+		// Delete policy
+		result, err = h.db.Exec("DELETE FROM retention_policies WHERE id = ?", policyID)
+		return err
+	})
+	if adopted != nil {
+		return h.clusterDelete(c, adopted, int64(policyID))
+	}
+	if errors.Is(err, errRetentionBeingAdopted) || errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to delete retention policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -632,12 +786,22 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover measurements: %w", err)
 	}
-	measurements := discovery.measurements
+	// Cold-only measurements are invisible to the hot listing, so the cold
+	// tier adds its own (#168).
+	cold := h.planColdRetention(ctx, policy, cutoffDate)
+	defer h.notifyColdRemoved(cold)
+	measurements := cold.addMeasurements(discovery.measurements)
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
 	// Record execution start
 	executionID := h.recordExecutionStart(policyID, cutoffDate)
+	if err := h.policyUnchanged(policy); err != nil {
+		if executionID > 0 {
+			h.recordExecutionComplete(executionID, "failed", 0, float64(time.Since(start).Milliseconds()), err.Error())
+		}
+		return nil, fmt.Errorf("retention policy %d: %w", policyID, err)
+	}
 
 	// Execute retention for each measurement
 	var totalDeleted int64
@@ -645,7 +809,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	var totalSkipped int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, skipped, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
+		deleted, filesDeleted, skipped, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, retentionManifestReason(policyID))
 		// Accumulate before error check: deleteOldFiles returns partial progress
 		// on abort so the execution record reflects all completed work accurately.
 		totalDeleted += deleted
@@ -659,13 +823,27 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			if executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
 			}
+			h.clearCachesAfterRun(false) // files of earlier measurements may be gone
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
+		}
+
+		// Only a cancelled context stops the cold pass; everything else it
+		// cannot do is counted in cold, so hot retention always runs.
+		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(ctx, cold, measurement, cutoffDate, false)
+		totalDeleted += coldRows
+		totalFilesDeleted += coldFiles
+		if coldErr != nil {
+			if executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
+			}
+			h.clearCachesAfterRun(false)
+			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, coldErr)
 		}
 	}
 	totalSkipped += discovery.unusable.orphans
 
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
-	h.duckdb.ClearHTTPCache()
+	h.clearCachesAfterRun(false)
 	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -674,6 +852,8 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	// not do what the policy asks, so it must not be recorded as a clean
 	// "completed": the whole failure mode #746 fixed was retention reporting
 	// success while deleting nothing.
+	coldReason := cold.skippedReason()
+	cold.logSkipped(h.logger, policy.Database)
 	if executionID > 0 {
 		status, detail := "completed", ""
 		if totalSkipped > 0 {
@@ -682,6 +862,10 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
 				Strs("sample", formatUnusableSamples(discovery.unusable)).
 				Msg("Retention could not resolve some files; their data will never age out")
+		}
+		if coldReason != "" {
+			status = "completed_with_errors"
+			detail = joinRetentionDetail(detail, coldReason)
 		}
 		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, detail)
 	}
@@ -699,6 +883,10 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		FilesDeleted:         totalFilesDeleted,
 		SkippedFiles:         totalSkipped,
 		SkippedReason:        skippedReason(totalSkipped),
+		ColdFilesDeleted:     cold.filesDeleted,
+		ColdRowsDeleted:      cold.rowsDeleted,
+		ColdFilesSkipped:     cold.skippedTotal(),
+		ColdSkippedReason:    coldReason,
 		ExecutionTimeMs:      executionTime,
 		DryRun:               false,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -708,6 +896,11 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 
 // GetActivePolicies returns all active retention policies (used by scheduler)
 func (h *RetentionHandler) GetActivePolicies() ([]RetentionPolicy, error) {
+	if src, err := h.readSource(); err != nil {
+		return nil, err
+	} else if src != nil {
+		return h.clusterPolicies(src, true)
+	}
 	rows, err := h.db.Query(`
 		SELECT
 			rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
@@ -781,6 +974,9 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 
 	// Get policy
 	policy, err := h.getPolicy(int64(policyID))
+	if errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
 	}
@@ -805,7 +1001,11 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			"error": "Failed to discover measurements: " + err.Error(),
 		})
 	}
-	measurements := discovery.measurements
+	// Cold-only measurements are invisible to the hot listing, so the cold
+	// tier adds its own (#168).
+	cold := h.planColdRetention(c.Context(), policy, cutoffDate)
+	defer h.notifyColdRemoved(cold)
+	measurements := cold.addMeasurements(discovery.measurements)
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -813,6 +1013,12 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	var executionID int64
 	if !req.DryRun {
 		executionID = h.recordExecutionStart(int64(policyID), cutoffDate)
+		if err := h.policyUnchanged(policy); err != nil {
+			if executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", 0, float64(time.Since(start).Milliseconds()), err.Error())
+			}
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+		}
 	}
 
 	// Execute retention for each measurement
@@ -821,7 +1027,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	var totalSkipped int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, skipped, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
+		deleted, filesDeleted, skipped, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, retentionManifestReason(policyID))
 		totalSkipped += skipped
 		totalSkipped += discovery.unusable.counts[measurement]
 		totalDeleted += deleted
@@ -831,8 +1037,23 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
 			}
+			h.clearCachesAfterRun(req.DryRun) // files of earlier measurements may be gone
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, err.Error()),
+			})
+		}
+		// Only a cancelled context stops the cold pass; everything else it
+		// cannot do is counted in cold, so hot retention always runs.
+		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(c.Context(), cold, measurement, cutoffDate, req.DryRun)
+		totalDeleted += coldRows
+		totalFilesDeleted += coldFiles
+		if coldErr != nil {
+			if !req.DryRun && executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
+			}
+			h.clearCachesAfterRun(req.DryRun)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, coldErr.Error()),
 			})
 		}
 	}
@@ -840,7 +1061,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 
 	// Clear DuckDB parquet metadata/data cache — dry runs also populate the cache via
 	// read_parquet calls in getFileMaxTimeAndRowCount, so always clear regardless of dry run.
-	h.duckdb.ClearHTTPCache()
+	h.clearCachesAfterRun(req.DryRun)
 	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -854,12 +1075,14 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			Strs("sample", formatUnusableSamples(discovery.unusable)).
 			Msg("Retention could not resolve some files; their data will never age out")
 	}
+	coldReason := cold.skippedReason()
+	cold.logSkipped(h.logger, policy.Database)
 	if !req.DryRun && executionID > 0 {
 		status := "completed"
-		if totalSkipped > 0 {
+		if totalSkipped > 0 || coldReason != "" {
 			status = "completed_with_errors"
 		}
-		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, skipDetail)
+		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, joinRetentionDetail(skipDetail, coldReason))
 	}
 
 	h.logger.Info().
@@ -876,6 +1099,10 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		FilesDeleted:         totalFilesDeleted,
 		SkippedFiles:         totalSkipped,
 		SkippedReason:        skipDetail,
+		ColdFilesDeleted:     cold.filesDeleted,
+		ColdRowsDeleted:      cold.rowsDeleted,
+		ColdFilesSkipped:     cold.skippedTotal(),
+		ColdSkippedReason:    coldReason,
 		ExecutionTimeMs:      executionTime,
 		DryRun:               req.DryRun,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -922,7 +1149,16 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 }
 
 // getPolicy retrieves a single policy by ID
+//
+// Once the cluster holds retention policies (#1324) the policy is the
+// cluster's, never a row of this node's own: every run reads it here, so a
+// mirror that has not caught up cannot change what a run deletes.
 func (h *RetentionHandler) getPolicy(policyID int64) (*RetentionPolicy, error) {
+	if src, err := h.readSource(); err != nil {
+		return nil, err
+	} else if src != nil {
+		return h.clusterPolicy(src, policyID)
+	}
 	row := h.db.QueryRow(`
 		SELECT
 			rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
@@ -952,6 +1188,11 @@ func (h *RetentionHandler) getPolicy(policyID int64) (*RetentionPolicy, error) {
 
 // getPolicies retrieves all policies
 func (h *RetentionHandler) getPolicies() ([]RetentionPolicy, error) {
+	if src, err := h.readSource(); err != nil {
+		return nil, err
+	} else if src != nil {
+		return h.clusterPolicies(src, false)
+	}
 	rows, err := h.db.Query(`
 		SELECT
 			rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
@@ -1274,8 +1515,36 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	return maxTime.UTC(), rowCount, nil
 }
 
+// errPolicyChangedBeforeRun: the policy a run read changed (or went) before
+// the run deleted anything.
+var errPolicyChangedBeforeRun = errors.New("the policy changed before the run started deleting (the cluster adopted retention policies, or the policy was edited); the next run uses the current policy")
+
+// policyUnchanged re-reads the policy a run read before its discovery, just
+// before it deletes: a run that straddles the cluster's adoption (or an edit)
+// must not delete under a definition that is no longer the policy.
+func (h *RetentionHandler) policyUnchanged(p *RetentionPolicy) error {
+	now, err := h.getPolicy(p.ID)
+	if err != nil || !now.IsActive || now.Name != p.Name || now.Database != p.Database ||
+		measurementKeyOf(now.Measurement) != measurementKeyOf(p.Measurement) ||
+		now.RetentionDays != p.RetentionDays || now.BufferDays != p.BufferDays {
+		return errPolicyChangedBeforeRun
+	}
+	return nil
+}
+
+func measurementKeyOf(m *string) string {
+	if m == nil {
+		return ""
+	}
+	return *m
+}
+
 // recordExecutionStart records the start of an execution
 func (h *RetentionHandler) recordExecutionStart(policyID int64, cutoffDate time.Time) int64 {
+	// The history's foreign key needs this node's row of a cluster policy. A
+	// run of a policy deleted cluster-wide after the run read it finds no row
+	// and goes unrecorded, as a run of a policy deleted locally always did.
+	h.ensureMirrored(context.Background())
 	result, err := h.db.Exec(`
 		INSERT INTO retention_executions (policy_id, execution_time, status, cutoff_date)
 		VALUES (?, CURRENT_TIMESTAMP, 'running', ?)
@@ -1347,4 +1616,28 @@ func (h *RetentionHandler) removeDirectoryTree(ctx context.Context, remover stor
 
 	parent := filepath.Dir(dir)
 	return 1 + h.removeDirectoryTree(ctx, remover, parent)
+}
+
+// retentionManifestReason is the manifest delete reason of a retention
+// policy's run: a compaction whose output it removes deletes its inputs too
+// (raft.OutputGoneAccounted, #1207 d2a2b).
+func retentionManifestReason[T int | int64](policyID T) string {
+	return fmt.Sprintf("retention:%d", policyID)
+}
+
+// SetOnFilesRemoved sets the function called after this handler removed or
+// rewrote parquet files: the query caches hold pruned partition lists, and one
+// naming a removed hour makes DuckDB report "No files found", which a query
+// answers with a retryable 503 (classifyNoFiles) until the cache is cleared.
+func (h *RetentionHandler) SetOnFilesRemoved(fn func()) {
+	h.onFilesRemoved = fn
+}
+
+// clearCachesAfterRun clears DuckDB's cache_httpfs cache (ClearHTTPCache) and,
+// unless the run was a dry run (it removed nothing), the query caches.
+func (h *RetentionHandler) clearCachesAfterRun(dryRun bool) {
+	h.duckdb.ClearHTTPCache()
+	if !dryRun && h.onFilesRemoved != nil {
+		h.onFilesRemoved()
+	}
 }

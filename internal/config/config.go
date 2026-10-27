@@ -71,7 +71,8 @@ type ServerConfig struct {
 	IdleTimeout     int // Connection idle timeout in seconds
 	ShutdownTimeout int // Graceful shutdown timeout in seconds
 	// StorageCredentialsFailReady: /ready returns 503 while any storage tier's
-	// credential state is "expired" (#603). Default false — recycling on
+	// credential state is "expired" (#603) or "unavailable" (a GCS tier whose
+	// credentials were never resolved, #1105). Default false — recycling on
 	// credential expiry is an operator policy; recommended for reader pools.
 	StorageCredentialsFailReady bool
 	MaxPayloadSize              int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
@@ -86,6 +87,10 @@ type DatabaseConfig struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	// Extensions are DuckDB extensions to install and load before external
+	// access is locked down. database.New accepts only the names in
+	// database.SupportedExtensionNames (#440).
+	Extensions []string
 	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
 	// overflow, large sorts, joins). Should be on local fast storage. Files
 	// here are NOT durable state; orphans from a crashed previous run are
@@ -103,6 +108,14 @@ type DatabaseConfig struct {
 	// pre-26.09.1 behavior where un-ordered SELECTs return rows in
 	// file/insertion order.
 	PreserveInsertionOrder bool
+	// ExternalFileCache controls DuckDB's file cache
+	// (enable_external_file_cache), which keeps blocks of every file DuckDB
+	// has read, including files compaction has since deleted, until
+	// memory_limit forces them out (#1372). "auto" (the default) turns it off
+	// on a node whose data is all on local disk, where the OS page cache
+	// already holds those blocks, and keeps it on a node that may read S3 or
+	// Azure, where it is the remote read cache. "true" and "false" force it.
+	ExternalFileCache string
 }
 
 type StorageConfig struct {
@@ -126,6 +139,14 @@ type StorageConfig struct {
 	AzurePrefix             string // Blob-name prefix within the container (e.g., "instances/abc123/")
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
+	// Google Cloud Storage (#1105). Authenticates with a service-account key
+	// file when GCSCredentialsFile is set, else Application Default
+	// Credentials (GOOGLE_APPLICATION_CREDENTIALS, gcloud ADC, or the metadata
+	// server: GCE, GKE Workload Identity, Cloud Run).
+	GCSBucket          string // Bucket name
+	GCSPrefix          string // Object-name prefix within the bucket (e.g., "instances/abc123/")
+	GCSCredentialsFile string // Service-account key file path (optional)
+	GCSEndpoint        string // https endpoint override, e.g. Private Service Connect (optional)
 }
 
 type IngestConfig struct {
@@ -173,7 +194,7 @@ type CompactionConfig struct {
 	HourlyEnabled             bool          // Enable hourly tier
 	DailyEnabled              bool          // Enable daily tier
 	HourlyMinAgeHours         int           // Minimum age for hourly compaction (default: 1)
-	HourlyMinFiles            int           // Minimum files for hourly compaction (default: 10)
+	HourlyMinFiles            int           // Per-hour uncompacted-file floor (default: 10; independent of flush cadence)
 	DailyMinAgeHours          int           // Minimum age for daily compaction (default: 24)
 	DailyMinFiles             int           // Minimum files for daily compaction (default: 12)
 	DailySkipFileAgeCheckDays int           // Skip file creation time check for partitions older than N days (default: 7)
@@ -461,6 +482,28 @@ type WALConfig struct {
 	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
 	// much written data a sync may leave behind, not the writer's throughput.
 	SyncBytes int64
+	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
+	// volume is low on free space, and keeps the WAL reserve file (#676).
+	// Default true; only acts with the WAL enabled.
+	DiskPressureEnabled bool
+	// DiskMinFreeMB is the free space below which live writes are refused.
+	// 0 (default) = max(512, 2 x max_size_mb); clamped to a fifth of the
+	// volume. Negative is rejected.
+	DiskMinFreeMB int
+	// MaxDirectoryMB caps the WAL directory's bytes, for a volume whose free
+	// space does not show the limit that applies (an emptyDir with a
+	// sizeLimit). 0 (default) = no cap. Negative is rejected.
+	MaxDirectoryMB int
+}
+
+// WALMinDirectoryMB is the least wal.max_directory_mb accepted for a
+// wal.max_size_mb (0 = the 100 MB default): four WAL files, the active one,
+// the two-file band the disk gate clears below, and one of margin (#676).
+func WALMinDirectoryMB(maxSizeMB int) int {
+	if maxSizeMB <= 0 {
+		maxSizeMB = 100
+	}
+	return 4 * maxSizeMB
 }
 
 type TelemetryConfig struct {
@@ -473,6 +516,13 @@ type DeleteConfig struct {
 	Enabled               bool // Enable delete operations (default: false for safety)
 	ConfirmationThreshold int  // Require confirm=true for deletes affecting more than this many rows
 	MaxRowsPerDelete      int  // Maximum rows that can be deleted in a single operation
+	// TimePruning: a DELETE whose WHERE bounds time reads only the partition
+	// directories that range can touch (default true). It relies on a file's
+	// directory holding only rows of that hour or day, which holds for every
+	// file written since 26.01.1; Arc 25.12 and earlier placed a file by the
+	// hour it was flushed, so a deployment still holding such data sets it
+	// false, and every DELETE reads every file again.
+	TimePruning bool
 }
 
 type RetentionConfig struct {
@@ -525,12 +575,11 @@ type QueryConfig struct {
 	EnableS3Cache            bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
 	S3CacheSize              int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
 	S3CacheTTLSeconds        int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
-	// FileTimePruning (EXPERIMENTAL, 26.09.2) expands the current-hour
-	// partition glob and drops files whose filename flush-timestamp proves
-	// they cannot contain rows in the query's time range. Big win for
-	// high-frequency ingest where the live hour holds thousands of small
-	// files (local backend only). Opt-in while experimental; planned to
-	// become the default in 27.01.1 (#659).
+	// FileTimePruning (26.09.2, on by default since 27.01.1, #659) expands
+	// the current-hour partition glob and drops files whose filename
+	// flush-timestamp proves they cannot contain rows in the query's time
+	// range. It helps high-frequency ingest, where the live hour holds
+	// thousands of small files (local backend only). false turns it off.
 	FileTimePruning bool
 	// FileTimePruningMarginSeconds widens the keep-window below the query's
 	// lower bound to absorb writer clock skew (default 300).
@@ -558,8 +607,7 @@ type QueryConfig struct {
 
 // LicenseConfig holds configuration for enterprise license validation
 type LicenseConfig struct {
-	Enabled bool   // Enable license validation (default: false)
-	Key     string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX)
+	Key string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX)
 	// FilePath points at an offline license file downloaded from the
 	// activation server admin ({license_file, license_signature}). When set it
 	// WINS over Key: the license is verified entirely from disk against the
@@ -582,7 +630,7 @@ type SchedulerConfig struct {
 type ReconciliationConfig struct {
 	Enabled                   bool   // Off by default — explicit operator opt-in
 	Schedule                  string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
-	GraceWindowSeconds        int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
+	GraceWindowSeconds        int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h; minimum 3600, a lower value is raised to it)
 	ClockSkewAllowanceSeconds int    // Added to grace window (default: 300 = 5m)
 	PerPrefixTimeoutSeconds   int    // Per-prefix List timeout (default: 300 = 5m)
 	MaxRunDurationSeconds     int    // Overall run timeout (default: 1800 = 30m)
@@ -599,7 +647,7 @@ type ReconciliationConfig struct {
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
 // Tiered storage enables automatic data lifecycle management with hot/cold tiers.
 // - Hot tier: Local storage for recent data (fast access)
-// - Cold tier: S3/Azure for archived data (cost-effective archival storage)
+// - Cold tier: S3/Azure/GCS for archived data (cost-effective archival storage)
 //
 // Data older than DefaultHotMaxAgeDays is automatically migrated to cold storage.
 type TieredStorageConfig struct {
@@ -627,11 +675,11 @@ type TieredStorageConfig struct {
 	// truncates never retires a stale row.
 	ScanTimeout time.Duration
 
-	// Cold tier configuration (remote S3/Azure storage)
+	// Cold tier configuration (remote S3/Azure/GCS storage)
 	Cold ColdTierConfig
 }
 
-// ColdTierConfig holds configuration for the cold storage tier (S3/Azure).
+// ColdTierConfig holds configuration for the cold storage tier (S3/Azure/GCS).
 // This is the only remote tier - data moves directly from hot (local) to cold (remote).
 // Cold objects are written with no storage class or access tier set — S3
 // STANDARD, and on Azure the storage account's default tier — and queried in
@@ -641,7 +689,7 @@ type TieredStorageConfig struct {
 // preserve for a saving that is small next to block storage versus S3.
 type ColdTierConfig struct {
 	Enabled bool   // Enable cold tier
-	Backend string // "s3" or "azure"
+	Backend string // "s3", "azure" or "gcs"
 
 	// S3 settings
 	S3Bucket    string // S3 bucket for cold-tier data
@@ -662,6 +710,13 @@ type ColdTierConfig struct {
 	AzureSASToken           string // SAS token for scoped access
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
+
+	// GCS settings (#1105). Credentials as for storage.gcs_*: a
+	// service-account key file, else Application Default Credentials.
+	GCSBucket          string // Bucket for cold-tier data
+	GCSPrefix          string // Object-name prefix within the bucket
+	GCSCredentialsFile string // Service-account key file path (optional)
+	GCSEndpoint        string // https endpoint override (optional)
 }
 
 // AuditLogConfig holds configuration for enterprise audit logging.
@@ -754,17 +809,33 @@ type ClusterConfig struct {
 	RaftHeartbeatTimeout  int    // Raft heartbeat timeout in milliseconds (default: 500)
 	RaftSnapshotInterval  int    // Snapshot interval in seconds (default: 300)
 	RaftSnapshotThreshold int    // Number of logs before snapshot (default: 10000)
+	// RaftPreVote runs the Raft pre-vote round before an election (#1272): a
+	// writer that cannot hear the leader no longer raises its term and makes
+	// the healthy leader step down when it reaches it. Default true. Set false
+	// while rolling a cluster up from a release before 27.01.1, whose nodes do
+	// not answer pre-vote (see the upgrade notes).
+	RaftPreVote bool
 
 	// Request routing configuration (Phase 3)
 	RouteTimeout int // Timeout for forwarded requests in milliseconds (default: 5000)
-	RouteRetries int // Number of retries for failed forwards (default: 3)
+	// WriteForwardTimeoutMs bounds one write forwarded to a writer, upload
+	// and processing included (default 60000). Forwarded writes are never
+	// retried once sent (#1270); a write that times out after being sent is
+	// answered 504 (it may have been written).
+	WriteForwardTimeoutMs int
+	// ImportForwardTimeoutMs bounds one import (/api/v1/import/*) forwarded
+	// to a writer, upload and processing included (default 3600000, 0 = no
+	// bound). A backstop, not a deadline: a forward is not cancelled when its
+	// client gives up, so this is what frees the forwarding node from a writer
+	// that never answers (#1070).
+	ImportForwardTimeoutMs int
+	RouteRetries           int // Number of retries for failed forwards (default: 3)
 
-	// Replication configuration (Phase 3.3). ReplicationEnabled starts peer file
-	// replication; the live WAL replication stream is not started (#888, #1207).
-	ReplicationEnabled     bool // Enable peer file replication (default: false)
-	ReplicationLagLimit    int  // Max acceptable lag in milliseconds before health degrades (default: 5000)
-	ReplicationBufferSize  int  // Entry buffer size for replication queue (default: 10000)
-	ReplicationAckInterval int  // How often readers send acks in milliseconds (default: 100)
+	// ReplicationEnabled starts peer file replication. The WAL replication
+	// stream it once started too is gone (#888, #1181); its
+	// replication_lag_limit, replication_buffer_size and
+	// replication_ack_interval keys are ignored.
+	ReplicationEnabled bool // Enable peer file replication (default: false)
 
 	// Peer file replication configuration (Enterprise Phase 2)
 	// These gate and tune the background puller that replicates Parquet files
@@ -830,12 +901,25 @@ type ClusterConfig struct {
 	StreamTakeoverDepartedTTL time.Duration
 	// StandbyStoreMaxBytes caps the copy a standby writer keeps of what its
 	// primary streams, with WALCoverage on (#1207). Past it the standby stores
-	// nothing until trimming frees room.
+	// nothing until trimming frees room. 0 (default): a quarter of the WAL
+	// volume, at least 1 GiB and at most 32 GiB; negative: no cap (#1266).
 	StandbyStoreMaxBytes int64
 	// OriginStreamQueueBytes caps what a primary holds in memory for one
 	// standby writer that is not keeping up; past it that standby misses
 	// batches (a gap in its copy).
 	OriginStreamQueueBytes int64
+	// StaleLocalSweep removes a local replica this node saw registered once
+	// the cluster manifest no longer lists it, when the delete that should
+	// have removed it was missed: the node was down, or crashed with the
+	// unlink queued (#1071). Local storage with replication only. Default on.
+	// Off stops the removals only: the tracking behind them also records what
+	// each local copy holds, which the manifest walks judge copies by (#1182).
+	StaleLocalSweep bool
+	// StaleLocalSweepMaxFraction stops a sweep pass that would remove more
+	// than this fraction of the files the node tracks (and at least 1000):
+	// a manifest rolled back by an unsafe recovery must not take every local
+	// copy with it. Raise it to let a refused pass run. Default 0.5.
+	StaleLocalSweepMaxFraction float64
 
 	// Cluster security (Enterprise)
 	SharedSecret string // Shared secret for join authentication (HMAC-SHA256). All nodes must share the same value.
@@ -947,6 +1031,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid cluster.stream_takeover_departed_ttl %q: must be a Go duration of at least 1m", v.GetString("cluster.stream_takeover_departed_ttl"))
 	}
 
+	// math.IsNaN via self-comparison: NaN would disable the breaker silently.
+	if f := v.GetFloat64("cluster.stale_local_sweep_max_fraction"); f != f || f <= 0 {
+		return nil, fmt.Errorf("invalid cluster.stale_local_sweep_max_fraction %v: must be a number above 0 (above 1 never refuses a pass)", v.Get("cluster.stale_local_sweep_max_fraction"))
+	}
+
 	scanTimeout, err := time.ParseDuration(v.GetString("tiered_storage.scan_timeout"))
 	if err != nil || scanTimeout <= 0 {
 		return nil, fmt.Errorf(
@@ -991,9 +1080,11 @@ func Load() (*Config, error) {
 			MemoryLimit:            v.GetString("database.memory_limit"),
 			ThreadCount:            v.GetInt("database.thread_count"),
 			EnableWAL:              v.GetBool("database.enable_wal"),
+			Extensions:             normalizeExtensionNames(parseTargetDatabases(v.Get("database.extensions"))),
 			TempDirectory:          v.GetString("database.temp_directory"),
 			ArcxExtensionPath:      v.GetString("database.arcx_extension_path"),
 			PreserveInsertionOrder: v.GetBool("database.preserve_insertion_order"),
+			ExternalFileCache:      strings.ToLower(strings.TrimSpace(v.GetString("database.external_file_cache"))),
 		},
 		Storage: StorageConfig{
 			// Normalize once at load so the backend switch, the DuckDB
@@ -1019,6 +1110,11 @@ func Load() (*Config, error) {
 			AzurePrefix:             v.GetString("storage.azure_prefix"),
 			AzureEndpoint:           v.GetString("storage.azure_endpoint"),
 			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
+			// Google Cloud Storage
+			GCSBucket:          v.GetString("storage.gcs_bucket"),
+			GCSPrefix:          v.GetString("storage.gcs_prefix"),
+			GCSCredentialsFile: v.GetString("storage.gcs_credentials_file"),
+			GCSEndpoint:        v.GetString("storage.gcs_endpoint"),
 		},
 		Ingest: IngestConfig{
 			MaxBufferSize:         v.GetInt("ingest.max_buffer_size"),
@@ -1120,6 +1216,9 @@ func Load() (*Config, error) {
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
+			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
+			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
+			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -1130,6 +1229,7 @@ func Load() (*Config, error) {
 			Enabled:               v.GetBool("delete.enabled"),
 			ConfirmationThreshold: v.GetInt("delete.confirmation_threshold"),
 			MaxRowsPerDelete:      v.GetInt("delete.max_rows_per_delete"),
+			TimePruning:           v.GetBool("delete.time_pruning"),
 		},
 		Retention: RetentionConfig{
 			Enabled: v.GetBool("retention.enabled"),
@@ -1178,7 +1278,6 @@ func Load() (*Config, error) {
 			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
 		},
 		License: LicenseConfig{
-			Enabled:  v.GetBool("license.enabled"),
 			Key:      v.GetString("license.key"),
 			FilePath: strings.TrimSpace(v.GetString("license.file_path")),
 		},
@@ -1202,25 +1301,27 @@ func Load() (*Config, error) {
 			RecheckConcurrency:        v.GetInt("reconciliation.recheck_concurrency"),
 		},
 		Cluster: ClusterConfig{
-			Enabled:                   v.GetBool("cluster.enabled"),
-			NodeID:                    v.GetString("cluster.node_id"),
-			Role:                      v.GetString("cluster.role"),
-			ClusterName:               v.GetString("cluster.cluster_name"),
-			Seeds:                     parseStringSlice(v.GetString("cluster.seeds")),
-			CoordinatorAddr:           v.GetString("cluster.coordinator_addr"),
-			AdvertiseAddr:             v.GetString("cluster.advertise_addr"),
-			HealthCheckInterval:       v.GetInt("cluster.health_check_interval"),
-			IngestFenceAfterMs:        v.GetInt("cluster.ingest_fence_after_ms"),
-			WALCoverage:               v.GetBool("cluster.wal_coverage"),
-			StreamTakeover:            v.GetBool("cluster.stream_takeover"),
-			StreamTakeoverGrace:       takeoverGrace,
-			StreamTakeoverDepartedTTL: departedTTL,
-			StandbyStoreMaxBytes:      v.GetInt64("cluster.standby_store_max_bytes"),
-			OriginStreamQueueBytes:    v.GetInt64("cluster.origin_stream_queue_bytes"),
-			HealthCheckTimeout:        v.GetInt("cluster.health_check_timeout"),
-			UnhealthyThreshold:        v.GetInt("cluster.unhealthy_threshold"),
-			HeartbeatInterval:         v.GetInt("cluster.heartbeat_interval"),
-			HeartbeatTimeout:          v.GetInt("cluster.heartbeat_timeout"),
+			Enabled:                    v.GetBool("cluster.enabled"),
+			NodeID:                     v.GetString("cluster.node_id"),
+			Role:                       v.GetString("cluster.role"),
+			ClusterName:                v.GetString("cluster.cluster_name"),
+			Seeds:                      parseStringSlice(v.GetString("cluster.seeds")),
+			CoordinatorAddr:            v.GetString("cluster.coordinator_addr"),
+			AdvertiseAddr:              v.GetString("cluster.advertise_addr"),
+			HealthCheckInterval:        v.GetInt("cluster.health_check_interval"),
+			IngestFenceAfterMs:         v.GetInt("cluster.ingest_fence_after_ms"),
+			WALCoverage:                v.GetBool("cluster.wal_coverage"),
+			StreamTakeover:             v.GetBool("cluster.stream_takeover"),
+			StreamTakeoverGrace:        takeoverGrace,
+			StreamTakeoverDepartedTTL:  departedTTL,
+			StandbyStoreMaxBytes:       v.GetInt64("cluster.standby_store_max_bytes"),
+			OriginStreamQueueBytes:     v.GetInt64("cluster.origin_stream_queue_bytes"),
+			StaleLocalSweep:            v.GetBool("cluster.stale_local_sweep"),
+			StaleLocalSweepMaxFraction: v.GetFloat64("cluster.stale_local_sweep_max_fraction"),
+			HealthCheckTimeout:         v.GetInt("cluster.health_check_timeout"),
+			UnhealthyThreshold:         v.GetInt("cluster.unhealthy_threshold"),
+			HeartbeatInterval:          v.GetInt("cluster.heartbeat_interval"),
+			HeartbeatTimeout:           v.GetInt("cluster.heartbeat_timeout"),
 			// Raft configuration
 			RaftDataDir:           v.GetString("cluster.raft_data_dir"),
 			RaftBindAddr:          v.GetString("cluster.raft_bind_addr"),
@@ -1230,14 +1331,14 @@ func Load() (*Config, error) {
 			RaftHeartbeatTimeout:  v.GetInt("cluster.raft_heartbeat_timeout"),
 			RaftSnapshotInterval:  v.GetInt("cluster.raft_snapshot_interval"),
 			RaftSnapshotThreshold: v.GetInt("cluster.raft_snapshot_threshold"),
+			RaftPreVote:           v.GetBool("cluster.raft_pre_vote"),
 			// Routing configuration
-			RouteTimeout: v.GetInt("cluster.route_timeout"),
-			RouteRetries: v.GetInt("cluster.route_retries"),
+			RouteTimeout:           v.GetInt("cluster.route_timeout"),
+			WriteForwardTimeoutMs:  v.GetInt("cluster.write_forward_timeout_ms"),
+			ImportForwardTimeoutMs: v.GetInt("cluster.import_forward_timeout_ms"),
+			RouteRetries:           v.GetInt("cluster.route_retries"),
 			// Replication configuration
-			ReplicationEnabled:     v.GetBool("cluster.replication_enabled"),
-			ReplicationLagLimit:    v.GetInt("cluster.replication_lag_limit"),
-			ReplicationBufferSize:  v.GetInt("cluster.replication_buffer_size"),
-			ReplicationAckInterval: v.GetInt("cluster.replication_ack_interval"),
+			ReplicationEnabled: v.GetBool("cluster.replication_enabled"),
 			// Peer file replication (Enterprise Phase 2)
 			ReplicationPullWorkers:                   v.GetInt("cluster.replication_pull_workers"),
 			ReplicationQueueSize:                     v.GetInt("cluster.replication_queue_size"),
@@ -1301,6 +1402,10 @@ func Load() (*Config, error) {
 				AzureSASToken:           v.GetString("tiered_storage.cold.azure_sas_token"),
 				AzureEndpoint:           v.GetString("tiered_storage.cold.azure_endpoint"),
 				AzureUseManagedIdentity: v.GetBool("tiered_storage.cold.azure_use_managed_identity"),
+				GCSBucket:               v.GetString("tiered_storage.cold.gcs_bucket"),
+				GCSPrefix:               v.GetString("tiered_storage.cold.gcs_prefix"),
+				GCSCredentialsFile:      v.GetString("tiered_storage.cold.gcs_credentials_file"),
+				GCSEndpoint:             v.GetString("tiered_storage.cold.gcs_endpoint"),
 			},
 		},
 		AuditLog: AuditLogConfig{
@@ -1325,8 +1430,29 @@ func Load() (*Config, error) {
 	if err := validateDuckDBMemoryLimit("database.memory_limit", cfg.Database.MemoryLimit); err != nil {
 		return nil, err
 	}
+	switch cfg.Database.ExternalFileCache {
+	case "auto", "true", "false":
+	default:
+		return nil, fmt.Errorf("database.external_file_cache must be auto, true or false, got %q", cfg.Database.ExternalFileCache)
+	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
+	}
+	if cfg.WAL.DiskMinFreeMB < 0 {
+		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
+	}
+	if cfg.WAL.MaxDirectoryMB < 0 {
+		return nil, fmt.Errorf("invalid wal.max_directory_mb value: %d (must be >= 0; 0 = no cap)", cfg.WAL.MaxDirectoryMB)
+	}
+	// The cap must hold the active WAL file, the band the gate clears below
+	// and a file of margin, or the gate could never clear (#676).
+	if minDir := WALMinDirectoryMB(cfg.WAL.MaxSizeMB); cfg.WAL.MaxDirectoryMB > 0 && cfg.WAL.MaxDirectoryMB < minDir {
+		cfg.Warnings = append(cfg.Warnings, LoadWarning{
+			Key:     "wal.max_directory_mb",
+			Value:   strconv.Itoa(cfg.WAL.MaxDirectoryMB),
+			Message: fmt.Sprintf("wal.max_directory_mb is below four WAL files (4 x wal.max_size_mb = %d MB): raised to %d MB, or the WAL disk gate could never clear once on", minDir, minDir),
+		})
+		cfg.WAL.MaxDirectoryMB = minDir
 	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
@@ -1365,11 +1491,15 @@ func Load() (*Config, error) {
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
 	cfg.Storage.AzurePrefix = strings.TrimSpace(cfg.Storage.AzurePrefix)
 	cfg.Storage.AzureEndpoint = strings.TrimSpace(cfg.Storage.AzureEndpoint)
+	cfg.Storage.GCSBucket = strings.TrimSpace(cfg.Storage.GCSBucket)
+	cfg.Storage.GCSPrefix = strings.TrimSpace(cfg.Storage.GCSPrefix)
+	cfg.Storage.GCSCredentialsFile = strings.TrimSpace(cfg.Storage.GCSCredentialsFile)
+	cfg.Storage.GCSEndpoint = strings.TrimSpace(cfg.Storage.GCSEndpoint)
 
 	// Validate the primary storage backend against the supported set and check
 	// its required fields — fail fast at load rather than late in main.go's
 	// backend switch. The supported set must match that switch
-	// (cmd/arc/main.go): local / s3 / minio / azure / azblob.
+	// (cmd/arc/main.go): local / s3 / minio / azure / azblob / gcs.
 	switch cfg.Storage.Backend {
 	case "local":
 		// No object-storage fields to validate.
@@ -1403,15 +1533,27 @@ func Load() (*Config, error) {
 		if err := cfg.checkObjectPrefix("storage.azure_prefix", cfg.Storage.AzurePrefix); err != nil {
 			return nil, err
 		}
+	case "gcs":
+		// Same reasons as the S3 bucket guard: an empty bucket would build an
+		// empty gs:// allowlist entry and a secret scoped to nothing.
+		if cfg.Storage.GCSBucket == "" {
+			return nil, fmt.Errorf("storage.backend is \"gcs\" but storage.gcs_bucket is empty; set storage.gcs_bucket")
+		}
+		if err := cfg.checkObjectPrefix("storage.gcs_prefix", cfg.Storage.GCSPrefix); err != nil {
+			return nil, err
+		}
+		if err := checkGCSEndpoint("storage.gcs_endpoint", cfg.Storage.GCSEndpoint); err != nil {
+			return nil, err
+		}
 	default:
-		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", or \"azblob\"", cfg.Storage.Backend)
+		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", \"azblob\", or \"gcs\"", cfg.Storage.Backend)
 	}
 
 	// Cold tier (Enterprise tiered storage). Validate its backend and required
 	// fields at startup — same rationale as the primary guards above: a missing
 	// bucket/container surfaces only as an opaque tiering / query-time error
-	// otherwise. The cold runtime switch (cmd/arc/main.go) handles exactly "s3"
-	// and "azure"; reject anything else loudly. Backend is normalized at load.
+	// otherwise. The cold runtime switch (cmd/arc/main.go) handles exactly "s3",
+	// "azure" and "gcs"; reject anything else loudly. Backend is normalized at load.
 	// cold is a POINTER so the in-place trims persist to the real config struct,
 	// not a copy.
 	//
@@ -1432,6 +1574,10 @@ func Load() (*Config, error) {
 		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
 		cold.AzurePrefix = strings.TrimSpace(cold.AzurePrefix)
 		cold.AzureEndpoint = strings.TrimSpace(cold.AzureEndpoint)
+		cold.GCSBucket = strings.TrimSpace(cold.GCSBucket)
+		cold.GCSPrefix = strings.TrimSpace(cold.GCSPrefix)
+		cold.GCSCredentialsFile = strings.TrimSpace(cold.GCSCredentialsFile)
+		cold.GCSEndpoint = strings.TrimSpace(cold.GCSEndpoint)
 		switch cold.Backend {
 		case "s3":
 			if cold.S3Bucket == "" {
@@ -1456,8 +1602,22 @@ func Load() (*Config, error) {
 			if err := cfg.checkObjectPrefix("tiered_storage.cold.azure_prefix", cold.AzurePrefix); err != nil {
 				return nil, err
 			}
+		case "gcs":
+			if cold.GCSBucket == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"gcs\" but tiered_storage.cold.gcs_bucket is empty; set tiered_storage.cold.gcs_bucket")
+			}
+			// Same reason as the cold S3 prefix above.
+			if err := cfg.checkObjectPrefix("tiered_storage.cold.gcs_prefix", cold.GCSPrefix); err != nil {
+				return nil, err
+			}
+			if err := checkGCSEndpoint("tiered_storage.cold.gcs_endpoint", cold.GCSEndpoint); err != nil {
+				return nil, err
+			}
 		default:
-			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\" or \"azure\"", cold.Backend)
+			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\", \"azure\" or \"gcs\"", cold.Backend)
+		}
+		if err := cfg.checkColdPrimaryOverlap(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1772,9 +1932,11 @@ func setDefaults(v *viper.Viper) {
 	// applyLicenseCoreLimits in cmd/arc/main.go).
 	v.SetDefault("database.thread_count", 0)
 	v.SetDefault("database.enable_wal", true)
+	v.SetDefault("database.extensions", []string{})
 	v.SetDefault("database.temp_directory", "./.tmp")        // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
 	v.SetDefault("database.arcx_extension_path", "")         // Enterprise-only; gated by licenseClient.CanUseArcx()
 	v.SetDefault("database.preserve_insertion_order", false) // false = SQL-standard unordered results; ORDER BY queries unaffected
+	v.SetDefault("database.external_file_cache", "auto")     // auto = off when all data is local, on when S3/Azure/GCS may be read (#1372)
 
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")
@@ -1783,6 +1945,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("storage.s3_use_ssl", true)
 	v.SetDefault("storage.s3_path_style", false) // Use virtual-hosted style by default (set true for MinIO)
 	v.SetDefault("storage.azure_prefix", "")     // Container root by default (#1102)
+	v.SetDefault("storage.gcs_bucket", "")
+	v.SetDefault("storage.gcs_prefix", "")           // Bucket root by default
+	v.SetDefault("storage.gcs_credentials_file", "") // Empty = Application Default Credentials
+	v.SetDefault("storage.gcs_endpoint", "")         // Empty = storage.googleapis.com
 
 	// Cache defaults
 	v.SetDefault("cache.enabled", true)
@@ -1909,6 +2075,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
+	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
+	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
+	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
@@ -1919,6 +2088,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("delete.enabled", false)                // Disabled by default for safety
 	v.SetDefault("delete.confirmation_threshold", 10000) // Require confirm=true for > 10k rows
 	v.SetDefault("delete.max_rows_per_delete", 1000000)  // Max 1M rows per delete
+	v.SetDefault("delete.time_pruning", true)            // Read only the time range's partitions
 
 	// Retention policy defaults
 	v.SetDefault("retention.enabled", true)            // Enable policy management by default
@@ -1949,7 +2119,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.timeout", 300)                           // 5 minute query timeout (0 = no timeout)
 	v.SetDefault("query.cancel_on_client_disconnect", true)      // Can be disabled for clients that half-close their write side
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
-	v.SetDefault("query.file_time_pruning", false)               // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
+	v.SetDefault("query.file_time_pruning", true)                // On by default since 27.01.1 (#659); false turns it off
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
 	v.SetDefault("query.stable_schema_bootstrap", true)          // Build anchors for pre-26.09.2 measurements on first query
@@ -1961,9 +2131,8 @@ func setDefaults(v *viper.Viper) {
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
-	v.SetDefault("license.enabled", false) // Disabled by default
-	v.SetDefault("license.key", "")        // Must be provided
-	v.SetDefault("license.file_path", "")  // Offline license file (air-gapped); wins over license.key
+	v.SetDefault("license.key", "")       // Must be provided
+	v.SetDefault("license.file_path", "") // Offline license file (air-gapped); wins over license.key
 
 	// Scheduler defaults (Enterprise features)
 	// Note: CQ and retention schedulers are auto-enabled when their features are enabled AND license allows
@@ -2019,16 +2188,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.raft_heartbeat_timeout", 500)    // 500ms heartbeat timeout
 	v.SetDefault("cluster.raft_snapshot_interval", 300)    // 5 minutes snapshot interval
 	v.SetDefault("cluster.raft_snapshot_threshold", 10000) // 10k logs before snapshot
+	v.SetDefault("cluster.raft_pre_vote", true)            // #1272; see Cluster.RaftPreVote
 
 	// Request routing defaults (Phase 3)
-	v.SetDefault("cluster.route_timeout", 5000) // 5 second timeout for forwards
-	v.SetDefault("cluster.route_retries", 3)    // 3 retries for failed forwards
+	v.SetDefault("cluster.route_timeout", 5000)                // 5 second timeout for forwards
+	v.SetDefault("cluster.write_forward_timeout_ms", 60000)    // #1270; see Cluster.WriteForwardTimeoutMs
+	v.SetDefault("cluster.import_forward_timeout_ms", 3600000) // #1070; see Cluster.ImportForwardTimeoutMs
+	v.SetDefault("cluster.route_retries", 3)                   // 3 retries for failed forwards
 
-	// WAL Replication defaults (Phase 3.3)
-	v.SetDefault("cluster.replication_enabled", false)     // Disabled by default
-	v.SetDefault("cluster.replication_lag_limit", 5000)    // 5 second lag limit
-	v.SetDefault("cluster.replication_buffer_size", 10000) // 10k entry buffer
-	v.SetDefault("cluster.replication_ack_interval", 100)  // 100ms ack interval
+	v.SetDefault("cluster.replication_enabled", false) // Disabled by default
 	// Peer file replication (Enterprise Phase 2)
 	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
 	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue
@@ -2057,9 +2225,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.wal_coverage", false)      // experimental (#1207); see Cluster.WALCoverage
 	v.SetDefault("cluster.stream_takeover_grace", "60s")
 	v.SetDefault("cluster.stream_takeover_departed_ttl", "24h")
-	v.SetDefault("cluster.stream_takeover", false) // experimental (#1207 S4b); see Cluster.StreamTakeover
-	v.SetDefault("cluster.standby_store_max_bytes", int64(1<<30))
+	v.SetDefault("cluster.stream_takeover", false)            // experimental (#1207 S4b); see Cluster.StreamTakeover
+	v.SetDefault("cluster.standby_store_max_bytes", int64(0)) // 0 = a quarter of the WAL volume, min 1 GiB (#1266)
 	v.SetDefault("cluster.origin_stream_queue_bytes", int64(64<<20))
+	v.SetDefault("cluster.stale_local_sweep", true) // #1071
+	v.SetDefault("cluster.stale_local_sweep_max_fraction", 0.5)
 
 	// Cluster security defaults
 	v.SetDefault("cluster.shared_secret", "")
@@ -2081,7 +2251,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.shared_storage_mode", false)
 
 	// Tiered storage defaults (Enterprise feature)
-	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
+	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure/GCS archive)
 	v.SetDefault("tiered_storage.enabled", false)                       // Disabled by default
 	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *")      // 2am daily
 	v.SetDefault("tiered_storage.migration_max_concurrent", 4)          // 4 concurrent migrations
@@ -2090,7 +2260,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
 
-	// Cold tier defaults (S3/Azure). Objects are written in the bucket's
+	// Cold tier defaults (S3/Azure/GCS). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.
 	v.SetDefault("tiered_storage.cold.enabled", false)         // Disabled by default
 	v.SetDefault("tiered_storage.cold.backend", "s3")          // S3 by default
@@ -2109,6 +2279,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.cold.azure_sas_token", "")
 	v.SetDefault("tiered_storage.cold.azure_endpoint", "")
 	v.SetDefault("tiered_storage.cold.azure_use_managed_identity", false)
+	v.SetDefault("tiered_storage.cold.gcs_bucket", "")           // Must be configured for GCS
+	v.SetDefault("tiered_storage.cold.gcs_prefix", "")           // Bucket root by default
+	v.SetDefault("tiered_storage.cold.gcs_credentials_file", "") // Empty = Application Default Credentials
+	v.SetDefault("tiered_storage.cold.gcs_endpoint", "")         // Empty = storage.googleapis.com
 
 	// Audit log defaults (Enterprise feature)
 	v.SetDefault("audit_log.enabled", false)
@@ -2144,6 +2318,26 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("backup.operation_timeout", "2h")
 }
 
+// checkGCSEndpoint validates storage.gcs_endpoint at load, so a bad value is
+// reported before the logger exists rather than as a failed boot. https only:
+// DuckDB reads GCS over https on the endpoint's host whatever the scheme
+// given here (it takes a bare host, #1105), so an http endpoint would send
+// the storage backend and query reads to different places, and an emulator
+// that serves only http cannot serve DuckDB at all.
+func checkGCSEndpoint(key, endpoint string) error {
+	if endpoint == "" {
+		return nil
+	}
+	u, err := storage.GCSEndpointURL(endpoint)
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	if !strings.HasPrefix(u, "https://") {
+		return fmt.Errorf("%s %q must be an https URL", key, endpoint)
+	}
+	return nil
+}
+
 // checkObjectPrefix validates one configured object-store key prefix. key is
 // the operator-facing configuration key, so a rejection names the key the
 // operator must change.
@@ -2173,6 +2367,24 @@ func (c *Config) checkObjectPrefix(key, value string) error {
 		return fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return nil
+}
+
+// normalizeExtensionNames lower-cases and de-duplicates database.extensions,
+// keeping first-seen order. The list arrives through parseTargetDatabases,
+// the accessor that reads both the TOML array and the comma-separated
+// ARC_DATABASE_EXTENSIONS spelling (GetStringSlice keeps "spatial,vss" as one
+// entry). Whether a name is supported is database.New's to decide (#440).
+func normalizeExtensionNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		n = strings.ToLower(n)
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // parseStringSlice parses a comma-separated string into a slice of strings.

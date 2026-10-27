@@ -28,7 +28,7 @@ func TestLineProtocolWALEntriesCarryTheirDatabase(t *testing.T) {
 		t.Fatalf("wal.NewWriter: %v", err)
 	}
 
-	// Capture what the replication sender would receive.
+	// Capture what the replication hook (the origin stream) receives.
 	var (
 		mu       sync.Mutex
 		streamed [][]byte
@@ -57,8 +57,7 @@ func TestLineProtocolWALEntriesCarryTheirDatabase(t *testing.T) {
 		t.Fatalf("wal close: %v", err)
 	}
 
-	// 1. The replicated entry names its database. This is exactly what the
-	//    receiver does with it (coordinator.buildReplicationIngestHandler).
+	// 1. The replicated entry names its database.
 	mu.Lock()
 	defer mu.Unlock()
 	if len(streamed) != 1 {

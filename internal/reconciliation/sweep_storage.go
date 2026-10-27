@@ -36,6 +36,7 @@ func (r *Reconciler) sweepOrphanStorage(
 	ctx context.Context,
 	run *Run,
 	candidates []orphanStorageCandidate,
+	remote map[string]struct{},
 	dryRun bool,
 ) error {
 	if len(candidates) == 0 {
@@ -119,6 +120,20 @@ func (r *Reconciler) sweepOrphanStorage(
 			// node's FSM has not applied yet (#1212).
 			if p := r.isPending.Load(); p != nil && (*p)(c.path) {
 				run.SkippedPending++
+				continue
+			}
+			if o := r.isOwned.Load(); o != nil && (*o)(c.path) {
+				run.SkippedHeld++
+				continue
+			}
+			// Pending registration on another node, or in a pending list a
+			// writer published to the store (#1214).
+			if _, ok := remote[c.path]; ok {
+				run.SkippedPendingRemote++
+				continue
+			}
+			if a := r.isAdoptable.Load(); a != nil && (*a)(ctx, c.path) {
+				run.SkippedAdoptable++
 				continue
 			}
 			if r.coord != nil {

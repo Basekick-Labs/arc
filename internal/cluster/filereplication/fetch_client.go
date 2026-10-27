@@ -242,6 +242,10 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		}
 		// not_found or manifest: peer simply doesn't hold this file.
 		if isFileNotOnPeerAck(ack) {
+			if ack.Code == protocol.AckCodeManifest || (ack.Code == "" && ack.Error == protocol.ErrMsgFileNotInManifest) {
+				// Its manifest lacks the entry: it may only trail ours.
+				return 0, fmt.Errorf("%w: %w: %s", ErrFileNotOnPeer, ErrNotInPeerManifest, ack.Error)
+			}
 			return 0, fmt.Errorf("%w: %s", ErrFileNotOnPeer, ack.Error)
 		}
 		return 0, fmt.Errorf("peer rejected fetch: %s", ack.Error)

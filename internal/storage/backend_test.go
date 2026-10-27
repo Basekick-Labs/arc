@@ -721,3 +721,28 @@ func BenchmarkLocalBackend_ListObjects(b *testing.B) {
 		}
 	}
 }
+
+func TestIsObjectURL(t *testing.T) {
+	for p, want := range map[string]bool{
+		"s3://bucket/db/m/**/*.parquet":   true,
+		"azure://container/db/*.parquet":  true,
+		"gs://bucket/prefix/db/*.parquet": true,
+		"gcs://bucket/x":                  true,
+		"x-future+v2.1://b/k":             true,
+		"/data/arc/db/m/*.parquet":        false,
+		"./data/db":                       false,
+		"data/db":                         false,
+		`C:\data\db`:                      false,
+		"C:/data/db":                      false,
+		"C://data/db":                     false,
+		"":                                false,
+		"://bucket/k":                     false,
+		"1s3://bucket/k":                  false,
+		"s 3://bucket/k":                  false,
+		"/data/odd://name/x.parquet":      false,
+	} {
+		if got := IsObjectURL(p); got != want {
+			t.Errorf("IsObjectURL(%q) = %v, want %v", p, got, want)
+		}
+	}
+}

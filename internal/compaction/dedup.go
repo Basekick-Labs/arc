@@ -331,26 +331,85 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 //     exactly make_timestamptz's unit; it yields a UTC-anchored TIMESTAMPTZ.
 const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMPTZ), make_timestamptz(TRY_CAST("time" AS BIGINT))) AS "time"`
 
+// parquetFilesColumns returns the column names of the unified schema of the
+// given Parquet files, keyed by asciiLower(name) — DuckDB binds column names
+// without regard to ASCII case — with the name as stored as the value. DESCRIBE over read_parquet reads footers only (no data scan), and
+// union_by_name gives exactly the schema the compaction COPY will see.
+// fileListSQL is a DuckDB array literal or single quoted path, as built by
+// Job.compactFiles.
+func parquetFilesColumns(ctx context.Context, db *sql.DB, fileListSQL string) (map[string]string, error) {
+	query := fmt.Sprintf(
+		`SELECT column_name FROM (DESCRIBE SELECT * FROM %s)`,
+		sqlutil.ReadParquet(fileListSQL, "union_by_name=true"),
+	)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to probe parquet schema: %w", err)
+	}
+	defer rows.Close()
+	cols := make(map[string]string)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("failed to probe parquet schema: %w", err)
+		}
+		cols[asciiLower(name)] = name
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to probe parquet schema: %w", err)
+	}
+	return cols, nil
+}
+
 // parquetFilesHaveTimeColumn reports whether the unified schema of the given
-// Parquet files contains a "time" column. DESCRIBE over read_parquet reads
-// footers only (no data scan), and union_by_name gives exactly the schema the
-// compaction COPY will see — so "true" here guarantees the REPLACE("time")
+// Parquet files contains a "time" column, so the REPLACE("time")
 // normalization and the default ORDER BY "time" can bind. When only SOME files
 // have the column, union_by_name backfills the others with NULLs and the query
 // still binds; the probe is false only when NO file has it (e.g. a dataset
 // loaded outside Arc's ingest path, which always writes "time").
-// fileListSQL is a DuckDB array literal or single quoted path, as built by
-// Job.compactFiles.
 func parquetFilesHaveTimeColumn(ctx context.Context, db *sql.DB, fileListSQL string) (bool, error) {
-	query := fmt.Sprintf(
-		`SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM %s) WHERE column_name = 'time'`,
-		sqlutil.ReadParquet(fileListSQL, "union_by_name=true"),
-	)
-	var n int64
-	if err := db.QueryRowContext(ctx, query).Scan(&n); err != nil {
-		return false, fmt.Errorf("failed to probe parquet schema for time column: %w", err)
+	cols, err := parquetFilesColumns(ctx, db, fileListSQL)
+	if err != nil {
+		return false, err
 	}
-	return n > 0, nil
+	return hasTimeColumn(cols), nil
+}
+
+// hasTimeColumn reports whether cols, from parquetFilesColumns, holds a column
+// named exactly "time", the name Arc's ingest always writes.
+func hasTimeColumn(cols map[string]string) bool {
+	return cols["time"] == "time"
+}
+
+// asciiLower lower-cases ASCII letters only. DuckDB matches column names
+// case-insensitively for ASCII; full Unicode folding would also match names
+// DuckDB keeps apart (the Kelvin sign folds to "k").
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+// tagsWithColumns splits tag names into those the files have a column for and
+// those they do not. A name without a column cannot bind in the dedup query,
+// and every later cycle would fail the same way (#1258): files written before
+// ingest checked its tag names carry them — a line-protocol tag key starting
+// with '_', or one with an escaped comma, which arc:tags splits in two.
+// Leaving a name out only narrows the key the exact-row dedup groups on; it
+// never makes two different rows equal.
+func tagsWithColumns(tags []string, cols map[string]string) (kept, missing []string) {
+	for _, tag := range tags {
+		if _, ok := cols[asciiLower(tag)]; ok {
+			kept = append(kept, tag)
+		} else {
+			missing = append(missing, tag)
+		}
+	}
+	return kept, missing
 }
 
 // countParquetRows counts total rows across Parquet files using metadata (no data scan).

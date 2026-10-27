@@ -164,3 +164,41 @@ func TestScanRegistersModernDailyFilename(t *testing.T) {
 		t.Fatalf("candidates = (%+v, %v), want the modern-named daily file", candidates, err)
 	}
 }
+
+// A daily file a compaction owns is not a migration candidate (#1207 d2a2b).
+func TestFindCandidatesSkipsFilesACompactionHolds(t *testing.T) {
+	m, hot, _, cleanup := setupIntegrationTest(t, true)
+	defer cleanup()
+	ctx := context.Background()
+	held := "db1/cpu/2024/03/15/cpu_20240315_daily.parquet"
+	free := "db1/cpu/2024/03/16/cpu_20240316_daily.parquet"
+	for _, p := range []string{held, free} {
+		if err := hot.Write(ctx, p, []byte("daily")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.ScanAndRegisterFiles(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeManifest{hot: hot, entries: map[string]int64{held: 5, free: 5}}
+	owned := &ownedManifest{fakeManifest: fake}
+	m.manifest = owned
+	paths := func() []string {
+		c, err := m.migrator.FindCandidates(ctx, TierHot, TierCold)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, x := range c {
+			out = append(out, x.Path)
+		}
+		return out
+	}
+	if got := paths(); len(got) != 2 {
+		t.Fatalf("candidates %v", got)
+	}
+	owned.ownedFrom = 1
+	if got := paths(); len(got) != 0 {
+		t.Fatalf("owned: candidates %v", got)
+	}
+}

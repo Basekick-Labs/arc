@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,7 +80,7 @@ func TestExecuteCQ_TagColumnsNotCoveringTheGroupingStillWrite(t *testing.T) {
 		t.Helper()
 		if _, err := h.sqliteDB.Exec(`INSERT INTO continuous_queries
 			(id, name, database, source_measurement, destination_measurement, query, interval, tag_columns, is_active, last_processed_time)
-			VALUES (?, ?, 'db1', ?, ?, ?, '1h', ?, 1, ?)`, id, name, map[int]string{1: "cpu", 2: "cpu", 3: "dup", 4: "cpu"}[id], dest, query, tags, watermark); err != nil {
+			VALUES (?, ?, 'db1', ?, ?, ?, '1h', ?, 1, ?)`, id, name, map[int]string{1: "cpu", 2: "cpu", 3: "dup", 4: "cpu", 5: "cpu"}[id], dest, query, tags, watermark); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -87,6 +88,9 @@ func TestExecuteCQ_TagColumnsNotCoveringTheGroupingStillWrite(t *testing.T) {
 	seed(2, "full_tags", grouped, "cpu_full", `["host","region"]`)
 	seed(3, "raw_copy", rawCopy, "dup_copy", `["host"]`)
 	seed(4, "tagless", grouped, "cpu_tagless", `[]`)
+	const underscored = "SELECT time_bucket(INTERVAL '1 hour', time) AS time, host AS _h, avg(usage) AS usage " +
+		"FROM db1.cpu WHERE time >= {start_time} AND time < {end_time} GROUP BY 1, 2"
+	seed(5, "underscore_tag", underscored, "cpu_underscore", `["_h"]`)
 
 	destFiles := func(meas string) int {
 		t.Helper()
@@ -137,9 +141,33 @@ func TestExecuteCQ_TagColumnsNotCoveringTheGroupingStillWrite(t *testing.T) {
 	if n := destFiles("cpu_tagless"); n == 0 {
 		t.Fatal("tagless run wrote no file")
 	}
-	var marker string
-	glob := filepath.ToSlash(filepath.Join(dataDir, "db1", "cpu_tagless")) + "/**/*.parquet"
-	if err := duck.DB().QueryRow(`SELECT value FROM parquet_kv_metadata('` + glob + `') WHERE key = 'arc:dedup_exact'`).Scan(&marker); err != nil || marker != "true" {
-		t.Errorf("tagless output marker = %q (err %v), want true", marker, err)
+	marker := func(meas string) (string, error) {
+		var v string
+		glob := filepath.ToSlash(filepath.Join(dataDir, "db1", meas)) + "/**/*.parquet"
+		err := duck.DB().QueryRow(`SELECT value FROM parquet_kv_metadata('` + glob + `') WHERE key = 'arc:dedup_exact'`).Scan(&v)
+		return v, err
+	}
+	if v, err := marker("cpu_tagless"); err != nil || v != "true" {
+		t.Errorf("tagless output marker = %q (err %v), want true", v, err)
+	}
+
+	// A definition stored before tag columns starting with '_' were refused
+	// (#1258). Arc does not store that column, so its name must not reach the
+	// file's arc:tags (compaction could never bind it), and the output must
+	// not be marked either: rows that differed only in the unstored column
+	// would look identical and collapse.
+	if _, err := h.ExecuteCQ(ctx, 5); err != nil {
+		t.Fatalf("run with an underscore tag column failed: %v", err)
+	}
+	if n := destFiles("cpu_underscore"); n == 0 {
+		t.Fatal("underscore-tag run wrote no file")
+	}
+	if v, err := marker("cpu_underscore"); err != sql.ErrNoRows {
+		t.Errorf("underscore-tag output is marked %q (err %v); rows differing only in _h would collapse", v, err)
+	}
+	var tagsMeta string
+	glob := filepath.ToSlash(filepath.Join(dataDir, "db1", "cpu_underscore")) + "/**/*.parquet"
+	if err := duck.DB().QueryRow(`SELECT value FROM parquet_kv_metadata('` + glob + `') WHERE key = 'arc:tags'`).Scan(&tagsMeta); err != sql.ErrNoRows {
+		t.Errorf("underscore-tag output carries arc:tags %q (err %v)", tagsMeta, err)
 	}
 }

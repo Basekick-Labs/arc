@@ -135,7 +135,7 @@ ARC_CLUSTER_SHARED_SECRET=$(openssl rand -hex 32)
 
 The shared secret authenticates HMAC for every cluster-internal RPC:
 peer file fetch, leader-forward apply (since v26.06.1 this includes the
-Phase A token-replication path), WAL replication handshake, and the
+Phase A token-replication path), the standby-writer origin stream, and the
 post-compaction cache-invalidate fan-out. Without it, follower-to-leader
 forward-apply fails HMAC validation and **token writes that originate on
 a non-leader silently fail** — readers can ingest cluster state but

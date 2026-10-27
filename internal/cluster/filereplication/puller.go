@@ -237,7 +237,9 @@ type Config struct {
 	// glob altogether.
 	//
 	// Called on a pull worker, so it must not block — the implementation is
-	// expected to queue, as ingest.FileRegistrar does on the flush path.
+	// expected to queue, as ingest.FileRegistrar does on the flush path. The
+	// coordinator's hook also stats the deferred unlinks of the pulled file's
+	// rewrite family (local stats, normally none).
 	// nil means no tiering on this node.
 	//
 	// Returns whether anything accepted the report. The hook itself is wired
@@ -245,6 +247,26 @@ type Config struct {
 	// later and can be absent entirely, so the return value — not the hook
 	// being non-nil — is what tier_registered counts.
 	RecordPulledFile func(path string, sizeBytes int64) bool
+	// ObserveListed, when set, sees every entry the catch-up and periodic
+	// reconciliation walks visit (the stale-local sweep records the ones
+	// present here, #1071). Runs inline in the walk: it must be cheap.
+	//
+	// Its verdict says whether this node knows the copy at the path holds the
+	// entry's content (#1182): a copy it cannot vouch for is refreshed by the
+	// walk under the walk's own source, so the startup walk's gate waits for
+	// it. nil, or ListedTrusted, keeps the size-only presence check.
+	ObserveListed func(entry *raft.FileEntry) ListedVerdict
+
+	// LocalStamp, when set, returns an opaque identity of the committed local
+	// file at path (false when there is none). A hash is recorded only when
+	// the stamps before and after it are equal.
+	LocalStamp func(path string) (string, bool)
+
+	// RecordContent, when set, records that the local file at entry.Path
+	// holds checksum sha (#1182): after a pull (stamp "" = as it is now) or
+	// a hash (stamp = the file that was read). Called on a pull worker while
+	// it holds the path's slot; must not block.
+	RecordContent func(entry *raft.FileEntry, stamp, sha string)
 
 	// RecordAbandonedFile, when set, is called for a file this node had just
 	// finished pulling when it found the path gone from the manifest and
@@ -254,6 +276,12 @@ type Config struct {
 	// generation of the path would stand until the next tier scan. Must not
 	// block. nil means no tiering on this node.
 	RecordAbandonedFile func(path string, sizeBytes int64)
+
+	// AdoptStaged, when set, moves this node's staged copy of a committed
+	// compaction output into place instead of pulling it (#1207 d2a2a): true
+	// when the output is now at its path. Tried before any fetch of an entry
+	// with a CompactionJob.
+	AdoptStaged func(ctx context.Context, entry *raft.FileEntry) (bool, error)
 
 	// Logger receives structured log output.
 	Logger zerolog.Logger
@@ -328,6 +356,10 @@ type Puller struct {
 	totalEnqueued          atomic.Int64
 	totalSkippedSelf       atomic.Int64 // origin is self — no pull needed
 	totalSkippedLocal      atomic.Int64 // file fully present locally
+	totalVerifyUnreadable  atomic.Int64 // a walk's hash of a local copy failed (#1182)
+	totalSuspectListed     atomic.Int64 // walk entries whose local copy was refreshed (#1182)
+	totalNoPeerExhausted   atomic.Int64 // pulls that found no candidate peer in any attempt
+	totalAdopted           atomic.Int64 // compaction outputs moved into place from a staged copy (#1207)
 	totalForcedRefresh     atomic.Int64 // forced requests that bypassed the size check
 	totalRefreshVerified   atomic.Int64 // verify requests whose local copy already matched
 	totalSkippedDup        atomic.Int64 // already enqueued / in-flight
@@ -404,10 +436,10 @@ type Puller struct {
 	// guaranteed a retry: the next arrival found nothing and re-enqueued.
 	// Keeping the file is better for availability but, for a rewrite that did
 	// not change the file's length, it makes the local copy read as present
-	// forever — turning a self-healing state into a permanent one. Not
-	// reachable today, because a same-size local file is skipped before any
-	// pull can mismatch, but it goes live the moment presence gains a content
-	// check, and the exhausted log line promises a retry either way.
+	// forever — turning a self-healing state into a permanent one. Reachable
+	// through every forced refresh, including the walks' refresh of a copy
+	// this node cannot vouch for (#1182), and the exhausted log line promises
+	// a retry either way.
 	//
 	// Bounded by maxQuarantineLogPaths, like quarantinedPaths: past the cap no
 	// new path is remembered, which degrades to the pre-#999 "kept forever"
@@ -558,6 +590,14 @@ func (p *Puller) removeCatchUpTagLocked(path string) {
 // either removed the tag before we got here (nothing recorded) or clears the
 // failure right after it was recorded.
 func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeeded, stillWanted bool) *pullRequest {
+	return p.finishEntryMarking(path, source, failed, succeeded, stillWanted, true)
+}
+
+// finishEntryMarking is finishEntry; markRefresh false keeps a failed forced
+// request from leaving the path pending a forced refresh: a walk's hash that
+// could not be read is retried by the next walk, with its hash, not forced
+// into a full download by whatever request comes next (#1182).
+func (p *Puller) finishEntryMarking(path string, source enqueueSource, failed, succeeded, stillWanted, markRefresh bool) *pullRequest {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
 
@@ -567,11 +607,13 @@ func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeede
 	if next := p.pending[path]; next != nil &&
 		(p.ctx == nil || p.ctx.Err() == nil) {
 		delete(p.pending, path)
-		// A failed forced refresh must not hand off to an ordinary request
-		// that could skip the still-stale same-size local copy.
-		if failed {
-			if active := p.inflight[path]; active != nil && active.force {
-				next.force = true
+		// A forced refresh that did not land (failed, or superseded before
+		// it pulled) must not hand off to an ordinary request that could
+		// skip the still-stale same-size local copy (#1182).
+		if !succeeded {
+			if active := p.inflight[path]; active != nil {
+				next.force = next.force || active.force
+				next.verifyLocal = next.verifyLocal || active.verifyLocal
 			}
 		}
 		// The superseding request inherits the existing catch-up ownership.
@@ -588,7 +630,7 @@ func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeede
 	if failed && stillWanted && source != enqueueSourceReconciliation && p.isCatchUpPathLocked(path) {
 		p.recordCatchUpFailureLocked(path)
 	}
-	if failed && stillWanted {
+	if failed && stillWanted && markRefresh {
 		if active := p.inflight[path]; active != nil && active.force {
 			p.markRefreshPendingLocked(path)
 		}
@@ -1074,8 +1116,8 @@ const (
 	// the version the manifest describes.
 	RefreshSkippedSelf
 	// RefreshDropped: the queue was full. The path is remembered in memory
-	// and the next arrival of the path is forced; a restart forgets it
-	// (#1182).
+	// and the next arrival of the path is forced; after a restart the walk
+	// finds the copy stale by what this node recorded it holds (#1182).
 	RefreshDropped
 	// RefreshStopped: the puller is stopped, so nothing will run the
 	// refresh.
@@ -1124,7 +1166,8 @@ func (p *Puller) enqueueRefresh(entry *raft.FileEntry, verifyLocal bool) Refresh
 	// check and the send would leave the request in a queue no worker reads.
 	// A refresh queued earlier and still waiting when Stop runs is dropped
 	// with the queue and reported as queued; the in-memory retry marker dies
-	// with the process either way (#1182).
+	// with the process either way, and the next start's walk finds the copy
+	// stale by what this node recorded it holds (#1182).
 	if p.Stopped() {
 		return RefreshStopped
 	}
@@ -1246,9 +1289,16 @@ func (p *Puller) enqueueRequest(entry *raft.FileEntry, source enqueueSource, for
 		}
 
 		if current != nil && (requestReplacesCurrent(request.entry, current.entry) ||
-			(request.force && !current.force)) {
+			(request.force && !current.force) || (request.verifyLocal && !current.verifyLocal)) {
 			// This is a new manifest version, not a duplicate. Keep just
 			// the latest pending version to bound memory under rapid updates.
+			// The kept one carries the replaced one's force and verify: a
+			// tier update must not turn a forced refresh of a stale copy into
+			// a size-only check (#1182).
+			if waiting := p.pending[entry.Path]; waiting != nil {
+				request.force = request.force || waiting.force
+				request.verifyLocal = request.verifyLocal || waiting.verifyLocal
+			}
 			p.pending[entry.Path] = request
 			p.totalEnqueued.Add(1)
 			p.inflightMu.Unlock()
@@ -1324,6 +1374,9 @@ func (p *Puller) Stats() map[string]int64 {
 		"forced_refresh":                     p.totalForcedRefresh.Load(),
 		"refresh_verified":                   p.totalRefreshVerified.Load(),
 		"refresh_pending":                    p.refreshPendingCount.Load(),
+		"listed_unvouched":                   p.totalSuspectListed.Load(),
+		"verify_unreadable":                  p.totalVerifyUnreadable.Load(),
+		"no_peer_exhausted":                  p.totalNoPeerExhausted.Load(),
 		"skipped_dup":                        p.totalSkippedDup.Load(),
 		"skipped_superseded":                 p.totalSkippedSuperseded.Load(),
 		"skipped_gone":                       p.totalSkippedGone.Load(),
@@ -1480,7 +1533,10 @@ func (p *Puller) CatchUpStatus() map[string]int64 {
 		// Same-size rewrites (#798): forced refreshes that downloaded, ones
 		// whose local copy was already the listed version, and failed or
 		// dropped ones waiting for the path's next arrival. refresh_pending
-		// lives in memory and a restart clears it (#1182).
+		// lives in memory; a restart clears it and the walk re-flags the copy
+		// (#1182). listed_unvouched: walk entries whose copy this node could
+		// not vouch for and refreshed; verify_unreadable: hashes of those
+		// that could not be read (retried by the next walk).
 		"forced_refresh":   p.totalForcedRefresh.Load(),
 		"refresh_verified": p.totalRefreshVerified.Load(),
 		"refresh_pending":  p.refreshPendingCount.Load(),
@@ -1551,6 +1607,8 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 	var failed, succeeded bool
 	// verified keeps the local hash to one per request across retry attempts.
 	var verified bool
+	// unreadable: a walk's hash of the local copy could not be read.
+	var unreadable bool
 
 	// Remove from the inflight set when we're done, whether success or failure.
 	// This keeps the set bounded even if a worker panics — Go's defer runs on
@@ -1566,7 +1624,7 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			current, wanted := p.manifestEntry(entry.Path)
 			stillWanted = wanted && !manifestSupersedes(&current, entry)
 		}
-		next = p.finishEntry(entry.Path, request.source, failed, succeeded, stillWanted)
+		next = p.finishEntryMarking(entry.Path, request.source, failed, succeeded, stillWanted, !unreadable)
 	}()
 
 	for attempt := 1; attempt <= p.cfg.RetryMaxAttempts; attempt++ {
@@ -1598,7 +1656,8 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			// size-only presence cannot falsely settle the readiness gate. A
 			// late reactive duplicate can use the local fast path; its paired
 			// content-change callback is delivered synchronously by the FSM.
-			p.enqueue(&current, request.source, request.source == enqueueSourceCatchUp)
+			p.enqueueRequest(&current, request.source,
+				request.force || request.source == enqueueSourceCatchUp, request.verifyLocal)
 			return
 		}
 
@@ -1624,11 +1683,23 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			} else if request.verifyLocal && !verified {
 				// Once per request, not per attempt: a mismatch stays one.
 				verified = true
-				if p.localCopyMatches(log, entry) {
+				switch p.verifyLocalCopy(log, entry) {
+				case localCopyMatched:
 					p.totalSkippedLocal.Add(1)
 					p.totalRefreshVerified.Add(1)
 					succeeded = true
 					return
+				case localCopyUnreadable:
+					// A walk asked because it does not know what the copy
+					// holds (#1182): a copy it could not hash (a slow disk
+					// past the deadline) is not downloaded again over the
+					// network, it is checked on the next walk. It still
+					// counts as unsettled, so the startup gate waits.
+					if request.source != enqueueSourceReactive {
+						p.totalVerifyUnreadable.Add(1)
+						failed, unreadable = true, true
+						return
+					}
 				}
 			}
 		}
@@ -1659,6 +1730,13 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 					Str("origin_node_id", entry.OriginNodeID).
 					Msg("Manifest entry names a storage key no backend can address; not pulling it from any peer. It cannot be replicated here and, if the query gate is enabled, it holds the gate closed until the entry is removed from the cluster manifest, and reopens as soon as it is. Nothing removes an unaddressable key automatically: retention cannot read it and the reconciliation sweep only reports it; the operator delete endpoint is tracked in #794")
 			}
+			return
+		}
+
+		// A committed compaction output this node holds staged (#1207
+		// d2a2a): moved into place, no fetch.
+		if p.adoptStaged(log, entry) {
+			succeeded = true
 			return
 		}
 
@@ -1709,7 +1787,7 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 					p.totalSkippedSuperseded.Add(1)
 					// The bytes just fetched match this request's checksum. Keep
 					// that valid local copy until the queued successor replaces it.
-					p.enqueue(&current, request.source, true)
+					p.enqueueRequest(&current, request.source, true, request.verifyLocal)
 					return
 				}
 				p.totalPulled.Add(1)
@@ -1728,6 +1806,9 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 				// against the manifest checksum. A rewrite landing between
 				// here and the write is corrected by the next pull.
 				p.recordPulledFile(entry.Path, entry.SizeBytes)
+				// The bytes were checked against entry's checksum on the way
+				// in: what this path now holds is known (#1182).
+				p.recordContent(entry, "", entry.SHA256)
 				pulledFromPeer = true
 				succeeded = true // Signal to processEntry's defer to clear any prior catch-up failure for this path.
 				if request.force {
@@ -1850,6 +1931,17 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 		}
 		p.sleepBackoff(attempt)
 	}
+	// Only the last attempt finding no candidate peer reaches here. That is
+	// a pull that did not happen, not one that is done: without this the
+	// startup gate went green over a file it never fetched, or over a local
+	// copy it could not vouch for (#1182).
+	if p.ctx.Err() == nil {
+		p.totalFailed.Add(1)
+		p.totalNoPeerExhausted.Add(1)
+		failed = true
+		log.Debug().Str("path", entry.Path).Str("origin_node_id", entry.OriginNodeID).
+			Msg("File pull giving up: no candidate peer in any attempt (will be retried by next FSM callback or catch-up scan)")
+	}
 	return
 }
 
@@ -1955,25 +2047,90 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 	return p.cfg.Backend.WriteReader(ctx, entry.Path, r, entry.SizeBytes)
 }
 
-// localCopyMatches hashes the committed local copy of entry.Path and reports
+// localCopyVerdict is what hashing the committed local copy found.
+type localCopyVerdict uint8
+
+const (
+	localCopyMismatched localCopyVerdict = iota
+	localCopyMatched
+	localCopyUnreadable
+)
+
+// localHashStall is how long a hash of a local copy may go without reading a
+// byte before it is given up. A stall, not a deadline: a large replica on a
+// busy disk is read slowly but completes, and a fixed bound made it read as
+// unreadable on every walk, forever (#1182). A variable for tests.
+var localHashStall = 30 * time.Second
+
+// verifyLocalCopy hashes the committed local copy of entry.Path and reports
 // whether it is the manifest's version. ReadTo, never ReadToAt: ReadToAt falls
 // back to the staged ".part" file (#1199), which is not the copy a query
 // reads. LocalBackend.ReadTo does not watch the context, so the hasher does:
-// a read past the deadline or a Stop fails, and the caller downloads. The read
-// counts in the storage read-bytes metric like any other local read.
-func (p *Puller) localCopyMatches(log zerolog.Logger, entry *raft.FileEntry) bool {
+// a read past the deadline or a Stop fails. The read counts in the storage
+// read-bytes metric like any other local read.
+//
+// The checksum it computed is recorded against the copy, match or not, when
+// the copy was the same file before and after the read (#1182): a later walk
+// then knows a mismatch without hashing again, and a manifest that later
+// names those bytes matches without a download.
+func (p *Puller) verifyLocalCopy(log zerolog.Logger, entry *raft.FileEntry) localCopyVerdict {
 	if entry.SHA256 == "" {
-		return false
+		return localCopyMismatched
 	}
-	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
+	before, stamped := p.localStamp(entry.Path)
+	ctx, cancel := context.WithCancel(p.ctx)
 	defer cancel()
 	h := sha256.New()
-	if err := p.cfg.Backend.ReadTo(ctx, entry.Path, &ctxWriter{ctx: ctx, w: h}); err != nil {
+	w := &progressWriter{ctxWriter: ctxWriter{ctx: ctx, w: h}}
+	w.last.Store(time.Now().UnixNano())
+	stall := localHashStall
+	watched := make(chan struct{})
+	// Joined before returning: nothing of this hash outlives the call.
+	defer func() { cancel(); <-watched }()
+	go func() {
+		defer close(watched)
+		t := time.NewTicker(min(time.Second, stall/4))
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				if now.UnixNano()-w.last.Load() > int64(stall) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	if err := p.cfg.Backend.ReadTo(ctx, entry.Path, w); err != nil {
 		log.Debug().Err(err).Str("path", entry.Path).
-			Msg("Could not hash the local copy; downloading the manifest version")
-		return false
+			Msg("Could not hash the local copy")
+		return localCopyUnreadable
 	}
-	return hex.EncodeToString(h.Sum(nil)) == entry.SHA256
+	sum := hex.EncodeToString(h.Sum(nil))
+	if after, ok := p.localStamp(entry.Path); stamped && ok && after == before {
+		p.recordContent(entry, before, sum)
+	}
+	if sum == entry.SHA256 {
+		return localCopyMatched
+	}
+	return localCopyMismatched
+}
+
+// localStamp and recordContent are the nil-safe wrappers around the
+// LocalStamp and RecordContent hooks.
+func (p *Puller) localStamp(path string) (string, bool) {
+	if p.cfg.LocalStamp == nil {
+		return "", false
+	}
+	return p.cfg.LocalStamp(path)
+}
+
+func (p *Puller) recordContent(entry *raft.FileEntry, stamp, sha string) {
+	if p.cfg.RecordContent != nil {
+		p.cfg.RecordContent(entry, stamp, sha)
+	}
 }
 
 // ctxWriter fails a write once ctx is done, so a copy into it stops early.
@@ -1987,6 +2144,21 @@ func (c *ctxWriter) Write(b []byte) (int, error) {
 		return 0, err
 	}
 	return c.w.Write(b)
+}
+
+// progressWriter is a ctxWriter that notes when it last wrote, for a stall
+// watchdog.
+type progressWriter struct {
+	ctxWriter
+	last atomic.Int64
+}
+
+func (w *progressWriter) Write(b []byte) (int, error) {
+	n, err := w.ctxWriter.Write(b)
+	if n > 0 {
+		w.last.Store(time.Now().UnixNano())
+	}
+	return n, err
 }
 
 // tryResumeFromPartial checks whether a partial file exists on disk for entry
@@ -2146,9 +2318,68 @@ var ErrChecksumMismatch = errors.New("filereplication: checksum mismatch")
 // original writer is gone but other peers still hold the file.
 var ErrFileNotOnPeer = errors.New("filereplication: file not on peer")
 
+// ErrNotInPeerManifest wraps ErrFileNotOnPeer when the peer refused the
+// fetch because its manifest has no entry for the file (it may trail the
+// requester's), as opposed to its storage not holding a file it lists.
+var ErrNotInPeerManifest = errors.New("filereplication: file not in the peer's manifest")
+
 // ErrBadOffset is returned by Fetcher implementations when the server rejects
 // the requested byte offset (negative, >= file size, or backend doesn't
 // support seeks). The puller should delete any partial file and retry from
 // zero — not fall through to another peer, since the file exists there and
 // the offset is simply invalid or stale.
 var ErrBadOffset = errors.New("filereplication: bad byte offset")
+
+// adoptStaged moves a staged copy of entry into place (#1207 d2a2a) and
+// reports whether entry is now at its path and still wanted. An output that
+// left the manifest while it moved is removed again.
+func (p *Puller) adoptStaged(log zerolog.Logger, entry *raft.FileEntry) bool {
+	if entry.CompactionJob == "" || p.cfg.AdoptStaged == nil {
+		return false
+	}
+	adopted, err := p.cfg.AdoptStaged(p.ctx, entry)
+	if err != nil {
+		log.Debug().Err(err).Str("path", entry.Path).Msg("Staged compaction output not adoptable; pulling it")
+	}
+	if !adopted {
+		return false
+	}
+	if _, wanted := p.manifestEntry(entry.Path); !wanted {
+		p.totalSkippedGone.Add(1)
+		p.deleteFile(log, entry.Path)
+		return false
+	}
+	p.totalAdopted.Add(1)
+	if p.cfg.RecordPulledFile != nil {
+		p.cfg.RecordPulledFile(entry.Path, entry.SizeBytes)
+	}
+	return true
+}
+
+// AdoptNow moves a committed compaction output into place from this node's
+// staged copy right away, holding the path's in-flight slot so a pull of the
+// same path cannot run beside it (#1207 d2a2a). When the slot is taken, the
+// request holding it adopts before it fetches. Reports whether the output is
+// at its path.
+func (p *Puller) AdoptNow(entry *raft.FileEntry) bool {
+	if entry == nil || !p.inflightAdd(entry.Path) {
+		return false
+	}
+	adopted := p.adoptStaged(p.logger.With().Str("component", "file-puller").Logger(), entry)
+	p.inflightRemove(entry.Path)
+	if !adopted {
+		// Holding the slot made the registration's own pull of this path a
+		// duplicate and dropped it: queue it now.
+		p.enqueue(entry, enqueueSourceReactive, false)
+	}
+	return adopted
+}
+
+// PullOwn pulls entry even when this node is its origin (#1207 d2a2a): a
+// committed compaction output whose staged copy this node lost.
+func (p *Puller) PullOwn(entry *raft.FileEntry) {
+	if entry == nil {
+		return
+	}
+	p.enqueueRequest(entry, enqueueSourceCatchUp, true, false)
+}

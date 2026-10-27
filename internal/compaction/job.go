@@ -150,6 +150,13 @@ type Job struct {
 	// marking commits (#619). See SubprocessJobConfig.ParentFinalizesManifest.
 	ParentFinalizesManifest bool
 
+	// staged / inputs: see JobConfig.Staged (#1207 d2a2a).
+	staged bool
+	inputs map[string]StagedInput
+
+	// outputName, when set, is the output file name the parent chose.
+	outputName string
+
 	// OutputStorageKey is the storage-relative key of the compacted output,
 	// set once the output name is fixed (before upload). Empty for jobs that
 	// produce no output (all sources vanished, or no time column).
@@ -201,6 +208,15 @@ type JobConfig struct {
 
 	// ParentFinalizesManifest — see Job.ParentFinalizesManifest (#619).
 	ParentFinalizesManifest bool
+
+	// Staged (#1207 d2a2a): write the output to its staged key, keep the
+	// inputs, and hand the job to the watcher in state "staged". Inputs
+	// describes every file of Files as the cluster manifest lists it.
+	Staged bool
+	Inputs map[string]StagedInput
+	// OutputName is the output file name the parent chose (OpenJobs);
+	// empty names it here, as before.
+	OutputName string
 
 	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
 	// so the parent (which spawns the subprocess) and the subprocess agree
@@ -254,10 +270,13 @@ func NewJob(cfg *JobConfig) *Job {
 		Status:                  JobStatusPending,
 		CompletionDir:           cfg.CompletionDir,
 		ParentFinalizesManifest: cfg.ParentFinalizesManifest,
+		staged:                  cfg.Staged,
+		inputs:                  cfg.Inputs,
 		PartitionTime:           cfg.PartitionTime,
 		logger:                  cfg.Logger.With().Str("job_id", jobID).Logger(),
 		db:                      cfg.DB,
 		manifestManager:         cfg.ManifestManager,
+		outputName:              cfg.OutputName,
 	}
 }
 
@@ -290,7 +309,8 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Phase 4: write an initial completion manifest in writing_output state.
 	// This marks the job as in-progress so CleanupOrphanedCompletionManifests
-	// can sweep it if the subprocess crashes before reaching output_written.
+	// can sweep it if the subprocess crashes before reaching output_written;
+	// the parent also drops it once this process exits (#1343).
 	if j.clusterMode() {
 		m := &CompletionManifest{
 			JobID:         j.JobID,
@@ -398,6 +418,10 @@ func (j *Job) Run(ctx context.Context) error {
 	// to the parent (compactFiles returns the local temp path, which no
 	// parent-side consumer can match against storage listings).
 	j.OutputStorageKey = compactedKey
+
+	if j.staged {
+		return j.runStaged(ctx, compactedFile, compactedKey, outputSHA)
+	}
 
 	// Write manifest BEFORE upload to enable crash recovery
 	// If we crash after upload but before deletion, the manifest allows recovery
@@ -727,14 +751,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// on the clock alone. The uploaded storage key derives from this basename
 	// (see Job.Run), so a collision here would silently overwrite a sibling
 	// batch's compacted output.
-	now := time.Now().UTC()
-	timestamp := now.Format("20060102_150405")
-	suffix := "compacted"
-	if j.Tier != "hourly" {
-		suffix = j.Tier
-	}
-	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%d_b%d_%s.parquet",
-		j.Measurement, timestamp, now.UnixNano(), j.BatchNumber, suffix))
+	outputFile := filepath.Join(tempDir, j.outputFileName())
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
@@ -801,10 +818,12 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// instead of surfacing a Binder Error every cycle. A probe FAILURE is not a
 	// skip — proceed and let the compaction query produce the authoritative
 	// error, so a transient read problem doesn't silently strand a partition.
-	hasTime, err := parquetFilesHaveTimeColumn(ctx, db, fileListSQL)
+	// The same probe gives decideDedup the columns its tag names must match.
+	columns, err := parquetFilesColumns(ctx, db, fileListSQL)
 	if err != nil {
 		j.logger.Warn().Err(err).Msg("Failed to probe parquet schema for time column; attempting compaction anyway")
-	} else if !hasTime {
+		columns = nil
+	} else if !hasTimeColumn(columns) {
 		return "", errNoTimeColumn
 	}
 
@@ -814,7 +833,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 
 	// Auto-dedup: decide from the files' metadata how this batch removes
 	// duplicate rows (see decideDedup).
-	tagColumns, mode := j.decideDedup(ctx, db, validLocalPaths)
+	tagColumns, mode := j.decideDedup(ctx, db, validLocalPaths, columns)
 
 	// Build and execute compaction statement(s) (with dedup if tag metadata found).
 	// The dedup path returns three statements (two CREATE OR REPLACE TEMP TABLE,
@@ -932,9 +951,12 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 // time for marked output — so a correction, a partial write of other fields,
 // or a re-run continuous-query window with late data lost every row but one.
 //
+// Tag names the files have no column for are left out of the key (#1258);
+// columns is nil when the schema probe failed, and then every name is kept.
+//
 // A failure reading metadata skips dedup for the batch: keeping a duplicate
 // is recoverable, guessing a key is not.
-func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string) ([]string, dedupMode) {
+func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string, columns map[string]string) ([]string, dedupMode) {
 	if len(localPaths) == 0 {
 		return nil, dedupNone
 	}
@@ -942,6 +964,16 @@ func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string) 
 	if err != nil {
 		j.logger.Warn().Err(err).Msg("Failed to read tag metadata from parquet, skipping dedup")
 		return nil, dedupNone
+	}
+	if columns != nil {
+		var missing []string
+		tags, missing = tagsWithColumns(tags, columns)
+		if len(missing) > 0 {
+			j.logger.Warn().
+				Strs("missing_tag_columns", missing).
+				Strs("tag_columns", tags).
+				Msg("Tag metadata names columns the files do not have; deduplicating on the remaining tags")
+		}
 	}
 	if len(tags) > 0 {
 		j.logger.Info().
@@ -1239,13 +1271,9 @@ func (j *Job) complete() error {
 		compressionRatio = (1 - float64(j.BytesAfter)/float64(j.BytesBefore)) * 100
 	}
 
-	// Record metrics
-	m := metrics.Get()
-	m.IncCompactionJobs()
-	m.IncCompactionSuccess()
-	m.IncCompactionFilesCompacted(int64(j.FilesCompacted))
-	m.IncCompactionBytesRead(j.BytesBefore)
-	m.IncCompactionBytesWritten(j.BytesAfter)
+	// No metrics here: a Job runs only in the compaction subprocess, whose
+	// registry nothing scrapes. The parent counts the outcome from the
+	// result (Manager.compactPartition, #1343).
 
 	j.logger.Info().
 		Int("files_compacted", j.FilesCompacted).
@@ -1272,10 +1300,7 @@ func (j *Job) fail(err error) error {
 		j.DurationSeconds = now.Sub(*j.StartedAt).Seconds()
 	}
 
-	// Record metrics
-	m := metrics.Get()
-	m.IncCompactionJobs()
-	m.IncCompactionFailed()
+	// Counted by the parent from the result; see complete (#1343).
 
 	j.logger.Error().Err(err).Msg("Compaction job failed")
 
@@ -1402,4 +1427,26 @@ func canonicalManifestDatabase(database string) string {
 		return rest
 	}
 	return database
+}
+
+// CompactionOutputName is a compaction output's file name:
+// {measurement}_{YYYYMMDD}_{HHMMSS}_{unixnano}_b{batch}_{suffix}.parquet, the
+// suffix "compacted" for the hourly tier and the tier name otherwise.
+func CompactionOutputName(measurement, tier string, batch int, at time.Time) string {
+	now := storage.NameTime(at)
+	suffix := "compacted"
+	if tier != "hourly" {
+		suffix = tier
+	}
+	return fmt.Sprintf("%s_%s_%d_b%d_%s.parquet",
+		measurement, now.Format("20060102_150405"), now.UnixNano(), batch, suffix)
+}
+
+// outputFileName is the output's file name: the parent's choice when it made
+// one (OpenJobs registered it), else named here.
+func (j *Job) outputFileName() string {
+	if j.outputName != "" {
+		return j.outputName
+	}
+	return CompactionOutputName(j.Measurement, j.Tier, j.BatchNumber, time.Now())
 }

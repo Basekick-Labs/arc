@@ -34,19 +34,31 @@ import (
 // default is hostname-PID, which changes at every restart on bare metal)
 // never advertises them.
 func (c *Coordinator) localCapabilities() []string {
+	// Compaction commit (#1207 d2) needs nothing of the node: every build
+	// that applies its rules advertises it.
+	// Cluster policies (#1324) likewise.
+	caps := []string{raft.CapabilityCompactionCommit, CapabilityForwardIdentity, raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention, raft.CapabilityClusterCQ}
+	if c.keepsLocalReplicas() {
+		caps = append(caps, CapabilityLocalReplica)
+	}
+	if c.streamClaimsCapable() {
+		caps = append(caps, raft.CapabilityStreamClaims)
+	}
+	return caps
+}
+
+// streamClaimsCapable reports whether this node advertises stream claims.
+func (c *Coordinator) streamClaimsCapable() bool {
 	if !c.cfg.StreamTakeover {
-		return nil
+		return false
 	}
 	if c.cfg.NodeID == "" {
 		c.nodeIDWarn.Do(func() {
 			c.logger.Error().Msg("cluster.stream_takeover needs an explicit cluster.node_id: stream takeover stays off on this node, and the cluster cannot enable it while this node is a member")
 		})
-		return nil
+		return false
 	}
-	if c.localNode.Role.GetCapabilities().CanIngest && !c.walCoverageActive.Load() {
-		return nil
-	}
-	return []string{raft.CapabilityStreamClaims}
+	return !c.localNode.Role.GetCapabilities().CanIngest || c.walCoverageActive.Load()
 }
 
 // SetWALCoverageActive records whether WAL coverage actually took effect on
@@ -156,10 +168,15 @@ func (c *Coordinator) maybeEnableStreamClaims() {
 // capability, and any Raft server that is not a capable FSM node (a member
 // whose AddNode never applied could run anything).
 func streamClaimsCandidates(fsmNodes []*raft.NodeInfo, config func() ([]string, error)) ([]string, []string) {
+	return capabilityCandidates(fsmNodes, config, raft.CapabilityStreamClaims)
+}
+
+// capabilityCandidates is streamClaimsCandidates for any capability.
+func capabilityCandidates(fsmNodes []*raft.NodeInfo, config func() ([]string, error), capability string) ([]string, []string) {
 	capable := map[string]bool{}
 	var nodes, blockers []string
 	for _, n := range fsmNodes {
-		if hasCapability(n.Capabilities, raft.CapabilityStreamClaims) {
+		if hasCapability(n.Capabilities, capability) {
 			capable[n.ID] = true
 			nodes = append(nodes, n.ID)
 		} else {
@@ -364,6 +381,22 @@ type StreamTakeoverView struct {
 	Instances []StreamTakeoverInstance `json:"instances"`
 	Claims    []StreamTakeoverClaim    `json:"claims"`
 	Departed  []StreamTakeoverDeparted `json:"departed_writers"`
+	// DeleteRecords are the DELETEs kept until every writer process they
+	// name has settled the batches before them (#1207 d1).
+	DeleteRecords []StreamTakeoverDeleteRecord `json:"delete_records"`
+}
+
+// StreamTakeoverDeleteRecord is one DELETE kept for stream takeover.
+// Waiting lists the writer processes (hex) that may still publish batches
+// acknowledged before it; Unacknowledged those that have not reported them.
+type StreamTakeoverDeleteRecord struct {
+	ID             uint64    `json:"id"`
+	Origin         string    `json:"origin"`
+	Database       string    `json:"database"`
+	Measurement    string    `json:"measurement,omitempty"`
+	Where          string    `json:"where,omitempty"`
+	At             time.Time `json:"at"`
+	Unacknowledged []string  `json:"unacknowledged,omitempty"`
 }
 
 // StreamTakeoverInstance is one writer process the cluster knows.
@@ -431,6 +464,16 @@ func (c *Coordinator) StreamTakeover() StreamTakeoverView {
 		v.Departed = append(v.Departed, StreamTakeoverDeparted{NodeID: id, Since: at, ExpiresAt: at.Add(ttl)})
 	}
 	sort.Slice(v.Departed, func(i, j int) bool { return v.Departed[i].NodeID < v.Departed[j].NodeID })
+	v.DeleteRecords = []StreamTakeoverDeleteRecord{}
+	for _, r := range fsm.DeleteRecords() {
+		dr := StreamTakeoverDeleteRecord{ID: r.ID, Origin: r.Origin, Database: r.Database, Measurement: r.Measurement, Where: r.Where, At: r.At}
+		for _, sc := range r.Before {
+			if !sc.Acked {
+				dr.Unacknowledged = append(dr.Unacknowledged, hex(sc.Instance))
+			}
+		}
+		v.DeleteRecords = append(v.DeleteRecords, dr)
+	}
 	return v
 }
 

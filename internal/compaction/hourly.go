@@ -36,7 +36,9 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 		cfg.MinAgeHours = 1
 	}
 	if cfg.MinFiles == 0 {
-		// 10 files: minimum input-file threshold for an hourly compaction pass.
+		// 10 files: fixed minimum input-file threshold per hourly partition; it
+		// is not derived from the ingest buffer's age threshold, which only
+		// triggers flush attempts and does not guarantee a file cadence.
 		// Ingest flushes when it reaches 50,000 rows or 5 seconds have elapsed,
 		// whichever comes first. Actual files per hour depend on ingest rate and
 		// schema changes.

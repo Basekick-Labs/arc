@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,11 @@ import (
 type tierCacheEntry struct {
 	tiers     map[Tier]bool
 	expiresAt time.Time
+}
+
+type tierCacheScope struct {
+	database    string
+	measurement string
 }
 
 // pruneExpiredTierCache removes expired entries. The caller must hold tierCacheMu.
@@ -146,6 +152,12 @@ func (s *MetadataStore) invalidateTierCache(database, measurement string) {
 	s.tierCacheMu.Unlock()
 }
 
+func (s *MetadataStore) invalidateTierCacheScopes(scopes map[tierCacheScope]struct{}) {
+	for scope := range scopes {
+		s.invalidateTierCache(scope.database, scope.measurement)
+	}
+}
+
 // The three write helpers below do NOT invalidate the tier cache; their
 // caller is the replication-registration drainer, which applies a whole batch
 // and then invalidates once per distinct database/measurement.
@@ -238,12 +250,12 @@ func (s *MetadataStore) recordHotFileIfNotCold(ctx context.Context, file *FileMe
 // migrated_at is deliberately left NULL on insert and untouched on update.
 // Stamping it would put every path this node unlinks into orphan
 // reconciliation's recently-migrated window, which HEADs each row — see
-// RecordColdFile, which stamps from the cold object's own timestamp for that
+// recordColdFile, which stamps from the cold object's own timestamp for that
 // reason.
 //
 // It stays NULL for good, and that is the intent rather than an oversight:
 // syncColdTierMetadata skips any path it already holds a cold row for, so it
-// never reaches RecordColdFile for one of these, and RecordColdFile keeps an
+// never writes a row for one of these, and its upsert keeps an
 // existing stamp when the tier is unchanged in any case. Nothing needs it.
 // Both readers of migrated_at — GetRecentlyMigratedFiles, for orphan
 // reconciliation, and the manifest sweep — look for work on a file whose hot
@@ -295,21 +307,43 @@ func (s *MetadataStore) retireHotRow(ctx context.Context, path string) (bool, st
 	// leaves a window in which a row inserted between them is deleted while
 	// the cache key reads empty, and it would have to discard the SELECT's
 	// error to stay readable.
-	var database, measurement string
-	err := s.db.QueryRowContext(ctx,
+	database, measurement, found, err := s.deleteReturningScope(ctx,
 		`DELETE FROM tier_files WHERE path = ? AND tier = ?
 		 RETURNING database, measurement`,
-		path, string(TierHot),
-	).Scan(&database, &measurement)
-	if errors.Is(err, sql.ErrNoRows) {
-		// No hot row for this path: already cold, quarantined away, or never
-		// registered. Not an error.
-		return false, "", "", nil
-	}
+		path, string(TierHot))
 	if err != nil {
 		return false, "", "", fmt.Errorf("failed to retire hot row: %w", err)
 	}
-	return true, database, measurement, nil
+	// No row: already cold, quarantined away, or never registered. Not an
+	// error.
+	return found, database, measurement, nil
+}
+
+// deleteReturningScope runs a DELETE ... RETURNING database, measurement on
+// one path and reads every row it returns.
+//
+// Never QueryRow for a write: it reads one row and resets the statement, so
+// the autocommit happens on the reset, and SQLite runs its WAL autocheckpoint
+// only when a step returns DONE. A run of such deletes never checkpointed: the
+// WAL grew by every page each one touched, tens of KB a row, to 99.6 GB on a
+// node whose startup tier scan retired 6.2M stale rows. Reading to the end steps to
+// DONE, and the autocheckpoint runs as for any other write.
+func (s *MetadataStore) deleteReturningScope(ctx context.Context, query string, args ...any) (database, measurement string, found bool, err error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return "", "", false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := rows.Scan(&database, &measurement); err != nil {
+			return "", "", false, err
+		}
+		found = true
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", false, err
+	}
+	return database, measurement, found, nil
 }
 
 // RecordFile records a new file in the metadata store
@@ -352,8 +386,24 @@ func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) erro
 // layout or the two formats sort against each other ('T' vs ' ').
 const sqliteTimestampLayout = "2006-01-02 15:04:05"
 
-// RecordColdFile records a file that is present in cold storage: found by the
-// cold-tier metadata sync, or written there by a restore (#1086 stage C).
+// RecordColdFile is recordColdFile plus the tier-cache invalidation for the
+// row's database/measurement. No production path calls it since #1188 — the
+// sync and the restore both write in batches — and it stays as the
+// single-file form tests seed cold rows with.
+func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) (bool, error) {
+	wrote, err := s.recordColdFile(ctx, file, migratedAt)
+	if wrote {
+		s.invalidateTierCache(file.Database, file.Measurement)
+	}
+	return wrote, err
+}
+
+// recordColdFile records a file that is present in cold storage (#1086 stage
+// C), without invalidating the tier cache: the caller does that, once per
+// database/measurement. The cold-tier metadata sync writes the same row
+// through recordColdFilesBatch, in batches, and falls back to this per row
+// when a batch fails (#1188); a restore writes it through
+// RecordColdFilesBatch.
 //
 // Unlike RecordFile it stamps migrated_at from the value the caller passes
 // rather than now, because the sync discovers moves after the fact, on every
@@ -380,7 +430,7 @@ const sqliteTimestampLayout = "2006-01-02 15:04:05"
 // guard matters because stage C added a SECOND caller: a restore writing a row
 // for a file it just put in the cold store, where silently acting on a
 // quarantined path would be a new way to lose the record of an unusable key.
-func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) (bool, error) {
+func (s *MetadataStore) recordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) (bool, error) {
 	if migratedAt.IsZero() {
 		migratedAt = time.Now()
 	}
@@ -417,14 +467,13 @@ func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, 
 		// Quarantined, so nothing changed and nothing cached is stale.
 		return false, nil
 	}
-	s.invalidateTierCache(file.Database, file.Measurement)
 	return true, nil
 }
 
-// RecordColdFilesBatch records a batch of files a RESTORE has just written to
-// the cold tier (#1141), each with the semantics RecordColdFile gives one:
-// migrated_at stamped from the caller's value, kept unchanged on a same-tier
-// conflict, and a QUARANTINED row left exactly as it is.
+// RecordColdFilesBatch records files present in cold storage with the semantics
+// recordColdFile gives one: migrated_at is kept unchanged on a same-tier
+// conflict, and a QUARANTINED row is left exactly as it is. When a file carries
+// MigratedAt, that timestamp is used; otherwise migratedAt is the fallback.
 //
 // Reports the paths whose row was not written, which with this statement means
 // quarantined and nothing else. The caller counts them separately from the
@@ -433,24 +482,27 @@ func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, 
 // Arc does not know yet.
 //
 // Replaces the per-file RecordRestoredColdFile the restore used to call in a
-// loop. That was one implicit transaction — one fsync — per file on a handle
+// loop (#1141): one implicit transaction — one fsync — per file on a handle
 // limited to a single connection and shared with auth, audit, MQTT and the
-// ingest path's own tier registration, so a restore of a few hundred thousand
-// cold files serialised every other SQLite user in the process behind a few
-// hundred thousand fsyncs. The cold-tier metadata sync keeps using the
-// single-file RecordColdFile: it writes rows it discovers one at a time as it
-// walks, and is not a burst.
+// ingest path's own tier registration. The cold-tier metadata sync writes
+// through recordColdFilesBatch as well (#1188): after a restored or lost
+// arc.db every object in the bucket is unseen, and one write per object was
+// one process-wide tier-cache invalidation per object while queries were
+// trying to fill it.
 func (s *MetadataStore) RecordColdFilesBatch(ctx context.Context, files []FileMetadata, migratedAt time.Time) ([]string, error) {
+	notWritten, touched, err := s.recordColdFilesBatch(ctx, files, migratedAt)
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateTierCacheScopes(touched)
+	return notWritten, nil
+}
+
+func (s *MetadataStore) recordColdFilesBatch(ctx context.Context, files []FileMetadata, migratedAt time.Time) ([]string, map[tierCacheScope]struct{}, error) {
 	if migratedAt.IsZero() {
 		migratedAt = time.Now()
 	}
-	// Formatted once, and as TEXT, exactly as the single-file version does:
-	// migrated_at is compared as a string against every other row, and
-	// go-sqlite3 binds a time.Time with its offset appended, which sorts
-	// against the layout every existing row was written in.
-	stamp := migratedAt.UTC().Format(sqliteTimestampLayout)
-
-	return s.recordRestoredFilesBatch(ctx, files, `
+	return s.recordTierFilesBatch(ctx, files, `
 		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
@@ -459,10 +511,21 @@ func (s *MetadataStore) RecordColdFilesBatch(ctx context.Context, files []FileMe
 			migrated_at = CASE WHEN tier_files.tier != excluded.tier THEN excluded.migrated_at ELSE tier_files.migrated_at END
 		WHERE tier_files.quarantined_at IS NULL
 	`, func(file FileMetadata) []any {
+		fileMigratedAt := migratedAt
+		if file.MigratedAt != nil {
+			fileMigratedAt = *file.MigratedAt
+		}
+		if fileMigratedAt.IsZero() {
+			fileMigratedAt = time.Now()
+		}
 		createdAt := file.CreatedAt
 		if createdAt.IsZero() {
-			createdAt = migratedAt
+			createdAt = fileMigratedAt
 		}
+		// migrated_at as TEXT, exactly as the single-file version writes it:
+		// it is compared as a string against every other row, and go-sqlite3
+		// binds a time.Time with its offset appended, which sorts against the
+		// layout every existing row was written in.
 		return []any{
 			file.Path,
 			file.Database,
@@ -471,7 +534,7 @@ func (s *MetadataStore) RecordColdFilesBatch(ctx context.Context, files []FileMe
 			string(TierCold),
 			file.SizeBytes,
 			createdAt.UTC(),
-			stamp,
+			fileMigratedAt.UTC().Format(sqliteTimestampLayout),
 		}
 	})
 }
@@ -496,7 +559,7 @@ func (s *MetadataStore) RecordColdFilesBatch(ctx context.Context, files []FileMe
 func (s *MetadataStore) RecordRestoredHotFilesBatch(ctx context.Context, files []FileMetadata) ([]string, error) {
 	now := time.Now().UTC()
 
-	return s.recordRestoredFilesBatch(ctx, files, `
+	notWritten, touched, err := s.recordTierFilesBatch(ctx, files, `
 		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
@@ -519,15 +582,20 @@ func (s *MetadataStore) RecordRestoredHotFilesBatch(ctx context.Context, files [
 			createdAt.UTC(),
 		}
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateTierCacheScopes(touched)
+	return notWritten, nil
 }
 
-// recordRestoredFilesBatch writes one upsert per file through a single
+// recordTierFilesBatch writes one upsert per file through a single
 // prepared statement inside ONE explicit transaction, and reports the paths
-// whose row was not written — RowsAffected 0, which under both callers'
-// statements means a quarantined row the upsert deliberately left alone.
+// whose row was not written — RowsAffected 0, which under these statements
+// means a quarantined row the upsert deliberately left alone.
 //
-// Shared by the two restore recorders because the only things that differ
-// between them are the statement and its bindings (#1141).
+// Shared by the cold and restored-hot recorders because the only things that
+// differ between them are the statement and its bindings (#1141).
 //
 // ONE TRANSACTION PER CALL, AND THE CALLER CHUNKS. That is the contract rather
 // than an implementation detail, because it is what keeps the outcome exact: a
@@ -554,15 +622,16 @@ func (s *MetadataStore) RecordRestoredHotFilesBatch(ctx context.Context, files [
 // wait forever for the connection the transaction itself is holding. That is a
 // self-deadlock, not a slow query. invalidateTierCache is safe on both counts:
 // it touches only the in-memory map under its own mutex, and it is called
-// after the commit regardless.
-func (s *MetadataStore) recordRestoredFilesBatch(ctx context.Context, files []FileMetadata, query string, bind func(FileMetadata) []any) ([]string, error) {
+// after the commit. The helper returns the touched scopes so callers can
+// invalidate immediately or defer it across multiple committed chunks.
+func (s *MetadataStore) recordTierFilesBatch(ctx context.Context, files []FileMetadata, query string, bind func(FileMetadata) []any) ([]string, map[tierCacheScope]struct{}, error) {
 	if len(files) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin a tier row batch of %d files: %w", len(files), err)
+		return nil, nil, fmt.Errorf("failed to begin a tier row batch of %d files: %w", len(files), err)
 	}
 	committed := false
 	defer func() {
@@ -573,38 +642,35 @@ func (s *MetadataStore) recordRestoredFilesBatch(ctx context.Context, files []Fi
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to prepare a tier row batch of %d files: %w", len(files), err)
+		return nil, nil, fmt.Errorf("failed to prepare a tier row batch of %d files: %w", len(files), err)
 	}
 	defer stmt.Close()
 
-	// The cache is keyed by database/measurement and a restore writes many
-	// files under each pair, so the invalidation is collected here and done
-	// once per pair after the commit — not once per row.
-	type tierScope struct{ database, measurement string }
-	touched := make(map[tierScope]struct{}, len(files))
+	// The cache is keyed by database/measurement and a batch writes many
+	// files under each pair, so the scopes are collected here and returned;
+	// the caller invalidates once per pair after the commit — not once per
+	// row.
+	touched := make(map[tierCacheScope]struct{}, len(files))
 
 	var notWritten []string
 	for _, file := range files {
 		res, err := stmt.ExecContext(ctx, bind(file)...)
 		if err != nil {
-			return nil, fmt.Errorf("failed to record a tier row for %s: %w", file.Path, err)
+			return nil, nil, fmt.Errorf("failed to record a tier row for %s: %w", file.Path, err)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			notWritten = append(notWritten, file.Path)
 			continue
 		}
-		touched[tierScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
+		touched[tierCacheScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit a tier row batch of %d files: %w", len(files), err)
+		return nil, nil, fmt.Errorf("failed to commit a tier row batch of %d files: %w", len(files), err)
 	}
 	committed = true
 
-	for scope := range touched {
-		s.invalidateTierCache(scope.database, scope.measurement)
-	}
-	return notWritten, nil
+	return notWritten, touched, nil
 }
 
 // GetFile retrieves file metadata by path
@@ -640,7 +706,8 @@ func (s *MetadataStore) GetFilesInTier(ctx context.Context, tier Tier) ([]FileMe
 // ColdFilePathsAndSizes returns every non-quarantined row of a tier as
 // path -> size_bytes (#1086 stage C). It backs the backup's cold walk, which
 // reconciles the cold listing against the rows in both directions and so needs
-// exactly these two columns, keyed for lookup.
+// exactly these two columns, keyed for lookup, and the cold-tier metadata
+// sync's skip set, for the same reason (#1188).
 //
 // Deliberately NOT GetFilesInTier plus a filter in Go. That one selects all
 // eleven columns, allocates a full FileMetadata per row, and sorts by
@@ -762,6 +829,22 @@ func (s *MetadataStore) CountFilesInTierByDatabase(ctx context.Context, tier Tie
 	return counts, nil
 }
 
+// CountFilesInTierForDatabase counts the non-quarantined rows for one database
+// and tier. Unlike CountFilesInTierByDatabase, this avoids scanning and
+// grouping every database when a caller only needs one database's count.
+func (s *MetadataStore) CountFilesInTierForDatabase(ctx context.Context, database string, tier Tier) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM tier_files
+		WHERE database = ? AND tier = ? AND quarantined_at IS NULL
+	`, database, string(tier)).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count files in tier for database: %w", err)
+	}
+	return count, nil
+}
+
 // GetFilesOlderThan retrieves files in a tier older than the specified age.
 // Quarantined rows are excluded: this is the migration candidate query, and a
 // quarantined file is one tiering has established it can never act on (#758).
@@ -778,6 +861,27 @@ func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge
 	rows, err := s.db.QueryContext(ctx, query, string(tier), cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query old files: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanFiles(rows)
+}
+
+// GetColdFilesForRetention returns one database's cold rows whose partition
+// starts before partitionBefore, quarantined rows included (retention counts
+// them and leaves them alone). Filtered in SQL: the table holds every
+// database's rows, and this runs once per retention execution.
+func (s *MetadataStore) GetColdFilesForRetention(ctx context.Context, database string, partitionBefore time.Time) ([]FileMetadata, error) {
+	query := `
+		SELECT ` + tierFileColumns + `
+		FROM tier_files
+		WHERE tier = ? AND database = ? AND partition_time < ?
+		ORDER BY measurement ASC, partition_time ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, string(TierCold), database, partitionBefore.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("failed to query cold files for retention: %w", err)
 	}
 	defer rows.Close()
 
@@ -857,6 +961,50 @@ func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurem
 	}
 	defer rows.Close()
 
+	return s.scanFiles(rows)
+}
+
+// HasColdFilesInRange reports whether a measurement has a cold row (not
+// quarantined) whose partition may hold data in [start, end]; nil bounds are
+// open. A cold file is a daily partition (partition_time at the start of its
+// day), so the lower bound is widened by a day: a range starting mid-day
+// still needs that day's file.
+func (s *MetadataStore) HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	query := `SELECT 1 FROM tier_files
+		WHERE database = ? AND measurement = ? AND tier = ? AND quarantined_at IS NULL`
+	args := []any{database, measurement, string(TierCold)}
+	if start != nil {
+		query += " AND partition_time >= ?"
+		args = append(args, start.UTC().Add(-24*time.Hour))
+	}
+	if end != nil {
+		query += " AND partition_time <= ?"
+		args = append(args, end.UTC())
+	}
+	query += " LIMIT 1"
+	var one int
+	switch err := s.db.QueryRowContext(ctx, query, args...).Scan(&one); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("failed to query cold files: %w", err)
+	}
+	return true, nil
+}
+
+// coldFilesForMeasurement is one measurement's cold rows, quarantined ones
+// excluded, in SQL: a DELETE asks for them, and the measurement's hot rows
+// (hourly files, the many) are no use to it (#1350).
+func (s *MetadataStore) coldFilesForMeasurement(ctx context.Context, database, measurement string) ([]FileMetadata, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+tierFileColumns+`
+		FROM tier_files
+		WHERE database = ? AND measurement = ? AND tier = ? AND quarantined_at IS NULL`,
+		database, measurement, string(TierCold))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query cold files: %w", err)
+	}
+	defer rows.Close()
 	return s.scanFiles(rows)
 }
 
@@ -972,6 +1120,43 @@ func (s *MetadataStore) UpdateTier(ctx context.Context, path string, newTier Tie
 	return nil
 }
 
+// UpdateTierIfCurrent changes a row only if it still has expectedTier. It is
+// used by cleanup paths whose object-store action is based on a metadata
+// snapshot; a concurrent migration must be able to invalidate that decision.
+func (s *MetadataStore) UpdateTierIfCurrent(ctx context.Context, path string, expectedTier, newTier Tier) (bool, error) {
+	var database, measurement string
+	lookupQuery := `SELECT database, measurement FROM tier_files WHERE path = ?`
+	err := s.db.QueryRowContext(ctx, lookupQuery, path).Scan(&database, &measurement)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("failed to load file metadata before conditional tier update: %w", err)
+	}
+
+	var migratedAt any
+	if newTier == TierCold {
+		migratedAt = time.Now().UTC()
+	}
+	query := `
+		UPDATE tier_files
+		SET tier = ?, migrated_at = ?
+		WHERE path = ? AND tier = ? AND quarantined_at IS NULL
+	`
+	result, err := s.db.ExecContext(ctx, query, string(newTier), migratedAt, path, string(expectedTier))
+	if err != nil {
+		return false, fmt.Errorf("failed to conditionally update tier: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read conditional tier update result: %w", err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if database != "" && measurement != "" {
+		s.invalidateTierCache(database, measurement)
+	}
+	return true, nil
+}
+
 // DeleteFile removes a file from the metadata store
 func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 	// Get database/measurement for cache invalidation before delete
@@ -1019,18 +1204,82 @@ func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier 
 	}
 	query += ` RETURNING database, measurement`
 
-	var database, measurement string
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(&database, &measurement)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	// Every row read (deleteReturningScope): QueryRow would leave the WAL
+	// unchecked.
+	database, measurement, found, err := s.deleteReturningScope(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("failed to delete file: %w", err)
+	}
+	if !found {
+		return false, nil
 	}
 	if database != "" && measurement != "" {
 		s.invalidateTierCache(database, measurement)
 	}
 	return true, nil
+}
+
+// hotRowsPage returns up to limit hot rows that are not quarantined, with an
+// id above afterID, in id order: the stale-row walk reads them a page at a
+// time rather than every hot row in one statement, which held the store's
+// only connection for the whole read (flushes registering files waited on
+// it) and every row in memory at once.
+func (s *MetadataStore) hotRowsPage(ctx context.Context, afterID int64, limit int) ([]FileMetadata, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+tierFileColumns+`
+		FROM tier_files
+		WHERE tier = ? AND quarantined_at IS NULL AND id > ?
+		ORDER BY id
+		LIMIT ?`, string(TierHot), afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query hot rows: %w", err)
+	}
+	defer rows.Close()
+	return s.scanFiles(rows)
+}
+
+// walFileBytes is the size of the store's WAL file on disk, 0 when there is
+// none (an in-memory database, or no WAL yet).
+func (s *MetadataStore) walFileBytes(ctx context.Context) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA database_list")
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var file string
+	for rows.Next() {
+		var seq int
+		var name, f string
+		if err := rows.Scan(&seq, &name, &f); err != nil {
+			return 0, err
+		}
+		if name == "main" {
+			file = f
+		}
+	}
+	if err := rows.Err(); err != nil || file == "" {
+		return 0, err
+	}
+	fi, err := os.Stat(file + "-wal")
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// truncateWAL checkpoints the store's WAL and truncates the file. A WAL file
+// never shrinks on its own (journal_size_limit is unset), so one a run of
+// writes grew stays that size on disk after its frames are folded in. It
+// reports SQLite's result: busy is 1 when a reader kept it from finishing.
+// It can wait on the busy handler twice, holding the store's only connection,
+// so it runs only for a WAL file far larger than the autocheckpoint keeps it
+// (retireVanishedHotRows).
+func (s *MetadataStore) truncateWAL(ctx context.Context) (busy, logFrames, checkpointed int, err error) {
+	err = s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed)
+	return busy, logFrames, checkpointed, err
 }
 
 // QuarantineFile marks a file index row as one tiering must never act on

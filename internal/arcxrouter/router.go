@@ -44,12 +44,20 @@ import (
 // explicitly so query.go exposes no new exported methods.
 type Deps struct {
 	Storage storage.Backend
+	// Exclude names storage keys under a "db/measurement/" prefix the engine
+	// must not read: one side of each compaction whose output and inputs are
+	// both in storage (api.wrapOpenCompactions). Optional.
+	Exclude func(ctx context.Context, prefix string) []string
 	DB      OracleDB
 	Logger  zerolog.Logger
 	Metrics Metrics
 	Mode    Mode
-	// ConvertedSQL is the DuckDB-correct rewrite the caller already computed for
-	// this query (the oracle SQL for shadow compare). date_trunc intact per DuckDB.
+	// ConvertedSQL is the rewrite the caller already computed for this query
+	// (the oracle SQL for shadow compare). time_bucket and date_trunc arrive in
+	// it as epoch arithmetic, not as the functions; before #1352 that
+	// arithmetic rounded sub-second rows into the next bucket, so a shadow
+	// mismatch on minute or second buckets over sub-second data was the
+	// oracle's error, not arcx's.
 	ConvertedSQL string
 	// ServeStream writes an arcx result to the response in the request's wire
 	// format (JSON or msgpack), reusing Arc's existing Arrow→wire streamers. It
@@ -271,6 +279,17 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	basePath := local.GetBasePath()
 
 	prefix := d.Ctx.Database + "/" + d.Ctx.Measurement + "/"
+	// Before the listing: a job's inputs are named only once its output is in
+	// storage, so a listing taken after always holds that output.
+	var skip map[string]struct{}
+	if h.Exclude != nil {
+		for _, k := range h.Exclude(ctx, prefix) {
+			if skip == nil {
+				skip = map[string]struct{}{}
+			}
+			skip[k] = struct{}{}
+		}
+	}
 	entries, err := h.Storage.List(ctx, prefix)
 	if err != nil {
 		h.Logger.Warn().Err(err).Str("prefix", prefix).Msg("arcx: storage list failed; declining")
@@ -281,6 +300,9 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	n := 0
 	for _, e := range entries {
 		if !strings.HasSuffix(e, ".parquet") {
+			continue
+		}
+		if _, ok := skip[e]; ok {
 			continue
 		}
 		if n > 0 {

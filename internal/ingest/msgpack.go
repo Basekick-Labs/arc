@@ -43,31 +43,76 @@ func NewMessagePackDecoder(logger zerolog.Logger) *MessagePackDecoder {
 // Returns either []models.Record or []models.ColumnarRecord depending on input format
 // The raw bytes are preserved in ColumnarRecord.RawPayload for zero-copy WAL
 func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
+	records, _, drops, err := d.DecodeWithDrops(data)
+	if err == nil && len(drops) > 0 {
+		n := 0
+		for _, dr := range drops {
+			n += dr.Points
+		}
+		return nil, fmt.Errorf("%d points cannot be written (use DecodeWithDrops to write the others)", n)
+	}
+	return records, err
+}
+
+// DecodeWithDrops is Decode for a writer: it also returns how many records
+// the payload held (rows for row format, items for columnar) and the points
+// the typed row decoder dropped (see tryDecodeRowsTyped), which the caller
+// reports after writing the rest.
+func (d *MessagePackDecoder) DecodeWithDrops(data []byte) (records interface{}, count int, drops []LPDrop, err error) {
+	return d.DecodeWithDropsKnown(data, nil)
+}
+
+// DecodeWithDropsKnown is DecodeWithDrops whose typed row decoder also drops a
+// point with a new column that differs only in letter case from a column
+// known gives for its measurement (#1342). known may be nil.
+func (d *MessagePackDecoder) DecodeWithDropsKnown(data []byte, known KnownColumns) (records interface{}, count int, drops []LPDrop, err error) {
+	// TYPED FAST PATHS: columnar payloads (one map, an array, a batch) and
+	// row-format payloads decode straight into typed column slices, skipping
+	// the per-value interface boxing of the generic path (~12% of write CPU
+	// at sustained 26M rec/s for columnar). Any shape they don't handle falls
+	// through to the generic path, the authority on accept/reject.
+	if d.typedEnabled && len(data) > 0 {
+		if recs, ok := d.tryDecodeTyped(data); ok {
+			d.typedHits.Add(1)
+			d.totalDecoded.Add(uint64(len(recs)))
+			return recs, len(recs), nil, nil
+		}
+		if recs, rows, dropped, ok := d.tryDecodeRowsTyped(data, known); ok {
+			d.typedHits.Add(1)
+			d.totalDecoded.Add(uint64(rows))
+			return recs, rows, dropped, nil
+		}
+		d.typedMisses.Add(1)
+	}
+	records, err = d.decodeGeneric(data)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if list, ok := records.([]interface{}); ok {
+		return records, len(list), nil, nil
+	}
+	return records, 1, nil, nil
+}
+
+// decodeGeneric decodes any accepted shape through interface{} values.
+func (d *MessagePackDecoder) decodeGeneric(data []byte) (interface{}, error) {
 	// NOTE: No bulk UTF-8 pre-validation here. MessagePack is a binary format —
 	// the raw bytes contain type markers, length prefixes, and packed numerics
 	// that are not valid UTF-8. Bulk validation would always fail, adding cost
 	// with zero benefit. Per-field sanitization handles the extracted strings.
 	// (Bulk pre-validation is used in the Line Protocol path where payloads ARE UTF-8.)
 
-	// TYPED FAST PATH: decode a top-level single-map columnar payload straight
-	// into typed column slices, skipping the per-value interface boxing below
-	// (~12% of write CPU at sustained 26M rec/s). Falls through to the generic
-	// path on any shape it doesn't handle — the generic path remains the
-	// authority on accept/reject behavior.
-	if d.typedEnabled {
-		if rec, ok := d.tryDecodeColumnarTyped(data); ok {
-			d.typedHits.Add(1)
-			d.totalDecoded.Add(1)
-			return []interface{}{rec}, nil
-		}
-		d.typedMisses.Add(1)
-	}
-
 	// IMPORTANT: Decode to generic interface{} first to handle both map and array formats
 	// Telegraf and other clients may send data in array-encoded format which would fail
 	// if we try to decode directly into a struct
+	// Lengths first: the library allocates a value's declared length before
+	// reading it (see msgpackValueEnd).
+	if !msgpackFramingOK(data) {
+		d.totalErrors.Add(1)
+		return nil, fmt.Errorf("failed to unmarshal msgpack: truncated payload or a declared length past its end")
+	}
 	var rawPayload interface{}
-	if err := msgpack.Unmarshal(data, &rawPayload); err != nil {
+	if err := unmarshalGeneric(data, &rawPayload); err != nil {
 		d.totalErrors.Add(1)
 		return nil, fmt.Errorf("failed to unmarshal msgpack: %w", err)
 	}
@@ -112,6 +157,19 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 
 	d.totalDecoded.Add(uint64(len(results)))
 	return results, nil
+}
+
+// unmarshalGeneric is msgpack.Unmarshal into an interface{}, with a panic in
+// the decoder turned into an error: a map with a nil key (four bytes:
+// 0x91 0x81 0xc0 0x30) panics inside the library's generic map decoding, and
+// a malformed payload is the client's error, not a 500 with a stack trace.
+func unmarshalGeneric(data []byte, v *interface{}) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("malformed payload: %v", r)
+		}
+	}()
+	return msgpack.Unmarshal(data, v)
 }
 
 // decodeMapPayload decodes a map[string]interface{} payload
@@ -187,6 +245,16 @@ func (d *MessagePackDecoder) mapToPayload(m map[string]interface{}) *models.MsgP
 				if arr, ok := v.([]interface{}); ok {
 					payload.Columns[k] = arr
 				}
+			}
+		}
+	}
+
+	// Columnar tag keys explicitly distinguish tags from string fields.
+	if rawTagKeys, ok := m["tag_keys"].([]interface{}); ok {
+		payload.TagKeys = make([]string, 0, len(rawTagKeys))
+		for _, value := range rawTagKeys {
+			if tag, ok := value.(string); ok {
+				payload.TagKeys = append(payload.TagKeys, tag)
 			}
 		}
 	}
@@ -285,6 +353,7 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 		Measurement: measurement,
 		Columnar:    true,
 		Columns:     payload.Columns,
+		TagColumns:  payload.TagKeys,
 		TimeUnit:    "us",       // microseconds
 		RawPayload:  walPayload, // Zero-copy: store original msgpack bytes for WAL
 	}, nil
@@ -313,8 +382,16 @@ func (d *MessagePackDecoder) decodeRow(payload *models.MsgPackPayload) (*models.
 		return nil, err
 	}
 
-	// Extract host
+	// Host: h when sent as a string or an integer; otherwise the row's own
+	// host tag; otherwise "unknown". extractHost returns "unknown" for a
+	// missing or unusable h, which used to replace the row's host tag: the
+	// Python client sends tags and never h, so every row was host=unknown.
 	host := d.extractHost(payload.H)
+	if _, usable := payload.H.(string); !usable && !isIntegerValue(payload.H) {
+		if _, tagged := payload.Tags["host"]; tagged {
+			host = "" // keep the host tag
+		}
+	}
 
 	// Extract fields
 	fields := payload.Fields
@@ -453,6 +530,15 @@ func (d *MessagePackDecoder) extractHost(h interface{}) string {
 	default:
 		return "unknown"
 	}
+}
+
+// isIntegerValue reports a Go integer of any width (a decoded msgpack int).
+func isIntegerValue(v interface{}) bool {
+	switch v.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return true
+	}
+	return false
 }
 
 // extractCompactFields converts compact field array to map
