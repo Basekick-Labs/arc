@@ -9,7 +9,7 @@ also accepts rule objects with MQTT `+` and `#` filters, measurement overrides,
 and zero-based tag extraction from full topic paths. Payload measurements and
 tags remain in use when a matched rule omits those fields.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1402](https://github.com/Basekick-Labs/arc/pull/1402).
 
 ## Fix: cluster cache invalidation reaches peers with wildcard API addresses (#1398)
 
