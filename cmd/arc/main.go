@@ -27,6 +27,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/credscrub"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/edgesync"
 	"github.com/basekick-labs/arc/internal/fieldschema"
@@ -5247,6 +5248,22 @@ func main() {
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {
 		return server.Shutdown(shutdownTimeout)
 	}, shutdown.PriorityHTTPServer)
+
+	// Clear credential material that earlier versions could leave in stored
+	// error messages (tiering, retention, continuous query and MQTT history,
+	// the edge-sync ledger). After every subsystem has created its tables and
+	// before the node is marked ready, so no reader sees the old text. Bounded
+	// and never fatal: a failure is logged and retried at the next start.
+	if scrubDB, scrubOwned, scrubErr := sharedSQLiteHandle(authManager, cfg.Auth.DBPath); scrubErr != nil {
+		log.Warn().Err(scrubErr).Msg("Could not open the shared database to clear stored error text")
+	} else {
+		scrubCtx, scrubCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, _ = credscrub.Run(scrubCtx, scrubDB, logger.Get("credscrub"))
+		scrubCancel()
+		if scrubOwned {
+			_ = scrubDB.Close()
+		}
+	}
 
 	// Mark /ready=200 so the load balancer (Pattern 2 multi-writer) starts
 	// routing traffic here. By this point WAL recovery has completed
