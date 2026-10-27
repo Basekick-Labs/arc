@@ -1831,6 +1831,17 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Azure Blob Storage error text is trimmed
+
+Errors from the Azure Blob Storage backend now name the operation, the host
+and the object, and nothing else of the request; every operation is covered,
+whichever way the backend authenticates. A connection string, SAS token or
+account key that ends in a newline (read from a file) is trimmed, and one with
+another control character is refused at startup with a message that does not
+repeat it. Error messages stored by earlier versions in the shared database
+(tiering, retention, continuous-query and MQTT history, the edge-sync ledger)
+are tidied the same way at startup.
+
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
 The Parquet import stored every binary column (a BYTE_ARRAY without a string
