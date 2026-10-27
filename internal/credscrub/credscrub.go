@@ -26,6 +26,10 @@ var columns = []column{
 	{"continuous_query_executions_dormant", "error_message"},
 	{"mqtt_subscriptions", "error_message"},
 	{"sync_ledger", "last_error"},
+	// Audit details are JSON (a reconciliation abort records its error
+	// there); the redactor keeps JSON escaping intact. Audit rows carry no
+	// integrity chain, so rewriting the text breaks nothing.
+	{"audit_logs", "detail"},
 }
 
 // batchSize bounds each UPDATE transaction, so the scrub never holds the

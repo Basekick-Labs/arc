@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -312,6 +313,10 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
+		// The request address carries the key (the server reads it from the
+		// query); a transport error quotes the address, so drop the query
+		// before the error is logged or returned.
+		err = withoutRequestQuery(err)
 		c.logger.Error().Err(err).Msg("License verification request failed")
 		return nil, transientErr("license verification request failed: %w", err)
 	}
@@ -649,4 +654,15 @@ func checkHTTPStatus(resp *http.Response) error {
 func readBoundedJSON(resp *http.Response, v any) error {
 	bounded := io.LimitReader(resp.Body, maxLicenseResponseBytes)
 	return json.NewDecoder(bounded).Decode(v)
+}
+
+// withoutRequestQuery trims the query from the request address an
+// *url.Error quotes, in place, so the error's text no longer carries what the
+// query held.
+func withoutRequestQuery(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		ue.URL, _, _ = strings.Cut(ue.URL, "?")
+	}
+	return err
 }
