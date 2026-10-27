@@ -674,6 +674,13 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # enabled = false
 # history_size = 100              # Number of completed queries to keep in memory
 
+# Peer file replication settings.
+[cluster]
+# Aggregate inbound replication bandwidth across all pull workers on this node.
+# Set to 0 for no limit. Increase cluster.replication_fetch_timeout_ms when
+# using a low cap with large files.
+# replication_pull_bytes_per_second = 0
+
 [wal]
 enabled = false
 # sync_mode = "fdatasync"   # fdatasync (default), fsync, or async (no sync; a flush checkpoint is still synced)

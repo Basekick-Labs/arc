@@ -759,6 +759,13 @@ GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
 
+### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
+
+`cluster.replication_pull_bytes_per_second` limits aggregate inbound file
+replication across a node's pull workers. The default `0` keeps transfers
+unlimited. Increase `cluster.replication_fetch_timeout_ms` if a low cap makes
+large-file downloads exceed the per-fetch timeout.
+
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
 `storage.backend = "gcs"` stores Arc's data in a Google Cloud

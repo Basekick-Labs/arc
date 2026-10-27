@@ -4394,6 +4394,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		TLSConfig:             c.tlsConfig,
 		DialTimeout:           10 * time.Second,
 		ResponseHeaderTimeout: fetchTimeout,
+		BytesPerSecond:        c.cfg.ReplicationPullBytesPerSecond,
 	})
 	if err != nil {
 		return fmt.Errorf("build fetch client: %w", err)
