@@ -109,12 +109,12 @@ func TestExecuteQueryArrowSetsRowsCappedTrailer(t *testing.T) {
 		if resp.StatusCode != fiber.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
 		}
-		// Presence is checked separately from value: fasthttp emits every
-		// REGISTERED trailer on every response, empty when never Set, and the
-		// client contract rests on that. Get() alone cannot tell an empty
-		// trailer from a missing one.
+		// The trailer must be registered (announced in the Trailer header) on
+		// every response: Go's client fills resp.Trailer from that header.
+		// Whether it was sent is a wire question, see
+		// TestArrowTrailersOnTheWire.
 		if _, ok := resp.Trailer[textproto.CanonicalMIMEHeaderKey(arrowRowsCappedTrailer)]; !ok {
-			t.Errorf("%s is absent from the trailers; it must be registered on every response", arrowRowsCappedTrailer)
+			t.Errorf("%s is not announced; it must be registered on every response", arrowRowsCappedTrailer)
 		}
 		// Without this the "want empty" subtests below would pass with the
 		// whole publish mechanism deleted. The execution-time trailer is set on
@@ -142,8 +142,8 @@ func TestExecuteQueryArrowSetsRowsCappedTrailer(t *testing.T) {
 	t.Run("a result short of the cap leaves the trailer empty", func(t *testing.T) {
 		var called int32
 		app := newApp(t, &governance.Policy{TokenID: 42, MaxRowsPerQuery: cap}, cap-1, nil, &called)
-		// Empty, not absent: the trailer is registered on every response, so
-		// the client contract is "non-empty means capped".
+		// Empty to the client (registered, never set): the client contract is
+		// "non-empty means capped".
 		got := trailerOf(t, app)
 		if atomic.LoadInt32(&called) != 1 {
 			t.Fatalf("the Arrow IPC stream writer never ran (%d calls)", called)

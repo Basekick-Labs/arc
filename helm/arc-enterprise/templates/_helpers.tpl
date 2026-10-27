@@ -164,6 +164,45 @@ Always compare with `eq (include ...) "true"` — Helm returns the string "true"
 {{- end }}
 
 {{/*
+Shared-storage backend: "s3" (default) or "gcs" (#1105).
+*/}}
+{{- define "arc-enterprise.sharedBackend" -}}
+{{- (.Values.storage.shared | default dict).backend | default "s3" -}}
+{{- end }}
+
+{{/*
+Whether a GCS service-account key Secret is mounted ("true"/"false").
+*/}}
+{{- define "arc-enterprise.gcsKeyMounted" -}}
+{{- $gcs := (.Values.storage.shared | default dict).gcs | default dict -}}
+{{- and (eq .Values.storage.mode "shared") (eq (include "arc-enterprise.sharedBackend" .) "gcs") (ne ($gcs.credentialsSecret | default "") "") -}}
+{{- end }}
+
+{{/*
+GCS key volume and mount, included by every role's StatefulSet.
+*/}}
+{{- define "arc-enterprise.gcsVolumeMount" -}}
+{{- if eq (include "arc-enterprise.gcsKeyMounted" .) "true" }}
+- name: gcs-credentials
+  mountPath: /etc/arc/gcs
+  readOnly: true
+{{- end }}
+{{- end }}
+
+{{- define "arc-enterprise.gcsVolume" -}}
+{{- if eq (include "arc-enterprise.gcsKeyMounted" .) "true" }}
+- name: gcs-credentials
+  secret:
+    secretName: {{ .Values.storage.shared.gcs.credentialsSecret | quote }}
+    defaultMode: 0400
+    items:
+      # Named so a wrong key fails the mount, not Arc's startup.
+      - key: {{ .Values.storage.shared.gcs.credentialsKey | default "key.json" | quote }}
+        path: {{ .Values.storage.shared.gcs.credentialsKey | default "key.json" | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
 S3 endpoint — auto-populate when using bundled SeaweedFS, otherwise use whatever the operator configured.
 The bundled Secret uses the same access-key / secret-key keys as an
 operator-supplied external-S3 secret, so no per-source key mapping exists
@@ -331,7 +370,27 @@ WAL env vars for writers. Enabled by default for Enterprise durability.
 Storage env vars — depends on storage.mode.
 */}}
 {{- define "arc-enterprise.storageEnv" -}}
-{{- if eq .Values.storage.mode "shared" }}
+{{- if and (eq .Values.storage.mode "shared") (eq (include "arc-enterprise.sharedBackend" .) "gcs") }}
+{{- $gcs := (.Values.storage.shared | default dict).gcs | default dict -}}
+- name: ARC_STORAGE_BACKEND
+  value: "gcs"
+- name: ARC_STORAGE_GCS_BUCKET
+  value: {{ .Values.storage.shared.bucket | quote }}
+{{- if .Values.storage.shared.prefix }}
+- name: ARC_STORAGE_GCS_PREFIX
+  value: {{ .Values.storage.shared.prefix | quote }}
+{{- end }}
+{{- if $gcs.endpoint }}
+- name: ARC_STORAGE_GCS_ENDPOINT
+  value: {{ $gcs.endpoint | quote }}
+{{- end }}
+{{- if eq (include "arc-enterprise.gcsKeyMounted" .) "true" }}
+- name: ARC_STORAGE_GCS_CREDENTIALS_FILE
+  value: {{ printf "/etc/arc/gcs/%s" ($gcs.credentialsKey | default "key.json") | quote }}
+{{- end }}
+- name: ARC_CLUSTER_REPLICATION_ENABLED
+  value: "false"
+{{- else if eq .Values.storage.mode "shared" }}
 {{- $creds := (.Values.storage.shared | default dict).credentials | default dict -}}
 - name: ARC_STORAGE_BACKEND
   value: "s3"

@@ -34,7 +34,9 @@ import (
 //
 // Only compaction outputs are adopted: other unlisted objects are leftovers
 // of a delete that failed after its manifest change (a DELETE rewrite, a
-// tiering flip, retention, a database delete), which the reconciler owns.
+// tiering flip, retention, a database delete), which the reconciler owns. A
+// compaction output a DELETE rewrote is such a leftover too, while the
+// manifest lists its rewrite (AdoptableObject).
 //
 // On every cluster, compaction also registered its outputs in the
 // compaction tier ("hourly", "daily") rather than "hot"; the repair moves
@@ -190,7 +192,9 @@ func parseCompactedOutputPath(path string) (database, measurement string, partit
 // AdoptableObject reports whether an unlisted object at path may be
 // registered as the compaction output it is: ManifestAdoption, owned by no
 // staged compaction (a finalizing job's input is out of the manifest on
-// purpose), and not one the tiering metadata records as cold.
+// purpose), not a row DELETE's leftover (another member of its rewrite
+// family is listed), and not one the tiering metadata records as cold. The
+// reconciler treats an object this refuses as an orphan.
 func (c *Coordinator) AdoptableObject(ctx context.Context, path string) bool {
 	if !c.ManifestAdoption() {
 		return false
@@ -198,10 +202,82 @@ func (c *Coordinator) AdoptableObject(ctx context.Context, path string) bool {
 	if _, _, _, ok := parseCompactedOutputPath(path); !ok || c.CompactionOwns(path) {
 		return false
 	}
+	// A row DELETE rewrote it and the manifest lists the rewrite (or the
+	// file it was rewritten from), or the DELETE journal names it: it is a
+	// leftover the DELETE could not remove (or a rewrite still being
+	// settled), and registering it would count its rows twice, for good.
+	if journaled, known := c.retiredByDelete(ctx, path); c.HasRewriteSibling(path) || journaled || !known {
+		return false
+	}
 	c.repair.mu.Lock()
 	cold := c.repair.coldPath
 	c.repair.mu.Unlock()
 	return cold == nil || !cold(ctx, path)
+}
+
+// HasRewriteSibling reports whether the manifest lists another member of
+// path's rewrite family (storage.RewriteFamily).
+func (c *Coordinator) HasRewriteSibling(path string) bool {
+	if c == nil || c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	return fsm != nil && fsm.HasRewriteSibling(path)
+}
+
+// ReconcilerKeeps is the reconciler's filter for unlisted objects: adoptable
+// ones are the repair's, and a file the DELETE journal names is the
+// drainer's (it may still be the current copy while its rewrite settles);
+// neither is an orphan to remove.
+func (c *Coordinator) ReconcilerKeeps(ctx context.Context, path string) bool {
+	journaled, known := c.retiredByDelete(ctx, path)
+	return journaled || !known || c.AdoptableObject(ctx, path)
+}
+
+// retiredJournalTTL bounds how stale the cached view of the DELETE journal
+// may be.
+const retiredJournalTTL = 30 * time.Second
+
+// retiredByDelete reports whether the DELETE journal (storage.ReadRetired)
+// names path, from a view refreshed at most every retiredJournalTTL (read
+// outside the lock). known is false until a read has succeeded: callers
+// then fail closed (nothing is adopted, nothing is an orphan).
+func (c *Coordinator) retiredByDelete(ctx context.Context, path string) (journaled, known bool) {
+	if c == nil || c.storage == nil {
+		return false, true
+	}
+	c.retiredJournal.mu.Lock()
+	stale := time.Since(c.retiredJournal.at) >= retiredJournalTTL
+	if stale {
+		c.retiredJournal.at = time.Now() // one reader per refresh
+	}
+	c.retiredJournal.mu.Unlock()
+	if stale {
+		r, err := storage.ReadRetired(ctx, c.storage)
+		c.retiredJournal.mu.Lock()
+		if err == nil {
+			c.retiredJournal.paths, c.retiredJournal.known = r, true
+		} else {
+			c.logger.Warn().Err(err).Msg("Could not read the DELETE journal; unlisted objects are neither adopted nor treated as orphans until it can be read")
+		}
+		c.retiredJournal.mu.Unlock()
+	}
+	c.retiredJournal.mu.Lock()
+	defer c.retiredJournal.mu.Unlock()
+	return c.retiredJournal.paths[path], c.retiredJournal.known
+}
+
+// RewriteSiblings returns the registered members of path's rewrite family
+// other than path.
+func (c *Coordinator) RewriteSiblings(path string) []raft.FileEntry {
+	if c == nil || c.raftNode == nil {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	return fsm.RewriteSiblings(path)
 }
 
 // ErrNotAdoptable: the object is gone, changed while it was read, or not one

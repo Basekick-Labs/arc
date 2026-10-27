@@ -4,6 +4,8 @@ Deployment pattern: {{ .Values.storage.mode }}-storage
 {{- if eq .Values.storage.mode "shared" }}
   {{- if not .Values.storage.shared.external }}
 Bundled SeaweedFS: enabled ({{ .Values.seaweedfs.replicas }} replica{{ if ne (int .Values.seaweedfs.replicas) 1 }}s{{ end }})
+  {{- else if eq (include "arc-enterprise.sharedBackend" .) "gcs" }}
+Google Cloud Storage: gs://{{ .Values.storage.shared.bucket }}/{{ .Values.storage.shared.prefix }}
   {{- else }}
 External object storage: {{ .Values.storage.shared.endpoint }}
   {{- end }}

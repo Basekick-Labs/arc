@@ -211,6 +211,14 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		return nil, err
 	}
 
+	// Files the DELETE retired journal names: a restored copy of one is
+	// data again, so its record goes before the file is written (a drainer
+	// must not remove what the restore just put back).
+	m.restoreRetired = nil
+	if recs, err := storage.ReadRetired(ctx, m.dataStorage); err == nil {
+		m.restoreRetired = recs
+	}
+
 	// ── 1. Read and validate the manifests ──────────────────────────────
 	// Every target the run committed to, assembled into one MERGED run view
 	// (#1085 stage B2b-2). Every gate below reads that and not one leg's
@@ -1819,6 +1827,12 @@ func (m *Manager) streamRestoreFile(ctx context.Context, src backupTarget, srcPa
 
 	if _, err := tmpFile.Seek(0, 0); err != nil {
 		return 0, fmt.Errorf("failed to seek temp file: %w", err)
+	}
+
+	if m.restoreRetired[destPath] {
+		if err := m.dataStorage.Delete(ctx, storage.RetiredKey(destPath)); err != nil && !storage.IsNotFound(err) {
+			return 0, fmt.Errorf("failed to clear the retired record of %s before restoring it: %w", destPath, err)
+		}
 	}
 
 	// Stream from temp file to the destination store

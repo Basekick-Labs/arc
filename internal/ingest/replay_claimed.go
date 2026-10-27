@@ -207,6 +207,16 @@ func (b *ArrowBuffer) claimedRecordSubs(i int, rec ClaimedRecord, r ClaimedRepla
 	if err != nil {
 		return nil, bad(err)
 	}
+	// As WAL replay does (#1342): a column whose name cannot be stored is
+	// dropped and the rows kept, the same on every replica of the record.
+	if dropped := dropUnstorableColumns(columns); len(dropped) > 0 {
+		b.logger.Error().
+			Str("database", r.Database).
+			Str("measurement", r.Measurement).
+			Strs("columns", quoteColumnNames(dropped)).
+			Int("rows", total).
+			Msg("Replayed stream record: dropped columns whose names cannot be stored; the rows are written without them")
+	}
 	typed, _, err := b.convertColumnsToTyped(r.Measurement, columns)
 	if err != nil {
 		return nil, bad(fmt.Errorf("convert columns: %w", err))
