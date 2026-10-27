@@ -766,6 +766,9 @@ replication across a node's pull workers. The default `0` keeps transfers
 unlimited. Increase `cluster.replication_fetch_timeout_ms` if a low cap makes
 large-file downloads exceed the per-fetch timeout.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1404](https://github.com/Basekick-Labs/arc/pull/1404).
+
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
 `storage.backend = "gcs"` stores Arc's data in a Google Cloud
