@@ -126,23 +126,25 @@ func TestSubscription_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "mapping_valid",
-			modify:  func(s *Subscription) { s.TopicMapping = map[string]string{"sensors/a": "iot-a", "sensors/b": "iot_b"} },
+			name: "mapping_valid",
+			modify: func(s *Subscription) {
+				s.TopicMapping = TopicMapping{"sensors/a": {Database: "iot-a"}, "sensors/b": {Database: "iot_b"}}
+			},
 			wantErr: false,
 		},
 		{
 			name:    "mapping_traversal",
-			modify:  func(s *Subscription) { s.TopicMapping = map[string]string{"sensors/a": "../other-db"} },
+			modify:  func(s *Subscription) { s.TopicMapping = TopicMapping{"sensors/a": {Database: "../other-db"}} },
 			wantErr: true,
 		},
 		{
 			name:    "mapping_absolute",
-			modify:  func(s *Subscription) { s.TopicMapping = map[string]string{"sensors/a": "/etc/passwd"} },
+			modify:  func(s *Subscription) { s.TopicMapping = TopicMapping{"sensors/a": {Database: "/etc/passwd"}} },
 			wantErr: true,
 		},
 		{
 			name:    "mapping_empty_target",
-			modify:  func(s *Subscription) { s.TopicMapping = map[string]string{"sensors/a": ""} },
+			modify:  func(s *Subscription) { s.TopicMapping = TopicMapping{"sensors/a": {Database: ""}} },
 			wantErr: true,
 		},
 		{
@@ -323,13 +325,13 @@ func TestValidateCreateRequest_TopicMappingValidated(t *testing.T) {
 		}
 	}
 	good := base()
-	good.TopicMapping = map[string]string{"sensors/a": "iot-a"}
+	good.TopicMapping = TopicMapping{"sensors/a": {Database: "iot-a"}}
 	if err := ValidateCreateRequest(good); err != nil {
 		t.Fatalf("valid mapping rejected: %v", err)
 	}
 	for _, bad := range []string{"../other-db", "a/b", "/etc/passwd", "", "1iot", "a\\b"} {
 		req := base()
-		req.TopicMapping = map[string]string{"sensors/a": bad}
+		req.TopicMapping = TopicMapping{"sensors/a": {Database: bad}}
 		if err := ValidateCreateRequest(req); err == nil {
 			t.Errorf("create request with topic_mapping target %q was accepted", bad)
 		}

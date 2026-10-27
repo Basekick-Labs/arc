@@ -2,6 +2,15 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: MQTT topic mappings can set measurements and tags (#479)
+
+`topic_mapping` still accepts the existing topic-to-database strings and now
+also accepts rule objects with MQTT `+` and `#` filters, measurement overrides,
+and zero-based tag extraction from full topic paths. Payload measurements and
+tags remain in use when a matched rule omits those fields.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir).
+
 ## Fix: cluster cache invalidation reaches peers with wildcard API addresses (#1398)
 
 Cache-invalidation fan-out now resolves hostless and wildcard API addresses
