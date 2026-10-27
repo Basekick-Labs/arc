@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -35,29 +36,59 @@ const batchSize = 1000
 // material; RedactCredentialText decides.
 const candidates = `(%[1]s LIKE '%%sig=%%' OR %[1]s LIKE '%%SharedAccessSignature%%' OR %[1]s LIKE '%%AccountKey=%%' OR %[1]s LIKE '%%://%%?%%')`
 
-// Run rewrites stored error text through storage.RedactCredentialText. It is
-// idempotent and cheap when there is nothing to change, so it runs at every
-// start rather than once behind a marker. It returns the number of rows
-// rewritten; an error stops the scrub of that column only.
+// markerTable records the columns already scrubbed in this database, so the
+// pass runs once per column: error text written by this version is clean at
+// the source, and re-reading every old row at every start would delay
+// readiness on a large history.
+const markerTable = "arc_credential_scrub"
+
+// Run rewrites stored error text through storage.RedactCredentialText, once
+// per column per database. It returns the number of rows rewritten; an error
+// stops the scrub of that column only, which is then retried at the next
+// start.
 func Run(ctx context.Context, db *sql.DB, logger zerolog.Logger) (int, error) {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+markerTable+` (col TEXT PRIMARY KEY, done_at TIMESTAMP)`); err != nil {
+		return 0, err
+	}
 	total := 0
 	var firstErr error
 	for _, c := range columns {
-		ok, err := columnExists(ctx, db, c)
-		if err != nil || !ok {
-			if err != nil && firstErr == nil {
+		key := c.table + "." + c.name
+		var done int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+markerTable+` WHERE col = ?`, key).Scan(&done); err != nil {
+			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		n, err := scrubColumn(ctx, db, c)
-		total += n
+		if done > 0 {
+			continue
+		}
+		ok, err := columnExists(ctx, db, c)
 		if err != nil {
 			logger.Warn().Err(err).Str("table", c.table).Str("column", c.name).
-				Msg("Could not finish clearing credential text from stored errors; it will be retried at the next start")
+				Msg("Could not inspect a table holding stored error messages; it will be retried at the next start")
 			if firstErr == nil {
 				firstErr = err
 			}
+			continue
+		}
+		if ok {
+			n, err := scrubColumn(ctx, db, c)
+			total += n
+			if err != nil {
+				logger.Warn().Err(err).Str("table", c.table).Str("column", c.name).
+					Msg("Could not finish clearing credential text from stored errors; it will be retried at the next start")
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+		}
+		// Absent columns are marked too: a table created by this version
+		// only ever holds clean text.
+		if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO `+markerTable+` (col, done_at) VALUES (?, ?)`, key, time.Now().UTC()); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	if total > 0 {
@@ -94,7 +125,10 @@ func scrubColumn(ctx context.Context, db *sql.DB, c column) (int, error) {
 	col := fmt.Sprintf("%q", c.name)
 	sel := fmt.Sprintf(`SELECT rowid, %s FROM %q WHERE rowid > ? AND %s ORDER BY rowid LIMIT %d`,
 		col, c.table, fmt.Sprintf(candidates, col), batchSize)
-	upd := fmt.Sprintf(`UPDATE %q SET %s = ? WHERE rowid = ?`, c.table, col)
+	// Only if the text is still what was read: a subsystem running alongside
+	// (an MQTT subscription clearing its error, a retry recording a new one)
+	// must not have its write replaced by a stale, scrubbed copy.
+	upd := fmt.Sprintf(`UPDATE %q SET %s = ? WHERE rowid = ? AND %s = ?`, c.table, col, col)
 	changed := 0
 	var after int64
 	for {
@@ -133,7 +167,7 @@ func scrubColumn(ctx context.Context, db *sql.DB, c column) (int, error) {
 		}
 		for _, r := range batch {
 			if clean := storage.RedactCredentialText(r.text); clean != r.text {
-				if _, err := tx.ExecContext(ctx, upd, clean, r.id); err != nil {
+				if _, err := tx.ExecContext(ctx, upd, clean, r.id, r.text); err != nil {
 					_ = tx.Rollback()
 					return changed, err
 				}

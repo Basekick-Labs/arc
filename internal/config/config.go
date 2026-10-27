@@ -1487,6 +1487,11 @@ func Load() (*Config, error) {
 	cfg.Storage.S3Region = strings.TrimSpace(cfg.Storage.S3Region)
 	cfg.Storage.S3Endpoint = strings.TrimSpace(cfg.Storage.S3Endpoint)
 	cfg.Storage.AzureConnectionString = strings.TrimSpace(cfg.Storage.AzureConnectionString)
+	// Credentials too: a value read from a file usually ends in a newline,
+	// and every consumer (the backend, the DuckDB secret, the compaction
+	// subprocess) must see the same string.
+	cfg.Storage.AzureAccountKey = strings.TrimSpace(cfg.Storage.AzureAccountKey)
+	cfg.Storage.AzureSASToken = strings.TrimSpace(cfg.Storage.AzureSASToken)
 	cfg.Storage.AzureAccountName = strings.TrimSpace(cfg.Storage.AzureAccountName)
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
 	cfg.Storage.AzurePrefix = strings.TrimSpace(cfg.Storage.AzurePrefix)
@@ -1570,6 +1575,8 @@ func Load() (*Config, error) {
 		cold.S3Region = strings.TrimSpace(cold.S3Region)
 		cold.S3Endpoint = strings.TrimSpace(cold.S3Endpoint)
 		cold.AzureConnectionString = strings.TrimSpace(cold.AzureConnectionString)
+		cold.AzureAccountKey = strings.TrimSpace(cold.AzureAccountKey)
+		cold.AzureSASToken = strings.TrimSpace(cold.AzureSASToken)
 		cold.AzureAccountName = strings.TrimSpace(cold.AzureAccountName)
 		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
 		cold.AzurePrefix = strings.TrimSpace(cold.AzurePrefix)

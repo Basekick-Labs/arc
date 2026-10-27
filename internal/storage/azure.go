@@ -136,7 +136,8 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 	connectionString := strings.TrimSpace(cfg.ConnectionString)
 	sasToken := strings.TrimPrefix(strings.TrimSpace(cfg.SASToken), "?")
 	accountKey := strings.TrimSpace(cfg.AccountKey)
-	if hasControlChar(connectionString) || hasControlChar(sasToken) || hasControlChar(accountKey) || hasControlChar(cfg.Endpoint) {
+	endpointValue := strings.TrimSpace(cfg.Endpoint)
+	if hasControlChar(connectionString) || hasControlChar(sasToken) || hasControlChar(accountKey) || hasControlChar(endpointValue) {
 		return nil, fmt.Errorf("Azure credential configuration contains a control character; check the connection string, SAS token, account key and endpoint values")
 	}
 	secrets := azureCredentialSecrets(connectionString, sasToken, accountKey)
@@ -157,8 +158,8 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 
 	case cfg.AccountName != "" && sasToken != "":
 		// SAS token authentication
-		if cfg.Endpoint != "" {
-			endpoint = cfg.Endpoint
+		if endpointValue != "" {
+			endpoint = endpointValue
 		} else {
 			endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", cfg.AccountName)
 		}
@@ -176,8 +177,8 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 
 	case cfg.AccountName != "" && accountKey != "":
 		// Shared key authentication
-		if cfg.Endpoint != "" {
-			endpoint = cfg.Endpoint
+		if endpointValue != "" {
+			endpoint = endpointValue
 		} else {
 			endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", cfg.AccountName)
 		}
@@ -193,8 +194,8 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 
 	case cfg.UseManagedIdentity && cfg.AccountName != "":
 		// Managed Identity authentication
-		if cfg.Endpoint != "" {
-			endpoint = cfg.Endpoint
+		if endpointValue != "" {
+			endpoint = endpointValue
 		} else {
 			endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", cfg.AccountName)
 		}
@@ -342,7 +343,7 @@ func (b *AzureBlobBackend) writeReader(ctx context.Context, path string, reader 
 	if err != nil {
 		recordStorageError(ctx, err)
 		b.logger.Error().
-			Err(err).
+			Err(redactError(err, b.secrets...)).
 			Str("path", path).
 			Int64("size", size).
 			Msg("Failed to write to Azure Blob Storage")
@@ -635,7 +636,7 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) (ret
 				blobName = strings.TrimPrefix(*item.BlobName, b.prefix)
 			}
 			b.logger.Warn().
-				Err(item.Error).
+				Err(redactError(item.Error, b.secrets...)).
 				Str("blob", blobName).
 				Msg("Azure batch: individual delete failed")
 			nonFatalErrs = append(nonFatalErrs, fmt.Errorf("%s: %w", blobName, item.Error))
