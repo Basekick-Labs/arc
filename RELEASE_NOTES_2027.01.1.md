@@ -1831,7 +1831,7 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column (PRNUM)
+### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column ([#1409](https://github.com/Basekick-Labs/arc/pull/1409))
 
 With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes each
 file within one hour, sorted by the keys and then time. The daily compaction
