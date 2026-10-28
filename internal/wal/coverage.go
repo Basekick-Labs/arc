@@ -133,20 +133,23 @@ func (w *Writer) PrepareCovered(database, key string, payload []byte) (*Prepared
 	}
 	p := &PreparedAppend{w: w, key: key, entries: make([]preparedEntry, 0, len(chunks))}
 	for i, chunk := range chunks {
-		logical := envelopePayload(dbBytes, chunk)
+		logicalLen := 3 + len(dbBytes) + len(chunk)
 		// Allocation and publication as pending are one step; see
 		// appendTrackedEntry.
 		w.pendingMu.Lock()
 		seq := atomic.AddUint64(&w.trackedSequence, 1)
 		w.pendingSeqs[seq] = struct{}{}
 		w.pendingMu.Unlock()
-		payloadLen := walTrackedHeaderSize + len(logical) + coverageTrailerLen(key)
+		payloadLen := walTrackedHeaderSize + logicalLen + coverageTrailerLen(key)
 		data := make([]byte, WALEntryHeaderSize+payloadLen)
 		body := data[WALEntryHeaderSize:]
 		body[0] = WALCoveredMarker
 		binary.BigEndian.PutUint64(body[1:9], w.trackedInstance)
 		binary.BigEndian.PutUint64(body[9:17], seq)
-		off := walTrackedHeaderSize + copy(body[walTrackedHeaderSize:], logical)
+		// Envelope header and chunk go straight into the entry: no separate
+		// logical buffer to allocate and copy from.
+		off := walTrackedHeaderSize + putEnvelopeHeader(body[walTrackedHeaderSize:], dbBytes)
+		off += copy(body[off:], chunk)
 		off += copy(body[off:], key)
 		binary.BigEndian.PutUint16(body[off:], uint16(len(key)))
 		binary.BigEndian.PutUint16(body[off+2:], uint16(i))
@@ -159,7 +162,7 @@ func (w *Writer) PrepareCovered(database, key string, payload []byte) (*Prepared
 			seq:       seq,
 			token:     fmt.Sprintf("%016x%016x", w.trackedInstance, seq),
 			prefixCRC: crc32.ChecksumIEEE(body[:len(body)-8]),
-			logical:   body[walTrackedHeaderSize : walTrackedHeaderSize+len(logical)],
+			logical:   body[walTrackedHeaderSize : walTrackedHeaderSize+logicalLen],
 			ts:        ts,
 			chunk:     uint16(i),
 		})

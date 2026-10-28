@@ -450,7 +450,8 @@ type ReplicationEntry struct {
 	// TimestampUS is the entry timestamp in microseconds since epoch
 	TimestampUS uint64
 
-	// Payload is the raw msgpack data
+	// Payload is the entry's logical payload: the msgpack data, preceded by the
+	// database envelope header for entries written with one.
 	Payload []byte
 
 	// Coverage identifies the ingest batch the entry belongs to, for entries
@@ -1414,7 +1415,7 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 		if !trackedPayloadFits(len(chunk), 0) {
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		token, err := w.appendTrackedEntry(chunk)
+		token, err := w.appendTrackedEntry(nil, chunk)
 		if err != nil {
 			// The chunks that already landed are pending in the floor, and
 			// their tokens go out of scope with this slice — the caller gets
@@ -1444,12 +1445,14 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 			return nil, oversizedPayloadError(err)
 		}
 	}
+	var envBuf [3 + 255]byte
+	envHeader := envBuf[:putEnvelopeHeader(envBuf[:], dbBytes)]
 	var hashes []string
 	for _, chunk := range chunks {
 		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
+		token, err := w.appendTrackedEntry(envHeader, chunk)
 		if err != nil {
 			// The chunks that already landed are pending in the floor, and
 			// their tokens go out of scope with this slice — the caller gets
@@ -1582,13 +1585,13 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, rel
 	return nil
 }
 
-func envelopePayload(dbBytes, payload []byte) []byte {
-	out := make([]byte, 3+len(dbBytes)+len(payload))
-	out[0] = WALEnvelopeMarker
-	binary.BigEndian.PutUint16(out[1:3], uint16(len(dbBytes)))
-	copy(out[3:], dbBytes)
-	copy(out[3+len(dbBytes):], payload)
-	return out
+// putEnvelopeHeader writes the envelope header for dbBytes (marker, length,
+// name) at the start of dst and returns its length. dst must have room for
+// 3+len(dbBytes) bytes; callers check the 255-byte name limit first.
+func putEnvelopeHeader(dst, dbBytes []byte) int {
+	dst[0] = WALEnvelopeMarker
+	binary.BigEndian.PutUint16(dst[1:3], uint16(len(dbBytes)))
+	return 3 + copy(dst[3:], dbBytes)
 }
 
 func payloadHash(payload []byte) string {
@@ -1600,7 +1603,13 @@ func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
 	return payloadLen <= MaxWALPayloadSize-walTrackedHeaderSize-envelopeHeaderLen
 }
 
-func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
+// appendTrackedEntry appends one tracked entry whose logical payload is
+// envHeader followed by payload (envHeader is nil for entries without an
+// envelope). The entry is built in a single allocation: entry header, tracked
+// header, then the logical payload. The tracked region is byte-identical to the
+// separate trackedPayload this used to assemble, so the CRC and the bytes on
+// disk are unchanged; only the two intermediate copies are gone.
+func (w *Writer) appendTrackedEntry(envHeader, payload []byte) (string, error) {
 	// Allocating the sequence and publishing it as pending must be one step.
 	// Everything after this — the Sprintf, the CRC, and above all the
 	// synchronous replication hook below — sits between them otherwise, and a
@@ -1612,19 +1621,23 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	w.pendingSeqs[seq] = struct{}{}
 	w.pendingMu.Unlock()
 	token := fmt.Sprintf("%016x%016x", w.trackedInstance, seq)
-	trackedPayload := make([]byte, walTrackedHeaderSize+len(logicalPayload))
-	trackedPayload[0] = WALTrackedMarker
-	binary.BigEndian.PutUint64(trackedPayload[1:9], w.trackedInstance)
-	binary.BigEndian.PutUint64(trackedPayload[9:17], seq)
-	copy(trackedPayload[17:], logicalPayload)
-	checksum := crc32.ChecksumIEEE(trackedPayload)
+	trackedLen := walTrackedHeaderSize + len(envHeader) + len(payload)
+	entryData := make([]byte, WALEntryHeaderSize+trackedLen)
+	tracked := entryData[WALEntryHeaderSize:]
+	tracked[0] = WALTrackedMarker
+	binary.BigEndian.PutUint64(tracked[1:9], w.trackedInstance)
+	binary.BigEndian.PutUint64(tracked[9:17], seq)
+	off := walTrackedHeaderSize + copy(tracked[walTrackedHeaderSize:], envHeader)
+	copy(tracked[off:], payload)
+	checksum := crc32.ChecksumIEEE(tracked)
 	timestampUS := uint64(time.Now().UnixMicro())
-	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: logicalPayload})
-	entryData := make([]byte, WALEntryHeaderSize+len(trackedPayload))
-	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(trackedPayload)))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(trackedLen))
 	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
 	binary.BigEndian.PutUint32(entryData[12:16], checksum)
-	copy(entryData[WALEntryHeaderSize:], trackedPayload)
+	// The hook gets the logical payload as a view into entryData, which is
+	// never written again after this point (PrepareCovered hands the hook the
+	// same kind of view). It still runs before the entry is enqueued.
+	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: tracked[walTrackedHeaderSize:]})
 	// Carry the sequence so the writer loop can record it against the file the
 	// write actually lands in (#1009).
 	if err := w.tryEnqueueEntry(walEntry{data: entryData, seq: seq}); err != nil {
@@ -1787,7 +1800,7 @@ func (w *Writer) AppendRawTracked(payload []byte) ([]string, error) {
 			w.releasePending(hashes)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		hash, err := w.appendTrackedEntry(chunk)
+		hash, err := w.appendTrackedEntry(nil, chunk)
 		if err != nil {
 			w.releasePending(hashes)
 			return nil, err
