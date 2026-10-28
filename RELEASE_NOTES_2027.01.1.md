@@ -1831,6 +1831,28 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A sort key the data has no column for no longer leaves the file unsorted (PRNUM)
+
+With `ingest.sort_keys` or `ingest.default_sort_keys` set, a flush whose rows
+had no column for one of the keys failed its sort, and the flush wrote the
+rows in arrival order: not sorted by the other keys, and not by time either,
+which also cost time-range pruning inside the file. Nothing was logged. (The
+documentation said such a flush fails; it never did, and no rows were lost.)
+
+- **The flush now sorts by the keys it has a column for, then time,** and
+  leaves the missing key out. A key configured for the measurement in
+  `ingest.sort_keys` is logged at Warn, once a minute per measurement, naming
+  the key. A key from `ingest.default_sort_keys` is logged at Debug: it applies
+  to every measurement without its own entry, and many do not have that
+  column.
+- **Key names match case-insensitively**, as compaction already binds them,
+  so a key configured as `Host` sorts a `host` column at ingest too. Before,
+  ingest left such a key out while compaction used it.
+- **If a sort still fails, the flush is written sorted by time** and logged at
+  Error, once a minute per measurement, instead of unsorted and silent.
+- Appending `time` to the sort keys no longer writes into the configuration's
+  own list, which concurrent flushes share.
+
 ### Azure Blob Storage error messages are shorter
 
 Errors from the Azure Blob Storage backend are shorter. Azure credential

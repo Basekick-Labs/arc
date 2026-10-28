@@ -69,7 +69,7 @@ func TestMergeSortedByTimeMatchesMergeThenSort(t *testing.T) {
 		require.True(t, ok, "iteration %d not eligible", iter)
 		merged, err := b.mergeBatches(batches)
 		require.NoError(t, err)
-		want := sortTypedColumnBatchByKeys(merged, []string{"time"})
+		want, _ := sortTypedColumnBatchByKeys(merged, []string{"time"})
 		rows := len(want.Data["time"].([]int64))
 		require.Equal(t, normalize(want, rows), normalize(got, rows), "iteration %d", iter)
 		_, has := got.Data["_x"]

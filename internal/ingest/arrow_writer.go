@@ -1816,8 +1816,12 @@ func (b *ArrowBuffer) getSortKeys(measurement string) []string {
 		}
 	}
 
-	// Append "time" - users configure ADDITIONAL sort keys only
-	return append(keys, "time")
+	// Append "time" - users configure ADDITIONAL sort keys only. Into a new
+	// slice: keys is the shared config slice, and appending in place would
+	// write into its spare capacity from concurrent flushes.
+	out := make([]string, len(keys), len(keys)+1)
+	copy(out, keys)
+	return append(out, "time")
 }
 
 // getDecimalColumns returns the decimal column config for a measurement.
@@ -4632,8 +4636,9 @@ func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferK
 // Called by both async (flushWithDataTimePartitioning) and sync (flushBufferLockedDataTime) paths
 // Uses hash-based grouping to partition by hour, then sorts each hour independently
 func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, database, measurement string, merged *TypedColumnBatch, recordCount int, flushType string, startTime time.Time, group *flushGroup) error {
-	// Get sort keys for this measurement (guaranteed to include "time")
-	sortKeys := b.getSortKeys(measurement)
+	// Sort keys for this flush (always include "time"; keys the flush has no
+	// column for are left out, see flushSortKeys).
+	sortKeys := b.flushSortKeys(database, measurement, merged.Data)
 
 	// Get decimal column config for this measurement (nil if none configured)
 	decimalCols := b.getDecimalColumns(measurement)
@@ -4698,7 +4703,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	maxHour := maxTime.Truncate(time.Hour)
 	if minHour.Equal(maxHour) {
 		// Single hour - sort once and write one file
-		sorted := sortTypedColumnBatchByKeys(merged, sortKeys)
+		sorted := b.sortFlushBatch(database, measurement, merged, sortKeys)
 
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
 		if err != nil {
@@ -4778,7 +4783,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		hourBatch := sliceTypedColumnBatchByIndices(merged, bucket.indices)
 
 		// Sort this hour's data by configured sort keys
-		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
+		sorted := b.sortFlushBatch(database, measurement, hourBatch, sortKeys)
 
 		// Write Parquet file for this hour
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
@@ -5567,15 +5572,19 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 // keeping validity bitmaps aligned with the reordered data.
 // Uses the permutation returned by sortColumnsByKeysWithPermutation to avoid
 // a second sort pass when validity bitmaps need reordering.
-func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *TypedColumnBatch {
+//
+// On error it returns the batch unchanged with the error; the caller decides
+// what to write. It used to return the batch silently, so a key the flush had
+// no column for wrote the file unsorted, not even by time.
+func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) (*TypedColumnBatch, error) {
 	sorted, indices, err := sortColumnsByKeysWithPermutation(batch.Data, sortKeys)
 	if err != nil {
-		return batch
+		return batch, err
 	}
 
 	// nil indices means data was already sorted — no permutation needed
 	if indices == nil || batch.Validity == nil {
-		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}, nil
 	}
 
 	// Apply the same permutation to validity bitmaps (no second sort)
@@ -5593,7 +5602,102 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 		sortedValidity[name] = newValid
 	}
 
-	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}, nil
+}
+
+// sortFlushBatch sorts a flush's rows for writing. It never drops data: if the
+// sort by the flush's keys fails, it logs (once a minute per measurement) and
+// sorts by time alone, and if that fails too, it writes the rows as they are.
+func (b *ArrowBuffer) sortFlushBatch(database, measurement string, batch *TypedColumnBatch, sortKeys []string) *TypedColumnBatch {
+	sorted, err := sortTypedColumnBatchByKeys(batch, sortKeys)
+	if err == nil {
+		return sorted
+	}
+	if b.warnOncePerMinute("sort-failed", database, measurement, time.Now()) {
+		b.logger.Error().Err(err).
+			Str("database", database).
+			Str("measurement", measurement).
+			Strs("sort_keys", sortKeys).
+			Msg("Sorting a flush by its sort keys failed; writing it sorted by time only")
+	}
+	if len(sortKeys) == 1 && sortKeys[0] == "time" {
+		return batch
+	}
+	if byTime, err := sortTypedColumnBatchByKeys(batch, []string{"time"}); err == nil {
+		return byTime
+	}
+	return batch
+}
+
+// flushSortKeys returns the sort keys for a flush of measurement: its
+// configured keys that the flush has a column for, then "time". A key with no
+// column cannot be sorted on; it is left out of this flush rather than failing
+// the whole sort. Names match case-insensitively, as compaction (DuckDB) binds
+// them, and the flush's own spelling is used. A key configured for this
+// measurement in ingest.sort_keys and missing is logged at Warn once a minute;
+// one from ingest.default_sort_keys at Debug, since measurements without that
+// column are normal. The result is a new slice when anything is left out.
+func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[string]interface{}) []string {
+	keys := b.getSortKeys(measurement)
+	var lower map[string]string // built only if a key is not an exact match
+	var resolved, missing []string
+	changed := false
+	for i, key := range keys {
+		if _, ok := data[key]; ok {
+			if resolved != nil {
+				resolved = append(resolved, key)
+			}
+			continue
+		}
+		if lower == nil {
+			lower = make(map[string]string, len(data))
+			for name := range data {
+				lower[asciiLowerKey(name)] = name
+			}
+		}
+		if resolved == nil {
+			resolved = append(make([]string, 0, len(keys)), keys[:i]...)
+		}
+		changed = true
+		if name, ok := lower[asciiLowerKey(key)]; ok {
+			resolved = append(resolved, name)
+		} else {
+			missing = append(missing, key)
+		}
+	}
+	if !changed {
+		return keys
+	}
+	if len(missing) > 0 && b.warnOncePerMinute("sort-key-missing", database, measurement, time.Now()) {
+		_, explicit := b.sortKeysConfig[measurement]
+		ev := b.logger.Debug()
+		if explicit {
+			ev = b.logger.Warn()
+		}
+		ev.Str("database", database).
+			Str("measurement", measurement).
+			Strs("missing_sort_keys", missing).
+			Strs("sort_keys", resolved).
+			Msg("Flushing without sort keys this data has no column for")
+	}
+	return resolved
+}
+
+// asciiLowerKey lower-cases ASCII letters only, like DuckDB's identifier
+// matching (and compaction's asciiLower).
+func asciiLowerKey(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; 'A' <= c && c <= 'Z' {
+			bs := []byte(s)
+			for j := i; j < len(bs); j++ {
+				if 'A' <= bs[j] && bs[j] <= 'Z' {
+					bs[j] += 'a' - 'A'
+				}
+			}
+			return string(bs)
+		}
+	}
+	return s
 }
 
 // sliceTypedColumnBatchByIndices extracts rows from a TypedColumnBatch by index list,
