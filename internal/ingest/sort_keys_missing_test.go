@@ -55,6 +55,15 @@ func TestFlushSortKeys(t *testing.T) {
 		}
 	})
 
+	t.Run("a key resolving to a listed column is not repeated", func(t *testing.T) {
+		var logs bytes.Buffer
+		b := sortKeysBuffer(&logs, map[string][]string{"m": {"Time"}, "n": {"host", "HOST"}}, []string{"time"})
+		// "Time" resolves to time, already last: a time-only sort, which
+		// takes the radix fast path.
+		require.Equal(t, []string{"time"}, b.flushSortKeys("d", "m", data))
+		require.Equal(t, []string{"host", "time"}, b.flushSortKeys("d", "n", data))
+	})
+
 	t.Run("default_sort_keys missing key: dropped, Debug", func(t *testing.T) {
 		var logs bytes.Buffer
 		b := sortKeysBuffer(&logs, map[string][]string{}, []string{"site"})

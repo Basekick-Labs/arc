@@ -1837,21 +1837,22 @@ With `ingest.sort_keys` or `ingest.default_sort_keys` set, a flush whose rows
 had no column for one of the keys failed its sort, and the flush wrote the
 rows in arrival order: not sorted by the other keys, and not by time either,
 which also cost time-range pruning inside the file. Nothing was logged. (The
-documentation said such a flush fails; it never did, and no rows were lost.)
+documentation said such a flush fails; it never did, and no rows were
+lost.)
 
 - **The flush now sorts by the keys it has a column for, then time,** and
   leaves the missing key out. A key configured for the measurement in
   `ingest.sort_keys` is logged at Warn, once a minute per measurement, naming
   the key. A key from `ingest.default_sort_keys` is logged at Debug: it applies
   to every measurement without its own entry, and many do not have that
-  column.
+  column. Compaction leaves such a key out of that partition's order as well
+  ([#1409](https://github.com/Basekick-Labs/arc/pull/1409)); before, it failed
+  the partition's compaction on every cycle.
 - **Key names match case-insensitively**, as compaction already binds them,
   so a key configured as `Host` sorts a `host` column at ingest too. Before,
-  ingest left such a key out while compaction used it.
-- **If a sort still fails, the flush is written sorted by time** and logged at
-  Error, once a minute per measurement, instead of unsorted and silent.
-- Appending `time` to the sort keys no longer writes into the configuration's
-  own list, which concurrent flushes share.
+  such a key failed the sort, and the file was written unsorted.
+- **Should a sort ever fail, the flush is written sorted by time** and logged
+  at Error, once a minute per measurement, rather than unsorted and silent.
 
 ### Azure Blob Storage error messages are shorter
 

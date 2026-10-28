@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -5609,6 +5610,9 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) (*Ty
 // sortFlushBatch sorts a flush's rows for writing. It never drops data: if the
 // sort by the flush's keys fails, it logs (once a minute per measurement) and
 // sorts by time alone, and if that fails too, it writes the rows as they are.
+// A safety net: with keys from flushSortKeys (every one resolved against the
+// flush's columns) and "time" checked as []int64, the sort has no error left
+// to return today; this keeps a future one from writing a file unsorted.
 func (b *ArrowBuffer) sortFlushBatch(database, measurement string, batch *TypedColumnBatch, sortKeys []string) *TypedColumnBatch {
 	sorted, err := sortTypedColumnBatchByKeys(batch, sortKeys)
 	if err == nil {
@@ -5637,7 +5641,11 @@ func (b *ArrowBuffer) sortFlushBatch(database, measurement string, batch *TypedC
 // them, and the flush's own spelling is used. A key configured for this
 // measurement in ingest.sort_keys and missing is logged at Warn once a minute;
 // one from ingest.default_sort_keys at Debug, since measurements without that
-// column are normal. The result is a new slice when anything is left out.
+// column are normal (compaction leaves it out of the partition's order too).
+// A key resolving to a column already in the list is dropped, so "Time" or
+// a key listed twice does not take the multi-key sort for a time-only one.
+// The result is a new slice when anything changed; otherwise it may be the
+// shared config slice, which callers only read.
 func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[string]interface{}) []string {
 	keys := b.getSortKeys(measurement)
 	var lower map[string]string // built only if a key is not an exact match
@@ -5654,8 +5662,11 @@ func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[strin
 			lower = make(map[string]string, len(data))
 			for name := range data {
 				// Two columns that differ only in case: take the smaller
-				// name, so the choice does not depend on map order.
-				l := asciiLowerKey(name)
+				// name, so the choice does not depend on map order. Ingest
+				// refuses such twins (#1342), so only data written before
+				// that has them; DuckDB may bind the other one in
+				// compaction, which is harmless for an order.
+				l := FoldColumnName(name)
 				if prev, ok := lower[l]; !ok || name < prev {
 					lower[l] = name
 				}
@@ -5665,7 +5676,7 @@ func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[strin
 			resolved = append(make([]string, 0, len(keys)), keys[:i]...)
 		}
 		changed = true
-		if name, ok := lower[asciiLowerKey(key)]; ok {
+		if name, ok := lower[FoldColumnName(key)]; ok {
 			resolved = append(resolved, name)
 		} else {
 			missing = append(missing, key)
@@ -5674,13 +5685,19 @@ func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[strin
 	if !changed {
 		return keys
 	}
-	if len(missing) > 0 && b.warnOncePerMinute("sort-key-missing", database, measurement, time.Now()) {
-		_, explicit := b.sortKeysConfig[measurement]
-		ev := b.logger.Debug()
-		if explicit {
-			ev = b.logger.Warn()
-		}
-		ev.Str("database", database).
+	resolved = dedupeKeys(resolved)
+	if len(missing) == 0 {
+		return resolved
+	}
+	_, explicit := b.sortKeysConfig[measurement]
+	lvl := zerolog.DebugLevel
+	if explicit {
+		lvl = zerolog.WarnLevel
+	}
+	// Check the level before the limiter: with Debug off, a default key most
+	// measurements lack would otherwise touch the limiter on every flush.
+	if b.logger.GetLevel() <= lvl && b.warnOncePerMinute("sort-key-missing", database, measurement, time.Now()) {
+		b.logger.WithLevel(lvl).Str("database", database).
 			Str("measurement", measurement).
 			Strs("missing_sort_keys", missing).
 			Strs("sort_keys", resolved).
@@ -5689,21 +5706,15 @@ func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[strin
 	return resolved
 }
 
-// asciiLowerKey lower-cases ASCII letters only, like DuckDB's identifier
-// matching (and compaction's asciiLower).
-func asciiLowerKey(s string) string {
-	for i := 0; i < len(s); i++ {
-		if c := s[i]; 'A' <= c && c <= 'Z' {
-			bs := []byte(s)
-			for j := i; j < len(bs); j++ {
-				if 'A' <= bs[j] && bs[j] <= 'Z' {
-					bs[j] += 'a' - 'A'
-				}
-			}
-			return string(bs)
+// dedupeKeys removes repeated names, keeping the first, in place.
+func dedupeKeys(keys []string) []string {
+	out := keys[:0]
+	for _, k := range keys {
+		if !slices.Contains(out, k) {
+			out = append(out, k)
 		}
 	}
-	return s
+	return out
 }
 
 // sliceTypedColumnBatchByIndices extracts rows from a TypedColumnBatch by index list,
