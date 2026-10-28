@@ -1831,6 +1831,35 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Ingest with sort keys is as fast as without them (PRNUM)
+
+A flush sorted by `ingest.sort_keys` (or `ingest.default_sort_keys`) went
+through a comparison sort that checked each key column's type on every one of
+its comparisons: 2.6 s for a 5M-row flush sorted by two tag columns and time,
+against 0.21 s for time alone. On a sustained load that was most of the cost
+of sort keys at ingest.
+
+- **The sort is now one linear, stable pass per key**: a radix sort for
+  integer and float keys, and for tag (string and binary) keys a counting sort
+  on each value's rank among the flush's distinct values. A key with more
+  distinct values than a quarter of the flush's rows, such as an id, is sorted
+  by comparison instead, which keeps memory bounded. Rows already in order are
+  not copied, as with time-only sorting.
+- **Measured**, sorting a flush by `fleet, name, time` (10,000 names): 50,000
+  rows (the default flush size) 13.9 ms to 6.3 ms; 1M rows 445 ms to 77 ms;
+  5M rows 2.60 s to 0.51 s. The sort uses about a fifth more memory while it
+  runs.
+- **End to end**, loading 155.6M TSBS IoT rows with
+  `sort_keys = ["readings:fleet,name", "diagnostics:fleet,name"]` and
+  `wal.ack_mode = "durable"`: 36.6 s (29.7 to 49.0 across three runs) before,
+  25.4 s (25.3 to 25.7) now, against 26.1 s with no sort keys. Rows were
+  queryable after 27.9 s, against 44.2 s before.
+- **Order changes only where it was undefined.** Rows equal on every key now
+  keep their arrival order (the old sort did not promise any). A float sort
+  key orders -0 and +0 as equal and NaN after +Infinity; the old sort treated
+  NaN as equal to every value, which left the order of rows with NaN keys
+  unspecified.
+
 ### Azure Blob Storage error messages are shorter
 
 Errors from the Azure Blob Storage backend are shorter. Azure credential
