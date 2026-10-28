@@ -48,8 +48,11 @@ type SubprocessJobConfig struct {
 	// raws next to the compacted output — permanent duplication. With it, a
 	// surviving manifest re-fires the marks through recovery (idempotent).
 	ParentFinalizesManifest bool     `json:"parent_finalizes_manifest,omitempty"`
-	SortKeys                []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
-	MemoryLimit             string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
+	SortKeys                []string `json:"sort_keys"` // Sort keys for ORDER BY in compaction
+	// SortKeysExplicit — see Job.SortKeysExplicit. Omitted (false) from an
+	// older parent, which only lowers the missing-key log to Debug.
+	SortKeysExplicit bool   `json:"sort_keys_explicit,omitempty"`
+	MemoryLimit      string `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 	// Threads is the DuckDB thread count for this subprocess. 0 means leave
 	// DuckDB at its own default, which is the container's CPU quota where there
 	// is one and all cores where there is not — the parent normally sends the
@@ -680,18 +683,19 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 // the job writing the output under the name the parent registered).
 func subprocessJobConfig(config *SubprocessJobConfig, backend storage.Backend, logger zerolog.Logger, db *sql.DB, manifestManager *ManifestManager) *JobConfig {
 	return &JobConfig{
-		Database:        config.Database,
-		Measurement:     config.Measurement,
-		PartitionPath:   config.PartitionPath,
-		Files:           config.Files,
-		StorageBackend:  backend,
-		Tier:            config.Tier,
-		BatchNumber:     config.BatchNumber,
-		TempDirectory:   config.TempDirectory,
-		SortKeys:        config.SortKeys,
-		Logger:          logger,
-		DB:              db,
-		ManifestManager: manifestManager,
+		Database:         config.Database,
+		Measurement:      config.Measurement,
+		PartitionPath:    config.PartitionPath,
+		Files:            config.Files,
+		StorageBackend:   backend,
+		Tier:             config.Tier,
+		BatchNumber:      config.BatchNumber,
+		TempDirectory:    config.TempDirectory,
+		SortKeys:         config.SortKeys,
+		SortKeysExplicit: config.SortKeysExplicit,
+		Logger:           logger,
+		DB:               db,
+		ManifestManager:  manifestManager,
 		// Phase 4: thread cluster-mode fields through to the job. When
 		// CompletionDir is empty (OSS / standalone), clusterMode() is
 		// false and the completion-manifest writes are no-ops.

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1816,8 +1817,12 @@ func (b *ArrowBuffer) getSortKeys(measurement string) []string {
 		}
 	}
 
-	// Append "time" - users configure ADDITIONAL sort keys only
-	return append(keys, "time")
+	// Append "time" - users configure ADDITIONAL sort keys only. Into a new
+	// slice: keys is the shared config slice, and appending in place would
+	// write into its spare capacity from concurrent flushes.
+	out := make([]string, len(keys), len(keys)+1)
+	copy(out, keys)
+	return append(out, "time")
 }
 
 // getDecimalColumns returns the decimal column config for a measurement.
@@ -4632,9 +4637,6 @@ func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferK
 // Called by both async (flushWithDataTimePartitioning) and sync (flushBufferLockedDataTime) paths
 // Uses hash-based grouping to partition by hour, then sorts each hour independently
 func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, database, measurement string, merged *TypedColumnBatch, recordCount int, flushType string, startTime time.Time, group *flushGroup) error {
-	// Get sort keys for this measurement (guaranteed to include "time")
-	sortKeys := b.getSortKeys(measurement)
-
 	// Get decimal column config for this measurement (nil if none configured)
 	decimalCols := b.getDecimalColumns(measurement)
 
@@ -4643,6 +4645,11 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	if !ok || len(times) == 0 {
 		return fmt.Errorf("no time data in batch")
 	}
+
+	// Sort keys for this flush: "time" plus the configured keys the flush has
+	// a column for (see flushSortKeys). After the time check, so a flush
+	// without time fails with that error rather than a sort-key log.
+	sortKeys := b.flushSortKeys(database, measurement, merged.Data)
 
 	// Cheap O(n) min/max scan to decide single- vs multi-hour. The full per-hour
 	// bucketing (groupByHour) allocates an index slice covering every row and is only
@@ -4698,7 +4705,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	maxHour := maxTime.Truncate(time.Hour)
 	if minHour.Equal(maxHour) {
 		// Single hour - sort once and write one file
-		sorted := sortTypedColumnBatchByKeys(merged, sortKeys)
+		sorted := b.sortFlushBatch(database, measurement, merged, sortKeys)
 
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
 		if err != nil {
@@ -4778,7 +4785,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		hourBatch := sliceTypedColumnBatchByIndices(merged, bucket.indices)
 
 		// Sort this hour's data by configured sort keys
-		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
+		sorted := b.sortFlushBatch(database, measurement, hourBatch, sortKeys)
 
 		// Write Parquet file for this hour
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
@@ -5576,15 +5583,19 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 // keeping validity bitmaps aligned with the reordered data.
 // Uses the permutation returned by sortColumnsByKeysWithPermutation to avoid
 // a second sort pass when validity bitmaps need reordering.
-func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *TypedColumnBatch {
+//
+// On error it returns the batch unchanged with the error; the caller decides
+// what to write. It used to return the batch silently, so a key the flush had
+// no column for wrote the file unsorted, not even by time.
+func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) (*TypedColumnBatch, error) {
 	sorted, indices, err := sortColumnsByKeysWithPermutation(batch.Data, sortKeys)
 	if err != nil {
-		return batch
+		return batch, err
 	}
 
 	// nil indices means data was already sorted — no permutation needed
 	if indices == nil || batch.Validity == nil {
-		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}, nil
 	}
 
 	// Apply the same permutation to validity bitmaps (no second sort)
@@ -5602,7 +5613,117 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 		sortedValidity[name] = newValid
 	}
 
-	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}, nil
+}
+
+// sortFlushBatch sorts a flush's rows for writing. It never drops data: if the
+// sort by the flush's keys fails, it logs (once a minute per measurement) and
+// sorts by time alone, and if that fails too, it writes the rows as they are.
+// A safety net: with keys from flushSortKeys (every one resolved against the
+// flush's columns) and "time" checked as []int64, the sort has no error left
+// to return today; this keeps a future one from writing a file unsorted.
+func (b *ArrowBuffer) sortFlushBatch(database, measurement string, batch *TypedColumnBatch, sortKeys []string) *TypedColumnBatch {
+	sorted, err := sortTypedColumnBatchByKeys(batch, sortKeys)
+	if err == nil {
+		return sorted
+	}
+	if b.warnOncePerMinute("sort-failed", database, measurement, time.Now()) {
+		b.logger.Error().Err(err).
+			Str("database", database).
+			Str("measurement", measurement).
+			Strs("sort_keys", sortKeys).
+			Msg("Sorting a flush by its sort keys failed; writing it sorted by time only")
+	}
+	if len(sortKeys) == 1 && sortKeys[0] == "time" {
+		return batch
+	}
+	if byTime, err := sortTypedColumnBatchByKeys(batch, []string{"time"}); err == nil {
+		return byTime
+	}
+	return batch
+}
+
+// flushSortKeys returns the sort keys for a flush of measurement: its
+// configured keys that the flush has a column for, then "time". A key with no
+// column cannot be sorted on; it is left out of this flush rather than failing
+// the whole sort. Names match case-insensitively, as compaction (DuckDB) binds
+// them, and the flush's own spelling is used. A key configured for this
+// measurement in ingest.sort_keys and missing is logged at Warn once a minute;
+// one from ingest.default_sort_keys at Debug, since measurements without that
+// column are normal (compaction leaves it out of the partition's order too).
+// A key resolving to a column already in the list is dropped, so "Time" or
+// a key listed twice does not take the multi-key sort for a time-only one.
+// The result is a new slice when anything changed; otherwise it may be the
+// shared config slice, which callers only read.
+func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[string]interface{}) []string {
+	keys := b.getSortKeys(measurement)
+	var lower map[string]string // built only if a key is not an exact match
+	var resolved, missing []string
+	changed := false
+	for i, key := range keys {
+		if _, ok := data[key]; ok {
+			if resolved != nil {
+				resolved = append(resolved, key)
+			}
+			continue
+		}
+		if lower == nil {
+			lower = make(map[string]string, len(data))
+			for name := range data {
+				// Two columns that differ only in case: take the smaller
+				// name, so the choice does not depend on map order. Ingest
+				// refuses such twins (#1342), so only data written before
+				// that has them; DuckDB may bind the other one in
+				// compaction, which is harmless for an order.
+				l := FoldColumnName(name)
+				if prev, ok := lower[l]; !ok || name < prev {
+					lower[l] = name
+				}
+			}
+		}
+		if resolved == nil {
+			resolved = append(make([]string, 0, len(keys)), keys[:i]...)
+		}
+		changed = true
+		if name, ok := lower[FoldColumnName(key)]; ok {
+			resolved = append(resolved, name)
+		} else {
+			missing = append(missing, key)
+		}
+	}
+	if !changed {
+		return keys
+	}
+	resolved = dedupeKeys(resolved)
+	if len(missing) == 0 {
+		return resolved
+	}
+	_, explicit := b.sortKeysConfig[measurement]
+	lvl := zerolog.DebugLevel
+	if explicit {
+		lvl = zerolog.WarnLevel
+	}
+	// Check the level before the limiter: with Debug off, a default key most
+	// measurements lack would otherwise touch the limiter on every flush.
+	if b.logger.GetLevel() <= lvl && b.warnOncePerMinute("sort-key-missing", database, measurement, time.Now()) {
+		b.logger.WithLevel(lvl).Str("database", database).
+			Str("measurement", measurement).
+			Strs("missing_sort_keys", missing).
+			Strs("sort_keys", resolved).
+			Msg("Flushing without sort keys this data has no column for")
+	}
+	return resolved
+}
+
+// dedupeKeys removes repeated names, keeping the first, in place.
+func dedupeKeys(keys []string) []string {
+	out := keys[:0]
+	for _, k := range keys {
+		if !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // sliceTypedColumnBatchByIndices extracts rows from a TypedColumnBatch by index list,

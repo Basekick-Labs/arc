@@ -256,6 +256,12 @@ func TestFlushWritesBufferedRowsInOrder(t *testing.T) {
 		{"one batch three hours", 1, 300, 3, true, nil},
 		{"sort by host then time", 8, 50, 1, true, []string{"m:host,time"}},
 		{"sort by host then time three hours", 8, 50, 3, true, []string{"m:host,time"}},
+		// A configured key the data has no column for used to fail the sort,
+		// and the flush wrote its rows unsorted, not even by time.
+		{"missing key left out", 8, 50, 1, true, []string{"m:site,host"}},
+		{"missing key left out three hours", 8, 50, 3, true, []string{"m:site,host"}},
+		// Matched case-insensitively, as compaction (DuckDB) binds it.
+		{"key spelled in another case", 8, 50, 1, true, []string{"m:HOST"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newFlushRig(t, &config.IngestConfig{SortKeys: tc.sortKeys})
