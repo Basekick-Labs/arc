@@ -5240,7 +5240,8 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 
 // sortColumnsByKeysWithPermutation sorts columns and returns the permutation indices used.
 // The permutation can be applied to validity bitmaps or other parallel arrays by the caller,
-// avoiding a second sort pass.
+// avoiding a second sort pass. nil indices with a nil error mean the rows were already in
+// order (the identity) and the columns are returned as they are.
 func sortColumnsByKeysWithPermutation(columns map[string]interface{}, sortKeys []string) (map[string]interface{}, []int, error) {
 	if len(sortKeys) == 0 {
 		return nil, nil, fmt.Errorf("no sort keys provided")
@@ -5288,16 +5289,24 @@ func sortColumnsByKeysWithPermutation(columns map[string]interface{}, sortKeys [
 		return columns, nil, nil
 	}
 
-	// Create permutation indices [0, 1, 2, ..., n-1]
-	indices := make([]int, n)
-	for i := range indices {
-		indices[i] = i
+	// Stable linear-time sort by the keys (see sort_multikey.go). nil
+	// indices means already in order: the identity, as the time-only path
+	// returns.
+	indices, ok := multiKeyPermutation(cachedCols, n)
+	if ok && indices == nil {
+		return columns, nil, nil
 	}
-
-	// Multi-key sort with cached columns (no map lookups in comparator)
-	sort.Slice(indices, func(i, j int) bool {
-		return compareMultiKeyCached(cachedCols, indices[i], indices[j])
-	})
+	if !ok {
+		// A key column of a type the linear sort does not handle: the
+		// comparison sort, as before.
+		indices = make([]int, n)
+		for i := range indices {
+			indices[i] = i
+		}
+		sort.Slice(indices, func(i, j int) bool {
+			return compareMultiKeyCached(cachedCols, indices[i], indices[j])
+		})
+	}
 
 	// Apply permutation to all columns
 	result := make(map[string]interface{}, len(columns))
