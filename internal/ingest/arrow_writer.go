@@ -5233,7 +5233,8 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 
 // sortColumnsByKeysWithPermutation sorts columns and returns the permutation indices used.
 // The permutation can be applied to validity bitmaps or other parallel arrays by the caller,
-// avoiding a second sort pass.
+// avoiding a second sort pass. nil indices with a nil error mean the rows were already in
+// order (the identity) and the columns are returned as they are.
 func sortColumnsByKeysWithPermutation(columns map[string]interface{}, sortKeys []string) (map[string]interface{}, []int, error) {
 	if len(sortKeys) == 0 {
 		return nil, nil, fmt.Errorf("no sort keys provided")

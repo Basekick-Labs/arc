@@ -1835,20 +1835,23 @@ an unbounded operation.
 
 A flush sorted by `ingest.sort_keys` (or `ingest.default_sort_keys`) went
 through a comparison sort that checked each key column's type on every one of
-its comparisons: 2.6 s for a 5M-row flush sorted by two tag columns and time,
+its comparisons: 2.60 s for a 5M-row flush sorted by two tag columns and time,
 against 0.21 s for time alone. On a sustained load that was most of the cost
 of sort keys at ingest.
 
 - **The sort is now one linear, stable pass per key**: a radix sort for
   integer and float keys, and for tag (string and binary) keys a counting sort
-  on each value's rank among the flush's distinct values. A key with more
-  distinct values than a quarter of the flush's rows, such as an id, is sorted
-  by comparison instead, which keeps memory bounded. Rows already in order are
-  not copied, as with time-only sorting.
+  on each value's rank among the flush's distinct values. Rows already in
+  order are not copied, as with time-only sorting.
+- **A key with many distinct values** (more than a quarter of the flush's
+  rows, such as a request id) or a decimal key has no such pass; the flush is
+  then sorted by one comparison over all its keys, about as fast as before
+  (1M rows by an id and time: 371 ms before, 339 ms now).
 - **Measured**, sorting a flush by `fleet, name, time` (10,000 names): 50,000
   rows (the default flush size) 13.9 ms to 6.3 ms; 1M rows 445 ms to 77 ms;
-  5M rows 2.60 s to 0.51 s. The sort uses about a fifth more memory while it
-  runs.
+  5M rows 2.60 s to 0.51 s. While it runs, the sort needs about 24 bytes of
+  scratch memory a row plus 4 for each tag or boolean key, against 8 before
+  (about 200 MB instead of 40 MB for 5M rows sorted by two tags and time).
 - **End to end**, loading 155.6M TSBS IoT rows with
   `sort_keys = ["readings:fleet,name", "diagnostics:fleet,name"]` and
   `wal.ack_mode = "durable"`: 36.6 s (29.7 to 49.0 across three runs) before,

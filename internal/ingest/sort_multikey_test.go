@@ -139,6 +139,13 @@ func TestMultiKeyPermutationAlreadySorted(t *testing.T) {
 	require.Nil(t, perm)
 }
 
+// A key column whose length is not the row count goes to the comparison sort
+// rather than indexing past the permutation.
+func TestMultiKeyPermutationLengthMismatch(t *testing.T) {
+	_, ok := multiKeyPermutation([]interface{}{[]string{"b", "a", "c"}, []int64{2, 1}}, 2)
+	require.False(t, ok)
+}
+
 // A key column of a type the linear sort does not handle is reported, and
 // sortColumnsByKeysWithPermutation falls back to the comparison sort.
 func TestMultiKeyPermutationUnknownType(t *testing.T) {
@@ -208,6 +215,41 @@ func multiKeyBenchColumns(n, trucks int) map[string]interface{} {
 		tm[a], tm[b] = tm[b], tm[a]
 	}
 	return cols
+}
+
+// A key with many distinct values (an id) or a decimal key takes the compound
+// comparison sort; it must stay about the cost of the old comparison sort.
+func BenchmarkMultiKeyPermutationHighCardinality(b *testing.B) {
+	for _, n := range []int{50_000, 1_000_000} {
+		rng := rand.New(rand.NewSource(3))
+		ids, tm, dec := make([]string, n), make([]int64, n), make([]decimal128.Num, n)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("req-%d", rng.Intn(n/3))
+			tm[i] = int64(rng.Intn(1 << 30))
+			dec[i] = decimal128.FromI64(int64(rng.Intn(1000)))
+		}
+		for _, c := range []struct {
+			name string
+			cols []interface{}
+		}{{"id_time", []interface{}{ids, tm}}, {"decimal_time", []interface{}{dec, tm}}} {
+			b.Run(fmt.Sprintf("%s/%d/new", c.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					_, _ = multiKeyPermutation(c.cols, n)
+				}
+			})
+			b.Run(fmt.Sprintf("%s/%d/old", c.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					idx := make([]int, n)
+					for j := range idx {
+						idx[j] = j
+					}
+					sort.Slice(idx, func(x, y int) bool { return compareMultiKeyCached(c.cols, idx[x], idx[y]) })
+				}
+			})
+		}
+	}
 }
 
 func BenchmarkSortColumnsMultiKey(b *testing.B) {
