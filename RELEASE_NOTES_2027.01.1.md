@@ -1831,6 +1831,46 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column (PRNUM)
+
+With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes one
+file per hour sorted by the keys and then time. The daily compaction then
+sorted the whole day by the keys alone, so each row group of the long-lived
+compacted file held every hour of the day for its keys, and a query over a few
+minutes read every row group: measured on a 54M-row daily file of TSBS IoT data
+sorted by `fleet,name`, every row group spanned about 17 hours.
+
+- **Compacted files are now ordered by hour, then the sort keys, then time.**
+  Each row group covers about an hour (one that straddles an hour boundary
+  covers two), so time-range pruning works on compacted files again, while
+  rows stay grouped by the keys within each hour. Measured on that 54M-row file
+  (DuckDB 1.5.6, warm medians):
+
+  | Query | Time only (default) | Keys, before | Hour, then keys |
+  |---|---|---|---|
+  | One truck, 24 hours | 51 ms | 8 ms | 9 ms |
+  | One fleet, 10 minutes | 11 ms | 26 ms | 11 ms |
+  | All trucks, 10 minutes | 9 ms | 38 ms | 11 ms |
+  | Latest position per truck, one fleet | 75 ms | 42 ms | 32 ms |
+  | File size | 984 MB | 802 MB | 807 MB |
+
+  Compacting that file took about 10% longer (7.0 s to 7.8 s) with about 2%
+  more peak memory. Hourly compaction is unchanged (its rows are all one
+  hour), and so is compaction without sort keys.
+- **Only newly compacted files get the new order.** A daily file compacted by
+  an earlier version keeps its order until it is rewritten; it is still read
+  correctly, just with the old pruning.
+- **A sort key the partition's files have no column for no longer fails its
+  compaction.** The ORDER BY named every configured key, and a key missing
+  from all of a batch's files was a bind error, so that partition failed to
+  compact on every cycle. The key is now left out of that batch's order, and a
+  Warn names it when it is configured for the measurement in
+  `ingest.sort_keys`; a key from `ingest.default_sort_keys` that a measurement
+  does not have is logged at Debug, since that is normal. Names match
+  case-insensitively, as DuckDB binds them.
+- Appending `time` to the sort keys no longer writes into the configuration's
+  own list, which concurrent compaction jobs share.
+
 ### Azure Blob Storage error messages are shorter
 
 Errors from the Azure Blob Storage backend are shorter. Azure credential
