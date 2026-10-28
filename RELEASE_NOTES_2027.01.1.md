@@ -1831,7 +1831,7 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Ingest with sort keys is as fast as without them (PRNUM)
+### Ingest with sort keys is as fast as without them ([#1411](https://github.com/Basekick-Labs/arc/pull/1411))
 
 A flush sorted by `ingest.sort_keys` (or `ingest.default_sort_keys`) went
 through a comparison sort that checked each key column's type on every one of
