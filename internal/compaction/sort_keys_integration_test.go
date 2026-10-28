@@ -48,9 +48,10 @@ func openDuckDB(t *testing.T) (*sql.DB, context.Context) {
 	}
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
-	// A non-UTC session zone: the hour bucket must not depend on it. Etc/*
-	// offsets are built into DuckDB's ICU (see the dedup integration test).
-	if _, err := db.ExecContext(ctx, "SET TimeZone='Etc/GMT+3'"); err != nil {
+	// A session zone with a half-hour offset: a zone-dependent bucket
+	// (date_trunc on a TIMESTAMPTZ) would cut hours at :30 UTC and break the
+	// order assertions; the epoch-based bucket must not depend on the zone.
+	if _, err := db.ExecContext(ctx, "SET TimeZone='Asia/Kolkata'"); err != nil {
 		t.Fatalf("set tz: %v", err)
 	}
 	return db, ctx

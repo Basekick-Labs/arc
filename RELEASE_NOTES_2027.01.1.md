@@ -1833,18 +1833,21 @@ an unbounded operation.
 
 ### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column (PRNUM)
 
-With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes one
-file per hour sorted by the keys and then time. The daily compaction then
-sorted the whole day by the keys alone, so each row group of the long-lived
-compacted file held every hour of the day for its keys, and a query over a few
-minutes read every row group: measured on a 54M-row daily file of TSBS IoT data
-sorted by `fleet,name`, every row group spanned about 17 hours.
+With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes each
+file within one hour, sorted by the keys and then time. The daily compaction
+then sorted the whole day by the keys alone, so each row group of the
+long-lived compacted file mixed the hours of the day, and a query over a few
+minutes read every row group: on a 54M-row daily file of TSBS IoT data sorted
+by `fleet,name`, every row group spanned about 17 hours, nearly all of that
+file's time range.
 
 - **Compacted files are now ordered by hour, then the sort keys, then time.**
-  Each row group covers about an hour (one that straddles an hour boundary
-  covers two), so time-range pruning works on compacted files again, while
-  rows stay grouped by the keys within each hour. Measured on that 54M-row file
-  (DuckDB 1.5.6, warm medians):
+  Each row group holds contiguous hours, so time-range pruning works on
+  compacted files again, while rows stay grouped by the keys within each hour.
+  A measurement whose hour fills a row group (122,880 rows) gets row groups of
+  about an hour; a smaller one gets fewer, wider row groups, as it did without
+  sort keys. Measured by rewriting that 54M-row file each way (DuckDB 1.5.6,
+  warm medians):
 
   | Query | Time only (default) | Keys, before | Hour, then keys |
   |---|---|---|---|
@@ -1854,8 +1857,8 @@ sorted by `fleet,name`, every row group spanned about 17 hours.
   | Latest position per truck, one fleet | 75 ms | 42 ms | 32 ms |
   | File size | 984 MB | 802 MB | 807 MB |
 
-  Compacting that file took about 10% longer (7.0 s to 7.8 s) with about 2%
-  more peak memory. Hourly compaction is unchanged (its rows are all one
+  Rewriting that file in the new order took about 10% longer (7.0 s to 7.8 s)
+  with about 2% more peak memory. Hourly compaction is unchanged (its rows are all one
   hour), and so is compaction without sort keys.
 - **Only newly compacted files get the new order.** A daily file compacted by
   an earlier version keeps its order until it is rewritten; it is still read
@@ -1868,9 +1871,6 @@ sorted by `fleet,name`, every row group spanned about 17 hours.
   `ingest.sort_keys`; a key from `ingest.default_sort_keys` that a measurement
   does not have is logged at Debug, since that is normal. Names match
   case-insensitively, as DuckDB binds them.
-- Appending `time` to the sort keys no longer writes into the configuration's
-  own list, which concurrent compaction jobs share.
-
 ### Azure Blob Storage error messages are shorter
 
 Errors from the Azure Blob Storage backend are shorter. Azure credential

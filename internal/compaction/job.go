@@ -91,11 +91,12 @@ const hourBucketExpr = `epoch_us("time") // 3600000000`
 // Column names are quoted to handle special characters.
 //
 // When the first key is not "time" (configured sort keys such as fleet,name),
-// the clause starts with the hour of "time". Ingest writes one file per hour,
-// each sorted by the keys, so a daily compaction ordered by the keys alone
-// would spread every row group across the whole day and lose time-range
+// the clause starts with the hour of "time". Ingest writes each file within
+// one hour, sorted by the keys, so a daily compaction ordered by the keys
+// alone would spread every row group across the day and lose time-range
 // pruning on the long-lived files. Ordering by hour first keeps the keys'
-// clustering within each hour and keeps row groups to about an hour.
+// clustering within each hour and keeps each row group to contiguous hours:
+// about one hour when an hour's rows fill a row group.
 //
 // The clause refers to "time" as an output column, so the caller must apply it
 // to a derived table whose "time" is already normalized (see
@@ -887,11 +888,11 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		// A key configured for this measurement and missing from its files is
 		// worth an operator's attention. A default_sort_keys key is normal to
 		// be missing from measurements without that column, every cycle.
-		ev := j.logger.Debug()
+		lvl := zerolog.DebugLevel
 		if j.SortKeysExplicit {
-			ev = j.logger.Warn()
+			lvl = zerolog.WarnLevel
 		}
-		ev.Strs("missing_sort_keys", droppedKeys).Strs("sort_keys", sortKeys).
+		j.logger.WithLevel(lvl).Strs("missing_sort_keys", droppedKeys).Strs("sort_keys", sortKeys).
 			Msg("Compacting without sort keys these files have no column for")
 	}
 	orderByClause := buildOrderByClause(sortKeys)
