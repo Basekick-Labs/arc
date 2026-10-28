@@ -4636,10 +4636,6 @@ func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferK
 // Called by both async (flushWithDataTimePartitioning) and sync (flushBufferLockedDataTime) paths
 // Uses hash-based grouping to partition by hour, then sorts each hour independently
 func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, database, measurement string, merged *TypedColumnBatch, recordCount int, flushType string, startTime time.Time, group *flushGroup) error {
-	// Sort keys for this flush (always include "time"; keys the flush has no
-	// column for are left out, see flushSortKeys).
-	sortKeys := b.flushSortKeys(database, measurement, merged.Data)
-
 	// Get decimal column config for this measurement (nil if none configured)
 	decimalCols := b.getDecimalColumns(measurement)
 
@@ -4648,6 +4644,11 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	if !ok || len(times) == 0 {
 		return fmt.Errorf("no time data in batch")
 	}
+
+	// Sort keys for this flush: "time" plus the configured keys the flush has
+	// a column for (see flushSortKeys). After the time check, so a flush
+	// without time fails with that error rather than a sort-key log.
+	sortKeys := b.flushSortKeys(database, measurement, merged.Data)
 
 	// Cheap O(n) min/max scan to decide single- vs multi-hour. The full per-hour
 	// bucketing (groupByHour) allocates an index slice covering every row and is only
@@ -5652,7 +5653,12 @@ func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[strin
 		if lower == nil {
 			lower = make(map[string]string, len(data))
 			for name := range data {
-				lower[asciiLowerKey(name)] = name
+				// Two columns that differ only in case: take the smaller
+				// name, so the choice does not depend on map order.
+				l := asciiLowerKey(name)
+				if prev, ok := lower[l]; !ok || name < prev {
+					lower[l] = name
+				}
 			}
 		}
 		if resolved == nil {

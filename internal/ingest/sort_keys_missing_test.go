@@ -46,6 +46,15 @@ func TestFlushSortKeys(t *testing.T) {
 		require.Contains(t, lines[0], `"measurement":"m"`)
 	})
 
+	t.Run("columns differing only in case: deterministic", func(t *testing.T) {
+		var logs bytes.Buffer
+		b := sortKeysBuffer(&logs, map[string][]string{"m": {"Host"}}, []string{"time"})
+		two := map[string]interface{}{"time": []int64{1}, "host": []string{"a"}, "HOST": []string{"b"}}
+		for i := 0; i < 50; i++ {
+			require.Equal(t, []string{"HOST", "time"}, b.flushSortKeys("d", "m", two))
+		}
+	})
+
 	t.Run("default_sort_keys missing key: dropped, Debug", func(t *testing.T) {
 		var logs bytes.Buffer
 		b := sortKeysBuffer(&logs, map[string][]string{}, []string{"site"})
