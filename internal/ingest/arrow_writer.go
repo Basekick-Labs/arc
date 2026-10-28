@@ -2308,24 +2308,36 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 		switch r := record.(type) {
 		case *models.ColumnarRecord:
 			if err := b.writeColumnar(ctx, database, r); err != nil {
-				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write columnar record")
-				b.totalErrors.Add(1)
+				// A refusal (a not-durable WAL entry, #1268) is not an ingest error: the
+				// handler answers and logs it, sampled per reason.
+				if !IsWriteRefusal(err) {
+					b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write columnar record")
+					b.totalErrors.Add(1)
+				}
 				return err
 			}
 		case *TypedColumnarRecord:
 			// Typed msgpack decode fast path: already converted, carries the
 			// raw client bytes for the zero-copy WAL branch.
 			if err := b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false); err != nil {
-				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
-				b.totalErrors.Add(1)
+				// A refusal (a not-durable WAL entry, #1268) is not an ingest error: the
+				// handler answers and logs it, sampled per reason.
+				if !IsWriteRefusal(err) {
+					b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
+					b.totalErrors.Add(1)
+				}
 				return err
 			}
 		}
 	}
 	for _, columnar := range converted {
 		if err := b.writeColumnar(ctx, database, columnar); err != nil {
-			b.logger.Error().Err(err).Str("measurement", columnar.Measurement).Msg("Failed to write converted row records")
-			b.totalErrors.Add(1)
+			// A refusal (a not-durable WAL entry, #1268) is not an ingest error: the
+			// handler answers and logs it, sampled per reason.
+			if !IsWriteRefusal(err) {
+				b.logger.Error().Err(err).Str("measurement", columnar.Measurement).Msg("Failed to write converted row records")
+				b.totalErrors.Add(1)
+			}
 			return err
 		}
 	}
@@ -2529,6 +2541,13 @@ const walDropLogIntervalNano = int64(time.Second)
 //
 // fields is a small closure that adds context (db/measurement/size)
 // to whichever logger ends up firing — keeps the call sites clean.
+// walDurableAck reports whether the WAL acknowledges only durable entries
+// (wal.ack_mode = "durable"): then any error on the WAL path refuses the write.
+func (b *ArrowBuffer) walDurableAck() bool {
+	d, ok := b.wal.(interface{ DurableAck() bool })
+	return ok && d.DurableAck()
+}
+
 func (b *ArrowBuffer) recordWALError(err error, fields func(*zerolog.Event)) {
 	if errors.Is(err, wal.ErrWALDropped) {
 		b.totalWALDropped.Add(1)
@@ -3229,6 +3248,12 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 			}
 			consumeWALReservation(ctx, len(record.RawPayload))
 			if err != nil {
+				// wal.ack_mode = "durable": the entry is not on disk (or never
+				// reached the WAL), so this write is refused (retryable) before
+				// it is buffered.
+				if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
+					return walNotDurable(err)
+				}
 				// Don't fail the write — WAL is for durability, not
 				// correctness. recordWALError differentiates backpressure
 				// drops (sampled Warn) from real I/O failures (unsampled
@@ -3258,6 +3283,12 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 				}
 				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
+					// wal.ack_mode = "durable": the entry is not on disk (or never
+					// reached the WAL), so this write is refused (retryable) before
+					// it is buffered.
+					if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
+						return walNotDurable(err)
+					}
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
 							Str("measurement", record.Measurement).
@@ -3515,6 +3546,12 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 			}
 			consumeWALReservation(ctx, len(rawPayload))
 			if err != nil {
+				// wal.ack_mode = "durable": the entry is not on disk (or never
+				// reached the WAL), so this write is refused (retryable) before
+				// it is buffered.
+				if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
+					return walNotDurable(err)
+				}
 				b.recordWALError(err, func(ev *zerolog.Event) {
 					ev.Str("database", database).
 						Str("measurement", measurement).
@@ -3539,6 +3576,12 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 				}
 				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
+					// wal.ack_mode = "durable": the entry is not on disk (or never
+					// reached the WAL), so this write is refused (retryable) before
+					// it is buffered.
+					if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
+						return walNotDurable(err)
+					}
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
 							Str("measurement", measurement).
