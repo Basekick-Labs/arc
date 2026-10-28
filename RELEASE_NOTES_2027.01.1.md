@@ -1831,7 +1831,7 @@ an unbounded operation.
 
 ## Bug fixes
 
-### A sort key the data has no column for no longer leaves the file unsorted (PRNUM)
+### A sort key the data has no column for no longer leaves the file unsorted ([#1410](https://github.com/Basekick-Labs/arc/pull/1410))
 
 With `ingest.sort_keys` or `ingest.default_sort_keys` set, a flush whose rows
 had no column for one of the keys failed its sort, and the flush wrote the
