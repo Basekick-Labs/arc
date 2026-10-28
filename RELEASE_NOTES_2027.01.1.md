@@ -1851,7 +1851,7 @@ of sort keys at ingest.
   rows (the default flush size) 13.9 ms to 6.3 ms; 1M rows 445 ms to 77 ms;
   5M rows 2.60 s to 0.51 s. While it runs, the sort needs about 24 bytes of
   scratch memory a row plus 4 for each tag or boolean key, against 8 before
-  (about 200 MB instead of 40 MB for 5M rows sorted by two tags and time).
+  (about 160 MB instead of 40 MB for 5M rows sorted by two tags and time).
 - **End to end**, loading 155.6M TSBS IoT rows with
   `sort_keys = ["readings:fleet,name", "diagnostics:fleet,name"]` and
   `wal.ack_mode = "durable"`: 36.6 s (29.7 to 49.0 across three runs) before,
