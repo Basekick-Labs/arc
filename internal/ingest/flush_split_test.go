@@ -2,8 +2,11 @@ package ingest
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 func TestSplitFlushRecordsByStringColumnBytes(t *testing.T) {
@@ -23,6 +26,53 @@ func TestSplitFlushRecordsByStringColumnBytes(t *testing.T) {
 	}
 	if len(parts[0].walHashes) != 2 || parts[0].walHashes[0] != "wal-1" || parts[0].walHashes[1] != "wal-2" || len(parts[1].walHashes) != 1 || parts[1].walHashes[0] != "wal-3" {
 		t.Fatalf("part WAL hashes = %v and %v", parts[0].walHashes, parts[1].walHashes)
+	}
+}
+
+func TestSplitFlushRecordsAccountsForSanitizedMessagePackStrings(t *testing.T) {
+	decoder := newTypedTestDecoder(true)
+	invalidString := strings.Repeat("\xff", 128)
+	decodeBatch := func(ts int64) (*TypedColumnBatch, int64) {
+		t.Helper()
+		payload, err := msgpack.Marshal(map[string]interface{}{
+			"m": "cpu",
+			"columns": map[string]interface{}{
+				"time": []interface{}{ts},
+				"host": []interface{}{invalidString},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, ok := decoder.tryDecodeColumnarTyped(payload)
+		if !ok {
+			t.Fatal("typed decoder rejected a valid columnar payload")
+		}
+		host := record.Batch.Data["host"].([]string)[0]
+		if len(host) != len(invalidString)*3 {
+			t.Fatalf("sanitized host length = %d, want %d", len(host), len(invalidString)*3)
+		}
+		// Use the same raw-plus-decoded estimate as the columnar writer.
+		record.Batch.estimatedBytes = estimateTypedColumnStringBytesWithRawPayload(record.Batch, record.RawPayload)
+		return record.Batch, int64(len(record.RawPayload))
+	}
+
+	first, firstEstimate := decodeBatch(1)
+	second, secondEstimate := decodeBatch(2)
+	records := []interface{}{first, second}
+	estimate := firstEstimate + secondEstimate
+	actualStringBytes := int64(len(first.Data["host"].([]string)[0]) + len(second.Data["host"].([]string)[0]))
+	if estimate >= actualStringBytes {
+		t.Fatalf("fixture does not expose estimate undercount: estimated %d, string data %d", estimate, actualStringBytes)
+	}
+	maxBytes := estimate + (actualStringBytes-estimate)/2
+	if estimate > maxBytes || actualStringBytes <= maxBytes {
+		t.Fatalf("invalid threshold: estimate %d, actual %d, max %d", estimate, actualStringBytes, maxBytes)
+	}
+
+	parts := (&ArrowBuffer{}).splitFlushRecordsByStringBytes("db/cpu", records, maxBytes)
+	if len(parts) != 2 {
+		t.Fatalf("got %d parts, want split for %d sanitized string bytes above limit %d", len(parts), actualStringBytes, maxBytes)
 	}
 }
 

@@ -1644,6 +1644,31 @@ func estimateTypedColumnBatchBytes(batch *TypedColumnBatch) int64 {
 	return total
 }
 
+// estimateTypedColumnStringBytesWithRawPayload accounts for strings that can
+// grow beyond their wire representation, such as invalid UTF-8 replaced by
+// three-byte U+FFFD runes. Only string values need this additional scan for
+// the Arrow offset bound; the raw payload remains the estimate for other data.
+func estimateTypedColumnStringBytesWithRawPayload(batch *TypedColumnBatch, rawPayload []byte) int64 {
+	stringBytes := int64(0)
+	if batch != nil {
+		for _, column := range batch.Data {
+			switch values := column.(type) {
+			case []string:
+				for _, value := range values {
+					stringBytes = saturatingAddInt64(stringBytes, int64(len(value)))
+				}
+			case []interface{}:
+				for _, value := range values {
+					if value, ok := value.(string); ok {
+						stringBytes = saturatingAddInt64(stringBytes, int64(len(value)))
+					}
+				}
+			}
+		}
+	}
+	return max(int64(len(rawPayload)), stringBytes)
+}
+
 func estimateBufferedBatchesBytes(batches []interface{}) int64 {
 	var total int64
 	for _, batch := range batches {
@@ -3200,7 +3225,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 		return fmt.Errorf("failed to convert columns: %w", err)
 	}
 	if len(record.RawPayload) > 0 {
-		typedColumns.estimatedBytes = int64(len(record.RawPayload))
+		typedColumns.estimatedBytes = estimateTypedColumnStringBytesWithRawPayload(typedColumns, record.RawPayload)
 	} else {
 		typedColumns.estimatedBytes = estimateTypedColumnBatchBytes(typedColumns)
 	}
@@ -3360,7 +3385,10 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		// The payload's size, but at least 8 bytes a cell: a NULL is one
 		// byte of msgpack and a full cell in memory (Telegraf's columns are
 		// mostly NULLs).
-		typedColumns.estimatedBytes = max(int64(len(rawPayload)), int64(numRecords)*int64(len(typedColumns.Data))*8)
+		typedColumns.estimatedBytes = max(
+			estimateTypedColumnStringBytesWithRawPayload(typedColumns, rawPayload),
+			int64(numRecords)*int64(len(typedColumns.Data))*8,
+		)
 	} else if typedColumns.estimatedBytes <= 0 {
 		typedColumns.estimatedBytes = estimateTypedColumnBatchBytes(typedColumns)
 	}
