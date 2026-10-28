@@ -1055,6 +1055,7 @@ func main() {
 			MaxAge:       time.Duration(cfg.WAL.MaxAgeSeconds) * time.Second,
 			BufferSize:   cfg.WAL.BufferSize,
 			SyncBytes:    cfg.WAL.SyncBytes,
+			AckMode:      wal.AckMode(cfg.WAL.AckMode),
 			Logger:       logger.Get("wal"),
 		})
 		if err != nil {

@@ -482,6 +482,10 @@ type WALConfig struct {
 	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
 	// much written data a sync may leave behind, not the writer's throughput.
 	SyncBytes int64
+	// AckMode is when a write is acknowledged with the WAL on: "queued" (the
+	// default) once its entry is queued for the WAL writer, or "durable" once
+	// a sync covering it has completed. See wal.AckMode.
+	AckMode string
 	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
 	// volume is low on free space, and keeps the WAL reserve file (#676).
 	// Default true; only acts with the WAL enabled.
@@ -1216,6 +1220,7 @@ func Load() (*Config, error) {
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
+			AckMode:                 v.GetString("wal.ack_mode"),
 			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
 			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
 			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
@@ -1437,6 +1442,24 @@ func Load() (*Config, error) {
 	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
+	}
+	switch cfg.WAL.AckMode {
+	case "queued", "durable":
+	default:
+		return nil, fmt.Errorf("wal.ack_mode must be queued or durable, got %q", cfg.WAL.AckMode)
+	}
+	// The covered append (cluster.wal_coverage) commits under the ingest shard
+	// lock, where waiting for a sync would stall every writer to that
+	// measurement: durable acknowledgement does not support it yet.
+	if !cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" {
+		cfg.Warnings = append(cfg.Warnings, LoadWarning{
+			Key:     "wal.ack_mode",
+			Value:   cfg.WAL.AckMode,
+			Message: "wal.ack_mode = \"durable\" has no effect while wal.enabled = false: writes are acknowledged without a WAL",
+		})
+	}
+	if cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" && cfg.Cluster.WALCoverage {
+		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true")
 	}
 	if cfg.WAL.DiskMinFreeMB < 0 {
 		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
@@ -2082,6 +2105,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
+	v.SetDefault("wal.ack_mode", "queued")             // Acknowledge once queued; "durable" waits for the covering sync
 	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
 	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
 	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes
