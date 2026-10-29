@@ -28,6 +28,10 @@ const unsubscribeTimeout = time.Second
 type Subscriber struct {
 	id     string
 	config *Subscription
+	// Topic mapping filters are compiled once at construction, not parsed on the
+	// ingest hot path. A persisted invalid rule prevents Start from connecting.
+	topicMappingRules compiledTopicMapping
+	topicMappingErr   error
 	// invalidDatabaseLogged remembers database values already reported by
 	// onMessage so a persistent misconfiguration logs once, not per message.
 	invalidDatabaseLogged sync.Map
@@ -71,21 +75,28 @@ func NewSubscriber(
 	logger zerolog.Logger,
 ) *Subscriber {
 	ctx, cancel := context.WithCancel(context.Background())
+	topicMappingRules, topicMappingErr := compileTopicMapping(config.TopicMapping)
 
 	return &Subscriber{
-		id:             config.ID,
-		config:         config,
-		arrowBuffer:    arrowBuffer,
-		encryptor:      encryptor,
-		onStatusChange: onStatusChange,
-		logger:         logger.With().Str("subscription_id", config.ID).Str("subscription_name", config.Name).Logger(),
-		ctx:            ctx,
-		cancel:         cancel,
+		id:                config.ID,
+		config:            config,
+		topicMappingRules: topicMappingRules,
+		topicMappingErr:   topicMappingErr,
+		arrowBuffer:       arrowBuffer,
+		encryptor:         encryptor,
+		onStatusChange:    onStatusChange,
+		logger:            logger.With().Str("subscription_id", config.ID).Str("subscription_name", config.Name).Logger(),
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 }
 
 // Start connects to the MQTT broker and begins message processing
 func (s *Subscriber) Start() error {
+	if s.topicMappingErr != nil {
+		return fmt.Errorf("invalid topic mapping: %w", s.topicMappingErr)
+	}
+
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
@@ -351,12 +362,11 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	metrics.Get().IncMQTTMessagesReceived()
 	metrics.Get().IncMQTTBytesReceived(int64(len(msg.Payload())))
 
-	// Determine database from topic mapping or use default
+	// Determine the mapped rule and database from the incoming topic.
 	database := s.config.Database
-	if s.config.TopicMapping != nil {
-		if mapped, ok := s.config.TopicMapping[msg.Topic()]; ok {
-			database = mapped
-		}
+	rule, topicLevels, matched := matchTopicMapping(s.topicMappingRules, msg.Topic())
+	if matched && rule.Database != "" {
+		database = rule.Database
 	}
 
 	// The database becomes the first segment of the storage key with no HTTP
@@ -383,7 +393,7 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	// subscription, so the broker holds new messages. One that was already in
 	// flight when the refusal started waits briefly for it to lift; never
 	// long, since blocking this handler stalls the client and its keepalive.
-	err := s.processMessage(s.ctx, msg.Topic(), msg.Payload(), database)
+	err := s.processMessageWithTopicMapping(s.ctx, msg.Topic(), msg.Payload(), database, rule, topicLevels)
 	// A retry is the same message: a disk pressure refusal of it is counted
 	// once in arc_wal_disk_pressure_rejections_total (#676).
 	retryCtx := ingest.WithRefusalCounted(s.ctx)
@@ -393,7 +403,7 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 			return
 		case <-time.After(mqttFencedRetry):
 		}
-		err = s.processMessage(retryCtx, msg.Topic(), msg.Payload(), database)
+		err = s.processMessageWithTopicMapping(retryCtx, msg.Topic(), msg.Payload(), database, rule, topicLevels)
 	}
 	if err != nil {
 		s.messagesFailed.Add(1)
@@ -488,9 +498,13 @@ func (s *Subscriber) nameWarnDue(key string) bool {
 
 // processMessage decodes and writes an MQTT message to the ArrowBuffer
 func (s *Subscriber) processMessage(ctx context.Context, topic string, payload []byte, database string) error {
+	return s.processMessageWithTopicMapping(ctx, topic, payload, database, TopicMappingRule{}, nil)
+}
+
+func (s *Subscriber) processMessageWithTopicMapping(ctx context.Context, topic string, payload []byte, database string, rule TopicMappingRule, topicLevels []string) error {
 	// Try to decode as MessagePack first (check magic bytes)
 	if len(payload) > 0 {
-		records, err := s.decodePayload(topic, payload)
+		records, err := s.decodePayload(topic, payload, rule, topicLevels)
 		if err != nil {
 			return fmt.Errorf("failed to decode payload: %w", err)
 		}
@@ -543,15 +557,15 @@ func (s *Subscriber) processMessage(ctx context.Context, topic string, payload [
 	return nil
 }
 
-// decodePayload attempts to decode the message payload
-func (s *Subscriber) decodePayload(topic string, payload []byte) ([]interface{}, error) {
+// decodePayload attempts to decode the message payload.
+func (s *Subscriber) decodePayload(topic string, payload []byte, rule TopicMappingRule, topicLevels []string) ([]interface{}, error) {
 	// Try MessagePack first (more efficient for IoT)
-	if records, err := s.tryDecodeMsgPack(payload); err == nil {
+	if records, err := s.tryDecodeMsgPack(payload, rule, topicLevels); err == nil {
 		return records, nil
 	}
 
 	// Fall back to JSON
-	if records, err := s.tryDecodeJSON(topic, payload); err == nil {
+	if records, err := s.tryDecodeJSON(topic, payload, rule, topicLevels); err == nil {
 		return records, nil
 	}
 
@@ -563,32 +577,32 @@ func (s *Subscriber) decodePayload(topic string, payload []byte) ([]interface{},
 	return nil, fmt.Errorf("failed to decode payload as MessagePack or JSON")
 }
 
-// tryDecodeMsgPack attempts to decode payload as MessagePack
-func (s *Subscriber) tryDecodeMsgPack(payload []byte) ([]interface{}, error) {
+// tryDecodeMsgPack attempts to decode payload as MessagePack.
+func (s *Subscriber) tryDecodeMsgPack(payload []byte, rule TopicMappingRule, topicLevels []string) ([]interface{}, error) {
 	var data interface{}
 	if err := msgpack.Unmarshal(payload, &data); err != nil {
 		return nil, err
 	}
 
-	return s.convertToRecords(data)
+	return s.convertToRecords(data, rule, topicLevels)
 }
 
-// tryDecodeJSON attempts to decode payload as JSON
-func (s *Subscriber) tryDecodeJSON(_ string, payload []byte) ([]interface{}, error) {
+// tryDecodeJSON attempts to decode payload as JSON.
+func (s *Subscriber) tryDecodeJSON(_ string, payload []byte, rule TopicMappingRule, topicLevels []string) ([]interface{}, error) {
 	var data interface{}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return nil, err
 	}
 
-	return s.convertToRecords(data)
+	return s.convertToRecords(data, rule, topicLevels)
 }
 
-// convertToRecords converts decoded data to records for ArrowBuffer
-func (s *Subscriber) convertToRecords(data interface{}) ([]interface{}, error) {
+// convertToRecords converts decoded data to records for ArrowBuffer.
+func (s *Subscriber) convertToRecords(data interface{}, rule TopicMappingRule, topicLevels []string) ([]interface{}, error) {
 	switch v := data.(type) {
 	case map[string]interface{}:
 		// Single record
-		record, err := s.mapToRecord(v)
+		record, err := s.mapToRecordWithTopicMapping(v, rule, topicLevels)
 		if err != nil {
 			return nil, err
 		}
@@ -599,7 +613,7 @@ func (s *Subscriber) convertToRecords(data interface{}) ([]interface{}, error) {
 		records := make([]interface{}, 0, len(v))
 		for _, item := range v {
 			if m, ok := item.(map[string]interface{}); ok {
-				record, err := s.mapToRecord(m)
+				record, err := s.mapToRecordWithTopicMapping(m, rule, topicLevels)
 				if err != nil {
 					return nil, err
 				}
@@ -615,6 +629,10 @@ func (s *Subscriber) convertToRecords(data interface{}) ([]interface{}, error) {
 
 // mapToRecord converts a map to a models.Record
 func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, error) {
+	return s.mapToRecordWithTopicMapping(m, TopicMappingRule{}, nil)
+}
+
+func (s *Subscriber) mapToRecordWithTopicMapping(m map[string]interface{}, rule TopicMappingRule, topicLevels []string) (*models.Record, error) {
 	record := &models.Record{
 		Fields: make(map[string]interface{}),
 		Tags:   make(map[string]string),
@@ -629,18 +647,20 @@ func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, erro
 	// data in the WAL and retries forever, wedging the buffer. MQTT payloads
 	// are unauthenticated relative to the HTTP write path, which validates
 	// measurement names before they reach the buffer.
-	if meas, ok := m["m"].(string); ok && meas != "" {
+	if rule.Measurement != "" {
+		record.Measurement = rule.Measurement
+	} else if meas, ok := m["m"].(string); ok && meas != "" {
 		record.Measurement = meas
 	} else if meas, ok := m["measurement"].(string); ok && meas != "" {
 		record.Measurement = meas
 	} else {
 		record.Measurement = "mqtt" // Default measurement
 	}
-	// The measurement is the second storage-key segment and comes from the
-	// publisher. A value like "../x" is accepted into the buffer and refused by
-	// the storage key contract at flush, which latches the buffer's
-	// flush-failure state; "a/b" is written under a mis-partitioned path no
-	// query can address. Refuse it here, as a decode error, the same way the
+	// The measurement is the second storage-key segment and can come from the
+	// publisher or a topic rule. A value like "../x" is accepted into the buffer
+	// and refused by the storage key contract at flush, which latches the
+	// buffer's flush-failure state; "a/b" is written under a mis-partitioned path
+	// no query can address. Refuse it here, as a decode error, the same way the
 	// HTTP write path refuses it before the buffer (#300).
 	if !isValidMeasurementSegment(record.Measurement) {
 		return nil, fmt.Errorf("measurement %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens (at most 128 characters)", record.Measurement)
@@ -655,6 +675,14 @@ func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, erro
 			if str, ok := v.(string); ok {
 				record.Tags[k] = str
 			}
+		}
+	}
+	// Topic-derived tags override payload tags with the same name. Positions
+	// refer to the full topic path, starting at zero; an unavailable segment
+	// (possible with a trailing # filter) is skipped without dropping the row.
+	for _, extraction := range rule.TagsFromTopic {
+		if extraction.Position < len(topicLevels) {
+			record.Tags[extraction.TagName] = topicLevels[extraction.Position]
 		}
 	}
 

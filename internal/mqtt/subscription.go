@@ -62,7 +62,7 @@ type Subscription struct {
 	AutoStart             bool               `json:"auto_start"`
 	Status                SubscriptionStatus `json:"status"`
 	ErrorMessage          string             `json:"error_message,omitempty"`
-	TopicMapping          map[string]string  `json:"topic_mapping,omitempty"`
+	TopicMapping          TopicMapping       `json:"topic_mapping,omitempty"`
 	KeepAliveSeconds      int                `json:"keep_alive_seconds"`
 	ConnectTimeoutSeconds int                `json:"connect_timeout_seconds"`
 	// ReconnectMaxSeconds caps paho's exponential reconnect backoff. There is no
@@ -84,44 +84,44 @@ type CreateSubscriptionRequest struct {
 	// from an omitted field. A plain int would make both indistinguishable, and
 	// the default logic would silently rewrite an explicit 0 to 1 (#326). nil
 	// means "use the default" (see defaultQoS / resolveQoS).
-	QoS                   *int              `json:"qos,omitempty"`
-	Database              string            `json:"database"`
-	Username              string            `json:"username,omitempty"`
-	Password              string            `json:"password,omitempty"`
-	TLSEnabled            bool              `json:"tls_enabled"`
-	TLSCertPath           string            `json:"tls_cert_path,omitempty"`
-	TLSKeyPath            string            `json:"tls_key_path,omitempty"`
-	TLSCAPath             string            `json:"tls_ca_path,omitempty"`
-	TLSInsecureSkipVerify bool              `json:"tls_insecure_skip_verify"`
-	AutoStart             bool              `json:"auto_start"`
-	TopicMapping          map[string]string `json:"topic_mapping,omitempty"`
-	KeepAliveSeconds      int               `json:"keep_alive_seconds"`
-	ConnectTimeoutSeconds int               `json:"connect_timeout_seconds"`
-	ReconnectMaxSeconds   int               `json:"reconnect_max_seconds"`
-	CleanSession          bool              `json:"clean_session"`
+	QoS                   *int         `json:"qos,omitempty"`
+	Database              string       `json:"database"`
+	Username              string       `json:"username,omitempty"`
+	Password              string       `json:"password,omitempty"`
+	TLSEnabled            bool         `json:"tls_enabled"`
+	TLSCertPath           string       `json:"tls_cert_path,omitempty"`
+	TLSKeyPath            string       `json:"tls_key_path,omitempty"`
+	TLSCAPath             string       `json:"tls_ca_path,omitempty"`
+	TLSInsecureSkipVerify bool         `json:"tls_insecure_skip_verify"`
+	AutoStart             bool         `json:"auto_start"`
+	TopicMapping          TopicMapping `json:"topic_mapping,omitempty"`
+	KeepAliveSeconds      int          `json:"keep_alive_seconds"`
+	ConnectTimeoutSeconds int          `json:"connect_timeout_seconds"`
+	ReconnectMaxSeconds   int          `json:"reconnect_max_seconds"`
+	CleanSession          bool         `json:"clean_session"`
 }
 
 // UpdateSubscriptionRequest is the request body for updating a subscription
 type UpdateSubscriptionRequest struct {
-	Name                  *string            `json:"name,omitempty"`
-	Broker                *string            `json:"broker,omitempty"`
-	ClientID              *string            `json:"client_id,omitempty"`
-	Topics                []string           `json:"topics,omitempty"`
-	QoS                   *int               `json:"qos,omitempty"`
-	Database              *string            `json:"database,omitempty"`
-	Username              *string            `json:"username,omitempty"`
-	Password              *string            `json:"password,omitempty"`
-	TLSEnabled            *bool              `json:"tls_enabled,omitempty"`
-	TLSCertPath           *string            `json:"tls_cert_path,omitempty"`
-	TLSKeyPath            *string            `json:"tls_key_path,omitempty"`
-	TLSCAPath             *string            `json:"tls_ca_path,omitempty"`
-	TLSInsecureSkipVerify *bool              `json:"tls_insecure_skip_verify,omitempty"`
-	AutoStart             *bool              `json:"auto_start,omitempty"`
-	TopicMapping          *map[string]string `json:"topic_mapping,omitempty"`
-	KeepAliveSeconds      *int               `json:"keep_alive_seconds,omitempty"`
-	ConnectTimeoutSeconds *int               `json:"connect_timeout_seconds,omitempty"`
-	ReconnectMaxSeconds   *int               `json:"reconnect_max_seconds,omitempty"`
-	CleanSession          *bool              `json:"clean_session,omitempty"`
+	Name                  *string       `json:"name,omitempty"`
+	Broker                *string       `json:"broker,omitempty"`
+	ClientID              *string       `json:"client_id,omitempty"`
+	Topics                []string      `json:"topics,omitempty"`
+	QoS                   *int          `json:"qos,omitempty"`
+	Database              *string       `json:"database,omitempty"`
+	Username              *string       `json:"username,omitempty"`
+	Password              *string       `json:"password,omitempty"`
+	TLSEnabled            *bool         `json:"tls_enabled,omitempty"`
+	TLSCertPath           *string       `json:"tls_cert_path,omitempty"`
+	TLSKeyPath            *string       `json:"tls_key_path,omitempty"`
+	TLSCAPath             *string       `json:"tls_ca_path,omitempty"`
+	TLSInsecureSkipVerify *bool         `json:"tls_insecure_skip_verify,omitempty"`
+	AutoStart             *bool         `json:"auto_start,omitempty"`
+	TopicMapping          *TopicMapping `json:"topic_mapping,omitempty"`
+	KeepAliveSeconds      *int          `json:"keep_alive_seconds,omitempty"`
+	ConnectTimeoutSeconds *int          `json:"connect_timeout_seconds,omitempty"`
+	ReconnectMaxSeconds   *int          `json:"reconnect_max_seconds,omitempty"`
+	CleanSession          *bool         `json:"clean_session,omitempty"`
 }
 
 // SubscriptionStats contains runtime statistics for a subscription
@@ -191,7 +191,7 @@ func (s *Subscription) Validate() error {
 	if s.Database == "" {
 		return errors.New("database is required")
 	}
-	if err := validateStorageTargets(s); err != nil {
+	if err := validateSubscriptionTargets(s); err != nil {
 		return err
 	}
 
@@ -320,21 +320,18 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 	return s.Validate()
 }
 
-// validateStorageTargets checks the subscription database and every
-// topic-mapping target. Both become the first segment of a storage key, and
-// this is the one ingest surface with no HTTP handler in front of it to
-// validate them, so a value like "" or "../x" would otherwise reach the writer
-// directly (#741, #300). Shared by Validate (create and update) and by
-// startSubscriber, which loads rows from SQLite that may predate the rule or
-// have been edited there.
-func validateStorageTargets(s *Subscription) error {
+// validateSubscriptionTargets checks the subscription database and every topic
+// mapping rule. Mapped databases become the first segment of a storage key,
+// while measurements and tag names become stored columns; this ingest surface
+// has no HTTP write handler in front of it to validate them. Shared by Validate
+// (create and update) and by startSubscriber, which loads rows from SQLite that
+// may predate these rules or have been edited there.
+func validateSubscriptionTargets(s *Subscription) error {
 	if !isValidStorageSegment(s.Database) {
 		return fmt.Errorf("database %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens", s.Database)
 	}
-	for topic, db := range s.TopicMapping {
-		if !isValidStorageSegment(db) {
-			return fmt.Errorf("topic mapping %q targets database %q, which must start with a letter and contain only alphanumeric characters, underscores, or hyphens", topic, db)
-		}
+	if err := validateTopicMapping(s.TopicMapping); err != nil {
+		return err
 	}
 	return nil
 }

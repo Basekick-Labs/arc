@@ -672,7 +672,7 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 	// so the subscription shows an error status instead of running and
 	// dropping every message (#300). onMessage keeps its own check as the
 	// last line.
-	if err := validateStorageTargets(sub); err != nil {
+	if err := validateSubscriptionTargets(sub); err != nil {
 		return fmt.Errorf("subscription targets cannot be written: %w", err)
 	}
 	subscriber := NewSubscriber(
