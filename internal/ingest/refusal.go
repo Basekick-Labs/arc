@@ -27,11 +27,19 @@ const (
 	// directory is at wal.max_directory_mb (#676); counted in
 	// arc_wal_disk_pressure_rejections_total.
 	RefusalWALDisk = "wal_disk"
+	// RefusalWALNotDurable: with wal.ack_mode = "durable", the write's WAL
+	// entry could not be made durable (write or sync failure, shutdown).
+	RefusalWALNotDurable = "wal_not_durable"
 )
 
 // WriteRefusal is a live write this node refuses for a local, transient
-// condition: nothing was written, the WAL included, and the client should
-// retry (#676). Unlike ErrIngestFenced, retrying against this same node is
+// condition: the write was not accepted and the client should retry (#676).
+// For every reason but RefusalWALNotDurable nothing was written, the WAL
+// included, because those refusals come before any part of the request is
+// applied. A not-durable refusal comes from the part that failed: earlier
+// parts of the same request (other measurements or records) may already be
+// buffered, and the failed part's WAL entry may have reached the file and
+// replay after a restart. A retry can therefore duplicate rows. Unlike ErrIngestFenced, retrying against this same node is
 // right. Reason is a Refusal constant: the HTTP answer carries it in the
 // X-Arc-Ingest-Refused header, and refusals are logged by it. Compare with
 // errors.Is against the package's Err values (same reason matches).
@@ -53,6 +61,22 @@ func (e *WriteRefusal) Is(target error) bool {
 var ErrWALDiskPressure error = &WriteRefusal{
 	Reason: RefusalWALDisk,
 	Text:   "write refused: the WAL volume is low on free space (WAL volume disk pressure); nothing was written, retry",
+}
+
+// ErrWALNotDurable refuses a live write whose WAL entry could not be made
+// durable in wal.ack_mode = "durable". Retryable.
+var ErrWALNotDurable error = &WriteRefusal{
+	Reason: RefusalWALNotDurable,
+	Text:   "write refused: the WAL entry could not be made durable; earlier parts of this request may already be stored, retry (a retry can duplicate them)",
+}
+
+// walNotDurable wraps a WAL ErrNotDurable as a not-durable refusal, keeping
+// the cause in the text.
+func walNotDurable(err error) error {
+	return &WriteRefusal{
+		Reason: RefusalWALNotDurable,
+		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); earlier parts of this request may already be stored, retry (a retry can duplicate them)",
+	}
 }
 
 // IsWriteRefusal reports any retryable refusal of a live write: a fence

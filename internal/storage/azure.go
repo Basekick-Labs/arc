@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -32,7 +33,52 @@ type AzureBlobBackend struct {
 	// tokenCred is the Entra credential of managed-identity auth: it
 	// authorises a server-side copy's source (CopyObject).
 	tokenCred azcore.TokenCredential
-	logger    zerolog.Logger
+	// secrets are the credential values this backend was built with, removed
+	// from the text of every error it returns (scrub).
+	secrets []string
+	logger  zerolog.Logger
+}
+
+// scrub removes credential material from the text of the error a method is
+// about to return. Every exported method that returns an error defers it, so
+// nothing the backend hands to a caller (and from there to a status payload,
+// an API response or a stored record) carries a credential.
+func (b *AzureBlobBackend) scrub(err *error) {
+	*err = redactError(*err, b.secrets...)
+}
+
+// azureClientOptions is nil in production (the SDK defaults); tests set it to
+// turn retries off so failure paths run in milliseconds.
+var azureClientOptions *azblob.ClientOptions
+
+// azureCredentialSecrets lists the credential values in cfg that error text
+// must never carry: whole values, and the signing parts inside them.
+func azureCredentialSecrets(connectionString, sasToken, accountKey string) []string {
+	secrets := []string{connectionString, sasToken, accountKey}
+	if q, err := url.ParseQuery(sasToken); err == nil {
+		secrets = append(secrets, q.Get("sig"))
+	}
+	for _, part := range strings.Split(connectionString, ";") {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "sharedaccesssignature", "accountkey":
+			secrets = append(secrets, v)
+			if q, err := url.ParseQuery(v); err == nil {
+				secrets = append(secrets, q.Get("sig"))
+			}
+		}
+	}
+	return secrets
+}
+
+// hasControlChar reports a control character, which a credential copied from
+// a file often ends with (a trailing newline). It would make every request
+// fail to build, with the credential in the error.
+func hasControlChar(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
 }
 
 // AzureBlobConfig holds Azure Blob Storage backend configuration
@@ -84,46 +130,63 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 
 	log := logger.With().Str("component", "azure-storage").Logger()
 
+	// Surrounding whitespace is dropped (a value read from a file usually
+	// ends in a newline); anything else that is a control character refuses
+	// the configuration. Neither message names the value.
+	connectionString := strings.TrimSpace(cfg.ConnectionString)
+	sasToken := strings.TrimPrefix(strings.TrimSpace(cfg.SASToken), "?")
+	accountKey := strings.TrimSpace(cfg.AccountKey)
+	endpointValue := strings.TrimSpace(cfg.Endpoint)
+	if hasControlChar(connectionString) || hasControlChar(sasToken) || hasControlChar(accountKey) || hasControlChar(endpointValue) {
+		return nil, fmt.Errorf("Azure credential configuration contains a control character; check the connection string, SAS token, account key and endpoint values")
+	}
+	secrets := azureCredentialSecrets(connectionString, sasToken, accountKey)
+
 	var client *azblob.Client
 	var endpoint string
 	var tokenCred azcore.TokenCredential
 
 	// Try authentication methods in order of preference
 	switch {
-	case cfg.ConnectionString != "":
+	case connectionString != "":
 		// Connection string authentication
-		client, err = azblob.NewClientFromConnectionString(cfg.ConnectionString, nil)
+		client, err = azblob.NewClientFromConnectionString(connectionString, azureClientOptions)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create Azure client from connection string: %w", err)
+			return nil, redactError(fmt.Errorf("failed to create Azure client from connection string: %w", err), secrets...)
 		}
 		log.Info().Msg("Using connection string authentication for Azure Blob Storage")
 
-	case cfg.AccountName != "" && cfg.SASToken != "":
+	case cfg.AccountName != "" && sasToken != "":
 		// SAS token authentication
-		if cfg.Endpoint != "" {
-			endpoint = cfg.Endpoint
+		if endpointValue != "" {
+			endpoint = endpointValue
 		} else {
 			endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", cfg.AccountName)
 		}
-		serviceURL := fmt.Sprintf("%s?%s", endpoint, strings.TrimPrefix(cfg.SASToken, "?"))
-		client, err = azblob.NewClientWithNoCredential(serviceURL, nil)
+		serviceURL := fmt.Sprintf("%s?%s", endpoint, sasToken)
+		// The client does not parse this until the first request, where a
+		// failure would quote it whole.
+		if _, perr := url.Parse(serviceURL); perr != nil {
+			return nil, fmt.Errorf("Azure endpoint and SAS token do not form a usable service address")
+		}
+		client, err = azblob.NewClientWithNoCredential(serviceURL, azureClientOptions)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create Azure client with SAS token: %w", err)
+			return nil, redactError(fmt.Errorf("failed to create Azure client with SAS token: %w", err), secrets...)
 		}
 		log.Info().Msg("Using SAS token authentication for Azure Blob Storage")
 
-	case cfg.AccountName != "" && cfg.AccountKey != "":
+	case cfg.AccountName != "" && accountKey != "":
 		// Shared key authentication
-		if cfg.Endpoint != "" {
-			endpoint = cfg.Endpoint
+		if endpointValue != "" {
+			endpoint = endpointValue
 		} else {
 			endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", cfg.AccountName)
 		}
-		cred, credErr := azblob.NewSharedKeyCredential(cfg.AccountName, cfg.AccountKey)
+		cred, credErr := azblob.NewSharedKeyCredential(cfg.AccountName, accountKey)
 		if credErr != nil {
-			return nil, fmt.Errorf("failed to create shared key credential: %w", credErr)
+			return nil, redactError(fmt.Errorf("failed to create shared key credential: %w", credErr), secrets...)
 		}
-		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
+		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, azureClientOptions)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Azure client with shared key: %w", err)
 		}
@@ -131,8 +194,8 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 
 	case cfg.UseManagedIdentity && cfg.AccountName != "":
 		// Managed Identity authentication
-		if cfg.Endpoint != "" {
-			endpoint = cfg.Endpoint
+		if endpointValue != "" {
+			endpoint = endpointValue
 		} else {
 			endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", cfg.AccountName)
 		}
@@ -141,7 +204,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 			return nil, fmt.Errorf("failed to create managed identity credential: %w", credErr)
 		}
 		tokenCred = cred
-		client, err = azblob.NewClient(endpoint, cred, nil)
+		client, err = azblob.NewClient(endpoint, cred, azureClientOptions)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Azure client with managed identity: %w", err)
 		}
@@ -159,12 +222,13 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 		accountName:   cfg.AccountName,
 		endpoint:      endpoint,
 		auth: AzureBlobConfig{
-			ConnectionString:   cfg.ConnectionString,
-			AccountKey:         cfg.AccountKey,
-			SASToken:           cfg.SASToken,
+			ConnectionString:   connectionString,
+			AccountKey:         accountKey,
+			SASToken:           sasToken,
 			UseManagedIdentity: cfg.UseManagedIdentity,
 		},
-		logger: log,
+		secrets: secrets,
+		logger:  log,
 	}
 
 	// Test connection by checking if container exists
@@ -174,7 +238,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 	containerClient := client.ServiceClient().NewContainerClient(cfg.ContainerName)
 	_, err = containerClient.GetProperties(ctx, nil)
 	if err != nil {
-		log.Warn().Err(err).Str("container", cfg.ContainerName).Msg("Could not verify container exists (may need to create it)")
+		log.Warn().Err(redactError(err, secrets...)).Str("container", cfg.ContainerName).Msg("Could not verify container exists (may need to create it)")
 	} else {
 		log.Info().Str("container", cfg.ContainerName).Msg("Successfully connected to Azure Blob Storage container")
 	}
@@ -243,12 +307,14 @@ func partitionValidKeys(prefix string, batch []string) (usable []string, rejecte
 }
 
 // Write writes data to Azure Blob Storage.
-func (b *AzureBlobBackend) Write(ctx context.Context, path string, data []byte) error {
+func (b *AzureBlobBackend) Write(ctx context.Context, path string, data []byte) (retErr error) {
+	defer b.scrub(&retErr)
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
 
 // WriteReader writes data from a reader to Azure Blob Storage
-func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) (retErr error) {
+	defer b.scrub(&retErr)
 	return b.writeReader(ctx, path, reader, size, nil)
 }
 
@@ -277,7 +343,7 @@ func (b *AzureBlobBackend) writeReader(ctx context.Context, path string, reader 
 	if err != nil {
 		recordStorageError(ctx, err)
 		b.logger.Error().
-			Err(err).
+			Err(redactError(err, b.secrets...)).
 			Str("path", path).
 			Int64("size", size).
 			Msg("Failed to write to Azure Blob Storage")
@@ -305,7 +371,8 @@ func (b *AzureBlobBackend) writeReader(ctx context.Context, path string, reader 
 }
 
 // Read reads data from Azure Blob Storage
-func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error) {
+func (b *AzureBlobBackend) Read(ctx context.Context, path string) (_ []byte, retErr error) {
+	defer b.scrub(&retErr)
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return nil, err
@@ -338,7 +405,8 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 }
 
 // ReadTo reads data from Azure Blob Storage and writes to a writer
-func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
+func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Writer) (retErr error) {
+	defer b.scrub(&retErr)
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
@@ -372,7 +440,8 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 // ReadToAt reads data from Azure Blob Storage starting at the given byte
 // offset and writes to writer. Uses blob.HTTPRange to skip already-transferred
 // bytes. offset=0 fetches the full blob without a Range header.
-func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) (retErr error) {
+	defer b.scrub(&retErr)
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
@@ -410,7 +479,8 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 }
 
 // StatFile returns the byte size of the Azure blob at path, or -1 if not found.
-func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, error) {
+func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (_ int64, retErr error) {
+	defer b.scrub(&retErr)
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return 0, err
@@ -431,7 +501,8 @@ func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, er
 }
 
 // List lists blobs with the given prefix
-func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, error) {
+func (b *AzureBlobBackend) List(ctx context.Context, prefix string) (_ []string, retErr error) {
+	defer b.scrub(&retErr)
 	fullPrefix, err := b.prefixedListPrefix(prefix)
 	if err != nil {
 		return nil, err
@@ -475,7 +546,8 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 }
 
 // Delete deletes a blob from Azure Blob Storage
-func (b *AzureBlobBackend) Delete(ctx context.Context, path string) error {
+func (b *AzureBlobBackend) Delete(ctx context.Context, path string) (retErr error) {
+	defer b.scrub(&retErr)
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
@@ -502,7 +574,8 @@ func (b *AzureBlobBackend) Delete(ctx context.Context, path string) error {
 // Individual sub-request failures are inspected: 404 (blob not found) is treated
 // as success (already deleted); any other error is collected and returned so
 // callers can fall back to per-file Delete or retry.
-func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) error {
+func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) (retErr error) {
+	defer b.scrub(&retErr)
 	if len(paths) == 0 {
 		return nil
 	}
@@ -563,7 +636,7 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 				blobName = strings.TrimPrefix(*item.BlobName, b.prefix)
 			}
 			b.logger.Warn().
-				Err(item.Error).
+				Err(redactError(item.Error, b.secrets...)).
 				Str("blob", blobName).
 				Msg("Azure batch: individual delete failed")
 			nonFatalErrs = append(nonFatalErrs, fmt.Errorf("%s: %w", blobName, item.Error))
@@ -579,7 +652,8 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 }
 
 // Exists checks if a blob exists in Azure Blob Storage
-func (b *AzureBlobBackend) Exists(ctx context.Context, path string) (bool, error) {
+func (b *AzureBlobBackend) Exists(ctx context.Context, path string) (_ bool, retErr error) {
+	defer b.scrub(&retErr)
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return false, err
@@ -663,7 +737,8 @@ func (b *AzureBlobBackend) ConfigJSON() string {
 // ListDirectories lists immediate subdirectories at a prefix.
 // Implements the DirectoryLister interface.
 // Uses Azure's hierarchy delimiter feature to efficiently list only "directories" (common prefixes).
-func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (_ []string, retErr error) {
+	defer b.scrub(&retErr)
 	// Ensure prefix ends with / for proper directory listing (unless empty)
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix = prefix + "/"
@@ -714,7 +789,8 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 
 // ListObjects lists blobs with their metadata at a prefix.
 // Implements the ObjectLister interface.
-func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) (_ []ObjectInfo, retErr error) {
+	defer b.scrub(&retErr)
 	fullPrefix, err := b.prefixedListPrefix(prefix)
 	if err != nil {
 		return nil, err
@@ -768,7 +844,8 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 // first blob whose name the contract accepts answers true, and the pager is
 // only advanced while a whole page was blobs ListObjects would hide. See
 // S3Backend.HasObjectsUnderPrefix.
-func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (_ bool, retErr error) {
+	defer b.scrub(&retErr)
 	fullPrefix, err := b.prefixedListPrefix(prefix)
 	if err != nil {
 		return false, err
@@ -803,7 +880,8 @@ func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix str
 // Like S3 and unlike local, ".part" blobs are reported: Azure does not stage
 // writes and does not implement StagingInspector, so such a blob is an ordinary
 // committed object that #744's reserved suffix made unaddressable.
-func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error) {
+func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) (_ []UnusableObject, retErr error) {
+	defer b.scrub(&retErr)
 	fullPrefix, err := b.prefixedListPrefix(prefix)
 	if err != nil {
 		return nil, err

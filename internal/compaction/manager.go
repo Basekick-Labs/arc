@@ -1159,18 +1159,19 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 // subprocessJob builds the job a compaction subprocess runs for candidate.
 func (m *Manager) subprocessJob(candidate Candidate, jobID string) *SubprocessJobConfig {
 	config := &SubprocessJobConfig{
-		Database:      candidate.Database,
-		Measurement:   candidate.Measurement,
-		PartitionPath: candidate.PartitionPath,
-		Files:         candidate.Files,
-		Tier:          candidate.Tier,
-		BatchNumber:   candidate.BatchNumber,
-		TempDirectory: m.TempDirectory,
-		MemoryLimit:   m.MemoryLimit,
-		Threads:       m.Threads,
-		SortKeys:      m.GetSortKeys(candidate.Measurement),
-		StorageType:   m.StorageBackend.Type(),
-		StorageConfig: m.StorageBackend.ConfigJSON(),
+		Database:         candidate.Database,
+		Measurement:      candidate.Measurement,
+		PartitionPath:    candidate.PartitionPath,
+		Files:            candidate.Files,
+		Tier:             candidate.Tier,
+		BatchNumber:      candidate.BatchNumber,
+		TempDirectory:    m.TempDirectory,
+		MemoryLimit:      m.MemoryLimit,
+		Threads:          m.Threads,
+		SortKeys:         m.GetSortKeys(candidate.Measurement),
+		SortKeysExplicit: m.hasMeasurementSortKeys(candidate.Measurement),
+		StorageType:      m.StorageBackend.Type(),
+		StorageConfig:    m.StorageBackend.ConfigJSON(),
 		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
 		// (cmd/arc sets it only in cluster mode, completionDirFor), so the
 		// subprocess's clusterMode() returns false and no completion
@@ -2505,8 +2506,19 @@ func (m *Manager) GetSortKeys(measurement string) []string {
 		}
 	}
 
-	// Append "time" - users configure ADDITIONAL sort keys only.
-	return append(keys, "time")
+	// Append "time" - users configure ADDITIONAL sort keys only. Into a new
+	// slice: keys is the shared config slice, and appending to it in place
+	// would write into its spare capacity from concurrent callers.
+	out := make([]string, len(keys), len(keys)+1)
+	copy(out, keys)
+	return append(out, "time")
+}
+
+// hasMeasurementSortKeys reports whether ingest.sort_keys configures this
+// measurement, rather than ingest.default_sort_keys applying to it.
+func (m *Manager) hasMeasurementSortKeys(measurement string) bool {
+	_, ok := m.SortKeysConfig[measurement]
+	return ok
 }
 
 // filterCandidateFiles removes files that are tracked by manifests from a candidate.
