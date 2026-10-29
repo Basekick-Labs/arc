@@ -608,6 +608,60 @@ func TestListBackupsOnlyConsidersBackupIDDirectories(t *testing.T) {
 	}
 }
 
+// manifestFaultDestination makes a candidate backup's manifest unreadable or
+// malformed while leaving listing and every other object operation available.
+type manifestFaultDestination struct {
+	*storage.LocalBackend
+	path string
+	data []byte
+	err  error
+}
+
+func (b *manifestFaultDestination) Read(ctx context.Context, path string) ([]byte, error) {
+	if path == b.path {
+		return b.data, b.err
+	}
+	return b.LocalBackend.Read(ctx, path)
+}
+
+// A directory listing can succeed while every manifest fetch fails. Returning
+// an empty successful result would tell an operator their backups are gone
+// rather than unavailable. A malformed commit record is equally unreadable to
+// the listing and must be surfaced too.
+func TestListBackupsDoesNotReportEmptyWhenManifestIsUnreadable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+		err  error
+	}{
+		{name: "read failure", err: errors.New("simulated manifest read failure")},
+		{name: "malformed manifest", data: []byte("not json")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			m := newBackupAt(t, t.TempDir(), "")
+			result, err := m.CreateBackup(ctx, BackupOptions{})
+			if err != nil {
+				t.Fatalf("CreateBackup: %v", err)
+			}
+
+			m.backupStorage = &manifestFaultDestination{
+				LocalBackend: m.backupStorage.(*storage.LocalBackend),
+				path:         result.Manifest.BackupID + "/manifest.json",
+				data:         tc.data,
+				err:          tc.err,
+			}
+			_, err = m.ListBackups(ctx)
+			if err == nil {
+				t.Fatal("ListBackups succeeded after a candidate manifest could not be read; want an error rather than an incomplete answer")
+			}
+			if !strings.Contains(err.Error(), result.Manifest.BackupID+"/manifest.json") {
+				t.Errorf("ListBackups error = %q, want it to name the unreadable manifest", err)
+			}
+		})
+	}
+}
+
 // countingDestination records which listing call the manager makes.
 type countingDestination struct {
 	storage.Backend
@@ -1135,6 +1189,10 @@ func TestATransportFailureIsNeverClassifiedAsAMissingObject(t *testing.T) {
 		"context deadline exceeded",
 		"operation error S3: GetObject, exceeded maximum number of attempts, 3",
 		"RequestError: send request failed",
+		// #1238: a URL, a local port or a request id holding "404".
+		`operation error S3: GetObject, https response error StatusCode: 0, RequestID: , HostID: , request send failed, Get "http://127.0.0.1:40404/b/backups/backup-20261007-140404-abcdef01/manifest.json": dial tcp 127.0.0.1:40404: connect: connection refused`,
+		"read tcp 127.0.0.1:40412->127.0.0.1:9000: read: connection reset by peer",
+		"https response error StatusCode: 503, RequestID: 404NotFound, api error SlowDown",
 	} {
 		if storage.IsNotFound(errors.New(msg)) {
 			t.Errorf("storage.IsNotFound(%q) = true, want false: a transport failure is not an absent object", msg)

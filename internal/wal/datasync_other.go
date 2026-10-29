@@ -16,9 +16,10 @@ const dataSyncSupported = false
 // fsync semantics, which the WAL logs once at startup so the choice is not
 // silently misrepresented.
 //
-// On darwin, note that Sync() maps to fsync(2), which flushes to the drive but
-// does not force the drive's own write cache — F_FULLFSYNC would be required
-// for that. The durability ladder is softer there regardless of sync mode.
+// On darwin, Go's Sync() issues fcntl(F_FULLFSYNC), which also flushes the
+// drive's own write cache, so both sync modes there are a full cache flush:
+// stronger than fsync(2), and slower, which is where running syncs beside the
+// writer (#1246) helps most.
 func dataSync(f *os.File) error {
 	return f.Sync()
 }

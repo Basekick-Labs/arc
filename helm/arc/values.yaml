@@ -94,10 +94,32 @@ arc:
   wal:
     enabled: true
     directory: /app/data/wal
+    # WAL volume disk pressure (#676): while the data volume's free space is
+    # below diskMinFreeMB, writes get 503 + Retry-After (nothing is written,
+    # clients retry) instead of being accepted and lost to a full disk.
+    diskPressureEnabled: true
+    diskMinFreeMB: 0        # 0 = max(512, 2 x wal.max_size_mb), at most a fifth of the volume
+    # Cap on the WAL directory's bytes. 0 = none, except with persistence
+    # disabled: an emptyDir reports the NODE's free space, so the chart then
+    # caps the WAL at 80% of persistence.emptyDirSizeLimitMB (1024 MB when no
+    # size limit is set). The cap covers the WAL alone: local Parquet files,
+    # arc.db and temp files share the same emptyDir and count against its
+    # sizeLimit, not against this cap. Arc raises a cap below four WAL files
+    # (4 x wal.max_size_mb) to that, with a warning.
+    maxDirectoryMB: 0
   # Additional environment variables
   env: []
     # - name: ARC_AUTH_ENABLED
     #   value: "true"
+
+# Pre-set the initial admin token instead of retrieving the generated token
+# from the pod logs. Existing tokens are preserved on reinstall.
+# `value` must be at least 32 characters long. When existingSecret is set, it
+# must contain the key `bootstrap-token`.
+auth:
+  bootstrapToken:
+    existingSecret: ""
+    value: ""
 
 # Persistent storage for Arc data
 persistence:
@@ -108,6 +130,10 @@ persistence:
   # ingest rate x worst-case WAL flush lag, plus cache and recovery headroom.
   size: 10Gi
   # existingClaim: ""
+  # With enabled: false the data lives in an emptyDir. Its sizeLimit in MB
+  # (0 = none; the pod is evicted when the emptyDir exceeds it). The WAL cap
+  # is derived from it, see arc.wal.maxDirectoryMB.
+  emptyDirSizeLimitMB: 0
 
 # NOTE: there is deliberately no `autoscaling` block here.
 #

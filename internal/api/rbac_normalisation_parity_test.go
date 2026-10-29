@@ -184,15 +184,15 @@ func TestRBACParity_CTEKeywordAsWord(t *testing.T) {
 			}
 			assertNoUnderCheck(t, tt.sql, check, readHeader)
 
-			// Rewriter 2: the parallel-transform entry point, whose own gate
+			// Rewriter 2: the fast-path transform entry point, whose own gate
 			// decides whether the fast path (no CTE guard at all) is reached.
-			parallel, _, _, err := h.getTransformedSQLForParallel(ctx, tt.sql, headerDB)
+			parallel, _, err := h.getTransformedSQLForQuery(ctx, tt.sql, headerDB)
 			if err != nil {
-				t.Fatalf("getTransformedSQLForParallel: %v", err)
+				t.Fatalf("getTransformedSQLForQuery: %v", err)
 			}
 			readParallel := parityReads(parallel)
 			if strings.Join(readParallel, ",") != strings.Join(tt.wantRead, ",") {
-				t.Errorf("getTransformedSQLForParallel read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
+				t.Errorf("getTransformedSQLForQuery read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
 			}
 			assertNoUnderCheck(t, tt.sql, check, readParallel)
 
@@ -274,13 +274,13 @@ func TestRBACParity_CTERegexWithoutWithKeyword(t *testing.T) {
 			}
 			assertNoUnderCheck(t, tt.sql, check, readHeader)
 
-			parallel, _, _, err := h.getTransformedSQLForParallel(ctx, tt.sql, headerDB)
+			parallel, _, err := h.getTransformedSQLForQuery(ctx, tt.sql, headerDB)
 			if err != nil {
-				t.Fatalf("getTransformedSQLForParallel: %v", err)
+				t.Fatalf("getTransformedSQLForQuery: %v", err)
 			}
 			readParallel := parityReads(parallel)
 			if strings.Join(readParallel, ",") != strings.Join(tt.wantRead, ",") {
-				t.Errorf("getTransformedSQLForParallel read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
+				t.Errorf("getTransformedSQLForQuery read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
 			}
 			assertNoUnderCheck(t, tt.sql, check, readParallel)
 		})
@@ -364,13 +364,13 @@ func TestRBACParity_FromKeywordWordBoundary(t *testing.T) {
 			}
 			assertNoUnderCheck(t, tt.sql, check, readHeader)
 
-			parallel, _, _, err := h.getTransformedSQLForParallel(ctx, tt.sql, headerDB)
+			parallel, _, err := h.getTransformedSQLForQuery(ctx, tt.sql, headerDB)
 			if err != nil {
-				t.Fatalf("getTransformedSQLForParallel: %v", err)
+				t.Fatalf("getTransformedSQLForQuery: %v", err)
 			}
 			readParallel := parityReads(parallel)
 			if strings.Join(readParallel, ",") != strings.Join(tt.wantRead, ",") {
-				t.Errorf("getTransformedSQLForParallel read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
+				t.Errorf("getTransformedSQLForQuery read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
 			}
 			assertNoUnderCheck(t, tt.sql, check, readParallel)
 		})
@@ -491,13 +491,13 @@ func TestRBACParity_SpacedDotQualifier(t *testing.T) {
 				}
 				assertNoUnderCheck(t, sql, check, read)
 			}
-			parallel, _, _, err := h.getTransformedSQLForParallel(ctx, sql, headerDB)
+			parallel, _, err := h.getTransformedSQLForQuery(ctx, sql, headerDB)
 			if err != nil {
-				t.Fatalf("getTransformedSQLForParallel: %v", err)
+				t.Fatalf("getTransformedSQLForQuery: %v", err)
 			}
 			readParallel := parityReads(parallel)
 			if strings.Join(readParallel, ",") != strings.Join(check, ",") {
-				t.Errorf("ForParallel read set = %v, want %v (parity with the check set)", readParallel, check)
+				t.Errorf("ForQuery read set = %v, want %v (parity with the check set)", readParallel, check)
 			}
 			assertNoUnderCheck(t, sql, check, readParallel)
 		})

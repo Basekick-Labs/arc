@@ -62,6 +62,23 @@ func waitForFSMPrimary(t *testing.T, raftNode *raft.Node, timeout time.Duration)
 	return ""
 }
 
+func waitForManagerPrimary(t *testing.T, mgr *WriterFailoverManager, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var primaryID string
+	var inProgress bool
+	for time.Now().Before(deadline) {
+		mgr.mu.RLock()
+		primaryID, inProgress = mgr.primaryID, mgr.failoverInProg
+		mgr.mu.RUnlock()
+		if primaryID == want && !inProgress {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("manager primaryID = %q, failoverInProg = %t; want primaryID %q and no election in progress", primaryID, inProgress, want)
+}
+
 func TestWriterFailover_ElectsInitialPrimary(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires a real Raft leader")
@@ -77,15 +94,7 @@ func TestWriterFailover_ElectsInitialPrimary(t *testing.T) {
 	if elected != "writer-1" {
 		t.Fatalf("elected = %q; want writer-1 (before #850 no promotion was ever issued)", elected)
 	}
-	mgr.mu.RLock()
-	primaryID, inProgress := mgr.primaryID, mgr.failoverInProg
-	mgr.mu.RUnlock()
-	if primaryID != "writer-1" {
-		t.Errorf("manager primaryID = %q; want writer-1", primaryID)
-	}
-	if inProgress {
-		t.Error("failoverInProg still set after the election completed")
-	}
+	waitForManagerPrimary(t, mgr, elected, 10*time.Second)
 }
 
 func TestWriterFailover_InitialElectionHappensOnce(t *testing.T) {
@@ -99,12 +108,13 @@ func TestWriterFailover_InitialElectionHappensOnce(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		mgr.checkPrimaryHealth()
 	}
-	if elected := waitForFSMPrimary(t, raftNode, 10*time.Second); elected == "" {
+	elected := waitForFSMPrimary(t, raftNode, 10*time.Second)
+	if elected == "" {
 		t.Fatal("no primary elected")
 	}
+	waitForManagerPrimary(t, mgr, elected, 10*time.Second)
 	// Mirror the promotion into the registry the way the coordinator callback
 	// does, so the manager sees a primary on the next tick.
-	elected := waitForFSMPrimary(t, raftNode, time.Second)
 	if n, ok := reg.Get(elected); ok {
 		n.SetWriterState(WriterStatePrimary)
 		if err := reg.Register(n); err != nil {
@@ -258,18 +268,16 @@ func TestWriterFailover_ElectionDoesNotArmTheCooldown(t *testing.T) {
 	}
 	mgr, raftNode, _ := electionRig(t, "writer-1")
 	mgr.checkPrimaryHealth()
-	if elected := waitForFSMPrimary(t, raftNode, 10*time.Second); elected != "writer-1" {
+	elected := waitForFSMPrimary(t, raftNode, 10*time.Second)
+	if elected != "writer-1" {
 		t.Fatalf("elected = %q; want writer-1", elected)
 	}
+	waitForManagerPrimary(t, mgr, elected, 10*time.Second)
 	mgr.mu.RLock()
 	lastFailoverAt := mgr.lastFailoverAt
-	primaryID := mgr.primaryID
 	mgr.mu.RUnlock()
 	if !lastFailoverAt.IsZero() {
 		t.Error("the election armed the failover cooldown; a failure in the cooldown window would be skipped")
-	}
-	if primaryID != "writer-1" {
-		t.Errorf("primaryID = %q; want writer-1", primaryID)
 	}
 }
 
@@ -328,6 +336,7 @@ func TestWriterFailover_StaysElectedAcrossTicks(t *testing.T) {
 	if elected == "" {
 		t.Fatal("no primary elected")
 	}
+	waitForManagerPrimary(t, mgr, elected, 10*time.Second)
 	// The coordinator callback mirrors the promotion into the registry; do the
 	// same so the manager sees the primary it just elected.
 	if n, ok := reg.Get(elected); ok {
@@ -381,5 +390,42 @@ func TestRouteWrite_PrefersTheElectedPrimary(t *testing.T) {
 	got := reg.GetPrimaryWriter()
 	if got == nil || got.ID != "writer-2" {
 		t.Fatalf("GetPrimaryWriter() = %v; want writer-2, which is what RouteWrite prefers before it falls back to round-robin", got)
+	}
+}
+
+// #1207: a writer whose current process another writer claimed is never
+// selected, including as the self fallback; selection is in id order.
+func TestSelectPrimarySkipsIneligibleWriters(t *testing.T) {
+	local := NewNode("writer-3", "writer-3", RoleWriter, "test-cluster")
+	local.UpdateState(StateHealthy)
+	reg := NewRegistry(&RegistryConfig{LocalNode: local, MaxNodes: 8, Logger: testLogger()})
+	for _, id := range []string{"writer-2", "writer-1"} {
+		n := NewNode(id, id, RoleWriter, "test-cluster")
+		n.UpdateState(StateHealthy)
+		n.SetWriterState(WriterStateStandby)
+		if err := reg.Register(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed := map[string]bool{}
+	mgr := NewWriterFailoverManager(&WriterFailoverConfig{Registry: reg, Logger: testLogger(),
+		Eligible: func(id string) bool { return !claimed[id] }})
+	if got := mgr.selectPrimary("writer-3", false); got != "writer-1" {
+		t.Fatalf("selected %q, want the lowest id writer-1", got)
+	}
+	claimed["writer-1"] = true
+	if got := mgr.selectPrimary("writer-3", false); got != "writer-2" {
+		t.Fatalf("selected %q, want writer-2", got)
+	}
+	claimed["writer-2"] = true
+	if got := mgr.selectPrimary("writer-3", false); got != "" {
+		t.Fatalf("selected %q with every other writer claimed", got)
+	}
+	if got := mgr.selectPrimary("writer-3", true); got != "writer-3" {
+		t.Fatalf("self fallback %q", got)
+	}
+	claimed["writer-3"] = true
+	if got := mgr.selectPrimary("writer-3", true); got != "" {
+		t.Fatalf("a claimed writer selected as its own fallback: %q", got)
 	}
 }

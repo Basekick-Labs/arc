@@ -6,13 +6,16 @@ package cluster
 // hang the shutdown.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/filereplication"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -52,6 +55,19 @@ func (b *recordingBackend) deleteCalls() []string {
 // workers — so a worker that still watched that context would show it.
 func newDeleteRig(t *testing.T, backend storage.Backend, ctxCancelled bool, has func(string) bool) *Coordinator {
 	t.Helper()
+	var relisted func(string) (bool, filereplication.RefreshOutcome)
+	if has != nil {
+		relisted = func(path string) (bool, filereplication.RefreshOutcome) {
+			return has(path), filereplication.RefreshQueued
+		}
+	}
+	return newDeleteRigWith(t, backend, ctxCancelled, relisted, zerolog.Nop())
+}
+
+// newDeleteRigWith is newDeleteRig with the manifest hook and the logger
+// given, both set before the workers start.
+func newDeleteRigWith(t *testing.T, backend storage.Backend, ctxCancelled bool, relisted func(string) (bool, filereplication.RefreshOutcome), logger zerolog.Logger) *Coordinator {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	if ctxCancelled {
 		cancel()
@@ -59,11 +75,11 @@ func newDeleteRig(t *testing.T, backend storage.Backend, ctxCancelled bool, has 
 		t.Cleanup(cancel)
 	}
 	c := &Coordinator{
-		storage:           backend,
-		logger:            zerolog.Nop(),
-		ctx:               ctx,
-		cancel:            cancel,
-		deleteManifestHas: has,
+		storage:                backend,
+		logger:                 logger,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		deleteManifestRelisted: relisted,
 	}
 	c.startDeleteWorkers()
 	t.Cleanup(func() {
@@ -85,6 +101,104 @@ func waitForDeletes(t *testing.T, backend *recordingBackend, want int, within ti
 		time.Sleep(20 * time.Millisecond)
 	}
 	return backend.deleteCalls()
+}
+
+// lockedLogBuffer collects log lines written from several goroutines.
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestDeleteWorkerKeepsARelistedPathAndReportsTheRefresh covers #798's skip: a
+// path the manifest lists again is never unlinked, whatever the puller did
+// with the refresh, and the log says whether the refresh will run.
+func TestDeleteWorkerKeepsARelistedPathAndReportsTheRefresh(t *testing.T) {
+	const path = "testdb/cpu/2026/10/08/reregistered.parquet"
+	cases := []struct {
+		name      string
+		refresh   filereplication.RefreshOutcome
+		wantLevel string
+		wantMsg   string
+	}{
+		{"queued", filereplication.RefreshQueued, "info", "refreshing the local copy"},
+		{"origin", filereplication.RefreshSkippedSelf, "info", "this node is its origin"},
+		{"queue full", filereplication.RefreshDropped, "warn", "queue is full"},
+		{"puller stopped", filereplication.RefreshStopped, "warn", "file puller is stopped"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mem := newMemBackend()
+			oldBody := []byte("old same-size payload")
+			if err := mem.Write(ctx, path, oldBody); err != nil {
+				t.Fatal(err)
+			}
+			backend := &recordingBackend{memBackend: mem}
+			var logs lockedLogBuffer
+			c := &Coordinator{storage: backend, logger: zerolog.New(&logs)}
+			var asked string
+
+			c.unlinkOne(deleteRequest{path: path, reason: "test"}, func(got string) (bool, filereplication.RefreshOutcome) {
+				asked = got
+				return true, tc.refresh
+			})
+
+			if asked != path {
+				t.Fatalf("manifest asked about %q, want %q", asked, path)
+			}
+			if calls := backend.deleteCalls(); len(calls) != 0 {
+				t.Fatalf("manifest-listed path was unlinked: %v", calls)
+			}
+			got, err := mem.Read(ctx, path)
+			if err != nil || !bytes.Equal(got, oldBody) {
+				t.Fatalf("old local copy must stay readable until the refresh lands: got %q, err=%v", got, err)
+			}
+			out := logs.String()
+			if !strings.Contains(out, `"level":"`+tc.wantLevel+`"`) || !strings.Contains(out, tc.wantMsg) {
+				t.Fatalf("log = %s, want level %s with %q", out, tc.wantLevel, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// TestDeleteWorkerThrottlesTheRelistedInfoLog: restores re-register paths in
+// bulk, so the Info line is written at 1, 2, 4, 8 only.
+func TestDeleteWorkerThrottlesTheRelistedInfoLog(t *testing.T) {
+	var logs lockedLogBuffer
+	c := &Coordinator{storage: &recordingBackend{memBackend: newMemBackend()}, logger: zerolog.New(&logs)}
+	relisted := func(string) (bool, filereplication.RefreshOutcome) { return true, filereplication.RefreshQueued }
+	for i := 0; i < 10; i++ {
+		c.unlinkOne(deleteRequest{path: fmt.Sprintf("db/m/p%d.parquet", i), reason: "test"}, relisted)
+	}
+	if n := strings.Count(logs.String(), "refreshing the local copy"); n != 4 {
+		t.Fatalf("Info lines = %d, want 4 (at 1, 2, 4, 8): %s", n, logs.String())
+	}
+}
+
+// TestDeleteWorkerThrottlesTheRelistedWarning: a shutdown drain stops the
+// puller first, so every relisted path still pending would warn.
+func TestDeleteWorkerThrottlesTheRelistedWarning(t *testing.T) {
+	var logs lockedLogBuffer
+	c := &Coordinator{storage: &recordingBackend{memBackend: newMemBackend()}, logger: zerolog.New(&logs)}
+	relisted := func(string) (bool, filereplication.RefreshOutcome) { return true, filereplication.RefreshStopped }
+	for i := 0; i < 10; i++ {
+		c.unlinkOne(deleteRequest{path: fmt.Sprintf("db/m/p%d.parquet", i), reason: "test"}, relisted)
+	}
+	if n := strings.Count(logs.String(), "file puller is stopped"); n != 4 {
+		t.Fatalf("Warn lines = %d, want 4 (at 1, 2, 4, 8): %s", n, logs.String())
+	}
 }
 
 // TestDeleteWorkerClassifiesAnUnusableKey covers the worker's three outcomes.
@@ -234,6 +348,55 @@ func TestDeleteWorkerSkipsPathBackInManifest(t *testing.T) {
 		if ok, _ := mem.Exists(ctx, k); ok {
 			t.Fatalf("%s survived", k)
 		}
+	}
+}
+
+// TestDeleteWorkerPoolReportsTheRefreshOfARelistedPath drives the hook through
+// enqueueLocalDelete and the real workers, not unlinkOne directly: the
+// workers must take c.deleteManifestRelisted when they start, ask it about
+// every path, and log what became of a kept path's refresh.
+func TestDeleteWorkerPoolReportsTheRefreshOfARelistedPath(t *testing.T) {
+	const back = "testdb/cpu/2026/04/11/14/back.parquet"
+	const gone = "testdb/cpu/2026/04/11/14/gone.parquet"
+	mem := newMemBackend()
+	ctx := context.Background()
+	for _, k := range []string{back, gone} {
+		if err := mem.Write(ctx, k, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend := &recordingBackend{memBackend: mem}
+	var (
+		mu    sync.Mutex
+		asked []string
+	)
+	var logs lockedLogBuffer
+	c := newDeleteRigWith(t, backend, false, func(path string) (bool, filereplication.RefreshOutcome) {
+		mu.Lock()
+		asked = append(asked, path)
+		mu.Unlock()
+		return path == back, filereplication.RefreshQueued
+	}, zerolog.New(&logs))
+
+	c.enqueueLocalDelete(back, "test")
+	c.enqueueLocalDelete(gone, "test")
+	calls := waitForDeletes(t, backend, 1, 5*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "refreshing the local copy") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if len(calls) != 1 || calls[0] != gone {
+		t.Fatalf("deletes = %v, want only %s", calls, gone)
+	}
+	mu.Lock()
+	gotAsked := append([]string(nil), asked...)
+	mu.Unlock()
+	if len(gotAsked) != 2 {
+		t.Fatalf("manifest asked about %v, want both paths", gotAsked)
+	}
+	if !strings.Contains(logs.String(), back) || !strings.Contains(logs.String(), "refreshing the local copy") {
+		t.Fatalf("no refresh line for the kept path: %s", logs.String())
 	}
 }
 

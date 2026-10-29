@@ -154,6 +154,10 @@ func (c *TimeSeriesCollector) collect() {
 			"query_rows_total":     m.queryRowsTotal.Load(),
 			// Buffer
 			"buffer_queue_depth":          m.bufferQueueDepth.Load(),
+			"buffer_records_queued":       m.bufferRecordsQueued.Load(),
+			"buffer_records_inflight":     m.bufferRecordsInflight.Load(),
+			"buffer_bytes_buffered":       m.bufferBytesBuffered.Load(),
+			"buffer_oldest_unflushed_ms":  m.bufferOldestAgeNS.Load() / int64(time.Millisecond),
 			"buffer_flushes_total":        m.bufferFlushesTotal.Load(),
 			"buffer_errors_total":         m.bufferErrorsTotal.Load(),
 			"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
@@ -164,11 +168,13 @@ func (c *TimeSeriesCollector) collect() {
 			"storage_read_bytes_total":  m.storageReadBytesTotal.Load(),
 			"storage_errors_total":      m.storageErrorsTotal.Load(),
 			// Compaction
-			"compaction_jobs_total":    m.compactionJobsTotal.Load(),
-			"compaction_jobs_success":  m.compactionJobsSuccess.Load(),
-			"compaction_jobs_failed":   m.compactionJobsFailed.Load(),
-			"compaction_bytes_read":    m.compactionBytesRead.Load(),
-			"compaction_bytes_written": m.compactionBytesWritten.Load(),
+			"compaction_jobs_total":       m.compactionJobsTotal.Load(),
+			"compaction_jobs_success":     m.compactionJobsSuccess.Load(),
+			"compaction_jobs_failed":      m.compactionJobsFailed.Load(),
+			"compaction_jobs_interrupted": m.compactionJobsInterrupted.Load(),
+			"compaction_files_compacted":  m.compactionFilesCompacted.Load(),
+			"compaction_bytes_read":       m.compactionBytesRead.Load(),
+			"compaction_bytes_written":    m.compactionBytesWritten.Load(),
 		},
 	})
 

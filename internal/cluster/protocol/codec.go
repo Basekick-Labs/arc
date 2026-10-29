@@ -205,6 +205,62 @@ func unmarshalPayload(msgType MessageType, payload []byte) (interface{}, error) 
 		}
 		return &ack, nil
 
+	case MsgOriginStreamHello:
+		var hello OriginStreamHello
+		if err := json.Unmarshal(payload, &hello); err != nil {
+			return nil, err
+		}
+		return &hello, nil
+
+	case MsgOriginStreamHelloAck:
+		var ack OriginStreamHelloAck
+		if err := json.Unmarshal(payload, &ack); err != nil {
+			return nil, err
+		}
+		return &ack, nil
+
+	case MsgPendingRegistrationsQuery:
+		var q PendingRegistrationsQuery
+		if err := json.Unmarshal(payload, &q); err != nil {
+			return nil, err
+		}
+		return &q, nil
+
+	case MsgPendingRegistrationsReply:
+		var reply PendingRegistrationsReply
+		if err := json.Unmarshal(payload, &reply); err != nil {
+			return nil, err
+		}
+		return &reply, nil
+
+	case MsgFlushScopeRequest:
+		var q FlushScopeRequest
+		if err := json.Unmarshal(payload, &q); err != nil {
+			return nil, err
+		}
+		return &q, nil
+
+	case MsgFlushScopeReply:
+		var reply FlushScopeReply
+		if err := json.Unmarshal(payload, &reply); err != nil {
+			return nil, err
+		}
+		return &reply, nil
+
+	case MsgLocalPoliciesQuery:
+		var q LocalPoliciesQuery
+		if err := json.Unmarshal(payload, &q); err != nil {
+			return nil, err
+		}
+		return &q, nil
+
+	case MsgLocalPoliciesReply:
+		var reply LocalPoliciesReply
+		if err := json.Unmarshal(payload, &reply); err != nil {
+			return nil, err
+		}
+		return &reply, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msgType)
 	}

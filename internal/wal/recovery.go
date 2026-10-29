@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -25,14 +26,23 @@ type TrackedRecoveryCallback func(ctx context.Context, records []map[string]inte
 // walIdentity is the identity of the entry being replayed, so the re-buffered
 // batch can inherit it and have its eventual flush checkpoint the ORIGINAL
 // entry — which is what stops a later pass replaying it again. It is empty for
-// an entry that carries no tracked identity.
+// an entry that carries no tracked identity. database may be empty if the WAL
+// entry predates the envelope format (defaults to "default").
 type ColumnarRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error
+
+// ColumnarRecoveryCallbackWithTagColumns also receives tag metadata preserved
+// in raw MessagePack entries. When set, it takes precedence over ColumnarCallback.
+type ColumnarRecoveryCallbackWithTagColumns func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error
 
 // RecoveryStats holds statistics about WAL recovery
 type RecoveryStats struct {
 	RecoveredFiles   int
 	RecoveredBatches int
 	RecoveredEntries int
+	// CorruptedEntries counts entries this pass could not replay: damaged
+	// ones, ones whose replay failed, and intact ones that cannot be decoded
+	// and were not flushed. An undecodable entry already flushed is skipped
+	// like any other flushed entry, and not counted.
 	CorruptedEntries int
 	SkippedFiles     int
 	KeptFiles        int
@@ -51,6 +61,13 @@ type RecoveryStats struct {
 	// a bad coverage map is itself evidence that ranges exist.
 	PartialRowEntries int
 	RecoveryDuration  time.Duration
+	// Retained lists the files this pass replayed (or found checkpointed) but
+	// kept because a batch in them is still waiting for its file to register
+	// (#1207 S4c), and every file after the first such one: a later file can
+	// hold the only checkpoint for an earlier one's entries. Not failures: they
+	// are not counted in KeptFiles; the writer deletes them through
+	// ReleaseRetained once nothing in them is held.
+	Retained []RetainedFile
 }
 
 // RecoveryOptions configures WAL recovery behavior
@@ -70,6 +87,9 @@ type RecoveryOptions struct {
 
 	// ColumnarCallback handles columnar WAL entries from the zero-copy write path
 	ColumnarCallback ColumnarRecoveryCallback
+
+	// ColumnarCallbackWithTagColumns preserves raw MessagePack tag metadata.
+	ColumnarCallbackWithTagColumns ColumnarRecoveryCallbackWithTagColumns
 
 	// TrackedRowCallback handles row-format entries in batches bounded by
 	// BatchSize. Legacy content-hash entries inherit no checkpoint identity.
@@ -122,6 +142,15 @@ type RecoveryOptions struct {
 	// MaxReplayFailures is the number of failed replay passes before a poison
 	// WAL file is quarantined as .wal.failed. Defaults to 3.
 	MaxReplayFailures int
+
+	// Held returns the registration hold (#1207 S4c). It is consulted after
+	// each barrier, so the batches this pass just replayed are in it. Nil
+	// holds nothing.
+	Held func() CoverageHold
+
+	// OnQuarantine is called after a WAL file is moved to quarantinedAs, so
+	// the writer can stop waiting for the entries in it (#1225).
+	OnQuarantine func(path, quarantinedAs string)
 }
 
 // Recovery manages WAL recovery operations
@@ -231,10 +260,14 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		entries int
 		batches int
 		parents []string
+		cov     coverageSet
 	}
 	var pendingDelete []recoveredWALFile
 	pendingRows := 0
 	var recoveryErr error
+	// retaining is set by the first file kept for the registration hold; no
+	// later file of this pass is deleted after it.
+	retaining := false
 	flushPending := func() bool {
 		if len(pendingDelete) == 0 {
 			return true
@@ -285,7 +318,24 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				}
 			}
 		}
+		var hold CoverageHold
+		if opts.Held != nil {
+			hold = opts.Held()
+		}
 		for index, recovered := range pendingDelete {
+			if retaining || recovered.cov.held(hold) {
+				if !retaining {
+					r.logger.Info().Str("file", filepath.Base(recovered.path)).
+						Msg("Keeping a recovered WAL file: batches in it are waiting for their files to register")
+				}
+				retaining = true
+				// The empty-file delete and quarantine below are not gated by
+				// this: neither file carries proof another file needs.
+				stats.Retained = append(stats.Retained, RetainedFile{Path: recovered.path, Coverage: recovered.cov.spans()})
+				stats.RecoveredBatches += recovered.batches
+				stats.RecoveredEntries += recovered.entries
+				continue
+			}
 			if err := os.Remove(recovered.path); err != nil {
 				if !os.IsNotExist(err) {
 					stats.KeptFiles += len(pendingDelete) - index
@@ -314,20 +364,31 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			recoveryErr = err
 			return false
 		}
-		quarantined, quarantineErr := r.noteReplayFailure(path, maxReplayFailures)
+		quarantinedAs, quarantineErr := r.noteReplayFailure(path, maxReplayFailures)
+		if quarantinedAs != "" {
+			// Renamed, even if the directory sync after it failed: the file
+			// is out of the WAL directory either way.
+			if quarantineErr != nil {
+				r.logger.Warn().Err(quarantineErr).Str("file", filepath.Base(path)).
+					Msg("Quarantined WAL file, but the WAL directory could not be synced after the rename")
+			}
+			stats.QuarantinedFiles++
+			metrics.Get().IncWALQuarantinedFiles()
+			r.logger.Error().Err(cause).
+				Str("file", filepath.Base(path)).
+				Str("quarantined_as", filepath.Base(quarantinedAs)).
+				Int("attempts", maxReplayFailures).
+				Msg("Quarantined WAL file after repeated recovery failures")
+			if opts.OnQuarantine != nil {
+				opts.OnQuarantine(path, quarantinedAs)
+			}
+			return true
+		}
 		if quarantineErr != nil {
 			stats.KeptFiles++
 			recoveryErr = fmt.Errorf("persist WAL replay failure for %q: %w", path, quarantineErr)
 			r.logger.Error().Err(quarantineErr).Str("file", path).Msg("Failed to quarantine repeatedly failing WAL file")
 			return false
-		}
-		if quarantined {
-			stats.QuarantinedFiles++
-			r.logger.Error().Err(cause).
-				Str("file", filepath.Base(path)).
-				Int("attempts", maxReplayFailures).
-				Msg("Quarantined WAL file after repeated recovery failures")
-			return true
 		}
 		stats.KeptFiles++
 		return false
@@ -415,19 +476,46 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		fileRecoveredEntries := 0
 		var fileRecoveredParents []string
 		hadSplitTracked := false
+		fileCov := make(coverageSet)
 
 		for _, entry := range entries {
 			if len(entry.CheckpointHashes) > 0 {
 				continue
 			}
+			// Before the checkpoint skip: a batch already flushed is held
+			// until its file registers, like one replayed now.
+			if entry.Coverage != nil {
+				fileCov.add(entry.Coverage.Instance, entry.Coverage.Key, entry.Coverage.CSeq)
+			}
 			if _, ok := flushed[entry.PayloadHash]; ok {
 				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")
 				continue
 			}
+			// After the checkpoint skip: an entry already in storage needs no
+			// decoding, and must not fail its file (#1225).
+			if entry.DecodeErr != nil {
+				r.logger.Error().Err(entry.DecodeErr).Str("file", filepath.Base(walFile)).Str("payload_hash", entry.PayloadHash).
+					Msg("WAL entry cannot be decoded and was not flushed; keeping the file for the replay-failure count")
+				allEntriesSucceeded = false
+				stats.CorruptedEntries++
+				continue
+			}
+			// A covered entry (#1207) carries its batch coverage to the buffer
+			// so the replayed rows register under their original coverage id.
+			entryCtx := ctx
+			if entry.Coverage != nil {
+				entryCtx = WithReplayCoverage(ctx, ReplayCoverage{Coverage: *entry.Coverage, RowTotal: len(entry.Records)})
+			}
 			// Dispatch based on entry format
-			if entry.ColumnarData != nil && opts.ColumnarCallback != nil {
+			if entry.ColumnarData != nil && (opts.ColumnarCallback != nil || opts.ColumnarCallbackWithTagColumns != nil) {
 				// Columnar entry from zero-copy AppendRaw path
-				if err := opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash); err != nil {
+				var err error
+				if opts.ColumnarCallbackWithTagColumns != nil {
+					err = opts.ColumnarCallbackWithTagColumns(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash, entry.ColumnarData.TagColumns)
+				} else {
+					err = opts.ColumnarCallback(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash)
+				}
+				if err != nil {
 					// #590: continue with the remaining entries instead of
 					// abandoning the rest of the file — one poisoned entry
 					// (e.g. a payload the write path rejects) must not
@@ -507,7 +595,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 									identity = recoveryRowIdentity(identity, start, end)
 								}
 							}
-							if err := opts.TrackedRowCallback(ctx, entry.Records[start:end], identity); err != nil {
+							if err := opts.TrackedRowCallback(entryCtx, entry.Records[start:end], identity); err != nil {
 								r.logger.Error().Err(err).Msg("Failed to replay tracked WAL row batch")
 								allEntriesSucceeded = false
 								break
@@ -591,13 +679,13 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		if allEntriesSucceeded && len(entries) > 0 {
 			r.clearReplayFailure(walFile)
 			if fileRecoveredBatches == 0 || opts.BeforeDelete == nil {
-				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents})
+				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents, cov: fileCov})
 				if !flushPending() {
 					stats.KeptFiles += len(walFiles) - fileIndex - 1
 					break
 				}
 			} else {
-				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents})
+				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents, cov: fileCov})
 				pendingRows += fileRecoveredEntries
 				rowsReached := opts.BarrierBatchRows > 0 && pendingRows >= opts.BarrierBatchRows
 				if len(pendingDelete) >= barrierBatchFiles || rowsReached {
@@ -660,12 +748,18 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 // moves it out of the recovery glob after the configured threshold. The
 // quarantined file remains on disk for operator inspection; it is never
 // discarded as part of recovery.
-func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error) {
+// It returns the quarantine path once the file was renamed, even when the
+// directory sync after the rename failed.
+//
+// The attempt sidecar is removed only after a durable rename: if the rename
+// is lost in a crash, the file comes back with its strikes and is
+// quarantined again on the next pass.
+func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (string, error) {
 	r.failuresMu.Lock()
 	defer r.failuresMu.Unlock()
 	attempts, err := readReplayAttempts(path)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if attempts < maxAttempts {
 		attempts++
@@ -696,7 +790,7 @@ func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error)
 			Msg("Could not persist the WAL replay-failure count; counting this pass in memory only, so quarantine may need more passes after a restart")
 	}
 	if attempts < maxAttempts {
-		return false, nil
+		return "", nil
 	}
 
 	quarantinePath := path + ".failed"
@@ -704,15 +798,19 @@ func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error)
 		quarantinePath = fmt.Sprintf("%s.%d.failed", path, time.Now().UnixNano())
 	}
 	if err := os.Rename(path, quarantinePath); err != nil {
-		return false, err
+		return "", err
 	}
-	if err := syncRecoveryDirectory(filepath.Dir(path)); err != nil {
-		return false, err
+	if err := syncQuarantineDirFn(filepath.Dir(path)); err != nil {
+		return quarantinePath, err
 	}
 	r.removeReplayAttempts(path)
 	delete(r.localFailures, path)
-	return true, nil
+	return quarantinePath, nil
 }
+
+// syncQuarantineDirFn syncs the WAL directory after a quarantine rename. A
+// variable so tests can make it fail.
+var syncQuarantineDirFn = syncRecoveryDirectory
 
 func (r *Recovery) clearReplayFailure(path string) {
 	r.failuresMu.Lock()

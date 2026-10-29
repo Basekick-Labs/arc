@@ -274,6 +274,29 @@ func TestRecordUnlinkedFile_SnapshotRemovedIsDecidedByTheColdTier(t *testing.T) 
 	}
 }
 
+// The stale-local sweep reports a copy the cluster deleted while this node
+// missed the delete, also without the reason (#1071): the cold tier decides.
+func TestRecordUnlinkedFile_StaleLocalIsDecidedByTheColdTier(t *testing.T) {
+	cold := newMockBackend("s3")
+	const migrated = "db1/cpu/2026/10/04/a_daily.parquet"
+	const deleted = "db1/cpu/2026/10/04/14/b.parquet"
+	cold.seedRaw(migrated, []byte("cold copy"))
+
+	m := newTierEventManager(t, cold, true)
+	hotRowFor(t, m, migrated)
+	hotRowFor(t, m, deleted)
+	m.RecordUnlinkedFile(migrated, unlinkReasonStaleLocal, 9)
+	m.RecordUnlinkedFile(deleted, unlinkReasonStaleLocal, 9)
+	waitTierEvents(t, m, 2)
+
+	if tier, ok := rowTier(t, m, migrated); !ok || tier != string(TierCold) {
+		t.Fatalf("migrated path: tier=%q present=%v, want cold", tier, ok)
+	}
+	if tier, ok := rowTier(t, m, deleted); ok {
+		t.Fatalf("deleted path: row left at tier %q, want none", tier)
+	}
+}
+
 // errStatBackend is a hot tier that cannot answer a stat right now.
 type errStatBackend struct {
 	*mockBackend

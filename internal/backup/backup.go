@@ -63,6 +63,13 @@ func isSourceReadError(err error) bool {
 	return errors.Is(err, errBackupRead)
 }
 
+// objectGone reports whether the store answers, by type, that the object does
+// not exist. A failed check is not an answer.
+func objectGone(ctx context.Context, src storage.Backend, path string) bool {
+	size, err := src.StatFile(ctx, path)
+	return err == nil && size < 0
+}
+
 // BackupOptions controls what gets backed up and where.
 type BackupOptions struct {
 	IncludeMetadata bool // back up the SQLite database
@@ -102,6 +109,10 @@ type backupRun struct {
 	byName map[string]*backupLeg
 	def    *backupLeg
 	index  *RunIndex
+	// sourceOf: a data file whose bytes are read from another key: the
+	// output of a committed compaction still waiting at its staged key
+	// (#1207 d2a2b).
+	sourceOf map[string]string
 }
 
 // backupLeg is one target's slice of a run.
@@ -642,6 +653,9 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	var stateFiles []storage.ObjectInfo
 	for _, obj := range objects {
 		switch {
+		case isStagedCompaction(obj.Path):
+			// A compaction output waiting for its commit is not data; a
+			// committed one is backed up at its own path (see stagedSource).
 		case isCompactionState(obj.Path):
 			stateFiles = append(stateFiles, obj)
 		case strings.HasSuffix(obj.Path, ".parquet"):
@@ -649,6 +663,27 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		case isIcebergMetadata(obj.Path):
 			icebergMetaFiles = append(icebergMetaFiles, obj)
 		}
+	}
+	// A file a row DELETE replaced and could not remove (the standalone
+	// retired journal) is not data: its replacement holds every row it still
+	// had to keep. Backing it up would bring both back on a restore, with
+	// nothing recording which is the old one.
+	if retired := m.retiredByDelete(ctx, objectLister, objects, sc.empty()); len(retired) > 0 {
+		// Only while its replacement is in this backup: a record is an
+		// intent, written before the replacement may exist.
+		present := make(map[string]bool, len(parquetFiles))
+		for _, obj := range parquetFiles {
+			present[obj.Path] = true
+		}
+		kept := parquetFiles[:0]
+		for _, obj := range parquetFiles {
+			if by, ok := retired[obj.Path]; !ok || !present[by] {
+				kept = append(kept, obj)
+			}
+		}
+		m.logger.Info().Int("files", len(parquetFiles)-len(kept)).
+			Msg("Backup leaves out files a DELETE replaced and has not removed yet")
+		parquetFiles = kept
 	}
 	// A scoped backup carries no Iceberg metadata (#1084): the namespace
 	// directories are not listed at all, and the catalog that would make a
@@ -709,8 +744,8 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// The cold tier is walked BEFORE the assignment, because its dedup
 	// decision removes paths from the hot set (#1086 stage C, decision 2): a
 	// migration copies to cold before releasing the hot copy, so one path can
-	// be in both listings, and the cold copy is the one that cannot vanish
-	// mid-run.
+	// be in both listings, and the cold copy is the one that vanishes mid-run
+	// only when retention deletes it (#168).
 	//
 	// Built from parquetFiles, the PRE-cross-check listing, not from
 	// dataFiles. A migration deletes the manifest entry before the hot copy,
@@ -1266,10 +1301,11 @@ func (r *backupRun) mergedManifest() *Manifest {
 // The tier also decides whether a source-read failure is survivable. For hot
 // it is: the file may have been deleted by compaction or retention between the
 // listing and the copy, so the file is skipped and the run continues. For cold
-// it is NOT, because nothing in Arc ever deletes a cold object — the hot-only
-// DeleteFileInTier is the only tier delete there is — so a cold read failure
-// means the cold store is unreachable, and skipping would turn that into a
-// backup that reports success while missing the data it was asked to carry.
+// it is only when the object is verifiably gone: retention deletes expired cold
+// objects (#168), so one can vanish between the listing and the copy. Any other
+// cold read failure, or one whose object cannot be checked, means the cold
+// store is unreachable, and skipping would turn that into a backup that reports
+// success while missing the data it was asked to carry.
 func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []storage.ObjectInfo, sidecar *sidecarBuilder, src storage.Backend, srcName, tier string) (int64, error) {
 	run := leg.run
 	progress := run.progress
@@ -1308,17 +1344,27 @@ func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []sto
 			continue
 		}
 
-		written, sha, err := m.streamBackupFileSHA(ctx, leg.target, src, srcName, obj.Path, destPath)
+		srcPath := obj.Path
+		if k, ok := run.sourceOf[obj.Path]; ok {
+			srcPath = k
+		}
+		written, sha, err := m.streamBackupFileSHA(ctx, leg.target, src, srcName, srcPath, destPath)
+		if err != nil && srcPath != obj.Path && isSourceReadError(err) {
+			// The compaction finished meanwhile: its output is at its path
+			// now, and its staged copy gone (#1207 d2a2b).
+			srcPath = obj.Path
+			written, sha, err = m.streamBackupFileSHA(ctx, leg.target, src, srcName, srcPath, destPath)
+		}
 		if err != nil {
 			// Only a source-read failure is skippable — the file may have been
 			// deleted by compaction/retention between listing and copy. Anything
 			// else (temp file, seek, backup write) means the environment is broken
 			// and continuing would silently drop files from the backup.
 			//
-			// And never for COLD: see the note on this function. An unreachable
-			// cold store must fail the run, not produce N skips and a green
-			// status.
-			if tier == tierCold || !isSourceReadError(err) {
+			// For COLD, only when the object is verifiably gone: see the note
+			// on this function. An unreachable cold store must fail the run,
+			// not produce N skips and a green status.
+			if !isSourceReadError(err) || (tier == tierCold && !objectGone(ctx, src, srcPath)) {
 				return skipped, fmt.Errorf("failed to back up %s: %w", obj.Path, err)
 			}
 			skipped++
@@ -1937,6 +1983,7 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 	late := map[*backupLeg][]storage.ObjectInfo{}
 	var lateCount int
 	var still []storage.ObjectInfo
+	var compactionInputs int
 	// Writes into the byPath map that every leg's sidecar aliases, so the row
 	// becomes visible to all of them. Correct — it is the manifest snapshot,
 	// not a per-leg set, and only the leg's files list decides what each sidecar
@@ -1964,6 +2011,12 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 		// so a run carrying a few such files could make its own restore
 		// refuse.
 		if _, carried := coldCarried[p]; carried {
+			continue
+		}
+		// An input of a committed object-store compaction: its rows are in
+		// the output, backed up from its staged copy below (#1207 d2a2b).
+		if so, ok := m.cluster.(StagedOutputs); ok && so.CompactionOwns(p) {
+			compactionInputs++
 			continue
 		}
 		still = append(still, obj)
@@ -2000,6 +2053,16 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 			addLate(storage.ObjectInfo{Path: p, Size: size}, e)
 			continue
 		}
+		// A committed object-store compaction whose output is not at its
+		// path yet: its bytes are at the staged key (#1207 d2a2b).
+		if key, size, ok := m.stagedSource(ctx, p); ok {
+			if run.sourceOf == nil {
+				run.sourceOf = map[string]string{}
+			}
+			run.sourceOf[p] = key
+			addLate(storage.ObjectInfo{Path: p, Size: size}, e)
+			continue
+		}
 		absent++
 		leg := run.legFor(p)
 		leg.manifest.ManifestOnlyFiles++
@@ -2029,6 +2092,10 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 			}
 			leg.dataSkipped += skipped
 		}
+	}
+	if compactionInputs > 0 {
+		m.logger.Info().Int("files", compactionInputs).
+			Msg("Inputs of committed compactions still in storage were not backed up: their rows are in the compactions' outputs, which were")
 	}
 	if len(still) > 0 {
 		var sample []string
@@ -2450,6 +2517,45 @@ func (m *Manager) copyStateFiles(ctx context.Context, leg *backupLeg) (int64, er
 
 // isCompactionState reports whether a key is compaction's crash-recovery
 // state: a manifest or a parked manifest under _compaction_state/.
+// deleteRetiredDir is the standalone DELETE's retired journal.
+const deleteRetiredDir = storage.DeleteRetiredRoot
+
+// retiredByDelete returns the files the retired journal names. An unscoped
+// backup's listing already holds the journal; a scoped one lists it. A
+// journal that cannot be read leaves them in the backup, as before.
+func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectLister, listed []storage.ObjectInfo, whole bool) map[string]string {
+	var objs []storage.ObjectInfo
+	if whole {
+		for _, o := range listed {
+			if strings.HasPrefix(o.Path, deleteRetiredDir+"/") {
+				objs = append(objs, o)
+			}
+		}
+	} else {
+		var err error
+		if objs, err = lister.ListObjects(ctx, deleteRetiredDir+"/"); err != nil {
+			return nil
+		}
+	}
+	if len(objs) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(objs))
+	for _, o := range objs {
+		if !strings.HasSuffix(o.Path, ".json") {
+			continue
+		}
+		data, err := m.dataStorage.Read(ctx, o.Path)
+		if err != nil {
+			continue
+		}
+		if p, by, ok := storage.ParseRetiredRecord(o.Path, data); ok && by != "" {
+			out[p] = by
+		}
+	}
+	return out
+}
+
 func isCompactionState(path string) bool {
 	return strings.HasPrefix(filepath.ToSlash(path), compactionStateDir+"/")
 }
@@ -2464,4 +2570,39 @@ func parseDBMeasurement(path string) (database, measurement string) {
 		return parts[0], "unknown"
 	}
 	return "unknown", "unknown"
+}
+
+// isStagedCompaction reports a key under the staged compaction root
+// (compaction.StagedRoot, spelled here so this package does not import
+// compaction).
+func isStagedCompaction(path string) bool {
+	return strings.HasPrefix(filepath.ToSlash(path), stagedCompactionRoot+"/")
+}
+
+const stagedCompactionRoot = "_compaction_staged"
+
+// StagedOutputs is a ClusterManifest that knows committed object-store
+// compactions (#1207 d2a2b): the key an output waits at until its finisher
+// copies it to its path, and the inputs such a job still owns.
+type StagedOutputs interface {
+	StagedOutputKey(path string) (key string, ok bool)
+	CompactionOwns(path string) bool
+}
+
+// stagedSource returns the staged key and size of a registered output that
+// is not at its path yet.
+func (m *Manager) stagedSource(ctx context.Context, path string) (string, int64, bool) {
+	so, ok := m.cluster.(StagedOutputs)
+	if !ok {
+		return "", 0, false
+	}
+	key, ok := so.StagedOutputKey(path)
+	if !ok {
+		return "", 0, false
+	}
+	size, err := m.dataStorage.StatFile(ctx, key)
+	if err != nil || size < 0 {
+		return "", 0, false
+	}
+	return key, size, true
 }

@@ -13,9 +13,17 @@ spec:
       {{- include "arc.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.podAnnotations .Values.arc.config.enabled }}
       annotations:
+        {{- if .Values.arc.config.enabled }}
+        {{- /* The config is mounted with subPath, which kubelet never
+             refreshes. Roll the pod when it changes, or an upgrade keeps
+             the old file. */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       labels:
         {{- include "arc.labels" . | nindent 8 }}
@@ -54,8 +62,23 @@ spec:
               value: {{ .Values.arc.wal.enabled | quote }}
             - name: ARC_WAL_DIRECTORY
               value: {{ .Values.arc.wal.directory | quote }}
+            # WAL volume disk pressure (#676): 503 instead of losing writes
+            # to a full volume.
+            - name: ARC_WAL_DISK_PRESSURE_ENABLED
+              value: {{ ternary "true" "false" (ne .Values.arc.wal.diskPressureEnabled false) | quote }}
+            - name: ARC_WAL_DISK_MIN_FREE_MB
+              value: {{ .Values.arc.wal.diskMinFreeMB | default 0 | int | quote }}
+            - name: ARC_WAL_MAX_DIRECTORY_MB
+              value: {{ include "arc.walMaxDirectoryMB" . | quote }}
             {{- with .Values.arc.env }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if or .Values.auth.bootstrapToken.existingSecret .Values.auth.bootstrapToken.value }}
+            - name: ARC_AUTH_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arc.bootstrapTokenSecretName" . }}
+                  key: bootstrap-token
             {{- end }}
           startupProbe:
             # WAL replay runs before the listener binds. Keep liveness from
@@ -100,7 +123,12 @@ spec:
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.existingClaim | default (include "arc.fullname" .) }}
           {{- else }}
+          {{- if gt (int (.Values.persistence.emptyDirSizeLimitMB | default 0)) 0 }}
+          emptyDir:
+            sizeLimit: {{ printf "%dMi" (int .Values.persistence.emptyDirSizeLimitMB) }}
+          {{- else }}
           emptyDir: {}
+          {{- end }}
           {{- end }}
         {{- if .Values.arc.config.enabled }}
         - name: config

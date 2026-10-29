@@ -175,6 +175,115 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		votersGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	votersGroup.Post("/converge", h.handleConvergeVoters)
+
+	// Admin-only: stream takeover state (#1207).
+	takeoverGroup := app.Group("/api/v1/cluster/stream-claims")
+	if h.authManager != nil {
+		takeoverGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	takeoverGroup.Get("", h.handleGetStreamClaims)
+	takeoverGroup.Post("/:instance/release", h.handleReleaseStreamClaim)
+
+	// Admin-only: end a compaction job that waits for an operator (#1207
+	// d2a2b; GET /api/v1/cluster lists them as compaction_commit.wedged_jobs).
+	compactionJobsGroup := app.Group("/api/v1/cluster/compaction-jobs")
+	if h.authManager != nil {
+		compactionJobsGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	compactionJobsGroup.Post("/:job/abort", h.handleAbortWedgedCompaction)
+
+	// Admin-only: each node's own retention policies, and choosing the node
+	// whose policies the cluster adopts (#1324). Leader only.
+	policiesGroup := app.Group("/api/v1/cluster/policies")
+	if h.authManager != nil {
+		policiesGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	policiesGroup.Get("", h.handleGetPolicyCandidates)
+	policiesGroup.Post("/adopt", h.handleAdoptPolicies)
+}
+
+// handleAbortWedgedCompaction ends a wedged compaction job.
+func (h *ClusterHandler) handleAbortWedgedCompaction(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node",
+		})
+	}
+	job := c.Params("job")
+	if err := h.coordinator.AbortWedgedCompaction(c.Context(), job); err != nil {
+		status := fiber.StatusInternalServerError
+		switch {
+		case errors.Is(err, cluster.ErrCompactionJobNotFound):
+			status = fiber.StatusNotFound
+		case errors.Is(err, cluster.ErrCompactionJobNotWedged), errors.Is(err, cluster.ErrClusterRaftNotConfigured):
+			status = fiber.StatusConflict
+		}
+		if status == fiber.StatusInternalServerError {
+			h.logger.Error().Err(err).Str("job", job).Msg("Failed to abort a wedged compaction job")
+		}
+		return c.Status(status).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"success": true, "job": job})
+}
+
+// handleGetStreamClaims returns the writer processes, claims and departed
+// writers of stream takeover, from this node's manifest.
+func (h *ClusterHandler) handleGetStreamClaims(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node",
+		})
+	}
+	return c.JSON(h.coordinator.StreamTakeover())
+}
+
+// releaseStreamClaimRequest is the body of
+// POST /api/v1/cluster/stream-claims/:instance/release. The epoch names the
+// claim: a later claim of the same instance is not released by mistake.
+type releaseStreamClaimRequest struct {
+	Epoch uint64 `json:"epoch"`
+	// Abandon finishes the claim instead: its unpublished batches are left
+	// to their origin (lost when the origin is gone).
+	Abandon bool `json:"abandon"`
+}
+
+// handleReleaseStreamClaim releases an unfinished stream claim whose
+// claimant cannot finish it, so another writer may take the instance over,
+// or abandons it ({"abandon": true}).
+// The instance is the 16-digit hex id the GET lists. Leader only.
+func (h *ClusterHandler) handleReleaseStreamClaim(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node",
+		})
+	}
+	inst, err := strconv.ParseUint(c.Params("instance"), 16, 64)
+	if err != nil || inst == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "instance must be the hex id listed by GET /api/v1/cluster/stream-claims"})
+	}
+	var req releaseStreamClaimRequest
+	if err := json.Unmarshal(c.Body(), &req); err != nil || req.Epoch == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "body must be {\"epoch\": n}, the epoch GET /api/v1/cluster/stream-claims lists for the claim"})
+	}
+	if err := h.coordinator.ReleaseStreamClaim(inst, req.Epoch, req.Abandon); err != nil {
+		status := fiber.StatusInternalServerError
+		switch {
+		case errors.Is(err, cluster.ErrStreamClaimNotFound):
+			status = fiber.StatusNotFound
+		case errors.Is(err, cluster.ErrStreamClaimFinished),
+			errors.Is(err, cluster.ErrNotLeaderForTopology),
+			errors.Is(err, cluster.ErrClusterRaftNotConfigured):
+			status = fiber.StatusConflict
+		}
+		if status == fiber.StatusInternalServerError {
+			h.logger.Error().Err(err).Msg("Failed to release a stream claim")
+		}
+		return c.Status(status).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"success": true, "instance": fmt.Sprintf("%016x", inst), "epoch": req.Epoch, "abandoned": req.Abandon})
 }
 
 // convergeVotersRequest is the body of POST /api/v1/cluster/voters/converge.
@@ -748,7 +857,7 @@ func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
 		}
 
 		return c.JSON(fiber.Map{
-			"files":       files,
+			"files":       withoutCoverage(files),
 			"total":       len(files),
 			"next_cursor": nextCursor,
 		})
@@ -763,9 +872,21 @@ func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"files": files,
+		"files": withoutCoverage(files),
 		"total": len(files),
 	})
+}
+
+// withoutCoverage returns copies of files without their batch coverage
+// (#1207 S4b): it is cluster-internal, and would multiply a page's size.
+func withoutCoverage(files []*clusterraft.FileEntry) []*clusterraft.FileEntry {
+	out := make([]*clusterraft.FileEntry, len(files))
+	for i, f := range files {
+		cp := *f
+		cp.Coverage = nil
+		out[i] = &cp
+	}
+	return out
 }
 
 // paginateSlice applies cursor-based pagination to an in-memory slice.

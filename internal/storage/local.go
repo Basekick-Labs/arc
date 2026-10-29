@@ -395,7 +395,7 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
-			return fmt.Errorf("file not found: %s", path)
+			return fmt.Errorf("%w: %s", ErrObjectNotFound, path)
 		}
 		return fmt.Errorf("failed to open file: %w", err)
 	}
@@ -444,7 +444,7 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
-			return fmt.Errorf("file not found: %s", path)
+			return fmt.Errorf("%w: %s", ErrObjectNotFound, path)
 		}
 		return fmt.Errorf("failed to open file: %w", err)
 	}
@@ -953,10 +953,9 @@ const (
 // MaxUsableKeyLen is exported at all: a caller that BUILDS keys under a
 // configured prefix has to bound the prefix by the same arithmetic, and
 // computing it independently is how a five-byte window opens. ValidateObjectPrefix
-// bounds a prefix at MaxUsableKeyLen on its OWN and the backends then build
-// prefix+key without re-checking the sum (prefixedKey validates the
-// UNPREFIXED key), so nothing else in this package bounds a prefix relative to
-// the keys that will follow it.
+// bounds a prefix on its own; object-store backends also validate the complete
+// prefixed name in prefixObjectKey so the combined length stays within this
+// limit (#1121).
 const LongestBackupKeySuffix = len("backup-20060102-150405-12345678/manifest-files.json")
 
 // MaxBackupTargetPrefixLen is the longest object-key prefix a backup
@@ -1227,7 +1226,7 @@ func (b *LocalBackend) ReadStaged(ctx context.Context, key string, writer io.Wri
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
-			return fmt.Errorf("file not found: %s", key)
+			return fmt.Errorf("%w: %s", ErrObjectNotFound, key)
 		}
 		return fmt.Errorf("failed to open staged file: %w", err)
 	}

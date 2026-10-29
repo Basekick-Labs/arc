@@ -1,6 +1,6 @@
 # Arc
 
-[![Ingestion](https://img.shields.io/badge/ingestion-34M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Ingestion](https://img.shields.io/badge/ingestion-38M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 34M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
+Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 38M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
 >
@@ -106,24 +106,28 @@ See Arc in action: [https://basekick.net/demos](https://basekick.net/demos)
 Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
-### Ingestion (August 2026)
+### Ingestion (October 2026)
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **34.0M rec/s** | 0.29ms | 1.40ms |
-| MessagePack + Zstd | 24.9M rec/s | 0.42ms | 1.53ms |
-| MessagePack + GZIP | 24.6M rec/s | 0.42ms | 1.53ms |
-| Line Protocol | 4.7M rec/s | 2.19ms | 6.61ms |
+| MessagePack Columnar | **38.1M rec/s** | 0.26ms | 1.19ms |
+| MessagePack + Zstd | 30.3M rec/s | 0.35ms | 1.23ms |
+| MessagePack + GZIP | 26.4M rec/s | 0.39ms | 1.36ms |
+| Line Protocol | 9.3M rec/s | 1.07ms | 3.38Ms |
 
 All rows measured over a 60-second sustained run. The MessagePack Columnar row is
-**2,043,451,000 records ingested in 60 seconds** — and that's not rows streamed into
+**2,288,281,000 records ingested in 60 seconds** — and that's not rows streamed into
 a memory buffer: every record was received over HTTP, decoded, time-sorted, and
-durably written to disk as queryable Parquet, at 0.29ms median latency, on a laptop.
+durably written to disk as queryable Parquet, at 0.26ms median latency, on a laptop.
 
-These numbers ship in **26.09.1**: ingest no longer dictionary-encodes Parquet
-(compaction re-encodes files anyway) and the msgpack columnar path now decodes
-payloads directly into typed column arrays, eliminating per-value allocations —
-see the 26.09.1 release notes.
+These numbers ship in **27.01.1**. Since 26.09.1 (34.0M, 24.9M, 24.6M and 4.7M
+rec/s): line-protocol writes parse straight into typed columns (#1299), and
+flushes copy each column once less on the way to Parquet.
+
+26.09.1 stopped dictionary-encoding Parquet at ingest (compaction re-encodes
+files anyway) and made the msgpack columnar path decode payloads directly into
+typed column arrays, eliminating per-value allocations — see the 26.09.1
+release notes.
 
 ### Compaction
 
@@ -139,32 +143,34 @@ Benefits:
 - **Faster queries** - scan 1 file vs 43 files
 - **Lower cloud costs** - less storage, fewer API calls
 
-### Query (May 2026)
+### Query (October 2026)
 
 Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (columnar, stable as of 26.09.1) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
 
-Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, M3 Max. Latency is p50 in milliseconds. The five SELECT-LIMIT rows were measured back-to-back in the same session so the three columns are apples-to-apples; the DuckDB-bound rows (Time Bucket, Date Trunc, GROUP BY) are dominated by query execution and converge across wire formats.
+Benchmark: Arc 27.01.1 (main at b4d98a31, October 2026), M3 Max, `query_suite` from arc-benchmarks, 5 iterations per query, latency is p50 in milliseconds. One session, one dataset: a 532.6M-row `cpu` measurement (60 s of `sustained_bench` msgpack ingest spread over 24 hours, hourly-compacted: 25 hour partitions, 100 files), so the three columns are apples-to-apples.
 
 | Query | JSON (ms) | MessagePack (ms) | Arrow IPC (ms) | msgpack vs JSON | Arrow vs JSON |
 |-------|----------:|-----------------:|---------------:|----------------:|--------------:|
-| COUNT(*) — 393.7M rows | 1.03 | 1.03 | 0.86 | 1.00x | 1.20x |
-| SELECT LIMIT 10K | 18.4 | 16.6 | 14.7 | 1.11x | 1.25x |
-| SELECT LIMIT 100K | 48.1 | 33.2 | 31.0 | **1.45x** | **1.55x** |
-| SELECT LIMIT 500K | 173.2 | 81.1 | 61.1 | **2.14x** | **2.84x** |
-| SELECT LIMIT 1M | 334.2 | **133.6** | **105.4** | **2.49x** | **3.17x** |
-| Time Range (7d) LIMIT 10K | 15.0 | 15.5 | 15.5 | 0.97x | 0.97x |
-| Time Bucket (1h, 7d) | 4.7 | 4.8 | 4.7 | 0.98x | 1.00x |
-| Date Trunc (day, 30d) | 416 | 415 | 413 | 1.00x | 1.01x |
-| GROUP BY host | 452 | 450 | 450 | 1.00x | 1.00x |
-| GROUP BY host + hour | 645 | 660 | 672 | 0.98x | 0.96x |
+| COUNT(*) — 532.6M rows | 52.9 | 52.1 | 52.5 | 1.02x | 1.01x |
+| SELECT LIMIT 10K | 12.3 | 12.5 | 11.9 | 0.99x | 1.04x |
+| SELECT LIMIT 100K | 18.9 | 17.4 | 14.9 | 1.09x | **1.27x** |
+| SELECT LIMIT 500K | 43.9 | 38.9 | 27.5 | 1.13x | **1.60x** |
+| SELECT LIMIT 1M | 71.6 | **65.4** | **39.6** | 1.09x | **1.81x** |
+| Time Range (1h) LIMIT 10K — no rows in window¹ | 2.6 | 2.7 | 3.1 | 0.96x | 0.84x |
+| Time Range (7d) LIMIT 10K | 13.6 | 13.5 | 12.9 | 1.01x | 1.05x |
+| Time Bucket (1h, 7d) | 605 | 606 | 612 | 1.00x | 0.99x |
+| Date Trunc (day, 30d) | 605 | 609 | 608 | 0.99x | 1.00x |
+| GROUP BY host | 502 | 501 | 500 | 1.00x | 1.00x |
+| GROUP BY host + hour | 835 | 836 | 836 | 1.00x | 1.00x |
 
 **Best throughput on LIMIT 1M (1M-row payload, single connection):**
-- Arrow IPC: **9.49M rows/sec** (105.4ms)
-- MessagePack: **7.49M rows/sec** (133.6ms)
-- JSON: **2.99M rows/sec** (334.2ms)
-- COUNT(*): **~382B rows/sec equivalent** (393.7M rows in 1.03ms — parquet footer reads, not a row scan)
+- Arrow IPC: **25.3M rows/sec** (39.6ms)
+- MessagePack: **15.3M rows/sec** (65.4ms)
+- JSON: **14.0M rows/sec** (71.6ms)
 
-**Notes on the table:** the wire-format speedups manifest on response-heavy queries (≥100k rows) where encoding dominates the per-request wall time. For aggregations (Time Bucket, Date Trunc, GROUP BY) the response is tiny — a few rows — and DuckDB execution is 99%+ of the wall time; all three formats converge. The Arrow IPC win comes from a memcpy of the column buffer; the MessagePack endpoint walks each cell through a typed columnar encoder (one type-switch per column, not per row) and lands at ~78% of Arrow IPC's throughput while remaining decodable by any msgpack client without an Arrow dependency.
+¹ The newest data is two hours old, so the window is empty. Arc 27.01.1 answers it from the newest partition alone (it filters to zero rows) instead of reading the whole measurement, as before (49 ms); measured on main at 2eecb2d1.
+
+**Notes on the table:** the wire-format differences show on response-heavy queries (≥100k rows) where encoding dominates the per-request wall time. For aggregations (Time Bucket, Date Trunc, GROUP BY) the response is a few rows and DuckDB execution is nearly all of the wall time; all three formats converge. Arrow IPC copies the engine's column buffers. Since 27.01.1 every format streams straight to the socket, and JSON and MessagePack are encoded on several cores (JSON by batch, MessagePack by column run, handed to encoder goroutines and written in order); MessagePack's typed columnar encoder keeps it ahead of JSON on large results.
 
 The MessagePack endpoint is **stable** as of 26.09.1: its response shape and type vocabulary are a published contract pinned by a golden test, so clients can bind to them. It's the best general-purpose format for a client not using Arrow directly — columnar, typed, and it accepts SHOW statements, which the Arrow endpoint doesn't. See the 26.09.1 release notes for the wire-format contract.
 
@@ -321,7 +327,8 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 
 - **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
 - **Query**: Full analytical SQL; JSON, columnar MessagePack, and Apache Arrow IPC responses
-- **Compaction**: Tiered (hourly/daily) automatic Parquet file merging — 10x storage reduction
+- **Compaction**: Tiered (hourly/daily) automatic Parquet file merging —
+  10x storage reduction; see [hourly compaction tuning](docs/operations/compaction.md)
 - **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
 - **Durability**: Optional write-ahead log (WAL), backup and restore; [WAL recovery monitoring](docs/operations/wal-recovery.md)
 - **Storage**: Local filesystem, S3 and S3-compatible object stores (SeaweedFS, R2, MinIO, ...), Azure Blob
@@ -379,7 +386,7 @@ arc/
 │   ├── auth/             # Token authentication and RBAC
 │   ├── backup/           # Backup and restore (data, metadata, config)
 │   ├── circuitbreaker/   # Resilience patterns (retry, backoff)
-│   ├── cluster/          # Raft consensus, node roles, WAL replication
+│   ├── cluster/          # Raft consensus, node roles, peer file replication, standby stream
 │   ├── compaction/       # Tiered hourly/daily Parquet file merging
 │   ├── config/           # TOML configuration with env var overrides
 │   ├── database/         # Query engine and connection management
@@ -390,7 +397,6 @@ arc/
 │   ├── metrics/          # Prometheus metrics
 │   ├── mqtt/             # MQTT subscriber — topic-to-measurement ingestion
 │   ├── pruning/          # Query-time partition pruning
-│   ├── query/            # Parallel partition executor
 │   ├── queryregistry/    # Active/completed query tracking
 │   ├── scheduler/        # Continuous queries and retention policies
 │   ├── shutdown/         # Graceful shutdown coordinator

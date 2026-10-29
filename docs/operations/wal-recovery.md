@@ -38,8 +38,17 @@ have been accounted for.
 
 An incomplete final entry after an interrupted append is treated as a truncated
 tail, not as a poison entry. Complete preceding entries still pass the flush
-barrier before their file is removed. A checksum or decoding failure in a
-complete entry remains a recovery failure, even at the end of the file.
+barrier before their file is removed. A checksum failure in a complete entry
+remains a recovery failure, even at the end of the file. An intact entry that
+cannot be decoded is a failure only when it was not flushed: one a checkpoint
+covers is skipped like any flushed entry (#1225).
+
+When the recovery that runs after a failed flush quarantines a file the
+running process wrote, the WAL writer stops waiting for that file's unflushed
+entries, so the WAL purge continues (#1225). The released count is
+`arc_wal_quarantine_released_entries_total`. The purge may then delete a later
+WAL file holding the only checkpoints for the quarantined file's flushed
+entries, so renaming the file back to `.wal` can replay those entries again.
 
 Quarantined WAL files are not replayed, but their valid flush checkpoints are
 still scanned on every recovery pass. A checkpoint in one file can cover data

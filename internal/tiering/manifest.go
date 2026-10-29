@@ -30,6 +30,24 @@ type ManifestCoordinator interface {
 	ManifestEntry(path string) (size int64, ok bool)
 }
 
+// compactionOwner is a ManifestCoordinator that knows the files a staged
+// compaction owns (#1207 d2a2b).
+type compactionOwner interface {
+	CompactionOwns(path string) bool
+}
+
+// heldByCompaction reports a hot file a staged compaction owns: an input or
+// output of a job not yet ended (an input of a committed job is unregistered
+// and still in the bucket until its finisher deletes it). Moving it to the
+// cold tier would leave its rows there next to the compaction's output.
+func (m *Manager) heldByCompaction(path string) bool {
+	if m.manifest == nil {
+		return false
+	}
+	o, ok := m.manifest.(compactionOwner)
+	return ok && o.CompactionOwns(path)
+}
+
 // manifestChunk bounds one manifest proposal, and manifestChunkPause is
 // the least time between two proposals from this node, whatever their
 // source (a migration batch, orphan reconciliation, the sweep) — the

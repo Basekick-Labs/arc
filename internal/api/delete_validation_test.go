@@ -50,6 +50,37 @@ func TestValidateWhereClauseRejectsDangerousTextOutsideLiterals(t *testing.T) {
 	}
 }
 
+func TestValidateWhereClauseRejectsKeywordsGluedToNumbersOrLiterals(t *testing.T) {
+	h := &DeleteHandler{}
+
+	for _, where := range []string{
+		`1=1UNION VALUES (1)`,
+		`host='a'UNION VALUES (1)`,
+		`1=1e0UNION VALUES (1)`,
+		`1=1.5e3UNION VALUES (1)`,
+		`1=.5UNION VALUES (1)`,
+		`1=1_000.5e1_0UNION VALUES (1)`,
+		`1=1.e1UNION VALUES (1)`,
+		`1=1_0UNION VALUES (1)`,
+	} {
+		if _, err := h.validateWhereClause(where); err == nil {
+			t.Errorf("validateWhereClause(%q) accepted a keyword without a word boundary", where)
+		}
+	}
+
+	for _, where := range []string{
+		`x1union = 1`,
+		`host = 'aUNION'`,
+		`host = 'web1'`,
+		`value > 1e5`,
+		`value < 1.5e-3 AND other = .25`,
+	} {
+		if _, err := h.validateWhereClause(where); err != nil {
+			t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
+		}
+	}
+}
+
 // Edge cases the review added on top of the masking: literals that mention a
 // file-I/O function or an identifier that is a keyword stay data; the escaped
 // quote, trailing comment and dollar-tag shapes the masker was hardened
@@ -116,5 +147,26 @@ func TestValidateWhereClauseAcceptsIdentifiersContainingProcedurePrefixes(t *tes
 	// The keyword check, not the deleted prefix scan, is what refuses this.
 	if _, err := h.validateWhereClause(`1=1; EXEC xp_cmdshell('dir')`); err == nil {
 		t.Error("validateWhereClause accepted EXEC xp_cmdshell; the keyword check must still refuse it")
+	}
+}
+
+// A WHERE fragment cannot call the functions that change or read state every
+// user shares (read_statements.go).
+func TestValidateWhereClauseRejectsSideEffectFunctions(t *testing.T) {
+	h := &DeleteHandler{}
+	for _, where := range []string{
+		`EXISTS (FROM enable_logging(['QueryLog']))`,
+		`host = 'a' OR EXISTS (FROM duckdb_logs)`,
+		`v = nextval('s')`,
+		`host = current_setting('threads')`,
+		`host = "current_setting"('threads')`,
+		"EXISTS (FROM enable_logging (['QueryLog']))",
+	} {
+		if _, err := h.validateWhereClause(where); err == nil {
+			t.Errorf("validateWhereClause(%q) accepted unsafe input", where)
+		}
+	}
+	if _, err := h.validateWhereClause(`host = 'enable_logging(x)'`); err != nil {
+		t.Errorf("a function name inside a literal was refused: %v", err)
 	}
 }

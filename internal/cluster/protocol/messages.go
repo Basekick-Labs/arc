@@ -1,6 +1,9 @@
 package protocol
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // MessageType identifies the type of cluster protocol message.
 type MessageType uint8
@@ -19,10 +22,12 @@ const (
 	// MsgLeaveNotify is sent when a node is gracefully leaving.
 	MsgLeaveNotify
 
-	// WAL Replication messages (Phase 3.3) - start at 0x10 to avoid conflicts
-	// MsgReplicateSync is sent by a reader to request replication sync.
-	MsgReplicateSync MessageType = 0x10
-	// MsgReplicateSyncAck is sent by the writer in response to sync request.
+	// WAL replication handshake (Phase 3.3). The stream is gone (#888,
+	// #1181): a reader of a release before 27.01.1 still sends
+	// MsgReplicateSync until it is upgraded, and a writer answers it with a
+	// refusing MsgReplicateSyncAck. Reserved: never reuse 0x10-0x1F while
+	// such readers can exist.
+	MsgReplicateSync    MessageType = 0x10
 	MsgReplicateSyncAck MessageType = 0x11
 
 	// Peer file replication messages (Enterprise Phase 2) - start at 0x20
@@ -58,7 +63,173 @@ const (
 	// to apply the forwarded command. Includes a success/error status so
 	// the caller can distinguish "applied" from "leader rejected".
 	MsgForwardApplyAck MessageType = 0x31
+
+	// Origin stream (#1207): a standby writer dials the primary and receives
+	// every ingest batch the primary commits, to keep a copy until the
+	// batch's files are registered. MsgOriginStreamHello opens it; the
+	// primary answers MsgOriginStreamHelloAck and then owns the connection
+	// (internal/cluster/originstream frames follow).
+	MsgOriginStreamHello    MessageType = 0x40
+	MsgOriginStreamHelloAck MessageType = 0x41
+
+	// Pending registrations (#1214): before the orphan-storage sweep deletes
+	// unregistered objects on a shared object store, the reconciler asks
+	// every node that can ingest which files it flushed and has not
+	// registered yet. A node before #1214 closes the connection on the
+	// unknown type, which the asker treats as no answer.
+	MsgPendingRegistrationsQuery MessageType = 0x50
+	MsgPendingRegistrationsReply MessageType = 0x51
+
+	// Flush scope (#1265): in shared storage every writer takes writes, so
+	// before a DELETE scans, the primary asks every node to flush the rows
+	// of its scope it has buffered and to name the files it flushed that
+	// wait for registration. A node before #1265 closes the connection on
+	// the unknown type, which the asker treats as no answer.
+	MsgFlushScopeRequest MessageType = 0x52
+	MsgFlushScopeReply   MessageType = 0x53
+
+	// Local policies (#1324): before the cluster takes over a policy kind,
+	// the leader asks every node for the rows of that kind in its own
+	// SQLite. Sent only once cluster policies are enabled, so every node
+	// knows the type.
+	MsgLocalPoliciesQuery MessageType = 0x54
+	MsgLocalPoliciesReply MessageType = 0x55
 )
+
+// LocalPoliciesQuery asks a node for its own rows of a policy kind, once its
+// FSM has applied the collect at Epoch (a log index).
+// HMAC: security.ComputeLocalPoliciesQueryHMAC.
+type LocalPoliciesQuery struct {
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Kind        string `json:"kind"`
+	Epoch       uint64 `json:"epoch"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// Local policies reply statuses.
+const (
+	// LocalPoliciesOK: Policies is every row of the kind on the node.
+	LocalPoliciesOK = "ok"
+	// LocalPoliciesFailed: the node could not read its rows, or had not
+	// applied the collect in time.
+	LocalPoliciesFailed = "failed"
+	// LocalPoliciesRefused: the query failed authentication or validation.
+	LocalPoliciesRefused = "refused"
+)
+
+// LocalPoliciesReply answers a LocalPoliciesQuery, bound to its nonce, kind
+// and epoch, over a digest of Policies: security.ComputeLocalPoliciesReplyHMAC.
+// Policies is the kind's rows as JSON.
+type LocalPoliciesReply struct {
+	NodeID    string          `json:"node_id"`
+	Status    string          `json:"status"`
+	Policies  json.RawMessage `json:"policies,omitempty"`
+	Timestamp int64           `json:"timestamp"`
+	HMAC      string          `json:"hmac"`
+}
+
+// PendingRegistrationsQuery asks a node for the files it flushed that the
+// cluster manifest does not list yet, whenever they were flushed.
+// HMAC: security.ComputePendingRegistrationsQueryHMAC.
+type PendingRegistrationsQuery struct {
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// Pending registrations reply statuses.
+const (
+	// PendingStatusOK: Paths is every file pending registration on the node.
+	PendingStatusOK = "ok"
+	// PendingStatusTooMany: more such files than one reply can carry.
+	PendingStatusTooMany = "too_many"
+	// PendingStatusUnknown: the node ingests but has no registration journal
+	// (it could not be opened), so it cannot tell.
+	PendingStatusUnknown = "unknown"
+	// PendingStatusRefused: the query failed authentication or validation.
+	PendingStatusRefused = "refused"
+)
+
+// PendingRegistrationsReply answers a query. The HMAC binds the reply to the
+// query's nonce and covers a digest of Paths, so neither a recorded reply nor
+// one with paths stripped is accepted:
+// security.ComputePendingRegistrationsReplyHMAC.
+type PendingRegistrationsReply struct {
+	NodeID    string   `json:"node_id"`
+	Status    string   `json:"status"`
+	Paths     []string `json:"paths,omitempty"`
+	Timestamp int64    `json:"timestamp"`
+	HMAC      string   `json:"hmac"`
+}
+
+// FlushScopeRequest asks a node to flush its buffered rows of Database
+// (Measurement "" = all of them). HMAC:
+// security.ComputeFlushScopeRequestHMAC.
+type FlushScopeRequest struct {
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Database    string `json:"database"`
+	Measurement string `json:"measurement,omitempty"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// Flush scope reply statuses.
+const (
+	// FlushStatusOK: flushed; Paths is every file of the scope still
+	// waiting to register on the node.
+	FlushStatusOK = "ok"
+	// FlushStatusUntracked: flushed, but the node has no registration
+	// journal, so it cannot name the files waiting to register.
+	FlushStatusUntracked = "untracked"
+	// FlushStatusFailed: the flush failed or timed out, or an earlier one
+	// failed and its rows wait for WAL recovery.
+	FlushStatusFailed = "flush_failed"
+	// FlushStatusTooMany: more pending files than one reply can carry.
+	FlushStatusTooMany = "too_many"
+	// FlushStatusRefused: the request failed authentication or validation.
+	FlushStatusRefused = "refused"
+)
+
+// FlushScopeReply answers a FlushScopeRequest, bound to its nonce and
+// scope, over a digest of Paths: security.ComputeFlushScopeReplyHMAC.
+type FlushScopeReply struct {
+	NodeID    string   `json:"node_id"`
+	Status    string   `json:"status"`
+	Paths     []string `json:"paths,omitempty"`
+	Timestamp int64    `json:"timestamp"`
+	HMAC      string   `json:"hmac"`
+}
+
+// OriginStreamHello is sent by a standby writer to open the origin stream.
+// HMAC: security.ComputeOriginStreamHelloHMAC.
+type OriginStreamHello struct {
+	// Version is the origin stream protocol the standby speaks; covered by
+	// the HMAC. The primary refuses one it does not speak.
+	Version     int    `json:"version"`
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// OriginStreamHelloAck answers a hello. Error is set on refusal. Instance is
+// the primary's current WAL writer instance (hex). The HMAC binds the reply
+// to the hello's nonce: security.ComputeOriginStreamHelloAckHMAC.
+type OriginStreamHelloAck struct {
+	OriginNodeID string `json:"origin_node_id"`
+	Instance     string `json:"instance,omitempty"`
+	Error        string `json:"error,omitempty"`
+	Timestamp    int64  `json:"timestamp"`
+	HMAC         string `json:"hmac"`
+}
 
 // String returns the string representation of a message type.
 func (m MessageType) String() string {
@@ -75,6 +246,22 @@ func (m MessageType) String() string {
 		return "HeartbeatAck"
 	case MsgLeaveNotify:
 		return "LeaveNotify"
+	case MsgOriginStreamHello:
+		return "OriginStreamHello"
+	case MsgOriginStreamHelloAck:
+		return "OriginStreamHelloAck"
+	case MsgPendingRegistrationsQuery:
+		return "PendingRegistrationsQuery"
+	case MsgPendingRegistrationsReply:
+		return "PendingRegistrationsReply"
+	case MsgFlushScopeRequest:
+		return "FlushScopeRequest"
+	case MsgFlushScopeReply:
+		return "FlushScopeReply"
+	case MsgLocalPoliciesQuery:
+		return "LocalPoliciesQuery"
+	case MsgLocalPoliciesReply:
+		return "LocalPoliciesReply"
 	case MsgReplicateSync:
 		return "ReplicateSync"
 	case MsgReplicateSyncAck:
@@ -92,40 +279,22 @@ func (m MessageType) String() string {
 	}
 }
 
-// ReplicateSync is sent by a reader node to request WAL replication.
-//
-// The six auth-bound fields (Nonce / Timestamp / HMAC / ClusterName /
-// the existing ReaderID acting as senderID / and SupportsBinaryEntries)
-// carry the application-layer HMAC over the handshake. Computed by
-// security.ComputeReplicateSyncHMAC at the reader, validated by
-// security.ValidateReplicateSyncHMAC at the writer before the
-// connection is accepted. See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
-//
-// The auth fields are required when cluster.shared_secret is configured;
-// when it's empty the receiver refuses every request (refuse-when-
-// unconfigured posture, same as cache-invalidate from PR #444).
+// ReplicateSync is what a reader of a release before 27.01.1 sends to request
+// the WAL replication stream. It is decoded only to be refused (#1181): every
+// request gets the same answer, so its HMAC fields (GHSA-wfgr-8x84-22q7) are
+// not checked.
 type ReplicateSync struct {
 	ReaderID          string `json:"reader_id"`
 	LastKnownSequence uint64 `json:"last_known_seq"`
 
-	// Application-layer authentication fields (GHSA-wfgr-8x84-22q7).
-	// Validated against cluster.shared_secret by the writer before
-	// the connection is accepted into the replication sender.
+	// Authentication fields of the old handshake (GHSA-wfgr-8x84-22q7).
 	Nonce       string `json:"nonce,omitempty"`
 	ClusterName string `json:"cluster_name,omitempty"`
 	Timestamp   int64  `json:"timestamp,omitempty"`
 	HMAC        string `json:"hmac,omitempty"`
 
-	// SupportsBinaryEntries advertises that this reader understands
-	// MsgReplicateEntryBin frames (#698), letting the writer send WAL
-	// entry payloads as raw bytes instead of JSON + base64 (whose 4/3
-	// inflation made entries above ~75MB unsendable).
-	//
-	// Covered by the replicate-sync HMAC (#714). Originally left out
-	// because folding it in would break mixed-version handshakes —
-	// that no longer applies since 26.09.2 made the coordinator
-	// handshake a hard cutover anyway, so this rides along with the
-	// same coordinated-restart release.
+	// SupportsBinaryEntries is what an old reader sent to ask for binary
+	// entry frames (#698); decoded and ignored.
 	SupportsBinaryEntries bool `json:"bin_entries,omitempty"`
 }
 
@@ -151,6 +320,15 @@ type JoinRequest struct {
 	AuthNonce     string `json:"auth_nonce,omitempty"`
 	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
 	AuthHMAC      string `json:"auth_hmac,omitempty"`
+
+	// Capabilities this node's build supports (#1207), e.g. stream_claims_v1.
+	// Outside AuthHMAC on purpose: an older leader validates AuthHMAC over the
+	// fields it knows, so adding one there would refuse every upgraded node
+	// during a rolling upgrade. AuthHMAC2 covers the same fields plus
+	// Capabilities; a leader that reads Capabilities requires it. Stripping
+	// both only makes the node look like an older build.
+	Capabilities []string `json:"capabilities,omitempty"`
+	AuthHMAC2    string   `json:"auth_hmac2,omitempty"`
 }
 
 // NodeInfo represents a node in the cluster (used in JoinResponse).
@@ -330,6 +508,13 @@ type ForwardApplyRequest struct {
 	Nonce       string `json:"nonce"`
 	Timestamp   int64  `json:"timestamp"`
 	HMAC        string `json:"hmac"`
+	// WantIndex asks the leader for the applied command's log index in the
+	// ack, so the requester can wait until its own FSM has applied it
+	// (#1324). Sent only once cluster policies are enabled, which means every
+	// node understands it. Not covered by the request MAC: flipping it only
+	// makes the ack fail validation, which an on-path attacker can cause by
+	// dropping the ack anyway.
+	WantIndex bool `json:"want_index,omitempty"`
 }
 
 // ForwardApplyAck is the leader's response. Status="ok" means the Raft
@@ -344,6 +529,9 @@ type ForwardApplyAck struct {
 	Status string           `json:"status"`          // "ok" or "error"
 	Code   ForwardApplyCode `json:"code,omitempty"`  // machine-readable error category
 	Error  string           `json:"error,omitempty"` // human-readable detail
+	// Index is the applied command's log index, on a success ack to a
+	// request with WantIndex (#1324). Signed when present.
+	Index uint64 `json:"index,omitempty"`
 	// Authentication (present when shared_secret is configured). Signed by
 	// the responder over the REQUEST's nonce plus every field above, so the
 	// requester validates with the nonce it generated and needs no nonce
@@ -372,7 +560,16 @@ const (
 	// Callers MAY retry — the failure could be transient (Raft timeout,
 	// FSM apply panic recovery, etc.).
 	ForwardCodeApplyFailed ForwardApplyCode = "apply_failed"
+	// ForwardCodeClaimConflict: the FSM refused registrations of rows another
+	// writer has claimed (#1207). Terminal: retrying cannot succeed. The
+	// message names the refused op indexes.
+	ForwardCodeClaimConflict ForwardApplyCode = "claim_conflict"
 	// ForwardCodeRaftUnavailable: the recipient's Raft node is nil or
 	// not running. Caller should not retry against this peer.
 	ForwardCodeRaftUnavailable ForwardApplyCode = "raft_unavailable"
 )
+
+// GetNodeID and GetCapabilities let the leader's stream claims join gate
+// read a join request without importing this package's types into raft.
+func (r *JoinRequest) GetNodeID() string         { return r.NodeID }
+func (r *JoinRequest) GetCapabilities() []string { return r.Capabilities }

@@ -46,6 +46,17 @@ func (r *Reconciler) sweepOrphanManifest(
 		// No manifest to sweep.
 		return nil
 	}
+	if held := r.isHeld.Load(); held != nil {
+		kept := paths[:0:0]
+		for _, p := range paths {
+			if (*held)(p) {
+				run.SkippedHeld++
+				continue
+			}
+			kept = append(kept, p)
+		}
+		paths = kept
+	}
 
 	batchSize := r.cfg.BatchSize
 	if batchSize <= 0 {

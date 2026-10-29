@@ -14,7 +14,7 @@ import (
 )
 
 func TestIsAzureNotFoundError(t *testing.T) {
-	respErr404 := &azcore.ResponseError{StatusCode: 404}
+	respErr404 := &azcore.ResponseError{StatusCode: 404, ErrorCode: "BlobNotFound"}
 	respErr500 := &azcore.ResponseError{StatusCode: 500}
 	otherErr := errors.New("other error")
 
@@ -49,14 +49,15 @@ func TestIsAzureNotFoundError(t *testing.T) {
 			expect: false,
 		},
 		{
-			name:   "string fallback BlobNotFound",
+			// Text alone is never a missing blob (#1238).
+			name:   "text BlobNotFound",
 			err:    errors.New("BlobNotFound"),
-			expect: true,
+			expect: false,
 		},
 		{
-			name:   "string fallback 404",
+			name:   "text 404",
 			err:    errors.New("HTTP 404"),
-			expect: true,
+			expect: false,
 		},
 		{
 			name:   "unrelated error",

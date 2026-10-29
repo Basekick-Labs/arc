@@ -3,14 +3,13 @@ package api
 import (
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
-	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -64,6 +63,7 @@ type ImportHandler struct {
 	// admin-tier auth because they rewrite historical data.
 	authManager *auth.AuthManager
 	rbacManager RBACChecker
+	router      *cluster.Router
 
 	// Stats
 	totalRequests atomic.Int64
@@ -91,6 +91,73 @@ func (h *ImportHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManage
 	h.rbacManager = rbacManager
 }
 
+// SetRouter configures cluster write forwarding for import requests.
+func (h *ImportHandler) SetRouter(router *cluster.Router) {
+	h.router = router
+}
+
+// forwardWriteIfNeeded sends an import to a writer when this node may not
+// take it (#1070): a reader or compactor forwards it like any other write,
+// and a standby writer forwards it to the primary (#1270). It runs before the
+// handler reads the upload, so nothing has been written when it forwards.
+// Sent once, never retried, bounded by cluster.import_forward_timeout_ms
+// (Router.RouteImport).
+// handled=false: import locally.
+func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		h.totalErrors.Add(1)
+		return true, RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		if importTooLargeToForward(c) {
+			h.totalErrors.Add(1)
+			return true, respondImportTooLarge(c)
+		}
+		req, err := BuildHTTPRequest(c)
+		if err != nil {
+			h.totalErrors.Add(1)
+			h.logger.Error().Err(err).Msg("Failed to build import request for forwarding")
+			return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare request for forwarding",
+			})
+		}
+
+		resp, err := h.router.RouteImport(c.Context(), req)
+		if err == cluster.ErrLocalNodeCanHandle {
+			break
+		}
+		if err != nil {
+			if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+				h.logger.Error().Err(err).Msg("Failed to route import request")
+			}
+			h.totalErrors.Add(1)
+			return true, respondWriteForwardError(c, err)
+		}
+		return true, CopyResponse(c, resp)
+	}
+	if _, ok := h.router.StandbyWriteTarget(); ok && c.Get(ForwardedByHeader) == "" && importTooLargeToForward(c) {
+		h.totalErrors.Add(1)
+		return true, respondImportTooLarge(c)
+	}
+	return forwardStandbyImport(h.router, c)
+}
+
+// maxForwardedImportBody is the largest upload forwarded: maxImportSize plus
+// room for the multipart framing around the file. A larger one holds a file
+// the writer would refuse with 413 after it crossed the cluster network
+// (#1070). A var for tests.
+var maxForwardedImportBody = maxImportSize + 1<<20
+
+func importTooLargeToForward(c *fiber.Ctx) bool {
+	return len(c.Request().Body()) > maxForwardedImportBody
+}
+
+func respondImportTooLarge(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+		"error": fmt.Sprintf("file exceeds maximum import size of %d bytes", maxImportSize),
+	})
+}
+
 // RegisterRoutes registers import API routes. Import endpoints write
 // historical data and use admin-tier auth (not write-tier) — bulk
 // imports can rewrite or supplant existing partitions, so the
@@ -111,6 +178,9 @@ func (h *ImportHandler) RegisterRoutes(app *fiber.App) {
 // Uses the same ArrowBuffer ingest pipeline as streaming LP ingestion.
 func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	if handled, err := h.forwardWriteIfNeeded(c); handled {
+		return err
+	}
 	start := time.Now()
 
 	// c.Get / c.Query are zero-copy aliases into the fasthttp request buffer.
@@ -161,108 +231,23 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		})
 	}
 
-	// Get uploaded file
-	fileHeader, err := c.FormFile("file")
-	if err != nil {
+	upload, ierr := importUploadFrom(c)
+	if ierr != nil {
 		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "no file uploaded: use multipart/form-data with field name 'file'",
-		})
+		return h.importErrorResponse(c, ierr)
 	}
 
-	// Read file contents
-	file, err := fileHeader.Open()
-	if err != nil {
+	// Validation pass: everything that would fail the import is refused
+	// here, before a row is written. It keeps only the measurements and the
+	// kind of each field, not the rows.
+	scan, ierr := scanLPImport(upload, precision, measurementFilter, h.arrowBuffer.IsDecimalColumn, writableKnownColumns(c, h.rbacManager, database, h.arrowBuffer.KnownColumns(database)))
+	if ierr != nil {
 		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to open uploaded file: " + err.Error(),
-		})
-	}
-	defer file.Close()
-
-	// Size limit (maxImportSize, package-level) applies to both compressed and
-	// uncompressed data. Bound the read at the limit (+1 to detect overflow) so an
-	// oversized upload is rejected without buffering the whole body — the global
-	// BodyLimit (1GB) is a coarser backstop; this matches the CSV/Parquet handlers.
-	data, err := io.ReadAll(io.LimitReader(file, maxImportSize+1))
-	if err != nil {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to read uploaded file: " + err.Error(),
-		})
-	}
-	if int64(len(data)) > maxImportSize {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-			"error": "file exceeds 500MB limit",
-		})
+		return h.importErrorResponse(c, ierr)
 	}
 
-	// Detect and decompress gzip (magic bytes: 0x1f 0x8b)
-	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-		decompressed, err := decompressGzipPooled(data, maxImportSize)
-		if err != nil {
-			h.totalErrors.Add(1)
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "failed to decompress gzip file: " + err.Error(),
-			})
-		}
-		data = decompressed
-	}
-
-	// Enforce size limit on uncompressed data (decompressed gzip may exceed it)
-	if len(data) > maxImportSize {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-			"error": "file exceeds 500MB limit",
-		})
-	}
-
-	if len(data) == 0 {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "file is empty",
-		})
-	}
-
-	// Parse Line Protocol with precision-aware timestamp conversion
-	parser := ingest.NewLineProtocolParser()
-	records := parser.ParseBatchWithPrecision(data, precision)
-	if len(records) == 0 {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "no valid line protocol records found in file",
-		})
-	}
-
-	// Filter by measurement if specified
-	if measurementFilter != "" {
-		filtered := make([]*models.Record, 0, len(records))
-		for _, r := range records {
-			if r.Measurement == measurementFilter {
-				filtered = append(filtered, r)
-			}
-		}
-		if len(filtered) == 0 {
-			h.totalErrors.Add(1)
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("no records found for measurement %q", measurementFilter),
-			})
-		}
-		records = filtered
-	}
-
-	// Check RBAC permissions for all measurements
-	measurements := make(map[string]bool)
-	for _, r := range records {
-		measurements[r.Measurement] = true
-	}
 	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
-		measList := make([]string, 0, len(measurements))
-		for m := range measurements {
-			measList = append(measList, m)
-		}
-		if err := CheckWritePermissions(c, h.rbacManager, h.logger, database, measList); err != nil {
+		if err := CheckWritePermissions(c, h.rbacManager, h.logger, database, scan.measurements); err != nil {
 			h.totalErrors.Add(1)
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 				"error": err.Error(),
@@ -270,55 +255,67 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		}
 	}
 
-	// Group by measurement and convert to columnar format
-	columnarByMeasurement := ingest.BatchToColumnar(records)
-
-	// Validate all measurement names from the LP body (prevent path traversal)
-	for measurement := range columnarByMeasurement {
-		if !isValidMeasurementName(measurement) {
-			h.totalErrors.Add(1)
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("invalid measurement name %q in LP data: must start with a letter and contain only alphanumeric characters, underscores, or hyphens", measurement),
-			})
-		}
+	// Refuse the whole import up front if writes are fenced (#1207) or the
+	// WAL volume is under disk pressure (#676); the admitted context keeps
+	// pressure that starts part-way from splitting it.
+	writeCtx, release, err := h.arrowBuffer.AdmitRequest(c.Context(), scan.bytes)
+	if err != nil {
+		h.totalErrors.Add(1)
+		return respondWriteRefused(c, err)
 	}
+	defer release()
 
-	// Feed each measurement into the ArrowBuffer ingest pipeline
-	var totalRows int64
-	importedMeasurements := make([]string, 0, len(columnarByMeasurement))
-	for measurement, record := range columnarByMeasurement {
-		if err := h.arrowBuffer.WriteColumnarRecord(c.Context(), database, record); err != nil {
-			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).
+	// Write pass, chunk by chunk, paced to the flushes.
+	w, err := newImportWriter(writeCtx, h.arrowBuffer, database)
+	if err != nil {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "import rejected (retry): " + err.Error()})
+	}
+	defer w.close()
+	if err := w.finish(writeLPImport(writeCtx, w, upload, database, precision, measurementFilter, scan.kinds)); err != nil {
+		h.totalErrors.Add(1)
+		if pe, ok := asImportPartial(err); ok {
+			// Part of the import is written: a retryable answer (503,
+			// Retry-After, the fenced or refused header) would promise
+			// nothing was, and a re-run duplicates the written rows
+			// (#1070).
+			h.logger.Error().Err(pe.Err).
 				Str("database", database).
-				Str("measurement", measurement).
-				Msg("LP import: failed to write to buffer")
-			// 503 for the two retryable buffer states. Note this loop has
-			// already written the measurements it got through, so the import is
-			// partial either way — a retryable status at least tells the client
-			// to re-run it rather than treating it as a permanent failure.
-			if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-					"error": fmt.Sprintf("import rejected at measurement %q (retry): %v", measurement, err),
-				})
-			}
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": fmt.Sprintf("failed to ingest measurement %q: %v", measurement, err),
+				Str("stopped_at", pe.StoppedAt).
+				Int64("rows_written", pe.RowsWritten).
+				Strs("written", pe.Measurements).
+				Msg("LP import: failed part-way")
+			return respondImportPartial(c, pe)
+		}
+		if ingest.IsWriteRefusal(err) {
+			return respondWriteRefused(c, err) // logged by reason (#1268)
+		}
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Str("database", database).Msg("LP import: failed to write to buffer")
+		// 503 for the two retryable buffer states: nothing of this import
+		// was written (a partial import answered above).
+		if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": fmt.Sprintf("import rejected (retry): %v", err),
 			})
 		}
-		// Count rows from the time column
-		if timeCol, ok := record.Columns["time"]; ok {
-			totalRows += int64(len(timeCol))
-		}
-		importedMeasurements = append(importedMeasurements, measurement)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": fmt.Sprintf("failed to ingest line protocol: %v", err),
+		})
 	}
+	totalRows := w.rows
+	importedMeasurements := w.order
 
-	// Force flush to ensure data is persisted before returning
+	// Hand what is still buffered to the flush. The rows are in the buffer
+	// and the WAL (when enabled) already; files follow as their flushes
+	// finish, so a 200 does not mean every file is written.
 	if err := h.arrowBuffer.FlushAll(c.Context()); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to flush imported data: " + err.Error(),
+			"error": importFlushFailed + ": " + err.Error(),
 		})
 	}
 
@@ -368,9 +365,31 @@ func (e *importError) Error() string {
 	return e.Message
 }
 
+// Unwrap exposes the cause, so errors.Is sees a refused write (#1268, #676).
+func (e *importError) Unwrap() error { return e.Err }
+
+// importFlushFailed answers an import whose rows were all written to the
+// buffer and whose flush then failed: they may still be stored, and running the
+// file again writes them again (#1070).
+const importFlushFailed = "failed to flush imported data; the rows were accepted and may still be stored, check before running the file again"
+
 // importErrorResponse returns the appropriate HTTP error response for an import error
 func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 	if ie, ok := err.(*importError); ok {
+		switch {
+		case errors.Is(ie.Err, ingest.ErrIngestFenced):
+			ingest.LogRefusal(c.Path(), ie.Err)
+			c.Locals(ingestFencedLocal, true)
+			c.Set(IngestFencedHeader, "1")
+			c.Set(fiber.HeaderRetryAfter, "5")
+		case ingest.IsWriteRefusal(ie.Err):
+			// WAL disk pressure and the like (#676): the headers of
+			// respondIngestRefused; the status is ie.StatusCode (503).
+			ingest.LogRefusal(c.Path(), ie.Err)
+			c.Locals(ingestRefusedLocal, true)
+			c.Set(IngestRefusedHeader, ingest.RefusalReason(ie.Err))
+			c.Set(fiber.HeaderRetryAfter, "5")
+		}
 		return c.Status(ie.StatusCode).JSON(fiber.Map{
 			"error": ie.Error(),
 		})
@@ -384,6 +403,9 @@ func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 // Uses the same ArrowBuffer ingest pipeline as streaming TLE ingestion.
 func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	if handled, err := h.forwardWriteIfNeeded(c); handled {
+		return err
+	}
 	start := time.Now()
 
 	// strings.Clone: c.Get/c.Query alias the fasthttp buffer and this database is
@@ -414,38 +436,24 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		})
 	}
 
-	// Get uploaded file
-	fileHeader, err := c.FormFile("file")
+	// TLE records span lines, so the file is parsed at once (TLE files are
+	// small); read straight from the request body, one copy (#1070 follow-up).
+	upload, uerr := importUploadFrom(c)
+	if uerr != nil {
+		h.totalErrors.Add(1)
+		return h.importErrorResponse(c, uerr)
+	}
+	data, err := upload.readAll()
 	if err != nil {
 		h.totalErrors.Add(1)
+		if errors.Is(err, errImportTooLarge) {
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+				"error": "file exceeds 500MB limit",
+			})
+		}
+		// A body cut short: the file part ends before its closing delimiter.
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "no file uploaded: use multipart/form-data with field name 'file'",
-		})
-	}
-
-	// Read file contents
-	file, err := fileHeader.Open()
-	if err != nil {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to open uploaded file: " + err.Error(),
-		})
-	}
-	defer file.Close()
-
-	// Bound the read at maxImportSize (+1 to detect overflow) so an oversized
-	// upload is rejected without buffering the whole body — matches CSV/Parquet/LP.
-	data, err := io.ReadAll(io.LimitReader(file, maxImportSize+1))
-	if err != nil {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "failed to read uploaded file: " + err.Error(),
-		})
-	}
-	if int64(len(data)) > maxImportSize {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-			"error": "file exceeds 500MB limit",
 		})
 	}
 
@@ -523,8 +531,22 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 
 	// Write directly to the ArrowBuffer ingest pipeline (typed path)
 	totalRows := int64(numRecords)
-	if err := h.arrowBuffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
+	// Admit the whole request, its size reserved against the WAL volume's
+	// free space (#676); a fence or disk pressure refuses it here.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	if aerr != nil {
 		h.totalErrors.Add(1)
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	if err := h.arrowBuffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, numRecords); err != nil {
+		h.totalErrors.Add(1)
+		if ingest.IsWriteRefusal(err) {
+			return respondWriteRefused(c, err) // logged by reason (#1268)
+		}
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).
 			Str("database", database).
 			Str("measurement", measurement).
@@ -539,7 +561,7 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("TLE import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to flush imported data: " + err.Error(),
+			"error": importFlushFailed + ": " + err.Error(),
 		})
 	}
 

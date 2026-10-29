@@ -863,6 +863,9 @@ func TestValidateWhereClauseQueryMaskingEdgeCases(t *testing.T) {
 		`tag = $$drop$$`,
 		`tag = E'delete'`,
 		`x1union = 1`,
+		`x = 1e5`,
+		`x = 1.5e-3 AND y = .25`,
+		`a.b1union = 1`,
 	} {
 		if err := validateWhereClauseQuery(where); err != nil {
 			t.Errorf("validateWhereClauseQuery(%q) rejected valid input: %v", where, err)
@@ -878,6 +881,15 @@ func TestValidateWhereClauseQueryMaskingEdgeCases(t *testing.T) {
 		// A keyword glued to a literal has no word boundary against the masker's placeholder.
 		`host='a'union select 1`,
 		`host='a'UNION SELECT * FROM users`,
+		// Every DuckDB number shape lexes as one token before the keyword (#1080).
+		`x = 1e0UNION SELECT 1`,
+		`x = 1.5e3UNION SELECT 1`,
+		`x = 1E+2UNION SELECT 1`,
+		`x = 1.UNION SELECT 1`,
+		`x = .5UNION SELECT 1`,
+		`x = 1.e1UNION SELECT 1`,
+		`x = 1_000.5e1_0UNION SELECT 1`,
+		`x = 1_0UNION SELECT 1`,
 	} {
 		if err := validateWhereClauseQuery(where); err == nil {
 			t.Errorf("validateWhereClauseQuery(%q) accepted unsafe input", where)
@@ -1682,53 +1694,53 @@ func TestRewriteTimeBucket(t *testing.T) {
 		{
 			name:     "1 hour with INTERVAL keyword",
 			input:    "SELECT time_bucket(INTERVAL '1 hour', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 hour without INTERVAL keyword",
 			input:    "SELECT time_bucket('1 hour', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 day",
 			input:    "SELECT time_bucket('1 day', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 86400) * 86400) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 86400000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 86400000000 < 0 THEN 1 ELSE 0 END) * 86400000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 minute",
 			input:    "SELECT time_bucket('1 minute', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 60) * 60) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 60000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 60000000 < 0 THEN 1 ELSE 0 END) * 60000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 week",
 			input:    "SELECT time_bucket('1 week', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 604800) * 604800) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 604800000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 604800000000 < 0 THEN 1 ELSE 0 END) * 604800000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 second",
 			input:    "SELECT time_bucket('1 second', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 1) * 1) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 1000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 1000000 < 0 THEN 1 ELSE 0 END) * 1000000) AS bucket FROM cpu",
 		},
 		// Custom intervals -> epoch arithmetic
 		{
 			name:     "30 minutes",
 			input:    "SELECT time_bucket('30 minutes', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 1800) * 1800) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 1800000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 1800000000 < 0 THEN 1 ELSE 0 END) * 1800000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "15 minutes",
 			input:    "SELECT time_bucket('15 minutes', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 900) * 900) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 900000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 900000000 < 0 THEN 1 ELSE 0 END) * 900000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "4 hours",
 			input:    "SELECT time_bucket('4 hours', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 14400) * 14400) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 14400000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 14400000000 < 0 THEN 1 ELSE 0 END) * 14400000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "2 days",
 			input:    "SELECT time_bucket('2 days', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 172800) * 172800) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 172800000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 172800000000 < 0 THEN 1 ELSE 0 END) * 172800000000) AS bucket FROM cpu",
 		},
 		// Months should NOT be rewritten (variable length)
 		{
@@ -1745,24 +1757,24 @@ func TestRewriteTimeBucket(t *testing.T) {
 		{
 			name:     "case insensitive TIME_BUCKET",
 			input:    "SELECT TIME_BUCKET('1 hour', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "case insensitive Time_Bucket",
 			input:    "SELECT Time_Bucket('1 HOUR', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS bucket FROM cpu",
 		},
 		// Multiple time_bucket calls
 		{
 			name:     "multiple time_bucket calls",
 			input:    "SELECT time_bucket('1 hour', time) AS h, time_bucket('30 minutes', time) AS m FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS h, to_timestamp((epoch(time)::BIGINT // 1800) * 1800) AS m FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS h, make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 1800000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 1800000000 < 0 THEN 1 ELSE 0 END) * 1800000000) AS m FROM cpu",
 		},
 		// Column with expression
 		{
 			name:     "column expression",
 			input:    "SELECT time_bucket('1 hour', created_at) AS bucket FROM events",
-			expected: "SELECT to_timestamp((epoch(created_at)::BIGINT // 3600) * 3600) AS bucket FROM events",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(created_at) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(created_at) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS bucket FROM events",
 		},
 		// No time_bucket - unchanged
 		{
@@ -1774,12 +1786,12 @@ func TestRewriteTimeBucket(t *testing.T) {
 		{
 			name:     "singular hour",
 			input:    "SELECT time_bucket('1 hours', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS bucket FROM cpu",
 		},
 		{
 			name:     "singular day",
 			input:    "SELECT time_bucket('1 days', time) AS bucket FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 86400) * 86400) AS bucket FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 86400000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 86400000000 < 0 THEN 1 ELSE 0 END) * 86400000000) AS bucket FROM cpu",
 		},
 		// #535: parenthesized column args must be left verbatim for DuckDB (the
 		// capture already fails to match most of these, but the guard makes the
@@ -1816,17 +1828,17 @@ func TestRewriteTimeBucketWithOrigin(t *testing.T) {
 		{
 			name:     "3-arg with timestamp origin",
 			input:    "SELECT time_bucket('1 hour', time, '2024-01-01 00:30:00') AS bucket FROM cpu",
-			contains: "to_timestamp(",
+			contains: "make_timestamptz(",
 		},
 		{
 			name:     "3-arg with TIMESTAMP keyword",
 			input:    "SELECT time_bucket('1 hour', time, TIMESTAMP '2024-01-01 00:30:00') AS bucket FROM cpu",
-			contains: "to_timestamp(",
+			contains: "make_timestamptz(",
 		},
 		{
 			name:     "3-arg with date only origin",
 			input:    "SELECT time_bucket('30 minutes', time, '2024-01-01') AS bucket FROM cpu",
-			contains: "to_timestamp(",
+			contains: "make_timestamptz(",
 		},
 	}
 
@@ -1912,27 +1924,27 @@ func TestRewriteDateTrunc(t *testing.T) {
 		{
 			name:     "date_trunc hour",
 			input:    "SELECT date_trunc('hour', time) AS h FROM cpu GROUP BY 1",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS h FROM cpu GROUP BY 1",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS h FROM cpu GROUP BY 1",
 		},
 		{
 			name:     "date_trunc day",
 			input:    "SELECT date_trunc('day', time) AS d FROM cpu GROUP BY 1",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 86400) * 86400) AS d FROM cpu GROUP BY 1",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 86400000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 86400000000 < 0 THEN 1 ELSE 0 END) * 86400000000) AS d FROM cpu GROUP BY 1",
 		},
 		{
 			name:     "date_trunc minute",
 			input:    "SELECT date_trunc('minute', time) AS m FROM cpu GROUP BY 1",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 60) * 60) AS m FROM cpu GROUP BY 1",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 60000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 60000000 < 0 THEN 1 ELSE 0 END) * 60000000) AS m FROM cpu GROUP BY 1",
 		},
 		{
 			name:     "date_trunc second",
 			input:    "SELECT date_trunc('second', time) AS s FROM cpu GROUP BY 1",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 1) * 1) AS s FROM cpu GROUP BY 1",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 1000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 1000000 < 0 THEN 1 ELSE 0 END) * 1000000) AS s FROM cpu GROUP BY 1",
 		},
 		{
 			name:     "date_trunc week",
 			input:    "SELECT date_trunc('week', time) AS w FROM cpu GROUP BY 1",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 604800) * 604800) AS w FROM cpu GROUP BY 1",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 604800000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 604800000000 < 0 THEN 1 ELSE 0 END) * 604800000000) AS w FROM cpu GROUP BY 1",
 		},
 		// Month should NOT be rewritten (variable length)
 		{
@@ -1944,24 +1956,24 @@ func TestRewriteDateTrunc(t *testing.T) {
 		{
 			name:     "case insensitive DATE_TRUNC",
 			input:    "SELECT DATE_TRUNC('hour', time) AS h FROM cpu GROUP BY 1",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS h FROM cpu GROUP BY 1",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS h FROM cpu GROUP BY 1",
 		},
 		{
 			name:     "case insensitive Date_Trunc",
 			input:    "SELECT Date_Trunc('DAY', time) AS d FROM cpu GROUP BY 1",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 86400) * 86400) AS d FROM cpu GROUP BY 1",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 86400000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 86400000000 < 0 THEN 1 ELSE 0 END) * 86400000000) AS d FROM cpu GROUP BY 1",
 		},
 		// Multiple date_trunc calls
 		{
 			name:     "multiple date_trunc calls",
 			input:    "SELECT date_trunc('hour', time) AS h, date_trunc('day', time) AS d FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS h, to_timestamp((epoch(time)::BIGINT // 86400) * 86400) AS d FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS h, make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 86400000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 86400000000 < 0 THEN 1 ELSE 0 END) * 86400000000) AS d FROM cpu",
 		},
 		// Different column names
 		{
 			name:     "different column name",
 			input:    "SELECT date_trunc('hour', created_at) AS h FROM events GROUP BY 1",
-			expected: "SELECT to_timestamp((epoch(created_at)::BIGINT // 3600) * 3600) AS h FROM events GROUP BY 1",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(created_at) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(created_at) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS h FROM events GROUP BY 1",
 		},
 		// No date_trunc - unchanged
 		{
@@ -1973,7 +1985,7 @@ func TestRewriteDateTrunc(t *testing.T) {
 		{
 			name:     "date_trunc in WHERE clause",
 			input:    "SELECT * FROM cpu WHERE date_trunc('day', time) = '2024-01-01'",
-			expected: "SELECT * FROM cpu WHERE to_timestamp((epoch(time)::BIGINT // 86400) * 86400) = '2024-01-01'",
+			expected: "SELECT * FROM cpu WHERE make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 86400000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 86400000000 < 0 THEN 1 ELSE 0 END) * 86400000000) = '2024-01-01'",
 		},
 		// #535: parenthesized column args must NOT be rewritten (paren-blind
 		// capture would corrupt them). Left verbatim for DuckDB to handle
@@ -2001,7 +2013,7 @@ func TestRewriteDateTrunc(t *testing.T) {
 		{
 			name:     "bare column still optimized alongside a parenthesized one (#535)",
 			input:    "SELECT date_trunc('hour', time) AS h, date_trunc('day', coalesce(time, a)) AS d FROM cpu",
-			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS h, date_trunc('day', coalesce(time, a)) AS d FROM cpu",
+			expected: "SELECT make_timestamptz(946857600000000 + ((epoch_us(time) - 946857600000000) // 3600000000 - CASE WHEN (epoch_us(time) - 946857600000000) % 3600000000 < 0 THEN 1 ELSE 0 END) * 3600000000) AS h, date_trunc('day', coalesce(time, a)) AS d FROM cpu",
 		},
 	}
 

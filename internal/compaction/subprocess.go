@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 
@@ -46,8 +48,11 @@ type SubprocessJobConfig struct {
 	// raws next to the compacted output — permanent duplication. With it, a
 	// surviving manifest re-fires the marks through recovery (idempotent).
 	ParentFinalizesManifest bool     `json:"parent_finalizes_manifest,omitempty"`
-	SortKeys                []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
-	MemoryLimit             string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
+	SortKeys                []string `json:"sort_keys"` // Sort keys for ORDER BY in compaction
+	// SortKeysExplicit — see Job.SortKeysExplicit. Omitted (false) from an
+	// older parent, which only lowers the missing-key log to Debug.
+	SortKeysExplicit bool   `json:"sort_keys_explicit,omitempty"`
+	MemoryLimit      string `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 	// Threads is the DuckDB thread count for this subprocess. 0 means leave
 	// DuckDB at its own default, which is the container's CPU quota where there
 	// is one and all cores where there is not — the parent normally sends the
@@ -56,8 +61,18 @@ type SubprocessJobConfig struct {
 	Threads int `json:"threads,omitempty"`
 
 	// Storage configuration
-	StorageType   string `json:"storage_type"`   // "local" or "s3"
-	StorageConfig string `json:"storage_config"` // JSON-encoded storage-specific config
+	StorageType   string `json:"storage_type"`   // Backend.Type(): "local", "s3", "azure" or "gcs"
+	StorageConfig string `json:"storage_config"` // Backend.ConfigJSON(): no secrets
+	// Credentials authenticate the subprocess's storage backend the way the
+	// parent's was authenticated (#1104). It travels only in this job, which
+	// the parent pipes over stdin and never logs or writes to disk, so the
+	// secrets stay out of the subprocess's environment and argv.
+	//
+	// nil means a parent from before this field: after a package upgrade a
+	// running parent can start the NEW binary as its subprocess (os.Executable
+	// resolves to the replaced file). That parent passes credentials the old
+	// way, in the environment, and backendSpecFromJob reads them from there.
+	Credentials *SubprocessCredentials `json:"credentials,omitempty"`
 
 	// Phase 4: cluster-mode completion-manifest handoff. When CompletionDir
 	// is non-empty, the job writes a local-disk CompletionManifest that the
@@ -74,6 +89,13 @@ type SubprocessJobConfig struct {
 	// sentinel checked via IsZero, and this is internal parent↔subprocess IPC,
 	// not a user-facing field — matches the plain tag on completion.go's twin.
 	PartitionTime time.Time `json:"partition_time"`
+	// Staged commit (#1207 d2a2a): see JobConfig.Staged.
+	// OutputName is the output's file name, chosen by the parent so it can
+	// register the job (OpenJobs) before the output can exist. Empty from
+	// an older parent: the job names it as before.
+	OutputName string                 `json:"output_name,omitempty"`
+	Staged     bool                   `json:"staged,omitempty"`
+	Inputs     map[string]StagedInput `json:"inputs,omitempty"`
 }
 
 // SubprocessJobResult is returned by the subprocess via stdout as JSON.
@@ -94,6 +116,67 @@ type SubprocessJobResult struct {
 	// left in place under ParentFinalizesManifest; empty otherwise. The
 	// parent deletes it after receipt marking commits.
 	ManifestPath string `json:"manifest_path,omitempty"`
+	// SourcesDeleted: every consumed input was deleted. Until then queries
+	// must not read the output and the inputs together (OpenJobs). False
+	// from an older subprocess, which keeps the parent's entry until the
+	// manifest is gone.
+	SourcesDeleted bool `json:"sources_deleted,omitempty"`
+	// Metrics are the counters this subprocess moved in its own registry
+	// (metrics.ChildCounters: storage reads, writes, bytes, errors), which
+	// nothing scrapes; the parent adds them to its own (#1343). The parent
+	// may run another binary version (subprocess.go starts os.Executable()):
+	// an older child sends none, and a key the parent does not know is
+	// ignored.
+	Metrics map[string]int64 `json:"metrics,omitempty"`
+}
+
+// SubprocessCredentials are the storage secrets a compaction subprocess needs
+// to rebuild its parent's backend. Only the fields for the parent's backend
+// type are set. Plaintext: never log this struct.
+type SubprocessCredentials struct {
+	S3AccessKey string `json:"s3_access_key,omitempty"`
+	S3SecretKey string `json:"s3_secret_key,omitempty"`
+
+	AzureConnectionString   string `json:"azure_connection_string,omitempty"`
+	AzureAccountKey         string `json:"azure_account_key,omitempty"`
+	AzureSASToken           string `json:"azure_sas_token,omitempty"`
+	AzureUseManagedIdentity bool   `json:"azure_use_managed_identity,omitempty"`
+
+	// GCS (#1105): a service-account key, as its contents or its path. Both
+	// empty means Application Default Credentials, which the subprocess
+	// resolves from the environment and metadata server it inherits.
+	GCSCredentialsJSON string `json:"gcs_credentials_json,omitempty"`
+	GCSCredentialsFile string `json:"gcs_credentials_file,omitempty"`
+}
+
+// String and GoString keep the secrets out of any %v, %+v or %#v that ever
+// reaches a log; the job JSON is the only place they are written.
+func (SubprocessCredentials) String() string   { return "SubprocessCredentials{redacted}" }
+func (SubprocessCredentials) GoString() string { return "SubprocessCredentials{redacted}" }
+
+// subprocessCredentials collects the credentials of the parent's backend.
+// Never nil: an empty value tells the subprocess this parent passes
+// credentials in the job, and that there are none (local storage, or S3 on
+// instance or IRSA credentials, which the subprocess resolves from the
+// environment it inherits, exactly as the parent did).
+func subprocessCredentials(backend storage.Backend) *SubprocessCredentials {
+	creds := &SubprocessCredentials{}
+	switch b := backend.(type) {
+	case *storage.S3Backend:
+		creds.S3AccessKey = b.GetAccessKey()
+		creds.S3SecretKey = b.GetSecretKey()
+	case *storage.AzureBlobBackend:
+		auth := b.Credentials()
+		creds.AzureConnectionString = auth.ConnectionString
+		creds.AzureAccountKey = auth.AccountKey
+		creds.AzureSASToken = auth.SASToken
+		creds.AzureUseManagedIdentity = auth.UseManagedIdentity
+	case *storage.GCSBackend:
+		auth := b.Credentials()
+		creds.GCSCredentialsJSON = auth.CredentialsJSON
+		creds.GCSCredentialsFile = auth.CredentialsFile
+	}
+	return creds
 }
 
 // RunSubprocessJob is called from the subprocess to execute compaction.
@@ -141,6 +224,12 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	if _, err := db.Exec("SET TimeZone='UTC'"); err != nil {
 		return nil, fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
 	}
+	// Read a GeoParquet file's geometry column as BLOB, as the query engine
+	// does (#440): with conversion on, a partition holding one such file next
+	// to Arc's BLOB files fails to compact on every cycle.
+	if err := database.DisableGeoParquetConversion(context.Background(), db); err != nil {
+		return nil, err
+	}
 
 	// Set DuckDB memory limit from config. Exceeding it makes DuckDB spill to
 	// its temp_directory (configured below) instead of OOMing the process.
@@ -187,49 +276,18 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	manifestManager := NewManifestManager(backend, logger)
 
 	// Create and run job
-	job := NewJob(&JobConfig{
-		Database:        config.Database,
-		Measurement:     config.Measurement,
-		PartitionPath:   config.PartitionPath,
-		Files:           config.Files,
-		StorageBackend:  backend,
-		Tier:            config.Tier,
-		BatchNumber:     config.BatchNumber,
-		TempDirectory:   config.TempDirectory,
-		SortKeys:        config.SortKeys,
-		Logger:          logger,
-		DB:              db,
-		ManifestManager: manifestManager,
-		// Phase 4: thread cluster-mode fields through to the job. When
-		// CompletionDir is empty (OSS / standalone), clusterMode() is
-		// false and the completion-manifest writes are no-ops.
-		JobID:                   config.JobID,
-		CompletionDir:           config.CompletionDir,
-		PartitionTime:           config.PartitionTime,
-		ParentFinalizesManifest: config.ParentFinalizesManifest,
-	})
+	job := NewJob(subprocessJobConfig(config, backend, logger, db, manifestManager))
 
-	// Use signal-aware context so the subprocess can cancel DuckDB queries
-	// when the parent kills it via SIGTERM (from exec.CommandContext).
+	// Signal-aware, so the subprocess can cancel DuckDB queries on SIGTERM or
+	// SIGINT sent to it directly: a service manager stopping the whole
+	// process group (systemd's KillMode=control-group), or Ctrl-C in a
+	// terminal. The parent's own cancellation does not come through here:
+	// exec.CommandContext kills the child outright (SIGKILL).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	err = job.Run(ctx)
 
-	result := &SubprocessJobResult{
-		Success:        err == nil,
-		FilesCompacted: job.FilesCompacted,
-		BytesBefore:    job.BytesBefore,
-		BytesAfter:     job.BytesAfter,
-		// The storage key of the output (empty when the job produced none).
-		// The parent's compacted-output observer keys the edge sync ledger
-		// on this; the temp path would never match a storage listing.
-		OutputFile:      job.OutputStorageKey,
-		CompactedInputs: job.CompactedInputKeys(),
-		ManifestPath:    job.RetainedManifestPath(),
-	}
-	if err != nil {
-		result.Error = err.Error()
-	}
+	result := subprocessResult(job, err)
 
 	logger.Info().
 		Bool("success", result.Success).
@@ -285,8 +343,9 @@ func writeHeapProfile(logger zerolog.Logger, path string) {
 // RunJobInSubprocess executes compaction in a subprocess for memory isolation.
 // The subprocess runs the same binary with the "compact" subcommand.
 // When the subprocess exits, all DuckDB memory (including jemalloc arenas) is released.
-// extraEnv can be used to pass additional environment variables (e.g., credentials).
-func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger zerolog.Logger, extraEnv ...string) (*SubprocessJobResult, error) {
+// Storage credentials travel in config.Credentials; the subprocess inherits
+// this process's environment unchanged.
+func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger zerolog.Logger) (*SubprocessJobResult, error) {
 	// Serialize config to JSON
 	configJSON, err := json.Marshal(config)
 	if err != nil {
@@ -305,11 +364,6 @@ func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger
 
 	// Pass config via stdin
 	cmd.Stdin = bytes.NewReader(configJSON)
-
-	// Set extra environment variables (e.g., Azure credentials)
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
-	}
 
 	// Capture stdout and stderr separately
 	var stdout, stderr bytes.Buffer
@@ -380,38 +434,44 @@ func forwardSubprocessLine(logger zerolog.Logger, line string) {
 		Msg(line)
 }
 
-// createStorageBackendFromConfig creates a storage backend from subprocess config.
-//
-// This deliberately does NOT go through the shared storage.NewBackend factory
-// (internal/storage/factory.go) that primary storage, the tiering cold tier and
-// the backup manager use. The subprocess has a credential model of its own, on
-// purpose: credentials are never serialised into the job config, so it MUST
-// read them from the environment the parent set. The S3 case passes none at all
-// and lets the SDK chain pick them up, and the Azure case derives
-// UseManagedIdentity from whether AZURE_STORAGE_KEY is present. The factory
-// itself is indifferent to credentials and its other callers simply forward
-// whatever the operator configured; here the empty credential set IS the
-// contract, and a regression in it surfaces as a failed compaction job in a
-// separate process rather than a failed startup - the hardest place to notice
-// one.
+// createStorageBackendFromConfig creates the subprocess's storage backend
+// through the same constructor as primary storage, the cold tier and backup
+// (storage.NewBackend, #1104). Only the inputs differ: backendSpecFromJob
+// reads them from the job and, for an older parent, the environment.
 func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.Logger) (storage.Backend, error) {
+	spec, err := backendSpecFromJob(config, os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewBackend(spec, logger)
+}
+
+// backendSpecFromJob turns a job's storage fields into a BackendSpec. Every
+// field a backend's ConfigJSON emits must be read here: prefix in particular
+// is applied to every key the backend touches, so dropping it silently
+// reroots the subprocess at the bucket or container root and compaction
+// reads and writes the wrong location.
+//
+// Credentials come from the job (config.Credentials). When that is nil the
+// job came from a parent that predates the field and put them in the
+// environment instead: S3 keys in AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
+// which NewS3Backend reads itself, and the Azure account key in
+// AZURE_STORAGE_KEY, with managed identity inferred from its absence.
+func backendSpecFromJob(config *SubprocessJobConfig, getenv func(string) string) (storage.BackendSpec, error) {
+	spec := storage.BackendSpec{Type: config.StorageType}
+	creds := config.Credentials
 	switch config.StorageType {
 	case "local":
-		var localConfig struct {
+		var c struct {
 			BasePath string `json:"base_path"`
 		}
-		if err := json.Unmarshal([]byte(config.StorageConfig), &localConfig); err != nil {
-			return nil, fmt.Errorf("failed to parse local storage config: %w", err)
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse local storage config: %w", err)
 		}
-		return storage.NewLocalBackend(localConfig.BasePath, logger)
+		spec.LocalPath = c.BasePath
 
 	case "s3":
-		// Every field S3Backend.ConfigJSON emits must be parsed and forwarded
-		// here. Prefix in particular: it is applied to every key the backend
-		// touches (prefixedKey), so dropping it silently reroots the subprocess
-		// at the bucket root and compaction reads and writes the wrong location.
-		// It defaults to empty, which is why the omission went unnoticed.
-		var s3Config struct {
+		var c struct {
 			Bucket    string `json:"bucket"`
 			Prefix    string `json:"prefix"`
 			Region    string `json:"region"`
@@ -419,50 +479,86 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 			PathStyle bool   `json:"path_style"`
 			UseSSL    bool   `json:"use_ssl"`
 		}
-		if err := json.Unmarshal([]byte(config.StorageConfig), &s3Config); err != nil {
-			return nil, fmt.Errorf("failed to parse S3 storage config: %w", err)
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse S3 storage config: %w", err)
 		}
-		return storage.NewS3Backend(&storage.S3Config{
-			Bucket:    s3Config.Bucket,
-			Prefix:    s3Config.Prefix,
-			Region:    s3Config.Region,
-			Endpoint:  s3Config.Endpoint,
-			PathStyle: s3Config.PathStyle,
-			UseSSL:    s3Config.UseSSL,
-			// Credentials come from environment variables
-		}, logger)
+		spec.S3 = storage.S3Config{
+			Bucket:    c.Bucket,
+			Prefix:    c.Prefix,
+			Region:    c.Region,
+			Endpoint:  c.Endpoint,
+			PathStyle: c.PathStyle,
+			UseSSL:    c.UseSSL,
+		}
+		// With no keys, NewS3Backend falls back to the AWS_* environment and
+		// the SDK chain, as the parent did: the subprocess inherits its
+		// environment (IRSA, instance roles, profiles).
+		if creds != nil {
+			spec.S3.AccessKey = creds.S3AccessKey
+			spec.S3.SecretKey = creds.S3SecretKey
+		}
 
 	case "azure":
-		// Same rule as the S3 case above, and for the same reason: every field
-		// AzureBlobBackend.ConfigJSON emits must be parsed and forwarded here.
-		// Prefix in particular is applied to every key the backend touches
-		// (prefixedKey), so dropping it silently reroots the subprocess at the
-		// container root and compaction reads and writes the wrong location.
-		// It defaults to empty, which is why the same omission on the S3 side
-		// went unnoticed.
-		var azureConfig struct {
+		var c struct {
 			Container   string `json:"container"`
 			Prefix      string `json:"prefix"`
 			AccountName string `json:"account_name"`
 			Endpoint    string `json:"endpoint"`
 		}
-		if err := json.Unmarshal([]byte(config.StorageConfig), &azureConfig); err != nil {
-			return nil, fmt.Errorf("failed to parse Azure storage config: %w", err)
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse Azure storage config: %w", err)
 		}
-		// Read credentials from environment variables (set by parent process)
-		accountKey := os.Getenv("AZURE_STORAGE_KEY")
-		return storage.NewAzureBlobBackend(&storage.AzureBlobConfig{
-			ContainerName:      azureConfig.Container,
-			Prefix:             azureConfig.Prefix,
-			AccountName:        azureConfig.AccountName,
-			AccountKey:         accountKey,
-			Endpoint:           azureConfig.Endpoint,
-			UseManagedIdentity: accountKey == "", // Only use managed identity if no key provided
-		}, logger)
+		spec.Azure = storage.AzureBlobConfig{
+			ContainerName: c.Container,
+			Prefix:        c.Prefix,
+			AccountName:   c.AccountName,
+			Endpoint:      c.Endpoint,
+		}
+		if creds != nil {
+			// All of them, so NewAzureBlobBackend applies the same precedence
+			// it applied in the parent. A connection string carries its own
+			// endpoint, which ConfigJSON does not.
+			spec.Azure.ConnectionString = creds.AzureConnectionString
+			spec.Azure.AccountKey = creds.AzureAccountKey
+			spec.Azure.SASToken = creds.AzureSASToken
+			spec.Azure.UseManagedIdentity = creds.AzureUseManagedIdentity
+		} else {
+			key := getenv("AZURE_STORAGE_KEY")
+			spec.Azure.AccountKey = key
+			spec.Azure.UseManagedIdentity = key == ""
+		}
+
+	case "gcs":
+		var c struct {
+			Bucket   string `json:"bucket"`
+			Prefix   string `json:"prefix"`
+			Endpoint string `json:"endpoint"`
+		}
+		if err := json.Unmarshal([]byte(config.StorageConfig), &c); err != nil {
+			return spec, fmt.Errorf("failed to parse GCS storage config: %w", err)
+		}
+		spec.GCS = storage.GCSConfig{
+			Bucket:   c.Bucket,
+			Prefix:   c.Prefix,
+			Endpoint: c.Endpoint,
+			// The parent probed the bucket and proved the key at startup;
+			// repeating both per job would add requests and failure points
+			// to every compaction.
+			SkipProbe: true,
+		}
+		// With neither set, the subprocess uses Application Default
+		// Credentials from the environment it inherits, as the parent did.
+		if creds != nil {
+			spec.GCS.CredentialsJSON = creds.GCSCredentialsJSON
+			spec.GCS.CredentialsFile = creds.GCSCredentialsFile
+		}
 
 	default:
-		return nil, fmt.Errorf("unsupported storage type: %s", config.StorageType)
+		// NewBackend accepts aliases (minio, azblob) that Backend.Type() never
+		// emits; the job only ever carries these four.
+		return spec, fmt.Errorf("unsupported storage type: %s", config.StorageType)
 	}
+	return spec, nil
 }
 
 // sqlErrorMarkers are deterministic DuckDB SQL failure classes: a query that
@@ -472,7 +568,7 @@ var sqlErrorMarkers = []string{"binder error", "catalog error", "parser error"}
 
 // memoryErrorMarkers indicate memory pressure; retrying with a smaller batch
 // is exactly the right response.
-var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed"}
+var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed", "bad_alloc"}
 
 // permanentErrorMarkers are failures no retry can fix: the input is gone or
 // unreadable. Both streams are searched for each one - see ClassifySubprocessError.
@@ -523,6 +619,11 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		if strings.Contains(errStr, "killed") {
 			return true, "killed"
 		}
+		// A C++ abort: DuckDB's std::bad_alloc when stderr says so (the
+		// memory markers below), otherwise an unknown crash.
+		if strings.Contains(errStr, "aborted") && !containsAny(errLower+stderrLower, memoryErrorMarkers) {
+			return true, "aborted"
+		}
 	}
 
 	// Check exit codes for OOM (137 = SIGKILL, often OOM killer)
@@ -537,6 +638,18 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 	}
 
+	// Memory errors before SQL errors: a child that died of memory (a Go
+	// runtime "out of memory", a std::bad_alloc abort) embeds its whole stderr,
+	// whose earlier warn lines may quote SQL error text, and classifying that
+	// as a permanent SQL error left a too-wide partition failing every cycle.
+	// A real SQL error arrives alone through the JSON result and carries no
+	// memory marker.
+	for _, marker := range memoryErrorMarkers {
+		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
+			return true, "memory_error"
+		}
+	}
+
 	// Deterministic DuckDB SQL errors — permanent at any batch size, so the
 	// splitter's retry ladder (each rung re-downloads the whole batch) is pure
 	// waste. These arrive via the JSON result path, so they appear in err
@@ -544,13 +657,6 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	for _, marker := range sqlErrorMarkers {
 		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
 			return false, "sql_error"
-		}
-	}
-
-	// Check for memory-related errors in either stream.
-	for _, marker := range memoryErrorMarkers {
-		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
-			return true, "memory_error"
 		}
 	}
 
@@ -570,4 +676,68 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	// Default: treat unknown errors as potentially recoverable once
 	// This allows one retry for transient issues
 	return true, "unknown"
+}
+
+// subprocessJobConfig is the Job a subprocess runs for config. Every field
+// the parent sends is carried here, OutputName included (OpenJobs relies on
+// the job writing the output under the name the parent registered).
+func subprocessJobConfig(config *SubprocessJobConfig, backend storage.Backend, logger zerolog.Logger, db *sql.DB, manifestManager *ManifestManager) *JobConfig {
+	return &JobConfig{
+		Database:         config.Database,
+		Measurement:      config.Measurement,
+		PartitionPath:    config.PartitionPath,
+		Files:            config.Files,
+		StorageBackend:   backend,
+		Tier:             config.Tier,
+		BatchNumber:      config.BatchNumber,
+		TempDirectory:    config.TempDirectory,
+		SortKeys:         config.SortKeys,
+		SortKeysExplicit: config.SortKeysExplicit,
+		Logger:           logger,
+		DB:               db,
+		ManifestManager:  manifestManager,
+		// Phase 4: thread cluster-mode fields through to the job. When
+		// CompletionDir is empty (OSS / standalone), clusterMode() is
+		// false and the completion-manifest writes are no-ops.
+		JobID:                   config.JobID,
+		CompletionDir:           config.CompletionDir,
+		PartitionTime:           config.PartitionTime,
+		ParentFinalizesManifest: config.ParentFinalizesManifest,
+		Staged:                  config.Staged,
+		Inputs:                  config.Inputs,
+		OutputName:              config.OutputName,
+	}
+}
+
+// subprocessResult is what the subprocess reports for job after Run.
+func subprocessResult(job *Job, err error) *SubprocessJobResult {
+	result := &SubprocessJobResult{
+		Success:        err == nil,
+		FilesCompacted: job.FilesCompacted,
+		BytesBefore:    job.BytesBefore,
+		BytesAfter:     job.BytesAfter,
+		// The storage key of the output (empty when the job produced none).
+		// The parent's compacted-output observer keys the edge sync ledger
+		// on this; the temp path would never match a storage listing.
+		OutputFile:      job.OutputStorageKey,
+		CompactedInputs: job.CompactedInputKeys(),
+		ManifestPath:    job.RetainedManifestPath(),
+		SourcesDeleted:  job.sourcesDeleted,
+		// Taken after Run: every count is I/O this job did (backend
+		// constructors move none).
+		Metrics: metrics.Get().ChildCounters(),
+	}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	return result
+}
+
+func containsAny(s string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }

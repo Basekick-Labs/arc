@@ -37,6 +37,8 @@ RUN if [ "$FIPS" = "1" ]; then \
 
 # Pre-seed the DuckDB extensions Arc loads at startup (httpfs for S3/HTTP reads,
 # aws for the credential-chain providers, incl. CHAIN 'web_identity' for IRSA).
+# Seeds httpfs, aws and every extension database.extensions accepts (spatial,
+# about 60 MB), so enabling one needs no network either.
 # Without this the first run performs an INSTALL that fetches from
 # extensions.duckdb.org: an air-gapped or egress-restricted deployment fails at
 # startup, and everyone else pays a network round-trip on first boot. Seeding

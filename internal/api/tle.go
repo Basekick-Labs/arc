@@ -123,15 +123,23 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 			goto localProcessing
 		}
 		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to route write request")
+			if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+				h.logger.Error().Err(err).Msg("Failed to route write request")
+			}
 			h.totalErrors.Add(1)
-			return HandleRoutingError(c, err)
+			return respondWriteForwardError(c, err)
 		}
 
 		return CopyResponse(c, resp)
 	}
 
 localProcessing:
+	// A standby writer forwards the write to the primary instead of refusing
+	// it, when the cluster names one it can trust (#1270). Before anything is
+	// read or written here.
+	if handled, err := forwardStandbyWrite(h.router, c); handled {
+		return err
+	}
 	// Shared decompressRequest helper (below) handles gzip/zstd/
 	// uncompressed dispatch with a hard 100MB output cap, the streaming
 	// LimitReader-bounded zstd path, and the defensive copy of fasthttp-
@@ -209,8 +217,24 @@ localProcessing:
 	}
 
 	// Write directly to the buffer (typed path — skips convertColumnsToTyped)
-	if err := h.buffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
+	// Admit the whole request, its size reserved against the WAL volume's
+	// free space (#676); a fence or disk pressure refuses it here.
+	writeCtx, release, aerr := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	if aerr != nil {
 		h.totalErrors.Add(1)
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	if err := h.buffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, numRecords); err != nil {
+		h.totalErrors.Add(1)
+		// Logged by reason, not as an ingest error (#1268).
+		if ingest.IsWriteRefusal(err) {
+			return respondWriteRefused(c, err)
+		}
+		// A client error (#440), refused before the WAL.
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		metrics.Get().IncIngestErrors()
 		h.logger.Error().
 			Err(err).
@@ -344,68 +368,75 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 	return result, nil
 }
 
-// decompressZstdPooled decompresses zstd data using the package-level
-// zstdDecoderPool (declared in msgpack.go). Returns a freshly-copied
-// []byte so LP and TLE callers can keep their flat-byte handler shape.
+// zstdMaxWindow bounds the window a zstd frame may declare. The decoder
+// allocates the declared window up front, so without it a 10-byte frame
+// declaring a 512 MB window allocated 512 MB, and the pooled decoder kept it.
+// zstd levels 1-19 use at most an 8 MB window and level 20 32 MB; levels 21
+// and 22 (--ultra) and --long mode use larger ones, and a body compressed
+// that way is refused (errZstdWindow).
+const zstdMaxWindow = 32 << 20
+
+// decompressZstdPooled decompresses an untrusted zstd request body with a
+// pooled decoder for maxSize (zstdDecoderPool in msgpack.go), into a fresh
+// []byte the caller owns.
 //
-// maxSize is a hard ceiling on the *decompressed output*; pass 0 for
-// the default 100MB. Critical: the bound is enforced by reading the
-// decoder via io.LimitReader, NOT by checking len after DecodeAll.
-// zstd.WithDecoderMaxMemory only bounds the decoder's per-frame
-// window state, not the output buffer growth — DecodeAll on a high-
-// ratio bomb (e.g. 100KB → 100GB) would OOM the process before any
-// post-hoc length check could fire. The streaming Reset+LimitReader+
-// ReadAll pattern matches the gzip helper above and is the same
-// shape klauspost recommends for untrusted input.
+// maxSize is a hard ceiling on the *decompressed output*; pass 0 for the
+// default 100MB. DecodeAll enforces it while decoding: the decoder's
+// WithDecoderMaxMemory is its output limit, checked against a frame's
+// declared size before allocating and against the output as blocks decode,
+// so a bomb (frames without a declared size, or many concatenated frames)
+// stops at the limit (TestDecompressZstdBombsStopAtTheLimit).
 //
-// Reads up to maxSize+1 bytes; if exactly maxSize+1 bytes were read,
-// the input was over-limit and we return an error (a single read of
-// maxSize+1 is still bounded so the bomb cannot OOM).
-func decompressZstdPooled(data []byte, maxSize int) ([]byte, error) {
+// Everything runs on the caller's goroutine. A streaming decoder with the
+// default concurrency decodes on a goroutine of its own, where a decoder
+// panic cannot be recovered and ends the process: klauspost/compress
+// <= 1.20.1 panics on a crafted frame (GHSA-fpmh-frq8-7rj8), and one request
+// crashed Arc. Here a panic is recovered and returned as a decode error, and
+// that decoder is dropped. DecodeAll is also faster than the stream was.
+func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 	if maxSize <= 0 {
 		maxSize = 100 * 1024 * 1024 // 100MB default
 	}
 
+	pool := zstdDecoderPool(maxSize)
 	var decoder *zstd.Decoder
-	var err error
-	if pooled := zstdDecoderPool.Get(); pooled != nil {
+	if pooled := pool.Get(); pooled != nil {
 		decoder = pooled.(*zstd.Decoder)
-		if err = decoder.Reset(bytes.NewReader(data)); err != nil {
-			// Pool entry's internal state is now poisoned — drop it.
-			decoder.Close()
-			return nil, fmt.Errorf("failed to reset zstd decoder: %w", err)
-		}
 	} else {
-		decoder, err = zstd.NewReader(bytes.NewReader(data), zstd.WithDecoderMaxMemory(uint64(maxSize)+1024))
+		decoder, err = zstd.NewReader(nil,
+			// DecodeAll never starts goroutines; concurrency 1 keeps a
+			// streaming decode (Reset/Read) on the caller's goroutine too,
+			// should one ever be added.
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(uint64(maxSize)),
+			zstd.WithDecoderMaxWindow(zstdMaxWindow))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 		}
 	}
 
-	// Bounded read: io.LimitReader caps the bytes we will pull from the
-	// decoder regardless of compression ratio. Reading maxSize+1 lets us
-	// distinguish "exactly at limit" from "over limit" with a single
-	// allocation — no unbounded buffer growth is possible.
-	limited := io.LimitReader(decoder, int64(maxSize)+1)
-	out, err := io.ReadAll(limited)
-	if err != nil {
-		// Decoder may be in an indeterminate state after a partial-decode
-		// error — corrupted internal frame state can't be safely reset.
-		// Drop the decoder entirely (Close releases its goroutines and
-		// buffers) rather than risk poisoning the pool. The pool's Get()
-		// will allocate a fresh one on the next request. Per gemini r7.
-		decoder.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			// Not returned to the pool: its state is half-built.
+			out, err = nil, fmt.Errorf("failed to decompress zstd: corrupt input (%v)", r)
+		}
+	}()
+
+	out, err = decoder.DecodeAll(data, nil)
+	// DecodeAll leaves the decoder reusable after an error (its block
+	// decoders go back in a defer), so it returns to the pool either way.
+	pool.Put(decoder)
+	switch {
+	case errors.Is(err, zstd.ErrWindowSizeExceeded):
+		return nil, fmt.Errorf("failed to decompress zstd: %w", errZstdWindow)
+	case errors.Is(err, zstd.ErrDecoderSizeExceeded):
+		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
+	case err != nil:
 		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
 	}
-
-	// Release the decoder's internal buffers (it may be holding the
-	// last decoded frame) before returning to the pool.
-	_ = decoder.Reset(nil)
-	zstdDecoderPool.Put(decoder)
-
-	if len(out) > maxSize {
-		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
-	}
-
 	return out, nil
 }
+
+// errZstdWindow names the window limit, so a client compressing with
+// --ultra or --long learns which setting to change.
+var errZstdWindow = fmt.Errorf("the frame's window is larger than %d MB; compress with level 20 or lower, without --long", zstdMaxWindow>>20)

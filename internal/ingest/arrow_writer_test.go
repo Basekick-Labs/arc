@@ -87,7 +87,7 @@ func TestRowsToColumnar_SingleRecord(t *testing.T) {
 		},
 	}
 
-	result := buffer.rowsToColumnar("cpu", rows)
+	result, _ := buffer.rowsToColumnar("cpu", rows)
 
 	// Verify basic structure
 	if result.Measurement != "cpu" {
@@ -169,7 +169,7 @@ func TestRowsToColumnar_MultipleRecords(t *testing.T) {
 		},
 	}
 
-	result := buffer.rowsToColumnar("cpu", rows)
+	result, _ := buffer.rowsToColumnar("cpu", rows)
 
 	// Verify column lengths
 	timeCol := result.Columns["time"]
@@ -229,7 +229,7 @@ func TestRowsToColumnar_SchemaVariation(t *testing.T) {
 		},
 	}
 
-	result := buffer.rowsToColumnar("cpu", rows)
+	result, _ := buffer.rowsToColumnar("cpu", rows)
 
 	// Verify all fields exist
 	if _, ok := result.Columns["usage"]; !ok {
@@ -274,7 +274,7 @@ func TestRowsToColumnar_SchemaVariation(t *testing.T) {
 func TestRowsToColumnar_EmptyRecords(t *testing.T) {
 	buffer := createTestArrowBuffer(t)
 
-	result := buffer.rowsToColumnar("cpu", []*models.Record{})
+	result, _ := buffer.rowsToColumnar("cpu", []*models.Record{})
 
 	if result.Measurement != "cpu" {
 		t.Errorf("Expected measurement 'cpu', got %q", result.Measurement)
@@ -312,7 +312,7 @@ func TestRowsToColumnar_TimestampFallback(t *testing.T) {
 		},
 	}
 
-	result := buffer.rowsToColumnar("cpu", rows)
+	result, _ := buffer.rowsToColumnar("cpu", rows)
 	timeCol := result.Columns["time"]
 
 	// First row: should use Timestamp directly
@@ -349,7 +349,7 @@ func TestRowsToColumnar_DifferentFieldTypes(t *testing.T) {
 		},
 	}
 
-	result := buffer.rowsToColumnar("metrics", rows)
+	result, _ := buffer.rowsToColumnar("metrics", rows)
 
 	// Verify field types are preserved
 	if result.Columns["float_val"][0].(float64) != 3.14159 {
@@ -732,7 +732,7 @@ func BenchmarkRowsToColumnar(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buffer.rowsToColumnar("cpu", rows)
+		_, _ = buffer.rowsToColumnar("cpu", rows)
 	}
 }
 
@@ -769,7 +769,7 @@ func BenchmarkRowsToColumnar_SchemaVariation(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buffer.rowsToColumnar("cpu", rows)
+		_, _ = buffer.rowsToColumnar("cpu", rows)
 	}
 }
 
@@ -954,7 +954,7 @@ func TestSortTypedColumnBatchByKeys_NilValidityEntry(t *testing.T) {
 		Signature:  "time:i64,val:f64",
 	}
 
-	sorted := sortTypedColumnBatchByKeys(batch, []string{"time"})
+	sorted, _ := sortTypedColumnBatchByKeys(batch, []string{"time"})
 
 	// Data should be sorted ascending
 	sortedTime := sorted.Data["time"].([]int64)

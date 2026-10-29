@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -32,9 +33,12 @@ type Subscriber struct {
 	invalidDatabaseLogged sync.Map
 	client                pahomqtt.Client
 	arrowBuffer           *ingest.ArrowBuffer
-	logger                zerolog.Logger
-	encryptor             PasswordEncryptor
-	onStatusChange        func(id string, status SubscriptionStatus, errMsg string)
+	// nameWarned rate-limits the warning for a dropped field name (#1342).
+	nameWarnMu     sync.Mutex
+	nameWarned     map[string]time.Time
+	logger         zerolog.Logger
+	encryptor      PasswordEncryptor
+	onStatusChange func(id string, status SubscriptionStatus, errMsg string)
 
 	// Runtime state. mu guards the lifecycle fields (running, connectedSince),
 	// which change only on connect/start/stop — not on the message hot path.
@@ -48,6 +52,7 @@ type Subscriber struct {
 	// full lock on every received message (#328).
 	messagesReceived   atomic.Int64
 	messagesFailed     atomic.Int64
+	suspended          atomic.Bool // disconnected while writes are fenced (#1207)
 	bytesReceived      atomic.Int64
 	reconnects         atomic.Int64
 	lastMessageAtNanos atomic.Int64
@@ -373,10 +378,43 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 		return
 	}
 
-	// Decode and write message
-	if err := s.processMessage(msg.Topic(), msg.Payload(), database); err != nil {
+	// Decode and write message. While writes are fenced (#1207) or the WAL
+	// volume is under disk pressure (#676) the manager suspends this
+	// subscription, so the broker holds new messages. One that was already in
+	// flight when the refusal started waits briefly for it to lift; never
+	// long, since blocking this handler stalls the client and its keepalive.
+	err := s.processMessage(s.ctx, msg.Topic(), msg.Payload(), database)
+	// A retry is the same message: a disk pressure refusal of it is counted
+	// once in arc_wal_disk_pressure_rejections_total (#676).
+	retryCtx := ingest.WithRefusalCounted(s.ctx)
+	for deadline := time.Now().Add(mqttFencedWait); err != nil && ingest.IsWriteRefusal(err) && time.Now().Before(deadline); {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(mqttFencedRetry):
+		}
+		err = s.processMessage(retryCtx, msg.Topic(), msg.Payload(), database)
+	}
+	if err != nil {
 		s.messagesFailed.Add(1)
 		metrics.Get().IncMQTTMessagesFailed()
+		if ingest.IsWriteRefusal(err) {
+			// Still refused after the wait: logged by reason, at most every
+			// 30 s, not once per message (#1268). The takeover gates do not
+			// suspend the subscription, so this repeats per message for as long
+			// as one is refusing.
+			ingest.LogRefusal("mqtt "+msg.Topic(), err)
+			return
+		}
+		// A device's payload changing a column between string and binary
+		// (#440) is refused on every message it sends: logged per topic at
+		// most every nameWarnEvery, like a dropped field name.
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			if s.nameWarnDue("type " + msg.Topic()) {
+				s.logger.Warn().Err(err).Str("topic", msg.Topic()).Msg("MQTT message refused: it changes a column between string and binary")
+			}
+			return
+		}
 		s.logger.Error().
 			Err(err).
 			Str("topic", msg.Topic()).
@@ -387,8 +425,69 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	}
 }
 
+// mqttFencedRetry and mqttFencedWait bound how long a message refused by ingest
+// fencing is retried before it is counted failed: far below any keepalive.
+const (
+	mqttFencedRetry = 250 * time.Millisecond
+	mqttFencedWait  = 2 * time.Second
+)
+
+// suspend disconnects from the broker without unsubscribing while writes are
+// refused (#1207, #676); the session, and with clean_session=false its queued
+// messages, survives. why completes the log line.
+func (s *Subscriber) suspend(why string) {
+	s.mu.RLock()
+	running, client := s.running, s.client
+	s.mu.RUnlock()
+	if !running || client == nil || !s.suspended.CompareAndSwap(false, true) {
+		return
+	}
+	client.Disconnect(250)
+	metrics.Get().SetMQTTConnected(false)
+	s.logger.Warn().Msg("MQTT subscription suspended: " + why + "; messages wait at the broker (clean_session=false sessions only)")
+}
+
+// resume reconnects a suspended subscription; onConnect resubscribes.
+func (s *Subscriber) resume() {
+	s.mu.RLock()
+	running, client := s.running, s.client
+	s.mu.RUnlock()
+	if !running || client == nil || !s.suspended.CompareAndSwap(true, false) {
+		return
+	}
+	token := client.Connect()
+	if !token.WaitTimeout(time.Duration(s.config.ConnectTimeoutSeconds)*time.Second) || token.Error() != nil {
+		s.logger.Error().Err(token.Error()).Msg("MQTT subscription could not reconnect after writes resumed")
+		s.updateStatus(StatusError, "reconnect after writes resumed failed")
+		return
+	}
+	s.logger.Info().Msg("MQTT subscription resumed: writes are accepted again")
+}
+
+// nameWarnEvery bounds how often one measurement's unstorable field name is
+// logged: a device sends it in every message.
+const nameWarnEvery = 10 * time.Minute
+
+// maxNameWarnsPerMessage bounds the dropped-name warnings one message logs.
+const maxNameWarnsPerMessage = 10
+
+// nameWarnDue reports whether key's warning may be logged now.
+func (s *Subscriber) nameWarnDue(key string) bool {
+	s.nameWarnMu.Lock()
+	defer s.nameWarnMu.Unlock()
+	now := time.Now()
+	if last, ok := s.nameWarned[key]; ok && now.Sub(last) < nameWarnEvery {
+		return false
+	}
+	if s.nameWarned == nil || len(s.nameWarned) > 10000 {
+		s.nameWarned = map[string]time.Time{}
+	}
+	s.nameWarned[key] = now
+	return true
+}
+
 // processMessage decodes and writes an MQTT message to the ArrowBuffer
-func (s *Subscriber) processMessage(topic string, payload []byte, database string) error {
+func (s *Subscriber) processMessage(ctx context.Context, topic string, payload []byte, database string) error {
 	// Try to decode as MessagePack first (check magic bytes)
 	if len(payload) > 0 {
 		records, err := s.decodePayload(topic, payload)
@@ -396,8 +495,47 @@ func (s *Subscriber) processMessage(topic string, payload []byte, database strin
 			return fmt.Errorf("failed to decode payload: %w", err)
 		}
 
-		// Write to ArrowBuffer
-		if err := s.arrowBuffer.Write(s.ctx, database, records); err != nil {
+		// A tag or field whose name Arc could not read back is removed and
+		// the rest of the reading kept (#1342): there is no client to answer,
+		// and a device's "Time" key must not cost every message.
+		for i, d := range ingest.StripRecordNames(records, s.arrowBuffer.KnownColumns(database)) {
+			if i == maxNameWarnsPerMessage {
+				break // one message cannot flood the log with distinct names
+			}
+			if !s.nameWarnDue(d.Measurement + "\x00" + ingest.TruncateColumnName(d.Column)) {
+				continue
+			}
+			s.logger.Warn().
+				Str("topic", topic).
+				Str("measurement", d.Measurement).
+				Str("column", ingest.QuoteColumnName(d.Column)).
+				Str("reason", d.Reason).
+				Int("records", d.Points).
+				Msg("MQTT field dropped: its name cannot be stored")
+		}
+
+		// Write to ArrowBuffer, the payload's size reserved against the WAL
+		// volume's free space (#676).
+		writeCtx, release, err := s.arrowBuffer.AdmitRequest(ctx, int64(len(payload)))
+		if err != nil {
+			return fmt.Errorf("failed to write to buffer: %w", err)
+		}
+		defer release()
+		if err := s.arrowBuffer.Write(writeCtx, database, records); err != nil {
+			var dropped *ingest.PointsDroppedError
+			if errors.As(err, &dropped) {
+				// The other points were written; these could not be.
+				for _, d := range dropped.Drops {
+					s.logger.Error().
+						Str("topic", topic).
+						Str("measurement", d.Measurement).
+						Str("column", ingest.QuoteColumnName(d.Column)).
+						Str("reason", d.Reason).
+						Int("points_dropped", d.Points).
+						Msg("MQTT points dropped (partial write)")
+				}
+				return nil
+			}
 			return fmt.Errorf("failed to write to buffer: %w", err)
 		}
 	}

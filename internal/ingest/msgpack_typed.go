@@ -1,9 +1,10 @@
 package ingest
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"math"
-	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/Basekick-Labs/msgpack/v6/msgpcode"
@@ -64,15 +65,184 @@ func isFloatCode(c byte) bool {
 }
 
 func isStrCode(c byte) bool {
-	// Deliberately excludes Bin8/16/32: the generic path boxes bin as []byte
-	// and convertColumnsToTyped rejects it, so the typed path must not
-	// accept bin where today's path errors. Bin falls back to the generic
-	// decoder, which produces today's rejection.
+	// Deliberately excludes Bin8/16/32: the typed path has no binary column
+	// class, so it must not accept bin. Bin falls back to the generic
+	// decoder, which boxes it as []byte; convertColumnsToTyped stores that as
+	// a binary column (#440).
 	return msgpcode.IsFixedString(c) || c == msgpcode.Str8 || c == msgpcode.Str16 || c == msgpcode.Str32
+}
+
+// skipScalar skips a value the typed path ignores, if every part of it is
+// plain: nil, bool, number, string, binary, or arrays and string-keyed maps
+// of those (at most 32 deep). Anything else (an extension, a map with a
+// non-string key) is left to the generic path, which decodes every value of
+// the payload and refuses some of them (an unknown extension, a nil key).
+func skipScalar(dec *msgpack.Decoder) bool {
+	return skipPlain(dec, 32)
+}
+
+func skipPlain(dec *msgpack.Decoder, depth int) bool {
+	if depth == 0 {
+		return false
+	}
+	c, err := dec.PeekCode()
+	if err != nil {
+		return false
+	}
+	switch {
+	case c == 0xc0, isBoolCode(c), isIntCode(c), isFloatCode(c), isStrCode(c), c == 0xc4, c == 0xc5, c == 0xc6:
+		return dec.Skip() == nil
+	case isArrayCode(c):
+		n, err := dec.DecodeArrayLen()
+		if err != nil {
+			return false
+		}
+		for i := 0; i < n; i++ {
+			if !skipPlain(dec, depth-1) {
+				return false
+			}
+		}
+		return true
+	case isMapCode(c):
+		n, err := dec.DecodeMapLen()
+		if err != nil {
+			return false
+		}
+		for i := 0; i < n; i++ {
+			kc, err := dec.PeekCode()
+			if err != nil || !isStrCode(kc) || dec.Skip() != nil {
+				return false
+			}
+			if !skipPlain(dec, depth-1) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func isBoolCode(c byte) bool {
 	return c == msgpcode.True || c == msgpcode.False
+}
+
+// tryDecodeTyped is the typed fast path for the payload shapes clients send
+// columnar data in: one columnar map, a top-level array of columnar maps
+// (Telegraf's Arc output, for more than one measurement), or {"batch": [...]}
+// (the Python client's encode_batch). Each array or batch item is decoded by
+// tryDecodeColumnarTyped from its own bytes, which become its RawPayload, so
+// its WAL entry stores the client's bytes as a single map's does. All or
+// nothing: if any item can't take the typed path, the whole payload goes to
+// the generic path, which stays the authority on accept/reject (including
+// its skip-and-log of bad items).
+func (d *MessagePackDecoder) tryDecodeTyped(data []byte) ([]interface{}, bool) {
+	if len(data) == 0 {
+		return nil, false
+	}
+	switch c := data[0]; {
+	case isArrayCode(c):
+		n, pos, ok := msgpackHeader(data, 0, true)
+		if !ok || n == 0 || n > len(data)-pos {
+			return nil, false // an empty array is the generic path's answer
+		}
+		recs := make([]interface{}, 0, n)
+		for i := 0; i < n; i++ {
+			end, ok := msgpackValueEnd(data, pos)
+			if !ok {
+				return nil, false
+			}
+			rec, ok := d.tryDecodeItemTyped(data[pos:end])
+			if !ok {
+				return nil, false // stop at the first item the typed path can't take
+			}
+			recs = append(recs, rec)
+			pos = end
+		}
+		if pos != len(data) {
+			return nil, false
+		}
+		return recs, true
+	case isMapCode(c):
+		if rec, ok := d.tryDecodeColumnarTyped(data); ok {
+			return []interface{}{rec}, true
+		}
+		items, ok := batchItemSpans(data)
+		if !ok || len(items) == 0 {
+			return nil, false
+		}
+		recs := make([]interface{}, 0, len(items))
+		for _, it := range items {
+			rec, ok := d.tryDecodeItemTyped(data[it[0]:it[1]])
+			if !ok {
+				return nil, false
+			}
+			recs = append(recs, rec)
+		}
+		return recs, true
+	}
+	return nil, false
+}
+
+func (d *MessagePackDecoder) tryDecodeItemTyped(item []byte) (*TypedColumnarRecord, bool) {
+	return d.tryDecodeColumnarTyped(item) // refuses anything but a map
+}
+
+// batchItemSpans is the byte spans of the items of {"batch": [...], ...}: a
+// map whose keys are all strings, with exactly one "batch" key holding an
+// array, and whose other values are plain (skipPlain), so the generic path
+// would read the map the same way (it ignores the other keys). False
+// otherwise. Items are only framed here; the caller decodes them.
+func batchItemSpans(data []byte) ([][2]int, bool) {
+	r := bytes.NewReader(data)
+	dec := msgpack.NewDecoder(r)
+	nkeys, err := dec.DecodeMapLen()
+	if err != nil || nkeys <= 0 || nkeys > r.Len() {
+		return nil, false
+	}
+	var items [][2]int
+	found := false
+	for k := 0; k < nkeys; k++ {
+		c, err := dec.PeekCode()
+		if err != nil || !isStrCode(c) {
+			return nil, false
+		}
+		key, err := dec.DecodeString()
+		if err != nil {
+			return nil, false
+		}
+		if key != "batch" {
+			if !skipPlain(dec, 32) {
+				return nil, false
+			}
+			continue
+		}
+		if found {
+			return nil, false // repeated key: the generic path keeps the last
+		}
+		found = true
+		pos := len(data) - r.Len()
+		n, next, ok := msgpackHeader(data, pos, true)
+		if !ok || n > len(data)-next {
+			return nil, false
+		}
+		items = make([][2]int, 0, n)
+		pos = next
+		for i := 0; i < n; i++ {
+			end, ok := msgpackValueEnd(data, pos)
+			if !ok {
+				return nil, false
+			}
+			items = append(items, [2]int{pos, end})
+			pos = end
+		}
+		if _, err := r.Seek(int64(pos), io.SeekStart); err != nil {
+			return nil, false
+		}
+	}
+	if !found || r.Len() != 0 {
+		return nil, false
+	}
+	return items, true
 }
 
 // tryDecodeColumnarTyped attempts to decode a top-level single-map columnar
@@ -82,12 +252,12 @@ func isBoolCode(c byte) bool {
 // validity, and inferred types are IDENTICAL to what the generic decode +
 // convertColumnsToTyped would have produced — or it returns ok=false having
 // caused no side effects, and the caller runs the generic path. It never
-// surfaces an error to the user: every reject decision (mixed types, bin
-// columns, string time, uint64 overflow, nested values, batch format, ...)
-// is delegated to the generic path by falling back, which guarantees the
+// surfaces an error to the user: every decision it cannot reproduce
+// (mixed types, bin columns, string time, uint64 overflow, nested values,
+// batch format, ...) is delegated to the generic path by falling back, which guarantees the
 // user-visible accept/reject behavior is byte-identical to the pre-typed
-// decoder. The cost of double-decoding malformed payloads is irrelevant:
-// they are rejected requests, not the hot path.
+// decoder. Double-decoding is the cost of a fallback: irrelevant for
+// rejected requests, and accepted for bin columns (#440), which are rare.
 //
 // Scope (deliberate, per the validated design): top-level single-map payloads
 // only. Batch format, array format, row format, and payloads for deployments
@@ -108,6 +278,8 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 
 	var (
 		measurement    string
+		tagKeys        []string
+		haveTagKeys    bool
 		haveM, haveCol bool
 		typed          map[string]interface{}
 		validity       map[string][]bool
@@ -143,14 +315,40 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 			if haveCol {
 				return nil, false
 			}
-			t, v, n, s, ok := d.decodeTypedColumns(dec)
+			t, v, n, s, ok := d.decodeTypedColumns(dec, len(data))
 			if !ok {
 				return nil, false
 			}
 			typed, validity, numRecords, sanitized = t, v, n, s
 			haveCol = true
+		case "tag_keys":
+			if haveTagKeys {
+				return nil, false
+			}
+			haveTagKeys = true
+
+			code, err := dec.PeekCode()
+			if err != nil || !isArrayCode(code) {
+				return nil, false
+			}
+			n, err := dec.DecodeArrayLen()
+			if err != nil || n > 256 {
+				return nil, false
+			}
+			tagKeys = make([]string, 0, n)
+			for i := 0; i < n; i++ {
+				code, err := dec.PeekCode()
+				if err != nil || !isStrCode(code) {
+					return nil, false
+				}
+				tag, err := dec.DecodeString()
+				if err != nil {
+					return nil, false
+				}
+				tagKeys = append(tagKeys, tag)
+			}
 		default:
-			if err := dec.Skip(); err != nil {
+			if !skipScalar(dec) {
 				return nil, false
 			}
 		}
@@ -160,20 +358,11 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 		return nil, false
 	}
 
-	// Missing/omitted time column: generate now-µs for every row, matching
-	// decodeColumnar's behavior (including the Warn so users know their data
-	// lacked timestamps).
+	// Missing/omitted time column: leave it to the generic path, which
+	// generates the time and keeps it in the WAL entry (#1207): this path
+	// stores the client's payload raw, which has no time to replay.
 	if _, ok := typed["time"]; !ok {
-		d.logger.Warn().
-			Str("measurement", measurement).
-			Int("row_count", numRecords).
-			Msg("Data missing 'time' column - generating UTC timestamps")
-		nowMicros := time.Now().UTC().UnixMicro()
-		arr := make([]int64, numRecords)
-		for i := range arr {
-			arr[i] = nowMicros
-		}
-		typed["time"] = arr
+		return nil, false
 	}
 
 	if sanitized > 0 {
@@ -184,9 +373,10 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 	}
 
 	batch := &TypedColumnBatch{
-		Data:      typed,
-		Validity:  validity,
-		Signature: getColumnSignature(typed),
+		Data:       typed,
+		Validity:   validity,
+		TagColumns: tagKeys,
+		Signature:  getColumnSignature(typed),
 	}
 	return &TypedColumnarRecord{
 		Measurement: measurement,
@@ -230,7 +420,10 @@ func decodeMeasurementTyped(dec *msgpack.Decoder) (string, bool) {
 
 // decodeTypedColumns decodes the columns map into typed slices.
 // Returns (data, validity, numRecords, sanitizedCount, ok).
-func (d *MessagePackDecoder) decodeTypedColumns(dec *msgpack.Decoder) (map[string]interface{}, map[string][]bool, int, int, bool) {
+// size is the payload's length: a column cannot have more values than the
+// payload has bytes (each takes at least one), so a larger declared count is
+// refused before anything is allocated for it.
+func (d *MessagePackDecoder) decodeTypedColumns(dec *msgpack.Decoder, size int) (map[string]interface{}, map[string][]bool, int, int, bool) {
 	c, err := dec.PeekCode()
 	if err != nil || !isMapCode(c) {
 		return nil, nil, 0, 0, false
@@ -250,6 +443,10 @@ func (d *MessagePackDecoder) decodeTypedColumns(dec *msgpack.Decoder) (map[strin
 	validity := make(map[string][]bool)
 	expected := -1
 	sanitized := 0
+	// The generic path decodes a map, so a repeated key keeps only its LAST
+	// value (dropped if that is not an array). A repeated array column is
+	// refused below; a non-array value before an array of the same name is
+	// skipped, so the array is kept, as the generic path keeps it.
 
 	for i := 0; i < ncols; i++ {
 		kc, err := dec.PeekCode()
@@ -260,6 +457,9 @@ func (d *MessagePackDecoder) decodeTypedColumns(dec *msgpack.Decoder) (map[strin
 		if err != nil {
 			return nil, nil, 0, 0, false
 		}
+		if _, dup := typed[name]; dup {
+			return nil, nil, 0, 0, false // duplicate column key
+		}
 		vc, err := dec.PeekCode()
 		if err != nil {
 			return nil, nil, 0, 0, false
@@ -267,13 +467,13 @@ func (d *MessagePackDecoder) decodeTypedColumns(dec *msgpack.Decoder) (map[strin
 		if !isArrayCode(vc) {
 			// The generic path silently drops non-array column values
 			// (mapToPayload keeps only arrays). Match it: skip the value.
-			if err := dec.Skip(); err != nil {
+			if !skipScalar(dec) {
 				return nil, nil, 0, 0, false
 			}
 			continue
 		}
 		n, err := dec.DecodeArrayLen()
-		if err != nil || n <= 0 || n > maxTypedPreallocElems {
+		if err != nil || n <= 0 || n > maxTypedPreallocElems || n > size {
 			// Empty columns and oversized length claims go to the generic
 			// path (which errors on mismatch / guards allocation).
 			return nil, nil, 0, 0, false
@@ -283,9 +483,6 @@ func (d *MessagePackDecoder) decodeTypedColumns(dec *msgpack.Decoder) (map[strin
 		} else if n != expected {
 			// Length mismatch — the generic path produces the error.
 			return nil, nil, 0, 0, false
-		}
-		if _, dup := typed[name]; dup {
-			return nil, nil, 0, 0, false // duplicate column key
 		}
 
 		if name == "time" {
@@ -449,7 +646,8 @@ func (d *MessagePackDecoder) decodeValueColumnTyped(dec *msgpack.Decoder, n int)
 				class = clsBool
 				bools = make([]bool, n)
 			default:
-				// bin, nested array/map, ext — generic path rejects.
+				// bin (generic path stores it as binary, #440), nested
+				// array/map, ext (generic path rejects) — fall back.
 				return nil, nil, 0, false
 			}
 		}

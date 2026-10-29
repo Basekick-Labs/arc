@@ -3,6 +3,7 @@ package compaction
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -31,17 +32,29 @@ func TestBuildOrderByClause(t *testing.T) {
 		{
 			name:     "two keys",
 			sortKeys: []string{"tag_sensor_id", "time"},
-			want:     `ORDER BY "tag_sensor_id", "time"`,
+			want:     `ORDER BY epoch_us("time") // 3600000000, "tag_sensor_id", "time"`,
 		},
 		{
 			name:     "three keys",
 			sortKeys: []string{"tag_region", "tag_host", "time"},
-			want:     `ORDER BY "tag_region", "tag_host", "time"`,
+			want:     `ORDER BY epoch_us("time") // 3600000000, "tag_region", "tag_host", "time"`,
+		},
+		{
+			// A legacy config that puts time first already orders by time;
+			// the hour prefix would be redundant.
+			name:     "time first (legacy config)",
+			sortKeys: []string{"time", "host"},
+			want:     `ORDER BY "time", "host"`,
+		},
+		{
+			name:     "quote in key is escaped after the hour prefix",
+			sortKeys: []string{`a"b`, "time"},
+			want:     `ORDER BY epoch_us("time") // 3600000000, "a""b", "time"`,
 		},
 		{
 			name:     "keys with special characters",
 			sortKeys: []string{"my-column", "tag_host", "time"},
-			want:     `ORDER BY "my-column", "tag_host", "time"`,
+			want:     `ORDER BY epoch_us("time") // 3600000000, "my-column", "tag_host", "time"`,
 		},
 	}
 
@@ -186,4 +199,66 @@ func searchString(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestCompactionSortKeys covers the filter that keeps a configured sort key
+// without a column out of the compaction ORDER BY (a key that cannot bind fails
+// the partition's compaction on every cycle).
+func TestCompactionSortKeys(t *testing.T) {
+	cols := map[string]string{"fleet": "fleet", "name": "Name", "time": "time"}
+	tests := []struct {
+		name        string
+		keys        []string
+		columns     map[string]string
+		wantKept    []string
+		wantDropped []string
+	}{
+		{"all present", []string{"fleet", "name", "time"}, cols, []string{"fleet", "name", "time"}, nil},
+		// DuckDB binds names case-insensitively, and the probe map is keyed
+		// lower-case: a key spelled differently from its column is present.
+		{"case-insensitive match", []string{"FLEET", "Name", "time"}, cols, []string{"FLEET", "Name", "time"}, nil},
+		{"missing key dropped, order kept", []string{"site", "fleet", "time"}, cols, []string{"fleet", "time"}, []string{"site"}},
+		{"only time left", []string{"site", "time"}, cols, []string{"time"}, []string{"site"}},
+		// The probe failed: keep every key and let the COPY report the error.
+		{"nil columns keeps all", []string{"site", "time"}, nil, []string{"site", "time"}, nil},
+		// time is kept even when absent from the map; the caller already
+		// refused a batch without a time column.
+		{"time always kept", []string{"fleet", "time"}, map[string]string{"fleet": "fleet"}, []string{"fleet", "time"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kept, dropped := compactionSortKeys(tt.keys, tt.columns)
+			if strings.Join(kept, ",") != strings.Join(tt.wantKept, ",") {
+				t.Errorf("kept = %v, want %v", kept, tt.wantKept)
+			}
+			if strings.Join(dropped, ",") != strings.Join(tt.wantDropped, ",") {
+				t.Errorf("dropped = %v, want %v", dropped, tt.wantDropped)
+			}
+		})
+	}
+
+	// The result never aliases the input: the input may be the shared config slice.
+	in := []string{"fleet", "time"}
+	kept, _ := compactionSortKeys(in, nil)
+	kept[0] = "changed"
+	if in[0] != "fleet" {
+		t.Fatal("compactionSortKeys returned a slice sharing the input's backing array")
+	}
+}
+
+// TestGetSortKeysDoesNotWriteIntoConfig pins that appending "time" never writes
+// into the config slice's spare capacity, which concurrent compaction jobs share.
+func TestGetSortKeysDoesNotWriteIntoConfig(t *testing.T) {
+	shared := make([]string, 1, 4)
+	shared[0] = "fleet"
+	m := &Manager{SortKeysConfig: map[string][]string{"m": shared}, DefaultSortKeys: shared}
+	a := m.GetSortKeys("m")
+	b := m.GetSortKeys("other")
+	a[1] = "x"
+	if b[1] != "time" || shared[:2][1] == "x" {
+		t.Fatalf("GetSortKeys appended into the shared config slice: a=%v b=%v", a, b)
+	}
+	if !m.hasMeasurementSortKeys("m") || m.hasMeasurementSortKeys("other") {
+		t.Fatal("hasMeasurementSortKeys does not tell sort_keys from default_sort_keys")
+	}
 }

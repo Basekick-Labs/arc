@@ -63,6 +63,11 @@ type Receiver struct {
 	// Nil is a supported configuration, not an error — the hub must work in
 	// OSS standalone, where no coordinator exists.
 	registerFile func(ctx context.Context, f *ReceivedFile) error
+
+	// holdPath keeps a cluster node's stale-local sweep away from the path
+	// for the whole receive: a redelivery re-registers the file it finds
+	// there without writing it (#1071). Nil outside a cluster.
+	holdPath func(path string) (release func())
 }
 
 // ReceivedFile describes a file that has been verified and promoted.
@@ -155,6 +160,10 @@ type ReceiverConfig struct {
 	// RegisterFile is called after a file is verified and promoted. Leave nil
 	// in standalone mode.
 	RegisterFile func(ctx context.Context, f *ReceivedFile) error
+
+	// HoldPath, when set, is held on the final path for the whole receive
+	// (Coordinator.HoldLocalPaths).
+	HoldPath func(path string) (release func())
 }
 
 // NewReceiver validates configuration and returns a ready Receiver.
@@ -171,6 +180,7 @@ func NewReceiver(cfg ReceiverConfig) (*Receiver, error) {
 		// aggregators mishandle.
 		logger:       cfg.Logger,
 		registerFile: cfg.RegisterFile,
+		holdPath:     cfg.HoldPath,
 	}, nil
 }
 
@@ -215,6 +225,10 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 
 	finalPath := NamespacedPath(spokeID, sourcePath)
 	stagingPath := stagingPathFor(spokeID, sourcePath)
+	if r.holdPath != nil {
+		release := r.holdPath(finalPath)
+		defer release()
+	}
 
 	// §6.1 identity check, before reading a single byte of the body. A
 	// duplicate costs no transfer, and a conflict must not consume bytes it
@@ -249,7 +263,9 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 	}
 
 	exists, err := r.backend.Exists(ctx, finalPath)
-	if err != nil {
+	// A hub bucket that does not exist yet holds nothing: the staging write
+	// below is what creates it on most S3-compatible stores (#1242).
+	if err != nil && !storage.IsStoreNotFound(err) {
 		return nil, fmt.Errorf("%w: stat %q: %w", ErrReceiveInternal, finalPath, err)
 	}
 	if exists {

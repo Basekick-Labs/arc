@@ -77,6 +77,8 @@ func TestCreateStorageBackendFromConfig_PreservesAzurePrefix(t *testing.T) {
 	logger := zerolog.Nop()
 
 	const fakeKey = "dGhpcy1pcy1ub3QtYS1yZWFsLWtleQ==" // base64("this-is-not-a-real-key")
+	// The job below carries no Credentials, the shape an older parent sends
+	// (#1104), so the subprocess reads the key from the environment.
 	t.Setenv("AZURE_STORAGE_KEY", fakeKey)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

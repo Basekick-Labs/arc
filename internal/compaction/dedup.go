@@ -46,27 +46,72 @@ func readTagColumnsFromParquetFiles(ctx context.Context, db *sql.DB, filePaths [
 	return result, nil
 }
 
-// readDedupTimeFromParquetFiles reports whether ANY of the given Parquet files
-// carries the "arc:dedup_time" marker. That marker is written only by producers
-// whose data model is one-row-per-(tags,time) — continuous queries (#521) — and
-// tells compaction it is safe to dedup on time even when there are no tag
-// columns. A missing marker (all raw-ingest files) returns false, so ingest
-// dedup behavior is unchanged.
-func readDedupTimeFromParquetFiles(ctx context.Context, db *sql.DB, filePaths []string) (bool, error) {
+// dedupMode is how a compaction batch removes duplicate rows.
+type dedupMode int
+
+const (
+	// dedupNone keeps every row: raw ingest without tag metadata or a
+	// continuous-query marker.
+	dedupNone dedupMode = iota
+	// dedupExact drops a row only when another row of the batch is identical
+	// to it in every column — time, every tag and every field (#1232). Rows
+	// that share their tags and time but differ in any field are different
+	// data and are all kept.
+	dedupExact
+)
+
+func (m dedupMode) String() string {
+	if m == dedupExact {
+		return "exact_rows"
+	}
+	return "none"
+}
+
+// exactDedupMarker is the Parquet footer key that marks continuous-query output
+// without tag columns, opting the file into exact-row dedup at compaction
+// (#1232). It replaced legacyDedupTimeMarker as the key Arc writes because
+// builds before #1232 read the old key as "dedup this batch on time alone": a
+// file marked with it here, which may hold several rows per time, would lose
+// rows to a node rolled back, or not yet upgraded, that compacts it.
+const exactDedupMarker = "arc:dedup_exact"
+
+// legacyDedupTimeMarker is the key written before #1232 on continuous-query
+// output that was one row per time (#521). Still read, never written.
+const legacyDedupTimeMarker = "arc:dedup_time"
+
+// readAnyContinuousQueryMarker reports whether any of the given Parquet files
+// carries exactDedupMarker or legacyDedupTimeMarker with the value "true": the
+// batch holds continuous-query output without tag columns and gets exact-row
+// dedup. One marked file is enough — exact-row dedup never deletes a row that
+// differs from every other, so the marker only decides whether the batch is
+// checked at all.
+func readAnyContinuousQueryMarker(ctx context.Context, db *sql.DB, filePaths []string) (bool, error) {
 	for _, filePath := range filePaths {
 		query := fmt.Sprintf(
-			`SELECT value FROM parquet_kv_metadata('%s') WHERE key = 'arc:dedup_time'`,
-			escapeSQLPath(filePath),
+			`SELECT value FROM parquet_kv_metadata('%s') WHERE key IN ('%s', '%s')`,
+			escapeSQLPath(filePath), exactDedupMarker, legacyDedupTimeMarker,
 		)
-		var val string
-		err := db.QueryRowContext(ctx, query).Scan(&val)
-		if err == sql.ErrNoRows {
-			continue
-		}
+		rows, err := db.QueryContext(ctx, query)
 		if err != nil {
-			return false, fmt.Errorf("failed to read parquet dedup_time metadata: %w", err)
+			return false, fmt.Errorf("failed to read parquet dedup marker metadata: %w", err)
 		}
-		if val == "true" {
+		marked := false
+		for rows.Next() {
+			var val string
+			if err := rows.Scan(&val); err != nil {
+				rows.Close()
+				return false, fmt.Errorf("failed to read parquet dedup marker metadata: %w", err)
+			}
+			if val == "true" {
+				marked = true
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return false, fmt.Errorf("failed to read parquet dedup marker metadata: %w", err)
+		}
+		if marked {
 			return true, nil
 		}
 	}
@@ -131,30 +176,37 @@ func isValidIdentifier(name string) bool {
 // concurrent jobs (distinct pinned connections) do not collide.
 const dedupStagingTable = "arc_compaction_staged"
 
+// dedupKeysTable holds the (tags..., time) keys that occur on more than one
+// staged row; same connection-local lifetime as dedupStagingTable.
+const dedupKeysTable = "arc_compaction_dupkeys"
+
 // buildCompactionQuery builds the DuckDB statement(s) for compaction. It returns
 // a slice of statements to execute in order on the same connection.
 //
-// Dedup runs when tagColumns is non-empty OR dedupTime is set. Without either,
-// returns a single standard COPY (zero overhead). When deduping, returns two
-// statements (CREATE OR REPLACE TEMP TABLE ... AS <normalized read> ; COPY
-// <dedup window over the table>) — see the long comment on the dedup branch for
-// why a temp table is required rather than a CTE or subquery.
-//
-// The dedup key is (tagColumns..., "time"). With no tag columns but dedupTime
-// set (a no-group-by continuous query, #521), the key is "time" alone — one row
-// per timestamp. This is safe ONLY because dedupTime is written exclusively by
-// producers whose data is one-row-per-time; raw ingest never sets it.
-func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string, dedupTime bool) []string {
+// mode dedupNone returns a single standard COPY (zero overhead). dedupExact
+// returns three statements: stage the normalized read in a temp table, collect
+// the (tagColumns..., time) keys that occur more than once, then copy every row
+// whose key is unique as is and, for the rows whose key repeats, one copy of
+// each distinct row. Comparing whole rows only inside repeated keys keeps the
+// cost close to the old one-row-per-key window — a full DISTINCT over the
+// batch hashes every column of every row, which is prohibitive on wide
+// measurements (#1232). With no tag columns (continuous-query output marked
+// exactDedupMarker) the key is time alone, and the output is marked in turn so a
+// later pass checks it again.
+func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string, mode dedupMode) []string {
 	escapedOutput := escapeSQLPath(outputFile)
 
-	if len(tagColumns) == 0 && !dedupTime {
+	if mode == dedupNone {
 		// Standard compaction — no dedup overhead.
 		// Normalize "time" to TIMESTAMP so a partition that mixes file schemas
 		// (some time=TIMESTAMP, some time=VARCHAR from a misbehaving writer)
 		// still compacts instead of failing the column bind. See timeNormalizeReplace.
+		//
+		// The ORDER BY applies to a derived table so it binds to the
+		// normalized "time", never a raw VARCHAR one (see buildOrderByClause).
 		return []string{fmt.Sprintf(`
 		COPY (
-			SELECT * REPLACE (%s) FROM %s
+			SELECT * FROM (SELECT * REPLACE (%s) FROM %s)
 			%s
 		) TO '%s' (
 			FORMAT PARQUET,
@@ -165,7 +217,8 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	`, timeNormalizeReplace, sqlutil.ReadParquet(fileListSQL, "union_by_name=true"), orderByClause, escapedOutput)}
 	}
 
-	// Dedup compaction — keep one row per unique (tags, time) key.
+	// Dedup compaction stages the normalized read in a temp table first, and
+	// every aggregate below runs over that table, never over the raw scan.
 	//
 	// The "time" normalization MUST be fully materialized into a typed relation
 	// BEFORE the dedup window binds. This requires a real temp table, not a CTE
@@ -197,13 +250,15 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	// concrete TIMESTAMPTZ "time" — binds correctly (fact 1) and dedups
 	// correctly (fact 3). Verified: real all-TIMESTAMPTZ partition binds; a
 	// partition with an injected VARCHAR-time duplicate dedups to one row.
-	//
-	// PARTITION BY all tag columns + time: rows with identical (tags, time) are
-	// duplicates; one is kept. This is the dedup key, not the output order — the
-	// output is sorted by the separate orderByClause (time).
-	// Build the PARTITION BY key: all tag columns plus "time". When there are no
-	// tag columns (a no-group-by CQ reaching here via dedupTime), the key is
-	// "time" alone — build the list without a dangling leading comma.
+	// (These facts were found with the one-row-per-key window this code used
+	// before #1232; the GROUP BY and joins below rely on the same temp table
+	// for the same reason.)
+	stage := fmt.Sprintf(
+		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM %s`,
+		dedupStagingTable, timeNormalizeReplace, sqlutil.ReadParquet(fileListSQL, "union_by_name=true"))
+
+	// The key: every tag column plus "time". It only narrows where whole rows
+	// are compared; it never decides on its own that two rows are duplicates.
 	quotedKeys := make([]string, 0, len(tagColumns)+1)
 	for _, tag := range tagColumns {
 		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
@@ -212,29 +267,52 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, escaped))
 	}
 	quotedKeys = append(quotedKeys, `"time"`)
-	partitionBy := strings.Join(quotedKeys, ", ")
 
-	stage := fmt.Sprintf(
-		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM %s`,
-		dedupStagingTable, timeNormalizeReplace, sqlutil.ReadParquet(fileListSQL, "union_by_name=true"))
+	// IS NOT DISTINCT FROM, not =: a tag is NULL on every row of a file that
+	// lacks the column (union_by_name), and = would match no key for those
+	// rows, dropping them from BOTH branches below.
+	match := make([]string, len(quotedKeys))
+	for i, k := range quotedKeys {
+		match[i] = fmt.Sprintf("k.%s IS NOT DISTINCT FROM s.%s", k, k)
+	}
+	keyMatch := strings.Join(match, " AND ")
 
+	dupKeys := fmt.Sprintf(
+		`CREATE OR REPLACE TEMP TABLE %s AS SELECT %s FROM %s GROUP BY ALL HAVING count(*) > 1`,
+		dedupKeysTable, strings.Join(quotedKeys, ", "), dedupStagingTable)
+
+	// UNION ALL plus DISTINCT keeps no insertion order, so the output is
+	// always ordered explicitly; by time when no sort keys are configured.
+	order := orderByClause
+	if order == "" {
+		order = `ORDER BY "time"`
+	}
+
+	kvMetadata := ""
+	if len(tagColumns) == 0 {
+		kvMetadata = `,
+			KV_METADATA {'` + exactDedupMarker + `': 'true'}`
+	}
+
+	// The UNION is a derived table: DuckDB rejects an expression (the
+	// hour of "time" in buildOrderByClause) in an ORDER BY directly on a UNION.
 	copyOut := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM %s
-			QUALIFY ROW_NUMBER() OVER (
-				PARTITION BY %s
-				ORDER BY "time" DESC
-			) = 1
-			%s
-		) TO '%s' (
+			SELECT * FROM (
+				(SELECT * FROM %[1]s s WHERE NOT EXISTS (SELECT 1 FROM %[2]s k WHERE %[3]s))
+				UNION ALL
+				(SELECT DISTINCT * FROM %[1]s s WHERE EXISTS (SELECT 1 FROM %[2]s k WHERE %[3]s))
+			)
+			%[4]s
+		) TO '%[5]s' (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880
+			ROW_GROUP_SIZE 122880%[6]s
 		)
-	`, dedupStagingTable, partitionBy, orderByClause, escapedOutput)
+	`, dedupStagingTable, dedupKeysTable, keyMatch, order, escapedOutput, kvMetadata)
 
-	return []string{stage, copyOut}
+	return []string{stage, dupKeys, copyOut}
 }
 
 // timeNormalizeReplace is the DuckDB `REPLACE (...)` expression that coerces a
@@ -260,26 +338,85 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 //     exactly make_timestamptz's unit; it yields a UTC-anchored TIMESTAMPTZ.
 const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMPTZ), make_timestamptz(TRY_CAST("time" AS BIGINT))) AS "time"`
 
+// parquetFilesColumns returns the column names of the unified schema of the
+// given Parquet files, keyed by asciiLower(name) — DuckDB binds column names
+// without regard to ASCII case — with the name as stored as the value. DESCRIBE over read_parquet reads footers only (no data scan), and
+// union_by_name gives exactly the schema the compaction COPY will see.
+// fileListSQL is a DuckDB array literal or single quoted path, as built by
+// Job.compactFiles.
+func parquetFilesColumns(ctx context.Context, db *sql.DB, fileListSQL string) (map[string]string, error) {
+	query := fmt.Sprintf(
+		`SELECT column_name FROM (DESCRIBE SELECT * FROM %s)`,
+		sqlutil.ReadParquet(fileListSQL, "union_by_name=true"),
+	)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to probe parquet schema: %w", err)
+	}
+	defer rows.Close()
+	cols := make(map[string]string)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("failed to probe parquet schema: %w", err)
+		}
+		cols[asciiLower(name)] = name
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to probe parquet schema: %w", err)
+	}
+	return cols, nil
+}
+
 // parquetFilesHaveTimeColumn reports whether the unified schema of the given
-// Parquet files contains a "time" column. DESCRIBE over read_parquet reads
-// footers only (no data scan), and union_by_name gives exactly the schema the
-// compaction COPY will see — so "true" here guarantees the REPLACE("time")
+// Parquet files contains a "time" column, so the REPLACE("time")
 // normalization and the default ORDER BY "time" can bind. When only SOME files
 // have the column, union_by_name backfills the others with NULLs and the query
 // still binds; the probe is false only when NO file has it (e.g. a dataset
 // loaded outside Arc's ingest path, which always writes "time").
-// fileListSQL is a DuckDB array literal or single quoted path, as built by
-// Job.compactFiles.
 func parquetFilesHaveTimeColumn(ctx context.Context, db *sql.DB, fileListSQL string) (bool, error) {
-	query := fmt.Sprintf(
-		`SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM %s) WHERE column_name = 'time'`,
-		sqlutil.ReadParquet(fileListSQL, "union_by_name=true"),
-	)
-	var n int64
-	if err := db.QueryRowContext(ctx, query).Scan(&n); err != nil {
-		return false, fmt.Errorf("failed to probe parquet schema for time column: %w", err)
+	cols, err := parquetFilesColumns(ctx, db, fileListSQL)
+	if err != nil {
+		return false, err
 	}
-	return n > 0, nil
+	return hasTimeColumn(cols), nil
+}
+
+// hasTimeColumn reports whether cols, from parquetFilesColumns, holds a column
+// named exactly "time", the name Arc's ingest always writes.
+func hasTimeColumn(cols map[string]string) bool {
+	return cols["time"] == "time"
+}
+
+// asciiLower lower-cases ASCII letters only. DuckDB matches column names
+// case-insensitively for ASCII; full Unicode folding would also match names
+// DuckDB keeps apart (the Kelvin sign folds to "k").
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+// tagsWithColumns splits tag names into those the files have a column for and
+// those they do not. A name without a column cannot bind in the dedup query,
+// and every later cycle would fail the same way (#1258): files written before
+// ingest checked its tag names carry them — a line-protocol tag key starting
+// with '_', or one with an escaped comma, which arc:tags splits in two.
+// Leaving a name out only narrows the key the exact-row dedup groups on; it
+// never makes two different rows equal.
+func tagsWithColumns(tags []string, cols map[string]string) (kept, missing []string) {
+	for _, tag := range tags {
+		if _, ok := cols[asciiLower(tag)]; ok {
+			kept = append(kept, tag)
+		} else {
+			missing = append(missing, tag)
+		}
+	}
+	return kept, missing
 }
 
 // countParquetRows counts total rows across Parquet files using metadata (no data scan).

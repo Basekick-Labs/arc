@@ -43,6 +43,12 @@ type NodeConfig struct {
 	SnapshotThreshold uint64
 	TrailingLogs      uint64
 
+	// PreVoteDisabled turns off the Raft pre-vote round (#1272). Off by
+	// default (pre-vote runs): a node that cannot hear the leader then keeps
+	// its term instead of raising it on every election timeout and forcing
+	// the leader to step down when it reaches it again.
+	PreVoteDisabled bool
+
 	Logger zerolog.Logger
 
 	// TLSConfig for encrypted Raft transport (nil = plain TCP)
@@ -152,6 +158,7 @@ func (n *Node) Start() error {
 
 	// Use zerolog adapter for raft's internal logging
 	raftConfig.Logger = newZerologAdapter(n.logger, "raft")
+	raftConfig.PreVoteDisabled = n.cfg.PreVoteDisabled
 
 	// Only override non-zero values to preserve sensible defaults
 	if n.cfg.ElectionTimeout > 0 {
@@ -386,6 +393,45 @@ func (n *Node) LeaderID() string {
 	return string(id)
 }
 
+// LastContact returns when this node last heard from the Raft leader, as a
+// follower. Zero before the first contact. A leader does not update it; ask
+// IsLeader first.
+func (n *Node) LastContact() time.Time {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return time.Time{}
+	}
+	return n.raft.LastContact()
+}
+
+// VoterCount returns how many voters this node's locally known Raft
+// configuration holds; 0 when it cannot be read.
+func (n *Node) VoterCount() int {
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+	if ra == nil {
+		return 0
+	}
+	future := ra.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return 0
+	}
+	voters := 0
+	for _, srv := range future.Configuration().Servers {
+		if srv.Suffrage == raft.Voter {
+			voters++
+		}
+	}
+	return voters
+}
+
+// ElectionTimeout is the configured election timeout.
+func (n *Node) ElectionTimeout() time.Duration {
+	return n.cfg.ElectionTimeout
+}
+
 // State returns the current Raft state.
 func (n *Node) State() raft.RaftState {
 	n.mu.RLock()
@@ -399,33 +445,53 @@ func (n *Node) State() raft.RaftState {
 // Apply applies a command to the Raft cluster.
 // This can only be called on the leader.
 func (n *Node) Apply(cmd *Command, timeout time.Duration) error {
+	_, err := n.ApplyIndex(cmd, timeout)
+	return err
+}
+
+// ApplyIndex is Apply, also returning the command's log index. The index is
+// set whenever the command committed, including when the FSM refused it.
+func (n *Node) ApplyIndex(cmd *Command, timeout time.Duration) (uint64, error) {
 	n.mu.RLock()
 	ra := n.raft
 	n.mu.RUnlock()
 
 	if ra == nil {
-		return fmt.Errorf("raft not initialized")
+		return 0, fmt.Errorf("raft not initialized")
 	}
 
 	data, err := json.Marshal(cmd)
 	if err != nil {
-		return fmt.Errorf("failed to marshal command: %w", err)
+		return 0, fmt.Errorf("failed to marshal command: %w", err)
 	}
 
 	future := ra.Apply(data, timeout)
 	if err := future.Error(); err != nil {
-		return fmt.Errorf("failed to apply command: %w", err)
+		return 0, fmt.Errorf("failed to apply command: %w", err)
 	}
 
 	// Check for application error
 	if resp := future.Response(); resp != nil {
 		if err, ok := resp.(error); ok {
-			return err
+			return future.Index(), &commandRefused{err}
 		}
 	}
 
-	return nil
+	return future.Index(), nil
 }
+
+// ErrCommandRefused matches (errors.Is) an error the FSM returned for a
+// committed command: the cluster state refused it, as opposed to Raft failing
+// to commit it (not leader, leadership lost, timeout). Retrying the same
+// command against the same state fails the same way (#1267).
+var ErrCommandRefused = errors.New("command refused by the cluster state")
+
+// commandRefused keeps the FSM's message as is and adds ErrCommandRefused.
+type commandRefused struct{ err error }
+
+func (e *commandRefused) Error() string        { return e.err.Error() }
+func (e *commandRefused) Unwrap() error        { return e.err }
+func (e *commandRefused) Is(target error) bool { return target == ErrCommandRefused }
 
 // AddVoter adds a voting member to the cluster.
 func (n *Node) AddVoter(nodeID, addr string, timeout time.Duration) error {
@@ -660,7 +726,12 @@ func (n *Node) AddNode(node *NodeInfo, timeout time.Duration) error {
 
 // RemoveNode removes a node from the cluster state via Raft.
 func (n *Node) RemoveNode(nodeID string, timeout time.Duration) error {
-	payload, err := json.Marshal(RemoveNodePayload{NodeID: nodeID})
+	return n.RemoveNodeWithReason(nodeID, "", time.Time{}, timeout)
+}
+
+// RemoveNodeWithReason removes a node, saying why (see RemoveNodePayload).
+func (n *Node) RemoveNodeWithReason(nodeID, reason string, at time.Time, timeout time.Duration) error {
+	payload, err := json.Marshal(RemoveNodePayload{NodeID: nodeID, Reason: reason, At: at})
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}

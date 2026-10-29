@@ -1,8 +1,11 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +52,90 @@ func snapshotInt(t *testing.T, key string) int64 {
 	return n
 }
 
+func awaitBufferRecordMetrics(t *testing.T, queued, inflight int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if snapshotInt(t, "buffer_records_queued") == queued && snapshotInt(t, "buffer_records_inflight") == inflight {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("queued/inflight records = %d/%d, want %d/%d", snapshotInt(t, "buffer_records_queued"), snapshotInt(t, "buffer_records_inflight"), queued, inflight)
+}
+
+func TestBufferMetricsIncludeQueuedAndInFlightRecords(t *testing.T) {
+	release := make(chan struct{})
+	releaseFlushes := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	backend := &gatedStorageBackend{
+		hangingStorageBackend: newHangingStorage(0, 0),
+		release:               release,
+		started:               make(chan struct{}, 2),
+		completed:             make(chan struct{}, 2),
+	}
+	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	t.Cleanup(func() {
+		releaseFlushes()
+		_ = buf.Close()
+	})
+
+	writeBatch := func() {
+		t.Helper()
+		for i := 0; i < 10; i++ {
+			if err := buf.Write(context.Background(), "default", []interface{}{bufferMetricsRecord()}); err != nil {
+				t.Fatalf("Write %d: %v", i, err)
+			}
+		}
+	}
+	writeBatch()
+	select {
+	case <-backend.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first flush did not reach the blocked storage backend")
+	}
+
+	writeBatch()
+	awaitBufferRecordMetrics(t, 10, 10)
+
+	for _, want := range []string{
+		"arc_buffer_records_queued 10",
+		"arc_buffer_records_inflight 10",
+	} {
+		if got := metrics.Get().PrometheusFormat(); !strings.Contains(got, want) {
+			t.Errorf("Prometheus output missing %q", want)
+		}
+	}
+
+	releaseFlushes()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-backend.completed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("flush %d did not complete after releasing storage", i+1)
+		}
+	}
+	awaitBufferRecordMetrics(t, 0, 0)
+}
+
+func snapshotFloat(t *testing.T, key string) float64 {
+	t.Helper()
+	v, ok := metrics.Get().Snapshot()[key]
+	if !ok {
+		t.Fatalf("metric %q missing from snapshot", key)
+	}
+	n, ok := v.(float64)
+	if !ok {
+		t.Fatalf("metric %q is %T, want float64", key, v)
+	}
+	return n
+}
+
 // TestBufferMetrics_RecordsBufferedTracksUnflushedData pins the ingest
 // backpressure gauge.
 //
@@ -81,6 +168,119 @@ func TestBufferMetrics_RecordsBufferedTracksUnflushedData(t *testing.T) {
 
 	t.Fatalf("buffer_records_buffered = %d, want %d: the ingest backpressure gauge does not reflect unflushed records (#802)",
 		snapshotInt(t, "buffer_records_buffered"), buffered)
+}
+
+type blockingBufferMetricsBackend struct {
+	mockStorageBackend
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingBufferMetricsBackend) Write(ctx context.Context, _ string, _ []byte) error {
+	b.once.Do(func() { close(b.entered) })
+	select {
+	case <-b.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestBufferMetricsIncludeInFlightFlush(t *testing.T) {
+	release := make(chan struct{})
+	backend := &blockingBufferMetricsBackend{entered: make(chan struct{}), release: release}
+	cfg := bufferMetricsConfig()
+	cfg.MaxBufferSize = 1
+	buf := NewArrowBuffer(cfg, backend, zerolog.New(io.Discard))
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = buf.Close()
+	})
+
+	if err := buf.Write(context.Background(), "default", []interface{}{bufferMetricsRecord()}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	select {
+	case <-backend.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flush worker did not reach storage")
+	}
+
+	// The batch has left the shard but is still retained by the blocked worker.
+	if got := buf.currentBufferedRecords(); got != 0 {
+		t.Fatalf("currentBufferedRecords() = %d, want 0 after handoff", got)
+	}
+	buf.publishBufferMemoryMetrics()
+
+	if got := snapshotInt(t, "buffer_bytes_buffered"); got <= 0 {
+		t.Fatalf("buffer_bytes_buffered = %d while worker retains a batch, want > 0", got)
+	}
+	if got := snapshotFloat(t, "buffer_oldest_unflushed_seconds"); got <= 0 {
+		t.Fatalf("buffer_oldest_unflushed_seconds = %f while flush is in flight, want > 0", got)
+	}
+	prometheus := metrics.Get().PrometheusFormat()
+	if !strings.Contains(prometheus, "arc_buffer_bytes_buffered ") || !strings.Contains(prometheus, "arc_buffer_oldest_unflushed_seconds ") || !strings.Contains(prometheus, "arc_buffer_memory_limit_bytes ") || !strings.Contains(prometheus, "arc_buffer_memory_pressure ") {
+		t.Fatalf("Prometheus output missing buffer memory gauges:\n%s", prometheus)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && buf.bufferBytesBuffered.Load() != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := buf.bufferBytesBuffered.Load(); got != 0 {
+		t.Fatalf("bufferBytesBuffered = %d after completed flush, want 0", got)
+	}
+	buf.publishBufferMemoryMetrics()
+	if got := snapshotInt(t, "buffer_bytes_buffered"); got != 0 {
+		t.Fatalf("buffer_bytes_buffered = %d after completed flush, want 0", got)
+	}
+	if got := snapshotFloat(t, "buffer_oldest_unflushed_seconds"); got != 0 {
+		t.Fatalf("buffer_oldest_unflushed_seconds = %f after completed flush, want 0", got)
+	}
+}
+
+func TestBufferMetricsWarnAtMemoryThreshold(t *testing.T) {
+	var logs bytes.Buffer
+	buf := &ArrowBuffer{
+		config:           &config.IngestConfig{MaxBufferSize: 100, MaxBufferAgeMS: 100},
+		memoryLimitBytes: 100,
+		logger:           zerolog.New(&logs),
+	}
+	buf.bufferBytesBuffered.Store(50)
+	buf.publishBufferMemoryMetrics()
+	buf.publishBufferMemoryMetrics()
+	if got := snapshotInt(t, "buffer_memory_pressure"); got != 1 {
+		t.Fatalf("buffer_memory_pressure = %d at 50%%, want 1", got)
+	}
+	if got := snapshotInt(t, "buffer_memory_limit_bytes"); got != 100 {
+		t.Fatalf("buffer_memory_limit_bytes = %d, want 100", got)
+	}
+	if got := strings.Count(logs.String(), "Ingest buffers are using a large share"); got != 1 {
+		t.Fatalf("memory pressure warning logged %d times while continuously above threshold, want 1", got)
+	}
+
+	buf.bufferBytesBuffered.Store(49)
+	buf.publishBufferMemoryMetrics()
+	if got := snapshotInt(t, "buffer_memory_pressure"); got != 0 {
+		t.Fatalf("buffer_memory_pressure = %d below threshold, want 0", got)
+	}
+	// Hovering at the threshold, as flushes and writes alternate, warns once.
+	buf.bufferBytesBuffered.Store(50)
+	buf.publishBufferMemoryMetrics()
+	if got := strings.Count(logs.String(), "Ingest buffers are using a large share"); got != 1 {
+		t.Fatalf("memory pressure warning logged %d times while hovering at the threshold, want 1", got)
+	}
+	// Falling below the 40% re-arm point and crossing again warns again.
+	buf.bufferBytesBuffered.Store(39)
+	buf.publishBufferMemoryMetrics()
+	buf.bufferBytesBuffered.Store(50)
+	buf.publishBufferMemoryMetrics()
+	if got := strings.Count(logs.String(), "Ingest buffers are using a large share"); got != 2 {
+		t.Fatalf("memory pressure warning logged %d times after re-arming and crossing again, want 2", got)
+	}
 }
 
 // TestBufferMetrics_FlushCountersMove pins that the flush counters are
@@ -122,5 +322,195 @@ func TestBufferMetrics_FlushCountersMove(t *testing.T) {
 	}
 	if got := snapshotInt(t, "buffer_records_written"); got != wantWritten {
 		t.Fatalf("buffer_records_written = %d, want %d: the buffer's written count is not published (#802)", got, wantWritten)
+	}
+}
+
+// newGatedMetricsBuffer is a one-worker buffer over storage that blocks every
+// write until release is closed.
+func newGatedMetricsBuffer(t *testing.T) (*ArrowBuffer, *gatedStorageBackend, func()) {
+	t.Helper()
+	release := make(chan struct{})
+	releaseFlushes := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	backend := &gatedStorageBackend{
+		hangingStorageBackend: newHangingStorage(0, 0),
+		release:               release,
+		started:               make(chan struct{}, 16),
+		completed:             make(chan struct{}, 16),
+	}
+	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	t.Cleanup(func() {
+		releaseFlushes()
+		_ = buf.Close()
+	})
+	return buf, backend, releaseFlushes
+}
+
+func writeMetricsRecords(t *testing.T, buf *ArrowBuffer, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if err := buf.Write(context.Background(), "default", []interface{}{bufferMetricsRecord()}); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+}
+
+func awaitStarted(t *testing.T, backend *gatedStorageBackend) {
+	t.Helper()
+	select {
+	case <-backend.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flush did not reach the blocked storage backend")
+	}
+}
+
+// A synchronous flush (FlushAll, the flush before a DELETE, Close) takes the
+// records out of the buffer without queueing them: they count as in flight
+// while the write runs, and only then leave every gauge.
+func TestBufferMetricsCountSynchronousFlushesInFlight(t *testing.T) {
+	buf, backend, release := newGatedMetricsBuffer(t)
+	writeMetricsRecords(t, buf, 6) // below MaxBufferSize: nothing is queued
+	done := make(chan error, 1)
+	go func() { done <- buf.FlushAll(context.Background()) }()
+	awaitStarted(t, backend)
+	awaitBufferRecordMetrics(t, 0, 6)
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
+	awaitBufferRecordMetrics(t, 0, 0)
+}
+
+// Close's drain flushes the tasks still queued itself: each moves from queued
+// to in flight like a worker's would, and the gauges end at zero.
+func TestBufferMetricsCloseDrainMovesQueuedToInFlight(t *testing.T) {
+	buf, backend, release := newGatedMetricsBuffer(t)
+	writeMetricsRecords(t, buf, 10) // task 1: the only worker takes it and blocks
+	awaitStarted(t, backend)
+	writeMetricsRecords(t, buf, 20) // tasks 2 and 3 wait in the queue
+	awaitBufferRecordMetrics(t, 20, 10)
+
+	done := make(chan int, 1)
+	go func() { done <- buf.drainAndFlushQueue(time.Now().Add(time.Minute)) }()
+	awaitStarted(t, backend) // the drain is flushing one task (parallelism 1)
+	awaitBufferRecordMetrics(t, 10, 20)
+	release()
+	<-done
+	awaitBufferRecordMetrics(t, 0, 0)
+}
+
+// A drain past Close's deadline writes nothing: the dropped tasks leave the
+// queued gauge rather than staying there forever.
+func TestBufferMetricsCloseDropReleasesQueued(t *testing.T) {
+	buf, backend, _ := newGatedMetricsBuffer(t)
+	writeMetricsRecords(t, buf, 10)
+	awaitStarted(t, backend)
+	writeMetricsRecords(t, buf, 20)
+	awaitBufferRecordMetrics(t, 20, 10)
+
+	if unwritten := buf.drainAndFlushQueue(time.Now().Add(-time.Second)); unwritten != 20 {
+		t.Fatalf("drain past the deadline left %d records unwritten, want 20", unwritten)
+	}
+	awaitBufferRecordMetrics(t, 0, 10)
+}
+
+func metricsTypedBatch() *TypedColumnBatch {
+	return &TypedColumnBatch{
+		Data: map[string]interface{}{
+			"time":  []int64{1, 2, 3},
+			"value": []float64{1, 2, 3},
+		},
+		TagColumns: []string{},
+		Signature:  "time:i64,value:f64",
+	}
+}
+
+// The MessagePack fast path and WAL replay write through writeTypedColumnarRaw,
+// which is most production ingest. A batch with a raw payload counts the
+// payload's length; one without counts its column estimate. A synchronous
+// flush releases both bytes and age.
+func TestBufferBytesCountTypedAndRawWrites(t *testing.T) {
+	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	t.Cleanup(func() { _ = buf.Close() })
+	ctx := context.Background()
+
+	if err := buf.writeTypedColumnarRaw(ctx, "default", "raw", metricsTypedBatch(), 3, make([]byte, 1000), true); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.bufferBytesBuffered.Load(); got != 1000 {
+		t.Fatalf("bytes after a raw-payload write = %d, want the payload length 1000", got)
+	}
+	if err := buf.writeTypedColumnarInternal(ctx, "default", "typed", metricsTypedBatch(), 3, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.bufferBytesBuffered.Load(); got != 1000+48 {
+		t.Fatalf("bytes after a typed write = %d, want 1000 + 48 (two 3-value 8-byte columns)", got)
+	}
+	if buf.oldestUnflushedAge() <= 0 {
+		t.Fatal("oldest unflushed age is zero with two buffers waiting")
+	}
+
+	if err := buf.FlushAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.bufferBytesBuffered.Load(); got != 0 {
+		t.Fatalf("bytes after FlushAll = %d, want 0", got)
+	}
+	if age := buf.oldestUnflushedAge(); age != 0 {
+		t.Fatalf("oldest unflushed age after FlushAll = %v, want 0", age)
+	}
+}
+
+// Records still in a shard buffer age from the buffer's first write.
+func TestBufferOldestAgeCoversShardBuffers(t *testing.T) {
+	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	t.Cleanup(func() { _ = buf.Close() })
+	writeMetricsRecords(t, buf, 1) // below MaxBufferSize: stays in the shard
+	time.Sleep(150 * time.Millisecond)
+	if age := buf.oldestUnflushedAge(); age < 150*time.Millisecond {
+		t.Fatalf("oldest unflushed age = %v, want at least 150ms for a buffer written 150ms ago", age)
+	}
+}
+
+// A drain past Close's deadline drops its tasks: their bytes and ages leave
+// the gauges, and only the worker's in-flight task remains.
+func TestBufferBytesReleasedByCloseDrop(t *testing.T) {
+	buf, backend, _ := newGatedMetricsBuffer(t)
+	writeMetricsRecords(t, buf, 10) // task 1: in flight, blocked
+	awaitStarted(t, backend)
+	writeMetricsRecords(t, buf, 20) // tasks 2 and 3: queued
+	awaitBufferRecordMetrics(t, 20, 10)
+	before := buf.bufferBytesBuffered.Load()
+
+	buf.drainAndFlushQueue(time.Now().Add(-time.Second))
+	if got := buf.bufferBytesBuffered.Load(); got*3 != before {
+		t.Fatalf("bytes after dropping 2 of 3 equal tasks = %d, want a third of %d", got, before)
+	}
+	buf.flushTimesMu.Lock()
+	tracked := len(buf.flushTimes)
+	buf.flushTimesMu.Unlock()
+	if tracked != 1 {
+		t.Fatalf("%d flushes still tracked for age, want 1 (the in-flight task)", tracked)
+	}
+}
+
+func TestBufferMemoryGaugesInPrometheus(t *testing.T) {
+	m := metrics.Get()
+	m.SetBufferBytesBuffered(1234)
+	m.SetBufferOldestAge(2 * time.Second)
+	t.Cleanup(func() {
+		m.SetBufferBytesBuffered(0)
+		m.SetBufferOldestAge(0)
+	})
+	out := m.PrometheusFormat()
+	for _, want := range []string{"arc_buffer_bytes_buffered 1234", "arc_buffer_oldest_unflushed_seconds 2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("Prometheus output missing %q", want)
+		}
 	}
 }
