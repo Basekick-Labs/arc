@@ -98,11 +98,11 @@ func (h *EdgeSyncAdminHandler) register(c *fiber.Ctx) error {
 
 	secret, err := h.registry.Register(ctx, req.SpokeID, req.Name)
 	if err != nil {
-		if errors.Is(err, edgesync.ErrSpokeExists) {
-			// 409 rather than 400: the request is well-formed, the ID is
-			// taken. Re-registering is refused rather than treated as an
-			// update, because reissuing a secret would lock out a live edge
-			// box with no signal.
+		if errors.Is(err, edgesync.ErrSpokeExists) || errors.Is(err, edgesync.ErrSpokeIDCollision) {
+			// 409 rather than 400: the request is well-formed, but the ID is
+			// taken or aliases another registration on some filesystems.
+			// Registration is refused rather than treated as an update,
+			// because reissuing a secret would lock out a live edge box.
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
 		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})

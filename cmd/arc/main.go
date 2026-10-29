@@ -3341,7 +3341,7 @@ func main() {
 			syncLogger.Warn().
 				Str("spoke_id", id).
 				Err(reason).
-				Msg("Registered spoke ID is no longer accepted; this spoke can no longer sync and must be re-registered under a valid ID")
+				Msg("Registered spoke ID is invalid or conflicts with another ID; this spoke cannot sync until it is re-registered with a distinct, filesystem-safe ID")
 		}
 
 		if spokeCount == 0 {

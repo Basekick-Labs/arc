@@ -7,10 +7,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // SecretBytes is the length of a generated spoke secret before hex encoding.
@@ -33,6 +38,10 @@ var (
 
 	// ErrSpokeDisabled is returned when a registered spoke has been disabled.
 	ErrSpokeDisabled = errors.New("edgesync: spoke is disabled")
+
+	// ErrSpokeIDCollision is returned when distinct IDs resolve to the same
+	// namespace on a case-insensitive or Unicode-normalizing filesystem.
+	ErrSpokeIDCollision = errors.New("edgesync: spoke ID collides with another registered ID on some filesystems")
 )
 
 // SecretCipher encrypts and decrypts spoke secrets at rest.
@@ -61,9 +70,11 @@ type Spoke struct {
 
 // Registry stores which spokes may sync to this hub, and their secrets.
 type Registry struct {
-	db     *sql.DB
-	cipher SecretCipher
-	logger zerolog.Logger
+	db            *sql.DB
+	cipher        SecretCipher
+	logger        zerolog.Logger
+	mu            sync.RWMutex
+	spokeIDsByKey map[string]map[string]struct{}
 }
 
 // NewRegistry creates the registry and initializes its schema.
@@ -94,11 +105,83 @@ func NewRegistry(db *sql.DB, cipher SecretCipher, logger zerolog.Logger) (*Regis
 		return nil, err
 	}
 
-	r := &Registry{db: db, cipher: cipher, logger: logger}
+	r := &Registry{
+		db:            db,
+		cipher:        cipher,
+		logger:        logger,
+		spokeIDsByKey: make(map[string]map[string]struct{}),
+	}
 	if err := r.initSchema(); err != nil {
 		return nil, fmt.Errorf("edgesync: initialize registry schema: %w", err)
 	}
+	if err := r.loadSpokeIDs(context.Background()); err != nil {
+		return nil, fmt.Errorf("edgesync: load registered spoke IDs: %w", err)
+	}
 	return r, nil
+}
+
+// loadSpokeIDs builds the filesystem-equivalence index, including legacy
+// collisions that must be refused for sync and reported at startup.
+func (r *Registry) loadSpokeIDs(ctx context.Context) error {
+	rows, err := r.db.QueryContext(ctx, `SELECT spoke_id FROM sync_spokes`)
+	if err != nil {
+		return fmt.Errorf("query registered spoke IDs: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var spokeID string
+		if err := rows.Scan(&spokeID); err != nil {
+			return fmt.Errorf("scan registered spoke ID: %w", err)
+		}
+		addSpokeID(r.spokeIDsByKey, spokeID)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read registered spoke IDs: %w", err)
+	}
+	return nil
+}
+
+func spokeIDCollisionKey(spokeID string) string {
+	// Keep malformed UTF-8 byte strings distinct. The validator permits them
+	// today, and Unicode folding would otherwise replace invalid bytes with
+	// RuneError, making unrelated IDs collide.
+	if !utf8.ValidString(spokeID) {
+		return "\x00" + spokeID
+	}
+	return norm.NFC.String(cases.Fold().String(norm.NFC.String(spokeID)))
+}
+
+func addSpokeID(index map[string]map[string]struct{}, spokeID string) {
+	key := spokeIDCollisionKey(spokeID)
+	if index[key] == nil {
+		index[key] = make(map[string]struct{})
+	}
+	index[key][spokeID] = struct{}{}
+}
+
+func removeSpokeID(index map[string]map[string]struct{}, spokeID string) {
+	key := spokeIDCollisionKey(spokeID)
+	delete(index[key], spokeID)
+	if len(index[key]) == 0 {
+		delete(index, key)
+	}
+}
+
+func spokeIDCollisionError(spokeID string, ids map[string]struct{}) error {
+	var colliding []string
+	for id := range ids {
+		if id != spokeID {
+			colliding = append(colliding, id)
+		}
+	}
+	if len(colliding) == 0 {
+		for id := range ids {
+			colliding = append(colliding, id)
+		}
+	}
+	sort.Strings(colliding)
+	return fmt.Errorf("%q collides with registered spoke ID(s) %q: %w", spokeID, colliding, ErrSpokeIDCollision)
 }
 
 func (r *Registry) initSchema() error {
@@ -154,6 +237,15 @@ func (r *Registry) Register(ctx context.Context, spokeID, name string) (secret s
 		}
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ids := r.spokeIDsByKey[spokeIDCollisionKey(spokeID)]; len(ids) > 0 {
+		if _, exists := ids[spokeID]; exists {
+			return "", fmt.Errorf("%q: %w", spokeID, ErrSpokeExists)
+		}
+		return "", spokeIDCollisionError(spokeID, ids)
+	}
+
 	secret, err = GenerateSecret()
 	if err != nil {
 		return "", err
@@ -180,6 +272,7 @@ func (r *Registry) Register(ctx context.Context, spokeID, name string) (secret s
 	if n == 0 {
 		return "", fmt.Errorf("%q: %w", spokeID, ErrSpokeExists)
 	}
+	addSpokeID(r.spokeIDsByKey, spokeID)
 
 	r.logger.Info().Str("spoke_id", spokeID).Str("name", name).Msg("Registered edge sync spoke")
 	return secret, nil
@@ -187,11 +280,19 @@ func (r *Registry) Register(ctx context.Context, spokeID, name string) (secret s
 
 // Secret returns a spoke's decrypted secret for HMAC verification.
 //
-// Returns ErrSpokeDisabled for a registered-but-disabled spoke, so a caller
-// can log the difference — but callers on the request path MUST NOT surface
-// that distinction to the client, since it would let an attacker enumerate
-// which spoke IDs exist.
+// Returns ErrSpokeDisabled for a registered-but-disabled spoke and
+// ErrSpokeIDCollision when its filesystem-equivalent group has multiple IDs.
+// Callers on the request path MUST NOT surface either distinction to the
+// client, since that would let an attacker enumerate registered IDs.
 func (r *Registry) Secret(ctx context.Context, spokeID string) (string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if ids := r.spokeIDsByKey[spokeIDCollisionKey(spokeID)]; len(ids) > 0 {
+		if _, registered := ids[spokeID]; !registered || len(ids) > 1 {
+			return "", spokeIDCollisionError(spokeID, ids)
+		}
+	}
+
 	var encrypted string
 	var enabled bool
 
@@ -273,6 +374,8 @@ func (r *Registry) SetEnabled(ctx context.Context, spokeID string, enabled bool)
 // deleting a registration must not delete data the hub was trusted with. An
 // operator reclaiming that storage does it explicitly.
 func (r *Registry) Delete(ctx context.Context, spokeID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	res, err := r.db.ExecContext(ctx, `DELETE FROM sync_spokes WHERE spoke_id = ?`, spokeID)
 	if err != nil {
 		return fmt.Errorf("edgesync: delete spoke %q: %w", spokeID, err)
@@ -282,6 +385,7 @@ func (r *Registry) Delete(ctx context.Context, spokeID string) error {
 	} else if n == 0 {
 		return fmt.Errorf("%q: %w", spokeID, ErrSpokeNotFound)
 	}
+	removeSpokeID(r.spokeIDsByKey, spokeID)
 	r.logger.Info().Str("spoke_id", spokeID).Msg("Deleted edge sync spoke registration")
 	return nil
 }
@@ -379,17 +483,24 @@ func (r *Registry) Count(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
-// InvalidStoredIDs returns the registered spoke IDs that today's validator
-// rejects, so an upgrade that tightens the rules can say so at startup instead
-// of letting an edge box fail later with no explanation on the hub (#737).
+// InvalidStoredIDs returns registered spoke IDs that fail validation or
+// collide on case-insensitive or Unicode-normalizing filesystems, so the hub
+// can warn at startup instead of letting an edge box fail without explanation.
 //
 // It reports rather than deletes: the rows still hold a live secret and the
 // data those spokes already synced is still on disk, so removing them is an
 // operator decision.
 func (r *Registry) InvalidStoredIDs(ctx context.Context) (map[string]error, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	spokes, err := r.List(ctx)
 	if err != nil {
 		return nil, err
+	}
+	groups := make(map[string]map[string]struct{}, len(spokes))
+	for _, s := range spokes {
+		addSpokeID(groups, s.SpokeID)
 	}
 	var bad map[string]error
 	for _, s := range spokes {
@@ -398,6 +509,17 @@ func (r *Registry) InvalidStoredIDs(ctx context.Context) (map[string]error, erro
 				bad = make(map[string]error, 1)
 			}
 			bad[s.SpokeID] = err
+		}
+		if ids := groups[spokeIDCollisionKey(s.SpokeID)]; len(ids) > 1 {
+			if bad == nil {
+				bad = make(map[string]error, 1)
+			}
+			collision := spokeIDCollisionError(s.SpokeID, ids)
+			if previous := bad[s.SpokeID]; previous != nil {
+				bad[s.SpokeID] = errors.Join(previous, collision)
+			} else {
+				bad[s.SpokeID] = collision
+			}
 		}
 	}
 	return bad, nil

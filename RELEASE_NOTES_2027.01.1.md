@@ -1831,6 +1831,16 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Filesystem-equivalent spoke IDs cannot share a sync namespace ([#740](https://github.com/Basekick-Labs/arc/issues/740))
+
+Spoke IDs that differ only by Unicode case folding or canonical normalization
+can map to the same directory on some filesystems. Arc now rejects new
+collisions, refuses sync for every member of an existing collision group, and
+reports those groups at startup. Unrelated IDs and their registrations remain
+available.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1401](https://github.com/Basekick-Labs/arc/pull/1401).
+
 ### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column ([#1409](https://github.com/Basekick-Labs/arc/pull/1409))
 
 With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes each
