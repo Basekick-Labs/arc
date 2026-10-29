@@ -845,11 +845,12 @@ type ClusterConfig struct {
 	// These gate and tune the background puller that replicates Parquet files
 	// between nodes over the coordinator TCP protocol. Only takes effect when
 	// ReplicationEnabled && Enabled and FeatureClustering is licensed.
-	ReplicationPullWorkers      int // Number of concurrent fetch workers per node (default: 4)
-	ReplicationQueueSize        int // Buffered FSM callback queue size (default: 1024)
-	ReplicationFetchTimeoutMs   int // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
-	ReplicationServeTimeoutMs   int // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
-	ReplicationRetryMaxAttempts int // Max immediate retry attempts per enqueue (default: 3)
+	ReplicationPullWorkers        int   // Number of concurrent fetch workers per node (default: 4)
+	ReplicationPullBytesPerSecond int64 // Aggregate inbound replication limit per node (0 = unlimited)
+	ReplicationQueueSize          int   // Buffered FSM callback queue size (default: 1024)
+	ReplicationFetchTimeoutMs     int   // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
+	ReplicationServeTimeoutMs     int   // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
+	ReplicationRetryMaxAttempts   int   // Max immediate retry attempts per enqueue (default: 3)
 
 	// Peer file replication catch-up and periodic reconciliation (Phase 3).
 	// These control the startup walker and the repeatable manifest rechecks
@@ -1346,6 +1347,7 @@ func Load() (*Config, error) {
 			ReplicationEnabled: v.GetBool("cluster.replication_enabled"),
 			// Peer file replication (Enterprise Phase 2)
 			ReplicationPullWorkers:                   v.GetInt("cluster.replication_pull_workers"),
+			ReplicationPullBytesPerSecond:            v.GetInt64("cluster.replication_pull_bytes_per_second"),
 			ReplicationQueueSize:                     v.GetInt("cluster.replication_queue_size"),
 			ReplicationFetchTimeoutMs:                v.GetInt("cluster.replication_fetch_timeout_ms"),
 			ReplicationServeTimeoutMs:                v.GetInt("cluster.replication_serve_timeout_ms"),
@@ -2230,6 +2232,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_enabled", false) // Disabled by default
 	// Peer file replication (Enterprise Phase 2)
 	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
+	v.SetDefault("cluster.replication_pull_bytes_per_second", 0) // Unlimited aggregate inbound bytes per second
 	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue
 	v.SetDefault("cluster.replication_fetch_timeout_ms", 60000)  // 60s puller-side per-fetch timeout
 	v.SetDefault("cluster.replication_serve_timeout_ms", 120000) // 120s origin-side body-stream timeout

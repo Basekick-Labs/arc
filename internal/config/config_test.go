@@ -80,6 +80,27 @@ func TestDefaultMaxConnections(t *testing.T) {
 	}
 }
 
+func TestReplicationPullBandwidthConfig(t *testing.T) {
+	t.Run("default unlimited", func(t *testing.T) {
+		v := viper.New()
+		setDefaults(v)
+		if got := v.GetInt64("cluster.replication_pull_bytes_per_second"); got != 0 {
+			t.Fatalf("replication pull bandwidth default = %d, want 0", got)
+		}
+	})
+
+	t.Run("environment override", func(t *testing.T) {
+		t.Setenv("ARC_CLUSTER_REPLICATION_PULL_BYTES_PER_SECOND", "4096")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := cfg.Cluster.ReplicationPullBytesPerSecond; got != 4096 {
+			t.Fatalf("replication pull bandwidth = %d, want 4096", got)
+		}
+	})
+}
+
 // TestGetDefaultMaxConnections_StaysMachineDerived pins the #1030 decision that
 // max_connections is NOT quota-derived: it bounds statements in flight, not CPU
 // work, and Arc queries are frequently S3-I/O-bound, so a 2-CPU pod dropping

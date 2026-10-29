@@ -402,6 +402,10 @@ func TestFetchClientConfigValidation(t *testing.T) {
 			name: "missing shared secret",
 			c:    FetchClient{SelfNodeID: "n", ClusterName: "c"},
 		},
+		{
+			name: "negative bandwidth limit",
+			c:    FetchClient{SelfNodeID: "n", ClusterName: "c", SharedSecret: "s", BytesPerSecond: -1},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -410,6 +414,49 @@ func TestFetchClientConfigValidation(t *testing.T) {
 				t.Fatal("expected error, got nil")
 			}
 		})
+	}
+}
+
+func TestFetchClientBandwidthLimitIsSharedAcrossConcurrentFetches(t *testing.T) {
+	const fileSize = 8 * 1024
+	body := bytes.Repeat([]byte("x"), fileSize)
+	peer := startFakePeer(t)
+	defer peer.stop()
+	peer.scriptOK(sha256Hex(body), body)
+
+	fc, err := NewFetchClient(FetchClient{
+		SelfNodeID:            "reader-1",
+		ClusterName:           "test-cluster",
+		SharedSecret:          "shared-secret-xyz",
+		DialTimeout:           2 * time.Second,
+		ResponseHeaderTimeout: 2 * time.Second,
+		BytesPerSecond:        fileSize,
+	})
+	if err != nil {
+		t.Fatalf("NewFetchClient: %v", err)
+	}
+	entry := &raft.FileEntry{Path: "db/cpu/large.parquet", SizeBytes: fileSize, SHA256: sha256Hex(body)}
+
+	started := time.Now()
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := fc.Fetch(context.Background(), peer.addr(), entry, io.Discard, 0, nil)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
+		t.Fatalf("two concurrent %d-byte fetches at %d bytes/s took %s; want at least 900ms for the shared node limit", fileSize, fileSize, elapsed)
 	}
 }
 
