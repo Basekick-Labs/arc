@@ -759,6 +759,8 @@ func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier
 
 	migrated, failed := m.migrator.MigrateTierFiltered(ctx, fromTier, toTier, database, measurement)
 	return migrated, failed, nil
+}
+
 // ColdTierMissing reports a cold tier that is configured on but has no
 // backend on this node: its construction failed at startup (a bad endpoint,
 // credentials that could not be resolved). Every cold accessor then answers
