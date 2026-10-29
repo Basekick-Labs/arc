@@ -2,6 +2,15 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: cluster cache invalidation reaches peers with wildcard API addresses (#1398)
+
+Cache-invalidation fan-out now resolves hostless and wildcard API addresses
+(`:8000`, `0.0.0.0:8000`, `[::]:8000`) using the peer's coordinator host,
+retaining the API port. Previously these requests could reach the sender
+itself and be rejected with 403, leaving peer caches stale after compaction,
+retention, DELETE or database/measurement removal. Explicit API hosts remain
+unchanged. Forwarded requests and invalidation now share the same resolver.
+
 ## New: MessagePack columnar tag keys (#275)
 
 MessagePack columnar payloads now accept an optional `tag_keys` field to
@@ -14,6 +23,207 @@ data, is left out with a warning, and the write succeeds
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#905](https://github.com/Basekick-Labs/arc/pull/905).
+
+## Security: a crafted request can no longer crash Arc or exhaust its memory
+
+**A crafted zstd write crashed Arc.** klauspost/compress, which Arc uses to
+decode zstd-compressed write requests, panics on a crafted 27 KB frame
+([GHSA-fpmh-frq8-7rj8](https://github.com/klauspost/compress/security/advisories/GHSA-fpmh-frq8-7rj8),
+affecting every release up to 1.20.1). Arc decoded those bodies on a goroutine
+of the decoder's own, where the panic could not be caught, so a single
+`POST` with `Content-Encoding: zstd` (or a zstd body without the header) to
+`/api/v1/write/msgpack`, `/api/v1/write/line-protocol`, `/write`,
+`/api/v2/write` or `/api/v1/write/tle` ended the process. Every release
+through 26.09.3 is affected; any client allowed to write, or anyone when auth
+is off, could do it. Arc now decodes request bodies on the request's own
+goroutine and answers `400` to a frame the decoder cannot handle, whatever
+the library version. (A zstd-compressed Parquet file uploaded to the import
+endpoint could hit the same panic; there it already failed only that request,
+with a `500`, and it is now answered `422` like any other corrupt file.)
+
+**A small compressed request could use gigabytes of memory.** Arc's HTTP
+framework decompresses a request body sent with `Content-Encoding` (gzip,
+deflate, br) without a size limit the first time a handler reads it: a 1 MB
+gzip body to `/api/v1/query` made the server allocate 3.4 GB. Only the write
+endpoints above decode compressed bodies, themselves and within their size
+limits; every other endpoint now answers `415` to a request with a
+`Content-Encoding` other than `identity` (in any of its header lines). None of
+Arc's clients send one there.
+
+**A tiny zstd frame could reserve half a gigabyte.** A zstd frame declares its
+window size and the decoder allocates it up front: a 10-byte frame declaring a
+512 MB window allocated 512 MB, and the pooled decoder kept it. Windows are
+now limited to 32 MB. zstd levels 1 to 20 stay within it (levels 1-19 use at
+most 8 MB); a body compressed with `--ultra` levels 21-22 or with `--long` is
+refused with an error naming the window. Arc's own clients and Telegraf
+compress at level 3 or with gzip. Decoders are also pooled per size limit, so
+a msgpack payload is no longer rejected because a decoder last served an
+endpoint with a smaller limit.
+
+Arc is now built with Go 1.26.9 and golang.org/x/net 0.60, which fix eleven
+vulnerabilities in Go's HTTP, TLS and template packages that `govulncheck`
+reports as reachable from Arc.
+
+## Security: the query API runs read statements only
+
+The query endpoints (`/api/v1/query` and its MessagePack, Arrow and estimate
+forms) and continuous queries now accept read statements only: `SELECT`,
+`WITH`, `FROM`, `VALUES`, `PIVOT`, `UNPIVOT`, `SHOW`, `DESCRIBE`, `SUMMARIZE`,
+and `EXPLAIN` of one of these. Any other statement is answered `400`. A few
+DuckDB functions that change or expose server-wide state are refused in
+queries and in `DELETE` predicates, and the checks Arc runs on query text now
+read it the way DuckDB does in more cases. A stored continuous query that is
+not a read statement fails its runs from this release.
+
+Full technical detail will accompany the corresponding security advisory once it
+is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
+
+## Security: a cluster node that took a Raft snapshot no longer keeps revoked tokens ([#1336](https://github.com/Basekick-Labs/arc/issues/1336))
+
+**Enterprise clusters with auth enabled.** Each node checks API tokens and
+RBAC grants against its own SQLite, which followed the replicated auth state
+only through per-command callbacks. Two paths skipped them:
+
+- **A Raft snapshot install.** A node that was down or partitioned long
+  enough to need one, or one that joined after the leader had snapshotted,
+  never applied the token and RBAC changes the snapshot covered.
+- **Startup.** Entries applied before the callbacks were wired at boot
+  never reached SQLite. For RBAC that window included the wait for a leader.
+
+On such a node, until the same token changed again:
+
+- tokens revoked or deleted elsewhere still authenticated;
+- a rotated token kept accepting its old secret, and rejected the new one;
+- tokens created elsewhere were rejected;
+- a removed team membership, role or measurement permission still granted
+  access.
+
+Every other node was correct. Every release since 26.06.1 is affected.
+
+Each node now rewrites its local auth and RBAC rows from the replicated state
+after every snapshot install, and once at startup after it has caught up with
+the leader. Until it has caught up, it retries every 15 s; reconciling against
+the snapshot it booted from would bring back what was revoked since.
+
+**What changes for operators**
+
+- Only rows the node wrote from the replicated state are changed or removed
+  (`raft_materialised`, a new column on `api_tokens` and the five `rbac_*`
+  tables). The cluster's apply commands now also act only on those rows: a
+  legacy or standalone-created row that happens to share an ID with a
+  replicated token is no longer revoked, renamed or rotated by it.
+- Legacy rows (pre-26.06.1, or created while a node ran standalone) are left
+  in place and reported at `Warn` on every restart. See
+  [Upgrading pre-26.06.1 API tokens](operations/pre-26.06.1-token-upgrade.md).
+- A token disabled on this node but enabled in the cluster stays disabled:
+  the cluster has no re-enable command, so this only happens after a local
+  revoke while the node ran standalone. A token *deleted* on a node while it
+  ran standalone comes back on its next reconcile if the cluster still has it:
+  revoke or delete it through the cluster instead. Organizations and teams
+  follow the cluster both ways, because their update command carries
+  `enabled`.
+- A Raft wiped and re-bootstrapped with the auth database kept is detected:
+  nothing is deleted, the old cluster rows become local-only, and an `Error`
+  log says so.
+- Until a node's first reconcile, the cluster's RBAC updates and deletes reach
+  any row at the ID, as before. From then on only rows the reconcile has
+  matched to the cluster's state. Team-membership removal always applies: it
+  is keyed by the token and team, which name the same grant whatever the
+  row's ID.
+- The new column is added at startup. A database file Arc cannot write to
+  now fails startup there, not at the first token write.
+- New metrics: `arc_cluster_auth_reconcile_total`,
+  `arc_cluster_auth_reconcile_failed_total`,
+  `arc_cluster_auth_reconcile_local_rows`,
+  `arc_cluster_auth_reconcile_collisions` and
+  `arc_cluster_auth_reconcile_kept_rows`.
+
+## Upgrade note: tag and field names Arc cannot read back are refused ([#1342](https://github.com/Basekick-Labs/arc/issues/1342))
+
+Ingest used to store three kinds of names that Arc could not read back.
+Once one reached a measurement, compaction of the measurement failed (`no
+'time' column`), `SELECT *` failed with `Invalid unicode`, the DELETE API
+failed with `Unimplemented type for cast (DOUBLE -> TIMESTAMP WITH TIME
+ZONE)`, and pyarrow and other external readers failed too:
+
+- **A name that is not valid UTF-8**, such as a Latin-1 `°` (`0xB0`) from a
+  migration tool.
+- **A name equal to `time` ignoring case**, such as a field `Time` or a tag
+  `TIME`. DuckDB matches column names without regard to case. In files where
+  that column came before Arc's own `time` column, `time` resolved to it.
+- **Two names of one measurement that differ only in case**, such as `Temp`
+  and `temp`. DuckDB reads them as one column, so one spelling's data shows up
+  under the other.
+
+These names are now refused everywhere a write enters Arc:
+
+| Path | What happens |
+|---|---|
+| Line protocol (`/write`, `/api/v2/write`, `/api/v1/write/line-protocol`) and msgpack rows | The point is dropped and the rest are written, as for a key named exactly `time` today. The answer is a partial-write `400` naming the measurement, the name and the reason. |
+| msgpack columnar | The item is dropped whole (its names belong to all its rows) and the other items are written. Partial-write `400`. |
+| CSV, Parquet and LP imports | The file is refused with a `400` before anything is written. A CSV's own time column may be called `Time` (as in Grafana's CSV export); it is renamed to `time`. |
+| MQTT | The reading is kept and only the offending key is dropped, with a warning at most once every 10 minutes per name. Tasmota's `SENSOR` messages carry a `"Time"` key, which is now dropped while the rest of the reading is stored. |
+| Continuous queries | A run whose output has such a column fails with an error naming it. A query that aliases a column `AS Time` now fails every run; rename the alias. |
+| WAL replay and standby or stream replay | A column an older binary accepted under such a name is dropped, and the rows and their other columns are written. Logged at `Error`. |
+
+For two names that differ only in case, the check covers both the write
+itself and the measurement's existing columns, as recorded in its field
+schema (`query.stable_schema`). The spelling the measurement already has
+wins. The comparison against existing columns uses the schema in memory, so
+right after a restart, until the measurement's schema is loaded, only the
+write is checked.
+
+**What clients see.** A client that has been sending, say, a field `Time`
+(pandas DataFrames often have one) got its writes accepted until now. They
+were accepted, and they broke the measurement later. Now those points are
+dropped with a `400`. The answer is the same partial-write answer line protocol
+gives for a key named exactly `time`.
+
+A case-twin refusal is answered only for measurements the token may
+write. For any other measurement, the check looks at the request alone, so
+an answer cannot reveal which columns that measurement already has.
+
+**Existing measurements.**
+- **Field schema:** the measurement's field schema no longer lists these
+  names, so reads of time ranges without such files work again. The stored
+  schema is rewritten on the next flush.
+- **Mixed versions:** during a rolling upgrade, a node still on an older
+  release can write the old names back. The upgraded nodes then rewrite the
+  schema again, every few minutes, until every node is upgraded.
+- **Files already on disk:** files written with such a column are not
+  rewritten. Reads and compaction of the hours they hold still fail. Arc
+  cannot export them either, because the bad column breaks every query that
+  touches those files. They leave with retention, or with the database when
+  it is deleted. Before that, rewriting them takes a tool that reads the
+  Parquet files directly and renames the column, then an import of the result.
+- **Edge sync:** a spoke on an older release can still send such files to
+  its hub; upgrade spokes first.
+
+## Upgrade note: a cold tier that overlaps primary storage refuses to start ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+With `tiered_storage.enabled` and `tiered_storage.cold.enabled`, Arc now
+refuses to start when the cold tier is the same location as primary
+storage, or one is inside the other (the same bucket with equal or nested
+prefixes), for every backend. This is a new check; nothing compared the two
+before. At the same location a file and its cold copy have one key, so
+migration copied the file onto itself and then deleted it: data loss.
+Nested, each tier's listing took in the other's objects and registered
+them as files of a database that does not exist. Move the cold tier to
+another bucket or to a prefix that is not a parent or child of the
+primary's.
+
+## Upgrade note: a query that needs an unavailable cold tier answers 503 ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+When the cold tier is enabled but its backend failed to start (a bad
+endpoint or credentials file, for any backend), a query whose time range
+reaches cold-tier files that this node's tier metadata records now answers
+HTTP 503 naming the cold tier. A node whose tier metadata holds no cold
+rows (a fresh or rebuilt one, which cannot rebuild them while the cold tier
+is down) still answers from the hot tier alone. It used
+to leave the cold files out and answer with the hot rows alone, as a
+success. Queries that need no cold data are served as before, and the
+failed cold tier is absent from `/health` (it was reported from a secret
+nothing read through).
 
 ## Upgrade note: three configurations now refuse to start
 
@@ -199,6 +409,132 @@ earlier release on a node, remove the node from the cluster, wipe its data
 directory, and join it fresh. To roll back the whole cluster, restore it from a
 backup taken before the upgrade.
 
+## Upgrade note: cluster-wide tiering policies ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+A cluster turns on cluster policies by itself once every node runs this
+release (`cluster_policies.enabled` in `GET /api/v1/cluster`). Like compaction
+commit, the flag stays on, and a node running an earlier release can no longer
+join. Roll back the same way: never one node in place.
+
+Right after that, the cluster takes over the tiering policies each node holds
+in its own database. During the takeover a tiering policy write answers `503`
+for up to a few seconds; retry it.
+
+Every node must answer, or nothing is taken over:
+
+- The leader first checks that it can reach every node. If one is down, it
+  takes nothing over, so writes are never held, and the policies stay on each
+  node exactly as before.
+- It tries again after 30 seconds, doubling the wait after each failed attempt
+  up to 10 minutes.
+- `cluster_policies.kinds.tiering` shows `missing_nodes`, `last_error` and
+  `failed_attempts`.
+- A node that is gone for good must be removed from the cluster before the
+  policies can be taken over.
+
+The policies are merged in the direction that moves less data. A database that
+is `hot_only` on any node stays `hot_only`. Otherwise it keeps the longest hot
+age any node applied to it: the policy's `hot_max_age_days`, or that node's
+`default_hot_max_age_days` where the policy left it unset. Afterwards:
+
+- every node reports the same policies;
+- `GET /api/v1/tiering/policies` lists them all from any node;
+- every node that runs tiering keeps its own `tiering_policies` table equal to
+  them, so a backup of such a node carries the current policies.
+
+## Upgrade note: cluster-wide retention policies ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+Retention has its own flag, `cluster_policies.retention_enabled` in
+`GET /api/v1/cluster`. A cluster turns it on by itself once every node runs
+this release; until then the leader's `retention_blocking_nodes` names the
+nodes still on an earlier one. Like the tiering flag it stays on, and a node running an
+earlier release can no longer join. Roll back the whole cluster, never one
+node in place.
+
+Then the leader reads every node's own retention policies. A retention policy
+deletes data, so the leader takes them over by itself only when:
+
+- every node answers;
+- no policy name has two different definitions on two nodes;
+- every active policy has already completed a run on some node since it was
+  last changed. Inactive policies are taken over as they are.
+
+A policy that never ran is never activated without an admin choosing it: it
+may have been created on a node that never runs retention.
+
+Otherwise nothing changes: each node keeps its own policies and the primary
+runs its own, as before. `cluster_policies.kinds.retention.last_error` says
+why, and the leader checks again after 30 seconds, doubling the wait up to 10
+minutes. To choose a node's policies, an admin calls, on the Raft leader:
+
+- `GET /api/v1/cluster/policies`: every node's own policies, with a hash of
+  each node's set;
+- `POST /api/v1/cluster/policies/adopt` with
+  `{"kind": "retention", "node": "<id>", "hash": "<hash>"}`. The policies are
+  taken over only if the node still holds exactly the ones the hash names.
+
+Both are admin-only; once `retention_enabled` is on, any other node answers
+`409` with the leader's ID. `POST` answers `202`, and
+`cluster_policies.kinds.retention` shows the outcome. A node where retention is
+disabled counts too: its database may still hold the policies of when
+retention ran there.
+
+When the policies are taken over:
+
+- **IDs.** Policies that all come from one node keep their IDs, as long as no
+  other node ever issued those IDs. Otherwise every policy gets a new ID above
+  any ID a node held, and the old IDs answer `404`. An old ID never names a
+  different policy.
+- **The other nodes' policies.** A policy the cluster did not take over is
+  moved, with its execution history, to `retention_policies_dormant` and
+  `retention_executions_dormant` in that node's database. It never runs again.
+- **Writes wait a few seconds.** While the leader reads the nodes' policies, a
+  retention write answers `503`; retry it.
+- **History stays per node.** Execution history stays on the node that ran the
+  policy. After a failover the new primary shows none until it runs it.
+- **Restoring a backup.** In a cluster, restoring `arc.db` from a backup no
+  longer restores retention policies: the cluster's policies win, and the
+  backup's own rows go to the dormant tables. A full disaster recovery onto a
+  fresh Raft cluster takes the restored policies over again, with new IDs,
+  because every node then holds the same rows.
+- **A restarted node waits.** A node whose own table already holds the
+  cluster's policies answers retention requests with `503`, and runs nothing,
+  until it has caught up with the cluster after a restart (seconds).
+- **Backups carry them.** Every node that runs retention keeps its own
+  `retention_policies` table equal to the cluster's policies.
+
+A retention database of its own (`retention.db_path` set to a file other
+than the auth database) now opens like the auth database: foreign keys on,
+WAL journal, and a 5-second busy timeout.
+
+## Upgrade note: cluster-wide continuous queries ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+Continuous queries have their own flag, `cluster_policies.cq_enabled` in
+`GET /api/v1/cluster`, turned on by the cluster once every node runs this
+release (the leader's `cq_blocking_nodes` names the rest). Like the other
+policy flags it stays on: roll back the whole cluster, never one node in place.
+
+Then the leader reads every node's own continuous queries and takes them over
+by itself when every node answers, no name has two definitions, and every
+active query has completed a run on some node. Each query keeps the newest
+`last_processed_time` any node holds for the same definition. Otherwise
+nothing changes until an admin chooses a node's queries, with the same
+endpoints as retention: `GET /api/v1/cluster/policies?kind=cq` and
+`POST /api/v1/cluster/policies/adopt` with `"kind": "cq"`. IDs, dormant tables
+(`continuous_queries_dormant`, `continuous_query_executions_dormant`), the
+`503` while the queries are read, and a restarted node's wait work as for
+retention policies.
+
+Once the cluster has adopted continuous queries, each run on the primary
+(scheduled or manual) writes its window's end to the cluster: one Raft entry,
+two when the primary is not the Raft leader (it first confirms it holds the
+latest watermark). A manual run's response says what happened to the
+watermark in `watermark_status`.
+
+A continuous query database of its own (`continuous_query.db_path` set to a
+file other than the auth database) now opens like the auth database: foreign
+keys on, WAL journal, and a 5-second busy timeout.
+
 ## Upgrade note: the live WAL replication stream is removed ([#888](https://github.com/Basekick-Labs/arc/issues/888), [#1181](https://github.com/Basekick-Labs/arc/issues/1181))
 
 This applies to clusters where readers or compactors run with both
@@ -276,7 +612,332 @@ wrote them.
   WAL after a crash
   ([#1206](https://github.com/Basekick-Labs/arc/issues/1206)).
 
+## Upgrade note: HTTP server (fasthttp 1.76)
+
+Arc's HTTP server library moved from fasthttp 1.51 to 1.76. Two changes are
+visible to clients:
+
+- **An HTTP/1.1 request without a `Host` header is answered `400`** and the
+  connection closed. HTTP/1.1 requires the header and every common client
+  sends it (curl, Go, Python, Telegraf, Grafana); HTTP/1.0 requests, which
+  have no such rule, are still served. A hand-written client or health check
+  that sends a bare `GET /health HTTP/1.1` needs a `Host` line.
+- **Arrow IPC responses no longer send an empty trailer.** The
+  `Arc-Stream-Truncated` and `Arc-Rows-Capped` trailers are still announced in
+  the `Trailer` header of every `/api/v1/query/arrow` response, but each is
+  sent only when it has a value; before, an unset one was sent empty. The
+  client contract is unchanged: a non-empty value means the stream was
+  truncated, or capped. A client that checked for the trailer's presence
+  rather than its value has to check the value.
+
+`klauspost/compress` stays at 1.19.2: 1.20 (which fasthttp 1.76 asks for)
+encodes snappy on arm64 with new assembly that cut line-protocol ingest by
+about 14% and msgpack+gzip ingest by about 11% on Apple silicon, because every
+Parquet file Arc writes is snappy-compressed.
+
+## Upgrade note: DuckDB 1.5.6 ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
+
+Arc's query engine moved from DuckDB 1.5.5 to 1.5.6, a bug-fix release.
+Among its fixes are queries that could return wrong results, if the SQL sent
+to Arc has these shapes:
+
+- a `UNION ALL` whose branches share a join;
+- Top-N over a window function (`row_number() … WHERE rn <= N`), including
+  ordering expressions that can be NULL.
+
+Arc's configuration and API do not change. Two things are visible:
+
+- **Error text quotes identifiers.** DuckDB now quotes table and column names
+  in its error messages, so the text of a query error can differ from 1.5.5.
+- **Extensions are rebuilt.** DuckDB extensions are built per DuckDB version,
+  so Arc uses the 1.5.6 builds. The Docker image carries httpfs and aws.
+  Arc downloads azure (for Azure storage) and cache_httpfs (with
+  `query.enable_s3_cache` with S3 primary storage) on first start when the configuration uses
+  them, and outside the image it downloads whichever of the four the storage
+  configuration uses.
+  - An air-gapped host needs the 1.5.6 builds of the ones it uses copied in,
+    as for any DuckDB upgrade.
+  - An arcx extension loaded with `database.arcx_extension_path` must be a
+    build for DuckDB 1.5.6.
+
+## Upgrade note: file-level time pruning is on by default ([#659](https://github.com/Basekick-Labs/arc/issues/659))
+
+`query.file_time_pruning` now defaults to `true`. It was added in 26.09.2 as
+an opt-in.
+
+**What it does.** Under high-frequency ingest, the current hour holds one
+small Parquet file per buffer flush, often thousands. A query whose range
+starts in the current UTC hour used to read every one of them. It now skips
+the files in that hour flushed before the query's start minus
+`query.file_time_pruning_margin_seconds` (default 300). Only local storage is
+affected; files on S3 or Azure are read as before.
+
+**Which queries gain.** Only those whose range starts in the current UTC hour,
+such as "last 5 minutes" at 10:40. A "last 1 hour" panel always starts in the
+previous hour and never gains. At the default
+`compaction.hourly_min_age_hours = 1`, the previous hour is not compacted until
+the first compaction run more than an hour after it ends (later with a larger
+min age), so it also still holds every per-flush file. On local storage, a
+query that starts in the current hour now lists that hour's directory and is
+not served from the query plan cache.
+
+**What it can hide.** A row stamped more than the margin ahead of the clock of
+the node that flushed it, and still within the current hour, can be missing
+from such a query until the hour closes. Rows stamped that far ahead in a
+later hour are not affected. `arc_ingest_future_stamped_rows_total` counts
+these rows on the node that flushed them: a writer, or an edge spoke whose
+files a hub receives. A cluster reader or hub that misses them counts
+nothing, so check the counter on the writers and spokes. Size the margin to
+the worst clock skew among them.
+
+**To turn it off,** set `query.file_time_pruning = false` (or
+`ARC_QUERY_FILE_TIME_PRUNING=false`) and restart. The node logs "File-level
+time pruning disabled" at startup.
+
+A negative `compaction.daily_min_age_hours` now reads as 24, as 0 already did.
+Before, it put the cutoff in the future, and daily compaction could fold the
+current hour while ingest was still writing it.
+
+## Upgrade note: a DELETE reads only the partitions of its time range (`delete.time_pruning`, [#1371](https://github.com/Basekick-Labs/arc/pull/1371))
+
+`delete.time_pruning` is new and defaults to `true`. A row DELETE whose WHERE
+bounds `time` now reads only the hour and day directories that range can
+touch (see the bug fix "A DELETE reads only the files its time range can
+touch" below).
+
+It relies on every file under an hour (or day) directory holding only rows
+of that hour (or day). The query path's partition pruning has always relied
+on the same thing. Every Arc release since 26.01.1 writes files that way.
+Arc 25.12 and earlier put a file in the directory of the hour it was
+flushed, and compaction and cold migration keep a file's directory. On a
+deployment that still holds data written by those versions, a row that
+arrived late sits in a later hour's directory, and a DELETE of its hour
+would not read it.
+
+**To turn it off,** set `delete.time_pruning = false` (or
+`ARC_DELETE_TIME_PRUNING=false`) and restart. Every DELETE then reads every
+file of the measurement again. The startup line "Delete operations enabled"
+shows the setting.
+
+## Upgrade note: JSON query results encode BLOB as base64 and UUID as text ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+The JSON query output (`/api/v1/query` without a `format`, and every
+endpoint that answers in the same shape) now writes:
+
+- **BLOB and GEOMETRY** values as standard base64 strings (RFC 4648, padded).
+  They used to be the raw bytes inside a JSON string, which is invalid JSON
+  for any value holding a byte of 0x80 or above. The Arrow and MessagePack
+  outputs are unchanged: they already carry real bytes, and the Grafana
+  plugin already shows binary values as base64 on both, so all three agree.
+  A spatial query's geometry therefore reads back as base64 WKB; use
+  `ST_AsText(...)` or `ST_AsGeoJSON(...)` for a readable value.
+- **UUID** values as their canonical text (`6f1c2c1e-8a3b-...`). They used
+  to come out as 16 raw bytes.
+
+Before this release no column Arc stored was a BLOB, so this changes the
+output of a query only where the query itself produced a BLOB, GEOMETRY or
+UUID (a cast, `uuid()`, a spatial function). During a rolling upgrade a
+proxied query is encoded by the node that answers it.
+
+## Upgrade note: GeoParquet columns read as binary ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+Arc's query, compaction and DELETE engines now read a GeoParquet column (one
+a file's `geo` metadata names) as the `BLOB` it is stored as, not as
+`GEOMETRY`. With the engine default, one GeoParquet file in a measurement
+turned that column into `GEOMETRY` for every file read with it; the other
+files' `BLOB` values cannot be cast to it, so every query that read the
+column failed, and so did compaction of the partition, on every cycle.
+
+What changes: a GeoParquet file placed straight into a measurement's storage
+used to read its geometry as `GEOMETRY` (`ST_X(geom)` worked); it now reads as
+`BLOB` like every geometry Arc stores, so use `ST_X(ST_GeomFromWKB(geom))`. A
+file that uses Parquet's own `GEOMETRY` type (written by pyarrow, GDAL, DuckDB's
+GeoParquet V2) still reads as `GEOMETRY` when placed into storage directly;
+import it through the Parquet import API instead, which stores it as binary.
+During a rolling upgrade, a node still on an earlier release reads a
+GeoParquet file placed into storage as `GEOMETRY`, as before.
+
 ## New features
+
+### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
+
+`storage.backend = "gcs"` stores Arc's data in a Google Cloud
+Storage bucket, standalone or as the shared storage of a cluster, through GCS's own API rather than its S3 interoperability
+endpoint, so it authenticates the way Google workloads do: no HMAC keys.
+GCS also serves as the tiered-storage cold tier
+(`tiered_storage.cold.backend = "gcs"`) and as a backup target
+(`backup.targets.<name>.type = "gcs"`), each taking the same four keys
+(`gcs_bucket`, `gcs_prefix`, `gcs_credentials_file`, `gcs_endpoint`) and
+its own identity.
+
+```toml
+[storage]
+backend = "gcs"
+gcs_bucket = "my-arc-data"
+# gcs_prefix = "instances/abc123/"          # default: the bucket root
+# gcs_credentials_file = "/etc/arc/key.json" # default: Application Default Credentials
+# gcs_endpoint = "https://storage-x.p.googleapis.com" # https only, e.g. Private Service Connect
+```
+
+- **Authentication.** Application Default Credentials by default: GKE
+  Workload Identity, the GCE or Cloud Run metadata server, or
+  `GOOGLE_APPLICATION_CREDENTIALS`. `gcs_credentials_file` names a
+  service-account key instead; only that key type is accepted. Ingest,
+  compaction and queries use the same identity.
+- **IAM.** `roles/storage.objectAdmin` on the bucket is enough to run. It
+  does not include `storage.buckets.get`, which the startup checks below
+  need; without it Arc logs a warning that the bucket's settings were not
+  checked and starts anyway, so a requester-pays bucket then fails at its
+  first query rather than at startup. Grant `storage.buckets.get` too.
+- **Queries.** DuckDB reads `gs://` with a bearer token Arc resolves from that
+  identity. Arc starts replacing it 10 minutes before it expires; with a key
+  file or user credentials the new token arrives then, while the GCE/GKE
+  metadata server keeps returning its current token until close to expiry,
+  so there the token is replaced when the server issues a new one (Arc polls
+  each minute meanwhile and warns if fewer than 5 minutes remain). `query.enable_s3_cache` does not
+  apply to GCS. `/health` reports the
+  hot tier as `"backend": "gcs"`. A new credential state, **`unavailable`**,
+  means no token has been resolved yet, so every query read of the bucket
+  fails (GCS has no fallback the way S3 and Azure do); Arc keeps retrying and
+  logs each failure at error level. With
+  `server.storage_credentials_fail_ready = true`, `/ready` answers 503 with
+  `storage_credentials_unavailable` in that state, as it does for `expired`.
+- **Refused at startup** (the bucket checks need `storage.buckets.get`): a
+  bucket with hierarchical namespace or with requester pays; an `http://`
+  `gcs_endpoint`; and Iceberg export, which is local-only.
+- **Clusters.** GCS is the shared storage of a Pattern 2 cluster
+  (`cluster.shared_storage_mode`: every writer writes the bucket, staged
+  compaction commits through the compactor), and the cold tier of a
+  Pattern 1 cluster. Each node resolves its own query token from its own
+  identity. Verified on a 5-node Pattern 2 cluster (3 writers, reader,
+  compactor) and a 4-node Pattern 1 cluster with a GCS cold tier, both on
+  real GCS: ingest on every writer, staged compaction, DELETE across
+  writers with unflushed rows, leader and compactor loss, writer failover
+  with migration continuing on the new primary, reconciliation dry-run.
+  The enterprise Helm chart deploys it with
+  `storage.shared.backend: gcs` and either Workload Identity (a
+  chart-created ServiceAccount, `serviceAccount.create: true`, carrying the
+  `iam.gke.io/gcp-service-account` annotation) or a service-account key
+  Secret (`storage.shared.gcs.credentialsSecret`, shared storage only).
+- **Rate limits.** GCS allows about one write per second to one object name
+  and ramps a new bucket's request rate up. A rate-limited (429) read,
+  listing, copy or delete now waits at least half a second (a second on
+  average) and is retried for up to a minute and a half, where other
+  transient errors keep their short schedule; uploads back off from one
+  second up to 16 s across their 12 retries.
+- **Warned at startup**, by what the bucket is for. Primary: soft delete
+  (on by default for new buckets, 7 days), a retention policy and a default
+  storage class other than STANDARD — compaction and retention delete
+  objects continuously, so soft delete keeps every deleted byte billed for
+  its period, a retention policy makes those deletes fail until objects are
+  old enough, and colder classes charge a minimum storage duration on each;
+  turn soft delete off on a bucket used only by Arc. Cold tier: a retention
+  policy, and a class other than STANDARD, which charges retrieval on every
+  query read of cold data — use STANDARD, or Autoclass, which charges
+  neither retrieval nor early deletion (a lifecycle rule that changes the
+  class of cold objects is not visible to this check). Backup target: a
+  retention policy only, since it stops a backup from being deleted or a
+  partial one from being cleaned up; a colder class is a reasonable choice
+  there.
+- **Endpoint.** DuckDB uses only the host of `gcs_endpoint` and speaks GCS's
+  XML API on it, so the endpoint must serve both the JSON API (ingest,
+  compaction) and the XML API (queries) on one host. Verified with
+  `https://storage.googleapis.com`; a Private Service Connect endpoint has
+  not been tested yet. An emulator that serves only the JSON API cannot
+  serve queries.
+- **Cold tier.** Files migrate to a GCS cold tier from any primary, and a
+  GCS primary takes a cold tier of any backend (verified with local → GCS
+  and GCS → GCS; the other pairs use the same generic migration path). The cold tier has its
+  own query secret and identity; `/health` reports it under `"cold"`, and a
+  cold tier whose credentials never resolved is `unavailable`, which drains
+  `/ready` when `server.storage_credentials_fail_ready` is on (an S3 cold
+  tier in the same state reports `fallback` and stays ready). With no credentials at
+  boot the cold tier still starts and its reads fail until they resolve, as
+  for S3 and Azure.
+- **Backup target.** Every #1085 behaviour applies: per-database routing,
+  key headroom for the prefix, cold-tier files carried once, restore into a
+  node with a cold tier at another prefix (files go to that cold tier) or
+  without one (they are restored hot). A target whose bucket does not exist
+  fails the backup rather than completing it.
+- An S3-typed target or cold tier pointed at the same bucket through
+  `storage.googleapis.com` is the same storage for the overlap checks.
+
+### MessagePack binary values are stored as binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+A MessagePack `bin` value is now stored as a Parquet BYTE_ARRAY column
+(DuckDB `BLOB`), byte for byte. It used to be refused ("unsupported column
+type"). This is the first step of spatial support: a geometry sent as WKB
+bytes is stored as-is, and `ST_GeomFromWKB(geom)` reads it once the `spatial`
+extension is available.
+
+- Every MessagePack shape (columnar, row, batch) and MQTT payloads accept
+  it. A NULL stays NULL and an empty value stays an empty value, through the
+  WAL and its recovery as well.
+- JSON query results show it as base64 (see the upgrade note above); Arrow
+  and MessagePack results carry the bytes.
+- Iceberg export maps it to the Iceberg `binary` type. It used to stop the
+  measurement's export with "unsupported Arrow type".
+- A continuous query whose output has a UUID column writes it as text (the
+  run used to fail); a BLOB or GEOMETRY output column is written as binary.
+- **A column cannot change between string and binary.** A write that sends
+  bytes to a column stored as a string, or a string to a column stored as
+  binary, is refused with HTTP 400 and nothing of the request is written (an
+  import already part-way through answers as a partial import, naming what
+  it wrote, as for any other failure). DuckDB reads
+  a column that is a string in some files and binary in others as binary, so
+  one such write would turn every stored string of that column into bytes for
+  every query. The check uses the field schema Arc keeps per measurement
+  (`query.stable_schema`, on by default) and knows a column once a file
+  holding it has been flushed or the measurement queried on that node. So it
+  is best-effort: it is not made with `query.stable_schema = false`, for a
+  column whose first values are still in the buffer (up to
+  `ingest.max_buffer_age_ms` after it first appears), on a writer that has
+  not flushed or queried the measurement since it started, for a
+  measurement whose schema was evicted from memory (more than 10,000
+  measurements in use), or between two writers changing the same column at
+  the same time. A change that gets through leaves the column mixed for
+  good, and its string rows read back as binary.
+- Parquet import is unchanged: a BYTE_ARRAY column without a string
+  annotation is still imported as a string, as Spark and Hive write string
+  columns that way.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#916](https://github.com/Basekick-Labs/arc/pull/916).
+
+### Spatial SQL functions with `database.extensions = ["spatial"]` ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+`database.extensions` (or `ARC_DATABASE_EXTENSIONS`, comma-separated) loads
+DuckDB extensions at startup. The one supported today is `spatial`: its
+`ST_*` functions work in queries, continuous queries and DELETE predicates,
+over DOUBLE longitude/latitude columns (`ST_Point(lon, lat)`) or over WKB
+stored in a binary column (`ST_GeomFromWKB(geom)`). The default is empty.
+
+- **Only supported extensions load.** An extension adds SQL functions Arc's
+  query validators have to know about, so each one is reviewed before it is
+  supported. Any other name, a file path or a URL stops Arc at startup with
+  an error naming the entry. Community extensions are not supported.
+- **Functions that open files are refused.** `ST_Read`, `ST_Read_Meta`,
+  `ST_ReadOSM`, `ST_ReadSHP`, `shapefile_meta`, `ST_Drivers` and
+  `ST_Transform` are rejected by the query, continuous query and DELETE
+  validators, like `read_csv` and the other file readers. Data comes into
+  Arc through its write endpoints. `ST_Transform` is among them because a
+  coordinate reference system can name a file; data stays in the reference
+  system it was written in. For distances in metres over longitude/latitude
+  use `ST_Distance_Sphere` or `ST_Distance_Spheroid`.
+- **No network needed.** The container image ships the extension (about
+  60 MB of the image, whether or not it is enabled); on a
+  binary install the first start downloads it into DuckDB's extension
+  directory (`~/.duckdb/extensions`), which an air-gapped host must
+  pre-populate.
+- **Set the same list on every node.** Each node loads its own; a query
+  routed to a node without the extension fails with an unknown-function
+  error. On a cluster, a DELETE whose WHERE uses a spatial function cannot
+  be applied by a node without the extension to the files it has not
+  registered yet; those files wait, and the node logs a warning naming
+  `database.extensions`, until the setting matches.
+- A JSON query result holding a geometry shows it as base64 WKB; use
+  `ST_AsText(...)` or `ST_AsGeoJSON(...)` for a readable value.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1082](https://github.com/Basekick-Labs/arc/pull/1082).
 
 ### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
@@ -1178,6 +1839,1307 @@ truncation, execution time and capped rows, consistent with the DuckDB path.
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1294](https://github.com/Basekick-Labs/arc/pull/1294).
 
+### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column ([#1409](https://github.com/Basekick-Labs/arc/pull/1409))
+
+With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes each
+file within one hour, sorted by the keys and then time. The daily compaction
+then sorted the whole day by the keys alone, so each row group of the
+long-lived compacted file mixed the hours of the day, and a query over a few
+minutes read every row group: on a 54M-row daily file of TSBS IoT data sorted
+by `fleet,name`, every row group spanned about 17 hours, nearly all of that
+file's time range.
+
+- **Compacted files are now ordered by hour, then the sort keys, then time.**
+  Each row group holds contiguous hours, so time-range pruning works on
+  compacted files again, while rows stay grouped by the keys within each hour.
+  A measurement whose hour fills a row group (122,880 rows) gets row groups of
+  about an hour; a smaller one gets fewer, wider row groups, as it did without
+  sort keys. Measured by rewriting that 54M-row file each way (DuckDB 1.5.6,
+  warm medians):
+
+  | Query | Time only (default) | Keys, before | Hour, then keys |
+  |---|---|---|---|
+  | One truck, 24 hours | 51 ms | 8 ms | 9 ms |
+  | One fleet, 10 minutes | 11 ms | 26 ms | 11 ms |
+  | All trucks, 10 minutes | 9 ms | 38 ms | 11 ms |
+  | Latest position per truck, one fleet | 75 ms | 42 ms | 32 ms |
+  | File size | 984 MB | 802 MB | 807 MB |
+
+  Rewriting that file in the new order took about 10% longer (7.0 s to 7.8 s)
+  with about 2% more peak memory. Hourly compaction is unchanged (its rows are all one
+  hour), and so is compaction without sort keys.
+- **Only newly compacted files get the new order.** A daily file compacted by
+  an earlier version keeps its order until it is rewritten; it is still read
+  correctly, just with the old pruning.
+- **A sort key the partition's files have no column for no longer fails its
+  compaction.** The ORDER BY named every configured key, and a key missing
+  from all of a batch's files was a bind error, so that partition failed to
+  compact on every cycle. The key is now left out of that batch's order, and a
+  Warn names it when it is configured for the measurement in
+  `ingest.sort_keys`; a key from `ingest.default_sort_keys` that a measurement
+  does not have is logged at Debug, since that is normal. Names match
+  case-insensitively, as DuckDB binds them.
+
+### A sort key the data has no column for no longer leaves the file unsorted ([#1410](https://github.com/Basekick-Labs/arc/pull/1410))
+
+With `ingest.sort_keys` or `ingest.default_sort_keys` set, a flush whose rows
+had no column for one of the keys failed its sort, and the flush wrote the
+rows in arrival order: not sorted by the other keys, and not by time either,
+which also cost time-range pruning inside the file. Nothing was logged. (The
+documentation said such a flush fails; it never did, and no rows were
+lost.)
+
+- **The flush now sorts by the keys it has a column for, then time,** and
+  leaves the missing key out. A key configured for the measurement in
+  `ingest.sort_keys` is logged at Warn, once a minute per measurement, naming
+  the key. A key from `ingest.default_sort_keys` is logged at Debug: it applies
+  to every measurement without its own entry, and many do not have that
+  column. Compaction leaves such a key out of that partition's order as well
+  ([#1409](https://github.com/Basekick-Labs/arc/pull/1409)); before, it failed
+  the partition's compaction on every cycle.
+- **Key names match case-insensitively**, as compaction already binds them,
+  so a key configured as `Host` sorts a `host` column at ingest too. Before,
+  such a key failed the sort, and the file was written unsorted.
+- **Should a sort ever fail, the flush is written sorted by time** and logged
+  at Error, once a minute per measurement, rather than unsorted and silent.
+
+### Ingest with sort keys is as fast as without them ([#1411](https://github.com/Basekick-Labs/arc/pull/1411))
+
+A flush sorted by `ingest.sort_keys` (or `ingest.default_sort_keys`) went
+through a comparison sort that checked each key column's type on every one of
+its comparisons: 2.60 s for a 5M-row flush sorted by two tag columns and time,
+against 0.21 s for time alone. On a sustained load that was most of the cost
+of sort keys at ingest.
+
+- **The sort is now one linear, stable pass per key**: a radix sort for
+  integer and float keys, and for tag (string and binary) keys a counting sort
+  on each value's rank among the flush's distinct values. Rows already in
+  order are not copied, as with time-only sorting.
+- **A key with many distinct values** (more than a quarter of the flush's
+  rows, such as a request id) or a decimal key has no such pass; the flush is
+  then sorted by one comparison over all its keys, about as fast as before
+  (1M rows by an id and time: 371 ms before, 339 ms now).
+- **Measured**, sorting a flush by `fleet, name, time` (10,000 names): 50,000
+  rows (the default flush size) 13.9 ms to 6.3 ms; 1M rows 445 ms to 77 ms;
+  5M rows 2.60 s to 0.51 s. While it runs, the sort needs about 24 bytes of
+  scratch memory a row plus 4 for each tag or boolean key, against 8 before
+  (about 160 MB instead of 40 MB for 5M rows sorted by two tags and time).
+- **End to end**, loading 155.6M TSBS IoT rows with
+  `sort_keys = ["readings:fleet,name", "diagnostics:fleet,name"]` and
+  `wal.ack_mode = "durable"`: 36.6 s (29.7 to 49.0 across three runs) before,
+  25.4 s (25.3 to 25.7) now, against 26.1 s with no sort keys. Rows were
+  queryable after 27.9 s, against 44.2 s before.
+- **Order changes only where it was undefined.** Rows equal on every key now
+  keep their arrival order (the old sort did not promise any). A float sort
+  key orders -0 and +0 as equal and NaN after +Infinity; the old sort treated
+  NaN as equal to every value, which left the order of rows with NaN keys
+  unspecified.
+
+### Azure Blob Storage error messages are shorter
+
+Errors from the Azure Blob Storage backend are shorter. Azure credential
+values (connection string, SAS token, account key) and the endpoint are
+trimmed of surrounding whitespace, so a value read from a file with a trailing
+newline works everywhere it is used; one with another control character is
+refused at startup. Errors from the licence server check are shorter in the
+same way.
+
+### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+The Parquet import stored every binary column (a BYTE_ARRAY without a string
+annotation) as a string. When the bytes were not text, such as a GeoParquet
+file's WKB geometries, every query that read the column failed with "Invalid
+string encoding". A binary column is now stored as binary when:
+
+- it has Parquet's `GEOMETRY` or `GEOGRAPHY` type, or the file's GeoParquet
+  `geo` metadata names it with WKB encoding (another encoding is refused with
+  422 before anything is written),
+- the file was written by a writer that marks its string columns: Arc itself
+  (ingest and compaction), DuckDB, pyarrow, or any file carrying an Arrow
+  schema, so Arc's own files keep their types when imported into another Arc,
+- the measurement already stores the column as binary, or
+- any of its values in the file is not valid UTF-8.
+
+Otherwise (Spark and Hive write string columns without the annotation) a
+column of text throughout is a string, as before. The whole file is checked
+before anything is written, so an import is never refused part-way for this.
+Two column types that were refused as unsupported now import: `LargeBinary`,
+and Parquet `UUID`, stored as its canonical text as Arc shows a UUID
+everywhere else. A GeoArrow column stored as `large_binary` is still refused.
+
+A column an earlier import already stored as a string holding binary data
+cannot be read. Import the binary values into a new column: writing bytes to
+the existing string column is refused, and the refusal says so.
+
+### DuckDB no longer caches blocks of deleted files on local storage ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
+
+DuckDB keeps a file cache of blocks from the Parquet files it reads. It frees
+that cache only when it reaches its memory limit, which defaults to 80% of RAM
+or of the container. Compaction deletes and replaces files all day, so on a
+busy node most of the cache belonged to files that no longer existed, and the
+process kept growing.
+
+On a node whose data is all on local disk, Arc now turns that cache off. The
+operating system's page cache already holds the same blocks. Measured on the
+same workload (ingest, compaction every minute, continuous queries):
+
+- **macOS, 73 minutes:** 1.6 GB physical footprint before, 760 MB after.
+- **Linux (EC2 c7i.xlarge), 80 minutes:** 1.6 GB resident before, 785 MB
+  after. Neither process gave any of it back over the next 8 idle hours, so
+  the old figure is not a peak but where a node stays.
+
+Turning it off did not slow queries:
+
+- **macOS:** compacted and small-file queries within ±2%, warm and hot.
+- **Linux (EC2 c7i.xlarge):** compacted-data queries within ±2%, and
+  small-file queries 5–7% faster.
+- **8 concurrent clients:** the same throughput on both platforms.
+
+A node that may read S3 or Azure, as primary storage or as a cold tier, keeps
+the cache: there it is the cache for remote reads.
+
+`database.external_file_cache` (`ARC_DATABASE_EXTERNAL_FILE_CACHE`) controls
+it:
+
+- `"auto"`, the default, applies the rule above.
+- `"true"` turns the cache on everywhere.
+- `"false"` turns it off everywhere, including on a node that reads S3 or
+  Azure.
+
+Arc logs the value in effect at startup ("DuckDB file cache"), and
+`/api/v1/debug/duckdb-memory` reports it as `external_file_cache`.
+
+**DuckDB's Parquet metadata cache still grows.** It also keeps entries for
+deleted files, and DuckDB offers no way to empty it. It is smaller (220–285 MB
+after the same runs) and is freed under memory pressure, so it stays
+within DuckDB's memory limit. The step Arc ran after every compaction, DELETE
+and retention pass to "reset" it freed nothing, and has been removed.
+
+### Rebuilding cold metadata no longer restarts every tier lookup ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
+
+When a node rebuilds its cold tier metadata — after a restored or lost
+`arc.db`, where every object in the cold bucket is new to it — the sync wrote
+one row per object, and each write cleared the tier cache for the whole
+process. A node serving queries during that first sync re-ran the tier
+lookup for every query, on the single shared SQLite connection, for as long
+as the walk took.
+
+The sync now writes in transactions of 1,000 rows and clears the cache once
+per database/measurement per transaction. Each row keeps the cold object's
+own timestamp. If a transaction fails, its rows are retried one at a time and
+a row that still fails is logged and skipped, as before.
+
+The cold rows the manifest sweep works from are now read only where the sweep
+runs — on the primary, after migration — rather than by every sync on every
+node, which also lowers the sync's peak memory on a large bucket.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1197](https://github.com/Basekick-Labs/arc/pull/1197), with review and fixes
+from [@jallegri](https://github.com/jallegri) in
+[#1309](https://github.com/Basekick-Labs/arc/pull/1309).
+
+### A query on a measurement whose files are all gone no longer fails ([#1364](https://github.com/Basekick-Labs/arc/issues/1364))
+
+With tiered storage, a node whose tier metadata still listed a measurement
+with no file left in any tier answered `Binder Error: * expression without
+FROM clause!`, even for `SELECT count(*)`. This happened after a DELETE,
+retention or tiering removed every file of the measurement. Such a
+measurement now reads as empty:
+- **With a field schema anchor** (`query.stable_schema`, on by default):
+  zero rows with the columns the anchor records, so `count(*)` answers `0`
+  and queries naming those columns run.
+- **Without an anchor:** the empty result (no rows at all, not even a
+  `count(*)` row) that a measurement with no files already gets. As for such
+  a measurement, a JOIN or UNION that includes it then answers empty too.
+
+**Limitations:**
+- A node with no tier metadata for the measurement, an Arc without tiering,
+  or a query made before the anchor is first built answers the empty result
+  (no rows) rather than `0`. The answer can therefore differ by node: `0` on
+  one, no rows on another.
+- The read never falls back to local files the tier metadata leaves out.
+
+### A row DELETE reaches cold storage ([#1350](https://github.com/Basekick-Labs/arc/issues/1350))
+
+A row DELETE (`POST /api/v1/delete`) read and rewrote hot-tier files only.
+Rows in files that tiering had moved to cold storage were never matched, and
+the response gave no sign: a clause whose rows were all in cold storage
+answered 200 with `affected_files: 0`, and queries kept returning those rows.
+
+A DELETE now looks at cold storage too:
+- **A cold file whose rows all match is deleted**, the way retention deletes
+  cold files, and its rows are counted in `deleted_count`. The response
+  lists these files in `cold_deleted_files`.
+- **A cold file where only some rows match is left as it is.** The answer is
+  207: `cold_files` and `failed_files` name the file, and
+  `cold_rows_not_deleted` counts its matching rows. Arc does not rewrite part
+  of a cold file: cold storage has nothing that keeps readers from counting
+  the kept rows twice while the old file is replaced. Narrow the clause, or
+  delete the whole file's rows, or let retention remove it.
+- **A dry run reports both kinds.** `deleted_count` includes only the rows
+  the real run would delete.
+- **Cold rows that would be deleted count against `max_rows_per_delete` and
+  the confirmation threshold.**
+- If cold storage is configured but could not be examined (its backend is
+  unusable on this node, or listing it failed), the response says so in
+  `cold_not_examined` and answers 207 instead of 200.
+- A cold file whose hot copy still exists (a move that has not finished) is
+  never deleted from cold storage. It is reported, and a retry once the move
+  completes handles it.
+- A cold file that does not have a column the clause names (an older file,
+  from before the column existed) is counted together with files that have
+  it, as one read across every file would count it. When no file in the
+  DELETE's time range has the column, it matches nothing, as for hot files.
+- A cold tier row whose object is gone is retired, or pointed back at the
+  file's hot copy if one exists. Both storage tiers are checked again at
+  that moment, as retention does, so a file a migration has just copied
+  keeps its row.
+
+Every cold file in the DELETE's time range (every cold file of the
+measurement, when the clause bounds no time range) is read to count its
+matching rows, so a DELETE over many files in cold storage costs one read of
+each file's footer and the columns the clause uses.
+
+Also fixed: in a database made `hot_only` (or given a longer hot age) after
+some of its files reached cold storage, a DELETE could rewrite a file that
+still had a cold copy. The next cold sync then recorded the old copy, and
+queries returned the deleted rows again and counted the kept ones twice. A
+DELETE now checks cold storage for a copy of every daily file, whatever the
+database's current policy, and leaves such a file as it is. In a `hot_only`
+database the hot-only cleanup then removes the copy; with a longer hot age,
+the file stays until it is moved to cold storage again under the new
+policy. As a consequence, while cold storage is unreachable, a DELETE that
+touches a daily file answers the retryable 503, even for recent data.
+
+### Compaction leaves alone a partition too wide to compact, instead of failing it every cycle ([#1388](https://github.com/Basekick-Labs/arc/pull/1388))
+
+Compaction sorts a batch's rows by time in one DuckDB job, and a sort holds
+whole rows. On a table of thousands of columns that does not fit the memory a
+job has (`compaction.memory_limit`, by default `database.memory_limit` divided
+by `compaction.max_concurrent`): measured on DuckDB 1.5.6, two files of 3,100
+columns ran out of memory at 2 GB on one thread, and 905 columns at 2 GB on
+any thread count. The batch splitter halved the batch until it could not
+split further (3 files at the default 30 per batch), failed again, and the next
+cycle started over, downloading the files each time, for good.
+
+- **A partition that fails at the smallest batch is remembered and left
+  alone** while its files and the job sizing stay the same. Only memory
+  evidence counts, at most once per partition per cycle: DuckDB's
+  out-of-memory error marks it after one cycle and holds; a kill, a crash or a
+  cycle deadline that cut off an attempt which had nine tenths of the cycle's
+  budget marks it after two cycles in a row (a kill can hit another job
+  running alongside), and that mark expires after a day, so the partition is
+  tried once a day. Any other failure (a SQL error, a missing file, a full
+  disk, object-store errors) never counts. A new input file in the partition,
+  or a change of `compaction.memory_limit`, `compaction.threads`,
+  `compaction.max_concurrent`, `compaction.max_files_per_batch` or
+  `compaction.cycle_timeout`, tries it again; a partition that then compacts
+  is forgotten.
+- **What is remembered survives a restart**: it is kept per node in
+  `too_wide.json` under `compaction.temp_directory`. A compactor failover
+  starts the new node with its own list: each partition fails there again
+  (once or twice, as above) before it is left alone.
+- **Seeing and clearing it**: `GET /api/v1/compaction/too-wide` lists the
+  partitions on the node that answers (with the settings each failed under
+  and the current ones; on a cluster, ask the compactor node),
+  `DELETE /api/v1/compaction/too-wide` (optionally `?tier=` and
+  `?partition=`) forgets them so the next cycle tries again; both admin-only.
+  `/api/v1/compaction/candidates` marks those the next cycle skips `too_wide`, each cycle record and
+  `/api/v1/compaction/stats` count `skipped_too_wide`, and the metrics are
+  `arc_compaction_partitions_skipped_too_wide_total` and
+  `arc_compaction_partitions_too_wide`. A Warn names each partition when it is
+  first remembered.
+- **What it means for that table:** its files stay as written. Queries read
+  them as before. Tiering moves only daily-compacted files to cold storage, so
+  the table stays on hot storage until retention removes it (as it did while
+  compaction kept failing). The remedy is more memory per job: a higher
+  `compaction.memory_limit` or a lower `compaction.max_concurrent` (measured
+  on DuckDB 1.5.6: two files of 906 columns and 3.93M rows compacted in 72 s
+  with 4 GB on one thread, and ran out of memory at 2 GB).
+- **The splitter no longer makes a batch it refuses.** A 3-file batch was split
+  into 1 and 2 files, and the 1-file half was refused unattempted, losing the
+  real error; a batch under twice the minimum, or one at the splitter's
+  deepest level (4 halvings), is now the smallest. A child
+  that died of memory (a Go runtime "out of memory", a C++ `std::bad_alloc`)
+  is classified as a memory error even when its earlier log lines quote SQL
+  error text; before, it read as a permanent SQL error.
+
+### A DELETE rewrites wide files in bounded memory, and keeps Arc's file metadata ([#1380](https://github.com/Basekick-Labs/arc/pull/1380))
+
+A row DELETE rewrites each file it removes rows from by copying the rows it
+keeps to a new file. That copy ran on every DuckDB thread, and each thread held
+a decoded row group (the one it read and the 122,880-row one it wrote, about
+9 bytes per value however sparse the data) plus the Parquet writer's state for
+every column, part of it outside `database.memory_limit`. On wide files and many-core
+nodes it spilled for a long time and then ran out of memory: a customer
+measured 8 minutes per file at 905 columns and 39 minutes per row group at
+3,100 columns (46 cores, 4 GB limit).
+
+- **A file too wide for the main DuckDB is rewritten on a private
+  single-threaded one.** Before each rewrite Arc reads the file's footer and
+  estimates what the copy holds per thread (columns × rows per row group read
+  or written, plus the writer's per-column state) times the threads it would
+  use. Above half of DuckDB's effective memory limit, the file goes to a
+  private DuckDB instance: one thread, half the main memory limit, its own
+  spill directory, smaller row groups, sandboxed to the file's own directories,
+  with no extensions. The row order is kept. On
+  object storage the file is downloaded first. Measured on DuckDB 1.5.6 with a
+  4 GB limit on a 14-core machine:
+
+  | File | Before | Now |
+  |---|---|---|
+  | 3,100 columns, 8 row groups | out of memory | 36 s, 2.0 GB |
+  | 905 columns, 16 row groups | 32 s, 5.0 GB | 20 s, 0.9 GB |
+  | 10,000 columns, 1 row group | stopped after 15 min | 23 s, 2.6 GB |
+
+  Narrower files are rewritten as before. A long narrow file can cross the
+  line too on a many-core node (50 columns and 33 full row groups at 46
+  threads and 4 GB), and is then rewritten on one thread. Rewrites run one at
+  a time (they already did). Wide output has smaller row groups (32,768 rows at
+  905 columns, 8,192 at 3,100, 2,048 at 10,000), so it is larger (1.35× at
+  3,100 columns, 7× at 10,000) and its footer is bigger, which costs reads: a
+  one-second query on a rewritten 3,100-column file took 240 ms and 330 MB
+  instead of 30 ms and 50 MB on the original (16,384-row groups would have
+  halved that again, but went past the memory limit). A second DELETE on such
+  a file goes to the private instance again. The private
+  instance's memory limit is on top of the main one's, not part of it: with the
+  default limit (80% of the machine) the two together can exceed the machine
+  while queries run. A WHERE that calls a function from an extension (arcx,
+  httpfs) fails on a wide file. No setting.
+- **A file that cannot be sized is not rewritten.** If its footer cannot be
+  read, or the private instance cannot be opened, that file's rewrite fails
+  (`failed_files`, 207) and the DELETE can be retried; it does not go to the
+  main DuckDB unsized.
+- **A rewritten file keeps Arc's metadata.** Every DELETE rewrite dropped the
+  file's `arc:tags`, `arc:dedup_exact` and `arc:decimals` entries, so a
+  rewritten continuous-query file lost its exact-duplicate marker at
+  compaction. They are now carried over, along with the legacy
+  `arc:dedup_time`. Other entries (`ARROW:schema`) are not: they describe the
+  file as it was first written.
+
+### A DELETE reads only the files its time range can touch ([#1371](https://github.com/Basekick-Labs/arc/pull/1371))
+
+A row DELETE (`POST /api/v1/delete`) listed every file of the measurement and
+counted its matches with one read across all of them, whatever its WHERE. Its
+memory grew with the table's file count times its width, not with the
+window: on a wide table (thousands of columns), a DELETE of one minute could
+need hundreds of GiB, and `database.memory_limit` did not bound it.
+
+- **Only the partitions in the time range are read.** When the WHERE bounds
+  `time` (`time >= … AND time < …`, `BETWEEN`, or `now()` plus or minus an
+  interval), the DELETE reads only the hour and day directories that range
+  can touch, plus one hour on each side. This applies to hot files, to the
+  files the cluster manifest lists (a DELETE no longer waits for, checks, or
+  answers 503 over a file outside its range), and to cold storage. A WHERE
+  without such a range (an `OR` at the top level, `time = …`, `time IN (…)`)
+  reads every file, as before.
+- **Matches are counted 64 files at a time, without keeping the files'
+  metadata.** Arc keeps Parquet footers in memory for queries; a DELETE kept
+  every footer it read until it finished, and on wide files the footers are
+  most of the cost. It now counts with that cache off. Measured on 1,416
+  files of 1,000 columns: +2.7 GB before, +0.4 GB now for a DELETE over all
+  of them, and +2 MB for one of a minute.
+- **A hot file that cannot be counted stops the DELETE** before anything is
+  rewritten. Before, the per-file fallback logged "skipping file" and went
+  on: the file's matching rows stayed and the DELETE answered success. A file
+  replaced since the listing (a compaction) answers 503, retry. A file that
+  cannot be read answers 500 and names it, on every DELETE whose range
+  includes it, until it is repaired or removed; there is no option to skip
+  it. A clause that binds but fails on a file's values (comparing a column
+  that is text in some files with a number) also answers 500 now, where it
+  used to be skipped. A cold file that cannot be counted is reported as
+  before (207, `cold_files`).
+- **A file that does not have a column the WHERE names, or has it with
+  another type, is counted together with files that do,** as the single
+  read across every file counted it. Before, a cold file that could not bind
+  the clause on its own counted as no match. For cold files whose rows all
+  match, the file is now deleted. A hot file counted this way is still
+  rewritten on its own, which fails to bind as it did before this change: it
+  is reported in `failed_files` (207), not left out silently. A column that
+  no file in the range has still matches nothing there.
+
+`delete.time_pruning` turns the first point off (see the upgrade note above).
+
+### Retiring tier rows no longer grows the tier metadata WAL without bound ([#1373](https://github.com/Basekick-Labs/arc/pull/1373))
+
+Removing tier rows one at a time grew the WAL of the shared SQLite database
+(`arc.db-wal`) by tens of KB per row, and nothing shrank it. A startup tier
+scan that retired 6.2 million stale hot rows took one customer's WAL to
+99.6 GB. Each removal ended in a way that skipped SQLite's automatic WAL
+checkpoint. Measured on 200,000 rows: 5.9 GB of WAL before, 3 MB now.
+
+The same removal is used when a file is compacted or deleted on a node with
+replication on, and when cold rows are retired by retention or a DELETE. All
+of those are fixed.
+
+Also:
+- The scan reads hot rows 10,000 at a time instead of all at once. A single
+  read held the database's only connection, which auth, audit and file
+  registration share, for the whole read. A file flushed during that read
+  could fail to record its tier row (`failed to record file: context
+  deadline exceeded`). Such a row was, and still is, written by the next
+  complete scan.
+- After each tier scan, a WAL file larger than 64 MB (one an earlier version
+  grew) is truncated back to its minimum size. Before, a WAL that had grown
+  stayed that size on disk even after its contents were checkpointed. The
+  truncation can make auth, audit and file registration wait for up to a few
+  seconds once, on the first scan after the upgrade; a WAL kept small by the
+  fix is never truncated.
+
+### A compaction run within a minute of its files' registration no longer leaves them behind, counted twice ([#1358](https://github.com/Basekick-Labs/arc/issues/1358))
+
+On a cluster with a shared object store, a compaction finishes by deleting
+its input files. The finisher kept any input this node had confirmed as
+registered in the previous minute, and ended the job anyway. Once the job
+ended, nothing deleted those inputs or left them out of reads, so every node
+counted their rows twice, alongside the compaction's output. This happened
+when a compaction ran less than a minute after the inputs were registered.
+Examples:
+- a manual or backfill compaction right after a flush or an import;
+- a scheduled hourly run (by default at :05) catching an hour that had
+  ended minutes earlier, while its last flush was still being registered;
+- a daily run over old days, which skips the file-age check
+  (`daily_skip_file_age_check_days`), right after an import into them;
+- a registration backlog drained after a Raft outage.
+
+**The fix:**
+- The finisher syncs with the leader before it decides. A confirmation
+  recorded before that sync belongs to a registration the compaction has
+  since removed, so the input is deleted.
+- If an input's registration is still pending on this node, or was
+  confirmed after the sync started, the finisher waits and retries rather
+  than ending the job with the file left behind. The input is then either
+  registered again (kept) or not (deleted). A job that keeps waiting is
+  logged at Warn every 5 minutes.
+- An input parked as refused is kept, logged at Warn naming the job and
+  the file, and the job ends as before.
+- The finisher sorts every input into keep, wait or delete before it
+  deletes any.
+- A node no longer registers a file again if a compaction that has not
+  ended took it as an input. This can happen after a registration whose
+  reply was lost, or one replayed from the journal. The file's rows are in
+  the compaction's output, so it is treated as registered. Before checking
+  a replayed or retried file, the node syncs with the leader.
+
+**Limitations:**
+- Inputs left behind by an older version, from jobs that have already
+  ended, are not removed. They are not in the cluster manifest. The opt-in
+  reconciliation sweep (`reconciliation.enabled`, then
+  `reconciliation.manifest_only_dry_run=false`) deletes them after its grace
+  window.
+- The check that keeps a consumed input from being registered again only
+  runs while the compaction's job is open. If another node's finisher
+  deletes the file and ends the job just after this node has checked it is
+  still in storage, the manifest gets an entry for a file that is gone. The
+  same happened before this fix. Queries list the bucket, so they are not
+  affected; the reconciliation sweep removes such an entry when it is
+  enabled.
+- While a finished compaction waits for an input's registration to settle
+  (at most about a minute for a recent confirmation), the node that made
+  that registration counts the input next to the output.
+
+### `time_bucket` and `date_trunc` put rows in the right bucket ([#1352](https://github.com/Basekick-Labs/arc/issues/1352))
+
+Arc runs `time_bucket(INTERVAL …, time)` and `date_trunc('…', time)` as epoch
+arithmetic, for speed. That arithmetic had two errors; both affected every
+query API answer (JSON, Arrow, msgpack, Grafana), and totals over a window
+were never affected:
+
+- **The last half second of every bucket was counted in the next one.** A row
+  at `03:29:59.7` was in the `03:30` minute. Any per-second, per-minute or
+  per-hour series over sub-second data had rows in the wrong bucket at every
+  edge.
+- **Some bucket widths did not line up with DuckDB's.** Arc aligned buckets
+  on 1970-01-01 (a Thursday); DuckDB aligns them on 2000-01-03 (a Monday),
+  which is also where ISO weeks start. Weekly buckets started on Thursdays,
+  `date_trunc('week', time)` was not the ISO week, and widths such as
+  `2 days`, `5 days` or `7 hours` started at different instants than
+  DuckDB's. Widths that divide the gap between the two dates evenly were
+  already the same: the common dashboard widths (1, 5, 10, 15 or 30 minutes,
+  1, 2, 3, 4, 6, 12 or 24 hours, `1 day`) did not move. Others (`7 minutes`,
+  `5 hours`, `2 days`, weeks) now match DuckDB, so those panels show
+  different bucket starts after the upgrade.
+
+Instants before the origin (before 1970 or 2000) floor correctly, a
+`time_bucket` origin with a fractional second keeps it, and the arithmetic is
+in integer microseconds, so it is exact for every timestamp. Continuous
+queries were not affected: they never used this rewrite.
+
+### A measurement's first files moved to cold storage are read on every node ([#1349](https://github.com/Basekick-Labs/arc/issues/1349))
+
+A node reads a measurement from cold storage only once it has a cold row for
+it. When tiering moved a measurement's first files to cold, other nodes could
+miss those rows until their own next cold metadata sync (about 24 hours with
+the default schedule), and read the files from neither tier until then:
+
+- **Shared object store:** other nodes were never told about the move.
+  Now every node records the cold copy when the migrating node releases the
+  hot one. A node that installs a Raft snapshot after missing migrations
+  checks the cold tier for each path the snapshot dropped, as nodes with
+  local storage already did. This works with `cluster.replication_enabled`
+  off, which is how the Helm chart runs shared storage. Before, a node
+  learned of manifest deletes only through the peer puller, which runs only
+  with replication on.
+- **Shared object store, DELETE rewrites:** for the same reason, a node
+  with replication off kept reading a file that a row DELETE had rewritten,
+  next to its rewrite, until the old object was removed. In that window it
+  counted the rows the DELETE kept twice. It now leaves the old file out of
+  reads once the rewrite is in the bucket, as nodes with replication on
+  already did.
+- **Both storage modes:** if the cold-tier check failed, the node waited for
+  the next sync. It now checks again after 1, 2 and 4 seconds. A cold tier
+  unreachable for longer than that still waits for the sync, or for the
+  startup scan at the next restart. A retry skips a path that has since been
+  written and registered again.
+
+Before recording a cold row, a node always checks that the cold copy exists.
+On a shared store the size comes from the same request, so each node makes
+one cold-tier request per moved file it has no row for yet.
+
+**Limitations:**
+- On a shared object store, other nodes now count a moved file twice until
+  the migrating node deletes its hot object. That node deletes them one at a
+  time, up to 200 per manifest release, so this can last a few seconds.
+  Before this fix, those nodes did not count the file at all.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+in [#1354](https://github.com/Basekick-Labs/arc/pull/1354).
+
+### Compaction job metrics count on `/metrics` ([#1343](https://github.com/Basekick-Labs/arc/issues/1343))
+
+`arc_compaction_jobs_total`, `arc_compaction_jobs_success_total` and
+`arc_compaction_jobs_failed_total` always read `0`, whatever
+`/api/v1/compaction/stats` said. They were counted inside the compaction
+subprocess, whose own metrics nothing scrapes. The storage reads, writes and
+bytes the subprocess did were lost the same way.
+
+They are now counted by the server, from each subprocess's result:
+
+- **Attempts, not partitions.** A batch that fails and is retried at half
+  size counts twice, as in `/api/v1/compaction/stats`. A subprocess that
+  crashed or was killed without reporting counts as failed. One cut short by
+  a shutdown or a cancelled cycle counts as interrupted, in the new
+  `arc_compaction_jobs_interrupted_total`. `arc_compaction_jobs_total` is the
+  sum of the three.
+- **Staged jobs** (clusters with compaction commit) count as succeeded once
+  their output is staged, before the cluster commits it.
+- **On `/metrics`:** `arc_compaction_files_compacted_total`,
+  `arc_compaction_bytes_read_total` and `arc_compaction_bytes_written_total`,
+  which existed only in the JSON metrics until now.
+- **Storage:** the subprocess's storage reads, writes, bytes, errors and
+  quarantined paths are added to `arc_storage_*`.
+
+**Alerts.** An alert on `arc_compaction_jobs_failed_total` (for example
+`rate(...[1h]) > 0`) never fired before this fix, and now will. A partition
+that cannot be compacted fails more than once per cycle as its batch is
+halved. An alert on `increase(arc_compaction_jobs_success_total[24h]) == 0`,
+which fired all the time, now means something.
+
+Also, a failed job's `writing_output` record in the compaction completion
+directory is removed once its subprocess exits, unless crash recovery still
+needs it. These records used to stay until a restart. On a node with staged
+compaction on local storage, they also kept the failed job's staged output
+from ever being swept. The JSON metrics (`/api/v1/metrics`) also gain
+`jobs_interrupted`. A subprocess that is killed reports nothing, so the
+storage I/O it did before it died is not counted.
+
+### A manifest walk no longer stalls Raft applies during heavy ingest ([#1341](https://github.com/Basekick-Labs/arc/issues/1341))
+
+**Enterprise clusters with file replication.** The periodic manifest walk
+(`cluster.replication_reconciliation_interval_seconds`, default 5 minutes),
+the startup catch-up and the paginated `GET /api/v1/cluster/files` read the
+manifest in 1,000-entry pages over a sorted list of every file path. Two things
+made that expensive under ingest:
+
+- The sorted list was rebuilt whenever any file was registered, updated or
+  deleted, so a walk re-sorted it on nearly every page.
+- Each rebuild ran under the Raft FSM's write lock: about 260 ms at 1.07M files,
+  on each of roughly 1,070 pages.
+
+Every Raft apply waited behind it: file registrations, compaction commits,
+deletes, token and RBAC changes. Under sustained heavy ingest the walk held
+that lock for minutes at a time. On 26.09.x, registrations failed outright
+in those windows, and their files were never replicated. On main the outbox
+retried them, but ingest registration and compaction commits still stalled,
+and compaction batches logged `raft: manifest apply failed`.
+
+The walk now never takes the write lock:
+
+- It copies the paths under the read lock: about 9 ms at 1.07M files.
+- It sorts them with no lock held.
+- It does this once per walk, and only when files were added or removed since
+  the last sort. A content update of an existing file triggers no re-sort.
+- In the measurement, an apply arriving mid-sort waited under a microsecond.
+
+Files registered during a walk are listed by the next walk. Replication picks
+them up from the registration as before. Files a Raft snapshot install brings
+in are listed by the walk in progress if they sort after its position, and
+otherwise by the next walk.
+
+A page of `GET /api/v1/cluster/files?cursor=…` can now be empty while
+`next_cursor` is not: its files were deleted after the walk's first page.
+Keep paging until `next_cursor` is empty; an empty page does not mean the
+end.
+
+The workaround of raising `replication_reconciliation_interval_seconds` during
+heavy loads is no longer needed.
+
+### Queries no longer count a compaction's rows twice
+
+Compaction writes its output into the partition and then deletes the files
+it merged. A query that ran in between read both, so it counted every row of
+that compaction twice. This happened with default settings, including OSS
+standalone and every cluster node, on JSON, Arrow and msgpack queries.
+- **How long:** normally milliseconds to seconds (longer on S3 with many
+  inputs). If deleting an input failed, it lasted until the next compaction
+  cycle recovered the job, up to an hour, or until the first cycle after a
+  restart.
+- **Clusters:** a staged compaction has the same window on every node.
+  - With shared storage, it runs from the output's copy to the deletion of
+    its inputs; a failing delete or a dead finisher held it open.
+  - With local storage, each node read the inputs it still had on disk
+    until its own delete of them ran. A delete that failed on a node left
+    that node reading both sides until the file was removed by hand.
+- **Permanent through continuous queries:** a continuous query that ran
+  inside the window wrote the doubled aggregate back to storage.
+
+**The fix:**
+- Arc now tracks each compaction whose output and inputs can both be in
+  storage. It does so from before the output is written until its inputs are
+  known to be gone. After a restart, the jobs are rebuilt from the
+  compaction's recovery manifests before any query is served.
+- Once a compaction's output is in storage, queries, continuous queries and
+  the arcx engine leave its inputs out, because the output holds their rows.
+  This holds until the inputs are deleted, including after a failed delete
+  or a restart.
+- In a cluster, every node does the same for staged compactions, whether
+  or not it compacts:
+  - With shared storage, a committed job's inputs are left out once its
+    output is at its final key, until the job ends. Once the output is
+    removed from the cluster manifest, nothing is left out: the job is then
+    either undone, with its inputs registered again, or its inputs are
+    deleted too.
+  - With local storage, a node leaves out an input it still has on disk once
+    the job's output is on the same disk.
+  - With local storage, files that retention or a whole-file DELETE removed
+    are left out as soon as the manifest drops them, rather than when each
+    node's delete runs.
+  - A path the manifest lists again is always read.
+  - If the node's deleted-file counts look like a rolled-back manifest
+    (`cluster.stale_local_sweep_max_fraction`), it leaves nothing out.
+- Outside those windows nothing changes. While a compaction is open, queries
+  on that measurement are not cached, so a read planned before the output
+  appeared is never served after it. With `query.enable_s3_cache` on, DuckDB's
+  object-store listing cache is dropped when an output is first seen.
+
+**Limitations:**
+- A DELETE that rewrites a file, and tiering moves, still have their own
+  short windows in a cluster; they are not covered here.
+- One short race remains, as before: a query planned just before the output
+  is written can still read both sides, if its read lists the files after
+  the upload and before the inputs are deleted (normally milliseconds).
+  Leaving the output out of such a query would instead lose the job's rows
+  when the inputs are deleted first, which is worse.
+
+### A retried DELETE no longer leaves the surviving rows in two files
+
+A row DELETE writes each affected file again without the deleted rows, then
+removes the old file. If removing the old file failed, it stayed in storage
+next to the new one, and queries counted its rows twice. That much is a
+window (see the limitations). What made it permanent:
+- **Retrying the DELETE:** the old file still had the matching rows, so the
+  retry wrote it again. Two files then held the surviving rows, and every
+  later DELETE rewrote both. On a shared object store cluster, the retry also
+  registered the second copy in the cluster manifest.
+- **Compaction:** standalone compaction, and cluster compaction with
+  compaction commit off, merged the old file and its replacement into one
+  output with the rows twice.
+- **The manifest repair** (shared object store clusters) registered a
+  compaction output a DELETE had rewritten whose old copy was still in the
+  bucket, so nothing ever removed it.
+
+**The fix:**
+- A DELETE retries removing the file it replaced a few times before giving
+  up, and so does the registration outbox when it rewrites a pending file.
+- Every rewrite of a file is named after it, so the DELETE can find the old
+  copy: of the copies of one file, the one with the fewest rows is the
+  current one (each rewrite only removes rows).
+- **Standalone:**
+  - Before removing the replaced file, the DELETE records it in the storage
+    backend (`_delete_retired/`). Arc removes recorded files at start and
+    every minute, so a failed removal is finished without a retry, after a
+    restart too.
+  - A later DELETE on the measurement leaves out and removes any older copy
+    it finds, recorded or not.
+  - A backup leaves out recorded files, so a restore does not bring both
+    copies back.
+- **Clusters:** the DELETE first catches up with the cluster manifest. It
+  then leaves out a file the manifest does not list while another copy of
+  the same file is listed or still being registered.
+  - With compaction commit on (a cluster turns it on once every node
+    supports it), the DELETE also
+    removes such a file when it is provably the older copy: the listed copy
+    is in storage at its registered size and has fewer rows.
+  - The manifest repair no longer registers such a file. When the
+    reconciler is enabled and acting (`reconciliation.enabled`, with
+    `reconciliation.manifest_only_dry_run = false`), it removes the file as
+    an orphan.
+- Compaction (outside staged compaction, which compacts only files the
+  cluster manifest lists) skips every copy of a file while more than one is
+  in storage, and any file the standalone record names.
+- A DELETE whose clause no longer matches anything when it rewrites a file
+  (a clause on `now()`) leaves the file as it is instead of writing the same
+  rows under a new name.
+
+**Limitations:**
+- While both copies are in storage, compaction skips that file.
+- Pairs of copies left by earlier versions (both rewrites of the bug above)
+  hold the same rows: neither can be told apart, so both are kept, read and
+  rewritten together. A DELETE on them warns. Remove one by hand.
+- Standalone with tiering: if a recorded copy moves to the cold tier before
+  it is removed, it stays there.
+- On a shared object store cluster, an old copy whose replacement was later
+  compacted, tiered or deleted away while the copy was still in the bucket:
+  - is never registered again or rewritten (the record keeps it out);
+  - is not removed either, since nothing proves it is old any more;
+  - is read until removed by hand.
+- On a shared object store cluster with tiering, an old copy whose
+  replacement is only in the cold tier is left out of every DELETE and not
+  removed: a DELETE leaves its matching rows in place (and logs a warning)
+  until it is removed by hand or by the reconciler.
+
+### Queries no longer count a DELETE's surviving rows twice while it rewrites a file
+
+A row DELETE writes each affected file again without the deleted rows, then
+removes the old file. Between the two, every query read both: the surviving
+rows twice, and the deleted rows again. Normally this lasts milliseconds; if
+removing the old file failed, it lasted until something removed it. Reads
+now leave the old file out once its replacement is in storage.
+- **Standalone:** from the moment the replacement is written. After a
+  restart, reads start from the DELETE's record of the file.
+- **Clusters (both storage patterns):** every node does the same once the
+  cluster manifest has dropped the old file and a registered copy of the
+  same file is in storage at its registered size.
+- With `query.enable_s3_cache` on, DuckDB's object-store listing cache is
+  dropped the first time the replacement is seen.
+
+**The DELETE's record of a replaced file, on clusters too:**
+- The DELETE writes the record before it changes the cluster manifest. It
+  lives in the storage backend (`_delete_retired/`, in the shared bucket on
+  an object store).
+- Each node settles its own records every minute. On a shared object store
+  only the primary writer does, checked every time.
+- A record is only acted on when it is safe:
+  - The old file is removed once the manifest no longer lists it and a
+    listed copy of it is in storage at its registered size (standalone: once
+    its replacement is in storage).
+  - A rewrite the manifest still does not list about 5 minutes after the
+    settling node first saw its record is removed (its change never
+    applied or was refused); the original is kept.
+  - If the rewrite took and has since moved on (compacted, rewritten
+    again) while the old file was still in storage, the record stays, so
+    the old file is never scanned or registered again.
+- A DELETE that cannot write its record first does not change the manifest
+  (it answers with an error). A DELETE retried while an earlier rewrite of
+  the same file is still settling answers 503 until it is settled.
+- The manifest repair never registers a file a record names, and the
+  reconciler does not treat one as an orphan.
+- A restore clears the record of every file it restores, and a backup leaves
+  a recorded file out only while its replacement is in the same backup.
+
+**Two ways a cluster DELETE could lose rows, fixed:**
+- When the manifest change returned an error whose outcome is unknown (a
+  forwarded change that timed out, leadership lost after it was proposed),
+  the DELETE removed its rewrite. If the change applied anyway, the manifest
+  listed a file that no longer existed and the old file was gone too. The
+  DELETE now keeps both files and its record (it still answers with an
+  error), and the record is settled once the manifest shows the outcome.
+- A file the node's own manifest did not list (with compaction commit off)
+  was removed with its rewrite left unregistered, even when the node's
+  manifest was only behind. The DELETE now catches up with the cluster
+  manifest first, and treats the file as unlisted only if it still is.
+
+**Limitations:**
+- The window between a replacement's upload and the manifest change that
+  registers it remains, on every node of a cluster: for that moment reads
+  see both files. Normally milliseconds.
+- A node whose manifest lags behind the cluster reads both copies until it
+  catches up.
+- On a shared object store cluster, a node that restarts reads both copies
+  of a file whose old copy is still in the bucket, until the primary
+  writer's drainer removes it (about a minute).
+- Standalone: if writing the record failed too (likely in the same storage
+  outage that stopped the removal), reads after a restart see both copies
+  until a DELETE runs on that measurement.
+- When compaction takes the replacement, the old file, if still in storage,
+  is read again until removed (its rows are not lost).
+
+### A cluster node no longer loses a DELETE rewrite's rows while the rewrite is on its way
+
+On a cluster with local storage, every node removes its copy of a file a
+row DELETE rewrote 500 ms after the cluster manifest drops it. The node
+receives the rewrite only when its pull completes, which can take seconds,
+or until the next reconciliation walk (5 minutes) when the pull queue was
+full. Until then that node had neither copy, so its queries were missing
+every row the DELETE kept from that file. A continuous query that ran
+there in that window stored the shortfall.
+
+**The fix:**
+- A node now keeps its copy of the old file until a registered copy of the
+  rewrite is on its disk at its registered size. The removal waits on the
+  side: the delete workers are never blocked by it.
+- Reads on that node keep counting the old file while it waits: the
+  node answers as before the DELETE (the deleted rows included) until the
+  rewrite arrives, rather than missing the file's rows. Once the rewrite
+  lands, the old file is left out of reads and removed. Queries on that
+  measurement are not cached while a file waits.
+- The old file is removed at once if the manifest no longer lists any
+  rewrite of it (its rows went elsewhere or were deleted), and kept if the
+  manifest lists the file itself again.
+- There is no time limit. A copy waits as long as its rewrite has not
+  arrived; removing it earlier would trade correct answers for disk space.
+- A node that stops keeps such copies on disk. After the restart, once
+  the node has caught up with the cluster manifest, they are found again
+  from its record of the files it has seen registered.
+- The stale-local sweep and the Iceberg export treat a waiting copy as the
+  node's own data.
+- New gauge `arc_cluster_local_delete_deferred`: removals waiting for their
+  rewrite. It rises while pulls are slow; a value that never falls means the
+  rewrites are not arriving.
+
+**Limitations:**
+- If the rewrite is compacted before it reaches the node, the old file is
+  removed when the rewrite leaves the manifest, even if the node does not
+  hold the compaction's output yet.
+- A node that catches up through a snapshot install removes the files the
+  snapshot dropped without waiting.
+- A node without that record does not keep copies waiting, and removes
+  the old file as before. That covers `cluster.replication_catchup_enabled
+  = false`, no Raft data directory, or a record that cannot be opened.
+
+### Tiering: a migration no longer brings deleted rows back, and reads count its files once
+
+Moving a file to cold storage copies it, marks it cold, and only then
+removes the hot copy. Three problems, all fixed:
+
+- **A DELETE during the move brought its rows back for good.** A row DELETE
+  that rewrote a file while it was being copied left the cold copy with the
+  deleted rows. The cold sync then recorded that copy as a cold file, so the
+  deleted rows came back and the file's other rows were counted twice, for
+  good.
+  - A DELETE and a migration now never work on the same file at once.
+  - A DELETE leaves alone a file that is being moved, or one that already
+    has a copy in cold storage (a move that was interrupted). Its response
+    is 207 and names the files and why. A DELETE does not reach files in
+    cold storage ([#1350](https://github.com/Basekick-Labs/arc/issues/1350)),
+    so once the move completes those rows stay; delete them before the file
+    ages into cold storage.
+  - When cold storage cannot be checked for such a copy, the DELETE answers
+    503 and the file is left as it is; retry.
+  - Only daily compacted files old enough for their database's tiering
+    policy are checked, so a DELETE of recent data does not touch cold
+    storage.
+  - Removing the leftover of an earlier DELETE also waits for a file being
+    moved.
+- **A file an earlier DELETE replaced could be moved to cold storage.**
+  Copied there, the leftover still held the deleted rows. A migration now
+  skips such a file:
+  - when the DELETE's record names it;
+  - in a cluster, when the manifest no longer lists it but lists its
+    replacement;
+  - standalone, when its hot copy disappears during the copy.
+  The check runs again just before the file is marked cold, and a copy
+  already made is deleted.
+- **Reads counted migrated files twice until the whole batch was done.**
+  The hot copies were removed only after every file in the batch (up to
+  `migration_batch_size`, default 100) had been copied. Until then a query
+  read both copies of every file already moved. Hot copies are now released
+  as files are moved, at least once a second, and the query caches are
+  dropped around each release. Measured on a standalone node with one copy
+  held mid-migration: 7,200 rows instead of 6,000 before, 6,000 after.
+
+**Also:**
+- A file is marked cold only if its tier row still says hot. If the row
+  changed during the copy (another node moved it), the cold copy is kept,
+  since it may be the only one.
+- A node that stops being the primary writer during a copy leaves the file
+  for the new primary instead of marking it cold.
+- A manifest failure stops the whole migration cycle, not just the current
+  batch. Files already marked cold keep their hot copies until
+  reconciliation removes them.
+- A copy that has finished is still marked cold when the cycle is cancelled
+  (for example at shutdown).
+- On a cluster with local storage, a node that records another node's
+  moved file as cold drops its query caches. Before, it could keep serving
+  a cached listing without the file for up to 30 seconds.
+
+**Limitations:**
+- Between a file being marked cold and its hot copy being released, reads
+  on that node still count it twice. This lasts about a second, or longer
+  when files are moved faster than the cluster manifest releases them (one
+  release of up to 200 files a second).
+- On a cluster with local storage, the other nodes count a moved file twice
+  until they remove their own copy.
+- On a cluster with a shared object store, the other nodes count a moved
+  file twice until the migrating node deletes the hot object (see #1349
+  above).
+- While a migration runs, the migrating node drops its query caches up to
+  twice a second.
+- A DELETE arriving on a new primary writer while the old one is still
+  copying the same file (during a failover) is not covered: the claim
+  between DELETE and migration only holds within one process.
+- The age check uses the database's current tiering policy. A file moved
+  under a shorter `hot_max_age_days`, with the policy raised since, is not
+  checked for a cold copy.
+- Continuous queries read the hot tier only and were never affected.
+
+### A DELETE no longer drops rows its clause cannot decide
+
+A row DELETE rewrote each file keeping the rows where `NOT (clause)` held. A
+row where the clause is NULL (for example `host <> 'a'` on a row with no
+`host`) fails that test too, so it was dropped from the rewritten file
+without being counted or matched: rows nobody asked to delete were lost. The
+rewrite now keeps every row the clause does not match, the same rows the
+DELETE counts as matched, on standalone and clusters, and for DELETE records
+applied to pending files.
+
+### A cached query no longer misses an hour its relative end has just reached
+
+Arc caches a query's pruned plan for up to 60 seconds, keyed by the current
+hour. A query whose end is relative, such as `time < now() - INTERVAL '10
+minutes'`, reaches a new hour partway through the current one. A plan cached
+just before that kept the new hour out until the entry expired, so the rows
+in it were missing. Both pruning caches are now keyed by the hours the
+query's range starts and ends in, as well as the current hour.
+
+### File-level time pruning: sub-second flushes, margin minimum, and metrics
+
+These changes apply to `query.file_time_pruning`, which is now on by default
+(see the upgrade note above).
+
+- **Sub-second flushes are no longer dropped.** File name times were read to
+  the second, so with a margin under one second, a file flushed late in a
+  second could be left out of a query that started earlier in the same
+  second. Name times are now read to the nanosecond.
+- **`query.file_time_pruning_margin_seconds` has a minimum of 1 second.**
+  A value of 0 or less is raised to 1, with a warning.
+- **A live-hour plan is no longer cached when file pruning declines to act.**
+  This covers the cases where every file is in range or too many are kept.
+  Before, such a plan stayed cached for 60 seconds and the next queries
+  skipped the pruning. Every query whose range starts in the current hour
+  now lists that hour's directory, which takes a few milliseconds. When more
+  than 1000 files are in range, the query lists them
+  and then reads the whole hour anyway. The `cap_fallback` counter shows how
+  often that happens.
+- **New counters** on `/metrics` (and in the JSON snapshot) show what the
+  feature does on a given workload:
+  - `arc_query_file_time_pruning_passes_total`
+  - `..._expanded_total`
+  - `..._files_listed_total`
+  - `..._files_dropped_total`
+  - `..._nothing_dropped_total`
+  - `..._cap_fallback_total`
+  - `..._zero_survivors_total`
+  - `..._anomalous_kept_total`
+- **New counter `arc_ingest_future_stamped_rows_total`,** whether or not the
+  feature is on. It counts rows stamped more than the margin after their
+  flush and still in the flush's hour. These are the only rows file pruning
+  can hide, until their hour closes. A warning names the measurement, at
+  most once a minute per measurement.
+- **The "more than 1 hour in future" ingest warning now checks a batch's
+  latest timestamp, not its earliest.** It is also logged even when the same
+  batch holds data more than 7 days old, and at most once a minute per
+  measurement.
+
+### Time-filtered queries no longer return too few rows, and Grafana panels are pruned again
+
+Arc reads the time range from a query's WHERE clause and reads only the hour
+partitions inside it. The old reader took the first `time >= …` it found
+anywhere in the first WHERE and applied it to every table. With default
+settings, these queries returned too few rows, with `success: true`:
+
+- a bound joined with **OR** or under **NOT**: `time >= X OR host = 'a'` lost
+  the older `host = 'a'` rows, and `NOT (time >= X)` returned nothing;
+- a column whose name merely ends in `time` (`downtime`, `end_time`), or a
+  column named `timestamp`, read as the time column;
+- **arithmetic after the bound**: `time >= '…'::timestamp - INTERVAL '3
+  hours'` and `now() - INTERVAL '1 day' - INTERVAL '6 hours'` read only the
+  first part;
+- an **inclusive end on an hour boundary**: `time <= '10:00:00'` and
+  `BETWEEN … AND '10:00:00'` left out the 10:00 hour;
+- an **end-only** range (`time < '2024-01-01'`) left out everything before
+  2020;
+- a **commented-out** bound (`-- AND time >= …`), or one in **QUALIFY**;
+- **JOINs** (including `FROM a, b`), **UNION**, **CTEs** and **subqueries**:
+  one table's bound was applied to every table, or a subquery's bound to the
+  outer query;
+- `now() - INTERVAL '1 month'` on the 29th to the 31st started up to three
+  days later than DuckDB's own result (Mar 31 minus a month is Feb 28, not
+  Mar 3);
+- a literal with an explicit UTC offset under a `::timestamp` cast, which
+  DuckDB reads without the offset.
+
+A range is now read only from the query's single WHERE clause, and only from
+its top-level `AND` terms that are exactly a comparison of `time` with a
+literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
+`BETWEEN`. Other terms are ignored, which only widens the range. A top-level
+`OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
+the whole measurement, correctly but without pruning.
+
+An aggregate's `FILTER (WHERE …)` clause, such as `count(*) FILTER (WHERE
+status = 500)`, is not a second WHERE. The query's own WHERE still prunes
+(#1360). A time bound inside a FILTER never narrows what the query reads. A
+subquery, or a FROM or JOIN, inside a FILTER still means no range.
+
+Accepted spellings:
+- the column as `time`, `"time"`, `alias.time` or Grafana's `(time)`;
+- the literal as `'…'`, `'…'::timestamp` or `TIMESTAMP '…'`;
+- the reversed form `'…' <= time`;
+- one trailing `;`.
+
+A literal with an explicit offset (`+02:00`) gives no range.
+
+An end-only range (`time < X`) no longer prunes. It reads the whole
+measurement, which is correct where the old 2020 assumption was not.
+
+**Grafana panels are pruned again.** Since grafana-arc-datasource 1.4.0,
+`$__timeFilter` writes `(time) >= '…' AND (time) < '…'`. Arc did not recognise
+that form, so every Grafana panel read its whole measurement. It is now
+recognised for partition pruning, the empty-range answer and the open-ended
+shortcut.
+
+### A query no longer answers empty when an hour it reads is removed while it runs
+
+Arc narrows a time-filtered query to the hour partitions that exist and hands
+DuckDB that list. If one of those hours was removed before DuckDB read it, the
+query answered `success: true` with **no rows at all**. Every row was lost,
+not just the removed hour's. This happened on JSON, Arrow and msgpack queries
+with default settings. The usual causes are retention, compaction or a DELETE
+removing the hour while the query was in flight, or a cached plan (kept up to
+60 seconds) that still named it.
+
+Such a query now answers **503 with `Retry-After: 1`** and the message "data
+read by this query was removed while it ran". The query caches are cleared,
+so a retry re-plans without the removed hour and returns the remaining rows.
+A measurement with no data at all still answers an empty result, as before.
+
+**S3 or Azure primary storage, or a cold tier:** when the object store cannot
+list a partition folder, Arc keeps that folder in the plan without checking
+it. If a kept folder turns out to hold no files, the query now gets the 503
+instead of an empty, incomplete answer, for as long as the listing keeps
+failing.
+
+**A file removed while DuckDB is reading the hour gets the same answer
+(#1355).** Compaction removes an hour's input files in batches as it merges
+them. A query can already have listed the hour's files, and then go to open
+one that is no longer there. That query failed with HTTP 500 (`Cannot open
+file … No such file or directory`, or the S3 404 / Azure `BlobNotFound`
+equivalent). It now gets the same retryable 503, on every query route.
+
+- On S3 or Azure, Arc also clears its object-store cache (at most once a
+  second), so the retry lists the hour again. Before, with
+  `query.enable_s3_cache`, a cached listing kept naming the removed object
+  until its entry expired, and every retry failed the same way. While
+  compaction keeps removing files that queries are reading, this clear can
+  repeat once a second.
+- A file that is missing for good also answers the 503, every time. Examples
+  are a broken symlink under the storage root, or a cold-tier object that a
+  stale tiering record still lists. Arc logs a warning that names the path.
+- Only DuckDB's own error counts. Text that a query puts in a string, and
+  DuckDB quotes back in another error, gets neither this answer nor #1333's
+  empty result.
+
+### Iceberg export on a local-storage cluster no longer publishes a file next to the one that replaced it
+
+On a cluster with local storage, a node removes its copy of a deleted file
+some time after the cluster manifest drops it. These deletes all leave a
+window where both the deleted file and the file holding its rows are on disk:
+
+- A staged compaction moves its output into place before the inputs are
+  unlinked.
+- A partial DELETE's new file can arrive before the old one is unlinked.
+- An unlink can fail, or be lost to a crash, and stay until the stale-local
+  sweep removes the copy.
+
+An Iceberg export pass inside that window published both files, so external
+readers saw those rows twice. The existing check for in-flight compactions
+never saw staged compactions, which are on by default on clusters. The window
+normally lasts under a second to about 5 seconds. It lasts as long as an
+unlink keeps failing, and the duplicated snapshot stays in the table's history
+until it expires.
+
+The export now leaves out any file the node saw registered that the manifest
+no longer lists. It uses the journal the stale-local sweep keeps, so it also
+covers copies left by a crash. It follows the sweep's own rules:
+- Only the exact file seen registered is left out. A different file written
+  at the same path since, and new flushes not yet registered, still export.
+- When the manifest has dropped more of the node's files than
+  `cluster.stale_local_sweep_max_fraction` allows (a manifest rolled back by a
+  recovery looks like this), the export keeps them all and logs an error.
+
+In return, a file the cluster deleted can disappear from the table slightly
+before the file holding its rows appears. On the compacting node that gap is
+milliseconds. On a node that has to pull a DELETE's new file, it lasts until
+the pull, and readers see those rows missing for one pass instead of
+duplicated.
+
+The journal runs when `cluster.replication_enabled`,
+`cluster.replication_catchup_enabled` (on by default) and
+`cluster.raft_data_dir` are set. A local-storage cluster exporting to Iceberg
+without them logs a warning at startup.
+
+### A cluster on `storage.backend = "azblob"` reconciles its container as shared storage
+
+`azblob` is an accepted spelling of the Azure backend. The orphan reconciler
+decided whether storage was shared from the configured name. Its list knew
+`azure` but not `azblob`, so a cluster configured with `azblob` reconciled as if
+every node had its own disk:
+
+- Every node ran the storage scan and the manifest sweep against the one
+  container, instead of only the active compactor.
+- The check that keeps files other writers have flushed but not yet registered
+  ([#1214](https://github.com/Basekick-Labs/arc/issues/1214)) was off. Only
+  the grace window protected those files.
+- A node with file replication on and catch-up off logged a warning about
+  restoring an empty data disk, which does not apply to shared storage.
+
+With `reconciliation.manifest_only_dry_run = false`, several nodes could delete
+from the container without that check.
+
+The reconciler now decides from the backend Arc actually built, using the same
+rule as the pending-registration publisher. An `azblob` cluster is reconciled exactly
+like an `azure` one. Runs, `GET /api/v1/reconciliation/status` and audit events
+now report `backend_kind: "shared"` instead of `"local"`. During a rolling
+upgrade, nodes still on the old version keep sweeping as before. Keep
+`reconciliation.manifest_only_dry_run = true` until every node is upgraded.
+
+On shared storage, reconciliation runs only on the node that holds the
+compactor lease. Compactor failover (`cluster.failover_enabled = true`, a Raft
+data directory and the `writer_failover` licence feature) is what assigns
+that lease and moves it off a failed node. Without it, no node reconciles on
+`s3`, `minio`, `azure` or `azblob`, unless a lease is still held from an
+earlier failover-enabled run. Until now that showed only in debug logs; a node
+without compactor failover now logs a warning at startup. An `azblob` cluster
+without failover moves from "every node reconciles" to "no node reconciles".
+Enable compactor failover to keep reconciliation running.
+
+### Setting a database to `hot_only` reports existing cold files ([#1304](https://github.com/Basekick-Labs/arc/issues/1304))
+
+The tiering-policy response now reports how many non-quarantined cold files
+this node's metadata has recorded for the database. It also clarifies that
+`hot_only` affects future tiering and does not restore files already in cold
+storage.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1311](https://github.com/Basekick-Labs/arc/pull/1311).
+
+### A tiering policy set on any node applies, and survives a failover ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+In a cluster, each node kept its own tiering policies, while only the primary
+writer migrates files to cold storage. So:
+
+- A policy set on a reader, or on any node other than the primary, was stored
+  and reported with `200` but never applied.
+- After a failover, the new primary ignored every policy that had been set on
+  the old one. Databases pinned `hot_only` started moving to cold storage.
+
+Tiering policies now live in the cluster state. A policy set on any node
+applies cluster-wide, every node reports the same policies, and a new primary
+applies them. A standalone node is unchanged. The upgrade note above explains
+how a cluster takes over the policies each node already holds.
+
+Status codes for `PUT` and `DELETE /api/v1/tiering/policies/{database}`:
+
+| Status | When |
+|---|---|
+| `503` | The cluster cannot take the write right now (no leader, or the policies are being taken over). Retry. |
+| `400` | The policy is invalid, for example a database name longer than 256 bytes. |
+| `404` | `DELETE` of a database with no policy. |
+| `500` | `DELETE` hit a database error. It used to answer `404` for any error. |
+
+A token or RBAC change made on a follower is forwarded to the leader. It now
+returns only once the follower that forwarded it has applied the change, up to
+the write's timeout, so reading it back on that node sees it. Before, the read
+could briefly miss it.
+
+### A retention policy created on any node runs, and survives a failover ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+In a cluster, each node kept its own retention policies, while only the
+primary writer runs retention. So:
+
+- A policy created on a reader, or on any node other than the primary, was
+  stored and answered `201`, but never ran.
+- After a failover, the new primary ran only its own policies. A policy that
+  had been deleting data stopped, and one that had never run could start.
+
+Retention policies now live in the cluster state. A policy written on any node
+applies cluster-wide, every node reports the same policies, and every run,
+scheduled or manual, reads the policy as the cluster holds it when the run
+starts. A new primary runs the same policies. A standalone node is unchanged.
+The upgrade note above explains how a cluster takes over the policies each
+node already holds.
+
+Status codes for `POST`, `PUT` and `DELETE /api/v1/retention`:
+
+| Status | When |
+|---|---|
+| `202` | `POST` only: the cluster took the policy, but this node has not applied it yet. List the policies to see it. |
+| `400` | The policy is invalid (including a name, database or measurement longer than 256 bytes), its name is taken, or `retention_days` is not greater than `buffer_days`. |
+| `404` | No such policy. |
+| `503` | The cluster cannot take the write right now (no leader, or the policies are being taken over). Retry. |
+
+### A continuous query created on any node runs, and continues across a failover ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+In a cluster, each node kept its own continuous queries and their
+`last_processed_time`, while only the primary writer runs them. So:
+
+- A query created on any node other than the primary answered `201` but never
+  ran. An update made on another node never reached the primary's schedule.
+- After a failover the new primary ran only its own queries, from its own
+  `last_processed_time`. With none, its first run covered only the last hour,
+  and the data since the old primary's last run was never aggregated. With an
+  old one, it aggregated those windows again.
+
+Continuous queries and their `last_processed_time` now live in the cluster
+state. Every node's scheduler follows them, and the primary flushes each run's
+output to storage and then records the window's end in the cluster before that
+query's next run, so a new primary continues where the old one stopped, and a
+recorded window's output is never only in the old primary's memory. (The
+flush before the record comes from @jallegri's #1328.) If the primary dies, or is
+demoted, after writing a run's output and before the cluster recorded its end,
+the new primary writes that one window again; a primary that cannot reach the cluster skips that query's runs
+until it can, so it never grows past one window. A standalone node is
+unchanged.
+
+A manual `POST /api/v1/continuous_queries/{id}/execute` with an `end_time` more
+than a minute in the future now answers `400`. The run's end becomes
+`last_processed_time`, and a future one made every later run fail until the
+clock caught up.
+
+### A `hot_only` database no longer keeps a cold copy left by a failed migration ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+A hot-to-cold migration that copied a file to the cold tier, then failed
+before marking it cold, left two copies of the file. After the database was
+pinned `hot_only`, nothing removed the cold one, which kept costing storage.
+
+On the primary writer, the cold-tier sync now deletes such a cold copy, but
+only when every one of these holds:
+
+- the file's metadata still says hot;
+- the hot copy exists;
+- the cluster manifest lists the file at the same size;
+- the cold object is the same size.
+
+A copy already recorded as cold is left alone, and so is any file whose hot
+copy cannot be confirmed. A failed delete is retried on the next cycle, and the
+sync carries on with the other files. Query caches are refreshed after a
+removal.
+
+On a reader whose replica of the hot file has not arrived yet, the cold copy
+stays recorded so queries still find the rows. Once the hot copy arrives and
+the cold object is gone, the reader marks the file hot again.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1329](https://github.com/Basekick-Labs/arc/pull/1329).
+
 ### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
 
 Since 26.02.1, a JSON query with the database in the `x-arc-database`
@@ -1206,6 +3168,94 @@ The fan-out is removed: the hours a query selects are read in one
 one). `/api/v1/query/arrow` was not affected. The query-management API still
 reports `is_parallel` and `partition_count`; they are now always `false` and
 omitted.
+
+### A new hour is queryable at its first flush; DELETE, retention and database delete no longer break query results
+
+The query path caches which hour partitions exist, for up to a minute and
+longer when its caches chain:
+
+- **A new hour was missing.** A query whose range reached the current hour
+  (`time > NOW() - INTERVAL 1 hour`, a range without an end, or an end at or
+  after the current hour) run before that hour's first flush left the hour
+  out, and every repeat of that query for the next minute or more answered
+  without it, even after the hour had data. Dashboards that refresh every
+  few seconds lost the newest hour after each hour boundary. Tiered
+  deployments (a cold tier configured) were affected the same way.
+- **DELETE and retention emptied query results.** After a DELETE removed
+  every row of an hour, or retention removed an hour's files, a repeat of a
+  query whose range covered that hour answered `200` with no rows at all,
+  including the rows of the hours still there, until the cache expired.
+- **A dropped and re-created database answered empty.** After
+  `DELETE /api/v1/databases/{name}`, a repeat of a query over that database
+  failed once ("No files found") and then answered `200` with no rows until
+  the cache expired, even once new data was written.
+
+Compaction already cleared these caches. DELETE (including one that stops
+part-way), retention (including a run that aborts part-way; not a dry run)
+and database delete now clear them the same way, on every node of a cluster
+that has `cluster.shared_secret` set.
+
+The current hour's absence is no longer cached, nor the previous hour's for
+the first 5 minutes after the boundary (rows stamped just before the hour can
+flush just after it). A cached list made before an hour started is never
+used after it. Once the current hour has files, queries are cached as
+before; until then, a repeated query checks again which hours exist: one
+directory read locally, one directory listing on S3 or Azure. Hours that
+have not started yet are cached as absent, as before: rows stamped in the
+future show up within about two and a half minutes of their flush.
+
+### A range without an end returns rows stamped more than a day ahead, and an empty one no longer reads the whole measurement
+
+A time range with a start and no end (`time > NOW() - INTERVAL '1 hour'`,
+`time >= '2026-10-19T00:00:00Z'`) asks for every row from its start on. The
+query path read the hour partitions only up to 24 hours from now:
+
+- **Rows stamped later were left out.** Forecasts, schedules and devices
+  whose clocks run ahead write rows more than a day in the future; a query
+  without an end answered `200` without them. A range with an explicit end
+  was not affected.
+- **An empty window read every file.** When no partition existed from the
+  start on (a source that stopped sending, a dashboard watching the last
+  hour of it), the query read the whole measurement to answer zero rows, on
+  every refresh.
+
+A range without an end now lists the measurement's directories, newest
+first, and also reads every partition that exists past 24 hours ahead, one
+path per hour, however far ahead; like other partition listings, one
+written after a query is seen by its repeats within about a minute. An
+empty window reads only the newest partition (it answers zero rows) instead
+of the whole measurement when the query reads one measurement with only
+`AND`-ed conditions (no JOIN, subquery, `OR` or `NOT`) and that
+measurement's schema anchor is complete (`query.stable_schema`, on by
+default; the anchor still supplies every column); otherwise it reads the
+whole measurement as before. More than
+10,000 partitions past 24 hours ahead read the whole measurement rather
+than leave rows out. Locally this costs a few directory reads per uncached
+query; on S3 and Azure, a few directory listings, cached like the existing
+partition listings.
+
+### A forwarded request no longer carries the caller's token to the peer ([#1305](https://github.com/Basekick-Labs/arc/issues/1305))
+
+In a cluster, a node that cannot serve a request itself forwards it to a
+peer: a write or import sent to a reader, compactor or standby writer goes
+to the writer, and a query sent to a compactor goes to a reader. The forward
+used to copy the caller's credential (`Authorization`, `x-api-key`, `Cookie`
+and the `?p=` parameter) to the peer, in clear text unless the cluster uses
+TLS. The forwarding node has already verified that token: it now removes the
+credential and sends the token's identity instead, signed with
+`cluster.shared_secret`. The peer accepts that identity only on the
+forwarded endpoints and only from a node of its own cluster, and checks the
+token's permissions and RBAC grants as before.
+
+Upgrade note: a node forwards this way only to peers running this release;
+older peers keep receiving the credential, so a rolling upgrade keeps
+working, and the credential stops crossing the hop once every node is
+upgraded. A cluster without Raft (where each node keeps its own tokens)
+forwards the credential as before. A node with authentication disabled
+cannot forward to a peer that has it enabled: the peer answers `401`. The
+signed identity is valid for 30 seconds, so the clocks of a cluster's nodes
+must agree within that for forwarded requests to be accepted (joins already
+require 5 minutes).
 
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
@@ -1780,6 +3830,72 @@ on, half the bytes and allocations.
   writes the rest.
 - Tag values are made valid UTF-8, as field values already were.
 
+### Query responses stream straight to the socket: Arrow up to 60% faster
+
+A query's response was encoded on a goroutine of its own into an in-memory
+pipe, and the connection copied the pipe to the socket 4 KB at a time,
+flushing the socket after every 4 KB. The encoder now runs on the connection
+itself and every batch it flushes goes out as one chunk, with no pipe, no copy
+and no second goroutine. Over loopback, against 2M rows of local Parquet:
+
+| query | endpoint | 26.09 | 27.01 |
+|---|---|---|---|
+| `LIMIT 1000000` | Arrow IPC | 80 ms | 32 ms |
+| `LIMIT 1000000` | MessagePack | 91 ms | 69 ms |
+| `LIMIT 1000000` | JSON | 394 ms | 326 ms |
+| `LIMIT 1000000` | JSON, gzip | 794 ms | 730 ms |
+| `LIMIT 100000` | Arrow IPC | 11.8 ms | 6.9 ms |
+| `LIMIT 100000` | MessagePack | 11.6 ms | 10.2 ms |
+| `COUNT(*)` | any | ~1.05 ms | ~0.98 ms |
+
+Responses are byte-for-byte the same; only their chunking on the wire
+changed. A client that goes away mid-response still stops the query at the
+next batch, and a response that is never sent (a `HEAD` request) cancels its
+query before releasing it.
+
+### JSON query responses are encoded on several cores: up to 4x faster
+
+Turning a result into JSON (floats and timestamps above all) was nearly the
+whole cost of a large JSON response, and it ran on one core. From a result's
+third batch on (about 4,000 rows), batches are encoded on other cores while
+the query goroutine reads the next ones, and written in order; timestamps
+reuse the formatted date and time of the second before. Over loopback,
+against 2M rows of local Parquet:
+
+| query | 27.01.1 before | 27.01.1 |
+|---|---|---|
+| `LIMIT 1000000`, JSON | 323 ms | 79 ms |
+| `LIMIT 1000000`, JSON with zstd | 600 ms | 406 ms |
+| `LIMIT 1000000`, JSON with gzip | 729 ms | 515 ms |
+| `LIMIT 100000`, JSON | 35.9 ms | 11.9 ms |
+| `LIMIT 10000`, JSON | 6.9 ms | 5.3 ms |
+| `COUNT(*)` | 0.96 ms | 0.94 ms |
+
+Responses are byte-for-byte the same, compressed ones included (compression
+itself still runs as one stream). Encoding takes at most GOMAXPROCS-1 extra
+goroutines across the whole process and at most four batches per query, and a
+core is held only while a batch is being encoded: with fourteen queries
+running at once, `LIMIT 100000` was 29% faster and smaller queries unchanged.
+Encoded batches go to the client as soon as they are ready, and a cancelled
+query still sends every row it read before the cancellation.
+
+### MessagePack query responses are encoded on several cores too: up to 40% faster
+
+`/api/v1/query/msgpack` responses are columnar, so a column's values are cut
+into runs of about 16,000 rows (or 1 MB) that are encoded on the same encoder
+goroutines as JSON's batches and written in order. Small results (up to two
+batches) keep the single-goroutine encoder. Over loopback, against 2M rows of
+local Parquet:
+
+| query | 27.01.1 before | 27.01.1 |
+|---|---|---|
+| `LIMIT 1000000`, MessagePack | 67.1 ms | 39.6 ms |
+| `LIMIT 1000000`, MessagePack with zstd | 147 ms | 121 ms |
+| `LIMIT 100000`, MessagePack | 9.8 ms | 7.2 ms |
+| `LIMIT 10000`, MessagePack | 4.2 ms | 4.1 ms |
+
+Responses are byte-for-byte the same.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary
@@ -2104,6 +4220,14 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
+### Initial writer-election tests wait for the manager's published state ([#1196](https://github.com/Basekick-Labs/arc/issues/1196))
+
+Raft records a promoted writer before the election goroutine updates the manager's
+`primaryID` and clears `failoverInProg`. Under load, the tests could observe the
+Raft state in that gap and fail. They now wait for the manager state they assert.
+Runtime election behaviour is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1200](https://github.com/Basekick-Labs/arc/pull/1200).
 
 ### Ingest memory is visible while flushes back up ([#1038](https://github.com/Basekick-Labs/arc/issues/1038))
 
@@ -2865,6 +4989,13 @@ leader writer, or compaction and reconciliation on the active compactor
 ([#1214](https://github.com/Basekick-Labs/arc/issues/1214)). Files already left
 unregistered by earlier versions are not picked up retroactively.
 
+### The cold-tier storage backend closes during shutdown ([#1103](https://github.com/Basekick-Labs/arc/issues/1103))
+
+The S3 or Azure backend used by tiering is now closed with the other storage
+backends after the tiering manager stops.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1204](https://github.com/Basekick-Labs/arc/pull/1204).
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
@@ -2873,6 +5004,16 @@ request. Removing this inactive SQL Server-specific check preserves existing
 validation behavior; keyword, punctuation and file-access checks remain.
 
 Original fix proposed by [@abhicodes-007](https://github.com/abhicodes-007) in [#1078](https://github.com/Basekick-Labs/arc/pull/1078).
+
+### Hot-only databases keep their hot metadata when a cold object is listed ([#1187](https://github.com/Basekick-Labs/arc/issues/1187))
+
+For a database pinned to the hot tier, cold metadata sync no longer records a
+cold object while this node still holds its hot copy (or cannot tell). A cold
+object left behind by a failed migration can no longer make the orphan sweep
+remove the hot copy. A cold object with no local hot copy, such as one
+migrated before the pin, is still recorded, so queries keep reading it.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1192](https://github.com/Basekick-Labs/arc/pull/1192).
 
 ### Cold-tier metadata is rebuilt on standalone nodes ([#1179](https://github.com/Basekick-Labs/arc/issues/1179))
 
@@ -4582,6 +6723,16 @@ These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
+
+### Hourly compaction file-count guidance (#793)
+
+Documented `compaction.hourly_min_files` as an independent per-partition floor,
+not a value derived from `ingest.max_buffer_age_ms`. Actual file cadence also
+depends on traffic gaps, row limits, schema changes and flush backpressure; the
+default remains 10.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1370](https://github.com/Basekick-Labs/arc/pull/1370).
 
 ### The unused `license.enabled` setting is removed ([#1195](https://github.com/Basekick-Labs/arc/issues/1195))
 

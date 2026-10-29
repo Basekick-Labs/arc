@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -606,5 +608,115 @@ func TestReadParquetPathRejectsGlobMetacharacters(t *testing.T) {
 	}
 	if want := "s3://test-bucket/tenant/" + ok; got != want {
 		t.Errorf("readParquetPath() = %q, want %q", got, want)
+	}
+}
+
+// A retention run that removed files invalidates the query caches: a cached
+// pruned partition list naming a removed hour answered empty results.
+func TestRetentionInvalidatesQueryCachesAfterRemovingFiles(t *testing.T) {
+	handler, tmpDir := setupTestRetentionHandler(t)
+	calls := 0
+	handler.SetOnFilesRemoved(func() { calls++ })
+	dir := filepath.Join(tmpDir, "testdb", "logs", "2020", "01", "01", "00")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handler.duckdb.DB().Exec(`COPY (SELECT TIMESTAMP '2020-01-01 00:00:00' AS time, 1 AS v FROM range(3)) TO '` + filepath.Join(dir, "f.parquet") + `' (FORMAT PARQUET)`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := handler.db.Exec(`INSERT INTO retention_policies (name, database, measurement, retention_days, buffer_days, is_active) VALUES (?, ?, ?, ?, ?, ?)`, "p", "testdb", "logs", 30, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := result.LastInsertId()
+	execution, err := handler.ExecutePolicy(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.FilesDeleted != 1 {
+		t.Fatalf("files deleted: %+v", execution)
+	}
+	if calls != 1 {
+		t.Fatalf("query caches invalidated %d times, want 1", calls)
+	}
+
+	// The HTTP execute endpoint: a dry run removes nothing and leaves the
+	// caches alone; a real run invalidates them.
+	app := fiber.New()
+	handler.RegisterRoutes(app)
+	for _, tc := range []struct {
+		body string
+		want int
+	}{{`{"dry_run":true}`, 1}, {`{"confirm":true}`, 2}} {
+		req := httptest.NewRequest("POST", "/api/v1/retention/"+strconv.FormatInt(id, 10)+"/execute", strings.NewReader(tc.body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("%s: status %d", tc.body, resp.StatusCode)
+		}
+		if calls != tc.want {
+			t.Fatalf("%s: query caches invalidated %d times, want %d", tc.body, calls, tc.want)
+		}
+	}
+}
+
+// flakyManifest accepts the first manifest batch and refuses the rest.
+type flakyManifest struct{ batches int }
+
+func (f *flakyManifest) BatchFileOpsInManifest([]raft.BatchFileOp) error {
+	f.batches++
+	if f.batches > 1 {
+		return errors.New("quorum lost")
+	}
+	return nil
+}
+func (f *flakyManifest) IsPrimaryWriter() bool { return true }
+func (f *flakyManifest) Role() string          { return "writer" }
+
+// A run aborted after an earlier measurement's files were removed still
+// invalidates the query caches.
+func TestRetentionAbortInvalidatesQueryCaches(t *testing.T) {
+	for _, viaHTTP := range []bool{false, true} {
+		handler, tmpDir := setupTestRetentionHandler(t)
+		calls := 0
+		handler.SetOnFilesRemoved(func() { calls++ })
+		handler.SetCoordinator(&flakyManifest{})
+		for _, m := range []string{"a_logs", "b_logs"} {
+			dir := filepath.Join(tmpDir, "testdb", m, "2020", "01", "01", "00")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := handler.duckdb.DB().Exec(`COPY (SELECT TIMESTAMP '2020-01-01 00:00:00' AS time, 1 AS v) TO '` + filepath.Join(dir, "f.parquet") + `' (FORMAT PARQUET)`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		result, err := handler.db.Exec(`INSERT INTO retention_policies (name, database, retention_days, buffer_days, is_active) VALUES (?, ?, ?, ?, ?)`, "p", "testdb", 30, 0, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := result.LastInsertId()
+		if viaHTTP {
+			app := fiber.New()
+			handler.RegisterRoutes(app)
+			req := httptest.NewRequest("POST", "/api/v1/retention/"+strconv.FormatInt(id, 10)+"/execute", strings.NewReader(`{"confirm":true}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 500 {
+				t.Fatalf("status %d, want 500", resp.StatusCode)
+			}
+		} else if _, err := handler.ExecutePolicy(context.Background(), id); err == nil {
+			t.Fatal("want the run aborted")
+		}
+		if calls != 1 {
+			t.Fatalf("http=%v: query caches invalidated %d times, want 1", viaHTTP, calls)
+		}
 	}
 }

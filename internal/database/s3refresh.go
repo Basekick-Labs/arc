@@ -142,5 +142,5 @@ func credSourceLabel(source string) string {
 func startS3CredentialRefresher(db *sql.DB, params s3SecretParams, provider awsCredentialsProvider, logger zerolog.Logger, onFirstFailure func(error)) *credentialRefresher {
 	return startCredentialRefresher(
 		&s3Resolver{db: db, params: params, provider: provider},
-		params.name, logger, s3DemotionHint, onFirstFailure)
+		params.name, logger, s3DemotionHint, false, onFirstFailure)
 }

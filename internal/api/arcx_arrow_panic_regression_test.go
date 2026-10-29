@@ -78,15 +78,15 @@ func TestArcxArrowPanicWiring(t *testing.T) {
 			return true
 		}
 		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if ok && selector.Sel.Name == "setBodyStreamWithTrailers" {
+		if ok && selector.Sel.Name == "setDirectBodyStream" {
 			streamCall = call
 		}
 		return true
 	})
-	if streamCall == nil || len(streamCall.Args) != 5 {
+	if streamCall == nil || len(streamCall.Args) != 6 {
 		t.Fatal("ArcX Arrow response helper lacks the panic-safe trailer stream")
 	}
-	onPanic, ok := streamCall.Args[3].(*ast.FuncLit)
+	onPanic, ok := streamCall.Args[4].(*ast.FuncLit)
 	if !ok {
 		t.Fatal("ArcX Arrow stream has no panic callback")
 	}

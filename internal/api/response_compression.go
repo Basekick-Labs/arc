@@ -13,7 +13,7 @@ import (
 
 // Streaming response compression for the JSON and msgpack query endpoints,
 // negotiated via the standard Accept-Encoding request header (zstd preferred
-// over gzip). Responses stream through SetBodyStreamWriter, which bypasses
+// over gzip). Responses stream through setDirectBodyStream, which bypasses
 // any body-rewriting middleware, so the compressor is wired directly into
 // the stream callback: encoder output feeds the fasthttp chunk writer, and
 // the endpoint's existing bufio layer sits in front of the encoder so

@@ -445,32 +445,39 @@ func (n *Node) State() raft.RaftState {
 // Apply applies a command to the Raft cluster.
 // This can only be called on the leader.
 func (n *Node) Apply(cmd *Command, timeout time.Duration) error {
+	_, err := n.ApplyIndex(cmd, timeout)
+	return err
+}
+
+// ApplyIndex is Apply, also returning the command's log index. The index is
+// set whenever the command committed, including when the FSM refused it.
+func (n *Node) ApplyIndex(cmd *Command, timeout time.Duration) (uint64, error) {
 	n.mu.RLock()
 	ra := n.raft
 	n.mu.RUnlock()
 
 	if ra == nil {
-		return fmt.Errorf("raft not initialized")
+		return 0, fmt.Errorf("raft not initialized")
 	}
 
 	data, err := json.Marshal(cmd)
 	if err != nil {
-		return fmt.Errorf("failed to marshal command: %w", err)
+		return 0, fmt.Errorf("failed to marshal command: %w", err)
 	}
 
 	future := ra.Apply(data, timeout)
 	if err := future.Error(); err != nil {
-		return fmt.Errorf("failed to apply command: %w", err)
+		return 0, fmt.Errorf("failed to apply command: %w", err)
 	}
 
 	// Check for application error
 	if resp := future.Response(); resp != nil {
 		if err, ok := resp.(error); ok {
-			return &commandRefused{err}
+			return future.Index(), &commandRefused{err}
 		}
 	}
 
-	return nil
+	return future.Index(), nil
 }
 
 // ErrCommandRefused matches (errors.Is) an error the FSM returned for a

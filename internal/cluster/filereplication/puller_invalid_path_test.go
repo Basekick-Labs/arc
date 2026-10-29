@@ -106,9 +106,15 @@ func TestPullerQuarantineKeepsTheQueryGateClosed(t *testing.T) {
 	// shares this file). Both keys are asserted because finishEntry and
 	// inflightRemove clear them in opposite orders, so neither alone is a
 	// barrier for the other.
-	stats := waitStats(t, p, func(s map[string]int64) bool {
+	waitStats(t, p, func(s map[string]int64) bool {
 		return s["invalid_path"] == 1 && s["inflight_count"] == 0 && s["catchup_inflight"] == 0
 	})
+	// Read the counters again: Stats() loads "failed" before "invalid_path"
+	// and the in-flight counters, so the snapshot that satisfied the wait can
+	// hold failed=0 from before the worker's two increments and the rest from
+	// after it finished. The worker adds to failed before finishEntry clears
+	// the in-flight counters, so a snapshot taken after the wait sees it.
+	stats := p.Stats()
 	if stats["failed"] != 1 {
 		t.Errorf("failed = %d, want 1: the file really is absent, so the gate must stay closed", stats["failed"])
 	}

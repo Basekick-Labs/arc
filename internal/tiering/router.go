@@ -65,7 +65,7 @@ func (r *Router) GetGlobPathsForQuery(database, measurement string) map[Tier]str
 	// Hot tier (local)
 	paths[TierHot] = fmt.Sprintf("%s/%s/**/*.parquet", database, measurement)
 
-	// Cold tier (S3/Azure archive) - if enabled. The same answer the cold
+	// Cold tier (S3/Azure/GCS archive) - if enabled. The same answer the cold
 	// accessors give, so a read can never be routed at a tier the writers
 	// consider unusable (#1143).
 	if r.manager.coldTierUsable() {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	duckdb "github.com/duckdb/duckdb-go/v2"
+	"github.com/google/uuid"
 )
 
 // colType represents a simplified column type for fast JSON serialization.
@@ -25,6 +27,12 @@ const (
 	colFloat64
 	colBool
 	colTimestamp
+	// colBinary is BLOB and GEOMETRY (WKB): base64 in JSON, the encoding the
+	// Arrow path and the Grafana plugin already use, since raw bytes are not
+	// valid JSON text (#440).
+	colBinary
+	// colUUID is UUID, which duckdb-go scans as 16 raw bytes: canonical text.
+	colUUID
 )
 
 // jsonFlushInterval controls how often we flush the bufio.Writer to the
@@ -54,9 +62,16 @@ func mapColumnTypes(cts []*sql.ColumnType) []colType {
 }
 
 // mapColumnType converts a DuckDB type name to our serialization enum.
-// Mirrors sqlTypeToArrowType in query_arrow.go.
+// BLOB, GEOMETRY and UUID are matched exactly: duckdb-go scans all three as
+// []byte, and only the type name tells them apart (#440).
 func mapColumnType(dbType string) colType {
 	dbType = strings.ToUpper(dbType)
+	switch dbType {
+	case "BLOB", "GEOMETRY":
+		return colBinary
+	case "UUID":
+		return colUUID
+	}
 	switch {
 	case strings.Contains(dbType, "BOOL"):
 		return colBool
@@ -374,6 +389,23 @@ func writeJSONValue(w *bufio.Writer, scratch []byte, val interface{}, ct colType
 		default:
 			scratch = writeFallbackJSON(w, scratch, v)
 		}
+
+	case colBinary:
+		if v, ok := val.([]byte); ok {
+			w.WriteByte('"')
+			scratch = base64.StdEncoding.AppendEncode(scratch[:0], v)
+			w.Write(scratch)
+			w.WriteByte('"')
+			return scratch
+		}
+		scratch = writeFallbackJSON(w, scratch, val)
+
+	case colUUID:
+		if v, ok := val.([]byte); ok && len(v) == 16 {
+			writeJSONString(w, scratch, uuid.UUID(v).String())
+			return scratch
+		}
+		scratch = writeFallbackJSON(w, scratch, val)
 
 	default: // colString
 		switch v := val.(type) {

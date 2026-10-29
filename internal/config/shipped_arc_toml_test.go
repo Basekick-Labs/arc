@@ -64,4 +64,8 @@ func TestShippedArcTomlHasNoLiveColdTierConnectionValues(t *testing.T) {
 	if cold.AzureConnectionString != "" || cold.AzureAccountKey != "" || cold.AzureSASToken != "" {
 		t.Error("arc.toml sets Azure cold-tier credentials; same hazard as the S3 keys above")
 	}
+	if cold.GCSBucket != "" || cold.GCSPrefix != "" || cold.GCSCredentialsFile != "" || cold.GCSEndpoint != "" {
+		t.Error("arc.toml sets a GCS cold-tier value; a shipped value cannot be cleared by an empty " +
+			"environment variable, so it would apply to every deployment that switches the cold tier to gcs")
+	}
 }

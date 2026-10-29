@@ -106,7 +106,7 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 	})
 	for _, required := range []string{
 		"registerArrowResponseTrailers",
-		"setBodyStreamWithTrailers",
+		"setDirectBodyStream",
 		"streamArrowIPCFunc",
 		"rowCapReached",
 		"poisonArrowStream",

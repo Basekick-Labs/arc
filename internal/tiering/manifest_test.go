@@ -101,7 +101,8 @@ func coldRowFor(path string) *FileMetadata {
 }
 
 func TestMigrateBatch_ManifestBeforeHotDelete(t *testing.T) {
-	m, hot, cold, _, cleanup := setupGatedTest(t)
+	m, hot, cold, gate, cleanup := setupGatedTest(t)
+	gate.primary.Store(true)
 	defer cleanup()
 	ctx := context.Background()
 	fake := &fakeManifest{hot: hot, entries: map[string]int64{}}
@@ -148,7 +149,8 @@ func TestMigrateBatch_ManifestBeforeHotDelete(t *testing.T) {
 // files are migrated (cold is canonical, rows say cold) and reconciliation
 // finishes the cleanup. It counts once for the cycle.
 func TestMigrateBatch_ManifestFailureKeepsHotCopies(t *testing.T) {
-	m, hot, cold, _, cleanup := setupGatedTest(t)
+	m, hot, cold, gate, cleanup := setupGatedTest(t)
+	gate.primary.Store(true)
 	defer cleanup()
 	ctx := context.Background()
 	fake := &fakeManifest{hot: hot, entries: map[string]int64{}, err: errors.New("raft: manifest apply failed")}
@@ -177,7 +179,8 @@ func TestMigrateBatch_ManifestFailureKeepsHotCopies(t *testing.T) {
 }
 
 func TestMigrateFile_ManifestBeforeHotDelete(t *testing.T) {
-	m, hot, _, _, cleanup := setupGatedTest(t)
+	m, hot, _, gate, cleanup := setupGatedTest(t)
+	gate.primary.Store(true)
 	defer cleanup()
 	ctx := context.Background()
 	fake := &fakeManifest{hot: hot, entries: map[string]int64{gateDailyA: 7}}

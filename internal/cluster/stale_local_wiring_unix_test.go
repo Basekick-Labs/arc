@@ -82,10 +82,20 @@ func TestStartupWalkWaitsForTheJournalAndRecordsTheHash(t *testing.T) {
 		rec, ok := seen.get(key)
 		return ok && rec.sha == shaPrefix(e.SHA256)
 	})
-	if s := puller.Stats(); s["refresh_verified"] != 1 || s["listed_unvouched"] != 1 {
-		t.Fatalf("stats %v, want one unvouched copy hashed and verified", s)
+	// The hash is recorded inside the verify, before the worker counts it
+	// and settles the request: wait for both rather than read them once.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s := puller.Stats()
+		if s["refresh_verified"] == 1 && s["listed_unvouched"] == 1 && puller.FullyCaughtUp() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stats %v, gate %v: want one unvouched copy hashed and verified, and the gate green", s, puller.CatchUpStatus())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if !puller.FullyCaughtUp() {
-		t.Fatalf("gate red after the hash: %v", puller.CatchUpStatus())
+	if s := puller.Stats(); s["refresh_verified"] != 1 || s["listed_unvouched"] != 1 {
+		t.Fatalf("stats moved past one verified copy: %v", s)
 	}
 }
