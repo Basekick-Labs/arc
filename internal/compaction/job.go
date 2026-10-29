@@ -79,23 +79,70 @@ func validateParquetFile(path string) error {
 	return nil
 }
 
+// hourBucketExpr is the hour of a row's "time": microseconds since the epoch,
+// integer-divided by one hour. It is monotone in time and independent of the
+// session time zone. `//` truncates toward zero, so the two hours either side
+// of 1970-01-01 share a bucket; the order stays monotone, which is all an
+// ORDER BY prefix needs.
+const hourBucketExpr = `epoch_us("time") // 3600000000`
+
 // buildOrderByClause builds an ORDER BY clause from sort keys.
 // Returns an empty string if no sort keys, or "ORDER BY col1, col2, ..." if sort keys exist.
 // Column names are quoted to handle special characters.
+//
+// When the first key is not "time" (configured sort keys such as fleet,name),
+// the clause starts with the hour of "time". Ingest writes each file within
+// one hour, sorted by the keys, so a daily compaction ordered by the keys
+// alone would spread every row group across the day and lose time-range
+// pruning on the long-lived files. Ordering by hour first keeps the keys'
+// clustering within each hour and keeps each row group to contiguous hours:
+// about one hour when an hour's rows fill a row group.
+//
+// The clause refers to "time" as an output column, so the caller must apply it
+// to a derived table whose "time" is already normalized (see
+// buildCompactionQuery): on a raw read_parquet it would bind to a VARCHAR
+// "time" in a mixed-schema partition, and DuckDB rejects an expression in an
+// ORDER BY directly on a UNION.
 func buildOrderByClause(sortKeys []string) string {
 	if len(sortKeys) == 0 {
 		return ""
 	}
 
-	var quotedKeys []string
+	terms := make([]string, 0, len(sortKeys)+1)
+	if sortKeys[0] != "time" {
+		terms = append(terms, hourBucketExpr)
+	}
 	for _, key := range sortKeys {
 		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
 		// (same as PostgreSQL). This prevents identifier breakout even if validation is bypassed.
 		escaped := strings.ReplaceAll(key, `"`, `""`)
-		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, escaped))
+		terms = append(terms, fmt.Sprintf(`"%s"`, escaped))
 	}
 
-	return fmt.Sprintf("ORDER BY %s", strings.Join(quotedKeys, ", "))
+	return fmt.Sprintf("ORDER BY %s", strings.Join(terms, ", "))
+}
+
+// compactionSortKeys returns the sort keys the batch's files have a column
+// for, and the ones they do not. A key without a column cannot bind in the
+// ORDER BY, and the partition would then fail to compact on every cycle.
+// Names match case-insensitively, as DuckDB binds them (see tagsWithColumns).
+// "time" is always kept: the caller has already refused a batch without it.
+// A nil columns map (the schema probe failed) keeps every key, as before.
+// The returned slice is always new: sortKeys may be the shared config slice.
+func compactionSortKeys(sortKeys []string, columns map[string]string) (kept, dropped []string) {
+	kept = make([]string, 0, len(sortKeys))
+	for _, key := range sortKeys {
+		if columns == nil || key == "time" {
+			kept = append(kept, key)
+			continue
+		}
+		if _, ok := columns[asciiLower(key)]; ok {
+			kept = append(kept, key)
+		} else {
+			dropped = append(dropped, key)
+		}
+	}
+	return kept, dropped
 }
 
 // JobStatus represents the status of a compaction job
@@ -123,6 +170,10 @@ type Job struct {
 	BatchNumber   int
 	TempDirectory string   // Base temp directory for compaction files
 	SortKeys      []string // Sort keys for this measurement (for ORDER BY in compaction)
+	// SortKeysExplicit is true when SortKeys come from ingest.sort_keys for
+	// this measurement rather than ingest.default_sort_keys. It only sets the
+	// log level when a key has no column in the batch's files.
+	SortKeysExplicit bool
 
 	// Job metadata
 	JobID       string
@@ -154,6 +205,9 @@ type Job struct {
 	staged bool
 	inputs map[string]StagedInput
 
+	// outputName, when set, is the output file name the parent chose.
+	outputName string
+
 	// OutputStorageKey is the storage-relative key of the compacted output,
 	// set once the output name is fixed (before upload). Empty for jobs that
 	// produce no output (all sources vanished, or no time column).
@@ -184,18 +238,20 @@ type Job struct {
 
 // JobConfig holds configuration for creating a compaction job
 type JobConfig struct {
-	Measurement     string
-	PartitionPath   string
-	Files           []string
-	StorageBackend  storage.Backend
-	Database        string
-	Tier            string
-	BatchNumber     int      // 1-based batch index within the partition (0 = not batched)
-	TempDirectory   string   // Base temp directory for compaction files (default: ./data/compaction)
-	SortKeys        []string // Sort keys for this measurement (for ORDER BY in compaction)
-	Logger          zerolog.Logger
-	DB              *sql.DB          // Shared DuckDB connection (avoids memory retention from temp connections)
-	ManifestManager *ManifestManager // Manifest manager for crash recovery (optional, recommended)
+	Measurement    string
+	PartitionPath  string
+	Files          []string
+	StorageBackend storage.Backend
+	Database       string
+	Tier           string
+	BatchNumber    int      // 1-based batch index within the partition (0 = not batched)
+	TempDirectory  string   // Base temp directory for compaction files (default: ./data/compaction)
+	SortKeys       []string // Sort keys for this measurement (for ORDER BY in compaction)
+	// SortKeysExplicit — see Job.SortKeysExplicit.
+	SortKeysExplicit bool
+	Logger           zerolog.Logger
+	DB               *sql.DB          // Shared DuckDB connection (avoids memory retention from temp connections)
+	ManifestManager  *ManifestManager // Manifest manager for crash recovery (optional, recommended)
 
 	// CompletionDir is the Phase 4 cluster-mode completion-manifest directory.
 	// When non-empty, the job writes a local-disk CompletionManifest at each
@@ -211,6 +267,9 @@ type JobConfig struct {
 	// describes every file of Files as the cluster manifest lists it.
 	Staged bool
 	Inputs map[string]StagedInput
+	// OutputName is the output file name the parent chose (OpenJobs);
+	// empty names it here, as before.
+	OutputName string
 
 	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
 	// so the parent (which spawns the subprocess) and the subprocess agree
@@ -260,6 +319,7 @@ func NewJob(cfg *JobConfig) *Job {
 		BatchNumber:             cfg.BatchNumber,
 		TempDirectory:           tempDir,
 		SortKeys:                sortKeys,
+		SortKeysExplicit:        cfg.SortKeysExplicit,
 		JobID:                   jobID,
 		Status:                  JobStatusPending,
 		CompletionDir:           cfg.CompletionDir,
@@ -270,6 +330,7 @@ func NewJob(cfg *JobConfig) *Job {
 		logger:                  cfg.Logger.With().Str("job_id", jobID).Logger(),
 		db:                      cfg.DB,
 		manifestManager:         cfg.ManifestManager,
+		outputName:              cfg.OutputName,
 	}
 }
 
@@ -302,7 +363,8 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Phase 4: write an initial completion manifest in writing_output state.
 	// This marks the job as in-progress so CleanupOrphanedCompletionManifests
-	// can sweep it if the subprocess crashes before reaching output_written.
+	// can sweep it if the subprocess crashes before reaching output_written;
+	// the parent also drops it once this process exits (#1343).
 	if j.clusterMode() {
 		m := &CompletionManifest{
 			JobID:         j.JobID,
@@ -743,14 +805,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// on the clock alone. The uploaded storage key derives from this basename
 	// (see Job.Run), so a collision here would silently overwrite a sibling
 	// batch's compacted output.
-	now := storage.NameTime(time.Now())
-	timestamp := now.Format("20060102_150405")
-	suffix := "compacted"
-	if j.Tier != "hourly" {
-		suffix = j.Tier
-	}
-	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%d_b%d_%s.parquet",
-		j.Measurement, timestamp, now.UnixNano(), j.BatchNumber, suffix))
+	outputFile := filepath.Join(tempDir, j.outputFileName())
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
@@ -826,9 +881,21 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		return "", errNoTimeColumn
 	}
 
-	// Build ORDER BY clause from sort keys
-	// This ensures compacted files maintain the same sort order as ingested files
-	orderByClause := buildOrderByClause(j.SortKeys)
+	// Build ORDER BY clause from sort keys: the ingest order (keys, then time)
+	// within each hour. Keys these files have no column for are left out.
+	sortKeys, droppedKeys := compactionSortKeys(j.SortKeys, columns)
+	if len(droppedKeys) > 0 {
+		// A key configured for this measurement and missing from its files is
+		// worth an operator's attention. A default_sort_keys key is normal to
+		// be missing from measurements without that column, every cycle.
+		lvl := zerolog.DebugLevel
+		if j.SortKeysExplicit {
+			lvl = zerolog.WarnLevel
+		}
+		j.logger.WithLevel(lvl).Strs("missing_sort_keys", droppedKeys).Strs("sort_keys", sortKeys).
+			Msg("Compacting without sort keys these files have no column for")
+	}
+	orderByClause := buildOrderByClause(sortKeys)
 
 	// Auto-dedup: decide from the files' metadata how this batch removes
 	// duplicate rows (see decideDedup).
@@ -1270,13 +1337,9 @@ func (j *Job) complete() error {
 		compressionRatio = (1 - float64(j.BytesAfter)/float64(j.BytesBefore)) * 100
 	}
 
-	// Record metrics
-	m := metrics.Get()
-	m.IncCompactionJobs()
-	m.IncCompactionSuccess()
-	m.IncCompactionFilesCompacted(int64(j.FilesCompacted))
-	m.IncCompactionBytesRead(j.BytesBefore)
-	m.IncCompactionBytesWritten(j.BytesAfter)
+	// No metrics here: a Job runs only in the compaction subprocess, whose
+	// registry nothing scrapes. The parent counts the outcome from the
+	// result (Manager.compactPartition, #1343).
 
 	j.logger.Info().
 		Int("files_compacted", j.FilesCompacted).
@@ -1303,10 +1366,7 @@ func (j *Job) fail(err error) error {
 		j.DurationSeconds = now.Sub(*j.StartedAt).Seconds()
 	}
 
-	// Record metrics
-	m := metrics.Get()
-	m.IncCompactionJobs()
-	m.IncCompactionFailed()
+	// Counted by the parent from the result; see complete (#1343).
 
 	j.logger.Error().Err(err).Msg("Compaction job failed")
 
@@ -1433,4 +1493,26 @@ func canonicalManifestDatabase(database string) string {
 		return rest
 	}
 	return database
+}
+
+// CompactionOutputName is a compaction output's file name:
+// {measurement}_{YYYYMMDD}_{HHMMSS}_{unixnano}_b{batch}_{suffix}.parquet, the
+// suffix "compacted" for the hourly tier and the tier name otherwise.
+func CompactionOutputName(measurement, tier string, batch int, at time.Time) string {
+	now := storage.NameTime(at)
+	suffix := "compacted"
+	if tier != "hourly" {
+		suffix = tier
+	}
+	return fmt.Sprintf("%s_%s_%d_b%d_%s.parquet",
+		measurement, now.Format("20060102_150405"), now.UnixNano(), batch, suffix)
+}
+
+// outputFileName is the output's file name: the parent's choice when it made
+// one (OpenJobs registered it), else named here.
+func (j *Job) outputFileName() string {
+	if j.outputName != "" {
+		return j.outputName
+	}
+	return CompactionOutputName(j.Measurement, j.Tier, j.BatchNumber, time.Now())
 }

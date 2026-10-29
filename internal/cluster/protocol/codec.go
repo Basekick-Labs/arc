@@ -247,6 +247,20 @@ func unmarshalPayload(msgType MessageType, payload []byte) (interface{}, error) 
 		}
 		return &reply, nil
 
+	case MsgLocalPoliciesQuery:
+		var q LocalPoliciesQuery
+		if err := json.Unmarshal(payload, &q); err != nil {
+			return nil, err
+		}
+		return &q, nil
+
+	case MsgLocalPoliciesReply:
+		var reply LocalPoliciesReply
+		if err := json.Unmarshal(payload, &reply); err != nil {
+			return nil, err
+		}
+		return &reply, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msgType)
 	}

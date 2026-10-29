@@ -168,11 +168,13 @@ func (c *TimeSeriesCollector) collect() {
 			"storage_read_bytes_total":  m.storageReadBytesTotal.Load(),
 			"storage_errors_total":      m.storageErrorsTotal.Load(),
 			// Compaction
-			"compaction_jobs_total":    m.compactionJobsTotal.Load(),
-			"compaction_jobs_success":  m.compactionJobsSuccess.Load(),
-			"compaction_jobs_failed":   m.compactionJobsFailed.Load(),
-			"compaction_bytes_read":    m.compactionBytesRead.Load(),
-			"compaction_bytes_written": m.compactionBytesWritten.Load(),
+			"compaction_jobs_total":       m.compactionJobsTotal.Load(),
+			"compaction_jobs_success":     m.compactionJobsSuccess.Load(),
+			"compaction_jobs_failed":      m.compactionJobsFailed.Load(),
+			"compaction_jobs_interrupted": m.compactionJobsInterrupted.Load(),
+			"compaction_files_compacted":  m.compactionFilesCompacted.Load(),
+			"compaction_bytes_read":       m.compactionBytesRead.Load(),
+			"compaction_bytes_written":    m.compactionBytesWritten.Load(),
 		},
 	})
 

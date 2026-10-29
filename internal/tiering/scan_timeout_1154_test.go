@@ -110,7 +110,7 @@ func TestTruncatedWalkReportsPartialCountsAndFlag(t *testing.T) {
 		}
 	}()
 
-	result, _, err := m.scanTiers(scanCtx)
+	result, err := m.scanTiers(scanCtx)
 	if result == nil {
 		t.Fatal("the result is never nil, even on truncation")
 	}
@@ -171,7 +171,7 @@ func TestScanTiersCopiesHotRowsWritten(t *testing.T) {
 		}
 	}
 
-	result, _, err := m.scanTiers(ctx)
+	result, err := m.scanTiers(ctx)
 	if err != nil {
 		t.Fatalf("scanTiers: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestInCycleScanIsNotRefusedByARunningApiScan(t *testing.T) {
 	}
 	defer m.scanRunning.Store(false)
 
-	if _, _, err := m.scanTiers(context.Background()); errors.Is(err, ErrScanRunning) {
+	if _, err := m.scanTiers(context.Background()); errors.Is(err, ErrScanRunning) {
 		t.Fatal("the in-cycle scan was refused while an API scan held the latch; the cycle would migrate on stale rows")
 	}
 }
@@ -385,7 +385,7 @@ func TestLastScanIsRecordedIncludingTruncation(t *testing.T) {
 		t.Fatal("precondition: nothing recorded before the first scan")
 	}
 
-	if _, _, err := m.scanTiers(context.Background()); err != nil {
+	if _, err := m.scanTiers(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	last, at := m.LastScan()
@@ -403,7 +403,7 @@ func TestLastScanIsRecordedIncludingTruncation(t *testing.T) {
 	// that pointer and hands it to HTTP responses and callbacks, so storing
 	// it rather than a copy would let any later annotation rewrite what this
 	// node reports as its last scan.
-	scanned, _, err := m.scanTiers(context.Background())
+	scanned, err := m.scanTiers(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +421,7 @@ func TestLastScanIsRecordedIncludingTruncation(t *testing.T) {
 	dead, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
 	time.Sleep(2 * time.Millisecond)
-	if _, _, err := m.scanTiers(dead); err == nil {
+	if _, err := m.scanTiers(dead); err == nil {
 		t.Fatal("expected the expired scan to fail")
 	}
 	if truncatedLast, _ := m.LastScan(); truncatedLast == nil || !truncatedLast.Truncated {
@@ -443,7 +443,7 @@ func TestLastScanIsRaceFree(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
-				_, _, _ = m.scanTiers(context.Background())
+				_, _ = m.scanTiers(context.Background())
 			}
 		}()
 	}

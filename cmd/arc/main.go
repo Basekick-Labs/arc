@@ -9,11 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +27,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/credscrub"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/edgesync"
 	"github.com/basekick-labs/arc/internal/fieldschema"
@@ -449,6 +448,7 @@ func main() {
 		MemoryLimit:            cfg.Database.MemoryLimit,
 		ThreadCount:            cfg.Database.ThreadCount,
 		EnableWAL:              cfg.Database.EnableWAL,
+		Extensions:             cfg.Database.Extensions,
 		TempDirectory:          cfg.Database.TempDirectory,
 		PreserveInsertionOrder: cfg.Database.PreserveInsertionOrder,
 		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)
@@ -477,6 +477,13 @@ func main() {
 		// Primary-backend signal for Azure (mirrors S3IsPrimaryBackend): only an
 		// azure/azblob primary backend provisions a primary Azure secret.
 		AzureIsPrimaryBackend: cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob",
+		// GCS primary (#1105): DuckDB reads gs:// with an Arc-managed bearer
+		// token resolved from the same identity as the storage backend.
+		GCSIsPrimaryBackend: cfg.Storage.Backend == "gcs",
+		GCSBucket:           cfg.Storage.GCSBucket,
+		GCSPrefix:           cfg.Storage.GCSPrefix,
+		GCSEndpoint:         cfg.Storage.GCSEndpoint,
+		GCSCredentialsFile:  cfg.Storage.GCSCredentialsFile,
 		// Cold-tier sandbox allowlist entries. The cold tier may use a
 		// different bucket/container from the primary backend (commonly
 		// hot=local + cold=S3 on Enterprise); the sandbox must allow both.
@@ -487,6 +494,12 @@ func main() {
 		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
 		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
 		ColdAzurePrefix:    cfg.TieredStorage.Cold.AzurePrefix,
+		// GCS cold (#1105): only when this node builds a GCS cold tier
+		// (tiering on, cold on, backend gcs), unlike the S3/Azure fields
+		// above, so a leftover tiered_storage.cold.gcs_bucket neither widens
+		// the allowlist nor loads httpfs at boot.
+		ColdGCSBucket: coldGCSField(cfg, cfg.TieredStorage.Cold.GCSBucket),
+		ColdGCSPrefix: coldGCSField(cfg, cfg.TieredStorage.Cold.GCSPrefix),
 		// Local storage root used by the DuckDB sandbox to whitelist
 		// Arc-managed file paths in allowed_directories. Always populated
 		// regardless of the configured backend; on S3/Azure-only deployments
@@ -501,6 +514,7 @@ func main() {
 		EnableS3Cache:     cfg.Query.EnableS3Cache,
 		S3CacheSize:       cfg.Query.S3CacheSize,
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
+		ExternalFileCache: cfg.Database.ExternalFileCache,
 		// arcx loader (cleared above when license does not permit)
 		ArcxExtensionPath: arcxPath,
 		// arcx storage root for the partition_agg table function. Only set
@@ -705,7 +719,9 @@ func main() {
 		dbConfig.S3Bucket == "" &&
 		dbConfig.ColdS3Bucket == "" &&
 		dbConfig.AzureContainer == "" &&
-		dbConfig.ColdAzureContainer == "" {
+		dbConfig.ColdAzureContainer == "" &&
+		dbConfig.GCSBucket == "" &&
+		dbConfig.ColdGCSBucket == "" {
 		log.Fatal().Msg("sandbox allowlist would be empty — every file-touching query would fail; check arc.toml [storage] and [database] config")
 	}
 
@@ -823,7 +839,7 @@ func main() {
 	// The switch is on the raw cfg.Storage.Backend so the accepted set is
 	// exactly what it has always been: config.Load lowercases and trims
 	// storage.backend before anything reads it, and already refuses anything
-	// outside the five aliases with "storage.backend %q is invalid". The
+	// outside the six aliases with "storage.backend %q is invalid". The
 	// default below is therefore unreachable through config today; it keeps its
 	// wording so a caller that ever bypasses that validation still Fatals here,
 	// before a backend is built.
@@ -935,12 +951,38 @@ func main() {
 				Msg("Storage backend initialized")
 		}
 
+	case "gcs":
+		// Credentials are never logged: only whether a key file is in use.
+		storageSpec.GCS = storage.GCSConfig{
+			Bucket:          cfg.Storage.GCSBucket,
+			Prefix:          cfg.Storage.GCSPrefix,
+			CredentialsFile: cfg.Storage.GCSCredentialsFile,
+			Endpoint:        cfg.Storage.GCSEndpoint,
+		}
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", "gcs").
+				Str("bucket", cfg.Storage.GCSBucket).
+				Str("prefix", cfg.Storage.GCSPrefix).
+				Str("endpoint", cfg.Storage.GCSEndpoint).
+				Msg("Failed to initialize Google Cloud Storage backend")
+		}
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", "gcs").
+				Str("bucket", cfg.Storage.GCSBucket).
+				Str("prefix", cfg.Storage.GCSPrefix).
+				Str("endpoint", cfg.Storage.GCSEndpoint).
+				Bool("credentials_file", cfg.Storage.GCSCredentialsFile != "").
+				Msg("Storage backend initialized")
+		}
+
 	default:
-		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
+		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', 'azblob', or 'gcs')")
 	}
 
 	// log.Fatal in the default case exits the process, so by here the backend
-	// type is one of the five aliases and both logStorageFatal and
+	// type is one of the six aliases and both logStorageFatal and
 	// logStorageReady carry that case's wording rather than the generic
 	// fallbacks they were declared with.
 	storageBackend, err = storage.NewBackend(storageSpec, logger.Get("storage"))
@@ -984,7 +1026,7 @@ func main() {
 		if cfg.Storage.Backend == "local" {
 			log.Fatal().
 				Str("backend", cfg.Storage.Backend).
-				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, or azblob); local-filesystem backend cannot be shared across writers")
+				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, azblob or gcs); local-filesystem backend cannot be shared across writers")
 		}
 		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone {
 			log.Fatal().
@@ -1013,6 +1055,7 @@ func main() {
 			MaxAge:       time.Duration(cfg.WAL.MaxAgeSeconds) * time.Second,
 			BufferSize:   cfg.WAL.BufferSize,
 			SyncBytes:    cfg.WAL.SyncBytes,
+			AckMode:      wal.AckMode(cfg.WAL.AckMode),
 			Logger:       logger.Get("wal"),
 		})
 		if err != nil {
@@ -1055,6 +1098,11 @@ func main() {
 		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
+	// Ingest counts rows stamped past file-level time pruning's margin
+	// whether or not the feature is on (it is by default), so the risk is
+	// visible on every node that flushes. Set before WAL recovery and the
+	// first flushes.
+	arrowBuffer.SetFutureStampMargin(time.Duration(cfg.Query.FileTimePruningMarginSeconds) * time.Second)
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
@@ -2171,11 +2219,12 @@ func main() {
 								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
 									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
 							}
-							var holds func(string) bool
+							// A typed nil would be a non-nil interface.
+							var holder cluster.StagedRegistrationHolder
 							if registrationOutbox != nil {
-								holds = registrationOutbox.HoldsRegistration
+								holder = registrationOutbox
 							}
-							clusterCoordinator.SetStagedCompactionHooks(watcher.HasStagedJob, holds)
+							clusterCoordinator.SetStagedCompactionHooks(watcher.HasStagedJob, holder)
 						}
 					}
 					clusterCoordinator.SetCompactionQuiescer(newCompactionQuiescer(
@@ -2637,6 +2686,11 @@ func main() {
 		// /api/v1/logs, by contrast, is NOT public — it is registered with admin
 		// auth below.
 		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/api/v1/metrics")
+		// A peer forwards a request with a signed identity instead of the
+		// caller's credential (#1305).
+		if clusterCoordinator != nil {
+			middlewareConfig.ForwardIdentity = api.ForwardIdentityVerifier(clusterCoordinator)
+		}
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
 
 		// Register the admin-authenticated logs route AFTER the auth
@@ -2755,6 +2809,17 @@ func main() {
 						}
 					},
 				)
+				// Both callback sets are wired: from here a snapshot install
+				// reconciles the local tables, and once this node has caught
+				// up with the leader they are reconciled for everything
+				// applied before the callbacks existed (#1336).
+				authReconcileCtx, authReconcileCancel := context.WithCancel(context.Background())
+				shutdownCoordinator.RegisterHook("cluster-auth-reconcile-cancel", func(context.Context) error {
+					authReconcileCancel()
+					return nil
+				}, 5)
+				startAuthReconcile(authReconcileCtx, fsm, clusterCoordinator, authManager.GetDB(), authManager, rbacManager,
+					authReconcileRetry, logger.Get("auth-reconcile"))
 				rbacProposer := cluster.NewCoordinatorAuthProposer(clusterCoordinator)
 				if rbacProposer != nil {
 					rbacManager.SetRaftProposer(rbacProposer)
@@ -3650,7 +3715,51 @@ func main() {
 	}
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
+	} else {
+		log.Info().Msg("File-level time pruning disabled (query.file_time_pruning = false)")
 	}
+	// Reads count each compaction's rows once while its output and inputs are
+	// both readable: this node's own legacy jobs (seeded from surviving
+	// manifests before any query is served), and in a cluster the staged jobs
+	// and this node's pending local deletes, on every node whether or not it
+	// compacts.
+	var compactionJobs, clusterOpen api.OpenCompactions
+	if compactionManager != nil {
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		compactionManager.SyncOpenJobs(syncCtx)
+		syncCancel()
+		compactionJobs = compactionManager.OpenJobs
+		if cfg.Query.EnableS3Cache {
+			// A listing cached before a job's output appeared would lack it
+			// while its inputs are already left out of reads.
+			compactionManager.OpenJobs.SetOnOutputSeen(db.ClearHTTPCache)
+		}
+	}
+	if clusterCoordinator != nil {
+		clusterOpen = clusterOpenCompactions{clusterCoordinator}
+		if cfg.Query.EnableS3Cache {
+			clusterCoordinator.SetOnObjectOutputSeen(db.ClearHTTPCache)
+		}
+	}
+	// Standalone: a file a row DELETE replaced is left out of reads while it
+	// is still in storage next to its replacement (seeded from the DELETE
+	// journal before any query is served).
+	var retiredReads *api.RetiredReads
+	var retiredOpen api.OpenCompactions
+	if clusterCoordinator == nil {
+		retiredReads = api.NewRetiredReads(storageBackend)
+		seedCtx, seedCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := retiredReads.Seed(seedCtx); err != nil {
+			log.Warn().Err(err).Msg("Could not read the DELETE journal at start; files it names are read until removed")
+		}
+		seedCancel()
+		if cfg.Query.EnableS3Cache {
+			retiredReads.SetOnSeen(db.ClearHTTPCache)
+		}
+		retiredOpen = retiredReads
+	}
+	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
+	queryHandler.SetOpenCompactions(openCompactions)
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
 	// pruner cache janitor — sweeps expired globCache / partitionCache
@@ -3824,6 +3933,82 @@ func main() {
 		}
 	}
 
+	// Query cache invalidation, after compaction, retention or DELETE removed files.
+	// After compaction deletes old parquet files, DuckDB's cache_httpfs still holds
+	// cached glob results (directory listings) pointing to deleted files, causing 404s.
+	// This callback clears all relevant caches in the parent process after each
+	// successful compaction job. See: https://github.com/Basekick-Labs/arc/issues/204
+	// Logged exactly once per process when cluster mode is up but
+	// cluster.shared_secret is empty — the per-compaction Warn would
+	// otherwise spam the log every compaction (hourly + daily).
+	var fanOutSkipLogOnce sync.Once
+
+	// Build a single shared *http.Client for the cache-invalidate
+	// fan-out so connection pooling actually reuses sockets across
+	// compactions. Only constructed when cluster mode is on —
+	// compaction itself works in OSS/standalone, but the fan-out
+	// path is cluster-only (the per-call `if clusterCoordinator
+	// != nil` guard inside the callback is what actually decides
+	// whether to send). We reuse the coordinator's already-loaded
+	// *tls.Config rather than re-reading cert/key/CA from disk;
+	// when cluster.tls_enabled is false the getter returns nil
+	// and the transport falls back to plaintext (or system roots
+	// if the URL is https://). No Client.Timeout: the per-request
+	// context.WithTimeout in invalidatePeerQueryCaches is the policy bound; an extra
+	// Client.Timeout would be redundant dead config.
+	var clusterHTTPClient *http.Client
+	var clusterScheme string
+	if clusterCoordinator != nil {
+		clusterHTTPClient = &http.Client{
+			Transport: security.NewClusterHTTPTransport(clusterCoordinator.ClusterTLSConfig()),
+		}
+		clusterScheme = security.SchemeForServer(cfg.Server.TLSEnabled)
+		log.Info().
+			Str("scheme", clusterScheme).
+			Bool("cluster_tls", cfg.Cluster.TLSEnabled).
+			Msg("Cache-invalidate fan-out transport initialised")
+	}
+
+	invalidateQueryCaches := func() {
+		// Local invalidation
+		db.ClearHTTPCache()
+		queryHandler.InvalidateCaches()
+
+		// Distributed invalidation (enterprise clustering)
+		// Notify all query-capable nodes to clear their caches too
+		if clusterCoordinator != nil {
+			registry := clusterCoordinator.GetRegistry()
+			localNode := registry.Local()
+			if localNode == nil {
+				return
+			}
+
+			// Skip the HTTP fan-out entirely when no cluster shared
+			// secret is configured. The receiving end refuses every
+			// request in that state (see handleCacheInvalidate), so
+			// sending would be a waste. Wrapped in sync.Once so the
+			// operator sees the explanation exactly once at first
+			// invalidation, not on every subsequent run.
+			if cfg.Cluster.SharedSecret == "" {
+				fanOutSkipLogOnce.Do(func() {
+					log.Warn().Msg("cluster cache invalidation skipped: cluster.shared_secret is not configured; each node's local in-process invalidation already ran. Set cluster.shared_secret to enable fan-out.")
+				})
+				return
+			}
+
+			targets := registry.GetReaders()
+			targets = append(targets, registry.GetWriters()...)
+
+			for _, node := range targets {
+				if node.ID == localNode.ID {
+					continue
+				}
+				go invalidatePeerQueryCaches(clusterHTTPClient, clusterScheme, node,
+					cfg.Cluster.SharedSecret, localNode.ID, cfg.Cluster.ClusterName, log.Logger)
+			}
+		}
+	}
+
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
 		// compactionAPIGate wraps the same gate value the schedulers consult,
@@ -3833,133 +4018,7 @@ func main() {
 		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, compactionAPIGate, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
 
-		// Wire post-compaction cache invalidation.
-		// After compaction deletes old parquet files, DuckDB's cache_httpfs still holds
-		// cached glob results (directory listings) pointing to deleted files, causing 404s.
-		// This callback clears all relevant caches in the parent process after each
-		// successful compaction job. See: https://github.com/Basekick-Labs/arc/issues/204
-		// Logged exactly once per process when cluster mode is up but
-		// cluster.shared_secret is empty — the per-compaction Warn would
-		// otherwise spam the log every compaction (hourly + daily).
-		var fanOutSkipLogOnce sync.Once
-
-		// Build a single shared *http.Client for the cache-invalidate
-		// fan-out so connection pooling actually reuses sockets across
-		// compactions. Only constructed when cluster mode is on —
-		// compaction itself works in OSS/standalone, but the fan-out
-		// path is cluster-only (the per-call `if clusterCoordinator
-		// != nil` guard inside the callback is what actually decides
-		// whether to send). We reuse the coordinator's already-loaded
-		// *tls.Config rather than re-reading cert/key/CA from disk;
-		// when cluster.tls_enabled is false the getter returns nil
-		// and the transport falls back to plaintext (or system roots
-		// if the URL is https://). No Client.Timeout: the per-request
-		// context.WithTimeout below is the policy bound; an extra
-		// Client.Timeout would be redundant dead config.
-		var clusterHTTPClient *http.Client
-		var clusterScheme string
-		if clusterCoordinator != nil {
-			clusterHTTPClient = &http.Client{
-				Transport: security.NewClusterHTTPTransport(clusterCoordinator.ClusterTLSConfig()),
-			}
-			clusterScheme = security.SchemeForServer(cfg.Server.TLSEnabled)
-			log.Info().
-				Str("scheme", clusterScheme).
-				Bool("cluster_tls", cfg.Cluster.TLSEnabled).
-				Msg("Post-compaction cache-invalidate fan-out transport initialised")
-		}
-
-		compactionManager.SetOnCompactionComplete(func() {
-			// Local invalidation
-			db.ClearHTTPCache()
-			queryHandler.InvalidateCaches()
-
-			// Distributed invalidation (enterprise clustering)
-			// Notify all query-capable nodes to clear their caches too
-			if clusterCoordinator != nil {
-				registry := clusterCoordinator.GetRegistry()
-				localNode := registry.Local()
-				if localNode == nil {
-					return
-				}
-
-				// Skip the HTTP fan-out entirely when no cluster shared
-				// secret is configured. The receiving end refuses every
-				// request in that state (see handleCacheInvalidate), so
-				// sending would be a waste. Wrapped in sync.Once so the
-				// operator sees the explanation exactly once at first
-				// compaction, not on every subsequent run.
-				if cfg.Cluster.SharedSecret == "" {
-					fanOutSkipLogOnce.Do(func() {
-						log.Warn().Msg("post-compaction cluster cache invalidation skipped: cluster.shared_secret is not configured; each node's local in-process invalidation already ran. Set cluster.shared_secret to enable fan-out.")
-					})
-					return
-				}
-
-				targets := registry.GetReaders()
-				targets = append(targets, registry.GetWriters()...)
-
-				for _, node := range targets {
-					if node.ID == localNode.ID {
-						continue
-					}
-					go func(n *cluster.Node) {
-						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-						defer cancel()
-
-						// Compute the HMAC once per request: a fresh nonce
-						// (32 random bytes, hex-encoded) binds the MAC to a
-						// single attempt; the timestamp binds it to a
-						// 5-minute freshness window. Receiver replay-checks
-						// (nonce, sender nodeID) against its NonceCache.
-						nonce, err := security.GenerateNonce()
-						if err != nil {
-							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to generate nonce for cache invalidation")
-							return
-						}
-						ts := time.Now().Unix()
-						mac := security.ComputeCacheInvalidateHMAC(
-							cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
-						)
-
-						// Build via *url.URL so an IPv6 literal in
-						// n.APIAddress (e.g. "[::1]:8000") survives
-						// unmangled. CacheInvalidatePath is a known-safe
-						// constant path, so we don't need to escape it.
-						peerURL := (&url.URL{
-							Scheme: clusterScheme,
-							Host:   n.APIAddress,
-							Path:   api.CacheInvalidatePath,
-						}).String()
-						req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, nil)
-						if err != nil {
-							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
-							return
-						}
-						req.Header.Set("X-Arc-Node-ID", localNode.ID)
-						req.Header.Set("X-Arc-Cluster", cfg.Cluster.ClusterName)
-						req.Header.Set("X-Arc-Nonce", nonce)
-						req.Header.Set("X-Arc-Timestamp", strconv.FormatInt(ts, 10))
-						req.Header.Set("X-Arc-HMAC", mac)
-
-						resp, err := clusterHTTPClient.Do(req)
-						if err != nil {
-							log.Warn().Err(err).Str("node_id", n.ID).Str("address", n.APIAddress).
-								Msg("Failed to invalidate cache on remote node")
-							return
-						}
-						defer resp.Body.Close()
-						_, _ = io.Copy(io.Discard, resp.Body)
-						if resp.StatusCode != http.StatusNoContent {
-							log.Warn().Int("status", resp.StatusCode).Str("node_id", n.ID).
-								Msg("Unexpected status from cache invalidation")
-						} else {
-							log.Debug().Str("node_id", n.ID).Msg("Remote cache invalidated after compaction")
-						}
-					}(node)
-				}
-			}
-		})
+		compactionManager.SetOnCompactionComplete(invalidateQueryCaches)
 	}
 
 	// Register Delete handler
@@ -3970,6 +4029,7 @@ func main() {
 	// upload). Cross-handler reuse is fine because the filenames are unique
 	// via os.CreateTemp.
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
+	deleteHandler.SetOnFilesRemoved(invalidateQueryCaches)
 	if registrationOutbox != nil {
 		// A rewrite of a file still pending registration is announced in its
 		// place (#1210).
@@ -3984,11 +4044,24 @@ func main() {
 		// DELETE records are applied to pending files with the DELETE's own
 		// rewrite (#1207 d1).
 		clusterCoordinator.SetDeleteRewriter(deleteHandler.RewriteForRecords)
+	} else {
+		deleteHandler.SetRetiredReads(retiredReads)
 	}
+	// Settle the DELETE journal (files a DELETE replaced and could not
+	// remove, rewrites whose manifest change had an unknown outcome) at start
+	// and every minute, whether or not DELETE is enabled now. On a shared
+	// object store only the primary writer acts, decided at every tick.
+	retiredCtx, retiredCancel := context.WithCancel(context.Background())
+	shutdownCoordinator.RegisterHook("delete-retired-drainer", func(_ context.Context) error {
+		retiredCancel()
+		return nil
+	}, shutdown.PriorityHTTPServer)
+	deleteHandler.StartRetiredDrainer(retiredCtx)
 	if cfg.Delete.Enabled {
 		log.Info().
 			Int("confirmation_threshold", cfg.Delete.ConfirmationThreshold).
 			Int("max_rows_per_delete", cfg.Delete.MaxRowsPerDelete).
+			Bool("time_pruning", cfg.Delete.TimePruning).
 			Msg("Delete operations enabled")
 	} else {
 		log.Info().Msg("Delete operations DISABLED (set delete.enabled=true in arc.toml to enable)")
@@ -3997,6 +4070,7 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
+	databasesHandler.SetOnFilesRemoved(invalidateQueryCaches)
 	databasesHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
 	if registrationOutbox != nil {
 		databasesHandler.SetPendingRegistrations(registrationOutbox)
@@ -4024,9 +4098,16 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
+		retentionHandler.SetOnFilesRemoved(invalidateQueryCaches)
 		retentionHandler.RegisterRoutes(server.GetApp())
 		if clusterCoordinator != nil {
 			retentionHandler.SetCoordinator(clusterCoordinator)
+			// Cluster-wide retention policies (#1324): the lister answers
+			// the cluster's adoption, the mirror keeps this node's table
+			// equal to the cluster's once adopted.
+			retentionHandler.SetClusterSource(clusterCoordinator)
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindRetention, retentionHandler.LocalPolicyLister())
+			clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindRetention, retentionHandler.MirrorClusterPolicies)
 		}
 		shutdownCoordinator.RegisterHook("retention", func(ctx context.Context) error {
 			return retentionHandler.Close()
@@ -4034,6 +4115,12 @@ func main() {
 		log.Info().Str("db_path", cfg.Retention.DBPath).Msg("Retention policies enabled")
 	} else {
 		log.Info().Msg("Retention policies DISABLED")
+		if clusterCoordinator != nil {
+			// Retention runs nothing here, but this node's database may
+			// still hold the policies of when it did: they count in the
+			// cluster's adoption (their IDs above all).
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindRetention, api.RetentionTableLister(authManager, cfg.Retention.DBPath))
+		}
 	}
 
 	// Iceberg export (opt-in). Publishes Arc's existing Parquet as Iceberg tables via a
@@ -4095,6 +4182,14 @@ func main() {
 		// earlier run still sits in storage, and the reads must be fresh.
 		icebergSource.SetPendingOutputs(compaction.NewManifestManager(storageBackend, logger.Get("compaction")).PendingOutputsUnder)
 		log.Info().Msg("Iceberg export leaves in-flight compaction outputs out of the table until their sources are deleted")
+		// On a local-storage cluster a delete reaches this disk after the
+		// manifest; files the cluster deleted stay out of the table meanwhile.
+		if clusterCoordinator != nil && storageBackend.Type() == "local" {
+			icebergSource.SetDeletedHere(clusterCoordinator.LocalCopyDeleted)
+			if !clusterCoordinator.TracksLocalCopies() {
+				log.Warn().Msg("Iceberg export on a local-storage cluster without local copy tracking (cluster.replication_enabled, cluster.replication_catchup_enabled and cluster.raft_data_dir): a pass that runs between a compaction, DELETE or retention removing a file from the manifest and this node unlinking it publishes the deleted file next to the one holding its rows, so external readers can see those rows twice")
+			}
+		}
 		// On an edge-sync hub, received data lives one level deeper
 		// ({spoke}/{db}/{meas}/…), so the walk must expand spoke namespaces or
 		// it exports {spoke}/{db} as a single table unioning every measurement
@@ -4142,12 +4237,20 @@ func main() {
 		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
 		if err == nil {
 			cqHandler.SetFieldSchema(fieldSchemaRegistry)
+			cqHandler.SetOpenCompactions(openCompactions)
 		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
 		}
 		if clusterCoordinator != nil {
 			cqHandler.SetCoordinator(clusterCoordinator)
+			// Cluster-wide continuous queries (#1324): the lister answers
+			// the cluster's adoption; the mirror keeps this node's tables
+			// equal to the cluster's once adopted and keeps every node's
+			// scheduler jobs on the cluster's CQs.
+			cqHandler.SetClusterSource(clusterCoordinator)
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindCQ, cqHandler.LocalPolicyLister())
+			clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindCQ, cqHandler.MirrorClusterPolicies)
 		}
 		cqHandler.RegisterRoutes(server.GetApp())
 		shutdownCoordinator.RegisterHook("continuous-query", func(ctx context.Context) error {
@@ -4156,6 +4259,11 @@ func main() {
 		log.Info().Str("db_path", cfg.ContinuousQuery.DBPath).Msg("Continuous queries enabled")
 	} else {
 		log.Info().Msg("Continuous queries DISABLED")
+		if clusterCoordinator != nil {
+			// Runs none here, but its database may still hold continuous
+			// queries of when it did: they count in the cluster's adoption.
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindCQ, api.CQTableLister(authManager, cfg.ContinuousQuery.DBPath))
+		}
 	}
 
 	// Shared-storage mode without a running cluster coordinator: every
@@ -4265,13 +4373,13 @@ func main() {
 	// enabled, runs on cron with conservative grace window + blast cap.
 	var reconciliationScheduler *reconciliation.Scheduler
 	if cfg.Reconciliation.Enabled && clusterCoordinator != nil {
-		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled)
-		if !isSharedBackend(cfg.Storage.Backend) && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.ReplicationCatchUpEnabled {
-			log.Warn().Msg("cluster.replication_catchup_enabled=false: the reconciler's orphan-manifest sweep is not held until file replication has converged on this node, and a node restored with an empty data disk does not pull back the files it originated. Keep reconciliation in dry run after such a restore, or re-enable the catch-up walker.")
+		gate, backendKind := newReconciliationTopology(clusterCoordinator, storageBackend, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled)
+		for _, msg := range reconciliationStartupWarnings(gate.shared, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled, clusterCoordinator.HasCompactorFailover()) {
+			log.Warn().Msg(msg)
 		}
 		recCfg := reconciliation.Config{
 			Enabled:     true,
-			BackendKind: reconciliationBackendKind(cfg.Storage.Backend),
+			BackendKind: backendKind,
 			// The coordinator's id, not the raw config value: it generates
 			// one when cluster.node_id is unset, and it is what every
 			// producer of OriginNodeID stamps into manifest entries. The raw
@@ -4311,7 +4419,7 @@ func main() {
 			})
 			// A compaction output manifest repair adopts is not an orphan
 			// either, whichever of the two gets to it first (#1214).
-			reconciler.SetAdoptableFilter(clusterCoordinator.AdoptableObject)
+			reconciler.SetAdoptableFilter(clusterCoordinator.ReconcilerKeeps)
 		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")
@@ -4396,7 +4504,7 @@ func main() {
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
 			} else {
-				// Create cold tier backend (S3 or Azure)
+				// Create cold tier backend (S3, Azure or GCS)
 				//
 				// coldBackend is only ever assigned from a successful
 				// storage.NewBackend, which never returns a typed nil inside a
@@ -4407,7 +4515,7 @@ func main() {
 				// query router's cold glob — would otherwise pass and then
 				// dereference a nil receiver.
 				//
-				// Only s3 and azure are accepted, each with its own logger name
+				// Only s3, azure and gcs are accepted, each with its own logger name
 				// and its own error wording. There is no default case, and what
 				// makes that safe is a CONJUNCTION, not one flag: config.Load
 				// refuses an invalid value with "tiered_storage.cold.backend %q
@@ -4477,8 +4585,40 @@ func main() {
 						} else {
 							coldBackend = b
 						}
+
+					case "gcs":
+						// Role cold: Application Default Credentials resolve
+						// on first use, as the S3 and Azure chains do, so a
+						// node without credentials yet still builds the tier
+						// and its reads fail loudly rather than skip it.
+						coldSpec := storage.BackendSpec{
+							Type: "gcs",
+							GCS: storage.GCSConfig{
+								Bucket:          cold.GCSBucket,
+								Prefix:          cold.GCSPrefix,
+								CredentialsFile: cold.GCSCredentialsFile,
+								Endpoint:        cold.GCSEndpoint,
+								Role:            storage.GCSRoleCold,
+							},
+						}
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-gcs")); err != nil {
+							// Same reason as the cold S3 site above.
+							log.Error().Err(err).
+								Str("bucket", cold.GCSBucket).
+								Str("prefix", cold.GCSPrefix).
+								Str("endpoint", cold.GCSEndpoint).
+								Msg("Failed to create cold tier GCS backend for tiering: the cold tier is unusable on this node until the configuration is fixed, and queries that need cold data answer 503")
+						} else {
+							coldBackend = b
+						}
 					}
 				}
+
+				// The backend is constructed separately from the tiering manager,
+				// so register its lifecycle independently. Do this before creating
+				// the manager as well: a manager-construction error must not leave
+				// the backend's transport open until process teardown.
+				registerTieringColdBackendShutdown(shutdownCoordinator, coldBackend)
 
 				// Where nodes share data — one hot bucket (shared-storage
 				// mode), or per-node disks kept in step by file replication
@@ -4521,6 +4661,16 @@ func main() {
 						tieringDB.Close()
 					}
 				} else {
+					// Cluster-wide tiering policies (#1324): once the cluster
+					// has seeded them, every node reads and writes the same
+					// policies through Raft instead of its own table.
+					if clusterCoordinator != nil {
+						if src := cluster.NewTieringPolicySource(clusterCoordinator); src != nil {
+							tieringManager.GetPolicies().SetClusterSource(src)
+							clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindTiering, cluster.TieringLocalLister(tieringManager.GetPolicies(), cfg.TieredStorage.DefaultHotMaxAgeDays))
+							clusterCoordinator.MirrorTieringPolicies(tieringManager.GetPolicies())
+						}
+					}
 					// The startup tier scan runs in the background below, and
 					// it writes through the same SQLite handle the shutdown
 					// step may close. Its context and completion channel are
@@ -4675,6 +4825,13 @@ func main() {
 				}
 			}
 		}
+	} else if clusterCoordinator != nil {
+		// Tiering is off here, so this node holds no tiering policy that
+		// ever applied: it answers the cluster's collect with none (#1324).
+		// A node whose tiering manager failed to start registers nothing
+		// and so holds the collect until it is fixed, rather than having
+		// its policies dropped.
+		clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindTiering, cluster.EmptyPolicyLister)
 	}
 
 	// A replicating local-storage cluster node reads a daily file that
@@ -4721,6 +4878,16 @@ func main() {
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
+		// Around every chunk of hot copies a migration releases, and when a
+		// replica records a pulled file's move to cold: a cold listing cached
+		// before the copy, or a hot glob cached before the release, would
+		// otherwise answer for a TTL without the moved file.
+		tieringManager.SetOnReadCachesStale(func() {
+			queryHandler.InvalidateCachesQuiet()
+			if cfg.Query.EnableS3Cache {
+				db.ClearHTTPCache()
+			}
+		})
 		// #687: on an edge-sync hub, tiering deletes of hot spoke files must
 		// mark their sync receipts first, or the spoke re-uploads duplicates.
 		// Wiring this also lifts the migrator's spoke-namespace gate.
@@ -4748,11 +4915,16 @@ func main() {
 		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
 		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly
 		cold := cfg.TieredStorage.Cold
+		// Only when the cold backend was built (all three): a cold tier whose
+		// construction failed is unusable, and #603's rule is that it is then
+		// ABSENT from /health rather than reported by a secret nothing reads
+		// through. Queries that need it answer 503 (refuseReadWithoutColdTier).
+		coldBuilt := tieringManager.ColdBackend() != nil
 		// Configure DuckDB for cold-tier S3 whenever cold tiering targets S3.
 		// Empty access/secret keys are valid: ConfigureS3 then provisions a
 		// CREDENTIAL_CHAIN secret so IAM roles / IRSA / env credentials work for
 		// tiered queries. A half-supplied key pair is rejected by ConfigureS3.
-		if cold.Enabled && cold.Backend == "s3" {
+		if coldBuilt && cold.Enabled && cold.Backend == "s3" {
 			if err := db.ConfigureS3(&database.S3Config{
 				Region:    cold.S3Region,
 				Endpoint:  cold.S3Endpoint,
@@ -4772,7 +4944,7 @@ func main() {
 		// Configure DuckDB for cold-tier Azure (scoped secret, separate from the
 		// primary Azure secret). Empty account key → credential chain (managed
 		// identity / env). Mirrors the cold-tier S3 path above.
-		if cold.Enabled && cold.Backend == "azure" {
+		if coldBuilt && cold.Enabled && cold.Backend == "azure" {
 			if err := db.ConfigureAzure(&database.AzureConfig{
 				ConnectionString: cold.AzureConnectionString,
 				AccountName:      cold.AzureAccountName,
@@ -4785,6 +4957,21 @@ func main() {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
 			} else {
 				log.Info().Msg("DuckDB configured with cold tier Azure credentials for multi-tier queries")
+			}
+		}
+
+		// Cold-tier GCS (#1105): an Arc-managed bearer-token secret from the
+		// cold tier's own identity, scoped to its bucket and prefix.
+		if coldBuilt && cold.Enabled && cold.Backend == "gcs" {
+			if err := db.ConfigureGCS(&database.GCSConfig{
+				Bucket:          cold.GCSBucket,
+				Prefix:          cold.GCSPrefix,
+				CredentialsFile: cold.GCSCredentialsFile,
+				Endpoint:        cold.GCSEndpoint,
+			}); err != nil {
+				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier GCS credentials")
+			} else {
+				log.Info().Msg("DuckDB configured with cold tier GCS credentials for multi-tier queries")
 			}
 		}
 	}
@@ -5063,6 +5250,14 @@ func main() {
 		return server.Shutdown(shutdownTimeout)
 	}, shutdown.PriorityHTTPServer)
 
+	// Clear credential material that earlier versions could leave in stored
+	// error messages (tiering, retention, continuous query and MQTT history,
+	// the edge-sync ledger), in every SQLite file that may hold them. After
+	// every subsystem has created its tables and before the node is marked
+	// ready, so no reader sees the old text. Once per column (credscrub
+	// keeps a marker), bounded, never fatal.
+	scrubStoredCredentialText(authManager, []string{cfg.Auth.DBPath, cfg.Retention.DBPath, cfg.ContinuousQuery.DBPath}, logger.Get("credscrub"))
+
 	// Mark /ready=200 so the load balancer (Pattern 2 multi-writer) starts
 	// routing traffic here. By this point WAL recovery has completed
 	// (cmd/arc/main.go:701-724), the Arrow buffer is initialised, the
@@ -5115,6 +5310,51 @@ var exitCode atomic.Int32
 // instance is not claimed. A restart policy that restarts only on failure
 // (systemd Restart=on-failure, Kubernetes) restarts it.
 const exitCodeInstanceClaimed = 3
+
+// scrubStoredCredentialText runs credscrub over each distinct SQLite file in
+// paths. The auth database is reached through the auth manager's handle when
+// there is one; any other file is opened only if it already exists, since a
+// file this node never created holds no old text.
+func scrubStoredCredentialText(authManager *auth.AuthManager, paths []string, logger zerolog.Logger) {
+	seen := map[string]bool{}
+	for _, p := range paths {
+		if p == "" || strings.HasPrefix(p, ":memory:") || strings.HasPrefix(p, "file::memory:") {
+			continue
+		}
+		key := p
+		if abs, err := filepath.Abs(p); err == nil {
+			key = abs
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if authManager.SharesDBPath(p) {
+			_, _ = credscrub.Run(ctx, authManager.GetDB(), logger)
+			cancel()
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			cancel()
+			continue
+		}
+		sep := "?"
+		if strings.Contains(p, "?") {
+			sep = "&"
+		}
+		db, err := sql.Open("sqlite3", p+sep+"_busy_timeout=5000&_journal_mode=WAL")
+		if err != nil {
+			logger.Warn().Err(err).Str("path", p).Msg("Could not open a database to clear stored error text")
+			cancel()
+			continue
+		}
+		db.SetMaxOpenConns(1)
+		_, _ = credscrub.Run(ctx, db, logger)
+		cancel()
+		_ = db.Close()
+	}
+}
 
 // sharedSQLiteHandle returns the SQLite handle a feature should use for the
 // shared metadata database, preferring the auth manager's existing connection.
@@ -5371,6 +5611,18 @@ type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
 
+// coldGCSField returns v when this node will build a GCS cold tier
+// (tiering on, cold on, backend gcs), else "". A leftover gcs_bucket must not
+// load httpfs at boot (an air-gapped host may not have it cached), widen the
+// allowlist or turn the file cache on.
+func coldGCSField(cfg *config.Config, v string) string {
+	ts := cfg.TieredStorage
+	if !ts.Enabled || !ts.Cold.Enabled || ts.Cold.Backend != "gcs" {
+		return ""
+	}
+	return v
+}
+
 // licenseHasClustering mirrors the cluster block's licence gate.
 func licenseHasClustering(lc *license.Client) bool {
 	if lc == nil {
@@ -5500,6 +5752,14 @@ func registerTieringShutdown(coordinator *shutdown.Coordinator, stop func() erro
 	coordinator.Register("tiering", shutdownFunc(stop), shutdown.PriorityCompaction)
 }
 
+// registerTieringColdBackendShutdown closes the separately constructed cold
+// storage backend after tiering has stopped using it.
+func registerTieringColdBackendShutdown(coordinator *shutdown.Coordinator, backend storage.Backend) {
+	if backend != nil {
+		coordinator.Register("tiering-cold-storage", backend, shutdown.PriorityStorage)
+	}
+}
+
 // tieringManifestAdapter implements tiering.ManifestCoordinator over the
 // cluster coordinator the way retention builds its manifest deletes
 // (internal/api/retention.go): JSON DeleteFilePayload ops in one batch,
@@ -5549,6 +5809,14 @@ func (a *tieringManifestAdapter) ManifestEntriesByDatabase(database string) []st
 	}
 	return paths
 }
+
+// HasRewriteSibling: the migrator leaves a file a DELETE replaced (the
+// manifest lists another member of its rewrite family instead) out of cold.
+func (a *tieringManifestAdapter) HasRewriteSibling(path string) bool {
+	return a.coordinator.HasRewriteSibling(path)
+}
+
+var _ tiering.RewriteSiblingChecker = (*tieringManifestAdapter)(nil)
 
 func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
 	return a.coordinator.CompactionOwns(path)
@@ -5674,6 +5942,13 @@ func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 //   - Shared storage (S3, Azure, MinIO): one node sweeps the bucket. Both
 //     halves gate on IsActiveCompactor — reuses the failover-managed
 //     compactor lease as a single-sweeper election with no new state.
+//     Without compactor failover nothing assigns or moves that lease, so
+//     unless one is already held no node reconciles;
+//     reconciliationStartupWarnings says so at startup.
+//     Shared is decided from the BUILT backend (cluster.IsSharedObjectStore),
+//     the predicate the pending-registration publisher uses, never from the
+//     config spelling: a string list missed "azblob" and ran every node of
+//     such a cluster as BackendLocal against the one container.
 //   - Local storage: every node walks its own disk against the full
 //     manifest; inside the reconciler the per-file OriginNodeID scopes
 //     only the orphan-manifest direction to entries this node originated.
@@ -5692,7 +5967,7 @@ func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 // compile-time dependency on the cluster package.
 type reconciliationClusterGate struct {
 	coordinator reconciliationGateCoordinator
-	shared      bool // true for s3/azure backends — one-node-sweeps semantics
+	shared      bool // the built backend is a shared object store — one-node-sweeps semantics
 	// holdSweepUntilCaughtUp arms the local-storage manifest-sweep hold:
 	// file replication and its catch-up walker are both enabled.
 	holdSweepUntilCaughtUp bool
@@ -5706,12 +5981,39 @@ type reconciliationGateCoordinator interface {
 	GetRole() cluster.NodeRole
 }
 
-func newReconciliationClusterGate(c reconciliationGateCoordinator, backendKind string, replicationEnabled, catchUpEnabled bool) *reconciliationClusterGate {
+func newReconciliationClusterGate(c reconciliationGateCoordinator, shared, replicationEnabled, catchUpEnabled bool) *reconciliationClusterGate {
 	return &reconciliationClusterGate{
 		coordinator:            c,
-		shared:                 isSharedBackend(backendKind),
-		holdSweepUntilCaughtUp: !isSharedBackend(backendKind) && replicationEnabled && catchUpEnabled,
+		shared:                 shared,
+		holdSweepUntilCaughtUp: !shared && replicationEnabled && catchUpEnabled,
 	}
+}
+
+// newReconciliationTopology builds the reconciler's gate and backend kind from
+// the storage backend main.go actually constructed. Both come from one
+// decision so the gate and the reconciler can never disagree about whether
+// the store is shared.
+func newReconciliationTopology(c reconciliationGateCoordinator, backend storage.Backend, replicationEnabled, catchUpEnabled bool) (*reconciliationClusterGate, reconciliation.BackendKind) {
+	shared := cluster.IsSharedObjectStore(backend)
+	kind := reconciliation.BackendLocal
+	if shared {
+		kind = reconciliation.BackendShared
+	}
+	return newReconciliationClusterGate(c, shared, replicationEnabled, catchUpEnabled), kind
+}
+
+// reconciliationStartupWarnings lists what an operator must know about how
+// this node's reconciler is gated. The scheduler logs a gated tick only at
+// Debug, so a configuration that can never run has to be named here.
+func reconciliationStartupWarnings(shared, replicationEnabled, catchUpEnabled, hasCompactorFailover bool) []string {
+	var out []string
+	if shared && !hasCompactorFailover {
+		out = append(out, "reconciliation is enabled on shared storage, where it runs only on the node holding the compactor lease, and this node runs no compactor failover to assign or move that lease. Unless a lease is already held from an earlier failover-enabled run, no node will reconcile. Compactor failover needs cluster.failover_enabled, a Raft data directory and the writer_failover licence feature.")
+	}
+	if !shared && replicationEnabled && !catchUpEnabled {
+		out = append(out, "cluster.replication_catchup_enabled=false: the reconciler's orphan-manifest sweep is not held until file replication has converged on this node, and a node restored with an empty data disk does not pull back the files it originated. Keep reconciliation in dry run after such a restore, or re-enable the catch-up walker.")
+	}
+	return out
 }
 
 func (g *reconciliationClusterGate) ShouldRunStorageScan() bool {
@@ -5733,26 +6035,6 @@ func (g *reconciliationClusterGate) ShouldRunManifestSweep() bool {
 
 func (g *reconciliationClusterGate) Role() string {
 	return string(g.coordinator.GetRole())
-}
-
-// reconciliationBackendKind maps the config storage backend string to
-// the reconciliation package's typed BackendKind.
-func reconciliationBackendKind(backend string) reconciliation.BackendKind {
-	if isSharedBackend(backend) {
-		return reconciliation.BackendShared
-	}
-	return reconciliation.BackendLocal
-}
-
-// isSharedBackend reports whether the configured storage backend is
-// shared across cluster nodes (one source of truth on disk).
-func isSharedBackend(backend string) bool {
-	switch backend {
-	case "s3", "minio", "azure":
-		return true
-	default:
-		return false
-	}
 }
 
 // backupClusterManifest adapts the cluster coordinator to backup.ClusterManifest
@@ -6066,3 +6348,12 @@ func tierColdCheck(get func(ctx context.Context, path string) (*tiering.FileMeta
 		return err != nil || (f != nil && f.Tier == tiering.TierCold)
 	}
 }
+
+// clusterOpenCompactions adapts the cluster coordinator to api.OpenCompactions.
+type clusterOpenCompactions struct{ c *cluster.Coordinator }
+
+func (o clusterOpenCompactions) ExcludedFor(ctx context.Context, prefix string) []string {
+	return o.c.OpenExcludedFor(ctx, prefix)
+}
+func (o clusterOpenCompactions) Open(prefix string) bool { return o.c.OpenAny(prefix) }
+func (o clusterOpenCompactions) Generation() uint64      { return o.c.OpenGeneration() }

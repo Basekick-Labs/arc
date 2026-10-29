@@ -61,7 +61,7 @@ func ForLog(sql string) string {
 			i = j
 		case c == '-' && i+1 < n && sql[i+1] == '-':
 			b.WriteString("--...")
-			for i < n && sql[i] != '\n' {
+			for i < n && sql[i] != '\n' && sql[i] != '\r' {
 				i++
 			}
 		case c == '/' && i+1 < n && sql[i+1] == '*':

@@ -53,6 +53,10 @@ type stagedReplica struct {
 	localJob func(job string) bool
 	// holds reports a path this node's registration outbox still owns.
 	holds func(path string) bool
+	// holdAt is the outbox's RegistrationHoldAt: the finisher's finer view,
+	// for a caller that synced after since (#1358). Set with holds, from the
+	// same outbox.
+	holdAt func(path string, since time.Time) RegistrationHold
 	// goneSince: leader memory of when a staged job's origin was first seen
 	// unhealthy (the leader loop's goroutine only).
 	goneSince map[string]time.Time
@@ -66,15 +70,29 @@ type stagedReplica struct {
 	// waitUntil: per compaction job, until when the delete worker waits for
 	// its staged copy to move into place (one wait per job, not per input).
 	waitUntil sync.Map
+	// settlingWarned: per job, when the finisher last warned that an input's
+	// registration has not settled (#1358).
+	settlingWarned sync.Map
 }
 
 // SetStagedCompactionHooks wires the compactor's and the outbox's views:
-// localJob is the CompletionWatcher's HasStagedJob, holds the outbox's
-// HoldsRegistration. Call before Start.
-func (c *Coordinator) SetStagedCompactionHooks(localJob func(job string) bool, holds func(path string) bool) {
+// localJob is the CompletionWatcher's HasStagedJob, outbox this node's
+// registration outbox (nil when there is none). Both of the outbox's views
+// come from one value so they cannot be wired apart. Call before Start.
+func (c *Coordinator) SetStagedCompactionHooks(localJob func(job string) bool, outbox StagedRegistrationHolder) {
 	c.staged.mu.Lock()
 	defer c.staged.mu.Unlock()
-	c.staged.localJob, c.staged.holds = localJob, holds
+	c.staged.localJob, c.staged.holds, c.staged.holdAt = localJob, nil, nil
+	if outbox != nil {
+		c.staged.holds, c.staged.holdAt = outbox.HoldsRegistration, outbox.RegistrationHoldAt
+	}
+}
+
+// StagedRegistrationHolder is the registration outbox as the staged-commit
+// paths see it (*RegistrationOutbox).
+type StagedRegistrationHolder interface {
+	HoldsRegistration(path string) bool
+	RegistrationHoldAt(path string, since time.Time) RegistrationHold
 }
 
 func (c *Coordinator) stagedLocalJob(job string) bool {

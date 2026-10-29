@@ -98,13 +98,21 @@ type Metrics struct {
 	storageErrorsTotal     atomic.Int64
 
 	// Compaction metrics
-	compactionJobsTotal          atomic.Int64
-	compactionJobsSuccess        atomic.Int64
-	compactionJobsFailed         atomic.Int64
-	compactionFilesCompacted     atomic.Int64
-	compactionBytesRead          atomic.Int64
-	compactionBytesWritten       atomic.Int64
-	compactionManifestsRecovered atomic.Int64
+	compactionJobsTotal   atomic.Int64
+	compactionJobsSuccess atomic.Int64
+	compactionJobsFailed  atomic.Int64
+	// compactionJobsInterrupted: attempts cut short by shutdown or a
+	// cancelled cycle (#1343).
+	compactionJobsInterrupted atomic.Int64
+	// compactionPartitionsSkippedTooWide: candidates a cycle left alone
+	// because they are remembered as too wide to compact; the gauge is how
+	// many partitions are remembered now.
+	compactionPartitionsSkippedTooWide atomic.Int64
+	compactionPartitionsTooWide        atomic.Int64
+	compactionFilesCompacted           atomic.Int64
+	compactionBytesRead                atomic.Int64
+	compactionBytesWritten             atomic.Int64
+	compactionManifestsRecovered       atomic.Int64
 
 	// Scheduled spoke metrics are absent from exports until the network
 	// scheduler starts. A bundle-only or disabled spoke must not look healthy.
@@ -261,6 +269,22 @@ type Metrics struct {
 	// no backend can address. Those entries are dropped from their work set, so
 	// this counter is the only place the condition is aggregated.
 	storageInvalidPathQuarantinedTotal atomic.Int64
+
+	// File-level time pruning (query.file_time_pruning, #659). A pass is a
+	// query whose range starts in the current hour on a local backend; the
+	// rest say what the pass did. nothingDropped and capFallback are the
+	// evidence for the margin and cap defaults.
+	fileTimePruningPasses         atomic.Int64
+	fileTimePruningExpanded       atomic.Int64
+	fileTimePruningFilesListed    atomic.Int64
+	fileTimePruningFilesDropped   atomic.Int64
+	fileTimePruningNothingDropped atomic.Int64
+	fileTimePruningCapFallback    atomic.Int64
+	fileTimePruningZeroSurvivors  atomic.Int64
+	fileTimePruningAnomalousKept  atomic.Int64
+	// ingestFutureStampedRows: rows stamped more than the file-time pruning
+	// margin past their flush, in its hour.
+	ingestFutureStampedRows atomic.Int64
 	// compactionCopyFallbackTotal counts compaction outputs an object store
 	// refused to copy server-side, copied through the node instead;
 	// compactionFinishedTotal, committed object-store compactions their
@@ -288,6 +312,11 @@ type Metrics struct {
 	// period of every burst; a value that keeps climbing means the delete
 	// workers cannot keep up with retention or a compaction backlog.
 	clusterLocalDeletePending atomic.Int64
+	// clusterLocalDeleteDeferred is the number of local unlinks of a file a
+	// row DELETE rewrote that wait for the rewrite to arrive on this node
+	// (normal while pulls are slow; a value that never falls means the
+	// rewrites are not arriving).
+	clusterLocalDeleteDeferred atomic.Int64
 
 	// compactionManifestsParkedUnparseableTotal counts crash-recovery
 	// manifests recovery parked because their body did not decode (#926): a
@@ -336,11 +365,18 @@ type Metrics struct {
 	clusterHeartbeatsUnknownNodeTotal atomic.Int64
 
 	clusterAuthApplyCreateTotal atomic.Int64
-	clusterAuthApplyUpdateTotal atomic.Int64
-	clusterAuthApplyRevokeTotal atomic.Int64
-	clusterAuthApplyDeleteTotal atomic.Int64
-	clusterAuthApplyRotateTotal atomic.Int64
-	clusterAuthRejectedTotal    atomic.Int64
+	// Reconcile of the local auth/RBAC SQLite with the cluster FSM (#1336).
+	// The three gauges hold the last run's counts across all six tables.
+	clusterAuthReconcileTotal       atomic.Int64
+	clusterAuthReconcileFailedTotal atomic.Int64
+	clusterAuthReconcileLocalRows   atomic.Int64
+	clusterAuthReconcileCollisions  atomic.Int64
+	clusterAuthReconcileKeptRows    atomic.Int64
+	clusterAuthApplyUpdateTotal     atomic.Int64
+	clusterAuthApplyRevokeTotal     atomic.Int64
+	clusterAuthApplyDeleteTotal     atomic.Int64
+	clusterAuthApplyRotateTotal     atomic.Int64
+	clusterAuthRejectedTotal        atomic.Int64
 
 	// Cluster RBAC metrics (Enterprise only — mutated on every FSM apply
 	// of an RBAC command). Same shape as the auth metrics above: one
@@ -605,9 +641,14 @@ func (m *Metrics) IncStorageReadBytes(bytes int64)  { m.storageReadBytesTotal.Ad
 func (m *Metrics) IncStorageErrors()                { m.storageErrorsTotal.Add(1) }
 
 // Compaction Metrics
-func (m *Metrics) IncCompactionJobs()                      { m.compactionJobsTotal.Add(1) }
-func (m *Metrics) IncCompactionSuccess()                   { m.compactionJobsSuccess.Add(1) }
-func (m *Metrics) IncCompactionFailed()                    { m.compactionJobsFailed.Add(1) }
+func (m *Metrics) IncCompactionJobs()        { m.compactionJobsTotal.Add(1) }
+func (m *Metrics) IncCompactionSuccess()     { m.compactionJobsSuccess.Add(1) }
+func (m *Metrics) IncCompactionFailed()      { m.compactionJobsFailed.Add(1) }
+func (m *Metrics) IncCompactionInterrupted() { m.compactionJobsInterrupted.Add(1) }
+func (m *Metrics) IncCompactionPartitionsSkippedTooWide() {
+	m.compactionPartitionsSkippedTooWide.Add(1)
+}
+func (m *Metrics) SetCompactionPartitionsTooWide(n int64)  { m.compactionPartitionsTooWide.Store(n) }
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
@@ -947,6 +988,87 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
 
+// Counters a compaction subprocess moves in its own registry, which nothing
+// scrapes (#1343): it returns them with its result and the parent adds them.
+var childCounterKeys = []string{
+	"storage_writes", "storage_write_bytes", "storage_reads", "storage_read_bytes",
+	"storage_errors", "storage_invalid_path_quarantined",
+}
+
+func (m *Metrics) childCounter(key string) *atomic.Int64 {
+	switch key {
+	case "storage_writes":
+		return &m.storageWritesTotal
+	case "storage_write_bytes":
+		return &m.storageWriteBytesTotal
+	case "storage_reads":
+		return &m.storageReadsTotal
+	case "storage_read_bytes":
+		return &m.storageReadBytesTotal
+	case "storage_errors":
+		return &m.storageErrorsTotal
+	case "storage_invalid_path_quarantined":
+		return &m.storageInvalidPathQuarantinedTotal
+	}
+	return nil
+}
+
+// ChildCounters is, in a compaction subprocess, the counters it moved that
+// the parent must add (see AddChildCounters). Zero values are left out.
+func (m *Metrics) ChildCounters() map[string]int64 {
+	out := map[string]int64{}
+	for _, k := range childCounterKeys {
+		if v := m.childCounter(k).Load(); v > 0 {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// AddChildCounters adds a compaction subprocess's ChildCounters. A key this
+// binary does not know (a child from another version) or a negative value is
+// ignored; nil adds nothing.
+func (m *Metrics) AddChildCounters(counts map[string]int64) {
+	for k, v := range counts {
+		if c := m.childCounter(k); c != nil && v > 0 {
+			c.Add(v)
+		}
+	}
+}
+
+// IncFileTimePruningPass records a file-time pruning pass over files listed.
+func (m *Metrics) IncFileTimePruningPass(files int) {
+	m.fileTimePruningPasses.Add(1)
+	m.fileTimePruningFilesListed.Add(int64(files))
+}
+
+// IncFileTimePruningExpanded records a pass that dropped files from the list.
+func (m *Metrics) IncFileTimePruningExpanded(dropped int) {
+	m.fileTimePruningExpanded.Add(1)
+	m.fileTimePruningFilesDropped.Add(int64(dropped))
+}
+
+// IncFileTimePruningNothingDropped records a pass with every file in range.
+func (m *Metrics) IncFileTimePruningNothingDropped() { m.fileTimePruningNothingDropped.Add(1) }
+
+// IncFileTimePruningCapFallback records a pass that kept too many files to list.
+func (m *Metrics) IncFileTimePruningCapFallback() { m.fileTimePruningCapFallback.Add(1) }
+
+// IncFileTimePruningZeroSurvivors records a pass that kept no file.
+func (m *Metrics) IncFileTimePruningZeroSurvivors() { m.fileTimePruningZeroSurvivors.Add(1) }
+
+// AddIngestFutureStampedRows records rows stamped more than the file-time
+// pruning margin past their flush, in its hour.
+func (m *Metrics) AddIngestFutureStampedRows(n int) { m.ingestFutureStampedRows.Add(int64(n)) }
+
+// AddFileTimePruningAnomalousKept records files kept because their name time
+// is before their directory's hour (future-stamped rows).
+func (m *Metrics) AddFileTimePruningAnomalousKept(n int) {
+	if n > 0 {
+		m.fileTimePruningAnomalousKept.Add(int64(n))
+	}
+}
+
 // IncCompactionCopyFallback, IncCompactionFinished, IncCompactionWedged: the
 // staged compaction commit on an object store (#1207 d2a2b).
 func (m *Metrics) IncCompactionCopyFallback() { m.compactionCopyFallbackTotal.Add(1) }
@@ -979,6 +1101,10 @@ func (m *Metrics) SetStaleLocalTrackingFailed(n int64) { m.staleLocalTrackingFai
 // waiting for a local unlink on this node.
 func (m *Metrics) SetClusterLocalDeletePending(n int64) { m.clusterLocalDeletePending.Store(n) }
 
+// SetClusterLocalDeleteDeferred publishes how many local unlinks wait for a
+// DELETE rewrite to arrive on this node.
+func (m *Metrics) SetClusterLocalDeleteDeferred(n int64) { m.clusterLocalDeleteDeferred.Store(n) }
+
 // IncCompactionManifestParkedUnparseable records one crash-recovery manifest
 // parked because its body could not be decoded (#926). Call it after the
 // park succeeded; a park that fails transiently is retried next cycle and
@@ -1008,6 +1134,26 @@ func (m *Metrics) SetBackupSkippedFiles(n int64) {
 func (m *Metrics) IncClusterHeartbeatUnknownNode() { m.clusterHeartbeatsUnknownNodeTotal.Add(1) }
 
 func (m *Metrics) IncClusterAuthApplyCreate() { m.clusterAuthApplyCreateTotal.Add(1) }
+
+// RecordClusterAuthReconcileFailure counts a reconcile that failed before
+// anything committed; the gauges keep the last run's counts.
+func (m *Metrics) RecordClusterAuthReconcileFailure() {
+	m.clusterAuthReconcileTotal.Add(1)
+	m.clusterAuthReconcileFailedTotal.Add(1)
+}
+
+// RecordClusterAuthReconcile records one reconcile of the local auth and RBAC
+// tables with the cluster FSM (#1336). failed counts a run that failed or hit
+// statement errors; the gauges take the counts of whatever it did apply.
+func (m *Metrics) RecordClusterAuthReconcile(failed bool, localRows, collisions, keptRows int) {
+	m.clusterAuthReconcileTotal.Add(1)
+	if failed {
+		m.clusterAuthReconcileFailedTotal.Add(1)
+	}
+	m.clusterAuthReconcileLocalRows.Store(int64(localRows))
+	m.clusterAuthReconcileCollisions.Store(int64(collisions))
+	m.clusterAuthReconcileKeptRows.Store(int64(keptRows))
+}
 func (m *Metrics) IncClusterAuthApplyUpdate() { m.clusterAuthApplyUpdateTotal.Add(1) }
 func (m *Metrics) IncClusterAuthApplyRevoke() { m.clusterAuthApplyRevokeTotal.Add(1) }
 func (m *Metrics) IncClusterAuthApplyDelete() { m.clusterAuthApplyDeleteTotal.Add(1) }
@@ -1143,13 +1289,16 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"storage_errors_total":      m.storageErrorsTotal.Load(),
 
 		// Compaction
-		"compaction_jobs_total":          m.compactionJobsTotal.Load(),
-		"compaction_jobs_success":        m.compactionJobsSuccess.Load(),
-		"compaction_jobs_failed":         m.compactionJobsFailed.Load(),
-		"compaction_files_compacted":     m.compactionFilesCompacted.Load(),
-		"compaction_bytes_read":          m.compactionBytesRead.Load(),
-		"compaction_bytes_written":       m.compactionBytesWritten.Load(),
-		"compaction_manifests_recovered": m.compactionManifestsRecovered.Load(),
+		"compaction_jobs_total":                  m.compactionJobsTotal.Load(),
+		"compaction_jobs_success":                m.compactionJobsSuccess.Load(),
+		"compaction_jobs_failed":                 m.compactionJobsFailed.Load(),
+		"compaction_jobs_interrupted":            m.compactionJobsInterrupted.Load(),
+		"compaction_partitions_skipped_too_wide": m.compactionPartitionsSkippedTooWide.Load(),
+		"compaction_partitions_too_wide":         m.compactionPartitionsTooWide.Load(),
+		"compaction_files_compacted":             m.compactionFilesCompacted.Load(),
+		"compaction_bytes_read":                  m.compactionBytesRead.Load(),
+		"compaction_bytes_written":               m.compactionBytesWritten.Load(),
+		"compaction_manifests_recovered":         m.compactionManifestsRecovered.Load(),
 
 		// Auth
 		"auth_requests_total": m.authRequestsTotal.Load(),
@@ -1248,20 +1397,30 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_mgmt_history_size":    m.queryMgmtHistorySize.Load(),
 
 		// Cluster FSM security (Enterprise)
-		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
-		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
-		"compaction_copy_fallback_total":         m.compactionCopyFallbackTotal.Load(),
-		"compaction_finished_total":              m.compactionFinishedTotal.Load(),
-		"compaction_wedged_total":                m.compactionWedgedTotal.Load(),
-		"manifest_repair_dropped_total":          m.manifestRepairDroppedTotal.Load(),
-		"manifest_repair_adopted_total":          m.manifestRepairAdoptedTotal.Load(),
-		"manifest_repair_pending":                m.manifestRepairPending.Load(),
-		"stale_local_unlinked_total":             m.staleLocalUnlinkedTotal.Load(),
-		"stale_local_tracked":                    m.staleLocalTracked.Load(),
-		"stale_local_blocked":                    m.staleLocalBlocked.Load(),
-		"stale_local_tracking_failed":            m.staleLocalTrackingFail.Load(),
+		"cluster_manifest_rejected_paths_total":   m.clusterManifestRejectedPathsTotal.Load(),
+		"storage_invalid_path_quarantined_total":  m.storageInvalidPathQuarantinedTotal.Load(),
+		"file_time_pruning_passes_total":          m.fileTimePruningPasses.Load(),
+		"file_time_pruning_expanded_total":        m.fileTimePruningExpanded.Load(),
+		"file_time_pruning_files_listed_total":    m.fileTimePruningFilesListed.Load(),
+		"file_time_pruning_files_dropped_total":   m.fileTimePruningFilesDropped.Load(),
+		"file_time_pruning_nothing_dropped_total": m.fileTimePruningNothingDropped.Load(),
+		"file_time_pruning_cap_fallback_total":    m.fileTimePruningCapFallback.Load(),
+		"file_time_pruning_zero_survivors_total":  m.fileTimePruningZeroSurvivors.Load(),
+		"file_time_pruning_anomalous_kept_total":  m.fileTimePruningAnomalousKept.Load(),
+		"ingest_future_stamped_rows_total":        m.ingestFutureStampedRows.Load(),
+		"compaction_copy_fallback_total":          m.compactionCopyFallbackTotal.Load(),
+		"compaction_finished_total":               m.compactionFinishedTotal.Load(),
+		"compaction_wedged_total":                 m.compactionWedgedTotal.Load(),
+		"manifest_repair_dropped_total":           m.manifestRepairDroppedTotal.Load(),
+		"manifest_repair_adopted_total":           m.manifestRepairAdoptedTotal.Load(),
+		"manifest_repair_pending":                 m.manifestRepairPending.Load(),
+		"stale_local_unlinked_total":              m.staleLocalUnlinkedTotal.Load(),
+		"stale_local_tracked":                     m.staleLocalTracked.Load(),
+		"stale_local_blocked":                     m.staleLocalBlocked.Load(),
+		"stale_local_tracking_failed":             m.staleLocalTrackingFail.Load(),
 		// Cluster local delete workers (per-node storage with replication)
 		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
+		"cluster_local_delete_deferred":                 m.clusterLocalDeleteDeferred.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
 		"storage_unaddressable_files":                   m.storageUnaddressableFiles.Load(),
 		"backup_skipped_files":                          m.backupSkippedFiles.Load(),
@@ -1269,12 +1428,17 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
 
-		"cluster_auth_apply_create_total": m.clusterAuthApplyCreateTotal.Load(),
-		"cluster_auth_apply_update_total": m.clusterAuthApplyUpdateTotal.Load(),
-		"cluster_auth_apply_revoke_total": m.clusterAuthApplyRevokeTotal.Load(),
-		"cluster_auth_apply_delete_total": m.clusterAuthApplyDeleteTotal.Load(),
-		"cluster_auth_apply_rotate_total": m.clusterAuthApplyRotateTotal.Load(),
-		"cluster_auth_rejected_total":     m.clusterAuthRejectedTotal.Load(),
+		"cluster_auth_apply_create_total":     m.clusterAuthApplyCreateTotal.Load(),
+		"cluster_auth_reconcile_total":        m.clusterAuthReconcileTotal.Load(),
+		"cluster_auth_reconcile_failed_total": m.clusterAuthReconcileFailedTotal.Load(),
+		"cluster_auth_reconcile_local_rows":   m.clusterAuthReconcileLocalRows.Load(),
+		"cluster_auth_reconcile_collisions":   m.clusterAuthReconcileCollisions.Load(),
+		"cluster_auth_reconcile_kept_rows":    m.clusterAuthReconcileKeptRows.Load(),
+		"cluster_auth_apply_update_total":     m.clusterAuthApplyUpdateTotal.Load(),
+		"cluster_auth_apply_revoke_total":     m.clusterAuthApplyRevokeTotal.Load(),
+		"cluster_auth_apply_delete_total":     m.clusterAuthApplyDeleteTotal.Load(),
+		"cluster_auth_apply_rotate_total":     m.clusterAuthApplyRotateTotal.Load(),
+		"cluster_auth_rejected_total":         m.clusterAuthRejectedTotal.Load(),
 
 		// Cluster RBAC (Enterprise, Phase A.1)
 		"cluster_rbac_apply_create_organization_total":           m.clusterRBACApplyCreateOrganizationTotal.Load(),
@@ -1536,17 +1700,43 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetric(b, "arc_storage_errors_total", float64(m.storageErrorsTotal.Load()))
 
 	// Compaction metrics
-	b = append(b, "# HELP arc_compaction_jobs_total Total compaction jobs\n"...)
+	// Compaction job counters count ATTEMPTS (a batch retried at half size is
+	// two), counted by the parent from each subprocess's result (#1343).
+	b = append(b, "# HELP arc_compaction_jobs_total Compaction job attempts that ran (succeeded, failed or interrupted)\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_total", float64(m.compactionJobsTotal.Load()))
 
-	b = append(b, "# HELP arc_compaction_jobs_success_total Successful compaction jobs\n"...)
+	b = append(b, "# HELP arc_compaction_jobs_success_total Compaction job attempts that succeeded (a staged job: its output staged, before the cluster commits it)\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_success_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_success_total", float64(m.compactionJobsSuccess.Load()))
 
-	b = append(b, "# HELP arc_compaction_jobs_failed_total Failed compaction jobs\n"...)
+	b = append(b, "# HELP arc_compaction_jobs_failed_total Compaction job attempts that failed, including a subprocess that crashed or was killed\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_failed_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_failed_total", float64(m.compactionJobsFailed.Load()))
+
+	b = append(b, "# HELP arc_compaction_jobs_interrupted_total Compaction job attempts cut short by shutdown or a cancelled cycle\n"...)
+	b = append(b, "# TYPE arc_compaction_jobs_interrupted_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_jobs_interrupted_total", float64(m.compactionJobsInterrupted.Load()))
+
+	b = append(b, "# HELP arc_compaction_partitions_skipped_too_wide_total Compaction candidates left alone because the partition failed at the smallest batch and is remembered as too wide to compact\n"...)
+	b = append(b, "# TYPE arc_compaction_partitions_skipped_too_wide_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_partitions_skipped_too_wide_total", float64(m.compactionPartitionsSkippedTooWide.Load()))
+
+	b = append(b, "# HELP arc_compaction_partitions_too_wide Partitions remembered as too wide to compact in a job's memory\n"...)
+	b = append(b, "# TYPE arc_compaction_partitions_too_wide gauge\n"...)
+	b = appendMetric(b, "arc_compaction_partitions_too_wide", float64(m.compactionPartitionsTooWide.Load()))
+
+	b = append(b, "# HELP arc_compaction_files_compacted_total Input files compacted by successful compaction attempts (a staged job: before the cluster commits it)\n"...)
+	b = append(b, "# TYPE arc_compaction_files_compacted_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_files_compacted_total", float64(m.compactionFilesCompacted.Load()))
+
+	b = append(b, "# HELP arc_compaction_bytes_read_total Bytes of input files of successful compaction attempts\n"...)
+	b = append(b, "# TYPE arc_compaction_bytes_read_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_bytes_read_total", float64(m.compactionBytesRead.Load()))
+
+	b = append(b, "# HELP arc_compaction_bytes_written_total Bytes of output files of successful compaction attempts\n"...)
+	b = append(b, "# TYPE arc_compaction_bytes_written_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_bytes_written_total", float64(m.compactionBytesWritten.Load()))
 
 	b = append(b, "# HELP arc_compaction_manifests_recovered_total Compaction manifests recovered after crash\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
@@ -1892,6 +2082,25 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
 	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
 	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
+
+	for _, c := range []struct {
+		name, help string
+		v          int64
+	}{
+		{"arc_query_file_time_pruning_passes_total", "Table reads whose range starts in the current hour that file-level time pruning listed (query.file_time_pruning); each pass ends as one of expanded, nothing_dropped, cap_fallback, or zero_survivors with a single path.", m.fileTimePruningPasses.Load()},
+		{"arc_query_file_time_pruning_expanded_total", "File-time pruning passes that left files out of the live-hour read.", m.fileTimePruningExpanded.Load()},
+		{"arc_query_file_time_pruning_files_listed_total", "Live-hour files listed by file-time pruning passes.", m.fileTimePruningFilesListed.Load()},
+		{"arc_query_file_time_pruning_files_dropped_total", "Live-hour files left out of reads by file-time pruning.", m.fileTimePruningFilesDropped.Load()},
+		{"arc_query_file_time_pruning_nothing_dropped_total", "File-time pruning passes where every live-hour file was in range (the margin covers the files listed).", m.fileTimePruningNothingDropped.Load()},
+		{"arc_query_file_time_pruning_cap_fallback_total", "File-time pruning passes that kept too many files to list and read the whole hour.", m.fileTimePruningCapFallback.Load()},
+		{"arc_query_file_time_pruning_zero_survivors_total", "File-time pruning passes that kept no live-hour file: with the hour as the only path the glob is kept (fail safe); with other paths the hour is dropped and the pass also counts as expanded.", m.fileTimePruningZeroSurvivors.Load()},
+		{"arc_query_file_time_pruning_anomalous_kept_total", "Live-hour files kept because their name time is before their hour (rows stamped ahead of the flushing node's clock).", m.fileTimePruningAnomalousKept.Load()},
+		{"arc_ingest_future_stamped_rows_total", "Rows stamped more than query.file_time_pruning_margin_seconds past their flush, in the flush's hour: with file-level time pruning on, a query can miss them until the hour closes.", m.ingestFutureStampedRows.Load()},
+	} {
+		b = append(b, "# HELP "+c.name+" "+c.help+"\n"...)
+		b = append(b, "# TYPE "+c.name+" counter\n"...)
+		b = appendMetric(b, c.name, float64(c.v))
+	}
 	b = appendMetric(b, "arc_compaction_copy_fallback_total", float64(m.compactionCopyFallbackTotal.Load()))
 	b = appendMetric(b, "arc_compaction_finished_total", float64(m.compactionFinishedTotal.Load()))
 	b = appendMetric(b, "arc_compaction_wedged_total", float64(m.compactionWedgedTotal.Load()))
@@ -1922,6 +2131,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)
 	b = appendMetric(b, "arc_cluster_local_delete_pending", float64(m.clusterLocalDeletePending.Load()))
 
+	b = append(b, "# HELP arc_cluster_local_delete_deferred Local unlinks of files a row DELETE rewrote that wait for the rewrite to arrive on this node, so reads here never miss its rows. Rises while pulls are slow and returns to zero as they land; a value that never falls means the rewrites are not arriving.\n"...)
+	b = append(b, "# TYPE arc_cluster_local_delete_deferred gauge\n"...)
+	b = appendMetric(b, "arc_cluster_local_delete_deferred", float64(m.clusterLocalDeleteDeferred.Load()))
+
 	b = append(b, "# HELP arc_compaction_manifests_parked_unparseable_total Total compaction crash-recovery manifests parked under the .quarantined suffix because their body could not be decoded. Growth means a manifest stopped blocking compaction without being completed; the parked file name gives the tier, database and job, and that partition should be checked for a zero-length _compacted output or for duplicate rows.\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_parked_unparseable_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_parked_unparseable_total", float64(m.compactionManifestsParkedUnparseableTotal.Load()))
@@ -1943,6 +2156,21 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_heartbeats_unknown_node_total Heartbeats received from a node absent from this node's registry.\n"...)
 	b = append(b, "# TYPE arc_cluster_heartbeats_unknown_node_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_heartbeats_unknown_node_total", float64(m.clusterHeartbeatsUnknownNodeTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_total Reconciles of this node's auth and RBAC tables with the cluster state (#1336).\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_total", float64(m.clusterAuthReconcileTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_failed_total Reconciles that failed; the local tables may still differ from the cluster.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_failed_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_failed_total", float64(m.clusterAuthReconcileFailedTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_local_rows Local auth/RBAC rows the cluster does not know, at the last reconcile (valid only on this node).\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_local_rows gauge\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_local_rows", float64(m.clusterAuthReconcileLocalRows.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_collisions Cluster auth/RBAC entries blocked by a local row at the last reconcile (unusable on this node).\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_collisions gauge\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_collisions", float64(m.clusterAuthReconcileCollisions.Load()))
+	b = append(b, "# HELP arc_cluster_auth_reconcile_kept_rows Cluster rows the FSM lacks that the last reconcile kept instead of deleting.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_reconcile_kept_rows gauge\n"...)
+	b = appendMetric(b, "arc_cluster_auth_reconcile_kept_rows", float64(m.clusterAuthReconcileKeptRows.Load()))
 	b = append(b, "# HELP arc_cluster_auth_apply_create_total Total CommandCreateToken applies on this node.\n"...)
 	b = append(b, "# TYPE arc_cluster_auth_apply_create_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_auth_apply_create_total", float64(m.clusterAuthApplyCreateTotal.Load()))

@@ -293,21 +293,38 @@ localProcessing:
 	// written, as InfluxDB does: a field would silently replace the
 	// timestamp, a tag would fail the write part-way. The answer is then a
 	// "partial write" 400.
-	droppedTime := 0
+	// So is a point with a name Arc cannot read back (#1342): one that is not
+	// valid UTF-8, "time" in another letter case, or one differing only in
+	// letter case from another column of the measurement.
+	names := ingest.NewRecordNameFilter(writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)))
+	var timeDrops map[string]int
 	kept := records[:0]
 	for _, rec := range records {
 		if _, found := ingest.LPRecordTimeKey(rec); found {
-			droppedTime++
+			if timeDrops == nil {
+				timeDrops = map[string]int{}
+			}
+			timeDrops[rec.Measurement]++
+			continue
+		}
+		if !names.Keep(rec) {
 			continue
 		}
 		kept = append(kept, rec)
 	}
 	records = kept
+	drops := names.Drops()
+	for measurement, n := range timeDrops {
+		drops = append(drops, ingest.LPDrop{Measurement: measurement, Reason: ingest.LPDropTime, Points: n})
+	}
+	dropped := 0
+	for _, d := range drops {
+		dropped += d.Points
+	}
 	if len(records) == 0 {
 		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("partial write: %d points dropped: a tag or field named \"time\" (time is the timestamp)", droppedTime),
-		})
+		logPointDrops(h.logger, "Line protocol", database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})
 	}
 
 	h.totalRecords.Add(int64(len(records)))
@@ -339,6 +356,15 @@ localProcessing:
 		}
 	}
 
+	// A column changed between string and binary refuses the whole request
+	// (#440), not the measurement it is in after the others were written.
+	for _, record := range columnarByMeasurement {
+		if err := h.buffer.CheckColumnsTextBinary(database, record.Measurement, record.Columns); err != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
 	// Refuse the whole request up front if writes are fenced (#1207) or the
 	// WAL volume is under disk pressure (#676), rather than part-way through
 	// the measurements below. The admitted context skips the per-call disk
@@ -358,6 +384,10 @@ localProcessing:
 			// Logged by reason, not as an ingest error (#1268).
 			if ingest.IsWriteRefusal(err) {
 				return respondWriteRefused(c, err)
+			}
+			// A client error (#440), refused before the WAL.
+			if errors.Is(err, ingest.ErrColumnTypeChange) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 			}
 			metrics.Get().IncIngestErrors()
 			h.logger.Error().
@@ -398,10 +428,11 @@ localProcessing:
 	m.IncIngestBytes(int64(len(body)))
 	m.IncIngestBatches()
 
-	if droppedTime > 0 {
+	if dropped > 0 {
 		h.totalErrors.Add(1)
+		logPointDrops(h.logger, "Line protocol", database, drops)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("partial write: %d points dropped: a tag or field named \"time\" (time is the timestamp); the other points were written", droppedTime),
+			"error": partialWriteMessage(drops, dropped, true),
 		})
 	}
 
@@ -416,7 +447,7 @@ localProcessing:
 // type) is dropped, the rest are written, and the answer is a "partial write"
 // 400, as InfluxDB does.
 func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, precision string) error {
-	batches, rows, drops, err := h.parser.ParseLPWrite(body, precision)
+	batches, rows, drops, err := h.parser.ParseLPWriteKnown(body, precision, writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		metrics.Get().IncIngestErrors()
@@ -462,6 +493,14 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 		}
 	}
 
+	// See the record path above (#440).
+	for _, m := range measurements {
+		if err := h.buffer.CheckTypedTextBinary(database, m, batches[m]); err != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
 	// Refuse the whole request up front if writes are fenced (#1207) or the
 	// WAL volume is under disk pressure (#676); see the record path above.
 	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
@@ -476,6 +515,9 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 			h.totalErrors.Add(1)
 			if ingest.IsWriteRefusal(err) {
 				return respondWriteRefused(c, err)
+			}
+			if errors.Is(err, ingest.ErrColumnTypeChange) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 			}
 			metrics.Get().IncIngestErrors()
 			h.logger.Error().Err(err).Str("database", database).Str("measurement", m).Int("records", rows[m]).Msg("Failed to write to Arrow buffer")

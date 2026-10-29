@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -393,6 +394,11 @@ func (w *CompletionWatcher) pausedByGate() bool {
 // remove on success. On bridge error leaves the manifest in place.
 func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 	manifest, err := readCompletionManifest(path)
+	if errors.Is(err, os.ErrNotExist) {
+		// Removed since the listing: the parent drops a finished job's
+		// writing_output record (#1343), and this poll raced it.
+		return
+	}
 	if err != nil {
 		w.logger.Warn().Err(err).Str("path", path).Msg("Failed to read completion manifest; leaving in place")
 		w.applyErrors.Add(1)
@@ -402,8 +408,9 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 
 	// writing_output manifests are still in progress inside the subprocess.
 	// The watcher ignores them until the subprocess advances the state.
-	// Orphan cleanup for stuck writing_output is handled separately by
-	// Manager.CleanupOrphanedCompletionManifests at startup.
+	// Orphan cleanup for stuck writing_output is handled separately: the
+	// parent drops a finished job's record once its subprocess exited
+	// (#1343), and Manager.CleanupOrphanedCompletionManifests at startup.
 	if manifest.State == CompletionStateStaged {
 		w.applyStaged(ctx, path, manifest)
 		return

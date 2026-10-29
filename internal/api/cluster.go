@@ -191,6 +191,15 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		compactionJobsGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	compactionJobsGroup.Post("/:job/abort", h.handleAbortWedgedCompaction)
+
+	// Admin-only: each node's own retention policies, and choosing the node
+	// whose policies the cluster adopts (#1324). Leader only.
+	policiesGroup := app.Group("/api/v1/cluster/policies")
+	if h.authManager != nil {
+		policiesGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	policiesGroup.Get("", h.handleGetPolicyCandidates)
+	policiesGroup.Post("/adopt", h.handleAdoptPolicies)
 }
 
 // handleAbortWedgedCompaction ends a wedged compaction job.

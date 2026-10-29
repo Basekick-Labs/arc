@@ -4,6 +4,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,7 +22,7 @@ import (
 )
 
 // The columnar streamer relies on the bufio.Writer's natural flush
-// behavior (its internal 4KiB buffer flushes when full as the encoder
+// behavior (the stream's 256 KiB buffer flushes when full as the encoder
 // writes primitives). Explicit per-column flushes added 7+ syscalls per
 // LIMIT 1M without measurable disconnect-detection benefit; the column
 // encoders below check ctx.Done() once per Arrow batch instead, which
@@ -83,10 +84,23 @@ func executeArrowMsgPackQuery(
 	}
 
 	if err != nil {
-		// "no files found" → empty result, not error. Mirrors the JSON
-		// path so a client polling a measurement before its first write
-		// sees the same shape regardless of wire format.
-		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		// "no files found": an empty result for a measurement with no data
+		// yet, a retryable 503 for a partition removed mid-query
+		// (classifyNoFiles). Mirrors the JSON path.
+		kind := h.classifyNoFiles(err)
+		if kind == noFilesVanished {
+			if cancel != nil {
+				cancel()
+			}
+			m.IncQueryErrors()
+			if onFail != nil {
+				onFail(vanishedPartitionMessage)
+			}
+			c.Set(fiber.HeaderRetryAfter, "1")
+			_ = respondError(c, fiber.StatusServiceUnavailable, vanishedPartitionMessage, timestamp, start)
+			return -1, true
+		}
+		if kind == noFilesEmpty {
 			if cancel != nil {
 				cancel()
 			}
@@ -211,8 +225,9 @@ func executeArrowMsgPackQuery(
 	}
 
 	// From here the response WILL be 200 — all batches are materialized
-	// in memory, encode is the only remaining work and can only fail
-	// via client disconnect (no DuckDB or context-deadline path).
+	// in memory, and encoding is the only remaining work. It can still end
+	// the stream early (client disconnect, the query's deadline, an
+	// encoder panic): the response is then marked truncated.
 	c.Set(fiber.HeaderContentType, msgpackContentType)
 	// Accept-Encoding negotiation before headers commit at first body byte.
 	respEncoding := negotiateResponseCompression(c)
@@ -223,7 +238,7 @@ func executeArrowMsgPackQuery(
 	if respEncoding != "" {
 		c.Set(fiber.HeaderContentEncoding, respEncoding)
 	}
-	c.Context().SetBodyStreamWriter(h.safeStream("query_msgpack", func() {
+	h.setDirectBodyStream(c.Context(), cancel, nil, "query_msgpack", func() {
 		// A panic skips the dispositions below, leaving the query registered
 		// as running forever (#717).
 		if onFail != nil {
@@ -242,15 +257,18 @@ func executeArrowMsgPackQuery(
 			}
 		}()
 
-		// Wrap the 4KiB-default bufio.Writer Fiber hands us with a
-		// 256 KiB layer. The msgpack encoder writes one primitive at a
-		// time (~9 bytes per int64), so on a 1M-row response the
-		// default bufio fills and flushes ~15k times — each flush is a
-		// channel-send to fasthttp's chunked-transfer goroutine. The
-		// larger buffer cuts that to ~250 sends. With compression
-		// negotiated, the pooled encoder sits between that buffer and w.
+		// w is the stream's pooled 256 KiB buffer (setDirectBodyStream).
+		// The envelope and small results are encoded one primitive at a
+		// time (~9 bytes per int64) straight into it; larger results arrive
+		// as pre-encoded column runs (encodeMsgPackColumns). With
+		// compression negotiated, the pooled encoder sits behind a 256 KiB
+		// buffer of its own, so it compresses whole blocks rather than
+		// single values.
 		sink, finishCompression := compressedSink(w, respEncoding)
-		bw := bufio.NewWriterSize(sink, 256*1024)
+		bw, isBufio := sink.(*bufio.Writer)
+		if !isBufio {
+			bw = bufio.NewWriterSize(sink, 256*1024)
+		}
 		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, governanceMaxRows, profile, start, timestamp)
 		bw.Flush()
 		if err := finishCompression(); err != nil && streamErr == nil {
@@ -298,7 +316,7 @@ func executeArrowMsgPackQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow MsgPack query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	}))
+	})
 
 	return 0, true
 }
@@ -393,12 +411,13 @@ func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanc
 // (query_json_writer.go:180) — correctly logged Warn for the identical
 // condition.
 //
-// Applying this at the two call sites in the emit loop is sound because the
-// only errors reachable there are ctx cancellation (already a client error,
-// passed through untouched below so a genuine timeout is not obscured) and
-// enc.Encode* write failures — the typed column encoders do no I/O of their
-// own and no validation that can fail. Encoding of the header fields above
-// happens before any large write and is left unwrapped.
+// It is applied where the error can only be a socket write failure or ctx
+// cancellation (already a client error, passed through untouched so a
+// genuine timeout is not obscured): the serial column loop, and the write
+// of a pre-encoded column run. A parallel job's own error (ctx, or an
+// encoder panic, which is a server fault) is returned without it. Encoding
+// of the header fields happens before any large write and is left
+// unwrapped.
 func wrapMsgPackWriteErr(err error) error {
 	if err == nil || isClientError(err) {
 		return err
@@ -431,7 +450,8 @@ func wrapMsgPackWriteErr(err error) error {
 // BEFORE the HTTP body stream opens, so DuckDB errors produce clean 5xx
 // responses instead of truncated 200s. This function only encodes; the
 // errors it returns are wire-write failures (client disconnect during
-// encode) or ctx cancellation observed mid-column.
+// encode), ctx cancellation observed between batches, or an encoder panic
+// recovered on an encoder goroutine.
 //
 // Returns (rowsWritten, err). An error after the envelope has opened
 // cannot change HTTP status, but the caller records it so operators
@@ -534,32 +554,8 @@ func streamMsgPackFromBatches(
 		return rowCount, wrapMsgPackWriteErr(err)
 	}
 
-	// Per-column emit: one type-switch on the first batch's column,
-	// then a typed loop over every batch's slice of that column. The
-	// switch fires numCols times total — not numCols×numRows like the
-	// row-oriented path. For LIMIT 1M × 7 columns this is 7 type
-	// assertions instead of 7M.
-	for colIdx := 0; colIdx < numCols; colIdx++ {
-		// Ctx check at column boundary — a long column emit (1M ints)
-		// is the longest uninterruptible work this function does, so
-		// also check inside the typed loops below at row granularity.
-		select {
-		case <-ctx.Done():
-			return rowCount, fmt.Errorf("stream cancelled at column %d: %w", colIdx, ctx.Err())
-		default:
-		}
-		if err := enc.EncodeArrayLen(rowCount); err != nil {
-			return rowCount, fmt.Errorf("encode column %d header: %w", colIdx, wrapMsgPackWriteErr(err))
-		}
-		if err := encodeColumn(ctx, enc, batches, colIdx); err != nil {
-			return rowCount, wrapMsgPackWriteErr(err)
-		}
-		// No explicit Flush per column. bufio.Writer flushes its 4KiB
-		// internal buffer automatically when full; for a multi-MB
-		// response that's already dozens of flushes triggered by the
-		// encode itself. The per-batch ctx check inside the column
-		// encoders handles disconnect detection. Saves 7+ syscalls
-		// per typical LIMIT 1M query.
+	if err := encodeMsgPackColumns(ctx, enc, w, batches, numCols, rowCount); err != nil {
+		return rowCount, err
 	}
 	// Final flush of any trailing buffered bytes before the trailer
 	// fields. Single syscall regardless of result size — bounds the
@@ -1071,4 +1067,141 @@ func encodeFallbackColumn(ctx context.Context, enc *msgpack.Encoder, batches []a
 		}
 	}
 	return nil
+}
+
+// msgpackChunkRows is roughly how many rows of one column a MessagePack job
+// encodes: big enough that the hand-off is noise, small enough that a 1M-row
+// column spreads over the encoder goroutines. msgpackChunkBytes ends a run
+// earlier for wide values (long strings), so a job's buffer stays small.
+const (
+	msgpackChunkRows  = 16384
+	msgpackChunkBytes = 1 << 20
+)
+
+// arrayBufferBytes is the size of an array's buffers: close to the encoded
+// size of its values.
+func arrayBufferBytes(a arrow.Array) int {
+	n := 0
+	for _, b := range a.Data().Buffers() {
+		if b != nil {
+			n += b.Len()
+		}
+	}
+	return n
+}
+
+// encodeMsgPackColumns writes the "data" arrays: one array per column, each
+// with rowCount values. With more than parallelEncodeAfterBatches batches,
+// each column is cut into runs of batches that are encoded on encoder
+// goroutines (encode_parallel.go) and written in (column, run) order; the
+// first run of a column carries the column's array header, so the runs are
+// written back to back. Every run uses the same typed column encoders as the
+// serial loop, and a value's bytes do not depend on the encoder that writes
+// it, so the output is the same either way.
+//
+// The batches belong to the caller for the whole call; every job is waited
+// for before this returns, on every path.
+func encodeMsgPackColumns(ctx context.Context, enc *msgpack.Encoder, w *bufio.Writer, batches []arrow.Record, numCols, rowCount int) error {
+	if len(batches) <= parallelEncodeAfterBatches {
+		// Per-column emit: one type-switch on the first batch's column,
+		// then a typed loop over every batch's slice of that column. The
+		// switch fires numCols times total — not numCols×numRows like the
+		// row-oriented path. For LIMIT 1M × 7 columns this is 7 type
+		// assertions instead of 7M.
+		for colIdx := 0; colIdx < numCols; colIdx++ {
+			// Ctx check at column boundary — a long column emit (1M ints)
+			// is the longest uninterruptible work this function does, so
+			// also check inside the typed encoders at batch granularity.
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("stream cancelled at column %d: %w", colIdx, ctx.Err())
+			default:
+			}
+			if err := enc.EncodeArrayLen(rowCount); err != nil {
+				return fmt.Errorf("encode column %d header: %w", colIdx, wrapMsgPackWriteErr(err))
+			}
+			if err := encodeColumn(ctx, enc, batches, colIdx); err != nil {
+				return wrapMsgPackWriteErr(err)
+			}
+			// No explicit Flush per column. bufio.Writer flushes its 256
+			// KiB buffer automatically when full; for a multi-MB response
+			// that's already several flushes triggered by the encode
+			// itself. The per-batch ctx check inside the column encoders
+			// handles disconnect detection.
+		}
+		return nil
+	}
+
+	pipe := &encodePipeline{}
+	defer pipe.drain()
+	// A job's error is a context error (passed through, so a deadline stays
+	// a timeout) or an encoder panic (a server fault, not relabelled a
+	// client disconnect); only the socket write is the client's.
+	write := func(job *encodeJob) error {
+		defer job.finish()
+		if job.err != nil {
+			return job.err
+		}
+		if _, err := w.Write(job.buf); err != nil {
+			return wrapMsgPackWriteErr(err)
+		}
+		return nil
+	}
+	for colIdx := 0; colIdx < numCols; colIdx++ {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("stream cancelled at column %d: %w", colIdx, ctx.Err())
+		default:
+		}
+		for lo := 0; lo < len(batches); {
+			hi, rows, size := lo, 0, 0
+			for hi < len(batches) && (hi == lo || (rows < msgpackChunkRows && size < msgpackChunkBytes)) {
+				rows += int(batches[hi].NumRows())
+				size += arrayBufferBytes(batches[hi].Column(colIdx))
+				hi++
+			}
+			job := &encodeJob{fill: msgpackColumnFill(ctx, batches[lo:hi], colIdx, lo == 0, rowCount)}
+			for pipe.full() {
+				if err := write(pipe.next()); err != nil {
+					return err
+				}
+			}
+			pipe.submit(job)
+			for pipe.ready() {
+				if err := write(pipe.next()); err != nil {
+					return err
+				}
+			}
+			lo = hi
+		}
+	}
+	for len(pipe.pending) > 0 {
+		if err := write(pipe.next()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// msgpackColumnFill returns a MessagePack job's fill: column colIdx of
+// batches, preceded by the column's array header when header is set.
+func msgpackColumnFill(ctx context.Context, batches []arrow.Record, colIdx int, header bool, rowCount int) func([]byte) ([]byte, error) {
+	return func(buf []byte) ([]byte, error) {
+		out := bytes.NewBuffer(buf)
+		enc := msgpack.GetEncoder()
+		enc.Reset(out)
+		defer func() {
+			enc.Reset(nil)
+			msgpack.PutEncoder(enc)
+		}()
+		if header {
+			if err := enc.EncodeArrayLen(rowCount); err != nil {
+				return nil, err
+			}
+		}
+		if err := encodeColumn(ctx, enc, batches, colIdx); err != nil {
+			return nil, err
+		}
+		return out.Bytes(), nil
+	}
 }

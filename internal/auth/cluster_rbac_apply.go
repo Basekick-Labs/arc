@@ -299,8 +299,7 @@ func (rm *RBACManager) ApplyCreateOrganization(entry ClusterOrganizationEntry) e
 	switch {
 	case queryErr == nil:
 		if existingName == entry.Name {
-			rm.InvalidateAllCache()
-			return nil
+			return rm.markMaterialised("rbac_organizations", entry.ID)
 		}
 		return fmt.Errorf("ApplyCreateOrganization: id %d already exists locally with different name (cluster<->local divergence; see upgrade notes)", entry.ID)
 	case errors.Is(queryErr, sql.ErrNoRows):
@@ -311,8 +310,8 @@ func (rm *RBACManager) ApplyCreateOrganization(entry ClusterOrganizationEntry) e
 
 	if _, insertErr := rm.db.Exec(`
 		INSERT INTO rbac_organizations
-			(id, name, description, created_at, updated_at, enabled)
-		VALUES (?, ?, ?, ?, ?, ?)
+			(id, name, description, created_at, updated_at, enabled, raft_materialised)
+		VALUES (?, ?, ?, ?, ?, ?, 1)
 	`, entry.ID, entry.Name, entry.Description, createdAt, updatedAt, enabled); insertErr != nil {
 		if strings.Contains(insertErr.Error(), "UNIQUE constraint failed") {
 			// Upgrade-seed path: the local SQLite already holds a row
@@ -344,8 +343,8 @@ func (rm *RBACManager) ApplyCreateOrganization(entry ClusterOrganizationEntry) e
 			}
 			if _, insErr := tx.Exec(`
 				INSERT INTO rbac_organizations
-					(id, name, description, created_at, updated_at, enabled)
-				VALUES (?, ?, ?, ?, ?, ?)
+					(id, name, description, created_at, updated_at, enabled, raft_materialised)
+				VALUES (?, ?, ?, ?, ?, ?, 1)
 			`, entry.ID, entry.Name, entry.Description, createdAt, updatedAt, enabled); insErr != nil {
 				return fmt.Errorf("ApplyCreateOrganization: upgrade-seed re-insert: %w", insErr)
 			}
@@ -382,7 +381,7 @@ func (rm *RBACManager) ApplyUpdateOrganization(entry ClusterOrganizationEntry) e
 	result, err := rm.db.Exec(`
 		UPDATE rbac_organizations
 		SET name = ?, description = ?, updated_at = ?, enabled = ?
-		WHERE id = ?
+		WHERE id = ? AND `+rbacClusterOwned+`
 	`, entry.Name, entry.Description, updatedAt, enabled, entry.ID)
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateOrganization: %w", err)
@@ -402,7 +401,7 @@ func (rm *RBACManager) ApplyUpdateOrganization(entry ClusterOrganizationEntry) e
 		rm.logger.Error().
 			Int64("organization_id", entry.ID).
 			Str("name", entry.Name).
-			Msg("ApplyUpdateOrganization: local SQLite row missing — cluster<->local divergence")
+			Msg("ApplyUpdateOrganization: local SQLite row missing or not cluster-materialised — cluster<->local divergence")
 		return fmt.Errorf("ApplyUpdateOrganization: id %d not present in local SQLite cache (cluster<->local divergence)", entry.ID)
 	}
 	rm.InvalidateAllCache()
@@ -419,7 +418,7 @@ func (rm *RBACManager) ApplyDeleteOrganization(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteOrganization: id required")
 	}
-	result, err := rm.db.Exec(`DELETE FROM rbac_organizations WHERE id = ?`, id)
+	result, err := rm.db.Exec(`DELETE FROM rbac_organizations WHERE id = ? AND `+rbacClusterOwned, id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteOrganization: %w", err)
 	}
@@ -430,7 +429,7 @@ func (rm *RBACManager) ApplyDeleteOrganization(id int64) error {
 	if rows == 0 {
 		rm.logger.Warn().
 			Int64("organization_id", id).
-			Msg("ApplyDeleteOrganization: local SQLite row missing (post-state matches; no-op)")
+			Msg("ApplyDeleteOrganization: no cluster-materialised row — already missing, or a local row the cluster does not own, left in place (#1336)")
 	}
 	rm.InvalidateAllCache()
 	return nil
@@ -458,8 +457,7 @@ func (rm *RBACManager) ApplyCreateTeam(entry ClusterTeamEntry) error {
 	switch {
 	case queryErr == nil:
 		if existingOrg == entry.OrganizationID && existingName == entry.Name {
-			rm.InvalidateAllCache()
-			return nil
+			return rm.markMaterialised("rbac_teams", entry.ID)
 		}
 		return fmt.Errorf("ApplyCreateTeam: id %d already exists locally with different content (cluster<->local divergence)", entry.ID)
 	case errors.Is(queryErr, sql.ErrNoRows):
@@ -469,8 +467,8 @@ func (rm *RBACManager) ApplyCreateTeam(entry ClusterTeamEntry) error {
 
 	if _, insertErr := rm.db.Exec(`
 		INSERT INTO rbac_teams
-			(id, organization_id, name, description, created_at, updated_at, enabled)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+			(id, organization_id, name, description, created_at, updated_at, enabled, raft_materialised)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1)
 	`, entry.ID, entry.OrganizationID, entry.Name, entry.Description, createdAt, updatedAt, enabled); insertErr != nil {
 		return fmt.Errorf("ApplyCreateTeam: insert: %w", insertErr)
 	}
@@ -491,7 +489,7 @@ func (rm *RBACManager) ApplyUpdateTeam(entry ClusterTeamEntry) error {
 	result, err := rm.db.Exec(`
 		UPDATE rbac_teams
 		SET name = ?, description = ?, updated_at = ?, enabled = ?
-		WHERE id = ?
+		WHERE id = ? AND `+rbacClusterOwned+`
 	`, entry.Name, entry.Description, updatedAt, enabled, entry.ID)
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateTeam: %w", err)
@@ -506,7 +504,7 @@ func (rm *RBACManager) ApplyUpdateTeam(entry ClusterTeamEntry) error {
 		rm.logger.Error().
 			Int64("team_id", entry.ID).
 			Str("name", entry.Name).
-			Msg("ApplyUpdateTeam: local SQLite row missing — cluster<->local divergence")
+			Msg("ApplyUpdateTeam: local SQLite row missing or not cluster-materialised — cluster<->local divergence")
 		return fmt.Errorf("ApplyUpdateTeam: id %d not present in local SQLite cache (cluster<->local divergence)", entry.ID)
 	}
 	rm.InvalidateAllCache()
@@ -518,7 +516,7 @@ func (rm *RBACManager) ApplyDeleteTeam(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteTeam: id required")
 	}
-	result, err := rm.db.Exec(`DELETE FROM rbac_teams WHERE id = ?`, id)
+	result, err := rm.db.Exec(`DELETE FROM rbac_teams WHERE id = ? AND `+rbacClusterOwned, id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteTeam: %w", err)
 	}
@@ -529,7 +527,7 @@ func (rm *RBACManager) ApplyDeleteTeam(id int64) error {
 	if rows == 0 {
 		rm.logger.Warn().
 			Int64("team_id", id).
-			Msg("ApplyDeleteTeam: local SQLite row missing (post-state matches; no-op)")
+			Msg("ApplyDeleteTeam: no cluster-materialised row — already missing, or a local row the cluster does not own, left in place (#1336)")
 	}
 	rm.InvalidateAllCache()
 	return nil
@@ -553,8 +551,7 @@ func (rm *RBACManager) ApplyCreateRole(entry ClusterRoleEntry) error {
 	switch {
 	case queryErr == nil:
 		if existingTeam == entry.TeamID && existingPattern == entry.DatabasePattern {
-			rm.InvalidateAllCache()
-			return nil
+			return rm.markMaterialised("rbac_roles", entry.ID)
 		}
 		return fmt.Errorf("ApplyCreateRole: id %d already exists locally with different content (cluster<->local divergence)", entry.ID)
 	case errors.Is(queryErr, sql.ErrNoRows):
@@ -564,8 +561,8 @@ func (rm *RBACManager) ApplyCreateRole(entry ClusterRoleEntry) error {
 
 	if _, insertErr := rm.db.Exec(`
 		INSERT INTO rbac_roles
-			(id, team_id, database_pattern, permissions, created_at)
-		VALUES (?, ?, ?, ?, ?)
+			(id, team_id, database_pattern, permissions, created_at, raft_materialised)
+		VALUES (?, ?, ?, ?, ?, 1)
 	`, entry.ID, entry.TeamID, entry.DatabasePattern, entry.Permissions, createdAt); insertErr != nil {
 		return fmt.Errorf("ApplyCreateRole: insert: %w", insertErr)
 	}
@@ -581,7 +578,7 @@ func (rm *RBACManager) ApplyUpdateRole(entry ClusterRoleEntry) error {
 	result, err := rm.db.Exec(`
 		UPDATE rbac_roles
 		SET database_pattern = ?, permissions = ?
-		WHERE id = ?
+		WHERE id = ? AND `+rbacClusterOwned+`
 	`, entry.DatabasePattern, entry.Permissions, entry.ID)
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateRole: %w", err)
@@ -595,7 +592,7 @@ func (rm *RBACManager) ApplyUpdateRole(entry ClusterRoleEntry) error {
 		// — see ApplyUpdateOrganization comment above for rationale.
 		rm.logger.Error().
 			Int64("role_id", entry.ID).
-			Msg("ApplyUpdateRole: local SQLite row missing — cluster<->local divergence")
+			Msg("ApplyUpdateRole: local SQLite row missing or not cluster-materialised — cluster<->local divergence")
 		return fmt.Errorf("ApplyUpdateRole: id %d not present in local SQLite cache (cluster<->local divergence)", entry.ID)
 	}
 	rm.InvalidateAllCache()
@@ -607,7 +604,7 @@ func (rm *RBACManager) ApplyDeleteRole(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteRole: id required")
 	}
-	result, err := rm.db.Exec(`DELETE FROM rbac_roles WHERE id = ?`, id)
+	result, err := rm.db.Exec(`DELETE FROM rbac_roles WHERE id = ? AND `+rbacClusterOwned, id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteRole: %w", err)
 	}
@@ -618,7 +615,7 @@ func (rm *RBACManager) ApplyDeleteRole(id int64) error {
 	if rows == 0 {
 		rm.logger.Warn().
 			Int64("role_id", id).
-			Msg("ApplyDeleteRole: local SQLite row missing (post-state matches; no-op)")
+			Msg("ApplyDeleteRole: no cluster-materialised row — already missing, or a local row the cluster does not own, left in place (#1336)")
 	}
 	rm.InvalidateAllCache()
 	return nil
@@ -641,8 +638,7 @@ func (rm *RBACManager) ApplyCreateMeasurementPermission(entry ClusterMeasurement
 	switch {
 	case queryErr == nil:
 		if existingRole == entry.RoleID && existingPattern == entry.MeasurementPattern {
-			rm.InvalidateAllCache()
-			return nil
+			return rm.markMaterialised("rbac_measurement_permissions", entry.ID)
 		}
 		return fmt.Errorf("ApplyCreateMeasurementPermission: id %d already exists locally with different content (cluster<->local divergence)", entry.ID)
 	case errors.Is(queryErr, sql.ErrNoRows):
@@ -652,8 +648,8 @@ func (rm *RBACManager) ApplyCreateMeasurementPermission(entry ClusterMeasurement
 
 	if _, insertErr := rm.db.Exec(`
 		INSERT INTO rbac_measurement_permissions
-			(id, role_id, measurement_pattern, permissions, created_at)
-		VALUES (?, ?, ?, ?, ?)
+			(id, role_id, measurement_pattern, permissions, created_at, raft_materialised)
+		VALUES (?, ?, ?, ?, ?, 1)
 	`, entry.ID, entry.RoleID, entry.MeasurementPattern, entry.Permissions, createdAt); insertErr != nil {
 		return fmt.Errorf("ApplyCreateMeasurementPermission: insert: %w", insertErr)
 	}
@@ -667,7 +663,7 @@ func (rm *RBACManager) ApplyDeleteMeasurementPermission(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteMeasurementPermission: id required")
 	}
-	result, err := rm.db.Exec(`DELETE FROM rbac_measurement_permissions WHERE id = ?`, id)
+	result, err := rm.db.Exec(`DELETE FROM rbac_measurement_permissions WHERE id = ? AND `+rbacClusterOwned, id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteMeasurementPermission: %w", err)
 	}
@@ -678,7 +674,7 @@ func (rm *RBACManager) ApplyDeleteMeasurementPermission(id int64) error {
 	if rows == 0 {
 		rm.logger.Warn().
 			Int64("measurement_permission_id", id).
-			Msg("ApplyDeleteMeasurementPermission: local SQLite row missing (post-state matches; no-op)")
+			Msg("ApplyDeleteMeasurementPermission: no cluster-materialised row — already missing, or a local row the cluster does not own, left in place (#1336)")
 	}
 	rm.InvalidateAllCache()
 	return nil
@@ -701,8 +697,7 @@ func (rm *RBACManager) ApplyAddTokenToTeam(entry ClusterTokenMembershipEntry) er
 	switch {
 	case queryErr == nil:
 		if existingTokenID == entry.TokenID && existingTeamID == entry.TeamID {
-			rm.InvalidateTokenCache(entry.TokenID)
-			return nil
+			return rm.markMaterialised("rbac_token_memberships", entry.ID)
 		}
 		return fmt.Errorf("ApplyAddTokenToTeam: id %d already exists locally with different content (cluster<->local divergence)", entry.ID)
 	case errors.Is(queryErr, sql.ErrNoRows):
@@ -712,8 +707,8 @@ func (rm *RBACManager) ApplyAddTokenToTeam(entry ClusterTokenMembershipEntry) er
 
 	if _, insertErr := rm.db.Exec(`
 		INSERT INTO rbac_token_memberships
-			(id, token_id, team_id, created_at)
-		VALUES (?, ?, ?, ?)
+			(id, token_id, team_id, created_at, raft_materialised)
+		VALUES (?, ?, ?, ?, 1)
 	`, entry.ID, entry.TokenID, entry.TeamID, createdAt); insertErr != nil {
 		// A SQLite UNIQUE(token_id, team_id) collision means a pre-A.1
 		// AUTOINCREMENT row had the same pair under a different ID —
@@ -747,8 +742,33 @@ func (rm *RBACManager) ApplyRemoveTokenFromTeam(tokenID, teamID int64) error {
 		rm.logger.Warn().
 			Int64("token_id", tokenID).
 			Int64("team_id", teamID).
-			Msg("ApplyRemoveTokenFromTeam: local SQLite row missing (post-state matches; no-op)")
+			Msg("ApplyRemoveTokenFromTeam: no cluster-materialised row — already missing, or a local row the cluster does not own, left in place (#1336)")
 	}
 	rm.InvalidateTokenCache(tokenID)
 	return nil
 }
+
+// markMaterialised records that the row at id in table is the cluster's
+// (#1336), then drops the RBAC cache. Called when a create apply finds the
+// row already present with the same identity: log replay, or a row written
+// before the marker existed. table is one of the five fixed RBAC table names,
+// never caller input.
+func (rm *RBACManager) markMaterialised(table string, id int64) error {
+	if _, err := rm.db.Exec(`UPDATE `+table+` SET raft_materialised = 1 WHERE id = ?`, id); err != nil {
+		rm.InvalidateAllCache()
+		return fmt.Errorf("mark %s id %d as cluster-materialised: %w", table, id, err)
+	}
+	rm.InvalidateAllCache()
+	return nil
+}
+
+// rbacClusterOwned is the WHERE clause an id-keyed RBAC update or delete
+// apply adds (#1336): the row must be the cluster's. Until this node's first
+// reconcile there is no cluster_auth_reconcile_state row, and RBAC rows
+// written before the marker existed are still unmarked, so until then the
+// applies reach any row at the id, as before #1336. The first reconcile marks
+// every row it can match to the FSM; from then on a local row that merely
+// shares an id is left alone. (Membership removal is keyed by the
+// (token, team) pair, which is the same grant whatever its id, and is not
+// gated at all.)
+const rbacClusterOwned = `(raft_materialised = 1 OR NOT EXISTS (SELECT 1 FROM cluster_auth_reconcile_state))`
