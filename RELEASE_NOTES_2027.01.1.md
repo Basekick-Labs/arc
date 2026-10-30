@@ -5080,10 +5080,10 @@ every earlier `total_gb` value is the process footprint, not a machine size.
 - `total_gb` is now the machine's memory: `/proc/meminfo` `MemTotal` on Linux,
   `hw.memsize` on macOS. The unit is GiB, as before.
 - A new `usable_gb` is what a cgroup limit leaves the process, the memory
-  counterpart of `usable_cores`. It is the same reading the compaction
-  subprocess budget uses: the lower of `memory.max` and `memory.high`, so with
-  Kubernetes MemoryQoS a 2Gi pod reports a little under 2. With no limit it
-  equals `total_gb`.
+  counterpart of `usable_cores`. It is the same detection the ingest buffer
+  sizes itself from: the lower of `memory.max` and `memory.high`, so with the
+  Kubernetes MemoryQoS feature gate enabled a 2Gi pod reports about 1.8. With
+  no limit it equals `total_gb`.
 
 Inside a container `total_gb` is the host's memory, unless lxcfs is mounted
 over `/proc/meminfo`, in which case it reads as the container limit. Both values

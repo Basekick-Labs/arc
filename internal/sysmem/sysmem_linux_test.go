@@ -213,11 +213,18 @@ func TestPhysicalImpliesLimit(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			withFS(t, files)
-			if _, _, ok := Physical(); !ok {
+			phys, _, ok := Physical()
+			if !ok {
 				t.Fatal("Physical() not ok")
 			}
-			if _, _, ok := Limit(); !ok {
+			lim, _, ok := Limit()
+			if !ok {
 				t.Fatal("Physical() succeeded but Limit() did not")
+			}
+			// With no effective limit the two agree; the docs promise
+			// usable_gb == total_gb there.
+			if lim != phys {
+				t.Fatalf("Limit() = %d, want Physical() = %d with no limit", lim, phys)
 			}
 		})
 	}

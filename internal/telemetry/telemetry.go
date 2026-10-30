@@ -143,14 +143,14 @@ type MemInfo struct {
 }
 
 // readMemory takes the memory figures once, when the collector is built at
-// startup. That is the figure Arc sized itself against (the compaction
-// subprocess budget and the ingest buffer read sysmem.Limit at startup too),
-// and it matches usable_cores, which is also a startup reading. A limit changed
+// startup. That is the figure Arc sized itself against (the ingest buffer reads
+// sysmem.Limit at startup, and so does the compaction subprocess budget when no
+// memory limit is configured), and it matches usable_cores, which is also a startup reading. A limit changed
 // in place without a restart is therefore reported from the next start. It
 // also keeps file reads, which may sit on an lxcfs FUSE mount, out of the
 // report loop that Stop waits on.
 func readMemory() (total, usable *float64) {
-	gib := func(fn func() (uint64, sysmem.Source, bool)) *float64 {
+	inGiB := func(fn func() (uint64, sysmem.Source, bool)) *float64 {
 		b, _, ok := fn()
 		if !ok {
 			return nil
@@ -158,7 +158,7 @@ func readMemory() (total, usable *float64) {
 		v := float64(b) / (1024 * 1024 * 1024)
 		return &v
 	}
-	return gib(physicalMemFn), gib(usableMemFn)
+	return inGiB(physicalMemFn), inGiB(usableMemFn)
 }
 
 // New creates a new telemetry collector
