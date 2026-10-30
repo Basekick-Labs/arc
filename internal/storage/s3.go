@@ -175,6 +175,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
+			configureGCSS3Options(endpoint, o)
 		})
 		log.Info().Str("endpoint", endpoint).Msg("Using custom S3 endpoint")
 	}
@@ -194,6 +195,9 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
 		u.PartSize = multipartPartSize
 		u.Concurrency = multipartConcurrency
+		// The uploader has its own checksum policy; inherit the client's GCS
+		// interoperability setting instead of re-enabling optional trailers.
+		u.RequestChecksumCalculation = client.Options().RequestChecksumCalculation
 	})
 
 	// Validate the prefix rather than repairing it. A prefix that cannot form
