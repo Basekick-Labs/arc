@@ -195,9 +195,11 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
 		u.PartSize = multipartPartSize
 		u.Concurrency = multipartConcurrency
-		// The uploader has its own checksum policy; inherit the client's GCS
-		// interoperability setting instead of re-enabling optional trailers.
-		u.RequestChecksumCalculation = client.Options().RequestChecksumCalculation
+		// The uploader has its own checksum policy. Apply the GCS exception
+		// without changing other endpoints' existing multipart defaults.
+		if _, gcs := client.Options().HTTPSignerV4.(*gcsS3Signer); gcs {
+			u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		}
 	})
 
 	// Validate the prefix rather than repairing it. A prefix that cannot form

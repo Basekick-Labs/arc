@@ -106,3 +106,24 @@ func TestGCSS3OptionsEndpointScope(t *testing.T) {
 		})
 	}
 }
+
+func TestNonGCSS3UploaderRetainsChecksumDefault(t *testing.T) {
+	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "WHEN_REQUIRED")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	defer server.Close()
+	backend, err := NewS3Backend(&S3Config{Bucket: "test", Region: "us-east-1", Endpoint: server.URL, PathStyle: true, AccessKey: "test", SecretKey: "test-secret"}, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	if backend.client.Options().RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired {
+		t.Fatal("test must exercise non-default client checksum policy")
+	}
+	if backend.uploader.RequestChecksumCalculation != aws.RequestChecksumCalculationWhenSupported {
+		t.Fatal("non-GCS multipart checksum default changed")
+	}
+}
