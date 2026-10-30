@@ -167,3 +167,65 @@ func TestLimit_Composition(t *testing.T) {
 		})
 	}
 }
+
+// Physical ignores every cgroup limit and reads the machine.
+func TestPhysical(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		files  map[string]string
+		want   uint64
+		wantOK bool
+	}{
+		{
+			name: "cgroup limit does not change physical",
+			files: map[string]string{
+				"sys/fs/cgroup/memory.max": "2147483648\n",
+				"proc/meminfo":             meminfo16GiB,
+			},
+			want: 16 * oneGiB, wantOK: true,
+		},
+		{name: "no meminfo", files: map[string]string{"sys/fs/cgroup/memory.max": "2147483648\n"}},
+		{name: "malformed meminfo", files: map[string]string{"proc/meminfo": "MemTotal: 167"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			withFS(t, c.files)
+			got, source, ok := Physical()
+			if ok != c.wantOK || got != c.want {
+				t.Fatalf("Physical() = (%d, %s, %v), want (%d, %v)", got, source, ok, c.want, c.wantOK)
+			}
+			if ok && source != SourceMemInfo {
+				t.Fatalf("source = %s, want %s", source, SourceMemInfo)
+			}
+		})
+	}
+}
+
+// The telemetry collector's "which reports carry a real total_gb" query keys
+// off usable_gb being non-null (#1412). That holds only while Limit falls back
+// to host memory with no cgroup limit, so a readable machine always yields a
+// usable figure too. If Limit ever starts answering "no limit" instead, this
+// fails, and that query has to change with it.
+func TestPhysicalImpliesLimit(t *testing.T) {
+	for name, files := range map[string]map[string]string{
+		"meminfo only":       {"proc/meminfo": meminfo16GiB},
+		"cgroup v2 max":      {"proc/meminfo": meminfo16GiB, "sys/fs/cgroup/memory.max": "max\n"},
+		"cgroup v1 sentinel": {"proc/meminfo": meminfo16GiB, "sys/fs/cgroup/memory/memory.limit_in_bytes": "9223372036854771712\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withFS(t, files)
+			phys, _, ok := Physical()
+			if !ok {
+				t.Fatal("Physical() not ok")
+			}
+			lim, _, ok := Limit()
+			if !ok {
+				t.Fatal("Physical() succeeded but Limit() did not")
+			}
+			// With no effective limit the two agree; the docs promise
+			// usable_gb == total_gb there.
+			if lim != phys {
+				t.Fatalf("Limit() = %d, want Physical() = %d with no limit", lim, phys)
+			}
+		})
+	}
+}

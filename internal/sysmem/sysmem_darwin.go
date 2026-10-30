@@ -18,6 +18,11 @@ import "golang.org/x/sys/unix"
 // is zero. 36 GiB is 0x900000000, so its last byte is zero and the value would
 // come back as 7 bytes.
 func limit() (uint64, Source, bool) {
+	return physical()
+}
+
+// physical reads hw.memsize.
+func physical() (uint64, Source, bool) {
 	v, err := unix.SysctlUint64("hw.memsize")
 	if err != nil || v == 0 {
 		return 0, SourceUnknown, false
