@@ -62,7 +62,11 @@ func TestMemoryIsReadAtStartup(t *testing.T) {
 	withMemSeams(t, read, read)
 	c := newTestCollector(t)
 	val = 1 * gib
-	if p := c.collectPayload(); p.Memory.UsableGB == nil || *p.Memory.UsableGB != 8 {
+	p := c.collectPayload()
+	if p.Memory.TotalGB == nil || *p.Memory.TotalGB != 8 {
+		t.Errorf("total_gb = %v, want the startup reading 8", p.Memory.TotalGB)
+	}
+	if p.Memory.UsableGB == nil || *p.Memory.UsableGB != 8 {
 		t.Errorf("usable_gb = %v, want the startup reading 8", p.Memory.UsableGB)
 	}
 }
