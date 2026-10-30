@@ -1,14 +1,18 @@
-// Package sysmem reports how much memory this process may actually use.
+// Package sysmem reports the machine's memory and how much of it this process
+// may actually use.
 //
-// It exists for one narrow reason. DuckDB already performs its own cgroup-aware
-// detection — duckdb::CGroups::GetMemoryLimit is in the linked library, and with
-// no memory_limit set DuckDB defaults to 80% of the detected limit — so Arc does
-// NOT need this to size the main database. What Arc does need it for is the
-// compaction subprocess limit: those are separate processes in the SAME cgroup,
-// and if each one falls back to DuckDB's own default they take 80% of the whole
-// container each, so a main process plus two subprocesses budgets 240% of the
-// box. Dividing a share requires a concrete number, and that is what this
+// Limit exists for the compaction subprocess budget. DuckDB already performs its
+// own cgroup-aware detection — duckdb::CGroups::GetMemoryLimit is in the linked
+// library, and with no memory_limit set DuckDB defaults to 80% of the detected
+// limit — so Arc does NOT need this to size the main database. What Arc does need
+// it for is the compaction subprocess limit: those are separate processes in the
+// SAME cgroup, and if each one falls back to DuckDB's own default they take 80% of
+// the whole container each, so a main process plus two subprocesses budgets 240%
+// of the box. Dividing a share requires a concrete number, and that is what this
 // package supplies.
+//
+// Physical exists for telemetry, which reports the machine's memory beside the
+// usable limit, the way it reports logical_cores beside usable_cores (#1412).
 //
 // Everything that parses or decides lives in this file, deliberately untagged,
 // so the table tests run on every platform. Only the I/O is platform-split, in
@@ -51,6 +55,18 @@ var rootFS fs.FS = os.DirFS("/")
 // whatever behaviour they had rather than substituting a guess.
 func Limit() (bytes uint64, source Source, ok bool) {
 	return limit()
+}
+
+// Physical reports the machine's total memory, ignoring any cgroup limit:
+// /proc/meminfo MemTotal on Linux, hw.memsize on macOS.
+//
+// Inside a container /proc/meminfo is the host's, unless lxcfs is mounted over
+// it, in which case it reads as the container limit.
+//
+// ok is false when it cannot be read; callers must report nothing rather than
+// substitute a guess.
+func Physical() (bytes uint64, source Source, ok bool) {
+	return physical()
 }
 
 // readFileLimited reads a small file, bounded. Paths are rootFS-relative, i.e.
