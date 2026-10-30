@@ -2,6 +2,14 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Google Cloud Storage through the S3-compatible endpoint (#1399)
+
+GCS S3 interoperability now leaves `Accept-Encoding` out of request signatures
+while preserving the SDK's identity encoding on the wire. Optional upload
+checksum trailers are disabled for `storage.googleapis.com`, allowing object
+writes without the SDK's streaming trailer format. Other S3 endpoints retain
+their existing signing and checksum behavior.
+
 ## Fix: cluster cache invalidation reaches peers with wildcard API addresses (#1398)
 
 Cache-invalidation fan-out now resolves hostless and wildcard API addresses
