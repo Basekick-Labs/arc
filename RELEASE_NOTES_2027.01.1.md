@@ -1845,8 +1845,8 @@ The execution-history endpoint now includes runs whose duration is still
 `NULL`. Their existing numeric `execution_duration_ms` field is `0` until the
 run completes; completed and failed durations are unchanged.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) for
-[#1415](https://github.com/Basekick-Labs/arc/issues/1415).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1417](https://github.com/Basekick-Labs/arc/pull/1417).
 
 ### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column ([#1409](https://github.com/Basekick-Labs/arc/pull/1409))
 
