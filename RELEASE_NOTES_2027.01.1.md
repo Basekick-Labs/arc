@@ -4989,6 +4989,16 @@ leader writer, or compaction and reconciliation on the active compactor
 ([#1214](https://github.com/Basekick-Labs/arc/issues/1214)). Files already left
 unregistered by earlier versions are not picked up retroactively.
 
+### Legacy standalone restores preserve unverifiable cold objects ([#1189](https://github.com/Basekick-Labs/arc/issues/1189))
+
+Standalone tier scans rebuild cold metadata from the cold listing. When a
+pre-stage-C backup has no per-file sidecar row for an object already held in
+cold storage, restore leaves that object untouched and reports
+`cold_rows_skipped_unverifiable` instead of replacing the only cold copy with
+bytes it cannot verify.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1205](https://github.com/Basekick-Labs/arc/pull/1205).
+
 ### The cold-tier storage backend closes during shutdown ([#1103](https://github.com/Basekick-Labs/arc/issues/1103))
 
 The S3 or Azure backend used by tiering is now closed with the other storage
