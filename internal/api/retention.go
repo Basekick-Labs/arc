@@ -1136,8 +1136,12 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 	var executions []RetentionExecution
 	for rows.Next() {
 		var ex RetentionExecution
-		if err := rows.Scan(&ex.ID, &ex.PolicyID, &ex.ExecutionTime, &ex.Status, &ex.DeletedCount, &ex.CutoffDate, &ex.ExecutionDurationMs, &ex.ErrorMessage); err != nil {
+		var executionDurationMs sql.NullFloat64
+		if err := rows.Scan(&ex.ID, &ex.PolicyID, &ex.ExecutionTime, &ex.Status, &ex.DeletedCount, &ex.CutoffDate, &executionDurationMs, &ex.ErrorMessage); err != nil {
 			continue
+		}
+		if executionDurationMs.Valid {
+			ex.ExecutionDurationMs = executionDurationMs.Float64
 		}
 		executions = append(executions, ex)
 	}

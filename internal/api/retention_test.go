@@ -72,6 +72,81 @@ func setupTestRetentionHandler(t *testing.T) (*RetentionHandler, string) {
 	return handler, tmpDir
 }
 
+func TestGetExecutionsIncludesRunningExecutions(t *testing.T) {
+	handler, _ := setupTestRetentionHandler(t)
+
+	result, err := handler.db.Exec(`
+		INSERT INTO retention_policies (name, database, retention_days, buffer_days, is_active)
+		VALUES (?, ?, ?, ?, ?)
+	`, "p", "testdb", 30, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runningID := handler.recordExecutionStart(policyID, time.Now())
+	if runningID == 0 {
+		t.Fatal("recordExecutionStart() returned 0")
+	}
+	completedID := handler.recordExecutionStart(policyID, time.Now())
+	handler.recordExecutionComplete(completedID, "completed", 5, 12.5, "")
+	failedID := handler.recordExecutionStart(policyID, time.Now())
+	handler.recordExecutionComplete(failedID, "failed", 2, 24.75, "cold store unavailable")
+
+	app := fiber.New()
+	app.Get("/api/v1/retention/:id/executions", handler.handleGetExecutions)
+	resp, err := app.Test(httptest.NewRequest("GET", "/api/v1/retention/"+strconv.FormatInt(policyID, 10)+"/executions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusOK)
+	}
+
+	var body struct {
+		PolicyID   int64                `json:"policy_id"`
+		Executions []RetentionExecution `json:"executions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.PolicyID != policyID {
+		t.Fatalf("policy_id = %d, want %d", body.PolicyID, policyID)
+	}
+	if len(body.Executions) != 3 {
+		t.Fatalf("got %d executions, want 3: %+v", len(body.Executions), body.Executions)
+	}
+
+	byStatus := make(map[string]RetentionExecution, len(body.Executions))
+	for _, execution := range body.Executions {
+		byStatus[execution.Status] = execution
+	}
+	if execution, ok := byStatus["running"]; !ok {
+		t.Fatal("running execution is missing from history")
+	} else if execution.ExecutionDurationMs != 0 {
+		t.Errorf("running execution duration = %v, want 0", execution.ExecutionDurationMs)
+	}
+	if execution, ok := byStatus["completed"]; !ok {
+		t.Fatal("completed execution is missing from history")
+	} else if execution.ExecutionDurationMs != 12.5 {
+		t.Errorf("completed execution duration = %v, want 12.5", execution.ExecutionDurationMs)
+	}
+	if execution, ok := byStatus["failed"]; !ok {
+		t.Fatal("failed execution is missing from history")
+	} else {
+		if execution.ExecutionDurationMs != 24.75 {
+			t.Errorf("failed execution duration = %v, want 24.75", execution.ExecutionDurationMs)
+		}
+		if execution.ErrorMessage == nil || *execution.ErrorMessage != "cold store unavailable" {
+			t.Errorf("failed execution error = %v, want cold store unavailable", execution.ErrorMessage)
+		}
+	}
+}
+
 // Retention resolves a listed key to the location the backend actually wrote
 // it to. Before #746 it built "s3://{bucket}/{key}" with no prefix, so on a
 // deployment with storage.s3_prefix set every file 404'd, the per-file read
