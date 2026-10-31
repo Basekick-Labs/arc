@@ -3169,6 +3169,14 @@ one). `/api/v1/query/arrow` was not affected. The query-management API still
 reports `is_parallel` and `partition_count`; they are now always `false` and
 omitted.
 
+### Query execution metrics distinguish DuckDB and Arcx
+
+Prometheus now exports query execution outcomes and a latency histogram by
+engine, including failed executions. The existing aggregate query counters
+remain available.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292).
+
 ### A new hour is queryable at its first flush; DELETE, retention and database delete no longer break query results
 
 The query path caches which hour partitions exist, for up to a minute and
@@ -3256,7 +3264,6 @@ cannot forward to a peer that has it enabled: the peer answers `401`. The
 signed identity is valid for 30 seconds, so the clocks of a cluster's nodes
 must agree within that for forwarded requests to be accepted (joins already
 require 5 minutes).
-
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,

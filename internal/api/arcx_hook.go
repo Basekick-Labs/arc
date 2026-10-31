@@ -247,13 +247,14 @@ func (h *QueryHandler) tryArcxRouterArrow(
 		// error metric, not a success — but the rows already on the wire still count.
 		if ipcErr != nil {
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineArcx, false, time.Since(start).Microseconds())
 			if onFail != nil {
 				onFail(ipcErr.Error())
 			}
 		} else {
 			m.IncQuerySuccess()
 			m.IncQueryRows(int64(rows))
-			m.RecordQueryLatency(time.Since(start).Microseconds())
+			m.RecordQueryLatencyForEngine(metrics.QueryEngineArcx, time.Since(start).Microseconds())
 			if onComplete != nil {
 				onComplete(rows)
 			}
@@ -329,6 +330,8 @@ func (h *QueryHandler) serveArcxResult(
 			if cancel != nil {
 				cancel()
 			}
+			metrics.Get().IncQueryErrors()
+			metrics.Get().RecordQueryEngineExecution(metrics.QueryEngineArcx, false, time.Since(start).Microseconds())
 			if onFail != nil {
 				onFail(derr.Error())
 			}
@@ -383,7 +386,7 @@ func (h *QueryHandler) serveArcxResult(
 			// working, which is disqualifying for a production flip.
 			m.IncQuerySuccess()
 			m.IncQueryRows(int64(rowCount))
-			m.RecordQueryLatency(time.Since(start).Microseconds())
+			m.RecordQueryLatencyForEngine(metrics.QueryEngineArcx, time.Since(start).Microseconds())
 			if onComplete != nil {
 				onComplete(rowCount)
 			}
@@ -426,6 +429,7 @@ func (h *QueryHandler) serveArcxResult(
 			// DuckDB path uses (query_arrow_json.go) — so the alarm is honest without
 			// contradicting what the client was sent.
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineArcx, false, time.Since(start).Microseconds())
 			h.streamErrEvent(serr).Err(serr).
 				Int("rows_sent", rc).
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
@@ -439,6 +443,7 @@ func (h *QueryHandler) serveArcxResult(
 			// partial-as-success silently. Same reasoning as above: the success envelope
 			// is already on the wire, so this is a truncation, not a request failure.
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineArcx, false, time.Since(start).Microseconds())
 			h.logger.Error().Err(rerr).
 				Int("rows_sent", rc).
 				Msg("arcx serve: json stream engine error mid-drain (partial result served)")
@@ -449,7 +454,7 @@ func (h *QueryHandler) serveArcxResult(
 			// F1: the DuckDB path's completion metrics.
 			m.IncQuerySuccess()
 			m.IncQueryRows(int64(rc))
-			m.RecordQueryLatency(time.Since(start).Microseconds())
+			m.RecordQueryLatencyForEngine(metrics.QueryEngineArcx, time.Since(start).Microseconds())
 			if onComplete != nil {
 				onComplete(rc)
 			}

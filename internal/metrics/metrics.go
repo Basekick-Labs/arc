@@ -62,6 +62,8 @@ type Metrics struct {
 	querySlowTotal     atomic.Int64
 	queryLatencySum    atomic.Int64 // microseconds
 	queryLatencyCount  atomic.Int64
+	queryExecutions    [2][2]atomic.Int64 // engine (DuckDB, arcx) by outcome (success, error)
+	queryEngineLatency [2]queryLatencyHistogram
 
 	// Client-disconnect mid-stream counters, broken out by streaming
 	// handler so operators can disambiguate "Grafana panels giving up"
@@ -408,6 +410,78 @@ type Metrics struct {
 	logger zerolog.Logger
 }
 
+// Query engines are a closed label set. Keep these values stable: they are
+// exported as Prometheus labels and must not contain request-controlled data.
+const (
+	QueryEngineDuckDB = "duckdb"
+	QueryEngineArcx   = "arcx"
+)
+
+const (
+	queryOutcomeSuccess = iota
+	queryOutcomeError
+)
+
+type queryLatencyHistogram struct {
+	buckets [11]atomic.Int64
+	sum     atomic.Int64 // microseconds
+	count   atomic.Int64
+}
+
+// RecordQueryEngineExecution records completed engine executions and their latency.
+// The buckets are 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 30s,
+// and +Inf. Query latency is recorded for failures as well as successes.
+func (m *Metrics) RecordQueryEngineExecution(engine string, succeeded bool, durationMicros int64) {
+	var engineIndex int
+	switch engine {
+	case QueryEngineDuckDB:
+		engineIndex = 0
+	case QueryEngineArcx:
+		engineIndex = 1
+	default:
+		return
+	}
+	if durationMicros < 0 {
+		durationMicros = 0
+	}
+	outcomeIndex := queryOutcomeError
+	if succeeded {
+		outcomeIndex = queryOutcomeSuccess
+	}
+	m.queryExecutions[engineIndex][outcomeIndex].Add(1)
+	h := &m.queryEngineLatency[engineIndex]
+	h.sum.Add(durationMicros)
+	h.count.Add(1)
+	h.buckets[queryLatencyBucket(durationMicros)].Add(1)
+}
+
+func queryLatencyBucket(micros int64) int {
+	switch {
+	case micros <= 10_000:
+		return 0
+	case micros <= 50_000:
+		return 1
+	case micros <= 100_000:
+		return 2
+	case micros <= 250_000:
+		return 3
+	case micros <= 500_000:
+		return 4
+	case micros <= 1_000_000:
+		return 5
+	case micros <= 2_500_000:
+		return 6
+	case micros <= 5_000_000:
+		return 7
+	case micros <= 10_000_000:
+		return 8
+	case micros <= 30_000_000:
+		return 9
+	default:
+		return 10
+	}
+}
+
 var (
 	instance *Metrics
 	once     sync.Once
@@ -502,8 +576,15 @@ func (m *Metrics) IncQueryRows(count int64) { m.queryRowsTotal.Add(count) }
 
 // RecordQueryLatency records query latency in microseconds
 func (m *Metrics) RecordQueryLatency(durationMicros int64) {
+	m.RecordQueryLatencyForEngine(QueryEngineDuckDB, durationMicros)
+}
+
+// RecordQueryLatencyForEngine preserves the aggregate latency summary while
+// recording the completed query under its serving engine.
+func (m *Metrics) RecordQueryLatencyForEngine(engine string, durationMicros int64) {
 	m.queryLatencySum.Add(durationMicros)
 	m.queryLatencyCount.Add(1)
+	m.RecordQueryEngineExecution(engine, true, durationMicros)
 }
 
 // Label values for the arc_query_client_disconnects_total Prometheus
@@ -1177,6 +1258,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_rows_total":     m.queryRowsTotal.Load(),
 		"query_latency_sum_us": m.queryLatencySum.Load(),
 		"query_latency_count":  m.queryLatencyCount.Load(),
+		"query_engine_executions": map[string]map[string]int64{
+			QueryEngineDuckDB: queryEngineExecutionSnapshot(&m.queryExecutions[0]),
+			QueryEngineArcx:   queryEngineExecutionSnapshot(&m.queryExecutions[1]),
+		},
 
 		"query_client_disconnects_arrow_ipc_total":  m.queryDisconnectsArrowIPC.Load(),
 		"query_client_disconnects_arrow_json_total": m.queryDisconnectsArrowJSON.Load(),
@@ -1492,6 +1577,37 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_errors_total Failed queries\n"...)
 	b = append(b, "# TYPE arc_query_errors_total counter\n"...)
 	b = appendMetric(b, "arc_query_errors_total", float64(m.queryErrorsTotal.Load()))
+
+	// Per-engine execution outcomes and latency. The label set is deliberately
+	// fixed to the engines Arc can dispatch to; request data is never used here.
+	b = append(b, "# HELP arc_query_engine_executions_total Completed query executions by engine and outcome\n"...)
+	b = append(b, "# TYPE arc_query_engine_executions_total counter\n"...)
+	engineNames := [...]string{QueryEngineDuckDB, QueryEngineArcx}
+	outcomeNames := [...]string{"success", "error"}
+	for engineIndex, engine := range engineNames {
+		for outcomeIndex, outcome := range outcomeNames {
+			b = appendMetricWithLabels(b, "arc_query_engine_executions_total",
+				[]string{"engine", "outcome"}, []string{engine, outcome},
+				float64(m.queryExecutions[engineIndex][outcomeIndex].Load()))
+		}
+	}
+
+	b = append(b, "# HELP arc_query_latency_seconds Query execution latency by engine\n"...)
+	b = append(b, "# TYPE arc_query_latency_seconds histogram\n"...)
+	queryLatencyBucketLabels := [...]string{"0.01", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "+Inf"}
+	for engineIndex, engine := range engineNames {
+		h := &m.queryEngineLatency[engineIndex]
+		var cumulative int64
+		for i, label := range queryLatencyBucketLabels {
+			cumulative += h.buckets[i].Load()
+			b = appendMetricWithLabels(b, "arc_query_latency_seconds_bucket",
+				[]string{"engine", "le"}, []string{engine, label}, float64(cumulative))
+		}
+		b = appendMetricWithLabel(b, "arc_query_latency_seconds_sum", "engine", engine,
+			float64(h.sum.Load())/1_000_000.0)
+		b = appendMetricWithLabel(b, "arc_query_latency_seconds_count", "engine", engine,
+			float64(h.count.Load()))
+	}
 
 	b = append(b, "# HELP arc_query_timeouts_total Queries that exceeded timeout\n"...)
 	b = append(b, "# TYPE arc_query_timeouts_total counter\n"...)
@@ -2148,6 +2264,31 @@ func appendMetricWithLabel(b []byte, name, labelName, labelValue string, value f
 	b = appendFloat(b, value)
 	b = append(b, '\n')
 	return b
+}
+
+func appendMetricWithLabels(b []byte, name string, labelNames, labelValues []string, value float64) []byte {
+	b = append(b, name...)
+	b = append(b, '{')
+	for i := range labelNames {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, labelNames[i]...)
+		b = append(b, '=', '"')
+		b = append(b, labelValues[i]...)
+		b = append(b, '"')
+	}
+	b = append(b, '}', ' ')
+	b = appendFloat(b, value)
+	b = append(b, '\n')
+	return b
+}
+
+func queryEngineExecutionSnapshot(counters *[2]atomic.Int64) map[string]int64 {
+	return map[string]int64{
+		"success": counters[queryOutcomeSuccess].Load(),
+		"error":   counters[queryOutcomeError].Load(),
+	}
 }
 
 func appendFloat(b []byte, v float64) []byte {
