@@ -1839,6 +1839,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### ArcX Arrow IPC honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
+
+ArcX-served Arrow IPC responses now enforce `MaxRows` and declare trailers for
+truncation, execution time and capped rows, consistent with the DuckDB path.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1294](https://github.com/Basekick-Labs/arc/pull/1294).
+
 ### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column ([#1409](https://github.com/Basekick-Labs/arc/pull/1409))
 
 With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes each

@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/basekick-labs/arc/internal/arcxrouter"
 	"github.com/basekick-labs/arc/internal/metrics"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
@@ -99,6 +98,9 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	execCtx context.Context,
 	cancel context.CancelFunc,
 	rawSQL, headerDB, convertedSQL string,
+	governanceMaxRows int,
+	onRows func(int64),
+	onDisconnect func(),
 	onComplete func(int),
 	onFail func(string),
 ) (handled bool) {
@@ -127,138 +129,13 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	if !served {
 		return false
 	}
-	// arcx served a STREAMING reader — write each batch as Arrow IPC (true streaming, no
-	// concat). FFI CLIFF: the reader's Release is a no-op and the arcx buffers free on a GC
-	// finalizer, so runtime.KeepAlive(reader) as the callback's LAST statement holds them
-	// alive across the async write. reader.Err() is checked after the loop so a mid-stream
-	// engine error alarms instead of silently truncating.
-	schema := reader.Schema()
-	c.Set("Content-Type", "application/vnd.apache.arrow.stream")
-	// Capture the fasthttp RequestCtx before the async callback; the pooled Fiber
-	// *Ctx is recycled after this handler returns (the UAF trap).
-	fctx := c.Context()
-	// safeStream (applied by setDirectBodyStream): this runs after the handler
-	// returned, outside Fiber's recover, so an unrecovered panic (an FFI
-	// reader fault, an encoder bug) would not fail the request cleanly (#717). The resources are released by the
-	// deferred block below, which runs on the way out of a panic too. A
-	// registry disposition IS needed here now: query_arrow.go registers the
-	// query before it chooses an engine (#731), so a panicked stream has to
-	// fail that entry instead of leaving it listed as running forever.
-	// The trailer is declared before the response headers are committed; its
-	// value is published by the connection goroutine, never from here.
-	if err := fctx.Response.Header.AddTrailer(arrowStreamTruncatedTrailer); err != nil {
-		arrowTrailerWarnOnce.Do(func() {
-			h.logger.Warn().Err(err).Str("trailer", arrowStreamTruncatedTrailer).
-				Msg("Failed to register arcx Arrow truncation trailer")
-		})
-	}
-	trailers := newResponseTrailers()
-
-	// A recovered panic must not leave a decodable but incomplete stream.
-	var streamW *bufio.Writer
-	h.setDirectBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
-		poisonArrowStream(streamW, h.logger)
-		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
-		if onFail != nil {
-			onFail("stream writer panicked")
-		}
-	}, func(w *bufio.Writer) {
-		streamW = w
-		// The async writer OWNS cancel — it runs AFTER the handler returns, so the caller must
-		// NOT cancel eagerly (that would cancel execCtx while we're still streaming → the
-		// select below breaks immediately → schema-only + spurious "cancel mid-stream").
-		defer func() {
-			if cancel != nil {
-				cancel()
-			}
-			runtime.KeepAlive(reader) // LAST: hold the FFI buffers past the final read.
-		}()
-		m := metrics.Get()
-		rows := 0
-		var ipcErr error
-		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
-	batchLoop:
-		for reader.Next() {
-			select {
-			case <-execCtx.Done():
-				// Labeled break: a bare `break` here would break the SELECT, not the
-				// loop, and keep writing batches after a client/timeout cancel.
-				h.logger.Warn().Msg("arcx serve (arrow): client/timeout cancel mid-stream")
-				break batchLoop
-			default:
-			}
-			batch := reader.Record()
-			if batch == nil {
-				break
-			}
-			if err := ipcWriter.Write(batch); err != nil {
-				h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC write failed after headers committed")
-				ipcErr = err
-				break
-			}
-			rows += int(batch.NumRows())
-			// F3: flush PER BATCH, matching the DuckDB arrow path (query_arrow.go).
-			// Without this the bufio buffer hides a closed connection, so a client that
-			// disconnects mid-stream is never noticed and the server keeps decoding and
-			// encoding a result nobody is reading.
-			if err := w.Flush(); err != nil {
-				h.logger.Warn().Err(err).Int("rows_sent", rows).
-					Msg("arcx serve (arrow): client disconnected mid-stream")
-				ipcErr = err
-				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
-				break
-			}
-		}
-		if rerr := reader.Err(); rerr != nil {
-			h.logger.Error().Err(rerr).Int("rows_sent", rows).
-				Msg("arcx serve (arrow): stream engine error mid-drain (partial IPC served)")
-			ipcErr = rerr
-		}
-		// Do not emit a clean end-of-stream marker after an error or
-		// cancellation: a truncated Arrow stream might otherwise decode.
-		if ipcErr == nil {
-			ipcErr = execCtx.Err()
-		}
-		if ipcErr != nil {
-			poisonArrowStream(w, h.logger)
-			trailers.setIfAbsent(
-				arrowStreamTruncatedTrailer,
-				sqlutil.SanitizeErrText(ipcErr.Error()),
-			)
-		} else {
-			if err := ipcWriter.Close(); err != nil {
-				h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC close failed")
-				ipcErr = err
-				poisonArrowStream(w, h.logger)
-				trailers.setIfAbsent(
-					arrowStreamTruncatedTrailer,
-					sqlutil.SanitizeErrText(err.Error()),
-				)
-			}
-		}
-		if err := w.Flush(); err != nil && ipcErr == nil {
-			ipcErr = err
-			trailers.setIfAbsent(
-				arrowStreamTruncatedTrailer,
-				sqlutil.SanitizeErrText(err.Error()),
-			)
-		}
-		// F1/F3: the DuckDB arrow path's completion metrics. A mid-stream failure is an
-		// error metric, not a success — but the rows already on the wire still count.
-		if ipcErr != nil {
-			m.IncQueryErrors()
-			if onFail != nil {
-				onFail(ipcErr.Error())
-			}
-		} else {
-			m.IncQuerySuccess()
-			m.IncQueryRows(int64(rows))
-			m.RecordQueryLatency(time.Since(start).Microseconds())
-			if onComplete != nil {
-				onComplete(rows)
-			}
-		}
-	})
+	// The helper owns the asynchronous stream and keeps ArcX's FFI-backed
+	// batches alive until the final read. It also applies the governance cap
+	// and publishes the same trailers as the DuckDB Arrow path.
+	h.serveArcxArrowIPCResult(
+		c.Context(), execCtx, cancel, reader, governanceMaxRows, start,
+		onRows, onDisconnect, onComplete, onFail,
+	)
 	return true
 }
 
