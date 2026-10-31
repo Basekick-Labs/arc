@@ -6738,6 +6738,17 @@ completion manifest and skips the digest entirely.
 copied one, so the counter is unchanged by this work and is not where the saving
 shows up.
 
+### Flush-queue backpressure no longer overflows Arrow string offsets (#1284)
+
+When the flush queue was full, a retained buffer could accumulate enough string
+data for one merged Parquet batch to exceed Arrow's signed 32-bit offsets. Sync
+and async flushes now split accumulated batches into smaller groups while
+keeping each group's WAL and coverage tracking together. The size estimate also
+accounts for strings expanded by invalid-UTF-8 replacement during decoding.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+in [#1321](https://github.com/Basekick-Labs/arc/pull/1321).
+
 ## Internal changes
 
 These do not change how Arc behaves. They are here because the codebase is the
