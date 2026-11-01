@@ -767,6 +767,15 @@ GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
 
+### Prometheus Remote Write 1.0 ingestion (#1383)
+
+Arc accepts Prometheus Remote Write 1.0 samples at `/api/v1/write/prometheus`,
+mapping metric names to measurements, labels to tag columns and samples to a
+float64 `value` column. The receiver bounds decoded payload and materialised
+column memory, ignores metric metadata, and rejects exemplars and native
+histograms rather than silently dropping them. Prometheus and Grafana Alloy
+configuration examples are in the [integration guide](docs/integrations/prometheus-remote-write.md).
+
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
 `storage.backend = "gcs"` stores Arc's data in a Google Cloud

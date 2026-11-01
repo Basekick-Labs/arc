@@ -99,6 +99,8 @@ func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
 	app.Post("/api/v2/write", writeAuth, h.WriteInfluxDB)
 	// Arc native endpoint (uses x-arc-database header)
 	app.Post("/api/v1/write/line-protocol", writeAuth, h.WriteSimple)
+	// Prometheus Remote Write 1.0 endpoint.
+	app.Post(prometheusRemoteWritePath, writeAuth, h.WritePrometheusRemoteWrite)
 	// Flush endpoint — admin-gated.
 	app.Post("/api/v1/write/line-protocol/flush", adminAuth, h.Flush)
 
