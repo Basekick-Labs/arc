@@ -767,6 +767,13 @@ GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
 
+### Arrow Flight SQL query endpoint ([#1385](https://github.com/Basekick-Labs/arc/issues/1385))
+
+An optional `[flight_sql]` listener exposes Arc's existing read-only query path
+over Arrow Flight SQL. It uses Arc token authentication and the configured TLS
+certificate, and maps databases and measurements to Flight SQL catalogs and
+tables for ADBC clients.
+
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
 `storage.backend = "gcs"` stores Arc's data in a Google Cloud
