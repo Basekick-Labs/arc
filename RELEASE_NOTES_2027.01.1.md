@@ -776,6 +776,8 @@ column memory, ignores metric metadata, and rejects exemplars and native
 histograms rather than silently dropping them. Prometheus and Grafana Alloy
 configuration examples are in the [integration guide](docs/integrations/prometheus-remote-write.md).
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
+
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
 `storage.backend = "gcs"` stores Arc's data in a Google Cloud
