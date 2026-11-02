@@ -80,9 +80,13 @@ func (h *MQTTSubscriptionHandler) requireEnabled(c *fiber.Ctx) error {
 func (h *MQTTSubscriptionHandler) handleCreate(c *fiber.Ctx) error {
 	var req mqtt.CreateSubscriptionRequest
 	if err := c.BodyParser(&req); err != nil {
+		// The decode error says which part is wrong, e.g. a topic_mapping rule
+		// missing tags_from_topic position (#479). encoding/json errors name a
+		// key and a type; a syntax error shows at most one byte of the input.
+		// Only the admin who sent the body sees it, and it is not logged.
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
-			"error":   "Invalid request body",
+			"error":   "Invalid request body: " + err.Error(),
 		})
 	}
 
@@ -168,9 +172,13 @@ func (h *MQTTSubscriptionHandler) handleUpdate(c *fiber.Ctx) error {
 
 	var req mqtt.UpdateSubscriptionRequest
 	if err := c.BodyParser(&req); err != nil {
+		// The decode error says which part is wrong, e.g. a topic_mapping rule
+		// missing tags_from_topic position (#479). encoding/json errors name a
+		// key and a type; a syntax error shows at most one byte of the input.
+		// Only the admin who sent the body sees it, and it is not logged.
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
-			"error":   "Invalid request body",
+			"error":   "Invalid request body: " + err.Error(),
 		})
 	}
 

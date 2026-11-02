@@ -3693,6 +3693,15 @@ func main() {
 	// staging — see NewDeleteHandler below.)
 	importHandler := api.NewImportHandler(logger.Get("import"))
 	importHandler.SetArrowBuffer(arrowBuffer)
+	// Import write slots (#1429): set before the import routes serve, after
+	// the licence pinned GOMAXPROCS (the auto value reads it).
+	importSlots := api.ConfigureImports(cfg.Ingest.ImportWriteConcurrency,
+		time.Duration(cfg.Ingest.ImportQueueTimeoutMS)*time.Millisecond, arrowBuffer)
+	log.Info().
+		Int("import_write_concurrency", importSlots).
+		Bool("auto", cfg.Ingest.ImportWriteConcurrency == 0).
+		Int("import_queue_timeout_ms", cfg.Ingest.ImportQueueTimeoutMS).
+		Msg("Bulk import write slots configured")
 	if authManager != nil && rbacManager != nil {
 		importHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
@@ -5489,7 +5498,10 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 				columns[key] = []interface{}{value}
 			}
 
-			if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+			// Replay, not NoWAL: these rows are still in the WAL file (recovery
+			// keeps it until the barrier flush succeeds), so a failed flush must
+			// not report them lost (#1377). No identity: the entry is untracked.
+			if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, ""); err != nil {
 				walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay WAL record")
 				return err
 			}

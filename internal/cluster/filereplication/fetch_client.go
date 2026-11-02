@@ -15,7 +15,10 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/security"
+	"golang.org/x/time/rate"
 )
+
+const maxFetchRateBurstBytes = 16 * 1024
 
 // FetchClient is the concrete Fetcher that the puller uses to download file
 // bytes from a peer over the coordinator TCP protocol. It dials a fresh
@@ -43,6 +46,13 @@ type FetchClient struct {
 	// header after sending the request. Default 15s if zero. The body stream
 	// itself is bounded by the ctx passed to Fetch.
 	ResponseHeaderTimeout time.Duration
+	// BytesPerSecond caps aggregate file-body downloads through this client.
+	// Zero leaves downloads unlimited. The coordinator shares one client across
+	// all pull workers on a node, so the cap applies to their combined traffic.
+	BytesPerSecond int64
+
+	rateLimiter *rate.Limiter
+	rateBurst   int
 }
 
 // NewFetchClient validates the required fields and returns a ready-to-use
@@ -58,11 +68,18 @@ func NewFetchClient(c FetchClient) (*FetchClient, error) {
 	if c.SharedSecret == "" {
 		return nil, fmt.Errorf("filereplication: FetchClient.SharedSecret is required (peer replication must be authenticated)")
 	}
+	if c.BytesPerSecond < 0 {
+		return nil, fmt.Errorf("filereplication: FetchClient.BytesPerSecond must be zero or positive")
+	}
 	if c.DialTimeout == 0 {
 		c.DialTimeout = 10 * time.Second
 	}
 	if c.ResponseHeaderTimeout == 0 {
 		c.ResponseHeaderTimeout = 15 * time.Second
+	}
+	if c.BytesPerSecond > 0 {
+		c.rateBurst = int(min(c.BytesPerSecond, int64(maxFetchRateBurstBytes)))
+		c.rateLimiter = rate.NewLimiter(rate.Limit(c.BytesPerSecond), c.rateBurst)
 	}
 	return &c, nil
 }
@@ -286,7 +303,11 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		hasher = sha256.New()
 	}
 	mw := io.MultiWriter(dst, hasher)
-	written, err := io.CopyN(mw, conn, ack.SizeBytes)
+	var body io.Reader = conn
+	if f.rateLimiter != nil {
+		body = &rateLimitedReader{ctx: ctx, reader: conn, limiter: f.rateLimiter, maxRead: f.rateBurst}
+	}
+	written, err := io.CopyN(mw, body, ack.SizeBytes)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return written, fmt.Errorf("stream body: %w (wrote %d of %d tail bytes)", ctxErr, written, ack.SizeBytes)
@@ -300,6 +321,45 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return written, fmt.Errorf("%w: computed=%s expected=%s", ErrChecksumMismatch, computed, entry.SHA256)
 	}
 	return written, nil
+}
+
+// rateLimitedReader shares a token bucket across fetches. It pays for the bytes
+// a socket read actually returned, after the read: rate.Limiter has no refund,
+// so reserving a full buffer up front and getting a short read back would
+// charge every other transfer for bytes that never arrived. The peer is still
+// slowed by TCP flow control, because the next Read does not happen until the
+// wait is over and the receive window closes in the meantime.
+type rateLimitedReader struct {
+	ctx     context.Context
+	reader  io.Reader
+	limiter *rate.Limiter
+	maxRead int
+	err     error
+}
+
+func (r *rateLimitedReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	// maxRead is the limiter's burst, so WaitN(n) never asks for more than
+	// the bucket can hold.
+	if len(p) > r.maxRead {
+		p = p[:r.maxRead]
+	}
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		if werr := r.limiter.WaitN(r.ctx, n); werr != nil {
+			// WaitN refuses as soon as the wait would pass the deadline, before
+			// the context itself expires; report it as the deadline it is.
+			if _, ok := r.ctx.Deadline(); ok && r.ctx.Err() == nil {
+				werr = context.DeadlineExceeded
+			}
+			// The n bytes are already off the socket: hand them over so a body
+			// whose last chunk this was still completes, and fail the next Read.
+			r.err = werr
+		}
+	}
+	return n, err
 }
 
 // Compile-time check that FetchClient satisfies Fetcher.

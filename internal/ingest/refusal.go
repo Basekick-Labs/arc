@@ -30,6 +30,9 @@ const (
 	// RefusalWALNotDurable: with wal.ack_mode = "durable", the write's WAL
 	// entry could not be made durable (write or sync failure, shutdown).
 	RefusalWALNotDurable = "wal_not_durable"
+	// RefusalImportQueue: a bulk import waited ingest.import_queue_timeout_ms
+	// for one of the node's import write slots (#1429).
+	RefusalImportQueue = "import_queue"
 )
 
 // WriteRefusal is a live write this node refuses for a local, transient
@@ -63,11 +66,19 @@ var ErrWALDiskPressure error = &WriteRefusal{
 	Text:   "write refused: the WAL volume is low on free space (WAL volume disk pressure); nothing was written, retry",
 }
 
+// ErrImportQueueTimeout refuses a bulk import that waited
+// ingest.import_queue_timeout_ms for an import write slot (#1429). Nothing of
+// it was written: the wait comes before its write pass. Retryable.
+var ErrImportQueueTimeout error = &WriteRefusal{
+	Reason: RefusalImportQueue,
+	Text:   "import refused: every import write slot on this node stayed busy for ingest.import_queue_timeout_ms; nothing was written, retry",
+}
+
 // ErrWALNotDurable refuses a live write whose WAL entry could not be made
 // durable in wal.ack_mode = "durable". Retryable.
 var ErrWALNotDurable error = &WriteRefusal{
 	Reason: RefusalWALNotDurable,
-	Text:   "write refused: the WAL entry could not be made durable; earlier parts of this request may already be stored, retry (a retry can duplicate them)",
+	Text:   "write refused: the WAL entry could not be made durable; if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",
 }
 
 // walNotDurable wraps a WAL ErrNotDurable as a not-durable refusal, keeping
@@ -75,7 +86,7 @@ var ErrWALNotDurable error = &WriteRefusal{
 func walNotDurable(err error) error {
 	return &WriteRefusal{
 		Reason: RefusalWALNotDurable,
-		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); earlier parts of this request may already be stored, retry (a retry can duplicate them)",
+		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",
 	}
 }
 

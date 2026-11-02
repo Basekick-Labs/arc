@@ -4,12 +4,14 @@ package ingest
 // the flush into the registrar, and the WAL held until registration.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -687,4 +689,41 @@ func TestCoverageFailedFlushSettlesAnEntryTheWALLost(t *testing.T) {
 		t.Fatalf("accounted %+v, want floor 3 with cseq 1 lost", got)
 	}
 	_ = b.Close()
+}
+
+// The coverage loss line is an Error only when it is the sole report (#1377):
+// a batch the WAL accepted and then lost reads as a WAL copy to
+// logFlushFailure, which says it will be replayed. A batch that never reached
+// the WAL is already an Error with its row count there, so this is a Warn.
+func TestCoverageLossLogLevel(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		piece     func(*coverageState) CoveragePiece
+		wantLevel string
+	}{
+		{name: "lost after the WAL accepted it", piece: func(cs *coverageState) CoveragePiece {
+			return CoveragePiece{Instance: cs.instance, CSeq: 1, replayable: true}
+		}, wantLevel: `"level":"error"`},
+		{name: "never reached the WAL", piece: func(cs *coverageState) CoveragePiece {
+			return CoveragePiece{Instance: cs.instance, CSeq: 2, replayable: false}
+		}, wantLevel: `"level":"warn"`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			b, _ := newCoverageBuffer(t, 1000, &coverageRegistrar{})
+			cs := b.coverage.Load()
+			real := cs.wal
+			cs.wal = lostCoverageWAL{coveredWALWriter: real, lost: map[uint64]bool{1: true}}
+			defer func() { cs.wal = real }()
+			// failed() reads only g.b.logger: a separate buffer holds the test
+			// logger, so the running one's goroutines never see it change.
+			var logs bytes.Buffer
+			logBuf := &ArrowBuffer{logger: zerolog.New(&logs)}
+			g := &flushGroup{b: logBuf, cs: cs, key: "db/x", settled: map[string]struct{}{}, pieces: []CoveragePiece{tt.piece(cs)}}
+			g.failed()
+			if !strings.Contains(logs.String(), tt.wantLevel) || !strings.Contains(logs.String(), "those rows are lost") {
+				t.Fatalf("want a %s loss line; logs:\n%s", tt.wantLevel, logs.String())
+			}
+			_ = b.Close()
+		})
+	}
 }
