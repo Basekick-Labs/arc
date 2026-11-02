@@ -316,7 +316,8 @@ func TestEdgeSyncHandler_RefusesLegacyFilesystemCollision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen registry: %v", err)
 	}
-	rig := newSyncTestRigWithSecrets(t, RegistrySpokeSecrets(registry, zerolog.Nop()))
+	var logs bytes.Buffer
+	rig := newSyncTestRigWithSecrets(t, RegistrySpokeSecrets(registry, zerolog.New(&logs)))
 
 	for _, id := range []string{"rocket_01", "ROCKET_01"} {
 		req := defaultReq([]byte("payload"))
@@ -334,6 +335,12 @@ func TestEdgeSyncHandler_RefusesLegacyFilesystemCollision(t *testing.T) {
 		if exists {
 			t.Errorf("sync for colliding ID %q wrote a file", id)
 		}
+	}
+
+	// A registered member refused for a collision is an operator problem, so
+	// it is a Warn naming it, not the Debug an unknown ID gets (#740).
+	if !strings.Contains(logs.String(), `"level":"warn"`) || !strings.Contains(logs.String(), "shares a directory with another registered ID") {
+		t.Errorf("no collision warning on the sync path; logs:\n%s", logs.String())
 	}
 
 	// Existing registrations outside the collision group keep working.

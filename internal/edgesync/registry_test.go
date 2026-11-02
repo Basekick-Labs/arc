@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -208,6 +209,11 @@ func TestRegistry_RejectsFilesystemEquivalentSpokeIDs(t *testing.T) {
 		{name: "case folding", first: "rocket_01", alias: "ROCKET_01"},
 		{name: "full Unicode case folding", first: "Straße", alias: "STRASSE"},
 		{name: "Unicode normalization", first: "café", alias: "cafe\u0301"},
+		// cases.Fold swaps Cherokee's two cases instead of settling on one;
+		// APFS stores them as one name, so the key must agree (#740).
+		{name: "Cherokee case", first: "rocket-\u13a0", alias: "rocket-\uab70"},
+		{name: "Cherokee small letter", first: "rocket-\u13f8", alias: "rocket-\u13f0"},
+		{name: "Kelvin sign", first: "rocket-k", alias: "rocket-\u212a"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -825,5 +831,201 @@ func TestRegistry_LegacyCollisionsAreReportedAndCannotSync(t *testing.T) {
 	}
 	if got, err := reopened.Secret(ctx, "rocket_01"); err != nil || got != "legacy-secret" {
 		t.Errorf("remaining spoke after collision removal: secret=%q, err=%v", got, err)
+	}
+}
+
+// On storage that does not fold names (Linux filesystems, S3/Azure/GCS),
+// "rocket_01" and "ROCKET_01" are two directories, so an existing pair keeps
+// syncing after upgrade and is only reported (#740). A NEW colliding
+// registration is still refused, wherever the hub runs.
+func TestRegistry_LegacyCollisionsSyncWhereStorageDoesNotFold(t *testing.T) {
+	ctx := context.Background()
+	reg, db := newTestRegistry(t)
+	encrypted, err := reg.cipher.Encrypt("legacy-secret")
+	if err != nil {
+		t.Fatalf("encrypt legacy secret: %v", err)
+	}
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO sync_spokes (spoke_id, name, secret_encrypted, enabled, registered_at)
+			 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`, id, id, encrypted); err != nil {
+			t.Fatalf("insert legacy spoke %q: %v", id, err)
+		}
+	}
+	reopened, err := NewRegistry(db, reg.cipher, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen registry: %v", err)
+	}
+	reopened.SetNameFolding(NameFolds{})
+
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		if got, err := reopened.Secret(ctx, id); err != nil || got != "legacy-secret" {
+			t.Errorf("Secret(%q) = %q, %v; want the secret: the IDs are distinct namespaces here", id, got, err)
+		}
+	}
+	if _, err := reopened.Secret(ctx, "Rocket_01"); !errors.Is(err, ErrSpokeNotFound) {
+		t.Errorf("Secret of an unregistered spelling = %v, want ErrSpokeNotFound", err)
+	}
+	bad, err := reopened.InvalidStoredIDs(ctx)
+	if err != nil {
+		t.Fatalf("InvalidStoredIDs: %v", err)
+	}
+	if len(bad) != 0 {
+		t.Errorf("InvalidStoredIDs = %v, want none: the pair can sync", bad)
+	}
+	colliding, err := reopened.CollidingStoredIDs(ctx)
+	if err != nil {
+		t.Fatalf("CollidingStoredIDs: %v", err)
+	}
+	if got := colliding["rocket_01"]; len(got) != 1 || got[0] != "ROCKET_01" {
+		t.Errorf("CollidingStoredIDs[rocket_01] = %v, want [ROCKET_01]", got)
+	}
+	if _, err := reopened.Register(ctx, "Rocket_01", "third"); !errors.Is(err, ErrSpokeIDCollision) {
+		t.Errorf("a new colliding registration = %v, want ErrSpokeIDCollision", err)
+	}
+}
+
+// The probe agrees with the filesystem it runs on and leaves nothing behind,
+// and probes both folds the collision key applies: a case-sensitive volume
+// can still normalize (case-sensitive APFS), so one cannot stand in for the
+// other. CI (Linux) folds neither and a macOS dev machine (APFS) usually
+// both, so the test compares each probe pair with a direct stat rather than
+// with a fixed answer.
+func TestProbeNameFoldingMatchesTheFilesystem(t *testing.T) {
+	kinds := map[string]bool{}
+	for _, p := range nameFoldProbes {
+		if p.write == p.lookup {
+			t.Fatalf("probe %q writes and looks up the same name %q", p.kind, p.write)
+		}
+		kinds[p.kind] = true
+	}
+	if !kinds["case"] || !kinds["normalization"] {
+		t.Fatalf("nameFoldProbes kinds = %v, want case and normalization", kinds)
+	}
+
+	dir := t.TempDir()
+	got, err := ProbeNameFolding(dir)
+	if err != nil {
+		t.Fatalf("ProbeNameFolding: %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("probe left %d entries behind", len(entries))
+	}
+	// Independent of nameFoldProbes, so a probe list that lost a fold
+	// disagrees with the filesystem instead of agreeing with itself.
+	direct := func(write, lookup string) bool {
+		sub := t.TempDir()
+		if err := os.WriteFile(filepath.Join(sub, write), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, statErr := os.Stat(filepath.Join(sub, lookup))
+		return statErr == nil
+	}
+	want := NameFolds{
+		Case:          direct("direct-case", "DIRECT-CASE"),
+		Normalization: direct("direct-\u00e9", "direct-e\u0301"),
+	}
+	if got != want {
+		t.Fatalf("ProbeNameFolding = %+v, direct checks say %+v", got, want)
+	}
+}
+
+// A probe that cannot run answers "folds": a collision that may be real is
+// refused rather than allowed.
+func TestProbeNameFoldingFailsClosed(t *testing.T) {
+	folds, err := ProbeNameFolding(filepath.Join(t.TempDir(), "missing"))
+	if err == nil || folds != AllNameFolds {
+		t.Fatalf("ProbeNameFolding on a missing dir = %+v, %v; want AllNameFolds and an error", folds, err)
+	}
+}
+
+// Case-sensitive APFS normalizes but does not fold case: a case-only pair is
+// two directories there and keeps syncing, while an NFC/NFD pair is one
+// directory and is refused (#740).
+func TestRegistry_LegacyCollisionsUnderNormalizationOnly(t *testing.T) {
+	ctx := context.Background()
+	reg, db := newTestRegistry(t)
+	encrypted, err := reg.cipher.Encrypt("legacy-secret")
+	if err != nil {
+		t.Fatalf("encrypt legacy secret: %v", err)
+	}
+	nfc, nfd := "café", "café"
+	for _, id := range []string{"rocket_01", "ROCKET_01", nfc, nfd} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO sync_spokes (spoke_id, name, secret_encrypted, enabled, registered_at)
+			 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`, id, id, encrypted); err != nil {
+			t.Fatalf("insert legacy spoke %q: %v", id, err)
+		}
+	}
+	reopened, err := NewRegistry(db, reg.cipher, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen registry: %v", err)
+	}
+	reopened.SetNameFolding(NameFolds{Normalization: true})
+
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		if _, err := reopened.Secret(ctx, id); err != nil {
+			t.Errorf("Secret(%q) = %v; a case-only pair is two directories here", id, err)
+		}
+	}
+	for _, id := range []string{nfc, nfd} {
+		if _, err := reopened.Secret(ctx, id); !errors.Is(err, ErrSpokeIDCollision) {
+			t.Errorf("Secret(%q) = %v, want ErrSpokeIDCollision: NFC and NFD are one directory here", id, err)
+		}
+	}
+	bad, err := reopened.InvalidStoredIDs(ctx)
+	if err != nil {
+		t.Fatalf("InvalidStoredIDs: %v", err)
+	}
+	if len(bad) != 2 || bad[nfc] == nil || bad[nfd] == nil {
+		t.Errorf("InvalidStoredIDs = %v, want exactly the NFC/NFD pair", bad)
+	}
+	colliding, err := reopened.CollidingStoredIDs(ctx)
+	if err != nil {
+		t.Fatalf("CollidingStoredIDs: %v", err)
+	}
+	if len(colliding) != 2 || len(colliding["rocket_01"]) != 1 || colliding[nfc] != nil {
+		t.Errorf("CollidingStoredIDs = %v, want only the case pair (it syncs here)", colliding)
+	}
+}
+
+// A disabled member cannot write, so it does not block its partner: disabling
+// one of a colliding pair lets the other sync, and re-enabling it refuses
+// both again (#740).
+func TestRegistry_DisabledMemberDoesNotBlockItsPartner(t *testing.T) {
+	ctx := context.Background()
+	reg, db := newTestRegistry(t)
+	encrypted, err := reg.cipher.Encrypt("legacy-secret")
+	if err != nil {
+		t.Fatalf("encrypt legacy secret: %v", err)
+	}
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO sync_spokes (spoke_id, name, secret_encrypted, enabled, registered_at)
+			 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`, id, id, encrypted); err != nil {
+			t.Fatalf("insert legacy spoke %q: %v", id, err)
+		}
+	}
+	reopened, err := NewRegistry(db, reg.cipher, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen registry: %v", err)
+	}
+	if _, err := reopened.Secret(ctx, "rocket_01"); !errors.Is(err, ErrRegisteredSpokeCollides) {
+		t.Fatalf("Secret before disabling = %v, want ErrRegisteredSpokeCollides", err)
+	}
+	if err := reopened.SetEnabled(ctx, "ROCKET_01", false); err != nil {
+		t.Fatalf("disable ROCKET_01: %v", err)
+	}
+	if got, err := reopened.Secret(ctx, "rocket_01"); err != nil || got != "legacy-secret" {
+		t.Fatalf("Secret after disabling the partner = %q, %v; want the secret", got, err)
+	}
+	if bad, err := reopened.InvalidStoredIDs(ctx); err != nil || len(bad) != 0 {
+		t.Fatalf("InvalidStoredIDs with the partner disabled = %v, %v; want none", bad, err)
+	}
+	if err := reopened.SetEnabled(ctx, "ROCKET_01", true); err != nil {
+		t.Fatalf("re-enable ROCKET_01: %v", err)
+	}
+	if _, err := reopened.Secret(ctx, "rocket_01"); !errors.Is(err, ErrRegisteredSpokeCollides) {
+		t.Fatalf("Secret after re-enabling = %v, want ErrRegisteredSpokeCollides", err)
 	}
 }

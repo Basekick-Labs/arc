@@ -10,7 +10,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/rs/zerolog"
@@ -42,6 +44,12 @@ var (
 	// ErrSpokeIDCollision is returned when distinct IDs resolve to the same
 	// namespace on a case-insensitive or Unicode-normalizing filesystem.
 	ErrSpokeIDCollision = errors.New("edgesync: spoke ID collides with another registered ID on some filesystems")
+
+	// ErrRegisteredSpokeCollides is ErrSpokeIDCollision for a REGISTERED spoke
+	// refused because another registered ID shares its directory on this
+	// storage: an operator problem worth a warning, unlike an unregistered
+	// spelling, which anyone can send.
+	ErrRegisteredSpokeCollides = fmt.Errorf("%w; the registered spoke is refused until one of them is deleted", ErrSpokeIDCollision)
 )
 
 // SecretCipher encrypts and decrypts spoke secrets at rest.
@@ -70,12 +78,29 @@ type Spoke struct {
 
 // Registry stores which spokes may sync to this hub, and their secrets.
 type Registry struct {
-	db            *sql.DB
-	cipher        SecretCipher
-	logger        zerolog.Logger
+	db     *sql.DB
+	cipher SecretCipher
+	logger zerolog.Logger
+	// regMu serialises Register and Delete, so the collision check and the
+	// row it guards change together; mu guards only the in-memory index and is
+	// never held across SQLite I/O, so a slow registration does not stall the
+	// sync-path lookups that read the index.
+	regMu         sync.Mutex
 	mu            sync.RWMutex
 	spokeIDsByKey map[string]map[string]struct{}
+	// folds is which name folds the hub's storage applies (#740). A new
+	// registration colliding under ANY fold is refused, wherever the hub
+	// runs; an existing pair is refused for sync only when it collides under
+	// the folds this storage applies, where it really is one namespace.
+	// AllNameFolds until SetNameFolding says otherwise.
+	folds atomic.Pointer[NameFolds]
 }
+
+// SetNameFolding records which folds the hub's storage applies (see
+// ProbeNameFolding). Call it before the hub accepts sync requests.
+func (r *Registry) SetNameFolding(folds NameFolds) { r.folds.Store(&folds) }
+
+func (r *Registry) nameFolds() NameFolds { return *r.folds.Load() }
 
 // NewRegistry creates the registry and initializes its schema.
 //
@@ -111,6 +136,7 @@ func NewRegistry(db *sql.DB, cipher SecretCipher, logger zerolog.Logger) (*Regis
 		logger:        logger,
 		spokeIDsByKey: make(map[string]map[string]struct{}),
 	}
+	r.SetNameFolding(AllNameFolds)
 	if err := r.initSchema(); err != nil {
 		return nil, fmt.Errorf("edgesync: initialize registry schema: %w", err)
 	}
@@ -143,13 +169,63 @@ func (r *Registry) loadSpokeIDs(ctx context.Context) error {
 }
 
 func spokeIDCollisionKey(spokeID string) string {
-	// Keep malformed UTF-8 byte strings distinct. The validator permits them
-	// today, and Unicode folding would otherwise replace invalid bytes with
-	// RuneError, making unrelated IDs collide.
+	return spokeIDKeyUnder(spokeID, AllNameFolds)
+}
+
+// spokeIDKeyUnder is the name a filesystem applying folds stores spokeID
+// under: two IDs with the same key are one directory there.
+func spokeIDKeyUnder(spokeID string, folds NameFolds) string {
+	// Keep malformed UTF-8 byte strings distinct, so folding cannot turn
+	// unrelated ones into the same RuneError key. Registration decodes JSON,
+	// which already replaces invalid bytes, so this only matters for a row
+	// written to SQLite some other way.
 	if !utf8.ValidString(spokeID) {
 		return "\x00" + spokeID
 	}
-	return norm.NFC.String(cases.Fold().String(norm.NFC.String(spokeID)))
+	key := spokeID
+	if folds.Normalization {
+		key = norm.NFC.String(key)
+	}
+	if folds.Case {
+		key = canonicalCase(cases.Fold().String(key))
+		if folds.Normalization {
+			key = norm.NFC.String(key)
+		}
+	}
+	return key
+}
+
+// canonicalCase maps each rune to the smallest rune of its case orbit
+// (unicode.SimpleFold). cases.Fold alone does not reach one form for every
+// script: it swaps Cherokee's two cases (U+13A0 <-> U+AB70) rather than
+// settling on one, so "rocket-\u13a0" and "rocket-\uab70" kept different
+// keys while APFS stores them as one name (#740).
+func canonicalCase(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		low := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < low {
+				low = f
+			}
+		}
+		b.WriteRune(low)
+	}
+	return b.String()
+}
+
+// sameNamespace returns the members of ids that share spokeID's namespace on
+// a filesystem applying folds.
+func sameNamespace(spokeID string, ids map[string]struct{}, folds NameFolds) map[string]struct{} {
+	key := spokeIDKeyUnder(spokeID, folds)
+	out := make(map[string]struct{}, len(ids))
+	for id := range ids {
+		if spokeIDKeyUnder(id, folds) == key {
+			out[id] = struct{}{}
+		}
+	}
+	return out
 }
 
 func addSpokeID(index map[string]map[string]struct{}, spokeID string) {
@@ -168,7 +244,7 @@ func removeSpokeID(index map[string]map[string]struct{}, spokeID string) {
 	}
 }
 
-func spokeIDCollisionError(spokeID string, ids map[string]struct{}) error {
+func spokeIDCollisionError(spokeID string, ids map[string]struct{}, sentinel error) error {
 	var colliding []string
 	for id := range ids {
 		if id != spokeID {
@@ -181,7 +257,53 @@ func spokeIDCollisionError(spokeID string, ids map[string]struct{}) error {
 		}
 	}
 	sort.Strings(colliding)
-	return fmt.Errorf("%q collides with registered spoke ID(s) %q: %w", spokeID, colliding, ErrSpokeIDCollision)
+	return fmt.Errorf("%q collides with registered spoke ID(s) %q: %w", spokeID, colliding, sentinel)
+}
+
+// collisionRefusal is the sync-time collision check (#740). Only the index is
+// read under the lock; the caller's database query runs without it.
+//
+// Under the folds this storage applies, more than one registered ID in
+// spokeID's namespace is one directory written by several spokes, so every
+// member is refused, and an unregistered spelling of a registered ID is
+// refused as that collision. IDs that are distinct here (any ID on Linux
+// filesystems and object stores; a case-only pair on case-sensitive APFS)
+// keep syncing, and only an exact registration counts, as before.
+//
+// A disabled member cannot write, so it does not block the others: disabling
+// one of a pair is enough to let the other sync, and re-enabling it refuses
+// both again. (Its files stay in the shared directory either way.)
+func (r *Registry) collisionRefusal(ctx context.Context, spokeID string) error {
+	folds := r.nameFolds()
+	if !folds.Any() {
+		return nil
+	}
+	r.mu.RLock()
+	ids := sameNamespace(spokeID, r.spokeIDsByKey[spokeIDCollisionKey(spokeID)], folds)
+	r.mu.RUnlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, registered := ids[spokeID]; !registered {
+		return spokeIDCollisionError(spokeID, ids, ErrSpokeIDCollision)
+	}
+	for id := range ids {
+		if id == spokeID {
+			continue
+		}
+		var enabled bool
+		err := r.db.QueryRowContext(ctx, `SELECT enabled FROM sync_spokes WHERE spoke_id = ?`, id).Scan(&enabled)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // deleted since the index was read
+		}
+		if err != nil {
+			return fmt.Errorf("edgesync: check colliding spoke %q: %w", id, err)
+		}
+		if enabled {
+			return spokeIDCollisionError(spokeID, ids, ErrRegisteredSpokeCollides)
+		}
+	}
+	return nil
 }
 
 func (r *Registry) initSchema() error {
@@ -237,13 +359,21 @@ func (r *Registry) Register(ctx context.Context, spokeID, name string) (secret s
 		}
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if ids := r.spokeIDsByKey[spokeIDCollisionKey(spokeID)]; len(ids) > 0 {
-		if _, exists := ids[spokeID]; exists {
-			return "", fmt.Errorf("%q: %w", spokeID, ErrSpokeExists)
-		}
-		return "", spokeIDCollisionError(spokeID, ids)
+	r.regMu.Lock()
+	defer r.regMu.Unlock()
+	r.mu.RLock()
+	ids := r.spokeIDsByKey[spokeIDCollisionKey(spokeID)]
+	_, exists := ids[spokeID]
+	var collision error
+	if len(ids) > 0 && !exists {
+		collision = spokeIDCollisionError(spokeID, ids, ErrSpokeIDCollision)
+	}
+	r.mu.RUnlock()
+	if exists {
+		return "", fmt.Errorf("%q: %w", spokeID, ErrSpokeExists)
+	}
+	if collision != nil {
+		return "", collision
 	}
 
 	secret, err = GenerateSecret()
@@ -272,7 +402,9 @@ func (r *Registry) Register(ctx context.Context, spokeID, name string) (secret s
 	if n == 0 {
 		return "", fmt.Errorf("%q: %w", spokeID, ErrSpokeExists)
 	}
+	r.mu.Lock()
 	addSpokeID(r.spokeIDsByKey, spokeID)
+	r.mu.Unlock()
 
 	r.logger.Info().Str("spoke_id", spokeID).Str("name", name).Msg("Registered edge sync spoke")
 	return secret, nil
@@ -281,16 +413,13 @@ func (r *Registry) Register(ctx context.Context, spokeID, name string) (secret s
 // Secret returns a spoke's decrypted secret for HMAC verification.
 //
 // Returns ErrSpokeDisabled for a registered-but-disabled spoke and
-// ErrSpokeIDCollision when its filesystem-equivalent group has multiple IDs.
+// ErrSpokeIDCollision when, on storage that folds names, its
+// filesystem-equivalent group has more than one registered ID.
 // Callers on the request path MUST NOT surface either distinction to the
 // client, since that would let an attacker enumerate registered IDs.
 func (r *Registry) Secret(ctx context.Context, spokeID string) (string, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if ids := r.spokeIDsByKey[spokeIDCollisionKey(spokeID)]; len(ids) > 0 {
-		if _, registered := ids[spokeID]; !registered || len(ids) > 1 {
-			return "", spokeIDCollisionError(spokeID, ids)
-		}
+	if err := r.collisionRefusal(ctx, spokeID); err != nil {
+		return "", err
 	}
 
 	var encrypted string
@@ -374,8 +503,8 @@ func (r *Registry) SetEnabled(ctx context.Context, spokeID string, enabled bool)
 // deleting a registration must not delete data the hub was trusted with. An
 // operator reclaiming that storage does it explicitly.
 func (r *Registry) Delete(ctx context.Context, spokeID string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.regMu.Lock()
+	defer r.regMu.Unlock()
 	res, err := r.db.ExecContext(ctx, `DELETE FROM sync_spokes WHERE spoke_id = ?`, spokeID)
 	if err != nil {
 		return fmt.Errorf("edgesync: delete spoke %q: %w", spokeID, err)
@@ -385,7 +514,9 @@ func (r *Registry) Delete(ctx context.Context, spokeID string) error {
 	} else if n == 0 {
 		return fmt.Errorf("%q: %w", spokeID, ErrSpokeNotFound)
 	}
+	r.mu.Lock()
 	removeSpokeID(r.spokeIDsByKey, spokeID)
+	r.mu.Unlock()
 	r.logger.Info().Str("spoke_id", spokeID).Msg("Deleted edge sync spoke registration")
 	return nil
 }
@@ -483,24 +614,29 @@ func (r *Registry) Count(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
-// InvalidStoredIDs returns registered spoke IDs that fail validation or
-// collide on case-insensitive or Unicode-normalizing filesystems, so the hub
-// can warn at startup instead of letting an edge box fail without explanation.
+// InvalidStoredIDs returns the registered spoke IDs that cannot sync: those
+// that fail validation, and those sharing a namespace with another ID under
+// the folds this storage applies (#740). The hub warns about them at startup
+// instead of letting an edge box fail without explanation.
+// CollidingStoredIDs lists the collisions this storage does not apply, which
+// still sync.
 //
 // It reports rather than deletes: the rows still hold a live secret and the
 // data those spokes already synced is still on disk, so removing them is an
 // operator decision.
 func (r *Registry) InvalidStoredIDs(ctx context.Context) (map[string]error, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	spokes, err := r.List(ctx)
 	if err != nil {
 		return nil, err
 	}
+	// Only enabled members are refused (collisionRefusal): a disabled one
+	// cannot write, so an enabled ID refused here has another ENABLED ID in
+	// its directory.
 	groups := make(map[string]map[string]struct{}, len(spokes))
+	enabled := make(map[string]bool, len(spokes))
 	for _, s := range spokes {
 		addSpokeID(groups, s.SpokeID)
+		enabled[s.SpokeID] = s.Enabled
 	}
 	var bad map[string]error
 	for _, s := range spokes {
@@ -510,11 +646,18 @@ func (r *Registry) InvalidStoredIDs(ctx context.Context) (map[string]error, erro
 			}
 			bad[s.SpokeID] = err
 		}
-		if ids := groups[spokeIDCollisionKey(s.SpokeID)]; len(ids) > 1 {
+		ids := sameNamespace(s.SpokeID, groups[spokeIDCollisionKey(s.SpokeID)], r.nameFolds())
+		liveOthers := 0
+		for id := range ids {
+			if id != s.SpokeID && enabled[id] {
+				liveOthers++
+			}
+		}
+		if r.nameFolds().Any() && s.Enabled && liveOthers > 0 {
 			if bad == nil {
 				bad = make(map[string]error, 1)
 			}
-			collision := spokeIDCollisionError(s.SpokeID, ids)
+			collision := spokeIDCollisionError(s.SpokeID, ids, ErrRegisteredSpokeCollides)
 			if previous := bad[s.SpokeID]; previous != nil {
 				bad[s.SpokeID] = errors.Join(previous, collision)
 			} else {
@@ -597,4 +740,42 @@ func scanSpoke(s rowScanner) (*Spoke, error) {
 		sp.LastSeenAt = &t
 	}
 	return &sp, nil
+}
+
+// CollidingStoredIDs returns, for each registered spoke ID, the other IDs it
+// collides with under some fold this storage does NOT apply (#740). They
+// still sync here; the hub reports them because moving that storage to a
+// volume that applies the fold would merge their namespaces.
+func (r *Registry) CollidingStoredIDs(ctx context.Context) (map[string][]string, error) {
+	spokes, err := r.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	groups := make(map[string]map[string]struct{}, len(spokes))
+	for _, s := range spokes {
+		addSpokeID(groups, s.SpokeID)
+	}
+	var out map[string][]string
+	for _, s := range spokes {
+		ids := groups[spokeIDCollisionKey(s.SpokeID)]
+		if len(ids) < 2 {
+			continue
+		}
+		here := sameNamespace(s.SpokeID, ids, r.nameFolds())
+		var others []string
+		for id := range ids {
+			if _, sameDir := here[id]; !sameDir {
+				others = append(others, id)
+			}
+		}
+		if len(others) == 0 {
+			continue
+		}
+		sort.Strings(others)
+		if out == nil {
+			out = make(map[string][]string)
+		}
+		out[s.SpokeID] = others
+	}
+	return out, nil
 }

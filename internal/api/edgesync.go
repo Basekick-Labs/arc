@@ -560,7 +560,13 @@ func RegistrySpokeSecrets(reg *edgesync.Registry, logger zerolog.Logger) SpokeSe
 			// endpoints keep returning 200 with a full spoke list because
 			// metadata is not encrypted. Without this branch the hub looks
 			// healthy while nothing can authenticate.
-			if errors.Is(err, edgesync.ErrSpokeNotFound) || errors.Is(err, edgesync.ErrSpokeDisabled) || errors.Is(err, edgesync.ErrSpokeIDCollision) {
+			if errors.Is(err, edgesync.ErrRegisteredSpokeCollides) {
+				// A registered spoke refused because another enabled ID shares
+				// its directory on this storage (#740): the operator has to act,
+				// and only a registered ID gets here, so it is not attacker-driven.
+				logger.Warn().Err(err).Str("spoke_id", spokeID).
+					Msg("Sync refused: this spoke ID shares a directory with another registered ID on this storage; delete or disable one of them")
+			} else if errors.Is(err, edgesync.ErrSpokeNotFound) || errors.Is(err, edgesync.ErrSpokeDisabled) || errors.Is(err, edgesync.ErrSpokeIDCollision) {
 				logger.Debug().Err(err).Str("spoke_id", spokeID).Msg("Spoke secret lookup failed")
 			} else {
 				logger.Warn().Err(err).Str("spoke_id", spokeID).
