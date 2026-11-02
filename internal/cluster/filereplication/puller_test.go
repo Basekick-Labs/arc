@@ -81,7 +81,7 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	}
 	// Atomic: read all bytes into a staging key. On success, promote to final key.
 	// On error, leave bytes in the ".part" staging key (same as real LocalBackend)
-	// so resume tests can discover them via StagingInspector/ReadTo.
+	// so resume tests can discover them through StagingInspector.
 	stagingKey := path + ".part"
 	var buf []byte
 	tmp := make([]byte, 4096)
@@ -130,15 +130,11 @@ func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer)
 	if err := checkKey(path); err != nil {
 		return err
 	}
-	// Fall back to staging file so tryResumeFromPartial can hash a partial prefix.
 	f.mu.Lock()
 	data, ok := f.files[path]
-	if !ok {
-		data, ok = f.files[path+".part"]
-	}
 	f.mu.Unlock()
 	if !ok {
-		return errors.New("not found")
+		return storage.ErrObjectNotFound
 	}
 	_, err := writer.Write(data)
 	return err
@@ -150,12 +146,9 @@ func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Write
 	}
 	f.mu.Lock()
 	data, ok := f.files[path]
-	if !ok {
-		data, ok = f.files[path+".part"]
-	}
 	f.mu.Unlock()
 	if !ok {
-		return errors.New("not found")
+		return storage.ErrObjectNotFound
 	}
 	if offset < 0 || offset > int64(len(data)) {
 		return fmt.Errorf("offset %d out of range for file size %d", offset, len(data))
@@ -2185,9 +2178,9 @@ func TestPuller_CatchUpStatus_KeySemantics(t *testing.T) {
 // TestTryResumeFromPartialRefusesCommittedFile pins the guard that makes
 // keeping the committed file on a rejected fetch (#999) safe.
 //
-// A resume hashes a prefix and appends a tail. ReadToAt prefers the committed
-// object and falls back to the staging file, while the tail is appended to the
-// staging file. So once a rejected fetch stops deleting the committed object,
+// A resume hashes a prefix and appends a tail. ReadToAt used to prefer the
+// committed object and fall back to the staging file (until #1199), while the
+// tail is appended to the staging file. So once a rejected fetch stops deleting the committed object,
 // a shorter previous generation on disk could be hashed as the "prefix" of the
 // file being fetched while the tail landed in a different file. Whenever the
 // old generation happened to be a byte prefix of the new one the combined

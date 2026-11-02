@@ -2087,9 +2087,10 @@ const (
 var localHashStall = 30 * time.Second
 
 // verifyLocalCopy hashes the committed local copy of entry.Path and reports
-// whether it is the manifest's version. ReadTo, never ReadToAt: ReadToAt falls
-// back to the staged ".part" file (#1199), which is not the copy a query
-// reads. LocalBackend.ReadTo does not watch the context, so the hasher does:
+// whether it is the manifest's version, reading the whole committed file with
+// ReadTo (never a staged ".part", which is not the copy a query reads; since
+// #1199 no read method returns one). LocalBackend.ReadTo does not watch the
+// context, so the hasher does:
 // a read past the deadline or a Stop fails. The read counts in the storage
 // read-bytes metric like any other local read.
 //
@@ -2207,8 +2208,7 @@ func (w *progressWriter) Write(b []byte) (int, error) {
 // committed file, and is refused outright when a committed file exists. Using
 // the staging interface for both operations also prevents a committed file
 // appearing between the size and read calls from changing which bytes are
-// hashed. ReadToAt can read staged data when no committed file exists, so it
-// must not be paired with a committed-file size when building a resume hash.
+// hashed.
 func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
 	si, ok := p.cfg.Backend.(storage.StagingInspector)
 	if !ok {

@@ -4981,6 +4981,17 @@ New metrics: `arc_manifest_repair_dropped_total`,
 the last repair under `compaction_commit.manifest_repair` (`dropped`,
 `adopted`, `retiered`, `pending`, `error`).
 
+### Local `ReadToAt` no longer returns staged partials ([#1199](https://github.com/Basekick-Labs/arc/issues/1199))
+
+No operator-visible change. On local storage, a ranged read of a file (the
+peer file fetch that replication uses, and edge sync resuming a transfer) could
+return the bytes of an interrupted transfer when the committed file was
+missing. It now reads committed files only, like the size and existence checks;
+a missing file is reported as not found. Resuming an interrupted replication
+pull still works: it reads the partial through the staging interface.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1203](https://github.com/Basekick-Labs/arc/pull/1203).
+
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 
 The delete endpoint's keyword scan used `\b` directly on the masked WHERE
@@ -5431,12 +5442,9 @@ can see change with it, all in the safe direction:
 - a backup counts such a path as absent — and says so in its incomplete
   sample — instead of recording a partial's size and then failing to copy it.
 
-One asymmetry to know about, because it is the thing most easily got wrong
-from the sentence above: **`ReadToAt` still serves staged data** when no
-committed file exists. The resume path depends on that. So a caller must not
-pair a committed-only `StatFile` size with a `ReadToAt` read and assume both
-saw the same bytes; the interface comments now say so, and making `ReadToAt`
-honest too is tracked separately.
+Ranged reads (`ReadToAt`) now read committed files only as well
+([#1199](https://github.com/Basekick-Labs/arc/issues/1199)), so every local
+read and size answers about the same committed file.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1190](https://github.com/Basekick-Labs/arc/pull/1190).
 
