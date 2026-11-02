@@ -557,13 +557,13 @@ func msgPackSpecDocument() fiber.Map {
 				"note":   "a row with neither h nor a host tag is tagged host=unknown",
 			},
 			"batch": fiber.Map{
-				"batch": "array of columnar and/or row items in one payload; a top-level array of items is also accepted",
+				"batch": "array of columnar and/or row items in one payload; a top-level array of items is also accepted; an item that cannot be decoded is dropped whole and reported as a partial write, the others are written",
 			},
 			"values": "msgpack bin values are stored as binary (BLOB) columns",
 		},
 		"responses": fiber.Map{
 			"204": "all points written",
-			"400": "empty body, bad compression, malformed MessagePack, a payload missing m or fields/f, columns of different lengths, a non-numeric time, an invalid database or measurement name, a column whose type conflicts with stored data, or \"partial write: N points dropped\" (the message says whether the other points were written)",
+			"400": "empty body, bad compression, malformed MessagePack, a payload missing m or fields/f, columns of different lengths, a non-numeric time, an invalid database or measurement name, a column whose type conflicts with stored data, or \"partial write: N points dropped\" when some points or batch/array items could not be written (the message says whether the others were)",
 			"401": "missing or invalid token",
 			"403": "token lacks write permission",
 			"413": "request body larger than server.max_payload_size",

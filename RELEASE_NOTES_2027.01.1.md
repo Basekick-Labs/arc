@@ -24,6 +24,18 @@ Clients that read `authentication.header` now get `Authorization` instead of
 `x-api-key`. Clients that read `compression` as a string need to read the new
 object.
 
+**Behaviour change: a bad item in a MessagePack batch is reported.** In a
+`batch`, or a top-level array of items, an item that could not be decoded (no
+`fields`, columns of different lengths, a time that is not a number, an item
+that is not a map) was logged and skipped, and the request answered **204** as
+if everything had been written. It is now dropped the way any other point that
+cannot be written is: the other items are still written, and the request
+answers **400** `partial write: N points dropped: ... an item of the batch or
+array could not be decoded: <reason>; the other points were written`. Each
+dropped item counts as one point. A client that treated 204 as "all written"
+was silently losing those items; one that retries on 400 should not retry a
+partial write, since the rest is already stored.
+
 ## Fix: a cluster node stalled for 15 seconds or more rejoins Raft ([#1431](https://github.com/Basekick-Labs/arc/issues/1431))
 
 A Raft node that stopped responding for about 15 seconds or longer (a paused
