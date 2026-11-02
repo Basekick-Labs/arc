@@ -460,6 +460,70 @@ func TestFetchClientBandwidthLimitIsSharedAcrossConcurrentFetches(t *testing.T) 
 	}
 }
 
+// chunkReader returns at most chunk bytes per Read, like a socket that hands
+// back whatever has arrived.
+type chunkReader struct{ chunk int }
+
+func (r chunkReader) Read(p []byte) (int, error) {
+	if len(p) > r.chunk {
+		p = p[:r.chunk]
+	}
+	return len(p), nil
+}
+
+func newLimitedFetchClient(t *testing.T, bytesPerSecond int64) *FetchClient {
+	t.Helper()
+	fc, err := NewFetchClient(FetchClient{SelfNodeID: "n", ClusterName: "c", SharedSecret: "s", BytesPerSecond: bytesPerSecond})
+	if err != nil {
+		t.Fatalf("NewFetchClient: %v", err)
+	}
+	return fc
+}
+
+// Short reads pay for the bytes they returned, not for a full buffer (#397).
+// The first version reserved the whole burst before every read and "returned"
+// the rest with AllowN, which consumes tokens instead: 1 KiB reads ran at a
+// fraction of the cap, and the shared bucket slowed every other worker too.
+func TestRateLimitedReaderShortReadsGetTheFullCap(t *testing.T) {
+	const capBps = 64 * 1024
+	const total = 128 * 1024
+	fc := newLimitedFetchClient(t, capBps)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	r := &rateLimitedReader{ctx: ctx, reader: chunkReader{chunk: 1024}, limiter: fc.rateLimiter, maxRead: fc.rateBurst}
+
+	started := time.Now()
+	if _, err := io.CopyN(io.Discard, r, total); err != nil {
+		t.Fatalf("CopyN: %v", err)
+	}
+	elapsed := time.Since(started)
+	// The first burst is free; the rest drains at the cap.
+	want := time.Duration(float64(total-fc.rateBurst) / capBps * float64(time.Second))
+	if elapsed < want*8/10 {
+		t.Fatalf("%d bytes at %d B/s took %s; want about %s (the cap is not applied)", total, capBps, elapsed, want)
+	}
+	if elapsed > want*13/10 {
+		t.Fatalf("%d bytes at %d B/s in 1 KiB reads took %s; want about %s (short reads are overcharged)", total, capBps, elapsed, want)
+	}
+}
+
+// When the wait for the last chunk would pass the deadline, the chunk is still
+// delivered: those bytes are already off the socket, and a body that has fully
+// arrived must not fail. Only a further Read fails.
+func TestRateLimitedReaderDeliversTheChunkWhoseWaitHitsTheDeadline(t *testing.T) {
+	fc := newLimitedFetchClient(t, 1024) // burst 1 KiB, then 1 KiB per second
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	r := &rateLimitedReader{ctx: ctx, reader: chunkReader{chunk: 1024}, limiter: fc.rateLimiter, maxRead: fc.rateBurst}
+
+	if n, err := io.CopyN(io.Discard, r, 2048); err != nil || n != 2048 {
+		t.Fatalf("CopyN = %d, %v; want 2048, nil", n, err)
+	}
+	if _, err := r.Read(make([]byte, 1024)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("next Read error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
 // Sanity: ensure io.CopyN-driven read path works with body larger than
 // the protocol MaxMessageSize. The body is raw bytes, not a framed message,
 // so this should not trigger the codec's 1 MB limit.

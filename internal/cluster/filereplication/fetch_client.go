@@ -323,30 +323,41 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 	return written, nil
 }
 
-// rateLimitedReader shares a token bucket across fetches and waits before each
-// socket read, so TCP flow control slows the peer instead of only delaying
-// writes after bytes have already arrived.
+// rateLimitedReader shares a token bucket across fetches. It pays for the bytes
+// a socket read actually returned, after the read: rate.Limiter has no refund,
+// so reserving a full buffer up front and getting a short read back would
+// charge every other transfer for bytes that never arrived. The peer is still
+// slowed by TCP flow control, because the next Read does not happen until the
+// wait is over and the receive window closes in the meantime.
 type rateLimitedReader struct {
 	ctx     context.Context
 	reader  io.Reader
 	limiter *rate.Limiter
 	maxRead int
+	err     error
 }
 
 func (r *rateLimitedReader) Read(p []byte) (int, error) {
-	if r.maxRead > 0 && len(p) > r.maxRead {
+	if r.err != nil {
+		return 0, r.err
+	}
+	// maxRead is the limiter's burst, so WaitN(n) never asks for more than
+	// the bucket can hold.
+	if len(p) > r.maxRead {
 		p = p[:r.maxRead]
 	}
-	requested := len(p)
-	if err := r.limiter.WaitN(r.ctx, requested); err != nil {
-		return 0, err
-	}
 	n, err := r.reader.Read(p)
-	if unused := requested - n; unused > 0 {
-		// A short socket read used fewer bytes than reserved. Return the unused
-		// tokens when possible so a slow or fragmented peer does not lower the
-		// effective cap for every other transfer.
-		r.limiter.AllowN(time.Now(), unused)
+	if n > 0 {
+		if werr := r.limiter.WaitN(r.ctx, n); werr != nil {
+			// WaitN refuses as soon as the wait would pass the deadline, before
+			// the context itself expires; report it as the deadline it is.
+			if _, ok := r.ctx.Deadline(); ok && r.ctx.Err() == nil {
+				werr = context.DeadlineExceeded
+			}
+			// The n bytes are already off the socket: hand them over so a body
+			// whose last chunk this was still completes, and fail the next Read.
+			r.err = werr
+		}
 	}
 	return n, err
 }

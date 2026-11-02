@@ -842,7 +842,7 @@ type ClusterConfig struct {
 	// between nodes over the coordinator TCP protocol. Only takes effect when
 	// ReplicationEnabled && Enabled and FeatureClustering is licensed.
 	ReplicationPullWorkers        int   // Number of concurrent fetch workers per node (default: 4)
-	ReplicationPullBytesPerSecond int64 // Aggregate inbound replication limit per node (0 = unlimited)
+	ReplicationPullBytesPerSecond int64 // Aggregate inbound puller bandwidth per node, bytes/s (0 = unlimited; staged compaction fetches are not capped)
 	ReplicationQueueSize          int   // Buffered FSM callback queue size (default: 1024)
 	ReplicationFetchTimeoutMs     int   // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
 	ReplicationServeTimeoutMs     int   // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
@@ -1030,6 +1030,14 @@ func Load() (*Config, error) {
 	departedTTL, err := time.ParseDuration(v.GetString("cluster.stream_takeover_departed_ttl"))
 	if err != nil || departedTTL < time.Minute {
 		return nil, fmt.Errorf("invalid cluster.stream_takeover_departed_ttl %q: must be a Go duration of at least 1m", v.GetString("cluster.stream_takeover_departed_ttl"))
+	}
+
+	// Peer replication bandwidth cap (#397). Parsed as a size so "10MB" means
+	// what it says: GetInt64 turns anything it cannot parse into 0, which is
+	// "unlimited", and a negative value used to switch replication off.
+	pullBytesPerSecond, err := ParseSize(v.GetString("cluster.replication_pull_bytes_per_second"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid cluster.replication_pull_bytes_per_second %q: must be 0 (unlimited) or a positive size such as 10MB: %w", v.GetString("cluster.replication_pull_bytes_per_second"), err)
 	}
 
 	// math.IsNaN via self-comparison: NaN would disable the breaker silently.
@@ -1342,7 +1350,7 @@ func Load() (*Config, error) {
 			ReplicationEnabled: v.GetBool("cluster.replication_enabled"),
 			// Peer file replication (Enterprise Phase 2)
 			ReplicationPullWorkers:                   v.GetInt("cluster.replication_pull_workers"),
-			ReplicationPullBytesPerSecond:            v.GetInt64("cluster.replication_pull_bytes_per_second"),
+			ReplicationPullBytesPerSecond:            pullBytesPerSecond,
 			ReplicationQueueSize:                     v.GetInt("cluster.replication_queue_size"),
 			ReplicationFetchTimeoutMs:                v.GetInt("cluster.replication_fetch_timeout_ms"),
 			ReplicationServeTimeoutMs:                v.GetInt("cluster.replication_serve_timeout_ms"),
@@ -2814,6 +2822,12 @@ func ParseSize(sizeStr string) (int64, error) {
 			}
 			if num < 0 {
 				return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
+			}
+			// Bound before converting: an out-of-range float-to-int64
+			// conversion is implementation-defined, and on amd64 gives
+			// MinInt64, a negative size the checks above have already passed.
+			if num*float64(unit.multiplier) >= math.MaxInt64 {
+				return 0, fmt.Errorf("size too large: %s", sizeStr)
 			}
 			return int64(num * float64(unit.multiplier)), nil
 		}

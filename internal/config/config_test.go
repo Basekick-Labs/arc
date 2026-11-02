@@ -99,6 +99,28 @@ func TestReplicationPullBandwidthConfig(t *testing.T) {
 			t.Fatalf("replication pull bandwidth = %d, want 4096", got)
 		}
 	})
+
+	t.Run("size string", func(t *testing.T) {
+		t.Setenv("ARC_CLUSTER_REPLICATION_PULL_BYTES_PER_SECOND", "10MB")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := cfg.Cluster.ReplicationPullBytesPerSecond; got != 10*1024*1024 {
+			t.Fatalf("replication pull bandwidth = %d, want %d", got, 10*1024*1024)
+		}
+	})
+
+	// GetInt64 read both of these as 0, "unlimited"; a negative value reached
+	// the fetch client and switched peer replication off with one log line.
+	for _, bad := range []string{"-1", "10MiB", "fast"} {
+		t.Run("rejects "+bad, func(t *testing.T) {
+			t.Setenv("ARC_CLUSTER_REPLICATION_PULL_BYTES_PER_SECOND", bad)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "cluster.replication_pull_bytes_per_second") {
+				t.Fatalf("Load error = %v, want one naming cluster.replication_pull_bytes_per_second", err)
+			}
+		})
+	}
 }
 
 // TestGetDefaultMaxConnections_StaysMachineDerived pins the #1030 decision that
@@ -828,6 +850,10 @@ func TestParseSize_InvalidSizes(t *testing.T) {
 		{"abc", "non-numeric"},
 		{"GB", "no number"},
 		{"MB100", "reversed format"},
+		// Out of int64 range: the float-to-int64 conversion would give
+		// MinInt64 on amd64 and slip past the negative check (#397).
+		{"99999999999GB", "overflowing size"},
+		{"8589934592GB", "exactly 2^63 bytes"},
 	}
 
 	for _, tt := range tests {
