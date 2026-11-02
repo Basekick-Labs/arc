@@ -446,12 +446,17 @@ func TestLocalBackend_ReadToAt(t *testing.T) {
 			t.Fatalf("WriteFile staged partial: %v", err)
 		}
 
-		var buf bytes.Buffer
-		if err := backend.ReadToAt(ctx, path, &buf, 0); err == nil {
-			t.Fatal("ReadToAt unexpectedly read a staged partial as a committed file")
-		}
-		if buf.Len() != 0 {
-			t.Fatalf("ReadToAt wrote %q before failing, want no bytes", buf.Bytes())
+		// Offset 0 and a resume offset: both production callers read at
+		// an offset when resuming (peer fetch, edge sync).
+		for _, offset := range []int64{0, 5} {
+			var buf bytes.Buffer
+			err := backend.ReadToAt(ctx, path, &buf, offset)
+			if !errors.Is(err, ErrObjectNotFound) {
+				t.Fatalf("ReadToAt at offset %d = %v, want ErrObjectNotFound: a staged partial is not a committed file", offset, err)
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("ReadToAt at offset %d wrote %q before failing, want no bytes", offset, buf.Bytes())
+			}
 		}
 
 		var staged bytes.Buffer

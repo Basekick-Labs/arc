@@ -134,7 +134,7 @@ func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer)
 	data, ok := f.files[path]
 	f.mu.Unlock()
 	if !ok {
-		return errors.New("not found")
+		return storage.ErrObjectNotFound
 	}
 	_, err := writer.Write(data)
 	return err
@@ -148,7 +148,7 @@ func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Write
 	data, ok := f.files[path]
 	f.mu.Unlock()
 	if !ok {
-		return errors.New("not found")
+		return storage.ErrObjectNotFound
 	}
 	if offset < 0 || offset > int64(len(data)) {
 		return fmt.Errorf("offset %d out of range for file size %d", offset, len(data))
@@ -2178,9 +2178,9 @@ func TestPuller_CatchUpStatus_KeySemantics(t *testing.T) {
 // TestTryResumeFromPartialRefusesCommittedFile pins the guard that makes
 // keeping the committed file on a rejected fetch (#999) safe.
 //
-// A resume hashes a prefix and appends a tail. ReadToAt prefers the committed
-// object and falls back to the staging file, while the tail is appended to the
-// staging file. So once a rejected fetch stops deleting the committed object,
+// A resume hashes a prefix and appends a tail. ReadToAt used to prefer the
+// committed object and fall back to the staging file (until #1199), while the
+// tail is appended to the staging file. So once a rejected fetch stops deleting the committed object,
 // a shorter previous generation on disk could be hashed as the "prefix" of the
 // file being fetched while the tail landed in a different file. Whenever the
 // old generation happened to be a byte prefix of the new one the combined

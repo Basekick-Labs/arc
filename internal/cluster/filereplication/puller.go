@@ -2087,9 +2087,10 @@ const (
 var localHashStall = 30 * time.Second
 
 // verifyLocalCopy hashes the committed local copy of entry.Path and reports
-// whether it is the manifest's version. ReadTo, never ReadToAt: ReadToAt falls
-// back to the staged ".part" file (#1199), which is not the copy a query
-// reads. LocalBackend.ReadTo does not watch the context, so the hasher does:
+// whether it is the manifest's version, reading the whole committed file with
+// ReadTo (never a staged ".part", which is not the copy a query reads; since
+// #1199 no read method returns one). LocalBackend.ReadTo does not watch the
+// context, so the hasher does:
 // a read past the deadline or a Stop fails. The read counts in the storage
 // read-bytes metric like any other local read.
 //
