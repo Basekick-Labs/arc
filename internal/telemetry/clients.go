@@ -20,11 +20,12 @@ import (
 // installations with Arc instances. Nothing about the request itself
 // (path, database, token) is recorded.
 
-// Client kinds; must match api.ClientKindArcli / api.ClientKindPythonSDK
-// (internal/api/client_identity.go). Any other kind is ignored.
+// Client kinds. internal/api/client_identity_test.go pins them to
+// api.ClientKindArcli / api.ClientKindPythonSDK, since neither package
+// imports the other. Any other kind is ignored.
 const (
-	clientKindArcli     = "arcli"
-	clientKindPythonSDK = "python_sdk"
+	ClientKindArcli     = "arcli"
+	ClientKindPythonSDK = "python_sdk"
 )
 
 // maxClientsPerKind bounds the registry, per client kind, so a churn of
@@ -88,8 +89,8 @@ type kindWindow struct {
 
 func newKindWindows() map[string]*kindWindow {
 	return map[string]*kindWindow{
-		clientKindArcli:     {seen: make(map[string]clientEntry)},
-		clientKindPythonSDK: {seen: make(map[string]clientEntry)},
+		ClientKindArcli:     {seen: make(map[string]clientEntry)},
+		ClientKindPythonSDK: {seen: make(map[string]clientEntry)},
 	}
 }
 
@@ -110,15 +111,15 @@ func newClientRegistry() *clientRegistry {
 // strings must already be owned by the caller (not fasthttp buffer
 // views).
 func (r *clientRegistry) record(kind, id, version, runtime, platform string, now time.Time) {
-	if kind != clientKindArcli && kind != clientKindPythonSDK {
+	if kind != ClientKindArcli && kind != ClientKindPythonSDK {
 		return
 	}
 	if len(id) != 36 || !installationIDRe.MatchString(id) {
 		return
 	}
 	e := clientEntry{version: cleanVersion(version), lastSeen: now}
-	if kind != clientKindArcli {
-		e.runtime, e.platform = cleanVersion(runtime), cleanVersion(platform)
+	if kind != ClientKindArcli {
+		e.runtime, e.platform = cleanRuntimeField(runtime), cleanRuntimeField(platform)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -143,7 +144,7 @@ func (r *clientRegistry) take() (*ClientsInfo, *clientWindow) {
 	r.kinds = newKindWindows()
 	r.mu.Unlock()
 	info := &ClientsInfo{}
-	if w := kinds[clientKindArcli]; len(w.seen) > 0 {
+	if w := kinds[ClientKindArcli]; len(w.seen) > 0 {
 		list := make([]ArcliClient, 0, len(w.seen))
 		for id, e := range w.seen {
 			list = append(list, ArcliClient{ID: id, Version: e.version, LastSeen: e.lastSeen.UTC().Format(time.RFC3339)})
@@ -151,7 +152,7 @@ func (r *clientRegistry) take() (*ClientsInfo, *clientWindow) {
 		sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 		info.Arcli = &ArcliClients{Installations: len(list), Truncated: w.truncated, List: list}
 	}
-	if w := kinds[clientKindPythonSDK]; len(w.seen) > 0 {
+	if w := kinds[ClientKindPythonSDK]; len(w.seen) > 0 {
 		info.PythonSDK = renderSDK(w)
 	}
 	if info.Arcli == nil && info.PythonSDK == nil {
@@ -224,6 +225,24 @@ func cleanVersion(v string) string {
 	}
 	for i := 0; i < len(v); i++ {
 		if v[i] < 0x21 || v[i] > 0x7e {
+			return "unknown"
+		}
+	}
+	return v
+}
+
+// cleanRuntimeField is cleanVersion with a tighter alphabet for the
+// runtime and platform fields ("3.12.4", "linux/amd64"): letters,
+// digits and . _ + / -. Values are attacker-controlled; the beacon
+// escapes them, but the telemetry store need not trust them further.
+func cleanRuntimeField(v string) string {
+	v = cleanVersion(v)
+	for i := 0; i < len(v); i++ {
+		ch := v[i]
+		switch {
+		case ch >= '0' && ch <= '9', ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z':
+		case ch == '.', ch == '_', ch == '+', ch == '/', ch == '-':
+		default:
 			return "unknown"
 		}
 	}

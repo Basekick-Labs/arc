@@ -20,7 +20,8 @@ const HeaderClientInstallationID = "Arc-Client-Installation-Id"
 const HeaderArcliInstallationID = "Arcli-Installation-Id"
 
 // Client kinds, derived from the User-Agent product token. The telemetry
-// registry (internal/telemetry/clients.go) accepts exactly these strings.
+// registry accepts exactly these strings; client_identity_test.go pins
+// them to telemetry.ClientKindArcli / telemetry.ClientKindPythonSDK.
 const (
 	ClientKindArcli     = "arcli"      // "arcli/<version> ..."
 	ClientKindPythonSDK = "python_sdk" // "arc-client-python/<version> ..."
@@ -58,11 +59,13 @@ func clientIdentity(rec ClientRecorder, authRequired bool) fiber.Handler {
 		if raw == "" {
 			raw = c.Get(HeaderArcliInstallationID)
 		}
-		if raw == "" || len(raw) != 36 || isUnauthenticatedRoute(c.Path()) {
+		if raw == "" || len(raw) != 36 {
 			return c.Next()
 		}
+		// The User-Agent check is cheaper than the route check (which
+		// allocates), so foreign clients carrying an id leave first.
 		ua := parseClientUserAgent(c.Get(fiber.HeaderUserAgent))
-		if ua.kind == "" {
+		if ua.kind == "" || isUnauthenticatedRoute(c.Path()) {
 			return c.Next()
 		}
 		id := strings.Clone(raw)
@@ -93,6 +96,9 @@ func isUnauthenticatedRoute(p string) bool {
 	return strings.HasPrefix(p, "/metrics") || strings.HasPrefix(p, "/api/v1/metrics")
 }
 
+// maxClientFieldLen mirrors the recorder's limit (telemetry.cleanVersion).
+const maxClientFieldLen = 32
+
 // clientUA is what the User-Agent says about the client. The fields
 // are views into the header (not owned); empty means not reported, and
 // the recorder turns it into "unknown".
@@ -104,7 +110,7 @@ type clientUA struct {
 //
 //	arcli/26.09.1 (darwin/arm64)                                  → arcli, "26.09.1"
 //	arc-client-python/0.2.0 (python/3.12.4; linux/amd64)          → python_sdk, "0.2.0", "3.12.4", "linux/amd64"
-//	arc-client-python/0.1.0                                       → python_sdk, "0.1.0" (older SDKs: no comment)
+//	arc-client-python/0.2.0                                       → python_sdk, "0.2.0" (comment absent or malformed: runtime/platform unknown)
 //
 // Anything else yields kind "". For the Python SDK, runtime is the bare
 // interpreter version ("python/" stripped) and platform the os/arch
@@ -130,6 +136,11 @@ func parseClientUserAgent(ua string) clientUA {
 	if i := strings.IndexByte(rest, ' '); i >= 0 {
 		r.version, comment = rest[:i], strings.TrimSpace(rest[i+1:])
 	}
+	// The recorder reports anything longer as "unknown"; dropping it here
+	// keeps the middleware from cloning a header-sized string per request.
+	if len(r.version) > maxClientFieldLen {
+		r.version = ""
+	}
 	if r.kind != ClientKindPythonSDK || len(comment) < 2 || comment[0] != '(' {
 		return r
 	}
@@ -137,16 +148,17 @@ func parseClientUserAgent(ua string) clientUA {
 	if end < 0 {
 		return r
 	}
-	parts := strings.Split(comment[1:end], ";")
-	if len(parts) != 2 {
+	// Exactly two elements; Cut avoids allocating on every SDK request.
+	first, second, ok := strings.Cut(comment[1:end], ";")
+	if !ok || strings.Contains(second, ";") {
 		return r
 	}
 	const pyPrefix = "python/"
-	if rt := strings.TrimSpace(parts[0]); strings.HasPrefix(rt, pyPrefix) {
+	if rt := strings.TrimSpace(first); strings.HasPrefix(rt, pyPrefix) {
 		r.runtime = rt[len(pyPrefix):]
 	} else {
 		return r
 	}
-	r.platform = strings.TrimSpace(parts[1])
+	r.platform = strings.TrimSpace(second)
 	return r
 }

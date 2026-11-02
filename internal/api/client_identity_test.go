@@ -9,6 +9,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/telemetry"
 )
 
 type recSpy struct {
@@ -226,5 +227,25 @@ func TestClientIdentityRequiresValidatedToken(t *testing.T) {
 		if resp, _ := app.Test(req); resp.StatusCode != 200 || spy.calls != tc.calls {
 			t.Errorf("%s: status=%d calls=%d want %d", tc.path, resp.StatusCode, spy.calls, tc.calls)
 		}
+	}
+}
+
+// The registry drops any kind it does not know, so a rename on one side
+// would silently stop counting that client. Neither package imports the
+// other in production; this test is where the two are tied together.
+func TestClientKindsMatchTelemetry(t *testing.T) {
+	if ClientKindArcli != telemetry.ClientKindArcli || ClientKindPythonSDK != telemetry.ClientKindPythonSDK {
+		t.Fatalf("api kinds (%q, %q) != telemetry kinds (%q, %q)",
+			ClientKindArcli, ClientKindPythonSDK, telemetry.ClientKindArcli, telemetry.ClientKindPythonSDK)
+	}
+}
+
+func TestParseClientUserAgent_OverlongVersionDropped(t *testing.T) {
+	ua := parseClientUserAgent("arc-client-python/" + strings.Repeat("9", 4096) + " (python/3.12.4; linux/amd64)")
+	if ua.kind != ClientKindPythonSDK || ua.version != "" || ua.runtime != "3.12.4" || ua.platform != "linux/amd64" {
+		t.Fatalf("got %+v", ua)
+	}
+	if got := parseClientUserAgent("arc-client-python/0.2.0 (python/3.12.4; linux/amd64; extra)"); got.runtime != "" || got.platform != "" {
+		t.Fatalf("three-element comment must not parse: %+v", got)
 	}
 }
