@@ -3633,9 +3633,9 @@ Measured on a 14-core laptop, 64 MB line-protocol files, 16 in flight:
 
 | | Before | Now |
 |---|---|---|
-| Throughput | 67 MB/s | 301 MB/s |
-| Median import | 15.4 s | 3.2 s |
-| Peak memory | 4.5 GB | 5.3 GB |
+| Throughput | 67 MB/s | 319 MB/s |
+| Median import | 15.4 s | 3.0 s |
+| Peak memory | 4.5 GB | 5.7 GB |
 
 - New `ingest.import_write_concurrency` (default `0` = auto): how many imports
   write at once. Auto is as many as fit an eighth of the memory limit at one
