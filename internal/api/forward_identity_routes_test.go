@@ -82,6 +82,16 @@ func TestBuildHTTPRequest_StripsForwardIdentityHeaders(t *testing.T) {
 	}
 }
 
+// Client installation ids are counted by the node that received the
+// request; a forwarded copy would count the same request again on the peer.
+func TestBuildHTTPRequest_StripsClientInstallationHeaders(t *testing.T) {
+	for _, h := range []string{HeaderArcliInstallationID, HeaderClientInstallationID} {
+		if !isClientForwardingHeader(h) {
+			t.Errorf("%s is not stripped", h)
+		}
+	}
+}
+
 // The request handed to the router carries the ID of the token this node
 // verified, which the router asserts to the peer.
 func TestBuildHTTPRequest_CarriesVerifiedTokenID(t *testing.T) {

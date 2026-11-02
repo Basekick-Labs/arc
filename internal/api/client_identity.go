@@ -9,45 +9,73 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 )
 
-// HeaderArcliInstallationID is sent by arcli on every request with a
-// random per-installation UUID (see arcli's README, "Privacy").
+// HeaderClientInstallationID is sent by Arc clients (the Python SDK
+// today) with a random per-installation UUID. Generic so later clients
+// reuse it; the client kind comes from the User-Agent product token.
+const HeaderClientInstallationID = "Arc-Client-Installation-Id"
+
+// HeaderArcliInstallationID is the legacy header arcli sends with its
+// per-installation UUID (see arcli's README, "Privacy"). Still accepted;
+// when both are present HeaderClientInstallationID wins.
 const HeaderArcliInstallationID = "Arcli-Installation-Id"
 
-// ClientRecorder receives the identity of CLI installations that talk
-// to this node. The telemetry collector implements it; nil disables
-// the middleware entirely.
+// Client kinds, derived from the User-Agent product token. The telemetry
+// registry (internal/telemetry/clients.go) accepts exactly these strings.
+const (
+	ClientKindArcli     = "arcli"      // "arcli/<version> ..."
+	ClientKindPythonSDK = "python_sdk" // "arc-client-python/<version> ..."
+)
+
+// ClientRecorder receives the identity of client installations (arcli,
+// the Python SDK) that talk to this node. The telemetry collector
+// implements it; nil disables the middleware entirely. runtime and
+// platform are empty for kinds that do not report them.
 type ClientRecorder interface {
-	RecordClient(id, version string)
+	RecordClient(kind, id, version, runtime, platform string)
 }
 
-// clientIdentity hands the arcli installation id and version to rec
-// after the request was served. Two gates keep anonymous callers out
-// of the bounded registry: the response must be < 400, and when the
+// clientIdentity hands the installation id, client kind and version to
+// rec after the request was served. The id comes from
+// Arc-Client-Installation-Id, or the legacy Arcli-Installation-Id; the
+// kind from the User-Agent product token, and a request whose
+// User-Agent names no known client is never recorded, so foreign
+// traffic cannot pollute the counts. Two gates keep anonymous callers
+// out of the bounded registry: the response must be < 400, and when the
 // server runs with authentication the auth middleware must have
 // validated a token on this request (auth.GetTokenInfo). Public routes
 // such as /health answer 200 without a token and are therefore never
 // counted (the path list below is only belt-and-braces: Fiber routes
 // case-insensitively and tolerates a trailing slash, so the path alone
 // is not a safe gate). Without authentication configured every caller
-// is trusted anyway, and the docs say so. Requests without the header
-// cost one header lookup. Header values are copied out of fasthttp's
-// request buffer before they outlive the request (Fiber runs without
-// Immutable), and are validated by the recorder; nothing is logged.
+// is trusted anyway, and the docs say so. Requests without either
+// header cost two header lookups. Header values are copied out of
+// fasthttp's request buffer before they outlive the request (Fiber runs
+// without Immutable), and are validated by the recorder; nothing is
+// logged.
 func clientIdentity(rec ClientRecorder, authRequired bool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		raw := c.Get(HeaderArcliInstallationID)
+		raw := c.Get(HeaderClientInstallationID)
+		if raw == "" {
+			raw = c.Get(HeaderArcliInstallationID)
+		}
 		if raw == "" || len(raw) != 36 || isUnauthenticatedRoute(c.Path()) {
 			return c.Next()
 		}
+		ua := parseClientUserAgent(c.Get(fiber.HeaderUserAgent))
+		if ua.kind == "" {
+			return c.Next()
+		}
 		id := strings.Clone(raw)
-		version := strings.Clone(arcliVersion(c.Get(fiber.HeaderUserAgent)))
+		version := strings.Clone(ua.version)
+		runtime := strings.Clone(ua.runtime)
+		platform := strings.Clone(ua.platform)
 		err := c.Next()
 		// Fiber runs the error handler after the stack unwinds, so a
 		// handler that returns an error (401 via fiber.NewError, a 500,
 		// an unknown route's 404) still shows status 200 here; err must
 		// be nil as well.
 		if err == nil && c.Response().StatusCode() < 400 && (!authRequired || auth.GetTokenInfo(c) != nil) {
-			rec.RecordClient(id, version)
+			rec.RecordClient(ua.kind, id, version, runtime, platform)
 		}
 		return err
 	}
@@ -65,16 +93,60 @@ func isUnauthenticatedRoute(p string) bool {
 	return strings.HasPrefix(p, "/metrics") || strings.HasPrefix(p, "/api/v1/metrics")
 }
 
-// arcliVersion extracts "26.09.1" from "arcli/26.09.1 (darwin/arm64)";
-// anything else yields "" and the recorder reports it as unknown.
-func arcliVersion(ua string) string {
-	const prefix = "arcli/"
-	if !strings.HasPrefix(ua, prefix) {
-		return ""
+// clientUA is what the User-Agent says about the client. The fields
+// are views into the header (not owned); empty means not reported, and
+// the recorder turns it into "unknown".
+type clientUA struct {
+	kind, version, runtime, platform string
+}
+
+// parseClientUserAgent recognises
+//
+//	arcli/26.09.1 (darwin/arm64)                                  → arcli, "26.09.1"
+//	arc-client-python/0.2.0 (python/3.12.4; linux/amd64)          → python_sdk, "0.2.0", "3.12.4", "linux/amd64"
+//	arc-client-python/0.1.0                                       → python_sdk, "0.1.0" (older SDKs: no comment)
+//
+// Anything else yields kind "". For the Python SDK, runtime is the bare
+// interpreter version ("python/" stripped) and platform the os/arch
+// element verbatim; a comment that does not have that shape leaves
+// both empty. arcli's comment is not reported (its payload is unchanged).
+func parseClientUserAgent(ua string) clientUA {
+	const (
+		arcliPrefix  = "arcli/"
+		pythonPrefix = "arc-client-python/"
+	)
+	var r clientUA
+	var rest string
+	switch {
+	case strings.HasPrefix(ua, arcliPrefix):
+		r.kind, rest = ClientKindArcli, ua[len(arcliPrefix):]
+	case strings.HasPrefix(ua, pythonPrefix):
+		r.kind, rest = ClientKindPythonSDK, ua[len(pythonPrefix):]
+	default:
+		return r
 	}
-	v := ua[len(prefix):]
-	if i := strings.IndexByte(v, ' '); i >= 0 {
-		v = v[:i]
+	r.version = rest
+	comment := ""
+	if i := strings.IndexByte(rest, ' '); i >= 0 {
+		r.version, comment = rest[:i], strings.TrimSpace(rest[i+1:])
 	}
-	return v
+	if r.kind != ClientKindPythonSDK || len(comment) < 2 || comment[0] != '(' {
+		return r
+	}
+	end := strings.IndexByte(comment, ')')
+	if end < 0 {
+		return r
+	}
+	parts := strings.Split(comment[1:end], ";")
+	if len(parts) != 2 {
+		return r
+	}
+	const pyPrefix = "python/"
+	if rt := strings.TrimSpace(parts[0]); strings.HasPrefix(rt, pyPrefix) {
+		r.runtime = rt[len(pyPrefix):]
+	} else {
+		return r
+	}
+	r.platform = strings.TrimSpace(parts[1])
+	return r
 }
