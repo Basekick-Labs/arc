@@ -165,6 +165,16 @@ type IngestConfig struct {
 	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
+	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
+	// csv, parquet) write at once on this node (#1429). 0 = auto: as many
+	// as fit an eighth of the memory limit at one import allowance each,
+	// at most the CPUs Arc runs on, at least 1. An explicit value (at most
+	// 1024) is used as is, without the memory calculation.
+	ImportWriteConcurrency int
+	// ImportQueueTimeoutMS is how long an import waits for a write slot
+	// before it is refused with 503 and nothing written (#1429). 0 = until a
+	// slot frees: the server does not see a client that gives up.
+	ImportQueueTimeoutMS int
 }
 
 type CacheConfig struct {
@@ -1130,21 +1140,23 @@ func Load() (*Config, error) {
 			GCSEndpoint:        v.GetString("storage.gcs_endpoint"),
 		},
 		Ingest: IngestConfig{
-			MaxBufferSize:         v.GetInt("ingest.max_buffer_size"),
-			MaxBufferAgeMS:        v.GetInt("ingest.max_buffer_age_ms"),
-			Compression:           v.GetString("ingest.compression"),
-			UseDictionary:         v.GetBool("ingest.use_dictionary"),
-			NumericDictionary:     v.GetBool("ingest.numeric_dictionary"),
-			WriteStatistics:       v.GetBool("ingest.write_statistics"),
-			DataPageVersion:       v.GetString("ingest.data_page_version"),
-			FlushWorkers:          v.GetInt("ingest.flush_workers"),
-			FlushQueueSize:        v.GetInt("ingest.flush_queue_size"),
-			FlushTimeoutSeconds:   v.GetInt("ingest.flush_timeout_seconds"),
-			ShardCount:            v.GetInt("ingest.shard_count"),
-			SortKeys:              v.GetStringSlice("ingest.sort_keys"),
-			DefaultSortKeys:       v.GetString("ingest.default_sort_keys"),
-			DecimalColumns:        v.GetStringSlice("ingest.decimal_columns"),
-			DefaultDecimalColumns: v.GetString("ingest.default_decimal_columns"),
+			MaxBufferSize:          v.GetInt("ingest.max_buffer_size"),
+			MaxBufferAgeMS:         v.GetInt("ingest.max_buffer_age_ms"),
+			Compression:            v.GetString("ingest.compression"),
+			UseDictionary:          v.GetBool("ingest.use_dictionary"),
+			NumericDictionary:      v.GetBool("ingest.numeric_dictionary"),
+			WriteStatistics:        v.GetBool("ingest.write_statistics"),
+			DataPageVersion:        v.GetString("ingest.data_page_version"),
+			FlushWorkers:           v.GetInt("ingest.flush_workers"),
+			FlushQueueSize:         v.GetInt("ingest.flush_queue_size"),
+			FlushTimeoutSeconds:    v.GetInt("ingest.flush_timeout_seconds"),
+			ShardCount:             v.GetInt("ingest.shard_count"),
+			SortKeys:               v.GetStringSlice("ingest.sort_keys"),
+			DefaultSortKeys:        v.GetString("ingest.default_sort_keys"),
+			DecimalColumns:         v.GetStringSlice("ingest.decimal_columns"),
+			DefaultDecimalColumns:  v.GetString("ingest.default_decimal_columns"),
+			ImportWriteConcurrency: v.GetInt("ingest.import_write_concurrency"),
+			ImportQueueTimeoutMS:   v.GetInt("ingest.import_queue_timeout_ms"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -1489,6 +1501,12 @@ func Load() (*Config, error) {
 	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
+	}
+	if cfg.Ingest.ImportWriteConcurrency < 0 || cfg.Ingest.ImportWriteConcurrency > 1024 {
+		return nil, fmt.Errorf("invalid ingest.import_write_concurrency value: %d (must be 0-1024; 0 = auto)", cfg.Ingest.ImportWriteConcurrency)
+	}
+	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
+		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
 	}
 	// A negative max_concurrent would reach make(chan struct{}, m.MaxConcurrent)
 	// in the compaction manager's cycle loop and panic the process at the first
@@ -2018,6 +2036,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
 	v.SetDefault("ingest.decimal_columns", []string{})
 	v.SetDefault("ingest.default_decimal_columns", "")
+	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
+	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")

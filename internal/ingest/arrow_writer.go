@@ -6052,6 +6052,28 @@ func (b *ArrowBuffer) FlushScope(ctx context.Context, database string) error {
 	return b.flushMatching(ctx, func(key string) bool { return keyInScope(key, database, "") })
 }
 
+// FlushMeasurements is FlushAll for the buffers of the given measurements of
+// one database. A bulk import ends with it: every row the import wrote is in
+// those buffers, and with imports running side by side a node-wide flush per
+// import would cut every other writer's buffers into small files (#1429).
+func (b *ArrowBuffer) FlushMeasurements(ctx context.Context, database string, measurements []string) error {
+	if len(measurements) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(measurements))
+	for _, m := range measurements {
+		want[m] = struct{}{}
+	}
+	return b.flushMatching(ctx, func(key string) bool {
+		parts := splitBufferKey(key)
+		if len(parts) != 2 || parts[0] != database {
+			return false
+		}
+		_, ok := want[parts[1]]
+		return ok
+	})
+}
+
 // IsDecimalColumn reports whether a column of a measurement is configured
 // as decimal (ingest.decimal_columns): its values are converted to decimal
 // whatever their type.

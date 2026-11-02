@@ -3693,6 +3693,15 @@ func main() {
 	// staging — see NewDeleteHandler below.)
 	importHandler := api.NewImportHandler(logger.Get("import"))
 	importHandler.SetArrowBuffer(arrowBuffer)
+	// Import write slots (#1429): set before the import routes serve, after
+	// the licence pinned GOMAXPROCS (the auto value reads it).
+	importSlots := api.ConfigureImports(cfg.Ingest.ImportWriteConcurrency,
+		time.Duration(cfg.Ingest.ImportQueueTimeoutMS)*time.Millisecond, arrowBuffer)
+	log.Info().
+		Int("import_write_concurrency", importSlots).
+		Bool("auto", cfg.Ingest.ImportWriteConcurrency == 0).
+		Int("import_queue_timeout_ms", cfg.Ingest.ImportQueueTimeoutMS).
+		Msg("Bulk import write slots configured")
 	if authManager != nil && rbacManager != nil {
 		importHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
