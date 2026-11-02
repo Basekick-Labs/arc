@@ -1419,6 +1419,55 @@ func TestPuller_ResumeOnRetry(t *testing.T) {
 	}
 }
 
+// A new enqueue resumes a partial an earlier enqueue left, on its first
+// attempt (#397). Before, only attempts 2..N resumed, so under a low
+// replication bandwidth cap every FSM callback, catch-up or recheck pulled the
+// file from zero, and a file larger than one enqueue's attempts could carry
+// never completed.
+func TestPuller_NewEnqueueResumesPartialOnFirstAttempt(t *testing.T) {
+	fullBody := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	entry := makeEntry("db/cpu/resume-enqueue.parquet", "writer-1", int64(len(fullBody)))
+	backend := newFakeBackend()
+	// The first enqueue's only attempt drops mid-body; everything after works.
+	fetcher := newResumeAwareFetcher(fullBody, errors.New("transport: connection reset"))
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        multiPeerResolver{addrs: []string{"peer-1:9999"}},
+		Workers:             1,
+		QueueSize:           8,
+		RetryMaxAttempts:    1,
+		RetryInitialBackoff: time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(entry)
+	waitStats(t, p, func(s map[string]int64) bool { return s["failed"] >= 1 })
+	p.Enqueue(entry)
+	waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] >= 1 })
+
+	fetcher.mu.Lock()
+	offsets := append([]int64(nil), fetcher.offsets...)
+	fetcher.mu.Unlock()
+	if len(offsets) != 2 {
+		t.Fatalf("Fetch calls = %d (offsets %v), want 2", len(offsets), offsets)
+	}
+	if offsets[0] != 0 {
+		t.Errorf("first enqueue offset = %d, want 0", offsets[0])
+	}
+	if offsets[1] <= 0 {
+		t.Errorf("second enqueue offset = %d, want > 0: its first attempt must resume the partial", offsets[1])
+	}
+}
+
 // TestPuller_BadOffsetDeletesPartialAndRetries verifies that when the fetcher
 // returns ErrBadOffset, the puller deletes the partial file, increments the
 // bad_offset counter, and continues to retry from zero.

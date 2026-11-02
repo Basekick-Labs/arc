@@ -808,6 +808,35 @@ GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
 
+### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
+
+`cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a
+node's peer file replication: one budget shared by all its pull workers, so
+reactive pulls, the startup catch-up and the periodic recheck together stay
+under it. It takes bytes per second or a size such as `"10MB"` (1 MB = 1024 KB);
+the default `0` is unlimited. A negative or unparseable value fails startup,
+instead of reading as unlimited. Helm: `cluster.replication.pullBytesPerSecond`.
+
+The cap does not apply to the staged compaction commit: a compacted output is
+fetched from the start every time, so a capped fetch could never deliver one
+larger than the cap allows within `cluster.replication_serve_timeout_ms`, and
+the partition would be compacted and aborted again on every cycle.
+
+Under a low cap a large file can take longer than one fetch. Each fetch is
+still bounded by `cluster.replication_fetch_timeout_ms` on the pulling node and
+by `cluster.replication_serve_timeout_ms` on the node serving the file; when
+either ends it, the next attempt resumes from the bytes already received. That
+now includes the first attempt of a new pull: before, only retries within one
+pull resumed, and every new pull of the same file (a manifest callback, the
+catch-up, the recheck) started again from zero, so a file too large for one
+pull's attempts never completed.
+A partial left by an older version of the same file fails the checksum when
+resumed; it is discarded and the same peer is asked again from the start, and
+the mismatch is not counted against that peer.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1404](https://github.com/Basekick-Labs/arc/pull/1404).
+
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
 `storage.backend = "gcs"` stores Arc's data in a Google Cloud
