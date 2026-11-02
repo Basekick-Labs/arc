@@ -2,6 +2,41 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a cluster node stalled for 15 seconds or more rejoins Raft ([#1431](https://github.com/Basekick-Labs/arc/issues/1431))
+
+A Raft node that stopped responding for about 15 seconds or longer (a paused
+container, a long GC or I/O stall, a VM migration) never rejoined once it
+resumed. It logged `raft auth handshake (accept): read client mac: EOF` and
+`pre-vote campaign failed` about once a second until it was restarted, while
+`/health`, `/ready` and `/api/v1/cluster/nodes` still reported it healthy. Raft
+stopped applying its file registrations, and on shared storage every `DELETE`
+and database drop answered 503 unless `allow_unreachable=true` was passed.
+
+The cause was the interaction between the Raft peer-authentication handshake
+and hashicorp/raft's accept loop. The connections that queued up during the
+stall had already been abandoned by their peers, so each one failed its
+handshake. raft then waited up to a second before accepting the next one, and
+by the time it did, that peer had given up too.
+
+Handshakes now run alongside each other, off raft's accept loop, and raft
+only ever receives connections that passed. Abandoned connections drain at
+once, and a peer that connects without speaking no longer delays the others.
+In testing, nodes paused for 15 s and for 40 s both rejoined without a restart.
+
+What operators see in logs changes:
+
+- A peer that fails authentication (wrong `cluster.shared_secret` or cluster
+  name, or something that is not an Arc node) is logged as a Warn,
+  `Rejected Raft connection: peer failed shared-secret authentication`, with
+  the remote address, at most once every 10 seconds plus a count of the
+  rejections since the previous Warn. It used to appear as a raft
+  `failed to accept connection` error line per attempt.
+- A connection whose peer hung up during the handshake, which is routine after
+  a stall, is logged at Debug only.
+
+No configuration change. Every node can be upgraded independently; the
+handshake on the wire is unchanged.
+
 ## Fix: Google Cloud Storage through the S3-compatible endpoint (#1399)
 
 GCS S3 interoperability now leaves `Accept-Encoding` out of request signatures
