@@ -2,6 +2,28 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
+
+`GET /api/v1/write/msgpack/spec` said authentication was "not yet
+implemented", although the route it describes (and the spec route itself)
+requires a token. The document now matches the code:
+
+- `authentication`: `Authorization: Bearer <token>`, also `Token <token>`,
+  `x-api-key` and the deprecated `?p=`; write permission is required.
+- New sections: `database` (the `x-arc-database` header, default `default`),
+  `time` (seconds, milliseconds, microseconds or nanoseconds, detected from the
+  first value; nanoseconds were missing), `responses` (status codes), and
+  `method`.
+- Columnar format documents `tag_keys`, and the columnar example now uses it.
+- `compression` is now an object: detection by magic bytes and the payload
+  limits. `content_type` notes that the server does not check it.
+- The `performance` section is removed. Its throughput figures were years out
+  of date; current numbers are in the README.
+
+Clients that read `authentication.header` now get `Authorization` instead of
+`x-api-key`. Clients that read `compression` as a string need to read the new
+object.
+
 ## Fix: a cluster node stalled for 15 seconds or more rejoins Raft ([#1431](https://github.com/Basekick-Labs/arc/issues/1431))
 
 A Raft node that stopped responding for about 15 seconds or longer (a paused
