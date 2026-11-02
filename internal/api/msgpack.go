@@ -529,7 +529,7 @@ func msgPackSpecDocument() fiber.Map {
 			"header":        "Authorization",
 			"scheme":        "Bearer <token>",
 			"also_accepted": []string{"Authorization: Token <token>", "Authorization: <token>", "x-api-key: <token>", "?p=<token> (deprecated: tokens in URLs reach access logs)"},
-			"permission":    "write on the target database; with RBAC, write on each measurement in the payload (403 otherwise)",
+			"permission":    "the token's permissions must include write (or admin); with RBAC configured it must also allow write on each measurement in the payload in the target database (403 otherwise)",
 			"note":          "required unless auth.enabled is false",
 		},
 		"database": fiber.Map{
@@ -537,9 +537,9 @@ func msgPackSpecDocument() fiber.Map {
 			"default": "default",
 		},
 		"time": fiber.Map{
-			"units":   "detected from the magnitude of the first value: < 1e10 seconds, < 1e13 milliseconds, < 1e16 microseconds, otherwise nanoseconds; a column uses its first value's unit for every row",
+			"units":   "detected by magnitude: < 1e10 seconds, < 1e13 milliseconds, < 1e16 microseconds, otherwise nanoseconds; columnar from the first value of the time column, applied to every row; row format per row",
 			"stored":  "microseconds",
-			"missing": "rows without a time get the server's receive time",
+			"missing": "a columnar item with no time column, or a row with no t, gets the server's receive time; a null inside a time column is a 400",
 		},
 		"format": fiber.Map{
 			"columnar (RECOMMENDED)": fiber.Map{
@@ -563,12 +563,15 @@ func msgPackSpecDocument() fiber.Map {
 		},
 		"responses": fiber.Map{
 			"204": "all points written",
-			"400": "empty or undecodable body, bad compression, invalid database or measurement name, a column whose type conflicts with stored data, or \"partial write: N points dropped\" (the message says whether the other points were written)",
+			"400": "empty body, bad compression, malformed MessagePack, a payload missing m or fields/f, columns of different lengths, a non-numeric time, an invalid database or measurement name, a column whose type conflicts with stored data, or \"partial write: N points dropped\" (the message says whether the other points were written)",
 			"401": "missing or invalid token",
 			"403": "token lacks write permission",
 			"413": "request body larger than server.max_payload_size",
 			"500": "unexpected server error",
-			"503": "temporarily refusing writes (shutdown, WAL disk pressure, schema churn, cluster write fence); retry",
+			"502": "cluster: the write could not be routed to a writer",
+			"503": "temporarily refusing writes (shutdown, WAL disk pressure, schema churn, cluster write fence, no writer reachable); retry",
+			"504": "cluster: a forwarded write got no answer and may have been written; retrying can duplicate it",
+			"508": "cluster: forwarding loop detected",
 		},
 		"example_columnar": fiber.Map{
 			"m":        "cpu",

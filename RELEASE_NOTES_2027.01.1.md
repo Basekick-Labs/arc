@@ -8,7 +8,7 @@
 implemented", although the route it describes (and the spec route itself)
 requires a token. The document now matches the code:
 
-- `authentication`: `Authorization: Bearer <token>`, also `Token <token>`,
+- `authentication`: `Authorization: Bearer <token>`, also `Token <token>`, a bare `Authorization: <token>`,
   `x-api-key` and the deprecated `?p=`; write permission is required.
 - New sections: `database` (the `x-arc-database` header, default `default`),
   `time` (seconds, milliseconds, microseconds or nanoseconds, detected from the

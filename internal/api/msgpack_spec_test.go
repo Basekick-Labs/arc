@@ -14,8 +14,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -92,4 +94,23 @@ func TestMsgPackSpecDescribesAuthentication(t *testing.T) {
 	require.Equal(t, "Authorization", spec.Authentication.Header)
 	require.Equal(t, "Bearer <token>", spec.Authentication.Scheme)
 	require.Equal(t, "x-arc-database", spec.Database.Header)
+}
+
+// The spec is not a public route: it needs a token like the endpoint it
+// describes. Public routes main.go adds are not here, but a default-config
+// change that opened /api/v1/write would be.
+func TestMsgPackSpecRequiresToken(t *testing.T) {
+	am, err := auth.NewAuthManager(":memory:", time.Minute, 16, zerolog.Nop())
+	require.NoError(t, err)
+	t.Cleanup(func() { am.Close() })
+	r := newLPWriteRig(t, nil)
+	cfg := auth.DefaultMiddlewareConfig()
+	cfg.AuthManager = am
+	app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
+	app.Use(auth.NewMiddleware(cfg))
+	NewMsgPackHandler(zerolog.Nop(), r.buf, 100<<20).RegisterRoutes(app)
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/api/v1/write/msgpack/spec", nil), -1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
