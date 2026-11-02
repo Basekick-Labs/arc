@@ -108,7 +108,8 @@ type ServerConfig struct {
 	TLSKeyFile  string
 
 	// ClientRecorder, when set, receives the installation id + version
-	// of arcli clients (Arcli-Installation-Id header) for telemetry.
+	// of arcli and SDK clients (Arc-Client-Installation-Id, or arcli's
+	// legacy Arcli-Installation-Id header) for telemetry.
 	// nil (telemetry disabled) installs no middleware.
 	ClientRecorder ClientRecorder
 	// AuthRequired tells the client-identity middleware that the auth
@@ -169,7 +170,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id",
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id",
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)
@@ -179,7 +180,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// (request_encoding.go).
 	app.Use(rejectEncodedBodies)
 
-	// arcli installation ids for telemetry (see client_identity.go).
+	// Client (arcli, SDK) installation ids for telemetry (see client_identity.go).
 	if config.ClientRecorder != nil {
 		app.Use(clientIdentity(config.ClientRecorder, config.AuthRequired))
 	}

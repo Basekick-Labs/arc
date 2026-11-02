@@ -374,6 +374,15 @@ func oversizedPayloadError(err error) error {
 // surface accurate operator-facing messages. Use errors.Is to detect.
 var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 
+// ErrNotDurable is returned in AckModeDurable when an entry could not be made
+// durable (write or sync failure, or the writer closing). The entry's pending
+// sequence is released; if its bytes did reach the WAL file, recovery may still
+// replay them, so a client retry can duplicate them (at-least-once).
+var ErrNotDurable = errors.New("WAL entry not durable")
+
+// errWriterExited answers a durable wait the writer loop exited without serving.
+var errWriterExited = errors.New("WAL writer closed before the entry was synced")
+
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
 	data    []byte // Complete entry: header + payload
@@ -441,8 +450,26 @@ type WriterConfig struct {
 	SyncInterval time.Duration // Request a sync at least this often while bytes are unsynced (default: 100ms; 0 = default)
 	SyncBytes    int64         // Request a sync once this many bytes are unsynced (default: 1MB; 0 = default)
 	BufferSize   int           // Size of async write buffer (default: 10000)
-	Logger       zerolog.Logger
+	// AckMode decides when a tracked data append returns: once its entry is
+	// queued for the writer (AckModeQueued, the default), or once a sync
+	// covering it has completed (AckModeDurable).
+	AckMode AckMode
+	Logger  zerolog.Logger
 }
+
+// AckMode is when a tracked data append is acknowledged to its caller.
+type AckMode string
+
+const (
+	// AckModeQueued returns once the entry is queued for the writer. A crash
+	// loses entries still queued or written but not yet synced, and a full
+	// queue drops entries (ErrWALDropped) while the write is still accepted.
+	AckModeQueued AckMode = "queued"
+	// AckModeDurable returns once a sync covering the entry has completed, in
+	// every sync mode (async included: a waiting entry forces the sync). A
+	// full queue blocks instead of dropping. Any failure is ErrNotDurable.
+	AckModeDurable AckMode = "durable"
+)
 
 // ReplicationEntry is a WAL entry as the replication hook receives it: the
 // origin stream (#1207) sends it to standby writers.
@@ -450,7 +477,8 @@ type ReplicationEntry struct {
 	// TimestampUS is the entry timestamp in microseconds since epoch
 	TimestampUS uint64
 
-	// Payload is the raw msgpack data
+	// Payload is the entry's logical payload: the msgpack data, preceded by the
+	// database envelope header for entries written with one.
 	Payload []byte
 
 	// Coverage identifies the ingest batch the entry belongs to, for entries
@@ -575,6 +603,12 @@ type Writer struct {
 	entryChan chan walEntry
 	done      chan struct{}
 	wg        sync.WaitGroup
+	// closedFlag mirrors closed for the durable data append path, which must
+	// stay off w.mu (held across file writes and rotation).
+	closedFlag atomic.Bool
+	// exited is closed by Close once the writer loop has drained and done its
+	// final sync: a durable wait still pending then was never served.
+	exited chan struct{}
 
 	// Replication hook for streaming entries to readers. Atomic, not under
 	// w.mu: the writer loop holds w.mu across fsync and rotation, and a covered
@@ -649,6 +683,13 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	trackedInstance := binary.BigEndian.Uint64(instanceBytes[:])
 
 	// Set defaults
+	switch cfg.AckMode {
+	case "":
+		cfg.AckMode = AckModeQueued
+	case AckModeQueued, AckModeDurable:
+	default:
+		return nil, fmt.Errorf("invalid WAL ack mode %q (queued or durable)", cfg.AckMode)
+	}
 	if cfg.SyncMode == "" {
 		cfg.SyncMode = SyncModeFdatasync
 	}
@@ -691,6 +732,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		created:         make(map[string]struct{}),
 		pendingSeqs:     make(map[uint64]struct{}),
 		done:            make(chan struct{}),
+		exited:          make(chan struct{}),
 		trackedInstance: trackedInstance,
 	}
 
@@ -714,6 +756,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	w.logger.Info().
 		Str("dir", cfg.WALDir).
 		Str("sync_mode", string(cfg.SyncMode)).
+		Str("ack_mode", string(cfg.AckMode)).
 		Bool("fdatasync_supported", dataSyncSupported).
 		Int64("max_size_mb", cfg.MaxSizeBytes/1024/1024).
 		Dur("max_age", cfg.MaxAge).
@@ -1125,7 +1168,7 @@ func (w *Writer) logWriteFailure(entry walEntry, err error) {
 		return
 	}
 	msg := "WAL data entry could not be written and is lost from the WAL: its rows reach storage only if the flush of the ingest buffer holding them succeeds; a crash or a failed flush before that loses them"
-	if entry.durable {
+	if entry.durable && entry.seq == 0 {
 		msg = "WAL flush checkpoint could not be written: its data is already in storage, but recovery may replay those entries again (a duplicate, not a loss)"
 	}
 	w.logger.Error().Err(err).
@@ -1398,6 +1441,11 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 // The identity is used by flush checkpoints to avoid replaying data that was
 // already durably written to storage.
 func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, error) {
+	hashes, err := w.appendTracked(records)
+	return hashes, w.durableErr(err)
+}
+
+func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, error) {
 	payload, err := msgpack.Marshal(records)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize records: %w", err)
@@ -1410,11 +1458,13 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 		}
 	}
 	hashes := make([]string, 0, len(chunks))
+	var dones []chan error
 	for _, chunk := range chunks {
 		if !trackedPayloadFits(len(chunk), 0) {
+			w.releasePending(hashes) // earlier chunks would otherwise pin the floor (#676)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		token, err := w.appendTrackedEntry(chunk)
+		token, done, err := w.appendTrackedEntry(nil, chunk)
 		if err != nil {
 			// The chunks that already landed are pending in the floor, and
 			// their tokens go out of scope with this slice — the caller gets
@@ -1425,12 +1475,25 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 			return nil, err
 		}
 		hashes = append(hashes, token)
+		if done != nil {
+			dones = append(dones, done)
+		}
+	}
+	if len(dones) > 0 {
+		if err := w.awaitDurable(hashes, dones); err != nil {
+			return nil, err
+		}
 	}
 	return hashes, nil
 }
 
 // AppendRawWithMetaTracked is the tracked counterpart to AppendRawWithMeta.
 func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
+	hashes, err := w.appendRawWithMetaTracked(database, payload)
+	return hashes, w.durableErr(err)
+}
+
+func (w *Writer) appendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
 	if len(database) > 255 {
 		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
 	}
@@ -1444,12 +1507,16 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 			return nil, oversizedPayloadError(err)
 		}
 	}
+	var envBuf [3 + 255]byte
+	envHeader := envBuf[:putEnvelopeHeader(envBuf[:], dbBytes)]
 	var hashes []string
+	var dones []chan error
 	for _, chunk := range chunks {
 		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
+			w.releasePending(hashes) // earlier chunks would otherwise pin the floor (#676)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
+		token, done, err := w.appendTrackedEntry(envHeader, chunk)
 		if err != nil {
 			// The chunks that already landed are pending in the floor, and
 			// their tokens go out of scope with this slice — the caller gets
@@ -1460,6 +1527,14 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 			return nil, err
 		}
 		hashes = append(hashes, token)
+		if done != nil {
+			dones = append(dones, done)
+		}
+	}
+	if len(dones) > 0 {
+		if err := w.awaitDurable(hashes, dones); err != nil {
+			return nil, err
+		}
 	}
 	return hashes, nil
 }
@@ -1567,6 +1642,20 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, rel
 				// outlive the process and the caller retains its file.
 				return errors.New("WAL writer is closed")
 			}
+		} else if w.config.AckMode == AckModeDurable {
+			// Durable ingest writers park on a full queue, and the runtime hands
+			// each slot the writer frees to a parked sender: a non-blocking
+			// admission would find the queue full and drop nearly every
+			// checkpoint under sustained load, so flushed data would replay
+			// after a restart. Wait for admission instead. The blocking
+			// admission can land after Close's drain, so the reply is awaited
+			// against exited too.
+			if err := w.enqueueEntryBlocking(context.Background(), entry); err != nil {
+				return err
+			}
+			if err := w.awaitDone(done); err != nil {
+				return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
+			}
 		} else {
 			if err := w.tryEnqueueEntry(entry); err != nil {
 				return err
@@ -1582,13 +1671,13 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, rel
 	return nil
 }
 
-func envelopePayload(dbBytes, payload []byte) []byte {
-	out := make([]byte, 3+len(dbBytes)+len(payload))
-	out[0] = WALEnvelopeMarker
-	binary.BigEndian.PutUint16(out[1:3], uint16(len(dbBytes)))
-	copy(out[3:], dbBytes)
-	copy(out[3+len(dbBytes):], payload)
-	return out
+// putEnvelopeHeader writes the envelope header for dbBytes (marker, length,
+// name) at the start of dst and returns its length. dst must have room for
+// 3+len(dbBytes) bytes; callers check the 255-byte name limit first.
+func putEnvelopeHeader(dst, dbBytes []byte) int {
+	dst[0] = WALEnvelopeMarker
+	binary.BigEndian.PutUint16(dst[1:3], uint16(len(dbBytes)))
+	return 3 + copy(dst[3:], dbBytes)
 }
 
 func payloadHash(payload []byte) string {
@@ -1600,7 +1689,13 @@ func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
 	return payloadLen <= MaxWALPayloadSize-walTrackedHeaderSize-envelopeHeaderLen
 }
 
-func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
+// appendTrackedEntry appends one tracked entry whose logical payload is
+// envHeader followed by payload (envHeader is nil for entries without an
+// envelope). The entry is built in a single allocation: entry header, tracked
+// header, then the logical payload. The tracked region is byte-identical to the
+// separate trackedPayload this used to assemble, so the CRC and the bytes on
+// disk are unchanged; only the two intermediate copies are gone.
+func (w *Writer) appendTrackedEntry(envHeader, payload []byte) (string, chan error, error) {
 	// Allocating the sequence and publishing it as pending must be one step.
 	// Everything after this — the Sprintf, the CRC, and above all the
 	// synchronous replication hook below — sits between them otherwise, and a
@@ -1612,29 +1707,115 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	w.pendingSeqs[seq] = struct{}{}
 	w.pendingMu.Unlock()
 	token := fmt.Sprintf("%016x%016x", w.trackedInstance, seq)
-	trackedPayload := make([]byte, walTrackedHeaderSize+len(logicalPayload))
-	trackedPayload[0] = WALTrackedMarker
-	binary.BigEndian.PutUint64(trackedPayload[1:9], w.trackedInstance)
-	binary.BigEndian.PutUint64(trackedPayload[9:17], seq)
-	copy(trackedPayload[17:], logicalPayload)
-	checksum := crc32.ChecksumIEEE(trackedPayload)
+	trackedLen := walTrackedHeaderSize + len(envHeader) + len(payload)
+	entryData := make([]byte, WALEntryHeaderSize+trackedLen)
+	tracked := entryData[WALEntryHeaderSize:]
+	tracked[0] = WALTrackedMarker
+	binary.BigEndian.PutUint64(tracked[1:9], w.trackedInstance)
+	binary.BigEndian.PutUint64(tracked[9:17], seq)
+	off := walTrackedHeaderSize + copy(tracked[walTrackedHeaderSize:], envHeader)
+	copy(tracked[off:], payload)
+	checksum := crc32.ChecksumIEEE(tracked)
 	timestampUS := uint64(time.Now().UnixMicro())
-	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: logicalPayload})
-	entryData := make([]byte, WALEntryHeaderSize+len(trackedPayload))
-	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(trackedPayload)))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(trackedLen))
 	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
 	binary.BigEndian.PutUint32(entryData[12:16], checksum)
-	copy(entryData[WALEntryHeaderSize:], trackedPayload)
+	// The hook gets the logical payload as a view into entryData, which is
+	// never written again after this point (PrepareCovered hands the hook the
+	// same kind of view). It still runs before the entry is enqueued.
+	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: tracked[walTrackedHeaderSize:]})
 	// Carry the sequence so the writer loop can record it against the file the
 	// write actually lands in (#1009).
-	if err := w.tryEnqueueEntry(walEntry{data: entryData, seq: seq}); err != nil {
+	entry := walEntry{data: entryData, seq: seq}
+	var err error
+	if w.config.AckMode == AckModeDurable {
+		// A durable entry is answered by the sync that covers it (writeEntry
+		// hands it to the syncer); the caller waits in awaitDurable. Capacity 1
+		// so the answer never blocks the writer or syncer if nobody waits.
+		entry.durable = true
+		entry.done = make(chan error, 1)
+		if err = w.enqueueDurable(entry); err != nil {
+			err = fmt.Errorf("%w: %v", ErrNotDurable, err)
+		}
+	} else {
+		err = w.tryEnqueueEntry(entry)
+	}
+	if err != nil {
 		w.pendingMu.Lock()
 		delete(w.pendingSeqs, seq)
 		w.pendingMu.Unlock()
 		w.signalPurge() // the floor may have moved (#676)
-		return "", err
+		return "", nil, err
 	}
-	return token, nil
+	return token, entry.done, nil
+}
+
+// enqueueDurable admits a durable data entry, blocking while the queue is full
+// instead of dropping it. It never takes w.mu: the writer loop holds that
+// across file writes and rotation, and this runs on every ingest request.
+func (w *Writer) enqueueDurable(entry walEntry) error {
+	if w.closedFlag.Load() {
+		return errors.New("WAL writer is closed")
+	}
+	select {
+	case w.entryChan <- entry:
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
+		return nil
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	}
+}
+
+// awaitDone waits for one durable entry's answer, or for the writer to have
+// exited without serving it.
+func (w *Writer) awaitDone(d chan error) error {
+	select {
+	case err := <-d:
+		return err
+	case <-w.exited:
+		// The loop may have answered d just before exiting.
+		select {
+		case err := <-d:
+			return err
+		default:
+			return errWriterExited
+		}
+	}
+}
+
+// DurableAck reports whether tracked appends acknowledge only durable entries
+// (AckModeDurable). Ingest refuses a write on any append error when it does.
+func (w *Writer) DurableAck() bool { return w.config.AckMode == AckModeDurable }
+
+// durableErr makes every tracked-append failure an ErrNotDurable in
+// AckModeDurable, so no error path (an unsplittable payload, a database name
+// over the limit) can leave the write acknowledged without durability.
+func (w *Writer) durableErr(err error) error {
+	if err == nil || w.config.AckMode != AckModeDurable || errors.Is(err, ErrNotDurable) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrNotDurable, err)
+}
+
+// awaitDurable waits until every entry in dones is covered by a completed
+// sync. On any failure it releases the pending sequences of tokens (the caller
+// returns no tokens, so nothing else would: an unreleased sequence pins the
+// purge floor for the life of the process, #676) and returns ErrNotDurable.
+// The entries are all enqueued before the first wait, so chunks of one payload
+// share syncs instead of paying one each.
+func (w *Writer) awaitDurable(tokens []string, dones []chan error) error {
+	var firstErr error
+	for _, d := range dones {
+		if err := w.awaitDone(d); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		w.releasePending(tokens)
+		w.signalPurge()
+		return fmt.Errorf("%w: %v", ErrNotDurable, firstErr)
+	}
+	return nil
 }
 
 // appendEnvelopedEntry is AppendRawWithMeta's single-entry fast path: CRC,
@@ -1772,6 +1953,11 @@ func (w *Writer) AppendRaw(payload []byte) error {
 // is used by replication followers so their local WAL participates in the
 // same sequence-floor purge as primary ingest.
 func (w *Writer) AppendRawTracked(payload []byte) ([]string, error) {
+	hashes, err := w.appendRawTracked(payload)
+	return hashes, w.durableErr(err)
+}
+
+func (w *Writer) appendRawTracked(payload []byte) ([]string, error) {
 	chunks := [][]byte{payload}
 	if len(payload) > MaxWALPayloadSize {
 		var err error
@@ -1782,17 +1968,26 @@ func (w *Writer) AppendRawTracked(payload []byte) ([]string, error) {
 	}
 
 	hashes := make([]string, 0, len(chunks))
+	var dones []chan error
 	for _, chunk := range chunks {
 		if len(chunk) > MaxWALPayloadSize-walTrackedHeaderSize {
 			w.releasePending(hashes)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		hash, err := w.appendTrackedEntry(chunk)
+		hash, done, err := w.appendTrackedEntry(nil, chunk)
 		if err != nil {
 			w.releasePending(hashes)
 			return nil, err
 		}
 		hashes = append(hashes, hash)
+		if done != nil {
+			dones = append(dones, done)
+		}
+	}
+	if len(dones) > 0 {
+		if err := w.awaitDurable(hashes, dones); err != nil {
+			return nil, err
+		}
 	}
 	return hashes, nil
 }
@@ -1852,12 +2047,16 @@ func (w *Writer) Close() error {
 	w.mu.Lock()
 	w.closed = true
 	w.mu.Unlock()
+	w.closedFlag.Store(true)
 
 	// Signal shutdown
 	close(w.done)
 
 	// Wait for writer goroutine to finish
 	w.wg.Wait()
+	// The drain and its final sync have answered every durable entry the loop
+	// dequeued; one that reached the channel after the drain never will.
+	close(w.exited)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()

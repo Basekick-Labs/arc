@@ -95,6 +95,7 @@ cluster:
   # Peer replication tuning. Only consulted when storage.mode=local.
   replication:
     pullWorkers: 4                 # concurrent file-fetch workers per node
+    pullBytesPerSecond: 0          # aggregate puller bandwidth cap per node, bytes/s (0 = unlimited)
     fetchTimeoutMs: 60000          # per-fetch timeout (puller side)
     serveTimeoutMs: 120000         # body-stream timeout (origin side)
     catchup:
