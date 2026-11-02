@@ -32,6 +32,47 @@ data, is left out with a warning, and the write succeeds
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#905](https://github.com/Basekick-Labs/arc/pull/905).
 
+## Changed: telemetry also reports Python SDK installations
+
+Arc's opt-out telemetry `clients` section, which lists the arcli
+installations an instance served, gains a `python_sdk` entry for the
+[Python SDK](https://github.com/Basekick-Labs/arc-client-python). The SDK
+sends a random per-installation UUID in a new, generic
+`Arc-Client-Installation-Id` header; arcli's `Arcli-Installation-Id` header
+is still accepted, and the new header wins when both are present. The client
+kind comes from the User-Agent (`arcli/...` or `arc-client-python/...`). Per
+SDK installation Arc reports the id, the SDK version, the Python version and
+the `os/arch` platform from the SDK's User-Agent (`unknown` when the
+User-Agent comment is absent or malformed), and the time it was last seen.
+Runtime and platform are limited to letters, digits and `. _ + / -`; anything
+else is reported as `unknown`.
+
+The same gates as for arcli apply: only requests that succeeded and, with
+authentication configured, carried a valid token count; public routes never
+do. Each client kind is capped at 256 distinct installations per report,
+independently, with its own `truncated` flag, so containers minting a new SDK
+id on every start cannot push arcli installations out of the report. The
+`clients.arcli` object is unchanged. Both installation headers are stripped
+when a cluster node forwards a request, so a forwarded request is counted
+once, by the node that received it.
+
+One behaviour change for arcli: a request carrying an installation id whose
+User-Agent names neither arcli nor the SDK is no longer counted (it used to be
+recorded with version `unknown`), so foreign traffic cannot inflate the
+counts. arcli always sends its own User-Agent, so its counts are unaffected.
+
+The SDK's own switches (`DO_NOT_TRACK=1`, `ARC_CLIENT_SEND_INSTALLATION_ID=0`,
+or `send_installation_id=False`) stop it sending the id, and
+`telemetry.enabled = false` / `ARC_TELEMETRY_ENABLED=false` on the node
+disables the whole section. In ephemeral containers, setting
+`ARC_CLIENT_INSTALLATION_ID` to a fixed UUID keeps each start from counting
+as a new installation.
+
+As with arcli, the counts are only as trustworthy as the callers: any token
+holder (any caller, without authentication) can send 256 random ids with an
+SDK User-Agent and fill that kind's slots for one report, which sets
+`truncated`. The per-kind cap keeps that from affecting arcli's counts.
+
 ## Security: a crafted request can no longer crash Arc or exhaust its memory
 
 **A crafted zstd write crashed Arc.** klauspost/compress, which Arc uses to

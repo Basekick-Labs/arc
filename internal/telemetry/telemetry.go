@@ -78,7 +78,7 @@ type TelemetryPayload struct {
 	CPU        CPUInfo `json:"cpu"`
 	Memory     MemInfo `json:"memory"`
 
-	// Clients lists the arcli installations seen since the last
+	// Clients lists the arcli and SDK installations seen since the last
 	// successful report (see clients.go). Omitted when none.
 	Clients *ClientsInfo `json:"clients,omitempty"`
 }
