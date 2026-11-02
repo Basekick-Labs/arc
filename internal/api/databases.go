@@ -692,7 +692,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// Converge re-runs (#639 item 3): a previous DELETE may have removed
 		// the files then crashed before catalog cleanup. Best-effort here so
 		// repeating the DELETE clears the residue; the 404 contract stands.
+		// That residue includes the empty directories an earlier version's
+		// delete left on local storage, which keep the database listed (#1425).
 		h.dropIcebergCatalog(ctx, name)
+		removeEmptyDirectories(ctx, h.storage, name, h.logger)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -891,14 +894,9 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		}
 	}
 
-	// Try to remove the empty database directory
-	// This is a best-effort operation - for local storage, we try to remove the directory
-	// For S3/Azure, directories don't exist as actual objects, so this is a no-op
-	if dirRemover, ok := h.storage.(storage.DirectoryRemover); ok {
-		if err := dirRemover.RemoveDirectory(ctx, name); err != nil {
-			h.logger.Debug().Err(err).Str("database", name).Msg("Could not remove database directory (may not be empty)")
-		}
-	}
+	// Remove the directory tree the deleted files leave behind on local
+	// storage (#1425). Object stores have no directories, so nothing to do.
+	removeEmptyDirectories(ctx, h.storage, name, h.logger)
 
 	// Cached pruned path lists may name the removed files, partial or not.
 	if h.onFilesRemoved != nil {
@@ -1440,6 +1438,40 @@ func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) 
 			Msg("Iceberg catalog cleanup after database drop failed; re-running the DELETE retries it")
 	} else {
 		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
+	}
+}
+
+// removeEmptyDirectories removes dir and every directory under it that holds
+// nothing, deepest first, on a backend with real directories (local storage).
+// Deleting a database's files leaves its measurement/YYYY/MM/DD/HH tree behind,
+// and the database listing reads directories, so an empty tree kept a deleted
+// database listed while GET answered 404 for it (#1425). A directory that
+// still holds a file stays, and so does every directory above it. Best
+// effort: a failure is logged at Debug, as removing the top directory always
+// was.
+func removeEmptyDirectories(ctx context.Context, backend storage.Backend, dir string, logger zerolog.Logger) {
+	lister, ok := backend.(storage.DirectoryLister)
+	if !ok {
+		return
+	}
+	remover, ok := backend.(storage.DirectoryRemover)
+	if !ok {
+		return
+	}
+	removeEmptyDirectoryTree(ctx, lister, remover, dir, logger)
+}
+
+func removeEmptyDirectoryTree(ctx context.Context, lister storage.DirectoryLister, remover storage.DirectoryRemover, dir string, logger zerolog.Logger) {
+	subdirs, err := lister.ListDirectories(ctx, dir+"/")
+	if err != nil {
+		logger.Debug().Err(err).Str("dir", dir).Msg("Could not list directory to remove it")
+		return
+	}
+	for _, sub := range subdirs {
+		removeEmptyDirectoryTree(ctx, lister, remover, dir+"/"+sub, logger)
+	}
+	if err := remover.RemoveDirectory(ctx, dir); err != nil {
+		logger.Debug().Err(err).Str("dir", dir).Msg("Could not remove directory (may not be empty)")
 	}
 }
 
