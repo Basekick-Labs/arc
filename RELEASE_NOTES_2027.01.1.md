@@ -3619,6 +3619,51 @@ outside the writer's WAL, and a standby writer refused it with `503`.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
 
+### Bulk imports write in parallel, and wait for a slot at most 30 seconds
+
+Earlier builds of this release let one bulk import (`/api/v1/import/lp`, `csv`,
+`parquet`) write at a time per node, whatever its size: a 46-core writer
+loading 64 MB line-protocol files with tsm2arc ran at about 85 MB/s, against
+about 1,250 MB/s on 26.09.2, with the CPUs mostly idle. More requests in flight
+only made each wait longer. A request that waited could not be abandoned: the
+server does not see a client that gives up, so the import later wrote all its
+rows, and a client retry wrote them a second time.
+
+Measured on a 14-core laptop, 64 MB line-protocol files, 16 in flight:
+
+| | Before | Now |
+|---|---|---|
+| Throughput | 67 MB/s | 301 MB/s |
+| Median import | 15.4 s | 3.2 s |
+| Peak memory | 4.5 GB | 5.3 GB |
+
+- New `ingest.import_write_concurrency` (default `0` = auto): how many imports
+  write at once. Auto is as many as fit an eighth of the memory limit at one
+  import allowance each (an eighth of the memory limit, 64 MB to 512 MB), at
+  most the CPUs Arc runs on (`GOMAXPROCS`, which a licence's core count can
+  lower), at least one: one on a 3 GiB writer, nine on a 36 GiB laptop, 46 on
+  a 46-core, 320 GiB writer licensed for all its cores. The value is logged at
+  startup ("Bulk import write slots configured"). Each writing import may hold
+  about one allowance plus its upload; set a lower value to bound memory more
+  tightly. `1` restores one import at a time.
+- New `ingest.import_queue_timeout_ms` (default `30000`; `0` = as long as the
+  request lives): an import that waited this long for a slot is refused with
+  `503`, `X-Arc-Ingest-Refused: import_queue` and `Retry-After`. Nothing of it
+  was written, so it is safe to retry. Keep it well under the client's own
+  timeout.
+- A client that times out while its import is writing still gets no answer,
+  and the import still completes: treat such an attempt as possibly written
+  before retrying it.
+- An import ends by flushing its own measurements' buffers, not every buffer
+  on the node, and it gives its slot to the next import before that flush.
+  The `200` contract is unchanged: the rows are in the buffer and the WAL
+  (when enabled), files follow as their flushes finish.
+- A write refused because other writers of the same measurement keep
+  changing its columns (`ErrSchemaChurnExceeded`) is tried again up to five
+  times inside the import before it fails. With imports running side by
+  side, two imports into one measurement whose columns change type can now
+  meet more often; that still fails part-way, as before.
+
 ### Bulk imports no longer hold the whole file in memory several times
 
 The import endpoints (`/api/v1/import/csv`, `parquet`, `lp`, `tle`) read the
@@ -3652,12 +3697,12 @@ peaked at 2.2 GiB.
   what the buffer held when it started. Over that it flushes its database's
   buffers and waits; if the buffered rows stay above the limit for two
   minutes, it stops (a failure part-way, below).
-- One import writes at a time on a node. Imports sent together are validated
-  together and written one after the other: concurrent write passes would add
-  up their allowances. Every request body is held in memory while it waits.
-  A forwarded import waiting its turn on the writer still counts down
-  `cluster.import_forward_timeout_ms` on the node that forwarded it, so a
-  `504` there can mean it was still queued.
+- Imports write in parallel, up to `ingest.import_write_concurrency` at once
+  on a node (#1429, below). Each writing import paces against one limit
+  shared by all of them: where the oldest of them started plus every one's
+  allowance. Every request body is held in memory while it waits for a slot.
+  A forwarded import waiting for a slot on the writer still counts down
+  `cluster.import_forward_timeout_ms` on the node that forwarded it.
 - A validation pass reads the whole file, chunk by chunk, before anything is
   written, so a bad file is still refused with nothing written: a bad time
   value, an invalid measurement name, a measurement the token may not write,
