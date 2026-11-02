@@ -416,16 +416,31 @@ localProcessing:
 		return respondWriteRefused(c, aerr)
 	}
 	defer release()
-	err = h.arrowBuffer.Write(writeCtx, database, records)
+	err = msgpackWrite(h.arrowBuffer, writeCtx, database, records)
+	// Checked first: the batch failed after part of it was buffered (#1437),
+	// so neither the drops answer nor the cause's own answer (a refusal says
+	// nothing was written) is true.
+	if ws, ok := ingest.AsWriteStopped(err); ok {
+		ws.Drops = append(drops, ws.Drops...)
+		if len(ws.Drops) > 0 {
+			logPointDrops(h.logger, "MessagePack", database, ws.Drops)
+		}
+		m := metrics.Get()
+		m.IncMsgPackRecords(ws.RecordsWritten)
+		m.IncIngestRecords(ws.RecordsWritten)
+		return respondWriteStopped(c, h.logger, "MessagePack", database, ws)
+	}
 	var rowDrops *ingest.PointsDroppedError
 	if errors.As(err, &rowDrops) {
 		// Rows the record path could not write (the others were written):
 		// a partial write, like the typed path's drops.
+		// Points count rows; recordCount is in the decoder's unit, where a
+		// columnar record refused for its content is one record (#1437).
 		drops = append(drops, rowDrops.Drops...)
 		for _, d := range rowDrops.Drops {
 			dropped += d.Points
-			recordCount -= d.Points
 		}
+		recordCount -= rowDrops.Records
 		err = nil
 	}
 	if err != nil {
@@ -434,8 +449,9 @@ localProcessing:
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err)
 		}
-		// #440: a client error, refused before the WAL; nothing was written.
-		if errors.Is(err, ingest.ErrColumnTypeChange) {
+		// A client error (#440, #1342), refused before the WAL; nothing was
+		// written.
+		if ingest.IsContentRefusal(err) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
@@ -444,9 +460,11 @@ localProcessing:
 		// upstream senders back off, mirroring the LP and TLE handlers.
 		// See ingest.ErrSchemaChurnExceeded.
 		// A write that arrives after its shard was flushed by shutdown is
-		// refused, not lost: the record is still in the WAL. 503 so the client
-		// retries (elsewhere, during a rolling restart) instead of treating a
-		// shutdown race as a permanent server error.
+		// refused: 503 so the client retries (elsewhere, during a rolling
+		// restart) instead of treating a shutdown race as a permanent server
+		// error. Nothing of this request was buffered (#1437); with the WAL on
+		// and no WAL coverage, the refused record itself is kept in the WAL
+		// and replayed at the next start, so the retry can duplicate it.
 		if errors.Is(err, ingest.ErrBufferClosing) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (server shutting down): " + err.Error(),
@@ -600,3 +618,7 @@ func formatBytes(bytes int64) string {
 		return fmt.Sprintf("%dB", bytes)
 	}
 }
+
+// msgpackWrite is the batch write of a MessagePack request, swapped by tests
+// to fail part-way (#1437).
+var msgpackWrite = (*ingest.ArrowBuffer).Write

@@ -2315,41 +2315,70 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 		return err
 	}
 
-	for _, record := range recordList {
-		switch r := record.(type) {
-		case *models.ColumnarRecord:
-			if err := b.writeColumnar(ctx, database, r); err != nil {
-				// A refusal (a not-durable WAL entry, #1268) is not an ingest error: the
-				// handler answers and logs it, sampled per reason.
-				if !IsWriteRefusal(err) {
-					b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write columnar record")
-					b.totalErrors.Add(1)
-				}
-				return err
-			}
-		case *TypedColumnarRecord:
-			// Typed msgpack decode fast path: already converted, carries the
-			// raw client bytes for the zero-copy WAL branch.
-			if err := b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false); err != nil {
-				// A refusal (a not-durable WAL entry, #1268) is not an ingest error: the
-				// handler answers and logs it, sampled per reason.
-				if !IsWriteRefusal(err) {
-					b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
-					b.totalErrors.Add(1)
-				}
-				return err
-			}
-		}
+	// The batch is written one record at a time, so a failure can follow
+	// records already buffered (#1437). A record refused for its content
+	// before the WAL (#440, #1342) is dropped and the others are written, as
+	// line protocol does. Any other failure once something is buffered stops
+	// the write with a WriteStoppedError, which says what was written: the
+	// error itself would read as "nothing was written" (a refusal promises
+	// that, and the MQTT subscriber resends the whole message on one). A
+	// failure before anything is buffered is returned as it is.
+	//
+	// Nothing below runs on the success path but the index: what was
+	// written is worked out from the indexes when a write fails.
+	var contentDropped []int // unit indexes, only when a content refusal happens
+	var firstContentErr error
+	// Every row drop is a row record: one record each in the decoder's unit.
+	dropRecords := 0
+	for _, d := range drops {
+		dropRecords += d.Points
 	}
-	for _, columnar := range converted {
-		if err := b.writeColumnar(ctx, database, columnar); err != nil {
-			// A refusal (a not-durable WAL entry, #1268) is not an ingest error: the
-			// handler answers and logs it, sampled per reason.
-			if !IsWriteRefusal(err) {
-				b.logger.Error().Err(err).Str("measurement", columnar.Measurement).Msg("Failed to write converted row records")
-				b.totalErrors.Add(1)
+	units := len(recordList) + len(converted)
+	for i := 0; i < units; i++ {
+		var err error
+		if i < len(recordList) {
+			switch r := recordList[i].(type) {
+			case *models.ColumnarRecord:
+				err = b.writeColumnar(ctx, database, r)
+			case *TypedColumnarRecord:
+				// Typed msgpack decode fast path: already converted, carries the
+				// raw client bytes for the zero-copy WAL branch.
+				err = b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false)
+			default:
+				continue // a row record: written below, converted
 			}
-			return err
+		} else {
+			err = b.writeColumnar(ctx, database, converted[i-len(recordList)])
+		}
+		if err == nil {
+			continue
+		}
+		measurement, rows := batchUnit(recordList, converted, i)
+		if isContentRefusal(err) {
+			if firstContentErr == nil {
+				firstContentErr = err
+			}
+			contentDropped = append(contentDropped, i)
+			drops = append(drops, LPDrop{Measurement: measurement, Reason: err.Error(), Points: rows})
+			dropRecords += int(unitRecords(recordList, i, rows))
+			continue
+		}
+		// A refusal (a not-durable WAL entry, #1268) is not an ingest error: the
+		// handler answers and logs it, sampled per reason.
+		if !IsWriteRefusal(err) {
+			b.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to write a MessagePack record")
+			b.totalErrors.Add(1)
+		}
+		written, rowsWritten, recordsWritten := writtenUnits(recordList, converted, i, contentDropped)
+		if len(written) == 0 {
+			return err // nothing buffered: the answer stays true
+		}
+		return &WriteStoppedError{Err: err, RowsWritten: rowsWritten, RecordsWritten: recordsWritten,
+			Written: written, StoppedAt: measurement, Drops: drops}
+	}
+	if firstContentErr != nil {
+		if written, _, _ := writtenUnits(recordList, converted, units, contentDropped); len(written) == 0 {
+			return firstContentErr // nothing written: refused for its content, as before
 		}
 	}
 	if len(drops) > 0 {
@@ -2359,7 +2388,7 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 			}
 			return drops[i].Reason < drops[j].Reason
 		})
-		return &PointsDroppedError{Drops: drops}
+		return &PointsDroppedError{Drops: drops, Records: dropRecords}
 	}
 
 	return nil
@@ -2370,6 +2399,11 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 // the caller reports a partial write.
 type PointsDroppedError struct {
 	Drops []LPDrop
+	// Records is how many of the request's records the drops are, in the
+	// MessagePack decoder's unit: a row record each, or a whole columnar
+	// record. Points counts rows, so a columnar record refused for its content
+	// is many points but one record (#1437).
+	Records int
 }
 
 func (e *PointsDroppedError) Error() string {

@@ -390,9 +390,13 @@ const IngestFencedHeader = "X-Arc-Ingest-Fenced"
 
 // IngestRefusedHeader marks a 503 that refused a write for a node-local,
 // transient condition (ingest.WriteRefusal, #676); its value is the reason,
-// e.g. "wal_disk". Nothing was written and a retry, to this node too, is
-// safe. A forwarding node and the request logger recognise it like
-// IngestFencedHeader.
+// e.g. "wal_disk". For every reason but one, nothing was written and a retry,
+// to this node too, is safe. The exception is "wal_not_durable": the WAL entry
+// that could not be made durable is refused after it was appended, so its rows
+// may still come back at the next start (ingest.ErrWALNotDurable says so). A
+// refusal never follows part of a request already buffered: that is answered
+// as a write stopped part-way, without this header (#1437). A forwarding node
+// and the request logger recognise it like IngestFencedHeader.
 const IngestRefusedHeader = "X-Arc-Ingest-Refused"
 
 // ingestRefusedLocal is the request flag the request logger reads to skip its

@@ -78,7 +78,7 @@ var ErrImportQueueTimeout error = &WriteRefusal{
 // durable in wal.ack_mode = "durable". Retryable.
 var ErrWALNotDurable error = &WriteRefusal{
 	Reason: RefusalWALNotDurable,
-	Text:   "write refused: the WAL entry could not be made durable; earlier parts of this request may already be stored, retry (a retry can duplicate them)",
+	Text:   "write refused: the WAL entry could not be made durable; if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",
 }
 
 // walNotDurable wraps a WAL ErrNotDurable as a not-durable refusal, keeping
@@ -86,7 +86,7 @@ var ErrWALNotDurable error = &WriteRefusal{
 func walNotDurable(err error) error {
 	return &WriteRefusal{
 		Reason: RefusalWALNotDurable,
-		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); earlier parts of this request may already be stored, retry (a retry can duplicate them)",
+		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",
 	}
 }
 

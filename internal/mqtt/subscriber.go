@@ -417,11 +417,12 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 			return
 		}
 		// A device's payload changing a column between string and binary
-		// (#440) is refused on every message it sends: logged per topic at
-		// most every nameWarnEvery, like a dropped field name.
-		if errors.Is(err, ingest.ErrColumnTypeChange) {
+		// (#440), or carrying a column name that cannot be stored (#1342), is
+		// refused on every message it sends: logged per topic at most every
+		// nameWarnEvery, like a dropped field name.
+		if ingest.IsContentRefusal(err) {
 			if s.nameWarnDue("type " + msg.Topic()) {
-				s.logger.Warn().Err(err).Str("topic", msg.Topic()).Msg("MQTT message refused: it changes a column between string and binary")
+				s.logger.Warn().Err(err).Str("topic", msg.Topic()).Msg("MQTT message refused for its content: a column changed between string and binary, or a column name that cannot be stored")
 			}
 			return
 		}
@@ -536,18 +537,27 @@ func (s *Subscriber) processMessageWithTopicMapping(ctx context.Context, topic s
 		}
 		defer release()
 		if err := s.arrowBuffer.Write(writeCtx, database, records); err != nil {
+			var drops []ingest.LPDrop
 			var dropped *ingest.PointsDroppedError
 			if errors.As(err, &dropped) {
 				// The other points were written; these could not be.
-				for _, d := range dropped.Drops {
-					s.logger.Error().
-						Str("topic", topic).
-						Str("measurement", d.Measurement).
-						Str("column", ingest.QuoteColumnName(d.Column)).
-						Str("reason", d.Reason).
-						Int("points_dropped", d.Points).
-						Msg("MQTT points dropped (partial write)")
-				}
+				drops = dropped.Drops
+			} else if ws, ok := ingest.AsWriteStopped(err); ok {
+				// Stopped after part of the message was written (#1437). Not a
+				// refusal, so the caller does not resend the message whole: it
+				// is counted failed, and its error names what was written.
+				drops = ws.Drops
+			}
+			for _, d := range drops {
+				s.logger.Error().
+					Str("topic", topic).
+					Str("measurement", d.Measurement).
+					Str("column", ingest.QuoteColumnName(d.Column)).
+					Str("reason", d.Reason).
+					Int("points_dropped", d.Points).
+					Msg("MQTT points dropped (partial write)")
+			}
+			if dropped != nil {
 				return nil
 			}
 			return fmt.Errorf("failed to write to buffer: %w", err)
