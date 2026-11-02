@@ -3239,6 +3239,20 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
 
+	// Convert []interface{} columns to typed arrays (optimized with zero-copy
+	// fast paths). Before the WAL append, not after it: a value the
+	// conversion refuses (a column of mixed types) refuses the write, and an
+	// entry appended first would be replayed at the next start (#1438).
+	typedColumns, numRecords, err := b.convertColumnsToTyped(record.Measurement, record.Columns)
+	if err != nil {
+		return fmt.Errorf("failed to convert columns: %w", err)
+	}
+	if len(record.RawPayload) > 0 {
+		typedColumns.estimatedBytes = int64(len(record.RawPayload))
+	} else {
+		typedColumns.estimatedBytes = estimateTypedColumnBatchBytes(typedColumns)
+	}
+
 	// WAL: Write to WAL before buffering (if enabled)
 	// Skip WAL during recovery to avoid re-writing recovered data
 	walHashes := append([]string(nil), inheritedWALHashes...)
@@ -3258,6 +3272,10 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	cs := b.coverage.Load()
 	covered := cs != nil && !skipWAL && b.wal != nil && len(bufferKey) <= wal.MaxCoverageKeyLen
 	var prep *wal.PreparedAppend
+	// An uncovered queued write prepares its entry too (#1438): committed
+	// under the shard lock, abandoned by a refusal before that.
+	var trackedPrep *wal.PreparedAppend
+	defer func() { trackedPrep.Abandon() }()
 	var replayCov []CoveragePiece
 	if cs != nil && skipWAL && len(inheritedWALHashes) == 1 {
 		if piece, ok := replayPiece(ctx, bufferKey, inheritedWALHashes[0]); ok {
@@ -3285,16 +3303,10 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 		}
 		defer prep.Abandon()
 	} else if b.wal != nil && !skipWAL {
-		tracked, canTrack := b.wal.(trackedWALWriter)
 		// ZERO-COPY PATH: Use raw msgpack bytes if available (avoids re-serialization)
 		if len(record.RawPayload) > 0 {
 			var err error
-			if canTrack {
-				walHashes, err = tracked.AppendRawWithMetaTracked(database, record.RawPayload)
-			} else {
-				err = b.wal.AppendRawWithMeta(database, record.RawPayload)
-			}
-			hasWALCopy = err == nil
+			trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(database, record.RawPayload)
 			consumeWALReservation(ctx, len(record.RawPayload))
 			if err != nil {
 				// wal.ack_mode = "durable": the entry is not on disk (or never
@@ -3325,12 +3337,9 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 				var err error
 				if marshalErr != nil {
 					err = marshalErr
-				} else if canTrack {
-					walHashes, err = tracked.AppendRawWithMetaTracked(database, rowPayload)
 				} else {
-					err = b.wal.AppendRawWithMeta(database, rowPayload)
+					trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(database, rowPayload)
 				}
-				hasWALCopy = err == nil
 				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
 					// wal.ack_mode = "durable": the entry is not on disk (or never
@@ -3349,7 +3358,6 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 		}
 	}
 
-	// Convert []interface{} columns to typed arrays (optimized with zero-copy fast paths)
 	// From here to the line that puts this batch into shard.buffers, every
 	// return abandons a write whose WAL append has already happened. One
 	// deferred release covers all of them — including returns added later,
@@ -3359,9 +3367,12 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// retained file rather than skipping it, so nothing after that file is
 	// reclaimed either and the WAL grows until the disk fills (#676).
 	//
-	// Deliberately not MarkFlushed: nothing reached storage, so there is no
-	// checkpoint to write. It only stops the floor waiting for data that no
-	// buffer holds.
+	// Retracted by checkpoint, not only released (#1438): the entry is in the
+	// WAL while the write is refused, so without one a crash before the next
+	// purge replays a write the client was told failed. The checkpoint also
+	// releases the floor; if it cannot be written the release still happens.
+	// Only a write that appended before the lock gets here with walHashes: a
+	// queued uncovered or covered one prepared its entry and Abandons it.
 	//
 	// Only for identities this write MINTED. On the replay path walHashes is
 	// the identity inherited from the entry being replayed (#1048), and that
@@ -3373,20 +3384,9 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	bufferCommitted := skipWAL
 	defer func() {
 		if !bufferCommitted && len(walHashes) > 0 {
-			if tracked, ok := b.wal.(trackedWALWriter); ok {
-				tracked.ForgetTracked(walHashes)
-			}
+			b.retractRefusedWAL(walHashes)
 		}
 	}()
-	typedColumns, numRecords, err := b.convertColumnsToTyped(record.Measurement, record.Columns)
-	if err != nil {
-		return fmt.Errorf("failed to convert columns: %w", err)
-	}
-	if len(record.RawPayload) > 0 {
-		typedColumns.estimatedBytes = int64(len(record.RawPayload))
-	} else {
-		typedColumns.estimatedBytes = estimateTypedColumnBatchBytes(typedColumns)
-	}
 
 	// Propagate tag column names for Parquet metadata (enables auto-dedup in compaction)
 	typedColumns.TagColumns = record.TagColumns
@@ -3439,16 +3439,24 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// bufferShard.swept for why refusing on the global flag loses replicated
 	// rows that have no WAL copy of their own.
 	//
-	// The record is already in the WAL when the WAL is enabled (that append
-	// precedes this lock), so count it as WAL-only: CloseFlushedCleanly then
-	// stays false and the shutdown purge is skipped.
+	// A write that appended its WAL entry before this lock (durable
+	// acknowledgement, or a WAL that cannot prepare) retracts it by checkpoint
+	// (#1438), so the refusal is true: nothing of it is stored or replayed. If
+	// the retraction fails the record is WAL-only, as before: counted, so
+	// CloseFlushedCleanly stays false, the shutdown purge is skipped and the
+	// next start replays it.
 	//
-	// A covered write only prepared its WAL entry (#1207): the deferred
-	// Abandon discards it, so there is nothing WAL-only to count. A replay
-	// (skipWAL) still is.
+	// A covered write (#1207), or an uncovered queued one (#1438), only
+	// prepared its WAL entry: the deferred Abandon discards it, so there is
+	// nothing WAL-only to count. A replay (skipWAL) still is.
 	if shard.swept {
 		shard.mu.Unlock()
-		if !covered {
+		retracted := false
+		if !skipWAL && len(walHashes) > 0 {
+			retracted = b.retractRefusedWAL(walHashes)
+			walHashes = nil // handled: the deferred release must not run again
+		}
+		if !covered && trackedPrep == nil && !retracted {
 			b.walOnlyRecords.Add(int64(numRecords))
 			// Refused, not acknowledged: nothing is lost, but only a write
 			// with a WAL copy is "preserved" (#1377).
@@ -3474,6 +3482,11 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// Here, immediately before the append and under the same lock
 	// acquisition, so a key's batches enter the buffer in cseq order.
 	walErr := b.commitCoverageLocked(cs, covered, prep, shard, bufferKey, typedColumns, replayCov)
+	// An uncovered queued write's prepared entry, at the same point: after
+	// every check that can refuse the write, under the lock (#1438).
+	if trackedPrep != nil {
+		walErr = commitTrackedLocked(trackedPrep, typedColumns)
+	}
 
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
@@ -3572,6 +3585,10 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	cs := b.coverage.Load()
 	covered := cs != nil && !skipWAL && b.wal != nil && len(bufferKey) <= wal.MaxCoverageKeyLen
 	var prep *wal.PreparedAppend
+	// An uncovered queued write prepares its entry too (#1438): committed
+	// under the shard lock, abandoned by a refusal before that.
+	var trackedPrep *wal.PreparedAppend
+	defer func() { trackedPrep.Abandon() }()
 	var replayCov []CoveragePiece
 	if covered {
 		payload := rawPayload
@@ -3592,15 +3609,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		}
 		defer prep.Abandon()
 	} else if b.wal != nil && !skipWAL {
-		tracked, canTrack := b.wal.(trackedWALWriter)
 		if len(rawPayload) > 0 {
 			var err error
-			if canTrack {
-				walHashes, err = tracked.AppendRawWithMetaTracked(database, rawPayload)
-			} else {
-				err = b.wal.AppendRawWithMeta(database, rawPayload)
-			}
-			hasWALCopy = err == nil
+			trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(database, rawPayload)
 			consumeWALReservation(ctx, len(rawPayload))
 			if err != nil {
 				// wal.ack_mode = "durable": the entry is not on disk (or never
@@ -3626,12 +3637,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 				var err error
 				if marshalErr != nil {
 					err = marshalErr
-				} else if canTrack {
-					walHashes, err = tracked.AppendRawWithMetaTracked(database, rowPayload)
 				} else {
-					err = b.wal.AppendRawWithMeta(database, rowPayload)
+					trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(database, rowPayload)
 				}
-				hasWALCopy = err == nil
 				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
 					// wal.ack_mode = "durable": the entry is not on disk (or never
@@ -3660,9 +3668,12 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	// retained file rather than skipping it, so nothing after that file is
 	// reclaimed either and the WAL grows until the disk fills (#676).
 	//
-	// Deliberately not MarkFlushed: nothing reached storage, so there is no
-	// checkpoint to write. It only stops the floor waiting for data that no
-	// buffer holds.
+	// Retracted by checkpoint, not only released (#1438): the entry is in the
+	// WAL while the write is refused, so without one a crash before the next
+	// purge replays a write the client was told failed. The checkpoint also
+	// releases the floor; if it cannot be written the release still happens.
+	// Only a write that appended before the lock gets here with walHashes: a
+	// queued uncovered or covered one prepared its entry and Abandons it.
 	//
 	// Only for identities this write MINTED. On the replay path walHashes is
 	// the identity inherited from the entry being replayed (#1048), and that
@@ -3674,9 +3685,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	bufferCommitted := skipWAL
 	defer func() {
 		if !bufferCommitted && len(walHashes) > 0 {
-			if tracked, ok := b.wal.(trackedWALWriter); ok {
-				tracked.ForgetTracked(walHashes)
-			}
+			b.retractRefusedWAL(walHashes)
 		}
 	}()
 
@@ -3719,16 +3728,24 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	// bufferShard.swept for why refusing on the global flag loses replicated
 	// rows that have no WAL copy of their own.
 	//
-	// The record is already in the WAL when the WAL is enabled (that append
-	// precedes this lock), so count it as WAL-only: CloseFlushedCleanly then
-	// stays false and the shutdown purge is skipped.
+	// A write that appended its WAL entry before this lock (durable
+	// acknowledgement, or a WAL that cannot prepare) retracts it by checkpoint
+	// (#1438), so the refusal is true: nothing of it is stored or replayed. If
+	// the retraction fails the record is WAL-only, as before: counted, so
+	// CloseFlushedCleanly stays false, the shutdown purge is skipped and the
+	// next start replays it.
 	//
-	// A covered write only prepared its WAL entry (#1207): the deferred
-	// Abandon discards it, so there is nothing WAL-only to count. A replay
-	// (skipWAL) still is.
+	// A covered write (#1207), or an uncovered queued one (#1438), only
+	// prepared its WAL entry: the deferred Abandon discards it, so there is
+	// nothing WAL-only to count. A replay (skipWAL) still is.
 	if shard.swept {
 		shard.mu.Unlock()
-		if !covered {
+		retracted := false
+		if !skipWAL && len(walHashes) > 0 {
+			retracted = b.retractRefusedWAL(walHashes)
+			walHashes = nil // handled: the deferred release must not run again
+		}
+		if !covered && trackedPrep == nil && !retracted {
 			b.walOnlyRecords.Add(int64(numRecords))
 			// Refused, not acknowledged: nothing is lost, but only a write
 			// with a WAL copy is "preserved" (#1377).
@@ -3752,6 +3769,11 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	// Mint and commit; see writeColumnarInternalWithWALHashes.
 	walErr := b.commitCoverageLocked(cs, covered, prep, shard, bufferKey, typedColumns, replayCov)
+	// An uncovered queued write's prepared entry, at the same point: after
+	// every check that can refuse the write, under the lock (#1438).
+	if trackedPrep != nil {
+		walErr = commitTrackedLocked(trackedPrep, typedColumns)
+	}
 
 	// Add typed columns to buffer directly (no conversion needed)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
