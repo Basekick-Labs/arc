@@ -2,6 +2,42 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
+
+`GET /api/v1/write/msgpack/spec` said authentication was "not yet
+implemented", although the route it describes (and the spec route itself)
+requires a token. The document now matches the code:
+
+- `authentication`: `Authorization: Bearer <token>`, also `Token <token>`, a bare `Authorization: <token>`,
+  `x-api-key` and the deprecated `?p=`; write permission is required.
+- New sections: `database` (the `x-arc-database` header, default `default`),
+  `time` (seconds, milliseconds, microseconds or nanoseconds, detected from the
+  first value; nanoseconds were missing), `responses` (status codes), and
+  `method`.
+- Columnar format documents `tag_keys`, and the columnar example now uses it.
+- `compression` is now an object: detection by magic bytes and the payload
+  limits. `content_type` notes that the server does not check it.
+- The `performance` section is removed. Its throughput figures were years out
+  of date; current numbers are in the README.
+
+Clients that read `authentication.header` now get `Authorization` instead of
+`x-api-key`. Clients that read `compression` as a string need to read the new
+object.
+
+**Behaviour change: a bad item in a MessagePack batch is reported.** In a
+`batch`, or a top-level array of items, an item that could not be decoded (no
+`fields`, columns of different lengths, a time that is not a number, an item
+that is not a map) was logged and skipped, and the request answered **204** as
+if everything had been written. It is now dropped the way any other point that
+cannot be written is: the other items are still written, and the request
+answers **400** `partial write: N points dropped: ... an item of the batch or
+array could not be decoded: <reason>; the other points were written`. Each
+dropped item counts as one point, however many rows it held. A client that treated 204 as "all written"
+was silently losing those items; one that retries on 400 should not retry a
+partial write, since the rest is already stored. A batch nested inside a
+batch or array, which answered 500 and stored nothing, is now written like a
+top-level one.
+
 ## Fix: a cluster node stalled for 15 seconds or more rejoins Raft ([#1431](https://github.com/Basekick-Labs/arc/issues/1431))
 
 A Raft node that stopped responding for about 15 seconds or longer (a paused
