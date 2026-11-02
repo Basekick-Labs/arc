@@ -25,14 +25,21 @@ In testing, nodes paused for 15 s and for 40 s both rejoined without a restart.
 
 What operators see in logs changes:
 
-- A peer that fails authentication (wrong `cluster.shared_secret` or cluster
-  name, or something that is not an Arc node) is logged as a Warn,
-  `Rejected Raft connection: peer failed shared-secret authentication`, with
-  the remote address, at most once every 10 seconds plus a count of the
-  rejections since the previous Warn. It used to appear as a raft
+- A peer that answers and is refused — a full handshake response that does not
+  verify (a wrong `cluster.shared_secret` or cluster name), or a TLS client
+  certificate that fails verification (`cluster.tls_enabled`) — is logged
+  as a Warn, `Rejected Raft connection: peer failed authentication`, with the
+  error and remote address. Each source host is logged at most once every
+  10 seconds, and the Warn carries a count of the rejections suppressed since
+  the previous one. These used to appear as a raft
   `failed to accept connection` error line per attempt.
-- A connection whose peer hung up during the handshake, which is routine after
-  a stall, is logged at Debug only.
+- A connection whose peer hung up, went silent or sent only part of a
+  handshake response, which is routine after a stall, is logged at Debug only.
+  A port scan, or a probe that sends fewer bytes than a handshake response, is
+  therefore no longer visible at the default log level.
+
+A node whose Raft startup fails part-way now releases the Raft port instead of
+holding it until the process exits.
 
 No configuration change. Every node can be upgraded independently; the
 handshake on the wire is unchanged.
