@@ -2039,6 +2039,33 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Filesystem-equivalent spoke IDs cannot share a sync namespace ([#740](https://github.com/Basekick-Labs/arc/issues/740))
+
+Spoke IDs that differ only in letter case or Unicode normalization
+(`rocket_01` and `ROCKET_01`, or `café` in NFC and NFD) are one directory on
+storage that folds names: a local root on macOS APFS (by default) or Windows.
+There either spoke could write into the other's namespace.
+
+- Registering an ID that collides this way with one registered on the same
+  hub node is refused with `409`, on every storage backend. The comparison
+  folds case the way APFS does, including scripts whose cases plain Unicode
+  folding leaves apart (Cherokee).
+- An existing pair is handled by what the hub's storage does, which Arc
+  probes at startup on the local storage root, for case and for
+  normalization separately. A pair that is one directory there is refused for
+  sync, every member of it (`401`, logged on the hub), and reported at
+  startup. A pair that is two directories there keeps syncing, and the startup
+  log names it, since moving that storage to a volume that folds the
+  difference would merge them: any pair on Linux filesystems, S3, Azure and
+  GCS, and a case-only pair on case-sensitive APFS, which still normalizes.
+- A refused member logs a warning on the hub at every sync attempt. Disabling
+  or deleting the other member of the pair lets it sync again; re-register the
+  edge box you moved under a distinct ID. On a volume that folds names the
+  remaining spoke's directory already holds both spokes' files: deleting a
+  registration keeps its data.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1401](https://github.com/Basekick-Labs/arc/pull/1401).
+
 ### A write that fails part-way says what was written ([#1437](https://github.com/Basekick-Labs/arc/issues/1437))
 
 A line-protocol or MessagePack request with several measurements is buffered
