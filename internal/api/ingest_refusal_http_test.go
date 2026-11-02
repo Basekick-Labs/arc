@@ -180,8 +180,10 @@ func TestMsgPackFencedWriteIsNotAnIngestError(t *testing.T) {
 
 // Every write path answers a fence refusal the same way: 503 marked as a fence
 // refusal, no per-request line, no ingest error counted, the refusal logged by
-// its reason. LP refuses up front (CheckIngestGate) and per measurement (a
-// gate that closes after the check); both are covered.
+// its reason. LP refuses up front only: a fence that closes after admission
+// no longer splits a request (#1422, see lineprotocol_fence_1422_test.go). The
+// LP import is still refused per measurement (a gate that closes after the
+// check); both are covered.
 func TestFencedWritePathsTable(t *testing.T) {
 	newBuf := func(t *testing.T, admitFirst int) *ingest.ArrowBuffer {
 		t.Helper()
@@ -224,15 +226,6 @@ func TestFencedWritePathsTable(t *testing.T) {
 		req        func() *http.Request
 	}{
 		{"line protocol, refused up front", 0,
-			func(app *fiber.App, b *ingest.ArrowBuffer, lg zerolog.Logger) {
-				NewLineProtocolHandler(b, lg).RegisterRoutes(app)
-			},
-			func() *http.Request {
-				r := httptest.NewRequest("POST", "/api/v1/write/line-protocol", strings.NewReader(lp))
-				r.Header.Set("x-arc-database", "db")
-				return r
-			}},
-		{"line protocol, refused per measurement", 1,
 			func(app *fiber.App, b *ingest.ArrowBuffer, lg zerolog.Logger) {
 				NewLineProtocolHandler(b, lg).RegisterRoutes(app)
 			},

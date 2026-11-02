@@ -67,3 +67,48 @@ func TestOpenGateAdmits(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// #1422: a request admitted whole passes the fence once. Its later buffer
+// calls are written even when the fence closes part-way, as a MessagePack
+// batch is; a request admitted with AdmitRequest (an import) is still
+// refused per call, and a fence already closed still refuses admission.
+func TestAdmitWholeRequestChecksTheFenceOnce(t *testing.T) {
+	buffer, wal := newCheckpointBuffer(1000)
+	defer buffer.Close()
+	fenced := false
+	buffer.SetIngestGate(func() error {
+		if fenced {
+			return fencedGate()
+		}
+		return nil
+	})
+	ctx := context.Background()
+	whole, release, err := buffer.AdmitWholeRequest(ctx, 0)
+	if err != nil {
+		t.Fatalf("AdmitWholeRequest with the fence open: %v", err)
+	}
+	defer release()
+	perCall, releasePerCall, err := buffer.AdmitRequest(ctx, 0)
+	if err != nil {
+		t.Fatalf("AdmitRequest with the fence open: %v", err)
+	}
+	defer releasePerCall()
+
+	fenced = true // closes after both requests were admitted
+	if err := buffer.WriteColumnarRecord(whole, "db", checkpointTestRecord()); err != nil {
+		t.Fatalf("first measurement of a request admitted whole: %v", err)
+	}
+	batch := &TypedColumnBatch{Data: map[string]interface{}{"time": []int64{time.Now().UnixMicro()}, "value": []float64{1}}}
+	if err := buffer.WriteTypedColumnarDirect(whole, "db", "m", batch, 1); err != nil {
+		t.Fatalf("second measurement of a request admitted whole was refused after the first was written: %v", err)
+	}
+	if err := buffer.WriteColumnarRecord(perCall, "db", checkpointTestRecord()); !errors.Is(err, ErrIngestFenced) {
+		t.Fatalf("write under AdmitRequest after the fence closed: err = %v, want ErrIngestFenced", err)
+	}
+	if _, _, err := buffer.AdmitWholeRequest(ctx, 0); !errors.Is(err, ErrIngestFenced) {
+		t.Fatalf("AdmitWholeRequest with the fence closed: err = %v, want ErrIngestFenced", err)
+	}
+	if handedOut, _ := wal.counts(); handedOut != 2 {
+		t.Fatalf("%d entries reached the WAL, want the 2 of the request admitted whole", handedOut)
+	}
+}

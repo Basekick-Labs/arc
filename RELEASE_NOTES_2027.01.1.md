@@ -2039,6 +2039,23 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A line-protocol write is no longer refused part-way by a fence ([#1422](https://github.com/Basekick-Labs/arc/issues/1422))
+
+A line-protocol body with several measurements is buffered one measurement at
+a time, and the ingest fence (#1207) was checked again for each one. When the
+fence closed part-way, during a writer failover, the request was answered with
+the fenced 503 (`X-Arc-Ingest-Fenced`), which says nothing was written and the
+write can be retried, after its first measurements were already buffered. A
+client that retried as told, such as Telegraf or an InfluxDB client, wrote
+those rows twice. The fence is now checked once for the whole request, before
+anything is written, as it already was for a MessagePack batch: a request
+admitted before the fence closes is written in full. The line-protocol import
+still checks the fence for each measurement, so a fence stops a long import
+part-way.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1428](https://github.com/Basekick-Labs/arc/pull/1428).
+
 ### A refused write is no longer replayed from the WAL ([#1438](https://github.com/Basekick-Labs/arc/issues/1438))
 
 With the WAL enabled and `cluster.wal_coverage` off (every standalone node, and
