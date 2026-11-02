@@ -1545,7 +1545,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_buffer_records_written_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_records_written_total", float64(m.bufferRecordsWritten.Load()))
 
-	b = append(b, "# HELP arc_buffer_records_dropped_total Records dropped from the buffer after a flush failure when no complete WAL copy was available\n"...)
+	b = append(b, "# HELP arc_buffer_records_dropped_total Acknowledged records lost because their flush failed, or Close could not write them, and the WAL held no copy (always the case with wal.enabled=false); a flush that failed after writing some hours counts all its rows\n"...)
 	b = append(b, "# TYPE arc_buffer_records_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_records_dropped_total", float64(m.bufferRecordsDropped.Load()))
 

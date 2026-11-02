@@ -201,6 +201,36 @@ func TestArrowBuffer_FlushFailureCountsOnlyRowsWithoutWALCopy(t *testing.T) {
 			},
 			wantDropped: 2,
 		},
+		// The typed path serves LP /write, imports and typed msgpack: the
+		// main ingest path, with its own flag assignment.
+		{
+			name:        "typed write, WAL off",
+			setWAL:      func(*ArrowBuffer) {},
+			write:       writeTypedFlushFailureBatch,
+			wantDropped: 2,
+		},
+		{
+			name:        "typed write, successful WAL append",
+			setWAL:      func(buf *ArrowBuffer) { buf.SetWAL(&checkpointRecordingWAL{}) },
+			write:       writeTypedFlushFailureBatch,
+			wantDropped: 0,
+		},
+		{
+			name:        "typed write, WAL append failure",
+			setWAL:      func(buf *ArrowBuffer) { buf.SetWAL(&failedAppendWAL{err: errors.New("WAL unavailable")}) },
+			write:       writeTypedFlushFailureBatch,
+			wantDropped: 2,
+		},
+		// Legacy untracked WAL recovery (cmd/arc createWALRecoveryCallback)
+		// replays with an empty identity: the rows are still in the WAL file.
+		{
+			name:   "untracked legacy replay keeps its WAL copy",
+			setWAL: func(buf *ArrowBuffer) { buf.SetWAL(&checkpointRecordingWAL{}) },
+			write: func(buf *ArrowBuffer) error {
+				return buf.WriteColumnarDirectReplay(context.Background(), "default", "flush_loss_wal_test", flushFailureColumns(), "")
+			},
+			wantDropped: 0,
+		},
 		{
 			name:   "untracked replay still has its WAL copy",
 			setWAL: func(buf *ArrowBuffer) { buf.SetWAL(&checkpointRecordingWAL{}) },
@@ -238,5 +268,151 @@ func TestArrowBuffer_FlushFailureCountsOnlyRowsWithoutWALCopy(t *testing.T) {
 				t.Fatalf("buffer_records_dropped_total delta = %d, want %d", after-before, tt.wantDropped)
 			}
 		})
+	}
+}
+
+func writeTypedFlushFailureBatch(buf *ArrowBuffer) error {
+	start := time.Now().UTC().Truncate(time.Hour).UnixMicro()
+	data := map[string]interface{}{
+		"time":  []int64{start, start + 1},
+		"value": []float64{1, 2},
+	}
+	batch := &TypedColumnBatch{Data: data, Signature: getColumnSignature(data)}
+	return buf.WriteTypedColumnarDirect(context.Background(), "default", "flush_loss_wal_test", batch, 2)
+}
+
+// Rows Close cannot write are split by WAL copy (#1377): without one they are
+// lost and counted as dropped, never as "remain in the WAL". Before, Close
+// reported every unwritten row as preserved whatever wal.enabled said.
+func TestClose_UnwrittenRowsAreReportedByWALCopy(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		setWAL        func(*ArrowBuffer)
+		wantDropped   int64
+		wantPreserved int64
+	}{
+		{name: "WAL off", setWAL: func(*ArrowBuffer) {}, wantDropped: 3, wantPreserved: 0},
+		{name: "WAL on", setWAL: func(buf *ArrowBuffer) { buf.SetWAL(&checkpointRecordingWAL{}) }, wantDropped: 0, wantPreserved: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.IngestConfig{MaxBufferSize: 100, MaxBufferAgeMS: 3_600_000, Compression: "snappy",
+				ShardCount: 1, FlushWorkers: 1, FlushQueueSize: 4, FlushTimeoutSeconds: 30, DataPageVersion: "2.0"}
+			buf := NewArrowBuffer(cfg, &failingStorageBackend{err: errors.New("storage unavailable")}, zerolog.New(io.Discard))
+			tt.setWAL(buf)
+			if err := buf.WriteColumnarDirect(context.Background(), "db", "close_split", makeColumns(3)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			// A budget already spent when the buffer loop starts: the rows are
+			// left unflushed, the budget-expired branch.
+			buf.SetCloseBudget(time.Nanosecond)
+			snap := metrics.Get().Snapshot()
+			droppedBefore, preservedBefore := snap["buffer_records_dropped_total"].(int64), snap["wal_records_preserved"].(int64)
+			_ = buf.Close()
+			snap = metrics.Get().Snapshot()
+			if d := snap["buffer_records_dropped_total"].(int64) - droppedBefore; d != tt.wantDropped {
+				t.Errorf("buffer_records_dropped_total delta = %d, want %d", d, tt.wantDropped)
+			}
+			if p := snap["wal_records_preserved"].(int64) - preservedBefore; p != tt.wantPreserved {
+				t.Errorf("wal_records_preserved delta = %d, want %d", p, tt.wantPreserved)
+			}
+			if buf.CloseFlushedCleanly() {
+				t.Error("Close reported clean with rows left unwritten")
+			}
+		})
+	}
+}
+
+// The coverage split flushes each class through flushPartSync, which reports
+// its own failure (#1377).
+func TestFlushPartSync_ReportsRowsWithoutWALCopy(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		hasWALCopy  bool
+		wantDropped int64
+	}{
+		{name: "no WAL copy", hasWALCopy: false, wantDropped: 2},
+		{name: "WAL copy", hasWALCopy: true, wantDropped: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := NewArrowBuffer(
+				&config.IngestConfig{MaxBufferSize: 100, MaxBufferAgeMS: 60000, Compression: "snappy", ShardCount: 1, FlushWorkers: 1, FlushQueueSize: 1},
+				&failingStorageBackend{err: errors.New("storage unavailable")},
+				zerolog.New(io.Discard),
+			)
+			t.Cleanup(func() { _ = buf.Close() })
+			start := time.Now().UTC().Truncate(time.Hour).UnixMicro()
+			data := map[string]interface{}{"time": []int64{start, start + 1}, "value": []float64{1, 2}}
+			batch := &TypedColumnBatch{Data: data, Signature: getColumnSignature(data), hasWALCopy: tt.hasWALCopy}
+			before := metrics.Get().Snapshot()["buffer_records_dropped_total"].(int64)
+			if err := buf.flushPartSync(context.Background(), "db/part", "db", "part", flushPart{records: []interface{}{batch}, rows: 2}); err == nil {
+				t.Fatal("expected storage failure")
+			}
+			if d := metrics.Get().Snapshot()["buffer_records_dropped_total"].(int64) - before; d != tt.wantDropped {
+				t.Fatalf("buffer_records_dropped_total delta = %d, want %d", d, tt.wantDropped)
+			}
+		})
+	}
+}
+
+// gateThenFailBackend blocks every write until release is closed, then fails
+// it: a worker holds the first task while later ones wait in the queue for
+// Close's drain, which then attempts them and fails.
+type gateThenFailBackend struct {
+	failingStorageBackend
+	release chan struct{}
+	started chan struct{}
+}
+
+func (s *gateThenFailBackend) Write(ctx context.Context, path string, data []byte) error {
+	s.started <- struct{}{}
+	<-s.release
+	return s.err
+}
+
+func (s *gateThenFailBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	return s.Write(ctx, path, nil)
+}
+
+// A queued task Close's drain attempts and fails reports its rows without a
+// WAL copy once, as dropped (logFlushFailure), and never as preserved: before
+// the split the drain also counted them as "remain in the WAL" (#1377).
+func TestCloseDrain_AttemptedFailureCountsRowsOnce(t *testing.T) {
+	backend := &gateThenFailBackend{
+		failingStorageBackend: failingStorageBackend{err: errors.New("storage unavailable")},
+		release:               make(chan struct{}),
+		started:               make(chan struct{}, 16),
+	}
+	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	t.Cleanup(func() { _ = buf.Close() })
+
+	writeMetricsRecords(t, buf, 10) // task 1: the only worker takes it and blocks
+	<-backend.started
+	writeMetricsRecords(t, buf, 10) // task 2 waits in the queue
+	awaitBufferRecordMetrics(t, 10, 10)
+
+	snap := metrics.Get().Snapshot()
+	droppedBefore, preservedBefore := snap["buffer_records_dropped_total"].(int64), snap["wal_records_preserved"].(int64)
+	done := make(chan [2]int, 1)
+	go func() {
+		withWAL, lost := buf.drainAndFlushQueue(time.Now().Add(time.Minute))
+		done <- [2]int{withWAL, lost}
+	}()
+	<-backend.started // the drain is attempting task 2
+	close(backend.release)
+	got := <-done
+	if got != [2]int{0, 0} {
+		t.Fatalf("drain returned %d unwritten with a WAL copy and %d unattempted lost, want 0 and 0: the failed attempt reports its own rows", got[0], got[1])
+	}
+	// Task 2's 10 rows via the drain's attempt; task 1's 10 via the worker.
+	deadline := time.Now().Add(5 * time.Second)
+	for metrics.Get().Snapshot()["buffer_records_dropped_total"].(int64)-droppedBefore < 20 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	snap = metrics.Get().Snapshot()
+	if d := snap["buffer_records_dropped_total"].(int64) - droppedBefore; d != 20 {
+		t.Errorf("buffer_records_dropped_total delta = %d, want 20", d)
+	}
+	if p := snap["wal_records_preserved"].(int64) - preservedBefore; p != 0 {
+		t.Errorf("wal_records_preserved delta = %d, want 0", p)
 	}
 }
