@@ -1123,7 +1123,7 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 		SELECT id, policy_id, execution_time, status, deleted_count, cutoff_date, execution_duration_ms, error_message
 		FROM retention_executions
 		WHERE policy_id = ?
-		ORDER BY execution_time DESC
+		ORDER BY execution_time DESC, id DESC
 		LIMIT ?
 	`, policyID, limit)
 	if err != nil {
@@ -1138,12 +1138,21 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 		var ex RetentionExecution
 		var executionDurationMs sql.NullFloat64
 		if err := rows.Scan(&ex.ID, &ex.PolicyID, &ex.ExecutionTime, &ex.Status, &ex.DeletedCount, &ex.CutoffDate, &executionDurationMs, &ex.ErrorMessage); err != nil {
+			// A row that cannot be read is left out of the history, but never
+			// silently: a NULL duration hid every running execution (#1415).
+			h.logger.Warn().Err(err).Int64("policy_id", int64(policyID)).Msg("Skipping unreadable retention execution row")
 			continue
 		}
 		if executionDurationMs.Valid {
 			ex.ExecutionDurationMs = executionDurationMs.Float64
 		}
 		executions = append(executions, ex)
+	}
+	if err := rows.Err(); err != nil {
+		h.logger.Error().Err(err).Int64("policy_id", int64(policyID)).Msg("Failed to read retention execution history")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get executions",
+		})
 	}
 
 	return c.JSON(fiber.Map{

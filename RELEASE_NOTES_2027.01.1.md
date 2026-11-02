@@ -1843,7 +1843,9 @@ an unbounded operation.
 
 The execution-history endpoint now includes runs whose duration is still
 `NULL`. Their existing numeric `execution_duration_ms` field is `0` until the
-run completes; completed and failed durations are unchanged.
+run completes; completed and failed durations are unchanged. Runs started in
+the same second are listed newest first, matching `last_execution_status`, and
+a row the endpoint cannot read is logged instead of being dropped silently.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1417](https://github.com/Basekick-Labs/arc/pull/1417).
