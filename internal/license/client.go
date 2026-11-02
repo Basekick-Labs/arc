@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -230,7 +231,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	}
 	defer resp.Body.Close()
 
-	if err := checkHTTPStatus(resp); err != nil {
+	if err := checkHTTPStatus(resp, c.licenseKey); err != nil {
 		return nil, fmt.Errorf("license activation failed: %w", err)
 	}
 	var activateResp ActivateResponse
@@ -312,12 +313,16 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
+		// The request address carries the key (the server reads it from the
+		// query); a transport error quotes the address, so drop the query
+		// before the error is logged or returned.
+		err = withoutRequestQuery(err)
 		c.logger.Error().Err(err).Msg("License verification request failed")
 		return nil, transientErr("license verification request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if err := checkHTTPStatus(resp); err != nil {
+	if err := checkHTTPStatus(resp, c.licenseKey); err != nil {
 		return nil, fmt.Errorf("license validation failed: %w", err)
 	}
 	var verifyResp VerifyResponse
@@ -611,7 +616,10 @@ func (c *Client) bindFingerprint(signed *SignedLicense) error {
 // protocol's own JSON error shape — a bare/HTML 4xx is an ingress artifact
 // (the field incident: deploy-window 404s crash-looped a cluster). The message
 // embeds a bounded, rune-safe preview of the body for diagnosis.
-func checkHTTPStatus(resp *http.Response) error {
+//
+// secrets are removed from the preview: a proxy's error page can echo the
+// request, whose address carries the licence key on verify.
+func checkHTTPStatus(resp *http.Response, secrets ...string) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
@@ -620,6 +628,11 @@ func checkHTTPStatus(resp *http.Response) error {
 	// certainly an HTML error page from an upstream proxy; truncate.
 	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	previewStr := strings.TrimSpace(string(preview))
+	for _, s := range secrets {
+		if s != "" {
+			previewStr = strings.ReplaceAll(previewStr, s, "REDACTED")
+		}
+	}
 	// Rune-safe truncation: a byte-slice cut can split a multi-byte
 	// UTF-8 sequence and leave the error string invalid (turns the
 	// log line into mojibake). Counting runes preserves character
@@ -649,4 +662,15 @@ func checkHTTPStatus(resp *http.Response) error {
 func readBoundedJSON(resp *http.Response, v any) error {
 	bounded := io.LimitReader(resp.Body, maxLicenseResponseBytes)
 	return json.NewDecoder(bounded).Decode(v)
+}
+
+// withoutRequestQuery trims the query from the request address an
+// *url.Error quotes, in place, so the error's text no longer carries what the
+// query held.
+func withoutRequestQuery(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		ue.URL, _, _ = strings.Cut(ue.URL, "?")
+	}
+	return err
 }

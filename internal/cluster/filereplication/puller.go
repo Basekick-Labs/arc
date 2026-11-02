@@ -1945,21 +1945,41 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 	return
 }
 
-// pullOnce performs a single fetch attempt end-to-end. On attempt > 1 it
-// checks for a partial file and resumes from the byte offset already written,
-// avoiding re-transferring bytes already on disk. The Fetcher verifies SHA-256
+// pullOnce performs a single fetch attempt end-to-end. It checks for a
+// partial file and resumes from the byte offset already written, avoiding
+// re-transferring bytes already on disk. The Fetcher verifies SHA-256
 // across the full file (prefix + tail); this function only tracks counters.
 func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr string, attempt int) error {
+	// Resume from a partial file already on disk, on the first attempt too:
+	// a new enqueue (FSM callback, catch-up, recheck) used to start from zero,
+	// so a file that takes longer than the attempts of one enqueue to transfer
+	// (a low cluster.replication_pull_bytes_per_second, #397, or a slow link)
+	// never completed. byteOffset > 0 means [0, byteOffset) is written and
+	// only the tail is needed.
+	byteOffset, prefixHasher := p.tryResumeFromPartial(log, entry)
+	err := p.fetchFrom(log, entry, peerAddr, byteOffset, prefixHasher)
+	if byteOffset > 0 && errors.Is(err, ErrChecksumMismatch) {
+		// The checksum covers prefix + tail, so a resumed fetch that fails it
+		// most likely failed on the prefix: a partial left by an older
+		// generation of this path. fetchFrom discarded it; pull from zero
+		// from the same peer before blaming the peer. Only a from-zero
+		// mismatch says the peer does not hold the manifest's checksum, so
+		// only that one reaches the content-mismatch accounting.
+		log.Debug().
+			Str("path", entry.Path).
+			Str("peer", peerAddr).
+			Int64("byte_offset", byteOffset).
+			Msg("Resumed pull failed its checksum; discarded the partial and pulling from zero")
+		return p.fetchFrom(log, entry, peerAddr, 0, nil)
+	}
+	return err
+}
+
+// fetchFrom is one fetch from peerAddr starting at byteOffset, bounded by
+// FetchTimeout.
+func (p *Puller) fetchFrom(log zerolog.Logger, entry *raft.FileEntry, peerAddr string, byteOffset int64, prefixHasher hash.Hash) error {
 	fetchCtx, cancel := context.WithTimeout(p.ctx, p.cfg.FetchTimeout)
 	defer cancel()
-
-	// On retries, attempt to resume from a partial file already on disk.
-	// byteOffset > 0 means [0, byteOffset) is written and only the tail is needed.
-	var byteOffset int64
-	var prefixHasher hash.Hash
-	if attempt > 1 {
-		byteOffset, prefixHasher = p.tryResumeFromPartial(log, entry)
-	}
 
 	tailBytes := entry.SizeBytes - byteOffset
 
@@ -2001,7 +2021,11 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 
 	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrChecksumMismatch) {
-			p.totalChecksumMismatch.Add(1)
+			if byteOffset == 0 {
+				// A resumed fetch's mismatch is the partial's until a
+				// from-zero fetch says otherwise (pullOnce).
+				p.totalChecksumMismatch.Add(1)
+			}
 			// Discard only the unverified bytes, never the committed file.
 			// On a staging backend the failed WriteReader left the rejected
 			// bytes in the ".part" and never renamed, so the committed file is

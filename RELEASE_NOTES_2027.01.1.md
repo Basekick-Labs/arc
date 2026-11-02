@@ -2,6 +2,14 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Google Cloud Storage through the S3-compatible endpoint (#1399)
+
+GCS S3 interoperability now leaves `Accept-Encoding` out of request signatures
+while preserving the SDK's identity encoding on the wire. Optional upload
+checksum trailers are disabled for `storage.googleapis.com`, allowing object
+writes without the SDK's streaming trailer format. Other S3 endpoints retain
+their existing signing and checksum behavior.
+
 ## New: MQTT topic mappings can set measurements and tags (#479)
 
 `topic_mapping` still accepts the existing topic-to-database strings and now
@@ -32,6 +40,47 @@ data, is left out with a warning, and the write succeeds
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#905](https://github.com/Basekick-Labs/arc/pull/905).
+
+## Changed: telemetry also reports Python SDK installations
+
+Arc's opt-out telemetry `clients` section, which lists the arcli
+installations an instance served, gains a `python_sdk` entry for the
+[Python SDK](https://github.com/Basekick-Labs/arc-client-python). The SDK
+sends a random per-installation UUID in a new, generic
+`Arc-Client-Installation-Id` header; arcli's `Arcli-Installation-Id` header
+is still accepted, and the new header wins when both are present. The client
+kind comes from the User-Agent (`arcli/...` or `arc-client-python/...`). Per
+SDK installation Arc reports the id, the SDK version, the Python version and
+the `os/arch` platform from the SDK's User-Agent (`unknown` when the
+User-Agent comment is absent or malformed), and the time it was last seen.
+Runtime and platform are limited to letters, digits and `. _ + / -`; anything
+else is reported as `unknown`.
+
+The same gates as for arcli apply: only requests that succeeded and, with
+authentication configured, carried a valid token count; public routes never
+do. Each client kind is capped at 256 distinct installations per report,
+independently, with its own `truncated` flag, so containers minting a new SDK
+id on every start cannot push arcli installations out of the report. The
+`clients.arcli` object is unchanged. Both installation headers are stripped
+when a cluster node forwards a request, so a forwarded request is counted
+once, by the node that received it.
+
+One behaviour change for arcli: a request carrying an installation id whose
+User-Agent names neither arcli nor the SDK is no longer counted (it used to be
+recorded with version `unknown`), so foreign traffic cannot inflate the
+counts. arcli always sends its own User-Agent, so its counts are unaffected.
+
+The SDK's own switches (`DO_NOT_TRACK=1`, `ARC_CLIENT_SEND_INSTALLATION_ID=0`,
+or `send_installation_id=False`) stop it sending the id, and
+`telemetry.enabled = false` / `ARC_TELEMETRY_ENABLED=false` on the node
+disables the whole section. In ephemeral containers, setting
+`ARC_CLIENT_INSTALLATION_ID` to a fixed UUID keeps each start from counting
+as a new installation.
+
+As with arcli, the counts are only as trustworthy as the callers: any token
+holder (any caller, without authentication) can send 256 random ids with an
+SDK User-Agent and fill that kind's slots for one report, which sets
+`truncated`. The per-kind cap keeps that from affecting arcli's counts.
 
 ## Security: a crafted request can no longer crash Arc or exhaust its memory
 
@@ -767,6 +816,35 @@ During a rolling upgrade, a node still on an earlier release reads a
 GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
+
+### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
+
+`cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a
+node's peer file replication: one budget shared by all its pull workers, so
+reactive pulls, the startup catch-up and the periodic recheck together stay
+under it. It takes bytes per second or a size such as `"10MB"` (1 MB = 1024 KB);
+the default `0` is unlimited. A negative or unparseable value fails startup,
+instead of reading as unlimited. Helm: `cluster.replication.pullBytesPerSecond`.
+
+The cap does not apply to the staged compaction commit: a compacted output is
+fetched from the start every time, so a capped fetch could never deliver one
+larger than the cap allows within `cluster.replication_serve_timeout_ms`, and
+the partition would be compacted and aborted again on every cycle.
+
+Under a low cap a large file can take longer than one fetch. Each fetch is
+still bounded by `cluster.replication_fetch_timeout_ms` on the pulling node and
+by `cluster.replication_serve_timeout_ms` on the node serving the file; when
+either ends it, the next attempt resumes from the bytes already received. That
+now includes the first attempt of a new pull: before, only retries within one
+pull resumed, and every new pull of the same file (a manifest callback, the
+catch-up, the recheck) started again from zero, so a file too large for one
+pull's attempts never completed.
+A partial left by an older version of the same file fails the checksum when
+resumed; it is discarded and the same peer is asked again from the start, and
+the mismatch is not counted against that peer.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1404](https://github.com/Basekick-Labs/arc/pull/1404).
 
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
@@ -1839,6 +1917,122 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
+
+The execution-history endpoint now includes runs whose duration is still
+`NULL`. Their existing numeric `execution_duration_ms` field is `0` until the
+run completes; completed and failed durations are unchanged. Runs started in
+the same second are listed newest first, matching `last_execution_status`, and
+a row the endpoint cannot read is logged instead of being dropped silently.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1417](https://github.com/Basekick-Labs/arc/pull/1417).
+
+### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column ([#1409](https://github.com/Basekick-Labs/arc/pull/1409))
+
+With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes each
+file within one hour, sorted by the keys and then time. The daily compaction
+then sorted the whole day by the keys alone, so each row group of the
+long-lived compacted file mixed the hours of the day, and a query over a few
+minutes read every row group: on a 54M-row daily file of TSBS IoT data sorted
+by `fleet,name`, every row group spanned about 17 hours, nearly all of that
+file's time range.
+
+- **Compacted files are now ordered by hour, then the sort keys, then time.**
+  Each row group holds contiguous hours, so time-range pruning works on
+  compacted files again, while rows stay grouped by the keys within each hour.
+  A measurement whose hour fills a row group (122,880 rows) gets row groups of
+  about an hour; a smaller one gets fewer, wider row groups, as it did without
+  sort keys. Measured by rewriting that 54M-row file each way (DuckDB 1.5.6,
+  warm medians):
+
+  | Query | Time only (default) | Keys, before | Hour, then keys |
+  |---|---|---|---|
+  | One truck, 24 hours | 51 ms | 8 ms | 9 ms |
+  | One fleet, 10 minutes | 11 ms | 26 ms | 11 ms |
+  | All trucks, 10 minutes | 9 ms | 38 ms | 11 ms |
+  | Latest position per truck, one fleet | 75 ms | 42 ms | 32 ms |
+  | File size | 984 MB | 802 MB | 807 MB |
+
+  Rewriting that file in the new order took about 10% longer (7.0 s to 7.8 s)
+  with about 2% more peak memory. Hourly compaction is unchanged (its rows are all one
+  hour), and so is compaction without sort keys.
+- **Only newly compacted files get the new order.** A daily file compacted by
+  an earlier version keeps its order until it is rewritten; it is still read
+  correctly, just with the old pruning.
+- **A sort key the partition's files have no column for no longer fails its
+  compaction.** The ORDER BY named every configured key, and a key missing
+  from all of a batch's files was a bind error, so that partition failed to
+  compact on every cycle. The key is now left out of that batch's order, and a
+  Warn names it when it is configured for the measurement in
+  `ingest.sort_keys`; a key from `ingest.default_sort_keys` that a measurement
+  does not have is logged at Debug, since that is normal. Names match
+  case-insensitively, as DuckDB binds them.
+
+### A sort key the data has no column for no longer leaves the file unsorted ([#1410](https://github.com/Basekick-Labs/arc/pull/1410))
+
+With `ingest.sort_keys` or `ingest.default_sort_keys` set, a flush whose rows
+had no column for one of the keys failed its sort, and the flush wrote the
+rows in arrival order: not sorted by the other keys, and not by time either,
+which also cost time-range pruning inside the file. Nothing was logged. (The
+documentation said such a flush fails; it never did, and no rows were
+lost.)
+
+- **The flush now sorts by the keys it has a column for, then time,** and
+  leaves the missing key out. A key configured for the measurement in
+  `ingest.sort_keys` is logged at Warn, once a minute per measurement, naming
+  the key. A key from `ingest.default_sort_keys` is logged at Debug: it applies
+  to every measurement without its own entry, and many do not have that
+  column. Compaction leaves such a key out of that partition's order as well
+  ([#1409](https://github.com/Basekick-Labs/arc/pull/1409)); before, it failed
+  the partition's compaction on every cycle.
+- **Key names match case-insensitively**, as compaction already binds them,
+  so a key configured as `Host` sorts a `host` column at ingest too. Before,
+  such a key failed the sort, and the file was written unsorted.
+- **Should a sort ever fail, the flush is written sorted by time** and logged
+  at Error, once a minute per measurement, rather than unsorted and silent.
+
+### Ingest with sort keys is as fast as without them ([#1411](https://github.com/Basekick-Labs/arc/pull/1411))
+
+A flush sorted by `ingest.sort_keys` (or `ingest.default_sort_keys`) went
+through a comparison sort that checked each key column's type on every one of
+its comparisons: 2.60 s for a 5M-row flush sorted by two tag columns and time,
+against 0.21 s for time alone. On a sustained load that was most of the cost
+of sort keys at ingest.
+
+- **The sort is now one linear, stable pass per key**: a radix sort for
+  integer and float keys, and for tag (string and binary) keys a counting sort
+  on each value's rank among the flush's distinct values. Rows already in
+  order are not copied, as with time-only sorting.
+- **A key with many distinct values** (more than a quarter of the flush's
+  rows, such as a request id) or a decimal key has no such pass; the flush is
+  then sorted by one comparison over all its keys, about as fast as before
+  (1M rows by an id and time: 371 ms before, 339 ms now).
+- **Measured**, sorting a flush by `fleet, name, time` (10,000 names): 50,000
+  rows (the default flush size) 13.9 ms to 6.3 ms; 1M rows 445 ms to 77 ms;
+  5M rows 2.60 s to 0.51 s. While it runs, the sort needs about 24 bytes of
+  scratch memory a row plus 4 for each tag or boolean key, against 8 before
+  (about 160 MB instead of 40 MB for 5M rows sorted by two tags and time).
+- **End to end**, loading 155.6M TSBS IoT rows with
+  `sort_keys = ["readings:fleet,name", "diagnostics:fleet,name"]` and
+  `wal.ack_mode = "durable"`: 36.6 s (29.7 to 49.0 across three runs) before,
+  25.4 s (25.3 to 25.7) now, against 26.1 s with no sort keys. Rows were
+  queryable after 27.9 s, against 44.2 s before.
+- **Order changes only where it was undefined.** Rows equal on every key now
+  keep their arrival order (the old sort did not promise any). A float sort
+  key orders -0 and +0 as equal and NaN after +Infinity; the old sort treated
+  NaN as equal to every value, which left the order of rows with NaN keys
+  unspecified.
+
+### Azure Blob Storage error messages are shorter
+
+Errors from the Azure Blob Storage backend are shorter. Azure credential
+values (connection string, SAS token, account key) and the endpoint are
+trimmed of surrounding whitespace, so a value read from a file with a trailing
+newline works everywhere it is used; one with another control character is
+refused at startup. Errors from the licence server check are shorter in the
+same way.
 
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
@@ -3463,6 +3657,59 @@ outside the writer's WAL, and a standby writer refused it with `503`.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
 
+### Bulk imports write in parallel, and wait for a slot at most 30 seconds
+
+Earlier builds of this release let one bulk import (`/api/v1/import/lp`, `csv`,
+`parquet`) write at a time per node, whatever its size: a 46-core writer
+loading 64 MB line-protocol files with tsm2arc ran at about 85 MB/s, against
+about 1,250 MB/s on 26.09.2, with the CPUs mostly idle. More requests in flight
+only made each wait longer. A request that waited could not be abandoned: the
+server does not see a client that gives up, so the import later wrote all its
+rows, and a client retry wrote them a second time.
+
+Measured on a 14-core laptop, 64 MB line-protocol files, 16 in flight:
+
+| | Before | Now |
+|---|---|---|
+| Throughput | 67 MB/s | 319 MB/s |
+| Median import | 15.4 s | 3.0 s |
+| Peak memory | 4.5 GB | 5.7 GB |
+
+- New `ingest.import_write_concurrency` (default `0` = auto): how many imports
+  write at once. Auto is as many as fit an eighth of the memory limit at one
+  import allowance each (an eighth of the memory limit, 64 MB to 512 MB), at
+  most the CPUs Arc runs on (`GOMAXPROCS`, which a licence's core count can
+  lower), at least one: one on a 3 GiB writer, nine on a 36 GiB laptop, 46 on
+  a 46-core, 320 GiB writer licensed for all its cores. The value is logged at
+  startup ("Bulk import write slots configured"). Each writing import may hold
+  about one allowance plus its upload, and each import that wakes from a wait
+  writes one batch before it paces again; set a lower value to bound memory
+  more tightly. An explicit value (1 to 1024) is used as is. `1` restores one
+  import writing at a time; the next one starts while the previous one is
+  still flushing, within the same allowance.
+- New `ingest.import_queue_timeout_ms` (default `30000`; `0` = until a slot
+  frees, since the server does not see a client that gives up): an import that waited this long for a slot is refused with
+  `503`, `X-Arc-Ingest-Refused: import_queue` and `Retry-After`. Nothing of it
+  was written, so it is safe to retry. Keep it well under the client's own
+  timeout.
+- A client that times out while its import is writing still gets no answer,
+  and the import still completes: treat such an attempt as possibly written
+  before retrying it.
+- An import ends by flushing its own measurements' buffers, not every buffer
+  on the node, and it gives its slot (and its allowance) to the next import
+  before that flush. An import that stops part-way flushes what it wrote
+  before it answers. While an import waits for flushes it flushes its own
+  measurements again every second; a flush that fails there stops it part-way
+  (`500`), as the first one did.
+  The `200` contract is unchanged: the rows are in the buffer and the WAL
+  (when enabled), files follow as their flushes finish.
+- A write refused because other writers of the same measurement keep
+  changing its columns (`ErrSchemaChurnExceeded`) is tried again up to five
+  times inside the import before it fails (not for line-protocol imports on
+  deployments with `ingest.decimal_columns`, which write records). With imports running side by
+  side, two imports into one measurement whose columns change type can now
+  meet more often; that still fails part-way, as before.
+
 ### Bulk imports no longer hold the whole file in memory several times
 
 The import endpoints (`/api/v1/import/csv`, `parquet`, `lp`, `tle`) read the
@@ -3496,12 +3743,12 @@ peaked at 2.2 GiB.
   what the buffer held when it started. Over that it flushes its database's
   buffers and waits; if the buffered rows stay above the limit for two
   minutes, it stops (a failure part-way, below).
-- One import writes at a time on a node. Imports sent together are validated
-  together and written one after the other: concurrent write passes would add
-  up their allowances. Every request body is held in memory while it waits.
-  A forwarded import waiting its turn on the writer still counts down
-  `cluster.import_forward_timeout_ms` on the node that forwarded it, so a
-  `504` there can mean it was still queued.
+- Imports write in parallel, up to `ingest.import_write_concurrency` at once
+  on a node (#1429, above). Each writing import paces against one limit
+  shared by all of them: the lowest buffered level any of them started at,
+  plus the allowance of every import holding a slot. Every request body is held in memory while it waits for a slot.
+  A forwarded import waiting for a slot on the writer still counts down
+  `cluster.import_forward_timeout_ms` on the node that forwarded it.
 - A validation pass reads the whole file, chunk by chunk, before anything is
   written, so a bad file is still refused with nothing written: a bad time
   value, an invalid measurement name, a measurement the token may not write,
@@ -4973,6 +5220,27 @@ saw the same bytes; the interface comments now say so, and making `ReadToAt`
 honest too is tracked separately.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1190](https://github.com/Basekick-Labs/arc/pull/1190).
+
+### Telemetry reports the machine's memory, and what the process may use ([#1412](https://github.com/Basekick-Labs/arc/issues/1412))
+
+Telemetry's `memory.total_gb` was documented as the machine's RAM but was
+`runtime.MemStats.Sys`: the memory the Arc process itself had obtained from the
+OS. A freshly started node reported a few tens of MB whatever the host had, so
+every earlier `total_gb` value is the process footprint, not a machine size.
+
+- `total_gb` is now the machine's memory: `/proc/meminfo` `MemTotal` on Linux,
+  `hw.memsize` on macOS. The unit is GiB, as before.
+- A new `usable_gb` is what a cgroup limit leaves the process, the memory
+  counterpart of `usable_cores`. It is the same detection the ingest buffer
+  sizes itself from: the lower of `memory.max` and `memory.high`, so with the
+  Kubernetes MemoryQoS feature gate enabled a 2Gi pod reports about 1.8. With
+  no limit it equals `total_gb`.
+
+Inside a container `total_gb` is the host's memory, unless lxcfs is mounted
+over `/proc/meminfo`, in which case it reads as the container limit. Both values
+are read once at startup, like `usable_cores`, so a limit changed in place is
+reported from the next restart. A value that cannot be read is sent as `null`,
+never a guess.
 
 ### Reported core counts account for the CPU quota ([#1039](https://github.com/Basekick-Labs/arc/issues/1039))
 
