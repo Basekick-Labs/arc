@@ -114,3 +114,44 @@ func TestMsgPackSpecRequiresToken(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
+
+// An item of a batch or top-level array that cannot be decoded is dropped and
+// reported as a partial write, like any other dropped point; it used to be
+// skipped silently with a 204 (#1434).
+func TestMsgPackBatchItemThatCannotBeDecodedIsAPartialWrite(t *testing.T) {
+	good := row("cpu", 1700000000, map[string]interface{}{"v": 1.5}, nil)
+	noFields := map[string]interface{}{"m": "cpu", "t": int64(1700000001)}
+	ragged := map[string]interface{}{"m": "mem", "columns": map[string]interface{}{
+		"time": []int64{1700000000000, 1700000001000},
+		"free": []int64{1},
+	}}
+	cases := []struct {
+		name      string
+		payload   interface{}
+		dropped   string
+		wroteRest bool
+		stored    map[string]int64
+	}{
+		{"batch", map[string]interface{}{"batch": []interface{}{good, noFields}}, "partial write: 1 points dropped", true, map[string]int64{"cpu": 1}},
+		{"array", []interface{}{good, ragged}, "partial write: 1 points dropped", true, map[string]int64{"cpu": 1}},
+		{"non-map item", []interface{}{good, "junk"}, "not a map (string)", true, map[string]int64{"cpu": 1}},
+		{"every item", map[string]interface{}{"batch": []interface{}{noFields, ragged}}, "partial write: 2 points dropped", false, map[string]int64{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, post := newMsgPackRowsRig(t)
+			status, out := post(tc.payload)
+			require.Equal(t, http.StatusBadRequest, status, out)
+			require.Contains(t, out, tc.dropped)
+			require.Contains(t, out, "could not be decoded")
+			if tc.wroteRest {
+				require.Contains(t, out, "the other points were written")
+			} else {
+				require.NotContains(t, out, "the other points were written")
+			}
+			rows, _ := r.stored(t)
+			require.Equal(t, tc.stored, rows)
+			require.Contains(t, r.log.String(), "MessagePack points dropped (partial write)")
+		})
+	}
+}
