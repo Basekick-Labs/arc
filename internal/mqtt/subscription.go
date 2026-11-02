@@ -142,6 +142,14 @@ type SubscriptionStats struct {
 
 // Validate validates the subscription configuration
 func (s *Subscription) Validate() error {
+	return s.validate(true)
+}
+
+// validate is Validate with a choice for the topic mapping's filters. An
+// update that leaves topic_mapping alone passes false, so a stored row whose
+// filter predates the MQTT filter rules (#479) can still be edited; one that
+// sets topic_mapping is checked in full, as a create is.
+func (s *Subscription) validate(strictFilters bool) error {
 	if s.Name == "" {
 		return errors.New("name is required")
 	}
@@ -191,7 +199,7 @@ func (s *Subscription) Validate() error {
 	if s.Database == "" {
 		return errors.New("database is required")
 	}
-	if err := validateSubscriptionTargets(s); err != nil {
+	if err := validateSubscriptionTargets(s, strictFilters); err != nil {
 		return err
 	}
 
@@ -321,16 +329,25 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 }
 
 // validateSubscriptionTargets checks the subscription database and every topic
-// mapping rule. Mapped databases become the first segment of a storage key,
-// while measurements and tag names become stored columns; this ingest surface
+// mapping rule. Mapped databases become the first segment of a storage key, so
+// a value like "" or "../x" would otherwise reach the writer directly (#741,
+// #300); measurements and tag names become stored columns. This ingest surface
 // has no HTTP write handler in front of it to validate them. Shared by Validate
 // (create and update) and by startSubscriber, which loads rows from SQLite that
 // may predate these rules or have been edited there.
-func validateSubscriptionTargets(s *Subscription) error {
+//
+// strictFilters false skips only the check that a mapping key is a valid MQTT
+// topic filter. Before #479 a key was matched as an exact string, so a stored
+// "sensors/temp+x" was legal and simply never matched (a published topic name
+// cannot contain a wildcard). Refusing such a row at boot would stop a
+// subscription that ingests fine today; the compiled mapping drops the dead
+// rule instead (deadTopicFilters names it). Every rule's targets are checked
+// either way.
+func validateSubscriptionTargets(s *Subscription, strictFilters bool) error {
 	if !isValidStorageSegment(s.Database) {
 		return fmt.Errorf("database %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens", s.Database)
 	}
-	if err := validateTopicMapping(s.TopicMapping); err != nil {
+	if err := validateTopicMapping(s.TopicMapping, strictFilters); err != nil {
 		return err
 	}
 	return nil

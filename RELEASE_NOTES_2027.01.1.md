@@ -13,9 +13,51 @@ their existing signing and checksum behavior.
 ## New: MQTT topic mappings can set measurements and tags (#479)
 
 `topic_mapping` still accepts the existing topic-to-database strings and now
-also accepts rule objects with MQTT `+` and `#` filters, measurement overrides,
-and zero-based tag extraction from full topic paths. Payload measurements and
-tags remain in use when a matched rule omits those fields.
+also accepts rule objects:
+
+```json
+"topic_mapping": {
+  "factory/+/+/metrics": {
+    "measurement": "machine_metrics",
+    "tags_from_topic": [
+      {"position": 1, "tag_name": "line"},
+      {"position": 2, "tag_name": "machine_id"}
+    ]
+  },
+  "legacy/topic": "otherdb"
+}
+```
+
+- A key is an MQTT topic filter: `+` matches one level, a trailing `#` any
+  number. An exact key wins; then the filter with more literal levels, then
+  more `+`, then fewer `#`. A leading wildcard does not match `$`-prefixed
+  topics.
+- `database`, `measurement` and `tags_from_topic` are each optional; a rule
+  sets at least one. What a rule leaves out still comes from the payload.
+- `position` counts levels of the full topic from 0. A position past the
+  filter's last level is refused, unless the filter ends in `#`, where a topic
+  without that level is written without the tag.
+- A topic tag replaces a payload tag of the same name, in any letter case. A
+  payload field of exactly that name is stored as `<name>_value`; one that
+  differs only in letter case, or a column already stored under another
+  spelling, is a case clash resolved as for any write: one of the two names is
+  dropped, with a warning.
+- An unknown key in a rule is refused, and a refused request body now says
+  what is wrong instead of only `Invalid request body`.
+
+**Existing mappings.** A stored key containing `+` or `#` used to match only a
+topic spelled exactly like it, which a published topic never is; it is now a
+wildcard and starts routing the topics it matches. Check stored mappings for
+such keys before upgrading. A stored key that is not a valid filter (for
+example `sensors/temp+x`, which no published topic can equal, or one longer
+than 1024 characters) now matches nothing: the subscription keeps running and
+logs a warning naming the key. An API update that leaves `topic_mapping` out is
+accepted; one that sets it requires valid filters, so remove such a key with
+the first edit that touches the mapping (`{}` clears it).
+
+**Downgrading.** An earlier release cannot read a rule object: with one stored,
+it fails to list or auto-start any MQTT subscription. Before downgrading,
+change every rule object back to a database string, or remove it.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1402](https://github.com/Basekick-Labs/arc/pull/1402).
 

@@ -1,10 +1,14 @@
 package mqtt
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
 )
@@ -112,14 +116,166 @@ func TestCompileTopicMappingValidatesFiltersAndRuleValues(t *testing.T) {
 		{name: "time tag", mapping: TopicMapping{"factory/+": {TagsFromTopic: []TopicTagExtraction{{Position: 1, TagName: "TIME"}}}}, wantErr: true},
 		{name: "duplicate tags", mapping: TopicMapping{"factory/+": {TagsFromTopic: []TopicTagExtraction{{Position: 1, TagName: "line"}, {Position: 2, TagName: "LINE"}}}}, wantErr: true},
 		{name: "empty rule", mapping: TopicMapping{"factory/+": {}}, wantErr: true},
+		// Without a trailing # a topic has exactly the filter's levels, so a
+		// position past them can never hold a value.
+		{name: "position past last level", mapping: TopicMapping{"factory/+/metrics": {TagsFromTopic: []TopicTagExtraction{{Position: 3, TagName: "x"}}}}, wantErr: true},
+		{name: "position past exact filter", mapping: TopicMapping{"a/b": {TagsFromTopic: []TopicTagExtraction{{Position: 2, TagName: "x"}}}}, wantErr: true},
+		{name: "last level position", mapping: TopicMapping{"factory/+/metrics": {TagsFromTopic: []TopicTagExtraction{{Position: 2, TagName: "x"}}}}},
+		{name: "position under trailing hash", mapping: TopicMapping{"factory/#": {TagsFromTopic: []TopicTagExtraction{{Position: 9, TagName: "x"}}}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := compileTopicMapping(tt.mapping)
+			err := validateTopicMapping(tt.mapping, true)
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("compileTopicMapping() error = %v, wantErr %v", err, tt.wantErr)
+				t.Fatalf("validateTopicMapping() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// Before #479 a mapping key was an exact topic, so a stored "sensors/temp+x"
+// was legal and never matched: a published topic cannot contain a wildcard.
+// Such a row keeps starting and keeps ingesting; only the dead rule is left
+// out. Its targets are still checked, and a create or a topic_mapping update
+// still refuses the filter.
+func TestStoredMappingWithAnInvalidFilterKeepsWorking(t *testing.T) {
+	mapping := TopicMapping{
+		"sensors/temp+x": {Database: "olddb"},
+		"plant/#":        {Database: "plantdb"},
+	}
+	if err := validateTopicMapping(mapping, true); err == nil {
+		t.Fatal("strict validation accepted an invalid filter")
+	}
+	if err := validateTopicMapping(mapping, false); err != nil {
+		t.Fatalf("boot validation refused a dead filter: %v", err)
+	}
+	if err := validateTopicMapping(TopicMapping{"sensors/temp+x": {Database: "../x"}}, false); err == nil {
+		t.Fatal("boot validation accepted an unwritable database behind a dead filter")
+	}
+	dead := deadTopicFilters(mapping)
+	if len(dead) != 1 || dead[0].filter != "sensors/temp+x" {
+		t.Fatalf("deadTopicFilters = %+v, want only sensors/temp+x", dead)
+	}
+
+	s := NewSubscriber(&Subscription{ID: "s", Name: "s", Database: "iot", TopicMapping: mapping}, nil, nil, nil, zerolog.Nop())
+	defer s.cancel()
+	if s.topicMappingErr != nil {
+		t.Fatalf("NewSubscriber: %v", s.topicMappingErr)
+	}
+	if rule, _, ok := matchTopicMapping(s.topicMappingRules, "plant/a"); !ok || rule.Database != "plantdb" {
+		t.Fatalf("plant/a matched %v %+v, want plantdb", ok, rule)
+	}
+	if _, _, ok := matchTopicMapping(s.topicMappingRules, "sensors/temp+x"); ok {
+		t.Fatal("a dead filter was compiled")
+	}
+}
+
+func TestManagerUpdateOfAStoredInvalidFilter(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+	sub := &Subscription{
+		ID: "legacy-1", Name: "legacy", Broker: "tcp://localhost:1883", ClientID: "c",
+		Topics: []string{"sensors/#"}, QoS: 1, Database: "iot",
+		TopicMapping: TopicMapping{"sensors/temp+x": {Database: "olddb"}},
+	}
+	sub.SetDefaults()
+	if err := mgr.repo.Create(ctx, sub); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	name := "renamed"
+	if _, err := mgr.Update(ctx, sub.ID, &UpdateSubscriptionRequest{Name: &name}); err != nil {
+		t.Fatalf("an update that leaves topic_mapping alone was refused: %v", err)
+	}
+	same := TopicMapping{"sensors/temp+x": {Database: "olddb"}}
+	if _, err := mgr.Update(ctx, sub.ID, &UpdateSubscriptionRequest{TopicMapping: &same}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("an update that sets an invalid filter: err = %v, want ErrValidation", err)
+	}
+}
+
+// Unknown keys are refused, so a typo cannot leave a rule silently partial.
+func TestTopicMappingRefusesUnknownKeys(t *testing.T) {
+	for _, input := range []string{
+		`{"a/+":{"database":"d","tag_from_topic":[{"position":1,"tag_name":"x"}]}}`,
+		`{"a/+":{"tags_from_topic":[{"position":1,"tag_name":"x","tagname":"y"}]}}`,
+	} {
+		var mapping TopicMapping
+		if err := json.Unmarshal([]byte(input), &mapping); err == nil {
+			t.Errorf("unmarshal %s: accepted an unknown key", input)
+		}
+	}
+}
+
+func TestMapToRecordMeasurementOnlyRule(t *testing.T) {
+	subscriber := &Subscriber{logger: zerolog.Nop()}
+	decoded, err := subscriber.convertToRecords(map[string]interface{}{
+		"m":    "payload_metrics",
+		"tags": map[string]interface{}{"site": "plant-a"},
+		"v":    1.0,
+	}, TopicMappingRule{Measurement: "rule_metrics"}, nil)
+	if err != nil {
+		t.Fatalf("convert payload: %v", err)
+	}
+	record := decoded[0].(*models.Record)
+	if record.Measurement != "rule_metrics" || record.Tags["site"] != "plant-a" || record.Fields["v"] != 1.0 {
+		t.Fatalf("record = %+v, want rule measurement with payload tags and fields", record)
+	}
+}
+
+// A topic tag wins over a payload tag that differs from it only in case.
+// Stored names are case-insensitive and StripRecordNames keeps the first
+// spelling in byte order, so a payload "LINE" would otherwise drop the
+// configured "line" on every message.
+func TestTopicTagWinsOverACaseOnlyPayloadTag(t *testing.T) {
+	subscriber := &Subscriber{logger: zerolog.Nop()}
+	decoded, err := subscriber.convertToRecords(map[string]interface{}{
+		"tags": map[string]interface{}{"LINE": "payload-tag", "site": "a"},
+		"v":    1.0,
+	}, TopicMappingRule{TagsFromTopic: []TopicTagExtraction{{Position: 1, TagName: "line"}}}, []string{"factory", "line-3"})
+	if err != nil {
+		t.Fatalf("convert payload: %v", err)
+	}
+	record := decoded[0].(*models.Record)
+	if !reflect.DeepEqual(record.Tags, map[string]string{"line": "line-3", "site": "a"}) {
+		t.Fatalf("tags = %#v, want line=line-3 and site=a", record.Tags)
+	}
+	if drops := ingest.StripRecordNames(decoded, nil); len(drops) != 0 || record.Tags["line"] != "line-3" {
+		t.Fatalf("StripRecordNames dropped %+v; tags now %#v", drops, record.Tags)
+	}
+}
+
+// Topic tags must not create two columns that differ only in case. The
+// writer stores a field of exactly a tag's name as "<name>_value"; renaming a
+// case-variant field the same way here once let "Temp_value" and the writer's
+// "temp_value" both reach the file (#1342). Whatever survives StripRecordNames,
+// the names the writer then stores are pairwise distinct after folding.
+func TestTopicTagsLeaveNoCaseTwinColumns(t *testing.T) {
+	subscriber := &Subscriber{logger: zerolog.Nop()}
+	decoded, err := subscriber.convertToRecords(map[string]interface{}{
+		"temp": 1.0,
+		"Temp": 2.0,
+		"v":    3.0,
+	}, TopicMappingRule{TagsFromTopic: []TopicTagExtraction{{Position: 1, TagName: "temp"}}}, []string{"factory", "hot"})
+	if err != nil {
+		t.Fatalf("convert payload: %v", err)
+	}
+	ingest.StripRecordNames(decoded, nil)
+	record := decoded[0].(*models.Record)
+	stored := map[string]string{}
+	add := func(name string) {
+		folded := ingest.FoldColumnName(name)
+		if prev, dup := stored[folded]; dup {
+			t.Fatalf("columns %q and %q differ only in case: tags %#v fields %#v", prev, name, record.Tags, record.Fields)
+		}
+		stored[folded] = name
+	}
+	for name := range record.Tags {
+		add(name)
+	}
+	for name := range record.Fields {
+		if _, isTag := record.Tags[name]; isTag {
+			name += "_value" // the writer's rename (arrow_writer rowsToColumnar)
+		}
+		add(name)
 	}
 }
 
@@ -194,7 +350,6 @@ func TestMapToRecordAppliesTopicMeasurementAndTags(t *testing.T) {
 		TagsFromTopic: []TopicTagExtraction{
 			{Position: 1, TagName: "line"},
 			{Position: 2, TagName: "machine_id"},
-			{Position: 9, TagName: "missing"},
 		},
 	}})
 	if err != nil {
@@ -225,6 +380,30 @@ func TestMapToRecordAppliesTopicMeasurementAndTags(t *testing.T) {
 	if record.Tags["line"] != "line-7" || record.Tags["machine_id"] != "machine-3" || record.Tags["site"] != "plant-a" {
 		t.Errorf("tags = %#v, want topic values plus payload site", record.Tags)
 	}
+}
+
+// Under a trailing # a topic can be shorter than a position: that segment is
+// skipped and the row is still written.
+func TestMapToRecordSkipsASegmentAHashTopicLacks(t *testing.T) {
+	subscriber := &Subscriber{logger: zerolog.Nop()}
+	rules, err := compileTopicMapping(TopicMapping{"factory/#": {TagsFromTopic: []TopicTagExtraction{
+		{Position: 1, TagName: "line"}, {Position: 4, TagName: "missing"},
+	}}})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	rule, levels, ok := matchTopicMapping(rules, "factory/line-1")
+	if !ok {
+		t.Fatal("factory/line-1 did not match factory/#")
+	}
+	decoded, err := subscriber.convertToRecords(map[string]interface{}{"v": 1.0}, rule, levels)
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	record := decoded[0].(*models.Record)
+	if record.Tags["line"] != "line-1" {
+		t.Errorf("tags = %#v, want line=line-1", record.Tags)
+	}
 	if _, ok := record.Tags["missing"]; ok {
 		t.Errorf("out-of-range extraction added a tag: %#v", record.Tags)
 	}
@@ -243,5 +422,26 @@ func TestMapToRecordKeepsPayloadValuesWhenRuleOmitsFields(t *testing.T) {
 	record := decoded[0].(*models.Record)
 	if record.Measurement != "payload_metrics" || record.Tags["site"] != "plant-a" {
 		t.Fatalf("payload values changed without a measurement or tag rule: %#v", record)
+	}
+}
+
+// The boot path itself: startSubscriber must get past target validation for a
+// stored row whose only problem is a dead filter. The broker is unreachable,
+// so Start fails on connect — the point is that it is reached.
+func TestStartSubscriberAcceptsAStoredDeadFilter(t *testing.T) {
+	mgr := newTestManager(t)
+	sub := &Subscription{
+		ID: "legacy-2", Name: "legacy", Broker: "tcp://127.0.0.1:1", ClientID: "c",
+		Topics: []string{"sensors/#"}, QoS: 1, Database: "iot",
+		ConnectTimeoutSeconds: 1,
+		TopicMapping:          TopicMapping{"sensors/temp+x": {Database: "olddb"}},
+	}
+	sub.SetDefaults()
+	err := mgr.startSubscriber(sub)
+	if err != nil && strings.Contains(err.Error(), "targets cannot be written") {
+		t.Fatalf("startSubscriber refused a dead filter: %v", err)
+	}
+	if err == nil {
+		_ = mgr.StopSubscription(context.Background(), sub.ID)
 	}
 }

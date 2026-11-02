@@ -677,15 +677,6 @@ func (s *Subscriber) mapToRecordWithTopicMapping(m map[string]interface{}, rule 
 			}
 		}
 	}
-	// Topic-derived tags override payload tags with the same name. Positions
-	// refer to the full topic path, starting at zero; an unavailable segment
-	// (possible with a trailing # filter) is skipped without dropping the row.
-	for _, extraction := range rule.TagsFromTopic {
-		if extraction.Position < len(topicLevels) {
-			record.Tags[extraction.TagName] = topicLevels[extraction.Position]
-		}
-	}
-
 	// Extract fields (everything else)
 	if fields, ok := m["fields"].(map[string]interface{}); ok {
 		record.Fields = fields
@@ -698,7 +689,39 @@ func (s *Subscriber) mapToRecordWithTopicMapping(m map[string]interface{}, rule 
 		}
 	}
 
+	applyTopicTags(record, rule, topicLevels)
 	return record, nil
+}
+
+// applyTopicTags writes a rule's tags_from_topic into record. Positions refer
+// to the full topic path, starting at zero; an unavailable segment (possible
+// only under a trailing # filter) is skipped without dropping the row.
+//
+// A topic tag overrides a payload tag of the same name, including one that
+// differs only in case: stored column names are case-insensitive, and
+// StripRecordNames keeps the first spelling in byte order, so a payload tag
+// "Line" would otherwise drop the configured "line" on every message.
+//
+// Payload fields are left as they are. One of exactly the tag's name is stored
+// as "<name>_value" by the writer; one differing only in case is a case twin
+// that StripRecordNames resolves like any other (one of the two is dropped,
+// with a warning), as is a column already stored under another spelling.
+// Renaming such a field here was tried and let "Temp_value" and the writer's
+// "temp_value" both reach the file (#1342).
+func applyTopicTags(record *models.Record, rule TopicMappingRule, topicLevels []string) {
+	for _, extraction := range rule.TagsFromTopic {
+		if extraction.Position >= len(topicLevels) {
+			continue
+		}
+		name := extraction.TagName
+		folded := ingest.FoldColumnName(name)
+		for k := range record.Tags {
+			if k != name && ingest.FoldColumnName(k) == folded {
+				delete(record.Tags, k)
+			}
+		}
+		record.Tags[name] = topicLevels[extraction.Position]
+	}
 }
 
 // extractTimestamp extracts and normalizes timestamp to microseconds

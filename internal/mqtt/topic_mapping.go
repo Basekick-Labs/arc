@@ -40,10 +40,14 @@ func (r *TopicMappingRule) UnmarshalJSON(data []byte) error {
 	if value[0] != '{' {
 		return errors.New("topic mapping value must be a database string or rule object")
 	}
+	// Unknown keys are refused: a misspelt "tag_from_topic" would otherwise
+	// leave a database-only rule and every tag silently unwritten.
 	type ruleAlias TopicMappingRule
 	var decoded ruleAlias
-	if err := json.Unmarshal(value, &decoded); err != nil {
-		return err
+	dec := json.NewDecoder(bytes.NewReader(value))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&decoded); err != nil {
+		return fmt.Errorf("topic mapping rule: %w", err)
 	}
 	*r = TopicMappingRule(decoded)
 	return nil
@@ -72,8 +76,10 @@ func (e *TopicTagExtraction) UnmarshalJSON(data []byte) error {
 		Position *int    `json:"position"`
 		TagName  *string `json:"tag_name"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return fmt.Errorf("tags_from_topic: %w", err)
 	}
 	if raw.Position == nil {
 		return errors.New("tags_from_topic position is required")
@@ -100,18 +106,44 @@ type compiledTopicMapping struct {
 	wildcards []compiledTopicRule
 }
 
-func validateTopicMapping(mapping TopicMapping) error {
+// validateTopicMapping checks every rule's targets, and with strictFilters
+// every key as an MQTT topic filter too (see validateSubscriptionTargets).
+func validateTopicMapping(mapping TopicMapping, strictFilters bool) error {
 	filters := make([]string, 0, len(mapping))
 	for filter := range mapping {
 		filters = append(filters, filter)
 	}
 	sort.Strings(filters)
 	for _, filter := range filters {
-		if err := validateTopicMappingRule(filter, mapping[filter]); err != nil {
+		if strictFilters {
+			if err := validateTopicFilter(filter); err != nil {
+				return err
+			}
+		}
+		if err := validateTopicRule(filter, mapping[filter]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+type deadTopicFilter struct {
+	filter string
+	reason string
+}
+
+// deadTopicFilters lists the mapping keys that are not valid MQTT topic
+// filters. compileTopicMapping leaves them out: no published topic can match
+// one (#479).
+func deadTopicFilters(mapping TopicMapping) []deadTopicFilter {
+	var dead []deadTopicFilter
+	for filter := range mapping {
+		if err := validateTopicFilter(filter); err != nil {
+			dead = append(dead, deadTopicFilter{filter: filter, reason: err.Error()})
+		}
+	}
+	sort.Slice(dead, func(i, j int) bool { return dead[i].filter < dead[j].filter })
+	return dead
 }
 
 // compileTopicMapping validates and orders rules once when a subscriber starts.
@@ -129,7 +161,10 @@ func compileTopicMapping(mapping TopicMapping) (compiledTopicMapping, error) {
 	}
 	for _, filter := range filters {
 		rule := mapping[filter]
-		if err := validateTopicMappingRule(filter, rule); err != nil {
+		if validateTopicFilter(filter) != nil {
+			continue // dead: no topic can match it (deadTopicFilters)
+		}
+		if err := validateTopicRule(filter, rule); err != nil {
 			return compiledTopicMapping{}, err
 		}
 		if !strings.ContainsAny(filter, "+#") {
@@ -169,7 +204,7 @@ func compileTopicMapping(mapping TopicMapping) (compiledTopicMapping, error) {
 	return compiled, nil
 }
 
-func validateTopicMappingRule(filter string, rule TopicMappingRule) error {
+func validateTopicFilter(filter string) error {
 	if filter == "" {
 		return errors.New("topic mapping filter cannot be empty")
 	}
@@ -188,6 +223,10 @@ func validateTopicMappingRule(filter string, rule TopicMappingRule) error {
 			return fmt.Errorf("topic mapping filter %q has an invalid + wildcard", filter)
 		}
 	}
+	return nil
+}
+
+func validateTopicRule(filter string, rule TopicMappingRule) error {
 	if rule.Database == "" && rule.Measurement == "" && len(rule.TagsFromTopic) == 0 {
 		return fmt.Errorf("topic mapping filter %q must set database, measurement, or tags_from_topic", filter)
 	}
@@ -197,10 +236,22 @@ func validateTopicMappingRule(filter string, rule TopicMappingRule) error {
 	if rule.Measurement != "" && !isValidMeasurementSegment(rule.Measurement) {
 		return fmt.Errorf("topic mapping %q measurement %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens (at most 128 characters)", filter, rule.Measurement)
 	}
+	// A filter without a trailing # matches only topics with exactly its
+	// number of levels, so a position past them can never hold a value: a
+	// typo that would silently write no tag. Under a trailing # the topic may
+	// be longer, and a missing segment is skipped per message.
+	levels := strings.Split(filter, "/")
+	maxPosition := -1
+	if levels[len(levels)-1] != "#" {
+		maxPosition = len(levels) - 1
+	}
 	seenTagNames := make(map[string]string, len(rule.TagsFromTopic))
 	for _, extraction := range rule.TagsFromTopic {
 		if extraction.Position < 0 {
 			return fmt.Errorf("topic mapping %q has a negative tags_from_topic position", filter)
+		}
+		if maxPosition >= 0 && extraction.Position > maxPosition {
+			return fmt.Errorf("topic mapping %q tags_from_topic position %d is past the filter's last level (%d; positions start at 0)", filter, extraction.Position, maxPosition)
 		}
 		if extraction.TagName == "" {
 			return fmt.Errorf("topic mapping %q has an empty tags_from_topic tag_name", filter)
