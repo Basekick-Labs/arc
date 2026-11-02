@@ -96,6 +96,17 @@ func (d *MessagePackDecoder) DecodeWithDropsKnown(data []byte, known KnownColumn
 	return records, 1 + skipped.points, skipped.drops, nil
 }
 
+// appendDecoded appends an item's decoded records, spreading a nested batch's
+// as the top-level map case does: the writer takes records, not a list of
+// them (a nested batch appended whole was a 500), and the caller's record
+// count is in records.
+func appendDecoded(results []interface{}, result interface{}) []interface{} {
+	if list, ok := result.([]interface{}); ok {
+		return append(results, list...)
+	}
+	return append(results, result)
+}
+
 // LPDropItem is the reason for an item of a batch or a top-level array that
 // could not be decoded. The item is dropped whole and the others are written,
 // as a row the typed decoders drop is (#1434: these were skipped silently,
@@ -198,7 +209,7 @@ func (d *MessagePackDecoder) decodeGeneric(data []byte, skipped *itemDrops) (int
 					skipped.add(typedItem, err)
 					continue
 				}
-				results = append(results, result)
+				results = appendDecoded(results, result)
 			default:
 				skipped.add(item, nil)
 			}
@@ -243,7 +254,7 @@ func (d *MessagePackDecoder) decodeMapPayload(payload map[string]interface{}, ra
 					skipped.add(itemMap, err)
 					continue
 				}
-				results = append(results, result)
+				results = appendDecoded(results, result)
 			}
 			return results, nil
 		}

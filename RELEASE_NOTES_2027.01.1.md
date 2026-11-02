@@ -32,9 +32,11 @@ if everything had been written. It is now dropped the way any other point that
 cannot be written is: the other items are still written, and the request
 answers **400** `partial write: N points dropped: ... an item of the batch or
 array could not be decoded: <reason>; the other points were written`. Each
-dropped item counts as one point. A client that treated 204 as "all written"
+dropped item counts as one point, however many rows it held. A client that treated 204 as "all written"
 was silently losing those items; one that retries on 400 should not retry a
-partial write, since the rest is already stored.
+partial write, since the rest is already stored. A batch nested inside a
+batch or array, which answered 500 and stored nothing, is now written like a
+top-level one.
 
 ## Fix: a cluster node stalled for 15 seconds or more rejoins Raft ([#1431](https://github.com/Basekick-Labs/arc/issues/1431))
 

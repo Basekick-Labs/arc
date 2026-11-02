@@ -136,6 +136,8 @@ func TestMsgPackBatchItemThatCannotBeDecodedIsAPartialWrite(t *testing.T) {
 		{"array", []interface{}{good, ragged}, "partial write: 1 points dropped", true, map[string]int64{"cpu": 1}},
 		{"non-map item", []interface{}{good, "junk"}, "not a map (string)", true, map[string]int64{"cpu": 1}},
 		{"every item", map[string]interface{}{"batch": []interface{}{noFields, ragged}}, "partial write: 2 points dropped", false, map[string]int64{}},
+		{"non-map batch item", map[string]interface{}{"batch": []interface{}{good, 5}}, "partial write: 1 points dropped: 1: an item of the batch or array could not be decoded: not a map", true, map[string]int64{"cpu": 1}},
+		{"nested batch", []interface{}{map[string]interface{}{"batch": []interface{}{noFields, good}}, good}, "partial write: 1 points dropped", true, map[string]int64{"cpu": 2}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
