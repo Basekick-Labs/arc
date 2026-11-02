@@ -141,6 +141,17 @@ default_sort_keys = ""
 # use_dictionary = false
 # numeric_dictionary = false
 
+# Bulk imports (/api/v1/import/lp, csv, parquet) write in parallel up to
+# import_write_concurrency on this node. 0 (default) = auto: as many as fit
+# an eighth of the memory limit at one import allowance each (an eighth of the
+# memory limit, 64-512 MB), at most the CPUs Arc runs on, at least 1. Each
+# writing import may hold about one allowance plus its upload.
+# import_queue_timeout_ms: an import that waits this long for a slot is
+# refused with 503 and X-Arc-Ingest-Refused: import_queue, nothing written,
+# safe to retry. 0 = wait as long as the request lives.
+# import_write_concurrency = 0
+# import_queue_timeout_ms = 30000
+
 # -----------------------------------------------------------------------------
 # Compaction
 # -----------------------------------------------------------------------------
