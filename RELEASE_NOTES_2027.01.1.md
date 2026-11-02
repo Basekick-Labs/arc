@@ -38,8 +38,9 @@ What operators see in logs changes:
   A port scan, or a probe that sends fewer bytes than a handshake response, is
   therefore no longer visible at the default log level.
 
-A node whose Raft startup fails part-way now releases the Raft port instead of
-holding it until the process exits.
+A node whose Raft startup fails before the Raft instance is created (for example,
+an unopenable log store) now releases the Raft port instead of holding it
+until the process exits.
 
 No configuration change. Every node can be upgraded independently; the
 handshake on the wire is unchanged.
