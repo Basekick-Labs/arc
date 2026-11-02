@@ -2039,6 +2039,52 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A write that fails part-way says what was written ([#1437](https://github.com/Basekick-Labs/arc/issues/1437))
+
+A line-protocol or MessagePack request with several measurements is buffered
+one measurement at a time. If one failed after the earlier ones were buffered,
+the answer read as if nothing had been written. For a fence or a WAL entry that
+could not be made durable, that was a 503 with `Retry-After` and
+`X-Arc-Ingest-Fenced` or `X-Arc-Ingest-Refused`. For schema churn or a shutdown,
+it was a 503 "Write rejected". Otherwise it was a 500. A client that resent the
+request, as Telegraf and the InfluxDB clients do on any 5xx, wrote the buffered
+measurements twice. MQTT subscriptions resent a message refused with
+`wal_not_durable` the same way.
+
+- **A failure after part of the request was buffered is now a `500` that says
+  what was written.** The body has `rows_written`, `written_measurements` and
+  `stopped_at_measurement`, the fields an import that stops part-way already
+  answers with. Points left out for good (a field named `time`, a value that
+  does not fit its column, a measurement refused for its content) add
+  `points_dropped` and `dropped`. The answer has no `Retry-After` and no
+  `X-Arc-Ingest-*` header. The part of the request it stopped at, and every part
+  after it, was not buffered. With the WAL enabled, the part it stopped at may
+  still come back from the WAL at the next start.
+- **Why 500 and not a 4xx.** Telegraf and the InfluxDB clients drop a batch
+  answered `4xx` for good, which would lose the measurements that were not
+  written. They do still resend a `500`, which duplicates the written part.
+  Compaction collapses rows identical in every column, so timestamped lines
+  converge. Lines without a timestamp get a new server time when resent, so
+  their duplicates remain. A client that reads the body can resend only the
+  measurements not listed in `written_measurements`.
+- **MQTT:** a message stopped part-way is no longer resent whole. It is counted
+  in the failed messages and logged with what was written.
+- **A measurement refused for its content during the write** (a column changed
+  between string and binary since the request was checked, or a column name
+  that cannot be stored) is now dropped, and the other measurements are written.
+  The answer is the usual `400` `partial write: N points dropped: ... the other
+  points were written`. Before, the request stopped there with a `400` that read
+  as if nothing had been written.
+- **Unchanged:** a failure before anything was buffered keeps its answer, so a
+  `503` with `Retry-After` still means nothing was written. A request refused
+  up front (a fence, WAL disk pressure, a column type change caught before the
+  write) is also unchanged.
+
+The record path that deployments with decimal columns use now writes
+measurements in name order, as the default path already did. The
+`wal_not_durable` refusal text no longer says earlier parts of the request may
+already be stored: a refusal is now only answered when nothing was buffered.
+
 ### Failed flushes report rows without a WAL copy ([#1377](https://github.com/Basekick-Labs/arc/issues/1377))
 
 With `wal.enabled = false` (the default) a failed flush loses the rows it
