@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -330,4 +331,69 @@ func TestImportStoppedPartWayFlushesWhatItWrote(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, status, body)
 	require.EqualValues(t, 2, body["rows_written"], body)
 	require.Zero(t, ci.buf.BufferedBytes(), "the stopped pass left its rows buffered")
+}
+
+// addOnFirstWriteBackend: its first Write adds rows to the buffer (other
+// writers' rows arriving during the flush); every write succeeds.
+type addOnFirstWriteBackend struct {
+	storage.Backend
+	buf   *ingest.ArrowBuffer
+	add   func(buf *ingest.ArrowBuffer) error
+	calls atomic.Int32
+	paths []string
+}
+
+func (b *addOnFirstWriteBackend) Write(ctx context.Context, path string, data []byte) error {
+	if b.calls.Add(1) == 1 {
+		if err := b.add(b.buf); err != nil {
+			return err
+		}
+	}
+	b.paths = append(b.paths, path)
+	return b.Backend.Write(ctx, path, data)
+}
+
+// While an import waits for flushes it flushes its own measurements again,
+// not every buffer of its database: a streamed measurement written meanwhile
+// stays buffered, not cut into a file per second (#1429 review).
+func TestImportReflushLeavesOtherMeasurements(t *testing.T) {
+	setVar(t, &importGroupBudgetOverride, 0)
+	setVar(t, &importAllowanceOverride, 16<<10)
+	setVar(t, &importReflushEvery, 20*time.Millisecond)
+	setVar(t, &importFlushWait, 5*time.Second)
+	local, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	require.NoError(t, err)
+	backend := &addOnFirstWriteBackend{Backend: local, add: func(buf *ingest.ArrowBuffer) error {
+		n := 5000 // well over the allowance: the import must wait for them
+		ts, vs := make([]int64, n), make([]float64, n)
+		for i := range ts {
+			ts[i], vs[i] = 1700000100000000+int64(i), float64(i)
+		}
+		if err := buf.WriteTypedColumnarDirect(context.Background(), "d", "cpu", &ingest.TypedColumnBatch{Data: map[string]interface{}{"time": ts, "v": vs}}, n); err != nil {
+			return err
+		}
+		return buf.WriteTypedColumnarDirect(context.Background(), "d", "streamed", &ingest.TypedColumnBatch{Data: map[string]interface{}{
+			"time": []int64{1700000000000000}, "v": []float64{1},
+		}}, 1)
+	}}
+	buf := ingest.NewArrowBuffer(&config.IngestConfig{
+		MaxBufferSize: 1_000_000, MaxBufferAgeMS: 600000, Compression: "snappy",
+		FlushWorkers: 2, FlushQueueSize: 8, ShardCount: 1, DataPageVersion: "2.0", // one shard: the first flush lists its keys before the rows below arrive
+	}, backend, zerolog.Nop())
+	t.Cleanup(func() { buf.Close() })
+	backend.buf = buf
+	h := NewImportHandler(zerolog.Nop())
+	h.SetArrowBuffer(buf)
+	ci := &chunkedImport{app: importApp(t, h), buf: buf}
+
+	var lp strings.Builder
+	for i := 0; i < 2000; i++ {
+		lp.WriteString("cpu v=1 " + strconv.FormatInt(1700000000000000000+int64(i)*1e9, 10) + "\n")
+	}
+	status, body := ci.post(t, "/api/v1/import/lp?db=d", []byte(lp.String()))
+	require.Equal(t, http.StatusOK, status, body)
+	require.GreaterOrEqual(t, int(backend.calls.Load()), 2, "the import never waited for its re-flush")
+	for _, p := range backend.paths {
+		require.NotContains(t, p, "d/streamed/", "the re-flush flushed another measurement")
+	}
 }
