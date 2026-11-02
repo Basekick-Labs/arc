@@ -2003,6 +2003,31 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Failed flushes report rows without a WAL copy ([#1377](https://github.com/Basekick-Labs/arc/issues/1377))
+
+With `wal.enabled = false` (the default) a failed flush loses the rows it
+held: nothing else has a copy, and nothing retries it. Arc logged them as
+"data preserved in WAL for recovery". It now says what happened:
+
+- A failed flush logs `Flush failed; rows without a WAL copy were lost` with
+  `records_without_wal`, and adds them to the new counter
+  `arc_buffer_records_dropped_total` (also in `/api/v1/metrics` and the
+  metrics time series). With the WAL on, rows whose WAL append succeeded are
+  not counted, and the message says they are replayed by the next recovery
+  pass (`wal.recovery_interval_seconds`) or on restart; rows whose append
+  failed have no copy and are counted. A flush that fails after writing some
+  of its hours counts all of its rows without a copy, including those hours.
+- Shutdown does the same for rows it cannot write in its time budget: those
+  without a WAL copy are logged and counted as lost, not as "remain in the
+  WAL", and `arc_wal_records_preserved_total` counts only rows the WAL holds.
+- One failed flush logs one Error, not two.
+
+Alert on `increase(arc_buffer_records_dropped_total[5m]) > 0`. To keep rows
+across a failed flush, enable the WAL.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1379](https://github.com/Basekick-Labs/arc/pull/1379).
+
 ### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
 
 The execution-history endpoint now includes runs whose duration is still

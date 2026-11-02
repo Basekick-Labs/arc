@@ -566,7 +566,7 @@ func (d *MessagePackDecoder) normalizeTimestamps(columns map[string][]interface{
 }
 
 // normalizeTimestampColumns is the package-level implementation, shared with
-// the WAL-replay/replication path (WriteColumnarDirectNoWAL, #590): raw WAL
+// the WAL-replay path (WriteColumnarDirectReplay, #590): raw WAL
 // payloads are original client bytes that never went through the live decode
 // path, so replay must apply identical normalization. Idempotent for values
 // already in microseconds (multiplier 1).
