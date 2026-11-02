@@ -79,10 +79,11 @@ func TestWaitBufferedBelowNudges(t *testing.T) {
 
 	b.bufferBytesBuffered.Store(500)
 	var nudges atomic.Int64
-	nudge := func() {
+	nudge := func() error {
 		if nudges.Add(1) == 3 {
 			b.bufferBytesBuffered.Store(0)
 		}
+		return nil
 	}
 	start := time.Now()
 	if err := b.WaitBufferedBelow(context.Background(), fixed(100), 5*time.Second, nudge, 50*time.Millisecond); err != nil {
@@ -93,5 +94,24 @@ func TestWaitBufferedBelowNudges(t *testing.T) {
 	}
 	if el := time.Since(start); el < 140*time.Millisecond {
 		t.Fatalf("3 nudges 50 ms apart took %v: nudged on every poll", el)
+	}
+}
+
+// A nudge that fails ends the wait with its error, even though the failed
+// flush lowered the buffered bytes (#1429 review: a failed flush drops its
+// rows with the WAL off).
+func TestWaitBufferedBelowNudgeErrorEndsTheWait(t *testing.T) {
+	b := NewArrowBuffer(&config.IngestConfig{MaxBufferSize: 10, MaxBufferAgeMS: 600000, Compression: "snappy", FlushWorkers: 1, FlushQueueSize: 1, ShardCount: 1, DataPageVersion: "2.0"}, &mockStorageBackend{}, zerolog.Nop())
+	defer b.Close()
+	defer b.bufferBytesBuffered.Store(0)
+
+	b.bufferBytesBuffered.Store(500)
+	boom := errors.New("flush failed")
+	nudge := func() error {
+		b.bufferBytesBuffered.Store(0)
+		return boom
+	}
+	if err := b.WaitBufferedBelow(context.Background(), fixed(100), 5*time.Second, nudge, 20*time.Millisecond); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the nudge's error", err)
 	}
 }

@@ -44,3 +44,15 @@ func TestLoad_ImportSlotNegativesRefused(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_ImportWriteConcurrencyCapped(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("ARC_INGEST_IMPORT_WRITE_CONCURRENCY", "1025")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "import_write_concurrency") {
+		t.Fatalf("Load() with 1025: err = %v, want a refusal", err)
+	}
+	t.Setenv("ARC_INGEST_IMPORT_WRITE_CONCURRENCY", "1024")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() with 1024: %v", err)
+	}
+}

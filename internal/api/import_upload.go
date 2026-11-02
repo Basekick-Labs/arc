@@ -258,6 +258,7 @@ type importWriter struct {
 	// final flush runs without a slot but still counted (#1429).
 	slotHeld bool
 	tracked  bool
+	flushed  bool // finalFlush ran (or close flushed a stopped pass)
 }
 
 // importBufferedAllowance is how many bytes an import may have written and
@@ -401,7 +402,7 @@ func (w *importWriter) writeBatch(ctx context.Context, measurement string, batch
 		if err == nil || !errors.Is(err, ingest.ErrSchemaChurnExceeded) || attempt >= importChurnRetries {
 			return err
 		}
-		wait := time.Duration(rand.Int64N(int64(importChurnBackoff<<attempt)) + 1)
+		wait := time.Duration(rand.Int64N(int64(max(importChurnBackoff<<attempt, 1))) + 1)
 		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -413,11 +414,13 @@ func (w *importWriter) writeBatch(ctx context.Context, measurement string, batch
 }
 
 // releaseSlot gives the write slot back after the import's last write. The
-// pass stays counted in the shared limit until close: its rows are still
-// buffered until its final flush (#1429).
+// pass keeps its baseline in the shared limit until close, but no longer
+// adds its allowance: the next import may start, and its rows plus the ones
+// this pass is still flushing stay within the allowances of the passes
+// holding slots (#1429 review: N passes, not N plus those flushing).
 func (w *importWriter) releaseSlot() {
 	if w.slotHeld {
-		w.pacer.releaseSlot()
+		w.pacer.releaseSlot(w)
 		w.slotHeld = false
 	}
 }
@@ -426,6 +429,7 @@ func (w *importWriter) releaseSlot() {
 // buffers are flushed. Call after end.
 func (w *importWriter) finalFlush(ctx context.Context) error {
 	w.releaseSlot()
+	w.flushed = true
 	if importBeforeFinalFlushHook != nil {
 		importBeforeFinalFlushHook(w)
 	}
@@ -433,8 +437,16 @@ func (w *importWriter) finalFlush(ctx context.Context) error {
 }
 
 // close releases the write slot, if still held, and the pass's share of the
-// shared limit.
+// shared limit. A pass that stopped part-way flushes what it wrote first:
+// left buffered, those rows would sit outside every remaining pass's limit
+// until their age flush, possibly past the others' flush wait.
 func (w *importWriter) close() {
+	if !w.flushed && w.started() {
+		w.flushed = true
+		// The answer (a failure part-way) is already decided; the buffer logs
+		// a failed flush itself.
+		_ = w.buf.FlushMeasurements(context.Background(), w.database, w.order)
+	}
 	w.releaseSlot()
 	if w.tracked {
 		w.pacer.leave(w)
@@ -469,7 +481,11 @@ func (w *importWriter) pace(ctx context.Context) error {
 	if err := w.buf.FlushScope(ctx, w.database); err != nil {
 		return err
 	}
-	reflush := func() { _ = w.buf.FlushScope(ctx, w.database) } // a failed flush is logged by the buffer and keeps its rows
+	// Again while waiting, for the import's own buffers only: rows it wrote
+	// after the first flush. Every waiting pass flushes its own, so none waits
+	// on rows nobody flushes, and other writers' buffers are not cut into
+	// one-second files. A failed flush ends the wait with its error.
+	reflush := func() error { return w.buf.FlushMeasurements(ctx, w.database, w.order) }
 	return w.buf.WaitBufferedBelow(ctx, limit, w.maxWait, reflush, importReflushEvery)
 }
 

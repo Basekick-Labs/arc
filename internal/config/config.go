@@ -168,11 +168,12 @@ type IngestConfig struct {
 	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
 	// csv, parquet) write at once on this node (#1429). 0 = auto: as many
 	// as fit an eighth of the memory limit at one import allowance each,
-	// at most the CPUs Arc runs on, at least 1.
+	// at most the CPUs Arc runs on, at least 1. An explicit value (at most
+	// 1024) is used as is, without the memory calculation.
 	ImportWriteConcurrency int
 	// ImportQueueTimeoutMS is how long an import waits for a write slot
-	// before it is refused with 503 and nothing written (#1429). 0 = as long
-	// as the request lives.
+	// before it is refused with 503 and nothing written (#1429). 0 = until a
+	// slot frees: the server does not see a client that gives up.
 	ImportQueueTimeoutMS int
 }
 
@@ -1491,11 +1492,11 @@ func Load() (*Config, error) {
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
 	}
-	if cfg.Ingest.ImportWriteConcurrency < 0 {
-		return nil, fmt.Errorf("invalid ingest.import_write_concurrency value: %d (must be >= 0; 0 = auto)", cfg.Ingest.ImportWriteConcurrency)
+	if cfg.Ingest.ImportWriteConcurrency < 0 || cfg.Ingest.ImportWriteConcurrency > 1024 {
+		return nil, fmt.Errorf("invalid ingest.import_write_concurrency value: %d (must be 0-1024; 0 = auto)", cfg.Ingest.ImportWriteConcurrency)
 	}
 	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
-		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = as long as the request lives)", cfg.Ingest.ImportQueueTimeoutMS)
+		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
 	}
 	// A negative max_concurrent would reach make(chan struct{}, m.MaxConcurrent)
 	// in the compaction manager's cycle loop and panic the process at the first

@@ -3644,10 +3644,13 @@ Measured on a 14-core laptop, 64 MB line-protocol files, 16 in flight:
   lower), at least one: one on a 3 GiB writer, nine on a 36 GiB laptop, 46 on
   a 46-core, 320 GiB writer licensed for all its cores. The value is logged at
   startup ("Bulk import write slots configured"). Each writing import may hold
-  about one allowance plus its upload; set a lower value to bound memory more
-  tightly. `1` restores one import at a time.
-- New `ingest.import_queue_timeout_ms` (default `30000`; `0` = as long as the
-  request lives): an import that waited this long for a slot is refused with
+  about one allowance plus its upload, and each import that wakes from a wait
+  writes one batch before it paces again; set a lower value to bound memory
+  more tightly. An explicit value (1 to 1024) is used as is. `1` restores one
+  import writing at a time; the next one starts while the previous one is
+  still flushing, within the same allowance.
+- New `ingest.import_queue_timeout_ms` (default `30000`; `0` = until a slot
+  frees, since the server does not see a client that gives up): an import that waited this long for a slot is refused with
   `503`, `X-Arc-Ingest-Refused: import_queue` and `Retry-After`. Nothing of it
   was written, so it is safe to retry. Keep it well under the client's own
   timeout.
@@ -3655,12 +3658,17 @@ Measured on a 14-core laptop, 64 MB line-protocol files, 16 in flight:
   and the import still completes: treat such an attempt as possibly written
   before retrying it.
 - An import ends by flushing its own measurements' buffers, not every buffer
-  on the node, and it gives its slot to the next import before that flush.
+  on the node, and it gives its slot (and its allowance) to the next import
+  before that flush. An import that stops part-way flushes what it wrote
+  before it answers. While an import waits for flushes it flushes its own
+  measurements again every second; a flush that fails there stops it part-way
+  (`500`), as the first one did.
   The `200` contract is unchanged: the rows are in the buffer and the WAL
   (when enabled), files follow as their flushes finish.
 - A write refused because other writers of the same measurement keep
   changing its columns (`ErrSchemaChurnExceeded`) is tried again up to five
-  times inside the import before it fails. With imports running side by
+  times inside the import before it fails (not for line-protocol imports on
+  deployments with `ingest.decimal_columns`, which write records). With imports running side by
   side, two imports into one measurement whose columns change type can now
   meet more often; that still fails part-way, as before.
 
@@ -3698,9 +3706,9 @@ peaked at 2.2 GiB.
   buffers and waits; if the buffered rows stay above the limit for two
   minutes, it stops (a failure part-way, below).
 - Imports write in parallel, up to `ingest.import_write_concurrency` at once
-  on a node (#1429, below). Each writing import paces against one limit
-  shared by all of them: where the oldest of them started plus every one's
-  allowance. Every request body is held in memory while it waits for a slot.
+  on a node (#1429, above). Each writing import paces against one limit
+  shared by all of them: the lowest buffered level any of them started at,
+  plus the allowance of every import holding a slot. Every request body is held in memory while it waits for a slot.
   A forwarded import waiting for a slot on the writer still counts down
   `cluster.import_forward_timeout_ms` on the node that forwarded it.
 - A validation pass reads the whole file, chunk by chunk, before anything is

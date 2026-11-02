@@ -148,7 +148,8 @@ default_sort_keys = ""
 # writing import may hold about one allowance plus its upload.
 # import_queue_timeout_ms: an import that waits this long for a slot is
 # refused with 503 and X-Arc-Ingest-Refused: import_queue, nothing written,
-# safe to retry. 0 = wait as long as the request lives.
+# safe to retry. 0 = wait until a slot frees (the server does not see a client
+# that gives up). An explicit import_write_concurrency (1-1024) is used as is.
 # import_write_concurrency = 0
 # import_queue_timeout_ms = 30000
 

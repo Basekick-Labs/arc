@@ -33,8 +33,10 @@ var waitBufferedPoll = 10 * time.Millisecond
 // that moves as they start and finish, and a waiter holding the value it
 // started with would wait for a level the others no longer pace to (#1429).
 // While still above it, nudge (when not nil) runs every nudgeEvery: rows
-// written after the waiter's own flush need flushing too.
-func (b *ArrowBuffer) WaitBufferedBelow(ctx context.Context, limit func() int64, maxWait time.Duration, nudge func(), nudgeEvery time.Duration) error {
+// written after the waiter's own flush need flushing too. A nudge's error
+// ends the wait with it: a failed flush can drop the rows it took (with the
+// WAL off they are gone), which would otherwise read as the wait succeeding.
+func (b *ArrowBuffer) WaitBufferedBelow(ctx context.Context, limit func() int64, maxWait time.Duration, nudge func() error, nudgeEvery time.Duration) error {
 	if b.bufferBytesBuffered.Load() <= limit() {
 		return nil
 	}
@@ -57,7 +59,9 @@ func (b *ArrowBuffer) WaitBufferedBelow(ctx context.Context, limit func() int64,
 				return nil
 			}
 			if nudge != nil && nudgeEvery > 0 && time.Since(lastNudge) >= nudgeEvery {
-				nudge()
+				if err := nudge(); err != nil {
+					return err
+				}
 				lastNudge = time.Now()
 			}
 		}

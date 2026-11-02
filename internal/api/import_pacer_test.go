@@ -3,11 +3,16 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
+	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,8 +51,9 @@ func TestImportAutoConcurrency(t *testing.T) {
 }
 
 // One pass: its start plus its allowance, as before #1429. Several: the
-// lowest start plus every allowance, the same for all of them; a pass that
-// leaves takes its share and, if it was the oldest, its baseline.
+// lowest start plus the allowance of every pass holding a slot, the same for
+// all of them. A pass that gives its slot back keeps its baseline but not its
+// allowance until it leaves.
 func TestImportPacerSharedLimit(t *testing.T) {
 	p := newImportPacer(3, 0)
 	a, b, c := &importWriter{}, &importWriter{}, &importWriter{}
@@ -59,10 +65,11 @@ func TestImportPacerSharedLimit(t *testing.T) {
 	require.NoError(t, p.acquire(context.Background(), c, at(300), 30))
 	require.Equal(t, int64(100+10+20+30), p.limit())
 
-	p.releaseSlot()
+	p.releaseSlot(a) // a in its final flush
+	require.Equal(t, int64(100+20+30), p.limit())
 	p.leave(a)
 	require.Equal(t, int64(300+20+30), p.limit())
-	p.releaseSlot()
+	p.releaseSlot(c)
 	p.leave(c)
 	require.Equal(t, int64(500+20), p.limit())
 }
@@ -70,7 +77,8 @@ func TestImportPacerSharedLimit(t *testing.T) {
 func TestImportPacerSlots(t *testing.T) {
 	p := newImportPacer(2, 40*time.Millisecond)
 	zero := func() int64 { return 0 }
-	require.NoError(t, p.acquire(context.Background(), &importWriter{}, zero, 1))
+	first := &importWriter{}
+	require.NoError(t, p.acquire(context.Background(), first, zero, 1))
 	require.NoError(t, p.acquire(context.Background(), &importWriter{}, zero, 1))
 
 	start := time.Now()
@@ -83,12 +91,17 @@ func TestImportPacerSlots(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, p.acquire(ctx, &importWriter{}, zero, 1), context.Canceled)
 
-	// A freed slot is taken by the next waiter.
-	done := make(chan error, 1)
-	go func() { done <- newImportPacer(0, 0).acquire(context.Background(), &importWriter{}, zero, 1) }()
-	require.NoError(t, <-done, "a pacer asked for 0 slots still has one")
-	p.releaseSlot()
-	require.NoError(t, p.acquire(context.Background(), &importWriter{}, zero, 1))
+	require.NoError(t, newImportPacer(0, 0).acquire(context.Background(), &importWriter{}, zero, 1), "a pacer asked for 0 slots still has one")
+
+	// A freed slot is taken by the next import, even with a timeout too
+	// small to wait for anything.
+	p.releaseSlot(first)
+	require.NoError(t, newImportPacerWith(p, time.Nanosecond).acquire(context.Background(), &importWriter{}, zero, 1))
+}
+
+// newImportPacerWith is p with another queue timeout (same slots and passes).
+func newImportPacerWith(p *importPacer, timeout time.Duration) *importPacer {
+	return &importPacer{slots: p.slots, queueTimeout: timeout, active: p.active}
 }
 
 // No timeout: a waiter waits as long as its context, then gets its error,
@@ -163,6 +176,7 @@ func TestImportFinalFlushWithoutSlotButCounted(t *testing.T) {
 		_, counted := p.active[w]
 		p.mu.Unlock()
 		require.True(t, counted, "pass no longer counted before its rows are flushed")
+		require.Equal(t, p.active[w].baseline, p.limit(), "a pass in its final flush still adds its allowance")
 	})
 	for _, tc := range []struct {
 		path    string
@@ -244,4 +258,76 @@ func TestImportRetriesSchemaChurn(t *testing.T) {
 			require.Equal(t, importChurnRetries+1, calls)
 		})
 	}
+}
+
+// writeThenFailBackend: its first Write also adds rows to the buffer under
+// key db/measurement (another writer's rows arriving during the flush), and
+// every later Write fails.
+type writeThenFailBackend struct {
+	storage.Backend
+	buf             *ingest.ArrowBuffer
+	db, measurement string
+	calls           atomic.Int32
+}
+
+func (b *writeThenFailBackend) Write(ctx context.Context, path string, data []byte) error {
+	if b.calls.Add(1) == 1 {
+		batch := &ingest.TypedColumnBatch{Data: map[string]interface{}{
+			"time": []int64{1700000005000000, 1700000006000000},
+			"v":    []float64{5, 6},
+		}}
+		if err := b.buf.WriteTypedColumnarDirect(context.Background(), b.db, b.measurement, batch, 2); err != nil {
+			return err
+		}
+		return b.Backend.Write(ctx, path, data)
+	}
+	return errors.New("storage down")
+}
+
+// A flush that fails while an import waits for flushes ends the import as a
+// failure part-way (#1429 review). Before, the failed re-flush was ignored:
+// it dropped the rows it took (WAL off), the buffered bytes fell, the wait
+// ended, and the import answered 200.
+func TestImportWaitStopsOnAFailedReflush(t *testing.T) {
+	setVar(t, &importGroupBudgetOverride, 0)
+	setVar(t, &importAllowanceOverride, 1)
+	setVar(t, &importReflushEvery, 20*time.Millisecond)
+	setVar(t, &importFlushWait, 5*time.Second)
+	local, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	require.NoError(t, err)
+	backend := &writeThenFailBackend{Backend: local, db: "d", measurement: "cpu"}
+	buf := ingest.NewArrowBuffer(&config.IngestConfig{
+		MaxBufferSize: 1_000_000, MaxBufferAgeMS: 600000, Compression: "snappy",
+		FlushWorkers: 2, FlushQueueSize: 8, ShardCount: 2, DataPageVersion: "2.0",
+	}, backend, zerolog.Nop())
+	t.Cleanup(func() { buf.Close() })
+	backend.buf = buf
+	h := NewImportHandler(zerolog.Nop())
+	h.SetArrowBuffer(buf)
+	ci := &chunkedImport{app: importApp(t, h), buf: buf}
+
+	status, body := ci.post(t, "/api/v1/import/lp?db=d", []byte("cpu v=1 1700000000000000000\n"))
+	require.Equal(t, http.StatusInternalServerError, status, body)
+	require.NotNil(t, body["rows_written"], body)
+}
+
+// A pass that stops part-way flushes what it wrote before it leaves the
+// shared limit (#1429 review): left buffered, those rows sit outside every
+// other pass's limit until their age flush.
+func TestImportStoppedPartWayFlushesWhatItWrote(t *testing.T) {
+	_, _ = captureRefusals(t)
+	setVar(t, &csvChunkRows, 2)
+	ci := newChunkedImport(t, 1000)
+	var calls atomic.Int32
+	ci.buf.SetIngestGate(func() error {
+		if calls.Add(1) > 2 { // admission, then the first write
+			return fencedErr(t)
+		}
+		return nil
+	})
+	status, body := ci.post(t, "/api/v1/import/csv?db=d&measurement=m&time_format=epoch_s",
+		[]byte("time,v\n1700000000,1\n1700000001,2\n1700000002,3\n1700000003,4\n"))
+	require.Equal(t, http.StatusInternalServerError, status, body)
+	require.EqualValues(t, 2, body["rows_written"], body)
+	require.Zero(t, ci.buf.BufferedBytes(), "the stopped pass left its rows buffered")
 }

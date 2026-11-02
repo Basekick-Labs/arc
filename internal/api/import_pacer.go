@@ -14,20 +14,21 @@ import (
 // passes pace against (#1429). Until #1429 one pass wrote at a time, which
 // on a large writer capped bulk loads at one core's worth of work.
 //
-// Every active pass paces against the same limit: where the oldest active
-// pass started (the lowest BufferedBytes any of them saw at its start) plus
-// every active pass's allowance. With per-pass limits, the pass with the
+// Every active pass paces against the same limit: the lowest BufferedBytes
+// any of them saw at its start, plus the allowance of every pass holding a
+// slot. With per-pass limits, the pass with the
 // lowest one would wait on rows the others wrote and it cannot flush, while
 // they kept writing under theirs, and could run out its whole flush wait into
 // a failure part-way. With one pass the limit is the pre-#1429 one: its start
 // plus its allowance.
 //
 // A pass is counted from its slot until close, after its final flush: its
-// rows are buffered until then, though it gives its slot back before that
-// flush.
+// rows are buffered until then. It gives its slot back before that flush,
+// and with it its allowance, so N slots bound the rows to N allowances
+// however many passes are still flushing.
 type importPacer struct {
 	slots        chan struct{}
-	queueTimeout time.Duration // 0: wait as long as the request lives
+	queueTimeout time.Duration // 0: wait until a slot frees (or server shutdown)
 
 	mu     sync.Mutex
 	active map[*importWriter]importPass
@@ -49,7 +50,9 @@ func newImportPacer(slots int, queueTimeout time.Duration) *importPacer {
 }
 
 // importPacerCurrent is the node's pacer: one slot and no queue timeout (the
-// pre-#1429 behaviour) until ConfigureImports runs at startup.
+// pre-#1429 behaviour) until ConfigureImports runs at startup. Each waiting
+// pass reads its limit every 10 ms under mu, which stays cheap at the 1024
+// slots ingest.import_write_concurrency allows.
 var importPacerCurrent atomic.Pointer[importPacer]
 
 func init() { importPacerCurrent.Store(newImportPacer(1, 0)) }
@@ -82,9 +85,17 @@ func importAutoConcurrency(memoryLimit uint64, allowance int64, procs int) int {
 	return min(max(n, 1), max(procs, 1))
 }
 
-// acquire waits for a slot, for as long as ctx lives and at most the queue
-// timeout, then counts w as active from buffered() and allowance.
+// acquire takes a slot, waiting at most the queue timeout (and while ctx
+// lives: a fasthttp request context ends only at server shutdown, not when
+// the client gives up), then counts w as active from buffered() and
+// allowance.
 func (p *importPacer) acquire(ctx context.Context, w *importWriter, buffered func() int64, allowance int64) error {
+	select {
+	case p.slots <- struct{}{}: // a free slot wins over any timeout
+		p.track(w, buffered(), allowance)
+		return nil
+	default:
+	}
 	var timeout <-chan time.Time
 	if p.queueTimeout > 0 {
 		t := time.NewTimer(p.queueTimeout)
@@ -98,13 +109,26 @@ func (p *importPacer) acquire(ctx context.Context, w *importWriter, buffered fun
 	case <-timeout:
 		return ingest.ErrImportQueueTimeout
 	}
-	p.mu.Lock()
-	p.active[w] = importPass{baseline: buffered(), allowance: allowance}
-	p.mu.Unlock()
+	p.track(w, buffered(), allowance)
 	return nil
 }
 
-func (p *importPacer) releaseSlot() { <-p.slots }
+func (p *importPacer) track(w *importWriter, baseline, allowance int64) {
+	p.mu.Lock()
+	p.active[w] = importPass{baseline: baseline, allowance: allowance}
+	p.mu.Unlock()
+}
+
+// releaseSlot frees w's slot; w keeps its baseline, not its allowance.
+func (p *importPacer) releaseSlot(w *importWriter) {
+	p.mu.Lock()
+	if a, ok := p.active[w]; ok {
+		a.allowance = 0
+		p.active[w] = a
+	}
+	p.mu.Unlock()
+	<-p.slots
+}
 
 // leave stops counting w.
 func (p *importPacer) leave(w *importWriter) {
