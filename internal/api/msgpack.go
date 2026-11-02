@@ -506,35 +506,73 @@ func (h *MsgPackHandler) msgPackStats(c *fiber.Ctx) error {
 
 // msgPackSpec returns MessagePack protocol specification
 func (h *MsgPackHandler) msgPackSpec(c *fiber.Ctx) error {
-	spec := fiber.Map{
+	return c.JSON(msgPackSpecDocument())
+}
+
+// msgPackSpecDocument describes what writeMsgPack and the ingest decoder
+// accept. Every claim here is about code in this package or internal/ingest;
+// TestMsgPackSpecExamplesAreAccepted posts the examples back through the
+// handler, so an example the decoder stops accepting fails a test (#1434).
+func msgPackSpecDocument() fiber.Map {
+	return fiber.Map{
 		"version":      "2.0",
 		"protocol":     "MessagePack",
+		"method":       "POST",
 		"endpoint":     "/api/v1/write/msgpack",
-		"content_type": "application/msgpack",
-		"compression":  "gzip or zstd (optional, zstd recommended for best performance)",
+		"content_type": "application/msgpack (recommended; the server does not check Content-Type)",
+		"compression": fiber.Map{
+			"formats":   []string{"zstd (recommended)", "gzip", "none"},
+			"detection": "by the body's magic bytes; no Content-Encoding header is needed",
+			"limits":    "server.max_payload_size (default 1GB) bounds the request body (413) and the decompressed payload (400); zstd frames declaring a window over 32MB (--long, --ultra) are refused",
+		},
 		"authentication": fiber.Map{
-			"header": "x-api-key",
-			"note":   "Authentication not yet implemented",
+			"header":        "Authorization",
+			"scheme":        "Bearer <token>",
+			"also_accepted": []string{"Authorization: Token <token>", "Authorization: <token>", "x-api-key: <token>", "?p=<token> (deprecated: tokens in URLs reach access logs)"},
+			"permission":    "write on the target database; with RBAC, write on each measurement in the payload (403 otherwise)",
+			"note":          "required unless auth.enabled is false",
+		},
+		"database": fiber.Map{
+			"header":  "x-arc-database",
+			"default": "default",
+		},
+		"time": fiber.Map{
+			"units":   "detected from the magnitude of the first value: < 1e10 seconds, < 1e13 milliseconds, < 1e16 microseconds, otherwise nanoseconds; a column uses its first value's unit for every row",
+			"stored":  "microseconds",
+			"missing": "rows without a time get the server's receive time",
 		},
 		"format": fiber.Map{
 			"columnar (RECOMMENDED)": fiber.Map{
-				"m":       "measurement (string)",
-				"columns": "dict of column_name: [array of values]",
-				"note":    "25-35% faster than row format, zero-copy passthrough",
+				"m":        "measurement (string; an integer n becomes measurement_n)",
+				"columns":  "map of column_name: [values]; every column the same length; \"time\" is the timestamp column (optional)",
+				"tag_keys": "list of column names stored as tags (optional); columns not listed are fields",
+				"note":     "fastest path: field names are sent once per batch, not once per row",
 			},
 			"row (LEGACY)": fiber.Map{
-				"m":      "measurement (string or int)",
-				"t":      "timestamp (int64 milliseconds, seconds, or microseconds)",
-				"h":      "host (string or int, optional)",
-				"fields": "dict of field_name: value",
-				"tags":   "dict of tag_name: value (optional)",
+				"m":      "measurement (string; an integer n becomes measurement_n)",
+				"t":      "timestamp (integer; seconds, milliseconds, microseconds or nanoseconds, see time)",
+				"h":      "host tag (string, optional; an integer n becomes host_n)",
+				"fields": "map of field_name: value (required; a positional array under \"f\" becomes field_0, field_1, ...)",
+				"tags":   "map of tag_name: value (optional; non-string values are stored as strings)",
+				"note":   "a row with neither h nor a host tag is tagged host=unknown",
 			},
 			"batch": fiber.Map{
-				"batch": "array of measurements (can mix columnar and row)",
+				"batch": "array of columnar and/or row items in one payload; a top-level array of items is also accepted",
 			},
+			"values": "msgpack bin values are stored as binary (BLOB) columns",
+		},
+		"responses": fiber.Map{
+			"204": "all points written",
+			"400": "empty or undecodable body, bad compression, invalid database or measurement name, a column whose type conflicts with stored data, or \"partial write: N points dropped\" (the message says whether the other points were written)",
+			"401": "missing or invalid token",
+			"403": "token lacks write permission",
+			"413": "request body larger than server.max_payload_size",
+			"500": "unexpected server error",
+			"503": "temporarily refusing writes (shutdown, WAL disk pressure, schema churn, cluster write fence); retry",
 		},
 		"example_columnar": fiber.Map{
-			"m": "cpu",
+			"m":        "cpu",
+			"tag_keys": []string{"host", "region"},
 			"columns": fiber.Map{
 				"time":         []int64{1633024800000, 1633024801000, 1633024802000},
 				"host":         []string{"server01", "server01", "server01"},
@@ -558,18 +596,7 @@ func (h *MsgPackHandler) msgPackSpec(c *fiber.Ctx) error {
 				"datacenter": "aws-1a",
 			},
 		},
-		"performance": fiber.Map{
-			"expected_rps_columnar": "2.5M+ (columnar format, zero-copy)",
-			"expected_rps_row":      "2.1M (row format, with conversion)",
-			"columnar_advantage":    "25-35% faster (no flattening, no row→column conversion)",
-			"parsing_speed":         "10-15x faster than text parsing",
-			"serialization":         "Direct Arrow (2-3x faster than DataFrame)",
-			"payload_size":          "50-70% smaller than Line Protocol",
-			"wire_efficiency":       "Columnar sends field names once vs per-record",
-		},
 	}
-
-	return c.JSON(spec)
 }
 
 // formatBytes formats a byte count into a human-readable string (e.g., "1GB", "500MB")
