@@ -8,7 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -59,11 +59,12 @@ const (
 	// accepts; when every slot is busy the loop stops accepting and the kernel
 	// backlog absorbs the excess.
 	raftAuthMaxInflight = 1024
-	// raftAuthWarnInterval rate-limits the Warn logged when a peer fails
-	// authentication, so a probe stays visible without flooding the log.
+	// raftAuthWarnInterval rate-limits, per source host, the Warn logged when
+	// a peer is refused, so a probe stays visible without flooding the log.
 	raftAuthWarnInterval = 10 * time.Second
 	// raftAcceptBaseDelay/raftAcceptMaxDelay back off acceptLoop on a listener
-	// error other than close (e.g. EMFILE), mirroring net/http.Server.Serve.
+	// error other than close (e.g. EMFILE), the same 5ms-doubling-to-1s steps
+	// net/http.Server.Serve uses for temporary accept errors.
 	raftAcceptBaseDelay = 5 * time.Millisecond
 	raftAcceptMaxDelay  = 1 * time.Second
 )
@@ -100,10 +101,7 @@ type AuthenticatedStreamLayer struct {
 	ready     chan net.Conn
 	slots     chan struct{}
 
-	// lastAuthWarn is the UnixNano of the last authentication-failure Warn;
-	// suppressedAuthFailures counts the failures not logged since.
-	lastAuthWarn           atomic.Int64
-	suppressedAuthFailures atomic.Int64
+	authWarns authWarnLimiter
 }
 
 // NewAuthenticatedStreamLayer wraps inner with the shared-secret handshake.
@@ -130,7 +128,8 @@ func (a *AuthenticatedStreamLayer) WithLogger(logger zerolog.Logger) *Authentica
 var _ raft.StreamLayer = (*AuthenticatedStreamLayer)(nil)
 
 // Accept returns the next connection whose peer completed the handshake. A
-// connection that fails it is closed and logged here, never returned, so it
+// connection that fails it is closed and logged here (logHandshakeFailure),
+// never returned, so it
 // cannot trip hashicorp/raft's accept backoff (#1431). Accept returns
 // net.ErrClosed once the layer is closed.
 func (a *AuthenticatedStreamLayer) Accept() (net.Conn, error) {
@@ -210,24 +209,85 @@ func (a *AuthenticatedStreamLayer) authenticate(conn net.Conn) {
 	}
 }
 
-// logHandshakeFailure separates a peer that answered with the wrong MAC — the
-// security signal, logged at Warn — from a connection that died mid-handshake,
-// which is routine after a stall (its dialer gave up) and logged at Debug.
+// logHandshakeFailure logs a rejected connection. A peer that went away
+// mid-handshake (EOF, reset, deadline) is routine after a stall — its dialer
+// gave up — and is logged at Debug. Anything else is a peer that answered and
+// was refused: a wrong MAC (wrong cluster.shared_secret or cluster name), a TLS
+// client certificate that failed verification, or bytes that are not this
+// protocol. Those are logged at Warn, at most once per raftAuthWarnInterval
+// per source host, so one noisy source cannot hide another.
 func (a *AuthenticatedStreamLayer) logHandshakeFailure(conn net.Conn, err error) {
-	if !errors.Is(err, errRaftAuthClientMAC) {
-		a.logger.Debug().Err(err).Str("remote_addr", conn.RemoteAddr().String()).Msg("Raft peer connection dropped during authentication handshake")
+	remote := conn.RemoteAddr().String()
+	if isPeerGone(err) {
+		a.logger.Debug().Err(err).Str("remote_addr", remote).Msg("Raft peer connection dropped during authentication handshake")
 		return
 	}
-	now := time.Now().UnixNano()
-	last := a.lastAuthWarn.Load()
-	if now-last < int64(raftAuthWarnInterval) || !a.lastAuthWarn.CompareAndSwap(last, now) {
-		a.suppressedAuthFailures.Add(1)
+	host, _, splitErr := net.SplitHostPort(remote)
+	if splitErr != nil {
+		host = remote
+	}
+	suppressed, ok := a.authWarns.allow(host, time.Now())
+	if !ok {
 		return
 	}
 	a.logger.Warn().
-		Str("remote_addr", conn.RemoteAddr().String()).
-		Int64("suppressed_since_last_warning", a.suppressedAuthFailures.Swap(0)).
-		Msg("Rejected Raft connection: peer failed shared-secret authentication (wrong cluster.shared_secret or cluster name, or not an Arc node)")
+		Err(err).
+		Str("remote_addr", remote).
+		Int64("suppressed_since_last_warning", suppressed).
+		Msg("Rejected Raft connection: peer failed authentication (wrong cluster.shared_secret or cluster name, a rejected TLS client certificate, or not an Arc Raft peer)")
+}
+
+// isPeerGone reports whether a handshake failed because the peer hung up or
+// went silent, rather than because it answered and was refused.
+func isPeerGone(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// raftAuthWarnMaxSources bounds the per-source rate-limit table.
+const raftAuthWarnMaxSources = 256
+
+// authWarnLimiter rate-limits rejection warnings per source host. Times come
+// from time.Now and keep their monotonic reading, so a wall-clock step cannot
+// silence the warnings.
+type authWarnLimiter struct {
+	mu         sync.Mutex
+	last       map[string]time.Time
+	suppressed int64
+}
+
+// allow reports whether a warning for host may be logged at now, and if so how
+// many were suppressed (across all sources) since the previous one.
+func (l *authWarnLimiter) allow(host string, now time.Time) (int64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.last == nil {
+		l.last = make(map[string]time.Time)
+	}
+	if t, seen := l.last[host]; seen && now.Sub(t) < raftAuthWarnInterval {
+		l.suppressed++
+		return 0, false
+	}
+	if _, seen := l.last[host]; !seen && len(l.last) >= raftAuthWarnMaxSources {
+		for h, t := range l.last {
+			if now.Sub(t) >= raftAuthWarnInterval {
+				delete(l.last, h)
+			}
+		}
+		if len(l.last) >= raftAuthWarnMaxSources {
+			l.suppressed++
+			return 0, false
+		}
+	}
+	l.last[host] = now
+	n := l.suppressed
+	l.suppressed = 0
+	return n, true
 }
 
 // Dial dials an inner connection and runs the client side of the handshake.
@@ -251,10 +311,6 @@ func (a *AuthenticatedStreamLayer) Close() error {
 
 // Addr returns the inner listener address.
 func (a *AuthenticatedStreamLayer) Addr() net.Addr { return a.inner.Addr() }
-
-// errRaftAuthClientMAC marks a peer that completed the exchange with a MAC
-// that does not verify.
-var errRaftAuthClientMAC = errors.New("client failed authentication")
 
 // raftAuthMAC computes the handshake HMAC over (label, nonce, clusterName).
 // The label provides direction domain-separation; clusterName binds the MAC to
@@ -298,7 +354,7 @@ func (a *AuthenticatedStreamLayer) serverHandshake(conn net.Conn) error {
 
 	expected := a.raftAuthMAC(MsgTypeRaftAuth, nonceS)
 	if !hmac.Equal(expected, macClient) {
-		return errRaftAuthClientMAC
+		return fmt.Errorf("client failed authentication")
 	}
 
 	macServer := a.raftAuthMAC(MsgTypeRaftAuthResp, nonceC)

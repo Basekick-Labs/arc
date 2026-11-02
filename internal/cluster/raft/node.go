@@ -226,6 +226,25 @@ func (n *Node) Start() error {
 	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName).
 		WithLogger(n.logger.With().Str("subcomponent", "raft-auth").Logger())
 	n.transport = raft.NewNetworkTransport(authStream, 3, 10*time.Second, os.Stderr)
+	// Until NewRaft takes ownership of them, a failed Start must release the
+	// transport (its listener and accept goroutines) and the stores it opened,
+	// or the Raft port stays bound for the life of the process.
+	// Stores left from an earlier Start/Stop were closed by Stop; forget them
+	// so the cleanup below only closes what this call opened.
+	n.logStore, n.stableStore = nil, nil
+	raftCreated := false
+	defer func() {
+		if raftCreated {
+			return
+		}
+		n.transport.Close()
+		if n.logStore != nil {
+			n.logStore.Close()
+		}
+		if n.stableStore != nil {
+			n.stableStore.Close()
+		}
+	}()
 
 	// Create log store
 	logStorePath := filepath.Join(n.cfg.DataDir, "raft-log.db")
@@ -264,6 +283,7 @@ func (n *Node) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to create raft instance: %w", err)
 	}
+	raftCreated = true
 	if count := n.fsm.RejectedPathsCount(); count > 0 {
 		// Only fires for snapshot Restore rejections (synchronous
 		// inside NewRaft). Log-replay rejections happen on runFSM

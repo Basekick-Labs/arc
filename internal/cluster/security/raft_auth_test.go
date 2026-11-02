@@ -2,11 +2,15 @@ package security
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -63,8 +67,13 @@ func handshakePair(t *testing.T, serverLayer, clientLayer *AuthenticatedStreamLa
 		srvCh <- res{c, err}
 	}()
 	cliConn, cliErr := clientLayer.Dial("ignored", time.Second)
-	sr := <-srvCh
-	return sr.conn, sr.err, cliConn, cliErr
+	select {
+	case sr := <-srvCh:
+		return sr.conn, sr.err, cliConn, cliErr
+	case <-time.After(2 * time.Second):
+		t.Fatal("server Accept never returned the authenticated connection")
+		return nil, nil, nil, nil
+	}
 }
 
 // expectRejected dials serverLayer with clientLayer and asserts the server
@@ -164,7 +173,7 @@ func TestRaftAuth_WrongSecretClientRejected(t *testing.T) {
 	expectRejected(t, base, server, client)
 	// A wrong MAC is the security signal: Warn, with the peer's address.
 	waitForLog(t, logs, `"level":"warn"`)
-	waitForLog(t, logs, "failed shared-secret authentication")
+	waitForLog(t, logs, "peer failed authentication")
 }
 
 func TestRaftAuth_WrongSecretServerRejected(t *testing.T) {
@@ -181,7 +190,7 @@ func TestRaftAuth_WrongClusterNameRejected(t *testing.T) {
 	client := NewAuthenticatedStreamLayer(base, testSecret, "cluster-b")
 
 	expectRejected(t, base, server, client)
-	waitForLog(t, logs, "failed shared-secret authentication")
+	waitForLog(t, logs, "peer failed authentication")
 }
 
 func TestRaftAuth_TruncatedHandshakeRejected(t *testing.T) {
@@ -235,16 +244,92 @@ func TestRaftAuth_AuthFailureWarnIsRateLimited(t *testing.T) {
 			t.Fatal("wrong-secret client authenticated")
 		}
 	}
-	waitForLog(t, logs, "failed shared-secret authentication")
+	waitForLog(t, logs, "peer failed authentication")
 	deadline := time.Now().Add(2 * time.Second)
-	for server.suppressedAuthFailures.Load() != 4 {
+	for suppressedWarns(server) != 4 {
 		if time.Now().After(deadline) {
-			t.Fatalf("suppressed = %d, want 4", server.suppressedAuthFailures.Load())
+			t.Fatalf("suppressed = %d, want 4", suppressedWarns(server))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if n := strings.Count(logs.String(), "failed shared-secret authentication"); n != 1 {
+	if n := strings.Count(logs.String(), "peer failed authentication"); n != 1 {
 		t.Fatalf("logged %d auth-failure warnings within the interval, want 1", n)
+	}
+}
+
+func suppressedWarns(a *AuthenticatedStreamLayer) int64 {
+	a.authWarns.mu.Lock()
+	defer a.authWarns.mu.Unlock()
+	return a.authWarns.suppressed
+}
+
+func TestRaftAuth_WarnLimiterIsPerSource(t *testing.T) {
+	var l authWarnLimiter
+	t0 := time.Now()
+	if _, ok := l.allow("10.0.0.1", t0); !ok {
+		t.Fatal("first warning from a source suppressed")
+	}
+	if _, ok := l.allow("10.0.0.1", t0.Add(time.Second)); ok {
+		t.Fatal("second warning from the same source within the interval logged")
+	}
+	// A noisy source must not hide a different one.
+	if n, ok := l.allow("10.0.0.2", t0.Add(2*time.Second)); !ok || n != 1 {
+		t.Fatalf("other source: logged=%v suppressed=%d, want true, 1", ok, n)
+	}
+	if _, ok := l.allow("10.0.0.1", t0.Add(raftAuthWarnInterval)); !ok {
+		t.Fatal("source not logged again after the interval")
+	}
+	// A full table drops expired entries before refusing a new source.
+	for i := 0; i < raftAuthWarnMaxSources; i++ {
+		l.allow(fmt.Sprintf("192.0.2.%d:%d", i/250, i), t0)
+	}
+	if _, ok := l.allow("198.51.100.1", t0.Add(time.Second)); ok && len(l.last) > raftAuthWarnMaxSources {
+		t.Fatalf("table grew past its bound: %d", len(l.last))
+	}
+	if _, ok := l.allow("198.51.100.2", t0.Add(2*raftAuthWarnInterval)); !ok {
+		t.Fatal("new source refused although every table entry had expired")
+	}
+	if len(l.last) > raftAuthWarnMaxSources {
+		t.Fatalf("table grew past its bound: %d", len(l.last))
+	}
+}
+
+// fakeAddrConn reports a chosen remote address.
+type fakeAddrConn struct {
+	net.Conn
+	remote string
+}
+
+func (c fakeAddrConn) RemoteAddr() net.Addr { return fakeAddr(c.remote) }
+
+type fakeAddr string
+
+func (a fakeAddr) Network() string { return "tcp" }
+func (a fakeAddr) String() string  { return string(a) }
+
+func TestRaftAuth_RefusalsWarnHangupsDebug(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		warn bool
+	}{
+		{"eof", fmt.Errorf("read client mac: %w", io.EOF), false},
+		{"unexpected eof", fmt.Errorf("read client mac: %w", io.ErrUnexpectedEOF), false},
+		{"reset", fmt.Errorf("write server nonce: %w", syscall.ECONNRESET), false},
+		{"timeout", fmt.Errorf("read client mac: %w", os.ErrDeadlineExceeded), false},
+		{"wrong mac", errors.New("client failed authentication"), true},
+		{"tls client cert", fmt.Errorf("write server nonce: %w", errors.New("tls: client didn't provide a certificate")), true},
+		{"not tls", fmt.Errorf("write server nonce: %w", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}), true},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			layer, logs := newLoggedLayer(newPipeStreamLayer(), testSecret, testCluster)
+			layer.logHandshakeFailure(fakeAddrConn{remote: fmt.Sprintf("10.1.0.%d:9200", i)}, tc.err)
+			got := strings.Contains(logs.String(), `"level":"warn"`)
+			if got != tc.warn {
+				t.Fatalf("warn=%v, want %v; log: %s", got, tc.warn, logs.String())
+			}
+		})
 	}
 }
 
