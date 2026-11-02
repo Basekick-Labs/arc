@@ -223,7 +223,8 @@ func (n *Node) Start() error {
 		}
 		baseStream = stream
 	}
-	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName)
+	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName).
+		WithLogger(n.logger.With().Str("subcomponent", "raft-auth").Logger())
 	n.transport = raft.NewNetworkTransport(authStream, 3, 10*time.Second, os.Stderr)
 
 	// Create log store
