@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"mime"
 	"mime/multipart"
 	"strings"
@@ -245,14 +246,19 @@ func forEachLineChunk(r io.Reader, target int, fn func(chunk []byte) error) erro
 // keeps what it wrote, for the answer to a failure part-way.
 type importWriter struct {
 	buf      *ingest.ArrowBuffer
+	pacer    *importPacer
 	database string
-	limit    int64
 	maxWait  time.Duration
 	rows     int64
 	measRows map[string]int64
 	order    []string
-	release  func()
 	grouper  *ingest.HourGrouper
+	// slotHeld and tracked: the write slot and the pass's share of the
+	// shared limit are released separately (releaseSlot, close), so the
+	// final flush runs without a slot but still counted (#1429).
+	slotHeld bool
+	tracked  bool
+	flushed  bool // finalFlush ran (or close flushed a stopped pass)
 }
 
 // importBufferedAllowance is how many bytes an import may have written and
@@ -271,6 +277,11 @@ func importBufferedAllowance(buf *ingest.ArrowBuffer) int64 {
 // importFlushWait bounds one wait for flushes between chunks.
 var importFlushWait = 2 * time.Minute
 
+// importReflushEvery is how often a write pass still waiting for flushes
+// flushes its database's buffers again: rows other passes wrote after its
+// first flush count against the same limit (#1429). A var for tests.
+var importReflushEvery = time.Second
+
 // importAllowanceOverride replaces importBufferedAllowance when > 0. Tests.
 var importAllowanceOverride int64
 
@@ -287,20 +298,27 @@ var importGroupCells = 1_000_000
 // makes. Tests.
 var importWriteHook func(rows int64)
 
-// importWriteGate lets one import write at a time on this node; validation
-// passes run concurrently. Concurrent write passes would each pace against
-// a buffer level the others raise: their allowances would add up, and one
-// could wait out its whole flush wait behind another.
-var importWriteGate = make(chan struct{}, 1)
+// importBeforeFinalFlushHook, when set, runs after an import's last write and
+// before its final flush. Tests.
+var importBeforeFinalFlushHook func(w *importWriter)
 
-// newImportWriter waits for this node's import write gate (as long as ctx
-// lives) and starts the pacing for an import into database. Call close.
+// importChurnRetries and importChurnBackoff: a grouped write refused with
+// ErrSchemaChurnExceeded (another writer of the same measurement kept
+// changing its columns) is tried again this many times, after a jittered
+// wait of up to backoff << attempt. The refusal comes before the batch
+// reaches the buffer, so a retry cannot duplicate it there (#1429).
+var (
+	importChurnRetries = 5
+	importChurnBackoff = 10 * time.Millisecond
+)
+
+// importWriteDirect is the buffer write of a grouped batch. A var for tests.
+var importWriteDirect = (*ingest.ArrowBuffer).WriteTypedColumnarDirect
+
+// newImportWriter waits for one of this node's import write slots (as long as
+// ctx lives, and at most the queue timeout: ingest.ErrImportQueueTimeout) and
+// starts the pacing for an import into database. Call close.
 func newImportWriter(ctx context.Context, buf *ingest.ArrowBuffer, database string) (*importWriter, error) {
-	select {
-	case importWriteGate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 	allowance := importBufferedAllowance(buf)
 	if importAllowanceOverride > 0 {
 		allowance = importAllowanceOverride
@@ -311,15 +329,19 @@ func newImportWriter(ctx context.Context, buf *ingest.ArrowBuffer, database stri
 	if importGroupBudgetOverride >= 0 {
 		budget = importGroupBudgetOverride
 	}
-	return &importWriter{
+	w := &importWriter{
 		buf:      buf,
+		pacer:    currentImportPacer(),
 		database: database,
-		limit:    buf.BufferedBytes() + max(allowance-budget, 1),
 		maxWait:  importFlushWait,
 		measRows: map[string]int64{},
-		release:  func() { <-importWriteGate },
 		grouper:  ingest.NewHourGrouper(budget),
-	}, nil
+	}
+	if err := w.pacer.acquire(ctx, w, buf.BufferedBytes, max(allowance-budget, 1)); err != nil {
+		return nil, err
+	}
+	w.slotHeld, w.tracked = true, true
+	return w, nil
 }
 
 // add takes a parsed batch of measurement. The batches are held, grouped by
@@ -337,7 +359,7 @@ func (w *importWriter) add(ctx context.Context, measurement string, batch *inges
 // paced to the flushes.
 func (w *importWriter) drain(ctx context.Context) error {
 	return w.grouper.Drain(importGroupCells, func(measurement string, batch *ingest.TypedColumnBatch, rows int) error {
-		if err := w.buf.WriteTypedColumnarDirect(ctx, w.database, measurement, batch, rows); err != nil {
+		if err := w.writeBatch(ctx, measurement, batch, rows); err != nil {
 			if w.started() {
 				return w.partial(err, measurement)
 			}
@@ -364,7 +386,7 @@ func importWriteError(err error, message string) error {
 }
 
 // end writes what the grouper still holds. Call after the last add, before
-// the final flush, with the write gate still held.
+// the final flush, with the write slot still held.
 func (w *importWriter) end(ctx context.Context) error {
 	if w.grouper.Empty() {
 		return nil
@@ -372,11 +394,63 @@ func (w *importWriter) end(ctx context.Context) error {
 	return w.drain(ctx)
 }
 
-// close releases the write gate.
+// writeBatch writes one grouped batch, trying it again while it is refused
+// for schema churn (see importChurnRetries).
+func (w *importWriter) writeBatch(ctx context.Context, measurement string, batch *ingest.TypedColumnBatch, rows int) error {
+	for attempt := 0; ; attempt++ {
+		err := importWriteDirect(w.buf, ctx, w.database, measurement, batch, rows)
+		if err == nil || !errors.Is(err, ingest.ErrSchemaChurnExceeded) || attempt >= importChurnRetries {
+			return err
+		}
+		wait := time.Duration(rand.Int64N(int64(max(importChurnBackoff<<attempt, 1))) + 1)
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return err
+		case <-t.C:
+		}
+	}
+}
+
+// releaseSlot gives the write slot back after the import's last write. The
+// pass keeps its baseline in the shared limit until close, but no longer
+// adds its allowance: the next import may start, and its rows plus the ones
+// this pass is still flushing stay within the allowances of the passes
+// holding slots (#1429 review: N passes, not N plus those flushing).
+func (w *importWriter) releaseSlot() {
+	if w.slotHeld {
+		w.pacer.releaseSlot(w)
+		w.slotHeld = false
+	}
+}
+
+// finalFlush ends a write pass: the slot goes back, then the import's own
+// buffers are flushed. Call after end.
+func (w *importWriter) finalFlush(ctx context.Context) error {
+	w.releaseSlot()
+	w.flushed = true
+	if importBeforeFinalFlushHook != nil {
+		importBeforeFinalFlushHook(w)
+	}
+	return w.buf.FlushMeasurements(ctx, w.database, w.order)
+}
+
+// close releases the write slot, if still held, and the pass's share of the
+// shared limit. A pass that stopped part-way flushes what it wrote first:
+// left buffered, those rows would sit outside every remaining pass's limit
+// until their age flush, possibly past the others' flush wait.
 func (w *importWriter) close() {
-	if w.release != nil {
-		w.release()
-		w.release = nil
+	if !w.flushed && w.started() {
+		w.flushed = true
+		// The answer (a failure part-way) is already decided; the buffer logs
+		// a failed flush itself.
+		_ = w.buf.FlushMeasurements(context.Background(), w.database, w.order)
+	}
+	w.releaseSlot()
+	if w.tracked {
+		w.pacer.leave(w)
+		w.tracked = false
 	}
 }
 
@@ -395,14 +469,24 @@ func (w *importWriter) wrote(measurement string, rows int64) {
 // pace waits until the import's unflushed rows are back under its allowance.
 // Over it, it first flushes what the database's buffers hold: rows below the
 // buffer's size threshold would otherwise wait for its age threshold.
+//
+// Every write pass on the node paces against one shared limit (importPacer):
+// a pass waiting on a lower limit than the others would wait on rows it
+// cannot flush while they keep writing (#1429).
 func (w *importWriter) pace(ctx context.Context) error {
-	if w.buf.BufferedBytes() <= w.limit {
+	limit := func() int64 { return w.pacer.limit() }
+	if w.buf.BufferedBytes() <= limit() {
 		return nil
 	}
 	if err := w.buf.FlushScope(ctx, w.database); err != nil {
 		return err
 	}
-	return w.buf.WaitBufferedBelow(ctx, w.limit, w.maxWait)
+	// Again while waiting, for the import's own buffers only: rows it wrote
+	// after the first flush. Every waiting pass flushes its own, so none waits
+	// on rows nobody flushes, and other writers' buffers are not cut into
+	// one-second files. A failed flush ends the wait with its error.
+	reflush := func() error { return w.buf.FlushMeasurements(ctx, w.database, w.order) }
+	return w.buf.WaitBufferedBelow(ctx, limit, w.maxWait, reflush, importReflushEvery)
 }
 
 // finish turns an error of the write pass into a failure part-way once a

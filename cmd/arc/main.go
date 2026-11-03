@@ -3055,6 +3055,11 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke registry; refusing to start")
 		}
+		// Spoke IDs differing only in case or Unicode normalization are one
+		// directory only where the storage folds names (#740): a local root on
+		// macOS APFS or Windows. Object stores and Linux filesystems compare
+		// names byte for byte, and an existing pair keeps syncing there.
+		spokeRegistry.SetNameFolding(storageFoldsNames(storageBackend, logger.Get("edgesync")))
 
 		// Receipt marker shared by hub compaction (#619) and tiering's
 		// hot-file-removal hook (#687). Group by first path segment and
@@ -3341,7 +3346,21 @@ func main() {
 			syncLogger.Warn().
 				Str("spoke_id", id).
 				Err(reason).
-				Msg("Registered spoke ID is no longer accepted; this spoke can no longer sync and must be re-registered under a valid ID")
+				Msg("Registered spoke ID is invalid or conflicts with another ID; this spoke cannot sync until it is re-registered with a distinct, filesystem-safe ID")
+		}
+		{
+			colCtx, cancelCol := context.WithTimeout(context.Background(), 10*time.Second)
+			colliding, colErr := spokeRegistry.CollidingStoredIDs(colCtx)
+			cancelCol()
+			if colErr != nil {
+				syncLogger.Warn().Err(colErr).Msg("Could not check registered spoke IDs for case or Unicode collisions")
+			}
+			for id, others := range colliding {
+				syncLogger.Warn().
+					Str("spoke_id", id).
+					Strs("colliding_with", others).
+					Msg("Registered spoke ID differs from another only in case or Unicode normalization; both keep syncing on this storage, but on a volume that folds that difference (macOS, Windows) they would share one directory. Re-register one under a distinct ID")
+			}
 		}
 
 		if spokeCount == 0 {
@@ -3693,6 +3712,15 @@ func main() {
 	// staging — see NewDeleteHandler below.)
 	importHandler := api.NewImportHandler(logger.Get("import"))
 	importHandler.SetArrowBuffer(arrowBuffer)
+	// Import write slots (#1429): set before the import routes serve, after
+	// the licence pinned GOMAXPROCS (the auto value reads it).
+	importSlots := api.ConfigureImports(cfg.Ingest.ImportWriteConcurrency,
+		time.Duration(cfg.Ingest.ImportQueueTimeoutMS)*time.Millisecond, arrowBuffer)
+	log.Info().
+		Int("import_write_concurrency", importSlots).
+		Bool("auto", cfg.Ingest.ImportWriteConcurrency == 0).
+		Int("import_queue_timeout_ms", cfg.Ingest.ImportQueueTimeoutMS).
+		Msg("Bulk import write slots configured")
 	if authManager != nil && rbacManager != nil {
 		importHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
@@ -5468,6 +5496,28 @@ func receivedNamespaces(registry *edgesync.Registry) func(ctx context.Context) (
 
 // createWALRecoveryCallback creates a reusable WAL recovery callback function.
 // This callback replays recovered WAL records through the ArrowBuffer for re-ingestion.
+// storageFoldsNames reports which folds storage applies to names, letter case
+// and Unicode normalization, which decides which existing edge-sync spoke IDs
+// that collide are refused (#740). Only a local backend applies any; when its
+// probe fails the answer is both, so a collision that may be real is refused
+// rather than allowed.
+func storageFoldsNames(backend storage.Backend, log zerolog.Logger) edgesync.NameFolds {
+	if backend.Type() != "local" {
+		return edgesync.NameFolds{} // object stores compare keys byte for byte
+	}
+	local, ok := backend.(interface{ GetBasePath() string })
+	if !ok {
+		// A local backend whose root cannot be probed: assume the worst.
+		log.Warn().Msg("Local storage does not expose its root, so name folding cannot be probed; treating it as folding both")
+		return edgesync.AllNameFolds
+	}
+	folds, err := edgesync.ProbeNameFolding(local.GetBasePath())
+	if err != nil {
+		log.Warn().Err(err).Msg("Could not tell whether local storage folds name case or Unicode normalization; treating it as folding both, so spoke IDs that collide that way are refused for sync")
+	}
+	return folds
+}
+
 func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.RecoveryCallback {
 	return func(ctx context.Context, records []map[string]interface{}) error {
 		if len(records) == 0 {
@@ -5489,7 +5539,10 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 				columns[key] = []interface{}{value}
 			}
 
-			if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+			// Replay, not NoWAL: these rows are still in the WAL file (recovery
+			// keeps it until the barrier flush succeeds), so a failed flush must
+			// not report them lost (#1377). No identity: the entry is untracked.
+			if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, ""); err != nil {
 				walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay WAL record")
 				return err
 			}

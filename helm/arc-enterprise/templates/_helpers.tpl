@@ -431,6 +431,8 @@ Storage env vars — depends on storage.mode.
   value: "true"
 - name: ARC_CLUSTER_REPLICATION_PULL_WORKERS
   value: {{ .Values.cluster.replication.pullWorkers | quote }}
+- name: ARC_CLUSTER_REPLICATION_PULL_BYTES_PER_SECOND
+  value: {{ .Values.cluster.replication.pullBytesPerSecond | default 0 | int64 | quote }}
 - name: ARC_CLUSTER_REPLICATION_FETCH_TIMEOUT_MS
   value: {{ .Values.cluster.replication.fetchTimeoutMs | quote }}
 - name: ARC_CLUSTER_REPLICATION_SERVE_TIMEOUT_MS

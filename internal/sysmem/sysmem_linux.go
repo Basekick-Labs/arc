@@ -108,6 +108,16 @@ func cgroupV2Limit(physical uint64) (uint64, bool) {
 	return 0, false
 }
 
+// physical reports host memory. Limit falls back to the same reading when no
+// cgroup limit applies, so Limit succeeds whenever this does; telemetry's
+// "which reports are fixed" query relies on that (TestPhysicalImpliesLimit).
+func physical() (uint64, Source, bool) {
+	if v, ok := hostMemory(); ok {
+		return v, SourceMemInfo, true
+	}
+	return 0, SourceUnknown, false
+}
+
 // hostMemory reads MemTotal from /proc/meminfo.
 func hostMemory() (uint64, bool) {
 	contents, ok := readFileLimited(rootFS, procMemInfo)
