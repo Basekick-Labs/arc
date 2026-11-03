@@ -736,14 +736,27 @@ func (g *flushGroup) failed() {
 		return
 	}
 	var gone []CoveragePiece
+	lostAfterEnqueue := false
 	for _, p := range g.pieces {
-		if !p.replayable || (p.Instance == g.cs.instance && g.cs.wal.CoverageLost(g.key, p.CSeq)) {
+		if !p.replayable {
 			gone = append(gone, p)
+		} else if p.Instance == g.cs.instance && g.cs.wal.CoverageLost(g.key, p.CSeq) {
+			gone = append(gone, p)
+			lostAfterEnqueue = true
 		}
 	}
 	if len(gone) > 0 {
 		metrics.Get().IncWALCoverageLost(int64(len(gone)))
-		g.b.logger.Error().Str("buffer_key", g.key).Int("batches", len(gone)).
+		// A batch that never reached the WAL is already an Error with its row
+		// count (logFlushFailure, arc_buffer_records_dropped_total, #1377), so
+		// this line is a Warn adding the floor. One whose entry the WAL
+		// accepted and then failed to write (#676) is not: logFlushFailure
+		// took it for a WAL copy, so this Error is the only report of it.
+		ev := g.b.logger.Warn()
+		if lostAfterEnqueue {
+			ev = g.b.logger.Error()
+		}
+		ev.Str("buffer_key", g.key).Int("batches", len(gone)).Bool("lost_after_wal_accepted", lostAfterEnqueue).
 			Msg("Flush failed for batches with no complete WAL copy; those rows are lost and the registered floor of this key stops below them")
 		g.cs.tracker.settleKey(g.key, gone, false)
 	}
@@ -968,6 +981,7 @@ func groupCoverage(g *flushGroup, files int) *GroupCoverage {
 func (b *ArrowBuffer) commitCoverageLocked(cs *coverageState, covered bool, prep *wal.PreparedAppend, shard *bufferShard, key string, batch *TypedColumnBatch, replay []CoveragePiece) error {
 	if replay != nil {
 		batch.Coverage = replay
+		batch.hasWALCopy = true
 		return nil
 	}
 	if !covered {
@@ -982,6 +996,7 @@ func (b *ArrowBuffer) commitCoverageLocked(cs *coverageState, covered bool, prep
 		batch.WALHashes = tokens
 		piece.replayable = err == nil
 	}
+	batch.hasWALCopy = prep != nil && err == nil
 	batch.Coverage = []CoveragePiece{piece}
 	return err
 }

@@ -17,8 +17,8 @@ import (
 // into a Response already reset for the next request.
 
 // TestFasthttpPublishesTrailersAfterBodyStream pins the fasthttp behaviour the
-// whole fix rests on: the connection goroutine drains the body stream to
-// io.EOF, and only then writes the trailer section.
+// whole fix rests on: the connection goroutine calls the body stream's WriteTo
+// to the end, and only then writes the trailer section.
 //
 // This is deliberately handler-free. Nothing in fasthttp's documented API
 // promises this order, so a version bump could quietly move the trailer write
@@ -31,10 +31,10 @@ func TestFasthttpPublishesTrailersAfterBodyStream(t *testing.T) {
 		t.Fatalf("AddTrailer: %v", err)
 	}
 
-	// Deliberately NOT publishTrailersOnEOF: this test must fail only when
+	// Deliberately NOT directBodyStream: this test must fail only when
 	// fasthttp's ordering changes, so routing it through the production type
 	// would make every local regression look like an upstream one.
-	resp.SetBodyStream(&setsTrailerAtEOF{data: []byte("body-bytes"), header: &resp.Header}, -1)
+	resp.SetBodyStream(&setsTrailerAfterWriteTo{data: []byte("body-bytes"), header: &resp.Header}, -1)
 
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
@@ -62,60 +62,6 @@ func TestFasthttpPublishesTrailersAfterBodyStream(t *testing.T) {
 	}
 }
 
-// TestPublishTrailersOnEOFPublishesExactlyOnce pins the two properties the
-// wrapper has to hold regardless of who calls it: publish on io.EOF, and
-// publish only once.
-func TestPublishTrailersOnEOFPublishesExactlyOnce(t *testing.T) {
-	var resp fasthttp.Response
-	if err := resp.Header.AddTrailer("X-Count"); err != nil {
-		t.Fatalf("AddTrailer: %v", err)
-	}
-	trailers := newResponseTrailers()
-	trailers.set("X-Count", "one")
-
-	p := &publishTrailersOnEOF{stream: io.NopCloser(strings.NewReader("ab")), header: &resp.Header, trailers: trailers}
-	b := make([]byte, 1)
-	for i := 0; i < 6; i++ {
-		if _, err := p.Read(b); err == io.EOF {
-			break
-		}
-	}
-	if got := string(resp.Header.Peek("X-Count")); got != "one" {
-		t.Errorf("trailer value = %q, want \"one\"", got)
-	}
-	// A second drain must not re-publish a value the writer has since changed.
-	trailers.set("X-Count", "two")
-	for i := 0; i < 3; i++ {
-		_, _ = p.Read(b)
-	}
-	if got := string(resp.Header.Peek("X-Count")); got != "one" {
-		t.Errorf("republished after EOF: value = %q, want the first publish to stand", got)
-	}
-}
-
-// TestPublishTrailersOnEOFIgnoresNonEOFErrors pins that a non-EOF read error
-// does not publish. fasthttp skips writeTrailer on those, and publishing early
-// would let the `published` flag suppress the real publish at EOF.
-func TestPublishTrailersOnEOFIgnoresNonEOFErrors(t *testing.T) {
-	var resp fasthttp.Response
-	if err := resp.Header.AddTrailer("X-Probe"); err != nil {
-		t.Fatalf("AddTrailer: %v", err)
-	}
-	trailers := newResponseTrailers()
-	trailers.set("X-Probe", "value")
-
-	p := &publishTrailersOnEOF{stream: errReadCloser{err: io.ErrUnexpectedEOF}, header: &resp.Header, trailers: trailers}
-	if _, err := p.Read(make([]byte, 4)); err != io.ErrUnexpectedEOF {
-		t.Fatalf("Read error = %v, want io.ErrUnexpectedEOF", err)
-	}
-	if got := resp.Header.Peek("X-Probe"); len(got) != 0 {
-		t.Errorf("published on a non-EOF error: %q", got)
-	}
-	if p.published {
-		t.Error("published flag set by a non-EOF error, which would suppress the real publish at EOF")
-	}
-}
-
 // TestResponseTrailersConcurrentSetAndPublish is the race regression at the
 // unit level: the writer goroutine sets while the connection goroutine
 // publishes. Run under -race.
@@ -140,31 +86,21 @@ func TestResponseTrailersConcurrentSetAndPublish(t *testing.T) {
 	wg.Wait()
 }
 
-// setsTrailerAtEOF is a minimal body stream that sets a trailer at the moment
-// it reports io.EOF, which is the only thing the ordering contract is about.
-type setsTrailerAtEOF struct {
+// setsTrailerAfterWriteTo is a minimal body stream that fasthttp writes with
+// WriteTo (as directBodyStream is) and that sets a trailer when it returns,
+// which is the only thing the ordering contract is about.
+type setsTrailerAfterWriteTo struct {
 	data   []byte
-	pos    int
 	header *fasthttp.ResponseHeader
-	fired  bool
 }
 
-func (r *setsTrailerAtEOF) Read(p []byte) (int, error) {
-	if r.pos >= len(r.data) {
-		if !r.fired {
-			r.fired = true
-			r.header.Set("X-Probe", "published")
-		}
-		return 0, io.EOF
-	}
-	n := copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
+func (r *setsTrailerAfterWriteTo) SupportsBodyWriteTo() bool { return true }
+
+func (r *setsTrailerAfterWriteTo) WriteTo(w io.Writer) (int64, error) {
+	n, err := w.Write(r.data)
+	r.header.Set("X-Probe", "published")
+	return int64(n), err
 }
 
-func (r *setsTrailerAtEOF) Close() error { return nil }
-
-type errReadCloser struct{ err error }
-
-func (e errReadCloser) Read([]byte) (int, error) { return 0, e.err }
-func (e errReadCloser) Close() error             { return nil }
+func (r *setsTrailerAfterWriteTo) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (r *setsTrailerAfterWriteTo) Close() error             { return nil }

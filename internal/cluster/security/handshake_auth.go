@@ -111,6 +111,11 @@ type ForwardAckAuthFields struct {
 	Status string
 	Code   string
 	Error  string
+	// Index is the log index of the applied command. It is signed only on
+	// a success ack to a request that asked for it (WantIndex, #1324), so
+	// an ack between builds that predate it is signed as before.
+	Index     uint64
+	SignIndex bool
 }
 
 // Handshake message-type labels for the response direction. The request
@@ -405,7 +410,11 @@ func ValidateLeaderInfoHMAC(sharedSecret, reqNonce string, timestamp int64, f Le
 }
 
 func forwardAckFields(reqNonce string, ts int64, f ForwardAckAuthFields) []string {
-	return []string{reqNonce, f.Status, f.Code, f.Error, strconv.FormatInt(ts, 10)}
+	fields := []string{reqNonce, f.Status, f.Code, f.Error, strconv.FormatInt(ts, 10)}
+	if f.SignIndex {
+		fields = append(fields, strconv.FormatUint(f.Index, 10))
+	}
+	return fields
 }
 
 // ComputeForwardAckHMAC signs a forward-apply ack over the request's nonce.

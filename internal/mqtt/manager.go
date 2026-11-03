@@ -463,8 +463,9 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 		sub.CleanSession = *req.CleanSession
 	}
 
-	// Validate updated subscription
-	if err := sub.Validate(); err != nil {
+	// Validate updated subscription. Its stored topic filters are checked in
+	// full only when this request replaces topic_mapping (#479).
+	if err := sub.validate(req.TopicMapping != nil); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrValidation, err)
 	}
 
@@ -672,8 +673,16 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 	// so the subscription shows an error status instead of running and
 	// dropping every message (#300). onMessage keeps its own check as the
 	// last line.
-	if err := validateStorageTargets(sub); err != nil {
+	if err := validateSubscriptionTargets(sub, false); err != nil {
 		return fmt.Errorf("subscription targets cannot be written: %w", err)
+	}
+	for _, dead := range deadTopicFilters(sub.TopicMapping) {
+		m.logger.Warn().
+			Str("id", sub.ID).
+			Str("name", sub.Name).
+			Str("topic_filter", dead.filter).
+			Str("reason", dead.reason).
+			Msg("Ignoring a topic_mapping key that is not a valid MQTT topic filter: no message can match it (it never did as an exact topic either); replace topic_mapping to remove it")
 	}
 	subscriber := NewSubscriber(
 		sub,

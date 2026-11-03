@@ -23,6 +23,9 @@ import (
 
 // DatabasesHandler handles database management API endpoints
 type DatabasesHandler struct {
+	// onFilesRemoved invalidates the query caches (and the cluster's) after
+	// a database's files were removed: see SetOnFilesRemoved.
+	onFilesRemoved func()
 	storage        storage.Backend
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
@@ -897,6 +900,11 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		}
 	}
 
+	// Cached pruned path lists may name the removed files, partial or not.
+	if h.onFilesRemoved != nil {
+		h.onFilesRemoved()
+	}
+
 	if len(deleteErrors) > 0 {
 		h.logger.Error().
 			Str("database", name).
@@ -1463,4 +1471,10 @@ func reclaimStagedPartials(ctx context.Context, backend storage.Backend, prefix 
 		removed++
 	}
 	return removed
+}
+
+// SetOnFilesRemoved sets the function called after a database delete removed
+// files: the query caches hold pruned partition lists naming them.
+func (h *DatabasesHandler) SetOnFilesRemoved(fn func()) {
+	h.onFilesRemoved = fn
 }

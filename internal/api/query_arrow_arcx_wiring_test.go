@@ -69,7 +69,7 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 
 	for _, required := range []string{
 		"AddTrailer",
-		"setBodyStreamWithTrailers",
+		"setDirectBodyStream",
 		"poisonArrowStream",
 		"onComplete",
 		"onFail",

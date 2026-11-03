@@ -109,7 +109,7 @@ func (c *fsmCoordinator) ManifestHotFiles(database, measurement string) []raft.F
 
 var _ compactionCommitter = (*fsmCoordinator)(nil)
 
-func (c *fsmCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
+func (c *fsmCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration, func(string) bool) ([]string, error) {
 	c.waits++
 	return c.missing, nil
 }
@@ -133,6 +133,10 @@ func casEntry(t *testing.T, root, rel string) raft.FileEntry {
 // raceDelete runs a DELETE whose first manifest batch finds that a compaction
 // (on w2, which read cpu_a before the DELETE) committed meanwhile: this node
 // then drops its copy of the input. missing is what WaitLocalFiles reports.
+// raceUnreadableOutput makes raceDelete's compaction output a file no read
+// can open.
+var raceUnreadableOutput bool
+
 func raceDelete(t *testing.T, where string, missing []string, extra ...string) (int, string, *fsmCoordinator, string) {
 	t.Helper()
 	shortDeleteWait(t)
@@ -159,6 +163,11 @@ func raceDelete(t *testing.T, where string, missing []string, extra ...string) (
 			return
 		}
 		writeRecordsParquet(t, db, root, o)
+		if raceUnreadableOutput {
+			if err := os.WriteFile(filepath.Join(root, o), []byte("not a parquet file"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
 		oe := casEntry(t, root, o)
 		if err := c.apply(raft.CommandStageCompaction, raft.StageCompactionPayload{Job: "j1", Origin: "w2", Output: oe,
 			Inputs: []raft.CompactionInput{{Path: a, SizeBytes: ae.SizeBytes, SHA256: ae.SHA256}}}); err != nil {
@@ -286,6 +295,8 @@ func TestDeleteGivesUpOnAFileThatKeepsChanging(t *testing.T) {
 	}
 	h := NewDeleteHandler(db, backend, &config.DeleteConfig{Enabled: true, MaxRowsPerDelete: 1000, ConfirmationThreshold: 1000}, nil, t.TempDir(), zerolog.Nop())
 	h.SetCoordinator(c)
+	invalidated := 0
+	h.SetOnFilesRemoved(func() { invalidated++ })
 	app := fiber.New()
 	h.RegisterRoutes(app)
 	req := httptest.NewRequest("POST", "/api/v1/delete", strings.NewReader(`{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`))
@@ -297,6 +308,10 @@ func TestDeleteGivesUpOnAFileThatKeepsChanging(t *testing.T) {
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 503 || c.batches != 3 || !strings.Contains(string(raw), "kept changing") {
 		t.Fatalf("got %d after %d batches: %s", resp.StatusCode, c.batches, raw)
+	}
+	// Incomplete, but other files may be rewritten: the query caches go.
+	if invalidated != 1 {
+		t.Fatalf("query caches invalidated %d times, want 1", invalidated)
 	}
 }
 
@@ -935,5 +950,36 @@ func TestOutputGoneAccountedReasons(t *testing.T) {
 		if !raft.OutputGoneAccounted(r) {
 			t.Fatalf("%q not accounted", r)
 		}
+	}
+}
+
+// failingManifest is a primary writer whose manifest refuses every batch.
+type failingManifest struct{ *fsmCoordinator }
+
+func (failingManifest) BatchFileOpsInManifest([]raft.BatchFileOp) error {
+	return errors.New("quorum lost")
+}
+
+// A manifest failure aborts the DELETE (500) and still invalidates the query
+// caches: earlier files of the same DELETE may be rewritten already.
+func TestDeleteManifestFailureInvalidatesQueryCaches(t *testing.T) {
+	root, backend, db := recordsDuckDB(t)
+	fsm := raft.NewClusterFSM(zerolog.Nop())
+	c := &fsmCoordinator{t: t, fsm: fsm}
+	const a = "db/cpu/2026/10/11/10/cpu_a.parquet"
+	writeRecordsParquet(t, db, root, a)
+	if err := c.apply(raft.CommandRegisterFile, raft.RegisterFilePayload{File: casEntry(t, root, a)}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewDeleteHandler(db, backend, &config.DeleteConfig{Enabled: true, MaxRowsPerDelete: 1000, ConfirmationThreshold: 1000}, nil, t.TempDir(), zerolog.Nop())
+	h.SetCoordinator(failingManifest{c})
+	invalidated := 0
+	h.SetOnFilesRemoved(func() { invalidated++ })
+	code, _, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if code != 500 || !strings.Contains(raw, "quorum lost") {
+		t.Fatalf("got %d: %s", code, raw)
+	}
+	if invalidated != 1 {
+		t.Fatalf("query caches invalidated %d times, want 1", invalidated)
 	}
 }

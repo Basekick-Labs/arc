@@ -49,7 +49,7 @@ func TestArcxArrowPanicWiring(t *testing.T) {
 			return true
 		}
 		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if ok && sel.Sel.Name == "setBodyStreamWithTrailers" {
+		if ok && sel.Sel.Name == "setDirectBodyStream" {
 			streamCall = call
 		}
 		return true
@@ -58,15 +58,18 @@ func TestArcxArrowPanicWiring(t *testing.T) {
 	if streamCall == nil {
 		t.Fatal("arcx Arrow path bypasses the panic-safe trailer stream")
 	}
-	if len(streamCall.Args) != 5 {
-		t.Fatalf("stream wrapper has %d arguments, want 5", len(streamCall.Args))
+	if len(streamCall.Args) != 6 {
+		t.Fatalf("stream wrapper has %d arguments, want 6", len(streamCall.Args))
+	}
+	if id, ok := streamCall.Args[2].(*ast.Ident); !ok || id.Name != "trailers" {
+		t.Fatal("arcx Arrow stream does not publish its trailers")
 	}
 
-	onPanic, ok := streamCall.Args[3].(*ast.FuncLit)
+	onPanic, ok := streamCall.Args[4].(*ast.FuncLit)
 	if !ok {
 		t.Fatal("arcx Arrow stream has no panic callback")
 	}
-	writer, ok := streamCall.Args[4].(*ast.FuncLit)
+	writer, ok := streamCall.Args[5].(*ast.FuncLit)
 	if !ok {
 		t.Fatal("arcx Arrow stream has no writer callback")
 	}
@@ -152,10 +155,11 @@ func TestArcxArrowPanicMarkerAndTrailer(t *testing.T) {
 	trailers := newResponseTrailers()
 	var streamW *bufio.Writer
 
-	h.setBodyStreamWithTrailers(
+	h.setDirectBodyStream(
 		&ctx,
-		"arcx_serve_arrow_ipc",
+		nil,
 		trailers,
+		"arcx_serve_arrow_ipc",
 		func() {
 			poisonArrowStream(streamW, h.logger)
 			trailers.setIfAbsent(

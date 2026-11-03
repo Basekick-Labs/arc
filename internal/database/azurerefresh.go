@@ -96,5 +96,5 @@ func (a *azureResolver) Emit(ctx context.Context, m credMaterial) error {
 func startAzureCredentialRefresher(db *sql.DB, params azureSecretParams, cred azureTokenCredential, logger zerolog.Logger, onFirstFailure func(error)) *credentialRefresher {
 	return startCredentialRefresher(
 		&azureResolver{db: db, params: params, cred: cred},
-		params.name, logger, azureDemotionHint, onFirstFailure)
+		params.name, logger, azureDemotionHint, false, onFirstFailure)
 }

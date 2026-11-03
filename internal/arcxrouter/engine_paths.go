@@ -12,6 +12,47 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
+// engineQueryEntries applies open-compaction exclusions to either the pruned
+// list or the ordinary local listing. Exclusions must be snapshotted first:
+// inputs are excluded only once the replacement output is present in storage.
+func engineQueryEntries(
+	ctx context.Context,
+	local *storage.LocalBackend,
+	shape, database, measurement, whereText string,
+	preds []scanPred,
+	pruner *pruning.PartitionPruner,
+	exclude func(context.Context, string) []string,
+) ([]string, error) {
+	prefix := database + "/" + measurement + "/"
+	var skip map[string]struct{}
+	if exclude != nil {
+		for _, key := range exclude(ctx, prefix) {
+			if skip == nil {
+				skip = make(map[string]struct{})
+			}
+			skip[key] = struct{}{}
+		}
+	}
+	entries, pruned := engineParquetEntries(ctx, local, shape, database, measurement, whereText, preds, pruner)
+	if !pruned {
+		var err error
+		entries, err = local.List(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+	}
+	filtered := entries[:0]
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry, ".parquet") {
+			continue
+		}
+		if _, excluded := skip[entry]; !excluded {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered, nil
+}
+
 // engineParquetEntries returns a fresh, range-limited file list when a routed
 // query has time bounds that can be safely extracted. Other shapes keep using
 // the backend's normal measurement listing.

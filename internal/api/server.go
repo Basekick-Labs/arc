@@ -67,9 +67,9 @@ type Server struct {
 
 	// storageCredsFailReady: when true (server.storage_credentials_fail_ready,
 	// default false), /ready returns 503 while any tier's credential state is
-	// "expired". Applied AND-ed after the ready flag — it can only remove
+	// "expired" or "unavailable" (#1105). Applied AND-ed after the ready flag — it can only remove
 	// readiness, never grant it, so WAL-recovery gating and shutdown drain are
-	// untouched. Only "expired" fails ready: "fallback"/"unknown"/"degraded"
+	// untouched. Only those two fail ready: "fallback"/"unknown"/"degraded"
 	// deployments may be healthy or permanently credential-less by design and
 	// must not flap the LB.
 	storageCredsFailReady bool
@@ -108,7 +108,8 @@ type ServerConfig struct {
 	TLSKeyFile  string
 
 	// ClientRecorder, when set, receives the installation id + version
-	// of arcli clients (Arcli-Installation-Id header) for telemetry.
+	// of arcli and SDK clients (Arc-Client-Installation-Id, or arcli's
+	// legacy Arcli-Installation-Id header) for telemetry.
 	// nil (telemetry disabled) installs no middleware.
 	ClientRecorder ClientRecorder
 	// AuthRequired tells the client-identity middleware that the auth
@@ -169,13 +170,17 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id",
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id",
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)
 	app.Use(securityHeaders(config.TLSEnabled))
 
-	// arcli installation ids for telemetry (see client_identity.go).
+	// Compressed request bodies only where a handler decodes them bounded
+	// (request_encoding.go).
+	app.Use(rejectEncodedBodies)
+
+	// Client (arcli, SDK) installation ids for telemetry (see client_identity.go).
 	if config.ClientRecorder != nil {
 		app.Use(clientIdentity(config.ClientRecorder, config.AuthRequired))
 	}
@@ -397,14 +402,21 @@ func (s *Server) readinessProblem() *notReady {
 	}
 	// Opt-in (#603): drain this node while storage credentials are expired.
 	// Checked after the ready flag — this can only remove readiness. Only
-	// "expired" qualifies; see SetStorageStatus.
+	// "expired" and "unavailable" qualify: in both no query can read the tier.
+	// "unavailable" is a tier with no fallback secret whose credentials were
+	// never resolved (GCS, #1105); "fallback" still has DuckDB's own chain.
 	if s.storageCredsFailReady && s.storageStatus != nil {
 		st := s.storageStatus()
 		// Deterministic order so incident logs are stable when both tiers are
 		// expired.
 		for _, tier := range []string{"hot", "cold"} {
-			if ts, ok := st[tier]; ok && ts.State == database.CredStateExpired {
+			ts, ok := st[tier]
+			switch {
+			case !ok:
+			case ts.State == database.CredStateExpired:
 				return &notReady{reason: "storage_credentials_expired", tier: tier}
+			case ts.State == database.CredStateUnavailable:
+				return &notReady{reason: "storage_credentials_unavailable", tier: tier}
 			}
 		}
 	}
@@ -617,14 +629,15 @@ func (s *Server) endpointMetricsHandler(c *fiber.Ctx) error {
 			"latency_avg_ms": queryLatencyAvgMs,
 		},
 		"buffer": fiber.Map{
-			"records_buffered":     snapshot["buffer_records_buffered"],
-			"records_queued":       snapshot["buffer_records_queued"],
-			"records_inflight":     snapshot["buffer_records_inflight"],
-			"records_written":      snapshot["buffer_records_written"],
-			"flushes_total":        snapshot["buffer_flushes_total"],
-			"errors_total":         snapshot["buffer_errors_total"],
-			"flush_failures_total": snapshot["buffer_flush_failures_total"],
-			"queue_depth":          snapshot["buffer_queue_depth"],
+			"records_buffered":      snapshot["buffer_records_buffered"],
+			"records_queued":        snapshot["buffer_records_queued"],
+			"records_inflight":      snapshot["buffer_records_inflight"],
+			"records_written":       snapshot["buffer_records_written"],
+			"records_dropped_total": snapshot["buffer_records_dropped_total"],
+			"flushes_total":         snapshot["buffer_flushes_total"],
+			"errors_total":          snapshot["buffer_errors_total"],
+			"flush_failures_total":  snapshot["buffer_flush_failures_total"],
+			"queue_depth":           snapshot["buffer_queue_depth"],
 		},
 		"storage": fiber.Map{
 			"writes_total":      snapshot["storage_writes_total"],
@@ -634,12 +647,13 @@ func (s *Server) endpointMetricsHandler(c *fiber.Ctx) error {
 			"errors_total":      snapshot["storage_errors_total"],
 		},
 		"compaction": fiber.Map{
-			"jobs_total":      snapshot["compaction_jobs_total"],
-			"jobs_success":    snapshot["compaction_jobs_success"],
-			"jobs_failed":     snapshot["compaction_jobs_failed"],
-			"files_compacted": snapshot["compaction_files_compacted"],
-			"bytes_read":      snapshot["compaction_bytes_read"],
-			"bytes_written":   snapshot["compaction_bytes_written"],
+			"jobs_total":       snapshot["compaction_jobs_total"],
+			"jobs_success":     snapshot["compaction_jobs_success"],
+			"jobs_failed":      snapshot["compaction_jobs_failed"],
+			"jobs_interrupted": snapshot["compaction_jobs_interrupted"],
+			"files_compacted":  snapshot["compaction_files_compacted"],
+			"bytes_read":       snapshot["compaction_bytes_read"],
+			"bytes_written":    snapshot["compaction_bytes_written"],
 		},
 		"auth": fiber.Map{
 			"requests_total": snapshot["auth_requests_total"],

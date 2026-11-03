@@ -45,8 +45,13 @@ const sandboxLockdownTimeout = 5 * time.Second
 // Called once at the end of configureDatabase, after every INSTALL/LOAD
 // and every SET GLOBAL Arc needs to perform.
 func lockdownExternalAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	return lockdownDirs(context.Background(), db, buildAllowedDirectories(cfg), logger)
+}
+
+// lockdownDirs is lockdownExternalAccess for an explicit allowlist: the main
+// instance's from Config, or a private rewrite instance's (rewrite_db.go).
+func lockdownDirs(ctx context.Context, db *sql.DB, dirs []string, logger zerolog.Logger) error {
 	componentLogger := logger.With().Str("component", "duckdb-sandbox").Logger()
-	dirs := buildAllowedDirectories(cfg)
 
 	// Empty allowlist + enable_external_access=false locks DuckDB out of
 	// every file it might legitimately need (spill, profile output, manifest
@@ -55,10 +60,10 @@ func lockdownExternalAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) erro
 	// Config field that contributes to the allowlist so operators see exactly
 	// which knob is unset.
 	if len(dirs) == 0 {
-		componentLogger.Warn().Msg("sandbox allowlist is empty — every file-touching query will fail; check Config.LocalStorageRoot / TempDirectory / UploadDir / CompactionTempDirectory / S3Bucket / ColdS3Bucket / AzureContainer / ColdAzureContainer wiring")
+		componentLogger.Warn().Msg("sandbox allowlist is empty — every file-touching query will fail; check Config.LocalStorageRoot / TempDirectory / UploadDir / CompactionTempDirectory / S3Bucket / ColdS3Bucket / AzureContainer / ColdAzureContainer / GCSBucket / ColdGCSBucket wiring")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), sandboxLockdownTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sandboxLockdownTimeout)
 	defer cancel()
 
 	// Compose the allowed_directories SET. DuckDB accepts a list literal.
@@ -151,6 +156,22 @@ func buildAllowedDirectories(cfg *Config) []string {
 		coldS3 := s3PrefixURI(cfg.ColdS3Bucket, cfg.ColdS3Prefix)
 		if coldS3 != hotS3 {
 			dirs = append(dirs, coldS3)
+		}
+	}
+	// Primary GCS backend (when storage.backend = "gcs", #1105). The query
+	// path reads gs://<bucket>/<prefix>/... (storage.backendRoot); the GCS
+	// secret's SCOPE is built by the same gcsPrefixURI.
+	var hotGCS string
+	if cfg.GCSIsPrimaryBackend && cfg.GCSBucket != "" {
+		hotGCS = gcsPrefixURI(cfg.GCSBucket, cfg.GCSPrefix)
+		dirs = append(dirs, hotGCS)
+	}
+	// Cold-tier GCS: its own entry unless it is byte-identical to the hot
+	// one (config.Load refuses an overlapping cold tier, so this dedupe only
+	// matters to a caller that skipped it).
+	if cfg.ColdGCSBucket != "" {
+		if coldGCS := gcsPrefixURI(cfg.ColdGCSBucket, cfg.ColdGCSPrefix); coldGCS != hotGCS {
+			dirs = append(dirs, coldGCS)
 		}
 	}
 	// Primary Azure backend (when storage.backend = "azure"). Azure has a key

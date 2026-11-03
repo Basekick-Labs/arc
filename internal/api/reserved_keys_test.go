@@ -28,7 +28,9 @@ func TestLPImportRefusesReservedKeys(t *testing.T) {
 		{"tag _database", "cpu,_database=x v=1 1700000000000000000\n", http.StatusBadRequest},
 		{"field _measurement", "cpu v=1,_measurement=\"x\" 1700000000000000000\n", http.StatusBadRequest},
 		{"field time_value is fine", "cpu v=1,time_value=2 1700000000000000000\n", http.StatusOK},
-		{"tag Time is fine", "cpu,Time=a v=1 1700000000000000000\n", http.StatusOK},
+		// #1342: "time" in another letter case is refused too: DuckDB binds
+		// it as the time column in files where it comes first.
+		{"tag Time", "cpu,Time=a v=1 1700000000000000000\n", http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ci := newChunkedImport(t, 10)
@@ -97,4 +99,29 @@ func TestLPWriteDropsTimeKeyPoints(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	require.Zero(t, ci2.buf.BufferedBytes())
+}
+
+// #1342: /write drops a point whose name Arc could not read back, and says
+// which name and why; the other points are written.
+func TestLPWriteDropsUnstorableNamePoints(t *testing.T) {
+	ci := newChunkedImport(t, 1000)
+	h := NewLineProtocolHandler(ci.buf, zerolog.Nop())
+	app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
+	h.RegisterRoutes(app)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/write/line-protocol", bytes.NewReader([]byte(
+		"cpu v=1 1700000000000000000\ncpu Time=2 1700000001000000000\ncpu t\xb0=3 1700000002000000000\ncpu V=4 1700000003000000000\n")))
+	req.Header.Set("x-arc-database", "d")
+	resp, err := app.Test(req, -1)
+	require.NoError(t, err)
+	out, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Contains(t, string(out), "partial write: 3 points dropped")
+	require.Contains(t, string(out), `column \"Time\"`)
+	require.Contains(t, string(out), "the other points were written")
+	require.NoError(t, ci.buf.FlushAllAndWait(context.Background()))
+	rows, types := ci.stored(t)
+	require.EqualValues(t, 1, rows)
+	for name := range types {
+		require.Contains(t, []string{"time", "v"}, name)
+	}
 }

@@ -91,6 +91,9 @@ type PreparedAppend struct {
 	key     string
 	entries []preparedEntry
 	done    bool
+	// covered: 0x04 entries whose coverage sequence Commit stamps. An
+	// uncovered prepare (PrepareTracked) holds finished 0x03 entries.
+	covered bool
 }
 
 type preparedEntry struct {
@@ -131,22 +134,25 @@ func (w *Writer) PrepareCovered(database, key string, payload []byte) (*Prepared
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+overhead+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
 	}
-	p := &PreparedAppend{w: w, key: key, entries: make([]preparedEntry, 0, len(chunks))}
+	p := &PreparedAppend{w: w, key: key, entries: make([]preparedEntry, 0, len(chunks)), covered: true}
 	for i, chunk := range chunks {
-		logical := envelopePayload(dbBytes, chunk)
+		logicalLen := 3 + len(dbBytes) + len(chunk)
 		// Allocation and publication as pending are one step; see
 		// appendTrackedEntry.
 		w.pendingMu.Lock()
 		seq := atomic.AddUint64(&w.trackedSequence, 1)
 		w.pendingSeqs[seq] = struct{}{}
 		w.pendingMu.Unlock()
-		payloadLen := walTrackedHeaderSize + len(logical) + coverageTrailerLen(key)
+		payloadLen := walTrackedHeaderSize + logicalLen + coverageTrailerLen(key)
 		data := make([]byte, WALEntryHeaderSize+payloadLen)
 		body := data[WALEntryHeaderSize:]
 		body[0] = WALCoveredMarker
 		binary.BigEndian.PutUint64(body[1:9], w.trackedInstance)
 		binary.BigEndian.PutUint64(body[9:17], seq)
-		off := walTrackedHeaderSize + copy(body[walTrackedHeaderSize:], logical)
+		// Envelope header and chunk go straight into the entry: no separate
+		// logical buffer to allocate and copy from.
+		off := walTrackedHeaderSize + putEnvelopeHeader(body[walTrackedHeaderSize:], dbBytes)
+		off += copy(body[off:], chunk)
 		off += copy(body[off:], key)
 		binary.BigEndian.PutUint16(body[off:], uint16(len(key)))
 		binary.BigEndian.PutUint16(body[off+2:], uint16(i))
@@ -159,9 +165,72 @@ func (w *Writer) PrepareCovered(database, key string, payload []byte) (*Prepared
 			seq:       seq,
 			token:     fmt.Sprintf("%016x%016x", w.trackedInstance, seq),
 			prefixCRC: crc32.ChecksumIEEE(body[:len(body)-8]),
-			logical:   body[walTrackedHeaderSize : walTrackedHeaderSize+len(logical)],
+			logical:   body[walTrackedHeaderSize : walTrackedHeaderSize+logicalLen],
 			ts:        ts,
 			chunk:     uint16(i),
+		})
+	}
+	return p, nil
+}
+
+// PrepareTracked builds, outside the ingest shard lock, the tracked entries
+// AppendRawWithMetaTracked would append for payload — the same 0x03 bytes,
+// split the same way — and holds them for Commit under the lock (#1438). A
+// write refused between the two (schema churn, a cancelled request, a shard
+// Close swept) Abandons them, so nothing it was refused for reaches the WAL
+// file: appended first, a refused write was replayed at the next start.
+//
+// Queued acknowledgement only. A durable entry is acknowledged by the sync
+// that covers it, and that wait cannot run under the shard lock, so a durable
+// writer appends before the lock and retracts by checkpoint instead.
+func (w *Writer) PrepareTracked(database string, payload []byte) (*PreparedAppend, error) {
+	if w.config.AckMode == AckModeDurable {
+		return nil, errors.New("PrepareTracked: a durable WAL entry cannot be committed under the shard lock")
+	}
+	if len(database) > 255 {
+		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
+	}
+	dbBytes := []byte(database)
+	envelopeHeaderLen := 3 + len(dbBytes)
+	chunks := [][]byte{payload}
+	if !trackedPayloadFits(len(payload), envelopeHeaderLen) {
+		var err error
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
+	}
+	for _, chunk := range chunks {
+		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
+		}
+	}
+	p := &PreparedAppend{w: w, entries: make([]preparedEntry, 0, len(chunks))}
+	for _, chunk := range chunks {
+		// Allocation and publication as pending are one step; see
+		// appendTrackedEntry.
+		w.pendingMu.Lock()
+		seq := atomic.AddUint64(&w.trackedSequence, 1)
+		w.pendingSeqs[seq] = struct{}{}
+		w.pendingMu.Unlock()
+		trackedLen := walTrackedHeaderSize + envelopeHeaderLen + len(chunk)
+		data := make([]byte, WALEntryHeaderSize+trackedLen)
+		tracked := data[WALEntryHeaderSize:]
+		tracked[0] = WALTrackedMarker
+		binary.BigEndian.PutUint64(tracked[1:9], w.trackedInstance)
+		binary.BigEndian.PutUint64(tracked[9:17], seq)
+		off := walTrackedHeaderSize + putEnvelopeHeader(tracked[walTrackedHeaderSize:], dbBytes)
+		copy(tracked[off:], chunk)
+		ts := uint64(time.Now().UnixMicro())
+		binary.BigEndian.PutUint32(data[0:4], uint32(trackedLen))
+		binary.BigEndian.PutUint64(data[4:12], ts)
+		binary.BigEndian.PutUint32(data[12:16], crc32.ChecksumIEEE(tracked))
+		p.entries = append(p.entries, preparedEntry{
+			data:    data,
+			seq:     seq,
+			token:   fmt.Sprintf("%016x%016x", w.trackedInstance, seq),
+			logical: tracked[walTrackedHeaderSize:],
+			ts:      ts,
 		})
 	}
 	return p, nil
@@ -175,7 +244,8 @@ func (p *PreparedAppend) Chunks() int { return len(p.entries) }
 
 // Commit stamps cseq, fires the replication hook and enqueues every entry in
 // order. It is cheap — no allocation proportional to the payload — because it
-// runs under the ingest shard lock.
+// runs under the ingest shard lock. An uncovered prepare (PrepareTracked) has
+// nothing to stamp: cseq is ignored.
 //
 // On a full queue it stops at the first dropped entry and returns
 // ErrWALDropped with the tokens of the entries already enqueued: those are in
@@ -192,14 +262,23 @@ func (p *PreparedAppend) Commit(cseq uint64) ([]string, error) {
 	tokens := make([]string, 0, len(p.entries))
 	for i := range p.entries {
 		e := &p.entries[i]
-		copy(e.data[len(e.data)-8:], cs[:])
-		binary.BigEndian.PutUint32(e.data[12:16], crc32.Update(e.prefixCRC, crc32.IEEETable, cs[:]))
-		if p.w.replicationHook.Load() != nil {
-			p.w.replicate(&ReplicationEntry{TimestampUS: e.ts, Payload: e.logical, Coverage: &Coverage{
-				Instance: p.w.trackedInstance, Key: p.key, CSeq: cseq, Chunk: e.chunk, Chunks: uint16(len(p.entries)),
-			}})
+		entry := walEntry{data: e.data, seq: e.seq}
+		if p.covered {
+			copy(e.data[len(e.data)-8:], cs[:])
+			binary.BigEndian.PutUint32(e.data[12:16], crc32.Update(e.prefixCRC, crc32.IEEETable, cs[:]))
+			if p.w.replicationHook.Load() != nil {
+				p.w.replicate(&ReplicationEntry{TimestampUS: e.ts, Payload: e.logical, Coverage: &Coverage{
+					Instance: p.w.trackedInstance, Key: p.key, CSeq: cseq, Chunk: e.chunk, Chunks: uint16(len(p.entries)),
+				}})
+			}
+			entry.covKey, entry.covSeq = p.key, cseq
+		} else if p.w.replicationHook.Load() != nil {
+			// What appendTrackedEntry hands the hook: the logical payload.
+			// Checked first, so a write with no hook (standalone) allocates
+			// nothing here, under the shard lock.
+			p.w.replicate(&ReplicationEntry{TimestampUS: e.ts, Payload: e.logical})
 		}
-		if err := p.w.tryEnqueueEntry(walEntry{data: e.data, seq: e.seq, covKey: p.key, covSeq: cseq}); err != nil {
+		if err := p.w.tryEnqueueEntry(entry); err != nil {
 			p.release(i)
 			return tokens, err
 		}

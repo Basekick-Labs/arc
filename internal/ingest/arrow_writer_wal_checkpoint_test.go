@@ -276,23 +276,19 @@ func TestReplay_DoesNotInheritContentHash(t *testing.T) {
 // stops at the first retained file instead of skipping it, one such identity
 // stops the WAL reclaiming anything at all for the life of the process (#676).
 //
-// A string time column is converted after the WAL append and rejected there
-// ("time column must be int64 microseconds"), which is one of several error
-// returns in that window — a type mismatch, a client that disconnects during a
-// schema-change flush, the schema-churn guard, a closing shard. The release is
-// deferred over the whole window rather than written at each return, so a
-// return added later cannot reintroduce the leak.
+// A cancelled request is refused under the shard lock, after the append, as
+// are the schema-churn guard and a closing shard. The release is deferred over
+// the whole window rather than written at each return, so a return added later
+// cannot reintroduce the leak. (This double of the WAL cannot checkpoint, so
+// the refused write's entries are only released; a real writer retracts them,
+// #1438.)
 func TestAbandonedWrite_ReleasesItsWALIdentity(t *testing.T) {
 	buffer, walWriter := newCheckpointBuffer(1)
 	defer buffer.Close()
 
-	rejected := checkpointTestRecord()
-	rejected.Columns = map[string][]interface{}{
-		"time":  {"not-an-int64"},
-		"value": {1.0},
-	}
-
-	err := buffer.writeColumnarInternal(context.Background(), "default", rejected, false, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := buffer.writeColumnarInternal(ctx, "default", checkpointTestRecord(), false, "")
 	if err == nil {
 		t.Fatal("expected the write to be rejected after its WAL append")
 	}
@@ -305,6 +301,26 @@ func TestAbandonedWrite_ReleasesItsWALIdentity(t *testing.T) {
 	if len(forgotten) != handedOut {
 		t.Fatalf("WAL handed out %d identities and %d were released: %v — an unreleased identity pins the purge floor",
 			handedOut, len(forgotten), forgotten)
+	}
+}
+
+// A value the conversion refuses ("time column must be int64 microseconds")
+// refuses the write before its WAL append (#1438): appended first, the entry
+// was replayed at the next start although the client was told it failed.
+func TestConversionRefusal_NeverReachesTheWAL(t *testing.T) {
+	buffer, walWriter := newCheckpointBuffer(1)
+	defer buffer.Close()
+
+	rejected := checkpointTestRecord()
+	rejected.Columns = map[string][]interface{}{
+		"time":  {"not-an-int64"},
+		"value": {1.0},
+	}
+	if err := buffer.writeColumnarInternal(context.Background(), "default", rejected, false, ""); err == nil {
+		t.Fatal("expected the write to be rejected")
+	}
+	if handedOut, _ := walWriter.counts(); handedOut != 0 {
+		t.Fatalf("the WAL handed out %d identities for a write refused by its conversion, want 0", handedOut)
 	}
 }
 

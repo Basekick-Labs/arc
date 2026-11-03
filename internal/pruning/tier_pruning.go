@@ -13,6 +13,7 @@ package pruning
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -70,11 +71,36 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 		return nil, TierPruneFallback
 	}
 
+	// A start-only range: add the partitions that exist past the assumed
+	// end on this tier (open_end.go). timeRange is shared by the tiers and
+	// is not changed.
+	if timeRange.EndAssumed {
+		var lister dirLister
+		if storage.IsObjectURL(tierGlob) {
+			lister = p.tierDirLister(backend, rootURL)
+		} else {
+			lister = localDirLister(basePath)
+		}
+		beyond, _, err := discoverOpenEnd(ctx, lister, database, measurement, timeRange.End)
+		switch {
+		case errors.Is(err, errTooManyBeyond):
+			return nil, TierPruneFallback
+		case err == nil:
+			paths = appendBeyond(paths, beyond, basePath, database, measurement)
+		}
+	}
+
 	verified := true
-	if strings.HasPrefix(tierGlob, "s3://") || strings.HasPrefix(tierGlob, "azure://") {
+	generated := paths
+	if storage.IsObjectURL(tierGlob) {
 		paths, verified = p.filterTierRemotePaths(ctx, paths, backend, rootURL)
 	} else {
 		paths = p.filterExistingLocalPaths(paths)
+	}
+	// A live partition left out because it has no files yet: the SQL
+	// transform cache must not keep a result made without it.
+	if p.liveWindow().droppedLive(generated, paths) {
+		markVolatile(ctx)
 	}
 
 	if len(paths) == 0 {
@@ -111,12 +137,9 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 	}
 
 	verified := true
+	live := p.liveWindow()
 	// hourDirs groups hour-level paths by their backend-relative parent (day)
 	// directory, listed once each.
-	type hourEntry struct {
-		path   string
-		target string // hour segment, e.g. "14"
-	}
 	hourDirs := make(map[string][]hourEntry)
 	var dayPaths []string // day-level compacted-file globs, checked individually
 
@@ -149,7 +172,9 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 	for parent, entries := range hourDirs {
 		cacheKey := "tier:dirs:" + rootURL + parent
 		var children []string
-		if cached, ok := p.globCache.get(cacheKey); ok {
+		// A cached listing missing a live hour is listed again: the hour may
+		// have appeared since.
+		if cached, ok := p.globCache.get(cacheKey); ok && !listingMissesLive(cached, entries, live) {
 			children = cached
 		} else {
 			listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -224,4 +249,31 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 		Bool("verified", verified).
 		Msg("Filtered tier remote paths")
 	return existing, verified
+}
+
+// hourEntry is an hour-level partition path and its hour segment ("14").
+type hourEntry struct {
+	path   string
+	target string
+}
+
+// listingMissesLive reports whether a cached child listing lacks a live hour
+// among entries.
+func listingMissesLive(children []string, entries []hourEntry, live liveWindow) bool {
+	for _, e := range entries {
+		if !live.isLive(e.path) {
+			continue
+		}
+		found := false
+		for _, c := range children {
+			if c == e.target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return true
+		}
+	}
+	return false
 }

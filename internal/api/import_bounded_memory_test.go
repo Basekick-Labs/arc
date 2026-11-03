@@ -467,3 +467,32 @@ func TestImportFileBytesInPlace(t *testing.T) {
 	require.NoError(t, mw.Close())
 	check(b.Bytes(), mw.FormDataContentType(), false)
 }
+
+// #1342: the LP import refuses, before writing anything, a key Arc could not
+// read back, including case twins split across chunks.
+func TestLPScanRefusesUnstorableNames(t *testing.T) {
+	setVar(t, &lpChunkBytes, 32)
+	for name, lp := range map[string]string{
+		"Time":        "cpu Time=1 1700000000000000000\n",
+		"not UTF-8":   "cpu t\xb0=1 1700000000000000000\n",
+		"twins apart": "cpu Temp=1 1700000000000000000\ncpu value=1 1700000000000000001\ncpu value=1 1700000000000000002\ncpu temp=2 1700000000000000003\n",
+		"tag twin":    "cpu,Host=a v=1 1700000000000000000\ncpu,host=b v=1 1700000000000000001\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, ct := multipartUpload(t, []byte(lp))
+			app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
+			var serr *importError
+			app.Post("/", func(c *fiber.Ctx) error {
+				u, ierr := importUploadFrom(c)
+				require.Nil(t, ierr)
+				_, serr = scanLPImport(u, "ns", "", nil)
+				return nil
+			})
+			req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+			req.Header.Set("Content-Type", ct)
+			_, err := app.Test(req, -1)
+			require.NoError(t, err)
+			require.NotNil(t, serr, "accepted %q", lp)
+		})
+	}
+}

@@ -6,8 +6,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path"
+	"strings"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/gofiber/fiber/v2"
 )
@@ -60,10 +64,12 @@ var clientForwardingHeaders = map[string]bool{
 	"Forwarded":           true, // RFC 7239
 	"X-Arc-Forwarded-By":  true, // internal loop marker; only the peer may set it
 	"X-Arc-Original-Host": true,
-	// arcli's installation id is recorded by the node that received the
-	// request (telemetry, client_identity.go); stripped here so a
-	// forwarded request is not counted a second time on the peer.
-	"Arcli-Installation-Id": true,
+	// Client installation ids (arcli's legacy header and the generic one
+	// the SDKs send) are recorded by the node that received the request
+	// (telemetry, client_identity.go); stripped here so a forwarded
+	// request is not counted a second time on the peer.
+	"Arcli-Installation-Id":      true,
+	"Arc-Client-Installation-Id": true,
 	// CDN / proxy client-IP headers. Not read by Arc today (identity is
 	// socket-only), stripped defensively so they cannot be trusted later.
 	"True-Client-Ip":   true, // canonical form of True-Client-IP (Akamai/Cloudflare)
@@ -75,7 +81,9 @@ var clientForwardingHeaders = map[string]bool{
 // client-controlled forwarding/identity header stripped at the forward
 // boundary. See clientForwardingHeaders.
 func isClientForwardingHeader(canonicalKey string) bool {
-	return clientForwardingHeaders[canonicalKey]
+	// The forwarded-request identity (#1305) is set by the router for each
+	// attempt; a client-sent copy never travels.
+	return clientForwardingHeaders[canonicalKey] || strings.HasPrefix(canonicalKey, security.ForwardIdentityHeaderPfx)
 }
 
 // BuildHTTPRequest converts a Fiber context to a net/http Request for
@@ -181,7 +189,66 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Set remote address for X-Forwarded-For handling in router
 	req.RemoteAddr = c.IP()
 
+	// The token this node verified for the caller: the router asserts it to
+	// a peer instead of forwarding the caller's credential (#1305).
+	var tok cluster.ForwardToken
+	if info := auth.GetTokenInfo(c); info != nil {
+		tok = cluster.ForwardToken{ID: info.ID, Fingerprint: info.Fingerprint}
+	}
+	req = req.WithContext(cluster.WithForwardToken(req.Context(), tok))
+
 	return req, nil
+}
+
+// forwardedRoutes are the requests a peer forwards (writes, imports and
+// queries; see the RouteWrite/RouteImport/RouteQuery callers). A forwarded
+// identity is accepted only on these, so it cannot stand in for a token
+// anywhere else.
+var forwardedRoutes = map[string]bool{
+	"POST /write":                      true,
+	"POST /api/v2/write":               true,
+	"POST /api/v1/write/line-protocol": true,
+	"POST /api/v1/write/msgpack":       true,
+	"POST /api/v1/write/tle":           true,
+	"POST /api/v1/import/csv":          true,
+	"POST /api/v1/import/parquet":      true,
+	"POST /api/v1/import/lp":           true,
+	"POST /api/v1/import/tle":          true,
+	"POST /api/v1/query":               true,
+	"POST /api/v1/query/msgpack":       true,
+}
+
+// ForwardIdentityChecker verifies a forwarded request's signed identity
+// (*cluster.Coordinator).
+type ForwardIdentityChecker interface {
+	VerifyForwardIdentity(values cluster.ForwardIdentityHeaderValues, method, requestURI string) (bool, cluster.ForwardToken, error)
+}
+
+// ForwardIdentityVerifier is the auth middleware's check of a forwarded
+// request's signed identity (auth.MiddlewareConfig.ForwardIdentity). The
+// request URI is the raw one received, which is what the peer signed.
+func ForwardIdentityVerifier(coord ForwardIdentityChecker) func(c *fiber.Ctx) (bool, int64, string, error) {
+	return func(c *fiber.Ctx) (bool, int64, string, error) {
+		values := func(name string) []string {
+			raw := c.Request().Header.PeekAll(name)
+			out := make([]string, len(raw))
+			for i, v := range raw {
+				out[i] = string(v)
+			}
+			return out
+		}
+		// The request URI exactly as received (Header.RequestURI): the
+		// parsed form fasthttp rebuilds can differ from the bytes the peer
+		// signed.
+		present, tok, err := coord.VerifyForwardIdentity(values, c.Method(), string(c.Request().Header.RequestURI()))
+		if !present {
+			return false, 0, "", nil
+		}
+		if err == nil && !forwardedRoutes[c.Method()+" "+path.Clean(c.Path())] {
+			err = security.ErrForwardIdentity
+		}
+		return true, tok.ID, tok.Fingerprint, err
+	}
 }
 
 // CopyResponse writes an HTTP response from the router to a Fiber context.
@@ -323,9 +390,13 @@ const IngestFencedHeader = "X-Arc-Ingest-Fenced"
 
 // IngestRefusedHeader marks a 503 that refused a write for a node-local,
 // transient condition (ingest.WriteRefusal, #676); its value is the reason,
-// e.g. "wal_disk". Nothing was written and a retry, to this node too, is
-// safe. A forwarding node and the request logger recognise it like
-// IngestFencedHeader.
+// e.g. "wal_disk". For every reason but one, nothing was written and a retry,
+// to this node too, is safe. The exception is "wal_not_durable": the WAL entry
+// that could not be made durable is refused after it was appended, so its rows
+// may still come back at the next start (ingest.ErrWALNotDurable says so). A
+// refusal never follows part of a request already buffered: that is answered
+// as a write stopped part-way, without this header (#1437). A forwarding node
+// and the request logger recognise it like IngestFencedHeader.
 const IngestRefusedHeader = "X-Arc-Ingest-Refused"
 
 // ingestRefusedLocal is the request flag the request logger reads to skip its

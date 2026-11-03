@@ -149,6 +149,12 @@ func TestValidateImportHeader(t *testing.T) {
 		{"empty column name (DoS guard)", []string{"time", "v", ""}, "time", -1, true},
 		{"rename collides with existing time", []string{"ts", "time", "v"}, "ts", -1, true},
 		{"time_column==time, no collision", []string{"time", "host"}, "time", 0, false},
+		// #1342: names Arc could not read back.
+		{"Time next to a renamed time column", []string{"ts", "Time"}, "ts", -1, true},
+		{"TIME next to time", []string{"time", "TIME"}, "time", -1, true},
+		{"time_column=Time (Grafana CSV export)", []string{"Time", "v"}, "Time", 0, false},
+		{"case twins", []string{"time", "Temp", "temp"}, "time", -1, true},
+		{"not UTF-8", []string{"time", "t\xb0"}, "time", -1, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -333,5 +339,16 @@ func TestMeasurementFilter(t *testing.T) {
 		if r.Measurement != "cpu" {
 			t.Errorf("expected measurement 'cpu', got %q", r.Measurement)
 		}
+	}
+}
+
+// #1342: a column whose spelling differs only in letter case from one the
+// measurement already has is refused.
+func TestValidateImportHeaderStoredTwin(t *testing.T) {
+	if _, err := validateImportHeader([]string{"time", "temp"}, "time", map[string]string{"temp": "Temp"}); err == nil {
+		t.Fatal("twin of a stored column accepted")
+	}
+	if _, err := validateImportHeader([]string{"time", "Temp"}, "time", map[string]string{"temp": "Temp"}); err != nil {
+		t.Fatalf("the stored spelling refused: %v", err)
 	}
 }

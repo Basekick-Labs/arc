@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
@@ -45,6 +46,10 @@ type PolicyStore struct {
 	// per-database: a bump for an unrelated database only costs one extra
 	// DB query on the next Get for the skipped name.
 	gen uint64
+
+	// cluster is the cluster's copy of the policies, used instead of the
+	// local table once it holds them (#1324; see cluster_policies.go).
+	cluster atomic.Pointer[clusterSourceHolder]
 }
 
 // NewPolicyStore creates a new policy store
@@ -120,6 +125,12 @@ func (s *PolicyStore) loadCache() error {
 
 // Get retrieves a policy for a specific database
 func (s *PolicyStore) Get(ctx context.Context, database string) (*DatabasePolicy, error) {
+	if src := s.clusterSource(); src != nil {
+		if p, ok := src.Get(database); ok {
+			return p, nil
+		}
+		return nil, nil
+	}
 	s.mu.RLock()
 	policy, exists := s.cache[database]
 	gen := s.gen
@@ -187,7 +198,20 @@ func (s *PolicyStore) getFromDB(ctx context.Context, database string) (*Database
 
 // Set creates or updates a policy for a database
 func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
+	if src := s.clusterSource(); src != nil {
+		return s.setInCluster(ctx, src, policy)
+	}
 	s.mu.Lock()
+	// Re-checked under the lock a collect's read of this table takes: the
+	// cluster may have seeded the policies, or opened a collect, while this
+	// call waited for it (#1324).
+	if src, refuse := s.localWriteLocked(); refuse != nil || src != nil {
+		s.mu.Unlock()
+		if refuse != nil {
+			return refuse
+		}
+		return s.setInCluster(ctx, src, policy)
+	}
 	defer s.mu.Unlock()
 
 	query := `
@@ -222,7 +246,17 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 
 // Delete removes a policy for a database (reverts to global defaults)
 func (s *PolicyStore) Delete(ctx context.Context, database string) error {
+	if src := s.clusterSource(); src != nil {
+		return s.deleteInCluster(ctx, src, database)
+	}
 	s.mu.Lock()
+	if src, refuse := s.localWriteLocked(); refuse != nil || src != nil {
+		s.mu.Unlock()
+		if refuse != nil {
+			return refuse
+		}
+		return s.deleteInCluster(ctx, src, database)
+	}
 	defer s.mu.Unlock()
 
 	query := `DELETE FROM tiering_policies WHERE database = ?`
@@ -233,7 +267,7 @@ func (s *PolicyStore) Delete(ctx context.Context, database string) error {
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("policy not found for database: %s", database)
+		return fmt.Errorf("policy not found for database: %s: %w", database, ErrPolicyNotFound)
 	}
 
 	// Remove from cache
@@ -249,6 +283,9 @@ func (s *PolicyStore) Delete(ctx context.Context, database string) error {
 
 // List returns all custom policies
 func (s *PolicyStore) List(ctx context.Context) ([]DatabasePolicy, error) {
+	if src := s.clusterSource(); src != nil {
+		return src.List(), nil
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

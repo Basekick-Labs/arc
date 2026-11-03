@@ -51,6 +51,9 @@ type ContinuousQueryHandler struct {
 	// lastSkipLogNano samples logSkippedRun (#676).
 	lastSkipLogNano atomic.Int64
 	fieldSchema     *fieldschema.Registry // optional, #914
+	// openCompactions: compaction jobs whose output and inputs can both be in
+	// storage (optional; see wrapOpenCompactions).
+	openCompactions OpenCompactions
 	config          *config.ContinuousQueryConfig
 	sqliteDB        *sql.DB
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
@@ -61,12 +64,35 @@ type ContinuousQueryHandler struct {
 	scheduler   CQSchedulerReloader
 	coordinator CQCoordinator
 	logger      zerolog.Logger
+	// cl is the cluster-wide state (#1324), see cq_cluster.go.
+	cl cqCluster
+	// outputFlusher flushes a run's output before its watermark is proposed
+	// in a cluster (the ingest buffer; nil without one).
+	outputFlusher cqOutputFlusher
+	// aggregateHook replaces executeAggregation in tests; nil in production.
+	aggregateHook func(ctx context.Context, cq *ContinuousQuery, query string, start time.Time) (int64, error)
+}
+
+// aggregate runs a CQ's aggregation (executeAggregation, or the test hook).
+func (h *ContinuousQueryHandler) aggregate(ctx context.Context, cq *ContinuousQuery, query string, start, end time.Time) (int64, error) {
+	if h.aggregateHook != nil {
+		return h.aggregateHook(ctx, cq, query, start)
+	}
+	return h.executeAggregation(ctx, cq, query, start, end)
 }
 
 // SetScheduler sets the CQ scheduler for reloading after updates.
 // Called after scheduler creation since it depends on the handler.
 func (h *ContinuousQueryHandler) SetScheduler(s CQSchedulerReloader) {
+	h.cl.mu.Lock()
 	h.scheduler = s
+	h.cl.scheduler = s
+	h.cl.mu.Unlock()
+	// Already adopted (a restart): hand it the cluster's CQs now, not at the
+	// mirror's next pass.
+	if src := h.adoptedSource(); src != nil {
+		h.syncJobs(src)
+	}
 }
 
 // SetCoordinator sets the cluster coordinator for writer-gate checks.
@@ -149,6 +175,11 @@ type ExecuteCQResponse struct {
 	DryRun                 bool    `json:"dry_run"`
 	ExecutedAt             string  `json:"executed_at"`
 	ExecutedQuery          string  `json:"executed_query,omitempty"`
+	// WatermarkStatus: in a cluster that adopted continuous queries, what a
+	// manual run did to last_processed_time: "set", "moved" (another run or
+	// primary moved it meanwhile; theirs is kept) or "pending" (the cluster
+	// has not taken it yet; the next run settles it).
+	WatermarkStatus string `json:"watermark_status,omitempty"`
 }
 
 // CQExecution represents an execution history record
@@ -167,6 +198,28 @@ type CQExecution struct {
 }
 
 // NewContinuousQueryHandler creates a new continuous query handler
+// sourceRead is the read_parquet expression a continuous query reads its
+// source measurement through.
+func (h *ContinuousQueryHandler) sourceRead(ctx context.Context, cq *ContinuousQuery, measurementPath string) string {
+	// Escape single quotes: DuckDB read_parquet() paths cannot be
+	// parameterized, so the path is interpolated into a SQL string literal.
+	expr := sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(measurementPath), "union_by_name=true")
+	// A continuous query reads a narrow, recent window: exactly the range in
+	// which a field absent from the newest files fails to bind. List the
+	// measurement's schema anchor first (#914).
+	if h.fieldSchema != nil {
+		if anchor, ok := h.fieldSchema.Resolve(ctx, cq.Database, cq.SourceMeasurement); ok {
+			expr = sqlutil.ReadParquetList([]string{sqlutil.QuoteStringLiteral(anchor), sqlutil.QuoteStringLiteral(measurementPath)}, "union_by_name=true")
+		}
+	}
+	// A run during a compaction's output-then-delete window would write the
+	// doubled aggregate back for good: read each job's rows once.
+	return wrapOpenCompactions(ctx, h.openCompactions, h.storage, expr, cq.Database, cq.SourceMeasurement)
+}
+
+// SetOpenCompactions wires the compaction jobs a source read must account for.
+func (h *ContinuousQueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
+
 func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
 	// continuous_query.db_path defaults to the auth database. When it resolves
 	// to the same file, borrow the auth manager's handle rather than opening a
@@ -188,7 +241,11 @@ func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arr
 		}
 
 		// Open SQLite database
-		opened, err := sql.Open("sqlite3", cfg.DBPath)
+		// The auth database's settings (#1324): the execution history's
+		// foreign key is enforced, a writer waits for the lock, and a
+		// transaction takes the write lock when it begins (the cluster
+		// mirror writes this database in the background).
+		opened, err := sql.Open("sqlite3", cfg.DBPath+dsnSep(cfg.DBPath)+"_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON&_txlock=immediate")
 		if err != nil {
 			return nil, fmt.Errorf("failed to open CQ database: %w", err)
 		}
@@ -212,6 +269,15 @@ func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arr
 			sqliteDB.Close()
 		}
 		return nil, fmt.Errorf("failed to initialize CQ tables: %w", err)
+	}
+	if arrowBuffer != nil {
+		h.outputFlusher = arrowBuffer
+	}
+	if err := h.initClusterTables(); err != nil {
+		if ownsDB {
+			sqliteDB.Close()
+		}
+		return nil, err
 	}
 
 	return h, nil
@@ -463,11 +529,22 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	// Insert query
-	result, err := h.sqliteDB.Exec(`
+	var result sql.Result
+	adopted, err := h.localWrite(func() (err error) {
+		result, err = h.sqliteDB.Exec(`
 		INSERT INTO continuous_queries
 		(name, description, database, source_measurement, destination_measurement, query, interval, tag_columns, retention_days, delete_source_after_days, is_active)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.Name.Value, req.Description.ptr(), req.Database.Value, req.SourceMeasurement.Value, req.DestinationMeasurement.Value, req.Query.Value, req.Interval.Value, tagColumnsJSON, req.RetentionDays.ptr(), req.DeleteSourceAfterDays.ptr(), isActive)
+		return err
+	})
+	if adopted != nil {
+		// Every node's scheduler picks the new CQ up from the cluster state.
+		return h.clusterCreate(c, adopted, &req, isActive)
+	}
+	if isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -510,6 +587,9 @@ func (h *ContinuousQueryHandler) handleList(c *fiber.Ctx) error {
 	isActiveStr := c.Query("is_active")
 
 	queries, err := h.getQueries(database, isActiveStr)
+	if isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list continuous queries")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -528,6 +608,9 @@ func (h *ContinuousQueryHandler) handleGet(c *fiber.Ctx) error {
 	}
 
 	cq, err := h.getQuery(int64(queryID))
+	if isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
 	}
@@ -596,9 +679,19 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 	if len(args) == 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no fields to update"})
 	}
-	result, err := h.sqliteDB.Exec(
-		"UPDATE continuous_queries SET "+assignments+", updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-		append(args, queryID)...)
+	var result sql.Result
+	adopted, err := h.localWrite(func() (err error) {
+		result, err = h.sqliteDB.Exec(
+			"UPDATE continuous_queries SET "+assignments+", updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+			append(args, queryID)...)
+		return err
+	})
+	if adopted != nil {
+		return h.clusterUpdate(c, adopted, int64(queryID), &req)
+	}
+	if isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	if err != nil {
 		// Mapped the way handleCreate maps it: name is UNIQUE, so a body
@@ -640,11 +733,20 @@ func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query ID"})
 	}
 
-	// Delete execution history first
-	_, _ = h.sqliteDB.Exec("DELETE FROM continuous_query_executions WHERE query_id = ?", queryID)
-
-	// Delete query
-	result, err := h.sqliteDB.Exec("DELETE FROM continuous_queries WHERE id = ?", queryID)
+	var result sql.Result
+	adopted, err := h.localWrite(func() (err error) {
+		// Delete execution history first
+		_, _ = h.sqliteDB.Exec("DELETE FROM continuous_query_executions WHERE query_id = ?", queryID)
+		// Delete query
+		result, err = h.sqliteDB.Exec("DELETE FROM continuous_queries WHERE id = ?", queryID)
+		return err
+	})
+	if adopted != nil {
+		return h.clusterDelete(c, adopted, int64(queryID))
+	}
+	if isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to delete continuous query")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -667,6 +769,22 @@ func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
 func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (*ExecuteCQResponse, error) {
 	start := time.Now()
 
+	// One run of a CQ at a time, scheduled or manual: each reads the
+	// watermark the previous one set.
+	release, err := h.acquireRun(ctx, queryID)
+	if err != nil {
+		return nil, fmt.Errorf("execution skipped: %w", err)
+	}
+	defer release()
+
+	// In a cluster (#1324): skipped while the cluster collects the nodes'
+	// CQs; once adopted, the definition and the watermark are the cluster's,
+	// read after catching up with the leader and settling an unsettled one.
+	src, err := h.prepareClusterRun(ctx, queryID)
+	if err != nil {
+		return nil, fmt.Errorf("execution skipped: %w", err)
+	}
+
 	// Get query definition
 	cq, err := h.getQuery(queryID)
 	if err != nil {
@@ -680,13 +798,16 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 	// Determine time range - use last processed time or default to 1 hour ago
 	var startTime, endTime time.Time
 
+	readWatermark := lastProcessedOf(cq)
 	if cq.LastProcessedTime != nil {
 		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
 		startTime = startTime.UTC()
 	} else {
 		startTime = time.Now().UTC().Add(-1 * time.Hour)
 	}
-	endTime = time.Now().UTC()
+	// Whole seconds: the window bounds go into the query as RFC3339, and the
+	// watermark is stored at that precision.
+	endTime = time.Now().UTC().Truncate(time.Second)
 
 	if !startTime.Before(endTime) {
 		return nil, fmt.Errorf("start_time must be before end_time")
@@ -706,7 +827,7 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		Msg("Executing scheduled continuous query")
 
 	// Execute the aggregation query using DuckDB
-	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
+	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
 	if err != nil && ingest.IsWriteRefusal(err) {
 		// Writes are refused (fenced, or WAL volume disk pressure, #676): the
 		// run is skipped, not failed. No execution row, which would be one
@@ -719,6 +840,9 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		executionDuration := time.Since(start).Seconds()
 
 		// Record failed execution
+		if src != nil {
+			h.ensureCQMirrored(ctx, queryID)
+		}
 		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
 
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Scheduled continuous query execution failed")
@@ -727,8 +851,13 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	executionDuration := time.Since(start).Seconds()
 
-	// Record successful execution and update last processed time atomically
-	if err := h.recordExecutionAndUpdateTime(queryID, executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
+	if src != nil {
+		// The history is this node's; the watermark is the cluster's.
+		h.ensureCQMirrored(ctx, queryID)
+		h.recordExecution(queryID, executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
+		h.commitWatermark(ctx, src, queryID, readWatermark, endTime, cq.Database, cq.DestinationMeasurement)
+	} else if err := h.recordExecutionAndUpdateTime(queryID, executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
+		// Record successful execution and update last processed time atomically
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Failed to record execution (data was written)")
 	}
 
@@ -764,6 +893,9 @@ func (h *ContinuousQueryHandler) GetCQ(queryID int64) (*ContinuousQuery, error) 
 	return h.getQuery(queryID)
 }
 
+// cqEndTimeSkew is how far in the future a manual end_time may be.
+const cqEndTimeSkew = time.Minute
+
 // handleExecute executes a continuous query
 func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	start := time.Now()
@@ -787,8 +919,35 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		})
 	}
 
+	// The CQ must exist before it gets a run slot.
+	if _, err := h.getQuery(int64(queryID)); isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
+	}
+	// A real run holds the CQ's run slot, like a scheduled one: the two read
+	// and move the same watermark.
+	var src CQClusterSource
+	if !req.DryRun {
+		release, err := h.acquireRun(c.Context(), int64(queryID))
+		if err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		}
+		defer release()
+		if src, err = h.prepareClusterRun(c.Context(), int64(queryID)); err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		}
+	} else if s, err := h.readSource(); err != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else {
+		src = s
+	}
+
 	// Get query definition
 	cq, err := h.getQuery(int64(queryID))
+	if isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
 	}
@@ -796,6 +955,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	if !cq.IsActive {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Continuous query is not active"})
 	}
+	readWatermark := lastProcessedOf(cq)
 
 	// Determine time range
 	var startTime, endTime time.Time
@@ -819,9 +979,15 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid end_time format"})
 		}
 		endTime = endTime.UTC()
+		// The run's end becomes the watermark: one in the future would make
+		// every later run fail until the clock caught up (#1324).
+		if !req.DryRun && endTime.After(time.Now().Add(cqEndTimeSkew)) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "end_time may not be more than a minute in the future"})
+		}
 	} else {
 		endTime = time.Now().UTC()
 	}
+	endTime = endTime.Truncate(time.Second)
 
 	if !startTime.Before(endTime) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start_time must be before end_time"})
@@ -868,11 +1034,14 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	// manual execute over a very wide range can't run unbounded.
 	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Minute)
 	defer cancel()
-	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
+	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
 
 		// Record failed execution
+		if src != nil {
+			h.ensureCQMirrored(c.Context(), int64(queryID))
+		}
 		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
 
 		if ingest.IsWriteRefusal(err) {
@@ -887,8 +1056,17 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 
 	executionDuration := time.Since(start).Seconds()
 
-	// Record successful execution and update last processed time atomically
-	if err := h.recordExecutionAndUpdateTime(int64(queryID), executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
+	watermarkStatus := ""
+	if src != nil {
+		// The watermark moves to this run's end, as it always has: forward,
+		// or back for an explicit end_time. A compare-and-set from the value
+		// read above, so it cannot undo a run that moved it meanwhile; the
+		// response says whether it took.
+		h.ensureCQMirrored(c.Context(), int64(queryID))
+		h.recordExecution(int64(queryID), executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
+		watermarkStatus = h.commitWatermark(c.Context(), src, int64(queryID), readWatermark, endTime, cq.Database, cq.DestinationMeasurement)
+	} else if err := h.recordExecutionAndUpdateTime(int64(queryID), executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
+		// Record successful execution and update last processed time atomically
 		h.logger.Error().Err(err).Int("query_id", queryID).Msg("Failed to record execution")
 	}
 
@@ -911,6 +1089,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		DestinationMeasurement: cq.DestinationMeasurement,
 		DryRun:                 false,
 		ExecutedAt:             time.Now().UTC().Format(time.RFC3339),
+		WatermarkStatus:        watermarkStatus,
 	})
 }
 
@@ -1071,18 +1250,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// Skip if the source measurement name matches a CTE name (it's a virtual table reference)
 	wrappedQuery := query
 	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
-		// Escape single quotes: DuckDB read_parquet() paths cannot be
-		// parameterized, so the path is interpolated into a SQL string literal.
-		readParquetExpr := sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(measurementPath), "union_by_name=true")
-		// A continuous query reads a narrow, recent window: exactly the
-		// range in which a field absent from the newest files fails to
-		// bind. List the measurement's schema anchor first (#914).
-		if h.fieldSchema != nil {
-			if anchor, ok := h.fieldSchema.Resolve(ctx, cq.Database, cq.SourceMeasurement); ok {
-				readParquetExpr = sqlutil.ReadParquetList([]string{sqlutil.QuoteStringLiteral(anchor), sqlutil.QuoteStringLiteral(measurementPath)}, "union_by_name=true")
-			}
-		}
-		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)
+		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
 	}
 
 	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")
@@ -1094,36 +1262,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	}
 	defer rows.Close()
 
-	// Get column names
-	columns, err := rows.Columns()
+	records, err := scanCQRecords(rows)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get columns: %w", err)
-	}
-
-	// Read all results
-	var records []map[string]interface{}
-	for rows.Next() {
-		// Create slice of interface{} to scan into
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return 0, fmt.Errorf("failed to scan row: %w", err)
-		}
-
-		// Convert to map
-		record := make(map[string]interface{})
-		for i, col := range columns {
-			record[col] = values[i]
-		}
-		records = append(records, record)
-	}
-
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("row iteration error: %w", err)
+		return 0, err
 	}
 
 	h.logger.Info().Int("record_count", len(records)).Msg("Aggregation query returned records")
@@ -1234,6 +1375,12 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		TagColumns:  tagColumns,
 		DedupTime:   dedupTime,
 	}
+	// An output column Arc could not read back fails the run, naming the
+	// alias, rather than breaking the destination measurement (#1342).
+	if _, drops, _ := ingest.FilterRecordNames(record, h.arrowBuffer.KnownColumns(cq.Database)); len(drops) > 0 {
+		return 0, fmt.Errorf("output column %q of measurement %q cannot be stored: %s; rename it in the query (AS ...)",
+			ingest.TruncateColumnName(drops[0].Column), cq.DestinationMeasurement, drops[0].Reason)
+	}
 	if err := h.arrowBuffer.WriteColumnarRecord(ctx, cq.Database, record); err != nil {
 		return 0, fmt.Errorf("failed to write records: %w", err)
 	}
@@ -1295,7 +1442,15 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 }
 
 // getQuery retrieves a single query by ID
+//
+// Once the cluster holds continuous queries (#1324) the CQ and its watermark
+// are the cluster's, never a row of this node's own.
 func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, error) {
+	if src, err := h.readSource(); err != nil {
+		return nil, err
+	} else if src != nil {
+		return h.clusterQuery(src, queryID)
+	}
 	row := h.sqliteDB.QueryRow(`
 		SELECT
 			cq.id, cq.name, cq.description, cq.database, cq.source_measurement, cq.destination_measurement,
@@ -1334,6 +1489,11 @@ func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, erro
 
 // getQueries retrieves all queries with optional filters
 func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]ContinuousQuery, error) {
+	if src, err := h.readSource(); err != nil {
+		return nil, err
+	} else if src != nil {
+		return h.clusterQueries(src, database, isActiveStr), nil
+	}
 	query := `
 		SELECT
 			cq.id, cq.name, cq.description, cq.database, cq.source_measurement, cq.destination_measurement,
@@ -1543,4 +1703,70 @@ func validateCQQuery(query string) error {
 		return fmt.Errorf("invalid query: %w", err)
 	}
 	return nil
+}
+
+// cqUUIDColumns reports which result columns are UUID. duckdb-go scans UUID,
+// BLOB and GEOMETRY all as []byte, and ingest stores a []byte as a binary
+// column (#440); only the DuckDB type tells them apart.
+func cqUUIDColumns(rows *sql.Rows, n int) []bool {
+	out := make([]bool, n)
+	cts, err := rows.ColumnTypes()
+	if err != nil || len(cts) != n {
+		return out
+	}
+	for i, ct := range cts {
+		out[i] = strings.EqualFold(ct.DatabaseTypeName(), "UUID")
+	}
+	return out
+}
+
+// cqUUIDText writes a UUID as its text, as every other Arc output shows it;
+// BLOB and GEOMETRY (WKB) stay bytes.
+func cqUUIDText(v interface{}) interface{} {
+	if b, ok := v.([]byte); ok && len(b) == 16 {
+		return uuid.UUID(b).String()
+	}
+	return v
+}
+
+// scanCQRecords reads a continuous query's result rows into records keyed
+// by column name. A UUID column is written as its text (#440).
+func scanCQRecords(rows *sql.Rows) ([]map[string]interface{}, error) {
+	// Get column names
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns: %w", err)
+	}
+	uuidCol := cqUUIDColumns(rows, len(columns))
+
+	// Read all results
+	var records []map[string]interface{}
+	for rows.Next() {
+		// Create slice of interface{} to scan into
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		// Convert to map
+		record := make(map[string]interface{})
+		for i, col := range columns {
+			if uuidCol[i] {
+				values[i] = cqUUIDText(values[i])
+			}
+			record[col] = values[i]
+		}
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %w", err)
+	}
+
+	return records, nil
 }

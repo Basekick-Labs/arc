@@ -9,11 +9,13 @@ import (
 // safeStream wraps a response body-stream writer so a panic inside it cannot
 // take the process down (#717).
 //
-// fasthttp runs these writers on a bare goroutine: SetBodyStreamWriter hands
-// the callback to NewStreamReader, which does `go func() { sw(bw); ... }()`
-// with no recovery of its own. Fiber's recover middleware does not help, since
-// the handler returned before the writer ever runs. An unrecovered panic there
-// is a process crash, not a failed request.
+// The writers run after the handler returned, on fasthttp's connection
+// goroutine (directBodyStream.WriteTo), so Fiber's recover middleware does not
+// cover them. fasthttp's writeBodyStream recovers a panic there, but only by
+// dropping the connection: nothing would log the cause, count the error,
+// release the query's resources or mark its registry entry. Before Arc
+// 27.01.1 the writers ran on a bare goroutine (SetBodyStreamWriter), where an
+// unrecovered panic was a process crash.
 //
 // onPanic runs only on the panic path, after the root cause has been logged,
 // and is for work that has no meaning on the happy path: disposing of a
@@ -30,10 +32,10 @@ import (
 // in flight: a second panic here would either kill the process or, being the
 // most recent value, replace the root cause in the log.
 //
-// Every body stream in this package goes through this wrapper, whether it is
-// installed with SetBodyStreamWriter directly or through
-// setBodyStreamWithTrailers (#729). CI greps for both, plus the underlying
-// NewStreamReader, and fails on any that does not mention safeStream.
+// Every body stream in this package is installed by setDirectBodyStream, which
+// applies this wrapper itself. CI fails on any SetBodyStreamWriter or
+// NewStreamReader in the package, and on any SetBodyStream outside that
+// helper.
 //
 // That includes the three writers in arcx_hook.go (#717). They build only
 // under the arcx_engine tag, which no CI or release build uses, so the grep is

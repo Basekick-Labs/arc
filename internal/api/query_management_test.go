@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 	"io"
-	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -40,7 +40,7 @@ func setupQueryManagementTest(t *testing.T) (*fiber.App, *queryregistry.Registry
 func TestQueryManagement_ListActiveQueries_Empty(t *testing.T) {
 	app, _ := setupQueryManagementTest(t)
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/active", nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/active", nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +61,7 @@ func TestQueryManagement_ListActiveQueries_WithRunning(t *testing.T) {
 	// Register a query but don't complete it
 	registry.Register(context.Background(), "SELECT * FROM test", 1, "test-token", "127.0.0.1")
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/active", nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/active", nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestQueryManagement_ListActiveQueries_WithRunning(t *testing.T) {
 func TestQueryManagement_ListHistory_Empty(t *testing.T) {
 	app, _ := setupQueryManagementTest(t)
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/history", nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/history", nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +90,7 @@ func TestQueryManagement_ListHistory_WithCompleted(t *testing.T) {
 	id, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	registry.Complete(id, 10)
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/history", nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/history", nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +108,7 @@ func TestQueryManagement_ListHistory_WithLimit(t *testing.T) {
 		registry.Complete(id, i)
 	}
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/history?limit=2", nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/history?limit=2", nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestQueryManagement_GetQuery_Active(t *testing.T) {
 
 	queryID, _ := registry.Register(context.Background(), "SELECT * FROM test", 1, "test-token", "127.0.0.1")
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/"+queryID, nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/"+queryID, nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +139,7 @@ func TestQueryManagement_GetQuery_Completed(t *testing.T) {
 	queryID, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	registry.Complete(queryID, 5)
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/"+queryID, nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/"+queryID, nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestQueryManagement_GetQuery_Completed(t *testing.T) {
 func TestQueryManagement_GetQuery_NotFound(t *testing.T) {
 	app, _ := setupQueryManagementTest(t)
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/nonexistent", nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/nonexistent", nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +167,7 @@ func TestQueryManagement_CancelQuery(t *testing.T) {
 
 	queryID, ctx := registry.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1")
 
-	req, _ := http.NewRequest("DELETE", "/api/v1/queries/"+queryID, nil)
+	req := httptest.NewRequest("DELETE", "/api/v1/queries/"+queryID, nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +193,7 @@ func TestQueryManagement_CancelQuery(t *testing.T) {
 func TestQueryManagement_CancelQuery_NotFound(t *testing.T) {
 	app, _ := setupQueryManagementTest(t)
 
-	req, _ := http.NewRequest("DELETE", "/api/v1/queries/nonexistent", nil)
+	req := httptest.NewRequest("DELETE", "/api/v1/queries/nonexistent", nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -209,7 +209,7 @@ func TestQueryManagement_CancelQuery_AlreadyCompleted(t *testing.T) {
 	queryID, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	registry.Complete(queryID, 1)
 
-	req, _ := http.NewRequest("DELETE", "/api/v1/queries/"+queryID, nil)
+	req := httptest.NewRequest("DELETE", "/api/v1/queries/"+queryID, nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +228,7 @@ func TestQueryManagement_LicenseRequired(t *testing.T) {
 	handler := NewQueryManagementHandler(registry, nil, nil, zerolog.Nop())
 	handler.RegisterRoutes(app)
 
-	req, _ := http.NewRequest("GET", "/api/v1/queries/active", nil)
+	req := httptest.NewRequest("GET", "/api/v1/queries/active", nil)
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Fatal(err)

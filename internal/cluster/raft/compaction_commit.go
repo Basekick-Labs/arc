@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"path"
 	"sort"
 	"strings"
@@ -373,6 +374,58 @@ func (f *ClusterFSM) StagedCompactionCount() int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return len(f.staged)
+}
+
+// FinalizingObjectUnder reports whether a committed object job's output is
+// under prefix (the read path's check, made on every query: no copies).
+func (f *ClusterFSM) FinalizingObjectUnder(prefix string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, s := range f.staged {
+		if s.Object && s.Finalizing && strings.HasPrefix(s.Output.Path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// FinalizingObjectJobsUnder returns a copy of each committed object job
+// whose output is under prefix.
+func (f *ClusterFSM) FinalizingObjectJobsUnder(prefix string) []StagedCompaction {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var out []StagedCompaction
+	for _, s := range f.staged {
+		if s.Object && s.Finalizing && strings.HasPrefix(s.Output.Path, prefix) {
+			out = append(out, copyStaged(s))
+		}
+	}
+	return out
+}
+
+// ObjectStagedSignature changes whenever an object job is staged, commits,
+// finalizes or leaves (no copies; independent of map order).
+func (f *ClusterFSM) ObjectStagedSignature() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var sig uint64
+	for _, s := range f.staged {
+		if !s.Object {
+			continue
+		}
+		h := fnv.New64a()
+		h.Write([]byte(s.Job))
+		h.Write([]byte{boolByte(s.Finalizing), boolByte(s.Finalized)})
+		sig += h.Sum64()
+	}
+	return sig
+}
+
+func boolByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // StagedCompactionByJob returns a copy of one staged job.
@@ -1014,8 +1067,31 @@ func (f *ClusterFSM) StagedCompactionOwns(path string) bool {
 	return ok
 }
 
+// StagedInputFor returns path as an input of the staged job that owns it, if
+// it is one (an output is not). A map lookup: the registration outbox asks for
+// every file it registers (#1358).
+func (f *ClusterFSM) StagedInputFor(path string) (CompactionInput, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	job, ok := f.stagedPaths[path]
+	if !ok {
+		return CompactionInput{}, false
+	}
+	s := f.staged[job]
+	if s == nil {
+		return CompactionInput{}, false
+	}
+	for _, in := range s.Inputs {
+		if in.Path == path {
+			return CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256}, true
+		}
+	}
+	return CompactionInput{}, false
+}
+
 // FileByCompactionJob returns the registered file a compaction job's commit
-// registered (a scan: for leftover staged directories only).
+// registered. A scan of the manifest: callers on a hot path memoise it (the
+// coordinator's pending local deletes resolve it at most every few seconds).
 func (f *ClusterFSM) FileByCompactionJob(job string) (*FileEntry, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()

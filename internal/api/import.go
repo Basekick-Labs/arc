@@ -240,7 +240,7 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	// Validation pass: everything that would fail the import is refused
 	// here, before a row is written. It keeps only the measurements and the
 	// kind of each field, not the rows.
-	scan, ierr := scanLPImport(upload, precision, measurementFilter, h.arrowBuffer.IsDecimalColumn)
+	scan, ierr := scanLPImport(upload, precision, measurementFilter, h.arrowBuffer.IsDecimalColumn, writableKnownColumns(c, h.rbacManager, database, h.arrowBuffer.KnownColumns(database)))
 	if ierr != nil {
 		h.totalErrors.Add(1)
 		return h.importErrorResponse(c, ierr)
@@ -269,6 +269,9 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	w, err := newImportWriter(writeCtx, h.arrowBuffer, database)
 	if err != nil {
 		h.totalErrors.Add(1)
+		if ingest.IsWriteRefusal(err) { // every write slot stayed busy (#1429)
+			return respondWriteRefused(c, err)
+		}
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "import rejected (retry): " + err.Error()})
 	}
 	defer w.close()
@@ -290,6 +293,9 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err) // logged by reason (#1268)
 		}
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: failed to write to buffer")
 		// 503 for the two retryable buffer states: nothing of this import
 		// was written (a partial import answered above).
@@ -305,10 +311,11 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	totalRows := w.rows
 	importedMeasurements := w.order
 
-	// Hand what is still buffered to the flush. The rows are in the buffer
+	// Hand what is still buffered of the import to the flush, its write slot
+	// already free for the next import (#1429). The rows are in the buffer
 	// and the WAL (when enabled) already; files follow as their flushes
 	// finish, so a 200 does not mean every file is written.
-	if err := h.arrowBuffer.FlushAll(c.Context()); err != nil {
+	if err := w.finalFlush(c.Context()); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -540,6 +547,9 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		h.totalErrors.Add(1)
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err) // logged by reason (#1268)
+		}
+		if errors.Is(err, ingest.ErrColumnTypeChange) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
 		h.logger.Error().Err(err).
 			Str("database", database).

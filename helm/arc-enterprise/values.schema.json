@@ -116,6 +116,10 @@
               "minimum": 1,
               "maximum": 256
             },
+            "pullBytesPerSecond": {
+              "type": "integer",
+              "minimum": 0
+            },
             "fetchTimeoutMs": {
               "type": "integer",
               "minimum": 1000
@@ -157,6 +161,13 @@
         "shared": {
           "type": "object",
           "properties": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "s3",
+                "gcs"
+              ]
+            },
             "external": {
               "type": "boolean"
             },
@@ -193,6 +204,21 @@
                 },
                 "secretKey": {
                   "type": "string"
+                }
+              }
+            },
+            "gcs": {
+              "type": "object",
+              "properties": {
+                "endpoint": {
+                  "type": "string"
+                },
+                "credentialsSecret": {
+                  "type": "string"
+                },
+                "credentialsKey": {
+                  "type": "string",
+                  "minLength": 1
                 }
               }
             }

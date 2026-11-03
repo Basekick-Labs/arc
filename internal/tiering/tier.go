@@ -8,7 +8,7 @@ type Tier string
 const (
 	// TierHot represents local/fast storage for recent data
 	TierHot Tier = "hot"
-	// TierCold represents S3/Azure archive storage for historical data
+	// TierCold represents S3/Azure/GCS archive storage for historical data
 	TierCold Tier = "cold"
 )
 
@@ -86,7 +86,7 @@ type MigrationRecord struct {
 type TieredPath struct {
 	Path    string `json:"path"`
 	Tier    Tier   `json:"tier"`
-	Backend string `json:"backend"` // "local", "s3", "azure"
+	Backend string `json:"backend"` // "local", "s3", "azure", "gcs"
 }
 
 // TierStats holds statistics for a single tier

@@ -13,7 +13,8 @@ import (
 const ObjectSHAMetadata = "arcsha256"
 
 // ObjectCopier is an object store that can stage a compaction output and copy
-// it into place inside the store (#1207 d2a2b): the S3 and Azure backends.
+// it into place inside the store (#1207 d2a2b): the S3, Azure and GCS
+// backends.
 type ObjectCopier interface {
 	// WriteReaderWithSHA is WriteReader recording sha as the object's
 	// ObjectSHAMetadata.
@@ -30,6 +31,7 @@ type ObjectCopier interface {
 var (
 	_ ObjectCopier = (*S3Backend)(nil)
 	_ ObjectCopier = (*AzureBlobBackend)(nil)
+	_ ObjectCopier = (*GCSBackend)(nil)
 )
 
 // shaMetadata is the metadata map recording sha.
