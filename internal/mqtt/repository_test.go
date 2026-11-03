@@ -1,9 +1,11 @@
 package mqtt
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -64,6 +66,73 @@ func TestRepository_OwnedDBIsClosed(t *testing.T) {
 func TestNewRepository_RejectsNilDB(t *testing.T) {
 	if _, err := NewRepository(nil, nil, zerolog.Nop()); err == nil {
 		t.Fatal("expected an error for a nil database handle")
+	}
+}
+
+func TestRepository_TopicMappingReadsLegacyAndObjectJSON(t *testing.T) {
+	repo, err := NewSQLiteRepository(filepath.Join(t.TempDir(), "mqtt.db"), nil, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewSQLiteRepository: %v", err)
+	}
+	defer func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	sub := &Subscription{
+		ID:       "topic-mapping",
+		Name:     "topic-mapping",
+		Broker:   "tcp://localhost:1883",
+		ClientID: "topic-mapping-client",
+		Topics:   []string{"sensors/#"},
+		Database: "default",
+	}
+	if err := repo.Create(context.Background(), sub); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	legacyJSON := `{"sensors/line-7":"iot"}`
+	if _, err := repo.db.Exec(`UPDATE mqtt_subscriptions SET topic_mapping = ? WHERE id = ?`, legacyJSON, sub.ID); err != nil {
+		t.Fatalf("store legacy mapping: %v", err)
+	}
+	got, err := repo.Get(context.Background(), sub.ID)
+	if err != nil {
+		t.Fatalf("Get legacy mapping: %v", err)
+	}
+	if got.TopicMapping["sensors/line-7"].Database != "iot" {
+		t.Fatalf("legacy mapping = %#v", got.TopicMapping)
+	}
+	if err := repo.Update(context.Background(), got); err != nil {
+		t.Fatalf("Update legacy mapping: %v", err)
+	}
+	var persisted string
+	if err := repo.db.QueryRow(`SELECT topic_mapping FROM mqtt_subscriptions WHERE id = ?`, sub.ID).Scan(&persisted); err != nil {
+		t.Fatalf("read persisted legacy mapping: %v", err)
+	}
+	if !strings.Contains(persisted, `"sensors/line-7":"iot"`) {
+		t.Fatalf("legacy mapping JSON shape changed: %s", persisted)
+	}
+
+	objectJSON := `{"factory/+/+/metrics":{"measurement":"machine_metrics","tags_from_topic":[{"position":1,"tag_name":"line"}]}}`
+	if _, err := repo.db.Exec(`UPDATE mqtt_subscriptions SET topic_mapping = ? WHERE id = ?`, objectJSON, sub.ID); err != nil {
+		t.Fatalf("store object mapping: %v", err)
+	}
+	got, err = repo.Get(context.Background(), sub.ID)
+	if err != nil {
+		t.Fatalf("Get object mapping: %v", err)
+	}
+	if got.TopicMapping["factory/+/+/metrics"].Measurement != "machine_metrics" {
+		t.Fatalf("object mapping = %#v", got.TopicMapping)
+	}
+	if err := repo.Update(context.Background(), got); err != nil {
+		t.Fatalf("Update object mapping: %v", err)
+	}
+	if err := repo.db.QueryRow(`SELECT topic_mapping FROM mqtt_subscriptions WHERE id = ?`, sub.ID).Scan(&persisted); err != nil {
+		t.Fatalf("read persisted object mapping: %v", err)
+	}
+	if !strings.Contains(persisted, `"factory/+/+/metrics":{"measurement":"machine_metrics"`) {
+		t.Fatalf("object mapping JSON shape changed: %s", persisted)
 	}
 }
 

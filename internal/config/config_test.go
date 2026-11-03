@@ -80,6 +80,49 @@ func TestDefaultMaxConnections(t *testing.T) {
 	}
 }
 
+func TestReplicationPullBandwidthConfig(t *testing.T) {
+	t.Run("default unlimited", func(t *testing.T) {
+		v := viper.New()
+		setDefaults(v)
+		if got := v.GetInt64("cluster.replication_pull_bytes_per_second"); got != 0 {
+			t.Fatalf("replication pull bandwidth default = %d, want 0", got)
+		}
+	})
+
+	t.Run("environment override", func(t *testing.T) {
+		t.Setenv("ARC_CLUSTER_REPLICATION_PULL_BYTES_PER_SECOND", "4096")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := cfg.Cluster.ReplicationPullBytesPerSecond; got != 4096 {
+			t.Fatalf("replication pull bandwidth = %d, want 4096", got)
+		}
+	})
+
+	t.Run("size string", func(t *testing.T) {
+		t.Setenv("ARC_CLUSTER_REPLICATION_PULL_BYTES_PER_SECOND", "10MB")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := cfg.Cluster.ReplicationPullBytesPerSecond; got != 10*1024*1024 {
+			t.Fatalf("replication pull bandwidth = %d, want %d", got, 10*1024*1024)
+		}
+	})
+
+	// GetInt64 read both of these as 0, "unlimited"; a negative value reached
+	// the fetch client and switched peer replication off with one log line.
+	for _, bad := range []string{"-1", "10MiB", "fast"} {
+		t.Run("rejects "+bad, func(t *testing.T) {
+			t.Setenv("ARC_CLUSTER_REPLICATION_PULL_BYTES_PER_SECOND", bad)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "cluster.replication_pull_bytes_per_second") {
+				t.Fatalf("Load error = %v, want one naming cluster.replication_pull_bytes_per_second", err)
+			}
+		})
+	}
+}
+
 // TestGetDefaultMaxConnections_StaysMachineDerived pins the #1030 decision that
 // max_connections is NOT quota-derived: it bounds statements in flight, not CPU
 // work, and Arc queries are frequently S3-I/O-bound, so a 2-CPU pod dropping
@@ -807,6 +850,10 @@ func TestParseSize_InvalidSizes(t *testing.T) {
 		{"abc", "non-numeric"},
 		{"GB", "no number"},
 		{"MB100", "reversed format"},
+		// Out of int64 range: the float-to-int64 conversion would give
+		// MinInt64 on amd64 and slip past the negative check (#397).
+		{"99999999999GB", "overflowing size"},
+		{"8589934592GB", "exactly 2^63 bytes"},
 	}
 
 	for _, tt := range tests {
@@ -1680,5 +1727,23 @@ func TestLoad_GCSColdTierValidation(t *testing.T) {
 				t.Fatalf("Load() error = %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// Azure credentials read from a file usually end in a newline; every consumer
+// must see the same trimmed value.
+func TestLoad_AzureCredentialsTrimmed(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("ARC_STORAGE_BACKEND", "azure")
+	t.Setenv("ARC_STORAGE_AZURE_ACCOUNT_NAME", "acct")
+	t.Setenv("ARC_STORAGE_AZURE_CONTAINER", "c")
+	t.Setenv("ARC_STORAGE_AZURE_SAS_TOKEN", "sv=1&sig=abc\n")
+	t.Setenv("ARC_STORAGE_AZURE_ACCOUNT_KEY", " key== \n")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Storage.AzureSASToken != "sv=1&sig=abc" || cfg.Storage.AzureAccountKey != "key==" {
+		t.Fatalf("not trimmed: %q %q", cfg.Storage.AzureSASToken, cfg.Storage.AzureAccountKey)
 	}
 }

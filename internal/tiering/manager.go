@@ -718,6 +718,49 @@ func (m *Manager) coldTierUsable() bool {
 	return m != nil && m.coldBackend != nil && m.config != nil && m.config.Cold.Enabled
 }
 
+// PreviewMigration returns the currently indexed candidates for a manual
+// filtered migration without copying, flipping metadata, or deleting files.
+func (m *Manager) PreviewMigration(ctx context.Context, fromTier, toTier Tier, database, measurement string) ([]MigrationCandidate, error) {
+	if m.roleGated() {
+		return nil, ErrMigrationRoleGated
+	}
+	if m.licenseClient != nil && !m.licenseClient.CanUseTieredStorage() {
+		return nil, fmt.Errorf("tiered storage license is not available")
+	}
+	if fromTier != TierHot || toTier != TierCold {
+		return nil, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
+	}
+	if !m.coldTierUsable() {
+		return nil, fmt.Errorf("cold tier is not enabled")
+	}
+	return m.migrator.FindCandidatesFiltered(ctx, fromTier, toTier, database, measurement)
+}
+
+// TriggerFilteredMigration runs a manual migration against an optional
+// database/measurement filter. It shares the cycle guard with the scheduler
+// so a manual request cannot race a scheduled migration.
+func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier Tier, database, measurement string) (int, int, error) {
+	if m.roleGated() {
+		return 0, 0, ErrMigrationRoleGated
+	}
+	if m.licenseClient != nil && !m.licenseClient.CanUseTieredStorage() {
+		return 0, 0, nil
+	}
+	if fromTier != TierHot || toTier != TierCold {
+		return 0, 0, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
+	}
+	if !m.coldTierUsable() {
+		return 0, 0, fmt.Errorf("cold tier is not enabled")
+	}
+	if !m.cycleRunning.CompareAndSwap(false, true) {
+		return 0, 0, ErrMigrationCycleRunning
+	}
+	defer m.cycleRunning.Store(false)
+
+	migrated, failed := m.migrator.MigrateTierFiltered(ctx, fromTier, toTier, database, measurement)
+	return migrated, failed, nil
+}
+
 // ColdTierMissing reports a cold tier that is configured on but has no
 // backend on this node: its construction failed at startup (a bad endpoint,
 // credentials that could not be resolved). Every cold accessor then answers

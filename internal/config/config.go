@@ -165,6 +165,16 @@ type IngestConfig struct {
 	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
+	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
+	// csv, parquet) write at once on this node (#1429). 0 = auto: as many
+	// as fit an eighth of the memory limit at one import allowance each,
+	// at most the CPUs Arc runs on, at least 1. An explicit value (at most
+	// 1024) is used as is, without the memory calculation.
+	ImportWriteConcurrency int
+	// ImportQueueTimeoutMS is how long an import waits for a write slot
+	// before it is refused with 503 and nothing written (#1429). 0 = until a
+	// slot frees: the server does not see a client that gives up.
+	ImportQueueTimeoutMS int
 }
 
 type CacheConfig struct {
@@ -482,6 +492,10 @@ type WALConfig struct {
 	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
 	// much written data a sync may leave behind, not the writer's throughput.
 	SyncBytes int64
+	// AckMode is when a write is acknowledged with the WAL on: "queued" (the
+	// default) once its entry is queued for the WAL writer, or "durable" once
+	// a sync covering it has completed. See wal.AckMode.
+	AckMode string
 	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
 	// volume is low on free space, and keeps the WAL reserve file (#676).
 	// Default true; only acts with the WAL enabled.
@@ -841,11 +855,12 @@ type ClusterConfig struct {
 	// These gate and tune the background puller that replicates Parquet files
 	// between nodes over the coordinator TCP protocol. Only takes effect when
 	// ReplicationEnabled && Enabled and FeatureClustering is licensed.
-	ReplicationPullWorkers      int // Number of concurrent fetch workers per node (default: 4)
-	ReplicationQueueSize        int // Buffered FSM callback queue size (default: 1024)
-	ReplicationFetchTimeoutMs   int // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
-	ReplicationServeTimeoutMs   int // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
-	ReplicationRetryMaxAttempts int // Max immediate retry attempts per enqueue (default: 3)
+	ReplicationPullWorkers        int   // Number of concurrent fetch workers per node (default: 4)
+	ReplicationPullBytesPerSecond int64 // Aggregate inbound puller bandwidth per node, bytes/s (0 = unlimited; staged compaction fetches are not capped)
+	ReplicationQueueSize          int   // Buffered FSM callback queue size (default: 1024)
+	ReplicationFetchTimeoutMs     int   // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
+	ReplicationServeTimeoutMs     int   // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
+	ReplicationRetryMaxAttempts   int   // Max immediate retry attempts per enqueue (default: 3)
 
 	// Peer file replication catch-up and periodic reconciliation (Phase 3).
 	// These control the startup walker and the repeatable manifest rechecks
@@ -1031,6 +1046,14 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid cluster.stream_takeover_departed_ttl %q: must be a Go duration of at least 1m", v.GetString("cluster.stream_takeover_departed_ttl"))
 	}
 
+	// Peer replication bandwidth cap (#397). Parsed as a size so "10MB" means
+	// what it says: GetInt64 turns anything it cannot parse into 0, which is
+	// "unlimited", and a negative value used to switch replication off.
+	pullBytesPerSecond, err := ParseSize(v.GetString("cluster.replication_pull_bytes_per_second"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid cluster.replication_pull_bytes_per_second %q: must be 0 (unlimited) or a positive size such as 10MB: %w", v.GetString("cluster.replication_pull_bytes_per_second"), err)
+	}
+
 	// math.IsNaN via self-comparison: NaN would disable the breaker silently.
 	if f := v.GetFloat64("cluster.stale_local_sweep_max_fraction"); f != f || f <= 0 {
 		return nil, fmt.Errorf("invalid cluster.stale_local_sweep_max_fraction %v: must be a number above 0 (above 1 never refuses a pass)", v.Get("cluster.stale_local_sweep_max_fraction"))
@@ -1117,21 +1140,23 @@ func Load() (*Config, error) {
 			GCSEndpoint:        v.GetString("storage.gcs_endpoint"),
 		},
 		Ingest: IngestConfig{
-			MaxBufferSize:         v.GetInt("ingest.max_buffer_size"),
-			MaxBufferAgeMS:        v.GetInt("ingest.max_buffer_age_ms"),
-			Compression:           v.GetString("ingest.compression"),
-			UseDictionary:         v.GetBool("ingest.use_dictionary"),
-			NumericDictionary:     v.GetBool("ingest.numeric_dictionary"),
-			WriteStatistics:       v.GetBool("ingest.write_statistics"),
-			DataPageVersion:       v.GetString("ingest.data_page_version"),
-			FlushWorkers:          v.GetInt("ingest.flush_workers"),
-			FlushQueueSize:        v.GetInt("ingest.flush_queue_size"),
-			FlushTimeoutSeconds:   v.GetInt("ingest.flush_timeout_seconds"),
-			ShardCount:            v.GetInt("ingest.shard_count"),
-			SortKeys:              v.GetStringSlice("ingest.sort_keys"),
-			DefaultSortKeys:       v.GetString("ingest.default_sort_keys"),
-			DecimalColumns:        v.GetStringSlice("ingest.decimal_columns"),
-			DefaultDecimalColumns: v.GetString("ingest.default_decimal_columns"),
+			MaxBufferSize:          v.GetInt("ingest.max_buffer_size"),
+			MaxBufferAgeMS:         v.GetInt("ingest.max_buffer_age_ms"),
+			Compression:            v.GetString("ingest.compression"),
+			UseDictionary:          v.GetBool("ingest.use_dictionary"),
+			NumericDictionary:      v.GetBool("ingest.numeric_dictionary"),
+			WriteStatistics:        v.GetBool("ingest.write_statistics"),
+			DataPageVersion:        v.GetString("ingest.data_page_version"),
+			FlushWorkers:           v.GetInt("ingest.flush_workers"),
+			FlushQueueSize:         v.GetInt("ingest.flush_queue_size"),
+			FlushTimeoutSeconds:    v.GetInt("ingest.flush_timeout_seconds"),
+			ShardCount:             v.GetInt("ingest.shard_count"),
+			SortKeys:               v.GetStringSlice("ingest.sort_keys"),
+			DefaultSortKeys:        v.GetString("ingest.default_sort_keys"),
+			DecimalColumns:         v.GetStringSlice("ingest.decimal_columns"),
+			DefaultDecimalColumns:  v.GetString("ingest.default_decimal_columns"),
+			ImportWriteConcurrency: v.GetInt("ingest.import_write_concurrency"),
+			ImportQueueTimeoutMS:   v.GetInt("ingest.import_queue_timeout_ms"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -1216,6 +1241,7 @@ func Load() (*Config, error) {
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
+			AckMode:                 v.GetString("wal.ack_mode"),
 			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
 			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
 			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
@@ -1341,6 +1367,7 @@ func Load() (*Config, error) {
 			ReplicationEnabled: v.GetBool("cluster.replication_enabled"),
 			// Peer file replication (Enterprise Phase 2)
 			ReplicationPullWorkers:                   v.GetInt("cluster.replication_pull_workers"),
+			ReplicationPullBytesPerSecond:            pullBytesPerSecond,
 			ReplicationQueueSize:                     v.GetInt("cluster.replication_queue_size"),
 			ReplicationFetchTimeoutMs:                v.GetInt("cluster.replication_fetch_timeout_ms"),
 			ReplicationServeTimeoutMs:                v.GetInt("cluster.replication_serve_timeout_ms"),
@@ -1438,6 +1465,24 @@ func Load() (*Config, error) {
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
 	}
+	switch cfg.WAL.AckMode {
+	case "queued", "durable":
+	default:
+		return nil, fmt.Errorf("wal.ack_mode must be queued or durable, got %q", cfg.WAL.AckMode)
+	}
+	// The covered append (cluster.wal_coverage) commits under the ingest shard
+	// lock, where waiting for a sync would stall every writer to that
+	// measurement: durable acknowledgement does not support it yet.
+	if !cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" {
+		cfg.Warnings = append(cfg.Warnings, LoadWarning{
+			Key:     "wal.ack_mode",
+			Value:   cfg.WAL.AckMode,
+			Message: "wal.ack_mode = \"durable\" has no effect while wal.enabled = false: writes are acknowledged without a WAL",
+		})
+	}
+	if cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" && cfg.Cluster.WALCoverage {
+		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true")
+	}
 	if cfg.WAL.DiskMinFreeMB < 0 {
 		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
 	}
@@ -1456,6 +1501,12 @@ func Load() (*Config, error) {
 	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
+	}
+	if cfg.Ingest.ImportWriteConcurrency < 0 || cfg.Ingest.ImportWriteConcurrency > 1024 {
+		return nil, fmt.Errorf("invalid ingest.import_write_concurrency value: %d (must be 0-1024; 0 = auto)", cfg.Ingest.ImportWriteConcurrency)
+	}
+	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
+		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
 	}
 	// A negative max_concurrent would reach make(chan struct{}, m.MaxConcurrent)
 	// in the compaction manager's cycle loop and panic the process at the first
@@ -1487,6 +1538,11 @@ func Load() (*Config, error) {
 	cfg.Storage.S3Region = strings.TrimSpace(cfg.Storage.S3Region)
 	cfg.Storage.S3Endpoint = strings.TrimSpace(cfg.Storage.S3Endpoint)
 	cfg.Storage.AzureConnectionString = strings.TrimSpace(cfg.Storage.AzureConnectionString)
+	// Credentials too: a value read from a file usually ends in a newline,
+	// and every consumer (the backend, the DuckDB secret, the compaction
+	// subprocess) must see the same string.
+	cfg.Storage.AzureAccountKey = strings.TrimSpace(cfg.Storage.AzureAccountKey)
+	cfg.Storage.AzureSASToken = strings.TrimSpace(cfg.Storage.AzureSASToken)
 	cfg.Storage.AzureAccountName = strings.TrimSpace(cfg.Storage.AzureAccountName)
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
 	cfg.Storage.AzurePrefix = strings.TrimSpace(cfg.Storage.AzurePrefix)
@@ -1570,6 +1626,8 @@ func Load() (*Config, error) {
 		cold.S3Region = strings.TrimSpace(cold.S3Region)
 		cold.S3Endpoint = strings.TrimSpace(cold.S3Endpoint)
 		cold.AzureConnectionString = strings.TrimSpace(cold.AzureConnectionString)
+		cold.AzureAccountKey = strings.TrimSpace(cold.AzureAccountKey)
+		cold.AzureSASToken = strings.TrimSpace(cold.AzureSASToken)
 		cold.AzureAccountName = strings.TrimSpace(cold.AzureAccountName)
 		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
 		cold.AzurePrefix = strings.TrimSpace(cold.AzurePrefix)
@@ -1978,6 +2036,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
 	v.SetDefault("ingest.decimal_columns", []string{})
 	v.SetDefault("ingest.default_decimal_columns", "")
+	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
+	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -2075,6 +2135,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
+	v.SetDefault("wal.ack_mode", "queued")             // Acknowledge once queued; "durable" waits for the covering sync
 	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
 	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
 	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes
@@ -2199,6 +2260,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_enabled", false) // Disabled by default
 	// Peer file replication (Enterprise Phase 2)
 	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
+	v.SetDefault("cluster.replication_pull_bytes_per_second", 0) // Unlimited aggregate inbound bytes per second
 	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue
 	v.SetDefault("cluster.replication_fetch_timeout_ms", 60000)  // 60s puller-side per-fetch timeout
 	v.SetDefault("cluster.replication_serve_timeout_ms", 120000) // 120s origin-side body-stream timeout
@@ -2811,6 +2873,12 @@ func ParseSize(sizeStr string) (int64, error) {
 			}
 			if num < 0 {
 				return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
+			}
+			// Bound before converting: an out-of-range float-to-int64
+			// conversion is implementation-defined, and on amd64 gives
+			// MinInt64, a negative size the checks above have already passed.
+			if num*float64(unit.multiplier) >= math.MaxInt64 {
+				return 0, fmt.Errorf("size too large: %s", sizeStr)
 			}
 			return int64(num * float64(unit.multiplier)), nil
 		}

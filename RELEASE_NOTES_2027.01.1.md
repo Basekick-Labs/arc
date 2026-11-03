@@ -2,6 +2,144 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
+
+`GET /api/v1/write/msgpack/spec` said authentication was "not yet
+implemented", although the route it describes (and the spec route itself)
+requires a token. The document now matches the code:
+
+- `authentication`: `Authorization: Bearer <token>`, also `Token <token>`, a bare `Authorization: <token>`,
+  `x-api-key` and the deprecated `?p=`; write permission is required.
+- New sections: `database` (the `x-arc-database` header, default `default`),
+  `time` (seconds, milliseconds, microseconds or nanoseconds, detected from the
+  first value; nanoseconds were missing), `responses` (status codes), and
+  `method`.
+- Columnar format documents `tag_keys`, and the columnar example now uses it.
+- `compression` is now an object: detection by magic bytes and the payload
+  limits. `content_type` notes that the server does not check it.
+- The `performance` section is removed. Its throughput figures were years out
+  of date; current numbers are in the README.
+
+Clients that read `authentication.header` now get `Authorization` instead of
+`x-api-key`. Clients that read `compression` as a string need to read the new
+object.
+
+**Behaviour change: a bad item in a MessagePack batch is reported.** In a
+`batch`, or a top-level array of items, an item that could not be decoded (no
+`fields`, columns of different lengths, a time that is not a number, an item
+that is not a map) was logged and skipped, and the request answered **204** as
+if everything had been written. It is now dropped the way any other point that
+cannot be written is: the other items are still written, and the request
+answers **400** `partial write: N points dropped: ... an item of the batch or
+array could not be decoded: <reason>; the other points were written`. Each
+dropped item counts as one point, however many rows it held. A client that treated 204 as "all written"
+was silently losing those items; one that retries on 400 should not retry a
+partial write, since the rest is already stored. A batch nested inside a
+batch or array, which answered 500 and stored nothing, is now written like a
+top-level one.
+
+## Fix: a cluster node stalled for 15 seconds or more rejoins Raft ([#1431](https://github.com/Basekick-Labs/arc/issues/1431))
+
+A Raft node that stopped responding for about 15 seconds or longer (a paused
+container, a long GC or I/O stall, a VM migration) never rejoined once it
+resumed. It logged `raft auth handshake (accept): read client mac: EOF` and
+`pre-vote campaign failed` about once a second until it was restarted, while
+`/health`, `/ready` and `/api/v1/cluster/nodes` still reported it healthy. Raft
+stopped applying its file registrations, and on shared storage every `DELETE`
+and database drop answered 503 unless `allow_unreachable=true` was passed.
+
+The cause was the interaction between the Raft peer-authentication handshake
+and hashicorp/raft's accept loop. The connections that queued up during the
+stall had already been abandoned by their peers, so each one failed its
+handshake. raft then waited up to a second before accepting the next one, and
+by the time it did, that peer had given up too.
+
+Handshakes now run alongside each other, off raft's accept loop, and raft
+only ever receives connections that passed. Abandoned connections drain at
+once, and a peer that connects without speaking no longer delays the others.
+In testing, nodes paused for 15 s and for 40 s both rejoined without a restart.
+
+What operators see in logs changes:
+
+- A peer that answers and is refused — a full handshake response that does not
+  verify (a wrong `cluster.shared_secret` or cluster name), or a TLS client
+  certificate that fails verification (`cluster.tls_enabled`) — is logged
+  as a Warn, `Rejected Raft connection: peer failed authentication`, with the
+  error and remote address. Each source host is logged at most once every
+  10 seconds, and the Warn carries a count of the rejections suppressed since
+  the previous one. These used to appear as a raft
+  `failed to accept connection` error line per attempt.
+- A connection whose peer hung up, went silent or sent only part of a
+  handshake response, which is routine after a stall, is logged at Debug only.
+  A port scan, or a probe that sends fewer bytes than a handshake response, is
+  therefore no longer visible at the default log level.
+
+A node whose Raft startup fails before the Raft instance is created (for example,
+an unopenable log store) now releases the Raft port instead of holding it
+until the process exits.
+
+No configuration change. Every node can be upgraded independently; the
+handshake on the wire is unchanged.
+
+## Fix: Google Cloud Storage through the S3-compatible endpoint (#1399)
+
+GCS S3 interoperability now leaves `Accept-Encoding` out of request signatures
+while preserving the SDK's identity encoding on the wire. Optional upload
+checksum trailers are disabled for `storage.googleapis.com`, allowing object
+writes without the SDK's streaming trailer format. Other S3 endpoints retain
+their existing signing and checksum behavior.
+
+## New: MQTT topic mappings can set measurements and tags (#479)
+
+`topic_mapping` still accepts the existing topic-to-database strings and now
+also accepts rule objects:
+
+```json
+"topic_mapping": {
+  "factory/+/+/metrics": {
+    "measurement": "machine_metrics",
+    "tags_from_topic": [
+      {"position": 1, "tag_name": "line"},
+      {"position": 2, "tag_name": "machine_id"}
+    ]
+  },
+  "legacy/topic": "otherdb"
+}
+```
+
+- A key is an MQTT topic filter: `+` matches one level, a trailing `#` any
+  number. An exact key wins; then the filter with more literal levels, then
+  more `+`, then fewer `#`. A leading wildcard does not match `$`-prefixed
+  topics.
+- `database`, `measurement` and `tags_from_topic` are each optional; a rule
+  sets at least one. What a rule leaves out still comes from the payload.
+- `position` counts levels of the full topic from 0. A position past the
+  filter's last level is refused, unless the filter ends in `#`, where a topic
+  without that level is written without the tag.
+- A topic tag replaces a payload tag of the same name, in any letter case. A
+  payload field of exactly that name is stored as `<name>_value`; one that
+  differs only in letter case, or a column already stored under another
+  spelling, is a case clash resolved as for any write: one of the two names is
+  dropped, with a warning.
+- An unknown key in a rule is refused, and a refused request body now says
+  what is wrong instead of only `Invalid request body`.
+
+**Existing mappings.** A stored key containing `+` or `#` used to match only a
+topic spelled exactly like it, which a published topic never is; it is now a
+wildcard and starts routing the topics it matches. Check stored mappings for
+such keys before upgrading. A stored key that is not a valid filter (for
+example `sensors/temp+x`, which no published topic can equal, or one longer
+than 1024 characters) now matches nothing: the subscription keeps running and
+logs a warning naming the key. An API update that leaves `topic_mapping` out is
+accepted; one that sets it requires valid filters, so remove such a key with
+the first edit that touches the mapping (`{}` clears it).
+
+**Downgrading.** An earlier release cannot read a rule object: with one stored,
+it fails to list or auto-start any MQTT subscription. Before downgrading,
+change every rule object back to a database string, or remove it.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1402](https://github.com/Basekick-Labs/arc/pull/1402).
+
 ## Fix: cluster cache invalidation reaches peers with wildcard API addresses (#1398)
 
 Cache-invalidation fan-out now resolves hostless and wildcard API addresses
@@ -23,6 +161,47 @@ data, is left out with a warning, and the write succeeds
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#905](https://github.com/Basekick-Labs/arc/pull/905).
+
+## Changed: telemetry also reports Python SDK installations
+
+Arc's opt-out telemetry `clients` section, which lists the arcli
+installations an instance served, gains a `python_sdk` entry for the
+[Python SDK](https://github.com/Basekick-Labs/arc-client-python). The SDK
+sends a random per-installation UUID in a new, generic
+`Arc-Client-Installation-Id` header; arcli's `Arcli-Installation-Id` header
+is still accepted, and the new header wins when both are present. The client
+kind comes from the User-Agent (`arcli/...` or `arc-client-python/...`). Per
+SDK installation Arc reports the id, the SDK version, the Python version and
+the `os/arch` platform from the SDK's User-Agent (`unknown` when the
+User-Agent comment is absent or malformed), and the time it was last seen.
+Runtime and platform are limited to letters, digits and `. _ + / -`; anything
+else is reported as `unknown`.
+
+The same gates as for arcli apply: only requests that succeeded and, with
+authentication configured, carried a valid token count; public routes never
+do. Each client kind is capped at 256 distinct installations per report,
+independently, with its own `truncated` flag, so containers minting a new SDK
+id on every start cannot push arcli installations out of the report. The
+`clients.arcli` object is unchanged. Both installation headers are stripped
+when a cluster node forwards a request, so a forwarded request is counted
+once, by the node that received it.
+
+One behaviour change for arcli: a request carrying an installation id whose
+User-Agent names neither arcli nor the SDK is no longer counted (it used to be
+recorded with version `unknown`), so foreign traffic cannot inflate the
+counts. arcli always sends its own User-Agent, so its counts are unaffected.
+
+The SDK's own switches (`DO_NOT_TRACK=1`, `ARC_CLIENT_SEND_INSTALLATION_ID=0`,
+or `send_installation_id=False`) stop it sending the id, and
+`telemetry.enabled = false` / `ARC_TELEMETRY_ENABLED=false` on the node
+disables the whole section. In ephemeral containers, setting
+`ARC_CLIENT_INSTALLATION_ID` to a fixed UUID keeps each start from counting
+as a new installation.
+
+As with arcli, the counts are only as trustworthy as the callers: any token
+holder (any caller, without authentication) can send 256 random ids with an
+SDK User-Agent and fill that kind's slots for one report, which sets
+`truncated`. The per-kind cap keeps that from affecting arcli's counts.
 
 ## Security: a crafted request can no longer crash Arc or exhaust its memory
 
@@ -758,6 +937,35 @@ During a rolling upgrade, a node still on an earlier release reads a
 GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
+
+### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
+
+`cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a
+node's peer file replication: one budget shared by all its pull workers, so
+reactive pulls, the startup catch-up and the periodic recheck together stay
+under it. It takes bytes per second or a size such as `"10MB"` (1 MB = 1024 KB);
+the default `0` is unlimited. A negative or unparseable value fails startup,
+instead of reading as unlimited. Helm: `cluster.replication.pullBytesPerSecond`.
+
+The cap does not apply to the staged compaction commit: a compacted output is
+fetched from the start every time, so a capped fetch could never deliver one
+larger than the cap allows within `cluster.replication_serve_timeout_ms`, and
+the partition would be compacted and aborted again on every cycle.
+
+Under a low cap a large file can take longer than one fetch. Each fetch is
+still bounded by `cluster.replication_fetch_timeout_ms` on the pulling node and
+by `cluster.replication_serve_timeout_ms` on the node serving the file; when
+either ends it, the next attempt resumes from the bytes already received. That
+now includes the first attempt of a new pull: before, only retries within one
+pull resumed, and every new pull of the same file (a manifest callback, the
+catch-up, the recheck) started again from zero, so a file too large for one
+pull's attempts never completed.
+A partial left by an older version of the same file fails the checksum when
+resumed; it is discarded and the same peer is asked again from the start, and
+the mismatch is not counted against that peer.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1404](https://github.com/Basekick-Labs/arc/pull/1404).
 
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
@@ -1838,6 +2046,258 @@ execution, including cached transforms and ArcX dispatch. User-supplied file
 readers and replacement scans are also rejected at the transform boundary.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
+
+### A refused write is no longer replayed from the WAL ([#1438](https://github.com/Basekick-Labs/arc/issues/1438))
+
+With the WAL enabled and `cluster.wal_coverage` off (every standalone node, and
+clusters that leave it off), a live write appended its WAL entry before the
+checks that can still refuse it: schema churn on the measurement, a request
+cancelled by its client, a node shutting down, and (for columnar MessagePack)
+a column that could not be converted. The client got the refusal, usually a
+`503` it resent, but the entry stayed in the WAL. A crash before the next
+purge, or for a shutdown refusal the next start, replayed it, so the rows were
+stored twice.
+
+- **`wal.ack_mode = "queued"` (the default):** the WAL entry is now built
+  before the shard lock, as before, but only queued for the WAL file after
+  those checks pass, under the same lock that puts the batch in the buffer.
+  WAL coverage already worked this way. A refused write leaves nothing in the
+  WAL. The on-disk format is unchanged.
+- **`wal.ack_mode = "durable"`:** a write is acknowledged only once its entry
+  is synced, and that wait cannot happen under the shard lock, so the entry is
+  still written first. A refusal after it now retracts the entry with a
+  checkpoint, the same record a flush writes, so recovery never replays it.
+  The same applies when one chunk of a split payload fails after the others
+  were written, and when the sync itself fails (the checkpoint is then
+  attempted, and usually fails with it). A retraction that cannot be written
+  leaves the old behaviour: the write may come back at the next start. Each
+  one is counted in `arc_wal_retractions_failed_total` and logged at Error, at
+  most once every 10 seconds.
+- **The conversion now runs before the WAL append** in every mode, so a value
+  it refuses never reaches the WAL.
+- **A full WAL queue** that drops a later chunk of a large write at commit
+  keeps the chunks already queued tracked, so their flush checkpoints them.
+  Before, they were replayed at the next start next to the rows the buffer had
+  already stored.
+
+In queued mode this also closes a race with the flush-failure recovery pass.
+A write's WAL entry and its batch now enter the WAL queue and the buffer in
+one step, so the pass can no longer replay an entry whose rows are still in
+the live buffer.
+
+### Filesystem-equivalent spoke IDs cannot share a sync namespace ([#740](https://github.com/Basekick-Labs/arc/issues/740))
+
+Spoke IDs that differ only in letter case or Unicode normalization
+(`rocket_01` and `ROCKET_01`, or `café` in NFC and NFD) are one directory on
+storage that folds names: a local root on macOS APFS (by default) or Windows.
+There either spoke could write into the other's namespace.
+
+- Registering an ID that collides this way with one registered on the same
+  hub node is refused with `409`, on every storage backend. The comparison
+  folds case the way APFS does, including scripts whose cases plain Unicode
+  folding leaves apart (Cherokee).
+- An existing pair is handled by what the hub's storage does, which Arc
+  probes at startup on the local storage root, for case and for
+  normalization separately. A pair that is one directory there is refused for
+  sync, every member of it (`401`, logged on the hub), and reported at
+  startup. A pair that is two directories there keeps syncing, and the startup
+  log names it, since moving that storage to a volume that folds the
+  difference would merge them: any pair on Linux filesystems, S3, Azure and
+  GCS, and a case-only pair on case-sensitive APFS, which still normalizes.
+- A refused member logs a warning on the hub at every sync attempt. Disabling
+  or deleting the other member of the pair lets it sync again; re-register the
+  edge box you moved under a distinct ID. On a volume that folds names the
+  remaining spoke's directory already holds both spokes' files: deleting a
+  registration keeps its data.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1401](https://github.com/Basekick-Labs/arc/pull/1401).
+
+### A write that fails part-way says what was written ([#1437](https://github.com/Basekick-Labs/arc/issues/1437))
+
+A line-protocol or MessagePack request with several measurements is buffered
+one measurement at a time. If one failed after the earlier ones were buffered,
+the answer read as if nothing had been written. For a fence or a WAL entry that
+could not be made durable, that was a 503 with `Retry-After` and
+`X-Arc-Ingest-Fenced` or `X-Arc-Ingest-Refused`. For schema churn or a shutdown,
+it was a 503 "Write rejected". Otherwise it was a 500. A client that resent the
+request, as Telegraf and the InfluxDB clients do on any 5xx, wrote the buffered
+measurements twice. MQTT subscriptions resent a message refused with
+`wal_not_durable` the same way.
+
+- **A failure after part of the request was buffered is now a `500` that says
+  what was written.** The body has `rows_written`, `written_measurements` and
+  `stopped_at_measurement`, the fields an import that stops part-way already
+  answers with. Points left out for good (a field named `time`, a value that
+  does not fit its column, a measurement refused for its content) add
+  `points_dropped` and `dropped`. The answer has no `Retry-After` and no
+  `X-Arc-Ingest-*` header. The part of the request it stopped at, and every part
+  after it, was not buffered. With the WAL enabled, the part it stopped at may
+  still come back from the WAL at the next start.
+- **Why 500 and not a 4xx.** Telegraf and the InfluxDB clients drop a batch
+  answered `4xx` for good, which would lose the measurements that were not
+  written. They do still resend a `500`, which duplicates the written part.
+  Compaction collapses rows identical in every column, so timestamped lines
+  converge. Lines without a timestamp get a new server time when resent, so
+  their duplicates remain. A client that reads the body can resend only the
+  measurements not listed in `written_measurements`.
+- **MQTT:** a message stopped part-way is no longer resent whole. It is counted
+  in the failed messages and logged with what was written.
+- **A measurement refused for its content during the write** (a column changed
+  between string and binary since the request was checked, or a column name
+  that cannot be stored) is now dropped, and the other measurements are written.
+  The answer is the usual `400` `partial write: N points dropped: ... the other
+  points were written`. Before, the request stopped there with a `400` that read
+  as if nothing had been written.
+- **Unchanged:** a failure before anything was buffered keeps its answer, so a
+  `503` with `Retry-After` still means nothing was written. A request refused
+  up front (a fence, WAL disk pressure, a column type change caught before the
+  write) is also unchanged.
+
+The record path that deployments with decimal columns use now writes
+measurements in name order, as the default path already did. The
+`wal_not_durable` refusal text no longer says earlier parts of the request may
+already be stored: a refusal is now only answered when nothing was buffered.
+
+### Failed flushes report rows without a WAL copy ([#1377](https://github.com/Basekick-Labs/arc/issues/1377))
+
+With `wal.enabled = false` (the default) a failed flush loses the rows it
+held: nothing else has a copy, and nothing retries it. Arc logged them as
+"data preserved in WAL for recovery". It now says what happened:
+
+- A failed flush logs `Flush failed; rows without a WAL copy were lost` with
+  `records_without_wal`, and adds them to the new counter
+  `arc_buffer_records_dropped_total` (also in `/api/v1/metrics` and the
+  metrics time series). With the WAL on, rows whose WAL append succeeded are
+  not counted, and the message says they are replayed by the next recovery
+  pass (`wal.recovery_interval_seconds`) or on restart; rows whose append
+  failed have no copy and are counted. A flush that fails after writing some
+  of its hours counts all of its rows without a copy, including those hours.
+- Shutdown does the same for rows it cannot write in its time budget: those
+  without a WAL copy are logged and counted as lost, not as "remain in the
+  WAL", and `arc_wal_records_preserved_total` counts only rows the WAL holds.
+- One failed flush logs one Error, not two.
+
+Alert on `increase(arc_buffer_records_dropped_total[5m]) > 0`. To keep rows
+across a failed flush, enable the WAL.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1379](https://github.com/Basekick-Labs/arc/pull/1379).
+
+### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
+
+The execution-history endpoint now includes runs whose duration is still
+`NULL`. Their existing numeric `execution_duration_ms` field is `0` until the
+run completes; completed and failed durations are unchanged. Runs started in
+the same second are listed newest first, matching `last_execution_status`, and
+a row the endpoint cannot read is logged instead of being dropped silently.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1417](https://github.com/Basekick-Labs/arc/pull/1417).
+
+### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column ([#1409](https://github.com/Basekick-Labs/arc/pull/1409))
+
+With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes each
+file within one hour, sorted by the keys and then time. The daily compaction
+then sorted the whole day by the keys alone, so each row group of the
+long-lived compacted file mixed the hours of the day, and a query over a few
+minutes read every row group: on a 54M-row daily file of TSBS IoT data sorted
+by `fleet,name`, every row group spanned about 17 hours, nearly all of that
+file's time range.
+
+- **Compacted files are now ordered by hour, then the sort keys, then time.**
+  Each row group holds contiguous hours, so time-range pruning works on
+  compacted files again, while rows stay grouped by the keys within each hour.
+  A measurement whose hour fills a row group (122,880 rows) gets row groups of
+  about an hour; a smaller one gets fewer, wider row groups, as it did without
+  sort keys. Measured by rewriting that 54M-row file each way (DuckDB 1.5.6,
+  warm medians):
+
+  | Query | Time only (default) | Keys, before | Hour, then keys |
+  |---|---|---|---|
+  | One truck, 24 hours | 51 ms | 8 ms | 9 ms |
+  | One fleet, 10 minutes | 11 ms | 26 ms | 11 ms |
+  | All trucks, 10 minutes | 9 ms | 38 ms | 11 ms |
+  | Latest position per truck, one fleet | 75 ms | 42 ms | 32 ms |
+  | File size | 984 MB | 802 MB | 807 MB |
+
+  Rewriting that file in the new order took about 10% longer (7.0 s to 7.8 s)
+  with about 2% more peak memory. Hourly compaction is unchanged (its rows are all one
+  hour), and so is compaction without sort keys.
+- **Only newly compacted files get the new order.** A daily file compacted by
+  an earlier version keeps its order until it is rewritten; it is still read
+  correctly, just with the old pruning.
+- **A sort key the partition's files have no column for no longer fails its
+  compaction.** The ORDER BY named every configured key, and a key missing
+  from all of a batch's files was a bind error, so that partition failed to
+  compact on every cycle. The key is now left out of that batch's order, and a
+  Warn names it when it is configured for the measurement in
+  `ingest.sort_keys`; a key from `ingest.default_sort_keys` that a measurement
+  does not have is logged at Debug, since that is normal. Names match
+  case-insensitively, as DuckDB binds them.
+
+### A sort key the data has no column for no longer leaves the file unsorted ([#1410](https://github.com/Basekick-Labs/arc/pull/1410))
+
+With `ingest.sort_keys` or `ingest.default_sort_keys` set, a flush whose rows
+had no column for one of the keys failed its sort, and the flush wrote the
+rows in arrival order: not sorted by the other keys, and not by time either,
+which also cost time-range pruning inside the file. Nothing was logged. (The
+documentation said such a flush fails; it never did, and no rows were
+lost.)
+
+- **The flush now sorts by the keys it has a column for, then time,** and
+  leaves the missing key out. A key configured for the measurement in
+  `ingest.sort_keys` is logged at Warn, once a minute per measurement, naming
+  the key. A key from `ingest.default_sort_keys` is logged at Debug: it applies
+  to every measurement without its own entry, and many do not have that
+  column. Compaction leaves such a key out of that partition's order as well
+  ([#1409](https://github.com/Basekick-Labs/arc/pull/1409)); before, it failed
+  the partition's compaction on every cycle.
+- **Key names match case-insensitively**, as compaction already binds them,
+  so a key configured as `Host` sorts a `host` column at ingest too. Before,
+  such a key failed the sort, and the file was written unsorted.
+- **Should a sort ever fail, the flush is written sorted by time** and logged
+  at Error, once a minute per measurement, rather than unsorted and silent.
+
+### Ingest with sort keys is as fast as without them ([#1411](https://github.com/Basekick-Labs/arc/pull/1411))
+
+A flush sorted by `ingest.sort_keys` (or `ingest.default_sort_keys`) went
+through a comparison sort that checked each key column's type on every one of
+its comparisons: 2.60 s for a 5M-row flush sorted by two tag columns and time,
+against 0.21 s for time alone. On a sustained load that was most of the cost
+of sort keys at ingest.
+
+- **The sort is now one linear, stable pass per key**: a radix sort for
+  integer and float keys, and for tag (string and binary) keys a counting sort
+  on each value's rank among the flush's distinct values. Rows already in
+  order are not copied, as with time-only sorting.
+- **A key with many distinct values** (more than a quarter of the flush's
+  rows, such as a request id) or a decimal key has no such pass; the flush is
+  then sorted by one comparison over all its keys, about as fast as before
+  (1M rows by an id and time: 371 ms before, 339 ms now).
+- **Measured**, sorting a flush by `fleet, name, time` (10,000 names): 50,000
+  rows (the default flush size) 13.9 ms to 6.3 ms; 1M rows 445 ms to 77 ms;
+  5M rows 2.60 s to 0.51 s. While it runs, the sort needs about 24 bytes of
+  scratch memory a row plus 4 for each tag or boolean key, against 8 before
+  (about 160 MB instead of 40 MB for 5M rows sorted by two tags and time).
+- **End to end**, loading 155.6M TSBS IoT rows with
+  `sort_keys = ["readings:fleet,name", "diagnostics:fleet,name"]` and
+  `wal.ack_mode = "durable"`: 36.6 s (29.7 to 49.0 across three runs) before,
+  25.4 s (25.3 to 25.7) now, against 26.1 s with no sort keys. Rows were
+  queryable after 27.9 s, against 44.2 s before.
+- **Order changes only where it was undefined.** Rows equal on every key now
+  keep their arrival order (the old sort did not promise any). A float sort
+  key orders -0 and +0 as equal and NaN after +Infinity; the old sort treated
+  NaN as equal to every value, which left the order of rows with NaN keys
+  unspecified.
+
+### Azure Blob Storage error messages are shorter
+
+Errors from the Azure Blob Storage backend are shorter. Azure credential
+values (connection string, SAS token, account key) and the endpoint are
+trimmed of surrounding whitespace, so a value read from a file with a trailing
+newline works everywhere it is used; one with another control character is
+refused at startup. Errors from the licence server check are shorter in the
+same way.
 
 ### Parquet import keeps binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 
@@ -3462,6 +3922,59 @@ outside the writer's WAL, and a standby writer refused it with `503`.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
 
+### Bulk imports write in parallel, and wait for a slot at most 30 seconds
+
+Earlier builds of this release let one bulk import (`/api/v1/import/lp`, `csv`,
+`parquet`) write at a time per node, whatever its size: a 46-core writer
+loading 64 MB line-protocol files with tsm2arc ran at about 85 MB/s, against
+about 1,250 MB/s on 26.09.2, with the CPUs mostly idle. More requests in flight
+only made each wait longer. A request that waited could not be abandoned: the
+server does not see a client that gives up, so the import later wrote all its
+rows, and a client retry wrote them a second time.
+
+Measured on a 14-core laptop, 64 MB line-protocol files, 16 in flight:
+
+| | Before | Now |
+|---|---|---|
+| Throughput | 67 MB/s | 319 MB/s |
+| Median import | 15.4 s | 3.0 s |
+| Peak memory | 4.5 GB | 5.7 GB |
+
+- New `ingest.import_write_concurrency` (default `0` = auto): how many imports
+  write at once. Auto is as many as fit an eighth of the memory limit at one
+  import allowance each (an eighth of the memory limit, 64 MB to 512 MB), at
+  most the CPUs Arc runs on (`GOMAXPROCS`, which a licence's core count can
+  lower), at least one: one on a 3 GiB writer, nine on a 36 GiB laptop, 46 on
+  a 46-core, 320 GiB writer licensed for all its cores. The value is logged at
+  startup ("Bulk import write slots configured"). Each writing import may hold
+  about one allowance plus its upload, and each import that wakes from a wait
+  writes one batch before it paces again; set a lower value to bound memory
+  more tightly. An explicit value (1 to 1024) is used as is. `1` restores one
+  import writing at a time; the next one starts while the previous one is
+  still flushing, within the same allowance.
+- New `ingest.import_queue_timeout_ms` (default `30000`; `0` = until a slot
+  frees, since the server does not see a client that gives up): an import that waited this long for a slot is refused with
+  `503`, `X-Arc-Ingest-Refused: import_queue` and `Retry-After`. Nothing of it
+  was written, so it is safe to retry. Keep it well under the client's own
+  timeout.
+- A client that times out while its import is writing still gets no answer,
+  and the import still completes: treat such an attempt as possibly written
+  before retrying it.
+- An import ends by flushing its own measurements' buffers, not every buffer
+  on the node, and it gives its slot (and its allowance) to the next import
+  before that flush. An import that stops part-way flushes what it wrote
+  before it answers. While an import waits for flushes it flushes its own
+  measurements again every second; a flush that fails there stops it part-way
+  (`500`), as the first one did.
+  The `200` contract is unchanged: the rows are in the buffer and the WAL
+  (when enabled), files follow as their flushes finish.
+- A write refused because other writers of the same measurement keep
+  changing its columns (`ErrSchemaChurnExceeded`) is tried again up to five
+  times inside the import before it fails (not for line-protocol imports on
+  deployments with `ingest.decimal_columns`, which write records). With imports running side by
+  side, two imports into one measurement whose columns change type can now
+  meet more often; that still fails part-way, as before.
+
 ### Bulk imports no longer hold the whole file in memory several times
 
 The import endpoints (`/api/v1/import/csv`, `parquet`, `lp`, `tle`) read the
@@ -3495,12 +4008,12 @@ peaked at 2.2 GiB.
   what the buffer held when it started. Over that it flushes its database's
   buffers and waits; if the buffered rows stay above the limit for two
   minutes, it stops (a failure part-way, below).
-- One import writes at a time on a node. Imports sent together are validated
-  together and written one after the other: concurrent write passes would add
-  up their allowances. Every request body is held in memory while it waits.
-  A forwarded import waiting its turn on the writer still counts down
-  `cluster.import_forward_timeout_ms` on the node that forwarded it, so a
-  `504` there can mean it was still queued.
+- Imports write in parallel, up to `ingest.import_write_concurrency` at once
+  on a node (#1429, above). Each writing import paces against one limit
+  shared by all of them: the lowest buffered level any of them started at,
+  plus the allowance of every import holding a slot. Every request body is held in memory while it waits for a slot.
+  A forwarded import waiting for a slot on the writer still counts down
+  `cluster.import_forward_timeout_ms` on the node that forwarded it.
 - A validation pass reads the whole file, chunk by chunk, before anything is
   written, so a bad file is still refused with nothing written: a bad time
   value, an invalid measurement name, a measurement the token may not write,
@@ -4514,6 +5027,17 @@ New metrics: `arc_manifest_repair_dropped_total`,
 the last repair under `compaction_commit.manifest_repair` (`dropped`,
 `adopted`, `retiered`, `pending`, `error`).
 
+### Local `ReadToAt` no longer returns staged partials ([#1199](https://github.com/Basekick-Labs/arc/issues/1199))
+
+No operator-visible change. On local storage, a ranged read of a file (the
+peer file fetch that replication uses, and edge sync resuming a transfer) could
+return the bytes of an interrupted transfer when the committed file was
+missing. It now reads committed files only, like the size and existence checks;
+a missing file is reported as not found. Resuming an interrupted replication
+pull still works: it reads the partial through the staging interface.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1203](https://github.com/Basekick-Labs/arc/pull/1203).
+
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 
 The delete endpoint's keyword scan used `\b` directly on the masked WHERE
@@ -4964,14 +5488,32 @@ can see change with it, all in the safe direction:
 - a backup counts such a path as absent — and says so in its incomplete
   sample — instead of recording a partial's size and then failing to copy it.
 
-One asymmetry to know about, because it is the thing most easily got wrong
-from the sentence above: **`ReadToAt` still serves staged data** when no
-committed file exists. The resume path depends on that. So a caller must not
-pair a committed-only `StatFile` size with a `ReadToAt` read and assume both
-saw the same bytes; the interface comments now say so, and making `ReadToAt`
-honest too is tracked separately.
+Ranged reads (`ReadToAt`) now read committed files only as well
+([#1199](https://github.com/Basekick-Labs/arc/issues/1199)), so every local
+read and size answers about the same committed file.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1190](https://github.com/Basekick-Labs/arc/pull/1190).
+
+### Telemetry reports the machine's memory, and what the process may use ([#1412](https://github.com/Basekick-Labs/arc/issues/1412))
+
+Telemetry's `memory.total_gb` was documented as the machine's RAM but was
+`runtime.MemStats.Sys`: the memory the Arc process itself had obtained from the
+OS. A freshly started node reported a few tens of MB whatever the host had, so
+every earlier `total_gb` value is the process footprint, not a machine size.
+
+- `total_gb` is now the machine's memory: `/proc/meminfo` `MemTotal` on Linux,
+  `hw.memsize` on macOS. The unit is GiB, as before.
+- A new `usable_gb` is what a cgroup limit leaves the process, the memory
+  counterpart of `usable_cores`. It is the same detection the ingest buffer
+  sizes itself from: the lower of `memory.max` and `memory.high`, so with the
+  Kubernetes MemoryQoS feature gate enabled a 2Gi pod reports about 1.8. With
+  no limit it equals `total_gb`.
+
+Inside a container `total_gb` is the host's memory, unless lxcfs is mounted
+over `/proc/meminfo`, in which case it reads as the container limit. Both values
+are read once at startup, like `usable_cores`, so a limit changed in place is
+reported from the next restart. A value that cannot be read is sent as `null`,
+never a guess.
 
 ### Reported core counts account for the CPU quota ([#1039](https://github.com/Basekick-Labs/arc/issues/1039))
 

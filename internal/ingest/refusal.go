@@ -27,11 +27,22 @@ const (
 	// directory is at wal.max_directory_mb (#676); counted in
 	// arc_wal_disk_pressure_rejections_total.
 	RefusalWALDisk = "wal_disk"
+	// RefusalWALNotDurable: with wal.ack_mode = "durable", the write's WAL
+	// entry could not be made durable (write or sync failure, shutdown).
+	RefusalWALNotDurable = "wal_not_durable"
+	// RefusalImportQueue: a bulk import waited ingest.import_queue_timeout_ms
+	// for one of the node's import write slots (#1429).
+	RefusalImportQueue = "import_queue"
 )
 
 // WriteRefusal is a live write this node refuses for a local, transient
-// condition: nothing was written, the WAL included, and the client should
-// retry (#676). Unlike ErrIngestFenced, retrying against this same node is
+// condition: the write was not accepted and the client should retry (#676).
+// For every reason but RefusalWALNotDurable nothing was written, the WAL
+// included, because those refusals come before any part of the request is
+// applied. A not-durable refusal comes from the part that failed: earlier
+// parts of the same request (other measurements or records) may already be
+// buffered, and the failed part's WAL entry may have reached the file and
+// replay after a restart. A retry can therefore duplicate rows. Unlike ErrIngestFenced, retrying against this same node is
 // right. Reason is a Refusal constant: the HTTP answer carries it in the
 // X-Arc-Ingest-Refused header, and refusals are logged by it. Compare with
 // errors.Is against the package's Err values (same reason matches).
@@ -53,6 +64,30 @@ func (e *WriteRefusal) Is(target error) bool {
 var ErrWALDiskPressure error = &WriteRefusal{
 	Reason: RefusalWALDisk,
 	Text:   "write refused: the WAL volume is low on free space (WAL volume disk pressure); nothing was written, retry",
+}
+
+// ErrImportQueueTimeout refuses a bulk import that waited
+// ingest.import_queue_timeout_ms for an import write slot (#1429). Nothing of
+// it was written: the wait comes before its write pass. Retryable.
+var ErrImportQueueTimeout error = &WriteRefusal{
+	Reason: RefusalImportQueue,
+	Text:   "import refused: every import write slot on this node stayed busy for ingest.import_queue_timeout_ms; nothing was written, retry",
+}
+
+// ErrWALNotDurable refuses a live write whose WAL entry could not be made
+// durable in wal.ack_mode = "durable". Retryable.
+var ErrWALNotDurable error = &WriteRefusal{
+	Reason: RefusalWALNotDurable,
+	Text:   "write refused: the WAL entry could not be made durable; if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",
+}
+
+// walNotDurable wraps a WAL ErrNotDurable as a not-durable refusal, keeping
+// the cause in the text.
+func walNotDurable(err error) error {
+	return &WriteRefusal{
+		Reason: RefusalWALNotDurable,
+		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",
+	}
 }
 
 // IsWriteRefusal reports any retryable refusal of a live write: a fence
