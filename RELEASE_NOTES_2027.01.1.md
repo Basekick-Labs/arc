@@ -772,7 +772,10 @@ GeoParquet file placed into storage as `GEOMETRY`, as before.
 An optional `[flight_sql]` listener exposes Arc's existing read-only query path
 over Arrow Flight SQL. It uses Arc token authentication and the configured TLS
 certificate, and maps databases and measurements to Flight SQL catalogs and
-tables for ADBC clients.
+tables for ADBC clients. Results stopped at a governance row cap end with a
+`ResourceExhausted` status rather than appearing to be complete.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https://github.com/Basekick-Labs/arc/pull/1419).
 
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 

@@ -14,8 +14,10 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -319,10 +321,63 @@ func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.
 	schema := reader.Schema()
 	stream := make(chan flight.StreamChunk)
 	go func() {
-		flight.StreamChunksFromReader(ctx, reader, stream)
+		flight.StreamChunksFromReader(ctx, &flightSQLResponseReader{RecordReader: reader, ctx: ctx, response: resp}, stream)
 		_ = resp.Body.Close()
 	}()
 	return schema, stream, nil
+}
+
+// flightSQLResponseReader preserves the HTTP completion signal when adapting
+// IPC to Flight. An IPC end marker can precede the HTTP trailers; a clean IPC
+// stream alone does not mean the query was uncapped.
+type flightSQLResponseReader struct {
+	array.RecordReader
+	ctx           context.Context
+	response      *http.Response
+	once          sync.Once
+	completionErr error
+}
+
+func (r *flightSQLResponseReader) Err() error {
+	// Decoder errors take precedence over any completion metadata.
+	if err := r.RecordReader.Err(); err != nil {
+		return err
+	}
+	r.once.Do(func() {
+		r.completionErr = flightSQLResponseCompletion(r.ctx, r.response)
+	})
+	return r.completionErr
+}
+
+func flightSQLResponseCompletion(ctx context.Context, response *http.Response) error {
+	// Only HTTP framing/trailers should remain after IPC's end marker. Bound
+	// both bytes and time: a broken internal bridge must not hang DoGet forever.
+	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	stopClose := context.AfterFunc(drainCtx, func() { _ = response.Body.Close() })
+	defer func() { stopClose(); cancel() }()
+	n, err := io.CopyN(io.Discard, response.Body, 1)
+	if ctxErr := drainCtx.Err(); ctxErr != nil {
+		return status.FromContextError(ctxErr).Err()
+	}
+	if n != 0 {
+		return status.Error(codes.Internal, "unexpected data after Arc Arrow IPC result")
+	}
+	if !errors.Is(err, io.EOF) {
+		return status.Error(codes.Internal, "could not read Arc query completion trailers")
+	}
+	if response.Trailer.Get(arrowStreamTruncatedTrailer) != "" {
+		return status.Error(codes.Internal, "Arc query stream was truncated")
+	}
+	if value := response.Trailer.Get(arrowRowsCappedTrailer); value != "" {
+		cap, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || cap == 0 {
+			return status.Error(codes.Internal, "invalid Arc query row-cap trailer")
+		}
+		// Standard Flight clients observe terminal RPC errors via reader.Err();
+		// custom application metadata is not universally consumed by SQL clients.
+		return status.Errorf(codes.ResourceExhausted, "Arc query reached its governance row cap (%d); result may be incomplete", cap)
+	}
+	return nil
 }
 
 func (s *flightSQLService) showResponse(ctx context.Context, resp *http.Response) (*arrow.Schema, <-chan flight.StreamChunk, error) {
