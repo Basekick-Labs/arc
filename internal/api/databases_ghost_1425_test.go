@@ -403,10 +403,14 @@ func TestDatabasesHandler_ManifestOnlyDatabaseIsListed(t *testing.T) {
 		t.Skipf("DuckDB: %v", err)
 	}
 	t.Cleanup(func() { duck.Close() })
-	qh := NewQueryHandler(duck, backend, zerolog.Nop(), 30, 1000)
+	recording := &checkRecordingBackend{ghostProbingBackend: backend, checked: map[string]bool{}}
+	qh := NewQueryHandler(duck, recording, zerolog.Nop(), 30, 1000)
 	qh.coordinator = manifestReadiness{entries: entries}
 	if got := qh.dropEmptyDatabaseDirectories(context.Background(), []string{"ghost", "peerdb", "_schema"}); !equalStrings(got, []string{"peerdb"}) {
 		t.Errorf("SHOW DATABASES keeps %v, want [peerdb]", got)
+	}
+	if recording.checked["_schema"] {
+		t.Error("SHOW DATABASES checked a hidden directory it drops anyway")
 	}
 }
 
