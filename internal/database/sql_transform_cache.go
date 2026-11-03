@@ -24,6 +24,7 @@ const DefaultQueryCacheMaxSize = DefaultSQLTransformCacheMaxSize
 // sqlTransformCacheEntry represents a cached transformed SQL with expiration
 type sqlTransformCacheEntry struct {
 	transformed string
+	metadata    []string
 	expiresAt   time.Time
 }
 
@@ -103,6 +104,13 @@ func (c *SQLTransformCache) shardFor(key string) *cacheShard {
 
 // Get retrieves a cached transformed SQL if it exists and hasn't expired
 func (c *SQLTransformCache) Get(sql string) (string, bool) {
+	transformed, _, ok := c.GetWithMetadata(sql)
+	return transformed, ok
+}
+
+// GetWithMetadata retrieves a cached transformed SQL and the metadata stored
+// with it. The metadata is the cache's own: callers must not modify it.
+func (c *SQLTransformCache) GetWithMetadata(sql string) (string, []string, bool) {
 	shard := c.shardFor(sql)
 
 	shard.mu.RLock()
@@ -111,20 +119,26 @@ func (c *SQLTransformCache) Get(sql string) (string, bool) {
 
 	if !ok {
 		c.misses.Add(1)
-		return "", false
+		return "", nil, false
 	}
 
 	if time.Now().After(entry.expiresAt) {
 		c.misses.Add(1)
-		return "", false
+		return "", nil, false
 	}
 
 	c.hits.Add(1)
-	return entry.transformed, true
+	return entry.transformed, entry.metadata, true
 }
 
 // Set stores a transformed SQL in the cache
 func (c *SQLTransformCache) Set(sql, transformed string) {
+	c.SetWithMetadata(sql, transformed, nil)
+}
+
+// SetWithMetadata stores transformed SQL with immutable metadata that remains
+// associated with the transform on cache hits.
+func (c *SQLTransformCache) SetWithMetadata(sql, transformed string, metadata []string) {
 	shard := c.shardFor(sql)
 
 	shard.mu.Lock()
@@ -161,6 +175,7 @@ func (c *SQLTransformCache) Set(sql, transformed string) {
 
 	shard.entries[sql] = sqlTransformCacheEntry{
 		transformed: transformed,
+		metadata:    append([]string(nil), metadata...),
 		expiresAt:   time.Now().Add(c.ttl),
 	}
 	shard.mu.Unlock()

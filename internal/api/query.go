@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1815,10 +1816,6 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 	// table rides along so quoted references are checked under their real
 	// names — the same resolution the query transform applies.
 	tableRefs := extractTableReferences(normalisedSQL, sqlutil.IdentifierNames(permMasks))
-	if len(tableRefs) == 0 {
-		// No tables referenced (e.g., SELECT 1+1)
-		return nil
-	}
 
 	// Re-point bare "default" references at the database the TRANSFORM will
 	// resolve them against. Without this, a user with default.cpu:read could
@@ -1833,6 +1830,11 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 				tableRefs[i].Database = defaultDB
 			}
 		}
+	}
+	c.Locals(queryPermissionRefsCtxKey{}, tableRefs)
+	if len(tableRefs) == 0 {
+		// No tables referenced (e.g., SELECT 1+1)
+		return nil
 	}
 
 	if h.debugEnabled {
@@ -1880,6 +1882,50 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 		}
 	}
 
+	return nil
+}
+
+type queryPermissionRefsCtxKey struct{}
+
+// checkEmittedQueryPermissions checks the scopes the query transform read
+// that the source-SQL permission check (checkQueryPermissionsForDefaultDB,
+// which leaves its references in c.Locals) did not cover (#764). When the two
+// agree, which is every query today, it makes no RBAC call; a scope the
+// extractor missed is checked here, and refused, before anything runs.
+func (h *QueryHandler) checkEmittedQueryPermissions(c *fiber.Ctx, permission string, emitted []TableReference) error {
+	if h.rbacManager == nil || len(emitted) == 0 {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	checkedRefs, _ := c.Locals(queryPermissionRefsCtxKey{}).([]TableReference)
+	var missing []TableReference
+	for _, ref := range emitted {
+		if !slices.Contains(checkedRefs, ref) && !slices.Contains(missing, ref) {
+			missing = append(missing, ref)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	reqs := make([]*auth.PermissionCheckRequest, len(missing))
+	for i, ref := range missing {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo: tokenInfo, Database: ref.Database, Measurement: ref.Measurement, Permission: permission,
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	for i, ref := range missing {
+		if i >= len(results) || results[i] == nil || !results[i].Allowed {
+			h.logger.Warn().Str("database", ref.Database).Str("measurement", ref.Measurement).
+				Str("permission", permission).Int64("token_id", tokenInfo.ID).
+				Msg("RBAC denied storage scope emitted by query transform")
+			return fmt.Errorf("access denied: no %s permission for %s.%s", permission, ref.Database, ref.Measurement)
+		}
+	}
 	return nil
 }
 
@@ -2222,10 +2268,14 @@ localProcessing:
 	}
 
 	// Convert SQL to storage paths
-	convertedSQL, cached, err := h.getTransformedSQLForQuery(c.Context(), req.SQL, headerDB)
+	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		m.IncQueryErrors()
 		return respondError(c, transformErrorStatus(err), err.Error(), timestamp, start)
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		m.IncQueryErrors()
+		return respondError(c, fiber.StatusForbidden, err.Error(), timestamp, start)
 	}
 
 	// arcx decline census (no-op stub in stock builds; no query text is emitted).
@@ -3224,20 +3274,32 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 // TestDynamicSQLFunctionPattern_Family pins the set.
 var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|json_execute_serialized_sql)\s*\(`)
 
+func (h *QueryHandler) queryTransformCacheKey(sql, headerDB string) string {
+	cacheKey := h.pruner.CacheEpoch(sql) + ":" + strconv.FormatUint(h.openCompactionsGeneration(), 10) + ":" + sql
+	if headerDB != "" {
+		cacheKey = headerDB + ":" + cacheKey
+	}
+	return cacheKey
+}
+
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
-func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool, error) {
+func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
-		return sql, true, nil // Return as "hit" since no work needed
+		// Run untransformed, so nothing Arc emitted and no scope to report.
+		// A user-supplied reader is refused before this by ValidateSQLRequest
+		// on every endpoint; what reaches here names "read_parquet" only in
+		// a literal, alias or comment, and reads no Arc table.
+		return sql, true, nil, nil
 	}
 
 	// Fast path: queries without FROM or JOIN don't need table transformation
 	// (e.g., SELECT 1+1, SELECT NOW(), SHOW commands handled elsewhere)
 	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
-		return sql, true, nil
+		return sql, true, nil, nil
 	}
 
 	// Build cache key - include header database if provided, the current
@@ -3245,14 +3307,18 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	// before an hour started is never served after it (the pruner leaves out
 	// hours that have not started and have no files), including an hour a
 	// relative end has just reached (CacheEpoch).
-	cacheKey := h.pruner.CacheEpoch(sql) + ":" + strconv.FormatUint(h.openCompactionsGeneration(), 10) + ":" + sql
-	if headerDB != "" {
-		cacheKey = headerDB + ":" + cacheKey
-	}
+	cacheKey := h.queryTransformCacheKey(sql, headerDB)
 
 	// Check cache
-	if transformed, ok := h.queryCache.Get(cacheKey); ok {
-		return transformed, true, nil
+	if transformed, metadata, ok := h.queryCache.GetWithMetadata(cacheKey); ok {
+		refs, err := decodeStoragePathReferences(metadata)
+		if err != nil {
+			return "", true, nil, err
+		}
+		if err := checkTransformProvenance(transformed, refs); err != nil {
+			return "", true, nil, err
+		}
+		return transformed, true, refs, nil
 	}
 
 	// Attach the volatility flag: file-level time pruning may embed an
@@ -3276,41 +3342,45 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	// Never cache, and never execute, SQL built around a rejected name: the
 	// transform leaves an empty path behind, which would read the backend root.
 	if pathFailure.err != nil {
-		return "", false, pathFailure.err
+		return "", false, nil, pathFailure.err
+	}
+	refs := storagePathReferences(pathFailure)
+	if err := checkTransformProvenance(transformed, refs); err != nil {
+		return "", false, nil, err
 	}
 
 	if !volatile.Volatile {
-		h.queryCache.Set(cacheKey, transformed)
+		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
 	}
-	return transformed, false, nil
+	return transformed, false, refs, nil
 }
 
 // getTransformedSQLForQuery returns the transformed SQL for a query. Simple
 // single-table queries with a header database take an uncached fast path
 // (their time-relative partition list must not outlive the request); the
 // rest go through the cached getTransformedSQL.
-func (h *QueryHandler) getTransformedSQLForQuery(ctx context.Context, sql string, headerDB string) (string, bool, error) {
+func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution
 	if strings.Contains(sqlLower, "read_parquet") {
-		return sql, true, nil
+		return sql, true, nil, nil
 	}
 	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
-		return sql, true, nil
+		return sql, true, nil, nil
 	}
 
 	// The fast path takes simple single-table queries with a header DB;
 	// complex queries (JOINs, subqueries, CTEs) take the cached path.
 	if headerDB == "" || !isSingleTableQuery(sqlLower) || containsSQLWord(sqlLower, "with") {
-		return h.getTransformedSQL(ctx, sql, headerDB)
+		return h.getTransformedSQLWithRefs(ctx, sql, headerDB)
 	}
 
 	// Bail to slow path for features the fast path can't handle. EXTRACT/
 	// SUBSTRING/TRIM/OVERLAY need the slow path's FROM-keyword mask.
 	features := scanSQLFeatures(sql)
 	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsFromKeywordFunction(sql) {
-		return h.getTransformedSQL(ctx, sql, headerDB)
+		return h.getTransformedSQLWithRefs(ctx, sql, headerDB)
 	}
 
 	// Rewrite time functions if present
@@ -3323,9 +3393,13 @@ func (h *QueryHandler) getTransformedSQLForQuery(ctx context.Context, sql string
 	ctx, pathFailure := withStoragePathFailure(ctx)
 	convertedSQL := h.convertSingleTableQuery(ctx, sql, sqlLower, headerDB)
 	if pathFailure.err != nil {
-		return "", false, pathFailure.err
+		return "", false, nil, pathFailure.err
 	}
-	return convertedSQL, false, nil
+	refs := storagePathReferences(pathFailure)
+	if err := checkTransformProvenance(convertedSQL, refs); err != nil {
+		return "", false, nil, err
+	}
+	return convertedSQL, false, refs, nil
 }
 
 // convertSQLToStoragePaths converts table references to storage paths
@@ -3576,7 +3650,8 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 // name would be reported to the client as a successful query over an empty
 // table. A name Arc cannot turn into a path is an error, not an empty result.
 type storagePathFailure struct {
-	err error
+	err     error
+	emitted map[TableReference]struct{}
 }
 
 // errColdTierUnavailable refuses a read that needs the cold tier on a node
@@ -3593,6 +3668,9 @@ var errColdTierUnavailable = errors.New("this query reads data in the cold stora
 func transformErrorStatus(err error) int {
 	if errors.Is(err, errColdTierUnavailable) {
 		return fiber.StatusServiceUnavailable
+	}
+	if errors.Is(err, errTransformProvenance) {
+		return fiber.StatusInternalServerError
 	}
 	return fiber.StatusBadRequest
 }
@@ -3639,7 +3717,7 @@ type storagePathCtxKey struct{}
 
 // withStoragePathFailure attaches a collector for storage-path rejections.
 func withStoragePathFailure(ctx context.Context) (context.Context, *storagePathFailure) {
-	f := &storagePathFailure{}
+	f := &storagePathFailure{emitted: make(map[TableReference]struct{})}
 	return context.WithValue(ctx, storagePathCtxKey{}, f), f
 }
 
@@ -3649,6 +3727,62 @@ func recordStoragePathFailure(ctx context.Context, err error) {
 	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok && f.err == nil {
 		f.err = err
 	}
+}
+
+func recordStoragePathEmission(ctx context.Context, database, measurement string) {
+	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
+		f.emitted[TableReference{Database: database, Measurement: measurement}] = struct{}{}
+	}
+}
+
+// errTransformProvenance refuses a transform that reads storage but recorded
+// no database or measurement for it (#764): its reads cannot be checked
+// against RBAC. Arc's own inconsistency, so a 500, not the caller's 400.
+var errTransformProvenance = errors.New("SQL transformation reads storage without recording what it reads")
+
+// checkTransformProvenance refuses transformed SQL that reads storage while
+// no scope was recorded for it. Every storage path the transform builds
+// records its scope, so this fires only on a transform branch that builds a
+// path some other way; the check is then refused rather than skipped.
+func checkTransformProvenance(transformed string, refs []TableReference) error {
+	if len(refs) == 0 && ioTableFunctionPattern.MatchString(ioDenylistNormalise(transformed)) {
+		return errTransformProvenance
+	}
+	return nil
+}
+
+func storagePathReferences(f *storagePathFailure) []TableReference {
+	refs := make([]TableReference, 0, len(f.emitted))
+	for ref := range f.emitted {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Database != refs[j].Database {
+			return refs[i].Database < refs[j].Database
+		}
+		return refs[i].Measurement < refs[j].Measurement
+	})
+	return refs
+}
+
+func encodeStoragePathReferences(refs []TableReference) []string {
+	encoded := make([]string, len(refs))
+	for i, ref := range refs {
+		encoded[i] = ref.Database + "\x00" + ref.Measurement
+	}
+	return encoded
+}
+
+func decodeStoragePathReferences(encoded []string) ([]TableReference, error) {
+	refs := make([]TableReference, 0, len(encoded))
+	for _, value := range encoded {
+		database, measurement, ok := strings.Cut(value, "\x00")
+		if !ok || database == "" || measurement == "" {
+			return nil, fmt.Errorf("%w: invalid scope metadata in SQL transform cache", errTransformProvenance)
+		}
+		refs = append(refs, TableReference{Database: database, Measurement: measurement})
+	}
+	return refs, nil
 }
 
 // getStoragePath returns the storage path for a database.table, recording a
@@ -3688,6 +3822,7 @@ func (h *QueryHandler) storagePathForBackend(ctx context.Context, backend storag
 		recordStoragePathFailure(ctx, err)
 		return ""
 	}
+	recordStoragePathEmission(ctx, database, table)
 	return path
 }
 
@@ -4246,13 +4381,22 @@ func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, ke
 		Str("database", database).
 		Str("measurement", measurement).
 		Msg("No tier holds a file of this measurement; reading it as empty")
+	// What this reads is this measurement's, as empty: record that scope
+	// (#764), never the sentinel's, which no grant names and would turn an
+	// empty result into a 403 for a token granted only this measurement.
+	recordStoragePathEmission(ctx, database, measurement)
 	if anchor := h.anchorFor(ctx, database, measurement); anchor != "" {
 		return readParquetExpr(keyword, anchor, nil, options)
 	}
 	if hotWasSource {
 		return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
-	return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, arcInvalidIdentifierSentinel)}, options)
+	empty, err := storage.GetStoragePath(h.storage, database, arcInvalidIdentifierSentinel)
+	if err != nil {
+		recordStoragePathFailure(ctx, err)
+		return ""
+	}
+	return readParquetExpr(keyword, "", []string{empty}, options)
 }
 
 // multiTierView is what buildMultiTierReadParquet reads from tiering: which
@@ -5099,10 +5243,19 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	}
 
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		metrics.Get().IncQueryErrors()
 		return c.Status(transformErrorStatus(err)).JSON(EstimateResponse{
+			Success:         false,
+			Error:           err.Error(),
+			WarningLevel:    "error",
+			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+		})
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
 			Success:         false,
 			Error:           err.Error(),
 			WarningLevel:    "error",
@@ -5648,7 +5801,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
-	convertedSQL, _, err := h.getTransformedSQL(c.Context(), sql, "")
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(c.Context(), sql, "")
 	if err != nil {
 		m.IncQueryErrors()
 		msg := "Invalid query: " + err.Error()
@@ -5658,6 +5811,14 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		return c.Status(transformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,
 			Error:     msg,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
+			Success:   false,
+			Error:     err.Error(),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}

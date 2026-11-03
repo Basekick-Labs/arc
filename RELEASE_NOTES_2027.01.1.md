@@ -2039,6 +2039,26 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
+
+With RBAC on, a query's permission check reads the table names in the SQL it
+receives, and the query transform separately turns those names into the
+storage paths that are read. Where the two disagreed about a name, the query
+read a database and measurement that nobody checked (#986 fixed three such
+cases). The transform now records the database and measurement of every
+storage path it builds, including on a cached transform, and any the
+permission check did not cover is checked before the query runs. A query
+refused there answers 403, on `/api/v1/query` (JSON and MessagePack),
+`/api/v1/query/arrow`, `/api/v1/query/estimate` and `GET
+/api/v1/query/:measurement`. A transform that reads storage without recording
+what it reads is refused with a 500 rather than run unchecked.
+
+When the permission check saw everything the transform reads, which is the
+case for every query today, the new check makes no RBAC call; recording the
+reads adds about 3-5% to the transform.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
+
 ### Time-bounded arcx queries avoid listing unrelated partitions ([#661](https://github.com/Basekick-Labs/arc/issues/661))
 
 The arcx router listed every file of the measurement for each routed query. A
