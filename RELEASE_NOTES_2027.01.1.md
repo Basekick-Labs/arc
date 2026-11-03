@@ -2175,6 +2175,44 @@ across a failed flush, enable the WAL.
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1379](https://github.com/Basekick-Labs/arc/pull/1379).
 
+### A deleted database disappears from the database list ([#1425](https://github.com/Basekick-Labs/arc/issues/1425))
+
+`GET /api/v1/databases` and `SHOW DATABASES` built their lists from
+directories, so a deleted database whose directories outlived its files stayed
+listed, with `measurement_count: 0`, and `GET
+/api/v1/databases/:name/measurements` still listed its measurements, while
+`GET /api/v1/databases/:name` answered 404. Two stores do that:
+
+- **Local storage.** The delete removed the files but left their
+  `measurement/YYYY/MM/DD/HH` directories. It now removes the empty
+  directories, deepest first; a directory that still holds a file stays, with
+  the directories above it. Deleting a database an earlier version left
+  behind still answers 404, and now removes its directories too.
+- **Object stores that keep empty prefixes** (SeaweedFS). A prefix outlives
+  its last object, and Arc cannot remove it through the storage API.
+
+So all three now answer by the rule `GET /api/v1/databases/:name` uses: a
+database is its marker, a file, a tiering metadata row, or a cluster manifest
+entry, and directories alone are not one.
+
+What that costs:
+
+- `GET /api/v1/databases` already reads every file, so a database with a file
+  or a tiering row costs nothing extra. Each other database is checked, 16 at
+  a time. On a store that keeps empty prefixes every database ever deleted
+  stays one of those, so the list's cost grows with them.
+- `SHOW DATABASES` read only directories, and now looks for each database's
+  first file, 16 at a time: usually one listing request on an object store,
+  plus one for a database with only its marker.
+- The measurements endpoint, for a database without a marker, now also looks
+  for its first file.
+- `GET /api/v1/databases/:name`, for a database without a marker, now stops at
+  its first file instead of listing all of them. That is every database
+  created by a write rather than by `POST /api/v1/databases`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1427](https://github.com/Basekick-Labs/arc/pull/1427).
+
 ### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
 
 The execution-history endpoint now includes runs whose duration is still
