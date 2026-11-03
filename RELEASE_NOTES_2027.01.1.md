@@ -2059,6 +2059,19 @@ reads adds about 3-5% to the transform.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
 
+### Time-bounded arcx queries avoid listing unrelated partitions ([#661](https://github.com/Basekick-Labs/arc/issues/661))
+
+The arcx router listed every file of the measurement for each routed query. A
+date-trunc or flat-scan query whose `WHERE` bounds `time` on both sides now
+lists only the hour and day partitions of that range, as the DuckDB path does.
+On a local measurement with a year of hourly partitions, a one-hour window
+went from 198 ms to 0.1 ms and a seven-day window to 5.4 ms. A query bounded
+only by a start (`time > now() - INTERVAL '1 hour'`) still lists the whole
+measurement, so rows stamped ahead of the clock are never left out. Other
+query shapes, and object storage, keep the full listing.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1293](https://github.com/Basekick-Labs/arc/pull/1293).
+
 ### A line-protocol write is no longer refused part-way by the ingest gate ([#1422](https://github.com/Basekick-Labs/arc/issues/1422))
 
 A line-protocol body with several measurements is buffered one measurement at

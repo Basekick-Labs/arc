@@ -64,6 +64,7 @@ func (h *QueryHandler) tryArcxRouter(
 	}
 	deps := arcxrouter.Deps{
 		Storage:      h.storage,
+		Pruner:       h.pruner,
 		Exclude:      h.openCompactionExclusions,
 		DB:           h.db,
 		Logger:       h.logger,
@@ -115,6 +116,7 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	}
 	deps := arcxrouter.Deps{
 		Storage:      h.storage,
+		Pruner:       h.pruner,
 		Exclude:      h.openCompactionExclusions,
 		DB:           h.db,
 		Logger:       h.logger,
