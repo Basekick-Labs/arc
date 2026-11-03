@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"testing"
 
@@ -114,4 +115,20 @@ func equalStorageRefStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// A transform that reads storage with nothing recorded is refused, as Arc's
+// own inconsistency (500), on every path that returns one; one that reads
+// nothing, or recorded what it reads, is not.
+func TestCheckTransformProvenance(t *testing.T) {
+	read := "SELECT * FROM read_parquet('./data/db1/cpu/**/*.parquet')"
+	if err := checkTransformProvenance(read, nil); !errors.Is(err, errTransformProvenance) || transformErrorStatus(err) != fiber.StatusInternalServerError {
+		t.Fatalf("unrecorded read: err %v, status %d; want errTransformProvenance, 500", err, transformErrorStatus(err))
+	}
+	if err := checkTransformProvenance(read, []TableReference{{Database: "db1", Measurement: "cpu"}}); err != nil {
+		t.Fatalf("recorded read refused: %v", err)
+	}
+	if err := checkTransformProvenance("SELECT 1", nil); err != nil {
+		t.Fatalf("a query reading nothing refused: %v", err)
+	}
 }
