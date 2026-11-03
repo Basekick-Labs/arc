@@ -2198,10 +2198,12 @@ already reads every file, so a database with a file or a cold-tier row costs
 nothing extra; only a database with neither is checked. `SHOW DATABASES`
 still reads directories.
 
-`GET /api/v1/databases/:name` and the measurements endpoint also stop at a
-database's first file instead of listing all of them, for a database without
-a marker, which is every database created by a write rather than by `POST
-/api/v1/databases`.
+For a database without a marker, which is every database created by a write
+rather than by `POST /api/v1/databases`, `GET /api/v1/databases/:name` now
+stops at the first file instead of listing all of them, and the measurements
+endpoint, which read only directories, now also looks for that first file:
+one listing request on an object store, one directory walk to the first file
+on local storage.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1427](https://github.com/Basekick-Labs/arc/pull/1427).
