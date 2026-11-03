@@ -255,7 +255,8 @@ type ObjectLister interface {
 //
 // Optional: callers type-assert and fall back to ListObjects when the backend
 // does not implement it (test fakes that embed the Backend interface, for
-// instance). LocalBackend, S3Backend and AzureBlobBackend all implement it.
+// instance). LocalBackend, S3Backend, AzureBlobBackend and GCSBackend all
+// implement it.
 type PrefixProber interface {
 	HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error)
 }

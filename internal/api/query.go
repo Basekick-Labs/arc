@@ -19,6 +19,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/governance"
@@ -4744,7 +4745,8 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	var databases []string
 	var err error
 
-	if lister, ok := h.storage.(storage.DirectoryLister); ok {
+	lister, fromDirectories := h.storage.(storage.DirectoryLister)
+	if fromDirectories {
 		databases, err = lister.ListDirectories(ctx, "")
 	} else {
 		// Fall back to List and extract unique top-level directories
@@ -4761,6 +4763,9 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	// for why a missing store must stay an error everywhere that decides.
 	if storage.IsStoreNotFound(err) {
 		databases, err = nil, nil
+	}
+	if err == nil && fromDirectories {
+		databases = h.dropEmptyDatabaseDirectories(ctx, databases)
 	}
 
 	if err != nil {
@@ -4831,6 +4836,51 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 		Msg("SHOW DATABASES completed")
 
 	return respondSuccessRows(c, columns, types, data, time.Now().UTC().Format(time.RFC3339), start)
+}
+
+// dropEmptyDatabaseDirectories drops the directories that hold no database: a
+// store that keeps empty prefixes (SeaweedFS) keeps a deleted database's, and
+// GET /api/v1/databases/:name answers 404 for it (#1425). A database is shown
+// if it holds a hot file, its marker, or (in a cluster) a manifest entry, as
+// GET /api/v1/databases lists it; a cold-only database is added from the
+// tiering metadata after this. A failed check keeps the database, as it was
+// shown before the check existed. One storage request per database (two for
+// one with only its marker), databaseCheckParallelism at a time.
+func (h *QueryHandler) dropEmptyDatabaseDirectories(ctx context.Context, dirs []string) []string {
+	manifest, _ := h.coordinator.(interface {
+		GetFileManifestByDatabase(database string) []*raft.FileEntry
+	})
+	visible := make([]string, 0, len(dirs))
+	for _, db := range dirs {
+		// Hidden directories (_schema and the like) are dropped below anyway.
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+			visible = append(visible, db)
+		}
+	}
+	answers := checkDatabases(visible, func(db string) (bool, error) {
+		found, err := databaseHasHotFiles(ctx, h.storage, db)
+		if err == nil && !found {
+			found, err = h.storage.Exists(ctx, db+"/.arc-database")
+			if storage.IsStoreNotFound(err) {
+				found, err = false, nil
+			}
+		}
+		if err != nil {
+			h.logger.Warn().Err(err).Str("database", db).Msg("SHOW DATABASES: failed to check whether a database directory holds anything; showing it")
+			return true, nil
+		}
+		if !found && manifest != nil {
+			found = manifestHasDatabasePath(db, manifest.GetFileManifestByDatabase(db))
+		}
+		return found, nil
+	})
+	kept := make([]string, 0, len(visible))
+	for _, db := range visible {
+		if answers[db] {
+			kept = append(kept, db)
+		}
+	}
+	return kept
 }
 
 // handleShowTables handles SHOW TABLES/MEASUREMENTS command by scanning storage
