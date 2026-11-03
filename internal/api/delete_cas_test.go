@@ -109,7 +109,7 @@ func (c *fsmCoordinator) ManifestHotFiles(database, measurement string) []raft.F
 
 var _ compactionCommitter = (*fsmCoordinator)(nil)
 
-func (c *fsmCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
+func (c *fsmCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration, func(string) bool) ([]string, error) {
 	c.waits++
 	return c.missing, nil
 }
@@ -133,6 +133,10 @@ func casEntry(t *testing.T, root, rel string) raft.FileEntry {
 // raceDelete runs a DELETE whose first manifest batch finds that a compaction
 // (on w2, which read cpu_a before the DELETE) committed meanwhile: this node
 // then drops its copy of the input. missing is what WaitLocalFiles reports.
+// raceUnreadableOutput makes raceDelete's compaction output a file no read
+// can open.
+var raceUnreadableOutput bool
+
 func raceDelete(t *testing.T, where string, missing []string, extra ...string) (int, string, *fsmCoordinator, string) {
 	t.Helper()
 	shortDeleteWait(t)
@@ -159,6 +163,11 @@ func raceDelete(t *testing.T, where string, missing []string, extra ...string) (
 			return
 		}
 		writeRecordsParquet(t, db, root, o)
+		if raceUnreadableOutput {
+			if err := os.WriteFile(filepath.Join(root, o), []byte("not a parquet file"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
 		oe := casEntry(t, root, o)
 		if err := c.apply(raft.CommandStageCompaction, raft.StageCompactionPayload{Job: "j1", Origin: "w2", Output: oe,
 			Inputs: []raft.CompactionInput{{Path: a, SizeBytes: ae.SizeBytes, SHA256: ae.SHA256}}}); err != nil {

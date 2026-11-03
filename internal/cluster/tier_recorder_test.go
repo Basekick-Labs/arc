@@ -57,6 +57,12 @@ func (r *fakeTierRecorder) RecordUnlinkedFile(path, reason string, sizeBytes int
 	r.mu.Unlock()
 }
 
+func (r *fakeTierRecorder) RecordManifestUnlinkedFile(path, reason string) {
+	r.mu.Lock()
+	r.unlinked = append(r.unlinked, unlinkReport{path: path, reason: reason, size: -1})
+	r.mu.Unlock()
+}
+
 func (r *fakeTierRecorder) unlinkReports() []unlinkReport {
 	r.mu.Lock()
 	defer r.mu.Unlock()

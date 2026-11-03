@@ -412,6 +412,9 @@ func (f *ClusterFSM) applyCreateOrganization(payload []byte, logIndex uint64) in
 		Uint64("lsn", entry.LSN).
 		Msg("Organization created in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := entry
 		callback(&entryCopy)
@@ -504,6 +507,9 @@ func (f *ClusterFSM) applyUpdateOrganization(payload []byte, logIndex uint64) in
 		Uint64("lsn", updated.LSN).
 		Msg("Organization updated in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := updated
 		callback(&entryCopy)
@@ -569,6 +575,9 @@ func (f *ClusterFSM) applyDeleteOrganization(payload []byte, logIndex uint64) in
 		Uint64("log_index", logIndex).
 		Msg("Organization deleted in cluster RBAC state (with cascade)")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(p.ID)
 	}
@@ -708,6 +717,9 @@ func (f *ClusterFSM) applyCreateTeam(payload []byte, logIndex uint64) interface{
 		Uint64("lsn", entry.LSN).
 		Msg("Team created in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := entry
 		callback(&entryCopy)
@@ -802,6 +814,9 @@ func (f *ClusterFSM) applyUpdateTeam(payload []byte, logIndex uint64) interface{
 		Uint64("lsn", updated.LSN).
 		Msg("Team updated in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := updated
 		callback(&entryCopy)
@@ -858,6 +873,9 @@ func (f *ClusterFSM) applyDeleteTeam(payload []byte, logIndex uint64) interface{
 		Uint64("log_index", logIndex).
 		Msg("Team deleted in cluster RBAC state (with cascade)")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(p.ID)
 	}
@@ -913,6 +931,9 @@ func (f *ClusterFSM) applyCreateRole(payload []byte, logIndex uint64) interface{
 		Uint64("lsn", entry.LSN).
 		Msg("Role created in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := entry
 		callback(&entryCopy)
@@ -973,6 +994,9 @@ func (f *ClusterFSM) applyUpdateRole(payload []byte, logIndex uint64) interface{
 		Uint64("lsn", updated.LSN).
 		Msg("Role updated in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := updated
 		callback(&entryCopy)
@@ -1023,6 +1047,9 @@ func (f *ClusterFSM) applyDeleteRole(payload []byte, logIndex uint64) interface{
 		Uint64("log_index", logIndex).
 		Msg("Role deleted in cluster RBAC state (with cascade)")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(p.ID)
 	}
@@ -1078,6 +1105,9 @@ func (f *ClusterFSM) applyCreateMeasurementPermission(payload []byte, logIndex u
 		Uint64("lsn", entry.LSN).
 		Msg("MeasurementPermission created in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := entry
 		callback(&entryCopy)
@@ -1125,6 +1155,9 @@ func (f *ClusterFSM) applyDeleteMeasurementPermission(payload []byte, logIndex u
 		Uint64("log_index", logIndex).
 		Msg("MeasurementPermission deleted in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(p.ID)
 	}
@@ -1201,6 +1234,9 @@ func (f *ClusterFSM) applyAddTokenToTeam(payload []byte, logIndex uint64) interf
 		Uint64("lsn", entry.LSN).
 		Msg("TokenMembership added in cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := entry
 		callback(&entryCopy)
@@ -1270,6 +1306,9 @@ func (f *ClusterFSM) applyRemoveTokenFromTeam(payload []byte, logIndex uint64) i
 		Uint64("log_index", logIndex).
 		Msg("TokenMembership removed from cluster RBAC state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(p.TokenID, p.TeamID)
 	}

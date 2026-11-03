@@ -20,6 +20,9 @@ import (
 // Manager orchestrates backup and restore operations.
 type Manager struct {
 	dataStorage storage.Backend // primary data storage
+	// restoreRetired: the files the DELETE retired journal named when the
+	// running restore started (restores run one at a time).
+	restoreRetired map[string]bool
 	// backupStorage is the DEFAULT target's backend. It kept its name through
 	// #1085 stage B2b-1, which made the destination configurable and possibly
 	// remote: the field means "where a backup goes" exactly as it did, and

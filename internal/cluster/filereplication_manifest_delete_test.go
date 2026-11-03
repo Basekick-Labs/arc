@@ -138,12 +138,14 @@ func newManifestDeleteRigWithBackend(t *testing.T, peerAddr string, backend stor
 		logger:    logger,
 		ctx:       ctx,
 	}
+	// Through the same decision Start makes (#1354), so these puller tests
+	// also pin that replication on keeps the puller's callbacks.
 	c.mu.Lock()
-	err := c.startFilePullerLocked()
+	c.startManifestCallbacksLocked()
 	c.mu.Unlock()
-	if err != nil {
+	if c.puller == nil {
 		cancel()
-		t.Fatalf("startFilePullerLocked: %v", err)
+		t.Fatal("startManifestCallbacksLocked did not start the puller")
 	}
 	t.Cleanup(func() {
 		c.puller.Stop()
@@ -453,6 +455,8 @@ func TestManifestDelete_ReregisterAfterUnlinkStillConverges(t *testing.T) {
 // asked for.
 func TestManifestDelete_SharedBackendNeverUnlinksOrRefreshes(t *testing.T) {
 	r := newReregisterRig(t, "shared", reregisterOpts{shared: true, logger: zerolog.Nop()})
+	recorder := &fakeTierRecorder{}
+	r.c.SetTierRecorder(recorder)
 	ctx := context.Background()
 
 	if err := r.c.raftNode.DeleteFile(r.unrelated.Path, "test: delete", 5*time.Second); err != nil {
@@ -468,6 +472,42 @@ func TestManifestDelete_SharedBackendNeverUnlinksOrRefreshes(t *testing.T) {
 	s := r.c.puller.Stats()
 	if r.c.deletesPending() != 0 || r.c.deleteRelistedLogged.Load() != 0 || s["forced_refresh"] != 0 || s["refresh_verified"] != 0 {
 		t.Fatalf("pending=%d relisted=%d stats=%v, want no delete-worker activity", r.c.deletesPending(), r.c.deleteRelistedLogged.Load(), s)
+	}
+	if reports := recorder.unlinkReports(); len(reports) != 0 {
+		t.Fatalf("non-tiering shared delete reported to tier metadata: %+v", reports)
+	}
+}
+
+func TestManifestDelete_SharedBackendReportsTieringMigration(t *testing.T) {
+	r := newReregisterRig(t, "shared-tiering", reregisterOpts{shared: true, logger: zerolog.Nop()})
+	recorder := &fakeTierRecorder{}
+	r.c.SetTierRecorder(recorder)
+
+	if err := r.c.raftNode.DeleteFile(r.path, "tiering:migrated", 5*time.Second); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+
+	reports := recorder.unlinkReports()
+	if len(reports) != 1 {
+		t.Fatalf("got %d tier unlink reports, want one: %+v", len(reports), reports)
+	}
+	if reports[0].path != r.path || reports[0].reason != "tiering:migrated" {
+		t.Fatalf("tier unlink report = %+v, want path %q and migration reason", reports[0], r.path)
+	}
+	if reports[0].size != -1 {
+		t.Fatalf("size = %d, want unknown size for a shared-store manifest delete", reports[0].size)
+	}
+
+	// A snapshot restore drops paths the cluster deleted while this node was
+	// away, for a reason the snapshot does not carry — a migration among
+	// them — so it is reported too (#1354 review). Driven through the same
+	// onDelete callback Restore calls with this reason.
+	if err := r.c.raftNode.DeleteFile(r.unrelated.Path, raft.UnlinkReasonSnapshotRemoved, 5*time.Second); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	reports = recorder.unlinkReports()
+	if len(reports) != 2 || reports[1].path != r.unrelated.Path || reports[1].reason != raft.UnlinkReasonSnapshotRemoved {
+		t.Fatalf("tier unlink reports = %+v, want the snapshot-restore drop reported second", reports)
 	}
 }
 

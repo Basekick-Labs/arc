@@ -66,3 +66,19 @@ func ReadParquet(pathExpr string, extraOpts ...string) string {
 func ReadParquetList(quotedPaths []string, extraOpts ...string) string {
 	return ReadParquet("["+strings.Join(quotedPaths, ", ")+"]", extraOpts...)
 }
+
+// ExcludeFiles wraps the one read_parquet(...) call that expr ends with so the
+// read leaves out the given files: a subquery over the read with a file-name
+// column (named column, so a data column called "filename" cannot collide)
+// and a NOT IN filter, the column then dropped. quotedFiles are SQL string
+// literals of the file paths exactly as DuckDB reports them. expr is returned
+// unchanged when it holds no such call or there is nothing to exclude.
+func ExcludeFiles(expr, column string, quotedFiles []string) string {
+	i := strings.Index(expr, "read_parquet(")
+	if i < 0 || len(quotedFiles) == 0 || !strings.HasSuffix(expr, ")") {
+		return expr
+	}
+	return expr[:i] + "(SELECT * EXCLUDE (" + column + ") FROM " +
+		expr[i:len(expr)-1] + ", filename='" + column + "') WHERE " +
+		column + " NOT IN (" + strings.Join(quotedFiles, ", ") + "))"
+}

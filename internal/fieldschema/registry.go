@@ -10,9 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/rs/zerolog"
@@ -86,7 +89,7 @@ type Registry struct {
 	describe describeFunc
 	now      func() time.Time
 
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	entries map[string]*entry
 
 	queue   chan *entry
@@ -116,6 +119,19 @@ type entry struct {
 	nextBootstrap     time.Time
 	refreshing        bool      // background re-read of the stored anchor in flight
 	retryAfter        time.Time // backend error: do not re-issue the lookup before this
+
+	// folds is schema's field names keyed by their ASCII-lowered form
+	// (KnownColumnFolds, #1342), republished by publishFolds whenever schema
+	// changes, so ingest reads it without the entry's lock: a lookup that
+	// waited for, or gave up on, a busy entry would cost or skip the check.
+	folds    atomic.Pointer[map[string]string]
+	foldsFor *arrow.Schema
+	// textBinary is, for schema's STRING and BINARY fields, whether the field
+	// is BINARY (KnownTextBinaryColumns, #440); published with folds.
+	textBinary atomic.Pointer[map[string]bool]
+	// dirty: the stored anchor holds fields Clean drops (#1342); the next
+	// publish rewrites it even when nothing else changed.
+	dirty bool
 }
 
 // maxEntries bounds the registry's memory against clients naming measurements
@@ -236,6 +252,7 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 		e.loadedAt = r.now()
 		e.absent = true
 		e.schema = nil
+		e.publishFolds()
 		return nil
 	}
 	data, err := r.backend.Read(ctx, k)
@@ -252,13 +269,28 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 		r.logger.Warn().Err(err).Str("anchor", k).Msg("Stored field schema anchor cannot be decoded; ignoring it")
 		e.absent = true
 		e.schema = nil
+		e.publishFolds()
 		return nil
 	}
 	e.absent = false
 	e.complete = complete
+	if cleaned, removed := Clean(stored); len(removed) > 0 {
+		stored = cleaned // order kept: the anchor was written in anchor order
+		e.dirty = true
+		r.logger.Warn().
+			Str("anchor", k).
+			Strs("fields", quoteNames(removed)).
+			Msg("Field schema anchor holds field names Arc cannot read back; they are left out of every query (#1342)")
+	} else {
+		e.dirty = false
+	}
 	merged, _, conflicts := Merge(stored, e.schema)
 	r.logConflicts(e, conflicts)
+	// Each side is clean on its own, but a merge can still pair two spellings
+	// ("Temp" stored, "temp" cached from a file): clean the result too.
+	merged, _ = Clean(merged)
 	e.schema = merged
+	e.publishFolds()
 	return nil
 }
 
@@ -341,7 +373,7 @@ func (r *Registry) EnsureFile(ctx context.Context, database, measurement string,
 	if e.pending != nil {
 		incoming, _, _ = Merge(e.pending, incoming)
 	}
-	if e.schema != nil && !e.absent && Covers(e.schema, incoming) && now.Sub(e.verifiedAt) < r.opts.VerifyTTL {
+	if e.schema != nil && !e.absent && !e.dirty && Covers(e.schema, incoming) && now.Sub(e.verifiedAt) < r.opts.VerifyTTL {
 		return nil
 	}
 	var hint *bool
@@ -412,6 +444,7 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 	e.schema = nil
 	if err := r.loadStored(ctx, e); err != nil {
 		e.schema = cached
+		e.publishFolds()
 		e.pending, _, _ = Merge(e.pending, incoming)
 		r.logger.Warn().Err(err).Msg("Field schema anchor unavailable; will retry on the next flush")
 		return err
@@ -424,8 +457,10 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 		base, _, c1 = Merge(stored, cached)
 	}
 	merged, _, c2 := Merge(base, incoming)
+	merged, _ = Clean(merged) // a merge can pair two spellings; see loadStored
 	r.logConflicts(e, append(c1, c2...))
 	e.schema = merged
+	e.publishFolds()
 	e.verifiedAt = r.now()
 	complete := e.complete
 	switch {
@@ -434,7 +469,7 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 	case stored == nil && completeHint == nil:
 		complete = r.measurementHasNoFiles(ctx, e.database, e.measurement)
 	}
-	if stored != nil && complete == e.complete && Fingerprint(stored) == Fingerprint(merged) {
+	if stored != nil && !e.dirty && complete == e.complete && Fingerprint(stored) == Fingerprint(merged) {
 		return nil
 	}
 	e.complete = complete
@@ -449,6 +484,7 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 		return fmt.Errorf("fieldschema: write %s: %w", k, err)
 	}
 	e.absent = false
+	e.dirty = false
 	r.logger.Info().
 		Str("database", e.database).
 		Str("measurement", e.measurement).
@@ -592,6 +628,102 @@ func (r *Registry) Fields(ctx context.Context, database, measurement string) ([]
 	return out, true, nil
 }
 
+// KnownColumnFolds is the measurement's registered field names keyed by their
+// ASCII-lowered form (fold -> stored spelling), for ingest to refuse a new
+// column that differs from a known one only in letter case (#1342). It takes
+// no entry lock, never blocks on I/O and never creates an entry: it answers
+// the folds last published for the entry's schema, or nil for a measurement
+// whose anchor is not in memory yet, and ingest then checks the write
+// against itself only. The map is shared; callers must not modify it.
+func (r *Registry) KnownColumnFolds(database, measurement string) map[string]string {
+	if !r.Enabled() {
+		return nil
+	}
+	r.mu.RLock()
+	e := r.entries[key(database, measurement)]
+	r.mu.RUnlock()
+	if e == nil {
+		return nil
+	}
+	if f := e.folds.Load(); f != nil {
+		return *f
+	}
+	return nil
+}
+
+// KnownTextBinaryColumns is, for the measurement's registered STRING and
+// BINARY fields, whether the field is BINARY (#440). Ingest refuses a write
+// that would change a column between the two: DuckDB binds VARCHAR and BLOB
+// across files as BLOB, so the stored strings would stop answering string
+// functions. Same contract as KnownColumnFolds: no I/O, no entry lock, never
+// creates an entry; nil when the anchor is not in memory, and the check is
+// then not made. A field with any other type (including the bottom type a
+// conflicting merge records) is absent: no opinion.
+func (r *Registry) KnownTextBinaryColumns(database, measurement string) map[string]bool {
+	if !r.Enabled() {
+		return nil
+	}
+	r.mu.RLock()
+	e := r.entries[key(database, measurement)]
+	r.mu.RUnlock()
+	if e == nil {
+		return nil
+	}
+	if m := e.textBinary.Load(); m != nil {
+		return *m
+	}
+	return nil
+}
+
+// publishFolds republishes e.folds and e.textBinary for e.schema. Caller
+// holds e.mu.
+func (e *entry) publishFolds() {
+	if e.foldsFor == e.schema {
+		return
+	}
+	e.foldsFor = e.schema
+	if e.schema == nil {
+		e.folds.Store(nil)
+		e.textBinary.Store(nil)
+		return
+	}
+	textBinary := make(map[string]bool)
+	for _, f := range e.schema.Fields() {
+		switch f.Type.ID() {
+		case arrow.STRING, arrow.LARGE_STRING:
+			textBinary[f.Name] = false
+		case arrow.BINARY, arrow.LARGE_BINARY:
+			textBinary[f.Name] = true
+		}
+	}
+	e.textBinary.Store(&textBinary)
+	folds := make(map[string]string, e.schema.NumFields())
+	for _, f := range e.schema.Fields() {
+		// An anchor from before #1342 can hold two spellings; the one listed
+		// first is the measurement's.
+		if k := asciiLower(f.Name); folds[k] == "" {
+			folds[k] = f.Name
+		}
+	}
+	e.folds.Store(&folds)
+}
+
+// asciiLower lower-cases ASCII letters only, as DuckDB folds identifiers.
+func asciiLower(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if c := b[j]; c >= 'A' && c <= 'Z' {
+					b[j] = c + ('a' - 'A')
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
+}
+
 // DeleteDatabase removes every stored anchor of a database and forgets them
 // locally. Called when the database itself is deleted.
 func (r *Registry) DeleteDatabase(ctx context.Context, database string) error {
@@ -627,6 +759,7 @@ func (r *Registry) DeleteDatabase(ctx context.Context, database string) error {
 			os.Remove(e.localPath)
 		}
 		e.schema = nil
+		e.publishFolds()
 		e.mu.Unlock()
 	}
 	return errs
@@ -786,7 +919,10 @@ func (r *Registry) runBootstrap(parent context.Context, e *entry) {
 		park("no field with a mappable type")
 		return
 	}
-	incoming := Normalize(arrow.NewSchema(fields, nil), nil)
+	// DESCRIBE renames the second of two names equal ignoring case
+	// ("temp_1"): drop those renames before the schema is used (#1342).
+	described, _ := CleanDescribed(arrow.NewSchema(fields, nil))
+	incoming := Normalize(described, nil)
 	// The anchor is complete only when every file was sampled and every
 	// field mapped; a partial sample may miss a column older files carry.
 	complete := sampledAll && allMapped
@@ -942,4 +1078,17 @@ func duckDBDescribe(db *sql.DB) describeFunc {
 		}
 		return out, rows.Err()
 	}
+}
+
+// quoteNames is names for a log field, an invalid byte escaped.
+func quoteNames(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		if utf8.ValidString(n) {
+			out[i] = n
+		} else {
+			out[i] = strconv.Quote(n)
+		}
+	}
+	return out
 }

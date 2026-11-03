@@ -15,7 +15,7 @@ import (
 // backends' own config structs rather than copies of them, so there stays
 // exactly one definition of what an S3 or an Azure destination is.
 type BackendSpec struct {
-	// Type names the backend: local, s3, minio, azure or azblob. It is matched
+	// Type names the backend: local, s3, minio, azure, azblob or gcs. It is matched
 	// case-insensitively after trimming, so a value that came through
 	// config.Load (which already lowercases and trims storage.backend) and a
 	// hand-built spec resolve the same way.
@@ -35,6 +35,10 @@ type BackendSpec struct {
 	// every key the backend touches, so a caller that drops it silently
 	// reroots itself at the container root.
 	Azure AzureBlobConfig
+
+	// GCS configures a gcs backend. Read only for that type. Prefix included,
+	// for the same reason as S3's.
+	GCS GCSConfig
 }
 
 // NewBackend builds the storage backend a BackendSpec names.
@@ -57,8 +61,9 @@ type BackendSpec struct {
 // Each backend keeps its own validation: NewS3Backend requires a bucket and
 // fails on an unusable prefix, NewAzureBlobBackend requires a container, a
 // usable prefix (checked first, before any credential or network work) and a
-// usable authentication combination, and NewLocalBackend creates its directory
-// with owner-only permissions.
+// usable authentication combination, NewGCSBackend requires a bucket and a
+// usable prefix and refuses a hierarchical-namespace bucket, and
+// NewLocalBackend creates its directory with owner-only permissions.
 func NewBackend(spec BackendSpec, logger zerolog.Logger) (Backend, error) {
 	switch strings.ToLower(strings.TrimSpace(spec.Type)) {
 	case "local":
@@ -82,7 +87,14 @@ func NewBackend(spec BackendSpec, logger zerolog.Logger) (Backend, error) {
 		}
 		return b, nil
 
+	case "gcs":
+		b, err := NewGCSBackend(&spec.GCS, logger)
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
+
 	default:
-		return nil, fmt.Errorf("unsupported storage backend %q (use local, s3, minio, azure or azblob)", spec.Type)
+		return nil, fmt.Errorf("unsupported storage backend %q (use local, s3, minio, azure, azblob or gcs)", spec.Type)
 	}
 }

@@ -306,6 +306,8 @@ type lpMeasurement struct {
 	time []int64
 	cols map[string]*lpColumn
 	hint int // capacity of a new column
+	// folds maps each column's FoldColumnName to its spelling (#1342).
+	folds map[string]string
 }
 
 // ParseLPTyped parses a line-protocol chunk straight into one typed batch per
@@ -319,7 +321,7 @@ func (p *LineProtocolParser) ParseLPTyped(data []byte, precision, filter string,
 	if kinds == nil {
 		kinds = map[string]map[string]LPKind{} // every column is then "has no kind"
 	}
-	batches, rows, _, err := p.parseLPTyped(data, precision, filter, kinds)
+	batches, rows, _, err := p.parseLPTyped(data, precision, filter, kinds, nil)
 	return batches, rows, err
 }
 
@@ -327,8 +329,8 @@ func (p *LineProtocolParser) ParseLPTyped(data []byte, precision, filter string,
 // and column.
 type LPDrop struct {
 	Measurement string
-	Column      string // "" for the time key
-	Reason      string // LPDropTime, LPDropSameColumn, LPDropKind
+	Column      string // the offending tag or field name or column ("" for a key named exactly "time")
+	Reason      string // LPDropTime, LPDropName, LPDropCase, LPDropSameColumn, LPDropKind
 	Kind        LPKind // the column's kind (LPDropKind)
 	ValueType   string // the dropped value's Go type (LPDropKind)
 	Points      int
@@ -336,7 +338,9 @@ type LPDrop struct {
 
 // Reasons a write drops a point.
 const (
-	LPDropTime       = "a tag or field named \"time\" (time is the timestamp)"
+	LPDropTime       = ColumnNameTimeAlike
+	LPDropName       = ColumnNameNotUTF8
+	LPDropCase       = ColumnNameCaseTwin
 	LPDropSameColumn = "two keys of one point write one column (a field named like a tag is stored as \"<name>_value\")"
 	LPDropKind       = "a value that does not fit its column's type (the column's first value decides it)"
 )
@@ -348,7 +352,14 @@ const (
 // land in one column, one with a value that does not fit its column's type.
 // A dropped point sets no column's type.
 func (p *LineProtocolParser) ParseLPWrite(data []byte, precision string) (map[string]*TypedColumnBatch, map[string]int, []LPDrop, error) {
-	return p.parseLPTyped(data, precision, "", nil)
+	return p.parseLPTyped(data, precision, "", nil, nil)
+}
+
+// ParseLPWriteKnown is ParseLPWrite that also drops a point whose new column
+// differs only in letter case from a column known gives for its measurement
+// (one the measurement was written with before, #1342). known may be nil.
+func (p *LineProtocolParser) ParseLPWriteKnown(data []byte, precision string, known KnownColumns) (map[string]*TypedColumnBatch, map[string]int, []LPDrop, error) {
+	return p.parseLPTyped(data, precision, "", nil, known)
 }
 
 // lpMaxColumnHint bounds the rows a new column reserves up front.
@@ -386,6 +397,12 @@ type lpBuilder struct {
 	// nullCols are, per measurement, columns that only ever had NULL values
 	// (msgpack rows: a field sent as nil); see finish.
 	nullCols map[string]map[string]struct{}
+	// known gives each measurement's stored column spellings (#1342), asked
+	// once per measurement; knownBy caches the answer.
+	known    KnownColumns
+	knownBy  map[string]map[string]string
+	newCols  []string          // fits' scratch: the point's new columns
+	newFolds map[string]string // fits' scratch: their folds, cleared per point
 }
 
 func newLPBuilder(kinds map[string]map[string]LPKind, hint int) *lpBuilder {
@@ -416,7 +433,7 @@ func (b *lpBuilder) add(p *lpPoint) error {
 	}
 	mk := b.kinds[p.measurement]
 	if m == nil {
-		m = &lpMeasurement{cols: map[string]*lpColumn{}, time: make([]int64, 0, b.hint), hint: b.hint}
+		m = &lpMeasurement{cols: map[string]*lpColumn{}, folds: map[string]string{}, time: make([]int64, 0, b.hint), hint: b.hint}
 		b.ms[p.measurement] = m
 		b.hint = 0
 	}
@@ -438,6 +455,7 @@ func (b *lpBuilder) add(p *lpPoint) error {
 			}
 			c = newLPColumn(k, tag, m.hint)
 			m.cols[name] = c
+			m.folds[FoldColumnName(name)] = name
 		}
 		c.tag = c.tag || tag
 		return c, nil
@@ -455,6 +473,9 @@ func (b *lpBuilder) add(p *lpPoint) error {
 		name := p.cols[i]
 		if f.Value == nil {
 			b.nullColumn(p.measurement, name) // a NULL: the row's cell stays empty
+			if k := FoldColumnName(name); m.folds[k] == "" {
+				m.folds[k] = name // a later twin of a NULL-only column is one too (#1342)
+			}
 			continue
 		}
 		c, err := col(name, false, f.Value)
@@ -473,18 +494,6 @@ func (b *lpBuilder) add(p *lpPoint) error {
 // point before any of it is written, so a dropped point leaves no partial
 // row and sets no column's type.
 func (b *lpBuilder) fits(p *lpPoint, m *lpMeasurement) bool {
-	for _, t := range p.tags {
-		if t.Key == "time" {
-			b.drop(p.measurement, "", LPDropTime, LPKindNone, nil)
-			return false
-		}
-	}
-	for _, f := range p.fields {
-		if f.Key == "time" {
-			b.drop(p.measurement, "", LPDropTime, LPKindNone, nil)
-			return false
-		}
-	}
 	if column, clash := pointColumnClash(p); clash {
 		b.drop(p.measurement, column, LPDropSameColumn, LPKindNone, nil)
 		return false
@@ -498,18 +507,32 @@ func (b *lpBuilder) fits(p *lpPoint, m *lpMeasurement) bool {
 		}
 		return LPKindNone, false
 	}
+	// A column the measurement does not have yet must have a name Arc can
+	// read back (#1342). One already in m passed when it was added, so the
+	// steady state pays nothing beyond the kind lookup it already does.
+	b.newCols = b.newCols[:0]
 	for _, t := range p.tags {
-		if k, ok := kindOf(t.Key); ok && k != LPKindString {
+		k, ok := kindOf(t.Key)
+		if !ok {
+			if !b.newColumnName(p, t.Key, t.Key) {
+				return false
+			}
+			continue
+		}
+		if k != LPKindString {
 			b.drop(p.measurement, t.Key, LPDropKind, k, t.Value)
 			return false
 		}
 	}
 	for i, f := range p.fields {
+		column := p.cols[i]
+		k, ok := kindOf(column)
+		if !ok && !b.newColumnName(p, f.Key, column) {
+			return false
+		}
 		if f.Value == nil {
 			continue // a NULL fits any column
 		}
-		column := p.cols[i]
-		k, ok := kindOf(column)
 		if !ok {
 			k = LPKindOf(f.Value) // a new column: its first value must fit it too
 		}
@@ -518,7 +541,72 @@ func (b *lpBuilder) fits(p *lpPoint, m *lpMeasurement) bool {
 			return false
 		}
 	}
+	return len(b.newCols) == 0 || b.newColumnsFit(p, m)
+}
+
+// newColumnName checks the name of a column the measurement does not have
+// yet (key is the tag or field key it comes from): not valid UTF-8, or "time"
+// in any letter case, drops the point. An acceptable one is queued for
+// newColumnsFit.
+func (b *lpBuilder) newColumnName(p *lpPoint, key, column string) bool {
+	switch ColumnNameProblem(key) {
+	case "":
+		b.newCols = append(b.newCols, column)
+		return true
+	case ColumnNameTimeAlike:
+		col := key
+		if key == "time" {
+			col = ""
+		}
+		b.drop(p.measurement, col, LPDropTime, LPKindNone, nil)
+	default:
+		b.drop(p.measurement, key, LPDropName, LPKindNone, nil)
+	}
+	return false
+}
+
+// newColumnsFit drops the point when one of its new columns differs only in
+// letter case from another column: of the measurement in this write, of the
+// point itself, or (via known) of the measurement's earlier writes.
+func (b *lpBuilder) newColumnsFit(p *lpPoint, m *lpMeasurement) bool {
+	known := b.knownColumns(p.measurement)
+	var batch map[string]string
+	if m != nil {
+		batch = m.folds
+	}
+	if b.newFolds == nil {
+		b.newFolds = map[string]string{}
+	}
+	clear(b.newFolds)
+	for _, c := range b.newCols {
+		if _, twin := ColumnCaseTwin(c, batch, known); twin {
+			b.drop(p.measurement, c, LPDropCase, LPKindNone, nil)
+			return false
+		}
+		f := FoldColumnName(c)
+		if o, ok := b.newFolds[f]; ok && o != c {
+			b.drop(p.measurement, c, LPDropCase, LPKindNone, nil)
+			return false
+		}
+		b.newFolds[f] = c
+	}
 	return true
+}
+
+// knownColumns is known's answer for measurement, asked once per write.
+func (b *lpBuilder) knownColumns(measurement string) map[string]string {
+	if b.known == nil {
+		return nil
+	}
+	if k, ok := b.knownBy[measurement]; ok {
+		return k
+	}
+	if b.knownBy == nil {
+		b.knownBy = map[string]map[string]string{}
+	}
+	k := b.known(measurement)
+	b.knownBy[measurement] = k
+	return k
 }
 
 // pointColumnClash reports a column two keys of p resolve to.
@@ -608,7 +696,7 @@ func (b *lpBuilder) finish() (map[string]*TypedColumnBatch, map[string]int, []LP
 	return out, rows, dropped
 }
 
-func (p *LineProtocolParser) parseLPTyped(data []byte, precision, filter string, kinds map[string]map[string]LPKind) (map[string]*TypedColumnBatch, map[string]int, []LPDrop, error) {
+func (p *LineProtocolParser) parseLPTyped(data []byte, precision, filter string, kinds map[string]map[string]LPKind, known KnownColumns) (map[string]*TypedColumnBatch, map[string]int, []LPDrop, error) {
 	// The first measurement's columns are sized for the whole body: exact for
 	// a body of one measurement (the common write), at most the body's line
 	// count per column otherwise. Later measurements grow by append: sizing
@@ -616,6 +704,7 @@ func (p *LineProtocolParser) parseLPTyped(data []byte, precision, filter string,
 	// Capped: blank, comment and invalid lines count but add no rows, and a
 	// larger body grows by append from the cap.
 	b := newLPBuilder(kinds, min(bytes.Count(data, []byte{'\n'})+1, lpMaxColumnHint))
+	b.known = known
 	var pt lpPoint
 	err := p.LexBatch(data, precision, func(l *LPLine) error {
 		if filter != "" && l.Measurement != filter {

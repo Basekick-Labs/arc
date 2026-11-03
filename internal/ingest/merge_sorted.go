@@ -115,6 +115,8 @@ func (b *ArrowBuffer) mergeSortedByTime(measurement string, batches []interface{
 			out.Data[name] = gatherMerged[bool](typed, name, perm, src, off)
 		case []decimal128.Num:
 			out.Data[name] = gatherMerged[decimal128.Num](typed, name, perm, src, off)
+		case [][]byte:
+			out.Data[name] = gatherMerged[[]byte](typed, name, perm, src, off)
 		default:
 			return nil, false
 		}
@@ -222,6 +224,9 @@ func sameColumnType(a, b interface{}) bool {
 	case []decimal128.Num:
 		_, ok := b.([]decimal128.Num)
 		return ok
+	case [][]byte:
+		_, ok := b.([][]byte)
+		return ok
 	}
 	return false
 }
@@ -237,6 +242,8 @@ func columnLen(col interface{}) int {
 	case []bool:
 		return len(c)
 	case []decimal128.Num:
+		return len(c)
+	case [][]byte:
 		return len(c)
 	}
 	return -1

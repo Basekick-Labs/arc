@@ -19,9 +19,9 @@ func TestParseFileTime(t *testing.T) {
 		want   time.Time
 	}{
 		{"ingest format", "cpu_20260828_200802_765188000.parquet", true,
-			time.Date(2026, 8, 28, 20, 8, 2, 0, time.UTC)},
+			time.Date(2026, 8, 28, 20, 8, 2, 765188000, time.UTC)},
 		{"underscored measurement", "my_weird_2x_measure_20260828_200802_765188000.parquet", true,
-			time.Date(2026, 8, 28, 20, 8, 2, 0, time.UTC)},
+			time.Date(2026, 8, 28, 20, 8, 2, 765188000, time.UTC)},
 		{"hourly compacted (real format: ..._{unixnano}_b{n}_compacted)", "cpu_20260828_200000_1787948669258000000_b0_compacted.parquet", false, time.Time{}},
 		{"daily compacted", "cpu_20260828_000000_1787948669258000000_b0_daily.parquet", false, time.Time{}},
 		{"too few tokens", "cpu_20260828_200802.parquet", false, time.Time{}},
@@ -29,8 +29,11 @@ func TestParseFileTime(t *testing.T) {
 		{"bad minute", "cpu_20260828_207102_765188000.parquet", false, time.Time{}},
 		{"bad month", "cpu_20261328_200802_765188000.parquet", false, time.Time{}},
 		{"garbage", "whatever.parquet", false, time.Time{}},
-		{"full path is fine", "/data/apex/cpu/2026/08/28/20/cpu_20260828_200802_765188000.parquet", true,
+		// A nanos token that is not 9 digits keeps the second (older names).
+		{"short nanos token", "cpu_20260828_200802_7651.parquet", true,
 			time.Date(2026, 8, 28, 20, 8, 2, 0, time.UTC)},
+		{"full path is fine", "/data/apex/cpu/2026/08/28/20/cpu_20260828_200802_765188000.parquet", true,
+			time.Date(2026, 8, 28, 20, 8, 2, 765188000, time.UTC)},
 	}
 	for _, c := range cases {
 		got, ok := parseFileTime(c.file)

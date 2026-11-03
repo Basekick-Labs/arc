@@ -3,15 +3,17 @@ package pruning
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
-// File-level time pruning. EXPERIMENTAL in 26.09.2 (opt-in via
-// query.file_time_pruning); promotion to stable + default-on is tracked in
-// #659, targeting 27.01.1.
+// File-level time pruning (query.file_time_pruning). Added in 26.09.2 as an
+// opt-in; on by default since 27.01.1 (#659), validated by the prune_diff
+// harness in arc-benchmarks.
 //
 // Partition pruning stops at hour-directory globs; the current (live) hour of
 // a high-frequency ingest workload can accumulate thousands of small parquet
@@ -39,12 +41,21 @@ import (
 //     margin but still WITHIN the same hour are indistinguishable from
 //     normal ingest and may be invisible until their hour closes (the hour
 //     rollover self-heals; plain partition pruning has no such window).
-//     Size the margin to the worst writer clock skew you expect.
+//     Size the margin to the worst clock skew of any node that flushes the
+//     files: writers, and edge spokes whose files a hub receives with their
+//     names unchanged. The flushing node counts the rows at risk
+//     (arc_ingest_future_stamped_rows_total); a reader or hub that misses
+//     them counts nothing.
 //
-// Restricting expansion to the current UTC hour has two purposes: it is the
-// only hour that accumulates uncompacted per-flush files (older hours fold at
-// :05), and hourly compaction never touches it (min age is clamped to >= 1h),
-// so an expanded explicit list can never race a compaction delete.
+// Expansion is restricted to the current UTC hour because compaction never
+// touches it (the hourly and daily min ages are both clamped to >= 1h), so
+// an expanded explicit list can never race a compaction delete. A row DELETE
+// rewriting a listed file can still make it vanish before the read; that
+// window exists with the glob too and answers 503 (#1356). The previous hour
+// holds per-flush files as well: compaction waits until a partition's newest
+// file is older than the min age, so at the default min age of 1h hour H
+// folds at the first run after H+2:00 (H + min age + 1h in general). Expanding
+// it would need its own race argument and is not done.
 //
 // Expanded results are volatile: they must never be served from a cache,
 // because a cached list hides every file flushed since it was built. The
@@ -89,19 +100,24 @@ func MarkVolatile(ctx context.Context) { markVolatile(ctx) }
 // SetFileTimePruning enables or disables file-level time pruning.
 // margin widens the keep-window below the query's lower bound to absorb
 // writer clock skew (rows stamped slightly ahead of the server clock).
-// Startup-only: the fields are read unlocked by concurrent queries, so this
-// must not be called while the handler is serving.
+// Safe while queries run (the fields are atomic). Ingest keeps its own copy
+// of the margin for the future-stamped row count (ArrowBuffer.
+// SetFutureStampMargin); a configuration reload must set both.
 func (p *PartitionPruner) SetFileTimePruning(enabled bool, margin time.Duration) {
-	if margin < 0 {
+	if margin < minFileTimeMargin {
 		// A negative margin would move the cutoff ABOVE the query's lower
-		// bound and prune files that certainly contain in-range rows.
+		// bound and prune files that certainly contain in-range rows; one
+		// under a second would rely on sub-second agreement between the
+		// flush clock and the rows' stamps that nothing guarantees.
 		p.logger.Warn().
 			Dur("configured_margin", margin).
-			Msg("file_time_pruning margin is negative; clamping to 0")
-		margin = 0
+			Dur("minimum", minFileTimeMargin).
+			Msg("file_time_pruning margin is below the minimum; raising it")
+		margin = minFileTimeMargin
 	}
-	p.fileTimePruning = enabled
-	p.fileTimeMargin = margin
+	// Margin first: a reader that sees the flag on must see the margin set.
+	p.fileTimeMargin.Store(int64(margin))
+	p.fileTimePruning.Store(enabled)
 	if enabled {
 		p.logger.Info().
 			Dur("margin", margin).
@@ -138,21 +154,43 @@ func parseFileTime(name string) (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
+	// The last token is the flush time's nanoseconds within its second
+	// (generateStoragePath, %09d). Without it a file flushed at hh:mm:ss.9
+	// read as hh:mm:ss.0 and could be dropped for a start inside that second.
+	if len(nanos) == 9 {
+		n, _ := strconv.Atoi(nanos)
+		ts = ts.Add(time.Duration(n))
+	}
 	return ts, true
 }
 
-// applyFileTimePruning expands the boundary-hour glob into an explicit file
+// minFileTimeMargin is the smallest margin the pruner accepts.
+const minFileTimeMargin = time.Second
+
+// applyFileTimePruning is fileTimePass without the eligibility flag.
+func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []string, timeRange *TimeRange) ([]string, bool) {
+	out, expanded, _ := p.fileTimePass(ctx, paths, timeRange)
+	return out, expanded
+}
+
+// fileTimePass expands the boundary-hour glob into an explicit file
 // list with provably-out-of-range files removed. Returns the (possibly
 // modified) path list and whether it was modified; when modified, the result
 // is volatile (never cache it) and the context is marked accordingly.
-// Remote (s3://, azure://) paths are never touched.
-func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []string, timeRange *TimeRange) ([]string, bool) {
-	if !p.fileTimePruning || timeRange == nil || len(paths) == 0 {
-		return paths, false
+// Object-store URLs (storage.IsObjectURL) are never touched.
+//
+// eligible reports a pass that looked at the live hour's files, whether or
+// not it changed the list. Its result is volatile either way: a declined pass
+// (every file in range, too many kept) can expand on the next query, so it is
+// not cached by the pruner, and the context is marked for the SQL transform
+// cache.
+func (p *PartitionPruner) fileTimePass(ctx context.Context, paths []string, timeRange *TimeRange) (out []string, expanded, eligible bool) {
+	if !p.fileTimePruning.Load() || timeRange == nil || timeRange.StartAssumed || len(paths) == 0 {
+		return paths, false, false
 	}
 	boundary := timeRange.Start.UTC().Truncate(time.Hour)
 	if !boundary.Equal(p.nowFn().UTC().Truncate(time.Hour)) {
-		return paths, false
+		return paths, false, false
 	}
 
 	// The boundary-hour glob ends in .../YYYY/MM/DD/HH/*.parquet, built by
@@ -163,7 +201,7 @@ func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []stri
 
 	idx := -1
 	for i, pth := range paths {
-		if strings.HasPrefix(pth, "s3://") || strings.HasPrefix(pth, "azure://") {
+		if storage.IsObjectURL(pth) {
 			continue
 		}
 		if strings.HasSuffix(pth, suffix) {
@@ -172,7 +210,7 @@ func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []stri
 		}
 	}
 	if idx < 0 {
-		return paths, false
+		return paths, false, false
 	}
 
 	// Fresh glob, never the TTL globCache: a cached expansion would hide
@@ -180,39 +218,56 @@ func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []stri
 	// feature must not introduce.
 	files, err := filepath.Glob(paths[idx])
 	if err != nil || len(files) == 0 {
-		return paths, false
+		return paths, false, false
 	}
+	markVolatile(ctx)
+	m := metrics.Get()
+	m.IncFileTimePruningPass(len(files))
 
-	cutoff := timeRange.Start.UTC().Add(-p.fileTimeMargin)
+	cutoff := timeRange.Start.UTC().Add(-time.Duration(p.fileTimeMargin.Load()))
 	kept := make([]string, 0, len(files))
+	anomalous := 0
 	for _, f := range files {
 		ft, ok := parseFileTime(f)
 		// Keep when: name unparseable (fail open); anomalous placement
 		// (parsed time before the directory's own hour — only
 		// future-stamped data creates that, and it may hold in-range
 		// rows); or flush time within the margin-padded range.
-		if !ok || ft.Before(boundary) || !ft.Before(cutoff) {
+		switch {
+		case ok && ft.Before(boundary):
+			anomalous++
+			kept = append(kept, f)
+		case !ok || !ft.Before(cutoff):
 			kept = append(kept, f)
 		}
 	}
+	m.AddFileTimePruningAnomalousKept(anomalous)
 
-	if len(kept) == len(files) || len(kept) > maxExpandedFiles {
-		return paths, false
-	}
-	if len(kept) == 0 && len(paths) == 1 {
+	switch {
+	case len(kept) == len(files):
+		m.IncFileTimePruningNothingDropped()
+		return paths, false, true
+	case len(kept) > maxExpandedFiles:
+		m.IncFileTimePruningCapFallback()
+		return paths, false, true
+	case len(kept) == 0 && len(paths) == 1:
 		// Fail safe: never empty the whole path set.
-		return paths, false
+		m.IncFileTimePruningZeroSurvivors()
+		return paths, false, true
 	}
+	if len(kept) == 0 {
+		m.IncFileTimePruningZeroSurvivors()
+	}
+	m.IncFileTimePruningExpanded(len(files) - len(kept))
 
-	out := make([]string, 0, len(paths)-1+len(kept))
+	out = make([]string, 0, len(paths)-1+len(kept))
 	out = append(out, paths[:idx]...)
 	out = append(out, kept...)
 	out = append(out, paths[idx+1:]...)
-	markVolatile(ctx)
 	p.logger.Debug().
 		Int("dir_files", len(files)).
 		Int("kept", len(kept)).
 		Time("cutoff", cutoff).
 		Msg("File-level time pruning expanded the live-hour glob")
-	return out, true
+	return out, true, true
 }

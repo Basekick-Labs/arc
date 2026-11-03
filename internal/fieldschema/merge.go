@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/apache/arrow-go/v18/arrow"
 )
@@ -24,6 +25,7 @@ func Normalize(schema *arrow.Schema, tagColumns []string) *arrow.Schema {
 	if schema == nil {
 		return nil
 	}
+	schema, _ = Clean(schema)
 	tags := make(map[string]bool, len(tagColumns))
 	for _, t := range tagColumns {
 		tags[t] = true
@@ -274,4 +276,117 @@ func Fingerprint(s *arrow.Schema) string {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Clean drops the fields Arc cannot read back (#1342) and returns their
+// names. Ingest refuses these names now; files and anchors written before
+// that can still carry them, and the anchor is listed first in every query
+// of the measurement, so one bad field breaks every read:
+//
+//   - a name that is not valid UTF-8 ("Invalid unicode" on SELECT *);
+//   - a name equal to "time" ignoring ASCII case, other than "time" itself;
+//   - of names equal ignoring ASCII case, every one after the first in field
+//     order: union_by_name reads them as one column anyway;
+//   - "time_<digits>" next to a time-like name: the real time column, as
+//     DuckDB's DESCRIBE renames it when "Time" comes first (no ingest path
+//     ever wrote "time_<n>" next to such a name).
+//
+// It never leaves a schema that dropped a time-like name without "time":
+// the renamed real time column is put back as "time", so a query of the
+// anchor alone still binds time. Field order is otherwise kept.
+func Clean(schema *arrow.Schema) (*arrow.Schema, []string) {
+	return clean(schema, false)
+}
+
+// CleanDescribed is Clean for a schema DuckDB's DESCRIBE produced (bootstrap):
+// there, every "<name>_<digits>" whose <name> has another spelling is a
+// rename DuckDB made, not a field, and is dropped too. Elsewhere "cpu_1" next
+// to "Cpu" is a field of its own.
+func CleanDescribed(schema *arrow.Schema) (*arrow.Schema, []string) {
+	return clean(schema, true)
+}
+
+func clean(schema *arrow.Schema, described bool) (*arrow.Schema, []string) {
+	if schema == nil {
+		return nil, nil
+	}
+	fields := schema.Fields()
+	// Distinct valid spellings per fold, for "has another spelling".
+	spellings := make(map[string]int, len(fields))
+	present := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		if !utf8.ValidString(f.Name) || present[f.Name] {
+			continue
+		}
+		present[f.Name] = true
+		spellings[asciiLower(f.Name)]++
+	}
+	hasOtherSpelling := func(name string) bool {
+		n := spellings[asciiLower(name)]
+		if present[name] {
+			n--
+		}
+		return n > 0
+	}
+	var removed []string
+	var realTime *arrow.Field
+	hasTime, timeLike := false, false
+	keptFold := make(map[string]bool, len(fields))
+	out := make([]arrow.Field, 0, len(fields))
+	for _, f := range fields {
+		name := f.Name
+		switch {
+		case !utf8.ValidString(name):
+			removed = append(removed, name)
+			continue
+		case name == TimeColumn:
+			hasTime = true
+		case asciiLower(name) == TimeColumn:
+			removed = append(removed, name)
+			timeLike = true
+			continue
+		}
+		if base, ok := dedupArtifactBase(name); ok && (described || asciiLower(base) == TimeColumn) && hasOtherSpelling(base) {
+			removed = append(removed, name)
+			if asciiLower(base) == TimeColumn && realTime == nil {
+				c := f
+				realTime = &c
+			}
+			continue
+		}
+		k := asciiLower(name)
+		if keptFold[k] {
+			removed = append(removed, name)
+			continue
+		}
+		keptFold[k] = true
+		out = append(out, f)
+	}
+	if len(removed) == 0 {
+		return schema, nil
+	}
+	if !hasTime && (timeLike || realTime != nil) {
+		t := arrow.Field{Name: TimeColumn, Type: arrow.FixedWidthTypes.Timestamp_us, Nullable: true}
+		if realTime != nil {
+			t.Type = realTime.Type
+		}
+		out = append([]arrow.Field{t}, out...)
+	}
+	md := schema.Metadata()
+	return arrow.NewSchema(out, &md), removed
+}
+
+// dedupArtifactBase splits "<base>_<digits>", the name DuckDB gives the
+// second of two columns equal ignoring case.
+func dedupArtifactBase(name string) (string, bool) {
+	i := strings.LastIndexByte(name, '_')
+	if i <= 0 || i == len(name)-1 {
+		return "", false
+	}
+	for _, c := range name[i+1:] {
+		if c < '0' || c > '9' {
+			return "", false
+		}
+	}
+	return name[:i], true
 }

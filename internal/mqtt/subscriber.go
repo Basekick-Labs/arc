@@ -28,14 +28,21 @@ const unsubscribeTimeout = time.Second
 type Subscriber struct {
 	id     string
 	config *Subscription
+	// Topic mapping filters are compiled once at construction, not parsed on the
+	// ingest hot path. A persisted invalid rule prevents Start from connecting.
+	topicMappingRules compiledTopicMapping
+	topicMappingErr   error
 	// invalidDatabaseLogged remembers database values already reported by
 	// onMessage so a persistent misconfiguration logs once, not per message.
 	invalidDatabaseLogged sync.Map
 	client                pahomqtt.Client
 	arrowBuffer           *ingest.ArrowBuffer
-	logger                zerolog.Logger
-	encryptor             PasswordEncryptor
-	onStatusChange        func(id string, status SubscriptionStatus, errMsg string)
+	// nameWarned rate-limits the warning for a dropped field name (#1342).
+	nameWarnMu     sync.Mutex
+	nameWarned     map[string]time.Time
+	logger         zerolog.Logger
+	encryptor      PasswordEncryptor
+	onStatusChange func(id string, status SubscriptionStatus, errMsg string)
 
 	// Runtime state. mu guards the lifecycle fields (running, connectedSince),
 	// which change only on connect/start/stop — not on the message hot path.
@@ -68,21 +75,28 @@ func NewSubscriber(
 	logger zerolog.Logger,
 ) *Subscriber {
 	ctx, cancel := context.WithCancel(context.Background())
+	topicMappingRules, topicMappingErr := compileTopicMapping(config.TopicMapping)
 
 	return &Subscriber{
-		id:             config.ID,
-		config:         config,
-		arrowBuffer:    arrowBuffer,
-		encryptor:      encryptor,
-		onStatusChange: onStatusChange,
-		logger:         logger.With().Str("subscription_id", config.ID).Str("subscription_name", config.Name).Logger(),
-		ctx:            ctx,
-		cancel:         cancel,
+		id:                config.ID,
+		config:            config,
+		topicMappingRules: topicMappingRules,
+		topicMappingErr:   topicMappingErr,
+		arrowBuffer:       arrowBuffer,
+		encryptor:         encryptor,
+		onStatusChange:    onStatusChange,
+		logger:            logger.With().Str("subscription_id", config.ID).Str("subscription_name", config.Name).Logger(),
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 }
 
 // Start connects to the MQTT broker and begins message processing
 func (s *Subscriber) Start() error {
+	if s.topicMappingErr != nil {
+		return fmt.Errorf("invalid topic mapping: %w", s.topicMappingErr)
+	}
+
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
@@ -348,12 +362,11 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	metrics.Get().IncMQTTMessagesReceived()
 	metrics.Get().IncMQTTBytesReceived(int64(len(msg.Payload())))
 
-	// Determine database from topic mapping or use default
+	// Determine the mapped rule and database from the incoming topic.
 	database := s.config.Database
-	if s.config.TopicMapping != nil {
-		if mapped, ok := s.config.TopicMapping[msg.Topic()]; ok {
-			database = mapped
-		}
+	rule, topicLevels, matched := matchTopicMapping(s.topicMappingRules, msg.Topic())
+	if matched && rule.Database != "" {
+		database = rule.Database
 	}
 
 	// The database becomes the first segment of the storage key with no HTTP
@@ -380,7 +393,7 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	// subscription, so the broker holds new messages. One that was already in
 	// flight when the refusal started waits briefly for it to lift; never
 	// long, since blocking this handler stalls the client and its keepalive.
-	err := s.processMessage(s.ctx, msg.Topic(), msg.Payload(), database)
+	err := s.processMessageWithTopicMapping(s.ctx, msg.Topic(), msg.Payload(), database, rule, topicLevels)
 	// A retry is the same message: a disk pressure refusal of it is counted
 	// once in arc_wal_disk_pressure_rejections_total (#676).
 	retryCtx := ingest.WithRefusalCounted(s.ctx)
@@ -390,7 +403,7 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 			return
 		case <-time.After(mqttFencedRetry):
 		}
-		err = s.processMessage(retryCtx, msg.Topic(), msg.Payload(), database)
+		err = s.processMessageWithTopicMapping(retryCtx, msg.Topic(), msg.Payload(), database, rule, topicLevels)
 	}
 	if err != nil {
 		s.messagesFailed.Add(1)
@@ -401,6 +414,16 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 			// suspend the subscription, so this repeats per message for as long
 			// as one is refusing.
 			ingest.LogRefusal("mqtt "+msg.Topic(), err)
+			return
+		}
+		// A device's payload changing a column between string and binary
+		// (#440), or carrying a column name that cannot be stored (#1342), is
+		// refused on every message it sends: logged per topic at most every
+		// nameWarnEvery, like a dropped field name.
+		if ingest.IsContentRefusal(err) {
+			if s.nameWarnDue("type " + msg.Topic()) {
+				s.logger.Warn().Err(err).Str("topic", msg.Topic()).Msg("MQTT message refused for its content: a column changed between string and binary, or a column name that cannot be stored")
+			}
 			return
 		}
 		s.logger.Error().
@@ -452,13 +475,58 @@ func (s *Subscriber) resume() {
 	s.logger.Info().Msg("MQTT subscription resumed: writes are accepted again")
 }
 
+// nameWarnEvery bounds how often one measurement's unstorable field name is
+// logged: a device sends it in every message.
+const nameWarnEvery = 10 * time.Minute
+
+// maxNameWarnsPerMessage bounds the dropped-name warnings one message logs.
+const maxNameWarnsPerMessage = 10
+
+// nameWarnDue reports whether key's warning may be logged now.
+func (s *Subscriber) nameWarnDue(key string) bool {
+	s.nameWarnMu.Lock()
+	defer s.nameWarnMu.Unlock()
+	now := time.Now()
+	if last, ok := s.nameWarned[key]; ok && now.Sub(last) < nameWarnEvery {
+		return false
+	}
+	if s.nameWarned == nil || len(s.nameWarned) > 10000 {
+		s.nameWarned = map[string]time.Time{}
+	}
+	s.nameWarned[key] = now
+	return true
+}
+
 // processMessage decodes and writes an MQTT message to the ArrowBuffer
 func (s *Subscriber) processMessage(ctx context.Context, topic string, payload []byte, database string) error {
+	return s.processMessageWithTopicMapping(ctx, topic, payload, database, TopicMappingRule{}, nil)
+}
+
+func (s *Subscriber) processMessageWithTopicMapping(ctx context.Context, topic string, payload []byte, database string, rule TopicMappingRule, topicLevels []string) error {
 	// Try to decode as MessagePack first (check magic bytes)
 	if len(payload) > 0 {
-		records, err := s.decodePayload(topic, payload)
+		records, err := s.decodePayload(topic, payload, rule, topicLevels)
 		if err != nil {
 			return fmt.Errorf("failed to decode payload: %w", err)
+		}
+
+		// A tag or field whose name Arc could not read back is removed and
+		// the rest of the reading kept (#1342): there is no client to answer,
+		// and a device's "Time" key must not cost every message.
+		for i, d := range ingest.StripRecordNames(records, s.arrowBuffer.KnownColumns(database)) {
+			if i == maxNameWarnsPerMessage {
+				break // one message cannot flood the log with distinct names
+			}
+			if !s.nameWarnDue(d.Measurement + "\x00" + ingest.TruncateColumnName(d.Column)) {
+				continue
+			}
+			s.logger.Warn().
+				Str("topic", topic).
+				Str("measurement", d.Measurement).
+				Str("column", ingest.QuoteColumnName(d.Column)).
+				Str("reason", d.Reason).
+				Int("records", d.Points).
+				Msg("MQTT field dropped: its name cannot be stored")
 		}
 
 		// Write to ArrowBuffer, the payload's size reserved against the WAL
@@ -469,18 +537,27 @@ func (s *Subscriber) processMessage(ctx context.Context, topic string, payload [
 		}
 		defer release()
 		if err := s.arrowBuffer.Write(writeCtx, database, records); err != nil {
+			var drops []ingest.LPDrop
 			var dropped *ingest.PointsDroppedError
 			if errors.As(err, &dropped) {
 				// The other points were written; these could not be.
-				for _, d := range dropped.Drops {
-					s.logger.Error().
-						Str("topic", topic).
-						Str("measurement", d.Measurement).
-						Str("column", d.Column).
-						Str("reason", d.Reason).
-						Int("points_dropped", d.Points).
-						Msg("MQTT points dropped (partial write)")
-				}
+				drops = dropped.Drops
+			} else if ws, ok := ingest.AsWriteStopped(err); ok {
+				// Stopped after part of the message was written (#1437). Not a
+				// refusal, so the caller does not resend the message whole: it
+				// is counted failed, and its error names what was written.
+				drops = ws.Drops
+			}
+			for _, d := range drops {
+				s.logger.Error().
+					Str("topic", topic).
+					Str("measurement", d.Measurement).
+					Str("column", ingest.QuoteColumnName(d.Column)).
+					Str("reason", d.Reason).
+					Int("points_dropped", d.Points).
+					Msg("MQTT points dropped (partial write)")
+			}
+			if dropped != nil {
 				return nil
 			}
 			return fmt.Errorf("failed to write to buffer: %w", err)
@@ -490,15 +567,15 @@ func (s *Subscriber) processMessage(ctx context.Context, topic string, payload [
 	return nil
 }
 
-// decodePayload attempts to decode the message payload
-func (s *Subscriber) decodePayload(topic string, payload []byte) ([]interface{}, error) {
+// decodePayload attempts to decode the message payload.
+func (s *Subscriber) decodePayload(topic string, payload []byte, rule TopicMappingRule, topicLevels []string) ([]interface{}, error) {
 	// Try MessagePack first (more efficient for IoT)
-	if records, err := s.tryDecodeMsgPack(payload); err == nil {
+	if records, err := s.tryDecodeMsgPack(payload, rule, topicLevels); err == nil {
 		return records, nil
 	}
 
 	// Fall back to JSON
-	if records, err := s.tryDecodeJSON(topic, payload); err == nil {
+	if records, err := s.tryDecodeJSON(topic, payload, rule, topicLevels); err == nil {
 		return records, nil
 	}
 
@@ -510,32 +587,32 @@ func (s *Subscriber) decodePayload(topic string, payload []byte) ([]interface{},
 	return nil, fmt.Errorf("failed to decode payload as MessagePack or JSON")
 }
 
-// tryDecodeMsgPack attempts to decode payload as MessagePack
-func (s *Subscriber) tryDecodeMsgPack(payload []byte) ([]interface{}, error) {
+// tryDecodeMsgPack attempts to decode payload as MessagePack.
+func (s *Subscriber) tryDecodeMsgPack(payload []byte, rule TopicMappingRule, topicLevels []string) ([]interface{}, error) {
 	var data interface{}
 	if err := msgpack.Unmarshal(payload, &data); err != nil {
 		return nil, err
 	}
 
-	return s.convertToRecords(data)
+	return s.convertToRecords(data, rule, topicLevels)
 }
 
-// tryDecodeJSON attempts to decode payload as JSON
-func (s *Subscriber) tryDecodeJSON(_ string, payload []byte) ([]interface{}, error) {
+// tryDecodeJSON attempts to decode payload as JSON.
+func (s *Subscriber) tryDecodeJSON(_ string, payload []byte, rule TopicMappingRule, topicLevels []string) ([]interface{}, error) {
 	var data interface{}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return nil, err
 	}
 
-	return s.convertToRecords(data)
+	return s.convertToRecords(data, rule, topicLevels)
 }
 
-// convertToRecords converts decoded data to records for ArrowBuffer
-func (s *Subscriber) convertToRecords(data interface{}) ([]interface{}, error) {
+// convertToRecords converts decoded data to records for ArrowBuffer.
+func (s *Subscriber) convertToRecords(data interface{}, rule TopicMappingRule, topicLevels []string) ([]interface{}, error) {
 	switch v := data.(type) {
 	case map[string]interface{}:
 		// Single record
-		record, err := s.mapToRecord(v)
+		record, err := s.mapToRecordWithTopicMapping(v, rule, topicLevels)
 		if err != nil {
 			return nil, err
 		}
@@ -546,7 +623,7 @@ func (s *Subscriber) convertToRecords(data interface{}) ([]interface{}, error) {
 		records := make([]interface{}, 0, len(v))
 		for _, item := range v {
 			if m, ok := item.(map[string]interface{}); ok {
-				record, err := s.mapToRecord(m)
+				record, err := s.mapToRecordWithTopicMapping(m, rule, topicLevels)
 				if err != nil {
 					return nil, err
 				}
@@ -562,6 +639,10 @@ func (s *Subscriber) convertToRecords(data interface{}) ([]interface{}, error) {
 
 // mapToRecord converts a map to a models.Record
 func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, error) {
+	return s.mapToRecordWithTopicMapping(m, TopicMappingRule{}, nil)
+}
+
+func (s *Subscriber) mapToRecordWithTopicMapping(m map[string]interface{}, rule TopicMappingRule, topicLevels []string) (*models.Record, error) {
 	record := &models.Record{
 		Fields: make(map[string]interface{}),
 		Tags:   make(map[string]string),
@@ -576,18 +657,20 @@ func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, erro
 	// data in the WAL and retries forever, wedging the buffer. MQTT payloads
 	// are unauthenticated relative to the HTTP write path, which validates
 	// measurement names before they reach the buffer.
-	if meas, ok := m["m"].(string); ok && meas != "" {
+	if rule.Measurement != "" {
+		record.Measurement = rule.Measurement
+	} else if meas, ok := m["m"].(string); ok && meas != "" {
 		record.Measurement = meas
 	} else if meas, ok := m["measurement"].(string); ok && meas != "" {
 		record.Measurement = meas
 	} else {
 		record.Measurement = "mqtt" // Default measurement
 	}
-	// The measurement is the second storage-key segment and comes from the
-	// publisher. A value like "../x" is accepted into the buffer and refused by
-	// the storage key contract at flush, which latches the buffer's
-	// flush-failure state; "a/b" is written under a mis-partitioned path no
-	// query can address. Refuse it here, as a decode error, the same way the
+	// The measurement is the second storage-key segment and can come from the
+	// publisher or a topic rule. A value like "../x" is accepted into the buffer
+	// and refused by the storage key contract at flush, which latches the
+	// buffer's flush-failure state; "a/b" is written under a mis-partitioned path
+	// no query can address. Refuse it here, as a decode error, the same way the
 	// HTTP write path refuses it before the buffer (#300).
 	if !isValidMeasurementSegment(record.Measurement) {
 		return nil, fmt.Errorf("measurement %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens (at most 128 characters)", record.Measurement)
@@ -604,7 +687,6 @@ func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, erro
 			}
 		}
 	}
-
 	// Extract fields (everything else)
 	if fields, ok := m["fields"].(map[string]interface{}); ok {
 		record.Fields = fields
@@ -617,7 +699,39 @@ func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, erro
 		}
 	}
 
+	applyTopicTags(record, rule, topicLevels)
 	return record, nil
+}
+
+// applyTopicTags writes a rule's tags_from_topic into record. Positions refer
+// to the full topic path, starting at zero; an unavailable segment (possible
+// only under a trailing # filter) is skipped without dropping the row.
+//
+// A topic tag overrides a payload tag of the same name, including one that
+// differs only in case: stored column names are case-insensitive, and
+// StripRecordNames keeps the first spelling in byte order, so a payload tag
+// "Line" would otherwise drop the configured "line" on every message.
+//
+// Payload fields are left as they are. One of exactly the tag's name is stored
+// as "<name>_value" by the writer; one differing only in case is a case twin
+// that StripRecordNames resolves like any other (one of the two is dropped,
+// with a warning), as is a column already stored under another spelling.
+// Renaming such a field here was tried and let "Temp_value" and the writer's
+// "temp_value" both reach the file (#1342).
+func applyTopicTags(record *models.Record, rule TopicMappingRule, topicLevels []string) {
+	for _, extraction := range rule.TagsFromTopic {
+		if extraction.Position >= len(topicLevels) {
+			continue
+		}
+		name := extraction.TagName
+		folded := ingest.FoldColumnName(name)
+		for k := range record.Tags {
+			if k != name && ingest.FoldColumnName(k) == folded {
+				delete(record.Tags, k)
+			}
+		}
+		record.Tags[name] = topicLevels[extraction.Position]
+	}
 }
 
 // extractTimestamp extracts and normalizes timestamp to microseconds

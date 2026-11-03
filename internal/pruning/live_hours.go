@@ -2,6 +2,7 @@ package pruning
 
 import (
 	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -47,10 +48,34 @@ func (p *PartitionPruner) liveEpoch() int64 {
 	return p.nowFn().Truncate(time.Hour).Unix()
 }
 
-// LiveEpoch is the start of the current hour (Unix seconds): a cache of SQL
-// transformed with pruned paths keys its entries by it, so SQL pruned before
-// an hour started is never served after it.
+// LiveEpoch is the start of the current hour (Unix seconds).
 func (p *PartitionPruner) LiveEpoch() int64 { return p.liveEpoch() }
+
+// CacheEpoch keys a cached pruning of sql: the current hour and, for a query
+// whose range is relative to now(), the hours that range starts and ends in.
+// The current hour alone is not enough there: a relative end (time < now() -
+// INTERVAL '10 minutes') crosses into a new hour partway through the current
+// one, and an entry cached just before it did would leave that hour out for
+// the rest of its TTL. A range of literals cannot move, so it costs no scan.
+func (p *PartitionPruner) CacheEpoch(sql string) string {
+	if !relativeTimeWord.MatchString(sql) {
+		return strconv.FormatInt(p.liveEpoch(), 10)
+	}
+	return p.epochFor(p.ExtractTimeRange(sql))
+}
+
+// epochFor is CacheEpoch for an already extracted range.
+func (p *PartitionPruner) epochFor(tr *TimeRange) string {
+	if tr == nil {
+		return strconv.FormatInt(p.liveEpoch(), 10)
+	}
+	return strconv.FormatInt(p.liveEpoch(), 10) + ":" +
+		strconv.FormatInt(tr.Start.Truncate(time.Hour).Unix(), 10) + ":" +
+		strconv.FormatInt(tr.End.Truncate(time.Hour).Unix(), 10)
+}
+
+// relativeTimeWord finds the forms a range can be relative to now with.
+var relativeTimeWord = regexp.MustCompile(`(?i)\b(now\s*\(|current_timestamp)`)
 
 // SetClock replaces the pruner's clock. Tests only.
 func (p *PartitionPruner) SetClock(now func() time.Time) { p.nowFn = now }

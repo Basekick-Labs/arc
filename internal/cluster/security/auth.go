@@ -386,3 +386,51 @@ func checkHMACTimestamp(label string, timestamp int64, tolerance time.Duration) 
 	}
 	return nil
 }
+
+// ComputeLocalPoliciesQueryHMAC authenticates a local policies query (#1324).
+//
+// Format: "local-policies-query" \x00 nonce \x00 nodeID \x00 clusterName \x00 kind \x00 epoch \x00 timestamp
+func ComputeLocalPoliciesQueryHMAC(sharedSecret, nonce, nodeID, clusterName, kind string, epoch uint64, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, localPoliciesQueryMessage(nonce, nodeID, clusterName, kind, epoch, timestamp)))
+}
+
+func localPoliciesQueryMessage(nonce, nodeID, clusterName, kind string, epoch uint64, timestamp int64) string {
+	return fmt.Sprintf("local-policies-query\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d", nonce, nodeID, clusterName, kind, epoch, timestamp)
+}
+
+// ValidateLocalPoliciesQueryHMAC checks a query's MAC and freshness.
+func ValidateLocalPoliciesQueryHMAC(sharedSecret, nonce, nodeID, clusterName, kind string, epoch uint64, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("local-policies-query", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, localPoliciesQueryMessage(nonce, nodeID, clusterName, kind, epoch, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("local-policies-query HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// ComputeLocalPoliciesReplyHMAC authenticates a node's rows, bound to the
+// query's nonce, kind and epoch, over a SHA-256 digest of the rows.
+//
+// Format: "local-policies-reply" \x00 queryNonce \x00 nodeID \x00 clusterName \x00 kind \x00 epoch \x00 status \x00 sha256(policies) \x00 timestamp
+func ComputeLocalPoliciesReplyHMAC(sharedSecret, queryNonce, nodeID, clusterName, kind string, epoch uint64, status string, policies []byte, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, localPoliciesReplyMessage(queryNonce, nodeID, clusterName, kind, epoch, status, policies, timestamp)))
+}
+
+func localPoliciesReplyMessage(queryNonce, nodeID, clusterName, kind string, epoch uint64, status string, policies []byte, timestamp int64) string {
+	sum := sha256.Sum256(policies)
+	return fmt.Sprintf("local-policies-reply\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%x\x00%d", queryNonce, nodeID, clusterName, kind, epoch, status, sum[:], timestamp)
+}
+
+// ValidateLocalPoliciesReplyHMAC checks a node's answer.
+func ValidateLocalPoliciesReplyHMAC(sharedSecret, queryNonce, nodeID, clusterName, kind string, epoch uint64, status string, policies []byte, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("local-policies-reply", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, localPoliciesReplyMessage(queryNonce, nodeID, clusterName, kind, epoch, status, policies, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("local-policies-reply HMAC validation failed: shared secret mismatch, rows tampered, or malformed MAC")
+	}
+	return nil
+}

@@ -155,7 +155,7 @@ func discoverOpenEnd(ctx context.Context, list dirLister, database, measurement 
 
 // partGlob is a partition's glob in the format GeneratePartitionPaths uses.
 func partGlob(basePath, database, measurement string, k partKey) string {
-	if strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://") {
+	if storage.IsObjectURL(basePath) {
 		p := basePath + "/" + database + "/" + measurement + "/" + k.year + "/" + k.month + "/" + k.day
 		if k.hour != "" {
 			p += "/" + k.hour
@@ -190,7 +190,7 @@ func localDirLister(basePath string) dirLister {
 }
 
 // remoteDirLister lists directories of the pruner's object store below
-// basePath (s3:// or azure://), through the same cached parent listings as
+// basePath (any object-store URL), through the same cached parent listings as
 // the existence filter.
 func (p *PartitionPruner) remoteDirLister(basePath string) dirLister {
 	return func(ctx context.Context, rel string) ([]string, error) {

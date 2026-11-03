@@ -17,11 +17,14 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/basekick-labs/arc/internal/database"
 	_ "github.com/duckdb/duckdb-go/v2"
 )
 
-// extensions must stay in sync with ensureHTTPFSLoaded.
-var extensions = []string{"httpfs", "aws"}
+// extensions are httpfs and aws (keep in sync with ensureHTTPFSLoaded) and
+// every extension database.extensions accepts (#440), so enabling one needs
+// no network on first boot.
+var extensions = append([]string{"httpfs", "aws"}, database.SupportedExtensionNames()...)
 
 func main() {
 	db, err := sql.Open("duckdb", "")

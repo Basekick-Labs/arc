@@ -61,6 +61,7 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /app/data
+            {{- include "arc-enterprise.gcsVolumeMount" . | nindent 12 }}
             {{- if .Values.cluster.tls.enabled }}
             - name: tls
               mountPath: /etc/arc/tls
@@ -93,11 +94,14 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.writer.resources | nindent 12 }}
-      {{- if .Values.cluster.tls.enabled }}
+      {{- if or .Values.cluster.tls.enabled (eq (include "arc-enterprise.gcsKeyMounted" .) "true") }}
       volumes:
+        {{- include "arc-enterprise.gcsVolume" . | nindent 8 }}
+        {{- if .Values.cluster.tls.enabled }}
         - name: tls
           secret:
             secretName: {{ .Values.cluster.tls.existingSecret | quote }}
+        {{- end }}
       {{- end }}
       {{- include "arc-enterprise.roleScheduling" (dict "ctx" . "role" "writer") | nindent 6 }}
   volumeClaimTemplates:

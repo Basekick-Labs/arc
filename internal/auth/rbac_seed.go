@@ -13,13 +13,14 @@ package auth
 // What the seed handles:
 //
 //   - rbac_organizations — top-level entity, no FK dependency. Safe to
-//     propose: the cluster FSM stamps a new log-index ID, the local
-//     materialise accepts the existing pre-A.1 AUTOINCREMENT row as an
-//     upgrade no-op via the UNIQUE(name)-collision-as-idempotency
-//     branch in ApplyCreateOrganization. Follower nodes get the row at
-//     the cluster's new ID; the leader keeps the row at its
-//     pre-A.1 ID. The two IDs map to the same logical organization
-//     because UNIQUE(name) is enforced cluster-wide.
+//     propose: the cluster FSM stamps a new log-index ID. On the leader,
+//     ApplyCreateOrganization meets the pre-A.1 AUTOINCREMENT row on
+//     UNIQUE(name) and REALIGNS it: it deletes the local row by name —
+//     cascading its local teams, roles, permissions and memberships —
+//     and re-inserts the organization at the cluster's ID, marked as the
+//     cluster's (#1336). Every node then holds the organization at the
+//     same ID. (An earlier version of this comment said the leader kept
+//     the row at its pre-A.1 ID; the code never did.)
 //
 // What the seed does NOT handle (deferred to operator re-issue):
 //

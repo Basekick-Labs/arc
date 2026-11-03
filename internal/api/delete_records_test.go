@@ -165,9 +165,15 @@ func (c *recordingCoordinator) RecordDelete(_ context.Context, db, m, where stri
 	}
 	return 7, c.recErr
 }
-func (c *recordingCoordinator) WaitLocalFiles(_ context.Context, db, m string, _ time.Duration) ([]string, error) {
+func (c *recordingCoordinator) WaitLocalFiles(_ context.Context, db, m string, _ time.Duration, keep func(string) bool) ([]string, error) {
 	*c.events = append(*c.events, "wait "+db+"/"+m)
-	return c.missing, nil
+	var out []string
+	for _, p := range c.missing {
+		if keep == nil || keep(p) {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 type recordingFlusher struct {
@@ -302,6 +308,20 @@ func TestDeleteRecordsTheDeleteBeforeRewriting(t *testing.T) {
 	if code, _ = send(h, body); code != 503 {
 		t.Fatalf("flush failure: %d", code)
 	}
+
+	// A recorded DELETE with a time range does not wait for a missing file
+	// outside it (delete_window.go); with pruning off it does.
+	far := []string{"db/cpu/2026/10/11/15/cpu_far.parquet"}
+	ranged := `{"database":"db","measurement":"cpu","where":"time >= '2026-10-11 10:00:00' AND time < '2026-10-11 10:30:00' AND host = 'h1'","confirm":true}`
+	h, _, _, _ = setup(true, far)
+	h.config.TimePruning = true
+	if code, out = send(h, ranged); code == 503 {
+		t.Fatalf("ranged: %d %+v, want no wait for a file outside the range", code, out)
+	}
+	h, _, _, _ = setup(true, far)
+	if code, out = send(h, ranged); code != 503 {
+		t.Fatalf("pruning off: %d %+v, want 503 waiting for the missing file", code, out)
+	}
 }
 
 type recordingPending struct{ events *[]string }
@@ -321,7 +341,7 @@ func (c *recordingDatabaseCoordinator) RecordDelete(_ context.Context, db, m, wh
 	*c.events = append(*c.events, "record "+db+"/"+m+" "+where)
 	return 7, nil
 }
-func (c *recordingDatabaseCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
+func (c *recordingDatabaseCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration, func(string) bool) ([]string, error) {
 	return nil, nil
 }
 
@@ -435,5 +455,19 @@ func TestDatabaseDeletionStopsWhenWithdrawFails(t *testing.T) {
 	}
 	if size, _ := handler.storage.StatFile(ctx, "db/cpu/a.parquet"); size < 0 {
 		t.Fatal("a file was removed")
+	}
+}
+
+// A DELETE record whose WHERE calls a function this node lacks (an extension
+// the recording node loads, #440) is not applied, and says which setting to
+// fix: unlike a column the file lacks, it is not "matches nothing".
+func TestRewriteForRecordsWithAFunctionThisNodeLacks(t *testing.T) {
+	root, backend, db := recordsDuckDB(t)
+	const rel = "db/cpu/2026/10/11/10/cpu_a.parquet"
+	writeRecordsParquet(t, db, root, rel)
+	h := &DeleteHandler{db: db, storage: backend, logger: zerolog.Nop()}
+	_, err := h.RewriteForRecords(context.Background(), rel, []string{"ST_X(ST_Point(v, 0)) > 1"})
+	if err == nil || !strings.Contains(err.Error(), "database.extensions") {
+		t.Fatalf("err = %v, want one naming database.extensions", err)
 	}
 }

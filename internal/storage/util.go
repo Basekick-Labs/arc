@@ -50,6 +50,13 @@ func GetLocalBasePath(backend Backend, logger *zerolog.Logger, feature string, f
 			logger.Warn().Msgf("%s not fully supported for Azure backend yet", feature)
 		}
 		return ""
+	case *GCSBackend:
+		// Explicit, because the default arm returns the caller's fallback,
+		// a LOCAL path: on a GCS node that is a location nothing was written to.
+		if logger != nil {
+			logger.Warn().Msgf("%s not fully supported for GCS backend yet", feature)
+		}
+		return ""
 	default:
 		return fallback
 	}
@@ -89,11 +96,47 @@ func backendRoot(backend Backend) string {
 		// written to. Same expression as the S3 arm above, because the prefix
 		// is either empty or already trailing-slashed.
 		return "azure://" + b.containerName + "/" + b.prefix
+	case *GCSBackend:
+		// gs://, not s3:// over the interoperability API: DuckDB applies a
+		// GCS secret (and the bearer token it carries) only to gs:// and
+		// gcs:// paths (#1105).
+		return "gs://" + b.bucket + "/" + b.prefix
 	case *LocalBackend:
 		return b.pathPrefix
 	default:
 		return defaultBackendRoot + "/"
 	}
+}
+
+// IsObjectURL reports whether path is an object-store URL ("s3://bucket/...",
+// "azure://container/...", "gs://bucket/...") rather than a local filesystem
+// path: any "<scheme>://" prefix of two or more characters, not a list of
+// known schemes. ("file:///..." is one too; only Iceberg export builds those,
+// and it does not ask this.)
+//
+// It is deliberately scheme-agnostic. The read paths that ask it (partition
+// pruning, open-end discovery, tier pruning) used to test for "s3://" and
+// "azure://" by name, so a path in any other scheme took the LOCAL branch:
+// filepath.Join folded "gs://b" into "gs:/b", filepath.Glob matched nothing,
+// and an existing partition read as absent, which is an empty answer with
+// success:true (#1105). Their remote branches list through the Backend, which
+// works for any object store, so the safe default for an unrecognised scheme
+// is remote. A local path never contains "://", and a one-letter scheme is a
+// Windows drive ("C://data" as easily as "C:\data"), so it is not one.
+func IsObjectURL(path string) bool {
+	i := strings.Index(path, "://")
+	if i < 2 {
+		return false
+	}
+	for j, c := range path[:i] {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case j > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ObjectURI returns the fully-qualified location of key for engines that read

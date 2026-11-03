@@ -105,8 +105,16 @@ func TestRecordDeleteAndLocalFiles(t *testing.T) {
 		t.Fatalf("whole database: %v", m)
 	}
 	start := time.Now()
-	if m, _ := c.WaitLocalFiles(ctx, "db", "cpu", 300*time.Millisecond); len(m) != 2 || time.Since(start) < 300*time.Millisecond {
+	if m, _ := c.WaitLocalFiles(ctx, "db", "cpu", 300*time.Millisecond, nil); len(m) != 2 || time.Since(start) < 300*time.Millisecond {
 		t.Fatalf("wait %v after %v", m, time.Since(start))
+	}
+	// keep: a DELETE does not wait for files outside its time range.
+	start = time.Now()
+	if m, err := c.WaitLocalFiles(ctx, "db", "cpu", 300*time.Millisecond, func(string) bool { return false }); len(m) != 0 || err != nil || time.Since(start) >= 300*time.Millisecond {
+		t.Fatalf("keep none: %v %v after %v, want nothing missing at once", m, err, time.Since(start))
+	}
+	if m, _ := c.WaitLocalFiles(ctx, "db", "cpu", 10*time.Millisecond, func(p string) bool { return p == missing[0] }); len(m) != 1 || m[0] != missing[0] {
+		t.Fatalf("keep one: %v, want only %s", m, missing[0])
 	}
 	if err := r.backend.Write(ctx, "db/cpu/2026/10/12/10/away.parquet", []byte("abc")); err != nil {
 		t.Fatal(err)
@@ -114,7 +122,7 @@ func TestRecordDeleteAndLocalFiles(t *testing.T) {
 	if err := r.backend.Write(ctx, "db/cpu/2026/10/12/10/short.parquet", []byte("abc")); err != nil {
 		t.Fatal(err)
 	}
-	if m, err := c.WaitLocalFiles(ctx, "db", "cpu", time.Second); len(m) != 0 || err != nil {
+	if m, err := c.WaitLocalFiles(ctx, "db", "cpu", time.Second, nil); len(m) != 0 || err != nil {
 		t.Fatalf("wait %v %v", m, err)
 	}
 }

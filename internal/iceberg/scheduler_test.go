@@ -523,6 +523,7 @@ func TestArrowToIceberg(t *testing.T) {
 		{"float64", arrow.PrimitiveTypes.Float64, iceberg.PrimitiveTypes.Float64},
 		{"float32", arrow.PrimitiveTypes.Float32, iceberg.PrimitiveTypes.Float32},
 		{"string", arrow.BinaryTypes.String, iceberg.PrimitiveTypes.String},
+		{"binary", arrow.BinaryTypes.Binary, iceberg.PrimitiveTypes.Binary},
 		{"bool", arrow.FixedWidthTypes.Boolean, iceberg.PrimitiveTypes.Bool},
 		// Arc's `time`: UTC-adjusted timestamp MUST become timestamptz, not timestamp.
 		{"timestamp_utc", arrow.FixedWidthTypes.Timestamp_us, iceberg.PrimitiveTypes.TimestampTz},

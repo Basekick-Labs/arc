@@ -1,0 +1,159 @@
+package api
+
+// GET /api/v1/write/msgpack/spec documents the write endpoint. It said
+// authentication was "not yet implemented" long after the route itself
+// required a token (#1434), so these tests hold the document to the code.
+
+import (
+	"encoding/json"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/require"
+)
+
+// The examples must be payloads the handler accepts, stored the way the
+// document says: tag_keys columns as tags, the other columns as fields.
+func TestMsgPackSpecExamplesAreAccepted(t *testing.T) {
+	doc := msgPackSpecDocument()
+	wantRows := map[string]int64{"example_columnar": 3, "example_row": 1}
+	for _, name := range []string{"example_columnar", "example_row"} {
+		t.Run(name, func(t *testing.T) {
+			r, post := newMsgPackRowsRig(t)
+			status, out := post(doc[name])
+			require.Equal(t, http.StatusNoContent, status, out)
+			rows, types := r.stored(t)
+			require.Equal(t, map[string]int64{"cpu": wantRows[name]}, rows)
+			require.Equal(t, "float64", types["cpu"]["usage_idle"])
+			tags := storedTags(t, r.dir, "cpu")
+			switch name {
+			case "example_columnar":
+				require.Equal(t, "host,region", tags)
+			case "example_row":
+				require.Equal(t, "datacenter,host,region", tags)
+			}
+		})
+	}
+}
+
+// storedTags returns the arc:tags metadata of the measurement's files.
+func storedTags(t *testing.T, dir, measurement string) string {
+	t.Helper()
+	var tags string
+	require.NoError(t, filepath.WalkDir(filepath.Join(dir, "d", measurement), func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".parquet") {
+			return err
+		}
+		f, err := os.Open(p)
+		require.NoError(t, err)
+		defer f.Close()
+		pf, err := file.NewParquetReader(f)
+		require.NoError(t, err)
+		defer pf.Close()
+		if v := pf.MetaData().KeyValueMetadata().FindValue("arc:tags"); v != nil {
+			tags = *v
+		}
+		return nil
+	}))
+	return tags
+}
+
+func TestMsgPackSpecDescribesAuthentication(t *testing.T) {
+	r := newLPWriteRig(t, nil)
+	app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
+	NewMsgPackHandler(zerolog.Nop(), r.buf, 100<<20).RegisterRoutes(app)
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/api/v1/write/msgpack/spec", nil), -1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NotContains(t, string(body), "not yet implemented")
+
+	var spec struct {
+		Authentication struct {
+			Header string `json:"header"`
+			Scheme string `json:"scheme"`
+		} `json:"authentication"`
+		Database struct {
+			Header string `json:"header"`
+		} `json:"database"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec))
+	require.Equal(t, "Authorization", spec.Authentication.Header)
+	require.Equal(t, "Bearer <token>", spec.Authentication.Scheme)
+	require.Equal(t, "x-arc-database", spec.Database.Header)
+}
+
+// The spec is not a public route: it needs a token like the endpoint it
+// describes. Public routes main.go adds are not here, but a default-config
+// change that opened /api/v1/write would be.
+func TestMsgPackSpecRequiresToken(t *testing.T) {
+	am, err := auth.NewAuthManager(":memory:", time.Minute, 16, zerolog.Nop())
+	require.NoError(t, err)
+	t.Cleanup(func() { am.Close() })
+	r := newLPWriteRig(t, nil)
+	cfg := auth.DefaultMiddlewareConfig()
+	cfg.AuthManager = am
+	app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
+	app.Use(auth.NewMiddleware(cfg))
+	NewMsgPackHandler(zerolog.Nop(), r.buf, 100<<20).RegisterRoutes(app)
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/api/v1/write/msgpack/spec", nil), -1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// An item of a batch or top-level array that cannot be decoded is dropped and
+// reported as a partial write, like any other dropped point; it used to be
+// skipped silently with a 204 (#1434).
+func TestMsgPackBatchItemThatCannotBeDecodedIsAPartialWrite(t *testing.T) {
+	good := row("cpu", 1700000000, map[string]interface{}{"v": 1.5}, nil)
+	noFields := map[string]interface{}{"m": "cpu", "t": int64(1700000001)}
+	ragged := map[string]interface{}{"m": "mem", "columns": map[string]interface{}{
+		"time": []int64{1700000000000, 1700000001000},
+		"free": []int64{1},
+	}}
+	cases := []struct {
+		name      string
+		payload   interface{}
+		dropped   string
+		wroteRest bool
+		stored    map[string]int64
+	}{
+		{"batch", map[string]interface{}{"batch": []interface{}{good, noFields}}, "partial write: 1 points dropped", true, map[string]int64{"cpu": 1}},
+		{"array", []interface{}{good, ragged}, "partial write: 1 points dropped", true, map[string]int64{"cpu": 1}},
+		{"non-map item", []interface{}{good, "junk"}, "not a map (string)", true, map[string]int64{"cpu": 1}},
+		{"every item", map[string]interface{}{"batch": []interface{}{noFields, ragged}}, "partial write: 2 points dropped", false, map[string]int64{}},
+		{"non-map batch item", map[string]interface{}{"batch": []interface{}{good, 5}}, "partial write: 1 points dropped: 1: an item of the batch or array could not be decoded: not a map", true, map[string]int64{"cpu": 1}},
+		{"nested batch", []interface{}{map[string]interface{}{"batch": []interface{}{noFields, good}}, good}, "partial write: 1 points dropped", true, map[string]int64{"cpu": 2}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, post := newMsgPackRowsRig(t)
+			status, out := post(tc.payload)
+			require.Equal(t, http.StatusBadRequest, status, out)
+			require.Contains(t, out, tc.dropped)
+			require.Contains(t, out, "could not be decoded")
+			if tc.wroteRest {
+				require.Contains(t, out, "the other points were written")
+			} else {
+				require.NotContains(t, out, "the other points were written")
+			}
+			rows, _ := r.stored(t)
+			require.Equal(t, tc.stored, rows)
+			require.Contains(t, r.log.String(), "MessagePack points dropped (partial write)")
+		})
+	}
+}

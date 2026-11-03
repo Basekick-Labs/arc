@@ -124,7 +124,7 @@ func TestOpenEndedRemote(t *testing.T) {
 	glob := "s3://bucket/db/cpu/**/*.parquet"
 	sql := "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'"
 	r, ok := p.OptimizeTablePath(context.Background(), glob, sql)
-	if !ok || !hasRemoteHour(asList(r), future.Format("15")) || len(asList(r)) < 2 {
+	if !ok || !hasRemotePartition(asList(r), future) || len(asList(r)) < 2 {
 		t.Fatalf("remote future partition missing: %v %v", ok, r)
 	}
 }
@@ -277,7 +277,7 @@ func TestOpenEndedRemoteTierKeepsFuturePartitions(t *testing.T) {
 	p := livePruner(now)
 	tr := p.ExtractTimeRange("SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'")
 	paths, outcome := p.PruneTierPaths(context.Background(), "s3://bucket/tenant1/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false)
-	if outcome != TierPrunePruned || !hasRemoteHour(paths, future.Format("15")) {
+	if outcome != TierPrunePruned || !hasRemotePartition(paths, future) {
 		t.Fatalf("outcome %v paths %v", outcome, paths)
 	}
 	for _, path := range paths {

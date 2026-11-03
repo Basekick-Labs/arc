@@ -29,6 +29,31 @@ func StripRewriteSuffix(filename string) string {
 	return base[:idx] + ".parquet"
 }
 
+// RewriteFamily returns the family of the file at path: the path with any
+// `_rewrite_<n>` suffix stripped. A row DELETE names each rewrite of a file
+// after its origin (rewritePath), so every rewrite of one file, and the file
+// itself, share a family; two members in storage at once means a superseded
+// one was not removed.
+func RewriteFamily(path string) string {
+	return StripRewriteSuffix(path)
+}
+
+// RewriteFamilies groups paths by RewriteFamily, keeping only families with
+// more than one member.
+func RewriteFamilies(paths []string) map[string][]string {
+	all := make(map[string][]string, len(paths))
+	for _, p := range paths {
+		f := RewriteFamily(p)
+		all[f] = append(all[f], p)
+	}
+	for f, members := range all {
+		if len(members) < 2 {
+			delete(all, f)
+		}
+	}
+	return all
+}
+
 // lastNameStamp is the last stamp NameTime issued, in Unix nanoseconds.
 var lastNameStamp atomic.Int64
 

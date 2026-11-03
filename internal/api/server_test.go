@@ -294,7 +294,8 @@ func TestHealthStorageField(t *testing.T) {
 }
 
 // TestReadyStorageCredentialsKnob (#603): the opt-in knob fails /ready ONLY on
-// state "expired" — fallback/unknown/degraded/local must not drain a node
+// state "expired" or "unavailable" (#1105: a GCS tier with no fallback secret
+// that never resolved credentials) — fallback/unknown/degraded/local must not drain a node
 // (they may be healthy or permanently credential-less by design), and the knob
 // never overrides the not-ready startup/shutdown flag.
 func TestReadyStorageCredentialsKnob(t *testing.T) {
@@ -321,6 +322,30 @@ func TestReadyStorageCredentialsKnob(t *testing.T) {
 		s.SetStorageStatus(statusFn("expired"), true)
 		if code := get(s); code != 503 {
 			t.Fatalf("code = %d, want 503", code)
+		}
+	})
+
+	t.Run("knob on + unavailable -> 503 naming the state", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		s.MarkReady()
+		s.SetStorageStatus(statusFn(database.CredStateUnavailable), true)
+		s.RegisterRoutes()
+		resp, err := s.app.Test(httptest.NewRequest("GET", "/ready", nil), 2000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 503 || !strings.Contains(string(body), "storage_credentials_unavailable") {
+			t.Fatalf("code = %d body %s, want 503 storage_credentials_unavailable", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("knob off + unavailable -> 200", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		s.MarkReady()
+		s.SetStorageStatus(statusFn(database.CredStateUnavailable), false)
+		if code := get(s); code != 200 {
+			t.Fatalf("code = %d, want 200 (default-off knob)", code)
 		}
 	})
 

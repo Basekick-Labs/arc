@@ -223,8 +223,28 @@ func (n *Node) Start() error {
 		}
 		baseStream = stream
 	}
-	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName)
+	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName).
+		WithLogger(n.logger.With().Str("subcomponent", "raft-auth").Logger())
 	n.transport = raft.NewNetworkTransport(authStream, 3, 10*time.Second, os.Stderr)
+	// Until NewRaft takes ownership of them, a failed Start must release the
+	// transport (its listener and accept goroutines) and the stores it opened,
+	// or the Raft port stays bound for the life of the process.
+	// Stores left from an earlier Start/Stop were closed by Stop; forget them
+	// so the cleanup below only closes what this call opened.
+	n.logStore, n.stableStore = nil, nil
+	raftCreated := false
+	defer func() {
+		if raftCreated {
+			return
+		}
+		n.transport.Close()
+		if n.logStore != nil {
+			n.logStore.Close()
+		}
+		if n.stableStore != nil {
+			n.stableStore.Close()
+		}
+	}()
 
 	// Create log store
 	logStorePath := filepath.Join(n.cfg.DataDir, "raft-log.db")
@@ -263,6 +283,7 @@ func (n *Node) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to create raft instance: %w", err)
 	}
+	raftCreated = true
 	if count := n.fsm.RejectedPathsCount(); count > 0 {
 		// Only fires for snapshot Restore rejections (synchronous
 		// inside NewRaft). Log-replay rejections happen on runFSM
@@ -445,32 +466,39 @@ func (n *Node) State() raft.RaftState {
 // Apply applies a command to the Raft cluster.
 // This can only be called on the leader.
 func (n *Node) Apply(cmd *Command, timeout time.Duration) error {
+	_, err := n.ApplyIndex(cmd, timeout)
+	return err
+}
+
+// ApplyIndex is Apply, also returning the command's log index. The index is
+// set whenever the command committed, including when the FSM refused it.
+func (n *Node) ApplyIndex(cmd *Command, timeout time.Duration) (uint64, error) {
 	n.mu.RLock()
 	ra := n.raft
 	n.mu.RUnlock()
 
 	if ra == nil {
-		return fmt.Errorf("raft not initialized")
+		return 0, fmt.Errorf("raft not initialized")
 	}
 
 	data, err := json.Marshal(cmd)
 	if err != nil {
-		return fmt.Errorf("failed to marshal command: %w", err)
+		return 0, fmt.Errorf("failed to marshal command: %w", err)
 	}
 
 	future := ra.Apply(data, timeout)
 	if err := future.Error(); err != nil {
-		return fmt.Errorf("failed to apply command: %w", err)
+		return 0, fmt.Errorf("failed to apply command: %w", err)
 	}
 
 	// Check for application error
 	if resp := future.Response(); resp != nil {
 		if err, ok := resp.(error); ok {
-			return &commandRefused{err}
+			return future.Index(), &commandRefused{err}
 		}
 	}
 
-	return nil
+	return future.Index(), nil
 }
 
 // ErrCommandRefused matches (errors.Is) an error the FSM returned for a

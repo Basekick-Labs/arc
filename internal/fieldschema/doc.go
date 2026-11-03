@@ -36,5 +36,9 @@
 // logged.
 //
 // The registry is additive: ingest and bootstrap only ever add fields.
-// Deleting a database deletes its anchors; nothing else removes a field.
+// Deleting a database deletes its anchors. The one exception is a field no
+// query could read (#1342): a name that is not valid UTF-8, "time" in another
+// letter case, a later spelling of two names equal ignoring case, and the
+// "<name>_<n>" DuckDB invents for one. Clean drops those on every load and
+// normalize, and a stored anchor holding one is rewritten on the next flush.
 package fieldschema

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,6 +129,20 @@ func TestLiveHourRemoteListing(t *testing.T) {
 	if remote.listDirCalls != calls {
 		t.Fatalf("a past range re-listed: %d -> %d", calls, remote.listDirCalls)
 	}
+}
+
+// hasRemotePartition reports whether paths hold h's hour partition, matched on
+// the whole year/month/day/hour: an hour alone matches every day, and the
+// open-end tests put their "future" partition a whole number of days ahead,
+// at the same hour as now, so an hour-only check passed without it.
+func hasRemotePartition(paths []string, h time.Time) bool {
+	want := "/" + h.Format("2006/01/02/15") + "/*.parquet"
+	for _, p := range paths {
+		if strings.HasSuffix(p, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasRemoteHour(paths []string, hour string) bool {

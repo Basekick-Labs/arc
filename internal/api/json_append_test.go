@@ -3,6 +3,8 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"math"
 	"math/rand"
 	"strconv"
@@ -75,7 +77,8 @@ func goldenColumns(t *testing.T) []arrow.Array {
 	ls.AppendValues([]string{"large", "\"x\""}, nil)
 	add(ls)
 	bin := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
-	bin.AppendValues([][]byte{{0x00, 0x22, 0x5c}, []byte("bytes")}, nil)
+	bin.AppendValues([][]byte{{0x00, 0x22, 0x5c}, []byte("bytes"), {0xff, 0x80, 0xfe}, {}}, nil)
+	bin.AppendNull()
 	add(bin)
 	// No case of its own: takes the ValueStr fallback.
 	dur := array.NewDurationBuilder(mem, &arrow.DurationType{Unit: arrow.Millisecond})
@@ -232,11 +235,44 @@ func oracleWriteArrowValue(w *bufio.Writer, scratch []byte, col arrow.Array, row
 	case *array.LargeString:
 		writeJSONString(w, scratch, c.Value(row))
 	case *array.Binary:
-		writeJSONString(w, scratch, string(c.Value(row)))
+		// #440: base64, not the raw bytes the replaced encoder wrote.
+		w.WriteByte('"')
+		w.WriteString(base64.StdEncoding.EncodeToString(c.Value(row)))
+		w.WriteByte('"')
 	default:
 		// Fallback: use ValueStr for any unhandled Arrow types
 		writeJSONString(w, scratch, col.ValueStr(row))
 	}
 
 	return scratch
+}
+
+// A BLOB or GEOMETRY value with bytes that are not UTF-8 is valid JSON, and
+// decodes back to the stored bytes (#440).
+func TestJSONValueEncoderBinaryIsBase64(t *testing.T) {
+	mem := memory.NewGoAllocator()
+	b := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+	want := [][]byte{{0x00, 0xff, 0x80}, {}, []byte("POINT")}
+	b.AppendValues(want, nil)
+	b.AppendNull()
+	col := b.NewArray()
+	defer col.Release()
+	enc := &jsonValueEncoder{}
+	for row := 0; row < col.Len(); row++ {
+		got := enc.appendValue(nil, col, row)
+		var s *string
+		if err := json.Unmarshal(got, &s); err != nil {
+			t.Fatalf("row %d: %q is not valid JSON: %v", row, got, err)
+		}
+		if row == len(want) {
+			if s != nil {
+				t.Fatalf("NULL row = %q, want null", *s)
+			}
+			continue
+		}
+		dec, err := base64.StdEncoding.DecodeString(*s)
+		if err != nil || !bytes.Equal(dec, want[row]) {
+			t.Fatalf("row %d: %q decodes to %x (%v), want %x", row, *s, dec, err, want[row])
+		}
+	}
 }

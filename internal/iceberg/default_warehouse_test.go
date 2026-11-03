@@ -106,3 +106,32 @@ func TestDefaultWarehouse(t *testing.T) {
 		}
 	})
 }
+
+// Resolve passes an object-store URI through and gives a local path the
+// file:// form, decided by the URI (storage.IsObjectURL) rather than by a list
+// of backend types, which wrapped a backend added later as "file://gs://…"
+// (#1105).
+func TestResolveKeepsObjectURIsAndWrapsLocalPaths(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "AuthenticationFailed", http.StatusForbidden)
+	}))
+	defer srv.Close()
+	s3b, err := storage.NewS3Backend(&storage.S3Config{
+		Bucket: "bkt", Prefix: "hot", Region: "us-east-1", Endpoint: srv.URL, PathStyle: true, AccessKey: "a", SecretKey: "b",
+	}, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewS3Backend against the stub endpoint: %v", err)
+	}
+	defer s3b.Close()
+	if got, err := NewPathResolver(s3b).Resolve("db/cpu/x.parquet"); err != nil || got != "s3://bkt/hot/db/cpu/x.parquet" {
+		t.Fatalf("S3 Resolve = %q, %v", got, err)
+	}
+	dir := t.TempDir()
+	lb, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := NewPathResolver(lb).Resolve("db/cpu/x.parquet"); err != nil || !strings.HasPrefix(got, "file://") || strings.Count(got, "://") != 1 {
+		t.Fatalf("local Resolve = %q, %v", got, err)
+	}
+}

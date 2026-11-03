@@ -91,12 +91,12 @@ func (r *PathResolver) Resolve(relativeKey string) (string, error) {
 	}
 	// Object stores are already URIs; a local path needs the file:// form that
 	// Spark, Trino and DuckDB expect.
-	switch r.backend.(type) {
-	case *storage.S3Backend, *storage.AzureBlobBackend:
+	// Decided by the URI, not by a list of backend types: a list missed every
+	// backend added after it and wrapped its URL as "file://gs://…" (#1105).
+	if storage.IsObjectURL(uri) {
 		return uri, nil
-	default:
-		return localFileURI(uri), nil
 	}
+	return localFileURI(uri), nil
 }
 
 // LocalPath returns an on-disk path for a relative key when the backend is local, or ""

@@ -94,3 +94,15 @@ func TestExtractNewestFileTime(t *testing.T) {
 		})
 	}
 }
+
+// TestNewDailyTier_NonPositiveMinAgeIsADay pins that a zero or negative
+// daily min age becomes 24 h. A negative one put the cutoff in the future,
+// so daily compaction could fold the current hour while ingest still writes
+// it and file-level time pruning expands it (#659).
+func TestNewDailyTier_NonPositiveMinAgeIsADay(t *testing.T) {
+	for _, in := range []int{0, -1, -48} {
+		if got := NewDailyTier(&DailyTierConfig{MinAgeHours: in}).MinAgeHours; got != 24 {
+			t.Errorf("MinAgeHours %d -> %d, want 24", in, got)
+		}
+	}
+}
