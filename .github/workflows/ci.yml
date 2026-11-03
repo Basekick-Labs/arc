@@ -9,6 +9,10 @@ name: CI
 
 on:
   pull_request:
+  # Only main on push. A branch with an open PR is already tested by the
+  # pull_request run (against its merge with main); pushing on every branch
+  # ran the same suite twice per push, and the two runs never cancelled each
+  # other because their refs (refs/heads/... vs refs/pull/N/merge) differ.
   push:
     branches: [main]
 

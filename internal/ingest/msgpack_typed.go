@@ -134,7 +134,7 @@ func isBoolCode(c byte) bool {
 // its WAL entry stores the client's bytes as a single map's does. All or
 // nothing: if any item can't take the typed path, the whole payload goes to
 // the generic path, which stays the authority on accept/reject (including
-// its skip-and-log of bad items).
+// reporting a bad item as a partial-write drop, #1434).
 func (d *MessagePackDecoder) tryDecodeTyped(data []byte) ([]interface{}, bool) {
 	if len(data) == 0 {
 		return nil, false

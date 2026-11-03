@@ -7,3 +7,8 @@ package sysmem
 func limit() (uint64, Source, bool) {
 	return 0, SourceUnknown, false
 }
+
+// physical reports nothing, for the same reason.
+func physical() (uint64, Source, bool) {
+	return 0, SourceUnknown, false
+}

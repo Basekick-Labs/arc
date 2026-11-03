@@ -39,13 +39,15 @@ func azureMetadata(meta map[string]string) map[string]*string {
 }
 
 // WriteReaderWithSHA is WriteReader recording sha as blob metadata.
-func (b *AzureBlobBackend) WriteReaderWithSHA(ctx context.Context, path string, reader io.Reader, size int64, sha string) error {
+func (b *AzureBlobBackend) WriteReaderWithSHA(ctx context.Context, path string, reader io.Reader, size int64, sha string) (retErr error) {
+	defer b.scrub(&retErr)
 	return b.writeReader(ctx, path, reader, size, shaMetadata(sha))
 }
 
 // ObjectSHA returns the size and recorded sha of the blob at path; size -1
 // when there is none.
-func (b *AzureBlobBackend) ObjectSHA(ctx context.Context, path string) (int64, string, error) {
+func (b *AzureBlobBackend) ObjectSHA(ctx context.Context, path string) (_ int64, _ string, retErr error) {
+	defer b.scrub(&retErr)
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return 0, "", err
@@ -76,7 +78,8 @@ func (b *AzureBlobBackend) ObjectSHA(ctx context.Context, path string) (int64, s
 // the account key, the Entra token of managed-identity auth, or the
 // configured SAS. A store that refuses the server-side copy gets the bytes
 // through this process instead.
-func (b *AzureBlobBackend) CopyObject(ctx context.Context, src, dst string, size int64, sha string) error {
+func (b *AzureBlobBackend) CopyObject(ctx context.Context, src, dst string, size int64, sha string) (retErr error) {
+	defer b.scrub(&retErr)
 	srcKey, err := b.prefixedKey(src)
 	if err != nil {
 		return err
@@ -94,7 +97,7 @@ func (b *AzureBlobBackend) CopyObject(ctx context.Context, src, dst string, size
 		recordStorageError(ctx, err)
 		return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
 	}
-	b.logger.Warn().Err(err).Str("src", src).Str("dst", dst).
+	b.logger.Warn().Err(redactError(err, b.secrets...)).Str("src", src).Str("dst", dst).
 		Msg("Azure refused a server-side copy; copying through this node")
 	metrics.Get().IncCompactionCopyFallback()
 	return streamCopy(ctx, b, func(r io.Reader) error { return b.writeReader(ctx, dst, r, size, shaMetadata(sha)) }, src)
@@ -103,6 +106,10 @@ func (b *AzureBlobBackend) CopyObject(ctx context.Context, src, dst string, size
 // copySource is the URL a copy reads src from, and the bearer token that
 // authorises it ("" when the URL carries its own authorisation), valid for
 // at least valid.
+//
+// The returned address can carry authorisation (a minted or configured
+// signature). It is only ever sent as the copy request's source header;
+// never format it into an error or a log line.
 func (b *AzureBlobBackend) copySource(ctx context.Context, src *blob.Client, valid time.Duration) (string, string, error) {
 	if u, err := src.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().Add(valid), nil); err == nil {
 		return u, "", nil
