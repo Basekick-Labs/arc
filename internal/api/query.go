@@ -19,6 +19,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/governance"
@@ -32,7 +33,6 @@ import (
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
-	"golang.org/x/sync/errgroup"
 )
 
 // RBACChecker interface for RBAC permission checking
@@ -4691,46 +4691,45 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	return respondSuccessRows(c, columns, types, data, time.Now().UTC().Format(time.RFC3339), start)
 }
 
-// showDatabasesCheckParallelism bounds the per-database checks of SHOW
-// DATABASES, each one storage request (two for a database with only its
-// marker).
-const showDatabasesCheckParallelism = 16
-
 // dropEmptyDatabaseDirectories drops the directories that hold no database: a
 // store that keeps empty prefixes (SeaweedFS) keeps a deleted database's, and
 // GET /api/v1/databases/:name answers 404 for it (#1425). A database is shown
-// if it holds a hot file or its marker; a cold-only database is added from
-// the tiering metadata after this. A failed check keeps the database, as it
-// was shown before the check existed. This node's view only, as SHOW
-// DATABASES always was: the cluster manifest is not consulted.
+// if it holds a hot file, its marker, or (in a cluster) a manifest entry, as
+// GET /api/v1/databases lists it; a cold-only database is added from the
+// tiering metadata after this. A failed check keeps the database, as it was
+// shown before the check existed. One storage request per database (two for
+// one with only its marker), databaseCheckParallelism at a time.
 func (h *QueryHandler) dropEmptyDatabaseDirectories(ctx context.Context, dirs []string) []string {
-	keep := make([]bool, len(dirs))
-	var g errgroup.Group
-	g.SetLimit(showDatabasesCheckParallelism)
-	for i, db := range dirs {
-		if strings.HasPrefix(db, ".") || strings.HasPrefix(db, "_") {
-			continue // filtered out below anyway
+	manifest, _ := h.coordinator.(interface {
+		GetFileManifestByDatabase(database string) []*raft.FileEntry
+	})
+	visible := make([]string, 0, len(dirs))
+	for _, db := range dirs {
+		// Hidden directories (_schema and the like) are dropped below anyway.
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+			visible = append(visible, db)
 		}
-		g.Go(func() error {
-			found, err := databaseHasHotFiles(ctx, h.storage, db)
-			if err == nil && !found {
-				found, err = h.storage.Exists(ctx, db+"/.arc-database")
-				if storage.IsStoreNotFound(err) {
-					found, err = false, nil
-				}
-			}
-			if err != nil {
-				h.logger.Warn().Err(err).Str("database", db).Msg("SHOW DATABASES: failed to check whether a database directory holds anything; showing it")
-				found = true
-			}
-			keep[i] = found
-			return nil
-		})
 	}
-	_ = g.Wait()
-	kept := make([]string, 0, len(dirs))
-	for i, db := range dirs {
-		if keep[i] {
+	answers := checkDatabases(visible, func(db string) (bool, error) {
+		found, err := databaseHasHotFiles(ctx, h.storage, db)
+		if err == nil && !found {
+			found, err = h.storage.Exists(ctx, db+"/.arc-database")
+			if storage.IsStoreNotFound(err) {
+				found, err = false, nil
+			}
+		}
+		if err != nil {
+			h.logger.Warn().Err(err).Str("database", db).Msg("SHOW DATABASES: failed to check whether a database directory holds anything; showing it")
+			return true, nil
+		}
+		if !found && manifest != nil {
+			found = manifestHasDatabasePath(db, manifest.GetFileManifestByDatabase(db))
+		}
+		return found, nil
+	})
+	kept := make([]string, 0, len(visible))
+	for _, db := range visible {
+		if answers[db] {
 			kept = append(kept, db)
 		}
 	}

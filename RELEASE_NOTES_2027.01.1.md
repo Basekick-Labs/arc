@@ -2177,11 +2177,11 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 
 ### A deleted database disappears from the database list ([#1425](https://github.com/Basekick-Labs/arc/issues/1425))
 
-`GET /api/v1/databases` built its list from directories, so a deleted database
-whose directories outlived its files stayed listed, with `measurement_count:
-0`, and `GET /api/v1/databases/:name/measurements` still listed its
-measurements, while `GET /api/v1/databases/:name` answered 404. Two stores do
-that:
+`GET /api/v1/databases` and `SHOW DATABASES` built their lists from
+directories, so a deleted database whose directories outlived its files stayed
+listed, with `measurement_count: 0`, and `GET
+/api/v1/databases/:name/measurements` still listed its measurements, while
+`GET /api/v1/databases/:name` answered 404. Two stores do that:
 
 - **Local storage.** The delete removed the files but left their
   `measurement/YYYY/MM/DD/HH` directories. It now removes the empty
@@ -2189,23 +2189,26 @@ that:
   the directories above it. Deleting a database an earlier version left
   behind still answers 404, and now removes its directories too.
 - **Object stores that keep empty prefixes** (SeaweedFS). A prefix outlives
-  its last object, so there is nothing to remove.
+  its last object, and Arc cannot remove it through the storage API.
 
-So the list and the measurements endpoint now answer by the rule `GET
-/api/v1/databases/:name` uses: a database is its marker, a file, a cold-tier
-row, or a cluster manifest entry, and directories alone are not one. The list
-already reads every file, so a database with a file or a cold-tier row costs
-nothing extra; only a database with neither is checked. `SHOW DATABASES`,
-which read only directories, now checks each one for its first file (one
-listing request on an object store, up to 16 at once; a database with only
-its marker costs one more), and leaves out those that hold nothing.
+So all three now answer by the rule `GET /api/v1/databases/:name` uses: a
+database is its marker, a file, a tiering metadata row, or a cluster manifest
+entry, and directories alone are not one.
 
-For a database without a marker, which is every database created by a write
-rather than by `POST /api/v1/databases`, `GET /api/v1/databases/:name` now
-stops at the first file instead of listing all of them, and the measurements
-endpoint, which read only directories, now also looks for that first file:
-one listing request on an object store, one directory walk to the first file
-on local storage.
+What that costs:
+
+- `GET /api/v1/databases` already reads every file, so a database with a file
+  or a tiering row costs nothing extra. Each other database is checked, 16 at
+  a time. On a store that keeps empty prefixes every database ever deleted
+  stays one of those, so the list's cost grows with them.
+- `SHOW DATABASES` read only directories, and now looks for each database's
+  first file, 16 at a time: usually one listing request on an object store,
+  plus one for a database with only its marker.
+- The measurements endpoint, for a database without a marker, now also looks
+  for its first file.
+- `GET /api/v1/databases/:name`, for a database without a marker, now stops at
+  its first file instead of listing all of them. That is every database
+  created by a write rather than by `POST /api/v1/databases`.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1427](https://github.com/Basekick-Labs/arc/pull/1427).

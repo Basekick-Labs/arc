@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -224,6 +225,17 @@ type coldTieringManager struct {
 
 func (m *coldTieringManager) GetMetadata() *tiering.MetadataStore { return m.metadata }
 
+// DatabaseHasTierRows answers from the metadata, as the tiering manager does.
+func (m *coldTieringManager) DatabaseHasTierRows(ctx context.Context, db string) (bool, error) {
+	dbs, err := m.metadata.GetAllDatabases(ctx)
+	for _, d := range dbs {
+		if d == db {
+			return true, err
+		}
+	}
+	return false, err
+}
+
 // The list costs nothing extra for a database with a file or a cold-tier
 // row: only a database found as directories alone is checked.
 func TestDatabasesHandler_ListChecksOnlyDatabasesWithNothingFound(t *testing.T) {
@@ -341,5 +353,95 @@ func TestShowDatabases_EmptyPrefixesAreNotADatabase(t *testing.T) {
 	}
 	if got := showDatabases(t, failingGhostExists{listing}); !equalStrings(got, []string{"empty", "ghost", "live"}) {
 		t.Errorf("SHOW DATABASES with a failing check = %v, want [empty ghost live]", got)
+	}
+}
+
+// getDatabaseStatus answers the status of a GET and its body.
+func getDatabaseStatus(t *testing.T, app *fiber.App, path string) (int, string) {
+	t.Helper()
+	resp, err := app.Test(httptest.NewRequest("GET", path, nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
+// A cluster node can hold a database's directories but none of its files
+// while the manifest lists them on peers (#1094): it is listed, and so are
+// its measurements, by the list, GET, the measurements endpoint and SHOW
+// DATABASES. A ghost beside it is not.
+func TestDatabasesHandler_ManifestOnlyDatabaseIsListed(t *testing.T) {
+	root := t.TempDir()
+	local, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	if err := os.MkdirAll(filepath.Join(root, "peerdb", "cpu"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &ghostProbingBackend{LocalBackend: local, ghostPrefixes: ghostPrefixes{local}}
+	entries := []*raft.FileEntry{{Path: "peerdb/cpu/2026/01/01/00/a.parquet", Database: "peerdb", Measurement: "cpu"}}
+
+	h := NewDatabasesHandler(backend, &config.DeleteConfig{Enabled: true}, nil, zerolog.Nop())
+	h.SetCoordinator(&databaseDeleteCoordinatorFake{primary: true, entries: entries}, false)
+	app := fiber.New()
+	h.RegisterRoutes(app)
+	if got := listedDatabases(t, app); !equalStrings(got, []string{"peerdb"}) {
+		t.Errorf("databases listed = %v, want [peerdb]", got)
+	}
+	for _, path := range []string{"/api/v1/databases/peerdb", "/api/v1/databases/peerdb/measurements"} {
+		if code, body := getDatabaseStatus(t, app, path); code != fiber.StatusOK {
+			t.Errorf("GET %s: status %d, want 200: %s", path, code, body)
+		}
+	}
+
+	dir := t.TempDir()
+	duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 1, MaxConnections: 2, LocalStorageRoot: dir, TempDirectory: dir}, zerolog.Nop())
+	if err != nil {
+		t.Skipf("DuckDB: %v", err)
+	}
+	t.Cleanup(func() { duck.Close() })
+	qh := NewQueryHandler(duck, backend, zerolog.Nop(), 30, 1000)
+	qh.coordinator = manifestReadiness{entries: entries}
+	if got := qh.dropEmptyDatabaseDirectories(context.Background(), []string{"ghost", "peerdb", "_schema"}); !equalStrings(got, []string{"peerdb"}) {
+		t.Errorf("SHOW DATABASES keeps %v, want [peerdb]", got)
+	}
+}
+
+// manifestReadiness is a query handler's cluster coordinator with a manifest.
+type manifestReadiness struct{ entries []*raft.FileEntry }
+
+func (manifestReadiness) ReplicationReady() bool                     { return true }
+func (manifestReadiness) ReplicationCatchUpStatus() map[string]int64 { return nil }
+func (m manifestReadiness) GetFileManifestByDatabase(db string) []*raft.FileEntry {
+	var out []*raft.FileEntry
+	for _, e := range m.entries {
+		if e.Database == db {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// A database whose rows are all in the cold tier, with its hot directories
+// left, still has its measurements listed.
+func TestDatabasesHandler_ColdOnlyDatabaseMeasurementsAreListed(t *testing.T) {
+	root := t.TempDir()
+	local, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	if err := os.MkdirAll(filepath.Join(root, "colddb", "cpu"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h := NewDatabasesHandler(local, &config.DeleteConfig{Enabled: true}, nil, zerolog.Nop())
+	h.SetTieringManager(&fakeDatabaseTieringManager{tierRows: true})
+	app := fiber.New()
+	h.RegisterRoutes(app)
+	if code, body := getDatabaseStatus(t, app, "/api/v1/databases/colddb/measurements"); code != fiber.StatusOK || !strings.Contains(body, `"cpu"`) {
+		t.Errorf("GET colddb/measurements: status %d, want 200 listing cpu: %s", code, body)
 	}
 }

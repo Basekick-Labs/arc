@@ -19,6 +19,7 @@ import (
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
 // DatabasesHandler handles database management API endpoints
@@ -908,12 +909,13 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 				paths = append(paths, u.Path)
 			}
 			h.logger.Warn().Str("database", name).Int("files", len(left)).Strs("paths", paths).
-				Msg("Dropped database left files no listing addresses; they keep the database visible and must be removed by hand")
+				Msg("Dropped database left files no listing addresses; they keep its directories and must be removed by hand")
 		}
 	}
 
 	// Remove the directory tree the deleted files leave behind on local
-	// storage (#1425). Object stores have no directories, so nothing to do.
+	// storage (#1425). An object store's prefixes cannot be removed through
+	// the backend; the listings leave out a database with nothing in it.
 	removeEmptyDirectories(ctx, h.storage, name, h.logger)
 
 	// Cached pruned path lists may name the removed files, partial or not.
@@ -1221,16 +1223,23 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 	// manifest entry. Otherwise it is what a delete left behind, which GET
 	// answers 404 for and the list must not show (#1425). Only these
 	// databases cost a check; one with a file or a cold row costs nothing.
+	// On a store that keeps empty prefixes every deleted database stays one
+	// of these, so they are checked concurrently, as SHOW DATABASES does.
+	unchecked := make([]string, 0)
 	for db := range dbMeasurements {
-		if hasContent[db] {
-			continue
+		if !hasContent[db] {
+			unchecked = append(unchecked, db)
 		}
+	}
+	for db, exists := range checkDatabases(unchecked, func(db string) (bool, error) {
 		exists, err := h.databaseExists(ctx, db)
 		if err != nil {
 			// Listed, as before this check: a failed check is not an absence.
 			h.logger.Warn().Err(err).Str("database", db).Msg("Failed to check whether a database with no files exists; listing it")
-			continue
+			return true, nil
 		}
+		return exists, nil
+	}) {
 		if !exists {
 			delete(dbMeasurements, db)
 		}
@@ -1390,7 +1399,46 @@ func (h *DatabasesHandler) databaseHasContent(ctx context.Context, name string) 
 	}
 	// A cluster node may hold none of the database's files locally while the
 	// manifest still lists them on peers (#1094).
-	return h.coordinator != nil && len(h.databaseManifestPaths(name, h.coordinator.GetFileManifestByDatabase(name))) > 0, nil
+	return h.coordinator != nil && manifestHasDatabasePath(name, h.coordinator.GetFileManifestByDatabase(name)), nil
+}
+
+// manifestHasDatabasePath reports whether any manifest entry's path is under
+// the database, by the rule databaseManifestPaths applies, stopping at the
+// first: a database can have millions of entries.
+func manifestHasDatabasePath(database string, entries []*raft.FileEntry) bool {
+	prefix := database + "/"
+	for _, entry := range entries {
+		if entry != nil && strings.HasPrefix(entry.Path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// databaseCheckParallelism bounds the per-database storage checks of the
+// database listings (GET /api/v1/databases, SHOW DATABASES).
+const databaseCheckParallelism = 16
+
+// checkDatabases runs check for each database, databaseCheckParallelism at a
+// time, and returns its answers. check reports a failure its own way and
+// answers what the caller should do with the database.
+func checkDatabases(dbs []string, check func(string) (bool, error)) map[string]bool {
+	answers := make([]bool, len(dbs))
+	var g errgroup.Group
+	g.SetLimit(databaseCheckParallelism)
+	for i, db := range dbs {
+		g.Go(func() error {
+			ok, err := check(db)
+			answers[i] = ok
+			return err
+		})
+	}
+	_ = g.Wait()
+	out := make(map[string]bool, len(dbs))
+	for i, db := range dbs {
+		out[db] = answers[i]
+	}
+	return out
 }
 
 // databaseManifestPaths returns the manifest paths that belong to the database
