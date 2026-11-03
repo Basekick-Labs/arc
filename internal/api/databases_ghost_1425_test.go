@@ -10,16 +10,24 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 )
 
@@ -182,4 +190,93 @@ func (b failingGhostExists) Exists(ctx context.Context, path string) (bool, erro
 		return false, io.ErrUnexpectedEOF
 	}
 	return b.ghostListingBackend.Exists(ctx, path)
+}
+
+// checkRecordingBackend records the databases a listing checks one by one.
+type checkRecordingBackend struct {
+	*ghostProbingBackend
+	mu      sync.Mutex
+	checked map[string]bool
+}
+
+func (b *checkRecordingBackend) record(path string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.checked[strings.SplitN(path, "/", 2)[0]] = true
+}
+
+func (b *checkRecordingBackend) Exists(ctx context.Context, path string) (bool, error) {
+	b.record(path)
+	return b.ghostProbingBackend.Exists(ctx, path)
+}
+
+func (b *checkRecordingBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	b.record(prefix)
+	return b.ghostProbingBackend.HasObjectsUnderPrefix(ctx, prefix)
+}
+
+// coldTieringManager is fakeDatabaseTieringManager with real tier metadata.
+type coldTieringManager struct {
+	fakeDatabaseTieringManager
+	metadata *tiering.MetadataStore
+}
+
+func (m *coldTieringManager) GetMetadata() *tiering.MetadataStore { return m.metadata }
+
+// The list costs nothing extra for a database with a file or a cold-tier
+// row: only a database found as directories alone is checked.
+func TestDatabasesHandler_ListChecksOnlyDatabasesWithNothingFound(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	local, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	backend := &checkRecordingBackend{
+		ghostProbingBackend: &ghostProbingBackend{LocalBackend: local, ghostPrefixes: ghostPrefixes{local}},
+		checked:             map[string]bool{},
+	}
+	if err := local.Write(ctx, "live/cpu/2026/01/01/00/a.parquet", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Write(ctx, "empty/.arc-database", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	// A cold-only database whose hot directories are still there.
+	if err := os.MkdirAll(filepath.Join(root, "colddb", "cpu"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	metadata, err := tiering.NewMetadataStore(db, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.RecordColdFile(ctx, &tiering.FileMetadata{
+		Path: "colddb/cpu/2026/01/01/00/a.parquet", Database: "colddb", Measurement: "cpu",
+		PartitionTime: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), SizeBytes: 4, CreatedAt: time.Now(),
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewDatabasesHandler(backend, &config.DeleteConfig{Enabled: true}, nil, zerolog.Nop())
+	h.SetTieringManager(&coldTieringManager{metadata: metadata})
+	app := fiber.New()
+	h.RegisterRoutes(app)
+
+	if got := listedDatabases(t, app); !equalStrings(got, []string{"colddb", "empty", "live"}) {
+		t.Errorf("databases listed = %v, want [colddb empty live]", got)
+	}
+	checked := make([]string, 0, len(backend.checked))
+	for db := range backend.checked {
+		checked = append(checked, db)
+	}
+	sort.Strings(checked)
+	if !equalStrings(checked, []string{"empty", "ghost"}) {
+		t.Errorf("databases checked one by one = %v, want [empty ghost]: one with a file or a cold row costs nothing", checked)
+	}
 }
