@@ -2047,6 +2047,23 @@ directories and preserve the existing treatment of symlinks. Other query shapes
 keep the existing full-list fallback.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1293](https://github.com/Basekick-Labs/arc/pull/1293).
+### A line-protocol write is no longer refused part-way by the ingest gate ([#1422](https://github.com/Basekick-Labs/arc/issues/1422))
+
+A line-protocol body with several measurements is buffered one measurement at
+a time, and the ingest gate (the fence and stream-takeover pauses, #1207) was
+checked again for each one. When the gate closed part-way, during a writer
+failover or a stream takeover, the write stopped after its first measurements
+were already buffered, and a client that resent the request, such as Telegraf
+or an InfluxDB client, wrote those rows twice. The gate is now checked once
+for the whole request, before anything is written, as it already was for a
+MessagePack batch: a request admitted before the gate closes is no longer
+refused part-way by it. Other failures can still stop a request part-way, and
+are answered with what was written (#1437). The line-protocol, CSV and Parquet
+imports still check the gate for each buffer call, so it stops a long import
+part-way.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1428](https://github.com/Basekick-Labs/arc/pull/1428).
 
 ### A refused write is no longer replayed from the WAL ([#1438](https://github.com/Basekick-Labs/arc/issues/1438))
 
@@ -2183,6 +2200,44 @@ across a failed flush, enable the WAL.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1379](https://github.com/Basekick-Labs/arc/pull/1379).
+
+### A deleted database disappears from the database list ([#1425](https://github.com/Basekick-Labs/arc/issues/1425))
+
+`GET /api/v1/databases` and `SHOW DATABASES` built their lists from
+directories, so a deleted database whose directories outlived its files stayed
+listed, with `measurement_count: 0`, and `GET
+/api/v1/databases/:name/measurements` still listed its measurements, while
+`GET /api/v1/databases/:name` answered 404. Two stores do that:
+
+- **Local storage.** The delete removed the files but left their
+  `measurement/YYYY/MM/DD/HH` directories. It now removes the empty
+  directories, deepest first; a directory that still holds a file stays, with
+  the directories above it. Deleting a database an earlier version left
+  behind still answers 404, and now removes its directories too.
+- **Object stores that keep empty prefixes** (SeaweedFS). A prefix outlives
+  its last object, and Arc cannot remove it through the storage API.
+
+So all three now answer by the rule `GET /api/v1/databases/:name` uses: a
+database is its marker, a file, a tiering metadata row, or a cluster manifest
+entry, and directories alone are not one.
+
+What that costs:
+
+- `GET /api/v1/databases` already reads every file, so a database with a file
+  or a tiering row costs nothing extra. Each other database is checked, 16 at
+  a time. On a store that keeps empty prefixes every database ever deleted
+  stays one of those, so the list's cost grows with them.
+- `SHOW DATABASES` read only directories, and now looks for each database's
+  first file, 16 at a time: usually one listing request on an object store,
+  plus one for a database with only its marker.
+- The measurements endpoint, for a database without a marker, now also looks
+  for its first file.
+- `GET /api/v1/databases/:name`, for a database without a marker, now stops at
+  its first file instead of listing all of them. That is every database
+  created by a write rather than by `POST /api/v1/databases`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1427](https://github.com/Basekick-Labs/arc/pull/1427).
 
 ### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
 
