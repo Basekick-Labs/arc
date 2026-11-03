@@ -50,11 +50,6 @@ func TestQueryCache_MetadataRemainsAssociatedWithTransform(t *testing.T) {
 	if fmt.Sprint(gotMetadata) != fmt.Sprint(want) {
 		t.Fatalf("metadata = %q, want %q", gotMetadata, want)
 	}
-	gotMetadata[1] = "mutated\x00reader"
-	_, again, ok := cache.GetWithMetadata("query")
-	if !ok || fmt.Sprint(again) != fmt.Sprint(want) {
-		t.Fatalf("cached metadata mutated by reader: got %q, want %q", again, want)
-	}
 }
 
 func TestQueryCache_Expiration(t *testing.T) {

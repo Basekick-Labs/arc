@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1830,7 +1831,7 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 			}
 		}
 	}
-	c.Locals(queryPermissionRefsCtxKey{}, append([]TableReference(nil), tableRefs...))
+	c.Locals(queryPermissionRefsCtxKey{}, tableRefs)
 	if len(tableRefs) == 0 {
 		// No tables referenced (e.g., SELECT 1+1)
 		return nil
@@ -1886,23 +1887,23 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 
 type queryPermissionRefsCtxKey struct{}
 
-// checkEmittedQueryPermissions checks transform-resolved scopes that were not
-// covered by the source-SQL permission check. This keeps the normal path to one
-// RBAC lookup while failing closed when extraction and transformation differ.
+// checkEmittedQueryPermissions checks the scopes the query transform read
+// that the source-SQL permission check (checkQueryPermissionsForDefaultDB,
+// which leaves its references in c.Locals) did not cover (#764). When the two
+// agree, which is every query today, it makes no RBAC call; a scope the
+// extractor missed is checked here, and refused, before anything runs.
 func (h *QueryHandler) checkEmittedQueryPermissions(c *fiber.Ctx, permission string, emitted []TableReference) error {
-	if h.rbacManager == nil || auth.GetTokenInfo(c) == nil || len(emitted) == 0 {
+	if h.rbacManager == nil || len(emitted) == 0 {
 		return nil
 	}
-	checked := make(map[string]struct{})
-	checkedRefs, _ := c.Locals(queryPermissionRefsCtxKey{}).([]TableReference)
-	for _, ref := range checkedRefs {
-		checked[ref.Database+"\x00"+ref.Measurement] = struct{}{}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
 	}
-	missing := make([]TableReference, 0, len(emitted))
+	checkedRefs, _ := c.Locals(queryPermissionRefsCtxKey{}).([]TableReference)
+	var missing []TableReference
 	for _, ref := range emitted {
-		key := ref.Database + "\x00" + ref.Measurement
-		if _, ok := checked[key]; !ok {
-			checked[key] = struct{}{}
+		if !slices.Contains(checkedRefs, ref) && !slices.Contains(missing, ref) {
 			missing = append(missing, ref)
 		}
 	}
@@ -1910,7 +1911,6 @@ func (h *QueryHandler) checkEmittedQueryPermissions(c *fiber.Ctx, permission str
 		return nil
 	}
 
-	tokenInfo := auth.GetTokenInfo(c)
 	reqs := make([]*auth.PermissionCheckRequest, len(missing))
 	for i, ref := range missing {
 		reqs[i] = &auth.PermissionCheckRequest{
@@ -3285,17 +3285,14 @@ func (h *QueryHandler) queryTransformCacheKey(sql, headerDB string) string {
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
-func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool, error) {
-	transformed, cached, _, err := h.getTransformedSQLWithRefs(ctx, sql, headerDB)
-	return transformed, cached, err
-}
-
 func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
-		// Nothing Arc emitted, so no scope to report: a user-supplied reader
-		// never gets here, ValidateSQLRequest refuses it on every endpoint.
+		// Run untransformed, so nothing Arc emitted and no scope to report.
+		// A user-supplied reader is refused before this by ValidateSQLRequest
+		// on every endpoint; what reaches here names "read_parquet" only in
+		// a literal, alias or comment, and reads no Arc table.
 		return sql, true, nil, nil
 	}
 
@@ -3318,8 +3315,8 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 		if err != nil {
 			return "", true, nil, err
 		}
-		if len(refs) == 0 && ioTableFunctionPattern.MatchString(ioDenylistNormalise(transformed)) {
-			return "", true, nil, fmt.Errorf("cached SQL transformation is missing storage-path provenance")
+		if err := checkTransformProvenance(transformed, refs); err != nil {
+			return "", true, nil, err
 		}
 		return transformed, true, refs, nil
 	}
@@ -3348,6 +3345,9 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 		return "", false, nil, pathFailure.err
 	}
 	refs := storagePathReferences(pathFailure)
+	if err := checkTransformProvenance(transformed, refs); err != nil {
+		return "", false, nil, err
+	}
 
 	if !volatile.Volatile {
 		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
@@ -3359,11 +3359,6 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 // single-table queries with a header database take an uncached fast path
 // (their time-relative partition list must not outlive the request); the
 // rest go through the cached getTransformedSQL.
-func (h *QueryHandler) getTransformedSQLForQuery(ctx context.Context, sql string, headerDB string) (string, bool, error) {
-	transformed, cached, _, err := h.getTransformedSQLForQueryWithRefs(ctx, sql, headerDB)
-	return transformed, cached, err
-}
-
 func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
 	sqlLower := strings.ToLower(sql)
 
@@ -3400,7 +3395,11 @@ func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sq
 	if pathFailure.err != nil {
 		return "", false, nil, pathFailure.err
 	}
-	return convertedSQL, false, storagePathReferences(pathFailure), nil
+	refs := storagePathReferences(pathFailure)
+	if err := checkTransformProvenance(convertedSQL, refs); err != nil {
+		return "", false, nil, err
+	}
+	return convertedSQL, false, refs, nil
 }
 
 // convertSQLToStoragePaths converts table references to storage paths
@@ -3652,7 +3651,7 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 // table. A name Arc cannot turn into a path is an error, not an empty result.
 type storagePathFailure struct {
 	err     error
-	emitted map[string]TableReference
+	emitted map[TableReference]struct{}
 }
 
 // errColdTierUnavailable refuses a read that needs the cold tier on a node
@@ -3669,6 +3668,9 @@ var errColdTierUnavailable = errors.New("this query reads data in the cold stora
 func transformErrorStatus(err error) int {
 	if errors.Is(err, errColdTierUnavailable) {
 		return fiber.StatusServiceUnavailable
+	}
+	if errors.Is(err, errTransformProvenance) {
+		return fiber.StatusInternalServerError
 	}
 	return fiber.StatusBadRequest
 }
@@ -3715,7 +3717,7 @@ type storagePathCtxKey struct{}
 
 // withStoragePathFailure attaches a collector for storage-path rejections.
 func withStoragePathFailure(ctx context.Context) (context.Context, *storagePathFailure) {
-	f := &storagePathFailure{emitted: make(map[string]TableReference)}
+	f := &storagePathFailure{emitted: make(map[TableReference]struct{})}
 	return context.WithValue(ctx, storagePathCtxKey{}, f), f
 }
 
@@ -3729,14 +3731,29 @@ func recordStoragePathFailure(ctx context.Context, err error) {
 
 func recordStoragePathEmission(ctx context.Context, database, measurement string) {
 	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
-		key := database + "\x00" + measurement
-		f.emitted[key] = TableReference{Database: database, Measurement: measurement}
+		f.emitted[TableReference{Database: database, Measurement: measurement}] = struct{}{}
 	}
+}
+
+// errTransformProvenance refuses a transform that reads storage but recorded
+// no database or measurement for it (#764): its reads cannot be checked
+// against RBAC. Arc's own inconsistency, so a 500, not the caller's 400.
+var errTransformProvenance = errors.New("SQL transformation reads storage without recording what it reads")
+
+// checkTransformProvenance refuses transformed SQL that reads storage while
+// no scope was recorded for it. Every storage path the transform builds
+// records its scope, so this fires only on a transform branch that builds a
+// path some other way; the check is then refused rather than skipped.
+func checkTransformProvenance(transformed string, refs []TableReference) error {
+	if len(refs) == 0 && ioTableFunctionPattern.MatchString(ioDenylistNormalise(transformed)) {
+		return errTransformProvenance
+	}
+	return nil
 }
 
 func storagePathReferences(f *storagePathFailure) []TableReference {
 	refs := make([]TableReference, 0, len(f.emitted))
-	for _, ref := range f.emitted {
+	for ref := range f.emitted {
 		refs = append(refs, ref)
 	}
 	sort.Slice(refs, func(i, j int) bool {
@@ -3761,7 +3778,7 @@ func decodeStoragePathReferences(encoded []string) ([]TableReference, error) {
 	for _, value := range encoded {
 		database, measurement, ok := strings.Cut(value, "\x00")
 		if !ok || database == "" || measurement == "" {
-			return nil, fmt.Errorf("invalid storage-path metadata in SQL transform cache")
+			return nil, fmt.Errorf("%w: invalid scope metadata in SQL transform cache", errTransformProvenance)
 		}
 		refs = append(refs, TableReference{Database: database, Measurement: measurement})
 	}
@@ -4364,13 +4381,22 @@ func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, ke
 		Str("database", database).
 		Str("measurement", measurement).
 		Msg("No tier holds a file of this measurement; reading it as empty")
+	// What this reads is this measurement's, as empty: record that scope
+	// (#764), never the sentinel's, which no grant names and would turn an
+	// empty result into a 403 for a token granted only this measurement.
+	recordStoragePathEmission(ctx, database, measurement)
 	if anchor := h.anchorFor(ctx, database, measurement); anchor != "" {
 		return readParquetExpr(keyword, anchor, nil, options)
 	}
 	if hotWasSource {
 		return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
-	return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, arcInvalidIdentifierSentinel)}, options)
+	empty, err := storage.GetStoragePath(h.storage, database, arcInvalidIdentifierSentinel)
+	if err != nil {
+		recordStoragePathFailure(ctx, err)
+		return ""
+	}
+	return readParquetExpr(keyword, "", []string{empty}, options)
 }
 
 // multiTierView is what buildMultiTierReadParquet reads from tiering: which

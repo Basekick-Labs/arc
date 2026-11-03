@@ -108,9 +108,8 @@ func (c *SQLTransformCache) Get(sql string) (string, bool) {
 	return transformed, ok
 }
 
-// GetWithMetadata retrieves a cached transformed SQL and its caller-owned
-// metadata if present. The returned metadata is copied so cache entries remain
-// immutable after publication.
+// GetWithMetadata retrieves a cached transformed SQL and the metadata stored
+// with it. The metadata is the cache's own: callers must not modify it.
 func (c *SQLTransformCache) GetWithMetadata(sql string) (string, []string, bool) {
 	shard := c.shardFor(sql)
 
@@ -129,7 +128,7 @@ func (c *SQLTransformCache) GetWithMetadata(sql string) (string, []string, bool)
 	}
 
 	c.hits.Add(1)
-	return entry.transformed, append([]string(nil), entry.metadata...), true
+	return entry.transformed, entry.metadata, true
 }
 
 // Set stores a transformed SQL in the cache
