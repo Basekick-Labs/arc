@@ -182,7 +182,7 @@ func TestCoveredHookFiresAtCommitWithCoverage(t *testing.T) {
 // rest are released.
 func TestCoveredCommitDropKeepsEnqueuedTokens(t *testing.T) {
 	w := &Writer{entryChan: make(chan walEntry, 1), pendingSeqs: map[uint64]struct{}{}, trackedInstance: 5}
-	p := &PreparedAppend{w: w, key: "db/m"}
+	p := &PreparedAppend{w: w, key: "db/m", covered: true}
 	for i := 0; i < 3; i++ {
 		seq := uint64(i + 1)
 		w.pendingSeqs[seq] = struct{}{}

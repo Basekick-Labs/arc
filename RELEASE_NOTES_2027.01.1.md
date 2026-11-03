@@ -2039,6 +2039,44 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A refused write is no longer replayed from the WAL ([#1438](https://github.com/Basekick-Labs/arc/issues/1438))
+
+With the WAL enabled and `cluster.wal_coverage` off (every standalone node, and
+clusters that leave it off), a live write appended its WAL entry before the
+checks that can still refuse it: schema churn on the measurement, a request
+cancelled by its client, a node shutting down, and (for columnar MessagePack)
+a column that could not be converted. The client got the refusal, usually a
+`503` it resent, but the entry stayed in the WAL. A crash before the next
+purge, or for a shutdown refusal the next start, replayed it, so the rows were
+stored twice.
+
+- **`wal.ack_mode = "queued"` (the default):** the WAL entry is now built
+  before the shard lock, as before, but only queued for the WAL file after
+  those checks pass, under the same lock that puts the batch in the buffer.
+  WAL coverage already worked this way. A refused write leaves nothing in the
+  WAL. The on-disk format is unchanged.
+- **`wal.ack_mode = "durable"`:** a write is acknowledged only once its entry
+  is synced, and that wait cannot happen under the shard lock, so the entry is
+  still written first. A refusal after it now retracts the entry with a
+  checkpoint, the same record a flush writes, so recovery never replays it.
+  The same applies when one chunk of a split payload fails after the others
+  were written, and when the sync itself fails (the checkpoint is then
+  attempted, and usually fails with it). A retraction that cannot be written
+  leaves the old behaviour: the write may come back at the next start. Each
+  one is counted in `arc_wal_retractions_failed_total` and logged at Error, at
+  most once every 10 seconds.
+- **The conversion now runs before the WAL append** in every mode, so a value
+  it refuses never reaches the WAL.
+- **A full WAL queue** that drops a later chunk of a large write at commit
+  keeps the chunks already queued tracked, so their flush checkpoints them.
+  Before, they were replayed at the next start next to the rows the buffer had
+  already stored.
+
+In queued mode this also closes a race with the flush-failure recovery pass.
+A write's WAL entry and its batch now enter the WAL queue and the buffer in
+one step, so the pass can no longer replay an entry whose rows are still in
+the live buffer.
+
 ### Filesystem-equivalent spoke IDs cannot share a sync namespace ([#740](https://github.com/Basekick-Labs/arc/issues/740))
 
 Spoke IDs that differ only in letter case or Unicode normalization
