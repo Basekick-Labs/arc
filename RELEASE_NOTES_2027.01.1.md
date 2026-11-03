@@ -2055,6 +2055,24 @@ transform.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
 
+### A line-protocol write is no longer refused part-way by the ingest gate ([#1422](https://github.com/Basekick-Labs/arc/issues/1422))
+
+A line-protocol body with several measurements is buffered one measurement at
+a time, and the ingest gate (the fence and stream-takeover pauses, #1207) was
+checked again for each one. When the gate closed part-way, during a writer
+failover or a stream takeover, the write stopped after its first measurements
+were already buffered, and a client that resent the request, such as Telegraf
+or an InfluxDB client, wrote those rows twice. The gate is now checked once
+for the whole request, before anything is written, as it already was for a
+MessagePack batch: a request admitted before the gate closes is no longer
+refused part-way by it. Other failures can still stop a request part-way, and
+are answered with what was written (#1437). The line-protocol, CSV and Parquet
+imports still check the gate for each buffer call, so it stops a long import
+part-way.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1428](https://github.com/Basekick-Labs/arc/pull/1428).
+
 ### A refused write is no longer replayed from the WAL ([#1438](https://github.com/Basekick-Labs/arc/issues/1438))
 
 With the WAL enabled and `cluster.wal_coverage` off (every standalone node, and

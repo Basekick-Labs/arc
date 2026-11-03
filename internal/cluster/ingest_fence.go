@@ -20,7 +20,8 @@ import (
 // failover the cluster promotes another writer, and the isolated one's rows
 // reach the others only once the partition heals — or never, if its disk dies
 // first. A fenced writer answers 503 before anything is written, the WAL
-// included, so the client retries against the primary.
+// included, so the client retries against the primary. A line-protocol
+// request is checked once, at admission, not per measurement (#1422).
 //
 // Two rules, on a writer in a cluster with a primary-election manager:
 //   - designation (always): another writer is the designated primary in this
