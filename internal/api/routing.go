@@ -64,10 +64,12 @@ var clientForwardingHeaders = map[string]bool{
 	"Forwarded":           true, // RFC 7239
 	"X-Arc-Forwarded-By":  true, // internal loop marker; only the peer may set it
 	"X-Arc-Original-Host": true,
-	// arcli's installation id is recorded by the node that received the
-	// request (telemetry, client_identity.go); stripped here so a
-	// forwarded request is not counted a second time on the peer.
-	"Arcli-Installation-Id": true,
+	// Client installation ids (arcli's legacy header and the generic one
+	// the SDKs send) are recorded by the node that received the request
+	// (telemetry, client_identity.go); stripped here so a forwarded
+	// request is not counted a second time on the peer.
+	"Arcli-Installation-Id":      true,
+	"Arc-Client-Installation-Id": true,
 	// CDN / proxy client-IP headers. Not read by Arc today (identity is
 	// socket-only), stripped defensively so they cannot be trusted later.
 	"True-Client-Ip":   true, // canonical form of True-Client-IP (Akamai/Cloudflare)
@@ -389,9 +391,13 @@ const IngestFencedHeader = "X-Arc-Ingest-Fenced"
 
 // IngestRefusedHeader marks a 503 that refused a write for a node-local,
 // transient condition (ingest.WriteRefusal, #676); its value is the reason,
-// e.g. "wal_disk". Nothing was written and a retry, to this node too, is
-// safe. A forwarding node and the request logger recognise it like
-// IngestFencedHeader.
+// e.g. "wal_disk". For every reason but one, nothing was written and a retry,
+// to this node too, is safe. The exception is "wal_not_durable": the WAL entry
+// that could not be made durable is refused after it was appended, so its rows
+// may still come back at the next start (ingest.ErrWALNotDurable says so). A
+// refusal never follows part of a request already buffered: that is answered
+// as a write stopped part-way, without this header (#1437). A forwarding node
+// and the request logger recognise it like IngestFencedHeader.
 const IngestRefusedHeader = "X-Arc-Ingest-Refused"
 
 // ingestRefusedLocal is the request flag the request logger reads to skip its

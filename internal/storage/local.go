@@ -160,8 +160,8 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 // partPath returns the persistent in-progress path for a file being written by
 // WriteReader or AppendReader. Using a deterministic name (rather than a
 // random .tmp) means a partial write that survives a crash or transport error
-// is discoverable through StagingInspector and ReadToAt, enabling the puller
-// to resume from the last committed byte on the next attempt.
+// is discoverable through StagingInspector, enabling the puller to resume from
+// the last staged byte on the next attempt.
 func partPath(fullPath string) string {
 	return fullPath + PartSuffix
 }
@@ -422,10 +422,8 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	return nil
 }
 
-// ReadToAt reads data from path starting at the given byte offset and writes
-// to writer. offset=0 starts at the beginning. Falls back to the ".part"
-// staging file if the final file does not exist (allows the puller to hash a
-// partial prefix before resuming a transfer).
+// ReadToAt reads the committed file at path starting at the given byte offset
+// and writes to writer. offset=0 starts at the beginning.
 func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
@@ -435,12 +433,7 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 		return fmt.Errorf("negative offset: %d", offset)
 	}
 
-	// Prefer the final file; fall back to the staging file so tryResumeFromPartial
-	// can hash a prefix even before the transfer completes.
 	file, err := os.Open(fullPath)
-	if os.IsNotExist(err) {
-		file, err = os.Open(partPath(fullPath))
-	}
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {

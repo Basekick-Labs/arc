@@ -2,12 +2,20 @@ package security
 
 import (
 	"bytes"
+	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
+	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/rs/zerolog"
 )
 
 const testSecret = "test-cluster-secret-32-bytes-long!"
@@ -15,16 +23,30 @@ const testCluster = "test-cluster"
 
 // pipeStreamLayer is an in-memory raft.StreamLayer backed by net.Pipe, so the
 // handshake can be exercised without binding a real port. Accept returns the
-// server end of the most recent Dial.
+// server end of the most recent Dial; Close unblocks it.
 type pipeStreamLayer struct {
-	accept chan net.Conn
+	accept    chan net.Conn
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
-func newPipeStreamLayer() *pipeStreamLayer { return &pipeStreamLayer{accept: make(chan net.Conn, 1)} }
+func newPipeStreamLayer() *pipeStreamLayer {
+	return &pipeStreamLayer{accept: make(chan net.Conn, 1), done: make(chan struct{})}
+}
 
-func (p *pipeStreamLayer) Accept() (net.Conn, error) { return <-p.accept, nil }
-func (p *pipeStreamLayer) Close() error              { return nil }
-func (p *pipeStreamLayer) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1} }
+func (p *pipeStreamLayer) Accept() (net.Conn, error) {
+	select {
+	case c := <-p.accept:
+		return c, nil
+	case <-p.done:
+		return nil, net.ErrClosed
+	}
+}
+func (p *pipeStreamLayer) Close() error {
+	p.closeOnce.Do(func() { close(p.done) })
+	return nil
+}
+func (p *pipeStreamLayer) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1} }
 func (p *pipeStreamLayer) Dial(_ raft.ServerAddress, _ time.Duration) (net.Conn, error) {
 	client, server := net.Pipe()
 	p.accept <- server
@@ -45,8 +67,76 @@ func handshakePair(t *testing.T, serverLayer, clientLayer *AuthenticatedStreamLa
 		srvCh <- res{c, err}
 	}()
 	cliConn, cliErr := clientLayer.Dial("ignored", time.Second)
-	sr := <-srvCh
-	return sr.conn, sr.err, cliConn, cliErr
+	select {
+	case sr := <-srvCh:
+		return sr.conn, sr.err, cliConn, cliErr
+	case <-time.After(2 * time.Second):
+		t.Fatal("server Accept never returned the authenticated connection")
+		return nil, nil, nil, nil
+	}
+}
+
+// expectRejected dials serverLayer with clientLayer and asserts the server
+// never hands the connection to its Accept caller (a rejected peer is closed
+// inside the layer, not returned as an error — #1431), and that the client
+// Dial fails.
+func expectRejected(t *testing.T, base *pipeStreamLayer, server, client *AuthenticatedStreamLayer) {
+	t.Helper()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if c, err := server.Accept(); err == nil {
+			accepted <- c
+		}
+	}()
+	cliConn, cliErr := client.Dial("ignored", time.Second)
+	if cliErr == nil {
+		cliConn.Close()
+		t.Error("client Dial succeeded against a peer that should have refused it")
+	}
+	select {
+	case c := <-accepted:
+		c.Close()
+		t.Fatal("server Accept returned a connection that failed authentication")
+	case <-time.After(200 * time.Millisecond):
+	}
+	server.Close()
+	base.Close()
+}
+
+// syncBuffer is a goroutine-safe log sink.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func newLoggedLayer(inner raft.StreamLayer, secret, cluster string) (*AuthenticatedStreamLayer, *syncBuffer) {
+	logs := &syncBuffer{}
+	return NewAuthenticatedStreamLayer(inner, secret, cluster).WithLogger(zerolog.New(logs).Level(zerolog.DebugLevel)), logs
+}
+
+// waitForLog polls logs for substr; the rejecting goroutine logs after the
+// client has already seen its Dial fail.
+func waitForLog(t *testing.T, logs *syncBuffer, substr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(logs.String(), substr) {
+		if time.Now().After(deadline) {
+			t.Fatalf("log never contained %q; got:\n%s", substr, logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func TestRaftAuth_MutualSuccess(t *testing.T) {
@@ -77,59 +167,193 @@ func TestRaftAuth_MutualSuccess(t *testing.T) {
 
 func TestRaftAuth_WrongSecretClientRejected(t *testing.T) {
 	base := newPipeStreamLayer()
-	server := NewAuthenticatedStreamLayer(base, testSecret, testCluster)
+	server, logs := newLoggedLayer(base, testSecret, testCluster)
 	client := NewAuthenticatedStreamLayer(base, "WRONG-SECRET", testCluster)
 
-	srvConn, srvErr, _, _ := handshakePair(t, server, client)
-	if srvErr == nil {
-		srvConn.Close()
-		t.Fatal("server accepted a client with the wrong secret")
-	}
+	expectRejected(t, base, server, client)
+	// A wrong MAC is the security signal: Warn, with the peer's address.
+	waitForLog(t, logs, `"level":"warn"`)
+	waitForLog(t, logs, "peer failed authentication")
 }
 
 func TestRaftAuth_WrongSecretServerRejected(t *testing.T) {
 	base := newPipeStreamLayer()
-	server := NewAuthenticatedStreamLayer(base, "WRONG-SECRET", testCluster)
+	server, _ := newLoggedLayer(base, "WRONG-SECRET", testCluster)
 	client := NewAuthenticatedStreamLayer(base, testSecret, testCluster)
 
-	_, _, cliConn, cliErr := handshakePair(t, server, client)
-	if cliErr == nil {
-		cliConn.Close()
-		t.Fatal("client accepted a server with the wrong secret")
-	}
+	expectRejected(t, base, server, client)
 }
 
 func TestRaftAuth_WrongClusterNameRejected(t *testing.T) {
 	base := newPipeStreamLayer()
-	server := NewAuthenticatedStreamLayer(base, testSecret, "cluster-a")
+	server, logs := newLoggedLayer(base, testSecret, "cluster-a")
 	client := NewAuthenticatedStreamLayer(base, testSecret, "cluster-b")
 
-	srvConn, srvErr, _, _ := handshakePair(t, server, client)
-	if srvErr == nil {
-		srvConn.Close()
-		t.Fatal("server accepted a peer bound to a different cluster name")
-	}
+	expectRejected(t, base, server, client)
+	waitForLog(t, logs, "peer failed authentication")
 }
 
 func TestRaftAuth_TruncatedHandshakeRejected(t *testing.T) {
-	// A peer that connects and immediately closes must not authenticate.
+	// A peer that connects and immediately closes must not authenticate, and
+	// is routine (a dialer that gave up), so it is logged at Debug, not Warn.
 	base := newPipeStreamLayer()
-	server := NewAuthenticatedStreamLayer(base, testSecret, testCluster)
+	server, logs := newLoggedLayer(base, testSecret, testCluster)
+	defer base.Close()
+	defer server.Close()
 
-	srvCh := make(chan error, 1)
+	accepted := make(chan net.Conn, 1)
 	go func() {
-		c, err := server.Accept()
-		if c != nil {
-			c.Close()
+		if c, err := server.Accept(); err == nil {
+			accepted <- c
 		}
-		srvCh <- err
 	}()
 	client, srv := net.Pipe()
 	base.accept <- srv
 	client.Close() // hang up before sending anything
 
-	if err := <-srvCh; err == nil {
+	waitForLog(t, logs, "dropped during authentication handshake")
+	select {
+	case c := <-accepted:
+		c.Close()
 		t.Fatal("server authenticated a peer that sent no handshake")
+	default:
+	}
+	if strings.Contains(logs.String(), `"level":"warn"`) {
+		t.Fatalf("a peer that hung up was logged at Warn:\n%s", logs.String())
+	}
+}
+
+func TestRaftAuth_AuthFailureWarnIsRateLimited(t *testing.T) {
+	base := newPipeStreamLayer()
+	server, logs := newLoggedLayer(base, testSecret, testCluster)
+	client := NewAuthenticatedStreamLayer(base, "WRONG-SECRET", testCluster)
+	defer base.Close()
+	defer server.Close()
+	go func() {
+		for {
+			c, err := server.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	for i := 0; i < 5; i++ {
+		if c, err := client.Dial("ignored", time.Second); err == nil {
+			c.Close()
+			t.Fatal("wrong-secret client authenticated")
+		}
+	}
+	waitForLog(t, logs, "peer failed authentication")
+	deadline := time.Now().Add(2 * time.Second)
+	for suppressedWarns(server) != 4 {
+		if time.Now().After(deadline) {
+			t.Fatalf("suppressed = %d, want 4", suppressedWarns(server))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := strings.Count(logs.String(), "peer failed authentication"); n != 1 {
+		t.Fatalf("logged %d auth-failure warnings within the interval, want 1", n)
+	}
+}
+
+func suppressedWarns(a *AuthenticatedStreamLayer) int64 {
+	a.authWarns.mu.Lock()
+	defer a.authWarns.mu.Unlock()
+	return a.authWarns.suppressed
+}
+
+func TestRaftAuth_WarnLimiterIsPerSource(t *testing.T) {
+	var l authWarnLimiter
+	t0 := time.Now()
+	if _, ok := l.allow("10.0.0.1", t0); !ok {
+		t.Fatal("first warning from a source suppressed")
+	}
+	if _, ok := l.allow("10.0.0.1", t0.Add(time.Second)); ok {
+		t.Fatal("second warning from the same source within the interval logged")
+	}
+	// A noisy source must not hide a different one.
+	if n, ok := l.allow("10.0.0.2", t0.Add(2*time.Second)); !ok || n != 1 {
+		t.Fatalf("other source: logged=%v suppressed=%d, want true, 1", ok, n)
+	}
+	if _, ok := l.allow("10.0.0.1", t0.Add(raftAuthWarnInterval)); !ok {
+		t.Fatal("source not logged again after the interval")
+	}
+	// A full table drops expired entries before refusing a new source.
+	for i := 0; i < raftAuthWarnMaxSources; i++ {
+		l.allow(fmt.Sprintf("192.0.2.%d:%d", i/250, i), t0)
+	}
+	if _, ok := l.allow("198.51.100.1", t0.Add(time.Second)); ok && len(l.last) > raftAuthWarnMaxSources {
+		t.Fatalf("table grew past its bound: %d", len(l.last))
+	}
+	if _, ok := l.allow("198.51.100.2", t0.Add(2*raftAuthWarnInterval)); !ok {
+		t.Fatal("new source refused although every table entry had expired")
+	}
+	if len(l.last) > raftAuthWarnMaxSources {
+		t.Fatalf("table grew past its bound: %d", len(l.last))
+	}
+}
+
+// fakeAddrConn reports a chosen remote address.
+type fakeAddrConn struct {
+	net.Conn
+	remote string
+}
+
+func (c fakeAddrConn) RemoteAddr() net.Addr { return fakeAddr(c.remote) }
+
+type fakeAddr string
+
+func (a fakeAddr) Network() string { return "tcp" }
+func (a fakeAddr) String() string  { return string(a) }
+
+func TestRaftAuth_RefusalsWarnHangupsDebug(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		warn bool
+	}{
+		{"eof", fmt.Errorf("read client mac: %w", io.EOF), false},
+		{"unexpected eof", fmt.Errorf("read client mac: %w", io.ErrUnexpectedEOF), false},
+		{"reset", fmt.Errorf("write server nonce: %w", syscall.ECONNRESET), false},
+		{"timeout", fmt.Errorf("read client mac: %w", os.ErrDeadlineExceeded), false},
+		{"wrong mac", errors.New("client failed authentication"), true},
+		{"tls client cert", fmt.Errorf("write server nonce: %w", errors.New("tls: client didn't provide a certificate")), true},
+		{"not tls", fmt.Errorf("write server nonce: %w", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}), true},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			layer, logs := newLoggedLayer(newPipeStreamLayer(), testSecret, testCluster)
+			layer.logHandshakeFailure(fakeAddrConn{remote: fmt.Sprintf("10.1.0.%d:9200", i)}, tc.err)
+			got := strings.Contains(logs.String(), `"level":"warn"`)
+			if got != tc.warn {
+				t.Fatalf("warn=%v, want %v; log: %s", got, tc.warn, logs.String())
+			}
+		})
+	}
+}
+
+func TestRaftAuth_CloseUnblocksAccept(t *testing.T) {
+	base := newPipeStreamLayer()
+	layer := NewAuthenticatedStreamLayer(base, testSecret, testCluster)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := layer.Accept()
+		errCh <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	layer.Close()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Accept after Close = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not unblock Accept")
+	}
+	// Close before (another) Accept: still returns, never blocks.
+	if _, err := layer.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Accept on a closed layer = %v, want net.ErrClosed", err)
 	}
 }
 
@@ -190,8 +414,9 @@ func (a *AuthenticatedStreamLayer) Accept2(conn net.Conn) (net.Conn, error) {
 
 func TestRaftAuth_DeadlineBelowHeartbeat(t *testing.T) {
 	// Guard the constant so a future edit can't push the handshake deadline
-	// above the Raft heartbeat and reintroduce the serial-accept election-storm
-	// risk.
+	// above the Raft heartbeat: the dial side runs inline in raft's per-peer
+	// heartbeat goroutine, so a deadline past the heartbeat lets one slow peer
+	// miss heartbeats (#671).
 	if raftAuthDeadline >= 500*time.Millisecond {
 		t.Fatalf("raftAuthDeadline %v must be below the 500ms default HeartbeatTimeout", raftAuthDeadline)
 	}

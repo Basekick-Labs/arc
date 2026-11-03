@@ -81,6 +81,7 @@ type Metrics struct {
 	bufferMemoryLimit     atomic.Int64
 	bufferMemoryPressure  atomic.Int64
 	bufferRecordsWritten  atomic.Int64
+	bufferRecordsDropped  atomic.Int64
 	bufferFlushesTotal    atomic.Int64
 	bufferErrorsTotal     atomic.Int64
 	bufferFlushFailures   atomic.Int64
@@ -190,15 +191,18 @@ type Metrics struct {
 	standbyStoreLowSpace     atomic.Int64 // 1 while the store's volume is below its free-space reserve (#1266)
 	standbyStoreMaxBytes     atomic.Int64 // the store's effective cap, 0 = none (#1266)
 
-	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
-	streamClaims         atomic.Int64 // stream claims held in the FSM
-	departedWriters      atomic.Int64 // writers that left gracefully and have not re-joined (#1207)
-	oldestClaimAge       atomic.Int64 // seconds the oldest unfinished stream claim has been open (#1207)
-	unpulledFiles        atomic.Int64 // files of claimed instances this claimant does not hold yet (#1207)
-	walCoverageRefused   atomic.Int64 // batches whose file was refused: another writer claimed them
-	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
-	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
+	streamClaimsEnabled atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
+	streamClaims        atomic.Int64 // stream claims held in the FSM
+	departedWriters     atomic.Int64 // writers that left gracefully and have not re-joined (#1207)
+	oldestClaimAge      atomic.Int64 // seconds the oldest unfinished stream claim has been open (#1207)
+	unpulledFiles       atomic.Int64 // files of claimed instances this claimant does not hold yet (#1207)
+	walCoverageRefused  atomic.Int64 // batches whose file was refused: another writer claimed them
+	walRecoveryTotal    atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords  atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries   atomic.Int64 // Entries dropped due to full WAL buffer
+	// WAL entries of a refused write that could not be retracted by
+	// checkpoint (#1438): they may be replayed at the next start.
+	walRetractionsFailed atomic.Int64
 	walFailedWrites      atomic.Int64 // WAL entries lost to a failed write (#676)
 	walDiskFullWrites    atomic.Int64 // Of those, lost to ENOSPC or EDQUOT
 	walRecoveredWrites   atomic.Int64 // Failed WAL writes the retry on a new file recovered
@@ -548,6 +552,7 @@ func (m *Metrics) SetBufferRecordsWritten(count int64)  { m.bufferRecordsWritten
 func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.Store(count) }
 func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
 func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
+func (m *Metrics) IncBufferRecordsDropped(count int64)  { m.bufferRecordsDropped.Add(count) }
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
 func (m *Metrics) SetBufferRecordsQueued(count int64)   { m.bufferRecordsQueued.Store(count) }
 func (m *Metrics) SetBufferRecordsInflight(count int64) { m.bufferRecordsInflight.Store(count) }
@@ -741,6 +746,7 @@ func (m *Metrics) SetStandbyStore(bytes, incomplete int64) {
 func (m *Metrics) IncWALRecoveryTotal()              { m.walRecoveryTotal.Add(1) }
 func (m *Metrics) IncWALRecoveryRecords(count int64) { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()             { m.walDroppedEntries.Add(1) }
+func (m *Metrics) IncWALRetractionsFailed(n int64)   { m.walRetractionsFailed.Add(n) }
 func (m *Metrics) IncWALFailedWrites()               { m.walFailedWrites.Add(1) }
 func (m *Metrics) IncWALDiskFullWrites()             { m.walDiskFullWrites.Add(1) }
 func (m *Metrics) IncWALRecoveredWrites()            { m.walRecoveredWrites.Add(1) }
@@ -1189,6 +1195,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"buffer_memory_limit_bytes":       m.bufferMemoryLimit.Load(),
 		"buffer_memory_pressure":          m.bufferMemoryPressure.Load(),
 		"buffer_records_written":          m.bufferRecordsWritten.Load(),
+		"buffer_records_dropped_total":    m.bufferRecordsDropped.Load(),
 		"buffer_flushes_total":            m.bufferFlushesTotal.Load(),
 		"buffer_errors_total":             m.bufferErrorsTotal.Load(),
 		"buffer_flush_failures_total":     m.bufferFlushFailures.Load(),
@@ -1278,6 +1285,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_recovery_total":                m.walRecoveryTotal.Load(),
 		"wal_recovery_records":              m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":               m.walDroppedEntries.Load(),
+		"wal_retractions_failed":            m.walRetractionsFailed.Load(),
 		"wal_failed_writes":                 m.walFailedWrites.Load(),
 		"wal_disk_full_writes":              m.walDiskFullWrites.Load(),
 		"wal_recovered_writes":              m.walRecoveredWrites.Load(),
@@ -1542,11 +1550,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_buffer_records_written_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_records_written_total", float64(m.bufferRecordsWritten.Load()))
 
+	b = append(b, "# HELP arc_buffer_records_dropped_total Acknowledged records lost because their flush failed, or Close could not write them, and the WAL held no copy (always the case with wal.enabled=false); a flush that failed after writing some hours counts all its rows\n"...)
+	b = append(b, "# TYPE arc_buffer_records_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_records_dropped_total", float64(m.bufferRecordsDropped.Load()))
+
 	b = append(b, "# HELP arc_buffer_flushes_total Total buffer flushes\n"...)
 	b = append(b, "# TYPE arc_buffer_flushes_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_flushes_total", float64(m.bufferFlushesTotal.Load()))
 
-	b = append(b, "# HELP arc_buffer_flush_failures_total Total buffer flush failures preserved for WAL recovery\n"...)
+	b = append(b, "# HELP arc_buffer_flush_failures_total Total buffer flush failures\n"...)
 	b = append(b, "# TYPE arc_buffer_flush_failures_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_flush_failures_total", float64(m.bufferFlushFailures.Load()))
 
@@ -1845,6 +1857,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_dropped_entries_total WAL entries dropped due to full buffer\n"...)
 	b = append(b, "# TYPE arc_wal_dropped_entries_total counter\n"...)
 	b = appendMetric(b, "arc_wal_dropped_entries_total", float64(m.walDroppedEntries.Load()))
+	b = appendMetric(b, "arc_wal_retractions_failed_total", float64(m.walRetractionsFailed.Load()))
 
 	b = append(b, "# HELP arc_wal_failed_writes_total WAL entries lost to a failed write (not written to any WAL file)\n"...)
 	b = append(b, "# TYPE arc_wal_failed_writes_total counter\n"...)

@@ -334,12 +334,18 @@ localProcessing:
 	// Convert to columnar format grouped by measurement
 	columnarByMeasurement := ingest.BatchToColumnar(records)
 
+	// The measurements in a fixed order: RBAC reads them, and the write loop
+	// below goes through them in this order, so a write that stops part-way
+	// can say which were written (#1437). This path runs only with decimal
+	// columns configured; the typed path sorts its list the same way.
+	measurements := make([]string, 0, len(columnarByMeasurement))
+	for measurement := range columnarByMeasurement {
+		measurements = append(measurements, measurement)
+	}
+	sort.Strings(measurements)
+
 	// Check RBAC permissions for all measurements being written (only if RBAC is enabled)
 	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
-		measurements := make([]string, 0, len(columnarByMeasurement))
-		for measurement := range columnarByMeasurement {
-			measurements = append(measurements, measurement)
-		}
 		if err := h.checkWritePermissions(c, database, measurements); err != nil {
 			h.totalErrors.Add(1)
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
@@ -359,7 +365,10 @@ localProcessing:
 	}
 
 	// A column changed between string and binary refuses the whole request
-	// (#440), not the measurement it is in after the others were written.
+	// (#440), not the measurement it is in after the others were written. A
+	// change that lands after this check (a concurrent writer) is refused by
+	// the write itself: that measurement is dropped and the others written
+	// (writeLPMeasurements, #1437).
 	for _, record := range columnarByMeasurement {
 		if err := h.buffer.CheckColumnsTextBinary(database, record.Measurement, record.Columns); err != nil {
 			h.totalErrors.Add(1)
@@ -370,7 +379,9 @@ localProcessing:
 	// Refuse the whole request up front if writes are fenced (#1207) or the
 	// WAL volume is under disk pressure (#676), rather than part-way through
 	// the measurements below. The admitted context skips the per-call disk
-	// pressure check, so pressure starting mid-request cannot split it.
+	// pressure check, so pressure starting mid-request cannot split it. The
+	// fence is still checked per call: one that closes part-way stops the
+	// write, answered with what was written (writeLPMeasurements, #1437).
 	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
@@ -378,55 +389,24 @@ localProcessing:
 	}
 	defer release()
 
-	// Write each measurement to the buffer
-	for measurement, record := range columnarByMeasurement {
-		err := h.buffer.WriteColumnarRecord(writeCtx, database, record)
-		if err != nil {
-			h.totalErrors.Add(1)
-			// Logged by reason, not as an ingest error (#1268).
-			if ingest.IsWriteRefusal(err) {
-				return respondWriteRefused(c, err)
-			}
-			// A client error (#440), refused before the WAL.
-			if errors.Is(err, ingest.ErrColumnTypeChange) {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
-			}
-			metrics.Get().IncIngestErrors()
-			h.logger.Error().
-				Err(err).
-				Str("database", database).
-				Str("measurement", measurement).
-				Int("records", len(record.Columns["time"])).
-				Msg("Failed to write to Arrow buffer")
-			// Schema-churn rejection is retryable — surface as 503 so
-			// upstream senders back off rather than treating this as a
-			// permanent server error. See ingest.ErrSchemaChurnExceeded.
-			// A write that arrives after its shard was flushed by shutdown is
-			// refused, not lost: the record is still in the WAL. 503 so the client
-			// retries (elsewhere, during a rolling restart) instead of treating a
-			// shutdown race as a permanent server error.
-			if errors.Is(err, ingest.ErrBufferClosing) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-					"error": "Write rejected (server shutting down): " + err.Error(),
-				})
-			}
-			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-					"error": "Write rejected (schema churn): " + err.Error(),
-				})
-			}
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "Write failed: " + err.Error(),
-			})
-		}
+	// One buffer call per measurement, so a failure can follow measurements
+	// already buffered (#1437): see writeLPMeasurements.
+	written := len(records)
+	var stop *lpStop
+	written, dropped, drops, stop = h.writeLPMeasurements(measurements, written, dropped, drops, func(m string) (int, error) {
+		record := columnarByMeasurement[m]
+		return len(record.Columns["time"]), lpWriteRecord(h.buffer, writeCtx, database, record)
+	})
+	if stop != nil {
+		return h.answerLPStop(c, database, stop, drops)
 	}
 
 	// Record global metrics
 	m := metrics.Get()
 	m.IncLineProtocolRequests()
-	m.IncLineProtocolRecords(int64(len(records)))
+	m.IncLineProtocolRecords(int64(written))
 	m.IncLineProtocolBytes(int64(len(body)))
-	m.IncIngestRecords(int64(len(records)))
+	m.IncIngestRecords(int64(written))
 	m.IncIngestBytes(int64(len(body)))
 	m.IncIngestBatches()
 
@@ -512,25 +492,14 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 	}
 	defer release()
 
-	for _, m := range measurements {
-		if err := h.buffer.WriteTypedColumnarDirect(writeCtx, database, m, batches[m], rows[m]); err != nil {
-			h.totalErrors.Add(1)
-			if ingest.IsWriteRefusal(err) {
-				return respondWriteRefused(c, err)
-			}
-			if errors.Is(err, ingest.ErrColumnTypeChange) {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
-			}
-			metrics.Get().IncIngestErrors()
-			h.logger.Error().Err(err).Str("database", database).Str("measurement", m).Int("records", rows[m]).Msg("Failed to write to Arrow buffer")
-			if errors.Is(err, ingest.ErrBufferClosing) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (server shutting down): " + err.Error()})
-			}
-			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (schema churn): " + err.Error()})
-			}
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
-		}
+	// One buffer call per measurement, so a failure can follow measurements
+	// already buffered (#1437): see writeLPMeasurements.
+	var stop *lpStop
+	total, dropped, drops, stop = h.writeLPMeasurements(measurements, total, dropped, drops, func(m string) (int, error) {
+		return rows[m], lpWriteTyped(h.buffer, writeCtx, database, m, batches[m], rows[m])
+	})
+	if stop != nil {
+		return h.answerLPStop(c, database, stop, drops)
 	}
 
 	m := metrics.Get()
@@ -609,3 +578,116 @@ func (h *LineProtocolHandler) GetStats() map[string]int64 {
 // to decompressGzipPooled. Keeping this comment as a tombstone so
 // future code review sees the decision rather than wondering why LP
 // has its own pooled-gzip helper next door (it doesn't anymore).
+
+// The buffer calls of a line-protocol write, swapped by tests to fail a
+// chosen measurement (#1437).
+var (
+	lpWriteTyped  = (*ingest.ArrowBuffer).WriteTypedColumnarDirect
+	lpWriteRecord = (*ingest.ArrowBuffer).WriteColumnarRecord
+)
+
+// lpStop is a line-protocol write whose buffer call for measurement failed.
+// written are the measurements buffered before it, in write order; empty when
+// nothing was.
+type lpStop struct {
+	measurement string
+	err         error
+	written     []string
+	rowsWritten int64
+}
+
+// writeLPMeasurements writes a line-protocol body's measurements in order,
+// one buffer call each (write returns the measurement's rows and the call's
+// error), and returns rows, dropped and drops updated for what it left out.
+//
+// A measurement refused for its content before the WAL (#440, #1342) is
+// dropped and the others are still written: a partial write, as for a point
+// that cannot be stored. Any other failure stops the write: the stop says
+// what was buffered before it, because an answer that reads as "nothing was
+// written" would have the client resend, and write the buffered part again
+// (#1437). When every measurement was refused for its content, the stop
+// carries the first refusal and nothing written.
+//
+// The success path adds rows and moves on: what was written is worked out
+// from the index only when a call fails.
+func (h *LineProtocolHandler) writeLPMeasurements(measurements []string, rows, dropped int, drops []ingest.LPDrop, write func(string) (int, error)) (int, int, []ingest.LPDrop, *lpStop) {
+	var contentDropped map[string]bool
+	var firstContent *lpStop
+	var rowsWritten int64
+	for i, m := range measurements {
+		n, err := write(m)
+		if err == nil {
+			rowsWritten += int64(n)
+			continue
+		}
+		if ingest.IsContentRefusal(err) {
+			if contentDropped == nil {
+				contentDropped = map[string]bool{}
+				firstContent = &lpStop{measurement: m, err: err}
+			}
+			contentDropped[m] = true
+			drops = append(drops, ingest.LPDrop{Measurement: m, Reason: err.Error(), Points: n})
+			dropped += n
+			rows -= n
+			continue
+		}
+		stop := &lpStop{measurement: m, err: err, rowsWritten: rowsWritten}
+		for _, w := range measurements[:i] {
+			if !contentDropped[w] {
+				stop.written = append(stop.written, w)
+			}
+		}
+		return rows, dropped, drops, stop
+	}
+	if firstContent != nil && len(contentDropped) == len(measurements) {
+		return rows, dropped, drops, firstContent
+	}
+	return rows, dropped, drops, nil
+}
+
+// answerLPStop answers a line-protocol write that stopped. With nothing
+// written it is the answer the failure always had: nothing was written, so a
+// refusal's "retry" is true. With part written, see respondWriteStopped.
+func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *lpStop, drops []ingest.LPDrop) error {
+	h.totalErrors.Add(1)
+	err := stop.err
+	if len(stop.written) > 0 {
+		if len(drops) > 0 {
+			logPointDrops(h.logger, "Line protocol", database, drops)
+		}
+		m := metrics.Get()
+		m.IncLineProtocolRecords(stop.rowsWritten)
+		m.IncIngestRecords(stop.rowsWritten)
+		return respondWriteStopped(c, h.logger, "Line protocol", database, &ingest.WriteStoppedError{
+			Err: err, RowsWritten: stop.rowsWritten, RecordsWritten: stop.rowsWritten,
+			// In name order already: both paths write the sorted list.
+			Written: stop.written, StoppedAt: stop.measurement, Drops: drops,
+		})
+	}
+	// Logged by reason, not as an ingest error (#1268).
+	if ingest.IsWriteRefusal(err) {
+		return respondWriteRefused(c, err)
+	}
+	// A client error (#440, #1342), refused before the WAL.
+	if ingest.IsContentRefusal(err) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	metrics.Get().IncIngestErrors()
+	h.logger.Error().Err(err).Str("database", database).Str("measurement", stop.measurement).Msg("Failed to write to Arrow buffer")
+	// Schema-churn rejection is retryable — surface as 503 so upstream
+	// senders back off rather than treating this as a permanent server
+	// error. See ingest.ErrSchemaChurnExceeded. A write that arrives after
+	// its shard was flushed by shutdown is refused: 503 so the client
+	// retries (elsewhere, during a rolling restart) instead of treating a
+	// shutdown race as a permanent server error. Nothing of this request
+	// was buffered; with the WAL on and no WAL coverage, the refused record
+	// itself is kept in the WAL (counted WAL-only) and replayed at the next
+	// start, so the retry can duplicate it.
+	if errors.Is(err, ingest.ErrBufferClosing) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (server shutting down): " + err.Error()})
+	}
+	if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (schema churn): " + err.Error()})
+	}
+	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
+}
