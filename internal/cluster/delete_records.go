@@ -116,6 +116,8 @@ func (c *Coordinator) deleteAckLoop(ctx context.Context, fsm *raft.ClusterFSM) {
 		for _, r := range fsm.UnackedDeleteRecords(inst) {
 			// Writes are refused from the moment the record applied here, so
 			// what the flush hands off is everything acknowledged before it.
+			// A line-protocol request is refused at admission, not per
+			// measurement (#1422).
 			actx, cancel := context.WithTimeout(ctx, claimantSyncBudget)
 			marks, err := st.buffer.FlushScopeAndWait(actx, r.Database, r.Measurement)
 			if err != nil {
