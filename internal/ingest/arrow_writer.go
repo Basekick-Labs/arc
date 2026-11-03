@@ -3081,9 +3081,9 @@ func noRelease() {}
 // several at once, cannot run the volume past its reserve, and released as
 // the request's appends reach the WAL queue, or when release runs. Writes
 // under the context skip their own disk pressure check, so pressure that
-// starts part-way cannot leave the request half written; fencing is still
-// checked per call (AdmitWholeRequest checks it once). With no disk gate ctx
-// is returned unchanged.
+// starts part-way cannot leave the request half written; the ingest gate is
+// still checked per call (AdmitWholeRequest checks it once). With no disk gate
+// ctx is returned unchanged.
 func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
 		if err := (*g)(); err != nil {
@@ -3105,25 +3105,31 @@ func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context
 	return context.WithValue(ctx, walDiskAdmittedKey{}, r), r.release, nil
 }
 
-// fenceAdmittedKey marks a context whose request passed the ingest gate as a
-// whole (AdmitWholeRequest).
+// fenceAdmittedKey marks a context whose request passed the ingest gate (the
+// fence and stream-takeover pauses) as a whole (AdmitWholeRequest).
 type fenceAdmittedKey struct{}
 
-// AdmitWholeRequest is AdmitRequest for a request written promptly as several
-// buffer calls, such as a line-protocol body of several measurements: writes
-// under the returned context skip the fence check too, so the gate is checked
-// once for the whole request, as ArrowBuffer.Write checks it for a MessagePack
-// batch. Checked per call, a fence that closed part-way refused the request
-// after its earlier measurements were buffered, with an answer saying nothing
-// was written, and a client retrying it as told duplicated them (#1422). A
-// fence that closes after admission lets the rest of the request through.
+// AdmitWholeRequest is AdmitRequest for a request written as several buffer
+// calls, such as a line-protocol body of several measurements: writes under
+// the returned context skip the ingest gate (the fence and stream-takeover
+// pauses) too, so it is checked once for the whole request, as
+// ArrowBuffer.Write checks it for a MessagePack batch. Checked per call, a
+// gate that closed part-way stopped the request after its earlier
+// measurements were buffered, and a client resending it duplicated them
+// (#1422). A request admitted before the gate closes is not refused by it
+// part-way, however long its buffer calls take (schema-change flushes,
+// durable WAL syncs). Other failures can still stop it part-way.
 //
-// A long-running write (an import) uses AdmitRequest instead, so a fence still
-// stops it part-way.
+// A long-running write (an import) uses AdmitRequest instead, so the gate
+// still stops it part-way. With no ingest gate (a standalone node) there is
+// nothing to skip, and ctx is returned as AdmitRequest returns it.
 func (b *ArrowBuffer) AdmitWholeRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
 	ctx, release, err := b.AdmitRequest(ctx, walBytes)
 	if err != nil {
 		return ctx, release, err
+	}
+	if g := b.ingestGate.Load(); g == nil || *g == nil {
+		return ctx, release, nil
 	}
 	return context.WithValue(ctx, fenceAdmittedKey{}, true), release, nil
 }
