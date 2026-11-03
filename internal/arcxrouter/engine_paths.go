@@ -78,6 +78,24 @@ func engineParquetEntries(
 	if timeRange == nil {
 		return nil, false
 	}
+	// Only a range the query bounds on both sides is pruned. A start-only
+	// predicate (`time > now() - INTERVAL '1 hour'`, the dashboard shape) gets
+	// an ASSUMED end of now+24h, and pruning to it would drop rows stamped past
+	// that end (forecasts, devices whose clocks run ahead). The DuckDB path
+	// keeps them by adding the partitions that exist past the assumed end, and
+	// the newest partition for an empty window (pruning/open_end.go, called
+	// from PartitionPruner.optimize). This path does not do that yet, so it
+	// takes the full listing instead: correct, and as slow as before #661.
+	//
+	// TODO(arcx, #661): when arcx work resumes, prune start-only ranges too by
+	// reusing discoverOpenEnd/appendBeyond (with a future-stamped partition
+	// test for both shapes). Also stop logging here per query:
+	// GeneratePartitionPaths logs "Generated partition paths" at Info and bumps
+	// QueriesOptimized, which the DuckDB path does only on a partitionCache
+	// miss but this path does on every routed query.
+	if timeRange.EndAssumed {
+		return nil, false
+	}
 	// GeneratePartitionPaths treats End as exclusive. Include its containing
 	// hour even when the SQL uses an inclusive upper bound; the engine's WHERE
 	// clause then removes rows beyond an exclusive upper bound as usual.

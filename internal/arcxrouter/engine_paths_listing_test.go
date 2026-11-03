@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -161,6 +163,59 @@ func TestEngineParquetEntries_NormalizedBasePaths(t *testing.T) {
 			actual, pruned := engineParquetEntries(context.Background(), local, ShapeDateTruncCent, "prod", "cpu", "time >= '2026-02-03T10:00:00Z' AND time < '2026-02-03T11:00:00Z'", nil, pruning.NewPartitionPruner(zerolog.Nop()))
 			if !pruned || !reflect.DeepEqual(actual, []string{key}) {
 				t.Fatalf("entries = %v, pruned = %v; want %s", actual, pruned, key)
+			}
+		})
+	}
+}
+
+// A start-only range has an assumed end (now+24h). Pruning to it would drop a
+// partition stamped past that end, which the DuckDB path keeps
+// (pruning/open_end.go), so this path declines and takes the full listing.
+func TestEngineQueryEntries_StartOnlyRangeKeepsFutureStampedPartitions(t *testing.T) {
+	base := t.TempDir()
+	local, err := storage.NewLocalBackend(base, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	keys := []string{
+		"prod/cpu/" + now.Add(-30*time.Minute).Format("2006/01/02/15") + "/current.parquet",
+		"prod/cpu/" + now.Add(72*time.Hour).Format("2006/01/02/15") + "/future.parquet",
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		full := filepath.Join(base, key)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("local fixture"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := now.Add(-time.Hour).Format(time.RFC3339)
+	cases := []struct {
+		name  string
+		shape string
+		where string
+		preds []scanPred
+	}{
+		{"date_trunc now()", ShapeDateTruncCent, "time > now() - INTERVAL '1 hour'", nil},
+		{"date_trunc literal", ShapeDateTruncCent, "time >= '" + start + "'", nil},
+		{"flat scan literal", ShapeScan, "", []scanPred{{col: "time", op: ">=", str: start, isStr: true}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pruner := pruning.NewPartitionPruner(zerolog.Nop())
+			if _, pruned := engineParquetEntries(context.Background(), local, tc.shape, "prod", "cpu", tc.where, tc.preds, pruner); pruned {
+				t.Fatal("a start-only range was pruned to its assumed end")
+			}
+			got, err := engineQueryEntries(context.Background(), local, tc.shape, "prod", "cpu", tc.where, tc.preds, pruner, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sort.Strings(got)
+			if !reflect.DeepEqual(got, keys) {
+				t.Fatalf("entries = %v, want %v (the future-stamped partition must be kept)", got, keys)
 			}
 		})
 	}
