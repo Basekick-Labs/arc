@@ -116,6 +116,10 @@
               "minimum": 1,
               "maximum": 256
             },
+            "pullBytesPerSecond": {
+              "type": "integer",
+              "minimum": 0
+            },
             "fetchTimeoutMs": {
               "type": "integer",
               "minimum": 1000

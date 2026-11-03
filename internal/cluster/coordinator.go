@@ -199,8 +199,9 @@ type Coordinator struct {
 	// puller is the background worker pool that downloads files from peers.
 	// Nil when peer replication is disabled or the license forbids it.
 	puller *filereplication.Puller
-	// fetcher is the puller's fetch client: the stream claimant probes peers
-	// for a file with it (#1207 S4b1c2b).
+	// fetcher is a peer fetch client with the puller's settings but without
+	// its bandwidth cap (#397): the stream claimant probes peers for a file
+	// with it (#1207 S4b1c2b), and the staged compaction commit pulls outputs.
 	fetcher filereplication.Fetcher
 	// pendingRegistration reports whether a path waits for registration in
 	// this writer's outbox (nil on other nodes).
@@ -4387,14 +4388,28 @@ func (c *Coordinator) startFilePullerLocked() error {
 
 	// Build the fetch client. Reuses cluster TLS (PR #382) so peer transfers
 	// run under the cluster PKI, not the public API cert.
-	fetchClient, err := filereplication.NewFetchClient(filereplication.FetchClient{
+	fetchSpec := filereplication.FetchClient{
 		SelfNodeID:            c.localNode.ID,
 		ClusterName:           c.cfg.ClusterName,
 		SharedSecret:          c.cfg.SharedSecret,
 		TLSConfig:             c.tlsConfig,
 		DialTimeout:           10 * time.Second,
 		ResponseHeaderTimeout: fetchTimeout,
-	})
+	}
+	// cluster.replication_pull_bytes_per_second (#397) caps the puller only,
+	// through one client its workers share. The staged compaction commit and
+	// the claimant's probes use an uncapped client: a staged fetch starts from
+	// byte zero every time and the origin ends any body at
+	// replication_serve_timeout_ms, so a capped one could never deliver an
+	// output above serve timeout x cap, and the partition would be compacted
+	// again and aborted again on every cycle.
+	directFetchClient, err := filereplication.NewFetchClient(fetchSpec)
+	if err != nil {
+		return fmt.Errorf("build fetch client: %w", err)
+	}
+	pullSpec := fetchSpec
+	pullSpec.BytesPerSecond = c.cfg.ReplicationPullBytesPerSecond
+	fetchClient, err := filereplication.NewFetchClient(pullSpec)
 	if err != nil {
 		return fmt.Errorf("build fetch client: %w", err)
 	}
@@ -4611,7 +4626,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// Start the puller workers.
 	puller.Start(context.Background())
 	c.puller = puller
-	c.fetcher = fetchClient
+	c.fetcher = directFetchClient
 	// The staged compaction commit (#1207 d2a2a), once the puller and the
 	// fetch client it uses are in place: pull staged outputs, move committed
 	// ones into place, sweep leftovers; abort orphans as leader. This node

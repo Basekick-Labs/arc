@@ -396,7 +396,10 @@ func TestBufferMetricsCloseDrainMovesQueuedToInFlight(t *testing.T) {
 	awaitBufferRecordMetrics(t, 20, 10)
 
 	done := make(chan int, 1)
-	go func() { done <- buf.drainAndFlushQueue(time.Now().Add(time.Minute)) }()
+	go func() {
+		withWAL, lost := buf.drainAndFlushQueue(time.Now().Add(time.Minute))
+		done <- withWAL + lost
+	}()
 	awaitStarted(t, backend) // the drain is flushing one task (parallelism 1)
 	awaitBufferRecordMetrics(t, 10, 20)
 	release()
@@ -413,8 +416,10 @@ func TestBufferMetricsCloseDropReleasesQueued(t *testing.T) {
 	writeMetricsRecords(t, buf, 20)
 	awaitBufferRecordMetrics(t, 20, 10)
 
-	if unwritten := buf.drainAndFlushQueue(time.Now().Add(-time.Second)); unwritten != 20 {
-		t.Fatalf("drain past the deadline left %d records unwritten, want 20", unwritten)
+	// No WAL on this buffer: the 20 unattempted rows are lost, not preserved
+	// (#1377).
+	if withWAL, lost := buf.drainAndFlushQueue(time.Now().Add(-time.Second)); withWAL != 0 || lost != 20 {
+		t.Fatalf("drain past the deadline: %d unwritten with a WAL copy and %d lost, want 0 and 20", withWAL, lost)
 	}
 	awaitBufferRecordMetrics(t, 0, 10)
 }

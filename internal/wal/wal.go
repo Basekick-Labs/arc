@@ -660,8 +660,12 @@ type Writer struct {
 	FailedSyncs    int64 // Syncs that returned an error
 	TotalRotations int64
 	DroppedEntries int64 // Entries dropped due to full buffer
-	FailedWrites   int64 // Entries the writer loop could not write (lost)
-	DiskFullWrites int64 // FailedWrites whose error was ENOSPC or EDQUOT
+	// RetractionsFailed counts refused writes whose WAL entries could not be
+	// retracted by checkpoint (#1438): they may come back at the next start.
+	RetractionsFailed int64
+	lastRetractLog    atomic.Int64 // unix nanos of the last failed-retraction Error line
+	FailedWrites      int64        // Entries the writer loop could not write (lost)
+	DiskFullWrites    int64        // FailedWrites whose error was ENOSPC or EDQUOT
 	// RecoveredWrites counts failed entry writes the retry on a new WAL file
 	// recovered: nothing was lost, but the WAL file or its device failed.
 	RecoveredWrites int64
@@ -1461,7 +1465,7 @@ func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, erro
 	var dones []chan error
 	for _, chunk := range chunks {
 		if !trackedPayloadFits(len(chunk), 0) {
-			w.releasePending(hashes) // earlier chunks would otherwise pin the floor (#676)
+			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
 		token, done, err := w.appendTrackedEntry(nil, chunk)
@@ -1471,7 +1475,10 @@ func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, erro
 			// nil and cannot release them. Unreleased, each pins the floor for
 			// the life of the process, and because PurgeFlushed stops at the
 			// first retained file the WAL never reclaims anything again (#676).
-			w.releasePending(hashes)
+			// They also reach the file untracked (and, in durable mode, the
+			// write is refused), so they are retracted, not only released
+			// (#1438).
+			w.retractEnqueued(hashes)
 			return nil, err
 		}
 		hashes = append(hashes, token)
@@ -1513,7 +1520,7 @@ func (w *Writer) appendRawWithMetaTracked(database string, payload []byte) ([]st
 	var dones []chan error
 	for _, chunk := range chunks {
 		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
-			w.releasePending(hashes) // earlier chunks would otherwise pin the floor (#676)
+			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
 		token, done, err := w.appendTrackedEntry(envHeader, chunk)
@@ -1523,7 +1530,10 @@ func (w *Writer) appendRawWithMetaTracked(database string, payload []byte) ([]st
 			// nil and cannot release them. Unreleased, each pins the floor for
 			// the life of the process, and because PurgeFlushed stops at the
 			// first retained file the WAL never reclaims anything again (#676).
-			w.releasePending(hashes)
+			// They also reach the file untracked (and, in durable mode, the
+			// write is refused), so they are retracted, not only released
+			// (#1438).
+			w.retractEnqueued(hashes)
 			return nil, err
 		}
 		hashes = append(hashes, token)
@@ -1811,8 +1821,9 @@ func (w *Writer) awaitDurable(tokens []string, dones []chan error) error {
 		}
 	}
 	if firstErr != nil {
-		w.releasePending(tokens)
-		w.signalPurge()
+		// Not durable is not "not written": the entries may still reach the
+		// file, and the write is refused, so they are retracted (#1438).
+		w.retractEnqueued(tokens)
 		return fmt.Errorf("%w: %v", ErrNotDurable, firstErr)
 	}
 	return nil
@@ -1971,12 +1982,12 @@ func (w *Writer) appendRawTracked(payload []byte) ([]string, error) {
 	var dones []chan error
 	for _, chunk := range chunks {
 		if len(chunk) > MaxWALPayloadSize-walTrackedHeaderSize {
-			w.releasePending(hashes)
+			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
 		hash, done, err := w.appendTrackedEntry(nil, chunk)
 		if err != nil {
-			w.releasePending(hashes)
+			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, err
 		}
 		hashes = append(hashes, hash)
@@ -2321,6 +2332,62 @@ func (w *Writer) coversForeignIdentity(hashes []string) bool {
 	return false
 }
 
+// retractEnqueued takes back the entries a failed append had already
+// enqueued (#1438): the caller gets no tokens, so nothing else would
+// checkpoint them, and in durable mode the write is refused while they may
+// reach the file. See RetractTracked.
+func (w *Writer) retractEnqueued(tokens []string) {
+	w.RetractTracked(tokens)
+}
+
+// RetractTracked checkpoints tracked entries of a write that was refused after
+// they were appended, so recovery never replays what the client was told was
+// not written (#1438), and releases them from the purge floor. A durable
+// writer waits for the checkpoint (admission bounded by retractTimeout); a
+// queued one enqueues it like a flush checkpoint. If the checkpoint cannot be
+// written the entries are only released, as before (they may come back at the
+// next start): counted in RetractionsFailed and arc_wal_retractions_failed_total,
+// and logged at Error at most once per retractLogInterval. Reports whether
+// they were retracted.
+func (w *Writer) RetractTracked(tokens []string) bool {
+	if len(tokens) == 0 {
+		return true
+	}
+	var err error
+	if w.config.AckMode == AckModeDurable {
+		ctx, cancel := context.WithTimeout(context.Background(), retractTimeout)
+		err = w.MarkFlushedContext(ctx, tokens)
+		cancel()
+	} else {
+		err = w.MarkFlushed(tokens)
+	}
+	if err == nil {
+		return true
+	}
+	w.releasePending(tokens)
+	w.signalPurge()
+	atomic.AddInt64(&w.RetractionsFailed, 1)
+	metrics.Get().IncWALRetractionsFailed(1)
+	// Sampled: a failing WAL disk fails every retraction, and logging each
+	// would flood the log at the worst moment.
+	now := time.Now().UnixNano()
+	last := w.lastRetractLog.Load()
+	if now-last >= int64(retractLogInterval) && w.lastRetractLog.CompareAndSwap(last, now) {
+		w.logger.Error().Err(err).Int("entries", len(tokens)).
+			Int64("retractions_failed_total", atomic.LoadInt64(&w.RetractionsFailed)).
+			Msg("WAL entries of a refused write could not be retracted; they may be replayed at the next start, duplicating rows the client was told were not written")
+	}
+	return false
+}
+
+// retractTimeout bounds how long a retraction waits to be admitted to a full
+// queue. Past it the write is refused without its retraction.
+const retractTimeout = 5 * time.Second
+
+// retractLogInterval is the least time between two Error lines for failed
+// retractions (each is counted regardless).
+const retractLogInterval = 10 * time.Second
+
 // releasePending drops identities from the unflushed set. Every release of
 // the purge floor goes through here (MarkFlushed, ReleaseRegistered,
 // ForgetTracked), so it is where the purge is told the floor may have moved.
@@ -2545,6 +2612,7 @@ func (w *Writer) Stats() map[string]interface{} {
 		"current_age_seconds": age.Seconds(),
 		"sync_mode":           string(w.config.SyncMode),
 		"total_entries":       atomic.LoadInt64(&w.TotalEntries),
+		"retractions_failed":  atomic.LoadInt64(&w.RetractionsFailed),
 		"total_bytes":         atomic.LoadInt64(&w.TotalBytes),
 		"total_syncs":         atomic.LoadInt64(&w.TotalSyncs),
 		"failed_syncs":        atomic.LoadInt64(&w.FailedSyncs),
