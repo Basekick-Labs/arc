@@ -1173,7 +1173,8 @@ an unbounded operation.
 ### Time-bounded arcx queries avoid listing unrelated partitions ([#661](https://github.com/Basekick-Labs/arc/issues/661))
 
 The arcx router now uses validated time bounds to list only matching hour or
-day partitions for date-trunc queries and flat AND scans. Other query shapes
+day partitions for date-trunc queries and flat AND scans. Pruned lists skip
+directories and preserve the existing treatment of symlinks. Other query shapes
 keep the existing full-list fallback.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1293](https://github.com/Basekick-Labs/arc/pull/1293).

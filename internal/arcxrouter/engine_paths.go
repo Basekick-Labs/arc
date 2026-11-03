@@ -2,6 +2,7 @@ package arcxrouter
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -48,6 +49,7 @@ func engineParquetEntries(
 	}
 
 	entries := make([]string, 0, len(patterns))
+	checkedDirs := make(map[string]bool)
 	for _, pattern := range patterns {
 		if err := ctx.Err(); err != nil {
 			return nil, false
@@ -68,6 +70,31 @@ func engineParquetEntries(
 			// keys rejected by storage validation are not queryable objects.
 			if strings.HasPrefix(filepath.Base(match), ".") || storage.ValidateKey(rel) != nil {
 				continue
+			}
+			info, err := os.Lstat(match)
+			if err != nil {
+				return nil, false
+			}
+			if info.IsDir() {
+				continue
+			}
+			// Glob traverses directory symlinks; LocalBackend.List's WalkDir does
+			// not. Fall back rather than introduce files from a linked directory.
+			// Lstat preserves List's existing treatment of terminal file symlinks.
+			for dir := filepath.Dir(match); dir != basePath; dir = filepath.Dir(dir) {
+				// ValidateKey(rel) established containment; still decline if a
+				// root is reached unexpectedly instead of looping at that root.
+				if parent := filepath.Dir(dir); parent == dir {
+					return nil, false
+				}
+				if checkedDirs[dir] {
+					break
+				}
+				info, err := os.Lstat(dir)
+				if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+					return nil, false
+				}
+				checkedDirs[dir] = true
 			}
 			entries = append(entries, rel)
 		}
