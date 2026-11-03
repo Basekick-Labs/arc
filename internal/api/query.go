@@ -3274,30 +3274,6 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 // TestDynamicSQLFunctionPattern_Family pins the set.
 var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|json_execute_serialized_sql)\s*\(`)
 
-// rejectUserStorageReads keeps user-supplied filesystem readers and replacement
-// scans out of transformed SQL; only storage paths emitted by Arc are allowed.
-func rejectUserStorageReads(sql string) error {
-	ioNormalised := ioDenylistNormalise(sql)
-	if match := ioTableFunctionPattern.FindStringSubmatch(ioNormalised); match != nil {
-		return &SQLValidationError{Message: "File I/O function not allowed in user SQL: " + match[1] + "()"}
-	}
-	if match := dynamicSQLFunctionPattern.FindStringSubmatch(ioNormalised); match != nil {
-		return &SQLValidationError{Message: "Dynamic SQL function not allowed in user SQL: " + match[1] + "()"}
-	}
-
-	maskInput := backticksToDoubleQuotes(sql)
-	features := scanSQLFeatures(maskInput)
-	normalised, masks := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
-	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
-	if stringLiteralInTablePosition(normalised) {
-		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
-	}
-	if name := invalidQuotedIdentifierInTablePosition(normalised, sqlutil.IdentifierNames(masks)); name != "" {
-		return &SQLValidationError{Message: "Quoted identifier in table position is not a valid database or measurement name (replacement scans are disabled): " + name}
-	}
-	return nil
-}
-
 func (h *QueryHandler) queryTransformCacheKey(sql, headerDB string) string {
 	cacheKey := h.pruner.CacheEpoch(sql) + ":" + strconv.FormatUint(h.openCompactionsGeneration(), 10) + ":" + sql
 	if headerDB != "" {
@@ -3315,14 +3291,12 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 }
 
 func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
-	if err := rejectUserStorageReads(sql); err != nil {
-		return "", false, nil, err
-	}
-
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
-		return sql, true, nil, nil // User-supplied readers were rejected above.
+		// Nothing Arc emitted, so no scope to report: a user-supplied reader
+		// never gets here, ValidateSQLRequest refuses it on every endpoint.
+		return sql, true, nil, nil
 	}
 
 	// Fast path: queries without FROM or JOIN don't need table transformation
@@ -3391,9 +3365,6 @@ func (h *QueryHandler) getTransformedSQLForQuery(ctx context.Context, sql string
 }
 
 func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
-	if err := rejectUserStorageReads(sql); err != nil {
-		return "", false, nil, err
-	}
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution

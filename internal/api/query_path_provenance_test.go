@@ -9,8 +9,10 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-func TestGetTransformedSQLRejectsUserStoragePaths(t *testing.T) {
-	h := newParityTestHandler()
+// The #764 shapes: a user-supplied reader or replacement scan. Each is refused
+// by ValidateSQLRequest, which every query endpoint runs before the transform,
+// so the transform never sees one.
+func TestValidateSQLRequestRejectsUserStoragePaths(t *testing.T) {
 	const root = "./data/db2/**/*.parquet"
 	for _, tc := range []struct{ name, sql string }{
 		{"read_parquet", "SELECT * FROM read_parquet('" + root + "')"},
@@ -23,11 +25,8 @@ func TestGetTransformedSQLRejectsUserStoragePaths(t *testing.T) {
 		{"nested reader with authorised table", "SELECT * FROM db1.cpu WHERE x IN (SELECT y FROM read_parquet('" + root + "'))"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, _, err := h.getTransformedSQL(context.Background(), tc.sql, ""); err == nil {
-				t.Fatalf("getTransformedSQL accepted a user-supplied storage path in %q", tc.sql)
-			}
-			if _, _, err := h.getTransformedSQLForQuery(context.Background(), tc.sql, "db1"); err == nil {
-				t.Fatalf("getTransformedSQLForQuery accepted a user-supplied storage path in %q", tc.sql)
+			if err := ValidateSQLRequest(tc.sql); err == nil {
+				t.Fatalf("ValidateSQLRequest accepted a user-supplied storage path in %q", tc.sql)
 			}
 		})
 	}

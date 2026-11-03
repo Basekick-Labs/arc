@@ -2039,11 +2039,19 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Query transformations check emitted storage scopes against RBAC ([#1261](https://github.com/Basekick-Labs/arc/pull/1261))
+### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
 
-Queries check database and measurement scopes resolved by the transform before
-execution, including cached transforms and ArcX dispatch. User-supplied file
-readers and replacement scans are also rejected at the transform boundary.
+With RBAC on, a query's permission check reads the table names in the SQL it
+receives, and the query transform separately turns those names into the
+storage paths that are read. Where the two disagreed about a name, the query
+read a database and measurement that nobody checked (#986 fixed three such
+cases). The transform now records every database and measurement it reads,
+including on a cached transform, and any the permission check did not cover
+is checked before the query runs: a query refused there answers 403, on
+`/api/v1/query`, `/api/v1/query/arrow`, `/api/v1/query/estimate` and `GET
+/api/v1/query/:measurement`. The extra RBAC lookup runs only for a read the
+permission check missed; recording the reads adds about 3-5% to the
+transform.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
 
