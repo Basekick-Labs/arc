@@ -2195,8 +2195,10 @@ So the list and the measurements endpoint now answer by the rule `GET
 /api/v1/databases/:name` uses: a database is its marker, a file, a cold-tier
 row, or a cluster manifest entry, and directories alone are not one. The list
 already reads every file, so a database with a file or a cold-tier row costs
-nothing extra; only a database with neither is checked. `SHOW DATABASES`
-still reads directories.
+nothing extra; only a database with neither is checked. `SHOW DATABASES`,
+which read only directories, now checks each one for its first file (one
+listing request on an object store, up to 16 at once; a database with only
+its marker costs one more), and leaves out those that hold nothing.
 
 For a database without a marker, which is every database created by a write
 rather than by `POST /api/v1/databases`, `GET /api/v1/databases/:name` now

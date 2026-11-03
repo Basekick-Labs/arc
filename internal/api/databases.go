@@ -1348,6 +1348,24 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	return h.databaseHasContent(ctx, name)
 }
 
+// databaseHasHotFiles reports whether the backend holds a listable file under
+// the database, stopping at the first (storage.PrefixProber) where the backend
+// can. A store that does not exist yet holds none (#945).
+func databaseHasHotFiles(ctx context.Context, backend storage.Backend, name string) (bool, error) {
+	if pp, ok := backend.(storage.PrefixProber); ok {
+		hit, err := pp.HasObjectsUnderPrefix(ctx, name+"/")
+		if err != nil && !storage.IsStoreNotFound(err) {
+			return false, err
+		}
+		return hit, nil
+	}
+	files, err := backend.List(ctx, name+"/")
+	if err != nil && !storage.IsStoreNotFound(err) {
+		return false, err
+	}
+	return len(files) > 0, nil
+}
+
 // databaseHasContent reports whether the database holds anything: a hot file,
 // a cold-tier row, or (in a cluster) a manifest entry. Its directories do not
 // count: a store that keeps empty prefixes (SeaweedFS) keeps a deleted
@@ -1357,19 +1375,9 @@ func (h *DatabasesHandler) databaseHasContent(ctx context.Context, name string) 
 	// The first file answers: a database can hold millions, and listing them
 	// all to ask whether there is one was the cost of every GET of a
 	// database without a marker.
-	var found bool
-	if pp, ok := h.storage.(storage.PrefixProber); ok {
-		hit, err := pp.HasObjectsUnderPrefix(ctx, name+"/")
-		if err != nil && !storage.IsStoreNotFound(err) {
-			return false, err
-		}
-		found = hit
-	} else {
-		files, err := h.storage.List(ctx, name+"/")
-		if err != nil && !storage.IsStoreNotFound(err) {
-			return false, err
-		}
-		found = len(files) > 0
+	found, err := databaseHasHotFiles(ctx, h.storage, name)
+	if err != nil {
+		return false, err
 	}
 	if found {
 		return true, nil

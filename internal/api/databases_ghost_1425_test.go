@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
@@ -278,5 +279,67 @@ func TestDatabasesHandler_ListChecksOnlyDatabasesWithNothingFound(t *testing.T) 
 	sort.Strings(checked)
 	if !equalStrings(checked, []string{"empty", "ghost"}) {
 		t.Errorf("databases checked one by one = %v, want [empty ghost]: one with a file or a cold row costs nothing", checked)
+	}
+}
+
+// showDatabases runs SHOW DATABASES against the backend and returns the names.
+func showDatabases(t *testing.T, backend storage.Backend) []string {
+	t.Helper()
+	dir := t.TempDir()
+	duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 1, MaxConnections: 2, LocalStorageRoot: dir, TempDirectory: dir}, zerolog.Nop())
+	if err != nil {
+		t.Skipf("DuckDB: %v", err)
+	}
+	t.Cleanup(func() { duck.Close() })
+	app := fiber.New()
+	NewQueryHandler(duck, backend, zerolog.Nop(), 30, 1000).RegisterRoutes(app)
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"sql":"SHOW DATABASES"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("SHOW DATABASES: status %d: %s", resp.StatusCode, body)
+	}
+	var out struct {
+		Data [][]any `json:"data"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("SHOW DATABASES: %v: %s", err, body)
+	}
+	names := make([]string, 0, len(out.Data))
+	for _, row := range out.Data {
+		names = append(names, row[0].(string))
+	}
+	return names
+}
+
+// SHOW DATABASES reads directories too, so it showed a deleted database on a
+// store that keeps empty prefixes; a failed check still shows the database.
+func TestShowDatabases_EmptyPrefixesAreNotADatabase(t *testing.T) {
+	ctx := context.Background()
+	local, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	if err := local.Write(ctx, "live/cpu/2026/01/01/00/a.parquet", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Write(ctx, "empty/.arc-database", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	probing := &ghostProbingBackend{LocalBackend: local, ghostPrefixes: ghostPrefixes{local}}
+	if got := showDatabases(t, probing); !equalStrings(got, []string{"empty", "live"}) {
+		t.Errorf("SHOW DATABASES = %v, want [empty live]", got)
+	}
+	listing := ghostListingBackend{Backend: local, ghostPrefixes: ghostPrefixes{local}}
+	if got := showDatabases(t, listing); !equalStrings(got, []string{"empty", "live"}) {
+		t.Errorf("SHOW DATABASES without a probe = %v, want [empty live]", got)
+	}
+	if got := showDatabases(t, failingGhostExists{listing}); !equalStrings(got, []string{"empty", "ghost", "live"}) {
+		t.Errorf("SHOW DATABASES with a failing check = %v, want [empty ghost live]", got)
 	}
 }

@@ -32,6 +32,7 @@ import (
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
 // RBACChecker interface for RBAC permission checking
@@ -4597,7 +4598,8 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	var databases []string
 	var err error
 
-	if lister, ok := h.storage.(storage.DirectoryLister); ok {
+	lister, fromDirectories := h.storage.(storage.DirectoryLister)
+	if fromDirectories {
 		databases, err = lister.ListDirectories(ctx, "")
 	} else {
 		// Fall back to List and extract unique top-level directories
@@ -4614,6 +4616,9 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	// for why a missing store must stay an error everywhere that decides.
 	if storage.IsStoreNotFound(err) {
 		databases, err = nil, nil
+	}
+	if err == nil && fromDirectories {
+		databases = h.dropEmptyDatabaseDirectories(ctx, databases)
 	}
 
 	if err != nil {
@@ -4684,6 +4689,52 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 		Msg("SHOW DATABASES completed")
 
 	return respondSuccessRows(c, columns, types, data, time.Now().UTC().Format(time.RFC3339), start)
+}
+
+// showDatabasesCheckParallelism bounds the per-database checks of SHOW
+// DATABASES, each one storage request (two for a database with only its
+// marker).
+const showDatabasesCheckParallelism = 16
+
+// dropEmptyDatabaseDirectories drops the directories that hold no database: a
+// store that keeps empty prefixes (SeaweedFS) keeps a deleted database's, and
+// GET /api/v1/databases/:name answers 404 for it (#1425). A database is shown
+// if it holds a hot file or its marker; a cold-only database is added from
+// the tiering metadata after this. A failed check keeps the database, as it
+// was shown before the check existed. This node's view only, as SHOW
+// DATABASES always was: the cluster manifest is not consulted.
+func (h *QueryHandler) dropEmptyDatabaseDirectories(ctx context.Context, dirs []string) []string {
+	keep := make([]bool, len(dirs))
+	var g errgroup.Group
+	g.SetLimit(showDatabasesCheckParallelism)
+	for i, db := range dirs {
+		if strings.HasPrefix(db, ".") || strings.HasPrefix(db, "_") {
+			continue // filtered out below anyway
+		}
+		g.Go(func() error {
+			found, err := databaseHasHotFiles(ctx, h.storage, db)
+			if err == nil && !found {
+				found, err = h.storage.Exists(ctx, db+"/.arc-database")
+				if storage.IsStoreNotFound(err) {
+					found, err = false, nil
+				}
+			}
+			if err != nil {
+				h.logger.Warn().Err(err).Str("database", db).Msg("SHOW DATABASES: failed to check whether a database directory holds anything; showing it")
+				found = true
+			}
+			keep[i] = found
+			return nil
+		})
+	}
+	_ = g.Wait()
+	kept := make([]string, 0, len(dirs))
+	for i, db := range dirs {
+		if keep[i] {
+			kept = append(kept, db)
+		}
+	}
+	return kept
 }
 
 // handleShowTables handles SHOW TABLES/MEASUREMENTS command by scanning storage
