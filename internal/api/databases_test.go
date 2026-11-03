@@ -1033,9 +1033,9 @@ func TestDatabasesHandler_DeleteRemovesDirectoryTree(t *testing.T) {
 }
 
 // TestDatabasesHandler_DeleteClearsEmptyDirectoryResidue covers a database an
-// earlier version deleted on local storage: only empty directories are left,
-// so it is listed but does not exist. Repeating the DELETE still answers 404,
-// and the listing no longer shows it (#1425).
+// earlier version deleted on local storage: only empty directories are left.
+// The listing does not show it, since it holds nothing, and repeating the
+// DELETE still answers 404 and removes the directories (#1425).
 func TestDatabasesHandler_DeleteClearsEmptyDirectoryResidue(t *testing.T) {
 	_, app, tmpDir := setupTestDatabasesHandler(t, true)
 	defer os.RemoveAll(tmpDir)
@@ -1045,8 +1045,8 @@ func TestDatabasesHandler_DeleteClearsEmptyDirectoryResidue(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := listedDatabases(t, app); !equalStrings(got, []string{"olddb"}) {
-		t.Fatalf("residue listed as %v before the delete, want [olddb]", got)
+	if got := listedDatabases(t, app); len(got) != 0 {
+		t.Fatalf("residue listed as %v before the delete, want none", got)
 	}
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/olddb?confirm=true", nil), testRequestTimeoutMS)
@@ -1059,6 +1059,9 @@ func TestDatabasesHandler_DeleteClearsEmptyDirectoryResidue(t *testing.T) {
 	}
 	if got := listedDatabases(t, app); len(got) != 0 {
 		t.Errorf("databases listed after the delete = %v, want none", got)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "olddb")); !os.IsNotExist(err) {
+		t.Errorf("the residue's directories are still on disk (stat err %v)", err)
 	}
 }
 

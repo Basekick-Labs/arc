@@ -2175,17 +2175,33 @@ across a failed flush, enable the WAL.
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1379](https://github.com/Basekick-Labs/arc/pull/1379).
 
-### A deleted database disappears from the database list on local storage ([#1425](https://github.com/Basekick-Labs/arc/issues/1425))
+### A deleted database disappears from the database list ([#1425](https://github.com/Basekick-Labs/arc/issues/1425))
 
-On local storage, deleting a database removed its files but left their
-`measurement/YYYY/MM/DD/HH` directories behind. `GET /api/v1/databases` reads
-directories, so it kept listing the deleted database with
-`measurement_count: 0`, and `GET /api/v1/databases/:name/measurements` still
-listed its measurements, while `GET /api/v1/databases/:name` answered 404.
-The delete now removes the empty directories, deepest first; a directory that
-still holds a file is left, with the directories above it. A database deleted
-by an earlier version is cleared from the list by deleting it again: the
-DELETE still answers 404, and removes the empty directories it finds.
+`GET /api/v1/databases` built its list from directories, so a deleted database
+whose directories outlived its files stayed listed, with `measurement_count:
+0`, and `GET /api/v1/databases/:name/measurements` still listed its
+measurements, while `GET /api/v1/databases/:name` answered 404. Two stores do
+that:
+
+- **Local storage.** The delete removed the files but left their
+  `measurement/YYYY/MM/DD/HH` directories. It now removes the empty
+  directories, deepest first; a directory that still holds a file stays, with
+  the directories above it. Deleting a database an earlier version left
+  behind still answers 404, and now removes its directories too.
+- **Object stores that keep empty prefixes** (SeaweedFS). A prefix outlives
+  its last object, so there is nothing to remove.
+
+So the list and the measurements endpoint now answer by the rule `GET
+/api/v1/databases/:name` uses: a database is its marker, a file, a cold-tier
+row, or a cluster manifest entry, and directories alone are not one. The list
+already reads every file, so a database with a file or a cold-tier row costs
+nothing extra; only a database with neither is checked. `SHOW DATABASES`
+still reads directories.
+
+`GET /api/v1/databases/:name` and the measurements endpoint also stop at a
+database's first file instead of listing all of them, for a database without
+a marker, which is every database created by a write rather than by `POST
+/api/v1/databases`.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1427](https://github.com/Basekick-Labs/arc/pull/1427).

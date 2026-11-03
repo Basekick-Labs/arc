@@ -564,6 +564,24 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": "Database '" + name + "' not found",
 		})
 	}
+	// Measurements found as directories are not content: a store that keeps
+	// empty prefixes keeps a deleted database's, which GET answers 404 for
+	// (#1425). A measurement left that way inside a live database is still
+	// listed; only a database with nothing in it is refused here.
+	if !markerExists {
+		hasContent, err := h.databaseHasContent(ctx, name)
+		if err != nil {
+			h.logger.Error().Err(err).Str("database", name).Msg("Failed to check database content")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to check database",
+			})
+		}
+		if !hasContent {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Database '" + name + "' not found",
+			})
+		}
+	}
 
 	// Existence was decided above on the UNFILTERED list, so filtering cannot
 	// turn an existing database into a 404 — a caller that may enumerate here
@@ -1133,6 +1151,11 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 
 	// Build a map of database -> set of measurements from files
 	dbMeasurements := make(map[string]map[string]bool)
+	// hasContent marks the databases known to hold something: a hot file or
+	// a cold-tier row. The rest were found only as directories, which a
+	// deleted database leaves behind on a store that keeps empty prefixes
+	// (#1425), and are listed only if databaseExists says so.
+	hasContent := make(map[string]bool)
 
 	// Initialize all known databases from hot tier (some may be empty)
 	for _, db := range databases {
@@ -1152,6 +1175,7 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 					if dbMeasurements[db] == nil {
 						dbMeasurements[db] = make(map[string]bool)
 					}
+					hasContent[db] = true
 				}
 			}
 		}
@@ -1182,6 +1206,7 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 		if dbMeasurements[db] == nil {
 			continue
 		}
+		hasContent[db] = true
 
 		// Skip hidden measurements (like .arc-database marker)
 		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") {
@@ -1189,6 +1214,26 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 		}
 
 		dbMeasurements[db][measurement] = true
+	}
+
+	// A database found only as a directory is listed if it exists by the
+	// rule GET answers with: its marker, a cold-tier row, or (in a cluster) a
+	// manifest entry. Otherwise it is what a delete left behind, which GET
+	// answers 404 for and the list must not show (#1425). Only these
+	// databases cost a check; one with a file or a cold row costs nothing.
+	for db := range dbMeasurements {
+		if hasContent[db] {
+			continue
+		}
+		exists, err := h.databaseExists(ctx, db)
+		if err != nil {
+			// Listed, as before this check: a failed check is not an absence.
+			h.logger.Warn().Err(err).Str("database", db).Msg("Failed to check whether a database with no files exists; listing it")
+			continue
+		}
+		if !exists {
+			delete(dbMeasurements, db)
+		}
 	}
 
 	// Also get measurements from tiering metadata (for cold-only measurements)
@@ -1300,13 +1345,33 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 		return true, nil
 	}
 
-	// Fallback: Check if there's any content in the database directory
-	// (for databases created before marker files were introduced)
-	files, err := h.storage.List(ctx, name+"/")
-	if err != nil && !storage.IsStoreNotFound(err) {
-		return false, err
+	return h.databaseHasContent(ctx, name)
+}
+
+// databaseHasContent reports whether the database holds anything: a hot file,
+// a cold-tier row, or (in a cluster) a manifest entry. Its directories do not
+// count: a store that keeps empty prefixes (SeaweedFS) keeps a deleted
+// database's (#1425). A database written by ingest has no marker, so this is
+// how most databases are found.
+func (h *DatabasesHandler) databaseHasContent(ctx context.Context, name string) (bool, error) {
+	// The first file answers: a database can hold millions, and listing them
+	// all to ask whether there is one was the cost of every GET of a
+	// database without a marker.
+	var found bool
+	if pp, ok := h.storage.(storage.PrefixProber); ok {
+		hit, err := pp.HasObjectsUnderPrefix(ctx, name+"/")
+		if err != nil && !storage.IsStoreNotFound(err) {
+			return false, err
+		}
+		found = hit
+	} else {
+		files, err := h.storage.List(ctx, name+"/")
+		if err != nil && !storage.IsStoreNotFound(err) {
+			return false, err
+		}
+		found = len(files) > 0
 	}
-	if len(files) > 0 {
+	if found {
 		return true, nil
 	}
 	if h.tieringManager != nil {
