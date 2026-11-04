@@ -103,6 +103,13 @@ func (h *TieringHandler) GetFiles(c *fiber.Ctx) error {
 	defer cancel()
 
 	tierParam := c.Query("tier")
+	// TierFromString answers hot for anything it does not recognise, so an
+	// unknown or wrong-case tier would list hot files under a 200.
+	if tierParam != "" {
+		if t := tiering.TierFromString(tierParam); t.String() != tierParam || !t.IsValid() {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid tier"})
+		}
+	}
 	database := c.Query("database")
 	limit := 100
 	if raw := c.Query("limit"); raw != "" {

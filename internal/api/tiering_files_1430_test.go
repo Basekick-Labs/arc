@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,6 +81,25 @@ func TestTieringFilesFiltersCombine(t *testing.T) {
 				require.ElementsMatch(t, tc.want, got)
 			}
 			require.Equal(t, len(tc.want), body.Count)
+		})
+	}
+
+	// An unknown or wrong-case tier is refused before the store is read,
+	// rather than listed as hot.
+	var listed atomic.Bool
+	unread := &TieringHandler{getFiles: func(context.Context, string, string) ([]tiering.FileMetadata, error) {
+		listed.Store(true)
+		return nil, nil
+	}}
+	refusing := fiber.New()
+	refusing.Get("/api/v1/tiering/files", unread.GetFiles)
+	for _, query := range []string{"?tier=COLD&database=sdktier", "?tier=warm"} {
+		t.Run(query, func(t *testing.T) {
+			resp, err := refusing.Test(httptest.NewRequest(http.MethodGet, "/api/v1/tiering/files"+query, nil), -1)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			require.False(t, listed.Load(), "files were listed for an invalid tier")
 		})
 	}
 }

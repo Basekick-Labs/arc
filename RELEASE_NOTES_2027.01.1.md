@@ -2067,7 +2067,10 @@ Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 in every tier: with `database` set, `tier` was ignored. With both set, the list
 is now the database's files in that tier, newest partition first as for
 `database` alone, read from SQLite on its `(database, tier)` index. `limit`
-applies to that list as before. Either filter alone is unchanged.
+applies to that list as before. Either filter alone is unchanged. A `tier`
+other than `hot` or `cold`, such as `COLD` or `warm`, used to list the hot
+files with a `200`; it is now answered `400 invalid tier`, with or without
+`database`.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1446](https://github.com/Basekick-Labs/arc/pull/1446).
