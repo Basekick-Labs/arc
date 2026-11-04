@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/arcxengine"
+	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -26,7 +27,7 @@ func newLocalDeps(t *testing.T, base string) Deps {
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
-	return Deps{Storage: be, Logger: zerolog.Nop(), Mode: ModeShadow}
+	return Deps{Storage: be, Pruner: pruning.NewPartitionPruner(zerolog.Nop()), Logger: zerolog.Nop(), Mode: ModeShadow}
 }
 
 // touchParquet creates an empty file at base/rel so List finds it.
@@ -146,5 +147,40 @@ func TestBuildEngineSQL_Agg_Filtered(t *testing.T) {
 	}
 	if !strings.HasSuffix(sql, " GROUP BY 1") {
 		t.Fatalf("unexpected suffix: %s", sql)
+	}
+}
+
+func TestBuildEngineSQL_Agg_FilteredListsOnlyMatchingPartitions(t *testing.T) {
+	base := t.TempDir()
+	for _, rel := range []string{
+		"prod/cpu/2026/02/03/10/in-range-a.parquet",
+		"prod/cpu/2026/02/03/11/in-range-b.parquet",
+		"prod/cpu/2026/02/03/13/out-of-range.parquet",
+		"prod/cpu/2025/02/03/10/history.parquet",
+	} {
+		touchParquet(t, base, rel)
+	}
+	deps := newLocalDeps(t, base)
+	d := Decision{
+		Eligible:  true,
+		Shape:     ShapeDateTruncCent,
+		Unit:      "hour",
+		WhereText: "time >= '2026-02-03T10:15:00Z' AND time < '2026-02-03T12:00:00Z'",
+		Ctx:       arcxengine.Context{Database: "prod", Measurement: "cpu", TimeColumn: "time"},
+	}
+
+	sql, ok := deps.buildEngineSQL(context.Background(), d)
+	if !ok {
+		t.Fatal("expected ok, got decline")
+	}
+	for _, want := range []string{"in-range-a.parquet", "in-range-b.parquet"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("sql missing %s: %s", want, sql)
+		}
+	}
+	for _, unwanted := range []string{"out-of-range.parquet", "history.parquet"} {
+		if strings.Contains(sql, unwanted) {
+			t.Fatalf("sql unexpectedly contains %s: %s", unwanted, sql)
+		}
 	}
 }

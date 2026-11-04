@@ -374,13 +374,14 @@ localProcessing:
 		}
 	}
 
-	// Refuse the whole request up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676), rather than part-way through
-	// the measurements below. The admitted context skips the per-call disk
-	// pressure check, so pressure starting mid-request cannot split it. The
-	// fence is still checked per call: one that closes part-way stops the
-	// write, answered with what was written (writeLPMeasurements, #1437).
-	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	// Refuse the whole request up front if the ingest gate is closed (the
+	// fence and stream-takeover pauses, #1207) or the WAL volume is under disk
+	// pressure (#676), rather than part-way through the measurements below.
+	// The admitted context skips the per-call gate and disk pressure checks,
+	// so neither closing mid-request can split it (#1422). Any other failure
+	// part-way stops the write, answered with what was written
+	// (writeLPMeasurements, #1437).
+	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
@@ -481,9 +482,11 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 		}
 	}
 
-	// Refuse the whole request up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676); see the record path above.
-	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	// Refuse the whole request up front if the ingest gate is closed (the
+	// fence and stream-takeover pauses, #1207) or the WAL volume is under disk
+	// pressure (#676), and check neither again per measurement (#1422); see
+	// the record path above.
+	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)

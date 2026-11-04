@@ -73,14 +73,17 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 		return true
 	})
 
+	if !calls["checkEmittedQueryPermissions"] {
+		t.Error("native arcx Arrow hook does not recheck the resolved scope")
+	}
 	if !calls["serveArcxArrowIPCResult"] {
 		t.Fatal("native arcx Arrow hook does not use the tested IPC response helper")
 	}
 	if !args["governanceMaxRows"] {
 		t.Fatal("native arcx Arrow hook does not pass the governance row cap")
 	}
-	if !args["onRows"] || !args["onDisconnect"] {
-		t.Fatal("native arcx Arrow hook does not pass row and disconnect callbacks")
+	if !args["onRows"] || !args["onDisconnect"] || !args["onComplete"] || !args["onFail"] {
+		t.Fatal("native arcx Arrow hook does not pass row, disconnect, completion and failure callbacks")
 	}
 
 	helper, _ := load("query_arrow.go", "serveArcxArrowIPCResult")
@@ -110,6 +113,8 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 		"streamArrowIPCFunc",
 		"rowCapReached",
 		"poisonArrowStream",
+		"onComplete",
+		"onFail",
 	} {
 		if !helperCalls[required] {
 			t.Errorf("ArcX Arrow response helper missing call: %s", required)
@@ -144,4 +149,32 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 	if !dispatchHasCallbacks {
 		t.Error("Arrow query handler does not pass row and disconnect callbacks to the ArcX hook")
 	}
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "arcx_hook.go", nil, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse arcx_hook.go: %v", err)
+	}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "tryArcxRouter" {
+			continue
+		}
+		found := false
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "checkEmittedQueryPermissions" {
+				found = true
+			}
+			return true
+		})
+		if !found {
+			t.Error("native arcx query hook does not recheck the resolved scope")
+		}
+		return
+	}
+	t.Error("tryArcxRouter missing from arcx_hook.go")
 }
