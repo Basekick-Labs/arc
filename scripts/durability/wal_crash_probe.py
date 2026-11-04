@@ -101,7 +101,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                 )
-            wait_ready(process, base_url, log_path)
+            try:
+                wait_ready(process, base_url, log_path)
+            except BaseException:
+                stop(process)
+                raise
             return process
 
         process = start()
@@ -153,7 +157,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "sync_mode": args.sync_mode,
                 "ack_mode": args.ack_mode,
                 "rows_sent": args.rows,
-                "rows_acknowledged": args.rows if status == 204 else 0,
                 "ack_latency_ms": round((acknowledged_at - started) * 1000, 3),
                 "pause_after_ack_ms": round(args.pause_after_ack * 1000, 3),
                 "rows_recovered": len(ids),
@@ -167,19 +170,34 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             stop(process)
 
 
+def run_many(args: argparse.Namespace) -> dict[str, object]:
+    # run owns its temporary directory and processes, including on failure.
+    # A failed request or query raises: it is not an acknowledged data-loss run.
+    results = [run(args) for _ in range(args.runs)]
+    losses = [result["missing_rows"] for result in results]
+    return {
+        "runs": results,
+        "runs_completed": len(results),
+        "runs_with_loss": sum(count > 0 for count in losses),
+        "lost_rows_per_run": losses,
+        "runs_with_duplicates": sum(result["duplicate_rows"] > 0 for result in results),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True, help="Path to a locally built Arc binary")
     parser.add_argument("--wal-enabled", action="store_true", help="Enable the WAL for this run")
     parser.add_argument("--sync-mode", choices=("fdatasync", "fsync", "async"), default="fdatasync")
     parser.add_argument("--ack-mode", choices=("queued", "durable"), default="queued")
+    parser.add_argument("--runs", type=int, default=1, help="Independent runs, each with a fresh data directory")
     parser.add_argument("--rows", type=int, default=10000)
     parser.add_argument("--pause-after-ack", type=float, default=0)
     parser.add_argument("--max-buffer-age-ms", type=int, default=5000)
     args = parser.parse_args()
-    if args.rows < 1 or args.max_buffer_age_ms < 1 or args.pause_after_ack < 0:
-        parser.error("rows and max-buffer-age-ms must be positive; pause-after-ack cannot be negative")
-    print(json.dumps(run(args), sort_keys=True))
+    if args.runs < 1 or args.rows < 1 or args.max_buffer_age_ms < 1 or args.pause_after_ack < 0:
+        parser.error("runs, rows and max-buffer-age-ms must be positive; pause-after-ack cannot be negative")
+    print(json.dumps(run_many(args), sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -1,89 +1,127 @@
 # Single-node durability: process crash probe
 
 This is the first measured slice of
-[#1387](https://github.com/Basekick-Labs/arc/issues/1387). It records which
-rows an Arc process recovered after `SIGKILL`, using the locally built server,
-a local storage backend and exact row IDs. It does not measure host power loss,
-virtual-machine reset, hardware failure or remote object storage.
+[#1387](https://github.com/Basekick-Labs/arc/issues/1387). It measures one quiet
+batch followed by a process-only `SIGKILL`, using local storage and exact row
+IDs. It does not cover sustained ingest, power loss, VM reset, hardware failure,
+remote object storage, disk pressure, or backup and restore RPO/RTO.
 
 ## Reproduce
 
-Build Arc with the same DuckDB integration used by the project:
+Build the server from the source revision being measured:
 
 ```sh
 go build -tags=duckdb_arrow -o /tmp/arc ./cmd/arc
 ```
 
 The probe starts Arc on a free loopback port with authentication and telemetry
-disabled, writes a batch to a fresh temporary data directory, kills the process
-without graceful shutdown, restarts it, and queries the recovered IDs. The
-directory is removed after each run.
-
-For the six WAL mode combinations, run:
+disabled. Each run uses a fresh temporary data directory, writes one batch,
+kills Arc after HTTP 204, restarts with that same directory, and queries the
+recovered IDs. Processes and directories are cleaned up before the next run.
 
 ```sh
 for sync_mode in fdatasync fsync async; do
   for ack_mode in queued durable; do
     python3 scripts/durability/wal_crash_probe.py \
-      --binary /tmp/arc --wal-enabled --rows 100000 \
+      --binary /tmp/arc --wal-enabled --rows 100000 --runs 3 \
       --sync-mode "$sync_mode" --ack-mode "$ack_mode"
   done
 done
 ```
 
-To observe the WAL-off buffer window, run the same probe without
-`--wal-enabled`, varying the delay after the successful response:
+`--runs` defaults to 1 and must be positive. Output is a JSON object with a
+`runs` array containing each measurement, `runs_completed`, `runs_with_loss`,
+`lost_rows_per_run`, and `runs_with_duplicates`. Per-run results retain missing
+and duplicate counts, acknowledgement latency, and restart/query time. A
+non-204 write, startup failure, or query failure raises an error and exits
+unsuccessfully instead of being counted as acknowledged data loss.
+
+For WAL-off runs, omit `--wal-enabled`:
 
 ```sh
+for pause in 0 1 5.5; do
+  python3 scripts/durability/wal_crash_probe.py \
+    --binary /tmp/arc --rows 10000 --runs 3 --pause-after-ack "$pause"
+done
 python3 scripts/durability/wal_crash_probe.py \
-  --binary /tmp/arc --rows 10000 --pause-after-ack 0
+  --binary /tmp/arc --rows 100000 --runs 3
 python3 scripts/durability/wal_crash_probe.py \
-  --binary /tmp/arc --rows 10000 --pause-after-ack 1
-python3 scripts/durability/wal_crash_probe.py \
-  --binary /tmp/arc --rows 10000 --pause-after-ack 5.5
+  --binary /tmp/arc --rows 10000 --runs 3 --ack-mode durable
 ```
 
-The buffer age is 5 seconds and the maximum buffer size is 50,000 rows. The
-output includes acknowledged and recovered row counts, missing and duplicate
-IDs, acknowledgement latency, and time from restart through the verification
-query.
+The buffer age is 5 seconds and the maximum buffer size is 50,000 rows.
+Run deterministic probe tests separately:
 
-## Result on Arc `1943fe8` (Go 1.27.1, macOS arm64)
+```sh
+python3 -m unittest discover -s scripts/durability -v
+```
 
-Each row is one run of a 100,000-row request. Arc answered HTTP 204, then the process was killed immediately. All six WAL-enabled runs recovered 100,000 unique IDs with no missing or duplicate rows.
+## Results on current main `07bb6bf`
 
-| WAL sync mode | Acknowledgement mode | Ack latency | Restart and query | Recovered |
-| --- | --- | ---: | ---: | ---: |
-| `fdatasync` | `queued` | 252 ms | 0.60 s | 100,000 / 100,000 |
-| `fsync` | `queued` | 362 ms | 3.72 s | 100,000 / 100,000 |
-| `async` | `queued` | 317 ms | 0.82 s | 100,000 / 100,000 |
-| `fdatasync` | `durable` | 306 ms | 0.79 s | 100,000 / 100,000 |
-| `fsync` | `durable` | 363 ms | 1.14 s | 100,000 / 100,000 |
-| `async` | `durable` | 542 ms | 1.50 s | 100,000 / 100,000 |
+Measured on Linux 6.18.57 x86_64 with Go 1.26.9, using source commit
+`07bb6bf525396cac6a47b2092941a8d71548ead2`. Builds used
+`-buildvcs=false -tags=duckdb_arrow` because VCS stamping was unavailable in
+the linked worktrees. Each configuration below had three independent runs of
+100,000 rows, killed immediately after HTTP 204.
 
-These timings are single-run observations on this machine, not comparative
-performance results. Restart time includes server startup and the SQL query.
+**Queued acknowledgements lost all rows in every run; durable acknowledgements
+recovered every row in every run.** These are observations, not durability
+guarantees or estimates of a real-world loss probability.
 
-With the WAL disabled, `queued` acknowledged 10,000 rows in 24 ms. An
-immediate kill and a kill after one second both recovered zero rows; waiting
-5.5 seconds recovered all 10,000. This batch stayed below the 50,000-row size
-trigger. A 100,000-row request crossed that threshold, was acknowledged in
-435 ms, and lost all rows when killed immediately while its size-triggered
-flush was still in progress. Setting `wal.ack_mode = "durable"` without
-enabling the WAL also acknowledged 10,000 rows and lost all of them after an
-immediate kill; the setting has no durability effect when no WAL is active.
+| WAL sync mode | Ack mode | Runs losing rows | Lost rows in each run | Ack latency range |
+| --- | --- | ---: | --- | ---: |
+| `fdatasync` | `queued` | 3 / 3 | 100,000; 100,000; 100,000 | 118–158 ms |
+| `fsync` | `queued` | 3 / 3 | 100,000; 100,000; 100,000 | 140–171 ms |
+| `async` | `queued` | 3 / 3 | 100,000; 100,000; 100,000 | 139–162 ms |
+| `fdatasync` | `durable` | 0 / 3 | 0; 0; 0 | 135–236 ms |
+| `fsync` | `durable` | 0 / 3 | 0; 0; 0 | 128–145 ms |
+| `async` | `durable` | 0 / 3 | 0; 0; 0 | 125–164 ms |
+
+No duplicate IDs were observed. The sync modes are distinct on this Linux host;
+on macOS `fdatasync` falls back to `fsync`, with a startup log saying so.
+Timings are rounded observations on a shared host, not comparative performance
+results. Restart/query time includes startup and the verification query.
+
+### Baseline comparison
+
+Repeating all six configurations three times against the original PR head
+`7b1ceba1f3504451ce3e301119a98b6372b88645` (server source identical to
+`1943fe87e0463bf9b5375dcbab40cf1171c1e731`) on the same Linux host gave the
+same loss counts: each queued configuration lost 100,000 rows in all three
+runs, and each durable configuration lost zero rows in all three runs. No
+duplicates were observed. The earlier single-run macOS results therefore do
+not establish that queued writes survive a process crash, nor does this
+comparison establish that loss was introduced by a newer main commit.
+
+### WAL disabled
+
+These measurements also used current main, with three runs per case:
+
+| Rows | Ack mode | Delay after 204 | Runs losing rows | Lost rows in each run |
+| ---: | --- | ---: | ---: | --- |
+| 10,000 | `queued` | 0 s | 3 / 3 | 10,000; 10,000; 10,000 |
+| 10,000 | `queued` | 1 s | 3 / 3 | 10,000; 10,000; 10,000 |
+| 10,000 | `queued` | 5.5 s | 0 / 3 | 0; 0; 0 |
+| 100,000 | `queued` | 0 s | 3 / 3 | 100,000; 100,000; 100,000 |
+| 10,000 | `durable` | 0 s | 3 / 3 | 10,000; 10,000; 10,000 |
+
+No duplicate IDs were observed. The 10,000-row batch is below the size trigger;
+the 100,000-row batch crosses it, but acknowledgement does not await that
+flush. `durable` without an enabled WAL has no durability effect. Arc warns:
+`wal.ack_mode = "durable" has no effect while wal.enabled = false: writes are acknowledged without a WAL`.
 
 ## What this result establishes
 
-On this local configuration, the WAL-off 10,000-row run lost the acknowledged
-buffer contents before the five-second age flush and recovered them after a
-5.5-second wait. The 100,000-row run lost its contents when killed during the
-size-triggered flush. With the WAL enabled, all tested configurations recovered
-the request after a process-only `SIGKILL`.
+The results are consistent with the WAL acknowledgement contract:
 
-The host kernel remained running during these tests. In particular, `SIGKILL`
-does not discard the operating system's file cache, so the `queued` results do
-not establish survival of sudden power loss. Testing the power-loss guarantee
-requires a controlled VM or host reset that discards unflushed writes.
-Object-store failures, backup and restore RPO/RTO, and disk pressure remain
-outside this measurement.
+- `queued` returns after admission to the writer queue, before completion of
+  the write or sync. An acknowledged batch can be lost at process crash,
+  including an entire batch represented by an incomplete WAL entry.
+- `durable` waits for a sync covering the entry, including in `async` sync
+  mode. In these runs, all acknowledged rows survived process termination.
+
+A finite number of successful runs does not prove a guarantee. The host
+kernel remains running during `SIGKILL`; its file cache is not discarded.
+Power-loss testing requires a controlled VM or host reset that discards
+unflushed writes. Crashing during sustained ingest is a separate, still
+unmeasured part of #1387.

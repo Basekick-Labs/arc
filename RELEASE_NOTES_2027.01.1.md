@@ -2068,6 +2068,15 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Process-crash probe repeats runs and reports acknowledged row loss
+
+The local WAL crash probe accepts `--runs`, isolates each run, and reports
+per-run missing rows and aggregate loss counts. Updated Linux measurements
+separate queued from durable acknowledgements without claiming power-loss
+or sustained-ingest coverage. Failed startup also cleans up its child process.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1421](https://github.com/Basekick-Labs/arc/pull/1421).
+
 ### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447))
 
 `SELECT readings.value FROM readings` failed with `Referenced table "readings"
