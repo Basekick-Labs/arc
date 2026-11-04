@@ -2075,6 +2075,26 @@ files with a `200`; it is now answered `400 invalid tier`, with or without
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1446](https://github.com/Basekick-Labs/arc/pull/1446).
 
+### The scheduler control routes say why a scheduler is not running ([#1433](https://github.com/Basekick-Labs/arc/issues/1433))
+
+`POST /api/v1/schedulers/cq/reload` and `POST
+/api/v1/schedulers/retention/trigger` answered `503 "... is not running -
+enterprise license required"` whenever the scheduler was not running, also on
+a licensed node with `continuous_query.enabled` or `retention.enabled` set to
+false. They now give the reason `GET /api/v1/schedulers/` gives: without a
+valid license, or with a tier that does not include the scheduler, a `403`, as
+other license-gated routes answer; with the license in order, a `503` saying
+the feature is not enabled.
+
+A retention trigger the scheduler refuses without running anything is no
+longer a `500`: on a cluster node that is not the primary writer, or while a
+retention cycle is running, it is a `409`. A trigger after the license stopped
+including the scheduler, which answered `200 "Retention triggered
+successfully"` without running anything, is a `403`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1445](https://github.com/Basekick-Labs/arc/pull/1445).
+
 ### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
 
 With RBAC on, a query's permission check reads the table names in the SQL it
