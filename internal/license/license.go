@@ -61,7 +61,7 @@ func (l *License) IsValid() bool {
 	if l == nil {
 		return false
 	}
-	return l.Status == "active" || l.Status == "grace_period"
+	return validAt(l.ExpiresAt, time.Now())
 }
 
 // IsExpired returns true if the license has expired
@@ -69,7 +69,20 @@ func (l *License) IsExpired() bool {
 	if l == nil {
 		return true
 	}
-	return l.Status == "expired" || l.Status == "read_only"
+	return !l.IsValid()
+}
+
+// expiryStatus derives display state from the same signed expiry used by the
+// gates. One clock reading governs both the boundary and whole days remaining.
+func expiryStatus(expiresAt, now time.Time) (string, int) {
+	if !validAt(expiresAt, now) {
+		return "expired", 0
+	}
+	return "active", int(expiresAt.Sub(now) / (24 * time.Hour))
+}
+
+func validAt(expiresAt, now time.Time) bool {
+	return now.Before(expiresAt)
 }
 
 // HasFeature checks if the license includes a specific feature

@@ -460,6 +460,16 @@ Thanks to [@efegokdemir](https://github.com/efegokdemir), who traced the
 overflow to buffers retained under flush-queue backpressure and proposed the
 first fix in [#1321](https://github.com/Basekick-Labs/arc/pull/1321); its
 tests are the basis of this change's.
+## Fix: license gates expire while Arc is running (#1442)
+
+License checks now use the signed expiry at the time of each check. A final
+definitive server rejection clears the current license and its disk cache;
+transient network or protocol failures preserve the license until that signed
+expiry. Both machine-reactivation responses still attempt activation before
+the final result determines whether to invalidate the license. Health status
+and days remaining use the same expiry calculation.
+
+Existing RBAC restrictions remain enforced when a license lapses.
 
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 
