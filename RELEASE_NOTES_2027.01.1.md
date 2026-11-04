@@ -2091,13 +2091,30 @@ The rows of a file in `unreachable_files` are not deleted. Run the DELETE
 again once the file is on the primary to remove them. On shared storage, the
 flush of the other nodes before a DELETE keeps its own timeouts.
 
-### Invalid object-store prefix diagnostics remain readable after log masking ([#1113](https://github.com/Basekick-Labs/arc/issues/1113))
+### Storage errors stay readable in the log ([#1113](https://github.com/Basekick-Labs/arc/issues/1113))
 
-Validation errors identify unsupported characters by code point and describe
-invalid path segments without quoting configured values. The allowed character
-set and rejection reason now survive log sanitization, including quote characters.
+Arc masks every quoted span in a logged error, because engine errors quote the
+values they refuse, and it logs only an error's first line. Storage errors that
+quoted the offending value lost exactly that part in the log, and a value with
+a quote in it masked the rest of the line:
+`storage prefix "..." contains an unsupported character '...'`.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+Storage errors no longer quote values. They say what is wrong instead:
+
+- An unsupported character in an object-store prefix, or a glob metacharacter
+  in a path, is named by its code point (`U+0027`), and the prefix error lists
+  the allowed characters.
+- Key and prefix errors describe the problem (an empty, `.` or `..` segment, a
+  trailing separator, the write-staging suffix, a length over the limit)
+  without repeating the key. A database name starting with `_` is refused as
+  reserved.
+- An unknown backend type, a GCS endpoint that is not an http(s) URL, and a
+  GCS bucket Arc cannot use are described, and the bucket is named unquoted.
+- A batch delete on S3, Azure or GCS logs each key it refuses as a warning
+  with the key as a `key` field, and names the key in front of its reason in
+  the returned error. Only the first line of the batch error reaches the log.
+
+Contributed in part by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
 
 ### A delete's WHERE may qualify columns by the measurement name ([#1451](https://github.com/Basekick-Labs/arc/issues/1451))
 

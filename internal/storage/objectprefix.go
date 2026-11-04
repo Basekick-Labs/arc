@@ -69,9 +69,11 @@ func ValidateObjectPrefix(prefix string) (string, error) {
 }
 
 // prefixObjectKey validates a caller's key and the complete object name that
-// the object store will receive. ValidateKey must run on the unprefixed key
-// first so errors for invalid caller input continue to identify that input;
-// the second check also accounts for the configured prefix (#1121).
+// the object store will receive. ValidateKey runs on the unprefixed key first
+// so a refusal is about the caller's input, not about the prefix; the second
+// check also accounts for the configured prefix (#1121). Neither error names
+// the key: the caller knows it, and batch deletes add it per key
+// (partitionValidKeys). A value in error text is masked in logs (#1113).
 func prefixObjectKey(prefix, key string) (string, error) {
 	if err := ValidateKey(key); err != nil {
 		return "", err
@@ -82,7 +84,7 @@ func prefixObjectKey(prefix, key string) (string, error) {
 
 	objectName := prefix + key
 	if err := ValidateKey(objectName); err != nil {
-		return "", fmt.Errorf("object name %q is not usable: %w", objectName, err)
+		return "", fmt.Errorf("object name under the configured prefix is not usable: %w", err)
 	}
 	return objectName, nil
 }
