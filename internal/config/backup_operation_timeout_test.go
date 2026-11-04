@@ -4,8 +4,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	sqlutil "github.com/basekick-labs/arc/internal/sql"
 )
 
 // backup.operation_timeout replaces the 2h that was hardcoded at both backup
@@ -126,17 +124,15 @@ func TestObjectPrefixKeysAreValidatedAtLoad(t *testing.T) {
 	// Each case sets its key to a prefix the storage contract refuses, and
 	// must be refused by Load with the key named.
 	cases := []struct {
-		name   string
-		key    string
-		value  string // the unusable prefix
-		reason string
-		env    map[string]string
+		name  string
+		key   string
+		value string // the unusable prefix, as the error must echo it
+		env   map[string]string
 	}{
 		{
-			name:   "storage.s3_prefix",
-			key:    "storage.s3_prefix",
-			value:  "a//b",
-			reason: "empty segment",
+			name:  "storage.s3_prefix",
+			key:   "storage.s3_prefix",
+			value: "a//b",
 			env: map[string]string{
 				"ARC_STORAGE_BACKEND":   "s3",
 				"ARC_STORAGE_S3_BUCKET": "bkt",
@@ -144,10 +140,9 @@ func TestObjectPrefixKeysAreValidatedAtLoad(t *testing.T) {
 			},
 		},
 		{
-			name:   "storage.azure_prefix",
-			key:    "storage.azure_prefix",
-			value:  "a b",
-			reason: "unsupported character U+0020",
+			name:  "storage.azure_prefix",
+			key:   "storage.azure_prefix",
+			value: "a b",
 			env: map[string]string{
 				"ARC_STORAGE_BACKEND":            "azure",
 				"ARC_STORAGE_AZURE_CONTAINER":    "cont",
@@ -156,10 +151,9 @@ func TestObjectPrefixKeysAreValidatedAtLoad(t *testing.T) {
 			},
 		},
 		{
-			name:   "tiered_storage.cold.s3_prefix",
-			key:    "tiered_storage.cold.s3_prefix",
-			value:  ".",
-			reason: "single-dot segment",
+			name:  "tiered_storage.cold.s3_prefix",
+			key:   "tiered_storage.cold.s3_prefix",
+			value: ".",
 			env: map[string]string{
 				"ARC_TIERED_STORAGE_ENABLED":        "true",
 				"ARC_TIERED_STORAGE_COLD_ENABLED":   "true",
@@ -169,10 +163,9 @@ func TestObjectPrefixKeysAreValidatedAtLoad(t *testing.T) {
 			},
 		},
 		{
-			name:   "tiered_storage.cold.azure_prefix",
-			key:    "tiered_storage.cold.azure_prefix",
-			value:  "/",
-			reason: "not a relative prefix",
+			name:  "tiered_storage.cold.azure_prefix",
+			key:   "tiered_storage.cold.azure_prefix",
+			value: "/",
 			env: map[string]string{
 				"ARC_TIERED_STORAGE_ENABLED":                 "true",
 				"ARC_TIERED_STORAGE_COLD_ENABLED":            "true",
@@ -196,14 +189,11 @@ func TestObjectPrefixKeysAreValidatedAtLoad(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.key) {
 				t.Errorf("error does not name the key %s; got: %v", tc.key, err)
 			}
-			// The key and rejection reason survive logging without echoing the
-			// configured value, which the global sanitiser would mask.
-			got := sqlutil.SanitizeErrText(err.Error())
-			if !strings.Contains(got, tc.key) || !strings.Contains(got, tc.reason) {
-				t.Errorf("sanitized diagnostic lost key or reason: %q", got)
-			}
-			if got != err.Error() {
-				t.Errorf("sanitization changed diagnostic: %q -> %q", err, got)
+			// The value must survive into the message: a rejection that does
+			// not echo what was configured is the masked-error problem this
+			// check exists to avoid.
+			if !strings.Contains(err.Error(), tc.value) {
+				t.Errorf("error does not name the rejected value %q; got: %v", tc.value, err)
 			}
 		})
 	}

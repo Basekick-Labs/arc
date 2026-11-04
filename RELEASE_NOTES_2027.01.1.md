@@ -2068,13 +2068,29 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Invalid object-store prefix diagnostics remain readable after log masking ([#1113](https://github.com/Basekick-Labs/arc/issues/1113))
+### `allow_unreachable=true` stops waiting for files nothing is delivering ([#1426](https://github.com/Basekick-Labs/arc/issues/1426))
 
-Validation errors identify unsupported characters by code point and describe
-invalid path segments without quoting configured values. The allowed character
-set and rejection reason now survive log sanitization, including quote characters.
+On a cluster, a DELETE waits for files the manifest lists that are not on the
+primary yet: replicated files and compaction outputs still on their way. It
+waits up to 30 seconds, then answers `503` naming them in
+`unreachable_files`, or with `allow_unreachable=true` runs without them. With
+the flag it still waited the full 30 seconds first, once per scan, even for a
+file no node holds any more. A DELETE can scan several times, before and after
+it is recorded and after a compaction replaced a file it read, so it could
+take minutes. A client with a 30-second timeout saw a connection failure for
+a DELETE that ran, and lost the list of files it skipped.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+With `allow_unreachable=true`, a missing file is now waited for only while
+something is delivering it: the replication puller has it queued or in
+progress, or on shared storage a staged compaction holds it. A file missing
+for 5 seconds with nothing delivering it is given up for the rest of the
+request and reported in `unreachable_files`. A file still on its way is waited
+for up to 30 seconds, as before. Without the flag nothing changes.
+
+The rows of a file in `unreachable_files` are not deleted. Run the DELETE
+again once the file is on the primary to remove them. On shared storage, the
+flush of the other nodes before a DELETE keeps its own timeouts.
+
 ### A delete's WHERE may qualify columns by the measurement name ([#1451](https://github.com/Basekick-Labs/arc/issues/1451))
 
 `POST /api/v1/delete` with `"where": "cpu.host = 'web-1'"` on measurement `cpu`
@@ -2096,7 +2112,7 @@ As with a query's table-name qualifier
 named like its measurement is no longer reached through that name with a
 field (`cpu.x` now means the column `x`).
 
-### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447), [#1450](https://github.com/Basekick-Labs/arc/issues/1450))
+### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447))
 
 `SELECT readings.value FROM readings` failed with `Referenced table "readings"
 not found`. Arc replaces a table reference with a `read_parquet(...)` read, and
@@ -2120,27 +2136,15 @@ The rewritten read now carries the table's name (`AS "readings"`) whenever the
 query qualifies a column with it and the reference has no alias of its own.
 This covers `FROM`, every `JOIN` form, comma joins, `database.table` references
 (named by the table), and queries with or without the `x-arc-database` header.
-It also covers continuous queries, whose source read is named after the source
-measurement: a body such as
-`SELECT cpu.host, avg(cpu.usage) AS usage FROM prod.cpu WHERE time >= {start_time} AND time < {end_time} GROUP BY 1`
-failed at every scheduled run and now writes its rows. A query that never qualifies by
-table name is rewritten exactly as before.
+A query that never qualifies by table name is rewritten exactly as before.
 
-A query that also gives the name to another relation, as in
-`FROM readings JOIN (SELECT ...) readings USING (channel_id)` or
-`FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
-keeps the unaliased read: naming the table as well would be a duplicate alias
-in the first, and would change which relation `readings.value` reads in the
-second. This holds wherever the other relation is in the query, including a
-subquery or `LATERAL` join aliased with the table's name
-(`LEFT JOIN LATERAL (SELECT ... FROM readings ...) readings ON true`); give one
-of the two a different alias to qualify by the table's name there. A column named like the table, such as Telegraf's `cpu` tag on the
-`cpu` measurement, is not an alias wherever it appears, so it does not stop
-the table being named.
-
-Two things now behave the way Postgres does, where before they relied on the
+Three things now behave the way Postgres does, where before they relied on the
 relation having no name:
 
+- **An inner reference shadows an outer alias of the same name.** In
+  `FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
+  the inner `readings.value` now reads the inner table. Before, it bound to the
+  outer relation.
 - **A struct column named like its table.** In a query that also qualifies by
   the table name, `readings.value` now names the table's column `value`, not a
   field of a struct column called `readings`.
@@ -2148,9 +2152,9 @@ relation having no name:
   `read_parquet` keeps working unless it also qualifies by the table name.
 
 A table reference followed by `WITH ORDINALITY` keeps its old form, because
-DuckDB accepts that clause only before an alias. A delete's `WHERE` may
-qualify columns by the measurement name too; see
-[#1451](https://github.com/Basekick-Labs/arc/issues/1451) above.
+DuckDB accepts that clause only before an alias. Continuous queries still read
+their source unaliased, so give the table an alias there. A delete's `WHERE`
+clause runs over an unaliased read too: use unqualified column names in it.
 
 ### A MessagePack value its column cannot hold is a client error, not a 500 ([#1424](https://github.com/Basekick-Labs/arc/issues/1424))
 

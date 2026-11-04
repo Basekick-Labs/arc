@@ -328,7 +328,7 @@ func TestNewBackendForwardsAndValidatesS3Prefix(t *testing.T) {
 		cases := []struct{ prefix, wantMsg string }{
 			{"/", "is not a relative prefix"},
 			{"a//b", "contains an empty segment"},
-			{".", "contains a single-dot segment"},
+			{".", `contains a "." segment`},
 			{"a b", "contains an unsupported character"},
 		}
 		base := s3SpecFor(t, "s3")
@@ -348,7 +348,7 @@ func TestNewBackendForwardsAndValidatesS3Prefix(t *testing.T) {
 				t.Errorf("NewBackend with prefix %q returned a non-nil backend alongside an error", tc.prefix)
 			}
 			msg := err.Error()
-			if !strings.Contains(msg, "storage prefix") {
+			if !strings.Contains(msg, "storage prefix") || !strings.Contains(msg, tc.prefix) {
 				t.Errorf("NewBackend with prefix %q failed for some other reason than the prefix: %s", tc.prefix, msg)
 				continue
 			}
