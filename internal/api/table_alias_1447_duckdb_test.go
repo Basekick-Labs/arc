@@ -131,14 +131,18 @@ func TestQueryTableNameQualifier_Issue1447(t *testing.T) {
 			"SELECT readings.channel_id FROM limits, readings WHERE readings.channel_id = limits.channel_id " +
 				"AND readings.value > limits.max",
 			"[[a]]"},
-		// A behaviour change, pinned: an inner reference that names the
-		// table now shadows an outer alias of the same name, as in Postgres.
-		// Before, readings.value in the subquery bound to the outer row (5),
-		// so this counted 0.
-		{"inner table name shadows an outer alias of the same name", "plant",
+		// A name the query also gives another relation is not given to the
+		// table (#1450), so these read as they did before #1447. Naming the
+		// table too made the first a duplicate alias and changed which
+		// relation the second's subquery reads.
+		{"another relation aliased with the table's name: JOIN", "plant",
+			"SELECT readings.channel_id, count(*) FROM readings JOIN (SELECT 'b' AS channel_id) readings " +
+				"USING (channel_id) GROUP BY 1",
+			"[[b 1]]"},
+		{"another relation aliased with the table's name: outer scope", "plant",
 			"SELECT count(*) FROM (VALUES (5)) readings(value) WHERE EXISTS (" +
 				"SELECT 1 FROM readings WHERE readings.value = 100)",
-			"[[1]]"},
+			"[[0]]"},
 		{"unqualified query unchanged", "plant",
 			"SELECT count(*) FROM readings", "[[4]]"},
 	} {

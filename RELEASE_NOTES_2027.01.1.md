@@ -2089,7 +2089,7 @@ As with a query's table-name qualifier
 named like its measurement is no longer reached through that name with a
 field (`cpu.x` now means the column `x`).
 
-### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447))
+### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447), [#1450](https://github.com/Basekick-Labs/arc/issues/1450))
 
 `SELECT readings.value FROM readings` failed with `Referenced table "readings"
 not found`. Arc replaces a table reference with a `read_parquet(...)` read, and
@@ -2113,15 +2113,27 @@ The rewritten read now carries the table's name (`AS "readings"`) whenever the
 query qualifies a column with it and the reference has no alias of its own.
 This covers `FROM`, every `JOIN` form, comma joins, `database.table` references
 (named by the table), and queries with or without the `x-arc-database` header.
-A query that never qualifies by table name is rewritten exactly as before.
+It also covers continuous queries, whose source read is named after the source
+measurement: a body such as
+`SELECT cpu.host, avg(cpu.usage) AS usage FROM prod.cpu WHERE time >= {start_time} AND time < {end_time} GROUP BY 1`
+failed at every scheduled run and now writes its rows. A query that never qualifies by
+table name is rewritten exactly as before.
 
-Three things now behave the way Postgres does, where before they relied on the
+A query that also gives the name to another relation, as in
+`FROM readings JOIN (SELECT ...) readings USING (channel_id)` or
+`FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
+keeps the unaliased read: naming the table as well would be a duplicate alias
+in the first, and would change which relation `readings.value` reads in the
+second. This holds wherever the other relation is in the query, including a
+subquery or `LATERAL` join aliased with the table's name
+(`LEFT JOIN LATERAL (SELECT ... FROM readings ...) readings ON true`); give one
+of the two a different alias to qualify by the table's name there. A column named like the table, such as Telegraf's `cpu` tag on the
+`cpu` measurement, is not an alias wherever it appears, so it does not stop
+the table being named.
+
+Two things now behave the way Postgres does, where before they relied on the
 relation having no name:
 
-- **An inner reference shadows an outer alias of the same name.** In
-  `FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
-  the inner `readings.value` now reads the inner table. Before, it bound to the
-  outer relation.
 - **A struct column named like its table.** In a query that also qualifies by
   the table name, `readings.value` now names the table's column `value`, not a
   field of a struct column called `readings`.
@@ -2129,9 +2141,9 @@ relation having no name:
   `read_parquet` keeps working unless it also qualifies by the table name.
 
 A table reference followed by `WITH ORDINALITY` keeps its old form, because
-DuckDB accepts that clause only before an alias. Continuous queries still read
-their source unaliased, so give the table an alias there. A delete's `WHERE`
-clause runs over an unaliased read too: use unqualified column names in it.
+DuckDB accepts that clause only before an alias. A delete's `WHERE` may
+qualify columns by the measurement name too; see
+[#1451](https://github.com/Basekick-Labs/arc/issues/1451) above.
 
 ### A MessagePack value its column cannot hold is a client error, not a 500 ([#1424](https://github.com/Basekick-Labs/arc/issues/1424))
 

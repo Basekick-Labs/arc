@@ -1107,12 +1107,82 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 // source matching is tracked as a follow-up. See
 // [[feedback_regex_sql_gating_is_leaky]].
 //
-// ReplaceAllLiteralString (not ReplaceAllString) is used so '$' characters in
-// the storage path are inserted verbatim rather than interpreted as regexp
-// submatch references ($1, $name).
+// The expression is inserted verbatim, so '$' characters in the storage path
+// are never read as regexp submatch references ($1, $name).
+//
+// A body that qualifies a column by the measurement's name (`cpu.usage`) gets
+// the read named after the measurement, as /api/v1/query does (#1447, #1450):
+// DuckDB names an unaliased read_parquet() relation "read_parquet", so
+// `cpu.usage` failed to bind. The rule is aliasTableRef's, applied to the
+// finished expression so the open-compaction exclusion still sees its closing
+// parenthesis. Any other body is rewritten byte for byte as before.
 func wrapSourceMeasurement(query, database, measurement, readParquetExpr string) string {
 	pattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(database) + `\.` + regexp.QuoteMeta(measurement) + `\b`)
-	return pattern.ReplaceAllLiteralString(query, "FROM "+readParquetExpr)
+	matches := pattern.FindAllStringIndex(query, -1)
+	if matches == nil {
+		return query
+	}
+	// The qualifier scan needs literals masked and comments gone; it only
+	// yields names, so its offsets need not line up with query's.
+	masked, masks := sqlutil.MaskStringLiterals(query, true)
+	// As on the query path: a FROM inside EXTRACT/TRIM/SUBSTRING does not
+	// start a table reference (`EXTRACT(epoch FROM cpu.time)` qualifies).
+	masked, _ = sqlutil.MaskFromKeywordsInFunctionBodies(masked)
+	masked = stripSQLComments(masked, true)
+	qualified := qualifierNames(masked, makeIdentResolver(sqlutil.IdentifierNames(masks)))
+
+	var b strings.Builder
+	last := 0
+	for _, m := range matches {
+		b.WriteString(query[last:m[0]])
+		expr := readParquetExpr
+		if !cqSourceKeepsOwnName(query, m[1]) {
+			expr = aliasTableRef(expr, query, m[1], measurement, true, qualified)
+		}
+		b.WriteString("FROM ")
+		b.WriteString(expr)
+		last = m[1]
+	}
+	b.WriteString(query[last:])
+	return b.String()
+}
+
+// cqSourceKeepsOwnName is keepsOwnName for the raw text a continuous-query
+// body is rewritten in: keepsOwnName expects masked, comment-free SQL. It
+// looks past comments, and treats a quoted word as the reference's own alias.
+// A match the name continues past (`FROM db.m.field`) is not a whole table
+// reference, so it is left as it was.
+func cqSourceKeepsOwnName(query string, end int) bool {
+	if end < len(query) && query[end] == '.' {
+		return true
+	}
+	i := skipSQLSpaceAndComments(query, end)
+	if i < len(query) && query[i] == '"' {
+		return true
+	}
+	return keepsOwnName(query, i)
+}
+
+// skipSQLSpaceAndComments returns the offset of the first byte at or after i
+// that is neither whitespace nor inside a -- or /* */ comment.
+func skipSQLSpaceAndComments(sql string, i int) int {
+	for {
+		i = skipSQLSpace(sql, i)
+		switch {
+		case strings.HasPrefix(sql[i:], "--"):
+			for i < len(sql) && sql[i] != '\n' && sql[i] != '\r' {
+				i++
+			}
+		case strings.HasPrefix(sql[i:], "/*"):
+			if j := strings.Index(sql[i+2:], "*/"); j >= 0 {
+				i += 2 + j + 2
+			} else {
+				return len(sql)
+			}
+		default:
+			return i
+		}
+	}
 }
 
 // executeAggregation runs the aggregation query and writes results.
