@@ -2039,6 +2039,50 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447))
+
+`SELECT readings.value FROM readings` failed with `Referenced table "readings"
+not found`. Arc replaces a table reference with a `read_parquet(...)` read, and
+DuckDB names that relation `read_parquet`, so a column qualified by the table's
+own name no longer matched it. The query worked only when it gave the table an
+alias of its own (`FROM readings r ... r.value`). Postgres and TimescaleDB SQL
+qualifies columns this way all the time, for example the LATERAL subquery that
+reads the latest value of each channel at a point in time:
+
+```sql
+SELECT c.ch, r.time, r.value
+FROM (VALUES ('x'), ('y'), ('z')) c(ch)
+LEFT JOIN LATERAL (
+  SELECT time, value FROM readings
+  WHERE readings.channel_id = c.ch AND time <= TIMESTAMP '2026-11-03 16:22:00'
+  ORDER BY time DESC LIMIT 1
+) r ON true
+```
+
+The rewritten read now carries the table's name (`AS "readings"`) whenever the
+query qualifies a column with it and the reference has no alias of its own.
+This covers `FROM`, every `JOIN` form, comma joins, `database.table` references
+(named by the table), and queries with or without the `x-arc-database` header.
+A query that never qualifies by table name is rewritten exactly as before.
+
+Three things now behave the way Postgres does, where before they relied on the
+relation having no name:
+
+- **An inner reference shadows an outer alias of the same name.** In
+  `FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
+  the inner `readings.value` now reads the inner table. Before, it bound to the
+  outer relation.
+- **A struct column named like its table.** In a query that also qualifies by
+  the table name, `readings.value` now names the table's column `value`, not a
+  field of a struct column called `readings`.
+- **`read_parquet.col`.** A query that qualified columns with the internal name
+  `read_parquet` keeps working unless it also qualifies by the table name.
+
+A table reference followed by `WITH ORDINALITY` keeps its old form, because
+DuckDB accepts that clause only before an alias. Continuous queries still read
+their source unaliased, so give the table an alias there. A delete's `WHERE`
+clause runs over an unaliased read too: use unqualified column names in it.
+
 ### A MessagePack value its column cannot hold is a client error, not a 500 ([#1424](https://github.com/Basekick-Labs/arc/issues/1424))
 
 A columnar MessagePack record with a value of the wrong type for its column,
