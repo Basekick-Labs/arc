@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -41,27 +42,58 @@ func TestValidateObjectPrefix(t *testing.T) {
 }
 
 func TestValidateObjectPrefixDiagnosticSurvivesLogSanitization(t *testing.T) {
-	_, err := ValidateObjectPrefix("tenant/bad*prefix")
-	if err == nil {
-		t.Fatal("ValidateObjectPrefix accepted a prefix with an unsupported character")
-	}
-
-	got := sqlutil.SanitizeErrText(err.Error())
-	for _, want := range []string{
-		"storage prefix",
-		"unsupported character",
-		"ASCII letters",
-		"digits",
-		"slash",
-		"hyphen",
-		"underscore",
-		"period",
+	for _, tc := range []struct{ prefix, code string }{
+		{"tenant/bad*prefix", "U+002A"},
+		{"it's/", "U+0027"},
+		{`a"b/`, "U+0022"},
+		{"a\nb/", "U+000A"},
+		{"aé/", "U+00E9"},
 	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("sanitized diagnostic %q does not contain %q", got, want)
-		}
+		t.Run(tc.code, func(t *testing.T) {
+			_, err := ValidateObjectPrefix(tc.prefix)
+			if err == nil {
+				t.Fatal("accepted a prefix with an unsupported character")
+			}
+			got := sqlutil.SanitizeErrText(err.Error())
+			for _, want := range []string{"storage prefix", "unsupported character " + tc.code, "ASCII letters", "digits", "slash", "hyphen", "underscore", "period"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("sanitized diagnostic %q does not contain %q", got, want)
+				}
+			}
+			if strings.Contains(err.Error(), tc.prefix) {
+				t.Errorf("diagnostic exposed the rejected prefix: %q", err)
+			}
+			if got != err.Error() {
+				t.Errorf("sanitization changed diagnostic: %q -> %q", err, got)
+			}
+		})
 	}
-	if strings.Contains(got, "tenant/bad*prefix") {
-		t.Errorf("sanitized diagnostic exposed the rejected prefix: %q", got)
+}
+
+func TestValidateObjectPrefixPathDiagnosticSurvivesLogSanitization(t *testing.T) {
+	for _, tc := range []struct{ prefix, want string }{
+		{"/", "not a relative prefix"},
+		{"/tenant", "must be relative"},
+		{"tenant//data", "empty segment"},
+		{"tenant/./data", "single-dot segment"},
+		{"tenant/../data", "double-dot segment"},
+		{`tenant\data`, "backslash"},
+		{"tenant/\x00data", "NUL byte"},
+		{strings.Repeat("a", MaxUsableKeySegmentLen+1), "segment, over"},
+		{strings.Repeat("a/", MaxUsableKeyLen), "byte limit"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			_, err := ValidateObjectPrefix(tc.prefix)
+			if !errors.Is(err, ErrInvalidPath) {
+				t.Fatalf("error = %v, want ErrInvalidPath", err)
+			}
+			got := sqlutil.SanitizeErrText(err.Error())
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("sanitized diagnostic %q does not contain %q", got, tc.want)
+			}
+			if got != err.Error() {
+				t.Errorf("sanitization changed diagnostic: %q -> %q", err, got)
+			}
+		})
 	}
 }

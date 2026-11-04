@@ -3081,8 +3081,9 @@ func noRelease() {}
 // several at once, cannot run the volume past its reserve, and released as
 // the request's appends reach the WAL queue, or when release runs. Writes
 // under the context skip their own disk pressure check, so pressure that
-// starts part-way cannot leave the request half written; fencing is still
-// checked per call. With no disk gate ctx is returned unchanged.
+// starts part-way cannot leave the request half written; the ingest gate is
+// still checked per call (AdmitWholeRequest checks it once). With no disk gate
+// ctx is returned unchanged.
 func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
 		if err := (*g)(); err != nil {
@@ -3104,6 +3105,35 @@ func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context
 	return context.WithValue(ctx, walDiskAdmittedKey{}, r), r.release, nil
 }
 
+// fenceAdmittedKey marks a context whose request passed the ingest gate (the
+// fence and stream-takeover pauses) as a whole (AdmitWholeRequest).
+type fenceAdmittedKey struct{}
+
+// AdmitWholeRequest is AdmitRequest for a request written as several buffer
+// calls, such as a line-protocol body of several measurements: writes under
+// the returned context skip the ingest gate (the fence and stream-takeover
+// pauses) too, so it is checked once for the whole request, as
+// ArrowBuffer.Write checks it for a MessagePack batch. Checked per call, a
+// gate that closed part-way stopped the request after its earlier
+// measurements were buffered, and a client resending it duplicated them
+// (#1422). A request admitted before the gate closes is not refused by it
+// part-way, however long its buffer calls take (schema-change flushes,
+// durable WAL syncs). Other failures can still stop it part-way.
+//
+// A long-running write (an import) uses AdmitRequest instead, so the gate
+// still stops it part-way. With no ingest gate (a standalone node) there is
+// nothing to skip, and ctx is returned as AdmitRequest returns it.
+func (b *ArrowBuffer) AdmitWholeRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
+	ctx, release, err := b.AdmitRequest(ctx, walBytes)
+	if err != nil {
+		return ctx, release, err
+	}
+	if g := b.ingestGate.Load(); g == nil || *g == nil {
+		return ctx, release, nil
+	}
+	return context.WithValue(ctx, fenceAdmittedKey{}, true), release, nil
+}
+
 func countWALDiskRefusal(ctx context.Context) {
 	if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
 		metrics.Get().IncWALDiskPressureRejections()
@@ -3112,8 +3142,10 @@ func countWALDiskRefusal(ctx context.Context) {
 
 func (b *ArrowBuffer) checkIngestGate(ctx context.Context) error {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
-		if err := (*g)(); err != nil {
-			return err
+		if admitted, _ := ctx.Value(fenceAdmittedKey{}).(bool); !admitted {
+			if err := (*g)(); err != nil {
+				return err
+			}
 		}
 	}
 	// Order matters for the common path: no gate, then no pressure, and only

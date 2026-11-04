@@ -46,7 +46,7 @@ func ValidateObjectPrefix(prefix string) (string, error) {
 	// separator is what a prefix is for, so strip it before checking and add
 	// it back after.
 	if err := ValidateListPrefix(prefix); err != nil {
-		return "", fmt.Errorf("storage prefix %q is not usable: %w", prefix, err)
+		return "", fmt.Errorf("storage prefix is not usable: %w", err)
 	}
 	// Defence in depth against SQL injection: the prefix is interpolated into
 	// DuckDB read_parquet() calls, so keep the character allowlist the old
@@ -57,8 +57,7 @@ func ValidateObjectPrefix(prefix string) (string, error) {
 		case c == '/' || c == '-' || c == '_' || c == '.':
 		default:
 			return "", fmt.Errorf(
-				"storage prefix %q contains an unsupported character %q; allowed characters are ASCII letters, digits, slash, hyphen, underscore, and period",
-				prefix,
+				"storage prefix contains an unsupported character %U; allowed characters are ASCII letters, digits, slash, hyphen, underscore, and period",
 				c,
 			)
 		}

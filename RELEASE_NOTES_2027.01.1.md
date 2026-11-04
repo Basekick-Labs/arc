@@ -2039,12 +2039,64 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Invalid object-store prefix diagnostics retain their allowed character set
+### Invalid object-store prefix diagnostics remain readable after log masking ([#1113](https://github.com/Basekick-Labs/arc/issues/1113))
 
-Validation errors now state the allowed prefix characters explicitly, so
-sanitized logs remain actionable even when the rejected value is masked.
+Validation errors identify unsupported characters by code point and describe
+invalid path segments without quoting configured values. The allowed character
+set and rejection reason now survive log sanitization, including quote characters.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+
+### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
+
+With RBAC on, a query's permission check reads the table names in the SQL it
+receives, and the query transform separately turns those names into the
+storage paths that are read. Where the two disagreed about a name, the query
+read a database and measurement that nobody checked (#986 fixed three such
+cases). The transform now records the database and measurement of every
+storage path it builds, including on a cached transform, and any the
+permission check did not cover is checked before the query runs. A query
+refused there answers 403, on `/api/v1/query` (JSON and MessagePack),
+`/api/v1/query/arrow`, `/api/v1/query/estimate` and `GET
+/api/v1/query/:measurement`. A transform that reads storage without recording
+what it reads is refused with a 500 rather than run unchecked.
+
+When the permission check saw everything the transform reads, which is the
+case for every query today, the new check makes no RBAC call; recording the
+reads adds about 3-5% to the transform.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
+
+### Time-bounded arcx queries avoid listing unrelated partitions ([#661](https://github.com/Basekick-Labs/arc/issues/661))
+
+The arcx router listed every file of the measurement for each routed query. A
+date-trunc or flat-scan query whose `WHERE` bounds `time` on both sides now
+lists only the hour and day partitions of that range, as the DuckDB path does.
+On a local measurement with a year of hourly partitions, a one-hour window
+went from 198 ms to 0.1 ms and a seven-day window to 5.4 ms. A query bounded
+only by a start (`time > now() - INTERVAL '1 hour'`) still lists the whole
+measurement, so rows stamped ahead of the clock are never left out. Other
+query shapes, and object storage, keep the full listing.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1293](https://github.com/Basekick-Labs/arc/pull/1293).
+
+### A line-protocol write is no longer refused part-way by the ingest gate ([#1422](https://github.com/Basekick-Labs/arc/issues/1422))
+
+A line-protocol body with several measurements is buffered one measurement at
+a time, and the ingest gate (the fence and stream-takeover pauses, #1207) was
+checked again for each one. When the gate closed part-way, during a writer
+failover or a stream takeover, the write stopped after its first measurements
+were already buffered, and a client that resent the request, such as Telegraf
+or an InfluxDB client, wrote those rows twice. The gate is now checked once
+for the whole request, before anything is written, as it already was for a
+MessagePack batch: a request admitted before the gate closes is no longer
+refused part-way by it. Other failures can still stop a request part-way, and
+are answered with what was written (#1437). The line-protocol, CSV and Parquet
+imports still check the gate for each buffer call, so it stops a long import
+part-way.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1428](https://github.com/Basekick-Labs/arc/pull/1428).
 
 ### A refused write is no longer replayed from the WAL ([#1438](https://github.com/Basekick-Labs/arc/issues/1438))
 
@@ -2181,6 +2233,44 @@ across a failed flush, enable the WAL.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1379](https://github.com/Basekick-Labs/arc/pull/1379).
+
+### A deleted database disappears from the database list ([#1425](https://github.com/Basekick-Labs/arc/issues/1425))
+
+`GET /api/v1/databases` and `SHOW DATABASES` built their lists from
+directories, so a deleted database whose directories outlived its files stayed
+listed, with `measurement_count: 0`, and `GET
+/api/v1/databases/:name/measurements` still listed its measurements, while
+`GET /api/v1/databases/:name` answered 404. Two stores do that:
+
+- **Local storage.** The delete removed the files but left their
+  `measurement/YYYY/MM/DD/HH` directories. It now removes the empty
+  directories, deepest first; a directory that still holds a file stays, with
+  the directories above it. Deleting a database an earlier version left
+  behind still answers 404, and now removes its directories too.
+- **Object stores that keep empty prefixes** (SeaweedFS). A prefix outlives
+  its last object, and Arc cannot remove it through the storage API.
+
+So all three now answer by the rule `GET /api/v1/databases/:name` uses: a
+database is its marker, a file, a tiering metadata row, or a cluster manifest
+entry, and directories alone are not one.
+
+What that costs:
+
+- `GET /api/v1/databases` already reads every file, so a database with a file
+  or a tiering row costs nothing extra. Each other database is checked, 16 at
+  a time. On a store that keeps empty prefixes every database ever deleted
+  stays one of those, so the list's cost grows with them.
+- `SHOW DATABASES` read only directories, and now looks for each database's
+  first file, 16 at a time: usually one listing request on an object store,
+  plus one for a database with only its marker.
+- The measurements endpoint, for a database without a marker, now also looks
+  for its first file.
+- `GET /api/v1/databases/:name`, for a database without a marker, now stops at
+  its first file instead of listing all of them. That is every database
+  created by a write rather than by `POST /api/v1/databases`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1427](https://github.com/Basekick-Labs/arc/pull/1427).
 
 ### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
 

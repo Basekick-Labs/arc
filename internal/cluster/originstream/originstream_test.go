@@ -411,23 +411,16 @@ func TestSlowStandbyOnlyLosesItsOwn(t *testing.T) {
 	dropped := metrics.Get().Snapshot()["origin_stream_dropped"].(int64)
 	big := string(bytes.Repeat([]byte("x"), 64<<10))
 	const n = 600 // ~38 MiB: past the stuck connection's socket buffers and its 8 MiB queue
-	// Keep real concurrent writes within each burst, but let the good standby
-	// drain it before publishing more. A fixed sleep assumes a minimum receiver
-	// throughput that a busy race-enabled runner cannot guarantee. Each 1 MiB
-	// burst fits well below the unchanged 8 MiB per-standby queue; the stuck
-	// standby never drains and must still exhaust its queue across the bursts.
-	const burst = 16
 	for c := uint64(1); c <= n; c++ {
 		hook(p, "db/a", c, big)
-		if c%burst == 0 || c == n {
-			waitFor(t, fmt.Sprintf("the good standby to receive entry %d", c), func() bool {
-				good.mu.Lock()
-				defer good.mu.Unlock()
-				d := good.instances[instanceID{"primary", p.instance}]
-				return d != nil && d.keys["db/a"] != nil && d.keys["db/a"].last == c
-			})
-		}
+		time.Sleep(time.Millisecond) // ~64 MiB/s: the good standby keeps up, under -race too
 	}
+	waitFor(t, "the good standby to receive everything", func() bool {
+		good.mu.Lock()
+		defer good.mu.Unlock()
+		d := good.instances[instanceID{"primary", p.instance}]
+		return d != nil && d.keys["db/a"] != nil && d.keys["db/a"].last == n
+	})
 	if g := keyGaps(good, "primary", p.instance, "db/a"); len(g) != 0 {
 		t.Fatalf("the good standby has gaps %v because another standby is slow", g)
 	}

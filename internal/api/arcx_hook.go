@@ -64,6 +64,7 @@ func (h *QueryHandler) tryArcxRouter(
 	}
 	deps := arcxrouter.Deps{
 		Storage:      h.storage,
+		Pruner:       h.pruner,
 		Exclude:      h.openCompactionExclusions,
 		DB:           h.db,
 		Logger:       h.logger,
@@ -81,6 +82,10 @@ func (h *QueryHandler) tryArcxRouter(
 	}
 	d := arcxrouter.Decide(rawSQL, headerDB, deps)
 	if !d.Eligible {
+		return false
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", []TableReference{{Database: d.Ctx.Database, Measurement: d.Ctx.Measurement}}); err != nil {
+		h.logger.Warn().Err(err).Msg("arcx query scope was not authorised; falling back to DuckDB")
 		return false
 	}
 	return arcxrouter.Run(c, d, deps, mode, start)
@@ -111,6 +116,7 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	}
 	deps := arcxrouter.Deps{
 		Storage:      h.storage,
+		Pruner:       h.pruner,
 		Exclude:      h.openCompactionExclusions,
 		DB:           h.db,
 		Logger:       h.logger,
@@ -121,6 +127,10 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	}
 	d := arcxrouter.Decide(rawSQL, headerDB, deps)
 	if !d.Eligible {
+		return false
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", []TableReference{{Database: d.Ctx.Database, Measurement: d.Ctx.Measurement}}); err != nil {
+		h.logger.Warn().Err(err).Msg("arcx Arrow query scope was not authorised; falling back to DuckDB")
 		return false
 	}
 	reader, served := arcxrouter.RunArrow(execCtx, d, deps, mode)
