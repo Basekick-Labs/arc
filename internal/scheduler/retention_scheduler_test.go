@@ -1,9 +1,12 @@
 package scheduler
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/api"
 	"github.com/robfig/cron/v3"
 	"github.com/rs/zerolog"
 )
@@ -222,5 +225,24 @@ func TestCronNextRun(t *testing.T) {
 	// Next run should be within 24 hours
 	if nextRun.Sub(now) > 24*time.Hour {
 		t.Error("next run should be within 24 hours")
+	}
+}
+
+// #1433: a manual trigger refused without running anything returns the api
+// package's error for it, which the API answers 409 or 403. The license check
+// returned nil, which the API answered 200 "Retention triggered successfully".
+func TestRetentionScheduler_TriggerNowRefusals(t *testing.T) {
+	reader := &mockCQClusterGate{role: "reader"}
+	s, err := NewRetentionScheduler(&RetentionSchedulerConfig{ClusterGate: reader, Logger: zerolog.Nop()})
+	if err != nil {
+		t.Fatalf("NewRetentionScheduler failed: %v", err)
+	}
+	if err := s.TriggerNow(context.Background()); !errors.Is(err, api.ErrRetentionTriggerRoleGated) {
+		t.Errorf("TriggerNow on a reader: err = %v, want ErrRetentionTriggerRoleGated", err)
+	}
+
+	reader.isPrimary.Store(true)
+	if err := s.TriggerNow(context.Background()); !errors.Is(err, api.ErrRetentionTriggerUnlicensed) {
+		t.Errorf("TriggerNow without a license: err = %v, want ErrRetentionTriggerUnlicensed", err)
 	}
 }

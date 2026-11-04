@@ -161,7 +161,7 @@ func TestLPWriteFailingFirstMeasurementIsUnchanged(t *testing.T) {
 // A measurement refused for its content is dropped; the others are written.
 func TestLPWriteDropsAContentRefusalAndWritesTheRest(t *testing.T) {
 	for _, path := range lpPaths {
-		for _, cause := range []error{ingest.ErrColumnTypeChange, ingest.ErrUnstorableColumnName} {
+		for _, cause := range []error{ingest.ErrColumnTypeChange, ingest.ErrUnstorableColumnName, ingest.ErrUnstorableColumnValue} {
 			t.Run(path.name+"/"+cause.Error(), func(t *testing.T) {
 				r := newLPWriteRig(t, path.cfg())
 				failLPAt(t, "bbb", cause)
@@ -301,7 +301,7 @@ func TestLPWriteStoppedReportsDroppedPoints(t *testing.T) {
 // A MessagePack batch whose every record was refused for its content is a
 // client error, whichever content check refused it.
 func TestMsgPackContentRefusalWithNothingWrittenIs400(t *testing.T) {
-	for _, cause := range []error{ingest.ErrColumnTypeChange, ingest.ErrUnstorableColumnName} {
+	for _, cause := range []error{ingest.ErrColumnTypeChange, ingest.ErrUnstorableColumnName, ingest.ErrUnstorableColumnValue} {
 		r := newLPWriteRig(t, nil)
 		app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
 		NewMsgPackHandler(zerolog.New(r.log), r.buf, 100<<20).RegisterRoutes(app)

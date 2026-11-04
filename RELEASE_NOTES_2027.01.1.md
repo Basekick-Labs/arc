@@ -149,6 +149,35 @@ itself and be rejected with 403, leaving peer caches stale after compaction,
 retention, DELETE or database/measurement removal. Explicit API hosts remain
 unchanged. Forwarded requests and invalidation now share the same resolver.
 
+## New: a configurable SQL length limit ([#1448](https://github.com/Basekick-Labs/arc/issues/1448))
+
+Arc refused any query longer than 10,000 characters, a fixed limit. A query
+naming many series, for example the latest value of 2,500 channels listed in
+an `IN (...)`, needs far more. The limit is now `query.max_sql_length`
+(env `ARC_QUERY_MAX_SQL_LENGTH`), in bytes:
+
+```toml
+[query]
+max_sql_length = 200000
+```
+
+- The default stays 10000. Values from 1000 to 1048576 (1 MiB) are accepted,
+  and the value must be smaller than `server.max_payload_size`, which limits
+  the request body that carries the SQL. Anything else refuses to start,
+  naming the key.
+- It applies to every endpoint that runs SQL (JSON, MessagePack, Arrow and the
+  row estimate) and to continuous query definitions. A continuous query is
+  checked again at every run, so lowering the limit below a stored
+  definition's length makes that query fail until it is shortened.
+- Preparing a long query now takes time in proportion to its length. Before,
+  restoring its string literals copied the whole statement once per literal,
+  so a 1 MB query with 50,000 literals spent 9.3 s there, and a 2.3 MB one
+  34 s. Both now take under 0.6 s. Validation and rewriting together cost
+  about 0.5 s of CPU per MiB before DuckDB starts, which is why the ceiling is
+  1 MiB.
+- Queries longer than 10,000 characters are not kept in the SQL transform
+  cache, so a raised limit leaves the cache's memory bound unchanged.
+
 ## New: MessagePack columnar tag keys (#275)
 
 MessagePack columnar payloads now accept an optional `tag_keys` field to
@@ -2046,6 +2075,142 @@ invalid path segments without quoting configured values. The allowed character
 set and rejection reason now survive log sanitization, including quote characters.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+### A delete's WHERE may qualify columns by the measurement name ([#1451](https://github.com/Basekick-Labs/arc/issues/1451))
+
+`POST /api/v1/delete` with `"where": "cpu.host = 'web-1'"` on measurement `cpu`
+failed with `Referenced table "cpu" not found`, while `"where": "host = 'web-1'"`
+worked. The caller sends only the predicate, so there was no alias to give the
+measurement either. A qualifier naming the measurement is now dropped before
+the clause is validated, recorded or run: `cpu.host`, `"cpu".host` and
+`CPU.host` all mean the column `host`. A name used bare (`cpu = 'x'`), one
+deeper in a path (`x.cpu.host`), and text inside string literals are left as
+written.
+
+The rows read are not renamed after the measurement, on purpose. A
+measurement often has a field named like itself, and in a file without that
+field the name would then stand for the whole row: `temperature IS NOT NULL`
+would match every row of such a file and delete it.
+
+As with a query's table-name qualifier
+([#1447](https://github.com/Basekick-Labs/arc/issues/1447)), a struct column
+named like its measurement is no longer reached through that name with a
+field (`cpu.x` now means the column `x`).
+
+### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447), [#1450](https://github.com/Basekick-Labs/arc/issues/1450))
+
+`SELECT readings.value FROM readings` failed with `Referenced table "readings"
+not found`. Arc replaces a table reference with a `read_parquet(...)` read, and
+DuckDB names that relation `read_parquet`, so a column qualified by the table's
+own name no longer matched it. The query worked only when it gave the table an
+alias of its own (`FROM readings r ... r.value`). Postgres and TimescaleDB SQL
+qualifies columns this way all the time, for example the LATERAL subquery that
+reads the latest value of each channel at a point in time:
+
+```sql
+SELECT c.ch, r.time, r.value
+FROM (VALUES ('x'), ('y'), ('z')) c(ch)
+LEFT JOIN LATERAL (
+  SELECT time, value FROM readings
+  WHERE readings.channel_id = c.ch AND time <= TIMESTAMP '2026-11-03 16:22:00'
+  ORDER BY time DESC LIMIT 1
+) r ON true
+```
+
+The rewritten read now carries the table's name (`AS "readings"`) whenever the
+query qualifies a column with it and the reference has no alias of its own.
+This covers `FROM`, every `JOIN` form, comma joins, `database.table` references
+(named by the table), and queries with or without the `x-arc-database` header.
+It also covers continuous queries, whose source read is named after the source
+measurement: a body such as
+`SELECT cpu.host, avg(cpu.usage) AS usage FROM prod.cpu WHERE time >= {start_time} AND time < {end_time} GROUP BY 1`
+failed at every scheduled run and now writes its rows. A query that never qualifies by
+table name is rewritten exactly as before.
+
+A query that also gives the name to another relation, as in
+`FROM readings JOIN (SELECT ...) readings USING (channel_id)` or
+`FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
+keeps the unaliased read: naming the table as well would be a duplicate alias
+in the first, and would change which relation `readings.value` reads in the
+second. This holds wherever the other relation is in the query, including a
+subquery or `LATERAL` join aliased with the table's name
+(`LEFT JOIN LATERAL (SELECT ... FROM readings ...) readings ON true`); give one
+of the two a different alias to qualify by the table's name there. A column named like the table, such as Telegraf's `cpu` tag on the
+`cpu` measurement, is not an alias wherever it appears, so it does not stop
+the table being named.
+
+Two things now behave the way Postgres does, where before they relied on the
+relation having no name:
+
+- **A struct column named like its table.** In a query that also qualifies by
+  the table name, `readings.value` now names the table's column `value`, not a
+  field of a struct column called `readings`.
+- **`read_parquet.col`.** A query that qualified columns with the internal name
+  `read_parquet` keeps working unless it also qualifies by the table name.
+
+A table reference followed by `WITH ORDINALITY` keeps its old form, because
+DuckDB accepts that clause only before an alias. A delete's `WHERE` may
+qualify columns by the measurement name too; see
+[#1451](https://github.com/Basekick-Labs/arc/issues/1451) above.
+
+### A MessagePack value its column cannot hold is a client error, not a 500 ([#1424](https://github.com/Basekick-Labs/arc/issues/1424))
+
+A columnar MessagePack record with a value of the wrong type for its column,
+such as `{"m": "cpu", "columns": {"time": [1, 2], "v": [1, "oops"]}}`, was
+answered `500 Failed to write records`, while the same conflict in row records
+or over line protocol is a `400` partial write. Clients take a 500 for a server
+failure: the Python SDK's buffered writer, for one, could not tell whether the
+batch was written. The record is now refused for its content, like a column
+that changes between string and binary: a request whose only record it is gets
+a `400` naming the measurement and column, and in a batch the record is
+dropped, the others are written, and the answer is the `400` partial write.
+Nothing of the refused record reaches the WAL, so it is not replayed at the
+next start. The same applies to a value outside a decimal column's precision,
+which over line protocol on a node with `ingest.decimal_columns` also answered
+500. An MQTT message is handled the same way: its other records are written
+and the refused one is logged as dropped points, and a message refused whole
+is logged as refused for its content, at most once per topic every ten
+minutes, instead of as an error each time.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1444](https://github.com/Basekick-Labs/arc/pull/1444).
+
+### The tiering file list applies the tier and database filters together ([#1430](https://github.com/Basekick-Labs/arc/issues/1430))
+
+`GET /api/v1/tiering/files?tier=cold&database=X` returned the database's files
+in every tier: with `database` set, `tier` was ignored. With both set, the list
+is now the database's files in that tier, newest partition first as for
+`database` alone, read from SQLite on its `(database, tier)` index. `limit`
+applies to that list as before. Either filter alone is unchanged. A `tier`
+other than `hot` or `cold`, such as `COLD` or `warm`, used to list the hot
+files with a `200`; it is now answered `400 invalid tier`, with or without
+`database`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1446](https://github.com/Basekick-Labs/arc/pull/1446).
+
+### The scheduler control routes say why a scheduler is not running ([#1433](https://github.com/Basekick-Labs/arc/issues/1433))
+
+`POST /api/v1/schedulers/cq/reload` and `POST
+/api/v1/schedulers/retention/trigger` answered `503 "... is not running -
+enterprise license required"` whenever the scheduler was not running, also on
+a licensed node with `continuous_query.enabled` or `retention.enabled` set to
+false. They now give the reason `GET /api/v1/schedulers/` gives: without a
+valid license, or with a tier that does not include the scheduler, a `403`, as
+other license-gated routes answer; with the license in order, a `503` saying
+the feature is not enabled or the scheduler failed to start, which the startup
+log reports. `GET /api/v1/schedulers/` now names that second cause too.
+
+A retention trigger the scheduler refuses without running anything is no
+longer a `500`: on a cluster node that is not the primary writer, or while a
+retention cycle is running, it is a `409`. A trigger after the license stopped
+including the scheduler, which answered `200 "Retention triggered
+successfully"` without running anything, is a `403`. A CQ reload after the
+license stopped including the scheduler stopped every continuous query and
+answered `200 "CQ scheduler reloaded successfully"`; it is now a `403` and
+leaves the running continuous queries as they were.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1445](https://github.com/Basekick-Labs/arc/pull/1445).
 
 ### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
 

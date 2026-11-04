@@ -598,6 +598,10 @@ type QueryConfig struct {
 	// FileTimePruningMarginSeconds widens the keep-window below the query's
 	// lower bound to absorb writer clock skew (default 300).
 	FileTimePruningMarginSeconds int
+	// MaxSQLLength caps the length in bytes of a query's SQL (#1448), on every
+	// endpoint that runs user SQL and on continuous query definitions.
+	// Default 10000; MaxSQLLengthCeiling at most.
+	MaxSQLLength int
 	// StableSchema (26.09.2, #914) lists a measurement's zero-row field
 	// schema anchor first in every read_parquet, so a field absent from
 	// the files a time range selects binds as a typed NULL column instead of
@@ -1295,6 +1299,7 @@ func Load() (*Config, error) {
 			SlowQueryThresholdMs:          v.GetInt("query.slow_query_threshold_ms"),
 			FileTimePruning:               v.GetBool("query.file_time_pruning"),
 			FileTimePruningMarginSeconds:  v.GetInt("query.file_time_pruning_margin_seconds"),
+			MaxSQLLength:                  v.GetInt("query.max_sql_length"),
 			StableSchema:                  v.GetBool("query.stable_schema"),
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
@@ -1940,7 +1945,36 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if err := checkMaxSQLLength(cfg.Query.MaxSQLLength, cfg.Server.MaxPayloadSize); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// DefaultMaxSQLLength is query.max_sql_length's default, the cap Arc always
+// had. MinMaxSQLLength and MaxSQLLengthCeiling bound what it accepts: below
+// the floor ordinary queries stop fitting, and above the ceiling one query's
+// validation and rewrite cost more than half a second of CPU before DuckDB
+// starts (about 0.5 s per MiB, linear).
+const (
+	DefaultMaxSQLLength = 10000
+	MinMaxSQLLength     = 1000
+	MaxSQLLengthCeiling = 1 << 20
+)
+
+func checkMaxSQLLength(n int, maxPayload int64) error {
+	if n < MinMaxSQLLength || n > MaxSQLLengthCeiling {
+		return fmt.Errorf("query.max_sql_length is %d; it must be between %d and %d bytes",
+			n, MinMaxSQLLength, MaxSQLLengthCeiling)
+	}
+	// The body limit is enforced before the handler runs, and the SQL travels
+	// inside a JSON or MessagePack body, so a cap at or above it never applies.
+	if maxPayload > 0 && int64(n) >= maxPayload {
+		return fmt.Errorf("query.max_sql_length (%d) must be smaller than server.max_payload_size (%d); "+
+			"the request body carrying the SQL is limited first", n, maxPayload)
+	}
+	return nil
 }
 
 func setDefaults(v *viper.Viper) {
@@ -2182,6 +2216,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
 	v.SetDefault("query.file_time_pruning", true)                // On by default since 27.01.1 (#659); false turns it off
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
+	v.SetDefault("query.max_sql_length", DefaultMaxSQLLength)    // #1448: bytes of SQL per query
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
 	v.SetDefault("query.stable_schema_bootstrap", true)          // Build anchors for pre-26.09.2 measurements on first query
 	v.SetDefault("query.stable_schema_bootstrap_max_files", 500) // Footers sampled per bootstrap (newest days, compacted files first)
