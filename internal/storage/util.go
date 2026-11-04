@@ -184,7 +184,7 @@ func GetStoragePath(backend Backend, database, measurement string) (string, erro
 	// one would serve files that are not data (#1207 d2a2a). ("." roots
 	// stay readable: the query rewriter's inert sentinel is one.)
 	if strings.HasPrefix(database, "_") {
-		return "", fmt.Errorf("database: %q is a reserved name", database)
+		return "", errors.New("database: a name starting with _ is reserved")
 	}
 	if err := validateReadSegment("measurement", measurement); err != nil {
 		return "", err

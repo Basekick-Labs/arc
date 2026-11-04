@@ -713,7 +713,10 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		for _, p := range batch {
 			key, kerr := b.prefixedKey(p)
 			if kerr != nil {
-				nonFatalErrs = append(nonFatalErrs, kerr)
+				// Named here, as a field and in the text: the joined error is
+				// logged only up to its first line (#1113).
+				b.logger.Warn().Err(kerr).Str("key", p).Msg("S3 batch: key refused before the delete")
+				nonFatalErrs = append(nonFatalErrs, fmt.Errorf("%s: %w", p, kerr))
 				continue
 			}
 			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/rs/zerolog"
 )
 
@@ -201,21 +202,19 @@ func TestNewBackendUnknownTypeNamesEveryAlias(t *testing.T) {
 			t.Fatalf("NewBackend(type=%q) returned a non-nil backend alongside an error", badType)
 		}
 		msg := err.Error()
-		// The message echoes the rejected value, and that echo can itself
-		// contain an alias ("s3 bucket" contains "s3"), which would satisfy the
-		// check below for the wrong reason. Look for the aliases in what is
-		// left after the quoted echo is removed.
-		aliasText := msg
-		if i, j := strings.Index(aliasText, `"`), strings.LastIndex(aliasText, `"`); i >= 0 && j > i {
-			aliasText = aliasText[:i] + aliasText[j+1:]
+		// The rejected value is not echoed: in a log it would be masked, and
+		// the config check that runs first names the key (#1113). The list
+		// of aliases must survive logging, so no quote may precede it.
+		if strings.Contains(msg, badType) && badType != "" {
+			t.Errorf("NewBackend(type=%q) error echoes the rejected value: %s", badType, msg)
+		}
+		if got := sqlutil.SanitizeErrText(msg); got != msg {
+			t.Errorf("NewBackend(type=%q) error changes when logged: %q -> %q", badType, msg, got)
 		}
 		for _, alias := range []string{"local", "s3", "minio", "azure", "azblob", "gcs"} {
-			if !strings.Contains(aliasText, alias) {
+			if !strings.Contains(msg, alias) {
 				t.Errorf("NewBackend(type=%q) error does not name the %q alias: %s", badType, alias, msg)
 			}
-		}
-		if badType != "" && !strings.Contains(msg, badType) {
-			t.Errorf("NewBackend(type=%q) error does not echo the rejected value: %s", badType, msg)
 		}
 	}
 }

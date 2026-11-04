@@ -1010,7 +1010,7 @@ func ValidateKey(key string) error {
 		return fmt.Errorf("%w: key is empty", ErrInvalidPath)
 	}
 	if key[len(key)-1] == '/' {
-		return fmt.Errorf("%w: %q ends in a separator, which names the same object as %q", ErrInvalidPath, key, key[:len(key)-1])
+		return fmt.Errorf("%w: key ends in a separator, which names the same object as the key without it", ErrInvalidPath)
 	}
 	// PartSuffix is reserved because LocalBackend stages every write at
 	// key+PartSuffix. Without this the staging file of key "x" IS the
@@ -1024,7 +1024,7 @@ func ValidateKey(key string) error {
 	// key remains portable between backends, which is the property #743
 	// established.
 	if strings.HasSuffix(key, PartSuffix) {
-		return fmt.Errorf("%w: %q ends in %q, which is reserved for write staging", ErrInvalidPath, key, PartSuffix)
+		return fmt.Errorf("%w: key ends in %s, which is reserved for write staging", ErrInvalidPath, PartSuffix)
 	}
 	return validateKeyBody(key)
 }
@@ -1137,9 +1137,9 @@ func ValidateKeySegment(seg string) error {
 		case 0:
 			return fmt.Errorf("%w: segment contains a NUL byte", ErrInvalidPath)
 		case '\\':
-			return fmt.Errorf("%w: segment %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, seg)
+			return fmt.Errorf("%w: segment contains a backslash, which Azure treats as a separator", ErrInvalidPath)
 		case '/':
-			return fmt.Errorf("%w: segment %q contains a separator, so it names more than one path component", ErrInvalidPath, seg)
+			return fmt.Errorf("%w: segment contains a separator, so it names more than one path component", ErrInvalidPath)
 		}
 	}
 	return checkSegment(seg)
@@ -1167,7 +1167,7 @@ const globMetacharacters = `*?[]{}`
 // segment of everything that spoke writes into the hub's storage root.
 func ValidateGlobSafe(s string) error {
 	if i := strings.IndexAny(s, globMetacharacters); i >= 0 {
-		return fmt.Errorf("%w: %q contains the glob metacharacter %q, which would match more than one path", ErrInvalidPath, s, s[i])
+		return fmt.Errorf("%w: contains the glob metacharacter %U, which would match more than one path", ErrInvalidPath, rune(s[i]))
 	}
 	return nil
 }
@@ -1186,7 +1186,7 @@ func (b *LocalBackend) stagedPath(key string) (string, error) {
 		return "", fmt.Errorf("%w: key is empty", ErrInvalidPath)
 	}
 	if key[len(key)-1] == '/' {
-		return "", fmt.Errorf("%w: %q ends in a separator", ErrInvalidPath, key)
+		return "", fmt.Errorf("%w: key ends in a separator", ErrInvalidPath)
 	}
 	if err := validateKeyBody(key); err != nil {
 		return "", err
