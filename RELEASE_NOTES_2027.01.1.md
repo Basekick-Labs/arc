@@ -2068,6 +2068,27 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A delete's WHERE may qualify columns by the measurement name ([#1451](https://github.com/Basekick-Labs/arc/issues/1451))
+
+`POST /api/v1/delete` with `"where": "cpu.host = 'web-1'"` on measurement `cpu`
+failed with `Referenced table "cpu" not found`, while `"where": "host = 'web-1'"`
+worked. The caller sends only the predicate, so there was no alias to give the
+measurement either. A qualifier naming the measurement is now dropped before
+the clause is validated, recorded or run: `cpu.host`, `"cpu".host` and
+`CPU.host` all mean the column `host`. A name used bare (`cpu = 'x'`), one
+deeper in a path (`x.cpu.host`), and text inside string literals are left as
+written.
+
+The rows read are not renamed after the measurement, on purpose. A
+measurement often has a field named like itself, and in a file without that
+field the name would then stand for the whole row: `temperature IS NOT NULL`
+would match every row of such a file and delete it.
+
+As with a query's table-name qualifier
+([#1447](https://github.com/Basekick-Labs/arc/issues/1447)), a struct column
+named like its measurement is no longer reached through that name with a
+field (`cpu.x` now means the column `x`).
+
 ### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447))
 
 `SELECT readings.value FROM readings` failed with `Referenced table "readings"

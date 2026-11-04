@@ -467,6 +467,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// A column qualified by the measurement's name means that column (#1451).
+	// Rewritten before validation, so what is validated is what runs.
+	req.Where = unqualifyMeasurement(req.Where, req.Measurement)
+
 	// Validate WHERE clause
 	isFullTableDelete, err := h.validateWhereClause(req.Where)
 	if err != nil {
