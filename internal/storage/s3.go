@@ -255,6 +255,37 @@ func (b *S3Backend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
 
+// WriteIfAbsent writes data at path unless an object is already there
+// (ConditionalWriter), with a conditional PutObject (If-None-Match: *). S3
+// answers 412 PreconditionFailed when the key exists, which is created=false;
+// a 409 ConditionalRequestConflict (another conditional write to the key in
+// flight) is an error for the caller to retry.
+func (b *S3Backend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return false, err
+	}
+	_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(b.bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		ContentType:   aws.String("application/octet-stream"),
+		IfNoneMatch:   aws.String("*"),
+	})
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+			return false, nil
+		}
+		recordStorageError(ctx, err)
+		return false, fmt.Errorf("failed to write to S3: %w", err)
+	}
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
+	return true, nil
+}
+
 // WriteReader writes data from a reader to S3.
 //
 // A body the SDK can rewind (*os.File, *bytes.Reader) goes as one PutObject
@@ -1233,6 +1264,6 @@ func (b *S3Backend) ClientSettings() S3ClientSettings {
 		Region:     b.region,
 		Endpoint:   b.clientEndpoint,
 		PathStyle:  b.pathStyle,
-		GCSInterop: isGCSEndpoint(b.clientEndpoint),
+		GCSInterop: IsGCSEndpoint(b.clientEndpoint),
 	}
 }

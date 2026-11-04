@@ -307,3 +307,43 @@ func TestFilesAndLocal_RepeatedlyMovingExclusionsFail(t *testing.T) {
 		t.Fatalf("moving exclusions exported %v, want an error", keysOf(files))
 	}
 }
+
+// Shared storage: a listed file the replicated manifest does not know means this node's manifest
+// (where the exclusions come from) lags a commit; the source waits for it once and lists again,
+// and does not wait when every listed file is known.
+func TestFilesAndLocal_ManifestBarrierOnlyForUnknownFiles(t *testing.T) {
+	ctx := context.Background()
+	b := localRig(t, oldKey, newKey)
+	src := NewStorageWalkSource(b, "arc", zerolog.Nop())
+	ex := &fakeExclusions{}
+	src.SetExclusions(ex)
+	known := map[string]bool{oldKey: true}
+	syncs := 0
+	src.SetManifestBarrier(func(p string) bool { return known[p] }, func(context.Context) error {
+		// The manifest catches up: the rewrite is registered and the old file left out.
+		syncs++
+		known[newKey] = true
+		ex.set(oldKey)
+		return nil
+	})
+	files, _, err := src.FilesAndLocal(ctx, cpu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keysOf(files); len(got) != 1 || got[0] != "a_rewrite_1.parquet" || syncs != 1 {
+		t.Fatalf("files = %v after %d syncs, want the rewrite only after 1", got, syncs)
+	}
+	if _, _, err := src.FilesAndLocal(ctx, cpu); err != nil || syncs != 1 {
+		t.Fatalf("every file known: %d syncs (err %v), want no further one", syncs, err)
+	}
+	// A file the manifest never learns of costs one barrier per call, not one per retry.
+	delete(known, newKey)
+	src.SetManifestBarrier(func(p string) bool { return known[p] }, func(context.Context) error { syncs++; return nil })
+	if _, _, err := src.FilesAndLocal(ctx, cpu); err != nil || syncs != 2 {
+		t.Fatalf("an unknown file: %d syncs (err %v), want exactly one more", syncs, err)
+	}
+	src.SetManifestBarrier(func(string) bool { return false }, func(context.Context) error { return errors.New("no leader") })
+	if _, _, err := src.FilesAndLocal(ctx, cpu); err == nil {
+		t.Fatal("a failed barrier must fail the measurement")
+	}
+}

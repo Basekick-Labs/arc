@@ -95,6 +95,14 @@ type Exporter struct {
 	// against a future concurrent caller.
 	hintFailMu  sync.Mutex
 	hintFailure bool
+	// fenced is set when a publish found another writer's v<N> (adopt.go); cleared with
+	// hintFailure. The pass that sees it stops before pruning or sweeping.
+	fenced error
+
+	// warehouseAuthoritative, published: see adopt.go.
+	warehouseAuthoritative bool
+	publishedMu            sync.Mutex
+	published              map[string]string
 
 	// collapseThreshold is the manifest count at which a pass also collapses the manifest set
 	// (see manifestCollapseThreshold). A field rather than a bare constant so a test can raise it
@@ -114,7 +122,15 @@ type Exporter struct {
 func (e *Exporter) resetHintFailure() {
 	e.hintFailMu.Lock()
 	e.hintFailure = false
+	e.fenced = nil
 	e.hintFailMu.Unlock()
+}
+
+// fencedErr returns the fence refusal recorded since the last reset, if any.
+func (e *Exporter) fencedErr() error {
+	e.hintFailMu.Lock()
+	defer e.hintFailMu.Unlock()
+	return e.fenced
 }
 
 // noteHintFailure records that a discovery-file write failed.
@@ -312,6 +328,12 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	// Namespace create is idempotent-ish; ignore "already exists".
 	if err := e.catalog.CreateNamespace(ctx, ns, nil); err != nil && !isAlreadyExists(err) {
 		return nil, fmt.Errorf("create namespace %v: %w", ns, err)
+	}
+
+	// The warehouse is the authority on the table's version (adopt.go): adopt what another node
+	// published before loading, or this load would start a fork from a stale row.
+	if _, err := e.adoptPublished(ctx, ident, catalogNamespaceKey(ns), ident[len(ident)-1]); err != nil {
+		return nil, err
 	}
 
 	tbl, err := e.catalog.LoadTable(ctx, ident)
@@ -578,6 +600,9 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	if err != nil {
 		return false, err
 	}
+	if err := e.fencedErr(); err != nil {
+		return false, err // EnsureTable's create or evolve lost a publish race (adopt.go)
+	}
 	hintOK := !e.hintFailed()
 
 	want := make(map[string]int64, len(current))
@@ -629,8 +654,12 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 		// skipped by the scheduler's fingerprint gate before it ever reaches this
 		// function, so for such a table THIS is the pass that reclaims: the first
 		// one after a restart, whose fingerprint cache is cold.
+		published := e.writeVersionHint(ctx, tbl)
+		if err := e.fencedErr(); err != nil {
+			return false, err
+		}
 		e.sweepOrphanMetadata(ctx, tbl)
-		return e.writeVersionHint(ctx, tbl) && hintOK, nil
+		return published && hintOK, nil
 	}
 
 	// Metadata-only: files are dropped and added as DataFiles in one commit. (Transaction.Delete
@@ -657,8 +686,12 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	}
 	if len(adds) == 0 && len(removes) == 0 {
 		// Every add was skipped: nothing to commit, so this pass converged like the branch above.
+		published := e.writeVersionHint(ctx, tbl)
+		if err := e.fencedErr(); err != nil {
+			return false, err
+		}
 		e.sweepOrphanMetadata(ctx, tbl)
-		return e.writeVersionHint(ctx, tbl) && hintOK, nil
+		return published && hintOK, nil
 	}
 
 	// The manifest collapse (#1106) is decided HERE, not inside, for two reasons: it reads the
@@ -687,6 +720,9 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	// because only a pass that removes something asks to floor, so there may be no next pass.
 	committed, expireOK := e.expireSnapshots(ctx, committed, database, measurement, expireModeFor(len(toRemove)))
 	hintOK = e.writeVersionHint(ctx, committed) && !e.hintFailed()
+	if err := e.fencedErr(); err != nil {
+		return false, err
+	}
 	e.pruneOldVersionFiles(ctx, committed)
 	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
 	// reachability is the one this pass settled on, not one version stale.
@@ -1577,8 +1613,18 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 			okAll = false
 		} else {
 			vKey := path.Join(dirKey, "v"+version+".metadata.json")
-			if err := e.backend.Write(ctx, vKey, body); err != nil {
-				e.logger.Warn().Err(err).Str("key", vKey).Msg("Failed to write v<N>.metadata.json (will retry next pass)")
+			if err := e.publishMetadataCopy(ctx, vKey, body); err != nil {
+				if errors.Is(err, errFenced) {
+					// Another node published this version first: this commit forked the table.
+					// No hint, no prune, no sweep; the next pass adopts the published lineage.
+					e.logger.Error().Err(err).Str("key", vKey).
+						Msg("Iceberg: another writer published this table version first; this pass stops and the next one adopts the published version")
+					e.hintFailMu.Lock()
+					e.fenced = err
+					e.hintFailMu.Unlock()
+				} else {
+					e.logger.Warn().Err(err).Str("key", vKey).Msg("Failed to write v<N>.metadata.json (will retry next pass)")
+				}
 				okAll = false
 			}
 		}
@@ -1592,6 +1638,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	if err := e.backend.Write(ctx, hintKey, []byte(version)); err != nil {
 		e.logger.Warn().Err(err).Str("key", hintKey).Msg("Failed to write version-hint.text (will retry next pass)")
 		okAll = false
+	}
+	if okAll {
+		e.markPublished(tbl.Identifier(), metaLoc)
 	}
 	return okAll
 }
@@ -1767,9 +1816,15 @@ func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey strin
 	if !strings.HasSuffix(base, ".metadata.json") {
 		return "", "", false
 	}
+	// A table adopted from the warehouse (adopt.go) points at Arc's own v<N>.metadata.json copy
+	// until its next commit, which iceberg-go names 000<N+1>-<uuid> again.
 	prefix, _, found := strings.Cut(base, "-") // "00004"
 	if !found {
-		return "", "", false
+		legacy := strings.TrimSuffix(base, ".metadata.json")
+		if !strings.HasPrefix(legacy, "v") {
+			return "", "", false
+		}
+		prefix = strings.TrimPrefix(legacy, "v")
 	}
 	n, err := strconv.Atoi(prefix)
 	if err != nil {
@@ -1778,11 +1833,6 @@ func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey strin
 	return strconv.Itoa(n), path.Dir(rel), true
 }
 
-// tableDataFiles returns the LIVE physical data-file paths in the table's current snapshot,
-// each with the file_size_in_bytes its manifest entry recorded at registration. Uses
-// Scan().PlanFiles, which resolves the current snapshot's live files honoring deletes across
-// snapshots — NOT AllManifests, which returns manifests from superseded snapshots too and
-// would report files a later removal has already dropped.
 // tableSeed returns what an existing table already says about a measurement:
 // its current schema and its current snapshot's data files (path -> size).
 // A scheduler with nothing cached (a restart) reads footers only for the
@@ -1809,6 +1859,11 @@ func (e *Exporter) tableSeed(ctx context.Context, database, measurement string) 
 	return sc, files, true, nil
 }
 
+// tableDataFiles returns the LIVE physical data-file paths in the table's current snapshot,
+// each with the file_size_in_bytes its manifest entry recorded at registration. Uses
+// Scan().PlanFiles, which resolves the current snapshot's live files honoring deletes across
+// snapshots — NOT AllManifests, which returns manifests from superseded snapshots too and
+// would report files a later removal has already dropped.
 func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map[string]int64, error) {
 	live, err := e.tableLiveFiles(ctx, tbl)
 	if err != nil {
