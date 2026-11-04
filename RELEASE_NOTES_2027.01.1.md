@@ -2061,6 +2061,17 @@ minutes, instead of as an error each time.
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1444](https://github.com/Basekick-Labs/arc/pull/1444).
 
+### The tiering file list applies the tier and database filters together ([#1430](https://github.com/Basekick-Labs/arc/issues/1430))
+
+`GET /api/v1/tiering/files?tier=cold&database=X` returned the database's files
+in every tier: with `database` set, `tier` was ignored. With both set, the list
+is now the database's files in that tier, newest partition first as for
+`database` alone, read from SQLite on its `(database, tier)` index. `limit`
+applies to that list as before. Either filter alone is unchanged.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1446](https://github.com/Basekick-Labs/arc/pull/1446).
+
 ### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
 
 With RBAC on, a query's permission check reads the table names in the SQL it

@@ -41,24 +41,41 @@ func NewTieringHandler(manager *tiering.Manager, authManager *auth.AuthManager, 
 		scanBudget:       manager.ScanBudget,
 		previewMigration: manager.PreviewMigration,
 		getFiles: func(ctx context.Context, tierParam, database string) ([]tiering.FileMetadata, error) {
-			var files []tiering.FileMetadata
-			if database != "" {
-				return manager.GetMetadata().GetFilesByDatabase(ctx, database)
-			}
-			if tierParam != "" {
-				tier := tiering.TierFromString(tierParam)
-				return manager.GetMetadata().GetFilesInTier(ctx, tier)
-			}
-			for _, t := range []tiering.Tier{tiering.TierHot, tiering.TierCold} {
-				tierFiles, err := manager.GetMetadata().GetFilesInTier(ctx, t)
-				if err != nil {
-					return nil, err
-				}
-				files = append(files, tierFiles...)
-			}
-			return files, nil
+			return listTieringFiles(ctx, manager.GetMetadata(), tierParam, database)
 		},
 	}
+}
+
+// tieringFileLister is the part of the tier metadata GET
+// /api/v1/tiering/files reads.
+type tieringFileLister interface {
+	GetFilesByDatabase(ctx context.Context, database string) ([]tiering.FileMetadata, error)
+	GetFilesInTier(ctx context.Context, tier tiering.Tier) ([]tiering.FileMetadata, error)
+	GetFilesInTierForDatabase(ctx context.Context, database string, tier tiering.Tier) ([]tiering.FileMetadata, error)
+}
+
+// listTieringFiles lists the files the tier and database filters select.
+// With both set it is the files of the database in that tier: the database
+// filter used to return before the tier was read, so the tier was ignored
+// (#1430).
+func listTieringFiles(ctx context.Context, md tieringFileLister, tierParam, database string) ([]tiering.FileMetadata, error) {
+	switch {
+	case database != "" && tierParam != "":
+		return md.GetFilesInTierForDatabase(ctx, database, tiering.TierFromString(tierParam))
+	case database != "":
+		return md.GetFilesByDatabase(ctx, database)
+	case tierParam != "":
+		return md.GetFilesInTier(ctx, tiering.TierFromString(tierParam))
+	}
+	var files []tiering.FileMetadata
+	for _, t := range []tiering.Tier{tiering.TierHot, tiering.TierCold} {
+		tierFiles, err := md.GetFilesInTier(ctx, t)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, tierFiles...)
+	}
+	return files, nil
 }
 
 // GetStatus returns the current tiering status
