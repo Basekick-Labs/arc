@@ -2039,6 +2039,29 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A MessagePack value its column cannot hold is a client error, not a 500 ([#1424](https://github.com/Basekick-Labs/arc/issues/1424))
+
+A columnar MessagePack record with a value of the wrong type for its column,
+such as `{"m": "cpu", "columns": {"time": [1, 2], "v": [1, "oops"]}}`, was
+answered `500 Failed to write records`, while the same conflict in row records
+or over line protocol is a `400` partial write. Clients take a 500 for a server
+failure: the Python SDK's buffered writer, for one, could not tell whether the
+batch was written. The record is now refused for its content, like a column
+that changes between string and binary: a request whose only record it is gets
+a `400` naming the measurement and column, and in a batch the record is
+dropped, the others are written, and the answer is the `400` partial write.
+Nothing of the refused record reaches the WAL, so it is not replayed at the
+next start. The same applies to a value outside a decimal column's precision,
+which over line protocol on a node with `ingest.decimal_columns` also answered
+500. An MQTT message is handled
+the same way: its other records are written and the refused one is logged as
+dropped points, and a message refused whole is logged as refused for its
+content, at most once per topic every ten minutes, instead of as an error each
+time.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1444](https://github.com/Basekick-Labs/arc/pull/1444).
+
 ### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
 
 With RBAC on, a query's permission check reads the table names in the SQL it

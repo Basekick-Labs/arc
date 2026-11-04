@@ -417,12 +417,13 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 			return
 		}
 		// A device's payload changing a column between string and binary
-		// (#440), or carrying a column name that cannot be stored (#1342), is
-		// refused on every message it sends: logged per topic at most every
-		// nameWarnEvery, like a dropped field name.
+		// (#440), carrying a column name that cannot be stored (#1342), or a
+		// value its column's type cannot hold (#1424), is refused on every
+		// message it sends: logged per topic at most every nameWarnEvery, like
+		// a dropped field name.
 		if ingest.IsContentRefusal(err) {
 			if s.nameWarnDue("type " + msg.Topic()) {
-				s.logger.Warn().Err(err).Str("topic", msg.Topic()).Msg("MQTT message refused for its content: a column changed between string and binary, or a column name that cannot be stored")
+				s.logger.Warn().Err(err).Str("topic", msg.Topic()).Msg("MQTT message refused for its content: a column changed between string and binary, a column name that cannot be stored, or a value its column's type cannot hold")
 			}
 			return
 		}

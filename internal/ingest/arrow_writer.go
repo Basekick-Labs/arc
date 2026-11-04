@@ -2317,12 +2317,13 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 
 	// The batch is written one record at a time, so a failure can follow
 	// records already buffered (#1437). A record refused for its content
-	// before the WAL (#440, #1342) is dropped and the others are written, as
-	// line protocol does. Any other failure once something is buffered stops
-	// the write with a WriteStoppedError, which says what was written: the
-	// error itself would read as "nothing was written" (a refusal promises
-	// that, and the MQTT subscriber resends the whole message on one). A
-	// failure before anything is buffered is returned as it is.
+	// before the WAL (#440, #1342, #1424) is dropped and the others are
+	// written, as line protocol does. Any other failure once something is
+	// buffered stops the write with a WriteStoppedError, which says what was
+	// written: the error itself would read as "nothing was written" (a
+	// refusal promises that, and the MQTT subscriber resends the whole
+	// message on one). A failure before anything is buffered is returned as
+	// it is.
 	//
 	// Nothing below runs on the success path but the index: what was
 	// written is worked out from the indexes when a write fails.
@@ -2970,6 +2971,14 @@ var ErrBufferClosing = errors.New("arrow buffer is closing: write refused")
 // written, the WAL included, so a retry against the primary is safe.
 var ErrIngestFenced = errors.New("ingest fenced: this node is not an available primary writer")
 
+// ErrUnstorableColumnValue is returned for a columnar record whose values
+// cannot be converted to typed columns (#1424): a column of mixed types, such
+// as an integer column holding a string, a time column that is not numeric,
+// or a value outside a decimal column's precision. The conversion runs before
+// the WAL append (#1438), so nothing of the record was written, and the same
+// record is refused on every attempt.
+var ErrUnstorableColumnValue = errors.New("column value cannot be stored")
+
 // SetIngestGate installs the check every live write passes before anything is
 // written, the WAL included (#1207). It returns nil to admit, or an error
 // wrapping ErrIngestFenced. Replay, recovery and replication paths are never
@@ -3277,7 +3286,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// entry appended first would be replayed at the next start (#1438).
 	typedColumns, numRecords, err := b.convertColumnsToTyped(record.Measurement, record.Columns)
 	if err != nil {
-		return fmt.Errorf("failed to convert columns: %w", err)
+		return fmt.Errorf("%w: measurement %q: %v", ErrUnstorableColumnValue, record.Measurement, err)
 	}
 	if len(record.RawPayload) > 0 {
 		typedColumns.estimatedBytes = int64(len(record.RawPayload))

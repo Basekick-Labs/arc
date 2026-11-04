@@ -601,12 +601,12 @@ type lpStop struct {
 // one buffer call each (write returns the measurement's rows and the call's
 // error), and returns rows, dropped and drops updated for what it left out.
 //
-// A measurement refused for its content before the WAL (#440, #1342) is
-// dropped and the others are still written: a partial write, as for a point
-// that cannot be stored. Any other failure stops the write: the stop says
-// what was buffered before it, because an answer that reads as "nothing was
-// written" would have the client resend, and write the buffered part again
-// (#1437). When every measurement was refused for its content, the stop
+// A measurement refused for its content before the WAL (#440, #1342, #1424)
+// is dropped and the others are still written: a partial write, as for a
+// point that cannot be stored. Any other failure stops the write: the stop
+// says what was buffered before it, because an answer that reads as "nothing
+// was written" would have the client resend, and write the buffered part
+// again (#1437). When every measurement was refused for its content, the stop
 // carries the first refusal and nothing written.
 //
 // The success path adds rows and moves on: what was written is worked out
@@ -669,7 +669,7 @@ func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *
 	if ingest.IsWriteRefusal(err) {
 		return respondWriteRefused(c, err)
 	}
-	// A client error (#440, #1342), refused before the WAL.
+	// A client error (#440, #1342, #1424), refused before the WAL.
 	if ingest.IsContentRefusal(err) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
