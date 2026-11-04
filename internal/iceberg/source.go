@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -43,7 +45,10 @@ type StorageWalkSource struct {
 	// deletedHere, when set, reports a listed file the cluster has deleted
 	// while this node's copy is still on disk; it is excluded too.
 	deletedHere func(path string) bool
-	logger      zerolog.Logger
+	// exclusions, when set, names the files Arc's own reads leave out under a
+	// prefix (see SetExclusions).
+	exclusions Exclusions
+	logger     zerolog.Logger
 
 	// namespaceExpander, when set, returns the top-level directories that are
 	// edge-sync spoke namespaces rather than databases (#634). A hub stores
@@ -78,6 +83,24 @@ func (s *StorageWalkSource) SetPendingOutputs(fn func(ctx context.Context, prefi
 // cluster node that does not track its local copies.
 func (s *StorageWalkSource) SetDeletedHere(fn func(path string) bool) {
 	s.deletedHere = fn
+}
+
+// Exclusions is the set of stored files Arc's own reads leave out because
+// another file under the same prefix holds their rows: the inputs of a
+// compaction whose output is in place, a file a row DELETE replaced, a local
+// copy the cluster deleted. It is the query layer's set
+// (api.CombineOpenCompactions), asked strictly: where a read would guess, an
+// export must not, so a source that cannot tell returns an error.
+type Exclusions interface {
+	ExcludedForStrict(ctx context.Context, prefix string) ([]string, error)
+}
+
+// SetExclusions installs the files Arc's reads leave out (#939 A0). Without
+// it the exporter publishes, during a DELETE rewrite or a compaction, a file
+// next to the one that replaced it, and external readers count its rows twice
+// while Arc's own queries count them once. nil excludes nothing.
+func (s *StorageWalkSource) SetExclusions(ex Exclusions) {
+	s.exclusions = ex
 }
 
 // SetNamespaceExpander installs edge-sync spoke-namespace expansion (#634).
@@ -237,19 +260,60 @@ func (s *StorageWalkSource) LocalFiles(ctx context.Context, m Measurement) ([]st
 
 const unusableSampleCap = 32
 
-// FilesAndLocal lists the measurement's Parquet files ONCE and returns both the iceberg-readable
-// URIs and the on-disk local paths, so the reconciler doesn't pay for two identical backend
-// List() calls per measurement per pass. The two slices are aligned only in the sense that every
+// FilesAndLocal lists the measurement's Parquet files and returns both the iceberg-readable
+// URIs and the on-disk local paths from that one listing, so the reconciler doesn't pay for two
+// identical backend List() calls per measurement per pass. It lists again only when files
+// changed under the listing (see listOnce). The two slices are aligned only in the sense that every
 // local path corresponds to a data file also present in `files`; local is empty when the backend
 // is non-local. Files() and LocalFiles() delegate here for callers that need just one view.
 func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
+	var prev []string
+	for attempt := 1; ; attempt++ {
+		files, local, vanished, err := s.listOnce(ctx, m)
+		moved := errors.Is(err, errExclusionsMoved)
+		if moved {
+			err = nil
+		}
+		if err != nil || (len(vanished) == 0 && !moved) {
+			return files, local, err
+		}
+		// The same keys listed and missing twice running are not a removal
+		// racing the listing (that key leaves the next listing) but an entry
+		// that never resolves, such as a dangling symlink: it holds no rows.
+		if !moved && slices.Equal(vanished, prev) {
+			return files, local, nil
+		}
+		if attempt == vanishRetries {
+			return nil, nil, fmt.Errorf(
+				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass",
+				m.Database, m.Measurement, len(vanished), attempt)
+		}
+		prev = vanished
+		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("vanished", len(vanished)).
+			Msg("Iceberg reconcile: files removed while the measurement was listed; listing again")
+	}
+}
+
+// vanishRetries bounds FilesAndLocal's attempts at a stable listing.
+const vanishRetries = 3
+
+// errExclusionsMoved: a listed file started being left out of Arc's reads
+// while the listing ran, so the listing has no usable set and is taken again.
+var errExclusionsMoved = errors.New("files left out of reads changed during the listing")
+
+// listOnce is one listing of the measurement. vanished names, sorted, the
+// listed files that changed under it: gone by the time they were stat'ed, or
+// left out of Arc's reads only once the listing ran. Whatever did that (a
+// compaction, a DELETE rewrite, retention) may have put their rows in a file
+// this listing missed, so the set is not exported.
+func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files []FileRef, local []string, vanished []string, err error) {
 	prefix := m.Database + "/" + m.Measurement + "/"
 	if ul, ok := s.backend.(storage.UnusableLister); ok {
 		// Enumerate hidden files first: a hidden-to-usable rename between the
 		// two passes may cause a spurious refusal, but never a silent omission.
 		unusable, err := ul.ListUnusable(ctx, prefix)
 		if err != nil {
-			return nil, nil, fmt.Errorf("check hidden files for %s/%s: %w", m.Database, m.Measurement, err)
+			return nil, nil, nil, fmt.Errorf("check hidden files for %s/%s: %w", m.Database, m.Measurement, err)
 		}
 		var hiddenData []storage.UnusableObject
 		for _, obj := range unusable {
@@ -273,15 +337,31 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 				}
 				samples = append(samples, fmt.Sprintf("%s: %s", obj.Path, reason))
 			}
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"refusing Iceberg export for %s/%s: %d data file(s) are hidden from the normal storage listing, so publishing the table would be incomplete; rename the files, and the next reconcile pass will publish. Sample(s): %s",
 				m.Database, m.Measurement, len(hiddenData), strings.Join(samples, "; "),
 			)
 		}
 	}
+	// The files Arc's reads leave out, read BEFORE the listing: each is left
+	// out only once the file holding its rows is in storage, so every
+	// replacement of a key read here is in the listing below. Read after it,
+	// a key whose replacement landed in between would drop that key's rows
+	// from this pass.
+	var leaveOut map[string]struct{}
+	if s.exclusions != nil {
+		keys, err := s.exclusions.ExcludedForStrict(ctx, prefix)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("files Arc's reads leave out under %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		leaveOut = make(map[string]struct{}, len(keys))
+		for _, k := range keys {
+			leaveOut[filepath.ToSlash(k)] = struct{}{}
+		}
+	}
 	paths, err := s.backend.List(ctx, prefix)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
+		return nil, nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
 	}
 	// Read the compaction state AFTER the listing and BEFORE the stat loop.
 	// The order is what makes this race-free: a compaction deletes its
@@ -295,18 +375,46 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 	if s.pendingOutputs != nil {
 		pending, err = s.pendingOutputs(ctx, prefix)
 		if err != nil {
-			return nil, nil, fmt.Errorf("pending compaction outputs for %s/%s: %w", m.Database, m.Measurement, err)
+			return nil, nil, nil, fmt.Errorf("pending compaction outputs for %s/%s: %w", m.Database, m.Measurement, err)
 		}
 	}
-	var files []FileRef
-	var local []string
-	excluded, deleted := 0, 0
+	// A key that started being left out while this listing ran: its
+	// replacement may have landed after the listing, so leaving it out could
+	// drop its rows, and keeping it could count them twice.
+	if s.exclusions != nil {
+		after, err := s.exclusions.ExcludedForStrict(ctx, prefix)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("files Arc's reads leave out under %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		listed := make(map[string]struct{}, len(paths))
+		for _, p := range paths {
+			listed[filepath.ToSlash(p)] = struct{}{}
+		}
+		for _, k := range after {
+			k = filepath.ToSlash(k)
+			if _, before := leaveOut[k]; before {
+				continue
+			}
+			if _, ok := listed[k]; ok {
+				vanished = append(vanished, k)
+			}
+		}
+		if len(vanished) > 0 {
+			sort.Strings(vanished)
+			return nil, nil, vanished, errExclusionsMoved
+		}
+	}
+	excluded, deleted, replaced := 0, 0, 0
 	for _, p := range paths {
 		if !isDataFile(p) {
 			continue
 		}
 		if _, skip := pending[filepath.ToSlash(p)]; skip {
 			excluded++
+			continue
+		}
+		if _, skip := leaveOut[filepath.ToSlash(p)]; skip {
+			replaced++
 			continue
 		}
 		if s.deletedHere != nil && s.deletedHere(filepath.ToSlash(p)) {
@@ -318,19 +426,19 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 			// The listing produced a key this backend would itself refuse.
 			// Fail rather than skip: a skipped file is missing from the
 			// exported table with no other signal.
-			return nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", p, err)
+			return nil, nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", p, err)
 		}
 		lp := s.resolver.LocalPath(p)
 		size, present, err := s.statSize(ctx, p, lp)
 		if err != nil {
-			return nil, nil, fmt.Errorf("stat listed file %q: %w", p, err)
+			return nil, nil, nil, fmt.Errorf("stat listed file %q: %w", p, err)
 		}
 		if !present {
 			// Removed between the listing and the stat (retention, compaction, the
-			// delete API). It is not on storage, so it is not in this pass's set;
-			// leaving it out of BOTH slices keeps the schema derivation from
-			// opening a path that no longer exists. The next pass converges.
-			s.logger.Debug().Str("file", p).Msg("Iceberg reconcile: file vanished after listing; skipping it this pass")
+			// delete API). Its rows may now sit in a file this listing predates, so
+			// the caller lists again rather than export a set missing them.
+			s.logger.Debug().Str("file", p).Msg("Iceberg reconcile: file vanished after listing")
+			vanished = append(vanished, filepath.ToSlash(p))
 			continue
 		}
 		files = append(files, FileRef{PhysicalPath: uri, SizeBytes: size})
@@ -346,7 +454,12 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("deleted", deleted).
 			Msg("Iceberg reconcile: files the cluster deleted, still on this node's disk, are left out of this pass")
 	}
-	return files, local, nil
+	if replaced > 0 {
+		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("replaced", replaced).
+			Msg("Iceberg reconcile: files Arc's reads leave out (replaced by a compaction or DELETE) are left out of this pass")
+	}
+	sort.Strings(vanished)
+	return files, local, vanished, nil
 }
 
 // statSize returns the file's current byte size, which the reconciler needs
