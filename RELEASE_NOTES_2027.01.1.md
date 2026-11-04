@@ -2053,11 +2053,10 @@ dropped, the others are written, and the answer is the `400` partial write.
 Nothing of the refused record reaches the WAL, so it is not replayed at the
 next start. The same applies to a value outside a decimal column's precision,
 which over line protocol on a node with `ingest.decimal_columns` also answered
-500. An MQTT message is handled
-the same way: its other records are written and the refused one is logged as
-dropped points, and a message refused whole is logged as refused for its
-content, at most once per topic every ten minutes, instead of as an error each
-time.
+500. An MQTT message is handled the same way: its other records are written
+and the refused one is logged as dropped points, and a message refused whole
+is logged as refused for its content, at most once per topic every ten
+minutes, instead of as an error each time.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1444](https://github.com/Basekick-Labs/arc/pull/1444).
