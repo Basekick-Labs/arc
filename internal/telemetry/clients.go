@@ -8,27 +8,39 @@ import (
 	"time"
 )
 
-// Client-side identity, as reported by arcli.
+// Client-side identity, as reported by arcli and the Python SDK.
 //
-// arcli sends a random per-installation UUID on every request
-// (Arcli-Installation-Id) together with its version in User-Agent.
-// The API server hands both to RecordClient for requests that were
-// served (status < 400, so unauthenticated probes cannot fill the set);
-// the collector includes the distinct installations seen since the
-// last successful report in its payload, so the telemetry database can
-// correlate CLI installations with Arc instances. Nothing about the
-// request itself (path, database, token) is recorded.
+// Clients send a random per-installation UUID on every request
+// (Arc-Client-Installation-Id, or arcli's legacy Arcli-Installation-Id)
+// together with their product and version in User-Agent. The API server
+// hands both to RecordClient for requests that were served (status <
+// 400, so unauthenticated probes cannot fill the set); the collector
+// includes the distinct installations seen since the last successful
+// report in its payload, so the telemetry database can correlate client
+// installations with Arc instances. Nothing about the request itself
+// (path, database, token) is recorded.
 
-// maxClients bounds the registry. Beyond it new ids are dropped and
-// the report says Truncated, so a flood of random ids cannot grow
-// memory (256 entries ≈ 25 KB).
-const maxClients = 256
+// Client kinds. internal/api/client_identity_test.go pins them to
+// api.ClientKindArcli / api.ClientKindPythonSDK, since neither package
+// imports the other. Any other kind is ignored.
+const (
+	ClientKindArcli     = "arcli"
+	ClientKindPythonSDK = "python_sdk"
+)
+
+// maxClientsPerKind bounds the registry, per client kind, so a churn of
+// SDK ids (one per container start, say) cannot crowd out arcli ids.
+// Beyond it new ids of that kind are dropped and the report says
+// Truncated for that kind, so a flood of random ids cannot grow memory
+// (2 × 256 entries ≈ 60 KB).
+const maxClientsPerKind = 256
 
 var installationIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // ClientsInfo is the "clients" object in the telemetry payload.
 type ClientsInfo struct {
-	Arcli *ArcliClients `json:"arcli,omitempty"`
+	Arcli     *ArcliClients `json:"arcli,omitempty"`
+	PythonSDK *SDKClients   `json:"python_sdk,omitempty"`
 }
 
 // ArcliClients lists the arcli installations seen since the last report.
@@ -45,89 +57,148 @@ type ArcliClient struct {
 	LastSeen string `json:"last_seen"` // RFC 3339, UTC
 }
 
+// SDKClients lists the installations of one SDK seen since the last
+// report. Generic so later SDKs (Go, JS) reuse it under their own key.
+type SDKClients struct {
+	Installations int         `json:"installations"` // == len(List)
+	Truncated     bool        `json:"truncated"`     // at least one more distinct id was seen and dropped
+	List          []SDKClient `json:"list"`
+}
+
+// SDKClient is one SDK installation. Runtime is the language runtime
+// version ("3.12.4"), Platform the os/arch pair ("linux/amd64");
+// either is "unknown" when the User-Agent did not say.
+type SDKClient struct {
+	ID       string `json:"id"`
+	Version  string `json:"version"`
+	Runtime  string `json:"runtime"`
+	Platform string `json:"platform"`
+	LastSeen string `json:"last_seen"` // RFC 3339, UTC
+}
+
 type clientEntry struct {
-	version  string
-	lastSeen time.Time
+	version, runtime, platform string
+	lastSeen                   time.Time
+}
+
+// kindWindow is one client kind's set within a reporting window.
+type kindWindow struct {
+	seen      map[string]clientEntry
+	truncated bool
+}
+
+func newKindWindows() map[string]*kindWindow {
+	return map[string]*kindWindow{
+		ClientKindArcli:     {seen: make(map[string]clientEntry)},
+		ClientKindPythonSDK: {seen: make(map[string]clientEntry)},
+	}
 }
 
 // clientRegistry is the bounded, mutex-protected set behind
 // Collector.RecordClient. One lock per recorded request; requests
 // without the header never touch it.
 type clientRegistry struct {
-	mu        sync.Mutex
-	seen      map[string]clientEntry
-	truncated bool
+	mu    sync.Mutex
+	kinds map[string]*kindWindow // fixed key set: newKindWindows
 }
 
 func newClientRegistry() *clientRegistry {
-	return &clientRegistry{seen: make(map[string]clientEntry)}
+	return &clientRegistry{kinds: newKindWindows()}
 }
 
-// record stores or refreshes an installation. Invalid ids and
-// over-long versions are rejected before the lock is taken; the strings
-// must already be owned by the caller (not fasthttp buffer views).
-func (r *clientRegistry) record(id, version string, now time.Time) {
+// record stores or refreshes an installation. Unknown kinds, invalid
+// ids and over-long fields are rejected before the lock is taken; the
+// strings must already be owned by the caller (not fasthttp buffer
+// views).
+func (r *clientRegistry) record(kind, id, version, runtime, platform string, now time.Time) {
+	if kind != ClientKindArcli && kind != ClientKindPythonSDK {
+		return
+	}
 	if len(id) != 36 || !installationIDRe.MatchString(id) {
 		return
 	}
-	version = cleanVersion(version)
+	e := clientEntry{version: cleanVersion(version), lastSeen: now}
+	if kind != ClientKindArcli {
+		e.runtime, e.platform = cleanRuntimeField(runtime), cleanRuntimeField(platform)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.seen[id]; !ok && len(r.seen) >= maxClients {
-		r.truncated = true
+	w := r.kinds[kind]
+	if _, ok := w.seen[id]; !ok && len(w.seen) >= maxClientsPerKind {
+		w.truncated = true
 		return
 	}
-	r.seen[id] = clientEntry{version: version, lastSeen: now}
+	w.seen[id] = e
 }
 
-// take returns the current set rendered for the payload and starts a
+// take returns the current sets rendered for the payload and starts a
 // fresh window, so records arriving during the send are not lost. The
 // returned window is handed back to restore() if the send fails; nil
-// means nothing was seen (the payload omits "clients").
+// means nothing was seen for any kind (the payload omits "clients").
 func (r *clientRegistry) take() (*ClientsInfo, *clientWindow) {
 	if r == nil {
 		return nil, nil
 	}
 	r.mu.Lock()
-	seen, truncated := r.seen, r.truncated
-	r.seen, r.truncated = make(map[string]clientEntry), false
+	kinds := r.kinds
+	r.kinds = newKindWindows()
 	r.mu.Unlock()
-	if len(seen) == 0 {
+	info := &ClientsInfo{}
+	if w := kinds[ClientKindArcli]; len(w.seen) > 0 {
+		list := make([]ArcliClient, 0, len(w.seen))
+		for id, e := range w.seen {
+			list = append(list, ArcliClient{ID: id, Version: e.version, LastSeen: e.lastSeen.UTC().Format(time.RFC3339)})
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
+		info.Arcli = &ArcliClients{Installations: len(list), Truncated: w.truncated, List: list}
+	}
+	if w := kinds[ClientKindPythonSDK]; len(w.seen) > 0 {
+		info.PythonSDK = renderSDK(w)
+	}
+	if info.Arcli == nil && info.PythonSDK == nil {
 		return nil, nil
 	}
-	list := make([]ArcliClient, 0, len(seen))
-	for id, e := range seen {
-		list = append(list, ArcliClient{ID: id, Version: e.version, LastSeen: e.lastSeen.UTC().Format(time.RFC3339)})
+	return info, &clientWindow{kinds: kinds}
+}
+
+func renderSDK(w *kindWindow) *SDKClients {
+	list := make([]SDKClient, 0, len(w.seen))
+	for id, e := range w.seen {
+		list = append(list, SDKClient{ID: id, Version: e.version, Runtime: e.runtime, Platform: e.platform, LastSeen: e.lastSeen.UTC().Format(time.RFC3339)})
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
-	return &ClientsInfo{Arcli: &ArcliClients{Installations: len(list), Truncated: truncated, List: list}},
-		&clientWindow{seen: seen, truncated: truncated}
+	return &SDKClients{Installations: len(list), Truncated: w.truncated, List: list}
 }
 
 type clientWindow struct {
-	seen      map[string]clientEntry
-	truncated bool
+	kinds map[string]*kindWindow
 }
 
-// restore merges a window back after a failed send. Entries recorded
-// since (newer) win; the bound still applies.
-func (r *clientRegistry) restore(w *clientWindow) {
-	if r == nil || w == nil {
+// restore merges a window back after a failed send, per kind. Entries
+// recorded since (newer) win; each kind's bound still applies.
+func (r *clientRegistry) restore(cw *clientWindow) {
+	if r == nil || cw == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for id, e := range w.seen {
-		if _, ok := r.seen[id]; ok {
+	for kind, old := range cw.kinds {
+		cur := r.kinds[kind]
+		if cur == nil {
 			continue
 		}
-		if len(r.seen) >= maxClients {
-			r.truncated = true
-			break
+		for id, e := range old.seen {
+			if _, ok := cur.seen[id]; ok {
+				continue
+			}
+			if len(cur.seen) >= maxClientsPerKind {
+				cur.truncated = true
+				break
+			}
+			cur.seen[id] = e
 		}
-		r.seen[id] = e
+		cur.truncated = cur.truncated || old.truncated
 	}
-	r.truncated = r.truncated || w.truncated
 }
 
 // pending reports whether anything is waiting to be sent.
@@ -137,11 +208,17 @@ func (r *clientRegistry) pending() bool {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.seen) > 0
+	for _, w := range r.kinds {
+		if len(w.seen) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
-// cleanVersion keeps a short printable-ASCII version string; anything
-// else becomes "unknown" rather than a payload full of junk.
+// cleanVersion keeps a short printable-ASCII string (version, runtime,
+// platform); anything else becomes "unknown" rather than a payload full
+// of junk.
 func cleanVersion(v string) string {
 	if v == "" || len(v) > 32 {
 		return "unknown"
@@ -154,24 +231,43 @@ func cleanVersion(v string) string {
 	return v
 }
 
-// RecordClient notes that an arcli installation was served by this
-// node. Safe on a nil collector (telemetry disabled): it does nothing.
-func (c *Collector) RecordClient(id, version string) {
+// cleanRuntimeField is cleanVersion with a tighter alphabet for the
+// runtime and platform fields ("3.12.4", "linux/amd64"): letters,
+// digits and . _ + / -. Values are attacker-controlled; the beacon
+// escapes them, but the telemetry store need not trust them further.
+func cleanRuntimeField(v string) string {
+	v = cleanVersion(v)
+	for i := 0; i < len(v); i++ {
+		ch := v[i]
+		switch {
+		case ch >= '0' && ch <= '9', ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z':
+		case ch == '.', ch == '_', ch == '+', ch == '/', ch == '-':
+		default:
+			return "unknown"
+		}
+	}
+	return v
+}
+
+// RecordClient notes that a client installation (arcli, Python SDK)
+// was served by this node. Safe on a nil collector (telemetry
+// disabled): it does nothing. Implements api.ClientRecorder.
+func (c *Collector) RecordClient(kind, id, version, runtime, platform string) {
 	if c == nil || c.clients == nil {
 		return
 	}
-	c.clients.record(id, version, time.Now())
+	c.clients.record(kind, id, version, runtime, platform, time.Now())
 }
 
 // flushClients sends one last report at shutdown when clients are
 // waiting, so nodes restarted more often than the interval still report
-// the CLI installations they served. Best effort, bounded by timeout.
+// the client installations they served. Best effort, bounded by timeout.
 func (c *Collector) flushClients(timeout time.Duration) {
 	if c == nil || c.clients == nil || !c.clients.pending() {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	c.logger.Info().Msg("Sending final telemetry beacon (pending CLI clients)")
+	c.logger.Info().Msg("Sending final telemetry beacon (pending clients)")
 	c.sendTelemetryCtx(ctx)
 }

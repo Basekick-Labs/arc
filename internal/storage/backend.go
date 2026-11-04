@@ -93,14 +93,13 @@ type Backend interface {
 
 	// ReadToAt reads data from path starting at the given byte offset and writes
 	// to writer. offset=0 starts at the beginning (equivalent to ReadTo).
-	// Returns an error if offset is negative or >= file size.
+	// A negative offset is an error. An offset at or past the end writes
+	// nothing; LocalBackend then returns nil, an object store may return an
+	// error.
 	//
-	// Unlike StatFile below, a backend that stages writes MAY serve a staged
-	// partial when no committed file exists — LocalBackend does, and the
-	// resume path depends on it. So the two are deliberately asymmetric: do
-	// not pair a committed-only StatFile size with a ReadToAt read and assume
-	// both saw the same bytes. Callers needing committed-only bytes confirm
-	// with Exists; callers wanting the partial go through StagingInspector.
+	// It reads the committed file only, like StatFile and Exists: a staged
+	// partial is never returned (#1199). Code that needs the partial, such as
+	// the puller's resume, reads it through StagingInspector.
 	ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error
 
 	// StatFile returns the byte size of the committed file at path.
@@ -256,7 +255,8 @@ type ObjectLister interface {
 //
 // Optional: callers type-assert and fall back to ListObjects when the backend
 // does not implement it (test fakes that embed the Backend interface, for
-// instance). LocalBackend, S3Backend and AzureBlobBackend all implement it.
+// instance). LocalBackend, S3Backend, AzureBlobBackend and GCSBackend all
+// implement it.
 type PrefixProber interface {
 	HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error)
 }

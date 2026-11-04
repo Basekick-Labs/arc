@@ -368,9 +368,10 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 	if err := w.finish(importWriteError(w.end(writeCtx), "failed to ingest CSV data")); err != nil {
 		return nil, err
 	}
-	// Hand what is still buffered to the flush: the rows are in the buffer and
-	// the WAL (when enabled); files follow as their flushes finish.
-	if err := h.arrowBuffer.FlushAll(writeCtx); err != nil {
+	// Hand what is still buffered of the import to the flush, its write slot
+	// already free (#1429): the rows are in the buffer and the WAL (when
+	// enabled); files follow as their flushes finish.
+	if err := w.finalFlush(writeCtx); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}
 	return stats.result(database, measurement, header, opts.timeColumn), nil
@@ -700,9 +701,10 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 	if err := w.finish(importWriteError(w.end(ctx), "failed to ingest parquet data")); err != nil {
 		return nil, err
 	}
-	// Hand what is still buffered to the flush: the rows are in the buffer and
-	// the WAL (when enabled); files follow as their flushes finish.
-	if err := h.arrowBuffer.FlushAll(ctx); err != nil {
+	// Hand what is still buffered of the import to the flush, its write slot
+	// already free (#1429): the rows are in the buffer and the WAL (when
+	// enabled); files follow as their flushes finish.
+	if err := w.finalFlush(ctx); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}
 	return stats.result(database, measurement, header, opts.timeColumn), nil

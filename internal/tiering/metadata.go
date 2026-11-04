@@ -947,6 +947,27 @@ func (s *MetadataStore) GetFilesByDatabase(ctx context.Context, database string)
 	return s.scanFiles(rows)
 }
 
+// GetFilesInTierForDatabase retrieves the files of one database in one tier,
+// newest partition first, as GetFilesByDatabase orders them (#1430). The
+// filter runs in SQLite, on the (database, tier) index, rather than over every
+// row of the database in Go.
+func (s *MetadataStore) GetFilesInTierForDatabase(ctx context.Context, database string, tier Tier) ([]FileMetadata, error) {
+	query := `
+		SELECT ` + tierFileColumns + `
+		FROM tier_files
+		WHERE database = ? AND tier = ?
+		ORDER BY partition_time DESC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, database, string(tier))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query files in tier for database: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanFiles(rows)
+}
+
 // GetFilesForQuery retrieves files for a database, optionally filtered by
 // measurement and/or time range. Filters are pushed into the SQL WHERE
 // clause instead of being applied client-side, so SQLite's indexes on
