@@ -562,6 +562,10 @@ type IcebergConfig struct {
 	// nothing regenerates, so it gets an off switch; turning it off restores the pre-#835
 	// behaviour, where that metadata grows without bound and is copied into every backup.
 	OrphanSweepEnabled bool
+	// ColdRescanInterval (seconds) is how long the export trusts a measurement's cached cold-tier
+	// listing when nothing invalidated it (#939): Arc's own cold changes invalidate it at once,
+	// so this bounds only changes made behind Arc's back.
+	ColdRescanInterval int
 }
 
 type ContinuousQueryConfig struct {
@@ -1274,6 +1278,7 @@ func Load() (*Config, error) {
 			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
+			ColdRescanInterval:       v.GetInt("iceberg.cold_rescan_interval"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -1713,17 +1718,21 @@ func Load() (*Config, error) {
 
 	// Iceberg export runs on a local or an S3 primary backend (#939). The reconciler walks the
 	// single configured storage backend and publishes through iceberg-go's FileIO, which Arc
-	// links for s3:// only, so Azure and GCS primaries are refused, as is cold-tier tiering
-	// (a file migrated to the cold tier would leave the Iceberg table). Refused at load time
-	// rather than run an unsupported or corrupting configuration.
+	// links for s3:// only, so Azure and GCS primaries are refused, as is a cold tier on anything
+	// but S3 (a file migrated there would leave the Iceberg table). Refused at load time rather
+	// than run an unsupported or corrupting configuration.
 	if cfg.Iceberg.Enabled {
 		if err := cfg.checkIcebergBackend(); err != nil {
 			return nil, err
 		}
 		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
-			return nil, fmt.Errorf("iceberg.enabled=true is not supported with cold-tier tiering " +
-				"(tiered_storage.cold.enabled): files migrated to the cold tier would be removed from the " +
-				"Iceberg table. Disable one of them")
+			if err := cfg.checkIcebergColdTier(); err != nil {
+				return nil, err
+			}
+		}
+		if cfg.Iceberg.ColdRescanInterval < 1 {
+			return nil, fmt.Errorf("iceberg.cold_rescan_interval must be >= 1 (got %d): it is how long, in seconds, "+
+				"a cached cold-tier listing is trusted", cfg.Iceberg.ColdRescanInterval)
 		}
 		if cfg.Iceberg.ReconcileInterval < 1 {
 			return nil, fmt.Errorf("iceberg.reconcile_interval must be >= 1 (got %d): "+
@@ -2196,6 +2205,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
+	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
 	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults
@@ -2942,6 +2952,7 @@ func ParseSize(sizeStr string) (int64, error) {
 //     every added data file through the table's FileIO, which is bound to the warehouse's bucket,
 //     so a warehouse in another bucket fails the first add; one under another prefix of the same
 //     bucket is outside what backups and the orphan sweep treat as Arc's.
+//   - a cold tier other than S3 (checkIcebergColdTier).
 //   - cluster.shared_storage_mode without cluster.failover_enabled: without the compactor lease
 //     every compactor-role node exports, and two exporters writing one table's metadata fork it.
 func (cfg *Config) checkIcebergBackend() error {
@@ -2963,6 +2974,24 @@ func (cfg *Config) checkIcebergBackend() error {
 		return fmt.Errorf("iceberg.enabled=true with cluster.shared_storage_mode=true requires cluster.failover_enabled=true: " +
 			"the compactor lease is what keeps a single node exporting, and two exporters writing the same table's " +
 			"metadata in shared storage fork its history")
+	}
+	return nil
+}
+
+// checkIcebergColdTier refuses a cold tier Iceberg export cannot track (#939): it follows files
+// migrated to an S3 cold tier into the table, and the cold URIs are registered through iceberg-go,
+// which Arc links for s3:// only. An Azure or GCS cold tier would drop migrated files from the
+// table, and so would S3 on Google Cloud Storage's interop endpoint, whose signer iceberg-go's
+// client does not get.
+func (cfg *Config) checkIcebergColdTier() error {
+	cold := cfg.TieredStorage.Cold
+	if cold.Backend != "s3" {
+		return fmt.Errorf("iceberg.enabled=true with cold-tier tiering requires tiered_storage.cold.backend=\"s3\" (got %q): "+
+			"files migrated to a %s cold tier would leave the Iceberg table. Disable one of them", cold.Backend, cold.Backend)
+	}
+	if storage.IsGCSEndpoint(cold.S3Endpoint) {
+		return fmt.Errorf("iceberg.enabled=true is not supported with an S3 cold tier on Google Cloud Storage's " +
+			"S3-compatible endpoint (tiered_storage.cold.s3_endpoint=storage.googleapis.com)")
 	}
 	return nil
 }

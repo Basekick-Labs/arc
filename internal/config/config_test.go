@@ -325,35 +325,6 @@ func TestLoad_BackupConfigPopulated(t *testing.T) {
 	}
 }
 
-func TestLoad_IcebergRejectsColdTiering(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "arc-config-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-	oldWd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(oldWd)
-
-	// iceberg + cold-tier tiering must be rejected (cold files would be deleted from the table).
-	os.Setenv("ARC_ICEBERG_ENABLED", "true")
-	os.Setenv("ARC_TIERED_STORAGE_ENABLED", "true")
-	os.Setenv("ARC_TIERED_STORAGE_COLD_ENABLED", "true")
-	os.Setenv("ARC_TIERED_STORAGE_COLD_BACKEND", "s3")
-	os.Setenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET", "b")
-	defer func() {
-		os.Unsetenv("ARC_ICEBERG_ENABLED")
-		os.Unsetenv("ARC_TIERED_STORAGE_ENABLED")
-		os.Unsetenv("ARC_TIERED_STORAGE_COLD_ENABLED")
-		os.Unsetenv("ARC_TIERED_STORAGE_COLD_BACKEND")
-		os.Unsetenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET")
-	}()
-
-	if _, err := Load(); err == nil {
-		t.Fatal("expected error for iceberg.enabled + cold-tier tiering, got nil")
-	}
-}
-
 // Iceberg export runs on a local or an S3 primary (#939); everything else is refused at load.
 func TestLoad_IcebergBackends(t *testing.T) {
 	s3 := map[string]string{"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b", "ARC_STORAGE_S3_PREFIX": "inst/a/"}
@@ -389,8 +360,16 @@ func TestLoad_IcebergBackends(t *testing.T) {
 		{"azure", with(map[string]string{"ARC_STORAGE_BACKEND": "azure", "ARC_STORAGE_AZURE_CONTAINER": "c", "ARC_STORAGE_AZURE_ACCOUNT_NAME": "a"}), "does not support azure"},
 		{"shared storage without failover", with(s3, shared...), "requires cluster.failover_enabled=true"},
 		{"shared storage with failover", with(s3, append(shared, "ARC_CLUSTER_FAILOVER_ENABLED", "true")...), ""},
-		{"s3 with a cold tier", with(s3, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
-			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c"), "cold-tier tiering"},
+		{"s3 with an S3 cold tier", with(s3, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c"), ""},
+		{"local with an S3 cold tier", with(nil, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c"), ""},
+		{"an Azure cold tier", with(nil, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "azure", "ARC_TIERED_STORAGE_COLD_AZURE_CONTAINER", "c", "ARC_TIERED_STORAGE_COLD_AZURE_ACCOUNT_NAME", "a"), "requires tiered_storage.cold.backend=\"s3\""},
+		{"a GCS cold tier", with(nil, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "gcs", "ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "c"), "requires tiered_storage.cold.backend=\"s3\""},
+		{"an S3 cold tier on the GCS interop endpoint", with(nil, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c", "ARC_TIERED_STORAGE_COLD_S3_ENDPOINT", "storage.googleapis.com"), "Google Cloud Storage"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Chdir(t.TempDir())

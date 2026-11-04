@@ -23,11 +23,25 @@ type measurementState struct {
 	schemaFiles map[string]struct{} // schemaKey of every file at that reconcile — to diff for newly-added files
 }
 
-// schemaKey identifies a file for schema derivation: its URI and size. A
-// different file written at a known path (a restore, an edge-sync promote)
-// has its footer read again rather than inherit the old file's types.
-func schemaKey(uri string, size int64) string {
-	return uri + "\x00" + strconv.FormatInt(size, 10)
+// schemaKey identifies a file for schema derivation: its storage key and size. A different file
+// written at a known path (a restore, an edge-sync promote) has its footer read again rather
+// than inherit the old file's types. The key, not the URI: a file migrated to the cold tier keeps
+// its key and bytes and changes only its URI, and must not cost a cold GET (#939 B2).
+func schemaKey(key string, size int64) string {
+	return key + "\x00" + strconv.FormatInt(size, 10)
+}
+
+// refSchemaKey is schemaKey for a listed file; a source that sets no Key falls back to the URI.
+func refSchemaKey(f FileRef) string {
+	if f.Key != "" {
+		return schemaKey(f.Key, f.SizeBytes)
+	}
+	return schemaKey(f.PhysicalPath, f.SizeBytes)
+}
+
+// keyOfURIer is a source that can map a URI it produced back to its storage key.
+type keyOfURIer interface {
+	KeyOf(uri string) (string, bool)
 }
 
 // WriterGate gates the reconciler to a single node in cluster mode. nil means "no gate,
@@ -313,14 +327,21 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		if ok {
 			base = tableSc
 			known = make(map[string]struct{}, len(tableFiles))
+			keyer, _ := s.source.(keyOfURIer)
 			for uri, size := range tableFiles {
-				known[schemaKey(uri, size)] = struct{}{}
+				key := uri
+				if keyer != nil {
+					if k, ok := keyer.KeyOf(uri); ok {
+						key = k
+					}
+				}
+				known[schemaKey(key, size)] = struct{}{}
 			}
 		}
 	}
 	var unread []FileRef
 	for _, f := range files {
-		if _, ok := known[schemaKey(f.PhysicalPath, f.SizeBytes)]; !ok {
+		if _, ok := known[refSchemaKey(f)]; !ok {
 			unread = append(unread, f)
 		}
 	}
@@ -360,7 +381,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 
 	schemaSet := make(map[string]struct{}, len(files))
 	for _, f := range files {
-		schemaSet[schemaKey(f.PhysicalPath, f.SizeBytes)] = struct{}{}
+		schemaSet[refSchemaKey(f)] = struct{}{}
 	}
 	s.state[key] = measurementState{fingerprint: fp, schema: sc, schemaFiles: schemaSet}
 	return true, nil
