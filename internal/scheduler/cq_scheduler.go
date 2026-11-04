@@ -224,6 +224,16 @@ func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive
 
 // ReloadAll reloads all CQ schedules from the database
 func (s *CQScheduler) ReloadAll() error {
+	// Check license - require valid license for CQ scheduler. This ran after
+	// every job was stopped and returned nil, which the API answered 200 "CQ
+	// scheduler reloaded successfully" with no CQ left running (#1433). The
+	// scheduler is only created with a license, so this is one that expired
+	// or was revoked since; the jobs it has are left as they are.
+	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
+		s.logger.Warn().Msg("Valid enterprise license required for CQ scheduler reload")
+		return api.ErrCQReloadUnlicensed
+	}
+
 	// Read the CQs first: a node that cannot read them yet (not caught up
 	// with the cluster, #1324) keeps the jobs it has rather than losing all.
 	cqs, err := s.cqHandler.GetActiveCQs()
@@ -254,12 +264,6 @@ func (s *CQScheduler) ReloadAll() error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	// Check license - require valid license for CQ scheduler
-	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
-		s.logger.Warn().Msg("Valid enterprise license required for CQ scheduler")
-		return nil
-	}
 
 	// Start all active CQs read above
 	for _, cq := range cqs {
