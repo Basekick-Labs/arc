@@ -2084,13 +2084,17 @@ a licensed node with `continuous_query.enabled` or `retention.enabled` set to
 false. They now give the reason `GET /api/v1/schedulers/` gives: without a
 valid license, or with a tier that does not include the scheduler, a `403`, as
 other license-gated routes answer; with the license in order, a `503` saying
-the feature is not enabled.
+the feature is not enabled or the scheduler failed to start, which the startup
+log reports. `GET /api/v1/schedulers/` now names that second cause too.
 
 A retention trigger the scheduler refuses without running anything is no
 longer a `500`: on a cluster node that is not the primary writer, or while a
 retention cycle is running, it is a `409`. A trigger after the license stopped
 including the scheduler, which answered `200 "Retention triggered
-successfully"` without running anything, is a `403`.
+successfully"` without running anything, is a `403`. A CQ reload after the
+license stopped including the scheduler stopped every continuous query and
+answered `200 "CQ scheduler reloaded successfully"`; it is now a `403` and
+leaves the running continuous queries as they were.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1445](https://github.com/Basekick-Labs/arc/pull/1445).
