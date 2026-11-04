@@ -918,7 +918,18 @@ func validateIdentifier(name string) error {
 	if !validIdentifierPattern.MatchString(name) {
 		return fmt.Errorf("name contains invalid characters (allowed: alphanumeric, underscore, hyphen)")
 	}
+	if containsMaskPlaceholder(name) {
+		return fmt.Errorf("name contains a reserved sequence (__STR_ or __IDENT_)")
+	}
 	return nil
+}
+
+// containsMaskPlaceholder reports whether name carries the text of a
+// MaskStringLiterals placeholder anywhere in it. Such names are reserved: the
+// SQL transform builds storage paths from names while literals are still
+// masked, and restores every placeholder afterwards, wherever it appears.
+func containsMaskPlaceholder(name string) bool {
+	return strings.Contains(name, "__STR_") || strings.Contains(name, "__IDENT_")
 }
 
 // validateHeaderDatabase validates the value of the x-arc-database HTTP
@@ -3462,6 +3473,10 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
 
+	// Names the query qualifies columns with (#1447), collected before any
+	// rewrite: the storage paths emitted below contain dots of their own.
+	qualified := qualifierNames(sql, resolveIdent)
+
 	// Handle tables continuing the FROM list after a cross-join comma:
 	// `FROM a, b` and `FROM a, db.b` (#978). Runs FIRST, on masked SQL the
 	// FROM/JOIN passes have not touched, so the storage paths they emit are
@@ -3469,18 +3484,19 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// otherwise confuse the walker). Its own output starts with "," — the
 	// clause keyword, re-emitted the way FROM/JOIN are — so the FROM/JOIN
 	// patterns below never match inside it.
+	commaSQL := sql
 	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
 		if ref.db != "" {
 			db, _ := resolveIdent(ref.db)
-			table, _ := resolveIdent(ref.table)
+			table, tableOK := resolveIdent(ref.table)
 			path := h.getStoragePath(ctx, db, table)
-			return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+			return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, ","), commaSQL, ref.end, table, tableOK, qualified), true
 		}
 		// Same guard chain as the FROM handler below.
 		if cteNames[strings.ToLower(ref.table)] {
 			return "", false
 		}
-		resolved, _ := resolveIdent(ref.table)
+		resolved, resolvedOK := resolveIdent(ref.table)
 		if cteNames[strings.ToLower(resolved)] {
 			return "", false
 		}
@@ -3488,31 +3504,29 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			return "", false
 		}
 		path := h.getStoragePath(ctx, "default", resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, ","), commaSQL, ref.end, resolved, resolvedOK, qualified), true
 	})
 
 	// Handle FROM database.table references
-	sql = patternDBTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternDBTable.FindStringSubmatch(match)
+	sql = replaceTableRefs(sql, patternDBTable, func(parts []string, end int) string {
 		if len(parts) < 3 {
-			return match
+			return parts[0]
 		}
 		db, _ := resolveIdent(parts[1])
-		table, _ := resolveIdent(parts[2])
+		table, tableOK := resolveIdent(parts[2])
 		path := h.getStoragePath(ctx, db, table)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
+		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, table, tableOK, qualified)
 	})
 
 	// Handle JOIN database.table references (includes LATERAL JOIN)
-	sql = patternJoinDBTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternJoinDBTable.FindStringSubmatch(match)
+	sql = replaceTableRefs(sql, patternJoinDBTable, func(parts []string, end int) string {
 		if len(parts) < 4 {
-			return match
+			return parts[0]
 		}
 		db, _ := resolveIdent(parts[2])
-		table, _ := resolveIdent(parts[3])
+		table, tableOK := resolveIdent(parts[3])
 		path := h.getStoragePath(ctx, db, table)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
+		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, table, tableOK, qualified)
 	})
 
 	// Handle FROM simple_table references
@@ -3531,7 +3545,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		// it — a placeholder token would never match either. The CTE check
 		// runs on BOTH forms: `WITH x AS (…) SELECT * FROM "x"` names the
 		// same virtual table in DuckDB whether or not the reference is quoted.
-		resolved, _ := resolveIdent(parts[1])
+		resolved, resolvedOK := resolveIdent(parts[1])
 		if cteNames[strings.ToLower(resolved)] {
 			return parts[0]
 		}
@@ -3547,7 +3561,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		}
 
 		path := h.getStoragePath(ctx, "default", resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
+		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK, qualified)
 	})
 
 	// Handle JOIN simple_table references (includes LATERAL JOIN)
@@ -3563,7 +3577,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		}
 
 		// Same resolve-then-check ordering as the FROM handler above.
-		resolved, _ := resolveIdent(parts[2])
+		resolved, resolvedOK := resolveIdent(parts[2])
 		if cteNames[strings.ToLower(resolved)] {
 			return parts[0]
 		}
@@ -3579,7 +3593,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		}
 
 		path := h.getStoragePath(ctx, "default", resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
+		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK, qualified)
 	})
 
 	// Restore masked FROM keywords and string literals. Both use content-
@@ -3612,8 +3626,8 @@ const arcInvalidIdentifierSentinel = ".arc-invalid-quoted-identifier"
 // still receives a safe segment to build a path from.
 //
 // A placeholder-shaped token this mask table did not produce is a masked
-// STRING literal (`__STR_n__`, or a name shaped like one) and resolves to the
-// sentinel as well. It must never become a path segment: the segment is
+// STRING literal (`__STR_n__`, or a name that contains one) and resolves to
+// the sentinel as well. It must never become a path segment: the segment is
 // quoted into read_parquet('…') while still a placeholder, and
 // UnmaskStringLiterals would then restore the raw literal, quotes and all,
 // INSIDE that quoted path — turning `FROM db.'…'` into a path expression
@@ -3623,7 +3637,7 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 	return func(name string) (string, bool) {
 		orig, isPlaceholder := identNames[name]
 		if !isPlaceholder {
-			if strings.HasPrefix(name, "__STR_") || strings.HasPrefix(name, "__IDENT_") {
+			if containsMaskPlaceholder(name) {
 				return arcInvalidIdentifierSentinel, false
 			}
 			return name, true
@@ -4479,6 +4493,11 @@ func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLowe
 	// Build replacement - use tiering-aware method that checks both hot and cold tiers
 	replacement := h.buildReadParquetExprForMeasurement(ctx, database, tableName, sql, "FROM")
 
+	// Both callers keep SQL with quotes or comments off this path, so the
+	// qualifier scan can read it as is (#1447).
+	qualified := qualifierNames(sql, func(name string) (string, bool) { return name, true })
+	replacement = aliasTableRef(replacement, sql, end, tableName, true, qualified)
+
 	return sql[:idx] + replacement + sql[end:]
 }
 
@@ -4549,11 +4568,15 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
 
+	// See convertSQLToStoragePaths (#1447).
+	qualified := qualifierNames(sql, resolveIdent)
+
 	// Handle tables continuing the FROM list after a cross-join comma (#978);
 	// runs first, see convertSQLToStoragePaths. A qualified name is left alone
 	// here, as the other passes of this path leave db.table alone:
 	// hasCrossDatabaseSyntax rejects it before the transform runs under a
 	// header database.
+	commaSQL := sql
 	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
 		if ref.db != "" {
 			return "", false
@@ -4561,7 +4584,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 		if cteNames[strings.ToLower(ref.table)] {
 			return "", false
 		}
-		resolved, _ := resolveIdent(ref.table)
+		resolved, resolvedOK := resolveIdent(ref.table)
 		if cteNames[strings.ToLower(resolved)] {
 			return "", false
 		}
@@ -4569,7 +4592,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 			return "", false
 		}
 		path := h.getStoragePath(ctx, database, resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, ","), commaSQL, ref.end, resolved, resolvedOK, qualified), true
 	})
 
 	// Handle FROM simple_table references - apply header database
@@ -4586,7 +4609,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 		// Resolve-then-check, matching convertSQLToStoragePaths: the CTE and
 		// skip checks must see the clean name, never a placeholder token.
-		resolved, _ := resolveIdent(parts[1])
+		resolved, resolvedOK := resolveIdent(parts[1])
 		if cteNames[strings.ToLower(resolved)] {
 			return parts[0]
 		}
@@ -4603,7 +4626,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(ctx, database, resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
+		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK, qualified)
 	})
 
 	// Handle JOIN simple_table references - apply header database
@@ -4619,7 +4642,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 		}
 
 		// Same resolve-then-check ordering as the FROM handler above.
-		resolved, _ := resolveIdent(parts[2])
+		resolved, resolvedOK := resolveIdent(parts[2])
 		if cteNames[strings.ToLower(resolved)] {
 			return parts[0]
 		}
@@ -4636,7 +4659,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(ctx, database, resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
+		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK, qualified)
 	})
 
 	// Restore masked FROM keywords and original string literals.
