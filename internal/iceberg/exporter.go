@@ -33,6 +33,7 @@ import (
 	icecatalog "github.com/apache/iceberg-go/catalog"
 	sqlcat "github.com/apache/iceberg-go/catalog/sql"
 	icetable "github.com/apache/iceberg-go/table"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -47,6 +48,12 @@ import (
 type FileRef struct {
 	PhysicalPath string
 	SizeBytes    int64
+	// Key and LocalPath are where the source found the file: its storage key,
+	// and its path on this node's disk ("" on an object store). Only schema
+	// derivation reads them (FileSchema); the reconcile key is PhysicalPath
+	// and SizeBytes.
+	Key       string
+	LocalPath string
 }
 
 // Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One Exporter per
@@ -56,10 +63,13 @@ type Exporter struct {
 	catalog     *sqlcat.Catalog
 	catalogName string
 	backend     storage.Backend // for writing version-hint.text alongside table metadata
-	warehouse   string          // warehouse root URI (file://… or s3://bucket/prefix)
-	nsPrefix    string          // namespace for Iceberg tables (e.g. "arc")
-	retain      int             // snapshots + metadata versions to keep per table (0 = keep all)
-	logger      zerolog.Logger
+	// awsCfg, with an S3 backend, is the backend's aws.Config, handed to
+	// iceberg-go's S3 FileIO through the context (withAWS); nil otherwise.
+	awsCfg    *aws.Config
+	warehouse string // warehouse root URI (file://… or s3://bucket/prefix)
+	nsPrefix  string // namespace for Iceberg tables (e.g. "arc")
+	retain    int    // snapshots + metadata versions to keep per table (0 = keep all)
+	logger    zerolog.Logger
 	// namespaceMigrationDryRun is set once during wiring, before the scheduler starts.
 	namespaceMigrationDryRun bool
 
@@ -131,9 +141,12 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 	if nsPrefix == "" {
 		nsPrefix = "arc"
 	}
-	cat, err := sqlcat.NewCatalog("arc", db, sqlcat.SQLite, iceberg.Properties{
-		"warehouse": warehouse,
-	})
+	props := iceberg.Properties{"warehouse": warehouse}
+	awsCfg, s3Props := awsConfigOf(backend)
+	for k, v := range s3Props {
+		props[k] = v
+	}
+	cat, err := sqlcat.NewCatalog("arc", db, sqlcat.SQLite, props)
 	if err != nil {
 		return nil, fmt.Errorf("create iceberg sql catalog: %w", err)
 	}
@@ -142,6 +155,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		catalog:     cat,
 		catalogName: "arc",
 		backend:     backend,
+		awsCfg:      awsCfg,
 		warehouse:   strings.TrimSuffix(warehouse, "/"),
 		// resolvedWarehouse/resolvedRoot are computed lazily on first
 		// warehouseRelKey call (the directories may not exist yet here).
@@ -253,6 +267,7 @@ type ArcField struct {
 // TableExists reports whether the Iceberg table for (database, measurement) exists, swallowing
 // catalog lookup errors and returning false.
 func (e *Exporter) TableExists(ctx context.Context, database, measurement string) bool {
+	ctx = e.withAWS(ctx)
 	exists, _ := e.tableExists(ctx, database, measurement)
 	return exists
 }
@@ -261,6 +276,7 @@ func (e *Exporter) TableExists(ctx context.Context, database, measurement string
 // need the (bool, error) form so a transient catalog error is not interpreted and cached as a
 // confirmed missing table.
 func (e *Exporter) tableExists(ctx context.Context, database, measurement string) (bool, error) {
+	ctx = e.withAWS(ctx)
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
 		return false, err
 	}
@@ -285,6 +301,7 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 // A catalog row that exists but cannot be loaded (its metadata file is missing or unreadable)
 // is an error, never a create: see the load gate below (#637).
 func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string, sc ArcSchema) (*icetable.Table, error) {
+	ctx = e.withAWS(ctx)
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
 		return nil, err
 	}
@@ -532,6 +549,7 @@ func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Ta
 // table but absent from Arc. One transaction. Idempotent — if the sets already match, it is a
 // no-op (no new snapshot). This is the core of the reconciler design.
 func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) error {
+	ctx = e.withAWS(ctx)
 	_, err := e.ReconcileMeasurementWithHint(ctx, database, measurement, sc, current)
 	return err
 }
@@ -549,6 +567,7 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 // The return is true when there was nothing to do for either step, which is the ordinary
 // converged case.
 func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) (settled bool, err error) {
+	ctx = e.withAWS(ctx)
 	// EnsureTable publishes the discovery files itself when it creates or evolves
 	// the table, so start from whether those writes succeeded. Otherwise a
 	// creation-time failure would be invisible here and the fingerprint would be
@@ -1761,6 +1780,32 @@ func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey strin
 // Scan().PlanFiles, which resolves the current snapshot's live files honoring deletes across
 // snapshots — NOT AllManifests, which returns manifests from superseded snapshots too and
 // would report files a later removal has already dropped.
+// tableSeed returns what an existing table already says about a measurement:
+// its current schema and its current snapshot's data files (path -> size).
+// A scheduler with nothing cached (a restart) reads footers only for the
+// files this does not list at their size. ok is false when there is no table.
+func (e *Exporter) tableSeed(ctx context.Context, database, measurement string) (sc ArcSchema, files map[string]int64, ok bool, err error) {
+	ctx = e.withAWS(ctx)
+	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
+		return ArcSchema{}, nil, false, err
+	}
+	tbl, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
+	if errors.Is(err, icecatalog.ErrNoSuchTable) {
+		return ArcSchema{}, nil, false, nil
+	}
+	if err != nil {
+		return ArcSchema{}, nil, false, err
+	}
+	files, err = e.tableDataFiles(ctx, tbl)
+	if err != nil {
+		return ArcSchema{}, nil, false, err
+	}
+	for _, f := range tbl.Schema().Fields() {
+		sc.Fields = append(sc.Fields, ArcField{Name: f.Name, Type: f.Type})
+	}
+	return sc, files, true, nil
+}
+
 func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map[string]int64, error) {
 	out := make(map[string]int64)
 	if tbl.CurrentSnapshot() == nil {
@@ -1805,6 +1850,7 @@ func isAlreadyExists(err error) bool {
 // their namespace naming does not follow this mapping, and their lifecycle is
 // owned by edge-sync.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
+	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
 		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
 	}

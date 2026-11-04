@@ -72,7 +72,13 @@ type S3Backend struct {
 	useSSL    bool   // stored for subprocess config passing
 	accessKey string // stored for subprocess credential passing
 	secretKey string // stored for subprocess credential passing
-	logger    zerolog.Logger
+	// awsCfg is the config the client was built from, credential provider
+	// included, so another client (the Iceberg FileIO) can share its
+	// credential cache and renewal; clientEndpoint is the endpoint as the
+	// client uses it (with scheme), "" for the SDK's own resolution.
+	awsCfg         aws.Config
+	clientEndpoint string
+	logger         zerolog.Logger
 	// bucketCheckedAt is when a HeadBucket last answered conclusively
 	// (UnixNano; 0 = not yet), and bucketMissing what it answered. See
 	// confirmObjectAbsent.
@@ -162,6 +168,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	var s3Opts []func(*s3.Options)
 
 	// Custom endpoint for MinIO
+	var clientEndpoint string
 	if cfg.Endpoint != "" {
 		endpoint := cfg.Endpoint
 		// Ensure endpoint has protocol
@@ -173,6 +180,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 			}
 		}
 
+		clientEndpoint = endpoint
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
 			configureGCSS3Options(endpoint, o)
@@ -211,17 +219,19 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	}
 
 	backend := &S3Backend{
-		client:    client,
-		uploader:  uploader,
-		bucket:    cfg.Bucket,
-		prefix:    prefix,
-		region:    region,
-		endpoint:  cfg.Endpoint,
-		pathStyle: cfg.PathStyle,
-		useSSL:    cfg.UseSSL,
-		accessKey: accessKey,
-		secretKey: secretKey,
-		logger:    log,
+		client:         client,
+		uploader:       uploader,
+		bucket:         cfg.Bucket,
+		prefix:         prefix,
+		region:         region,
+		endpoint:       cfg.Endpoint,
+		pathStyle:      cfg.PathStyle,
+		useSSL:         cfg.UseSSL,
+		accessKey:      accessKey,
+		secretKey:      secretKey,
+		awsCfg:         awsCfg,
+		clientEndpoint: clientEndpoint,
+		logger:         log,
 	}
 
 	// Test connection by checking if bucket exists
@@ -1194,4 +1204,35 @@ func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]Unusable
 	}
 
 	return objects, nil
+}
+
+// S3ClientSettings is what another S3 client needs to reach the same bucket
+// the same way this backend does.
+type S3ClientSettings struct {
+	// AWS is the config the backend's client was built from. Its credential
+	// provider is the backend's, cache and renewal included.
+	AWS aws.Config
+	// Region is the bucket's region.
+	Region string
+	// Endpoint is the custom endpoint with its scheme, "" when the SDK
+	// resolves the endpoint itself (AWS).
+	Endpoint string
+	// PathStyle is path-style addressing.
+	PathStyle bool
+	// GCSInterop: the endpoint is Google Cloud Storage's S3-compatible XML
+	// API, which this backend reaches through a client option (a signer)
+	// another client built from AWS alone would not have.
+	GCSInterop bool
+}
+
+// ClientSettings returns the settings another S3 client needs to share this
+// backend's bucket and credentials.
+func (b *S3Backend) ClientSettings() S3ClientSettings {
+	return S3ClientSettings{
+		AWS:        b.awsCfg,
+		Region:     b.region,
+		Endpoint:   b.clientEndpoint,
+		PathStyle:  b.pathStyle,
+		GCSInterop: isGCSEndpoint(b.clientEndpoint),
+	}
 }

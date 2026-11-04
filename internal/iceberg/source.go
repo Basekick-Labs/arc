@@ -294,6 +294,39 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 	}
 }
 
+// FileSchema derives one listed file's schema from its footer: from disk when
+// the file is local, otherwise from the tail of the object (SchemaFromBackend).
+func (s *StorageWalkSource) FileSchema(ctx context.Context, f FileRef) (ArcSchema, error) {
+	if f.LocalPath != "" {
+		return SchemaFromParquet(f.LocalPath)
+	}
+	return SchemaFromBackend(ctx, s.backend, f.Key, f.SizeBytes)
+}
+
+// objectLister is the backend's sized listing when the backend is an object
+// store; nil for local storage, which keeps its per-file stat (List plus
+// os.Stat is cheaper there than a walk that stats every file anyway).
+func (s *StorageWalkSource) objectLister() storage.ObjectLister {
+	if s.backend.Type() == "local" {
+		return nil
+	}
+	ol, _ := s.backend.(storage.ObjectLister)
+	return ol
+}
+
+// listSizes lists prefix with each object's size, keyed as List keys it.
+func listSizes(ctx context.Context, lister storage.ObjectLister, prefix string) (map[string]int64, error) {
+	objs, err := lister.ListObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(objs))
+	for _, o := range objs {
+		out[o.Path] = o.Size
+	}
+	return out, nil
+}
+
 // vanishRetries bounds FilesAndLocal's attempts at a stable listing.
 const vanishRetries = 3
 
@@ -359,7 +392,23 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 			leaveOut[filepath.ToSlash(k)] = struct{}{}
 		}
 	}
-	paths, err := s.backend.List(ctx, prefix)
+	// On an object store the listing carries each object's size, so no file is
+	// HEADed; a second listing below stands in for the per-file stat.
+	lister := s.objectLister()
+	var paths []string
+	var listedSize map[string]int64
+	if lister != nil {
+		listedSize, err = listSizes(ctx, lister, prefix)
+		if err == nil {
+			paths = make([]string, 0, len(listedSize))
+			for p := range listedSize {
+				paths = append(paths, p)
+			}
+			sort.Strings(paths)
+		}
+	} else {
+		paths, err = s.backend.List(ctx, prefix)
+	}
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
 	}
@@ -404,6 +453,26 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 			return nil, nil, vanished, errExclusionsMoved
 		}
 	}
+	if lister != nil {
+		// The object-store stat: a data object gone, or a different size, by
+		// this second listing changed under the first.
+		again, err := listSizes(ctx, lister, prefix)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		for _, p := range paths {
+			if !isDataFile(p) {
+				continue
+			}
+			if size, ok := again[p]; !ok || size != listedSize[p] {
+				vanished = append(vanished, p)
+			}
+		}
+		if len(vanished) > 0 {
+			sort.Strings(vanished)
+			return nil, nil, vanished, nil
+		}
+	}
 	excluded, deleted, replaced := 0, 0, 0
 	for _, p := range paths {
 		if !isDataFile(p) {
@@ -429,9 +498,12 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 			return nil, nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", p, err)
 		}
 		lp := s.resolver.LocalPath(p)
-		size, present, err := s.statSize(ctx, p, lp)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("stat listed file %q: %w", p, err)
+		size, present := listedSize[p], true
+		if lister == nil {
+			size, present, err = s.statSize(ctx, p, lp)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("stat listed file %q: %w", p, err)
+			}
 		}
 		if !present {
 			// Removed between the listing and the stat (retention, compaction, the
@@ -441,7 +513,7 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 			vanished = append(vanished, filepath.ToSlash(p))
 			continue
 		}
-		files = append(files, FileRef{PhysicalPath: uri, SizeBytes: size})
+		files = append(files, FileRef{PhysicalPath: uri, SizeBytes: size, Key: filepath.ToSlash(p), LocalPath: lp})
 		if lp != "" {
 			local = append(local, lp)
 		}
@@ -467,9 +539,10 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 // partial-match branch publishes a fresh path instead, but restores and
 // edge-sync still write a known path, and only the size tells that
 // content apart from what the Iceberg manifest describes.
-// present=false means the file is gone. Local files are stat'ed directly; any
-// other backend answers through StatFile (Iceberg export is local-only, so
-// that branch only serves wrapped backends in tests).
+// present=false means the file is gone. Local files are stat'ed directly; a
+// backend that is not an object store (objectLister) but has no local path
+// answers through StatFile. Object stores never get here: their size comes
+// from the listing.
 func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string) (size int64, present bool, err error) {
 	if localPath != "" {
 		st, err := os.Stat(localPath)
@@ -500,9 +573,9 @@ const compactionStateDir = "_compaction_state"
 // exported; vortex is a separate (shelved) format and Iceberg's data files are Parquet.
 func isDataFile(p string) bool {
 	// filepath.Base (not path.Base): storage keys from a local backend on Windows are
-	// backslash-separated (LocalBackend.List uses filepath.Rel without ToSlash), and Iceberg
-	// export is local-only. filepath.Base handles both separators; path.Base would treat a
-	// backslash key as one component.
+	// backslash-separated (LocalBackend.List uses filepath.Rel without ToSlash). filepath.Base
+	// handles both separators; path.Base would treat a backslash key as one component. An
+	// object-store key never holds a backslash (the backends refuse one), so it is unaffected.
 	base := filepath.Base(p)
 	// Skip dotfiles. This covers Arc's in-flight ".tmp.*" writes (a separate ".tmp." check would
 	// be redundant — it already starts with "."), so a partially-written file is never registered.
