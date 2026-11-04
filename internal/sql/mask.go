@@ -203,18 +203,76 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 }
 
 // UnmaskStringLiterals restores the original string literals from their placeholders.
+//
+// One pass over sql: each placeholder found is replaced by its mask's
+// original text, and restored text is never scanned again. A string
+// placeholder is restored at its first occurrence only; an identifier
+// placeholder, deduplicated at mask time, at every occurrence. Replacing
+// mask by mask (strings.Replace per mask) copied the whole statement once per
+// literal, which is quadratic in the number of literals, and rescanned text
+// it had already restored.
 func UnmaskStringLiterals(sql string, masks []StringMask) string {
-	result := sql
-	for _, mask := range masks {
-		if mask.Identifier {
-			// Identifier placeholders are deduplicated at mask time, so one
-			// mask entry may stand for several occurrences.
-			result = strings.ReplaceAll(result, mask.Placeholder, mask.Original)
+	if len(masks) == 0 {
+		return sql
+	}
+	index := make(map[string]int, len(masks))
+	for i, mask := range masks {
+		index[mask.Placeholder] = i
+	}
+	restored := make([]bool, len(masks))
+	var b strings.Builder
+	b.Grow(len(sql) + len(sql)/4)
+	last := 0
+	for i := 0; i < len(sql); {
+		j := strings.Index(sql[i:], "__")
+		if j < 0 {
+			break
+		}
+		j += i
+		end := placeholderEnd(sql, j)
+		if end < 0 {
+			i = j + 1
 			continue
 		}
-		result = strings.Replace(result, mask.Placeholder, mask.Original, 1)
+		k, ok := index[sql[j:end]]
+		if !ok || (!masks[k].Identifier && restored[k]) {
+			i = j + 1
+			continue
+		}
+		restored[k] = true
+		b.WriteString(sql[last:j])
+		b.WriteString(masks[k].Original)
+		last, i = end, end
 	}
-	return result
+	if last == 0 {
+		return sql
+	}
+	b.WriteString(sql[last:])
+	return b.String()
+}
+
+// placeholderEnd returns the end of the `__STR_<n>__` or `__IDENT_<n>__`
+// placeholder that starts at i in s, or -1 if none starts there. It is
+// lenient about the digits: the caller looks the token up among the masks.
+func placeholderEnd(s string, i int) int {
+	rest := s[i:]
+	var n int
+	switch {
+	case strings.HasPrefix(rest, "__STR_"):
+		n = len("__STR_")
+	case strings.HasPrefix(rest, "__IDENT_"):
+		n = len("__IDENT_")
+	default:
+		return -1
+	}
+	d := n
+	for d < len(rest) && rest[d] >= '0' && rest[d] <= '9' {
+		d++
+	}
+	if !strings.HasPrefix(rest[d:], "__") {
+		return -1
+	}
+	return i + d + 2
 }
 
 // IdentifierNames maps each identifier placeholder to its UNQUOTED name:

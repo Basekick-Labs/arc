@@ -149,6 +149,35 @@ itself and be rejected with 403, leaving peer caches stale after compaction,
 retention, DELETE or database/measurement removal. Explicit API hosts remain
 unchanged. Forwarded requests and invalidation now share the same resolver.
 
+## New: a configurable SQL length limit ([#1448](https://github.com/Basekick-Labs/arc/issues/1448))
+
+Arc refused any query longer than 10,000 characters, a fixed limit. A query
+naming many series, for example the latest value of 2,500 channels listed in
+an `IN (...)`, needs far more. The limit is now `query.max_sql_length`
+(env `ARC_QUERY_MAX_SQL_LENGTH`), in bytes:
+
+```toml
+[query]
+max_sql_length = 200000
+```
+
+- The default stays 10000. Values from 1000 to 1048576 (1 MiB) are accepted,
+  and the value must be smaller than `server.max_payload_size`, which limits
+  the request body that carries the SQL. Anything else refuses to start,
+  naming the key.
+- It applies to every endpoint that runs SQL (JSON, MessagePack, Arrow and the
+  row estimate) and to continuous query definitions. A continuous query is
+  checked again at every run, so lowering the limit below a stored
+  definition's length makes that query fail until it is shortened.
+- Preparing a long query now takes time in proportion to its length. Before,
+  restoring its string literals copied the whole statement once per literal,
+  so a 1 MB query with 50,000 literals spent 9.3 s there, and a 2.3 MB one
+  34 s. Both now take under 0.6 s. Validation and rewriting together cost
+  about 0.5 s of CPU per MiB before DuckDB starts, which is why the ceiling is
+  1 MiB.
+- Queries longer than 10,000 characters are not kept in the SQL transform
+  cache, so a raised limit leaves the cache's memory bound unchanged.
+
 ## New: MessagePack columnar tag keys (#275)
 
 MessagePack columnar payloads now accept an optional `tag_keys` field to
