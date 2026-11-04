@@ -463,8 +463,10 @@ tests are the basis of this change's.
 ## Fix: license gates expire while Arc is running (#1442)
 
 License checks now use the signed expiry at the time of each check. A final
-definitive server rejection clears the current license and its disk cache;
-transient network or protocol failures preserve the license until that signed
+definitive server rejection clears the current license and attempts to remove
+its disk cache. Removal failures are logged; if deletion fails, a restart
+during an outage may still reuse the rejected cache. Transient network or
+protocol failures preserve the license until that signed
 expiry. Both machine-reactivation responses still attempt activation before
 the final result determines whether to invalidate the license. Health status
 and days remaining use the same expiry calculation.
