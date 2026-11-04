@@ -3246,11 +3246,13 @@ func (c *Coordinator) Status() map[string]interface{} {
 		totalCores := c.raftFSM.TotalCores()
 		status["total_cores"] = totalCores
 
-		if c.licenseClient != nil && c.licenseClient.GetLicense() != nil {
-			maxCores := c.licenseClient.GetLicense().MaxCores
-			status["max_cores"] = maxCores
-			if maxCores > 0 {
-				status["cores_remaining"] = maxCores - totalCores
+		if c.licenseClient != nil {
+			if lic := c.licenseClient.GetLicense(); lic != nil {
+				maxCores := lic.MaxCores
+				status["max_cores"] = maxCores
+				if maxCores > 0 {
+					status["cores_remaining"] = maxCores - totalCores
+				}
 			}
 		}
 	}

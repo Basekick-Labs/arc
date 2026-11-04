@@ -106,8 +106,8 @@ var (
 // escape, so a 4-core license would run 8 flush workers and whatever
 // database.thread_count the operator wrote.
 //
-// Enforcement is boot-time, matching the model used for mid-process license
-// expiry: nothing re-applies this after StartPeriodicValidation re-verifies.
+// Core-limit enforcement is boot-time: periodic validation does not reapply
+// these resource limits. Feature entitlement gates check expiry at read time.
 func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 	machineCores, effective := numCPUFn(), effectiveCoresFn()
 	// Non-positive MaxCores means unlimited.

@@ -14,6 +14,35 @@ type changingSchedulerLicense struct {
 	current atomic.Pointer[license.License]
 }
 
+func TestSchedulerSignedExpiryCancelsActivePass(t *testing.T) {
+	gate := &changingSchedulerLicense{}
+	gate.current.Store(&license.License{Tier: license.TierEnterprise, Status: "active", ExpiresAt: time.Now().Add(500 * time.Millisecond)})
+	started := make(chan int, 16)
+	cancelled := make(chan struct{})
+	runner := &schedulerRunner{started: started, call: func(ctx context.Context, _ int) (*RunResult, error) {
+		<-ctx.Done()
+		close(cancelled)
+		return nil, ctx.Err()
+	}}
+	s, err := NewScheduler(SchedulerConfig{Agent: runner, Enabled: true, SyncInterval: 10 * time.Millisecond, RetryInterval: 5 * time.Millisecond, LicenseClient: gate, Logger: zerolog.Nop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	waitSchedulerCall(t, started, 1, time.Second)
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("signed expiry did not cancel active scheduled pass")
+	}
+	if n := runner.calls.Load(); n != 1 {
+		t.Fatalf("expired license started %d passes", n)
+	}
+}
+
 func (l *changingSchedulerLicense) CanUseEdgeSyncScheduler() bool {
 	return l.current.Load().CanUseEdgeSyncScheduler()
 }
@@ -48,7 +77,7 @@ func TestSchedulerLicenseLossCancelsAndRenewalResumes(t *testing.T) {
 	for _, status := range []string{"expired", "read_only", "missing"} {
 		t.Run(status, func(t *testing.T) {
 			gate := &changingSchedulerLicense{}
-			gate.current.Store(&license.License{Tier: license.TierStarter, Status: "active"})
+			gate.current.Store(&license.License{Tier: license.TierStarter, Status: "active", ExpiresAt: time.Now().Add(time.Hour)})
 			started := make(chan int, 16)
 			cancelled := make(chan struct{})
 			m := &schedulerMetrics{}
@@ -86,7 +115,7 @@ func TestSchedulerLicenseLossCancelsAndRenewalResumes(t *testing.T) {
 			if m.failures.Load() != 0 || m.successes.Load() != 0 {
 				t.Fatal("license cancellation counted as hub outcome")
 			}
-			gate.current.Store(&license.License{Tier: license.TierProfessional, Status: "grace_period"})
+			gate.current.Store(&license.License{Tier: license.TierProfessional, Status: "grace_period", ExpiresAt: time.Now().Add(time.Hour)})
 			waitSchedulerCall(t, started, 2, time.Second)
 		})
 	}

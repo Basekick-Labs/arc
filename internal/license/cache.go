@@ -116,11 +116,13 @@ func (c *Client) saveCache(licenseFile, licenseSignature string) {
 	c.logger.Debug().Str("path", path).Msg("license cache updated")
 }
 
-// deleteCache removes the cache (best-effort), used when its contents cannot
-// belong to the configured key.
+// deleteCache removes an unusable or definitively rejected cache. Failure does
+// not reopen in-memory gates, but can leave stale entitlements on disk.
 func (c *Client) deleteCache() {
 	if path := c.cachePath(); path != "" {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			c.logger.Warn().Err(err).Msg("License cache removal failed; a restart during an outage may reuse the rejected cache")
+		}
 	}
 }
 
@@ -243,11 +245,8 @@ type LicenseHealth struct {
 	SiteLicense   bool       `json:"site_license,omitempty"`
 }
 
-// HealthStatus reports the current license for /health. Status is derived at
-// READ time against the clock (the #603 lesson): enforcement stays boot-time,
-// but health tells the truth — a license that expires mid-process shows
-// "expired" here within a probe interval, even though features remain enabled
-// until the next restart rejects it.
+// HealthStatus reports the current license for /health using the signed expiry
+// at read time, matching feature gates without mutating their shared snapshot.
 func (c *Client) HealthStatus() LicenseHealth {
 	c.mu.RLock()
 	lic := c.license
@@ -256,16 +255,7 @@ func (c *Client) HealthStatus() LicenseHealth {
 	if lic == nil {
 		return LicenseHealth{Tier: "oss", Status: "unlicensed", Source: string(src)}
 	}
-	status := lic.Status
-	now := time.Now().UTC()
-	days := 0
-	if !lic.ExpiresAt.IsZero() {
-		if !now.Before(lic.ExpiresAt) {
-			status = "expired"
-		} else {
-			days = int(time.Until(lic.ExpiresAt).Hours() / 24)
-		}
-	}
+	status, days := expiryStatus(lic.ExpiresAt, time.Now())
 	exp := lic.ExpiresAt.UTC()
 	return LicenseHealth{
 		Tier:          string(lic.Tier),

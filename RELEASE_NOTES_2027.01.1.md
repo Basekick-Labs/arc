@@ -2,6 +2,19 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: license gates expire while Arc is running (#1442)
+
+License checks now use the signed expiry at the time of each check. A final
+definitive server rejection clears the current license and its disk cache;
+transient network or protocol failures preserve the license until that signed
+expiry. Both machine-reactivation responses still attempt activation before
+the final result determines whether to invalidate the license. Health status
+and days remaining use the same expiry calculation.
+
+This change closes existing runtime entitlement checks. It does not yet
+implement automatic conversion of a running cluster into one standalone OSS
+writer. Existing RBAC restrictions remain enforced when a license lapses.
+
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 
 `GET /api/v1/write/msgpack/spec` said authentication was "not yet
