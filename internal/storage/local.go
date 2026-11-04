@@ -1050,7 +1050,7 @@ func ValidateListPrefix(prefix string) error {
 		return nil
 	}
 	if prefix == "/" {
-		return fmt.Errorf("%w: %q is not a relative prefix; use \"\" for everything", ErrInvalidPath, prefix)
+		return fmt.Errorf("%w: root separator is not a relative prefix; use an empty prefix for everything", ErrInvalidPath)
 	}
 	if prefix[len(prefix)-1] == '/' {
 		prefix = prefix[:len(prefix)-1]
@@ -1069,7 +1069,7 @@ func validateKeyBody(p string) error {
 		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxUsableKeyLen)
 	}
 	if p[0] == '/' {
-		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, p)
+		return fmt.Errorf("%w: path must be relative to the backend root", ErrInvalidPath)
 	}
 	start := 0
 	for i := 0; i <= len(p); i++ {
@@ -1079,14 +1079,14 @@ func validateKeyBody(p string) error {
 				return fmt.Errorf("%w: contains a NUL byte", ErrInvalidPath)
 			}
 			if c == '\\' {
-				return fmt.Errorf("%w: %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, p)
+				return fmt.Errorf("%w: path contains a backslash, which Azure treats as a separator", ErrInvalidPath)
 			}
 			if c != '/' {
 				continue
 			}
 		}
 		if err := checkSegment(p[start:i]); err != nil {
-			return fmt.Errorf("%w (in %q)", err, p)
+			return err
 		}
 		start = i + 1
 	}
@@ -1101,8 +1101,10 @@ func checkSegment(seg string) error {
 	switch seg {
 	case "":
 		return fmt.Errorf("%w: contains an empty segment", ErrInvalidPath)
-	case ".", "..":
-		return fmt.Errorf("%w: contains a %q segment", ErrInvalidPath, seg)
+	case ".":
+		return fmt.Errorf("%w: contains a single-dot segment", ErrInvalidPath)
+	case "..":
+		return fmt.Errorf("%w: contains a double-dot segment", ErrInvalidPath)
 	}
 	if len(seg) > MaxUsableKeySegmentLen {
 		return fmt.Errorf("%w: has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, len(seg), MaxUsableKeySegmentLen)

@@ -2068,6 +2068,13 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Invalid object-store prefix diagnostics remain readable after log masking ([#1113](https://github.com/Basekick-Labs/arc/issues/1113))
+
+Validation errors identify unsupported characters by code point and describe
+invalid path segments without quoting configured values. The allowed character
+set and rejection reason now survive log sanitization, including quote characters.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
 ### A delete's WHERE may qualify columns by the measurement name ([#1451](https://github.com/Basekick-Labs/arc/issues/1451))
 
 `POST /api/v1/delete` with `"where": "cpu.host = 'web-1'"` on measurement `cpu`
