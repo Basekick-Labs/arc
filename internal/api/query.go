@@ -21,6 +21,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/governance"
@@ -2856,13 +2857,34 @@ func (e *SQLValidationError) Error() string {
 // `\b...\b` token boundary) and string literals masked (so `SELECT
 // 'DROP TABLE x'` does not false-positive). The cost is one full pass
 // over the SQL; for the 10KB cap that's microseconds.
+// transformCacheMaxSQLLength is the longest statement whose transform is
+// cached: the default SQL cap, so a raised cap leaves the cache's memory
+// bound where it was.
+const transformCacheMaxSQLLength = config.DefaultMaxSQLLength
+
+// maxSQLLength is query.max_sql_length (#1448). Zero, before main sets it
+// and in tests that never do, means config.DefaultMaxSQLLength.
+var maxSQLLength atomic.Int64
+
+// SetMaxSQLLength sets the SQL length cap ValidateSQLRequest enforces. Load
+// has already checked the value's range; n <= 0 restores the default.
+func SetMaxSQLLength(n int) { maxSQLLength.Store(int64(n)) }
+
+// MaxSQLLength is the SQL length cap in force.
+func MaxSQLLength() int {
+	if n := maxSQLLength.Load(); n > 0 {
+		return int(n)
+	}
+	return config.DefaultMaxSQLLength
+}
+
 func ValidateSQLRequest(sql string) error {
 	if strings.TrimSpace(sql) == "" {
 		return &SQLValidationError{Message: "SQL query is required"}
 	}
 
-	if len(sql) > 10000 {
-		return &SQLValidationError{Message: "SQL query exceeds maximum length (10000 characters)"}
+	if max := MaxSQLLength(); len(sql) > max {
+		return &SQLValidationError{Message: fmt.Sprintf("SQL query exceeds maximum length (%d characters; query.max_sql_length)", max)}
 	}
 
 	// Normalise before denylist check: mask string literals so keywords
@@ -3360,7 +3382,11 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 		return "", false, nil, err
 	}
 
-	if !volatile.Volatile {
+	// The cache is bounded by entry count and holds each statement twice (key
+	// and transform), so statements longer than the default cap are not
+	// cached: a raised query.max_sql_length would otherwise multiply its
+	// memory bound. Transforming is linear, so re-running it is cheap.
+	if !volatile.Volatile && len(sql) <= transformCacheMaxSQLLength {
 		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
 	}
 	return transformed, false, refs, nil
