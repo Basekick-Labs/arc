@@ -7875,6 +7875,20 @@ thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
 
+### The buffer refuses a measurement name containing "/" ([#1475](https://github.com/Basekick-Labs/arc/issues/1475))
+
+Buffer, coverage and tier-cache keys are `database + "/" + measurement`. They
+are unambiguous only while a measurement has no `/`, which every ingest entry
+point already guarantees by validating names (a letter, then letters, digits,
+`_` or `-`). The buffer now refuses such a name itself, before any WAL work,
+as a content refusal, so a future entry point that skipped validation cannot
+make two measurements share a key. No supported write path can reach it.
+
+A test now also pins how the Iceberg exporter reads a metadata file's version
+(`00004-<uuid>.metadata.json` and `v4.metadata.json` are both version `4`): it
+is the integer `version-hint.text` holds, so the leading zeros are dropped on
+purpose. Both items close the last two open points of #750.
+
 ### Hourly compaction file-count guidance (#793)
 
 Documented `compaction.hourly_min_files` as an independent per-partition floor,

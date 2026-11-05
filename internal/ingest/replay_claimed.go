@@ -139,6 +139,9 @@ func (b *ArrowBuffer) ReplayClaimed(ctx context.Context, r ClaimedReplay) ([]Hou
 		}
 		seen[id] = true
 	}
+	// Rebuilds a key that was already buffered: the claimant took Database and
+	// Measurement from it with strings.Cut at the first "/", so it is the same
+	// key (#1475). Measurements reached the buffer through its "/" backstop.
 	key := r.Database + "/" + r.Measurement
 
 	var out []HourOutcome

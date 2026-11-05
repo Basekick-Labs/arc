@@ -3430,9 +3430,13 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 }
 
 func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALHashes []string, inheritedWALCopy bool) error {
-	// Every ingest path refuses these names before here (#1342); this is the
-	// backstop, before any WAL work, so a path that misses the check fails
-	// the write instead of storing a column nothing can read back.
+	// Every ingest path refuses these names before here (#1342, #1475); this
+	// is the backstop, before any WAL work, so a path that misses the check
+	// fails the write instead of storing a column nothing can read back, or
+	// a measurement its buffer key cannot tell apart from another.
+	if err := unstorableMeasurementError(record.Measurement); err != nil {
+		return err
+	}
 	for name := range record.Columns {
 		if err := unstorableColumnError(record.Measurement, name); err != nil {
 			return err
@@ -3447,6 +3451,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	}
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
+	// Unambiguous because the measurement has no "/" (#1475 backstop above).
 	bufferKey := database + "/" + record.Measurement
 
 	// Convert []interface{} columns to typed arrays (optimized with zero-copy
@@ -3766,7 +3771,10 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // encoded as row entries (encodeTypedWALRows), NULL cells left out.
 // The typed msgpack decode path always supplies rawPayload.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
-	// The #1342 backstop; see writeColumnarInternalWithWALHashes.
+	// The #1342 and #1475 backstops; see writeColumnarInternalWithWALCopy.
+	if err := unstorableMeasurementError(measurement); err != nil {
+		return err
+	}
 	for name := range typedColumns.Data {
 		if err := unstorableColumnError(measurement, name); err != nil {
 			return err
@@ -3777,6 +3785,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 			return err
 		}
 	}
+	// Unambiguous because the measurement has no "/" (#1475 backstop above).
 	bufferKey := database + "/" + measurement
 	if len(rawPayload) > 0 {
 		// The payload's size, but at least 8 bytes a cell: a NULL is one
@@ -6338,7 +6347,7 @@ func (b *ArrowBuffer) countFutureStamped(database, measurement string, times []i
 // warnOncePerMinute rate-limits a warning per kind and measurement. Two
 // flushes racing past the check may both warn; that is harmless.
 func (b *ArrowBuffer) warnOncePerMinute(kind, database, measurement string, now time.Time) bool {
-	key := kind + "|" + database + "/" + measurement
+	key := kind + "|" + database + "/" + measurement // a measurement has no "/" (#1475)
 	nowNano := now.UnixNano()
 	if v, ok := b.futureStampWarned.Load(key); ok && nowNano-v.(int64) < int64(time.Minute) {
 		return false

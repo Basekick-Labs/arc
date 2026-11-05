@@ -63,7 +63,7 @@ func AsWriteStopped(err error) (*WriteStoppedError, bool) {
 // written and the measurement reported as dropped.
 func isContentRefusal(err error) bool {
 	return errors.Is(err, ErrColumnTypeChange) || errors.Is(err, ErrUnstorableColumnName) ||
-		errors.Is(err, ErrUnstorableColumnValue)
+		errors.Is(err, ErrUnstorableColumnValue) || errors.Is(err, ErrUnstorableMeasurementName)
 }
 
 // IsContentRefusal is isContentRefusal for the write handlers.

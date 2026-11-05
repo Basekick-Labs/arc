@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -155,6 +156,25 @@ func quoteColumnNames(names []string) []string {
 // ColumnNameProblem refuses that reached it (#1342): every ingest path drops
 // or refuses such names first, so it means a path that does not.
 var ErrUnstorableColumnName = errors.New("column name cannot be stored")
+
+// ErrUnstorableMeasurementName is returned by the buffer for a measurement
+// name containing "/" (#1475). Buffer, coverage and tier-cache keys are
+// database + "/" + measurement: cluster code splits them at the first "/",
+// which holds because database names are validated without one, and every
+// other use is an exact lookup or a storage path, which holds only while the
+// measurement has none. Every ingest path validates measurement names first
+// (a letter, then letters, digits, "_" or "-"), so this means a path that
+// does not.
+var ErrUnstorableMeasurementName = errors.New("measurement name cannot be stored")
+
+// unstorableMeasurementError refuses a measurement name the buffer's keys
+// cannot hold unambiguously; nil for any other.
+func unstorableMeasurementError(measurement string) error {
+	if strings.Contains(measurement, "/") {
+		return fmt.Errorf("%w: measurement %s contains \"/\"", ErrUnstorableMeasurementName, strconv.Quote(measurement))
+	}
+	return nil
+}
 
 func unstorableColumnError(measurement, name string) error {
 	if name == "time" {
