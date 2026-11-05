@@ -1711,15 +1711,14 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	// Iceberg export is LOCAL-ONLY in v1. The reconciler walks the single configured storage
-	// backend and derives schemas by reading Parquet footers from the local filesystem, and the
-	// export was verified only against a local backend. Refuse non-local primary backends and
-	// cold-tier tiering (a file migrated to object storage would leave the Iceberg table) at
-	// load time rather than run an unsupported/corrupting configuration.
+	// Iceberg export runs on a local or an S3 primary backend (#939). The reconciler walks the
+	// single configured storage backend and publishes through iceberg-go's FileIO, which Arc
+	// links for s3:// only, so Azure and GCS primaries are refused, as is cold-tier tiering
+	// (a file migrated to the cold tier would leave the Iceberg table). Refused at load time
+	// rather than run an unsupported or corrupting configuration.
 	if cfg.Iceberg.Enabled {
-		if cfg.Storage.Backend != "local" {
-			return nil, fmt.Errorf("iceberg.enabled=true requires storage.backend=\"local\" (got %q); "+
-				"Iceberg export is local-only in this release", cfg.Storage.Backend)
+		if err := cfg.checkIcebergBackend(); err != nil {
+			return nil, err
 		}
 		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
 			return nil, fmt.Errorf("iceberg.enabled=true is not supported with cold-tier tiering " +
@@ -2930,4 +2929,82 @@ func ParseSize(sizeStr string) (int64, error) {
 		return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
 	}
 	return num, nil
+}
+
+// checkIcebergBackend refuses the primary-backend shapes Iceberg export does not support (#939).
+//
+//   - storage.backend other than "local" or "s3": the exporter publishes through iceberg-go's
+//     FileIO, and Arc links its s3:// driver only.
+//   - storage.backend="s3" on Google Cloud Storage's S3-compatible endpoint: Arc reaches GCS
+//     through a request signer and checksum policy set on its own S3 client, which iceberg-go's
+//     client does not get, so its writes would be refused.
+//   - storage.backend="s3" with an iceberg.warehouse outside the storage root: iceberg-go opens
+//     every added data file through the table's FileIO, which is bound to the warehouse's bucket,
+//     so a warehouse in another bucket fails the first add; one under another prefix of the same
+//     bucket is outside what backups and the orphan sweep treat as Arc's.
+//   - cluster.shared_storage_mode without cluster.failover_enabled: without the compactor lease
+//     every compactor-role node exports, and two exporters writing one table's metadata fork it.
+func (cfg *Config) checkIcebergBackend() error {
+	switch cfg.Storage.Backend {
+	case "local":
+	case "s3":
+		if storage.IsGCSEndpoint(cfg.Storage.S3Endpoint) {
+			return fmt.Errorf("iceberg.enabled=true is not supported with storage.backend=\"s3\" on Google Cloud Storage's " +
+				"S3-compatible endpoint (storage.s3_endpoint=storage.googleapis.com): Iceberg export supports local and S3 primary storage")
+		}
+		if err := checkIcebergWarehouseUnderS3Root(cfg.Iceberg.Warehouse, cfg.Storage.S3Bucket, cfg.Storage.S3Prefix); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("iceberg.enabled=true requires storage.backend=\"local\" or \"s3\" (got %q): "+
+			"Iceberg export does not support %s primary storage", cfg.Storage.Backend, cfg.Storage.Backend)
+	}
+	if cfg.Cluster.Enabled && cfg.Cluster.SharedStorageMode && !cfg.Cluster.FailoverEnabled {
+		return fmt.Errorf("iceberg.enabled=true with cluster.shared_storage_mode=true requires cluster.failover_enabled=true: " +
+			"the compactor lease is what keeps a single node exporting, and two exporters writing the same table's " +
+			"metadata in shared storage fork its history")
+	}
+	return nil
+}
+
+// checkIcebergWarehouseUnderS3Root refuses an explicit iceberg.warehouse that is not
+// s3://<storage.s3_bucket>/ under storage.s3_prefix, compared on whole path segments
+// (s3://b/ab is not under s3://b/a). An empty warehouse means the default, the storage root.
+func checkIcebergWarehouseUnderS3Root(warehouse, bucket, prefix string) error {
+	warehouse = strings.TrimSpace(warehouse)
+	if warehouse == "" {
+		return nil
+	}
+	root := "s3://" + bucket + "/" + strings.TrimSuffix(prefix, "/")
+	refuse := func(why string) error {
+		return fmt.Errorf("iceberg.warehouse=%q must be inside the storage root %s (%s): Iceberg data files are opened "+
+			"through the warehouse's bucket, and metadata outside the root is not covered by backups", warehouse, strings.TrimSuffix(root, "/"), why)
+	}
+	u, err := url.Parse(warehouse)
+	if err != nil {
+		return refuse("not a URI")
+	}
+	if u.Scheme != "s3" {
+		return refuse("not an s3:// URI")
+	}
+	if u.Host != bucket {
+		return refuse("a different bucket")
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return refuse("a URI with a query, fragment or user")
+	}
+	path := strings.TrimPrefix(u.Path, "/")
+	if path != "" {
+		if _, err := storage.ValidateObjectPrefix(path); err != nil {
+			return refuse(err.Error())
+		}
+	}
+	want, err := storage.ValidateObjectPrefix(prefix)
+	if err != nil {
+		return refuse(err.Error())
+	}
+	if !strings.HasPrefix(strings.TrimSuffix(path, "/")+"/", want) && want != "" {
+		return refuse("a path outside storage.s3_prefix")
+	}
+	return nil
 }

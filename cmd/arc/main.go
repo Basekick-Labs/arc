@@ -4204,6 +4204,10 @@ func main() {
 		if !cfg.Iceberg.OrphanSweepEnabled {
 			log.Warn().Msg("Iceberg orphan metadata sweep is disabled (iceberg.orphan_sweep_enabled=false): the manifest files of expired snapshots are retained indefinitely and are copied into every backup")
 		}
+		// Shared storage: every node sees the same tables and the export moves with the
+		// compactor lease, so the published version, not this node's catalog row, is current
+		// (#939). Elsewhere it is consulted only for a table with no catalog row.
+		exporter.SetWarehouseAuthoritative(cfg.Cluster.SharedStorageMode)
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
@@ -4224,6 +4228,17 @@ func main() {
 				log.Fatal().Msgf("Iceberg export: the query layer's file exclusions (%T) cannot be read strictly", openCompactions)
 			}
 			icebergSource.SetExclusions(strict)
+		}
+		// Shared storage: the exclusions above come from this node's manifest, so a listed file
+		// it does not know yet waits for it to catch up before export (#939).
+		if cfg.Cluster.SharedStorageMode && clusterCoordinator != nil {
+			icebergSource.SetManifestBarrier(func(p string) bool {
+				node := clusterCoordinator.GetRaftNode()
+				if node == nil || node.FSM() == nil {
+					return true
+				}
+				return node.FSM().HasFile(p)
+			}, clusterCoordinator.SyncManifest)
 		}
 		// On a local-storage cluster a delete reaches this disk after the
 		// manifest; files the cluster deleted stay out of the table meanwhile.
@@ -4249,8 +4264,16 @@ func main() {
 		// with MULTIPLE compaction-capable nodes and no lease, CanCompact() is true on each of
 		// them — configure only ONE compaction-capable node when iceberg export is enabled, or
 		// two nodes will race on the warehouse files.
+		//
+		// In shared-storage mode (#939) the exported tables live in the one bucket every node
+		// sees, so the gate is the compactor lease itself, with no static-role fallback: before
+		// the first lease is assigned no node exports. Config refuses shared-storage Iceberg
+		// without cluster.failover_enabled, which is what assigns the lease.
 		var icebergGate iceberg.WriterGate
-		if compactionGate != nil {
+		switch {
+		case cfg.Cluster.SharedStorageMode && clusterCoordinator != nil:
+			icebergGate = icebergLeaseGate{clusterCoordinator}
+		case compactionGate != nil:
 			icebergGate = icebergWriterGate{compactionGate}
 		}
 		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
@@ -5040,7 +5063,9 @@ func main() {
 			}
 			if p, ok := iceberg.LocalWarehousePath(rawWarehouse); ok {
 				icebergWarehousePath = p
-			} else {
+			} else if cfg.Storage.Backend != "s3" {
+				// An S3 warehouse is inside the storage root (config refuses any other, #939),
+				// so the storage listing carries its table metadata like any other object.
 				log.Warn().Str("warehouse", rawWarehouse).
 					Msg("iceberg.warehouse is not a local path; backups cannot include its table metadata")
 			}
@@ -6002,6 +6027,12 @@ func (g *compactionClusterGate) Role() string {
 type icebergWriterGate struct{ inner compaction.ClusterGate }
 
 func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
+
+// icebergLeaseGate is the shared-storage Iceberg gate: only the node holding the compactor
+// lease exports, and no node does while no lease is assigned (see its use for why).
+type icebergLeaseGate struct{ c *cluster.Coordinator }
+
+func (g icebergLeaseGate) CanRun() bool { return g.c.IsActiveCompactor() }
 
 // reconciliationClusterGate implements reconciliation.Gate. The two halves
 // of a reconcile run (storage scan, manifest sweep) have different gating

@@ -48,7 +48,11 @@ type StorageWalkSource struct {
 	// exclusions, when set, names the files Arc's own reads leave out under a
 	// prefix (see SetExclusions).
 	exclusions Exclusions
-	logger     zerolog.Logger
+	// manifestKnows and manifestSync, when set (shared-storage clusters), are the replicated
+	// manifest's view of a listed file and its read barrier (see SetManifestBarrier).
+	manifestKnows func(path string) bool
+	manifestSync  func(ctx context.Context) error
+	logger        zerolog.Logger
 
 	// namespaceExpander, when set, returns the top-level directories that are
 	// edge-sync spoke namespaces rather than databases (#634). A hub stores
@@ -101,6 +105,17 @@ type Exclusions interface {
 // while Arc's own queries count them once. nil excludes nothing.
 func (s *StorageWalkSource) SetExclusions(ex Exclusions) {
 	s.exclusions = ex
+}
+
+// SetManifestBarrier installs the shared-storage read barrier (#939 A2). In shared storage every
+// data object is registered in the replicated manifest, and the files Arc's reads leave out
+// (SetExclusions) come from this node's copy of it. A listed file that copy does not know is the
+// sign it lags a commit — a compaction whose output this listing already sees, say, while its
+// inputs are not yet left out. Then the source waits for the manifest to catch up (sync) and
+// lists once more. Only then: a barrier is a replicated log entry on a follower, so one per
+// measurement per pass would be thousands of entries per pass.
+func (s *StorageWalkSource) SetManifestBarrier(knows func(path string) bool, sync func(ctx context.Context) error) {
+	s.manifestKnows, s.manifestSync = knows, sync
 }
 
 // SetNamespaceExpander installs edge-sync spoke-namespace expansion (#634).
@@ -268,11 +283,22 @@ const unusableSampleCap = 32
 // is non-local. Files() and LocalFiles() delegate here for callers that need just one view.
 func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
 	var prev []string
+	synced := false
 	for attempt := 1; ; attempt++ {
 		files, local, vanished, err := s.listOnce(ctx, m)
 		moved := errors.Is(err, errExclusionsMoved)
 		if moved {
 			err = nil
+		}
+		if err == nil && len(vanished) == 0 && !moved && !synced && s.manifestKnows != nil && s.unknownToManifest(files) {
+			// At most once per call: a file the manifest never learns of (an unmanaged
+			// object) must not turn every pass into a barrier per listing.
+			synced = true
+			if err := s.manifestSync(ctx); err != nil {
+				return nil, nil, fmt.Errorf("wait for the cluster manifest before exporting %s/%s: %w", m.Database, m.Measurement, err)
+			}
+			attempt--
+			continue
 		}
 		if err != nil || (len(vanished) == 0 && !moved) {
 			return files, local, err
@@ -325,6 +351,16 @@ func listSizes(ctx context.Context, lister storage.ObjectLister, prefix string) 
 		out[o.Path] = o.Size
 	}
 	return out, nil
+}
+
+// unknownToManifest reports whether any listed file is unknown to the replicated manifest.
+func (s *StorageWalkSource) unknownToManifest(files []FileRef) bool {
+	for _, f := range files {
+		if !s.manifestKnows(f.Key) {
+			return true
+		}
+	}
+	return false
 }
 
 // vanishRetries bounds FilesAndLocal's attempts at a stable listing.

@@ -196,6 +196,13 @@ func (s *Scheduler) runPass(ctx context.Context) {
 			awaitingMigration++
 			continue
 		}
+		// Re-checked per measurement, not only per pass: a pass over many measurements on
+		// object storage takes minutes, and a lease that moved meanwhile would otherwise leave
+		// two nodes writing the same tables until this one finished (#939).
+		if s.gate != nil && !s.gate.CanRun() {
+			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
+			return
+		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
 		changed, err := s.reconcileOne(mctx, m, key)
 		cancel()

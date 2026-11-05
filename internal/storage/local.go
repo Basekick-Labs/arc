@@ -157,6 +157,45 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	return nil
 }
 
+// WriteIfAbsent writes data at path unless a file is already there
+// (ConditionalWriter). The bytes go to a temporary file first and are linked
+// into place: link fails when the target exists and never exposes a partial
+// file, which a plain O_EXCL create of the target would.
+func (b *LocalBackend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return false, fmt.Errorf("invalid path: %w", err)
+	}
+	dir := filepath.Dir(fullPath)
+	if err := b.ensureDir(dir); err != nil {
+		return false, err
+	}
+	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
+	if err != nil {
+		return false, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	_, writeErr := tmpFile.Write(data)
+	closeErr := tmpFile.Close()
+	if writeErr != nil {
+		return false, fmt.Errorf("failed to write temp file: %w", writeErr)
+	}
+	if closeErr != nil {
+		return false, fmt.Errorf("failed to close temp file: %w", closeErr)
+	}
+	if err := os.Link(tmpPath, fullPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		metrics.Get().IncStorageErrors()
+		return false, fmt.Errorf("failed to link file into place: %w", err)
+	}
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
+	return true, nil
+}
+
 // partPath returns the persistent in-progress path for a file being written by
 // WriteReader or AppendReader. Using a deterministic name (rather than a
 // random .tmp) means a partial write that survives a crash or transport error

@@ -2,6 +2,52 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: Iceberg export on S3 primary storage ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Iceberg export now runs with `storage.backend = "s3"` (AWS S3 and S3-compatible
+stores), not only on local storage. Tables are written under the storage root
+(`s3://<bucket>/<prefix>/arc_<database>.db/<measurement>/`) and read by
+Iceberg engines with S3 access (verified with PyIceberg and DuckDB
+`iceberg_scan`).
+
+- **Credentials:** the export uses Arc's own S3 credentials and renews them the
+  same way: static keys, the default chain, IRSA on EKS, or an assumed role. No
+  credential is written into Iceberg metadata, the catalog or the logs.
+  Readers need their own read access to the bucket.
+- **Endpoint:** `storage.s3_endpoint` and `storage.s3_path_style` apply to the
+  export too. The `AWS_S3_ENDPOINT` environment variable no longer changes
+  where it writes.
+- **Cost:** schemas are read from each new file's footer (the last 64 KiB of
+  the object), never the whole file, and sizes come from the listing. After a
+  restart an unchanged table reads no footers.
+
+**Refused at startup with Iceberg enabled:**
+- `storage.backend` other than `local` or `s3` (Azure, GCS);
+- `storage.backend = "s3"` on Google Cloud Storage's S3-compatible endpoint;
+- an `iceberg.warehouse` outside the storage root (another bucket, another
+  prefix, or a local path with an S3 backend);
+- `cluster.shared_storage_mode = true` without `cluster.failover_enabled =
+  true`;
+- cold-tier tiering, as before.
+
+**Shared-storage clusters:** only the node holding the compactor lease
+exports, with no fallback to the static compactor role, and the lease is
+re-checked for each measurement. The table's current version is the one
+published in the warehouse, not the node's own catalog row:
+- a node that takes over, or comes back after a failover, continues from
+  the published version;
+- if two nodes commit the same version, the second one's publish is refused,
+  its pass fails, and it adopts the published version on the next pass,
+  logged as `another writer published this table version first`;
+- a node that lost its catalog (a new node, a deleted SQLite) continues the
+  existing table instead of creating a second one in the same directory. On
+  local storage too.
+
+**Upgrade:** nothing to do for local-storage deployments. To export an existing
+S3 deployment, set `iceberg.enabled = true`. The first pass registers every
+existing data file, reading each file's footer twice (once for the schema,
+once for its statistics); expect two ranged GETs per file on that pass.
+
 ## Fix: Iceberg export counts each row once during a DELETE or a compaction ([#939](https://github.com/Basekick-Labs/arc/issues/939))
 
 Arc's queries leave out a file whose rows another file already holds, such as
