@@ -29,13 +29,14 @@ import (
 // scope (#1483), which is not known until every pass has run.
 
 // refSentinel stands in for a rewritten table reference. A NUL cannot come
-// from the query: string literals are masked before the passes run, and
-// deferredRefs.refuseNUL refuses one anywhere else.
+// from the query: ValidateSQLRequest refuses one, and as a backstop for a
+// caller that skips validation, string literals are masked before the passes
+// run and deferredRefs.refuseNUL refuses one anywhere else.
 const refSentinel = '\x00'
 
-// errSQLContainsNUL refuses a query with a NUL byte outside a string literal.
-// DuckDB reads the statement as a C string and would stop at it, so the query
-// would run truncated; here it would also be read as a rewritten reference.
+// errSQLContainsNUL refuses a query with a NUL byte outside a string literal,
+// which the passes would read as a rewritten reference. ValidateSQLRequest
+// refuses every NUL first; this is the transform's own backstop.
 var errSQLContainsNUL = errors.New("SQL contains a NUL byte outside a string literal")
 
 // cancelCheckInterval is how many references a pass rewrites between checks
@@ -48,6 +49,8 @@ type deferredRef struct {
 	// rewritten reference shares this one's scope. Empty when the reference
 	// must never be given one (see deferredRefs.candidate).
 	name string
+	// lower is name lower-cased, the key of bareNames and rewrittenBare.
+	lower string
 	// aliased is true when the expression already carries its alias: the
 	// query qualifies columns by the table's name (#1447, aliasTableRef).
 	aliased bool
@@ -66,10 +69,17 @@ type deferredRefs struct {
 	cteNames     map[string]bool
 	otherAliases map[string]bool
 	qualified    map[string]bool
+	// bareNames counts each name's bare uses in the query (bareNameCounts),
+	// and rewrittenBare those that were table references this rewrite
+	// replaced. A name with a use left over is the query's for something
+	// else, and is never given to a table.
+	bareNames     map[string]int
+	rewrittenBare map[string]int
 }
 
-func newDeferredRefs(ctx context.Context, cteNames, qualified, otherAliases map[string]bool) *deferredRefs {
-	return &deferredRefs{ctx: ctx, cteNames: cteNames, qualified: qualified, otherAliases: otherAliases}
+func newDeferredRefs(ctx context.Context, cteNames, qualified, otherAliases map[string]bool, bareNames map[string]int) *deferredRefs {
+	return &deferredRefs{ctx: ctx, cteNames: cteNames, qualified: qualified, otherAliases: otherAliases,
+		bareNames: bareNames, rewrittenBare: make(map[string]int)}
 }
 
 // refuseNUL reports whether sql, masked and comment-stripped, holds a NUL,
@@ -114,22 +124,28 @@ func (d *deferredRefs) cancelled() bool {
 
 // ref builds the deferred form of expr, the rewritten reference to table
 // name ending at end in sql. ok is false for a name the identifier resolver
-// rejected. The #1447 alias is applied now, as aliasTableRef always did; the
-// #1483 one waits for expansion.
-func (d *deferredRefs) ref(expr, sql string, end int, name string, ok bool) deferredRef {
+// rejected. bare is true when the reference names the table alone, not as
+// db.table, so its word is one of bareNameCounts'. The #1447 alias is applied
+// now, as aliasTableRef always did; the #1483 one waits for expansion.
+func (d *deferredRefs) ref(expr, sql string, end int, name string, ok, bare bool) deferredRef {
+	lower := strings.ToLower(name)
+	if bare && ok {
+		d.rewrittenBare[lower]++
+	}
 	if aliased := aliasTableRef(expr, sql, end, name, ok, d.qualified); aliased != expr {
 		return deferredRef{expr: aliased, aliased: true}
 	}
 	r := deferredRef{expr: expr}
 	if d.candidate(expr, sql, end, name, ok) {
-		r.name = name
+		r.name, r.lower = name, lower
 	}
 	return r
 }
 
 // candidate reports whether the reference may be named after its table at
 // expansion: the same conditions as aliasTableRef apart from the qualifier,
-// and the name is no CTE's or other relation's.
+// and the name is no CTE's or other relation's. expand also requires that
+// the query use the name for nothing but rewritten references.
 func (d *deferredRefs) candidate(expr, sql string, end int, name string, ok bool) bool {
 	if expr == "" || !ok || containsMaskPlaceholder(name) || keepsOwnName(sql, end) {
 		return false
@@ -218,9 +234,10 @@ func (d *deferredRefs) replace(sql string, re *regexp.Regexp, fn func(parts []st
 
 // expand puts each reference's expression in place of its sentinel. A
 // reference that is a naming candidate gets ` AS "<name>"` when its scope
-// holds another rewritten reference (#1483): DuckDB names every unaliased
-// read_parquet() relation "read_parquet", so two of them in one FROM leave
-// every unqualified column and * ambiguous.
+// holds another rewritten reference and the query uses the name for nothing
+// else (#1483): DuckDB names every unaliased read_parquet() relation
+// "read_parquet", so two of them in one FROM leave every unqualified column
+// and * ambiguous.
 func (d *deferredRefs) expand(sql string) string {
 	if len(d.refs) == 0 {
 		return sql
@@ -245,7 +262,7 @@ func (d *deferredRefs) expand(sql string) string {
 		r := d.refs[i]
 		b.WriteString(sql[last:pos])
 		b.WriteString(r.expr)
-		if !r.aliased && r.name != "" && perScope[scopes[i]] > 1 {
+		if !r.aliased && r.name != "" && perScope[scopes[i]] > 1 && d.bareNames[r.lower] == d.rewrittenBare[r.lower] {
 			b.WriteString(` AS "`)
 			b.WriteString(strings.ReplaceAll(r.name, `"`, `""`))
 			b.WriteByte('"')
@@ -259,8 +276,9 @@ func (d *deferredRefs) expand(sql string) string {
 
 // sentinelScopes returns the scope of each of the n sentinels in sql, in
 // order. A scope is the part of a statement one SELECT reads from: it starts
-// at an opening parenthesis and at each SELECT at the current depth, so a
-// subquery, and each arm of a UNION, is a scope of its own. sql is masked and
+// at an opening parenthesis and at each SELECT or set operation at the
+// current depth, so a subquery, and each arm of a UNION (including a
+// FROM-first one), is a scope of its own. sql is masked and
 // comment-stripped, so every parenthesis and word in it is SQL.
 func sentinelScopes(sql string, n int) []int {
 	scopes := make([]int, 0, n)
@@ -286,7 +304,7 @@ func sentinelScopes(sql string, n int) []int {
 			for i < len(sql) && isIdentChar(sql[i]) {
 				i++
 			}
-			if i-start == 6 && strings.EqualFold(sql[start:i], "select") {
+			if opensScope(sql[start:i]) {
 				next++
 				stack[len(stack)-1] = next
 			}
@@ -295,4 +313,18 @@ func sentinelScopes(sql string, n int) []int {
 		}
 	}
 	return scopes
+}
+
+// opensScope reports whether word starts a new scope at its depth: SELECT,
+// or a set operation, whose next arm may be FROM-first (`UNION ALL FROM b`).
+func opensScope(word string) bool {
+	switch len(word) {
+	case 5:
+		return strings.EqualFold(word, "union")
+	case 6:
+		return strings.EqualFold(word, "select") || strings.EqualFold(word, "except")
+	case 9:
+		return strings.EqualFold(word, "intersect")
+	}
+	return false
 }

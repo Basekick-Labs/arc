@@ -201,6 +201,54 @@ func qualifierAndAliasNames(sql string, resolve func(string) (string, bool)) (ma
 	return names, aliases
 }
 
+// bareNameCounts counts, by lower-cased name, the words in sql that are
+// neither a qualifier (`cpu.`) nor qualified (`.cpu`): a table written bare
+// as a reference, a column, a SELECT-list alias, a function. sql is masked
+// and comment-stripped and not yet rewritten; resolve maps a quoted
+// identifier's placeholder to its name, since DuckDB binds `"disk"` as it
+// binds `disk`.
+//
+// The #1483 naming compares this with the bare references it rewrote: a
+// name the query also uses for anything else is never given to a table.
+// DuckDB binds a table alias before a SELECT-list alias in WHERE and GROUP
+// BY, and before an outer query's column, so `SELECT x AS mem … GROUP BY
+// mem` or a correlated `disk` would start reading the table's whole row.
+func bareNameCounts(sql string, resolve func(string) (string, bool)) map[string]int {
+	var counts map[string]int
+	for i := 0; i < len(sql); {
+		if !isIdentChar(sql[i]) {
+			i++
+			continue
+		}
+		start := i
+		for i < len(sql) && isIdentChar(sql[i]) {
+			i++
+		}
+		if sql[start] >= '0' && sql[start] <= '9' {
+			continue
+		}
+		if j := skipSQLSpace(sql, i); j < len(sql) && sql[j] == '.' {
+			continue
+		}
+		k := start - 1
+		for k >= 0 && (sql[k] == ' ' || sql[k] == '\t' || sql[k] == '\n' || sql[k] == '\r') {
+			k--
+		}
+		if k >= 0 && sql[k] == '.' {
+			continue
+		}
+		name, ok := resolve(sql[start:i])
+		if !ok {
+			continue
+		}
+		if counts == nil {
+			counts = make(map[string]int)
+		}
+		counts[strings.ToLower(name)]++
+	}
+	return counts
+}
+
 // inAliasPosition reports whether the word starting at start is a relation's
 // alias: it follows `)`, AS, or a word that is not a keyword, as in
 // `(...) cpu`, `(...) AS cpu`, `limits cpu` or `"limits" cpu`, and it sits in

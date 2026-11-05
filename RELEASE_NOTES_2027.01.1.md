@@ -853,7 +853,8 @@ about 30 times as long as the references it replaced, so every later pass
 scanned tens of MB for a 1 MiB query. Each pass now leaves a one-byte marker
 and the reads are put in once at the end, so every pass scans text about as
 long as the query. A whole request at the 1 MiB `query.max_sql_length`
-ceiling:
+ceiling, before and after, measured the same way (in-process, one
+machine; earlier figures for these shapes came from a different setup):
 
 | Query (1 MiB) | Before | After |
 |---|---|---|
@@ -871,9 +872,12 @@ shape goes from 0.31 s to 0.20 s.
   its query is prepared is answered `504 Query timed out`, as one that times
   out while running is, on every query endpoint (JSON, MessagePack, Arrow,
   the row estimate and `GET /api/v1/query/{measurement}`).
-- A query with a NUL byte outside a string literal is refused with 400.
-  DuckDB stops reading a statement at a NUL, so such a query used to run cut
-  short at that byte.
+- A query containing a NUL byte is refused with 400, on every query
+  endpoint. DuckDB stops reading a statement at the first NUL, in a string
+  literal or anywhere else, so such a query used to run cut short at that
+  byte: a different query from the one Arc validated. Continuous query
+  definitions are checked too, at creation and at every run, so a stored
+  definition containing a NUL now fails instead of running cut short.
 - A storage path that contains `from` or `join` followed by a word is no
   longer rewritten inside the read Arc emits for it.
 
@@ -893,11 +897,18 @@ DuckDB names every unaliased file read `read_parquet`, so the two sides had
 the same name. Arc gave a table its own name only when the query qualified a
 column with it (`cpu.host`, since
 [#1447](https://github.com/Basekick-Labs/arc/issues/1447)). Now, when one
-FROM clause reads two or more measurements, each is named after itself.
+FROM clause reads two or more measurements, each is named after itself,
+unless:
+
+- you gave it an alias, which it keeps;
+- the query already uses that name for something else: a CTE, another
+  relation, a column, a SELECT-list alias (`SELECT x AS mem … GROUP BY mem`),
+  or an outer query's column. DuckDB would bind the name to the table first,
+  so that measurement keeps its old naming. If the join is then still
+  ambiguous, give it an alias.
+
 Queries reading one measurement per FROM clause, including those with
-subqueries over another, are rewritten exactly as before. A table keeps any
-alias you gave it, and is not given a name that a CTE or another relation in
-the query already uses.
+subqueries over another, are rewritten exactly as before.
 
 Joining a measurement to itself, or to the measurement of the same name in
 another database, still needs an alias on at least one side

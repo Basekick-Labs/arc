@@ -2295,6 +2295,7 @@ localProcessing:
 		m.IncQueryErrors()
 		if errors.Is(err, errQueryTimedOut) {
 			m.IncQueryTimeouts()
+			h.logTransformTimeout(req.SQL, effectiveTimeout)
 		}
 		return respondError(c, transformErrorStatus(err), err.Error(), timestamp, start)
 	}
@@ -2892,6 +2893,14 @@ func ValidateSQLRequest(sql string) error {
 
 	if max := MaxSQLLength(); len(sql) > max {
 		return &SQLValidationError{Message: fmt.Sprintf("SQL query exceeds maximum length (%d characters; query.max_sql_length)", max)}
+	}
+
+	// DuckDB reads a statement as a C string and stops at the first NUL, in
+	// a string literal or anywhere else, so it would run a different query
+	// from the one checked here. The storage-path rewrite also uses NUL as
+	// its marker for a rewritten reference (#1482) and refuses one itself.
+	if strings.IndexByte(sql, 0) >= 0 {
+		return &SQLValidationError{Message: "SQL query must not contain a NUL byte"}
 	}
 
 	// Normalise before denylist check: mask string literals so keywords
@@ -3600,7 +3609,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// Each pass below writes a one-byte sentinel for the reference it
 	// rewrites and keeps the expression aside; expand puts them in at the
 	// end, so no pass scans another's output (#1482, deferred_refs.go).
-	refs := newDeferredRefs(ctx, cteNames, qualified, otherAliases)
+	refs := newDeferredRefs(ctx, cteNames, qualified, otherAliases, bareNameCounts(sql, resolveIdent))
 	if refs.refuseNUL(sql) {
 		return sql
 	}
@@ -3614,7 +3623,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			db, _ := resolveIdent(ref.db)
 			table, tableOK := resolveIdent(ref.table)
 			path := h.getStoragePath(ctx, db, table)
-			return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, table, tableOK), true
+			return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, table, tableOK, false), true
 		}
 		// Same guard chain as the FROM handler below.
 		if cteNames[strings.ToLower(ref.table)] {
@@ -3628,7 +3637,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			return deferredRef{}, false
 		}
 		path := h.getStoragePath(ctx, "default", resolved)
-		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, resolved, resolvedOK), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, resolved, resolvedOK, true), true
 	})
 
 	// Handle FROM database.table references
@@ -3639,7 +3648,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		db, _ := resolveIdent(parts[1])
 		table, tableOK := resolveIdent(parts[2])
 		path := h.getStoragePath(ctx, db, table)
-		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, table, tableOK), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, table, tableOK, false), true
 	})
 
 	// Handle JOIN database.table references (includes LATERAL JOIN)
@@ -3650,7 +3659,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		db, _ := resolveIdent(parts[2])
 		table, tableOK := resolveIdent(parts[3])
 		path := h.getStoragePath(ctx, db, table)
-		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, table, tableOK), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, table, tableOK, false), true
 	})
 
 	// Handle FROM simple_table references
@@ -3685,7 +3694,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		}
 
 		path := h.getStoragePath(ctx, "default", resolved)
-		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK, true), true
 	})
 
 	// Handle JOIN simple_table references (includes LATERAL JOIN)
@@ -3717,7 +3726,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		}
 
 		path := h.getStoragePath(ctx, "default", resolved)
-		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK, true), true
 	})
 
 	// A request that ended during the passes has its error recorded; the
@@ -3848,6 +3857,12 @@ func transformContextErr(ctx context.Context) error {
 	default:
 		return err
 	}
+}
+
+// logTransformTimeout logs a request whose deadline passed while its SQL was
+// being rewritten, as an execution timeout is logged.
+func (h *QueryHandler) logTransformTimeout(sql string, timeout time.Duration) {
+	h.logger.Error().Str("sql", sqlutil.ForLog(sql)).Dur("timeout", timeout).Msg("Query timed out while its SQL was prepared")
 }
 
 // requestDeadline is the time by which a request with the given timeout must
@@ -4711,7 +4726,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 	// See convertSQLToStoragePaths (#1447, #1450, #1482).
 	qualified, otherAliases := qualifierAndAliasNames(sql, resolveIdent)
-	refs := newDeferredRefs(ctx, cteNames, qualified, otherAliases)
+	refs := newDeferredRefs(ctx, cteNames, qualified, otherAliases, bareNameCounts(sql, resolveIdent))
 	if refs.refuseNUL(sql) {
 		return sql
 	}
@@ -4736,7 +4751,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 			return deferredRef{}, false
 		}
 		path := h.getStoragePath(ctx, database, resolved)
-		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, resolved, resolvedOK), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, resolved, resolvedOK, true), true
 	})
 
 	// Handle FROM simple_table references - apply header database
@@ -4770,7 +4785,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(ctx, database, resolved)
-		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK, true), true
 	})
 
 	// Handle JOIN simple_table references - apply header database
@@ -4803,7 +4818,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(ctx, database, resolved)
-		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK, true), true
 	})
 
 	// See convertSQLToStoragePaths for the order of these.
@@ -5429,6 +5444,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	if err != nil {
 		if errors.Is(err, errQueryTimedOut) {
 			metrics.Get().IncQueryTimeouts()
+			h.logTransformTimeout(req.SQL, effectiveTimeout)
 		} else {
 			metrics.Get().IncQueryErrors()
 		}
@@ -6001,6 +6017,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		}
 		if errors.Is(err, errQueryTimedOut) {
 			m.IncQueryTimeouts()
+			h.logTransformTimeout(sql, effectiveTimeout)
 		}
 		return c.Status(transformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,

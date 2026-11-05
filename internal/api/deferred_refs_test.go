@@ -21,7 +21,8 @@ func TestSentinelScopes(t *testing.T) {
 		{"one FROM", "SELECT * FROM " + s + " JOIN " + s + " USING (a)", []int{1, 1}},
 		{"a parenthesised condition returns to its scope", "SELECT * FROM " + s + " JOIN " + s + " USING (a) JOIN " + s + " ON (x)", []int{1, 1, 1}},
 		{"subquery", "SELECT * FROM " + s + " WHERE a IN (SELECT a FROM " + s + ")", []int{1, 3}},
-		{"UNION arms", "SELECT * FROM " + s + " UNION ALL SELECT * FROM " + s, []int{1, 2}},
+		{"UNION arms", "SELECT * FROM " + s + " UNION ALL SELECT * FROM " + s, []int{1, 3}},
+		{"FROM-first set operation arm", "SELECT * FROM " + s + " UNION ALL FROM " + s + " EXCEPT FROM " + s, []int{1, 2, 3}},
 		{"FROM-first", "FROM " + s + s, []int{0, 0}},
 		{"select inside a word is not SELECT", "SELECT selected FROM " + s + " JOIN " + s, []int{1, 1}},
 		{"unbalanced close", ") FROM " + s, []int{0}},
@@ -58,6 +59,7 @@ func TestOneTableAScopeIsNotRenamed_Issue1483(t *testing.T) {
 		"SELECT * FROM cpu",
 		"SELECT * FROM cpu WHERE host IN (SELECT host FROM mem)",
 		"SELECT * FROM cpu UNION ALL SELECT * FROM mem",
+		"SELECT * FROM cpu UNION ALL FROM mem",
 		"WITH m AS (SELECT * FROM mem) SELECT * FROM cpu JOIN m USING (host)",
 	} {
 		got := h.convertSQLToStoragePaths(context.Background(), sql)
@@ -76,6 +78,11 @@ func TestNamesTheQueryUsesAreNotGivenToATable_Issue1483(t *testing.T) {
 		{"SELECT * FROM cpu JOIN mem USING (host) JOIN (SELECT 1 AS host) cpu USING (host)", `AS "cpu"`},
 		// The reference has an alias of its own.
 		{"SELECT * FROM cpu c JOIN mem USING (host)", `AS "cpu"`},
+		// The query uses the name for something else: a SELECT-list
+		// alias, a column, an outer query's column, quoted or not.
+		{"SELECT x AS cpu FROM cpu JOIN mem USING (host) GROUP BY cpu", `AS "cpu"`},
+		{"SELECT cpu FROM cpu JOIN mem USING (host)", `AS "cpu"`},
+		{`SELECT (SELECT 1 FROM cpu JOIN mem USING (host) WHERE "cpu" = 1) FROM t`, `AS "cpu"`},
 	} {
 		got := h.convertSQLToStoragePaths(context.Background(), tt.sql)
 		require.NotContains(t, got, tt.notWant, "%s\n%s", tt.sql, got)
@@ -137,7 +144,7 @@ func TestTransformRefusedOnceTheDeadlinePasses_Issue1482(t *testing.T) {
 func TestDeferredRefsStopWhenTheRequestEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, failure := withStoragePathFailure(ctx)
-	d := newDeferredRefs(ctx, nil, nil, nil)
+	d := newDeferredRefs(ctx, nil, nil, nil, nil)
 	sql := "SELECT 1 FROM x" + strings.Repeat(", x", 3*cancelCheckInterval)
 	calls := 0
 	out := d.replaceComma(sql, func(ref commaJoinRef) (deferredRef, bool) {
@@ -151,4 +158,18 @@ func TestDeferredRefsStopWhenTheRequestEnds(t *testing.T) {
 	require.Len(t, d.refs, calls)
 	require.Equal(t, calls, strings.Count(out, string(refSentinel)))
 	require.ErrorIs(t, failure.err, context.Canceled)
+}
+
+// DuckDB stops reading a statement at a NUL, so a query holding one, even in
+// a string literal, would run as something other than what was validated.
+func TestValidateSQLRequestRefusesNUL(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT * FROM cpu\x00 WHERE time > now() - INTERVAL 1 HOUR",
+		"SELECT * FROM cpu WHERE host = 'a\x00b'",
+		"SELECT \"a\x00b\" FROM cpu",
+	} {
+		err := ValidateSQLRequest(sql)
+		require.Error(t, err, "%q", sql)
+		require.Contains(t, err.Error(), "NUL")
+	}
 }

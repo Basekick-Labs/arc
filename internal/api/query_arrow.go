@@ -541,6 +541,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		m.IncQueryErrors()
 		if errors.Is(err, errQueryTimedOut) {
 			m.IncQueryTimeouts()
+			h.logTransformTimeout(req.SQL, effectiveTimeout)
 		}
 		return c.Status(transformErrorStatus(err)).JSON(fiber.Map{
 			"success": false,

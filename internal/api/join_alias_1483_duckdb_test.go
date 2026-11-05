@@ -97,6 +97,16 @@ func TestJoinOfTwoMeasurementsBindsUnqualifiedColumns_Issue1483(t *testing.T) {
 			{"a CTE named like a measurement is not given a second relation of its name",
 				"WITH cpu AS (SELECT * FROM mem) SELECT count(*) FROM cpu JOIN mem USING (time)", "[[1]]"},
 			{"an aliased table keeps its alias", "SELECT c.usage, m.used FROM cpu c JOIN mem AS m USING (host)", "[[1 2]]"},
+			// A name the query also uses for something else keeps binding
+			// to that: DuckDB binds a table alias first (review finding).
+			{"a SELECT-list alias named like a table, in GROUP BY",
+				"SELECT usage + 1 AS mem, count(*) FROM cpu JOIN mem USING (host) GROUP BY mem", "[[2 1]]"},
+			{"a SELECT-list alias named like a table, in WHERE",
+				"SELECT usage AS mem FROM cpu JOIN mem USING (host) WHERE mem > 0", "[[1]]"},
+			{"an outer column named like a table, in a correlated subquery",
+				"SELECT (SELECT count(*) FROM cpu JOIN mem USING (host) WHERE mem = 42) FROM (SELECT 42 AS mem) t", "[[1]]"},
+			{"a quoted column named like a table",
+				`SELECT "mem" FROM (SELECT 7 AS mem) t WHERE "mem" IN (SELECT usage + 6 FROM cpu JOIN mem USING (host))`, "[[7]]"},
 		} {
 			t.Run(fmt.Sprintf("db=%q/%s", db, tt.name), func(t *testing.T) {
 				status, got := query(db, tt.sql)
