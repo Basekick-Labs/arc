@@ -33,7 +33,13 @@ var memoryLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 type Config struct {
 	// Warnings are load-time advisories about accepted values (see
 	// LoadWarning). Emitted by cmd/arc/main.go right after Load; never fatal.
-	Warnings        []LoadWarning
+	Warnings []LoadWarning
+	// ConfigFile is the config file Load read, as an absolute path (viper's
+	// ConfigFileUsed), or "" when none was found and Arc runs on defaults and
+	// environment variables. Backup's include_config and restore_config use
+	// it (#1466): the file is found through a search path, so "arc.toml"
+	// relative to the working directory is not it.
+	ConfigFile      string
 	Server          ServerConfig
 	Database        DatabaseConfig
 	Storage         StorageConfig
@@ -1008,9 +1014,9 @@ func Load() (*Config, error) {
 	// Load config file
 	v.SetConfigName("arc")
 	v.SetConfigType("toml")
-	v.AddConfigPath(".")
-	v.AddConfigPath("/etc/arc/")
-	v.AddConfigPath("$HOME/.arc/")
+	for _, p := range configSearchPaths {
+		v.AddConfigPath(p)
+	}
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -1723,6 +1729,11 @@ func Load() (*Config, error) {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 	if w := legacyBackupsWarning(v, cfg); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+
+	cfg.ConfigFile = v.ConfigFileUsed()
+	if w := shadowedConfigFilesWarning(cfg.ConfigFile); w != nil {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 

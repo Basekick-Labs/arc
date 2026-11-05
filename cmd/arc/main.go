@@ -5191,7 +5191,7 @@ func main() {
 			IcebergCatalogDBPath:   icebergCatalogDBPath,
 			IcebergWarehousePath:   icebergWarehousePath,
 			IcebergNamespacePrefix: cfg.Iceberg.NamespacePrefix,
-			ConfigPath:             "arc.toml",
+			ConfigPath:             cfg.ConfigFile,
 			Logger:                 logger.Get("backup"),
 		})
 		if err != nil {
@@ -5285,7 +5285,17 @@ func main() {
 				// claiming a cold source in either case would be the kind of
 				// lie that takes an operator a long afternoon.
 				Bool("cold_source", tieringManager != nil && tieringManager.ColdBackend() != nil).
+				// The file include_config copies and restore_config
+				// overwrites (#1466), and whether a config restore could
+				// write it at all: never on a cluster node (#1083), and not
+				// where the file or its directory is not this process's,
+				// such as a package's root-owned /etc/arc.
+				Str("config_file", cfg.ConfigFile).
+				Bool("config_restore", clusterCoordinator == nil && backupManager.ConfigRestoreBlocker("") == nil).
 				Msg("Backup/restore enabled")
+			if cfg.ConfigFile == "" {
+				log.Warn().Msg("Arc started without a config file: backups do not include a config, and restore_config is refused")
+			}
 		}
 	}
 
