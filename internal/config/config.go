@@ -1716,6 +1716,16 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// The packaged layout's two silent consequences (#1463): the unit's
+	// ARC_BACKUP_LOCAL_PATH overriding an edited arc.toml, and backups an
+	// earlier release left where this boot no longer looks.
+	if w := backupLocalPathOverrideWarning(v, cfg); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+	if w := legacyBackupsWarning(v, cfg); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+
 	// Iceberg export runs on a local or an S3 primary backend (#939). The reconciler walks the
 	// single configured storage backend and publishes through iceberg-go's FileIO, which Arc
 	// links for s3:// only, so Azure and GCS primaries are refused, as is a cold tier on anything
@@ -2409,7 +2419,7 @@ func setDefaults(v *viper.Viper) {
 
 	// Backup defaults
 	v.SetDefault("backup.enabled", true)
-	v.SetDefault("backup.local_path", "./data/backups")
+	v.SetDefault("backup.local_path", defaultBackupLocalPath)
 	// Backup targets (#1085 stage B2b-1). Only the two keys whose names are
 	// fixed can be defaulted here: a target's own fields are
 	// backup.targets.<name>.*, and no name exists until a config file has been
