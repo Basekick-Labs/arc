@@ -630,20 +630,27 @@ discarding the operator's edits (auth, retention, credentials, ports) without
 a prompt or a backup copy. The rpm and Arch packages already kept the file.
 
 From this release the .deb ships the stock config at `/usr/share/arc/arc.toml`
-and installs it at `/etc/arc/arc.toml` only when that file does not exist. An
-existing file is never modified, including on the upgrade from 26.09.x: the
-config you have now is the one 27.01.1 starts with. Keys that are not in your
-file take Arc's built-in defaults, so a config from an older release keeps
-working; diff it against `/usr/share/arc/arc.toml` to see what the new stock
-file documents.
+and installs it at `/etc/arc/arc.toml` only when that file does not exist. The
+content of an existing file is never changed, including on the upgrade from
+26.09.x: the config you have now is the one 27.01.1 starts with. A symlinked
+`/etc/arc/arc.toml` stays a symlink. As before, the package sets the file's
+owner to `arc:arc`. Keys that are not in your file take Arc's built-in
+defaults, so a config from an older release keeps working; diff it against
+`/usr/share/arc/arc.toml` to see what the new stock file documents.
 
 Upgrades never prompt, so non-interactive installs (`apt-get install -y`,
 configuration management) keep working without `--force-confold`. The file
-is not a dpkg conffile: with a conffile, an edited `arc.toml` makes every
-upgrade prompt, and the upgrade from 26.09.x failed non-interactively even for
-an unedited file. `dpkg --purge` removes `/etc/arc/arc.toml`, unless the other
-variant (`arc` or `arc-fips`) is installed and still uses it; `dpkg --remove`
-leaves it.
+is not a dpkg conffile: an edited conffile prompts on every upgrade whose
+stock file changed, which is nearly every release, and the upgrade from 26.09.x
+failed non-interactively even for an unedited file.
+
+- `dpkg --remove` leaves `/etc/arc/arc.toml`. `dpkg --purge` removes it,
+  unless the other variant (`arc` or `arc-fips`) is installed and still uses
+  it.
+- `dpkg -S /etc/arc/arc.toml` no longer names a package, because no package
+  owns the file.
+- Downgrading to 26.09.x or earlier replaces `/etc/arc/arc.toml` with that
+  release's stock file, as every upgrade used to. Back it up first.
 
 ## Upgrade note: three configurations now refuse to start
 
