@@ -213,6 +213,7 @@ type Metrics struct {
 	walDiskPressure           atomic.Int64 // 1 while live writes are refused for the WAL volume's free space
 	walDiskFreeBytes          atomic.Int64 // Free bytes on the WAL volume at the last sample
 	walDiskPressureRejections atomic.Int64 // Live writes refused for WAL volume disk pressure
+	bufferFullRejections      atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
 	walDiskStatErrors         atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
 
 	// Cluster file registration outbox (#1209)
@@ -765,6 +766,7 @@ func (m *Metrics) SetWALDiskPressure(on bool) {
 }
 func (m *Metrics) SetWALDiskFreeBytes(bytes int64) { m.walDiskFreeBytes.Store(bytes) }
 func (m *Metrics) IncWALDiskPressureRejections()   { m.walDiskPressureRejections.Add(1) }
+func (m *Metrics) IncBufferFullRejections()        { m.bufferFullRejections.Add(1) }
 func (m *Metrics) IncWALDiskStatErrors()           { m.walDiskStatErrors.Add(1) }
 
 // SetReconciliationStorageSweepHeld records whether the last reconciliation
@@ -1295,6 +1297,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_disk_pressure":                 m.walDiskPressure.Load(),
 		"wal_disk_free_bytes":               m.walDiskFreeBytes.Load(),
 		"wal_disk_pressure_rejections":      m.walDiskPressureRejections.Load(),
+		"ingest_buffer_full_rejections":     m.bufferFullRejections.Load(),
 		"wal_disk_stat_errors":              m.walDiskStatErrors.Load(),
 		"file_registrations_pending":        m.fileRegistrationsPending.Load(),
 		"reconciliation_storage_sweep_held": m.reconciliationStorageSweepHeld.Load(),
@@ -1889,6 +1892,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_disk_pressure_rejections_total Live writes refused for WAL volume disk pressure; nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_wal_disk_pressure_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_wal_disk_pressure_rejections_total", float64(m.walDiskPressureRejections.Load()))
+	b = append(b, "# HELP arc_ingest_buffer_full_rejections_total Write requests refused because rows waiting to be flushed reached ingest.max_buffered_bytes; nothing was written, clients retry\n"...)
+	b = append(b, "# TYPE arc_ingest_buffer_full_rejections_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_buffer_full_rejections_total", float64(m.bufferFullRejections.Load()))
 	b = append(b, "# HELP arc_wal_disk_stat_errors_total Failed reads of the WAL volume's free space; the disk pressure gate fails open while they fail\n"...)
 	b = append(b, "# TYPE arc_wal_disk_stat_errors_total counter\n"...)
 	b = appendMetric(b, "arc_wal_disk_stat_errors_total", float64(m.walDiskStatErrors.Load()))

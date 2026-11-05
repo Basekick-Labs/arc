@@ -175,7 +175,19 @@ type IngestConfig struct {
 	// before it is refused with 503 and nothing written (#1429). 0 = until a
 	// slot frees: the server does not see a client that gives up.
 	ImportQueueTimeoutMS int
+	// MaxBufferedBytes is ingest.max_buffered_bytes resolved to bytes (#1468):
+	// once the rows held for flushing (arc_buffer_bytes_buffered) reach it, new
+	// write requests are refused with a retryable 503. 0 = off, unless
+	// MaxBufferedBytesAuto, the default ("auto"), which the buffer resolves
+	// against the memory limit it detects.
+	MaxBufferedBytes     int64
+	MaxBufferedBytesAuto bool
 }
+
+// minMaxBufferedBytes is the smallest explicit ingest.max_buffered_bytes: a
+// limit below one ordinary request refuses every write once anything is
+// buffered.
+const minMaxBufferedBytes = 1 << 20
 
 type CacheConfig struct {
 	Enabled    bool
@@ -1518,6 +1530,9 @@ func Load() (*Config, error) {
 	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
 		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
 	}
+	if cfg.Ingest.MaxBufferedBytes, cfg.Ingest.MaxBufferedBytesAuto, err = parseMaxBufferedBytes(v.GetString("ingest.max_buffered_bytes")); err != nil {
+		return nil, err
+	}
 	// A negative max_concurrent would reach make(chan struct{}, m.MaxConcurrent)
 	// in the compaction manager's cycle loop and panic the process at the first
 	// scheduled cycle — NewManager only defaults the ZERO value. Fail fast here
@@ -2090,6 +2105,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.default_decimal_columns", "")
 	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
 	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
+	v.SetDefault("ingest.max_buffered_bytes", "auto") // half the memory limit; "0" = off (#1468)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -2885,6 +2901,22 @@ func (cfg *ServerConfig) ValidateTLS() error {
 	}
 
 	return nil
+}
+
+// parseMaxBufferedBytes parses ingest.max_buffered_bytes: "auto", a size of
+// at least 1MB, or a size of 0 (off).
+func parseMaxBufferedBytes(s string) (n int64, auto bool, err error) {
+	if strings.EqualFold(strings.TrimSpace(s), "auto") {
+		return 0, true, nil
+	}
+	n, err = ParseSize(s)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid ingest.max_buffered_bytes: %w (use \"auto\", a size such as \"2GB\", or \"0\" for off)", err)
+	}
+	if n > 0 && n < minMaxBufferedBytes {
+		return 0, false, fmt.Errorf("invalid ingest.max_buffered_bytes value %q: must be at least 1MB, \"auto\", or 0 for off", s)
+	}
+	return n, false, nil
 }
 
 // ParseSize parses a human-readable size string (e.g., "1GB", "500MB", "100KB") to bytes.

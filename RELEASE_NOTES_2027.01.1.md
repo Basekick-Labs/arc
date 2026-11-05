@@ -130,8 +130,9 @@ before: one flush still writes the same files. Flushes within the limit are
 written exactly as before. A flush that is cut holds the Arrow arrays of one
 row group at a time instead of the whole flush's.
 
-This does not bound what a buffer retains while storage is behind; ingest
-memory still grows with the backlog (see `arc_buffer_bytes_buffered`).
+What a buffer retains while storage is behind is bounded separately, by
+`ingest.max_buffered_bytes` ([#1468](https://github.com/Basekick-Labs/arc/issues/1468),
+see its upgrade note).
 
 Thanks to [@efegokdemir](https://github.com/efegokdemir), who traced the
 overflow to buffers retained under flush-queue backpressure and proposed the
@@ -542,6 +543,50 @@ an answer cannot reveal which columns that measurement already has.
   Parquet files directly and renames the column, then an import of the result.
 - **Edge sync:** a spoke on an older release can still send such files to
   its hub; upgrade spokes first.
+
+## Upgrade note: writes are refused with 503 while ingest holds too much unflushed data ([#1468](https://github.com/Basekick-Labs/arc/issues/1468))
+
+When storage fell behind (a slow disk or object store), the flush queue
+filled and each measurement's buffer kept growing in memory with no limit,
+until the process ran out of memory. Arc now stops taking new writes first.
+Once the rows waiting to be flushed (`arc_buffer_bytes_buffered`) reach
+`ingest.max_buffered_bytes`, every write request is refused before any of it
+is written:
+
+- HTTP writes (MessagePack, line protocol, TLE, imports) answer **503** with
+  `Retry-After: 5` and `X-Arc-Ingest-Refused: buffer_full`. Nothing of a
+  refused request is stored, so retrying it is safe. Clients that already
+  retry the other 503 refusals (WAL disk pressure, cluster fencing) need no
+  change.
+- Bulk imports are refused from 90% of the limit, and a running import paces
+  its writes below that level, so it does not hold the node over the limit
+  while other clients are refused. An import already running is never
+  stopped part-way by the limit.
+- MQTT subscriptions are suspended until the buffer drains below 90% of the
+  limit (and for at least 5 seconds), as they are for WAL disk pressure. With
+  `clean_session = false` and QoS 1 or 2 the broker holds the messages; a
+  `clean_session = true` subscription loses what is published meanwhile.
+- WAL replay and continuous-query writes are never refused.
+- New counter `arc_ingest_buffer_full_rejections_total` (one per refused
+  request), and a warning in the log at 80% of the limit.
+
+The default, `"auto"`, is half the memory limit Arc detects (the container
+limit where there is one), and off when none is detected; startup logs the
+value in use. Set a size (`"4GB"`, at least `1MB`) to choose it, or `"0"` to
+turn the limit off and keep the old behaviour:
+
+```toml
+[ingest]
+max_buffered_bytes = "auto"   # or "4GB", or "0" for off
+```
+
+Or `ARC_INGEST_MAX_BUFFERED_BYTES`. It is a backstop, not a bound on memory:
+the estimate is a MessagePack request's payload size and leaves out the
+copies a flush makes, requests admitted at the same time can each overshoot it
+by their own size (up to `server.max_payload_size`), and WAL replay at startup
+can put a node over it until the replayed rows are flushed. The existing
+`arc_buffer_memory_pressure` gauge and its warning at 50% of the memory limit
+are unchanged.
 
 ## Upgrade note: a cold tier that overlaps primary storage refuses to start ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 

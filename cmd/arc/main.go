@@ -1102,6 +1102,19 @@ func main() {
 		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
+	// Writes are refused with a retryable 503 while the rows waiting to be
+	// flushed are at this limit (#1468); "auto" is half the memory limit.
+	if limit := arrowBuffer.MaxBufferedBytes(); limit > 0 {
+		log.Info().
+			Int64("max_buffered_bytes", limit).
+			Bool("auto", cfg.Ingest.MaxBufferedBytesAuto).
+			Uint64("memory_limit_bytes", arrowBuffer.MemoryLimitBytes()).
+			Msg("Ingest buffered-bytes limit set")
+	} else {
+		log.Info().
+			Bool("auto", cfg.Ingest.MaxBufferedBytesAuto).
+			Msg("Ingest buffered-bytes limit off (ingest.max_buffered_bytes = 0, or auto without a detected memory limit)")
+	}
 	// Ingest counts rows stamped past file-level time pruning's margin
 	// whether or not the feature is on (it is by default), so the risk is
 	// visible on every node that flushes. Set before WAL recovery and the
@@ -1731,6 +1744,11 @@ func main() {
 		// pressure (#676), as while writes are fenced.
 		if walDisk != nil {
 			walDisk.OnChange(subscriptionManager.SetWALDiskPressure)
+		}
+		// And while the rows waiting to be flushed are at
+		// ingest.max_buffered_bytes (#1468), when that limit is on.
+		if arrowBuffer.MaxBufferedBytes() > 0 {
+			arrowBuffer.OnBufferFullChange(subscriptionManager.SetBufferFull)
 		}
 
 		// Start manager (loads and starts auto_start subscriptions). On a
