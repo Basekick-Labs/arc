@@ -42,7 +42,7 @@ func ForLog(sql string) string {
 			// Standard string. E-string is handled below before we get here.
 			b.WriteString("'...'")
 			i = skipStdString(sql, i+1)
-		case (c == 'E' || c == 'e') && i+1 < n && sql[i+1] == '\'' && !identChar(prevByte(sql, i)):
+		case (c == 'E' || c == 'e') && i+1 < n && sql[i+1] == '\'' && !continuesIdentifier(sql, i):
 			b.WriteString("E'...'")
 			i = skipEscString(sql, i+2)
 		case c == '$':
@@ -102,23 +102,72 @@ func skipStdString(sql string, i int) int {
 }
 
 // skipEscString is skipStdString for E'...' strings, where backslash escapes.
+//
+// It also folds quote-continuations: DuckDB (following Postgres) joins
+// `E'a'<whitespace with a newline>'b'` into one string, and the continued
+// segment stays an escape string, so a trailing backslash there still escapes
+// the closing quote. A masker that ended at the first quote would read the
+// continued segment as a plain string (backslash literal) and place its end
+// where DuckDB does not — hiding the SQL after it from every gate. The gap may
+// contain `--` line comments; a space-only gap or a block comment does not
+// continue (verified on the DuckDB Arc ships).
 func skipEscString(sql string, i int) int {
 	n := len(sql)
-	for i < n {
-		switch sql[i] {
-		case '\\':
-			i += 2
-			continue
-		case '\'':
-			if i+1 < n && sql[i+1] == '\'' {
+	for {
+		for i < n {
+			switch sql[i] {
+			case '\\':
 				i += 2
 				continue
+			case '\'':
+				if i+1 < n && sql[i+1] == '\'' {
+					i += 2
+					continue
+				}
+				i++ // past the closing quote
+				goto closed
 			}
-			return i + 1
+			i++
 		}
-		i++
+		return n // unterminated: consume the rest (fail closed)
+	closed:
+		reopen, ok := quoteContinuation(sql, i)
+		if !ok {
+			return i
+		}
+		i = reopen + 1 // scan the continued segment as an escape string
 	}
-	return n
+}
+
+// quoteContinuation reports whether a string closed at i continues, per
+// DuckDB's quote-continue rule: a run of whitespace that includes at least one
+// newline (optionally with `--` line comments) followed by a reopening `'`. It
+// returns the index of that `'`. A block comment or a gap with no newline does
+// not continue.
+func quoteContinuation(sql string, i int) (int, bool) {
+	n := len(sql)
+	sawNewline := false
+	for i < n {
+		switch {
+		case sql[i] == '\n' || sql[i] == '\r':
+			sawNewline = true
+			i++
+		case sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\f':
+			i++
+		case sql[i] == '-' && i+1 < n && sql[i+1] == '-':
+			for i < n && sql[i] != '\n' && sql[i] != '\r' {
+				i++
+			}
+		case sql[i] == '\'':
+			if sawNewline {
+				return i, true
+			}
+			return 0, false
+		default:
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
 // skipQuotedIdent returns the index just past the closing double quote, with
@@ -156,10 +205,6 @@ func scanDollarQuote(sql string, i int) (int, int, bool) {
 	}
 	return body + end + len(delim), len(tag), true
 }
-
-func identChar(c byte) bool { return isIdentifierByte(c) }
-
-// prevByte is shared with mask.go.
 
 // SanitizeErrText prepares an ERROR STRING for logging or storage: cut the
 // engine's "LINE 1: <query>" echo block (verbatim user query text), keep only

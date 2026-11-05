@@ -137,7 +137,11 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 		// reads as a plain identifier and hides the replacement scan from
 		// stringLiteralInTablePosition. Consume the prefix WITH the literal so the
 		// whole construct collapses to one placeholder (GHSA-wmjj-g8xc-6hwr).
-		if (ch == 'e' || ch == 'E') && i+1 < len(sql) && sql[i+1] == '\'' && !isIdentifierByte(prevByte(sql, i)) {
+		//
+		// The prefix must start a token: in `a$e'…'` the `e` continues the
+		// identifier `a$e` (DuckDB accepts `$` inside one), and the quote opens a
+		// plain string, whose escape rule differs.
+		if (ch == 'e' || ch == 'E') && i+1 < len(sql) && sql[i+1] == '\'' && !continuesIdentifier(sql, i) {
 			start := i
 			i += 2 // move past the E and the opening quote
 			i = skipEscString(sql, i)
@@ -667,10 +671,12 @@ func QuoteStringLiteral(s string) string {
 // so, returns its tag (empty for the anonymous `$$` form).
 //
 // DuckDB/Postgres dollar quoting is `$tag$body$tag$`, where tag is empty or a
-// valid identifier that must not start with a digit. Bounding the tag this way
-// keeps `a$1` (a legal identifier) and `$1` (a positional parameter) from being
-// misread as string openers — misreading either would swallow the rest of the
-// query into a placeholder and hide real SQL from every scanner.
+// valid identifier that must not start with a digit. As in an unquoted
+// identifier, every byte of a multi-byte UTF-8 character is a tag byte:
+// DuckDB reads `$é$…$é$` as a string, so the masker must too, to keep the same
+// code/literal split the checks rely on. Bounding the tag this way keeps `a$1`
+// (a legal identifier) and `$1` (a positional parameter) from being misread as
+// string openers, which would fold the rest of the query into one placeholder.
 func dollarQuoteTag(sql string, i int) (string, bool) {
 	if i >= len(sql) || sql[i] != '$' {
 		return "", false
@@ -682,17 +688,13 @@ func dollarQuoteTag(sql string, i int) (string, bool) {
 	// second and third `$` as an opener found no closing tag and masked the
 	// rest of the statement into one placeholder, hiding it from every gate
 	// while DuckDB parsed the name and ran what followed.
-	j := i - 1
-	for j >= 0 && sql[j] == '$' {
-		j--
-	}
-	if j >= 0 && isIdentifierByte(sql[j]) {
+	if continuesIdentifier(sql, i) {
 		return "", false
 	}
 	k := i + 1
 	for k < len(sql) && sql[k] != '$' {
 		c := sql[k]
-		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80
 		isDigit := c >= '0' && c <= '9'
 		if !isAlpha && !(isDigit && k > i+1) {
 			return "", false
@@ -720,12 +722,16 @@ func isIdentifierByte(c byte) bool {
 		(c >= '0' && c <= '9')
 }
 
-// prevByte returns the byte before index i, or 0 at the start of the string.
-func prevByte(s string, i int) byte {
-	if i == 0 {
-		return 0
+// continuesIdentifier reports whether the byte at i would continue an unquoted
+// identifier that ends just before it. DuckDB accepts `$` inside an identifier
+// (not as its first byte), so a run of `$` is walked back and the byte before
+// the run decides: `t$$$` and `a$e` are each one name, while a lone `$` is not.
+func continuesIdentifier(sql string, i int) bool {
+	j := i - 1
+	for j >= 0 && sql[j] == '$' {
+		j--
 	}
-	return s[i-1]
+	return j >= 0 && isIdentifierByte(sql[j])
 }
 
 // Span marks a byte range [Start, End) of sql that is inside a string literal
@@ -792,8 +798,9 @@ func scanSQLSpans(sql string, emit func(start, end int)) {
 			}
 		}
 		// Escape string E'…' / e'…' (backslash escapes); the prefix is part of
-		// the span. Same guard as the masker: previous byte not an identifier.
-		if (ch == 'e' || ch == 'E') && i+1 < n && sql[i+1] == '\'' && !isIdentifierByte(prevByte(sql, i)) {
+		// the span. Same guard as the masker (continuesIdentifier), and
+		// skipEscString folds quote-continuations identically.
+		if (ch == 'e' || ch == 'E') && i+1 < n && sql[i+1] == '\'' && !continuesIdentifier(sql, i) {
 			start := i
 			i = skipEscString(sql, i+2)
 			emit(start, i)
