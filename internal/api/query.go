@@ -3245,8 +3245,11 @@ var unicodeEscapePattern = regexp.MustCompile(`(?i)\bu&__(?:STR|IDENT)_\d+__`)
 // substring of a longer identifier.
 //
 // Maintenance: when DuckDB adds a new path-taking table function, add it here.
-// TestIOTableFunctionPattern_Family documents the set we verified against the
-// pinned DuckDB release. An extension's functions are not listed here: they
+// TestCoreTableFunctionsReviewed enumerates the linked DuckDB's table
+// functions and fails on one that is neither refused nor reviewed, so an
+// upgrade cannot add a reader silently (GHSA-r7vm-9hcg-xgf7: DuckDB added
+// parquet_full_metadata and read_duckdb after this list was written).
+// TestIOTableFunctionPattern_Family pins the names. An extension's functions are not listed here: they
 // come from database.DeniedExtensionFunctions, and an extension is loadable
 // only once its function surface is reviewed there (#440).
 var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
@@ -3257,6 +3260,8 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 	"parquet_file_metadata",
 	"parquet_kv_metadata",
 	"parquet_bloom_probe",
+	"parquet_full_metadata", // GHSA-r7vm-9hcg-xgf7
+	"read_duckdb",           // reads a DuckDB database file
 	"read_csv",
 	"read_csv_auto",
 	"sniff_csv",
@@ -3276,6 +3281,10 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 	"iceberg_metadata",
 	"iceberg_snapshots",
 	"arc_partition_agg",
+	// Scan an Arrow stream at a raw memory address. No SQL type can spell
+	// the POINTER arguments today; denied rather than reviewed as safe.
+	"arrow_scan",
+	"arrow_scan_dumb",
 	// The file readers of the DuckDB extensions database.extensions may load
 	// (#440), denied whether or not this node loads them.
 }, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)

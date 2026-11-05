@@ -476,6 +476,34 @@ not a read statement fails its runs from this release.
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
+## Security: DuckDB functions that read or write files under the storage root are refused ([GHSA-r7vm-9hcg-xgf7](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-r7vm-9hcg-xgf7))
+
+Arc refuses DuckDB's file-reading functions in user SQL, but the list predated
+functions that the DuckDB release Arc links now provides. A token scoped to one
+database could read another database's Parquet schema, row counts and
+per-column minimum and maximum values with `parquet_full_metadata()`, or a
+DuckDB database file under the storage root with `read_duckdb()`. Any token
+allowed to query could also call `enable_profiling(save_location := ...)`,
+which profiled later queries on the same pooled connection, including other
+users', into a `.json` or `.txt` file it named under the storage root. That
+file could be new or an existing one, overwritten. These functions,
+`disable_profiling`, the parser toggles, and the views of the engine-wide file
+cache, temporary files and prepared statements are now refused with `400`.
+That applies on every query endpoint and in continuous queries, and stored
+continuous queries that call them fail their runs.
+
+`DELETE` predicates kept their own, older copy of the list and did not check
+the functions that run SQL given as a string (`query()`, `query_table()`).
+They now refuse exactly what queries refuse.
+
+A test now lists every table function of the linked DuckDB and fails until
+each new one is refused or reviewed, so a DuckDB upgrade can no longer add one
+unnoticed.
+
+Full technical detail will accompany the security advisory once it is
+published. Responsibly reported by **[@harsh-prajapati1312](https://github.com/harsh-prajapati1312)**; the
+`read_duckdb` and `enable_profiling` gaps were found while fixing the report.
+
 ## Security: a cluster node that took a Raft snapshot no longer keeps revoked tokens ([#1336](https://github.com/Basekick-Labs/arc/issues/1336))
 
 **Enterprise clusters with auth enabled.** Each node checks API tokens and
