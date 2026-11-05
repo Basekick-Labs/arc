@@ -7877,17 +7877,19 @@ old place.
 
 ### The buffer refuses a measurement name containing "/" ([#1475](https://github.com/Basekick-Labs/arc/issues/1475))
 
-Buffer, coverage and tier-cache keys are `database + "/" + measurement`. They
-are unambiguous only while a measurement has no `/`, which every ingest entry
-point already guarantees by validating names (a letter, then letters, digits,
-`_` or `-`). The buffer now refuses such a name itself, before any WAL work,
-as a content refusal, so a future entry point that skipped validation cannot
-make two measurements share a key. No supported write path can reach it.
+Buffer, coverage and tier-cache keys are `database + "/" + measurement`, and
+storage paths are built the same way. They need a measurement with no `/`,
+which every ingest entry point already guarantees by validating names (a
+letter, then letters, digits, `_` or `-`). The buffer now refuses such a name
+itself, before any WAL work, as a content refusal, so a future entry point
+that skipped validation cannot make two measurements share a key. No supported
+write path can reach it. Database names are still validated only at the entry
+points.
 
 A test now also pins how the Iceberg exporter reads a metadata file's version
 (`00004-<uuid>.metadata.json` and `v4.metadata.json` are both version `4`): it
 is the integer `version-hint.text` holds, so the leading zeros are dropped on
-purpose. Both items close the last two open points of #750.
+purpose. Both are the hardening #750 handed to #1475.
 
 ### Hourly compaction file-count guidance (#793)
 

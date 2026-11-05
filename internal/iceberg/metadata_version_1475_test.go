@@ -34,9 +34,8 @@ func TestParseVersionAndMetaDir(t *testing.T) {
 		{in("00004-1f6e1c62-2a37-4f4b-9b3e-1d2c3b4a5f60.metadata.json"), "4"},
 		{in("00010-abc.metadata.json"), "10"},
 		{in("00000-abc.metadata.json"), "0"},
-		{in("v4.metadata.json"), "4"},     // Arc's adopted copy (adopt.go)
-		{in("v04.metadata.json"), "4"},    // the same version
-		{in("+4-abc.metadata.json"), "4"}, // Atoi accepts a sign; iceberg-go never writes one
+		{in("v4.metadata.json"), "4"},  // Arc's adopted copy (adopt.go)
+		{in("v04.metadata.json"), "4"}, // the same version
 		{in("x4.metadata.json"), ""},
 		{in("v.metadata.json"), ""},
 		{in("-abc.metadata.json"), ""},

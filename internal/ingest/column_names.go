@@ -158,13 +158,16 @@ func quoteColumnNames(names []string) []string {
 var ErrUnstorableColumnName = errors.New("column name cannot be stored")
 
 // ErrUnstorableMeasurementName is returned by the buffer for a measurement
-// name containing "/" (#1475). Buffer, coverage and tier-cache keys are
-// database + "/" + measurement: cluster code splits them at the first "/",
-// which holds because database names are validated without one, and every
-// other use is an exact lookup or a storage path, which holds only while the
-// measurement has none. Every ingest path validates measurement names first
-// (a letter, then letters, digits, "_" or "-"), so this means a path that
-// does not.
+// name containing "/" (#1475). Buffer and coverage keys are database + "/" +
+// measurement, and ingest (splitBufferKey) and cluster code split them at the
+// first "/": that holds only while the database has no "/", which the buffer
+// still trusts the entry points to validate (isValidDatabaseName; MQTT's
+// isValidStorageSegment). The tier cache keys on the same string but only for
+// exact lookup, and its database may contain "/" (edge-sync spoke
+// namespaces), so there it holds only while the measurement has none, as do
+// storage paths. Every ingest path validates measurement names first (a
+// letter, then letters, digits, "_" or "-"), so this means a path that does
+// not.
 var ErrUnstorableMeasurementName = errors.New("measurement name cannot be stored")
 
 // unstorableMeasurementError refuses a measurement name the buffer's keys

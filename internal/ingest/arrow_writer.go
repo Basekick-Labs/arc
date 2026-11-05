@@ -2477,7 +2477,7 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 
 	// The batch is written one record at a time, so a failure can follow
 	// records already buffered (#1437). A record refused for its content
-	// before the WAL (#440, #1342, #1424) is dropped and the others are
+	// before the WAL (#440, #1342, #1424, #1475) is dropped and the others are
 	// written, as line protocol does. Any other failure once something is
 	// buffered stops the write with a WriteStoppedError, which says what was
 	// written: the error itself would read as "nothing was written" (a
@@ -2662,6 +2662,10 @@ func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, databas
 		return fmt.Errorf("normalize replayed timestamps for %s: %w", measurement, err)
 	}
 	sanitizeColumnarStrings(columns)
+	// A measurement name with "/" is not dropped like a column: the entry is
+	// refused (writeColumnarInternalWithWALCopy) and handled as any failed
+	// replay (#1475). Entry points validate measurement names, so none is
+	// expected in a WAL.
 	// A column a binary from before #1342 accepted under a name Arc cannot
 	// read back would break the measurement: drop the column, keep the rows.
 	if dropped := dropUnstorableColumns(columns); len(dropped) > 0 {
