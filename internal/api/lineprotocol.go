@@ -374,13 +374,14 @@ localProcessing:
 		}
 	}
 
-	// Refuse the whole request up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676), rather than part-way through
-	// the measurements below. The admitted context skips the per-call disk
-	// pressure check, so pressure starting mid-request cannot split it. The
-	// fence is still checked per call: one that closes part-way stops the
-	// write, answered with what was written (writeLPMeasurements, #1437).
-	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	// Refuse the whole request up front if the ingest gate is closed (the
+	// fence and stream-takeover pauses, #1207) or the WAL volume is under disk
+	// pressure (#676), rather than part-way through the measurements below.
+	// The admitted context skips the per-call gate and disk pressure checks,
+	// so neither closing mid-request can split it (#1422). Any other failure
+	// part-way stops the write, answered with what was written
+	// (writeLPMeasurements, #1437).
+	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
@@ -481,9 +482,11 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 		}
 	}
 
-	// Refuse the whole request up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676); see the record path above.
-	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	// Refuse the whole request up front if the ingest gate is closed (the
+	// fence and stream-takeover pauses, #1207) or the WAL volume is under disk
+	// pressure (#676), and check neither again per measurement (#1422); see
+	// the record path above.
+	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
@@ -598,12 +601,12 @@ type lpStop struct {
 // one buffer call each (write returns the measurement's rows and the call's
 // error), and returns rows, dropped and drops updated for what it left out.
 //
-// A measurement refused for its content before the WAL (#440, #1342) is
-// dropped and the others are still written: a partial write, as for a point
-// that cannot be stored. Any other failure stops the write: the stop says
-// what was buffered before it, because an answer that reads as "nothing was
-// written" would have the client resend, and write the buffered part again
-// (#1437). When every measurement was refused for its content, the stop
+// A measurement refused for its content before the WAL (#440, #1342, #1424)
+// is dropped and the others are still written: a partial write, as for a
+// point that cannot be stored. Any other failure stops the write: the stop
+// says what was buffered before it, because an answer that reads as "nothing
+// was written" would have the client resend, and write the buffered part
+// again (#1437). When every measurement was refused for its content, the stop
 // carries the first refusal and nothing written.
 //
 // The success path adds rows and moves on: what was written is worked out
@@ -666,7 +669,7 @@ func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *
 	if ingest.IsWriteRefusal(err) {
 		return respondWriteRefused(c, err)
 	}
-	// A client error (#440, #1342), refused before the WAL.
+	// A client error (#440, #1342, #1424), refused before the WAL.
 	if ingest.IsContentRefusal(err) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}

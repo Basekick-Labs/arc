@@ -186,11 +186,12 @@ func TestRBACParity_CTEKeywordAsWord(t *testing.T) {
 
 			// Rewriter 2: the fast-path transform entry point, whose own gate
 			// decides whether the fast path (no CTE guard at all) is reached.
-			parallel, _, err := h.getTransformedSQLForQuery(ctx, tt.sql, headerDB)
+			parallel, _, recorded, err := h.getTransformedSQLForQueryWithRefs(ctx, tt.sql, headerDB)
 			if err != nil {
 				t.Fatalf("getTransformedSQLForQuery: %v", err)
 			}
 			readParallel := parityReads(parallel)
+			assertReadsRecorded(t, readParallel, recorded)
 			if strings.Join(readParallel, ",") != strings.Join(tt.wantRead, ",") {
 				t.Errorf("getTransformedSQLForQuery read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
 			}
@@ -274,11 +275,12 @@ func TestRBACParity_CTERegexWithoutWithKeyword(t *testing.T) {
 			}
 			assertNoUnderCheck(t, tt.sql, check, readHeader)
 
-			parallel, _, err := h.getTransformedSQLForQuery(ctx, tt.sql, headerDB)
+			parallel, _, recorded, err := h.getTransformedSQLForQueryWithRefs(ctx, tt.sql, headerDB)
 			if err != nil {
 				t.Fatalf("getTransformedSQLForQuery: %v", err)
 			}
 			readParallel := parityReads(parallel)
+			assertReadsRecorded(t, readParallel, recorded)
 			if strings.Join(readParallel, ",") != strings.Join(tt.wantRead, ",") {
 				t.Errorf("getTransformedSQLForQuery read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
 			}
@@ -364,11 +366,12 @@ func TestRBACParity_FromKeywordWordBoundary(t *testing.T) {
 			}
 			assertNoUnderCheck(t, tt.sql, check, readHeader)
 
-			parallel, _, err := h.getTransformedSQLForQuery(ctx, tt.sql, headerDB)
+			parallel, _, recorded, err := h.getTransformedSQLForQueryWithRefs(ctx, tt.sql, headerDB)
 			if err != nil {
 				t.Fatalf("getTransformedSQLForQuery: %v", err)
 			}
 			readParallel := parityReads(parallel)
+			assertReadsRecorded(t, readParallel, recorded)
 			if strings.Join(readParallel, ",") != strings.Join(tt.wantRead, ",") {
 				t.Errorf("getTransformedSQLForQuery read set = %v, want %v\n  rewritten: %s", readParallel, tt.wantRead, parallel)
 			}
@@ -553,5 +556,22 @@ func TestRBACParity_WhereFragmentSyntaxSurface(t *testing.T) {
 			}
 			assertNoUnderCheck(t, sql, check, read)
 		})
+	}
+}
+
+// assertReadsRecorded fails when the rewritten SQL reads a database and
+// measurement the transform did not record (#764): the emitted-scope check
+// can only check what was recorded, so a path built outside
+// storagePathForBackend would be read unchecked.
+func assertReadsRecorded(t *testing.T, reads []string, recorded []TableReference) {
+	t.Helper()
+	have := map[string]bool{}
+	for _, r := range recorded {
+		have[r.Database+"/"+r.Measurement] = true
+	}
+	for _, r := range reads {
+		if !have[r] {
+			t.Errorf("rewritten SQL reads %s, which the transform did not record (recorded %v)", r, recorded)
+		}
 	}
 }

@@ -233,6 +233,16 @@ type ObjectInfo struct {
 	LastModified time.Time
 }
 
+// ConditionalWriter writes an object only when nothing is at its path yet: a
+// compare-and-set on existence, so two writers racing for one path cannot
+// both believe they created it.
+type ConditionalWriter interface {
+	// WriteIfAbsent writes data at path unless an object already exists there.
+	// created is false, with a nil error, when one did; it is left untouched.
+	// A reader never sees a partial object at path.
+	WriteIfAbsent(ctx context.Context, path string, data []byte) (created bool, err error)
+}
+
 // ObjectLister lists objects with their metadata.
 // This is useful for retention policies that need to check file ages.
 type ObjectLister interface {
@@ -255,7 +265,8 @@ type ObjectLister interface {
 //
 // Optional: callers type-assert and fall back to ListObjects when the backend
 // does not implement it (test fakes that embed the Backend interface, for
-// instance). LocalBackend, S3Backend and AzureBlobBackend all implement it.
+// instance). LocalBackend, S3Backend, AzureBlobBackend and GCSBackend all
+// implement it.
 type PrefixProber interface {
 	HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error)
 }

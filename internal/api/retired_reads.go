@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,9 @@ type RetiredReads struct {
 	entries map[string]*retiredRead
 	gen     atomic.Uint64
 	onSeen  atomic.Pointer[func()]
+	// seeded: a Seed read every journal record. Until then a strict reader
+	// cannot know which files are replaced (ExcludedForStrict seeds again).
+	seeded atomic.Bool
 }
 
 type retiredRead struct {
@@ -49,15 +53,20 @@ func (r *RetiredReads) SetOnSeen(fn func()) {
 	}
 }
 
-// Seed adds the journal's records.
+// Seed adds the journal's records. A record it cannot read is skipped and
+// reported once the rest are added.
 func (r *RetiredReads) Seed(ctx context.Context) error {
 	keys, err := r.store.List(ctx, storage.DeleteRetiredRoot+"/")
 	if err != nil {
 		return err
 	}
+	var readErr error
 	for _, k := range keys {
 		data, err := r.store.Read(ctx, k)
 		if err != nil {
+			if !storage.IsNotFound(err) && readErr == nil {
+				readErr = fmt.Errorf("read DELETE journal record %s: %w", k, err)
+			}
 			continue
 		}
 		old, by, ok := storage.ParseRetiredRecord(k, data)
@@ -66,6 +75,10 @@ func (r *RetiredReads) Seed(ctx context.Context) error {
 		}
 		r.add(old, by)
 	}
+	if readErr != nil {
+		return readErr
+	}
+	r.seeded.Store(true)
 	return nil
 }
 
@@ -127,6 +140,18 @@ func (r *RetiredReads) ExcludedFor(ctx context.Context, prefix string) []string 
 		out = append(out, c.old)
 	}
 	return out
+}
+
+// ExcludedForStrict is ExcludedFor for a reader that must not guess (the
+// Iceberg export): while the journal has not been read in full, it reads it
+// again, and fails if it still cannot.
+func (r *RetiredReads) ExcludedForStrict(ctx context.Context, prefix string) ([]string, error) {
+	if !r.seeded.Load() {
+		if err := r.Seed(ctx); err != nil {
+			return nil, fmt.Errorf("files a DELETE replaced are unknown: %w", err)
+		}
+	}
+	return r.ExcludedFor(ctx, prefix), nil
 }
 
 // Open reports whether reads under prefix must not be cached.

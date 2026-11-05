@@ -2317,12 +2317,13 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 
 	// The batch is written one record at a time, so a failure can follow
 	// records already buffered (#1437). A record refused for its content
-	// before the WAL (#440, #1342) is dropped and the others are written, as
-	// line protocol does. Any other failure once something is buffered stops
-	// the write with a WriteStoppedError, which says what was written: the
-	// error itself would read as "nothing was written" (a refusal promises
-	// that, and the MQTT subscriber resends the whole message on one). A
-	// failure before anything is buffered is returned as it is.
+	// before the WAL (#440, #1342, #1424) is dropped and the others are
+	// written, as line protocol does. Any other failure once something is
+	// buffered stops the write with a WriteStoppedError, which says what was
+	// written: the error itself would read as "nothing was written" (a
+	// refusal promises that, and the MQTT subscriber resends the whole
+	// message on one). A failure before anything is buffered is returned as
+	// it is.
 	//
 	// Nothing below runs on the success path but the index: what was
 	// written is worked out from the indexes when a write fails.
@@ -2970,6 +2971,14 @@ var ErrBufferClosing = errors.New("arrow buffer is closing: write refused")
 // written, the WAL included, so a retry against the primary is safe.
 var ErrIngestFenced = errors.New("ingest fenced: this node is not an available primary writer")
 
+// ErrUnstorableColumnValue is returned for a columnar record whose values
+// cannot be converted to typed columns (#1424): a column of mixed types, such
+// as an integer column holding a string, a time column that is not numeric,
+// or a value outside a decimal column's precision. The conversion runs before
+// the WAL append (#1438), so nothing of the record was written, and the same
+// record is refused on every attempt.
+var ErrUnstorableColumnValue = errors.New("column value cannot be stored")
+
 // SetIngestGate installs the check every live write passes before anything is
 // written, the WAL included (#1207). It returns nil to admit, or an error
 // wrapping ErrIngestFenced. Replay, recovery and replication paths are never
@@ -3081,8 +3090,9 @@ func noRelease() {}
 // several at once, cannot run the volume past its reserve, and released as
 // the request's appends reach the WAL queue, or when release runs. Writes
 // under the context skip their own disk pressure check, so pressure that
-// starts part-way cannot leave the request half written; fencing is still
-// checked per call. With no disk gate ctx is returned unchanged.
+// starts part-way cannot leave the request half written; the ingest gate is
+// still checked per call (AdmitWholeRequest checks it once). With no disk gate
+// ctx is returned unchanged.
 func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
 		if err := (*g)(); err != nil {
@@ -3104,6 +3114,35 @@ func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context
 	return context.WithValue(ctx, walDiskAdmittedKey{}, r), r.release, nil
 }
 
+// fenceAdmittedKey marks a context whose request passed the ingest gate (the
+// fence and stream-takeover pauses) as a whole (AdmitWholeRequest).
+type fenceAdmittedKey struct{}
+
+// AdmitWholeRequest is AdmitRequest for a request written as several buffer
+// calls, such as a line-protocol body of several measurements: writes under
+// the returned context skip the ingest gate (the fence and stream-takeover
+// pauses) too, so it is checked once for the whole request, as
+// ArrowBuffer.Write checks it for a MessagePack batch. Checked per call, a
+// gate that closed part-way stopped the request after its earlier
+// measurements were buffered, and a client resending it duplicated them
+// (#1422). A request admitted before the gate closes is not refused by it
+// part-way, however long its buffer calls take (schema-change flushes,
+// durable WAL syncs). Other failures can still stop it part-way.
+//
+// A long-running write (an import) uses AdmitRequest instead, so the gate
+// still stops it part-way. With no ingest gate (a standalone node) there is
+// nothing to skip, and ctx is returned as AdmitRequest returns it.
+func (b *ArrowBuffer) AdmitWholeRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
+	ctx, release, err := b.AdmitRequest(ctx, walBytes)
+	if err != nil {
+		return ctx, release, err
+	}
+	if g := b.ingestGate.Load(); g == nil || *g == nil {
+		return ctx, release, nil
+	}
+	return context.WithValue(ctx, fenceAdmittedKey{}, true), release, nil
+}
+
 func countWALDiskRefusal(ctx context.Context) {
 	if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
 		metrics.Get().IncWALDiskPressureRejections()
@@ -3112,8 +3151,10 @@ func countWALDiskRefusal(ctx context.Context) {
 
 func (b *ArrowBuffer) checkIngestGate(ctx context.Context) error {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
-		if err := (*g)(); err != nil {
-			return err
+		if admitted, _ := ctx.Value(fenceAdmittedKey{}).(bool); !admitted {
+			if err := (*g)(); err != nil {
+				return err
+			}
 		}
 	}
 	// Order matters for the common path: no gate, then no pressure, and only
@@ -3245,7 +3286,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// entry appended first would be replayed at the next start (#1438).
 	typedColumns, numRecords, err := b.convertColumnsToTyped(record.Measurement, record.Columns)
 	if err != nil {
-		return fmt.Errorf("failed to convert columns: %w", err)
+		return fmt.Errorf("%w: measurement %q: %v", ErrUnstorableColumnValue, record.Measurement, err)
 	}
 	if len(record.RawPayload) > 0 {
 		typedColumns.estimatedBytes = int64(len(record.RawPayload))
