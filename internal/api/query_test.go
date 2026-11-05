@@ -845,9 +845,9 @@ func TestValidateWhereClauseQuery(t *testing.T) {
 
 // Edge cases added in review: identifiers that merely contain the former
 // xp_/sp_ prefixes or a keyword pass; the escaped-quote, trailing-comment and
-// dollar-tag shapes the masker was hardened against stay refused; and a quote
-// inside a backtick identifier must not open a literal that swallows the
-// statement after it.
+// dollar-tag shapes the masker was hardened against stay refused; and a
+// backtick, which is not a quote in DuckDB, is refused rather than guessed at
+// (#1480).
 func TestValidateWhereClauseQueryMaskingEdgeCases(t *testing.T) {
 	// Every keyword in the list is still refused as a bare word.
 	for _, kw := range dangerousQueryKeywords {
@@ -1271,7 +1271,7 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		// statement separator) is preserved by the column-position case
 		// below, which must stay allowed.
 		{name: "semicolon inside backtick identifier in table position rejected as invalid name", sql: "SELECT * FROM `my;db`", shouldFail: true},
-		{name: "semicolon inside backtick identifier in column position allowed", sql: "SELECT `my;col` FROM cpu", shouldFail: false},
+		{name: "backtick-quoted column refused: DuckDB does not quote with backticks (#1480)", sql: "SELECT `my;col` FROM cpu", shouldFail: true},
 		{name: "SHOW smuggled behind semicolon in backtick db", sql: "SHOW TABLES FROM `db`; SELECT 1", shouldFail: true},
 	}
 

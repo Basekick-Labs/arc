@@ -84,8 +84,8 @@ func TestValidateWhereClauseRejectsKeywordsGluedToNumbersOrLiterals(t *testing.T
 // Edge cases the review added on top of the masking: literals that mention a
 // file-I/O function or an identifier that is a keyword stay data; the escaped
 // quote, trailing comment and dollar-tag shapes the masker was hardened
-// against stay refused; and a quote inside a backtick identifier must not
-// open a literal that swallows the call after it.
+// against stay refused; and a backtick, which is not a quote in DuckDB, is
+// refused rather than guessed at (#1480).
 func TestValidateWhereClauseMaskingEdgeCases(t *testing.T) {
 	h := &DeleteHandler{}
 	for _, where := range []string{

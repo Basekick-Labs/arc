@@ -919,11 +919,13 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
 	// inside a string literal is data, not SQL (#834). The raw clause is what
 	// gets interpolated into the DuckDB statement, so the unmatched-quote and
-	// unmatched-parenthesis checks below stay on it. Backtick identifiers are
-	// normalised to double quotes first, as the query path's validator does:
-	// the masker does not know backticks, so a quote inside one would
-	// otherwise open a spurious literal that hides whatever follows it.
-	maskInput := backticksToDoubleQuotes(where)
+	// unmatched-parenthesis checks below stay on it. An unquoted backtick is
+	// refused before anything is masked: it is not a quote in DuckDB, so the
+	// masker must see the clause exactly as DuckDB will (#1480).
+	if hasUnquotedBacktick(where) {
+		return false, errors.New("WHERE clause: " + errUnquotedBacktick)
+	}
+	maskInput := where
 	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
@@ -974,7 +976,7 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 			ioCheck = strings.ReplaceAll(ioCheck, mask.Placeholder, mask.Original)
 		}
 	}
-	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
+	ioCheck = strings.ReplaceAll(ioCheck, `"`, "")
 	if unicodeEscapePattern.MatchString(maskedWhere) {
 		return false, fmt.Errorf(`WHERE clause contains a unicode-escaped identifier or string (U&"...")`)
 	}

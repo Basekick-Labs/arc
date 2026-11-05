@@ -865,6 +865,33 @@ Arc now reads them once per query and shares them across its references.
 Results are unchanged. A time range is only ever found for a single-table
 query, so no query's pruning differs.
 
+## Fix: a backtick in SQL is refused with a clear error ([#1480](https://github.com/Basekick-Labs/arc/issues/1480))
+
+DuckDB does not quote identifiers with backticks; outside quoted text a
+backtick is an operator character, so `` SELECT `value` FROM cpu `` has never
+run. Arc's own checks on query text, however, read backticks as quotes, so
+Arc and DuckDB could disagree about what a query said. One result was the
+reported query, which answered `success: true` with no columns instead of an
+error.
+
+A backtick outside a string literal, a `"…"` identifier or a comment is now
+refused with `400` and `backticks are not identifier quotes in DuckDB; quote
+identifiers with double quotes ("name")`. This applies to every query
+endpoint, continuous queries, the `where` parameter of
+`/api/v1/query/:measurement`, and `DELETE` predicates. Arc's checks now read
+the query exactly as DuckDB will. `` SHOW TABLES FROM `mydb` `` still works,
+because Arc answers it itself. A backtick inside a literal or a quoted
+identifier is unaffected.
+
+Two related fixes:
+- **Stream takeover `DELETE` with a backtick in a string literal.** With
+  stream takeover on, such a `DELETE` (`WHERE msg = 'a`b'`) ran with the
+  backtick turned into a double quote, so it matched the wrong rows. It now
+  runs as written.
+- **Stored `DELETE` records.** A record applied to a pending file is checked
+  again before it runs. A record the current checks refuse is skipped, with
+  an error in the log.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
