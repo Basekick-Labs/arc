@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -155,6 +156,35 @@ func quoteColumnNames(names []string) []string {
 // ColumnNameProblem refuses that reached it (#1342): every ingest path drops
 // or refuses such names first, so it means a path that does not.
 var ErrUnstorableColumnName = errors.New("column name cannot be stored")
+
+// ErrUnstorableMeasurementName and ErrUnstorableDatabaseName are returned by
+// the buffer for a measurement or database name containing "/" (#1475).
+// Buffer and coverage keys are database + "/" + measurement, and ingest
+// (splitBufferKey) and cluster code split them at the first "/", which needs
+// a database with no "/". Tier-cache keys are the same string used for exact
+// lookup only, and storage paths are built the same way; those need a
+// measurement with no "/". Every ingest path validates both names first
+// (isValidDatabaseName, isValidMeasurementName; MQTT's isValidStorageSegment
+// and isValidMeasurementSegment), so either error means a path that does not:
+// entry points have missed the database check before (#300, #993, #1010).
+// Edge-sync spoke namespaces, whose database does contain "/", reach storage
+// as files and never pass through the buffer.
+var (
+	ErrUnstorableMeasurementName = errors.New("measurement name cannot be stored")
+	ErrUnstorableDatabaseName    = errors.New("database name cannot be stored")
+)
+
+// unstorableKeyError refuses a database or measurement name the buffer's
+// keys cannot hold unambiguously; nil for any other.
+func unstorableKeyError(database, measurement string) error {
+	if strings.Contains(database, "/") {
+		return fmt.Errorf("%w: database %s contains \"/\"", ErrUnstorableDatabaseName, strconv.Quote(database))
+	}
+	if strings.Contains(measurement, "/") {
+		return fmt.Errorf("%w: measurement %s contains \"/\"", ErrUnstorableMeasurementName, strconv.Quote(measurement))
+	}
+	return nil
+}
 
 func unstorableColumnError(measurement, name string) error {
 	if name == "time" {

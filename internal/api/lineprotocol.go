@@ -669,7 +669,7 @@ func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *
 	if ingest.IsWriteRefusal(err) {
 		return respondWriteRefused(c, err)
 	}
-	// A client error (#440, #1342, #1424), refused before the WAL.
+	// A client error (#440, #1342, #1424, #1475), refused before the WAL.
 	if ingest.IsContentRefusal(err) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
