@@ -69,6 +69,10 @@ func TestWrapSourceMeasurementSkipsQuotedTextAndComments(t *testing.T) {
 		{"quoted alias written against the name",
 			`SELECT c.host FROM prod.cpu"c"`,
 			`SELECT c.host FROM ` + rp + `"c"`},
+		// DuckDB continues an identifier through `$` and non-ASCII bytes.
+		{"name continued by a non-ASCII byte", "SELECT 1 FROM prod.cpué", "SELECT 1 FROM prod.cpué"},
+		{"name continued by a dollar", "SELECT 1 FROM prod.cpu$x", "SELECT 1 FROM prod.cpu$x"},
+		{"FROM continuing a word", "SELECT 1 AS éFROM prod.cpu", "SELECT 1 AS éFROM prod.cpu"},
 		// A word shaped like the masker's placeholder is a word.
 		{"placeholder-shaped words",
 			"SELECT __STR_0__ AS a, 'x' AS b, __IDENT_0__, \"h\" FROM prod.cpu",

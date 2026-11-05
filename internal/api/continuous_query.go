@@ -1099,9 +1099,9 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 // Scope is deliberately narrow — only the `FROM db.measurement` form is matched
 // (not JOIN, comma-joins, or quoted identifiers). A regex cannot safely
 // distinguish a genuine table position from a same-named column qualifier
-// (`db.m.field`), a projection/GROUP BY column (`SELECT a, db.m`), or text inside
-// a string literal without a real SQL tokenizer; widening the pattern to those
-// forms silently corrupts valid queries (rewriting a table-valued function into
+// (`db.m.field`) or a projection/GROUP BY column (`SELECT a, db.m`) without a
+// real SQL tokenizer; widening the pattern to those forms silently corrupts
+// valid queries (rewriting a table-valued function into
 // a scalar position). Anything not matched here is left unchanged and fails
 // loudly at query time rather than being mis-rewritten. Broader, parser-based
 // source matching is tracked as a follow-up. See
@@ -1115,12 +1115,20 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 // DuckDB names an unaliased read_parquet() relation "read_parquet", so
 // `cpu.usage` failed to bind. The rule is aliasTableRef's, applied to the
 // finished expression so the open-compaction exclusion still sees its closing
-// parenthesis. Any other body is rewritten byte for byte as before.
+// parenthesis.
 //
 // The pattern runs on cqStructureView, a copy of the body with the inside of
 // every literal, quoted identifier and comment blanked, so `FROM db.m` written
-// inside one is never rewritten (#1487). The copy has the body's length, so the
-// splice goes into the body as written: nothing is unmasked, and comments stay.
+// inside one is not rewritten (#1487). Which spans are literals is
+// MaskStringLiterals' reading of the body, the same one the validator uses.
+// The copy has the body's length, so the splice goes into the body as
+// written: nothing is unmasked, and comments outside the reference stay. A
+// comment between FROM and the name is part of the replaced reference.
+//
+// A match is skipped when the byte on either side would continue an
+// identifier in DuckDB, which Go's ASCII-only \b does not know: `$` and every
+// byte of a multi-byte UTF-8 character. `FROM prod.cpué` names a different
+// table, and rewriting its prefix would leave `é` as an alias of this one.
 func wrapSourceMeasurement(query, database, measurement, readParquetExpr string) string {
 	pattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(database) + `\.` + regexp.QuoteMeta(measurement) + `\b`)
 	view := cqStructureView(query)
@@ -1140,6 +1148,9 @@ func wrapSourceMeasurement(query, database, measurement, readParquetExpr string)
 	var b strings.Builder
 	last := 0
 	for _, m := range matches {
+		if m[0] > 0 && continuesIdentifier(view[m[0]-1]) || m[1] < len(view) && continuesIdentifier(view[m[1]]) {
+			continue
+		}
 		b.WriteString(query[last:m[0]])
 		expr := readParquetExpr
 		if !cqSourceKeepsOwnName(view, m[1]) {
@@ -1151,6 +1162,12 @@ func wrapSourceMeasurement(query, database, measurement, readParquetExpr string)
 	}
 	b.WriteString(query[last:])
 	return b.String()
+}
+
+// continuesIdentifier reports whether c, next to a word, would extend it into
+// one identifier in DuckDB though Go's \b sees a boundary there.
+func continuesIdentifier(c byte) bool {
+	return c == '$' || c >= 0x80
 }
 
 // cqStructureView returns query with the inside of every string literal,
@@ -1424,8 +1441,10 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// own `FROM prod.cpu` unrewritten and the query failed (#1487).
 	//
 	// This runs after the definition was re-validated above, which refuses
-	// nested block comments; cqStructureView reads them as DuckDB does, but
-	// the validator is what guarantees the body is one DuckDB parses.
+	// nested block comments. cqStructureView finds literals with
+	// MaskStringLiterals, which ends a comment at its first `*/`, so it reads a
+	// nested comment as DuckDB does only because the validator never lets one
+	// through.
 	wrappedQuery := wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
 
 	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")

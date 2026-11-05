@@ -970,13 +970,16 @@ Two related fixes:
 Before a continuous query runs, Arc replaces its `FROM <database>.<measurement>`
 with a read of the measurement's files. It found that text anywhere in the
 query, including inside a string literal, a quoted identifier or a comment,
-and rewrote those occurrences too. Such a query then failed to parse. It now
-rewrites only a real table reference and leaves everything else exactly as
-written.
+and rewrote those occurrences too. In a `'…'` literal that made the query fail
+to parse. In a dollar-quoted string (`$$…$$`) or a quoted identifier, the query
+ran, and the storage path ended up inside the string value or the output
+column's name. Arc now rewrites only a real table reference and leaves
+everything else exactly as written.
 
-Two related fixes:
-- `FROM /* comment */ db.cpu` is now rewritten. Before, it was left as is
-  and the query failed.
+Related fixes:
+- A comment between `FROM` and the name (`FROM /* c */ db.cpu`,
+  `FROM -- c` then a newline and `db.cpu`) no longer stops the rewrite. Such
+  queries used to fail with `Table with name "db.cpu" does not exist`.
 - A query with a CTE named after its source measurement now runs, e.g.
   `WITH cpu AS (SELECT … FROM db.cpu …) SELECT … FROM cpu`. Before, Arc
   skipped the rewrite for it, and the query failed with `Table db.cpu does not
