@@ -177,9 +177,9 @@ type IngestConfig struct {
 	ImportQueueTimeoutMS int
 	// MaxBufferedBytes is ingest.max_buffered_bytes resolved to bytes (#1468):
 	// once the rows held for flushing (arc_buffer_bytes_buffered) reach it, new
-	// write requests are refused with a retryable 503. 0 = off, unless
-	// MaxBufferedBytesAuto, the default ("auto"), which the buffer resolves
-	// against the memory limit it detects.
+	// write requests are refused with a retryable 503. 0 = off (the default),
+	// unless MaxBufferedBytesAuto ("auto"), which the buffer resolves against
+	// the memory limit it detects.
 	MaxBufferedBytes     int64
 	MaxBufferedBytesAuto bool
 }
@@ -2105,7 +2105,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.default_decimal_columns", "")
 	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
 	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
-	v.SetDefault("ingest.max_buffered_bytes", "auto") // half the memory limit; "0" = off (#1468)
+	v.SetDefault("ingest.max_buffered_bytes", "0") // off; "auto" = half the memory limit (#1468)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")

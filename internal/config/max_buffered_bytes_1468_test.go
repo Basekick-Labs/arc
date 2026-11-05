@@ -13,7 +13,7 @@ func TestLoad_MaxBufferedBytes(t *testing.T) {
 		want     int64
 		errPart  string
 	}{
-		{env: "", wantAuto: true},
+		{env: ""}, // the default: off
 		{env: "auto", wantAuto: true},
 		{env: " AUTO ", wantAuto: true},
 		{env: "0"},

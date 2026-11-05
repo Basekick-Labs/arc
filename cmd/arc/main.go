@@ -1103,7 +1103,8 @@ func main() {
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
 	// Writes are refused with a retryable 503 while the rows waiting to be
-	// flushed are at this limit (#1468); "auto" is half the memory limit.
+	// flushed are at this limit (#1468): off by default, "auto" is half the
+	// memory limit.
 	if limit := arrowBuffer.MaxBufferedBytes(); limit > 0 {
 		log.Info().
 			Int64("max_buffered_bytes", limit).
@@ -1113,7 +1114,7 @@ func main() {
 	} else {
 		log.Info().
 			Bool("auto", cfg.Ingest.MaxBufferedBytesAuto).
-			Msg("Ingest buffered-bytes limit off (ingest.max_buffered_bytes = 0, or auto without a detected memory limit)")
+			Msg("Ingest buffered-bytes limit off (ingest.max_buffered_bytes = 0, the default, or auto without a detected memory limit)")
 	}
 	// Ingest counts rows stamped past file-level time pruning's margin
 	// whether or not the feature is on (it is by default), so the risk is
