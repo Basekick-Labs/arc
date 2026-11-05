@@ -791,6 +791,33 @@ ignored. Arc now logs a warning at startup naming both files. Merge what you
 need into `/etc/arc/arc.toml`, then remove `/var/lib/arc/arc.toml`. The
 storage and backup paths are set by the systemd unit and override either file.
 
+## Fix: `IS [NOT] DISTINCT FROM` works in queries ([#1472](https://github.com/Basekick-Labs/arc/issues/1472))
+
+Arc read the `FROM` in `x IS [NOT] DISTINCT FROM y` as the start of a table
+reference, so standard SQL using the operator failed:
+
+- A literal operand (`host IS DISTINCT FROM 'a'`) was refused with "String
+  literal not allowed in table position".
+- A column or `NULL` operand was rewritten into a table scan, and DuckDB
+  failed with `Binder Error: Function "read_parquet" is a table function`.
+- With RBAC on, the operand was checked as a table, so a query could be
+  refused for a grant it does not need.
+- A comma after the operand (`SELECT a IS DISTINCT FROM b, c FROM cpu`)
+  turned `c` into a cross-join table.
+- `DELETE … WHERE host IS DISTINCT FROM 'a'` was refused.
+- Time-range pruning skipped queries that used the operator.
+
+All of these now treat the operator as a comparison. The same change fixes a
+literal after the `FROM` of a function form, such as
+`trim(BOTH FROM '  x  ')`, which was refused the same way.
+
+Arc also no longer reads a parenthesis or `FROM` inside a SQL comment as part
+of `EXTRACT`, `SUBSTRING`, `TRIM` or `OVERLAY`. A comment such as
+`/* trim( */` could previously make a real table reference after it invisible
+to the RBAC check and to the query rewrite, and the query then failed.
+
+The workaround for earlier releases is `(x != 'a' OR x IS NULL)`.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,

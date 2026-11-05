@@ -407,12 +407,97 @@ func skipWhitespaceAndCommentsForward(sql string, i int) int {
 	return i
 }
 
+// ContainsMaskableFromKeyword reports whether sql holds a FROM keyword that
+// MaskFromKeywordsInFunctionBodies would mask: one inside EXTRACT, SUBSTRING,
+// TRIM or OVERLAY, or the FROM of an `IS [NOT] DISTINCT FROM` comparison
+// (#1472). Callers that rewrite the token after FROM without running the
+// masker (the single-table fast path) must bail out when this is true.
+// Allocation-free; a false positive only costs the slower path.
+func ContainsMaskableFromKeyword(sql string) bool {
+	return ContainsFromKeywordFunction(sql) || containsDistinctFromOperator(sql)
+}
+
+// containsDistinctFromOperator reports whether some whole-word FROM in sql is
+// the FROM of an `IS [NOT] DISTINCT FROM` comparison. Allocation-free.
+func containsDistinctFromOperator(sql string) bool {
+	for i := 0; i+4 <= len(sql); i++ {
+		if (sql[i] == 'f' || sql[i] == 'F') && isFromKeywordAt(sql, i) && isDistinctFromOperatorFrom(sql, i) {
+			return true
+		}
+	}
+	return false
+}
+
+// isDistinctFromOperatorFrom reports whether the FROM keyword at sql[fromIdx]
+// is the FROM of an `IS [NOT] DISTINCT FROM` comparison (#1472): walking
+// backwards over ASCII whitespace and SQL comments, the preceding words are
+// bare DISTINCT, an optional bare NOT, and bare IS, each directly adjacent.
+//
+// Adjacency is the safety argument, not keyword reservation: IS is not
+// reserved in DuckDB, but `IS [NOT] DISTINCT` is never followed by a FROM that
+// introduces a relation. `UNION DISTINCT FROM '…'` (FROM-first syntax) DOES
+// read a relation, and fails the IS test, as does any word other than IS.
+// Only ASCII whitespace counts as a separator: DuckDB reads `is<U+0085>distinct`
+// as one identifier, so a caller must run this before folding Unicode spaces.
+// A word inside a comment is skipped as comment, so `-- is distinct⏎FROM t`
+// leaves that FROM alone. Quoted words are placeholders by the masker's
+// precondition, so `"is" DISTINCT FROM` never matches.
+func isDistinctFromOperatorFrom(sql string, fromIdx int) bool {
+	start, ok := bareWordBefore(sql, fromIdx)
+	if !ok || !equalFoldASCII(sql[start:start+wordLen(sql, start)], "distinct") {
+		return false
+	}
+	start, ok = bareWordBefore(sql, start)
+	if !ok {
+		return false
+	}
+	if equalFoldASCII(sql[start:start+wordLen(sql, start)], "not") {
+		if start, ok = bareWordBefore(sql, start); !ok {
+			return false
+		}
+	}
+	// A qualified `t.is` is a column, not the keyword: DuckDB rejects
+	// `t.is DISTINCT FROM`, but nothing here depends on that.
+	if start > 0 && sql[start-1] == '.' {
+		return false
+	}
+	return equalFoldASCII(sql[start:start+wordLen(sql, start)], "is")
+}
+
+// bareWordBefore returns the start of the identifier-character run that ends
+// at the last non-whitespace, non-comment byte before sql[i], or false when
+// that byte is not an identifier character.
+func bareWordBefore(sql string, i int) (int, bool) {
+	j := skipWhitespaceAndCommentsBack(sql, i-1)
+	if j < 0 || !isIdentByte(sql[j]) {
+		return 0, false
+	}
+	for j >= 0 && isIdentByte(sql[j]) {
+		j--
+	}
+	return j + 1, true
+}
+
+// wordLen returns the length of the identifier-character run at sql[i].
+func wordLen(sql string, i int) int {
+	n := 0
+	for i+n < len(sql) && isIdentByte(sql[i+n]) {
+		n++
+	}
+	return n
+}
+
 // MaskFromKeywordsInFunctionBodies replaces whole-word FROM tokens that appear
 // inside the argument list of EXTRACT, SUBSTRING, TRIM, or OVERLAY with unique
 // placeholders so the caller's table-rewriter regex (which would otherwise
-// match `FROM <ident>` greedily inside these expressions) skips them. The
-// placeholders contain only identifier characters and never satisfy
-// `\bFROM\b`.
+// match `FROM <ident>` greedily inside these expressions) skips them. It masks
+// the FROM of an `IS [NOT] DISTINCT FROM` comparison the same way, at any
+// paren depth (#1472; see isDistinctFromOperatorFrom). The placeholders
+// contain only identifier characters and never satisfy `\bFROM\b`.
+//
+// SQL comments are copied through untouched: a `(` or a FROM inside one is
+// not code. Before #1472 a comment could open a masking frame
+// (`/* trim( */ FROM '…' /* ) */`) and hide a real FROM.
 //
 // The mask is content-addressed via the placeholders, not offset-based —
 // callers may run arbitrary length-changing transformations between the
@@ -440,7 +525,7 @@ func MaskFromKeywordsInFunctionBodies(sql string) (string, []FromMask) {
 	// strings.Builder and walk the entire SQL byte-by-byte for every
 	// uncached query, even the 99% that have no EXTRACT/SUBSTRING/
 	// TRIM/OVERLAY. The miss path is 0 allocs.
-	if !ContainsFromKeywordFunction(sql) {
+	if !ContainsMaskableFromKeyword(sql) {
 		return sql, nil
 	}
 
@@ -465,6 +550,15 @@ func MaskFromKeywordsInFunctionBodies(sql string) (string, []FromMask) {
 	i := 0
 	for i < len(sql) {
 		c := sql[i]
+		// A comment is copied verbatim: neither a paren nor a FROM in it is
+		// code. skipWhitespaceAndCommentsForward stops at the first byte that
+		// is neither, so the comment ends where it says it does.
+		if (c == '/' && i+1 < len(sql) && sql[i+1] == '*') || (c == '-' && i+1 < len(sql) && sql[i+1] == '-') {
+			end := skipWhitespaceAndCommentsForward(sql, i)
+			b.WriteString(sql[i:end])
+			i = end
+			continue
+		}
 		switch c {
 		case '(':
 			if isFromKeywordFuncBeforeParen(sql, i) {
@@ -487,7 +581,8 @@ func MaskFromKeywordsInFunctionBodies(sql string) (string, []FromMask) {
 			// rewriter can convert `cpu` to read_parquet(...). Without
 			// the depth-equality check, DuckDB fails with "Table cpu
 			// does not exist". (gemini-code-assist round 2.)
-			if len(stack) > 0 && depth == stack[len(stack)-1] && (c == 'f' || c == 'F') && isFromKeywordAt(sql, i) {
+			inFuncFrame := len(stack) > 0 && depth == stack[len(stack)-1]
+			if (c == 'f' || c == 'F') && isFromKeywordAt(sql, i) && (inFuncFrame || isDistinctFromOperatorFrom(sql, i)) {
 				ph := strconv.AppendInt(append(phBuf[:0], "__FROM_MASK_"...), int64(maskIndex), 10)
 				ph = append(ph, '_', '_')
 				placeholder := string(ph)

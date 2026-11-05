@@ -2902,6 +2902,22 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "Nested block comments are not allowed"}
 	}
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	// The table-position guards below read their own copy, with the FROM of
+	// EXTRACT/SUBSTRING/TRIM/OVERLAY and of `IS [NOT] DISTINCT FROM` masked, as
+	// the rewriters and the RBAC extractor already see it: without it,
+	// `host IS DISTINCT FROM 'a'` and `trim(BOTH FROM '  x  ')` put a literal
+	// in "table position" and were refused (#1472).
+	//
+	// SECURITY: the copy is masked AFTER the comments are stripped and BEFORE
+	// Unicode spaces are folded, and both orders matter. Before stripping, a
+	// comment could open a masking frame (`/* trim( */ FROM '…' /* ) */`) and
+	// hide a real FROM from the replacement-scan guard. After folding, a code
+	// point DuckDB does NOT treat as a separator (U+0085, U+2028, …) would
+	// read as one: DuckDB parses `is<U+0085>distinct FROM 'f.csv'` as an alias
+	// and a replacement scan, which the masker must not mistake for the
+	// operator. The other checks keep reading the unmasked form.
+	tablePosNormalised, _ := sqlutil.MaskFromKeywordsInFunctionBodies(normalised)
+	tablePosNormalised = foldUnicodeSpace(tablePosNormalised)
 	normalised = foldUnicodeSpace(normalised)
 
 	// SECURITY: reject multi-statement queries. A second statement smuggled
@@ -3025,7 +3041,7 @@ func ValidateSQLRequest(sql string) error {
 	// alias (`FROM cpu "where", '…'`) came back as the keyword `where`, which
 	// terminates the table list in the scanner and hid the string after the
 	// comma from this guard (#978 review).
-	if stringLiteralInTablePosition(normalised) {
+	if stringLiteralInTablePosition(tablePosNormalised) {
 		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
 	}
 
@@ -3039,7 +3055,7 @@ func ValidateSQLRequest(sql string) error {
 	// pass. Runs on the shared normalisation, where quoted identifiers are
 	// distinct __IDENT__ placeholders. (2026-08 edge-sync audit follow-up to
 	// GHSA-w8x2.)
-	if name := invalidQuotedIdentifierInTablePosition(normalised, sqlutil.IdentifierNames(vMasks)); name != "" {
+	if name := invalidQuotedIdentifierInTablePosition(tablePosNormalised, sqlutil.IdentifierNames(vMasks)); name != "" {
 		return &SQLValidationError{Message: "Quoted identifier in table position is not a valid database or measurement name (replacement scans are disabled): " + name}
 	}
 
@@ -3414,9 +3430,11 @@ func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sq
 	}
 
 	// Bail to slow path for features the fast path can't handle. EXTRACT/
-	// SUBSTRING/TRIM/OVERLAY need the slow path's FROM-keyword mask.
+	// SUBSTRING/TRIM/OVERLAY and `IS [NOT] DISTINCT FROM` need the slow
+	// path's FROM-keyword mask: the fast path rewrites whatever follows the
+	// first FROM, which for `x IS DISTINCT FROM y` is the operand (#1472).
 	features := scanSQLFeatures(sql)
-	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsFromKeywordFunction(sql) {
+	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsMaskableFromKeyword(sql) {
 		return h.getTransformedSQLWithRefs(ctx, sql, headerDB)
 	}
 
@@ -4542,10 +4560,11 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	}
 
 	// FAST PATH: skip all regex machinery for simple single-table queries.
-	// Bail when the SQL has a bare FROM inside EXTRACT/SUBSTRING/TRIM/OVERLAY
-	// — `SELECT EXTRACT(YEAR FROM CURRENT_DATE)` slips past isSingleTableQuery
-	// with fromCount==1, so the slow path's mask helper must run.
-	if isSingleTableQuery(sqlLower) && !containsSQLWord(sqlLower, "with") && !sqlutil.ContainsFromKeywordFunction(sql) {
+	// Bail when the SQL has a FROM the slow path's mask helper hides: inside
+	// EXTRACT/SUBSTRING/TRIM/OVERLAY, or of `IS [NOT] DISTINCT FROM` (#1472).
+	// `SELECT EXTRACT(YEAR FROM CURRENT_DATE)` and `SELECT 1 IS DISTINCT FROM
+	// 2` slip past isSingleTableQuery with fromCount==1.
+	if isSingleTableQuery(sqlLower) && !containsSQLWord(sqlLower, "with") && !sqlutil.ContainsMaskableFromKeyword(sql) {
 		features := scanSQLFeatures(sql)
 		if !features.hasQuotes && !features.hasDashComment && !features.hasBlockComment {
 			// Also need to rewrite time functions if present
