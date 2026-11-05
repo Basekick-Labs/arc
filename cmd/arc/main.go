@@ -220,6 +220,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The SQL length cap every SQL endpoint and continuous query enforces
+	// (#1448). Set before anything can validate a statement.
+	api.SetMaxSQLLength(cfg.Query.MaxSQLLength)
+
 	// Validate TLS configuration before starting
 	if err := cfg.Server.ValidateTLS(); err != nil {
 		fmt.Fprintf(os.Stderr, "TLS configuration error: %v\n", err)
@@ -4154,6 +4158,10 @@ func main() {
 	// Iceberg export (opt-in). Publishes Arc's existing Parquet as Iceberg tables via a
 	// periodic reconciler that walks storage — works in OSS and cluster, no tiering/Raft
 	// dependency. Wired OUTSIDE the cluster block so it runs in standalone mode.
+	// Set by the Iceberg block, used once tiering is set up (see below).
+	var icebergStart func()
+	var icebergExporter *iceberg.Exporter
+	var icebergWalk *iceberg.StorageWalkSource
 	if cfg.Iceberg.Enabled {
 		icebergDBPath := cfg.Iceberg.CatalogDBPath
 		if icebergDBPath == "" {
@@ -4200,6 +4208,10 @@ func main() {
 		if !cfg.Iceberg.OrphanSweepEnabled {
 			log.Warn().Msg("Iceberg orphan metadata sweep is disabled (iceberg.orphan_sweep_enabled=false): the manifest files of expired snapshots are retained indefinitely and are copied into every backup")
 		}
+		// Shared storage: every node sees the same tables and the export moves with the
+		// compactor lease, so the published version, not this node's catalog row, is current
+		// (#939). Elsewhere it is consulted only for a table with no catalog row.
+		exporter.SetWarehouseAuthoritative(cfg.Cluster.SharedStorageMode)
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
@@ -4210,6 +4222,28 @@ func main() {
 		// earlier run still sits in storage, and the reads must be fresh.
 		icebergSource.SetPendingOutputs(compaction.NewManifestManager(storageBackend, logger.Get("compaction")).PendingOutputsUnder)
 		log.Info().Msg("Iceberg export leaves in-flight compaction outputs out of the table until their sources are deleted")
+		// The files Arc's own reads leave out (a compaction's inputs once its
+		// output is in place, a file a row DELETE replaced, a local copy the
+		// cluster deleted) are left out of the table too, so external readers
+		// count each row once, as Arc does (#939 A0).
+		if openCompactions != nil {
+			strict, ok := openCompactions.(api.StrictExcluder)
+			if !ok {
+				log.Fatal().Msgf("Iceberg export: the query layer's file exclusions (%T) cannot be read strictly", openCompactions)
+			}
+			icebergSource.SetExclusions(strict)
+		}
+		// Shared storage: the exclusions above come from this node's manifest, so a listed file
+		// it does not know yet waits for it to catch up before export (#939).
+		if cfg.Cluster.SharedStorageMode && clusterCoordinator != nil {
+			icebergSource.SetManifestBarrier(func(p string) bool {
+				node := clusterCoordinator.GetRaftNode()
+				if node == nil || node.FSM() == nil {
+					return true
+				}
+				return node.FSM().HasFile(p)
+			}, clusterCoordinator.SyncManifest)
+		}
 		// On a local-storage cluster a delete reaches this disk after the
 		// manifest; files the cluster deleted stay out of the table meanwhile.
 		if clusterCoordinator != nil && storageBackend.Type() == "local" {
@@ -4234,8 +4268,16 @@ func main() {
 		// with MULTIPLE compaction-capable nodes and no lease, CanCompact() is true on each of
 		// them — configure only ONE compaction-capable node when iceberg export is enabled, or
 		// two nodes will race on the warehouse files.
+		//
+		// In shared-storage mode (#939) the exported tables live in the one bucket every node
+		// sees, so the gate is the compactor lease itself, with no static-role fallback: before
+		// the first lease is assigned no node exports. Config refuses shared-storage Iceberg
+		// without cluster.failover_enabled, which is what assigns the lease.
 		var icebergGate iceberg.WriterGate
-		if compactionGate != nil {
+		switch {
+		case cfg.Cluster.SharedStorageMode && clusterCoordinator != nil:
+			icebergGate = icebergLeaseGate{clusterCoordinator}
+		case compactionGate != nil:
 			icebergGate = icebergWriterGate{compactionGate}
 		}
 		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
@@ -4245,7 +4287,9 @@ func main() {
 			Gate:     icebergGate,
 			Logger:   logger.Get("iceberg"),
 		})
-		icebergScheduler.Start()
+		// Started after tiering is set up (below), so the first pass already sees the cold tier.
+		icebergStart = icebergScheduler.Start
+		icebergExporter, icebergWalk = exporter, icebergSource
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
 			icebergScheduler.Stop()
 			// Close only a handle this block opened. A borrowed one belongs to
@@ -5004,6 +5048,39 @@ func main() {
 		}
 	}
 
+	// Iceberg export, once tiering is set up: with a cold tier, files migrated to it stay in the
+	// tables (#939), so the export must see the cold tier from its first pass. Exporting without
+	// it would drop every migrated file from the tables, so an unavailable cold tier keeps the
+	// export from starting and the tables keep their last snapshot.
+	if icebergStart != nil {
+		startExport := true
+		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
+			var cold storage.Backend
+			if tieringManager != nil {
+				cold = tieringManager.GetBackendForTier(tiering.TierCold)
+			}
+			if cold == nil {
+				startExport = false
+				log.Error().Msg("Iceberg export not started: tiered_storage.cold is enabled but the cold tier is unavailable, and exporting without it would drop migrated files from the tables")
+			} else if err := wireIcebergCold(icebergWalk, icebergExporter, cold, tieringManager, cfg.Iceberg.ColdRescanInterval); err != nil {
+				startExport = false
+				log.Error().Err(err).Msg("Iceberg export not started: cannot track the cold tier")
+			} else {
+				// Every Arc path that changes the cold tier (a tiering cycle, cold retention, a
+				// cold DELETE, a database delete) fires this; the export lists cold again.
+				tieringManager.SetOnMigrationComplete(func() {
+					queryHandler.InvalidateCaches()
+					icebergWalk.InvalidateCold("")
+				})
+				log.Info().Int("cold_rescan_interval_s", cfg.Iceberg.ColdRescanInterval).
+					Msg("Iceberg export tracks files migrated to the S3 cold tier")
+			}
+		}
+		if startExport {
+			icebergStart()
+		}
+	}
+
 	// Initialize Backup/Restore (OSS feature — no license required)
 	if cfg.Backup.Enabled {
 		// Pass the Iceberg catalog path so a catalog the operator moved out of the
@@ -5025,7 +5102,9 @@ func main() {
 			}
 			if p, ok := iceberg.LocalWarehousePath(rawWarehouse); ok {
 				icebergWarehousePath = p
-			} else {
+			} else if cfg.Storage.Backend != "s3" {
+				// An S3 warehouse is inside the storage root (config refuses any other, #939),
+				// so the storage listing carries its table metadata like any other object.
 				log.Warn().Str("warehouse", rawWarehouse).
 					Msg("iceberg.warehouse is not a local path; backups cannot include its table metadata")
 			}
@@ -5988,6 +6067,12 @@ type icebergWriterGate struct{ inner compaction.ClusterGate }
 
 func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 
+// icebergLeaseGate is the shared-storage Iceberg gate: only the node holding the compactor
+// lease exports, and no node does while no lease is assigned (see its use for why).
+type icebergLeaseGate struct{ c *cluster.Coordinator }
+
+func (g icebergLeaseGate) CanRun() bool { return g.c.IsActiveCompactor() }
+
 // reconciliationClusterGate implements reconciliation.Gate. The two halves
 // of a reconcile run (storage scan, manifest sweep) have different gating
 // rules depending on the storage backend topology:
@@ -6408,5 +6493,26 @@ type clusterOpenCompactions struct{ c *cluster.Coordinator }
 func (o clusterOpenCompactions) ExcludedFor(ctx context.Context, prefix string) []string {
 	return o.c.OpenExcludedFor(ctx, prefix)
 }
+func (o clusterOpenCompactions) ExcludedForStrict(ctx context.Context, prefix string) ([]string, error) {
+	return o.c.OpenExcludedForStrict(ctx, prefix)
+}
 func (o clusterOpenCompactions) Open(prefix string) bool { return o.c.OpenAny(prefix) }
 func (o clusterOpenCompactions) Generation() uint64      { return o.c.OpenGeneration() }
+
+// wireIcebergCold gives the Iceberg export the S3 cold tier (#939): the source lists it next to
+// the primary, asking tiering's tier record which copy is current for a key on both tiers, and the
+// exporter registers cold files under their cold URIs.
+func wireIcebergCold(src *iceberg.StorageWalkSource, exp *iceberg.Exporter, cold storage.Backend, tm *tiering.Manager, rescanSeconds int) error {
+	meta := tm.GetMetadata()
+	isCold := func(ctx context.Context, key string) (bool, error) {
+		f, err := meta.GetFile(ctx, key)
+		if err != nil {
+			return false, err
+		}
+		return f != nil && f.Tier == tiering.TierCold, nil
+	}
+	if err := src.SetColdTier(cold, isCold, time.Duration(rescanSeconds)*time.Second); err != nil {
+		return err
+	}
+	return exp.SetColdTier(cold)
+}

@@ -562,6 +562,10 @@ type IcebergConfig struct {
 	// nothing regenerates, so it gets an off switch; turning it off restores the pre-#835
 	// behaviour, where that metadata grows without bound and is copied into every backup.
 	OrphanSweepEnabled bool
+	// ColdRescanInterval (seconds) is how long the export trusts a measurement's cached cold-tier
+	// listing when nothing invalidated it (#939): Arc's own cold changes invalidate it at once,
+	// so this bounds only changes made behind Arc's back.
+	ColdRescanInterval int
 }
 
 type ContinuousQueryConfig struct {
@@ -598,6 +602,10 @@ type QueryConfig struct {
 	// FileTimePruningMarginSeconds widens the keep-window below the query's
 	// lower bound to absorb writer clock skew (default 300).
 	FileTimePruningMarginSeconds int
+	// MaxSQLLength caps the length in bytes of a query's SQL (#1448), on every
+	// endpoint that runs user SQL and on continuous query definitions.
+	// Default 10000; MaxSQLLengthCeiling at most.
+	MaxSQLLength int
 	// StableSchema (26.09.2, #914) lists a measurement's zero-row field
 	// schema anchor first in every read_parquet, so a field absent from
 	// the files a time range selects binds as a typed NULL column instead of
@@ -1270,6 +1278,7 @@ func Load() (*Config, error) {
 			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
+			ColdRescanInterval:       v.GetInt("iceberg.cold_rescan_interval"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -1295,6 +1304,7 @@ func Load() (*Config, error) {
 			SlowQueryThresholdMs:          v.GetInt("query.slow_query_threshold_ms"),
 			FileTimePruning:               v.GetBool("query.file_time_pruning"),
 			FileTimePruningMarginSeconds:  v.GetInt("query.file_time_pruning_margin_seconds"),
+			MaxSQLLength:                  v.GetInt("query.max_sql_length"),
 			StableSchema:                  v.GetBool("query.stable_schema"),
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
@@ -1706,20 +1716,23 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	// Iceberg export is LOCAL-ONLY in v1. The reconciler walks the single configured storage
-	// backend and derives schemas by reading Parquet footers from the local filesystem, and the
-	// export was verified only against a local backend. Refuse non-local primary backends and
-	// cold-tier tiering (a file migrated to object storage would leave the Iceberg table) at
-	// load time rather than run an unsupported/corrupting configuration.
+	// Iceberg export runs on a local or an S3 primary backend (#939). The reconciler walks the
+	// single configured storage backend and publishes through iceberg-go's FileIO, which Arc
+	// links for s3:// only, so Azure and GCS primaries are refused, as is a cold tier on anything
+	// but S3 (a file migrated there would leave the Iceberg table). Refused at load time rather
+	// than run an unsupported or corrupting configuration.
 	if cfg.Iceberg.Enabled {
-		if cfg.Storage.Backend != "local" {
-			return nil, fmt.Errorf("iceberg.enabled=true requires storage.backend=\"local\" (got %q); "+
-				"Iceberg export is local-only in this release", cfg.Storage.Backend)
+		if err := cfg.checkIcebergBackend(); err != nil {
+			return nil, err
 		}
 		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
-			return nil, fmt.Errorf("iceberg.enabled=true is not supported with cold-tier tiering " +
-				"(tiered_storage.cold.enabled): files migrated to the cold tier would be removed from the " +
-				"Iceberg table. Disable one of them")
+			if err := cfg.checkIcebergColdTier(); err != nil {
+				return nil, err
+			}
+		}
+		if cfg.Iceberg.ColdRescanInterval < 1 {
+			return nil, fmt.Errorf("iceberg.cold_rescan_interval must be >= 1 (got %d): it is how long, in seconds, "+
+				"a cached cold-tier listing is trusted", cfg.Iceberg.ColdRescanInterval)
 		}
 		if cfg.Iceberg.ReconcileInterval < 1 {
 			return nil, fmt.Errorf("iceberg.reconcile_interval must be >= 1 (got %d): "+
@@ -1940,7 +1953,36 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if err := checkMaxSQLLength(cfg.Query.MaxSQLLength, cfg.Server.MaxPayloadSize); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// DefaultMaxSQLLength is query.max_sql_length's default, the cap Arc always
+// had. MinMaxSQLLength and MaxSQLLengthCeiling bound what it accepts: below
+// the floor ordinary queries stop fitting, and above the ceiling one query's
+// validation and rewrite cost more than half a second of CPU before DuckDB
+// starts (about 0.5 s per MiB, linear).
+const (
+	DefaultMaxSQLLength = 10000
+	MinMaxSQLLength     = 1000
+	MaxSQLLengthCeiling = 1 << 20
+)
+
+func checkMaxSQLLength(n int, maxPayload int64) error {
+	if n < MinMaxSQLLength || n > MaxSQLLengthCeiling {
+		return fmt.Errorf("query.max_sql_length is %d; it must be between %d and %d bytes",
+			n, MinMaxSQLLength, MaxSQLLengthCeiling)
+	}
+	// The body limit is enforced before the handler runs, and the SQL travels
+	// inside a JSON or MessagePack body, so a cap at or above it never applies.
+	if maxPayload > 0 && int64(n) >= maxPayload {
+		return fmt.Errorf("query.max_sql_length (%d) must be smaller than server.max_payload_size (%d); "+
+			"the request body carrying the SQL is limited first", n, maxPayload)
+	}
+	return nil
 }
 
 func setDefaults(v *viper.Viper) {
@@ -2163,6 +2205,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
+	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
 	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults
@@ -2182,6 +2225,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
 	v.SetDefault("query.file_time_pruning", true)                // On by default since 27.01.1 (#659); false turns it off
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
+	v.SetDefault("query.max_sql_length", DefaultMaxSQLLength)    // #1448: bytes of SQL per query
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
 	v.SetDefault("query.stable_schema_bootstrap", true)          // Build anchors for pre-26.09.2 measurements on first query
 	v.SetDefault("query.stable_schema_bootstrap_max_files", 500) // Footers sampled per bootstrap (newest days, compacted files first)
@@ -2895,4 +2939,101 @@ func ParseSize(sizeStr string) (int64, error) {
 		return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
 	}
 	return num, nil
+}
+
+// checkIcebergBackend refuses the primary-backend shapes Iceberg export does not support (#939).
+//
+//   - storage.backend other than "local" or "s3": the exporter publishes through iceberg-go's
+//     FileIO, and Arc links its s3:// driver only.
+//   - storage.backend="s3" on Google Cloud Storage's S3-compatible endpoint: Arc reaches GCS
+//     through a request signer and checksum policy set on its own S3 client, which iceberg-go's
+//     client does not get, so its writes would be refused.
+//   - storage.backend="s3" with an iceberg.warehouse outside the storage root: iceberg-go opens
+//     every added data file through the table's FileIO, which is bound to the warehouse's bucket,
+//     so a warehouse in another bucket fails the first add; one under another prefix of the same
+//     bucket is outside what backups and the orphan sweep treat as Arc's.
+//   - a cold tier other than S3 (checkIcebergColdTier).
+//   - cluster.shared_storage_mode without cluster.failover_enabled: without the compactor lease
+//     every compactor-role node exports, and two exporters writing one table's metadata fork it.
+func (cfg *Config) checkIcebergBackend() error {
+	switch cfg.Storage.Backend {
+	case "local":
+	case "s3":
+		if storage.IsGCSEndpoint(cfg.Storage.S3Endpoint) {
+			return fmt.Errorf("iceberg.enabled=true is not supported with storage.backend=\"s3\" on Google Cloud Storage's " +
+				"S3-compatible endpoint (storage.s3_endpoint=storage.googleapis.com): Iceberg export supports local and S3 primary storage")
+		}
+		if err := checkIcebergWarehouseUnderS3Root(cfg.Iceberg.Warehouse, cfg.Storage.S3Bucket, cfg.Storage.S3Prefix); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("iceberg.enabled=true requires storage.backend=\"local\" or \"s3\" (got %q): "+
+			"Iceberg export does not support %s primary storage", cfg.Storage.Backend, cfg.Storage.Backend)
+	}
+	if cfg.Cluster.Enabled && cfg.Cluster.SharedStorageMode && !cfg.Cluster.FailoverEnabled {
+		return fmt.Errorf("iceberg.enabled=true with cluster.shared_storage_mode=true requires cluster.failover_enabled=true: " +
+			"the compactor lease is what keeps a single node exporting, and two exporters writing the same table's " +
+			"metadata in shared storage fork its history")
+	}
+	return nil
+}
+
+// checkIcebergColdTier refuses a cold tier Iceberg export cannot track (#939): it follows files
+// migrated to an S3 cold tier into the table, and the cold URIs are registered through iceberg-go,
+// which Arc links for s3:// only. An Azure or GCS cold tier would drop migrated files from the
+// table, and so would S3 on Google Cloud Storage's interop endpoint, whose signer iceberg-go's
+// client does not get.
+func (cfg *Config) checkIcebergColdTier() error {
+	cold := cfg.TieredStorage.Cold
+	if cold.Backend != "s3" {
+		return fmt.Errorf("iceberg.enabled=true with cold-tier tiering requires tiered_storage.cold.backend=\"s3\" (got %q): "+
+			"files migrated to a %s cold tier would leave the Iceberg table. Disable one of them", cold.Backend, cold.Backend)
+	}
+	if storage.IsGCSEndpoint(cold.S3Endpoint) {
+		return fmt.Errorf("iceberg.enabled=true is not supported with an S3 cold tier on Google Cloud Storage's " +
+			"S3-compatible endpoint (tiered_storage.cold.s3_endpoint=storage.googleapis.com)")
+	}
+	return nil
+}
+
+// checkIcebergWarehouseUnderS3Root refuses an explicit iceberg.warehouse that is not
+// s3://<storage.s3_bucket>/ under storage.s3_prefix, compared on whole path segments
+// (s3://b/ab is not under s3://b/a). An empty warehouse means the default, the storage root.
+func checkIcebergWarehouseUnderS3Root(warehouse, bucket, prefix string) error {
+	warehouse = strings.TrimSpace(warehouse)
+	if warehouse == "" {
+		return nil
+	}
+	root := "s3://" + bucket + "/" + strings.TrimSuffix(prefix, "/")
+	refuse := func(why string) error {
+		return fmt.Errorf("iceberg.warehouse=%q must be inside the storage root %s (%s): Iceberg data files are opened "+
+			"through the warehouse's bucket, and metadata outside the root is not covered by backups", warehouse, strings.TrimSuffix(root, "/"), why)
+	}
+	u, err := url.Parse(warehouse)
+	if err != nil {
+		return refuse("not a URI")
+	}
+	if u.Scheme != "s3" {
+		return refuse("not an s3:// URI")
+	}
+	if u.Host != bucket {
+		return refuse("a different bucket")
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return refuse("a URI with a query, fragment or user")
+	}
+	path := strings.TrimPrefix(u.Path, "/")
+	if path != "" {
+		if _, err := storage.ValidateObjectPrefix(path); err != nil {
+			return refuse(err.Error())
+		}
+	}
+	want, err := storage.ValidateObjectPrefix(prefix)
+	if err != nil {
+		return refuse(err.Error())
+	}
+	if !strings.HasPrefix(strings.TrimSuffix(path, "/")+"/", want) && want != "" {
+		return refuse("a path outside storage.s3_prefix")
+	}
+	return nil
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -43,7 +45,16 @@ type StorageWalkSource struct {
 	// deletedHere, when set, reports a listed file the cluster has deleted
 	// while this node's copy is still on disk; it is excluded too.
 	deletedHere func(path string) bool
-	logger      zerolog.Logger
+	// exclusions, when set, names the files Arc's own reads leave out under a
+	// prefix (see SetExclusions).
+	exclusions Exclusions
+	// manifestKnows and manifestSync, when set (shared-storage clusters), are the replicated
+	// manifest's view of a listed file and its read barrier (see SetManifestBarrier).
+	manifestKnows func(path string) bool
+	manifestSync  func(ctx context.Context) error
+	// cold, when set, is the cold tier the source lists next to the primary (cold.go).
+	cold   *coldTier
+	logger zerolog.Logger
 
 	// namespaceExpander, when set, returns the top-level directories that are
 	// edge-sync spoke namespaces rather than databases (#634). A hub stores
@@ -78,6 +89,35 @@ func (s *StorageWalkSource) SetPendingOutputs(fn func(ctx context.Context, prefi
 // cluster node that does not track its local copies.
 func (s *StorageWalkSource) SetDeletedHere(fn func(path string) bool) {
 	s.deletedHere = fn
+}
+
+// Exclusions is the set of stored files Arc's own reads leave out because
+// another file under the same prefix holds their rows: the inputs of a
+// compaction whose output is in place, a file a row DELETE replaced, a local
+// copy the cluster deleted. It is the query layer's set
+// (api.CombineOpenCompactions), asked strictly: where a read would guess, an
+// export must not, so a source that cannot tell returns an error.
+type Exclusions interface {
+	ExcludedForStrict(ctx context.Context, prefix string) ([]string, error)
+}
+
+// SetExclusions installs the files Arc's reads leave out (#939 A0). Without
+// it the exporter publishes, during a DELETE rewrite or a compaction, a file
+// next to the one that replaced it, and external readers count its rows twice
+// while Arc's own queries count them once. nil excludes nothing.
+func (s *StorageWalkSource) SetExclusions(ex Exclusions) {
+	s.exclusions = ex
+}
+
+// SetManifestBarrier installs the shared-storage read barrier (#939 A2). In shared storage every
+// data object is registered in the replicated manifest, and the files Arc's reads leave out
+// (SetExclusions) come from this node's copy of it. A listed file that copy does not know is the
+// sign it lags a commit — a compaction whose output this listing already sees, say, while its
+// inputs are not yet left out. Then the source waits for the manifest to catch up (sync) and
+// lists once more. Only then: a barrier is a replicated log entry on a follower, so one per
+// measurement per pass would be thousands of entries per pass.
+func (s *StorageWalkSource) SetManifestBarrier(knows func(path string) bool, sync func(ctx context.Context) error) {
+	s.manifestKnows, s.manifestSync = knows, sync
 }
 
 // SetNamespaceExpander installs edge-sync spoke-namespace expansion (#634).
@@ -134,6 +174,29 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 	if !ok {
 		return nil, fmt.Errorf("storage backend does not support directory listing")
 	}
+	out, err := s.measurementsOn(ctx, dl)
+	if err != nil {
+		return nil, err
+	}
+	cold, err := s.coldMeasurements(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[Measurement]bool, len(out))
+	for _, m := range out {
+		seen[m] = true
+	}
+	for _, m := range cold {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+// measurementsOn enumerates the (database, measurement) directories of one backend.
+func (s *StorageWalkSource) measurementsOn(ctx context.Context, dl dirLister) ([]Measurement, error) {
 	dbs, err := dl.ListDirectories(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("list databases: %w", err)
@@ -237,19 +300,117 @@ func (s *StorageWalkSource) LocalFiles(ctx context.Context, m Measurement) ([]st
 
 const unusableSampleCap = 32
 
-// FilesAndLocal lists the measurement's Parquet files ONCE and returns both the iceberg-readable
-// URIs and the on-disk local paths, so the reconciler doesn't pay for two identical backend
-// List() calls per measurement per pass. The two slices are aligned only in the sense that every
+// FilesAndLocal lists the measurement's Parquet files and returns both the iceberg-readable
+// URIs and the on-disk local paths from that one listing, so the reconciler doesn't pay for two
+// identical backend List() calls per measurement per pass. It lists again only when files
+// changed under the listing (see listOnce). The two slices are aligned only in the sense that every
 // local path corresponds to a data file also present in `files`; local is empty when the backend
 // is non-local. Files() and LocalFiles() delegate here for callers that need just one view.
 func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
+	var prev []string
+	synced := false
+	for attempt := 1; ; attempt++ {
+		files, local, vanished, err := s.listOnce(ctx, m)
+		moved := errors.Is(err, errExclusionsMoved)
+		if moved {
+			err = nil
+		}
+		if err == nil && len(vanished) == 0 && !moved && !synced && s.manifestKnows != nil && s.unknownToManifest(files) {
+			// At most once per call: a file the manifest never learns of (an unmanaged
+			// object) must not turn every pass into a barrier per listing.
+			synced = true
+			if err := s.manifestSync(ctx); err != nil {
+				return nil, nil, fmt.Errorf("wait for the cluster manifest before exporting %s/%s: %w", m.Database, m.Measurement, err)
+			}
+			attempt--
+			continue
+		}
+		if err != nil || (len(vanished) == 0 && !moved) {
+			return files, local, err
+		}
+		// The same keys listed and missing twice running are not a removal
+		// racing the listing (that key leaves the next listing) but an entry
+		// that never resolves, such as a dangling symlink: it holds no rows.
+		if !moved && slices.Equal(vanished, prev) {
+			return files, local, nil
+		}
+		if attempt == vanishRetries {
+			return nil, nil, fmt.Errorf(
+				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass",
+				m.Database, m.Measurement, len(vanished), attempt)
+		}
+		prev = vanished
+		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("vanished", len(vanished)).
+			Msg("Iceberg reconcile: files removed while the measurement was listed; listing again")
+	}
+}
+
+// FileSchema derives one listed file's schema from its footer: from disk when
+// the file is local, otherwise from the tail of the object (SchemaFromBackend).
+func (s *StorageWalkSource) FileSchema(ctx context.Context, f FileRef) (ArcSchema, error) {
+	if f.Cold && s.cold != nil {
+		return s.coldSchema(ctx, f)
+	}
+	if f.LocalPath != "" {
+		return SchemaFromParquet(f.LocalPath)
+	}
+	return SchemaFromBackend(ctx, s.backend, f.Key, f.SizeBytes)
+}
+
+// objectLister is the backend's sized listing when the backend is an object
+// store; nil for local storage, which keeps its per-file stat (List plus
+// os.Stat is cheaper there than a walk that stats every file anyway).
+func (s *StorageWalkSource) objectLister() storage.ObjectLister {
+	if s.backend.Type() == "local" {
+		return nil
+	}
+	ol, _ := s.backend.(storage.ObjectLister)
+	return ol
+}
+
+// listSizes lists prefix with each object's size, keyed as List keys it.
+func listSizes(ctx context.Context, lister storage.ObjectLister, prefix string) (map[string]int64, error) {
+	objs, err := lister.ListObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(objs))
+	for _, o := range objs {
+		out[o.Path] = o.Size
+	}
+	return out, nil
+}
+
+// unknownToManifest reports whether any listed file is unknown to the replicated manifest.
+func (s *StorageWalkSource) unknownToManifest(files []FileRef) bool {
+	for _, f := range files {
+		if !s.manifestKnows(f.Key) {
+			return true
+		}
+	}
+	return false
+}
+
+// vanishRetries bounds FilesAndLocal's attempts at a stable listing.
+const vanishRetries = 3
+
+// errExclusionsMoved: a listed file started being left out of Arc's reads
+// while the listing ran, so the listing has no usable set and is taken again.
+var errExclusionsMoved = errors.New("files left out of reads changed during the listing")
+
+// listOnce is one listing of the measurement. vanished names, sorted, the
+// listed files that changed under it: gone by the time they were stat'ed, or
+// left out of Arc's reads only once the listing ran. Whatever did that (a
+// compaction, a DELETE rewrite, retention) may have put their rows in a file
+// this listing missed, so the set is not exported.
+func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files []FileRef, local []string, vanished []string, err error) {
 	prefix := m.Database + "/" + m.Measurement + "/"
 	if ul, ok := s.backend.(storage.UnusableLister); ok {
 		// Enumerate hidden files first: a hidden-to-usable rename between the
 		// two passes may cause a spurious refusal, but never a silent omission.
 		unusable, err := ul.ListUnusable(ctx, prefix)
 		if err != nil {
-			return nil, nil, fmt.Errorf("check hidden files for %s/%s: %w", m.Database, m.Measurement, err)
+			return nil, nil, nil, fmt.Errorf("check hidden files for %s/%s: %w", m.Database, m.Measurement, err)
 		}
 		var hiddenData []storage.UnusableObject
 		for _, obj := range unusable {
@@ -273,15 +434,47 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 				}
 				samples = append(samples, fmt.Sprintf("%s: %s", obj.Path, reason))
 			}
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"refusing Iceberg export for %s/%s: %d data file(s) are hidden from the normal storage listing, so publishing the table would be incomplete; rename the files, and the next reconcile pass will publish. Sample(s): %s",
 				m.Database, m.Measurement, len(hiddenData), strings.Join(samples, "; "),
 			)
 		}
 	}
-	paths, err := s.backend.List(ctx, prefix)
+	// The files Arc's reads leave out, read BEFORE the listing: each is left
+	// out only once the file holding its rows is in storage, so every
+	// replacement of a key read here is in the listing below. Read after it,
+	// a key whose replacement landed in between would drop that key's rows
+	// from this pass.
+	var leaveOut map[string]struct{}
+	if s.exclusions != nil {
+		keys, err := s.exclusions.ExcludedForStrict(ctx, prefix)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("files Arc's reads leave out under %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		leaveOut = make(map[string]struct{}, len(keys))
+		for _, k := range keys {
+			leaveOut[filepath.ToSlash(k)] = struct{}{}
+		}
+	}
+	// On an object store the listing carries each object's size, so no file is
+	// HEADed; a second listing below stands in for the per-file stat.
+	lister := s.objectLister()
+	var paths []string
+	var listedSize map[string]int64
+	if lister != nil {
+		listedSize, err = listSizes(ctx, lister, prefix)
+		if err == nil {
+			paths = make([]string, 0, len(listedSize))
+			for p := range listedSize {
+				paths = append(paths, p)
+			}
+			sort.Strings(paths)
+		}
+	} else {
+		paths, err = s.backend.List(ctx, prefix)
+	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
+		return nil, nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
 	}
 	// Read the compaction state AFTER the listing and BEFORE the stat loop.
 	// The order is what makes this race-free: a compaction deletes its
@@ -295,18 +488,66 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 	if s.pendingOutputs != nil {
 		pending, err = s.pendingOutputs(ctx, prefix)
 		if err != nil {
-			return nil, nil, fmt.Errorf("pending compaction outputs for %s/%s: %w", m.Database, m.Measurement, err)
+			return nil, nil, nil, fmt.Errorf("pending compaction outputs for %s/%s: %w", m.Database, m.Measurement, err)
 		}
 	}
-	var files []FileRef
-	var local []string
-	excluded, deleted := 0, 0
+	// A key that started being left out while this listing ran: its
+	// replacement may have landed after the listing, so leaving it out could
+	// drop its rows, and keeping it could count them twice.
+	if s.exclusions != nil {
+		after, err := s.exclusions.ExcludedForStrict(ctx, prefix)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("files Arc's reads leave out under %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		listed := make(map[string]struct{}, len(paths))
+		for _, p := range paths {
+			listed[filepath.ToSlash(p)] = struct{}{}
+		}
+		for _, k := range after {
+			k = filepath.ToSlash(k)
+			if _, before := leaveOut[k]; before {
+				continue
+			}
+			if _, ok := listed[k]; ok {
+				vanished = append(vanished, k)
+			}
+		}
+		if len(vanished) > 0 {
+			sort.Strings(vanished)
+			return nil, nil, vanished, errExclusionsMoved
+		}
+	}
+	if lister != nil {
+		// The object-store stat: a data object gone, or a different size, by
+		// this second listing changed under the first.
+		again, err := listSizes(ctx, lister, prefix)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		for _, p := range paths {
+			if !isDataFile(p) {
+				continue
+			}
+			if size, ok := again[p]; !ok || size != listedSize[p] {
+				vanished = append(vanished, p)
+			}
+		}
+		if len(vanished) > 0 {
+			sort.Strings(vanished)
+			return nil, nil, vanished, nil
+		}
+	}
+	excluded, deleted, replaced := 0, 0, 0
 	for _, p := range paths {
 		if !isDataFile(p) {
 			continue
 		}
 		if _, skip := pending[filepath.ToSlash(p)]; skip {
 			excluded++
+			continue
+		}
+		if _, skip := leaveOut[filepath.ToSlash(p)]; skip {
+			replaced++
 			continue
 		}
 		if s.deletedHere != nil && s.deletedHere(filepath.ToSlash(p)) {
@@ -318,22 +559,25 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 			// The listing produced a key this backend would itself refuse.
 			// Fail rather than skip: a skipped file is missing from the
 			// exported table with no other signal.
-			return nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", p, err)
+			return nil, nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", p, err)
 		}
 		lp := s.resolver.LocalPath(p)
-		size, present, err := s.statSize(ctx, p, lp)
-		if err != nil {
-			return nil, nil, fmt.Errorf("stat listed file %q: %w", p, err)
+		size, present := listedSize[p], true
+		if lister == nil {
+			size, present, err = s.statSize(ctx, p, lp)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("stat listed file %q: %w", p, err)
+			}
 		}
 		if !present {
 			// Removed between the listing and the stat (retention, compaction, the
-			// delete API). It is not on storage, so it is not in this pass's set;
-			// leaving it out of BOTH slices keeps the schema derivation from
-			// opening a path that no longer exists. The next pass converges.
-			s.logger.Debug().Str("file", p).Msg("Iceberg reconcile: file vanished after listing; skipping it this pass")
+			// delete API). Its rows may now sit in a file this listing predates, so
+			// the caller lists again rather than export a set missing them.
+			s.logger.Debug().Str("file", p).Msg("Iceberg reconcile: file vanished after listing")
+			vanished = append(vanished, filepath.ToSlash(p))
 			continue
 		}
-		files = append(files, FileRef{PhysicalPath: uri, SizeBytes: size})
+		files = append(files, FileRef{PhysicalPath: uri, SizeBytes: size, Key: filepath.ToSlash(p), LocalPath: lp})
 		if lp != "" {
 			local = append(local, lp)
 		}
@@ -346,7 +590,26 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("deleted", deleted).
 			Msg("Iceberg reconcile: files the cluster deleted, still on this node's disk, are left out of this pass")
 	}
-	return files, local, nil
+	if replaced > 0 {
+		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("replaced", replaced).
+			Msg("Iceberg reconcile: files Arc's reads leave out (replaced by a compaction or DELETE) are left out of this pass")
+	}
+	sort.Strings(vanished)
+	if s.cold != nil {
+		skip := func(key string) bool {
+			if _, ok := pending[key]; ok {
+				return true
+			}
+			if _, ok := leaveOut[key]; ok {
+				return true
+			}
+			return s.deletedHere != nil && s.deletedHere(key)
+		}
+		if files, local, err = s.mergeCold(ctx, prefix, files, local, skip); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return files, local, vanished, nil
 }
 
 // statSize returns the file's current byte size, which the reconciler needs
@@ -354,9 +617,10 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 // partial-match branch publishes a fresh path instead, but restores and
 // edge-sync still write a known path, and only the size tells that
 // content apart from what the Iceberg manifest describes.
-// present=false means the file is gone. Local files are stat'ed directly; any
-// other backend answers through StatFile (Iceberg export is local-only, so
-// that branch only serves wrapped backends in tests).
+// present=false means the file is gone. Local files are stat'ed directly; a
+// backend that is not an object store (objectLister) but has no local path
+// answers through StatFile. Object stores never get here: their size comes
+// from the listing.
 func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string) (size int64, present bool, err error) {
 	if localPath != "" {
 		st, err := os.Stat(localPath)
@@ -387,9 +651,9 @@ const compactionStateDir = "_compaction_state"
 // exported; vortex is a separate (shelved) format and Iceberg's data files are Parquet.
 func isDataFile(p string) bool {
 	// filepath.Base (not path.Base): storage keys from a local backend on Windows are
-	// backslash-separated (LocalBackend.List uses filepath.Rel without ToSlash), and Iceberg
-	// export is local-only. filepath.Base handles both separators; path.Base would treat a
-	// backslash key as one component.
+	// backslash-separated (LocalBackend.List uses filepath.Rel without ToSlash). filepath.Base
+	// handles both separators; path.Base would treat a backslash key as one component. An
+	// object-store key never holds a backslash (the backends refuse one), so it is unaffected.
 	base := filepath.Base(p)
 	// Skip dotfiles. This covers Arc's in-flight ".tmp.*" writes (a separate ".tmp." check would
 	// be redundant — it already starts with "."), so a partially-written file is never registered.

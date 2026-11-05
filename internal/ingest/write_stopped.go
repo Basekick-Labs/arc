@@ -56,12 +56,14 @@ func AsWriteStopped(err error) (*WriteStoppedError, bool) {
 }
 
 // isContentRefusal reports an error the buffer raises for a measurement's
-// content before its WAL append: a string/binary column change (#440) or a
-// column name that cannot be stored (#1342). Only that measurement is
+// content before its WAL append: a string/binary column change (#440), a
+// column name that cannot be stored (#1342), or a column value that cannot
+// be converted to its column's type (#1424). Only that measurement is
 // refused; nothing of it reached the WAL, so the rest of a request can be
 // written and the measurement reported as dropped.
 func isContentRefusal(err error) bool {
-	return errors.Is(err, ErrColumnTypeChange) || errors.Is(err, ErrUnstorableColumnName)
+	return errors.Is(err, ErrColumnTypeChange) || errors.Is(err, ErrUnstorableColumnName) ||
+		errors.Is(err, ErrUnstorableColumnValue)
 }
 
 // IsContentRefusal is isContentRefusal for the write handlers.

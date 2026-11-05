@@ -1,16 +1,22 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	iceberg "github.com/apache/iceberg-go"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // SchemaFromParquet derives an ArcSchema (typed Iceberg columns) by reading a Parquet file's
@@ -34,20 +40,124 @@ func SchemaFromParquet(localPath string) (ArcSchema, error) {
 		return ArcSchema{}, fmt.Errorf("open parquet %q: %w", localPath, err)
 	}
 	defer f.Close()
+	return schemaFromReader(f, localPath)
+}
 
+// footerWindow is how much of a remote file's tail SchemaFromBackend reads
+// first: Arc's footers are a few KiB, so one read normally holds the whole
+// footer; a larger one costs a second read.
+var footerWindow int64 = 64 << 10
+
+// SchemaFromBackend derives a remote Parquet file's schema from its footer,
+// reading only the file's tail through the backend (a ranged GET from the
+// footer to the end of the object, ReadToAt), never the whole object. size
+// is the file's size from the listing; a tail that does not match it (the
+// file was replaced or truncated since) is an error, not a guess.
+func SchemaFromBackend(ctx context.Context, backend storage.Backend, key string, size int64) (ArcSchema, error) {
+	if size < parquetTrailerLen+int64(len(parquetMagic)) {
+		return ArcSchema{}, fmt.Errorf("parquet %q: %d bytes is too small for a Parquet file", key, size)
+	}
+	off := size - footerWindow
+	if off < 0 {
+		off = 0
+	}
+	tail, err := readTail(ctx, backend, key, size, off)
+	if err != nil {
+		return ArcSchema{}, err
+	}
+	trailer := tail[len(tail)-parquetTrailerLen:]
+	if string(trailer[4:]) != parquetMagic {
+		return ArcSchema{}, fmt.Errorf("parquet %q: no Parquet magic at the end of the file", key)
+	}
+	need := int64(binary.LittleEndian.Uint32(trailer[:4])) + parquetTrailerLen
+	if need > size-int64(len(parquetMagic)) {
+		return ArcSchema{}, fmt.Errorf("parquet %q: footer length %d does not fit a %d-byte file", key, need-parquetTrailerLen, size)
+	}
+	if need > int64(len(tail)) {
+		off = size - need
+		if tail, err = readTail(ctx, backend, key, size, off); err != nil {
+			return ArcSchema{}, err
+		}
+	}
+	return schemaFromReader(&tailReader{base: off, data: tail, size: size}, key)
+}
+
+const (
+	parquetMagic      = "PAR1"
+	parquetTrailerLen = 8 // footer length (uint32 LE) + magic
+)
+
+// readTail reads key from off to its end and checks the result ends where
+// the listing said the file does.
+func readTail(ctx context.Context, backend storage.Backend, key string, size, off int64) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Grow(int(size - off))
+	if err := backend.ReadToAt(ctx, key, &buf, off); err != nil {
+		return nil, fmt.Errorf("read footer of %q: %w", key, err)
+	}
+	if got := int64(buf.Len()); got != size-off {
+		return nil, fmt.Errorf("read footer of %q: read %d bytes from offset %d, want %d (the file changed since it was listed)", key, got, off, size-off)
+	}
+	return buf.Bytes(), nil
+}
+
+// tailReader serves reads within a file's tail [base, size) for the Parquet
+// footer parser; a read before base is an error (the parser asked for more
+// than the footer, which a schema read never needs).
+type tailReader struct {
+	base int64
+	data []byte
+	size int64
+	pos  int64
+}
+
+func (r *tailReader) ReadAt(p []byte, off int64) (int, error) {
+	if off < r.base {
+		return 0, fmt.Errorf("parquet footer read at offset %d, before the %d bytes read from the tail", off, r.base)
+	}
+	if off >= r.size {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[off-r.base:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (r *tailReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+	case io.SeekCurrent:
+		offset += r.pos
+	case io.SeekEnd:
+		offset += r.size
+	default:
+		return 0, fmt.Errorf("tailReader: bad whence %d", whence)
+	}
+	if offset < 0 {
+		return 0, fmt.Errorf("tailReader: negative position %d", offset)
+	}
+	r.pos = offset
+	return offset, nil
+}
+
+// schemaFromReader derives the ArcSchema from a Parquet file's footer. name
+// labels errors.
+func schemaFromReader(f parquet.ReaderAtSeeker, name string) (ArcSchema, error) {
 	rdr, err := file.NewParquetReader(f)
 	if err != nil {
-		return ArcSchema{}, fmt.Errorf("parquet reader %q: %w", localPath, err)
+		return ArcSchema{}, fmt.Errorf("parquet reader %q: %w", name, err)
 	}
 	defer rdr.Close()
 
 	fr, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
 	if err != nil {
-		return ArcSchema{}, fmt.Errorf("pqarrow reader %q: %w", localPath, err)
+		return ArcSchema{}, fmt.Errorf("pqarrow reader %q: %w", name, err)
 	}
 	arrowSchema, err := fr.Schema()
 	if err != nil {
-		return ArcSchema{}, fmt.Errorf("arrow schema %q: %w", localPath, err)
+		return ArcSchema{}, fmt.Errorf("arrow schema %q: %w", name, err)
 	}
 
 	fields := make([]ArcField, 0, len(arrowSchema.Fields()))

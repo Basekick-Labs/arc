@@ -467,6 +467,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// A column qualified by the measurement's name means that column (#1451).
+	// Rewritten before validation, so what is validated is what runs.
+	req.Where = unqualifyMeasurement(req.Where, req.Measurement)
+
 	// Validate WHERE clause
 	isFullTableDelete, err := h.validateWhereClause(req.Where)
 	if err != nil {
@@ -510,6 +514,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// The time range the scans read only the files of (delete_window.go):
 	// from the WHERE as written, with now() pinned as the record pins it.
 	scan := scanOpts{wait: !req.DryRun, allowUnreachable: req.AllowUnreachable, windowWhere: req.Where}
+	if req.AllowUnreachable {
+		// Shared by every wait of this request (#1426).
+		scan.track = newMissingTracker(h.coordinator)
+	}
 	if !req.DryRun {
 		if rec = recorderOf(h.coordinator); rec != nil {
 			scan.windowNow = deleteNow().UTC()
@@ -529,7 +537,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// a file it lists that is not here yet (a compaction output on its way)
 	// is waited for.
 	if rec != nil {
-		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow())); err != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow()), scan.track); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
 	}
@@ -675,7 +683,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete not run: recording it in the cluster failed or could not be confirmed (" + err.Error() + "); it may already apply to rows replayed later; retry to run it"})
 		}
 		h.recordID = id
-		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow())); err != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow()), scan.track); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
 		affected, unlisted, err = h.findAffectedFiles(ctx, req.Database, req.Measurement, where, scan)

@@ -49,6 +49,9 @@ type deleteColdTier interface {
 	ColdFilesForMeasurement(ctx context.Context, database, measurement string) ([]tiering.FileMetadata, error)
 	RetireColdRows(ctx context.Context, paths []string) (int, error)
 	RevertColdRowToHot(ctx context.Context, path string) error
+	// NotifyColdFilesRemoved tells tiering's listeners (query caches, the Iceberg export's
+	// cold listing, #939) that cold objects are gone.
+	NotifyColdFilesRemoved(n int)
 }
 
 // coldFile is one cold object a DELETE counted.
@@ -454,6 +457,9 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			h.logger.Warn().Err(err).Int("removed", n).Int("rows", len(retire)).
 				Msg("Failed to retire cold tier rows; the next DELETE or retention run retires them")
 		}
+	}
+	if len(c.deleted) > 0 {
+		h.coldTier.NotifyColdFilesRemoved(len(c.deleted))
 	}
 }
 
