@@ -600,6 +600,11 @@ jobs:
           # Reload systemd
           if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload
+            # On an upgrade ($2 = the old version) restart a running service so
+            # the new binary takes over; prerm no longer stops it on upgrade.
+            if [ "$1" = configure ] && [ -n "${2:-}" ]; then
+              systemctl try-restart arc.service || true
+            fi
             echo ""
             echo "Arc installed successfully!"
             echo "  Start:  sudo systemctl start arc"
@@ -610,13 +615,20 @@ jobs:
           chmod +x ${PKG_DIR}/DEBIAN/postinst
 
           # Create prerm script
+          # Stop and disable only on removal. On an upgrade this used to
+          # disable the service too, so it stayed down after every upgrade;
+          # postinst now restarts it instead.
           cat > ${PKG_DIR}/DEBIAN/prerm << 'PRERM'
           #!/bin/bash
           set -e
-          if command -v systemctl >/dev/null 2>&1; then
-            systemctl stop arc.service || true
-            systemctl disable arc.service || true
-          fi
+          case "$1" in
+            remove|deconfigure)
+              if command -v systemctl >/dev/null 2>&1; then
+                systemctl stop arc.service || true
+                systemctl disable arc.service || true
+              fi
+              ;;
+          esac
           PRERM
           chmod +x ${PKG_DIR}/DEBIAN/prerm
 
@@ -643,23 +655,36 @@ jobs:
           sudo mkdir -p /etc/systemd/system/arc.service.d
           printf '[Service]\nEnvironment="ARC_TELEMETRY_ENABLED=false"\n' | sudo tee /etc/systemd/system/arc.service.d/ci.conf
           sudo systemctl daemon-reload
-          sudo systemctl start arc
-          for _ in $(seq 1 30); do
-            if curl -sf http://localhost:8000/health; then
-              echo ""
-              # The backup directory must be the unit's, outside the storage root.
-              sudo test -d /var/lib/arc/backups
-              sudo test ! -e /var/lib/arc/data/backups
-              echo "deb package smoke test passed"
-              sudo systemctl stop arc
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "deb package smoke test FAILED"
-          systemctl status arc --no-pager || true
-          sudo journalctl -u arc --no-pager -n 200 || true
-          exit 1
+          sudo systemctl enable --now arc
+
+          wait_healthy() {
+            for _ in $(seq 1 30); do
+              curl -sf http://localhost:8000/health && echo "" && return 0
+              sleep 2
+            done
+            return 1
+          }
+          fail() {
+            echo "deb package smoke test FAILED: $1"
+            systemctl status arc --no-pager || true
+            sudo journalctl -u arc --no-pager -n 200 || true
+            exit 1
+          }
+
+          wait_healthy || fail "no /health on a fresh install"
+          # The backup directory must be the unit's, outside the storage root.
+          sudo test -d /var/lib/arc/backups || fail "/var/lib/arc/backups was not created"
+          sudo test ! -e /var/lib/arc/data/backups || fail "a backup directory exists inside the storage root"
+
+          # Reinstall over itself: dpkg runs prerm "upgrade" and postinst
+          # "configure <old version>", the upgrade path. The service must come
+          # back enabled and healthy, not stopped and disabled.
+          sudo dpkg -i "${DEB}"
+          systemctl is-enabled arc || fail "upgrade left the service disabled"
+          wait_healthy || fail "no /health after an upgrade"
+
+          echo "deb package smoke test passed"
+          sudo systemctl stop arc
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v6
@@ -796,8 +821,18 @@ jobs:
           echo "  Logs:   sudo journalctl -u arc -f"
 
           %preun
-          systemctl stop arc.service || true
-          systemctl disable arc.service || true
+          # \$1 is 0 on erase, 1 on upgrade: stop and disable only on erase,
+          # or every upgrade leaves the service disabled.
+          if [ \$1 -eq 0 ]; then
+            systemctl stop arc.service || true
+            systemctl disable arc.service || true
+          fi
+
+          %postun
+          # On upgrade, restart a running service so the new binary takes over.
+          if [ \$1 -ge 1 ]; then
+            systemctl try-restart arc.service || true
+          fi
 
           %changelog
           * $(date "+%a %b %d %Y") Basekick Labs <contact@basekick.com> - ${VERSION}-1
@@ -986,7 +1021,11 @@ jobs:
             UNIT_USER=$(sed -n 's/^User=//p' "${UNIT}")
             UNIT_WD=$(sed -n 's/^WorkingDirectory=//p' "${UNIT}")
             mapfile -t UNIT_ENV < <(sed -n 's/^Environment="\(.*\)"$/\1/p' "${UNIT}")
-            test -n "${UNIT_USER}" && test -n "${UNIT_WD}" && test "${#UNIT_ENV[@]}" -gt 0
+            # Separate lines: a failing non-final element of an && list does
+            # not trip set -e.
+            test -n "${UNIT_USER}"
+            test -n "${UNIT_WD}"
+            test "${#UNIT_ENV[@]}" -gt 0
             cd "${UNIT_WD}"
             runuser -u "${UNIT_USER}" -- env ARC_TELEMETRY_ENABLED=false "${UNIT_ENV[@]}" \
               /usr/bin/arc > /tmp/arc-boot.log 2>&1 &
@@ -994,6 +1033,9 @@ jobs:
             for i in $(seq 1 20); do
               if curl -sf http://localhost:8000/health; then
                 echo ""
+                # The backup directory must be the unit's, outside the storage root.
+                test -d /var/lib/arc/backups
+                test ! -e /var/lib/arc/data/backups
                 echo "arch package smoke test passed"
                 kill ${ARC_PID} || true
                 exit 0

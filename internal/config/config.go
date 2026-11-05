@@ -1718,11 +1718,11 @@ func Load() (*Config, error) {
 
 	// The packaged layout's two silent consequences (#1463): the unit's
 	// ARC_BACKUP_LOCAL_PATH overriding an edited arc.toml, and backups an
-	// earlier release left inside the storage root.
+	// earlier release left where this boot no longer looks.
 	if w := backupLocalPathOverrideWarning(v, cfg); w != nil {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
-	if w := legacyBackupsInStorageRootWarning(cfg); w != nil {
+	if w := legacyBackupsWarning(v, cfg); w != nil {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 

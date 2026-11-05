@@ -522,8 +522,9 @@ include_reads = false           # Log GET/query requests (high volume)
 # is a parent of "./data/backups" resolved from /var/lib/arc, so the unit also
 # sets ARC_BACKUP_LOCAL_PATH=/var/lib/arc/backups (#1463). That environment
 # variable overrides the value here; to change the backup directory on a
-# packaged install, override it with `systemctl edit arc`. An empty local_path with no target is refused too, where it used
-# to boot with the backup API quietly skipped.
+# packaged install, override it with `systemctl edit arc`. An empty local_path
+# with no target is refused too, where it used to boot with the backup API
+# quietly skipped.
 enabled = true
 local_path = "./data/backups"           # Directory for local backups; see the refusal note above
 # How long one backup or one restore may run before its context is cancelled.

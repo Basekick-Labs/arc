@@ -560,8 +560,11 @@ or Arch upgrade keeps an existing `/etc/arc/arc.toml`. The same environment
 variable also beats the file:
 
 - **If you changed `backup.local_path` in `/etc/arc/arc.toml`,** the unit now
-  overrides it, and Arc logs a warning at startup naming both paths. Keep your
-  directory with a drop-in:
+  overrides it. On rpm and Arch, which keep your `arc.toml` across upgrades,
+  Arc logs a warning at startup naming both paths. The .deb has always
+  replaced `/etc/arc/arc.toml` on upgrade, so a deb install has already lost
+  that edit and gets no warning. Either way, keep your directory with a
+  drop-in:
 
   ```
   sudo systemctl edit arc
@@ -574,39 +577,48 @@ variable also beats the file:
   packaged installs.)
 
 - **Backups taken by an earlier release are still in
-  `/var/lib/arc/data/backups`.** Arc logs a warning at startup when it finds
-  them. Where they are, they are inside the storage root, so:
-  - the backup API does not list them;
-  - the next backup copies them as data;
+  `/var/lib/arc/data/backups`**, whatever the primary storage backend: an
+  install with S3, Azure or GCS primary storage started before this fix and
+  wrote its backups there. Arc logs a warning at startup when it finds them.
+  The backup API does not list them until they are moved. With local primary
+  storage they are also inside the storage root, so:
+  - the next backup copies their data files as data;
   - on a cluster with reconciliation enabled and `manifest_only_dry_run` off,
-    the sweep deletes them.
+    the sweep deletes their data files, leaving backups that look complete and
+    cannot be restored;
+  - each of them already holds a copy of the ones taken before it.
 
-  Each of them also holds a copy of the ones taken before it, for the same
-  reason. Move them before starting 27.01.1. The loop moves only directories
-  that contain a `manifest.json`, so a database named `backups` stays where it
-  is:
+  Move them before starting 27.01.1. The loop moves only directories that
+  contain a `manifest.json`, so a database named `backups` stays where it is:
 
   ```
   sudo systemctl stop arc
   sudo mkdir -p /var/lib/arc/backups
   sudo sh -c 'for d in /var/lib/arc/data/backups/*/; do
-    [ -f "$d/manifest.json" ] && mv "$d" /var/lib/arc/backups/
+    if [ -f "$d/manifest.json" ]; then mv "$d" /var/lib/arc/backups/; fi
   done'
-  sudo rmdir /var/lib/arc/data/backups   # fails, harmlessly, if a database named backups is there
+  # Fails, harmlessly, if anything is left: a database named backups, or a
+  # partial backup with no manifest.json. Inspect what is left before deleting it.
+  sudo rmdir /var/lib/arc/data/backups
   sudo chown -R arc:arc /var/lib/arc/backups
   sudo chmod 700 /var/lib/arc/backups
   ```
 
-  Restoring one of these older backups with `restore_data` writes its
-  `backups/...` files back into the storage root, and the startup warning
-  will then appear again.
+  With local primary storage, restoring one of these older backups with
+  `restore_data` writes the data files of the backups nested in it back to
+  `/var/lib/arc/data/backups/<id>/data/...`, without their `manifest.json`.
+  Arc does not warn about those; delete them by hand.
 
-- **Re-enable the service after upgrading from 26.09.x.** The 26.09 package's
-  remove script stops and disables `arc.service` during an upgrade, and that
-  script comes from the old package, so this release cannot change it. Run
-  `sudo systemctl enable --now arc` after the upgrade.
+- **After upgrading a .deb or .rpm from 26.09.x, re-enable the service.** The
+  26.09 package's remove script stops and disables `arc.service` on every
+  upgrade, and on an upgrade that script comes from the old package. Run
+  `sudo systemctl enable --now arc` after the upgrade. From this release on,
+  the deb and rpm scripts stop and disable the service only on removal, and
+  an upgrade restarts a running service with the new binary. Arch upgrades
+  never stopped the service and still do not restart it.
 
-The release pipeline now installs the .deb and starts it under systemd, and
+The release pipeline now installs the .deb, starts it under systemd and
+reinstalls it over itself to check the service survives an upgrade, and it
 boots the Arch package with its unit's user, working directory and environment.
 Before, every boot test ran the binary from a directory of its own choosing,
 and none of them saw the packaged layout. The three packages now share one unit
