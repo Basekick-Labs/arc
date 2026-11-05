@@ -365,11 +365,11 @@ max_sql_length = 200000
   34 s. Both now take under 0.6 s. Validation and rewriting are linear in
   the query's length (since [#1479](https://github.com/Basekick-Labs/arc/issues/1479)),
   but their cost depends on the query's shape. At the 1 MiB ceiling one
-  request costs about 1.4 s of CPU for a JOIN chain, and up to about 21 s for
-  a comma join of many short references (`FROM x,x,x…`), most of it in
-  passes over the rewritten SQL
-  ([#1482](https://github.com/Basekick-Labs/arc/issues/1482) tracks that
-  shape). At the 10 KB default, about 0.2 s at worst.
+  request costs about 1.7 s of CPU for a JOIN chain, and up to about 4.1 s
+  for a comma join of many short references (`FROM x,x,x…`; see
+  [#1482](https://github.com/Basekick-Labs/arc/issues/1482)). At the 10 KB
+  default, about 0.2 s at worst. `query.timeout` covers that preparation
+  too.
 - Queries longer than 10,000 characters are not kept in the SQL transform
   cache, so a raised limit leaves the cache's memory bound unchanged.
 
@@ -844,6 +844,76 @@ an operand glued to the keyword (`IS DISTINCT FROM'a'`, `'a'IS DISTINCT FROM
 x`), and a non-ASCII space between the words. Put an ASCII space there.
 
 The workaround for earlier releases is `(x != 'a' OR x IS NULL)`.
+
+## Fix: a long comma join is prepared without rescanning its own rewrite ([#1482](https://github.com/Basekick-Labs/arc/issues/1482))
+
+Before running a query, Arc rewrites each table reference into a read of its
+files, in several passes. The comma-join pass ran first, and its output is
+about 30 times as long as the references it replaced, so every later pass
+scanned tens of MB for a 1 MiB query. Each pass now leaves a one-byte marker
+and the reads are put in once at the end, so every pass scans text about as
+long as the query. A whole request at the 1 MiB `query.max_sql_length`
+ceiling, before and after, measured the same way (in-process, one
+machine; earlier figures for these shapes came from a different setup):
+
+| Query (1 MiB) | Before | After |
+|---|---|---|
+| Comma join, `SELECT 1 FROM x,x,x,…` | 14.3 s | 4.1 s |
+| Comma join, `SELECT 1 FROM x, x, x, …` | 9.8 s | 2.9 s |
+| `SELECT 1 FROM x from x from …` | 3.4 s | 2.3 s |
+| `JOIN x USING (a)` repeated | 1.7 s | 1.7 s |
+
+The rest is validation and DuckDB's own parse. At the 10 KB default the worst
+shape goes from 0.31 s to 0.20 s.
+
+- `query.timeout` (or a governance policy's maximum duration) now bounds the
+  whole request, preparing the query included. Before, preparation ran
+  outside it and could not be stopped. A request whose deadline passes while
+  its query is prepared is answered `504 Query timed out`, as one that times
+  out while running is, on every query endpoint (JSON, MessagePack, Arrow,
+  the row estimate and `GET /api/v1/query/{measurement}`).
+- A query containing a NUL byte is refused with 400, on every query
+  endpoint. DuckDB stops reading a statement at the first NUL, in a string
+  literal or anywhere else, so such a query used to run cut short at that
+  byte: a different query from the one Arc validated. Continuous query
+  definitions are checked too, at creation and at every run, so a stored
+  definition containing a NUL now fails instead of running cut short.
+- A storage path that contains `from` or `join` followed by a word is no
+  longer rewritten inside the read Arc emits for it.
+
+## Fix: joins of two measurements bind unqualified columns ([#1483](https://github.com/Basekick-Labs/arc/issues/1483))
+
+A join of two measurements failed with `Binder Error: Ambiguous reference to
+table "read_parquet"` whenever DuckDB had to resolve an unqualified column or
+`*` across them, with or without an `x-arc-database` header:
+
+```sql
+SELECT count(*) FROM cpu JOIN mem USING (time, host) WHERE host = 'a';
+SELECT * FROM cpu JOIN mem ON cpu.host = mem.host;
+SELECT * FROM cpu, mem;
+```
+
+DuckDB names every unaliased file read `read_parquet`, so the two sides had
+the same name. Arc gave a table its own name only when the query qualified a
+column with it (`cpu.host`, since
+[#1447](https://github.com/Basekick-Labs/arc/issues/1447)). Now, when one
+FROM clause reads two or more measurements, each is named after itself,
+unless:
+
+- you gave it an alias, which it keeps;
+- the query already uses that name for something else: a CTE, another
+  relation, a column, a SELECT-list alias (`SELECT x AS mem … GROUP BY mem`),
+  or an outer query's column. DuckDB would bind the name to the table first,
+  so that measurement keeps its old naming. If the join is then still
+  ambiguous, give it an alias.
+
+Queries reading one measurement per FROM clause, including those with
+subqueries over another, are rewritten exactly as before.
+
+Joining a measurement to itself, or to the measurement of the same name in
+another database, still needs an alias on at least one side
+(`FROM cpu a JOIN plant.cpu b USING (time)`): both sides have the same name
+either way.
 
 ## Fix: a query naming many tables no longer takes quadratic time to prepare ([#1479](https://github.com/Basekick-Labs/arc/issues/1479))
 

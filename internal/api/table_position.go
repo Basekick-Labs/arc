@@ -244,7 +244,7 @@ func identRunLen(s string) int {
 // handed to fn starts at the comma, so a replacement must re-emit the
 // separator — the rewriters pass "," as the clause keyword to
 // buildReadParquetExpr for exactly that. One scan, one rebuild: like
-// replaceTableRefs, this never rescans a string it has already changed.
+// deferredRefs.replace, this never rescans a string it has already changed.
 func rewriteCommaJoinRefs(sql string, fn func(ref commaJoinRef) (string, bool)) string {
 	refs := findCommaJoinRefs(sql)
 	if len(refs) == 0 {
