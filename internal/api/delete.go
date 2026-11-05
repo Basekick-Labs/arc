@@ -958,7 +958,9 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// <where>`, so a reader in a scalar expression (`1=1 OR
 	// list_contains(glob('/data/**'), 'x')`, GHSA-wmjj-g8xc-6hwr) or under
 	// `EXISTS (FROM name(...))` runs with no SELECT of its own and turns the
-	// row count into a cross-tenant oracle. These are the SAME patterns as
+	// row count into a cross-tenant oracle; DELETE is admin-gated, but an
+	// admin token is not meant to be a filesystem read primitive. These are
+	// the SAME patterns as
 	// ValidateSQLRequest: this path kept its own copy, which missed every
 	// reader added after it was written and never checked dynamic SQL
 	// (GHSA-r7vm-9hcg-xgf7). Matched against the identifier-quote-stripped
@@ -984,6 +986,9 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	}
 	if name := sideEffectFunction(ioCheck); name != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden function: %s", name)
+	}
+	if name := queryTableMacroInTablePosition(maskedWhere, sqlutil.IdentifierNames(masks)); name != "" {
+		return false, fmt.Errorf("WHERE clause contains forbidden table function: %s()", name)
 	}
 
 	// SECURITY: reject a path literal standing in table position inside the

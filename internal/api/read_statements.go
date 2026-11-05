@@ -196,8 +196,8 @@ func hasNestedBlockComment(masked string) bool {
 // profiling and the parser choice, which persist on the pooled connection
 // (enable_profiling's save_location wrote the NEXT request's query to a file
 // the caller named inside the storage root, GHSA-r7vm-9hcg-xgf7); and the
-// views of engine-wide state that name other tenants' files or other
-// connections' statements. Enumerated from duckdb_functions() of the linked
+// views of engine state that name other tenants' files (the external file
+// cache, temporary files) or a pooled connection's PREPAREd statements. Enumerated from duckdb_functions() of the linked
 // DuckDB; TestSideEffectFunctionPattern_Family and
 // TestCoreTableFunctionsReviewed pin the list. The log views are also
 // matched as bare names: `FROM duckdb_logs` needs no parentheses.
@@ -209,7 +209,7 @@ var sideEffectFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]st
 	"duckdb_settings", "duckdb_profiling_settings", "current_setting", "duckdb_variables", "getvariable",
 	"enable_profiling", "disable_profiling", "enable_peg_parser", "disable_peg_parser",
 	"duckdb_external_file_cache", "duckdb_temporary_files", "duckdb_prepared_statements",
-}, "|") + `)\s*\(|\b(duckdb_logs|duckdb_logs_parsed|duckdb_log_contexts|pg_settings)\b`)
+}, "|") + `)\s*\(|\b(duckdb_logs|duckdb_logs_parsed|duckdb_log_contexts|pg_settings|pg_prepared_statements)\b`)
 
 // sideEffectFunction returns the side-effect function or log view named in
 // the identifier-unquoted, literal-masked SQL, or "".

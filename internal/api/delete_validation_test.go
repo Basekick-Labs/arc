@@ -188,13 +188,16 @@ func TestValidateWhereClauseRefusesQueryDeniedFunctions(t *testing.T) {
 		"time > 0 AND EXISTS (FROM enable_profiling(format := 'json', save_location := '/x.json'))",
 		"time > 0 AND EXISTS (FROM \"PARQUET_FULL_METADATA\"('/x'))",
 		"time > 0 AND EXISTS (FROM duckdb_external_file_cache())",
+		"time > 0 AND EXISTS (FROM histogram_values('/x', v) WHERE bin = 'S')",
+		"time > 0 AND EXISTS (FROM histogram('/x', v))",
+		"time > 0 AND json_serialize_plan('SELECT * FROM read_parquet(''/x'')') IS NOT NULL",
 	} {
 		if _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause accepted %q", where)
 		}
 	}
 	// A column that shares a refused function's name is still a column.
-	if _, err := h.validateWhereClause("enable_profiling = 1 AND query > 0"); err != nil {
+	if _, err := h.validateWhereClause("enable_profiling = 1 AND query > 0 AND histogram > 0"); err != nil {
 		t.Errorf("validateWhereClause refused plain columns: %v", err)
 	}
 }

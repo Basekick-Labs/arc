@@ -1345,9 +1345,42 @@ func TestValidateSQLRequest_GHSAr7vmPayloads(t *testing.T) {
 			t.Errorf("ValidateSQLRequest accepted %q", sql)
 		}
 	}
-	// Columns that share those names are still columns.
-	if err := ValidateSQLRequest("SELECT enable_profiling, read_duckdb FROM cpu"); err != nil {
-		t.Errorf("ValidateSQLRequest refused plain columns: %v", err)
+	// Found while fixing it: a table macro over query_table, and a scalar
+	// that binds the SQL it is given.
+	const p = "'./data/arc/db2/m2/*.parquet'"
+	for _, sql := range []string{
+		"SELECT * FROM histogram_values(" + p + ", secret)",
+		"SELECT * FROM histogram(" + p + ", secret)",
+		"FROM histogram(" + p + ", secret)",
+		"SELECT * FROM main.histogram(" + p + ", secret)",
+		`SELECT * FROM "HISTOGRAM"(` + p + ", secret)",
+		"SELECT * FROM cpu, histogram(" + p + ", secret)",
+		"SELECT * FROM cpu, LATERAL histogram(" + p + ", secret)",
+		"SELECT * FROM cpu JOIN histogram(" + p + ", secret) h ON true",
+		"SELECT * FROM cpu \"where\", histogram(" + p + ", secret)",
+		"SELECT (SELECT bin FROM histogram (" + p + ", secret) LIMIT 1)",
+		"SELECT * FROM histogram\u00a0(" + p + ", secret)",
+		"SELECT json_serialize_plan('SELECT * FROM read_parquet(''./data/arc/**/*.parquet'')')",
+		"SELECT * FROM pg_prepared_statements",
+		"SELECT * FROM sql_auto_complete('SELECT * FROM ''./data/')",
+	} {
+		if err := ValidateSQLRequest(sql); err == nil {
+			t.Errorf("ValidateSQLRequest accepted %q", sql)
+		}
+	}
+	// Columns that share those names are still columns, the histogram
+	// aggregate is still an aggregate, and a measurement may be called
+	// histogram.
+	for _, sql := range []string{
+		"SELECT enable_profiling, read_duckdb FROM cpu",
+		"SELECT histogram(usage) FROM cpu",
+		"SELECT histogram(usage, [10, 50, 90]) FROM cpu GROUP BY host",
+		"SELECT * FROM histogram",
+		"SELECT * FROM cpu, histogram WHERE cpu.time = histogram.time",
+	} {
+		if err := ValidateSQLRequest(sql); err != nil {
+			t.Errorf("ValidateSQLRequest refused %q: %v", sql, err)
+		}
 	}
 }
 
