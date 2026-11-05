@@ -1339,6 +1339,14 @@ type ArrowBuffer struct {
 	nextFlushID         atomic.Uint64
 	memoryLimitBytes    uint64
 	bufferMemoryWarning atomic.Bool
+	// Buffered-bytes limit (#1468, buffer_full.go): maxBufferedBytes is
+	// ingest.max_buffered_bytes resolved (0 = off), bufferFull the state MQTT
+	// suspends on, bufferFullWarning the latch of the warning before it.
+	maxBufferedBytes   int64
+	bufferFull         atomic.Bool
+	bufferFullMu       sync.Mutex // orders bufferFull changes with their notifications
+	bufferFullWarning  atomic.Bool
+	bufferFullListener atomic.Pointer[func(bool)]
 
 	// closing is the shutdown short-circuit checked by tryEnqueueFlush.
 	// See Close() for the full ordering rationale; senders see this
@@ -2076,6 +2084,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		flushWorkers:         flushWorkers,
 		flushTimes:           make(map[uint64]time.Time),
 		memoryLimitBytes:     memoryLimitBytes,
+		maxBufferedBytes:     resolveMaxBufferedBytes(cfg, memoryLimitBytes),
 		flushTimeout:         flushTimeout,
 		maxBufferAge:         time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
 		sortKeysConfig:       sortKeysConfig,
@@ -3183,13 +3192,14 @@ func (b *ArrowBuffer) SetWALDiskGate(g WALDiskGate) {
 type walDiskAdmittedKey struct{}
 
 // refusalCountedKey marks a context whose refusal is already counted in
-// arc_wal_disk_pressure_rejections_total: a retry of the same write (MQTT)
+// arc_wal_disk_pressure_rejections_total or
+// arc_ingest_buffer_full_rejections_total: a retry of the same write (MQTT)
 // must not count again.
 type refusalCountedKey struct{}
 
-// WithRefusalCounted returns ctx marked so a WAL disk pressure refusal of a
-// write under it is not counted again (#676): a caller retrying one message
-// counts it once.
+// WithRefusalCounted returns ctx marked so a WAL disk pressure (#676) or
+// buffer-full (#1468) refusal of a write under it is not counted again: a
+// caller retrying one message counts it once.
 func WithRefusalCounted(ctx context.Context) context.Context {
 	return context.WithValue(ctx, refusalCountedKey{}, true)
 }
@@ -3243,12 +3253,20 @@ func noRelease() {}
 // under the context skip their own disk pressure check, so pressure that
 // starts part-way cannot leave the request half written; the ingest gate is
 // still checked per call (AdmitWholeRequest checks it once). With no disk gate
-// ctx is returned unchanged.
+// ctx is returned unchanged. A request is also refused, with ErrBufferFull,
+// while the rows held for flushing are at ingest.max_buffered_bytes (#1468);
+// that is checked here only, so an admitted request is never stopped by it
+// part-way.
 func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
 		if err := (*g)(); err != nil {
 			return ctx, noRelease, err
 		}
+	}
+	// Before the disk gate: a standalone node has none and returns below,
+	// and a refusal here must not hold a WAL reservation (#1468).
+	if err := b.admitBufferedBytes(ctx, b.maxBufferedBytes, true); err != nil {
+		return ctx, noRelease, err
 	}
 	gp := b.walDiskGate.Load()
 	if gp == nil {
@@ -4578,6 +4596,7 @@ func (b *ArrowBuffer) metricsSampler() {
 		case <-ticker.C:
 			b.publishBufferMetrics()
 			b.publishBufferMemoryMetrics()
+			b.observeBufferedBytes(b.bufferBytesBuffered.Load())
 			// Only on the sampler, not inside publishBufferMetrics:
 			// publishBufferMetrics also runs once per flushed file, and this
 			// walks every shard under RLock — 32 lock round-trips per flush on

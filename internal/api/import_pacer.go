@@ -29,6 +29,10 @@ import (
 type importPacer struct {
 	slots        chan struct{}
 	queueTimeout time.Duration // 0: wait until a slot frees (or server shutdown)
+	// ceiling caps limit() at importAdmitPercent of
+	// ingest.max_buffered_bytes (#1468), so imports pace below the level where
+	// other writes are refused; 0 = no cap.
+	ceiling int64
 
 	mu     sync.Mutex
 	active map[*importWriter]importPass
@@ -68,7 +72,9 @@ func ConfigureImports(concurrency int, queueTimeout time.Duration, buf *ingest.A
 	if n <= 0 {
 		n = importAutoConcurrency(buf.MemoryLimitBytes(), importBufferedAllowance(buf), runtime.GOMAXPROCS(0))
 	}
-	importPacerCurrent.Store(newImportPacer(n, queueTimeout))
+	p := newImportPacer(n, queueTimeout)
+	p.ceiling = importCeiling(buf.MaxBufferedBytes())
+	importPacerCurrent.Store(p)
 	return n
 }
 
@@ -137,7 +143,23 @@ func (p *importPacer) leave(w *importWriter) {
 	p.mu.Unlock()
 }
 
-// limit is the shared limit of the active passes (see importPacer).
+// importCeiling is the pacing cap for a buffered-bytes limit: the level at
+// which imports are refused at admission (ingest.AdmitImport), 0 with no
+// limit.
+func importCeiling(maxBuffered int64) int64 {
+	if maxBuffered <= 0 {
+		return 0
+	}
+	return maxBuffered / 100 * 90
+}
+
+// limit is the shared limit of the active passes (see importPacer), capped
+// by the ceiling but never below the lowest baseline. Passes that started
+// above the ceiling (the slot queue can hold an import admitted below it)
+// therefore get no allowance: they wait for the bytes to come back to where
+// the earliest of them started, which their own flushes bring about unless
+// other writers keep the level up, in which case the wait ends with
+// ErrBufferedBytesStuck after importFlushWait, as it could before.
 func (p *importPacer) limit() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -149,6 +171,9 @@ func (p *importPacer) limit() int64 {
 		}
 		first = false
 		sum += a.allowance
+	}
+	if p.ceiling > 0 {
+		return min(base+sum, max(p.ceiling, base))
 	}
 	return base + sum
 }

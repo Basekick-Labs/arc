@@ -33,6 +33,10 @@ const (
 	// RefusalImportQueue: a bulk import waited ingest.import_queue_timeout_ms
 	// for one of the node's import write slots (#1429).
 	RefusalImportQueue = "import_queue"
+	// RefusalBufferFull: the rows held for flushing reached
+	// ingest.max_buffered_bytes, because storage is not keeping up (#1468);
+	// counted in arc_ingest_buffer_full_rejections_total.
+	RefusalBufferFull = "buffer_full"
 )
 
 // WriteRefusal is a live write this node refuses for a local, transient
@@ -72,6 +76,15 @@ var ErrWALDiskPressure error = &WriteRefusal{
 var ErrImportQueueTimeout error = &WriteRefusal{
 	Reason: RefusalImportQueue,
 	Text:   "import refused: every import write slot on this node stayed busy for ingest.import_queue_timeout_ms; nothing was written, retry",
+}
+
+// ErrBufferFull refuses a write request while the rows held for flushing are
+// at ingest.max_buffered_bytes (#1468): flushes are not keeping up, and taking
+// more would grow memory without bound. Retryable: it clears as flushes
+// complete. Checked once per request, before any of it is written.
+var ErrBufferFull error = &WriteRefusal{
+	Reason: RefusalBufferFull,
+	Text:   "write refused: rows waiting to be flushed reached ingest.max_buffered_bytes (storage is not keeping up, see arc_buffer_bytes_buffered); nothing was written, retry",
 }
 
 // ErrWALNotDurable refuses a live write whose WAL entry could not be made
@@ -207,6 +220,9 @@ func (l *refusalLog) record(reason, source string, err error) {
 func refusalLogMessage(reason string) string {
 	if reason == RefusalWALDisk || reason == "forwarded_"+RefusalWALDisk {
 		return "Writes refused on this node (retryable): WAL volume disk pressure; logged once per reason every 30s, see arc_wal_disk_pressure and arc_wal_disk_pressure_rejections_total"
+	}
+	if reason == RefusalBufferFull || reason == "forwarded_"+RefusalBufferFull {
+		return "Writes refused on this node (retryable): rows waiting to be flushed reached ingest.max_buffered_bytes; logged once per reason every 30s, see arc_buffer_bytes_buffered and arc_ingest_buffer_full_rejections_total"
 	}
 	return "Writes refused on this node (retryable); logged once per reason every 30s, see arc_cluster_ingest_fenced_writes_total"
 }

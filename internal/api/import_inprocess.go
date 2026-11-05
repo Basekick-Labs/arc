@@ -281,10 +281,11 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 	if len(upload.body) > maxForwardedImportBody {
 		return nil, &importError{StatusCode: fiber.StatusRequestEntityTooLarge, Message: fmt.Sprintf("file exceeds maximum import size of %d bytes", maxImportSize)}
 	}
-	// Admit before parsing the file: refused when fenced (#1207), or when its
+	// Admit before parsing the file: refused when fenced (#1207), when its
 	// size does not fit the WAL volume's free space (#676), which stays
-	// reserved for it until the import ends.
-	writeCtx, release, err := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(upload.body)))
+	// reserved for it until the import ends, or when the rows waiting to be
+	// flushed are near ingest.max_buffered_bytes (#1468).
+	writeCtx, release, err := h.arrowBuffer.AdmitImport(c.Context(), int64(len(upload.body)))
 	if err != nil {
 		return nil, err
 	}
@@ -430,10 +431,11 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "file is empty"})
 	}
 
-	// Admit before parsing the file: refused when fenced (#1207), or when
-	// its size does not fit the WAL volume's free space (#676), which stays
-	// reserved for it until the import ends.
-	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	// Admit before parsing the file: refused when fenced (#1207), when its
+	// size does not fit the WAL volume's free space (#676), which stays
+	// reserved for it until the import ends, or when the rows waiting to be
+	// flushed are near ingest.max_buffered_bytes (#1468).
+	writeCtx, release, aerr := h.arrowBuffer.AdmitImport(c.Context(), int64(len(data)))
 	if aerr != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, aerr)
