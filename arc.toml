@@ -516,8 +516,13 @@ include_reads = false           # Log GET/query requests (high volume)
 # primary storage, and with no target configured the destination is
 # local_path. A deployment whose local_path sits inside storage.local_path — or
 # whose storage.local_path is a parent of it, such as "./data" — boots today
-# and will not boot after the upgrade. The defaults below are disjoint and are
-# unaffected. An empty local_path with no target is refused too, where it used
+# and will not boot after the upgrade. The defaults in this file are disjoint
+# ("./data/arc" beside "./data/backups"). The .deb/.rpm/Arch packages are not
+# laid out that way: their systemd unit puts storage at /var/lib/arc/data, which
+# is a parent of "./data/backups" resolved from /var/lib/arc, so the unit also
+# sets ARC_BACKUP_LOCAL_PATH=/var/lib/arc/backups (#1463). That environment
+# variable overrides the value here; to change the backup directory on a
+# packaged install, override it with `systemctl edit arc`. An empty local_path with no target is refused too, where it used
 # to boot with the backup API quietly skipped.
 enabled = true
 local_path = "./data/backups"           # Directory for local backups; see the refusal note above
