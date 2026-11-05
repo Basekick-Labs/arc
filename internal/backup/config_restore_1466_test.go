@@ -155,6 +155,26 @@ func TestSecondConfigRestoreKeepsTheFirstSafetyCopy(t *testing.T) {
 	}
 }
 
+// TestRetriedConfigRestoreKeepsTheOriginalSafetyCopy: the likeliest second
+// restore is a retry of the same backup, after one that reported failed past
+// its config step. A copy named for the backup alone would then hold the
+// backup's config, and the operator's original would be gone.
+func TestRetriedConfigRestoreKeepsTheOriginalSafetyCopy(t *testing.T) {
+	r := newConfigRig(t, writeConfig(t, "# backed up\n"))
+	id := r.backup(t, true)
+	if err := os.WriteFile(r.configPath, []byte("# operator original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.m.RestoreBackup(context.Background(), RestoreOptions{BackupID: id, RestoreConfig: true}); err != nil {
+			t.Fatalf("restore %d: %v", i+1, err)
+		}
+	}
+	if s := mustRead(t, configSafetyCopyPath(r.configPath, id)); s != "# operator original\n" {
+		t.Errorf("safety copy after a retry = %q, want the operator's original", s)
+	}
+}
+
 // TestConfigRestoreRefusedBeforeAnyDataIsRestored: the config step runs after
 // data and metadata, so a config that cannot be written used to fail the
 // restore after the data was already back. Refused up front now, and only when

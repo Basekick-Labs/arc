@@ -698,13 +698,20 @@ Both now use the file Arc loaded at startup. The startup line
 `Backup/restore enabled` shows it as `config_file`, and `config_restore`
 says whether this node can restore a config at all.
 
-**`restore_config` is refused with 400 before anything is restored** when
-the backup holds a config and the node cannot write it. Before, the config
-step ran last, so it failed after the data had been restored. It is refused
-when:
+**Backups on a package install now hold the config, and its credentials.**
+`include_config` defaults to true for a backup to a local target, so every
+default backup now contains `/etc/arc/arc.toml`, with any S3, Azure or GCS
+keys and the cluster shared secret in it. Before, these backups silently held
+no config. Treat the backup directory as secret, or send
+`"include_config": false`.
 
-- Arc started without a config file. Arc logs a warning at startup, and its
-  backups hold no config.
+**`restore_config` is refused with 400 before anything is restored** when
+the backup holds a config and the node cannot write it. The config step runs
+last, so where the write failed (a read-only ConfigMap, for example) the
+restore used to fail after the data had been restored. It is refused when:
+
+- Arc started without a config file. Arc logs a warning at startup, and each
+  backup logs that it holds no config.
 - The config file is not writable by the Arc process. This covers the rpm and
   Arch packages, where `/etc/arc/arc.toml` is root's, and a Kubernetes
   ConfigMap mount, which is read-only.
@@ -720,9 +727,9 @@ so a restored config does not survive recreating the container.
 
 Before overwriting, Arc copies the current config to
 `<config>.before-restore-<backup_id>`. A failed copy now fails the config
-restore, instead of logging a warning and overwriting anyway. The name
-carries the backup ID, so a second restore no longer overwrites the copy of
-the original config.
+restore, instead of logging a warning and overwriting anyway. An existing copy
+is never replaced, so neither a restore of another backup nor a retry of the
+same one overwrites the copy of the config it first replaced.
 
 **If you ran `restore_config` on a package install before this release,**
 `/var/lib/arc/arc.toml` is still your config, and `/etc/arc/arc.toml` is

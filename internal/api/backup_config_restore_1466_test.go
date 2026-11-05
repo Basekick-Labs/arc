@@ -87,4 +87,17 @@ func TestRestoreConfigRefusedUpFrontWhenItCannotBeWritten(t *testing.T) {
 	if _, present := resp["restart_required"]; present {
 		t.Errorf("data-only restore: restart_required = %v, want absent", resp["restart_required"])
 	}
+	// The admitted restore runs asynchronously; let it finish before the
+	// temp directories it reads are removed.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		p := m.GetProgress()
+		if p != nil && p.Status != "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restore still running: %+v", p)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

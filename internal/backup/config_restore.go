@@ -3,6 +3,7 @@ package backup
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 )
 
@@ -12,10 +13,30 @@ import (
 var ErrConfigRestoreUnavailable = errors.New("restore_config is not available on this node")
 
 // configSafetyCopyPath is where restoreConfig keeps the config it is about to
-// overwrite: beside it, named for the restore, so a second restore cannot
-// overwrite the copy of the original.
+// overwrite: beside it, named for the backup restored. restoreConfig never
+// replaces an existing copy, so neither another backup's restore nor a retry
+// of the same one can overwrite the copy of the config it first replaced.
 func configSafetyCopyPath(configPath, backupID string) string {
 	return configPath + ".before-restore-" + backupID
+}
+
+// writeFileExclusive creates path with data, mode 0600, failing with an error
+// matching os.ErrExist when it already exists.
+func writeFileExclusive(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 // ConfigRestoreBlocker reports why restoring the config of backupID would fail

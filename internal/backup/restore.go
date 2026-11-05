@@ -251,18 +251,6 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		progress.Error = err.Error()
 		return nil, err
 	}
-	// A config restore that cannot be written is refused here, before any
-	// data is restored (#1466); the config step runs last, so failing there
-	// would leave the data restored and the config not. Only when the backup
-	// holds a config: without one the step is skipped, as it always was.
-	if opts.RestoreConfig && manifest.HasConfig {
-		if err := m.ConfigRestoreBlocker(opts.BackupID); err != nil {
-			progress.Status = "failed"
-			progress.Error = err.Error()
-			return nil, err
-		}
-	}
-
 	// The effective mode is decided from the manifest (#1084): a scoped
 	// backup on a cluster node restores in replace mode unless the request
 	// named one. Same function and same inputs as the API handler's echo.
@@ -283,6 +271,18 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
+	}
+	// A config restore that cannot be written is refused here, before any
+	// data is restored and in the API's order (#1466); the config step runs
+	// last, so failing there would leave the data restored and the config
+	// not. Only when the backup holds a config: without one the step is
+	// skipped, as it always was.
+	if opts.RestoreConfig && manifest.HasConfig {
+		if err := m.ConfigRestoreBlocker(opts.BackupID); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
 	}
 
 	// A backup another instance wrote is restorable, and that is a decision,
@@ -1964,11 +1964,19 @@ func (m *Manager) restoreConfig(ctx context.Context, src backupTarget, backupID 
 	if err != nil {
 		return fmt.Errorf("failed to read the current config %s to keep a copy of it; the config was not restored: %w", m.configPath, err)
 	}
+	// Created exclusively, and an existing copy is kept: a retry of the same
+	// backup (a restore that reports failed after its config step, #762)
+	// would otherwise replace the copy of the operator's config with the
+	// backup's own.
 	safetyCopy := configSafetyCopyPath(m.configPath, backupID)
-	if err := os.WriteFile(safetyCopy, current, 0600); err != nil {
+	switch err := writeFileExclusive(safetyCopy, current); {
+	case errors.Is(err, os.ErrExist):
+		m.logger.Info().Str("path", safetyCopy).Msg("Keeping the existing copy of the config from an earlier restore of this backup")
+	case err != nil:
 		return fmt.Errorf("failed to keep a copy of the current config at %s; the config was not restored: %w", safetyCopy, err)
+	default:
+		m.logger.Info().Str("path", safetyCopy).Msg("Kept a copy of the current config before restoring")
 	}
-	m.logger.Info().Str("path", safetyCopy).Msg("Kept a copy of the current config before restoring")
 
 	if err := os.WriteFile(m.configPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file %s (the previous config is at %s): %w", m.configPath, safetyCopy, err)
