@@ -2393,8 +2393,7 @@ localProcessing:
 		// (classifyNoFiles).
 		kind := h.classifyNoFiles(err)
 		if kind == noFilesVanished {
-			m.IncQueryErrors()
-			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
 			}
@@ -2423,8 +2422,7 @@ localProcessing:
 			})
 		}
 
-		m.IncQueryErrors()
-		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		// Check if it was a timeout
 		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
@@ -2465,8 +2463,7 @@ localProcessing:
 		if cancel != nil {
 			cancel()
 		}
-		m.IncQueryErrors()
-		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		h.logger.Error().Err(err).Msg("Failed to get column names")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -2495,6 +2492,7 @@ localProcessing:
 	// can fire inside the streaming callback. See C5.
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(c.Context(), cancel, nil, "query_json", func() {
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Fail(queryID, "stream writer panicked")
@@ -2512,7 +2510,7 @@ localProcessing:
 			}
 		}()
 		rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
-		w.Flush()
+		streamErr = firstStreamWriteError(streamErr, w.Flush())
 
 		// Reported before the error branch below: a stream can reach the
 		// cap and then fail on the way out, and the envelope marks it
@@ -2533,8 +2531,7 @@ localProcessing:
 		// was already sent — operators must see the partial-result
 		// signal. See review/query-path-criticals C5.
 		if streamErr != nil {
-			m.IncQueryErrors()
-			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
+			outcome.fail()
 			if h.queryRegistry != nil && queryID != "" {
 				if errors.Is(streamErr, context.DeadlineExceeded) {
 					h.queryRegistry.TimedOut(queryID)
@@ -2559,16 +2556,14 @@ localProcessing:
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Complete(queryID, rowCount)
 		}
-		m.IncQuerySuccess()
-		m.IncQueryRows(int64(rowCount))
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(int64(rowCount))
 
 		h.logger.Info().
 			Int("row_count", rowCount).
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Query completed")
 		h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-	})
+	}, outcome.fail)
 	return nil
 }
 
@@ -5724,8 +5719,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		if cancel != nil {
 			cancel()
 		}
-		m.IncQueryErrors()
-		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		// A partition or file removed mid-query: retryable, as on the other
 		// routes (classifyNoFiles).
 		if h.classifyNoFiles(err) == noFilesVanished {
@@ -5772,8 +5766,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		if cancel != nil {
 			cancel()
 		}
-		m.IncQueryErrors()
-		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(sqlutil.SanitizeErrText(err.Error()))
 		}
@@ -5804,6 +5797,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
 	streamStarted = true
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(c.Context(), cancel, nil, "query_measurement", func() {
 		// A recovered panic skips the dispositions below, which would leave
 		// the entry listed as running forever with nothing to reap it (#731,
@@ -5819,7 +5813,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			}
 		}()
 		rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, nil, start, timestamp)
-		w.Flush()
+		streamErr = firstStreamWriteError(streamErr, w.Flush())
 
 		// Reported before the error branch below: a stream can reach the cap
 		// and then fail on the way out, and the envelope marks it capped
@@ -5829,8 +5823,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 
 		if streamErr != nil {
-			m.IncQueryErrors()
-			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
+			outcome.fail()
 			// Per-handler client-disconnect counter (#426). queryMeasurement
 			// uses the pure database/sql streaming JSON path same as the
 			// other sites above, so it shares the sql_json label.
@@ -5857,9 +5850,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		}
 
 		// Record success metrics
-		m.IncQuerySuccess()
-		m.IncQueryRows(int64(rowCount))
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(int64(rowCount))
 
 		h.logger.Info().
 			Str("measurement", measurement).
@@ -5870,6 +5861,6 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		if onComplete != nil {
 			onComplete(rowCount)
 		}
-	})
+	}, outcome.fail)
 	return nil
 }

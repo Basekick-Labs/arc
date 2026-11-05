@@ -156,6 +156,7 @@ func (h *QueryHandler) tryArcxRouterArrow(
 
 	// A recovered panic must not leave a decodable but incomplete stream.
 	var streamW *bufio.Writer
+	outcome := newQueryStreamOutcome(metrics.QueryEngineArcx, start)
 	h.setDirectBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
 		poisonArrowStream(streamW, h.logger)
 		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
@@ -246,20 +247,17 @@ func (h *QueryHandler) tryArcxRouterArrow(
 		// F1/F3: the DuckDB arrow path's completion metrics. A mid-stream failure is an
 		// error metric, not a success — but the rows already on the wire still count.
 		if ipcErr != nil {
-			m.IncQueryErrors()
-			m.RecordQueryEngineExecution(metrics.QueryEngineArcx, false, time.Since(start).Microseconds())
+			outcome.fail()
 			if onFail != nil {
 				onFail(ipcErr.Error())
 			}
 		} else {
-			m.IncQuerySuccess()
-			m.IncQueryRows(int64(rows))
-			m.RecordQueryLatencyForEngine(metrics.QueryEngineArcx, time.Since(start).Microseconds())
+			outcome.succeed(int64(rows))
 			if onComplete != nil {
 				onComplete(rows)
 			}
 		}
-	})
+	}, outcome.fail)
 	return true
 }
 
@@ -330,8 +328,7 @@ func (h *QueryHandler) serveArcxResult(
 			if cancel != nil {
 				cancel()
 			}
-			metrics.Get().IncQueryErrors()
-			metrics.Get().RecordQueryEngineExecution(metrics.QueryEngineArcx, false, time.Since(start).Microseconds())
+			metrics.Get().RecordQueryFailure(metrics.QueryEngineArcx, time.Since(start).Microseconds())
 			if onFail != nil {
 				onFail(derr.Error())
 			}
@@ -340,6 +337,7 @@ func (h *QueryHandler) serveArcxResult(
 			return true // we produced the (error) response
 		}
 		c.Set(fiber.HeaderContentType, msgpackContentType)
+		outcome := newQueryStreamOutcome(metrics.QueryEngineArcx, start)
 		h.setDirectBodyStream(c.Context(), cancel, nil, "arcx_serve_msgpack", func() {
 			// A panic skips the dispositions below, leaving the query
 			// registered as running forever (#717).
@@ -362,15 +360,14 @@ func (h *QueryHandler) serveArcxResult(
 			// w is the stream's pooled 256 KiB buffer (setDirectBodyStream).
 			bw := w
 			_, serr := streamMsgPackFromBatches(streamCtx, bw, schema, batches, rowCount, governanceMaxRows, nil, start, timestamp)
-			bw.Flush()
-			w.Flush()
-			m := metrics.Get()
+			serr = firstStreamWriteError(serr, bw.Flush())
+			serr = firstStreamWriteError(serr, w.Flush())
 			if serr != nil {
 				// As the arcx JSON callback: the success envelope is on the
 				// wire, so this is a truncated stream, counted as an error and
 				// logged at the stream error's level (an encoder panic is a
 				// server fault, not a Warn).
-				m.IncQueryErrors()
+				outcome.fail()
 				h.streamErrEvent(serr).Err(serr).
 					Int("rows_sent", rowCount).
 					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
@@ -384,15 +381,13 @@ func (h *QueryHandler) serveArcxResult(
 			// (query_msgpack.go). Without these, flipping to serve makes served
 			// queries vanish from dashboards — you cannot tell whether arcx is
 			// working, which is disqualifying for a production flip.
-			m.IncQuerySuccess()
-			m.IncQueryRows(int64(rowCount))
-			m.RecordQueryLatencyForEngine(metrics.QueryEngineArcx, time.Since(start).Microseconds())
+			outcome.succeed(int64(rowCount))
 			if onComplete != nil {
 				onComplete(rowCount)
 			}
 			h.logGovernanceRowCap("msgpack", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-		})
+		}, outcome.fail)
 		return true
 	}
 
@@ -401,6 +396,7 @@ func (h *QueryHandler) serveArcxResult(
 	// the row count; we check reader.Err() after it to catch a mid-stream engine error
 	// (else a truncated result serves as success — gotcha #4).
 	c.Set("Content-Type", "application/json")
+	outcome := newQueryStreamOutcome(metrics.QueryEngineArcx, start)
 	h.setDirectBodyStream(c.Context(), cancel, nil, "arcx_serve_json", func() {
 		// A panic skips the dispositions below, leaving the query registered
 		// as running forever (#717).
@@ -417,7 +413,7 @@ func (h *QueryHandler) serveArcxResult(
 			runtime.KeepAlive(reader)
 		}()
 		rc, serr := streamArrowJSON(streamCtx, w, reader, governanceMaxRows, nil, start, timestamp)
-		m := metrics.Get()
+		serr = firstStreamWriteError(serr, w.Flush())
 		// Reported before the branch below: a stream can reach the cap and
 		// then fail on the way out, and the envelope marks it capped either
 		// way, so the operator-side record has to fire on both paths (#724).
@@ -428,8 +424,7 @@ func (h *QueryHandler) serveArcxResult(
 			// the two disagree. Record it as a truncated stream — the same shape the
 			// DuckDB path uses (query_arrow_json.go) — so the alarm is honest without
 			// contradicting what the client was sent.
-			m.IncQueryErrors()
-			m.RecordQueryEngineExecution(metrics.QueryEngineArcx, false, time.Since(start).Microseconds())
+			outcome.fail()
 			h.streamErrEvent(serr).Err(serr).
 				Int("rows_sent", rc).
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
@@ -442,8 +437,7 @@ func (h *QueryHandler) serveArcxResult(
 			// indistinguishable from clean EOF at the transcoder. Alarm — never serve
 			// partial-as-success silently. Same reasoning as above: the success envelope
 			// is already on the wire, so this is a truncation, not a request failure.
-			m.IncQueryErrors()
-			m.RecordQueryEngineExecution(metrics.QueryEngineArcx, false, time.Since(start).Microseconds())
+			outcome.fail()
 			h.logger.Error().Err(rerr).
 				Int("rows_sent", rc).
 				Msg("arcx serve: json stream engine error mid-drain (partial result served)")
@@ -452,16 +446,13 @@ func (h *QueryHandler) serveArcxResult(
 			}
 		} else {
 			// F1: the DuckDB path's completion metrics.
-			m.IncQuerySuccess()
-			m.IncQueryRows(int64(rc))
-			m.RecordQueryLatencyForEngine(metrics.QueryEngineArcx, time.Since(start).Microseconds())
+			outcome.succeed(int64(rc))
 			if onComplete != nil {
 				onComplete(rc)
 			}
 			h.logSlowQuery(convertedSQL, start, rc, tokenName)
 		}
-		w.Flush()
-	})
+	}, outcome.fail)
 	return true
 }
 

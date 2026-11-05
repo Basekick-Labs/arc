@@ -423,13 +423,12 @@ const (
 )
 
 type queryLatencyHistogram struct {
-	buckets [11]atomic.Int64
+	buckets [13]atomic.Int64
 	sum     atomic.Int64 // microseconds
-	count   atomic.Int64
 }
 
 // RecordQueryEngineExecution records completed engine executions and their latency.
-// The buckets are 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 30s,
+// The buckets are 1ms, 5ms, 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 30s,
 // and +Inf. Query latency is recorded for failures as well as successes.
 func (m *Metrics) RecordQueryEngineExecution(engine string, succeeded bool, durationMicros int64) {
 	var engineIndex int
@@ -451,34 +450,37 @@ func (m *Metrics) RecordQueryEngineExecution(engine string, succeeded bool, dura
 	m.queryExecutions[engineIndex][outcomeIndex].Add(1)
 	h := &m.queryEngineLatency[engineIndex]
 	h.sum.Add(durationMicros)
-	h.count.Add(1)
 	h.buckets[queryLatencyBucket(durationMicros)].Add(1)
 }
 
 func queryLatencyBucket(micros int64) int {
 	switch {
-	case micros <= 10_000:
+	case micros <= 1_000:
 		return 0
-	case micros <= 50_000:
+	case micros <= 5_000:
 		return 1
-	case micros <= 100_000:
+	case micros <= 10_000:
 		return 2
-	case micros <= 250_000:
+	case micros <= 50_000:
 		return 3
-	case micros <= 500_000:
+	case micros <= 100_000:
 		return 4
-	case micros <= 1_000_000:
+	case micros <= 250_000:
 		return 5
-	case micros <= 2_500_000:
+	case micros <= 500_000:
 		return 6
-	case micros <= 5_000_000:
+	case micros <= 1_000_000:
 		return 7
-	case micros <= 10_000_000:
+	case micros <= 2_500_000:
 		return 8
-	case micros <= 30_000_000:
+	case micros <= 5_000_000:
 		return 9
-	default:
+	case micros <= 10_000_000:
 		return 10
+	case micros <= 30_000_000:
+		return 11
+	default:
+		return 12
 	}
 }
 
@@ -574,9 +576,11 @@ func (m *Metrics) IncQueryTimeouts()        { m.queryTimeoutsTotal.Add(1) }
 func (m *Metrics) IncSlowQueries()          { m.querySlowTotal.Add(1) }
 func (m *Metrics) IncQueryRows(count int64) { m.queryRowsTotal.Add(count) }
 
-// RecordQueryLatency records query latency in microseconds
-func (m *Metrics) RecordQueryLatency(durationMicros int64) {
-	m.RecordQueryLatencyForEngine(QueryEngineDuckDB, durationMicros)
+// RecordQueryFailure pairs the aggregate failure and engine execution counters.
+// Call it only after execution reaches the named engine.
+func (m *Metrics) RecordQueryFailure(engine string, durationMicros int64) {
+	m.IncQueryErrors()
+	m.RecordQueryEngineExecution(engine, false, durationMicros)
 }
 
 // RecordQueryLatencyForEngine preserves the aggregate latency summary while
@@ -1594,7 +1598,7 @@ func (m *Metrics) PrometheusFormat() string {
 
 	b = append(b, "# HELP arc_query_latency_seconds Query execution latency by engine\n"...)
 	b = append(b, "# TYPE arc_query_latency_seconds histogram\n"...)
-	queryLatencyBucketLabels := [...]string{"0.01", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "+Inf"}
+	queryLatencyBucketLabels := [...]string{"0.001", "0.005", "0.01", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "+Inf"}
 	for engineIndex, engine := range engineNames {
 		h := &m.queryEngineLatency[engineIndex]
 		var cumulative int64
@@ -1606,7 +1610,7 @@ func (m *Metrics) PrometheusFormat() string {
 		b = appendMetricWithLabel(b, "arc_query_latency_seconds_sum", "engine", engine,
 			float64(h.sum.Load())/1_000_000.0)
 		b = appendMetricWithLabel(b, "arc_query_latency_seconds_count", "engine", engine,
-			float64(h.count.Load()))
+			float64(cumulative))
 	}
 
 	b = append(b, "# HELP arc_query_timeouts_total Queries that exceeded timeout\n"...)

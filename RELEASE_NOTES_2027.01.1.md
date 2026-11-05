@@ -3163,9 +3163,17 @@ omitted.
 
 ### Query execution metrics distinguish DuckDB and Arcx
 
-Prometheus now exports query execution outcomes and a latency histogram by
-engine, including failed executions. The existing aggregate query counters
-remain available.
+Prometheus now exports `arc_query_engine_executions_total{engine,outcome}` and
+`arc_query_latency_seconds{engine}`, including failed executions. These count
+only requests that reach an engine; earlier validation, permission and SQL
+transform failures remain in the aggregate request and error counters. Thus
+engine executions can be fewer than `arc_query_requests_total`.
+
+Arrow IPC pre-stream timeouts now also count as query errors. Empty Arrow-JSON
+and MessagePack results now count as successes and contribute to aggregate
+latency. Stream panics before completion and final response flush failures
+count as failures; a panic after a recorded outcome does not count the same
+execution again. Existing dashboards using these counters may change after upgrading.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292).
 
@@ -3256,6 +3264,7 @@ cannot forward to a peer that has it enabled: the peer answers `401`. The
 signed identity is valid for 30 seconds, so the clocks of a cluster's nodes
 must agree within that for forwarded requests to be accepted (joins already
 require 5 minutes).
+
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,
