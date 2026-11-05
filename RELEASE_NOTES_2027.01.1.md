@@ -2,6 +2,114 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: Iceberg export keeps files moved to an S3 cold tier ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Iceberg export and cold-tier tiering can now run together when the cold tier is
+S3 (`tiered_storage.cold.backend = "s3"`). A file that tiering moves to cold
+stays in the Iceberg table under its cold URI, with the same rows and
+statistics. External readers see the same data before, during and after a
+migration. Supported with a local or an S3 primary.
+
+- **Mixed-location tables:** with a local primary, an exported table holds
+  `file://` paths for hot data and `s3://` paths for cold data. A reader needs
+  access to both, so it must run on the Arc host with S3 credentials.
+- **Which copy is exported:** the one Arc's own queries read. When a file is
+  on both tiers (during a migration, or a hot-only database's cold copy), the
+  hot copy is exported until Arc's tier record says the file is cold.
+- **No extra reads:** a migrated file's entry is copied from the hot one, and
+  the cold object is not read. Only cold data the table never held hot is
+  read, once, with the cold tier's own credentials.
+- **Cost:** the cold tier is listed per measurement and the listing is cached.
+  Arc re-lists after every change it makes to the cold tier: a tiering cycle,
+  cold retention, a DELETE of a cold file, a database delete. Otherwise it
+  re-lists every `iceberg.cold_rescan_interval` seconds (new, default `3600`),
+  which bounds changes made outside Arc. Before the table drops a file that
+  left the hot tier, Arc checks the cold tier for it (one HEAD), so a
+  migration never makes the table lose a file.
+- **Window:** during the one pass between the hot copy's delete and the table
+  moving to the cold URI, a reader that already resolved the old URI can get
+  a not-found error. It never gets wrong rows. Compaction and retention
+  already have the same window.
+- **Refused at startup:** an Azure or GCS cold tier, or S3 cold on Google
+  Cloud Storage's interop endpoint, with Iceberg enabled.
+- **Unavailable cold tier:** if the cold tier is configured but cannot be
+  built, the export does not start, and the tables keep their last snapshot.
+- **Licensing:** tiering requires an Enterprise license and Iceberg export does
+  not. Without the license Arc disables tiering, so with a cold tier still
+  configured the export does not start (as for an unavailable cold tier) and
+  the tables keep their last snapshot until the license is restored.
+
+DELETE of a whole cold file now also drops the query caches, as cold retention
+already did.
+
+## New: Iceberg export on S3 primary storage ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Iceberg export now runs with `storage.backend = "s3"` (AWS S3 and S3-compatible
+stores), not only on local storage. Tables are written under the storage root
+(`s3://<bucket>/<prefix>/arc_<database>.db/<measurement>/`) and read by
+Iceberg engines with S3 access (verified with PyIceberg and DuckDB
+`iceberg_scan`).
+
+- **Credentials:** the export uses Arc's own S3 credentials and renews them the
+  same way: static keys, the default chain, IRSA on EKS, or an assumed role. No
+  credential is written into Iceberg metadata, the catalog or the logs.
+  Readers need their own read access to the bucket.
+- **Endpoint:** `storage.s3_endpoint` and `storage.s3_path_style` apply to the
+  export too. The `AWS_S3_ENDPOINT` environment variable no longer changes
+  where it writes.
+- **Cost:** schemas are read from each new file's footer (the last 64 KiB of
+  the object), never the whole file, and sizes come from the listing. After a
+  restart an unchanged table reads no footers.
+
+**Refused at startup with Iceberg enabled:**
+- `storage.backend` other than `local` or `s3` (Azure, GCS);
+- `storage.backend = "s3"` on Google Cloud Storage's S3-compatible endpoint;
+- an `iceberg.warehouse` outside the storage root (another bucket, another
+  prefix, or a local path with an S3 backend);
+- `cluster.shared_storage_mode = true` without `cluster.failover_enabled =
+  true`;
+- cold-tier tiering, as before.
+
+**Shared-storage clusters:** only the node holding the compactor lease
+exports, with no fallback to the static compactor role, and the lease is
+re-checked for each measurement. The table's current version is the one
+published in the warehouse, not the node's own catalog row:
+- a node that takes over, or comes back after a failover, continues from
+  the published version;
+- if two nodes commit the same version, the second one's publish is refused,
+  its pass fails, and it adopts the published version on the next pass,
+  logged as `another writer published this table version first`;
+- a node that lost its catalog (a new node, a deleted SQLite) continues the
+  existing table instead of creating a second one in the same directory. On
+  local storage too.
+
+**Upgrade:** nothing to do for local-storage deployments. To export an existing
+S3 deployment, set `iceberg.enabled = true`. The first pass registers every
+existing data file, reading each file's footer twice (once for the schema,
+once for its statistics); expect two ranged GETs per file on that pass.
+
+## Fix: Iceberg export counts each row once during a DELETE or a compaction ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Arc's queries leave out a file whose rows another file already holds, such as
+the file a row DELETE replaced while it is still in storage next to its
+rewrite. On a standalone node the Iceberg export did not: a reconcile pass
+between a partial DELETE publishing its rewrite and removing the old file
+published both, and external readers (PyIceberg, DuckDB `iceberg_scan`)
+counted the surviving rows twice. The window is normally milliseconds; if the
+removal failed, it lasted until the leftover drainer removed the old file.
+
+The export now leaves out exactly the files Arc's queries leave out (DELETE
+rewrites, compactions in flight, and on a cluster the same set its queries
+use). Where a query would guess (a stat that fails, an unreadable DELETE
+journal, the stale-local breaker), the export does not: that measurement's
+pass fails, keeps the previous snapshot, and is retried on the next pass.
+
+**A file removed while a measurement is being listed** (a compaction or DELETE
+finishing mid-listing) no longer drops its rows from that pass: the
+measurement is listed again, up to three times. If the files keep changing,
+the pass fails for that measurement and keeps the previous snapshot, logged
+as `file set of <db>/<measurement> kept changing under the listing`.
+
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 
 `GET /api/v1/write/msgpack/spec` said authentication was "not yet
@@ -2077,7 +2185,77 @@ or sustained-ingest coverage. Failed startup also cleans up its child process.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1421](https://github.com/Basekick-Labs/arc/pull/1421).
 
-### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447))
+
+### `allow_unreachable=true` stops waiting for files nothing is delivering ([#1426](https://github.com/Basekick-Labs/arc/issues/1426))
+
+On a cluster, a DELETE waits for files the manifest lists that are not on the
+primary yet: replicated files and compaction outputs still on their way. It
+waits up to 30 seconds, then answers `503` naming them in
+`unreachable_files`, or with `allow_unreachable=true` runs without them. With
+the flag it still waited the full 30 seconds first, once per scan, even for a
+file no node holds any more. A DELETE can scan several times, before and after
+it is recorded and after a compaction replaced a file it read, so it could
+take minutes. A client with a 30-second timeout saw a connection failure for
+a DELETE that ran, and lost the list of files it skipped.
+
+With `allow_unreachable=true`, a missing file is now waited for only while
+something is delivering it: the replication puller has it queued or in
+progress, or on shared storage a staged compaction holds it. A file missing
+for 5 seconds with nothing delivering it is given up for the rest of the
+request and reported in `unreachable_files`. A file still on its way is waited
+for up to 30 seconds, as before. Without the flag nothing changes.
+
+The rows of a file in `unreachable_files` are not deleted. Run the DELETE
+again once the file is on the primary to remove them. On shared storage, the
+flush of the other nodes before a DELETE keeps its own timeouts.
+
+### Storage errors stay readable in the log ([#1113](https://github.com/Basekick-Labs/arc/issues/1113))
+
+Arc masks every quoted span in a logged error, because engine errors quote the
+values they refuse, and it logs only an error's first line. Storage errors that
+quoted the offending value lost exactly that part in the log, and a value with
+a quote in it masked the rest of the line:
+`storage prefix "..." contains an unsupported character '...'`.
+
+Storage errors no longer quote values. They say what is wrong instead:
+
+- An unsupported character in an object-store prefix, or a glob metacharacter
+  in a path, is named by its code point (`U+0027`), and the prefix error lists
+  the allowed characters.
+- Key and prefix errors describe the problem (an empty, `.` or `..` segment, a
+  trailing separator, the write-staging suffix, a length over the limit)
+  without repeating the key. A database name starting with `_` is refused as
+  reserved.
+- An unknown backend type, a GCS endpoint that is not an http(s) URL, and a
+  GCS bucket Arc cannot use are described, and the bucket is named unquoted.
+- A batch delete on S3, Azure or GCS logs each key it refuses as a warning
+  with the key as a `key` field, and names the key in front of its reason in
+  the returned error. Only the first line of the batch error reaches the log.
+
+Contributed in part by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+
+### A delete's WHERE may qualify columns by the measurement name ([#1451](https://github.com/Basekick-Labs/arc/issues/1451))
+
+`POST /api/v1/delete` with `"where": "cpu.host = 'web-1'"` on measurement `cpu`
+failed with `Referenced table "cpu" not found`, while `"where": "host = 'web-1'"`
+worked. The caller sends only the predicate, so there was no alias to give the
+measurement either. A qualifier naming the measurement is now dropped before
+the clause is validated, recorded or run: `cpu.host`, `"cpu".host` and
+`CPU.host` all mean the column `host`. A name used bare (`cpu = 'x'`), one
+deeper in a path (`x.cpu.host`), and text inside string literals are left as
+written.
+
+The rows read are not renamed after the measurement, on purpose. A
+measurement often has a field named like itself, and in a file without that
+field the name would then stand for the whole row: `temperature IS NOT NULL`
+would match every row of such a file and delete it.
+
+As with a query's table-name qualifier
+([#1447](https://github.com/Basekick-Labs/arc/issues/1447)), a struct column
+named like its measurement is no longer reached through that name with a
+field (`cpu.x` now means the column `x`).
+
+### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447), [#1450](https://github.com/Basekick-Labs/arc/issues/1450))
 
 `SELECT readings.value FROM readings` failed with `Referenced table "readings"
 not found`. Arc replaces a table reference with a `read_parquet(...)` read, and
@@ -2101,15 +2279,27 @@ The rewritten read now carries the table's name (`AS "readings"`) whenever the
 query qualifies a column with it and the reference has no alias of its own.
 This covers `FROM`, every `JOIN` form, comma joins, `database.table` references
 (named by the table), and queries with or without the `x-arc-database` header.
-A query that never qualifies by table name is rewritten exactly as before.
+It also covers continuous queries, whose source read is named after the source
+measurement: a body such as
+`SELECT cpu.host, avg(cpu.usage) AS usage FROM prod.cpu WHERE time >= {start_time} AND time < {end_time} GROUP BY 1`
+failed at every scheduled run and now writes its rows. A query that never qualifies by
+table name is rewritten exactly as before.
 
-Three things now behave the way Postgres does, where before they relied on the
+A query that also gives the name to another relation, as in
+`FROM readings JOIN (SELECT ...) readings USING (channel_id)` or
+`FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
+keeps the unaliased read: naming the table as well would be a duplicate alias
+in the first, and would change which relation `readings.value` reads in the
+second. This holds wherever the other relation is in the query, including a
+subquery or `LATERAL` join aliased with the table's name
+(`LEFT JOIN LATERAL (SELECT ... FROM readings ...) readings ON true`); give one
+of the two a different alias to qualify by the table's name there. A column named like the table, such as Telegraf's `cpu` tag on the
+`cpu` measurement, is not an alias wherever it appears, so it does not stop
+the table being named.
+
+Two things now behave the way Postgres does, where before they relied on the
 relation having no name:
 
-- **An inner reference shadows an outer alias of the same name.** In
-  `FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
-  the inner `readings.value` now reads the inner table. Before, it bound to the
-  outer relation.
 - **A struct column named like its table.** In a query that also qualifies by
   the table name, `readings.value` now names the table's column `value`, not a
   field of a struct column called `readings`.
@@ -2117,9 +2307,9 @@ relation having no name:
   `read_parquet` keeps working unless it also qualifies by the table name.
 
 A table reference followed by `WITH ORDINALITY` keeps its old form, because
-DuckDB accepts that clause only before an alias. Continuous queries still read
-their source unaliased, so give the table an alias there. A delete's `WHERE`
-clause runs over an unaliased read too: use unqualified column names in it.
+DuckDB accepts that clause only before an alias. A delete's `WHERE` may
+qualify columns by the measurement name too; see
+[#1451](https://github.com/Basekick-Labs/arc/issues/1451) above.
 
 ### A MessagePack value its column cannot hold is a client error, not a 500 ([#1424](https://github.com/Basekick-Labs/arc/issues/1424))
 

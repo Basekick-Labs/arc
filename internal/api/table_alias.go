@@ -133,13 +133,18 @@ var duckdbNonAliasKeywords = map[string]struct{}{
 	"with":          {},
 }
 
-// qualifierNames returns the lower-cased names the query uses as a qualifier:
-// an identifier followed by a dot and then a name or *, as in
-// `readings.value` or `readings.*`. sql must be masked and comment-stripped
-// and must not have been rewritten yet; emitted storage paths contain dots.
-// resolve maps a quoted-identifier placeholder to its name.
+// qualifierNames returns the lower-cased names the query uses as a qualifier,
+// an identifier followed by a dot and then a name or * as in `readings.value`
+// or `readings.*`, and does not also use as an alias. sql must be masked and
+// comment-stripped and must not have been rewritten yet; emitted storage paths
+// contain dots. resolve maps a quoted-identifier placeholder to its name.
+//
+// A name the query also gives another relation, as in
+// `FROM cpu JOIN (SELECT ...) cpu USING (host)`, is left out: naming the table
+// too would be a duplicate alias, and in a nested scope it would change which
+// relation `cpu.x` reads. Such a table is rewritten as it was before #1447.
 func qualifierNames(sql string, resolve func(string) (string, bool)) map[string]bool {
-	var names map[string]bool
+	var names, aliases map[string]bool
 	for i := 0; i < len(sql); {
 		c := sql[i]
 		if !isIdentChar(c) {
@@ -153,23 +158,154 @@ func qualifierNames(sql string, resolve func(string) (string, bool)) map[string]
 		// A number (1.5) can be collected too: no valid table name starts
 		// with a digit, so it never matches one.
 		j := skipSQLSpace(sql, i)
-		if j >= len(sql) || sql[j] != '.' {
+		qualifier := j < len(sql) && sql[j] == '.'
+		if qualifier {
+			k := skipSQLSpace(sql, j+1)
+			qualifier = k < len(sql) && (isIdentChar(sql[k]) || sql[k] == '*')
+		}
+		if qualifier && startsRelationRef(sql, start) {
+			// `FROM db.readings`: the database part of a table reference,
+			// not a column qualifier.
 			continue
 		}
-		k := skipSQLSpace(sql, j+1)
-		if k >= len(sql) || !(isIdentChar(sql[k]) || sql[k] == '*') {
+		if !qualifier && !inAliasPosition(sql, start) {
 			continue
 		}
 		name, ok := resolve(sql[start:i])
 		if !ok {
 			continue
 		}
-		if names == nil {
-			names = make(map[string]bool)
+		set := &names
+		if !qualifier {
+			set = &aliases
 		}
-		names[strings.ToLower(name)] = true
+		if *set == nil {
+			*set = make(map[string]bool)
+		}
+		(*set)[strings.ToLower(name)] = true
+	}
+	for name := range aliases {
+		delete(names, name)
 	}
 	return names
+}
+
+// inAliasPosition reports whether the word starting at start is a relation's
+// alias: it follows `)`, AS, or a word that is not a keyword, as in
+// `(...) cpu`, `(...) AS cpu`, `limits cpu` or `"limits" cpu`, and it sits in
+// a FROM or JOIN list (inRelationList). A word in the select list, a star
+// modifier (`* EXCLUDE cpu`), `DISTINCT ON (...) cpu` or a function body is a
+// column, however it is preceded.
+func inAliasPosition(sql string, start int) bool {
+	i := start - 1
+	for i >= 0 && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n' || sql[i] == '\r') {
+		i--
+	}
+	if i < 0 {
+		return false
+	}
+	if sql[i] != ')' {
+		if !isIdentChar(sql[i]) {
+			return false
+		}
+		end := i + 1
+		for i >= 0 && isIdentChar(sql[i]) {
+			i--
+		}
+		// After a dotted name (`db.limits cpu`) the word before is the
+		// table's, whatever it is called.
+		if i < 0 || sql[i] != '.' {
+			prev := strings.ToLower(sql[i+1 : end])
+			if _, keyword := duckdbNonAliasKeywords[prev]; keyword && prev != "as" {
+				return false
+			}
+		}
+	}
+	return inRelationList(sql, start)
+}
+
+// clauseStartWords are the keywords that start a clause other than FROM: a
+// word after one of them, at the same depth, is not in a FROM list. Other
+// keywords (join types, ON and USING, the words of a join condition) can sit
+// between FROM and a later relation's alias, as in
+// `FROM a JOIN b ON true, (...) cpu`.
+var clauseStartWords = map[string]bool{
+	"select": true, "where": true, "group": true, "having": true,
+	"qualify": true, "window": true, "order": true, "limit": true,
+	"offset": true, "union": true, "intersect": true, "except": true,
+	"returning": true, "with": true, "values": true, "set": true, "into": true,
+}
+
+// inRelationList reports whether the word starting at start is in a FROM or
+// JOIN list: walking back at the same parenthesis depth, FROM or JOIN comes
+// before a keyword that starts another clause (clauseStartWords) and before
+// the parenthesis that opens the enclosing group. Other words, dots, commas
+// and whole parenthesised groups are passed over.
+func inRelationList(sql string, start int) bool {
+	depth := 0
+	for i := start - 1; i >= 0; {
+		c := sql[i]
+		switch {
+		case c == ')':
+			depth++
+			i--
+		case c == '(':
+			if depth == 0 {
+				return false
+			}
+			depth--
+			i--
+		case c == ';':
+			if depth == 0 {
+				return false
+			}
+			i--
+		case isIdentChar(c):
+			end := i + 1
+			for i >= 0 && isIdentChar(sql[i]) {
+				i--
+			}
+			// Inside a group, or after a dot (`db.group`), a word is a name.
+			if depth > 0 || (i >= 0 && sql[i] == '.') {
+				continue
+			}
+			word := strings.ToLower(sql[i+1 : end])
+			if word == "from" || word == "join" {
+				return true
+			}
+			if clauseStartWords[word] {
+				return false
+			}
+		default:
+			i--
+		}
+	}
+	return false
+}
+
+// startsRelationRef reports whether the word starting at start begins a
+// table reference: it directly follows FROM, JOIN, LATERAL or ONLY, or a
+// comma in a FROM list.
+func startsRelationRef(sql string, start int) bool {
+	i := start - 1
+	for i >= 0 && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n' || sql[i] == '\r') {
+		i--
+	}
+	if i < 0 {
+		return false
+	}
+	if sql[i] == ',' {
+		return inRelationList(sql, i)
+	}
+	end := i + 1
+	for i >= 0 && isIdentChar(sql[i]) {
+		i--
+	}
+	switch strings.ToLower(sql[i+1 : end]) {
+	case "from", "join", "lateral", "only":
+		return true
+	}
+	return false
 }
 
 func skipSQLSpace(sql string, i int) int {
