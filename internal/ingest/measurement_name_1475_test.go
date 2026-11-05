@@ -1,9 +1,9 @@
 package ingest
 
 // #1475: buffer, coverage and tier-cache keys are database + "/" +
-// measurement, so the buffer refuses a measurement containing "/" before any
-// WAL work, on every path, as a content refusal. Entry points validate names
-// first; this is the backstop for one that does not.
+// measurement, so the buffer refuses a database or measurement containing "/"
+// before any WAL work, on every path, as a content refusal. Entry points
+// validate names first; this is the backstop for one that does not.
 
 import (
 	"context"
@@ -17,36 +17,45 @@ import (
 
 const slashMeasurement = "cpu/load"
 
-func TestBufferRefusesAMeasurementWithASlashOnEveryPath(t *testing.T) {
+func TestBufferRefusesASlashInEitherKeyNameOnEveryPath(t *testing.T) {
 	ctx := context.Background()
 	cols := func() map[string][]interface{} {
 		return map[string][]interface{}{"time": {time.Now().UnixMicro()}, "value": {1.0}}
 	}
-	for name, write := range map[string]func(*ArrowBuffer) error{
-		"WriteColumnarRecord": func(b *ArrowBuffer) error {
-			return b.WriteColumnarRecord(ctx, "db", &models.ColumnarRecord{Measurement: slashMeasurement, Columnar: true, Columns: cols()})
-		},
-		"WriteColumnarDirect": func(b *ArrowBuffer) error { return b.WriteColumnarDirect(ctx, "db", slashMeasurement, cols()) },
-		"WriteTypedColumnarDirect": func(b *ArrowBuffer) error {
-			batch := &TypedColumnBatch{Data: map[string]interface{}{"time": []int64{time.Now().UnixMicro()}, "value": []float64{1}}}
-			return b.WriteTypedColumnarDirect(ctx, "db", slashMeasurement, batch, 1)
-		},
-		"WriteColumnarDirectReplay": func(b *ArrowBuffer) error {
-			return b.WriteColumnarDirectReplay(ctx, "db", slashMeasurement, cols(), "")
-		},
+	for _, names := range []struct {
+		label, database, measurement, quoted string
+		want                                 error
+	}{
+		{"measurement", "db", slashMeasurement, `"cpu/load"`, ErrUnstorableMeasurementName},
+		{"database", "spoke/db", "cpu", `"spoke/db"`, ErrUnstorableDatabaseName},
 	} {
-		t.Run(name, func(t *testing.T) {
-			b, w := newCheckpointBuffer(1000)
-			defer b.Close()
-			err := write(b)
-			require.ErrorIs(t, err, ErrUnstorableMeasurementName)
-			require.True(t, IsContentRefusal(err))
-			require.Contains(t, err.Error(), `"cpu/load"`)
-			if handedOut, _ := w.counts(); handedOut != 0 {
-				t.Fatalf("a refused write reached the WAL (%d entries)", handedOut)
-			}
-			require.Zero(t, b.BufferedBytes(), "a refused write was buffered")
-		})
+		db, m := names.database, names.measurement
+		for name, write := range map[string]func(*ArrowBuffer) error{
+			"WriteColumnarRecord": func(b *ArrowBuffer) error {
+				return b.WriteColumnarRecord(ctx, db, &models.ColumnarRecord{Measurement: m, Columnar: true, Columns: cols()})
+			},
+			"WriteColumnarDirect": func(b *ArrowBuffer) error { return b.WriteColumnarDirect(ctx, db, m, cols()) },
+			"WriteTypedColumnarDirect": func(b *ArrowBuffer) error {
+				batch := &TypedColumnBatch{Data: map[string]interface{}{"time": []int64{time.Now().UnixMicro()}, "value": []float64{1}}}
+				return b.WriteTypedColumnarDirect(ctx, db, m, batch, 1)
+			},
+			"WriteColumnarDirectReplay": func(b *ArrowBuffer) error {
+				return b.WriteColumnarDirectReplay(ctx, db, m, cols(), "")
+			},
+		} {
+			t.Run(names.label+"/"+name, func(t *testing.T) {
+				b, w := newCheckpointBuffer(1000)
+				defer b.Close()
+				err := write(b)
+				require.ErrorIs(t, err, names.want)
+				require.True(t, IsContentRefusal(err))
+				require.Contains(t, err.Error(), names.quoted)
+				if handedOut, _ := w.counts(); handedOut != 0 {
+					t.Fatalf("a refused write reached the WAL (%d entries)", handedOut)
+				}
+				require.Zero(t, b.BufferedBytes(), "a refused write was buffered")
+			})
+		}
 	}
 }
 
@@ -69,9 +78,9 @@ func TestWriteDropsASlashMeasurementAndWritesTheRest(t *testing.T) {
 	}
 }
 
-func TestMeasurementBackstopAcceptsOrdinaryNames(t *testing.T) {
-	for _, m := range []string{"cpu", "cpu-load", "cpu_load", "CPU.load", "x"} {
-		require.NoError(t, unstorableMeasurementError(m), m)
+func TestKeyBackstopAcceptsOrdinaryNames(t *testing.T) {
+	for _, n := range []string{"cpu", "cpu-load", "cpu_load", "CPU.load", "x", "rocket.01"} {
+		require.NoError(t, unstorableKeyError(n, n), n)
 	}
 }
 

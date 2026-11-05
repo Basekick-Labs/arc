@@ -7875,16 +7875,19 @@ thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
 
-### The buffer refuses a measurement name containing "/" ([#1475](https://github.com/Basekick-Labs/arc/issues/1475))
+### The buffer refuses a database or measurement name containing "/" ([#1475](https://github.com/Basekick-Labs/arc/issues/1475))
 
 Buffer, coverage and tier-cache keys are `database + "/" + measurement`, and
-storage paths are built the same way. They need a measurement with no `/`,
-which every ingest entry point already guarantees by validating names (a
-letter, then letters, digits, `_` or `-`). The buffer now refuses such a name
-itself, before any WAL work, as a content refusal, so a future entry point
-that skipped validation cannot make two measurements share a key. No supported
-write path can reach it. Database names are still validated only at the entry
-points.
+storage paths are built the same way. Ingest and cluster code split buffer
+keys at the first `/`, which needs a database name with no `/`; exact lookups
+and storage paths need a measurement name with no `/`. Every ingest entry
+point already guarantees both by validating names, but entry points have
+missed the database check before (#300, #993, #1010). The buffer now refuses
+either name itself, before any WAL work, as a content refusal, so a future
+entry point that skipped validation cannot make two series share a key. No
+supported write path can reach it: edge-sync spoke namespaces, whose database
+names do contain `/`, reach storage as files and never pass through the
+buffer.
 
 A test now also pins how the Iceberg exporter reads a metadata file's version
 (`00004-<uuid>.metadata.json` and `v4.metadata.json` are both version `4`): it
