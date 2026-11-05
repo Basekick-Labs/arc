@@ -1027,6 +1027,11 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	features := scanSQLFeatures(maskInput)
 	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	// As in ValidateSQLRequest, and in the same order (after the comments are
+	// gone, so a comment cannot open a masking frame): the FROM of
+	// `IS [NOT] DISTINCT FROM` and of EXTRACT/TRIM/… is not a table position,
+	// so `host IS DISTINCT FROM 'a'` is a valid predicate (#1472).
+	normalised, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalised)
 	if stringLiteralInTablePosition(normalised) {
 		return false, fmt.Errorf("WHERE clause may not put a string literal in table position (replacement scans are disabled)")
 	}
