@@ -84,7 +84,8 @@ func TestCommaJoinRewrite_Issue978(t *testing.T) {
 		{
 			name: "comma table inside a WHERE subquery",
 			sql:  "SELECT * FROM cpu WHERE host IN (SELECT host FROM a, b)",
-			want: []string{"FROM " + rp("default", "a"), ", " + rp("default", "b") + ", union_by_name=true))"},
+			// Two tables in one FROM are named after themselves (#1483).
+			want: []string{"FROM " + rp("default", "a"), ", " + rp("default", "b") + `, union_by_name=true) AS "b")`},
 		},
 		{
 			name:    "comma tables inside a CTE body and after the CTE",
@@ -116,7 +117,7 @@ func TestCommaJoinRewrite_Issue978(t *testing.T) {
 		{
 			name: "FROM-first form with a comma table before SELECT",
 			sql:  "FROM a, b SELECT *",
-			want: []string{"FROM " + rp("default", "a"), ", " + rp("default", "b") + ", union_by_name=true) SELECT *"},
+			want: []string{"FROM " + rp("default", "a"), ", " + rp("default", "b") + `, union_by_name=true) AS "b" SELECT *`},
 		},
 
 		// --- negative: a comma that is not a cross-join must not rewrite ---

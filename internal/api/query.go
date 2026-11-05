@@ -2279,10 +2279,23 @@ localProcessing:
 		return respondError(c, fiber.StatusForbidden, err.Error(), timestamp, start)
 	}
 
+	// Compute effective timeout. Its deadline bounds the transform below and
+	// the execution after it (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+
 	// Convert SQL to storage paths
-	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(c.Context(), req.SQL, headerDB)
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(transformCtx, req.SQL, headerDB)
+	cancelTransform()
 	if err != nil {
 		m.IncQueryErrors()
+		if errors.Is(err, errQueryTimedOut) {
+			m.IncQueryTimeouts()
+		}
 		return respondError(c, transformErrorStatus(err), err.Error(), timestamp, start)
 	}
 	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
@@ -2321,12 +2334,6 @@ localProcessing:
 		c.Set("X-Arc-Query-ID", queryID)
 	}
 
-	// Compute effective timeout
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
-
 	// Check for profiling mode
 	profileMode := c.Get("x-arc-profile") == "true"
 
@@ -2339,8 +2346,8 @@ localProcessing:
 		ctx = queryCtx
 	}
 	var cancel context.CancelFunc
-	if effectiveTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
+	if !deadline.IsZero() {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
 		// Note: cancel is called inside the stream writer callback, not deferred here,
 		// because the stream writer runs after this function returns.
 	}
@@ -3445,6 +3452,11 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 		transformed = h.convertSQLToStoragePaths(ctx, sql)
 	}
 
+	// Never cache, and never execute, SQL the transform did not finish: a
+	// reference it left unrewritten can keep a path-shaped quoted name.
+	if err := transformContextErr(ctx); err != nil {
+		return "", false, nil, err
+	}
 	// Never cache, and never execute, SQL built around a rejected name: the
 	// transform leaves an empty path behind, which would read the backend root.
 	if pathFailure.err != nil {
@@ -3504,6 +3516,10 @@ func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sq
 
 	ctx, pathFailure := withStoragePathFailure(ctx)
 	convertedSQL := h.convertSingleTableQuery(ctx, sql, sqlLower, headerDB)
+	// See getTransformedSQLWithRefs.
+	if err := transformContextErr(ctx); err != nil {
+		return "", false, nil, err
+	}
 	if pathFailure.err != nil {
 		return "", false, nil, pathFailure.err
 	}
@@ -3577,72 +3593,76 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
 
-	// Names the query qualifies columns with (#1447), collected before any
-	// rewrite: the storage paths emitted below contain dots of their own.
-	qualified := qualifierNames(sql, resolveIdent)
+	// Names the query qualifies columns with (#1447), and names it gives
+	// other relations (#1450), collected before any rewrite.
+	qualified, otherAliases := qualifierAndAliasNames(sql, resolveIdent)
+
+	// Each pass below writes a one-byte sentinel for the reference it
+	// rewrites and keeps the expression aside; expand puts them in at the
+	// end, so no pass scans another's output (#1482, deferred_refs.go).
+	refs := newDeferredRefs(ctx, cteNames, qualified, otherAliases)
+	if refs.refuseNUL(sql) {
+		return sql
+	}
 
 	// Handle tables continuing the FROM list after a cross-join comma:
 	// `FROM a, b` and `FROM a, db.b` (#978). Runs FIRST, on masked SQL the
-	// FROM/JOIN passes have not touched, so the storage paths they emit are
-	// never tokenised (a storage root containing a paren or a comma would
-	// otherwise confuse the walker). Its own output starts with "," — the
-	// clause keyword, re-emitted the way FROM/JOIN are — so the FROM/JOIN
-	// patterns below never match inside it.
-	commaSQL := sql
-	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
+	// FROM/JOIN passes have not touched. Its references start at the comma,
+	// which the emitted expression re-emits as its clause keyword.
+	sql = refs.replaceComma(sql, func(ref commaJoinRef) (deferredRef, bool) {
 		if ref.db != "" {
 			db, _ := resolveIdent(ref.db)
 			table, tableOK := resolveIdent(ref.table)
 			path := h.getStoragePath(ctx, db, table)
-			return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, ","), commaSQL, ref.end, table, tableOK, qualified), true
+			return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, table, tableOK), true
 		}
 		// Same guard chain as the FROM handler below.
 		if cteNames[strings.ToLower(ref.table)] {
-			return "", false
+			return deferredRef{}, false
 		}
 		resolved, resolvedOK := resolveIdent(ref.table)
 		if cteNames[strings.ToLower(resolved)] {
-			return "", false
+			return deferredRef{}, false
 		}
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return "", false
+			return deferredRef{}, false
 		}
 		path := h.getStoragePath(ctx, "default", resolved)
-		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, ","), commaSQL, ref.end, resolved, resolvedOK, qualified), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, resolved, resolvedOK), true
 	})
 
 	// Handle FROM database.table references
-	sql = replaceTableRefs(sql, patternDBTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternDBTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 3 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		db, _ := resolveIdent(parts[1])
 		table, tableOK := resolveIdent(parts[2])
 		path := h.getStoragePath(ctx, db, table)
-		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, table, tableOK, qualified)
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, table, tableOK), true
 	})
 
 	// Handle JOIN database.table references (includes LATERAL JOIN)
-	sql = replaceTableRefs(sql, patternJoinDBTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternJoinDBTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 4 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		db, _ := resolveIdent(parts[2])
 		table, tableOK := resolveIdent(parts[3])
 		path := h.getStoragePath(ctx, db, table)
-		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, table, tableOK, qualified)
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, table, tableOK), true
 	})
 
 	// Handle FROM simple_table references
-	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternSimpleTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 2 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		table := strings.ToLower(parts[1])
 
 		// Skip if this is a CTE name - CTEs are virtual tables, not physical storage
 		if cteNames[table] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// A quoted name resolves before the skip/CTE checks below run against
@@ -3651,61 +3671,70 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		// same virtual table in DuckDB whether or not the reference is quoted.
 		resolved, resolvedOK := resolveIdent(parts[1])
 		if cteNames[strings.ToLower(resolved)] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
-		// Skip already converted read_parquet, system tables, etc.
+		// Skip system tables, etc.
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Check if followed by a dot (database.table already handled) or parenthesis (function call)
 		if isDotOrCallAt(sql, end) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		path := h.getStoragePath(ctx, "default", resolved)
-		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK, qualified)
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK), true
 	})
 
 	// Handle JOIN simple_table references (includes LATERAL JOIN)
-	sql = replaceTableRefs(sql, patternJoinSimpleTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternJoinSimpleTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 3 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		table := strings.ToLower(parts[2])
 
 		// Skip if this is a CTE name - CTEs are virtual tables, not physical storage
 		if cteNames[table] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Same resolve-then-check ordering as the FROM handler above.
 		resolved, resolvedOK := resolveIdent(parts[2])
 		if cteNames[strings.ToLower(resolved)] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
-		// Skip already converted read_parquet, system tables, etc.
+		// Skip system tables, etc.
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Check if followed by a dot or parenthesis
 		if isDotOrCallAt(sql, end) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		path := h.getStoragePath(ctx, "default", resolved)
-		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK, qualified)
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK), true
 	})
 
-	// Restore masked FROM keywords and string literals. Both use content-
-	// addressed placeholders, so the intermediate length-changing regex
-	// rewrites above are safe. Identifier placeholders consumed by the table
-	// rewrites above are gone from the SQL (their names went into storage
-	// paths); the unmask restores only the ones that remain — quoted column
-	// names, aliases, and any reference left unrewritten.
+	// A request that ended during the passes has its error recorded; the
+	// caller refuses the partly rewritten SQL.
+	if refs.cancelled() {
+		return sql
+	}
+
+	// Put the expressions in, then restore masked FROM keywords and string
+	// literals, in that order: a literal can hold a NUL, which expand would
+	// read as a sentinel. Both masks use content-addressed placeholders, so
+	// the length-changing rewrites above are safe. Identifier placeholders
+	// consumed by the table rewrites above are gone from the SQL (their
+	// names went into storage paths); the unmask restores only the ones that
+	// remain — quoted column names, aliases, and any reference left
+	// unrewritten.
+	sql = refs.expand(sql)
 	sql = sqlutil.UnmaskFromKeywordsInFunctionBodies(sql, fromMasks)
 	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
@@ -3784,6 +3813,12 @@ var errColdTierUnavailable = errors.New("this query reads data in the cold stora
 // transform: 503 for a cold tier this node cannot read, 400 otherwise (a name
 // that cannot become a storage path).
 func transformErrorStatus(err error) int {
+	if errors.Is(err, errQueryTimedOut) {
+		return fiber.StatusGatewayTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return fiber.StatusServiceUnavailable
+	}
 	if errors.Is(err, errColdTierUnavailable) {
 		return fiber.StatusServiceUnavailable
 	}
@@ -3791,6 +3826,47 @@ func transformErrorStatus(err error) int {
 		return fiber.StatusInternalServerError
 	}
 	return fiber.StatusBadRequest
+}
+
+// errQueryTimedOut answers a request whose deadline passed while its SQL was
+// being rewritten, with the message and status (504) an execution timeout
+// gets. The rewrite is linear but not free: at query.max_sql_length's ceiling
+// it can take seconds, and query.timeout bounds the whole request (#1482).
+var errQueryTimedOut = errors.New("Query timed out")
+
+// transformContextErr is the error a transform run under ctx must be refused
+// with, or nil. It is checked before the storage-path failure: a deadline
+// that passes inside a lookup can make that lookup refuse the read (a cold
+// tier it could not ask), and the refusal must still be reported as the
+// timeout that caused it.
+func transformContextErr(ctx context.Context) error {
+	switch err := ctx.Err(); {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.DeadlineExceeded):
+		return errQueryTimedOut
+	default:
+		return err
+	}
+}
+
+// requestDeadline is the time by which a request with the given timeout must
+// be answered, or zero for none. The SQL transform and the query's execution
+// share it, so query.timeout bounds the request rather than each half.
+func requestDeadline(timeout time.Duration) time.Time {
+	if timeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(timeout)
+}
+
+// transformContext bounds the SQL transform by deadline. Without one the
+// transform runs on parent, as it always did.
+func transformContext(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return parent, func() {}
+	}
+	return context.WithDeadline(parent, deadline)
 }
 
 // refuseReadWithoutColdTier records errColdTierUnavailable on ctx and reports
@@ -3959,48 +4035,6 @@ func quotePath(path string) string {
 // DuckDB handles projection pushdown internally when it sees which columns are actually used.
 func buildReadParquetOptions() string {
 	return "union_by_name=true"
-}
-
-// replaceTableRefs rewrites every match of re in sql using fn.
-//
-// It exists because the rewriter's "is this identifier followed by '.' or '('?"
-// lookahead needs the offset of the match within the CURRENT string. The
-// obvious implementation — regexp.ReplaceAllStringFunc plus
-// strings.Index(sqlLower, match) to recover the offset — is wrong: sqlLower is
-// computed once, before the earlier FROM/JOIN passes rewrite sql, so the
-// recovered index refers to the pre-rewrite string. Slicing the post-rewrite
-// string at that stale offset lands inside an already-emitted
-// read_parquet('…') and the '(' there trips the function-call guard, silently
-// leaving a legitimate table un-rewritten (`FROM a JOIN cross` left `cross`
-// alone, while the longer `crossx` happened to land on a different character
-// and worked).
-//
-// fn receives the submatch strings and the byte offset just past the match in
-// the string being scanned, and returns the replacement text. parts[0] is
-// always the full match, so callers can `return parts[0]` to leave a match
-// untouched; parts for groups that did not participate are empty strings.
-func replaceTableRefs(sql string, re *regexp.Regexp, fn func(parts []string, end int) string) string {
-	matches := re.FindAllStringSubmatchIndex(sql, -1)
-	if len(matches) == 0 {
-		return sql
-	}
-
-	var b strings.Builder
-	b.Grow(len(sql))
-	last := 0
-	for _, m := range matches {
-		parts := make([]string, len(m)/2)
-		for i := range parts {
-			if m[2*i] >= 0 {
-				parts[i] = sql[m[2*i]:m[2*i+1]]
-			}
-		}
-		b.WriteString(sql[last:m[0]])
-		b.WriteString(fn(parts, m[1]))
-		last = m[1]
-	}
-	b.WriteString(sql[last:])
-	return b.String()
 }
 
 // isDotOrCallAt reports whether the first non-blank byte at or after end is a
@@ -4675,101 +4709,108 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
 
-	// See convertSQLToStoragePaths (#1447).
-	qualified := qualifierNames(sql, resolveIdent)
+	// See convertSQLToStoragePaths (#1447, #1450, #1482).
+	qualified, otherAliases := qualifierAndAliasNames(sql, resolveIdent)
+	refs := newDeferredRefs(ctx, cteNames, qualified, otherAliases)
+	if refs.refuseNUL(sql) {
+		return sql
+	}
 
 	// Handle tables continuing the FROM list after a cross-join comma (#978);
 	// runs first, see convertSQLToStoragePaths. A qualified name is left alone
 	// here, as the other passes of this path leave db.table alone:
 	// hasCrossDatabaseSyntax rejects it before the transform runs under a
 	// header database.
-	commaSQL := sql
-	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
+	sql = refs.replaceComma(sql, func(ref commaJoinRef) (deferredRef, bool) {
 		if ref.db != "" {
-			return "", false
+			return deferredRef{}, false
 		}
 		if cteNames[strings.ToLower(ref.table)] {
-			return "", false
+			return deferredRef{}, false
 		}
 		resolved, resolvedOK := resolveIdent(ref.table)
 		if cteNames[strings.ToLower(resolved)] {
-			return "", false
+			return deferredRef{}, false
 		}
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return "", false
+			return deferredRef{}, false
 		}
 		path := h.getStoragePath(ctx, database, resolved)
-		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, ","), commaSQL, ref.end, resolved, resolvedOK, qualified), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, resolved, resolvedOK), true
 	})
 
 	// Handle FROM simple_table references - apply header database
-	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternSimpleTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 2 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		table := strings.ToLower(parts[1])
 
 		// Skip if this is a CTE name
 		if cteNames[table] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Resolve-then-check, matching convertSQLToStoragePaths: the CTE and
 		// skip checks must see the clean name, never a placeholder token.
 		resolved, resolvedOK := resolveIdent(parts[1])
 		if cteNames[strings.ToLower(resolved)] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
-		// Skip already converted read_parquet, system tables, etc.
+		// Skip system tables, etc.
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Check if followed by a dot (function call like db.func()) or parenthesis
 		if isDotOrCallAt(sql, end) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(ctx, database, resolved)
-		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK, qualified)
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK), true
 	})
 
 	// Handle JOIN simple_table references - apply header database
-	sql = replaceTableRefs(sql, patternJoinSimpleTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternJoinSimpleTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 3 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		table := strings.ToLower(parts[2])
 
 		// Skip if this is a CTE name
 		if cteNames[table] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Same resolve-then-check ordering as the FROM handler above.
 		resolved, resolvedOK := resolveIdent(parts[2])
 		if cteNames[strings.ToLower(resolved)] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
-		// Skip already converted read_parquet, system tables, etc.
+		// Skip system tables, etc.
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Check if followed by a dot or parenthesis
 		if isDotOrCallAt(sql, end) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(ctx, database, resolved)
-		return aliasTableRef(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK, qualified)
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK), true
 	})
 
-	// Restore masked FROM keywords and original string literals.
+	// See convertSQLToStoragePaths for the order of these.
+	if refs.cancelled() {
+		return sql
+	}
+	sql = refs.expand(sql)
 	sql = sqlutil.UnmaskFromKeywordsInFunctionBodies(sql, fromMasks)
 	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
@@ -5372,10 +5413,25 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// Create context with timeout if configured; a governance policy's
+	// MaxDuration overrides the global timeout (#702). Its deadline bounds
+	// the transform and the count query (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(c.Context(), req.SQL, headerDB)
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
+	cancelTransform()
 	if err != nil {
-		metrics.Get().IncQueryErrors()
+		if errors.Is(err, errQueryTimedOut) {
+			metrics.Get().IncQueryTimeouts()
+		} else {
+			metrics.Get().IncQueryErrors()
+		}
 		return c.Status(transformErrorStatus(err)).JSON(EstimateResponse{
 			Success:         false,
 			Error:           err.Error(),
@@ -5403,16 +5459,10 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 
 	m := metrics.Get()
 
-	// Create context with timeout if configured; a governance policy's
-	// MaxDuration overrides the global timeout (#702).
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
 	ctx := c.UserContext()
 	var cancel context.CancelFunc
-	if effectiveTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
+	if !deadline.IsZero() {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
 
@@ -5929,14 +5979,28 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		})
 	}
 
+	// A governance policy's MaxDuration overrides the global timeout (#702),
+	// matching the POST handler's effectiveTimeout semantics. Its deadline
+	// bounds the transform and the execution (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
-	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(c.Context(), sql, "")
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, sql, "")
+	cancelTransform()
 	if err != nil {
 		m.IncQueryErrors()
 		msg := "Invalid query: " + err.Error()
-		if errors.Is(err, errColdTierUnavailable) {
+		if errors.Is(err, errColdTierUnavailable) || errors.Is(err, errQueryTimedOut) || errors.Is(err, context.Canceled) {
 			msg = err.Error()
+		}
+		if errors.Is(err, errQueryTimedOut) {
+			m.IncQueryTimeouts()
 		}
 		return c.Status(transformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,
@@ -5963,13 +6027,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Create context with timeout if configured (0 = no timeout).
 	// Same pattern as POST /api/v1/query: start from UserContext, watch the
-	// client connection for disconnects, then wrap with queryTimeout (#308).
-	// A governance policy's MaxDuration overrides the global timeout (#702),
-	// matching the POST handler's effectiveTimeout semantics.
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
+	// client connection for disconnects, then wrap with the request's
+	// deadline (#308, #1482).
 
 	// Register with the query registry so this endpoint appears in
 	// /api/v1/queries and can be cancelled (#731). The registered statement is
@@ -6015,8 +6074,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	ctx := baseCtx
 	var cancel context.CancelFunc
-	if effectiveTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
+	if !deadline.IsZero() {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
 		// cancel is invoked inside the stream writer callback (or on error
 		// paths below), not deferred here, because the stream writer runs
 		// after this function returns.
