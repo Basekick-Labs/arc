@@ -1999,8 +1999,14 @@ func Load() (*Config, error) {
 // DefaultMaxSQLLength is query.max_sql_length's default, the cap Arc always
 // had. MinMaxSQLLength and MaxSQLLengthCeiling bound what it accepts: below
 // the floor ordinary queries stop fitting, and above the ceiling one query's
-// validation and rewrite cost more than half a second of CPU before DuckDB
-// starts (about 0.5 s per MiB, linear).
+// validation and rewrite cost too much CPU before DuckDB starts.
+//
+// That cost is linear in the query's length since #1479, but depends on its
+// shape. Measured at the ceiling (1 MiB): a JOIN chain about 1.4 s, a run of
+// `FROM x` about 4 s, and a comma join (`FROM x, x, …`, the worst shape)
+// about 14 s, because the comma-join rewrite expands each reference about 30x
+// before the FROM/JOIN passes scan it (#1482). At the 10 KB default the comma
+// join costs about 0.15 s. Raising the cap trades that CPU for longer queries.
 const (
 	DefaultMaxSQLLength = 10000
 	MinMaxSQLLength     = 1000

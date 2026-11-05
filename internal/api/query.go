@@ -3523,6 +3523,9 @@ func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sq
 // CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
 // String literals and comments are protected from regex matching.
 func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string) string {
+	// One scan of the SQL for the pruner's SQL-only facts, shared by every
+	// table reference the rewrite below visits (#1479).
+	ctx = pruning.WithQueryFacts(ctx)
 	originalSQL := sql
 
 	// Phase 0a: Rewrite regex functions to faster string functions BEFORE masking
@@ -3806,7 +3809,7 @@ func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, 
 	// skip them without asking again.
 	pruning.MarkVolatile(ctx)
 	var start, end *time.Time
-	if tr := h.pruner.ExtractTimeRange(originalSQL); tr != nil {
+	if tr := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL); tr != nil {
 		if !tr.StartAssumed {
 			s := tr.Start
 			start = &s
@@ -4388,7 +4391,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// backend; a tier verified to hold no data for the time range is dropped
 	// entirely (a recent-range dashboard query never lists or reads cold
 	// object storage beyond the cached parent listings).
-	timeRange := h.pruner.ExtractTimeRange(originalSQL)
+	timeRange := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL)
 	results := make([]tierPruneResult, 0, len(sources))
 	for _, src := range sources {
 		if src.tier == tiering.TierCold && timeRange != nil && timeRange.StartAssumed {
@@ -4607,6 +4610,8 @@ func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLowe
 // skips the database.table regex patterns since all tables use the header-specified database.
 // This provides ~50% reduction in regex operations compared to convertSQLToStoragePaths.
 func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context, sql string, database string) string {
+	// See convertSQLToStoragePaths (#1479).
+	ctx = pruning.WithQueryFacts(ctx)
 	originalSQL := sql
 	sqlLower := strings.ToLower(sql)
 
