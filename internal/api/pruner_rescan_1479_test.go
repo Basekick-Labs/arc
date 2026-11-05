@@ -66,9 +66,13 @@ func TestColdTierGuardScansTheQueryOnce(t *testing.T) {
 // TestMultiTierReadScansTheQueryOnce: a measurement with a cold tier goes
 // through buildMultiTierReadParquet, which reads the range, once per
 // reference. Reaching it through the rewrite needs a tiering manager and
-// router, so the per-reference calls are made directly, on one per-query
-// context as the rewrite makes them (multiTierRead does the same for #1364);
-// the rewrite installing that context is pinned by the tests around this one.
+// router, so the per-reference calls are made directly (as multiTierRead does
+// for #1364), on one per-query context as the rewrite makes them; the rewrite
+// installing that context is pinned by the tests around this one.
+//
+// This test and TestColdTierGuardScansTheQueryOnce diff the process-wide
+// pruning.TimeRangeScans counter: they must stay sequential (no t.Parallel),
+// and no earlier test may leave a goroutine running queries.
 func TestMultiTierReadScansTheQueryOnce(t *testing.T) {
 	e := newFieldSchemaEnv(t, fieldschema.Options{}, true)
 	e.write("sch", "both", time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC), map[string]interface{}{"host": []string{"a"}, "v": []int64{1}})

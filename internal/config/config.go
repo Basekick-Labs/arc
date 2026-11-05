@@ -2002,11 +2002,13 @@ func Load() (*Config, error) {
 // validation and rewrite cost too much CPU before DuckDB starts.
 //
 // That cost is linear in the query's length since #1479, but depends on its
-// shape. Measured at the ceiling (1 MiB): a JOIN chain about 1.4 s, a run of
-// `FROM x` about 4 s, and a comma join (`FROM x, x, …`, the worst shape)
-// about 14 s, because the comma-join rewrite expands each reference about 30x
-// before the FROM/JOIN passes scan it (#1482). At the 10 KB default the comma
-// join costs about 0.15 s. Raising the cap trades that CPU for longer queries.
+// shape. Measured for a whole request at the ceiling (1 MiB): a JOIN chain
+// about 1.4 s, a run of `FROM x` about 4.4 s, and a comma join of 2-byte
+// references (`FROM x,x,x…`, the worst shape) about 21 s. The comma join's
+// cost is mostly after validation: its rewrite expands each reference about
+// 30x, and later passes scan the expanded SQL (#1482). At the 10 KB default
+// the worst shape costs about 0.2 s. Raising the cap trades that CPU for
+// longer queries.
 const (
 	DefaultMaxSQLLength = 10000
 	MinMaxSQLLength     = 1000

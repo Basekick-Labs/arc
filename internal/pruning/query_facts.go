@@ -28,13 +28,13 @@ type queryFactsCtxKey struct{}
 // The rewriter calls the pruner once per table reference, always with the
 // same SQL, and each call used to re-scan the whole query: quadratic in the
 // query's length for a query made of many short references. A comma join
-// (`FROM x, x, x, …`) took 5.6 s at the default 10 KB query limit.
+// (`FROM x,x,x,…`) took 9.8 s at the default 10 KB query limit.
 //
 // Every value here depends on the SQL only, never on the table, so sharing it
 // across references cannot change a result. The time range is read at the
 // first reference's now; a range only exists for a single-table query (see
-// scanTimeBoundsAt), so in practice it is shared by one reference's calls
-// (the cold-tier guard, the tier split and the partition pruning).
+// scanTimeBoundsAt), so in practice it is shared by one reference's calls:
+// the cold-tier guard, then either the tier split or the partition pruning.
 type queryFacts struct {
 	mu        sync.Mutex
 	sql       string
@@ -76,8 +76,11 @@ func QueryFactsComputed(ctx context.Context) int {
 // p.enabled: the cold-tier guard and the tier split read the range whether
 // or not partition pruning is on.
 //
-// The memo compares the SQL with ==, which returns at once when both strings
-// share their bytes; the rewriter passes the same string to every call.
+// The memo compares the SQL with ==. The rewriter passes the same string to
+// every call, and on amd64 and arm64 (the platforms Arc ships; its DuckDB
+// bindings exist for no others) runtime.memequal returns at once for two
+// strings that share their bytes. On an architecture without that fast path
+// the comparison would cost the SQL's length per reference again.
 func (p *PartitionPruner) facts(ctx context.Context, sql string) (tr *TimeRange, relative bool, hash [sha256.Size]byte) {
 	qf, ok := ctx.Value(queryFactsCtxKey{}).(*queryFacts)
 	if !ok {

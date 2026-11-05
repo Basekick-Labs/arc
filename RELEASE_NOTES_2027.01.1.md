@@ -364,11 +364,12 @@ max_sql_length = 200000
   so a 1 MB query with 50,000 literals spent 9.3 s there, and a 2.3 MB one
   34 s. Both now take under 0.6 s. Validation and rewriting are linear in
   the query's length (since [#1479](https://github.com/Basekick-Labs/arc/issues/1479)),
-  but their cost depends on the query's shape. At the 1 MiB ceiling they
-  cost about 1.4 s of CPU for a JOIN chain, and up to about 14 s for a comma
-  join of many short references (`FROM x, x, …`), before DuckDB starts
+  but their cost depends on the query's shape. At the 1 MiB ceiling one
+  request costs about 1.4 s of CPU for a JOIN chain, and up to about 21 s for
+  a comma join of many short references (`FROM x,x,x…`), most of it in
+  passes over the rewritten SQL
   ([#1482](https://github.com/Basekick-Labs/arc/issues/1482) tracks that
-  shape). At the 10 KB default, about 0.15 s at worst.
+  shape). At the 10 KB default, about 0.2 s at worst.
 - Queries longer than 10,000 characters are not kept in the SQL transform
   cache, so a raised limit leaves the cache's memory bound unchanged.
 
@@ -854,8 +855,9 @@ on the table. A query made of many short references therefore took time
 quadratic in its length. Any user with query rights could hold a CPU core
 with one request:
 
-| Query | 10 KB (default limit) | 20 KB |
+| Crafted query (whole request) | 10 KB (default limit) | 20 KB |
 |---|---|---|
+| Comma join, `SELECT 1 FROM x,x,x,…` | 9.8 s → 0.21 s | |
 | Comma join, `SELECT 1 FROM x, x, x, …` | 5.6 s → 0.15 s | 21.8 s → 0.29 s |
 | `SELECT 1 x from x from …` | 1.6 s → 0.06 s | 6.6 s → 0.10 s |
 
