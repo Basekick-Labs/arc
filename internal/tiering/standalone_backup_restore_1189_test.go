@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -153,18 +152,6 @@ func newStandaloneLegacyRestoreFixture(t *testing.T, backupBodies, coldBodies ma
 	t.Cleanup(cleanup)
 
 	workDir := t.TempDir()
-	if stateDir := os.Getenv("ARC_1189_TEST_STATE_DIR"); stateDir != "" {
-		var err error
-		workDir, err = os.MkdirTemp(stateDir, "issue1189-")
-		if err != nil {
-			t.Fatalf("create isolated test data directory in mounted project volume: %v", err)
-		}
-		t.Cleanup(func() {
-			if err := os.RemoveAll(workDir); err != nil {
-				t.Errorf("remove this test's isolated work directory: %v", err)
-			}
-		})
-	}
 	hot, err := storage.NewLocalBackend(filepath.Join(workDir, "hot"), zerolog.Nop())
 	if err != nil {
 		t.Fatalf("create local hot backend: %v", err)
@@ -179,7 +166,6 @@ func newStandaloneLegacyRestoreFixture(t *testing.T, backupBodies, coldBodies ma
 
 	backups := make(map[string][]byte, len(backupBodies))
 	for path, body := range backupBodies {
-		body = existingInstallBytes(t, path, body)
 		backups[path] = append([]byte(nil), body...)
 		if err := hot.Write(ctx, path, body); err != nil {
 			t.Fatalf("write hot source %s: %v", path, err)
@@ -236,27 +222,6 @@ func newStandaloneLegacyRestoreFixture(t *testing.T, backupBodies, coldBodies ma
 		backupStore: backupStore, backupDir: backupDir, backupID: created.Manifest.BackupID,
 		hot: hot, cold: cold, backupBodies: backups, coldBodies: coldBodies,
 	}
-}
-
-func existingInstallBytes(t *testing.T, path string, fallback []byte) []byte {
-	t.Helper()
-	legacyFixture := bytes.Equal(fallback, []byte("PAR1-from-legacy-backup")) || bytes.Equal(fallback, []byte("PAR1-cold-source-from-legacy-backup"))
-	if os.Getenv("ARC_1189_INSTALL_STATE") != "existing" || path != gateDailyA || !legacyFixture {
-		return fallback
-	}
-	fixturePath := os.Getenv("ARC_1189_EXISTING_FIXTURE")
-	if fixturePath == "" {
-		t.Fatal("existing-data Docker run did not provide the copied Arc Parquet fixture")
-	}
-	data, err := os.ReadFile(fixturePath)
-	if err != nil {
-		t.Fatalf("read copied existing-installation fixture: %v", err)
-	}
-	if len(data) == 0 {
-		t.Fatal("existing-installation Parquet fixture is empty")
-	}
-	t.Logf("using %d bytes from the read-only existing Arc installation fixture", len(data))
-	return data
 }
 
 func oneColdLegacyRestoreFixture(t *testing.T) *standaloneLegacyRestoreFixture {

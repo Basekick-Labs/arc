@@ -216,8 +216,8 @@ type Manifest struct {
 	// ColdRowsStaleButHot counts tier rows that say cold, have no object in the
 	// cold store, and whose file the backup carried from HOT storage anyway.
 	// NOT a gap — the data is in the backup — but a metadata disagreement an
-	// operator should see, for example while a tier scan has not yet reconciled
-	// the row.
+	// operator should see, and reachable persistently on a node whose
+	// reconciliation is role gated.
 	ColdRowsStaleButHot int64 `json:"cold_rows_stale_but_hot,omitempty"`
 	// Target names the configured backup target this backup was written to
 	// (#1085 stage B2b-1), absent when it went to backup.local_path as
