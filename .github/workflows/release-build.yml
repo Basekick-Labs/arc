@@ -538,6 +538,7 @@ jobs:
           mkdir -p ${PKG_DIR}/DEBIAN
           mkdir -p ${PKG_DIR}/usr/bin
           mkdir -p ${PKG_DIR}/etc/arc
+          mkdir -p ${PKG_DIR}/usr/share/arc
           mkdir -p ${PKG_DIR}/lib/systemd/system
           mkdir -p ${PKG_DIR}/var/lib/arc
 
@@ -545,8 +546,17 @@ jobs:
           cp "${SRC_BIN}" ${PKG_DIR}/usr/bin/arc
           chmod +x ${PKG_DIR}/usr/bin/arc
 
-          # Copy config
-          cp arc.toml ${PKG_DIR}/etc/arc/arc.toml
+          # Stock config. NOT shipped at /etc/arc/arc.toml: a file the package
+          # ships there is replaced on every upgrade, discarding the operator's
+          # edits (#1465). postinst installs this copy at /etc/arc/arc.toml only
+          # when that file does not exist, and never touches it afterwards.
+          #
+          # Not a dpkg conffile either: a conffile the operator edited makes
+          # every later upgrade prompt, and a non-interactive `apt-get install
+          # -y` then fails without --force-confold. The upgrade from a release
+          # that shipped the file as a plain file prompts even when it is
+          # unedited, because dpkg has no recorded checksum for it. Tested.
+          cp arc.toml ${PKG_DIR}/usr/share/arc/arc.toml
 
           # The unit is one file in the repo shared by deb, rpm and Arch (#1463).
           cp deploy/systemd/arc.service ${PKG_DIR}/lib/systemd/system/arc.service
@@ -593,6 +603,21 @@ jobs:
             useradd --system --home-dir /var/lib/arc --no-create-home --shell /bin/false arc
           fi
 
+          # /etc/arc/arc.toml belongs to the operator, not the package (#1465).
+          # Restore the copy preinst saved, if dpkg removed it during this
+          # upgrade: a release up to 26.09 shipped it as a package file, and
+          # dpkg deletes a package file the new version no longer ships. Else
+          # install the stock copy if there is none. An existing file is never
+          # touched.
+          SAVED=/etc/arc/.arc.toml.dpkg-save
+          if [ ! -e /etc/arc/arc.toml ] && [ -e "${SAVED}" ]; then
+            mv "${SAVED}" /etc/arc/arc.toml
+          elif [ ! -e /etc/arc/arc.toml ]; then
+            cp /usr/share/arc/arc.toml /etc/arc/arc.toml
+            chmod 644 /etc/arc/arc.toml
+          fi
+          rm -f "${SAVED}"
+
           # Set ownership
           chown -R arc:arc /var/lib/arc
           chown arc:arc /etc/arc/arc.toml
@@ -613,6 +638,31 @@ jobs:
           fi
           POSTINST
           chmod +x ${PKG_DIR}/DEBIAN/postinst
+
+          # Save the operator's config before dpkg unpacks: when the installed
+          # package shipped /etc/arc/arc.toml as a package file (every release
+          # up to 26.09) dpkg deletes it during this upgrade, or when that
+          # package is removed in favour of this variant. postinst restores it.
+          cat > ${PKG_DIR}/DEBIAN/preinst << 'PREINST'
+          #!/bin/bash
+          set -e
+          if [ -e /etc/arc/arc.toml ]; then
+            cp -p /etc/arc/arc.toml /etc/arc/.arc.toml.dpkg-save
+          fi
+          PREINST
+          chmod +x ${PKG_DIR}/DEBIAN/preinst
+
+          # purge removes the config, which dpkg does not own. Not when the
+          # other variant (arc / arc-fips) is installed and still uses it.
+          cat > ${PKG_DIR}/DEBIAN/postrm << 'POSTRM'
+          #!/bin/bash
+          set -e
+          if [ "$1" = purge ] && [ ! -e /usr/bin/arc ]; then
+            rm -f /etc/arc/arc.toml /etc/arc/.arc.toml.dpkg-save
+            rmdir /etc/arc 2>/dev/null || true
+          fi
+          POSTRM
+          chmod +x ${PKG_DIR}/DEBIAN/postrm
 
           # Create prerm script
           # Stop and disable only on removal. On an upgrade this used to
@@ -678,8 +728,11 @@ jobs:
 
           # Reinstall over itself: dpkg runs prerm "upgrade" and postinst
           # "configure <old version>", the upgrade path. The service must come
-          # back enabled and healthy, not stopped and disabled.
-          sudo dpkg -i "${DEB}"
+          # back enabled and healthy, not stopped and disabled, and an edit to
+          # /etc/arc/arc.toml must survive it (#1465).
+          echo "# smoke-test-marker" | sudo tee -a /etc/arc/arc.toml > /dev/null
+          sudo dpkg -i "${DEB}" < /dev/null || fail "non-interactive upgrade failed"
+          grep -q "smoke-test-marker" /etc/arc/arc.toml || fail "upgrade replaced the operator's /etc/arc/arc.toml"
           systemctl is-enabled arc || fail "upgrade left the service disabled"
           wait_healthy || fail "no /health after an upgrade"
 
