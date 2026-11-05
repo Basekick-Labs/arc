@@ -965,6 +965,23 @@ Two related fixes:
   the log names the file and the predicate; issue the `DELETE` again with a
   predicate the current checks accept.
 
+## Fix: continuous queries rewrite only the source reference itself ([#1487](https://github.com/Basekick-Labs/arc/issues/1487))
+
+Before a continuous query runs, Arc replaces its `FROM <database>.<measurement>`
+with a read of the measurement's files. It found that text anywhere in the
+query, including inside a string literal, a quoted identifier or a comment,
+and rewrote those occurrences too. Such a query then failed to parse. It now
+rewrites only a real table reference and leaves everything else exactly as
+written.
+
+Two related fixes:
+- `FROM /* comment */ db.cpu` is now rewritten. Before, it was left as is
+  and the query failed.
+- A query with a CTE named after its source measurement now runs, e.g.
+  `WITH cpu AS (SELECT … FROM db.cpu …) SELECT … FROM cpu`. Before, Arc
+  skipped the rewrite for it, and the query failed with `Table db.cpu does not
+  exist`.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
