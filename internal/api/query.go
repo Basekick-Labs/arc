@@ -3005,6 +3005,9 @@ func ValidateSQLRequest(sql string) error {
 	if name := sideEffectFunction(ioCheckNormalised); name != "" {
 		return &SQLValidationError{Message: "Function not allowed in user SQL: " + name}
 	}
+	if name := queryTableMacroInTablePosition(normalised, sqlutil.IdentifierNames(vMasks)); name != "" {
+		return &SQLValidationError{Message: "Table function not allowed in user SQL: " + name + "()"}
+	}
 
 	// SECURITY: reject a bare single-quoted string in table position — a
 	// DuckDB replacement scan (GHSA-w8x2-cccw-25f7, incomplete-fix residual of
@@ -3261,8 +3264,11 @@ var unicodeEscapePattern = regexp.MustCompile(`(?i)\bu&__(?:STR|IDENT)_\d+__`)
 // substring of a longer identifier.
 //
 // Maintenance: when DuckDB adds a new path-taking table function, add it here.
-// TestIOTableFunctionPattern_Family documents the set we verified against the
-// pinned DuckDB release. An extension's functions are not listed here: they
+// TestCoreTableFunctionsReviewed enumerates the linked DuckDB's table
+// functions and fails on one that is neither refused nor reviewed, so an
+// upgrade cannot add a reader silently (GHSA-r7vm-9hcg-xgf7: DuckDB added
+// parquet_full_metadata and read_duckdb after this list was written).
+// TestIOTableFunctionPattern_Family pins the names. An extension's functions are not listed here: they
 // come from database.DeniedExtensionFunctions, and an extension is loadable
 // only once its function surface is reviewed there (#440).
 var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
@@ -3273,6 +3279,9 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 	"parquet_file_metadata",
 	"parquet_kv_metadata",
 	"parquet_bloom_probe",
+	"parquet_full_metadata", // GHSA-r7vm-9hcg-xgf7
+	"read_duckdb",           // reads a DuckDB database file
+	"sql_auto_complete",     // suggests file names from the filesystem
 	"read_csv",
 	"read_csv_auto",
 	"sniff_csv",
@@ -3292,6 +3301,10 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 	"iceberg_metadata",
 	"iceberg_snapshots",
 	"arc_partition_agg",
+	// Scan an Arrow stream at a raw memory address. No SQL type can spell
+	// the POINTER arguments today; denied rather than reviewed as safe.
+	"arrow_scan",
+	"arrow_scan_dumb",
 	// The file readers of the DuckDB extensions database.extensions may load
 	// (#440), denied whether or not this node loads them.
 }, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
@@ -3321,7 +3334,51 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 // and is the reason this is not just {query, query_table}. When DuckDB or a
 // loaded extension adds another string-executing table function, add it here;
 // TestDynamicSQLFunctionPattern_Family pins the set.
-var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|json_execute_serialized_sql)\s*\(`)
+//
+// json_serialize_plan is a scalar that BINDS its SQL argument: binding a reader
+// expands its glob and reads Parquet footers, so it listed every database's
+// files and schemas (GHSA-r7vm-9hcg-xgf7). histogram_values is a system table
+// macro whose body is query_table(source): `histogram_values('<path>', col)`
+// returned another database's column values. Its sibling histogram shares the
+// name of the histogram() aggregate, so it is refused in table position only
+// (queryTableMacroInTablePosition).
+var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|json_execute_serialized_sql|json_serialize_plan|histogram_values)\s*\(`)
+
+// queryTableMacros are the system table macros that read whatever their string
+// argument names through query_table, under a name an aggregate also uses.
+// histogram(col) the aggregate is ordinary SQL; histogram('<path>', col) the
+// table macro reads the file (GHSA-r7vm-9hcg-xgf7). A table macro stands only
+// in table position and an aggregate never does, so position tells them apart.
+var queryTableMacros = map[string]bool{"histogram": true}
+
+var lateralKeyword = regexp.MustCompile(`(?i)\blateral\b`)
+
+// queryTableMacroInTablePosition returns the queryTableMacros member called in
+// table position (after FROM, JOIN, LATERAL, a cross-join comma, or as the
+// last part of a qualified name), or "". normalised is the shared validator
+// normalisation with identifier placeholders intact; identNames resolves them,
+// so `FROM "histogram"(…)` is seen. It walks with walkTablePositions, the same
+// state machine RBAC extraction uses.
+func queryTableMacroInTablePosition(normalised string, identNames map[string]string) string {
+	isolated := tablePosPlaceholder.ReplaceAllString(foldUnicodeSpace(normalised), " $0 ")
+	// LATERAL only prefixes a table reference; the walker reports LATERAL
+	// itself as the table-position token, so drop it here (`FROM cpu,
+	// LATERAL histogram(…)`). A quoted "lateral" is a placeholder, untouched.
+	isolated = lateralKeyword.ReplaceAllString(isolated, " ")
+	found := ""
+	walkTablePositions(isolated, func(p tablePosition) bool {
+		name := p.tok
+		if strings.HasPrefix(name, "__IDENT_") {
+			name = identNames[name]
+		}
+		if queryTableMacros[strings.ToLower(name)] && strings.HasPrefix(strings.TrimLeft(isolated[p.end:], " \t\n\r\f\v"), "(") {
+			found = strings.ToLower(name)
+			return true
+		}
+		return false
+	})
+	return found
+}
 
 func (h *QueryHandler) queryTransformCacheKey(sql, headerDB string) string {
 	cacheKey := h.pruner.CacheEpoch(sql) + ":" + strconv.FormatUint(h.openCompactionsGeneration(), 10) + ":" + sql
