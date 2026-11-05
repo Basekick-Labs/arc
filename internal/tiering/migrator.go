@@ -105,6 +105,11 @@ func (m *Migrator) MigrateTierFiltered(ctx context.Context, fromTier, toTier Tie
 	failed := 0
 
 	for i := 0; i < len(candidates); i += m.batchSize {
+		// Finish an admitted batch safely, but do not start another after the
+		// policy disables migration. Manifest-before-storage ordering stays intact.
+		if m.manager.readOnly || (m.manager.licenseClient != nil && !m.manager.licenseClient.CanMigrateTieredStorage()) {
+			break
+		}
 		end := i + m.batchSize
 		if end > len(candidates) {
 			end = len(candidates)

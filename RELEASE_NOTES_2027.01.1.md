@@ -34,10 +34,11 @@ migration. Supported with a local or an S3 primary.
   Cloud Storage's interop endpoint, with Iceberg enabled.
 - **Unavailable cold tier:** if the cold tier is configured but cannot be
   built, the export does not start, and the tables keep their last snapshot.
-- **Licensing:** tiering requires an Enterprise license and Iceberg export does
-  not. Without the license Arc disables tiering, so with a cold tier still
-  configured the export does not start (as for an unavailable cold tier) and
-  the tables keep their last snapshot until the license is restored.
+- **Licensing:** new tier migrations require a license and Iceberg export does
+  not. A read-only cold backend remains available when migration permission
+  ends, so configured cold data can remain in reads and exports. If that
+  backend cannot be built, export keeps its last snapshot instead of dropping
+  migrated files.
 
 DELETE of a whole cold file now also drops the query caches, as cold retention
 already did.
@@ -87,6 +88,51 @@ published in the warehouse, not the node's own catalog row:
 S3 deployment, set `iceberg.enabled = true`. The first pass registers every
 existing data file, reading each file's footer twice (once for the schema,
 once for its statistics); expect two ranged GETs per file on that pass.
+
+## Signed license-server time and cluster expiry lifecycle
+
+The development branch adds a nonce-bound signed authority clock, mandatory fresh
+online time after restart, explicit UTC paid/trial policy, RBAC-management
+read-only gating and stopped admission of new tier migrations during degradation.
+Legacy signed expirations are not blindly extended. Transient validation errors
+do not reset the timeline; data authorization remains independent of management.
+
+The controller now persists one serving node per role from paid grace day 8 and
+disables automatic replacement. At the final cutoff it fences mutations, drains
+acknowledged ingest and background work, materializes a hash-verified manifest
+namespace on each participant and seals a durable OSS handoff. Every restart
+elects one standalone process through authenticated unanimous coordination; other
+nodes remain parked and ordinary Raft transport stops. Missing participants or
+failed drains/copies block the handoff instead of permitting independent writers.
+
+This requires compatible reachable participants. Resolved generated node IDs are
+persisted, and controller restarts resume incomplete peer releases.
+Prepared identity is recovered across PID changes even before local sealing;
+that recovery never grants permission to disable Raft. Effective OSS
+configuration disables shared-storage cluster mode without editing operator
+configuration. Hot namespaces stay inside the configured roots and are isolated
+by cluster and node. The drain joins admitted MQTT work and complete tiering
+cycles, retries WAL recovery failures, and checks auth/RBAC materialization.
+Keeping expired cluster configuration can select another node after coordinated
+restarts; later OSS writes remain preserved on their accepting node, without
+automatic cross-node merging. License reactivation reconstructs available
+standalone components and retains the current OSS owner. Rebuilding the former
+cluster and reconciling divergent OSS namespaces remain separate work.
+Changed feature sets or resource limits are held pending until process
+reconstruction; a retained topology above the new machine or aggregate core limit
+remains fenced. Local seal durability is separate from global permission to leave
+Raft, so a crash before every participant persists retains a quorum recovery path.
+Isolated Docker acceptance covers paid and trial cutoffs, repeated restarts,
+shared S3 storage, generated IDs and controller crashes before global release
+with two and three voters. Natural-expiry soak and production activation-server
+integration remain separate verification boundaries.
+See [the protocol and implementation status](docs/license-lifecycle.md).
+
+**Iceberg after final OSS handoff:** the new generation publishes through an
+independent local catalog and warehouse. Predecessor catalogs, warehouses and
+snapshots remain retained; they are not silently rebound to another backend.
+Directory readers must use the new warehouse logged at startup and have access
+to the selected node's local data. Subsequent OSS writes advance that new export.
 
 ## Fix: Iceberg export counts each row once during a DELETE or a compaction ([#939](https://github.com/Basekick-Labs/arc/issues/939))
 
@@ -191,6 +237,24 @@ Thanks to [@efegokdemir](https://github.com/efegokdemir), who traced the
 overflow to buffers retained under flush-queue backpressure and proposed the
 first fix in [#1321](https://github.com/Basekick-Labs/arc/pull/1321); its
 tests are the basis of this change's.
+
+## Fix: license gates expire while Arc is running (#1442)
+
+License checks now use the signed expiry at the time of each check. A final
+definitive server rejection clears the current license and attempts to remove
+its disk cache. Removal failures are logged; online restart still requires
+fresh signed authority even when rejected bytes remain on disk. Transient network or
+protocol failures preserve the license until that signed
+expiry. Both machine-reactivation responses still attempt activation before
+the final result determines whether to invalidate the license. Health status
+and days remaining use the same expiry calculation.
+Read-serving tier scans retain their configured deadline and preserve cold
+objects; rejected cached payloads cannot regain entitlement in an already
+anchored process after a failed cache deletion.
+
+Existing RBAC data restrictions remain enforced when a license lapses. The
+cluster lifecycle above handles the final transition independently of those
+authorization checks.
 
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 

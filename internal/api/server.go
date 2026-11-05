@@ -47,7 +47,8 @@ type Server struct {
 	// is done; MarkNotReady() is called by the graceful-shutdown hook
 	// so the LB drains this node before Stop() actually closes the
 	// listener. See docs/progress/2026-05-26-multi-writer-pattern2.md.
-	ready atomic.Bool
+	ready          atomic.Bool
+	servingAllowed func() bool
 
 	// storageStatus supplies the /health "storage" payload (#603): per-tier
 	// backend + credential state from the DuckDB credential refresher
@@ -397,6 +398,9 @@ type notReady struct {
 // by /ready and /ready/write so the two cannot drift: everything that makes a
 // node unready makes it unready for writes too.
 func (s *Server) readinessProblem() *notReady {
+	if s.servingAllowed != nil && !s.servingAllowed() {
+		return &notReady{reason: "license_lifecycle_fenced"}
+	}
 	if !s.ready.Load() {
 		return &notReady{reason: "server is starting up or shutting down; load balancer should not route traffic here"}
 	}
@@ -994,3 +998,6 @@ func appConfig(config *ServerConfig, logger zerolog.Logger) fiber.Config {
 		StreamRequestBody: false, // Keep false to get full body at once
 	}
 }
+
+// SetServingReadiness excludes parked license-role instances from all data pools.
+func (s *Server) SetServingReadiness(fn func() bool) { s.servingAllowed = fn }

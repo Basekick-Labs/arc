@@ -20,6 +20,7 @@ import (
 
 // Manager orchestrates tiered storage operations
 type Manager struct {
+	readOnly bool
 	// Storage backends
 	hotBackend  storage.Backend
 	coldBackend storage.Backend
@@ -144,15 +145,44 @@ type Manager struct {
 	running atomic.Bool
 	// cycleRunning serializes runCycle: a scheduled tick and a manual
 	// trigger must not overlap (see ErrMigrationCycleRunning).
-	cycleRunning atomic.Bool
-	stopCh       chan struct{}
+	cycleRunning    atomic.Bool
+	licenseQuiesced atomic.Bool
+	stopCh          chan struct{}
 
 	logger zerolog.Logger
 	mu     sync.RWMutex
 }
 
+// QuiesceLicense waits for complete migration/release and scan passes, then
+// reserves both activity guards until process replacement. Durable execution
+// history is deliberately not used as a current-process liveness indicator.
+func (m *Manager) QuiesceLicense(ctx context.Context) error {
+	if m.licenseQuiesced.Load() {
+		return nil
+	}
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if m.scanRunning.CompareAndSwap(false, true) {
+			if m.cycleRunning.CompareAndSwap(false, true) {
+				m.licenseQuiesced.Store(true)
+				return nil
+			}
+			m.scanRunning.Store(false)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+}
+
 // ManagerConfig holds configuration for creating a tiering manager
 type ManagerConfig struct {
+	// ReadOnly constructs existing-data routing/synchronization without
+	// granting migration. It is computed by startup, not an operator bypass.
+	ReadOnly bool
 	// Storage backends
 	HotBackend  storage.Backend // Required: local storage for hot tier
 	ColdBackend storage.Backend // Optional: S3/Azure for cold tier
@@ -210,10 +240,10 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 	}
 
 	// Validate license
-	if cfg.LicenseClient == nil {
+	if !cfg.ReadOnly && cfg.LicenseClient == nil {
 		return nil, fmt.Errorf("license client is required for tiered storage")
 	}
-	if !cfg.LicenseClient.CanUseTieredStorage() {
+	if !cfg.ReadOnly && !cfg.LicenseClient.CanUseTieredStorage() {
 		return nil, fmt.Errorf("valid license with tiered_storage feature required")
 	}
 
@@ -230,6 +260,7 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 	}
 
 	m := &Manager{
+		readOnly:      cfg.ReadOnly,
 		hotBackend:    cfg.HotBackend,
 		coldBackend:   cfg.ColdBackend,
 		metadata:      metadata,
@@ -286,7 +317,7 @@ func (m *Manager) Start() error {
 	}
 
 	// Verify license before starting
-	if !m.licenseClient.CanUseTieredStorage() {
+	if !m.readOnly && (m.licenseClient == nil || !m.licenseClient.CanUseTieredStorage()) {
 		m.logger.Warn().Msg("Valid license required for tiered storage - not starting scheduler")
 		return nil
 	}
@@ -344,12 +375,31 @@ func (m *Manager) IsRunning() bool {
 // RunMigrationCycle runs a single migration cycle. On a node a cluster gate
 // excludes it syncs tier metadata and returns ErrMigrationRoleGated.
 func (m *Manager) RunMigrationCycle(ctx context.Context) error {
-	// Check license before each cycle
-	if !m.licenseClient.CanUseTieredStorage() {
+	if m.readOnly {
+		return m.syncOnlyCycle(ctx)
+	}
+	if m.licenseClient == nil || !m.licenseClient.CanUseTieredStorage() {
 		m.logger.Warn().Msg("Valid license required - skipping migration cycle")
 		return nil
 	}
+	if !m.licenseClient.CanMigrateTieredStorage() {
+		return m.syncOnlyCycle(ctx)
+	}
 	return m.runCycle(ctx)
+}
+
+func (m *Manager) syncOnlyCycle(ctx context.Context) error {
+	if !m.cycleRunning.CompareAndSwap(false, true) {
+		return ErrMigrationCycleRunning
+	}
+	defer m.cycleRunning.Store(false)
+	scanCtx, cancelScan := context.WithTimeout(ctx, m.scanBudget())
+	defer cancelScan()
+	result, err := m.scanTiers(scanCtx)
+	if result != nil {
+		m.notifyMigrationComplete(result.ColdSynced+result.HotRowsWritten+result.HotRetired, 0)
+	}
+	return err
 }
 
 // runCycle is RunMigrationCycle after the license check. Every node brings
@@ -743,8 +793,8 @@ func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier
 	if m.roleGated() {
 		return 0, 0, ErrMigrationRoleGated
 	}
-	if m.licenseClient != nil && !m.licenseClient.CanUseTieredStorage() {
-		return 0, 0, nil
+	if m.readOnly || (m.licenseClient != nil && !m.licenseClient.CanMigrateTieredStorage()) {
+		return 0, 0, fmt.Errorf("tier migrations are disabled by the current license policy")
 	}
 	if fromTier != TierHot || toTier != TierCold {
 		return 0, 0, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
@@ -927,7 +977,7 @@ func (m *Manager) NotifyColdFilesRemoved(n int) {
 func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	status := &StatusResponse{
 		Enabled:      m.config.Enabled,
-		LicenseValid: m.licenseClient.CanUseTieredStorage(),
+		LicenseValid: m.licenseClient != nil && m.licenseClient.CanUseTieredStorage(),
 	}
 	if last, at := m.LastScan(); last != nil {
 		status.LastScan = last
@@ -1415,6 +1465,11 @@ func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storag
 		return cleaned
 	}
 	for _, object := range objects {
+		// Read-serving scans must never turn a license downgrade into storage
+		// cleanup. Recheck between objects in case the paid phase just changed.
+		if m.readOnly || (m.licenseClient != nil && !m.licenseClient.CanMigrateTieredStorage()) {
+			break
+		}
 		if err := ctx.Err(); err != nil {
 			break
 		}

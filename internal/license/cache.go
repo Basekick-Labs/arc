@@ -10,21 +10,14 @@ import (
 	"time"
 )
 
-// License cache + resilient boot (#license-boot-resilience).
+// Signed entitlement cache. Online-key startup now requires fresh signed
+// server time: a cached license alone cannot establish the current date after
+// a restart. Cached bytes remain useful as recovery evidence, and may be used
+// in a process that has already obtained a fresh authority anchor. Explicit
+// offline files retain their network-free contract and unverified time label.
 //
-// Field incident: every pod boot made one blocking ActivateOrVerify with no
-// retry and no cache; a deploy-window ingress 404 on the license server
-// crash-looped a customer's cluster (27 restarts) because OSS fallback is
-// FATAL for enterprise-required configs (shared-storage multi-writer).
-//
-// The cache is the exact signed server response pair — tamper-evident by
-// signature, nothing secret beyond what the license already is. Loading it is
-// gated HARD (see LoadCachedLicense): without the fingerprint requirement, a
-// copied cache file would license any number of machines until expiry
-// (VerifyLicenseFile alone checks signature+parse only, and bindFingerprint
-// accepts an EMPTY fingerprint as unbound — a legitimate cache can never be
-// unbound, because Arc always sends a non-empty fingerprint for the server to
-// sign).
+// The cache must remain machine-bound. Merely verifying its RSA signature is
+// insufficient: a copied unbound site file must not become an online activation.
 
 // cacheFileName sits in the auth-DB directory (per-pod volume in the Helm
 // chart — no cross-pod file races).
@@ -116,11 +109,13 @@ func (c *Client) saveCache(licenseFile, licenseSignature string) {
 	c.logger.Debug().Str("path", path).Msg("license cache updated")
 }
 
-// deleteCache removes the cache (best-effort), used when its contents cannot
-// belong to the configured key.
+// deleteCache removes an unusable or definitively rejected cache. Failure does
+// not reopen in-memory gates, but can leave stale entitlements on disk.
 func (c *Client) deleteCache() {
 	if path := c.cachePath(); path != "" {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			c.logger.Warn().Err(err).Msg("License cache removal failed; rejected bytes remain on disk but online restart still requires fresh signed authority")
+		}
 	}
 }
 
@@ -136,6 +131,14 @@ func (c *Client) deleteCache() {
 //  4. not expired (the cache is honored until the license's OWN expires_at,
 //     never longer — no new grace is introduced).
 func (c *Client) LoadCachedLicense() (*License, error) {
+	c.validationMu.Lock()
+	defer c.validationMu.Unlock()
+	// An online key's signed file proves entitlement, not the current date.
+	// A fresh challenge after every process start prevents replaying a cache
+	// with a rolled-back machine clock. Preserve the cache for later recovery.
+	if c.requireAuthorityTime && c.runtimeClock().source() != "license_server" {
+		return nil, fmt.Errorf("fresh signed license-server time required after restart")
+	}
 	path := c.cachePath()
 	if path == "" {
 		return nil, fmt.Errorf("license cache disabled")
@@ -159,12 +162,20 @@ func (c *Client) LoadCachedLicense() (*License, error) {
 	if signed.MachineFingerprint == "" || signed.MachineFingerprint != c.fingerprint {
 		return nil, fmt.Errorf("license cache is not bound to this machine")
 	}
-	now := time.Now().UTC()
+	if c.requireAuthorityTime && !c.runtimeClock().matchesLicense(pair.LicenseFile) {
+		return nil, fmt.Errorf("cached license does not match the current signed authority response")
+	}
+	clock := c.runtimeClock()
+	now := clock.now()
+	if now.IsZero() {
+		return nil, fmt.Errorf("license clock unavailable")
+	}
 	if !now.Before(signed.ExpiresAt) {
 		return nil, fmt.Errorf("cached license expired at %s", signed.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 
 	lic := signed.ToRuntimeLicense(now)
+	lic.clock = clock
 	c.mu.Lock()
 	c.license = lic
 	c.source = SourceCache
@@ -181,17 +192,18 @@ const (
 	SourceCache  LicenseSource = "cache"
 )
 
-// ActivateOrVerifyResilient is the boot entry point: bounded retries against
-// the server, then — for TRANSIENT failures only — the verified cache.
+// ActivateOrVerifyResilient performs bounded retries. Cache consultation on a
+// transient failure never bypasses the fresh authority requirement for online
+// clients. AwaitOnlineAuthority supplies the cancellable startup waiting loop.
 //
 //   - The whole retry phase shares one deadline (bootRetryPhaseBudget); a
 //     black-holed server cannot stretch it to attempts × HTTP-timeout.
 //   - A DEFINITIVE rejection (the server spoke the protocol and said no)
 //     returns immediately and never consults the cache: revocation stays
 //     effective whenever the server is reachable.
-//   - Cache fallback proceeds FULLY LICENSED until the license's own
-//     expires_at; the caller logs it loudly and the periodic re-verify keeps
-//     trying the server (first success rewrites the cache).
+//   - An already anchored process can reuse matching verified cached policy;
+//     the authority clock keeps advancing through the outage. A new process
+//     cannot obtain an authority clock merely by reading that cached pair.
 func (c *Client) ActivateOrVerifyResilient(ctx context.Context) (*License, LicenseSource, error) {
 	phaseCtx, cancel := context.WithTimeout(ctx, bootRetryPhaseBudget)
 	defer cancel()
@@ -235,39 +247,71 @@ const SourceFile LicenseSource = "file"
 // excludes the license key, customer identity, and the feature list — /health
 // is unauthenticated (see the decision comments in internal/api/server.go).
 type LicenseHealth struct {
-	Tier          string     `json:"tier"`
-	Status        string     `json:"status"`
-	Source        string     `json:"source"`
-	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
-	DaysRemaining int        `json:"days_remaining,omitempty"`
-	SiteLicense   bool       `json:"site_license,omitempty"`
+	RuntimeRestartRequired bool         `json:"runtime_restart_required,omitempty"`
+	Tier                   string       `json:"tier"`
+	Status                 string       `json:"status"`
+	Source                 string       `json:"source"`
+	ExpiresAt              *time.Time   `json:"expires_at,omitempty"`
+	DaysRemaining          int          `json:"days_remaining,omitempty"`
+	TermEndsAt             *time.Time   `json:"term_ends_at,omitempty"`
+	LicenseKind            string       `json:"license_kind,omitempty"`
+	DesiredPolicy          *ExpiryState `json:"desired_policy,omitempty"`
+	ClockSource            string       `json:"clock_source,omitempty"`
+	EvaluatedAt            *time.Time   `json:"evaluated_at,omitempty"`
+	SiteLicense            bool         `json:"site_license,omitempty"`
 }
 
-// HealthStatus reports the current license for /health. Status is derived at
-// READ time against the clock (the #603 lesson): enforcement stays boot-time,
-// but health tells the truth — a license that expires mid-process shows
-// "expired" here within a probe interval, even though features remain enabled
-// until the next restart rejects it.
+// HealthStatus reports the current license for /health using the signed expiry
+// at read time, matching feature gates without mutating their shared snapshot.
 func (c *Client) HealthStatus() LicenseHealth {
 	c.mu.RLock()
 	lic := c.license
 	src := c.source
+	pending := c.runtimeRestartRequired
 	c.mu.RUnlock()
 	if lic == nil {
 		return LicenseHealth{Tier: "oss", Status: "unlicensed", Source: string(src)}
 	}
-	status := lic.Status
-	now := time.Now().UTC()
-	days := 0
-	if !lic.ExpiresAt.IsZero() {
-		if !now.Before(lic.ExpiresAt) {
-			status = "expired"
-		} else {
-			days = int(time.Until(lic.ExpiresAt).Hours() / 24)
+	instant := lic.currentTime()
+	status, days := expiryStatus(lic.ExpiresAt, instant)
+	observed := lic.expiryStateAt(instant)
+	status = observed.Status
+	if !observed.Valid {
+		days = 0
+	}
+	var policyState *ExpiryState
+	var termEndsAt *time.Time
+	kind := ""
+	if lic.Policy != nil {
+		term := lic.Policy.TermEndsAt.UTC()
+		termEndsAt = &term
+		kind = lic.Policy.Kind
+		state := observed
+		policyState = &state
+		status = state.Status
+		days = 0
+		if !instant.IsZero() && instant.Before(lic.Policy.TermEndsAt) {
+			days = int(lic.Policy.TermEndsAt.Sub(instant) / (24 * time.Hour))
 		}
 	}
 	exp := lic.ExpiresAt.UTC()
+	var now *time.Time
+	clockSource := "local_unverified"
+	if lic.clock != nil {
+		clockSource = lic.clock.source()
+		if !instant.IsZero() {
+			value := instant.UTC()
+			now = &value
+		}
+	}
+	if pending && observed.Valid {
+		status = "runtime_restart_required"
+	}
 	return LicenseHealth{
+		RuntimeRestartRequired: pending,
+		TermEndsAt:             termEndsAt, LicenseKind: kind,
+		DesiredPolicy: policyState,
+		ClockSource:   clockSource, EvaluatedAt: now,
 		Tier:          string(lic.Tier),
 		Status:        status,
 		Source:        string(src),

@@ -37,6 +37,7 @@ import (
 
 // CompactorFailoverConfig holds configuration for the compactor failover manager.
 type CompactorFailoverConfig struct {
+	AutomaticAllowed func() bool
 	// Registry provides access to cluster node state.
 	Registry *Registry
 
@@ -228,6 +229,9 @@ func (m *CompactorFailoverManager) checkLoop() {
 // checkCompactorHealth verifies the active compactor is still healthy.
 // Only the Raft leader acts — other nodes observe the FSM callback.
 func (m *CompactorFailoverManager) checkCompactorHealth() {
+	if m.cfg.AutomaticAllowed != nil && !m.cfg.AutomaticAllowed() {
+		return
+	}
 	// Only the Raft leader coordinates failover.
 	if m.cfg.RaftNode == nil || !m.cfg.RaftNode.IsLeader() {
 		return

@@ -920,6 +920,11 @@ var errHiddenName = errors.New("storage: name is dot-prefixed")
 // would miss everything skipped for another reason, and would drift again the
 // next time a listing grows a filter (#756).
 func omittedFromListing(base, relPath string) error {
+	// A prepared license namespace is not part of the predecessor dataset.
+	// In particular, an interrupted handoff must not rediscover its copies.
+	if relPath == ".arc-license-oss" || strings.HasPrefix(relPath, ".arc-license-oss/") {
+		return errHiddenName
+	}
 	// Dot-prefixed names cover Arc's own in-flight ".arc-*.tmp" writes and OS
 	// debris such as .DS_Store. Note it also covers dot-prefixed DATA files,
 	// which the key contract accepts, which is why this is part of the

@@ -27,10 +27,9 @@ import (
 //     there, and the two paths cannot be confused into weakening each other.
 //
 // Offline mode is network-free, full stop: no activation, no verification
-// calls, no periodic re-validation, no cache. Expiry is enforced AT LOAD —
-// a file that expires mid-process keeps its features until the next restart
-// rejects it (consistent with the boot-only enforcement philosophy of the
-// resilience work; do not claim runtime expiry enforcement in docs).
+// calls, no periodic re-validation, no cache. Expiry is checked at load and
+// by feature gates at read time, so a signed file cannot keep those gates
+// open after its expiry while the process remains running.
 // Fail-closed: any error → OSS.
 
 // offlineFile is the accepted file shape; unknown fields (summary) ignored.
@@ -80,12 +79,17 @@ func NewOfflineClient(path string, logger zerolog.Logger) (*Client, error) {
 			return nil, fmt.Errorf("offline license verification failed: %w", err)
 		}
 	}
-	now := time.Now().UTC()
+	clock := c.runtimeClock()
+	now := clock.now()
+	if now.IsZero() {
+		return nil, fmt.Errorf("license clock unavailable")
+	}
 	if !now.Before(signed.ExpiresAt) {
 		return nil, fmt.Errorf("offline license expired at %s", signed.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 
 	lic := signed.ToRuntimeLicense(now)
+	lic.clock = clock
 	c.mu.Lock()
 	c.license = lic
 	c.source = SourceFile

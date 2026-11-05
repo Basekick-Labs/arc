@@ -37,7 +37,7 @@ func (c *Coordinator) localCapabilities() []string {
 	// Compaction commit (#1207 d2) needs nothing of the node: every build
 	// that applies its rules advertises it.
 	// Cluster policies (#1324) likewise.
-	caps := []string{raft.CapabilityCompactionCommit, CapabilityForwardIdentity, raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention, raft.CapabilityClusterCQ}
+	caps := []string{lifecyclePolicyKind, raft.CapabilityCompactionCommit, CapabilityForwardIdentity, raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention, raft.CapabilityClusterCQ}
 	if c.keepsLocalReplicas() {
 		caps = append(caps, CapabilityLocalReplica)
 	}
@@ -365,6 +365,11 @@ var _ TakeoverReader = (*Coordinator)(nil)
 // whose current process another writer has claimed (it exits for a restart,
 // and its claimed batches are being published elsewhere) (#1207).
 func (c *Coordinator) writerEligible(nodeID string) bool {
+	if s := c.LifecycleState(); s.Mode == "reduced" || s.Mode == "preparing" || s.Mode == "sealed" {
+		if s.Owner != nodeID {
+			return false
+		}
+	}
 	if c.raftNode == nil {
 		return true
 	}

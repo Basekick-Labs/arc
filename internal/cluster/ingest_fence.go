@@ -378,6 +378,9 @@ func (c *Coordinator) IngestGate() func() error {
 
 // ingestRefusal is IngestGate's check, uncounted.
 func (c *Coordinator) ingestRefusal() error {
+	if !c.ServingAllowed() {
+		return fmt.Errorf("%w: node fenced by license lifecycle", ingest.ErrIngestFenced)
+	}
 	if c.claimedExit.Load() {
 		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverClaimed)
 	}

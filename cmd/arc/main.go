@@ -10,11 +10,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -47,6 +49,7 @@ import (
 	"github.com/basekick-labs/arc/internal/telemetry"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
+	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -106,8 +109,8 @@ var (
 // escape, so a 4-core license would run 8 flush workers and whatever
 // database.thread_count the operator wrote.
 //
-// Enforcement is boot-time, matching the model used for mid-process license
-// expiry: nothing re-applies this after StartPeriodicValidation re-verifies.
+// Core-limit enforcement is boot-time: periodic validation does not reapply
+// these resource limits. Feature entitlement gates check expiry at read time.
 func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 	machineCores, effective := numCPUFn(), effectiveCoresFn()
 	// Non-positive MaxCores means unlimited.
@@ -264,27 +267,92 @@ func main() {
 		log.Fatal().Msg("Arc was built without -tags=duckdb_arrow; refusing to start. The Arrow query path is required: rebuild with `make build` (or `go build -tags=duckdb_arrow ./cmd/arc`).")
 	}
 
-	// The WAL reserve file (#676), before anything writes to the data volume
-	// (the staged restores below, SQLite, the registration journal, the WAL
-	// header): on a full volume it is released so this start has room, and
-	// with the WAL or its disk gate turned off it is removed.
-	prepareWALReserveAtBoot(cfg, logger.Get("wal"))
-
-	// Apply staged metadata restores BEFORE anything opens the SQLite
-	// databases (#635): the restore API only stages; the swap happens here,
-	// where no connection, pool, or sidecar can be live. The same paths are
-	// derived again for backup.NewManager later; keep the two in sync.
-	{
-		bootIcebergCatalog := ""
-		if cfg.Iceberg.Enabled {
-			bootIcebergCatalog = cfg.Iceberg.CatalogDBPath
-			if bootIcebergCatalog == "" {
-				bootIcebergCatalog = cfg.Auth.DBPath
+	// A completed license handoff is resolved before SQLite restores, WAL
+	// reserve/replay or any data service can mutate the predecessor generation.
+	var licenseBootstrap *cluster.LicenseBootstrap
+	var licenseSealedRecovery bool
+	retainLicenseOwner := os.Getenv("ARC_INTERNAL_LICENSE_RETAIN_OWNER")
+	os.Unsetenv("ARC_INTERNAL_LICENSE_RETAIN_OWNER")
+	if cfg.Cluster.RaftDataDir != "" {
+		if err := loadLicensePreparedIdentity(cfg); err != nil {
+			log.Fatal().Err(err).Msg("Cannot recover prepared lifecycle identity")
+		}
+		record, bootErr := cluster.ReadLicenseBootRecord(filepath.Join(cfg.Cluster.RaftDataDir, "license-lifecycle.json"), cfg.Cluster.ClusterName)
+		if bootErr != nil {
+			log.Fatal().Err(bootErr).Msg("Invalid durable license lifecycle state")
+		}
+		if record == nil {
+			sealed, err := cluster.ReadLicenseBootRecord(filepath.Join(cfg.Cluster.RaftDataDir, "license-lifecycle.json.sealed"), cfg.Cluster.ClusterName)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Invalid locally sealed license state")
+			}
+			if sealed != nil {
+				local, err := cluster.ReadLicenseBootRecord(filepath.Join(cfg.Cluster.RaftDataDir, "license-lifecycle.json.prepared"), cfg.Cluster.ClusterName)
+				if err != nil {
+					log.Fatal().Err(err).Msg("Cannot recover sealed participant identity")
+				}
+				if err := prepareLicenseOSSConfig(cfg, sealed, local); err != nil {
+					log.Fatal().Err(err).Msg("Invalid prepared sealed participant")
+				}
+				licenseSealedRecovery = true
+				cfg.Cluster.Enabled = true
+				log.Warn().Msg("Local license seal has no global release authorization; recovering fenced Raft coordination")
 			}
 		}
-		backup.ApplyPendingRestores(logger.Get("backup"), cfg.Auth.DBPath, bootIcebergCatalog)
+		if record != nil {
+			localPrepared, err := cluster.ReadLicenseBootRecord(filepath.Join(cfg.Cluster.RaftDataDir, "license-lifecycle.json.prepared"), cfg.Cluster.ClusterName)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Cannot read local OSS namespace")
+			}
+			if err := prepareLicenseOSSConfig(cfg, record, localPrepared); err != nil {
+				log.Fatal().Err(err).Msg("This node lacks its verified OSS namespace; data services remain fenced")
+			}
+			preferLicenseOwner := cfg.Cluster.NodeID != "" && retainLicenseOwner == cfg.Cluster.NodeID
+			licenseBootstrap, bootErr = cluster.StartLicenseBootstrap(&cfg.Cluster, record, logger.Get("license-bootstrap"), preferLicenseOwner)
+			if bootErr != nil {
+				log.Fatal().Err(bootErr).Msg("License bootstrap control could not start")
+			}
+			bootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			bootErr = licenseBootstrap.WaitOwner(bootCtx)
+			cancel()
+			if bootErr != nil {
+				licenseBootstrap.Close()
+				log.Warn().Err(bootErr).Msg("License bootstrap stopped without opening data services")
+				return
+			}
+			// These are effective settings only. Operator configuration, old Raft,
+			// metadata, journals and WAL remain intact for inspection/recovery.
+			log.Warn().Str("selected_owner", licenseBootstrap.SelectedOwner()).Str("original_owner", record.Owner).Msg("Expired cluster configuration retained: this boot uses the selected node's preserved OSS state; node-local OSS changes on other nodes remain there")
+			configureLicenseOSSPaths(cfg, localPrepared)
+			if cfg.Iceberg.Enabled {
+				log.Warn().Str("catalog", cfg.Iceberg.CatalogDBPath).Str("warehouse", cfg.Iceberg.Warehouse).Msg("OSS generation uses an independent Iceberg catalog and warehouse; predecessor export metadata is retained. Directory readers must use the new warehouse and have access to this node's local data")
+			}
+			log.Warn().Str("owner", record.Owner).Uint64("generation", record.Generation).Msg("License lifecycle selected standalone OSS runtime; predecessor Raft will not start")
+		}
 	}
+	if licenseBootstrap == nil {
+		// The WAL reserve file (#676), before anything writes to the data volume
+		// (the staged restores below, SQLite, the registration journal, the WAL
+		// header): on a full volume it is released so this start has room, and
+		// with the WAL or its disk gate turned off it is removed.
+		prepareWALReserveAtBoot(cfg, logger.Get("wal"))
 
+		// Apply staged metadata restores BEFORE anything opens the SQLite
+		// databases (#635): the restore API only stages; the swap happens here,
+		// where no connection, pool, or sidecar can be live. The same paths are
+		// derived again for backup.NewManager later; keep the two in sync.
+		{
+			bootIcebergCatalog := ""
+			if cfg.Iceberg.Enabled {
+				bootIcebergCatalog = cfg.Iceberg.CatalogDBPath
+				if bootIcebergCatalog == "" {
+					bootIcebergCatalog = cfg.Auth.DBPath
+				}
+			}
+			backup.ApplyPendingRestores(logger.Get("backup"), cfg.Auth.DBPath, bootIcebergCatalog)
+		}
+
+	}
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers
 	var licenseClient *license.Client
@@ -318,27 +386,44 @@ func main() {
 		var err error
 		licenseClient, err = license.NewClient(&license.ClientConfig{
 			LicenseKey: cfg.License.Key,
-			// Cache lives next to the auth DB (per-pod volume): boot survives a
-			// transient license-server outage on the last verified license,
-			// honored until ITS OWN expiry. Deliberately inside the Key != ""
-			// branch — removing the key must also stop cache consultation.
+			// Signed entitlement is retained for recovery, but online-key boot
+			// requires a fresh signed server-time challenge after each restart.
+			// Cached bytes cannot prove today's date on a rolled-back host.
 			CacheDir: filepath.Dir(cfg.Auth.DBPath),
 			Logger:   logger.Get("license"),
 		})
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to initialize license client - enterprise features disabled")
 		} else {
-			// Activate or verify at startup: bounded retries, then — for
-			// transient failures only — the signature-verified cache. A
-			// definitive server rejection still lands in OSS mode; a
-			// deploy-window ingress 404 no longer crash-loops the cluster.
-			lic, src, err := licenseClient.ActivateOrVerifyResilient(context.Background())
+			// Wait on temporary authority failures rather than converting a
+			// persisted cluster into independent OSS writers during an outage.
+			bootCtx, stopBootSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			var lic *license.License
+			var src license.LicenseSource
+			var err error
+			if licenseBootstrap != nil || licenseSealedRecovery {
+				// A sealed OSS runtime may serve without an online authority; only a
+				// fresh successful proof can enable Enterprise in this new process.
+				attemptCtx, cancel := context.WithTimeout(bootCtx, 30*time.Second)
+				lic, err = licenseClient.ActivateOrVerify(attemptCtx)
+				cancel()
+				src = license.SourceServer
+			} else {
+				lic, src, err = licenseClient.AwaitOnlineAuthority(bootCtx)
+			}
+			canceled := bootCtx.Err() != nil
+			stopBootSignals()
+			if canceled {
+				log.Info().Msg("Shutdown while waiting for license authority")
+				return
+			}
+
 			if err != nil {
 				log.Warn().
 					Err(err).
 					Str("license_key", cfg.License.Key[:min(12, len(cfg.License.Key))]+"...").
 					Msg("License activation/verification failed - enterprise features disabled")
-				licenseClient = nil
+				// Retain the configured client so reactivation remains observable.
 			} else {
 				if src == license.SourceCache {
 					log.Warn().
@@ -409,6 +494,17 @@ func main() {
 			Msg("server.shutdown_timeout must be positive; falling back to the default")
 		shutdownTimeout = defaultShutdownTimeout
 	}
+	recoverCluster := cfg.Cluster.Enabled && cfg.Cluster.RaftDataDir != ""
+	bootLicensed := licenseClient != nil && licenseClient.IsValid()
+	bootLicenseShape := licenseRuntimeShape(nil)
+	if bootLicensed {
+		bootLicenseShape = licenseRuntimeShape(licenseClient.GetLicense())
+		licenseClient.PinRuntimeLicense()
+	}
+	if !bootLicensed && licenseClient != nil {
+		licenseClient.RequireRuntimeRestart()
+	}
+	var licenseReexec atomic.Bool
 	shutdownCoordinator := shutdown.New(shutdownTimeout, logger.Get("shutdown"))
 
 	// Opt-in pprof on a localhost listener (no-op unless ARC_DEBUG_PPROF=1).
@@ -1037,7 +1133,7 @@ func main() {
 				Str("role", cfg.Cluster.Role).
 				Msg("cluster.shared_storage_mode=true requires cluster.role to be writer, reader or compactor; a standalone-role node can win Raft leadership but never passes the primary-writer gate, so retention, CQ, delete and tiering migration would run on no node")
 		}
-		if licenseClient == nil || !licenseClient.CanUseSharedStorageMultiWriter() {
+		if (licenseClient == nil || !licenseClient.CanUseSharedStorageMultiWriter()) && !recoverCluster {
 			log.Fatal().
 				Msg("cluster.shared_storage_mode=true requires an Enterprise license with the shared_storage_multi_writer feature; contact sales@basekick.net")
 		}
@@ -1048,6 +1144,7 @@ func main() {
 
 	// Initialize WAL writer (if enabled) - recovery happens after ArrowBuffer is ready
 	var walWriter *wal.Writer
+	var licensePauseWALMaintenance func(context.Context) (func(), error)
 	var walRecovery *wal.Recovery
 	var walDisk *wal.DiskMonitor
 	if cfg.WAL.Enabled {
@@ -1116,6 +1213,12 @@ func main() {
 			Bool("auto", cfg.Ingest.MaxBufferedBytesAuto).
 			Msg("Ingest buffered-bytes limit off (ingest.max_buffered_bytes = 0, the default, or auto without a detected memory limit)")
 	}
+	if recoverCluster {
+		arrowBuffer.TrackLiveAdmission()
+		arrowBuffer.SetIngestGate(func() error {
+			return fmt.Errorf("%w: cluster startup ownership is not established", ingest.ErrIngestFenced)
+		})
+	}
 	// Ingest counts rows stamped past file-level time pruning's margin
 	// whether or not the feature is on (it is by default), so the risk is
 	// visible on every node that flushes. Set before WAL recovery and the
@@ -1132,7 +1235,7 @@ func main() {
 	// recovery below and MQTT ingest, which flush before the coordinator is
 	// up. Must be set before recovery runs; its drain starts in the cluster
 	// block.
-	registrationOutbox := newRegistrationOutbox(cfg, licenseHasClustering(licenseClient), logger.Get("file-registrar"))
+	registrationOutbox := newRegistrationOutbox(cfg, licenseHasClustering(licenseClient) || recoverCluster, logger.Get("file-registrar"))
 	if registrationOutbox != nil {
 		arrowBuffer.SetFileRegistrar(registrationOutbox)
 		// On a shared object store the writer publishes what it has pending
@@ -1394,6 +1497,11 @@ func main() {
 		//   Recovery: when a flush failure is detected (S3 outage), replay WAL files
 		//             to re-buffer data that was cleared from buffers after failed flush
 		walMaintenanceCtx, walMaintenanceCancel := context.WithCancel(context.Background())
+		walMaintenanceDone := make(chan struct{})
+		walMaintenancePauses := make(chan licenseMaintenancePause)
+		licensePauseWALMaintenance = func(ctx context.Context) (func(), error) {
+			return pauseLicenseMaintenance(ctx, walMaintenancePauses)
+		}
 		shutdownCoordinator.RegisterHook("wal-periodic-maintenance", func(ctx context.Context) error {
 			walMaintenanceCancel()
 			return nil
@@ -1401,6 +1509,7 @@ func main() {
 
 		recoveryInterval := time.Duration(cfg.WAL.RecoveryIntervalSeconds) * time.Second
 		go func() {
+			defer close(walMaintenanceDone)
 			ticker := time.NewTicker(recoveryInterval)
 			defer ticker.Stop()
 			bytesTicker := time.NewTicker(15 * time.Second)
@@ -1429,6 +1538,8 @@ func main() {
 				select {
 				case <-walMaintenanceCtx.Done():
 					return
+				case pause := <-walMaintenancePauses:
+					pause.wait(walMaintenanceCtx)
 				case <-bytesTicker.C:
 					updateWALDirectoryBytes()
 				case <-purgeHint:
@@ -2070,11 +2181,14 @@ func main() {
 	// its construction failed.
 	var completionWatcher *compaction.CompletionWatcher
 	if cfg.Cluster.Enabled {
-		if licenseClient == nil {
+		if licenseClient == nil && !recoverCluster {
 			log.Warn().Msg("Clustering requires enterprise license - running in standalone mode")
 		} else {
-			lic := licenseClient.GetLicense()
-			if lic == nil || !lic.HasFeature(license.FeatureClustering) {
+			var lic *license.License
+			if licenseClient != nil {
+				lic = licenseClient.GetLicense()
+			}
+			if (lic == nil || !lic.HasFeature(license.FeatureClustering)) && !recoverCluster {
 				log.Warn().Msg("License does not include clustering feature - running in standalone mode")
 			} else {
 				// Determine API address for this node. Use api.ListenAddr
@@ -2156,11 +2270,12 @@ func main() {
 
 				var err error
 				clusterCoordinator, err = cluster.NewCoordinator(&cluster.CoordinatorConfig{
-					Config:        &cfg.Cluster,
-					LicenseClient: licenseClient,
-					Version:       Version,
-					APIAddress:    apiAddr,
-					Logger:        logger.Get("cluster"),
+					Config:          &cfg.Cluster,
+					LicenseRecovery: recoverCluster,
+					LicenseClient:   licenseClient,
+					Version:         Version,
+					APIAddress:      apiAddr,
+					Logger:          logger.Get("cluster"),
 					// Mirror the Fiber listener's TLS posture so the
 					// internal request Router uses https:// when peers
 					// serve TLS. All cluster nodes are expected to be
@@ -2173,7 +2288,7 @@ func main() {
 					WarnIfNoCompactor: cfg.Cluster.ReplicationEnabled && cfg.Compaction.Enabled,
 				})
 				if err != nil {
-					log.Error().Err(err).Msg("Failed to initialize cluster coordinator - running in standalone mode")
+					log.Fatal().Err(err).Msg("Cannot initialize requested cluster; independent data services remain closed")
 				} else {
 					// Peer replication Phase 2 needs the storage backend handle so the
 					// fetch handler can serve local bytes and the puller can write
@@ -2305,7 +2420,7 @@ func main() {
 					// no request finds the node without its buffer.
 					clusterCoordinator.SetDeleteScopeFlusher(deleteFlusher(arrowBuffer, walWriter))
 					if err := clusterCoordinator.Start(); err != nil {
-						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
+						log.Fatal().Err(err).Msg("Cannot start requested cluster; independent data services remain closed")
 						arrowBuffer.SetIngestGate(nil)
 						clusterCoordinator = nil
 					} else {
@@ -2650,6 +2765,32 @@ func main() {
 	}
 
 	server := api.NewServer(serverConfig, logger.Get("server"))
+	admission := cluster.NewServiceAdmission(func() bool { return clusterCoordinator == nil || clusterCoordinator.ServingAllowed() })
+	server.SetServingReadiness(func() bool { return clusterCoordinator == nil || clusterCoordinator.ReadServingAllowed() })
+	server.GetApp().Use(func(c *fiber.Ctx) error {
+		path := c.Path()
+		if path == "/health" || path == "/ready" || path == "/ready/write" || path == "/metrics" || (c.Method() == fiber.MethodGet && (path == "/api/v1/cluster" || path == "/api/v1/cluster/local" || path == "/api/v1/cluster/nodes")) {
+			return c.Next()
+		}
+		// Preserve the existing authenticated admin recovery route when a new
+		// capacity limit fences the retained topology. Its handler still
+		// rejects removal during an in-progress sealed handoff.
+		if c.Method() == fiber.MethodDelete && strings.HasPrefix(path, "/api/v1/cluster/nodes/") {
+			return c.Next()
+		}
+		if clusterCoordinator != nil && (path == "/api/v1/query" || path == "/api/v1/query/arrow" || path == "/api/v1/query/msgpack") {
+			if !clusterCoordinator.ReadServingAllowed() {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "node fenced by license lifecycle"})
+			}
+			return c.Next()
+		}
+		finish, ok := admission.Enter()
+		if !ok {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "node fenced by license lifecycle"})
+		}
+		defer finish()
+		return c.Next()
+	})
 
 	// /health "license" field: reports the live client when licensed; when a
 	// license was CONFIGURED but failed (rejected file, definitive server
@@ -2920,8 +3061,7 @@ func main() {
 			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
 		} else {
 			// Share the auth manager's SQLite handle when there is one. Audit
-			// and auth are enabled independently (this block is gated on the
-			// license, not on cfg.Auth.Enabled), so authManager may be nil —
+			// and auth are enabled independently, so authManager may be nil —
 			// sharedSQLiteHandle falls back to a dedicated handle we own.
 			auditDB, auditOwnsDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
 			if err != nil {
@@ -4580,15 +4720,16 @@ func main() {
 	// 2-tier system: Hot (local) -> Cold (S3/Azure archive)
 	var tieringManager *tiering.Manager
 	if cfg.TieredStorage.Enabled {
-		if licenseClient == nil {
-			log.Warn().Msg("Tiered storage requires enterprise license - feature disabled")
-		} else if !licenseClient.CanUseTieredStorage() {
-			log.Warn().Msg("License does not include tiered_storage feature - feature disabled")
-		} else {
+		readOnlyTiering := licenseClient == nil || !licenseClient.CanUseTieredStorage()
+		if readOnlyTiering {
+			log.Info().Msg("Existing cold data remains readable; tier migrations are disabled without entitlement")
+		}
+		{
+
 			// Open SQLite database for tiering metadata (shared with other features)
 			// Share the auth manager's SQLite handle when there is one. Tiering
-			// and auth are enabled independently (this block is gated on the
-			// license, not on cfg.Auth.Enabled), so authManager may be nil —
+			// and auth are enabled independently. This block preserves reads
+			// even without a license, so authManager may be nil —
 			// sharedSQLiteHandle falls back to a dedicated handle we own.
 			tieringDBPath := cfg.Auth.DBPath // Shared SQLite database
 			tieringDB, tieringOwnsDB, err := sharedSQLiteHandle(authManager, tieringDBPath)
@@ -4742,6 +4883,7 @@ func main() {
 					DB:            tieringDB,
 					Config:        &cfg.TieredStorage,
 					LicenseClient: licenseClient,
+					ReadOnly:      readOnlyTiering,
 					ClusterGate:   tieringGate,
 					Manifest:      tieringManifest,
 					Logger:        logger.Get("tiering"),
@@ -5394,6 +5536,108 @@ func main() {
 	// keeps a marker), bounded, never fatal.
 	scrubStoredCredentialText(authManager, []string{cfg.Auth.DBPath, cfg.Retention.DBPath, cfg.ContinuousQuery.DBPath}, logger.Get("credscrub"))
 
+	if licenseBootstrap != nil {
+		shutdownCoordinator.Register("license-bootstrap", shutdownFunc(licenseBootstrap.Close), shutdown.PriorityStorage+100)
+	}
+	if clusterCoordinator != nil {
+		shutdownCoordinator.RegisterHook("license-lifecycle", clusterCoordinator.StopLicenseLifecycle, shutdown.PriorityScheduler)
+		clusterCoordinator.StartLicenseLifecycle(func(ctx context.Context) error {
+			if err := admission.CloseAndWait(ctx); err != nil {
+				return err
+			}
+			if err := arrowBuffer.CloseLiveAdmission(ctx); err != nil {
+				return err
+			}
+			if err := newCompactionQuiescer(clusterCoordinator, compactionManager, completionWatcher, completionDir != "" && cfg.Compaction.Enabled, logger.Get("license-drain"))(ctx); err != nil {
+				return err
+			}
+			for compactionManager != nil && compactionManager.ActiveJobs() > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+			if cqScheduler != nil {
+				cqScheduler.Stop()
+			}
+			if retentionScheduler != nil {
+				retentionScheduler.Stop()
+			}
+			if tieringManager != nil {
+				if err := tieringManager.QuiesceLicense(ctx); err != nil {
+					return err
+				}
+			}
+			if licensePauseWALMaintenance != nil {
+				resume, err := licensePauseWALMaintenance(ctx)
+				if err != nil {
+					return err
+				}
+				defer resume()
+			}
+			if arrowBuffer.HasFlushFailure() {
+				return errors.New("unsettled WAL recovery blocks license handoff")
+			}
+			if nodeCapabilities.CanIngest {
+				if registrationOutbox == nil {
+					return errors.New("durable registration outbox unavailable; cannot seal acknowledged data")
+				}
+				if err := arrowBuffer.FlushAllAndWait(ctx); err != nil {
+					return err
+				}
+				if err := registrationOutbox.WaitDrained(ctx); err != nil {
+					return err
+				}
+			}
+			if err := clusterCoordinator.SyncManifest(ctx); err != nil {
+				return err
+			}
+			if authManager != nil && clusterCoordinator.GetRaftNode() != nil {
+				return reconcileLicenseAuth(ctx, clusterCoordinator.GetRaftNode().FSM(), clusterCoordinator.RaftTerm(), authManager, rbacManager, logger.Get("license-auth-drain"))
+			}
+			return nil
+		}, func(ctx context.Context, state clusterraft.LicenseLifecycleState) error {
+			return clusterCoordinator.SealLicenseOSS(ctx, state, cfg.Storage.LocalPath, cfg.WAL.Directory)
+		}, clusterCoordinator.PersistLicenseOSS, func(state clusterraft.LicenseLifecycleState) {
+			licenseReexec.Store(true)
+			shutdownCoordinator.TriggerShutdown()
+		})
+	}
+	if licenseClient != nil {
+		if !bootLicensed {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				_, _ = licenseClient.ActivateOrVerify(ctx)
+			}()
+		}
+		stopRecovery := make(chan struct{})
+		shutdownCoordinator.RegisterHook("license-boot-recovery", func(ctx context.Context) error { close(stopRecovery); return nil }, shutdown.PriorityTelemetry)
+		go func() {
+			tick := time.NewTicker(time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-stopRecovery:
+					return
+				case <-tick.C:
+					pending := licenseClient.PendingRuntimeLicense()
+					current := licenseClient.GetLicense()
+					changed := current != nil && current.IsValid() && licenseRuntimeShape(current) != bootLicenseShape
+					if ((pending != nil && pending.IsValid()) || changed) && (clusterCoordinator == nil || !clusterCoordinator.LifecyclePreparing()) {
+						licenseClient.RequireRuntimeRestart()
+						if licenseBootstrap != nil && cfg.Cluster.NodeID != "" {
+							os.Setenv("ARC_INTERNAL_LICENSE_RETAIN_OWNER", cfg.Cluster.NodeID)
+						}
+						licenseReexec.Store(true)
+						shutdownCoordinator.TriggerShutdown()
+						return
+					}
+				}
+			}
+		}()
+	}
 	// Mark /ready=200 so the load balancer (Pattern 2 multi-writer) starts
 	// routing traffic here. By this point WAL recovery has completed
 	// (cmd/arc/main.go:701-724), the Arrow buffer is initialised, the
@@ -5432,6 +5676,11 @@ func main() {
 	}
 
 	log.Info().Msg("Arc shutdown complete")
+	if licenseReexec.Load() {
+		if err := replaceLicenseProcess(); err != nil {
+			log.Fatal().Err(err).Msg("Cannot restart Arc after license lifecycle transition")
+		}
+	}
 	if code := exitCode.Load(); code != 0 {
 		log.Warn().Int32("exit_code", code).Msg("Exiting non-zero so the restart policy starts this writer again")
 		os.Exit(int(code))

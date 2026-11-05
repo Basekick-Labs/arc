@@ -91,6 +91,8 @@ var deleteStopDrainBound = 10 * time.Second
 const deletePendingWarnAt = 10_000
 
 type Coordinator struct {
+	lifecycle         lifecycleRuntime
+	lifecycleRecovery bool
 	// open is what reads must leave out while a compaction's output and
 	// inputs are both readable (open_compactions.go).
 	open openState
@@ -345,11 +347,13 @@ type Coordinator struct {
 
 // CoordinatorConfig holds configuration for the coordinator.
 type CoordinatorConfig struct {
-	Config        *config.ClusterConfig
-	LicenseClient *license.Client
-	Version       string // Arc version
-	APIAddress    string // HTTP API address for this node
-	Logger        zerolog.Logger
+	// LicenseRecovery allows only coordinated recovery with admission fenced.
+	LicenseRecovery bool
+	Config          *config.ClusterConfig
+	LicenseClient   *license.Client
+	Version         string // Arc version
+	APIAddress      string // HTTP API address for this node
+	Logger          zerolog.Logger
 
 	// ServerTLSEnabled mirrors cfg.Server.TLSEnabled so the request
 	// Router knows whether peer Fiber listeners serve HTTPS. The
@@ -395,7 +399,7 @@ func ResolveRole(configured string) (NodeRole, error) {
 // Returns an error if the license is invalid or missing the clustering feature.
 func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// Validate license - clustering requires enterprise license
-	if err := validateClusteringLicense(cfg.LicenseClient); err != nil {
+	if err := validateClusteringLicense(cfg.LicenseClient); err != nil && !cfg.LicenseRecovery {
 		return nil, err
 	}
 
@@ -473,14 +477,15 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	c := &Coordinator{
-		cfg:           cfg.Config,
-		licenseClient: cfg.LicenseClient,
-		registry:      registry,
-		localNode:     localNode,
-		tlsConfig:     tlsCfg,
-		stopCh:        make(chan struct{}),
-		logger:        logger,
-		staged:        stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), finisherWake: make(chan struct{}, 1), finishing: map[string]bool{}, goneSince: map[string]time.Time{}},
+		lifecycleRecovery: cfg.LicenseRecovery,
+		cfg:               cfg.Config,
+		licenseClient:     cfg.LicenseClient,
+		registry:          registry,
+		localNode:         localNode,
+		tlsConfig:         tlsCfg,
+		stopCh:            make(chan struct{}),
+		logger:            logger,
+		staged:            stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), finisherWake: make(chan struct{}, 1), finishing: map[string]bool{}, goneSince: map[string]time.Time{}},
 	}
 
 	if tlsCfg != nil {
@@ -578,6 +583,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		Scheme:    security.SchemeForServer(cfg.ServerTLSEnabled),
 		// Pattern 1 only: in shared storage every writer takes writes and a
 		// designation left over in the state must not pin them to one.
+		Allowed: c.serviceOwner,
 		Designated: func() string {
 			if c.cfg.SharedStorageMode {
 				return ""
@@ -617,13 +623,14 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		}
 
 		c.writerFailoverMgr = NewWriterFailoverManager(&WriterFailoverConfig{
-			Registry:        registry,
-			RaftNode:        c.raftNode,
-			AutoFailover:    c.autoFailover,
-			FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
-			CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
-			Eligible:        c.writerEligible,
-			Logger:          cfg.Logger,
+			Registry:         registry,
+			RaftNode:         c.raftNode,
+			AutoFailover:     c.autoFailover,
+			AutomaticAllowed: c.automaticFailoverAllowed,
+			FailoverTimeout:  time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
+			CooldownPeriod:   time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
+			Eligible:         c.writerEligible,
+			Logger:           cfg.Logger,
 		})
 
 		// Wire FSM writer promotion callback to update registry
@@ -673,11 +680,12 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			c.logger.Warn().Msg("Compactor failover enabled but license does not include writer_failover feature — compactor failover disabled")
 		} else {
 			c.compactorFailoverMgr = NewCompactorFailoverManager(&CompactorFailoverConfig{
-				Registry:        registry,
-				RaftNode:        c.raftNode,
-				RaftFSM:         c.raftFSM,
-				FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
-				CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
+				AutomaticAllowed: c.automaticFailoverAllowed,
+				Registry:         registry,
+				RaftNode:         c.raftNode,
+				RaftFSM:          c.raftFSM,
+				FailoverTimeout:  time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
+				CooldownPeriod:   time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
 				// PreemptCooldown is deliberately NOT set here. It derives
 				// from CooldownPeriod inside NewCompactorFailoverManager, so
 				// the rule lives in exactly one place; setting it here too
@@ -740,7 +748,7 @@ func (c *Coordinator) Start() error {
 	}
 
 	// Validate license on each start (license may have expired)
-	if err := validateClusteringLicense(c.licenseClient); err != nil {
+	if err := validateClusteringLicense(c.licenseClient); err != nil && !c.lifecycleRecovery {
 		return err
 	}
 
@@ -874,6 +882,7 @@ func (c *Coordinator) Start() error {
 	go c.heartbeatLoop()
 
 	c.running = true
+	c.lifecycle.ready.Store(true)
 	c.localNode.MarkJoined()
 
 	c.logger.Info().
@@ -967,6 +976,7 @@ func (c *Coordinator) Stop() error {
 	if !c.leaving.CompareAndSwap(false, true) {
 		return nil
 	}
+	c.lifecycle.ready.Store(false)
 	c.finalTakeoverReport()
 	if g := c.leaveGate.Load(); g != nil && !(*g)() {
 		// A node that left is no longer asked what it has pending, and its
@@ -974,7 +984,7 @@ func (c *Coordinator) Stop() error {
 		// its files from the orphan sweep (#1214), which it holds until this
 		// node returns or is removed.
 		c.logger.Error().Msg("Not leaving the cluster at shutdown: files pending registration here could not be published to the shared store; the orphan-storage sweep is held until this node returns or is removed from the cluster")
-	} else {
+	} else if s := c.LifecycleState(); s.Mode != "sealed" && s.Mode != "reduced" && s.Mode != "preparing" {
 		c.broadcastLeave()
 	}
 	// Before c.mu is taken: stopOriginStream takes it, and joins goroutines
@@ -2246,6 +2256,20 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		return
 	}
 
+	if state := c.LifecycleState(); state.Mode != "" && state.Mode != "active" {
+		known := false
+		for _, id := range state.Participants {
+			known = known || id == req.NodeID
+		}
+		if !known {
+			c.sendJoinError(conn, req, "new participants require a full licensed topology")
+			return
+		}
+		if !hasCapability(req.Capabilities, lifecyclePolicyKind) {
+			c.sendJoinError(conn, req, "node cannot enforce the license lifecycle fence")
+			return
+		}
+	}
 	// Validate cluster-wide core limit
 	if err := c.validateCoreLimitForJoin(req.NodeID, req.CoreCount); err != nil {
 		c.logger.Warn().
@@ -3047,6 +3071,9 @@ func (c *Coordinator) GetRole() NodeRole {
 //     IsPrimaryWriter uses when no promotion can ever happen
 //   - otherwise: only the elected primary
 func (c *Coordinator) MayAcceptIngest() bool {
+	if !c.ServingAllowed() {
+		return false
+	}
 	node := c.GetLocalNode()
 	if node == nil {
 		return false
@@ -3070,6 +3097,12 @@ func (c *Coordinator) MayAcceptIngest() bool {
 }
 
 func (c *Coordinator) IsPrimaryWriter() bool {
+	if !c.ServingAllowed() {
+		return false
+	}
+	if s := c.LifecycleState(); s.Mode == "reduced" {
+		return s.Owner == c.localNode.ID
+	}
 	// Pattern 2 multi-writer: singleton tasks gate on Raft leader AND
 	// RoleWriter. The role check is still load-bearing even though only
 	// ingest-capable nodes vote now (#862): standalone nodes vote too, and a
@@ -3150,16 +3183,18 @@ func (c *Coordinator) Status() map[string]interface{} {
 	summary := c.registry.Summary()
 
 	status := map[string]interface{}{
-		"running":       running,
-		"cluster_name":  c.cfg.ClusterName,
-		"local_node_id": c.localNode.ID,
-		"local_role":    c.localNode.Role,
-		"node_count":    summary["total"],
-		"healthy_count": summary["healthy"],
-		"nodes":         nodeList,
-		"writers":       summary["writers"],
-		"readers":       summary["readers"],
-		"compactors":    summary["compactors"],
+		"running":           running,
+		"license_lifecycle": c.LifecycleState(),
+		"serving_allowed":   c.ServingAllowed(),
+		"cluster_name":      c.cfg.ClusterName,
+		"local_node_id":     c.localNode.ID,
+		"local_role":        c.localNode.Role,
+		"node_count":        summary["total"],
+		"healthy_count":     summary["healthy"],
+		"nodes":             nodeList,
+		"writers":           summary["writers"],
+		"readers":           summary["readers"],
+		"compactors":        summary["compactors"],
 	}
 	if puller != nil {
 		status["replication_catchup_status"] = puller.CatchUpStatus()
@@ -3246,11 +3281,13 @@ func (c *Coordinator) Status() map[string]interface{} {
 		totalCores := c.raftFSM.TotalCores()
 		status["total_cores"] = totalCores
 
-		if c.licenseClient != nil && c.licenseClient.GetLicense() != nil {
-			maxCores := c.licenseClient.GetLicense().MaxCores
-			status["max_cores"] = maxCores
-			if maxCores > 0 {
-				status["cores_remaining"] = maxCores - totalCores
+		if c.licenseClient != nil {
+			if lic := c.licenseClient.GetLicense(); lic != nil {
+				maxCores := lic.MaxCores
+				status["max_cores"] = maxCores
+				if maxCores > 0 {
+					status["cores_remaining"] = maxCores - totalCores
+				}
 			}
 		}
 	}
@@ -4005,9 +4042,11 @@ func (c *Coordinator) validateCoreLimitForJoin(nodeID string, coreCount int) err
 
 	lic := c.licenseClient.GetLicense()
 	if lic == nil {
+		if c.lifecycleRecovery {
+			return nil
+		}
 		return ErrLicenseRequired
 	}
-
 	return c.checkCoreLimit(lic.MaxCores, nodeID, coreCount)
 }
 
@@ -4317,6 +4356,9 @@ func (c *Coordinator) SetCompactorCallbacks(onBecome, onLose func()) {
 
 // IsActiveCompactor returns true if this node currently holds the compactor lease.
 func (c *Coordinator) IsActiveCompactor() bool {
+	if !c.ServingAllowed() {
+		return false
+	}
 	if c.raftFSM == nil {
 		return false
 	}
@@ -5009,6 +5051,9 @@ var ErrNotPrimaryWriter = errors.New("node is not the current primary writer")
 // does not name a successor and should not, because the election already
 // applies the selection rules.
 func (c *Coordinator) DemoteWriterViaRaft(nodeID string) (string, error) {
+	if s := c.LifecycleState(); s.Mode != "" && s.Mode != "active" {
+		return "", fmt.Errorf("licensed role assignment does not permit writer replacement")
+	}
 	if c.raftNode == nil {
 		return "", fmt.Errorf("clustering is not configured with Raft")
 	}
@@ -5096,6 +5141,9 @@ func (c *Coordinator) compactorPreemptStatus() map[string]interface{} {
 //
 // Must be called on the leader.
 func (c *Coordinator) AssignCompactorViaRaft(nodeID string) (string, error) {
+	if s := c.LifecycleState(); s.Mode != "" && s.Mode != "active" && s.Roles["compactor"] != nodeID {
+		return "", fmt.Errorf("licensed role assignment does not permit compactor replacement")
+	}
 	if c.raftNode == nil {
 		// A supported configuration (coordinator.go warns about it at
 		// startup), so this is the operator's state to see and correct, not a
@@ -5207,6 +5255,9 @@ func (c *Coordinator) AddNodeViaRaft(node *Node) error {
 // cluster FSM state, then unregisters it from the local registry.
 // Must be called on the leader.
 func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
+	if s := c.LifecycleState(); s.Mode != "" && s.Mode != "active" {
+		return fmt.Errorf("cannot remove a license lifecycle participant before renewal or handoff")
+	}
 	if c.raftNode == nil {
 		// No Raft, just unregister locally
 		c.registry.Unregister(nodeID)

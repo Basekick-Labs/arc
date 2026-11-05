@@ -44,6 +44,8 @@ const (
 
 // License represents a validated license
 type License struct {
+	Policy        *ExpiryPolicy `json:"expiry_policy,omitempty"`
+	clock         *authorityClock
 	LicenseKey    string    `json:"license_key"`
 	CustomerID    string    `json:"customer_id"`
 	CustomerName  string    `json:"customer_name"`
@@ -61,7 +63,14 @@ func (l *License) IsValid() bool {
 	if l == nil {
 		return false
 	}
-	return l.Status == "active" || l.Status == "grace_period"
+	return l.ExpiryState().Valid
+}
+
+func (l *License) currentTime() time.Time {
+	if l.clock != nil {
+		return l.clock.now()
+	}
+	return time.Now()
 }
 
 // IsExpired returns true if the license has expired
@@ -69,7 +78,20 @@ func (l *License) IsExpired() bool {
 	if l == nil {
 		return true
 	}
-	return l.Status == "expired" || l.Status == "read_only"
+	return !l.IsValid()
+}
+
+// expiryStatus derives display state from the same signed expiry used by the
+// gates. One clock reading governs both the boundary and whole days remaining.
+func expiryStatus(expiresAt, now time.Time) (string, int) {
+	if !validAt(expiresAt, now) {
+		return "expired", 0
+	}
+	return "active", int(expiresAt.Sub(now) / (24 * time.Hour))
+}
+
+func validAt(expiresAt, now time.Time) bool {
+	return now.Before(expiresAt)
 }
 
 // HasFeature checks if the license includes a specific feature

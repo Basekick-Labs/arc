@@ -1277,7 +1277,8 @@ type ArrowBuffer struct {
 	deleteScope  deleteScopePtr
 
 	// ingestGate refuses live writes on a fenced node (#1207).
-	ingestGate atomic.Pointer[func() error]
+	ingestGate    atomic.Pointer[func() error]
+	liveAdmission atomic.Pointer[liveRequestAdmission]
 	// walDiskGate refuses live writes under WAL volume disk pressure (#676).
 	// A slot of its own: the cluster wiring replaces ingestGate. Nil unless
 	// the WAL is enabled with wal.disk_pressure_enabled.
@@ -3258,6 +3259,23 @@ func noRelease() {}
 // that is checked here only, so an admitted request is never stopped by it
 // part-way.
 func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
+	tracker := b.liveAdmission.Load()
+	if tracker == nil {
+		return b.admitRequest(ctx, walBytes)
+	}
+	finish, ok := tracker.enter()
+	if !ok {
+		return ctx, noRelease, ErrIngestFenced
+	}
+	admitted, release, err := b.admitRequest(ctx, walBytes)
+	if err != nil {
+		finish()
+		return admitted, release, err
+	}
+	return admitted, func() { release(); finish() }, nil
+}
+
+func (b *ArrowBuffer) admitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
 		if err := (*g)(); err != nil {
 			return ctx, noRelease, err

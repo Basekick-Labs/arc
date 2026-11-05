@@ -82,6 +82,9 @@ var compactionPauseRefreshInterval = 30 * time.Second
 // has not expired. The compaction manager consults it before every batch and
 // the scheduler before every tick. False without a Raft manifest.
 func (c *Coordinator) CompactionPaused() bool {
+	if c.LifecyclePreparing() {
+		return true
+	}
 	if c.raftFSM == nil {
 		return false
 	}

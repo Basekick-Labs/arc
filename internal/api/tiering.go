@@ -218,6 +218,9 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 		})
 	}
 
+	if h.licenseClient != nil && !h.licenseClient.CanMigrateTieredStorage() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "new tier migrations are disabled by the current license policy"})
+	}
 	migrated, failed, err := h.manager.TriggerFilteredMigration(ctx, fromTier, toTier, req.Database, req.Measurement)
 	if err != nil {
 		if errors.Is(err, tiering.ErrMigrationRoleGated) {

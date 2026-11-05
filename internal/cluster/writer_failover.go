@@ -15,6 +15,7 @@ import (
 
 // WriterFailoverConfig holds configuration for the writer failover manager.
 type WriterFailoverConfig struct {
+	AutomaticAllowed func() bool
 	// Registry provides access to cluster node state
 	Registry *Registry
 
@@ -243,7 +244,7 @@ func (m *WriterFailoverManager) checkPrimaryHealth() {
 
 	// We had a primary and it is gone. Replacing it is the licensed
 	// capability.
-	if !m.cfg.AutoFailover {
+	if !m.cfg.AutoFailover || (m.cfg.AutomaticAllowed != nil && !m.cfg.AutomaticAllowed()) {
 		m.warnNoAutoFailoverLocked()
 		return
 	}
@@ -308,7 +309,7 @@ func (m *WriterFailoverManager) HandleWriterUnhealthy(node *Node) {
 	// The other way into a replacement, and gated the same way. Electing a
 	// first primary does not come through here — that is the tick path — so
 	// this can refuse outright.
-	if !m.cfg.AutoFailover {
+	if !m.cfg.AutoFailover || (m.cfg.AutomaticAllowed != nil && !m.cfg.AutomaticAllowed()) {
 		return
 	}
 

@@ -1740,3 +1740,20 @@ func fileCoverage(cov *ingest.GroupCoverage) []raft.InstanceCoverage {
 // maxFileCoverageBytes bounds one registration's coverage, so a batch of
 // registrations stays within the 1 MiB forward frame.
 const maxFileCoverageBytes = 64 << 10
+
+// WaitDrained proves that every accepted registration is durably acknowledged
+// while Raft is still available. Stop alone does not establish this barrier.
+func (r *RegistrationOutbox) WaitDrained(ctx context.Context) error {
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if r.Pending() == 0 {
+			return r.SyncRegistrations()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+}

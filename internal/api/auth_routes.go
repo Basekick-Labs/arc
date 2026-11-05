@@ -521,6 +521,12 @@ func (h *AuthHandler) addTokenToTeam(c *fiber.Ctx) error {
 			"error":   "RBAC requires an enterprise license with the 'rbac' feature enabled",
 		})
 	}
+	if !h.rbacManager.CanManageRBAC() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error":   "RBAC management is read-only during license degradation",
+		})
+	}
 
 	tokenID, err := strconv.ParseInt(c.Params("id"), 10, 64)
 	if err != nil {

@@ -107,6 +107,20 @@ func (c *Coordinator) PolicyCollecting(kind string) bool {
 // the collect at epoch and it is still open. Epoch zero is a read-only probe:
 // the rows as they are now, with no collect.
 func (c *Coordinator) localPoliciesAnswer(ctx context.Context, kind string, epoch uint64) (string, json.RawMessage) {
+	if kind == lifecycleSealKind {
+		s := c.LifecycleState()
+		if s.Mode != "preparing" || s.Generation != epoch {
+			return protocol.LocalPoliciesRefused, nil
+		}
+		return c.readLocalPolicies(ctx, kind)
+	}
+	if kind == lifecycleReleaseKind || kind == lifecycleDurableKind {
+		s := c.LifecycleState()
+		if s.Mode != "sealed" || s.Generation != epoch {
+			return protocol.LocalPoliciesRefused, nil
+		}
+		return c.readLocalPolicies(ctx, kind)
+	}
 	if epoch == 0 {
 		return c.readLocalPolicies(ctx, kind)
 	}
@@ -182,7 +196,11 @@ func (c *Coordinator) handleLocalPoliciesQuery(conn net.Conn, q *protocol.LocalP
 		refuse("raft not initialized")
 		return
 	}
-	if leader := c.raftNode.LeaderID(); leader == "" || leader != q.NodeID {
+	leader := c.raftNode.LeaderID()
+	if state := c.LifecycleState(); q.Kind == lifecycleReleaseKind || q.Kind == lifecycleDurableKind || (q.Kind == lifecyclePolicyKind && state.Mode == "sealed") {
+		leader = state.Controller
+	}
+	if leader == "" || leader != q.NodeID {
 		refuse("the peer is not the Raft leader")
 		return
 	}

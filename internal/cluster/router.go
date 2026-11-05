@@ -63,6 +63,8 @@ var (
 
 // RouterConfig holds configuration for the request router.
 type RouterConfig struct {
+	// Allowed filters durable licensed service owners, independently of health.
+	Allowed func(string) bool
 	// Timeout for forwarded requests
 	Timeout time.Duration
 
@@ -262,6 +264,9 @@ func (r *Router) writeTarget() (*Node, error) {
 		}
 		writer = r.selectWriter(writers)
 	}
+	if writer == nil || (r.cfg.Allowed != nil && !r.cfg.Allowed(writer.ID)) {
+		return nil, ErrNoWriterAvailable
+	}
 	return writer, nil
 }
 
@@ -409,6 +414,7 @@ func (r *Router) doForwardOnce(ctx context.Context, client *http.Client, node *N
 // list of writer nodes. Mirrors selectNode but uses writerIndex so
 // the rotation isn't perturbed by interleaved reader queries.
 func (r *Router) selectWriter(nodes []*Node) *Node {
+	nodes = r.allowedNodes(nodes)
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -430,7 +436,7 @@ func (r *Router) selectWriter(nodes []*Node) *Node {
 // Returns ErrLocalNodeCanHandle if this node can process the query directly.
 func (r *Router) RouteQuery(ctx context.Context, req *http.Request) (*http.Response, error) {
 	// Check if local node can handle queries
-	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanQuery {
+	if r.cfg.LocalNode != nil && (r.cfg.Allowed == nil || r.cfg.Allowed(r.cfg.LocalNode.ID)) && r.cfg.LocalNode.Role.GetCapabilities().CanQuery {
 		return nil, ErrLocalNodeCanHandle
 	}
 
@@ -457,6 +463,7 @@ func (r *Router) RouteQuery(ctx context.Context, req *http.Request) (*http.Respo
 
 // selectNode selects a node from the list based on the configured strategy.
 func (r *Router) selectNode(nodes []*Node) *Node {
+	nodes = r.allowedNodes(nodes)
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -684,4 +691,17 @@ func (r *Router) Stats() map[string]interface{} {
 		"writer_index":       r.writerIndex.Load(),
 		"active_connections": connStats,
 	}
+}
+
+func (r *Router) allowedNodes(nodes []*Node) []*Node {
+	if r.cfg.Allowed == nil {
+		return nodes
+	}
+	out := make([]*Node, 0, len(nodes))
+	for _, n := range nodes {
+		if r.cfg.Allowed(n.ID) {
+			out = append(out, n)
+		}
+	}
+	return out
 }

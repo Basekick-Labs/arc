@@ -293,6 +293,11 @@ func (rm *RBACManager) IsRBACEnabled() bool {
 	return lic.HasFeature(license.FeatureRBAC)
 }
 
+// CanManageRBAC is independent of enforcement of already stored grants.
+func (rm *RBACManager) CanManageRBAC() bool {
+	return rm != nil && rm.licenseClient != nil && rm.licenseClient.CanManageRBAC()
+}
+
 // =============================================================================
 // Organizations CRUD
 // =============================================================================
@@ -1797,8 +1802,8 @@ func hasCoarseAdmin(info *TokenInfo) bool {
 // MEMBERSHIPS, never by the license. The license gates RBAC *management* only
 // (RBACHandler.requireRBACLicense guards every /api/v1/rbac route).
 //
-// Keying enforcement off the license would fail OPEN. License.IsValid() is
-// true only for "active" and "grace_period", and cmd/arc/main.go sets
+// Keying enforcement off the license would fail OPEN. License.IsValid()
+// checks the signed expiry against the current clock, and cmd/arc/main.go sets
 // licenseClient to nil when validation fails at boot — so a lapsed trial, a
 // revoked key, or an outage past the cached-license window all make
 // IsRBACEnabled() false. If that switched enforcement off, every tenant token

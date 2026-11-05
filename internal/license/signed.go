@@ -21,36 +21,33 @@ import (
 // signature now travels in a separate envelope field
 // (response.license_signature), not embedded in the payload.
 type SignedLicense struct {
-	Version            int       `json:"version"`
-	LicenseKey         string    `json:"license_key"`
-	CustomerID         string    `json:"customer_id"`
-	CustomerName       string    `json:"customer_name"`
-	CustomerEmail      string    `json:"customer_email,omitempty"`
-	Tier               Tier      `json:"tier"`
-	MaxCores           int       `json:"max_cores"`
-	MaxMachines        int       `json:"max_machines"`
-	Features           []string  `json:"features"`
-	MachineFingerprint string    `json:"machine_fingerprint,omitempty"`
-	IssuedAt           time.Time `json:"issued_at"`
-	ExpiresAt          time.Time `json:"expires_at"`
+	Policy             *ExpiryPolicy `json:"expiry_policy,omitempty"`
+	Version            int           `json:"version"`
+	LicenseKey         string        `json:"license_key"`
+	CustomerID         string        `json:"customer_id"`
+	CustomerName       string        `json:"customer_name"`
+	CustomerEmail      string        `json:"customer_email,omitempty"`
+	Tier               Tier          `json:"tier"`
+	MaxCores           int           `json:"max_cores"`
+	MaxMachines        int           `json:"max_machines"`
+	Features           []string      `json:"features"`
+	MachineFingerprint string        `json:"machine_fingerprint,omitempty"`
+	IssuedAt           time.Time     `json:"issued_at"`
+	ExpiresAt          time.Time     `json:"expires_at"`
 }
 
 // ToRuntimeLicense converts a verified SignedLicense into the runtime
 // License type used by the rest of arc. Caller must have already
 // verified the signature; this function does NOT re-verify.
 //
-// Status and DaysRemaining are derived locally from the signed
-// ExpiresAt rather than trusted from the unsigned envelope: an
-// attacker controlling the response could otherwise replay a
-// previously-signed blob (legitimately expired today) alongside an
-// envelope claiming "active". The signed ExpiresAt is the only
-// trustworthy expiry signal.
-//
-// `now` is passed in so tests can drive the computation; callers
-// outside tests pass time.Now().UTC().
+// Status and DaysRemaining are derived from the signed policy at the supplied
+// evaluation time, never from unsigned envelope status. Online callers supply
+// the verified authority clock; explicit offline files retain separate local
+// time provenance. Legacy files without a policy keep their exact signed cutoff.
 func (s *SignedLicense) ToRuntimeLicense(now time.Time) *License {
 	status, daysRemaining := s.deriveStatus(now)
 	return &License{
+		Policy:        s.Policy,
 		LicenseKey:    s.LicenseKey,
 		CustomerID:    s.CustomerID,
 		CustomerName:  s.CustomerName,
@@ -64,20 +61,16 @@ func (s *SignedLicense) ToRuntimeLicense(now time.Time) *License {
 	}
 }
 
-// deriveStatus computes Status + DaysRemaining from the signed
-// ExpiresAt + the current time:
-//   - ExpiresAt in the past   → "expired"
-//   - ExpiresAt in the future → "active"
-//
-// We deliberately don't implement a grace period client-side: if the
-// signed ExpiresAt is in the past, the license is expired. The server
-// can grant a different status in its unsigned envelope (e.g. for
-// billing-grace UX) but Arc's feature gates use the strict signed
-// expiry to prevent trust escalation through the unsigned envelope.
+// deriveStatus never infers grace from a legacy expires_at. Only an explicit,
+// signature-verified policy can authorize the paid calendar grace period.
 func (s *SignedLicense) deriveStatus(now time.Time) (string, int) {
-	if !s.ExpiresAt.After(now) {
-		return "expired", 0
+	if s.Policy != nil {
+		state := s.Policy.state(now)
+		days := 0
+		if now.Before(s.Policy.TermEndsAt) {
+			days = int(s.Policy.TermEndsAt.Sub(now) / (24 * time.Hour))
+		}
+		return state.Status, days
 	}
-	remaining := int(s.ExpiresAt.Sub(now).Hours() / 24)
-	return "active", remaining
+	return expiryStatus(s.ExpiresAt, now)
 }
