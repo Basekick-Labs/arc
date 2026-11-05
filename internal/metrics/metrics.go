@@ -1892,7 +1892,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_disk_pressure_rejections_total Live writes refused for WAL volume disk pressure; nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_wal_disk_pressure_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_wal_disk_pressure_rejections_total", float64(m.walDiskPressureRejections.Load()))
-	b = append(b, "# HELP arc_ingest_buffer_full_rejections_total Write requests refused because rows waiting to be flushed reached ingest.max_buffered_bytes; nothing was written, clients retry\n"...)
+	b = append(b, "# HELP arc_ingest_buffer_full_rejections_total Write requests refused because rows waiting to be flushed reached ingest.max_buffered_bytes (bulk imports: 90 percent of it); nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_ingest_buffer_full_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_buffer_full_rejections_total", float64(m.bufferFullRejections.Load()))
 	b = append(b, "# HELP arc_wal_disk_stat_errors_total Failed reads of the WAL volume's free space; the disk pressure gate fails open while they fail\n"...)

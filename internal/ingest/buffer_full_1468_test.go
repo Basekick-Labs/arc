@@ -332,3 +332,32 @@ func (l *syncLogBuffer) String() string {
 	defer l.mu.Unlock()
 	return l.buf.String()
 }
+
+// Sets and clears from many goroutines reach the listener in the order they
+// took effect: strictly alternating, ending on the current state. Out of
+// order, a stale "full" after the clear would leave MQTT suspended for good.
+func TestBufferFullNotificationsFollowTheState(t *testing.T) {
+	b, _ := limitedBuffer(t, 1<<20, 0)
+	ev := &bufferFullEvents{}
+	b.OnBufferFullChange(ev.fn)
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 2000 {
+				b.setBufferFull((i+g)%2 == 0)
+			}
+		}()
+	}
+	wg.Wait()
+	got := ev.snapshot()
+	for i := 1; i < len(got); i++ {
+		if got[i] == got[i-1] {
+			t.Fatalf("event %d repeats %v: notifications out of order", i, got[i])
+		}
+	}
+	if got[len(got)-1] != b.bufferFull.Load() {
+		t.Fatalf("last notification %v, state %v", got[len(got)-1], b.bufferFull.Load())
+	}
+}

@@ -559,16 +559,21 @@ is written:
   retry the other 503 refusals (WAL disk pressure, cluster fencing) need no
   change.
 - Bulk imports are refused from 90% of the limit, and a running import paces
-  its writes below that level, so it does not hold the node over the limit
-  while other clients are refused. An import already running is never
-  stopped part-way by the limit.
+  its writes to stay below that level (each grouped write can still add up to
+  a few tens of MB at once). The limit never refuses an import part-way, but
+  while other writers keep the node near it a running import can wait out its
+  2-minute flush wait and end with a partial write, as it could before when
+  flushes did not keep up.
 - MQTT subscriptions are suspended until the buffer drains below 90% of the
   limit (and for at least 5 seconds), as they are for WAL disk pressure. With
   `clean_session = false` and QoS 1 or 2 the broker holds the messages; a
-  `clean_session = true` subscription loses what is published meanwhile.
+  `clean_session = true` subscription loses what is published meanwhile. A
+  message already being handled when the limit is reached is retried for 2
+  seconds and then dropped (counted as failed).
 - WAL replay and continuous-query writes are never refused.
 - New counter `arc_ingest_buffer_full_rejections_total` (one per refused
-  request), and a warning in the log at 80% of the limit.
+  request, imports refused from 90% included), and a warning in the log at
+  80% of the limit.
 
 The default, `"auto"`, is half the memory limit Arc detects (the container
 limit where there is one), and off when none is detected; startup logs the
@@ -580,7 +585,11 @@ turn the limit off and keep the old behaviour:
 max_buffered_bytes = "auto"   # or "4GB", or "0" for off
 ```
 
-Or `ARC_INGEST_MAX_BUFFERED_BYTES`. It is a backstop, not a bound on memory:
+Or `ARC_INGEST_MAX_BUFFERED_BYTES`. A refusal does not itself start a flush:
+an explicit limit below what buffers normally hold before their size or age
+flush (`max_buffer_size`, `max_buffer_age_ms`) refuses writes until the next
+one, even with storage keeping up, so set it well above that. It is a
+backstop, not a bound on memory:
 the estimate is a MessagePack request's payload size and leaves out the
 copies a flush makes, requests admitted at the same time can each overshoot it
 by their own size (up to `server.max_payload_size`), and WAL replay at startup

@@ -161,6 +161,8 @@ default_sort_keys = ""
 # refused from 90% of it and pace their writes below that. "auto" (default) is
 # half the detected memory limit, off when none is detected; "0" turns it off.
 # A backstop, not a heap bound: the estimate leaves out a flush's copies.
+# A refusal does not start a flush: keep an explicit value well above what
+# buffers hold before their size/age flush, or writes wait for the next one.
 # max_buffered_bytes = "auto"
 
 # -----------------------------------------------------------------------------

@@ -64,7 +64,8 @@ type SubscriptionManager struct {
 }
 
 // heldReason is a suspend reason applied at once when it sets and, when it
-// clears, only after it has held for its minimum time. Guarded by mu.
+// clears, only after it has held for its minimum time. Its fields are
+// guarded by its own mu.
 type heldReason struct {
 	mu       sync.Mutex
 	on       bool        // the state applied to suspended

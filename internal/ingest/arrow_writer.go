@@ -1344,6 +1344,7 @@ type ArrowBuffer struct {
 	// suspends on, bufferFullWarning the latch of the warning before it.
 	maxBufferedBytes   int64
 	bufferFull         atomic.Bool
+	bufferFullMu       sync.Mutex // orders bufferFull changes with their notifications
 	bufferFullWarning  atomic.Bool
 	bufferFullListener atomic.Pointer[func(bool)]
 

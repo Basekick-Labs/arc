@@ -66,14 +66,26 @@ func (b *ArrowBuffer) MaxBufferedBytes() int64 { return b.maxBufferedBytes }
 // OnBufferFullChange registers fn to be told when the buffer-full state
 // changes, and tells it the current state at once: the state may already be
 // set when the caller registers (the sampler runs from NewArrowBuffer). fn
-// must not block; it can run on a write's goroutine. One listener; a second
-// call replaces the first.
+// must not block; it can run on a write's goroutine, under bufferFullMu.
+// One listener; a second call replaces the first.
 func (b *ArrowBuffer) OnBufferFullChange(fn func(full bool)) {
+	b.bufferFullMu.Lock()
+	defer b.bufferFullMu.Unlock()
 	b.bufferFullListener.Store(&fn)
 	fn(b.bufferFull.Load())
 }
 
+// setBufferFull changes the state and tells the listener, both under
+// bufferFullMu. It is called from the sampler and from refused writes; done
+// apart, a set and a clear racing could reach the listener in the opposite
+// order to the one they took effect in, leaving MQTT suspended with the state
+// clear, and no later change to undo it.
 func (b *ArrowBuffer) setBufferFull(full bool) {
+	if b.bufferFull.Load() == full {
+		return // the common case, without the lock
+	}
+	b.bufferFullMu.Lock()
+	defer b.bufferFullMu.Unlock()
 	if !b.bufferFull.CompareAndSwap(!full, full) {
 		return
 	}
