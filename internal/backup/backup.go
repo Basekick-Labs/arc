@@ -1117,6 +1117,12 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	m.recordUnaddressable(run, unaddressable)
 
 	// ── 4. Copy config, on the DEFAULT leg ──────────────────────────────
+	// Info, not Warn: include_config defaults to true, so an install
+	// configured only through the environment would warn on every backup;
+	// startup already warned once (#1466).
+	if opts.IncludeConfig && m.configPath == "" {
+		m.logger.Info().Str("backup_id", backupID).Msg("Backup holds no config: Arc started without a config file")
+	}
 	if opts.IncludeConfig && m.configPath != "" {
 		// The default for a remote target is false, decided at the API layer
 		// from Manager.TargetIsRemote. Reaching here with a remote target

@@ -680,6 +680,63 @@ failed non-interactively even for an unedited file.
 - Downgrading to 26.09.x or earlier replaces `/etc/arc/arc.toml` with that
   release's stock file, as every upgrade used to. Back it up first.
 
+## Fix: backups include, and restores replace, the config file Arc actually loaded ([#1466](https://github.com/Basekick-Labs/arc/issues/1466))
+
+`include_config` and `restore_config` used `arc.toml` in the working
+directory. Arc finds its config through a search path (the working directory,
+then `/etc/arc/`, then `~/.arc/`), so on any install whose config lives
+elsewhere both were wrong. On the .deb/.rpm/Arch packages the working
+directory is `/var/lib/arc` and the config is `/etc/arc/arc.toml`:
+
+- A backup never held the config. The backup succeeded, and the only sign
+  was a `Failed to backup config file` warning in the log.
+- A config restore wrote `/var/lib/arc/arc.toml`. The working directory is
+  searched first, so from the next start that file was the config, and edits
+  to `/etc/arc/arc.toml` had no effect.
+
+Both now use the file Arc loaded at startup. The startup line
+`Backup/restore enabled` shows it as `config_file`, and `config_restore`
+says whether this node can restore a config at all.
+
+**Backups on a package install now hold the config, and its credentials.**
+`include_config` defaults to true for a backup to a local target, so every
+default backup now contains `/etc/arc/arc.toml`, with any S3, Azure or GCS
+keys and the cluster shared secret in it. Before, these backups silently held
+no config. Treat the backup directory as secret, or send
+`"include_config": false`.
+
+**`restore_config` is refused with 400 before anything is restored** when
+the backup holds a config and the node cannot write it. The config step runs
+last, so where the write failed (a read-only ConfigMap, for example) the
+restore used to fail after the data had been restored. It is refused when:
+
+- Arc started without a config file. Arc logs a warning at startup, and each
+  backup logs that it holds no config.
+- The config file is not writable by the Arc process. This covers the rpm and
+  Arch packages, where `/etc/arc/arc.toml` is root's, and a Kubernetes
+  ConfigMap mount, which is read-only.
+- Arc cannot create the safety copy next to the config file. On the .deb,
+  `/etc/arc` is root's.
+
+**This changes what `restore_config` does on a package install.** It used to
+"work" by writing the shadow file described above; it is now refused. Restore
+the config by hand from `<backup_id>/config/arc.toml` in the backup instead.
+Docker is unaffected: the config there is `/app/arc.toml`, in the working
+directory. Note that it is in the container layer, not the `/app/data` volume,
+so a restored config does not survive recreating the container.
+
+Before overwriting, Arc copies the current config to
+`<config>.before-restore-<backup_id>`. A failed copy now fails the config
+restore, instead of logging a warning and overwriting anyway. An existing copy
+is never replaced, so neither a restore of another backup nor a retry of the
+same one overwrites the copy of the config it first replaced.
+
+**If you ran `restore_config` on a package install before this release,**
+`/var/lib/arc/arc.toml` is still your config, and `/etc/arc/arc.toml` is
+ignored. Arc now logs a warning at startup naming both files. Merge what you
+need into `/etc/arc/arc.toml`, then remove `/var/lib/arc/arc.toml`. The
+storage and backup paths are set by the systemd unit and override either file.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
@@ -7230,8 +7287,8 @@ holds Raft-replicated tokens, this node's tier rows and the audit log, and
 the shared secret, so either one from a backup would give the node another
 node's state. A client that sends `restore_metadata: true` explicitly by
 default will be refused on every cluster node and must stop sending it. A
-standalone config restore still writes the literal `arc.toml` in the working
-directory, not the path the server was started with.
+standalone config restore writes the config file the server loaded at
+startup; see [#1466](https://github.com/Basekick-Labs/arc/issues/1466).
 
 ### Cluster restores pause compaction cluster-wide ([#1087](https://github.com/Basekick-Labs/arc/issues/1087))
 
