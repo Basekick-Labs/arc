@@ -73,6 +73,7 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 // scanTimeBoundsAt is scanTimeBounds with now() and current_timestamp read as
 // now.
 func scanTimeBoundsAt(sqlStr string, now time.Time) (timeBounds, bool) {
+	timeRangeScans.Add(1)
 	masked, masks := sql.MaskStringLiterals(sqlStr, sql.HasQuotes(sqlStr))
 	masked, ok := stripMaskedComments(masked)
 	if !ok {

@@ -362,9 +362,14 @@ max_sql_length = 200000
 - Preparing a long query now takes time in proportion to its length. Before,
   restoring its string literals copied the whole statement once per literal,
   so a 1 MB query with 50,000 literals spent 9.3 s there, and a 2.3 MB one
-  34 s. Both now take under 0.6 s. Validation and rewriting together cost
-  about 0.5 s of CPU per MiB before DuckDB starts, which is why the ceiling is
-  1 MiB.
+  34 s. Both now take under 0.6 s. Validation and rewriting are linear in
+  the query's length (since [#1479](https://github.com/Basekick-Labs/arc/issues/1479)),
+  but their cost depends on the query's shape. At the 1 MiB ceiling one
+  request costs about 1.4 s of CPU for a JOIN chain, and up to about 21 s for
+  a comma join of many short references (`FROM x,x,x…`), most of it in
+  passes over the rewritten SQL
+  ([#1482](https://github.com/Basekick-Labs/arc/issues/1482) tracks that
+  shape). At the 10 KB default, about 0.2 s at worst.
 - Queries longer than 10,000 characters are not kept in the SQL transform
   cache, so a raised limit leaves the cache's memory bound unchanged.
 
@@ -839,6 +844,26 @@ an operand glued to the keyword (`IS DISTINCT FROM'a'`, `'a'IS DISTINCT FROM
 x`), and a non-ASCII space between the words. Put an ASCII space there.
 
 The workaround for earlier releases is `(x != 'a' OR x IS NULL)`.
+
+## Fix: a query naming many tables no longer takes quadratic time to prepare ([#1479](https://github.com/Basekick-Labs/arc/issues/1479))
+
+Before running a query, Arc rewrites each table reference into a read of its
+files and works out which time partitions that read needs. For every
+reference it re-read the whole query: its time range, whether that range is
+relative to `now()`, and a hash for the partition cache. None of these depend
+on the table. A query made of many short references therefore took time
+quadratic in its length. Any user with query rights could hold a CPU core
+with one request:
+
+| Crafted query (whole request) | 10 KB (default limit) | 20 KB |
+|---|---|---|
+| Comma join, `SELECT 1 FROM x,x,x,…` | 9.8 s → 0.21 s | |
+| Comma join, `SELECT 1 FROM x, x, x, …` | 5.6 s → 0.15 s | 21.8 s → 0.29 s |
+| `SELECT 1 x from x from …` | 1.6 s → 0.06 s | 6.6 s → 0.10 s |
+
+Arc now reads them once per query and shares them across its references.
+Results are unchanged. A time range is only ever found for a single-table
+query, so no query's pruning differs.
 
 ## Upgrade note: three configurations now refuse to start
 
