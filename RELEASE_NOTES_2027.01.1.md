@@ -476,45 +476,18 @@ not a read statement fails its runs from this release.
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
-## Security: DuckDB functions that read or write files under the storage root are refused ([GHSA-r7vm-9hcg-xgf7](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-r7vm-9hcg-xgf7))
+## Security: more DuckDB functions are refused in user SQL
 
-Arc refuses DuckDB's file-reading functions in user SQL, but the list predated
-functions that the DuckDB release Arc links now provides. A token scoped to
-one database could reach other databases' files under the storage root:
+Some functions of the DuckDB release Arc links were not covered by the checks
+Arc runs on query text, and could reach data or state outside the caller's
+scope. They are now refused with `400` on every query endpoint, in continuous
+queries and in `DELETE` predicates; a stored continuous query that calls one
+fails its runs. `DELETE` predicates now apply exactly the checks queries do.
+A test now reviews the linked DuckDB's functions so an upgrade cannot add one
+unnoticed.
 
-- `parquet_full_metadata()` returned another database's Parquet schema, row
-  counts and per-column minimum and maximum values;
-- the `histogram()` and `histogram_values()` table functions returned the
-  values of any column of any Parquet file they were given a path to;
-- `json_serialize_plan()` listed every database's Parquet files and their
-  columns;
-- `read_duckdb()` read a DuckDB database file.
-
-Any token allowed to query could also call `enable_profiling(save_location :=
-...)`, which profiled later queries on the same pooled connection, including
-other users', into a `.json` or `.txt` file it named under the storage root,
-creating it or overwriting an existing one.
-
-These functions are now refused with `400` on every query endpoint and in
-continuous queries; a stored continuous query that calls one fails its runs.
-So are `disable_profiling`, the parser toggles, `sql_auto_complete` (which
-suggests file names), and the views of the engine's file cache, temporary
-files and prepared statements. The `histogram()` aggregate is unaffected:
-only the table function of that name, in a `FROM` clause, is refused.
-
-`DELETE` predicates kept their own, older copy of the list and did not check
-functions that run SQL given as a string (`query()`, `query_table()`). They
-now refuse exactly what queries refuse. A cluster DELETE record created before
-the upgrade is still replayed as it was recorded.
-
-A test now lists every table function, table macro, pragma and internal view
-of the linked DuckDB, and every function whose name says it handles SQL, and
-fails until each new one is refused or reviewed. It also fails when a reviewed
-macro or view turns out to call a refused function.
-
-Full technical detail will accompany the security advisory once it is
-published. Responsibly reported by **[@harsh-prajapati1312](https://github.com/harsh-prajapati1312)**; the
-other functions were found while fixing the report.
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@harsh-prajapati1312](https://github.com/harsh-prajapati1312)**.
 
 ## Security: a cluster node that took a Raft snapshot no longer keeps revoked tokens ([#1336](https://github.com/Basekick-Labs/arc/issues/1336))
 
