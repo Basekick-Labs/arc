@@ -50,6 +50,11 @@ func TestValidateSQLStillRefusesReplacementScans(t *testing.T) {
 		"set operation after the operator":    "SELECT 'a' IS DISTINCT FROM 'b' UNION DISTINCT FROM '" + victim + "'",
 		"FROM-first subquery as the operand":  "SELECT * FROM cpu WHERE x IS DISTINCT FROM (FROM '" + victim + "')",
 		"real FROM after the operator":        "SELECT a IS DISTINCT FROM b FROM '" + victim + "'",
+		// The first fix's backward scan read these comment shapes wrongly
+		// and hid the real FROM; validation was safe only because it strips
+		// comments before masking, which nothing tested (#1472 review).
+		"operator words in a block comment holding --": "SELECT v /*is distinct --*/ x FROM '" + victim + "'",
+		"block delimiters inside line comments":        "SELECT a IS DISTINCT -- /*\nFROM cpu, 1 AS z -- */\nFROM '" + victim + "'",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := ValidateSQLRequest(sql); err == nil {
@@ -104,6 +109,8 @@ func TestRewriteLeavesDistinctFromOperandAlone(t *testing.T) {
 		{"header DB, no table", "SELECT 1 IS DISTINCT FROM 2 AS d", "mydb", nil, "IS DISTINCT FROM 2"},
 		{"header DB, newline before the table", "SELECT host IS DISTINCT FROM note AS d FROM\ncpu", "mydb", []string{rp("mydb", "cpu")}, "IS DISTINCT FROM note"},
 		{"header DB, column operand", "SELECT host FROM cpu WHERE host IS DISTINCT FROM note", "mydb", []string{rp("mydb", "cpu")}, "IS DISTINCT FROM note"},
+		{"comment before IS", "SELECT host FROM cpu WHERE host /* -- */ IS DISTINCT FROM note", "", []string{rp("default", "cpu")}, "IS DISTINCT FROM note"},
+		{"block comment holding -- before a real FROM", "SELECT v /*is distinct --*/ x FROM cpu", "", []string{rp("default", "cpu")}, "x FROM read_parquet"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

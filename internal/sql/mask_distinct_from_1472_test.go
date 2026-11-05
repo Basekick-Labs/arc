@@ -3,6 +3,7 @@ package sql
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // maskedFroms returns how many FROM keywords MaskFromKeywordsInFunctionBodies
@@ -75,7 +76,7 @@ func TestFromThatIntroducesARelationIsNotMasked(t *testing.T) {
 		// Only ASCII whitespace separates the words: DuckDB reads
 		// `is<U+0085>distinct` as one identifier (#1472 review B2).
 		{"U+0085 between IS and DISTINCT", "SELECT __STR_0__ is\u0085distinct FROM __STR_1__"},
-		{"U+2028 between DISTINCT and FROM", "SELECT a IS distinct FROM __STR_0__"},
+		{"U+2028 between DISTINCT and FROM", "SELECT a IS distinct\u2028FROM __STR_0__"},
 		{"identifier ending in is", "SELECT this DISTINCT FROM t"},
 	}
 	for _, tc := range cases {
@@ -106,5 +107,55 @@ func TestOperatorThenSetOperation(t *testing.T) {
 func TestCommentedFunctionFormStillMasked(t *testing.T) {
 	if got := maskedFroms(t, "SELECT EXTRACT /* c */ (YEAR FROM t) FROM cpu"); got != 1 {
 		t.Errorf("masked %d, want 1", got)
+	}
+}
+
+// TestCommentShapesTheBackwardScanMisread: the first fix looked behind each
+// FROM by scanning backwards, and its comment detection disagreed with the
+// lexer — a `--` inside a block comment counted as a line comment, and a `*/`
+// inside a line comment closed a block. The scan is now forward and skips
+// comments as DuckDB does.
+func TestCommentShapesTheBackwardScanMisread(t *testing.T) {
+	cases := []struct {
+		name, sql string
+		want      int
+	}{
+		{"operator words in a block comment holding --", "SELECT a /*is distinct --*/ x FROM secret", 0},
+		{"block delimiters inside line comments", "SELECT a IS DISTINCT -- /*\nFROM cpu, 1 AS z -- */\nFROM secret", 1},
+		{"comment before IS", "SELECT host FROM cpu WHERE host /* -- */ IS DISTINCT FROM note", 1},
+		{"form feed and vertical tab", "SELECT a IS\fNOT\vDISTINCT\fFROM b FROM cpu", 1},
+		{"unterminated block comment", "SELECT a IS DISTINCT /* FROM b", 0},
+		{"line comment at end of input", "SELECT a IS DISTINCT FROM b -- FROM", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := maskedFroms(t, tc.sql); got != tc.want {
+				t.Errorf("masked %d FROMs in %q, want %d", got, tc.sql, tc.want)
+			}
+		})
+	}
+	out, _ := MaskFromKeywordsInFunctionBodies("SELECT a IS DISTINCT -- /*\nFROM cpu, 1 AS z -- */\nFROM secret")
+	if !strings.HasSuffix(out, "\nFROM secret") {
+		t.Errorf("the real FROM was masked: %q", out)
+	}
+}
+
+// TestMaskerIsLinear: the pre-check runs on every query, and the backward
+// scans made it quadratic (88 s on 1 MiB of `FROM `). 1 MiB inputs must take
+// milliseconds; the bound is loose enough for -race.
+func TestMaskerIsLinear(t *testing.T) {
+	for name, unit := range map[string]string{
+		"FROM":     "FROM ",
+		"operator": "a IS DISTINCT FROM b ",
+		"trim":     "trim(",
+		"comments": "-- x\nFROM /* y */ ",
+	} {
+		sql := strings.Repeat(unit, (1<<20)/len(unit))
+		start := time.Now()
+		ContainsMaskableFromKeyword(sql)
+		MaskFromKeywordsInFunctionBodies(sql)
+		if d := time.Since(start); d > 3*time.Second {
+			t.Errorf("%s: 1 MiB took %v", name, d)
+		}
 	}
 }

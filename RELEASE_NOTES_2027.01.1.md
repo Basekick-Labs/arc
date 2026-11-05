@@ -816,6 +816,15 @@ of `EXTRACT`, `SUBSTRING`, `TRIM` or `OVERLAY`. A comment such as
 `/* trim( */` could previously make a real table reference after it invisible
 to the RBAC check and to the query rewrite, and the query then failed.
 
+The scan behind all of this is now one linear pass. It used to rescan each
+line once per keyword: at the default `query.max_sql_length` (10 KB) a
+crafted single-line query cost tens of milliseconds, and with the limit raised
+to 1 MiB it cost minutes. It now costs milliseconds at 1 MiB.
+
+Two spellings still fail as before, because Arc reads them as one word:
+an operand glued to the keyword (`IS DISTINCT FROM'a'`, `'a'IS DISTINCT FROM
+x`), and a non-ASCII space between the words. Put an ASCII space there.
+
 The workaround for earlier releases is `(x != 'a' OR x IS NULL)`.
 
 ## Upgrade note: three configurations now refuse to start

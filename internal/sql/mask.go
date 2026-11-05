@@ -408,96 +408,139 @@ func skipWhitespaceAndCommentsForward(sql string, i int) int {
 }
 
 // ContainsMaskableFromKeyword reports whether sql holds a FROM keyword that
-// MaskFromKeywordsInFunctionBodies would mask: one inside EXTRACT, SUBSTRING,
-// TRIM or OVERLAY, or the FROM of an `IS [NOT] DISTINCT FROM` comparison
-// (#1472). Callers that rewrite the token after FROM without running the
-// masker (the single-table fast path) must bail out when this is true.
-// Allocation-free; a false positive only costs the slower path.
+// MaskFromKeywordsInFunctionBodies masks: one inside EXTRACT, SUBSTRING, TRIM
+// or OVERLAY, or the FROM of an `IS [NOT] DISTINCT FROM` comparison (#1472).
+// Callers that rewrite the token after FROM without running the masker (the
+// single-table fast paths) must bail out when this is true. It is the
+// masker's own scan, stopped at the first hit, so the two cannot disagree;
+// linear in len(sql) and allocation-free unless a trigger function's
+// parenthesis is open.
 func ContainsMaskableFromKeyword(sql string) bool {
-	return ContainsFromKeywordFunction(sql) || containsDistinctFromOperator(sql)
+	found := false
+	scanMaskableFroms(sql, func(int) bool {
+		found = true
+		return false
+	})
+	return found
 }
 
-// containsDistinctFromOperator reports whether some whole-word FROM in sql is
-// the FROM of an `IS [NOT] DISTINCT FROM` comparison. Allocation-free.
-func containsDistinctFromOperator(sql string) bool {
-	for i := 0; i+4 <= len(sql); i++ {
-		if (sql[i] == 'f' || sql[i] == 'F') && isFromKeywordAt(sql, i) && isDistinctFromOperatorFrom(sql, i) {
+// maskToken is one token of the scan's look-behind window: a word, or a single
+// byte of anything else (punctuation, a quote, a byte of a multi-byte UTF-8
+// sequence). Whitespace and comments are not tokens.
+type maskToken struct {
+	word string // the word, or "" for a non-word byte
+	b    byte   // the byte, when word == ""
+}
+
+func (t maskToken) is(word string) bool { return t.word != "" && equalFoldASCII(t.word, word) }
+
+// scanMaskableFroms is the one pass behind MaskFromKeywordsInFunctionBodies and
+// ContainsMaskableFromKeyword. It walks sql forward, skipping whitespace and
+// SQL comments the way DuckDB's lexer does, and calls visit with the byte
+// offset of every FROM keyword to mask; visit returns false to stop.
+//
+// A FROM is masked when it is
+//   - inside the argument list of EXTRACT, SUBSTRING, TRIM or OVERLAY, at
+//     that call's own paren depth (a subquery in the arguments keeps its FROM);
+//   - the FROM of `IS [NOT] DISTINCT FROM`: the three or four tokens before it
+//     are the words IS, optional NOT, DISTINCT, and the token before IS is not
+//     a '.' (a qualified `t.is` is a column).
+//
+// Adjacency of words is the safety argument, not keyword reservation: IS is
+// not reserved in DuckDB, but `IS [NOT] DISTINCT` is never followed by a FROM
+// that introduces a relation, while `UNION DISTINCT FROM '…'` (FROM-first
+// syntax) does read one and fails the IS test.
+//
+// Only the separators DuckDB itself treats as whitespace separate words here:
+// ASCII space, tab, CR, LF, form feed and vertical tab. A non-ASCII byte is a
+// token of its own, so `is<U+0085>distinct`, which DuckDB reads as one
+// identifier, is never the operator; a caller must therefore run this before
+// folding Unicode spaces.
+//
+// Comments are skipped, never read: a word, a paren or a FROM inside one is
+// not code. Before #1472 the masker's main loop read comments as code and its
+// look-behind scanned back across them, so `/* trim( */` could open a masking
+// frame and `/*is distinct --*/ x FROM t` could hide a real FROM.
+//
+// Linear: one forward pass with a four-token window. The earlier backward
+// scans rescanned each line from its start per keyword.
+func scanMaskableFroms(sql string, visit func(fromIdx int) bool) {
+	var (
+		stack []int // paren depths at which a trigger function's args open
+		depth int
+		win   [4]maskToken // win[3] is the most recent token
+	)
+	push := func(t maskToken) {
+		win[0], win[1], win[2], win[3] = win[1], win[2], win[3], t
+	}
+	operatorBefore := func() bool {
+		if !win[3].is("distinct") {
+			return false
+		}
+		if win[2].is("is") {
+			return !(win[1].word == "" && win[1].b == '.')
+		}
+		return win[2].is("not") && win[1].is("is") && !(win[0].word == "" && win[0].b == '.')
+	}
+	for i := 0; i < len(sql); {
+		c := sql[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
+			i++
+		case (c == '/' && i+1 < len(sql) && sql[i+1] == '*') || (c == '-' && i+1 < len(sql) && sql[i+1] == '-'):
+			i = skipWhitespaceAndCommentsForward(sql, i)
+		case isIdentByte(c):
+			start := i
+			for i < len(sql) && isIdentByte(sql[i]) {
+				i++
+			}
+			word := sql[start:i]
+			if len(word) == 4 && equalFoldASCII(word, "from") {
+				inFrame := len(stack) > 0 && depth == stack[len(stack)-1]
+				if (inFrame || operatorBefore()) && !visit(start) {
+					return
+				}
+			}
+			push(maskToken{word: word})
+		case c == '(':
+			if w := win[3].word; w != "" && isFromKeywordFunction(w) {
+				stack = append(stack, depth+1)
+			}
+			depth++
+			push(maskToken{b: c})
+			i++
+		case c == ')':
+			depth--
+			if len(stack) > 0 && stack[len(stack)-1] > depth {
+				stack = stack[:len(stack)-1]
+			}
+			push(maskToken{b: c})
+			i++
+		default:
+			push(maskToken{b: c})
+			i++
+		}
+	}
+}
+
+// isFromKeywordFunction reports whether word names EXTRACT, SUBSTRING, TRIM or
+// OVERLAY, case-insensitively.
+func isFromKeywordFunction(word string) bool {
+	for _, name := range fromKeywordFunctions {
+		if equalFoldASCII(word, name) {
 			return true
 		}
 	}
 	return false
 }
 
-// isDistinctFromOperatorFrom reports whether the FROM keyword at sql[fromIdx]
-// is the FROM of an `IS [NOT] DISTINCT FROM` comparison (#1472): walking
-// backwards over ASCII whitespace and SQL comments, the preceding words are
-// bare DISTINCT, an optional bare NOT, and bare IS, each directly adjacent.
-//
-// Adjacency is the safety argument, not keyword reservation: IS is not
-// reserved in DuckDB, but `IS [NOT] DISTINCT` is never followed by a FROM that
-// introduces a relation. `UNION DISTINCT FROM '…'` (FROM-first syntax) DOES
-// read a relation, and fails the IS test, as does any word other than IS.
-// Only ASCII whitespace counts as a separator: DuckDB reads `is<U+0085>distinct`
-// as one identifier, so a caller must run this before folding Unicode spaces.
-// A word inside a comment is skipped as comment, so `-- is distinct⏎FROM t`
-// leaves that FROM alone. Quoted words are placeholders by the masker's
-// precondition, so `"is" DISTINCT FROM` never matches.
-func isDistinctFromOperatorFrom(sql string, fromIdx int) bool {
-	start, ok := bareWordBefore(sql, fromIdx)
-	if !ok || !equalFoldASCII(sql[start:start+wordLen(sql, start)], "distinct") {
-		return false
-	}
-	start, ok = bareWordBefore(sql, start)
-	if !ok {
-		return false
-	}
-	if equalFoldASCII(sql[start:start+wordLen(sql, start)], "not") {
-		if start, ok = bareWordBefore(sql, start); !ok {
-			return false
-		}
-	}
-	// A qualified `t.is` is a column, not the keyword: DuckDB rejects
-	// `t.is DISTINCT FROM`, but nothing here depends on that.
-	if start > 0 && sql[start-1] == '.' {
-		return false
-	}
-	return equalFoldASCII(sql[start:start+wordLen(sql, start)], "is")
-}
-
-// bareWordBefore returns the start of the identifier-character run that ends
-// at the last non-whitespace, non-comment byte before sql[i], or false when
-// that byte is not an identifier character.
-func bareWordBefore(sql string, i int) (int, bool) {
-	j := skipWhitespaceAndCommentsBack(sql, i-1)
-	if j < 0 || !isIdentByte(sql[j]) {
-		return 0, false
-	}
-	for j >= 0 && isIdentByte(sql[j]) {
-		j--
-	}
-	return j + 1, true
-}
-
-// wordLen returns the length of the identifier-character run at sql[i].
-func wordLen(sql string, i int) int {
-	n := 0
-	for i+n < len(sql) && isIdentByte(sql[i+n]) {
-		n++
-	}
-	return n
-}
-
-// MaskFromKeywordsInFunctionBodies replaces whole-word FROM tokens that appear
-// inside the argument list of EXTRACT, SUBSTRING, TRIM, or OVERLAY with unique
-// placeholders so the caller's table-rewriter regex (which would otherwise
-// match `FROM <ident>` greedily inside these expressions) skips them. It masks
-// the FROM of an `IS [NOT] DISTINCT FROM` comparison the same way, at any
-// paren depth (#1472; see isDistinctFromOperatorFrom). The placeholders
-// contain only identifier characters and never satisfy `\bFROM\b`.
-//
-// SQL comments are copied through untouched: a `(` or a FROM inside one is
-// not code. Before #1472 a comment could open a masking frame
-// (`/* trim( */ FROM '…' /* ) */`) and hide a real FROM.
+// MaskFromKeywordsInFunctionBodies replaces the FROM keywords that do not
+// introduce a relation with unique placeholders, so the caller's
+// table-rewriter regex (which would otherwise match `FROM <ident>` greedily)
+// skips them: the FROM inside the argument list of EXTRACT, SUBSTRING, TRIM or
+// OVERLAY, and the FROM of `IS [NOT] DISTINCT FROM` (#1472). See
+// scanMaskableFroms for the exact rules. The placeholders contain only
+// identifier characters and never satisfy `\bFROM\b`.
 //
 // The mask is content-addressed via the placeholders, not offset-based —
 // callers may run arbitrary length-changing transformations between the
@@ -509,93 +552,41 @@ func wordLen(sql string, i int) int {
 // substring of mask 10).
 //
 // PRECONDITION: string literals must already be masked by the caller via
-// MaskStringLiterals. The paren-depth scanner does not re-detect quotes,
-// so a literal `'... FROM ...'` inside a trigger-function arg would have
-// its FROM masked too if not pre-masked.
+// MaskStringLiterals, so a quoted "is" or a literal containing FROM is a
+// placeholder. Comments may still be present; they are skipped.
 //
-// Returns the original sql (no allocation) when no trigger function is
-// present.
+// Returns the original sql (no allocation) when there is nothing to mask.
 func MaskFromKeywordsInFunctionBodies(sql string) (string, []FromMask) {
 	if len(sql) == 0 {
 		return sql, nil
 	}
-	// Cheap pre-check skips the scanner allocation when no trigger
-	// function call is present. Round-2 reviewers asked if the
-	// pre-check is redundant; it is NOT — without it we'd build a
-	// strings.Builder and walk the entire SQL byte-by-byte for every
-	// uncached query, even the 99% that have no EXTRACT/SUBSTRING/
-	// TRIM/OVERLAY. The miss path is 0 allocs.
-	if !ContainsMaskableFromKeyword(sql) {
+	var at []int
+	scanMaskableFroms(sql, func(i int) bool {
+		at = append(at, i)
+		return true
+	})
+	if len(at) == 0 {
 		return sql, nil
 	}
 
-	// stack holds the paren depths at which active mask frames were entered.
-	// A new frame is pushed when a `(` is preceded by a trigger function
-	// name; popped when paren depth drops back through that level. Nested
-	// non-trigger calls (e.g. EXTRACT(YEAR FROM CAST(t AS DATE))) inherit
-	// the outer mask because the outer frame stays on the stack until its
-	// matching `)`.
-	var stack []int
-	depth := 0
-
 	var b strings.Builder
-	b.Grow(len(sql))
-
-	var masks []FromMask
-	maskIndex := 0
+	b.Grow(len(sql) + len(at)*16)
+	masks := make([]FromMask, 0, len(at))
 	// Reusable scratch buffer for placeholder generation — strconv.AppendInt
 	// writes into this byte slice so we avoid fmt.Sprintf's allocation per
 	// mask. "__FROM_MASK_" + max-19-digit int + "__" fits in 32 bytes.
 	var phBuf [32]byte
-	i := 0
-	for i < len(sql) {
-		c := sql[i]
-		// A comment is copied verbatim: neither a paren nor a FROM in it is
-		// code. skipWhitespaceAndCommentsForward stops at the first byte that
-		// is neither, so the comment ends where it says it does.
-		if (c == '/' && i+1 < len(sql) && sql[i+1] == '*') || (c == '-' && i+1 < len(sql) && sql[i+1] == '-') {
-			end := skipWhitespaceAndCommentsForward(sql, i)
-			b.WriteString(sql[i:end])
-			i = end
-			continue
-		}
-		switch c {
-		case '(':
-			if isFromKeywordFuncBeforeParen(sql, i) {
-				stack = append(stack, depth+1)
-			}
-			depth++
-			b.WriteByte(c)
-			i++
-		case ')':
-			depth--
-			if len(stack) > 0 && stack[len(stack)-1] > depth {
-				stack = stack[:len(stack)-1]
-			}
-			b.WriteByte(c)
-			i++
-		default:
-			// Only mask FROM at the trigger frame's own paren depth.
-			// `EXTRACT(YEAR FROM (SELECT t FROM cpu))` — the inner
-			// subquery's `FROM cpu` must be left alone so the regex
-			// rewriter can convert `cpu` to read_parquet(...). Without
-			// the depth-equality check, DuckDB fails with "Table cpu
-			// does not exist". (gemini-code-assist round 2.)
-			inFuncFrame := len(stack) > 0 && depth == stack[len(stack)-1]
-			if (c == 'f' || c == 'F') && isFromKeywordAt(sql, i) && (inFuncFrame || isDistinctFromOperatorFrom(sql, i)) {
-				ph := strconv.AppendInt(append(phBuf[:0], "__FROM_MASK_"...), int64(maskIndex), 10)
-				ph = append(ph, '_', '_')
-				placeholder := string(ph)
-				masks = append(masks, FromMask{Placeholder: placeholder, Original: sql[i : i+4]})
-				b.WriteString(placeholder)
-				maskIndex++
-				i += 4
-				continue
-			}
-			b.WriteByte(c)
-			i++
-		}
+	last := 0
+	for n, i := range at {
+		ph := strconv.AppendInt(append(phBuf[:0], "__FROM_MASK_"...), int64(n), 10)
+		ph = append(ph, '_', '_')
+		placeholder := string(ph)
+		masks = append(masks, FromMask{Placeholder: placeholder, Original: sql[i : i+4]})
+		b.WriteString(sql[last:i])
+		b.WriteString(placeholder)
+		last = i + 4
 	}
+	b.WriteString(sql[last:])
 	return b.String(), masks
 }
 
@@ -616,127 +607,6 @@ func UnmaskFromKeywordsInFunctionBodies(sql string, masks []FromMask) string {
 		pairs = append(pairs, m.Placeholder, m.Original)
 	}
 	return strings.NewReplacer(pairs...).Replace(sql)
-}
-
-// isFromKeywordFuncBeforeParen reports whether the identifier immediately
-// preceding the `(` at sql[parenIdx] is one of the trigger SQL builtins
-// (EXTRACT, SUBSTRING, TRIM, OVERLAY). Walks backwards over whitespace and
-// inline SQL comments (`/* ... */` and `--`-to-EOL) — required because the
-// masker runs before stripSQLComments, so `EXTRACT /* c */ (YEAR FROM x)`
-// must still be recognised.
-//
-// Rejects quoted identifiers — `"EXTRACT"(...)` or “ `EXTRACT`(...) “ is
-// a user column, not the builtin. DuckDB does not accept backticks for
-// identifiers in its default parser, but the check costs nothing and
-// matches gemini-code-assist's defensive guidance.
-//
-// Allocation-free: compares the byte range against fromKeywordFunctions
-// in place via equalFoldASCII.
-func isFromKeywordFuncBeforeParen(sql string, parenIdx int) bool {
-	j := skipWhitespaceAndCommentsBack(sql, parenIdx-1)
-	if j < 0 || sql[j] == '"' || sql[j] == '`' {
-		return false
-	}
-	end := j + 1
-	for j >= 0 && isIdentByte(sql[j]) {
-		j--
-	}
-	start := j + 1
-	if start >= end {
-		return false
-	}
-	ident := sql[start:end]
-	for _, name := range fromKeywordFunctions {
-		if equalFoldASCII(ident, name) {
-			return true
-		}
-	}
-	return false
-}
-
-// skipWhitespaceAndCommentsBack walks backwards from sql[i] over ASCII
-// whitespace and SQL comments, returning the index of the first non-skip
-// byte (or -1 if the scan reaches before the start of the string).
-//
-// Handles:
-//   - whitespace: space, tab, CR, LF.
-//   - block comments `/* ... */` — the cursor is on `/` of the closing
-//     `*/`; we walk back to the matching `/*` (no nesting in standard SQL).
-//   - line comments `-- ... \n` — the closing newline is consumed as
-//     whitespace; once we land on the trailing char of a `-- ...` segment
-//     we must walk back to the `--` start. Detected by scanning the
-//     current line backwards to either start-of-string or `\n`, and
-//     checking if a `--` precedes the cursor position on that line.
-func skipWhitespaceAndCommentsBack(sql string, i int) int {
-	for i >= 0 {
-		c := sql[i]
-		// Skip whitespace.
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			i--
-			continue
-		}
-		// Closing of a block comment `*/`: walk back to the matching `/*`.
-		if c == '/' && i > 0 && sql[i-1] == '*' {
-			i -= 2 // step past the `/` and `*` of `*/`
-			for i > 0 && !(sql[i-1] == '/' && sql[i] == '*') {
-				i--
-			}
-			// i now points at the `*` of `/*`; step past both bytes.
-			i -= 2
-			continue
-		}
-		// Possible end of a `-- ...` line comment: walk to start-of-line
-		// and check whether a `--` opens a comment that covers position i.
-		if dashStart, ok := findDashCommentStartBackward(sql, i); ok {
-			i = dashStart - 1
-			continue
-		}
-		return i
-	}
-	return -1
-}
-
-// findDashCommentStartBackward checks whether sql[i] is inside a
-// `-- ...`-style line comment that has not yet been terminated by `\n`.
-// If so, returns the index of the first `-` in the `--` opener (so the
-// caller can resume scanning at that-1). Otherwise returns (_, false).
-//
-// SQL `--` line comments run from `--` to the next `\n`. The caller has
-// already established sql[i] is non-whitespace; we walk back to either
-// start-of-string or `\n` and then forward looking for `--` on that line.
-func findDashCommentStartBackward(sql string, i int) (int, bool) {
-	lineStart := i
-	for lineStart > 0 && sql[lineStart-1] != '\n' && sql[lineStart-1] != '\r' {
-		lineStart--
-	}
-	for k := lineStart; k < i; k++ {
-		if sql[k] == '-' && k+1 < len(sql) && sql[k+1] == '-' {
-			return k, true
-		}
-	}
-	return 0, false
-}
-
-// isFromKeywordAt reports whether sql[i:i+4] is a whole-word case-insensitive
-// FROM keyword.
-func isFromKeywordAt(sql string, i int) bool {
-	if i+4 > len(sql) {
-		return false
-	}
-	c0, c1, c2, c3 := sql[i], sql[i+1], sql[i+2], sql[i+3]
-	if (c0 != 'f' && c0 != 'F') ||
-		(c1 != 'r' && c1 != 'R') ||
-		(c2 != 'o' && c2 != 'O') ||
-		(c3 != 'm' && c3 != 'M') {
-		return false
-	}
-	if i > 0 && isIdentByte(sql[i-1]) {
-		return false
-	}
-	if i+4 < len(sql) && isIdentByte(sql[i+4]) {
-		return false
-	}
-	return true
 }
 
 // isIdentByte returns true if c is a valid SQL identifier byte (a-z, A-Z,
