@@ -919,12 +919,13 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
 	// inside a string literal is data, not SQL (#834). The raw clause is what
 	// gets interpolated into the DuckDB statement, so the unmatched-quote and
-	// unmatched-parenthesis checks below stay on it. Backtick identifiers are
-	// normalised to double quotes first, as the query path's validator does:
-	// the masker does not know backticks, so a quote inside one would
-	// otherwise open a spurious literal that hides whatever follows it.
-	maskInput := backticksToDoubleQuotes(where)
-	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// unmatched-parenthesis checks below stay on it. An unquoted backtick is
+	// refused before anything is masked: it is not a quote in DuckDB, so the
+	// masker must see the clause exactly as DuckDB will (#1480).
+	if hasUnquotedBacktick(where) {
+		return false, errors.New("WHERE clause: " + errUnquotedBacktick)
+	}
+	maskedWhere, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
 	maskedWhere = foldUnicodeSpace(maskedWhere)
@@ -974,7 +975,7 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 			ioCheck = strings.ReplaceAll(ioCheck, mask.Placeholder, mask.Original)
 		}
 	}
-	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
+	ioCheck = strings.ReplaceAll(ioCheck, `"`, "")
 	if unicodeEscapePattern.MatchString(maskedWhere) {
 		return false, fmt.Errorf(`WHERE clause contains a unicode-escaped identifier or string (U&"...")`)
 	}
@@ -1017,8 +1018,8 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// ordering constraint queryMeasurement documents. A fragment that
 	// introduces a relation carries its own keyword, so the scanner arms
 	// without needing a synthetic FROM clause around it.
-	features := scanSQLFeatures(maskInput)
-	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	features := scanSQLFeatures(where)
+	normalised, _ := sqlutil.MaskStringLiterals(where, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
 	// As in ValidateSQLRequest, and in the same order (after the comments are
 	// gone, so a comment cannot open a masking frame): the FROM of

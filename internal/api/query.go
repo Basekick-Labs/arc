@@ -281,12 +281,17 @@ func isFunctionCallAt(sql string, pos int) bool {
 	return pos < len(sql) && sql[pos] == '('
 }
 
-// maskedQuoteForBacktick lets MaskStringLiterals (which only recognises ' and ")
-// also protect backtick-quoted identifiers: we map ` to " before masking so a
-// comment marker, semicolon, or keyword inside a backtick-quoted name does not
-// leak into comment-stripping / statement-splitting / denylist scanning. The
-// content inside is what matters for those scans; the exact quote character is
-// irrelevant downstream (the SHOW regex's capture excludes quotes either way).
+// backticksToDoubleQuotes maps every backtick to a double quote. Only
+// normalizeSQLForShow uses it, for a SHOW TABLES FROM with a backtick-quoted
+// name, which Arc answers itself and DuckDB never sees.
+//
+// SECURITY: never use it on SQL that DuckDB will run, or to normalise SQL for
+// a validator. DuckDB does not quote identifiers with backticks: an unquoted
+// backtick is an operator character, and a backtick-quoted column fails to
+// bind. The mapping also rewrites a backtick that sits inside a "…"
+// identifier or a '…' literal, which moves where the masker thinks quoted text
+// ends, so the validator and DuckDB disagree about the statement (#1480). The validators refuse unquoted
+// backticks instead (hasUnquotedBacktick) and mask the SQL as written.
 func backticksToDoubleQuotes(sql string) string {
 	if !strings.ContainsRune(sql, '`') {
 		return sql
@@ -304,12 +309,45 @@ func backticksToDoubleQuotes(sql string) string {
 // double quotes first so backtick-quoted names are masked too (MaskStringLiterals
 // only knows ' and "). The captured database name excludes the surrounding
 // quotes, so the quote-character swap does not change the resolved db.
+//
+// The output is used only to match the SHOW patterns (#1480). A query this
+// mapping makes look like a SHOW still passes every check in
+// ValidateSQLRequest on its unmapped text, and a routed SHOW is answered by
+// Arc, never by DuckDB.
 func normalizeSQLForShow(sql string) string {
 	sql = backticksToDoubleQuotes(sql)
 	features := scanSQLFeatures(sql)
 	masked, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 	stripped := stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
 	return strings.TrimSpace(sqlutil.UnmaskStringLiterals(stripped, masks))
+}
+
+// errUnquotedBacktick is the reason the validators give for an unquoted
+// backtick (hasUnquotedBacktick).
+const errUnquotedBacktick = "backticks are not identifier quotes in DuckDB; quote identifiers with double quotes (\"name\")"
+
+// hasUnquotedBacktick reports whether sql has a backtick outside a string
+// literal, a quoted identifier, a dollar-quoted string or a comment.
+//
+// DuckDB never reads a backtick as an identifier quote; outside quoted text it
+// is an operator character, so a query carrying one does not run anyway. The
+// validators refuse it up front, so that they never have to guess how DuckDB
+// will tokenise it (#1480).
+func hasUnquotedBacktick(sql string) bool {
+	if !strings.ContainsRune(sql, '`') {
+		return false
+	}
+	features := scanSQLFeatures(sql)
+	masked, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	masked = stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
+	return strings.ContainsRune(masked, '`')
+}
+
+// isArcAnsweredShow reports whether sql is a SHOW DATABASES or SHOW TABLES
+// command, which the query handlers answer themselves.
+func isArcAnsweredShow(sql string) bool {
+	s := normalizeSQLForShow(sql)
+	return showDatabasesPattern.MatchString(s) || showTablesPattern.MatchString(s)
 }
 
 // isSingleTableQuery returns true if query has exactly one FROM naming a
@@ -972,15 +1010,17 @@ func validateWhereClauseQuery(where string) error {
 		return fmt.Errorf("where clause too long (max 4096 characters)")
 	}
 
+	// Refused before anything is masked: a backtick is not a quote, so the
+	// masker must see the clause exactly as DuckDB will (#1480).
+	if hasUnquotedBacktick(where) {
+		return errors.New(errUnquotedBacktick)
+	}
+
 	// Scan a string-literal-masked copy (#987): a keyword or comment marker
-	// inside a value is data, not SQL. Backtick identifiers are normalised to
-	// double quotes first, as ValidateSQLRequest does, because the masker does
-	// not know backticks and a quote inside one would otherwise open a
-	// spurious literal that hides whatever follows it. The raw clause is what
-	// the quote and parenthesis counts below check and what reaches the SQL
-	// assembly; ValidateSQLRequest then validates the assembled statement.
-	maskInput := backticksToDoubleQuotes(where)
-	whereMasked, _ := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// inside a value is data, not SQL. The raw clause is what the quote and
+	// parenthesis counts below check and what reaches the SQL assembly;
+	// ValidateSQLRequest then validates the assembled statement.
+	whereMasked, _ := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
 	// DuckDB lexes a number glued to a word as two tokens (`1UNION` is `1`
 	// then `UNION`), while the whole-word scan below treats digits as
 	// identifier bytes and would not see the keyword. Split a number that
@@ -2906,14 +2946,21 @@ func ValidateSQLRequest(sql string) error {
 	// Normalise before denylist check: mask string literals so keywords
 	// inside literals don't false-positive, then strip comments so
 	// keywords interleaved with comments don't slip past token
-	// boundaries (`DROP /* */ TABLE x`). Map backticks to double quotes first
-	// so backtick-quoted identifiers are masked too — otherwise a semicolon
-	// inside `a;b` would false-trip the multi-statement check below, and a
-	// keyword inside `select` could be scanned. `normalised` is only ever read
-	// (never reconstructed into executable SQL), so the swap is safe here.
-	maskInput := backticksToDoubleQuotes(sql)
-	features := scanSQLFeatures(maskInput)
-	normalised, vMasks := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	// boundaries (`DROP /* */ TABLE x`).
+	//
+	// SECURITY: the SQL is masked exactly as written. Backticks were once
+	// mapped to double quotes first, on the belief that DuckDB quotes
+	// identifiers with them; it does not. The mapping also rewrote a backtick
+	// inside a "…" identifier or a '…' literal, so every check below scanned a
+	// different statement from the one DuckDB runs (#1480). An unquoted
+	// backtick is refused instead. The one exception is SHOW TABLES FROM a
+	// backtick-quoted name, which the query handlers answer or refuse before
+	// DuckDB; the checks below still run on it unmapped.
+	if hasUnquotedBacktick(sql) && !isArcAnsweredShow(sql) {
+		return &SQLValidationError{Message: errUnquotedBacktick}
+	}
+	features := scanSQLFeatures(sql)
+	normalised, vMasks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 	if features.hasBlockComment && hasNestedBlockComment(normalised) {
 		return &SQLValidationError{Message: "Nested block comments are not allowed"}
 	}
@@ -2995,11 +3042,10 @@ func ValidateSQLRequest(sql string) error {
 	// before this runs (see ioDenylistNormalise).
 	//
 	// IMPORTANT: this uses a DIFFERENT normalisation than `normalised` above.
-	// The shared `normalised` masks double-quoted/backtick identifiers, but
-	// DuckDB executes `"parquet_scan"(...)` / `` `read_parquet`(...) ``
-	// identically to the unquoted call — so matching the denylist against
-	// `normalised` lets a quoted spelling slip past (the name is hidden inside
-	// a `__STR__` placeholder). Confirmed live: `SELECT * FROM
+	// The shared `normalised` masks double-quoted identifiers, but DuckDB
+	// executes `"parquet_scan"(...)` identically to the unquoted call — so
+	// matching the denylist against `normalised` lets a quoted spelling slip
+	// past (the name is hidden inside a `__STR__` placeholder). Confirmed live: `SELECT * FROM
 	// "parquet_scan"('…/other-db/…')` executed and returned cross-tenant rows
 	// (GHSA-93cm-2v4m-c56c review round 2). ioDenylistNormalise strips
 	// identifier quoting so quoted function names are exposed to the regex,
@@ -3048,9 +3094,9 @@ func ValidateSQLRequest(sql string) error {
 	// FROM clause's table list via a cross-join comma) trips it.
 	//
 	// The check must distinguish a single-quoted STRING from a quoted
-	// IDENTIFIER: DuckDB uses `'` for strings and `"`/backtick for identifiers,
-	// and a quoted identifier in table position (`FROM "my table"`,
-	// `` FROM `my;db` ``) is legitimate — not a replacement scan. The shared
+	// IDENTIFIER: DuckDB uses `'` for strings and `"` for identifiers (a
+	// backtick is not a quote, and is refused above), and a quoted identifier
+	// in table position (`FROM "my table"`) is legitimate — not a replacement scan. The shared
 	// `normalised` form keeps the two apart as distinct placeholder classes
 	// (`__STR_n__` vs `__IDENT_n__`), and the scanner flags only the string
 	// class, so a quoted identifier never trips it.
@@ -3232,10 +3278,6 @@ func ioDenylistNormalise(sql string) string {
 			masked = strings.ReplaceAll(masked, placeholder, name)
 		}
 	}
-	// Backticks are DuckDB's other identifier quote and the masker does not
-	// treat them as one, so they are dropped here; a backtick inside a string
-	// literal is already behind a placeholder and is not touched.
-	masked = strings.ReplaceAll(masked, "`", "")
 	masked = stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
 	return masked
 }
