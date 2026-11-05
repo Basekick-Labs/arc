@@ -52,7 +52,9 @@ type StorageWalkSource struct {
 	// manifest's view of a listed file and its read barrier (see SetManifestBarrier).
 	manifestKnows func(path string) bool
 	manifestSync  func(ctx context.Context) error
-	logger        zerolog.Logger
+	// cold, when set, is the cold tier the source lists next to the primary (cold.go).
+	cold   *coldTier
+	logger zerolog.Logger
 
 	// namespaceExpander, when set, returns the top-level directories that are
 	// edge-sync spoke namespaces rather than databases (#634). A hub stores
@@ -172,6 +174,29 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 	if !ok {
 		return nil, fmt.Errorf("storage backend does not support directory listing")
 	}
+	out, err := s.measurementsOn(ctx, dl)
+	if err != nil {
+		return nil, err
+	}
+	cold, err := s.coldMeasurements(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[Measurement]bool, len(out))
+	for _, m := range out {
+		seen[m] = true
+	}
+	for _, m := range cold {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+// measurementsOn enumerates the (database, measurement) directories of one backend.
+func (s *StorageWalkSource) measurementsOn(ctx context.Context, dl dirLister) ([]Measurement, error) {
 	dbs, err := dl.ListDirectories(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("list databases: %w", err)
@@ -323,6 +348,9 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 // FileSchema derives one listed file's schema from its footer: from disk when
 // the file is local, otherwise from the tail of the object (SchemaFromBackend).
 func (s *StorageWalkSource) FileSchema(ctx context.Context, f FileRef) (ArcSchema, error) {
+	if f.Cold && s.cold != nil {
+		return s.coldSchema(ctx, f)
+	}
 	if f.LocalPath != "" {
 		return SchemaFromParquet(f.LocalPath)
 	}
@@ -567,6 +595,20 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 			Msg("Iceberg reconcile: files Arc's reads leave out (replaced by a compaction or DELETE) are left out of this pass")
 	}
 	sort.Strings(vanished)
+	if s.cold != nil {
+		skip := func(key string) bool {
+			if _, ok := pending[key]; ok {
+				return true
+			}
+			if _, ok := leaveOut[key]; ok {
+				return true
+			}
+			return s.deletedHere != nil && s.deletedHere(key)
+		}
+		if files, local, err = s.mergeCold(ctx, prefix, files, local, skip); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 	return files, local, vanished, nil
 }
 

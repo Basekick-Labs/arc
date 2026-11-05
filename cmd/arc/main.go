@@ -4158,6 +4158,10 @@ func main() {
 	// Iceberg export (opt-in). Publishes Arc's existing Parquet as Iceberg tables via a
 	// periodic reconciler that walks storage — works in OSS and cluster, no tiering/Raft
 	// dependency. Wired OUTSIDE the cluster block so it runs in standalone mode.
+	// Set by the Iceberg block, used once tiering is set up (see below).
+	var icebergStart func()
+	var icebergExporter *iceberg.Exporter
+	var icebergWalk *iceberg.StorageWalkSource
 	if cfg.Iceberg.Enabled {
 		icebergDBPath := cfg.Iceberg.CatalogDBPath
 		if icebergDBPath == "" {
@@ -4283,7 +4287,9 @@ func main() {
 			Gate:     icebergGate,
 			Logger:   logger.Get("iceberg"),
 		})
-		icebergScheduler.Start()
+		// Started after tiering is set up (below), so the first pass already sees the cold tier.
+		icebergStart = icebergScheduler.Start
+		icebergExporter, icebergWalk = exporter, icebergSource
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
 			icebergScheduler.Stop()
 			// Close only a handle this block opened. A borrowed one belongs to
@@ -5039,6 +5045,39 @@ func main() {
 			} else {
 				log.Info().Msg("DuckDB configured with cold tier GCS credentials for multi-tier queries")
 			}
+		}
+	}
+
+	// Iceberg export, once tiering is set up: with a cold tier, files migrated to it stay in the
+	// tables (#939), so the export must see the cold tier from its first pass. Exporting without
+	// it would drop every migrated file from the tables, so an unavailable cold tier keeps the
+	// export from starting and the tables keep their last snapshot.
+	if icebergStart != nil {
+		startExport := true
+		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
+			var cold storage.Backend
+			if tieringManager != nil {
+				cold = tieringManager.GetBackendForTier(tiering.TierCold)
+			}
+			if cold == nil {
+				startExport = false
+				log.Error().Msg("Iceberg export not started: tiered_storage.cold is enabled but the cold tier is unavailable, and exporting without it would drop migrated files from the tables")
+			} else if err := wireIcebergCold(icebergWalk, icebergExporter, cold, tieringManager, cfg.Iceberg.ColdRescanInterval); err != nil {
+				startExport = false
+				log.Error().Err(err).Msg("Iceberg export not started: cannot track the cold tier")
+			} else {
+				// Every Arc path that changes the cold tier (a tiering cycle, cold retention, a
+				// cold DELETE, a database delete) fires this; the export lists cold again.
+				tieringManager.SetOnMigrationComplete(func() {
+					queryHandler.InvalidateCaches()
+					icebergWalk.InvalidateCold("")
+				})
+				log.Info().Int("cold_rescan_interval_s", cfg.Iceberg.ColdRescanInterval).
+					Msg("Iceberg export tracks files migrated to the S3 cold tier")
+			}
+		}
+		if startExport {
+			icebergStart()
 		}
 	}
 
@@ -6459,3 +6498,21 @@ func (o clusterOpenCompactions) ExcludedForStrict(ctx context.Context, prefix st
 }
 func (o clusterOpenCompactions) Open(prefix string) bool { return o.c.OpenAny(prefix) }
 func (o clusterOpenCompactions) Generation() uint64      { return o.c.OpenGeneration() }
+
+// wireIcebergCold gives the Iceberg export the S3 cold tier (#939): the source lists it next to
+// the primary, asking tiering's tier record which copy is current for a key on both tiers, and the
+// exporter registers cold files under their cold URIs.
+func wireIcebergCold(src *iceberg.StorageWalkSource, exp *iceberg.Exporter, cold storage.Backend, tm *tiering.Manager, rescanSeconds int) error {
+	meta := tm.GetMetadata()
+	isCold := func(ctx context.Context, key string) (bool, error) {
+		f, err := meta.GetFile(ctx, key)
+		if err != nil {
+			return false, err
+		}
+		return f != nil && f.Tier == tiering.TierCold, nil
+	}
+	if err := src.SetColdTier(cold, isCold, time.Duration(rescanSeconds)*time.Second); err != nil {
+		return err
+	}
+	return exp.SetColdTier(cold)
+}

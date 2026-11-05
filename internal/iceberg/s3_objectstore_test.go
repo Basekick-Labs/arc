@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,16 +67,6 @@ func putParquet(t *testing.T, b storage.Backend, key string, baseTS int64, rows 
 	if err := b.Write(context.Background(), key, data); err != nil {
 		t.Fatal(err)
 	}
-}
-
-type countingSource struct {
-	*StorageWalkSource
-	footers atomic.Int32
-}
-
-func (c *countingSource) FileSchema(ctx context.Context, f FileRef) (ArcSchema, error) {
-	c.footers.Add(1)
-	return c.StorageWalkSource.FileSchema(ctx, f)
 }
 
 func s3Exporter(t *testing.T, b *storage.S3Backend) (*Exporter, *sql.DB, string) {
@@ -281,5 +270,94 @@ func TestS3Source_RemovalBetweenListings(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("listed %d times, want 2", n)
+	}
+}
+
+// Local primary, S3 cold tier (#939 B2): a migrated file moves to its s3:// URI without being
+// read, and a cold file the table never held hot is read through the cold tier's own FileIO and
+// credentials, since the table's FileIO here is local disk.
+func TestS3ColdTier_LocalHotS3Cold(t *testing.T) {
+	cold, _ := s3Rig(t)
+	ctx := context.Background()
+	hotRoot := t.TempDir()
+	hot, err := storage.NewLocalBackend(hotRoot, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := int64(1_700_000_000_000_000)
+	k1 := "mydb/cpu/2023/11/14/22/a.parquet"
+	k2 := "mydb/cpu/2023/11/14/23/b.parquet"
+	k3 := "mydb/cpu/2023/11/13/10/old.parquet" // only ever on cold
+	writeArcStyleParquet(t, filepath.Join(hotRoot, k1), base, 10)
+	writeArcStyleParquet(t, filepath.Join(hotRoot, k2), base+3_600_000_000, 20)
+
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, hot, DefaultWarehouse(hot), "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetColdTier(cold); err != nil {
+		t.Fatal(err)
+	}
+	coldKeys := map[string]bool{}
+	src := &countingSource{StorageWalkSource: NewStorageWalkSource(hot, "arc", zerolog.Nop())}
+	if err := src.SetColdTier(cold, func(_ context.Context, k string) (bool, error) { return coldKeys[k], nil }, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Logger: zerolog.Nop()})
+	sched.runPass(ctx)
+
+	// Migrate k1: copy to cold (same key), flip, delete hot.
+	data, err := os.ReadFile(filepath.Join(hotRoot, k1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cold.Write(ctx, k1, data); err != nil {
+		t.Fatal(err)
+	}
+	coldKeys[k1] = true
+	if err := os.Remove(filepath.Join(hotRoot, k1)); err != nil {
+		t.Fatal(err)
+	}
+	// k3 exists on cold only (cold data from before the export).
+	putParquet(t, cold, k3, base-86_400_000_000, 5)
+	coldKeys[k3] = true
+	src.InvalidateCold("")
+	footers := src.footers.Load()
+	sched.runPass(ctx)
+
+	tbl, err := exp.catalog.LoadTable(ctx, exp.tableIdent("mydb", "cpu"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := exp.tableLiveFiles(ctx, tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows int64
+	got := map[string]string{}
+	for p, df := range live {
+		rows += df.Count()
+		switch {
+		case strings.HasSuffix(p, "/"+k1):
+			got["k1"] = p
+		case strings.HasSuffix(p, "/"+k2):
+			got["k2"] = p
+		case strings.HasSuffix(p, "/"+k3):
+			got["k3"] = p
+		}
+	}
+	if !strings.HasPrefix(got["k1"], "s3://") || !strings.HasPrefix(got["k3"], "s3://") || !strings.HasPrefix(got["k2"], "file://") {
+		t.Fatalf("URIs = %v: want k1 and k3 on s3://, k2 on file://", got)
+	}
+	if rows != 35 {
+		t.Fatalf("rows = %d, want 35 (10 migrated + 20 hot + 5 cold-only)", rows)
+	}
+	if n := src.footers.Load() - footers; n != 1 {
+		t.Fatalf("read %d footers for the migration pass, want 1 (the cold-only file; the migrated one is cloned)", n)
 	}
 }

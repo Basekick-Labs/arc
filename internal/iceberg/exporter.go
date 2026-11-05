@@ -32,6 +32,7 @@ import (
 	iceberg "github.com/apache/iceberg-go"
 	icecatalog "github.com/apache/iceberg-go/catalog"
 	sqlcat "github.com/apache/iceberg-go/catalog/sql"
+	iceio "github.com/apache/iceberg-go/io"
 	icetable "github.com/apache/iceberg-go/table"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/rs/zerolog"
@@ -55,6 +56,8 @@ type FileRef struct {
 	// and SizeBytes.
 	Key       string
 	LocalPath string
+	// Cold: the file is on the cold tier (#939 B2); PhysicalPath is its cold URI.
+	Cold bool
 }
 
 // Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One Exporter per
@@ -66,7 +69,9 @@ type Exporter struct {
 	backend     storage.Backend // for writing version-hint.text alongside table metadata
 	// awsCfg, with an S3 backend, is the backend's aws.Config, handed to
 	// iceberg-go's S3 FileIO through the context (withAWS); nil otherwise.
-	awsCfg    *aws.Config
+	awsCfg *aws.Config
+	// cold, when set, is the S3 cold tier whose files the table also holds (cold_export.go).
+	cold      *coldExport
 	warehouse string // warehouse root URI (file://… or s3://bucket/prefix)
 	nsPrefix  string // namespace for Iceberg tables (e.g. "arc")
 	retain    int    // snapshots + metadata versions to keep per table (0 = keep all)
@@ -672,10 +677,21 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	for _, p := range toRemove {
 		removes = append(removes, live[p])
 	}
-	adds, skipped, err := e.buildDataFiles(ctx, tbl, toAdd, want)
+	// A file that moved tiers is the same file under another URI: its DataFile is the table's
+	// own entry with the new path, and the moved object is never read (cold_export.go).
+	keyOf := make(map[string]string, len(current))
+	for _, f := range current {
+		keyOf[f.PhysicalPath] = f.Key
+	}
+	cloned, toBuild, err := cloneFromTable(tbl, live, toAdd, keyOf, want)
 	if err != nil {
 		return false, err
 	}
+	adds, skipped, err := e.buildDataFiles(ctx, tbl, toBuild, want)
+	if err != nil {
+		return false, err
+	}
+	adds = append(cloned, adds...)
 	if len(skipped) > 0 {
 		// Some files could not be partitioned (day-straddling data — see day() spec). They are
 		// omitted from the table but logged loudly; the rest of the measurement still exports.
@@ -859,15 +875,17 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 	}
 	out := make([]iceberg.DataFile, len(paths))
 	errs := make([]error, len(paths))
-	fio, err := tbl.FS(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open table filesystem: %w", err)
+	ios := make([]iceio.IO, len(paths))
+	for i, p := range paths {
+		if ios[i], err = e.fileIOFor(ctx, tbl, p); err != nil {
+			return nil, nil, err
+		}
 	}
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(unionSchemaConcurrency)
 	for i := range paths {
 		g.Go(func() error {
-			df, err := icetable.FileToDataFile(gctx, fio, paths[i], tbl.Schema(), tbl.Spec(), 0, tbl.Properties())
+			df, err := icetable.FileToDataFile(gctx, ios[i], paths[i], tbl.Schema(), tbl.Spec(), 0, tbl.Properties())
 			if err != nil {
 				if isPartitionInferenceError(err) {
 					errs[i] = err

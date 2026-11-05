@@ -2,6 +2,46 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: Iceberg export keeps files moved to an S3 cold tier ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Iceberg export and cold-tier tiering can now run together when the cold tier is
+S3 (`tiered_storage.cold.backend = "s3"`). A file that tiering moves to cold
+stays in the Iceberg table under its cold URI, with the same rows and
+statistics. External readers see the same data before, during and after a
+migration. Supported with a local or an S3 primary.
+
+- **Mixed-location tables:** with a local primary, an exported table holds
+  `file://` paths for hot data and `s3://` paths for cold data. A reader needs
+  access to both, so it must run on the Arc host with S3 credentials.
+- **Which copy is exported:** the one Arc's own queries read. When a file is
+  on both tiers (during a migration, or a hot-only database's cold copy), the
+  hot copy is exported until Arc's tier record says the file is cold.
+- **No extra reads:** a migrated file's entry is copied from the hot one, and
+  the cold object is not read. Only cold data the table never held hot is
+  read, once, with the cold tier's own credentials.
+- **Cost:** the cold tier is listed per measurement and the listing is cached.
+  Arc re-lists after every change it makes to the cold tier: a tiering cycle,
+  cold retention, a DELETE of a cold file, a database delete. Otherwise it
+  re-lists every `iceberg.cold_rescan_interval` seconds (new, default `3600`),
+  which bounds changes made outside Arc. Before the table drops a file that
+  left the hot tier, Arc checks the cold tier for it (one HEAD), so a
+  migration never makes the table lose a file.
+- **Window:** during the one pass between the hot copy's delete and the table
+  moving to the cold URI, a reader that already resolved the old URI can get
+  a not-found error. It never gets wrong rows. Compaction and retention
+  already have the same window.
+- **Refused at startup:** an Azure or GCS cold tier, or S3 cold on Google
+  Cloud Storage's interop endpoint, with Iceberg enabled.
+- **Unavailable cold tier:** if the cold tier is configured but cannot be
+  built, the export does not start, and the tables keep their last snapshot.
+- **Licensing:** tiering requires an Enterprise license and Iceberg export does
+  not. Without the license Arc disables tiering, so with a cold tier still
+  configured the export does not start (as for an unavailable cold tier) and
+  the tables keep their last snapshot until the license is restored.
+
+DELETE of a whole cold file now also drops the query caches, as cold retention
+already did.
+
 ## New: Iceberg export on S3 primary storage ([#939](https://github.com/Basekick-Labs/arc/issues/939))
 
 Iceberg export now runs with `storage.backend = "s3"` (AWS S3 and S3-compatible
