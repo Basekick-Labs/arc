@@ -692,145 +692,26 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 		return nil, nil, fmt.Errorf("failed to get schema: %w", err)
 	}
 
-	// Create Arrow arrays from columns
-	// MEMORY FIX: Use shared allocator instead of creating new one per write
-	mem := sharedArrowAllocator
-	builders := make([]array.Builder, len(schema.Fields()))
-	arrays := make([]arrow.Array, len(schema.Fields()))
-
-	// CRITICAL: Release both builders and arrays to prevent memory leak
-	defer func() {
-		for _, builder := range builders {
-			if builder != nil {
-				builder.Release()
-			}
-		}
-		for _, arr := range arrays {
-			if arr != nil {
-				arr.Release()
-			}
-		}
-	}()
-
-	// Build arrays
-	for i, field := range schema.Fields() {
-		col, ok := columns[field.Name]
-		if !ok {
-			return nil, nil, fmt.Errorf("column %s not found in data", field.Name)
-		}
-
-		// Get validity bitmap for this column (nil means all valid)
-		var colValidity []bool
-		if validity != nil {
-			colValidity = validity[field.Name]
-		}
-
-		switch field.Type.ID() {
-		case arrow.INT64:
-			intCol, ok := col.([]int64)
-			if !ok {
-				return nil, nil, fmt.Errorf("column %s: expected []int64, got %T", field.Name, col)
-			}
-			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
-			if err != nil {
-				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
-			}
-			arrays[i] = array.NewInt64Data(data)
-
-		case arrow.TIMESTAMP:
-			intCol, ok := col.([]int64)
-			if !ok {
-				return nil, nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
-			}
-			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
-			if err != nil {
-				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
-			}
-			arrays[i] = array.NewTimestampData(data)
-
-		case arrow.FLOAT64:
-			floatCol, ok := col.([]float64)
-			if !ok {
-				return nil, nil, fmt.Errorf("column %s: expected []float64, got %T", field.Name, col)
-			}
-			data, err := fixedWidthArrayData(field.Type, arrow.Float64Traits.CastToBytes(floatCol), len(floatCol), colValidity)
-			if err != nil {
-				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
-			}
-			arrays[i] = array.NewFloat64Data(data)
-
-		case arrow.STRING:
-			builder := array.NewStringBuilder(mem)
-			builders[i] = builder
-			if strCol, ok := col.([]string); ok {
-				// Sized once: the builder otherwise grows by doubling.
-				size := 0
-				for _, v := range strCol {
-					size += len(v)
-				}
-				builder.Reserve(len(strCol))
-				builder.ReserveData(size)
-				builder.AppendValues(strCol, colValidity)
-			} else {
-				return nil, nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
-			}
-			arrays[i] = builder.NewArray()
-
-		case arrow.BINARY:
-			builder := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
-			builders[i] = builder
-
-			binaryCol, ok := col.([][]byte)
-			if !ok {
-				return nil, nil, fmt.Errorf(
-					"column %s: expected [][]byte, got %T",
-					field.Name, col,
-				)
-			}
-
-			// Sized once, as the string path is.
-			size := 0
-			for _, v := range binaryCol {
-				size += len(v)
-			}
-			builder.Reserve(len(binaryCol))
-			builder.ReserveData(size)
-			builder.AppendValues(binaryCol, colValidity)
-			arrays[i] = builder.NewArray()
-
-		case arrow.BOOL:
-			builder := array.NewBooleanBuilder(mem)
-			builders[i] = builder
-			if boolCol, ok := col.([]bool); ok {
-				builder.Reserve(len(boolCol))
-				builder.AppendValues(boolCol, colValidity)
-			} else {
-				return nil, nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
-			}
-			arrays[i] = builder.NewArray()
-
-		case arrow.DECIMAL128:
-			dt := field.Type.(*arrow.Decimal128Type)
-			builder := array.NewDecimal128Builder(mem, dt)
-			builders[i] = builder
-			if decCol, ok := col.([]decimal128.Num); ok {
-				builder.Reserve(len(decCol))
-				builder.AppendValues(decCol, colValidity)
-			} else {
-				return nil, nil, fmt.Errorf("column %s: expected []decimal128.Num, got %T", field.Name, col)
-			}
-			arrays[i] = builder.NewArray()
-
-		default:
-			return nil, nil, fmt.Errorf("unsupported Arrow type for column %s: %s", field.Name, field.Type.Name())
-		}
-	}
-
 	rows := 0
-	if len(arrays) > 0 {
-		rows = arrays[0].Len()
+	if fields := schema.Fields(); len(fields) > 0 {
+		rows = max(columnLen(columns[fields[0].Name]), 0)
 	}
-	data, err := w.writeRecordToParquet(schema, arrays, w.parquetSizeHint(measurement, rows, arrays))
+	chunks, err := parquetChunks(schema, columns, rows, maxParquetChunkColumnBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	build := func(lo, hi int) ([]arrow.Array, error) {
+		return buildParquetArrays(schema, columns, validity, rows, lo, hi)
+	}
+	hint := func(first []arrow.Array) int {
+		if len(chunks) > 2 {
+			// The other records' arrays are not built yet, so the hint
+			// cannot be clamped by them.
+			return w.parquetSizeHint(measurement, rows, nil)
+		}
+		return w.parquetSizeHint(measurement, rows, first)
+	}
+	data, err := w.writeRecordToParquet(schema, chunks, build, hint)
 	if err == nil && rows >= minRowsForSizeHint {
 		if w.hintEntries.Load() >= maxSizeHintEntries {
 			w.fileBytesPerRow.Clear()
@@ -841,6 +722,244 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 		}
 	}
 	return data, schema, err
+}
+
+// maxParquetChunkColumnBytes bounds the bytes one string or binary column
+// holds in one Arrow record of a file (#1284). Arrow offsets are int32, so a
+// column built past 2 GiB overflows them, and the Parquet write then fails
+// ("slice bounds out of range [:-2147483616]"). A flush can hold that much:
+// a buffer whose flush the full queue defers keeps growing, and one request
+// can expand up to 3x when invalid UTF-8 becomes U+FFFD. The rows are written
+// as several records of the same file, each its own row group (or several,
+// past the writer's row-count limit, as before). A var for tests.
+var maxParquetChunkColumnBytes int64 = 1 << 30
+
+// parquetChunks returns the row boundaries of the records a file of rows rows
+// is written as: [0, rows] when every string and binary column fits in
+// maxBytes, and otherwise cuts before any row that would take one of them past
+// it. A row whose value alone is larger than maxBytes is a record of its own.
+func parquetChunks(schema *arrow.Schema, columns map[string]interface{}, rows int, maxBytes int64) ([]int, error) {
+	var varWidth [][]int64
+	for _, field := range schema.Fields() {
+		var lens func(yield func(int) bool)
+		switch col := columns[field.Name].(type) {
+		case []string:
+			if field.Type.ID() != arrow.STRING {
+				continue
+			}
+			lens = func(yield func(int) bool) {
+				for _, v := range col {
+					if !yield(len(v)) {
+						return
+					}
+				}
+			}
+		case [][]byte:
+			if field.Type.ID() != arrow.BINARY {
+				continue
+			}
+			lens = func(yield func(int) bool) {
+				for _, v := range col {
+					if !yield(len(v)) {
+						return
+					}
+				}
+			}
+		default:
+			continue
+		}
+		var total int64
+		for n := range lens {
+			total += int64(n)
+		}
+		if total <= maxBytes {
+			continue
+		}
+		sizes := make([]int64, 0, columnLen(columns[field.Name]))
+		for n := range lens {
+			if int64(n) >= math.MaxInt32 {
+				return nil, fmt.Errorf("column %s: a value of %d bytes is larger than a Parquet column can hold", field.Name, n)
+			}
+			sizes = append(sizes, int64(n))
+		}
+		varWidth = append(varWidth, sizes)
+	}
+	if len(varWidth) == 0 {
+		return []int{0, rows}, nil
+	}
+	bounds := []int{0}
+	cur := make([]int64, len(varWidth))
+	for r := 0; r < rows; r++ {
+		cut := false
+		for c, sizes := range varWidth {
+			if r < len(sizes) && cur[c]+sizes[r] > maxBytes {
+				cut = true
+				break
+			}
+		}
+		if cut && r > bounds[len(bounds)-1] {
+			bounds = append(bounds, r)
+			clear(cur)
+		}
+		for c, sizes := range varWidth {
+			if r < len(sizes) {
+				cur[c] += sizes[r]
+			}
+		}
+	}
+	return append(bounds, rows), nil
+}
+
+// buildParquetArrays builds the Arrow arrays of rows [lo, hi) of columns.
+// The caller releases them. A NULL bitmap is sliced with its column when it
+// has one entry per row; a whole-file record ([0, rows)) passes any bitmap on
+// as it is, so a malformed one fails where it always has.
+func buildParquetArrays(schema *arrow.Schema, columns map[string]interface{}, validity map[string][]bool, rows, lo, hi int) (_ []arrow.Array, err error) {
+	// MEMORY FIX: Use shared allocator instead of creating new one per write
+	mem := sharedArrowAllocator
+	arrays := make([]arrow.Array, len(schema.Fields()))
+	defer func() {
+		if err != nil {
+			for _, arr := range arrays {
+				if arr != nil {
+					arr.Release()
+				}
+			}
+		}
+	}()
+	whole := lo == 0 && hi == rows
+
+	for i, field := range schema.Fields() {
+		col, ok := columns[field.Name]
+		if !ok {
+			return nil, fmt.Errorf("column %s not found in data", field.Name)
+		}
+		// A whole-file record takes each column as it is; a chunk needs every
+		// column to have one value per row.
+		lo, hi := lo, hi
+		if whole {
+			hi = columnLen(col)
+		} else if n := columnLen(col); n != rows {
+			return nil, fmt.Errorf("column %s has %d values for %d rows", field.Name, n, rows)
+		}
+
+		// Get validity bitmap for this column (nil means all valid)
+		var colValidity []bool
+		if validity != nil {
+			colValidity = validity[field.Name]
+		}
+		if !whole && len(colValidity) != 0 {
+			if len(colValidity) != rows {
+				return nil, fmt.Errorf("column %s: NULL bitmap has %d entries for %d values", field.Name, len(colValidity), rows)
+			}
+			colValidity = colValidity[lo:hi]
+		}
+
+		switch field.Type.ID() {
+		case arrow.INT64:
+			intCol, ok := col.([]int64)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []int64, got %T", field.Name, col)
+			}
+			intCol = intCol[lo:hi]
+			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
+			if err != nil {
+				return nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewInt64Data(data)
+
+		case arrow.TIMESTAMP:
+			intCol, ok := col.([]int64)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
+			}
+			intCol = intCol[lo:hi]
+			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
+			if err != nil {
+				return nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewTimestampData(data)
+
+		case arrow.FLOAT64:
+			floatCol, ok := col.([]float64)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []float64, got %T", field.Name, col)
+			}
+			floatCol = floatCol[lo:hi]
+			data, err := fixedWidthArrayData(field.Type, arrow.Float64Traits.CastToBytes(floatCol), len(floatCol), colValidity)
+			if err != nil {
+				return nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewFloat64Data(data)
+
+		case arrow.STRING:
+			strCol, ok := col.([]string)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
+			}
+			strCol = strCol[lo:hi]
+			builder := array.NewStringBuilder(mem)
+			// Sized once: the builder otherwise grows by doubling.
+			size := 0
+			for _, v := range strCol {
+				size += len(v)
+			}
+			builder.Reserve(len(strCol))
+			builder.ReserveData(size)
+			builder.AppendValues(strCol, colValidity)
+			arrays[i] = builder.NewArray()
+			builder.Release()
+
+		case arrow.BINARY:
+			binaryCol, ok := col.([][]byte)
+			if !ok {
+				return nil, fmt.Errorf(
+					"column %s: expected [][]byte, got %T",
+					field.Name, col,
+				)
+			}
+			binaryCol = binaryCol[lo:hi]
+			builder := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+			// Sized once, as the string path is.
+			size := 0
+			for _, v := range binaryCol {
+				size += len(v)
+			}
+			builder.Reserve(len(binaryCol))
+			builder.ReserveData(size)
+			builder.AppendValues(binaryCol, colValidity)
+			arrays[i] = builder.NewArray()
+			builder.Release()
+
+		case arrow.BOOL:
+			boolCol, ok := col.([]bool)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
+			}
+			boolCol = boolCol[lo:hi]
+			builder := array.NewBooleanBuilder(mem)
+			builder.Reserve(len(boolCol))
+			builder.AppendValues(boolCol, colValidity)
+			arrays[i] = builder.NewArray()
+			builder.Release()
+
+		case arrow.DECIMAL128:
+			decCol, ok := col.([]decimal128.Num)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []decimal128.Num, got %T", field.Name, col)
+			}
+			decCol = decCol[lo:hi]
+			builder := array.NewDecimal128Builder(mem, field.Type.(*arrow.Decimal128Type))
+			builder.Reserve(len(decCol))
+			builder.AppendValues(decCol, colValidity)
+			arrays[i] = builder.NewArray()
+			builder.Release()
+
+		default:
+			return nil, fmt.Errorf("unsupported Arrow type for column %s: %s", field.Name, field.Type.Name())
+		}
+	}
+	return arrays, nil
 }
 
 // Parquet output buffer sizing: a measurement's bytes per row are learned
@@ -856,7 +975,9 @@ const (
 )
 
 // parquetSizeHint is the output buffer size to reserve for a file of rows
-// rows built from arrays, or 0 for none.
+// rows built from arrays, or 0 for none. With arrays nil (a file written as
+// several records, whose arrays are built one record at a time) the hint is
+// not clamped by their size.
 func (w *ArrowWriter) parquetSizeHint(measurement string, rows int, arrays []arrow.Array) int {
 	v, ok := w.fileBytesPerRow.Load(measurement)
 	if !ok || rows == 0 {
@@ -871,6 +992,9 @@ func (w *ArrowWriter) parquetSizeHint(measurement string, rows int, arrays []arr
 				raw += int64(b.Len())
 			}
 		}
+	}
+	if arrays == nil {
+		return int(min(hint, maxParquetSizeHint))
 	}
 	return int(min(hint, raw+64<<10, maxParquetSizeHint))
 }
@@ -903,35 +1027,53 @@ func fixedWidthArrayData(dt arrow.DataType, values []byte, n int, valid []bool) 
 	return array.NewData(dt, n, []*memory.Buffer{nullBitmap, memory.NewBufferBytes(values)}, nil, nulls, 0), nil
 }
 
-// writeRecordToParquet writes Arrow arrays to Parquet bytes
-func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.Array, sizeHint int) ([]byte, error) {
-	// Create record batch
-	record := array.NewRecord(schema, arrays, -1)
-	defer record.Release()
-
-	// Write to Parquet, into a buffer sized for the file when a hint is known
-	// (growing by doubling allocates about twice the file).
+// writeRecordToParquet writes the rows between consecutive bounds as one
+// record each (each record starts a new row group), building every record's arrays with build just
+// before it is written and releasing them after, so only one record's arrays
+// are held at a time. sizeHint gets the first record's arrays.
+func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, bounds []int, build func(lo, hi int) ([]arrow.Array, error), sizeHint func(first []arrow.Array) int) ([]byte, error) {
 	var buf bytes.Buffer
-	if sizeHint > 0 {
-		buf.Grow(sizeHint)
+	var writer *pqarrow.FileWriter
+	rows := 0
+	for c := 0; c+1 < len(bounds); c++ {
+		arrays, err := build(bounds[c], bounds[c+1])
+		if err != nil {
+			if writer != nil {
+				writer.Close()
+			}
+			return nil, err
+		}
+		if writer == nil {
+			// Write to Parquet, into a buffer sized for the file when a hint is
+			// known (growing by doubling allocates about twice the file).
+			if hint := sizeHint(arrays); hint > 0 {
+				buf.Grow(hint)
+			}
+			// Schema-aware writer properties (see writerPropsFor for the
+			// per-configuration dictionary tiers).
+			writer, err = pqarrow.NewFileWriter(
+				schema,
+				&buf,
+				w.writerPropsFor(schema),
+				w.arrowProps,
+			)
+			if err != nil {
+				releaseArrays(arrays)
+				return nil, fmt.Errorf("failed to create Parquet writer: %w", err)
+			}
+		}
+		record := array.NewRecord(schema, arrays, -1)
+		rows += int(record.NumRows())
+		err = writer.Write(record)
+		record.Release()
+		releaseArrays(arrays)
+		if err != nil {
+			writer.Close()
+			return nil, fmt.Errorf("failed to write record batch: %w", err)
+		}
 	}
-
-	// Schema-aware writer properties (see writerPropsFor for the
-	// per-configuration dictionary tiers).
-	writer, err := pqarrow.NewFileWriter(
-		schema,
-		&buf,
-		w.writerPropsFor(schema),
-		w.arrowProps,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Parquet writer: %w", err)
-	}
-
-	// Write record batch
-	if err := writer.Write(record); err != nil {
-		writer.Close()
-		return nil, fmt.Errorf("failed to write record batch: %w", err)
+	if writer == nil {
+		return nil, fmt.Errorf("failed to write Parquet: no rows")
 	}
 
 	// Close writer
@@ -941,11 +1083,20 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.
 
 	w.logger.Debug().
 		Int("columns", len(schema.Fields())).
-		Int("rows", int(record.NumRows())).
+		Int("rows", rows).
+		Int("row_groups", len(bounds)-1).
 		Int("size", buf.Len()).
 		Msg("Wrote Parquet file")
 
 	return buf.Bytes(), nil
+}
+
+func releaseArrays(arrays []arrow.Array) {
+	for _, arr := range arrays {
+		if arr != nil {
+			arr.Release()
+		}
+	}
 }
 
 // bufferShard represents a single shard of the buffer map with its own lock

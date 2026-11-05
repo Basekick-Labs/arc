@@ -110,6 +110,34 @@ measurement is listed again, up to three times. If the files keep changing,
 the pass fails for that measurement and keeps the previous snapshot, logged
 as `file set of <db>/<measurement> kept changing under the listing`.
 
+## Fix: a flush with more than 2 GiB in one text column is written instead of failing ([#1284](https://github.com/Basekick-Labs/arc/issues/1284))
+
+When storage fell behind and the flush queue stayed full, a measurement's
+buffer kept growing until one string or binary column of its flush held more
+than 2 GiB. Arrow addresses such a column with 32-bit offsets, so the flush
+failed with `failed to write Parquet: failed to write record batch: ...
+slice bounds out of range [:-2147483616]`. With the WAL on the rows stayed in
+the WAL and were replayed later; with it off they were lost. One MessagePack
+request could get there alone too: invalid UTF-8 is stored as U+FFFD, three
+bytes for each invalid byte, so a request under the 1 GiB payload limit could
+hold more than 2 GiB of text, and its flush failed on every replay until the
+WAL quarantined it.
+
+A flush now writes its rows as several row groups of the same file, cutting
+before any row that would take a string or binary column of the row group
+past 1 GiB. Files, WAL checkpoints and cluster file registration are as
+before: one flush still writes the same files. Flushes within the limit are
+written exactly as before. A flush that is cut holds the Arrow arrays of one
+row group at a time instead of the whole flush's.
+
+This does not bound what a buffer retains while storage is behind; ingest
+memory still grows with the backlog (see `arc_buffer_bytes_buffered`).
+
+Thanks to [@efegokdemir](https://github.com/efegokdemir), who traced the
+overflow to buffers retained under flush-queue backpressure and proposed the
+first fix in [#1321](https://github.com/Basekick-Labs/arc/pull/1321); its
+tests are the basis of this change's.
+
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 
 `GET /api/v1/write/msgpack/spec` said authentication was "not yet
