@@ -4214,6 +4214,17 @@ func main() {
 		// earlier run still sits in storage, and the reads must be fresh.
 		icebergSource.SetPendingOutputs(compaction.NewManifestManager(storageBackend, logger.Get("compaction")).PendingOutputsUnder)
 		log.Info().Msg("Iceberg export leaves in-flight compaction outputs out of the table until their sources are deleted")
+		// The files Arc's own reads leave out (a compaction's inputs once its
+		// output is in place, a file a row DELETE replaced, a local copy the
+		// cluster deleted) are left out of the table too, so external readers
+		// count each row once, as Arc does (#939 A0).
+		if openCompactions != nil {
+			strict, ok := openCompactions.(api.StrictExcluder)
+			if !ok {
+				log.Fatal().Msgf("Iceberg export: the query layer's file exclusions (%T) cannot be read strictly", openCompactions)
+			}
+			icebergSource.SetExclusions(strict)
+		}
 		// On a local-storage cluster a delete reaches this disk after the
 		// manifest; files the cluster deleted stay out of the table meanwhile.
 		if clusterCoordinator != nil && storageBackend.Type() == "local" {
@@ -6411,6 +6422,9 @@ type clusterOpenCompactions struct{ c *cluster.Coordinator }
 
 func (o clusterOpenCompactions) ExcludedFor(ctx context.Context, prefix string) []string {
 	return o.c.OpenExcludedFor(ctx, prefix)
+}
+func (o clusterOpenCompactions) ExcludedForStrict(ctx context.Context, prefix string) ([]string, error) {
+	return o.c.OpenExcludedForStrict(ctx, prefix)
 }
 func (o clusterOpenCompactions) Open(prefix string) bool { return o.c.OpenAny(prefix) }
 func (o clusterOpenCompactions) Generation() uint64      { return o.c.OpenGeneration() }

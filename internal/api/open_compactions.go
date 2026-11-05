@@ -1,6 +1,9 @@
 package api
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // CombineOpenCompactions unions the sources a read must account for (the
 // compaction manager's own jobs, the cluster's staged jobs and pending local
@@ -47,4 +50,27 @@ func (c combinedOpenCompactions) Generation() uint64 {
 		g = g*1000003 + s.Generation()
 	}
 	return g
+}
+
+// StrictExcluder is an OpenCompactions source that can answer for a reader
+// that must not guess (the Iceberg export): an error where ExcludedFor would
+// count a file next to its replacement.
+type StrictExcluder interface {
+	ExcludedForStrict(ctx context.Context, prefix string) ([]string, error)
+}
+
+func (c combinedOpenCompactions) ExcludedForStrict(ctx context.Context, prefix string) ([]string, error) {
+	var out []string
+	for _, s := range c {
+		ss, ok := s.(StrictExcluder)
+		if !ok {
+			return nil, fmt.Errorf("%T cannot name the files to leave out strictly", s)
+		}
+		keys, err := ss.ExcludedForStrict(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, keys...)
+	}
+	return out, nil
 }

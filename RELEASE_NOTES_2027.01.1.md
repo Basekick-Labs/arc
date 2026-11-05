@@ -2,6 +2,28 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Iceberg export counts each row once during a DELETE or a compaction ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Arc's queries leave out a file whose rows another file already holds, such as
+the file a row DELETE replaced while it is still in storage next to its
+rewrite. On a standalone node the Iceberg export did not: a reconcile pass
+between a partial DELETE publishing its rewrite and removing the old file
+published both, and external readers (PyIceberg, DuckDB `iceberg_scan`)
+counted the surviving rows twice. The window is normally milliseconds; if the
+removal failed, it lasted until the leftover drainer removed the old file.
+
+The export now leaves out exactly the files Arc's queries leave out (DELETE
+rewrites, compactions in flight, and on a cluster the same set its queries
+use). Where a query would guess (a stat that fails, an unreadable DELETE
+journal, the stale-local breaker), the export does not: that measurement's
+pass fails, keeps the previous snapshot, and is retried on the next pass.
+
+**A file removed while a measurement is being listed** (a compaction or DELETE
+finishing mid-listing) no longer drops its rows from that pass: the
+measurement is listed again, up to three times. If the files keep changing,
+the pass fails for that measurement and keeps the previous snapshot, logged
+as `file set of <db>/<measurement> kept changing under the listing`.
+
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 
 `GET /api/v1/write/msgpack/spec` said authentication was "not yet
