@@ -705,8 +705,9 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 	}
 	hint := func(first []arrow.Array) int {
 		if len(chunks) > 2 {
-			// The other chunks' arrays are not built yet: no clamp by them.
-			first = nil
+			// The other records' arrays are not built yet, so the hint
+			// cannot be clamped by them.
+			return w.parquetSizeHint(measurement, rows, nil)
 		}
 		return w.parquetSizeHint(measurement, rows, first)
 	}
@@ -729,7 +730,8 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 // ("slice bounds out of range [:-2147483616]"). A flush can hold that much:
 // a buffer whose flush the full queue defers keeps growing, and one request
 // can expand up to 3x when invalid UTF-8 becomes U+FFFD. The rows are written
-// as several records, one row group each, in the same file. A var for tests.
+// as several records of the same file, each its own row group (or several,
+// past the writer's row-count limit, as before). A var for tests.
 var maxParquetChunkColumnBytes int64 = 1 << 30
 
 // parquetChunks returns the row boundaries of the records a file of rows rows
@@ -973,7 +975,9 @@ const (
 )
 
 // parquetSizeHint is the output buffer size to reserve for a file of rows
-// rows built from arrays, or 0 for none.
+// rows built from arrays, or 0 for none. With arrays nil (a file written as
+// several records, whose arrays are built one record at a time) the hint is
+// not clamped by their size.
 func (w *ArrowWriter) parquetSizeHint(measurement string, rows int, arrays []arrow.Array) int {
 	v, ok := w.fileBytesPerRow.Load(measurement)
 	if !ok || rows == 0 {
@@ -988,6 +992,9 @@ func (w *ArrowWriter) parquetSizeHint(measurement string, rows int, arrays []arr
 				raw += int64(b.Len())
 			}
 		}
+	}
+	if arrays == nil {
+		return int(min(hint, maxParquetSizeHint))
 	}
 	return int(min(hint, raw+64<<10, maxParquetSizeHint))
 }
@@ -1021,7 +1028,7 @@ func fixedWidthArrayData(dt arrow.DataType, values []byte, n int, valid []bool) 
 }
 
 // writeRecordToParquet writes the rows between consecutive bounds as one
-// record (one row group) each, building every record's arrays with build just
+// record each (each record starts a new row group), building every record's arrays with build just
 // before it is written and releasing them after, so only one record's arrays
 // are held at a time. sizeHint gets the first record's arrays.
 func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, bounds []int, build func(lo, hi int) ([]arrow.Array, error), sizeHint func(first []arrow.Array) int) ([]byte, error) {

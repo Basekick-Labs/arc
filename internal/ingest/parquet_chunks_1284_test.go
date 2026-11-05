@@ -13,11 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
@@ -127,16 +129,23 @@ func TestChunkedParquetWriteRoundTrips(t *testing.T) {
 			"blob": [][]byte{[]byte("x"), nil, []byte("yz"), []byte("w"), []byte("v")},
 			"v":    []float64{1, 2, 3, 4, 5},
 			"ok":   []bool{true, false, true, false, true},
+			"price": []decimal128.Num{
+				decimal128.FromI64(100), decimal128.FromI64(250), decimal128.FromI64(-75),
+				decimal128.FromI64(0), decimal128.FromI64(999),
+			},
 		}
 	}
+	// The cuts fall before rows 2 and 4. NULLs on both sides of the first.
 	validity := map[string][]bool{
-		"host": {true, false, true, true, true}, // a NULL just before the first cut
-		"blob": {true, false, true, true, true},
-		"v":    {true, true, false, true, true}, // a NULL just after it
+		"host":  {true, false, false, true, true},
+		"blob":  {true, false, true, true, true},
+		"v":     {true, true, false, true, true},
+		"price": {true, true, false, true, true},
 	}
+	decimals := map[string]config.DecimalSpec{"price": {Precision: 10, Scale: 2}}
 	write := func() []byte {
 		w := NewArrowWriter(&config.IngestConfig{Compression: "snappy"}, zerolog.Nop())
-		data, err := w.WriteParquetColumnar(context.Background(), "m", columns(), validity, []string{"host"}, true, nil)
+		data, err := w.WriteParquetColumnar(context.Background(), "m", columns(), validity, []string{"host"}, true, decimals)
 		require.NoError(t, err)
 		return data
 	}
@@ -151,8 +160,12 @@ func TestChunkedParquetWriteRoundTrips(t *testing.T) {
 	require.Equal(t, whole.rows, chunked.rows)
 	require.Equal(t, whole.metadata, chunked.metadata)
 	require.Nil(t, chunked.rows[1]["host"])
+	require.Nil(t, chunked.rows[2]["host"])
 	require.Nil(t, chunked.rows[2]["v"])
+	require.Nil(t, chunked.rows[2]["price"])
 	require.Equal(t, "pqrst", chunked.rows[4]["host"])
+	require.Equal(t, "w", chunked.rows[3]["blob"])
+	require.Equal(t, "9.99", chunked.rows[4]["price"])
 }
 
 // flushedRowGroups flushes the rig and returns each file's row-group count
@@ -172,6 +185,8 @@ func flushedRowGroups(t *testing.T, r *flushRig) ([]int, map[int64]string) {
 		groups = append(groups, c.rowGroups)
 		for _, row := range c.rows {
 			hosts[row["time"].(int64)] = row["host"].(string)
+			// The binary column holds the same bytes as host.
+			require.Equal(t, row["host"], row["blob"])
 		}
 		return nil
 	}))
@@ -190,6 +205,7 @@ func writeChunkTestRows(t *testing.T, b *ArrowBuffer, base int64) {
 				"time": {base + int64(i)},
 				"v":    {float64(i)},
 				"host": {host},
+				"blob": {[]byte(host)},
 			},
 		}))
 	}
@@ -247,6 +263,8 @@ func TestChunkedFlushKeepsOneCoveredFile(t *testing.T) {
 	lowerParquetChunkLimit(t, 5)
 	reg := &coverageRegistrar{}
 	b, _ := newCoverageBuffer(t, 1000, reg)
+	store := &recordingBackend{}
+	b.storage = store
 	base := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC).UnixMicro()
 	records := make([]interface{}, 0, len(chunkTestHosts))
 	for i, host := range chunkTestHosts {
@@ -270,4 +288,35 @@ func TestChunkedFlushKeepsOneCoveredFile(t *testing.T) {
 	require.Len(t, ranges, 1)
 	require.Equal(t, uint64(1), ranges[0].Lo)
 	require.Equal(t, uint64(5), ranges[0].Hi)
+	require.Len(t, store.files, 1)
+	for _, data := range store.files {
+		require.Equal(t, 3, readParquetContents(t, data).rowGroups)
+	}
+}
+
+// recordingBackend keeps the bytes of every file written to it.
+type recordingBackend struct {
+	mockStorageBackend
+	mu    sync.Mutex
+	files map[string][]byte
+}
+
+func (r *recordingBackend) Write(_ context.Context, path string, data []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.files == nil {
+		r.files = map[string][]byte{}
+	}
+	r.files[path] = append([]byte(nil), data...)
+	return nil
+}
+
+// A file written as several records sizes its buffer from the learned bytes
+// per row: its arrays are built one record at a time, so they cannot clamp
+// the hint (they clamped it to 64 KiB).
+func TestParquetSizeHintWithoutArraysIsNotClamped(t *testing.T) {
+	w := NewArrowWriter(&config.IngestConfig{Compression: "snappy"}, zerolog.Nop())
+	w.fileBytesPerRow.Store("m", int64(100))
+	require.Equal(t, 100*10_000+100*10_000/8+4096, w.parquetSizeHint("m", 10_000, nil))
+	require.Equal(t, maxParquetSizeHint, w.parquetSizeHint("m", 10_000_000, nil))
 }

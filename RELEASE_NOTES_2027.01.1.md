@@ -126,8 +126,8 @@ WAL quarantined it.
 A flush now writes its rows as several row groups of the same file, cutting
 before any row that would take a string or binary column of the row group
 past 1 GiB. Files, WAL checkpoints and cluster file registration are as
-before: one flush still writes the same files. Flushes within the limit write
-one row group, unchanged. A flush that is cut holds the Arrow arrays of one
+before: one flush still writes the same files. Flushes within the limit are
+written exactly as before. A flush that is cut holds the Arrow arrays of one
 row group at a time instead of the whole flush's.
 
 This does not bound what a buffer retains while storage is behind; ingest
