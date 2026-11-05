@@ -451,11 +451,11 @@ func (t maskToken) is(word string) bool { return t.word != "" && equalFoldASCII(
 // that introduces a relation, while `UNION DISTINCT FROM '…'` (FROM-first
 // syntax) does read one and fails the IS test.
 //
-// Only the separators DuckDB itself treats as whitespace separate words here:
-// ASCII space, tab, CR, LF, form feed and vertical tab. A non-ASCII byte is a
-// token of its own, so `is<U+0085>distinct`, which DuckDB reads as one
-// identifier, is never the operator; a caller must therefore run this before
-// folding Unicode spaces.
+// Words are split the way DuckDB splits identifiers: only ASCII space, tab,
+// CR, LF and form feed separate them (DuckDB rejects a vertical tab), and a
+// non-ASCII byte is part of the word, so `is<U+0085>distinct` and `éis`, which
+// DuckDB reads as single identifiers, are never IS. A caller must therefore
+// run this before folding Unicode spaces.
 //
 // Comments are skipped, never read: a word, a paren or a FROM inside one is
 // not code. Before #1472 the masker's main loop read comments as code and its
@@ -485,13 +485,13 @@ func scanMaskableFroms(sql string, visit func(fromIdx int) bool) {
 	for i := 0; i < len(sql); {
 		c := sql[i]
 		switch {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f':
 			i++
 		case (c == '/' && i+1 < len(sql) && sql[i+1] == '*') || (c == '-' && i+1 < len(sql) && sql[i+1] == '-'):
 			i = skipWhitespaceAndCommentsForward(sql, i)
-		case isIdentByte(c):
+		case isScanWordByte(c):
 			start := i
-			for i < len(sql) && isIdentByte(sql[i]) {
+			for i < len(sql) && isScanWordByte(sql[i]) {
 				i++
 			}
 			word := sql[start:i]
@@ -522,6 +522,12 @@ func scanMaskableFroms(sql string, visit func(fromIdx int) bool) {
 		}
 	}
 }
+
+// isScanWordByte reports whether c continues a word for scanMaskableFroms: an
+// ASCII identifier byte, or any byte of a multi-byte UTF-8 sequence, since
+// DuckDB accepts non-ASCII letters (and the code points Arc folds to spaces)
+// inside an unquoted identifier.
+func isScanWordByte(c byte) bool { return isIdentByte(c) || c >= 0x80 }
 
 // isFromKeywordFunction reports whether word names EXTRACT, SUBSTRING, TRIM or
 // OVERLAY, case-insensitively.

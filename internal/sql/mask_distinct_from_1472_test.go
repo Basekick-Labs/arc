@@ -123,7 +123,11 @@ func TestCommentShapesTheBackwardScanMisread(t *testing.T) {
 		{"operator words in a block comment holding --", "SELECT a /*is distinct --*/ x FROM secret", 0},
 		{"block delimiters inside line comments", "SELECT a IS DISTINCT -- /*\nFROM cpu, 1 AS z -- */\nFROM secret", 1},
 		{"comment before IS", "SELECT host FROM cpu WHERE host /* -- */ IS DISTINCT FROM note", 1},
-		{"form feed and vertical tab", "SELECT a IS\fNOT\vDISTINCT\fFROM b FROM cpu", 1},
+		{"form feed", "SELECT a IS\fNOT\fDISTINCT\fFROM b FROM cpu", 1},
+		// DuckDB rejects a vertical tab as whitespace and reads a non-ASCII
+		// letter as part of the identifier: neither is the operator.
+		{"vertical tab", "SELECT a IS\vDISTINCT FROM b", 0},
+		{"non-ASCII letter glued to is", "SELECT 1 éis DISTINCT FROM t", 0},
 		{"unterminated block comment", "SELECT a IS DISTINCT /* FROM b", 0},
 		{"line comment at end of input", "SELECT a IS DISTINCT FROM b -- FROM", 1},
 	}
