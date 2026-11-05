@@ -560,11 +560,10 @@ or Arch upgrade keeps an existing `/etc/arc/arc.toml`. The same environment
 variable also beats the file:
 
 - **If you changed `backup.local_path` in `/etc/arc/arc.toml`,** the unit now
-  overrides it. On rpm and Arch, which keep your `arc.toml` across upgrades,
-  Arc logs a warning at startup naming both paths. The .deb has always
-  replaced `/etc/arc/arc.toml` on upgrade, so a deb install has already lost
-  that edit and gets no warning. Either way, keep your directory with a
-  drop-in:
+  overrides it, and Arc logs a warning at startup naming both paths. All three
+  packages now keep your `arc.toml` across the upgrade (the .deb from this
+  release on, see the next note); an edit that an earlier .deb upgrade already
+  reset is gone and draws no warning. Keep your directory with a drop-in:
 
   ```
   sudo systemctl edit arc
@@ -623,6 +622,28 @@ boots the Arch package with its unit's user, working directory and environment.
 Before, every boot test ran the binary from a directory of its own choosing,
 and none of them saw the packaged layout. The three packages now share one unit
 file, `deploy/systemd/arc.service`.
+
+## Fix: .deb upgrades keep `/etc/arc/arc.toml` ([#1465](https://github.com/Basekick-Labs/arc/issues/1465))
+
+Every .deb upgrade used to replace `/etc/arc/arc.toml` with the stock file,
+discarding the operator's edits (auth, retention, credentials, ports) without
+a prompt or a backup copy. The rpm and Arch packages already kept the file.
+
+From this release the .deb ships the stock config at `/usr/share/arc/arc.toml`
+and installs it at `/etc/arc/arc.toml` only when that file does not exist. An
+existing file is never modified, including on the upgrade from 26.09.x: the
+config you have now is the one 27.01.1 starts with. Keys that are not in your
+file take Arc's built-in defaults, so a config from an older release keeps
+working; diff it against `/usr/share/arc/arc.toml` to see what the new stock
+file documents.
+
+Upgrades never prompt, so non-interactive installs (`apt-get install -y`,
+configuration management) keep working without `--force-confold`. The file
+is not a dpkg conffile: with a conffile, an edited `arc.toml` makes every
+upgrade prompt, and the upgrade from 26.09.x failed non-interactively even for
+an unedited file. `dpkg --purge` removes `/etc/arc/arc.toml`, unless the other
+variant (`arc` or `arc-fips`) is installed and still uses it; `dpkg --remove`
+leaves it.
 
 ## Upgrade note: three configurations now refuse to start
 
