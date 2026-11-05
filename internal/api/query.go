@@ -288,9 +288,9 @@ func isFunctionCallAt(sql string, pos int) bool {
 // SECURITY: never use it on SQL that DuckDB will run, or to normalise SQL for
 // a validator. DuckDB does not quote identifiers with backticks: an unquoted
 // backtick is an operator character, and a backtick-quoted column fails to
-// bind. The mapping also rewrites a backtick that sits inside a "…" identifier or a '…' literal,
-// which moves where the masker thinks quoted text ends, so the validator and
-// DuckDB disagree about the statement (#1480). The validators refuse unquoted
+// bind. The mapping also rewrites a backtick that sits inside a "…"
+// identifier or a '…' literal, which moves where the masker thinks quoted text
+// ends, so the validator and DuckDB disagree about the statement (#1480). The validators refuse unquoted
 // backticks instead (hasUnquotedBacktick) and mask the SQL as written.
 func backticksToDoubleQuotes(sql string) string {
 	if !strings.ContainsRune(sql, '`') {
@@ -310,10 +310,10 @@ func backticksToDoubleQuotes(sql string) string {
 // only knows ' and "). The captured database name excludes the surrounding
 // quotes, so the quote-character swap does not change the resolved db.
 //
-// The mapping is safe here only because every caller runs ValidateSQLRequest
-// first, which masks the SQL as written and refuses what this mapping could
-// make look like a SHOW (#1480). The output feeds only the SHOW patterns, and
-// a routed SHOW is answered by Arc, never by DuckDB.
+// The output is used only to match the SHOW patterns (#1480). A query this
+// mapping makes look like a SHOW still passes every check in
+// ValidateSQLRequest on its unmapped text, and a routed SHOW is answered by
+// Arc, never by DuckDB.
 func normalizeSQLForShow(sql string) string {
 	sql = backticksToDoubleQuotes(sql)
 	features := scanSQLFeatures(sql)
@@ -2937,9 +2937,9 @@ func ValidateSQLRequest(sql string) error {
 	// identifiers with them; it does not. The mapping also rewrote a backtick
 	// inside a "…" identifier or a '…' literal, so every check below scanned a
 	// different statement from the one DuckDB runs (#1480). An unquoted
-	// backtick is refused instead. The one exception is a SHOW the handlers
-	// answer themselves (SHOW TABLES FROM a backtick-quoted name); it never reaches DuckDB,
-	// and the checks below still run on it unmapped.
+	// backtick is refused instead. The one exception is SHOW TABLES FROM a
+	// backtick-quoted name, which the query handlers answer or refuse before
+	// DuckDB; the checks below still run on it unmapped.
 	if hasUnquotedBacktick(sql) && !isArcAnsweredShow(sql) {
 		return &SQLValidationError{Message: errUnquotedBacktick}
 	}
@@ -3027,9 +3027,9 @@ func ValidateSQLRequest(sql string) error {
 	//
 	// IMPORTANT: this uses a DIFFERENT normalisation than `normalised` above.
 	// The shared `normalised` masks double-quoted identifiers, but DuckDB
-	// executes `"parquet_scan"(...)` identically to the unquoted call — so matching the denylist against
-	// `normalised` lets a quoted spelling slip past (the name is hidden inside
-	// a `__STR__` placeholder). Confirmed live: `SELECT * FROM
+	// executes `"parquet_scan"(...)` identically to the unquoted call — so
+	// matching the denylist against `normalised` lets a quoted spelling slip
+	// past (the name is hidden inside a `__STR__` placeholder). Confirmed live: `SELECT * FROM
 	// "parquet_scan"('…/other-db/…')` executed and returned cross-tenant rows
 	// (GHSA-93cm-2v4m-c56c review round 2). ioDenylistNormalise strips
 	// identifier quoting so quoted function names are exposed to the regex,

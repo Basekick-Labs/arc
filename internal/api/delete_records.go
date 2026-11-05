@@ -132,8 +132,9 @@ var (
 // The clause is masked as written. It runs after validateWhereClause, which
 // refuses an unquoted backtick; mapping backticks to double quotes here, as
 // this once did, rewrote a backtick inside a literal into the SQL that ran
-// (`msg = 'a`b'` deleted the rows where msg = 'a"b') and could hide a time
-// function from the pin (#1480).
+// whenever the clause also had a time function to pin (`msg = 'a`b' AND time
+// < now()` deleted the rows where msg = 'a"b'), and could hide a time function
+// from the pin (#1480).
 func pinDeleteTime(where string, now time.Time) (string, error) {
 	masked, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
 	if m := volatileFunction.FindStringSubmatch(masked); m != nil {
@@ -182,10 +183,14 @@ func (h *DeleteHandler) RewriteForRecords(ctx context.Context, relativePath stri
 		}
 		// A record is SQL from the cluster log, interpolated below as it was
 		// stored. One stored before the validator was tightened is checked
-		// again here, as a stored continuous query is before it runs; one it
-		// refuses is not run and matches nothing in this file (#1480).
+		// again here, as a stored continuous query is before it runs (#1480).
+		// One it refuses is not run, so the rows that DELETE removed elsewhere
+		// stay in this file; returning an error instead would hold the file
+		// back for good. The log carries the clause so the DELETE can be
+		// issued again.
 		if _, err := h.validateWhereClause(w); err != nil {
-			h.logger.Error().Err(err).Str("file", relativePath).Msg("DELETE record refused by WHERE validation; not applied to this file")
+			h.logger.Error().Err(err).Str("file", relativePath).Str("where", sqlutil.ForLog(w)).
+				Msg("DELETE record refused by WHERE validation; not applied, so its rows remain in this file; issue the DELETE again")
 			continue
 		}
 		var n int64

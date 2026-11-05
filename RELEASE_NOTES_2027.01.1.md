@@ -885,12 +885,15 @@ identifier is unaffected.
 
 Two related fixes:
 - **Stream takeover `DELETE` with a backtick in a string literal.** With
-  stream takeover on, such a `DELETE` (`WHERE msg = 'a`b'`) ran with the
-  backtick turned into a double quote, so it matched the wrong rows. It now
-  runs as written.
+  stream takeover on, a `DELETE` whose predicate had both a backtick in a
+  string literal and a time function such as `now()` (`WHERE msg = 'a`b' AND
+  time < now()`) ran with the backtick turned into a double quote, so it
+  matched the wrong rows. It now runs as written.
 - **Stored `DELETE` records.** A record applied to a pending file is checked
-  again before it runs. A record the current checks refuse is skipped, with
-  an error in the log.
+  again before it runs. A record the current checks refuse is skipped, so
+  the rows that `DELETE` removed elsewhere remain in that file. The error in
+  the log names the file and the predicate; issue the `DELETE` again with a
+  predicate the current checks accept.
 
 ## Upgrade note: three configurations now refuse to start
 

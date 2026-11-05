@@ -56,8 +56,7 @@ func TestValidateSQLAllowsBacktickInQuotedText(t *testing.T) {
 	}
 }
 
-// A backtick inside a quoted identifier is part of the name. It must not move
-// where the validator thinks the identifier ends.
+// A backtick inside a quoted identifier is part of the name.
 func TestValidateSQLReadsBacktickInIdentifierAsWritten(t *testing.T) {
 	for _, sql := range []string{
 		`SELECT 1 AS "x` + "`" + `/*"; SELECT 2 --*/`,
@@ -78,7 +77,6 @@ func TestWhereValidatorsRefuseUnquotedBacktick(t *testing.T) {
 		"host = 'a' ` 1",
 		`"x` + "`" + `/*" = 1; SELECT 2 --*/`,
 		"`a'` = 1 OR glob('/etc/passwd') IS NOT NULL OR `'` = 1",
-		// The backticks are inside identifiers; the literal is in table position.
 		`"x` + "`" + `" = 1 OR v IN (FROM '/data/db2/x.parquet') OR "` + "`" + `" = 1`,
 	} {
 		// The /query/:measurement path checks the fragment, then the assembled
@@ -89,6 +87,10 @@ func TestWhereValidatorsRefuseUnquotedBacktick(t *testing.T) {
 		if _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause(%q) accepted", where)
 		}
+	}
+	// The fragment check on its own reads the clause as written.
+	if err := validateWhereClauseQuery(`"x` + "`" + `" = 1 UNION SELECT 2 OR "` + "`" + `" = 1`); err == nil {
+		t.Error("validateWhereClauseQuery accepted a keyword between two identifiers holding backticks")
 	}
 	for _, where := range []string{
 		"msg = 'a`b'",

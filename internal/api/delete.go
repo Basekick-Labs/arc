@@ -925,8 +925,7 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	if hasUnquotedBacktick(where) {
 		return false, errors.New("WHERE clause: " + errUnquotedBacktick)
 	}
-	maskInput := where
-	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	maskedWhere, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
 	maskedWhere = foldUnicodeSpace(maskedWhere)
@@ -1019,8 +1018,8 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// ordering constraint queryMeasurement documents. A fragment that
 	// introduces a relation carries its own keyword, so the scanner arms
 	// without needing a synthetic FROM clause around it.
-	features := scanSQLFeatures(maskInput)
-	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	features := scanSQLFeatures(where)
+	normalised, _ := sqlutil.MaskStringLiterals(where, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
 	// As in ValidateSQLRequest, and in the same order (after the comments are
 	// gone, so a comment cannot open a masking frame): the FROM of
