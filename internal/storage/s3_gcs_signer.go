@@ -28,10 +28,16 @@ func (s *gcsS3Signer) SignHTTP(ctx context.Context, credentials aws.Credentials,
 	return s.signer.SignHTTP(ctx, credentials, request, payloadHash, service, region, signingTime, options...)
 }
 
+// isGCSEndpoint reports whether endpoint is Google Cloud Storage's
+// S3-compatible XML API.
+func isGCSEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	return err == nil && strings.EqualFold(parsed.Hostname(), "storage.googleapis.com")
+}
+
 // configureGCSS3Options confines XML interop differences to Google's endpoint.
 func configureGCSS3Options(endpoint string, options *s3.Options) {
-	parsed, err := url.Parse(endpoint)
-	if err != nil || !strings.EqualFold(parsed.Hostname(), "storage.googleapis.com") {
+	if !isGCSEndpoint(endpoint) {
 		return
 	}
 	// Optional streaming checksum trailers are rejected by GCS XML interop.

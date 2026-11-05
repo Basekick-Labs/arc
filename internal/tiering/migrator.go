@@ -621,8 +621,9 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		return fmt.Errorf("%s is being compacted; it migrates on a later cycle", candidate.Path)
 	}
 
-	// The row's size is what the last scan recorded; a file rewritten in
-	// place since (the delete API does that) is longer or shorter, and an
+	// The row's size is what the last scan recorded; a file rewritten at
+	// its own path since (a restore, an edge-sync promote; the delete API
+	// did that before #1073) is longer or shorter, and an
 	// object-store destination now enforces the declared length. Ask the
 	// source, falling back to the row when it cannot say.
 	size := candidate.SizeBytes
