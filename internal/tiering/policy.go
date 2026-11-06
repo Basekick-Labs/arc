@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -180,7 +181,9 @@ func (s *PolicyStore) cacheIfFresh(database string, policy *DatabasePolicy, gen 
 	if s.gen != gen {
 		return policy
 	}
-	s.cache[database] = policy
+	// Copied: the name can point into a request buffer the HTTP framework
+	// reuses for the next request on the connection.
+	s.cache[strings.Clone(database)] = policy
 	return policy
 }
 
@@ -232,7 +235,10 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 		return fmt.Errorf("failed to set policy: %w", err)
 	}
 
-	// Update cache
+	// Update cache. The name is copied: it can point into a request buffer
+	// the HTTP framework reuses, and both the key and the cached policy
+	// outlive the request.
+	policy.Database = strings.Clone(policy.Database)
 	s.cache[policy.Database] = policy
 	s.gen++
 

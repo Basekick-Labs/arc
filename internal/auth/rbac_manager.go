@@ -64,6 +64,19 @@ type permissionCacheKey struct {
 	permission  string
 }
 
+// owned returns the key with its strings copied, for storing in permCache.
+// A request's database and measurement names can point into the HTTP
+// framework's request buffer (fasthttp reuses it for the next request on the
+// same connection), so a key stored without a copy would change under the
+// cache: an allow cached for one name would then match another. Lookups may
+// use the uncopied key, as the map compares the bytes at that moment.
+func (k permissionCacheKey) owned() permissionCacheKey {
+	k.database = strings.Clone(k.database)
+	k.measurement = strings.Clone(k.measurement)
+	k.permission = strings.Clone(k.permission)
+	return k
+}
+
 // permissionCacheEntry caches a permission check result
 type permissionCacheEntry struct {
 	result    *PermissionCheckResult
@@ -1479,7 +1492,7 @@ func (rm *RBACManager) CheckPermission(req *PermissionCheckRequest) *PermissionC
 	if result.Source != SourceUnavailable {
 		rm.permCacheMu.Lock()
 		rm.evictPermCacheIfFull()
-		rm.permCache[cacheKey] = &permissionCacheEntry{
+		rm.permCache[cacheKey.owned()] = &permissionCacheEntry{
 			result:    result,
 			expiresAt: time.Now().Add(rm.permCacheTTL),
 		}
@@ -1594,7 +1607,7 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 			if result.Source != SourceUnavailable {
 				rm.permCacheMu.Lock()
 				rm.evictPermCacheIfFull()
-				rm.permCache[cacheKey] = &permissionCacheEntry{
+				rm.permCache[cacheKey.owned()] = &permissionCacheEntry{
 					result:    result,
 					expiresAt: time.Now().Add(rm.permCacheTTL),
 				}
