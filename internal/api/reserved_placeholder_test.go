@@ -13,11 +13,13 @@ import (
 func TestValidateSQLRequestRefusesReservedPlaceholders(t *testing.T) {
 	for _, sql := range []string{
 		"SELECT v, EXTRACT(YEAR FROM time) AS y __FROM_MASK_0__ cpu",
-		"SELECT '__FROM_MASK_0__' FROM cpu",
-		`SELECT "__FROM_MASK_0__" FROM cpu`,
 		"SELECT v FROM cpu -- __FROM_MASK_0__",
-		// Completes a FROM placeholder only once the literal is masked.
+		"SELECT v FROM cpu WHERE host = __STR_0__",
+		"SELECT e__STR_0__, 'x' FROM cpu",
+		`SELECT __IDENT_0__, "x" FROM cpu`,
+		// Completed only once the literal is masked.
 		"SELECT v, EXTRACT(YEAR FROM time) AS y, 'a'FROM_MASK_0__ cpu",
+		"SELECT 'a'STR_1__, 'b' FROM cpu",
 	} {
 		err := ValidateSQLRequest(sql)
 		if err == nil || !strings.Contains(err.Error(), "reserved sequence") {
@@ -32,6 +34,9 @@ func TestValidateSQLRequestKeepsFunctionBodyFrom(t *testing.T) {
 		"SELECT trim(BOTH FROM host), substring(host FROM 1 FOR 2) FROM cpu",
 		"SELECT v FROM cpu WHERE host IS DISTINCT FROM 'a'",
 		"SELECT my_str_col, from_mask, _ident_ FROM cpu",
+		// Inside a literal or quoted identifier the text is data.
+		"SELECT '__FROM_MASK_0__', '__STR_0__' FROM cpu",
+		`SELECT v AS "__FROM_MASK_0__" FROM cpu WHERE m LIKE '%__IDENT_%'`,
 		// Exact bytes: the restore never matches another case.
 		"SELECT EXTRACT(YEAR FROM time) AS y, __from_mask_0__ FROM cpu",
 	} {
@@ -94,6 +99,8 @@ func TestTransformRefusesReservedPlaceholders(t *testing.T) {
 // pinDeleteTime restores each literal once, where the masker left it. A
 // literal whose content spells another literal's placeholder keeps its
 // content; replacing every occurrence spliced the other literal into it.
+// validateWhereClause accepts this clause (the text is inside a literal),
+// so it reaches the pin on the real DELETE path.
 func TestPinDeleteTimeRestoresEachLiteralInPlace(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	in := "a = 'x' AND b = '__STR_0__' AND time < now()"
@@ -108,9 +115,14 @@ func TestPinDeleteTimeRestoresEachLiteralInPlace(t *testing.T) {
 }
 
 func TestDeleteWhereRefusesReservedPlaceholders(t *testing.T) {
-	for _, where := range []string{"b = '__STR_0__'", "__IDENT_0__ = 1", "x __FROM_MASK_0__ y"} {
+	for _, where := range []string{"b = __STR_0__", "__IDENT_0__ = 1", "x __FROM_MASK_0__ y", "a = 'x'STR_1__ AND b = 'y'"} {
 		if _, err := (&DeleteHandler{}).validateWhereClause(where); err == nil || !strings.Contains(err.Error(), "reserved sequence") {
 			t.Errorf("%q: want reserved-sequence refusal, got %v", where, err)
+		}
+	}
+	for _, where := range []string{"b = '__STR_0__'", "m LIKE '%__FROM_MASK_%'"} {
+		if _, err := (&DeleteHandler{}).validateWhereClause(where); err != nil {
+			t.Errorf("%q: placeholder text inside a literal refused: %v", where, err)
 		}
 	}
 }

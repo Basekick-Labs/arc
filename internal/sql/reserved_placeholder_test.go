@@ -30,18 +30,35 @@ func TestContainsReservedPlaceholder(t *testing.T) {
 	}
 }
 
-// A literal's placeholder ends in `__`, so caller text written straight
-// after the literal can complete a FROM placeholder only in the masked form.
-func TestContainsFromMaskPlaceholderAfterLiteralMask(t *testing.T) {
-	raw := "SELECT 'a'FROM_MASK_0__ x"
-	if ContainsReservedPlaceholder(raw) {
-		t.Fatalf("raw form unexpectedly matched; the test no longer covers the masked-only shape")
-	}
-	masked, _ := MaskStringLiterals(raw, true)
-	if !ContainsFromMaskPlaceholder(masked) {
-		t.Fatalf("masked %q: FROM placeholder not detected", masked)
-	}
-	if ContainsFromMaskPlaceholder("SELECT __STR_0__, __IDENT_1__ FROM cpu") {
-		t.Fatalf("literal and identifier placeholders must not match the FROM check")
+func TestHasCallerPlaceholder(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"SELECT 1", false},
+		{"SELECT 'a', \"b\" FROM cpu", false},
+		// Inside a literal or quoted identifier: hidden and restored as is.
+		{"SELECT '__STR_0__', '__FROM_MASK_0__', \"x__IDENT_0__\" FROM cpu", false},
+		{"SELECT v FROM cpu WHERE m LIKE '%__STR_%'", false},
+		// The masker reuses an identifier's placeholder for each occurrence.
+		{"SELECT \"x\" FROM cpu \"x\" WHERE \"x\".v = 'a'", false},
+		// Outside them: restored with the real placeholders.
+		{"SELECT __STR_0__ FROM cpu", true},
+		{"SELECT __STR_x FROM cpu", true},
+		{"SELECT 'a'IDENT_ FROM cpu", true},
+		{"SELECT e__STR_0__, 'x' FROM cpu", true},
+		{"SELECT __IDENT_0__, \"x\" FROM cpu", true},
+		{"SELECT a __FROM_MASK_0__ cpu", true},
+		{"SELECT v FROM cpu -- __STR_0__", true},
+		// Completed only once the literal is masked.
+		{"SELECT 'a'STR_1__, 'b' FROM cpu", true},
+		{"SELECT 'a'FROM_MASK_0__ cpu", true},
+		// Exact bytes: the restorers never match another case.
+		{"SELECT __str_0__, __from_mask_0__ FROM cpu", false},
+	} {
+		masked, masks := MaskStringLiterals(tc.in, true)
+		if got := HasCallerPlaceholder(masked, masks); got != tc.want {
+			t.Errorf("HasCallerPlaceholder(%q) = %v, want %v (masked %q)", tc.in, got, tc.want, masked)
+		}
 	}
 }

@@ -326,9 +326,10 @@ func normalizeSQLForShow(sql string) string {
 // backtick (hasUnquotedBacktick).
 const errUnquotedBacktick = "backticks are not identifier quotes in DuckDB; quote identifiers with double quotes (\"name\")"
 
-// errReservedPlaceholder refuses caller SQL that spells a function-body FROM
-// placeholder (sqlutil.ContainsFromMaskPlaceholder).
-const errReservedPlaceholder = "SQL must not contain the reserved sequence __FROM_MASK_"
+// errReservedPlaceholder refuses caller SQL that spells a placeholder the
+// SQL maskers generate, outside a string literal or quoted identifier
+// (sqlutil.HasCallerPlaceholder).
+const errReservedPlaceholder = "SQL must not contain the reserved sequences __STR_, __IDENT_ or __FROM_MASK_ outside a string literal or quoted identifier"
 
 // hasUnquotedBacktick reports whether sql has a backtick outside a string
 // literal, a quoted identifier, a dollar-quoted string or a comment.
@@ -3022,16 +3023,6 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "SQL query must not contain a NUL byte"}
 	}
 
-	// The transform masks the FROM of EXTRACT/SUBSTRING/TRIM/OVERLAY and
-	// `IS [NOT] DISTINCT FROM` with generated placeholders, checks the masked
-	// form, and restores every occurrence of each placeholder's text. A copy
-	// the caller wrote would become a FROM nothing checked, so the text is
-	// reserved. (Literal and identifier placeholder text is handled where it
-	// matters, in table position; see reserved_names_test.go.)
-	if sqlutil.ContainsFromMaskPlaceholder(sql) {
-		return &SQLValidationError{Message: errReservedPlaceholder}
-	}
-
 	// Normalise before denylist check: mask string literals so keywords
 	// inside literals don't false-positive, then strip comments so
 	// keywords interleaved with comments don't slip past token
@@ -3050,9 +3041,13 @@ func ValidateSQLRequest(sql string) error {
 	}
 	features := scanSQLFeatures(sql)
 	normalised, vMasks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
-	// A literal's placeholder ends in `__`, so text written straight after
-	// a literal can complete a FROM placeholder that the raw SQL lacks.
-	if sqlutil.ContainsFromMaskPlaceholder(normalised) {
+	// The transform restores placeholders by their text after the checks
+	// below have run on the masked form, so placeholder text the caller
+	// wrote outside a literal or quoted identifier is refused: it would be
+	// restored with the real ones, and the statement DuckDB runs would not
+	// be the one checked. Text inside a literal is hidden by the literal's
+	// own placeholder and stays data.
+	if sqlutil.HasCallerPlaceholder(normalised, vMasks) {
 		return &SQLValidationError{Message: errReservedPlaceholder}
 	}
 	if features.hasBlockComment && hasNestedBlockComment(normalised) {
@@ -3711,7 +3706,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// Phase 1: Mask string literals to prevent regex from matching inside them
 	// e.g., WHERE msg = 'SELECT * FROM mydb.cpu' should not convert the string content
 	sql, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
-	if reservedPlaceholderInTransform(ctx, originalSQL, sql) {
+	if reservedPlaceholderInTransform(ctx, sql) {
 		return sql
 	}
 
@@ -3876,9 +3871,10 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 
 	// Restore masked FROM keywords, put the expressions in, then restore
 	// string literals, in that order. The FROM restore runs before expand so
-	// it never reads the storage paths expand inserts: a path is built from
-	// names, and a name that spelled a placeholder would otherwise be
-	// restored into the path (names refuse that text too). String literals
+	// it never reads the storage paths expand inserts. Here that is a second
+	// line: the identifier resolver already refuses a name carrying
+	// placeholder text. Under a header database the database name comes
+	// from the header, so the order is what keeps it out of the restore. String literals
 	// go last because a literal can hold a NUL, which expand would read as a
 	// sentinel. Both masks use content-addressed placeholders, so the
 	// length-changing rewrites above are safe. Identifier placeholders
@@ -4074,13 +4070,15 @@ func withStoragePathFailure(ctx context.Context) (context.Context, *storagePathF
 }
 
 // reservedPlaceholderInTransform refuses, through the storage-path failure
-// collector, a statement that spells a function-body FROM placeholder: original is the SQL
-// as the caller wrote it, masked the same SQL after MaskStringLiterals.
-// ValidateSQLRequest refuses both shapes first on every endpoint; this keeps
-// the transform from restoring caller text into a checked statement if a
-// path ever reaches it without that gate.
-func reservedPlaceholderInTransform(ctx context.Context, original, masked string) bool {
-	if sqlutil.ContainsFromMaskPlaceholder(original) || sqlutil.ContainsFromMaskPlaceholder(masked) {
+// collector, a statement whose string-masked form spells a function-body
+// FROM placeholder, which UnmaskFromKeywordsInFunctionBodies would restore
+// as a FROM. ValidateSQLRequest refuses it first on every endpoint; this
+// keeps the transform from restoring caller text into a checked statement
+// if a path ever reaches it without that gate. (Literal and identifier
+// placeholder text is refused per name by the rewriters' identifier
+// resolver; see reserved_names_test.go.)
+func reservedPlaceholderInTransform(ctx context.Context, masked string) bool {
+	if sqlutil.ContainsFromMaskPlaceholder(masked) {
 		recordStoragePathFailure(ctx, errors.New(errReservedPlaceholder))
 		return true
 	}
@@ -4857,7 +4855,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 	// Phase 1: Mask string literals to prevent regex from matching inside them
 	sql, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
-	if reservedPlaceholderInTransform(ctx, originalSQL, sql) {
+	if reservedPlaceholderInTransform(ctx, sql) {
 		return sql
 	}
 

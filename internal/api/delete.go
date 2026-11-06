@@ -910,10 +910,6 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
-// errReservedDeletePlaceholder refuses a DELETE WHERE clause that spells a
-// placeholder the SQL maskers generate (sqlutil.ContainsReservedPlaceholder).
-const errReservedDeletePlaceholder = "WHERE clause must not contain the reserved sequences __STR_, __IDENT_ or __FROM_MASK_"
-
 // validateWhereClause validates the WHERE clause and returns true if it's a full table delete
 func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	if where == "" || strings.TrimSpace(where) == "" {
@@ -926,16 +922,17 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// unmatched-parenthesis checks below stay on it. An unquoted backtick is
 	// refused before anything is masked: it is not a quote in DuckDB, so the
 	// masker must see the clause exactly as DuckDB will (#1480).
-	// Placeholder text is reserved: the clause is masked, checked, and
-	// restored by placeholder text (pinDeleteTime, the DELETE scan), so a
-	// copy the caller wrote would be restored with the real ones.
-	if sqlutil.ContainsReservedPlaceholder(where) {
-		return false, errors.New(errReservedDeletePlaceholder)
-	}
 	if hasUnquotedBacktick(where) {
 		return false, errors.New("WHERE clause: " + errUnquotedBacktick)
 	}
 	maskedWhere, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
+	// Placeholder text outside a literal or quoted identifier is reserved:
+	// the clause is masked, checked, and its literals restored by
+	// placeholder (pinDeleteTime), so a copy the caller wrote would move a
+	// literal after the checks. Text inside a literal stays data.
+	if sqlutil.HasCallerPlaceholder(maskedWhere, masks) {
+		return false, errors.New("WHERE clause: " + errReservedPlaceholder)
+	}
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
 	maskedWhere = foldUnicodeSpace(maskedWhere)
