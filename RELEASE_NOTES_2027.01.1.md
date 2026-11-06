@@ -85,7 +85,8 @@ only accepted in the spelling it already has on disk:
 - **Ingest** to another spelling of an existing database or measurement is
   refused and reported like other unstorable names, before anything reaches
   the WAL. Two first writes racing with different spellings can't both win,
-  and a write refused for its columns or values doesn't claim a spelling.
+  first writes racing with the same spelling are all accepted, and a write
+  refused for its columns or values doesn't claim a spelling.
 - **Queries** are refused with a 400 that names the existing spelling.
   Before, `FROM CPU` on a Mac returned `cpu`'s rows. On such a volume,
   rewritten SQL is no longer cached, so a spelling accepted before another

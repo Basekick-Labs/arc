@@ -188,13 +188,31 @@ func (b *LocalBackend) checkSpelling(segments []string) (missing bool, err error
 // entry reports whether parent holds an entry the filesystem resolves seg
 // to, and that entry's spelling on disk.
 func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, err error) {
+	// A stat can find an entry the listing taken just before it lacks:
+	// another first write created it in between. The second pass lists again
+	// after that stat, so an entry it still does not hold was renamed or
+	// replaced, not merely late.
+	for attempt := 0; attempt < 2; attempt++ {
+		exists, onDisk, unlisted, err := s.entryOnce(parent, seg)
+		if err != nil || !unlisted {
+			return exists, onDisk, err
+		}
+	}
+	// Resolved, but to no listed entry: refuse rather than accept a spelling
+	// the listing does not hold.
+	return true, "(another spelling)", nil
+}
+
+// entryOnce is one listing pass of entry. unlisted reports that the
+// filesystem resolved seg but the listing holds no entry it resolves to.
+func (s *nameSpelling) entryOnce(parent, seg string) (exists bool, onDisk string, unlisted bool, err error) {
 	// Stat, not Lstat: a symlinked storage root's own mtime never changes.
 	st, err := os.Stat(parent)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, "", nil
+			return false, "", false, nil
 		}
-		return false, "", err
+		return false, "", false, err
 	}
 	mod := st.ModTime()
 	s.mu.Lock()
@@ -202,13 +220,13 @@ func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, er
 	s.mu.Unlock()
 	if ok && l.mod.Equal(mod) && l.takenAt.Sub(mod) >= listingTrustAge {
 		if _, ok := l.names[seg]; ok {
-			return true, seg, nil
+			return true, seg, false, nil
 		}
 	}
 	takenAt := time.Now()
 	entries, err := os.ReadDir(parent)
 	if err != nil {
-		return false, "", err
+		return false, "", false, err
 	}
 	names := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
@@ -221,16 +239,16 @@ func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, er
 	s.listings[parent] = dirListing{mod: mod, takenAt: takenAt, names: names}
 	s.mu.Unlock()
 	if _, ok := names[seg]; ok {
-		return true, seg, nil
+		return true, seg, false, nil
 	}
 	// Not listed under this spelling: does the filesystem resolve it to
 	// another entry?
 	target, err := os.Lstat(filepath.Join(parent, seg))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, "", nil
+			return false, "", false, nil
 		}
-		return false, "", err
+		return false, "", false, err
 	}
 	// Likely candidates first (a Unicode case fold), then every entry, for
 	// folds strings.EqualFold does not apply (normalization).
@@ -240,11 +258,9 @@ func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, er
 				continue
 			}
 			if info, err := os.Lstat(filepath.Join(parent, e.Name())); err == nil && os.SameFile(info, target) {
-				return true, e.Name(), nil
+				return true, e.Name(), false, nil
 			}
 		}
 	}
-	// Resolved, but to no listed entry (renamed in between): refuse rather
-	// than accept a spelling the listing does not hold.
-	return true, "(another spelling)", nil
+	return true, "", true, nil
 }
