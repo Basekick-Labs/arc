@@ -192,17 +192,15 @@ func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, er
 	// another first write created it in between. The second pass lists again
 	// after that stat, so an entry it still does not hold was renamed or
 	// replaced, not merely late.
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt < 2; attempt++ {
 		exists, onDisk, unlisted, err := s.entryOnce(parent, seg)
 		if err != nil || !unlisted {
 			return exists, onDisk, err
 		}
-		if attempt > 0 {
-			// Resolved, but to no listed entry: refuse rather than accept a
-			// spelling the listing does not hold.
-			return true, "(another spelling)", nil
-		}
 	}
+	// Resolved, but to no listed entry: refuse rather than accept a spelling
+	// the listing does not hold.
+	return true, "(another spelling)", nil
 }
 
 // entryOnce is one listing pass of entry. unlisted reports that the
