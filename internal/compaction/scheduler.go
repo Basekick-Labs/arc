@@ -39,10 +39,13 @@ type Scheduler struct {
 	schedule  string
 	tierNames []string // Specific tiers to process (must be non-empty and enabled)
 	enabled   bool
-	// clusterGate is the Phase 4 role check. When non-nil, Start() and
-	// TriggerNow() both consult it and refuse to run when CanCompact is
-	// false. nil gate means "no check, allow" — used by OSS / standalone
-	// paths and by existing tests that predate Phase 4.
+	// clusterGate is the Phase 4 role check. When non-nil, Start(), every
+	// tick (tickAllowed, including a deferred tick's every attempt) and
+	// TriggerNow() consult it and refuse to run when CanCompact is false.
+	// Assigned only in NewScheduler, so a tick reads it without s.mu, which
+	// Stop holds while it waits for running ticks. nil gate means "no check,
+	// allow" — used by OSS / standalone paths and by existing tests that
+	// predate Phase 4.
 	clusterGate ClusterGate
 
 	cron      *cron.Cron
@@ -52,6 +55,13 @@ type Scheduler struct {
 
 	// nextTickForTest replaces getNextRun when non-nil.
 	nextTickForTest func() time.Time
+	// afterClaimRefusedForTest, when non-nil, runs in a deferred tick between
+	// a refused claim and the wait for its release: the window the release
+	// signal, taken before the attempt, must cover.
+	afterClaimRefusedForTest func()
+	// beforeStopWaitForTest, when non-nil, runs in Stop after this scheduler
+	// is signalled and before it waits for running jobs.
+	beforeStopWaitForTest func()
 
 	logger zerolog.Logger
 	mu     sync.Mutex
@@ -178,7 +188,10 @@ func (s *Scheduler) Stop() {
 
 	// A deferred tick must stop waiting, or the wait below lasts until the next
 	// tick.
-	close(s.stopCh)
+	s.signalStopLocked()
+	if s.beforeStopWaitForTest != nil {
+		s.beforeStopWaitForTest()
+	}
 
 	// Stop cron scheduler
 	if s.cron != nil {
@@ -188,6 +201,38 @@ func (s *Scheduler) Stop() {
 
 	s.running = false
 	s.logger.Info().Msg("Compaction scheduler stopped")
+}
+
+// signalStop tells this scheduler's deferred ticks to stop waiting, without
+// waiting for anything: StopAll signals every scheduler before stopping any.
+func (s *Scheduler) signalStop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.signalStopLocked()
+}
+
+func (s *Scheduler) signalStopLocked() {
+	if s.running && s.stopCh != nil {
+		close(s.stopCh)
+		s.stopCh = nil
+	}
+}
+
+// StopAll stops schedulers that share a Manager. Every one is told to stop
+// before any is waited for: Stop waits for a running cycle, and a deferred
+// tick of a scheduler not yet stopped would wake when that cycle releases the
+// claim and start a new cycle during shutdown (#220). nil entries are skipped.
+func StopAll(schedulers ...*Scheduler) {
+	for _, s := range schedulers {
+		if s != nil {
+			s.signalStop()
+		}
+	}
+	for _, s := range schedulers {
+		if s != nil {
+			s.Stop()
+		}
+	}
 }
 
 // tick is what a cron tick runs. stop ends a tick still waiting for the claim.
@@ -300,6 +345,15 @@ func (s *Scheduler) runDeferredTick(stop <-chan struct{}) {
 
 	expired := time.NewTimer(time.Until(next))
 	defer expired.Stop()
+	skipped := func() {
+		for _, tier := range s.tierNames {
+			metrics.Get().IncCompactionScheduledSkips(tier)
+		}
+		s.logger.Warn().
+			Strs("tiers", s.tierNames).
+			Time("next_run", next).
+			Msg("Scheduled compaction skipped: a cycle held the claim until the next tick (see arc_compaction_scheduled_skips_total)")
+	}
 	for {
 		// Taken before the attempt: a release after the attempt fails closes
 		// this signal, so it cannot be missed. Another scheduler can win the
@@ -310,22 +364,27 @@ func (s *Scheduler) runDeferredTick(stop <-chan struct{}) {
 			return
 		default:
 		}
+		// The next tick stands for itself from here: a release and the
+		// deadline can be ready together, and the wait below picks either.
+		select {
+		case <-expired.C:
+			skipped()
+			return
+		default:
+		}
 		if !s.tickAllowed() {
 			return
 		}
 		if !errors.Is(s.runScheduledCycle(), ErrCycleAlreadyRunning) {
 			return
 		}
+		if s.afterClaimRefusedForTest != nil {
+			s.afterClaimRefusedForTest()
+		}
 		select {
 		case <-released:
 		case <-expired.C:
-			for _, tier := range s.tierNames {
-				metrics.Get().IncCompactionScheduledSkips(tier)
-			}
-			s.logger.Warn().
-				Strs("tiers", s.tierNames).
-				Time("next_run", next).
-				Msg("Scheduled compaction skipped: a cycle held the claim until the next tick (see arc_compaction_scheduled_skips_total)")
+			skipped()
 			return
 		case <-stop:
 			return

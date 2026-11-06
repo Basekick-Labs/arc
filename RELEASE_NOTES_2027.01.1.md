@@ -2879,21 +2879,27 @@ an unbounded operation.
 The hourly and daily compaction schedulers share one cycle claim with the manual
 trigger. A tick that found the claim held logged an Info line and did nothing
 until its next tick, which costs the hourly tier an hour and the daily tier a
-day. If the collision repeats, daily compaction never runs. It takes schedules
-that share a minute, a raised `compaction.cycle_timeout`, or a manual cycle at
-the tick; the default schedules do not collide.
+day. If the collision repeats, daily compaction never runs. At the default
+schedules it happens whenever the 03:00 daily cycle is still running at the
+03:05 hourly tick; schedules that share a minute, a raised
+`compaction.cycle_timeout` or a manual cycle at the tick cause it too.
 
 Such a tick now runs once, as soon as the claim is released. It passes the same
 compactor lease and cluster-wide pause checks as any tick when it does. It gives
 up at the scheduler's next tick, and a tick lost that way is logged at Warn and
-counted in the new `arc_compaction_scheduled_skips_total{tier}`. The schedules,
-the per-tier API trigger and the status endpoint are unchanged.
+counted in the new `arc_compaction_scheduled_skips_total{tier}`. If the claim is
+released just before that next tick, the deferred run starts and the next tick
+waits behind it, so the tier runs twice in a row. Stopping compaction, at
+shutdown or when this node loses the compactor lease, tells both schedulers to
+stop before waiting for either, so a waiting tick never starts a cycle then.
+The schedules, the per-tier API trigger and the status endpoint are
+unchanged.
 
 This also removes a rare deadlock: `Stop` could wait forever for a tick that had
 just started, which was itself waiting for the lock `Stop` held.
 
-Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
-[#1507](https://github.com/Basekick-Labs/arc/pull/1507).
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar)
+([#1507](https://github.com/Basekick-Labs/arc/pull/1507)).
 
 ### `allow_unreachable=true` stops waiting for files nothing is delivering ([#1426](https://github.com/Basekick-Labs/arc/issues/1426))
 

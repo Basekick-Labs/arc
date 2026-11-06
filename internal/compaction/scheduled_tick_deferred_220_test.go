@@ -354,3 +354,98 @@ func TestCycleReleaseSignal(t *testing.T) {
 	default:
 	}
 }
+
+// The release signal is taken before the claim attempt: a release that lands
+// between a refused attempt and the wait still wakes the tick, which then
+// runs. Taken after the attempt, the signal would be one no release closes,
+// and the tick would wait for its next tick.
+func TestDeferredTickSeesAReleaseBetweenItsAttemptAndItsWait(t *testing.T) {
+	r := newDeferredTickRig(t, "daily", nil)
+	r.sched.nextTickForTest = func() time.Time { return time.Now().Add(2 * time.Second) }
+	var once sync.Once
+	r.sched.afterClaimRefusedForTest = func() { once.Do(r.claim.Release) }
+	awaitTick(t, r.tick())
+	if got := scheduledCycles(r.manager); len(got) != 1 {
+		t.Fatalf("cycles: %v, want the deferred tick's one", got)
+	}
+	if strings.Contains(r.logs.String(), "Scheduled compaction skipped") {
+		t.Fatal("the tick waited for its next tick")
+	}
+}
+
+// Stop and a release ready together: the check before each attempt stops the
+// tick whichever the wait picked, so no cycle starts after Stop.
+func TestStoppedDeferredTickNeverRunsOnARelease(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		r := newDeferredTickRig(t, "hourly", nil)
+		var once sync.Once
+		r.sched.afterClaimRefusedForTest = func() {
+			once.Do(func() {
+				close(r.stop)
+				r.claim.Release()
+			})
+		}
+		awaitTick(t, r.tick())
+		if got := scheduledCycles(r.manager); len(got) != 0 {
+			t.Fatalf("run %d: a cycle started after Stop: %v", i, got)
+		}
+	}
+}
+
+// The deadline and a release ready together: the check before each attempt
+// gives the tick up, so it never runs after its next tick has fired.
+func TestDeferredTickPastItsNextTickNeverRuns(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		r := newDeferredTickRig(t, "hourly", nil)
+		r.sched.nextTickForTest = func() time.Time { return time.Now().Add(20 * time.Millisecond) }
+		var once sync.Once
+		r.sched.afterClaimRefusedForTest = func() {
+			once.Do(func() {
+				time.Sleep(40 * time.Millisecond) // past the next tick
+				r.claim.Release()
+			})
+		}
+		awaitTick(t, r.tick())
+		if got := scheduledCycles(r.manager); len(got) != 0 {
+			t.Fatalf("run %d: a tick ran after its next tick: %v", i, got)
+		}
+	}
+}
+
+// StopAll tells every scheduler to stop before waiting for any: when the
+// first waits for its running cycle, whose end releases the claim, a deferred
+// tick of the second must already have been told to stop, or it would start a
+// cycle of its own during shutdown.
+func TestStopAllSignalsEverySchedulerBeforeWaiting(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	t.Cleanup(cleanup)
+	manager.ManifestManager = nil
+	newSched := func(tier string) *Scheduler {
+		s, err := NewScheduler(&SchedulerConfig{Manager: manager, Schedule: "5 * * * *", TierNames: []string{tier}, Enabled: true, Logger: zerolog.New(&syncBuffer{})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	hourly, daily := newSched("hourly"), newSched("daily")
+	dailyStop := daily.stopCh
+	signalled := func(ch chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+	var hourlyWaitSawDaily, dailyWaitSawHourly bool
+	hourlyStop := hourly.stopCh
+	hourly.beforeStopWaitForTest = func() { hourlyWaitSawDaily = signalled(dailyStop) }
+	daily.beforeStopWaitForTest = func() { dailyWaitSawHourly = signalled(hourlyStop) }
+	StopAll(hourly, daily)
+	if !hourlyWaitSawDaily || !dailyWaitSawHourly {
+		t.Fatalf("a scheduler waited before the other was told to stop (hourly saw daily %v, daily saw hourly %v)", hourlyWaitSawDaily, dailyWaitSawHourly)
+	}
+}
