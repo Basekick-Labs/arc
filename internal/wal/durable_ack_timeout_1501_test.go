@@ -207,7 +207,11 @@ func TestDurableAckTimeoutOnAMultiChunkAppendDoesNotWaitOnTheDevice(t *testing.T
 	elapsed := time.Since(start)
 	require.ErrorIs(t, err, ErrNotDurable)
 	require.ErrorIs(t, err, errAckTimeout)
-	require.Less(t, elapsed, 2*time.Second, "the admitted chunk's retraction must not wait on the device")
+	// The bound guards against the unbounded wait on the writer mutex the
+	// stalled loop holds (the mutation runs to the test timeout); the time
+	// measured also includes splitting the payload into chunks, which under
+	// -race on a slow runner takes seconds by itself.
+	require.Less(t, elapsed, 10*time.Second, "the admitted chunk's retraction must not wait on the device")
 	require.Equal(t, int64(1), atomic.LoadInt64(&w.DurableAckTimeouts), "one timeout per append")
 	require.Equal(t, int64(1), atomic.LoadInt64(&w.RetractionsFailed), "the full queue refused the retraction: counted, the chunk may replay")
 	require.Equal(t, 0, w.PendingUnflushedCount(), "the admitted chunk was released")
