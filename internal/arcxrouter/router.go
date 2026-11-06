@@ -552,7 +552,7 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 		// re-serialized by matchProjFunc (`length(col)`, 2f-0). Re-validate both here
 		// (defense in depth vs a hand-built Decision) — a bare ident, or a proj-func
 		// item whose form re-parses cleanly.
-		if !isBareIdent(col) && !isProjFuncItem(col) {
+		if !isColumnRef(col) && !isProjFuncItem(col) {
 			return "", false
 		}
 		if i > 0 {
@@ -573,7 +573,7 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	} else if len(d.Preds) > 0 {
 		b.WriteString(" WHERE ")
 		for i, p := range d.Preds {
-			if !isBareIdent(p.col) {
+			if !isColumnRef(p.col) {
 				return "", false
 			}
 			if i > 0 {

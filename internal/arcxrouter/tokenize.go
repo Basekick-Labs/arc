@@ -69,9 +69,12 @@ func tokenize(sql string) ([]token, bool) {
 			// shape consumes them, so it declines.
 			toks = append(toks, token{kind: tokIntDiv})
 			i += 2
-		case c == '(' || c == ')' || c == '*' || c == ',' || c == '+' || c == '/':
+		case c == '(' || c == ')' || c == '*' || c == ',' || c == '+' || c == '/' || c == '[' || c == ']':
 			// `+`/`/` for 2e DOUBLE arith in WHERE (`*` was already here for SELECT *
 			// / count(*) AND doubles as arith-multiply by position, same as the engine).
+			// `[`/`]` for the map subscript `col['key']` (map-1); only readColumnRef
+			// consumes them, so a bracket anywhere else leaves an unconsumed token and
+			// the shape declines, exactly as before they were lexable.
 			toks = append(toks, token{kind: tokPunct, punct: c})
 			i++
 		case c == '=':
@@ -261,6 +264,38 @@ func isZeroFloatLiteral(s string) bool {
 type cursor struct {
 	toks []token
 	i    int
+	// sawSubscript records that readColumnRef produced a map subscript somewhere in
+	// this cursor's walk. Shapes the engine does not serve derived columns in (the
+	// grouped aggregate) check it after re-serializing their WHERE and decline.
+	sawSubscript bool
+}
+
+// readColumnRef completes a column reference whose identifier token `t` was just
+// consumed: with no `[` following it is the bare identifier; with `[ 'key' ]` it is
+// the map subscript spelled `ident['key']` — the engine's canonical form
+// (arcx/src/parse.rs finish_column_ref) and DuckDB's output column name for it.
+// Mirrors the engine's declines exactly: the key must be a string literal without
+// `'` or `\` (no escaping rules to get wrong), the subscript must close, and a
+// second `[` (nested) is not a column reference. A bracket that does not complete
+// a subscript leaves the cursor consumed past it and returns false, so the caller
+// declines.
+func readColumnRef(c *cursor, t token) (string, bool) {
+	if c.i >= len(c.toks) || c.toks[c.i].kind != tokPunct || c.toks[c.i].punct != '[' {
+		return t.orig, true
+	}
+	c.i++ // consume `[`
+	keyT, ok := c.next()
+	if !ok || keyT.kind != tokStr || strings.ContainsAny(keyT.str, "'\\") {
+		return "", false
+	}
+	if !c.punct(']') {
+		return "", false
+	}
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '[' {
+		return "", false
+	}
+	c.sawSubscript = true
+	return t.orig + "['" + keyT.str + "']", true
 }
 
 func (c *cursor) next() (token, bool) {
@@ -962,6 +997,12 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		if !wok {
 			return fail()
 		}
+		// The engine does not serve a map subscript in a grouped shape (map-1:
+		// `bind_grouped_agg` never extends the union with derived columns) — do not
+		// route what it will decline.
+		if c.sawSubscript {
+			return fail()
+		}
 		whereText = wt
 	}
 	if !c.ident("group") || !c.ident("by") {
@@ -1159,7 +1200,12 @@ func matchScan(toks []token) (cols []string, preds []scanPred, whereText string,
 			}
 			cols = append(cols, item)
 		} else {
-			cols = append(cols, t.orig)
+			// A bare column or a map subscript `col['key']` (map-1).
+			ref, ok := readColumnRef(c, t)
+			if !ok {
+				return fail()
+			}
+			cols = append(cols, ref)
 		}
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
@@ -1196,6 +1242,13 @@ func matchScan(toks []token) (cols []string, preds []scanPred, whereText string,
 			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
 				return fail()
 			}
+			// A map subscript `col['key']` is a column reference here too (map-1); the
+			// pred carries its spelling and buildScanSQL re-validates it.
+			colRef, ok := readColumnRef(c, colT)
+			if !ok {
+				return fail()
+			}
+			colT.orig = colRef
 			// Branch: `IS [NOT] NULL` / `BETWEEN lo AND hi` / `<op> <literal>`.
 			if c.peekIdentLower() == "is" {
 				c.next() // consume `is`
@@ -1678,15 +1731,25 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
 		return false
 	}
-	b.WriteString(colT.orig)
+	// A map subscript `col['key']` (map-1) is an atom head like a bare column.
+	colRef, ok := readColumnRef(c, colT)
+	if !ok {
+		return false
+	}
+	isSubscript := colRef != colT.orig
+	b.WriteString(colRef)
 
 	// 2e: `<col> (+|-|*|/) <num> <op> <num>` — an arith punct right after the column. Re-emit
 	// verbatim (both engines parse identically); the engine owns the Float64 type-gate, the
 	// signed-zero normalization, AND the `-0.0`-divisor fold. `/` is true division (any divisor
 	// incl. zero); `//` (floor-div) declines because its lexed second `/` fails isNumericTok —
-	// exactly mirroring the engine's match_arith_literal decline.
+	// exactly mirroring the engine's match_arith_literal decline. Arithmetic on a map
+	// subscript (a VARCHAR) declines in the engine; decline it here too.
 	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct {
 		if ap := c.toks[c.i].punct; ap == '+' || ap == '-' || ap == '*' || ap == '/' {
+			if isSubscript {
+				return false
+			}
 			c.next() // consume the arith punct
 			arithLit, ok := c.next()
 			if !ok || !isNumericTok(arithLit) {
