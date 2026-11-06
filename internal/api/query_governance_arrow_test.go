@@ -24,7 +24,7 @@ func TestExecuteQueryArrowGovernanceRateLimit(t *testing.T) {
 	app := newGovernanceTestApp(t, h, &auth.TokenInfo{ID: 42, Name: "limited"}, nil, nil)
 	app.Post("/api/v1/query/arrow", h.executeQueryArrow)
 
-	if res := m.CheckRateLimit(42); !res.Allowed {
+	if res := m.Admit(42); !res.Allowed {
 		t.Fatal("precondition failed: first rate-limit slot should be allowed")
 	}
 

@@ -18,13 +18,18 @@ type quotaTracker struct {
 }
 
 func newQuotaTracker(maxPerHour, maxPerDay int) *quotaTracker {
-	now := time.Now()
+	return newQuotaTrackerWithClock(maxPerHour, maxPerDay, time.Now)
+}
+
+// newQuotaTrackerWithClock is newQuotaTracker reading the clock now.
+func newQuotaTrackerWithClock(maxPerHour, maxPerDay int, clock func() time.Time) *quotaTracker {
+	now := clock()
 	return &quotaTracker{
 		maxPerHour:  maxPerHour,
 		maxPerDay:   maxPerDay,
 		hourResetAt: now.Truncate(time.Hour).Add(time.Hour),
 		dayResetAt:  now.Truncate(24 * time.Hour).Add(24 * time.Hour),
-		now:         time.Now,
+		now:         clock,
 	}
 }
 
@@ -49,18 +54,43 @@ func (q *quotaTracker) AllowQuery() (bool, string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.maybeReset()
+	if ok, reason := q.admitsLocked(); !ok {
+		return false, reason
+	}
+	q.recordLocked()
+	return true, ""
+}
 
+// admits reports whether a query would pass the quotas now, without counting
+// it (#1524), and why not.
+func (q *quotaTracker) admits() (bool, string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.admitsLocked()
+}
+
+// record counts a query that every limit admitted.
+func (q *quotaTracker) record() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.recordLocked()
+}
+
+func (q *quotaTracker) admitsLocked() (bool, string) {
+	q.maybeReset()
 	if q.maxPerHour > 0 && q.queriesThisHour >= q.maxPerHour {
 		return false, "Hourly query quota exceeded"
 	}
 	if q.maxPerDay > 0 && q.queriesThisDay >= q.maxPerDay {
 		return false, "Daily query quota exceeded"
 	}
+	return true, ""
+}
 
+func (q *quotaTracker) recordLocked() {
+	q.maybeReset()
 	q.queriesThisHour++
 	q.queriesThisDay++
-	return true, ""
 }
 
 // RetryAfterSec returns the number of seconds until a query can pass every quota
