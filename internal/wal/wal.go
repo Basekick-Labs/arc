@@ -2310,9 +2310,13 @@ func (w *Writer) trackedTokenSeq(token string) (uint64, bool) {
 }
 
 // coversForeignIdentity reports whether any identity in a checkpoint batch
-// describes an entry this process did not write: a row-range identity (which by
-// construction covers part of an entry recovery replayed), or a whole-entry
-// token minted by an earlier writer instance.
+// describes an entry this process did not write: a whole-entry token minted by
+// an earlier writer instance, or a row-range identity of such a token. A row
+// range of this process's own entry is not foreign: a multi-hour flush writes
+// one for each hour file it stores (#1492), and recovery of this process's
+// own files writes them too. Its parent's sequence stays pending until the
+// parent is checkpointed, so the parent's file stops the purge walk by itself
+// (PurgeFlushed) and the proof needs no pin.
 //
 // The file such a checkpoint lands in must not be purged by sequence while an
 // earlier process's WAL file remains — the entries it vouches for can live in
@@ -2320,8 +2324,14 @@ func (w *Writer) trackedTokenSeq(token string) (uint64, bool) {
 // reach them to stop there.
 func (w *Writer) coversForeignIdentity(hashes []string) bool {
 	for _, h := range hashes {
+		if parent, _, _, ok := ParseRecoveryRowIdentity(h); ok {
+			if _, ours := w.trackedTokenSeq(parent); !ours {
+				return true
+			}
+			continue
+		}
 		if strings.HasPrefix(h, recoveryRowPrefix) {
-			return true
+			return true // a malformed row identity: pin rather than guess
 		}
 		if len(h) == 32 {
 			if _, ours := w.trackedTokenSeq(h); !ours {
