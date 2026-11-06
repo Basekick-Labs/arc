@@ -181,8 +181,10 @@ func TestManager_CheckRateLimit_WithPolicy(t *testing.T) {
 	if result.Allowed {
 		t.Fatal("expected Allowed=false after exceeding rate limit")
 	}
-	if result.RetryAfterSec < 1 {
-		t.Fatalf("expected RetryAfterSec >= 1, got %d", result.RetryAfterSec)
+	// The three requests above landed together, so nothing frees up until they
+	// leave the one-minute window.
+	if result.RetryAfterSec < 50 || result.RetryAfterSec > 60 {
+		t.Fatalf("expected RetryAfterSec near 60 after a burst, got %d", result.RetryAfterSec)
 	}
 }
 
@@ -231,6 +233,9 @@ func TestManager_CheckQuota_WithPolicy(t *testing.T) {
 	result := m.CheckQuota(1)
 	if result.Allowed {
 		t.Fatal("expected Allowed=false after exceeding hourly quota")
+	}
+	if result.RetryAfterSec < 1 || result.RetryAfterSec > 3600 {
+		t.Fatalf("expected RetryAfterSec to be the wait for the next hour, got %d", result.RetryAfterSec)
 	}
 }
 

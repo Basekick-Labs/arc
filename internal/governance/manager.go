@@ -388,8 +388,9 @@ func (m *Manager) CheckQuota(tokenID int64) *EnforcementResult {
 		allowed, reason := tracker.AllowQuery()
 		if !allowed {
 			return &EnforcementResult{
-				Allowed: false,
-				Reason:  reason,
+				Allowed:       false,
+				Reason:        reason,
+				RetryAfterSec: tracker.RetryAfterSec(),
 			}
 		}
 	}

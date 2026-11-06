@@ -2964,6 +2964,30 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: a governance 429 says when a retry can succeed ([#1519](https://github.com/Basekick-Labs/arc/issues/1519))
+
+With query governance on, a refused query's `Retry-After` was wrong or missing:
+
+- **A rate limit** answered with the time left in the window's current slot, so
+  `Retry-After: 1` after a burst on a per-minute limit and at most `60` on a
+  per-hour limit, whatever the limit's real state. A client that honoured it
+  was refused again each time it came back, about 60 times per window, each a
+  log warning and a count in the rate-limit metric. It now answers with the
+  time until enough of the oldest requests have left the window to bring the
+  count under the limit: about 60 seconds after a burst on a per-minute limit.
+- **A quota** (`max_queries_per_hour`, `max_queries_per_day`) answered with no
+  `Retry-After` at all. It now carries the seconds until the exhausted quota
+  resets, or until the daily reset when both are exhausted. The rejection's log
+  line gains the `retry_after_sec` field the rate-limit line already has.
+
+A quota now resets exactly on the hour or day boundary, not just after it, so a
+client that waits exactly `Retry-After` seconds is not refused. Which queries are
+allowed is otherwise unchanged. Clients that retry on `Retry-After` will retry
+later than they did, and less often.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1520](https://github.com/Basekick-Labs/arc/pull/1520).
+
 ### A scheduled compaction that finds a cycle running runs when it ends ([#220](https://github.com/Basekick-Labs/arc/issues/220))
 
 The hourly and daily compaction schedulers share one cycle claim with the manual
