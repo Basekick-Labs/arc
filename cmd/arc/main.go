@@ -1983,11 +1983,6 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to start hourly compaction scheduler")
 			}
 
-			shutdownCoordinator.RegisterHook("hourly-compaction-scheduler", func(ctx context.Context) error {
-				hourlyScheduler.Stop()
-				return nil
-			}, shutdown.PriorityScheduler)
-
 			log.Info().
 				Str("schedule", cfg.Compaction.HourlySchedule).
 				Msg("Hourly compaction scheduler started")
@@ -2011,14 +2006,19 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to start daily compaction scheduler")
 			}
 
-			shutdownCoordinator.RegisterHook("daily-compaction-scheduler", func(ctx context.Context) error {
-				dailyScheduler.Stop()
-				return nil
-			}, shutdown.PriorityScheduler)
-
 			log.Info().
 				Str("schedule", cfg.Compaction.DailySchedule).
 				Msg("Daily compaction scheduler started")
+		}
+
+		// One hook for both: they share a cycle claim, and stopping one while
+		// the other's deferred tick still waits lets that tick start a cycle
+		// mid-shutdown when the first's cycle ends (#220).
+		if hourlyScheduler != nil || dailyScheduler != nil {
+			shutdownCoordinator.RegisterHook("compaction-schedulers", func(ctx context.Context) error {
+				compaction.StopAll(hourlyScheduler, dailyScheduler)
+				return nil
+			}, shutdown.PriorityScheduler)
 		}
 
 		log.Info().
@@ -2565,12 +2565,7 @@ func main() {
 								func() {
 									// OnLoseCompactor: stop scheduler + watcher
 									log.Info().Msg("Phase 5: this node lost the active compactor lease — stopping compaction")
-									if hourlyScheduler != nil {
-										hourlyScheduler.Stop()
-									}
-									if dailyScheduler != nil {
-										dailyScheduler.Stop()
-									}
+									compaction.StopAll(hourlyScheduler, dailyScheduler) // both told before either waits (#220)
 									if !isDedicatedCompactor {
 										watcher.Stop()
 									}
