@@ -3,6 +3,7 @@ package license
 import (
 	"context"
 	"encoding/json"
+	"github.com/rs/zerolog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -99,18 +100,69 @@ func resetClock(t *testing.T) {
 	})
 }
 
-// A mark saved ahead of the wall clock (the clock was set back since) holds
-// the license clock there; a corrupt or missing file starts from the wall
-// clock; what is saved is the monotonic estimate, never the wall clock.
+func readMark(t *testing.T, dir string) (time.Time, bool) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, clockFileName))
+	if err != nil {
+		return time.Time{}, false
+	}
+	var f struct {
+		HighWater time.Time `json:"high_water"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	return f.HighWater, true
+}
+
+// The mark comes only from server time (or a signed issue time) and advances
+// by monotonic time: the host clock is never written into it, so a clock fast
+// at startup and corrected later is not held against the license. A mark
+// saved ahead of the wall clock (the clock was set back since) holds the
+// license clock there; a corrupt or missing file means no mark.
 func TestLicenseClockGuard(t *testing.T) {
 	resetClock(t)
 	dir := t.TempDir()
+
+	// No file, no server time: nothing is saved, the license clock is the
+	// wall clock. (A host clock fast at this point is therefore never kept.)
+	if ahead := InitClock(dir); ahead != 0 {
+		t.Fatalf("ahead %v with no file", ahead)
+	}
+	clockMu.Lock()
+	clockSave = time.Time{}
+	clockMu.Unlock()
+	if err := saveClock(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readMark(t, dir); ok {
+		t.Fatal("a mark was saved before any server time was seen")
+	}
+
+	// Server time sets the mark; it is saved, and never lowered.
+	server := time.Now().Add(-10 * time.Minute)
+	AdvanceClock(server)
+	AdvanceClock(server.Add(-time.Hour))
+	if err := saveClock(); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := readMark(t, dir)
+	if !ok || m.Before(server) || m.After(server.Add(time.Minute)) {
+		t.Fatalf("saved mark %v (ok %v), want from the server time %v", m, ok, server)
+	}
+	if st, _ := os.Stat(filepath.Join(dir, clockFileName)); st.Mode().Perm() != 0o600 {
+		t.Fatalf("mark file mode %v", st.Mode().Perm())
+	}
+
+	// A saved mark ahead of the wall clock: the clock was set back since.
 	ahead := time.Now().Add(48 * time.Hour).UTC()
 	b, _ := json.Marshal(map[string]time.Time{"high_water": ahead})
 	if err := os.WriteFile(filepath.Join(dir, clockFileName), b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	InitClock(dir)
+	if d := InitClock(dir); d < 47*time.Hour {
+		t.Fatalf("ahead %v, want ~48h", d)
+	}
 	if got := licenseNow(); got.Before(ahead) {
 		t.Fatalf("licenseNow %v is before the saved mark %v", got, ahead)
 	}
@@ -119,37 +171,14 @@ func TestLicenseClockGuard(t *testing.T) {
 		t.Fatal("a clock set back made a license expired by the mark valid")
 	}
 
+	// A corrupt file: no mark.
+	clock.Store(nil)
 	if err := os.WriteFile(filepath.Join(dir, clockFileName), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	InitClock(dir)
 	if d := licenseNow().Sub(time.Now()); d < -time.Second || d > time.Second {
 		t.Fatalf("corrupt file: licenseNow off the wall clock by %v", d)
-	}
-
-	// The mark trails the wall clock (the host was off); a save writes the
-	// monotonic estimate, so a wall clock ahead of it is not persisted.
-	behind := time.Now().Add(-time.Hour)
-	clock.Store(&clockState{loaded: behind, base: time.Now()})
-	clockMu.Lock()
-	clockSave = behind.Add(-time.Hour)
-	clockMu.Unlock()
-	saveClock()
-	raw, err := os.ReadFile(filepath.Join(dir, clockFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var f struct {
-		HighWater time.Time `json:"high_water"`
-	}
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatal(err)
-	}
-	if f.HighWater.After(time.Now().Add(-50 * time.Minute)) {
-		t.Fatalf("saved %v: the wall clock leaked into the mark", f.HighWater)
-	}
-	if st, _ := os.Stat(filepath.Join(dir, clockFileName)); st.Mode().Perm() != 0o600 {
-		t.Fatalf("mark file mode %v", st.Mode().Perm())
 	}
 }
 
@@ -166,6 +195,7 @@ func TestReactivationRefusedPastTermKeepsGrace(t *testing.T) {
 		{"paid in grace, refused as expired", false, "license has expired", true},
 		{"trial past expiry", true, "license has expired", false},
 		{"paid in grace, suspended", false, "license is not active", false},
+		{"paid in grace, refusal only containing the text", false, "license has expired; contact sales", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -231,5 +261,41 @@ func TestWritesStoppedFollowsThePhase(t *testing.T) {
 	var nilClient *Client
 	if nilClient.WritesStopped() {
 		t.Fatal("nil client stopped writes")
+	}
+}
+
+// An offline license file loads through its grace period, and /health shows
+// the grace fields; the boot path reports a license kept from the cache after
+// a refused re-activation as coming from the cache.
+func TestGraceOfflineFileHealthAndBootSource(t *testing.T) {
+	withTestPublicKey(t, &rsaKey1.PublicKey)
+	lf, sig := signDetached(t, rsaKey1, &SignedLicense{Version: 1, LicenseKey: "ARC-ENT-SITE-KEY", CustomerID: "cust_site",
+		Tier: TierEnterprise, ExpiresAt: time.Now().Add(-2 * 24 * time.Hour)})
+	path := writeOfflineFile(t, `{"license_file":"`+lf+`","license_signature":"`+sig+`"}`)
+	c, err := NewOfflineClient(path, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("offline file in grace refused: %v", err)
+	}
+	h := c.HealthStatus()
+	if h.Status != "grace_period" || h.GraceDay == nil || h.WritesStopAt == nil || h.Cutoff == nil {
+		t.Fatalf("health in grace: %+v", h)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/verify") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"valid": false, "error": "activation has been revoked"})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "license has expired"})
+	}))
+	defer ts.Close()
+	cl := newTestClient(t, ts.URL, t.TempDir())
+	lf, sig = signDetached(t, rsaKey1, &SignedLicense{Version: 1, LicenseKey: cl.licenseKey, CustomerID: "cust_test",
+		Tier: TierEnterprise, MachineFingerprint: cl.fingerprint, ExpiresAt: time.Now().Add(-3 * 24 * time.Hour)})
+	cl.saveCache(lf, sig)
+	lic, src, err := cl.ActivateOrVerifyResilient(context.Background())
+	if err != nil || lic == nil || src != SourceCache {
+		t.Fatalf("boot in grace after a refused re-activation: lic=%v src=%s err=%v", lic, src, err)
 	}
 }

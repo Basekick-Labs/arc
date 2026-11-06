@@ -65,16 +65,10 @@ func (s *SignedLicense) ToRuntimeLicense(now time.Time) *License {
 	}
 }
 
-// deriveStatus computes Status + DaysRemaining from the signed
-// ExpiresAt + the current time:
-//   - ExpiresAt in the past   → "expired"
-//   - ExpiresAt in the future → "active"
-//
-// We deliberately don't implement a grace period client-side: if the
-// signed ExpiresAt is in the past, the license is expired. The server
-// can grant a different status in its unsigned envelope (e.g. for
-// billing-grace UX) but Arc's feature gates use the strict signed
-// expiry to prevent trust escalation through the unsigned envelope.
+// deriveStatus computes Status + DaysRemaining from the signed ExpiresAt
+// and CustomerID and the given time, on Arc's own grace schedule (grace.go):
+// active, grace_period, writes_stopped or expired. The unsigned envelope's
+// status is never used: the gates read the signed fields only.
 func (s *SignedLicense) deriveStatus(now time.Time) (string, int) {
 	return expiryStatus(s.ExpiresAt, strings.HasPrefix(s.CustomerID, TrialCustomerPrefix), now)
 }

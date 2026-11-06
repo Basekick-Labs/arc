@@ -506,7 +506,7 @@ func respondIngestRefused(c *fiber.Ctx, err error) error {
 	ingest.LogRefusal(c.Path(), err)
 	c.Locals(ingestRefusedLocal, true)
 	c.Set(IngestRefusedHeader, reason)
-	if reason == ingest.RefusalLicenseGrace || reason == "forwarded_"+ingest.RefusalLicenseGrace {
+	if reason == ingest.RefusalLicenseGrace {
 		// Not a moment's condition: it lasts until the license is renewed or
 		// its grace period ends. A long Retry-After keeps clients from
 		// hammering, and 503 keeps them retrying rather than dropping data.

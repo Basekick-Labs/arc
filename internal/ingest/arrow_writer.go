@@ -3168,10 +3168,6 @@ var ErrIngestFenced = errors.New("ingest fenced: this node is not an available p
 // record is refused on every attempt.
 var ErrUnstorableColumnValue = errors.New("column value cannot be stored")
 
-// SetIngestGate installs the check every live write passes before anything is
-// written, the WAL included (#1207). It returns nil to admit, or an error
-// wrapping ErrIngestFenced. Replay, recovery and replication paths are never
-// gated.
 // SetLicenseWriteGate installs the license's ingestion stop: stopped reports
 // whether live writes are refused (grace days 7-14). nil removes it.
 func (b *ArrowBuffer) SetLicenseWriteGate(stopped func() bool) {
@@ -3182,6 +3178,10 @@ func (b *ArrowBuffer) SetLicenseWriteGate(stopped func() bool) {
 	b.licenseWriteGate.Store(&stopped)
 }
 
+// SetIngestGate installs the check every live write passes before anything is
+// written, the WAL included (#1207). It returns nil to admit, or an error
+// wrapping ErrIngestFenced. Replay, recovery and replication paths are never
+// gated.
 func (b *ArrowBuffer) SetIngestGate(gate func() error) {
 	b.ingestGate.Store(&gate)
 }

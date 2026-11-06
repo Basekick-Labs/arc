@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"strconv"
 	"time"
 
@@ -55,6 +56,8 @@ type EdgeSyncHandler struct {
 	hubID        string
 	maxFileBytes int64
 	logger       zerolog.Logger
+	// writesStopped: see EdgeSyncHandlerConfig.WritesStopped.
+	writesStopped func() bool
 }
 
 // EdgeSyncHandlerConfig configures the handler.
@@ -82,6 +85,11 @@ type EdgeSyncHandlerConfig struct {
 
 	AuthManager *auth.AuthManager
 	Logger      zerolog.Logger
+
+	// WritesStopped, when set, reports whether the expired license's grace
+	// period stops ingestion (days 7-14); a pushed file is then refused like
+	// any live write. nil never refuses.
+	WritesStopped func() bool
 }
 
 // NewEdgeSyncHandler validates configuration and returns a ready handler.
@@ -118,7 +126,8 @@ func NewEdgeSyncHandler(cfg EdgeSyncHandlerConfig) (*EdgeSyncHandler, error) {
 		hubID:        cfg.HubID,
 		maxFileBytes: cfg.MaxFileBytes,
 		// logger.Get already sets component; adding it again duplicates the key.
-		logger: cfg.Logger,
+		logger:        cfg.Logger,
+		writesStopped: cfg.WritesStopped,
 	}, nil
 }
 
@@ -175,6 +184,11 @@ func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 
 // receiveFile handles POST /api/v1/sync/file.
 func (h *EdgeSyncHandler) receiveFile(c *fiber.Ctx) error {
+	// A pushed file is ingestion: refused on grace days 7-14 of an expired
+	// license, as every live write is, before anything is read or stored.
+	if h.writesStopped != nil && h.writesStopped() {
+		return respondIngestRefused(c, ingest.ErrLicenseWritesStopped)
+	}
 	// Size check FIRST, before anything else touches the request.
 	//
 	// The Fiber app runs with StreamRequestBody=false, so fasthttp has already

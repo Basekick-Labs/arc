@@ -89,6 +89,14 @@ var (
 	effectiveCoresFn = config.EffectiveCores
 )
 
+// applyLicenseCoreLimitsIfValid applies the license's core limits unless it is
+// already expired past its grace period, when the node runs as OSS.
+func applyLicenseCoreLimitsIfValid(lic *license.License, cfg *config.Config) {
+	if lic.IsValid() {
+		applyLicenseCoreLimits(lic, cfg)
+	}
+}
+
 // applyLicenseCoreLimits enforces lic.MaxCores on every execution surface —
 // Go runtime (GOMAXPROCS), DuckDB native threads (cfg.Database.ThreadCount is
 // the REAL DuckDB enforcement; GOMAXPROCS does not bound CGo threads), and
@@ -108,14 +116,6 @@ var (
 //
 // Core-limit enforcement is boot-time: periodic validation does not reapply
 // these resource limits. Feature entitlement gates check expiry at read time.
-// applyLicenseCoreLimitsIfValid applies the license's core limits unless it is
-// already expired past its grace period, when the node runs as OSS.
-func applyLicenseCoreLimitsIfValid(lic *license.License, cfg *config.Config) {
-	if lic.IsValid() {
-		applyLicenseCoreLimits(lic, cfg)
-	}
-}
-
 func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 	machineCores, effective := numCPUFn(), effectiveCoresFn()
 	// Non-positive MaxCores means unlimited.
@@ -298,7 +298,10 @@ func main() {
 	var licenseClient *license.Client
 	// The license clock's high-water mark lives beside the auth DB in both
 	// license modes: setting the host clock back does not extend a license.
-	license.InitClock(filepath.Dir(cfg.Auth.DBPath))
+	if ahead := license.InitClock(filepath.Dir(cfg.Auth.DBPath)); ahead > 5*time.Minute {
+		log.Warn().Dur("ahead", ahead).
+			Msg("The host clock reads earlier than the license clock's saved mark; the license is judged by the mark (delete license_clock.json beside the auth database if the mark itself is wrong)")
+	}
 	if cfg.License.FilePath != "" {
 		// Offline (air-gapped) license file: verified entirely from disk
 		// against the pinned public key — no license-server dependency, no
@@ -331,7 +334,7 @@ func main() {
 			LicenseKey: cfg.License.Key,
 			// Cache lives next to the auth DB (per-pod volume): boot survives a
 			// transient license-server outage on the last verified license,
-			// honored until ITS OWN expiry. Deliberately inside the Key != ""
+			// honored until its cutoff (signed expiry plus grace). Deliberately inside the Key != ""
 			// branch — removing the key must also stop cache consultation.
 			CacheDir: filepath.Dir(cfg.Auth.DBPath),
 			Logger:   logger.Get("license"),
@@ -355,7 +358,7 @@ func main() {
 					log.Warn().
 						Str("tier", string(lic.Tier)).
 						Time("expires_at", lic.ExpiresAt).
-						Msg("license server unreachable; running on the cached verified license until it expires or the server recovers (background re-verification continues)")
+						Msg("license server unreachable; running on the cached verified license until its grace cutoff or the server recovers (background re-verification continues)")
 				} else if lic.IsValid() {
 					h := licenseClient.HealthStatus()
 					log.Info().
@@ -3216,6 +3219,8 @@ func main() {
 				MaxFileBytes: cfg.EdgeSync.MaxFileBytes,
 				AuthManager:  authManager,
 				Logger:       logger.Get("edgesync"),
+				// Pushed files are ingestion: refused on grace days 7-14.
+				WritesStopped: licenseClient.WritesStopped,
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create edge sync handler; refusing to start")

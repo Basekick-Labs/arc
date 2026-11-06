@@ -19,9 +19,12 @@ type licenseWatch struct {
 	writesStopped atomic.Bool
 	listenerMu    sync.Mutex
 	listener      func(stopped bool) // guarded by listenerMu
-	wake          chan struct{}      // made once by wakeCh
-	wakeOnce      sync.Once
-	started       atomic.Bool
+	// deliverMu serialises calls to the listener, made outside listenerMu
+	// so a slow listener (MQTT reconnects) never blocks registration.
+	deliverMu sync.Mutex
+	wake      chan struct{} // made once by wakeCh
+	wakeOnce  sync.Once
+	started   atomic.Bool
 }
 
 func (w *licenseWatch) wakeCh() chan struct{} {
@@ -41,9 +44,9 @@ func (c *Client) WritesStopped() bool {
 func (c *Client) OnWritesStoppedChange(fn func(stopped bool)) {
 	c.evaluatePhase()
 	c.watch.listenerMu.Lock()
-	defer c.watch.listenerMu.Unlock()
 	c.watch.listener = fn
-	fn(c.watch.writesStopped.Load())
+	c.watch.listenerMu.Unlock()
+	c.deliver(fn)
 }
 
 // notifyLicenseChange asks the watcher to re-read the phase now: the license
@@ -65,11 +68,21 @@ func (c *Client) evaluatePhase() (*License, Phase, int) {
 	}
 	stopped := lic != nil && phase == PhaseWritesStopped
 	c.watch.listenerMu.Lock()
-	if c.watch.writesStopped.Swap(stopped) != stopped && c.watch.listener != nil {
-		c.watch.listener(stopped)
-	}
+	changed := c.watch.writesStopped.Swap(stopped) != stopped
+	fn := c.watch.listener
 	c.watch.listenerMu.Unlock()
+	if changed && fn != nil {
+		c.deliver(fn)
+	}
 	return lic, phase, day
+}
+
+// deliver tells fn the current state. Serialised, and it reads the state at
+// delivery, so two deliveries racing never leave the listener on a stale one.
+func (c *Client) deliver(fn func(bool)) {
+	c.watch.deliverMu.Lock()
+	defer c.watch.deliverMu.Unlock()
+	fn(c.watch.writesStopped.Load())
 }
 
 // StartLicenseWatcher follows the license along its grace schedule in both
@@ -86,9 +99,13 @@ func (c *Client) StartLicenseWatcher() {
 		last := Phase(-1)
 		var lastKey string
 		var lastWarn time.Time
+		saveWarned := false
 		for {
 			lic, phase, day := c.evaluatePhase()
-			saveClock()
+			if err := saveClock(); err != nil && !saveWarned {
+				saveWarned = true
+				c.logger.Warn().Err(err).Msg("Could not save the license clock mark; setting the host clock back is not caught across restarts until it can be saved")
+			}
 			key := ""
 			if lic != nil {
 				key = lic.LicenseKey + "|" + lic.ExpiresAt.String()

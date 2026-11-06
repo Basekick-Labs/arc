@@ -80,6 +80,7 @@ func NewOfflineClient(path string, logger zerolog.Logger) (*Client, error) {
 			return nil, fmt.Errorf("offline license verification failed: %w", err)
 		}
 	}
+	AdvanceClock(signed.IssuedAt) // signed server time: a floor for the license clock
 	now := time.Now().UTC()
 	// Loadable until the cutoff, grace included (grace.go): an air-gapped
 	// site restarted during grace keeps its license.

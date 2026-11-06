@@ -480,7 +480,8 @@ expires, counted from the midnight UTC that follows its expiry. Grace days 1-6
 run as usual; days 4-6 log a warning every hour. On grace days 7-14 Enterprise
 features stay on and live ingestion is refused with `503`,
 `X-Arc-Ingest-Refused: license_grace` and `Retry-After: 300`, counted in
-`arc_license_write_refusals_total`; MQTT subscriptions are suspended so the
+`arc_license_write_refusals_total`, and so are files pushed to an edge-sync
+hub; MQTT subscriptions are suspended so the
 broker holds messages (QoS 1 or 2, `clean_session=false`, within the broker's
 own limits). WAL replay, continuous queries, compaction and retention keep
 running. At the start of day 15 the license expires and every Enterprise gate
@@ -494,15 +495,18 @@ grace. The schedule is computed in Arc from the signed license, the same way
 online and for license files, and needs no license-server change. A restart
 during grace keeps the license (from the verified cache, or the license file),
 and so does the license server refusing to re-activate a license past its
-term. A machine whose fingerprint changed (a rescheduled pod, new hardware)
-cannot activate during grace and starts without Enterprise features. A
-renewal takes effect at the next periodic license check (every 4 hours) or a
-restart.
+term. A machine whose fingerprint changed (a rescheduled pod, new hardware),
+or whose license cache was lost, cannot activate during grace and starts
+without Enterprise features. A renewal takes effect at the next periodic
+license check (every 4 hours) or a restart.
 
 Setting the host clock back does not extend a license: the license clock
 never goes below a high-water mark kept in `license_clock.json` beside the
-auth database. A clock set forward and then corrected is not held against the
-license.
+auth database. The mark comes only from the license server's clock (or a
+license file's signed issue time) and advances by elapsed time, so a host
+clock that is wrong, ahead or behind, is never written into it. Arc logs a
+warning at startup when the host clock reads earlier than the mark; deleting
+the file resets the guard.
 
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 
