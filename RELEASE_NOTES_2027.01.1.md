@@ -44,14 +44,20 @@ What changes with the WAL on:
   duplicate rows (at-least-once). A request spanning several measurements is
   written one at a time; a failure after some were buffered answers `500`
   naming what was written, as for other refusals.
-- **A stalled WAL device stalls writes instead of losing them.** With
+- **A stalled WAL device refuses writes instead of losing them.** With
   `"queued"`, a hung disk meant the WAL queue filled, entries were dropped and
   ingest kept answering 204 for writes that were never durable. With
-  `"durable"` every request waits until its sync completes or the WAL writer
-  closes; the request context does not interrupt that wait. The disk-pressure
-  gate (#676) covers low free space, not a hung device. Watch
-  `arc_wal_failed_syncs_total`, `arc_wal_not_durable_rejections_total` and the
-  `wal_not_durable` refusal log.
+  `"durable"` a request waits for its sync for at most
+  `wal.ack_timeout_seconds` (default 30; `0` = no bound,
+  [#1501](https://github.com/Basekick-Labs/arc/issues/1501)); past that it is
+  refused (`503`, `wal_not_durable`) and its WAL entry retracted without
+  waiting on the device, so the client retries and nothing is left pinned.
+  The disk-pressure gate (#676) covers low free space, not a hung device.
+  Watch `arc_wal_durable_ack_timeouts_total` (a stalled device),
+  `arc_wal_failed_syncs_total` (a failing one),
+  `arc_wal_not_durable_rejections_total` and the `wal_not_durable` refusal
+  log. The HTTP request context plays no part: in Fiber it has no deadline
+  and ends only at server shutdown.
 - **MQTT.** A message refused as not durable is retried for 2 seconds and then
   dropped, as for other refusals; a stalled or failing WAL therefore costs
   MQTT messages where `"queued"` acknowledged them and risked them at the next
