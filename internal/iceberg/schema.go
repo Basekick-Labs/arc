@@ -40,6 +40,17 @@ func SchemaFromParquet(localPath string) (ArcSchema, error) {
 		return ArcSchema{}, fmt.Errorf("open parquet %q: %w", localPath, err)
 	}
 	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return ArcSchema{}, fmt.Errorf("stat parquet %q: %w", localPath, err)
+	}
+	n, err := footerLen(f, st.Size(), localPath)
+	if err != nil {
+		return ArcSchema{}, err
+	}
+	if err := checkFooterLen(n, localPath); err != nil {
+		return ArcSchema{}, err
+	}
 	return schemaFromReader(f, localPath)
 }
 
@@ -70,6 +81,9 @@ func SchemaFromBackend(ctx context.Context, backend storage.Backend, key string,
 		return ArcSchema{}, fmt.Errorf("parquet %q: no Parquet magic at the end of the file", key)
 	}
 	need := int64(binary.LittleEndian.Uint32(trailer[:4])) + parquetTrailerLen
+	if err := checkFooterLen(need-parquetTrailerLen, key); err != nil {
+		return ArcSchema{}, err
+	}
 	if need > size-int64(len(parquetMagic)) {
 		return ArcSchema{}, fmt.Errorf("parquet %q: footer length %d does not fit a %d-byte file", key, need-parquetTrailerLen, size)
 	}
@@ -142,10 +156,56 @@ func (r *tailReader) Seek(offset int64, whence int) (int64, error) {
 	return offset, nil
 }
 
+// newParquetReader opens a Parquet file's footer; a test seam.
+var newParquetReader = file.NewParquetReader
+
+// maxFooterBytes bounds the footer schemaFromReader hands the Parquet
+// library. Arc's footers are a few KiB and a file with thousands of row
+// groups a few MiB; the bound keeps a malformed footer's nesting from
+// recursing the library's schema builder past the stack limit, a fatal error
+// no recover reaches.
+var maxFooterBytes int64 = 16 << 20
+
+// footerLen reads the footer length from a Parquet file's trailer.
+func footerLen(f io.ReaderAt, size int64, name string) (int64, error) {
+	if size < parquetTrailerLen+int64(len(parquetMagic)) {
+		return 0, fmt.Errorf("parquet %q: %d bytes is too small for a Parquet file", name, size)
+	}
+	var trailer [parquetTrailerLen]byte
+	if _, err := f.ReadAt(trailer[:], size-parquetTrailerLen); err != nil {
+		return 0, fmt.Errorf("parquet %q: read trailer: %w", name, err)
+	}
+	if string(trailer[4:]) != parquetMagic {
+		return 0, fmt.Errorf("parquet %q: no Parquet magic at the end of the file", name)
+	}
+	return int64(binary.LittleEndian.Uint32(trailer[:4])), nil
+}
+
+// checkFooterLen refuses a footer over maxFooterBytes.
+func checkFooterLen(n int64, name string) error {
+	if n > maxFooterBytes {
+		return fmt.Errorf("parquet %q: footer of %d bytes is over the %d-byte limit", name, n, maxFooterBytes)
+	}
+	return nil
+}
+
 // schemaFromReader derives the ArcSchema from a Parquet file's footer. name
 // labels errors.
-func schemaFromReader(f parquet.ReaderAtSeeker, name string) (ArcSchema, error) {
-	rdr, err := file.NewParquetReader(f)
+//
+// A malformed footer can panic inside the Parquet library rather than return
+// an error (a length field it trusts for an allocation, for one). The files
+// read here include ones Arc did not write itself, EdgeSync spokes' among
+// them, and the reads run on the reconcile goroutine and on footer-reading
+// worker goroutines, where a panic ends the process; and the file stays in
+// storage, so every restart would reach it again. The panic is returned as
+// this file's error instead, and the measurement fails its pass.
+func schemaFromReader(f parquet.ReaderAtSeeker, name string) (sc ArcSchema, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			sc, err = ArcSchema{}, fmt.Errorf("parquet %q: reading its footer panicked (%v); the file is malformed, and this measurement's export stays blocked until it is removed", name, r)
+		}
+	}()
+	rdr, err := newParquetReader(f)
 	if err != nil {
 		return ArcSchema{}, fmt.Errorf("parquet reader %q: %w", name, err)
 	}

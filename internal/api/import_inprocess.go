@@ -476,20 +476,36 @@ var (
 	parquetBatchCells = 2_000_000
 )
 
+// openParquetFooter opens an uploaded Parquet file's footer; a test seam.
+var openParquetFooter = file.NewParquetReader
+
 // openImportParquet opens Parquet bytes for batched reads. Buffered streams
 // read a column chunk a buffer at a time; without them each row group's
 // column chunks are read into memory whole, whatever the batch size, and a
 // file written as one row group is read at once. Page streaming stays off:
 // it reuses buffers that string values would alias.
-func openImportParquet(data []byte) (*pqarrow.FileReader, *importError) {
+//
+// A malformed footer can panic inside the Parquet library instead of
+// returning an error; that is a corrupt upload, answered 422 like the others,
+// rather than a 500 from the server's recover middleware.
+func openImportParquet(data []byte) (fr *pqarrow.FileReader, ierr *importError) {
+	var pf *file.Reader
+	defer func() {
+		if r := recover(); r != nil {
+			if pf != nil {
+				_ = pf.Close()
+			}
+			fr, ierr = nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to read parquet file", Err: fmt.Errorf("corrupt file: %v", r)}
+		}
+	}()
 	props := parquet.NewReaderProperties(memory.DefaultAllocator)
 	props.BufferedStreamEnabled = true
-	pf, err := file.NewParquetReader(bytes.NewReader(data), file.WithReadProps(props))
+	pf, err := openParquetFooter(bytes.NewReader(data), file.WithReadProps(props))
 	if err != nil {
 		return nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to read parquet file", Err: err}
 	}
 	batch := chunkRows(parquetBatchRows, parquetBatchCells, pf.MetaData().Schema.NumColumns())
-	fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: int64(batch)}, memory.DefaultAllocator)
+	fr, err = pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: int64(batch)}, memory.DefaultAllocator)
 	if err != nil {
 		_ = pf.Close()
 		return nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to open parquet reader", Err: err}
