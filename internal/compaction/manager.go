@@ -29,10 +29,10 @@ var ErrCompactionPaused = errors.New("compaction is paused cluster-wide")
 
 // Where a cycle came from, recorded on its outcome so an operator can tell
 // their own trigger's cycle from the scheduler's. "unspecified" is the honest
-// label for the public RunCompactionCycle* family: the scheduler reaches the
-// cycle body through runCycleInternal directly, so those exported entries have
-// no production caller today and guessing "scheduler" for them would mislabel
-// whichever caller is added next.
+// label for the public RunCompactionCycle* family: the scheduler claims a cycle
+// and runs its body directly, so those exported entries have no production
+// caller today and guessing "scheduler" for them would mislabel whichever caller
+// is added next.
 const (
 	cycleSourceAPI         = "api"
 	cycleSourceScheduler   = "scheduler"
@@ -301,6 +301,9 @@ type Manager struct {
 	claimMu      sync.Mutex
 	cycleRunning atomic.Bool
 	cycleID      atomic.Int64
+	// cycleReleased is closed by the next claim release, and made when someone
+	// first waits for it (cycleReleaseSignal). Guarded by claimMu.
+	cycleReleased chan struct{}
 
 	// Metrics
 	totalJobsCompleted   int
@@ -1606,15 +1609,33 @@ func (c *CycleClaim) Release() {
 	if c == nil || !c.released.CompareAndSwap(false, true) {
 		return
 	}
+	c.m.claimMu.Lock()
+	defer c.m.claimMu.Unlock()
 	c.m.cycleRunning.Store(false)
+	if c.m.cycleReleased != nil {
+		close(c.m.cycleReleased)
+		c.m.cycleReleased = nil
+	}
+}
+
+// cycleReleaseSignal returns a channel closed by the next claim release. Take
+// it before trying ClaimCycle, so a release right after a refused claim still
+// closes the channel in hand.
+func (m *Manager) cycleReleaseSignal() <-chan struct{} {
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	if m.cycleReleased == nil {
+		m.cycleReleased = make(chan struct{})
+	}
+	return m.cycleReleased
 }
 
 // ClaimCycle takes the exclusive right to run one cycle and assigns its id.
 // Returns ErrCycleAlreadyRunning when a cycle already holds the claim.
 //
 // Deliberately silent: the caller decides whether a refusal is worth a log
-// line. runCycleInternalFiltered keeps the scheduler's Warn, and the API
-// handler logs its own refusal, so moving a log in here would double it.
+// line. runCycleInternalFiltered keeps its Warn, and the scheduler and the API
+// handler log their own refusals, so moving a log in here would double them.
 func (m *Manager) ClaimCycle() (*CycleClaim, error) {
 	m.claimMu.Lock()
 	defer m.claimMu.Unlock()
@@ -1699,9 +1720,9 @@ func (m *Manager) RunCompactionCycle(ctx context.Context) (int64, error) {
 // tierNames must be non-empty - specify which tiers to run explicitly.
 //
 // Cycles started through this family are recorded with source "unspecified"
-// (#1162). The scheduler passes cycleSourceScheduler through runCycleInternal
-// directly, so labelling this family "scheduler" would mislabel whichever
-// caller is added next -- today it has none in production.
+// (#1162). The scheduler passes cycleSourceScheduler to the cycle body directly,
+// so labelling this family "scheduler" would mislabel whichever caller is added
+// next -- today it has none in production.
 func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []string) (int64, error) {
 	return m.runCycleInternal(ctx, cycleSourceUnspecified, nil, tierNames)
 }
@@ -1727,10 +1748,10 @@ func (m *Manager) runCycleInternal(ctx context.Context, source string, filterDat
 }
 
 // runCycleInternalFiltered claims a cycle and runs it to completion. Every
-// caller that wants the whole operation in one call -- both schedulers and the
-// three RunCompactionCycleFor* entry points -- goes through here, so their
-// behaviour is unchanged by the claim split: same loss Warn, same (0, error)
-// on a lost claim, same release-after-the-finalizer ordering.
+// caller that wants the whole operation in one call -- the three
+// RunCompactionCycleFor* entry points -- goes through here, so their behaviour
+// is unchanged by the claim split: same loss Warn, same (0, error) on a lost
+// claim, same release-after-the-finalizer ordering.
 func (m *Manager) runCycleInternalFiltered(ctx context.Context, source string, filterDatabases []string, tierNames []string, filterMeasurement string) (int64, error) {
 	claim, err := m.ClaimCycle()
 	if err != nil {
