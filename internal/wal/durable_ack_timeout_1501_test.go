@@ -10,6 +10,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func newTimeoutWriter(t *testing.T, bufferSize int, ackTimeout time.Duration) *Writer {
@@ -165,4 +166,51 @@ func TestDurableAckTimeoutDefaults(t *testing.T) {
 	}
 	_, err = q.AppendRawWithMetaTracked("iot", durablePayload(t))
 	require.False(t, errors.Is(err, errAckTimeout))
+}
+
+// A multi-chunk append whose later chunk times out at admission retracts the
+// admitted chunks without waiting on the device either: the earlier form took
+// the writer mutex the stalled loop holds, for as long as the device did.
+func TestDurableAckTimeoutOnAMultiChunkAppendDoesNotWaitOnTheDevice(t *testing.T) {
+	// Built before the stall: marshalling it under -race takes longer than
+	// the timeout, and the parked append must not time out before the first
+	// chunk has taken the queue slot.
+	value := string(make([]byte, 16<<20))
+	records := make([]map[string]interface{}, 0, 8)
+	for i := 0; i < 8; i++ {
+		records = append(records, map[string]interface{}{"v": value})
+	}
+	big, err := msgpack.Marshal(records)
+	require.NoError(t, err)
+	require.Greater(t, len(big), MaxWALPayloadSize)
+
+	w := newTimeoutWriter(t, 1, 200*time.Millisecond)
+	release, held := stallWriterLoop(t)
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+		_ = w.Close()
+	}()
+	// An untracked write parks the loop: it never waits, so nothing but the
+	// append under test times out and competes for the queue slot.
+	require.NoError(t, w.AppendRawWithMeta("iot", durablePayload(t)))
+	for !held.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	// Two chunks (an array of records over MaxWALPayloadSize is split): the
+	// first takes the one queue slot, the second waits for admission and
+	// times out.
+	start := time.Now()
+	_, err = w.AppendRawWithMetaTracked("iot", big)
+	elapsed := time.Since(start)
+	require.ErrorIs(t, err, ErrNotDurable)
+	require.ErrorIs(t, err, errAckTimeout)
+	require.Less(t, elapsed, 2*time.Second, "the admitted chunk's retraction must not wait on the device")
+	require.Equal(t, int64(1), atomic.LoadInt64(&w.DurableAckTimeouts), "one timeout per append")
+	require.Equal(t, int64(1), atomic.LoadInt64(&w.RetractionsFailed), "the full queue refused the retraction: counted, the chunk may replay")
+	require.Equal(t, 0, w.PendingUnflushedCount(), "the admitted chunk was released")
+	released = true
+	close(release)
 }

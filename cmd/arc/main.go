@@ -5867,10 +5867,6 @@ func walCoverageHold(outbox *cluster.RegistrationOutbox) func() wal.CoverageHold
 	return outbox.CoverageHold
 }
 
-// enableWALCoverage turns on ingest coverage ids (#1207) where they can be used:
-// cluster.wal_coverage on a Pattern-1 node (local storage) that writes a WAL
-// and announces its files through the journaled registration outbox. Before
-// recovery, so replayed entries keep their coverage.
 // walAckTimeout maps wal.ack_timeout_seconds to WriterConfig.AckTimeout: 0
 // in the config is "no bound", which the writer spells as a negative value
 // (its own zero means the default).
@@ -5881,6 +5877,10 @@ func walAckTimeout(seconds int) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// enableWALCoverage turns on ingest coverage ids (#1207) where they can be used:
+// cluster.wal_coverage on a Pattern-1 node (local storage) that writes a WAL
+// and announces its files through the journaled registration outbox. Before
+// recovery, so replayed entries keep their coverage.
 func enableWALCoverage(cfg *config.Config, buffer *ingest.ArrowBuffer, walWriter *wal.Writer, outbox *cluster.RegistrationOutbox, logger zerolog.Logger) {
 	if !cfg.Cluster.WALCoverage {
 		return

@@ -1497,8 +1497,13 @@ func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, erro
 			// first retained file the WAL never reclaims anything again (#676).
 			// They also reach the file untracked (and, in durable mode, the
 			// write is refused), so they are retracted, not only released
-			// (#1438).
-			w.retractEnqueued(hashes)
+			// (#1438). A timed-out admission retracts without waiting on the
+			// device (#1501).
+			if errors.Is(err, errAckTimeout) {
+				w.retractTimedOut(hashes, true)
+			} else {
+				w.retractEnqueued(hashes)
+			}
 			return nil, err
 		}
 		hashes = append(hashes, token)
@@ -1554,8 +1559,13 @@ func (w *Writer) appendRawWithMetaTracked(database string, payload []byte) ([]st
 			// first retained file the WAL never reclaims anything again (#676).
 			// They also reach the file untracked (and, in durable mode, the
 			// write is refused), so they are retracted, not only released
-			// (#1438).
-			w.retractEnqueued(hashes)
+			// (#1438). A timed-out admission retracts without waiting on the
+			// device (#1501).
+			if errors.Is(err, errAckTimeout) {
+				w.retractTimedOut(hashes, true)
+			} else {
+				w.retractEnqueued(hashes)
+			}
 			return nil, err
 		}
 		hashes = append(hashes, token)
@@ -1797,9 +1807,8 @@ func (w *Writer) enqueueDurable(entry walEntry, deadline <-chan time.Time) error
 		return errors.New("WAL writer is closed")
 	case <-deadline:
 		// Admission waited AckTimeout on a full queue: the device is as
-		// stalled as a sync that never completes.
-		atomic.AddInt64(&w.DurableAckTimeouts, 1)
-		metrics.Get().IncWALDurableAckTimeouts()
+		// stalled as a sync that never completes. The caller's error path
+		// counts and retracts (retractTimedOut).
 		return errAckTimeout
 	}
 }
@@ -1811,8 +1820,8 @@ var errAckTimeout = errors.New("durable acknowledgement timed out (wal.ack_timeo
 // ackDeadline is the timer channel bounding one durable append, or nil (never
 // fires) when AckTimeout is negative. The caller stops the timer.
 func (w *Writer) ackDeadline() (<-chan time.Time, func()) {
-	if w.config.AckTimeout < 0 {
-		return nil, func() {}
+	if w.config.AckTimeout < 0 || w.config.AckMode != AckModeDurable {
+		return nil, func() {} // queued mode never waits: no timer on its path
 	}
 	t := time.NewTimer(w.config.AckTimeout)
 	return t.C, func() { t.Stop() }
@@ -1825,7 +1834,14 @@ func (w *Writer) awaitDone(d chan error, deadline <-chan time.Time) error {
 	case err := <-d:
 		return err
 	case <-deadline:
-		return errAckTimeout
+		// The answer may have arrived with the deadline: a durable entry must
+		// not be refused and retracted, or the client's retry duplicates it.
+		select {
+		case err := <-d:
+			return err
+		default:
+			return errAckTimeout
+		}
 	case <-w.exited:
 		// The loop may have answered d just before exiting.
 		select {
@@ -1859,21 +1875,24 @@ func (w *Writer) durableErr(err error) error {
 // share syncs instead of paying one each.
 func (w *Writer) awaitDurable(tokens []string, dones []chan error, deadline <-chan time.Time) error {
 	var firstErr error
+	timedOut := false
 	for _, d := range dones {
-		if err := w.awaitDone(d, deadline); err != nil && firstErr == nil {
+		err := w.awaitDone(d, deadline)
+		if err != nil && firstErr == nil {
 			firstErr = err
-			if errors.Is(err, errAckTimeout) {
-				break // the others would time out too
-			}
+		}
+		if errors.Is(err, errAckTimeout) {
+			timedOut = true // the device is stalled: the others would time out too
+			break
 		}
 	}
 	if firstErr != nil {
 		// Not durable is not "not written": the entries may still reach the
 		// file, and the write is refused, so they are retracted (#1438).
-		if errors.Is(firstErr, errAckTimeout) {
+		if timedOut {
 			// The device is stalled: a retraction that waited for its own
 			// completion would park the caller on it again (#1501).
-			w.retractTimedOut(tokens)
+			w.retractTimedOut(tokens, false)
 		} else {
 			w.retractEnqueued(tokens)
 		}
@@ -1890,14 +1909,34 @@ func (w *Writer) awaitDurable(tokens []string, dones []chan error, deadline <-ch
 // recovery skips them; if it never does, neither reaches the file. A full
 // queue that refuses admission within retractTimeout counts as a failed
 // retraction, as today.
-func (w *Writer) retractTimedOut(tokens []string) {
+//
+// Also the error path of a timed-out admission (queueFull): the chunks of
+// the append that were admitted before it are retracted this way, never with
+// the waiting retraction, which would park on the writer mutex the stalled
+// loop holds. The queue was full for the whole AckTimeout then, so the
+// retraction is only tried without waiting: if it is refused, the chunks are
+// released without one and may replay once, the at-least-once case. With no
+// admitted chunk there is nothing to retract; the timeout still counts.
+// During a shutdown drain a retraction admitted after the drain's last pass
+// stays unwritten: the entry is then durable without it and may replay once.
+//
+// One Error line every retractLogInterval, shared with RetractTracked's: on a
+// stalled device both describe the same event.
+func (w *Writer) retractTimedOut(tokens []string, queueFull bool) {
 	atomic.AddInt64(&w.DurableAckTimeouts, 1)
 	metrics.Get().IncWALDurableAckTimeouts()
-	ctx, cancel := context.WithTimeout(context.Background(), retractTimeout)
-	err := w.enqueueCheckpointNoWait(ctx, tokens)
-	cancel()
-	w.releasePending(tokens)
-	w.signalPurge()
+	var err error
+	if len(tokens) > 0 {
+		budget := retractTimeout
+		if queueFull {
+			budget = 0 // a refused admission, not a wait on the full queue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		err = w.enqueueCheckpointNoWait(ctx, tokens)
+		cancel()
+		w.releasePending(tokens)
+		w.signalPurge()
+	}
 	if err != nil {
 		atomic.AddInt64(&w.RetractionsFailed, 1)
 		metrics.Get().IncWALRetractionsFailed(1)
@@ -1933,6 +1972,14 @@ func (w *Writer) enqueueCheckpointNoWait(ctx context.Context, hashes []string) e
 		return errors.New("WAL writer is closed")
 	}
 	entry := walEntry{data: entryData, durable: true, done: make(chan error, 1), foreignProof: w.coversForeignIdentity(hashes)}
+	// A slot free right now is taken whatever ctx says (a zero budget means
+	// "do not wait", not "do not try").
+	select {
+	case w.entryChan <- entry:
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
+		return nil
+	default:
+	}
 	select {
 	case w.entryChan <- entry:
 		w.enqueuedBytes.Add(uint64(len(entry.data)))
@@ -2104,7 +2151,11 @@ func (w *Writer) appendRawTracked(payload []byte) ([]string, error) {
 		}
 		hash, done, err := w.appendTrackedEntry(nil, chunk, deadline)
 		if err != nil {
-			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
+			if errors.Is(err, errAckTimeout) {
+				w.retractTimedOut(hashes, true) // #1501: never wait on the stalled device
+			} else {
+				w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
+			}
 			return nil, err
 		}
 		hashes = append(hashes, hash)
