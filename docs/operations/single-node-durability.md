@@ -19,6 +19,11 @@ disabled. Each run uses a fresh temporary data directory, writes one batch,
 kills Arc after HTTP 204, restarts with that same directory, and queries the
 recovered IDs. Processes and directories are cleaned up before the next run.
 
+`--ack-mode` defaults to `auto`, Arc's own default since
+[#1499](https://github.com/Basekick-Labs/arc/issues/1499): `durable` with the
+WAL on, `queued` with it off. `queued` with the WAL on is now an explicit
+choice.
+
 ```sh
 for sync_mode in fdatasync fsync async; do
   for ack_mode in queued durable; do
@@ -56,7 +61,15 @@ Run deterministic probe tests separately:
 python3 -m unittest discover -s scripts/durability -v
 ```
 
-## Results on current main `07bb6bf`
+## Results at `07bb6bf` (2026-11-04)
+
+These runs predate [#1499](https://github.com/Basekick-Labs/arc/issues/1499)
+(`durable` acknowledgements by default with the WAL on),
+[#1492](https://github.com/Basekick-Labs/arc/issues/1492) (a crash during a
+multi-hour flush no longer replays stored hours) and
+[#1501](https://github.com/Basekick-Labs/arc/issues/1501) (the durable wait is
+bounded by `wal.ack_timeout_seconds`). The acknowledgement semantics they
+measure are unchanged.
 
 Measured on Linux 6.18.57 x86_64 with Go 1.26.9, using source commit
 `07bb6bf525396cac6a47b2092941a8d71548ead2`. Builds used
@@ -77,7 +90,11 @@ guarantees or estimates of a real-world loss probability.
 | `fsync` | `durable` | 0 / 3 | 0; 0; 0 | 128–145 ms |
 | `async` | `durable` | 0 / 3 | 0; 0; 0 | 125–164 ms |
 
-No duplicate IDs were observed. The sync modes are distinct on this Linux host;
+No duplicate IDs were observed. Whether a `queued` batch is lost depends on
+timing: on macOS (arm64, APFS) at `f1a56dd3` (2026-11-06), two runs each of
+100,000 rows with the WAL on lost nothing under `queued` either, nor under
+`durable`. A `queued` acknowledgement promises nothing about a crash in either
+direction; only `durable` does. The sync modes are distinct on this Linux host;
 on macOS `fdatasync` falls back to `fsync`, with a startup log saying so.
 Timings are rounded observations on a shared host, not comparative performance
 results. Restart/query time includes startup and the verification query.

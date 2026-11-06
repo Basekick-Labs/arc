@@ -189,7 +189,8 @@ def main() -> None:
     parser.add_argument("--binary", type=Path, required=True, help="Path to a locally built Arc binary")
     parser.add_argument("--wal-enabled", action="store_true", help="Enable the WAL for this run")
     parser.add_argument("--sync-mode", choices=("fdatasync", "fsync", "async"), default="fdatasync")
-    parser.add_argument("--ack-mode", choices=("queued", "durable"), default="queued")
+    # auto is Arc's default since #1499: durable with the WAL on, queued without.
+    parser.add_argument("--ack-mode", choices=("auto", "queued", "durable"), default="auto")
     parser.add_argument("--runs", type=int, default=1, help="Independent runs, each with a fresh data directory")
     parser.add_argument("--rows", type=int, default=10000)
     parser.add_argument("--pause-after-ack", type=float, default=0)
