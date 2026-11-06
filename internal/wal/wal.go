@@ -554,6 +554,19 @@ type Writer struct {
 	// can start. Lock order: w.mu, then syncIOMu, then syncMu; the syncer
 	// takes only the last two.
 	syncIOMu sync.Mutex
+	// Durable acknowledgements failing (#1502): on from the first durable
+	// append the device refused (a timed-out admission or wait, a failed
+	// sync, a failed write), off at the next sync that succeeds. MQTT
+	// subscriptions wait at the broker while it is on. ackFailingMu orders a
+	// set and a clear to the listener as they took effect. probeRetryAt
+	// paces the probe syncs the writer loop requests while it is on: with
+	// writers suspended nothing else would sync, and the state would never
+	// clear on an idle node.
+	ackFailing         atomic.Bool
+	ackFailingMu       sync.Mutex
+	ackFailingListener atomic.Pointer[func(bool)]
+	probeRequested     atomic.Bool
+	probeRetryAt       time.Time
 	// rotateRetryAt delays the next rotation attempt after one failed, so a
 	// full disk is not retried on every entry. Writer loop only.
 	rotateRetryAt time.Time
@@ -824,6 +837,7 @@ func (w *Writer) writerLoop() {
 				w.nudgeSyncer()
 			}
 			w.rotateIfSyncFailed()
+			w.probeIfAckFailing()
 
 		case <-w.done:
 			// Drain remaining entries before shutdown. The syncer keeps
@@ -863,8 +877,11 @@ func (w *Writer) syncerLoop(stop <-chan struct{}, done chan<- struct{}) {
 		w.syncMu.Lock()
 		f, gen, target := w.syncTarget, w.syncGen, w.writtenBytes
 		forceData := len(w.syncWaiters) > 0
-		skip := f == nil || target <= w.syncedBytes ||
-			(!forceData && w.config.SyncMode == SyncModeAsync)
+		// A probe (#1502) syncs the file even with nothing unsynced and in
+		// async mode: its result is what clears, or keeps, ackFailing.
+		probe := w.probeRequested.Swap(false)
+		skip := f == nil || (!probe && (target <= w.syncedBytes ||
+			(!forceData && w.config.SyncMode == SyncModeAsync)))
 		w.syncMu.Unlock()
 		if skip {
 			w.syncIOMu.Unlock()
@@ -909,6 +926,9 @@ func (w *Writer) completeSyncLocked(target uint64, err error, requestRotate bool
 	}
 	atomic.AddInt64(&w.TotalSyncs, 1)
 	answer := w.syncErr
+	if answer == nil {
+		w.setAckFailing(false) // the device acknowledged: durable again (#1502)
+	}
 	n := 0
 	for _, wt := range w.syncWaiters {
 		if wt.target > target {
@@ -1808,9 +1828,58 @@ func (w *Writer) enqueueDurable(entry walEntry, deadline <-chan time.Time) error
 	case <-deadline:
 		// Admission waited AckTimeout on a full queue: the device is as
 		// stalled as a sync that never completes. The caller's error path
-		// counts and retracts (retractTimedOut).
+		// counts and retracts (retractTimedOut); the state is set here, so
+		// the suspend is not delayed by that (#1502).
+		w.setAckFailing(true)
 		return errAckTimeout
 	}
+}
+
+// OnDurableAckChange registers fn to be told when durable acknowledgements
+// start failing and when they recover (#1502), and tells it the current state
+// at once. fn runs on the refusing write's goroutine for a set and under the
+// writer's sync mutex for a clear, so it must return quickly and never call
+// back into the writer; the MQTT manager schedules its change and returns.
+func (w *Writer) OnDurableAckChange(fn func(failing bool)) {
+	w.ackFailingMu.Lock()
+	defer w.ackFailingMu.Unlock()
+	w.ackFailingListener.Store(&fn)
+	fn(w.ackFailing.Load())
+}
+
+// setAckFailing changes the state, the gauge and the listener under one
+// mutex, so a set and a clear racing reach the listener in the order they
+// took effect (the #1468 lesson).
+func (w *Writer) setAckFailing(failing bool) {
+	if w.ackFailing.Load() == failing {
+		return
+	}
+	w.ackFailingMu.Lock()
+	defer w.ackFailingMu.Unlock()
+	if !w.ackFailing.CompareAndSwap(!failing, failing) {
+		return
+	}
+	metrics.Get().SetWALDurableAckFailing(failing)
+	if failing {
+		w.logger.Warn().Msg("WAL durable acknowledgements are failing: live writes are refused until a sync succeeds; MQTT subscriptions wait at the broker")
+	} else {
+		w.logger.Info().Msg("WAL durable acknowledgements recovered")
+	}
+	if fn := w.ackFailingListener.Load(); fn != nil {
+		(*fn)(failing)
+	}
+}
+
+// probeIfAckFailing asks the syncer for a probe sync while acknowledgements
+// are failing, at most once a second: the clear edge is a sync that
+// succeeds, and with writers suspended no write would request one.
+func (w *Writer) probeIfAckFailing() {
+	if !w.ackFailing.Load() || time.Now().Before(w.probeRetryAt) {
+		return
+	}
+	w.probeRetryAt = time.Now().Add(time.Second)
+	w.probeRequested.Store(true)
+	w.nudgeSyncer()
 }
 
 // errAckTimeout is a durable append that waited AckTimeout for admission or
@@ -1887,6 +1956,12 @@ func (w *Writer) awaitDurable(tokens []string, dones []chan error, deadline <-ch
 		}
 	}
 	if firstErr != nil {
+		// The device refused (a timeout, a failed sync or write): say so
+		// before the retraction, which may itself wait (#1502). The writer
+		// exiting is shutdown, not the device.
+		if !errors.Is(firstErr, errWriterExited) {
+			w.setAckFailing(true)
+		}
 		// Not durable is not "not written": the entries may still reach the
 		// file, and the write is refused, so they are retracted (#1438).
 		if timedOut {

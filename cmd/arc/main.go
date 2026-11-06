@@ -1755,6 +1755,12 @@ func main() {
 		if arrowBuffer.MaxBufferedBytes() > 0 {
 			arrowBuffer.OnBufferFullChange(subscriptionManager.SetBufferFull)
 		}
+		// And while the WAL refuses durable acknowledgements (#1502): a
+		// stalled or failing device. Never set in queued mode, where no
+		// write waits on a sync.
+		if walWriter != nil {
+			walWriter.OnDurableAckChange(subscriptionManager.SetWALNotDurable)
+		}
 
 		// Start manager (loads and starts auto_start subscriptions). On a
 		// cluster node it starts after the coordinator, so its writes pass the
