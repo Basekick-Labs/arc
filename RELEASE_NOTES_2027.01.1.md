@@ -655,6 +655,18 @@ not a read statement fails its runs from this release.
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
+## Security: more relation keywords are checked in user SQL
+
+A string literal in table position is refused because DuckDB would read it as
+a file. The check now also covers `PIVOT_WIDER`, `PIVOT_LONGER`, `DESC` and
+`SHOW`, DuckDB's other spellings of `PIVOT`, `UNPIVOT` and `DESCRIBE`, which
+read a file the same way inside a subquery. Such a query is answered `400` on
+every query endpoint, in continuous queries and in `DELETE` predicates.
+Queries that use these keywords on a measurement are unaffected.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
+
 ## Security: more DuckDB functions are refused in user SQL
 
 Some functions of the DuckDB release Arc links were not covered by the checks

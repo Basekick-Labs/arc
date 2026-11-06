@@ -1009,7 +1009,8 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// Reuses the query path's guard rather than growing a third keyword list
 	// in this file: that guard is fed by the same normalisation and already
 	// knows every relation-introducing keyword DuckDB has (FROM, JOIN, TABLE,
-	// SUMMARIZE, DESCRIBE, PIVOT, UNPIVOT), so this inherits additions to it
+	// SUMMARIZE, DESCRIBE, DESC, SHOW, PIVOT, PIVOT_WIDER, UNPIVOT, PIVOT_LONGER),
+	// so this inherits additions to it
 	// instead of drifting from them.
 	//
 	// It is applied to the FRAGMENT, not to the assembled statement: by the

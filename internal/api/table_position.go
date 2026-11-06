@@ -121,10 +121,14 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 			fromArmed[depth] = true
 			afterFromJoin = true
 			introStart = m[0]
-		case "table", "summarize", "describe", "pivot", "unpivot":
+		case "table", "summarize", "describe", "desc", "show", "pivot", "pivot_wider", "unpivot", "pivot_longer":
 			// DuckDB introduces a relation after these too, and it accepts a
 			// bare path there exactly as it does after FROM: `TABLE '<glob>'`,
 			// `SUMMARIZE '<glob>'`, `PIVOT '<glob>' ON …` all read the file.
+			// PIVOT_WIDER and PIVOT_LONGER are DuckDB's spellings of PIVOT and
+			// UNPIVOT, and DESC and SHOW of DESCRIBE; each reads a path the
+			// same way inside a subquery, where the read-statement allowlist
+			// does not reach.
 			// Arming only on from/join left the replacement-scan guard blind
 			// to every one of them, so a string literal in those positions
 			// reached DuckDB verbatim while the RBAC extractor emitted no
@@ -141,6 +145,14 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 			// are unaffected. Arc supports no replacement scans at all, so a
 			// literal directly after one of these keywords has no legitimate
 			// form to protect.
+			//
+			// Several are also valid column names (`WHERE show = 'a'`). The
+			// walker does not tokenise operators, so a comparison would put the
+			// literal "directly after" the name; an operator next means the
+			// word is an operand, not a relation keyword, and nothing is armed.
+			if operatorFollows(normalised, m[1]) {
+				break
+			}
 			afterFromJoin = true
 			introStart = m[0]
 		default:
@@ -384,6 +396,22 @@ func countSQLTokenStart(sqlLower, s string) int {
 		}
 		pos = idx + 1
 	}
+}
+
+// operatorFollows reports whether the next non-space byte at or after pos in s
+// is an operator character, so the word before it is an operand. No relation
+// keyword is ever followed by one.
+func operatorFollows(s string, pos int) bool {
+	for i := pos; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r', '\f', '\v':
+			continue
+		case '=', '<', '>', '!', '+', '-', '*', '/', '%', '|', '&', '^', '~':
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 // dotFollows reports whether the first non-blank byte at or after pos is a
