@@ -727,3 +727,137 @@ func prevByte(s string, i int) byte {
 	}
 	return s[i-1]
 }
+
+// Span marks a byte range [Start, End) of sql that is inside a string literal
+// (any of the four quoted forms) or a comment — the regions a text rewrite
+// must not match into, because changing their bytes changes what the SQL
+// means or where a literal/comment ends. Code is every byte outside a span.
+type Span struct {
+	Start int
+	End   int
+}
+
+// scanSQLSpans walks sql once and calls emit for each maximal literal or
+// comment span, in order, using the SAME leaf scanners and the SAME branch
+// order as MaskStringLiterals (single/double quotes, E'…', $tag$…$tag$) and as
+// stripSQLComments (line comment to \n or \r, block comment to the first */).
+// It is the single place those rules live for span consumers;
+// TestProtectedSpansAgreeWithMasker pins it against MaskStringLiterals so the
+// two cannot drift.
+func scanSQLSpans(sql string, emit func(start, end int)) {
+	i := 0
+	n := len(sql)
+	for i < n {
+		ch := sql[i]
+
+		// Line comment: ends at \n or \r (DuckDB), like stripSQLComments.
+		if ch == '-' && i+1 < n && sql[i+1] == '-' {
+			j := i
+			for j < n && sql[j] != '\n' && sql[j] != '\r' {
+				j++
+			}
+			emit(i, j)
+			i = j
+			continue
+		}
+		// Block comment: to the first */ (not nested), like stripSQLComments.
+		if ch == '/' && i+1 < n && sql[i+1] == '*' {
+			j := i + 2
+			for j+1 < n && !(sql[j] == '*' && sql[j+1] == '/') {
+				j++
+			}
+			if j+1 < n {
+				j += 2
+			} else {
+				j = n
+			}
+			emit(i, j)
+			i = j
+			continue
+		}
+		// Dollar-quoted string $tag$…$tag$ (no escape; may be unterminated).
+		if ch == '$' {
+			if tag, ok := dollarQuoteTag(sql, i); ok {
+				closing := "$" + tag + "$"
+				rel := strings.Index(sql[i+len(closing):], closing)
+				var stop int
+				if rel >= 0 {
+					stop = i + len(closing) + rel + len(closing)
+				} else {
+					stop = n // unterminated: to end
+				}
+				emit(i, stop)
+				i = stop
+				continue
+			}
+		}
+		// Escape string E'…' / e'…' (backslash escapes); the prefix is part of
+		// the span. Same guard as the masker: previous byte not an identifier.
+		if (ch == 'e' || ch == 'E') && i+1 < n && sql[i+1] == '\'' && !isIdentifierByte(prevByte(sql, i)) {
+			start := i
+			i = skipEscString(sql, i+2)
+			emit(start, i)
+			continue
+		}
+		// Plain '…' string or "…" identifier (only the doubled quote escapes).
+		if ch == '\'' {
+			start := i
+			i = skipStdString(sql, i+1)
+			emit(start, i)
+			continue
+		}
+		if ch == '"' {
+			start := i
+			i = skipQuotedIdent(sql, i+1)
+			emit(start, i)
+			continue
+		}
+		i++
+	}
+}
+
+// ProtectedSpans returns the literal and comment spans of sql, in order. A
+// text rewrite that matches outside every span, and whose own output does not
+// alter span structure, keeps the SQL's meaning unchanged.
+func ProtectedSpans(sql string) []Span {
+	var spans []Span
+	scanSQLSpans(sql, func(start, end int) {
+		spans = append(spans, Span{Start: start, End: end})
+	})
+	return spans
+}
+
+// InProtectedSpan reports whether byte offset pos falls inside one of spans
+// (which must be in ascending, non-overlapping order, as ProtectedSpans
+// returns them).
+func InProtectedSpan(spans []Span, pos int) bool {
+	for _, s := range spans {
+		if pos < s.Start {
+			return false
+		}
+		if pos < s.End {
+			return true
+		}
+	}
+	return false
+}
+
+// IsMaskerClean reports whether s contains no string literal and no comment:
+// MaskStringLiterals leaves it byte-for-byte unchanged and it has no comment
+// marker. A fragment that is masker-clean can be duplicated or moved by a
+// rewrite without changing the surrounding SQL's literal/comment structure.
+// s must begin in code (a caller checks the match start is not in a span
+// first), so a fragment that opens a literal is detected by the masker here.
+func IsMaskerClean(s string) bool {
+	if strings.Contains(s, "--") || strings.Contains(s, "/*") || strings.Contains(s, "*/") {
+		return false
+	}
+	if !HasQuotes(s) {
+		return true
+	}
+	// A `'`, `"` or `$` that does not open a literal (a dollar-quoted body
+	// needs a closing tag; `ts$a$` is one identifier) leaves the masker output
+	// identical, and is clean.
+	masked, _ := MaskStringLiterals(s, true)
+	return masked == s
+}

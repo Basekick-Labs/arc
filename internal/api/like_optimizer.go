@@ -3,6 +3,8 @@ package api
 import (
 	"regexp"
 	"strings"
+
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 )
 
 // LIKE pattern optimizer for DuckDB queries.
@@ -58,7 +60,24 @@ func OptimizeLikePatterns(sql string) (string, bool) {
 func reorderEmptyCheckBeforeLike(sql string) string {
 	// Match pattern: WHERE col1 LIKE '%x%' AND col2 <> ''
 	// Rewrite to:    WHERE col2 <> '' AND col1 LIKE '%x%'
-	return patternEmptyCheckAfterLike.ReplaceAllString(sql, "${1}${4}${3}${2}")
+	//
+	// Skip a match inside a literal/comment, and skip when either reordered
+	// predicate is not masker-clean, so moving them cannot change the
+	// statement's literal/comment structure (#1488). parts: 1=WHERE 2=LIKE
+	// predicate 3=AND 4=empty check.
+	return replaceMatchesOutsideSpansIdx(sql, patternEmptyCheckAfterLike, func(parts []string, m []int, spans []sqlutil.Span) string {
+		if len(parts) < 5 {
+			return parts[0]
+		}
+		// The LIKE predicate (parts[2]) and the empty check (parts[4]) are
+		// swapped. Each may hold a whole string literal (the LIKE pattern,
+		// ''), but moving them is safe only if no literal or comment is cut at
+		// a group boundary and neither moved piece hides a comment (#1488).
+		if !reorderIsStructureSafe(parts, m, spans) {
+			return parts[0]
+		}
+		return parts[1] + parts[4] + parts[3] + parts[2]
+	})
 }
 
 // optimizeMultiplePredicates handles more complex cases with multiple predicates
@@ -70,8 +89,8 @@ func optimizeMultiplePredicates(sql string) string {
 	// Find the pattern: ... AND col <> '' at the end of WHERE clause
 	// and move it to the beginning
 
-	return patternEndEmptyCheck.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternEndEmptyCheck.FindStringSubmatch(match)
+	return replaceMatchesOutsideSpansIdx(sql, patternEndEmptyCheck, func(parts []string, m []int, spans []sqlutil.Span) string {
+		match := parts[0]
 		if len(parts) < 6 {
 			return match
 		}
@@ -91,7 +110,37 @@ func optimizeMultiplePredicates(sql string) string {
 			return match
 		}
 
+		// The middle predicates (.*?) are moved ahead of the empty check;
+		// moving them is safe only if no literal or comment is cut at a group
+		// boundary and neither moved piece hides a comment marker (#1488).
+		if !reorderIsStructureSafe(parts, m, spans) {
+			return match
+		}
+
 		// Reorder: WHERE col <> '' AND <other predicates> <rest>
 		return parts[1] + parts[4] + parts[3] + parts[2] + parts[5]
 	})
+}
+
+// reorderIsStructureSafe reports whether the predicates captured by the LIKE
+// optimizer can be reordered without changing the statement's literal/comment
+// structure: no protected span straddles any submatch group boundary (so each
+// moved group holds only whole literals/comments), and no moved group contains
+// a comment marker (a line comment moved ahead of another predicate would
+// comment it out). m and spans come from replaceMatchesOutsideSpansIdx.
+func reorderIsStructureSafe(parts []string, m []int, spans []sqlutil.Span) bool {
+	for i := 0; i*2 < len(m); i++ {
+		if m[2*i] < 0 {
+			continue
+		}
+		if spanStraddles(spans, m[2*i]) || spanStraddles(spans, m[2*i+1]) {
+			return false
+		}
+	}
+	for _, p := range parts {
+		if strings.Contains(p, "--") || strings.Contains(p, "/*") || strings.Contains(p, "*/") {
+			return false
+		}
+	}
+	return true
 }

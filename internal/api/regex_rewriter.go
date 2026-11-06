@@ -41,8 +41,12 @@ func rewriteURLDomainExtraction(sql string) string {
 	// Pattern: REGEXP_REPLACE(column, 'regex_with_https_and_domain_capture', '\1')
 	re := regexp.MustCompile(`(?i)REGEXP_REPLACE\s*\(\s*(\w+)\s*,\s*'([^']+)'\s*,\s*'\\\\?1'\s*\)`)
 
-	result := re.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := re.FindStringSubmatch(match)
+	// Skip a match inside a string literal or comment so the rewrite never
+	// alters a literal's content or a comment (#1488). The column capture is
+	// \w+ and buildURLDomainCASE emits only balanced literals, so no further
+	// structural guard is needed.
+	result := replaceMatchesOutsideSpans(sql, re, func(parts []string) string {
+		match := parts[0]
 		if len(parts) < 3 {
 			return match
 		}
@@ -101,8 +105,8 @@ func rewriteURLDomainExtractionExtract(sql string) string {
 	// Pattern: REGEXP_EXTRACT(column, 'regex_with_https_and_domain_capture', 1)
 	re := regexp.MustCompile(`(?i)REGEXP_EXTRACT\s*\(\s*(\w+)\s*,\s*'([^']+)'\s*,\s*1\s*\)`)
 
-	result := re.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := re.FindStringSubmatch(match)
+	result := replaceMatchesOutsideSpans(sql, re, func(parts []string) string {
+		match := parts[0]
 		if len(parts) < 3 {
 			return match
 		}
