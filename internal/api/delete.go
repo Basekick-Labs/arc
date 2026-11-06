@@ -444,7 +444,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	// A column qualified by the measurement's name means that column (#1451).
-	// Rewritten before validation, so what is validated is what runs.
+	// Rewritten before validation, so what is validated is what runs. Keep
+	// this order: the rewrite masks and restores caller text, and
+	// validateWhereClause (including its placeholder check) must see its
+	// output, which is also what pinDeleteTime later re-masks.
 	req.Where = unqualifyMeasurement(req.Where, req.Measurement)
 
 	// Validate WHERE clause
@@ -926,6 +929,13 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, errors.New("WHERE clause: " + errUnquotedBacktick)
 	}
 	maskedWhere, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
+	// Placeholder text outside a literal or quoted identifier is reserved:
+	// the clause is masked, checked, and its literals restored by
+	// placeholder (pinDeleteTime), so a copy the caller wrote would move a
+	// literal after the checks. Text inside a literal stays data.
+	if sqlutil.HasCallerPlaceholder(maskedWhere, masks) {
+		return false, errors.New("WHERE clause: " + errReservedPlaceholder)
+	}
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
 	maskedWhere = foldUnicodeSpace(maskedWhere)

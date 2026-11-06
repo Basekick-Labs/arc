@@ -148,10 +148,11 @@ func pinDeleteTime(where string, now time.Time) (string, error) {
 	if out == masked {
 		return where, nil
 	}
-	for i := len(masks) - 1; i >= 0; i-- {
-		out = strings.ReplaceAll(out, masks[i].Placeholder, masks[i].Original)
-	}
-	return out, nil
+	// One left-to-right restore, each placeholder at the place the masker
+	// left it. Replacing every occurrence of each placeholder text also
+	// rewrote copies the caller wrote and text inside literals already
+	// restored, after the clause had been validated.
+	return sqlutil.UnmaskStringLiterals(out, masks), nil
 }
 
 // RewriteForRecords applies DELETE records to a pending local file (the

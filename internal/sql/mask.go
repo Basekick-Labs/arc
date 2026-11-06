@@ -22,6 +22,12 @@ type StringMask struct {
 	// validateSQL, the FROM-in-function-body scanner, the partition pruner)
 	// still sees an inert placeholder.
 	Identifier bool
+	// Uses is how many times MaskStringLiterals wrote Placeholder into the
+	// masked SQL: 1 for a string literal, the number of occurrences of the
+	// quoted name for an identifier. HasCallerPlaceholder compares it with
+	// what the masked SQL holds, so a copy the caller wrote is told apart
+	// from the masker's own reuse.
+	Uses int
 }
 
 // MaskStringLiterals replaces string literals with placeholders to prevent regex from matching inside them.
@@ -49,7 +55,7 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 	// the CTE and rewrite it to a nonexistent storage path.
 	// Allocated lazily: the common single-quote-only query on this hot path
 	// never carries a double-quoted identifier.
-	var identPlaceholders map[string]string
+	var identPlaceholders map[string]int
 
 	for i < len(sql) {
 		ch := sql[i]
@@ -113,7 +119,7 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 					original := sql[i:stop]
 					placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
 					maskIndex++
-					masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+					masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Uses: 1})
 					result.WriteString(placeholder)
 					i = stop
 					continue
@@ -123,7 +129,7 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 				original := sql[i:]
 				placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
 				maskIndex++
-				masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+				masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Uses: 1})
 				result.WriteString(placeholder)
 				i = len(sql)
 				continue
@@ -148,7 +154,7 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 			original := sql[start:i]
 			placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
 			maskIndex++
-			masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+			masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Uses: 1})
 			result.WriteString(placeholder)
 			continue
 		}
@@ -180,20 +186,21 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 			if quote == '"' {
 				// Identifier class: deduplicated, distinct prefix (see the
 				// StringMask.Identifier comment).
-				placeholder, seen := identPlaceholders[original]
+				k, seen := identPlaceholders[original]
 				if !seen {
 					if identPlaceholders == nil {
-						identPlaceholders = make(map[string]string)
+						identPlaceholders = make(map[string]int)
 					}
-					placeholder = fmt.Sprintf("__IDENT_%d__", maskIndex)
-					identPlaceholders[original] = placeholder
-					masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Identifier: true})
+					k = len(masks)
+					identPlaceholders[original] = k
+					masks = append(masks, StringMask{Placeholder: fmt.Sprintf("__IDENT_%d__", maskIndex), Original: original, Identifier: true})
 					maskIndex++
 				}
-				result.WriteString(placeholder)
+				masks[k].Uses++
+				result.WriteString(masks[k].Placeholder)
 			} else {
 				placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
-				masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+				masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Uses: 1})
 				result.WriteString(placeholder)
 				maskIndex++
 			}
@@ -544,6 +551,76 @@ func isFromKeywordFunction(word string) bool {
 	return false
 }
 
+// fromMaskPrefix opens every MaskFromKeywordsInFunctionBodies placeholder.
+const fromMaskPrefix = "__FROM_MASK_"
+
+// ContainsReservedPlaceholder reports whether s holds the opening of a
+// placeholder the maskers in this package generate: `__STR_`, `__IDENT_` or
+// `__FROM_MASK_`. The restorers match placeholders by their exact text,
+// wherever it appears, so a caller-written copy is restored with the real
+// ones; names and other text spliced into masked SQL must not carry it.
+func ContainsReservedPlaceholder(s string) bool {
+	return strings.Contains(s, "__STR_") || strings.Contains(s, "__IDENT_") || strings.Contains(s, fromMaskPrefix)
+}
+
+// ContainsFromMaskPlaceholder reports whether s holds the opening of a
+// MaskFromKeywordsInFunctionBodies placeholder. UnmaskFromKeywordsInFunctionBodies
+// restores every occurrence of a placeholder's text, so caller SQL that
+// spells one gains a FROM after the checks that ran on the masked form.
+func ContainsFromMaskPlaceholder(s string) bool {
+	return strings.Contains(s, fromMaskPrefix)
+}
+
+// HasCallerPlaceholder reports whether masked, the output of
+// MaskStringLiterals that produced masks, holds placeholder text the masker
+// did not write: any FROM placeholder; a `__STR_`/`__IDENT_` opening that
+// does not start one of masks' placeholders; or a placeholder occurring more
+// often than the masker wrote it (StringMask.Uses). Every opening is
+// examined, overlapping ones included, so text written straight after a
+// placeholder that completes another is caught.
+//
+// Text inside a literal or quoted identifier is hidden by its own
+// placeholder and restored as written, so it is never seen here. Text
+// outside them would be restored too: UnmaskStringLiterals restores a
+// literal at the first occurrence of its placeholder and an identifier at
+// every one, so a copy the caller wrote would put a literal or a quoted name
+// there after the checks, next to text that can change how DuckDB lexes it.
+func HasCallerPlaceholder(masked string, masks []StringMask) bool {
+	if ContainsFromMaskPlaceholder(masked) {
+		return true
+	}
+	if !strings.Contains(masked, "__STR_") && !strings.Contains(masked, "__IDENT_") {
+		return false
+	}
+	byText := make(map[string]int, len(masks))
+	for k, m := range masks {
+		byText[m.Placeholder] = k
+	}
+	found := make([]int, len(masks))
+	for i := 0; i+1 < len(masked); i++ {
+		if masked[i] != '_' || masked[i+1] != '_' {
+			continue
+		}
+		rest := masked[i:]
+		if !strings.HasPrefix(rest, "__STR_") && !strings.HasPrefix(rest, "__IDENT_") {
+			continue
+		}
+		end := placeholderEnd(masked, i)
+		if end < 0 {
+			return true
+		}
+		k, ok := byText[masked[i:end]]
+		if !ok {
+			return true
+		}
+		found[k]++
+		if found[k] > masks[k].Uses {
+			return true
+		}
+	}
+	return false
+}
+
 // MaskFromKeywordsInFunctionBodies replaces the FROM keywords that do not
 // introduce a relation with unique placeholders, so the caller's
 // table-rewriter regex (which would otherwise match `FROM <ident>` greedily)
@@ -588,7 +665,7 @@ func MaskFromKeywordsInFunctionBodies(sql string) (string, []FromMask) {
 	var phBuf [32]byte
 	last := 0
 	for n, i := range at {
-		ph := strconv.AppendInt(append(phBuf[:0], "__FROM_MASK_"...), int64(n), 10)
+		ph := strconv.AppendInt(append(phBuf[:0], fromMaskPrefix...), int64(n), 10)
 		ph = append(ph, '_', '_')
 		placeholder := string(ph)
 		masks = append(masks, FromMask{Placeholder: placeholder, Original: sql[i : i+4]})
