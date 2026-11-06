@@ -2467,6 +2467,18 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 			return fmt.Errorf("unknown record type %T in write dispatch (unwired decoder output)", record)
 		}
 	}
+	// Converted dense, every column a cell per row: refused before any of
+	// it is built when its keys would make that far more cells than values.
+	if rowRecordsByMeasurement != nil {
+		var all []*models.Record
+		for _, rowRecords := range rowRecordsByMeasurement {
+			all = append(all, rowRecords...)
+		}
+		if err := CheckDenseCells(all); err != nil {
+			b.totalErrors.Add(1)
+			return err
+		}
+	}
 	// Convert grouped row records to columnar format. The conversion renames
 	// a field named like a tag, so the type check below reads its output.
 	var drops []LPDrop

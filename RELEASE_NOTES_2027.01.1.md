@@ -74,7 +74,7 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
-## Fix: Arc's internal SQL placeholder text is reserved
+## Security: Arc's internal SQL placeholder text is reserved
 
 Before its checks, Arc swaps string literals, quoted names and some keywords
 for generated placeholders, for example the `FROM` inside
@@ -100,6 +100,9 @@ too, so the statement that ran could differ from the one that was checked.
 
 Matching is exact and case-sensitive, as the restore itself is. Queries that
 don't contain these sequences outside literals are unaffected.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
 
 ## Fix: a crash during a multi-hour flush no longer replays the hours already stored ([#1492](https://github.com/Basekick-Labs/arc/issues/1492))
 
@@ -713,6 +716,28 @@ schema anchor whose footer panics is treated as undecodable.
 
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@glacieraxiom](https://github.com/glacieraxiom)**.
+## Security: a write with a new key on every point is refused instead of exhausting memory
+
+Arc builds a write's columns dense: every column holds a value or a NULL for
+every row. A write in which each point brought a tag or field key no other
+point had built rows x rows cells from a body linear in rows, so a few hundred
+KB of line protocol could hold more than a GB while it was parsed. A write may
+now leave at most eight cells empty for each cell it fills, or about four
+million, whichever is more, counting keys sent only as NULLs and room
+reserved for the first row's columns; past that it is answered `413` and
+nothing of it is written. The bound follows the values a write carries, not
+its size, so padding or compressing a body buys nothing. This covers line
+protocol and MessagePack rows, with or without `ingest.decimal_columns`, MQTT
+messages (refused and logged at most once per topic per interval) and line
+protocol imports, where the chunks before the refused one may already be
+written, as for any import that stops part-way. A dense write leaves no cell
+empty; a sparse one is admitted down to columns about 11% filled past the
+floor. Send points with different keys as separate writes or measurements.
+Parsing also builds each column at its final size once, roughly halving its
+peak memory for wide batches.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@glyphanchor](https://github.com/glyphanchor)**.
 
 ## Security: more DuckDB functions are refused in user SQL
 
