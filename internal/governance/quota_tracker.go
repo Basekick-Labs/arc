@@ -48,6 +48,8 @@ func (q *quotaTracker) maybeReset() {
 }
 
 // AllowQuery checks if a query is allowed under the hourly/daily quotas.
+// Test helper: the query path uses Manager.Admit, which checks every limit
+// before recording on any (#1524).
 // If allowed, it increments the counters.
 // Returns (allowed, reason) where reason describes why the query was denied.
 func (q *quotaTracker) AllowQuery() (bool, string) {
@@ -78,11 +80,13 @@ func (q *quotaTracker) record() {
 
 func (q *quotaTracker) admitsLocked() (bool, string) {
 	q.maybeReset()
-	if q.maxPerHour > 0 && q.queriesThisHour >= q.maxPerHour {
-		return false, "Hourly query quota exceeded"
-	}
+	// Daily first: when both are exhausted the daily reset is the one a retry
+	// waits for (RetryAfterSec), so the reason names it.
 	if q.maxPerDay > 0 && q.queriesThisDay >= q.maxPerDay {
 		return false, "Daily query quota exceeded"
+	}
+	if q.maxPerHour > 0 && q.queriesThisHour >= q.maxPerHour {
+		return false, "Hourly query quota exceeded"
 	}
 	return true, ""
 }

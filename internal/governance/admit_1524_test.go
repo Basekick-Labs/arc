@@ -56,6 +56,15 @@ func TestAdmitNamesTheBindingLimit(t *testing.T) {
 	if r.Allowed || r.Kind != KindQuota || r.Reason != "Daily query quota exceeded" || r.RetryAfterSec <= 60 {
 		t.Fatalf("refusal %+v: want the daily quota with a wait past the minute", r)
 	}
+
+	// Both quotas exhausted: the daily reset is the wait, so the daily quota
+	// is the reason.
+	m2 := setupTestManager(t, nil)
+	m2.CreatePolicy(context.Background(), &Policy{TokenID: 1, MaxQueriesPerHour: 1, MaxQueriesPerDay: 1})
+	m2.Admit(1)
+	if r := m2.Admit(1); r.Reason != "Daily query quota exceeded" {
+		t.Fatalf("hour and day exhausted: %+v", r)
+	}
 }
 
 // Check and record are one step: with the window between them held open,
@@ -87,7 +96,10 @@ func TestAdmitRetryAfterIsHonoured(t *testing.T) {
 	m := setupTestManager(t, nil)
 	clock := &fakeClock{t: time.Date(2026, 6, 1, 12, 30, 0, 0, time.UTC)}
 	m.now = clock.Now
-	m.CreatePolicy(context.Background(), &Policy{TokenID: 1, RateLimitPerMinute: 2, MaxQueriesPerHour: 1})
+	// The hour rate limit is the one hammering would have used up before
+	// #1524: refusals counted in its sliding window and the retry at the
+	// quota's reset was refused by it.
+	m.CreatePolicy(context.Background(), &Policy{TokenID: 1, RateLimitPerMinute: 2, RateLimitPerHour: 3, MaxQueriesPerHour: 1})
 	if !m.Admit(1).Allowed {
 		t.Fatal("first query refused")
 	}
@@ -105,6 +117,54 @@ func TestAdmitRetryAfterIsHonoured(t *testing.T) {
 	clock.Advance(time.Second)
 	if r := m.Admit(1); !r.Allowed {
 		t.Fatalf("refused at Retry-After: %+v", r)
+	}
+}
+
+// A policy update waits for an Admit in progress: a limit lowered while a
+// query is between its check and its record applies only after the record.
+func TestPolicyUpdateWaitsForAdmit(t *testing.T) {
+	m := setupTestManager(t, nil)
+	ctx := context.Background()
+	m.CreatePolicy(ctx, &Policy{TokenID: 1, RateLimitPerMinute: 5})
+	m.Admit(1) // creates the limiter
+	l := m.getOrCreateMinuteLimiter(1, 5)
+	limit := func() int { l.mu.Lock(); defer l.mu.Unlock(); return l.limit }
+	done := make(chan struct{})
+	var during int
+	m.afterAdmitCheckForTest = func() {
+		m.afterAdmitCheckForTest = nil
+		go func() {
+			m.UpdatePolicy(ctx, &Policy{TokenID: 1, RateLimitPerMinute: 1})
+			close(done)
+		}()
+		time.Sleep(20 * time.Millisecond)
+		during = limit()
+	}
+	m.Admit(1)
+	<-done
+	if during != 5 {
+		t.Fatalf("limit %d applied while the query was between check and record", during)
+	}
+	if limit() != 1 {
+		t.Fatalf("the update never applied: limit %d", limit())
+	}
+}
+
+// A policy deleted while a query reads it does not leave a limiter on the
+// deleted limits: the delete and Admit are serialised.
+func TestPolicyDeleteWithAdmit(t *testing.T) {
+	m := setupTestManager(t, nil)
+	ctx := context.Background()
+	m.CreatePolicy(ctx, &Policy{TokenID: 1, RateLimitPerMinute: 100})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); m.Admit(1) }()
+	go func() { defer wg.Done(); m.DeletePolicy(ctx, 1) }()
+	wg.Wait()
+	if _, ok := m.minuteLimiters[1]; ok {
+		// Admit ran first and DeletePolicy removed its limiter, or Admit ran
+		// after and found no policy: either way no limiter is left.
+		t.Fatal("a limiter outlived its deleted policy")
 	}
 }
 

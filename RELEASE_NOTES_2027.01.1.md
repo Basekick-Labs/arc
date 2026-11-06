@@ -3031,7 +3031,8 @@ With query governance on, a refused query's `Retry-After` was wrong or missing:
 
 A quota now resets exactly on the hour or day boundary, not just after it, so a
 client that waits exactly `Retry-After` is not refused. `Retry-After` is always
-at least 1. Which queries are allowed is otherwise unchanged. Clients that retry on `Retry-After` will retry
+at least 1. See also #1524 below: a refused query no longer counts against any
+limit. Clients that retry on `Retry-After` will retry
 later than they did, and less often.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
@@ -3049,9 +3050,10 @@ it: a refused query spends nothing, and a client that waits `Retry-After` finds
 every limit as it was told. A refusal names the limit with the longest wait
 (the reason in the 429, the log line, and `arc_governance_rate_limited_total`
 or `arc_governance_quota_exhausted_total`), and `Retry-After` is that wait.
-Each admitted query now counts once on every limit, which the governance usage
-endpoint reflects. A client that keeps hammering after a refusal is still
-refused on every request until the wait has passed.
+Refused queries no longer appear in the counts the governance usage endpoint
+reports. When the hourly and daily quotas are both exhausted, the refusal now
+names the daily one, whose reset it waits for. A client that keeps hammering
+after a refusal is still refused on every request until the wait has passed.
 
 ### A scheduled compaction that finds a cycle running runs when it ends ([#220](https://github.com/Basekick-Labs/arc/issues/220))
 

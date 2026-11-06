@@ -224,11 +224,7 @@ func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 	p.UpdatedAt = p.CreatedAt
 
 	// Update cache and in-memory trackers
-	m.policiesMu.Lock()
-	m.policies[p.TokenID] = p
-	m.policiesMu.Unlock()
-
-	m.updateTrackersForToken(p.TokenID, p)
+	m.publishPolicy(p)
 	metrics.Get().SetGovernancePoliciesActive(int64(m.policyCount()))
 
 	m.logger.Info().Int64("token_id", p.TokenID).Msg("Governance policy created")
@@ -265,11 +261,7 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 
 	p.UpdatedAt = time.Now()
 
-	m.policiesMu.Lock()
-	m.policies[p.TokenID] = p
-	m.policiesMu.Unlock()
-
-	m.updateTrackersForToken(p.TokenID, p)
+	m.publishPolicy(p)
 
 	m.logger.Info().Int64("token_id", p.TokenID).Msg("Governance policy updated")
 	return p, nil
@@ -282,6 +274,11 @@ func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
 		return fmt.Errorf("failed to delete governance policy: %w", err)
 	}
 
+	// The cache entry and the limiters go together under admitMu: an Admit
+	// that read the policy before this must not recreate a limiter on its
+	// limits after it (#1524).
+	m.admitMu.Lock()
+	defer m.admitMu.Unlock()
 	m.policiesMu.Lock()
 	delete(m.policies, tokenID)
 	m.policiesMu.Unlock()
@@ -366,7 +363,7 @@ const (
 //
 // A refusal names the limit with the longest wait, which is the one that
 // decides when a retry can succeed, and RetryAfterSec is that wait (at least
-// 1). Check and record run under admitMu, so two concurrent queries cannot
+// 1). On a tie the limit checked first (minute, hour, quota) is named. Check and record run under admitMu, so two concurrent queries cannot
 // both pass a limit with one slot left.
 func (m *Manager) Admit(tokenID int64) *EnforcementResult {
 	m.admitMu.Lock()
@@ -386,13 +383,23 @@ func (m *Manager) Admit(tokenID int64) *EnforcementResult {
 	var gates []gate
 	if policy.RateLimitPerMinute > 0 {
 		l := m.getOrCreateMinuteLimiter(tokenID, policy.RateLimitPerMinute)
-		reason := fmt.Sprintf("Rate limit exceeded: %d queries per minute", policy.RateLimitPerMinute)
-		gates = append(gates, gate{func() (bool, string) { return l.admits(), reason }, l.record, l.RetryAfterSec, KindRateLimit})
+		limit := policy.RateLimitPerMinute
+		gates = append(gates, gate{func() (bool, string) {
+			if l.admits() {
+				return true, ""
+			}
+			return false, fmt.Sprintf("Rate limit exceeded: %d queries per minute", limit)
+		}, l.record, l.RetryAfterSec, KindRateLimit})
 	}
 	if policy.RateLimitPerHour > 0 {
 		l := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
-		reason := fmt.Sprintf("Rate limit exceeded: %d queries per hour", policy.RateLimitPerHour)
-		gates = append(gates, gate{func() (bool, string) { return l.admits(), reason }, l.record, l.RetryAfterSec, KindRateLimit})
+		limit := policy.RateLimitPerHour
+		gates = append(gates, gate{func() (bool, string) {
+			if l.admits() {
+				return true, ""
+			}
+			return false, fmt.Sprintf("Rate limit exceeded: %d queries per hour", limit)
+		}, l.record, l.RetryAfterSec, KindRateLimit})
 	}
 	if policy.MaxQueriesPerHour > 0 || policy.MaxQueriesPerDay > 0 {
 		t := m.getOrCreateQuotaTracker(tokenID, policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
@@ -537,11 +544,22 @@ func (m *Manager) getOrCreateQuotaTracker(tokenID int64, maxPerHour, maxPerDay i
 	return tracker
 }
 
-func (m *Manager) updateTrackersForToken(tokenID int64, p *Policy) {
-	// Under admitMu: an Admit in progress finishes on the old limits, and the
-	// next one sees the new limits (#1524).
+// publishPolicy puts p in the cache and applies its limits to the token's
+// limiters in one step under admitMu, so an Admit sees the policy and the
+// limits it enforces together, and two writes for one token cannot leave the
+// cache on one and the limiters on the other (#1524).
+func (m *Manager) publishPolicy(p *Policy) {
 	m.admitMu.Lock()
 	defer m.admitMu.Unlock()
+	m.policiesMu.Lock()
+	m.policies[p.TokenID] = p
+	m.policiesMu.Unlock()
+	m.updateTrackersForToken(p.TokenID, p)
+}
+
+// updateTrackersForToken applies p's limits to the token's limiters. Called
+// with admitMu held.
+func (m *Manager) updateTrackersForToken(tokenID int64, p *Policy) {
 	// Update minute limiter
 	m.minuteLimitersMu.Lock()
 	if limiter, ok := m.minuteLimiters[tokenID]; ok {

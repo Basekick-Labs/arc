@@ -73,6 +73,8 @@ func (s *slidingWindowCounter) advance() {
 }
 
 // Allow checks if a request is allowed under the rate limit.
+// Test helper: the query path uses Manager.Admit, which checks every limit
+// before recording on any (#1524).
 // If allowed, it increments the counter and returns true.
 func (s *slidingWindowCounter) Allow() bool {
 	s.mu.Lock()
