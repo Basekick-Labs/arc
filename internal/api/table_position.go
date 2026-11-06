@@ -93,6 +93,12 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 
 		// tok is a placeholder or an identifier/keyword run.
 		inTablePos := afterFromJoin || afterComma
+		if inTablePos && strings.EqualFold(tok, "only") {
+			// PostgreSQL's inheritance modifier, which DuckDB accepts between
+			// the keyword and the relation (`FROM ONLY t`) and which reads a
+			// path there too. Transparent: the relation is the next atom.
+			continue
+		}
 		if inTablePos {
 			if visit(tablePosition{tok: tok, start: m[0], end: m[1], viaComma: afterComma, introStart: introStart}) {
 				return
@@ -121,10 +127,14 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 			fromArmed[depth] = true
 			afterFromJoin = true
 			introStart = m[0]
-		case "table", "summarize", "describe", "pivot", "unpivot":
+		case "table", "summarize", "describe", "desc", "show", "pivot", "pivot_wider", "unpivot", "pivot_longer":
 			// DuckDB introduces a relation after these too, and it accepts a
 			// bare path there exactly as it does after FROM: `TABLE '<glob>'`,
 			// `SUMMARIZE '<glob>'`, `PIVOT '<glob>' ON …` all read the file.
+			// PIVOT_WIDER and PIVOT_LONGER are DuckDB's spellings of PIVOT and
+			// UNPIVOT, and DESC and SHOW of DESCRIBE; each reads a path the
+			// same way inside a subquery, where the read-statement allowlist
+			// does not reach.
 			// Arming only on from/join left the replacement-scan guard blind
 			// to every one of them, so a string literal in those positions
 			// reached DuckDB verbatim while the RBAC extractor emitted no
@@ -141,6 +151,13 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 			// are unaffected. Arc supports no replacement scans at all, so a
 			// literal directly after one of these keywords has no legitimate
 			// form to protect.
+			//
+			// DuckDB reserves every one of these words, so unquoted one names
+			// a column only as the attribute of a qualified name
+			// (`c.show = 'a'`), never a relation keyword: nothing is armed.
+			if dotPrecedes(normalised, m[0]) {
+				break
+			}
 			afterFromJoin = true
 			introStart = m[0]
 		default:
@@ -384,6 +401,21 @@ func countSQLTokenStart(sqlLower, s string) int {
 		}
 		pos = idx + 1
 	}
+}
+
+// dotPrecedes reports whether the last non-space byte before pos in s is a
+// dot, so the word at pos is the attribute of a qualified name.
+func dotPrecedes(s string, pos int) bool {
+	for i := pos - 1; i >= 0; i-- {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r', '\f', '\v':
+			continue
+		case '.':
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 // dotFollows reports whether the first non-blank byte at or after pos is a
