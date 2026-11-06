@@ -464,6 +464,66 @@ func extractCTENames(sql string) map[string]bool {
 	return cteNames
 }
 
+// replaceMatchesOutsideSpans rewrites each match of re whose start is outside
+// every string-literal and comment span of sql, using fn; a match that begins
+// inside such a span is left unchanged, so these text rewrites never alter the
+// content of a literal or comment and the SQL keeps the structure
+// ValidateSQLRequest approved (#1488). parts[0] is the whole match; fn returns
+// the replacement, or parts[0] to decline. Spans and match offsets are both
+// taken from this same sql, so they line up.
+func replaceMatchesOutsideSpans(sql string, re *regexp.Regexp, fn func(parts []string) string) string {
+	return replaceMatchesOutsideSpansIdx(sql, re, func(parts []string, _ []int, _ []sqlutil.Span) string {
+		return fn(parts)
+	})
+}
+
+// replaceMatchesOutsideSpansIdx is replaceMatchesOutsideSpans with the match's
+// submatch indices (m, as FindAllStringSubmatchIndex returns) and the sql's
+// protected spans handed to fn, for a rewrite that moves text and must check
+// that no literal or comment straddles a group boundary.
+func replaceMatchesOutsideSpansIdx(sql string, re *regexp.Regexp, fn func(parts []string, m []int, spans []sqlutil.Span) string) string {
+	matches := re.FindAllStringSubmatchIndex(sql, -1)
+	if len(matches) == 0 {
+		return sql
+	}
+	spans := sqlutil.ProtectedSpans(sql)
+	var b strings.Builder
+	b.Grow(len(sql))
+	last := 0
+	for _, m := range matches {
+		if sqlutil.InProtectedSpan(spans, m[0]) {
+			continue
+		}
+		parts := make([]string, len(m)/2)
+		for i := range parts {
+			if m[2*i] >= 0 {
+				parts[i] = sql[m[2*i]:m[2*i+1]]
+			}
+		}
+		b.WriteString(sql[last:m[0]])
+		b.WriteString(fn(parts, m, spans))
+		last = m[1]
+	}
+	b.WriteString(sql[last:])
+	return b.String()
+}
+
+// spanStraddles reports whether any span strictly contains pos (s.Start < pos
+// < s.End): a literal or comment is cut at pos. A boundary that only touches a
+// span edge is not a straddle. Reordering text across a straddle would change
+// where that literal or comment ends.
+func spanStraddles(spans []sqlutil.Span, pos int) bool {
+	for _, s := range spans {
+		if pos <= s.Start {
+			return false
+		}
+		if pos < s.End {
+			return true
+		}
+	}
+	return false
+}
+
 // rewriteTimeBucket converts time_bucket() to epoch-based arithmetic.
 // All intervals are converted to epoch-based arithmetic for consistent ~2.5x performance improvement.
 // Handles both 2-arg and 3-arg (with origin) forms.
@@ -474,8 +534,8 @@ func rewriteTimeBucket(sql string) string {
 	}
 
 	// First handle 3-argument form (with origin) - must come first to avoid partial matches
-	sql = patternTimeBucket3Args.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternTimeBucket3Args.FindStringSubmatch(match)
+	sql = replaceMatchesOutsideSpans(sql, patternTimeBucket3Args, func(parts []string) string {
+		match := parts[0]
 		if len(parts) < 5 {
 			return match
 		}
@@ -487,10 +547,15 @@ func rewriteTimeBucket(sql string) string {
 
 		// Paren-blind guard (#535): if the column arg contains parentheses the
 		// regex capture may be truncated at the wrong ')'. Leave the call
-		// unrewritten so DuckDB handles it natively. (For time_bucket the
-		// capture already fails to match most nested args, so this is belt-and-
-		// suspenders — but it keeps every rewrite path consistently safe.)
+		// unrewritten so DuckDB handles it natively.
 		if strings.Contains(column, "(") {
+			return match
+		}
+		// The column is emitted twice (epochBucket); if it carries a quote or
+		// comment marker, duplicating it would change the statement's literal/
+		// comment structure. Leave such a call unrewritten so DuckDB parses it
+		// exactly as the validator read it (#1488).
+		if !sqlutil.IsMaskerClean(column) {
 			return match
 		}
 
@@ -511,8 +576,8 @@ func rewriteTimeBucket(sql string) string {
 	})
 
 	// Then handle 2-argument form (no origin)
-	sql = patternTimeBucket2Args.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternTimeBucket2Args.FindStringSubmatch(match)
+	sql = replaceMatchesOutsideSpans(sql, patternTimeBucket2Args, func(parts []string) string {
+		match := parts[0]
 		if len(parts) < 4 {
 			return match
 		}
@@ -524,6 +589,11 @@ func rewriteTimeBucket(sql string) string {
 		// Paren-blind guard (#535): see the 3-arg form above. If the column arg
 		// contains parentheses the capture may be truncated; leave it for DuckDB.
 		if strings.Contains(column, "(") {
+			return match
+		}
+		// See the 3-arg form: a quote/comment marker in the column would
+		// desync the statement when duplicated (#1488).
+		if !sqlutil.IsMaskerClean(column) {
 			return match
 		}
 
@@ -569,8 +639,8 @@ func rewriteDateTrunc(sql string) string {
 		return sql
 	}
 
-	return patternDateTrunc.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternDateTrunc.FindStringSubmatch(match)
+	return replaceMatchesOutsideSpans(sql, patternDateTrunc, func(parts []string) string {
+		match := parts[0]
 		if len(parts) < 3 {
 			return match
 		}
@@ -589,6 +659,11 @@ func rewriteDateTrunc(sql string) string {
 		// column and leave the call unrewritten — DuckDB runs date_trunc()
 		// natively (correct, just without the epoch optimization).
 		if strings.Contains(column, "(") {
+			return match
+		}
+		// A quote/comment marker in the column would desync the statement when
+		// the column is duplicated by epochBucket (#1488).
+		if !sqlutil.IsMaskerClean(column) {
 			return match
 		}
 
