@@ -878,7 +878,9 @@ func (w *Writer) syncerLoop(stop <-chan struct{}, done chan<- struct{}) {
 		f, gen, target := w.syncTarget, w.syncGen, w.writtenBytes
 		forceData := len(w.syncWaiters) > 0
 		// A probe (#1502) syncs the file even with nothing unsynced and in
-		// async mode: its result is what clears, or keeps, ackFailing.
+		// async mode, as a data sync: its result is what clears, or keeps,
+		// ackFailing, and in async mode a plain call would be a no-op that
+		// cleared it without touching the device.
 		probe := w.probeRequested.Swap(false)
 		skip := f == nil || (!probe && (target <= w.syncedBytes ||
 			(!forceData && w.config.SyncMode == SyncModeAsync)))
@@ -890,7 +892,7 @@ func (w *Writer) syncerLoop(stop <-chan struct{}, done chan<- struct{}) {
 		// target was read after the writes it counts had returned, and a sync
 		// covers every write completed before it starts, so a successful sync
 		// covers target.
-		err := w.syncFile(f, forceData)
+		err := w.syncFile(f, forceData || probe)
 		w.syncMu.Lock()
 		if gen == w.syncGen {
 			w.completeSyncLocked(target, err, true)
@@ -904,7 +906,10 @@ func (w *Writer) syncerLoop(stop <-chan struct{}, done chan<- struct{}) {
 }
 
 // completeSyncLocked records a sync covering target and answers the waiters it
-// covers. Caller holds syncMu. A failed sync still advances syncedBytes: the
+// covers; a sync that succeeded also clears ackFailing, which calls the
+// durable-ack listener, so callers hold only locks the listener never takes
+// (syncMu, and w.mu and syncIOMu from rotation and shutdown). Caller holds
+// syncMu. A failed sync still advances syncedBytes: the
 // waiters it covered get the error, and retrying cannot recover pages the
 // kernel already reported lost. The error then sticks to the file, and
 // requestRotate asks the writer loop to move to a new one (the rotation path
@@ -1838,8 +1843,9 @@ func (w *Writer) enqueueDurable(entry walEntry, deadline <-chan time.Time) error
 // OnDurableAckChange registers fn to be told when durable acknowledgements
 // start failing and when they recover (#1502), and tells it the current state
 // at once. fn runs on the refusing write's goroutine for a set and under the
-// writer's sync mutex for a clear, so it must return quickly and never call
-// back into the writer; the MQTT manager schedules its change and returns.
+// writer's sync mutex (and, from rotation and shutdown, the writer mutex) for
+// a clear, so it must return quickly and never call back into the writer;
+// the MQTT manager schedules its change and returns.
 func (w *Writer) OnDurableAckChange(fn func(failing bool)) {
 	w.ackFailingMu.Lock()
 	defer w.ackFailingMu.Unlock()
@@ -1875,6 +1881,12 @@ func (w *Writer) setAckFailing(failing bool) {
 // succeeds, and with writers suspended no write would request one.
 func (w *Writer) probeIfAckFailing() {
 	if !w.ackFailing.Load() || time.Now().Before(w.probeRetryAt) {
+		return
+	}
+	if w.syncFailed.Load() {
+		// The file carries a sticky sync error and the rotation away from
+		// it is pending (rotateIfSyncFailed): a probe of this file can only
+		// answer that error again, and would log it once a second.
 		return
 	}
 	w.probeRetryAt = time.Now().Add(time.Second)
@@ -1958,7 +1970,11 @@ func (w *Writer) awaitDurable(tokens []string, dones []chan error, deadline <-ch
 	if firstErr != nil {
 		// The device refused (a timeout, a failed sync or write): say so
 		// before the retraction, which may itself wait (#1502). The writer
-		// exiting is shutdown, not the device.
+		// exiting is shutdown, not the device. A wait that timed out just as
+		// the device recovered sets the state after the recovering sync
+		// cleared it; the next probe, within a second, clears it again, at
+		// the cost of one MQTT hold. The order of set and clear is the order
+		// they took effect, which is what matters.
 		if !errors.Is(firstErr, errWriterExited) {
 			w.setAckFailing(true)
 		}

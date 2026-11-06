@@ -62,8 +62,8 @@ What changes with the WAL on:
   sync: the device is stalled or failing), MQTT subscriptions are suspended,
   as they are for a fence, WAL disk pressure and a full buffer
   ([#1502](https://github.com/Basekick-Labs/arc/issues/1502)), and resume
-  once a sync succeeds; the writer probes the device with a sync once a
-  second meanwhile, so an idle node recovers too. With `clean_session=false`
+  once a sync succeeds; the writer syncs the WAL file once a second
+  meanwhile, so an idle node recovers too. With `clean_session=false`
   and QoS 1 or 2 the broker holds the messages. The message in flight when
   the refusal starts is still briefly retried and then dropped, as for the
   other reasons, and a merely slow device alternates between suspended and

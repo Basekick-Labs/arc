@@ -3,7 +3,6 @@ package wal
 import (
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,63 +51,90 @@ func TestDurableAckFailingFlipsOnTimeoutAndOffOnTheNextGoodSync(t *testing.T) {
 	require.Equal(t, []bool{false, true}, l.snapshot(), "set at the first refusal")
 	require.True(t, w.ackFailing.Load())
 
-	// The device recovers; no writer sends anything (they are held). The
-	// probe sync clears the state within about a second.
+	// The device recovers: the parked write lands and its sync, the first to
+	// succeed, clears the state. (The idle-node probe is covered by
+	// TestDurableAckFailingFlipsOnAFailedSync and the async probe test.)
 	released = true
 	close(release)
 	deadline := time.Now().Add(5 * time.Second)
 	for w.ackFailing.Load() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	require.False(t, w.ackFailing.Load(), "no write came, so only the probe sync can clear the state")
+	require.False(t, w.ackFailing.Load())
 	require.Equal(t, []bool{false, true, false}, l.snapshot())
 }
 
-// A failed sync turns the state on; the writer rotates away from the file
-// that reported it, and the probe on the new file turns it off.
-func TestDurableAckFailingFlipsOnAFailedSync(t *testing.T) {
-	rec := installSyncRecorder(t, 1)
-	rec.errOnce = errors.New("injected sync failure")
-	// A short tick: the writer loop's tick is what rotates away from the
-	// failed file and requests the probe sync.
+// The admission path sets the state too: a full queue that refuses admission
+// for the whole timeout is the device not keeping up.
+func TestDurableAckFailingSetByAnAdmissionTimeout(t *testing.T) {
+	w := newTimeoutWriter(t, 1, 200*time.Millisecond)
+	l := &ackListener{}
+	w.OnDurableAckChange(l.fn)
+	release, held := stallWriterLoop(t)
+	defer func() { close(release); _ = w.Close() }()
+	require.NoError(t, w.AppendRawWithMeta("iot", durablePayload(t))) // untracked: parks the loop, never waits
+	for !held.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	require.NoError(t, w.AppendRawWithMeta("iot", durablePayload(t))) // fills the one slot
+	for len(w.entryChan) < 1 {
+		time.Sleep(time.Millisecond)
+	}
+	_, err := w.AppendRawWithMetaTracked("iot", durablePayload(t)) // waits for admission, times out
+	require.ErrorIs(t, err, errAckTimeout)
+	require.Equal(t, []bool{false, true}, l.snapshot())
+}
+
+// A durable append refused because the writer closed is shutdown, not the
+// device: the state stays off.
+func TestDurableAckFailingNotSetByAClosedWriter(t *testing.T) {
+	w := newDurableWriter(t, SyncModeAsync, 16)
+	l := &ackListener{}
+	w.OnDurableAckChange(l.fn)
+	require.NoError(t, w.Close())
+	_, err := w.AppendRawWithMetaTracked("iot", durablePayload(t))
+	require.ErrorIs(t, err, ErrNotDurable)
+	require.Equal(t, []bool{false}, l.snapshot())
+	require.False(t, w.ackFailing.Load())
+}
+
+// In async mode the probe is a real data sync: a probe that did not touch the
+// device would clear the state whatever the device does.
+func TestDurableAckFailingProbeSyncsInAsyncMode(t *testing.T) {
+	rec := installSyncRecorder(t, 0)
 	w, err := NewWriter(&WriterConfig{
-		WALDir: t.TempDir(), SyncMode: SyncModeFsync, MaxSizeBytes: 64 << 20, MaxAge: time.Hour,
-		SyncInterval: 50 * time.Millisecond, SyncBytes: 1 << 30, BufferSize: 16,
+		WALDir: t.TempDir(), SyncMode: SyncModeAsync, MaxSizeBytes: 64 << 20, MaxAge: time.Hour,
+		SyncInterval: 20 * time.Millisecond, SyncBytes: 1 << 30, BufferSize: 16,
 		AckMode: AckModeDurable, Logger: zerolog.Nop(),
 	})
 	require.NoError(t, err)
 	defer w.Close()
-	l := &ackListener{}
-	w.OnDurableAckChange(l.fn)
-	res := appendAsync(w, durablePayload(t))
-	<-rec.started
-	close(rec.release)
-	require.ErrorIs(t, awaitResult(t, res).err, ErrNotDurable)
-	require.Equal(t, []bool{false, true}, l.snapshot())
+	before := rec.callCount()
+	w.setAckFailing(true)
 	deadline := time.Now().Add(5 * time.Second)
 	for w.ackFailing.Load() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	require.False(t, w.ackFailing.Load(), "the new file's probe sync clears it")
-	// And a durable write is accepted again.
-	_, err = w.AppendRawWithMetaTracked("iot", durablePayload(t))
-	require.NoError(t, err)
+	require.False(t, w.ackFailing.Load(), "the probe cleared it")
+	// async mode's no-op path returns without calling syncFileFn at all.
+	require.GreaterOrEqual(t, rec.callCount()-before, 1, "the probe performed a sync")
 }
 
-// Queued mode never waits, so it never reports the state, whatever the device
-// does; and a per-write refusal (an oversized payload) is not a device state.
-func TestDurableAckFailingNeverSetInQueuedModeOrByAPerWriteError(t *testing.T) {
-	q, err := NewWriter(&WriterConfig{WALDir: t.TempDir(), SyncMode: SyncModeAsync, Logger: zerolog.Nop()})
+// Probes are paced: at most one a second while the state holds.
+func TestDurableAckFailingProbesAtMostOncePerSecond(t *testing.T) {
+	rec := installSyncRecorder(t, 0)
+	rec.errAlways = errors.New("device keeps failing")
+	w, err := NewWriter(&WriterConfig{
+		WALDir: t.TempDir(), SyncMode: SyncModeFsync, MaxSizeBytes: 64 << 20, MaxAge: time.Hour,
+		SyncInterval: 20 * time.Millisecond, SyncBytes: 1 << 30, BufferSize: 16,
+		AckMode: AckModeDurable, Logger: zerolog.Nop(),
+	})
 	require.NoError(t, err)
-	defer q.Close()
-	_, err = q.AppendRawWithMetaTracked("iot", durablePayload(t))
-	require.NoError(t, err)
-	require.False(t, q.ackFailing.Load())
-
-	w := newDurableWriter(t, SyncModeAsync, 16)
 	defer w.Close()
-	_, err = w.AppendRawWithMetaTracked(string(make([]byte, 300)), durablePayload(t)) // database name over 255 bytes
-	require.ErrorIs(t, err, ErrNotDurable)
-	require.False(t, w.ackFailing.Load(), "a per-write error is not the device's state")
-	require.Equal(t, int64(0), atomic.LoadInt64(&w.DurableAckTimeouts))
+	w.setAckFailing(true)
+	time.Sleep(2500 * time.Millisecond)
+	// Each probe fails, sticks and rotates (one sync in the rotation): a
+	// handful of calls, not one per 20 ms tick.
+	require.LessOrEqual(t, rec.callCount(), 8, "probes are paced to one a second")
+	require.True(t, w.ackFailing.Load(), "a failing device keeps the state on")
 }

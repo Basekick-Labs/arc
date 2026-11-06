@@ -26,6 +26,7 @@ type syncRecorder struct {
 	started    chan struct{}
 	release    chan struct{}
 	errOnce    error // returned by the first held call, after release
+	errAlways  error // returned by every call (#1502 probe pacing test)
 }
 
 func installSyncRecorder(t *testing.T, hold int) *syncRecorder {
@@ -43,7 +44,11 @@ func installSyncRecorder(t *testing.T, hold int) *syncRecorder {
 			r.startSizes = append(r.startSizes, st.Size())
 		}
 		held := n <= r.hold
+		always := r.errAlways
 		r.mu.Unlock()
+		if always != nil {
+			return always
+		}
 		if held {
 			r.started <- struct{}{}
 			<-r.release
