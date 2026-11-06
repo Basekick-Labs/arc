@@ -2,6 +2,51 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a crash during a multi-hour flush no longer replays the hours already stored ([#1492](https://github.com/Basekick-Labs/arc/issues/1492))
+
+A flush whose rows span several hours writes one Parquet file per hour. The
+WAL checkpoint that stops those rows replaying was written once, after the
+last file, so a crash (kill -9, OOM, power loss of the process) between the
+first file and that checkpoint replayed every row of the flush on restart: the
+hours already in storage were stored twice. Compaction removes the duplicates
+of a tagged measurement at its next pass; a tagless measurement kept them
+([#948](https://github.com/Basekick-Labs/arc/issues/948)). How many rows that
+is depends on how many hours one flush spans: with the sample `arc.toml`
+(`max_buffer_size = 5000000`, `max_buffer_age_ms = 100`) a kill -9 during a
+backfill duplicated 21–23% of the rows acknowledged in the run, eleven whole
+hours each stored twice.
+
+Each hour file's rows are now checkpointed in the WAL as soon as that file is
+stored and registered, with the row-range checkpoint recovery already used
+for its own split replays. A crash replays only the rows of the files not yet
+written, and recovery replays a columnar entry's uncovered rows alone. The
+duplicate window is now at most the rows of the hour file each in-flight flush
+was writing when the process died.
+
+What changes for an operator:
+- fewer duplicates after a crash, and for a tagless measurement no longer
+  whole hours of them;
+- one durable WAL write per hour file of a multi-hour flush, before the
+  flush's own checkpoint, so a backfill flush spanning 30 hours writes 30
+  small checkpoints where it wrote one; on a cluster node each hour file also
+  makes its registration durable (one outbox sync) before its checkpoint. A
+  flush within one hour (live ingest) is unchanged;
+- `arc_wal_row_checkpoints_written_total` and
+  `arc_wal_row_checkpoints_dropped_total`: a dropped checkpoint (the WAL
+  writer refused it or it timed out) only means those rows replay as before;
+- a flush that fails part-way now reports the rows and files it did store
+  (`records_stored`, `files_stored`) and counts as lost only rows with no WAL
+  copy that reached no file.
+
+Downgrade: an Arc without this change replays an entry with row-range
+checkpoints in full, which is today's duplicate window, not a loss. The gauge
+`arc_wal_partial_row_recovery_pending` reports only ranges left by a recovery
+pass, not those a live flush leaves.
+
+Not yet on a writer with WAL coverage enabled (`cluster.wal_coverage`,
+[#1207](https://github.com/Basekick-Labs/arc/issues/1207)): it keeps the
+single checkpoint after the last file. A follow-up issue covers it.
+
 ## Fix: a time bound written with `epoch_ms()`, `make_timestamp()` or `to_timestamp()` prunes ([#1491](https://github.com/Basekick-Labs/arc/issues/1491))
 
 A query bounded by an epoch number read every partition of the measurement.

@@ -5697,10 +5697,12 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		if database == "" {
 			database = "default"
 		}
-		// Inherit the replayed entry's identity: one columnar entry becomes
-		// exactly one buffer write, so a checkpoint for it covers precisely
-		// these records. Row batches instead inherit their precise row-range
-		// identities when recovery splits an entry.
+		// Inherit the replayed entry's identity: a whole entry becomes exactly
+		// one buffer write, so a checkpoint for it covers precisely these
+		// records. When rows of the entry were already checkpointed by a
+		// multi-hour flush (#1492), recovery hands over only the other rows,
+		// each range under its own row-range identity, as for split row
+		// entries.
 		if err := arrowBuffer.WriteColumnarDirectReplayWithTagColumns(ctx, database, measurement, columns, walIdentity, tagColumns); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err

@@ -213,8 +213,12 @@ type Metrics struct {
 	walDiskPressure           atomic.Int64 // 1 while live writes are refused for the WAL volume's free space
 	walDiskFreeBytes          atomic.Int64 // Free bytes on the WAL volume at the last sample
 	walDiskPressureRejections atomic.Int64 // Live writes refused for WAL volume disk pressure
-	bufferFullRejections      atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
-	walDiskStatErrors         atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
+	// Per-hour WAL row checkpoints of a multi-hour flush (#1492): written, and
+	// dropped (the WAL writer refused or timed out; those rows replay).
+	walRowCheckpointsWritten atomic.Int64
+	walRowCheckpointsDropped atomic.Int64
+	bufferFullRejections     atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
+	walDiskStatErrors        atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -766,6 +770,8 @@ func (m *Metrics) SetWALDiskPressure(on bool) {
 }
 func (m *Metrics) SetWALDiskFreeBytes(bytes int64) { m.walDiskFreeBytes.Store(bytes) }
 func (m *Metrics) IncWALDiskPressureRejections()   { m.walDiskPressureRejections.Add(1) }
+func (m *Metrics) IncWALRowCheckpointsWritten()    { m.walRowCheckpointsWritten.Add(1) }
+func (m *Metrics) IncWALRowCheckpointsDropped()    { m.walRowCheckpointsDropped.Add(1) }
 func (m *Metrics) IncBufferFullRejections()        { m.bufferFullRejections.Add(1) }
 func (m *Metrics) IncWALDiskStatErrors()           { m.walDiskStatErrors.Add(1) }
 
@@ -1297,6 +1303,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_disk_pressure":                 m.walDiskPressure.Load(),
 		"wal_disk_free_bytes":               m.walDiskFreeBytes.Load(),
 		"wal_disk_pressure_rejections":      m.walDiskPressureRejections.Load(),
+		"wal_row_checkpoints_written":       m.walRowCheckpointsWritten.Load(),
+		"wal_row_checkpoints_dropped":       m.walRowCheckpointsDropped.Load(),
 		"ingest_buffer_full_rejections":     m.bufferFullRejections.Load(),
 		"wal_disk_stat_errors":              m.walDiskStatErrors.Load(),
 		"file_registrations_pending":        m.fileRegistrationsPending.Load(),
@@ -1892,6 +1900,13 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_disk_pressure_rejections_total Live writes refused for WAL volume disk pressure; nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_wal_disk_pressure_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_wal_disk_pressure_rejections_total", float64(m.walDiskPressureRejections.Load()))
+
+	b = append(b, "# HELP arc_wal_row_checkpoints_written_total WAL row-range checkpoints written by multi-hour flushes for the rows of each stored hour file (#1492)\n"...)
+	b = append(b, "# TYPE arc_wal_row_checkpoints_written_total counter\n"...)
+	b = appendMetric(b, "arc_wal_row_checkpoints_written_total", float64(m.walRowCheckpointsWritten.Load()))
+	b = append(b, "# HELP arc_wal_row_checkpoints_dropped_total Row-range checkpoints the WAL writer refused or timed out on; those rows replay after a crash\n"...)
+	b = append(b, "# TYPE arc_wal_row_checkpoints_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_wal_row_checkpoints_dropped_total", float64(m.walRowCheckpointsDropped.Load()))
 	b = append(b, "# HELP arc_ingest_buffer_full_rejections_total Write requests refused because rows waiting to be flushed reached ingest.max_buffered_bytes (bulk imports: 90 percent of it); nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_ingest_buffer_full_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_buffer_full_rejections_total", float64(m.bufferFullRejections.Load()))
@@ -1943,7 +1958,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_wal_quarantine_released_entries_total counter\n"...)
 	b = appendMetric(b, "arc_wal_quarantine_released_entries_total", float64(m.walQuarantineReleased.Load()))
 
-	b = append(b, "# HELP arc_wal_partial_row_recovery_pending 1 when the last WAL recovery pass left a retained file whose parent entry had row ranges replayed\n"...)
+	b = append(b, "# HELP arc_wal_partial_row_recovery_pending 1 when the last WAL recovery pass left a retained file whose parent entry had row ranges replayed; a live multi-hour flush also leaves row ranges (#1492), which this gauge does not report\n"...)
 	b = append(b, "# TYPE arc_wal_partial_row_recovery_pending gauge\n"...)
 	b = appendMetric(b, "arc_wal_partial_row_recovery_pending", float64(m.walPartialRowRecovery.Load()))
 

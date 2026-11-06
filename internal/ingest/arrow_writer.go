@@ -1125,6 +1125,12 @@ type TypedColumnBatch struct {
 	// estimatedBytes approximates retained column data for the ingest-memory
 	// gauge; it is not used to limit or reject writes.
 	estimatedBytes int64
+	// walSpans is set by mergeBatches on the batch it returns: the WAL entry
+	// and row of every row, by position (#1492, wal_row_spans.go). nil on a
+	// batch whose rows are not the records' concatenation (mergeSortedByTime,
+	// a slice, a sort), so a multi-hour flush can only checkpoint rows it can
+	// name exactly.
+	walSpans *walRowSpans
 }
 
 type bufferShard struct {
@@ -2244,7 +2250,9 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 
 	// Announce to cluster-wide file manifest (peer replication). Called on
 	// the flush path: the registrar must not block on the network. The outbox
-	// only appends here; completeFlush makes it durable once per flush.
+	// only appends here; syncRegistrations makes it durable, once per flush in
+	// completeFlush and, for a multi-hour flush without coverage, once per
+	// hour file before that file's row checkpoint (#1492).
 	if ref := b.fileRegistrar.Load(); ref != nil && ref.FileRegistrar != nil {
 		if cr, ok := ref.FileRegistrar.(CoverageFileRegistrar); ok && cov != nil {
 			cr.RegisterCoveredFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex, cov)
@@ -4853,8 +4861,16 @@ func recordsWithoutWALCopy(records []interface{}, expectedRows int) int {
 
 func (b *ArrowBuffer) logFlushFailure(err error, bufferKey string, recordCount, recordsWithoutWAL int) {
 	event := b.logger.Error().Err(err).
-		Str("buffer_key", bufferKey).
-		Int("records", recordCount)
+		Str("buffer_key", bufferKey)
+	// A multi-hour flush that stored some hour files first (#1492): those rows
+	// are in storage and checkpointed, so they are neither replayed nor lost.
+	var partial *flushPartialError
+	if errors.As(err, &partial) {
+		recordCount -= partial.StoredRows
+		recordsWithoutWAL = partial.LostWithoutWAL
+		event.Int("records_stored", partial.StoredRows).Int("files_stored", partial.StoredFiles)
+	}
+	event.Int("records", recordCount)
 	if recordsWithoutWAL > 0 {
 		metrics.Get().IncBufferRecordsDropped(int64(recordsWithoutWAL))
 		event.Int("records_without_wal", recordsWithoutWAL).
@@ -4929,27 +4945,14 @@ type FileRegistrationSyncer interface {
 // completeFlush runs once a flush's files are written and registered. The
 // registrations are made durable before the WAL checkpoint, so the WAL cannot
 // drop rows whose file the cluster has no durable record of (#1209). One
-// sync per flush, however many hourly files it wrote, and none without a WAL.
+// sync here per flush, and none without a WAL; a multi-hour flush on a writer
+// without coverage also synced once per hour file, before that file's row
+// checkpoint (#1492, flushPartitionedData).
 //
 // A covered flush (#1207) checkpoints without releasing the purge floor: the
 // group releases its WAL entries once every file has settled in the outbox.
 func (b *ArrowBuffer) completeFlush(walHashes []string, group *flushGroup) {
-	// Without a WAL there is no checkpoint to order the sync before, and the
-	// unsynced append already survives a process crash; skipping it keeps
-	// serial flushes (Close, the aged sweep) from paying a fsync each.
-	if ref := b.fileRegistrar.Load(); ref != nil && b.wal != nil {
-		if syncer, ok := ref.FileRegistrar.(FileRegistrationSyncer); ok {
-			if err := syncer.SyncRegistrations(); err != nil {
-				// Checkpointing anyway is deliberate. The registrations are
-				// still held in memory and register in this process; only a
-				// crash before that loses them, leaving a file this writer
-				// alone can query. Withholding the checkpoint would replay
-				// these rows into a second file instead: duplicates on every
-				// node.
-				b.logger.Error().Err(err).Msg("Failed to persist file registrations before the WAL checkpoint")
-			}
-		}
-	}
+	b.syncRegistrations()
 	if group != nil {
 		if len(walHashes) > 0 {
 			if err := group.cs.wal.MarkFlushedRetained(walHashes); err != nil {
@@ -4961,6 +4964,90 @@ func (b *ArrowBuffer) completeFlush(walHashes []string, group *flushGroup) {
 	}
 	b.markWALFlushed(walHashes)
 }
+
+// syncRegistrations makes the registrations appended so far durable, before
+// the checkpoint that stops their rows replaying (#1209). Without a WAL there
+// is no checkpoint to order the sync before, and the unsynced append already
+// survives a process crash; skipping it keeps serial flushes (Close, the aged
+// sweep) from paying a fsync each.
+func (b *ArrowBuffer) syncRegistrations() {
+	ref := b.fileRegistrar.Load()
+	if ref == nil || b.wal == nil {
+		return
+	}
+	if syncer, ok := ref.FileRegistrar.(FileRegistrationSyncer); ok {
+		if err := syncer.SyncRegistrations(); err != nil {
+			// Checkpointing anyway is deliberate. The registrations are
+			// still held in memory and register in this process; only a
+			// crash before that loses them, leaving a file this writer
+			// alone can query. Withholding the checkpoint would replay
+			// these rows into a second file instead: duplicates on every
+			// node.
+			b.logger.Error().Err(err).Msg("Failed to persist file registrations before the WAL checkpoint")
+		}
+	}
+}
+
+// checkpointRows writes the durable checkpoint for row ranges whose rows are
+// in a stored, registered hour file of a flush still in progress (#1492), so a
+// crash before the flush's own checkpoint replays only the rows of the files
+// not yet written. A row identity never moves the purge floor (the parent's
+// sequence stays pending until completeFlush checkpoints it), so this cannot
+// let the WAL reclaim an unflushed entry.
+//
+// Admission is bounded by ctx and blocks (MarkFlushedContext): the drop-on-full
+// enqueue of MarkFlushed loses nearly every checkpoint under the sustained
+// load a backfill is. A checkpoint that is still refused or times out is
+// counted and dropped: its rows replay as they did before, nothing is lost.
+//
+// "Stored" is storage.Write having returned, the same standard the flush's
+// own checkpoint has always relied on: the local backend renames a closed
+// file without fsync, so this survives a process crash, not a power loss.
+//
+// The wait counts against the flush's context (ingest.flush_timeout_seconds)
+// like the storage writes do: a backfill flush of many hours pays one WAL
+// sync per hour here. Reports whether a checkpoint was written; false with no
+// ids means the file had no rows the map could name (walRowSpans).
+func (b *ArrowBuffer) checkpointRows(ctx context.Context, ids []string) bool {
+	if len(ids) == 0 || b.wal == nil {
+		return false
+	}
+	var err error
+	switch w := b.wal.(type) {
+	case interface {
+		MarkFlushedContext(context.Context, []string) error
+	}:
+		err = w.MarkFlushedContext(ctx, ids)
+	case trackedWALWriter:
+		err = w.MarkFlushed(ids)
+	default:
+		return false
+	}
+	if err != nil {
+		metrics.Get().IncWALRowCheckpointsDropped()
+		b.logger.Warn().Err(err).Int("ranges", len(ids)).Msg("WAL row checkpoint for a stored hour file was not written; a crash before the flush completes replays its rows")
+		return false
+	}
+	metrics.Get().IncWALRowCheckpointsWritten()
+	return true
+}
+
+// flushPartialError is a multi-hour flush that failed after storing,
+// registering and checkpointing some of its hour files (#1492). The rows in
+// those files are not lost and are not replayed; logFlushFailure reports the
+// rest.
+type flushPartialError struct {
+	Err            error
+	StoredRows     int
+	StoredFiles    int
+	LostWithoutWAL int // rows with no WAL copy that are in no stored file
+}
+
+func (e *flushPartialError) Error() string {
+	return fmt.Sprintf("%v (after %d rows in %d hour files were stored and checkpointed)", e.Err, e.StoredRows, e.StoredFiles)
+}
+
+func (e *flushPartialError) Unwrap() error { return e.Err }
 
 func (b *ArrowBuffer) markWALFlushed(hashes []string) {
 	if len(hashes) == 0 || b.wal == nil {
@@ -5118,10 +5205,46 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		Int("total_records", recordCount).
 		Msg("Splitting batch across multiple hour partitions")
 
-	// Collect registration entries after all storage writes succeed.
-	// registerFileInTiering is called only after every hour's storage.Write succeeds
-	// to avoid leaving stale manifest entries when a later hour fails — WAL replay
-	// would otherwise create a duplicate file for the already-registered hour.
+	// Each hour file is registered and its rows checkpointed in the WAL as
+	// soon as it is stored (#1492), so a crash before the flush's own
+	// checkpoint replays only the hours not yet written, not the whole flush.
+	// Registration before the checkpoint, and durable (syncRegistrations),
+	// because a checkpointed row that is in no registered file is a row the
+	// cluster cannot see and nothing replays (#1209).
+	//
+	// Registration used to wait for every hour to succeed, so that a later
+	// hour's failure did not leave a registered file whose rows the WAL then
+	// replayed into a second file. The checkpoint is what makes registering
+	// early safe: the registered hour's rows are no longer replayed. (If the
+	// checkpoint itself is dropped, replay writes them again: the at-least-
+	// once case this used to be for every multi-hour flush.)
+	//
+	// Not on a coverage-enabled writer (#1207): its flush group announces the
+	// files of a flush together and settles them together, and a flush that
+	// failed after registering some of its hours would leave the group open
+	// for the life of the process. Such a writer keeps the deferred
+	// registration and the single checkpoint; see the follow-up on #1492.
+	// The gate reads the writer's state now, not the group built at enqueue:
+	// after DisableCoverage (an abandoned outbox at startup) a queued covered
+	// flush takes this path, registers with no coverage, and its group
+	// finishes with zero files, releasing its entries as before.
+	spans := merged.walSpans
+	if spans != nil && spans.rows != len(times) {
+		spans = nil // a layout the merge did not produce: name nothing
+	}
+	perHour := b.coverage.Load() == nil && b.wal != nil && spans != nil
+	partial := func(err error, stored, files int, writtenAt []bool) error {
+		if files == 0 {
+			return err
+		}
+		return &flushPartialError{Err: err, StoredRows: stored, StoredFiles: files, LostWithoutWAL: spans.lostWithoutCopy(writtenAt)}
+	}
+	var storedRows, storedFiles int
+	var writtenAt []bool // positions of the merged batch now in a stored file
+	if perHour {
+		writtenAt = make([]bool, len(times))
+	}
+
 	type tieringEntry struct {
 		storagePath string
 		bucketTime  time.Time
@@ -5145,7 +5268,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Write Parquet file for this hour
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
 		if err != nil {
-			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
+			return partial(fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err), storedRows, storedFiles, writtenAt)
 		}
 
 		// Use bucket's minTime for path generation (convert hourID to time only here)
@@ -5158,9 +5281,33 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+			return partial(fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err), storedRows, storedFiles, writtenAt)
 		}
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
+
+		if perHour {
+			b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, nil)
+			b.syncRegistrations()
+			ranges := spans.rangesIn(bucket.indices)
+			checkpointed := b.checkpointRows(ctx, ranges)
+			for _, i := range bucket.indices {
+				writtenAt[i] = true
+			}
+			storedRows += splitRecordCount
+			storedFiles++
+			b.totalRecordsWritten.Add(int64(splitRecordCount))
+			b.totalFlushes.Add(1)
+			b.logger.Info().
+				Str("buffer_key", bufferKey).
+				Str("storage_path", storagePath).
+				Int64("hour_id", hourID).
+				Int("records", splitRecordCount).
+				Int("size_bytes", len(parquetData)).
+				Int("row_ranges", len(ranges)).
+				Bool("rows_checkpointed", checkpointed).
+				Msg("Wrote hour partition and registered it")
+			continue
+		}
 
 		written = append(written, tieringEntry{
 			storagePath: storagePath,
@@ -5181,15 +5328,18 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	}
 
 	// All hours written successfully — now register in tiering and cluster manifest.
-	totalWritten := 0
+	// (Already done per hour when perHour: written is then empty.)
+	totalWritten := storedRows
 	cov := groupCoverage(group, len(written))
 	for _, e := range written {
 		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
 		totalWritten += e.records
 	}
 
-	b.totalRecordsWritten.Add(int64(totalWritten))
-	b.totalFlushes.Add(int64(len(hourBuckets)))
+	if !perHour {
+		b.totalRecordsWritten.Add(int64(totalWritten))
+		b.totalFlushes.Add(int64(len(hourBuckets)))
+	}
 	b.publishBufferMetrics()
 
 	flushDuration := time.Since(startTime)
@@ -5340,6 +5490,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 	// If only one batch, return it directly
 	if len(batches) == 1 {
 		if tcb, ok := batches[0].(*TypedColumnBatch); ok {
+			tcb.walSpans = walRowSpansOf(batches)
 			return tcb, nil
 		}
 		// Legacy: bare map without validity (e.g. from WAL replay)
@@ -5570,7 +5721,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		}
 	}
 
-	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime}, nil
+	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime, walSpans: walRowSpansOf(batches)}, nil
 }
 
 // sortColumnsByTime sorts all columns by the time column in-place
@@ -7011,8 +7162,16 @@ drain:
 
 			b.markFlushTaskInFlight(task)
 			if err := b.flushTrackedTask(flushCtx, task); err != nil {
+				// A multi-hour flush that stored some hour files first
+				// (#1492): those rows are stored and checkpointed, not
+				// unwritten.
+				stored := 0
+				var partial *flushPartialError
+				if errors.As(err, &partial) {
+					stored = partial.StoredRows
+				}
 				mu.Lock()
-				unwrit += task.recordCount - noWAL
+				unwrit += task.recordCount - noWAL - stored
 				mu.Unlock()
 			}
 		}()
