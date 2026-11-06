@@ -2,6 +2,40 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a time bound written with `epoch_ms()`, `make_timestamp()` or `to_timestamp()` prunes ([#1491](https://github.com/Basekick-Labs/arc/issues/1491))
+
+A query bounded by an epoch number read every partition of the measurement.
+It now reads only the partitions and files of its range, the same as one
+written with a `TIMESTAMP` literal. Clients that keep event time as epoch
+milliseconds usually write it this way:
+
+```sql
+SELECT ... FROM market.quotes
+WHERE time >= epoch_ms(1790856000000) AND time < epoch_ms(1790856060000)
+```
+
+On 8.7M forex ticks the one-minute query above went from 97 ms to 1.8 ms on
+freshly ingested data (656 files), and from 9.7 ms to 3.1 ms after compaction
+(43 files): the same as the `TIMESTAMP` literal.
+
+Accepted, with one plain number as the argument:
+- `epoch_ms(n)`: milliseconds;
+- `make_timestamp(n)`: microseconds;
+- `to_timestamp(x)`: seconds, whole or decimal.
+
+Anything else in the call, such as arithmetic, a cast, a column or a second
+argument, gives no bound from that term, as before. So does a bound outside
+years 0001 to 9999, counting the second added to a `to_timestamp` bound and
+the microsecond added to an inclusive end. This also applies to a literal:
+`time <= '9999-12-31 23:59:59.999999'` no longer gives an end in year 10000,
+which a query that needs an unavailable cold tier read as "no cold data"
+instead of answering 503. A DELETE with such a bound now also reads only the files
+of its range (`delete.time_pruning`).
+
+`to_timestamp` is computed through a double and compared in the session time
+zone, which Arc pins to UTC. Its bound is widened by one second. These bounds
+narrow what is read but are not used to answer a query as empty without
+reading it.
 ## Fix: query pre-processing rewrites stay inside their own text ([#1488](https://github.com/Basekick-Labs/arc/issues/1488))
 
 Before running a query, Arc applies a few text rewrites that speed common
@@ -4122,8 +4156,9 @@ settings, these queries returned too few rows, with `success: true`:
 
 A range is now read only from the query's single WHERE clause, and only from
 its top-level `AND` terms that are exactly a comparison of `time` with a
-literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
-`BETWEEN`. Other terms are ignored, which only widens the range. A top-level
+literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, with
+an epoch call of one number (since
+[#1491](https://github.com/Basekick-Labs/arc/issues/1491)), or a `BETWEEN`. Other terms are ignored, which only widens the range. A top-level
 `OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
 the whole measurement, correctly but without pruning.
 
@@ -4135,6 +4170,8 @@ subquery, or a FROM or JOIN, inside a FILTER still means no range.
 Accepted spellings:
 - the column as `time`, `"time"`, `alias.time` or Grafana's `(time)`;
 - the literal as `'…'`, `'…'::timestamp` or `TIMESTAMP '…'`;
+- (since [#1491](https://github.com/Basekick-Labs/arc/issues/1491)) `epoch_ms(n)`,
+  `make_timestamp(n)` or `to_timestamp(x)` of one numeric literal;
 - the reversed form `'…' <= time`;
 - one trailing `;`.
 

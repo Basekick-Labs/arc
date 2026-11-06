@@ -45,8 +45,9 @@ type deleteWindow struct {
 // windowFor reads the window of where, with now() read as now. nil when
 // pruning is off or the WHERE has no range the extractor can prove: a
 // top-level OR, a subquery, a time column compared with anything but a
-// literal or now() plus or minus one interval, or time = / IN (point deletes
-// read every file).
+// literal, now() plus or minus one interval, or epoch_ms(n),
+// make_timestamp(n) or to_timestamp(x) of one numeric literal (#1491), or
+// time = / IN (point deletes read every file).
 //
 // It relies on a file's directory holding only rows of that hour (or day,
 // for a daily compaction output). Ingest splits every batch by row hour since
