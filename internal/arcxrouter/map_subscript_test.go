@@ -112,6 +112,9 @@ func TestMatchScan_Subscript_Declines(t *testing.T) {
 		{"subscript in between hi", "SELECT id FROM t WHERE id BETWEEN 1 AND m['k']"},
 		{"subscript as literal", "SELECT id FROM t WHERE host = m['k']"},
 		{"subscript on measurement", "SELECT id FROM t['x']"},
+		{"dotted base", "SELECT a.b['k'] FROM t"},
+		{"dotted base in where", "SELECT id FROM t WHERE a.b['k'] = 'x'"},
+		{"dotted base in tree where", "SELECT id FROM t WHERE a.b['k'] = 'x' OR id = 1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

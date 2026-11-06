@@ -536,7 +536,8 @@ func isArgItem(item string) bool {
 //
 //	SELECT <cols> FROM read_parquet([<paths>]) [WHERE <col> <op> <lit> AND ...]
 //
-// Every column (projection AND predicate) must be a bare identifier — they came
+// Every column (projection AND predicate) must be a bare identifier or a map
+// subscript `col['key']` (map-1; isColumnRef) — they came
 // from the tokenizer as identifiers, so injection-safe by construction, but we
 // guard defensively. String literals are single-quote escaped; numeric literals
 // are validated as integers. Declines (ok=false) on any non-bare column or

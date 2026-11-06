@@ -184,8 +184,11 @@ projection function stay on DuckDB, as do keys containing `'` or `\`.
 
 Nothing changes for a deployment without the engine linked in (`arcx_engine`
 build tag) or with `ARC_ROUTER=off`; the DuckDB path runs the user's SQL
-unchanged. In shadow mode the derived column compares by position; its name is
-`col['key']` on both engines.
+unchanged. In shadow mode the derived column is named `col['key']` on both
+engines and compares cell for cell; a mismatch log names the column with the
+key masked (`col['...']`), since a key is user data. One metrics detail for
+engine builds: the shape census now files any query containing brackets
+(`arr[1]`, `m['a']['b']`) under a shape reason instead of `unlexable`.
 
 ## Fix: a crash during a multi-hour flush no longer replays the hours already stored ([#1492](https://github.com/Basekick-Labs/arc/issues/1492))
 

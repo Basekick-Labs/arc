@@ -153,7 +153,7 @@ func tokenize(sql string) ([]token, bool) {
 			toks = append(toks, token{kind: tokStr, str: lit})
 			i = next
 		default:
-			// Anything else (operators, quotes, unicode, brackets) is outside the
+			// Anything else (operators, quotes, unicode, braces) is outside the
 			// vocabulary — decline rather than guess.
 			return nil, false
 		}
@@ -282,6 +282,12 @@ type cursor struct {
 func readColumnRef(c *cursor, t token) (string, bool) {
 	if c.i >= len(c.toks) || c.toks[c.i].kind != tokPunct || c.toks[c.i].punct != '[' {
 		return t.orig, true
+	}
+	// The engine's identifier lexer has no `.`, so a dotted base (`a.b['k']`) would
+	// be emitted and then declined by the engine, or refused at the SQL boundary
+	// (isSubscriptRef has no dot either) with no log or metric. Refuse it here.
+	if strings.IndexByte(t.orig, '.') >= 0 {
+		return "", false
 	}
 	c.i++ // consume `[`
 	keyT, ok := c.next()
@@ -557,7 +563,8 @@ func (c *cursor) peekIdentLower() string {
 //
 // Deliberately narrow, mirroring the engine's 2a grammar and its decline-harder
 // posture — the router recognizes only what the engine answers green:
-//   - projection is an explicit, non-empty BARE-COLUMN list. `*` is NOT routed
+//   - projection is an explicit, non-empty list of bare columns, map subscripts
+//     `col['key']` (map-1) or recognized projection functions. `*` is NOT routed
 //     (the engine declines SELECT * under schema drift, which the router can't
 //     detect ahead of the files — so star scans stay on DuckDB).
 //   - WHERE is AND-conjoined `<col> <op> <literal>` / `<col> IS [NOT] NULL` /

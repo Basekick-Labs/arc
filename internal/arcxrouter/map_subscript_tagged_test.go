@@ -31,3 +31,33 @@ func TestBuildScanSQL_Subscript(t *testing.T) {
 		t.Fatal("buildScanSQL must refuse a malformed subscript pred")
 	}
 }
+
+// A shadow MISMATCH names the first differing column; a map subscript's key is
+// user data and must not reach the log (the SQL masker hides the same literal
+// one field over).
+func TestLogColumnName_MasksSubscriptKey(t *testing.T) {
+	if got := logColumnName("LogAttributes['tenant-42']"); got != "LogAttributes['...']" {
+		t.Fatalf("got %q", got)
+	}
+	if got := logColumnName("host"); got != "host" {
+		t.Fatalf("got %q", got)
+	}
+	if got := firstDiffColumn(scanRow{"a=1", "m['k']=x"}, scanRow{"a=1", "m['k']=y"}, []string{"a", "m['k']"}); got != "m['...']" {
+		t.Fatalf("firstDiffColumn = %q", got)
+	}
+}
+
+// Brackets now lex, so a bracket query that is not the served shape moves from the
+// `unlexable` census bucket to a shape bucket. Pin the new label so a dashboard
+// reader can find the reason here.
+func TestCensusClassify_BracketQueryIsNotUnlexable(t *testing.T) {
+	for _, sql := range []string{"SELECT arr[1] FROM t", "SELECT m['a']['b'] FROM t", "SELECT id FROM t ORDER BY m['k']"} {
+		reason, _ := CensusClassify(sql, "")
+		if reason == "unlexable" || reason == "eligible" {
+			t.Fatalf("%s classified %q", sql, reason)
+		}
+	}
+	if reason, _ := CensusClassify("SELECT a[1:2] FROM t", ""); reason != "unlexable" {
+		t.Fatalf("slice syntax should stay unlexable, got %q", reason)
+	}
+}
