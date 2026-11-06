@@ -58,12 +58,17 @@ What changes with the WAL on:
   `arc_wal_not_durable_rejections_total` and the `wal_not_durable` refusal
   log. The HTTP request context plays no part: in Fiber it has no deadline
   and ends only at server shutdown.
-- **MQTT.** A message refused as not durable is retried for 2 seconds and then
-  dropped, as for other refusals; a stalled or failing WAL therefore costs
-  MQTT messages where `"queued"` acknowledged them and risked them at the next
-  crash. Set `wal.ack_mode = "queued"` for an MQTT deployment where a stalled
-  WAL disk must never cost a message, until a not-durable suspend reason
-  exists for MQTT (follow-up).
+- **MQTT.** While the WAL refuses writes as not durable (a timed-out or failed
+  sync: the device is stalled or failing), MQTT subscriptions are suspended,
+  as they are for a fence, WAL disk pressure and a full buffer
+  ([#1502](https://github.com/Basekick-Labs/arc/issues/1502)), and resume
+  once a sync succeeds; the writer syncs the WAL file once a second
+  meanwhile, so an idle node recovers too. With `clean_session=false`
+  and QoS 1 or 2 the broker holds the messages. The message in flight when
+  the refusal starts is still briefly retried and then dropped, as for the
+  other reasons, and a merely slow device alternates between suspended and
+  resumed at about the ack timeout. `arc_wal_durable_ack_failing` is 1 while
+  the state holds.
 - **The shipped examples that enable the WAL** (`deploy/docker-compose/`
   `oss-local`, `oss-s3`, `oss-traefik` and `enterprise-shared`, and
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the

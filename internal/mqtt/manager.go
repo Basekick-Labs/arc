@@ -61,6 +61,7 @@ type SubscriptionManager struct {
 	// otherwise disconnect and reconnect every subscription with it.
 	disk       heldReason
 	bufferFull heldReason
+	notDurable heldReason
 }
 
 // heldReason is a suspend reason applied at once when it sets and, when it
@@ -101,9 +102,10 @@ func (m *SubscriptionManager) registerStarted(id string, subscriber *Subscriber)
 type suspendReasons uint8
 
 const (
-	suspendFenced     suspendReasons = 1 << iota // writes fenced (#1207)
-	suspendWALDisk                               // WAL volume disk pressure (#676)
-	suspendBufferFull                            // ingest.max_buffered_bytes reached (#1468)
+	suspendFenced        suspendReasons = 1 << iota // writes fenced (#1207)
+	suspendWALDisk                                  // WAL volume disk pressure (#676)
+	suspendBufferFull                               // ingest.max_buffered_bytes reached (#1468)
+	suspendWALNotDurable                            // the WAL refuses durable acknowledgements (#1502)
 )
 
 // mqttDiskMinState is the least time subscriptions stay suspended for WAL disk
@@ -123,6 +125,9 @@ func (r suspendReasons) describe() string {
 	}
 	if r&suspendBufferFull != 0 {
 		parts = append(parts, "rows waiting to be flushed reached ingest.max_buffered_bytes")
+	}
+	if r&suspendWALNotDurable != 0 {
+		parts = append(parts, "the WAL is not acknowledging writes as durable")
 	}
 	if len(parts) == 0 {
 		return "writes are refused on this node"
@@ -160,6 +165,17 @@ func (m *SubscriptionManager) SetWALDiskPressure(on bool) {
 // another.
 func (m *SubscriptionManager) SetBufferFull(on bool) {
 	m.setHeld(&m.bufferFull, suspendBufferFull, on)
+}
+
+// SetWALNotDurable suspends every subscription while the WAL refuses writes
+// as not durable (a stalled or failing device: a timed-out or failed sync,
+// #1501, #1502) and resumes them once a sync succeeds and no other reason
+// holds them. Timed as SetWALDiskPressure is. The message in flight when the
+// refusal starts is still briefly retried and then dropped, as for the other
+// reasons; the ones that follow wait at the broker (QoS 1 or 2,
+// clean_session=false).
+func (m *SubscriptionManager) SetWALNotDurable(on bool) {
+	m.setHeld(&m.notDurable, suspendWALNotDurable, on)
 }
 
 func (m *SubscriptionManager) setHeld(h *heldReason, reason suspendReasons, on bool) {
