@@ -166,3 +166,23 @@ func TestLoad_WALAckModeDurableWithoutWALWarns(t *testing.T) {
 	}
 	t.Fatalf("no wal.ack_mode warning with the WAL disabled: %+v", cfg.Warnings)
 }
+
+// #1501: the durable wait is bounded by wal.ack_timeout_seconds, 30 by default; 0 is no bound.
+func TestLoad_WALAckTimeoutDefaultAndBounds(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.WAL.AckTimeoutSeconds != 30 {
+		t.Errorf("WAL.AckTimeoutSeconds = %d, want 30", cfg.WAL.AckTimeoutSeconds)
+	}
+	t.Setenv("ARC_WAL_ACK_TIMEOUT_SECONDS", "0")
+	if cfg, err = Load(); err != nil || cfg.WAL.AckTimeoutSeconds != 0 {
+		t.Fatalf("0 (no bound) rejected: %v, %+v", err, cfg)
+	}
+	t.Setenv("ARC_WAL_ACK_TIMEOUT_SECONDS", "-5")
+	if _, err = Load(); err == nil || !strings.Contains(err.Error(), "wal.ack_timeout_seconds") {
+		t.Fatalf("Load() error = %v, want a wal.ack_timeout_seconds error", err)
+	}
+}

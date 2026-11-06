@@ -520,6 +520,11 @@ type WALConfig struct {
 	AckMode string
 	// AckModeAuto records that AckMode was resolved from "auto".
 	AckModeAuto bool
+	// AckTimeoutSeconds bounds a durable write's wait for its covering sync
+	// (#1501): past it the write is refused (503, wal_not_durable) and its
+	// entries retracted without waiting on the device. Default 30; 0 = no
+	// bound. See wal.WriterConfig.AckTimeout.
+	AckTimeoutSeconds int
 	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
 	// volume is low on free space, and keeps the WAL reserve file (#676).
 	// Default true; only acts with the WAL enabled.
@@ -1274,6 +1279,7 @@ func Load() (*Config, error) {
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
 			AckMode:                 v.GetString("wal.ack_mode"),
+			AckTimeoutSeconds:       v.GetInt("wal.ack_timeout_seconds"),
 			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
 			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
 			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
@@ -1540,6 +1546,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.WAL.AckMode == "durable" && coverageInEffect {
 		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true on a clustered writer")
+	}
+	if cfg.WAL.AckTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("wal.ack_timeout_seconds must be 0 (no bound) or positive, got %d", cfg.WAL.AckTimeoutSeconds)
 	}
 	if cfg.WAL.DiskMinFreeMB < 0 {
 		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
@@ -2253,6 +2262,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
 	v.SetDefault("wal.ack_mode", "auto")               // durable with the WAL on (#1499); queued with it off or with cluster.wal_coverage
+	v.SetDefault("wal.ack_timeout_seconds", 30)        // A durable write waits at most this long for its sync (#1501); 0 = no bound
 	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
 	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
 	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes

@@ -1060,6 +1060,7 @@ func main() {
 			BufferSize:   cfg.WAL.BufferSize,
 			SyncBytes:    cfg.WAL.SyncBytes,
 			AckMode:      wal.AckMode(cfg.WAL.AckMode),
+			AckTimeout:   walAckTimeout(cfg.WAL.AckTimeoutSeconds),
 			Logger:       logger.Get("wal"),
 		})
 		if err != nil {
@@ -1081,6 +1082,7 @@ func main() {
 			Str("sync_mode", cfg.WAL.SyncMode).
 			Str("ack_mode", cfg.WAL.AckMode).
 			Bool("ack_mode_auto", cfg.WAL.AckModeAuto).
+			Int("ack_timeout_seconds", cfg.WAL.AckTimeoutSeconds).
 			Int("max_size_mb", cfg.WAL.MaxSizeMB).
 			Int("max_age_seconds", cfg.WAL.MaxAgeSeconds).
 			Bool("disk_pressure_enabled", walDisk != nil)
@@ -5869,6 +5871,16 @@ func walCoverageHold(outbox *cluster.RegistrationOutbox) func() wal.CoverageHold
 // cluster.wal_coverage on a Pattern-1 node (local storage) that writes a WAL
 // and announces its files through the journaled registration outbox. Before
 // recovery, so replayed entries keep their coverage.
+// walAckTimeout maps wal.ack_timeout_seconds to WriterConfig.AckTimeout: 0
+// in the config is "no bound", which the writer spells as a negative value
+// (its own zero means the default).
+func walAckTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return -1
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func enableWALCoverage(cfg *config.Config, buffer *ingest.ArrowBuffer, walWriter *wal.Writer, outbox *cluster.RegistrationOutbox, logger zerolog.Logger) {
 	if !cfg.Cluster.WALCoverage {
 		return
