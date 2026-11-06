@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -56,10 +57,11 @@ func IsNameSpellingError(err error) bool {
 	return errors.As(err, &e)
 }
 
-// listingTrustAge is how old a directory's mtime must be before its cached
-// listing is trusted. A remove and a create landing within one mtime tick
-// would leave the mtime unchanged; volumes with coarse timestamps (exFAT
-// keeps 10 ms to 2 s) make that window real.
+// listingTrustAge is how long after a directory's mtime a listing must have
+// been taken to be trusted while that mtime is unchanged. A remove and a
+// create landing within one mtime tick leave the mtime unchanged; volumes
+// with coarse timestamps (exFAT keeps 10 ms to 2 s) make that window real.
+// A listing taken within it is never trusted, however old it grows.
 const listingTrustAge = 2 * time.Second
 
 // nameSpelling is the guard's state on a LocalBackend.
@@ -73,8 +75,9 @@ type nameSpelling struct {
 }
 
 type dirListing struct {
-	mod   time.Time
-	names map[string]struct{}
+	mod     time.Time
+	takenAt time.Time
+	names   map[string]struct{}
 }
 
 // maxSpellingListings bounds the listing cache: one entry per directory the
@@ -185,7 +188,8 @@ func (b *LocalBackend) checkSpelling(segments []string) (missing bool, err error
 // entry reports whether parent holds an entry the filesystem resolves seg
 // to, and that entry's spelling on disk.
 func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, err error) {
-	st, err := os.Lstat(parent)
+	// Stat, not Lstat: a symlinked storage root's own mtime never changes.
+	st, err := os.Stat(parent)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, "", nil
@@ -196,11 +200,12 @@ func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, er
 	s.mu.Lock()
 	l, ok := s.listings[parent]
 	s.mu.Unlock()
-	if ok && l.mod.Equal(mod) && time.Since(mod) >= listingTrustAge {
+	if ok && l.mod.Equal(mod) && l.takenAt.Sub(mod) >= listingTrustAge {
 		if _, ok := l.names[seg]; ok {
 			return true, seg, nil
 		}
 	}
+	takenAt := time.Now()
 	entries, err := os.ReadDir(parent)
 	if err != nil {
 		return false, "", err
@@ -213,7 +218,7 @@ func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, er
 	if len(s.listings) >= maxSpellingListings {
 		clear(s.listings)
 	}
-	s.listings[parent] = dirListing{mod: mod, names: names}
+	s.listings[parent] = dirListing{mod: mod, takenAt: takenAt, names: names}
 	s.mu.Unlock()
 	if _, ok := names[seg]; ok {
 		return true, seg, nil
@@ -227,9 +232,16 @@ func (s *nameSpelling) entry(parent, seg string) (exists bool, onDisk string, er
 		}
 		return false, "", err
 	}
-	for _, e := range entries {
-		if info, err := os.Lstat(filepath.Join(parent, e.Name())); err == nil && os.SameFile(info, target) {
-			return true, e.Name(), nil
+	// Likely candidates first (a Unicode case fold), then every entry, for
+	// folds strings.EqualFold does not apply (normalization).
+	for _, pass := range [2]bool{true, false} {
+		for _, e := range entries {
+			if pass != strings.EqualFold(e.Name(), seg) {
+				continue
+			}
+			if info, err := os.Lstat(filepath.Join(parent, e.Name())); err == nil && os.SameFile(info, target) {
+				return true, e.Name(), nil
+			}
 		}
 	}
 	// Resolved, but to no listed entry (renamed in between): refuse rather

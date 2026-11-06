@@ -14,8 +14,8 @@ import (
 )
 
 // On a volume that folds names, a live write under another spelling of an
-// existing measurement or database is a content refusal; a replicated or
-// replayed entry (skipWAL) was accepted where it was written and is not.
+// existing measurement or database is a content refusal; a replayed WAL
+// entry (skipWAL) was accepted when it was written and is not.
 func TestLiveWriteRefusesAnotherSpelling_Issue1509(t *testing.T) {
 	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
 	if err != nil {
@@ -47,11 +47,38 @@ func TestLiveWriteRefusesAnotherSpelling_Issue1509(t *testing.T) {
 			t.Errorf("%s/%s typed: got %v, want a content refusal", tc.db, tc.meas, err)
 		}
 	}
-	if err := b.WriteColumnarDirectNoWAL(ctx, "db", "CPU", cols()); err != nil {
-		t.Fatalf("replicated write refused: %v", err)
+	if err := b.WriteColumnarDirectReplay(ctx, "db", "CPU", cols(), ""); err != nil {
+		t.Fatalf("WAL replay refused: %v", err)
 	}
 }
 
 func storageSpellingText(err error) bool {
 	return strings.Contains(err.Error(), "exists in storage as") && strings.Contains(err.Error(), "use the existing spelling")
+}
+
+// A write refused for its content does not claim the spelling: the name
+// check runs last of the content refusals, and it creates the directories.
+func TestContentRefusedWriteDoesNotClaimSpelling_Issue1509(t *testing.T) {
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !backend.CaseFolds() {
+		t.Skip("temp volume does not fold letter case")
+	}
+	b := NewArrowBuffer(&config.IngestConfig{MaxBufferSize: 1000, MaxBufferAgeMS: 600000, Compression: "snappy", ShardCount: 1, FlushWorkers: 1, FlushQueueSize: 4, FlushTimeoutSeconds: 2}, backend, zerolog.Nop())
+	defer b.Close()
+	ctx := context.Background()
+	mixed := map[string][]interface{}{"time": {time.Now().UnixMicro(), time.Now().UnixMicro()}, "v": {1.0, "x"}}
+	if err := b.WriteColumnarDirect(ctx, "db", "CPU", mixed); err == nil || storageSpellingText(err) {
+		t.Fatalf("mixed-type write: got %v, want a value refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(backend.GetBasePath(), "db", "CPU")); err == nil {
+		entries, _ := os.ReadDir(filepath.Join(backend.GetBasePath(), "db"))
+		t.Fatalf("a refused write created its measurement directory: %v", entries)
+	}
+	ok := map[string][]interface{}{"time": {time.Now().UnixMicro()}, "v": {1.0}}
+	if err := b.WriteColumnarDirect(ctx, "db", "cpu", ok); err != nil {
+		t.Fatalf("valid write after a refused one: %v", err)
+	}
 }
