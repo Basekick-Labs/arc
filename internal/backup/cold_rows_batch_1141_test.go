@@ -208,8 +208,9 @@ func (b *cancellingColdBackend) Write(ctx context.Context, path string, data []b
 // cold store are still written. The final flush therefore runs on a context
 // detached from the restore's — on the restore's own it would fail to begin a
 // transaction and write nothing, in exactly the situation the deferred flush
-// exists for. Nothing else ever writes those rows on a standalone node: the
-// cold-metadata sync does not run there.
+// exists for. A later cold-metadata scan can repair missing rows, including
+// on a standalone node, but the files remain unreadable until that scan
+// succeeds.
 func TestColdRestoreFlushesTierRowsAfterACancelledRestore(t *testing.T) {
 	rig := newColdRig(t, nil)
 	first := "prod/cpu/2026/01/01/00/a.parquet"

@@ -157,6 +157,45 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	return nil
 }
 
+// WriteIfAbsent writes data at path unless a file is already there
+// (ConditionalWriter). The bytes go to a temporary file first and are linked
+// into place: link fails when the target exists and never exposes a partial
+// file, which a plain O_EXCL create of the target would.
+func (b *LocalBackend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return false, fmt.Errorf("invalid path: %w", err)
+	}
+	dir := filepath.Dir(fullPath)
+	if err := b.ensureDir(dir); err != nil {
+		return false, err
+	}
+	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
+	if err != nil {
+		return false, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	_, writeErr := tmpFile.Write(data)
+	closeErr := tmpFile.Close()
+	if writeErr != nil {
+		return false, fmt.Errorf("failed to write temp file: %w", writeErr)
+	}
+	if closeErr != nil {
+		return false, fmt.Errorf("failed to close temp file: %w", closeErr)
+	}
+	if err := os.Link(tmpPath, fullPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		metrics.Get().IncStorageErrors()
+		return false, fmt.Errorf("failed to link file into place: %w", err)
+	}
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
+	return true, nil
+}
+
 // partPath returns the persistent in-progress path for a file being written by
 // WriteReader or AppendReader. Using a deterministic name (rather than a
 // random .tmp) means a partial write that survives a crash or transport error
@@ -881,6 +920,11 @@ var errHiddenName = errors.New("storage: name is dot-prefixed")
 // would miss everything skipped for another reason, and would drift again the
 // next time a listing grows a filter (#756).
 func omittedFromListing(base, relPath string) error {
+	// A prepared license namespace is not part of the predecessor dataset.
+	// In particular, an interrupted handoff must not rediscover its copies.
+	if relPath == ".arc-license-oss" || strings.HasPrefix(relPath, ".arc-license-oss/") {
+		return errHiddenName
+	}
 	// Dot-prefixed names cover Arc's own in-flight ".arc-*.tmp" writes and OS
 	// debris such as .DS_Store. Note it also covers dot-prefixed DATA files,
 	// which the key contract accepts, which is why this is part of the
@@ -1010,7 +1054,7 @@ func ValidateKey(key string) error {
 		return fmt.Errorf("%w: key is empty", ErrInvalidPath)
 	}
 	if key[len(key)-1] == '/' {
-		return fmt.Errorf("%w: %q ends in a separator, which names the same object as %q", ErrInvalidPath, key, key[:len(key)-1])
+		return fmt.Errorf("%w: key ends in a separator, which names the same object as the key without it", ErrInvalidPath)
 	}
 	// PartSuffix is reserved because LocalBackend stages every write at
 	// key+PartSuffix. Without this the staging file of key "x" IS the
@@ -1024,7 +1068,7 @@ func ValidateKey(key string) error {
 	// key remains portable between backends, which is the property #743
 	// established.
 	if strings.HasSuffix(key, PartSuffix) {
-		return fmt.Errorf("%w: %q ends in %q, which is reserved for write staging", ErrInvalidPath, key, PartSuffix)
+		return fmt.Errorf("%w: key ends in %s, which is reserved for write staging", ErrInvalidPath, PartSuffix)
 	}
 	return validateKeyBody(key)
 }
@@ -1050,7 +1094,7 @@ func ValidateListPrefix(prefix string) error {
 		return nil
 	}
 	if prefix == "/" {
-		return fmt.Errorf("%w: %q is not a relative prefix; use \"\" for everything", ErrInvalidPath, prefix)
+		return fmt.Errorf("%w: root separator is not a relative prefix; use an empty prefix for everything", ErrInvalidPath)
 	}
 	if prefix[len(prefix)-1] == '/' {
 		prefix = prefix[:len(prefix)-1]
@@ -1069,7 +1113,7 @@ func validateKeyBody(p string) error {
 		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxUsableKeyLen)
 	}
 	if p[0] == '/' {
-		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, p)
+		return fmt.Errorf("%w: path must be relative to the backend root", ErrInvalidPath)
 	}
 	start := 0
 	for i := 0; i <= len(p); i++ {
@@ -1079,14 +1123,14 @@ func validateKeyBody(p string) error {
 				return fmt.Errorf("%w: contains a NUL byte", ErrInvalidPath)
 			}
 			if c == '\\' {
-				return fmt.Errorf("%w: %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, p)
+				return fmt.Errorf("%w: path contains a backslash, which Azure treats as a separator", ErrInvalidPath)
 			}
 			if c != '/' {
 				continue
 			}
 		}
 		if err := checkSegment(p[start:i]); err != nil {
-			return fmt.Errorf("%w (in %q)", err, p)
+			return err
 		}
 		start = i + 1
 	}
@@ -1101,8 +1145,10 @@ func checkSegment(seg string) error {
 	switch seg {
 	case "":
 		return fmt.Errorf("%w: contains an empty segment", ErrInvalidPath)
-	case ".", "..":
-		return fmt.Errorf("%w: contains a %q segment", ErrInvalidPath, seg)
+	case ".":
+		return fmt.Errorf("%w: contains a single-dot segment", ErrInvalidPath)
+	case "..":
+		return fmt.Errorf("%w: contains a double-dot segment", ErrInvalidPath)
 	}
 	if len(seg) > MaxUsableKeySegmentLen {
 		return fmt.Errorf("%w: has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, len(seg), MaxUsableKeySegmentLen)
@@ -1135,9 +1181,9 @@ func ValidateKeySegment(seg string) error {
 		case 0:
 			return fmt.Errorf("%w: segment contains a NUL byte", ErrInvalidPath)
 		case '\\':
-			return fmt.Errorf("%w: segment %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, seg)
+			return fmt.Errorf("%w: segment contains a backslash, which Azure treats as a separator", ErrInvalidPath)
 		case '/':
-			return fmt.Errorf("%w: segment %q contains a separator, so it names more than one path component", ErrInvalidPath, seg)
+			return fmt.Errorf("%w: segment contains a separator, so it names more than one path component", ErrInvalidPath)
 		}
 	}
 	return checkSegment(seg)
@@ -1165,7 +1211,7 @@ const globMetacharacters = `*?[]{}`
 // segment of everything that spoke writes into the hub's storage root.
 func ValidateGlobSafe(s string) error {
 	if i := strings.IndexAny(s, globMetacharacters); i >= 0 {
-		return fmt.Errorf("%w: %q contains the glob metacharacter %q, which would match more than one path", ErrInvalidPath, s, s[i])
+		return fmt.Errorf("%w: contains the glob metacharacter %U, which would match more than one path", ErrInvalidPath, rune(s[i]))
 	}
 	return nil
 }
@@ -1184,7 +1230,7 @@ func (b *LocalBackend) stagedPath(key string) (string, error) {
 		return "", fmt.Errorf("%w: key is empty", ErrInvalidPath)
 	}
 	if key[len(key)-1] == '/' {
-		return "", fmt.Errorf("%w: %q ends in a separator", ErrInvalidPath, key)
+		return "", fmt.Errorf("%w: key ends in a separator", ErrInvalidPath)
 	}
 	if err := validateKeyBody(key); err != nil {
 		return "", err

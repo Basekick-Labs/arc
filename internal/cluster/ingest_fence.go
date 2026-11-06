@@ -254,6 +254,9 @@ func (f *ingestFence) inSteadyContact() bool {
 // is another node, healthy, with an API address. Never derived from a refusal
 // error, and counts nothing.
 func (c *Coordinator) WriteForwardTarget() (*Node, bool) {
+	if !c.LicenseWritesAllowed() {
+		return nil, false
+	}
 	if c.cfg.SharedStorageMode || c.raftNode == nil || c.localNode == nil || c.localNode.Role != RoleWriter {
 		return nil, false
 	}
@@ -265,6 +268,9 @@ func (c *Coordinator) WriteForwardTarget() (*Node, bool) {
 	}
 	d := fsm.PrimaryWriterIDFast()
 	if d == "" || d == c.localNode.ID {
+		return nil, false
+	}
+	if !c.allocationAllows(d) {
 		return nil, false
 	}
 	if c.claimedExit.Load() || c.takeoverGateClosed() || c.deleteAckOwed() {
@@ -378,6 +384,12 @@ func (c *Coordinator) IngestGate() func() error {
 
 // ingestRefusal is IngestGate's check, uncounted.
 func (c *Coordinator) ingestRefusal() error {
+	if !c.LicenseWritesAllowed() {
+		return fmt.Errorf("%w: paid license grace period has stopped writers; renew the license", ingest.ErrIngestFenced)
+	}
+	if !c.ServingAllowed() {
+		return fmt.Errorf("%w: node fenced by license lifecycle", ingest.ErrIngestFenced)
+	}
 	if c.claimedExit.Load() {
 		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverClaimed)
 	}

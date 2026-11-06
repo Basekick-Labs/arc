@@ -244,6 +244,24 @@ func (c *Coordinator) ManifestHotFiles(database, measurement string) []raft.File
 	return out
 }
 
+// FileArriving reports whether something is delivering path to this node:
+// the replication puller has it enqueued or in progress, or, on a shared
+// object store, a staged compaction holds it as an output. A DELETE run with
+// allow_unreachable stops waiting for a missing file nothing is delivering
+// (#1426).
+func (c *Coordinator) FileArriving(path string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	puller := c.puller
+	c.mu.RUnlock()
+	if puller != nil && puller.Pending(path) {
+		return true
+	}
+	return c.SharedObjectStore() && c.CompactionOutputHeld(path)
+}
+
 // WaitLocalFiles waits, up to budget, until MissingLocalFiles is empty, and
 // returns what is still missing. keep, when set, limits it to the files a
 // DELETE's time range can touch: a file it does not read is not waited for.

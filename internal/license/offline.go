@@ -79,12 +79,17 @@ func NewOfflineClient(path string, logger zerolog.Logger) (*Client, error) {
 			return nil, fmt.Errorf("offline license verification failed: %w", err)
 		}
 	}
-	now := time.Now().UTC()
+	clock := c.runtimeClock()
+	now := clock.now()
+	if now.IsZero() {
+		return nil, fmt.Errorf("license clock unavailable")
+	}
 	if !now.Before(signed.ExpiresAt) {
 		return nil, fmt.Errorf("offline license expired at %s", signed.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 
 	lic := signed.ToRuntimeLicense(now)
+	lic.clock = clock
 	c.mu.Lock()
 	c.license = lic
 	c.source = SourceFile

@@ -204,10 +204,9 @@ type Manifest struct {
 	// because it is also a report about the node: cold metadata that does not
 	// match the store.
 	//
-	// Not necessarily transient. The tiering cold sync that would record the
-	// missing rows only runs on a cluster with shared storage or replication,
-	// so on a standalone node, and on a local-storage cluster without
-	// replication, nothing will ever record them.
+	// The next successful tier scan can record missing rows on any node with a
+	// usable cold tier, including a standalone node. Until that scan succeeds,
+	// this count records the mismatch seen by the backup.
 	ColdObjectsUnrecorded int64 `json:"cold_objects_unrecorded,omitempty"`
 	// ColdDedupSkipped counts paths that were in BOTH the hot and the cold
 	// listing — the window a migration opens by copying to cold before
@@ -428,10 +427,9 @@ type Progress struct {
 	// — the bytes were written, the row was left alone, and the file is not
 	// queryable until an operator clears the quarantine.
 	// ColdRowsNotRecorded counts files whose bytes reached the cold store but
-	// whose row could not be written, which is the same unqueryable outcome
-	// from a different cause — and on a node where the cold-metadata sync
-	// never runs (standalone, or a cluster without shared storage or
-	// replication) nothing will write that row later either.
+	// whose row could not be written. Those files are not queryable until a
+	// later successful tier scan records the missing rows; the scan also runs
+	// on standalone nodes.
 	ColdFilesRestoredToCold int64 `json:"cold_files_restored_to_cold,omitempty"`
 	ColdFilesRestoredToHot  int64 `json:"cold_files_restored_to_hot,omitempty"`
 	// ColdFilesSkippedAlreadyCold counts hot-backup files whose matching cold

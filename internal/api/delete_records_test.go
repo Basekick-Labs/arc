@@ -189,6 +189,7 @@ func (f *recordingFlusher) FlushScopeAndWait(_ context.Context, db, m string) (m
 func (f *recordingFlusher) HasFlushFailure() bool { return f.failure }
 
 func TestDeleteRecordsTheDeleteBeforeRewriting(t *testing.T) {
+	shortGiveUp(t, 100*time.Millisecond)
 	root, backend, db := recordsDuckDB(t)
 	const rel = "db/cpu/2026/10/11/10/cpu_a.parquet"
 	send := func(h *DeleteHandler, body string) (int, DeleteResponse) {

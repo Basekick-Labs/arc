@@ -233,19 +233,40 @@ type localFileWaiter interface {
 	WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration, keep func(path string) bool) ([]string, error)
 }
 
-func (h *DeleteHandler) waitLocalFiles(ctx context.Context, w localFileWaiter, database, measurement string, allowUnreachable bool, window *deleteWindow) (missing []string, err error) {
+func (h *DeleteHandler) waitLocalFiles(ctx context.Context, w localFileWaiter, database, measurement string, allowUnreachable bool, window *deleteWindow, track *missingTracker) (missing []string, err error) {
 	var keep func(string) bool
 	if window != nil {
 		keep = window.keeps
 	}
-	missing, err = w.WaitLocalFiles(ctx, database, measurement, deleteLocalWait, keep)
-	if err != nil {
-		return nil, err
+	if !allowUnreachable || track == nil {
+		missing, err = w.WaitLocalFiles(ctx, database, measurement, deleteLocalWait, keep)
+		if err != nil {
+			return nil, err
+		}
+		if len(missing) > 0 && !allowUnreachable {
+			return missing, errUnreachableFiles
+		}
+		return missing, nil
 	}
-	if len(missing) > 0 && !allowUnreachable {
-		return missing, errUnreachableFiles
+	// With allow_unreachable: one check at a time, so a file nothing is
+	// delivering is given up after deleteGiveUpAfter instead of holding the
+	// whole budget (#1426). A file given up earlier in the request ends no
+	// wait of its own.
+	deadline := time.Now().Add(deleteLocalWait)
+	for {
+		missing, err = w.WaitLocalFiles(ctx, database, measurement, 0, keep)
+		if err != nil {
+			return nil, err
+		}
+		if len(track.waitFor(missing, time.Now())) == 0 || !time.Now().Before(deadline) {
+			return track.withGivenUp(missing, keep), nil
+		}
+		select {
+		case <-ctx.Done():
+			return track.withGivenUp(missing, keep), ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
-	return missing, nil
 }
 
 var errUnreachableFiles = errors.New("files the cluster manifest lists are not on this node yet")

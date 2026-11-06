@@ -71,6 +71,9 @@ func (h *RBACHandler) requireRBACLicense(c *fiber.Ctx) error {
 			"error":   "RBAC requires an enterprise license with the 'rbac' feature enabled",
 		})
 	}
+	if c.Method() != fiber.MethodGet && c.Method() != fiber.MethodHead && !h.rbacManager.CanManageRBAC() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"success": false, "error": "RBAC management is read-only during license degradation"})
+	}
 	return c.Next()
 }
 

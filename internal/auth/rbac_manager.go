@@ -293,6 +293,11 @@ func (rm *RBACManager) IsRBACEnabled() bool {
 	return lic.HasFeature(license.FeatureRBAC)
 }
 
+// CanManageRBAC is independent of enforcement of already stored grants.
+func (rm *RBACManager) CanManageRBAC() bool {
+	return rm != nil && rm.licenseClient != nil && rm.licenseClient.CanManageRBAC()
+}
+
 // =============================================================================
 // Organizations CRUD
 // =============================================================================

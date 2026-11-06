@@ -165,6 +165,15 @@ jobs:
           ARC_TEST_S3_ENDPOINT: http://localhost:9000
         run: go test -tags="duckdb_arrow objectstore" ./internal/api/ -run '^TestReplaceManifestAfterRewriteDeletesOriginalS3Object$'
 
+      # Iceberg export on an S3 primary (#939): the exporter publishes through
+      # iceberg-go's S3 FileIO with Arc's own credentials, reads footers from
+      # the object tail, and reads the table back through the same FileIO.
+      - name: Test Iceberg export against real object storage
+        env:
+          ARC_TEST_S3_BUCKET: arctest
+          ARC_TEST_S3_ENDPOINT: http://localhost:9000
+        run: go test -tags="duckdb_arrow objectstore" ./internal/iceberg/
+
       - name: Stop SeaweedFS
         if: always()
         run: docker rm -f arc-ci-seaweedfs || true

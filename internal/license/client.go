@@ -46,10 +46,18 @@ type ClientConfig struct {
 
 // Client handles license validation with the enterprise server
 type Client struct {
-	serverURL   string
-	licenseKey  string
-	fingerprint string
-	cacheDir    string
+	// A newly verified boot-time grant cannot enable half-built components.
+	runtimeRestartRequired bool
+	runtimeShapePinned     bool
+	pinnedRuntimeShape     string
+	validationMu           sync.Mutex
+	clock                  *authorityClock
+	requireAuthorityTime   bool
+	policyProtocol         int
+	serverURL              string
+	licenseKey             string
+	fingerprint            string
+	cacheDir               string
 	// offline marks a file-mode client (NewOfflineClient): network-free, no
 	// periodic validation, no cache.
 	offline bool
@@ -79,6 +87,8 @@ type VerifyRequest struct {
 // VerifyLicenseFile(LicenseFile, LicenseSignature) to derive a
 // verified License.
 type VerifyResponse struct {
+	TimeFile         string `json:"time_file,omitempty"`
+	TimeSignature    string `json:"time_signature,omitempty"`
 	Valid            bool   `json:"valid"`
 	LicenseFile      string `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
 	LicenseSignature string `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
@@ -110,7 +120,8 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	}
 
 	c := &Client{
-		serverURL:   LicenseServerURL,
+		serverURL: LicenseServerURL,
+		clock:     newAuthorityClock(), requireAuthorityTime: true, policyProtocol: 2,
 		licenseKey:  cfg.LicenseKey,
 		cacheDir:    cfg.CacheDir,
 		fingerprint: fingerprint,
@@ -153,6 +164,7 @@ var usableCoresFn = syscpu.CoresAtStartup
 // applyLicenseCoreLimits. A future server-side check reading the stored value
 // would have to decide which of these two it means.
 type ActivateRequest struct {
+	TimeNonce          string `json:"time_nonce,omitempty"`
 	LicenseKey         string `json:"license_key"`
 	MachineFingerprint string `json:"machine_fingerprint"`
 	Hostname           string `json:"hostname"`
@@ -167,6 +179,8 @@ type ActivateRequest struct {
 // Decoded LicenseFile bytes ARE what was signed; LicenseSignature is
 // RSA-PKCS1v15 SHA-256 over those exact bytes.
 type ActivateResponse struct {
+	TimeFile         string `json:"time_file,omitempty"`
+	TimeSignature    string `json:"time_signature,omitempty"`
 	Success          bool   `json:"success"`
 	LicenseFile      string `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
 	LicenseSignature string `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
@@ -184,10 +198,32 @@ type ActivateResponse struct {
 
 // Activate registers this machine with the license server
 func (c *Client) Activate(ctx context.Context) (*License, error) {
+	c.validationMu.Lock()
+	defer c.validationMu.Unlock()
+	return c.activate(ctx)
+}
+
+// licenseAPIURL selects the wire contract by endpoint. Protocol 2 never
+// negotiates or falls back to the legacy API when the authority lacks v2.
+func (c *Client) licenseAPIURL(action string) string {
+	version := "v1"
+	if c.policyProtocol == 2 {
+		version = "v2"
+	}
+	return fmt.Sprintf("%s/api/%s/%s", c.serverURL, version, action)
+}
+
+func (c *Client) activate(ctx context.Context) (*License, error) {
+	clock := c.runtimeClock()
+	nonce, err := timeNonce()
+	if err != nil {
+		return nil, transientErr("cannot generate license time challenge: %w", err)
+	}
+	started := clock.tick()
 	if c.offline {
 		return nil, fmt.Errorf("license client is in offline file mode; network operations are disabled")
 	}
-	url := fmt.Sprintf("%s/api/v1/activate", c.serverURL)
+	url := c.licenseAPIURL("activate")
 
 	hostname, _ := os.Hostname()
 	// runtime.NumCPU stays the machine figure. It also stays what
@@ -199,6 +235,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 
 	req := &ActivateRequest{
 		LicenseKey:         c.licenseKey,
+		TimeNonce:          nonce,
 		MachineFingerprint: c.fingerprint,
 		Hostname:           hostname,
 		Cores:              cores,
@@ -231,7 +268,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	}
 	defer resp.Body.Close()
 
-	if err := checkHTTPStatus(resp, c.licenseKey); err != nil {
+	if err := checkHTTPStatusForProtocol(resp, c.policyProtocol, c.licenseKey); err != nil {
 		return nil, fmt.Errorf("license activation failed: %w", err)
 	}
 	var activateResp ActivateResponse
@@ -276,11 +313,27 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	}
 	c.logger.Debug().Msg("signature verified")
 
-	license := signed.ToRuntimeLicense(time.Now().UTC())
+	if c.policyProtocol == 2 && signed.Policy == nil {
+		return nil, transientErr("signed expiry policy missing; license server upgrade required")
+	}
+	if signed.LicenseKey != c.licenseKey {
+		return nil, transientErr("signed license is for a different key")
+	}
+	if c.requireAuthorityTime || activateResp.TimeFile != "" || activateResp.TimeSignature != "" {
+		grant, err := verifyAuthorityTime(activateResp.TimeFile, activateResp.TimeSignature, nonce, c.licenseKey, c.fingerprint, activateResp.LicenseFile)
+		if err != nil {
+			return nil, transientErr("license server time rejected: %w", err)
+		}
+		if err := clock.accept(grant, started); err != nil {
+			return nil, transientErr("license server time rejected: %w", err)
+		}
+	}
+	license := signed.ToRuntimeLicense(clock.now())
+	license.clock = clock
 
 	// Store the license
 	c.mu.Lock()
-	c.license = license
+	c.storeRuntimeLicenseLocked(license)
 	c.source = SourceServer
 	c.mu.Unlock()
 
@@ -300,10 +353,22 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 
 // Verify validates the license with the enterprise server
 func (c *Client) Verify(ctx context.Context) (*License, error) {
+	c.validationMu.Lock()
+	defer c.validationMu.Unlock()
+	return c.verify(ctx)
+}
+
+func (c *Client) verify(ctx context.Context) (*License, error) {
+	clock := c.runtimeClock()
+	nonce, err := timeNonce()
+	if err != nil {
+		return nil, transientErr("cannot generate license time challenge: %w", err)
+	}
+	started := clock.tick()
 	if c.offline {
 		return nil, fmt.Errorf("license client is in offline file mode; network operations are disabled")
 	}
-	url := fmt.Sprintf("%s/api/v1/verify", c.serverURL)
+	url := c.licenseAPIURL("verify")
 
 	c.logger.Debug().
 		Str("license_key", c.licenseKey[:min(12, len(c.licenseKey))]+"...").
@@ -316,6 +381,7 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	}
 	q := httpReq.URL.Query()
 	q.Add("license_key", c.licenseKey)
+	q.Add("time_nonce", nonce)
 	q.Add("machine_fingerprint", c.fingerprint)
 	httpReq.URL.RawQuery = q.Encode()
 
@@ -330,7 +396,7 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	}
 	defer resp.Body.Close()
 
-	if err := checkHTTPStatus(resp, c.licenseKey); err != nil {
+	if err := checkHTTPStatusForProtocol(resp, c.policyProtocol, c.licenseKey); err != nil {
 		return nil, fmt.Errorf("license validation failed: %w", err)
 	}
 	var verifyResp VerifyResponse
@@ -377,11 +443,27 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	}
 	c.logger.Debug().Msg("signature verified")
 
-	license := signed.ToRuntimeLicense(time.Now().UTC())
+	if c.policyProtocol == 2 && signed.Policy == nil {
+		return nil, transientErr("signed expiry policy missing; license server upgrade required")
+	}
+	if signed.LicenseKey != c.licenseKey {
+		return nil, transientErr("signed license is for a different key")
+	}
+	if c.requireAuthorityTime || verifyResp.TimeFile != "" || verifyResp.TimeSignature != "" {
+		grant, err := verifyAuthorityTime(verifyResp.TimeFile, verifyResp.TimeSignature, nonce, c.licenseKey, c.fingerprint, verifyResp.LicenseFile)
+		if err != nil {
+			return nil, transientErr("license server time rejected: %w", err)
+		}
+		if err := clock.accept(grant, started); err != nil {
+			return nil, transientErr("license server time rejected: %w", err)
+		}
+	}
+	license := signed.ToRuntimeLicense(clock.now())
+	license.clock = clock
 
 	// Store the license
 	c.mu.Lock()
-	c.license = license
+	c.storeRuntimeLicenseLocked(license)
 	c.source = SourceServer
 	c.mu.Unlock()
 
@@ -401,8 +483,10 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 
 // ActivateOrVerify tries to verify first, and if the machine is not activated, activates it
 func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
+	c.validationMu.Lock()
+	defer c.validationMu.Unlock()
 	// Try to verify first
-	license, err := c.Verify(ctx)
+	license, err := c.verify(ctx)
 	if err == nil {
 		return license, nil
 	}
@@ -419,7 +503,7 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 	//     definitively ("license is not active").
 	if errors.Is(err, errActivationMissing) {
 		c.logger.Info().Msg("No live activation for this machine, attempting activation")
-		license, err = c.Activate(ctx)
+		license, err = c.activate(ctx)
 	}
 
 	// Only the final outcome is authoritative: a missing activation can recover
@@ -429,6 +513,7 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 		hadLicense := c.license != nil
 		c.license = nil
 		c.mu.Unlock()
+		c.runtimeClock().rejectLicense()
 		c.deleteCache()
 		if hadLicense {
 			c.logger.Warn().Err(err).Msg("License rejected; enterprise feature gates disabled")
@@ -481,6 +566,25 @@ func (c *Client) Stop() {
 func (c *Client) GetLicense() *License {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.runtimeRestartRequired {
+		return nil
+	}
+	return c.license
+}
+
+// RequireRuntimeRestart keeps configured services in OSS while a rejected boot
+// retries verification. A fresh process must apply resource limits and build
+// all authorized components before the new grant becomes effective.
+func (c *Client) RequireRuntimeRestart() { c.mu.Lock(); c.runtimeRestartRequired = true; c.mu.Unlock() }
+
+// PendingRuntimeLicense is verified authority for the lifecycle controller only;
+// it must not be used to activate individual services in the old process.
+func (c *Client) PendingRuntimeLicense() *License {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.runtimeRestartRequired {
+		return nil
+	}
 	return c.license
 }
 
@@ -488,28 +592,28 @@ func (c *Client) GetLicense() *License {
 func (c *Client) IsValid() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.IsValid()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.IsValid()
 }
 
 // IsEnterprise returns true if the license is enterprise tier or higher
 func (c *Client) IsEnterprise() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.IsEnterprise()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.IsEnterprise()
 }
 
 // CanUseCQScheduler returns true if CQ scheduling is allowed
 func (c *Client) CanUseCQScheduler() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseCQScheduler()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseCQScheduler()
 }
 
 // CanUseRetentionScheduler returns true if retention scheduling is allowed
 func (c *Client) CanUseRetentionScheduler() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseRetentionScheduler()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseRetentionScheduler()
 }
 
 // CanUseEdgeSyncScheduler reads the current entitlement, including revalidation.
@@ -519,14 +623,14 @@ func (c *Client) CanUseEdgeSyncScheduler() bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license.CanUseEdgeSyncScheduler()
+	return !c.runtimeRestartRequired && c.license.CanUseEdgeSyncScheduler()
 }
 
 // CanUseTieredStorage returns true if tiered storage is allowed
 func (c *Client) CanUseTieredStorage() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseTieredStorage()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseTieredStorage()
 }
 
 // CanUseClustering returns true if multi-node clustering is allowed.
@@ -536,35 +640,35 @@ func (c *Client) CanUseTieredStorage() bool {
 func (c *Client) CanUseClustering() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseClustering()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseClustering()
 }
 
 // CanUseAuditLogging returns true if audit logging is allowed
 func (c *Client) CanUseAuditLogging() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseAuditLogging()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseAuditLogging()
 }
 
 // CanUseWriterFailover returns true if automatic writer failover is allowed
 func (c *Client) CanUseWriterFailover() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseWriterFailover()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseWriterFailover()
 }
 
 // CanUseQueryGovernance returns true if query governance is allowed
 func (c *Client) CanUseQueryGovernance() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseQueryGovernance()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseQueryGovernance()
 }
 
 // CanUseQueryManagement returns true if query management is allowed
 func (c *Client) CanUseQueryManagement() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseQueryManagement()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseQueryManagement()
 }
 
 // CanUseArcx returns true if loading the proprietary arcx DuckDB
@@ -577,7 +681,7 @@ func (c *Client) CanUseQueryManagement() bool {
 func (c *Client) CanUseArcx() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseArcx()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseArcx()
 }
 
 // CanUseSharedStorageMultiWriter returns true if Pattern 2 multi-writer
@@ -588,7 +692,7 @@ func (c *Client) CanUseArcx() bool {
 func (c *Client) CanUseSharedStorageMultiWriter() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.license != nil && c.license.CanUseSharedStorageMultiWriter()
+	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseSharedStorageMultiWriter()
 }
 
 // GetFingerprint returns the machine fingerprint
@@ -647,13 +751,26 @@ func (c *Client) bindFingerprint(signed *SignedLicense) error {
 // secrets are removed from the preview: a proxy's error page can echo the
 // request, whose address carries the licence key on verify.
 func checkHTTPStatus(resp *http.Response, secrets ...string) error {
+	return checkHTTPStatusForProtocol(resp, 1, secrets...)
+}
+
+// V2 may be unavailable while the authority still serves v1. A router or proxy
+// can return a JSON error for that missing endpoint, which is not a license
+// verdict. Only the authority's frozen "license not found" 404 rejects a key.
+// Other statuses and the entire v1 classification retain their legacy behavior.
+func checkHTTPStatusForProtocol(resp *http.Response, protocol int, secrets ...string) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
 	// Drain a small bounded prefix of the body so the message can include
 	// the server's error text. Anything more than 4 KiB is almost
 	// certainly an HTML error page from an upstream proxy; truncate.
-	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	limit := int64(4 << 10)
+	v2NotFound := protocol == 2 && resp.StatusCode == http.StatusNotFound
+	if v2NotFound {
+		limit++ // Detect a truncated verdict without reading an unbounded body.
+	}
+	preview, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
 	previewStr := strings.TrimSpace(string(preview))
 	for _, s := range secrets {
 		if s != "" {
@@ -669,6 +786,12 @@ func checkHTTPStatus(resp *http.Response, secrets ...string) error {
 	}
 	definitive := resp.StatusCode >= 400 && resp.StatusCode < 500 &&
 		resp.StatusCode != 429 && isProtocolJSONBody(previewStr)
+	if v2NotFound {
+		var verdict struct {
+			Error string `json:"error"`
+		}
+		definitive = len(preview) <= 4<<10 && json.Unmarshal(preview, &verdict) == nil && verdict.Error == "license not found"
+	}
 	mk := transientErr
 	if definitive {
 		mk = definitiveErr
@@ -700,4 +823,24 @@ func withoutRequestQuery(err error) error {
 		ue.URL, _, _ = strings.Cut(ue.URL, "?")
 	}
 	return err
+}
+
+// CanManageRBAC allows management only while the policy permits changes.
+func (c *Client) CanManageRBAC() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !c.runtimeRestartRequired && c.license.CanManageRBAC()
+}
+
+// CanMigrateTieredStorage gates new migration work, not reads of existing data.
+func (c *Client) CanMigrateTieredStorage() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !c.runtimeRestartRequired && c.license.CanMigrateTieredStorage()
 }

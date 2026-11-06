@@ -37,6 +37,8 @@ import (
 
 // CompactorFailoverConfig holds configuration for the compactor failover manager.
 type CompactorFailoverConfig struct {
+	AutomaticAllowed func() bool
+	Eligible         func(string) bool
 	// Registry provides access to cluster node state.
 	Registry *Registry
 
@@ -228,6 +230,9 @@ func (m *CompactorFailoverManager) checkLoop() {
 // checkCompactorHealth verifies the active compactor is still healthy.
 // Only the Raft leader acts — other nodes observe the FSM callback.
 func (m *CompactorFailoverManager) checkCompactorHealth() {
+	if m.cfg.AutomaticAllowed != nil && !m.cfg.AutomaticAllowed() {
+		return
+	}
 	// Only the Raft leader coordinates failover.
 	if m.cfg.RaftNode == nil || !m.cfg.RaftNode.IsLeader() {
 		return
@@ -256,7 +261,7 @@ func (m *CompactorFailoverManager) checkCompactorHealth() {
 
 	// Check if the active compactor is still healthy.
 	node, ok := m.cfg.Registry.Get(activeID)
-	if !ok || node.GetState() != StateHealthy {
+	if !ok || node.GetState() != StateHealthy || (m.cfg.Eligible != nil && !m.cfg.Eligible(activeID)) {
 		m.consecutiveFails++
 		m.logger.Warn().
 			Str("compactor_id", activeID).
@@ -502,7 +507,7 @@ func (m *CompactorFailoverManager) selectNewCompactor(excludeNodeID string) stri
 		return id
 	}
 	// Then anything else the lease may sit on.
-	return lowestHealthyNodeID(m.cfg.Registry.GetHealthy(), excludeNodeID, func(r NodeRole) bool {
+	return lowestHealthyNodeID(m.eligibleNodes(m.cfg.Registry.GetHealthy()), excludeNodeID, func(r NodeRole) bool {
 		return r != RoleCompactor && canHoldCompactorLease(r)
 	})
 }
@@ -518,7 +523,20 @@ func (m *CompactorFailoverManager) selectNewCompactor(excludeNodeID string) stri
 // separate registry reads, so this must not be able to answer with a writer
 // if the compactor disappeared in between.
 func (m *CompactorFailoverManager) selectDedicatedCompactor(excludeNodeID string) string {
-	return lowestHealthyNodeID(m.cfg.Registry.GetCompactors(), excludeNodeID, nil)
+	return lowestHealthyNodeID(m.eligibleNodes(m.cfg.Registry.GetCompactors()), excludeNodeID, nil)
+}
+
+func (m *CompactorFailoverManager) eligibleNodes(nodes []*Node) []*Node {
+	if m.cfg.Eligible == nil {
+		return nodes
+	}
+	eligible := make([]*Node, 0, len(nodes))
+	for _, n := range nodes {
+		if m.cfg.Eligible(n.ID) {
+			eligible = append(eligible, n)
+		}
+	}
+	return eligible
 }
 
 // lowestHealthyNodeID returns the smallest node ID among healthy candidates
@@ -626,6 +644,9 @@ func (m *CompactorFailoverManager) TriggerManualFailover() error {
 // manual assignment from racing an automatic one that has already chosen a
 // different target.
 func (m *CompactorFailoverManager) AssignTo(nodeID string) (oldCompactorID string, err error) {
+	if m.cfg.Eligible != nil && !m.cfg.Eligible(nodeID) {
+		return "", fmt.Errorf("node is outside the licensed serving allocation")
+	}
 	if m.cfg.RaftNode == nil {
 		return "", fmt.Errorf("clustering is not configured with Raft")
 	}

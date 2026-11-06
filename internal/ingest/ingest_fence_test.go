@@ -33,18 +33,26 @@ func TestFencedWritesReachNeitherTheWALNorTheBuffer(t *testing.T) {
 			return b.WriteTypedColumnarDirect(ctx, "db", "m", batch, 1)
 		},
 	}
-	for name, write := range entries {
-		t.Run(name, func(t *testing.T) {
-			buffer, wal := newCheckpointBuffer(1000)
-			defer buffer.Close()
-			buffer.SetIngestGate(fencedGate)
-			if err := write(buffer); !errors.Is(err, ErrIngestFenced) {
-				t.Fatalf("err = %v, want ErrIngestFenced", err)
-			}
-			if handedOut, _ := wal.counts(); handedOut != 0 {
-				t.Fatalf("a fenced write reached the WAL (%d entries): it would resurface on recovery", handedOut)
-			}
-		})
+	for gateName, install := range map[string]func(*ArrowBuffer){
+		"cluster": func(b *ArrowBuffer) { b.SetIngestGate(fencedGate) },
+		"license": func(b *ArrowBuffer) {
+			b.SetLicenseIngestGate(fencedGate)
+			b.SetIngestGate(nil) // cluster startup cannot clear the license gate
+		},
+	} {
+		for name, write := range entries {
+			t.Run(gateName+"/"+name, func(t *testing.T) {
+				buffer, wal := newCheckpointBuffer(1000)
+				defer buffer.Close()
+				install(buffer)
+				if err := write(buffer); !errors.Is(err, ErrIngestFenced) {
+					t.Fatalf("err = %v, want ErrIngestFenced", err)
+				}
+				if handedOut, _ := wal.counts(); handedOut != 0 {
+					t.Fatalf("a fenced write reached the WAL (%d entries): it would resurface on recovery", handedOut)
+				}
+			})
+		}
 	}
 }
 
@@ -54,6 +62,7 @@ func TestReplayIsNotFenced(t *testing.T) {
 	buffer, _ := newCheckpointBuffer(1000)
 	defer buffer.Close()
 	buffer.SetIngestGate(fencedGate)
+	buffer.SetLicenseIngestGate(fencedGate)
 	cols := map[string][]interface{}{"time": {time.Now().UnixMicro()}, "value": {1.0}}
 	if err := buffer.WriteColumnarDirectReplay(context.Background(), "db", "m", cols, ""); err != nil {
 		t.Fatalf("replay refused by the ingest fence: %v", err)

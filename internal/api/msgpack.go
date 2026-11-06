@@ -449,8 +449,8 @@ localProcessing:
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err)
 		}
-		// A client error (#440, #1342), refused before the WAL; nothing was
-		// written.
+		// A client error (#440, #1342, #1424), refused before the WAL; nothing
+		// was written.
 		if ingest.IsContentRefusal(err) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}

@@ -152,6 +152,18 @@ default_sort_keys = ""
 # that gives up). An explicit import_write_concurrency (1-1024) is used as is.
 # import_write_concurrency = 0
 # import_queue_timeout_ms = 30000
+#
+# Buffered-bytes limit (#1468). When storage falls behind, rows waiting to be
+# flushed stay in memory; once they reach max_buffered_bytes (the estimate in
+# arc_buffer_bytes_buffered), new write requests are refused with a retryable
+# 503 (header X-Arc-Ingest-Refused: buffer_full) until flushes catch up, and
+# MQTT subscriptions pause so the broker holds their messages. Bulk imports are
+# refused from 90% of it and pace their writes below that. Off by default
+# ("0"); "auto" is half the detected memory limit (off when none is detected).
+# A backstop, not a heap bound: the estimate leaves out a flush's copies.
+# A refusal does not start a flush: keep an explicit value well above what
+# buffers hold before their size/age flush, or writes wait for the next one.
+# max_buffered_bytes = "0"   # or "auto", or a size such as "4GB"
 
 # -----------------------------------------------------------------------------
 # Compaction
@@ -516,9 +528,15 @@ include_reads = false           # Log GET/query requests (high volume)
 # primary storage, and with no target configured the destination is
 # local_path. A deployment whose local_path sits inside storage.local_path — or
 # whose storage.local_path is a parent of it, such as "./data" — boots today
-# and will not boot after the upgrade. The defaults below are disjoint and are
-# unaffected. An empty local_path with no target is refused too, where it used
-# to boot with the backup API quietly skipped.
+# and will not boot after the upgrade. The defaults in this file are disjoint
+# ("./data/arc" beside "./data/backups"). The .deb/.rpm/Arch packages are not
+# laid out that way: their systemd unit puts storage at /var/lib/arc/data, which
+# is a parent of "./data/backups" resolved from /var/lib/arc, so the unit also
+# sets ARC_BACKUP_LOCAL_PATH=/var/lib/arc/backups (#1463). That environment
+# variable overrides the value here; to change the backup directory on a
+# packaged install, override it with `systemctl edit arc`. An empty local_path
+# with no target is refused too, where it used to boot with the backup API
+# quietly skipped.
 enabled = true
 local_path = "./data/backups"           # Directory for local backups; see the refusal note above
 # How long one backup or one restore may run before its context is cancelled.

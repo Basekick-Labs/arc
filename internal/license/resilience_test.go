@@ -12,8 +12,9 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// newTestClient builds a client against a fake server with the test keypair
-// pinned and time compressed.
+// newTestClient exercises the legacy response/cache contract with the test
+// keypair and compressed retries. Production NewClient requires protocol 2;
+// its signed-policy/time contract is tested separately, including replacement keys.
 func newTestClient(t *testing.T, serverURL, cacheDir string) *Client {
 	t.Helper()
 	withTestPublicKey(t, &rsaKey1.PublicKey)
@@ -28,6 +29,8 @@ func newTestClient(t *testing.T, serverURL, cacheDir string) *Client {
 	}
 	c.serverURL = serverURL
 	c.httpClient.Timeout = 2 * time.Second
+	c.requireAuthorityTime = false
+	c.policyProtocol = 1
 	return c
 }
 

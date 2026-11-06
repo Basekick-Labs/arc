@@ -21,9 +21,9 @@ import (
 // scheduler has no compile-time dependency on the cluster package — the
 // gate is a function pointer plus a tiny interface, not an import.
 type ClusterGate interface {
-	// CanCompact reports whether the local node may run compaction. When
-	// the scheduler sees false, it logs a clear "gated" message and stays
-	// idle (NOT running, NOT an error).
+	// CanCompact reports whether the local node may execute compaction.
+	// Gates with temporary fences may additionally implement
+	// CanScheduleCompaction() bool to keep cron armed while execution waits.
 	CanCompact() bool
 	// Role returns the current node's role string for log messages. The
 	// scheduler only uses this for human-readable output, never for
@@ -37,9 +37,9 @@ type Scheduler struct {
 	schedule  string
 	tierNames []string // Specific tiers to process (must be non-empty and enabled)
 	enabled   bool
-	// clusterGate is the Phase 4 role check. When non-nil, Start() and
-	// TriggerNow() both consult it and refuse to run when CanCompact is
-	// false. nil gate means "no check, allow" — used by OSS / standalone
+	// clusterGate is the Phase 4 role check. Every execution checks
+	// CanCompact; Start may use its optional CanScheduleCompaction method.
+	// nil gate means "no check, allow" — used by OSS / standalone
 	// paths and by existing tests that predate Phase 4.
 	clusterGate ClusterGate
 
@@ -124,7 +124,13 @@ func (s *Scheduler) Start() error {
 	// enforcement, placed at the single chokepoint so scattered goroutines
 	// don't need individual checks. OSS/standalone pass no gate and
 	// short-circuit past this check.
-	if s.clusterGate != nil && !s.clusterGate.CanCompact() {
+	allowed := s.clusterGate == nil || s.clusterGate.CanCompact()
+	if gate, ok := s.clusterGate.(interface{ CanScheduleCompaction() bool }); ok {
+		// A temporary license fence must not permanently disable cron. The
+		// execution and manual-trigger paths still check CanCompact every time.
+		allowed = gate.CanScheduleCompaction()
+	}
+	if !allowed {
 		s.roleGated = true
 		s.logger.Info().
 			Str("role", s.clusterGate.Role()).

@@ -63,6 +63,10 @@ var (
 
 // RouterConfig holds configuration for the request router.
 type RouterConfig struct {
+	// Allowed filters durable licensed service owners, independently of health.
+	Allowed func(string) bool
+	// WriteAllowed is independent of reads and filters all live write forwarding.
+	WriteAllowed func() bool
 	// Timeout for forwarded requests
 	Timeout time.Duration
 
@@ -237,8 +241,11 @@ func (r *Router) RouteImport(ctx context.Context, req *http.Request) (*http.Resp
 // writeTarget picks the writer a write from this node goes to, or
 // ErrLocalNodeCanHandle when this node ingests itself.
 func (r *Router) writeTarget() (*Node, error) {
+	if r.cfg.WriteAllowed != nil && !r.cfg.WriteAllowed() {
+		return nil, ErrWriteForwardUnavailable
+	}
 	// Check if local node can handle writes
-	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanIngest {
+	if r.cfg.LocalNode != nil && (r.cfg.Allowed == nil || r.cfg.Allowed(r.cfg.LocalNode.ID)) && r.cfg.LocalNode.Role.GetCapabilities().CanIngest {
 		return nil, ErrLocalNodeCanHandle
 	}
 
@@ -247,6 +254,9 @@ func (r *Router) writeTarget() (*Node, error) {
 	writer := r.designatedWriter()
 	if writer == nil {
 		writer = r.cfg.Registry.GetPrimaryWriter()
+	}
+	if writer != nil && r.cfg.Allowed != nil && !r.cfg.Allowed(writer.ID) {
+		writer = nil
 	}
 	if writer == nil {
 		// Fall back to round-robin across healthy writers. In Pattern 2
@@ -261,6 +271,9 @@ func (r *Router) writeTarget() (*Node, error) {
 			return nil, ErrNoWriterAvailable
 		}
 		writer = r.selectWriter(writers)
+	}
+	if writer == nil || (r.cfg.Allowed != nil && !r.cfg.Allowed(writer.ID)) {
+		return nil, ErrNoWriterAvailable
 	}
 	return writer, nil
 }
@@ -307,6 +320,12 @@ func (r *Router) ForwardImportTo(ctx context.Context, node *Node, req *http.Requ
 }
 
 func (r *Router) forwardWriteOnce(ctx context.Context, client *http.Client, node *Node, req *http.Request) (*http.Response, error) {
+	if r.cfg.WriteAllowed != nil && !r.cfg.WriteAllowed() {
+		return nil, ErrWriteForwardUnavailable
+	}
+	if node == nil || (r.cfg.Allowed != nil && !r.cfg.Allowed(node.ID)) {
+		return nil, ErrWriteForwardUnavailable
+	}
 	// Whether any of the request left this node decides what a failure
 	// means, not the error's type: a dead host shows up as a timeout, a TLS
 	// failure as EOF.
@@ -409,6 +428,7 @@ func (r *Router) doForwardOnce(ctx context.Context, client *http.Client, node *N
 // list of writer nodes. Mirrors selectNode but uses writerIndex so
 // the rotation isn't perturbed by interleaved reader queries.
 func (r *Router) selectWriter(nodes []*Node) *Node {
+	nodes = r.allowedNodes(nodes)
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -430,12 +450,12 @@ func (r *Router) selectWriter(nodes []*Node) *Node {
 // Returns ErrLocalNodeCanHandle if this node can process the query directly.
 func (r *Router) RouteQuery(ctx context.Context, req *http.Request) (*http.Response, error) {
 	// Check if local node can handle queries
-	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanQuery {
+	if r.cfg.LocalNode != nil && (r.cfg.Allowed == nil || r.cfg.Allowed(r.cfg.LocalNode.ID)) && r.cfg.LocalNode.Role.GetCapabilities().CanQuery {
 		return nil, ErrLocalNodeCanHandle
 	}
 
 	// Find healthy readers
-	readers := r.cfg.Registry.GetReaders()
+	readers := r.allowedNodes(r.cfg.Registry.GetReaders())
 	if len(readers) == 0 {
 		// Fall back to writers if no readers (writers can also query in standalone/small clusters)
 		writers := r.cfg.Registry.GetWriters()
@@ -457,6 +477,7 @@ func (r *Router) RouteQuery(ctx context.Context, req *http.Request) (*http.Respo
 
 // selectNode selects a node from the list based on the configured strategy.
 func (r *Router) selectNode(nodes []*Node) *Node {
+	nodes = r.allowedNodes(nodes)
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -684,4 +705,17 @@ func (r *Router) Stats() map[string]interface{} {
 		"writer_index":       r.writerIndex.Load(),
 		"active_connections": connStats,
 	}
+}
+
+func (r *Router) allowedNodes(nodes []*Node) []*Node {
+	if r.cfg.Allowed == nil {
+		return nodes
+	}
+	out := make([]*Node, 0, len(nodes))
+	for _, n := range nodes {
+		if r.cfg.Allowed(n.ID) {
+			out = append(out, n)
+		}
+	}
+	return out
 }

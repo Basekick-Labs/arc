@@ -244,7 +244,7 @@ func GCSEndpointURL(endpoint string) (string, error) {
 	}
 	u, err := url.Parse(e)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("GCS endpoint %q is not a usable http(s) URL", endpoint)
+		return "", errors.New("GCS endpoint is not a usable http(s) URL")
 	}
 	if u.Path == "" || u.Path == "/" {
 		u.Path = "/storage/v1/"
@@ -473,13 +473,13 @@ func (b *GCSBackend) probeBucket() error {
 		return nil
 	}
 	if attrs.HierarchicalNamespace != nil && attrs.HierarchicalNamespace.Enabled {
-		return fmt.Errorf("GCS bucket %q has hierarchical namespace enabled, which Arc does not support; use a bucket without it", b.bucket)
+		return fmt.Errorf("GCS bucket %s has hierarchical namespace enabled, which Arc does not support; use a bucket without it", b.bucket)
 	}
 	if attrs.Billing != nil && attrs.Billing.RequesterPays {
 		// Every request against a requester-pays bucket must name a project to
 		// bill. Neither this backend nor DuckDB's query reads (whose GCS
 		// secret carries a token, not a billing project) send one.
-		return fmt.Errorf("GCS bucket %q has requester pays enabled, which Arc does not support; disable it or use another bucket", b.bucket)
+		return fmt.Errorf("GCS bucket %s has requester pays enabled, which Arc does not support; disable it or use another bucket", b.bucket)
 	}
 	if rp := attrs.RetentionPolicy; rp != nil && rp.RetentionPeriod > 0 {
 		ev := b.logger.Warn().Str("bucket", b.bucket).Str("role", b.roleName()).
@@ -732,7 +732,7 @@ func (b *GCSBackend) DeleteBatch(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	usable, errs := partitionValidKeys(b.prefix, paths)
+	usable, errs := partitionValidKeys(b.prefix, paths, b.logger, "GCS")
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup

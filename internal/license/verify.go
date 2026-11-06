@@ -122,6 +122,9 @@ func VerifyLicenseFile(licenseFileB64, signatureB64 string) (*SignedLicense, err
 		return nil, fmt.Errorf("%w: %v", ErrMalformedSignedLicense, err)
 	}
 
+	if err := signed.Policy.validate(signed.ExpiresAt); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedSignedLicense, err)
+	}
 	return signed, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -236,6 +237,7 @@ const (
 	CommandUpdateCQ
 	CommandDeleteCQ
 	CommandSetCQWatermark
+	CommandLicenseLifecycle
 )
 
 // Command represents a command to be applied to the FSM.
@@ -591,11 +593,12 @@ type RotateTokenPayload struct {
 // entries — no version field required. The reverse (newer snapshot decoded
 // by older binary) silently drops the unknown fields per encoding/json.
 type FSMSnapshot struct {
-	Nodes             map[string]*NodeInfo  `json:"nodes"`
-	PrimaryWriterID   string                `json:"primary_writer_id,omitempty"`
-	ActiveCompactorID string                `json:"active_compactor_id,omitempty"`
-	Files             map[string]*FileEntry `json:"files,omitempty"`  // File manifest (peer replication)
-	Tokens            map[int64]*TokenEntry `json:"tokens,omitempty"` // Cluster-wide auth tokens (Phase A)
+	LicenseLifecycle  *LicenseLifecycleState `json:"license_lifecycle,omitempty"`
+	Nodes             map[string]*NodeInfo   `json:"nodes"`
+	PrimaryWriterID   string                 `json:"primary_writer_id,omitempty"`
+	ActiveCompactorID string                 `json:"active_compactor_id,omitempty"`
+	Files             map[string]*FileEntry  `json:"files,omitempty"`  // File manifest (peer replication)
+	Tokens            map[int64]*TokenEntry  `json:"tokens,omitempty"` // Cluster-wide auth tokens (Phase A)
 	// Phase A.1: Cluster Auth Convergence (RBAC). Secondary indices
 	// (organizationsByName, teamsByOrg, etc.) are intentionally NOT
 	// persisted — Restore rebuilds them from the primary maps after the
@@ -630,6 +633,7 @@ type FSMSnapshot struct {
 // ClusterFSM implements the raft.FSM interface for cluster state management.
 // It maintains the authoritative state of nodes in the cluster.
 type ClusterFSM struct {
+	licenseLifecycle LicenseLifecycleState
 	// applyStarted and applyDone are the index of the last command Apply
 	// began and finished (#1207). Only FSM commands count: hashicorp/raft's
 	// AppliedIndex also counts barrier, no-op and configuration entries,
@@ -1291,6 +1295,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	}
 
 	switch cmd.Type {
+	case CommandLicenseLifecycle:
+		return f.applyLicenseLifecycle(cmd.Payload)
 	case CommandAddNode:
 		return f.applyAddNode(cmd.Payload)
 	case CommandRemoveNode:
@@ -1805,6 +1811,10 @@ func (f *ClusterFSM) applyPromoteWriter(payload []byte) interface{} {
 		f.mu.Unlock()
 		return fmt.Errorf("promote writer: node %s has role %s, expected writer", p.NodeID, newNode.Role)
 	}
+	if a := f.licenseLifecycle.Allocation; a != nil && !slices.Contains(a.ServingIDs, p.NodeID) {
+		f.mu.Unlock()
+		return fmt.Errorf("promote writer: node is outside the licensed serving allocation")
+	}
 
 	// Warn if OldPrimaryID doesn't match actual primary (informational only — FSM uses its own tracking)
 	oldPrimaryID := f.primaryWriterID
@@ -2207,6 +2217,10 @@ func (f *ClusterFSM) applyAssignCompactor(payload []byte) interface{} {
 	}
 
 	f.mu.Lock()
+	if a := f.licenseLifecycle.Allocation; a != nil && !slices.Contains(a.ServingIDs, p.NodeID) {
+		f.mu.Unlock()
+		return fmt.Errorf("assign compactor: node is outside the licensed serving allocation")
+	}
 	oldCompactorID := f.activeCompactorID
 	f.activeCompactorID = p.NodeID
 	callback := f.onCompactorAssigned
@@ -2929,7 +2943,9 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		claimsState = &streamClaimsState{Enabled: f.streamClaims, Takeover: tk}
 	}
 
+	lifecycle := cloneLicenseLifecycle(f.licenseLifecycle)
 	return &fsmSnapshot{
+		licenseLifecycle: &lifecycle,
 		compactionCommit: f.snapshotCompactionCommitLocked(),
 		clusterPolicies:  f.snapshotClusterPoliciesLocked(),
 		streamClaims:     claimsState,
@@ -3298,6 +3314,10 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.restoreCompactionCommitLocked(snapshot.CompactionCommit)
 	f.restoreClusterPoliciesLocked(snapshot.ClusterPolicies)
 	onCompactionPauseChanged := f.onCompactionPauseChanged
+	f.licenseLifecycle = LicenseLifecycleState{}
+	if snapshot.LicenseLifecycle != nil {
+		f.licenseLifecycle = cloneLicenseLifecycle(*snapshot.LicenseLifecycle)
+	}
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
 	f.barrierOrder = restoredOrder
@@ -3796,6 +3816,7 @@ func (f *ClusterFSM) FileCount() int {
 
 // fsmSnapshot implements raft.FSMSnapshot.
 type fsmSnapshot struct {
+	licenseLifecycle  *LicenseLifecycleState
 	nodes             map[string]*NodeInfo
 	primaryWriterID   string
 	activeCompactorID string
@@ -3819,6 +3840,7 @@ type fsmSnapshot struct {
 // Persist writes the snapshot to the given sink.
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	snapshot := FSMSnapshot{
+		LicenseLifecycle:       s.licenseLifecycle,
 		Nodes:                  s.nodes,
 		PrimaryWriterID:        s.primaryWriterID,
 		ActiveCompactorID:      s.activeCompactorID,
@@ -3916,6 +3938,18 @@ func (f *ClusterFSM) ReconcileAuthNow() bool {
 	}
 	fn(snap)
 	return true
+}
+
+// ReconcileAuthChecked serializes a final checked materialization with auth
+// callbacks. fn must not call the FSM or Raft. Call after a catch-up barrier.
+func (f *ClusterFSM) ReconcileAuthChecked(fn func(AuthSnapshot) error) error {
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
+	f.mu.RLock()
+	snap := f.authSnapshotLocked()
+	f.mu.RUnlock()
+	snap.AppliedIndex = f.applyDone.Load()
+	return fn(snap)
 }
 
 // authSnapshotLocked deep-copies the auth and RBAC maps. Caller holds f.mu.

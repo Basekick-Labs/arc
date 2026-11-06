@@ -2,20 +2,271 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: Iceberg export keeps files moved to an S3 cold tier ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Iceberg export and cold-tier tiering can now run together when the cold tier is
+S3 (`tiered_storage.cold.backend = "s3"`). A file that tiering moves to cold
+stays in the Iceberg table under its cold URI, with the same rows and
+statistics. External readers see the same data before, during and after a
+migration. Supported with a local or an S3 primary.
+
+- **Mixed-location tables:** with a local primary, an exported table holds
+  `file://` paths for hot data and `s3://` paths for cold data. A reader needs
+  access to both, so it must run on the Arc host with S3 credentials.
+- **Which copy is exported:** the one Arc's own queries read. When a file is
+  on both tiers (during a migration, or a hot-only database's cold copy), the
+  hot copy is exported until Arc's tier record says the file is cold.
+- **No extra reads:** a migrated file's entry is copied from the hot one, and
+  the cold object is not read. Only cold data the table never held hot is
+  read, once, with the cold tier's own credentials.
+- **Cost:** the cold tier is listed per measurement and the listing is cached.
+  Arc re-lists after every change it makes to the cold tier: a tiering cycle,
+  cold retention, a DELETE of a cold file, a database delete. Otherwise it
+  re-lists every `iceberg.cold_rescan_interval` seconds (new, default `3600`),
+  which bounds changes made outside Arc. Before the table drops a file that
+  left the hot tier, Arc checks the cold tier for it (one HEAD), so a
+  migration never makes the table lose a file.
+- **Window:** during the one pass between the hot copy's delete and the table
+  moving to the cold URI, a reader that already resolved the old URI can get
+  a not-found error. It never gets wrong rows. Compaction and retention
+  already have the same window.
+- **Refused at startup:** an Azure or GCS cold tier, or S3 cold on Google
+  Cloud Storage's interop endpoint, with Iceberg enabled.
+- **Unavailable cold tier:** if the cold tier is configured but cannot be
+  built, the export does not start, and the tables keep their last snapshot.
+- **Licensing:** new tier migrations require a license and Iceberg export does
+  not. A read-only cold backend remains available when migration permission
+  ends, so configured cold data can remain in reads and exports. If that
+  backend cannot be built, export keeps its last snapshot instead of dropping
+  migrated files.
+
+DELETE of a whole cold file now also drops the query caches, as cold retention
+already did.
+
+## New: Iceberg export on S3 primary storage ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Iceberg export now runs with `storage.backend = "s3"` (AWS S3 and S3-compatible
+stores), not only on local storage. Tables are written under the storage root
+(`s3://<bucket>/<prefix>/arc_<database>.db/<measurement>/`) and read by
+Iceberg engines with S3 access (verified with PyIceberg and DuckDB
+`iceberg_scan`).
+
+- **Credentials:** the export uses Arc's own S3 credentials and renews them the
+  same way: static keys, the default chain, IRSA on EKS, or an assumed role. No
+  credential is written into Iceberg metadata, the catalog or the logs.
+  Readers need their own read access to the bucket.
+- **Endpoint:** `storage.s3_endpoint` and `storage.s3_path_style` apply to the
+  export too. The `AWS_S3_ENDPOINT` environment variable no longer changes
+  where it writes.
+- **Cost:** schemas are read from each new file's footer (the last 64 KiB of
+  the object), never the whole file, and sizes come from the listing. After a
+  restart an unchanged table reads no footers.
+
+**Refused at startup with Iceberg enabled:**
+- `storage.backend` other than `local` or `s3` (Azure, GCS);
+- `storage.backend = "s3"` on Google Cloud Storage's S3-compatible endpoint;
+- an `iceberg.warehouse` outside the storage root (another bucket, another
+  prefix, or a local path with an S3 backend);
+- `cluster.shared_storage_mode = true` without `cluster.failover_enabled =
+  true`;
+- cold-tier tiering, as before.
+
+**Shared-storage clusters:** only the node holding the compactor lease
+exports, with no fallback to the static compactor role, and the lease is
+re-checked for each measurement. The table's current version is the one
+published in the warehouse, not the node's own catalog row:
+- a node that takes over, or comes back after a failover, continues from
+  the published version;
+- if two nodes commit the same version, the second one's publish is refused,
+  its pass fails, and it adopts the published version on the next pass,
+  logged as `another writer published this table version first`;
+- a node that lost its catalog (a new node, a deleted SQLite) continues the
+  existing table instead of creating a second one in the same directory. On
+  local storage too.
+
+**Upgrade:** nothing to do for local-storage deployments. To export an existing
+S3 deployment, set `iceberg.enabled = true`. The first pass registers every
+existing data file, reading each file's footer twice (once for the schema,
+once for its statistics); expect two ranged GETs per file on that pass.
+
+## Signed license-server time and cluster expiry lifecycle
+
+The development branch adds a nonce-bound signed authority clock, mandatory fresh
+online time after restart and explicit UTC paid/trial policy. Paid grace days 1–3
+retain licensed behavior. From day 4, processes restart gracefully every four
+hours; from day 7 through day 14 they also refuse new writer ingestion. The
+restrictions accumulate: writer stopping never cancels the four-hour restarts.
+Reads, recovery, RBAC management and tiering retain licensed behavior during grace.
+There are no additional day-8, day-9 or day-10 restrictions. Trials retain full
+Enterprise operation for their fourteen days, then transition directly to OSS
+on day 15 with no additional grace or paid-license degradation. Production uses
+a separate new key, retaining data/configuration and respecting its limits.
+Legacy signed expirations are not blindly extended. Transient validation errors
+do not reset the timeline; data authorization remains independent of management.
+
+Periodic restarts retain Raft membership and follow normal graceful shutdown;
+process replacement requires a successful drain. At the final cutoff the
+controller fences mutations, drains
+acknowledged ingest and background work, materializes a hash-verified manifest
+namespace on each participant and seals a durable OSS handoff. Every restart
+elects one standalone process through authenticated unanimous coordination; other
+nodes remain parked and ordinary Raft transport stops. Missing participants or
+failed drains/copies block the handoff instead of permitting independent writers.
+
+This requires compatible reachable participants. Resolved generated node IDs are
+persisted, and controller restarts resume incomplete peer releases.
+Prepared identity is recovered across PID changes even before local sealing;
+that recovery never grants permission to disable Raft. Effective OSS
+configuration disables shared-storage cluster mode without editing operator
+configuration. Hot namespaces stay inside the configured roots and are isolated
+by cluster and node. The drain joins admitted MQTT work and complete tiering
+cycles, retries WAL recovery failures, and checks auth/RBAC materialization.
+Keeping expired cluster configuration can select another node after coordinated
+restarts; later OSS writes remain preserved on their accepting node, without
+automatic cross-node merging. License reactivation reconstructs available
+standalone components and retains the current OSS owner. Rebuilding the former
+cluster and reconciling divergent OSS namespaces remain separate work.
+Changed feature sets or resource limits are held pending until process
+reconstruction. A retained topology above the new machine or aggregate core limit
+receives a durable supported serving subset after agreement on the replacement
+key; excess nodes remain fenced without removing their configuration, data or
+coordination membership. The allocation preserves the designated writer and
+revalidates actual selected core counts. Local seal durability is separate from global permission to leave
+Raft, so a crash before every participant persists retains a quorum recovery path.
+Isolated Docker acceptance covers paid and trial cutoffs, repeated restarts,
+shared S3 storage, generated IDs and controller crashes before global release
+with two and three voters. That earlier acceptance predates the revised grace
+schedule; multi-node periodic-restart acceptance, natural-expiry soak and production
+activation-server integration remain separate verification boundaries.
+See [the protocol and implementation status](docs/license-lifecycle.md).
+
+**Iceberg after final OSS handoff:** the new generation publishes through an
+independent local catalog and warehouse. Predecessor catalogs, warehouses and
+snapshots remain retained; they are not silently rebound to another backend.
+Directory readers must use the new warehouse logged at startup and have access
+to the selected node's local data. Subsequent OSS writes advance that new export.
+
+## Fix: Iceberg export counts each row once during a DELETE or a compaction ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Arc's queries leave out a file whose rows another file already holds, such as
+the file a row DELETE replaced while it is still in storage next to its
+rewrite. On a standalone node the Iceberg export did not: a reconcile pass
+between a partial DELETE publishing its rewrite and removing the old file
+published both, and external readers (PyIceberg, DuckDB `iceberg_scan`)
+counted the surviving rows twice. The window is normally milliseconds; if the
+removal failed, it lasted until the leftover drainer removed the old file.
+
+The export now leaves out exactly the files Arc's queries leave out (DELETE
+rewrites, compactions in flight, and on a cluster the same set its queries
+use). Where a query would guess (a stat that fails, an unreadable DELETE
+journal, the stale-local breaker), the export does not: that measurement's
+pass fails, keeps the previous snapshot, and is retried on the next pass.
+
+**A file removed while a measurement is being listed** (a compaction or DELETE
+finishing mid-listing) no longer drops its rows from that pass: the
+measurement is listed again, up to three times. If the files keep changing,
+the pass fails for that measurement and keeps the previous snapshot, logged
+as `file set of <db>/<measurement> kept changing under the listing`.
+
+## New: an opt-in limit on unflushed ingest data, refusing writes with 503 ([#1468](https://github.com/Basekick-Labs/arc/issues/1468))
+
+When storage falls behind (a slow disk or object store), the flush queue
+fills and each measurement's buffer keeps growing in memory with no limit,
+until the process runs out of memory. The new `ingest.max_buffered_bytes`
+makes Arc stop taking new writes first. It is **off by default**; nothing
+changes until you set it. Once the rows waiting to be flushed
+(`arc_buffer_bytes_buffered`) reach the limit, every write request is refused
+before any of it is written:
+
+- HTTP writes (MessagePack, line protocol, TLE, imports) answer **503** with
+  `Retry-After: 5` and `X-Arc-Ingest-Refused: buffer_full`. Nothing of a
+  refused request is stored, so retrying it is safe. Clients that already
+  retry the other 503 refusals (WAL disk pressure, cluster fencing) need no
+  change.
+- Bulk imports are refused from 90% of the limit, and a running import paces
+  its writes to stay below that level (each grouped write can still add up to
+  a few tens of MB at once). The limit never refuses an import part-way, but
+  while other writers keep the node near it a running import can wait out its
+  2-minute flush wait and end with a partial write, as it could before when
+  flushes did not keep up.
+- MQTT subscriptions are suspended until the buffer drains below 90% of the
+  limit (and for at least 5 seconds), as they are for WAL disk pressure. With
+  `clean_session = false` and QoS 1 or 2 the broker holds the messages; a
+  `clean_session = true` subscription loses what is published meanwhile. A
+  message already being handled when the limit is reached is retried for 2
+  seconds and then dropped (counted as failed).
+- WAL replay and continuous-query writes are never refused.
+- New counter `arc_ingest_buffer_full_rejections_total` (one per refused
+  request, imports refused from 90% included), and a warning in the log at
+  80% of the limit.
+
+Set `"auto"` for half the memory limit Arc detects (the container limit where
+there is one; off when none is detected), or a size (`"4GB"`, at least `1MB`).
+The default, `"0"`, keeps the limit off. Startup logs the value in use:
+
+```toml
+[ingest]
+max_buffered_bytes = "auto"   # or "4GB"; "0" (default) is off
+```
+
+Or `ARC_INGEST_MAX_BUFFERED_BYTES`. A refusal does not itself start a flush:
+an explicit limit below what buffers normally hold before their size or age
+flush (`max_buffer_size`, `max_buffer_age_ms`) refuses writes until the next
+one, even with storage keeping up, so set it well above that. It is a
+backstop, not a bound on memory:
+the estimate is a MessagePack request's payload size and leaves out the
+copies a flush makes, requests admitted at the same time can each overshoot it
+by their own size (up to `server.max_payload_size`), and WAL replay at startup
+can put a node over it until the replayed rows are flushed. The existing
+`arc_buffer_memory_pressure` gauge and its warning at 50% of the memory limit
+are unchanged.
+
+## Fix: a flush with more than 2 GiB in one text column is written instead of failing ([#1284](https://github.com/Basekick-Labs/arc/issues/1284))
+
+When storage fell behind and the flush queue stayed full, a measurement's
+buffer kept growing until one string or binary column of its flush held more
+than 2 GiB. Arrow addresses such a column with 32-bit offsets, so the flush
+failed with `failed to write Parquet: failed to write record batch: ...
+slice bounds out of range [:-2147483616]`. With the WAL on the rows stayed in
+the WAL and were replayed later; with it off they were lost. One MessagePack
+request could get there alone too: invalid UTF-8 is stored as U+FFFD, three
+bytes for each invalid byte, so a request under the 1 GiB payload limit could
+hold more than 2 GiB of text, and its flush failed on every replay until the
+WAL quarantined it.
+
+A flush now writes its rows as several row groups of the same file, cutting
+before any row that would take a string or binary column of the row group
+past 1 GiB. Files, WAL checkpoints and cluster file registration are as
+before: one flush still writes the same files. Flushes within the limit are
+written exactly as before. A flush that is cut holds the Arrow arrays of one
+row group at a time instead of the whole flush's.
+
+What a buffer retains while storage is behind is bounded separately, by
+`ingest.max_buffered_bytes` ([#1468](https://github.com/Basekick-Labs/arc/issues/1468),
+see its entry).
+
+Thanks to [@efegokdemir](https://github.com/efegokdemir), who traced the
+overflow to buffers retained under flush-queue backpressure and proposed the
+first fix in [#1321](https://github.com/Basekick-Labs/arc/pull/1321); its
+tests are the basis of this change's.
+
 ## Fix: license gates expire while Arc is running (#1442)
 
 License checks now use the signed expiry at the time of each check. A final
 definitive server rejection clears the current license and attempts to remove
-its disk cache. Removal failures are logged; if deletion fails, a restart
-during an outage may still reuse the rejected cache. Transient network or
+its disk cache. Removal failures are logged; online restart still requires
+fresh signed authority even when rejected bytes remain on disk. Transient network or
 protocol failures preserve the license until that signed
 expiry. Both machine-reactivation responses still attempt activation before
 the final result determines whether to invalidate the license. Health status
 and days remaining use the same expiry calculation.
+Read-serving tier scans retain their configured deadline and preserve cold
+objects; rejected cached payloads cannot regain entitlement in an already
+anchored process after a failed cache deletion.
 
-This change closes existing runtime entitlement checks. It does not yet
-implement automatic conversion of a running cluster into one standalone OSS
-writer. Existing RBAC restrictions remain enforced when a license lapses.
+Existing RBAC data restrictions remain enforced when a license lapses. The
+cluster lifecycle above handles the final transition independently of those
+authorization checks.
 
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 
@@ -163,6 +414,35 @@ retaining the API port. Previously these requests could reach the sender
 itself and be rejected with 403, leaving peer caches stale after compaction,
 retention, DELETE or database/measurement removal. Explicit API hosts remain
 unchanged. Forwarded requests and invalidation now share the same resolver.
+
+## New: a configurable SQL length limit ([#1448](https://github.com/Basekick-Labs/arc/issues/1448))
+
+Arc refused any query longer than 10,000 characters, a fixed limit. A query
+naming many series, for example the latest value of 2,500 channels listed in
+an `IN (...)`, needs far more. The limit is now `query.max_sql_length`
+(env `ARC_QUERY_MAX_SQL_LENGTH`), in bytes:
+
+```toml
+[query]
+max_sql_length = 200000
+```
+
+- The default stays 10000. Values from 1000 to 1048576 (1 MiB) are accepted,
+  and the value must be smaller than `server.max_payload_size`, which limits
+  the request body that carries the SQL. Anything else refuses to start,
+  naming the key.
+- It applies to every endpoint that runs SQL (JSON, MessagePack, Arrow and the
+  row estimate) and to continuous query definitions. A continuous query is
+  checked again at every run, so lowering the limit below a stored
+  definition's length makes that query fail until it is shortened.
+- Preparing a long query now takes time in proportion to its length. Before,
+  restoring its string literals copied the whole statement once per literal,
+  so a 1 MB query with 50,000 literals spent 9.3 s there, and a 2.3 MB one
+  34 s. Both now take under 0.6 s. Validation and rewriting together cost
+  about 0.5 s of CPU per MiB before DuckDB starts, which is why the ceiling is
+  1 MiB.
+- Queries longer than 10,000 characters are not kept in the SQL transform
+  cache, so a raised limit leaves the cache's memory bound unchanged.
 
 ## New: MessagePack columnar tag keys (#275)
 
@@ -419,6 +699,174 @@ success. Queries that need no cold data are served as before, and the
 failed cold tier is absent from `/health` (it was reported from a secret
 nothing read through).
 
+## Upgrade note: packaged installs keep backups in `/var/lib/arc/backups` ([#1463](https://github.com/Basekick-Labs/arc/issues/1463))
+
+Applies to the .deb, .rpm and Arch packages. The container image, Helm charts
+and Kubernetes manifests are unaffected.
+
+The packages' systemd unit runs Arc from `/var/lib/arc` with storage at
+`/var/lib/arc/data`. The packaged `arc.toml` puts backups at `./data/backups`,
+which from there is `/var/lib/arc/data/backups`, inside the storage root. The
+new overlap refusal (next note) rejects that, so without this fix a packaged
+install did not start: a fresh install and an upgrade both crash-looped under
+systemd. The unit now also sets
+`ARC_BACKUP_LOCAL_PATH=/var/lib/arc/backups`, and Arc creates that directory on
+first start.
+
+The unit sets the variable rather than the packaged `arc.toml`, because an rpm
+or Arch upgrade keeps an existing `/etc/arc/arc.toml`. The same environment
+variable also beats the file:
+
+- **If you changed `backup.local_path` in `/etc/arc/arc.toml`,** the unit now
+  overrides it, and Arc logs a warning at startup naming both paths. All three
+  packages now keep your `arc.toml` across the upgrade (the .deb from this
+  release on, see the next note); an edit that an earlier .deb upgrade already
+  reset is gone and draws no warning. Keep your directory with a drop-in:
+
+  ```
+  sudo systemctl edit arc
+  # add:
+  [Service]
+  Environment="ARC_BACKUP_LOCAL_PATH=/your/backup/dir"
+  ```
+
+  A drop-in survives upgrades. (`storage.local_path` already worked this way on
+  packaged installs.)
+
+- **Backups taken by an earlier release are still in
+  `/var/lib/arc/data/backups`**, whatever the primary storage backend: an
+  install with S3, Azure or GCS primary storage started before this fix and
+  wrote its backups there. Arc logs a warning at startup when it finds them.
+  The backup API does not list them until they are moved. With local primary
+  storage they are also inside the storage root, so:
+  - the next backup copies their data files as data;
+  - on a cluster with reconciliation enabled and `manifest_only_dry_run` off,
+    the sweep deletes their data files, leaving backups that look complete and
+    cannot be restored;
+  - each of them already holds a copy of the ones taken before it.
+
+  Move them before starting 27.01.1. The loop moves only directories that
+  contain a `manifest.json`, so a database named `backups` stays where it is:
+
+  ```
+  sudo systemctl stop arc
+  sudo mkdir -p /var/lib/arc/backups
+  sudo sh -c 'for d in /var/lib/arc/data/backups/*/; do
+    if [ -f "$d/manifest.json" ]; then mv "$d" /var/lib/arc/backups/; fi
+  done'
+  # Fails, harmlessly, if anything is left: a database named backups, or a
+  # partial backup with no manifest.json. Inspect what is left before deleting it.
+  sudo rmdir /var/lib/arc/data/backups
+  sudo chown -R arc:arc /var/lib/arc/backups
+  sudo chmod 700 /var/lib/arc/backups
+  ```
+
+  With local primary storage, restoring one of these older backups with
+  `restore_data` writes the data files of the backups nested in it back to
+  `/var/lib/arc/data/backups/<id>/data/...`, without their `manifest.json`.
+  Arc does not warn about those; delete them by hand.
+
+- **After upgrading a .deb or .rpm from 26.09.x, re-enable the service.** The
+  26.09 package's remove script stops and disables `arc.service` on every
+  upgrade, and on an upgrade that script comes from the old package. Run
+  `sudo systemctl enable --now arc` after the upgrade. From this release on,
+  the deb and rpm scripts stop and disable the service only on removal, and
+  an upgrade restarts a running service with the new binary. Arch upgrades
+  never stopped the service and still do not restart it.
+
+The release pipeline now installs the .deb, starts it under systemd and
+reinstalls it over itself to check the service survives an upgrade, and it
+boots the Arch package with its unit's user, working directory and environment.
+Before, every boot test ran the binary from a directory of its own choosing,
+and none of them saw the packaged layout. The three packages now share one unit
+file, `deploy/systemd/arc.service`.
+
+## Fix: .deb upgrades keep `/etc/arc/arc.toml` ([#1465](https://github.com/Basekick-Labs/arc/issues/1465))
+
+Every .deb upgrade used to replace `/etc/arc/arc.toml` with the stock file,
+discarding the operator's edits (auth, retention, credentials, ports) without
+a prompt or a backup copy. The rpm and Arch packages already kept the file.
+
+From this release the .deb ships the stock config at `/usr/share/arc/arc.toml`
+and installs it at `/etc/arc/arc.toml` only when that file does not exist. The
+content of an existing file is never changed, including on the upgrade from
+26.09.x: the config you have now is the one 27.01.1 starts with. A symlinked
+`/etc/arc/arc.toml` stays a symlink. As before, the package sets the file's
+owner to `arc:arc`. Keys that are not in your file take Arc's built-in
+defaults, so a config from an older release keeps working; diff it against
+`/usr/share/arc/arc.toml` to see what the new stock file documents.
+
+Upgrades never prompt, so non-interactive installs (`apt-get install -y`,
+configuration management) keep working without `--force-confold`. The file
+is not a dpkg conffile: an edited conffile prompts on every upgrade whose
+stock file changed, which is nearly every release, and the upgrade from 26.09.x
+failed non-interactively even for an unedited file.
+
+- `dpkg --remove` leaves `/etc/arc/arc.toml`. `dpkg --purge` removes it,
+  unless the other variant (`arc` or `arc-fips`) is installed and still uses
+  it.
+- `dpkg -S /etc/arc/arc.toml` no longer names a package, because no package
+  owns the file.
+- Downgrading to 26.09.x or earlier replaces `/etc/arc/arc.toml` with that
+  release's stock file, as every upgrade used to. Back it up first.
+
+## Fix: backups include, and restores replace, the config file Arc actually loaded ([#1466](https://github.com/Basekick-Labs/arc/issues/1466))
+
+`include_config` and `restore_config` used `arc.toml` in the working
+directory. Arc finds its config through a search path (the working directory,
+then `/etc/arc/`, then `~/.arc/`), so on any install whose config lives
+elsewhere both were wrong. On the .deb/.rpm/Arch packages the working
+directory is `/var/lib/arc` and the config is `/etc/arc/arc.toml`:
+
+- A backup never held the config. The backup succeeded, and the only sign
+  was a `Failed to backup config file` warning in the log.
+- A config restore wrote `/var/lib/arc/arc.toml`. The working directory is
+  searched first, so from the next start that file was the config, and edits
+  to `/etc/arc/arc.toml` had no effect.
+
+Both now use the file Arc loaded at startup. The startup line
+`Backup/restore enabled` shows it as `config_file`, and `config_restore`
+says whether this node can restore a config at all.
+
+**Backups on a package install now hold the config, and its credentials.**
+`include_config` defaults to true for a backup to a local target, so every
+default backup now contains `/etc/arc/arc.toml`, with any S3, Azure or GCS
+keys and the cluster shared secret in it. Before, these backups silently held
+no config. Treat the backup directory as secret, or send
+`"include_config": false`.
+
+**`restore_config` is refused with 400 before anything is restored** when
+the backup holds a config and the node cannot write it. The config step runs
+last, so where the write failed (a read-only ConfigMap, for example) the
+restore used to fail after the data had been restored. It is refused when:
+
+- Arc started without a config file. Arc logs a warning at startup, and each
+  backup logs that it holds no config.
+- The config file is not writable by the Arc process. This covers the rpm and
+  Arch packages, where `/etc/arc/arc.toml` is root's, and a Kubernetes
+  ConfigMap mount, which is read-only.
+- Arc cannot create the safety copy next to the config file. On the .deb,
+  `/etc/arc` is root's.
+
+**This changes what `restore_config` does on a package install.** It used to
+"work" by writing the shadow file described above; it is now refused. Restore
+the config by hand from `<backup_id>/config/arc.toml` in the backup instead.
+Docker is unaffected: the config there is `/app/arc.toml`, in the working
+directory. Note that it is in the container layer, not the `/app/data` volume,
+so a restored config does not survive recreating the container.
+
+Before overwriting, Arc copies the current config to
+`<config>.before-restore-<backup_id>`. A failed copy now fails the config
+restore, instead of logging a warning and overwriting anyway. An existing copy
+is never replaced, so neither a restore of another backup nor a retry of the
+same one overwrites the copy of the config it first replaced.
+
+**If you ran `restore_config` on a package install before this release,**
+`/var/lib/arc/arc.toml` is still your config, and `/etc/arc/arc.toml` is
+ignored. Arc now logs a warning at startup naming both files. Merge what you
+need into `/etc/arc/arc.toml`, then remove `/var/lib/arc/arc.toml`. The
+storage and backup paths are set by the systemd unit and override either file.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
@@ -471,10 +919,12 @@ To fix either: move one path outside the other, point `backup.default_target` at
 a configured target, or set `backup.enabled = false`, which skips the check
 entirely.
 
-**Every shipped artifact is unaffected.** The stock `arc.toml` uses `./data/arc`
-and `./data/backups`; the Helm charts and Kubernetes manifests set
-`/app/data/storage` or `/app/data/arc` and leave `backup.local_path` at its
-default.
+**The container image, Helm charts and Kubernetes manifests are unaffected.**
+The stock `arc.toml` uses `./data/arc` and `./data/backups`; the Helm charts and
+Kubernetes manifests set `/app/data/storage` or `/app/data/arc` and leave
+`backup.local_path` at its default. **The .deb, .rpm and Arch packages were
+affected**, and their systemd unit now sets the backup directory itself: see
+the packaged-installs note above.
 
 Why the refusal exists: a backup destination inside the storage root makes each
 backup copy the previous one, so the inventory compounds every run. Worse, those
@@ -2053,6 +2503,191 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### `allow_unreachable=true` stops waiting for files nothing is delivering ([#1426](https://github.com/Basekick-Labs/arc/issues/1426))
+
+On a cluster, a DELETE waits for files the manifest lists that are not on the
+primary yet: replicated files and compaction outputs still on their way. It
+waits up to 30 seconds, then answers `503` naming them in
+`unreachable_files`, or with `allow_unreachable=true` runs without them. With
+the flag it still waited the full 30 seconds first, once per scan, even for a
+file no node holds any more. A DELETE can scan several times, before and after
+it is recorded and after a compaction replaced a file it read, so it could
+take minutes. A client with a 30-second timeout saw a connection failure for
+a DELETE that ran, and lost the list of files it skipped.
+
+With `allow_unreachable=true`, a missing file is now waited for only while
+something is delivering it: the replication puller has it queued or in
+progress, or on shared storage a staged compaction holds it. A file missing
+for 5 seconds with nothing delivering it is given up for the rest of the
+request and reported in `unreachable_files`. A file still on its way is waited
+for up to 30 seconds, as before. Without the flag nothing changes.
+
+The rows of a file in `unreachable_files` are not deleted. Run the DELETE
+again once the file is on the primary to remove them. On shared storage, the
+flush of the other nodes before a DELETE keeps its own timeouts.
+
+### Storage errors stay readable in the log ([#1113](https://github.com/Basekick-Labs/arc/issues/1113))
+
+Arc masks every quoted span in a logged error, because engine errors quote the
+values they refuse, and it logs only an error's first line. Storage errors that
+quoted the offending value lost exactly that part in the log, and a value with
+a quote in it masked the rest of the line:
+`storage prefix "..." contains an unsupported character '...'`.
+
+Storage errors no longer quote values. They say what is wrong instead:
+
+- An unsupported character in an object-store prefix, or a glob metacharacter
+  in a path, is named by its code point (`U+0027`), and the prefix error lists
+  the allowed characters.
+- Key and prefix errors describe the problem (an empty, `.` or `..` segment, a
+  trailing separator, the write-staging suffix, a length over the limit)
+  without repeating the key. A database name starting with `_` is refused as
+  reserved.
+- An unknown backend type, a GCS endpoint that is not an http(s) URL, and a
+  GCS bucket Arc cannot use are described, and the bucket is named unquoted.
+- A batch delete on S3, Azure or GCS logs each key it refuses as a warning
+  with the key as a `key` field, and names the key in front of its reason in
+  the returned error. Only the first line of the batch error reaches the log.
+
+Contributed in part by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+
+### A delete's WHERE may qualify columns by the measurement name ([#1451](https://github.com/Basekick-Labs/arc/issues/1451))
+
+`POST /api/v1/delete` with `"where": "cpu.host = 'web-1'"` on measurement `cpu`
+failed with `Referenced table "cpu" not found`, while `"where": "host = 'web-1'"`
+worked. The caller sends only the predicate, so there was no alias to give the
+measurement either. A qualifier naming the measurement is now dropped before
+the clause is validated, recorded or run: `cpu.host`, `"cpu".host` and
+`CPU.host` all mean the column `host`. A name used bare (`cpu = 'x'`), one
+deeper in a path (`x.cpu.host`), and text inside string literals are left as
+written.
+
+The rows read are not renamed after the measurement, on purpose. A
+measurement often has a field named like itself, and in a file without that
+field the name would then stand for the whole row: `temperature IS NOT NULL`
+would match every row of such a file and delete it.
+
+As with a query's table-name qualifier
+([#1447](https://github.com/Basekick-Labs/arc/issues/1447)), a struct column
+named like its measurement is no longer reached through that name with a
+field (`cpu.x` now means the column `x`).
+
+### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447), [#1450](https://github.com/Basekick-Labs/arc/issues/1450))
+
+`SELECT readings.value FROM readings` failed with `Referenced table "readings"
+not found`. Arc replaces a table reference with a `read_parquet(...)` read, and
+DuckDB names that relation `read_parquet`, so a column qualified by the table's
+own name no longer matched it. The query worked only when it gave the table an
+alias of its own (`FROM readings r ... r.value`). Postgres and TimescaleDB SQL
+qualifies columns this way all the time, for example the LATERAL subquery that
+reads the latest value of each channel at a point in time:
+
+```sql
+SELECT c.ch, r.time, r.value
+FROM (VALUES ('x'), ('y'), ('z')) c(ch)
+LEFT JOIN LATERAL (
+  SELECT time, value FROM readings
+  WHERE readings.channel_id = c.ch AND time <= TIMESTAMP '2026-11-03 16:22:00'
+  ORDER BY time DESC LIMIT 1
+) r ON true
+```
+
+The rewritten read now carries the table's name (`AS "readings"`) whenever the
+query qualifies a column with it and the reference has no alias of its own.
+This covers `FROM`, every `JOIN` form, comma joins, `database.table` references
+(named by the table), and queries with or without the `x-arc-database` header.
+It also covers continuous queries, whose source read is named after the source
+measurement: a body such as
+`SELECT cpu.host, avg(cpu.usage) AS usage FROM prod.cpu WHERE time >= {start_time} AND time < {end_time} GROUP BY 1`
+failed at every scheduled run and now writes its rows. A query that never qualifies by
+table name is rewritten exactly as before.
+
+A query that also gives the name to another relation, as in
+`FROM readings JOIN (SELECT ...) readings USING (channel_id)` or
+`FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
+keeps the unaliased read: naming the table as well would be a duplicate alias
+in the first, and would change which relation `readings.value` reads in the
+second. This holds wherever the other relation is in the query, including a
+subquery or `LATERAL` join aliased with the table's name
+(`LEFT JOIN LATERAL (SELECT ... FROM readings ...) readings ON true`); give one
+of the two a different alias to qualify by the table's name there. A column named like the table, such as Telegraf's `cpu` tag on the
+`cpu` measurement, is not an alias wherever it appears, so it does not stop
+the table being named.
+
+Two things now behave the way Postgres does, where before they relied on the
+relation having no name:
+
+- **A struct column named like its table.** In a query that also qualifies by
+  the table name, `readings.value` now names the table's column `value`, not a
+  field of a struct column called `readings`.
+- **`read_parquet.col`.** A query that qualified columns with the internal name
+  `read_parquet` keeps working unless it also qualifies by the table name.
+
+A table reference followed by `WITH ORDINALITY` keeps its old form, because
+DuckDB accepts that clause only before an alias. A delete's `WHERE` may
+qualify columns by the measurement name too; see
+[#1451](https://github.com/Basekick-Labs/arc/issues/1451) above.
+
+### A MessagePack value its column cannot hold is a client error, not a 500 ([#1424](https://github.com/Basekick-Labs/arc/issues/1424))
+
+A columnar MessagePack record with a value of the wrong type for its column,
+such as `{"m": "cpu", "columns": {"time": [1, 2], "v": [1, "oops"]}}`, was
+answered `500 Failed to write records`, while the same conflict in row records
+or over line protocol is a `400` partial write. Clients take a 500 for a server
+failure: the Python SDK's buffered writer, for one, could not tell whether the
+batch was written. The record is now refused for its content, like a column
+that changes between string and binary: a request whose only record it is gets
+a `400` naming the measurement and column, and in a batch the record is
+dropped, the others are written, and the answer is the `400` partial write.
+Nothing of the refused record reaches the WAL, so it is not replayed at the
+next start. The same applies to a value outside a decimal column's precision,
+which over line protocol on a node with `ingest.decimal_columns` also answered
+500. An MQTT message is handled the same way: its other records are written
+and the refused one is logged as dropped points, and a message refused whole
+is logged as refused for its content, at most once per topic every ten
+minutes, instead of as an error each time.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1444](https://github.com/Basekick-Labs/arc/pull/1444).
+
+### The tiering file list applies the tier and database filters together ([#1430](https://github.com/Basekick-Labs/arc/issues/1430))
+
+`GET /api/v1/tiering/files?tier=cold&database=X` returned the database's files
+in every tier: with `database` set, `tier` was ignored. With both set, the list
+is now the database's files in that tier, newest partition first as for
+`database` alone, read from SQLite on its `(database, tier)` index. `limit`
+applies to that list as before. Either filter alone is unchanged. A `tier`
+other than `hot` or `cold`, such as `COLD` or `warm`, used to list the hot
+files with a `200`; it is now answered `400 invalid tier`, with or without
+`database`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1446](https://github.com/Basekick-Labs/arc/pull/1446).
+
+### The scheduler control routes say why a scheduler is not running ([#1433](https://github.com/Basekick-Labs/arc/issues/1433))
+
+`POST /api/v1/schedulers/cq/reload` and `POST
+/api/v1/schedulers/retention/trigger` answered `503 "... is not running -
+enterprise license required"` whenever the scheduler was not running, also on
+a licensed node with `continuous_query.enabled` or `retention.enabled` set to
+false. They now give the reason `GET /api/v1/schedulers/` gives: without a
+valid license, or with a tier that does not include the scheduler, a `403`, as
+other license-gated routes answer; with the license in order, a `503` saying
+the feature is not enabled or the scheduler failed to start, which the startup
+log reports. `GET /api/v1/schedulers/` now names that second cause too.
+
+A retention trigger the scheduler refuses without running anything is no
+longer a `500`: on a cluster node that is not the primary writer, or while a
+retention cycle is running, it is a `409`. A trigger after the license stopped
+including the scheduler, which answered `200 "Retention triggered
+successfully"` without running anything, is a `403`. A CQ reload after the
+license stopped including the scheduler stopped every continuous query and
+answered `200 "CQ scheduler reloaded successfully"`; it is now a `403` and
+leaves the running continuous queries as they were.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1445](https://github.com/Basekick-Labs/arc/pull/1445).
 
 ### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
 
@@ -5504,6 +6139,16 @@ leader writer, or compaction and reconciliation on the active compactor
 ([#1214](https://github.com/Basekick-Labs/arc/issues/1214)). Files already left
 unregistered by earlier versions are not picked up retroactively.
 
+### Legacy standalone restores preserve unverifiable cold objects ([#1189](https://github.com/Basekick-Labs/arc/issues/1189))
+
+Standalone tier scans rebuild cold metadata from the cold listing. When a
+pre-stage-C backup has no per-file sidecar row for an object already held in
+cold storage, restore leaves that object untouched and reports
+`cold_rows_skipped_unverifiable` instead of replacing the only cold copy with
+bytes it cannot verify.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1205](https://github.com/Basekick-Labs/arc/pull/1205).
+
 ### The cold-tier storage backend closes during shutdown ([#1103](https://github.com/Basekick-Labs/arc/issues/1103))
 
 The S3 or Azure backend used by tiering is now closed with the other storage
@@ -6772,8 +7417,8 @@ holds Raft-replicated tokens, this node's tier rows and the audit log, and
 the shared secret, so either one from a backup would give the node another
 node's state. A client that sends `restore_metadata: true` explicitly by
 default will be refused on every cluster node and must stop sending it. A
-standalone config restore still writes the literal `arc.toml` in the working
-directory, not the path the server was started with.
+standalone config restore writes the config file the server loaded at
+startup; see [#1466](https://github.com/Basekick-Labs/arc/issues/1466).
 
 ### Cluster restores pause compaction cluster-wide ([#1087](https://github.com/Basekick-Labs/arc/issues/1087))
 
