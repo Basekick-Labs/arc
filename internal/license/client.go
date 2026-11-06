@@ -62,6 +62,8 @@ type Client struct {
 	mu         sync.RWMutex
 	stopCh     chan struct{}
 	logger     zerolog.Logger
+	// watch follows the license along its grace schedule (watcher.go).
+	watch licenseWatch
 }
 
 // VerifyRequest represents a license verification request
@@ -255,7 +257,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 			errMsg = "license activation failed"
 		}
 		// 200 envelope rejection: the server spoke the protocol and said no.
-		return nil, definitiveErr("license activation failed: %s", errMsg)
+		return nil, markTermEnded(definitiveErr("license activation failed: %s", errMsg), activateResp.Error)
 	}
 
 	// Verify the detached signature against the raw license_file
@@ -276,7 +278,12 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	}
 	c.logger.Debug().Msg("signature verified")
 
-	license := signed.ToRuntimeLicense(time.Now().UTC())
+	// The server's own clock, on a response whose license verified: it
+	// advances the license clock's high-water mark (clock.go).
+	if d, err := http.ParseTime(resp.Header.Get("Date")); err == nil {
+		AdvanceClock(d)
+	}
+	license := signed.ToRuntimeLicense(licenseNow().UTC())
 
 	// Store the license
 	c.mu.Lock()
@@ -377,7 +384,12 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	}
 	c.logger.Debug().Msg("signature verified")
 
-	license := signed.ToRuntimeLicense(time.Now().UTC())
+	// The server's own clock, on a response whose license verified: it
+	// advances the license clock's high-water mark (clock.go).
+	if d, err := http.ParseTime(resp.Header.Get("Date")); err == nil {
+		AdvanceClock(d)
+	}
+	license := signed.ToRuntimeLicense(licenseNow().UTC())
 
 	// Store the license
 	c.mu.Lock()
@@ -404,6 +416,7 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 	// Try to verify first
 	license, err := c.Verify(ctx)
 	if err == nil {
+		c.notifyLicenseChange()
 		return license, nil
 	}
 
@@ -422,6 +435,21 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 		license, err = c.Activate(ctx)
 	}
 
+	// v1 refuses to activate a license past its term ("license has expired")
+	// although it still verifies one in grace. That refusal only restates the
+	// signed expiry Arc already holds, so a paid license within its grace keeps
+	// working: an activation reaped during a long outage must not end grace
+	// early (grace.go). Only that refusal: suspended, revoked or not found
+	// still drop the license below.
+	if err != nil && FailureClassOf(err) == ClassDefinitive && errors.Is(err, errLicenseTermEnded) {
+		if held := c.heldOrCachedInGrace(); held != nil {
+			c.logger.Warn().Err(err).Time("expires_at", held.ExpiresAt).Time("cutoff", held.Schedule().Cutoff).
+				Msg("License server refused re-activation past the license term; keeping the license through its grace period")
+			c.notifyLicenseChange()
+			return held, nil
+		}
+	}
+
 	// Only the final outcome is authoritative: a missing activation can recover
 	// successfully, or fail transiently without invalidating the current pair.
 	if err != nil && FailureClassOf(err) == ClassDefinitive {
@@ -434,7 +462,30 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 			c.logger.Warn().Err(err).Msg("License rejected; enterprise feature gates disabled")
 		}
 	}
+	c.notifyLicenseChange()
 	return license, err
+}
+
+// heldOrCachedInGrace returns the paid license held, or else the one in the
+// verified disk cache for this machine, when it is past its signed expiry but
+// not past its cutoff; nil otherwise.
+func (c *Client) heldOrCachedInGrace() *License {
+	c.mu.RLock()
+	held := c.license
+	c.mu.RUnlock()
+	if held == nil {
+		if lic, err := c.LoadCachedLicense(); err == nil {
+			held = lic
+		}
+	}
+	if held == nil {
+		return nil
+	}
+	// A trial has no grace: past its expiry its phase is already Expired.
+	if p, _ := held.Phase(); p == PhaseActive || p == PhaseExpired {
+		return nil
+	}
+	return held
 }
 
 // StartPeriodicValidation starts background license validation
@@ -646,6 +697,25 @@ func (c *Client) bindFingerprint(signed *SignedLicense) error {
 //
 // secrets are removed from the preview: a proxy's error page can echo the
 // request, whose address carries the licence key on verify.
+// licenseTermEndedMsg is the license server's refusal to activate a license
+// past its term. FROZEN CONTRACT with the license server's activate handler:
+// matched exactly, never by substring. v1 still verifies such a license during
+// its grace period, so the refusal only restates the signed expiry Arc holds.
+const licenseTermEndedMsg = "license has expired"
+
+// errLicenseTermEnded marks a definitive rejection carrying exactly
+// licenseTermEndedMsg.
+var errLicenseTermEnded = errors.New("license term ended")
+
+// markTermEnded wraps a definitive error with errLicenseTermEnded when the
+// server's error text is exactly licenseTermEndedMsg.
+func markTermEnded(err error, serverMsg string) error {
+	if strings.TrimSpace(serverMsg) == licenseTermEndedMsg {
+		return fmt.Errorf("%w: %w", errLicenseTermEnded, err)
+	}
+	return err
+}
+
 func checkHTTPStatus(resp *http.Response, secrets ...string) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
@@ -676,7 +746,16 @@ func checkHTTPStatus(resp *http.Response, secrets ...string) error {
 	if previewStr == "" {
 		return mk("HTTP %d from license server", resp.StatusCode)
 	}
-	return mk("HTTP %d from license server: %s", resp.StatusCode, previewStr)
+	err := mk("HTTP %d from license server: %s", resp.StatusCode, previewStr)
+	if definitive {
+		var body struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal([]byte(previewStr), &body) == nil {
+			err = markTermEnded(err, body.Error)
+		}
+	}
+	return err
 }
 
 // readBoundedJSON decodes a JSON response body into `v`, refusing to

@@ -89,6 +89,14 @@ var (
 	effectiveCoresFn = config.EffectiveCores
 )
 
+// applyLicenseCoreLimitsIfValid applies the license's core limits unless it is
+// already expired past its grace period, when the node runs as OSS.
+func applyLicenseCoreLimitsIfValid(lic *license.License, cfg *config.Config) {
+	if lic.IsValid() {
+		applyLicenseCoreLimits(lic, cfg)
+	}
+}
+
 // applyLicenseCoreLimits enforces lic.MaxCores on every execution surface —
 // Go runtime (GOMAXPROCS), DuckDB native threads (cfg.Database.ThreadCount is
 // the REAL DuckDB enforcement; GOMAXPROCS does not bound CGo threads), and
@@ -288,6 +296,12 @@ func main() {
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers
 	var licenseClient *license.Client
+	// The license clock's high-water mark lives beside the auth DB in both
+	// license modes: setting the host clock back does not extend a license.
+	if ahead := license.InitClock(filepath.Dir(cfg.Auth.DBPath)); ahead > 5*time.Minute {
+		log.Warn().Dur("ahead", ahead).
+			Msg("The host clock reads earlier than the license clock's saved mark; the license is judged by the mark (delete license_clock.json beside the auth database if the mark itself is wrong)")
+	}
 	if cfg.License.FilePath != "" {
 		// Offline (air-gapped) license file: verified entirely from disk
 		// against the pinned public key — no license-server dependency, no
@@ -307,7 +321,7 @@ func main() {
 				Time("expires_at", lic.ExpiresAt).
 				Strs("features", lic.Features).
 				Msg("Enterprise license loaded from offline file")
-			applyLicenseCoreLimits(lic, cfg)
+			applyLicenseCoreLimitsIfValid(lic, cfg)
 		}
 	} else if cfg.License.Key != "" {
 		log.Info().
@@ -320,7 +334,7 @@ func main() {
 			LicenseKey: cfg.License.Key,
 			// Cache lives next to the auth DB (per-pod volume): boot survives a
 			// transient license-server outage on the last verified license,
-			// honored until ITS OWN expiry. Deliberately inside the Key != ""
+			// honored until its cutoff (signed expiry plus grace). Deliberately inside the Key != ""
 			// branch — removing the key must also stop cache consultation.
 			CacheDir: filepath.Dir(cfg.Auth.DBPath),
 			Logger:   logger.Get("license"),
@@ -344,21 +358,31 @@ func main() {
 					log.Warn().
 						Str("tier", string(lic.Tier)).
 						Time("expires_at", lic.ExpiresAt).
-						Msg("license server unreachable; running on the cached verified license until it expires or the server recovers (background re-verification continues)")
-				} else {
+						Msg("license server unreachable; running on the cached verified license until its grace cutoff or the server recovers (background re-verification continues)")
+				} else if lic.IsValid() {
+					h := licenseClient.HealthStatus()
 					log.Info().
 						Str("tier", string(lic.Tier)).
-						Str("status", lic.Status).
-						Int("days_remaining", lic.DaysRemaining).
+						Str("status", h.Status).
+						Int("days_remaining", h.DaysRemaining).
 						Int("max_cores", lic.MaxCores).
 						Time("expires_at", lic.ExpiresAt).
 						Strs("features", lic.Features).
 						Msg("Enterprise license verified successfully")
+				} else {
+					// v1 still verifies a paid license for a while past Arc's
+					// grace cutoff; Arc treats it as expired (grace.go). The
+					// client stays, so a renewal takes effect at the next
+					// periodic check without a restart.
+					log.Warn().
+						Str("tier", string(lic.Tier)).
+						Time("expires_at", lic.ExpiresAt).
+						Msg("License verified but expired past its grace period - enterprise features disabled until it is renewed")
 				}
 
 				// Apply core limits from license to config (shared with the
 				// offline-file path).
-				applyLicenseCoreLimits(lic, cfg)
+				applyLicenseCoreLimitsIfValid(lic, cfg)
 			}
 		}
 	} else {
@@ -1106,6 +1130,12 @@ func main() {
 		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
+	// Grace days 7-14 of an expired license refuse live ingestion (503,
+	// X-Arc-Ingest-Refused: license_grace); replay, CQ and compaction writes
+	// are never refused.
+	if licenseClient != nil {
+		arrowBuffer.SetLicenseWriteGate(licenseClient.WritesStopped)
+	}
 	// Writes are refused with a retryable 503 while the rows waiting to be
 	// flushed are at this limit (#1468): off by default, "auto" is half the
 	// memory limit.
@@ -1761,6 +1791,10 @@ func main() {
 		if walWriter != nil {
 			walWriter.OnDurableAckChange(subscriptionManager.SetWALNotDurable)
 		}
+		// And while the expired license's grace period stops ingestion.
+		if licenseClient != nil {
+			licenseClient.OnWritesStoppedChange(subscriptionManager.SetLicenseWritesStopped)
+		}
 
 		// Start manager (loads and starts auto_start subscriptions). On a
 		// cluster node it starts after the coordinator, so its writes pass the
@@ -2062,6 +2096,9 @@ func main() {
 
 	// Start periodic license validation (if license was validated earlier)
 	if licenseClient != nil {
+		// The watcher follows the grace schedule in both license modes; the
+		// periodic validation is online only (a no-op for a file license).
+		licenseClient.StartLicenseWatcher()
 		licenseClient.StartPeriodicValidation(license.ValidationInterval)
 		shutdownCoordinator.RegisterHook("license-client", func(ctx context.Context) error {
 			licenseClient.Stop()
@@ -3182,6 +3219,8 @@ func main() {
 				MaxFileBytes: cfg.EdgeSync.MaxFileBytes,
 				AuthManager:  authManager,
 				Logger:       logger.Get("edgesync"),
+				// Pushed files are ingestion: refused on grace days 7-14.
+				WritesStopped: licenseClient.WritesStopped,
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create edge sync handler; refusing to start")

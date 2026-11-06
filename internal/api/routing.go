@@ -506,6 +506,13 @@ func respondIngestRefused(c *fiber.Ctx, err error) error {
 	ingest.LogRefusal(c.Path(), err)
 	c.Locals(ingestRefusedLocal, true)
 	c.Set(IngestRefusedHeader, reason)
+	if reason == ingest.RefusalLicenseGrace {
+		// Not a moment's condition: it lasts until the license is renewed or
+		// its grace period ends. A long Retry-After keeps clients from
+		// hammering, and 503 keeps them retrying rather than dropping data.
+		c.Set(fiber.HeaderRetryAfter, "300")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected: " + err.Error()})
+	}
 	c.Set(fiber.HeaderRetryAfter, "5")
 	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 		"error": "Write rejected (retry): " + err.Error(),

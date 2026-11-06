@@ -217,6 +217,7 @@ type Metrics struct {
 	walDurableAckFailing      atomic.Int64 // 1 while the WAL refuses durable acknowledgements (a stalled or failing device, #1502)
 	walDiskFreeBytes          atomic.Int64 // Free bytes on the WAL volume at the last sample
 	walDiskPressureRejections atomic.Int64 // Live writes refused for WAL volume disk pressure
+	licenseWriteRefusals      atomic.Int64 // Live writes refused on grace days 7-14 of an expired license
 	walNotDurableRejections   atomic.Int64 // Live writes refused because their WAL entry could not be made durable (wal.ack_mode durable)
 	walDurableAckTimeouts     atomic.Int64 // Durable appends refused because their sync did not complete within wal.ack_timeout_seconds (#1501)
 	// Per-hour WAL row checkpoints of a multi-hour flush (#1492): written, and
@@ -823,6 +824,7 @@ func (m *Metrics) SetWALDiskPressure(on bool) {
 }
 func (m *Metrics) SetWALDiskFreeBytes(bytes int64) { m.walDiskFreeBytes.Store(bytes) }
 func (m *Metrics) IncWALDiskPressureRejections()   { m.walDiskPressureRejections.Add(1) }
+func (m *Metrics) IncLicenseWriteRefusals()        { m.licenseWriteRefusals.Add(1) }
 func (m *Metrics) IncWALNotDurableRejections()     { m.walNotDurableRejections.Add(1) }
 func (m *Metrics) IncWALDurableAckTimeouts()       { m.walDurableAckTimeouts.Add(1) }
 func (m *Metrics) IncWALRowCheckpointsWritten()    { m.walRowCheckpointsWritten.Add(1) }
@@ -1360,6 +1362,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_durable_ack_failing":           m.walDurableAckFailing.Load(),
 		"wal_disk_free_bytes":               m.walDiskFreeBytes.Load(),
 		"wal_disk_pressure_rejections":      m.walDiskPressureRejections.Load(),
+		"license_write_refusals":            m.licenseWriteRefusals.Load(),
 		"wal_not_durable_rejections":        m.walNotDurableRejections.Load(),
 		"wal_durable_ack_timeouts":          m.walDurableAckTimeouts.Load(),
 		"wal_row_checkpoints_written":       m.walRowCheckpointsWritten.Load(),
@@ -1968,6 +1971,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_disk_pressure_rejections_total Live writes refused for WAL volume disk pressure; nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_wal_disk_pressure_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_wal_disk_pressure_rejections_total", float64(m.walDiskPressureRejections.Load()))
+	b = append(b, "# HELP arc_license_write_refusals_total Live writes refused on grace days 7-14 of an expired license; nothing was written\n"...)
+	b = append(b, "# TYPE arc_license_write_refusals_total counter\n"...)
+	b = appendMetric(b, "arc_license_write_refusals_total", float64(m.licenseWriteRefusals.Load()))
 	b = append(b, "# HELP arc_wal_not_durable_rejections_total Live writes refused (503, wal_not_durable) because their WAL entry could not be made durable; the client retries\n"...)
 	b = append(b, "# TYPE arc_wal_not_durable_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_wal_not_durable_rejections_total", float64(m.walNotDurableRejections.Load()))

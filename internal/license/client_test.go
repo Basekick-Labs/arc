@@ -36,8 +36,9 @@ func assertRuntimeGates(t *testing.T, c *Client, want bool) {
 // because the test license never carried the feature in the first place.
 func runtimePair(t *testing.T, c *Client, expires time.Time) (string, string) {
 	t.Helper()
+	// A trial: it ends exactly at its signed expiry, which these tests pin.
 	return signDetached(t, rsaKey1, &SignedLicense{
-		Version: 1, LicenseKey: c.licenseKey, Tier: TierEnterprise,
+		Version: 1, LicenseKey: c.licenseKey, Tier: TierEnterprise, CustomerID: TrialCustomerPrefix + "runtime",
 		MachineFingerprint: c.fingerprint, ExpiresAt: expires,
 		Features: []string{FeatureTieredStorage, FeatureClustering, FeatureAuditLogging,
 			FeatureWriterFailover, FeatureQueryGovernance, FeatureQueryManagement,

@@ -56,12 +56,13 @@ type License struct {
 	DaysRemaining int       `json:"days_remaining"`
 }
 
-// IsValid returns true if the license is valid and not expired
+// IsValid returns true if the license is valid: before its cutoff on the
+// grace schedule (grace.go) at the license clock.
 func (l *License) IsValid() bool {
 	if l == nil {
 		return false
 	}
-	return validAt(l.ExpiresAt, time.Now())
+	return validAt(l.ExpiresAt, l.IsTrial(), licenseNow())
 }
 
 // IsExpired returns true if the license has expired
@@ -70,19 +71,6 @@ func (l *License) IsExpired() bool {
 		return true
 	}
 	return !l.IsValid()
-}
-
-// expiryStatus derives display state from the same signed expiry used by the
-// gates. One clock reading governs both the boundary and whole days remaining.
-func expiryStatus(expiresAt, now time.Time) (string, int) {
-	if !validAt(expiresAt, now) {
-		return "expired", 0
-	}
-	return "active", int(expiresAt.Sub(now) / (24 * time.Hour))
-}
-
-func validAt(expiresAt, now time.Time) bool {
-	return now.Before(expiresAt)
 }
 
 // HasFeature checks if the license includes a specific feature
