@@ -20,15 +20,17 @@ Each hour file's rows are now checkpointed in the WAL as soon as that file is
 stored and registered, with the row-range checkpoint recovery already used
 for its own split replays. A crash replays only the rows of the files not yet
 written, and recovery replays a columnar entry's uncovered rows alone. The
-duplicate window is now at most the rows of the one hour file being written
-when the process died.
+duplicate window is now at most the rows of the hour file each in-flight flush
+was writing when the process died.
 
 What changes for an operator:
 - fewer duplicates after a crash, and for a tagless measurement no longer
   whole hours of them;
-- one durable WAL write per hour file beyond the first in a multi-hour flush,
-  so a backfill flush spanning 30 hours writes 30 small checkpoints; a flush
-  within one hour (live ingest) is unchanged;
+- one durable WAL write per hour file of a multi-hour flush, before the
+  flush's own checkpoint, so a backfill flush spanning 30 hours writes 30
+  small checkpoints where it wrote one; on a cluster node each hour file also
+  makes its registration durable (one outbox sync) before its checkpoint. A
+  flush within one hour (live ingest) is unchanged;
 - `arc_wal_row_checkpoints_written_total` and
   `arc_wal_row_checkpoints_dropped_total`: a dropped checkpoint (the WAL
   writer refused it or it timed out) only means those rows replay as before;

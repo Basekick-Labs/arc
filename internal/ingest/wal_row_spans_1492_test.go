@@ -127,10 +127,10 @@ func TestMergeSetsWALRowSpansOnlyWhenPositional(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, merged.walSpans)
 	require.Equal(t, []string{wal.RecoveryRowIdentity(tokA, 1, 2)}, merged.walSpans.rangesIn([]int{1}))
-	// A slice and a sort start over.
+	// A slice and a sort start over (the batch is out of time order, so the
+	// sort returns a new one).
 	require.Nil(t, sliceTypedColumnBatchByIndices(merged, []int{0}).walSpans)
 	sorted := b.sortFlushBatch("db", "m", merged, []string{"time"})
-	if sorted != merged {
-		require.Nil(t, sorted.walSpans)
-	}
+	require.NotSame(t, merged, sorted)
+	require.Nil(t, sorted.walSpans)
 }

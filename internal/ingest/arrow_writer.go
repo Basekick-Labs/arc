@@ -2250,7 +2250,9 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 
 	// Announce to cluster-wide file manifest (peer replication). Called on
 	// the flush path: the registrar must not block on the network. The outbox
-	// only appends here; completeFlush makes it durable once per flush.
+	// only appends here; syncRegistrations makes it durable, once per flush in
+	// completeFlush and, for a multi-hour flush without coverage, once per
+	// hour file before that file's row checkpoint (#1492).
 	if ref := b.fileRegistrar.Load(); ref != nil && ref.FileRegistrar != nil {
 		if cr, ok := ref.FileRegistrar.(CoverageFileRegistrar); ok && cov != nil {
 			cr.RegisterCoveredFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex, cov)
@@ -4943,7 +4945,9 @@ type FileRegistrationSyncer interface {
 // completeFlush runs once a flush's files are written and registered. The
 // registrations are made durable before the WAL checkpoint, so the WAL cannot
 // drop rows whose file the cluster has no durable record of (#1209). One
-// sync per flush, however many hourly files it wrote, and none without a WAL.
+// sync here per flush, and none without a WAL; a multi-hour flush on a writer
+// without coverage also synced once per hour file, before that file's row
+// checkpoint (#1492, flushPartitionedData).
 //
 // A covered flush (#1207) checkpoints without releasing the purge floor: the
 // group releases its WAL entries once every file has settled in the outbox.
@@ -4999,9 +5003,14 @@ func (b *ArrowBuffer) syncRegistrations() {
 // "Stored" is storage.Write having returned, the same standard the flush's
 // own checkpoint has always relied on: the local backend renames a closed
 // file without fsync, so this survives a process crash, not a power loss.
-func (b *ArrowBuffer) checkpointRows(ctx context.Context, ids []string) {
+//
+// The wait counts against the flush's context (ingest.flush_timeout_seconds)
+// like the storage writes do: a backfill flush of many hours pays one WAL
+// sync per hour here. Reports whether a checkpoint was written; false with no
+// ids means the file had no rows the map could name (walRowSpans).
+func (b *ArrowBuffer) checkpointRows(ctx context.Context, ids []string) bool {
 	if len(ids) == 0 || b.wal == nil {
-		return
+		return false
 	}
 	var err error
 	switch w := b.wal.(type) {
@@ -5012,14 +5021,15 @@ func (b *ArrowBuffer) checkpointRows(ctx context.Context, ids []string) {
 	case trackedWALWriter:
 		err = w.MarkFlushed(ids)
 	default:
-		return
+		return false
 	}
 	if err != nil {
 		metrics.Get().IncWALRowCheckpointsDropped()
 		b.logger.Warn().Err(err).Int("ranges", len(ids)).Msg("WAL row checkpoint for a stored hour file was not written; a crash before the flush completes replays its rows")
-		return
+		return false
 	}
 	metrics.Get().IncWALRowCheckpointsWritten()
+	return true
 }
 
 // flushPartialError is a multi-hour flush that failed after storing,
@@ -5214,6 +5224,10 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// failed after registering some of its hours would leave the group open
 	// for the life of the process. Such a writer keeps the deferred
 	// registration and the single checkpoint; see the follow-up on #1492.
+	// The gate reads the writer's state now, not the group built at enqueue:
+	// after DisableCoverage (an abandoned outbox at startup) a queued covered
+	// flush takes this path, registers with no coverage, and its group
+	// finishes with zero files, releasing its entries as before.
 	spans := merged.walSpans
 	if spans != nil && spans.rows != len(times) {
 		spans = nil // a layout the merge did not produce: name nothing
@@ -5274,7 +5288,8 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if perHour {
 			b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, nil)
 			b.syncRegistrations()
-			b.checkpointRows(ctx, spans.rangesIn(bucket.indices))
+			ranges := spans.rangesIn(bucket.indices)
+			checkpointed := b.checkpointRows(ctx, ranges)
 			for _, i := range bucket.indices {
 				writtenAt[i] = true
 			}
@@ -5288,7 +5303,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				Int64("hour_id", hourID).
 				Int("records", splitRecordCount).
 				Int("size_bytes", len(parquetData)).
-				Msg("Wrote hour partition; registered and its rows checkpointed")
+				Int("row_ranges", len(ranges)).
+				Bool("rows_checkpointed", checkpointed).
+				Msg("Wrote hour partition and registered it")
 			continue
 		}
 
@@ -7145,8 +7162,16 @@ drain:
 
 			b.markFlushTaskInFlight(task)
 			if err := b.flushTrackedTask(flushCtx, task); err != nil {
+				// A multi-hour flush that stored some hour files first
+				// (#1492): those rows are stored and checkpointed, not
+				// unwritten.
+				stored := 0
+				var partial *flushPartialError
+				if errors.As(err, &partial) {
+					stored = partial.StoredRows
+				}
 				mu.Lock()
-				unwrit += task.recordCount - noWAL
+				unwrit += task.recordCount - noWAL - stored
 				mu.Unlock()
 			}
 		}()
