@@ -49,6 +49,16 @@ func TestTimeRewriteSkipsDirtyColumn_Issue1488(t *testing.T) {
 			t.Errorf("time_bucket rewrote a dirty column: %q -> %q", sql, got)
 		}
 	}
+	// The 3-arg (with-origin) form takes the same column guard.
+	timeBucket3 := []string{
+		"SELECT time_bucket('1 hour', time', TIMESTAMP '2024-01-01 00:00:00') FROM cpu",
+		"SELECT time_bucket('1 hour', ts $a$ $a$, TIMESTAMP '2024-01-01 00:00:00') FROM cpu",
+	}
+	for _, sql := range timeBucket3 {
+		if got := rewriteTimeBucket(sql); got != sql {
+			t.Errorf("3-arg time_bucket rewrote a dirty column: %q -> %q", sql, got)
+		}
+	}
 	dateTrunc := []string{
 		"SELECT date_trunc('hour', time') FROM cpu",
 		"SELECT date_trunc('day', c /* x */) FROM cpu",
@@ -90,6 +100,62 @@ func TestLikeReorderSkipsUnsafe_Issue1488(t *testing.T) {
 	withComment := "SELECT 1 FROM t WHERE x LIKE '%a%' /* c */ AND y <> ''"
 	if got, changed := OptimizeLikePatterns(withComment); changed {
 		t.Errorf("reordered a predicate with a comment marker: %q -> %q", withComment, got)
+	}
+	// Exercise reorderEmptyCheckBeforeLike specifically (the WHERE col LIKE
+	// 'pat' AND col2 <> '' shape): a comment in the LIKE pattern's predicate
+	// must not be reordered ahead of the empty check.
+	emptyCheckShape := "SELECT 1 FROM t WHERE url LIKE '%a%' -- c\n AND sp <> ''"
+	if got, changed := OptimizeLikePatterns(emptyCheckShape); changed {
+		t.Errorf("reorderEmptyCheckBeforeLike moved a predicate with a comment: %q -> %q", emptyCheckShape, got)
+	}
+}
+
+// The PR's whole contract: OptimizeLikePatterns never changes which bytes are
+// inside a string literal or comment. If a reorder ever minted or dropped a
+// literal/comment boundary, the SQL DuckDB runs would stop matching the SQL
+// ValidateSQLRequest approved (#1488, #1490 review). Checked two-sided over a
+// corpus of predicate fragments, including the pieces that can splice into a
+// new opener at a reorder seam (lone quote, dollar fragment, comment marker).
+func TestLikeReorderPreservesLiteralPartition_Issue1488(t *testing.T) {
+	frags := []string{
+		"url LIKE '%a%'", "sp <> ''", "x = 1", "y = 'v'",
+		"k = $tag$b", "k2 = $q", "m = '", "n = $$r", "p /* c */ = 2",
+		"q LIKE '%b%'", "r <> ''", "s = $a$t$a$",
+	}
+	tails := []string{"", " GROUP BY z", " ORDER BY z", " LIMIT 10"}
+	n := 0
+	for _, a := range frags {
+		for _, b := range frags {
+			for _, c := range frags {
+				for _, tl := range tails {
+					sql := "SELECT 1 FROM t WHERE " + a + " AND " + b + " AND " + c + tl
+					got, _ := OptimizeLikePatterns(sql)
+					if in, out := protectedSpanContents(sql), protectedSpanContents(got); !equalStrings(in, out) {
+						t.Errorf("reorder changed the literal/comment partition\n in:  %q\n out: %q\n spans in=%v out=%v", sql, got, in, out)
+					}
+					n++
+				}
+			}
+		}
+	}
+	t.Logf("checked %d reorder inputs", n)
+}
+
+// sameProtectedPartition accepts a genuine reordering of the same literal and
+// comment regions and rejects one whose regions differ.
+func TestSameProtectedPartition_Issue1488(t *testing.T) {
+	// Same literals, reordered: accepted.
+	if !sameProtectedPartition("WHERE a LIKE '%x%' AND b <> ''", "WHERE b <> '' AND a LIKE '%x%'") {
+		t.Error("rejected a reorder that keeps the same literals")
+	}
+	// A candidate whose quote now encloses different text (a literal grew to
+	// swallow code that was executable before) has different span content.
+	if sameProtectedPartition("'p' AND x", "'p AND x'") {
+		t.Error("accepted a candidate that merged code into a literal")
+	}
+	// A candidate whose comment now reaches further is a different partition.
+	if sameProtectedPartition("x -- c\n", "x -- c AND y\n") {
+		t.Error("accepted a candidate that changes a comment's reach")
 	}
 }
 

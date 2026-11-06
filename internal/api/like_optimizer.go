@@ -2,6 +2,7 @@ package api
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
@@ -52,7 +53,38 @@ func OptimizeLikePatterns(sql string) (string, bool) {
 	// ensure cheap checks come first
 	sql = optimizeMultiplePredicates(sql)
 
+	// Authoritative safety check (#1488, #1490 review). Both reorders move
+	// whole captured predicates, and the per-reorder guards look only within a
+	// match — they cannot see a literal or comment boundary that forms where a
+	// moved predicate becomes adjacent to the unchanged head or tail of the
+	// query. A reorder must never change which bytes are inside a string
+	// literal or comment: if it did, the SQL DuckDB runs would stop matching
+	// the SQL ValidateSQLRequest approved. original and the result hold the
+	// same bytes permuted, so an identical multiset of protected-span contents
+	// proves the same bytes remain code. If anything differs, discard every
+	// reorder and run the query as written.
+	if sql != original && !sameProtectedPartition(original, sql) {
+		return original, false
+	}
+
 	return sql, sql != original
+}
+
+// sameProtectedPartition reports whether a and b have the same multiset of
+// string-literal and comment regions (by content). For two strings that hold
+// the same bytes in a different order, this holds exactly when the same bytes
+// are code in both.
+func sameProtectedPartition(a, b string) bool {
+	sa, sb := protectedSpanContents(a), protectedSpanContents(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for i := range sa {
+		if sa[i] != sb[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // reorderEmptyCheckBeforeLike moves empty string checks before LIKE predicates
@@ -143,4 +175,17 @@ func reorderIsStructureSafe(parts []string, m []int, spans []sqlutil.Span) bool 
 		}
 	}
 	return true
+}
+
+// protectedSpanContents returns the text of every string-literal and comment
+// span of sql, sorted, so two reorderings of the same bytes can be compared
+// for an identical set of protected regions.
+func protectedSpanContents(sql string) []string {
+	spans := sqlutil.ProtectedSpans(sql)
+	out := make([]string, len(spans))
+	for i, s := range spans {
+		out[i] = sql[s.Start:s.End]
+	}
+	sort.Strings(out)
+	return out
 }

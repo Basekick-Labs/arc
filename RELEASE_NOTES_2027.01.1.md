@@ -13,10 +13,12 @@ quote, and the rewritten query no longer matched the text that was validated.
 
 The rewrites now skip any match that begins inside a string literal (`'…'`,
 `E'…'`, `"…"`, `$tag$…$tag$`) or a comment, and `time_bucket`/`date_trunc` are
-left unchanged when their column argument is not a plain expression. Normal
-queries are rewritten exactly as before. No query that was answered correctly
-changes; a query that would have been rewritten into something other than what
-was validated is now run as written (DuckDB evaluates the un-rewritten form).
+left unchanged when their column argument is not a plain unquoted expression.
+No query's result changes. A query whose `time_bucket`/`date_trunc` column is a
+quoted identifier (for example `"my col"`) is now evaluated by DuckDB natively
+rather than through the epoch-arithmetic rewrite — the same answer, without that
+speedup. A query that would have been rewritten into something other than what
+was validated is now run as written.
 
 ## New: Iceberg export keeps files moved to an S3 cold tier ([#939](https://github.com/Basekick-Labs/arc/issues/939))
 

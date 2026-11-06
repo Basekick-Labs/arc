@@ -742,7 +742,7 @@ type Span struct {
 // order as MaskStringLiterals (single/double quotes, E'…', $tag$…$tag$) and as
 // stripSQLComments (line comment to \n or \r, block comment to the first */).
 // It is the single place those rules live for span consumers;
-// TestProtectedSpansAgreeWithMasker pins it against MaskStringLiterals so the
+// TestProtectedSpansPropertyVsMasker pins it against MaskStringLiterals so the
 // two cannot drift.
 func scanSQLSpans(sql string, emit func(start, end int)) {
 	i := 0
