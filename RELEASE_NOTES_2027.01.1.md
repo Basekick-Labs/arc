@@ -139,7 +139,6 @@ a peer belongs to the cluster, not which node it is.
 
 Per-node peer identity remains open in #1510.
 
-## Fix: Arc's internal SQL placeholder text is reserved
 ## Security: Arc's internal SQL placeholder text is reserved
 
 Before its checks, Arc swaps string literals, quoted names and some keywords
