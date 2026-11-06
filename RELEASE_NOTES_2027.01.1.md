@@ -74,6 +74,28 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: Arc's internal SQL placeholder text is reserved
+
+Before its checks, Arc swaps parts of a query for generated placeholders, for
+example the `FROM` inside `EXTRACT(YEAR FROM time)`. It restores them by
+matching their text once the checks have run. Text a caller wrote that
+matched a placeholder was restored too, so the statement that ran could
+differ from the one that was checked.
+- **Queries** containing `__FROM_MASK_` are refused with a 400, including
+  text that only forms once a string literal is masked. The check runs on
+  every query endpoint and again inside the storage-path rewrite.
+- **Database names** (including the `x-arc-database` header) and **DELETE
+  `WHERE` clauses** also refuse `__FROM_MASK_`, in addition to the existing
+  `__STR_` and `__IDENT_`.
+- **The DELETE time pin** used with stream takeover restores each string
+  literal once, where it was. Before, it replaced every copy of the
+  literal's placeholder text.
+- **The storage-path rewrite** restores `FROM` keywords before it inserts
+  storage paths, so a path is never read by that restore.
+
+Matching is exact and case-sensitive, as the restore itself is. Queries that
+don't contain these sequences are unaffected.
+
 ## Fix: a crash during a multi-hour flush no longer replays the hours already stored ([#1492](https://github.com/Basekick-Labs/arc/issues/1492))
 
 A flush whose rows span several hours writes one Parquet file per hour. The

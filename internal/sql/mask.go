@@ -544,6 +544,29 @@ func isFromKeywordFunction(word string) bool {
 	return false
 }
 
+// fromMaskPrefix opens every MaskFromKeywordsInFunctionBodies placeholder.
+const fromMaskPrefix = "__FROM_MASK_"
+
+// ContainsReservedPlaceholder reports whether s holds the opening of a
+// placeholder the maskers in this package generate: `__STR_`, `__IDENT_` or
+// `__FROM_MASK_`. The restorers match placeholders by their exact text,
+// wherever it appears, so a caller-written copy is restored with the real
+// ones; names and other text spliced into masked SQL must not carry it.
+func ContainsReservedPlaceholder(s string) bool {
+	return strings.Contains(s, "__STR_") || strings.Contains(s, "__IDENT_") || strings.Contains(s, fromMaskPrefix)
+}
+
+// ContainsFromMaskPlaceholder reports whether s holds the opening of a
+// MaskFromKeywordsInFunctionBodies placeholder. UnmaskFromKeywordsInFunctionBodies
+// restores every occurrence of a placeholder's text, so caller SQL that
+// spells one gains a FROM after the checks that ran on the masked form.
+// Run it on the SQL as written and again after MaskStringLiterals: a
+// literal's placeholder ends in `__`, so text written straight after a
+// literal can complete one that the raw SQL lacks.
+func ContainsFromMaskPlaceholder(s string) bool {
+	return strings.Contains(s, fromMaskPrefix)
+}
+
 // MaskFromKeywordsInFunctionBodies replaces the FROM keywords that do not
 // introduce a relation with unique placeholders, so the caller's
 // table-rewriter regex (which would otherwise match `FROM <ident>` greedily)
@@ -588,7 +611,7 @@ func MaskFromKeywordsInFunctionBodies(sql string) (string, []FromMask) {
 	var phBuf [32]byte
 	last := 0
 	for n, i := range at {
-		ph := strconv.AppendInt(append(phBuf[:0], "__FROM_MASK_"...), int64(n), 10)
+		ph := strconv.AppendInt(append(phBuf[:0], fromMaskPrefix...), int64(n), 10)
 		ph = append(ph, '_', '_')
 		placeholder := string(ph)
 		masks = append(masks, FromMask{Placeholder: placeholder, Original: sql[i : i+4]})
