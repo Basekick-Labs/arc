@@ -74,6 +74,33 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: names that differ only in case stay apart on case-insensitive volumes ([#1509](https://github.com/Basekick-Labs/arc/issues/1509))
+
+On a volume that does not distinguish names by case (macOS APFS by default,
+Docker Desktop bind mounts from a Mac, NTFS), `cpu` and `CPU` were one
+directory. A write, query or delete under either name acted on the same
+files, while permissions matched names exactly. Arc now checks the storage
+volume at startup. If it folds names, a database or measurement is only
+accepted in the spelling it already has on disk:
+- **Writes** to another spelling of an existing database or measurement are
+  refused and reported like other unstorable names, before anything reaches
+  the WAL. Two first writes racing with different spellings can't both win.
+- **Queries** are refused with a 400 that names the existing spelling.
+  Before, `FROM CPU` on a Mac returned `cpu`'s rows. A continuous query
+  whose source is spelled differently fails its run with the same message.
+- **Deletes, retention and listings** under another spelling are refused
+  instead of acting on the existing directory.
+
+Linux filesystems, S3 and Azure are unaffected, and the check costs nothing
+there. A startup warning says when the check is active. To keep names that
+differ only by case, use a case-sensitive volume.
+
+Known limits:
+- Rows replicated from a cluster writer, and WAL replay, are not refused.
+  They were accepted where they were written.
+- Several nodes sharing one case-insensitive network volume are not
+  coordinated with each other.
+
 ## Docs: the cluster trust model is written down ([#1510](https://github.com/Basekick-Labs/arc/issues/1510))
 
 A new `SECURITY.md` explains how to report a vulnerability privately and what

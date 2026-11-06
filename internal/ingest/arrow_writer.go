@@ -3461,6 +3461,13 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	if err := unstorableKeyError(database, record.Measurement); err != nil {
 		return err
 	}
+	// #1509: a replayed or replicated entry (skipWAL) was accepted where it
+	// was written; only a live write is refused for its spelling.
+	if !skipWAL {
+		if err := b.nameSpellingRefusal(database, record.Measurement); err != nil {
+			return err
+		}
+	}
 	for name := range record.Columns {
 		if err := unstorableColumnError(record.Measurement, name); err != nil {
 			return err
@@ -3795,9 +3802,14 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // encoded as row entries (encodeTypedWALRows), NULL cells left out.
 // The typed msgpack decode path always supplies rawPayload.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
-	// The #1342 and #1475 backstops; see writeColumnarInternalWithWALCopy.
+	// The #1342, #1475 and #1509 backstops; see writeColumnarInternalWithWALCopy.
 	if err := unstorableKeyError(database, measurement); err != nil {
 		return err
+	}
+	if !skipWAL {
+		if err := b.nameSpellingRefusal(database, measurement); err != nil {
+			return err
+		}
 	}
 	for name := range typedColumns.Data {
 		if err := unstorableColumnError(measurement, name); err != nil {

@@ -31,6 +31,10 @@ type LocalBackend struct {
 	// causing filesystem lock contention. This cache eliminates that.
 	dirCache map[string]bool
 	dirMu    sync.RWMutex
+
+	// spelling refuses database and measurement names that exist on disk
+	// in another spelling, armed only when the root folds names (#1509).
+	spelling nameSpelling
 }
 
 // NewLocalBackend creates a new local filesystem storage backend
@@ -52,12 +56,25 @@ func NewLocalBackend(basePath string, logger zerolog.Logger) (*LocalBackend, err
 		prefix += storagePathSeparator
 	}
 
-	return &LocalBackend{
+	b := &LocalBackend{
 		basePath:   absPath,
 		pathPrefix: prefix,
 		logger:     logger.With().Str("component", "local-storage").Logger(),
 		dirCache:   make(map[string]bool),
-	}, nil
+	}
+	folds, err := probeNamesFold(absPath)
+	b.spelling = nameSpelling{armed: folds.Case || folds.Normalization, folds: folds, listings: make(map[string]dirListing)}
+	switch {
+	case err != nil:
+		b.logger.Warn().Err(err).Msg("Could not tell whether the storage volume distinguishes names by case; database and measurement names are only accepted in the spelling they have on disk")
+	case folds.Case:
+		b.logger.Warn().Str("path", absPath).Msg("The storage volume does not distinguish names that differ only in case (for example macOS APFS by default); database and measurement names are only accepted in the spelling they have on disk. Use a case-sensitive volume if names may differ only by case")
+	case folds.Normalization:
+		// Case-sensitive APFS: ingest names are ASCII, so only an existing
+		// non-ASCII name can meet this fold.
+		b.logger.Debug().Str("path", absPath).Msg("The storage volume folds Unicode normalization; names are only accepted in the spelling they have on disk")
+	}
+	return b, nil
 }
 
 // ensureDir creates the directory if it doesn't exist, using a cache to avoid
@@ -1485,6 +1502,18 @@ func (b *LocalBackend) validateListPath(prefix string) (string, error) {
 	}
 	if prefix[len(prefix)-1] == '/' {
 		prefix = prefix[:len(prefix)-1]
+	}
+	// The prefix names a directory; its database and measurement segments
+	// must have their on-disk spelling on a volume that folds names, or
+	// a delete or retention pass under `CPU` would act on `cpu` (#1509).
+	if b.spelling.armed {
+		segs := strings.SplitN(prefix, "/", 3)
+		if len(segs) > 2 {
+			segs = segs[:2]
+		}
+		if _, err := b.checkSpelling(segs); err != nil {
+			return "", err
+		}
 	}
 	return b.pathPrefix + prefix, nil
 }
