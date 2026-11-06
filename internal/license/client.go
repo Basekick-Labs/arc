@@ -68,12 +68,13 @@ type Client struct {
 	// source says where the CURRENT license came from ("server", "cache",
 	// "file") for /health; guarded by mu. A cache-boot flips to "server" on
 	// the first successful background verify.
-	source     LicenseSource
-	httpClient *http.Client
-	license    *License
-	mu         sync.RWMutex
-	stopCh     chan struct{}
-	logger     zerolog.Logger
+	source         LicenseSource
+	httpClient     *http.Client
+	license        *License
+	mu             sync.RWMutex
+	stopCh         chan struct{}
+	validationWake chan struct{}
+	logger         zerolog.Logger
 }
 
 // VerifyRequest represents a license verification request
@@ -133,8 +134,9 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		stopCh: make(chan struct{}),
-		logger: cfg.Logger.With().Str("component", "license-client").Logger(),
+		stopCh:         make(chan struct{}),
+		validationWake: make(chan struct{}, 1),
+		logger:         cfg.Logger.With().Str("component", "license-client").Logger(),
 	}
 
 	c.logger.Debug().
@@ -531,20 +533,37 @@ func (c *Client) recordValidationFailure(err error) {
 	switch FailureClassOf(err) {
 	case ClassAdmissionDenied:
 		c.mu.Lock()
+		wasBlocked := c.admissionBlocked
 		c.admissionBlocked = true
+		if !wasBlocked {
+			c.notifyValidationWakeLocked()
+		}
 		c.mu.Unlock()
 	case ClassDefinitive:
 		c.mu.Lock()
 		hadLicense := c.license != nil
+		wasBlocked := c.admissionBlocked
 		c.license = nil
 		c.keyRejected = true
 		c.admissionBlocked = false
+		if wasBlocked {
+			c.notifyValidationWakeLocked()
+		}
 		c.mu.Unlock()
 		c.runtimeClock().rejectLicense()
 		c.deleteCache()
 		if hadLicense {
 			c.logger.Warn().Err(err).Msg("License rejected; enterprise feature gates disabled")
 		}
+	}
+}
+
+// notifyValidationWakeLocked coalesces admission transitions. The worker reads
+// the current state under mu; repeated refusals must not reset its backoff.
+func (c *Client) notifyValidationWakeLocked() {
+	select {
+	case c.validationWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -573,6 +592,7 @@ func (c *Client) StartPeriodicValidation(interval time.Duration) {
 		}
 		timer := time.NewTimer(nextDelay)
 		defer timer.Stop()
+		c.logger.Debug().Dur("delay", nextDelay).Msg("Periodic license validation timer armed")
 
 		for {
 			select {
@@ -608,6 +628,23 @@ func (c *Client) StartPeriodicValidation(interval time.Duration) {
 				} else {
 					retryDelay, nextDelay = baseRetry, interval
 					wasBlocked = false
+				}
+				timer.Reset(nextDelay)
+			case <-c.validationWake:
+				blocked := c.AdmissionBlocked()
+				if blocked == wasBlocked {
+					continue
+				}
+				wasBlocked = blocked
+				retryDelay, nextDelay = baseRetry, interval
+				if blocked {
+					nextDelay = baseRetry
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
 				}
 				timer.Reset(nextDelay)
 			case <-c.stopCh:

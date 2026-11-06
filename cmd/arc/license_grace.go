@@ -15,7 +15,7 @@ type licenseGraceRestart struct {
 }
 
 func (r *licenseGraceRestart) due(now time.Time, state license.ExpiryState, preparing bool) bool {
-	if state.Phase == license.PhaseAuthorityUnavailable {
+	if state.Phase == license.PhaseAuthorityUnavailable || state.Phase == license.PhaseAdmissionBlocked {
 		return false
 	}
 	if !state.Valid || state.RestartIntervalSeconds == 0 {

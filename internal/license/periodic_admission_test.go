@@ -15,8 +15,11 @@ import (
 func startObservedAdmissionValidation(t *testing.T, c *Client, interval time.Duration) (<-chan struct{}, <-chan struct{}, func()) {
 	t.Helper()
 	failed, admitted, stopped := make(chan struct{}, 8), make(chan struct{}, 8), make(chan struct{})
+	armed := make(chan struct{})
 	c.logger = zerolog.New(io.Discard).Level(zerolog.DebugLevel).Hook(zerolog.HookFunc(func(_ *zerolog.Event, _ zerolog.Level, message string) {
 		switch message {
+		case "Periodic license validation timer armed":
+			close(armed)
 		case "Periodic license validation failed":
 			select {
 			case failed <- struct{}{}:
@@ -42,7 +45,44 @@ func startObservedAdmissionValidation(t *testing.T, c *Client, interval time.Dur
 	}
 	t.Cleanup(stop)
 	c.StartPeriodicValidation(interval)
+	select {
+	case <-armed:
+	case <-time.After(time.Second):
+		t.Fatal("periodic validation timer did not initialize")
+	}
 	return failed, admitted, stop
+}
+
+func TestPeriodicAdmissionExternalDenialWakesHealthyFourHourTimer(t *testing.T) {
+	withTestPublicKey(t, &rsaKey1.PublicKey)
+	c := admissionClient(t, nil)
+	fresh := c.httpClient.Transport
+	var attempts atomic.Int32
+	c.httpClient.Transport = replacementTransport(func(r *http.Request) (*http.Response, error) {
+		if attempts.Add(1) == 1 {
+			return admissionResponse(http.StatusForbidden, `{"error":"maximum machine activations reached"}`), nil
+		}
+		return fresh.RoundTrip(r)
+	})
+	// The helper waits until the healthy four-hour timer has been armed. The
+	// denial below therefore happens after initialization, as in boot recovery.
+	_, admitted, stop := startObservedAdmissionValidation(t, c, 4*time.Hour)
+	if _, err := c.ActivateOrVerify(context.Background()); FailureClassOf(err) != ClassAdmissionDenied {
+		t.Fatalf("external verification did not deny admission: %v", err)
+	}
+	assertAdmissionGates(t, c, false)
+	if c.GetLicense() != nil || c.LifecycleState().Phase != PhaseAdmissionBlocked {
+		t.Fatal("external denial did not fence the retained grant")
+	}
+	select {
+	case <-admitted:
+	case <-time.After(8 * time.Second):
+		t.Fatal("external admission denial did not wake the normal four-hour timer")
+	}
+	if c.AdmissionBlocked() || !c.ServingAllowed() || attempts.Load() != 2 {
+		t.Fatal("fresh periodic proof failed to recover or started duplicate requests")
+	}
+	stop()
 }
 
 func blockPeriodicAdmission(t *testing.T, c *Client) http.RoundTripper {

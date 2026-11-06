@@ -5673,7 +5673,7 @@ func main() {
 						shutdownCoordinator.TriggerShutdown()
 						return
 					}
-					state := current.ExpiryState()
+					state := licenseClient.LifecycleState()
 					if graceRestart.due(time.Now(), state, clusterCoordinator != nil && clusterCoordinator.LifecyclePreparing()) {
 						log.Warn().Int("grace_day", state.GraceDay).Msg("Paid license expired: restarting Arc after four hours of grace-period operation")
 						if clusterCoordinator != nil {

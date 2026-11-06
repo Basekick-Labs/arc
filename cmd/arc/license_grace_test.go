@@ -52,3 +52,16 @@ func TestGraceRestartRenewalTrialAndFinalCutoff(t *testing.T) {
 		t.Fatal("temporary unavailable authority reset the restart deadline")
 	}
 }
+
+func TestLicenseGraceAdmissionRefusalDoesNotResetRestartDeadline(t *testing.T) {
+	now := time.Now()
+	grace := license.ExpiryState{Valid: true, Phase: license.PhaseGraceRestarts, RestartIntervalSeconds: 4 * 60 * 60}
+	var r licenseGraceRestart
+	r.due(now, grace, false)
+	if r.due(now.Add(5*time.Hour), license.ExpiryState{Phase: license.PhaseAdmissionBlocked}, false) {
+		t.Fatal("admission-blocked runtime started a periodic restart")
+	}
+	if !r.due(now.Add(6*time.Hour), grace, false) {
+		t.Fatal("admission refusal discarded the existing grace restart deadline")
+	}
+}

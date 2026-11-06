@@ -3379,6 +3379,11 @@ func countWALDiskRefusal(ctx context.Context) {
 }
 
 func (b *ArrowBuffer) checkIngestGate(ctx context.Context) error {
+	// Legacy callers may omit context, including invalid-payload dispatch.
+	// Omission must neither panic nor bypass an installed admission gate.
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if admitted, _ := ctx.Value(fenceAdmittedKey{}).(bool); !admitted {
 		if err := b.checkLiveIngestGates(); err != nil {
 			return err

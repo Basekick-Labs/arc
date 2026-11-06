@@ -34,8 +34,12 @@ func (c *Client) storeRuntimeLicenseLocked(l *License) {
 		c.runtimeRestartRequired = true
 	}
 	c.license = l
+	wasBlocked := c.admissionBlocked
 	c.admissionBlocked = false
 	c.keyRejected = false
+	if wasBlocked {
+		c.notifyValidationWakeLocked()
+	}
 }
 
 // AdmissionBlocked reports an installation-local refusal. It does not say that
