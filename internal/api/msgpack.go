@@ -323,6 +323,10 @@ localProcessing:
 	knownDB = strings.Clone(knownDB)
 	known := writableKnownColumns(c, h.rbacManager, knownDB, h.arrowBuffer.KnownColumns(knownDB))
 	records, recordCount, drops, err := h.decoder.DecodeWithDropsKnown(payload, known)
+	if errors.Is(err, ingest.ErrLPCellBudget) {
+		h.logger.Warn().Err(err).Int("body_bytes", len(payload)).Msg("MessagePack write refused")
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to decode MessagePack")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -453,6 +457,10 @@ localProcessing:
 		// was written.
 		if ingest.IsContentRefusal(err) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Msg("MessagePack write refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
 		metrics.Get().IncIngestErrors()
