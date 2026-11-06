@@ -451,8 +451,9 @@ type WriterConfig struct {
 	SyncBytes    int64         // Request a sync once this many bytes are unsynced (default: 1MB; 0 = default)
 	BufferSize   int           // Size of async write buffer (default: 10000)
 	// AckMode decides when a tracked data append returns: once its entry is
-	// queued for the writer (AckModeQueued, the default), or once a sync
-	// covering it has completed (AckModeDurable).
+	// queued for the writer (AckModeQueued), or once a sync covering it has
+	// completed (AckModeDurable). Unset means queued here; Arc's config
+	// resolves its default ("auto", #1499) before constructing the writer.
 	AckMode AckMode
 	Logger  zerolog.Logger
 }
@@ -464,6 +465,7 @@ const (
 	// AckModeQueued returns once the entry is queued for the writer. A crash
 	// loses entries still queued or written but not yet synced, and a full
 	// queue drops entries (ErrWALDropped) while the write is still accepted.
+	// The package default when AckMode is unset.
 	AckModeQueued AckMode = "queued"
 	// AckModeDurable returns once a sync covering the entry has completed, in
 	// every sync mode (async included: a waiting entry forces the sync). A
