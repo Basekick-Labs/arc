@@ -675,7 +675,8 @@ func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 //
 //	select <agg> [, <agg>]* from <measurement> [where <pred tree>]
 //
-// where <agg> is `count(*)` or `{count|sum|min|max|avg}(<bare column>)`. Each item
+// where <agg> is `count(*)`, `{count|sum|min|max|avg}(<bare column>)` or, for count
+// only, `count(<col>['<key>'])` (map-2). Each item
 // is re-serialized from its VALIDATED tokens as `fn(colAsWritten)` — the function
 // name lowercased (both engines lowercase it in the derived output name anyway),
 // the argument's typed spelling preserved (DuckDB and arcx both echo it verbatim
