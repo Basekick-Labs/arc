@@ -486,8 +486,10 @@ func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
 // top-level AND terms of a single-table query's one WHERE clause that are a
 // bare comparison of the time column (time, "time", alias.time, (time)) with
 // a literal ('…', '…'::timestamp, TIMESTAMP '…'), now()/CURRENT_TIMESTAMP
-// plus or minus one interval, or a BETWEEN; either operand order. An
-// inclusive end is returned one microsecond past its literal.
+// plus or minus one interval, epoch_ms(n), make_timestamp(n) or
+// to_timestamp(x) of one numeric literal (#1491), or a BETWEEN; either
+// operand order. An inclusive end is returned one microsecond past its
+// literal; a to_timestamp bound is widened by a second (epochCallSlack).
 func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	return ExtractTimeRangeAt(sqlStr, time.Now().UTC())
 }
