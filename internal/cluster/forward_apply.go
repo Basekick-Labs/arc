@@ -606,9 +606,11 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	//
 	// Topology-mutating commands (AddNode, RemoveNode, PromoteWriter,
 	// etc.) must go through their dedicated join/leave handlers which
-	// have their own auth flow. Rejecting unexpected types prevents a
-	// compromised peer from escalating a shared-secret credential into
-	// topology mutations.
+	// have their own auth flow. Rejecting unexpected types keeps topology
+	// changes on those paths and narrows what a forward can do. It is not
+	// a boundary against a compromised node: every holder of the shared
+	// secret is a fully trusted member and can use the join and leave
+	// paths too (SECURITY.md, #1510).
 	isManifest := cmd.Type == clusterraft.CommandRegisterFile ||
 		cmd.Type == clusterraft.CommandDeleteFile ||
 		cmd.Type == clusterraft.CommandBatchFileOps
@@ -653,10 +655,12 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// The cluster-wide compaction pause (#1087). Setting it (pause, refresh,
 	// resume) is proposed by the restoring primary writer, so it follows the
 	// manifest role rule; the ack is proposed by every node, readers
-	// included, like the barrier. Both must speak only for the peer that
-	// signed the request: a Set whose requested_by, or an Ack whose node_id,
-	// is another node would let one authenticated peer ack on behalf of the
-	// compactor, which is exactly the guarantee the restore waits for.
+	// included, like the barrier. Both must name the requesting node: a Set
+	// whose requested_by, or an Ack whose node_id, is another node is
+	// refused, so a mis-stamped command cannot ack on behalf of the
+	// compactor, which is exactly the guarantee the restore waits for. This
+	// is a consistency check, not sender authentication: the requesting
+	// node ID is a claim any holder of the shared secret can make (#1510).
 	isPauseSet := cmd.Type == clusterraft.CommandSetCompactionPause
 	isPauseAck := cmd.Type == clusterraft.CommandAckCompactionPause
 	// Compaction commit (#1207 d2): a compactor stages, commits, aborts,
@@ -688,7 +692,9 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// A continuous query's watermark is set by the primary writer, which in
 	// local-storage mode need not be the Raft leader. The FSM decides who
 	// may set it (applySetCQWatermark); refused here early are a watermark
-	// that speaks for another node, one whose shared-storage claim does not
+	// whose proposer is not the requesting node (a consistency check: the
+	// requesting node ID is a claim under the shared secret, #1510), one
+	// whose shared-storage claim does not
 	// match this cluster's mode (the claim would otherwise open the FSM's
 	// no-designated-primary path in local mode), and any forwarded one in
 	// shared-storage mode, where the primary is the leader itself.
@@ -912,10 +918,11 @@ func (c *Coordinator) leaderCoordinatorAddress(leaderID string) string {
 
 // manifestCommandSpeaksFor refuses a forwarded manifest or claim command
 // that names another node (#1207): a registration's origin, and a claim's
-// claimant, must be the peer that signed the request. Every in-tree
-// registration stamps the local node as origin, so this refuses nothing
-// legitimate; without it one authenticated peer could register files as
-// another, which the stream claim rule keys on.
+// claimant, must match the requesting node ID in the signed request. Every
+// in-tree registration stamps the local node as origin, so this refuses
+// nothing legitimate and catches a mis-stamped origin, which the stream
+// claim rule keys on. The requesting node ID is itself a claim under the
+// shared secret, so this is not sender authentication (#1510).
 func manifestCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
 	checkRegister := func(raw []byte) error {
 		var p clusterraft.RegisterFilePayload

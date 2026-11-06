@@ -74,6 +74,27 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Docs: the cluster trust model is written down ([#1510](https://github.com/Basekick-Labs/arc/issues/1510))
+
+A new `SECURITY.md` explains how to report a vulnerability privately and what
+the cluster's shared secret guarantees. Every node holding
+`cluster.shared_secret` is a fully trusted member, and a node ID in a peer
+message is a claim, not a proven identity. Cluster TLS with a CA proves that
+a peer belongs to the cluster, not which node it is.
+- **Code comments** that described some peer checks as authenticating the
+  sender now call them what they are: consistency checks on the node ID
+  the request claims.
+- **The startup warning** for cluster TLS without `cluster.tls_ca_file` now
+  says that cluster membership, not node identity, rests on the shared
+  secret.
+- **A new Warn log** appears when a standby's origin-stream session is
+  replaced by a connection from a different address. The replacement itself
+  is unchanged: the primary cannot tell a live session from a half-open one,
+  and a standby that restarts with a new address must still be able to
+  reconnect.
+
+Per-node peer identity remains open in #1510.
+
 ## Fix: Arc's internal SQL placeholder text is reserved
 
 Before its checks, Arc swaps string literals, quoted names and some keywords

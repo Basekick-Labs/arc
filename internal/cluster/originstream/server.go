@@ -153,6 +153,17 @@ func (s *Server) Accept(node string, conn net.Conn, sessionKey []byte) {
 	s.mu.Unlock()
 	if old != nil {
 		old.closeConn()
+		// Log only. A new session replaces the old one whatever its
+		// address: the stream is one-way, so the primary cannot tell a
+		// live old session from a half-open one, and a standby restarted
+		// with a new address must not be locked out while the old
+		// connection lingers. Which node a hello names is a claim under
+		// the shared secret (SECURITY.md, #1510); the address change is
+		// recorded so an operator can see a session move.
+		if was, now := remoteHost(old.conn), remoteHost(conn); was != now {
+			ss.logger.Warn().Str("previous_address", was).Str("address", now).
+				Msg("Origin stream session for this standby replaced by a connection from a different address")
+		}
 	}
 	if f := s.floors(); f != nil {
 		ss.setFloors(f)
@@ -168,6 +179,19 @@ func (s *Server) Accept(node string, conn net.Conn, sessionKey []byte) {
 		metrics.Get().SetOriginStreamSessions(int64(len(s.sessions)))
 		s.mu.Unlock()
 	}()
+}
+
+// remoteHost is the host part of conn's remote address, or the whole
+// address when it has no port; empty when there is none.
+func remoteHost(conn net.Conn) string {
+	if conn == nil || conn.RemoteAddr() == nil {
+		return ""
+	}
+	addr := conn.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
 
 func (ss *session) setFloors(f *Floors) uint64 {
