@@ -1,6 +1,8 @@
 package ingest
 
 import (
+	"context"
+
 	"github.com/basekick-labs/arc/internal/wal"
 )
 
@@ -9,6 +11,12 @@ import (
 // the WAL. Queued acknowledgement only; see wal.(*Writer).PrepareTracked.
 type walPreparer interface {
 	PrepareTracked(database string, payload []byte) (*wal.PreparedAppend, error)
+}
+
+// walContextAppender is a tracked WAL append whose durable wait ends with the
+// write's context (*wal.Writer, #1501).
+type walContextAppender interface {
+	AppendRawWithMetaTrackedContext(ctx context.Context, database string, payload []byte) ([]string, error)
 }
 
 // walCommitter is a prepared WAL append (*wal.PreparedAppend).
@@ -78,14 +86,17 @@ func (b *ArrowBuffer) retractRefusedWAL(hashes []string) bool {
 // before, and a refusal after this point retracts it (retractRefusedWAL).
 // hasCopy is whether the entry is already complete in the WAL; a prepared one
 // is decided at commit.
-func (b *ArrowBuffer) appendUncoveredWAL(database string, payload []byte) (prep *wal.PreparedAppend, hashes []string, hasCopy bool, err error) {
+func (b *ArrowBuffer) appendUncoveredWAL(ctx context.Context, database string, payload []byte) (prep *wal.PreparedAppend, hashes []string, hasCopy bool, err error) {
 	if p := b.prepareTrackedWAL(); p != nil {
 		prep, err = p.PrepareTracked(database, payload)
 		return prep, nil, false, err
 	}
-	if tracked, ok := b.wal.(trackedWALWriter); ok {
-		hashes, err = tracked.AppendRawWithMetaTracked(database, payload)
-	} else {
+	switch w := b.wal.(type) {
+	case walContextAppender:
+		hashes, err = w.AppendRawWithMetaTrackedContext(ctx, database, payload)
+	case trackedWALWriter:
+		hashes, err = w.AppendRawWithMetaTracked(database, payload)
+	default:
 		err = b.wal.AppendRawWithMeta(database, payload)
 	}
 	return nil, hashes, err == nil, err

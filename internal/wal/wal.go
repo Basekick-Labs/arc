@@ -455,7 +455,13 @@ type WriterConfig struct {
 	// completed (AckModeDurable). Unset means queued here; Arc's config
 	// resolves its default ("auto", #1499) before constructing the writer.
 	AckMode AckMode
-	Logger  zerolog.Logger
+	// AckTimeout bounds how long a tracked data append waits, in
+	// AckModeDurable, for queue admission and the sync covering its entry;
+	// past it the append is refused with ErrNotDurable (#1501). Unset means no
+	// bound here; Arc's config always sets it. It has no effect in
+	// AckModeQueued, which does not wait.
+	AckTimeout time.Duration
+	Logger     zerolog.Logger
 }
 
 // AckMode is when a tracked data append is acknowledged to its caller.
@@ -1447,11 +1453,13 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 // The identity is used by flush checkpoints to avoid replaying data that was
 // already durably written to storage.
 func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, error) {
-	hashes, err := w.appendTracked(records)
+	ctx, cancel := w.ackWaitContext(context.Background())
+	defer cancel()
+	hashes, err := w.appendTracked(ctx, records)
 	return hashes, w.durableErr(err)
 }
 
-func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, error) {
+func (w *Writer) appendTracked(ctx context.Context, records []map[string]interface{}) ([]string, error) {
 	payload, err := msgpack.Marshal(records)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize records: %w", err)
@@ -1470,7 +1478,7 @@ func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, erro
 			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		token, done, err := w.appendTrackedEntry(nil, chunk)
+		token, done, err := w.appendTrackedEntry(ctx, nil, chunk)
 		if err != nil {
 			// The chunks that already landed are pending in the floor, and
 			// their tokens go out of scope with this slice — the caller gets
@@ -1489,7 +1497,7 @@ func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, erro
 		}
 	}
 	if len(dones) > 0 {
-		if err := w.awaitDurable(hashes, dones); err != nil {
+		if err := w.awaitDurable(ctx, hashes, dones); err != nil {
 			return nil, err
 		}
 	}
@@ -1498,11 +1506,23 @@ func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, erro
 
 // AppendRawWithMetaTracked is the tracked counterpart to AppendRawWithMeta.
 func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
-	hashes, err := w.appendRawWithMetaTracked(database, payload)
+	return w.AppendRawWithMetaTrackedContext(context.Background(), database, payload)
+}
+
+// AppendRawWithMetaTrackedContext is AppendRawWithMetaTracked whose durable
+// wait also ends with ctx (#1501): in AckModeDurable, a ctx done before the
+// covering sync answers refuses the append with ErrNotDurable and retracts its
+// entries. Ingest calls this with the write's context. AckTimeout applies
+// either way, since an HTTP handler's context (a fasthttp.RequestCtx) has no
+// deadline of its own and ends only at server shutdown.
+func (w *Writer) AppendRawWithMetaTrackedContext(ctx context.Context, database string, payload []byte) ([]string, error) {
+	ctx, cancel := w.ackWaitContext(ctx)
+	defer cancel()
+	hashes, err := w.appendRawWithMetaTracked(ctx, database, payload)
 	return hashes, w.durableErr(err)
 }
 
-func (w *Writer) appendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
+func (w *Writer) appendRawWithMetaTracked(ctx context.Context, database string, payload []byte) ([]string, error) {
 	if len(database) > 255 {
 		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
 	}
@@ -1525,7 +1545,7 @@ func (w *Writer) appendRawWithMetaTracked(database string, payload []byte) ([]st
 			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		token, done, err := w.appendTrackedEntry(envHeader, chunk)
+		token, done, err := w.appendTrackedEntry(ctx, envHeader, chunk)
 		if err != nil {
 			// The chunks that already landed are pending in the floor, and
 			// their tokens go out of scope with this slice — the caller gets
@@ -1544,7 +1564,7 @@ func (w *Writer) appendRawWithMetaTracked(database string, payload []byte) ([]st
 		}
 	}
 	if len(dones) > 0 {
-		if err := w.awaitDurable(hashes, dones); err != nil {
+		if err := w.awaitDurable(ctx, hashes, dones); err != nil {
 			return nil, err
 		}
 	}
@@ -1608,24 +1628,9 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, rel
 		if end > len(hashes) {
 			end = len(hashes)
 		}
-		payload, err := msgpack.Marshal(hashes[start:end])
+		entry, done, err := w.checkpointEntry(hashes[start:end])
 		if err != nil {
 			return err
-		}
-		checkpoint := append([]byte{WALCheckpointMarker}, payload...)
-		checksum := crc32.ChecksumIEEE(checkpoint)
-		timestampUS := uint64(time.Now().UnixMicro())
-		entryData := make([]byte, WALEntryHeaderSize+len(checkpoint))
-		binary.BigEndian.PutUint32(entryData[0:4], uint32(len(checkpoint)))
-		binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
-		binary.BigEndian.PutUint32(entryData[12:16], checksum)
-		copy(entryData[WALEntryHeaderSize:], checkpoint)
-		done := make(chan error, 1)
-		entry := walEntry{
-			data:         entryData,
-			durable:      true,
-			done:         done,
-			foreignProof: w.coversForeignIdentity(hashes[start:end]),
 		}
 		if blocking {
 			if err := w.enqueueEntryBlocking(ctx, entry); err != nil {
@@ -1665,7 +1670,7 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, rel
 			if err := w.enqueueEntryBlocking(context.Background(), entry); err != nil {
 				return err
 			}
-			if err := w.awaitDone(done); err != nil {
+			if err := w.awaitDone(context.Background(), done); err != nil {
 				return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
 			}
 		} else {
@@ -1681,6 +1686,30 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, rel
 		}
 	}
 	return nil
+}
+
+// checkpointEntry builds the durable checkpoint entry for one batch of
+// identities, and the channel it is answered on.
+func (w *Writer) checkpointEntry(hashes []string) (walEntry, chan error, error) {
+	payload, err := msgpack.Marshal(hashes)
+	if err != nil {
+		return walEntry{}, nil, err
+	}
+	checkpoint := append([]byte{WALCheckpointMarker}, payload...)
+	checksum := crc32.ChecksumIEEE(checkpoint)
+	timestampUS := uint64(time.Now().UnixMicro())
+	entryData := make([]byte, WALEntryHeaderSize+len(checkpoint))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(checkpoint)))
+	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+	binary.BigEndian.PutUint32(entryData[12:16], checksum)
+	copy(entryData[WALEntryHeaderSize:], checkpoint)
+	done := make(chan error, 1)
+	return walEntry{
+		data:         entryData,
+		durable:      true,
+		done:         done,
+		foreignProof: w.coversForeignIdentity(hashes),
+	}, done, nil
 }
 
 // putEnvelopeHeader writes the envelope header for dbBytes (marker, length,
@@ -1707,7 +1736,7 @@ func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
 // header, then the logical payload. The tracked region is byte-identical to the
 // separate trackedPayload this used to assemble, so the CRC and the bytes on
 // disk are unchanged; only the two intermediate copies are gone.
-func (w *Writer) appendTrackedEntry(envHeader, payload []byte) (string, chan error, error) {
+func (w *Writer) appendTrackedEntry(ctx context.Context, envHeader, payload []byte) (string, chan error, error) {
 	// Allocating the sequence and publishing it as pending must be one step.
 	// Everything after this — the Sprintf, the CRC, and above all the
 	// synchronous replication hook below — sits between them otherwise, and a
@@ -1746,7 +1775,7 @@ func (w *Writer) appendTrackedEntry(envHeader, payload []byte) (string, chan err
 		// so the answer never blocks the writer or syncer if nobody waits.
 		entry.durable = true
 		entry.done = make(chan error, 1)
-		if err = w.enqueueDurable(entry); err != nil {
+		if err = w.enqueueDurable(ctx, entry); err != nil {
 			err = fmt.Errorf("%w: %v", ErrNotDurable, err)
 		}
 	} else {
@@ -1764,23 +1793,30 @@ func (w *Writer) appendTrackedEntry(envHeader, payload []byte) (string, chan err
 
 // enqueueDurable admits a durable data entry, blocking while the queue is full
 // instead of dropping it. It never takes w.mu: the writer loop holds that
-// across file writes and rotation, and this runs on every ingest request.
-func (w *Writer) enqueueDurable(entry walEntry) error {
+// across file writes and rotation, and this runs on every ingest request. A hung
+// WAL device can hold w.mu for as long as it hangs, so the wait ends with ctx.
+func (w *Writer) enqueueDurable(ctx context.Context, entry walEntry) error {
 	if w.closedFlag.Load() {
 		return errors.New("WAL writer is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	select {
 	case w.entryChan <- entry:
 		w.enqueuedBytes.Add(uint64(len(entry.data)))
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-w.done:
 		return errors.New("WAL writer is closed")
 	}
 }
 
-// awaitDone waits for one durable entry's answer, or for the writer to have
-// exited without serving it.
-func (w *Writer) awaitDone(d chan error) error {
+// awaitDone waits for one durable entry's answer, for the writer to have exited
+// without serving it, or for ctx. An answer that is already there wins over
+// either: an entry the sync covered is durable however late it is read.
+func (w *Writer) awaitDone(ctx context.Context, d chan error) error {
 	select {
 	case err := <-d:
 		return err
@@ -1792,7 +1828,23 @@ func (w *Writer) awaitDone(d chan error) error {
 		default:
 			return errWriterExited
 		}
+	case <-ctx.Done():
+		select {
+		case err := <-d:
+			return err
+		default:
+			return ctx.Err()
+		}
 	}
+}
+
+// ackWaitContext is ctx bounded by AckTimeout, for a durable append's wait. The
+// caller always calls the returned cancel.
+func (w *Writer) ackWaitContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if w.config.AckMode != AckModeDurable || w.config.AckTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, w.config.AckTimeout)
 }
 
 // DurableAck reports whether tracked appends acknowledge only durable entries
@@ -1810,15 +1862,15 @@ func (w *Writer) durableErr(err error) error {
 }
 
 // awaitDurable waits until every entry in dones is covered by a completed
-// sync. On any failure it releases the pending sequences of tokens (the caller
-// returns no tokens, so nothing else would: an unreleased sequence pins the
-// purge floor for the life of the process, #676) and returns ErrNotDurable.
-// The entries are all enqueued before the first wait, so chunks of one payload
-// share syncs instead of paying one each.
-func (w *Writer) awaitDurable(tokens []string, dones []chan error) error {
+// sync, or until ctx is done (#1501). On any failure it releases the pending
+// sequences of tokens (the caller returns no tokens, so nothing else would: an
+// unreleased sequence pins the purge floor for the life of the process, #676)
+// and returns ErrNotDurable. The entries are all enqueued before the first wait,
+// so chunks of one payload share syncs instead of paying one each.
+func (w *Writer) awaitDurable(ctx context.Context, tokens []string, dones []chan error) error {
 	var firstErr error
 	for _, d := range dones {
-		if err := w.awaitDone(d); err != nil && firstErr == nil {
+		if err := w.awaitDone(ctx, d); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1966,11 +2018,13 @@ func (w *Writer) AppendRaw(payload []byte) error {
 // is used by replication followers so their local WAL participates in the
 // same sequence-floor purge as primary ingest.
 func (w *Writer) AppendRawTracked(payload []byte) ([]string, error) {
-	hashes, err := w.appendRawTracked(payload)
+	ctx, cancel := w.ackWaitContext(context.Background())
+	defer cancel()
+	hashes, err := w.appendRawTracked(ctx, payload)
 	return hashes, w.durableErr(err)
 }
 
-func (w *Writer) appendRawTracked(payload []byte) ([]string, error) {
+func (w *Writer) appendRawTracked(ctx context.Context, payload []byte) ([]string, error) {
 	chunks := [][]byte{payload}
 	if len(payload) > MaxWALPayloadSize {
 		var err error
@@ -1987,7 +2041,7 @@ func (w *Writer) appendRawTracked(payload []byte) ([]string, error) {
 			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		hash, done, err := w.appendTrackedEntry(nil, chunk)
+		hash, done, err := w.appendTrackedEntry(ctx, nil, chunk)
 		if err != nil {
 			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, err
@@ -1998,7 +2052,7 @@ func (w *Writer) appendRawTracked(payload []byte) ([]string, error) {
 		}
 	}
 	if len(dones) > 0 {
-		if err := w.awaitDurable(hashes, dones); err != nil {
+		if err := w.awaitDurable(ctx, hashes, dones); err != nil {
 			return nil, err
 		}
 	}
@@ -2355,7 +2409,7 @@ func (w *Writer) retractEnqueued(tokens []string) {
 // RetractTracked checkpoints tracked entries of a write that was refused after
 // they were appended, so recovery never replays what the client was told was
 // not written (#1438), and releases them from the purge floor. A durable
-// writer waits for the checkpoint (admission bounded by retractTimeout); a
+// writer waits for the checkpoint for at most retractTimeout (retractDurable); a
 // queued one enqueues it like a flush checkpoint. If the checkpoint cannot be
 // written the entries are only released, as before (they may come back at the
 // next start): counted in RetractionsFailed and arc_wal_retractions_failed_total,
@@ -2368,7 +2422,7 @@ func (w *Writer) RetractTracked(tokens []string) bool {
 	var err error
 	if w.config.AckMode == AckModeDurable {
 		ctx, cancel := context.WithTimeout(context.Background(), retractTimeout)
-		err = w.MarkFlushedContext(ctx, tokens)
+		err = w.retractDurable(ctx, tokens)
 		cancel()
 	} else {
 		err = w.MarkFlushed(tokens)
@@ -2392,9 +2446,35 @@ func (w *Writer) RetractTracked(tokens []string) bool {
 	return false
 }
 
-// retractTimeout bounds how long a retraction waits to be admitted to a full
-// queue. Past it the write is refused without its retraction.
-const retractTimeout = 5 * time.Second
+// retractDurable checkpoints tokens and releases them, waiting for no longer
+// than ctx: this runs on the request of a write being refused, often because
+// the WAL device hangs (#1501), and that request must get its answer. So unlike
+// MarkFlushedContext it takes no w.mu, which the writer loop holds across a
+// hung write, and it stops waiting for the reply too. That is safe here because
+// RetractTracked releases the tokens on an error: a checkpoint still in the
+// queue only makes the retraction true later, when the device recovers.
+func (w *Writer) retractDurable(ctx context.Context, tokens []string) error {
+	for start := 0; start < len(tokens); start += walCheckpointBatchSize {
+		end := min(start+walCheckpointBatchSize, len(tokens))
+		entry, done, err := w.checkpointEntry(tokens[start:end])
+		if err != nil {
+			return err
+		}
+		if err := w.enqueueDurable(ctx, entry); err != nil {
+			return err
+		}
+		if err := w.awaitDone(ctx, done); err != nil {
+			return err
+		}
+	}
+	w.releasePending(tokens)
+	return nil
+}
+
+// retractTimeout bounds how long a retraction waits, for queue admission and for
+// the sync covering it. Past it the write is refused without its retraction. A
+// variable so a test can shorten it.
+var retractTimeout = 5 * time.Second
 
 // retractLogInterval is the least time between two Error lines for failed
 // retractions (each is counted regardless).

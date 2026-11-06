@@ -44,12 +44,13 @@ What changes with the WAL on:
   duplicate rows (at-least-once). A request spanning several measurements is
   written one at a time; a failure after some were buffered answers `500`
   naming what was written, as for other refusals.
-- **A stalled WAL device stalls writes instead of losing them.** With
+- **A stalled WAL device refuses writes instead of losing them.** With
   `"queued"`, a hung disk meant the WAL queue filled, entries were dropped and
   ingest kept answering 204 for writes that were never durable. With
-  `"durable"` every request waits until its sync completes or the WAL writer
-  closes; the request context does not interrupt that wait. The disk-pressure
-  gate (#676) covers low free space, not a hung device. Watch
+  `"durable"` a request waits for its sync for at most `wal.ack_timeout`
+  (default `30s`, [#1501](https://github.com/Basekick-Labs/arc/issues/1501)) and
+  is then refused as below. The disk-pressure gate (#676) covers low free space,
+  not a hung device. Watch
   `arc_wal_failed_syncs_total`, `arc_wal_not_durable_rejections_total` and the
   `wal_not_durable` refusal log.
 - **MQTT.** A message refused as not durable is retried for 2 seconds and then
@@ -2803,6 +2804,43 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### A hung WAL device refuses a durable write instead of hanging it ([#1501](https://github.com/Basekick-Labs/arc/issues/1501))
+
+With `wal.ack_mode = "durable"`, a write waited for the sync covering its WAL
+entry with nothing to end the wait but the WAL writer closing. On a WAL device
+that hangs, as opposed to one that fails or fills up, every live write parked
+with its payload for as long as the hang lasted, and nothing limited how many.
+
+A durable write now waits for at most the new `wal.ack_timeout` (default
+`30s`, a positive Go duration; anything else is a startup error). It is then
+refused with `503`, `Retry-After` and `X-Arc-Ingest-Refused: wal_not_durable`,
+and counted in `arc_wal_not_durable_rejections_total`, like any other write the
+WAL could not make durable. The wait also ends with the write's own context
+(server shutdown, stopping an MQTT subscription, a continuous query's deadline);
+that write gets the context's error, as a cancelled write already did, and is
+not counted.
+
+The refused entries are retracted as before
+([#1438](https://github.com/Basekick-Labs/arc/issues/1438)). That retraction now
+waits at most 5 seconds in all, its reply included, so a refused request can take
+`wal.ack_timeout` plus 5 seconds to answer. On a hung device it often cannot
+finish in that time: it is then counted in `arc_wal_retractions_failed_total`,
+and the entry may replay at the next start, so a client's retry can duplicate
+rows (at-least-once). Nothing is lost, and no sequence stays pinned in the purge
+floor.
+
+A sync slower than `wal.ack_timeout` now refuses writes too: raise the key if
+your WAL volume is that slow when healthy.
+
+An MQTT message is refused the same way once the wait ends, and is then retried
+and dropped as the upgrade note above describes, where before it held the
+subscription until the device recovered. Set `wal.ack_mode = "queued"` for a
+deployment where that must not happen, until the follow-up
+([#1502](https://github.com/Basekick-Labs/arc/issues/1502)) lands.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1506](https://github.com/Basekick-Labs/arc/pull/1506).
 
 ### `allow_unreachable=true` stops waiting for files nothing is delivering ([#1426](https://github.com/Basekick-Labs/arc/issues/1426))
 

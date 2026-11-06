@@ -721,6 +721,9 @@ enabled = false
 #                           # durable is refused with 503), or "queued" once the entry is queued (acknowledged
 #                           # sooner; a crash can lose entries still queued or unsynced). "auto", the default,
 #                           # is durable with the WAL on, and queued with cluster.wal_coverage set.
+# ack_timeout = "30s"       # With durable, the longest a write waits for its WAL entry to be queued and synced.
+#                           # Past it the write is refused with 503 (wal_not_durable) instead of hanging with a
+#                           # stalled WAL device. Must be a positive duration.
 # sync_bytes = 1048576      # Request a sync once this many WAL bytes are unsynced (default 1 MiB).
 #                           # Syncs run beside the WAL writer, so this bounds how much written data a
 #                           # sync can leave behind, not ingest throughput. A sync also runs every 100 ms

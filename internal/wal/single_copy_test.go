@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"hash/crc32"
 	"io"
@@ -150,7 +151,7 @@ func TestTrackedEntriesMatchReferenceBytes(t *testing.T) {
 			var envBuf [3 + 255]byte
 			env := envBuf[:putEnvelopeHeader(envBuf[:], []byte("iot"))]
 			for i := 0; i < 2; i++ {
-				if _, _, err := writer.appendTrackedEntry(env, small); err != nil {
+				if _, _, err := writer.appendTrackedEntry(context.Background(), env, small); err != nil {
 					t.Fatalf("chunk %d: %v", i, err)
 				}
 				writes = append(writes, write{name: "chunk-" + strconv.Itoa(i), db: "iot", envelope: true, payload: small})

@@ -31,7 +31,8 @@ const (
 	RefusalWALDisk = "wal_disk"
 	// RefusalWALNotDurable: with wal.ack_mode = "durable" (the resolved
 	// default with the WAL on, #1499), the write's WAL entry could not be
-	// made durable (write or sync failure, shutdown); counted in
+	// made durable (write or sync failure, wal.ack_timeout passed, shutdown);
+	// counted in
 	// arc_wal_not_durable_rejections_total.
 	RefusalWALNotDurable = "wal_not_durable"
 	// RefusalImportQueue: a bulk import waited ingest.import_queue_timeout_ms
@@ -102,8 +103,14 @@ var ErrWALNotDurable error = &WriteRefusal{
 // the cause in the text.
 // walNotDurable is the refusal of a write whose WAL entry could not be made
 // durable, counted once per write: a retry of the same message under
-// WithRefusalCounted (MQTT) is not counted again, as for the other refusals.
+// WithRefusalCounted (MQTT) is not counted again, as for the other refusals. A
+// write whose own context ended is not one: the caller gave up, which says
+// nothing about the WAL, so it gets the context's error as any cancelled write
+// does (#1501). wal.ack_timeout passing is not the write's context ending.
 func walNotDurable(ctx context.Context, err error) error {
+	if cause := ctx.Err(); cause != nil {
+		return cause
+	}
 	if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
 		metrics.Get().IncWALNotDurableRejections()
 	}

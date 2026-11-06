@@ -3533,7 +3533,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 		// ZERO-COPY PATH: Use raw msgpack bytes if available (avoids re-serialization)
 		if len(record.RawPayload) > 0 {
 			var err error
-			trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(database, record.RawPayload)
+			trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(ctx, database, record.RawPayload)
 			consumeWALReservation(ctx, len(record.RawPayload))
 			if err != nil {
 				// wal.ack_mode = "durable": the entry is not on disk (or never
@@ -3565,7 +3565,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 				if marshalErr != nil {
 					err = marshalErr
 				} else {
-					trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(database, rowPayload)
+					trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(ctx, database, rowPayload)
 				}
 				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
@@ -3842,7 +3842,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	} else if b.wal != nil && !skipWAL {
 		if len(rawPayload) > 0 {
 			var err error
-			trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(database, rawPayload)
+			trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(ctx, database, rawPayload)
 			consumeWALReservation(ctx, len(rawPayload))
 			if err != nil {
 				// wal.ack_mode = "durable": the entry is not on disk (or never
@@ -3869,7 +3869,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 				if marshalErr != nil {
 					err = marshalErr
 				} else {
-					trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(database, rowPayload)
+					trackedPrep, walHashes, hasWALCopy, err = b.appendUncoveredWAL(ctx, database, rowPayload)
 				}
 				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
