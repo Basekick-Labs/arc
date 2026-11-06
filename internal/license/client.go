@@ -121,7 +121,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	// network changes must not consume another machine activation on restart.
 	fingerprint, err := loadOrCreateInstallationFingerprint(cfg.CacheDir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate machine fingerprint: %w", err)
+		return nil, fmt.Errorf("failed to initialize installation identity: %w", err)
 	}
 
 	c := &Client{
@@ -598,7 +598,7 @@ func (c *Client) GetLicense() *License {
 	return c.license
 }
 
-// RequireRuntimeRestart keeps configured services in OSS while a rejected boot
+// RequireRuntimeRestart keeps configured services fenced while a rejected boot
 // retries verification. A fresh process must apply resource limits and build
 // all authorized components before the new grant becomes effective.
 func (c *Client) RequireRuntimeRestart() { c.mu.Lock(); c.runtimeRestartRequired = true; c.mu.Unlock() }

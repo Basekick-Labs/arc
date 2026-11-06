@@ -48,7 +48,8 @@ trusted policy while admission is blocked; admission never extends grace.
 Online installations persist `license_installation.json` beside the auth database
 on the node's own persistent volume. The first identity uses the normal machine
 fingerprint and remains stable across subsequent pod/network replacements.
-Creation is atomic and uses restrictive permissions; a corrupt identity or
+Creation is atomic and uses owner-private permissions, accepting private group
+read/write modes applied by Kubernetes fsGroup on remount. A corrupt identity or
 failed persistence does not silently create a different installation. Keep this
 file with the node's data across restarts and key changes. A copied license
 cache alone never supplies an identity or authorizes an online boot. An older

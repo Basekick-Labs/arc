@@ -22,5 +22,13 @@ func syncInstallationIdentityDirectory(path string) error {
 }
 
 func installationIdentityPermissionsSecure(mode os.FileMode) bool {
-	return mode.Perm() == 0o600
+	// Kubernetes fsGroup may add trusted deployment-group access when a
+	// volume is remounted. Keep that identity without chmod/regeneration;
+	// creation still uses 0600. Execution and access by others stay forbidden.
+	switch mode.Perm() {
+	case 0o600, 0o640, 0o660:
+		return true
+	default:
+		return false
+	}
 }

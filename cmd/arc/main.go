@@ -1898,8 +1898,8 @@ func main() {
 	// Phase 4: build the compaction role gate from config. When clustering
 	// is enabled, only nodes with RoleCompactor actually run compaction —
 	// the gate is consulted at Scheduler.Start() and TriggerNow(). OSS and
-	// standalone deployments pass a nil gate (compactionGate below) and
-	// skip the role check entirely, preserving pre-Phase-4 behavior.
+	// unconfigured standalone deployments pass a nil gate and skip role checks.
+	// Configured online standalones additionally gate execution on admission.
 	//
 	// Two interface variables over ONE gate value (#1152): the schedulers
 	// take compaction.ClusterGate, and the API handler takes

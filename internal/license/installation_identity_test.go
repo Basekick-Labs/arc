@@ -98,6 +98,62 @@ func TestInstallationIdentityPreservesExistingDirectoryPermissions(t *testing.T)
 	}
 }
 
+func TestInstallationIdentityPreservesTrustedGroupPermissionsAfterRemount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows file access is controlled by ACLs")
+	}
+	for _, tc := range []struct {
+		mode os.FileMode
+		want bool
+	}{
+		{0o600, true}, {0o640, true}, {0o660, true},
+		{0o644, false}, {0o664, false}, {0o666, false}, {0o604, false},
+		{0o700, false}, {0o610, false}, {0o601, false},
+		{0o400, false}, {0o620, false},
+	} {
+		t.Run(fmt.Sprintf("mode=%o", tc.mode), func(t *testing.T) {
+			dir := t.TempDir()
+			want := installationTestFingerprint(1)
+			if got, err := loadOrCreateInstallationFingerprintWithGenerator(dir, func() (string, error) {
+				return want, nil
+			}); err != nil || got != want {
+				t.Fatalf("initial private identity: %q, %v", got, err)
+			}
+			path := filepath.Join(dir, installationIdentityFileName)
+			created, err := os.Stat(path)
+			if err != nil || created.Mode().Perm() != 0o600 {
+				t.Fatalf("identity must initially be 0600: %v", err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			got, err := loadOrCreateInstallationFingerprintWithGenerator(dir, func() (string, error) {
+				t.Error("an existing identity must never consult changed hardware or regenerate")
+				return installationTestFingerprint(2), nil
+			})
+			if tc.want {
+				if err != nil || got != want {
+					t.Fatalf("trusted group remount lost the identity: %q, %v", got, err)
+				}
+			} else if err == nil || got != "" {
+				t.Fatalf("unsafe identity mode accepted: %q, %v", got, err)
+			}
+			retained, err := os.Stat(path)
+			if err != nil || retained.Mode().Perm() != tc.mode {
+				t.Fatalf("loading changed existing file permissions: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("loading changed existing identity bytes: %v", err)
+			}
+		})
+	}
+}
+
 func TestInstallationIdentityCorruptionNeverRegenerates(t *testing.T) {
 	valid := installationTestFingerprint(1)
 	for name, data := range map[string]string{
