@@ -106,6 +106,7 @@ const (
 	suspendWALDisk                                  // WAL volume disk pressure (#676)
 	suspendBufferFull                               // ingest.max_buffered_bytes reached (#1468)
 	suspendWALNotDurable                            // the WAL refuses durable acknowledgements (#1502)
+	suspendLicense                                  // the license's grace period stops ingestion (days 7-14)
 )
 
 // mqttDiskMinState is the least time subscriptions stay suspended for WAL disk
@@ -129,6 +130,9 @@ func (r suspendReasons) describe() string {
 	if r&suspendWALNotDurable != 0 {
 		parts = append(parts, "the WAL is not acknowledging writes as durable")
 	}
+	if r&suspendLicense != 0 {
+		parts = append(parts, "the expired license's grace period stops ingestion")
+	}
 	if len(parts) == 0 {
 		return "writes are refused on this node"
 	}
@@ -142,6 +146,15 @@ func (r suspendReasons) describe() string {
 // messages until the subscription resumes.
 func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
 	m.setSuspendReason(suspendFenced, fenced)
+}
+
+// SetLicenseWritesStopped suspends every subscription while the expired
+// license's grace period refuses ingestion (days 7-14), and resumes them when
+// it ends: on renewal, or at the cutoff, when the node runs without
+// Enterprise features. The broker holds messages meanwhile (QoS 1 or 2,
+// clean_session=false), within its own session and queue limits.
+func (m *SubscriptionManager) SetLicenseWritesStopped(stopped bool) {
+	m.setSuspendReason(suspendLicense, stopped)
 }
 
 // SetWALDiskPressure suspends every subscription while the WAL volume is

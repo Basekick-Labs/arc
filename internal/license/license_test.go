@@ -18,17 +18,18 @@ func TestSignedExpiryBoundaryAndDisplayStatus(t *testing.T) {
 		{"after", now.Add(time.Nanosecond), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := validAt(tc.expires, now); got != tc.want {
+			// A trial ends exactly at its signed expiry (no grace).
+			if got := validAt(tc.expires, true, now); got != tc.want {
 				t.Fatalf("validAt = %v, want %v", got, tc.want)
 			}
-			status, days := expiryStatus(tc.expires, now)
+			status, days := expiryStatus(tc.expires, true, now)
 			if (status == "active") != tc.want || days != 0 {
 				t.Fatalf("status=%s days=%d", status, days)
 			}
 		})
 	}
 	for _, status := range []string{"active", "grace_period", "expired", "read_only", ""} {
-		l := &License{Status: status, ExpiresAt: now.Add(time.Hour)}
+		l := &License{Status: status, CustomerID: TrialCustomerPrefix + "x", ExpiresAt: now.Add(time.Hour)}
 		if !l.IsValid() || l.IsExpired() {
 			t.Fatalf("display status %q overrode signed future expiry", status)
 		}

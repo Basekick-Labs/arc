@@ -16,7 +16,7 @@ type changingSchedulerLicense struct {
 
 func TestSchedulerSignedExpiryCancelsActivePass(t *testing.T) {
 	gate := &changingSchedulerLicense{}
-	gate.current.Store(&license.License{Tier: license.TierEnterprise, Status: "active", ExpiresAt: time.Now().Add(500 * time.Millisecond)})
+	gate.current.Store(&license.License{Tier: license.TierEnterprise, Status: "active", CustomerID: license.TrialCustomerPrefix + "x", ExpiresAt: time.Now().Add(500 * time.Millisecond)}) // a trial: no grace past its expiry
 	started := make(chan int, 16)
 	cancelled := make(chan struct{})
 	runner := &schedulerRunner{started: started, call: func(ctx context.Context, _ int) (*RunResult, error) {

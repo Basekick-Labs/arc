@@ -1,6 +1,7 @@
 package license
 
 import (
+	"strings"
 	"time"
 )
 
@@ -75,5 +76,5 @@ func (s *SignedLicense) ToRuntimeLicense(now time.Time) *License {
 // billing-grace UX) but Arc's feature gates use the strict signed
 // expiry to prevent trust escalation through the unsigned envelope.
 func (s *SignedLicense) deriveStatus(now time.Time) (string, int) {
-	return expiryStatus(s.ExpiresAt, now)
+	return expiryStatus(s.ExpiresAt, strings.HasPrefix(s.CustomerID, TrialCustomerPrefix), now)
 }

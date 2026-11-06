@@ -1284,6 +1284,11 @@ type ArrowBuffer struct {
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]
+	// licenseWriteGate refuses live writes on grace days 7-14 of an expired
+	// license. A slot of its own: the cluster wiring owns ingestGate, and this
+	// one is checked only at request admission, never on CQ output, replay or
+	// compaction writes.
+	licenseWriteGate atomic.Pointer[func() bool]
 	// walDiskGate refuses live writes under WAL volume disk pressure (#676).
 	// A slot of its own: the cluster wiring replaces ingestGate. Nil unless
 	// the WAL is enabled with wal.disk_pressure_enabled.
@@ -3167,6 +3172,16 @@ var ErrUnstorableColumnValue = errors.New("column value cannot be stored")
 // written, the WAL included (#1207). It returns nil to admit, or an error
 // wrapping ErrIngestFenced. Replay, recovery and replication paths are never
 // gated.
+// SetLicenseWriteGate installs the license's ingestion stop: stopped reports
+// whether live writes are refused (grace days 7-14). nil removes it.
+func (b *ArrowBuffer) SetLicenseWriteGate(stopped func() bool) {
+	if stopped == nil {
+		b.licenseWriteGate.Store(nil)
+		return
+	}
+	b.licenseWriteGate.Store(&stopped)
+}
+
 func (b *ArrowBuffer) SetIngestGate(gate func() error) {
 	b.ingestGate.Store(&gate)
 }
@@ -3282,6 +3297,12 @@ func noRelease() {}
 // that is checked here only, so an admitted request is never stopped by it
 // part-way.
 func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
+	if g := b.licenseWriteGate.Load(); g != nil && *g != nil && (*g)() {
+		if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
+			metrics.Get().IncLicenseWriteRefusals()
+		}
+		return ctx, noRelease, ErrLicenseWritesStopped
+	}
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
 		if err := (*g)(); err != nil {
 			return ctx, noRelease, err

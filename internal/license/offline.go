@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -80,8 +81,10 @@ func NewOfflineClient(path string, logger zerolog.Logger) (*Client, error) {
 		}
 	}
 	now := time.Now().UTC()
-	if !now.Before(signed.ExpiresAt) {
-		return nil, fmt.Errorf("offline license expired at %s", signed.ExpiresAt.UTC().Format(time.RFC3339))
+	// Loadable until the cutoff, grace included (grace.go): an air-gapped
+	// site restarted during grace keeps its license.
+	if !validAt(signed.ExpiresAt, strings.HasPrefix(signed.CustomerID, TrialCustomerPrefix), licenseNow()) {
+		return nil, fmt.Errorf("offline license expired (signed expiry %s, grace included)", signed.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 
 	lic := signed.ToRuntimeLicense(now)

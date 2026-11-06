@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -162,8 +163,11 @@ func (c *Client) LoadCachedLicense() (*License, error) {
 		return nil, fmt.Errorf("license cache is not bound to this machine")
 	}
 	now := time.Now().UTC()
-	if !now.Before(signed.ExpiresAt) {
-		return nil, fmt.Errorf("cached license expired at %s", signed.ExpiresAt.UTC().Format(time.RFC3339))
+	// Usable until the cutoff, grace included (grace.go): v1 refuses
+	// activation past the term but verifies during grace, so a restart in
+	// grace must boot from the cache and verify.
+	if !validAt(signed.ExpiresAt, strings.HasPrefix(signed.CustomerID, TrialCustomerPrefix), licenseNow()) {
+		return nil, fmt.Errorf("cached license expired (signed expiry %s, grace included)", signed.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 
 	lic := signed.ToRuntimeLicense(now)
@@ -243,6 +247,12 @@ type LicenseHealth struct {
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	DaysRemaining int        `json:"days_remaining,omitempty"`
 	SiteLicense   bool       `json:"site_license,omitempty"`
+	// Set once a paid license is past its signed expiry: the grace day
+	// (0 on the expiry day), when ingestion stops and when the license
+	// expires. DaysRemaining then counts to Cutoff.
+	GraceDay     *int       `json:"grace_day,omitempty"`
+	WritesStopAt *time.Time `json:"writes_stop_at,omitempty"`
+	Cutoff       *time.Time `json:"cutoff,omitempty"`
 }
 
 // HealthStatus reports the current license for /health using the signed expiry
@@ -255,9 +265,10 @@ func (c *Client) HealthStatus() LicenseHealth {
 	if lic == nil {
 		return LicenseHealth{Tier: "oss", Status: "unlicensed", Source: string(src)}
 	}
-	status, days := expiryStatus(lic.ExpiresAt, time.Now())
+	now := licenseNow()
+	status, days := expiryStatus(lic.ExpiresAt, lic.IsTrial(), now)
 	exp := lic.ExpiresAt.UTC()
-	return LicenseHealth{
+	h := LicenseHealth{
 		Tier:          string(lic.Tier),
 		Status:        status,
 		Source:        string(src),
@@ -265,4 +276,9 @@ func (c *Client) HealthStatus() LicenseHealth {
 		DaysRemaining: days,
 		SiteLicense:   c.offline && c.fingerprint == "",
 	}
+	if p, day := lic.PhaseAt(now); p != PhaseActive && p != PhaseExpired {
+		s := lic.Schedule()
+		h.GraceDay, h.WritesStopAt, h.Cutoff = &day, &s.WritesStopAt, &s.Cutoff
+	}
+	return h
 }

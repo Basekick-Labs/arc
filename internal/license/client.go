@@ -62,6 +62,8 @@ type Client struct {
 	mu         sync.RWMutex
 	stopCh     chan struct{}
 	logger     zerolog.Logger
+	// watch follows the license along its grace schedule (watcher.go).
+	watch licenseWatch
 }
 
 // VerifyRequest represents a license verification request
@@ -422,6 +424,21 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 		license, err = c.Activate(ctx)
 	}
 
+	// v1 refuses to activate a license past its term ("license has expired")
+	// although it still verifies one in grace. That refusal only restates the
+	// signed expiry Arc already holds, so a paid license within its grace keeps
+	// working: an activation reaped during a long outage must not end grace
+	// early (grace.go). Only that refusal: suspended, revoked or not found
+	// still drop the license below.
+	if err != nil && FailureClassOf(err) == ClassDefinitive && strings.Contains(err.Error(), "license has expired") {
+		if held := c.heldOrCachedInGrace(); held != nil {
+			c.logger.Warn().Err(err).Time("expires_at", held.ExpiresAt).Time("cutoff", held.Schedule().Cutoff).
+				Msg("License server refused re-activation past the license term; keeping the license through its grace period")
+			c.notifyLicenseChange()
+			return held, nil
+		}
+	}
+
 	// Only the final outcome is authoritative: a missing activation can recover
 	// successfully, or fail transiently without invalidating the current pair.
 	if err != nil && FailureClassOf(err) == ClassDefinitive {
@@ -434,7 +451,30 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 			c.logger.Warn().Err(err).Msg("License rejected; enterprise feature gates disabled")
 		}
 	}
+	c.notifyLicenseChange()
 	return license, err
+}
+
+// heldOrCachedInGrace returns the paid license held, or else the one in the
+// verified disk cache for this machine, when it is past its signed expiry but
+// not past its cutoff; nil otherwise.
+func (c *Client) heldOrCachedInGrace() *License {
+	c.mu.RLock()
+	held := c.license
+	c.mu.RUnlock()
+	if held == nil {
+		if lic, err := c.LoadCachedLicense(); err == nil {
+			held = lic
+		}
+	}
+	if held == nil {
+		return nil
+	}
+	// A trial has no grace: past its expiry its phase is already Expired.
+	if p, _ := held.Phase(); p == PhaseActive || p == PhaseExpired {
+		return nil
+	}
+	return held
 }
 
 // StartPeriodicValidation starts background license validation

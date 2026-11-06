@@ -41,7 +41,20 @@ const (
 	// ingest.max_buffered_bytes, because storage is not keeping up (#1468);
 	// counted in arc_ingest_buffer_full_rejections_total.
 	RefusalBufferFull = "buffer_full"
+	// RefusalLicenseGrace: the license expired and is on grace days 7-14,
+	// when live ingestion is refused until it is renewed; counted in
+	// arc_license_write_refusals_total.
+	RefusalLicenseGrace = "license_grace"
 )
+
+// ErrLicenseWritesStopped refuses a live write on grace days 7-14 of an
+// expired paid license. Nothing was written. It clears when the license is
+// renewed, or at the end of the grace period, when the node runs without
+// Enterprise features and accepts writes again.
+var ErrLicenseWritesStopped error = &WriteRefusal{
+	Reason: RefusalLicenseGrace,
+	Text:   "write refused: the Enterprise license expired and its grace period has stopped ingestion; renew the license to resume writes (see /health license.cutoff); nothing was written",
+}
 
 // WriteRefusal is a live write this node refuses for a local, transient
 // condition: the write was not accepted and the client should retry (#676).
@@ -230,6 +243,9 @@ func (l *refusalLog) record(reason, source string, err error) {
 func refusalLogMessage(reason string) string {
 	if reason == RefusalWALDisk || reason == "forwarded_"+RefusalWALDisk {
 		return "Writes refused on this node (retryable): WAL volume disk pressure; logged once per reason every 30s, see arc_wal_disk_pressure and arc_wal_disk_pressure_rejections_total"
+	}
+	if reason == RefusalLicenseGrace || reason == "forwarded_"+RefusalLicenseGrace {
+		return "Writes refused on this node: the license expired and its grace period stops ingestion until it is renewed; logged once per reason every 30s, see /health license and arc_license_write_refusals_total"
 	}
 	if reason == RefusalBufferFull || reason == "forwarded_"+RefusalBufferFull {
 		return "Writes refused on this node (retryable): rows waiting to be flushed reached ingest.max_buffered_bytes; logged once per reason every 30s, see arc_buffer_bytes_buffered and arc_ingest_buffer_full_rejections_total"

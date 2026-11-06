@@ -473,6 +473,37 @@ and days remaining use the same expiry calculation.
 
 Existing RBAC restrictions remain enforced when a license lapses.
 
+## New: a grace period after a paid license expires
+
+A paid license keeps its Enterprise features for fourteen grace days after it
+expires, counted from the midnight UTC that follows its expiry. Grace days 1-6
+run as usual; days 4-6 log a warning every hour. On grace days 7-14 Enterprise
+features stay on and live ingestion is refused with `503`,
+`X-Arc-Ingest-Refused: license_grace` and `Retry-After: 300`, counted in
+`arc_license_write_refusals_total`; MQTT subscriptions are suspended so the
+broker holds messages (QoS 1 or 2, `clean_session=false`, within the broker's
+own limits). WAL replay, continuous queries, compaction and retention keep
+running. At the start of day 15 the license expires and every Enterprise gate
+closes; the node then accepts writes again, without Enterprise features. A
+self-serve trial ends at its expiry, with no grace.
+
+`/health` reports `grace_period`, `writes_stopped` or `expired`, with
+`grace_day`, `writes_stop_at` and `cutoff` during grace; `days_remaining`
+counts to the expiry while the license is active and to the cutoff during
+grace. The schedule is computed in Arc from the signed license, the same way
+online and for license files, and needs no license-server change. A restart
+during grace keeps the license (from the verified cache, or the license file),
+and so does the license server refusing to re-activate a license past its
+term. A machine whose fingerprint changed (a rescheduled pod, new hardware)
+cannot activate during grace and starts without Enterprise features. A
+renewal takes effect at the next periodic license check (every 4 hours) or a
+restart.
+
+Setting the host clock back does not extend a license: the license clock
+never goes below a high-water mark kept in `license_clock.json` beside the
+auth database. A clock set forward and then corrected is not held against the
+license.
+
 ## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
 
 `GET /api/v1/write/msgpack/spec` said authentication was "not yet
