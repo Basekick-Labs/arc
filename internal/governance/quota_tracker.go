@@ -14,6 +14,7 @@ type quotaTracker struct {
 	dayResetAt      time.Time
 	maxPerHour      int
 	maxPerDay       int
+	now             func() time.Time
 }
 
 func newQuotaTracker(maxPerHour, maxPerDay int) *quotaTracker {
@@ -23,18 +24,19 @@ func newQuotaTracker(maxPerHour, maxPerDay int) *quotaTracker {
 		maxPerDay:   maxPerDay,
 		hourResetAt: now.Truncate(time.Hour).Add(time.Hour),
 		dayResetAt:  now.Truncate(24 * time.Hour).Add(24 * time.Hour),
+		now:         time.Now,
 	}
 }
 
 // maybeReset resets counters if the hour or day boundary has passed.
 // Must be called with mu held.
 func (q *quotaTracker) maybeReset() {
-	now := time.Now()
-	if now.After(q.hourResetAt) {
+	now := q.now()
+	if !now.Before(q.hourResetAt) {
 		q.queriesThisHour = 0
 		q.hourResetAt = now.Truncate(time.Hour).Add(time.Hour)
 	}
-	if now.After(q.dayResetAt) {
+	if !now.Before(q.dayResetAt) {
 		q.queriesThisDay = 0
 		q.dayResetAt = now.Truncate(24 * time.Hour).Add(24 * time.Hour)
 	}
@@ -59,6 +61,30 @@ func (q *quotaTracker) AllowQuery() (bool, string) {
 	q.queriesThisHour++
 	q.queriesThisDay++
 	return true, ""
+}
+
+// RetryAfterSec returns the number of seconds until a query can pass every quota
+// it has exhausted. Returns 0 if neither is exhausted.
+func (q *quotaTracker) RetryAfterSec() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.maybeReset()
+
+	// Both reset times are in the future here, and the next day boundary is
+	// never before the next hour boundary, so the daily quota decides when
+	// both are exhausted.
+	var resetAt time.Time
+	if q.maxPerHour > 0 && q.queriesThisHour >= q.maxPerHour {
+		resetAt = q.hourResetAt
+	}
+	if q.maxPerDay > 0 && q.queriesThisDay >= q.maxPerDay {
+		resetAt = q.dayResetAt
+	}
+	if resetAt.IsZero() {
+		return 0
+	}
+	return retryAfterSeconds(resetAt.Sub(q.now()))
 }
 
 // GetUsage returns the current usage and reset times.

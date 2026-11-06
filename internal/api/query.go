@@ -5944,12 +5944,14 @@ func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout 
 	}
 	result := h.governanceManager.CheckQuota(tokenInfo.ID)
 	if !result.Allowed {
+		c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
 		m.IncQueryErrors()
 		m.IncGovernanceQuotaExhausted()
 		h.logger.Warn().
 			Int64("token_id", tokenInfo.ID).
 			Str("token_name", tokenInfo.Name).
 			Str("reason", result.Reason).
+			Int("retry_after_sec", result.RetryAfterSec).
 			Msg("Query rejected: quota exhausted")
 		return 0, 0, &governanceRejection{reason: result.Reason}
 	}

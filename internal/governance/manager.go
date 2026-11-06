@@ -350,10 +350,17 @@ func (m *Manager) CheckRateLimit(tokenID int64) *EnforcementResult {
 		limiter := m.getOrCreateMinuteLimiter(tokenID, policy.RateLimitPerMinute)
 		if !limiter.Allow() {
 			retryAfter := limiter.RetryAfterSec()
+			// A retry once the minute frees up also has to fit the hour: when
+			// that is exhausted too, its wait is the one that lets a query
+			// through. Read-only: nothing is spent on the hour limiter.
+			if policy.RateLimitPerHour > 0 {
+				hour := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
+				retryAfter = max(retryAfter, hour.RetryAfterSec())
+			}
 			return &EnforcementResult{
 				Allowed:       false,
 				Reason:        fmt.Sprintf("Rate limit exceeded: %d queries per minute", policy.RateLimitPerMinute),
-				RetryAfterSec: retryAfter,
+				RetryAfterSec: max(retryAfter, 1),
 			}
 		}
 	}
@@ -366,7 +373,7 @@ func (m *Manager) CheckRateLimit(tokenID int64) *EnforcementResult {
 			return &EnforcementResult{
 				Allowed:       false,
 				Reason:        fmt.Sprintf("Rate limit exceeded: %d queries per hour", policy.RateLimitPerHour),
-				RetryAfterSec: retryAfter,
+				RetryAfterSec: max(retryAfter, 1),
 			}
 		}
 	}
@@ -390,6 +397,9 @@ func (m *Manager) CheckQuota(tokenID int64) *EnforcementResult {
 			return &EnforcementResult{
 				Allowed: false,
 				Reason:  reason,
+				// At least 1: a slot or the hour can turn over between the
+				// refusal and this read, which would otherwise say 0.
+				RetryAfterSec: max(tracker.RetryAfterSec(), 1),
 			}
 		}
 	}

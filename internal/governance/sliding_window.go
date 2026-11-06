@@ -17,6 +17,7 @@ type slidingWindowCounter struct {
 	lastSlotTime time.Time
 	total        int
 	limit        int
+	now          func() time.Time
 }
 
 func newSlidingWindowCounter(windowSize time.Duration, slotCount int, limit int) *slidingWindowCounter {
@@ -36,12 +37,13 @@ func newSlidingWindowCounter(windowSize time.Duration, slotCount int, limit int)
 		lastSlotTime: time.Now().Truncate(slotDuration),
 		total:        0,
 		limit:        limit,
+		now:          time.Now,
 	}
 }
 
 // advance moves the window forward to the current time, clearing expired slots.
 func (s *slidingWindowCounter) advance() {
-	now := time.Now().Truncate(s.slotDuration)
+	now := s.now().Truncate(s.slotDuration)
 	elapsed := now.Sub(s.lastSlotTime)
 	if elapsed <= 0 {
 		return
@@ -96,8 +98,8 @@ func (s *slidingWindowCounter) Remaining() int {
 	return remaining
 }
 
-// RetryAfterSec returns the number of seconds until the oldest slot in the window
-// expires, freeing capacity. Returns 0 if there is remaining capacity.
+// RetryAfterSec returns the number of seconds until enough of the window has
+// expired for Allow to succeed. Returns 0 if there is remaining capacity.
 func (s *slidingWindowCounter) RetryAfterSec() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,16 +110,20 @@ func (s *slidingWindowCounter) RetryAfterSec() int {
 		return 0
 	}
 
-	// The oldest slot will expire after one slotDuration
-	retryAfter := s.slotDuration - time.Since(s.lastSlotTime)
-	if retryAfter <= 0 {
-		retryAfter = s.slotDuration
+	// A slot is cleared when currentSlot comes round to it, so the slot after
+	// currentSlot goes first, one slotDuration after lastSlotTime, and
+	// currentSlot itself goes last, slotCount slotDurations after it. Slots
+	// can be empty, and a lowered limit can need more than one of them gone,
+	// so walk them oldest first until what is left fits under the limit.
+	held := s.total
+	steps := 1
+	for ; steps < s.slotCount; steps++ {
+		held -= s.slots[(s.currentSlot+steps)%s.slotCount]
+		if held < s.limit {
+			break
+		}
 	}
-	secs := int(retryAfter.Seconds()) + 1
-	if secs < 1 {
-		secs = 1
-	}
-	return secs
+	return retryAfterSeconds(s.lastSlotTime.Add(time.Duration(steps) * s.slotDuration).Sub(s.now()))
 }
 
 // UpdateLimit changes the rate limit. Takes effect immediately.
@@ -125,4 +131,15 @@ func (s *slidingWindowCounter) UpdateLimit(limit int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.limit = limit
+}
+
+// retryAfterSeconds rounds a wait up to whole seconds, as a Retry-After header
+// carries it, so a client that waits that long is not early. It is at least 1,
+// as the wait can have ended between reading the state and reading the clock.
+func retryAfterSeconds(wait time.Duration) int {
+	secs := int((wait + time.Second - 1) / time.Second)
+	if secs < 1 {
+		return 1
+	}
+	return secs
 }

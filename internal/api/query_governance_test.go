@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"io"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -122,8 +123,9 @@ func TestQueryMeasurementGovernanceRateLimit(t *testing.T) {
 	if resp.StatusCode != fiber.StatusTooManyRequests {
 		t.Fatalf("request over the rate limit: got %d, want 429", resp.StatusCode)
 	}
-	if resp.Header.Get("Retry-After") == "" {
-		t.Error("429 response is missing the Retry-After header")
+	// The two requests above landed together, so the wait is the whole window.
+	if retryAfter, err := strconv.Atoi(resp.Header.Get("Retry-After")); err != nil || retryAfter < 50 || retryAfter > 60 {
+		t.Errorf("Retry-After = %q, want the seconds left of the one-minute window", resp.Header.Get("Retry-After"))
 	}
 }
 
@@ -148,6 +150,9 @@ func TestQueryMeasurementGovernanceQuota(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != fiber.StatusTooManyRequests {
 		t.Fatalf("request over quota: got %d, want 429", resp.StatusCode)
+	}
+	if retryAfter, err := strconv.Atoi(resp.Header.Get("Retry-After")); err != nil || retryAfter < 1 || retryAfter > 3600 {
+		t.Errorf("Retry-After = %q, want the seconds left until the next hour", resp.Header.Get("Retry-After"))
 	}
 }
 
