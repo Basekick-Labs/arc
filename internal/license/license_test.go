@@ -5,6 +5,40 @@ import (
 	"time"
 )
 
+func TestSignedExpiryBoundaryAndDisplayStatus(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name    string
+		expires time.Time
+		want    bool
+	}{
+		{"zero", time.Time{}, false},
+		{"before", now.Add(-time.Nanosecond), false},
+		{"equal", now, false},
+		{"after", now.Add(time.Nanosecond), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validAt(tc.expires, now); got != tc.want {
+				t.Fatalf("validAt = %v, want %v", got, tc.want)
+			}
+			status, days := expiryStatus(tc.expires, now)
+			if (status == "active") != tc.want || days != 0 {
+				t.Fatalf("status=%s days=%d", status, days)
+			}
+		})
+	}
+	for _, status := range []string{"active", "grace_period", "expired", "read_only", ""} {
+		l := &License{Status: status, ExpiresAt: now.Add(time.Hour)}
+		if !l.IsValid() || l.IsExpired() {
+			t.Fatalf("display status %q overrode signed future expiry", status)
+		}
+		l.ExpiresAt = now.Add(-time.Hour)
+		if l.IsValid() || !l.IsExpired() {
+			t.Fatalf("display status %q overrode signed past expiry", status)
+		}
+	}
+}
+
 func TestLicense_IsValid(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -19,14 +53,16 @@ func TestLicense_IsValid(t *testing.T) {
 		{
 			name: "active license",
 			license: &License{
-				Status: "active",
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
 			},
 			want: true,
 		},
 		{
 			name: "grace period license",
 			license: &License{
-				Status: "grace_period",
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "grace_period",
 			},
 			want: true,
 		},
@@ -69,7 +105,8 @@ func TestLicense_IsExpired(t *testing.T) {
 		{
 			name: "active license",
 			license: &License{
-				Status: "active",
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
 			},
 			want: false,
 		},
@@ -100,8 +137,9 @@ func TestLicense_IsExpired(t *testing.T) {
 
 func TestLicense_HasFeature(t *testing.T) {
 	license := &License{
-		Status:   "active",
-		Features: []string{"cq_scheduler", "retention_scheduler", "clustering"},
+		ExpiresAt: time.Now().Add(time.Hour),
+		Status:    "active",
+		Features:  []string{"cq_scheduler", "retention_scheduler", "clustering"},
 	}
 
 	tests := []struct {
@@ -156,32 +194,36 @@ func TestLicense_IsEnterprise(t *testing.T) {
 		{
 			name: "starter tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierStarter,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierStarter,
 			},
 			want: false,
 		},
 		{
 			name: "professional tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierProfessional,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierProfessional,
 			},
 			want: false,
 		},
 		{
 			name: "enterprise tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierEnterprise,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierEnterprise,
 			},
 			want: true,
 		},
 		{
 			name: "unlimited tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierUnlimited,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierUnlimited,
 			},
 			want: true,
 		},
@@ -213,32 +255,36 @@ func TestLicense_IsProfessional(t *testing.T) {
 		{
 			name: "starter tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierStarter,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierStarter,
 			},
 			want: false,
 		},
 		{
 			name: "professional tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierProfessional,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierProfessional,
 			},
 			want: true,
 		},
 		{
 			name: "enterprise tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierEnterprise,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierEnterprise,
 			},
 			want: true,
 		},
 		{
 			name: "unlimited tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierUnlimited,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierUnlimited,
 			},
 			want: true,
 		},
@@ -268,32 +314,36 @@ func TestLicense_CanUseCQScheduler(t *testing.T) {
 		{
 			name: "starter tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierStarter,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierStarter,
 			},
 			want: true,
 		},
 		{
 			name: "professional tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierProfessional,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierProfessional,
 			},
 			want: true,
 		},
 		{
 			name: "enterprise tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierEnterprise,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierEnterprise,
 			},
 			want: true,
 		},
 		{
 			name: "unlimited tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierUnlimited,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierUnlimited,
 			},
 			want: true,
 		},
@@ -331,24 +381,27 @@ func TestLicense_CanUseRetentionScheduler(t *testing.T) {
 		{
 			name: "starter tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierStarter,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierStarter,
 			},
 			want: true,
 		},
 		{
 			name: "professional tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierProfessional,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierProfessional,
 			},
 			want: true,
 		},
 		{
 			name: "enterprise tier",
 			license: &License{
-				Status: "active",
-				Tier:   TierEnterprise,
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Tier:      TierEnterprise,
 			},
 			want: true,
 		},
@@ -448,16 +501,18 @@ func TestLicense_CanUseSharedStorageMultiWriter(t *testing.T) {
 		{
 			name: "active license without feature",
 			license: &License{
-				Status:   "active",
-				Features: []string{FeatureClustering},
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Features:  []string{FeatureClustering},
 			},
 			want: false,
 		},
 		{
 			name: "active license with feature",
 			license: &License{
-				Status:   "active",
-				Features: []string{FeatureClustering, FeatureSharedStorageMultiWriter},
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "active",
+				Features:  []string{FeatureClustering, FeatureSharedStorageMultiWriter},
 			},
 			want: true,
 		},
@@ -472,8 +527,9 @@ func TestLicense_CanUseSharedStorageMultiWriter(t *testing.T) {
 		{
 			name: "grace_period license with feature",
 			license: &License{
-				Status:   "grace_period",
-				Features: []string{FeatureSharedStorageMultiWriter},
+				ExpiresAt: time.Now().Add(time.Hour),
+				Status:    "grace_period",
+				Features:  []string{FeatureSharedStorageMultiWriter},
 			},
 			want: true,
 		},

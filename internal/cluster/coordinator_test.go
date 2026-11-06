@@ -7,8 +7,30 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/rs/zerolog"
 )
+
+func TestCoordinatorStatusWithoutCurrentLicense(t *testing.T) {
+	lc, err := license.NewClient(&license.ClientConfig{LicenseKey: "ARC-TEST", Logger: zerolog.Nop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Coordinator{
+		cfg:           &config.ClusterConfig{ClusterName: "test"},
+		localNode:     NewNode("writer", "writer", RoleWriter, "test"),
+		registry:      newTestRegistry(),
+		raftFSM:       raft.NewClusterFSM(zerolog.Nop()),
+		licenseClient: lc,
+	}
+	status := c.Status()
+	if _, exists := status["max_cores"]; exists {
+		t.Fatal("status advertised entitlements without a current license")
+	}
+	if _, exists := status["total_cores"]; !exists {
+		t.Fatal("status lost cluster core count")
+	}
+}
 
 func TestRegisterFileInManifest_CancelledCoordinatorContext(t *testing.T) {
 	lifecycleCtx, cancel := context.WithCancel(context.Background())

@@ -119,8 +119,7 @@ func TestOfflineClientGrid(t *testing.T) {
 }
 
 // TestLicenseHealthStatus pins the /health license payload: source labels,
-// read-time expired derivation (#603 lesson — health tells the truth even
-// though enforcement is boot-time), and the site-license flag.
+// read-time expiry derivation matching feature gates, and the site-license flag.
 func TestLicenseHealthStatus(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
 

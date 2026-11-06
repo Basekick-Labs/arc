@@ -235,17 +235,25 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 		return nil, fmt.Errorf("license activation failed: %w", err)
 	}
 	var activateResp ActivateResponse
-	if err := readBoundedJSON(resp, &activateResp); err != nil {
+	var envelope struct {
+		*ActivateResponse
+		Success *bool `json:"success"`
+	}
+	envelope.ActivateResponse = &activateResp
+	if err := readBoundedJSON(resp, &envelope); err != nil {
 		// Malformed 200 = proxy default backend, not a protocol answer.
 		return nil, transientErr("failed to decode activation response: %w", err)
 	}
+	if envelope.Success == nil {
+		return nil, transientErr("activation response missing a boolean success verdict")
+	}
+	activateResp.Success = *envelope.Success
 
 	if !activateResp.Success {
 		errMsg := activateResp.Error
 		if errMsg == "" {
 			errMsg = "license activation failed"
 		}
-		c.logger.Warn().Str("error", errMsg).Msg("License activation failed")
 		// 200 envelope rejection: the server spoke the protocol and said no.
 		return nil, definitiveErr("license activation failed: %s", errMsg)
 	}
@@ -326,16 +334,24 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 		return nil, fmt.Errorf("license validation failed: %w", err)
 	}
 	var verifyResp VerifyResponse
-	if err := readBoundedJSON(resp, &verifyResp); err != nil {
+	var envelope struct {
+		*VerifyResponse
+		Valid *bool `json:"valid"`
+	}
+	envelope.VerifyResponse = &verifyResp
+	if err := readBoundedJSON(resp, &envelope); err != nil {
 		return nil, transientErr("failed to decode verify response: %w", err)
 	}
+	if envelope.Valid == nil {
+		return nil, transientErr("verify response missing a boolean valid verdict")
+	}
+	verifyResp.Valid = *envelope.Valid
 
 	if !verifyResp.Valid {
 		errMsg := verifyResp.Error
 		if errMsg == "" {
 			errMsg = "license validation failed"
 		}
-		c.logger.Warn().Str("error", errMsg).Msg("License validation failed")
 		// Two envelope rejections are NOT terminal (activation is the intended
 		// recovery); matched EXACTLY against the server's strings here — where
 		// the raw envelope is in hand — rather than substring-scanned on a
@@ -403,11 +419,22 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 	//     definitively ("license is not active").
 	if errors.Is(err, errActivationMissing) {
 		c.logger.Info().Msg("No live activation for this machine, attempting activation")
-		return c.Activate(ctx)
+		license, err = c.Activate(ctx)
 	}
 
-	// Other error, return it (carrying its failure class).
-	return nil, err
+	// Only the final outcome is authoritative: a missing activation can recover
+	// successfully, or fail transiently without invalidating the current pair.
+	if err != nil && FailureClassOf(err) == ClassDefinitive {
+		c.mu.Lock()
+		hadLicense := c.license != nil
+		c.license = nil
+		c.mu.Unlock()
+		c.deleteCache()
+		if hadLicense {
+			c.logger.Warn().Err(err).Msg("License rejected; enterprise feature gates disabled")
+		}
+	}
+	return license, err
 }
 
 // StartPeriodicValidation starts background license validation
@@ -429,7 +456,7 @@ func (c *Client) StartPeriodicValidation(interval time.Duration) {
 				// self-heals on the next tick instead of warning every 4h
 				// until restart — and each success refreshes the cache.
 				_, err := c.ActivateOrVerify(ctx)
-				if err != nil {
+				if err != nil && FailureClassOf(err) != ClassDefinitive {
 					c.logger.Warn().Err(err).Msg("Periodic license validation failed")
 				}
 				cancel()

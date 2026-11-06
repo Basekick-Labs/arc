@@ -75,9 +75,5 @@ func (s *SignedLicense) ToRuntimeLicense(now time.Time) *License {
 // billing-grace UX) but Arc's feature gates use the strict signed
 // expiry to prevent trust escalation through the unsigned envelope.
 func (s *SignedLicense) deriveStatus(now time.Time) (string, int) {
-	if !s.ExpiresAt.After(now) {
-		return "expired", 0
-	}
-	remaining := int(s.ExpiresAt.Sub(now).Hours() / 24)
-	return "active", remaining
+	return expiryStatus(s.ExpiresAt, now)
 }
