@@ -74,6 +74,71 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: names that differ only in case stay apart on case-insensitive volumes ([#1509](https://github.com/Basekick-Labs/arc/issues/1509))
+
+On a volume that does not distinguish names by case (macOS APFS by default,
+Docker Desktop bind mounts from a Mac, NTFS), `cpu` and `CPU` were one
+directory. A write, query or delete under either name acted on the same
+files, while permissions matched names exactly. Arc now checks the local
+storage volume at startup. If it folds names, a database or measurement is
+only accepted in the spelling it already has on disk:
+- **Ingest** to another spelling of an existing database or measurement is
+  refused and reported like other unstorable names, before anything reaches
+  the WAL. Two first writes racing with different spellings can't both win,
+  and a write refused for its columns or values doesn't claim a spelling.
+- **Queries** are refused with a 400 that names the existing spelling.
+  Before, `FROM CPU` on a Mac returned `cpu`'s rows. On such a volume,
+  rewritten SQL is no longer cached, so a spelling accepted before another
+  one existed is checked again on every query.
+- **Database get, create and delete** under another spelling are refused
+  with a 400 before anything else runs.
+- **Measurement deletes, retention and listings** under another spelling
+  are refused instead of acting on the existing directory.
+
+Linux filesystems, S3 and Azure are unaffected, and the check is skipped
+there. If the startup check itself fails (for example a read-only storage
+root), Arc assumes names fold. A startup warning says when case folding was
+detected. To keep names that differ only by case, use a case-sensitive
+volume.
+
+**Upgrading on macOS:** a retention policy, continuous query or client that
+names a database or measurement in a different case from its directory now
+fails instead of acting on that directory. Check them after upgrading.
+Retention that fails lets disk usage grow.
+
+Known limits:
+- Only ingest is checked on the write side. Restores, edge-sync imports,
+  cluster file replication and WAL replay write what they were given.
+- Several nodes sharing one case-insensitive network volume are not
+  coordinated with each other.
+- An empty measurement directory removed by a cleanup while its rows are
+  still buffered can be re-created in another spelling before those rows
+  flush. The rows then land in that directory.
+- Data already stored under mixed spellings before the upgrade isn't
+  migrated. With tiering, files moved to a case-sensitive cold store under
+  the other spelling are not reachable by either name.
+
+## Docs: the cluster trust model is written down ([#1510](https://github.com/Basekick-Labs/arc/issues/1510))
+
+A new `SECURITY.md` explains how to report a vulnerability privately and what
+the cluster's shared secret guarantees. Every node holding
+`cluster.shared_secret` is a fully trusted member, and a node ID in a peer
+message is a claim, not a proven identity. Cluster TLS with a CA proves that
+a peer belongs to the cluster, not which node it is.
+- **Code comments** that described some peer checks as authenticating the
+  sender now call them what they are: consistency checks on the node ID
+  the request claims.
+- **The startup warning** for cluster TLS without `cluster.tls_ca_file` now
+  says that client certificates are not verified and that cluster
+  membership, not node identity, rests on the shared secret.
+- **A new Info log** appears when a standby's origin-stream session is
+  replaced by a connection from a different address. The replacement itself
+  is unchanged: the primary cannot tell a live session from a half-open one,
+  and a standby that restarts with a new address must still be able to
+  reconnect.
+
+Per-node peer identity remains open in #1510.
+
 ## Security: Arc's internal SQL placeholder text is reserved
 
 Before its checks, Arc swaps string literals, quoted names and some keywords
@@ -2974,6 +3039,33 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### A scheduled compaction that finds a cycle running runs when it ends ([#220](https://github.com/Basekick-Labs/arc/issues/220))
+
+The hourly and daily compaction schedulers share one cycle claim with the manual
+trigger. A tick that found the claim held logged an Info line and did nothing
+until its next tick, which costs the hourly tier an hour and the daily tier a
+day. If the collision repeats, daily compaction never runs. At the default
+schedules it happens whenever the 03:00 daily cycle is still running at the
+03:05 hourly tick; schedules that share a minute, a raised
+`compaction.cycle_timeout` or a manual cycle at the tick cause it too.
+
+Such a tick now runs once, as soon as the claim is released. It passes the same
+compactor lease and cluster-wide pause checks as any tick when it does. It gives
+up at the scheduler's next tick, and a tick lost that way is logged at Warn and
+counted in the new `arc_compaction_scheduled_skips_total{tier}`. If the claim is
+released just before that next tick, the deferred run starts and the next tick
+waits behind it, so the tier runs twice in a row. Stopping compaction, at
+shutdown or when this node loses the compactor lease, tells both schedulers to
+stop before waiting for either, so a waiting tick never starts a cycle then.
+The schedules, the per-tier API trigger and the status endpoint are
+unchanged.
+
+This also removes a rare deadlock: `Stop` could wait forever for a tick that had
+just started, which was itself waiting for the lock `Stop` held.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar)
+([#1507](https://github.com/Basekick-Labs/arc/pull/1507)).
 
 ### `allow_unreachable=true` stops waiting for files nothing is delivering ([#1426](https://github.com/Basekick-Labs/arc/issues/1426))
 

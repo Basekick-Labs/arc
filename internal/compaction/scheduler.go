@@ -9,6 +9,8 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"github.com/rs/zerolog"
+
+	"github.com/basekick-labs/arc/internal/metrics"
 )
 
 // ClusterGate is the minimal interface the compaction scheduler needs to
@@ -37,16 +39,28 @@ type Scheduler struct {
 	schedule  string
 	tierNames []string // Specific tiers to process (must be non-empty and enabled)
 	enabled   bool
-	// clusterGate is the Phase 4 role check. Every execution checks
-	// CanCompact; Start may use its optional CanScheduleCompaction method.
-	// nil gate means "no check, allow" — used by OSS / standalone
-	// paths and by existing tests that predate Phase 4.
+	// clusterGate is the Phase 4 role check. Every tick (including every
+	// deferred attempt) and TriggerNow consult CanCompact. Start may use the
+	// optional CanScheduleCompaction method to arm cron during temporary fences.
+	// Assigned only in NewScheduler, so a tick reads it without s.mu, which
+	// Stop holds while it waits for running ticks. nil gate means "no check,
+	// allow" for OSS / standalone paths and existing tests.
 	clusterGate ClusterGate
 
 	cron      *cron.Cron
 	running   bool
-	roleGated bool // true when Start found CanCompact=false; used by Status
-	stopCh    chan struct{}
+	roleGated bool          // true when Start found CanCompact=false; used by Status
+	stopCh    chan struct{} // closed by Stop, so a deferred tick stops waiting; one per Start
+
+	// nextTickForTest replaces getNextRun when non-nil.
+	nextTickForTest func() time.Time
+	// afterClaimRefusedForTest, when non-nil, runs in a deferred tick between
+	// a refused claim and the wait for its release: the window the release
+	// signal, taken before the attempt, must cover.
+	afterClaimRefusedForTest func()
+	// beforeStopWaitForTest, when non-nil, runs in Stop after this scheduler
+	// is signalled and before it waits for running jobs.
+	beforeStopWaitForTest func()
 
 	logger zerolog.Logger
 	mu     sync.Mutex
@@ -81,7 +95,6 @@ func NewScheduler(cfg *SchedulerConfig) (*Scheduler, error) {
 		tierNames:   cfg.TierNames,
 		enabled:     cfg.Enabled,
 		clusterGate: cfg.ClusterGate,
-		stopCh:      make(chan struct{}),
 		logger:      cfg.Logger.With().Str("component", "compaction-scheduler").Logger(),
 	}
 
@@ -146,12 +159,14 @@ func (s *Scheduler) Start() error {
 	)))
 
 	// Add compaction job
+	stop := make(chan struct{})
 	_, err := s.cron.AddFunc(s.schedule, func() {
-		s.runCompaction()
+		s.tick(stop)
 	})
 	if err != nil {
 		return err
 	}
+	s.stopCh = stop
 
 	// Start cron scheduler
 	s.cron.Start()
@@ -176,6 +191,13 @@ func (s *Scheduler) Stop() {
 		return
 	}
 
+	// A deferred tick must stop waiting, or the wait below lasts until the next
+	// tick.
+	s.signalStopLocked()
+	if s.beforeStopWaitForTest != nil {
+		s.beforeStopWaitForTest()
+	}
+
 	// Stop cron scheduler
 	if s.cron != nil {
 		ctx := s.cron.Stop()
@@ -186,8 +208,57 @@ func (s *Scheduler) Stop() {
 	s.logger.Info().Msg("Compaction scheduler stopped")
 }
 
-// runCompaction runs one compaction cycle
-func (s *Scheduler) runCompaction() {
+// signalStop tells this scheduler's deferred ticks to stop waiting, without
+// waiting for anything: StopAll signals every scheduler before stopping any.
+func (s *Scheduler) signalStop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.signalStopLocked()
+}
+
+func (s *Scheduler) signalStopLocked() {
+	if s.running && s.stopCh != nil {
+		close(s.stopCh)
+		s.stopCh = nil
+	}
+}
+
+// StopAll stops schedulers that share a Manager. Every one is told to stop
+// before any is waited for: Stop waits for a running cycle, and a deferred
+// tick of a scheduler not yet stopped would wake when that cycle releases the
+// claim and start a new cycle during shutdown (#220). nil entries are skipped.
+func StopAll(schedulers ...*Scheduler) {
+	for _, s := range schedulers {
+		if s != nil {
+			s.signalStop()
+		}
+	}
+	for _, s := range schedulers {
+		if s != nil {
+			s.Stop()
+		}
+	}
+}
+
+// tick is what a cron tick runs. stop ends a tick still waiting for the claim.
+func (s *Scheduler) tick(stop <-chan struct{}) {
+	if s.runCompaction() {
+		s.runDeferredTick(stop)
+	}
+}
+
+// runCompaction runs one compaction cycle for a tick, and reports whether the
+// tick found another cycle holding the claim, so nothing ran.
+func (s *Scheduler) runCompaction() (claimHeld bool) {
+	if !s.tickAllowed() {
+		return false
+	}
+	return errors.Is(s.runScheduledCycle(), ErrCycleAlreadyRunning)
+}
+
+// tickAllowed reports whether this node may run a scheduled cycle now, and logs
+// why not.
+func (s *Scheduler) tickAllowed() bool {
 	// Re-check the gate on EVERY tick, not only in Start().
 	//
 	// Start() runs before the cluster coordinator exists (main.go starts the
@@ -205,21 +276,34 @@ func (s *Scheduler) runCompaction() {
 	// belongs in the execution path so a lease change takes effect without a
 	// restart — and this scheduler is the file that rule cites as the
 	// reference pattern.
-	s.mu.Lock()
+	//
+	// Read without s.mu: the gate never changes after NewScheduler, and Stop
+	// holds s.mu while it waits for this job to return.
 	gate := s.clusterGate
-	s.mu.Unlock()
 	if gate != nil && !gate.CanCompact() {
 		s.logger.Debug().
 			Str("role", gate.Role()).
 			Msg("Scheduled compaction skipped: this node does not hold the compactor lease")
-		return
+		return false
 	}
 	if reason := pauseReasonOf(gate); reason != "" {
 		s.logger.Info().
 			Str("pause", reason).
 			Msg("Scheduled compaction skipped: compaction is paused cluster-wide")
-		return
+		return false
 	}
+	return true
+}
+
+// runScheduledCycle claims a cycle and runs it, logging its outcome. It returns
+// ErrCycleAlreadyRunning, unlogged, when another cycle holds the claim: whether
+// that costs the tick is for the caller to say (#220).
+func (s *Scheduler) runScheduledCycle() error {
+	claim, err := s.manager.ClaimCycle()
+	if err != nil {
+		return err
+	}
+	defer claim.Release()
 
 	startTime := time.Now()
 	s.logger.Info().
@@ -229,26 +313,96 @@ func (s *Scheduler) runCompaction() {
 	ctx, cancel := context.WithTimeout(context.Background(), s.manager.CycleTimeout)
 	defer cancel()
 
-	cycleID, err := s.manager.runCycleInternal(ctx, cycleSourceScheduler, nil, s.tierNames)
+	err = s.manager.runClaimed(ctx, claim.ID, cycleSourceScheduler, nil, s.tierNames, "")
 	if err != nil {
 		switch {
-		case errors.Is(err, ErrCycleAlreadyRunning):
-			s.logger.Info().Msg("Scheduled compaction skipped: a cycle is already running")
 		case errors.Is(err, ErrCompactionPaused):
-			s.logger.Info().Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction stopped at a batch boundary: compaction is paused cluster-wide")
+			s.logger.Info().Int64("cycle_id", claim.ID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction stopped at a batch boundary: compaction is paused cluster-wide")
 		case ctx.Err() != nil:
-			s.logger.Info().Err(ctx.Err()).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction interrupted")
+			s.logger.Info().Err(ctx.Err()).Int64("cycle_id", claim.ID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction interrupted")
 		default:
-			s.logger.Error().Err(err).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction failed")
+			s.logger.Error().Err(err).Int64("cycle_id", claim.ID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction failed")
 		}
-		return
+		return err
 	}
 
 	duration := time.Since(startTime)
 	s.logger.Info().
-		Int64("cycle_id", cycleID).
+		Int64("cycle_id", claim.ID).
 		Dur("duration", duration).
 		Msg("Scheduled compaction completed")
+	return nil
+}
+
+// runDeferredTick gives a tick that found another cycle holding the claim its
+// one run, as soon as the claim is free (#220): the hourly and daily schedulers
+// and the manual trigger share one claim, and without this a collision costs
+// the tier a whole period, or every day's run if it repeats. It gives up at the
+// scheduler's next tick, which then stands for itself, and on Stop. Each attempt
+// passes the same gate as a tick, so losing the compactor lease or a pause ends
+// the wait like any tick those would have stopped.
+func (s *Scheduler) runDeferredTick(stop <-chan struct{}) {
+	next := s.nextTick()
+	s.logger.Info().
+		Strs("tiers", s.tierNames).
+		Time("next_run", next).
+		Msg("Scheduled compaction deferred: a cycle is already running; it runs when that cycle ends")
+
+	expired := time.NewTimer(time.Until(next))
+	defer expired.Stop()
+	skipped := func() {
+		for _, tier := range s.tierNames {
+			metrics.Get().IncCompactionScheduledSkips(tier)
+		}
+		s.logger.Warn().
+			Strs("tiers", s.tierNames).
+			Time("next_run", next).
+			Msg("Scheduled compaction skipped: a cycle held the claim until the next tick (see arc_compaction_scheduled_skips_total)")
+	}
+	for {
+		// Taken before the attempt: a release after the attempt fails closes
+		// this signal, so it cannot be missed. Another scheduler can win the
+		// claim first; then this waits for that cycle too.
+		released := s.manager.cycleReleaseSignal()
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		// The next tick stands for itself from here: a release and the
+		// deadline can be ready together, and the wait below picks either.
+		select {
+		case <-expired.C:
+			skipped()
+			return
+		default:
+		}
+		if !s.tickAllowed() {
+			return
+		}
+		if !errors.Is(s.runScheduledCycle(), ErrCycleAlreadyRunning) {
+			return
+		}
+		if s.afterClaimRefusedForTest != nil {
+			s.afterClaimRefusedForTest()
+		}
+		select {
+		case <-released:
+		case <-expired.C:
+			skipped()
+			return
+		case <-stop:
+			return
+		}
+	}
+}
+
+// nextTick is when the next tick of this schedule fires.
+func (s *Scheduler) nextTick() time.Time {
+	if s.nextTickForTest != nil {
+		return s.nextTickForTest()
+	}
+	return s.getNextRun()
 }
 
 // ErrCompactionRoleGated is returned by TriggerNow on a node whose role

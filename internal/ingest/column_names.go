@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // Field and tag names Arc refuses at ingest (#1342).
@@ -194,4 +196,36 @@ func unstorableColumnError(measurement, name string) error {
 		return fmt.Errorf("%w: measurement %q column %s: %s", ErrUnstorableColumnName, measurement, strconv.Quote(name), p)
 	}
 	return nil
+}
+
+// nameSpellingRefusal refuses a live write to a database or measurement that
+// exists in storage under another spelling, on a volume that folds names
+// (#1509). It creates the directories of a new name, so the filesystem
+// decides which of two racing first spellings exists. It is a content
+// refusal: nothing of the measurement has reached the WAL.
+//
+// Only a spelling conflict refuses. An I/O error from the check (storage not
+// writable or readable right now) admits the write as before the guard
+// existed: the flush reports the storage failure where it always has, and
+// a write that could be buffered is not turned away by the check.
+func (b *ArrowBuffer) nameSpellingRefusal(database, measurement string) error {
+	g, ok := b.storage.(storage.NameSpellingGuard)
+	if !ok {
+		return nil
+	}
+	err := g.AdmitNameSpelling(database, measurement)
+	var se *storage.NameSpellingError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &se):
+		if se.What == "database" {
+			return fmt.Errorf("%w: %v", ErrUnstorableDatabaseName, se)
+		}
+		return fmt.Errorf("%w: %v", ErrUnstorableMeasurementName, se)
+	default:
+		b.logger.Debug().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Could not check the name's spelling in storage; write admitted")
+		return nil
+	}
 }
