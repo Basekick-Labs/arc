@@ -161,7 +161,7 @@ func (s *Server) Accept(node string, conn net.Conn, sessionKey []byte) {
 		// the shared secret (SECURITY.md, #1510); the address change is
 		// recorded so an operator can see a session move.
 		if was, now := remoteHost(old.conn), remoteHost(conn); was != now {
-			ss.logger.Warn().Str("previous_address", was).Str("address", now).
+			ss.logger.Info().Str("previous_address", was).Str("address", now).
 				Msg("Origin stream session for this standby replaced by a connection from a different address")
 		}
 	}

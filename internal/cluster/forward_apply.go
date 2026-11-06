@@ -694,10 +694,10 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// may set it (applySetCQWatermark); refused here early are a watermark
 	// whose proposer is not the requesting node (a consistency check: the
 	// requesting node ID is a claim under the shared secret, #1510), one
-	// whose shared-storage claim does not
-	// match this cluster's mode (the claim would otherwise open the FSM's
-	// no-designated-primary path in local mode), and any forwarded one in
-	// shared-storage mode, where the primary is the leader itself.
+	// whose shared-storage claim does not match this cluster's mode (the
+	// claim would otherwise open the FSM's no-designated-primary path in
+	// local mode), and any forwarded one in shared-storage mode, where the
+	// primary is the leader itself.
 	isWatermark := cmd.Type == clusterraft.CommandSetCQWatermark
 	if isWatermark {
 		if why := c.watermarkForwardRefusal(&cmd, req.NodeID); why != "" {

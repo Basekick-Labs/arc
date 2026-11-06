@@ -17,12 +17,15 @@ Arc cluster nodes authenticate each other with one shared secret
   identity. Any holder can act as any node: join, leave, send heartbeats,
   forward Raft commands, read any replicated file, and assert the identity
   of an API caller on a request it forwards.
-- **`cluster.tls_enabled` encrypts inter-node traffic.** With
-  `cluster.tls_ca_file` set, peers must also present a certificate from that
-  CA. That proves the peer is a member of the cluster; it does not prove
-  which node the peer is, because certificates are not bound to node IDs.
-- **Raft tolerates crashed nodes, not malicious ones.** A compromised voting
-  node can disrupt the cluster or change its state.
+- **`cluster.tls_enabled` encrypts Raft and coordinator traffic.**
+  Inter-node HTTP (request routing, forwarded requests, cache invalidation)
+  runs on the API listener and is encrypted by `server.tls_enabled`. With
+  `cluster.tls_ca_file` set, Raft and coordinator peers must also present a
+  certificate from that CA. That proves the peer is a member of the cluster;
+  it does not prove which node the peer is, because certificates are not
+  bound to node IDs.
+- **Raft tolerates crashed nodes, not malicious ones.** A compromised node
+  or a leaked secret can disrupt the cluster or change its state.
 
 Treat the shared secret as a root credential for the whole cluster:
 

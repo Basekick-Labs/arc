@@ -85,9 +85,9 @@ a peer belongs to the cluster, not which node it is.
   sender now call them what they are: consistency checks on the node ID
   the request claims.
 - **The startup warning** for cluster TLS without `cluster.tls_ca_file` now
-  says that cluster membership, not node identity, rests on the shared
-  secret.
-- **A new Warn log** appears when a standby's origin-stream session is
+  says that client certificates are not verified and that cluster
+  membership, not node identity, rests on the shared secret.
+- **A new Info log** appears when a standby's origin-stream session is
   replaced by a connection from a different address. The replacement itself
   is unchanged: the primary cannot tell a live session from a half-open one,
   and a standby that restarts with a new address must still be able to
