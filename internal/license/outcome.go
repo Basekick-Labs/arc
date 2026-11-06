@@ -8,10 +8,10 @@ import (
 
 // Failure taxonomy for license-server interactions (#license-boot-resilience).
 //
-// The boot path routes on ONE question: did the server SPEAK THE PROTOCOL and
-// say "no" (definitive — fall back to OSS, never use the cache), or could we
-// simply not get a protocol answer (transient — retry, then fall back to the
-// locally cached, signature-verified license)?
+// Protocol 2 distinguishes an admission refusal for this installation from a
+// confirmed rejection of the key. Neither refusal permits cache fallback;
+// admission preserves signed evidence and does not authorize an OSS handoff.
+// Protocol 1 retains its historical classification below.
 //
 // The classification table (from the reviewed plan; server behavior enumerated
 // from enterprise_activation_server handlers):
@@ -48,6 +48,9 @@ const (
 	// ClassDefinitive: the server spoke the protocol and rejected. OSS
 	// fallback; the cache MUST NOT override an explicit rejection.
 	ClassDefinitive
+	// ClassAdmissionDenied: this node was not admitted. Fence data services,
+	// retain signed evidence, and retry without declaring the key expired.
+	ClassAdmissionDenied
 )
 
 // errActivationMissing marks the two verify rejections for which activation is
@@ -72,6 +75,28 @@ func transientErr(format string, args ...any) error {
 
 func definitiveErr(format string, args ...any) error {
 	return &classifiedError{class: ClassDefinitive, err: fmt.Errorf(format, args...)}
+}
+
+func admissionErr(format string, args ...any) error {
+	return &classifiedError{class: ClassAdmissionDenied, err: fmt.Errorf(format, args...)}
+}
+
+// These are key-wide verdicts in the existing issuer contract. In particular,
+// "activation has been revoked" concerns one activation and is not on this list.
+func keyRejection(reason string) bool {
+	switch reason {
+	case "license not found", "license is not active", "license is suspended", "license has expired", "license has been revoked":
+		return true
+	default:
+		return false
+	}
+}
+
+func envelopeRejection(protocol int, operation, reason string) error {
+	if protocol != 2 || keyRejection(reason) {
+		return definitiveErr("license %s failed: %s", operation, reason)
+	}
+	return admissionErr("license %s denied for this installation: %s", operation, reason)
 }
 
 // FailureClassOf extracts the class from an error chain. Unclassified errors

@@ -356,6 +356,7 @@ func main() {
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers
 	var licenseClient *license.Client
+	onlineLicenseConfigured := cfg.License.Key != "" && cfg.License.FilePath == ""
 	if cfg.License.FilePath != "" {
 		// Offline (air-gapped) license file: verified entirely from disk
 		// against the pinned public key — no license-server dependency, no
@@ -456,9 +457,13 @@ func main() {
 	// Deliberately placed after both no-license branches so it fires
 	// exactly once regardless of which path got us here.
 	if licenseClient == nil {
-		log.Info().
-			Str("url", "https://basekick.net/enterprise").
-			Msg("Running Arc OSS — try Arc Enterprise for tiering, clustering, RBAC, audit, and arcx")
+		if onlineLicenseConfigured {
+			log.Warn().Msg("Configured online license could not initialize; data services remain fenced")
+		} else {
+			log.Info().
+				Str("url", "https://basekick.net/enterprise").
+				Msg("Running Arc OSS — try Arc Enterprise for tiering, clustering, RBAC, audit, and arcx")
+		}
 	}
 
 	// Initialize metrics collector
@@ -1219,9 +1224,7 @@ func main() {
 			return fmt.Errorf("%w: cluster startup ownership is not established", ingest.ErrIngestFenced)
 		})
 	}
-	if licenseClient != nil {
-		arrowBuffer.SetLicenseIngestGate(licenseIngestGate(licenseClient))
-	}
+	arrowBuffer.SetLicenseIngestGate(licenseRuntimeIngestGate(licenseClient, onlineLicenseConfigured, licenseBootstrap != nil))
 	// Ingest counts rows stamped past file-level time pruning's margin
 	// whether or not the feature is on (it is by default), so the risk is
 	// visible on every node that flushes. Set before WAL recovery and the
@@ -1917,6 +1920,11 @@ func main() {
 		gate := newCompactionClusterGate(cfg.Cluster.Role)
 		compactionGate = gate
 		compactionAPIGate = gate
+	} else if onlineLicenseConfigured && licenseBootstrap == nil {
+		gate := &standaloneLicenseCompactionGate{allowed: func() bool {
+			return licenseDataAllowed(licenseClient, onlineLicenseConfigured, false)
+		}}
+		compactionGate, compactionAPIGate = gate, gate
 	}
 	// Phase 4: completion-manifest directory used by the cluster-mode
 	// subprocess → parent handoff. Empty in OSS (nil gate is what disables
@@ -2768,8 +2776,15 @@ func main() {
 	}
 
 	server := api.NewServer(serverConfig, logger.Get("server"))
-	admission := cluster.NewServiceAdmission(func() bool { return clusterCoordinator == nil || clusterCoordinator.ServingAllowed() })
-	server.SetServingReadiness(func() bool { return clusterCoordinator == nil || clusterCoordinator.ReadServingAllowed() })
+	dataAllowed := func() bool {
+		return licenseDataAllowed(licenseClient, onlineLicenseConfigured, licenseBootstrap != nil)
+	}
+	admission := cluster.NewServiceAdmission(func() bool {
+		return dataAllowed() && (clusterCoordinator == nil || clusterCoordinator.ServingAllowed())
+	})
+	server.SetServingReadiness(func() bool {
+		return dataAllowed() && (clusterCoordinator == nil || clusterCoordinator.ReadServingAllowed())
+	})
 	server.GetApp().Use(func(c *fiber.Ctx) error {
 		path := c.Path()
 		if path == "/health" || path == "/ready" || path == "/ready/write" || path == "/metrics" || (c.Method() == fiber.MethodGet && (path == "/api/v1/cluster" || path == "/api/v1/cluster/local" || path == "/api/v1/cluster/nodes")) {
@@ -2782,7 +2797,7 @@ func main() {
 			return c.Next()
 		}
 		if clusterCoordinator != nil && (path == "/api/v1/query" || path == "/api/v1/query/arrow" || path == "/api/v1/query/msgpack") {
-			if !clusterCoordinator.ReadServingAllowed() {
+			if !dataAllowed() || !clusterCoordinator.ReadServingAllowed() {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "node fenced by license lifecycle"})
 			}
 			return c.Next()
@@ -2804,6 +2819,10 @@ func main() {
 		server.SetLicenseStatus(licenseClient.HealthStatus)
 	} else if cfg.License.FilePath != "" || cfg.License.Key != "" {
 		server.SetLicenseStatus(func() license.LicenseHealth {
+			if onlineLicenseConfigured {
+				state := license.ExpiryState{Phase: license.PhaseAuthorityUnavailable, Status: "initialization_failed", Reason: "grant_unavailable"}
+				return license.LicenseHealth{Tier: "unavailable", Status: "initialization_failed", Source: "none", DesiredPolicy: &state}
+			}
 			return license.LicenseHealth{Tier: "oss", Status: "unlicensed", Source: "none"}
 		})
 	}
@@ -4700,9 +4719,11 @@ func main() {
 	// /ready/write answers whether a load balancer should send writes here.
 	// Licensed standalone nodes also respect the paid-grace writer stop.
 	if clusterCoordinator != nil {
-		server.SetWriteReadiness(clusterCoordinator.MayAcceptIngest)
+		server.SetWriteReadiness(func() bool { return dataAllowed() && clusterCoordinator.MayAcceptIngest() })
 	} else if licenseClient != nil {
-		server.SetWriteReadiness(func() bool { return licenseIngestGate(licenseClient)() == nil })
+		server.SetWriteReadiness(func() bool {
+			return dataAllowed() && licenseRuntimeIngestGate(licenseClient, onlineLicenseConfigured, licenseBootstrap != nil)() == nil
+		})
 	}
 
 	// MQTT API handlers are registered unconditionally. Both MQTTHandler

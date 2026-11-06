@@ -46,6 +46,10 @@ type ClientConfig struct {
 
 // Client handles license validation with the enterprise server
 type Client struct {
+	// Admission is installation-local; retained policy remains evidence for
+	// actual expiry, but may not authorize serving or cache fallback.
+	admissionBlocked bool
+	keyRejected      bool
 	// A newly verified boot-time grant cannot enable half-built components.
 	runtimeRestartRequired bool
 	runtimeShapePinned     bool
@@ -113,8 +117,9 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("license key is required")
 	}
 
-	// Generate machine fingerprint
-	fingerprint, err := GenerateMachineFingerprint()
+	// Persist the installation identity before contacting the authority. Pod
+	// network changes must not consume another machine activation on restart.
+	fingerprint, err := loadOrCreateInstallationFingerprint(cfg.CacheDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate machine fingerprint: %w", err)
 	}
@@ -200,7 +205,11 @@ type ActivateResponse struct {
 func (c *Client) Activate(ctx context.Context) (*License, error) {
 	c.validationMu.Lock()
 	defer c.validationMu.Unlock()
-	return c.activate(ctx)
+	lic, err := c.activate(ctx)
+	if c.policyProtocol == 2 {
+		c.recordValidationFailure(err)
+	}
+	return lic, err
 }
 
 // licenseAPIURL selects the wire contract by endpoint. Protocol 2 never
@@ -291,8 +300,7 @@ func (c *Client) activate(ctx context.Context) (*License, error) {
 		if errMsg == "" {
 			errMsg = "license activation failed"
 		}
-		// 200 envelope rejection: the server spoke the protocol and said no.
-		return nil, definitiveErr("license activation failed: %s", errMsg)
+		return nil, envelopeRejection(c.policyProtocol, "activation", errMsg)
 	}
 
 	// Verify the detached signature against the raw license_file
@@ -355,7 +363,11 @@ func (c *Client) activate(ctx context.Context) (*License, error) {
 func (c *Client) Verify(ctx context.Context) (*License, error) {
 	c.validationMu.Lock()
 	defer c.validationMu.Unlock()
-	return c.verify(ctx)
+	lic, err := c.verify(ctx)
+	if c.policyProtocol == 2 {
+		c.recordValidationFailure(err)
+	}
+	return lic, err
 }
 
 func (c *Client) verify(ctx context.Context) (*License, error) {
@@ -426,9 +438,7 @@ func (c *Client) verify(ctx context.Context) (*License, error) {
 		if errMsg == "machine not activated for this license" || errMsg == "activation has been revoked" {
 			return nil, fmt.Errorf("license validation failed: %w: %s", errActivationMissing, errMsg)
 		}
-		// Everything else = definitive (unknown strings included: the server
-		// spoke the protocol and said no).
-		return nil, definitiveErr("license validation failed: %s", errMsg)
+		return nil, envelopeRejection(c.policyProtocol, "validation", errMsg)
 	}
 
 	// Same detached-signature verification path as Activate.
@@ -508,10 +518,27 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 
 	// Only the final outcome is authoritative: a missing activation can recover
 	// successfully, or fail transiently without invalidating the current pair.
-	if err != nil && FailureClassOf(err) == ClassDefinitive {
+	c.recordValidationFailure(err)
+	return license, err
+}
+
+// Called while validationMu serializes response acceptance and cache access.
+// Only a newly verified response clears either refusal (storeRuntimeLicenseLocked).
+func (c *Client) recordValidationFailure(err error) {
+	if err == nil {
+		return
+	}
+	switch FailureClassOf(err) {
+	case ClassAdmissionDenied:
+		c.mu.Lock()
+		c.admissionBlocked = true
+		c.mu.Unlock()
+	case ClassDefinitive:
 		c.mu.Lock()
 		hadLicense := c.license != nil
 		c.license = nil
+		c.keyRejected = true
+		c.admissionBlocked = false
 		c.mu.Unlock()
 		c.runtimeClock().rejectLicense()
 		c.deleteCache()
@@ -519,7 +546,6 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 			c.logger.Warn().Err(err).Msg("License rejected; enterprise feature gates disabled")
 		}
 	}
-	return license, err
 }
 
 // StartPeriodicValidation starts background license validation
@@ -566,7 +592,7 @@ func (c *Client) Stop() {
 func (c *Client) GetLicense() *License {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.runtimeRestartRequired {
+	if c.runtimeRestartRequired || c.admissionBlocked || c.keyRejected {
 		return nil
 	}
 	return c.license
@@ -582,7 +608,7 @@ func (c *Client) RequireRuntimeRestart() { c.mu.Lock(); c.runtimeRestartRequired
 func (c *Client) PendingRuntimeLicense() *License {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if !c.runtimeRestartRequired {
+	if !c.runtimeRestartRequired || c.admissionBlocked || c.keyRejected {
 		return nil
 	}
 	return c.license
@@ -592,28 +618,28 @@ func (c *Client) PendingRuntimeLicense() *License {
 func (c *Client) IsValid() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.IsValid()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.IsValid()
 }
 
 // IsEnterprise returns true if the license is enterprise tier or higher
 func (c *Client) IsEnterprise() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.IsEnterprise()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.IsEnterprise()
 }
 
 // CanUseCQScheduler returns true if CQ scheduling is allowed
 func (c *Client) CanUseCQScheduler() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseCQScheduler()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseCQScheduler()
 }
 
 // CanUseRetentionScheduler returns true if retention scheduling is allowed
 func (c *Client) CanUseRetentionScheduler() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseRetentionScheduler()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseRetentionScheduler()
 }
 
 // CanUseEdgeSyncScheduler reads the current entitlement, including revalidation.
@@ -623,14 +649,14 @@ func (c *Client) CanUseEdgeSyncScheduler() bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license.CanUseEdgeSyncScheduler()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license.CanUseEdgeSyncScheduler()
 }
 
 // CanUseTieredStorage returns true if tiered storage is allowed
 func (c *Client) CanUseTieredStorage() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseTieredStorage()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseTieredStorage()
 }
 
 // CanUseClustering returns true if multi-node clustering is allowed.
@@ -640,35 +666,35 @@ func (c *Client) CanUseTieredStorage() bool {
 func (c *Client) CanUseClustering() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseClustering()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseClustering()
 }
 
 // CanUseAuditLogging returns true if audit logging is allowed
 func (c *Client) CanUseAuditLogging() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseAuditLogging()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseAuditLogging()
 }
 
 // CanUseWriterFailover returns true if automatic writer failover is allowed
 func (c *Client) CanUseWriterFailover() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseWriterFailover()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseWriterFailover()
 }
 
 // CanUseQueryGovernance returns true if query governance is allowed
 func (c *Client) CanUseQueryGovernance() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseQueryGovernance()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseQueryGovernance()
 }
 
 // CanUseQueryManagement returns true if query management is allowed
 func (c *Client) CanUseQueryManagement() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseQueryManagement()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseQueryManagement()
 }
 
 // CanUseArcx returns true if loading the proprietary arcx DuckDB
@@ -681,7 +707,7 @@ func (c *Client) CanUseQueryManagement() bool {
 func (c *Client) CanUseArcx() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseArcx()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseArcx()
 }
 
 // CanUseSharedStorageMultiWriter returns true if Pattern 2 multi-writer
@@ -692,7 +718,7 @@ func (c *Client) CanUseArcx() bool {
 func (c *Client) CanUseSharedStorageMultiWriter() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license != nil && c.license.CanUseSharedStorageMultiWriter()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license != nil && c.license.CanUseSharedStorageMultiWriter()
 }
 
 // GetFingerprint returns the machine fingerprint
@@ -767,10 +793,10 @@ func checkHTTPStatusForProtocol(resp *http.Response, protocol int, secrets ...st
 	// certainly an HTML error page from an upstream proxy; truncate.
 	limit := int64(4 << 10)
 	v2NotFound := protocol == 2 && resp.StatusCode == http.StatusNotFound
-	if v2NotFound {
+	if protocol == 2 {
 		limit++ // Detect a truncated verdict without reading an unbounded body.
 	}
-	preview, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
+	preview, readErr := io.ReadAll(io.LimitReader(resp.Body, limit))
 	previewStr := strings.TrimSpace(string(preview))
 	for _, s := range secrets {
 		if s != "" {
@@ -786,15 +812,29 @@ func checkHTTPStatusForProtocol(resp *http.Response, protocol int, secrets ...st
 	}
 	definitive := resp.StatusCode >= 400 && resp.StatusCode < 500 &&
 		resp.StatusCode != 429 && isProtocolJSONBody(previewStr)
-	if v2NotFound {
-		var verdict struct {
-			Error string `json:"error"`
-		}
-		definitive = len(preview) <= 4<<10 && json.Unmarshal(preview, &verdict) == nil && verdict.Error == "license not found"
-	}
 	mk := transientErr
 	if definitive {
 		mk = definitiveErr
+	}
+	if protocol == 2 {
+		var verdict struct {
+			Error string `json:"error"`
+		}
+		// Parse the complete bounded body, never its redacted/truncated log
+		// preview. Unknown protocol refusals fence only this installation.
+		mk = transientErr
+		if readErr == nil && len(preview) <= 4<<10 && json.Unmarshal(preview, &verdict) == nil && verdict.Error != "" &&
+			resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+			if v2NotFound {
+				if verdict.Error == "license not found" {
+					mk = definitiveErr
+				}
+			} else if keyRejection(verdict.Error) {
+				mk = definitiveErr
+			} else {
+				mk = admissionErr
+			}
+		}
 	}
 	if previewStr == "" {
 		return mk("HTTP %d from license server", resp.StatusCode)
@@ -832,7 +872,7 @@ func (c *Client) CanManageRBAC() bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license.CanManageRBAC()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license.CanManageRBAC()
 }
 
 // CanMigrateTieredStorage gates new migration work, not reads of existing data.
@@ -842,5 +882,5 @@ func (c *Client) CanMigrateTieredStorage() bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return !c.runtimeRestartRequired && c.license.CanMigrateTieredStorage()
+	return !c.admissionBlocked && !c.keyRejected && !c.runtimeRestartRequired && c.license.CanMigrateTieredStorage()
 }

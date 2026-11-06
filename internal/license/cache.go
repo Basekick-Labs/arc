@@ -133,6 +133,15 @@ func (c *Client) deleteCache() {
 func (c *Client) LoadCachedLicense() (*License, error) {
 	c.validationMu.Lock()
 	defer c.validationMu.Unlock()
+	c.mu.RLock()
+	blocked, rejected := c.admissionBlocked, c.keyRejected
+	c.mu.RUnlock()
+	if blocked {
+		return nil, admissionErr("installation admission is blocked; retained cache cannot authorize serving")
+	}
+	if rejected {
+		return nil, definitiveErr("license key was rejected; fresh authority required")
+	}
 	// An online key's signed file proves entitlement, not the current date.
 	// A fresh challenge after every process start prevents replaying a cache
 	// with a rolled-back machine clock. Preserve the cache for later recovery.
@@ -224,8 +233,11 @@ func (c *Client) ActivateOrVerifyResilient(ctx context.Context) (*License, Licen
 			return lic, SourceServer, nil
 		}
 		lastErr = err
-		if FailureClassOf(err) == ClassDefinitive {
+		if FailureClassOf(err) == ClassDefinitive || FailureClassOf(err) == ClassAdmissionDenied {
 			return nil, SourceServer, err
+		}
+		if c.AdmissionBlocked() {
+			return nil, SourceServer, admissionErr("installation remains blocked pending fresh admission: %w", err)
 		}
 		c.logger.Warn().Err(err).Int("attempt", attempt).Int("max_attempts", bootRetryAttempts).
 			Msg("license server unreachable or answered non-definitively; will retry")
@@ -247,6 +259,7 @@ const SourceFile LicenseSource = "file"
 // excludes the license key, customer identity, and the feature list — /health
 // is unauthenticated (see the decision comments in internal/api/server.go).
 type LicenseHealth struct {
+	AdmissionBlocked       bool         `json:"admission_blocked,omitempty"`
 	RuntimeRestartRequired bool         `json:"runtime_restart_required,omitempty"`
 	Tier                   string       `json:"tier"`
 	Status                 string       `json:"status"`
@@ -268,8 +281,13 @@ func (c *Client) HealthStatus() LicenseHealth {
 	lic := c.license
 	src := c.source
 	pending := c.runtimeRestartRequired
+	blocked, rejected := c.admissionBlocked, c.keyRejected
 	c.mu.RUnlock()
 	if lic == nil {
+		if c.policyProtocol == 2 && !c.offline {
+			state := c.LifecycleState()
+			return LicenseHealth{AdmissionBlocked: blocked, Tier: "unavailable", Status: state.Status, Source: string(src), DesiredPolicy: &state}
+		}
 		return LicenseHealth{Tier: "oss", Status: "unlicensed", Source: string(src)}
 	}
 	instant := lic.currentTime()
@@ -307,7 +325,12 @@ func (c *Client) HealthStatus() LicenseHealth {
 	if pending && observed.Valid {
 		status = "runtime_restart_required"
 	}
+	if blocked || rejected {
+		state := c.LifecycleState()
+		status, policyState = state.Status, &state
+	}
 	return LicenseHealth{
+		AdmissionBlocked:       blocked,
 		RuntimeRestartRequired: pending,
 		TermEndsAt:             termEndsAt, LicenseKind: kind,
 		DesiredPolicy: policyState,

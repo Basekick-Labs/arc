@@ -32,6 +32,32 @@ An unavailable v2 route, including a router's JSON 404, is transient: a running
 process retains its current grant and cache, and a fresh process waits for
 authority rather than enabling Enterprise or starting independent OSS services.
 An explicit `license not found` verdict remains a definitive rejection.
+
+Protocol 2 distinguishes an installation's admission from the validity of its
+key. `maximum machine activations reached` and unrecognized protocol refusals
+fence this installation; they do not erase signed evidence, invalidate the key
+for peers, or prove that grace has ended. Retained cache bytes cannot reopen a
+refused installation. A configured cluster can recover coordination while data
+and maintenance remain fenced. A fresh successful proof clears the refusal and
+uses the existing runtime-rebuild path before newly licensed components serve.
+An absent grant or unavailable clock is nonterminal. A final OSS handoff needs
+a recognized terminal cause on every participant, such as the signed cutoff or
+an explicit key-wide rejection. Actual cutoffs still apply to the preserved
+trusted policy while admission is blocked; admission never extends grace.
+
+Online installations persist `license_installation.json` beside the auth database
+on the node's own persistent volume. The first identity uses the normal machine
+fingerprint and remains stable across subsequent pod/network replacements.
+Creation is atomic and uses restrictive permissions; a corrupt identity or
+failed persistence does not silently create a different installation. Keep this
+file with the node's data across restarts and key changes. A copied license
+cache alone never supplies an identity or authorizes an online boot. An older
+installation without this file establishes its current machine identity on its
+first upgraded start; this does not automatically recover activations already
+consumed by earlier identity churn. Migration/reassignment of those existing
+activations requires explicit validation, not automatic slot release or a quota
+increase. Cloning an entire node volume, including its identity, is outside the
+cache-only copy boundary and must not be used to run a second logical node.
 Changing only the request URL to v1 does not satisfy protocol 2: a legacy signed
 license without its policy and fresh time proof cannot enable Enterprise at
 startup. A process with an already trusted grant keeps that grant's deadlines

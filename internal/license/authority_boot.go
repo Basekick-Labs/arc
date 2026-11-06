@@ -14,7 +14,7 @@ var authorityBootRetryDelay = 5 * time.Second
 func (c *Client) AwaitOnlineAuthority(ctx context.Context) (*License, LicenseSource, error) {
 	for {
 		lic, source, err := c.ActivateOrVerifyResilient(ctx)
-		if err == nil || FailureClassOf(err) == ClassDefinitive || c.offline {
+		if err == nil || FailureClassOf(err) == ClassDefinitive || FailureClassOf(err) == ClassAdmissionDenied || c.offline {
 			return lic, source, err
 		}
 		if ctx.Err() != nil {

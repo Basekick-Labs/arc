@@ -34,4 +34,52 @@ func (c *Client) storeRuntimeLicenseLocked(l *License) {
 		c.runtimeRestartRequired = true
 	}
 	c.license = l
+	c.admissionBlocked = false
+	c.keyRejected = false
+}
+
+// AdmissionBlocked reports an installation-local refusal. It does not say that
+// the key or its signed policy expired, and it never exposes the retained grant.
+func (c *Client) AdmissionBlocked() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.admissionBlocked
+}
+
+// ServingAllowed requires a currently admitted, constructed licensed runtime.
+// Callers distinguish genuine OSS deployments and a completed OSS handoff.
+func (c *Client) ServingAllowed() bool {
+	return c != nil && c.IsValid()
+}
+
+// LifecycleState separates absence of authority from positive terminal
+// evidence. The retained signed policy and advancing trusted clock can still
+// reach their real cutoff while admission is blocked; cache bytes alone cannot.
+func (c *Client) LifecycleState() ExpiryState {
+	unknown := ExpiryState{Phase: PhaseAuthorityUnavailable, Status: "authority_unavailable", Reason: "grant_unavailable"}
+	if c == nil {
+		return unknown
+	}
+	c.mu.RLock()
+	lic, blocked, rejected := c.license, c.admissionBlocked, c.keyRejected
+	needsAuthority, offline := c.requireAuthorityTime, c.offline
+	c.mu.RUnlock()
+	if rejected {
+		return ExpiryState{Phase: PhaseOSS, Status: "rejected", Reason: "key_rejected"}
+	}
+	state := unknown
+	if lic != nil && (offline || !needsAuthority || (lic.clock != nil && lic.clock.source() == "license_server")) {
+		state = lic.ExpiryState()
+		if state.Phase == PhaseOSS {
+			state.Reason = "signed_cutoff"
+			return state
+		}
+	}
+	if blocked {
+		return ExpiryState{Phase: PhaseAdmissionBlocked, Status: "admission_blocked", Reason: "installation_not_admitted"}
+	}
+	return state
 }

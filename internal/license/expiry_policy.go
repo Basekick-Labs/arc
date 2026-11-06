@@ -18,6 +18,7 @@ type Phase string
 
 const (
 	PhaseAuthorityUnavailable Phase = "authority_unavailable"
+	PhaseAdmissionBlocked     Phase = "admission_blocked"
 	PhaseActive               Phase = "active"
 	PhaseExpirationDay        Phase = "expiration_day"
 	PhaseGrace                Phase = "grace_full"
@@ -27,6 +28,7 @@ const (
 )
 
 type ExpiryState struct {
+	Reason                 string `json:"reason,omitempty"`
 	Phase                  Phase  `json:"phase"`
 	GraceDay               int    `json:"grace_day"`
 	Status                 string `json:"status"`

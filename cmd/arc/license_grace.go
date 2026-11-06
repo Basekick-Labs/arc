@@ -31,10 +31,43 @@ func (r *licenseGraceRestart) due(now time.Time, state license.ExpiryState, prep
 }
 
 func licenseIngestGate(client *license.Client) func() error {
+	return licenseRuntimeIngestGate(client, client != nil, false)
+}
+
+// A configured online installation cannot become an independent OSS writer
+// merely because admission is unavailable. Only an authorized sealed owner or
+// a positive terminal key/cutoff verdict may use the OSS runtime.
+func licenseDataAllowed(client *license.Client, onlineConfigured, authorizedOSS bool) bool {
+	if authorizedOSS {
+		return true
+	}
+	if client == nil {
+		return !onlineConfigured
+	}
+	p := client.LifecycleState()
+	if p.Phase == license.PhaseOSS && (p.Reason == "signed_cutoff" || p.Reason == "key_rejected") {
+		return true
+	}
+	return client.ServingAllowed()
+}
+
+func licenseRuntimeIngestGate(client *license.Client, onlineConfigured, authorizedOSS bool) func() error {
 	return func() error {
-		if client != nil && client.GetLicense().ExpiryState().WritersStopped {
+		if !licenseDataAllowed(client, onlineConfigured, authorizedOSS) {
+			return fmt.Errorf("%w: installation is not admitted by the license authority", ingest.ErrIngestFenced)
+		}
+		if !authorizedOSS && client != nil && client.LifecycleState().WritersStopped {
 			return fmt.Errorf("%w: paid license grace period has stopped writers; renew the license", ingest.ErrIngestFenced)
 		}
 		return nil
 	}
 }
+
+// Standalone online deployments have no cluster role gate. Keep cron armed,
+// but apply the same runtime admission decision to every maintenance pass.
+type standaloneLicenseCompactionGate struct{ allowed func() bool }
+
+func (g *standaloneLicenseCompactionGate) CanCompact() bool            { return g.allowed() }
+func (g *standaloneLicenseCompactionGate) CanScheduleCompaction() bool { return true }
+func (g *standaloneLicenseCompactionGate) Role() string                { return "standalone" }
+func (g *standaloneLicenseCompactionGate) LeaseHolder() string         { return "" }

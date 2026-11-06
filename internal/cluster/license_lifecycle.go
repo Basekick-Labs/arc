@@ -56,14 +56,21 @@ func (c *Coordinator) licensePhase() license.ExpiryState {
 		return c.lifecycle.phase()
 	}
 	if c.licenseClient == nil {
-		return license.ExpiryState{Phase: license.PhaseOSS}
+		return license.ExpiryState{Phase: license.PhaseAuthorityUnavailable, Status: "unlicensed"}
+	}
+	// Absence of an admitted runtime is not evidence that the key expired.
+	// The client retains verified policy solely for lifecycle decisions while
+	// keeping rejected nodes out of all service gates.
+	state := c.licenseClient.LifecycleState()
+	if !state.Valid {
+		return state
 	}
 	l := c.licenseClient.GetLicense()
 	if l == nil {
 		l = c.licenseClient.PendingRuntimeLicense()
 	}
 	if l == nil {
-		return license.ExpiryState{Phase: license.PhaseOSS}
+		return license.ExpiryState{Phase: license.PhaseAuthorityUnavailable, Status: "unlicensed"}
 	}
 	return licensePhaseForMode(l, c.cfg.SharedStorageMode)
 }
@@ -73,6 +80,7 @@ func licensePhaseForMode(l *license.License, shared bool) license.ExpiryState {
 	if p.Valid && (!l.HasFeature(license.FeatureClustering) || (shared && !l.HasFeature(license.FeatureSharedStorageMultiWriter))) {
 		p.Valid = false
 		p.Phase = license.PhaseOSS
+		p.Reason = "clustering_not_licensed"
 	}
 	return p
 }
@@ -89,6 +97,12 @@ func (c *Coordinator) LifecycleState() raft.LicenseLifecycleState {
 func (c *Coordinator) ServingAllowed() bool {
 	if c == nil {
 		return true
+	}
+	if c.licenseClient != nil {
+		p := c.licenseClient.LifecycleState()
+		if p.Phase == license.PhaseAdmissionBlocked || p.Phase == license.PhaseAuthorityUnavailable {
+			return false
+		}
 	}
 	if !c.lifecycle.started.Load() && !c.lifecycleRecovery && c.LifecycleState().Allocation == nil {
 		return true
@@ -110,7 +124,7 @@ func (c *Coordinator) ServingAllowed() bool {
 		}
 	}
 	phase := c.licensePhase()
-	if phase.Phase == license.PhaseAuthorityUnavailable || phase.Phase == license.PhaseOSS {
+	if !phase.Valid {
 		return false
 	}
 	if s.Mode == "preparing" || s.Mode == "sealed" {
@@ -155,7 +169,11 @@ func (c *Coordinator) automaticFailoverAllowed() bool {
 // LicenseWritesAllowed stops new ingestion without stopping reads, replication,
 // recovery or the coordination needed to preserve data at the final cutoff.
 func (c *Coordinator) LicenseWritesAllowed() bool {
-	return c == nil || !c.licensePhase().WritersStopped
+	if c == nil || (!c.lifecycle.started.Load() && !c.lifecycleRecovery && c.licenseClient == nil && c.lifecycle.phase == nil) {
+		return true
+	}
+	p := c.licensePhase()
+	return p.Valid && !p.WritersStopped && !c.LifecyclePreparing()
 }
 
 // PrepareLicenseRestart retains membership while this process drains and
@@ -385,7 +403,7 @@ func (c *Coordinator) lifecycleTick(ctx context.Context) error {
 	allActive, allOSS, allDrained := true, true, true
 	for _, r := range reports {
 		allActive = allActive && r.Phase.Valid
-		allOSS = allOSS && r.Phase.Phase == license.PhaseOSS
+		allOSS = allOSS && terminalLicensePhase(r.Phase)
 		allDrained = allDrained && r.Generation == s.Generation && r.Mode == "preparing" && r.Drained
 	}
 	if allActive && s.Mode != "sealed" {
@@ -495,7 +513,25 @@ func (c *Coordinator) ReadServingAllowed() bool {
 	}
 	s := c.LifecycleState()
 	if s.Mode == "preparing" {
-		return c.lifecycle.ready.Load() && s.Roles[string(c.localNode.Role)] == c.localNode.ID
+		p := c.licensePhase()
+		if !p.Valid && !terminalLicensePhase(p) {
+			return false
+		}
+		return c.localNode != nil && c.lifecycle.ready.Load() && s.Roles[string(c.localNode.Role)] == c.localNode.ID
 	}
 	return c.ServingAllowed()
+}
+
+// Every participant must report a positive terminal cause before a handoff.
+// Old/malformed reports and a missing grant cannot authorize sealing data.
+func terminalLicensePhase(p license.ExpiryState) bool {
+	if p.Phase != license.PhaseOSS {
+		return false
+	}
+	switch p.Reason {
+	case "signed_cutoff", "key_rejected", "clustering_not_licensed":
+		return true
+	default:
+		return false
+	}
 }
