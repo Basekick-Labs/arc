@@ -2,6 +2,7 @@ package pruning
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -531,9 +532,9 @@ func TestPartitionCache(t *testing.T) {
 	cache := newPartitionCache(100 * time.Millisecond)
 
 	t.Run("cache key generation", func(t *testing.T) {
-		key1 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", "SELECT * FROM cpu", "0")
-		key2 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", "SELECT * FROM cpu", "0")
-		key3 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", "SELECT * FROM memory", "0")
+		key1 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", sha256.Sum256([]byte("SELECT * FROM cpu")), "0")
+		key2 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", sha256.Sum256([]byte("SELECT * FROM cpu")), "0")
+		key3 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", sha256.Sum256([]byte("SELECT * FROM memory")), "0")
 
 		if key1 != key2 {
 			t.Error("Same inputs should produce same key")

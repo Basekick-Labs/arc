@@ -716,6 +716,14 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 [wal]
 enabled = false
 # sync_mode = "fdatasync"   # fdatasync (default), fsync, or async (no sync; a flush checkpoint is still synced)
+# ack_mode = "auto"         # When a write is acknowledged: "durable" once a sync covering its WAL entry has
+#                           # completed (a crash loses no acknowledged write; a write the WAL cannot make
+#                           # durable is refused with 503), or "queued" once the entry is queued (acknowledged
+#                           # sooner; a crash can lose entries still queued or unsynced). "auto", the default,
+#                           # is durable with the WAL on, and queued with cluster.wal_coverage set.
+# ack_timeout_seconds = 30  # A durable write waits at most this long for the sync covering its WAL entry;
+#                           # past it the write is refused (503, wal_not_durable) and its entry retracted
+#                           # without waiting on the device. 0 = no bound (the wait ends only with the sync).
 # sync_bytes = 1048576      # Request a sync once this many WAL bytes are unsynced (default 1 MiB).
 #                           # Syncs run beside the WAL writer, so this bounds how much written data a
 #                           # sync can leave behind, not ingest throughput. A sync also runs every 100 ms

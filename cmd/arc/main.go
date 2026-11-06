@@ -1162,6 +1162,7 @@ func main() {
 			BufferSize:   cfg.WAL.BufferSize,
 			SyncBytes:    cfg.WAL.SyncBytes,
 			AckMode:      wal.AckMode(cfg.WAL.AckMode),
+			AckTimeout:   walAckTimeout(cfg.WAL.AckTimeoutSeconds),
 			Logger:       logger.Get("wal"),
 		})
 		if err != nil {
@@ -1181,6 +1182,9 @@ func main() {
 		walLog := log.Info().
 			Str("directory", cfg.WAL.Directory).
 			Str("sync_mode", cfg.WAL.SyncMode).
+			Str("ack_mode", cfg.WAL.AckMode).
+			Bool("ack_mode_auto", cfg.WAL.AckModeAuto).
+			Int("ack_timeout_seconds", cfg.WAL.AckTimeoutSeconds).
 			Int("max_size_mb", cfg.WAL.MaxSizeMB).
 			Int("max_age_seconds", cfg.WAL.MaxAgeSeconds).
 			Bool("disk_pressure_enabled", walDisk != nil)
@@ -1867,6 +1871,12 @@ func main() {
 		// ingest.max_buffered_bytes (#1468), when that limit is on.
 		if arrowBuffer.MaxBufferedBytes() > 0 {
 			arrowBuffer.OnBufferFullChange(subscriptionManager.SetBufferFull)
+		}
+		// And while the WAL refuses durable acknowledgements (#1502): a
+		// stalled or failing device. Never set in queued mode, where no
+		// write waits on a sync.
+		if walWriter != nil {
+			walWriter.OnDurableAckChange(subscriptionManager.SetWALNotDurable)
 		}
 
 		// Start manager (loads and starts auto_start subscriptions). On a
@@ -5985,10 +5995,12 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		if database == "" {
 			database = "default"
 		}
-		// Inherit the replayed entry's identity: one columnar entry becomes
-		// exactly one buffer write, so a checkpoint for it covers precisely
-		// these records. Row batches instead inherit their precise row-range
-		// identities when recovery splits an entry.
+		// Inherit the replayed entry's identity: a whole entry becomes exactly
+		// one buffer write, so a checkpoint for it covers precisely these
+		// records. When rows of the entry were already checkpointed by a
+		// multi-hour flush (#1492), recovery hands over only the other rows,
+		// each range under its own row-range identity, as for split row
+		// entries.
 		if err := arrowBuffer.WriteColumnarDirectReplayWithTagColumns(ctx, database, measurement, columns, walIdentity, tagColumns); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
@@ -6147,6 +6159,16 @@ func walCoverageHold(outbox *cluster.RegistrationOutbox) func() wal.CoverageHold
 		return nil
 	}
 	return outbox.CoverageHold
+}
+
+// walAckTimeout maps wal.ack_timeout_seconds to WriterConfig.AckTimeout: 0
+// in the config is "no bound", which the writer spells as a negative value
+// (its own zero means the default).
+func walAckTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return -1
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // enableWALCoverage turns on ingest coverage ids (#1207) where they can be used:

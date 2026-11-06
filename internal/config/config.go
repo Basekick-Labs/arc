@@ -510,10 +510,21 @@ type WALConfig struct {
 	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
 	// much written data a sync may leave behind, not the writer's throughput.
 	SyncBytes int64
-	// AckMode is when a write is acknowledged with the WAL on: "queued" (the
-	// default) once its entry is queued for the WAL writer, or "durable" once
-	// a sync covering it has completed. See wal.AckMode.
+	// AckMode is when a write is acknowledged with the WAL on: "durable" once
+	// a sync covering its entry has completed, or "queued" once the entry is
+	// queued for the WAL writer. Always resolved here to one of the two: the
+	// default "auto" (#1499) is durable with the WAL on, and queued with the
+	// WAL off or with cluster.wal_coverage set (the covered append commits
+	// under the ingest shard lock, where a durable wait would stall every
+	// writer to the measurement). See wal.AckMode.
 	AckMode string
+	// AckModeAuto records that AckMode was resolved from "auto".
+	AckModeAuto bool
+	// AckTimeoutSeconds bounds a durable write's wait for its covering sync
+	// (#1501): past it the write is refused (503, wal_not_durable) and its
+	// entries retracted without waiting on the device. Default 30; 0 = no
+	// bound. See wal.WriterConfig.AckTimeout.
+	AckTimeoutSeconds int
 	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
 	// volume is low on free space, and keeps the WAL reserve file (#676).
 	// Default true; only acts with the WAL enabled.
@@ -1268,6 +1279,7 @@ func Load() (*Config, error) {
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
 			AckMode:                 v.GetString("wal.ack_mode"),
+			AckTimeoutSeconds:       v.GetInt("wal.ack_timeout_seconds"),
 			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
 			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
 			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
@@ -1494,9 +1506,33 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	switch cfg.WAL.AckMode {
-	case "queued", "durable":
+	case "auto", "queued", "durable":
 	default:
-		return nil, fmt.Errorf("wal.ack_mode must be queued or durable, got %q", cfg.WAL.AckMode)
+		return nil, fmt.Errorf("wal.ack_mode must be auto, queued or durable, got %q", cfg.WAL.AckMode)
+	}
+	// "auto" is resolved first, so no later check ever sees it (#1499):
+	// durable with the WAL on; queued with the WAL off (the key has no
+	// effect) or with cluster.wal_coverage set, which durable does not
+	// support (below). The explicit values keep their checks.
+	// Coverage takes effect only on a clustered, local-storage writer with
+	// the WAL on (enableWALCoverage in cmd/arc); the key alone is ignored,
+	// with a warning, everywhere else.
+	coverageInEffect := cfg.WAL.Enabled && cfg.Cluster.Enabled && cfg.Cluster.WALCoverage && !cfg.Cluster.SharedStorageMode
+	if cfg.WAL.AckMode == "auto" {
+		cfg.WAL.AckModeAuto = true
+		switch {
+		case !cfg.WAL.Enabled:
+			cfg.WAL.AckMode = "queued"
+		case coverageInEffect:
+			cfg.WAL.AckMode = "queued"
+			cfg.Warnings = append(cfg.Warnings, LoadWarning{
+				Key:     "wal.ack_mode",
+				Value:   "auto",
+				Message: "wal.ack_mode = \"auto\" resolves to \"queued\" because cluster.wal_coverage is in effect on this writer: writes are acknowledged before their WAL entry is synced, and a crash can lose entries still queued or unsynced",
+			})
+		default:
+			cfg.WAL.AckMode = "durable"
+		}
 	}
 	// The covered append (cluster.wal_coverage) commits under the ingest shard
 	// lock, where waiting for a sync would stall every writer to that
@@ -1508,8 +1544,11 @@ func Load() (*Config, error) {
 			Message: "wal.ack_mode = \"durable\" has no effect while wal.enabled = false: writes are acknowledged without a WAL",
 		})
 	}
-	if cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" && cfg.Cluster.WALCoverage {
-		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true")
+	if cfg.WAL.AckMode == "durable" && coverageInEffect {
+		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true on a clustered writer")
+	}
+	if cfg.WAL.AckTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("wal.ack_timeout_seconds must be 0 (no bound) or positive, got %d", cfg.WAL.AckTimeoutSeconds)
 	}
 	if cfg.WAL.DiskMinFreeMB < 0 {
 		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
@@ -1999,8 +2038,16 @@ func Load() (*Config, error) {
 // DefaultMaxSQLLength is query.max_sql_length's default, the cap Arc always
 // had. MinMaxSQLLength and MaxSQLLengthCeiling bound what it accepts: below
 // the floor ordinary queries stop fitting, and above the ceiling one query's
-// validation and rewrite cost more than half a second of CPU before DuckDB
-// starts (about 0.5 s per MiB, linear).
+// validation and rewrite cost too much CPU before DuckDB starts.
+//
+// That cost is linear in the query's length since #1479, but depends on its
+// shape. Measured for a whole request at the ceiling (1 MiB): a JOIN chain
+// about 1.7 s, a run of `FROM x` about 2.3 s, and a comma join of 2-byte
+// references (`FROM x,x,x…`, the worst shape) about 4.1 s, of which
+// validation, the rewrite and DuckDB's parse each take about a third. No
+// rewrite pass scans another's output since #1482, and query.timeout stops
+// the rewrite. At the 10 KB default the worst shape costs about 0.2 s.
+// Raising the cap trades that CPU for longer queries.
 const (
 	DefaultMaxSQLLength = 10000
 	MinMaxSQLLength     = 1000
@@ -2214,7 +2261,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
-	v.SetDefault("wal.ack_mode", "queued")             // Acknowledge once queued; "durable" waits for the covering sync
+	v.SetDefault("wal.ack_mode", "auto")               // durable with the WAL on (#1499); queued with it off or with cluster.wal_coverage
+	v.SetDefault("wal.ack_timeout_seconds", 30)        // A durable write waits at most this long for its sync (#1501); 0 = no bound
 	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
 	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
 	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes

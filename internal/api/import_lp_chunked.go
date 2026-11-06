@@ -228,6 +228,9 @@ func writeLPImport(ctx context.Context, w *importWriter, upload *importUpload, d
 		if len(records) == 0 {
 			return nil
 		}
+		if err := ingest.CheckDenseCells(records); err != nil {
+			return err
+		}
 		byMeasurement := ingest.BatchToColumnar(records)
 		names := make([]string, 0, len(byMeasurement))
 		for m := range byMeasurement {

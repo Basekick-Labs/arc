@@ -128,9 +128,15 @@ var (
 // replaced by a literal of now, and refuses functions with a value no later
 // evaluation reproduces. String literals and quoted identifiers are left
 // alone.
+//
+// The clause is masked as written. It runs after validateWhereClause, which
+// refuses an unquoted backtick; mapping backticks to double quotes here, as
+// this once did, rewrote a backtick inside a literal into the SQL that ran
+// whenever the clause also had a time function to pin (`msg = 'a`b' AND time
+// < now()` deleted the rows where msg = 'a"b'), and could hide a time function
+// from the pin (#1480).
 func pinDeleteTime(where string, now time.Time) (string, error) {
-	in := backticksToDoubleQuotes(where)
-	masked, masks := sqlutil.MaskStringLiterals(in, sqlutil.HasQuotes(in))
+	masked, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
 	if m := volatileFunction.FindStringSubmatch(masked); m != nil {
 		return "", fmt.Errorf("WHERE clause may not use %s() while stream takeover is on: a DELETE is applied again to rows replayed after a failover, and must match the same rows", strings.ToLower(m[1]))
 	}
@@ -142,10 +148,11 @@ func pinDeleteTime(where string, now time.Time) (string, error) {
 	if out == masked {
 		return where, nil
 	}
-	for i := len(masks) - 1; i >= 0; i-- {
-		out = strings.ReplaceAll(out, masks[i].Placeholder, masks[i].Original)
-	}
-	return out, nil
+	// One left-to-right restore, each placeholder at the place the masker
+	// left it. Replacing every occurrence of each placeholder text also
+	// rewrote copies the caller wrote and text inside literals already
+	// restored, after the clause had been validated.
+	return sqlutil.UnmaskStringLiterals(out, masks), nil
 }
 
 // RewriteForRecords applies DELETE records to a pending local file (the
@@ -173,6 +180,18 @@ func (h *DeleteHandler) RewriteForRecords(ctx context.Context, relativePath stri
 	for _, w := range wheres {
 		if strings.TrimSpace(w) == "" {
 			bound = append(bound, w)
+			continue
+		}
+		// A record is SQL from the cluster log, interpolated below as it was
+		// stored. One stored before the validator was tightened is checked
+		// again here, as a stored continuous query is before it runs (#1480).
+		// One it refuses is not run, so the rows that DELETE removed elsewhere
+		// stay in this file; returning an error instead would hold the file
+		// back for good. The log carries the clause so the DELETE can be
+		// issued again.
+		if _, err := h.validateWhereClause(w); err != nil {
+			h.logger.Error().Err(err).Str("file", relativePath).Str("where", sqlutil.ForLog(w)).
+				Msg("DELETE record refused by WHERE validation; not applied, so its rows remain in this file; issue the DELETE again")
 			continue
 		}
 		var n int64

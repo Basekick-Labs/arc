@@ -2,6 +2,210 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
+
+`wal.ack_mode` now defaults to `"auto"`, which is `"durable"` on every node
+with `wal.enabled = true`: a 2xx means a sync covering the write's WAL entry
+has completed, so a crash loses no acknowledged write. Before, the default was
+`"queued"`: a write was acknowledged once its entry was queued for the WAL
+writer, and a kill -9 right after the acknowledgement could lose it. #1492's
+crash harness lost the last acknowledged request, 50,000 rows, in one of seven
+runs that way. Nothing in `arc.toml` or the docs' defaults said that "WAL on"
+did not mean "acknowledged means durable"; now it does.
+
+`"auto"` resolves to `"queued"` where durable is not available: with the WAL
+off (the key has no effect) and where `cluster.wal_coverage = true` is in
+effect, on a clustered local-storage writer (experimental,
+[#1207](https://github.com/Basekick-Labs/arc/issues/1207)), whose covered append
+commits under the ingest shard lock, where a durable wait would stall every
+writer to the measurement. A standalone node with the key set ignores it and
+stays durable. The coverage case is logged as a config warning; the resolved
+mode is in the `WAL enabled` startup line (`ack_mode`, `ack_mode_auto`).
+Setting `wal.ack_mode = "queued"` restores the old behaviour; `"durable"`
+with `cluster.wal_coverage` is still refused at startup.
+
+What changes with the WAL on:
+
+- **Latency.** Each request waits for the sync that covers its entry, about
+  one `fsync` (shared between the requests in flight: a durable entry starts a
+  sync at once, it does not wait for the 100 ms interval). Sequential small
+  writers feel it most. Measured on an M3 Max (`fdatasync` falls back to a
+  full `fsync` there), 8.7M rows of MessagePack columnar writes: 50,000-row
+  requests from one client 4.7M rows/s → 2.9M rows/s; 5,000-row requests from
+  one client 2.8M → 0.66M rows/s; 5,000-row requests from eight clients 9.4M →
+  2.4M rows/s. Throughput-first benchmarks should set `wal.ack_mode =
+  "queued"` to stay comparable with earlier numbers.
+- **A write the WAL cannot make durable is refused**, with `503`,
+  `Retry-After` and `X-Arc-Ingest-Refused: wal_not_durable`, counted in the
+  new `arc_wal_not_durable_rejections_total`. Before, the write was
+  acknowledged and the entry dropped (`arc_wal_dropped_entries_total`) or
+  lost at the crash. The refusal comes after the append: the entry may still
+  reach the WAL file and replay at the next start, so a client's retry can
+  duplicate rows (at-least-once). A request spanning several measurements is
+  written one at a time; a failure after some were buffered answers `500`
+  naming what was written, as for other refusals.
+- **A stalled WAL device refuses writes instead of losing them.** With
+  `"queued"`, a hung disk meant the WAL queue filled, entries were dropped and
+  ingest kept answering 204 for writes that were never durable. With
+  `"durable"` a request waits for its sync for at most
+  `wal.ack_timeout_seconds` (default 30; `0` = no bound,
+  [#1501](https://github.com/Basekick-Labs/arc/issues/1501)); past that it is
+  refused (`503`, `wal_not_durable`) and its WAL entry retracted without
+  waiting on the device, so the client retries and nothing is left pinned.
+  The disk-pressure gate (#676) covers low free space, not a hung device.
+  Watch `arc_wal_durable_ack_timeouts_total` (a stalled device),
+  `arc_wal_failed_syncs_total` (a failing one),
+  `arc_wal_not_durable_rejections_total` and the `wal_not_durable` refusal
+  log. The HTTP request context plays no part: in Fiber it has no deadline
+  and ends only at server shutdown.
+- **MQTT.** While the WAL refuses writes as not durable (a timed-out or failed
+  sync: the device is stalled or failing), MQTT subscriptions are suspended,
+  as they are for a fence, WAL disk pressure and a full buffer
+  ([#1502](https://github.com/Basekick-Labs/arc/issues/1502)), and resume
+  once a sync succeeds; the writer syncs the WAL file once a second
+  meanwhile, so an idle node recovers too. With `clean_session=false`
+  and QoS 1 or 2 the broker holds the messages. The message in flight when
+  the refusal starts is still briefly retried and then dropped, as for the
+  other reasons, and a merely slow device alternates between suspended and
+  resumed at about the ack timeout. `arc_wal_durable_ack_failing` is 1 while
+  the state holds.
+- **The shipped examples that enable the WAL** (`deploy/docker-compose/`
+  `oss-local`, `oss-s3`, `oss-traefik` and `enterprise-shared`, and
+  `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
+  WAL off.
+
+## Security: Arc's internal SQL placeholder text is reserved
+
+Before its checks, Arc swaps string literals, quoted names and some keywords
+for generated placeholders, for example the `FROM` inside
+`EXTRACT(YEAR FROM time)`. It restores them by matching their text once the
+checks have run. Text a caller wrote that matched a placeholder was restored
+too, so the statement that ran could differ from the one that was checked.
+- **Queries** are refused with a 400 when `__STR_`, `__IDENT_` or
+  `__FROM_MASK_` appears outside a string literal or quoted identifier,
+  comments included. The
+  rule also catches text that only forms once a literal is masked. Inside a
+  literal or quoted name these sequences remain ordinary data. The check
+  runs on every query endpoint, including continuous queries, and the FROM
+  part runs again inside the storage-path rewrite.
+- **DELETE `WHERE` clauses** follow the same rule. Before, they had no such
+  check.
+- **Database names**, including the `x-arc-database` header, also refuse
+  `__FROM_MASK_`, in addition to the existing `__STR_` and `__IDENT_`.
+- **The DELETE time pin** used with stream takeover restores each string
+  literal once, where it was. Before, it replaced every copy of the
+  literal's placeholder text.
+- **The storage-path rewrite** restores `FROM` keywords before it inserts
+  storage paths, so a path is never read by that restore.
+
+Matching is exact and case-sensitive, as the restore itself is. Queries that
+don't contain these sequences outside literals are unaffected.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
+
+## Fix: a crash during a multi-hour flush no longer replays the hours already stored ([#1492](https://github.com/Basekick-Labs/arc/issues/1492))
+
+A flush whose rows span several hours writes one Parquet file per hour. The
+WAL checkpoint that stops those rows replaying was written once, after the
+last file, so a crash (kill -9, OOM, power loss of the process) between the
+first file and that checkpoint replayed every row of the flush on restart: the
+hours already in storage were stored twice. Compaction removes the duplicates
+of a tagged measurement at its next pass; a tagless measurement kept them
+([#948](https://github.com/Basekick-Labs/arc/issues/948)). How many rows that
+is depends on how many hours one flush spans: with the sample `arc.toml`
+(`max_buffer_size = 5000000`, `max_buffer_age_ms = 100`) a kill -9 during a
+backfill duplicated 21–23% of the rows acknowledged in the run, eleven whole
+hours each stored twice.
+
+Each hour file's rows are now checkpointed in the WAL as soon as that file is
+stored and registered, with the row-range checkpoint recovery already used
+for its own split replays. A crash replays only the rows of the files not yet
+written, and recovery replays a columnar entry's uncovered rows alone. The
+duplicate window is now at most the rows of the hour file each in-flight flush
+was writing when the process died.
+
+What changes for an operator:
+- fewer duplicates after a crash, and for a tagless measurement no longer
+  whole hours of them;
+- one durable WAL write per hour file of a multi-hour flush, before the
+  flush's own checkpoint, so a backfill flush spanning 30 hours writes 30
+  small checkpoints where it wrote one; on a cluster node each hour file also
+  makes its registration durable (one outbox sync) before its checkpoint. A
+  flush within one hour (live ingest) is unchanged;
+- `arc_wal_row_checkpoints_written_total` and
+  `arc_wal_row_checkpoints_dropped_total`: a dropped checkpoint (the WAL
+  writer refused it or it timed out) only means those rows replay as before;
+- a flush that fails part-way now reports the rows and files it did store
+  (`records_stored`, `files_stored`) and counts as lost only rows with no WAL
+  copy that reached no file.
+
+Downgrade: an Arc without this change replays an entry with row-range
+checkpoints in full, which is today's duplicate window, not a loss. The gauge
+`arc_wal_partial_row_recovery_pending` reports only ranges left by a recovery
+pass, not those a live flush leaves.
+
+On a writer with WAL coverage (`cluster.wal_coverage`,
+[#1207](https://github.com/Basekick-Labs/arc/issues/1207),
+[#1498](https://github.com/Basekick-Labs/arc/issues/1498)) each hour file
+registers with the group's coverage for that file as before, only as soon as
+it is stored. For a flush that fails part-way, the registered-floor tracker
+counts the stored rows once those files' registrations settle, never earlier,
+and the floor advances once recovery's replay of the other rows completes each
+batch; the flush's WAL entries are kept until then.
+
+## Fix: a time bound written with `epoch_ms()`, `make_timestamp()` or `to_timestamp()` prunes ([#1491](https://github.com/Basekick-Labs/arc/issues/1491))
+
+A query bounded by an epoch number read every partition of the measurement.
+It now reads only the partitions and files of its range, the same as one
+written with a `TIMESTAMP` literal. Clients that keep event time as epoch
+milliseconds usually write it this way:
+
+```sql
+SELECT ... FROM market.quotes
+WHERE time >= epoch_ms(1790856000000) AND time < epoch_ms(1790856060000)
+```
+
+On 8.7M forex ticks the one-minute query above went from 97 ms to 1.8 ms on
+freshly ingested data (656 files), and from 9.7 ms to 3.1 ms after compaction
+(43 files): the same as the `TIMESTAMP` literal.
+
+Accepted, with one plain number as the argument:
+- `epoch_ms(n)`: milliseconds;
+- `make_timestamp(n)`: microseconds;
+- `to_timestamp(x)`: seconds, whole or decimal.
+
+Anything else in the call, such as arithmetic, a cast, a column or a second
+argument, gives no bound from that term, as before. So does a bound outside
+years 0001 to 9999, counting the second added to a `to_timestamp` bound and
+the microsecond added to an inclusive end. This also applies to a literal:
+`time <= '9999-12-31 23:59:59.999999'` no longer gives an end in year 10000,
+which a query that needs an unavailable cold tier read as "no cold data"
+instead of answering 503. A DELETE with such a bound now also reads only the files
+of its range (`delete.time_pruning`).
+
+`to_timestamp` is computed through a double and compared in the session time
+zone, which Arc pins to UTC. Its bound is widened by one second. These bounds
+narrow what is read but are not used to answer a query as empty without
+reading it.
+## Fix: query pre-processing rewrites stay inside their own text ([#1488](https://github.com/Basekick-Labs/arc/issues/1488))
+
+Before running a query, Arc applies a few text rewrites that speed common
+shapes up — `time_bucket`/`date_trunc` to epoch arithmetic, some
+`REGEXP_REPLACE`/`REGEXP_EXTRACT` to string functions, and a reorder of `LIKE`
+predicates. These ran on the raw query text, so a rewrite could match a string
+literal's content or a comment, or copy a column argument that contained a
+quote, and the rewritten query no longer matched the text that was validated.
+
+The rewrites now skip any match that begins inside a string literal (`'…'`,
+`E'…'`, `"…"`, `$tag$…$tag$`) or a comment, and `time_bucket`/`date_trunc` are
+left unchanged when their column argument is not a plain unquoted expression.
+No query's result changes. A query whose `time_bucket`/`date_trunc` column is a
+quoted identifier (for example `"my col"`) is now evaluated by DuckDB natively
+rather than through the epoch-arithmetic rewrite — the same answer, without that
+speedup. A query that would have been rewritten into something other than what
+was validated is now run as written.
+
 ## New: Iceberg export keeps files moved to an S3 cold tier ([#939](https://github.com/Basekick-Labs/arc/issues/939))
 
 Iceberg export and cold-tier tiering can now run together when the cold tier is
@@ -438,9 +642,14 @@ max_sql_length = 200000
 - Preparing a long query now takes time in proportion to its length. Before,
   restoring its string literals copied the whole statement once per literal,
   so a 1 MB query with 50,000 literals spent 9.3 s there, and a 2.3 MB one
-  34 s. Both now take under 0.6 s. Validation and rewriting together cost
-  about 0.5 s of CPU per MiB before DuckDB starts, which is why the ceiling is
-  1 MiB.
+  34 s. Both now take under 0.6 s. Validation and rewriting are linear in
+  the query's length (since [#1479](https://github.com/Basekick-Labs/arc/issues/1479)),
+  but their cost depends on the query's shape. At the 1 MiB ceiling one
+  request costs about 1.7 s of CPU for a JOIN chain, and up to about 4.1 s
+  for a comma join of many short references (`FROM x,x,x…`; see
+  [#1482](https://github.com/Basekick-Labs/arc/issues/1482)). At the 10 KB
+  default, about 0.2 s at worst. `query.timeout` covers that preparation
+  too.
 - Queries longer than 10,000 characters are not kept in the SQL transform
   cache, so a raised limit leaves the cache's memory bound unchanged.
 
@@ -551,6 +760,73 @@ not a read statement fails its runs from this release.
 
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
+
+## Security: more relation keywords are checked in user SQL
+
+A string literal in table position is refused because DuckDB would read it as
+a file. The check now also covers `PIVOT_WIDER`, `PIVOT_LONGER`, `DESC` and
+`SHOW`, DuckDB's other spellings of `PIVOT`, `UNPIVOT` and `DESCRIBE`, which
+read a file the same way (`SHOW` at the top level too, the others inside a
+subquery), and `ONLY` between such a keyword and the relation
+(`FROM ONLY …`). Such a query is answered `400` on every query endpoint, in
+continuous queries and in `DELETE` predicates. Queries that use these keywords
+on a measurement are unaffected, and a column of one of these names referenced
+through a table qualifier (`c.show = 'a'`) is no longer refused.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
+## Security: a malformed Parquet footer no longer stops Iceberg export
+
+Some malformed Parquet footers make the library Arc reads them with panic
+instead of returning an error. With Iceberg export on, the export pass reads
+the footer of every file it publishes, including files EdgeSync spokes send,
+so one such file stopped the process, and again on every restart while the
+file stayed in storage. The footer reads now return the panic as an error:
+the measurement holding the file fails its export pass, is logged with the
+file's name, and stays blocked until the file is removed, while every other
+measurement is exported. A panic elsewhere on the export goroutine is
+contained to its measurement the same way and logged with its stack. Footers
+over 16 MiB are refused before they are read (Arc's own are a few KiB). A
+Parquet import whose footer panics is answered `422` instead of `500`, and a
+schema anchor whose footer panics is treated as undecodable.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@glacieraxiom](https://github.com/glacieraxiom)**.
+## Security: a write with a new key on every point is refused instead of exhausting memory
+
+Arc builds a write's columns dense: every column holds a value or a NULL for
+every row. A write in which each point brought a tag or field key no other
+point had built rows x rows cells from a body linear in rows, so a few hundred
+KB of line protocol could hold more than a GB while it was parsed. A write may
+now leave at most eight cells empty for each cell it fills, or about four
+million, whichever is more, counting keys sent only as NULLs and room
+reserved for the first row's columns; past that it is answered `413` and
+nothing of it is written. The bound follows the values a write carries, not
+its size, so padding or compressing a body buys nothing. This covers line
+protocol and MessagePack rows, with or without `ingest.decimal_columns`, MQTT
+messages (refused and logged at most once per topic per interval) and line
+protocol imports, where the chunks before the refused one may already be
+written, as for any import that stops part-way. A dense write leaves no cell
+empty; a sparse one is admitted down to columns about 11% filled past the
+floor. Send points with different keys as separate writes or measurements.
+Parsing also builds each column at its final size once, roughly halving its
+peak memory for wide batches.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@glyphanchor](https://github.com/glyphanchor)**.
+
+## Security: more DuckDB functions are refused in user SQL
+
+Some functions of the DuckDB release Arc links were not covered by the checks
+Arc runs on query text, and could reach data or state outside the caller's
+scope. They are now refused with `400` on every query endpoint, in continuous
+queries and in `DELETE` predicates; a stored continuous query that calls one
+fails its runs. `DELETE` predicates now apply exactly the checks queries do.
+A test now reviews the linked DuckDB's functions so an upgrade cannot add one
+unnoticed.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@harsh-prajapati1312](https://github.com/harsh-prajapati1312)**.
 
 ## Security: a cluster node that took a Raft snapshot no longer keeps revoked tokens ([#1336](https://github.com/Basekick-Labs/arc/issues/1336))
 
@@ -866,6 +1142,201 @@ same one overwrites the copy of the config it first replaced.
 ignored. Arc now logs a warning at startup naming both files. Merge what you
 need into `/etc/arc/arc.toml`, then remove `/var/lib/arc/arc.toml`. The
 storage and backup paths are set by the systemd unit and override either file.
+
+## Fix: `IS [NOT] DISTINCT FROM` works in queries ([#1472](https://github.com/Basekick-Labs/arc/issues/1472))
+
+Arc read the `FROM` in `x IS [NOT] DISTINCT FROM y` as the start of a table
+reference, so standard SQL using the operator failed:
+
+- A literal operand (`host IS DISTINCT FROM 'a'`) was refused with "String
+  literal not allowed in table position".
+- A column or `NULL` operand was rewritten into a table scan, and DuckDB
+  failed with `Binder Error: Function "read_parquet" is a table function`.
+- With RBAC on, the operand was checked as a table, so a query could be
+  refused for a grant it does not need.
+- A comma after the operand (`SELECT a IS DISTINCT FROM b, c FROM cpu`)
+  turned `c` into a cross-join table.
+- `DELETE … WHERE host IS DISTINCT FROM 'a'` was refused.
+- Time-range pruning skipped queries that used the operator.
+
+All of these now treat the operator as a comparison. The same change fixes a
+literal after the `FROM` of a function form, such as
+`trim(BOTH FROM '  x  ')`, which was refused the same way.
+
+Arc also no longer reads a parenthesis or `FROM` inside a SQL comment as part
+of `EXTRACT`, `SUBSTRING`, `TRIM` or `OVERLAY`. A comment such as
+`/* trim( */` could previously make a real table reference after it invisible
+to the RBAC check and to the query rewrite, and the query then failed.
+
+The scan behind all of this is now one linear pass. It used to rescan each
+line once per keyword: at the default `query.max_sql_length` (10 KB) a
+crafted single-line query cost tens of milliseconds, and with the limit raised
+to 1 MiB it cost minutes. It now costs milliseconds at 1 MiB.
+
+Two spellings still fail as before, because Arc reads them as one word:
+an operand glued to the keyword (`IS DISTINCT FROM'a'`, `'a'IS DISTINCT FROM
+x`), and a non-ASCII space between the words. Put an ASCII space there.
+
+The workaround for earlier releases is `(x != 'a' OR x IS NULL)`.
+
+## Fix: a long comma join is prepared without rescanning its own rewrite ([#1482](https://github.com/Basekick-Labs/arc/issues/1482))
+
+Before running a query, Arc rewrites each table reference into a read of its
+files, in several passes. The comma-join pass ran first, and its output is
+about 30 times as long as the references it replaced, so every later pass
+scanned tens of MB for a 1 MiB query. Each pass now leaves a one-byte marker
+and the reads are put in once at the end, so every pass scans text about as
+long as the query. A whole request at the 1 MiB `query.max_sql_length`
+ceiling, before and after, measured the same way (in-process, one
+machine; earlier figures for these shapes came from a different setup):
+
+| Query (1 MiB) | Before | After |
+|---|---|---|
+| Comma join, `SELECT 1 FROM x,x,x,…` | 14.3 s | 4.1 s |
+| Comma join, `SELECT 1 FROM x, x, x, …` | 9.8 s | 2.9 s |
+| `SELECT 1 FROM x from x from …` | 3.4 s | 2.3 s |
+| `JOIN x USING (a)` repeated | 1.7 s | 1.7 s |
+
+The rest is validation and DuckDB's own parse. At the 10 KB default the worst
+shape goes from 0.31 s to 0.20 s.
+
+- `query.timeout` (or a governance policy's maximum duration) now bounds the
+  whole request, preparing the query included. Before, preparation ran
+  outside it and could not be stopped. A request whose deadline passes while
+  its query is prepared is answered `504 Query timed out`, as one that times
+  out while running is, on every query endpoint (JSON, MessagePack, Arrow,
+  the row estimate and `GET /api/v1/query/{measurement}`).
+- A query containing a NUL byte is refused with 400, on every query
+  endpoint. DuckDB stops reading a statement at the first NUL, in a string
+  literal or anywhere else, so such a query used to run cut short at that
+  byte: a different query from the one Arc validated. Continuous query
+  definitions are checked too, at creation and at every run, so a stored
+  definition containing a NUL now fails instead of running cut short.
+- A storage path that contains `from` or `join` followed by a word is no
+  longer rewritten inside the read Arc emits for it.
+
+## Fix: joins of two measurements bind unqualified columns ([#1483](https://github.com/Basekick-Labs/arc/issues/1483))
+
+A join of two measurements failed with `Binder Error: Ambiguous reference to
+table "read_parquet"` whenever DuckDB had to resolve an unqualified column or
+`*` across them, with or without an `x-arc-database` header:
+
+```sql
+SELECT count(*) FROM cpu JOIN mem USING (time, host) WHERE host = 'a';
+SELECT * FROM cpu JOIN mem ON cpu.host = mem.host;
+SELECT * FROM cpu, mem;
+```
+
+DuckDB names every unaliased file read `read_parquet`, so the two sides had
+the same name. Arc gave a table its own name only when the query qualified a
+column with it (`cpu.host`, since
+[#1447](https://github.com/Basekick-Labs/arc/issues/1447)). Now, when one
+FROM clause reads two or more measurements, each is named after itself,
+unless:
+
+- you gave it an alias, which it keeps;
+- the query already uses that name for something else: a CTE, another
+  relation, a column, a SELECT-list alias (`SELECT x AS mem … GROUP BY mem`),
+  or an outer query's column. DuckDB would bind the name to the table first,
+  so that measurement keeps its old naming. If the join is then still
+  ambiguous, give it an alias.
+
+Queries reading one measurement per FROM clause, including those with
+subqueries over another, are rewritten exactly as before.
+
+Joining a measurement to itself, or to the measurement of the same name in
+another database, still needs an alias on at least one side
+(`FROM cpu a JOIN plant.cpu b USING (time)`): both sides have the same name
+either way.
+
+## Fix: a query naming many tables no longer takes quadratic time to prepare ([#1479](https://github.com/Basekick-Labs/arc/issues/1479))
+
+Before running a query, Arc rewrites each table reference into a read of its
+files and works out which time partitions that read needs. For every
+reference it re-read the whole query: its time range, whether that range is
+relative to `now()`, and a hash for the partition cache. None of these depend
+on the table. A query made of many short references therefore took time
+quadratic in its length. Any user with query rights could hold a CPU core
+with one request:
+
+| Crafted query (whole request) | 10 KB (default limit) | 20 KB |
+|---|---|---|
+| Comma join, `SELECT 1 FROM x,x,x,…` | 9.8 s → 0.21 s | |
+| Comma join, `SELECT 1 FROM x, x, x, …` | 5.6 s → 0.15 s | 21.8 s → 0.29 s |
+| `SELECT 1 x from x from …` | 1.6 s → 0.06 s | 6.6 s → 0.10 s |
+
+Arc now reads them once per query and shares them across its references.
+Results are unchanged. A time range is only ever found for a single-table
+query, so no query's pruning differs.
+
+## Fix: a backtick in SQL is refused with a clear error ([#1480](https://github.com/Basekick-Labs/arc/issues/1480))
+
+DuckDB does not quote identifiers with backticks; outside quoted text a
+backtick is an operator character, so `` SELECT `value` FROM cpu `` has never
+run. Arc's own checks on query text, however, read backticks as quotes, so
+Arc and DuckDB could disagree about what a query said. One result was the
+reported query, which answered `success: true` with no columns instead of an
+error.
+
+A backtick outside a string literal, a `"…"` identifier or a comment is now
+refused with `400` and `backticks are not identifier quotes in DuckDB; quote
+identifiers with double quotes ("name")`. This applies to every query
+endpoint, continuous queries, the `where` parameter of
+`/api/v1/query/:measurement`, and `DELETE` predicates. Arc's checks now read
+the query exactly as DuckDB will. `` SHOW TABLES FROM `mydb` `` still works,
+because Arc answers it itself. A backtick inside a literal or a quoted
+identifier is unaffected.
+
+Two related fixes:
+- **Stream takeover `DELETE` with a backtick in a string literal.** With
+  stream takeover on, a `DELETE` whose predicate had both a backtick in a
+  string literal and a time function such as `now()` (`WHERE msg = 'a`b' AND
+  time < now()`) ran with the backtick turned into a double quote, so it
+  matched the wrong rows. It now runs as written.
+- **Stored `DELETE` records.** A record applied to a pending file is checked
+  again before it runs. A record the current checks refuse is skipped, so
+  the rows that `DELETE` removed elsewhere remain in that file. The error in
+  the log names the file and the predicate; issue the `DELETE` again with a
+  predicate the current checks accept.
+
+## Fix: continuous queries rewrite only the source reference itself ([#1487](https://github.com/Basekick-Labs/arc/issues/1487))
+
+Before a continuous query runs, Arc replaces its `FROM <database>.<measurement>`
+with a read of the measurement's files. It found that text anywhere in the
+query, including inside a string literal, a quoted identifier or a comment,
+and rewrote those occurrences too. In a `'…'` literal that made the query fail
+to parse. In a dollar-quoted string (`$$…$$`) or a quoted identifier, the query
+ran, and the storage path ended up inside the string value or the output
+column's name. Arc now rewrites only a real table reference and leaves
+everything else exactly as written.
+
+Related fixes:
+- A comment between `FROM` and the name (`FROM /* c */ db.cpu`,
+  `FROM -- c` then a newline and `db.cpu`) no longer stops the rewrite. Such
+  queries used to fail with `Table with name "db.cpu" does not exist`.
+- A query with a CTE named after its source measurement now runs, e.g.
+  `WITH cpu AS (SELECT … FROM db.cpu …) SELECT … FROM cpu`. Before, Arc
+  skipped the rewrite for it, and the query failed with `Table db.cpu does not
+  exist`.
+
+## Fix: SQL checks read three more string spellings as DuckDB does
+
+Arc masks string literals before its read-only checks run, so anything the
+masker counts as a literal is invisible to them. Three spellings were masked
+differently from how DuckDB reads them, which could leave part of a statement
+outside a literal for the checks while DuckDB kept it inside one, or the
+reverse:
+- **A dollar-quoted tag with a non-ASCII letter** (`$é$…$é$`) now opens a
+  string. DuckDB accepts these tags, as Postgres does.
+- **`e'…'` after a name that contains `$`.** In `a$e'…'` the `e` belongs to
+  the name, so the quote opens a plain string, not an escape string.
+- **An escape string continued across a newline** (`E'a'` newline `'b'`, which
+  DuckDB joins into one string) is now read as one string, so a backslash in
+  the continued part still escapes and the string ends where DuckDB ends it.
+
+This covers every query endpoint, continuous queries and `DELETE` predicates,
+and the masking of SQL in logs. A query that does not use these spellings is
+unaffected.
 
 ## Upgrade note: three configurations now refuse to start
 
@@ -2751,7 +3222,7 @@ a column that could not be converted. The client got the refusal, usually a
 purge, or for a shutdown refusal the next start, replayed it, so the rows were
 stored twice.
 
-- **`wal.ack_mode = "queued"` (the default):** the WAL entry is now built
+- **`wal.ack_mode = "queued"`** (the default until [#1499](https://github.com/Basekick-Labs/arc/issues/1499) made `"auto"`, durable with the WAL on, the default): the WAL entry is now built
   before the shard lock, as before, but only queued for the WAL file after
   those checks pass, under the same lock that puts the batch in the buffer.
   WAL coverage already worked this way. A refused write leaves nothing in the
@@ -3967,8 +4438,9 @@ settings, these queries returned too few rows, with `success: true`:
 
 A range is now read only from the query's single WHERE clause, and only from
 its top-level `AND` terms that are exactly a comparison of `time` with a
-literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
-`BETWEEN`. Other terms are ignored, which only widens the range. A top-level
+literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, with
+an epoch call of one number (since
+[#1491](https://github.com/Basekick-Labs/arc/issues/1491)), or a `BETWEEN`. Other terms are ignored, which only widens the range. A top-level
 `OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
 the whole measurement, correctly but without pruning.
 
@@ -3980,6 +4452,8 @@ subquery, or a FROM or JOIN, inside a FILTER still means no range.
 Accepted spellings:
 - the column as `time`, `"time"`, `alias.time` or Grafana's `(time)`;
 - the literal as `'…'`, `'…'::timestamp` or `TIMESTAMP '…'`;
+- (since [#1491](https://github.com/Basekick-Labs/arc/issues/1491)) `epoch_ms(n)`,
+  `make_timestamp(n)` or `to_timestamp(x)` of one numeric literal;
 - the reversed form `'…' <= time`;
 - one trailing `;`.
 
@@ -7901,6 +8375,25 @@ These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
+
+### The buffer refuses a database or measurement name containing "/" ([#1475](https://github.com/Basekick-Labs/arc/issues/1475))
+
+Buffer, coverage and tier-cache keys are `database + "/" + measurement`, and
+storage paths are built the same way. Ingest and cluster code split buffer
+keys at the first `/`, which needs a database name with no `/`; exact lookups
+and storage paths need a measurement name with no `/`. Every ingest entry
+point already guarantees both by validating names, but entry points have
+missed the database check before (#300, #993, #1010). The buffer now refuses
+either name itself, before any WAL work, as a content refusal, so a future
+entry point that skipped validation cannot make two series share a key. No
+supported write path can reach it: edge-sync spoke namespaces, whose database
+names do contain `/`, reach storage as files and never pass through the
+buffer.
+
+A test now also pins how the Iceberg exporter reads a metadata file's version
+(`00004-<uuid>.metadata.json` and `v4.metadata.json` are both version `4`): it
+is the integer `version-hint.text` holds, so the leading zeros are dropped on
+purpose. Both are the hardening #750 handed to #1475.
 
 ### Hourly compaction file-count guidance (#793)
 
