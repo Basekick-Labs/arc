@@ -444,7 +444,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	// A column qualified by the measurement's name means that column (#1451).
-	// Rewritten before validation, so what is validated is what runs.
+	// Rewritten before validation, so what is validated is what runs. Keep
+	// this order: the rewrite masks and restores caller text, and
+	// validateWhereClause (including its placeholder check) must see its
+	// output, which is also what pinDeleteTime later re-masks.
 	req.Where = unqualifyMeasurement(req.Where, req.Measurement)
 
 	// Validate WHERE clause

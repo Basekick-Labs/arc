@@ -82,7 +82,8 @@ for generated placeholders, for example the `FROM` inside
 checks have run. Text a caller wrote that matched a placeholder was restored
 too, so the statement that ran could differ from the one that was checked.
 - **Queries** are refused with a 400 when `__STR_`, `__IDENT_` or
-  `__FROM_MASK_` appears outside a string literal or quoted identifier. The
+  `__FROM_MASK_` appears outside a string literal or quoted identifier,
+  comments included. The
   rule also catches text that only forms once a literal is masked. Inside a
   literal or quoted name these sequences remain ordinary data. The check
   runs on every query endpoint, including continuous queries, and the FROM
