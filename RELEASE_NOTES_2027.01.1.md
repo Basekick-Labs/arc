@@ -104,9 +104,13 @@ checkpoints in full, which is today's duplicate window, not a loss. The gauge
 `arc_wal_partial_row_recovery_pending` reports only ranges left by a recovery
 pass, not those a live flush leaves.
 
-Not yet on a writer with WAL coverage enabled (`cluster.wal_coverage`,
-[#1207](https://github.com/Basekick-Labs/arc/issues/1207)): it keeps the
-single checkpoint after the last file. A follow-up issue covers it.
+On a writer with WAL coverage (`cluster.wal_coverage`,
+[#1207](https://github.com/Basekick-Labs/arc/issues/1207),
+[#1498](https://github.com/Basekick-Labs/arc/issues/1498)) each hour file
+registers with the group's coverage for that file as before, only as soon as
+it is stored, and the registered floor of a flush that fails part-way
+advances for the stored rows once those files' registrations settle, never
+earlier.
 
 ## Fix: a time bound written with `epoch_ms()`, `make_timestamp()` or `to_timestamp()` prunes ([#1491](https://github.com/Basekick-Labs/arc/issues/1491))
 

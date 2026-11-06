@@ -2251,8 +2251,8 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 	// Announce to cluster-wide file manifest (peer replication). Called on
 	// the flush path: the registrar must not block on the network. The outbox
 	// only appends here; syncRegistrations makes it durable, once per flush in
-	// completeFlush and, for a multi-hour flush without coverage, once per
-	// hour file before that file's row checkpoint (#1492).
+	// completeFlush and, for a multi-hour flush, once per hour file before
+	// that file's row checkpoint (#1492, #1498).
 	if ref := b.fileRegistrar.Load(); ref != nil && ref.FileRegistrar != nil {
 		if cr, ok := ref.FileRegistrar.(CoverageFileRegistrar); ok && cov != nil {
 			cr.RegisterCoveredFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex, cov)
@@ -4945,9 +4945,9 @@ type FileRegistrationSyncer interface {
 // completeFlush runs once a flush's files are written and registered. The
 // registrations are made durable before the WAL checkpoint, so the WAL cannot
 // drop rows whose file the cluster has no durable record of (#1209). One
-// sync here per flush, and none without a WAL; a multi-hour flush on a writer
-// without coverage also synced once per hour file, before that file's row
-// checkpoint (#1492, flushPartitionedData).
+// sync here per flush, and none without a WAL; a multi-hour flush also synced
+// once per hour file, before that file's row checkpoint (#1492, #1498,
+// flushPartitionedData).
 //
 // A covered flush (#1207) checkpoints without releasing the purge floor: the
 // group releases its WAL entries once every file has settled in the outbox.
@@ -5219,30 +5219,36 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// checkpoint itself is dropped, replay writes them again: the at-least-
 	// once case this used to be for every multi-hour flush.)
 	//
-	// Not on a coverage-enabled writer (#1207): its flush group announces the
-	// files of a flush together and settles them together, and a flush that
-	// failed after registering some of its hours would leave the group open
-	// for the life of the process. Such a writer keeps the deferred
-	// registration and the single checkpoint; see the follow-up on #1492.
-	// The gate reads the writer's state now, not the group built at enqueue:
-	// after DisableCoverage (an abandoned outbox at startup) a queued covered
-	// flush takes this path, registers with no coverage, and its group
-	// finishes with zero files, releasing its entries as before.
+	// On a coverage-enabled writer (#1207, #1498) each hour file registers
+	// with the group's coverage for that file, as the deferred loop did, so
+	// the manifest sees what it saw before, only sooner. The group announces
+	// its files at the first stored hour and finishes as before when every
+	// file has settled and the checkpoint is written. A flush that fails
+	// after storing some hours tells the group (storedPartially): it settles
+	// the tracker with the stored rows once those files' outcomes are in,
+	// and never releases its tokens, since the other hours are still only in
+	// the WAL; recovery releases the parent sequences once it has replayed
+	// them. The outbox hold on the group's batches ends with the first
+	// file's durable registration; from then on the unflushed hours are
+	// protected by the parent sequences alone, as on a writer without
+	// coverage.
 	spans := merged.walSpans
 	if spans != nil && spans.rows != len(times) {
 		spans = nil // a layout the merge did not produce: name nothing
 	}
-	perHour := b.coverage.Load() == nil && b.wal != nil && spans != nil
-	partial := func(err error, stored, files int, writtenAt []bool) error {
-		if files == 0 {
-			return err
-		}
-		return &flushPartialError{Err: err, StoredRows: stored, StoredFiles: files, LostWithoutWAL: spans.lostWithoutCopy(writtenAt)}
-	}
+	perHour := b.wal != nil && spans != nil
 	var storedRows, storedFiles int
 	var writtenAt []bool // positions of the merged batch now in a stored file
 	if perHour {
 		writtenAt = make([]bool, len(times))
+	}
+	var cov *GroupCoverage // announced at the first stored hour
+	partial := func(err error) error {
+		if storedFiles == 0 {
+			return err
+		}
+		group.storedPartially(group.storedPieces(spans, writtenAt), storedFiles)
+		return &flushPartialError{Err: err, StoredRows: storedRows, StoredFiles: storedFiles, LostWithoutWAL: spans.lostWithoutCopy(writtenAt)}
 	}
 
 	type tieringEntry struct {
@@ -5268,7 +5274,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Write Parquet file for this hour
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
 		if err != nil {
-			return partial(fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err), storedRows, storedFiles, writtenAt)
+			return partial(fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err))
 		}
 
 		// Use bucket's minTime for path generation (convert hourID to time only here)
@@ -5281,12 +5287,15 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return partial(fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err), storedRows, storedFiles, writtenAt)
+			return partial(fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err))
 		}
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
 		if perHour {
-			b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, nil)
+			if cov == nil {
+				cov = groupCoverage(group, len(hourBuckets)) // nil without coverage
+			}
+			b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, cov.forFile(group.piecesAt(bucket.indices)))
 			b.syncRegistrations()
 			ranges := spans.rangesIn(bucket.indices)
 			checkpointed := b.checkpointRows(ctx, ranges)
@@ -5330,7 +5339,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// All hours written successfully — now register in tiering and cluster manifest.
 	// (Already done per hour when perHour: written is then empty.)
 	totalWritten := storedRows
-	cov := groupCoverage(group, len(written))
+	if !perHour {
+		cov = groupCoverage(group, len(written))
+	}
 	for _, e := range written {
 		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
 		totalWritten += e.records

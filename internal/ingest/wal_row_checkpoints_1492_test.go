@@ -99,6 +99,12 @@ func (f *rowCheckpointFixture) closeWriter(t *testing.T) {
 }
 
 func newRowCheckpointFixture(t *testing.T, failAt int) *rowCheckpointFixture {
+	return newRowCheckpointFixtureCov(t, failAt, nil)
+}
+
+// newRowCheckpointFixtureCov enables coverage (#1207) with reg before the
+// writes, so the batches carry coverage and their flush has a group (#1498).
+func newRowCheckpointFixtureCov(t *testing.T, failAt int, reg *coverageRegistrar) *rowCheckpointFixture {
 	t.Helper()
 	tmp := t.TempDir()
 	writer, err := wal.NewWriter(&wal.WriterConfig{
@@ -111,6 +117,10 @@ func newRowCheckpointFixture(t *testing.T, failAt int) *rowCheckpointFixture {
 	b := newReplayTestBuffer(t, filepath.Join(tmp, "unused"))
 	b.storage = st
 	b.SetWAL(writer)
+	if reg != nil {
+		b.SetFileRegistrar(reg)
+		require.NoError(t, b.EnableCoverage())
+	}
 	f := &rowCheckpointFixture{writer: writer, storage: st, buffer: b, rows: map[string][]int64{}}
 	t.Cleanup(func() { f.closeWriter(t); _ = local.Close() })
 	base := timeMicros(2026, 10, 1, 10, 0)
@@ -260,20 +270,4 @@ func TestMultiHourFlushCheckpointsEveryHourThenTheParents(t *testing.T) {
 		}})
 	require.NoError(t, err)
 	require.Equal(t, 0, calls)
-}
-
-// The coverage-enabled writer (#1207) keeps today's behaviour: files are
-// registered after the last hour and no row range is checkpointed.
-func TestMultiHourFlushUnderCoverageWritesNoRowCheckpoints(t *testing.T) {
-	f := newRowCheckpointFixture(t, 0)
-	f.buffer.SetFileRegistrar(&coverageRegistrar{})
-	require.NoError(t, f.buffer.EnableCoverage())
-	// The three batches were written before coverage was on, so they carry
-	// no coverage and their flush has no group: the gate must still hold,
-	// because it is the writer's state, not the group, that decides.
-	require.NoError(t, f.buffer.FlushAll(context.Background()))
-	ranges, whole := f.coveredRows(t)
-	require.Empty(t, ranges)
-	require.Len(t, whole, 3)
-	require.Len(t, f.storage.storedHours(t), 4)
 }
