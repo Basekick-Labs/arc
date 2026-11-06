@@ -429,6 +429,14 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 			}
 			return
 		}
+		// A message whose points each bring a new key is refused before
+		// anything is built; logged per topic at the same rate.
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			if s.nameWarnDue("cells " + msg.Topic()) {
+				s.logger.Warn().Err(err).Str("topic", msg.Topic()).Int("payload_size", len(msg.Payload())).Msg("MQTT message refused")
+			}
+			return
+		}
 		s.logger.Error().
 			Err(err).
 			Str("topic", msg.Topic()).
