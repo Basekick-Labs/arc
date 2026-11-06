@@ -2969,20 +2969,25 @@ an unbounded operation.
 With query governance on, a refused query's `Retry-After` was wrong or missing:
 
 - **A rate limit** answered with the time left in the window's current slot, so
-  `Retry-After: 1` after a burst on a per-minute limit and at most `60` on a
-  per-hour limit, whatever the limit's real state. A client that honoured it
+  `Retry-After: 1` after a burst on a per-minute limit and about `60` at most on
+  a per-hour limit, whatever the limit's real state. A client that honoured it
   was refused again each time it came back, about 60 times per window, each a
   log warning and a count in the rate-limit metric. It now answers with the
   time until enough of the oldest requests have left the window to bring the
   count under the limit: about 60 seconds after a burst on a per-minute limit.
+  When the per-minute and per-hour limits are both exhausted, it answers with
+  the longer of the two waits.
 - **A quota** (`max_queries_per_hour`, `max_queries_per_day`) answered with no
   `Retry-After` at all. It now carries the seconds until the exhausted quota
   resets, or until the daily reset when both are exhausted. The rejection's log
   line gains the `retry_after_sec` field the rate-limit line already has.
 
 A quota now resets exactly on the hour or day boundary, not just after it, so a
-client that waits exactly `Retry-After` seconds is not refused. Which queries are
-allowed is otherwise unchanged. Clients that retry on `Retry-After` will retry
+client that waits exactly a quota's `Retry-After` is not refused by that quota.
+A refused query still counts against the rate limits checked before the one
+that refused it, so a client can meet another limit when it comes back; that
+refusal carries its own wait. `Retry-After` is always at least 1. Which
+queries are allowed is otherwise unchanged. Clients that retry on `Retry-After` will retry
 later than they did, and less often.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in

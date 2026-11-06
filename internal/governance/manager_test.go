@@ -368,3 +368,25 @@ func TestManager_PolicyPersistsAfterReload(t *testing.T) {
 	}
 	m2.Stop()
 }
+
+// With both rate limits exhausted, a refusal by the per-minute limit gives the
+// per-hour wait: waiting only out the minute would be refused again by the
+// hour.
+func TestManager_CheckRateLimit_BothLimitsExhausted(t *testing.T) {
+	m := setupTestManager(t, nil)
+	m.CreatePolicy(context.Background(), &Policy{TokenID: 1, RateLimitPerMinute: 2, RateLimitPerHour: 2})
+	for i := 0; i < 2; i++ {
+		if r := m.CheckRateLimit(1); !r.Allowed {
+			t.Fatalf("request %d refused", i+1)
+		}
+	}
+	r := m.CheckRateLimit(1)
+	if r.Allowed {
+		t.Fatal("third request allowed")
+	}
+	// The two requests sit in the current one-minute slot of the hour window,
+	// which clears 59-60 minutes from now.
+	if r.RetryAfterSec < 3500 || r.RetryAfterSec > 3600 {
+		t.Fatalf("RetryAfterSec = %d, want the hour limiter's wait (~3540-3600)", r.RetryAfterSec)
+	}
+}
