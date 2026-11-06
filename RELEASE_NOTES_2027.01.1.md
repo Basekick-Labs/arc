@@ -108,9 +108,10 @@ On a writer with WAL coverage (`cluster.wal_coverage`,
 [#1207](https://github.com/Basekick-Labs/arc/issues/1207),
 [#1498](https://github.com/Basekick-Labs/arc/issues/1498)) each hour file
 registers with the group's coverage for that file as before, only as soon as
-it is stored, and the registered floor of a flush that fails part-way
-advances for the stored rows once those files' registrations settle, never
-earlier.
+it is stored. For a flush that fails part-way, the registered-floor tracker
+counts the stored rows once those files' registrations settle, never earlier,
+and the floor advances once recovery's replay of the other rows completes each
+batch; the flush's WAL entries are kept until then.
 
 ## Fix: a time bound written with `epoch_ms()`, `make_timestamp()` or `to_timestamp()` prunes ([#1491](https://github.com/Basekick-Labs/arc/issues/1491))
 

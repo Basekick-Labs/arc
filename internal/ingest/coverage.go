@@ -451,9 +451,10 @@ type flushGroup struct {
 	// registering and checkpointing some of its hour files (#1498). stored
 	// is the coverage of the rows in those files; files was shrunk to their
 	// count. The group settles the tracker with stored once those files'
-	// outcomes are in, and never releases its tokens: the rows of the hours
-	// not written are still only in the WAL, and recovery releases the
-	// parent sequences once it has replayed them.
+	// outcomes are in, and never releases its tokens, not through maybeFinish
+	// and not through resolve: the rows of the hours not written are still
+	// only in the WAL, and recovery releases the parent sequences once it has
+	// replayed them.
 	partialFlush bool
 	stored       []CoveragePiece
 }
@@ -749,13 +750,17 @@ func (g *flushGroup) maybeSettleStoredLocked() {
 	}
 	g.finished = true
 	ok := !g.lost && !g.refused
+	refused := g.refused
 	pieces := g.stored
 	g.mu.Unlock()
 	if g.claimReplay() || len(pieces) == 0 {
 		return
 	}
 	if !ok {
-		g.b.logger.Warn().Str("buffer_key", g.key).Int("batches", len(pieces)).
+		if refused {
+			metrics.Get().IncWALCoverageRefused(int64(len(pieces)))
+		}
+		g.b.logger.Warn().Str("buffer_key", g.key).Int("batches", len(pieces)).Bool("refused", refused).
 			Msg("A partly stored flush's registered files settled lost or refused; their rows count as unregistered")
 	}
 	g.cs.tracker.settleKey(g.key, pieces, ok)
@@ -773,16 +778,14 @@ func (g *flushGroup) storedPieces(spans *walRowSpans, writtenAt []bool) []Covera
 	if g == nil || spans == nil {
 		return nil
 	}
+	byLo := make(map[int]*walRowSpan, len(spans.spans))
+	for i := range spans.spans {
+		byLo[spans.spans[i].lo] = &spans.spans[i]
+	}
 	var out []CoveragePiece
 	for _, cs := range g.spans {
-		var ws *walRowSpan
-		for i := range spans.spans {
-			if spans.spans[i].lo == cs.lo && spans.spans[i].hi == cs.hi {
-				ws = &spans.spans[i]
-				break
-			}
-		}
-		if ws == nil || ws.parent == "" {
+		ws := byLo[cs.lo]
+		if ws == nil || ws.hi != cs.hi || ws.parent == "" {
 			continue
 		}
 		n := cs.hi - cs.lo
@@ -843,9 +846,23 @@ func (g *flushGroup) failed() {
 	if g == nil {
 		return
 	}
+	// A piece a partial flush stored whole (#1498) is judged by its file's
+	// outcome, not here: its rows are in a registered file whatever the WAL
+	// holds. A partly stored one without a WAL copy is gone for good.
+	g.mu.Lock()
+	storedWhole := map[CoveragePiece]bool{}
+	for _, p := range g.stored {
+		if p.whole() || p.Chunks > 0 && p.RowTotal == 0 {
+			storedWhole[p] = true
+		}
+	}
+	g.mu.Unlock()
 	var gone []CoveragePiece
 	lostAfterEnqueue := false
 	for _, p := range g.pieces {
+		if storedWhole[p] {
+			continue
+		}
 		if !p.replayable {
 			gone = append(gone, p)
 		} else if p.Instance == g.cs.instance && g.cs.wal.CoverageLost(g.key, p.CSeq) {
@@ -1112,11 +1129,14 @@ func (b *ArrowBuffer) commitCoverageLocked(cs *coverageState, covered bool, prep
 // resolve records that a refused file's rows are all in registered files.
 // When the group finished refused and every refused file is resolved, its WAL
 // entries are released. The tracker already counted the batches lost: they
-// stay so (another writer published them).
+// stay so (another writer published them). Not for a partial flush (#1498):
+// its stored files account for their own hours only, and the hours it never
+// wrote are still in the WAL alone; recovery releases those entries once it
+// has replayed them.
 func (g *flushGroup) resolve(path string) {
 	g.mu.Lock()
 	delete(g.refusedOpen, path)
-	release := g.finished && g.refused && len(g.refusedOpen) == 0 && !g.released
+	release := g.finished && g.refused && !g.partialFlush && len(g.refusedOpen) == 0 && !g.released
 	if release {
 		g.released = true
 	}

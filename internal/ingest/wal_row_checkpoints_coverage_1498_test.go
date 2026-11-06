@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -147,8 +148,42 @@ func TestCoveredPartialFlushLostFileKeepsTheFloor(t *testing.T) {
 			require.Equal(t, uint64(0), kr.Floor)
 			require.ElementsMatch(t, []uint64{1, 2, 3}, kr.Lost)
 			require.Equal(t, 3, f.writer.PendingUnflushedCount(), "no token released")
+			// A refused file resolved (its rows found in other registered
+			// files) releases a complete group's entries; not a partial
+			// flush's, whose other hours are still only in the WAL.
+			files[0].cov.Settle(files[0].path, CoverageResolved)
+			require.Equal(t, 3, f.writer.PendingUnflushedCount(), "a resolved refusal must not release a partial flush's entries")
 		})
 	}
+}
+
+// failed() leaves a piece the partial flush stored whole to its file's
+// outcome, even without a WAL copy; a partly stored one without a copy is
+// lost. The group is finished once the stored files settled.
+func TestFailedLeavesStoredWholePiecesToTheirOutcome(t *testing.T) {
+	cs := &coverageState{instance: 9, tracker: newCoverageTracker(9)}
+	b := NewArrowBuffer(testCoverageIngestConfig(), &mockStorageBackend{}, zerolog.Nop())
+	defer b.Close()
+	whole := CoveragePiece{Instance: 9, CSeq: 1}  // no WAL copy, all rows stored
+	partly := CoveragePiece{Instance: 9, CSeq: 2} // no WAL copy, half stored
+	g := &flushGroup{b: b, cs: cs, key: fxKey, pieces: []CoveragePiece{whole, partly}, settled: map[string]struct{}{}}
+	g.coverage(2) // announced
+	g.storedPartially([]CoveragePiece{whole, {Instance: 9, CSeq: 2, RowLo: 0, RowHi: 2, RowTotal: 4}}, 1)
+	g.failed()
+	kr := cs.tracker.progress()[fxKey]
+	require.ElementsMatch(t, []uint64{2}, kr.Lost, "the partly stored piece without a copy is lost; the whole one waits for its file")
+	g.settle("f1", CoverageRegistered)
+	g.mu.Lock()
+	finished := g.finished
+	g.mu.Unlock()
+	require.True(t, finished)
+	kr = cs.tracker.progress()[fxKey]
+	require.Equal(t, uint64(1), kr.Floor, "the stored-whole piece settled on its outcome")
+	require.ElementsMatch(t, []uint64{2}, kr.Lost)
+}
+
+func testCoverageIngestConfig() *config.IngestConfig {
+	return &config.IngestConfig{MaxBufferSize: 1000, MaxBufferAgeMS: 600000, Compression: "snappy", ShardCount: 1, FlushWorkers: 1, FlushQueueSize: 4}
 }
 
 // storedPieces: whole pieces for a fully stored batch, one partial piece per

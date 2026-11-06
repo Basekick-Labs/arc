@@ -5228,10 +5228,12 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// the tracker with the stored rows once those files' outcomes are in,
 	// and never releases its tokens, since the other hours are still only in
 	// the WAL; recovery releases the parent sequences once it has replayed
-	// them. The outbox hold on the group's batches ends with the first
-	// file's durable registration; from then on the unflushed hours are
-	// protected by the parent sequences alone, as on a writer without
-	// coverage.
+	// them, and the group releases its tokens through no path (not even a
+	// refused file's resolution). The outbox hold on the group's batches
+	// (every stored file's record carries the whole group's ranges) ends
+	// when the last stored file leaves the outbox, registered or resolved;
+	// from then on the unflushed hours are protected by the parent sequences
+	// alone, as on a writer without coverage.
 	spans := merged.walSpans
 	if spans != nil && spans.rows != len(times) {
 		spans = nil // a layout the merge did not produce: name nothing
