@@ -536,7 +536,8 @@ func isArgItem(item string) bool {
 //
 //	SELECT <cols> FROM read_parquet([<paths>]) [WHERE <col> <op> <lit> AND ...]
 //
-// Every column (projection AND predicate) must be a bare identifier — they came
+// Every column (projection AND predicate) must be a bare identifier or a map
+// subscript `col['key']` (map-1; isColumnRef) — they came
 // from the tokenizer as identifiers, so injection-safe by construction, but we
 // guard defensively. String literals are single-quote escaped; numeric literals
 // are validated as integers. Declines (ok=false) on any non-bare column or
@@ -552,7 +553,7 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 		// re-serialized by matchProjFunc (`length(col)`, 2f-0). Re-validate both here
 		// (defense in depth vs a hand-built Decision) — a bare ident, or a proj-func
 		// item whose form re-parses cleanly.
-		if !isBareIdent(col) && !isProjFuncItem(col) {
+		if !isColumnRef(col) && !isProjFuncItem(col) {
 			return "", false
 		}
 		if i > 0 {
@@ -573,7 +574,7 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	} else if len(d.Preds) > 0 {
 		b.WriteString(" WHERE ")
 		for i, p := range d.Preds {
-			if !isBareIdent(p.col) {
+			if !isColumnRef(p.col) {
 				return "", false
 			}
 			if i > 0 {
