@@ -36,6 +36,12 @@ The severity is ours to set. A CVSS score in a report is ignored.
 
 ## Automated and bulk reports
 
+AI-assisted reports are welcome when a person has checked the finding, run the
+reproduction against a running build and stands behind every claim in it.
+Detected slop (invented code paths, made-up line numbers, reproductions that
+were never run, findings that restate this page) is closed and the account is
+blocked from this repository.
+
 Reports produced by a tool or a language model and filed without a person
 reproducing them against a running build are not accepted. That includes
 batches filed within minutes, reports from accounts created to file them, and
