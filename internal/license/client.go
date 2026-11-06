@@ -554,13 +554,35 @@ func (c *Client) StartPeriodicValidation(interval time.Duration) {
 		c.logger.Debug().Msg("offline license mode: periodic validation disabled")
 		return
 	}
+	if interval <= 0 {
+		panic("non-positive interval for periodic license validation")
+	}
 	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		defer func() { c.logger.Debug().Msg("Stopping periodic license validation") }()
+		baseRetry, maxRetry := 5*time.Second, time.Minute
+		if interval < baseRetry {
+			baseRetry = interval
+		}
+		if interval < maxRetry {
+			maxRetry = interval
+		}
+		retryDelay, nextDelay := baseRetry, interval
+		wasBlocked := c.AdmissionBlocked()
+		if wasBlocked {
+			nextDelay = retryDelay
+		}
+		timer := time.NewTimer(nextDelay)
+		defer timer.Stop()
 
 		for {
 			select {
-			case <-ticker.C:
+			case <-timer.C:
+				// If Stop raced a ready timer, do not begin another request.
+				select {
+				case <-c.stopCh:
+					return
+				default:
+				}
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				// ActivateOrVerify, not bare Verify: an activation reaped
 				// during a long outage (>72h without a liveness signal)
@@ -571,8 +593,24 @@ func (c *Client) StartPeriodicValidation(interval time.Duration) {
 					c.logger.Warn().Err(err).Msg("Periodic license validation failed")
 				}
 				cancel()
+				// Admission remains blocked across later transport failures. Use
+				// that durable in-process state rather than the last error class;
+				// only a fresh accepted response restores the normal cadence.
+				if c.AdmissionBlocked() {
+					if wasBlocked {
+						retryDelay *= 2
+						if retryDelay > maxRetry {
+							retryDelay = maxRetry
+						}
+					}
+					nextDelay = retryDelay
+					wasBlocked = true
+				} else {
+					retryDelay, nextDelay = baseRetry, interval
+					wasBlocked = false
+				}
+				timer.Reset(nextDelay)
 			case <-c.stopCh:
-				c.logger.Debug().Msg("Stopping periodic license validation")
 				return
 			}
 		}

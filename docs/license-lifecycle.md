@@ -40,6 +40,8 @@ for peers, or prove that grace has ended. Retained cache bytes cannot reopen a
 refused installation. A configured cluster can recover coordination while data
 and maintenance remain fenced. A fresh successful proof clears the refusal and
 uses the existing runtime-rebuild path before newly licensed components serve.
+Blocked installations retry after five seconds with exponential backoff capped
+at one minute; successful admission restores the ordinary verification interval.
 An absent grant or unavailable clock is nonterminal. A final OSS handoff needs
 a recognized terminal cause on every participant, such as the signed cutoff or
 an explicit key-wide rejection. Actual cutoffs still apply to the preserved
