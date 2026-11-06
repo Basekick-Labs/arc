@@ -142,7 +142,10 @@ func (c *Client) logPhase(lic *License, phase Phase, day int) {
 			Int("grace_day", day).Time("cutoff", s.Cutoff).
 			Msg("License expired: grace days 7-14, live ingestion is refused until the license is renewed; Enterprise features end at cutoff")
 	case PhaseExpired:
-		c.logger.Warn().Str("phase", phase.String()).Time("expires_at", lic.ExpiresAt).
-			Msg("License expired past its grace period: Enterprise features are disabled")
+		msg := "License expired past its grace period: Enterprise features are disabled"
+		if lic.IsTrial() {
+			msg = "Trial license expired (trials have no grace period): Enterprise features are disabled"
+		}
+		c.logger.Warn().Str("phase", phase.String()).Time("expires_at", lic.ExpiresAt).Msg(msg)
 	}
 }
