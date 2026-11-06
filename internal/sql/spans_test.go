@@ -30,6 +30,13 @@ func TestProtectedSpans(t *testing.T) {
 		{"SELECT 'unterminated", []string{"'unterminated"}},
 		{"SELECT $a$ unterminated", []string{"$a$ unterminated"}},
 		{"SELECT ts$a$ FROM t", nil}, // $ continues the identifier, no literal
+		// e'…' after a name containing $ is a plain string: the span starts at
+		// the quote, not the e (pins the scanSQLSpans prefix check, mask.go:803).
+		{"SELECT a$e'x' , 'b' FROM t", []string{"'x'", "'b'"}},
+		// non-ASCII dollar tag through the span scanner.
+		{"SELECT $é$a'b$é$, 'z' FROM t", []string{"$é$a'b$é$", "'z'"}},
+		// an E-string continued across a newline is one span.
+		{"SELECT E'a'\n'b' , 'z' FROM t", []string{"E'a'\n'b'", "'z'"}},
 	} {
 		got := ProtectedSpans(tt.sql)
 		var want []Span
@@ -93,7 +100,7 @@ func TestIsMaskerClean(t *testing.T) {
 // IsMaskerClean guard both depend on this agreement, #1488).
 func TestProtectedSpansPropertyVsMasker(t *testing.T) {
 	// An alphabet dense in the bytes that open/close literals and comments.
-	alphabet := []byte("ab _,()'\"$e-/*\n01")
+	alphabet := []byte("ab _,()'\"$e-/*\n\r\t\\01\xc3\xa9")
 	rng := newDet(1488)
 	for iter := 0; iter < 20000; iter++ {
 		n := rng.intn(24)

@@ -1003,6 +1003,25 @@ Related fixes:
   skipped the rewrite for it, and the query failed with `Table db.cpu does not
   exist`.
 
+## Fix: SQL checks read three more string spellings as DuckDB does
+
+Arc masks string literals before its read-only checks run, so anything the
+masker counts as a literal is invisible to them. Three spellings were masked
+differently from how DuckDB reads them, which could leave part of a statement
+outside a literal for the checks while DuckDB kept it inside one, or the
+reverse:
+- **A dollar-quoted tag with a non-ASCII letter** (`$é$…$é$`) now opens a
+  string. DuckDB accepts these tags, as Postgres does.
+- **`e'…'` after a name that contains `$`.** In `a$e'…'` the `e` belongs to
+  the name, so the quote opens a plain string, not an escape string.
+- **An escape string continued across a newline** (`E'a'` newline `'b'`, which
+  DuckDB joins into one string) is now read as one string, so a backslash in
+  the continued part still escapes and the string ends where DuckDB ends it.
+
+This covers every query endpoint, continuous queries and `DELETE` predicates,
+and the masking of SQL in logs. A query that does not use these spellings is
+unaffected.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
