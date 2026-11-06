@@ -851,6 +851,18 @@ peak memory for wide batches.
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@glyphanchor](https://github.com/glyphanchor)**.
 
+## Security: a cached RBAC decision can no longer apply to another database
+
+The RBAC permission cache stored the database and measurement names of a check
+without copying them. On a keep-alive connection the HTTP framework reuses the
+request buffer those names point into, so a cached allow could come to match a
+different name of the same length, and a token scoped by RBAC could read a
+database it was not granted. The cache now stores its own copy of each name.
+Deployments without RBAC roles were not affected.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@gablealder823](https://github.com/gablealder823)**.
+
 ## Security: more DuckDB functions are refused in user SQL
 
 Some functions of the DuckDB release Arc links were not covered by the checks
