@@ -669,6 +669,23 @@ through a table qualifier (`c.show = 'a'`) is no longer refused.
 
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
+## Security: a malformed Parquet footer no longer stops Iceberg export
+
+Some malformed Parquet footers make the library Arc reads them with panic
+instead of returning an error. With Iceberg export on, the export pass reads
+the footer of every file it publishes, including files EdgeSync spokes send,
+so one such file stopped the process, and again on every restart while the
+file stayed in storage. The footer reads now return the panic as an error:
+the measurement holding the file fails its export pass, is logged with the
+file's name, and stays blocked until the file is removed, while every other
+measurement is exported. A panic elsewhere on the export goroutine is
+contained to its measurement the same way and logged with its stack. Footers
+over 16 MiB are refused before they are read (Arc's own are a few KiB). A
+Parquet import whose footer panics is answered `422` instead of `500`, and a
+schema anchor whose footer panics is treated as undecodable.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@glacieraxiom](https://github.com/glacieraxiom)**.
 
 ## Security: more DuckDB functions are refused in user SQL
 
