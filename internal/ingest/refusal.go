@@ -1,12 +1,13 @@
 package ingest
 
 import (
+	"context"
 	"errors"
-	"github.com/basekick-labs/arc/internal/metrics"
 	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/logger"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -99,8 +100,13 @@ var ErrWALNotDurable error = &WriteRefusal{
 
 // walNotDurable wraps a WAL ErrNotDurable as a not-durable refusal, keeping
 // the cause in the text.
-func walNotDurable(err error) error {
-	metrics.Get().IncWALNotDurableRejections()
+// walNotDurable is the refusal of a write whose WAL entry could not be made
+// durable, counted once per write: a retry of the same message under
+// WithRefusalCounted (MQTT) is not counted again, as for the other refusals.
+func walNotDurable(ctx context.Context, err error) error {
+	if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
+		metrics.Get().IncWALNotDurableRejections()
+	}
 	return &WriteRefusal{
 		Reason: RefusalWALNotDurable,
 		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",

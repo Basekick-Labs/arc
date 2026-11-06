@@ -43,9 +43,10 @@ func TestLoad_WALAckModeDefaultIsQueuedWithTheWALOff(t *testing.T) {
 }
 
 // Durable is not supported with the covered append, so auto resolves to
-// queued there, says so, and the node starts.
+// queued where coverage is in effect, says so, and the node starts.
 func TestLoad_WALAckModeDefaultIsQueuedWithCoverageAndWarns(t *testing.T) {
 	t.Setenv("ARC_WAL_ENABLED", "true")
+	t.Setenv("ARC_CLUSTER_ENABLED", "true")
 	t.Setenv("ARC_CLUSTER_WAL_COVERAGE", "true")
 	t.Chdir(t.TempDir())
 	cfg, err := Load()
@@ -61,6 +62,33 @@ func TestLoad_WALAckModeDefaultIsQueuedWithCoverageAndWarns(t *testing.T) {
 		}
 	}
 	t.Fatalf("no wal.ack_mode warning naming cluster.wal_coverage: %+v", cfg.Warnings)
+}
+
+// The key alone does not make coverage: a standalone node ignores it
+// (enableWALCoverage), so auto stays durable there, and durable is accepted.
+func TestLoad_WALAckModeCoverageKeyOnAStandaloneNodeKeepsDurable(t *testing.T) {
+	for _, mode := range []string{"", "durable"} {
+		t.Run("ack_mode="+mode, func(t *testing.T) {
+			t.Setenv("ARC_WAL_ENABLED", "true")
+			t.Setenv("ARC_CLUSTER_WAL_COVERAGE", "true")
+			if mode != "" {
+				t.Setenv("ARC_WAL_ACK_MODE", mode)
+			}
+			t.Chdir(t.TempDir())
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.WAL.AckMode != "durable" {
+				t.Errorf("WAL.AckMode = %q, want durable", cfg.WAL.AckMode)
+			}
+			for _, w := range cfg.Warnings {
+				if w.Key == "wal.ack_mode" {
+					t.Errorf("unexpected wal.ack_mode warning: %+v", w)
+				}
+			}
+		})
+	}
 }
 
 func TestLoad_WALAckModeExplicitAuto(t *testing.T) {
@@ -115,6 +143,7 @@ func TestLoad_WALAckModeRejectsUnknown(t *testing.T) {
 func TestLoad_WALAckModeDurableRefusesCoverage(t *testing.T) {
 	t.Setenv("ARC_WAL_ENABLED", "true")
 	t.Setenv("ARC_WAL_ACK_MODE", "durable")
+	t.Setenv("ARC_CLUSTER_ENABLED", "true")
 	t.Setenv("ARC_CLUSTER_WAL_COVERAGE", "true")
 	t.Chdir(t.TempDir())
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "cluster.wal_coverage") {

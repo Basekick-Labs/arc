@@ -14,11 +14,13 @@ runs that way. Nothing in `arc.toml` or the docs' defaults said that "WAL on"
 did not mean "acknowledged means durable"; now it does.
 
 `"auto"` resolves to `"queued"` where durable is not available: with the WAL
-off (the key has no effect) and with `cluster.wal_coverage = true`
-(experimental, [#1207](https://github.com/Basekick-Labs/arc/issues/1207)), whose
-covered append commits under the ingest shard lock, where a durable wait would
-stall every writer to the measurement. That resolution is logged as a config
-warning and in the `WAL enabled` startup line (`ack_mode`, `ack_mode_auto`).
+off (the key has no effect) and where `cluster.wal_coverage = true` is in
+effect, on a clustered local-storage writer (experimental,
+[#1207](https://github.com/Basekick-Labs/arc/issues/1207)), whose covered append
+commits under the ingest shard lock, where a durable wait would stall every
+writer to the measurement. A standalone node with the key set ignores it and
+stays durable. The coverage case is logged as a config warning; the resolved
+mode is in the `WAL enabled` startup line (`ack_mode`, `ack_mode_auto`).
 Setting `wal.ack_mode = "queued"` restores the old behaviour; `"durable"`
 with `cluster.wal_coverage` is still refused at startup.
 
@@ -56,8 +58,10 @@ What changes with the WAL on:
   crash. Set `wal.ack_mode = "queued"` for an MQTT deployment where a stalled
   WAL disk must never cost a message, until a not-durable suspend reason
   exists for MQTT (follow-up).
-- **The shipped examples** (`deploy/docker-compose/*`, `deploy/kubernetes*`)
-  enable the WAL and so take the new default.
+- **The shipped examples that enable the WAL** (`deploy/docker-compose/`
+  `oss-local`, `oss-s3`, `oss-traefik` and `enterprise-shared`, and
+  `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
+  WAL off.
 
 ## Fix: a crash during a multi-hour flush no longer replays the hours already stored ([#1492](https://github.com/Basekick-Labs/arc/issues/1492))
 
@@ -3042,7 +3046,7 @@ a column that could not be converted. The client got the refusal, usually a
 purge, or for a shutdown refusal the next start, replayed it, so the rows were
 stored twice.
 
-- **`wal.ack_mode = "queued"`** (the default until [#1499](https://github.com/Basekick-Labs/arc/issues/1499) made `"auto"`, durable with the WAL on, the default)**:** the WAL entry is now built
+- **`wal.ack_mode = "queued"`** (the default until [#1499](https://github.com/Basekick-Labs/arc/issues/1499) made `"auto"`, durable with the WAL on, the default): the WAL entry is now built
   before the shard lock, as before, but only queued for the WAL file after
   those checks pass, under the same lock that puts the batch in the buffer.
   WAL coverage already worked this way. A refused write leaves nothing in the

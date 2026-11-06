@@ -3204,8 +3204,8 @@ func (b *ArrowBuffer) SetWALDiskGate(g WALDiskGate) {
 type walDiskAdmittedKey struct{}
 
 // refusalCountedKey marks a context whose refusal is already counted in
-// arc_wal_disk_pressure_rejections_total or
-// arc_ingest_buffer_full_rejections_total: a retry of the same write (MQTT)
+// arc_wal_disk_pressure_rejections_total, arc_wal_not_durable_rejections_total
+// or arc_ingest_buffer_full_rejections_total: a retry of the same write (MQTT)
 // must not count again.
 type refusalCountedKey struct{}
 
@@ -3540,7 +3540,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 				// reached the WAL), so this write is refused (retryable) before
 				// it is buffered.
 				if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
-					return walNotDurable(err)
+					return walNotDurable(ctx, err)
 				}
 				// Don't fail the write — WAL is for durability, not
 				// correctness. recordWALError differentiates backpressure
@@ -3573,7 +3573,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 					// reached the WAL), so this write is refused (retryable) before
 					// it is buffered.
 					if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
-						return walNotDurable(err)
+						return walNotDurable(ctx, err)
 					}
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
@@ -3849,7 +3849,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 				// reached the WAL), so this write is refused (retryable) before
 				// it is buffered.
 				if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
-					return walNotDurable(err)
+					return walNotDurable(ctx, err)
 				}
 				b.recordWALError(err, func(ev *zerolog.Event) {
 					ev.Str("database", database).
@@ -3877,7 +3877,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 					// reached the WAL), so this write is refused (retryable) before
 					// it is buffered.
 					if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
-						return walNotDurable(err)
+						return walNotDurable(ctx, err)
 					}
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).

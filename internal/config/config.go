@@ -1508,17 +1508,21 @@ func Load() (*Config, error) {
 	// durable with the WAL on; queued with the WAL off (the key has no
 	// effect) or with cluster.wal_coverage set, which durable does not
 	// support (below). The explicit values keep their checks.
+	// Coverage takes effect only on a clustered, local-storage writer with
+	// the WAL on (enableWALCoverage in cmd/arc); the key alone is ignored,
+	// with a warning, everywhere else.
+	coverageInEffect := cfg.WAL.Enabled && cfg.Cluster.Enabled && cfg.Cluster.WALCoverage && !cfg.Cluster.SharedStorageMode
 	if cfg.WAL.AckMode == "auto" {
 		cfg.WAL.AckModeAuto = true
 		switch {
 		case !cfg.WAL.Enabled:
 			cfg.WAL.AckMode = "queued"
-		case cfg.Cluster.WALCoverage:
+		case coverageInEffect:
 			cfg.WAL.AckMode = "queued"
 			cfg.Warnings = append(cfg.Warnings, LoadWarning{
 				Key:     "wal.ack_mode",
 				Value:   "auto",
-				Message: "wal.ack_mode = \"auto\" resolves to \"queued\" because cluster.wal_coverage is set: writes are acknowledged before their WAL entry is synced, and a crash can lose entries still queued or unsynced",
+				Message: "wal.ack_mode = \"auto\" resolves to \"queued\" because cluster.wal_coverage is in effect on this writer: writes are acknowledged before their WAL entry is synced, and a crash can lose entries still queued or unsynced",
 			})
 		default:
 			cfg.WAL.AckMode = "durable"
@@ -1534,8 +1538,8 @@ func Load() (*Config, error) {
 			Message: "wal.ack_mode = \"durable\" has no effect while wal.enabled = false: writes are acknowledged without a WAL",
 		})
 	}
-	if cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" && cfg.Cluster.WALCoverage {
-		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true")
+	if cfg.WAL.AckMode == "durable" && coverageInEffect {
+		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true on a clustered writer")
 	}
 	if cfg.WAL.DiskMinFreeMB < 0 {
 		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
