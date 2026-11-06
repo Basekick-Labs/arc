@@ -177,10 +177,11 @@ projection and WHERE (arcX #72), the shape OpenTelemetry logs need for
 `ResourceAttributes`, `ScopeAttributes` and `LogAttributes`. Arc's eligibility
 recognizer previously declined any query containing `[`, so none of those
 queries could reach the engine. It now recognizes the subscript exactly where
-the engine serves it: as a select item and as the head of a WHERE atom (`=`,
+the engine serves it: as a select item, as the head of a WHERE atom (`=`,
 `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN`,
-`BETWEEN`) in single-table scans and ungrouped aggregates. Subscripts in ORDER
-BY, as aggregate arguments, in grouped aggregates, in arithmetic or inside a
+`BETWEEN`) in single-table scans and ungrouped aggregates, and as the argument
+of `count(...)` in an ungrouped aggregate (arcX #73). Subscripts in ORDER BY,
+under any other aggregate, in grouped aggregates, in arithmetic or inside a
 projection function stay on DuckDB, as do keys containing `'` or `\`.
 
 Nothing changes for a deployment without the engine linked in (`arcx_engine`

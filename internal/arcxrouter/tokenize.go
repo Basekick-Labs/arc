@@ -675,7 +675,8 @@ func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 //
 //	select <agg> [, <agg>]* from <measurement> [where <pred tree>]
 //
-// where <agg> is `count(*)` or `{count|sum|min|max|avg}(<bare column>)`. Each item
+// where <agg> is `count(*)`, `{count|sum|min|max|avg}(<bare column>)` or, for count
+// only, `count(<col>['<key>'])` (map-2). Each item
 // is re-serialized from its VALIDATED tokens as `fn(colAsWritten)` — the function
 // name lowercased (both engines lowercase it in the derived output name anyway),
 // the argument's typed spelling preserved (DuckDB and arcx both echo it verbatim
@@ -717,12 +718,19 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 				if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" {
 					return fail()
 				}
+				// A map subscript argument (map-2) serves for `count` only: the engine
+				// counts a derived Utf8 column but declines min/max/sum/avg over Utf8
+				// (agg-1 matrix), so only `count(m['k'])` is routed.
+				argRef, ok := readColumnRef(c, arg)
+				if !ok || (argRef != arg.orig && f.lower != "count") {
+					return fail()
+				}
 				// The immediately-following `)` requirement declines expressions
 				// (`sum(a*b)`) and DISTINCT — mirroring the engine's matcher.
 				if !c.punct(')') {
 					return fail()
 				}
-				items = append(items, f.lower+"("+arg.orig+")")
+				items = append(items, f.lower+"("+argRef+")")
 			}
 		case "arg_max", "arg_min", "max_by", "min_by":
 			// agg-4 two-arg by-time aggregates: `fn(payload, orderkey)` — both

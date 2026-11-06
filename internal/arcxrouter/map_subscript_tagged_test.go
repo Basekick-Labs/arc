@@ -61,3 +61,27 @@ func TestCensusClassify_BracketQueryIsNotUnlexable(t *testing.T) {
 		t.Fatalf("slice syntax should stay unlexable, got %q", reason)
 	}
 }
+
+func TestBuildScanAggSQL_Subscript(t *testing.T) {
+	m, ok := eligibleShape("SELECT count(*), count(LogAttributes['userId']) FROM otel_logs WHERE ResourceAttributes['service.name'] = 'payment'")
+	if !ok || m.shape != ShapeScanAgg {
+		t.Fatalf("eligibleShape: ok=%v shape=%q", ok, m.shape)
+	}
+	d := Decision{Eligible: true, Shape: m.shape, AggItems: m.aggItems, WhereText: m.whereText}
+	sql, ok := buildScanAggSQL(d, "['/data/a.parquet']")
+	if !ok {
+		t.Fatal("buildScanAggSQL must accept count over a subscript")
+	}
+	want := "SELECT count(*), count(LogAttributes['userId']) FROM read_parquet(['/data/a.parquet']) WHERE ResourceAttributes['service.name'] = 'payment'"
+	if sql != want {
+		t.Fatalf("sql =\n%s\nwant\n%s", sql, want)
+	}
+	for _, bad := range []string{"min(m['k'])", "count(m['k']) FROM evil", "count(m['k''])", "count(a.b['k'])"} {
+		if isAggItem(bad) {
+			t.Fatalf("isAggItem must refuse %q", bad)
+		}
+	}
+	if !isAggItem("count(m['k'])") || !isAggItem("count(host)") {
+		t.Fatal("isAggItem must accept count over a bare column or a subscript")
+	}
+}

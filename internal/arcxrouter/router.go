@@ -492,9 +492,11 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	return b.String(), true
 }
 
-// isAggItem re-validates one re-serialized aggregate item: `count(*)`, or
-// `{count|sum|min|max|avg}(<bare ident>)` with the fn lowercased — exactly what
-// matchScanAgg emits.
+// isAggItem re-validates one re-serialized aggregate item: `count(*)`,
+// `{count|sum|min|max|avg}(<bare ident>)` or `count(<ident>['<key>'])` (map-2) with
+// the fn lowercased — exactly what matchScanAgg emits. The grouped matcher never
+// emits the subscript form (its agg arm requires `)` right after the ident), so
+// the gate for grouped map aggregates is that matcher, not this re-check.
 func isAggItem(item string) bool {
 	if item == "count(*)" {
 		return true
@@ -505,7 +507,10 @@ func isAggItem(item string) bool {
 	}
 	inner := item[open+1 : len(item)-1]
 	switch item[:open] {
-	case "count", "sum", "min", "max", "avg":
+	// `count` also takes a map subscript `m['k']` (map-2); the other four stay bare.
+	case "count":
+		return isColumnRef(inner)
+	case "sum", "min", "max", "avg":
 		return isBareIdent(inner)
 	// agg-4: the two-arg by-time aggregates — EXACTLY two bare idents,
 	// re-serialized as `fn(a, b)`. The 3-arg top-N form, arg_max_null, and

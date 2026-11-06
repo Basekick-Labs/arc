@@ -139,11 +139,31 @@ func TestMatchScanAgg_Subscript(t *testing.T) {
 	if whereText != "ResourceAttributes['k8s.namespace.name'] = 'kube-system'" {
 		t.Fatalf("whereText = %q", whereText)
 	}
-	// Declined: subscript as an aggregate argument (engine review B3).
+	// Served (map-2): `count(m['k'])`, alone, with others, with a derived WHERE.
+	for _, tc := range []struct{ sql, items, where string }{
+		{"SELECT count(m['k']) FROM t WHERE host = 'h'", "count(m['k'])", "host = 'h'"},
+		{"SELECT count(*), count(m['k']) FROM t WHERE m['k'] IS NOT NULL", "count(*)|count(m['k'])", "m['k'] IS NOT NULL"},
+		{"SELECT count(LogAttributes['userId']) FROM otel_logs", "count(LogAttributes['userId'])", ""},
+	} {
+		toks, ok := tokenize(tc.sql)
+		if !ok {
+			t.Fatalf("tokenize: %s", tc.sql)
+		}
+		items, whereText, _, ok := matchScanAgg(toks)
+		if !ok || strings.Join(items, "|") != tc.items || whereText != tc.where {
+			t.Fatalf("matchScanAgg(%s): ok=%v items=%v where=%q", tc.sql, ok, items, whereText)
+		}
+	}
+	// Declined: a subscript under any other aggregate (the engine's agg-1 matrix
+	// declines Utf8 there), DISTINCT, and the two-arg by-time forms.
 	for _, sql := range []string{
-		"SELECT count(m['k']) FROM t",
 		"SELECT min(m['k']) FROM t WHERE host = 'h'",
+		"SELECT max(m['k']) FROM t",
+		"SELECT sum(m['k']) FROM t",
+		"SELECT avg(m['k']) FROM t",
+		"SELECT count(DISTINCT m['k']) FROM t",
 		"SELECT arg_max(m['k'], time) FROM t",
+		"SELECT arg_max(val, m['k']) FROM t",
 	} {
 		toks, ok := tokenize(sql)
 		if !ok {
@@ -157,6 +177,7 @@ func TestMatchScanAgg_Subscript(t *testing.T) {
 
 func TestMatchGroupedAgg_Subscript_Declines(t *testing.T) {
 	for _, sql := range []string{
+		"SELECT host, count(m['k']) FROM t GROUP BY host",
 		"SELECT host, count(*) FROM t WHERE m['k'] = 'x' GROUP BY host",
 		"SELECT m['k'], count(*) FROM t GROUP BY m['k']",
 		"SELECT m['k'], count(*) FROM t GROUP BY 1",
