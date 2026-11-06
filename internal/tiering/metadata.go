@@ -145,7 +145,7 @@ const tierFileColumns = "id, path, database, measurement, partition_time, tier, 
 // invalidateTierCache removes the cache entry for a database/measurement pair.
 // Call this after any operation that might change which tiers have data.
 func (s *MetadataStore) invalidateTierCache(database, measurement string) {
-	cacheKey := database + "/" + measurement
+	cacheKey := database + "/" + measurement // exact lookup; measurement names have no "/" (#1475)
 	s.tierCacheMu.Lock()
 	delete(s.tierCache, cacheKey)
 	s.tierCacheGen++
@@ -1483,7 +1483,7 @@ func (s *MetadataStore) GetTierStats(ctx context.Context) (map[Tier]TierStats, e
 // Returns a map of tier -> bool indicating presence of data in that tier.
 // Results are cached for 30 seconds to reduce SQLite query overhead during query execution.
 func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, measurement string) (map[Tier]bool, error) {
-	cacheKey := database + "/" + measurement
+	cacheKey := database + "/" + measurement // exact lookup; measurement names have no "/" (#1475)
 
 	// Check cache first (with separate lock to avoid blocking other operations).
 	s.tierCacheMu.RLock()

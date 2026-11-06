@@ -14,13 +14,14 @@ import (
 // A node that forwards a client's request to a peer (a write from a reader to
 // the writer, an import from a standby, a query from a compactor) used to copy
 // the client's credential onto the inter-node hop, so every peer it forwarded
-// to saw the raw token. The forwarding node has already verified that token;
-// it now strips the credential and asserts the caller's token ID instead,
+// to saw the raw token. The forwarding node verifies that token, then
+// strips the credential and asserts the caller's token ID instead,
 // signed with the cluster's shared secret. The receiving node checks the
 // assertion and authorizes the request as that token (its permissions and
 // RBAC grants, which Raft replicates to every node under the same ID).
 //
-// The MAC binds who forwarded it and to whom, the cluster, the token (ID
+// The MAC binds the claimed forwarder and the target node (claims any holder
+// of the shared secret can make; SECURITY.md, #1510), the cluster, the token (ID
 // and fingerprint), the method and request URI as sent, the database and
 // measurement headers, and the content headers that decide how the body is
 // decoded. The body itself (a query's SQL, a write's rows) is not bound: imports

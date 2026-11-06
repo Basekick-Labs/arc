@@ -696,6 +696,19 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 	}
 	opts.Mode = mode
 
+	// A config restore this node cannot write is refused before anything is
+	// restored (#1466): the config step runs after the data, so failing there
+	// would leave the data restored and the config not. Only when the backup
+	// holds a config, which is the condition the manager restores it under;
+	// an absent manifest fails in the manager as before.
+	if opts.RestoreConfig && manifest != nil && manifest.HasConfig {
+		if err := h.manager.ConfigRestoreBlocker(req.BackupID); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
+	}
+
 	acquired, err := h.acquireOperation(c, "restore")
 	if !acquired {
 		return err

@@ -441,14 +441,18 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// Warn when cluster TLS is enabled but no CA is configured
 	// (GHSA-wwfh-qrfq-6f8g defense-in-depth). Without a CA, client-cert
 	// verification is off (RequireAndVerifyClientCert is only set when
-	// tls_ca_file is non-empty), so TLS provides encryption but not peer
-	// identity — inter-node connections are not mutually authenticated at the
-	// TLS layer. Peer identity in that mode rests on the shared-secret HMAC
-	// (the Raft handshake and the coordinator channels). This is a warning, not
-	// a hard error: TLS-for-encryption + HMAC-for-identity is a supported
-	// posture, but operators should know mTLS is not in effect.
+	// tls_ca_file is non-empty), so inter-node connections are not mutually
+	// authenticated at the TLS layer; servers are still verified, against the
+	// system roots (see the next warning for the same condition).
+	// Cluster membership in that mode rests on the shared-secret HMAC (the
+	// Raft handshake and the coordinator channels). With a CA, mTLS proves a
+	// peer holds a certificate from the cluster CA, which is membership too:
+	// certificates are not bound to node IDs, so in either mode which node a
+	// message comes from is a claim (SECURITY.md, #1510). This is a warning,
+	// not a hard error: TLS for encryption plus HMAC for membership is a
+	// supported posture, but operators should know mTLS is not in effect.
 	if cfg.Config.TLSEnabled && cfg.Config.TLSCAFile == "" {
-		logger.Warn().Msg("Cluster TLS enabled without tls_ca_file — peer certificates are NOT verified (no mTLS); inter-node identity rests on the shared-secret HMAC. Set cluster.tls_ca_file to enable mutual TLS authentication.")
+		logger.Warn().Msg("Cluster TLS enabled without tls_ca_file — client certificates are NOT verified (no mTLS); cluster membership rests on the shared-secret HMAC. Set cluster.tls_ca_file to enable mutual TLS authentication.")
 	}
 
 	// Warn when the public Fiber listener serves HTTPS but cluster TLS
@@ -3246,11 +3250,13 @@ func (c *Coordinator) Status() map[string]interface{} {
 		totalCores := c.raftFSM.TotalCores()
 		status["total_cores"] = totalCores
 
-		if c.licenseClient != nil && c.licenseClient.GetLicense() != nil {
-			maxCores := c.licenseClient.GetLicense().MaxCores
-			status["max_cores"] = maxCores
-			if maxCores > 0 {
-				status["cores_remaining"] = maxCores - totalCores
+		if c.licenseClient != nil {
+			if lic := c.licenseClient.GetLicense(); lic != nil {
+				maxCores := lic.MaxCores
+				status["max_cores"] = maxCores
+				if maxCores > 0 {
+					status["cores_remaining"] = maxCores - totalCores
+				}
 			}
 		}
 	}

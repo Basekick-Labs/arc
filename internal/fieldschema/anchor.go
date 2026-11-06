@@ -99,9 +99,20 @@ func DecodeAnchor(data []byte) (*arrow.Schema, error) {
 	return s, err
 }
 
+// openAnchorFooter opens an anchor's footer; a test seam.
+var openAnchorFooter = file.NewParquetReader
+
 // DecodeAnchorComplete is DecodeAnchor also returning the completeness flag.
-func DecodeAnchorComplete(data []byte) (*arrow.Schema, bool, error) {
-	pf, err := file.NewParquetReader(bytes.NewReader(data))
+//
+// A malformed footer can panic inside the Parquet library; it is returned as
+// an error, which callers treat as an undecodable anchor.
+func DecodeAnchorComplete(data []byte) (sc *arrow.Schema, complete bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			sc, complete, err = nil, false, fmt.Errorf("fieldschema: open anchor: panicked: %v", r)
+		}
+	}()
+	pf, err := openAnchorFooter(bytes.NewReader(data))
 	if err != nil {
 		return nil, false, fmt.Errorf("fieldschema: open anchor: %w", err)
 	}
@@ -114,7 +125,7 @@ func DecodeAnchorComplete(data []byte) (*arrow.Schema, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("fieldschema: decode anchor schema: %w", err)
 	}
-	complete := false
+	complete = false
 	if v, ok := s.Metadata().GetValue(completeKey); ok && v == "true" {
 		complete = true
 	}

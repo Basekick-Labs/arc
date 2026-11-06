@@ -89,6 +89,14 @@ var (
 	effectiveCoresFn = config.EffectiveCores
 )
 
+// applyLicenseCoreLimitsIfValid applies the license's core limits unless it is
+// already expired past its grace period, when the node runs as OSS.
+func applyLicenseCoreLimitsIfValid(lic *license.License, cfg *config.Config) {
+	if lic.IsValid() {
+		applyLicenseCoreLimits(lic, cfg)
+	}
+}
+
 // applyLicenseCoreLimits enforces lic.MaxCores on every execution surface —
 // Go runtime (GOMAXPROCS), DuckDB native threads (cfg.Database.ThreadCount is
 // the REAL DuckDB enforcement; GOMAXPROCS does not bound CGo threads), and
@@ -106,8 +114,8 @@ var (
 // escape, so a 4-core license would run 8 flush workers and whatever
 // database.thread_count the operator wrote.
 //
-// Enforcement is boot-time, matching the model used for mid-process license
-// expiry: nothing re-applies this after StartPeriodicValidation re-verifies.
+// Core-limit enforcement is boot-time: periodic validation does not reapply
+// these resource limits. Feature entitlement gates check expiry at read time.
 func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 	machineCores, effective := numCPUFn(), effectiveCoresFn()
 	// Non-positive MaxCores means unlimited.
@@ -288,6 +296,12 @@ func main() {
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers
 	var licenseClient *license.Client
+	// The license clock's high-water mark lives beside the auth DB in both
+	// license modes: setting the host clock back does not extend a license.
+	if ahead := license.InitClock(filepath.Dir(cfg.Auth.DBPath)); ahead > 5*time.Minute {
+		log.Warn().Dur("ahead", ahead).
+			Msg("The host clock reads earlier than the license clock's saved mark; the license is judged by the mark (delete license_clock.json beside the auth database if the mark itself is wrong)")
+	}
 	if cfg.License.FilePath != "" {
 		// Offline (air-gapped) license file: verified entirely from disk
 		// against the pinned public key — no license-server dependency, no
@@ -307,7 +321,7 @@ func main() {
 				Time("expires_at", lic.ExpiresAt).
 				Strs("features", lic.Features).
 				Msg("Enterprise license loaded from offline file")
-			applyLicenseCoreLimits(lic, cfg)
+			applyLicenseCoreLimitsIfValid(lic, cfg)
 		}
 	} else if cfg.License.Key != "" {
 		log.Info().
@@ -320,7 +334,7 @@ func main() {
 			LicenseKey: cfg.License.Key,
 			// Cache lives next to the auth DB (per-pod volume): boot survives a
 			// transient license-server outage on the last verified license,
-			// honored until ITS OWN expiry. Deliberately inside the Key != ""
+			// honored until its cutoff (signed expiry plus grace). Deliberately inside the Key != ""
 			// branch — removing the key must also stop cache consultation.
 			CacheDir: filepath.Dir(cfg.Auth.DBPath),
 			Logger:   logger.Get("license"),
@@ -344,21 +358,31 @@ func main() {
 					log.Warn().
 						Str("tier", string(lic.Tier)).
 						Time("expires_at", lic.ExpiresAt).
-						Msg("license server unreachable; running on the cached verified license until it expires or the server recovers (background re-verification continues)")
-				} else {
+						Msg("license server unreachable; running on the cached verified license until its grace cutoff or the server recovers (background re-verification continues)")
+				} else if lic.IsValid() {
+					h := licenseClient.HealthStatus()
 					log.Info().
 						Str("tier", string(lic.Tier)).
-						Str("status", lic.Status).
-						Int("days_remaining", lic.DaysRemaining).
+						Str("status", h.Status).
+						Int("days_remaining", h.DaysRemaining).
 						Int("max_cores", lic.MaxCores).
 						Time("expires_at", lic.ExpiresAt).
 						Strs("features", lic.Features).
 						Msg("Enterprise license verified successfully")
+				} else {
+					// v1 still verifies a paid license for a while past Arc's
+					// grace cutoff; Arc treats it as expired (grace.go). The
+					// client stays, so a renewal takes effect at the next
+					// periodic check without a restart.
+					log.Warn().
+						Str("tier", string(lic.Tier)).
+						Time("expires_at", lic.ExpiresAt).
+						Msg("License verified but expired past its grace period - enterprise features disabled until it is renewed")
 				}
 
 				// Apply core limits from license to config (shared with the
 				// offline-file path).
-				applyLicenseCoreLimits(lic, cfg)
+				applyLicenseCoreLimitsIfValid(lic, cfg)
 			}
 		}
 	} else {
@@ -1060,6 +1084,7 @@ func main() {
 			BufferSize:   cfg.WAL.BufferSize,
 			SyncBytes:    cfg.WAL.SyncBytes,
 			AckMode:      wal.AckMode(cfg.WAL.AckMode),
+			AckTimeout:   walAckTimeout(cfg.WAL.AckTimeoutSeconds),
 			Logger:       logger.Get("wal"),
 		})
 		if err != nil {
@@ -1079,6 +1104,9 @@ func main() {
 		walLog := log.Info().
 			Str("directory", cfg.WAL.Directory).
 			Str("sync_mode", cfg.WAL.SyncMode).
+			Str("ack_mode", cfg.WAL.AckMode).
+			Bool("ack_mode_auto", cfg.WAL.AckModeAuto).
+			Int("ack_timeout_seconds", cfg.WAL.AckTimeoutSeconds).
 			Int("max_size_mb", cfg.WAL.MaxSizeMB).
 			Int("max_age_seconds", cfg.WAL.MaxAgeSeconds).
 			Bool("disk_pressure_enabled", walDisk != nil)
@@ -1102,6 +1130,26 @@ func main() {
 		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
+	// Grace days 7-14 of an expired license refuse live ingestion (503,
+	// X-Arc-Ingest-Refused: license_grace); replay, CQ and compaction writes
+	// are never refused.
+	if licenseClient != nil {
+		arrowBuffer.SetLicenseWriteGate(licenseClient.WritesStopped)
+	}
+	// Writes are refused with a retryable 503 while the rows waiting to be
+	// flushed are at this limit (#1468): off by default, "auto" is half the
+	// memory limit.
+	if limit := arrowBuffer.MaxBufferedBytes(); limit > 0 {
+		log.Info().
+			Int64("max_buffered_bytes", limit).
+			Bool("auto", cfg.Ingest.MaxBufferedBytesAuto).
+			Uint64("memory_limit_bytes", arrowBuffer.MemoryLimitBytes()).
+			Msg("Ingest buffered-bytes limit set")
+	} else {
+		log.Info().
+			Bool("auto", cfg.Ingest.MaxBufferedBytesAuto).
+			Msg("Ingest buffered-bytes limit off (ingest.max_buffered_bytes = 0, the default, or auto without a detected memory limit)")
+	}
 	// Ingest counts rows stamped past file-level time pruning's margin
 	// whether or not the feature is on (it is by default), so the risk is
 	// visible on every node that flushes. Set before WAL recovery and the
@@ -1732,6 +1780,21 @@ func main() {
 		if walDisk != nil {
 			walDisk.OnChange(subscriptionManager.SetWALDiskPressure)
 		}
+		// And while the rows waiting to be flushed are at
+		// ingest.max_buffered_bytes (#1468), when that limit is on.
+		if arrowBuffer.MaxBufferedBytes() > 0 {
+			arrowBuffer.OnBufferFullChange(subscriptionManager.SetBufferFull)
+		}
+		// And while the WAL refuses durable acknowledgements (#1502): a
+		// stalled or failing device. Never set in queued mode, where no
+		// write waits on a sync.
+		if walWriter != nil {
+			walWriter.OnDurableAckChange(subscriptionManager.SetWALNotDurable)
+		}
+		// And while the expired license's grace period stops ingestion.
+		if licenseClient != nil {
+			licenseClient.OnWritesStoppedChange(subscriptionManager.SetLicenseWritesStopped)
+		}
 
 		// Start manager (loads and starts auto_start subscriptions). On a
 		// cluster node it starts after the coordinator, so its writes pass the
@@ -1954,11 +2017,6 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to start hourly compaction scheduler")
 			}
 
-			shutdownCoordinator.RegisterHook("hourly-compaction-scheduler", func(ctx context.Context) error {
-				hourlyScheduler.Stop()
-				return nil
-			}, shutdown.PriorityScheduler)
-
 			log.Info().
 				Str("schedule", cfg.Compaction.HourlySchedule).
 				Msg("Hourly compaction scheduler started")
@@ -1982,14 +2040,19 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to start daily compaction scheduler")
 			}
 
-			shutdownCoordinator.RegisterHook("daily-compaction-scheduler", func(ctx context.Context) error {
-				dailyScheduler.Stop()
-				return nil
-			}, shutdown.PriorityScheduler)
-
 			log.Info().
 				Str("schedule", cfg.Compaction.DailySchedule).
 				Msg("Daily compaction scheduler started")
+		}
+
+		// One hook for both: they share a cycle claim, and stopping one while
+		// the other's deferred tick still waits lets that tick start a cycle
+		// mid-shutdown when the first's cycle ends (#220).
+		if hourlyScheduler != nil || dailyScheduler != nil {
+			shutdownCoordinator.RegisterHook("compaction-schedulers", func(ctx context.Context) error {
+				compaction.StopAll(hourlyScheduler, dailyScheduler)
+				return nil
+			}, shutdown.PriorityScheduler)
 		}
 
 		log.Info().
@@ -2033,6 +2096,9 @@ func main() {
 
 	// Start periodic license validation (if license was validated earlier)
 	if licenseClient != nil {
+		// The watcher follows the grace schedule in both license modes; the
+		// periodic validation is online only (a no-op for a file license).
+		licenseClient.StartLicenseWatcher()
 		licenseClient.StartPeriodicValidation(license.ValidationInterval)
 		shutdownCoordinator.RegisterHook("license-client", func(ctx context.Context) error {
 			licenseClient.Stop()
@@ -2536,12 +2602,7 @@ func main() {
 								func() {
 									// OnLoseCompactor: stop scheduler + watcher
 									log.Info().Msg("Phase 5: this node lost the active compactor lease — stopping compaction")
-									if hourlyScheduler != nil {
-										hourlyScheduler.Stop()
-									}
-									if dailyScheduler != nil {
-										dailyScheduler.Stop()
-									}
+									compaction.StopAll(hourlyScheduler, dailyScheduler) // both told before either waits (#220)
 									if !isDedicatedCompactor {
 										watcher.Stop()
 									}
@@ -3158,6 +3219,8 @@ func main() {
 				MaxFileBytes: cfg.EdgeSync.MaxFileBytes,
 				AuthManager:  authManager,
 				Logger:       logger.Get("edgesync"),
+				// Pushed files are ingestion: refused on grace days 7-14.
+				WritesStopped: licenseClient.WritesStopped,
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create edge sync handler; refusing to start")
@@ -5191,7 +5254,7 @@ func main() {
 			IcebergCatalogDBPath:   icebergCatalogDBPath,
 			IcebergWarehousePath:   icebergWarehousePath,
 			IcebergNamespacePrefix: cfg.Iceberg.NamespacePrefix,
-			ConfigPath:             "arc.toml",
+			ConfigPath:             cfg.ConfigFile,
 			Logger:                 logger.Get("backup"),
 		})
 		if err != nil {
@@ -5285,7 +5348,17 @@ func main() {
 				// claiming a cold source in either case would be the kind of
 				// lie that takes an operator a long afternoon.
 				Bool("cold_source", tieringManager != nil && tieringManager.ColdBackend() != nil).
+				// The file include_config copies and restore_config
+				// overwrites (#1466), and whether a config restore could
+				// write it at all: never on a cluster node (#1083), and not
+				// where the file or its directory is not this process's,
+				// such as a package's root-owned /etc/arc.
+				Str("config_file", cfg.ConfigFile).
+				Bool("config_restore", clusterCoordinator == nil && backupManager.ConfigRestoreBlocker("") == nil).
 				Msg("Backup/restore enabled")
+			if cfg.ConfigFile == "" {
+				log.Warn().Msg("Arc started without a config file: backups do not include a config, and restore_config is refused")
+			}
 		}
 	}
 
@@ -5668,10 +5741,12 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		if database == "" {
 			database = "default"
 		}
-		// Inherit the replayed entry's identity: one columnar entry becomes
-		// exactly one buffer write, so a checkpoint for it covers precisely
-		// these records. Row batches instead inherit their precise row-range
-		// identities when recovery splits an entry.
+		// Inherit the replayed entry's identity: a whole entry becomes exactly
+		// one buffer write, so a checkpoint for it covers precisely these
+		// records. When rows of the entry were already checkpointed by a
+		// multi-hour flush (#1492), recovery hands over only the other rows,
+		// each range under its own row-range identity, as for split row
+		// entries.
 		if err := arrowBuffer.WriteColumnarDirectReplayWithTagColumns(ctx, database, measurement, columns, walIdentity, tagColumns); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
@@ -5830,6 +5905,16 @@ func walCoverageHold(outbox *cluster.RegistrationOutbox) func() wal.CoverageHold
 		return nil
 	}
 	return outbox.CoverageHold
+}
+
+// walAckTimeout maps wal.ack_timeout_seconds to WriterConfig.AckTimeout: 0
+// in the config is "no bound", which the writer spells as a negative value
+// (its own zero means the default).
+func walAckTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return -1
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // enableWALCoverage turns on ingest coverage ids (#1207) where they can be used:

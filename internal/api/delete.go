@@ -283,30 +283,6 @@ var dangerousPunctuationPatterns = []string{
 // Uses \b word boundaries to avoid false positives on column names like "offset", "payload", "dataset"
 var dangerousKeywordPattern = regexp.MustCompile(`(?i)\b(DROP|DELETE|INSERT|UPDATE|EXEC|EXECUTE|UNION|SELECT|CREATE|ALTER|COPY|ATTACH|DETACH|LOAD|INSTALL|PRAGMA|CALL|SET)\b`)
 
-// dangerousIOFunctionPattern rejects DuckDB's filesystem-I/O table-function
-// family in a DELETE WHERE clause.
-//
-// The keyword list above blocks SELECT, which kills the scalar-subquery vector
-// that made GHSA-wmjj-g8xc-6hwr exploitable on the query endpoint — but these
-// readers do not need a subquery to run. The WHERE clause is interpolated into
-// `SELECT ... FROM read_parquet(...) WHERE <where>`, so a scalar expression like
-// `1=1 OR list_contains(glob('/data/**'), 'x')` reaches DuckDB with no SELECT of
-// its own and turns the row count into a cross-tenant existence oracle. DELETE is
-// admin-gated, but an admin token is not meant to be a filesystem read primitive.
-//
-// Matches the function NAME anywhere in the clause, not anchored to a FROM/JOIN
-// position — these can sit in any scalar expression. Kept as a separate pattern
-// from the keyword list so the error message can name the offending function.
-var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
-	"read_parquet", "parquet_scan", "read_csv", "read_csv_auto",
-	"read_json", "read_json_auto", "read_ndjson", "read_ndjson_auto",
-	"read_text", "read_blob", "read_xlsx", "glob",
-	"parquet_metadata", "parquet_schema", "parquet_file_metadata",
-	"parquet_kv_metadata", "parquet_bloom_probe",
-	"delta_scan", "iceberg_scan", "iceberg_metadata", "iceberg_snapshots",
-	"arc_partition_agg",
-}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
-
 // NewDeleteHandler creates a new delete handler. tempDir MUST be the same
 // path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
 // otherwise the COPY ... TO inside rewriteS3File fails on S3-backed
@@ -468,7 +444,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	// A column qualified by the measurement's name means that column (#1451).
-	// Rewritten before validation, so what is validated is what runs.
+	// Rewritten before validation, so what is validated is what runs. Keep
+	// this order: the rewrite masks and restores caller text, and
+	// validateWhereClause (including its placeholder check) must see its
+	// output, which is also what pinDeleteTime later re-masks.
 	req.Where = unqualifyMeasurement(req.Where, req.Measurement)
 
 	// Validate WHERE clause
@@ -943,12 +922,20 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
 	// inside a string literal is data, not SQL (#834). The raw clause is what
 	// gets interpolated into the DuckDB statement, so the unmatched-quote and
-	// unmatched-parenthesis checks below stay on it. Backtick identifiers are
-	// normalised to double quotes first, as the query path's validator does:
-	// the masker does not know backticks, so a quote inside one would
-	// otherwise open a spurious literal that hides whatever follows it.
-	maskInput := backticksToDoubleQuotes(where)
-	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// unmatched-parenthesis checks below stay on it. An unquoted backtick is
+	// refused before anything is masked: it is not a quote in DuckDB, so the
+	// masker must see the clause exactly as DuckDB will (#1480).
+	if hasUnquotedBacktick(where) {
+		return false, errors.New("WHERE clause: " + errUnquotedBacktick)
+	}
+	maskedWhere, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
+	// Placeholder text outside a literal or quoted identifier is reserved:
+	// the clause is masked, checked, and its literals restored by
+	// placeholder (pinDeleteTime), so a copy the caller wrote would move a
+	// literal after the checks. Text inside a literal stays data.
+	if sqlutil.HasCallerPlaceholder(maskedWhere, masks) {
+		return false, errors.New("WHERE clause: " + errReservedPlaceholder)
+	}
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
 	maskedWhere = foldUnicodeSpace(maskedWhere)
@@ -976,9 +963,20 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
 	}
 
-	// Reject filesystem-I/O table functions (see dangerousIOFunctionPattern).
-	// Matched against the identifier-quote-stripped form so the quoted spelling
-	// `"glob"(...)`, which DuckDB executes identically, cannot slip past.
+	// Reject the functions the query validator refuses: filesystem readers,
+	// dynamic SQL and side effects. The keyword list blocks SELECT, but the
+	// fragment is interpolated into `SELECT ... FROM read_parquet(...) WHERE
+	// <where>`, so a reader in a scalar expression (`1=1 OR
+	// list_contains(glob('/data/**'), 'x')`, GHSA-wmjj-g8xc-6hwr) or under
+	// `EXISTS (FROM name(...))` runs with no SELECT of its own and turns the
+	// row count into a cross-tenant oracle; DELETE is admin-gated, but an
+	// admin token is not meant to be a filesystem read primitive. These are
+	// the SAME patterns as
+	// ValidateSQLRequest: this path kept its own copy, which missed every
+	// reader added after it was written and never checked dynamic SQL
+	// (GHSA-r7vm-9hcg-xgf7). Matched against the identifier-quote-stripped
+	// form so the quoted spelling `"glob"(...)`, which DuckDB executes
+	// identically, cannot slip past.
 	ioCheck := maskedWhere
 	for _, mask := range masks {
 		if mask.Identifier {
@@ -987,15 +985,21 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 			ioCheck = strings.ReplaceAll(ioCheck, mask.Placeholder, mask.Original)
 		}
 	}
-	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
+	ioCheck = strings.ReplaceAll(ioCheck, `"`, "")
 	if unicodeEscapePattern.MatchString(maskedWhere) {
 		return false, fmt.Errorf(`WHERE clause contains a unicode-escaped identifier or string (U&"...")`)
 	}
-	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
+	if m := ioTableFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
+	}
+	if m := dynamicSQLFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
+		return false, fmt.Errorf("WHERE clause contains forbidden dynamic SQL function: %s()", m[1])
 	}
 	if name := sideEffectFunction(ioCheck); name != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden function: %s", name)
+	}
+	if name := queryTableMacroInTablePosition(maskedWhere, sqlutil.IdentifierNames(masks)); name != "" {
+		return false, fmt.Errorf("WHERE clause contains forbidden table function: %s()", name)
 	}
 
 	// SECURITY: reject a path literal standing in table position inside the
@@ -1015,7 +1019,8 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// Reuses the query path's guard rather than growing a third keyword list
 	// in this file: that guard is fed by the same normalisation and already
 	// knows every relation-introducing keyword DuckDB has (FROM, JOIN, TABLE,
-	// SUMMARIZE, DESCRIBE, PIVOT, UNPIVOT), so this inherits additions to it
+	// SUMMARIZE, DESCRIBE, DESC, SHOW, PIVOT, PIVOT_WIDER, UNPIVOT, PIVOT_LONGER,
+	// and ONLY after one), so this inherits additions to it
 	// instead of drifting from them.
 	//
 	// It is applied to the FRAGMENT, not to the assembled statement: by the
@@ -1024,9 +1029,14 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// ordering constraint queryMeasurement documents. A fragment that
 	// introduces a relation carries its own keyword, so the scanner arms
 	// without needing a synthetic FROM clause around it.
-	features := scanSQLFeatures(maskInput)
-	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	features := scanSQLFeatures(where)
+	normalised, _ := sqlutil.MaskStringLiterals(where, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	// As in ValidateSQLRequest, and in the same order (after the comments are
+	// gone, so a comment cannot open a masking frame): the FROM of
+	// `IS [NOT] DISTINCT FROM` and of EXTRACT/TRIM/… is not a table position,
+	// so `host IS DISTINCT FROM 'a'` is a valid predicate (#1472).
+	normalised, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalised)
 	if stringLiteralInTablePosition(normalised) {
 		return false, fmt.Errorf("WHERE clause may not put a string literal in table position (replacement scans are disabled)")
 	}
