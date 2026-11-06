@@ -3030,15 +3030,30 @@ With query governance on, a refused query's `Retry-After` was wrong or missing:
   line gains the `retry_after_sec` field the rate-limit line already has.
 
 A quota now resets exactly on the hour or day boundary, not just after it, so a
-client that waits exactly a quota's `Retry-After` is not refused by that quota.
-A refused query still counts against the rate limits checked before the one
-that refused it, so a client can meet another limit when it comes back; that
-refusal carries its own wait. `Retry-After` is always at least 1. Which
-queries are allowed is otherwise unchanged. Clients that retry on `Retry-After` will retry
+client that waits exactly `Retry-After` is not refused. `Retry-After` is always
+at least 1. See also #1524 below: a refused query no longer counts against any
+limit. Clients that retry on `Retry-After` will retry
 later than they did, and less often.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1520](https://github.com/Basekick-Labs/arc/pull/1520).
+
+### Fix: a governance-refused query is counted against no limit ([#1524](https://github.com/Basekick-Labs/arc/issues/1524))
+
+The rate limits and quotas were checked one after another, each counting the
+query as it passed: a query refused by the per-hour limit had already used a
+per-minute slot, and one refused by a quota had used both rate limits. A client
+that kept retrying after a refusal used up the earlier limits too, and could be
+refused by one of those when it came back on time. The limits are now checked
+together and a query is counted against all of them only when every one admits
+it: a refused query spends nothing, and a client that waits `Retry-After` finds
+every limit as it was told. A refusal names the limit with the longest wait
+(the reason in the 429, the log line, and `arc_governance_rate_limited_total`
+or `arc_governance_quota_exhausted_total`), and `Retry-After` is that wait.
+Refused queries no longer appear in the counts the governance usage endpoint
+reports. When the hourly and daily quotas are both exhausted, the refusal now
+names the daily one, whose reset it waits for. A client that keeps hammering
+after a refusal is still refused on every request until the wait has passed.
 
 ### A scheduled compaction that finds a cycle running runs when it ends ([#220](https://github.com/Basekick-Labs/arc/issues/220))
 

@@ -5900,14 +5900,15 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 
 // governanceRejection describes a request rejected by query governance.
 // When it is returned, metrics and logging are already recorded and the
-// Retry-After header (rate limits only) is already set on the response;
+// Retry-After header is already set on the response;
 // the caller renders the 429 body in its endpoint's own error shape.
 type governanceRejection struct {
 	reason string
 }
 
 // checkQueryGovernance runs the Enterprise query-governance checks (rate
-// limit, then quota) for the request's token. A non-nil rejection means the
+// limits and quotas, one decision: a refused request is counted against none
+// of them, #1524) for the request's token. A non-nil rejection means the
 // request must be answered with 429 and the returned reason; otherwise the
 // returned policy limits apply to the query: maxRows caps streamed rows and
 // timeout overrides the global query timeout (zero values mean no policy
@@ -5930,29 +5931,25 @@ func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout 
 		return 0, 0, nil
 	}
 	m := metrics.Get()
-	if result := h.governanceManager.CheckRateLimit(tokenInfo.ID); !result.Allowed {
-		c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
-		m.IncQueryErrors()
-		m.IncGovernanceRateLimited()
-		h.logger.Warn().
-			Int64("token_id", tokenInfo.ID).
-			Str("token_name", tokenInfo.Name).
-			Str("reason", result.Reason).
-			Int("retry_after_sec", result.RetryAfterSec).
-			Msg("Query rejected: rate limit exceeded")
-		return 0, 0, &governanceRejection{reason: result.Reason}
-	}
-	result := h.governanceManager.CheckQuota(tokenInfo.ID)
+	// One decision over every limit: a refused query is counted against none
+	// of them (#1524).
+	result := h.governanceManager.Admit(tokenInfo.ID)
 	if !result.Allowed {
 		c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
 		m.IncQueryErrors()
-		m.IncGovernanceQuotaExhausted()
+		msg := "Query rejected: rate limit exceeded"
+		if result.Kind == governance.KindQuota {
+			m.IncGovernanceQuotaExhausted()
+			msg = "Query rejected: quota exhausted"
+		} else {
+			m.IncGovernanceRateLimited()
+		}
 		h.logger.Warn().
 			Int64("token_id", tokenInfo.ID).
 			Str("token_name", tokenInfo.Name).
 			Str("reason", result.Reason).
 			Int("retry_after_sec", result.RetryAfterSec).
-			Msg("Query rejected: quota exhausted")
+			Msg(msg)
 		return 0, 0, &governanceRejection{reason: result.Reason}
 	}
 	return result.MaxRows, result.MaxDuration, nil

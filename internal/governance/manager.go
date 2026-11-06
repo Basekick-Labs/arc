@@ -45,6 +45,9 @@ type EnforcementResult struct {
 	RetryAfterSec int           `json:"retry_after_sec,omitempty"`
 	MaxRows       int           `json:"max_rows,omitempty"`
 	MaxDuration   time.Duration `json:"-"`
+	// Kind is KindRateLimit or KindQuota on a refusal: the limit with the
+	// longest wait.
+	Kind string `json:"-"`
 }
 
 // ManagerConfig holds configuration for creating a Manager.
@@ -74,6 +77,16 @@ type Manager struct {
 	policies   map[int64]*Policy
 	policiesMu sync.RWMutex
 
+	// admitMu serialises Admit's check-then-record, and policy updates of the
+	// limiters (#1524). Taken before any other lock here; nothing that holds
+	// another of these locks takes it.
+	admitMu sync.Mutex
+	// now is the clock new limiters and trackers read; time.Now outside tests.
+	now func() time.Time
+	// afterAdmitCheckForTest runs in Admit between checking every limit and
+	// recording the query.
+	afterAdmitCheckForTest func()
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -94,6 +107,7 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		quotaTrackers:  make(map[int64]*quotaTracker),
 		policies:       make(map[int64]*Policy),
 		stopCh:         make(chan struct{}),
+		now:            time.Now,
 	}
 
 	if err := m.initSchema(); err != nil {
@@ -210,11 +224,7 @@ func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 	p.UpdatedAt = p.CreatedAt
 
 	// Update cache and in-memory trackers
-	m.policiesMu.Lock()
-	m.policies[p.TokenID] = p
-	m.policiesMu.Unlock()
-
-	m.updateTrackersForToken(p.TokenID, p)
+	m.publishPolicy(p)
 	metrics.Get().SetGovernancePoliciesActive(int64(m.policyCount()))
 
 	m.logger.Info().Int64("token_id", p.TokenID).Msg("Governance policy created")
@@ -251,11 +261,7 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 
 	p.UpdatedAt = time.Now()
 
-	m.policiesMu.Lock()
-	m.policies[p.TokenID] = p
-	m.policiesMu.Unlock()
-
-	m.updateTrackersForToken(p.TokenID, p)
+	m.publishPolicy(p)
 
 	m.logger.Info().Int64("token_id", p.TokenID).Msg("Governance policy updated")
 	return p, nil
@@ -268,6 +274,11 @@ func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
 		return fmt.Errorf("failed to delete governance policy: %w", err)
 	}
 
+	// The cache entry and the limiters go together under admitMu: an Admit
+	// that read the policy before this must not recreate a limiter on its
+	// limits after it (#1524).
+	m.admitMu.Lock()
+	defer m.admitMu.Unlock()
 	m.policiesMu.Lock()
 	delete(m.policies, tokenID)
 	m.policiesMu.Unlock()
@@ -338,70 +349,82 @@ func (m *Manager) GetCachedPolicy(tokenID int64) *Policy {
 	return m.getEffectivePolicy(tokenID)
 }
 
-// CheckRateLimit checks if the token's query rate is within limits.
-func (m *Manager) CheckRateLimit(tokenID int64) *EnforcementResult {
+// Kinds of limit an EnforcementResult can be refused by.
+const (
+	KindRateLimit = "rate_limit"
+	KindQuota     = "quota"
+)
+
+// Admit decides whether the token may run a query now, against every limit
+// its policy sets: the per-minute and per-hour rate limits and the hourly and
+// daily quotas. A query is counted against all of them only when every one
+// admits it (#1524): a refused query spends nothing, so a client that waits
+// out the refusal's RetryAfterSec finds every limit as it was told.
+//
+// A refusal names the limit with the longest wait, which is the one that
+// decides when a retry can succeed, and RetryAfterSec is that wait (at least
+// 1). On a tie the limit checked first (minute, hour, quota) is named. Check and record run under admitMu, so two concurrent queries cannot
+// both pass a limit with one slot left.
+func (m *Manager) Admit(tokenID int64) *EnforcementResult {
+	m.admitMu.Lock()
+	defer m.admitMu.Unlock()
+
 	policy := m.getEffectivePolicy(tokenID)
 	if policy == nil {
 		return &EnforcementResult{Allowed: true}
 	}
 
-	// Check per-minute rate limit
+	type gate struct {
+		admits func() (bool, string)
+		record func()
+		wait   func() int
+		kind   string
+	}
+	var gates []gate
 	if policy.RateLimitPerMinute > 0 {
-		limiter := m.getOrCreateMinuteLimiter(tokenID, policy.RateLimitPerMinute)
-		if !limiter.Allow() {
-			retryAfter := limiter.RetryAfterSec()
-			// A retry once the minute frees up also has to fit the hour: when
-			// that is exhausted too, its wait is the one that lets a query
-			// through. Read-only: nothing is spent on the hour limiter.
-			if policy.RateLimitPerHour > 0 {
-				hour := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
-				retryAfter = max(retryAfter, hour.RetryAfterSec())
+		l := m.getOrCreateMinuteLimiter(tokenID, policy.RateLimitPerMinute)
+		limit := policy.RateLimitPerMinute
+		gates = append(gates, gate{func() (bool, string) {
+			if l.admits() {
+				return true, ""
 			}
-			return &EnforcementResult{
-				Allowed:       false,
-				Reason:        fmt.Sprintf("Rate limit exceeded: %d queries per minute", policy.RateLimitPerMinute),
-				RetryAfterSec: max(retryAfter, 1),
-			}
-		}
+			return false, fmt.Sprintf("Rate limit exceeded: %d queries per minute", limit)
+		}, l.record, l.RetryAfterSec, KindRateLimit})
 	}
-
-	// Check per-hour rate limit
 	if policy.RateLimitPerHour > 0 {
-		limiter := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
-		if !limiter.Allow() {
-			retryAfter := limiter.RetryAfterSec()
-			return &EnforcementResult{
-				Allowed:       false,
-				Reason:        fmt.Sprintf("Rate limit exceeded: %d queries per hour", policy.RateLimitPerHour),
-				RetryAfterSec: max(retryAfter, 1),
+		l := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
+		limit := policy.RateLimitPerHour
+		gates = append(gates, gate{func() (bool, string) {
+			if l.admits() {
+				return true, ""
 			}
-		}
+			return false, fmt.Sprintf("Rate limit exceeded: %d queries per hour", limit)
+		}, l.record, l.RetryAfterSec, KindRateLimit})
 	}
-
-	return &EnforcementResult{Allowed: true}
-}
-
-// CheckQuota checks if the token's query quota is within limits.
-// Returns an EnforcementResult with MaxRows and MaxDuration if applicable.
-func (m *Manager) CheckQuota(tokenID int64) *EnforcementResult {
-	policy := m.getEffectivePolicy(tokenID)
-	if policy == nil {
-		return &EnforcementResult{Allowed: true}
-	}
-
-	// Check hourly/daily quotas
 	if policy.MaxQueriesPerHour > 0 || policy.MaxQueriesPerDay > 0 {
-		tracker := m.getOrCreateQuotaTracker(tokenID, policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
-		allowed, reason := tracker.AllowQuery()
-		if !allowed {
-			return &EnforcementResult{
-				Allowed: false,
-				Reason:  reason,
-				// At least 1: a slot or the hour can turn over between the
-				// refusal and this read, which would otherwise say 0.
-				RetryAfterSec: max(tracker.RetryAfterSec(), 1),
+		t := m.getOrCreateQuotaTracker(tokenID, policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
+		gates = append(gates, gate{t.admits, t.record, t.RetryAfterSec, KindQuota})
+	}
+
+	var refused *EnforcementResult
+	longest := -1
+	for _, g := range gates {
+		if ok, reason := g.admits(); !ok {
+			if w := g.wait(); w > longest {
+				longest = w
+				refused = &EnforcementResult{Allowed: false, Reason: reason, Kind: g.kind}
 			}
 		}
+	}
+	if refused != nil {
+		refused.RetryAfterSec = max(longest, 1)
+		return refused
+	}
+	if m.afterAdmitCheckForTest != nil {
+		m.afterAdmitCheckForTest()
+	}
+	for _, g := range gates {
+		g.record()
 	}
 
 	result := &EnforcementResult{Allowed: true}
@@ -415,7 +438,7 @@ func (m *Manager) CheckQuota(tokenID int64) *EnforcementResult {
 }
 
 // RecordQueryCompletion records that a query completed for a token.
-// Currently a no-op since quota tracking increments on AllowQuery.
+// Currently a no-op since Admit counts a query when it admits it.
 func (m *Manager) RecordQueryCompletion(tokenID int64, rowCount int) {
 	// Future: track row counts for analytics
 }
@@ -480,7 +503,7 @@ func (m *Manager) getOrCreateMinuteLimiter(tokenID int64, limit int) *slidingWin
 	if limiter, ok = m.minuteLimiters[tokenID]; ok {
 		return limiter
 	}
-	limiter = newSlidingWindowCounter(time.Minute, 60, limit)
+	limiter = newSlidingWindowCounterWithClock(time.Minute, 60, limit, m.now)
 	m.minuteLimiters[tokenID] = limiter
 	return limiter
 }
@@ -498,7 +521,7 @@ func (m *Manager) getOrCreateHourLimiter(tokenID int64, limit int) *slidingWindo
 	if limiter, ok = m.hourLimiters[tokenID]; ok {
 		return limiter
 	}
-	limiter = newSlidingWindowCounter(time.Hour, 60, limit)
+	limiter = newSlidingWindowCounterWithClock(time.Hour, 60, limit, m.now)
 	m.hourLimiters[tokenID] = limiter
 	return limiter
 }
@@ -516,11 +539,26 @@ func (m *Manager) getOrCreateQuotaTracker(tokenID int64, maxPerHour, maxPerDay i
 	if tracker, ok = m.quotaTrackers[tokenID]; ok {
 		return tracker
 	}
-	tracker = newQuotaTracker(maxPerHour, maxPerDay)
+	tracker = newQuotaTrackerWithClock(maxPerHour, maxPerDay, m.now)
 	m.quotaTrackers[tokenID] = tracker
 	return tracker
 }
 
+// publishPolicy puts p in the cache and applies its limits to the token's
+// limiters in one step under admitMu, so an Admit sees the policy and the
+// limits it enforces together, and two writes for one token cannot leave the
+// cache on one and the limiters on the other (#1524).
+func (m *Manager) publishPolicy(p *Policy) {
+	m.admitMu.Lock()
+	defer m.admitMu.Unlock()
+	m.policiesMu.Lock()
+	m.policies[p.TokenID] = p
+	m.policiesMu.Unlock()
+	m.updateTrackersForToken(p.TokenID, p)
+}
+
+// updateTrackersForToken applies p's limits to the token's limiters. Called
+// with admitMu held.
 func (m *Manager) updateTrackersForToken(tokenID int64, p *Policy) {
 	// Update minute limiter
 	m.minuteLimitersMu.Lock()

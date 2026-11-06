@@ -21,6 +21,11 @@ type slidingWindowCounter struct {
 }
 
 func newSlidingWindowCounter(windowSize time.Duration, slotCount int, limit int) *slidingWindowCounter {
+	return newSlidingWindowCounterWithClock(windowSize, slotCount, limit, time.Now)
+}
+
+// newSlidingWindowCounterWithClock is newSlidingWindowCounter reading the clock now.
+func newSlidingWindowCounterWithClock(windowSize time.Duration, slotCount int, limit int, now func() time.Time) *slidingWindowCounter {
 	if slotCount <= 0 {
 		slotCount = 60
 	}
@@ -34,10 +39,10 @@ func newSlidingWindowCounter(windowSize time.Duration, slotCount int, limit int)
 		slots:        make([]int, slotCount),
 		slotCount:    slotCount,
 		currentSlot:  0,
-		lastSlotTime: time.Now().Truncate(slotDuration),
+		lastSlotTime: now().Truncate(slotDuration),
 		total:        0,
 		limit:        limit,
-		now:          time.Now,
+		now:          now,
 	}
 }
 
@@ -68,20 +73,44 @@ func (s *slidingWindowCounter) advance() {
 }
 
 // Allow checks if a request is allowed under the rate limit.
+// Test helper: the query path uses Manager.Admit, which checks every limit
+// before recording on any (#1524).
 // If allowed, it increments the counter and returns true.
 func (s *slidingWindowCounter) Allow() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.advance()
-
-	if s.limit > 0 && s.total >= s.limit {
+	if !s.admitsLocked() {
 		return false
 	}
+	s.recordLocked()
+	return true
+}
 
+// admits reports whether a request would be allowed now, without counting it
+// (#1524: a query is counted only once every limit admits it).
+func (s *slidingWindowCounter) admits() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.admitsLocked()
+}
+
+// record counts a request that every limit admitted.
+func (s *slidingWindowCounter) record() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordLocked()
+}
+
+func (s *slidingWindowCounter) admitsLocked() bool {
+	s.advance()
+	return s.limit <= 0 || s.total < s.limit
+}
+
+func (s *slidingWindowCounter) recordLocked() {
+	s.advance()
 	s.slots[s.currentSlot]++
 	s.total++
-	return true
 }
 
 // Remaining returns the number of requests remaining in the current window.
