@@ -189,6 +189,13 @@ func GetStoragePath(backend Backend, database, measurement string) (string, erro
 	if err := validateReadSegment("measurement", measurement); err != nil {
 		return "", err
 	}
+	// On a volume that folds names, `CPU` would glob `cpu`'s files: a name
+	// reaches data only in its spelling on disk (#1509).
+	if g, ok := backend.(NameSpellingGuard); ok {
+		if err := g.CheckNameSpelling(database, measurement); err != nil {
+			return "", err
+		}
+	}
 	return backendRoot(backend) + database + "/" + measurement + "/**/*.parquet", nil
 }
 

@@ -3611,10 +3611,19 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 	// and transform), so statements longer than the default cap are not
 	// cached: a raised query.max_sql_length would otherwise multiply its
 	// memory bound. Transforming is linear, so re-running it is cheap.
-	if !volatile.Volatile && len(sql) <= transformCacheMaxSQLLength {
+	if !volatile.Volatile && len(sql) <= transformCacheMaxSQLLength && !storageFoldsNames(h.storage) {
 		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
 	}
 	return transformed, false, refs, nil
+}
+
+// storageFoldsNames reports whether backend is a local volume that folds
+// names (#1509). Such a backend's transforms are not cached: a name accepted
+// while no spelling of it existed would keep its glob after another spelling
+// is created, and DuckDB's glob would then read that one's files.
+func storageFoldsNames(backend storage.Backend) bool {
+	f, ok := backend.(interface{ NamesFold() bool })
+	return ok && f.NamesFold()
 }
 
 // getTransformedSQLForQuery returns the transformed SQL for a query. Simple

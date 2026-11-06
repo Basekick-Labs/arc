@@ -3486,6 +3486,15 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	if err != nil {
 		return fmt.Errorf("%w: measurement %q: %v", ErrUnstorableColumnValue, record.Measurement, err)
 	}
+	// #1509, after every other content refusal so a write refused for its
+	// columns or values does not claim the spelling (it creates the
+	// directories). A replayed entry (skipWAL) was accepted where it was
+	// written; only a live write is refused for its spelling.
+	if !skipWAL {
+		if err := b.nameSpellingRefusal(database, record.Measurement); err != nil {
+			return err
+		}
+	}
 	if len(record.RawPayload) > 0 {
 		typedColumns.estimatedBytes = int64(len(record.RawPayload))
 	} else {
@@ -3806,6 +3815,10 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	}
 	if !skipWAL {
 		if err := checkTypedTextBinary(b.knownTextBinary(database, measurement), measurement, typedColumns); err != nil {
+			return err
+		}
+		// #1509, last of the content refusals; see writeColumnarInternalWithWALCopy.
+		if err := b.nameSpellingRefusal(database, measurement); err != nil {
 			return err
 		}
 	}

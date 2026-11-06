@@ -74,6 +74,50 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: names that differ only in case stay apart on case-insensitive volumes ([#1509](https://github.com/Basekick-Labs/arc/issues/1509))
+
+On a volume that does not distinguish names by case (macOS APFS by default,
+Docker Desktop bind mounts from a Mac, NTFS), `cpu` and `CPU` were one
+directory. A write, query or delete under either name acted on the same
+files, while permissions matched names exactly. Arc now checks the local
+storage volume at startup. If it folds names, a database or measurement is
+only accepted in the spelling it already has on disk:
+- **Ingest** to another spelling of an existing database or measurement is
+  refused and reported like other unstorable names, before anything reaches
+  the WAL. Two first writes racing with different spellings can't both win,
+  and a write refused for its columns or values doesn't claim a spelling.
+- **Queries** are refused with a 400 that names the existing spelling.
+  Before, `FROM CPU` on a Mac returned `cpu`'s rows. On such a volume,
+  rewritten SQL is no longer cached, so a spelling accepted before another
+  one existed is checked again on every query.
+- **Database get, create and delete** under another spelling are refused
+  with a 400 before anything else runs.
+- **Measurement deletes, retention and listings** under another spelling
+  are refused instead of acting on the existing directory.
+
+Linux filesystems, S3 and Azure are unaffected, and the check is skipped
+there. If the startup check itself fails (for example a read-only storage
+root), Arc assumes names fold. A startup warning says when case folding was
+detected. To keep names that differ only by case, use a case-sensitive
+volume.
+
+**Upgrading on macOS:** a retention policy, continuous query or client that
+names a database or measurement in a different case from its directory now
+fails instead of acting on that directory. Check them after upgrading.
+Retention that fails lets disk usage grow.
+
+Known limits:
+- Only ingest is checked on the write side. Restores, edge-sync imports,
+  cluster file replication and WAL replay write what they were given.
+- Several nodes sharing one case-insensitive network volume are not
+  coordinated with each other.
+- An empty measurement directory removed by a cleanup while its rows are
+  still buffered can be re-created in another spelling before those rows
+  flush. The rows then land in that directory.
+- Data already stored under mixed spellings before the upgrade isn't
+  migrated. With tiering, files moved to a case-sensitive cold store under
+  the other spelling are not reachable by either name.
+
 ## Docs: the cluster trust model is written down ([#1510](https://github.com/Basekick-Labs/arc/issues/1510))
 
 A new `SECURITY.md` explains how to report a vulnerability privately and what
@@ -95,7 +139,6 @@ a peer belongs to the cluster, not which node it is.
 
 Per-node peer identity remains open in #1510.
 
-## Fix: Arc's internal SQL placeholder text is reserved
 ## Security: Arc's internal SQL placeholder text is reserved
 
 Before its checks, Arc swaps string literals, quoted names and some keywords

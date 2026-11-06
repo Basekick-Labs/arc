@@ -59,7 +59,8 @@ func AsWriteStopped(err error) (*WriteStoppedError, bool) {
 // content before its WAL append: a string/binary column change (#440), a
 // column name that cannot be stored (#1342), a column value that cannot be
 // converted to its column's type (#1424), or a database or measurement name
-// its keys cannot hold (#1475). Only that measurement is
+// its keys cannot hold (#1475), or one that exists in storage under another
+// spelling on a volume that folds names (#1509). Only that measurement is
 // refused; nothing of it reached the WAL, so the rest of a request can be
 // written and the measurement reported as dropped.
 func isContentRefusal(err error) bool {
