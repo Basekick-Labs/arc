@@ -139,6 +139,33 @@ func TestAdmitNameSpellingRace(t *testing.T) {
 	}
 }
 
+// Racing first writes of one spelling: every one is admitted. A check that
+// listed the directory just before another writer created the name, then
+// found it by stat, must not mistake it for another spelling.
+func TestAdmitNameSpellingRaceSameSpelling(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		b := foldingBackend(t)
+		var wg sync.WaitGroup
+		errs := make([]error, 16)
+		start := make(chan struct{})
+		for i := range errs {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				errs[i] = b.AdmitNameSpelling("db", "cpu")
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: same-spelling first write refused: %v", round, err)
+			}
+		}
+	}
+}
+
 // A measurement removed and re-created in another spelling: the old
 // spelling is refused, not served from a cached listing.
 func TestCheckNameSpellingAfterRecreate(t *testing.T) {
