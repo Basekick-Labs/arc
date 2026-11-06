@@ -505,7 +505,10 @@ func isAggItem(item string) bool {
 	}
 	inner := item[open+1 : len(item)-1]
 	switch item[:open] {
-	case "count", "sum", "min", "max", "avg":
+	// `count` also takes a map subscript `m['k']` (map-2); the other four stay bare.
+	case "count":
+		return isColumnRef(inner)
+	case "sum", "min", "max", "avg":
 		return isBareIdent(inner)
 	// agg-4: the two-arg by-time aggregates — EXACTLY two bare idents,
 	// re-serialized as `fn(a, b)`. The 3-arg top-N form, arg_max_null, and
