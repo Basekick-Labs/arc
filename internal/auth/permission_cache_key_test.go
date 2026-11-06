@@ -18,9 +18,10 @@ func TestPermissionCacheKeyOwnsItsStrings(t *testing.T) {
 			rm, info, cleanup := scopedRig(t, "read") // grants db1/cpu only
 			defer cleanup()
 
-			buf := []byte("db1")
-			reused := unsafe.String(&buf[0], len(buf)) // aliases buf, like c.Get
-			req := &PermissionCheckRequest{TokenInfo: info, Database: reused, Measurement: "cpu", Permission: "read"}
+			buf := []byte("db1cpu")
+			db := unsafe.String(&buf[0], 3)   // aliases buf, like c.Get
+			meas := unsafe.String(&buf[3], 3) // the measurement too (x-arc-measurement)
+			req := &PermissionCheckRequest{TokenInfo: info, Database: db, Measurement: meas, Permission: "read"}
 			var first *PermissionCheckResult
 			if batch {
 				first = rm.CheckPermissionsBatch([]*PermissionCheckRequest{req})[0]
@@ -31,7 +32,7 @@ func TestPermissionCacheKeyOwnsItsStrings(t *testing.T) {
 				t.Fatalf("granted db1/cpu denied: %+v", first)
 			}
 
-			copy(buf, "db2") // the next request on the connection reuses the buffer
+			copy(buf, "db2mem") // the next request on the connection reuses the buffer
 
 			// The stored key must still name db1. (A lookup for db2 alone would
 			// usually miss: the map hashed the key as db1 when it stored it, so
@@ -40,9 +41,9 @@ func TestPermissionCacheKeyOwnsItsStrings(t *testing.T) {
 			// the aliasing every time.)
 			rm.permCacheMu.RLock()
 			for k := range rm.permCache {
-				if k.tokenID == info.ID && k.database != "db1" {
+				if k.tokenID == info.ID && (k.database != "db1" || k.measurement != "cpu") {
 					rm.permCacheMu.RUnlock()
-					t.Fatalf("a cached key changed with the request buffer: database %q", k.database)
+					t.Fatalf("a cached key changed with the request buffer: %q/%q", k.database, k.measurement)
 				}
 			}
 			rm.permCacheMu.RUnlock()

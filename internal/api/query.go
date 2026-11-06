@@ -1894,8 +1894,9 @@ func extractTableReferences(sql string, identNames map[string]string) []TableRef
 func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission string) error {
 	// The x-arc-database header is what the query transform resolves bare
 	// names against on this path, so it is also what the check must use.
-	// Copied: c.Get points into the request buffer, which the next request on
-	// the connection reuses, and the name can outlive this request in caches.
+	// Copied, as defence in depth: c.Get points into the request buffer the
+	// next request on the connection reuses. The permission cache copies what
+	// it stores itself.
 	return h.checkQueryPermissionsForDefaultDB(c, sql, permission, strings.Clone(c.Get("x-arc-database")))
 }
 

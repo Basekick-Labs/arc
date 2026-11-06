@@ -860,6 +860,9 @@ different name of the same length, and a token scoped by RBAC could read a
 database it was not granted. The cache now stores its own copy of each name.
 Deployments without RBAC roles were not affected.
 
+The tiered-storage policy cache had the same shape for the database name of a
+policy. It now stores its own copy too.
+
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@gablealder823](https://github.com/gablealder823)**.
 
