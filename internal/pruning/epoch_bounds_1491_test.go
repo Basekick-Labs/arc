@@ -139,3 +139,35 @@ func TestEpochCallTimeYearLimits(t *testing.T) {
 		t.Errorf("epochCallTime = %v, %v; want %v", got, ok, last)
 	}
 }
+
+// The year limit holds for the bound as returned, after an inclusive end's
+// microsecond and a to_timestamp bound's second: a year-10000 end is read as
+// text by HasColdFilesInRange as earlier than every partition, so a query that
+// needs an unavailable cold tier would run on hot data only instead of 503.
+func TestAdjustedBoundsStayInYears(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	for _, q := range []string{
+		"SELECT * FROM db.q WHERE time >= '2026-10-01' AND time < to_timestamp(253402300799)",          // + 1 s
+		"SELECT * FROM db.q WHERE time >= '2026-10-01' AND time <= make_timestamp(253402300799999999)", // + 1 µs
+		"SELECT * FROM db.q WHERE time >= '2026-10-01' AND time <= '9999-12-31 23:59:59.999999'",       // a literal, + 1 µs
+		"SELECT * FROM db.q WHERE time >= '2026-10-01' AND time BETWEEN '2026-10-02' AND '9999-12-31 23:59:59.999999'",
+	} {
+		tr := p.ExtractTimeRange(q)
+		if tr == nil || !tr.EndAssumed {
+			t.Errorf("range %+v for %q, want the start alone (an assumed end)", tr, q)
+		}
+	}
+	// - 1 s from 0001-01-01 is year 0.
+	if tr := p.ExtractTimeRange("SELECT * FROM db.q WHERE time >= to_timestamp(-62135596800)"); tr != nil {
+		t.Errorf("range %v..%v, want none", tr.Start, tr.End)
+	}
+	// The last second of 9999 that still fits stays a bound.
+	if tr := p.ExtractTimeRange("SELECT * FROM db.q WHERE time >= '2026-10-01' AND time < to_timestamp(253402300798)"); tr == nil || tr.EndAssumed || tr.End.Year() != 9999 {
+		t.Errorf("range %+v, want an end in 9999", tr)
+	}
+	// (?i) folds Unicode: a name the regex matches that is none of the three
+	// (long s for s) is not a bound.
+	if tr := p.ExtractTimeRange("SELECT * FROM db.q WHERE time >= epoch_m\u017f(1790848800000)"); tr != nil {
+		t.Errorf("range %v..%v for a non-ASCII name, want none", tr.Start, tr.End)
+	}
+}

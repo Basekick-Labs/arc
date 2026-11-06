@@ -24,8 +24,12 @@ Accepted, with one plain number as the argument:
 - `to_timestamp(x)`: seconds, whole or decimal.
 
 Anything else in the call, such as arithmetic, a cast, a column or a second
-argument, gives no bound from that term, as before. So does a value outside
-years 0001 to 9999. A DELETE with such a bound now also reads only the files
+argument, gives no bound from that term, as before. So does a bound outside
+years 0001 to 9999, counting the second added to a `to_timestamp` bound and
+the microsecond added to an inclusive end. This also applies to a literal:
+`time <= '9999-12-31 23:59:59.999999'` no longer gives an end in year 10000,
+which a query that needs an unavailable cold tier read as "no cold data"
+instead of answering 503. A DELETE with such a bound now also reads only the files
 of its range (`delete.time_pruning`).
 
 `to_timestamp` is computed through a double and compared in the session time
@@ -4116,8 +4120,9 @@ settings, these queries returned too few rows, with `success: true`:
 
 A range is now read only from the query's single WHERE clause, and only from
 its top-level `AND` terms that are exactly a comparison of `time` with a
-literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
-`BETWEEN`. Other terms are ignored, which only widens the range. A top-level
+literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, with
+an epoch call of one number (since
+[#1491](https://github.com/Basekick-Labs/arc/issues/1491)), or a `BETWEEN`. Other terms are ignored, which only widens the range. A top-level
 `OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
 the whole measurement, correctly but without pruning.
 

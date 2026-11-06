@@ -213,6 +213,24 @@ func (b *timeBounds) addTerms(terms []string, literals map[string]string, now ti
 // microsecond (Arc's timestamp precision) past its literal, so the hour it
 // falls on is read.
 func readBoundTerm(term string, literals map[string]string, now time.Time) (lo, hi *time.Time, ok, proofSafe bool) {
+	lo, hi, ok, proofSafe = readBoundTermUnchecked(term, literals, now)
+	// The year limit applies to the bound as returned, after an inclusive
+	// end's microsecond and a to_timestamp bound's slack: either can carry
+	// 9999-12-31 into year 10000, which HasColdFilesInRange (it compares
+	// the range as text) reads as earlier than every real partition.
+	if ok && (!inBoundYears(lo) || !inBoundYears(hi)) {
+		return nil, nil, false, false
+	}
+	return lo, hi, ok, proofSafe
+}
+
+// inBoundYears reports whether a bound lies in years 0001-9999 (nil is a
+// side the term does not bound).
+func inBoundYears(t *time.Time) bool {
+	return t == nil || (!t.Before(minEpochCallTime) && t.Before(maxEpochCallTime))
+}
+
+func readBoundTermUnchecked(term string, literals map[string]string, now time.Time) (lo, hi *time.Time, ok, proofSafe bool) {
 	if m := betweenRHS.FindStringSubmatch(term); m != nil {
 		a, okA := operandTime(m[1:6], literals, now)
 		z, okZ := operandTime(m[6:11], literals, now)
@@ -333,11 +351,13 @@ func operandTime(m []string, literals map[string]string, now time.Time) (time.Ti
 //     TIMESTAMP, exactly; a decimal argument is a binder error in DuckDB.
 //   - to_timestamp(DOUBLE) returns a TIMESTAMPTZ, compared in the session
 //     time zone, which Arc pins to UTC (database/duckdb.go). DuckDB goes
-//     through a double, so its instant can be off from the exact one by up
-//     to a few milliseconds at the end of its range: epochCallSlack widens
-//     the bound by a second on its open side (readBoundTerm).
+//     through a double, so its instant can be off from the exact one by
+//     tens of microseconds near year 9999 (a double's spacing at 2.5e11 s
+//     is about 30 µs): epochCallSlack widens the bound by a second on its
+//     open side (readBoundTerm), far more than that.
 //
-// An instant outside years 0001-9999 is not a bound. A literal cannot
+// An instant outside years 0001-9999 is not a bound, and neither is a bound
+// that leaves them once adjusted (readBoundTerm). A literal cannot
 // spell one (parseDateTime takes four-digit years), and a consumer that
 // stores the range as text compares it as text: HasColdFilesInRange reads
 // "10000-01-01" as earlier than "2026-…".
@@ -347,18 +367,21 @@ func epochCallTime(whole string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	var t time.Time
-	switch strings.ToLower(p[1]) {
-	case "epoch_ms", "make_timestamp":
+	// Each name exactly, lowered: (?i) folds Unicode, so the regex also
+	// matches names that are none of the three (epoch_mſ), which DuckDB
+	// does not have. EqualFold would fold them the same way.
+	switch name := strings.ToLower(p[1]); {
+	case name == "epoch_ms" || name == "make_timestamp":
 		n, err := strconv.ParseInt(p[2], 10, 64)
 		if err != nil {
 			return time.Time{}, false
 		}
-		if strings.EqualFold(p[1], "epoch_ms") {
+		if name == "epoch_ms" {
 			t = time.UnixMilli(n)
 		} else {
 			t = time.UnixMicro(n)
 		}
-	default: // to_timestamp
+	case name == "to_timestamp":
 		f, err := strconv.ParseFloat(p[2], 64)
 		// Bound the seconds before converting; past this the year check
 		// below fails anyway, and int64 conversion of a huge float is not.
@@ -367,6 +390,8 @@ func epochCallTime(whole string) (time.Time, bool) {
 		}
 		sec := math.Floor(f) // floor, not truncation: -1.9 is -2 s + 0.1 s
 		t = time.Unix(int64(sec), int64((f-sec)*1e9))
+	default:
+		return time.Time{}, false
 	}
 	t = t.UTC()
 	if t.Before(minEpochCallTime) || !t.Before(maxEpochCallTime) {
@@ -390,7 +415,7 @@ var (
 // one epochCall shape whose instant is approximate.
 func isToTimestampCall(whole string) bool {
 	p := epochCallParts.FindStringSubmatch(strings.TrimSpace(whole))
-	return p != nil && strings.EqualFold(p[1], "to_timestamp")
+	return p != nil && strings.ToLower(p[1]) == "to_timestamp"
 }
 
 var placeholderPattern = regexp.MustCompile(`__STR_\d+__`)

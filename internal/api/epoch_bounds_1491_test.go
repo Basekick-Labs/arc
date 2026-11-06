@@ -35,6 +35,12 @@ func TestEpochCallBoundsHoldDuckDBsInstant(t *testing.T) {
 		// The far end of the range, where the double is coarsest.
 		"to_timestamp(253402300799.999)", "to_timestamp(253402300799)",
 	}
+	// Calls whose bound, once widened or moved past an inclusive end, leaves
+	// years 0001-9999 on some side: no range there.
+	atYearLimit := map[string]bool{
+		"make_timestamp(253402300799999999)": true, "make_timestamp(-62135596800000000)": true,
+		"to_timestamp(253402300799.999)": true, "to_timestamp(253402300799)": true,
+	}
 	for _, call := range calls {
 		var us int64
 		if err := db.QueryRow("SELECT epoch_us(" + call + "::TIMESTAMP)").Scan(&us); err != nil {
@@ -45,8 +51,20 @@ func TestEpochCallBoundsHoldDuckDBsInstant(t *testing.T) {
 			q := fmt.Sprintf("SELECT * FROM db.q WHERE time %s %s", op, call)
 			tr := pruning.ExtractTimeRangeAt(q, time.Now())
 			if tr == nil {
-				t.Errorf("%s: no range", q)
+				// No range is always safe; it is expected only where the
+				// adjusted bound leaves years 0001-9999.
+				if !atYearLimit[call] {
+					t.Errorf("%s: no range", q)
+				}
 				continue
+			}
+			for _, b := range []struct {
+				v       time.Time
+				assumed bool
+			}{{tr.Start, tr.StartAssumed}, {tr.End, tr.EndAssumed}} {
+				if !b.assumed && (b.v.Year() < 1 || b.v.Year() > 9999) {
+					t.Errorf("%s: bound %v outside years 0001-9999", q, b.v)
+				}
 			}
 			switch op {
 			case ">=", ">":
