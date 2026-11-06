@@ -58,6 +58,12 @@ func TestValidateSQLRequest_RejectsLiteralAfterRelationKeywords(t *testing.T) {
 		{"nested DESC", "SELECT * FROM (DESC '" + victim + "')"},
 		{"SHOW", "SHOW '" + victim + "'"},
 		{"nested SHOW", "SELECT * FROM (SHOW '" + victim + "')"},
+		// PostgreSQL's ONLY between the keyword and the relation.
+		{"FROM ONLY", "SELECT * FROM ONLY '" + victim + "'"},
+		{"JOIN ONLY", "SELECT * FROM db1.cpu JOIN ONLY '" + victim + "' ON true"},
+		{"comma ONLY", "SELECT * FROM db1.cpu, ONLY '" + victim + "'"},
+		{"lowercase only, double-quoted path", `SELECT * FROM only "` + victim + `"`},
+		{"TABLE ONLY", "SELECT * FROM (TABLE ONLY '" + victim + "')"},
 	}
 	for _, tt := range rejected {
 		t.Run("rejected/"+tt.name, func(t *testing.T) {
@@ -89,11 +95,14 @@ func TestValidateSQLRequest_RejectsLiteralAfterRelationKeywords(t *testing.T) {
 		{"window ORDER BY DESC", "SELECT first(v ORDER BY time DESC) FROM db1.cpu WHERE host = 'a'"},
 		{"string_agg ORDER BY DESC", "SELECT string_agg(host, ',' ORDER BY time DESC) FROM db1.cpu"},
 		{"SHOW TABLES", "SHOW TABLES"},
-		// Columns named like a relation keyword, compared with a literal.
-		{"column named show", "SELECT * FROM db1.cpu WHERE show = 'a'"},
-		{"column named summarize", "SELECT * FROM db1.cpu WHERE summarize <> 'a'"},
-		{"column named pivot_wider", "SELECT * FROM db1.cpu WHERE pivot_wider >= 'a'"},
-		{"column named show, concatenated", "SELECT show || 'a' FROM db1.cpu"},
+		// DuckDB reserves these words; unquoted, one names a column only
+		// through a qualifier.
+		{"qualified column named show", "SELECT * FROM db1.cpu c WHERE c.show = 'a'"},
+		{"qualified column named summarize", "SELECT * FROM db1.cpu c WHERE c.summarize <> 'a'"},
+		{"qualified column named pivot_wider", "SELECT * FROM db1.cpu c WHERE c.pivot_wider >= 'a'"},
+		{"qualified column named table, any operator", "SELECT * FROM db1.cpu c WHERE c.table @> 'a'"},
+		{"qualified column named desc, subscript", "SELECT c.desc['k'] FROM db1.cpu c"},
+		{"ONLY on a named table", "SELECT * FROM ONLY db1.cpu"},
 		{"SHOW DATABASES", "SHOW DATABASES"},
 		{"nested PIVOT_WIDER on a real table", "SELECT * FROM (PIVOT_WIDER db1.cpu ON host USING count(*))"},
 		{"nested PIVOT_LONGER on a real table", "SELECT * FROM (PIVOT_LONGER db1.cpu ON usage INTO NAME k VALUE v)"},

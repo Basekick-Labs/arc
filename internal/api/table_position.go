@@ -93,6 +93,12 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 
 		// tok is a placeholder or an identifier/keyword run.
 		inTablePos := afterFromJoin || afterComma
+		if inTablePos && strings.EqualFold(tok, "only") {
+			// PostgreSQL's inheritance modifier, which DuckDB accepts between
+			// the keyword and the relation (`FROM ONLY t`) and which reads a
+			// path there too. Transparent: the relation is the next atom.
+			continue
+		}
 		if inTablePos {
 			if visit(tablePosition{tok: tok, start: m[0], end: m[1], viaComma: afterComma, introStart: introStart}) {
 				return
@@ -146,11 +152,10 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 			// literal directly after one of these keywords has no legitimate
 			// form to protect.
 			//
-			// Several are also valid column names (`WHERE show = 'a'`). The
-			// walker does not tokenise operators, so a comparison would put the
-			// literal "directly after" the name; an operator next means the
-			// word is an operand, not a relation keyword, and nothing is armed.
-			if operatorFollows(normalised, m[1]) {
+			// DuckDB reserves every one of these words, so unquoted one names
+			// a column only as the attribute of a qualified name
+			// (`c.show = 'a'`), never a relation keyword: nothing is armed.
+			if dotPrecedes(normalised, m[0]) {
 				break
 			}
 			afterFromJoin = true
@@ -398,15 +403,14 @@ func countSQLTokenStart(sqlLower, s string) int {
 	}
 }
 
-// operatorFollows reports whether the next non-space byte at or after pos in s
-// is an operator character, so the word before it is an operand. No relation
-// keyword is ever followed by one.
-func operatorFollows(s string, pos int) bool {
-	for i := pos; i < len(s); i++ {
+// dotPrecedes reports whether the last non-space byte before pos in s is a
+// dot, so the word at pos is the attribute of a qualified name.
+func dotPrecedes(s string, pos int) bool {
+	for i := pos - 1; i >= 0; i-- {
 		switch s[i] {
 		case ' ', '\t', '\n', '\r', '\f', '\v':
 			continue
-		case '=', '<', '>', '!', '+', '-', '*', '/', '%', '|', '&', '^', '~':
+		case '.':
 			return true
 		}
 		return false

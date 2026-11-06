@@ -660,11 +660,12 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 A string literal in table position is refused because DuckDB would read it as
 a file. The check now also covers `PIVOT_WIDER`, `PIVOT_LONGER`, `DESC` and
 `SHOW`, DuckDB's other spellings of `PIVOT`, `UNPIVOT` and `DESCRIBE`, which
-read a file the same way inside a subquery. Such a query is answered `400` on
-every query endpoint, in continuous queries and in `DELETE` predicates.
-Queries that use these keywords on a measurement are unaffected, and a column
-named like one of these keywords, `TABLE`, `SUMMARIZE`, `PIVOT` or `UNPIVOT`
-and compared with a literal (`WHERE show = 'a'`) is no longer refused.
+read a file the same way (`SHOW` at the top level too, the others inside a
+subquery), and `ONLY` between such a keyword and the relation
+(`FROM ONLY …`). Such a query is answered `400` on every query endpoint, in
+continuous queries and in `DELETE` predicates. Queries that use these keywords
+on a measurement are unaffected, and a column of one of these names referenced
+through a table qualifier (`c.show = 'a'`) is no longer refused.
 
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
