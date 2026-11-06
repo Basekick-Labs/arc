@@ -1079,6 +1079,8 @@ func main() {
 		walLog := log.Info().
 			Str("directory", cfg.WAL.Directory).
 			Str("sync_mode", cfg.WAL.SyncMode).
+			Str("ack_mode", cfg.WAL.AckMode).
+			Bool("ack_mode_auto", cfg.WAL.AckModeAuto).
 			Int("max_size_mb", cfg.WAL.MaxSizeMB).
 			Int("max_age_seconds", cfg.WAL.MaxAgeSeconds).
 			Bool("disk_pressure_enabled", walDisk != nil)

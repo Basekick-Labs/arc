@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"errors"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"sync"
 	"time"
 
@@ -27,8 +28,10 @@ const (
 	// directory is at wal.max_directory_mb (#676); counted in
 	// arc_wal_disk_pressure_rejections_total.
 	RefusalWALDisk = "wal_disk"
-	// RefusalWALNotDurable: with wal.ack_mode = "durable", the write's WAL
-	// entry could not be made durable (write or sync failure, shutdown).
+	// RefusalWALNotDurable: with wal.ack_mode = "durable" (the resolved
+	// default with the WAL on, #1499), the write's WAL entry could not be
+	// made durable (write or sync failure, shutdown); counted in
+	// arc_wal_not_durable_rejections_total.
 	RefusalWALNotDurable = "wal_not_durable"
 	// RefusalImportQueue: a bulk import waited ingest.import_queue_timeout_ms
 	// for one of the node's import write slots (#1429).
@@ -97,6 +100,7 @@ var ErrWALNotDurable error = &WriteRefusal{
 // walNotDurable wraps a WAL ErrNotDurable as a not-durable refusal, keeping
 // the cause in the text.
 func walNotDurable(err error) error {
+	metrics.Get().IncWALNotDurableRejections()
 	return &WriteRefusal{
 		Reason: RefusalWALNotDurable,
 		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",

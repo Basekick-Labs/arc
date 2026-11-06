@@ -2,6 +2,63 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
+
+`wal.ack_mode` now defaults to `"auto"`, which is `"durable"` on every node
+with `wal.enabled = true`: a 2xx means a sync covering the write's WAL entry
+has completed, so a crash loses no acknowledged write. Before, the default was
+`"queued"`: a write was acknowledged once its entry was queued for the WAL
+writer, and a kill -9 right after the acknowledgement could lose it. #1492's
+crash harness lost the last acknowledged request, 50,000 rows, in one of seven
+runs that way. Nothing in `arc.toml` or the docs' defaults said that "WAL on"
+did not mean "acknowledged means durable"; now it does.
+
+`"auto"` resolves to `"queued"` where durable is not available: with the WAL
+off (the key has no effect) and with `cluster.wal_coverage = true`
+(experimental, [#1207](https://github.com/Basekick-Labs/arc/issues/1207)), whose
+covered append commits under the ingest shard lock, where a durable wait would
+stall every writer to the measurement. That resolution is logged as a config
+warning and in the `WAL enabled` startup line (`ack_mode`, `ack_mode_auto`).
+Setting `wal.ack_mode = "queued"` restores the old behaviour; `"durable"`
+with `cluster.wal_coverage` is still refused at startup.
+
+What changes with the WAL on:
+
+- **Latency.** Each request waits for the sync that covers its entry, about
+  one `fsync` (shared between the requests in flight: a durable entry starts a
+  sync at once, it does not wait for the 100 ms interval). Sequential small
+  writers feel it most. Measured on an M3 Max (`fdatasync` falls back to a
+  full `fsync` there), 8.7M rows of MessagePack columnar writes: 50,000-row
+  requests from one client 4.7M rows/s → 2.9M rows/s; 5,000-row requests from
+  one client 2.8M → 0.66M rows/s; 5,000-row requests from eight clients 9.4M →
+  2.4M rows/s. Throughput-first benchmarks should set `wal.ack_mode =
+  "queued"` to stay comparable with earlier numbers.
+- **A write the WAL cannot make durable is refused**, with `503`,
+  `Retry-After` and `X-Arc-Ingest-Refused: wal_not_durable`, counted in the
+  new `arc_wal_not_durable_rejections_total`. Before, the write was
+  acknowledged and the entry dropped (`arc_wal_dropped_entries_total`) or
+  lost at the crash. The refusal comes after the append: the entry may still
+  reach the WAL file and replay at the next start, so a client's retry can
+  duplicate rows (at-least-once). A request spanning several measurements is
+  written one at a time; a failure after some were buffered answers `500`
+  naming what was written, as for other refusals.
+- **A stalled WAL device stalls writes instead of losing them.** With
+  `"queued"`, a hung disk meant the WAL queue filled, entries were dropped and
+  ingest kept answering 204 for writes that were never durable. With
+  `"durable"` every request waits until its sync completes or the WAL writer
+  closes; the request context does not interrupt that wait. The disk-pressure
+  gate (#676) covers low free space, not a hung device. Watch
+  `arc_wal_failed_syncs_total`, `arc_wal_not_durable_rejections_total` and the
+  `wal_not_durable` refusal log.
+- **MQTT.** A message refused as not durable is retried for 2 seconds and then
+  dropped, as for other refusals; a stalled or failing WAL therefore costs
+  MQTT messages where `"queued"` acknowledged them and risked them at the next
+  crash. Set `wal.ack_mode = "queued"` for an MQTT deployment where a stalled
+  WAL disk must never cost a message, until a not-durable suspend reason
+  exists for MQTT (follow-up).
+- **The shipped examples** (`deploy/docker-compose/*`, `deploy/kubernetes*`)
+  enable the WAL and so take the new default.
+
 ## Fix: a crash during a multi-hour flush no longer replays the hours already stored ([#1492](https://github.com/Basekick-Labs/arc/issues/1492))
 
 A flush whose rows span several hours writes one Parquet file per hour. The
@@ -2985,7 +3042,7 @@ a column that could not be converted. The client got the refusal, usually a
 purge, or for a shutdown refusal the next start, replayed it, so the rows were
 stored twice.
 
-- **`wal.ack_mode = "queued"` (the default):** the WAL entry is now built
+- **`wal.ack_mode = "queued"`** (the default until [#1499](https://github.com/Basekick-Labs/arc/issues/1499) made `"auto"`, durable with the WAL on, the default)**:** the WAL entry is now built
   before the shard lock, as before, but only queued for the WAL file after
   those checks pass, under the same lock that puts the batch in the buffer.
   WAL coverage already worked this way. A refused write leaves nothing in the
