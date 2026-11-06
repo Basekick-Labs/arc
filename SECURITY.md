@@ -45,6 +45,10 @@ They are closed without a response, the accounts are reported to GitHub, and
 they are blocked from the organisation. Using a tool to find a bug is fine;
 making us verify what you did not is not.
 
+**Reports from new GitHub accounts are discarded unread.** An account created
+less than 90 days before the report is treated as an account created to file
+it, whatever the report says.
+
 ## Out of scope
 
 These are known, documented or by design, and reports about them are closed
