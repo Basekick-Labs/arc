@@ -170,30 +170,33 @@ don't contain these sequences outside literals are unaffected.
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
 
-## Ingest: Parquet row groups capped at 122,880 rows; page index written
+## Ingest: Parquet row groups capped at 524,288 rows (page index available, off)
 
 Each ingest flush used to become one Parquet row group (arrow-go's default cap is
 64 Mi rows), so an hourly file was a single 3.3 M-row group: no row-group
 min/max pruning inside the file, and one unit of parallel decode per file for
-every reader. Ingest now caps row groups at 122,880 rows, the size compaction
-already writes, and also writes the Parquet page index (column and offset
-index). Both are free at the writer (+1.6 % CPU for the cap, 0 for the index;
-file size unchanged). Measured on 40 M rows through the arcx engine, the cap
-alone turns a time-ordered `ORDER BY time DESC LIMIT 100` with a tag filter
-from 70 ms to 4 ms, an hourly `date_trunc` bucket from 67 to 48 ms, and filtered
-scans 10–25 % faster; DuckDB gains less because it prunes fewer shapes by
-row-group statistics. Nothing in Arc reads the page index yet; files written
-from now on carry it for the reader that will. Compaction's DuckDB `COPY` does
-not preserve the page index, so it lives on hot-tier files; tiering moves files
-whole; continuous-query output and `/api/v1/import` go through the same writer
-and get both. The column index needs `write_statistics = true` (the default);
-the offset index is always written. Values of `max_row_group_rows` between 1
-and 1023, or negative, are rejected at startup.
+every reader. Ingest now caps row groups at 524,288 rows. Measured on the
+sustained msgpack benchmark (iot, 12 workers, 60 s, 5 M-row flushes) this cap
+is free — 36.9 M rec/s against 36.1 M on the previous build, within run-to-run
+noise — where compaction's 122,880 cost 1.7 % alone and 3.7 % together with the
+page index. Through the arcx engine on 40 M rows, a time-ordered
+`ORDER BY time DESC LIMIT 100` with a tag filter goes from 70 ms to 5 ms, an
+hourly `date_trunc` bucket from 67 to 58 ms, filtered scans 10–20 % faster;
+DuckDB gains less because it prunes fewer shapes by row-group statistics.
+
+The Parquet page index (column and offset index) can be written too, but it is
+off by default: nothing in Arc reads it yet, and its write cost grows with the
+row-group count (−3.7 % at 41 groups per flush). Compaction's DuckDB `COPY`
+does not preserve it, tiering moves files whole, and continuous-query output
+and `/api/v1/import` go through the same writer and get both settings. The
+column index needs `write_statistics = true` (the default); the offset index
+is always written when enabled. Values of `max_row_group_rows` between 1 and
+1023, or negative, are rejected at startup.
 
 ```toml
 [ingest]
-max_row_group_rows = 122880   # 0 restores one row group per flush
-write_page_index = true
+max_row_group_rows = 524288   # 0 restores one row group per flush; 122880 matches compaction (−1.7 % sustained ingest)
+write_page_index = false      # true writes column + offset indexes (no reader in Arc yet)
 ```
 
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.

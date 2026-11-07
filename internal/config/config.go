@@ -163,8 +163,8 @@ type IngestConfig struct {
 	NumericDictionary     bool     // With UseDictionary, also dictionary-encode numeric/timestamp columns (pre-26.09.1 behavior; costs hashing+boxing per value)
 	WriteStatistics       bool     // Write Parquet statistics
 	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
-	MaxRowGroupRows       int      // Rows per Parquet row group at ingest (default 122880, compaction's size; 0 = one row group per flush; 1..1023 and negatives rejected by Load)
-	WritePageIndex        bool     // Write the Parquet page index at ingest (default true; free). Offset index always; column index only where statistics exist (needs write_statistics) and fit the stats size cap
+	MaxRowGroupRows       int      // Rows per Parquet row group at ingest (default 524288, free on the sustained benchmark; 0 = one row group per flush; 1..1023 and negatives rejected by Load)
+	WritePageIndex        bool     // Write the Parquet page index at ingest (default false: no reader yet, cost grows with row-group count). Offset index always; column index only where statistics exist (needs write_statistics) and fit the stats size cap
 	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
@@ -2167,16 +2167,20 @@ func setDefaults(v *viper.Viper) {
 	// Row groups are the unit of parallelism and of min/max pruning for every
 	// reader. One flush used to become one row group (arrow-go's default cap is
 	// 64 Mi rows), so an hourly file was ONE group: nothing to prune, one task
-	// per file. 122880 is what compaction writes; measured free at the writer
-	// (+1.6% CPU) and worth 70 → 4 ms on a time-ordered top-N through arcx
-	// (plannings: Arc_research_ingest_writer_knobs, 2026-11-07).
-	v.SetDefault("ingest.max_row_group_rows", 122880)
-	// Page index: free at the writer, read by nothing in Arc yet; written so
-	// files already carry it when a consumer lands. The offset index is always
-	// written; the column index needs write_statistics and is dropped for a
-	// chunk whose page stats are missing or over the stats size cap (arrow-go
-	// discards, never errors). Compaction (DuckDB COPY) does not preserve it.
-	v.SetDefault("ingest.write_page_index", true)
+	// per file. 524288 measured FREE on the sustained msgpack benchmark (36.9 M
+	// vs 36.1 M rec/s on main, within noise) where compaction's 122880 cost
+	// 1.7 % alone and 3.7 % with the page index; through arcx a time-ordered
+	// top-N still goes 70 → 5 ms and an hourly bucket 67 → 58 ms (plannings:
+	// Arc_research_ingest_writer_knobs, 2026-11-07).
+	v.SetDefault("ingest.max_row_group_rows", 524288)
+	// Page index: nothing in Arc reads it yet and its write cost grows with the
+	// row-group count (−3.7 % at 41 groups per 5 M-row flush on the sustained
+	// benchmark), so it is off until a consumer exists. When on, the offset
+	// index is always written; the column index needs write_statistics and is
+	// dropped for a chunk whose page stats are missing or over the stats size
+	// cap (arrow-go discards, never errors). Compaction (DuckDB COPY) does not
+	// preserve it.
+	v.SetDefault("ingest.write_page_index", false)
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
 	v.SetDefault("ingest.shard_count", 32)

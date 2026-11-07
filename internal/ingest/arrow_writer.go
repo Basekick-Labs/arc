@@ -254,7 +254,8 @@ func NewArrowWriter(cfg *config.IngestConfig, logger zerolog.Logger) *ArrowWrite
 	// Row-group cap: one flush (one Arrow record) used to be one row group, so
 	// an hourly file had a single 3.3 M-row group — no min/max pruning inside
 	// the file and one work item per file for every reader. 0 keeps that
-	// writer default; the configured default matches compaction's 122880.
+	// writer default; the configured default is 524288 (free on the sustained
+	// msgpack benchmark; compaction's 122880 measured 1.7 % there).
 	if cfg.MaxRowGroupRows > 0 {
 		writerOpts = append(writerOpts, parquet.WithMaxRowGroupLength(int64(cfg.MaxRowGroupRows)))
 	}
