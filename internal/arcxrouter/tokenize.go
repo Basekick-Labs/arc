@@ -700,8 +700,8 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 		if !ok || f.kind != tokIdent {
 			return fail()
 		}
-		switch f.lower {
-		case "count", "sum", "min", "max", "avg":
+		switch {
+		case unaryAggFns[f.lower]:
 			if !c.punct('(') {
 				return fail()
 			}
@@ -732,7 +732,7 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 				}
 				items = append(items, f.lower+"("+argRef+")")
 			}
-		case "arg_max", "arg_min", "max_by", "min_by":
+		case twoArgAggFns[f.lower]:
 			// agg-4 two-arg by-time aggregates: `fn(payload, orderkey)` — both
 			// bare idents, re-serialized `fn(a, b)` (fn lowercased, spellings
 			// preserved). The 3-arg top-N form and any other arg-shape fall to
@@ -809,6 +809,12 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	fail := func() (groupedMatch, bool) { return groupedMatch{}, false }
 	var items []string
 	var bucketText, tagKey, whereText, meas string
+	// agg-6a: a moment aggregate is served grouped ONLY under a bucket key.
+	// Measured on the production cpu corpus (3.95B rows, through Arc): hourly
+	// bucket + var_samp 6.1 s vs DuckDB 8.9 s (the engine folds bucket RUNS as
+	// two-pass partials); host + stddev 18.3 s vs 6.7 s (interleaved tag keys
+	// pay a per-row Welford chain) — a known loss, not routed (gotcha #5).
+	hasMoment := false
 
 	bucketItem := -1
 	tagItem := -1
@@ -941,7 +947,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				bucketText += " AS " + alias
 			}
 			items = append(items, bucketText)
-		} else if isCall && (t.lower == "arg_max" || t.lower == "arg_min" || t.lower == "max_by" || t.lower == "min_by") {
+		} else if isCall && twoArgAggFns[t.lower] {
 			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm).
 			item, iok := parseTwoArgAggItem(c, t.lower)
 			if !iok {
@@ -950,10 +956,11 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			items = append(items, item)
 			nAggs++
 		} else if isCall {
-			switch t.lower {
-			case "count", "sum", "min", "max", "avg":
-			default:
+			if !unaryAggFns[t.lower] {
 				return fail()
+			}
+			if momentAggFns[t.lower] {
+				hasMoment = true
 			}
 			c.i++ // consume '('
 			if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
@@ -1078,6 +1085,9 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	if len(seen) != nKeys {
 		return fail() // every projected key must be grouped exactly once
 	}
+	if hasMoment && tagKey != "" {
+		return fail() // agg-6a: tag-keyed moments are a measured loss (see hasMoment)
+	}
 	// Optional `HAVING <tree>` (agg-5a) — clause order is GROUP BY, HAVING,
 	// ORDER BY. Re-serialized from validated parts; the grammar is the engine's,
 	// so a shape accepted here cannot be one the engine declines.
@@ -1156,6 +1166,34 @@ type groupedMatch struct {
 // parseTwoArgAggItem consumes `( <bare ident> , <bare ident> )` after an agg-4
 // function name and re-serializes it as `fn(a, b)` — validated tokens only,
 // never source text. Anything else (star, expression, a third argument) fails.
+// unaryAggFns: the single-bare-column aggregates the engine serves — the agg-1
+// set, the `mean` alias of `avg`, and the agg-6a moment family (arcX
+// feat/agg6-moments: var_pop, var_samp, variance, stddev, stddev_samp,
+// stddev_pop, sem). `count(*)` is the one star form and is special-cased at
+// each site. Every select-list, HAVING and re-validation arm consults THIS map,
+// so adding a unary aggregate the engine has proven in its differential harness
+// is a one-line router change. Not here, deliberately: skewness/kurtosis (held
+// until Arc pins DuckDB 2.0 — v1.5.6's raw-sum algorithm cannot be matched
+// within the shadow tolerance at mean/σ ≥ 10), the binary covariance/
+// correlation family (agg-6b), and every sketch/collection aggregate.
+var unaryAggFns = map[string]bool{
+	"count": true, "sum": true, "min": true, "max": true, "avg": true, "mean": true,
+	"var_pop": true, "var_samp": true, "variance": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+}
+
+// momentAggFns: the agg-6a subset of unaryAggFns whose grouped form is gated to
+// bucket-keyed shapes (see matchGroupedAgg's hasMoment).
+var momentAggFns = map[string]bool{
+	"var_pop": true, "var_samp": true, "variance": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+}
+
+// twoArgAggFns: the agg-4 by-time aggregates — `fn(payload, orderkey)`.
+var twoArgAggFns = map[string]bool{
+	"arg_max": true, "arg_min": true, "max_by": true, "min_by": true,
+}
+
 func parseTwoArgAggItem(c *cursor, fnLower string) (string, bool) {
 	if !c.punct('(') {
 		return "", false

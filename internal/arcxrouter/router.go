@@ -506,16 +506,18 @@ func isAggItem(item string) bool {
 		return false
 	}
 	inner := item[open+1 : len(item)-1]
-	switch item[:open] {
-	// `count` also takes a map subscript `m['k']` (map-2); the other four stay bare.
-	case "count":
+	fn := item[:open]
+	switch {
+	// `count` also takes a map subscript `m['k']` (map-2); every other unary
+	// aggregate (agg-1 set, mean, the agg-6a moments) stays bare.
+	case fn == "count":
 		return isColumnRef(inner)
-	case "sum", "min", "max", "avg":
+	case unaryAggFns[fn]:
 		return isBareIdent(inner)
 	// agg-4: the two-arg by-time aggregates — EXACTLY two bare idents,
 	// re-serialized as `fn(a, b)`. The 3-arg top-N form, arg_max_null, and
 	// no-underscore argmax/argmin exist on DuckDB and must NOT match.
-	case "arg_max", "arg_min", "max_by", "min_by":
+	case twoArgAggFns[fn]:
 		a, b, ok := strings.Cut(inner, ", ")
 		return ok && isBareIdent(a) && isBareIdent(b)
 	}

@@ -151,8 +151,8 @@ func havingRef(c *cursor, hc havingCtx) (string, bool) {
 	isCall := c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '('
 	if isCall {
 		var itemText string
-		switch t.lower {
-		case "count", "sum", "min", "max", "avg":
+		switch {
+		case unaryAggFns[t.lower]:
 			// Mirrors the select-list arm in matchGroupedAgg exactly (same accepted
 			// forms, same emitted text); kept inline rather than refactoring that
 			// proven arm into a shared helper.
@@ -173,7 +173,7 @@ func havingRef(c *cursor, hc havingCtx) (string, bool) {
 				}
 				itemText = t.lower + "(" + arg.orig + ")"
 			}
-		case "arg_max", "arg_min", "max_by", "min_by":
+		case twoArgAggFns[t.lower]:
 			var iok bool
 			itemText, iok = parseTwoArgAggItem(c, t.lower)
 			if !iok {
