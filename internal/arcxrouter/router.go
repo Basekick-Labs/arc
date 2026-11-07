@@ -492,9 +492,11 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	return b.String(), true
 }
 
-// isAggItem re-validates one re-serialized aggregate item: `count(*)`, or
-// `{count|sum|min|max|avg}(<bare ident>)` with the fn lowercased — exactly what
-// matchScanAgg emits.
+// isAggItem re-validates one re-serialized aggregate item: `count(*)`,
+// `{count|sum|min|max|avg}(<bare ident>)` or `count(<ident>['<key>'])` (map-2) with
+// the fn lowercased — exactly what matchScanAgg emits. The grouped matcher never
+// emits the subscript form (its agg arm requires `)` right after the ident), so
+// the gate for grouped map aggregates is that matcher, not this re-check.
 func isAggItem(item string) bool {
 	if item == "count(*)" {
 		return true
@@ -505,7 +507,10 @@ func isAggItem(item string) bool {
 	}
 	inner := item[open+1 : len(item)-1]
 	switch item[:open] {
-	case "count", "sum", "min", "max", "avg":
+	// `count` also takes a map subscript `m['k']` (map-2); the other four stay bare.
+	case "count":
+		return isColumnRef(inner)
+	case "sum", "min", "max", "avg":
 		return isBareIdent(inner)
 	// agg-4: the two-arg by-time aggregates — EXACTLY two bare idents,
 	// re-serialized as `fn(a, b)`. The 3-arg top-N form, arg_max_null, and
@@ -536,7 +541,8 @@ func isArgItem(item string) bool {
 //
 //	SELECT <cols> FROM read_parquet([<paths>]) [WHERE <col> <op> <lit> AND ...]
 //
-// Every column (projection AND predicate) must be a bare identifier — they came
+// Every column (projection AND predicate) must be a bare identifier or a map
+// subscript `col['key']` (map-1; isColumnRef) — they came
 // from the tokenizer as identifiers, so injection-safe by construction, but we
 // guard defensively. String literals are single-quote escaped; numeric literals
 // are validated as integers. Declines (ok=false) on any non-bare column or
@@ -552,7 +558,7 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 		// re-serialized by matchProjFunc (`length(col)`, 2f-0). Re-validate both here
 		// (defense in depth vs a hand-built Decision) — a bare ident, or a proj-func
 		// item whose form re-parses cleanly.
-		if !isBareIdent(col) && !isProjFuncItem(col) {
+		if !isColumnRef(col) && !isProjFuncItem(col) {
 			return "", false
 		}
 		if i > 0 {
@@ -573,7 +579,7 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	} else if len(d.Preds) > 0 {
 		b.WriteString(" WHERE ")
 		for i, p := range d.Preds {
-			if !isBareIdent(p.col) {
+			if !isColumnRef(p.col) {
 				return "", false
 			}
 			if i > 0 {

@@ -155,7 +155,7 @@ func TestManager_ListPolicies(t *testing.T) {
 func TestManager_CheckRateLimit_NoPolicy(t *testing.T) {
 	m := setupTestManager(t, nil)
 
-	result := m.CheckRateLimit(999)
+	result := m.Admit(999)
 	if !result.Allowed {
 		t.Fatal("expected Allowed=true with no policy and no defaults")
 	}
@@ -171,18 +171,20 @@ func TestManager_CheckRateLimit_WithPolicy(t *testing.T) {
 	})
 
 	for i := 0; i < 3; i++ {
-		result := m.CheckRateLimit(1)
+		result := m.Admit(1)
 		if !result.Allowed {
 			t.Fatalf("expected Allowed=true on request %d", i+1)
 		}
 	}
 
-	result := m.CheckRateLimit(1)
+	result := m.Admit(1)
 	if result.Allowed {
 		t.Fatal("expected Allowed=false after exceeding rate limit")
 	}
-	if result.RetryAfterSec < 1 {
-		t.Fatalf("expected RetryAfterSec >= 1, got %d", result.RetryAfterSec)
+	// The three requests above landed together, so nothing frees up until they
+	// leave the one-minute window.
+	if result.RetryAfterSec < 50 || result.RetryAfterSec > 60 {
+		t.Fatalf("expected RetryAfterSec near 60 after a burst, got %d", result.RetryAfterSec)
 	}
 }
 
@@ -192,10 +194,10 @@ func TestManager_CheckRateLimit_WithDefaults(t *testing.T) {
 	})
 
 	// No per-token policy — should use config defaults
-	m.CheckRateLimit(1)
-	m.CheckRateLimit(1)
+	m.Admit(1)
+	m.Admit(1)
 
-	result := m.CheckRateLimit(1)
+	result := m.Admit(1)
 	if result.Allowed {
 		t.Fatal("expected Allowed=false after exceeding default rate limit")
 	}
@@ -204,7 +206,7 @@ func TestManager_CheckRateLimit_WithDefaults(t *testing.T) {
 func TestManager_CheckQuota_NoPolicy(t *testing.T) {
 	m := setupTestManager(t, nil)
 
-	result := m.CheckQuota(999)
+	result := m.Admit(999)
 	if !result.Allowed {
 		t.Fatal("expected Allowed=true with no policy and no defaults")
 	}
@@ -222,15 +224,18 @@ func TestManager_CheckQuota_WithPolicy(t *testing.T) {
 	})
 
 	for i := 0; i < 3; i++ {
-		result := m.CheckQuota(1)
+		result := m.Admit(1)
 		if !result.Allowed {
 			t.Fatalf("expected Allowed=true on query %d", i+1)
 		}
 	}
 
-	result := m.CheckQuota(1)
+	result := m.Admit(1)
 	if result.Allowed {
 		t.Fatal("expected Allowed=false after exceeding hourly quota")
+	}
+	if result.RetryAfterSec < 1 || result.RetryAfterSec > 3600 {
+		t.Fatalf("expected RetryAfterSec to be the wait for the next hour, got %d", result.RetryAfterSec)
 	}
 }
 
@@ -243,7 +248,7 @@ func TestManager_CheckQuota_ReturnsMaxRows(t *testing.T) {
 		MaxRowsPerQuery: 50000,
 	})
 
-	result := m.CheckQuota(1)
+	result := m.Admit(1)
 	if !result.Allowed {
 		t.Fatal("expected Allowed=true")
 	}
@@ -261,7 +266,7 @@ func TestManager_CheckQuota_ReturnsMaxDuration(t *testing.T) {
 		MaxScanDurationSec: 15,
 	})
 
-	result := m.CheckQuota(1)
+	result := m.Admit(1)
 	if !result.Allowed {
 		t.Fatal("expected Allowed=true")
 	}
@@ -282,22 +287,20 @@ func TestManager_GetTokenUsage(t *testing.T) {
 		MaxQueriesPerDay:   1000,
 	})
 
-	// Make some requests to populate usage
-	m.CheckRateLimit(1)
-	m.CheckRateLimit(1)
-	m.CheckQuota(1)
-	m.CheckQuota(1)
-	m.CheckQuota(1)
+	// Five admitted queries: each counts once on every limit.
+	for i := 0; i < 5; i++ {
+		m.Admit(1)
+	}
 
 	usage := m.GetTokenUsage(1)
 	if usage.TokenID != 1 {
 		t.Fatalf("expected TokenID=1, got %d", usage.TokenID)
 	}
-	if usage.QueriesThisHour != 3 {
-		t.Fatalf("expected QueriesThisHour=3, got %d", usage.QueriesThisHour)
+	if usage.QueriesThisHour != 5 {
+		t.Fatalf("expected QueriesThisHour=5, got %d", usage.QueriesThisHour)
 	}
-	if usage.RateLimitRemainingPerMin != 58 { // 60 - 2
-		t.Fatalf("expected RateLimitRemainingPerMin=58, got %d", usage.RateLimitRemainingPerMin)
+	if usage.RateLimitRemainingPerMin != 55 { // 60 - 5
+		t.Fatalf("expected RateLimitRemainingPerMin=55, got %d", usage.RateLimitRemainingPerMin)
 	}
 }
 
@@ -362,4 +365,26 @@ func TestManager_PolicyPersistsAfterReload(t *testing.T) {
 		t.Fatalf("expected RateLimitPerMinute=99, got %d", got.RateLimitPerMinute)
 	}
 	m2.Stop()
+}
+
+// With both rate limits exhausted, a refusal by the per-minute limit gives the
+// per-hour wait: waiting only out the minute would be refused again by the
+// hour.
+func TestManager_CheckRateLimit_BothLimitsExhausted(t *testing.T) {
+	m := setupTestManager(t, nil)
+	m.CreatePolicy(context.Background(), &Policy{TokenID: 1, RateLimitPerMinute: 2, RateLimitPerHour: 2})
+	for i := 0; i < 2; i++ {
+		if r := m.Admit(1); !r.Allowed {
+			t.Fatalf("request %d refused", i+1)
+		}
+	}
+	r := m.Admit(1)
+	if r.Allowed {
+		t.Fatal("third request allowed")
+	}
+	// The two requests sit in the current one-minute slot of the hour window,
+	// which clears 59-60 minutes from now.
+	if r.RetryAfterSec < 3500 || r.RetryAfterSec > 3600 {
+		t.Fatalf("RetryAfterSec = %d, want the hour limiter's wait (~3540-3600)", r.RetryAfterSec)
+	}
 }

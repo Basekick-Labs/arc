@@ -68,7 +68,7 @@ func TestOfflineClientGrid(t *testing.T) {
 	})
 
 	t.Run("expired rejected", func(t *testing.T) {
-		lf, sig := mint("", -time.Minute)
+		lf, sig := mint("", -20*24*time.Hour)
 		path := writeOfflineFile(t, `{"license_file":"`+lf+`","license_signature":"`+sig+`"}`)
 		if _, err := NewOfflineClient(path, zerolog.Nop()); err == nil {
 			t.Fatal("expired file must be rejected")
@@ -119,8 +119,7 @@ func TestOfflineClientGrid(t *testing.T) {
 }
 
 // TestLicenseHealthStatus pins the /health license payload: source labels,
-// read-time expired derivation (#603 lesson — health tells the truth even
-// though enforcement is boot-time), and the site-license flag.
+// read-time expiry derivation matching feature gates, and the site-license flag.
 func TestLicenseHealthStatus(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
 
@@ -138,7 +137,7 @@ func TestLicenseHealthStatus(t *testing.T) {
 	})
 
 	t.Run("expired derives at read time", func(t *testing.T) {
-		c := &Client{license: &License{Tier: TierEnterprise, Status: "active",
+		c := &Client{license: &License{Tier: TierEnterprise, Status: "active", CustomerID: TrialCustomerPrefix + "x",
 			ExpiresAt: time.Now().UTC().Add(50 * time.Millisecond)}, source: SourceCache}
 		if h := c.HealthStatus(); h.Status != "active" || h.Source != "cache" {
 			t.Fatalf("pre-expiry: %+v", h)

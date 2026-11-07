@@ -188,7 +188,8 @@ func (c *Coordinator) VerifyForwardIdentity(values ForwardIdentityHeaderValues, 
 		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	node := got[security.HeaderForwardNode]
-	// The loop marker names the same sender, so a peer can trust it.
+	// The loop marker must name the same claimed sender as the signed
+	// header (a consistency check, not sender authentication; #1510).
 	if by := values("X-Arc-Forwarded-By"); len(by) != 1 || by[0] != node {
 		return true, ForwardToken{}, security.ErrForwardIdentity
 	}

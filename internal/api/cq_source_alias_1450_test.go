@@ -159,9 +159,9 @@ func TestWrapSourceMeasurementNamesTheRead_Issue1450(t *testing.T) {
 		{"comma after a join condition, another relation aliased cpu", "cpu",
 			"SELECT cpu.host FROM prod.cpu JOIN prod.mem ON true, (SELECT 'a' host) cpu",
 			"SELECT cpu.host FROM " + rp + " JOIN prod.mem ON true, (SELECT 'a' host) cpu"},
-		{"match in a line comment: unchanged in kind", "cpu",
+		{"a match in a line comment is left alone (#1487)", "cpu",
 			"SELECT cpu.usage FROM prod.cpu c -- was FROM prod.cpu\n",
-			"SELECT cpu.usage FROM " + rp + " c -- was FROM " + cpu + "\n"},
+			"SELECT cpu.usage FROM " + rp + " c -- was FROM prod.cpu\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := wrapSourceMeasurement(tt.query, "prod", tt.measurement, rp); got != tt.want {

@@ -121,7 +121,7 @@ type RestoreOptions struct {
 	BackupID        string
 	RestoreData     bool // restore parquet files
 	RestoreMetadata bool // restore SQLite database
-	RestoreConfig   bool // restore arc.toml (requires restart)
+	RestoreConfig   bool // restore the config file Arc loaded at startup (requires restart)
 	// Mode is RestoreModeMerge or RestoreModeReplace, or empty for the
 	// default: merge, except that a scoped backup restored on a cluster node
 	// defaults to replace (see ResolveRestoreMode, which the manager applies
@@ -251,7 +251,6 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		progress.Error = err.Error()
 		return nil, err
 	}
-
 	// The effective mode is decided from the manifest (#1084): a scoped
 	// backup on a cluster node restores in replace mode unless the request
 	// named one. Same function and same inputs as the API handler's echo.
@@ -272,6 +271,18 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
+	}
+	// A config restore that cannot be written is refused here, before any
+	// data is restored and in the API's order (#1466); the config step runs
+	// last, so failing there would leave the data restored and the config
+	// not. Only when the backup holds a config: without one the step is
+	// skipped, as it always was.
+	if opts.RestoreConfig && manifest.HasConfig {
+		if err := m.ConfigRestoreBlocker(opts.BackupID); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
 	}
 
 	// A backup another instance wrote is restorable, and that is a decision,
@@ -957,10 +968,9 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 	// reg's pending rows are abandoned on an early return because a failed
 	// restore is re-run and the cluster re-derives its manifest, but a tier
 	// row has no such second chance. The bytes are already in the cold store,
-	// and on a standalone node — or a cluster without shared storage or
-	// replication — nothing ever writes the row, because the cold-metadata
-	// sync does not run there. A file whose bytes landed and whose row was
-	// dropped is unreadable indefinitely.
+	// and a later scan is not a substitute for this flush: until a scan
+	// succeeds the file has no row and is unreadable, including on a standalone
+	// node where cold metadata sync does run.
 	batch := newColdRowBatch()
 	defer func() {
 		m.flushColdRows(ctx, batch, progress)
@@ -1355,8 +1365,8 @@ func (m *Manager) flushColdRowsTo(ctx context.Context, batch *coldRowBatch, prog
 		// transaction per call — so the whole chunk is unrecorded. The bytes
 		// are in storage; only the rows are missing, so those files are not
 		// yet queryable. Warn rather than fail: the rest of the restore is
-		// sound, and on a cluster whose gate runs it the tiering cold sync
-		// records the rows. On a standalone node nothing will.
+		// sound. A later successful tier scan can record the missing rows,
+		// including on a standalone node; until then the files are not queryable.
 		atomic.AddInt64(&progress.ColdRowsNotRecorded, submitted)
 		event := m.logger.Warn().Int64("files", submitted).Err(err)
 		if toCold {
@@ -1933,32 +1943,45 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, src backupTarget, backu
 	return nil
 }
 
-// restoreConfig restores the arc.toml config file from the backup.
-// It creates a .before-restore backup of the current config first.
+// restoreConfig restores the backup's config over the file Arc loaded at
+// startup (m.configPath, #1466), after copying the current file to
+// configSafetyCopyPath. ConfigRestoreBlocker refused this restore up front if
+// either write could not happen, so a failure here is a race or an I/O error;
+// it is still fatal, because overwriting the config without the copy would
+// lose it. The write follows a symlinked config to its target, and keeps the
+// target's mode.
 func (m *Manager) restoreConfig(ctx context.Context, src backupTarget, backupID string) error {
 	srcPath := fmt.Sprintf("%s/config/arc.toml", backupID)
 	data, err := src.backend.Read(ctx, srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to read config backup: %w", err)
 	}
+	if err := m.ConfigRestoreBlocker(backupID); err != nil {
+		return err
+	}
 
-	// Safety: backup the current config before overwriting
-	if _, statErr := os.Stat(m.configPath); statErr == nil {
-		preRestorePath := m.configPath + ".before-restore"
-		currentData, err := os.ReadFile(m.configPath)
-		if err == nil {
-			if err := os.WriteFile(preRestorePath, currentData, 0600); err != nil {
-				m.logger.Warn().Err(err).Msg("Failed to create pre-restore backup of config")
-			} else {
-				m.logger.Info().Str("path", preRestorePath).Msg("Created pre-restore backup of config")
-			}
-		}
+	current, err := os.ReadFile(m.configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read the current config %s to keep a copy of it; the config was not restored: %w", m.configPath, err)
+	}
+	// Created exclusively, and an existing copy is kept: a retry of the same
+	// backup (a restore that reports failed after its config step, #762)
+	// would otherwise replace the copy of the operator's config with the
+	// backup's own.
+	safetyCopy := configSafetyCopyPath(m.configPath, backupID)
+	switch err := writeFileExclusive(safetyCopy, current); {
+	case errors.Is(err, os.ErrExist):
+		m.logger.Info().Str("path", safetyCopy).Msg("Keeping the existing copy of the config from an earlier restore of this backup")
+	case err != nil:
+		return fmt.Errorf("failed to keep a copy of the current config at %s; the config was not restored: %w", safetyCopy, err)
+	default:
+		m.logger.Info().Str("path", safetyCopy).Msg("Kept a copy of the current config before restoring")
 	}
 
 	if err := os.WriteFile(m.configPath, data, 0600); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
+		return fmt.Errorf("failed to write config file %s (the previous config is at %s): %w", m.configPath, safetyCopy, err)
 	}
 
-	m.logger.Info().Str("backup_id", backupID).Msg("Config file restored (restart required)")
+	m.logger.Info().Str("backup_id", backupID).Str("path", m.configPath).Msg("Config file restored (restart required)")
 	return nil
 }

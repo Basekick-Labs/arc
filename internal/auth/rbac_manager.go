@@ -64,6 +64,19 @@ type permissionCacheKey struct {
 	permission  string
 }
 
+// owned returns the key with its strings copied, for storing in permCache.
+// A request's database and measurement names can point into the HTTP
+// framework's request buffer (fasthttp reuses it for the next request on the
+// same connection), so a key stored without a copy would change under the
+// cache: an allow cached for one name would then match another. Lookups may
+// use the uncopied key, as the map compares the bytes at that moment.
+func (k permissionCacheKey) owned() permissionCacheKey {
+	k.database = strings.Clone(k.database)
+	k.measurement = strings.Clone(k.measurement)
+	k.permission = strings.Clone(k.permission)
+	return k
+}
+
 // permissionCacheEntry caches a permission check result
 type permissionCacheEntry struct {
 	result    *PermissionCheckResult
@@ -1479,7 +1492,7 @@ func (rm *RBACManager) CheckPermission(req *PermissionCheckRequest) *PermissionC
 	if result.Source != SourceUnavailable {
 		rm.permCacheMu.Lock()
 		rm.evictPermCacheIfFull()
-		rm.permCache[cacheKey] = &permissionCacheEntry{
+		rm.permCache[cacheKey.owned()] = &permissionCacheEntry{
 			result:    result,
 			expiresAt: time.Now().Add(rm.permCacheTTL),
 		}
@@ -1594,7 +1607,7 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 			if result.Source != SourceUnavailable {
 				rm.permCacheMu.Lock()
 				rm.evictPermCacheIfFull()
-				rm.permCache[cacheKey] = &permissionCacheEntry{
+				rm.permCache[cacheKey.owned()] = &permissionCacheEntry{
 					result:    result,
 					expiresAt: time.Now().Add(rm.permCacheTTL),
 				}
@@ -1797,8 +1810,8 @@ func hasCoarseAdmin(info *TokenInfo) bool {
 // MEMBERSHIPS, never by the license. The license gates RBAC *management* only
 // (RBACHandler.requireRBACLicense guards every /api/v1/rbac route).
 //
-// Keying enforcement off the license would fail OPEN. License.IsValid() is
-// true only for "active" and "grace_period", and cmd/arc/main.go sets
+// Keying enforcement off the license would fail OPEN. License.IsValid()
+// checks the signed expiry against the current clock, and cmd/arc/main.go sets
 // licenseClient to nil when validation fails at boot — so a lapsed trial, a
 // revoked key, or an outage past the cached-license window all make
 // IsRBACEnabled() false. If that switched enforcement off, every tenant token

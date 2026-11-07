@@ -330,6 +330,12 @@ localProcessing:
 	h.totalRecords.Add(int64(len(records)))
 
 	// Convert to columnar format grouped by measurement
+	if err := ingest.CheckDenseCells(records); err != nil {
+		h.totalErrors.Add(1)
+		metrics.Get().IncIngestErrors()
+		h.logger.Warn().Err(err).Str("database", database).Msg("Line protocol write refused")
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+	}
 	columnarByMeasurement := ingest.BatchToColumnar(records)
 
 	// The measurements in a fixed order: RBAC reads them, and the write loop
@@ -432,6 +438,10 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 	if err != nil {
 		h.totalErrors.Add(1)
 		metrics.Get().IncIngestErrors()
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Int("body_bytes", len(body)).Msg("Line protocol write refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Str("database", database).Msg("Failed to parse line protocol")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
 	}
@@ -669,7 +679,7 @@ func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *
 	if ingest.IsWriteRefusal(err) {
 		return respondWriteRefused(c, err)
 	}
-	// A client error (#440, #1342, #1424), refused before the WAL.
+	// A client error (#440, #1342, #1424, #1475), refused before the WAL.
 	if ingest.IsContentRefusal(err) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}

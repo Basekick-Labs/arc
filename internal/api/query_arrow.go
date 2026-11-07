@@ -672,9 +672,23 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// ArrowQueryContext: once either commits to a body stream the status
 	// code is already on the wire, and the only way left to report a failure is
 	// a trailer the client may not read.
-	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(c.Context(), req.SQL, headerDB)
+	//
+	// A governance policy's MaxDuration overrides the global timeout (#702).
+	// Its deadline bounds the transform and the execution (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
+	cancelTransform()
 	if err != nil {
 		m.IncQueryErrors()
+		if errors.Is(err, errQueryTimedOut) {
+			m.IncQueryTimeouts()
+			h.logTransformTimeout(req.SQL, effectiveTimeout)
+		}
 		return c.Status(transformErrorStatus(err)).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
@@ -700,11 +714,6 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	tokenName := getTokenName(c)
 	tokenID := getTokenID(c)
 
-	// A governance policy's MaxDuration overrides the global timeout (#702).
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
 	// Register before choosing an engine. An arcx-served query must have
 	// the same query ID, cancellation context and history as a DuckDB query.
 	// The registry must not be completed here: streaming starts after this
@@ -723,8 +732,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	ctx := baseCtx
 	var cancel context.CancelFunc
 	switch {
-	case effectiveTimeout > 0:
-		ctx, cancel = context.WithTimeout(baseCtx, effectiveTimeout)
+	case !deadline.IsZero():
+		ctx, cancel = context.WithDeadline(baseCtx, deadline)
 	case queryID != "":
 		ctx, cancel = context.WithCancel(baseCtx)
 	}

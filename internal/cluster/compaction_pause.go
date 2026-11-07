@@ -695,9 +695,10 @@ func (c *Coordinator) ackCompactionPauseIfActive() {
 }
 
 // compactionPauseCommandSpeaksFor checks that a forwarded pause command names
-// the node that signed the request: a Set must carry requested_by == the
-// requester, an Ack node_id == the requester. Otherwise one authenticated
-// peer could ack, or pause, on behalf of another.
+// the requesting node: a Set must carry requested_by == the requester, an Ack
+// node_id == the requester, so a mis-stamped command cannot ack or pause on
+// behalf of another node. This is a consistency check: under the shared
+// secret the requester's node ID is a claim, not a proven identity (#1510).
 func compactionPauseCommandSpeaksFor(cmd *raft.Command, requester string) error {
 	switch cmd.Type {
 	case raft.CommandSetCompactionPause:

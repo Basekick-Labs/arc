@@ -399,6 +399,10 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
 
+	if err := databaseSpellingError(h.storage, req.Name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
 	// Check if database already exists
 	exists, err := h.databaseExists(ctx, req.Name)
 	if err != nil {
@@ -467,6 +471,10 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
+
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -697,6 +705,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer func() { cancel() }()
+
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -1335,6 +1347,22 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	sort.Strings(filtered)
 
 	return filtered, nil
+}
+
+// databaseSpellingError refuses a database name that exists in storage under
+// another spelling on a volume that folds names (#1509). Checked before
+// databaseExists, whose marker lookup would follow the fold: a delete would
+// otherwise flush, record and withdraw under the requested spelling before
+// its listing refused it.
+func databaseSpellingError(backend storage.Backend, name string) error {
+	g, ok := backend.(storage.NameSpellingGuard)
+	if !ok {
+		return nil
+	}
+	if err := g.CheckNameSpelling(name); storage.IsNameSpellingError(err) {
+		return err
+	}
+	return nil
 }
 
 func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (bool, error) {

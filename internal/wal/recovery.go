@@ -503,12 +503,87 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			// A covered entry (#1207) carries its batch coverage to the buffer
 			// so the replayed rows register under their original coverage id.
 			entryCtx := ctx
+			columnarRows, columnarRect := columnarRowCount(entry.ColumnarData)
 			if entry.Coverage != nil {
-				entryCtx = WithReplayCoverage(ctx, ReplayCoverage{Coverage: *entry.Coverage, RowTotal: len(entry.Records)})
+				rowTotal := len(entry.Records)
+				if entry.ColumnarData != nil {
+					rowTotal = columnarRows
+				}
+				entryCtx = WithReplayCoverage(ctx, ReplayCoverage{Coverage: *entry.Coverage, RowTotal: rowTotal})
 			}
 			// Dispatch based on entry format
 			if entry.ColumnarData != nil && (opts.ColumnarCallback != nil || opts.ColumnarCallbackWithTagColumns != nil) {
-				// Columnar entry from zero-copy AppendRaw path
+				// Columnar entry from zero-copy AppendRaw path. Rows of it
+				// may already be checkpointed by range (#1492: a multi-hour
+				// flush checkpoints the rows of each hour file it stored);
+				// then only the other rows are replayed, each range under
+				// its own identity, and the parent is finalized after the
+				// barrier flush, as for a split row entry.
+				if covered := rowCoverage[entry.PayloadHash]; len(covered) > 0 && trackedRowIdentity(entry.PayloadHash) {
+					if !columnarRect {
+						// The columnar analogue of ValidateTrackedRows: a
+						// range cannot be cut from ragged columns. The live
+						// decoders never write one; keep the file for the
+						// replay-failure count like a decode failure.
+						r.logger.Error().Str("file", filepath.Base(walFile)).Str("payload_hash", entry.PayloadHash).
+							Msg("Columnar WAL entry with row checkpoints has columns of different lengths; keeping the file for the replay-failure count")
+						allEntriesSucceeded = false
+						stats.CorruptedEntries++
+						continue
+					}
+					missing, err := uncoveredRecoveryRows(columnarRows, covered)
+					if err != nil {
+						// As the row branch: a coverage map describing rows
+						// the entry does not have poisons this file's row
+						// accounting; the strike path, not an abandoned pass.
+						r.logger.Error().Err(err).
+							Str("file", filepath.Base(walFile)).
+							Int("entry_rows", columnarRows).
+							Msg("WAL row checkpoint describes rows beyond its columnar entry; keeping the file for the replay-failure count")
+						allEntriesSucceeded = false
+						break
+					}
+					replayed := true
+					for _, span := range missing {
+						if ctx.Err() != nil {
+							allEntriesSucceeded = false
+							replayed = false
+							break
+						}
+						identity := recoveryRowIdentity(entry.PayloadHash, span.start, span.end)
+						cols := sliceColumnarRange(entry.ColumnarData.Columns, span.start, span.end)
+						var err error
+						if opts.ColumnarCallbackWithTagColumns != nil {
+							err = opts.ColumnarCallbackWithTagColumns(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, cols, identity, entry.ColumnarData.TagColumns)
+						} else {
+							err = opts.ColumnarCallback(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, cols, identity)
+						}
+						if err != nil {
+							r.logger.Error().Err(err).
+								Str("database", entry.ColumnarData.Database).
+								Str("measurement", entry.ColumnarData.Measurement).
+								Int("row_start", span.start).Int("row_end", span.end).
+								Msg("Failed to replay a row range of a columnar WAL entry; continuing with remaining entries")
+							allEntriesSucceeded = false
+							stats.CorruptedEntries++
+							replayed = false
+							break
+						}
+						fileRecoveredBatches++
+						fileRecoveredEntries += span.end - span.start
+						if !hadSplitTracked {
+							// After the first successful handoff, as the row
+							// branch: ranges are durable for part of a
+							// parent an older binary would replay whole.
+							hadSplitTracked = true
+							splitTrackedFiles = append(splitTrackedFiles, walFile)
+						}
+					}
+					if replayed {
+						fileRecoveredParents = append(fileRecoveredParents, entry.PayloadHash)
+					}
+					continue
+				}
 				var err error
 				if opts.ColumnarCallbackWithTagColumns != nil {
 					err = opts.ColumnarCallbackWithTagColumns(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash, entry.ColumnarData.TagColumns)

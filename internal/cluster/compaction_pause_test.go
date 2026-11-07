@@ -457,7 +457,7 @@ func TestCompactionPause_WaitNamesTheNodesThatDidNotAck(t *testing.T) {
 
 // The forwarding path: a follower proposes through the leader. Setting the
 // pause follows the manifest role rule (a reader is refused), the ack is open
-// to every known peer, and both must name the node that signed the request.
+// to every known peer, and both must name the requesting node.
 func TestCompactionPause_ForwardedCommandsAreAllowlistedAndRoleGated(t *testing.T) {
 	addrs := allocFreePorts(t, 2)
 	raftA := startRaftNodeInDir(t, "writer-A", addrs[0], filepath.Join(t.TempDir(), "writer-A"), true)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,7 +47,7 @@ type SubscriptionManager struct {
 	mu          sync.RWMutex
 	subscribers map[string]*Subscriber
 	// suspended holds the reasons this node refuses writes (suspendFenced,
-	// suspendWALDisk); while any is set, subscribers stay disconnected so
+	// suspendWALDisk, suspendBufferFull); while any is set, subscribers stay disconnected so
 	// messages wait at the broker instead of being acknowledged and lost. A
 	// set, not a bool: a cluster unfence must not resume subscriptions while
 	// the WAL volume is still under disk pressure (#676). Guarded by mu.
@@ -55,15 +56,24 @@ type SubscriptionManager struct {
 	// cannot apply their results out of order.
 	applyMu sync.Mutex
 
-	// WAL disk pressure, with a minimum time in each state (#676): a gate
-	// that flaps would otherwise disconnect and reconnect every subscription
-	// with it. Guarded by diskMu.
-	diskMu       sync.Mutex
-	diskOn       bool        // the state applied to suspended
-	diskWant     bool        // the latest state reported
-	diskChanged  time.Time   // when diskOn last changed
-	diskTimer    *time.Timer // a pending apply; nil when none
-	diskMinState time.Duration
+	// WAL disk pressure (#676) and the buffered-bytes limit (#1468), each
+	// with a minimum time in each state: a condition that flaps would
+	// otherwise disconnect and reconnect every subscription with it.
+	disk       heldReason
+	bufferFull heldReason
+	notDurable heldReason
+}
+
+// heldReason is a suspend reason applied at once when it sets and, when it
+// clears, only after it has held for its minimum time. Its fields are
+// guarded by its own mu.
+type heldReason struct {
+	mu       sync.Mutex
+	on       bool        // the state applied to suspended
+	want     bool        // the latest state reported
+	changed  time.Time   // when on last changed
+	timer    *time.Timer // a pending apply; nil when none
+	minState time.Duration
 }
 
 // registerStarted publishes a started subscriber and suspends it if any
@@ -92,24 +102,41 @@ func (m *SubscriptionManager) registerStarted(id string, subscriber *Subscriber)
 type suspendReasons uint8
 
 const (
-	suspendFenced  suspendReasons = 1 << iota // writes fenced (#1207)
-	suspendWALDisk                            // WAL volume disk pressure (#676)
+	suspendFenced        suspendReasons = 1 << iota // writes fenced (#1207)
+	suspendWALDisk                                  // WAL volume disk pressure (#676)
+	suspendBufferFull                               // ingest.max_buffered_bytes reached (#1468)
+	suspendWALNotDurable                            // the WAL refuses durable acknowledgements (#1502)
+	suspendLicense                                  // the license's grace period stops ingestion (days 7-14)
 )
 
 // mqttDiskMinState is the least time subscriptions stay suspended for WAL disk
-// pressure before they resume (#676). Suspending is never delayed: every
-// message accepted while writes are refused would be lost.
+// pressure (#676) or the buffered-bytes limit (#1468) before they resume.
+// Suspending is never delayed: every message accepted while writes are
+// refused would be lost.
 const mqttDiskMinState = 5 * time.Second
 
+// describe names every reason in r, joined with "and".
 func (r suspendReasons) describe() string {
-	switch {
-	case r&suspendFenced != 0 && r&suspendWALDisk != 0:
-		return "writes are fenced on this node and its WAL volume is under disk pressure"
-	case r&suspendWALDisk != 0:
-		return "the WAL volume is under disk pressure"
-	default:
-		return "writes are fenced on this node"
+	var parts []string
+	if r&suspendFenced != 0 {
+		parts = append(parts, "writes are fenced on this node")
 	}
+	if r&suspendWALDisk != 0 {
+		parts = append(parts, "the WAL volume is under disk pressure")
+	}
+	if r&suspendBufferFull != 0 {
+		parts = append(parts, "rows waiting to be flushed reached ingest.max_buffered_bytes")
+	}
+	if r&suspendWALNotDurable != 0 {
+		parts = append(parts, "the WAL is not acknowledging writes as durable")
+	}
+	if r&suspendLicense != 0 {
+		parts = append(parts, "the expired license's grace period stops ingestion")
+	}
+	if len(parts) == 0 {
+		return "writes are refused on this node"
+	}
+	return strings.Join(parts, " and ")
 }
 
 // SetIngestFenced suspends every subscription while this node's writes are
@@ -119,6 +146,15 @@ func (r suspendReasons) describe() string {
 // messages until the subscription resumes.
 func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
 	m.setSuspendReason(suspendFenced, fenced)
+}
+
+// SetLicenseWritesStopped suspends every subscription while the expired
+// license's grace period refuses ingestion (days 7-14), and resumes them when
+// it ends: on renewal, or at the cutoff, when the node runs without
+// Enterprise features. The broker holds messages meanwhile (QoS 1 or 2,
+// clean_session=false), within its own session and queue limits.
+func (m *SubscriptionManager) SetLicenseWritesStopped(stopped bool) {
+	m.setSuspendReason(suspendLicense, stopped)
 }
 
 // SetWALDiskPressure suspends every subscription while the WAL volume is
@@ -131,42 +167,67 @@ func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
 // while it is suspended: the broker keeps no session for it. Only
 // clean_session=false (with QoS 1 or 2) queues them at the broker.
 func (m *SubscriptionManager) SetWALDiskPressure(on bool) {
-	m.diskMu.Lock()
-	defer m.diskMu.Unlock()
-	m.diskWant = on
-	if on == m.diskOn || m.diskTimer != nil {
-		// Nothing to change, or a pending apply reads diskWant when it runs.
+	m.setHeld(&m.disk, suspendWALDisk, on)
+}
+
+// SetBufferFull suspends every subscription while the rows waiting to be
+// flushed are at ingest.max_buffered_bytes and resumes them once that clears
+// and no other reason holds them (#1468): a refused message would otherwise be
+// acknowledged and lost. Timed as SetWALDiskPressure is. It can be called on
+// a write's goroutine (an MQTT handler's among them): the change is applied on
+// another.
+func (m *SubscriptionManager) SetBufferFull(on bool) {
+	m.setHeld(&m.bufferFull, suspendBufferFull, on)
+}
+
+// SetWALNotDurable suspends every subscription while the WAL refuses writes
+// as not durable (a stalled or failing device: a timed-out or failed sync,
+// #1501, #1502) and resumes them once a sync succeeds and no other reason
+// holds them. Timed as SetWALDiskPressure is. The message in flight when the
+// refusal starts is still briefly retried and then dropped, as for the other
+// reasons; the ones that follow wait at the broker (QoS 1 or 2,
+// clean_session=false).
+func (m *SubscriptionManager) SetWALNotDurable(on bool) {
+	m.setHeld(&m.notDurable, suspendWALNotDurable, on)
+}
+
+func (m *SubscriptionManager) setHeld(h *heldReason, reason suspendReasons, on bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.want = on
+	if on == h.on || h.timer != nil {
+		// Nothing to change, or a pending apply reads want when it runs.
 		return
 	}
 	var wait time.Duration
 	if !on {
-		minState := m.diskMinState
+		minState := h.minState
 		if minState == 0 {
 			minState = mqttDiskMinState
 		}
-		wait = max(0, minState-time.Since(m.diskChanged))
+		wait = max(0, minState-time.Since(h.changed))
 	}
-	// Applied off the caller's goroutine: the caller is the WAL disk monitor,
-	// and suspending disconnects every subscription in turn.
-	m.diskTimer = time.AfterFunc(wait, m.applyPendingDisk)
+	// Applied off the caller's goroutine: the caller is the WAL disk monitor
+	// or a write, and suspending disconnects every subscription in turn.
+	h.timer = time.AfterFunc(wait, func() { m.applyPendingHeld(h, reason) })
 }
 
-// applyPendingDisk applies the latest reported disk pressure state, unless it
-// was undone before the minimum time ran out.
-func (m *SubscriptionManager) applyPendingDisk() {
+// applyPendingHeld applies the latest reported state of h, unless it was
+// undone before the minimum time ran out.
+func (m *SubscriptionManager) applyPendingHeld(h *heldReason, reason suspendReasons) {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
-	m.diskMu.Lock()
-	m.diskTimer = nil
-	if m.diskWant == m.diskOn {
-		m.diskMu.Unlock()
+	h.mu.Lock()
+	h.timer = nil
+	if h.want == h.on {
+		h.mu.Unlock()
 		return
 	}
-	on := m.diskWant
-	m.diskOn = on
-	m.diskChanged = time.Now()
-	m.diskMu.Unlock()
-	m.setSuspendReasonLocked(suspendWALDisk, on)
+	on := h.want
+	h.on = on
+	h.changed = time.Now()
+	h.mu.Unlock()
+	m.setSuspendReasonLocked(reason, on)
 }
 
 // setSuspendReason sets or clears one reason and suspends or resumes every
@@ -178,7 +239,7 @@ func (m *SubscriptionManager) setSuspendReason(reason suspendReasons, set bool) 
 }
 
 // setSuspendReasonLocked is setSuspendReason with applyMu held. Lock order:
-// applyMu, then diskMu or mu.
+// applyMu, then a heldReason's mu or mu.
 func (m *SubscriptionManager) setSuspendReasonLocked(reason suspendReasons, set bool) {
 	m.mu.Lock()
 	if set {
