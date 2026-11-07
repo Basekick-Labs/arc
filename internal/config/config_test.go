@@ -240,6 +240,12 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	// compaction re-encodes via DuckDB anyway. A silent revert of either
 	// SetDefault would ship unnoticed otherwise: every ingest test constructs
 	// IngestConfig by hand and the bool zero values coincide with these.
+	if cfg.Ingest.MaxRowGroupRows != 524288 {
+		t.Errorf("Ingest.MaxRowGroupRows default = %d, want 524288 (free on the sustained msgpack benchmark; 122880 cost 1.7%%)", cfg.Ingest.MaxRowGroupRows)
+	}
+	if cfg.Ingest.WritePageIndex {
+		t.Error("Ingest.WritePageIndex default = true, want false (no reader yet; cost grows with row-group count)")
+	}
 	if cfg.Ingest.UseDictionary {
 		t.Error("Ingest.UseDictionary default = true, want false (26.09.1 default flip)")
 	}
@@ -1756,5 +1762,21 @@ func TestLoad_AzureCredentialsTrimmed(t *testing.T) {
 	}
 	if cfg.Storage.AzureSASToken != "sv=1&sig=abc" || cfg.Storage.AzureAccountKey != "key==" {
 		t.Fatalf("not trimmed: %q %q", cfg.Storage.AzureSASToken, cfg.Storage.AzureAccountKey)
+	}
+}
+
+// ingest.max_row_group_rows: 0 keeps one row group per flush; 1..1023 and
+// negatives are rejected (a cap of 1 writes a row group and a page-index entry
+// per row); 1024 and up are accepted.
+func TestLoad_MaxRowGroupRowsValidation(t *testing.T) {
+	for _, c := range []struct {
+		v  string
+		ok bool
+	}{{"0", true}, {"1024", true}, {"122880", true}, {"1", false}, {"1023", false}, {"-5", false}} {
+		t.Setenv("ARC_INGEST_MAX_ROW_GROUP_ROWS", c.v)
+		_, err := Load()
+		if (err == nil) != c.ok {
+			t.Errorf("max_row_group_rows=%s: err=%v, want ok=%v", c.v, err, c.ok)
+		}
 	}
 }

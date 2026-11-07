@@ -251,6 +251,17 @@ func NewArrowWriter(cfg *config.IngestConfig, logger zerolog.Logger) *ArrowWrite
 	if cfg.DataPageVersion == "2.0" {
 		writerOpts = append(writerOpts, parquet.WithDataPageVersion(parquet.DataPageV2))
 	}
+	// Row-group cap: one flush (one Arrow record) used to be one row group, so
+	// an hourly file had a single 3.3 M-row group — no min/max pruning inside
+	// the file and one work item per file for every reader. 0 keeps that
+	// writer default; the configured default is 524288 (free on the sustained
+	// msgpack benchmark; compaction's 122880 measured 1.7 % there).
+	if cfg.MaxRowGroupRows > 0 {
+		writerOpts = append(writerOpts, parquet.WithMaxRowGroupLength(int64(cfg.MaxRowGroupRows)))
+	}
+	if cfg.WritePageIndex {
+		writerOpts = append(writerOpts, parquet.WithPageIndexEnabled(true))
+	}
 
 	return &ArrowWriter{
 		compression:       comp,
@@ -1084,7 +1095,10 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, bounds []int, b
 	w.logger.Debug().
 		Int("columns", len(schema.Fields())).
 		Int("rows", rows).
-		Int("row_groups", len(bounds)-1).
+		// One record per bounds pair; each record splits into ceil(rows/cap)
+		// row groups once `ingest.max_row_group_rows` applies, so this is the
+		// RECORD count — the row-group count is in the file's footer.
+		Int("records", len(bounds)-1).
 		Int("size", buf.Len()).
 		Msg("Wrote Parquet file")
 
