@@ -19,6 +19,7 @@ var encodedBodyRoutes = map[string]bool{
 	"/write":                      true, // InfluxDB 1.x
 	"/api/v2/write":               true, // InfluxDB 2.x
 	"/api/v1/write/line-protocol": true,
+	"/api/v1/write/prometheus":    true,
 	"/api/v1/write/msgpack":       true,
 	"/api/v1/write/tle":           true,
 }

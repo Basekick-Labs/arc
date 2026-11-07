@@ -1948,6 +1948,17 @@ GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
 
+### Prometheus Remote Write 1.0 ingestion (#1383)
+
+Arc accepts Prometheus Remote Write 1.0 samples at `/api/v1/write/prometheus`,
+mapping metric names to measurements, labels to tag columns and samples to a
+float64 `value` column. The receiver bounds decoded payload and materialised
+column memory, ignores metric metadata, and rejects exemplars and native
+histograms rather than silently dropping them. Prometheus and Grafana Alloy
+configuration examples are in the [integration guide](docs/integrations/prometheus-remote-write.md).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
+
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 
 `cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a
