@@ -175,9 +175,11 @@ it is published. Responsibly reported by **[@garnetarc](https://github.com/garne
 The arcx engine now serves the unary moment aggregates `var_pop`, `var_samp`,
 `variance`, `stddev`, `stddev_samp`, `stddev_pop` and `sem`, plus `mean` as an
 alias of `avg`, over `BIGINT` and `DOUBLE` columns (arcX feat/agg6-moments). The
-eligibility recognizer accepts them wherever it accepts `avg`: in ungrouped
-aggregates, in tag- and time-bucket-grouped aggregates, and in `HAVING` when the
-same aggregate is also selected. The function name is lowercased in the derived
+eligibility recognizer accepts them in ungrouped aggregates, in aggregates
+grouped by a `date_trunc` time bucket, and in `HAVING` when the same aggregate
+is also selected. Grouped by a tag column they stay on DuckDB: measured on a
+3.95-billion-row production corpus the engine folds bucket runs 1.5× faster
+than DuckDB but is 2.7× slower per host, and a known loss is not routed. The function name is lowercased in the derived
 column name and the argument keeps its spelling (`VARIANCE(X)` → `variance(X)`),
 as DuckDB does.
 

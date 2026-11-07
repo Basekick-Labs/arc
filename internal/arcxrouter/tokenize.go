@@ -809,6 +809,12 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	fail := func() (groupedMatch, bool) { return groupedMatch{}, false }
 	var items []string
 	var bucketText, tagKey, whereText, meas string
+	// agg-6a: a moment aggregate is served grouped ONLY under a bucket key.
+	// Measured on the production cpu corpus (3.95B rows, through Arc): hourly
+	// bucket + var_samp 6.1 s vs DuckDB 8.9 s (the engine folds bucket RUNS as
+	// two-pass partials); host + stddev 18.3 s vs 6.7 s (interleaved tag keys
+	// pay a per-row Welford chain) — a known loss, not routed (gotcha #5).
+	hasMoment := false
 
 	bucketItem := -1
 	tagItem := -1
@@ -953,6 +959,9 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			if !unaryAggFns[t.lower] {
 				return fail()
 			}
+			if momentAggFns[t.lower] {
+				hasMoment = true
+			}
 			c.i++ // consume '('
 			if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
 				c.i++
@@ -1076,6 +1085,9 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	if len(seen) != nKeys {
 		return fail() // every projected key must be grouped exactly once
 	}
+	if hasMoment && tagKey != "" {
+		return fail() // agg-6a: tag-keyed moments are a measured loss (see hasMoment)
+	}
 	// Optional `HAVING <tree>` (agg-5a) — clause order is GROUP BY, HAVING,
 	// ORDER BY. Re-serialized from validated parts; the grammar is the engine's,
 	// so a shape accepted here cannot be one the engine declines.
@@ -1166,6 +1178,13 @@ type groupedMatch struct {
 // correlation family (agg-6b), and every sketch/collection aggregate.
 var unaryAggFns = map[string]bool{
 	"count": true, "sum": true, "min": true, "max": true, "avg": true, "mean": true,
+	"var_pop": true, "var_samp": true, "variance": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+}
+
+// momentAggFns: the agg-6a subset of unaryAggFns whose grouped form is gated to
+// bucket-keyed shapes (see matchGroupedAgg's hasMoment).
+var momentAggFns = map[string]bool{
 	"var_pop": true, "var_samp": true, "variance": true,
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
 }

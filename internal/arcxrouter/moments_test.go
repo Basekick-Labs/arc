@@ -44,16 +44,18 @@ func TestGroupedAggMoments(t *testing.T) {
 		sql   string
 		items []string
 	}{
-		{"SELECT host, stddev(cpu_user), var_pop(cpu_idle) FROM cpu GROUP BY host",
-			[]string{"host", "stddev(cpu_user)", "var_pop(cpu_idle)"}},
-		// NOTE: a FLOAT literal in HAVING (`> 0.5`) declines today for every
-		// aggregate, sum included — a pre-existing recognizer limit, not agg-6a's.
-		{"SELECT host, count(*), stddev(v) FROM cpu GROUP BY host HAVING stddev(v) > 1",
-			[]string{"host", "count(*)", "stddev(v)"}},
-		{"SELECT host, sem(v), count(*) FROM cpu WHERE v > 1 GROUP BY host HAVING count(*) > 1 AND sem(v) < 5 ORDER BY host",
-			[]string{"host", "sem(v)", "count(*)"}},
+		// Bucket-keyed moments route (engine folds bucket runs: 6.1 s vs 8.9 s).
 		{"SELECT date_trunc('hour', time), var_samp(value) FROM cpu GROUP BY 1",
 			[]string{"date_trunc('hour', time)", "var_samp(value)"}},
+		{"SELECT date_trunc('minute', time), count(*), stddev(v), mean(v) FROM cpu WHERE v > 1 GROUP BY 1",
+			[]string{"date_trunc('minute', time)", "count(*)", "stddev(v)", "mean(v)"}},
+		// NOTE: a FLOAT literal in HAVING (`> 0.5`) declines today for every
+		// aggregate, sum included — a pre-existing recognizer limit, not agg-6a's.
+		{"SELECT date_trunc('hour', time), count(*), stddev(v) FROM cpu GROUP BY 1 HAVING stddev(v) > 1",
+			[]string{"date_trunc('hour', time)", "count(*)", "stddev(v)"}},
+		// mean is avg: tag-keyed is fine (same state as avg).
+		{"SELECT host, mean(v), count(*) FROM cpu WHERE v > 1 GROUP BY host HAVING count(*) > 1 ORDER BY host",
+			[]string{"host", "mean(v)", "count(*)"}},
 	}
 	for _, c := range cases {
 		m, ok := eligibleShape(c.sql)
@@ -87,7 +89,12 @@ func TestMomentsDecline(t *testing.T) {
 		"SELECT stddev(m['k']) FROM cpu",
 		"SELECT stddev() FROM cpu",
 		// a HAVING aggregate absent from the select list
-		"SELECT host, count(*) FROM cpu GROUP BY host HAVING stddev(v) > 1",
+		"SELECT date_trunc('hour', time), count(*) FROM cpu GROUP BY 1 HAVING stddev(v) > 1",
+		// tag-keyed moments: a measured 2.7× loss (18.3 s vs 6.7 s by host) — held
+		"SELECT host, stddev(cpu_user), var_pop(cpu_idle) FROM cpu GROUP BY host",
+		"SELECT host, count(*), stddev(v) FROM cpu GROUP BY host HAVING stddev(v) > 1",
+		"SELECT date_trunc('hour', time), host, stddev(v) FROM cpu GROUP BY 1, host",
+		"SELECT host, sem(v) FROM cpu WHERE v > 1 GROUP BY host ORDER BY host",
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline (%s): %s", m.shape, sql)
