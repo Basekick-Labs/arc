@@ -163,6 +163,8 @@ type IngestConfig struct {
 	NumericDictionary     bool     // With UseDictionary, also dictionary-encode numeric/timestamp columns (pre-26.09.1 behavior; costs hashing+boxing per value)
 	WriteStatistics       bool     // Write Parquet statistics
 	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
+	MaxRowGroupRows       int      // Rows per Parquet row group at ingest (default 122880, compaction's size; 0 = writer default of one row group per flush)
+	WritePageIndex        bool     // Write the Parquet page index (column + offset index) at ingest (default true; free at the writer)
 	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
@@ -1184,6 +1186,8 @@ func Load() (*Config, error) {
 			NumericDictionary:      v.GetBool("ingest.numeric_dictionary"),
 			WriteStatistics:        v.GetBool("ingest.write_statistics"),
 			DataPageVersion:        v.GetString("ingest.data_page_version"),
+			MaxRowGroupRows:        v.GetInt("ingest.max_row_group_rows"),
+			WritePageIndex:         v.GetBool("ingest.write_page_index"),
 			FlushWorkers:           v.GetInt("ingest.flush_workers"),
 			FlushQueueSize:         v.GetInt("ingest.flush_queue_size"),
 			FlushTimeoutSeconds:    v.GetInt("ingest.flush_timeout_seconds"),
@@ -2153,6 +2157,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.numeric_dictionary", false) // only relevant with use_dictionary=true; see IngestConfig
 	v.SetDefault("ingest.write_statistics", true)
 	v.SetDefault("ingest.data_page_version", "2.0")
+	// Row groups are the unit of parallelism and of min/max pruning for every
+	// reader. One flush used to become one row group (arrow-go's default cap is
+	// 64 Mi rows), so an hourly file was ONE group: nothing to prune, one task
+	// per file. 122880 is what compaction writes; measured free at the writer
+	// (+1.6% CPU) and worth 70 → 4 ms on a time-ordered top-N through arcx
+	// (plannings: Arc_research_ingest_writer_knobs, 2026-11-07).
+	v.SetDefault("ingest.max_row_group_rows", 122880)
+	// Page index (column + offset index): free at the writer, read by nothing in
+	// Arc yet; written so files already carry it when a consumer lands. Note
+	// compaction (DuckDB COPY) does not preserve it.
+	v.SetDefault("ingest.write_page_index", true)
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
 	v.SetDefault("ingest.shard_count", 32)

@@ -170,6 +170,32 @@ don't contain these sequences outside literals are unaffected.
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
 
+## Ingest: Parquet row groups capped at 122,880 rows; page index written
+
+Each ingest flush used to become one Parquet row group (arrow-go's default cap is
+64 Mi rows), so an hourly file was a single 3.3 M-row group: no row-group
+min/max pruning inside the file, and one unit of parallel decode per file for
+every reader. Ingest now caps row groups at 122,880 rows, the size compaction
+already writes, and also writes the Parquet page index (column and offset
+index). Both are free at the writer (+1.6 % CPU for the cap, 0 for the index;
+file size unchanged). Measured on 40 M rows through the arcx engine, the cap
+alone turns a time-ordered `ORDER BY time DESC LIMIT 100` with a tag filter
+from 70 ms to 4 ms, an hourly `date_trunc` bucket from 67 to 48 ms, and filtered
+scans 10–25 % faster; DuckDB gains less because it prunes fewer shapes by
+row-group statistics. Nothing in Arc reads the page index yet; files written
+from now on carry it for the reader that will. Compaction's DuckDB `COPY` does
+not preserve the page index, so it lives on hot-tier files; tiering moves files
+whole; continuous-query output goes through the same writer and gets both.
+
+```toml
+[ingest]
+max_row_group_rows = 122880   # 0 restores one row group per flush
+write_page_index = true
+```
+
+Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
+Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
+
 ## arcx router: variance and standard deviation aggregates route to the engine
 
 The arcx engine now serves the unary moment aggregates `var_pop`, `var_samp`,

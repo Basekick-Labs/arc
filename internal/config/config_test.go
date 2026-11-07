@@ -240,6 +240,12 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	// compaction re-encodes via DuckDB anyway. A silent revert of either
 	// SetDefault would ship unnoticed otherwise: every ingest test constructs
 	// IngestConfig by hand and the bool zero values coincide with these.
+	if cfg.Ingest.MaxRowGroupRows != 122880 {
+		t.Errorf("Ingest.MaxRowGroupRows default = %d, want 122880 (compaction's row-group size)", cfg.Ingest.MaxRowGroupRows)
+	}
+	if !cfg.Ingest.WritePageIndex {
+		t.Error("Ingest.WritePageIndex default = false, want true")
+	}
 	if cfg.Ingest.UseDictionary {
 		t.Error("Ingest.UseDictionary default = true, want false (26.09.1 default flip)")
 	}
