@@ -6,6 +6,28 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+// arrowStreamTruncatedTrailer tells the client the Arrow IPC body it received
+// is short. It is a trailer because the status line and headers are long gone
+// by the time a stream fails.
+const arrowStreamTruncatedTrailer = "Arc-Stream-Truncated"
+
+// arrowRowsCappedTrailer tells the client the Arrow IPC body it received
+// stopped at an Enterprise governance row cap and may therefore be missing
+// rows the query matched (#724). The value is the cap.
+//
+// Read it alongside arrowStreamTruncatedTrailer, which means nearly the
+// opposite: that trailer says the body is short because the stream FAILED and
+// must not be trusted, while this one says the body is short because policy
+// said so, and is a complete, valid result up to the cap.
+//
+// A trailer for the same reason the other two are: the cap is only known to
+// have been reached once the last batch has been written, long after the
+// status line and headers went out. Like every registered trailer it is
+// announced in the Trailer header of every response but sent only when Set
+// (since fasthttp 1.76, Arc 27.01.1; before, it was sent empty), so the
+// client contract is "non-empty means capped".
+const arrowRowsCappedTrailer = "Arc-Rows-Capped"
+
 // HTTP trailers on a streamed response have to be filled in after the body is
 // written, which is the whole reason they exist, but nothing may touch the
 // response header while fasthttp serialises it (#729).

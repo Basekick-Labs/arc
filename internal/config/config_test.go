@@ -30,6 +30,42 @@ func TestDatabaseThreadCountDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestFlightSQLDefaults(t *testing.T) {
+	v := viper.New()
+	setDefaults(v)
+	if v.GetBool("flight_sql.enabled") {
+		t.Fatal("flight_sql.enabled default = true, want false")
+	}
+	if got := v.GetInt("flight_sql.port"); got != 50051 {
+		t.Fatalf("flight_sql.port default = %d, want 50051", got)
+	}
+}
+
+func TestValidateFlightSQLConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		flight  FlightSQLConfig
+		server  ServerConfig
+		wantErr bool
+	}{
+		{name: "disabled ignores port", flight: FlightSQLConfig{Port: -1}, server: ServerConfig{Port: 8000}},
+		{name: "valid", flight: FlightSQLConfig{Enabled: true, Port: 50051}, server: ServerConfig{Port: 8000}},
+		{name: "minimum port", flight: FlightSQLConfig{Enabled: true, Port: 1}, server: ServerConfig{Port: 8000}},
+		{name: "maximum port", flight: FlightSQLConfig{Enabled: true, Port: 65535}, server: ServerConfig{Port: 8000}},
+		{name: "zero port", flight: FlightSQLConfig{Enabled: true, Port: 0}, server: ServerConfig{Port: 8000}, wantErr: true},
+		{name: "large port", flight: FlightSQLConfig{Enabled: true, Port: 65536}, server: ServerConfig{Port: 8000}, wantErr: true},
+		{name: "HTTP port conflict", flight: FlightSQLConfig{Enabled: true, Port: 8000}, server: ServerConfig{Port: 8000}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateFlightSQLConfig(tc.flight, tc.server)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateFlightSQLConfig() error = %v, wantErr %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestEffectiveCores_ForwardsToSyscpu pins that config's exported form is the
 // same answer as the package that owns the implementation. The table-driven
 // coverage of the pure form lives in internal/syscpu with the function.

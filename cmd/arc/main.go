@@ -5416,6 +5416,23 @@ func main() {
 		return nil
 	}, 5)
 
+	var flightSQLServer *api.FlightSQLServer
+	if cfg.FlightSQL.Enabled {
+		flightSQLServer, err = api.NewFlightSQLServer(queryHandler, api.FlightSQLServerConfig{
+			Host:        cfg.Server.Host,
+			Port:        cfg.FlightSQL.Port,
+			TLSEnabled:  cfg.Server.TLSEnabled,
+			TLSCertFile: cfg.Server.TLSCertFile,
+			TLSKeyFile:  cfg.Server.TLSKeyFile,
+		}, logger.Get("flight-sql"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize Flight SQL server")
+		}
+		shutdownCoordinator.RegisterHook("flight-sql-server", func(ctx context.Context) error {
+			return flightSQLServer.Shutdown(ctx)
+		}, shutdown.PriorityHTTPServer-1)
+	}
+
 	// Register HTTP server shutdown hook (first to stop accepting new
 	// requests). The arg is the HTTP server's INTERNAL drain timeout —
 	// independent of shutdownCoordinator's own budget, though both now derive
@@ -5449,6 +5466,11 @@ func main() {
 	// Start server
 	if err := server.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
+	}
+	if flightSQLServer != nil {
+		if err := flightSQLServer.Start(); err != nil {
+			log.Fatal().Err(err).Msg("Failed to start Flight SQL server")
+		}
 	}
 
 	protocol := "HTTP"

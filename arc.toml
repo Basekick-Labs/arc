@@ -13,6 +13,11 @@ tls_enabled = false
 # tls_cert_file = "/etc/letsencrypt/live/example.com/fullchain.pem"
 # tls_key_file = "/etc/letsencrypt/live/example.com/privkey.pem"
 
+# Optional Arrow Flight SQL listener (disabled by default)
+[flight_sql]
+enabled = false
+port = 50051
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------

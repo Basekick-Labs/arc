@@ -1948,6 +1948,16 @@ GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
 
+### Arrow Flight SQL query endpoint ([#1385](https://github.com/Basekick-Labs/arc/issues/1385))
+
+An optional `[flight_sql]` listener exposes Arc's existing read-only query path
+over Arrow Flight SQL. It uses Arc token authentication and the configured TLS
+certificate, and maps databases and measurements to Flight SQL catalogs and
+tables for ADBC clients. Results stopped at a governance row cap end with a
+`ResourceExhausted` status rather than appearing to be complete.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https://github.com/Basekick-Labs/arc/pull/1419).
+
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 
 `cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a
