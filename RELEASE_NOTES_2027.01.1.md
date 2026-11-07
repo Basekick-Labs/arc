@@ -170,6 +170,33 @@ don't contain these sequences outside literals are unaffected.
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
 
+## arcx router: variance and standard deviation aggregates route to the engine
+
+The arcx engine now serves the unary moment aggregates `var_pop`, `var_samp`,
+`variance`, `stddev`, `stddev_samp`, `stddev_pop` and `sem`, plus `mean` as an
+alias of `avg`, over `BIGINT` and `DOUBLE` columns (arcX feat/agg6-moments). The
+eligibility recognizer accepts them wherever it accepts `avg`: in ungrouped
+aggregates, in tag- and time-bucket-grouped aggregates, and in `HAVING` when the
+same aggregate is also selected. The function name is lowercased in the derived
+column name and the argument keeps its spelling (`VARIANCE(X)` → `variance(X)`),
+as DuckDB does.
+
+A column holding `NaN` or `±Inf` makes DuckDB raise an out-of-range error for
+these functions; the engine declines such a query instead, so the router falls
+back and DuckDB raises its own error. The user sees the same outcome either way,
+and shadow mode counts a decline, not an engine error.
+
+Still on DuckDB, deliberately: `skewness`, `kurtosis` and `kurtosis_pop` (the
+DuckDB 1.5.6 implementation uses raw power sums whose result cannot be matched
+within the shadow comparator's tolerance once the mean exceeds roughly ten
+standard deviations; they route once Arc pins DuckDB 2.0, whose implementation
+is stable), the covariance/correlation/regression family, `DISTINCT` and
+expression arguments, and map-subscript arguments. In shadow mode the new
+columns compare within the same 1e-9 tolerance as `sum` and `avg`.
+
+Nothing changes for a deployment without the engine linked in (`arcx_engine`
+build tag) or with `ARC_ROUTER=off`.
+
 ## arcx router: map subscripts `col['key']` route to the engine
 
 The arcx engine now serves `col['key']` over `MAP(VARCHAR, VARCHAR)` columns in

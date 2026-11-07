@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -126,10 +127,21 @@ func aggFromArcx(rec arrow.Record) ([]aggCell, error) {
 	return out, nil
 }
 
+// tolerantAggFns: aggregates whose float result is an order-dependent reduction
+// and so compares within the documented 1e-9 tolerance — sum/avg (and the mean
+// alias) and the agg-6a moment family (Welford partials combined in work-list
+// order on the engine, thread order on DuckDB). min/max/count stay exact.
+var tolerantAggFns = map[string]bool{
+	"sum": true, "avg": true, "mean": true,
+	"var_pop": true, "var_samp": true, "variance": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+}
+
 // aggItemTolerant reports whether the item's float result carries the documented
-// tolerance (sum/avg — order-dependent reductions). min/max/count stay exact.
+// tolerance (see tolerantAggFns).
 func aggItemTolerant(item string) bool {
-	return len(item) > 4 && (item[:4] == "sum(" || item[:4] == "avg(")
+	fn, _, ok := strings.Cut(item, "(")
+	return ok && tolerantAggFns[fn]
 }
 
 // compareAgg returns "" on match, else a short VALUE-FREE diff.
