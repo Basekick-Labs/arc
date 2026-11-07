@@ -97,6 +97,7 @@ func TestExecuteQueryArrowReleasesExactlyOnce(t *testing.T) {
 
 		app := fiber.New(fiber.Config{DisableStartupMessage: true})
 		app.Post("/api/v1/query/arrow", h.executeQueryArrow)
+		beforeMetrics := metrics.Get().Snapshot()
 		req := httptest.NewRequest("POST", "/api/v1/query/arrow", strings.NewReader(`{"sql":"SELECT 1 AS id"}`))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := app.Test(req, 10000)
@@ -107,6 +108,13 @@ func TestExecuteQueryArrowReleasesExactlyOnce(t *testing.T) {
 			t.Fatalf("draining body: %v", err)
 		}
 		resp.Body.Close()
+		afterMetrics := metrics.Get().Snapshot()
+		beforeEngine := beforeMetrics["query_engine_executions"].(map[string]map[string]int64)[metrics.QueryEngineDuckDB]
+		afterEngine := afterMetrics["query_engine_executions"].(map[string]map[string]int64)[metrics.QueryEngineDuckDB]
+		if afterEngine["success"] != beforeEngine["success"]+1 || afterEngine["error"] != beforeEngine["error"] || afterMetrics["query_errors_total"] != beforeMetrics["query_errors_total"] {
+			t.Fatal("post-success panic recorded a second outcome")
+		}
+
 		return atomic.LoadInt32(&releases)
 	}
 

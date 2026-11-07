@@ -651,7 +651,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
 			}
@@ -671,6 +671,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			cancel()
 		}
 		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			m.IncQueryTimeouts()
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.TimedOut(queryID)
@@ -688,14 +689,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// operator cancel that lands during
 			// execution — the common case for a long query — surfaces here as an
 			// error return, not as a mid-stream break with a truncation trailer.
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"success": false,
 				"error":   "Query cancelled",
 			})
 		}
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(err.Error()))
 		}
@@ -786,6 +787,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// through onPanic. That retry is gone. It is not worth restoring, but the
 	// change is not strictly better on every panic path.
 	var streamW *bufio.Writer
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(fctx, cancel, trailers, "query_arrow_ipc", func() {
 		// A recovered panic leaves a stream the client would otherwise read as
 		// complete: fasthttp still writes the terminating chunk, and a cut on
@@ -851,7 +853,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		}
 
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			// Disposition, mirroring executeQuery: a deadline that fires
 			// mid-stream is a timeout (and counts as one — the pre-stream
 			// branch above already did, this path never had it); everything
@@ -908,9 +910,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Complete(queryID, int(totalRows))
 		}
-		m.IncQuerySuccess()
-		m.IncQueryRows(totalRows)
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(totalRows)
 
 		h.logger.Info().
 			Int64("row_count", totalRows).
@@ -918,7 +918,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			Msg("Arrow streaming query completed")
 		// query.slow_query_threshold_ms covered only the JSON path until #309.
 		h.logSlowQuery(convertedSQL, start, int(totalRows), tokenName)
-	})
+	}, outcome.fail)
 
 	return nil
 }

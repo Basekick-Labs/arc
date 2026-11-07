@@ -70,7 +70,7 @@ func executeArrowJSONQuery(
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if onFail != nil {
 				onFail(vanishedPartitionMessage)
 			}
@@ -91,6 +91,8 @@ func executeArrowJSONQuery(
 			if onComplete != nil {
 				onComplete(0)
 			}
+			m.IncQuerySuccess()
+			m.RecordQueryLatencyForEngine(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			c.JSON(QueryResponse{
 				Success:         true,
 				Columns:         []string{},
@@ -107,7 +109,7 @@ func executeArrowJSONQuery(
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			m.IncQueryTimeouts()
 			if onTimeout != nil {
 				onTimeout()
@@ -133,7 +135,7 @@ func executeArrowJSONQuery(
 		if cancel != nil {
 			cancel()
 		}
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(err.Error())
 		}
@@ -165,6 +167,7 @@ func executeArrowJSONQuery(
 	if respEncoding != "" {
 		c.Set(fiber.HeaderContentEncoding, respEncoding)
 	}
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(c.Context(), cancel, nil, "query_arrow_json", func() {
 		// A panic skips the onComplete/onFail/onTimeout dispositions below,
 		// which would leave the query registered as running forever (#717).
@@ -194,15 +197,13 @@ func executeArrowJSONQuery(
 			isWrapped = true
 		}
 		rc, streamErr := streamArrowJSON(streamCtx, bw, reader, governanceMaxRows, profile, start, timestamp)
-		bw.Flush()
+		streamErr = firstStreamWriteError(streamErr, bw.Flush())
 		if isWrapped {
-			if err := finishCompression(); err != nil && streamErr == nil {
-				streamErr = err
-			}
+			streamErr = firstStreamWriteError(streamErr, finishCompression())
 			bw.Reset(nil)
 			compressBufPool.Put(bw)
 		}
-		w.Flush()
+		streamErr = firstStreamWriteError(streamErr, w.Flush())
 
 		// Reported before the error branch below: a stream can reach the cap
 		// and then fail on the way out, and the marker is emitted either way,
@@ -212,7 +213,7 @@ func executeArrowJSONQuery(
 		h.logGovernanceRowCap("arrow_json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
 
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			if errors.Is(streamErr, context.DeadlineExceeded) {
 				m.IncQueryTimeouts()
 				if onTimeout != nil {
@@ -238,9 +239,7 @@ func executeArrowJSONQuery(
 			return
 		}
 
-		m.IncQuerySuccess()
-		m.IncQueryRows(int64(rc))
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(int64(rc))
 
 		if onComplete != nil {
 			onComplete(rc)
@@ -251,7 +250,7 @@ func executeArrowJSONQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow JSON query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	})
+	}, outcome.fail)
 
 	// Return 0 — actual row count is only known after async streaming completes.
 	// Metrics are recorded in the callback above.

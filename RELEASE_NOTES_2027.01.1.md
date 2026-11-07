@@ -4874,6 +4874,22 @@ one). `/api/v1/query/arrow` was not affected. The query-management API still
 reports `is_parallel` and `partition_count`; they are now always `false` and
 omitted.
 
+### Query execution metrics distinguish DuckDB and Arcx
+
+Prometheus now exports `arc_query_engine_executions_total{engine,outcome}` and
+`arc_query_latency_seconds{engine}`, including failed executions. These count
+only requests that reach an engine; earlier validation, permission and SQL
+transform failures remain in the aggregate request and error counters. Thus
+engine executions can be fewer than `arc_query_requests_total`.
+
+Arrow IPC pre-stream timeouts now also count as query errors. Empty Arrow-JSON
+and MessagePack results now count as successes and contribute to aggregate
+latency. Stream panics before completion and final response flush failures
+count as failures; a panic after a recorded outcome does not count the same
+execution again. Existing dashboards using these counters may change after upgrading.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292).
+
 ### A new hour is queryable at its first flush; DELETE, retention and database delete no longer break query results
 
 The query path caches which hour partitions exist, for up to a minute and
