@@ -49,6 +49,9 @@ func TestArcxArrowRegistryLifecycle(t *testing.T) {
 				ctx context.Context,
 				cancel context.CancelFunc,
 				_, _, _ string,
+				_ int,
+				_ func(int64),
+				_ func(),
 				onComplete func(int),
 				onFail func(string),
 			) bool {
@@ -138,6 +141,9 @@ func TestArcxArrowDeclineUsesSameRegistryEntry(t *testing.T) {
 		ctx context.Context,
 		_ context.CancelFunc,
 		_, _, _ string,
+		_ int,
+		_ func(int64),
+		_ func(),
 		_ func(int),
 		_ func(string),
 	) bool {
