@@ -77,9 +77,6 @@ func TestMomentsDecline(t *testing.T) {
 		"SELECT skewness(v) FROM cpu",
 		"SELECT kurtosis(v) FROM cpu",
 		"SELECT kurtosis_pop(v) FROM cpu",
-		"SELECT corr(v, w) FROM cpu",
-		"SELECT covar_pop(v, w) FROM cpu",
-		"SELECT regr_slope(v, w) FROM cpu",
 		"SELECT host, skewness(v) FROM cpu GROUP BY host",
 		// argument shapes the engine declines
 		"SELECT stddev(DISTINCT v) FROM cpu",

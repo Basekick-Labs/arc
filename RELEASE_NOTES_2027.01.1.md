@@ -202,6 +202,29 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: covariance, correlation and regression aggregates route to the engine
+
+The arcx engine now serves DuckDB's two-argument statistics family, `fn(y, x)` over two
+`BIGINT` or `DOUBLE` columns (arcX feat/agg6b-binary): `covar_pop`, `covar_samp`, `corr`,
+`regr_count`, `regr_avgx`, `regr_avgy`, `regr_slope`, `regr_intercept`, `regr_r2`,
+`regr_sxx`, `regr_syy` and `regr_sxy`. The recognizer routes them in ungrouped aggregates,
+in aggregates grouped by a `date_trunc` time bucket, and in `HAVING` when the same
+aggregate is selected. Grouped by a tag column they stay on DuckDB, like the variance
+family. A NaN or ±Inf in either argument makes the engine decline the query; DuckDB then
+answers (or raises its own out-of-range error) exactly as before.
+
+Shadow mode compares the new columns within the same 1e-9 tolerance as `sum` and `avg`;
+`regr_count` (an unsigned 32-bit integer in DuckDB) compares exactly. On four of these
+functions DuckDB 1.5.6 itself returns values that move by more than the tolerance between
+thread counts on data with heavy cancellation (`covar_pop`, `covar_samp` and `regr_sxy`
+near zero at large magnitudes, `regr_intercept` far from the data's mean). A value-only
+difference on those four is logged at WARN and counted under a new `oraclediff` shadow
+outcome instead of the mismatch alarm, the same treatment `arg_max` ties already get under
+`argdiff`. A NULL-ness, NaN-ness or type difference on them still raises the alarm.
+
+Nothing changes for a deployment without the engine linked in (`arcx_engine` build tag) or
+with `ARC_ROUTER=off`.
+
 ## arcx router: variance and standard deviation aggregates route to the engine
 
 The arcx engine now serves the unary moment aggregates `var_pop`, `var_samp`,

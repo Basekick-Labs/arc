@@ -45,6 +45,7 @@ var arcxShadowOutcomes = [...]string{
 	"match",
 	"mismatch",
 	"argdiff",
+	"oraclediff",
 	"declined",
 	"error",
 	"oracle_error",
@@ -62,6 +63,7 @@ const (
 	ShadowMatch       = "match"
 	ShadowMismatch    = "mismatch"
 	ShadowArgDiff     = "argdiff"
+	ShadowOracleDiff  = "oraclediff"
 	ShadowDeclined    = "declined"
 	ShadowError       = "error"
 	ShadowOracleError = "oracle_error"

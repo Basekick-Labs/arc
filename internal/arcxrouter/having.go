@@ -173,7 +173,7 @@ func havingRef(c *cursor, hc havingCtx) (string, bool) {
 				}
 				itemText = t.lower + "(" + arg.orig + ")"
 			}
-		case twoArgAggFns[t.lower]:
+		case twoArgAggFns[t.lower] || binaryMomentFns[t.lower]:
 			var iok bool
 			itemText, iok = parseTwoArgAggItem(c, t.lower)
 			if !iok {

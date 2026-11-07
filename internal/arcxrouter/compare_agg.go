@@ -80,6 +80,8 @@ func aggFromRows(rows *sql.Rows) ([]aggCell, error) {
 			out[i] = aggCell{isNull: true}
 		case int64:
 			out[i] = aggCell{isInt: true, i: big.NewInt(x)}
+		case uint32: // agg-6b regr_count (UINTEGER)
+			out[i] = aggCell{isInt: true, i: big.NewInt(int64(x))}
 		case *big.Int:
 			out[i] = aggCell{isInt: true, i: x}
 		case float64:
@@ -113,6 +115,12 @@ func aggFromArcx(rec arrow.Record) ([]aggCell, error) {
 			} else {
 				out[c] = aggCell{f: col.Value(0)}
 			}
+		case *array.Uint32: // agg-6b regr_count
+			if col.IsNull(0) {
+				out[c] = aggCell{isNull: true}
+			} else {
+				out[c] = aggCell{isInt: true, i: big.NewInt(int64(col.Value(0)))}
+			}
 		case *array.Timestamp:
 			if col.IsNull(0) {
 				out[c] = aggCell{isNull: true}
@@ -135,6 +143,10 @@ var tolerantAggFns = map[string]bool{
 	"sum": true, "avg": true, "mean": true,
 	"var_pop": true, "var_samp": true, "variance": true,
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+	// agg-6b (regr_count is an integer and stays exact)
+	"covar_pop": true, "covar_samp": true, "corr": true,
+	"regr_avgx": true, "regr_avgy": true, "regr_slope": true, "regr_intercept": true,
+	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
 }
 
 // aggItemTolerant reports whether the item's float result carries the documented
@@ -159,6 +171,7 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	// nondeterministic; arcx's is pinned). Structural diffs (null-ness/kind)
 	// on arg cells still alarm: ties can't change a cell's type.
 	argDiff := ""
+	oracleDiff := ""
 	deferArg := func(c int, msg string) bool {
 		if c < len(items) && isArgItem(items[c]) {
 			if argDiff == "" {
@@ -208,7 +221,14 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 		if tolerant {
 			scale := math.Max(math.Abs(a.f), math.Abs(d.f))
 			if math.Abs(a.f-d.f) > aggFloatRelTol*math.Max(scale, 1.0) {
-				return fmt.Sprintf("agg col %d differs (float beyond 1e-9 tolerance, values withheld)", c)
+				msg := fmt.Sprintf("agg col %d differs (float beyond 1e-9 tolerance, values withheld)", c)
+				if c < len(items) && isOracleUnstableItem(items[c]) {
+					if oracleDiff == "" {
+						oracleDiff = msg
+					}
+					continue
+				}
+				return msg
 			}
 		} else if a.f != d.f {
 			msg := fmt.Sprintf("agg col %d differs (float values withheld from log)", c)
@@ -220,6 +240,9 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	}
 	if argDiff != "" {
 		return "argdiff:" + argDiff
+	}
+	if oracleDiff != "" {
+		return "oraclediff:" + oracleDiff
 	}
 	return ""
 }
