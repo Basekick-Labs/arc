@@ -185,7 +185,10 @@ scans 10–25 % faster; DuckDB gains less because it prunes fewer shapes by
 row-group statistics. Nothing in Arc reads the page index yet; files written
 from now on carry it for the reader that will. Compaction's DuckDB `COPY` does
 not preserve the page index, so it lives on hot-tier files; tiering moves files
-whole; continuous-query output goes through the same writer and gets both.
+whole; continuous-query output and `/api/v1/import` go through the same writer
+and get both. The column index needs `write_statistics = true` (the default);
+the offset index is always written. Values of `max_row_group_rows` between 1
+and 1023, or negative, are rejected at startup.
 
 ```toml
 [ingest]

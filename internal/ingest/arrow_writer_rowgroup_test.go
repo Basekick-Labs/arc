@@ -82,16 +82,18 @@ func TestWriteParquetColumnar_PageIndex(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rg := rdr.MetaData().RowGroup(0)
-		for i := 0; i < rg.NumColumns(); i++ {
-			cc, err := rg.ColumnChunk(i)
-			if err != nil {
-				t.Fatal(err)
-			}
-			hasOffset := cc.GetOffsetIndexLocation() != nil
-			hasColumn := cc.GetColumnIndexLocation() != nil
-			if hasOffset != on || hasColumn != on {
-				t.Fatalf("write_page_index=%v: column %d offset_index=%v column_index=%v", on, i, hasOffset, hasColumn)
+		for g := 0; g < rdr.MetaData().NumRowGroups(); g++ {
+			rg := rdr.MetaData().RowGroup(g)
+			for i := 0; i < rg.NumColumns(); i++ {
+				cc, err := rg.ColumnChunk(i)
+				if err != nil {
+					t.Fatal(err)
+				}
+				hasOffset := cc.GetOffsetIndexLocation() != nil
+				hasColumn := cc.GetColumnIndexLocation() != nil
+				if hasOffset != on || hasColumn != on {
+					t.Fatalf("write_page_index=%v: group %d column %d offset_index=%v column_index=%v", on, g, i, hasOffset, hasColumn)
+				}
 			}
 		}
 		rdr.Close()

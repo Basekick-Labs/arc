@@ -163,8 +163,8 @@ type IngestConfig struct {
 	NumericDictionary     bool     // With UseDictionary, also dictionary-encode numeric/timestamp columns (pre-26.09.1 behavior; costs hashing+boxing per value)
 	WriteStatistics       bool     // Write Parquet statistics
 	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
-	MaxRowGroupRows       int      // Rows per Parquet row group at ingest (default 122880, compaction's size; 0 = writer default of one row group per flush)
-	WritePageIndex        bool     // Write the Parquet page index (column + offset index) at ingest (default true; free at the writer)
+	MaxRowGroupRows       int      // Rows per Parquet row group at ingest (default 122880, compaction's size; 0 = one row group per flush; 1..1023 and negatives rejected by Load)
+	WritePageIndex        bool     // Write the Parquet page index at ingest (default true; free). Offset index always; column index only where statistics exist (needs write_statistics) and fit the stats size cap
 	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
@@ -1576,6 +1576,13 @@ func Load() (*Config, error) {
 	if cfg.Ingest.ImportWriteConcurrency < 0 || cfg.Ingest.ImportWriteConcurrency > 1024 {
 		return nil, fmt.Errorf("invalid ingest.import_write_concurrency value: %d (must be 0-1024; 0 = auto)", cfg.Ingest.ImportWriteConcurrency)
 	}
+	// 0 keeps the writer's own cap (one row group per flush). Anything else
+	// below 1024 is a footer footgun — a cap of 1 writes one row group AND one
+	// page-index entry per row (probe: 300 rows → 780 KB) — so it is rejected
+	// like a negative value rather than silently clamped.
+	if cfg.Ingest.MaxRowGroupRows != 0 && cfg.Ingest.MaxRowGroupRows < 1024 {
+		return nil, fmt.Errorf("invalid ingest.max_row_group_rows value: %d (must be 0 or >= 1024; 0 = one row group per flush)", cfg.Ingest.MaxRowGroupRows)
+	}
 	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
 		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
 	}
@@ -2164,9 +2171,11 @@ func setDefaults(v *viper.Viper) {
 	// (+1.6% CPU) and worth 70 → 4 ms on a time-ordered top-N through arcx
 	// (plannings: Arc_research_ingest_writer_knobs, 2026-11-07).
 	v.SetDefault("ingest.max_row_group_rows", 122880)
-	// Page index (column + offset index): free at the writer, read by nothing in
-	// Arc yet; written so files already carry it when a consumer lands. Note
-	// compaction (DuckDB COPY) does not preserve it.
+	// Page index: free at the writer, read by nothing in Arc yet; written so
+	// files already carry it when a consumer lands. The offset index is always
+	// written; the column index needs write_statistics and is dropped for a
+	// chunk whose page stats are missing or over the stats size cap (arrow-go
+	// discards, never errors). Compaction (DuckDB COPY) does not preserve it.
 	v.SetDefault("ingest.write_page_index", true)
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())

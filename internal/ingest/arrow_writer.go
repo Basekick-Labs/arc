@@ -1094,7 +1094,10 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, bounds []int, b
 	w.logger.Debug().
 		Int("columns", len(schema.Fields())).
 		Int("rows", rows).
-		Int("row_groups", len(bounds)-1).
+		// One record per bounds pair; each record splits into ceil(rows/cap)
+		// row groups once `ingest.max_row_group_rows` applies, so this is the
+		// RECORD count — the row-group count is in the file's footer.
+		Int("records", len(bounds)-1).
 		Int("size", buf.Len()).
 		Msg("Wrote Parquet file")
 

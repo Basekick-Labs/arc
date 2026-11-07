@@ -1764,3 +1764,19 @@ func TestLoad_AzureCredentialsTrimmed(t *testing.T) {
 		t.Fatalf("not trimmed: %q %q", cfg.Storage.AzureSASToken, cfg.Storage.AzureAccountKey)
 	}
 }
+
+// ingest.max_row_group_rows: 0 keeps one row group per flush; 1..1023 and
+// negatives are rejected (a cap of 1 writes a row group and a page-index entry
+// per row); 1024 and up are accepted.
+func TestLoad_MaxRowGroupRowsValidation(t *testing.T) {
+	for _, c := range []struct {
+		v  string
+		ok bool
+	}{{"0", true}, {"1024", true}, {"122880", true}, {"1", false}, {"1023", false}, {"-5", false}} {
+		t.Setenv("ARC_INGEST_MAX_ROW_GROUP_ROWS", c.v)
+		_, err := Load()
+		if (err == nil) != c.ok {
+			t.Errorf("max_row_group_rows=%s: err=%v, want ok=%v", c.v, err, c.ok)
+		}
+	}
+}
