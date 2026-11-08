@@ -159,6 +159,10 @@ var tolerantAggFns = map[string]bool{
 	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
 	// agg-6b' (bit_*, bool_*, count_if compare exact)
 	"product": true, "fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	// agg-7: the interpolating order statistics (the discrete ones and mode are
+	// exact). DuckDB's arm64 build fuses the interpolation into an FMA, so a
+	// 1-ulp difference is architecture, not a bug (arcX agg-7 adversarial B1).
+	"median": true, "quantile_cont": true, "mad": true,
 }
 
 // aggItemTolerant reports whether the item's float result carries the documented

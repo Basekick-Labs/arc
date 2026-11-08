@@ -13,6 +13,7 @@
 package arcxrouter
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -773,6 +774,12 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 				}
 				items = append(items, f.lower+"("+argRef+")")
 			}
+		case quantileAggFns[f.lower]:
+			item, ok := parseQuantileAggItem(c, f.lower)
+			if !ok {
+				return fail()
+			}
+			items = append(items, item)
 		case twoArgAggFns[f.lower] || binaryMomentFns[f.lower]:
 			// agg-4 two-arg by-time aggregates: `fn(payload, orderkey)` — both
 			// bare idents, re-serialized `fn(a, b)` (fn lowercased, spellings
@@ -988,6 +995,15 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				bucketText += " AS " + alias
 			}
 			items = append(items, bucketText)
+		} else if isCall && quantileAggFns[t.lower] {
+			// agg-7: gated on tag keys like the moments (momentAggFns).
+			item, iok := parseQuantileAggItem(c, t.lower)
+			if !iok {
+				return fail()
+			}
+			hasMoment = true
+			items = append(items, item)
+			nAggs++
 		} else if isCall && (twoArgAggFns[t.lower] || binaryMomentFns[t.lower]) {
 			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm), and the
 			// agg-6b fn(y, x) family — which gates tag-keyed shapes like the
@@ -1002,7 +1018,8 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			items = append(items, item)
 			nAggs++
 		} else if isCall {
-			if !unaryAggFns[t.lower] {
+			// agg-7: grouped `mode` is not routed (see unaryAggFns).
+			if !unaryAggFns[t.lower] || t.lower == "mode" {
 				return fail()
 			}
 			if momentAggFns[t.lower] {
@@ -1243,6 +1260,15 @@ var unaryAggFns = map[string]bool{
 	"fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
 	"bit_and": true, "bit_or": true, "bit_xor": true,
 	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
+	// agg-7 (arcX feat/agg-7-order-stats): the single-argument order statistics.
+	// `mode` is routed UNGROUPED only (matchGroupedAgg refuses it): one tied group
+	// declines the whole query in the engine, and small groups tie often.
+	"median": true, "mad": true, "mode": true,
+}
+
+// quantileAggFns: agg-7 `fn(<bare col>, <fraction literal>)`.
+var quantileAggFns = map[string]bool{
+	"quantile_cont": true, "quantile_disc": true, "quantile": true,
 }
 
 // momentAggFns: the agg-6a subset of unaryAggFns whose grouped form is gated to
@@ -1256,6 +1282,10 @@ var momentAggFns = map[string]bool{
 	"fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
 	"bit_and": true, "bit_or": true, "bit_xor": true,
 	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
+	// agg-7: tag-keyed order statistics take the engine's generic hash path (the
+	// dictionary paths are off for value-list states) — gated like the moments.
+	"median": true, "mad": true, "mode": true,
+	"quantile_cont": true, "quantile_disc": true, "quantile": true,
 }
 
 // binaryMomentFns: the agg-6b two-argument family, `fn(y, x)` over two bare
@@ -1272,6 +1302,46 @@ var binaryMomentFns = map[string]bool{
 // twoArgAggFns: the agg-4 by-time aggregates — `fn(payload, orderkey)`.
 var twoArgAggFns = map[string]bool{
 	"arg_max": true, "arg_min": true, "max_by": true, "min_by": true,
+}
+
+// parseQuantileAggItem consumes `( <bare ident> , <fraction> )` after an agg-7
+// quantile name and re-serializes it as `fn(col, q)`. The fraction mirrors the
+// engine's parse_quantile_lit: `0`, `1`, or a canonical decimal `0.d…` / `1.0…` in
+// [0, 1] (≤15 digits — the lexer already declines wider decimals). A list, a
+// negative fraction, a cast or anything else fails.
+func parseQuantileAggItem(c *cursor, fnLower string) (string, bool) {
+	if !c.punct('(') {
+		return "", false
+	}
+	a, ok := c.next()
+	if !ok || a.kind != tokIdent || isScanKeyword(a.lower) || !isBareIdent(a.orig) ||
+		strings.Contains(a.orig, ".") || duckdbNonColumnKeywords[a.lower] {
+		return "", false
+	}
+	if !c.punct(',') {
+		return "", false
+	}
+	q, ok := c.next()
+	if !ok || !isQuantileLit(q) {
+		return "", false
+	}
+	if !c.punct(')') {
+		return "", false
+	}
+	return fnLower + "(" + a.orig + ", " + q.orig + ")", true
+}
+
+var quantileDecimal = regexp.MustCompile(`^(0\.[0-9]+|1\.0+)$`)
+
+// isQuantileLit: the fraction spellings both DuckDB versions echo verbatim.
+func isQuantileLit(t token) bool {
+	switch t.kind {
+	case tokNum:
+		return t.orig == "0" || t.orig == "1"
+	case tokFloat:
+		return quantileDecimal.MatchString(t.orig)
+	}
+	return false
 }
 
 func parseTwoArgAggItem(c *cursor, fnLower string) (string, bool) {

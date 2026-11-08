@@ -158,6 +158,10 @@ func havingRef(c *cursor, hc havingCtx) (string, bool) {
 			// rows and `= 1` / `> 0` / `= 'true'` match) — refused here so the engine
 			// is not handed a query it always declines.
 			return "", false
+		case t.lower == "median" || t.lower == "mad" || t.lower == "mode":
+			// agg-7: order statistics in HAVING are not routed in v1 (the engine
+			// resolves them; held until measured).
+			return "", false
 		case unaryAggFns[t.lower]:
 			// Mirrors the select-list arm in matchGroupedAgg exactly (same accepted
 			// forms, same emitted text); kept inline rather than refactoring that

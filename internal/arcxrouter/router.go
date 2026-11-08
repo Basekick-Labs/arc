@@ -518,6 +518,14 @@ func isAggItem(item string) bool {
 	case fn == "count":
 		return isColumnRef(inner)
 	// agg-6b2: a predicate argument must re-parse to exactly itself.
+	// agg-7: `quantile_*(col, q)` — exactly a bare ident and a fraction.
+	case quantileAggFns[fn]:
+		a, q, ok := strings.Cut(inner, ", ")
+		if !ok || !isBareIdent(a) || strings.Contains(a, ".") {
+			return false
+		}
+		toks, tok := tokenize(q)
+		return tok && len(toks) == 1 && isQuantileLit(toks[0]) && toks[0].orig == q
 	case predArgAggFns[fn] && !isBareIdent(inner):
 		return isPredArgItem(item)
 	case unaryAggFns[fn]:
