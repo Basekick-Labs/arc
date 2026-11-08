@@ -171,7 +171,7 @@ func havingRef(c *cursor, hc havingCtx) (string, bool) {
 				itemText = "count(*)"
 			} else {
 				arg, tok := c.next()
-				if !tok || arg.kind != tokIdent || isScanKeyword(arg.lower) {
+				if !tok || arg.kind != tokIdent || isScanKeyword(arg.lower) || duckdbNonColumnKeywords[arg.lower] {
 					return "", false
 				}
 				if !c.punct(')') {

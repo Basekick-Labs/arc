@@ -517,6 +517,9 @@ func isAggItem(item string) bool {
 	// aggregate (agg-1 set, mean, the agg-6a moments) stays bare.
 	case fn == "count":
 		return isColumnRef(inner)
+	// agg-6b2: a predicate argument must re-parse to exactly itself.
+	case predArgAggFns[fn] && !isBareIdent(inner):
+		return isPredArgItem(item)
 	case unaryAggFns[fn]:
 		return isBareIdent(inner)
 	// agg-4: the two-arg by-time aggregates — EXACTLY two bare idents,
