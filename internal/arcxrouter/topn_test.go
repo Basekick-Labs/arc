@@ -70,6 +70,9 @@ func TestGroupedTopNDeclines(t *testing.T) {
 		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 2 DESC DESC",                             // repeated direction
 		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY count(*) + 1",                            // expression
 		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 2 LIMIT 5 LIMIT 6",                       // trailing clause
+		// `AS desc` resolved by ORDER BY is a DuckDB parser error (review M2).
+		"SELECT host, max(x) AS desc FROM cpu GROUP BY host ORDER BY desc",
+		"SELECT host, max(x) AS asc FROM cpu GROUP BY host ORDER BY asc LIMIT 3",
 		// res-2 session guard: an in-query default_order change.
 		"SELECT host, count(*) FROM cpu WHERE default_order > 1 GROUP BY host ORDER BY 2",
 	} {

@@ -151,7 +151,7 @@ type matchResult struct {
 	// can't represent the WHERE (2b-2). buildScanSQL emits it verbatim; the engine is
 	// the tree authority.
 	orderBy []scanOrderKey // scan only: ORDER BY keys
-	limit   int            // scan only: LIMIT n (0 = none)
+	limit   int            // LIMIT n: scan (0 = none); grouped only under hasLimit (res-2)
 	// scan_agg only: re-serialized aggregate items ("count(*)", "sum(colAsWritten)"),
 	// in select-list order — validated token-by-token in matchScanAgg.
 	aggItems []string
@@ -166,9 +166,8 @@ type matchResult struct {
 	// The SQL builder re-emits from THESE, never from groupKey's text.
 	bucketUnit string
 	bucketCol  string
-	// agg-3c: the ordered KEY's 1-based select position (0 = no ORDER BY);
-	// the builder emits `ORDER BY <this position>` ascending.
-	// res-2 grouped ORDER BY keys and explicit LIMIT.
+	// res-2 grouped ORDER BY keys (1-based positions; replaced agg-3c's single
+	// ascending key) and an explicit LIMIT.
 	orderKeys []OrderKey
 	hasLimit  bool
 	// agg-3c: rebuilt bucket item text ("" = no bucket key). groupKey holds

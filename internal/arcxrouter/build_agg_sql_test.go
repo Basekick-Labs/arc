@@ -162,6 +162,23 @@ func TestBuildGroupedSQLComposite(t *testing.T) {
 	if !ok || got != want {
 		t.Fatalf("got (%q, %t), want %q", got, ok, want)
 	}
+	// Review H1: the shadow tie-verification variant appends the engine's
+	// tie-break (every key position, GROUP BY order, ASC NULLS LAST) before the
+	// LIMIT and reads with union_by_name like Arc's own queries.
+	got, ok = buildGroupedSQL(Decision{
+		AggItems:       []string{"date_trunc('hour', time)", "host", "count(*)"},
+		GroupKey:       "host",
+		BucketUnit:     "hour",
+		BucketCol:      "time",
+		OrderKeys:      []OrderKey{{Pos: 3, Desc: true}},
+		HasLimit:       true,
+		Limit:          5,
+		tieBreakOracle: true,
+	}, paths)
+	want = "SELECT date_trunc('hour', time), host, count(*) FROM read_parquet(['/p.parquet'], union_by_name=true) GROUP BY 1, 2 ORDER BY 3 DESC NULLS LAST, 1 ASC NULLS LAST, 2 ASC NULLS LAST LIMIT 5"
+	if !ok || got != want {
+		t.Fatalf("got (%q, %t), want %q", got, ok, want)
+	}
 	base := func() Decision {
 		return Decision{AggItems: []string{"host", "count(*)", "arg_max(v, time)"}, GroupKey: "host"}
 	}

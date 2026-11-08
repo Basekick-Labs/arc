@@ -416,9 +416,12 @@ const (
 // which the engine serves: DuckDB's own fsum/favg swing by orders of magnitude
 // across thread counts on cancelling data, so the oracle's ORDER would move
 // with them and every disagreement would read as a mismatch.
+var orderTargetRefusedPrefixes = []string{"fsum(", "sumkahan(", "kahan_sum(", "favg(",
+	"arg_max(", "arg_min(", "max_by(", "min_by(", "skewness(", "kurtosis(",
+	"kurtosis_pop(", "covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept("}
+
 func orderTargetRefused(item string) bool {
-	for _, p := range []string{"fsum(", "sumkahan(", "kahan_sum(", "favg(", "arg_max(", "arg_min(", "max_by(", "min_by(", "skewness(", "kurtosis(",
-		"kurtosis_pop(", "covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept("} {
+	for _, p := range orderTargetRefusedPrefixes {
 		if strings.HasPrefix(item, p) {
 			return true
 		}
@@ -478,6 +481,11 @@ func orderKeyRef(c *cursor, items []string, orderRef func(token) int, aliases []
 			}
 		}
 	case t.kind == tokIdent:
+		if t.lower == "asc" || t.lower == "desc" {
+			// `max(x) AS desc … ORDER BY desc` is a DuckDB parser error (review
+			// M2); an alias of that spelling never resolves here.
+			return -1, false
+		}
 		if r := orderRef(t); r >= 0 {
 			idx = r
 		} else {
@@ -1024,8 +1032,8 @@ func matchScanAgg(toks []token) (items, aliases []string, whereText string, meas
 // `date_trunc('<unit>', <bare col>)` with unit in the engine's fixed-width set
 // (second/minute/hour/day — bucketUnit/bucketCol return the validated parts and
 // the builder re-emits them, never the source text). An optional trailing
-// `ORDER BY <key pos|key name> [ASC]` is accepted (the engine sorts ascending,
-// NULLS LAST); DESC/LIMIT/multi-key ORDER decline. Non-UTC sessions never get
+// `ORDER BY … [LIMIT n]` follows (res-2; see the ORDER BY loop below). Non-UTC
+// sessions never get
 // here — the M3 tz-injection gate runs before shape matching (gotcha #3).
 func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	var aggAliases []string // res-1: per-item alias ("" = none / key item)
@@ -1497,7 +1505,6 @@ type groupedMatch struct {
 	meas       string
 	bucketUnit string
 	bucketCol  string
-	// ORDER BY: the ordered KEY's 1-based select-list position (0 = none).
 	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
 	// the MANDATORY alias — validated parts the builder re-emits.
 	epochWidthSecs int

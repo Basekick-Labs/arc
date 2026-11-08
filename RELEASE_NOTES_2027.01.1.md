@@ -221,14 +221,18 @@ These forms still run on DuckDB:
 - sorting by `arg_max`/`arg_min`/`max_by`/`min_by`, `skewness`/`kurtosis`, `covar_pop`,
   `covar_samp`, `regr_sxy`, `regr_intercept` or the Kahan sums (`fsum`, `favg`, …): DuckDB
   1.5.6's results for these vary between runs or drift on real data, so its order would too;
-- a floating-point aggregate such as `avg` as any key but the last;
+- an aggregate whose result carries a floating-point tolerance (`sum`, `avg`, the variance and
+  standard-deviation family, `median`, `quantile_cont`, `mad`, …) as any key but the last;
 - a query that mentions `default_order` or `default_null_order`.
 
 In shadow mode the order of the rows is compared as part of the answer. Groups that tie on every sort
 key may come back in a different order without counting as a difference. When the `LIMIT` cut falls
 inside a run of tied groups, the two engines can legitimately keep different groups from that run.
-Shadow mode records that under a new `tiediff` outcome (a WARN), provided every row before the run
-matched. Any other difference in row membership or order is a mismatch.
+Shadow mode then asks DuckDB again, this time with the engine's tie-break appended, so the answer is
+deterministic. The engine's rows must match that answer exactly, values included. Only then is the
+difference recorded under a new `tiediff` outcome (a WARN). A wrong row at the cut, or any other
+difference in membership, order or values, is a mismatch. The second query runs only when a tie falls
+at the cut.
 
 ## arcx router: aliased aggregates route to the engine
 
