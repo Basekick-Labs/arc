@@ -1185,6 +1185,12 @@ var unaryAggFns = map[string]bool{
 	"count": true, "sum": true, "min": true, "max": true, "avg": true, "mean": true,
 	"var_pop": true, "var_samp": true, "variance": true,
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+	// agg-6b': product, the Kahan sums, bitwise, and the Boolean-column forms of
+	// bool_and / bool_or / count_if (predicate arguments are not accepted here:
+	// the bare-column requirement declines `count_if(x > 0)`, as the engine does).
+	"product": true, "fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	"bit_and": true, "bit_or": true, "bit_xor": true,
+	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
 }
 
 // momentAggFns: the agg-6a subset of unaryAggFns whose grouped form is gated to

@@ -152,6 +152,12 @@ func havingRef(c *cursor, hc havingCtx) (string, bool) {
 	if isCall {
 		var itemText string
 		switch {
+		case t.lower == "bool_and" || t.lower == "bool_or":
+			// agg-6b': a Boolean aggregate in HAVING needs a Boolean comparison the
+			// engine does not bind (DuckDB's bool-vs-int casts make `= 2` match no
+			// rows and `= 1` / `> 0` / `= 'true'` match) — refused here so the engine
+			// is not handed a query it always declines.
+			return "", false
 		case unaryAggFns[t.lower]:
 			// Mirrors the select-list arm in matchGroupedAgg exactly (same accepted
 			// forms, same emitted text); kept inline rather than refactoring that

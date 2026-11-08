@@ -202,6 +202,26 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: product, Kahan sums, bitwise and boolean aggregates route to the engine
+
+The arcx engine now serves `product`, `fsum` / `sumkahan` / `kahan_sum`, `favg`, `bit_and`,
+`bit_or`, `bit_xor`, and — over a `BOOLEAN` column — `bool_and`, `bool_or` and `count_if` /
+`countif` (arcX feat/agg6bp-numeric). They route wherever `avg` does, grouped by a tag
+included. Predicate arguments (`count_if(status >= 500)`) still run on DuckDB; they are the
+next engine slice. `bool_and` / `bool_or` in `HAVING` stay on DuckDB as well.
+
+The engine declines a `product` whose factors could overflow or underflow under some
+partitioning of the rows (the sums of the positive and negative parts of `log2|x|` must stay
+within ±1000), and a Kahan sum that comes out non-finite — DuckDB's own results there depend on
+how it splits the work. Shadow mode compares `product` and the Kahan sums within the 1e-9
+tolerance; on cancelling data DuckDB's Kahan sums swing between thread counts, so a value-only
+difference on them is a WARN under the `oraclediff` outcome. The bitwise, boolean and
+`count_if` results compare exactly.
+
+**Shadow comparator fix:** a difference between a finite value and ±Inf, or between +Inf and
+−Inf, passed the tolerance test as a match, because the tolerance itself became infinite. Such
+differences are now reported (`Inf-ness`) in both the ungrouped and grouped comparators.
+
 ## arcx router: covariance, correlation and regression aggregates route to the engine
 
 The arcx engine now serves DuckDB's two-argument statistics family, `fn(y, x)` over two

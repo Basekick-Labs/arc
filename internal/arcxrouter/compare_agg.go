@@ -41,8 +41,10 @@ const aggFloatRelTol = 1e-9
 type aggCell struct {
 	isNull bool
 	isInt  bool
+	isBool bool     // agg-6b' bool_and / bool_or (exact compare)
 	i      *big.Int // isInt: count, integer sum, timestamp µs
-	f      float64  // !isInt: float sum/avg/min/max
+	f      float64  // !isInt && !isBool: float sum/avg/min/max
+	b      bool     // isBool
 }
 
 // aggFromRows scans DuckDB's single aggregate row. The driver hands back int64
@@ -82,6 +84,8 @@ func aggFromRows(rows *sql.Rows) ([]aggCell, error) {
 			out[i] = aggCell{isInt: true, i: big.NewInt(x)}
 		case uint32: // agg-6b regr_count (UINTEGER)
 			out[i] = aggCell{isInt: true, i: big.NewInt(int64(x))}
+		case bool: // agg-6b' bool_and / bool_or
+			out[i] = aggCell{isBool: true, b: x}
 		case *big.Int:
 			out[i] = aggCell{isInt: true, i: x}
 		case float64:
@@ -121,6 +125,12 @@ func aggFromArcx(rec arrow.Record) ([]aggCell, error) {
 			} else {
 				out[c] = aggCell{isInt: true, i: big.NewInt(int64(col.Value(0)))}
 			}
+		case *array.Boolean: // agg-6b' bool_and / bool_or
+			if col.IsNull(0) {
+				out[c] = aggCell{isNull: true}
+			} else {
+				out[c] = aggCell{isBool: true, b: col.Value(0)}
+			}
 		case *array.Timestamp:
 			if col.IsNull(0) {
 				out[c] = aggCell{isNull: true}
@@ -147,6 +157,8 @@ var tolerantAggFns = map[string]bool{
 	"covar_pop": true, "covar_samp": true, "corr": true,
 	"regr_avgx": true, "regr_avgy": true, "regr_slope": true, "regr_intercept": true,
 	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
+	// agg-6b' (bit_*, bool_*, count_if compare exact)
+	"product": true, "fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
 }
 
 // aggItemTolerant reports whether the item's float result carries the documented
@@ -189,6 +201,15 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 		if a.isNull {
 			continue
 		}
+		if a.isBool != d.isBool {
+			return fmt.Sprintf("agg col %d differs (kind: arcx_bool=%t duckdb_bool=%t)", c, a.isBool, d.isBool)
+		}
+		if a.isBool {
+			if a.b != d.b {
+				return fmt.Sprintf("agg col %d differs (boolean value withheld from log)", c)
+			}
+			continue
+		}
 		if a.isInt != d.isInt {
 			// One side numeric-int, the other float — a type divergence (e.g. a
 			// shape mapping bug), not a value difference.
@@ -212,6 +233,20 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 				continue
 			}
 			msg := fmt.Sprintf("agg col %d differs (NaN-ness: arcx_nan=%t duckdb_nan=%t)", c, math.IsNaN(a.f), math.IsNaN(d.f))
+			if deferArg(c, msg) {
+				continue
+			}
+			return msg
+		}
+		// ±Inf on either side compares exactly. The tolerance test below cannot
+		// see it: |finite − Inf| = Inf and 1e-9·max(Inf, 1) = Inf, and Inf > Inf
+		// is false — a finite-vs-Inf (or +Inf-vs-−Inf) divergence passed as a
+		// match (found by the agg-6b' plan review).
+		if math.IsInf(a.f, 0) || math.IsInf(d.f, 0) {
+			if a.f == d.f {
+				continue
+			}
+			msg := fmt.Sprintf("agg col %d differs (Inf-ness, values withheld)", c)
 			if deferArg(c, msg) {
 				continue
 			}
