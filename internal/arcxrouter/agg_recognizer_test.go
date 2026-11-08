@@ -95,7 +95,7 @@ func TestScanAggDeclines(t *testing.T) {
 		"SELECT sum(a * b) FROM cpu",
 		"SELECT sum(*) FROM cpu",
 		"SELECT host, count(*) FROM cpu",                       // mixed list
-		"SELECT count(*) AS c FROM cpu WHERE x=1",              // alias
+		"SELECT count(*) c FROM cpu WHERE x=1",                 // bare alias (no AS) — res-1 serves AS only
 		"SELECT approx_count_distinct(x) FROM cpu WHERE x > 1", // unsupported aggregate
 		"SELECT sum(x) FROM cpu WHERE",                         // dangling WHERE
 	} {

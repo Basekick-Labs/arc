@@ -77,7 +77,7 @@ func TestEligibleShape_ScalarAggregates(t *testing.T) {
 func TestEligibleShape_ScalarDeclines(t *testing.T) {
 	for _, sql := range []string{
 		"SELECT max(time) FROM cpu GROUP BY 1",
-		"SELECT min(time) AS m FROM cpu",
+		"SELECT min(time) m FROM cpu",
 		"SELECT min(time + 1) FROM cpu",
 		"SELECT min(*) FROM cpu",
 		// NOTE: `sum(value)`, `avg(value)`, `min(a), max(b)`, and WHERE-bearing
@@ -121,7 +121,7 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"count with join", "SELECT count(*) FROM cpu JOIN mem ON cpu.time = mem.time"},
 		// NOTE: `count(x)` is now ELIGIBLE (ShapeCountCol, Phase 1b) — no longer a
 		// decline. Its acceptance is covered by TestEligibleShape_ScalarAggregates.
-		{"count alias", "SELECT count(*) AS n FROM cpu"},
+		{"count alias", "SELECT count(*) n FROM cpu"},
 		{"count two tables", "SELECT count(*) FROM cpu, mem"},
 		// NOTE: `sum(x)` is now ELIGIBLE (ShapeScanAgg, agg-1) — no longer a
 		// decline. Its acceptance is covered by TestScanAggRecognized.

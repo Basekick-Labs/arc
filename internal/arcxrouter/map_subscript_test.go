@@ -132,7 +132,7 @@ func TestMatchScan_Subscript_Declines(t *testing.T) {
 func TestMatchScanAgg_Subscript(t *testing.T) {
 	// Served: subscript in the WHERE of an ungrouped aggregate (engine ScanAgg).
 	toks, _ := tokenize("SELECT count(*) FROM otel_logs WHERE ResourceAttributes['k8s.namespace.name'] = 'kube-system'")
-	items, whereText, meas, ok := matchScanAgg(toks)
+	items, _, whereText, meas, ok := matchScanAgg(toks)
 	if !ok || meas != "otel_logs" || len(items) != 1 || items[0] != "count(*)" {
 		t.Fatalf("scan agg with subscript WHERE must match: ok=%v items=%v meas=%q", ok, items, meas)
 	}
@@ -149,7 +149,7 @@ func TestMatchScanAgg_Subscript(t *testing.T) {
 		if !ok {
 			t.Fatalf("tokenize: %s", tc.sql)
 		}
-		items, whereText, _, ok := matchScanAgg(toks)
+		items, _, whereText, _, ok := matchScanAgg(toks)
 		if !ok || strings.Join(items, "|") != tc.items || whereText != tc.where {
 			t.Fatalf("matchScanAgg(%s): ok=%v items=%v where=%q", tc.sql, ok, items, whereText)
 		}
@@ -169,7 +169,7 @@ func TestMatchScanAgg_Subscript(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if _, _, _, ok := matchScanAgg(toks); ok {
+		if _, _, _, _, ok := matchScanAgg(toks); ok {
 			t.Fatalf("matchScanAgg must decline: %s", sql)
 		}
 	}

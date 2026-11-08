@@ -139,7 +139,12 @@ type Decision struct {
 	OrderBy   []scanOrderKey // scan only: ORDER BY keys
 	Limit     int            // scan only: LIMIT n (0 = none)
 	AggItems  []string       // scan_agg only: re-serialized aggregate items, select-list order
-	GroupKey  string         // scan_agg_grouped only: the single group-key column (or the rebuilt bucket text)
+	// res-1: per-item `AS` alias ("" = none), parallel to AggItems; AggItems stay
+	// the bare call text (HAVING matching, tolerance and key detection read them).
+	AggAliases []string
+	// res-1: alias of the single aggregate of a footer shape (count(*), min/max/count).
+	AggAlias string
+	GroupKey string // scan_agg_grouped only: the single group-key column (or the rebuilt bucket text)
 	// agg-3 bucket key parts (empty = bare tag key) — the builder re-emits from
 	// these validated parts, never from GroupKey's text.
 	BucketUnit string
@@ -199,6 +204,8 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		OrderBy:        m.orderBy,
 		Limit:          m.limit,
 		AggItems:       m.aggItems,
+		AggAliases:     m.aggAliases,
+		AggAlias:       m.aggAlias,
 		GroupKey:       m.groupKey,
 		BucketUnit:     m.bucketUnit,
 		BucketCol:      m.bucketCol,
@@ -313,7 +320,11 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 
 	switch d.Shape {
 	case ShapeCountStar:
-		return "SELECT count(*) FROM read_parquet(" + arr.String() + ")", true
+		as, ok := aliasSuffix(d.AggAlias)
+		if !ok {
+			return "", false
+		}
+		return "SELECT count(*)" + as + " FROM read_parquet(" + arr.String() + ")", true
 	case ShapeDateTruncCent:
 		// Unit spelling preserved verbatim so the engine reproduces DuckDB's
 		// derived column name. Column is the "time" convention (F1). An optional
@@ -339,7 +350,11 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 			return "", false
 		}
 		fn := map[string]string{ShapeMinCol: "min", ShapeMaxCol: "max", ShapeCountCol: "count"}[d.Shape]
-		return "SELECT " + fn + "(" + d.Col + ") FROM read_parquet(" + arr.String() + ")", true
+		as, ok := aliasSuffix(d.AggAlias)
+		if !ok {
+			return "", false
+		}
+		return "SELECT " + fn + "(" + d.Col + ")" + as + " FROM read_parquet(" + arr.String() + ")", true
 	case ShapeScan:
 		return buildScanSQL(d, arr.String())
 	case ShapeScanAgg:
@@ -349,6 +364,25 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// aliasSuffix renders ` AS <alias>` for a re-validated res-1 alias ("" → "").
+func aliasSuffix(a string) (string, bool) {
+	if a == "" {
+		return "", true
+	}
+	if !isAggAlias(a) {
+		return "", false
+	}
+	return " AS " + a, true
+}
+
+// itemAlias returns the alias for item i ("" when the slice is shorter).
+func itemAlias(aliases []string, i int) string {
+	if i < len(aliases) {
+		return aliases[i]
+	}
+	return ""
 }
 
 // buildScanAggSQL constructs the engine SQL for an ungrouped aggregation (agg-1):
@@ -373,6 +407,11 @@ func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
 			b.WriteString(", ")
 		}
 		b.WriteString(item)
+		as, ok := aliasSuffix(itemAlias(d.AggAliases, i))
+		if !ok {
+			return "", false
+		}
+		b.WriteString(as)
 	}
 	b.WriteString(" FROM read_parquet(")
 	b.WriteString(pathArray)
@@ -437,9 +476,12 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	var b strings.Builder
 	b.WriteString("SELECT ")
 	for i, item := range d.AggItems {
+		alias := itemAlias(d.AggAliases, i)
 		switch {
 		case isAggItem(item):
 			sawAgg = true
+		case alias != "":
+			return "", false // res-1: aliases ride aggregate items only
 		case bucketText != "" && item == bucketText && !sawBucket:
 			sawBucket = true
 			keyPositions = append(keyPositions, i+1)
@@ -453,6 +495,11 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 			b.WriteString(", ")
 		}
 		b.WriteString(item)
+		as, ok := aliasSuffix(alias)
+		if !ok {
+			return "", false
+		}
+		b.WriteString(as)
 	}
 	if !sawAgg || (bucketText != "" && !sawBucket) || (tagText != "" && !sawTag) {
 		return "", false
@@ -840,6 +887,31 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	h.Metrics.ArcxShadowMatch(d.Shape)
 }
 
+// columnNameDiff compares DuckDB's result column names with arcx's ("" = same;
+// index only in the message — names may be data-bearing). One pre-existing
+// divergence is exempted by NAME, so it covers every shape and nothing else: Arc's
+// epoch-math rewrite of a `date_trunc` bucket (internal/api/query.go) makes
+// DuckDB name that column after the rewritten `make_timestamptz(…)` expression
+// while arcx names it `date_trunc(…)` — the unaliased bucket of both the grouped
+// and the `date_trunc_count` shapes (an aliased bucket is named identically).
+// Tracked as a follow-up: the rewrite should alias back to the native name.
+func columnNameDiff(oracleCols []string, rec arrow.Record) string {
+	if len(oracleCols) != int(rec.NumCols()) {
+		return "" // the cell comparators report the arity difference
+	}
+	for i, c := range oracleCols {
+		a := rec.ColumnName(i)
+		if a == c {
+			continue
+		}
+		if strings.HasPrefix(c, "make_timestamptz(") && strings.HasPrefix(a, "date_trunc(") {
+			continue
+		}
+		return "result column " + strconv.Itoa(i) + " name differs (names withheld)"
+	}
+	return ""
+}
+
 // compareToOracle runs the DuckDB oracle for this query and compares its result to
 // arcx's `rec`, returning the diff string ("" == match) or an oracle error. Scalar
 // shapes (min/max/count(col)) use the single-cell comparison; count(*)/agg use the
@@ -850,6 +922,15 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		return "", err
 	}
 	defer rows.Close()
+
+	// res-1 (adversarial M3): result column NAMES reach clients verbatim, and
+	// aliases make them user-controlled — compare them too (the cell comparators
+	// below are positional).
+	if cols, err := rows.Columns(); err == nil {
+		if diff := columnNameDiff(cols, rec); diff != "" {
+			return diff, nil
+		}
+	}
 
 	if d.Shape == ShapeScan {
 		oracle, err := scanRowsFromRows(rows)
