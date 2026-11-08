@@ -100,6 +100,21 @@ func TestPredicateArgDeclines(t *testing.T) {
 			t.Fatalf("should decline: %s (items %v)", sql, m.aggItems)
 		}
 	}
+	// Bare reserved keywords in the other column positions (review M1).
+	for _, sql := range []string{
+		"SELECT corr(end, i) FROM t",
+		"SELECT arg_max(end, time) FROM t",
+		"SELECT date_trunc('hour', at), count(*), sum(v) FROM t GROUP BY 1",
+		"SELECT count(*) FROM t WHERE x + end > 10",
+	} {
+		if _, ok := eligibleShape(sql); ok {
+			t.Fatalf("should decline: %s", sql)
+		}
+	}
+	// ...but the five type_function names DuckDB accepts as columns route.
+	if _, ok := eligibleShape("SELECT sum(map), count_if(map > 2) FROM t"); !ok {
+		t.Fatalf("`map` is a valid column on 1.5.6")
+	}
 	// A 15-digit decimal still routes.
 	if _, ok := eligibleShape("SELECT count(*) FROM t WHERE x > 0.12345678901234"); !ok {
 		t.Fatalf("a 15-digit decimal should still be eligible")

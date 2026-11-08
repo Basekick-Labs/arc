@@ -26,27 +26,26 @@ var predArgAggFns = map[string]bool{
 }
 
 // duckdbNonColumnKeywords: DuckDB 1.5.6's reserved and type_function keywords
-// (110 names, from duckdb_keywords()). A bare one is not a column reference in
-// DuckDB (`sum(end)` is a parser error), and the engine declines it.
+// (110 names, from duckdb_keywords()) minus the five 1.5.6 accepts as columns
+// anyway (columns, generated, map, struct, try_cast). A bare one is not a column
+// reference in DuckDB (`sum(end)` is a parser error), and the engine declines it
+// in every column position; so does the router.
 var duckdbNonColumnKeywords = map[string]bool{
 	"all": true, "analyse": true, "analyze": true, "and": true, "anti": true, "any": true,
 	"array": true, "as": true, "asc": true, "asof": true, "asymmetric": true, "at": true,
 	"authorization": true, "binary": true, "both": true, "by": true, "case": true, "cast": true,
-	"check": true, "collate": true, "collation": true, "column": true, "columns": true,
-	"concurrently": true, "constraint": true, "create": true, "cross": true, "default": true,
+	"check": true, "collate": true, "collation": true, "column": true, "concurrently": true, "constraint": true, "create": true, "cross": true, "default": true,
 	"deferrable": true, "desc": true, "describe": true, "distinct": true, "do": true,
 	"else": true, "end": true, "except": true, "false": true, "fetch": true, "for": true,
-	"foreign": true, "freeze": true, "from": true, "full": true, "generated": true, "glob": true,
+	"foreign": true, "freeze": true, "from": true, "full": true, "glob": true,
 	"group": true, "having": true, "ilike": true, "in": true, "initially": true, "inner": true,
 	"intersect": true, "into": true, "is": true, "isnull": true, "join": true, "lambda": true,
-	"lateral": true, "leading": true, "left": true, "like": true, "limit": true, "map": true,
-	"natural": true, "not": true, "notnull": true, "null": true, "offset": true, "on": true,
+	"lateral": true, "leading": true, "left": true, "like": true, "limit": true, "natural": true, "not": true, "notnull": true, "null": true, "offset": true, "on": true,
 	"only": true, "or": true, "order": true, "outer": true, "overlaps": true, "pivot": true,
 	"pivot_longer": true, "pivot_wider": true, "placing": true, "positional": true,
 	"primary": true, "qualify": true, "references": true, "returning": true, "right": true,
-	"select": true, "semi": true, "show": true, "similar": true, "some": true, "struct": true,
-	"summarize": true, "symmetric": true, "table": true, "tablesample": true, "then": true,
-	"to": true, "trailing": true, "true": true, "try_cast": true, "union": true, "unique": true,
+	"select": true, "semi": true, "show": true, "similar": true, "some": true, "summarize": true, "symmetric": true, "table": true, "tablesample": true, "then": true,
+	"to": true, "trailing": true, "true": true, "union": true, "unique": true,
 	"unpack": true, "unpivot": true, "using": true, "variadic": true, "verbose": true,
 	"when": true, "where": true, "window": true, "with": true,
 }

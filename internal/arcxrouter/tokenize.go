@@ -877,7 +877,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				return fail()
 			}
 			bc, tok := c.next()
-			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) {
+			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) || duckdbNonColumnKeywords[bc.lower] {
 				return fail()
 			}
 			if !c.punct(')') {
@@ -942,7 +942,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				return fail()
 			}
 			bc, tok := c.next()
-			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) {
+			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) || duckdbNonColumnKeywords[bc.lower] {
 				return fail()
 			}
 			if !c.punct(')') {
@@ -1274,14 +1274,14 @@ func parseTwoArgAggItem(c *cursor, fnLower string) (string, bool) {
 		return "", false
 	}
 	a1, ok := c.next()
-	if !ok || a1.kind != tokIdent || isScanKeyword(a1.lower) || !isBareIdent(a1.orig) {
+	if !ok || a1.kind != tokIdent || isScanKeyword(a1.lower) || !isBareIdent(a1.orig) || duckdbNonColumnKeywords[a1.lower] {
 		return "", false
 	}
 	if !c.punct(',') {
 		return "", false
 	}
 	a2, ok := c.next()
-	if !ok || a2.kind != tokIdent || isScanKeyword(a2.lower) || !isBareIdent(a2.orig) {
+	if !ok || a2.kind != tokIdent || isScanKeyword(a2.lower) || !isBareIdent(a2.orig) || duckdbNonColumnKeywords[a2.lower] {
 		return "", false
 	}
 	if !c.punct(')') {
@@ -1793,7 +1793,7 @@ func arithPrimary(c *cursor, ap *arithParse) (bool, bool) {
 		}
 		ap.litCount++
 		return true, true // a literal leaf is constant
-	case t.kind == tokIdent && !isScanKeyword(t.lower) && isBareIdent(t.orig):
+	case t.kind == tokIdent && !isScanKeyword(t.lower) && isBareIdent(t.orig) && !duckdbNonColumnKeywords[t.lower]:
 		// A `(` right after the ident is a function call — no functions in arith.
 		if c.i+1 < len(c.toks) && c.toks[c.i+1].kind == tokPunct && c.toks[c.i+1].punct == '(' {
 			return false, false
