@@ -1185,10 +1185,13 @@ var unaryAggFns = map[string]bool{
 	"count": true, "sum": true, "min": true, "max": true, "avg": true, "mean": true,
 	"var_pop": true, "var_samp": true, "variance": true,
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
-	// agg-6b': product, the Kahan sums, bitwise, and the Boolean-column forms of
+	// agg-6b': the Kahan sums, bitwise, and the Boolean-column forms of
 	// bool_and / bool_or / count_if (predicate arguments are not accepted here:
 	// the bare-column requirement declines `count_if(x > 0)`, as the engine does).
-	"product": true, "fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	// `product` is served by the engine but NOT routed: through Arc it measured
+	// 64 ms vs DuckDB's 34 on 132 M rows (the overflow-band bookkeeping), and a
+	// known loss is not routed.
+	"fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
 	"bit_and": true, "bit_or": true, "bit_xor": true,
 	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
 }
@@ -1198,6 +1201,12 @@ var unaryAggFns = map[string]bool{
 var momentAggFns = map[string]bool{
 	"var_pop": true, "var_samp": true, "variance": true,
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+	// agg-6b': same gate — tag-keyed grouping measured 1.1–1.4× behind DuckDB
+	// (host, fsum 125 vs 111 ms; count_if 84 vs 61; bit_or 63 vs 54), while the
+	// time-bucket form wins (250 vs 360 ms).
+	"fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	"bit_and": true, "bit_or": true, "bit_xor": true,
+	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
 }
 
 // binaryMomentFns: the agg-6b two-argument family, `fn(y, x)` over two bare

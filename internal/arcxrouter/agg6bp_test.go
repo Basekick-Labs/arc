@@ -1,6 +1,6 @@
-// agg-6b' companion: product, the Kahan sums, bitwise, and Boolean-column
-// bool_and / bool_or / count_if route wherever avg does (no tag gate — no
-// division chain); predicate arguments and Boolean aggregates in HAVING decline.
+// agg-6b' companion: the Kahan sums, bitwise, and Boolean-column bool_and /
+// bool_or / count_if route ungrouped and under a time bucket; tag-keyed grouping,
+// product, predicate arguments and Boolean aggregates in HAVING decline.
 
 package arcxrouter
 
@@ -14,8 +14,8 @@ func TestNumericAggsRecognized(t *testing.T) {
 		sql   string
 		items []string
 	}{
-		{"SELECT product(f), fsum(f), SUMKAHAN(F), kahan_sum(f), favg(f) FROM m",
-			[]string{"product(f)", "fsum(f)", "sumkahan(F)", "kahan_sum(f)", "favg(f)"}},
+		{"SELECT fsum(f), SUMKAHAN(F), kahan_sum(f), favg(f) FROM m",
+			[]string{"fsum(f)", "sumkahan(F)", "kahan_sum(f)", "favg(f)"}},
 		{"SELECT bit_and(i), bit_or(i), bit_xor(i), bool_and(b), bool_or(b), count_if(b), COUNTIF(b) FROM m WHERE host = 'a'",
 			[]string{"bit_and(i)", "bit_or(i)", "bit_xor(i)", "bool_and(b)", "bool_or(b)", "count_if(b)", "countif(b)"}},
 	}
@@ -28,11 +28,10 @@ func TestNumericAggsRecognized(t *testing.T) {
 			t.Fatalf("items = %v, want %v", m.aggItems, c.items)
 		}
 	}
-	// tag-keyed routes (no gate for these), and HAVING on a numeric one
+	// time-bucket grouping routes (measured win), HAVING on a numeric one
 	for _, sql := range []string{
-		"SELECT host, fsum(f), count_if(b) FROM m GROUP BY host",
-		"SELECT date_trunc('hour', time), bit_or(i) FROM m GROUP BY 1",
-		"SELECT host, count_if(b) FROM m GROUP BY host HAVING count_if(b) > 2",
+		"SELECT date_trunc('hour', time), fsum(value), bit_or(i) FROM m GROUP BY 1",
+		"SELECT date_trunc('hour', time), count_if(b) FROM m GROUP BY 1 HAVING count_if(b) > 2",
 	} {
 		if m, ok := eligibleShape(sql); !ok || m.shape != ShapeScanAggGrouped {
 			t.Fatalf("should be scan_agg_grouped: %s (got %q, %t)", sql, m.shape, ok)
@@ -48,6 +47,12 @@ func TestNumericAggsDecline(t *testing.T) {
 		"SELECT fsum(DISTINCT f) FROM m",
 		"SELECT host, bool_or(b) FROM m GROUP BY host HAVING bool_or(b) = 1",
 		"SELECT host, bool_and(b) FROM m GROUP BY host HAVING bool_and(b) > 0",
+		// product: engine-served, not routed (measured loss)
+		"SELECT product(f) FROM m",
+		// tag-keyed grouping: measured loss, gated
+		"SELECT host, fsum(f), count_if(b) FROM m GROUP BY host",
+		"SELECT host, bit_or(i) FROM m GROUP BY host",
+		"SELECT date_trunc('hour', time), host, count_if(b) FROM m GROUP BY 1, host",
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline (%s): %s", m.shape, sql)

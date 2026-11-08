@@ -204,19 +204,24 @@ Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
 ## arcx router: product, Kahan sums, bitwise and boolean aggregates route to the engine
 
-The arcx engine now serves `product`, `fsum` / `sumkahan` / `kahan_sum`, `favg`, `bit_and`,
-`bit_or`, `bit_xor`, and — over a `BOOLEAN` column — `bool_and`, `bool_or` and `count_if` /
-`countif` (arcX feat/agg6bp-numeric). They route wherever `avg` does, grouped by a tag
-included. Predicate arguments (`count_if(status >= 500)`) still run on DuckDB; they are the
-next engine slice. `bool_and` / `bool_or` in `HAVING` stay on DuckDB as well.
+The arcx engine now serves `fsum` / `sumkahan` / `kahan_sum`, `favg`, `bit_and`, `bit_or`,
+`bit_xor`, and — over a `BOOLEAN` column — `bool_and`, `bool_or` and `count_if` / `countif`
+(arcX feat/agg6bp-numeric). The recognizer routes them in ungrouped aggregates and under a
+`date_trunc` time bucket. Grouped by a tag column they stay on DuckDB (measured 1.1–1.4×
+slower in the engine). The engine also implements `product`, but it is not routed: it
+measured slower than DuckDB. Predicate arguments (`count_if(status >= 500)`) still run on
+DuckDB; they are the next engine slice. `bool_and` / `bool_or` in `HAVING` stay on DuckDB as
+well.
 
-The engine declines a `product` whose factors could overflow or underflow under some
-partitioning of the rows (the sums of the positive and negative parts of `log2|x|` must stay
-within ±1000), and a Kahan sum that comes out non-finite — DuckDB's own results there depend on
-how it splits the work. Shadow mode compares `product` and the Kahan sums within the 1e-9
-tolerance; on cancelling data DuckDB's Kahan sums swing between thread counts, so a value-only
-difference on them is a WARN under the `oraclediff` outcome. The bitwise, boolean and
-`count_if` results compare exactly.
+Measured through Arc on a synthetic 132-million-row corpus: `bit_and` / `bit_or` / `bit_xor`
+46 → 25 ms, `count_if` / `bool_or` / `bool_and` 40 → 36 ms, an hourly-bucket
+`fsum` + `bit_or` 360 → 250 ms; `fsum` + `favg` at parity.
+
+The engine declines a Kahan sum that comes out non-finite (DuckDB's own result there depends
+on how it splits the work). Shadow mode compares the Kahan sums within the 1e-9 tolerance; on
+cancelling data DuckDB's Kahan sums swing between thread counts, so a value-only difference on
+them is a WARN under the `oraclediff` outcome. The bitwise, boolean and `count_if` results
+compare exactly.
 
 **Shadow comparator fix:** a difference between a finite value and ±Inf, or between +Inf and
 −Inf, passed the tolerance test as a match, because the tolerance itself became infinite. Such
