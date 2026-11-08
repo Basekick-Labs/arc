@@ -1284,8 +1284,9 @@ var momentAggFns = map[string]bool{
 	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
 	// agg-7: tag-keyed order statistics take the engine's generic hash path (the
 	// dictionary paths are off for value-list states) — gated like the moments.
-	"median": true, "mad": true, "mode": true,
-	"quantile_cont": true, "quantile_disc": true, "quantile": true,
+	// (Grouped `mode` is refused outright, and the quantile arm sets the gate
+	// itself, so only median/mad are read here.)
+	"median": true, "mad": true,
 }
 
 // binaryMomentFns: the agg-6b two-argument family, `fn(y, x)` over two bare

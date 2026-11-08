@@ -45,6 +45,8 @@ type aggCell struct {
 	i      *big.Int // isInt: count, integer sum, timestamp µs
 	f      float64  // !isInt && !isBool: float sum/avg/min/max
 	b      bool     // isBool
+	isStr  bool     // agg-7 mode over VARCHAR (exact compare)
+	s      string   // isStr
 }
 
 // aggFromRows scans DuckDB's single aggregate row. The driver hands back int64
@@ -86,6 +88,8 @@ func aggFromRows(rows *sql.Rows) ([]aggCell, error) {
 			out[i] = aggCell{isInt: true, i: big.NewInt(int64(x))}
 		case bool: // agg-6b' bool_and / bool_or
 			out[i] = aggCell{isBool: true, b: x}
+		case string: // agg-7 mode over VARCHAR
+			out[i] = aggCell{isStr: true, s: x}
 		case *big.Int:
 			out[i] = aggCell{isInt: true, i: x}
 		case float64:
@@ -130,6 +134,12 @@ func aggFromArcx(rec arrow.Record) ([]aggCell, error) {
 				out[c] = aggCell{isNull: true}
 			} else {
 				out[c] = aggCell{isBool: true, b: col.Value(0)}
+			}
+		case *array.String: // agg-7 mode over VARCHAR
+			if col.IsNull(0) {
+				out[c] = aggCell{isNull: true}
+			} else {
+				out[c] = aggCell{isStr: true, s: col.Value(0)}
 			}
 		case *array.Timestamp:
 			if col.IsNull(0) {
@@ -211,6 +221,15 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 		if a.isBool {
 			if a.b != d.b {
 				return fmt.Sprintf("agg col %d differs (boolean value withheld from log)", c)
+			}
+			continue
+		}
+		if a.isStr != d.isStr {
+			return fmt.Sprintf("agg col %d differs (kind: arcx_str=%t duckdb_str=%t)", c, a.isStr, d.isStr)
+		}
+		if a.isStr {
+			if a.s != d.s {
+				return fmt.Sprintf("agg col %d differs (string value withheld from log)", c)
 			}
 			continue
 		}
