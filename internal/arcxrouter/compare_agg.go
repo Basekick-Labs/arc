@@ -155,30 +155,6 @@ func aggFromArcx(rec arrow.Record) ([]aggCell, error) {
 	return out, nil
 }
 
-// tolerantAggFns: aggregates whose float result is an order-dependent reduction
-// and so compares within the documented 1e-9 tolerance — sum/avg (and the mean
-// alias) and the agg-6a moment family (Welford partials combined in work-list
-// order on the engine, thread order on DuckDB). min/max/count stay exact.
-var tolerantAggFns = map[string]bool{
-	"sum": true, "avg": true, "mean": true,
-	"var_pop": true, "var_samp": true, "variance": true,
-	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
-	// agg-6b (regr_count is an integer and stays exact)
-	"covar_pop": true, "covar_samp": true, "corr": true,
-	"regr_avgx": true, "regr_avgy": true, "regr_slope": true, "regr_intercept": true,
-	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
-	// agg-6b' (bit_*, bool_*, count_if compare exact)
-	"product": true, "fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
-	// agg-7: the interpolating order statistics (the discrete ones and mode are
-	// exact). DuckDB's arm64 build fuses the interpolation into an FMA, so a
-	// 1-ulp difference is architecture, not a bug (arcX agg-7 adversarial B1).
-	"median": true, "quantile_cont": true, "mad": true,
-	// agg-8: the shape statistics. Kept for aggItemTolerant callers only: both
-	// comparators file any shape-cell difference as oraclediff before reaching
-	// the tolerance branch (isShapeItem).
-	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
-}
-
 // isShapeItem reports an agg-8 shape-statistic item. DuckDB 1.5.6 computes these
 // from raw power sums: on constant columns and high-offset data its result is
 // architecture-dependent garbage, NULL or NaN where the true value exists (arcX
@@ -222,13 +198,6 @@ func shapeCellDiffers(a, d aggCell) bool {
 	}
 	scale := math.Max(math.Abs(a.f), math.Abs(d.f))
 	return math.Abs(a.f-d.f) > aggFloatRelTol*math.Max(scale, 1.0)
-}
-
-// aggItemTolerant reports whether the item's float result carries the documented
-// tolerance (see tolerantAggFns).
-func aggItemTolerant(item string) bool {
-	fn, _, ok := strings.Cut(item, "(")
-	return ok && tolerantAggFns[fn]
 }
 
 // compareAgg returns "" on match, else a short VALUE-FREE diff.

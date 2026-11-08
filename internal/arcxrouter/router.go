@@ -102,6 +102,9 @@ type Metrics interface {
 	// (agg-6b: covar_pop, covar_samp, regr_sxy, regr_intercept under
 	// cancellation). WARN + metric, never the mismatch alarm.
 	ArcxShadowOracleDivergence(shape string)
+	// ArcxShadowTieDivergence: a grouped top-N whose LIMIT cut fell inside a tie
+	// class returned a different (equally valid) member of that class (res-2).
+	ArcxShadowTieDivergence(shape string)
 	ArcxShadowError(shape string)
 	// ArcxServeError: an engine failure on the SERVE path. Separate from
 	// ArcxShadowError because feeding both into one counter made a serve-mode
@@ -149,10 +152,12 @@ type Decision struct {
 	// these validated parts, never from GroupKey's text.
 	BucketUnit string
 	BucketCol  string
-	// agg-3c: the ordered KEY's 1-based select position (0 = no ORDER BY);
-	// the builder emits `ORDER BY <this position>` ascending after validating
-	// it points at a key item.
-	OrderByItem int
+	// res-2 (was agg-3c's single ascending OrderByItem): grouped ORDER BY keys
+	// by 1-based select position. The builder re-validates each position and
+	// emits direction and null order explicitly. HasLimit carries an explicit
+	// grouped LIMIT in Limit (LIMIT 0 is a real limit — adversarial B2).
+	OrderKeys []OrderKey
+	HasLimit  bool
 	// agg-3c: the rebuilt bucket item text is NOT carried — the builder
 	// rebuilds it from the validated parts below; GroupKey holds the TAG key
 	// ("" = no tag key).
@@ -209,7 +214,8 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		GroupKey:       m.groupKey,
 		BucketUnit:     m.bucketUnit,
 		BucketCol:      m.bucketCol,
-		OrderByItem:    m.orderByItem,
+		OrderKeys:      m.orderKeys,
+		HasLimit:       m.hasLimit,
 		EpochWidthSecs: m.epochWidthSecs,
 		BucketAlias:    m.bucketAlias,
 	}
@@ -528,18 +534,38 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 		b.WriteString(" HAVING ")
 		b.WriteString(d.HavingText)
 	}
-	if d.OrderByItem != 0 {
-		ok := false
-		for _, kp := range keyPositions {
-			if d.OrderByItem == kp {
-				ok = true
-			}
-		}
-		if !ok {
+	if len(d.OrderKeys) > maxOrderKeys || (d.HasLimit && len(d.OrderKeys) == 0) {
+		return "", false
+	}
+	for i, k := range d.OrderKeys {
+		if k.Pos < 1 || k.Pos > len(d.AggItems) || orderTargetRefused(d.AggItems[k.Pos-1]) {
 			return "", false
 		}
-		b.WriteString(" ORDER BY ")
-		b.WriteString(strconv.Itoa(d.OrderByItem))
+		if i == 0 {
+			b.WriteString(" ORDER BY ")
+		} else {
+			b.WriteString(", ")
+		}
+		b.WriteString(strconv.Itoa(k.Pos))
+		// Direction and null order always explicit (DuckDB's defaults are
+		// ASC / NULLS LAST; the engine assumes exactly those).
+		if k.Desc {
+			b.WriteString(" DESC")
+		} else {
+			b.WriteString(" ASC")
+		}
+		if k.NullsFirst {
+			b.WriteString(" NULLS FIRST")
+		} else {
+			b.WriteString(" NULLS LAST")
+		}
+	}
+	if d.HasLimit {
+		if d.Limit < 0 || d.Limit > maxTopNLimit {
+			return "", false
+		}
+		b.WriteString(" LIMIT ")
+		b.WriteString(strconv.Itoa(d.Limit))
 	}
 	return b.String(), true
 }
@@ -867,6 +893,17 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 			h.Metrics.ArcxShadowOracleDivergence(d.Shape)
 			return
 		}
+		if strings.HasPrefix(diff, "tiediff:") {
+			// res-2: a top-N whose LIMIT cut falls inside a tie class. DuckDB
+			// picks among tied groups arbitrarily; arcx breaks ties by group key.
+			// Every row outside the cut's tie class matched.
+			h.Logger.Warn().
+				Str("shape", d.Shape).
+				Str("diff", strings.TrimPrefix(diff, "tiediff:")).
+				Msg("arcx shadow: top-N tie at the LIMIT cut (values withheld)")
+			h.Metrics.ArcxShadowTieDivergence(d.Shape)
+			return
+		}
 		if strings.HasPrefix(diff, "argdiff:") {
 			h.Logger.Warn().
 				Str("shape", d.Shape).
@@ -959,6 +996,10 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		oracle, err := groupedFromRows(rows, keyCols)
 		if err != nil {
 			return "", err
+		}
+		if len(d.OrderKeys) > 0 {
+			// res-2: the order is part of the answer — never re-sorted.
+			return compareGroupedOrdered(rec, oracle, d.AggItems, keyCols, d.OrderKeys, d.HasLimit, d.Limit), nil
 		}
 		return compareGrouped(rec, oracle, d.AggItems, keyCols), nil
 	}

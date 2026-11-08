@@ -363,6 +363,138 @@ func (c *cursor) numOne() bool {
 	return ok && t.kind == tokNum && t.orig == "1"
 }
 
+// Moved from compare_agg.go (engine-tagged) so the untagged grouped matcher
+// can apply res-2's float-only-last rule.
+// tolerantAggFns: aggregates whose float result is an order-dependent reduction
+// and so compares within the documented 1e-9 tolerance — sum/avg (and the mean
+// alias) and the agg-6a moment family (Welford partials combined in work-list
+// order on the engine, thread order on DuckDB). min/max/count stay exact.
+var tolerantAggFns = map[string]bool{
+	"sum": true, "avg": true, "mean": true,
+	"var_pop": true, "var_samp": true, "variance": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+	// agg-6b (regr_count is an integer and stays exact)
+	"covar_pop": true, "covar_samp": true, "corr": true,
+	"regr_avgx": true, "regr_avgy": true, "regr_slope": true, "regr_intercept": true,
+	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
+	// agg-6b' (bit_*, bool_*, count_if compare exact)
+	"product": true, "fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	// agg-7: the interpolating order statistics (the discrete ones and mode are
+	// exact). DuckDB's arm64 build fuses the interpolation into an FMA, so a
+	// 1-ulp difference is architecture, not a bug (arcX agg-7 adversarial B1).
+	"median": true, "quantile_cont": true, "mad": true,
+	// agg-8: the shape statistics. Kept for aggItemTolerant callers only: both
+	// comparators file any shape-cell difference as oraclediff before reaching
+	// the tolerance branch (isShapeItem).
+	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
+}
+
+// aggItemTolerant reports whether the item's float result carries the documented
+// tolerance (see tolerantAggFns).
+func aggItemTolerant(item string) bool {
+	fn, _, ok := strings.Cut(item, "(")
+	return ok && tolerantAggFns[fn]
+}
+
+// OrderKey is one grouped ORDER BY key (res-2): a 1-based output position, the
+// direction and the null order (DuckDB default NULLS LAST for both directions).
+type OrderKey struct {
+	Pos        int
+	Desc       bool
+	NullsFirst bool
+}
+
+const (
+	maxOrderKeys = 4             // the engine's MAX_ORDER_KEYS (duplicates count)
+	maxTopNLimit = (1 << 31) - 1 // the engine's MAX_TOPN_LIMIT
+)
+
+// orderTargetRefused mirrors the engine's order_target_refused (arcX res-2 B1):
+// arg_* (DuckDB's tie choice is nondeterministic), the shape statistics and the
+// agg-6b cancellation-prone bivariates (DuckDB 1.5.6's value is not stable
+// enough to order by). The router additionally refuses the agg-6b' Kahan sums,
+// which the engine serves: DuckDB's own fsum/favg swing by orders of magnitude
+// across thread counts on cancelling data, so the oracle's ORDER would move
+// with them and every disagreement would read as a mismatch.
+func orderTargetRefused(item string) bool {
+	for _, p := range []string{"fsum(", "sumkahan(", "kahan_sum(", "favg(", "arg_max(", "arg_min(", "max_by(", "min_by(", "skewness(", "kurtosis(",
+		"kurtosis_pop(", "covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// orderKeyRef resolves one grouped ORDER BY reference to a select-item index:
+// a position, a key / bucket alias (orderRef), an aggregate alias, or an aggregate
+// expression whose re-serialization equals an item (case-insensitive, the HAVING
+// matcher's rule). A hidden aggregate (not in the select list) and refused
+// targets fail.
+func orderKeyRef(c *cursor, items []string, orderRef func(token) int, aliases []string) (int, bool) {
+	t, ok := c.next()
+	if !ok {
+		return -1, false
+	}
+	idx := -1
+	switch {
+	case t.kind == tokNum:
+		p, err := strconv.Atoi(t.orig)
+		if err != nil || p < 1 || p > len(items) {
+			return -1, false
+		}
+		idx = p - 1
+	case t.kind == tokIdent && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(':
+		var text string
+		switch {
+		case quantileAggFns[t.lower]:
+			txt, qok := parseQuantileAggItem(c, t.lower)
+			if !qok {
+				return -1, false
+			}
+			text = txt
+		case unaryAggFns[t.lower]:
+			c.i++ // '('
+			if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
+				c.i++
+				if !c.punct(')') {
+					return -1, false
+				}
+				text = "count(*)"
+			} else {
+				a, aok := c.next()
+				if !aok || a.kind != tokIdent || !isBareIdent(a.orig) || !c.punct(')') {
+					return -1, false // predicate arguments / expressions: not matched
+				}
+				text = t.lower + "(" + a.orig + ")"
+			}
+		default:
+			return -1, false
+		}
+		for i, it := range items {
+			if strings.EqualFold(it, text) {
+				idx = i
+				break
+			}
+		}
+	case t.kind == tokIdent:
+		if r := orderRef(t); r >= 0 {
+			idx = r
+		} else {
+			for i, a := range aliases {
+				if a != "" && strings.EqualFold(a, t.orig) {
+					idx = i
+					break
+				}
+			}
+		}
+	}
+	if idx < 0 || orderTargetRefused(items[idx]) {
+		return -1, false
+	}
+	return idx, true
+}
+
 // readAggAlias consumes an optional `AS <alias>` after a select-list aggregate
 // (res-1, arcX feat/res-1-agg-aliases). The alias is a bare identifier with no
 // dot that is neither one of the router's clause keywords nor the engine's
@@ -1235,25 +1367,74 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		havingText = ht
 	}
 
-	// Optional `ORDER BY <key ref> [ASC]` (agg-3): the engine sorts that single
-	// key ascending, NULLS LAST. DESC / LIMIT / multi-key ORDER decline.
+	// Optional `ORDER BY <ref> [ASC|DESC] [NULLS FIRST|LAST] (, <ref>){0,3}
+	// [LIMIT n]` (agg-3 single ascending key; res-2 top-N, arcX
+	// feat/res-2-topn). Mirrors the engine: a ref is a 1-based position, the tag
+	// key, the bucket alias, an aggregate alias, or an aggregate expression equal
+	// to a select item; an arg/shape/oracle-unstable aggregate is refused as a
+	// target (its shadow policy tolerates differences that would reorder rows);
+	// a tolerant (float) aggregate only as the LAST key; LIMIT without ORDER BY,
+	// OFFSET and expressions decline.
 	if c.peekIdentLower() == "order" {
 		c.next()
 		if !c.ident("by") {
 			return fail()
 		}
-		ot, tok := c.next()
-		if !tok {
+		for {
+			oi, rok := orderKeyRef(c, items, orderRef, aggAliases)
+			if !rok {
+				return fail()
+			}
+			k := OrderKey{Pos: oi + 1}
+			switch c.peekIdentLower() {
+			case "asc":
+				c.next()
+			case "desc":
+				c.next()
+				k.Desc = true
+			}
+			if c.peekIdentLower() == "nulls" {
+				c.next()
+				switch c.peekIdentLower() {
+				case "first":
+					k.NullsFirst = true
+				case "last":
+				default:
+					return fail()
+				}
+				c.next()
+			}
+			m.orderKeys = append(m.orderKeys, k)
+			if len(m.orderKeys) > maxOrderKeys {
+				return fail()
+			}
+			if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+				c.i++
+				continue
+			}
+			break
+		}
+		// A tolerant (float) aggregate only as the last key (arcX res-2 M2).
+		for _, k := range m.orderKeys[:len(m.orderKeys)-1] {
+			if p := k.Pos - 1; p != m.bucketItem && p != m.tagItem && aggItemTolerant(items[p]) {
+				return fail()
+			}
+		}
+	}
+	if c.peekIdentLower() == "limit" {
+		if len(m.orderKeys) == 0 {
+			return fail() // unordered LIMIT is nondeterministic
+		}
+		c.next()
+		lt, tok := c.next()
+		if !tok || lt.kind != tokNum {
 			return fail()
 		}
-		oi := orderRef(ot)
-		if oi < 0 {
+		n, err := strconv.Atoi(lt.orig)
+		if err != nil || n < 0 || n > maxTopNLimit {
 			return fail()
 		}
-		if c.peekIdentLower() == "asc" {
-			c.next()
-		}
-		m.orderByItem = oi + 1 // 1-based select-list position
+		m.limit, m.hasLimit = n, true
 	}
 	if !c.atEnd() {
 		return fail()
@@ -1298,7 +1479,12 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 // one bare TAG key, at least one of either), their select-list indices, and the
 // validated bucket parts the SQL builder re-emits (never source text).
 type groupedMatch struct {
-	items []string
+	// res-2: ORDER BY keys (1-based positions) and an explicit LIMIT (hasLimit
+	// distinguishes LIMIT 0 from "no limit" — adversarial B2).
+	orderKeys []OrderKey
+	limit     int
+	hasLimit  bool
+	items     []string
 	// res-1: per-item `AS` alias of an aggregate item ("" = none / a key item).
 	aggAliases []string
 	bucketText string // rebuilt bucket item text ("" = no bucket key)
@@ -1312,7 +1498,6 @@ type groupedMatch struct {
 	bucketUnit string
 	bucketCol  string
 	// ORDER BY: the ordered KEY's 1-based select-list position (0 = none).
-	orderByItem int
 	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
 	// the MANDATORY alias — validated parts the builder re-emits.
 	epochWidthSecs int

@@ -154,7 +154,6 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"having count(DISTINCT)", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(DISTINCT x) > 1"},
 		{"ungrouped having", "SELECT count(*) FROM cpu HAVING count(*) > 1"},
 		{"having on a bucket alias that was never declared", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 HAVING h > 1"},
-		{"agg order by 2", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 ORDER BY 2"},
 		// "agg sum not count": the agg-3 surface itself — now eligible (grouped).
 
 		// --- TZ-injection declines (M3) ---

@@ -9,7 +9,7 @@ import "testing"
 func TestArcxShadowOutcomeLabelsAreClosedAndComplete(t *testing.T) {
 	m := &Metrics{}
 	for _, label := range []string{
-		ShadowMatch, ShadowMismatch, ShadowArgDiff, ShadowOracleDiff, ShadowDeclined, ShadowError,
+		ShadowMatch, ShadowMismatch, ShadowArgDiff, ShadowOracleDiff, ShadowTieDiff, ShadowDeclined, ShadowError,
 		ShadowOracleError, ShadowPanic, ShadowSkippedShed, ShadowSkippedCap, ShadowSkippedHost,
 	} {
 		before := m.arcxShadowSnapshot()
@@ -28,7 +28,7 @@ func TestArcxShadowOutcomeLabelsAreClosedAndComplete(t *testing.T) {
 	// Every declared slot must be reachable through an exported constant, so a new
 	// outcome cannot be added to the table and then referenced by a bare literal.
 	consts := map[string]bool{
-		ShadowMatch: true, ShadowMismatch: true, ShadowArgDiff: true, ShadowOracleDiff: true,
+		ShadowMatch: true, ShadowMismatch: true, ShadowArgDiff: true, ShadowOracleDiff: true, ShadowTieDiff: true,
 		ShadowDeclined: true, ShadowError: true, ShadowOracleError: true,
 		ShadowPanic: true, ShadowSkippedShed: true, ShadowSkippedCap: true,
 		ShadowSkippedHost: true,

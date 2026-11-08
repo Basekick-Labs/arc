@@ -495,6 +495,10 @@ func (m arcxMetrics) ArcxShadowOracleDivergence(shape string) {
 	metrics.Get().IncArcxShadowOutcome(metrics.ShadowOracleDiff)
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: oracle-unstable divergence metric")
 }
+func (m arcxMetrics) ArcxShadowTieDivergence(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowTieDiff)
+	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: top-N tie-at-cut divergence metric")
+}
 func (m arcxMetrics) ArcxShadowMismatch(shape string) {
 	metrics.Get().IncArcxShadowOutcome(metrics.ShadowMismatch)
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: mismatch metric")
