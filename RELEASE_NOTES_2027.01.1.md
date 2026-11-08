@@ -214,15 +214,16 @@ their aggregates. The output column carries the alias exactly as written.
 These forms still run on DuckDB:
 - an alias without `AS` (`min(x) mx`);
 - a quoted alias (`AS "time"`);
-- an alias that matches the group key, the bucket alias or another alias;
+- in a grouped query, an alias that matches the group key, the bucket alias or another alias;
+- an alias that is a SQL clause word (`AS from`, `AS where`), which DuckDB accepts;
 - a `HAVING` or `ORDER BY` that names an aggregate's alias, because DuckDB resolves those names
   differently in each clause. `HAVING avg(value) > 5` (the aggregate written out) still routes.
 
 Shadow mode now also compares result column names, since aliases make them user-controlled. One
-existing difference is exempted. When DuckDB serves an unaliased `date_trunc` bucket, Arc's
-rewrite of the bucket expression names that column after the rewritten expression
-(`make_timestamptz(…)`). The engine names it `date_trunc('hour', "time")`. Aliased buckets
-(`AS time`) are named identically on both paths.
+existing difference is exempted. When DuckDB serves an unaliased `date_trunc` bucket (grouped,
+or the plain `date_trunc(…), count(*)` form), Arc's rewrite of the bucket expression names that
+column after the rewritten expression (`make_timestamptz(…)`). The engine names it
+`date_trunc('hour', "time")`. Aliased buckets (`AS time`) are named identically on both paths.
 
 ## arcx router: skewness and kurtosis route to the engine
 

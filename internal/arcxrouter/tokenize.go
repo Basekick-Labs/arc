@@ -363,8 +363,6 @@ func (c *cursor) numOne() bool {
 	return ok && t.kind == tokNum && t.orig == "1"
 }
 
-// matchCountStar matches: select count ( * ) from <measurement-ident>
-// with nothing after. Returns the measurement token (as written) and ok.
 // readAggAlias consumes an optional `AS <alias>` after a select-list aggregate
 // (res-1, arcX feat/res-1-agg-aliases). The alias is a bare identifier with no
 // dot that is neither one of the router's clause keywords nor the engine's
@@ -393,6 +391,9 @@ func isAggAlias(a string) bool {
 	return !isScanKeyword(l) && l != "between" && l != "like"
 }
 
+// matchCountStar matches: select count ( * ) [AS <alias>] from <measurement-ident>
+// with nothing after. Returns the measurement token (as written), the res-1 alias
+// ("" = none) and ok.
 func matchCountStar(toks []token) (meas, alias string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") || !c.ident("count") || !c.punct('(') || !c.punct('*') || !c.punct(')') {
@@ -423,6 +424,8 @@ func matchCountStar(toks []token) (meas, alias string, ok bool) {
 // with nothing after. `count(*)` is NOT matched here — that's matchCountStar; the
 // arg must be a bare identifier, not `*`. Returns (func, col-as-written,
 // measurement, ok). `func` is one of "min", "max", "count".
+//
+// res-1: an optional `AS <alias>` before FROM is returned as `alias` ("" = none).
 func matchScalarAgg(toks []token) (fn, col, meas, alias string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
@@ -752,7 +755,7 @@ func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 // in the derived name, so canonicalizing the arg would change the client-visible
 // column name). The WHERE reuses the scan's boolean-tree re-serialization — the
 // same injection-proof construction, the engine is the tree authority. Anything
-// after the WHERE (GROUP BY / ORDER BY / LIMIT / aliases) declines: those are
+// after the WHERE (GROUP BY / ORDER BY / LIMIT) declines: those are
 // later slices and the engine declines them too.
 //
 // Tried AFTER the footer matchers (count(*)/scalar agg get first refusal — the

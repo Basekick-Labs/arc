@@ -887,6 +887,31 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	h.Metrics.ArcxShadowMatch(d.Shape)
 }
 
+// columnNameDiff compares DuckDB's result column names with arcx's ("" = same;
+// index only in the message — names may be data-bearing). One pre-existing
+// divergence is exempted by NAME, so it covers every shape and nothing else: Arc's
+// epoch-math rewrite of a `date_trunc` bucket (internal/api/query.go) makes
+// DuckDB name that column after the rewritten `make_timestamptz(…)` expression
+// while arcx names it `date_trunc(…)` — the unaliased bucket of both the grouped
+// and the `date_trunc_count` shapes (an aliased bucket is named identically).
+// Tracked as a follow-up: the rewrite should alias back to the native name.
+func columnNameDiff(oracleCols []string, rec arrow.Record) string {
+	if len(oracleCols) != int(rec.NumCols()) {
+		return "" // the cell comparators report the arity difference
+	}
+	for i, c := range oracleCols {
+		a := rec.ColumnName(i)
+		if a == c {
+			continue
+		}
+		if strings.HasPrefix(c, "make_timestamptz(") && strings.HasPrefix(a, "date_trunc(") {
+			continue
+		}
+		return "result column " + strconv.Itoa(i) + " name differs (names withheld)"
+	}
+	return ""
+}
+
 // compareToOracle runs the DuckDB oracle for this query and compares its result to
 // arcx's `rec`, returning the diff string ("" == match) or an oracle error. Scalar
 // shapes (min/max/count(col)) use the single-cell comparison; count(*)/agg use the
@@ -900,21 +925,10 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 
 	// res-1 (adversarial M3): result column NAMES reach clients verbatim, and
 	// aliases make them user-controlled — compare them too (the cell comparators
-	// below are positional). Index only in the message; names may be data-bearing.
-	if cols, err := rows.Columns(); err == nil && len(cols) == int(rec.NumCols()) {
-		for i, c := range cols {
-			// Known pre-existing divergence, exempted (tracked as a follow-up): an
-			// UNALIASED date_trunc bucket reaches DuckDB through Arc's epoch-math
-			// rewrite, whose output column is named after the rewritten expression
-			// (`make_timestamptz((946857600000000 + …))`), while arcx names it
-			// `date_trunc('hour', "time")`. An aliased bucket (`AS time`) matches.
-			if d.Shape == ShapeScanAggGrouped && d.BucketUnit != "" && d.BucketAlias == "" &&
-				i < len(d.AggItems) && strings.HasPrefix(d.AggItems[i], "date_trunc(") {
-				continue
-			}
-			if rec.ColumnName(i) != c {
-				return "result column " + strconv.Itoa(i) + " name differs (names withheld)", nil
-			}
+	// below are positional).
+	if cols, err := rows.Columns(); err == nil {
+		if diff := columnNameDiff(cols, rec); diff != "" {
+			return diff, nil
 		}
 	}
 
