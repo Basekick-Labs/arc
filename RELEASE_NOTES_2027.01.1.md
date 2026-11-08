@@ -202,6 +202,38 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: count_if / bool_and / bool_or with a predicate argument route to the engine
+
+The arcx engine now serves the predicate form of the Boolean aggregates (arcX
+feat/agg-6b2-predicate): `count_if(status >= 500)`, `countif(...)`, `bool_and(cpu_user < 90)`,
+`bool_or(host = 'web-1')`. The argument may combine comparisons, `IS [NOT] NULL`,
+`BETWEEN`, `[NOT] LIKE`, `AND`, `OR` and parentheses. The recognizer routes these in
+ungrouped aggregates and under a `date_trunc` time bucket; grouped by a tag column they
+stay on DuckDB, as the column forms do. Forms whose output column name DuckDB 1.5.6 and
+2.0 render differently stay on DuckDB: `IN`, `NOT`, arithmetic, timestamp literals, and
+non-canonical number spellings such as `007` or `-0.0`. A `HAVING` that references a
+predicate aggregate also stays on DuckDB.
+
+Measured through Arc on a synthetic 132-million-row corpus (DuckDB → engine):
+`count_if(cpu_user > 90)` 103 → 76 ms, `count_if(code >= 400)` 34 → 19 ms,
+`count_if(host = '…')` 38 → 24 ms, `bool_or(…) + bool_and(…)` 145 → 98 ms, three predicate
+counts in one query 184 → 93 ms, an hourly-bucket `count_if` + `bool_or` 405 → 235 ms;
+`count_if(host LIKE '…')` at parity (27 → 25 ms). A string column read only by predicate
+arguments is evaluated on its Parquet dictionary.
+
+The engine now names derived columns with DuckDB 1.5.6's full keyword table, so a column
+named like a keyword is quoted exactly as DuckDB quotes it. Two names changed: `sum(level)`
+is now `sum("level")`, and `sum(date)` is now `sum(date)` rather than `sum("date")`, since
+`date` is not a DuckDB keyword. A grouped `date_trunc` over a non-keyword column also lost
+its quotes (`date_trunc('hour', ts)`). These are the names DuckDB has always returned for
+the same queries, so served results now carry the same column names as DuckDB fallbacks.
+
+The engine and the recognizer now decline three things DuckDB rejects or binds
+differently: a bare reserved keyword used as a column (`sum(end)`), `!=` written directly
+against a sign (`x!=-2`, which DuckDB reads as an unknown operator), and decimal literals
+with more than 15 significant digits. DuckDB 1.5.6 converts the last of these to a slightly
+different double, which can change the match.
+
 ## arcx router: product, Kahan sums, bitwise and boolean aggregates route to the engine
 
 The arcx engine now serves `fsum` / `sumkahan` / `kahan_sum`, `favg`, `bit_and`, `bit_or`,
