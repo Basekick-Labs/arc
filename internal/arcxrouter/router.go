@@ -543,7 +543,10 @@ func isAggItem(item string) bool {
 // cells is filed as `oraclediff:` (WARN), the `argdiff:` precedent; NULL-ness,
 // NaN-ness and kind differences still alarm.
 func isOracleUnstableItem(item string) bool {
-	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept("} {
+	// agg-6b' adds the Kahan sums: on cancelling data DuckDB's own fsum swings by
+	// orders of magnitude across thread counts (plan-adversarial M1).
+	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept(",
+		"fsum(", "sumkahan(", "kahan_sum(", "favg("} {
 		if strings.HasPrefix(item, p) {
 			return true
 		}

@@ -161,6 +161,12 @@ func groupedFromArcx(rec arrow.Record, keyCols []int) ([]groupedRow, error) {
 				} else {
 					row.cells = append(row.cells, aggCell{isInt: true, i: big.NewInt(int64(col.Value(r)))})
 				}
+			case *array.Boolean: // agg-6b' bool_and / bool_or
+				if col.IsNull(r) {
+					row.cells = append(row.cells, aggCell{isNull: true})
+				} else {
+					row.cells = append(row.cells, aggCell{isBool: true, b: col.Value(r)})
+				}
 			case *array.Timestamp:
 				if col.IsNull(r) {
 					row.cells = append(row.cells, aggCell{isNull: true})
@@ -224,6 +230,8 @@ func groupedFromRows(rows *sql.Rows, keyCols []int) ([]groupedRow, error) {
 				row.cells = append(row.cells, aggCell{isInt: true, i: big.NewInt(x)})
 			case uint32: // agg-6b regr_count (UINTEGER)
 				row.cells = append(row.cells, aggCell{isInt: true, i: big.NewInt(int64(x))})
+			case bool: // agg-6b' bool_and / bool_or
+				row.cells = append(row.cells, aggCell{isBool: true, b: x})
 			case *big.Int:
 				row.cells = append(row.cells, aggCell{isInt: true, i: x})
 			case float64:
@@ -310,6 +318,15 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 			if ac.isNull {
 				continue
 			}
+			if ac.isBool != dc.isBool {
+				return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
+			}
+			if ac.isBool {
+				if ac.b != dc.b {
+					return fmt.Sprintf("grouped row %d of %d differs (agg col %d boolean, values withheld)", i, len(got), c)
+				}
+				continue
+			}
 			if ac.isInt != dc.isInt {
 				return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
 			}
@@ -328,6 +345,17 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 					continue
 				}
 				msg := fmt.Sprintf("grouped row %d differs (agg col %d NaN-ness)", i, c)
+				if deferArg(c, msg) {
+					continue
+				}
+				return msg
+			}
+			// ±Inf compares exactly — the tolerance test cannot see it (see compareAgg).
+			if math.IsInf(ac.f, 0) || math.IsInf(dc.f, 0) {
+				if ac.f == dc.f {
+					continue
+				}
+				msg := fmt.Sprintf("grouped row %d differs (agg col %d Inf-ness)", i, c)
 				if deferArg(c, msg) {
 					continue
 				}
