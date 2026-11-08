@@ -208,7 +208,7 @@ The arcx engine now serves the predicate form of the Boolean aggregates (arcX
 feat/agg-6b2-predicate): `count_if(status >= 500)`, `countif(...)`, `bool_and(cpu_user < 90)`,
 `bool_or(host = 'web-1')`. The argument may combine comparisons, `IS [NOT] NULL`,
 `BETWEEN`, `[NOT] LIKE`, `AND`, `OR` and parentheses. The recognizer routes these in
-ungrouped aggregates and under a `date_trunc` time bucket; grouped by a tag column they
+ungrouped aggregates and under a time bucket (`date_trunc` or the epoch-math form); grouped by a tag column they
 stay on DuckDB, as the column forms do. Forms whose output column name DuckDB 1.5.6 and
 2.0 render differently stay on DuckDB: `IN`, `NOT`, arithmetic, timestamp literals, and
 non-canonical number spellings such as `007` or `-0.0`. A `HAVING` that references a
@@ -231,7 +231,7 @@ the same queries, so served results now carry the same column names as DuckDB fa
 The engine and the recognizer now decline three things DuckDB rejects or binds
 differently: a bare reserved keyword used as a column (`sum(end)`), `!=` written directly
 against a sign (`x!=-2`, which DuckDB reads as an unknown operator), and decimal literals
-with more than 15 significant digits. DuckDB 1.5.6 converts the last of these to a slightly
+with more than 15 digits (counted after any leading zeros of the integer part). DuckDB 1.5.6 converts the last of these to a slightly
 different double, which can change the match.
 
 ## arcx router: product, Kahan sums, bitwise and boolean aggregates route to the engine

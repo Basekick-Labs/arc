@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// agg-6b” (arcX feat/agg-6b2-predicate): predicate arguments of the four Boolean
+// agg-6b2 (arcX feat/agg-6b2-predicate): predicate arguments of the four Boolean
 // aggregates — `count_if(status >= 500)`, `bool_and(cpu_user < 90)`. The grammar
 // below mirrors the engine's parse_pred_arg production for production, so a shape
 // accepted here is one the engine serves; the engine re-parses the emitted text
@@ -29,7 +29,9 @@ var predArgAggFns = map[string]bool{
 // (110 names, from duckdb_keywords()) minus the five 1.5.6 accepts as columns
 // anyway (columns, generated, map, struct, try_cast). A bare one is not a column
 // reference in DuckDB (`sum(end)` is a parser error), and the engine declines it
-// in every column position; so does the router.
+// in every column position; the router declines it in aggregate arguments,
+// predicate atoms, WHERE atoms, projection columns, tag keys, bucket columns,
+// arithmetic operands and HAVING arguments.
 var duckdbNonColumnKeywords = map[string]bool{
 	"all": true, "analyse": true, "analyze": true, "and": true, "anti": true, "any": true,
 	"array": true, "as": true, "asc": true, "asof": true, "asymmetric": true, "at": true,
@@ -131,8 +133,11 @@ func predArgPrim(c *cursor, b *strings.Builder, depth int, atoms *int) bool {
 	col, ok := c.next()
 	// No qualifier: the router lexes `t.x` as one identifier, the engine's lexer
 	// has no `.` at all.
+	// `between`/`like` are clause words to the engine's lexer (SCAN_CLAUSE_KEYWORDS)
+	// although DuckDB allows them as columns — the engine declines, so does this.
 	if !ok || col.kind != tokIdent || !isBareIdent(col.orig) || strings.Contains(col.orig, ".") ||
-		isScanKeyword(col.lower) || duckdbNonColumnKeywords[col.lower] {
+		isScanKeyword(col.lower) || duckdbNonColumnKeywords[col.lower] ||
+		col.lower == "between" || col.lower == "like" {
 		return false
 	}
 	b.WriteString(col.orig)
@@ -171,7 +176,10 @@ func predArgPrim(c *cursor, b *strings.Builder, depth int, atoms *int) bool {
 		pat, ok := c.next()
 		// A backslash pattern: arrow treats `\` as an escape, DuckDB (no ESCAPE)
 		// as a literal — the engine declines it.
-		if !ok || pat.kind != tokStr || strings.ContainsRune(pat.str, '\\') {
+		// A timestamp-shaped pattern lexes as a timestamp literal in the engine,
+		// which LIKE does not take.
+		if !ok || pat.kind != tokStr || strings.ContainsRune(pat.str, '\\') ||
+			engineTimestampLit.MatchString(pat.str) {
 			return false
 		}
 		b.WriteString(" LIKE '")

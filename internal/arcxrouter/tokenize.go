@@ -104,7 +104,7 @@ func tokenize(sql string) ([]token, bool) {
 			if i+1 < n && b[i+1] == '=' {
 				// DuckDB lexes an operator run containing `!` greedily: `x!=-2` is
 				// the unknown operator `!=-` (an error on both oracles), and the
-				// engine declines it (agg-6b'' adversarial M4).
+				// engine declines it (agg-6b2 adversarial M4).
 				if i+2 < n && (b[i+2] == '-' || b[i+2] == '+') {
 					return nil, false
 				}
@@ -192,10 +192,11 @@ func lexNumber(sql string, b []byte, start, i, n int) (token, int) {
 	return token{kind: tokNum, orig: sql[start:i]}, i
 }
 
-// decimalTooWide mirrors the engine lexer's agg-6b” M1 rule: DuckDB 1.5.6 binds
-// a DECIMAL literal against a DOUBLE in two roundings, so beyond 15 significant
-// digits it can be a different double than the engine's parse — the engine
-// declines the query, and so does the router.
+// decimalTooWide mirrors the engine lexer's agg-6b2 M1 rule: DuckDB 1.5.6 binds
+// a DECIMAL literal against a DOUBLE in two roundings, so a wide literal can be a
+// different double than the engine's parse. The rule counts every digit after the
+// integer part's leading zeros (`0.0000000000000001` counts 16) — conservative, and
+// exactly the engine's — and over 15 the engine declines the query, as does the router.
 func decimalTooWide(orig string) bool {
 	digits := strings.TrimLeft(strings.TrimPrefix(orig, "-"), "0")
 	n := 0
@@ -306,6 +307,10 @@ type cursor struct {
 // a subscript leaves the cursor consumed past it and returns false, so the caller
 // declines.
 func readColumnRef(c *cursor, t token) (string, bool) {
+	// A bare reserved keyword is not a column in DuckDB; the engine declines it.
+	if duckdbNonColumnKeywords[t.lower] {
+		return "", false
+	}
 	if c.i >= len(c.toks) || c.toks[c.i].kind != tokPunct || c.toks[c.i].punct != '[' {
 		return t.orig, true
 	}
@@ -740,7 +745,7 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 				}
 				items = append(items, "count(*)")
 			} else if predArgAggFns[f.lower] && predArgFollows(c) {
-				// agg-6b'': a predicate argument (pred_arg.go).
+				// agg-6b2: a predicate argument (pred_arg.go).
 				text, ok := reserializePredArg(c)
 				if !ok || !c.punct(')') {
 					return fail()
@@ -749,7 +754,7 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 			} else {
 				arg, ok := c.next()
 				// A bare reserved keyword is not a column in DuckDB (`count_if(true)`,
-				// `sum(end)`); the engine declines it (agg-6b'' adversarial M3).
+				// `sum(end)`); the engine declines it (agg-6b2 adversarial M3).
 				if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" ||
 					duckdbNonColumnKeywords[arg.lower] {
 					return fail()
@@ -1011,7 +1016,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				}
 				items = append(items, "count(*)")
 			} else if predArgAggFns[t.lower] && predArgFollows(c) {
-				// agg-6b'': a predicate argument (pred_arg.go); the tag-key gate
+				// agg-6b2: a predicate argument (pred_arg.go); the tag-key gate
 				// above (hasMoment) still applies — these names are momentAggFns.
 				text, tok := reserializePredArg(c)
 				if !tok || !c.punct(')') {
@@ -1034,7 +1039,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			// (alongside an optional bucket): a second tag would ride the
 			// generic engine path that measured 1.4-2.4x BEHIND at corpus
 			// scale — allow-listing it routes a known loss (gotcha #5).
-			if tagItem >= 0 {
+			if tagItem >= 0 || duckdbNonColumnKeywords[t.lower] {
 				return fail()
 			}
 			tagItem = len(items)
@@ -1367,7 +1372,7 @@ func matchScan(toks []token) (cols []string, preds []scanPred, whereText string,
 		}
 		for {
 			colT, ok := c.next()
-			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
+			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || duckdbNonColumnKeywords[colT.lower] {
 				return fail()
 			}
 			// A map subscript `col['key']` is a column reference here too (map-1); the
@@ -1477,7 +1482,7 @@ afterWhere:
 		}
 		for {
 			colT, ok := c.next()
-			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
+			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || duckdbNonColumnKeywords[colT.lower] {
 				return fail()
 			}
 			desc := false
@@ -1852,7 +1857,8 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 		return false
 	}
 	colT, ok := c.next()
-	if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || !isBareIdent(colT.orig) {
+	if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || !isBareIdent(colT.orig) ||
+		duckdbNonColumnKeywords[colT.lower] {
 		return false
 	}
 	// A `(` right after the ident is a function call — decline (no expression atoms).

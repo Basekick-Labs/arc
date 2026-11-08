@@ -1,4 +1,4 @@
-// agg-6b'' companion: the recognizer accepts predicate arguments of
+// agg-6b2 companion: the recognizer accepts predicate arguments of
 // count_if/countif/bool_and/bool_or exactly where the engine serves them
 // (ungrouped, bucket-grouped), re-serialized from validated tokens, and declines
 // what the engine declines (IN, NOT, arithmetic, non-canonical literals, timestamp
@@ -93,7 +93,7 @@ func TestPredicateArgDeclines(t *testing.T) {
 		"SELECT bit_or(i > 0) FROM t",
 		// Tag-keyed grouping stays gated (momentAggFns), as for the column form.
 		"SELECT host, count_if(x > 0) FROM t GROUP BY host",
-		// HAVING on a predicate aggregate: the engine declines it (agg-6b'' B1).
+		// HAVING on a predicate aggregate: the engine declines it (agg-6b2 B1).
 		"SELECT date_trunc('hour', time), count_if(x > 0) FROM t GROUP BY 1 HAVING count_if(x > 0) > 3",
 	} {
 		if m, ok := eligibleShape(sql); ok {
@@ -106,6 +106,13 @@ func TestPredicateArgDeclines(t *testing.T) {
 		"SELECT arg_max(end, time) FROM t",
 		"SELECT date_trunc('hour', at), count(*), sum(v) FROM t GROUP BY 1",
 		"SELECT count(*) FROM t WHERE x + end > 10",
+		"SELECT count(*) FROM t WHERE left > 0",
+		"SELECT count_if(x > 1) FROM t WHERE end > 0",
+		"SELECT end, left FROM t",
+		"SELECT end, count(*) FROM t GROUP BY end",
+		// Engine-side clause words and a timestamp-shaped LIKE pattern (review M1/M2).
+		"SELECT count_if(between > 3) FROM t",
+		"SELECT count_if(s LIKE '2024-06-15T12:30:45Z') FROM t",
 	} {
 		if _, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline: %s", sql)
