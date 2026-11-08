@@ -139,7 +139,12 @@ type Decision struct {
 	OrderBy   []scanOrderKey // scan only: ORDER BY keys
 	Limit     int            // scan only: LIMIT n (0 = none)
 	AggItems  []string       // scan_agg only: re-serialized aggregate items, select-list order
-	GroupKey  string         // scan_agg_grouped only: the single group-key column (or the rebuilt bucket text)
+	// res-1: per-item `AS` alias ("" = none), parallel to AggItems; AggItems stay
+	// the bare call text (HAVING matching, tolerance and key detection read them).
+	AggAliases []string
+	// res-1: alias of the single aggregate of a footer shape (count(*), min/max/count).
+	AggAlias string
+	GroupKey string // scan_agg_grouped only: the single group-key column (or the rebuilt bucket text)
 	// agg-3 bucket key parts (empty = bare tag key) — the builder re-emits from
 	// these validated parts, never from GroupKey's text.
 	BucketUnit string
@@ -199,6 +204,8 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		OrderBy:        m.orderBy,
 		Limit:          m.limit,
 		AggItems:       m.aggItems,
+		AggAliases:     m.aggAliases,
+		AggAlias:       m.aggAlias,
 		GroupKey:       m.groupKey,
 		BucketUnit:     m.bucketUnit,
 		BucketCol:      m.bucketCol,
@@ -313,7 +320,11 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 
 	switch d.Shape {
 	case ShapeCountStar:
-		return "SELECT count(*) FROM read_parquet(" + arr.String() + ")", true
+		as, ok := aliasSuffix(d.AggAlias)
+		if !ok {
+			return "", false
+		}
+		return "SELECT count(*)" + as + " FROM read_parquet(" + arr.String() + ")", true
 	case ShapeDateTruncCent:
 		// Unit spelling preserved verbatim so the engine reproduces DuckDB's
 		// derived column name. Column is the "time" convention (F1). An optional
@@ -339,7 +350,11 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 			return "", false
 		}
 		fn := map[string]string{ShapeMinCol: "min", ShapeMaxCol: "max", ShapeCountCol: "count"}[d.Shape]
-		return "SELECT " + fn + "(" + d.Col + ") FROM read_parquet(" + arr.String() + ")", true
+		as, ok := aliasSuffix(d.AggAlias)
+		if !ok {
+			return "", false
+		}
+		return "SELECT " + fn + "(" + d.Col + ")" + as + " FROM read_parquet(" + arr.String() + ")", true
 	case ShapeScan:
 		return buildScanSQL(d, arr.String())
 	case ShapeScanAgg:
@@ -349,6 +364,25 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// aliasSuffix renders ` AS <alias>` for a re-validated res-1 alias ("" → "").
+func aliasSuffix(a string) (string, bool) {
+	if a == "" {
+		return "", true
+	}
+	if !isAggAlias(a) {
+		return "", false
+	}
+	return " AS " + a, true
+}
+
+// itemAlias returns the alias for item i ("" when the slice is shorter).
+func itemAlias(aliases []string, i int) string {
+	if i < len(aliases) {
+		return aliases[i]
+	}
+	return ""
 }
 
 // buildScanAggSQL constructs the engine SQL for an ungrouped aggregation (agg-1):
@@ -373,6 +407,11 @@ func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
 			b.WriteString(", ")
 		}
 		b.WriteString(item)
+		as, ok := aliasSuffix(itemAlias(d.AggAliases, i))
+		if !ok {
+			return "", false
+		}
+		b.WriteString(as)
 	}
 	b.WriteString(" FROM read_parquet(")
 	b.WriteString(pathArray)
@@ -437,9 +476,12 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	var b strings.Builder
 	b.WriteString("SELECT ")
 	for i, item := range d.AggItems {
+		alias := itemAlias(d.AggAliases, i)
 		switch {
 		case isAggItem(item):
 			sawAgg = true
+		case alias != "":
+			return "", false // res-1: aliases ride aggregate items only
 		case bucketText != "" && item == bucketText && !sawBucket:
 			sawBucket = true
 			keyPositions = append(keyPositions, i+1)
@@ -453,6 +495,11 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 			b.WriteString(", ")
 		}
 		b.WriteString(item)
+		as, ok := aliasSuffix(alias)
+		if !ok {
+			return "", false
+		}
+		b.WriteString(as)
 	}
 	if !sawAgg || (bucketText != "" && !sawBucket) || (tagText != "" && !sawTag) {
 		return "", false
@@ -850,6 +897,17 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		return "", err
 	}
 	defer rows.Close()
+
+	// res-1 (adversarial M3): result column NAMES reach clients verbatim, and
+	// aliases make them user-controlled — compare them too (the cell comparators
+	// below are positional). Index only in the message; names may be data-bearing.
+	if cols, err := rows.Columns(); err == nil && len(cols) == int(rec.NumCols()) {
+		for i, c := range cols {
+			if rec.ColumnName(i) != c {
+				return "result column " + strconv.Itoa(i) + " name differs (names withheld)", nil
+			}
+		}
+	}
 
 	if d.Shape == ShapeScan {
 		oracle, err := scanRowsFromRows(rows)

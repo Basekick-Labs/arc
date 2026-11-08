@@ -365,22 +365,55 @@ func (c *cursor) numOne() bool {
 
 // matchCountStar matches: select count ( * ) from <measurement-ident>
 // with nothing after. Returns the measurement token (as written) and ok.
-func matchCountStar(toks []token) (string, bool) {
-	c := &cursor{toks: toks}
-	if !c.ident("select") || !c.ident("count") || !c.punct('(') || !c.punct('*') || !c.punct(')') || !c.ident("from") {
+// readAggAlias consumes an optional `AS <alias>` after a select-list aggregate
+// (res-1, arcX feat/res-1-agg-aliases). The alias is a bare identifier with no
+// dot that is neither one of the router's clause keywords nor the engine's
+// (between, like) — the union, so a shape the router accepts is one the engine
+// parses. Returns ("", true) when there is no alias, ok=false on a malformed one.
+// Quoted aliases do not lex (the engine has no quoted identifiers either).
+func readAggAlias(c *cursor) (string, bool) {
+	if c.peekIdentLower() != "as" {
+		return "", true
+	}
+	c.next()
+	a, ok := c.next()
+	if !ok || a.kind != tokIdent || !isBareIdent(a.orig) || strings.Contains(a.orig, ".") ||
+		isScanKeyword(a.lower) || a.lower == "between" || a.lower == "like" {
 		return "", false
+	}
+	return a.orig, true
+}
+
+// isAggAlias re-validates an alias at the SQL boundary (defense in depth).
+func isAggAlias(a string) bool {
+	if a == "" || !isBareIdent(a) || strings.Contains(a, ".") {
+		return false
+	}
+	l := strings.ToLower(a)
+	return !isScanKeyword(l) && l != "between" && l != "like"
+}
+
+func matchCountStar(toks []token) (meas, alias string, ok bool) {
+	c := &cursor{toks: toks}
+	if !c.ident("select") || !c.ident("count") || !c.punct('(') || !c.punct('*') || !c.punct(')') {
+		return "", "", false
+	}
+	// res-1: `count(*) AS n` keeps the footer path (the engine's matcher accepts it).
+	alias, ok = readAggAlias(c)
+	if !ok || !c.ident("from") {
+		return "", "", false
 	}
 	t, ok := c.next()
 	if !ok || t.kind != tokIdent {
-		return "", false
+		return "", "", false
 	}
-	meas := t.orig
-	// Nothing may follow — a WHERE/GROUP BY/alias/JOIN means this isn't the bare
+	meas = t.orig
+	// Nothing may follow — a WHERE/GROUP BY/JOIN means this isn't the bare
 	// count-all shape; the footer path would silently ignore it. Decline.
 	if !c.atEnd() {
-		return "", false
+		return "", "", false
 	}
-	return meas, true
+	return meas, alias, true
 }
 
 // matchScalarAgg matches a single-scalar footer aggregate over a bare column:
@@ -390,45 +423,49 @@ func matchCountStar(toks []token) (string, bool) {
 // with nothing after. `count(*)` is NOT matched here — that's matchCountStar; the
 // arg must be a bare identifier, not `*`. Returns (func, col-as-written,
 // measurement, ok). `func` is one of "min", "max", "count".
-func matchScalarAgg(toks []token) (fn, col, meas string, ok bool) {
+func matchScalarAgg(toks []token) (fn, col, meas, alias string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	f, ok := c.next()
 	if !ok || f.kind != tokIdent {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	switch f.lower {
 	case "min", "max", "count":
 		fn = f.lower
 	default:
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	if !c.punct('(') {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	// The argument must be a bare column identifier — NOT `*` (count(*) is the
 	// existing CountStar shape) and NOT an expression.
 	arg, ok := c.next()
 	if !ok || arg.kind != tokIdent {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	col = arg.orig
-	if !c.punct(')') || !c.ident("from") {
-		return "", "", "", false
+	if !c.punct(')') {
+		return "", "", "", "", false
+	}
+	alias, ok = readAggAlias(c) // res-1
+	if !ok || !c.ident("from") {
+		return "", "", "", "", false
 	}
 	m, ok := c.next()
 	if !ok || m.kind != tokIdent {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	meas = m.orig
-	// Nothing may follow — a WHERE/GROUP BY/alias means the footer scalar path
-	// would silently ignore it. Decline.
+	// Nothing may follow — a WHERE/GROUP BY means the footer scalar path would
+	// silently ignore it. Decline.
 	if !c.atEnd() {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
-	return fn, col, meas, true
+	return fn, col, meas, alias, true
 }
 
 // matchDateTruncCount matches:
@@ -720,12 +757,12 @@ func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 //
 // Tried AFTER the footer matchers (count(*)/scalar agg get first refusal — the
 // engine routes footer-first for those) and BEFORE matchScan.
-func matchScanAgg(toks []token) (items []string, whereText string, meas string, ok bool) {
+func matchScanAgg(toks []token) (items, aliases []string, whereText string, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
-		return nil, "", "", false
+		return nil, nil, "", "", false
 	}
-	fail := func() ([]string, string, string, bool) { return nil, "", "", false }
+	fail := func() ([]string, []string, string, string, bool) { return nil, nil, "", "", false }
 
 	for {
 		f, ok := c.next()
@@ -794,6 +831,12 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 		default:
 			return fail()
 		}
+		// res-1: optional `AS <alias>` after the aggregate (parallel slice).
+		alias, aok := readAggAlias(c)
+		if !aok {
+			return fail()
+		}
+		aliases = append(aliases, alias)
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
 			continue
@@ -823,7 +866,7 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 	if !c.atEnd() {
 		return fail()
 	}
-	return items, whereText, meas, true
+	return items, aliases, whereText, meas, true
 }
 
 // matchGroupedAgg matches the grouped class the engine's perf gate has cleared
@@ -850,6 +893,7 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 // NULLS LAST); DESC/LIMIT/multi-key ORDER decline. Non-UTC sessions never get
 // here — the M3 tz-injection gate runs before shape matching (gotcha #3).
 func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
+	var aggAliases []string // res-1: per-item alias ("" = none / key item)
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
 		return groupedMatch{}, false
@@ -1063,6 +1107,18 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			tagKey = t.orig
 			items = append(items, t.orig)
 		}
+		// res-1: optional `AS <alias>` after an AGGREGATE item (keys carry their
+		// own alias forms in their arms; an alias on a tag key declines).
+		if last := len(items) - 1; last >= 0 && last != bucketItem && last != tagItem {
+			alias, aok := readAggAlias(c)
+			if !aok {
+				return fail()
+			}
+			for len(aggAliases) < last {
+				aggAliases = append(aggAliases, "")
+			}
+			aggAliases = append(aggAliases, alias)
+		}
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
 			continue
@@ -1199,6 +1255,30 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	if !c.atEnd() {
 		return fail()
 	}
+	for len(aggAliases) < len(items) {
+		aggAliases = append(aggAliases, "")
+	}
+	// res-1: mirror the engine's collision decline — an aggregate alias equal
+	// (case-insensitively) to the tag key, the bucket alias or another alias.
+	{
+		seen := map[string]bool{}
+		if tagKey != "" {
+			seen[strings.ToLower(tagKey)] = true
+		}
+		if m.bucketAlias != "" {
+			seen[strings.ToLower(m.bucketAlias)] = true
+		}
+		for _, a := range aggAliases {
+			if a == "" {
+				continue
+			}
+			if seen[strings.ToLower(a)] {
+				return fail()
+			}
+			seen[strings.ToLower(a)] = true
+		}
+	}
+	m.aggAliases = aggAliases
 	m.items = items
 	m.bucketText = bucketText
 	m.bucketItem = bucketItem
@@ -1215,7 +1295,9 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 // one bare TAG key, at least one of either), their select-list indices, and the
 // validated bucket parts the SQL builder re-emits (never source text).
 type groupedMatch struct {
-	items      []string
+	items []string
+	// res-1: per-item `AS` alias of an aggregate item ("" = none / a key item).
+	aggAliases []string
 	bucketText string // rebuilt bucket item text ("" = no bucket key)
 	bucketItem int    // select-list index of the bucket (-1 = none)
 	tagKey     string // the bare tag key's spelling ("" = no tag key)

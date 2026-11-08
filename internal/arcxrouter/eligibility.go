@@ -151,6 +151,10 @@ type matchResult struct {
 	// scan_agg only: re-serialized aggregate items ("count(*)", "sum(colAsWritten)"),
 	// in select-list order — validated token-by-token in matchScanAgg.
 	aggItems []string
+	// res-1: per-item `AS` alias ("" = none), parallel to aggItems; and the
+	// alias of the single aggregate of a footer shape (count(*), min/max/count).
+	aggAliases []string
+	aggAlias   string
 	// scan_agg_grouped_count only: the single group-key column (as written).
 	// aggItems then holds the select list ("count(*)" or the key), in order.
 	groupKey string
@@ -206,19 +210,19 @@ func eligibleShape(sql string) (matchResult, bool) {
 	if u, meas, whereText, ok := matchDateTruncCount(toks); ok {
 		return matchResult{shape: ShapeDateTruncCent, unit: u, measurement: meas, whereText: whereText}, true
 	}
-	if meas, ok := matchCountStar(toks); ok {
-		return matchResult{shape: ShapeCountStar, measurement: meas}, true
+	if meas, alias, ok := matchCountStar(toks); ok {
+		return matchResult{shape: ShapeCountStar, measurement: meas, aggAlias: alias}, true
 	}
-	if fn, col, meas, ok := matchScalarAgg(toks); ok {
+	if fn, col, meas, alias, ok := matchScalarAgg(toks); ok {
 		shape := map[string]string{"min": ShapeMinCol, "max": ShapeMaxCol, "count": ShapeCountCol}[fn]
-		return matchResult{shape: shape, col: col, measurement: meas}, true
+		return matchResult{shape: shape, col: col, measurement: meas, aggAlias: alias}, true
 	}
 	// Agg-1 ungrouped aggregation: tried after the footer shapes (they keep first
 	// refusal — the engine itself routes footer-first) and before the scan. Catches
 	// the shapes the footer matchers just declined (a WHERE, a multi-agg list,
 	// sum/avg) — the engine's parse-level fall-through, mirrored.
-	if items, whereText, meas, ok := matchScanAgg(toks); ok {
-		return matchResult{shape: ShapeScanAgg, aggItems: items, whereText: whereText, measurement: meas}, true
+	if items, aliases, whereText, meas, ok := matchScanAgg(toks); ok {
+		return matchResult{shape: ShapeScanAgg, aggItems: items, aggAliases: aliases, whereText: whereText, measurement: meas}, true
 	}
 	// The allow-listed grouped shape (agg-2b → agg-2c full agg set → mimalloc
 	// slice optional WHERE). Tried before the scan (a bare-column-led grouped
@@ -228,6 +232,7 @@ func eligibleShape(sql string) (matchResult, bool) {
 		return matchResult{
 			shape:          ShapeScanAggGrouped,
 			aggItems:       gm.items,
+			aggAliases:     gm.aggAliases,
 			groupKey:       gm.tagKey,
 			bucketText:     gm.bucketText,
 			bucketUnit:     gm.bucketUnit,
