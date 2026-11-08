@@ -41,8 +41,7 @@ func TestNumericAggsRecognized(t *testing.T) {
 
 func TestNumericAggsDecline(t *testing.T) {
 	for _, sql := range []string{
-		"SELECT count_if(x > 0) FROM m",
-		"SELECT bool_and(x > 0) FROM m",
+		// (Predicate arguments route since agg-6b'' — pred_arg_test.go.)
 		"SELECT count_if(*) FROM m",
 		"SELECT fsum(DISTINCT f) FROM m",
 		"SELECT host, bool_or(b) FROM m GROUP BY host HAVING bool_or(b) = 1",

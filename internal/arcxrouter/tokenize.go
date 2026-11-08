@@ -102,6 +102,12 @@ func tokenize(sql string) ([]token, bool) {
 			}
 		case c == '!':
 			if i+1 < n && b[i+1] == '=' {
+				// DuckDB lexes an operator run containing `!` greedily: `x!=-2` is
+				// the unknown operator `!=-` (an error on both oracles), and the
+				// engine declines it (agg-6b'' adversarial M4).
+				if i+2 < n && (b[i+2] == '-' || b[i+2] == '+') {
+					return nil, false
+				}
 				toks = append(toks, token{kind: tokOp, op: "!="})
 				i += 2
 			} else {
@@ -158,6 +164,11 @@ func tokenize(sql string) ([]token, bool) {
 			return nil, false
 		}
 	}
+	for _, t := range toks {
+		if t.kind == tokFloat && decimalTooWide(t.orig) {
+			return nil, false
+		}
+	}
 	return toks, true
 }
 
@@ -179,6 +190,21 @@ func lexNumber(sql string, b []byte, start, i, n int) (token, int) {
 		return token{kind: tokFloat, orig: sql[start:i]}, i
 	}
 	return token{kind: tokNum, orig: sql[start:i]}, i
+}
+
+// decimalTooWide mirrors the engine lexer's agg-6b” M1 rule: DuckDB 1.5.6 binds
+// a DECIMAL literal against a DOUBLE in two roundings, so beyond 15 significant
+// digits it can be a different double than the engine's parse — the engine
+// declines the query, and so does the router.
+func decimalTooWide(orig string) bool {
+	digits := strings.TrimLeft(strings.TrimPrefix(orig, "-"), "0")
+	n := 0
+	for i := 0; i < len(digits); i++ {
+		if isDigit(digits[i]) {
+			n++
+		}
+	}
+	return n > 15
 }
 
 // lexString reads a single-quoted literal starting at start (a '). ” is an
@@ -713,9 +739,19 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 					return fail()
 				}
 				items = append(items, "count(*)")
+			} else if predArgAggFns[f.lower] && predArgFollows(c) {
+				// agg-6b'': a predicate argument (pred_arg.go).
+				text, ok := reserializePredArg(c)
+				if !ok || !c.punct(')') {
+					return fail()
+				}
+				items = append(items, f.lower+"("+text+")")
 			} else {
 				arg, ok := c.next()
-				if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" {
+				// A bare reserved keyword is not a column in DuckDB (`count_if(true)`,
+				// `sum(end)`); the engine declines it (agg-6b'' adversarial M3).
+				if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" ||
+					duckdbNonColumnKeywords[arg.lower] {
 					return fail()
 				}
 				// A map subscript argument (map-2) serves for `count` only: the engine
@@ -974,9 +1010,17 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 					return fail()
 				}
 				items = append(items, "count(*)")
+			} else if predArgAggFns[t.lower] && predArgFollows(c) {
+				// agg-6b'': a predicate argument (pred_arg.go); the tag-key gate
+				// above (hasMoment) still applies — these names are momentAggFns.
+				text, tok := reserializePredArg(c)
+				if !tok || !c.punct(')') {
+					return fail()
+				}
+				items = append(items, t.lower+"("+text+")")
 			} else {
 				arg, tok := c.next()
-				if !tok || arg.kind != tokIdent || isScanKeyword(arg.lower) {
+				if !tok || arg.kind != tokIdent || isScanKeyword(arg.lower) || duckdbNonColumnKeywords[arg.lower] {
 					return fail()
 				}
 				if !c.punct(')') {
