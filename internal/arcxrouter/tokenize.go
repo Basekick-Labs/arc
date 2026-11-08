@@ -732,7 +732,7 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 				}
 				items = append(items, f.lower+"("+argRef+")")
 			}
-		case twoArgAggFns[f.lower]:
+		case twoArgAggFns[f.lower] || binaryMomentFns[f.lower]:
 			// agg-4 two-arg by-time aggregates: `fn(payload, orderkey)` — both
 			// bare idents, re-serialized `fn(a, b)` (fn lowercased, spellings
 			// preserved). The 3-arg top-N form and any other arg-shape fall to
@@ -947,11 +947,16 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				bucketText += " AS " + alias
 			}
 			items = append(items, bucketText)
-		} else if isCall && twoArgAggFns[t.lower] {
-			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm).
+		} else if isCall && (twoArgAggFns[t.lower] || binaryMomentFns[t.lower]) {
+			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm), and the
+			// agg-6b fn(y, x) family — which gates tag-keyed shapes like the
+			// moments (agg-6b plan-adversarial M2: the gate lives here too).
 			item, iok := parseTwoArgAggItem(c, t.lower)
 			if !iok {
 				return fail()
+			}
+			if binaryMomentFns[t.lower] {
+				hasMoment = true
 			}
 			items = append(items, item)
 			nAggs++
@@ -1187,6 +1192,17 @@ var unaryAggFns = map[string]bool{
 var momentAggFns = map[string]bool{
 	"var_pop": true, "var_samp": true, "variance": true,
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+}
+
+// binaryMomentFns: the agg-6b two-argument family, `fn(y, x)` over two bare
+// columns (arcX feat/agg6b-binary). Served ungrouped and under a date_trunc
+// bucket key; a tag key with any of them declines (matchGroupedAgg's
+// hasMoment gate — per-row recurrences on interleaved slots are the measured
+// loss class from agg-6a).
+var binaryMomentFns = map[string]bool{
+	"covar_pop": true, "covar_samp": true, "corr": true, "regr_count": true,
+	"regr_avgx": true, "regr_avgy": true, "regr_slope": true, "regr_intercept": true,
+	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
 }
 
 // twoArgAggFns: the agg-4 by-time aggregates — `fn(payload, orderkey)`.

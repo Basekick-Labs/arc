@@ -29,6 +29,9 @@ import "sync/atomic"
 //	match         — compared, identical
 //	mismatch      — compared, DIFFERENT: the alarm that means "arcx is wrong"
 //	argdiff       — arg_max/arg_min tie divergence (DuckDB is nondeterministic here)
+//	oraclediff    — value drift beyond tolerance on an aggregate where DuckDB 1.5.6
+//	                disagrees with itself across thread counts (agg-6b: covar_pop,
+//	                covar_samp, regr_sxy, regr_intercept)
 //	declined      — the engine declined an eligible shape (eligibility over-claimed)
 //	error         — the SHADOW engine run failed
 //	oracle_error  — the DuckDB oracle failed; says nothing about arcx
@@ -45,6 +48,7 @@ var arcxShadowOutcomes = [...]string{
 	"match",
 	"mismatch",
 	"argdiff",
+	"oraclediff",
 	"declined",
 	"error",
 	"oracle_error",
@@ -62,6 +66,7 @@ const (
 	ShadowMatch       = "match"
 	ShadowMismatch    = "mismatch"
 	ShadowArgDiff     = "argdiff"
+	ShadowOracleDiff  = "oraclediff"
 	ShadowDeclined    = "declined"
 	ShadowError       = "error"
 	ShadowOracleError = "oracle_error"

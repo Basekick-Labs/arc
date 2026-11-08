@@ -97,6 +97,11 @@ type Metrics interface {
 	// agg-4: a shadow diff confined to arg_max/arg_min cells (tie-divergence
 	// candidate — WARN-class, never the mismatch alarm).
 	ArcxShadowArgDivergence(shape string)
+	// ArcxShadowOracleDivergence: a value-only difference beyond tolerance on an
+	// aggregate where DuckDB 1.5.6 disagrees with ITSELF across thread counts
+	// (agg-6b: covar_pop, covar_samp, regr_sxy, regr_intercept under
+	// cancellation). WARN + metric, never the mismatch alarm.
+	ArcxShadowOracleDivergence(shape string)
 	ArcxShadowError(shape string)
 	// ArcxServeError: an engine failure on the SERVE path. Separate from
 	// ArcxShadowError because feeding both into one counter made a serve-mode
@@ -517,7 +522,7 @@ func isAggItem(item string) bool {
 	// agg-4: the two-arg by-time aggregates — EXACTLY two bare idents,
 	// re-serialized as `fn(a, b)`. The 3-arg top-N form, arg_max_null, and
 	// no-underscore argmax/argmin exist on DuckDB and must NOT match.
-	case twoArgAggFns[fn]:
+	case twoArgAggFns[fn] || binaryMomentFns[fn]:
 		a, b, ok := strings.Cut(inner, ", ")
 		return ok && isBareIdent(a) && isBareIdent(b)
 	}
@@ -530,6 +535,22 @@ func isAggItem(item string) bool {
 // choice is run-to-run nondeterministic at high thread counts (oracle-probed)
 // while arcx is pinned deterministic, so ambiguous ties diverge legitimately
 // (~0.1% of groups on real data).
+// isOracleUnstableItem reports whether a re-serialized item is one of the four
+// agg-6b aggregates whose DuckDB 1.5.6 result moves across thread counts by more
+// than the 1e-9 tolerance under cancellation (a covariance near zero at large
+// mean/σ; an intercept far smaller than slope·x̄ — measured 2.3e-9 … 1.6e-5,
+// plannings/arcX agg-6b plan, adversarial B1). A value-only difference on these
+// cells is filed as `oraclediff:` (WARN), the `argdiff:` precedent; NULL-ness,
+// NaN-ness and kind differences still alarm.
+func isOracleUnstableItem(item string) bool {
+	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func isArgItem(item string) bool {
 	for _, p := range []string{"arg_max(", "arg_min(", "max_by(", "min_by("} {
 		if strings.HasPrefix(item, p) {
@@ -768,6 +789,14 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 			h.Logger.Warn().Str("shape", d.Shape).Str("reason", strings.TrimPrefix(diff, skipPrefix)).
 				Msg("arcx shadow: skipped, could not render the arcx result")
 			h.Metrics.ArcxShadowSkipped(d.Shape, metrics.ShadowSkippedHost)
+			return
+		}
+		if strings.HasPrefix(diff, "oraclediff:") {
+			h.Logger.Warn().
+				Str("shape", d.Shape).
+				Str("diff", strings.TrimPrefix(diff, "oraclediff:")).
+				Msg("arcx shadow: value divergence on an oracle-unstable aggregate (values withheld)")
+			h.Metrics.ArcxShadowOracleDivergence(d.Shape)
 			return
 		}
 		if strings.HasPrefix(diff, "argdiff:") {

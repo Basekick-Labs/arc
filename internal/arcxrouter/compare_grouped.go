@@ -155,6 +155,12 @@ func groupedFromArcx(rec arrow.Record, keyCols []int) ([]groupedRow, error) {
 				} else {
 					row.cells = append(row.cells, aggCell{f: col.Value(r)})
 				}
+			case *array.Uint32: // agg-6b regr_count
+				if col.IsNull(r) {
+					row.cells = append(row.cells, aggCell{isNull: true})
+				} else {
+					row.cells = append(row.cells, aggCell{isInt: true, i: big.NewInt(int64(col.Value(r)))})
+				}
 			case *array.Timestamp:
 				if col.IsNull(r) {
 					row.cells = append(row.cells, aggCell{isNull: true})
@@ -216,6 +222,8 @@ func groupedFromRows(rows *sql.Rows, keyCols []int) ([]groupedRow, error) {
 				row.cells = append(row.cells, aggCell{isNull: true})
 			case int64:
 				row.cells = append(row.cells, aggCell{isInt: true, i: big.NewInt(x)})
+			case uint32: // agg-6b regr_count (UINTEGER)
+				row.cells = append(row.cells, aggCell{isInt: true, i: big.NewInt(int64(x))})
 			case *big.Int:
 				row.cells = append(row.cells, aggCell{isInt: true, i: x})
 			case float64:
@@ -272,6 +280,7 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 	// kind) always alarm: ties cannot cause them (a NULL payload never wins in
 	// either engine — the both-non-NULL participation rule).
 	argDiff := ""
+	oracleDiff := ""
 	deferArg := func(c int, msg string) bool {
 		if c < len(cellItems) && isArgItem(cellItems[c]) {
 			if argDiff == "" {
@@ -327,7 +336,14 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 			if tolerant[c] {
 				scale := math.Max(math.Abs(ac.f), math.Abs(dc.f))
 				if math.Abs(ac.f-dc.f) > aggFloatRelTol*math.Max(scale, 1.0) {
-					return fmt.Sprintf("grouped row %d differs (agg col %d beyond 1e-9 tolerance, values withheld)", i, c)
+					msg := fmt.Sprintf("grouped row %d differs (agg col %d beyond 1e-9 tolerance, values withheld)", i, c)
+					if c < len(cellItems) && isOracleUnstableItem(cellItems[c]) {
+						if oracleDiff == "" {
+							oracleDiff = msg
+						}
+						continue
+					}
+					return msg
 				}
 			} else if ac.f != dc.f {
 				msg := fmt.Sprintf("grouped row %d of %d differs (agg col %d float, values withheld)", i, len(got), c)
@@ -340,6 +356,9 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 	}
 	if argDiff != "" {
 		return "argdiff:" + argDiff
+	}
+	if oracleDiff != "" {
+		return "oraclediff:" + oracleDiff
 	}
 	return ""
 }
