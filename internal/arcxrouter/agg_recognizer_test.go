@@ -94,10 +94,10 @@ func TestScanAggDeclines(t *testing.T) {
 		"SELECT count(DISTINCT x) FROM cpu",
 		"SELECT sum(a * b) FROM cpu",
 		"SELECT sum(*) FROM cpu",
-		"SELECT host, count(*) FROM cpu",          // mixed list
-		"SELECT count(*) AS c FROM cpu WHERE x=1", // alias
-		"SELECT median(x) FROM cpu WHERE x > 1",   // unsupported aggregate
-		"SELECT sum(x) FROM cpu WHERE",            // dangling WHERE
+		"SELECT host, count(*) FROM cpu",                       // mixed list
+		"SELECT count(*) AS c FROM cpu WHERE x=1",              // alias
+		"SELECT approx_count_distinct(x) FROM cpu WHERE x > 1", // unsupported aggregate
+		"SELECT sum(x) FROM cpu WHERE",                         // dangling WHERE
 	} {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAgg {
 			t.Fatalf("must not match scan_agg: %s", sql)

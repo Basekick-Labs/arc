@@ -167,6 +167,12 @@ func groupedFromArcx(rec arrow.Record, keyCols []int) ([]groupedRow, error) {
 				} else {
 					row.cells = append(row.cells, aggCell{isBool: true, b: col.Value(r)})
 				}
+			case *array.String: // agg-7 mode over VARCHAR
+				if col.IsNull(r) {
+					row.cells = append(row.cells, aggCell{isNull: true})
+				} else {
+					row.cells = append(row.cells, aggCell{isStr: true, s: col.Value(r)})
+				}
 			case *array.Timestamp:
 				if col.IsNull(r) {
 					row.cells = append(row.cells, aggCell{isNull: true})
@@ -232,6 +238,8 @@ func groupedFromRows(rows *sql.Rows, keyCols []int) ([]groupedRow, error) {
 				row.cells = append(row.cells, aggCell{isInt: true, i: big.NewInt(int64(x))})
 			case bool: // agg-6b' bool_and / bool_or
 				row.cells = append(row.cells, aggCell{isBool: true, b: x})
+			case string: // agg-7 mode over VARCHAR
+				row.cells = append(row.cells, aggCell{isStr: true, s: x})
 			case *big.Int:
 				row.cells = append(row.cells, aggCell{isInt: true, i: x})
 			case float64:
@@ -324,6 +332,15 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 			if ac.isBool {
 				if ac.b != dc.b {
 					return fmt.Sprintf("grouped row %d of %d differs (agg col %d boolean, values withheld)", i, len(got), c)
+				}
+				continue
+			}
+			if ac.isStr != dc.isStr {
+				return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
+			}
+			if ac.isStr {
+				if ac.s != dc.s {
+					return fmt.Sprintf("grouped row %d of %d differs (agg col %d string, values withheld)", i, len(got), c)
 				}
 				continue
 			}

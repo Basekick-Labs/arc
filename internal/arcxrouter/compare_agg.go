@@ -45,6 +45,8 @@ type aggCell struct {
 	i      *big.Int // isInt: count, integer sum, timestamp µs
 	f      float64  // !isInt && !isBool: float sum/avg/min/max
 	b      bool     // isBool
+	isStr  bool     // agg-7 mode over VARCHAR (exact compare)
+	s      string   // isStr
 }
 
 // aggFromRows scans DuckDB's single aggregate row. The driver hands back int64
@@ -86,6 +88,8 @@ func aggFromRows(rows *sql.Rows) ([]aggCell, error) {
 			out[i] = aggCell{isInt: true, i: big.NewInt(int64(x))}
 		case bool: // agg-6b' bool_and / bool_or
 			out[i] = aggCell{isBool: true, b: x}
+		case string: // agg-7 mode over VARCHAR
+			out[i] = aggCell{isStr: true, s: x}
 		case *big.Int:
 			out[i] = aggCell{isInt: true, i: x}
 		case float64:
@@ -131,6 +135,12 @@ func aggFromArcx(rec arrow.Record) ([]aggCell, error) {
 			} else {
 				out[c] = aggCell{isBool: true, b: col.Value(0)}
 			}
+		case *array.String: // agg-7 mode over VARCHAR
+			if col.IsNull(0) {
+				out[c] = aggCell{isNull: true}
+			} else {
+				out[c] = aggCell{isStr: true, s: col.Value(0)}
+			}
 		case *array.Timestamp:
 			if col.IsNull(0) {
 				out[c] = aggCell{isNull: true}
@@ -159,6 +169,10 @@ var tolerantAggFns = map[string]bool{
 	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
 	// agg-6b' (bit_*, bool_*, count_if compare exact)
 	"product": true, "fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	// agg-7: the interpolating order statistics (the discrete ones and mode are
+	// exact). DuckDB's arm64 build fuses the interpolation into an FMA, so a
+	// 1-ulp difference is architecture, not a bug (arcX agg-7 adversarial B1).
+	"median": true, "quantile_cont": true, "mad": true,
 }
 
 // aggItemTolerant reports whether the item's float result carries the documented
@@ -207,6 +221,15 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 		if a.isBool {
 			if a.b != d.b {
 				return fmt.Sprintf("agg col %d differs (boolean value withheld from log)", c)
+			}
+			continue
+		}
+		if a.isStr != d.isStr {
+			return fmt.Sprintf("agg col %d differs (kind: arcx_str=%t duckdb_str=%t)", c, a.isStr, d.isStr)
+		}
+		if a.isStr {
+			if a.s != d.s {
+				return fmt.Sprintf("agg col %d differs (string value withheld from log)", c)
 			}
 			continue
 		}

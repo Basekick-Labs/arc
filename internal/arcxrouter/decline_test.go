@@ -27,7 +27,7 @@ func TestCensusClassifySeparatesShapes(t *testing.T) {
 		{"SELECT DISTINCT host FROM cpu", "distinct"},
 		{"SELECT host FROM cpu LIMIT 10 OFFSET 5", "offset"},
 		{"SELECT * FROM cpu", "star_projection"},
-		{"SELECT median(value) FROM cpu", "agg_fn"},
+		{"SELECT approx_quantile(value, 0.5) FROM cpu", "agg_fn"},
 		{"SELECT upper(host) FROM cpu", "fn_other"},
 		// Guards keep their own buckets (correctness gates, not missing features).
 		{"SELECT host FROM cpu WHERE t AT TIME ZONE 'UTC' > 1", "tz_setting"},

@@ -202,6 +202,35 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: median, quantiles, mad and mode route to the engine
+
+The arcx engine now serves DuckDB's order statistics (arcX feat/agg-7-order-stats):
+`median(x)`, `quantile_cont(x, q)`, `quantile_disc(x, q)` and its alias `quantile(x, q)` and
+`mad(x)` over `BIGINT` and `DOUBLE` columns, and `mode(x)` over `BIGINT` and `VARCHAR` columns. `q` is a single
+literal between 0 and 1. The recognizer routes these in ungrouped aggregates and under a time
+bucket. Grouped by a tag column they stay on DuckDB, as does `mode` in any grouped query and
+any `HAVING` that references one of these functions. A list of fractions, a negative
+fraction, `mode` over `DOUBLE`, and timestamp or text arguments to the other functions also stay
+on DuckDB; the router cannot see column types, so these reach the engine and fall back
+immediately.
+
+Measured through Arc on a 33-million-row window of a synthetic corpus (DuckDB → engine):
+`median` 436 → 53 ms, `quantile_cont(…, 0.99)` 271 → 58 ms, `quantile_disc` 218 → 50 ms,
+`mad` 1074 → 54 ms, `mode` 43 → 32 ms, an hourly-bucket `median` + p99 375 → 90 ms.
+DuckDB finalizes each of these with a single-threaded selection; the engine selects in
+parallel.
+
+Like DuckDB, the engine keeps every value in memory for these functions. It refuses a query
+whose values would exceed 1 GiB — for example a median over 132 million rows, or three
+quantiles over 33 million — using the Parquet row counts, before reading any data, and
+DuckDB serves it instead.
+
+`mode` falls back to DuckDB whenever two values tie for most frequent, because DuckDB 1.5.6
+and 2.0 pick different winners in that case. A tie is only known after the engine has counted
+every value, so a tied `mode` costs the engine's scan plus DuckDB's. Shadow mode compares `median`, `quantile_cont` and
+`mad` within the usual 1e-9 tolerance, since DuckDB's ARM build can differ from its x86 build in
+the last bit of an interpolated value. `quantile_disc` and `mode` compare exactly.
+
 ## arcx router: count_if / bool_and / bool_or with a predicate argument route to the engine
 
 The arcx engine now serves the predicate form of the Boolean aggregates (arcX
