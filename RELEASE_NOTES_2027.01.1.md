@@ -202,6 +202,29 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: skewness and kurtosis route to the engine
+
+The arcx engine now serves `skewness(x)`, `kurtosis(x)` and `kurtosis_pop(x)` over `BIGINT` and
+`DOUBLE` columns (arcX feat/agg-8-skew-kurt). The recognizer routes them in ungrouped aggregates
+and under a time bucket; grouped by a tag column they stay on DuckDB.
+
+Measured through Arc on a synthetic 132-million-row corpus (DuckDB → engine): `skewness`
+155 → 90 ms, `kurtosis` 233 → 90 ms, all three together 555 → 157 ms, an hourly-bucket
+`skewness` + `kurtosis` 555 → 216 ms.
+
+The engine computes these with central moments. DuckDB 1.5.6 uses raw power sums, which lose
+precision when values are large compared with their spread. That covers most telemetry, from a
+12 V rail to a temperature sensor or an epoch-scale counter. In those cases the engine is exact
+where DuckDB's answer drifts or comes back NULL or NaN. On a constant column (a stuck sensor) the
+engine returns NULL; DuckDB 1.5.6 returns a value that depends on the CPU architecture.
+`skewness` of a constant column is NULL rather than DuckDB 1.5.6's NaN, so stuck sensors no longer
+sort above every real value. Shadow mode therefore records any difference on these three functions
+under the `oraclediff` outcome (a WARN), not as a mismatch.
+
+**Fix included:** `stddev`, `variance` and `var_pop` over a constant column whose value has no
+exact binary form (for example `0.1` repeated) returned a tiny non-zero number instead of `0`, so
+`HAVING stddev(x) = 0` missed stuck sensors. They now return exactly `0`, as DuckDB does.
+
 ## arcx router: median, quantiles, mad and mode route to the engine
 
 The arcx engine now serves DuckDB's order statistics (arcX feat/agg-7-order-stats):
