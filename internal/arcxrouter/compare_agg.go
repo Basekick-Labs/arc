@@ -173,7 +173,9 @@ var tolerantAggFns = map[string]bool{
 	// exact). DuckDB's arm64 build fuses the interpolation into an FMA, so a
 	// 1-ulp difference is architecture, not a bug (arcX agg-7 adversarial B1).
 	"median": true, "quantile_cont": true, "mad": true,
-	// agg-8: the shape statistics (arcx central moments vs DuckDB 1.5.6 raw sums).
+	// agg-8: the shape statistics. Kept for aggItemTolerant callers only: both
+	// comparators file any shape-cell difference as oraclediff before reaching
+	// the tolerance branch (isShapeItem).
 	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
 }
 
@@ -185,13 +187,25 @@ var tolerantAggFns = map[string]bool{
 // `oraclediff:` (WARN), never a mismatch alarm; their correctness is pinned by
 // the engine's exact-reference fixtures, and the shadow comparison is
 // informational.
+var shapeItemPrefixes = []string{"skewness(", "kurtosis(", "kurtosis_pop("}
+
 func isShapeItem(item string) bool {
-	for _, p := range []string{"skewness(", "kurtosis(", "kurtosis_pop("} {
+	for _, p := range shapeItemPrefixes {
 		if strings.HasPrefix(item, p) {
 			return true
 		}
 	}
 	return false
+}
+
+// shapeKindDiffers: a kind difference (int/bool/string vs float) on a shape cell
+// is a structural engine bug — oracle garbage can't change a value's type — so it
+// still alarms (review M1).
+func shapeKindDiffers(a, d aggCell) bool {
+	if a.isNull || d.isNull {
+		return false
+	}
+	return a.isInt != d.isInt || a.isBool != d.isBool || a.isStr != d.isStr
 }
 
 // shapeCellDiffers: true when two shape cells differ beyond the tolerance in any
@@ -245,6 +259,9 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	for c := range got {
 		a, d := got[c], oracle[c]
 		if c < len(items) && isShapeItem(items[c]) {
+			if shapeKindDiffers(a, d) {
+				return fmt.Sprintf("agg col %d differs (kind on a shape statistic)", c)
+			}
 			if shapeCellDiffers(a, d) && oracleDiff == "" {
 				oracleDiff = fmt.Sprintf("agg col %d differs (shape statistic vs DuckDB 1.5.6 raw sums, values withheld)", c)
 			}

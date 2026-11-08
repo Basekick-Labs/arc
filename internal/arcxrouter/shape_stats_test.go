@@ -32,6 +32,10 @@ func TestShapeStatsRoute(t *testing.T) {
 		"SELECT skewness(DISTINCT v) FROM cpu",
 		"SELECT skewness(v * 2) FROM cpu",
 		"SELECT skewness(v, w) FROM cpu",
+		// Review H1: HAVING over a shape statistic would turn DuckDB 1.5.6's
+		// garbage into a row-set difference the cell exemption cannot see.
+		"SELECT date_trunc('hour', time), skewness(v) FROM cpu GROUP BY 1 HAVING skewness(v) > 0",
+		"SELECT date_trunc('hour', time), kurtosis(v) FROM cpu GROUP BY 1 HAVING kurtosis(v) < 3",
 	} {
 		if _, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline: %s", sql)

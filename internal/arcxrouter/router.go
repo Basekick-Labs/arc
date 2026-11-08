@@ -797,6 +797,13 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		// here too) is recorded in the agg-4 plan doc; a WARN-rate spike is
 		// itself the signal, and the differential harness carries the strict
 		// membership checks.
+		//
+		// agg-8 shape statistics (skewness/kurtosis/kurtosis_pop) go further:
+		// ANY cell difference (value, NULL-ness, NaN-ness) is oraclediff, because
+		// DuckDB 1.5.6's raw sums are garbage on constant/high-offset data. The
+		// accepted residual risk: a real engine bug in those three never alarms
+		// here — the engine's exact-reference fixtures are the guard, and an
+		// oraclediff-rate spike (log message names the column) is the signal.
 		if strings.HasPrefix(diff, skipPrefix) {
 			// The comparator could not render the arcx side (host-side failure).
 			// Same reasoning as errShadowAssembly above: never the mismatch alarm.
@@ -809,7 +816,7 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 			h.Logger.Warn().
 				Str("shape", d.Shape).
 				Str("diff", strings.TrimPrefix(diff, "oraclediff:")).
-				Msg("arcx shadow: value divergence on an oracle-unstable aggregate (values withheld)")
+				Msg("arcx shadow: divergence on an oracle-unstable aggregate — value drift, or NULL/NaN-ness on a shape statistic (values withheld)")
 			h.Metrics.ArcxShadowOracleDivergence(d.Shape)
 			return
 		}

@@ -162,6 +162,12 @@ func havingRef(c *cursor, hc havingCtx) (string, bool) {
 			// agg-7: order statistics in HAVING are not routed in v1 (the engine
 			// resolves them; held until measured).
 			return "", false
+		case t.lower == "skewness" || t.lower == "kurtosis" || t.lower == "kurtosis_pop":
+			// agg-8 review H1: a HAVING over a shape statistic turns DuckDB 1.5.6's
+			// raw-sum garbage into a different ROW SET (a stuck sensor's NaN passes
+			// `> 0`; arcx's NULL does not), which the cell-level oraclediff exemption
+			// cannot see — refused, so shadow never alarms on DuckDB's defect.
+			return "", false
 		case unaryAggFns[t.lower]:
 			// Mirrors the select-list arm in matchGroupedAgg exactly (same accepted
 			// forms, same emitted text); kept inline rather than refactoring that

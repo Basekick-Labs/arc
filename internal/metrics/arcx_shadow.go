@@ -29,9 +29,12 @@ import "sync/atomic"
 //	match         — compared, identical
 //	mismatch      — compared, DIFFERENT: the alarm that means "arcx is wrong"
 //	argdiff       — arg_max/arg_min tie divergence (DuckDB is nondeterministic here)
-//	oraclediff    — value drift beyond tolerance on an aggregate where DuckDB 1.5.6
-//	                disagrees with itself across thread counts (agg-6b: covar_pop,
-//	                covar_samp, regr_sxy, regr_intercept)
+//	oraclediff    — a divergence attributable to DuckDB 1.5.6, not arcx: value drift
+//	                beyond tolerance where 1.5.6 disagrees with itself across thread
+//	                counts (agg-6b covar_pop/covar_samp/regr_sxy/regr_intercept,
+//	                agg-6b' Kahan sums), or ANY difference — value, NULL-ness,
+//	                NaN-ness — on the agg-8 shape statistics (skewness, kurtosis,
+//	                kurtosis_pop), where 1.5.6's raw power sums are unreliable
 //	declined      — the engine declined an eligible shape (eligibility over-claimed)
 //	error         — the SHADOW engine run failed
 //	oracle_error  — the DuckDB oracle failed; says nothing about arcx

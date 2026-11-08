@@ -1,9 +1,8 @@
 // agg-6a companion: the recognizer accepts the unary moment aggregates
 // (var_pop/var_samp/variance, stddev/stddev_samp/stddev_pop, sem) and the `mean`
 // alias exactly where the engine serves them (ungrouped, grouped, HAVING), and
-// keeps declining what the engine does not build (
-// the binary covariance/correlation family, DISTINCT/expression arguments). Pure
-// tokenizer tests — no engine, no cgo.
+// keeps declining what the engine does not build: DISTINCT and expression
+// arguments. Pure tokenizer tests — no engine, no cgo.
 
 package arcxrouter
 
