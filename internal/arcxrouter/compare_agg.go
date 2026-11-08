@@ -173,6 +173,41 @@ var tolerantAggFns = map[string]bool{
 	// exact). DuckDB's arm64 build fuses the interpolation into an FMA, so a
 	// 1-ulp difference is architecture, not a bug (arcX agg-7 adversarial B1).
 	"median": true, "quantile_cont": true, "mad": true,
+	// agg-8: the shape statistics (arcx central moments vs DuckDB 1.5.6 raw sums).
+	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
+}
+
+// isShapeItem reports an agg-8 shape-statistic item. DuckDB 1.5.6 computes these
+// from raw power sums: on constant columns and high-offset data its result is
+// architecture-dependent garbage, NULL or NaN where the true value exists (arcX
+// agg-8 adversarial B2), while arcx computes central moments exactly. So ANY
+// difference on these cells — value, NULL-ness, NaN-ness — is filed as
+// `oraclediff:` (WARN), never a mismatch alarm; their correctness is pinned by
+// the engine's exact-reference fixtures, and the shadow comparison is
+// informational.
+func isShapeItem(item string) bool {
+	for _, p := range []string{"skewness(", "kurtosis(", "kurtosis_pop("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// shapeCellDiffers: true when two shape cells differ beyond the tolerance in any
+// way (NULL-ness, NaN-ness, Inf-ness, value).
+func shapeCellDiffers(a, d aggCell) bool {
+	if a.isNull || d.isNull {
+		return a.isNull != d.isNull
+	}
+	if math.IsNaN(a.f) || math.IsNaN(d.f) {
+		return !(math.IsNaN(a.f) && math.IsNaN(d.f))
+	}
+	if math.IsInf(a.f, 0) || math.IsInf(d.f, 0) {
+		return a.f != d.f
+	}
+	scale := math.Max(math.Abs(a.f), math.Abs(d.f))
+	return math.Abs(a.f-d.f) > aggFloatRelTol*math.Max(scale, 1.0)
 }
 
 // aggItemTolerant reports whether the item's float result carries the documented
@@ -209,6 +244,12 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	}
 	for c := range got {
 		a, d := got[c], oracle[c]
+		if c < len(items) && isShapeItem(items[c]) {
+			if shapeCellDiffers(a, d) && oracleDiff == "" {
+				oracleDiff = fmt.Sprintf("agg col %d differs (shape statistic vs DuckDB 1.5.6 raw sums, values withheld)", c)
+			}
+			continue
+		}
 		if a.isNull != d.isNull {
 			return fmt.Sprintf("agg col %d differs (null-ness: arcx_null=%t duckdb_null=%t)", c, a.isNull, d.isNull)
 		}

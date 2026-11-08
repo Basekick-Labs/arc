@@ -42,7 +42,7 @@ func TestBuildScanAggSQLDeclinesUnsafeItems(t *testing.T) {
 		{"count(*) --"},                 // trailing junk
 		{"sum(x); DROP TABLE t"},        // injection attempt
 		{"sum(x')"},                     // non-ident arg
-		{"skewness(x)"},                 // unknown fn
+		{"approx_count_distinct(x)"},    // unknown fn
 		{"sum(a, b)"},                   // arity
 		{"SUM(x)"},                      // fn not lowercased = not our serialization
 		{"sum(x)", "count(*) OR 1 = 1"}, // second item unsafe
@@ -118,10 +118,10 @@ func TestBuildGroupedSQL(t *testing.T) {
 			AggItems:   []string{"date_trunc('minute', x)", "count(*)"},
 			BucketUnit: "minute", BucketCol: "x; DROP",
 		},
-		{AggItems: []string{"count(*)"}, GroupKey: "host"},                 // no key item
-		{AggItems: []string{"host", "count(*)"}, GroupKey: "h; DROP"},      // unsafe key
-		{AggItems: []string{"host", "skewness(x)"}, GroupKey: "host"},      // unknown fn item
-		{AggItems: []string{"host", "host", "count(*)"}, GroupKey: "host"}, // repeated key
+		{AggItems: []string{"count(*)"}, GroupKey: "host"},                         // no key item
+		{AggItems: []string{"host", "count(*)"}, GroupKey: "h; DROP"},              // unsafe key
+		{AggItems: []string{"host", "approx_count_distinct(x)"}, GroupKey: "host"}, // unknown fn item
+		{AggItems: []string{"host", "host", "count(*)"}, GroupKey: "host"},         // repeated key
 	} {
 		if got, ok := buildGroupedSQL(d, paths); ok {
 			t.Fatalf("must decline unsafe decision %v, got %q", d, got)

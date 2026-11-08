@@ -1,7 +1,7 @@
 // agg-6a companion: the recognizer accepts the unary moment aggregates
 // (var_pop/var_samp/variance, stddev/stddev_samp/stddev_pop, sem) and the `mean`
 // alias exactly where the engine serves them (ungrouped, grouped, HAVING), and
-// keeps declining what the engine holds or does not build (skewness/kurtosis,
+// keeps declining what the engine does not build (
 // the binary covariance/correlation family, DISTINCT/expression arguments). Pure
 // tokenizer tests — no engine, no cgo.
 
@@ -73,10 +73,7 @@ func TestGroupedAggMoments(t *testing.T) {
 
 func TestMomentsDecline(t *testing.T) {
 	for _, sql := range []string{
-		// held until the 2.0 pin / not built
-		"SELECT skewness(v) FROM cpu",
-		"SELECT kurtosis(v) FROM cpu",
-		"SELECT kurtosis_pop(v) FROM cpu",
+		// tag-keyed shape statistics stay gated (agg-8)
 		"SELECT host, skewness(v) FROM cpu GROUP BY host",
 		// argument shapes the engine declines
 		"SELECT stddev(DISTINCT v) FROM cpu",
