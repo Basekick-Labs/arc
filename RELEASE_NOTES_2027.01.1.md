@@ -202,6 +202,28 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: aliased aggregates route to the engine
+
+Aggregates with an `AS` alias now route to the arcx engine
+(arcX feat/res-1-agg-aliases). This covers `SELECT avg(value) AS value, count(*) AS n …`,
+grouped queries such as `SELECT date_trunc('hour', time) AS time, avg(value) AS value …
+GROUP BY 1`, and the footer fast paths (`SELECT count(*) AS n FROM cpu`, `max(time) AS newest`).
+Until now any alias on an aggregate sent the query to DuckDB, and most dashboard panels alias
+their aggregates. The output column carries the alias exactly as written.
+
+These forms still run on DuckDB:
+- an alias without `AS` (`min(x) mx`);
+- a quoted alias (`AS "time"`);
+- an alias that matches the group key, the bucket alias or another alias;
+- a `HAVING` or `ORDER BY` that names an aggregate's alias, because DuckDB resolves those names
+  differently in each clause. `HAVING avg(value) > 5` (the aggregate written out) still routes.
+
+Shadow mode now also compares result column names, since aliases make them user-controlled. One
+existing difference is exempted. When DuckDB serves an unaliased `date_trunc` bucket, Arc's
+rewrite of the bucket expression names that column after the rewritten expression
+(`make_timestamptz(…)`). The engine names it `date_trunc('hour', "time")`. Aliased buckets
+(`AS time`) are named identically on both paths.
+
 ## arcx router: skewness and kurtosis route to the engine
 
 The arcx engine now serves `skewness(x)`, `kurtosis(x)` and `kurtosis_pop(x)` over `BIGINT` and
