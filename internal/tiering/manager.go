@@ -24,6 +24,12 @@ type Manager struct {
 	hotBackend  storage.Backend
 	coldBackend storage.Backend
 
+	// afterColdFallbackRow is a test seam: when set, syncColdTierMetadata calls it
+	// after each row the per-row fallback writes (after a batch failed). Nil in
+	// production. It lets a test cancel at an exact point inside the fallback
+	// instead of polling for a row that a fast runner may finish past.
+	afterColdFallbackRow func()
+
 	// onMigrationComplete, when set, runs after a migration cycle that moved
 	// or deleted at least one tier file. The query layer uses it to invalidate
 	// pruner and SQL transform caches, whose cached partition paths go stale
@@ -1249,6 +1255,9 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 				}
 				touched[tierCacheScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
 				synced++
+				if m.afterColdFallbackRow != nil {
+					m.afterColdFallbackRow()
+				}
 			}
 			return nil
 		}
