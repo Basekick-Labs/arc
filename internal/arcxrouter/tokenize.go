@@ -1243,10 +1243,10 @@ type groupedMatch struct {
 // stddev_pop, sem). `count(*)` is the one star form and is special-cased at
 // each site. Every select-list, HAVING and re-validation arm consults THIS map,
 // so adding a unary aggregate the engine has proven in its differential harness
-// is a one-line router change. Not here, deliberately: skewness/kurtosis (held
-// until Arc pins DuckDB 2.0 — v1.5.6's raw-sum algorithm cannot be matched
-// within the shadow tolerance at mean/σ ≥ 10), the binary covariance/
-// correlation family (agg-6b), and every sketch/collection aggregate.
+// is a one-line router change. Not here: the binary covariance/correlation
+// family (twoArgAggFns/binaryMomentFns) and every sketch/collection aggregate.
+// skewness/kurtosis ARE here since agg-8 (arcx computes central moments; DuckDB
+// 1.5.6's raw-sum differences are filed as oraclediff — see isShapeItem).
 var unaryAggFns = map[string]bool{
 	"count": true, "sum": true, "min": true, "max": true, "avg": true, "mean": true,
 	"var_pop": true, "var_samp": true, "variance": true,
@@ -1264,6 +1264,8 @@ var unaryAggFns = map[string]bool{
 	// `mode` is routed UNGROUPED only (matchGroupedAgg refuses it): one tied group
 	// declines the whole query in the engine, and small groups tie often.
 	"median": true, "mad": true, "mode": true,
+	// agg-8 (arcX feat/agg-8-skew-kurt): the shape statistics.
+	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
 }
 
 // quantileAggFns: agg-7 `fn(<bare col>, <fraction literal>)`.
@@ -1287,6 +1289,8 @@ var momentAggFns = map[string]bool{
 	// (Grouped `mode` is refused outright, and the quantile arm sets the gate
 	// itself, so only median/mad are read here.)
 	"median": true, "mad": true,
+	// agg-8: tag-keyed shape statistics are per-row central-moment chains.
+	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
 }
 
 // binaryMomentFns: the agg-6b two-argument family, `fn(y, x)` over two bare

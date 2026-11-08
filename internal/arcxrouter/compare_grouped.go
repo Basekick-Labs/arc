@@ -320,6 +320,16 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 		}
 		for c := range a.cells {
 			ac, dc := &a.cells[c], &d.cells[c]
+			// agg-8: any shape-statistic difference is an oracle defect (WARN).
+			if c < len(cellItems) && isShapeItem(cellItems[c]) {
+				if shapeKindDiffers(*ac, *dc) {
+					return fmt.Sprintf("grouped row %d differs (agg col %d kind on a shape statistic)", i, c)
+				}
+				if shapeCellDiffers(*ac, *dc) && oracleDiff == "" {
+					oracleDiff = fmt.Sprintf("grouped row %d of %d differs (agg col %d shape statistic vs DuckDB 1.5.6, values withheld)", i, len(got), c)
+				}
+				continue
+			}
 			if ac.isNull != dc.isNull {
 				return fmt.Sprintf("grouped row %d differs (agg col %d null-ness)", i, c)
 			}

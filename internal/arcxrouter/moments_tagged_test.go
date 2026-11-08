@@ -13,7 +13,7 @@ func TestIsAggItemMoments(t *testing.T) {
 			t.Fatalf("isAggItem(%q) = false", item)
 		}
 	}
-	for _, item := range []string{"skewness(v)", "stddev(a, b)", "stddev(m['k'])", "stddev(v) FROM x", "stddev()"} {
+	for _, item := range []string{"skewness(a, b)", "stddev(a, b)", "stddev(m['k'])", "stddev(v) FROM x", "stddev()"} {
 		if isAggItem(item) {
 			t.Fatalf("isAggItem(%q) = true", item)
 		}

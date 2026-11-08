@@ -202,6 +202,26 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: skewness and kurtosis route to the engine
+
+The arcx engine now serves `skewness(x)`, `kurtosis(x)` and `kurtosis_pop(x)` over `BIGINT` and
+`DOUBLE` columns (arcX feat/agg-8-skew-kurt). The recognizer routes them in ungrouped aggregates
+and under a time bucket; grouped by a tag column they stay on DuckDB, as does any `HAVING` that
+references one of them.
+
+Measured through Arc on a synthetic 132-million-row corpus (DuckDB → engine): `skewness`
+155 → 90 ms, `kurtosis` 233 → 90 ms, all three together 555 → 157 ms, an hourly-bucket
+`skewness` + `kurtosis` 555 → 216 ms.
+
+The engine computes these with central moments. DuckDB 1.5.6 uses raw power sums, which lose
+precision when values are large compared with their spread. That covers most telemetry, from a
+12 V rail to a temperature sensor or an epoch-scale counter. In those cases the engine is exact
+where DuckDB's answer drifts or comes back NULL or NaN. On a constant column (a stuck sensor) the
+engine returns NULL; DuckDB 1.5.6 returns a value that depends on the CPU architecture.
+`skewness` of a constant column is NULL rather than DuckDB 1.5.6's NaN, so stuck sensors no longer
+sort above every real value. Shadow mode therefore records any difference on these three functions
+under the `oraclediff` outcome (a WARN), not as a mismatch.
+
 ## arcx router: median, quantiles, mad and mode route to the engine
 
 The arcx engine now serves DuckDB's order statistics (arcX feat/agg-7-order-stats):
@@ -329,13 +349,12 @@ these functions; the engine declines such a query instead, so the router falls
 back and DuckDB raises its own error. The user sees the same outcome either way,
 and shadow mode counts a decline, not an engine error.
 
-Still on DuckDB, deliberately: `skewness`, `kurtosis` and `kurtosis_pop` (the
-DuckDB 1.5.6 implementation uses raw power sums whose result cannot be matched
-within the shadow comparator's tolerance once the mean exceeds roughly ten
-standard deviations; they route once Arc pins DuckDB 2.0, whose implementation
-is stable), the covariance/correlation/regression family, `DISTINCT` and
-expression arguments, and map-subscript arguments. In shadow mode the new
-columns compare within the same 1e-9 tolerance as `sum` and `avg`.
+Over a constant column (a stuck sensor) they return exactly `0`, as DuckDB does — including for
+values with no exact binary form, such as `0.1` repeated.
+
+Still on DuckDB, deliberately: `DISTINCT` and expression arguments, and map-subscript arguments
+(`skewness`/`kurtosis` and the covariance family route since — see their sections). In shadow
+mode the new columns compare within the same 1e-9 tolerance as `sum` and `avg`.
 
 Nothing changes for a deployment without the engine linked in (`arcx_engine`
 build tag) or with `ARC_ROUTER=off`.
