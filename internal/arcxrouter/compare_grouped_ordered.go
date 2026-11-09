@@ -184,6 +184,41 @@ func ordCols(items []string, keyCols []int, keys []OrderKey) ([]ordCol, bool) {
 	return out, true
 }
 
+// compareGroupedKeyOrdered: res-3 — a HAVING over an unstable item (oneSided =
+// Decision.HavingUnstable) with an ORDER BY over GROUP KEYS only and no LIMIT (the
+// recognizer refuses anything else). Unique keys leave no tie to reconcile, so the
+// engine's order is checked on its own rows and the row sets are then merged as in
+// the unordered comparison, where a one-sided group is a WARN.
+func compareGroupedKeyOrdered(rec arrow.Record, oracle []groupedRow, items []string, keyCols []int,
+	keys []OrderKey, oneSided string) string {
+	got, err := groupedFromArcx(rec, keyCols)
+	if err != nil {
+		return skipPrefix + "arcx grouped decode error: " + err.Error()
+	}
+	nCells := len(items) - len(keyCols)
+	for i := range got {
+		if len(got[i].keys) != len(keyCols) || len(got[i].cells) != nCells {
+			return fmt.Sprintf("grouped row %d differs (arcx column arity)", i)
+		}
+	}
+	cols, ok := ordCols(items, keyCols, keys)
+	if !ok {
+		return skipPrefix + "ORDER BY position out of range"
+	}
+	for _, oc := range cols {
+		if !oc.key {
+			return skipPrefix + "unstable HAVING with an aggregate ORDER BY target (recognizer invariant)"
+		}
+	}
+	normalizeNullParts(got)
+	for i := 1; i < len(got); i++ {
+		if c, ok := tupleCmp(cols, &got[i-1], &got[i]); !ok || c > 0 {
+			return fmt.Sprintf("grouped rows %d..%d of %d not in ORDER BY order on arcx (values withheld)", i-1, i, len(got))
+		}
+	}
+	return compareGroupedRows(got, oracle, items, keyCols, oneSided)
+}
+
 // compareGroupedOrdered: both result sets in the order each engine returned.
 //
 //  1. Each side must be monotone under the ORDER BY (DuckDB semantics, exact on

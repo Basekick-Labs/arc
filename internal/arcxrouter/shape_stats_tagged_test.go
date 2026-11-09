@@ -76,15 +76,15 @@ func TestCompareGroupedShapeStats(t *testing.T) {
 		return groupedRow{keys: []keyPart{{s: h}}, cells: []aggCell{c, {isInt: true, i: big.NewInt(n)}}}
 	}
 	oracle := []groupedRow{row("a", aggCell{f: -1.5e8}, 3), row("b", aggCell{f: 0.5}, 4)}
-	if diff := compareGrouped(rec, oracle, items, []int{0}); !strings.HasPrefix(diff, "oraclediff:") {
+	if diff := compareGrouped(rec, oracle, items, []int{0}, ""); !strings.HasPrefix(diff, "oraclediff:") {
 		t.Fatalf("stuck-sensor shape diff must be oraclediff, got %q", diff)
 	}
 	bad := []groupedRow{row("a", aggCell{f: -1.5e8}, 3), row("b", aggCell{f: 0.5}, 5)}
-	if diff := compareGrouped(rec, bad, items, []int{0}); diff == "" || strings.HasPrefix(diff, "oraclediff:") {
+	if diff := compareGrouped(rec, bad, items, []int{0}, ""); diff == "" || strings.HasPrefix(diff, "oraclediff:") {
 		t.Fatalf("a count mismatch beside a shape diff must alarm, got %q", diff)
 	}
 	kind := []groupedRow{row("a", aggCell{isNull: true}, 3), row("b", aggCell{isInt: true, i: big.NewInt(0)}, 4)}
-	if diff := compareGrouped(rec, kind, items, []int{0}); diff == "" || strings.HasPrefix(diff, "oraclediff:") {
+	if diff := compareGrouped(rec, kind, items, []int{0}, ""); diff == "" || strings.HasPrefix(diff, "oraclediff:") {
 		t.Fatalf("a kind difference on a shape cell must alarm, got %q", diff)
 	}
 }

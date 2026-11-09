@@ -64,8 +64,6 @@ func TestOrderStatsDecline(t *testing.T) {
 		"SELECT host, quantile_cont(x, 0.9) FROM t GROUP BY host",
 		// Grouped mode: not routed in v1 (ties decline the whole query).
 		"SELECT date_trunc('hour', time), mode(code) FROM t GROUP BY 1",
-		// HAVING on an order statistic: not routed in v1.
-		"SELECT date_trunc('hour', time), median(x) FROM t GROUP BY 1 HAVING median(x) > 1",
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline: %s (items %v)", sql, m.aggItems)
