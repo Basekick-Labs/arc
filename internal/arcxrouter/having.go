@@ -20,11 +20,20 @@ import (
 //
 //	having     := hAnd (OR hAnd)*
 //	hAnd       := hNot (AND hNot)*
-//	hNot       := NOT hNot | '(' having ')' | hAtom
-//	hAtom      := hRef <cmp> <literal> | <literal> <cmp> hRef | hRef <cmp> hRef
-//	            | hRef IS [NOT] NULL | hRef [NOT] BETWEEN <lit> AND <lit>
-//	            | hRef [NOT] IN (<lit>, …) | hRef <eq op> TRUE|FALSE | hRef
+//	hNot       := NOT hNot | '(' having ')' | hAtom      -- '(' is an operand when the token
+//	                                                       after its ')' says so (havingParenIsOperand)
+//	hAtom      := operand <cmp> operand
+//	            | operand IS [NOT] NULL | operand IS [NOT] DISTINCT FROM (operand | NULL)
+//	            | hRef IS [NOT] TRUE|FALSE | <tag key> [NOT] LIKE '<pattern>'
+//	            | operand [NOT] BETWEEN <lit> AND <lit> | operand [NOT] IN (<lit>, …) | hRef
+//	operand    := term (('+' | '-') term)*      -- res-3c; a signed number after an operand is a binary minus
+//	term       := unary (('*' | '/') unary)*
+//	unary      := '-' unary | '(' operand ')' | <literal> | hRef
 //	hRef       := <aggregate item re-spelled> | <tag key> | <bucket alias> | <aggregate alias>
+//
+// A bare reference against a plain literal or another bare reference keeps the
+// res-3 / res-3b rules (havingLiteral, refsComparable); every other comparison is a
+// derived one and passes derivedOK.
 //
 // An aggregate that is not in the select list is a HIDDEN item (res-3b): parsed
 // with the select list's own item parsers, emitted as item text, computed by the

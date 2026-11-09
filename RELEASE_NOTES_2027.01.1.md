@@ -220,7 +220,7 @@ integers, exact decimals, `/` always a double, and DuckDB's own rounding when it
 reports it, as before.
 
 These forms still run on DuckDB:
-- `%`, `//` and `^`;
+- `%`, `//` and `^`; a negative-zero (`-0e0`) or out-of-range (`1e400`) scientific literal;
 - arithmetic over the tag column, the time bucket, `min`/`max` of the time column, `bool_and` /
   `bool_or` or `regr_count`;
 - two float-accumulated aggregates in one comparison (`sum(x) - sum(y) > 0`), or one of them added
