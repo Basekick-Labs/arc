@@ -3220,6 +3220,13 @@ func main() {
 		// import-only hub takes drives and must not expose a remotely-writable
 		// surface just because it can read a bundle off a mount point.
 		if cfg.EdgeSync.Enabled {
+			// Guarded like every SetAuthAndRBAC call: a nil *auth.RBACManager
+			// assigned into the RBACChecker field would be a typed nil that
+			// passes the handler's nil checks (#1561).
+			var edgeSyncRBAC api.RBACChecker
+			if authManager != nil && rbacManager != nil {
+				edgeSyncRBAC = rbacManager
+			}
 			syncHandler, err := api.NewEdgeSyncHandler(api.EdgeSyncHandlerConfig{
 				Receiver:     receiver,
 				Reconciler:   reconciler,
@@ -3228,6 +3235,7 @@ func main() {
 				HubID:        cfg.EdgeSync.HubID,
 				MaxFileBytes: cfg.EdgeSync.MaxFileBytes,
 				AuthManager:  authManager,
+				RBAC:         edgeSyncRBAC,
 				Logger:       logger.Get("edgesync"),
 				// Pushed files are ingestion: refused on grace days 7-14.
 				WritesStopped: licenseClient.WritesStopped,

@@ -74,6 +74,44 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: edge-sync pushes are decided by RBAC on the spoke's database ([#1561](https://github.com/Basekick-Labs/arc/issues/1561))
+
+The edge-sync hub endpoints (`POST /api/v1/sync/file` and
+`/api/v1/sync/reconcile`) checked only the token's own `write` permission and
+no RBAC grant. A push also needs the spoke's HMAC secret, and a pushed file
+always lands in that spoke's namespace, which queries read as database
+`{spoke_id}` with the spoke's own database as the measurement
+(`FROM "rocket-01".metrics`). So a token in an RBAC team was not limited by
+its team's grants there, unlike on every other ingest endpoint.
+
+Both endpoints now check the token's `write` grant on that pair, after the
+request's signature is verified and before anything is stored:
+
+- **`/file`:** a push the token may not make is refused with 403 and
+  `"reason":"permission_denied"`, and nothing is stored.
+- **`/reconcile`:** a file the token may not write is reported as missing,
+  without looking up whether the hub holds it. The other files in the batch are
+  answered as usual, so a spoke with one ungranted measurement keeps syncing
+  the rest.
+- **Admission:** the endpoints admit a token whose access comes only from RBAC,
+  as the other ingest endpoints do since #1559.
+- **Tokens in no team:** unchanged. Their own `write` permission decides, as
+  before.
+- **Root-level spoke files:** a file at the root of a spoke's storage
+  (`x.parquet`) is in no measurement, so it needs `write` on the whole
+  database `{spoke_id}`. A grant on one measurement is not enough.
+
+**What operators may see.** A spoke whose token is in a team without a
+`write` grant on its namespace now gets 403 on those files. Each 403 counts
+against the file's attempts (five by default), after which the spoke stops
+offering it. Grant the team `write` on database `{spoke_id}` (or the spoke's
+database as the measurement), then requeue the files with
+`POST /api/v1/spoke-sync/ledger/requeue` on the spoke. Giving the spoke a
+token that is in no team also works.
+
+If the hub cannot read the permission store, the endpoints answer 503
+`hub_unavailable`. A spoke treats that like any other hub-side failure.
+
 ## Fix: tokens whose access comes from RBAC can query and ingest ([#1559](https://github.com/Basekick-Labs/arc/issues/1559))
 
 A token with no permissions of its own, given access through an RBAC team
@@ -118,12 +156,9 @@ a token, because it might have been added to a team.
 upgraded yet is checked by that node the old way, so an RBAC-only token can
 see a 403 until every node runs this version.
 
-The edge-sync hub endpoints still require the token's own `write`
-permission (together with the spoke's HMAC secret). They do not check RBAC
-on the spoke's database, so that check is the only token check they have.
-It also means RBAC does not narrow a team-member token there
-([#1561](https://github.com/Basekick-Labs/arc/issues/1561)); give edge-sync
-spokes a token that is in no team.
+The edge-sync hub endpoints moved to RBAC as well; see
+"Fix: edge-sync pushes are decided by RBAC on the spoke's database"
+([#1561](https://github.com/Basekick-Labs/arc/issues/1561)).
 
 ## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
 
