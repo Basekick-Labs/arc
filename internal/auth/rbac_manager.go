@@ -1833,7 +1833,11 @@ func hasCoarseAdmin(info *TokenInfo) bool {
 // RBAC under any configuration: a token had to hold "read" to pass the route
 // middleware, and had to NOT hold it for an RBAC denial to stand. Those are
 // contradictory, so every read and write path was unnarrowable. Both halves
-// are fixed together; see RequireResourcePermission in middleware.go.
+// are fixed together; see RequireResourcePermission in middleware.go for
+// routes that name their database in the path or headers, and
+// RequireAnyResourcePermission for routes whose resources are in the body —
+// query SQL and ingest payloads (#1559: those routes kept the coarse door
+// after the first fix, so an RBAC-only token could not query or ingest).
 
 // checkOSSPermission checks permissions using OSS token model
 func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *PermissionCheckResult {
@@ -1866,55 +1870,95 @@ func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *Permissi
 // Resolution order matches CheckPermission: admin break-glass, then
 // memberships, then coarse permissions.
 func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permission string) bool {
-	if tokenInfo == nil {
-		return false
-	}
-	if hasCoarseAdmin(tokenInfo) {
-		return true
-	}
-	data, err := rm.getTokenRBACData(tokenInfo.ID)
+	ok, err := rm.holdsGrant(tokenInfo, permission, func(pattern string) bool {
+		return matchPattern(pattern, database)
+	})
 	if err != nil {
 		rm.logger.Error().Err(err).
 			Int64("token_id", tokenInfo.ID).
 			Msg("RBAC data load failed; denying listing (fail closed)")
 		return false
 	}
+	return ok
+}
+
+// HasPermissionAnywhere reports whether the token holds any grant permitting
+// `permission` on at least one measurement of at least one database.
+//
+// This is the question a route asks at the door when the resource it serves is
+// named in the request BODY — the tables in a query's SQL, the measurements in
+// an ingest payload — and so is not known to the middleware (#1559). The
+// handler behind such a route must then decide per resource, as the query and
+// ingest handlers do (checkQueryPermissions, CheckWritePermissions). Never use
+// it as the only gate on a route that serves data.
+//
+// Rules are CanAccessAnythingIn's with every database pattern matching: admin
+// break-glass; with memberships, RBAC is authoritative (a role with
+// measurement grants counts only through them); without memberships, the
+// coarse permissions. A grant of one permission never implies another.
+//
+// An error means the token's grants could not be read: the caller must refuse
+// (fail closed), and should say the store is unavailable rather than that
+// the token lacks the permission. Coarse admin is decided before the store is
+// read, so it never errors.
+func (rm *RBACManager) HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) (bool, error) {
+	return rm.holdsGrant(tokenInfo, permission, func(string) bool { return true })
+}
+
+// holdsGrant is CanAccessAnythingIn and HasPermissionAnywhere: whether the
+// token holds a grant permitting `permission` on a measurement of a database
+// whose role pattern dbMatches accepts.
+func (rm *RBACManager) holdsGrant(tokenInfo *TokenInfo, permission string, dbMatches func(pattern string) bool) (bool, error) {
+	if tokenInfo == nil {
+		return false, nil
+	}
+	if hasCoarseAdmin(tokenInfo) {
+		return true, nil
+	}
+	data, err := rm.getTokenRBACData(tokenInfo.ID)
+	if err != nil {
+		return false, err
+	}
 	if len(data.teams) == 0 {
+		// The coarse list names no database, so the database plays no part.
 		return rm.checkOSSPermission(&PermissionCheckRequest{
-			TokenInfo: tokenInfo, Database: database, Measurement: "*", Permission: permission,
-		}).Allowed
+			TokenInfo: tokenInfo, Measurement: "*", Permission: permission,
+		}).Allowed, nil
 	}
 	// Enabled is checked here rather than at the top, matching
 	// checkRBACPermissionCached, which is reached the same way. A disabled
-	// token cannot arrive on a request path at all: VerifyToken is the only
-	// producer of a TokenInfo there and it never returns a disabled one, so
-	// the ordering is not load-bearing. A future caller that constructs a
+	// token cannot arrive on a request path at all: its only producers there
+	// are VerifyToken and, for a request forwarded by a cluster peer,
+	// TokenForForward, and neither returns a disabled or expired one, so the
+	// ordering is not load-bearing. A future caller that constructs a
 	// TokenInfo directly must not rely on that.
 	if !tokenInfo.Enabled {
-		return false
+		return false, nil
 	}
 	for _, team := range data.teams {
 		if !team.Enabled {
 			continue
 		}
 		for _, role := range data.roles[team.ID] {
-			if !matchPattern(role.DatabasePattern, database) {
+			if !dbMatches(role.DatabasePattern) {
 				continue
 			}
+			// A role with measurement grants is restricted to them: its
+			// role-level list no longer grants anything on its own.
 			if measPerms := data.measPerms[role.ID]; len(measPerms) > 0 {
 				for _, mp := range measPerms {
 					if containsPermission(mp.Permissions, permission) {
-						return true
+						return true, nil
 					}
 				}
 				continue
 			}
 			if containsPermission(role.Permissions, permission) {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // checkRBACPermissionCached checks permissions using cached RBAC data (no DB queries)

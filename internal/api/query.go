@@ -47,6 +47,10 @@ type RBACChecker interface {
 	// only question a listing gate should ask. See its doc comment in
 	// internal/auth.
 	CanAccessAnythingIn(tokenInfo *auth.TokenInfo, database, permission string) bool
+	// HasPermissionAnywhere answers "does this caller hold the permission on
+	// anything", the door question for routes whose resources are in the
+	// body (#1559). The handler must still check each resource.
+	HasPermissionAnywhere(tokenInfo *auth.TokenInfo, permission string) (bool, error)
 }
 
 // TableReference represents a database.measurement reference extracted from SQL
@@ -2202,17 +2206,20 @@ func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measur
 // RegisterRoutes registers query endpoints
 func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// User-facing read endpoints get the read-auth + catch-up gate (#392) as
-	// route-level middleware. The read-auth middleware enforces that the token
-	// has read-level permission (not just any valid token). The catch-up gate
-	// is a no-op unless cluster.query_gate_on_catchup is true AND the
-	// coordinator reports peer file replication is still drifting.
+	// route-level middleware. The read-auth middleware admits a token that
+	// holds read on anything (not just any valid token); each handler then
+	// checks every table it reads (checkQueryPermissions and friends). The
+	// catch-up gate is a no-op unless cluster.query_gate_on_catchup is true
+	// AND the coordinator reports peer file replication is still drifting.
 	//
-	// withReadAuth resolves to auth.RequireRead(h.authManager), or a no-op
-	// passthrough when auth is disabled (h.authManager == nil). SetAuthAndRBAC
-	// runs before RegisterRoutes (cmd/arc/main.go), so h.authManager is already
-	// set here — no lazy resolution needed. Same pattern as the ingest handlers'
-	// withWriteAuth (internal/api/auth_middleware.go).
-	readAuth := withReadAuth(h.authManager)
+	// withAnyResourceReadAuth resolves to auth.RequireAnyResourcePermission,
+	// which asks RBAC when it is wired, or a no-op passthrough when auth is
+	// disabled (h.authManager == nil). It replaced withReadAuth, which asked
+	// only the token's coarse permissions and so refused tokens whose read
+	// authority comes from RBAC alone (#1559). SetAuthAndRBAC runs before
+	// RegisterRoutes (cmd/arc/main.go), so both managers are already set here:
+	// the checker is captured now, not looked up per request.
+	readAuth := withAnyResourceReadAuth(h.authManager, h.rbacManager)
 	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Same execution pipeline as /api/v1/query, but the response is
 	// streamed as MessagePack instead of JSON — columnar, typed, and

@@ -27,8 +27,8 @@ type LineProtocolHandler struct {
 	parser *ingest.LineProtocolParser
 	logger zerolog.Logger
 
-	// authManager holds the concrete *auth.AuthManager so route-level
-	// auth.RequireWrite / RequireAdmin can be wired without the
+	// authManager holds the concrete *auth.AuthManager so the route-level
+	// write and admin middleware can be wired without the
 	// silent-miss type-assert pattern. See MsgPackHandler.authManager
 	// for full rationale. nil = OSS no-auth.
 	authManager *auth.AuthManager
@@ -85,12 +85,14 @@ func (h *LineProtocolHandler) checkWritePermissions(c *fiber.Ctx, database strin
 }
 
 // RegisterRoutes registers Line Protocol routes. All write endpoints
-// are gated by auth.RequireWrite when auth is enabled; the /flush
-// endpoint is admin-gated because it forces a global flush across
-// all shards (operationally heavy + spammable). Per CLAUDE.md,
-// mutating endpoints MUST have an explicit auth middleware.
+// are gated by withAnyResourceWriteAuth when auth is enabled: a token
+// holding write on anything, RBAC included (#1559), with every
+// measurement in the payload then checked by checkWritePermissions. The
+// /flush endpoint is admin-gated because it forces a global flush across
+// all shards (operationally heavy + spammable). Per CLAUDE.md, mutating
+// endpoints MUST have an explicit auth middleware.
 func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
-	writeAuth := withWriteAuth(h.authManager)
+	writeAuth := withAnyResourceWriteAuth(h.authManager, h.rbacManager)
 	adminAuth := withAdminAuth(h.authManager)
 
 	// InfluxDB 1.x compatible endpoint

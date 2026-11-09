@@ -166,10 +166,22 @@ func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 
 	if h.authManager != nil {
 		// Write-level, not admin: these endpoints are ingest-shaped (a spoke
-		// pushes data files), and the ingest endpoints gate on RequireWrite.
-		// Requiring admin here would force every spoke to hold a credential
-		// that can also rotate tokens and delete data on the hub. The spoke
-		// presents the token from ARC_EDGE_SYNC_HUB_TOKEN.
+		// pushes data files). Requiring admin here would force every spoke
+		// to hold a credential that can also rotate tokens and delete data on
+		// the hub. The spoke presents the token from ARC_EDGE_SYNC_HUB_TOKEN.
+		//
+		// The coarse RequireWrite, NOT the RBAC-aware door the ingest
+		// endpoints moved to (#1559): these handlers check no RBAC grant on
+		// the database a file lands in (the spoke's namespace, {spoke_id}),
+		// so this middleware is the only token gate, and admitting a token on
+		// an RBAC grant for some other database would let it push into any
+		// spoke namespace whose HMAC secret the caller holds.
+		//
+		// That is not RBAC enforcement either. A token that holds the coarse
+		// "write" bit AND is a team member is not narrowed by its team's
+		// grants here, unlike on every ingest route, where RBAC is
+		// authoritative for team members (#1561). Until these handlers check
+		// the spoke's database, give spokes a token that is in no team.
 		group.Use(auth.RequireWrite(h.authManager))
 	}
 
