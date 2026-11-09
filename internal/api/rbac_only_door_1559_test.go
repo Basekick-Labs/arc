@@ -39,6 +39,9 @@ import (
 type doorRig struct {
 	app    *fiber.App
 	tokens map[string]string
+	am     *auth.AuthManager
+	qh     *QueryHandler
+	dbs    *DatabasesHandler
 }
 
 // doorDenied is the door's refusal body; a handler's RBAC refusal reads
@@ -61,8 +64,9 @@ func newDoorRig(t *testing.T) *doorRig {
 		FlushWorkers: 1, FlushQueueSize: 4, ShardCount: 1, DataPageVersion: "2.0",
 	}, backend, logger)
 	t.Cleanup(func() { buffer.Close() })
-	for _, db := range []string{"tenanta", "tenantb"} {
-		if err := buffer.WriteTypedColumnarDirect(ctx, db, "cpu", &ingest.TypedColumnBatch{
+	for _, dm := range [][2]string{{"tenanta", "cpu"}, {"tenanta", "mem"}, {"tenantb", "cpu"}} {
+		db, meas := dm[0], dm[1]
+		if err := buffer.WriteTypedColumnarDirect(ctx, db, meas, &ingest.TypedColumnBatch{
 			Data: map[string]interface{}{
 				"time":  []int64{time.Now().UTC().UnixMicro()},
 				"value": []int64{1},
@@ -162,7 +166,10 @@ func newDoorRig(t *testing.T) *doorRig {
 	tle := NewTLEHandler(buffer, logger)
 	tle.SetAuthAndRBAC(am, rm)
 	tle.RegisterRoutes(app)
-	return &doorRig{app: app, tokens: tokens}
+	dbs := NewDatabasesHandler(backend, &config.DeleteConfig{}, am, logger)
+	dbs.SetRBACManager(rm)
+	dbs.RegisterRoutes(app)
+	return &doorRig{app: app, tokens: tokens, am: am, qh: qh, dbs: dbs}
 }
 
 func (r *doorRig) do(t *testing.T, token string, req *http.Request) (int, string) {

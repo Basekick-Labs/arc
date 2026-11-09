@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http/httptest"
 	"net/url"
@@ -179,12 +180,18 @@ func TestDatabasesListing_RequiresReadPermission(t *testing.T) {
 	})
 }
 
-// With RBAC on, the listing endpoints must apply the same bar their query-path
-// twins do: `*` for list-everything (SHOW DATABASES), the named database for
-// the scoped routes (SHOW TABLES FROM db).
+// With RBAC on, the listing endpoints apply the same rules their query-path
+// twins do: list-everything shows the databases the caller can read something
+// in (SHOW DATABASES, #1562), the scoped routes check the named database
+// (SHOW TABLES FROM db).
 func TestDatabasesListing_RBACScoping(t *testing.T) {
 	h, app, am, cleanup := authedDatabasesRig(t)
 	defer cleanup()
+	for _, p := range []string{"db1/cpu/2026/01/01/00/a.parquet", "db1/mem/2026/01/01/00/a.parquet", "db2/secrets/2026/01/01/00/a.parquet"} {
+		if err := h.storage.Write(context.Background(), p, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// Granted db1 only; "*" is denied (mockRBACChecker denies the wildcard
 	// unless allowAll).
@@ -206,8 +213,21 @@ func TestDatabasesListing_RBACScoping(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	if code := get("/api/v1/databases"); code != fiber.StatusForbidden {
-		t.Errorf("listing every database needs a grant covering every database (the SHOW DATABASES bar), got %d", code)
+	// Listing every database: only db1, counted by what the caller can read.
+	req := httptest.NewRequest("GET", "/api/v1/databases", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list DatabaseListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK || list.Count != 1 || len(list.Databases) != 1 ||
+		list.Databases[0].Name != "db1" || list.Databases[0].MeasurementCount != 2 {
+		t.Errorf("listing every database: status %d, %+v; want 200 with db1 (2 measurements) only", resp.StatusCode, list)
 	}
 	if code := get("/api/v1/databases/db2"); code != fiber.StatusForbidden {
 		t.Errorf("a database the caller has no grant for must be 403, got %d", code)
@@ -349,8 +369,10 @@ func TestDatabasesListing_RBACOnlyTokenIsScopedNotRefused(t *testing.T) {
 	if code := get("/api/v1/databases/db2"); code != fiber.StatusForbidden {
 		t.Errorf("an ungranted database must be 403 for an RBAC-only token, got %d", code)
 	}
-	if code := get("/api/v1/databases"); code != fiber.StatusForbidden {
-		t.Errorf("listing every database needs a grant covering every database, got %d", code)
+	// Listing every database is no longer refused (#1562): the RBAC-only
+	// token sees what it can read, and nothing it cannot.
+	if code := get("/api/v1/databases"); code != fiber.StatusOK {
+		t.Errorf("listing every database: an RBAC-only token with a grant must get its databases, got %d", code)
 	}
 }
 

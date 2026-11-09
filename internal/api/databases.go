@@ -118,15 +118,6 @@ func (h *DatabasesHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSche
 // nil` true for a typed nil and defeat the guards below.
 func (h *DatabasesHandler) SetRBACManager(rm RBACChecker) { h.rbacManager = rm }
 
-// checkDatabasePermission gates a listing on the caller's read grant for a
-// database, mirroring QueryHandler.checkMeasurementPermission — which is what
-// the equivalent query-path endpoints use (`SHOW DATABASES`, `SHOW TABLES
-// FROM db`, GET /api/v1/measurements). database may be "*" for the
-// list-everything endpoint, matching the `SHOW DATABASES` gate.
-//
-// Returns nil when RBAC is disabled or no token is present: the route
-// middleware has already decided whether an unauthenticated request is
-// allowed, exactly as the query path does.
 // filterReadableMeasurements returns only the measurements the caller may
 // read, preserving order.
 //
@@ -188,38 +179,6 @@ func (h *DatabasesHandler) checkDatabasePermissionScoped(c *fiber.Ctx, database,
 		Int64("token_id", tokenInfo.ID).
 		Msg("RBAC denied listing")
 	return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
-}
-
-func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, measurement, permission string) error {
-	// Gated on the checker being WIRED, not on the license. Enforcement must
-	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
-	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
-	// three cases (admin break-glass, memberships -> RBAC authoritative, no
-	// memberships -> coarse permissions), so a deployment without RBAC
-	// configured is unaffected.
-	if h.rbacManager == nil {
-		return nil
-	}
-	tokenInfo := auth.GetTokenInfo(c)
-	if tokenInfo == nil {
-		return nil
-	}
-	result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
-		TokenInfo:   tokenInfo,
-		Database:    database,
-		Measurement: measurement,
-		Permission:  permission,
-	})
-	if !result.Allowed {
-		h.logger.Warn().
-			Str("database", database).
-			Str("permission", permission).
-			Str("reason", result.Reason).
-			Int64("token_id", tokenInfo.ID).
-			Msg("RBAC permission denied")
-		return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
-	}
-	return nil
 }
 
 // CreateDatabaseRequest represents a request to create a new database
@@ -327,8 +286,13 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 	// the middleware asks "does this token have read authority at all, coarse
 	// or granted", the handler asks "for THIS database, or for all of them".
 	readAuth := withResourceReadAuth(h.authManager, h.rbacManager)
+	// The list-everything route names no database, so the per-database door
+	// above would ask about database "" and refuse every tenant token. It
+	// asks "may this token read anything" instead, and handleList shows the
+	// databases the token can read (#1562).
+	listAuth := withAnyResourceReadAuth(h.authManager, h.rbacManager)
 
-	app.Get("/api/v1/databases", readAuth, h.handleList)
+	app.Get("/api/v1/databases", listAuth, h.handleList)
 	app.Get("/api/v1/databases/:name", readAuth, h.handleGet)
 	app.Get("/api/v1/databases/:name/measurements", readAuth, h.handleListMeasurements)
 	app.Post("/api/v1/databases", adminAuth, h.handleCreate)
@@ -337,22 +301,28 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 
 // handleList handles GET /api/v1/databases
 func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
-	// Listing every database asks for a grant covering every database, the
-	// same bar `SHOW DATABASES` applies (handleShowDatabases in query.go).
-	//
-	// A caller without a grant covering every database is refused here and
-	// must name its database via GET /api/v1/databases/<name>, which asks the
-	// weaker "may you enumerate inside it" question and filters the names it
-	// returns. Same bar `SHOW DATABASES` applies.
-	if err := h.checkDatabasePermission(c, "*", "*", "read"); err != nil {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	// A caller with a grant covering every database sees them all; any
+	// other sees the databases it can read something in, each counted by the
+	// measurements it can read, as GET /api/v1/databases/:name counts them
+	// (#1562). Same rule as SHOW DATABASES (databaseListingFilter).
+	visible, unavailable := databaseListingFilter(c, h.rbacManager)
+	if unavailable {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Permission store unavailable; retry later",
+		})
+	}
+	var count func(db string, names []string) int
+	if visible != nil {
+		count = func(db string, names []string) int {
+			return len(h.filterReadableMeasurements(c, db, names))
+		}
 	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
 
 	// Optimized: Single storage call to get all databases with measurement counts
-	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx)
+	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx, visible, count)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -1156,7 +1126,11 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 // using minimal storage calls instead of N+1 calls.
 // Strategy: Get list of databases first (1 call), then get all files (1 call) to count measurements.
 // Also checks tiering metadata for databases that may only have data in cold storage.
-func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Context) ([]DatabaseInfo, error) {
+//
+// visible, when non-nil, drops the databases the caller may not see before
+// anything else is asked of storage about them (#1562); count, when non-nil,
+// replaces len(measurements) for each database shown.
+func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Context, visible func(string) bool, count func(db string, names []string) int) ([]DatabaseInfo, error) {
 	// First, get list of all databases from hot tier (includes empty databases with just .arc-database marker)
 	databases, err := h.listDatabases(ctx)
 	if err != nil {
@@ -1191,6 +1165,14 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 					}
 					hasContent[db] = true
 				}
+			}
+		}
+	}
+
+	if visible != nil {
+		for db := range dbMeasurements {
+			if !visible(db) {
+				delete(dbMeasurements, db)
 			}
 		}
 	}
@@ -1285,9 +1267,17 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 
 	result := make([]DatabaseInfo, 0, len(sortedDatabases))
 	for _, db := range sortedDatabases {
+		n := len(dbMeasurements[db])
+		if count != nil {
+			names := make([]string, 0, n)
+			for m := range dbMeasurements[db] {
+				names = append(names, m)
+			}
+			n = count(db, names)
+		}
 		result = append(result, DatabaseInfo{
 			Name:             db,
-			MeasurementCount: len(dbMeasurements[db]),
+			MeasurementCount: n,
 		})
 	}
 

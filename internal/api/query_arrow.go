@@ -458,14 +458,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// /api/v1/query. normalizeSQLForShow masks literals before stripping
 	// comments so a comment marker inside a quoted db name can't truncate it.
 	showNormalised := normalizeSQLForShow(req.SQL)
+	// No permission check left to make: the route door required read
+	// somewhere, and /api/v1/query shows each caller only the databases it
+	// may see (#1562).
 	if showDatabasesPattern.MatchString(showNormalised) {
-		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
-			m.IncQueryErrors()
-			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-				"success": false,
-				"error":   "access denied: no read permission to list databases",
-			})
-		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
 			"error":   "SHOW DATABASES is not supported on the Arrow endpoint; use /api/v1/query instead",
