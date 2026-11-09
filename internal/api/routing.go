@@ -27,6 +27,7 @@ var hopByHopHeaders = map[string]bool{
 	"Proxy-Authenticate":  true,
 	"Proxy-Authorization": true,
 	"Te":                  true,
+	"Trailer":             true,
 	"Trailers":            true,
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
@@ -259,12 +260,28 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 	// Set status code
 	c.Status(resp.StatusCode)
 
-	// Copy headers (excluding hop-by-hop headers)
-	for key, values := range resp.Header {
+	// Copy headers (excluding hop-by-hop headers). The upstream's values
+	// replace any this node already set, as c.Set did: the forwarding node's
+	// own middleware (CORS, security headers) runs before this, and the
+	// upstream node ran the same middleware, so appending would send
+	// Access-Control-Allow-Origin twice and browsers reject that. Every
+	// upstream value of a repeated header is kept, in order (#1556): c.Set
+	// kept only the last.
+	//
+	// Two passes: fasthttp deletes a header by moving the last one into its
+	// slot, so a Del between Adds could reorder values already added.
+	h := &c.Context().Response.Header
+	for key := range resp.Header {
 		if !isHopByHop(key) {
-			for _, v := range values {
-				c.Set(key, v)
-			}
+			h.Del(key)
+		}
+	}
+	for key, values := range resp.Header {
+		if isHopByHop(key) {
+			continue
+		}
+		for _, v := range values {
+			h.Add(key, v)
 		}
 	}
 
