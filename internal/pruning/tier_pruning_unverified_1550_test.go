@@ -3,6 +3,7 @@ package pruning
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -36,7 +37,7 @@ func TestPruneTierPathsDetail_AllListingsFailedAreUnverified(t *testing.T) {
 		errPrefixes:   map[string]bool{"db/cpu/2024/03/15/": true},
 	}
 	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu",
-		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false)
+		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false, true)
 
 	if d.Outcome != TierPrunePruned {
 		t.Fatalf("outcome = %v, want TierPrunePruned (fail-open is unchanged)", d.Outcome)
@@ -60,7 +61,7 @@ func TestPruneTierPathsDetail_ConfirmedPathIsNeverUnverified(t *testing.T) {
 		listErr: map[string]bool{"db/cpu/2024/03/15/": true},
 	}
 	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu",
-		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false)
+		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false, true)
 
 	hour := "s3://bucket/db/cpu/2024/03/15/14/*.parquet"
 	day := "s3://bucket/db/cpu/2024/03/15/*.parquet"
@@ -82,7 +83,7 @@ func TestPruneTierPathsDetail_StopsListingAfterAFailure(t *testing.T) {
 		storeMissing:  true,
 	}
 	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu",
-		tierRange(t, "2024-03-10T00:00:00Z", "2024-03-15T23:00:00Z"), backend, false)
+		tierRange(t, "2024-03-10T00:00:00Z", "2024-03-15T23:00:00Z"), backend, false, true)
 
 	if len(backend.requested) != 1 {
 		t.Fatalf("issued %d listings %v over six days, want 1", len(backend.requested), backend.requested)
@@ -102,7 +103,7 @@ func TestPruneTierPathsDetail_OpenEndFailureStopsTheFilter(t *testing.T) {
 	}
 	tr := tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z")
 	tr.EndAssumed = true
-	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false)
+	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false, true)
 
 	if len(backend.requested) != 1 {
 		t.Fatalf("issued %d listings %v, want only open-end discovery's one", len(backend.requested), backend.requested)
@@ -119,7 +120,7 @@ func TestPruneTierPathsDetail_NonListerIsNotUnverified(t *testing.T) {
 	p := NewPartitionPruner(zerolog.Nop())
 	var backend storage.Backend = struct{ storage.Backend }{&mockS3Backend{}}
 	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu",
-		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false)
+		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false, true)
 
 	if len(d.Paths) == 0 {
 		t.Fatalf("outcome %v with no paths", d.Outcome)
@@ -140,7 +141,7 @@ func TestPruneTierPathsDetail_HealthyListingMatchesPruneTierPaths(t *testing.T) 
 		files: map[string][]string{},
 	}
 	tr := tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z")
-	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false)
+	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false, true)
 	paths, outcome := p.PruneTierPaths(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false)
 
 	if len(d.Unverified) != 0 {
@@ -166,4 +167,52 @@ func sameSet(a, b []string) bool {
 		seen[s]--
 	}
 	return true
+}
+
+// The day-level object listing can be the first to fail: the next day's is
+// then not issued either.
+func TestPruneTierPathsDetail_StopsAfterADayLevelFailure(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	backend := &listErrMock{
+		tierMock: &tierMock{
+			mockS3Backend: &mockS3Backend{existingDirs: map[string][]string{}},
+			files:         map[string][]string{},
+		},
+		listErr: map[string]bool{"db/cpu/2024/03/14/": true},
+	}
+	p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu",
+		tierRange(t, "2024-03-14T22:00:00Z", "2024-03-15T01:00:00Z"), backend, false, true)
+
+	n := 0
+	for _, r := range backend.requested {
+		if r == "db/cpu/2024/03/15/" {
+			n++
+		}
+	}
+	// One for the hour listing of the 15th, none for its day-level listing.
+	if n != 1 {
+		t.Fatalf("db/cpu/2024/03/15/ listed %d times (%v), want only the hour listing", n, backend.requested)
+	}
+}
+
+// Without stopAfterFailure (every caller but the query path's cold tier),
+// one failed listing leaves the others to run, as before #1550.
+func TestPruneTierPathsDetail_KeepsListingWithoutStop(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	backend := &tierMock{
+		mockS3Backend: &mockS3Backend{existingDirs: map[string][]string{}},
+		files:         map[string][]string{},
+		errPrefixes:   map[string]bool{"db/cpu/2024/03/10/": true},
+	}
+	d := p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu",
+		tierRange(t, "2024-03-10T00:00:00Z", "2024-03-12T23:00:00Z"), backend, false, false)
+
+	if len(backend.requested) < 3 {
+		t.Fatalf("issued %d listings %v, want every day listed", len(backend.requested), backend.requested)
+	}
+	for _, path := range d.Unverified {
+		if !strings.Contains(path, "/2024/03/10/") {
+			t.Fatalf("unverified %v includes a day whose own listing answered", d.Unverified)
+		}
+	}
 }

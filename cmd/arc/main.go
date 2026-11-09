@@ -4800,7 +4800,11 @@ func main() {
 					Manifest:      tieringManifest,
 					// The same database ApplyPendingRestoresWith marks (#1550).
 					ColdMetadataMarkerPath: tiering.ColdMetadataMarkerPath(tieringDBPath),
-					Logger:                 logger.Get("tiering"),
+					// From config, not from clusterCoordinator: a cluster node
+					// whose coordinator failed to start, or whose licence lacks
+					// clustering, still shares storage with nodes that do (#1550).
+					ClusteredDeployment: cfg.Cluster.Enabled || cfg.Cluster.SharedStorageMode,
+					Logger:              logger.Get("tiering"),
 				})
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to create tiering manager - feature disabled")

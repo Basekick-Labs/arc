@@ -201,10 +201,19 @@ type ManagerConfig struct {
 	Manifest ManifestCoordinator
 
 	// ColdMetadataMarkerPath is where this node records that its cold tier
-	// rows may be missing files the cold store holds (after a metadata
-	// restore, or a restore that could not record cold rows); "" keeps the
-	// state in memory only. See cold_authority.go (#1550).
+	// rows may be missing files the cold store holds (a metadata restore, a
+	// restore writing to cold, a sync that could not record every object);
+	// "" keeps that in memory only. See cold_authority.go (#1550).
 	ColdMetadataMarkerPath string
+
+	// ClusteredDeployment is set when the node is configured as part of a
+	// cluster (cluster.enabled or cluster.shared_storage_mode), whether or
+	// not a coordinator is running: other nodes may then write the cold store
+	// this node reads, so its cold rows are never treated as a complete
+	// record of it (#1550). Manifest alone is not that signal: it is nil
+	// whenever the coordinator is, including a cluster node whose
+	// coordinator failed to start or whose licence lacks clustering.
+	ClusteredDeployment bool
 
 	// Logger
 	Logger zerolog.Logger
@@ -260,13 +269,7 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		logger:        logger,
 	}
 
-	if err := m.coldAuth.load(cfg.ColdMetadataMarkerPath); err != nil {
-		logger.Error().Err(err).Msg("Could not read the incomplete-cold-rows marker; treating cold tier rows as incomplete")
-	}
-	if unverified, reason := m.coldAuth.state(); unverified {
-		logger.Warn().Str("reason", reason).
-			Msg("Cold tier rows may be missing cold files until a cold-tier metadata sync records every cold object; while the cold tier cannot be listed, reads that touch it fail rather than answer from these rows")
-	}
+	m.initColdAuthority(cfg)
 
 	// Started here rather than in Start so the cluster layer can report pulls
 	// and unlinks from the moment the manager exists, and so a manager whose
@@ -1206,7 +1209,7 @@ const coldTierMetadataBatchSize = 1000
 func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// Read before the listing: a marking after this point may concern objects
 	// the listing snapshot does not hold (#1550).
-	authGen := m.coldAuth.generation()
+	authGen := m.coldAuth.gen.Load()
 	// notRecorded counts listed objects this sync left without a row: a row
 	// write that failed, or a hot-only object whose hot copy could not be
 	// checked. Either keeps cold rows marked incomplete.

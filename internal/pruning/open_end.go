@@ -228,9 +228,8 @@ func (p *PartitionPruner) remoteDirLister(basePath string) dirLister {
 
 // tierDirLister lists directories of a tier's backend, keys relative to the
 // tier root, through the tier pruner's cached listings. A failed listing is
-// recorded on listing, and once one has failed the lister does not list
-// again (#1550): every later call would wait out the same timeout against
-// the same store.
+// recorded on listing; when the call asked to stop after a failure, the
+// lister does not list again (#1550).
 func (p *PartitionPruner) tierDirLister(backend storage.Backend, rootURL string, listing *tierListing) dirLister {
 	return func(ctx context.Context, rel string) ([]string, error) {
 		lister, ok := backend.(storage.DirectoryLister)
@@ -241,7 +240,7 @@ func (p *PartitionPruner) tierDirLister(backend storage.Backend, rootURL string,
 		if cached, ok := p.globCache.get(cacheKey); ok {
 			return cached, nil
 		}
-		if listing.failed {
+		if listing.skip() {
 			return nil, errTierListingFailed
 		}
 		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

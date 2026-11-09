@@ -211,14 +211,40 @@ func TestHotEmptyRangeWithColdLeftOutReadsHotUnpruned(t *testing.T) {
 	}
 }
 
-// Only the unverified paths leave: a cold partition a listing confirmed stays
-// in the read whatever the metadata says.
-func TestWithoutPathsKeepsTheRest(t *testing.T) {
-	got := withoutPaths([]string{"a", "b", "c", "d"}, []string{"b", "d", "x"})
-	if strings.Join(got, ",") != "a,c" {
-		t.Fatalf("withoutPaths = %v, want [a c]", got)
+// A cold path a listing confirmed is evidence the metadata is incomplete: the
+// tier is only left out when every kept path rests on a failed listing.
+func TestAllColdPathsUnlisted(t *testing.T) {
+	cases := []struct {
+		d    pruning.TierPruneDetail
+		want bool
+	}{
+		{pruning.TierPruneDetail{Paths: []string{"a", "b"}, Unverified: []string{"a", "b"}}, true},
+		{pruning.TierPruneDetail{Paths: []string{"a", "b"}, Unverified: []string{"b"}}, false},
+		{pruning.TierPruneDetail{Paths: []string{"a"}}, false},
+		{pruning.TierPruneDetail{}, false},
 	}
-	if got := withoutPaths([]string{"a"}, nil); len(got) != 1 {
-		t.Fatalf("withoutPaths with nothing to drop = %v", got)
+	for i, tc := range cases {
+		if got := allColdPathsUnlisted(tc.d); got != tc.want {
+			t.Errorf("case %d: allColdPathsUnlisted(%+v) = %v, want %v", i, tc.d, got, tc.want)
+		}
+	}
+}
+
+// A multi-day range against an unreachable cold tier pays one listing
+// timeout, not one per day: the cold tier's prune stops after its first
+// failed listing (#1550).
+func TestMultiDayReadPaysOneColdListingTimeout(t *testing.T) {
+	t.Parallel()
+	sql := "SELECT count(*) FROM sch.m WHERE time >= '2025-12-28T00:00:00Z' AND time < '2026-01-01T11:00:00Z'"
+	e := unlistedEnv(t)
+	started := time.Now()
+	from, _ := unlistedRead(t, e, &unlistedColdGuard{authoritative: true}, sql)
+	elapsed := time.Since(started)
+	if strings.Contains(from, "s3://") {
+		t.Fatalf("read %s kept the unlistable cold tier", from)
+	}
+	// Five covered days at 5 s each would be 25 s; one timeout is ~5 s.
+	if elapsed > 12*time.Second {
+		t.Fatalf("building the read took %v; the cold tier was listed once per day", elapsed)
 	}
 }

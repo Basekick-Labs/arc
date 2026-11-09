@@ -14,6 +14,12 @@ import (
 // #1550: whether this node's cold tier rows may vouch for an empty cold
 // range when the cold tier cannot be listed.
 
+// tiering.Manager is the backup package's cold restore guard.
+var _ interface {
+	BeginColdRestore()
+	EndColdRestore()
+} = (*Manager)(nil)
+
 func markerIn(t *testing.T) string {
 	t.Helper()
 	return ColdMetadataMarkerPath(filepath.Join(t.TempDir(), "arc.db"))
@@ -27,21 +33,78 @@ func coldObjects(paths ...string) []storage.ObjectInfo {
 	return out
 }
 
-func TestColdMetadataAuthority_Standalone(t *testing.T) {
-	m, _, _, cleanup := setupIntegrationTest(t, true)
-	defer cleanup()
-	if ok, reason := m.ColdMetadataAuthority(); !ok {
-		t.Fatalf("standalone node without a marker: authoritative = false (%s)", reason)
+// authManager is an integration manager whose trust state was loaded from
+// cfg, as NewManager does.
+func authManager(t *testing.T, cfg ManagerConfig) (*Manager, *mockBackend, *mockBackend) {
+	t.Helper()
+	m, hot, cold, cleanup := setupIntegrationTest(t, true)
+	t.Cleanup(cleanup)
+	m.initColdAuthority(&cfg)
+	return m, hot, cold
+}
+
+// completeSync runs a cold sync over objects that records every one.
+func completeSync(t *testing.T, m *Manager, cold *mockBackend, paths ...string) {
+	t.Helper()
+	if len(paths) == 0 {
+		paths = []string{"db1/cpu/2024/03/15/cpu_a_daily.parquet"}
+	}
+	m.coldBackend = &listedColdObjects{mockBackend: cold, objects: coldObjects(paths...)}
+	if _, err := m.syncColdTierMetadata(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
 	}
 }
 
-func TestColdMetadataAuthority_ClusterNodeNever(t *testing.T) {
-	m, hot, _, cleanup := setupIntegrationTest(t, true)
-	defer cleanup()
-	m.manifest = &fakeManifest{hot: hot, entries: map[string]int64{}}
+// A database no complete sync has filled is not trusted: a fresh, lost or
+// moved arc.db over a cold bucket that already holds data.
+func TestColdRowsUntrustedUntilACompleteSync(t *testing.T) {
+	m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: markerIn(t)})
+	ok, reason := m.ColdMetadataAuthority()
+	if ok || reason != coldAuthorityReasonNoSync {
+		t.Fatalf("fresh database: authoritative = %v (%q), want false, no complete sync", ok, reason)
+	}
+	completeSync(t, m, cold)
+	if ok, reason := m.ColdMetadataAuthority(); !ok {
+		t.Fatalf("after a complete sync: authoritative = false (%q)", reason)
+	}
+}
+
+// The flag is in the database: a manager started later on the same database
+// reads it (the NewManager → ManagerConfig path).
+func TestCompleteSyncSurvivesARestart(t *testing.T) {
+	m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: markerIn(t)})
+	completeSync(t, m, cold)
+
+	var again coldAuthority
+	if err := again.load(context.Background(), m.metadata, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if !again.complete.Load() {
+		t.Fatal("a restarted manager did not read the complete-sync flag from the database")
+	}
+}
+
+// A clustered deployment is never trusted, with or without a coordinator
+// (and so a manifest): the cluster.enabled node whose coordinator failed to
+// start or whose licence lacks clustering.
+func TestClusteredDeploymentNeverTrusted(t *testing.T) {
+	m, _, cold := authManager(t, ManagerConfig{ClusteredDeployment: true})
+	completeSync(t, m, cold)
+	if m.manifest != nil {
+		t.Fatal("test setup: expected no manifest")
+	}
 	ok, reason := m.ColdMetadataAuthority()
 	if ok || !strings.Contains(reason, "cluster") {
-		t.Fatalf("cluster node: authoritative = %v (%q), want false naming the cluster", ok, reason)
+		t.Fatalf("clustered deployment without a coordinator: authoritative = %v (%q)", ok, reason)
+	}
+}
+
+func TestClusterManifestNeverTrusted(t *testing.T) {
+	m, hot, cold := authManager(t, ManagerConfig{})
+	completeSync(t, m, cold)
+	m.manifest = &fakeManifest{hot: hot, entries: map[string]int64{}}
+	if m.ColdMetadataAuthoritative() {
+		t.Fatal("a node with a cluster manifest was trusted")
 	}
 }
 
@@ -50,158 +113,133 @@ func TestColdMetadataAuthority_NilManager(t *testing.T) {
 	if m.ColdMetadataAuthoritative() {
 		t.Fatal("nil manager reported authoritative")
 	}
+	m.BeginColdRestore()
+	m.EndColdRestore()
 }
 
-// A marker written before the manager starts (main.go writes it when a staged
-// metadata restore is applied) makes the rows non-authoritative, and a
-// complete cold sync clears it from disk and memory.
-func TestColdMetadataMarkerClearedByACompleteSync(t *testing.T) {
-	m, _, cold, cleanup := setupIntegrationTest(t, true)
-	defer cleanup()
+// The boot marker (a staged metadata restore) overrides the restored
+// database's flag; a complete sync removes it.
+func TestRestoreMarkerOverridesTheRestoredFlag(t *testing.T) {
 	marker := markerIn(t)
+	m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: marker})
+	completeSync(t, m, cold) // the backup's database had the flag
+
 	if err := MarkColdMetadataUnverified(strings.TrimSuffix(marker, ColdMetadataUnverifiedSuffix), ColdMetadataReasonRestored); err != nil {
 		t.Fatal(err)
 	}
 	if info, err := os.Stat(marker); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("marker stat = %v, %v; want a 0600 file", info, err)
 	}
-	if err := m.coldAuth.load(marker); err != nil {
-		t.Fatal(err)
-	}
+	m.initColdAuthority(&ManagerConfig{ColdMetadataMarkerPath: marker}) // the boot after the swap
 	ok, reason := m.ColdMetadataAuthority()
 	if ok || !strings.Contains(reason, ColdMetadataReasonRestored) {
 		t.Fatalf("after a restore marker: authoritative = %v (%q)", ok, reason)
 	}
 
-	m.coldBackend = &listedColdObjects{mockBackend: cold, objects: coldObjects("db1/cpu/2024/03/15/cpu_a_daily.parquet")}
-	if _, err := m.syncColdTierMetadata(context.Background()); err != nil {
-		t.Fatalf("sync: %v", err)
-	}
+	completeSync(t, m, cold)
 	if !m.ColdMetadataAuthoritative() {
-		t.Fatal("a complete cold sync did not make the rows authoritative again")
+		t.Fatal("a complete sync did not clear the restore marker")
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("marker still on disk after a complete sync: %v", err)
 	}
 }
 
-// A sync that returns nil but could not record a listed object is not
-// complete: the marker stays.
-func TestColdMetadataMarkerKeptWhenARowCannotBeRecorded(t *testing.T) {
-	m, _, cold, cleanup := setupIntegrationTest(t, true)
-	defer cleanup()
+// A sync that returns nil but could not record a listed object proves rows
+// are missing: it marks them, and only a later complete sync clears that.
+func TestUnrecordedObjectMarksTheRows(t *testing.T) {
 	marker := markerIn(t)
-	if err := m.coldAuth.load(marker); err != nil {
-		t.Fatal(err)
-	}
-	m.markColdMetadataUnverified(ColdMetadataReasonRestored)
+	m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: marker})
+	completeSync(t, m, cold)
 
-	bad := "db1/cpu/2024/03/15/cpu_bad_daily.parquet"
+	bad := "db1/cpu/2024/03/16/cpu_bad_daily.parquet"
 	if _, err := m.metadata.db.Exec(`CREATE TRIGGER fail_one_cold_row BEFORE INSERT ON tier_files WHEN NEW.path = '` + bad + `' BEGIN SELECT RAISE(ABORT, 'forced row failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	m.coldBackend = &listedColdObjects{mockBackend: cold, objects: coldObjects("db1/cpu/2024/03/15/cpu_ok_daily.parquet", bad)}
-	if _, err := m.syncColdTierMetadata(context.Background()); err != nil {
-		t.Fatalf("sync returned %v; a per-row failure is logged, not returned", err)
-	}
+	completeSync(t, m, cold, "db1/cpu/2024/03/16/cpu_ok_daily.parquet", bad)
 	if m.ColdMetadataAuthoritative() {
-		t.Fatal("a sync that left a listed object without a row cleared the marker")
+		t.Fatal("a sync that left a listed object without a row kept the rows trusted")
 	}
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("marker gone after an incomplete sync: %v", err)
+		t.Fatalf("no marker after an incomplete sync: %v", err)
+	}
+	if complete, _ := m.metadata.coldRowsComplete(context.Background()); complete {
+		t.Fatal("the complete-sync flag survived an incomplete sync")
 	}
 }
 
 // A hot-only database's cold object whose hot copy could not be checked is
-// skipped by the sync; that leaves it without a row, so the marker stays.
-func TestColdMetadataMarkerKeptWhenAHotOnlyObjectIsSkipped(t *testing.T) {
-	m, hot, cold, cleanup := setupIntegrationTest(t, true)
-	defer cleanup()
+// skipped by the sync without a row: the rows are marked.
+func TestSkippedHotOnlyObjectMarksTheRows(t *testing.T) {
+	m, hot, cold := authManager(t, ManagerConfig{})
+	completeSync(t, m, cold)
 	ctx := context.Background()
-	m.markColdMetadataUnverified(ColdMetadataReasonRestored)
 	if err := m.policies.Set(ctx, &DatabasePolicy{Database: "db1", HotOnly: true}); err != nil {
 		t.Fatal(err)
 	}
 	m.hotBackend = &hotOnlyExistsErrorBackend{mockBackend: hot}
-	m.coldBackend = &listedColdObjects{mockBackend: cold, objects: coldObjects("db1/cpu/2024/03/15/cpu_a_daily.parquet")}
-	if _, err := m.syncColdTierMetadata(ctx); err != nil {
-		t.Fatalf("sync: %v", err)
-	}
+	completeSync(t, m, cold, "db1/cpu/2024/03/17/cpu_a_daily.parquet")
 	if m.ColdMetadataAuthoritative() {
-		t.Fatal("a sync that skipped an object it could not check cleared the marker")
+		t.Fatal("a sync that skipped an object it could not check kept the rows trusted")
 	}
 }
 
-// A marking that lands while a sync runs concerns objects the sync's listing
-// may not hold: that sync must not clear it.
-func TestColdMetadataMarkingDuringASyncSurvivesIt(t *testing.T) {
-	var a coldAuthority
-	if err := a.load(markerIn(t)); err != nil {
+// A marking that lands while a sync runs concerns objects its listing may
+// not hold: that sync must not clear it.
+func TestMarkingDuringASyncSurvivesIt(t *testing.T) {
+	m, _, cold := authManager(t, ManagerConfig{})
+	completeSync(t, m, cold)
+	ctx := context.Background()
+	start := m.coldAuth.gen.Load()
+	if err := m.coldAuth.mark(ctx, m.metadata, coldAuthorityReasonRestore); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.mark(ColdMetadataReasonRestored); err != nil {
-		t.Fatal(err)
-	}
-	start := a.generation()
-	if err := a.mark(coldAuthorityReasonRecord); err != nil {
-		t.Fatal(err)
-	}
-	if cleared, err := a.clear(start); cleared || err != nil {
+	if cleared, err := m.coldAuth.clear(ctx, m.metadata, start); cleared || err != nil {
 		t.Fatalf("clear after a mid-sync marking = %v, %v; want kept", cleared, err)
 	}
-	if cleared, err := a.clear(a.generation()); !cleared || err != nil {
+	if cleared, err := m.coldAuth.clear(ctx, m.metadata, m.coldAuth.gen.Load()); !cleared || err != nil {
 		t.Fatalf("clear by a later sync = %v, %v; want cleared", cleared, err)
 	}
 }
 
-// The marker persists: a manager started after a marking reads it.
-func TestColdMetadataMarkerSurvivesARestart(t *testing.T) {
+// A restore that may write to cold marks the rows before it starts, and no
+// sync clears that until it ends: a crash mid-restore leaves it marked.
+func TestColdRestoreWindowBlocksClearing(t *testing.T) {
 	marker := markerIn(t)
-	var first coldAuthority
-	if err := first.load(marker); err != nil {
-		t.Fatal(err)
-	}
-	if err := first.mark(coldAuthorityReasonRecord); err != nil {
-		t.Fatal(err)
-	}
-	var second coldAuthority
-	if err := second.load(marker); err != nil {
-		t.Fatal(err)
-	}
-	if unverified, reason := second.state(); !unverified || reason != coldAuthorityReasonRecord {
-		t.Fatalf("after restart: unverified = %v, reason %q", unverified, reason)
-	}
-}
+	m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: marker})
+	completeSync(t, m, cold)
 
-// A restore that could not record some of its cold rows marks the rows
-// incomplete, on disk.
-func TestRestoredColdFilesWithoutRowsMarkTheRows(t *testing.T) {
-	m, _, _, cleanup := setupIntegrationTest(t, true)
-	defer cleanup()
-	marker := markerIn(t)
-	if err := m.coldAuth.load(marker); err != nil {
-		t.Fatal(err)
-	}
-	_, failed, err := m.RecordRestoredColdFiles(context.Background(), map[string]int64{"not-a-partition-path.parquet": 10})
-	if err != nil || len(failed) != 1 {
-		t.Fatalf("RecordRestoredColdFiles = failed %v, err %v; want the unparseable path failed", failed, err)
-	}
+	m.BeginColdRestore()
 	if m.ColdMetadataAuthoritative() {
-		t.Fatal("cold rows still authoritative after a restore could not record one")
+		t.Fatal("rows trusted while a restore into cold runs")
 	}
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("marker not written: %v", err)
+		t.Fatalf("no marker on disk at restore start: %v", err)
+	}
+	completeSync(t, m, cold) // a sync during the restore
+	if m.ColdMetadataAuthoritative() {
+		t.Fatal("a sync during the restore cleared the marking")
+	}
+
+	m.EndColdRestore()
+	completeSync(t, m, cold)
+	if !m.ColdMetadataAuthoritative() {
+		t.Fatal("a complete sync after the restore did not clear the marking")
 	}
 }
 
-// A restore that recorded every row leaves the rows authoritative.
-func TestRestoredColdFilesAllRecordedKeepAuthority(t *testing.T) {
-	m, _, _, cleanup := setupIntegrationTest(t, true)
-	defer cleanup()
-	if _, failed, err := m.RecordRestoredColdFiles(context.Background(), map[string]int64{"db1/cpu/2024/03/15/cpu_a_daily.parquet": 10}); err != nil || len(failed) != 0 {
-		t.Fatalf("RecordRestoredColdFiles: failed %v, err %v", failed, err)
+// A marker that could not be written still leaves the rows untrusted after a
+// restart, because the database flag is forgotten too.
+func TestMarkForgetsTheFlagEvenWithoutAMarkerFile(t *testing.T) {
+	m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: filepath.Join(t.TempDir(), "missing-dir", "arc.db"+ColdMetadataUnverifiedSuffix)})
+	completeSync(t, m, cold)
+	m.markColdMetadataUnverified(coldAuthorityReasonRestore)
+
+	var again coldAuthority
+	if err := again.load(context.Background(), m.metadata, "", false); err != nil {
+		t.Fatal(err)
 	}
-	if !m.ColdMetadataAuthoritative() {
-		t.Fatal("a fully recorded restore marked the rows incomplete")
+	if again.complete.Load() {
+		t.Fatal("after a marking whose file could not be written, a restart trusts the rows")
 	}
 }

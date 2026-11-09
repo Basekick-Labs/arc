@@ -4586,19 +4586,13 @@ func combineTierPruneResults(results []tierPruneResult) ([]string, int) {
 	return paths, prunedTiers
 }
 
-// withoutPaths is paths minus drop, in paths' order.
-func withoutPaths(paths, drop []string) []string {
-	skip := make(map[string]struct{}, len(drop))
-	for _, p := range drop {
-		skip[p] = struct{}{}
-	}
-	out := make([]string, 0, len(paths))
-	for _, p := range paths {
-		if _, ok := skip[p]; !ok {
-			out = append(out, p)
-		}
-	}
-	return out
+// allColdPathsUnlisted reports whether every cold path the pruner kept rests
+// only on a failed listing. A path a listing confirmed (or a cached listing
+// did) is evidence of cold data in the range; if tier metadata says there is
+// none, the metadata is the incomplete one, and the read keeps everything
+// rather than trust it (#1550).
+func allColdPathsUnlisted(d pruning.TierPruneDetail) bool {
+	return len(d.Paths) > 0 && len(d.Unverified) == len(d.Paths)
 }
 
 // buildMultiTierReadParquet builds a read_parquet expression that queries tiers with actual data.
@@ -4698,24 +4692,20 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			resultSources = append(resultSources, src)
 			continue
 		}
-		d := h.pruner.PruneTierPathsDetail(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
-		if src.tier == tiering.TierCold && len(d.Unverified) > 0 && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
-			// The cold tier could not be listed for these partitions, and
-			// this node's tier metadata, a complete record of the cold store,
-			// holds no cold row in the range: they cannot hold data, and
-			// reading them would fail the whole query on the same outage
-			// (#1550). Partitions a listing confirmed stay.
-			kept := withoutPaths(d.Paths, d.Unverified)
-			h.noteColdUnlistedSkipped(database, measurement, len(d.Paths)-len(kept))
+		isCold := src.tier == tiering.TierCold
+		d := h.pruner.PruneTierPathsDetail(ctx, src.glob, database, measurement, timeRange, src.backend, !isCold, isCold)
+		if isCold && allColdPathsUnlisted(d) && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
+			// The cold tier could not be listed for any of these partitions,
+			// and this node's tier metadata, a complete record of the cold
+			// store, holds no cold row in the range: they cannot hold data,
+			// and reading them would fail the whole query on the same outage
+			// (#1550). Dropped as a source, not reported Empty:
+			// combineTierPruneResults keeps an Empty tier's full glob unless
+			// another tier pruned, and that glob is the read this avoids.
+			h.noteColdUnlistedSkipped(database, measurement, len(d.Paths))
 			skippedUnlisted = true
-			if len(kept) == 0 {
-				// Not an Empty result: combineTierPruneResults keeps an
-				// Empty tier's full glob unless another tier pruned, and
-				// that glob is the read this exists to avoid.
-				droppedUnlisted++
-				continue
-			}
-			d.Paths = kept
+			droppedUnlisted++
+			continue
 		}
 		results = append(results, tierPruneResult{glob: src.glob, paths: d.Paths, outcome: d.Outcome})
 		resultSources = append(resultSources, src)

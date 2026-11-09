@@ -3,30 +3,54 @@ package tiering
 // Whether this node's cold tier rows can stand in for a listing of the cold
 // store (#1550).
 //
-// When the cold tier cannot be listed, the query path may drop the cold
+// When the cold tier cannot be listed, the query path may leave out the cold
 // partitions of a read whose range has no cold rows, so a hot-only query
-// keeps working through a cold-tier outage. That is only safe where the rows
-// are a complete record of what the cold store holds for the range:
+// keeps working through a cold-tier outage. That is only safe while the rows
+// are a complete record of what the cold store holds. The rows are trusted
+// only when all of these hold:
 //
-//   - Not on a cluster node. A node learns of other nodes' cold files through
-//     replication events and the cold-tier metadata sync, and several of those
-//     paths record nothing while the cold store is unreachable (#1552).
-//   - Not after a metadata restore. restore_metadata replaces tier_files with
-//     the backup's snapshot (internal/backup/restore.go), so every file
-//     migrated since the backup is in the cold store with no row.
-//   - Not after a data restore that could not record some of its cold rows.
+//   - The node is not part of a cluster deployment (cluster.enabled or
+//     cluster.shared_storage_mode, whether or not a coordinator is running),
+//     and has no cluster manifest. A clustered node learns of other nodes'
+//     cold files through replication events and the cold sync, and several of
+//     those record nothing while the cold store is unreachable (#1552).
+//   - A cold-tier metadata sync that recorded a row for every listed cold
+//     object has finished against THIS database: the tier_state flag
+//     (metadata.go). A fresh, lost or moved database has no flag, so its rows
+//     are not trusted before a sync has filled them.
+//   - No marker file says rows may be missing since then. The marker, beside
+//     the SQLite database, is written:
+//   - at boot, before a staged metadata restore replaces the database
+//     (main.go): the restored rows predate every file migrated since the
+//     backup, and the restored database carries the backup's flag;
+//   - when a restore that may write cold objects starts (BeginColdRestore),
+//     before its first cold write, so a crash mid-restore leaves it set;
+//   - when a cold sync lists objects it cannot record.
+//     It is a file, not a row, because a metadata restore replaces the database
+//     and with it any row that could say so.
 //
-// The last two are persisted as a marker file next to the SQLite database,
-// so a restart before the cold store is reachable again does not forget
-// them. Only a cold-tier metadata sync that recorded a row for every object
-// it listed clears the marker.
+// Only a complete cold sync that started after the last marking, with no
+// restore in progress, sets the flag and removes the marker.
+//
+// A cold sync that fails, or stops early, does not mark anything on a
+// standalone node: nothing else writes cold objects there without a row. The
+// migrator records a file's cold row before it releases the hot copy
+// (migrator.go), and a restore is covered by BeginColdRestore.
+//
+// Readers (every tiered read asks) only load atomics. writeMu serializes the
+// writers — mark, clear, restore begin/end — across their file and SQLite
+// I/O, so a marking can never land between a clear's generation check and
+// its state change; no reader ever takes it.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // ColdMetadataUnverifiedSuffix names the marker file, next to the SQLite
@@ -44,8 +68,8 @@ func ColdMetadataMarkerPath(dbPath string) string {
 }
 
 // MarkColdMetadataUnverified writes the marker for the database at dbPath.
-// Used at boot when a staged metadata restore replaced that database, before
-// the tiering manager opens it.
+// main.go calls it at boot, before a staged metadata restore replaces that
+// database, so no crash between the swap and the marking can lose it.
 func MarkColdMetadataUnverified(dbPath, reason string) error {
 	path := ColdMetadataMarkerPath(dbPath)
 	if path == "" {
@@ -63,99 +87,136 @@ func writeColdMarker(path, reason string) error {
 
 // Reasons reported by ColdMetadataAuthority.
 const (
-	coldAuthorityReasonCluster = "cluster node: cold rows arrive from other nodes and can lag the cold store"
+	// ColdMetadataReasonRestored is the boot marker's reason.
 	ColdMetadataReasonRestored = "tier metadata was restored from a backup"
-	coldAuthorityReasonRecord  = "a restore could not record some of its cold rows"
+
+	coldAuthorityReasonCluster    = "cluster deployment: cold rows arrive from other nodes and can lag the cold store"
+	coldAuthorityReasonNoSync     = "no cold-tier metadata sync has recorded every cold object against this database yet"
+	coldAuthorityReasonRestore    = "a restore wrote to the cold tier"
+	coldAuthorityReasonUnrecorded = "a cold-tier metadata sync could not record every cold object"
+	coldAuthorityReasonUnreadable = "the incomplete-cold-rows marker could not be read"
 )
 
-// coldAuthority is the persisted "rows may be missing" state of one manager.
+// coldAuthority is one manager's trust state.
 type coldAuthority struct {
-	mu         sync.Mutex
+	writeMu    sync.Mutex
 	markerPath string
-	unverified bool
-	reason     string
-	// gen counts markings. A sync clears the marker only when no marking
-	// happened while it ran: rows a concurrent restore failed to record were
-	// not in the sync's listing snapshot.
-	gen uint64
+	clustered  bool
+
+	complete atomic.Bool // tier_state flag, mirrored
+	marked   atomic.Bool // marker file present, mirrored
+	reason   atomic.Value
+	// gen counts markings and restore starts. A sync clears only when it is
+	// unchanged since the sync began: what changed may not be in its listing.
+	gen atomic.Uint64
+	// restoring counts restores in progress; no sync clears while one runs.
+	restoring atomic.Int32
 }
 
-// load reads the marker, if any.
-func (a *coldAuthority) load(markerPath string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+func (a *coldAuthority) setReason(r string) { a.reason.Store(r) }
+
+func (a *coldAuthority) reasonText() string {
+	r, _ := a.reason.Load().(string)
+	return r
+}
+
+// load reads the marker file and the tier_state flag at startup.
+func (a *coldAuthority) load(ctx context.Context, store *MetadataStore, markerPath string, clustered bool) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
 	a.markerPath = markerPath
-	if markerPath == "" {
-		return nil
+	a.clustered = clustered
+
+	var errs []error
+	if store != nil {
+		complete, err := store.coldRowsComplete(ctx)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		a.complete.Store(complete)
 	}
-	b, err := os.ReadFile(markerPath)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return nil
-	case err != nil:
-		// Unreadable is not absent: treat it as set.
-		a.unverified = true
-		a.reason = ColdMetadataReasonRestored
-		return fmt.Errorf("read %s: %w", markerPath, err)
+	if markerPath != "" {
+		b, err := os.ReadFile(markerPath)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			// Unreadable is not absent.
+			a.marked.Store(true)
+			a.setReason(coldAuthorityReasonUnreadable)
+			errs = append(errs, fmt.Errorf("read %s: %w", markerPath, err))
+		default:
+			a.marked.Store(true)
+			reason := strings.TrimSpace(string(b))
+			if reason == "" {
+				reason = ColdMetadataReasonRestored
+			}
+			a.setReason(reason)
+		}
 	}
-	a.unverified = true
-	a.reason = strings.TrimSpace(string(b))
-	if a.reason == "" {
-		a.reason = ColdMetadataReasonRestored
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// generation is the marking count, read at the start of a cold sync.
-func (a *coldAuthority) generation() uint64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.gen
-}
-
-// state is the current marking.
-func (a *coldAuthority) state() (unverified bool, reason string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.unverified, a.reason
-}
-
-// mark records that rows may be missing, in memory always and on disk when
-// there is a marker path. A failed write is returned; the in-memory state is
-// set regardless, so this process stays conservative.
-func (a *coldAuthority) mark(reason string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.gen++
-	a.unverified = true
-	a.reason = reason
-	if a.markerPath == "" {
-		return nil
+// mark records that rows may be missing: the marker file, and the tier_state
+// flag forgotten, so a marker that could not be written still leaves the rows
+// untrusted after a restart. Failures are returned; the in-memory state is
+// set first regardless.
+func (a *coldAuthority) mark(ctx context.Context, store *MetadataStore, reason string) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	a.gen.Add(1)
+	a.marked.Store(true)
+	a.setReason(reason)
+	var errs []error
+	if a.markerPath != "" {
+		if err := writeColdMarker(a.markerPath, reason); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return writeColdMarker(a.markerPath, reason)
+	if store != nil {
+		if err := store.setColdRowsComplete(ctx, false); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	a.complete.Store(false)
+	return errors.Join(errs...)
 }
 
-// clear removes the marking after a complete cold sync that started at
-// generation startGen. It reports whether the state was cleared; a marking
-// that happened during the sync, or a marker file that cannot be removed,
-// keeps it.
-func (a *coldAuthority) clear(startGen uint64) (bool, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if !a.unverified {
+// clear records a complete cold sync that began at generation startGen. It
+// reports whether the rows became trusted; a marking or a restore since the
+// sync began, or a write that fails, leaves them as they were.
+func (a *coldAuthority) clear(ctx context.Context, store *MetadataStore, startGen uint64) (bool, error) {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	if a.gen.Load() != startGen || a.restoring.Load() > 0 {
 		return false, nil
 	}
-	if a.gen != startGen {
-		return false, nil
+	if store != nil {
+		if err := store.setColdRowsComplete(ctx, true); err != nil {
+			return false, err
+		}
 	}
+	a.complete.Store(true)
 	if a.markerPath != "" {
 		if err := os.Remove(a.markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return false, fmt.Errorf("remove %s: %w", a.markerPath, err)
 		}
 	}
-	a.unverified = false
-	a.reason = ""
+	a.marked.Store(false)
+	a.setReason("")
 	return true, nil
+}
+
+// initColdAuthority loads the trust state from cfg at construction.
+func (m *Manager) initColdAuthority(cfg *ManagerConfig) {
+	ctx, cancel := context.WithTimeout(context.Background(), coldAuthTimeout)
+	defer cancel()
+	if err := m.coldAuth.load(ctx, m.metadata, cfg.ColdMetadataMarkerPath, cfg.ClusteredDeployment); err != nil {
+		m.logger.Error().Err(err).Msg("Could not read whether cold tier rows are complete; treating them as incomplete")
+	}
+	if m.coldAuth.marked.Load() {
+		m.logger.Warn().Str("reason", m.coldAuth.reasonText()).
+			Msg("Cold tier rows may be missing cold files until a cold-tier metadata sync records every cold object; until then a read the cold tier cannot list fails rather than answer from these rows")
+	}
 }
 
 // ColdMetadataAuthority reports whether this node's cold tier rows are a
@@ -166,11 +227,14 @@ func (m *Manager) ColdMetadataAuthority() (authoritative bool, reason string) {
 	if m == nil {
 		return false, "tiering is not running"
 	}
-	if m.manifest != nil {
+	if m.coldAuth.clustered || m.manifest != nil {
 		return false, coldAuthorityReasonCluster
 	}
-	if unverified, why := m.coldAuth.state(); unverified {
-		return false, why + "; cleared by the next cold-tier metadata sync that records every cold object"
+	if m.coldAuth.marked.Load() {
+		return false, m.coldAuth.reasonText() + "; cleared by the next cold-tier metadata sync that records every cold object"
+	}
+	if !m.coldAuth.complete.Load() {
+		return false, coldAuthorityReasonNoSync
 	}
 	return true, ""
 }
@@ -181,32 +245,60 @@ func (m *Manager) ColdMetadataAuthoritative() bool {
 	return ok
 }
 
-// markColdMetadataUnverified records that cold rows may be missing and logs
-// a marker that could not be persisted.
+// coldAuthTimeout bounds the SQLite write a marking or a clear makes.
+const coldAuthTimeout = 10 * time.Second
+
+// markColdMetadataUnverified records that cold rows may be missing.
 func (m *Manager) markColdMetadataUnverified(reason string) {
-	if err := m.coldAuth.mark(reason); err != nil {
-		m.logger.Error().Err(err).
-			Msg("Could not persist that cold tier rows may be incomplete; this process still treats them as incomplete, a restart before the next complete cold sync will not")
+	ctx, cancel := context.WithTimeout(context.Background(), coldAuthTimeout)
+	defer cancel()
+	if err := m.coldAuth.mark(ctx, m.metadata, reason); err != nil {
+		m.logger.Error().Err(err).Str("reason", reason).
+			Msg("Could not fully persist that cold tier rows may be incomplete; this process treats them as incomplete regardless")
 	}
 }
 
+// BeginColdRestore is called by a restore before it may write to the cold
+// tier. It marks the rows incomplete, persistently, and keeps any cold sync
+// from clearing that until EndColdRestore: objects the restore writes after a
+// sync has listed would otherwise lose their only record if the restore then
+// died before recording their rows. Nil-receiver safe.
+func (m *Manager) BeginColdRestore() {
+	if m == nil {
+		return
+	}
+	m.coldAuth.restoring.Add(1)
+	m.markColdMetadataUnverified(coldAuthorityReasonRestore)
+}
+
+// EndColdRestore ends a BeginColdRestore. The next complete cold sync then
+// records the restored objects and clears the marking.
+func (m *Manager) EndColdRestore() {
+	if m == nil {
+		return
+	}
+	m.coldAuth.restoring.Add(-1)
+}
+
 // coldSyncCompleted is called by a cold-tier metadata sync that listed the
-// whole cold store and returned no error. incomplete counts the objects it
+// whole cold store and returned no error. notRecorded counts the objects it
 // listed but could not record.
-func (m *Manager) coldSyncCompleted(startGen uint64, incomplete int) {
-	if incomplete > 0 {
-		if unverified, _ := m.coldAuth.state(); unverified {
-			m.logger.Warn().Int("objects_not_recorded", incomplete).
-				Msg("Cold tier metadata sync could not record every cold object; cold tier rows stay marked incomplete")
-		}
+func (m *Manager) coldSyncCompleted(startGen uint64, notRecorded int) {
+	if notRecorded > 0 {
+		m.logger.Warn().Int("objects_not_recorded", notRecorded).
+			Msg("Cold tier metadata sync could not record every cold object; cold tier rows are marked incomplete until a sync records them all")
+		m.markColdMetadataUnverified(coldAuthorityReasonUnrecorded)
 		return
 	}
-	cleared, err := m.coldAuth.clear(startGen)
+	wasTrusted := m.ColdMetadataAuthoritative()
+	ctx, cancel := context.WithTimeout(context.Background(), coldAuthTimeout)
+	defer cancel()
+	cleared, err := m.coldAuth.clear(ctx, m.metadata, startGen)
 	if err != nil {
-		m.logger.Error().Err(err).Msg("Could not remove the incomplete-cold-rows marker after a complete cold sync; cold tier rows stay marked incomplete")
+		m.logger.Error().Err(err).Msg("Could not record a complete cold sync; cold tier rows stay marked incomplete")
 		return
 	}
-	if cleared {
-		m.logger.Info().Msg("Cold tier metadata sync recorded every cold object; cold tier rows are complete again")
+	if cleared && !wasTrusted && m.ColdMetadataAuthoritative() {
+		m.logger.Info().Msg("Cold tier metadata sync recorded every cold object; cold tier rows are a complete record again")
 	}
 }

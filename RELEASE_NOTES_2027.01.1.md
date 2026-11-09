@@ -85,35 +85,47 @@ took down recent-data dashboards along with archive queries.
 
 On a standalone node, Arc now uses its tier metadata when the cold tier cannot
 be listed. If no cold file is recorded for the query's time range, the read
-leaves out the cold partitions it could not check and answers from hot data.
-If cold files are recorded for the range, the query fails as before: the
-answer would be incomplete. The same applies when the metadata lookup fails,
-or when the query has no time range and the measurement has cold data.
+leaves the cold tier out and answers from hot data. The query fails as before
+in every other case:
+- cold files are recorded for the range, so the answer would be incomplete;
+- the metadata lookup fails;
+- the query has no time range and the measurement has cold data;
+- a listing that did answer found cold data the metadata does not record.
 
 Arc only uses this shortcut while its tier metadata is a complete record of
 the cold tier:
-- **Never on a cluster node.** Cluster nodes keep the previous behaviour,
-  because their cold-tier records can lag the cold store while it is
-  unreachable ([#1552](https://github.com/Basekick-Labs/arc/issues/1552)).
-- **Not after a metadata restore.** Applying a staged `restore_metadata`
-  writes a marker, `<arc.db>.cold-metadata-unverified`, next to the database.
-  Files migrated after the backup have no record until the cold tier is
-  listed again.
-- **Not after a restore that could not record some of its cold files.** The
-  same marker is written.
+- **Never on a node configured for a cluster.** This covers
+  `cluster.enabled` and `cluster.shared_storage_mode`, including a node whose
+  cluster coordinator did not start. Cluster nodes keep the previous
+  behaviour ([#1552](https://github.com/Basekick-Labs/arc/issues/1552)).
+- **Only after a complete cold-tier metadata sync on this version.** The sync
+  must record every cold object against the node's current database. A new,
+  lost or moved database starts without that record.
+- **Not after a metadata restore,** until the next complete sync. The
+  restored rows predate files migrated since the backup.
+- **Not while a data restore into the cold tier is running,** nor after one
+  that stopped part way, until the next complete sync.
+- **Not after a sync that could not record some cold objects,** until a later
+  complete sync.
 
-The marker is removed by the next cold-tier metadata sync that records every
-cold object, and it survives restarts until then. `GET
-/api/v1/tiering/status` reports the state as `cold_metadata.authoritative`,
-with the reason when it is false.
+`GET /api/v1/tiering/status` reports the state as
+`cold_metadata.authoritative`, with the reason when it is false.
+
+**Upgrading:** the shortcut is available only after the first complete
+cold-tier metadata sync on this version. That sync runs with the startup tier
+scan. A node whose cold tier is already unreachable when it starts on this
+version keeps the previous behaviour until the cold tier is reachable again.
 
 Other changes:
-- **One timeout per query.** Once a cold-tier listing fails, the query stops
-  listing the cold tier. An unreachable endpoint now costs one listing
-  timeout (5 s) per query, not one per day in the range.
-- **Visibility.** Each read that leaves cold partitions out this way
-  increments `arc_query_cold_unlisted_skipped_total`. Arc also logs a warning
-  at most once a minute per measurement.
+- **Fewer timeouts during an outage.** Once a cold-tier listing fails, Arc
+  stops listing the cold tier for the rest of that read. An unreachable cold
+  endpoint now costs one listing timeout (5 s) per tiered measurement in each
+  query, instead of one per day in the range. Arc does not remember the
+  failure between queries, so each query pays it again. Hot-tier listings are
+  unchanged.
+- **Visibility.** Each read that leaves the cold tier out this way increments
+  `arc_query_cold_unlisted_skipped_total`. Arc also logs a warning at most
+  once a minute per measurement.
 - **Not cached.** These reads are not cached, so the cold tier is read again
   as soon as it can be listed.
 
