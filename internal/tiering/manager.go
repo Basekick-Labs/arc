@@ -118,6 +118,13 @@ type Manager struct {
 	// holds (#1550). See cold_authority.go.
 	coldAuth coldAuthority
 
+	// coldMissing is the last check of cold rows whose object is gone;
+	// coldRemovals/coldRemovalGen track cold DELETE and retention runs that
+	// check must not overlap (#1551). See cold_missing.go.
+	coldMissing    atomic.Pointer[ColdMissingObjectsStatus]
+	coldRemovals   atomic.Int32
+	coldRemovalGen atomic.Uint64
+
 	// tierEvent* carry the registration reports the cluster layer makes for
 	// files this node did not write itself — pulled from a peer, or unlinked
 	// because another node migrated them. One drainer applies them so a
@@ -998,6 +1005,7 @@ func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	if m.config.Cold.Enabled {
 		ok, reason := m.ColdMetadataAuthority()
 		status.ColdMetadata = &ColdMetadataStatus{Authoritative: ok, Reason: reason}
+		status.ColdMissingObjects = m.ColdMissingObjects()
 	}
 
 	quarantined, err := m.metadata.CountQuarantinedFiles(ctx)
@@ -1480,6 +1488,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 			Strs("sample", sample).
 			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read)")
 	}
+	m.checkMissingColdObjects(ctx, unseen)
 
 	// Debug: the cycle summary already reports cold_synced.
 	m.logger.Debug().

@@ -117,6 +117,9 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 	if c == nil || c.backend == nil {
 		return 0, 0, nil
 	}
+	if !dryRun {
+		defer beginColdRemoval(h.coldTier)()
+	}
 	var rows int64
 	var deleted, retire []string
 	for _, f := range c.files[measurement] {
