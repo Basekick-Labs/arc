@@ -2358,14 +2358,17 @@ localProcessing:
 	// the SHOW RBAC gate would have denied. SECURITY: RBAC bypass.
 	showNormalised := normalizeSQLForShow(req.SQL)
 
-	// Handle SHOW DATABASES command
+	// Handle SHOW DATABASES command. A caller with a grant covering every
+	// database sees them all; any other sees the databases it can read
+	// something in (#1562). The route door has already required read
+	// somewhere.
 	if showDatabasesPattern.MatchString(showNormalised) {
-		// Check RBAC - user needs at least some read permission to see databases
-		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
+		visible, unavailable := databaseListingFilter(c, h.rbacManager)
+		if unavailable {
 			m.IncQueryErrors()
-			return respondError(c, fiber.StatusForbidden, "access denied: no read permission to list databases", timestamp, start)
+			return respondError(c, fiber.StatusServiceUnavailable, "permission store unavailable; retry later", timestamp, start)
 		}
-		return h.handleShowDatabases(c, start)
+		return h.handleShowDatabases(c, start, visible)
 	}
 
 	// Handle SHOW TABLES/MEASUREMENTS command
@@ -2395,7 +2398,8 @@ localProcessing:
 		// it (Measurement: "*"). Asking "*" denies every token whose role carries
 		// measurement-level grants — the canonical tenant shape, and the whole
 		// reason rbac_measurement_permissions exists — because matchPattern("cpu",
-		// "*") is false. Listing EVERYTHING still requires ("*","*").
+		// "*") is false. Listing every database shows only those the caller
+		// can read something in (databaseListingFilter, #1562).
 		if err := h.checkListingPermission(c, database); err != nil {
 			m.IncQueryErrors()
 			return respondError(c, fiber.StatusForbidden, fmt.Sprintf("access denied: no read permission for database '%s'", database), timestamp, start)
@@ -5205,8 +5209,11 @@ func (h *QueryHandler) convertValue(v interface{}) interface{} {
 	}
 }
 
-// handleShowDatabases handles SHOW DATABASES command by scanning storage
-func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error {
+// handleShowDatabases handles SHOW DATABASES command by scanning storage.
+// visible, when non-nil, keeps only the databases the caller may see
+// (databaseListingFilter); it is applied before any per-database storage or
+// metadata lookup, so a hidden database costs the caller nothing observable.
+func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visible func(string) bool) error {
 	h.logger.Debug().Msg("Handling SHOW DATABASES")
 
 	// Include tier column if tiering is enabled. The types slice is
@@ -5251,6 +5258,7 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	if storage.IsStoreNotFound(err) {
 		databases, err = nil, nil
 	}
+	databases = keepVisible(databases, visible)
 	if err == nil && fromDirectories {
 		databases = h.dropEmptyDatabaseDirectories(ctx, databases)
 	}
@@ -5273,7 +5281,7 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 				for _, db := range databases {
 					dbSet[db] = true
 				}
-				for _, db := range coldDatabases {
+				for _, db := range keepVisible(coldDatabases, visible) {
 					dbSet[db] = true
 				}
 				// Convert back to slice
@@ -5635,15 +5643,10 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	// the comment and execute the SHOW).
 	normalised := normalizeSQLForShow(req.SQL)
 
+	// SHOW DATABASES is answered only by /api/v1/query, which shows each
+	// caller the databases it may see (#1562); the route door has already
+	// required read somewhere, so there is nothing left to refuse here.
 	if showDatabasesPattern.MatchString(normalised) {
-		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
-			metrics.Get().IncQueryErrors()
-			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
-				Success:      false,
-				Error:        "access denied: no read permission to list databases",
-				WarningLevel: "error",
-			})
-		}
 		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
 			Success:      false,
 			Error:        "SHOW DATABASES is not supported on the estimate endpoint; use /api/v1/query instead",
@@ -5678,7 +5681,8 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		// it (Measurement: "*"). Asking "*" denies every token whose role carries
 		// measurement-level grants — the canonical tenant shape, and the whole
 		// reason rbac_measurement_permissions exists — because matchPattern("cpu",
-		// "*") is false. Listing EVERYTHING still requires ("*","*").
+		// "*") is false. Listing every database shows only those the caller
+		// can read something in (databaseListingFilter, #1562).
 		if err := h.checkListingPermission(c, database); err != nil {
 			metrics.Get().IncQueryErrors()
 			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
@@ -5923,11 +5927,25 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	// SHOW TABLES gate above). Unscoped: a grant covering everything.
 	// Scoped to one database: the listing question. Unscoped: a grant
 	// covering everything, the same bar SHOW DATABASES applies.
+	//
+	// Unscoped, the databases are those the caller may see
+	// (databaseListingFilter, #1562): all of them with a grant covering
+	// everything, otherwise the ones it can read something in. The per-pair
+	// filter below then keeps the measurements it can read.
 	var permErr error
+	var visible func(string) bool
 	if dbFilter != "" {
 		permErr = h.checkListingPermission(c, dbFilter)
 	} else {
-		permErr = h.checkMeasurementPermission(c, "*", "*", "read")
+		var unavailable bool
+		visible, unavailable = databaseListingFilter(c, h.rbacManager)
+		if unavailable {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   "permission store unavailable; retry later",
+			})
+		}
 	}
 	if err := permErr; err != nil {
 		metrics.Get().IncQueryErrors()
@@ -5975,6 +5993,12 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 
 		// Apply database filter if specified
 		if dbFilter != "" && dbName != dbFilter {
+			continue
+		}
+		// Not the correctness guard (the per-pair filter below hides every
+		// measurement of a database the caller cannot read): it keeps this
+		// listing from walking those databases at all.
+		if visible != nil && !visible(dbName) {
 			continue
 		}
 

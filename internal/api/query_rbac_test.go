@@ -266,7 +266,7 @@ func TestEstimateQuery_RBAC_NoToken(t *testing.T) {
 // listMeasurements RBAC tests
 // =============================================================================
 
-func TestListMeasurements_RBAC_Denied(t *testing.T) {
+func TestListMeasurements_RBAC_NoGrantListsNothing(t *testing.T) {
 	rbac := &mockRBACChecker{
 		enabled:      true,
 		allowAll:     false,
@@ -281,9 +281,12 @@ func TestListMeasurements_RBAC_Denied(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if resp.StatusCode != fiber.StatusForbidden {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 403 Forbidden, got %d: %s", resp.StatusCode, string(bodyBytes))
+	// A caller without a grant covering everything sees only the databases
+	// it can read something in (#1562); this one can read nothing, so the
+	// listing is empty rather than refused.
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != fiber.StatusOK || !strings.Contains(string(bodyBytes), `"count":0`) {
+		t.Fatalf("expected 200 with no measurements, got %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 }
 
@@ -808,44 +811,11 @@ GROUP BY a.host, b.region`
 // its fix removed, the request escapes the gate and the test fails.
 // =============================================================================
 
-// TestExecuteQuery_ShowDatabases_CommentBypassDenied verifies a SHOW command
-// hidden behind a comment cannot bypass the RBAC gate. The gate matches against
-// comment-stripped SQL (normalizeSQLForShow); without that, the raw match fails,
-// checkQueryPermissions finds zero table refs and allows it, and DuckDB strips
-// the comment and executes the SHOW — leaking the database list. The token here
-// lacks *.*:read, so every form must be denied (403).
-func TestExecuteQuery_ShowDatabases_CommentBypassDenied(t *testing.T) {
-	rbac := &mockRBACChecker{
-		enabled:      true,
-		allowAll:     false, // *.* check is denied
-		deniedReason: "no read permission to list databases",
-	}
-	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "no-wildcard"))
-
-	for _, tc := range []struct {
-		name string
-		json string // pre-escaped JSON request body
-	}{
-		{name: "plain SHOW DATABASES", json: `{"sql": "SHOW DATABASES"}`},
-		{name: "block comment before SHOW", json: `{"sql": "/* sneaky */ SHOW DATABASES"}`},
-		{name: "dash comment before SHOW", json: "{\"sql\": \"-- sneaky\\nSHOW DATABASES\"}"},
-		{name: "trailing dash comment", json: `{"sql": "SHOW DATABASES -- trailing"}`},
-	} {
-		req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(tc.json))
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := app.Test(req, -1)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
-		}
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != fiber.StatusForbidden {
-			t.Errorf("%s: expected 403 (SHOW gate must deny), got %d: %s",
-				tc.name, resp.StatusCode, string(bodyBytes))
-		}
-	}
-}
+// The comment-bypass guard for SHOW DATABASES (a comment hiding the command
+// from the SHOW match, so DuckDB would answer it unfiltered) is pinned end to
+// end by TestShowDatabasesCommentFormsAreFiltered (listing_1562_test.go): the
+// SHOW answer is now a filtered list rather than a 403, which needs real
+// storage to check.
 
 // TestExecuteQuery_ShowTables_HeaderDBScoped verifies that SHOW TABLES with no
 // explicit `FROM db` checks permission against the x-arc-database header (the

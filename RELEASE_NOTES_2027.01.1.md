@@ -74,6 +74,31 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: a token limited to some databases can list them ([#1562](https://github.com/Basekick-Labs/arc/issues/1562))
+
+Listing every database required a read grant covering every database, so a
+token whose RBAC role names specific databases got 403 from
+`GET /api/v1/databases`, from `SHOW DATABASES`, and from
+`GET /api/v1/measurements` without `?database=`, even though it could query
+its databases. (2026.09.3 introduced that bar when these listings gained RBAC.)
+
+These listings now show each caller the databases it can read something in:
+
+- **What a scoped token sees:** a token limited to some databases sees those
+  databases and no others. A token limited to some measurements sees their
+  databases.
+- **Counts:** in `GET /api/v1/databases`, `measurement_count` counts only the
+  measurements the caller can read, as `GET /api/v1/databases/:name` already
+  did.
+- **Unchanged for full access:** a token that can read every database, a token
+  that is in no team, and any request with auth disabled see the full list,
+  as before.
+- **No read grant anywhere:** still 403.
+- **Grants unreadable:** if the permission store cannot be read, the listings
+  answer 503 instead of an empty list.
+- **Other endpoints:** `SHOW DATABASES` sent to `/api/v1/query/estimate` or
+  `/api/v1/query/arrow` answers 400 "use /api/v1/query" for every caller.
+  Before, a token without the all-databases grant got 403 there.
 ## Fix: edge-sync pushes are decided by RBAC on the spoke's database ([#1561](https://github.com/Basekick-Labs/arc/issues/1561))
 
 The edge-sync hub endpoints (`POST /api/v1/sync/file` and
