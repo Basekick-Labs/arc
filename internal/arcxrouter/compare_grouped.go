@@ -381,7 +381,10 @@ func newGroupedCmp(items []string, keyCols []int, total int) *groupedCmp {
 
 // deferArg: agg-4 tie policy — VALUE (and NaN-ness) diffs on arg cells are
 // deferred, surfaced tagged "argdiff:" only when nothing else differs. Structural
-// diffs (row count, keys, null-ness, kind) always alarm.
+// diffs (row count, keys, null-ness, kind) always alarm — with ONE exception
+// (res-3): under Decision.HavingUnstable a group present on one side only is
+// deferred by mergeOneSided, because the HAVING itself filters on the unstable
+// value. Null-ness, kind and duplicate keys still alarm there.
 func (gc *groupedCmp) deferArg(c int, msg string) bool {
 	if c < len(gc.cellItems) && isArgItem(gc.cellItems[c]) {
 		if gc.argDiff == "" {
