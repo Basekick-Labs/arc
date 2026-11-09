@@ -4050,17 +4050,7 @@ func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, 
 	// migration replicated in, a restore). A cached hot-only read would then
 	// skip them without asking again.
 	pruning.MarkVolatile(ctx)
-	var start, end *time.Time
-	if tr := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL); tr != nil {
-		if !tr.StartAssumed {
-			s := tr.Start
-			start = &s
-		}
-		if !tr.EndAssumed {
-			e := tr.End
-			end = &e
-		}
-	}
+	start, end := statedBounds(h.pruner.ExtractTimeRangeCtx(ctx, originalSQL))
 	has, err := guard.HasColdFilesInRange(ctx, database, measurement, start, end)
 	if err != nil {
 		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
@@ -4071,6 +4061,73 @@ func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, 
 	}
 	recordStoragePathFailure(ctx, errColdTierUnavailable)
 	return true
+}
+
+// statedBounds is a query's time range as tier metadata may be asked about
+// it: a bound the extractor only assumed is left open (nil), so a lookup
+// never excludes rows the query did not exclude. No range: both open.
+func statedBounds(tr *pruning.TimeRange) (start, end *time.Time) {
+	if tr == nil {
+		return nil, nil
+	}
+	if !tr.StartAssumed {
+		s := tr.Start
+		start = &s
+	}
+	if !tr.EndAssumed {
+		e := tr.End
+		end = &e
+	}
+	return start, end
+}
+
+// coldRangeHasNoRows reports whether this read may leave out cold partitions
+// the cold tier could not list (#1550): only on a node whose tier metadata is
+// a complete record of the cold store (tiering.Manager.ColdMetadataAuthority:
+// standalone, and not since a restore that left cold files without rows),
+// and only when that metadata holds no cold row for the read's range. Any
+// doubt — a cluster node, an incomplete record, a metadata error — answers
+// false, and the read keeps the unlisted partitions and fails as it did.
+//
+// The cost is one SQLite lookup, and only on a read whose cold listing
+// already failed.
+func (h *QueryHandler) coldRangeHasNoRows(ctx context.Context, database, measurement string, timeRange *pruning.TimeRange) bool {
+	guard := h.coldTierGuard()
+	if guard == nil || !guard.ColdMetadataAuthoritative() {
+		return false
+	}
+	start, end := statedBounds(timeRange)
+	has, err := guard.HasColdFilesInRange(ctx, database, measurement, start, end)
+	if err != nil {
+		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Could not check tier metadata for cold rows in this read's range; keeping the cold partitions the cold tier could not list")
+		return false
+	}
+	return !has
+}
+
+// coldUnlistedLog limits the Warn coldRangeHasNoRows' callers log when they
+// leave cold partitions out, to one per measurement per minute: during an
+// outage every read of every tiered measurement would otherwise log.
+var coldUnlistedLog sync.Map // "db/measurement" -> time.Time
+
+const coldUnlistedLogEvery = time.Minute
+
+// noteColdUnlistedSkipped counts and (rate-limited) logs a read that left out
+// cold partitions the cold tier could not list.
+func (h *QueryHandler) noteColdUnlistedSkipped(database, measurement string, partitions int) {
+	metrics.Get().IncQueryColdUnlistedSkipped()
+	key := database + "/" + measurement
+	now := time.Now()
+	if last, ok := coldUnlistedLog.Load(key); ok && now.Sub(last.(time.Time)) < coldUnlistedLogEvery {
+		return
+	}
+	coldUnlistedLog.Store(key, now)
+	h.logger.Warn().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("cold_partitions_skipped", partitions).
+		Msg("The cold tier could not be listed; answering this read without its cold partitions because tier metadata holds no cold rows for its range (logged at most once a minute per measurement)")
 }
 
 type storagePathCtxKey struct{}
@@ -4529,6 +4586,21 @@ func combineTierPruneResults(results []tierPruneResult) ([]string, int) {
 	return paths, prunedTiers
 }
 
+// withoutPaths is paths minus drop, in paths' order.
+func withoutPaths(paths, drop []string) []string {
+	skip := make(map[string]struct{}, len(drop))
+	for _, p := range drop {
+		skip[p] = struct{}{}
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, ok := skip[p]; !ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // buildMultiTierReadParquet builds a read_parquet expression that queries tiers with actual data.
 // Queries the tiering metadata to determine which tiers have files for this database/measurement,
 // then only includes paths for tiers that actually have data.
@@ -4609,16 +4681,44 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// object storage beyond the cached parent listings).
 	timeRange := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL)
 	results := make([]tierPruneResult, 0, len(sources))
+	// resultSources[i] is the source of results[i]: a cold tier left out
+	// below has no result, so the two no longer line up with sources.
+	resultSources := make([]tierSource, 0, len(sources))
+	droppedUnlisted := 0
+	// skippedUnlisted: cold partitions were left out on tier metadata's word
+	// (#1550), whether or not the whole tier went; the transform must not be
+	// cached past the cold tier coming back.
+	skippedUnlisted := false
 	for _, src := range sources {
 		if src.tier == tiering.TierCold && timeRange != nil && timeRange.StartAssumed {
 			// An end-only predicate's assumed start (the 1970 floor) must not
 			// exclude cold-archive data that can legitimately be older; scan
 			// the full cold glob instead.
 			results = append(results, tierPruneResult{glob: src.glob, outcome: pruning.TierPruneFallback})
+			resultSources = append(resultSources, src)
 			continue
 		}
-		tierPaths, outcome := h.pruner.PruneTierPaths(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
-		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome})
+		d := h.pruner.PruneTierPathsDetail(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
+		if src.tier == tiering.TierCold && len(d.Unverified) > 0 && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
+			// The cold tier could not be listed for these partitions, and
+			// this node's tier metadata, a complete record of the cold store,
+			// holds no cold row in the range: they cannot hold data, and
+			// reading them would fail the whole query on the same outage
+			// (#1550). Partitions a listing confirmed stay.
+			kept := withoutPaths(d.Paths, d.Unverified)
+			h.noteColdUnlistedSkipped(database, measurement, len(d.Paths)-len(kept))
+			skippedUnlisted = true
+			if len(kept) == 0 {
+				// Not an Empty result: combineTierPruneResults keeps an
+				// Empty tier's full glob unless another tier pruned, and
+				// that glob is the read this exists to avoid.
+				droppedUnlisted++
+				continue
+			}
+			d.Paths = kept
+		}
+		results = append(results, tierPruneResult{glob: src.glob, paths: d.Paths, outcome: d.Outcome})
+		resultSources = append(resultSources, src)
 	}
 	// A tier that could not be pruned (no time range, or the cold end-only
 	// fallback) goes to DuckDB as its full glob. If that glob matches
@@ -4629,34 +4729,50 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// file at all before keeping it; a listing that cannot be trusted keeps
 	// the tier, as before. A transform that dropped a tier is volatile: the
 	// next flush into that tier must not wait out the cache TTL.
+	//
+	// A cold tier whose listing failed here is left out on the same terms
+	// as above (#1550): only when tier metadata, a complete record of the
+	// cold store on this node, holds no cold row for the range. With no
+	// range, or only an end, that is a measurement with no cold rows before
+	// the end, which TiersForMeasurement has mostly ruled out already; the
+	// branch matters for reads the pruner did not prune (path cap, pruning
+	// off) and for cold rows that are all quarantined.
 	kept := results[:0]
 	droppedEmpty := 0
 	for i, r := range results {
+		src := resultSources[i]
 		if r.outcome == pruning.TierPruneFallback {
-			if has, verified := pruning.TierHasFiles(ctx, sources[i].backend, database, measurement); verified && !has {
+			has, verified := pruning.TierHasFiles(ctx, src.backend, database, measurement)
+			if verified && !has {
 				h.logger.Debug().
 					Str("database", database).
 					Str("measurement", measurement).
-					Str("tier", string(sources[i].tier)).
+					Str("tier", string(src.tier)).
 					Msg("Tier holds no files for this measurement; dropped from the read")
 				droppedEmpty++
+				continue
+			}
+			if !verified && src.tier == tiering.TierCold && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
+				h.noteColdUnlistedSkipped(database, measurement, 1)
+				droppedUnlisted++
+				skippedUnlisted = true
 				continue
 			}
 		}
 		kept = append(kept, r)
 	}
 	results = kept
-	if droppedEmpty > 0 {
+	if droppedEmpty > 0 || skippedUnlisted {
 		pruning.MarkVolatile(ctx)
 	}
 
 	paths, prunedTiers := combineTierPruneResults(results)
-	if prunedTiers > 0 || droppedEmpty > 0 {
+	if prunedTiers > 0 || droppedEmpty > 0 || droppedUnlisted > 0 {
 		h.logger.Info().
 			Str("database", database).
 			Str("measurement", measurement).
 			Int("tiers", len(sources)).
-			Int("pruned_tiers", prunedTiers+droppedEmpty).
+			Int("pruned_tiers", prunedTiers+droppedEmpty+droppedUnlisted).
 			Int("path_count", len(paths)).
 			Msg("Multi-tier partition pruning applied")
 	}
@@ -4756,6 +4872,9 @@ func (v tieringTierView) GetBackendForTier(tier tiering.Tier) storage.Backend {
 type coldTierGuard interface {
 	ColdTierMissing() bool
 	HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error)
+	// ColdMetadataAuthoritative: this node's cold rows are a complete record
+	// of the cold store (#1550).
+	ColdMetadataAuthoritative() bool
 }
 
 func (h *QueryHandler) coldTierGuard() coldTierGuard {

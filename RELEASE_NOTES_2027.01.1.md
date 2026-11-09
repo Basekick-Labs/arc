@@ -74,6 +74,49 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
+
+When the cold tier could not be listed (expired or missing credentials, a
+network failure, an unreachable endpoint), a query on any measurement with
+data in the cold tier failed, even if its time range only covered hot data.
+Arc tried to check the cold tier for every partition in the range and then
+read those it could not check, which hit the same error. A cold-tier outage
+took down recent-data dashboards along with archive queries.
+
+On a standalone node, Arc now uses its tier metadata when the cold tier cannot
+be listed. If no cold file is recorded for the query's time range, the read
+leaves out the cold partitions it could not check and answers from hot data.
+If cold files are recorded for the range, the query fails as before: the
+answer would be incomplete. The same applies when the metadata lookup fails,
+or when the query has no time range and the measurement has cold data.
+
+Arc only uses this shortcut while its tier metadata is a complete record of
+the cold tier:
+- **Never on a cluster node.** Cluster nodes keep the previous behaviour,
+  because their cold-tier records can lag the cold store while it is
+  unreachable ([#1552](https://github.com/Basekick-Labs/arc/issues/1552)).
+- **Not after a metadata restore.** Applying a staged `restore_metadata`
+  writes a marker, `<arc.db>.cold-metadata-unverified`, next to the database.
+  Files migrated after the backup have no record until the cold tier is
+  listed again.
+- **Not after a restore that could not record some of its cold files.** The
+  same marker is written.
+
+The marker is removed by the next cold-tier metadata sync that records every
+cold object, and it survives restarts until then. `GET
+/api/v1/tiering/status` reports the state as `cold_metadata.authoritative`,
+with the reason when it is false.
+
+Other changes:
+- **One timeout per query.** Once a cold-tier listing fails, the query stops
+  listing the cold tier. An unreachable endpoint now costs one listing
+  timeout (5 s) per query, not one per day in the range.
+- **Visibility.** Each read that leaves cold partitions out this way
+  increments `arc_query_cold_unlisted_skipped_total`. Arc also logs a warning
+  at most once a minute per measurement.
+- **Not cached.** These reads are not cached, so the cold tier is read again
+  as soon as it can be listed.
+
 ## Fix: names that differ only in case stay apart on case-insensitive volumes ([#1509](https://github.com/Basekick-Labs/arc/issues/1509))
 
 On a volume that does not distinguish names by case (macOS APFS by default,

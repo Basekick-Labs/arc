@@ -339,6 +339,11 @@ func (m *Manager) RecordRestoredColdFiles(ctx context.Context, sizes map[string]
 	now := time.Now()
 	files, failed := m.restoredFileRows(sizes, now)
 	quarantined, err := m.metadata.RecordColdFilesBatch(ctx, files, now)
+	if err != nil || len(failed) > 0 {
+		// Bytes in the cold store with no row: until a complete cold sync
+		// records them, these rows cannot vouch for an empty range (#1550).
+		m.markColdMetadataUnverified(coldAuthorityReasonRecord)
+	}
 	if err != nil {
 		return nil, failed, err
 	}

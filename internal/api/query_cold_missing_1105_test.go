@@ -24,6 +24,11 @@ type fakeColdGuard struct {
 
 func (f *fakeColdGuard) ColdTierMissing() bool { return f.missing }
 
+// ColdMetadataAuthoritative: a node whose cold backend failed to start never
+// reaches the #1550 path (no cold source); answering false keeps these tests
+// on the path they pin.
+func (f *fakeColdGuard) ColdMetadataAuthoritative() bool { return false }
+
 func (f *fakeColdGuard) HasColdFilesInRange(_ context.Context, _, measurement string, start, _ *time.Time) (bool, error) {
 	f.calls++
 	f.start = start

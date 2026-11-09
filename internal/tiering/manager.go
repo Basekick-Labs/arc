@@ -114,6 +114,10 @@ type Manager struct {
 	manifestMu           sync.Mutex
 	lastManifestProposal time.Time
 
+	// coldAuth: whether cold tier rows may be missing files the cold store
+	// holds (#1550). See cold_authority.go.
+	coldAuth coldAuthority
+
 	// tierEvent* carry the registration reports the cluster layer makes for
 	// files this node did not write itself — pulled from a peer, or unlinked
 	// because another node migrated them. One drainer applies them so a
@@ -196,6 +200,12 @@ type ManagerConfig struct {
 	// cluster coordinator exists.
 	Manifest ManifestCoordinator
 
+	// ColdMetadataMarkerPath is where this node records that its cold tier
+	// rows may be missing files the cold store holds (after a metadata
+	// restore, or a restore that could not record cold rows); "" keeps the
+	// state in memory only. See cold_authority.go (#1550).
+	ColdMetadataMarkerPath string
+
 	// Logger
 	Logger zerolog.Logger
 }
@@ -248,6 +258,14 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		tierEvents:    newTierEventQueue(),
 		tierEventStop: make(chan struct{}),
 		logger:        logger,
+	}
+
+	if err := m.coldAuth.load(cfg.ColdMetadataMarkerPath); err != nil {
+		logger.Error().Err(err).Msg("Could not read the incomplete-cold-rows marker; treating cold tier rows as incomplete")
+	}
+	if unverified, reason := m.coldAuth.state(); unverified {
+		logger.Warn().Str("reason", reason).
+			Msg("Cold tier rows may be missing cold files until a cold-tier metadata sync records every cold object; while the cold tier cannot be listed, reads that touch it fail rather than answer from these rows")
 	}
 
 	// Started here rather than in Start so the cluster layer can report pulls
@@ -967,6 +985,10 @@ func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	coldStats.Enabled = m.coldTierUsable()
 	coldStats.Backend = m.config.Cold.Backend
 	status.Tiers["cold"] = coldStats
+	if m.config.Cold.Enabled {
+		ok, reason := m.ColdMetadataAuthority()
+		status.ColdMetadata = &ColdMetadataStatus{Authoritative: ok, Reason: reason}
+	}
 
 	quarantined, err := m.metadata.CountQuarantinedFiles(ctx)
 	if err != nil {
@@ -1182,6 +1204,13 @@ const coldTierMetadataBatchSize = 1000
 // every object in the bucket is unseen: each invalidation bumps the
 // process-wide generation and discards every concurrent tier-cache fill.
 func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
+	// Read before the listing: a marking after this point may concern objects
+	// the listing snapshot does not hold (#1550).
+	authGen := m.coldAuth.generation()
+	// notRecorded counts listed objects this sync left without a row: a row
+	// write that failed, or a hot-only object whose hot copy could not be
+	// checked. Either keeps cold rows marked incomplete.
+	notRecorded := 0
 	lister, ok := m.coldBackend.(storage.ObjectLister)
 	if !ok {
 		return 0, fmt.Errorf("cold backend does not support ListObjects")
@@ -1247,6 +1276,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 						return ctxErr
 					}
 					m.logger.Warn().Str("path", file.Path).Err(err).Msg("Failed to record cold file, skipping")
+					notRecorded++
 					continue
 				}
 				if !wrote {
@@ -1323,6 +1353,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 			if present, existsErr := m.hotBackend.Exists(ctx, obj.Path); existsErr != nil || present {
 				if existsErr != nil {
 					m.logger.Warn().Err(existsErr).Str("path", obj.Path).Msg("Could not verify local hot copy for a hot-only cold object; preserving it")
+					notRecorded++
 				}
 				delete(unseen, obj.Path)
 				continue
@@ -1411,7 +1442,9 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		Int("synced", synced).
 		Int("unparseable", unparseable).
 		Int("quarantined_skipped", quarantined).
+		Int("not_recorded", notRecorded).
 		Msg("Cold tier metadata sync completed")
+	m.coldSyncCompleted(authGen, notRecorded)
 	return synced, nil
 }
 
