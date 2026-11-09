@@ -1273,8 +1273,10 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		}
 		break
 	}
-	// At least one key of either kind + at least one aggregate.
-	if (bucketItem < 0 && tagItem < 0) || nAggs == 0 {
+	// At least one key of either kind; at least one aggregate is checked after the
+	// HAVING (res-3b: `SELECT host … GROUP BY host HAVING count(*) > 100` carries
+	// its only aggregate there).
+	if bucketItem < 0 && tagItem < 0 {
 		return fail()
 	}
 	if !c.ident("from") {
@@ -1360,9 +1362,6 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	if len(seen) != nKeys {
 		return fail() // every projected key must be grouped exactly once
 	}
-	if hasMoment && tagKey != "" {
-		return fail() // agg-6a: tag-keyed moments are a measured loss (see hasMoment)
-	}
 	// Optional `HAVING <tree>` (agg-5a) — clause order is GROUP BY, HAVING,
 	// ORDER BY. Re-serialized from validated parts; the grammar is the engine's,
 	// so a shape accepted here cannot be one the engine declines.
@@ -1375,16 +1374,27 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		for len(aliases) < len(items) {
 			aliases = append(aliases, "")
 		}
-		ht, hu, hok := reserializeHaving(c, havingCtx{
+		ht, hst, hok := reserializeHaving(c, havingCtx{
 			items:       items,
 			tagKey:      tagKey,
 			bucketAlias: m.bucketAlias,
 			aliases:     aliases,
+			bucketCol:   m.bucketCol,
 		})
 		if !hok {
 			return fail()
 		}
-		havingText, havingUnstable = ht, hu
+		havingText, havingUnstable = ht, hst.unstable
+		m.havingHidden = len(hst.hidden)
+		hasMoment = hasMoment || hst.hiddenMoment
+	}
+	// res-3b: moved after the HAVING so a hidden moment / order statistic / binary
+	// statistic is gated like a selected one.
+	if hasMoment && tagKey != "" {
+		return fail() // agg-6a: tag-keyed moments are a measured loss (see hasMoment)
+	}
+	if nAggs == 0 && m.havingHidden == 0 {
+		return fail() // a grouped select with no aggregate anywhere (bare DISTINCT)
 	}
 
 	// Optional `ORDER BY <ref> [ASC|DESC] [NULLS FIRST|LAST] (, <ref>){0,3}
@@ -1534,9 +1544,11 @@ type groupedMatch struct {
 	// res-3: shadow class of an unstable item the HAVING references ("" none,
 	// "arg", "oracle") — see Decision.HavingUnstable.
 	havingUnstable string
-	meas           string
-	bucketUnit     string
-	bucketCol      string
+	// res-3b: number of hidden HAVING aggregates (not in the select list).
+	havingHidden int
+	meas         string
+	bucketUnit   string
+	bucketCol    string
 	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
 	// the MANDATORY alias — validated parts the builder re-emits.
 	epochWidthSecs int

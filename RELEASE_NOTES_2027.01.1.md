@@ -202,6 +202,45 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: more `HAVING` forms route to the engine
+
+These `HAVING` forms now route to the arcx engine (arcX feat/having-grammar):
+- an aggregate that is not in the select list, including a select list with no aggregate at
+  all: `SELECT host FROM cpu GROUP BY host HAVING count(*) > 100`. The engine computes it and
+  leaves it out of the result;
+- `NOT`, at any depth;
+- `IS NULL` and `IS NOT NULL`;
+- `BETWEEN` and `NOT BETWEEN` with literal bounds;
+- `IN` and `NOT IN` with a list of literals;
+- a literal on the left (`100 < count(*)`);
+- one aggregate compared with another (`count(*) > max(retries)`, `max(x) > min(x)`,
+  `bool_and(ok) <> bool_or(ok)`), or a time bucket compared with `min`/`max` of its own
+  time column.
+
+An aggregate compared with another aggregate routes only when both sides are exact:
+- group keys;
+- `count`, `count_if`, `regr_count`, `min`, `max`, the bitwise and Boolean aggregates, and
+  `quantile_disc`.
+
+`avg`, `sum`, the variance family, `median`, `quantile_cont`, `mad`, the Kahan sums, the
+regression and correlation aggregates, `skewness`/`kurtosis` and `arg_max`/`arg_min` stay on
+DuckDB in that position. DuckDB 1.5.6 accumulates those in floating point, and the last digits
+depend on how many threads ran the query. On 3 million rows of a constant 0.1, `avg(x)` came out
+above `max(x)` with 1 thread, below it with 4, and above it again with 14, so neither engine has a
+stable answer to compare.
+
+These forms still run on DuckDB:
+- `ORDER BY` an aggregate that is not in the select list (shadow mode cannot check an order whose
+  values are not in the result);
+- arithmetic over aggregates (`sum(bytes) / count(*) > 1000`);
+- `LIKE`, `IS DISTINCT FROM`, and `IN` with `NULL` or a column in the list;
+- an aggregate that is not in the select list and that is grouped by a tag column, when the same
+  aggregate would stay on DuckDB if selected (the variance family, order statistics, regression
+  aggregates, predicate aggregates).
+
+When a hidden integer `sum` overflows 64 bits, the engine sends the query back to DuckDB, which
+computes the `HAVING` in 128 bits. A selected sum that overflows still errors, as before.
+
 ## arcx router: `HAVING` routes over every aggregate the engine serves
 
 A grouped query's `HAVING` now routes to the arcx engine for every aggregate the engine serves
@@ -226,9 +265,9 @@ router sends the aggregate itself to the engine in place of the alias.
 now runs on the engine.
 
 These forms still run on DuckDB:
-- an aggregate in `HAVING` that is not in the select list (`SELECT host … HAVING count(*) > 100`);
-- `IS NULL`, `BETWEEN`, `NOT`, `IN`, a literal on the left, two aggregates compared with each other,
-  and arithmetic;
+- an aggregate in `HAVING` that is not in the select list, `IS NULL`, `BETWEEN`, `NOT`, `IN`, a
+  literal on the left and two aggregates compared with each other (all route since the change
+  above), and arithmetic;
 - a decimal literal with more than 15 significant digits;
 - `bool_and` / `bool_or` compared with anything but `TRUE` / `FALSE`, or with `<` / `>`;
 - a number compared with the time bucket;

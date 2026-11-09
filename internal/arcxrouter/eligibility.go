@@ -149,6 +149,7 @@ type matchResult struct {
 	havingText  string     // agg-5a: re-serialized HAVING over the grouped select items ("" = none)
 	// res-3: shadow class of an unstable item the HAVING references ("", "arg", "oracle").
 	havingUnstable string
+	havingHidden   int // res-3b
 	// (OR / parens). Mutually exclusive with preds — set only when the flat AND-list
 	// can't represent the WHERE (2b-2). buildScanSQL emits it verbatim; the engine is
 	// the tree authority.
@@ -252,6 +253,7 @@ func eligibleShape(sql string) (matchResult, bool) {
 			whereText:      gm.whereText,
 			havingText:     gm.havingText,
 			havingUnstable: gm.havingUnstable,
+			havingHidden:   gm.havingHidden,
 			measurement:    gm.meas,
 		}, true
 	}

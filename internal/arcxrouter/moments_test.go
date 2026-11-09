@@ -82,7 +82,6 @@ func TestMomentsDecline(t *testing.T) {
 		"SELECT stddev(m['k']) FROM cpu",
 		"SELECT stddev() FROM cpu",
 		// a HAVING aggregate absent from the select list
-		"SELECT date_trunc('hour', time), count(*) FROM cpu GROUP BY 1 HAVING stddev(v) > 1",
 		// tag-keyed moments: a measured 2.7× loss (18.3 s vs 6.7 s by host) — held
 		"SELECT host, stddev(cpu_user), var_pop(cpu_idle) FROM cpu GROUP BY host",
 		"SELECT host, count(*), stddev(v) FROM cpu GROUP BY host HAVING stddev(v) > 1",

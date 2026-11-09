@@ -181,6 +181,10 @@ type Decision struct {
 	// with the normal cell rules. The recognizer refuses these with LIMIT or an
 	// aggregate ORDER BY target.
 	HavingUnstable string
+	// res-3b: the number of aggregates the HAVING references that are not in the
+	// select list (hidden items the engine computes and projects away). Non-zero
+	// allows a select list with no aggregate at all.
+	HavingHidden int
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -221,6 +225,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		WhereText:      m.whereText,
 		HavingText:     m.havingText,
 		HavingUnstable: m.havingUnstable,
+		HavingHidden:   m.havingHidden,
 		OrderBy:        m.orderBy,
 		Limit:          m.limit,
 		AggItems:       m.aggItems,
@@ -489,7 +494,7 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	if bucketText == "" && tagText == "" {
 		return "", false
 	}
-	if len(d.AggItems) < 2 {
+	if len(d.AggItems) < 2 && d.HavingHidden == 0 {
 		return "", false
 	}
 	sawBucket, sawTag, sawAgg := false, false, false
@@ -522,7 +527,9 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 		}
 		b.WriteString(as)
 	}
-	if !sawAgg || (bucketText != "" && !sawBucket) || (tagText != "" && !sawTag) {
+	// res-3b: a select list without an aggregate is valid only when the HAVING
+	// carries one (a hidden item) — never a bare DISTINCT.
+	if (!sawAgg && (d.HavingHidden == 0 || d.HavingText == "")) || (bucketText != "" && !sawBucket) || (tagText != "" && !sawTag) {
 		return "", false
 	}
 	b.WriteString(" FROM read_parquet(")
