@@ -87,10 +87,10 @@ type MsgPackHandler struct {
 	maxPayloadSize int64 // Maximum payload size in bytes (applies to both compressed and decompressed)
 
 	// authManager holds the concrete *auth.AuthManager so we can wire
-	// auth.RequireWrite as route-level middleware AND so RBAC checks
-	// at request time use the same instance. Concrete (not the local
-	// AuthManager interface) because auth.RequireWrite is implemented
-	// against the struct; using the interface required a type
+	// the write-tier route middleware AND so RBAC checks at request time
+	// use the same instance. Concrete (not the local AuthManager
+	// interface) because the auth middleware is implemented against the
+	// struct; using the interface required a type
 	// assertion that could silently miss on a mock and disable route
 	// protection.
 	authManager *auth.AuthManager
@@ -116,8 +116,8 @@ func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, m
 }
 
 // SetAuthAndRBAC sets the auth and RBAC managers. Takes the concrete
-// *auth.AuthManager (not the local AuthManager interface) so route-
-// level auth.RequireWrite middleware can be wired without a type
+// *auth.AuthManager (not the local AuthManager interface) so the route-
+// level write middleware can be wired without a type
 // assertion that could silently miss on a mock and disable
 // protection. nil = auth disabled (OSS default).
 func (h *MsgPackHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
@@ -177,13 +177,15 @@ func (h *MsgPackHandler) checkWritePermissions(c *fiber.Ctx, database string, me
 	return CheckWritePermissions(c, h.rbacManager, h.logger, database, measurements)
 }
 
-// RegisterRoutes registers MessagePack endpoints. The write endpoint
-// is gated by auth.RequireWrite when an auth manager is configured —
-// per CLAUDE.md, mutating endpoints MUST have an explicit write-tier
-// auth middleware. Stats and spec remain at any-authenticated-token
-// level (gated by the global auth middleware in main.go).
+// RegisterRoutes registers MessagePack endpoints. The write endpoint is
+// gated by withAnyResourceWriteAuth when an auth manager is configured —
+// per CLAUDE.md, mutating endpoints MUST have an explicit write-tier auth
+// middleware. It admits a token holding write on anything, RBAC included
+// (#1559); checkWritePermissions then checks every measurement in the
+// payload. Stats and spec remain at any-authenticated-token level (gated
+// by the global auth middleware in main.go).
 func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/msgpack", withWriteAuth(h.authManager), h.writeMsgPack)
+	app.Post("/api/v1/write/msgpack", withAnyResourceWriteAuth(h.authManager, h.rbacManager), h.writeMsgPack)
 	app.Get("/api/v1/write/msgpack/stats", h.msgPackStats)
 	app.Get("/api/v1/write/msgpack/spec", h.msgPackSpec)
 }

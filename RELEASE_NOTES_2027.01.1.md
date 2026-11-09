@@ -74,6 +74,47 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: tokens whose access comes from RBAC can query and ingest ([#1559](https://github.com/Basekick-Labs/arc/issues/1559))
+
+A token with no permissions of its own, given access through an RBAC team
+(`POST /api/v1/auth/tokens` with `permissions: []`), was refused with 403 by
+the query and ingest endpoints, even though RBAC granted the access,
+`GET /api/v1/databases` accepted it, and
+`GET /api/v1/auth/tokens/:id/permissions` reported the grant. These
+endpoints first checked the token's own `read` or `write` permission and did
+not ask RBAC. A token could therefore only be limited by RBAC if it also held
+that permission.
+
+The endpoints now admit a token that holds the permission anywhere,
+through RBAC or its own permissions. Each endpoint then checks every table a
+query reads and every measurement a write names, as before:
+
+- `POST /api/v1/query`, `/api/v1/query/msgpack`, `/api/v1/query/arrow` and
+  `/api/v1/query/estimate`
+- `GET /api/v1/measurements`, `GET /api/v1/query/:measurement` and
+  `GET /api/v1/databases/:database/measurements/:measurement/schema`
+- `POST /write`, `/api/v2/write`, `/api/v1/write/line-protocol`,
+  `/api/v1/write/msgpack` and `/api/v1/write/tle`
+
+Tokens that are in no team are unchanged: their own permissions decide, as
+they always have.
+
+**Behaviour change for team members.** A token in a team is decided by RBAC
+on these endpoints, as it already was for every table and measurement. A
+token that holds `read` itself but whose teams grant `read` on nothing is now
+refused before the query runs. Before, it got through, every table it named
+was refused, and only a query with no table (`SELECT 1`) succeeded. The same
+applies to `write`. A health check that runs `SELECT 1` with such a token
+gets 403: grant its team `read`, or use a token that is in no team.
+
+**Rolling upgrades.** A request forwarded to a node that has not been
+upgraded yet is checked by that node the old way, so an RBAC-only token can
+see a 403 until every node runs this version.
+
+The edge-sync hub endpoints still require the token's own `write`
+permission: they do not check RBAC per database, so that check is the only
+one they have.
+
 ## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
 
 When the cold tier could not be listed (expired or missing credentials, a

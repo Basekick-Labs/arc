@@ -95,6 +95,19 @@ func (m *mockRBACChecker) CanAccessAnythingIn(tokenInfo *auth.TokenInfo, databas
 	return m.allowedDBs != nil && m.allowedDBs[database]
 }
 
+// HasPermissionAnywhere mirrors auth.RBACManager.HasPermissionAnywhere: any
+// grant at all. Same rules as CanAccessAnythingIn with every database
+// matching.
+func (m *mockRBACChecker) HasPermissionAnywhere(tokenInfo *auth.TokenInfo, permission string) bool {
+	if !m.enabled || m.allowAll {
+		return true
+	}
+	if tokenInfo == nil {
+		return false
+	}
+	return len(m.allowedDBs) > 0
+}
+
 func (m *mockRBACChecker) CheckPermissionsBatch(reqs []*auth.PermissionCheckRequest) []*auth.PermissionCheckResult {
 	results := make([]*auth.PermissionCheckResult, len(reqs))
 	for i, req := range reqs {

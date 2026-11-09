@@ -166,10 +166,14 @@ func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 
 	if h.authManager != nil {
 		// Write-level, not admin: these endpoints are ingest-shaped (a spoke
-		// pushes data files), and the ingest endpoints gate on RequireWrite.
-		// Requiring admin here would force every spoke to hold a credential
-		// that can also rotate tokens and delete data on the hub. The spoke
-		// presents the token from ARC_EDGE_SYNC_HUB_TOKEN.
+		// pushes data files). Requiring admin here would force every spoke
+		// to hold a credential that can also rotate tokens and delete data on
+		// the hub. The spoke presents the token from ARC_EDGE_SYNC_HUB_TOKEN.
+		//
+		// The coarse RequireWrite, NOT the RBAC-aware door the ingest
+		// endpoints moved to (#1559): these handlers check no RBAC grant per
+		// database, so this middleware is the only gate, and admitting a
+		// token on an RBAC grant for one database would let it write any.
 		group.Use(auth.RequireWrite(h.authManager))
 	}
 

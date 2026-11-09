@@ -1833,7 +1833,11 @@ func hasCoarseAdmin(info *TokenInfo) bool {
 // RBAC under any configuration: a token had to hold "read" to pass the route
 // middleware, and had to NOT hold it for an RBAC denial to stand. Those are
 // contradictory, so every read and write path was unnarrowable. Both halves
-// are fixed together; see RequireResourcePermission in middleware.go.
+// are fixed together; see RequireResourcePermission in middleware.go for
+// routes that name their database in the path or headers, and
+// RequireAnyResourcePermission for routes whose resources are in the body —
+// query SQL and ingest payloads (#1559: those routes kept the coarse door
+// after the first fix, so an RBAC-only token could not query or ingest).
 
 // checkOSSPermission checks permissions using OSS token model
 func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *PermissionCheckResult {
@@ -1866,6 +1870,34 @@ func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *Permissi
 // Resolution order matches CheckPermission: admin break-glass, then
 // memberships, then coarse permissions.
 func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permission string) bool {
+	return rm.holdsGrant(tokenInfo, permission, func(pattern string) bool {
+		return matchPattern(pattern, database)
+	}, "RBAC data load failed; denying listing (fail closed)")
+}
+
+// HasPermissionAnywhere reports whether the token holds any grant permitting
+// `permission` on at least one measurement of at least one database.
+//
+// This is the question a route asks at the door when the resource it serves is
+// named in the request BODY — the tables in a query's SQL, the measurements in
+// an ingest payload — and so is not known to the middleware (#1559). The
+// handler behind such a route must then decide per resource, as the query and
+// ingest handlers do (checkQueryPermissions, CheckWritePermissions). Never use
+// it as the only gate on a route that serves data.
+//
+// Rules are CanAccessAnythingIn's with every database pattern matching: admin
+// break-glass; with memberships, RBAC is authoritative (a role with
+// measurement grants counts only through them); without memberships, the
+// coarse permissions. A grant of one permission never implies another.
+func (rm *RBACManager) HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) bool {
+	return rm.holdsGrant(tokenInfo, permission, func(string) bool { return true },
+		"RBAC data load failed; denying request (fail closed)")
+}
+
+// holdsGrant is CanAccessAnythingIn and HasPermissionAnywhere: whether the
+// token holds a grant permitting `permission` on a measurement of a database
+// whose role pattern dbMatches accepts.
+func (rm *RBACManager) holdsGrant(tokenInfo *TokenInfo, permission string, dbMatches func(pattern string) bool, loadFailedMsg string) bool {
 	if tokenInfo == nil {
 		return false
 	}
@@ -1876,12 +1908,13 @@ func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permi
 	if err != nil {
 		rm.logger.Error().Err(err).
 			Int64("token_id", tokenInfo.ID).
-			Msg("RBAC data load failed; denying listing (fail closed)")
+			Msg(loadFailedMsg)
 		return false
 	}
 	if len(data.teams) == 0 {
+		// The coarse list names no database, so the database plays no part.
 		return rm.checkOSSPermission(&PermissionCheckRequest{
-			TokenInfo: tokenInfo, Database: database, Measurement: "*", Permission: permission,
+			TokenInfo: tokenInfo, Measurement: "*", Permission: permission,
 		}).Allowed
 	}
 	// Enabled is checked here rather than at the top, matching
@@ -1898,9 +1931,11 @@ func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permi
 			continue
 		}
 		for _, role := range data.roles[team.ID] {
-			if !matchPattern(role.DatabasePattern, database) {
+			if !dbMatches(role.DatabasePattern) {
 				continue
 			}
+			// A role with measurement grants is restricted to them: its
+			// role-level list no longer grants anything on its own.
 			if measPerms := data.measPerms[role.ID]; len(measPerms) > 0 {
 				for _, mp := range measPerms {
 					if containsPermission(mp.Permissions, permission) {

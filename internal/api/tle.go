@@ -64,10 +64,12 @@ func (h *TLEHandler) SetRouter(router *cluster.Router) {
 }
 
 // RegisterRoutes registers TLE routes. The write endpoint is gated by
-// auth.RequireWrite when auth is enabled — per CLAUDE.md, mutating
-// endpoints MUST have an explicit write-tier auth middleware.
+// withAnyResourceWriteAuth when auth is enabled — per CLAUDE.md, mutating
+// endpoints MUST have an explicit write-tier auth middleware. It admits a
+// token holding write on anything, RBAC included (#1559); handleWrite then
+// checks the measurement it writes.
 func (h *TLEHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/tle", withWriteAuth(h.authManager), h.handleWrite)
+	app.Post("/api/v1/write/tle", withAnyResourceWriteAuth(h.authManager, h.rbacManager), h.handleWrite)
 	app.Get("/api/v1/write/tle/stats", h.Stats)
 
 	h.logger.Info().Msg("TLE routes registered")
