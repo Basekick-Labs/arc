@@ -93,8 +93,6 @@ func TestPredicateArgDeclines(t *testing.T) {
 		"SELECT bit_or(i > 0) FROM t",
 		// Tag-keyed grouping stays gated (momentAggFns), as for the column form.
 		"SELECT host, count_if(x > 0) FROM t GROUP BY host",
-		// HAVING on a predicate aggregate: the engine declines it (agg-6b2 B1).
-		"SELECT date_trunc('hour', time), count_if(x > 0) FROM t GROUP BY 1 HAVING count_if(x > 0) > 3",
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline: %s (items %v)", sql, m.aggItems)

@@ -172,6 +172,15 @@ type Decision struct {
 	BucketAlias    string
 	// agg-5a: re-serialized HAVING over the select items ("" = none).
 	HavingText string
+	// res-3: non-empty when the HAVING references an item whose DuckDB value
+	// legitimately moves between runs — "arg" (arg_*/max_by/min_by ties) or
+	// "oracle" (Kahan sums, covar_pop/covar_samp/regr_sxy/regr_intercept, shape
+	// statistics). Such a HAVING can put a group in one side's result and not the
+	// other's; the shadow files a one-sided group as argdiff/oraclediff (WARN)
+	// instead of a row-count mismatch, while groups on both sides still compare
+	// with the normal cell rules. The recognizer refuses these with LIMIT or an
+	// aggregate ORDER BY target.
+	HavingUnstable string
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -211,6 +220,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		Preds:          m.preds,
 		WhereText:      m.whereText,
 		HavingText:     m.havingText,
+		HavingUnstable: m.havingUnstable,
 		OrderBy:        m.orderBy,
 		Limit:          m.limit,
 		AggItems:       m.aggItems,
@@ -1051,6 +1061,10 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		if err != nil {
 			return "", err
 		}
+		if len(d.OrderKeys) > 0 && d.HavingUnstable != "" {
+			// res-3: key-only ORDER BY, no LIMIT (recognizer-enforced).
+			return compareGroupedKeyOrdered(rec, oracle, d.AggItems, keyCols, d.OrderKeys, d.HavingUnstable), nil
+		}
 		if len(d.OrderKeys) > 0 {
 			// res-2: the order is part of the answer — never re-sorted.
 			diff := compareGroupedOrdered(rec, oracle, d.AggItems, keyCols, d.OrderKeys, d.HasLimit, d.Limit)
@@ -1059,7 +1073,7 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 			}
 			return diff, nil
 		}
-		return compareGrouped(rec, oracle, d.AggItems, keyCols), nil
+		return compareGrouped(rec, oracle, d.AggItems, keyCols, d.HavingUnstable), nil
 	}
 	if isScalarShape(d.Shape) {
 		oracle, err := scalarFromRows(rows)

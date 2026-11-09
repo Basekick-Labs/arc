@@ -270,20 +270,35 @@ func normalizeNullParts(rows []groupedRow) {
 
 // compareGrouped returns "" on match, else a short VALUE-FREE diff. `items` is
 // the select list in column order (keyCols mark the key columns; the rest pick
-// the per-cell policy — tolerance only for float sum/avg).
-func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCols []int) string {
+// the per-cell policy — tolerance only for float sum/avg). oneSided is
+// Decision.HavingUnstable (res-3): "" compares row sets strictly.
+func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCols []int, oneSided string) string {
 	got, err := groupedFromArcx(rec, keyCols)
 	if err != nil {
 		return skipPrefix + "arcx grouped decode error: " + err.Error()
 	}
-	if len(got) != len(oracle) {
+	return compareGroupedRows(got, oracle, items, keyCols, oneSided)
+}
+
+// compareGroupedRows is compareGrouped after decoding. With oneSided set (a HAVING
+// over an unstable item, res-3 review H3), the two sides are MERGED on the group
+// key instead of required to be the same length: a group present on one side only
+// is the legitimate effect of DuckDB's value moving across the HAVING literal and is
+// recorded as a deferred argdiff/oraclediff; a group on both sides compares with the
+// normal cell rules (every non-unstable cell strict). A duplicate group key on
+// either side still alarms — a merge would otherwise file it as one-sided.
+func compareGroupedRows(got, oracle []groupedRow, items []string, keyCols []int, oneSided string) string {
+	if oneSided == "" && len(got) != len(oracle) {
 		return fmt.Sprintf("grouped row count differs (arcx=%d duckdb=%d)", len(got), len(oracle))
 	}
-	gc := newGroupedCmp(items, keyCols, len(got))
+	gc := newGroupedCmp(items, keyCols, max(len(got), len(oracle)))
 	normalizeNullParts(got)
 	normalizeNullParts(oracle)
 	sort.Slice(got, func(i, j int) bool { return groupedLess(&got[i], &got[j]) })
 	sort.Slice(oracle, func(i, j int) bool { return groupedLess(&oracle[i], &oracle[j]) })
+	if oneSided != "" {
+		return gc.mergeOneSided(got, oracle, oneSided)
+	}
 	for i := range got {
 		a, d := &got[i], &oracle[i]
 		if !groupedKeyEq(a, d) {
@@ -291,6 +306,57 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 		}
 		if msg := gc.rowCells(i, a, d); msg != "" {
 			return msg
+		}
+	}
+	return gc.deferred()
+}
+
+// mergeOneSided walks two key-sorted row sets in step (see compareGroupedRows).
+func (gc *groupedCmp) mergeOneSided(got, oracle []groupedRow, oneSided string) string {
+	for _, side := range [][]groupedRow{got, oracle} {
+		for i := 1; i < len(side); i++ {
+			if groupedKeyEq(&side[i-1], &side[i]) {
+				return fmt.Sprintf("grouped rows %d..%d share a group key (values withheld)", i-1, i)
+			}
+		}
+	}
+	i, j, oneSidedRows, matched := 0, 0, 0, 0
+	for i < len(got) || j < len(oracle) {
+		switch {
+		case j >= len(oracle) || (i < len(got) && groupedLess(&got[i], &oracle[j])):
+			oneSidedRows++
+			i++
+		case i >= len(got) || groupedLess(&oracle[j], &got[i]):
+			oneSidedRows++
+			j++
+		default:
+			if !groupedKeyEq(&got[i], &oracle[j]) {
+				return fmt.Sprintf("grouped row %d differs (key, values withheld)", i)
+			}
+			if msg := gc.rowCells(i, &got[i], &oracle[j]); msg != "" {
+				return msg
+			}
+			matched++
+			i++
+			j++
+		}
+	}
+	// Post-impl review M1: an unstable value near the literal moves SOME groups; a
+	// result with no group in common (one side empty, or disjoint keys — a shifted
+	// bucket, a wrong key, a filter that dropped everything) is a whole-result
+	// defect, not oracle noise, and alarms.
+	if oneSidedRows > 0 && matched == 0 {
+		return fmt.Sprintf("no group in common under a HAVING over an unstable aggregate (arcx=%d duckdb=%d)", len(got), len(oracle))
+	}
+	if oneSidedRows > 0 {
+		msg := fmt.Sprintf("%d group(s) on one side only under a HAVING over an unstable aggregate (arcx=%d duckdb=%d, values withheld)",
+			oneSidedRows, len(got), len(oracle))
+		if oneSided == "arg" {
+			if gc.argDiff == "" {
+				gc.argDiff = msg
+			}
+		} else if gc.oracleDiff == "" {
+			gc.oracleDiff = msg
 		}
 	}
 	return gc.deferred()
@@ -323,7 +389,10 @@ func newGroupedCmp(items []string, keyCols []int, total int) *groupedCmp {
 
 // deferArg: agg-4 tie policy — VALUE (and NaN-ness) diffs on arg cells are
 // deferred, surfaced tagged "argdiff:" only when nothing else differs. Structural
-// diffs (row count, keys, null-ness, kind) always alarm.
+// diffs (row count, keys, null-ness, kind) always alarm — with ONE exception
+// (res-3): under Decision.HavingUnstable a group present on one side only is
+// deferred by mergeOneSided, because the HAVING itself filters on the unstable
+// value. Null-ness, kind and duplicate keys still alarm there.
 func (gc *groupedCmp) deferArg(c int, msg string) bool {
 	if c < len(gc.cellItems) && isArgItem(gc.cellItems[c]) {
 		if gc.argDiff == "" {

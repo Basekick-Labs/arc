@@ -53,8 +53,6 @@ func TestAggAliasesDecline(t *testing.T) {
 		"SELECT host, sum(i) AS HOST FROM cpu GROUP BY host",
 		"SELECT date_trunc('hour', time) AS t, count(*) AS t FROM cpu GROUP BY 1",
 		"SELECT date_trunc('hour', time), min(i) AS a, max(i) AS A FROM cpu GROUP BY 1",
-		// HAVING naming an alias (ORDER BY an alias is served since res-2)
-		"SELECT date_trunc('hour', time), avg(x) AS a FROM cpu GROUP BY 1 HAVING a > 2",
 		// alias on a tag key
 		"SELECT host AS h, avg(x) FROM cpu GROUP BY host",
 	} {

@@ -486,6 +486,11 @@ func orderKeyRef(c *cursor, items []string, orderRef func(token) int, aliases []
 			// M2); an alias of that spelling never resolves here.
 			return -1, false
 		}
+		if !aliasRefBindable(t.lower) {
+			// res-3 review: `ORDER BY true` sorts by a constant and `ORDER BY
+			// current_timestamp` by now() — never by a key or alias of that name.
+			return -1, false
+		}
 		if r := orderRef(t); r >= 0 {
 			idx = r
 		} else {
@@ -1361,18 +1366,25 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	// Optional `HAVING <tree>` (agg-5a) — clause order is GROUP BY, HAVING,
 	// ORDER BY. Re-serialized from validated parts; the grammar is the engine's,
 	// so a shape accepted here cannot be one the engine declines.
-	havingText := ""
+	havingText, havingUnstable := "", ""
 	if c.peekIdentLower() == "having" {
 		c.next()
-		ht, hok := reserializeHaving(c, havingCtx{
+		// res-3: aggregate aliases resolve in HAVING; the alias slice is padded to
+		// the item count here (it is otherwise padded after ORDER BY below).
+		aliases := append([]string(nil), aggAliases...)
+		for len(aliases) < len(items) {
+			aliases = append(aliases, "")
+		}
+		ht, hu, hok := reserializeHaving(c, havingCtx{
 			items:       items,
 			tagKey:      tagKey,
 			bucketAlias: m.bucketAlias,
+			aliases:     aliases,
 		})
 		if !hok {
 			return fail()
 		}
-		havingText = ht
+		havingText, havingUnstable = ht, hu
 	}
 
 	// Optional `ORDER BY <ref> [ASC|DESC] [NULLS FIRST|LAST] (, <ref>){0,3}
@@ -1424,7 +1436,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		}
 		// A tolerant (float) aggregate only as the last key (arcX res-2 M2).
 		for _, k := range m.orderKeys[:len(m.orderKeys)-1] {
-			if p := k.Pos - 1; p != m.bucketItem && p != m.tagItem && aggItemTolerant(items[p]) {
+			if p := k.Pos - 1; p != bucketItem && p != tagItem && aggItemTolerant(items[p]) {
 				return fail()
 			}
 		}
@@ -1446,6 +1458,22 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	}
 	if !c.atEnd() {
 		return fail()
+	}
+	// res-3 (review H3/H4): a HAVING over an unstable item can flip a group in or
+	// out of DuckDB's result. The unordered comparator tolerates that (one-sided
+	// groups → WARN), and so does a key-only ORDER BY without LIMIT (the order of
+	// unique keys is not in question); the res-2 ordered comparator and the tie
+	// verification re-run DuckDB strictly, so ordering by an aggregate or cutting
+	// with LIMIT is refused — the same set res-2 refuses as ORDER BY targets.
+	if havingUnstable != "" {
+		if m.hasLimit {
+			return fail()
+		}
+		for _, k := range m.orderKeys {
+			if p := k.Pos - 1; p != bucketItem && p != tagItem {
+				return fail()
+			}
+		}
 	}
 	for len(aggAliases) < len(items) {
 		aggAliases = append(aggAliases, "")
@@ -1478,6 +1506,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	m.tagItem = tagItem
 	m.whereText = whereText
 	m.havingText = havingText
+	m.havingUnstable = havingUnstable
 	m.meas = meas
 	return m, true
 }
@@ -1502,9 +1531,12 @@ type groupedMatch struct {
 	whereText  string
 	// agg-5a: re-serialized HAVING over the select items ("" = none).
 	havingText string
-	meas       string
-	bucketUnit string
-	bucketCol  string
+	// res-3: shadow class of an unstable item the HAVING references ("" none,
+	// "arg", "oracle") — see Decision.HavingUnstable.
+	havingUnstable string
+	meas           string
+	bucketUnit     string
+	bucketCol      string
 	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
 	// the MANDATORY alias — validated parts the builder re-emits.
 	epochWidthSecs int

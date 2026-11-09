@@ -202,6 +202,57 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: `HAVING` routes over every aggregate the engine serves
+
+A grouped query's `HAVING` now routes to the arcx engine for every aggregate the engine serves
+(arcX feat/having-all-aggs). Until now the router sent these to DuckDB:
+- `median`, `quantile_cont`, `quantile_disc`, `quantile` and `mad`;
+- `skewness`, `kurtosis` and `kurtosis_pop`;
+- `bool_and` / `bool_or`, bare (`HAVING bool_and(ok)`) or compared with `= TRUE`, `= FALSE`,
+  `<> TRUE` or `<> FALSE`;
+- `count_if`, `bool_and` and `bool_or` with a predicate argument (`HAVING count_if(status >= 500)
+  > 10`), when written the same way as in the select list;
+- a decimal literal (`HAVING count(*) > 2.5`, `HAVING avg(value) > 0.25`);
+- an aggregate's alias (`count(*) AS n … HAVING n > 100`).
+
+A decimal compared with a whole-number aggregate (`count`, `sum`, `min` or `max` of a `BIGINT`,
+`regr_count`) is compared exactly, as DuckDB does, without going through floating point. The same
+applies to `WHERE`: `WHERE status > 2.5` on a `BIGINT` column now runs on the engine instead of
+falling back. An alias in `HAVING` is resolved the way DuckDB 1.5.6 resolves it. A group key wins
+over an alias, and an alias wins over a table column of the same name that is not grouped. The
+router sends the aggregate itself to the engine in place of the alias.
+
+`HAVING regr_count(…)` was routed before but always fell back, costing a second run on DuckDB. It
+now runs on the engine.
+
+These forms still run on DuckDB:
+- an aggregate in `HAVING` that is not in the select list (`SELECT host … HAVING count(*) > 100`);
+- `IS NULL`, `BETWEEN`, `NOT`, `IN`, a literal on the left, two aggregates compared with each other,
+  and arithmetic;
+- a decimal literal with more than 15 significant digits;
+- `bool_and` / `bool_or` compared with anything but `TRUE` / `FALSE`, or with `<` / `>`;
+- a number compared with the time bucket;
+- a `HAVING` or `ORDER BY` name that DuckDB reads as something other than a column or alias: a
+  keyword (`AS true … HAVING true > 5` compares the literal `true`) or a SQL value function
+  (`current_timestamp`, `current_date`, `localtimestamp`, `user`, …, which DuckDB evaluates);
+- `HAVING` over `arg_max`/`arg_min`/`max_by`/`min_by`, `skewness`/`kurtosis`/`kurtosis_pop`, the Kahan sums,
+  `covar_pop`, `covar_samp`, `regr_sxy` or `regr_intercept`, when the query also has a `LIMIT` or
+  orders by an aggregate. Ordering by the group keys still routes.
+
+DuckDB 1.5.6's results for those last aggregates vary between runs or drift on real data. When such
+a value sits close to the `HAVING` literal, a group can be in one engine's result and not the
+other's. Shadow mode records a group present on only one side under `argdiff` or `oraclediff` (a
+WARN), not as a mismatch. Groups present on both sides are still compared value by value. A
+difference in any other column is a mismatch, as is a group key that appears twice, or a result
+with no group in common with DuckDB's. `median`, `quantile_cont` and `mad` are not treated this
+way: DuckDB's ARM build can differ from the engine in the last bit of an interpolated value, so a
+value sitting exactly on the `HAVING` literal could in principle show as a mismatch.
+
+The same change fixes a router check for top-N queries. An aggregate that carries a floating-point
+tolerance must be the last sort key, but the check did not apply when that aggregate came first in
+the select list (`SELECT avg(x), host … ORDER BY 1, 2`). The engine declined those queries, so
+DuckDB ran them a second time. They now go to DuckDB directly.
+
 ## arcx router: grouped top-N (`ORDER BY … LIMIT`) routes to the engine
 
 Grouped aggregates with an `ORDER BY` over aggregates, `DESC`, `NULLS FIRST`/`LAST`, up to four
@@ -248,9 +299,8 @@ These forms still run on DuckDB:
 - a quoted alias (`AS "time"`);
 - in a grouped query, an alias that matches the group key, the bucket alias or another alias;
 - an alias that is a SQL clause word (`AS from`, `AS where`), which DuckDB accepts;
-- a `HAVING` that names an aggregate's alias, because DuckDB resolves alias names differently
-  in `HAVING`. `HAVING avg(value) > 5` (the aggregate written out) still routes. `ORDER BY` an
-  alias routes since the top-N change below.
+- a `HAVING` that names an aggregate's alias. That routes since the `HAVING` change above,
+  and `ORDER BY` an alias since the top-N change above.
 
 Shadow mode now also compares result column names, since aliases make them user-controlled. One
 existing difference is exempted. When DuckDB serves an unaliased `date_trunc` bucket (grouped,
@@ -262,8 +312,8 @@ column after the rewritten expression (`make_timestamptz(…)`). The engine name
 
 The arcx engine now serves `skewness(x)`, `kurtosis(x)` and `kurtosis_pop(x)` over `BIGINT` and
 `DOUBLE` columns (arcX feat/agg-8-skew-kurt). The recognizer routes them in ungrouped aggregates
-and under a time bucket; grouped by a tag column they stay on DuckDB, as does any `HAVING` that
-references one of them.
+and under a time bucket; grouped by a tag column they stay on DuckDB. A `HAVING` that
+references one of them stayed on DuckDB too, until the `HAVING` change above.
 
 Measured through Arc on a synthetic 132-million-row corpus (DuckDB → engine): `skewness`
 155 → 90 ms, `kurtosis` 233 → 90 ms, all three together 555 → 157 ms, an hourly-bucket
@@ -284,8 +334,9 @@ The arcx engine now serves DuckDB's order statistics (arcX feat/agg-7-order-stat
 `median(x)`, `quantile_cont(x, q)`, `quantile_disc(x, q)` and its alias `quantile(x, q)` and
 `mad(x)` over `BIGINT` and `DOUBLE` columns, and `mode(x)` over `BIGINT` and `VARCHAR` columns. `q` is a single
 literal between 0 and 1. The recognizer routes these in ungrouped aggregates and under a time
-bucket. Grouped by a tag column they stay on DuckDB, as does `mode` in any grouped query and
-any `HAVING` that references one of these functions. A list of fractions, a negative
+bucket. Grouped by a tag column they stay on DuckDB, as does `mode` in any grouped query. A
+`HAVING` that references one of these functions stayed on DuckDB too, until the `HAVING` change
+above. A list of fractions, a negative
 fraction, `mode` over `DOUBLE`, and timestamp or text arguments to the other functions also stay
 on DuckDB; the router cannot see column types, so these reach the engine and fall back
 immediately.
@@ -317,7 +368,7 @@ ungrouped aggregates and under a time bucket (`date_trunc` or the epoch-math for
 stay on DuckDB, as the column forms do. Forms whose output column name DuckDB 1.5.6 and
 2.0 render differently stay on DuckDB: `IN`, `NOT`, arithmetic, timestamp literals, and
 non-canonical number spellings such as `007` or `-0.0`. A `HAVING` that references a
-predicate aggregate also stays on DuckDB.
+predicate aggregate also stayed on DuckDB, until the `HAVING` change above.
 
 Measured through Arc on a synthetic 132-million-row corpus (DuckDB → engine):
 `count_if(cpu_user > 90)` 103 → 76 ms, `count_if(code >= 400)` 34 → 19 ms,
@@ -347,8 +398,8 @@ The arcx engine now serves `fsum` / `sumkahan` / `kahan_sum`, `favg`, `bit_and`,
 `date_trunc` time bucket. Grouped by a tag column they stay on DuckDB (measured 1.1–1.4×
 slower in the engine). The engine also implements `product`, but it is not routed: it
 measured slower than DuckDB. Predicate arguments (`count_if(status >= 500)`) still run on
-DuckDB; they are the next engine slice. `bool_and` / `bool_or` in `HAVING` stay on DuckDB as
-well.
+DuckDB; they are the next engine slice. `bool_and` / `bool_or` in `HAVING` stayed on DuckDB as
+well, until the `HAVING` change above.
 
 Measured through Arc on a synthetic 132-million-row corpus: `bit_and` / `bit_or` / `bit_xor`
 46 → 25 ms, `count_if` / `bool_or` / `bool_and` 40 → 36 ms, an hourly-bucket
@@ -371,7 +422,8 @@ The arcx engine now serves DuckDB's two-argument statistics family, `fn(y, x)` o
 `regr_count`, `regr_avgx`, `regr_avgy`, `regr_slope`, `regr_intercept`, `regr_r2`,
 `regr_sxx`, `regr_syy` and `regr_sxy`. The recognizer routes them in ungrouped aggregates,
 in aggregates grouped by a `date_trunc` time bucket, and in `HAVING` when the same
-aggregate is selected. Grouped by a tag column they stay on DuckDB, like the variance
+aggregate is selected (`HAVING regr_count(…)` fell back to DuckDB until the `HAVING` change
+above). Grouped by a tag column they stay on DuckDB, like the variance
 family. A NaN or ±Inf in either argument makes the engine decline the query; DuckDB then
 answers (or raises its own out-of-range error) exactly as before.
 
