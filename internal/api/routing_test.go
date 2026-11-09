@@ -7,6 +7,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -473,4 +474,38 @@ func TestHandleRoutingError(t *testing.T) {
 	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusBadGateway, resp.StatusCode)
+}
+
+// The forwarding node's own middleware sets headers before CopyResponse runs,
+// and the upstream node ran the same middleware, so the upstream response
+// carries them too. Each must reach the client once: two
+// Access-Control-Allow-Origin values make a browser reject the response.
+func TestCopyResponseDoesNotDuplicateHeadersTheForwarderSet(t *testing.T) {
+	app := fiber.New()
+	app.Use(cors.New(cors.Config{AllowOrigins: "*"}))
+	app.Use(securityHeaders(true))
+	app.Get("/test", func(c *fiber.Ctx) error {
+		return CopyResponse(c, &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Access-Control-Allow-Origin": []string{"*"},
+				"X-Frame-Options":             []string{"DENY"},
+				"Vary":                        []string{"Accept", "Accept-Encoding"},
+			},
+			Body: http.NoBody,
+		})
+	})
+	// Repeated: Go's map order decides which header CopyResponse handles
+	// first, and a delete between adds reorders values only for some
+	// orders. Fifty requests make an order-dependent regression show.
+	for i := 0; i < 50; i++ {
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Origin", "https://app.example")
+		resp, err := app.Test(req, testRequestTimeoutMS)
+		require.NoError(t, err)
+		require.Equal(t, []string{"*"}, resp.Header.Values("Access-Control-Allow-Origin"))
+		require.Equal(t, []string{"DENY"}, resp.Header.Values("X-Frame-Options"))
+		require.Equal(t, []string{"Accept", "Accept-Encoding"}, resp.Header.Values("Vary"),
+			"repeated values keep their order")
+	}
 }

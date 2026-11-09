@@ -79,7 +79,9 @@ What changes with the WAL on:
 When a cluster node forwards a request to another node, the response
 returned to the client kept only the last value of an end-to-end header that
 appeared more than once (`Vary`, `Link`, `WWW-Authenticate`, …). Every value
-now reaches the client. `Set-Cookie` was not affected.
+now reaches the client, in order. `Set-Cookie` was not affected. A header
+both nodes set, such as `Access-Control-Allow-Origin`, is still sent once,
+with the answering node's value.
 
 Thanks to [@lecodev-26](https://github.com/lecodev-26) for the fix.
 ## Fix: a token limited to some databases can list them ([#1562](https://github.com/Basekick-Labs/arc/issues/1562))
