@@ -107,13 +107,21 @@ was refused, and only a query with no table (`SELECT 1`) succeeded. The same
 applies to `write`. A health check that runs `SELECT 1` with such a token
 gets 403: grant its team `read`, or use a token that is in no team.
 
+**When the permission store cannot be read** (the SQLite database holding
+tokens and RBAC grants), these endpoints now answer 503 "Permission store
+unavailable" once a token's cached grants expire, for every token except
+admin tokens. Before, a token that is in no team kept passing this first
+check, because it never read the store. The store is not bypassed for such
+a token, because it might have been added to a team.
+
 **Rolling upgrades.** A request forwarded to a node that has not been
 upgraded yet is checked by that node the old way, so an RBAC-only token can
 see a 403 until every node runs this version.
 
 The edge-sync hub endpoints still require the token's own `write`
 permission: they do not check RBAC per database, so that check is the only
-one they have.
+one they have. It also means RBAC does not narrow a team-member token there;
+give edge-sync spokes a token that is in no team.
 
 ## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
 

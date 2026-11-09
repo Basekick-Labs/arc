@@ -1870,9 +1870,16 @@ func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *Permissi
 // Resolution order matches CheckPermission: admin break-glass, then
 // memberships, then coarse permissions.
 func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permission string) bool {
-	return rm.holdsGrant(tokenInfo, permission, func(pattern string) bool {
+	ok, err := rm.holdsGrant(tokenInfo, permission, func(pattern string) bool {
 		return matchPattern(pattern, database)
-	}, "RBAC data load failed; denying listing (fail closed)")
+	})
+	if err != nil {
+		rm.logger.Error().Err(err).
+			Int64("token_id", tokenInfo.ID).
+			Msg("RBAC data load failed; denying listing (fail closed)")
+		return false
+	}
+	return ok
 }
 
 // HasPermissionAnywhere reports whether the token holds any grant permitting
@@ -1889,42 +1896,44 @@ func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permi
 // break-glass; with memberships, RBAC is authoritative (a role with
 // measurement grants counts only through them); without memberships, the
 // coarse permissions. A grant of one permission never implies another.
-func (rm *RBACManager) HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) bool {
-	return rm.holdsGrant(tokenInfo, permission, func(string) bool { return true },
-		"RBAC data load failed; denying request (fail closed)")
+//
+// An error means the token's grants could not be read: the caller must refuse
+// (fail closed), and should say the store is unavailable rather than that
+// the token lacks the permission. Coarse admin is decided before the store is
+// read, so it never errors.
+func (rm *RBACManager) HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) (bool, error) {
+	return rm.holdsGrant(tokenInfo, permission, func(string) bool { return true })
 }
 
 // holdsGrant is CanAccessAnythingIn and HasPermissionAnywhere: whether the
 // token holds a grant permitting `permission` on a measurement of a database
 // whose role pattern dbMatches accepts.
-func (rm *RBACManager) holdsGrant(tokenInfo *TokenInfo, permission string, dbMatches func(pattern string) bool, loadFailedMsg string) bool {
+func (rm *RBACManager) holdsGrant(tokenInfo *TokenInfo, permission string, dbMatches func(pattern string) bool) (bool, error) {
 	if tokenInfo == nil {
-		return false
+		return false, nil
 	}
 	if hasCoarseAdmin(tokenInfo) {
-		return true
+		return true, nil
 	}
 	data, err := rm.getTokenRBACData(tokenInfo.ID)
 	if err != nil {
-		rm.logger.Error().Err(err).
-			Int64("token_id", tokenInfo.ID).
-			Msg(loadFailedMsg)
-		return false
+		return false, err
 	}
 	if len(data.teams) == 0 {
 		// The coarse list names no database, so the database plays no part.
 		return rm.checkOSSPermission(&PermissionCheckRequest{
 			TokenInfo: tokenInfo, Measurement: "*", Permission: permission,
-		}).Allowed
+		}).Allowed, nil
 	}
 	// Enabled is checked here rather than at the top, matching
 	// checkRBACPermissionCached, which is reached the same way. A disabled
-	// token cannot arrive on a request path at all: VerifyToken is the only
-	// producer of a TokenInfo there and it never returns a disabled one, so
-	// the ordering is not load-bearing. A future caller that constructs a
+	// token cannot arrive on a request path at all: its only producers there
+	// are VerifyToken and, for a request forwarded by a cluster peer,
+	// TokenForForward, and neither returns a disabled or expired one, so the
+	// ordering is not load-bearing. A future caller that constructs a
 	// TokenInfo directly must not rely on that.
 	if !tokenInfo.Enabled {
-		return false
+		return false, nil
 	}
 	for _, team := range data.teams {
 		if !team.Enabled {
@@ -1939,17 +1948,17 @@ func (rm *RBACManager) holdsGrant(tokenInfo *TokenInfo, permission string, dbMat
 			if measPerms := data.measPerms[role.ID]; len(measPerms) > 0 {
 				for _, mp := range measPerms {
 					if containsPermission(mp.Permissions, permission) {
-						return true
+						return true, nil
 					}
 				}
 				continue
 			}
 			if containsPermission(role.Permissions, permission) {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // checkRBACPermissionCached checks permissions using cached RBAC data (no DB queries)

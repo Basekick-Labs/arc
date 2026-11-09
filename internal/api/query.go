@@ -50,7 +50,7 @@ type RBACChecker interface {
 	// HasPermissionAnywhere answers "does this caller hold the permission on
 	// anything", the door question for routes whose resources are in the
 	// body (#1559). The handler must still check each resource.
-	HasPermissionAnywhere(tokenInfo *auth.TokenInfo, permission string) bool
+	HasPermissionAnywhere(tokenInfo *auth.TokenInfo, permission string) (bool, error)
 }
 
 // TableReference represents a database.measurement reference extracted from SQL

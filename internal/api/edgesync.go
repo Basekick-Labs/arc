@@ -174,6 +174,13 @@ func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 		// endpoints moved to (#1559): these handlers check no RBAC grant per
 		// database, so this middleware is the only gate, and admitting a
 		// token on an RBAC grant for one database would let it write any.
+		//
+		// That is not RBAC enforcement either. A token that holds the coarse
+		// "write" bit AND is a team member is not narrowed to its team's
+		// databases here, unlike on every ingest route, where RBAC is
+		// authoritative for team members. Closing that needs a per-database
+		// check in these handlers; until then, give spokes a token that is in
+		// no team.
 		group.Use(auth.RequireWrite(h.authManager))
 	}
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -194,6 +195,8 @@ func TestRBACOnlyTokenCanQuery(t *testing.T) {
 		// The issue's reproduction, on both query routes sharing the door.
 		{"rbac-only", "/api/v1/query", "SELECT 1", 200, false},
 		{"rbac-only", "/api/v1/query/msgpack", "SELECT 1", 200, false},
+		{"rbac-only", "/api/v1/query/arrow", "SELECT 1", 200, false},
+		{"none", "/api/v1/query/arrow", "SELECT 1", 403, true},
 		{"rbac-only", "/api/v1/query", "SELECT count(*) FROM tenanta.cpu", 200, false},
 		{"rbac-meas-read", "/api/v1/query", "SELECT count(*) FROM tenanta.cpu", 200, false},
 		// Past the door, the handler still scopes it.
@@ -311,9 +314,14 @@ func TestRBACOnlyTokenPassesTheTLEDoor(t *testing.T) {
 	}
 }
 
-type anyChecker struct{ allow bool }
+type anyChecker struct {
+	allow bool
+	err   error
+}
 
-func (a anyChecker) HasPermissionAnywhere(*auth.TokenInfo, string) bool { return a.allow }
+func (a anyChecker) HasPermissionAnywhere(*auth.TokenInfo, string) (bool, error) {
+	return a.allow, a.err
+}
 
 // The door middleware on its own. Here, not in package auth: the first fiber
 // response a test binary serves starts fasthttp's server-date goroutine, which
@@ -349,9 +357,12 @@ func TestRequireAnyResourcePermission(t *testing.T) {
 		info *auth.TokenInfo
 		want int
 	}{
-		{"no token", anyChecker{true}, nil, 401},
-		{"checker allows an RBAC-only token", anyChecker{true}, rbacOnly, 204},
-		{"checker refuses, coarse bit not consulted", anyChecker{false}, coarse, 403},
+		{"no token", anyChecker{allow: true}, nil, 401},
+		{"checker allows an RBAC-only token", anyChecker{allow: true}, rbacOnly, 204},
+		{"checker refuses, coarse bit not consulted", anyChecker{}, coarse, 403},
+		// Grants unreadable: refused, as unavailable rather than denied, and
+		// the coarse bit is not a fallback.
+		{"grants unreadable", anyChecker{err: errors.New("store down")}, coarse, 503},
 		{"no checker, coarse read", nil, coarse, 204},
 		{"no checker, no coarse read", nil, rbacOnly, 403},
 	} {

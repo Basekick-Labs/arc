@@ -377,7 +377,7 @@ func RequireResourcePermission(am *AuthManager, rm ResourcePermissionChecker, pe
 // AnyResourcePermissionChecker is what RequireAnyResourcePermission needs:
 // *RBACManager.HasPermissionAnywhere.
 type AnyResourcePermissionChecker interface {
-	HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) bool
+	HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) (bool, error)
 }
 
 // RequireAnyResourcePermission is the door for routes whose resources are
@@ -414,7 +414,21 @@ func RequireAnyResourcePermission(am *AuthManager, rm AnyResourcePermissionCheck
 			// RequireResourcePermission.
 			allowed = am.HasPermission(tokenInfo, permission)
 		} else {
-			allowed = rm.HasPermissionAnywhere(tokenInfo, permission)
+			var err error
+			allowed, err = rm.HasPermissionAnywhere(tokenInfo, permission)
+			if err != nil {
+				// Refused (fail closed), but not as "permission denied": the
+				// grants could not be read, and that is what the operator
+				// needs to see. Falling back to the coarse list would widen a
+				// team member restricted by RBAC for as long as the store is
+				// down.
+				am.logger.Error().Err(err).Int64("token_id", tokenInfo.ID).
+					Msg("RBAC grants could not be read; refusing the request (fail closed)")
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"success": false,
+					"error":   "Permission store unavailable; retry later",
+				})
+			}
 		}
 		if !allowed {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{

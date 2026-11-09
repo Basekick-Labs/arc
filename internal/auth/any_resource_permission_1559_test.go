@@ -90,8 +90,8 @@ func TestHasPermissionAnywhere(t *testing.T) {
 		// RBAC is authoritative for a team member: the coarse bit is not consulted.
 		{"coarse read,write, team grants neither", coarseWithNoGrant, "read", false},
 	} {
-		if got := rm.HasPermissionAnywhere(c.tok, c.permission); got != c.want {
-			t.Errorf("%s: HasPermissionAnywhere(%q) = %v, want %v", c.name, c.permission, got, c.want)
+		if got, err := rm.HasPermissionAnywhere(c.tok, c.permission); err != nil || got != c.want {
+			t.Errorf("%s: HasPermissionAnywhere(%q) = %v, %v; want %v", c.name, c.permission, got, err, c.want)
 		}
 	}
 
@@ -101,10 +101,15 @@ func TestHasPermissionAnywhere(t *testing.T) {
 	if err := am.GetDB().Close(); err != nil {
 		t.Fatal(err)
 	}
-	if rm.HasPermissionAnywhere(readOnly, "read") {
-		t.Error("RBAC data load failure: allowed, want denied")
+	if ok, err := rm.HasPermissionAnywhere(readOnly, "read"); ok || err == nil {
+		t.Errorf("RBAC data load failure: %v, %v; want refused with an error", ok, err)
 	}
-	if !rm.HasPermissionAnywhere(admin, "read") {
-		t.Error("coarse admin refused while the store is unreadable")
+	// A token with no team is refused too: its coarse bit is not trusted
+	// without knowing it has no team.
+	if ok, err := rm.HasPermissionAnywhere(coarseRead, "read"); ok || err == nil {
+		t.Errorf("RBAC data load failure, no-team token: %v, %v; want refused with an error", ok, err)
+	}
+	if ok, err := rm.HasPermissionAnywhere(admin, "read"); !ok || err != nil {
+		t.Errorf("coarse admin while the store is unreadable: %v, %v; want allowed", ok, err)
 	}
 }
