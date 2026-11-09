@@ -118,16 +118,6 @@ func (h *DatabasesHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSche
 // nil` true for a typed nil and defeat the guards below.
 func (h *DatabasesHandler) SetRBACManager(rm RBACChecker) { h.rbacManager = rm }
 
-// checkDatabasePermission gates a listing on the caller's read grant for a
-// database, mirroring QueryHandler.checkMeasurementPermission — which is what
-// the equivalent query-path endpoints use (`SHOW DATABASES`, `SHOW TABLES
-// FROM db`, GET /api/v1/measurements). The list-everything endpoint does
-// not use it: it shows the databases the caller may see
-// (databaseListingFilter, #1562).
-//
-// Returns nil when RBAC is disabled or no token is present: the route
-// middleware has already decided whether an unauthenticated request is
-// allowed, exactly as the query path does.
 // filterReadableMeasurements returns only the measurements the caller may
 // read, preserving order.
 //
@@ -189,38 +179,6 @@ func (h *DatabasesHandler) checkDatabasePermissionScoped(c *fiber.Ctx, database,
 		Int64("token_id", tokenInfo.ID).
 		Msg("RBAC denied listing")
 	return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
-}
-
-func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, measurement, permission string) error {
-	// Gated on the checker being WIRED, not on the license. Enforcement must
-	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
-	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
-	// three cases (admin break-glass, memberships -> RBAC authoritative, no
-	// memberships -> coarse permissions), so a deployment without RBAC
-	// configured is unaffected.
-	if h.rbacManager == nil {
-		return nil
-	}
-	tokenInfo := auth.GetTokenInfo(c)
-	if tokenInfo == nil {
-		return nil
-	}
-	result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
-		TokenInfo:   tokenInfo,
-		Database:    database,
-		Measurement: measurement,
-		Permission:  permission,
-	})
-	if !result.Allowed {
-		h.logger.Warn().
-			Str("database", database).
-			Str("permission", permission).
-			Str("reason", result.Reason).
-			Int64("token_id", tokenInfo.ID).
-			Msg("RBAC permission denied")
-		return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
-	}
-	return nil
 }
 
 // CreateDatabaseRequest represents a request to create a new database

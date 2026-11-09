@@ -871,6 +871,8 @@ type QueryHandler struct {
 
 	// Tiering support for multi-tier query routing (hot/cold)
 	tieringManager *tiering.Manager
+	// coldDatabases overrides coldDatabaseSource in tests.
+	coldDatabases func(context.Context) ([]string, error)
 
 	// Query governance (Enterprise feature - rate limiting and quotas)
 	governanceManager *governance.Manager
@@ -5209,6 +5211,23 @@ func (h *QueryHandler) convertValue(v interface{}) interface{} {
 	}
 }
 
+// coldDatabaseSource lists the databases tier metadata records, which a
+// cold-only database appears in alone; nil without tiering. A test sets
+// QueryHandler.coldDatabases.
+func (h *QueryHandler) coldDatabaseSource() func(context.Context) ([]string, error) {
+	if h.coldDatabases != nil {
+		return h.coldDatabases
+	}
+	if h.tieringManager == nil {
+		return nil
+	}
+	metadata := h.tieringManager.GetMetadata()
+	if metadata == nil {
+		return nil
+	}
+	return metadata.GetAllDatabases
+}
+
 // handleShowDatabases handles SHOW DATABASES command by scanning storage.
 // visible, when non-nil, keeps only the databases the caller may see
 // (databaseListingFilter); it is applied before any per-database storage or
@@ -5269,26 +5288,23 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visibl
 	}
 
 	// Also get databases from tiering metadata (for cold-only databases)
-	if h.tieringManager != nil {
-		metadata := h.tieringManager.GetMetadata()
-		if metadata != nil {
-			coldDatabases, coldErr := metadata.GetAllDatabases(ctx)
-			if coldErr != nil {
-				h.logger.Warn().Err(coldErr).Msg("Failed to get databases from tiering metadata")
-			} else {
-				// Merge into a set to deduplicate
-				dbSet := make(map[string]bool)
-				for _, db := range databases {
-					dbSet[db] = true
-				}
-				for _, db := range keepVisible(coldDatabases, visible) {
-					dbSet[db] = true
-				}
-				// Convert back to slice
-				databases = make([]string, 0, len(dbSet))
-				for db := range dbSet {
-					databases = append(databases, db)
-				}
+	if coldSource := h.coldDatabaseSource(); coldSource != nil {
+		coldDatabases, coldErr := coldSource(ctx)
+		if coldErr != nil {
+			h.logger.Warn().Err(coldErr).Msg("Failed to get databases from tiering metadata")
+		} else {
+			// Merge into a set to deduplicate
+			dbSet := make(map[string]bool)
+			for _, db := range databases {
+				dbSet[db] = true
+			}
+			for _, db := range keepVisible(coldDatabases, visible) {
+				dbSet[db] = true
+			}
+			// Convert back to slice
+			databases = make([]string, 0, len(dbSet))
+			for db := range dbSet {
+				databases = append(databases, db)
 			}
 		}
 	}
@@ -5919,14 +5935,8 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 		}
 	}
 
-	// RBAC permission check - user needs at least some read permission to list measurements.
-	// When a database filter is specified, check against that specific database instead of
-	// requiring wildcard access — users with single-database permissions should be able to
-	// list measurements scoped to that database.
-	// Scoped to one database: "some read grant inside it" (see the note on the
-	// SHOW TABLES gate above). Unscoped: a grant covering everything.
-	// Scoped to one database: the listing question. Unscoped: a grant
-	// covering everything, the same bar SHOW DATABASES applies.
+	// RBAC: scoped to one database, the listing question ("some read grant
+	// inside it"; see the note on the SHOW TABLES gate above).
 	//
 	// Unscoped, the databases are those the caller may see
 	// (databaseListingFilter, #1562): all of them with a grant covering
@@ -6031,9 +6041,10 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 
 	// Drop the (database, measurement) pairs the caller may not read. This
 	// endpoint can span several databases, so it filters per pair rather than
-	// per name. Unscoped callers had to clear the ("*","*") bar above to get
-	// here, so in practice this trims the scoped case; it is applied
-	// unconditionally so the result can never exceed the caller's grants.
+	// per name. It is the correctness guard for both cases: a scoped call, and
+	// an unscoped call by a caller without a grant covering everything
+	// (#1562), whose visible databases can still hold measurements it cannot
+	// read. Never narrow it to one case.
 	measurements = h.filterReadableMeasurementInfos(c, measurements)
 
 	// Sort by database, then measurement

@@ -1,14 +1,18 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog"
 )
 
 // #1562: listing every database (GET /api/v1/databases, SHOW DATABASES, the
@@ -179,5 +183,73 @@ func TestDatabaseListingFilterReportsAnUnreadableStore(t *testing.T) {
 	})
 	if _, err := app.Test(httptest.NewRequest(http.MethodGet, "/", nil)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// coldTiering is a database tiering manager whose metadata is a real store,
+// so a cold-only database (a tier row, no hot file) reaches the listing.
+type coldTiering struct {
+	fakeDatabaseTieringManager
+	store *tiering.MetadataStore
+}
+
+func (c *coldTiering) GetMetadata() *tiering.MetadataStore { return c.store }
+
+// A database known only from tier metadata (cold-only) is filtered like any
+// other, in both listings: a tenant token must not learn its name.
+func TestColdOnlyDatabasesAreFiltered(t *testing.T) {
+	r := newDoorRig(t)
+	ctx := context.Background()
+
+	// SHOW DATABASES: the query handler's cold-database list.
+	r.qh.coldDatabases = func(context.Context) ([]string, error) { return []string{"coldhidden"}, nil }
+	show := func(token string) []string {
+		t.Helper()
+		status, body := r.query(t, token, "/api/v1/query", "SHOW DATABASES")
+		var resp struct {
+			Data [][]interface{} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(body), &resp); err != nil || status != 200 {
+			t.Fatalf("%s: %d %s", token, status, body)
+		}
+		var got []string
+		for _, row := range resp.Data {
+			got = append(got, row[0].(string))
+		}
+		sort.Strings(got)
+		return got
+	}
+	if got := show("rbac-only"); len(got) != 1 || got[0] != "tenanta" {
+		t.Errorf("SHOW DATABASES, tenant token: %v, want [tenanta]", got)
+	}
+	if got := show("coarse-no-team"); len(got) != 3 || got[0] != "coldhidden" {
+		t.Errorf("SHOW DATABASES, full access: %v, want coldhidden among 3", got)
+	}
+
+	// GET /api/v1/databases: a real tier-metadata row in a cold-only database.
+	store, err := tiering.NewMetadataStore(r.am.GetDB(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordColdFile(ctx, &tiering.FileMetadata{
+		Path: "coldhidden/cpu/2026/01/01/cpu_daily.parquet", Database: "coldhidden", Measurement: "cpu",
+		PartitionTime: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), Tier: tiering.TierCold, SizeBytes: 1,
+		CreatedAt: time.Now(),
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	r.dbs.SetTieringManager(&coldTiering{store: store})
+	for _, c := range []struct {
+		token string
+		want  bool
+	}{{"rbac-only", false}, {"coarse-no-team", true}} {
+		_, list := r.databasesList(t, c.token)
+		found := false
+		for _, d := range list.Databases {
+			found = found || d.Name == "coldhidden"
+		}
+		if found != c.want {
+			t.Errorf("GET /databases, %s: coldhidden listed = %v, want %v (%+v)", c.token, found, c.want, list.Databases)
+		}
 	}
 }

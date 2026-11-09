@@ -39,6 +39,9 @@ import (
 type doorRig struct {
 	app    *fiber.App
 	tokens map[string]string
+	am     *auth.AuthManager
+	qh     *QueryHandler
+	dbs    *DatabasesHandler
 }
 
 // doorDenied is the door's refusal body; a handler's RBAC refusal reads
@@ -166,7 +169,7 @@ func newDoorRig(t *testing.T) *doorRig {
 	dbs := NewDatabasesHandler(backend, &config.DeleteConfig{}, am, logger)
 	dbs.SetRBACManager(rm)
 	dbs.RegisterRoutes(app)
-	return &doorRig{app: app, tokens: tokens}
+	return &doorRig{app: app, tokens: tokens, am: am, qh: qh, dbs: dbs}
 }
 
 func (r *doorRig) do(t *testing.T, token string, req *http.Request) (int, string) {

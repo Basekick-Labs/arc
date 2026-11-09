@@ -266,29 +266,9 @@ func TestEstimateQuery_RBAC_NoToken(t *testing.T) {
 // listMeasurements RBAC tests
 // =============================================================================
 
-func TestListMeasurements_RBAC_NoGrantListsNothing(t *testing.T) {
-	rbac := &mockRBACChecker{
-		enabled:      true,
-		allowAll:     false,
-		deniedReason: "no read permission for *.*",
-	}
-	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "test-token"))
-
-	req := httptest.NewRequest("GET", "/api/v1/measurements", nil)
-
-	resp, err := app.Test(req, -1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// A caller without a grant covering everything sees only the databases
-	// it can read something in (#1562); this one can read nothing, so the
-	// listing is empty rather than refused.
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != fiber.StatusOK || !strings.Contains(string(bodyBytes), `"count":0`) {
-		t.Fatalf("expected 200 with no measurements, got %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-}
+// The unscoped listing for a caller with no grant is covered end to end by
+// TestUnscopedMeasurementsListShowsTheCallersDatabases (listing_1562_test.go):
+// this rig has no storage, so it answered empty before any RBAC ran.
 
 func TestListMeasurements_RBAC_Allowed(t *testing.T) {
 	rbac := &mockRBACChecker{
