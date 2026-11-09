@@ -274,6 +274,18 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 		return err
 	}
 
+	// net/http populates resp.Trailer only after the body has been consumed.
+	// Re-declare and publish those end-to-end trailers on the forwarded response.
+	for key, values := range resp.Trailer {
+		if isHopByHop(key) || len(values) == 0 {
+			continue
+		}
+		if err := c.Context().Response.Header.AddTrailer(key); err != nil {
+			return fmt.Errorf("register forwarded response trailer %q: %w", key, err)
+		}
+		c.Context().Response.Header.Set(key, strings.Join(values, ", "))
+	}
+
 	// A fence refusal from the node the write was forwarded to is the expected
 	// answer during a failover: logged here by reason, not per request (#1268).
 	// Only once the body arrived: a failed copy is a real proxy error.

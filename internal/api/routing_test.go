@@ -231,7 +231,8 @@ func TestCopyResponse(t *testing.T) {
 				"Connection":        []string{"keep-alive"}, // Should be filtered out (hop-by-hop)
 				"Transfer-Encoding": []string{"chunked"},    // Should be filtered out (hop-by-hop)
 			},
-			Body: http.NoBody,
+			Trailer: http.Header{"X-Arc-Stream-Status": []string{"truncated"}},
+			Body:    http.NoBody,
 		}
 
 		err := CopyResponse(c, mockResp)
@@ -253,6 +254,7 @@ func TestCopyResponse(t *testing.T) {
 	// Verify hop-by-hop headers are NOT copied
 	assert.Empty(t, resp.Header.Get("Connection"))
 	assert.Empty(t, resp.Header.Get("Transfer-Encoding"))
+	assert.Equal(t, "truncated", resp.Trailer.Get("X-Arc-Stream-Status"))
 }
 
 func TestShouldForwardWrite(t *testing.T) {
