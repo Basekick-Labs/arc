@@ -80,7 +80,8 @@ type TierPruneDetail struct {
 // same store, once per covered day, and a multi-day range against an
 // unreachable endpoint would spend the request's deadline in the pruner.
 // Their paths are kept unverified instead, exactly as if their own listing
-// had failed. The query path asks for it on the cold tier only, where the
+// had failed. The query path asks for it on the cold tier only, and only on a
+// node whose tier metadata is trusted, where the
 // unverified paths may then be left out; elsewhere one transient failure
 // would only turn the rest of the range into unverified globs that match
 // nothing, and the read into a "no files" failure.

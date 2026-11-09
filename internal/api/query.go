@@ -4092,18 +4092,28 @@ func statedBounds(tr *pruning.TimeRange) (start, end *time.Time) {
 // The cost is one SQLite lookup, and only on a read whose cold listing
 // already failed.
 func (h *QueryHandler) coldRangeHasNoRows(ctx context.Context, database, measurement string, timeRange *pruning.TimeRange) bool {
-	guard := h.coldTierGuard()
-	if guard == nil || !guard.ColdMetadataAuthoritative() {
+	if !h.coldMetadataTrusted() {
 		return false
 	}
+	guard := h.coldTierGuard()
 	start, end := statedBounds(timeRange)
-	has, err := guard.HasColdFilesInRange(ctx, database, measurement, start, end)
+	// Quarantined rows count: their objects are still read through the glob
+	// on a healthy store, so leaving them out would drop real rows.
+	has, err := guard.HasAnyColdRowsInRange(ctx, database, measurement, start, end)
 	if err != nil {
 		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
 			Msg("Could not check tier metadata for cold rows in this read's range; keeping the cold partitions the cold tier could not list")
 		return false
 	}
 	return !has
+}
+
+// coldMetadataTrusted reports whether this node's tier metadata may stand in
+// for a cold listing that failed (tiering.Manager.ColdMetadataAuthority).
+// Atomic loads only; asked on every tiered read.
+func (h *QueryHandler) coldMetadataTrusted() bool {
+	guard := h.coldTierGuard()
+	return guard != nil && guard.ColdMetadataAuthoritative()
 }
 
 // coldUnlistedLog limits the Warn coldRangeHasNoRows' callers log when they
@@ -4693,7 +4703,13 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			continue
 		}
 		isCold := src.tier == tiering.TierCold
-		d := h.pruner.PruneTierPathsDetail(ctx, src.glob, database, measurement, timeRange, src.backend, !isCold, isCold)
+		// Stop listing after the first failure only where the unlisted
+		// partitions may then be left out. Elsewhere (a cluster node, rows
+		// not yet trusted) one transient failure would turn every later day
+		// into an unchecked glob, and a day with no cold data into a "no
+		// files" 503 on a healthy store (#1550).
+		stopAfterFailure := isCold && h.coldMetadataTrusted()
+		d := h.pruner.PruneTierPathsDetail(ctx, src.glob, database, measurement, timeRange, src.backend, !isCold, stopAfterFailure)
 		if isCold && allColdPathsUnlisted(d) && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
 			// The cold tier could not be listed for any of these partitions,
 			// and this node's tier metadata, a complete record of the cold
@@ -4862,6 +4878,8 @@ func (v tieringTierView) GetBackendForTier(tier tiering.Tier) storage.Backend {
 type coldTierGuard interface {
 	ColdTierMissing() bool
 	HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error)
+	// HasAnyColdRowsInRange: HasColdFilesInRange with quarantined rows (#1550).
+	HasAnyColdRowsInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error)
 	// ColdMetadataAuthoritative: this node's cold rows are a complete record
 	// of the cold store (#1550).
 	ColdMetadataAuthoritative() bool

@@ -16,7 +16,7 @@ import (
 
 // tiering.Manager is the backup package's cold restore guard.
 var _ interface {
-	BeginColdRestore()
+	BeginColdRestore() error
 	EndColdRestore()
 } = (*Manager)(nil)
 
@@ -191,7 +191,7 @@ func TestMarkingDuringASyncSurvivesIt(t *testing.T) {
 	completeSync(t, m, cold)
 	ctx := context.Background()
 	start := m.coldAuth.gen.Load()
-	if err := m.coldAuth.mark(ctx, m.metadata, coldAuthorityReasonRestore); err != nil {
+	if _, err := m.coldAuth.mark(ctx, m.metadata, coldAuthorityReasonRestore); err != nil {
 		t.Fatal(err)
 	}
 	if cleared, err := m.coldAuth.clear(ctx, m.metadata, start); cleared || err != nil {
@@ -233,7 +233,10 @@ func TestColdRestoreWindowBlocksClearing(t *testing.T) {
 func TestMarkForgetsTheFlagEvenWithoutAMarkerFile(t *testing.T) {
 	m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: filepath.Join(t.TempDir(), "missing-dir", "arc.db"+ColdMetadataUnverifiedSuffix)})
 	completeSync(t, m, cold)
-	m.markColdMetadataUnverified(coldAuthorityReasonRestore)
+	// The flag was forgotten, so the marking is persisted: no error.
+	if err := m.markColdMetadataUnverified(coldAuthorityReasonRestore); err != nil {
+		t.Fatalf("marking with the flag forgotten reported %v", err)
+	}
 
 	var again coldAuthority
 	if err := again.load(context.Background(), m.metadata, "", false); err != nil {
@@ -241,5 +244,87 @@ func TestMarkForgetsTheFlagEvenWithoutAMarkerFile(t *testing.T) {
 	}
 	if again.complete.Load() {
 		t.Fatal("after a marking whose file could not be written, a restart trusts the rows")
+	}
+}
+
+// HasAnyColdRowsInRange counts a quarantined cold row as cold data, where
+// HasColdFilesInRange (#1105) does not: DuckDB's glob still reads the object
+// behind it, so a read that leaves the cold tier out on metadata's word would
+// drop its rows (#1550). Bounds behave as in HasColdFilesInRange.
+func TestHasAnyColdRowsInRangeCountsQuarantinedRows(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	recordAt(t, store, "db3/cpu/2025/01/01/q_daily.parquet", "db3", TierCold) // 2025-01-01 00:00
+	if err := store.QuarantineFile(ctx, "db3/cpu/2025/01/01/q_daily.parquet", "x"); err != nil {
+		t.Fatal(err)
+	}
+	recordAt(t, store, "db2/cpu/2025/01/01/00/h.parquet", "db2", TierHot)
+	m := &Manager{metadata: store}
+	at := func(s string) *time.Time { v, _ := time.Parse(time.RFC3339, s); return &v }
+	for _, c := range []struct {
+		name       string
+		db         string
+		start, end *time.Time
+		want       bool
+	}{
+		{"quarantined, open range", "db3", nil, nil, true},
+		{"quarantined, range covering it", "db3", at("2025-01-01T15:00:00Z"), at("2025-01-01T16:00:00Z"), true},
+		{"quarantined, range the next day", "db3", at("2025-01-02T01:00:00Z"), nil, false},
+		{"hot rows only", "db2", nil, nil, false},
+	} {
+		got, err := m.HasAnyColdRowsInRange(ctx, c.db, "cpu", c.start, c.end)
+		if err != nil || got != c.want {
+			t.Errorf("%s: %v, %v; want %v", c.name, got, err, c.want)
+		}
+	}
+	// The #1105 guard's view is unchanged.
+	if got, err := m.HasColdFilesInRange(ctx, "db3", "cpu", nil, nil); err != nil || got {
+		t.Errorf("HasColdFilesInRange on a quarantined-only measurement = %v, %v; want false", got, err)
+	}
+}
+
+// A marking neither the marker file nor the database flag recorded would be
+// lost on a restart: BeginColdRestore reports it and leaves no window open.
+func TestBeginColdRestoreFailsWhenTheMarkingCannotPersist(t *testing.T) {
+	m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: filepath.Join(t.TempDir(), "missing-dir", "arc.db"+ColdMetadataUnverifiedSuffix)})
+	completeSync(t, m, cold)
+	// The flag write fails too: the database is closed.
+	if err := m.metadata.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.BeginColdRestore(); err == nil {
+		t.Fatal("BeginColdRestore succeeded with nothing persisted")
+	}
+	if n := m.coldAuth.restoring.Load(); n != 0 {
+		t.Fatalf("restoring = %d after a refused begin; want 0", n)
+	}
+	if m.ColdMetadataAuthoritative() {
+		t.Fatal("rows trusted in memory after a failed marking")
+	}
+}
+
+// An object the sync cannot parse under a measurement that has cold rows is
+// read by that measurement's fallback glob (db/measurement/**/*.parquet), so
+// it leaves the rows untrusted, on the first sync as on later ones. One
+// outside every tiered measurement (a shared bucket's other contents) does
+// not.
+func TestUnparseableObjectUnderATieredMeasurementKeepsRowsUntrusted(t *testing.T) {
+	const good = "db1/cpu/2024/03/15/cpu_a_daily.parquet"
+	for _, c := range []struct {
+		name    string
+		objects []string
+		trusted bool
+	}{
+		{"under a tiered measurement", []string{good, "db1/cpu/stray.parquet"}, false},
+		{"outside every tiered measurement", []string{good, "warehouse/t/stray.parquet"}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m, _, cold := authManager(t, ManagerConfig{ColdMetadataMarkerPath: markerIn(t)})
+			completeSync(t, m, cold, c.objects...)
+			if ok, reason := m.ColdMetadataAuthority(); ok != c.trusted {
+				t.Fatalf("authoritative = %v (%q), want %v", ok, reason, c.trusted)
+			}
+		})
 	}
 }

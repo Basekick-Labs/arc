@@ -390,7 +390,12 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		// vouch for an empty cold range (#1550); marked before the first
 		// cold write, so a crash mid-restore leaves it marked.
 		if g, ok := m.coldSource.(coldRestoreGuard); ok && m.coldBackendOrNil() != nil {
-			g.BeginColdRestore()
+			if err := g.BeginColdRestore(); err != nil {
+				err = fmt.Errorf("restore refused before writing data: %w", err)
+				progress.Status = "failed"
+				progress.Error = err.Error()
+				return nil, err
+			}
 			defer g.EndColdRestore()
 		}
 		if err := m.restoreDataFiles(ctx, opts.BackupID, read, progress, mode, pause); err != nil {

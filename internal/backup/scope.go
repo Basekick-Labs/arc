@@ -291,7 +291,9 @@ type ColdSource interface {
 // cold source can stop trusting its cold rows across the restore.
 // tiering.Manager implements it.
 type coldRestoreGuard interface {
-	BeginColdRestore()
+	// BeginColdRestore's error refuses the restore: the cold source could
+	// not record that its rows may become incomplete (#1550).
+	BeginColdRestore() error
 	EndColdRestore()
 }
 

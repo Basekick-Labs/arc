@@ -342,7 +342,9 @@ func (m *Manager) RecordRestoredColdFiles(ctx context.Context, sizes map[string]
 	if err != nil || len(failed) > 0 {
 		// Bytes in the cold store with no row: until a complete cold sync
 		// records them, these rows cannot vouch for an empty range (#1550).
-		m.markColdMetadataUnverified(coldAuthorityReasonRestore)
+		// Logged inside if it cannot be persisted; untrusted in memory
+		// regardless.
+		_ = m.markColdMetadataUnverified(coldAuthorityReasonRestore)
 	}
 	if err != nil {
 		return nil, failed, err

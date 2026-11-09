@@ -159,26 +159,35 @@ func (a *coldAuthority) load(ctx context.Context, store *MetadataStore, markerPa
 // mark records that rows may be missing: the marker file, and the tier_state
 // flag forgotten, so a marker that could not be written still leaves the rows
 // untrusted after a restart. Failures are returned; the in-memory state is
-// set first regardless.
-func (a *coldAuthority) mark(ctx context.Context, store *MetadataStore, reason string) error {
+// set first regardless. lost reports that neither write landed while the
+// flag may still say complete, so a restart would trust the rows again.
+func (a *coldAuthority) mark(ctx context.Context, store *MetadataStore, reason string) (lost bool, err error) {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 	a.gen.Add(1)
 	a.marked.Store(true)
 	a.setReason(reason)
 	var errs []error
+	markerWritten := false
 	if a.markerPath != "" {
 		if err := writeColdMarker(a.markerPath, reason); err != nil {
 			errs = append(errs, err)
+		} else {
+			markerWritten = true
 		}
 	}
+	// Without a store there is no flag to outlive this process: the rows are
+	// untrusted after a restart either way.
+	flagForgotten := store == nil
 	if store != nil {
 		if err := store.setColdRowsComplete(ctx, false); err != nil {
 			errs = append(errs, err)
+		} else {
+			flagForgotten = true
 		}
 	}
 	a.complete.Store(false)
-	return errors.Join(errs...)
+	return !markerWritten && !flagForgotten, errors.Join(errs...)
 }
 
 // clear records a complete cold sync that began at generation startGen. It
@@ -249,13 +258,20 @@ func (m *Manager) ColdMetadataAuthoritative() bool {
 const coldAuthTimeout = 10 * time.Second
 
 // markColdMetadataUnverified records that cold rows may be missing.
-func (m *Manager) markColdMetadataUnverified(reason string) {
+// It reports an error when the marking could not be persisted at all: a
+// restart would then trust the rows again.
+func (m *Manager) markColdMetadataUnverified(reason string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), coldAuthTimeout)
 	defer cancel()
-	if err := m.coldAuth.mark(ctx, m.metadata, reason); err != nil {
+	lost, err := m.coldAuth.mark(ctx, m.metadata, reason)
+	if err != nil {
 		m.logger.Error().Err(err).Str("reason", reason).
 			Msg("Could not fully persist that cold tier rows may be incomplete; this process treats them as incomplete regardless")
 	}
+	if lost {
+		return fmt.Errorf("could not persist that cold tier rows may be incomplete: %w", err)
+	}
+	return nil
 }
 
 // BeginColdRestore is called by a restore before it may write to the cold
@@ -263,12 +279,21 @@ func (m *Manager) markColdMetadataUnverified(reason string) {
 // from clearing that until EndColdRestore: objects the restore writes after a
 // sync has listed would otherwise lose their only record if the restore then
 // died before recording their rows. Nil-receiver safe.
-func (m *Manager) BeginColdRestore() {
+//
+// An error means the marking could not be persisted anywhere (neither the
+// marker file nor the tier_state flag): a crash mid-restore would bring the
+// rows back trusted with the restored objects missing from them. The restore
+// must not start; no window is left open and EndColdRestore must not follow.
+func (m *Manager) BeginColdRestore() error {
 	if m == nil {
-		return
+		return nil
 	}
 	m.coldAuth.restoring.Add(1)
-	m.markColdMetadataUnverified(coldAuthorityReasonRestore)
+	if err := m.markColdMetadataUnverified(coldAuthorityReasonRestore); err != nil {
+		m.coldAuth.restoring.Add(-1)
+		return err
+	}
+	return nil
 }
 
 // EndColdRestore ends a BeginColdRestore. The next complete cold sync then
@@ -289,7 +314,9 @@ func (m *Manager) coldSyncCompleted(startGen uint64, notRecorded int, sample []s
 	if notRecorded > 0 {
 		m.logger.Warn().Int("objects_not_recorded", notRecorded).Strs("sample", sample).
 			Msg("Cold tier metadata sync could not record every cold object; cold tier rows are marked incomplete until a sync records them all, so a read the cold tier cannot list fails rather than answer from them")
-		m.markColdMetadataUnverified(coldAuthorityReasonUnrecorded)
+		// A marking that could not be persisted is logged inside; this
+		// process keeps the rows untrusted either way.
+		_ = m.markColdMetadataUnverified(coldAuthorityReasonUnrecorded)
 		return
 	}
 	wasTrusted := m.ColdMetadataAuthoritative()

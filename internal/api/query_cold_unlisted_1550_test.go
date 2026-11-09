@@ -3,7 +3,10 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,7 +35,13 @@ type unlistedColdGuard struct {
 
 func (g *unlistedColdGuard) ColdTierMissing() bool           { return false }
 func (g *unlistedColdGuard) ColdMetadataAuthoritative() bool { return g.authoritative }
-func (g *unlistedColdGuard) HasColdFilesInRange(_ context.Context, _, _ string, start, end *time.Time) (bool, error) {
+
+// HasColdFilesInRange skips quarantined rows; the #1550 path must not ask it.
+func (g *unlistedColdGuard) HasColdFilesInRange(context.Context, string, string, *time.Time, *time.Time) (bool, error) {
+	panic("#1550: leaving out unlisted cold partitions must ask HasAnyColdRowsInRange (quarantined rows count)")
+}
+
+func (g *unlistedColdGuard) HasAnyColdRowsInRange(_ context.Context, _, _ string, start, end *time.Time) (bool, error) {
 	g.calls++
 	g.start, g.end = start, end
 	return g.hasCold, g.err
@@ -246,5 +255,68 @@ func TestMultiDayReadPaysOneColdListingTimeout(t *testing.T) {
 	// Five covered days at 5 s each would be 25 s; one timeout is ~5 s.
 	if elapsed > 12*time.Second {
 		t.Fatalf("building the read took %v; the cold tier was listed once per day", elapsed)
+	}
+}
+
+// deniedCold is an S3 cold tier whose endpoint answers every request 403
+// AccessDenied at once (revoked credentials), counting the requests.
+func deniedCold(t *testing.T) (storage.Backend, *atomic.Int64) {
+	t.Helper()
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`))
+	}))
+	t.Cleanup(srv.Close)
+	b, err := storage.NewS3Backend(&storage.S3Config{
+		Bucket: "cold", Region: "us-east-1", Endpoint: srv.URL,
+		AccessKey: "k", SecretKey: "s", PathStyle: true,
+	}, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	// Whatever the constructor itself asked is not a listing.
+	requests.Store(0)
+	return b, &requests
+}
+
+// Stopping after the first failed listing is only for a node whose metadata
+// may then leave the unlisted partitions out. On any other node (a cluster
+// node, rows not yet trusted) each day is still listed on its own, as on
+// main: stopping would turn one transient failure into unchecked globs for
+// every later day, and a day with no cold data into a "no files" 503.
+func TestColdListingStopsAfterAFailureOnlyWhereMetadataIsTrusted(t *testing.T) {
+	sql := "SELECT count(*) FROM sch.m WHERE time >= '2025-12-28T00:00:00Z' AND time < '2026-01-01T11:00:00Z'"
+	for _, c := range []struct {
+		name          string
+		authoritative bool
+		want          func(int64) bool
+	}{
+		{"trusted", true, func(n int64) bool { return n == 1 }},
+		{"not trusted", false, func(n int64) bool { return n >= 5 }}, // one per covered day
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := unlistedEnv(t)
+			cold, requests := deniedCold(t)
+			// Metadata has cold rows in range, so the tier is never left out:
+			// this pins the listing count alone.
+			e.h.coldGuard = &unlistedColdGuard{authoritative: c.authoritative, hasCold: true}
+			e.h.tierView = fakeTierView{tiers: map[tiering.Tier]bool{tiering.TierHot: true, tiering.TierCold: true}, cold: cold}
+			ctx, _ := pruning.WithVolatileResult(context.Background())
+			paths := map[tiering.Tier]string{
+				tiering.TierHot:  e.h.getStoragePath(ctx, "sch", "m"),
+				tiering.TierCold: e.h.storagePathForBackend(ctx, cold, "sch", "m"),
+			}
+			from := e.h.buildMultiTierReadParquet(ctx, "sch", "m", sql, paths, "FROM")
+			if !strings.Contains(from, "s3://") {
+				t.Fatalf("read %s left the cold tier out; metadata says it has cold rows", from)
+			}
+			if n := requests.Load(); !c.want(n) {
+				t.Fatalf("cold listing requests = %d", n)
+			}
+		})
 	}
 }

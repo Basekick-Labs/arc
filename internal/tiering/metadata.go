@@ -1016,8 +1016,24 @@ func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurem
 // day), so the lower bound is widened by a day: a range starting mid-day
 // still needs that day's file.
 func (s *MetadataStore) HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	return s.hasColdRowsInRange(ctx, database, measurement, start, end, false)
+}
+
+// HasAnyColdRowsInRange is HasColdFilesInRange counting quarantined cold rows
+// too (#1550). A quarantined key is one Arc's own path checks refuse, but
+// DuckDB's glob over the partition does not apply them: on a healthy store
+// the read still returns that object's rows. So a read that may leave the
+// cold tier out on metadata's word must treat a quarantined row as data.
+func (s *MetadataStore) HasAnyColdRowsInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	return s.hasColdRowsInRange(ctx, database, measurement, start, end, true)
+}
+
+func (s *MetadataStore) hasColdRowsInRange(ctx context.Context, database, measurement string, start, end *time.Time, includeQuarantined bool) (bool, error) {
 	query := `SELECT 1 FROM tier_files
-		WHERE database = ? AND measurement = ? AND tier = ? AND quarantined_at IS NULL`
+		WHERE database = ? AND measurement = ? AND tier = ?`
+	if !includeQuarantined {
+		query += " AND quarantined_at IS NULL"
+	}
 	args := []any{database, measurement, string(TierCold)}
 	if start != nil {
 		query += " AND partition_time >= ?"

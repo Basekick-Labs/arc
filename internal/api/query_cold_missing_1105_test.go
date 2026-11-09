@@ -29,6 +29,10 @@ func (f *fakeColdGuard) ColdTierMissing() bool { return f.missing }
 // on the path they pin.
 func (f *fakeColdGuard) ColdMetadataAuthoritative() bool { return false }
 
+func (f *fakeColdGuard) HasAnyColdRowsInRange(context.Context, string, string, *time.Time, *time.Time) (bool, error) {
+	panic("#1105 tests never reach the #1550 path")
+}
+
 func (f *fakeColdGuard) HasColdFilesInRange(_ context.Context, _, measurement string, start, _ *time.Time) (bool, error) {
 	f.calls++
 	f.start = start
