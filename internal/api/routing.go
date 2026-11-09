@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
@@ -27,6 +28,7 @@ var hopByHopHeaders = map[string]bool{
 	"Proxy-Authenticate":  true,
 	"Proxy-Authorization": true,
 	"Te":                  true,
+	"Trailer":             true,
 	"Trailers":            true,
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
@@ -253,42 +255,96 @@ func ForwardIdentityVerifier(coord ForwardIdentityChecker) func(c *fiber.Ctx) (b
 
 // CopyResponse writes an HTTP response from the router to a Fiber context.
 // It copies the status code, headers (excluding hop-by-hop), and body.
-func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
-	defer resp.Body.Close()
+type forwardedResponseBody struct {
+	body   io.ReadCloser
+	onEOF  func()
+	once   sync.Once
+}
 
-	// Set status code
+func (b *forwardedResponseBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+	if err == io.EOF {
+		b.once.Do(b.onEOF)
+	}
+	return n, err
+}
+
+func (b *forwardedResponseBody) Close() error {
+	return b.body.Close()
+}
+
+// CopyResponse streams an HTTP response from the router into a Fiber context.
+// It copies status and end-to-end headers without buffering the response body.
+func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
+	// Capture the request context and path before returning: Fiber recycles its
+	// *Ctx after the handler, while fasthttp consumes the body stream afterward.
+	fctx := c.Context()
+	requestPath := c.Path()
+
+	// Set status code.
 	c.Status(resp.StatusCode)
 
-	// Copy headers (excluding hop-by-hop headers)
+	// Copy end-to-end headers, preserving repeated values.
 	for key, values := range resp.Header {
 		if !isHopByHop(key) {
 			for _, v := range values {
-				c.Set(key, v)
+				fctx.Response.Header.Add(key, v)
 			}
 		}
 	}
 
-	// Copy body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
+	// Declare upstream trailers before the response is committed. net/http
+	// fills their values only after the body reaches EOF.
+	for key := range resp.Trailer {
+		if isHopByHop(key) {
+			continue
+		}
+		if err := fctx.Response.Header.AddTrailer(key); err != nil {
+			_ = resp.Body.Close()
+			return fmt.Errorf("register forwarded response trailer %q: %w", key, err)
+		}
 	}
 
-	// A fence refusal from the node the write was forwarded to is the expected
-	// answer during a failover: logged here by reason, not per request (#1268).
-	// Only once the body arrived: a failed copy is a real proxy error.
+	onEOF := func() {
+		// Publish trailer values after net/http has populated resp.Trailer.
+		// SetBodyStream reads on the response-writing goroutine, so this runs
+		// after the header and body and before fasthttp writes the trailer block.
+		for key, values := range resp.Trailer {
+			if isHopByHop(key) || len(values) == 0 {
+				continue
+			}
+			fctx.Response.Header.Set(key, strings.Join(values, ", "))
+		}
+
+		// A fence refusal from the node the write was forwarded to is the expected
+		// answer during a failover: log only after the complete upstream body arrives.
+		if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestFencedHeader) != "" {
+			ingest.LogRefusal("forwarded "+requestPath, &ingest.RefusalError{Reason: "forwarded", Text: "the node this write was forwarded to refused it (503)"})
+		} else if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestRefusedHeader) != "" {
+			reason := forwardedRefusalReason(resp.Header.Get(IngestRefusedHeader))
+			ingest.LogRefusal("forwarded "+requestPath, &ingest.WriteRefusal{Reason: reason, Text: "the node this write was forwarded to refused it (503, " + reason + ")"})
+		}
+	}
+
+	// Preserve the request-local refusal classification before the Fiber handler
+	// returns; the stream callback must not touch the recycled Fiber context.
 	if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestFencedHeader) != "" {
 		c.Locals(ingestFencedLocal, true)
-		ingest.LogRefusal("forwarded "+c.Path(), &ingest.RefusalError{Reason: "forwarded", Text: "the node this write was forwarded to refused it (503)"})
 	} else if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestRefusedHeader) != "" {
-		// Likewise a node-local refusal there, such as WAL disk pressure
-		// (#676), logged by the reason it sent.
 		c.Locals(ingestRefusedLocal, true)
-		reason := forwardedRefusalReason(resp.Header.Get(IngestRefusedHeader))
-		ingest.LogRefusal("forwarded "+c.Path(), &ingest.WriteRefusal{Reason: reason, Text: "the node this write was forwarded to refused it (503, " + reason + ")"})
 	}
 
-	return c.Send(body)
+	bodySize := -1
+	if resp.ContentLength >= 0 && resp.ContentLength <= int64(^uint(0)>>1) {
+		bodySize = int(resp.ContentLength)
+	}
+	if bodySize == 0 {
+		_ = resp.Body.Close()
+		onEOF()
+		return nil
+	}
+	fctx.Response.SetBodyStream(&forwardedResponseBody{body: resp.Body, onEOF: onEOF}, bodySize)
+	return nil
 }
 
 // ForwardDecision is the outcome of the pre-handler routing check. It
