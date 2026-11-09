@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
 )
@@ -197,4 +198,96 @@ func TestColdMissingObjects_NilAndNoColdTier(t *testing.T) {
 	}
 	m.BeginColdRemoval()
 	m.EndColdRemoval()
+}
+
+// An incomplete check never lowers the lost count; a complete one does.
+func TestColdMissingObjects_IncompleteCheckDoesNotClear(t *testing.T) {
+	m, hot, cold := missingRig(t)
+	syncListing(t, m, cold) // both lost
+	if st := m.ColdMissingObjects(); st.Lost != 2 {
+		t.Fatalf("%+v", st)
+	}
+	m.hotBackend = &hotOnlyExistsErrorBackend{mockBackend: hot}
+	syncListing(t, m, cold) // every hot stat fails: 0 lost, 2 unchecked
+	if st := m.ColdMissingObjects(); st.Lost != 2 || st.Unchecked != 0 {
+		t.Fatalf("an incomplete check replaced the result: %+v", st)
+	}
+	if metrics.Get().Snapshot()["tiering_cold_rows_missing_objects"] != int64(2) {
+		t.Fatal("an incomplete check cleared the gauge")
+	}
+	m.hotBackend = hot
+	cold.seedRaw(missA, []byte("x"))
+	cold.seedRaw(missB, []byte("x"))
+	syncListing(t, m, cold, missA, missB)
+	if st := m.ColdMissingObjects(); st.Lost != 0 {
+		t.Fatalf("a complete check did not clear: %+v", st)
+	}
+}
+
+// A check that started earlier never overwrites one that started later.
+func TestColdMissingObjects_OlderCheckDoesNotOverwrite(t *testing.T) {
+	m, _, _ := missingRig(t)
+	now := time.Now()
+	newer := &ColdMissingObjectsStatus{Lost: 3}
+	if !m.publishColdMissing(newer, now) {
+		t.Fatal("newer not published")
+	}
+	if m.publishColdMissing(&ColdMissingObjectsStatus{}, now.Add(-time.Second)) || m.ColdMissingObjects() != newer {
+		t.Fatal("an older check overwrote a newer one")
+	}
+}
+
+// A primary demoted to reader stops reporting at once, before its next sync.
+func TestColdMissingObjects_DemotedPrimaryStopsReporting(t *testing.T) {
+	m, _, cold := missingRig(t)
+	syncListing(t, m, cold)
+	gate := &mockGate{role: "writer"}
+	gate.primary.Store(true)
+	m.clusterGate = gate
+	if m.ColdMissingObjects() == nil {
+		t.Fatal("primary: no result")
+	}
+	gate.primary.Store(false)
+	if m.ColdMissingObjects() != nil {
+		t.Fatal("demoted primary still reports")
+	}
+}
+
+// Database delete removes cold objects before their rows: bracketed.
+func TestColdMissingObjects_DatabaseDeleteIsBracketed(t *testing.T) {
+	m, _, cold := missingRig(t)
+	cold.seedRaw(missA, []byte("x"))
+	cold.seedRaw(missB, []byte("x"))
+	var during []int32
+	m.coldBackend = &deleteSpy{listedColdObjects: &listedColdObjects{mockBackend: cold}, onDelete: func() { during = append(during, m.coldRemovals.Load()) }}
+	m.CleanupDatabaseDelete(context.Background(), "db1", nil, nil)
+	if len(during) == 0 || during[0] != 1 || m.coldRemovals.Load() != 0 {
+		t.Fatalf("removals during deletes %v, after %d: want 1 and 0", during, m.coldRemovals.Load())
+	}
+}
+
+type deleteSpy struct {
+	*listedColdObjects
+	onDelete func()
+}
+
+func (d *deleteSpy) Delete(ctx context.Context, path string) error {
+	d.onDelete()
+	return d.listedColdObjects.Delete(ctx, path)
+}
+
+// dropTakenOver deletes the cold copy while the row is still cold: bracketed.
+func TestColdMissingObjects_DropTakenOverIsBracketed(t *testing.T) {
+	m, hot, cold, cleanup := setupIntegrationTest(t, true)
+	t.Cleanup(cleanup)
+	m.manifest = &ownedManifest{fakeManifest: &fakeManifest{hot: hot, entries: map[string]int64{}}, ownedFrom: 1}
+	cold.seedRaw(missA, []byte("x"))
+	var during []int32
+	m.coldBackend = &deleteSpy{listedColdObjects: &listedColdObjects{mockBackend: cold}, onDelete: func() { during = append(during, m.coldRemovals.Load()) }}
+	if kept := m.migrator.dropTakenOver(context.Background(), []MigrationCandidate{candidateFor(missA)}); len(kept) != 0 {
+		t.Fatalf("kept %v", kept)
+	}
+	if len(during) != 1 || during[0] != 1 || m.coldRemovals.Load() != 0 {
+		t.Fatalf("removals during the delete %v, after %d: want [1] and 0", during, m.coldRemovals.Load())
+	}
 }

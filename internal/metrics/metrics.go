@@ -2176,7 +2176,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_backup_skipped_files gauge\n"...)
 	b = appendMetric(b, "arc_backup_skipped_files", float64(m.backupSkippedFiles.Load()))
 
-	b = append(b, "# HELP arc_tiering_cold_rows_missing_objects Cold tier rows whose object is gone from cold storage and that have no hot copy, as of the last cold-tier metadata sync on a standalone node or the cluster's primary writer (0 elsewhere). Non-zero means data the tier metadata lists cannot be read, typically a bucket lifecycle/expiry rule or a delete outside Arc on the cold prefix; the log and GET /api/v1/tiering/status name a sample.\n"...)
+	b = append(b, "# HELP arc_tiering_cold_rows_missing_objects Cold tier rows whose object is gone from cold storage and that have no hot copy, as of the last cold-tier metadata sync on a standalone node or the cluster's primary writer (0 on readers, from a demoted primary's next sync). Non-zero means data the tier metadata lists cannot be read, typically a bucket lifecycle/expiry rule or a delete outside Arc on the cold prefix; the log and GET /api/v1/tiering/status name a sample.\n"...)
 	b = append(b, "# TYPE arc_tiering_cold_rows_missing_objects gauge\n"...)
 	b = appendMetric(b, "arc_tiering_cold_rows_missing_objects", float64(m.tieringColdRowsMissingObjects.Load()))
 

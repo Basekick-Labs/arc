@@ -16,10 +16,18 @@ package tiering
 // deleted (#1563), so on a reader every normal cold DELETE or retention would
 // read as data loss.
 //
-// A cold DELETE or retention run removes each object before its row, so a
-// check that overlaps one would count rows it is about to retire. Such runs
-// bracket themselves with BeginColdRemoval/EndColdRemoval, and a check that
-// overlapped one keeps the previous result.
+// A cold DELETE, retention run or database delete removes each object
+// before its row, and so does the migrator when a compaction took a file
+// over (dropTakenOver), so a check that overlaps one would count rows about
+// to be retired. Each brackets itself with BeginColdRemoval/EndColdRemoval,
+// and a check that overlapped one keeps the previous result.
+//
+// A row whose retirement failed after Arc deleted its object (logged by that
+// DELETE or retention run) is counted as lost until a later run retires it.
+//
+// A check that could not examine every candidate (time or count budget, a
+// failed stat) never lowers the published lost count: it keeps the previous
+// result instead, so an alert is cleared only by a check that saw it gone.
 
 import (
 	"context"
@@ -74,10 +82,11 @@ func (m *Manager) EndColdRemoval() {
 }
 
 // ColdMissingObjects returns the last check, or nil when this node has not
-// checked: no usable cold tier, no sync yet, or a cluster reader.
+// checked or does not report: no usable cold tier, no sync yet, or a cluster
+// reader (including a primary demoted since its last check).
 // Nil-receiver safe.
 func (m *Manager) ColdMissingObjects() *ColdMissingObjectsStatus {
-	if m == nil || !m.coldTierUsable() {
+	if m == nil || !m.coldTierUsable() || m.roleGated() {
 		return nil
 	}
 	return m.coldMissing.Load()
@@ -92,6 +101,7 @@ func (m *Manager) checkMissingColdObjects(ctx context.Context, unseen map[string
 		return
 	}
 	gen := m.coldRemovalGen.Load()
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, coldMissingCheckBudget)
 	defer cancel()
 	st := &ColdMissingObjectsStatus{}
@@ -116,17 +126,36 @@ func (m *Manager) checkMissingColdObjects(ctx context.Context, unseen map[string
 		}
 	}
 	if m.coldRemovals.Load() > 0 || m.coldRemovalGen.Load() != gen {
-		// A cold DELETE or retention overlapped: it may have deleted objects
-		// whose rows it had not retired yet. Keep the previous result.
+		// A cold removal overlapped: it may have deleted objects whose rows
+		// it had not retired yet. Keep the previous result.
 		return
 	}
 	st.CheckedAt = time.Now().UTC()
-	m.coldMissing.Store(st)
-	metrics.Get().SetTieringColdRowsMissingObjects(int64(st.Lost), int64(st.HotCopy))
+	if !m.publishColdMissing(st, started) {
+		return
+	}
 	if st.Lost > 0 {
 		m.logger.Error().Int("count", st.Lost).Strs("sample", st.Sample).
-			Msg("Cold tier rows have no object in cold storage and no hot copy: these files cannot be read and nothing in Arc restores them. Check for bucket lifecycle/expiry rules or deletes outside Arc on the cold prefix; restore the objects from a backup, or delete the data through Arc to retire the rows")
+			Msg("Cold tier rows have no object in cold storage and no hot copy: these files cannot be read and nothing in Arc restores them. Check for bucket lifecycle/expiry rules or deletes outside Arc on the cold prefix, or a DELETE or retention run that logged a failure to retire cold rows; restore the objects from a backup, or delete the data through Arc to retire the rows")
 	}
+}
+
+// publishColdMissing stores st unless a check that started later already
+// published, or st is incomplete and would lower the lost count. Concurrent
+// syncs (ScanTiers and the cycle) can each run a check.
+func (m *Manager) publishColdMissing(st *ColdMissingObjectsStatus, started time.Time) bool {
+	m.coldMissingMu.Lock()
+	defer m.coldMissingMu.Unlock()
+	if started.Before(m.coldMissingStarted) {
+		return false
+	}
+	if prev := m.coldMissing.Load(); st.Unchecked > 0 && prev != nil && st.Lost < prev.Lost {
+		return false
+	}
+	m.coldMissingStarted = started
+	m.coldMissing.Store(st)
+	metrics.Get().SetTieringColdRowsMissingObjects(int64(st.Lost), int64(st.HotCopy))
+	return true
 }
 
 // recheckColdRow checks one candidate now. lost: the row is still cold and

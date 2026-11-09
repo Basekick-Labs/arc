@@ -121,9 +121,11 @@ type Manager struct {
 	// coldMissing is the last check of cold rows whose object is gone;
 	// coldRemovals/coldRemovalGen track cold DELETE and retention runs that
 	// check must not overlap (#1551). See cold_missing.go.
-	coldMissing    atomic.Pointer[ColdMissingObjectsStatus]
-	coldRemovals   atomic.Int32
-	coldRemovalGen atomic.Uint64
+	coldMissing        atomic.Pointer[ColdMissingObjectsStatus]
+	coldMissingMu      sync.Mutex // orders publishes; guards coldMissingStarted
+	coldMissingStarted time.Time
+	coldRemovals       atomic.Int32
+	coldRemovalGen     atomic.Uint64
 
 	// tierEvent* carry the registration reports the cluster layer makes for
 	// files this node did not write itself — pulled from a peer, or unlinked

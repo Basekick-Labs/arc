@@ -211,11 +211,11 @@ At the end of each cold-tier metadata sync, Arc now checks again each cold row w
 
 Notes:
 
-- Reported on standalone nodes and on the cluster's primary writer only. A reader keeps the cold rows of files the primary deleted ([#1563](https://github.com/Basekick-Labs/arc/issues/1563)), so there it would report every normal DELETE or retention as missing; the fields are absent and the gauges are 0 on readers. A reader promoted by failover can report the rows it inherited until #1563 is fixed.
-- A sync that overlaps a cold DELETE or retention run keeps the previous result rather than count rows the run is about to retire.
-- At most 1,000 rows, within 30 seconds, are checked per sync; the rest are reported as `unchecked`.
+- Reported on standalone nodes and on the cluster's primary writer only. A reader keeps the cold rows of files the primary deleted ([#1563](https://github.com/Basekick-Labs/arc/issues/1563)), so there it would report every normal DELETE or retention as missing; the fields are absent on readers, and the gauges are 0 (on a demoted primary, from its next sync). A reader promoted by failover can report the rows it inherited until #1563 is fixed.
+- A sync that overlaps a cold DELETE, retention run or database delete keeps the previous result rather than count rows that run is about to retire. A DELETE or retention whose row retirement failed (it logs that) leaves rows that are counted as lost until a later run retires them.
+- At most 1,000 rows, within 30 seconds, are checked per sync, in no fixed order; the rest are reported as `unchecked`. A check that could not examine every row never lowers the lost count: it keeps the previous result, so an alert clears only once a check has seen every row.
 - The fields are absent, and the gauges 0, until the first cold sync after startup. With the default `migration_schedule` that sync runs at startup and then daily.
-- Do not apply lifecycle or expiry rules, or deletes outside Arc, to Arc's cold prefix. Remove data through Arc's DELETE or retention so its rows are retired with it.
+- Do not apply lifecycle or expiry rules, or deletes outside Arc, to Arc's cold prefix. Remove data through Arc (DELETE, retention, database delete) so its rows are retired with it.
 
 ## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
 

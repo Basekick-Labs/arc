@@ -111,6 +111,10 @@ func (m *Manager) CleanupDatabaseDelete(ctx context.Context, database string, ho
 	if m == nil || m.metadata == nil {
 		return 0, nil
 	}
+	// Cold objects go before their rows: keep the missing-object check off
+	// them meanwhile (#1551).
+	m.BeginColdRemoval()
+	defer m.EndColdRemoval()
 	rows, err := m.metadata.GetFilesByDatabase(ctx, database)
 	if err != nil {
 		return 0, []error{fmt.Errorf("read tier rows for database %q: %w", database, err)}
