@@ -83,6 +83,16 @@ func TestHavingAllAggsDecline(t *testing.T) {
 		"SELECT host, arg_max(x, time), count(*) FROM cpu GROUP BY host HAVING arg_max(x, time) > 1 ORDER BY 3",
 		// Grouped mode is never routed.
 		b + "mode(code) FROM cpu GROUP BY 1 HAVING mode(code) > 1",
+		// Post-impl review B1: names DuckDB binds to a literal / value function.
+		"SELECT host, count(*) AS true FROM cpu GROUP BY host HAVING true > 5",
+		"SELECT host, count(*) AS null FROM cpu GROUP BY host HAVING null > 5",
+		"SELECT host, count(*) AS false FROM cpu GROUP BY host HAVING false < 5000",
+		"SELECT host, max(time) AS current_timestamp FROM cpu GROUP BY host HAVING current_timestamp > '2026-06-01T00:00:00Z'",
+		b + "max(time) AS localtimestamp FROM cpu GROUP BY 1 HAVING localtimestamp > '2026-06-01T00:00:00Z'",
+		"SELECT host, count(*) AS user FROM cpu GROUP BY host HAVING user > 5",
+		"SELECT host, count(*) AS current_date FROM cpu GROUP BY host HAVING current_date > 5",
+		"SELECT host, count(*) AS true FROM cpu GROUP BY host ORDER BY true DESC LIMIT 2",
+		"SELECT host, count(*) AS user FROM cpu GROUP BY host ORDER BY user",
 		// Duplicate / colliding aliases still decline (res-1).
 		"SELECT host, count(*) AS n, avg(x) AS n FROM cpu GROUP BY host HAVING n > 3",
 	} {

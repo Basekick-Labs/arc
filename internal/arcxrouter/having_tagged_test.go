@@ -45,6 +45,13 @@ func TestCompareGroupedUnstableHavingOneSided(t *testing.T) {
 	if diff := compareGrouped(dup, []groupedRow{row("a", 0.5, 3)}, items, []int{0}, "oracle"); diff == "" || strings.Contains(diff, "diff:") {
 		t.Fatalf("a duplicate group key must alarm, got %q", diff)
 	}
+	// Review M1: no group in common alarms (one side empty, or disjoint keys).
+	if diff := compareGrouped(arcx, nil, items, []int{0}, "oracle"); diff == "" || strings.Contains(diff, "diff:") {
+		t.Fatalf("an empty DuckDB side against groups must alarm, got %q", diff)
+	}
+	if diff := compareGrouped(arcx, []groupedRow{row("x", 0.5, 3), row("y", 1, 5)}, items, []int{0}, "oracle"); diff == "" || strings.Contains(diff, "diff:") {
+		t.Fatalf("disjoint group keys must alarm, got %q", diff)
+	}
 	// Equal row sets: a match.
 	if diff := compareGrouped(arcx, []groupedRow{row("a", 0.5, 3), row("c", 1, 5)}, items, []int{0}, "oracle"); diff != "" {
 		t.Fatalf("unexpected diff %q", diff)

@@ -486,6 +486,11 @@ func orderKeyRef(c *cursor, items []string, orderRef func(token) int, aliases []
 			// M2); an alias of that spelling never resolves here.
 			return -1, false
 		}
+		if !aliasRefBindable(t.lower) {
+			// res-3 review: `ORDER BY true` sorts by a constant and `ORDER BY
+			// current_timestamp` by now() — never by a key or alias of that name.
+			return -1, false
+		}
 		if r := orderRef(t); r >= 0 {
 			idx = r
 		} else {

@@ -7,9 +7,12 @@ import (
 // agg-5a HAVING recognition and re-serialization; res-3 (arcX
 // feat/having-all-aggs) widens it to every served aggregate.
 //
-// The grammar is deliberately the SAME narrow one the engine accepts, so a shape
-// the router sends can never be a shape the engine declines (a served-then-declined
-// query is a wasted DuckDB re-execution plus a shadow decline, per gotcha #4):
+// The grammar is deliberately the SAME narrow one the engine accepts, so the router
+// sends no FORM the engine's parser declines (a served-then-declined query is a
+// wasted DuckDB re-execution plus a shadow decline, per gotcha #4). Column TYPES are
+// invisible here, so a literal of the wrong type for its target (a decimal against a
+// VARCHAR key or `max(time)`, a string against `count(*)`, a timestamp written without
+// the `T…Z` form) still reaches the engine and declines at bind:
 //
 //	having     := hAnd (OR hAnd)*
 //	hAnd       := hAtom (AND hAtom)*
@@ -28,10 +31,10 @@ import (
 // KEY column on v1.5.5 (res-1 declines that collision anyway); an aggregate alias
 // beats an UNGROUPED table column of the same name on 1.5.6.
 //
-// Literal typing the router can see (res-3 review M6), so the engine is never
-// handed a compare it declines: TRUE/FALSE and the bare form only against a
-// bool_and/bool_or item and only with = / <> / !=; a numeric literal never against
-// a Boolean item nor against the bucket alias (a timestamp).
+// Literal typing the router CAN see (res-3 review M6) is enforced: TRUE/FALSE and
+// the bare form only against a bool_and/bool_or item and only with = / <> / !=; a
+// numeric literal never against a Boolean item nor against the bucket alias (a
+// timestamp). Everything else is type-checked by the engine (see above).
 
 // havingCtx is what a HAVING reference may resolve against: the re-serialized
 // select items plus the names of the possible key items and the aggregate aliases.
@@ -225,7 +228,24 @@ func havingItemKind(item string, st *havingState) havingRefKind {
 	return refAny
 }
 
-// havingArgItem: the agg-4 by-time items (DuckDB's tie choice is nondeterministic).
+// sqlBareValueFunctions: SQL value functions DuckDB 1.5.6 evaluates when written
+// bare (`user` is current_user). Mirrors the engine's is_bare_value_function.
+var sqlBareValueFunctions = map[string]bool{
+	"current_date": true, "current_time": true, "current_timestamp": true,
+	"localtime": true, "localtimestamp": true, "current_user": true, "session_user": true,
+	"current_role": true, "current_schema": true, "current_catalog": true, "user": true,
+}
+
+// aliasRefBindable: may a bare HAVING / ORDER BY name resolve to a select alias?
+// Not when DuckDB 1.5.6 binds it to a keyword or a value function instead (swept
+// over every duckdb_keywords() name: exactly duckdbNonColumnKeywords plus `user`,
+// and the value functions above).
+func aliasRefBindable(lower string) bool {
+	return !duckdbNonColumnKeywords[lower] && !sqlBareValueFunctions[lower]
+}
+
+// havingArgItem: the agg-4 by-time items (DuckDB's tie choice is nondeterministic);
+// the same prefixes as isArgItem, which lives in a tagged file.
 func havingArgItem(item string) bool {
 	for _, p := range []string{"arg_max(", "arg_min(", "max_by(", "min_by("} {
 		if strings.HasPrefix(item, p) {
@@ -308,6 +328,14 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefKind,
 			}
 		}
 		// Legal DuckDB (an aggregate not in the select list) — declines here.
+		return "", refAny, false
+	}
+	// res-3 post-impl review B1: a name DuckDB binds to something else — a keyword
+	// (`true`, `null` are literals) or a bare SQL value function (`current_timestamp`
+	// is now()) — never resolves to a key or an alias in DuckDB. An alias is emitted
+	// as its ITEM TEXT, so the engine could not catch it: refuse every bare form here
+	// (the engine declines the same set).
+	if !aliasRefBindable(t.lower) {
 		return "", refAny, false
 	}
 	// A bare identifier: KEY first, then the bucket alias, then an aggregate alias.

@@ -320,7 +320,7 @@ func (gc *groupedCmp) mergeOneSided(got, oracle []groupedRow, oneSided string) s
 			}
 		}
 	}
-	i, j, oneSidedRows := 0, 0, 0
+	i, j, oneSidedRows, matched := 0, 0, 0, 0
 	for i < len(got) || j < len(oracle) {
 		switch {
 		case j >= len(oracle) || (i < len(got) && groupedLess(&got[i], &oracle[j])):
@@ -336,9 +336,17 @@ func (gc *groupedCmp) mergeOneSided(got, oracle []groupedRow, oneSided string) s
 			if msg := gc.rowCells(i, &got[i], &oracle[j]); msg != "" {
 				return msg
 			}
+			matched++
 			i++
 			j++
 		}
+	}
+	// Post-impl review M1: an unstable value near the literal moves SOME groups; a
+	// result with no group in common (one side empty, or disjoint keys — a shifted
+	// bucket, a wrong key, a filter that dropped everything) is a whole-result
+	// defect, not oracle noise, and alarms.
+	if oneSidedRows > 0 && matched == 0 {
+		return fmt.Sprintf("no group in common under a HAVING over an unstable aggregate (arcx=%d duckdb=%d)", len(got), len(oracle))
 	}
 	if oneSidedRows > 0 {
 		msg := fmt.Sprintf("%d group(s) on one side only under a HAVING over an unstable aggregate (arcx=%d duckdb=%d, values withheld)",

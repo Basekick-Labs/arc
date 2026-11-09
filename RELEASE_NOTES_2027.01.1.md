@@ -232,7 +232,10 @@ These forms still run on DuckDB:
 - a decimal literal with more than 15 significant digits;
 - `bool_and` / `bool_or` compared with anything but `TRUE` / `FALSE`, or with `<` / `>`;
 - a number compared with the time bucket;
-- `HAVING` over `arg_max`/`arg_min`/`max_by`/`min_by`, `skewness`/`kurtosis`, the Kahan sums,
+- a `HAVING` or `ORDER BY` name that DuckDB reads as something other than a column or alias: a
+  keyword (`AS true … HAVING true > 5` compares the literal `true`) or a SQL value function
+  (`current_timestamp`, `current_date`, `localtimestamp`, `user`, …, which DuckDB evaluates);
+- `HAVING` over `arg_max`/`arg_min`/`max_by`/`min_by`, `skewness`/`kurtosis`/`kurtosis_pop`, the Kahan sums,
   `covar_pop`, `covar_samp`, `regr_sxy` or `regr_intercept`, when the query also has a `LIMIT` or
   orders by an aggregate. Ordering by the group keys still routes.
 
@@ -240,7 +243,15 @@ DuckDB 1.5.6's results for those last aggregates vary between runs or drift on r
 a value sits close to the `HAVING` literal, a group can be in one engine's result and not the
 other's. Shadow mode records a group present on only one side under `argdiff` or `oraclediff` (a
 WARN), not as a mismatch. Groups present on both sides are still compared value by value. A
-difference in any other column is a mismatch, as is a group key that appears twice.
+difference in any other column is a mismatch, as is a group key that appears twice, or a result
+with no group in common with DuckDB's. `median`, `quantile_cont` and `mad` are not treated this
+way: DuckDB's ARM build can differ from the engine in the last bit of an interpolated value, so a
+value sitting exactly on the `HAVING` literal could in principle show as a mismatch.
+
+The same change fixes a router check for top-N queries. An aggregate that carries a floating-point
+tolerance must be the last sort key, but the check did not apply when that aggregate came first in
+the select list (`SELECT avg(x), host … ORDER BY 1, 2`). The engine declined those queries, so
+DuckDB ran them a second time. They now go to DuckDB directly.
 
 ## arcx router: grouped top-N (`ORDER BY … LIMIT`) routes to the engine
 
@@ -288,10 +299,8 @@ These forms still run on DuckDB:
 - a quoted alias (`AS "time"`);
 - in a grouped query, an alias that matches the group key, the bucket alias or another alias;
 - an alias that is a SQL clause word (`AS from`, `AS where`), which DuckDB accepts;
-- a `HAVING` that names an aggregate's alias, because DuckDB resolves alias names differently
-  in `HAVING`. `HAVING avg(value) > 5` (the aggregate written out) still routes. `ORDER BY` an
-  alias routes since the top-N change above, and `HAVING` an alias since the `HAVING` change
-  above.
+- a `HAVING` that names an aggregate's alias. That routes since the `HAVING` change above,
+  and `ORDER BY` an alias since the top-N change above.
 
 Shadow mode now also compares result column names, since aliases make them user-controlled. One
 existing difference is exempted. When DuckDB serves an unaliased `date_trunc` bucket (grouped,
