@@ -779,8 +779,9 @@ func (m *Manager) ColdTierMissing() bool {
 
 // HasColdFilesInRange reports whether the measurement has cold tier rows
 // whose partition may hold data in [start, end]. A nil bound is open. Used
-// only by the query path when ColdTierMissing, to fail exactly the reads
-// that would have needed the cold tier.
+// only by the query path when the cold tier is missing (ColdTierMissing) or
+// cannot be listed (#1550), to fail exactly the reads that would have needed
+// the cold tier.
 func (m *Manager) HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
 	return m.metadata.HasColdFilesInRange(ctx, database, measurement, start, end)
 }

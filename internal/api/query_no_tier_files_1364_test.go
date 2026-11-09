@@ -15,14 +15,27 @@ import (
 )
 
 // fakeTierView is tiering's view of a measurement: tier rows that say where
-// its files are, over a cold store that may hold none of them.
+// its files are, over a cold store that may hold none of them. coldInRange
+// and coldRangeErr answer HasColdFilesInRange, which the read asks only when
+// the cold store cannot be listed (#1550); rangeAsks, when set, records the
+// bounds of each ask.
 type fakeTierView struct {
-	tiers map[tiering.Tier]bool
-	cold  storage.Backend
+	tiers        map[tiering.Tier]bool
+	cold         storage.Backend
+	coldInRange  bool
+	coldRangeErr error
+	rangeAsks    *[][2]*time.Time
 }
 
 func (f fakeTierView) TiersForMeasurement(context.Context, string, string) (map[tiering.Tier]bool, error) {
 	return f.tiers, nil
+}
+
+func (f fakeTierView) HasColdFilesInRange(_ context.Context, _, _ string, start, end *time.Time) (bool, error) {
+	if f.rangeAsks != nil {
+		*f.rangeAsks = append(*f.rangeAsks, [2]*time.Time{start, end})
+	}
+	return f.coldInRange, f.coldRangeErr
 }
 
 func (f fakeTierView) GetBackendForTier(tier tiering.Tier) storage.Backend {

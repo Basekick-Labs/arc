@@ -4050,17 +4050,7 @@ func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, 
 	// migration replicated in, a restore). A cached hot-only read would then
 	// skip them without asking again.
 	pruning.MarkVolatile(ctx)
-	var start, end *time.Time
-	if tr := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL); tr != nil {
-		if !tr.StartAssumed {
-			s := tr.Start
-			start = &s
-		}
-		if !tr.EndAssumed {
-			e := tr.End
-			end = &e
-		}
-	}
+	start, end := coldRowBounds(h.pruner.ExtractTimeRangeCtx(ctx, originalSQL))
 	has, err := guard.HasColdFilesInRange(ctx, database, measurement, start, end)
 	if err != nil {
 		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
@@ -4071,6 +4061,24 @@ func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, 
 	}
 	recordStoragePathFailure(ctx, errColdTierUnavailable)
 	return true
+}
+
+// coldRowBounds is a query's time range as HasColdFilesInRange takes it. A
+// bound the extractor only assumed is left open (nil), so it never narrows
+// the cold rows a read is checked against; no range leaves both open.
+func coldRowBounds(tr *pruning.TimeRange) (start, end *time.Time) {
+	if tr == nil {
+		return nil, nil
+	}
+	if !tr.StartAssumed {
+		s := tr.Start
+		start = &s
+	}
+	if !tr.EndAssumed {
+		e := tr.End
+		end = &e
+	}
+	return start, end
 }
 
 type storagePathCtxKey struct{}
@@ -4487,12 +4495,14 @@ type tierPruneResult struct {
 	glob    string
 	paths   []string
 	outcome pruning.TierPruneOutcome
+	source  int // index of the tier in buildMultiTierReadParquet's sources
 }
 
 // combineTierPruneResults assembles the final read_parquet path list from
 // per-tier pruning outcomes. Rules:
 //   - Pruned tiers contribute their pruned paths; Fallback tiers contribute
-//     their full glob.
+//     their full glob. Unverified tiers count as Pruned: their paths are
+//     the range's partitions, kept because a listing could not check them.
 //   - A verified-Empty tier is DROPPED only when at least one other tier is
 //     Pruned: a positive pruning result is evidence the pruner's view of the
 //     layout matches this query. Without one (an Empty/Fallback mix, e.g. a
@@ -4504,7 +4514,7 @@ type tierPruneResult struct {
 func combineTierPruneResults(results []tierPruneResult) ([]string, int) {
 	anyPruned := false
 	for _, r := range results {
-		if r.outcome == pruning.TierPrunePruned {
+		if r.outcome == pruning.TierPrunePruned || r.outcome == pruning.TierPruneUnverified {
 			anyPruned = true
 			break
 		}
@@ -4513,7 +4523,7 @@ func combineTierPruneResults(results []tierPruneResult) ([]string, int) {
 	prunedTiers := 0
 	for _, r := range results {
 		switch r.outcome {
-		case pruning.TierPrunePruned:
+		case pruning.TierPrunePruned, pruning.TierPruneUnverified:
 			paths = append(paths, r.paths...)
 			prunedTiers++
 		case pruning.TierPruneEmpty:
@@ -4609,16 +4619,28 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// object storage beyond the cached parent listings).
 	timeRange := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL)
 	results := make([]tierPruneResult, 0, len(sources))
-	for _, src := range sources {
+	// dropped counts tiers left out of the read below. Each makes the
+	// transform volatile: what dropped it can change before the cache TTL.
+	dropped := 0
+	for i, src := range sources {
 		if src.tier == tiering.TierCold && timeRange != nil && timeRange.StartAssumed {
 			// An end-only predicate's assumed start (the 1970 floor) must not
 			// exclude cold-archive data that can legitimately be older; scan
 			// the full cold glob instead.
-			results = append(results, tierPruneResult{glob: src.glob, outcome: pruning.TierPruneFallback})
+			results = append(results, tierPruneResult{glob: src.glob, outcome: pruning.TierPruneFallback, source: i})
 			continue
 		}
 		tierPaths, outcome := h.pruner.PruneTierPaths(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
-		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome})
+		// A cold tier that cannot be listed (expired credentials, a network
+		// or metadata server outage) keeps its paths unverified, and DuckDB
+		// fails the whole read on them with the same error. When tier
+		// metadata says the range holds no cold rows, the read never needed
+		// that tier: answer it from the others (#1550).
+		if src.tier == tiering.TierCold && outcome == pruning.TierPruneUnverified && !h.readNeedsColdTier(ctx, tiers, database, measurement, timeRange) {
+			dropped++
+			continue
+		}
+		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome, source: i})
 	}
 	// A tier that could not be pruned (no time range, or the cold end-only
 	// fallback) goes to DuckDB as its full glob. If that glob matches
@@ -4630,33 +4652,33 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// the tier, as before. A transform that dropped a tier is volatile: the
 	// next flush into that tier must not wait out the cache TTL.
 	kept := results[:0]
-	droppedEmpty := 0
-	for i, r := range results {
+	for _, r := range results {
 		if r.outcome == pruning.TierPruneFallback {
-			if has, verified := pruning.TierHasFiles(ctx, sources[i].backend, database, measurement); verified && !has {
+			src := sources[r.source]
+			if has, verified := pruning.TierHasFiles(ctx, src.backend, database, measurement); verified && !has {
 				h.logger.Debug().
 					Str("database", database).
 					Str("measurement", measurement).
-					Str("tier", string(sources[i].tier)).
+					Str("tier", string(src.tier)).
 					Msg("Tier holds no files for this measurement; dropped from the read")
-				droppedEmpty++
+				dropped++
 				continue
 			}
 		}
 		kept = append(kept, r)
 	}
 	results = kept
-	if droppedEmpty > 0 {
+	if dropped > 0 {
 		pruning.MarkVolatile(ctx)
 	}
 
 	paths, prunedTiers := combineTierPruneResults(results)
-	if prunedTiers > 0 || droppedEmpty > 0 {
+	if prunedTiers > 0 || dropped > 0 {
 		h.logger.Info().
 			Str("database", database).
 			Str("measurement", measurement).
 			Int("tiers", len(sources)).
-			Int("pruned_tiers", prunedTiers+droppedEmpty).
+			Int("pruned_tiers", prunedTiers+dropped).
 			Int("path_count", len(paths)).
 			Msg("Multi-tier partition pruning applied")
 	}
@@ -4733,11 +4755,40 @@ func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, ke
 	return readParquetExpr(keyword, "", []string{empty}, options)
 }
 
+// readNeedsColdTier reports whether a read over timeRange needs the
+// measurement's cold tier, asked when the tier's listing could not be
+// verified. Tier metadata decides, as refuseReadWithoutColdTier lets it for
+// a cold tier that failed to start (#1105): only "no cold rows in range"
+// answers false. A metadata error, or a range with no start to bound the
+// cold rows by, answers true, so the read keeps the tier and fails loudly
+// rather than silently leaving cold data out.
+func (h *QueryHandler) readNeedsColdTier(ctx context.Context, tiers multiTierView, database, measurement string, timeRange *pruning.TimeRange) bool {
+	start, end := coldRowBounds(timeRange)
+	if start == nil {
+		return true
+	}
+	has, err := tiers.HasColdFilesInRange(ctx, database, measurement, start, end)
+	if err != nil {
+		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Could not check this read against cold tier rows while the cold tier cannot be listed; keeping the cold tier")
+		return true
+	}
+	if !has {
+		h.logger.Debug().
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("Cold tier cannot be listed and holds no rows in this range; dropped from the read")
+	}
+	return has
+}
+
 // multiTierView is what buildMultiTierReadParquet reads from tiering: which
-// tiers hold rows of a measurement, and the cold backend. *tiering.Manager
-// through tieringTierView; a test sets QueryHandler.tierView.
+// tiers hold rows of a measurement, whether it has cold rows in a range, and
+// the cold backend. *tiering.Manager through tieringTierView; a test sets
+// QueryHandler.tierView.
 type multiTierView interface {
 	TiersForMeasurement(ctx context.Context, database, measurement string) (map[tiering.Tier]bool, error)
+	HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error)
 	GetBackendForTier(tier tiering.Tier) storage.Backend
 }
 
@@ -4745,6 +4796,10 @@ type tieringTierView struct{ m *tiering.Manager }
 
 func (v tieringTierView) TiersForMeasurement(ctx context.Context, database, measurement string) (map[tiering.Tier]bool, error) {
 	return v.m.GetMetadata().GetTiersForMeasurement(ctx, database, measurement)
+}
+
+func (v tieringTierView) HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	return v.m.HasColdFilesInRange(ctx, database, measurement, start, end)
 }
 
 func (v tieringTierView) GetBackendForTier(tier tiering.Tier) storage.Backend {

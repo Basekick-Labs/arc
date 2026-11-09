@@ -3428,6 +3428,27 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: recent-data queries keep working while the cold tier cannot be listed ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
+
+When the cold tier could not be listed (expired or unresolvable credentials,
+a network or metadata server outage), every query of a measurement with any
+cold rows failed, including a query whose time range covered only hot data. A
+cold listing that fails keeps that tier's partitions in the read unchecked, so
+a misconfigured store is never read as empty; DuckDB then hit the same error
+reading them. A cold-tier outage took down recent-data dashboards for every
+measurement with migrated data, on S3, Azure and GCS alike.
+
+Now, when the cold listing fails, tier metadata decides, as it already does
+for a cold tier that failed to start (#1105). A query whose range holds no cold
+rows is answered from the hot tier, and that answer is not cached, since cold
+rows can arrive while the tier is down. A query whose range holds cold rows
+still fails, as before, and so does one whose cold rows metadata cannot check:
+a metadata error, or a range with no start (`WHERE time < ...`, or no time
+filter). Nothing changes while the cold tier lists normally.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+
 ### Fix: a governance 429 says when a retry can succeed ([#1519](https://github.com/Basekick-Labs/arc/issues/1519))
 
 With query governance on, a refused query's `Retry-After` was wrong or missing:

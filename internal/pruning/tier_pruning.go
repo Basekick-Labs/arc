@@ -36,6 +36,13 @@ const (
 	// the tier's backend with no listing errors. The tier holds no data for
 	// the time range and may be dropped from the query entirely.
 	TierPruneEmpty
+	// TierPruneUnverified: the returned paths are the tier's partitions for
+	// the time range, but a listing failed (a store that cannot be reached
+	// or authenticated against), so some were kept without checking that
+	// they exist. Read them as TierPrunePruned; they are never "verified
+	// absent". A caller with other evidence that the read needs nothing from
+	// this tier (#1550) may leave it out; without that evidence it must not.
+	TierPruneUnverified
 )
 
 // PruneTierPaths prunes one storage tier's partition paths for a query time
@@ -115,6 +122,9 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 		if len(paths) == 0 {
 			return nil, TierPruneFallback
 		}
+	}
+	if !verified {
+		return paths, TierPruneUnverified
 	}
 	return paths, TierPrunePruned
 }

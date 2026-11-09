@@ -119,13 +119,15 @@ func TestPruneTierPaths_MissingStoreKeepsTheTier(t *testing.T) {
 	paths, outcome := p.PruneTierPaths(context.Background(), glob, "db", "cpu",
 		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false)
 
-	// The tier must stay IN the read. Which non-empty outcome it takes is an
-	// implementation detail — a listing failure keeps the paths unverified,
-	// so this is TierPrunePruned with every generated path — but
+	// The tier must stay IN the read. A listing failure keeps the paths
+	// unverified, so this is TierPruneUnverified with every generated path:
 	// TierPruneEmpty is the one answer that would drop the tier, and it must
 	// never be reachable from a store that does not exist.
 	if outcome == TierPruneEmpty {
 		t.Fatal("a missing store was reported as TierPruneEmpty; the tier would be dropped from the read")
+	}
+	if outcome != TierPruneUnverified {
+		t.Fatalf("outcome = %v, want TierPruneUnverified: the caller must be able to tell the paths were not checked", outcome)
 	}
 	if len(paths) == 0 {
 		t.Fatalf("outcome = %v with no paths: the tier contributes nothing to the read", outcome)
@@ -165,8 +167,8 @@ func TestPruneTierPaths_ListingErrorFailsOpen(t *testing.T) {
 	paths, outcome := p.PruneTierPaths(context.Background(), glob, "db", "cpu",
 		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false)
 
-	if outcome != TierPrunePruned {
-		t.Fatalf("outcome = %v, want TierPrunePruned (fail-open keeps unverifiable paths)", outcome)
+	if outcome != TierPruneUnverified {
+		t.Fatalf("outcome = %v, want TierPruneUnverified (fail-open keeps unverifiable paths)", outcome)
 	}
 	// The hour paths under the erroring parent AND the day-level path (same
 	// erroring prefix) must all survive.
