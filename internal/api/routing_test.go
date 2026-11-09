@@ -226,9 +226,13 @@ func TestCopyResponse(t *testing.T) {
 		mockResp := &http.Response{
 			StatusCode: http.StatusCreated,
 			Header: http.Header{
-				"Content-Type":      []string{"application/json"},
-				"X-Custom-Header":   []string{"custom-value"},
-				"Set-Cookie":        []string{"a=1; Path=/", "b=2; Path=/"},
+				"Content-Type":    []string{"application/json"},
+				"X-Custom-Header": []string{"custom-value"},
+				"Set-Cookie":      []string{"a=1; Path=/", "b=2; Path=/"},
+				// An ordinary header with two values: c.Set kept only the
+				// last one (#1556). Set-Cookie above was never affected:
+				// fasthttp appends cookies even on Set.
+				"Vary":              []string{"Accept", "Accept-Encoding"},
 				"Trailer":           []string{"X-Stream-Status"},
 				"Connection":        []string{"keep-alive"}, // Should be filtered out (hop-by-hop)
 				"Transfer-Encoding": []string{"chunked"},    // Should be filtered out (hop-by-hop)
@@ -252,6 +256,8 @@ func TestCopyResponse(t *testing.T) {
 	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 	assert.Equal(t, "custom-value", resp.Header.Get("X-Custom-Header"))
 	assert.Equal(t, []string{"a=1; Path=/", "b=2; Path=/"}, resp.Header.Values("Set-Cookie"))
+	assert.Equal(t, []string{"Accept", "Accept-Encoding"}, resp.Header.Values("Vary"),
+		"every value of a repeated end-to-end header must reach the client")
 
 	// Verify hop-by-hop headers are NOT copied
 	assert.Empty(t, resp.Header.Get("Connection"))

@@ -74,6 +74,14 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: forwarded responses keep every value of a repeated header ([#1556](https://github.com/Basekick-Labs/arc/pull/1556))
+
+When a cluster node forwards a request to another node, the response
+returned to the client kept only the last value of an end-to-end header that
+appeared more than once (`Vary`, `Link`, `WWW-Authenticate`, …). Every value
+now reaches the client. `Set-Cookie` was not affected.
+
+Thanks to [@lecodev-26](https://github.com/lecodev-26) for the fix.
 ## Fix: a token limited to some databases can list them ([#1562](https://github.com/Basekick-Labs/arc/issues/1562))
 
 Listing every database required a read grant covering every database, so a
