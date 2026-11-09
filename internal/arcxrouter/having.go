@@ -5,23 +5,33 @@ import (
 )
 
 // agg-5a HAVING recognition and re-serialization; res-3 (arcX
-// feat/having-all-aggs) widens it to every served aggregate.
+// feat/having-all-aggs) widens it to every served aggregate, res-3b (arcX
+// feat/having-grammar) to the grammar below.
 //
-// The grammar is deliberately the SAME narrow one the engine accepts, so the router
-// sends no FORM the engine's parser declines (a served-then-declined query is a
-// wasted DuckDB re-execution plus a shadow decline, per gotcha #4). Column TYPES are
-// invisible here, so a literal of the wrong type for its target (a decimal against a
-// VARCHAR key or `max(time)`, a string against `count(*)`, a timestamp written without
-// the `T…Z` form) still reaches the engine and declines at bind:
+// The grammar is deliberately the SAME one the engine accepts, so the router sends
+// no FORM the engine's parser declines (a served-then-declined query is a wasted
+// DuckDB re-execution plus a shadow decline, per gotcha #4). Column TYPES are
+// invisible here, so a literal or reference of the wrong type for its target (a
+// decimal against a VARCHAR key, a string against `count(*)`, a timestamp written
+// without the `T…Z` form, `max(<string or time column>)` against a number) still
+// reaches the engine and declines at bind:
 //
 //	having     := hAnd (OR hAnd)*
-//	hAnd       := hAtom (AND hAtom)*
-//	hAtom      := '(' having ')' | hRef <cmp op> <literal> | hRef <eq op> TRUE|FALSE | hRef
+//	hAnd       := hNot (AND hNot)*
+//	hNot       := NOT hNot | '(' having ')' | hAtom
+//	hAtom      := hRef <cmp> <literal> | <literal> <cmp> hRef | hRef <cmp> hRef
+//	            | hRef IS [NOT] NULL | hRef [NOT] BETWEEN <lit> AND <lit>
+//	            | hRef [NOT] IN (<lit>, …) | hRef <eq op> TRUE|FALSE | hRef
 //	hRef       := <aggregate item re-spelled> | <tag key> | <bucket alias> | <aggregate alias>
 //
+// An aggregate that is not in the select list is a HIDDEN item (res-3b): parsed
+// with the select list's own item parsers, emitted as item text, computed by the
+// engine and projected away.
+//
 // Every emitted byte comes from a VALIDATED part: an aggregate reference is matched
-// against the already-re-serialized select items and the ITEM TEXT is what gets
-// written, never the user's spelling — an aggregate ALIAS is emitted as its item
+// against the already-re-serialized select items (or becomes a hidden item) and the
+// ITEM TEXT is what gets written, never the user's spelling — an aggregate ALIAS is
+// emitted as its item
 // text too (res-3 review M5), so a routed query never depends on the engine's alias
 // resolution; a key reference is re-emitted from the validated bare identifier; a
 // literal is re-emitted from its token. Nothing is copied out of the source string.
@@ -43,6 +53,26 @@ type havingCtx struct {
 	tagKey      string   // "" when the shape has no bare tag key
 	bucketAlias string   // "" when the bucket is unaliased or absent
 	aliases     []string // res-3: per-item aggregate alias ("" = none), len == len(items)
+	bucketCol   string   // res-3b: the bucket's source column ("" = no bucket)
+}
+
+// refCmpClass: what a reference may be compared WITH in a res-3b reference-vs-
+// reference atom. The engine compares only ORDER-EXACT items (arcX res-3b review
+// B1: DuckDB 1.5.6's float accumulators are thread-count dependent) and only
+// compatible types; the router mirrors that with what it can see.
+type refCmpClass int
+
+const (
+	cmpNone refCmpClass = iota // tag key (type unknown), or a float-accumulated / unstable item
+	cmpNum                     // count / count_if / regr_count / bit_* / min / max / quantile_disc
+	cmpBool                    // bool_and / bool_or
+	cmpTime                    // the bucket alias, or min/max over the bucket's source column
+)
+
+// havingRefInfo is what havingRef learned about one reference.
+type havingRefInfo struct {
+	kind havingRefKind
+	cmp  refCmpClass
 }
 
 // HAVING reference kinds — what a literal may be compared against.
@@ -63,20 +93,25 @@ type havingState struct {
 	// statistics) can flip a group in or out of the result. See
 	// HavingUnstable on Decision.
 	unstable string
+	// res-3b: hidden aggregates (HAVING references not in the select list), as item
+	// text in first-reference order, and whether any of them is a bucket-gated
+	// family (moment / order statistic / binary — the tag-key gate in
+	// matchGroupedAgg applies to them as to select items).
+	hidden       []string
+	hiddenMoment bool
 }
 
 // reserializeHaving parses a HAVING clause and rebuilds it from validated parts.
 // Returns ok=false to decline — the caller then declines the whole shape.
-func reserializeHaving(c *cursor, hc havingCtx) (text string, unstable string, ok bool) {
+func reserializeHaving(c *cursor, hc havingCtx) (text string, st havingState, ok bool) {
 	var b strings.Builder
-	var st havingState
 	if !havingOr(c, &b, hc, &st) {
-		return "", "", false
+		return "", st, false
 	}
 	if st.depth != 0 || st.atoms == 0 {
-		return "", "", false
+		return "", st, false
 	}
-	return b.String(), st.unstable, true
+	return b.String(), st, true
 }
 
 func havingOr(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bool {
@@ -108,6 +143,21 @@ func havingAnd(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) boo
 }
 
 func havingAtomOrParen(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bool {
+	// res-3b: prefix NOT (any depth) — the engine pushes it down at parse; it counts
+	// toward the same depth cap there.
+	if c.peekIdentLower() == "not" {
+		st.depth++
+		if st.depth > maxWhereDepth {
+			return false
+		}
+		c.next()
+		b.WriteString("NOT ")
+		if !havingAtomOrParen(c, b, hc, st) {
+			return false
+		}
+		st.depth--
+		return true
+	}
 	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
 		st.depth++
 		// Same cap as the WHERE tree: untrusted text must not be able to recurse the
@@ -149,17 +199,91 @@ func havingAtomEnds(c *cursor) bool {
 	return false
 }
 
-// havingAtom: `<ref> <cmp op> <literal>`, `<bool ref> <=|<>|!=> TRUE|FALSE`, or a
-// bare `<bool ref>`.
+// havingLiteral validates and re-emits one literal compared against a reference of
+// the given kind (with op, "" for IN/BETWEEN elements). Returns ok=false for a
+// literal the engine would decline against it.
+func havingLiteral(litT token, kind havingRefKind, op string) (string, bool) {
+	switch {
+	case litT.kind == tokIdent && (litT.lower == "true" || litT.lower == "false"):
+		// res-3: Boolean literals only against a Boolean item, and only equality —
+		// DuckDB's boolean ordering (`> false`) is not mirrored by the engine.
+		if kind != refBool || (op != "=" && op != "<>" && op != "!=") {
+			return "", false
+		}
+		return strings.ToUpper(litT.lower), true
+	case kind == refBool:
+		return "", false // `= 1` / `= 'true'` go through DuckDB casts the engine declines
+	case litT.kind == tokNum || litT.kind == tokFloat:
+		if kind == refTime {
+			return "", false // a number against the timestamp bucket: the engine declines
+		}
+		// tokFloat: the tokenizer already refused a decimal wider than 15
+		// significant digits (decimalTooWide) — the bound that makes the engine's
+		// integer-vs-decimal rewrite exact (arcX res-3).
+		return litT.orig, true
+	case litT.kind == tokStr:
+		// Re-emit from the UNESCAPED content with SQL-standard quote doubling, the
+		// same way the WHERE path does — never by copying source bytes.
+		return "'" + strings.ReplaceAll(litT.str, "'", "''") + "'", true
+	}
+	return "", false
+}
+
+// havingIsLiteral: the token starts a literal (not a reference).
+func havingIsLiteral(t token) bool {
+	return t.kind == tokNum || t.kind == tokFloat || t.kind == tokStr ||
+		(t.kind == tokIdent && (t.lower == "true" || t.lower == "false"))
+}
+
+func (st *havingState) bumpAtoms(n int) bool {
+	st.atoms += n
+	return st.atoms <= maxWhereAtoms
+}
+
+// refsComparable: may two references meet in `<ref> <op> <ref>`? Both order-exact
+// and of compatible kinds (see refCmpClass).
+func refsComparable(a, b havingRefInfo) bool {
+	return a.cmp != cmpNone && a.cmp == b.cmp
+}
+
+// havingAtom (res-3b grammar, mirroring the engine's parse_having_atom):
+//
+//	<ref> <cmp> <literal> | <literal> <cmp> <ref> | <ref> <cmp> <ref>
+//	<ref> IS [NOT] NULL | <ref> [NOT] BETWEEN <lit> AND <lit> | <ref> [NOT] IN (<lit>, …)
+//	<ref>                                    -- bare: a Boolean item
+//
+// Atom accounting matches the engine's: one per atom, plus one for a BETWEEN's
+// second bound and one per extra IN element.
 func havingAtom(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bool {
-	st.atoms++
-	if st.atoms > maxWhereAtoms {
+	if !st.bumpAtoms(1) {
 		return false
 	}
-	refText, kind, ok := havingRef(c, hc, st)
+	// Literal on the left: `5 < count(*)`.
+	if c.i < len(c.toks) && havingIsLiteral(c.toks[c.i]) {
+		litT, _ := c.next()
+		opT, tok := c.next()
+		if !tok || opT.kind != tokOp || !isCmpOp(opT.op) {
+			return false
+		}
+		if c.i < len(c.toks) && havingIsLiteral(c.toks[c.i]) {
+			return false // literal vs literal
+		}
+		refText, info, ok := havingRef(c, hc, st)
+		if !ok {
+			return false
+		}
+		litText, lok := havingLiteral(litT, info.kind, opT.op)
+		if !lok {
+			return false
+		}
+		b.WriteString(litText + " " + opT.op + " " + refText)
+		return true
+	}
+	refText, info, ok := havingRef(c, hc, st)
 	if !ok {
 		return false
 	}
+	kind := info.kind
 	if havingAtomEnds(c) {
 		if kind != refBool {
 			return false
@@ -167,47 +291,107 @@ func havingAtom(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bo
 		b.WriteString(refText)
 		return true
 	}
+	// IS [NOT] NULL — any reference.
+	if c.peekIdentLower() == "is" {
+		c.next()
+		not := ""
+		if c.peekIdentLower() == "not" {
+			c.next()
+			not = "NOT "
+		}
+		if !c.ident("null") {
+			return false
+		}
+		b.WriteString(refText + " IS " + not + "NULL")
+		return true
+	}
+	not := ""
+	if c.peekIdentLower() == "not" {
+		c.next()
+		not = "NOT "
+	}
+	switch c.peekIdentLower() {
+	case "between":
+		c.next()
+		if kind == refBool {
+			return false
+		}
+		lo, tok := c.next()
+		if !tok {
+			return false
+		}
+		loText, lok := havingLiteral(lo, kind, "")
+		if !lok || !c.ident("and") {
+			return false
+		}
+		hi, tok := c.next()
+		if !tok {
+			return false
+		}
+		hiText, hok := havingLiteral(hi, kind, "")
+		if !hok || !st.bumpAtoms(1) {
+			return false
+		}
+		b.WriteString(refText + " " + not + "BETWEEN " + loText + " AND " + hiText)
+		return true
+	case "in":
+		c.next()
+		if kind == refBool || !c.punct('(') {
+			return false
+		}
+		var elems []string
+		for {
+			lt, tok := c.next()
+			// A NULL / column / TRUE in the list is an identifier: refused, as the
+			// engine declines it (`NOT IN (…, NULL)` is never TRUE in DuckDB).
+			if !tok || lt.kind == tokIdent {
+				return false
+			}
+			et, eok := havingLiteral(lt, kind, "")
+			if !eok {
+				return false
+			}
+			elems = append(elems, et)
+			if len(elems) > 1 && !st.bumpAtoms(1) {
+				return false
+			}
+			// `c.punct` consumes even on a miss: peek before choosing.
+			if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+				c.i++
+				continue
+			}
+			if !c.punct(')') {
+				return false
+			}
+			break
+		}
+		b.WriteString(refText + " " + not + "IN (" + strings.Join(elems, ", ") + ")")
+		return true
+	}
+	if not != "" {
+		return false
+	}
 	opT, tok := c.next()
 	// `op` carries the NORMALISED comparison operator for tokOp (`orig` is not set
 	// for operators); `isCmpOp` is the same gate the WHERE path applies.
 	if !tok || opT.kind != tokOp || !isCmpOp(opT.op) {
 		return false
 	}
-	litT, tok := c.next()
-	if !tok {
-		return false
-	}
-	var litText string
-	switch {
-	case litT.kind == tokIdent && (litT.lower == "true" || litT.lower == "false"):
-		// res-3: Boolean literals only against a Boolean item, and only equality —
-		// DuckDB's boolean ordering (`> false`) is not mirrored by the engine.
-		if kind != refBool || (opT.op != "=" && opT.op != "<>" && opT.op != "!=") {
+	if c.i < len(c.toks) && havingIsLiteral(c.toks[c.i]) {
+		litT, _ := c.next()
+		litText, lok := havingLiteral(litT, kind, opT.op)
+		if !lok {
 			return false
 		}
-		litText = strings.ToUpper(litT.lower)
-	case kind == refBool:
-		return false // `= 1` / `= 'true'` go through DuckDB casts the engine declines
-	case litT.kind == tokNum || litT.kind == tokFloat:
-		if kind == refTime {
-			return false // a number against the timestamp bucket: the engine declines
-		}
-		// tokFloat: the tokenizer already refused a decimal wider than 15
-		// significant digits (decimalTooWide) — the bound that makes the engine's
-		// integer-vs-decimal rewrite exact (arcX res-3).
-		litText = litT.orig
-	case litT.kind == tokStr:
-		// Re-emit from the UNESCAPED content with SQL-standard quote doubling, the
-		// same way the WHERE path does — never by copying source bytes.
-		litText = "'" + strings.ReplaceAll(litT.str, "'", "''") + "'"
-	default:
+		b.WriteString(refText + " " + opT.op + " " + litText)
+		return true
+	}
+	// res-3b: reference vs reference — order-exact, compatible kinds only.
+	rhsText, rhs, rok := havingRef(c, hc, st)
+	if !rok || !refsComparable(info, rhs) {
 		return false
 	}
-	b.WriteString(refText)
-	b.WriteString(" ")
-	b.WriteString(opT.op)
-	b.WriteString(" ")
-	b.WriteString(litText)
+	b.WriteString(refText + " " + opT.op + " " + rhsText)
 	return true
 }
 
@@ -228,6 +412,35 @@ func havingItemKind(item string, st *havingState) havingRefKind {
 	return refAny
 }
 
+// havingItemInfo: literal kind + reference-comparison class of an aggregate item.
+func havingItemInfo(item string, hc havingCtx, st *havingState) havingRefInfo {
+	info := havingRefInfo{kind: havingItemKind(item, st)}
+	open := strings.IndexByte(item, '(')
+	if open < 0 {
+		return info
+	}
+	fn, arg := item[:open], strings.TrimSuffix(item[open+1:], ")")
+	switch fn {
+	case "bool_and", "bool_or":
+		info.cmp = cmpBool
+	case "count", "count_if", "countif", "regr_count", "bit_and", "bit_or", "bit_xor":
+		info.cmp = cmpNum
+	case "min", "max":
+		if hc.bucketCol != "" && strings.EqualFold(arg, hc.bucketCol) {
+			// A timestamp: string literals only, like the bucket alias (review M2).
+			info.kind, info.cmp = refTime, cmpTime
+		} else {
+			info.cmp = cmpNum
+		}
+	case "quantile_disc", "quantile":
+		info.cmp = cmpNum
+	}
+	// sum (the router cannot tell an integer sum from a float one), avg, the
+	// moments, the bivariates, median/quantile_cont/mad, the Kahan sums, shape
+	// statistics and arg_* stay cmpNone.
+	return info
+}
+
 // sqlBareValueFunctions: SQL value functions DuckDB 1.5.6 evaluates when written
 // bare (`user` is current_user). Mirrors the engine's is_bare_value_function.
 var sqlBareValueFunctions = map[string]bool{
@@ -244,6 +457,10 @@ func aliasRefBindable(lower string) bool {
 	return !duckdbNonColumnKeywords[lower] && !sqlBareValueFunctions[lower]
 }
 
+// maxGroupedItems mirrors the engine's MAX_AGG_ITEMS: select items plus hidden
+// HAVING aggregates.
+const maxGroupedItems = 64
+
 // havingArgItem: the agg-4 by-time items (DuckDB's tie choice is nondeterministic);
 // the same prefixes as isArgItem, which lives in a tagged file.
 func havingArgItem(item string) bool {
@@ -257,10 +474,10 @@ func havingArgItem(item string) bool {
 
 // havingRef resolves one reference and returns the TEXT to emit for it and what
 // kind of literal it may be compared against.
-func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefKind, bool) {
+func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefInfo, bool) {
 	t, tok := c.next()
 	if !tok || t.kind != tokIdent {
-		return "", refAny, false
+		return "", havingRefInfo{}, false
 	}
 	// An aggregate call: re-serialize it with the SAME item parsers the select list
 	// used, then match the result against the select items. Matching on
@@ -274,14 +491,14 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefKind,
 		case t.lower == "mode":
 			// agg-7: grouped `mode` is never routed (matchGroupedAgg), so it can
 			// never be a select item here.
-			return "", refAny, false
+			return "", havingRefInfo{}, false
 		case quantileAggFns[t.lower]:
 			// res-3: the select list's own parser (scalar fractions only — a LIST
 			// quantile never lexes as an item, so it cannot be referenced).
 			var qok bool
 			itemText, qok = parseQuantileAggItem(c, t.lower)
 			if !qok {
-				return "", refAny, false
+				return "", havingRefInfo{}, false
 			}
 		case unaryAggFns[t.lower]:
 			// Mirrors the select-list arm in matchGroupedAgg exactly (same accepted
@@ -291,7 +508,7 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefKind,
 			if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
 				c.i++
 				if !c.punct(')') {
-					return "", refAny, false
+					return "", havingRefInfo{}, false
 				}
 				itemText = "count(*)"
 			} else if predArgAggFns[t.lower] && predArgFollows(c) {
@@ -300,16 +517,16 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefKind,
 				// structural match (the reverse can miss, which only declines).
 				text, ptok := reserializePredArg(c)
 				if !ptok || !c.punct(')') {
-					return "", refAny, false
+					return "", havingRefInfo{}, false
 				}
 				itemText = t.lower + "(" + text + ")"
 			} else {
 				arg, tok := c.next()
 				if !tok || arg.kind != tokIdent || isScanKeyword(arg.lower) || duckdbNonColumnKeywords[arg.lower] {
-					return "", refAny, false
+					return "", havingRefInfo{}, false
 				}
 				if !c.punct(')') {
-					return "", refAny, false // expression / DISTINCT / arity -> decline
+					return "", havingRefInfo{}, false // expression / DISTINCT / arity -> decline
 				}
 				itemText = t.lower + "(" + arg.orig + ")"
 			}
@@ -317,18 +534,37 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefKind,
 			var iok bool
 			itemText, iok = parseTwoArgAggItem(c, t.lower)
 			if !iok {
-				return "", refAny, false
+				return "", havingRefInfo{}, false
 			}
 		default:
-			return "", refAny, false
+			return "", havingRefInfo{}, false
 		}
 		for _, it := range hc.items {
 			if it == itemText {
-				return itemText, havingItemKind(itemText, st), true
+				return itemText, havingItemInfo(itemText, hc, st), true
 			}
 		}
-		// Legal DuckDB (an aggregate not in the select list) — declines here.
-		return "", refAny, false
+		// res-3b: an aggregate not in the select list is a HIDDEN item — the engine
+		// computes it, filters on it and projects it away. It was parsed by the
+		// select list's own item parsers above (so it is a routable item), and the
+		// bucket-gated families are recorded for matchGroupedAgg's tag-key gate.
+		found := false
+		for _, h := range st.hidden {
+			if h == itemText {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if len(hc.items)+len(st.hidden) >= maxGroupedItems {
+				return "", havingRefInfo{}, false
+			}
+			st.hidden = append(st.hidden, itemText)
+			if momentAggFns[t.lower] || quantileAggFns[t.lower] || binaryMomentFns[t.lower] {
+				st.hiddenMoment = true
+			}
+		}
+		return itemText, havingItemInfo(itemText, hc, st), true
 	}
 	// res-3 post-impl review B1: a name DuckDB binds to something else — a keyword
 	// (`true`, `null` are literals) or a bare SQL value function (`current_timestamp`
@@ -336,19 +572,19 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefKind,
 	// as its ITEM TEXT, so the engine could not catch it: refuse every bare form here
 	// (the engine declines the same set).
 	if !aliasRefBindable(t.lower) {
-		return "", refAny, false
+		return "", havingRefInfo{}, false
 	}
 	// A bare identifier: KEY first, then the bucket alias, then an aggregate alias.
 	if hc.tagKey != "" && strings.EqualFold(t.orig, hc.tagKey) {
-		return hc.tagKey, refAny, true
+		return hc.tagKey, havingRefInfo{kind: refAny, cmp: cmpNone}, true
 	}
 	if hc.bucketAlias != "" && strings.EqualFold(t.orig, hc.bucketAlias) {
-		return hc.bucketAlias, refTime, true
+		return hc.bucketAlias, havingRefInfo{kind: refTime, cmp: cmpTime}, true
 	}
 	for i, a := range hc.aliases {
 		if a != "" && strings.EqualFold(a, t.orig) && i < len(hc.items) {
-			return hc.items[i], havingItemKind(hc.items[i], st), true
+			return hc.items[i], havingItemInfo(hc.items[i], hc, st), true
 		}
 	}
-	return "", refAny, false
+	return "", havingRefInfo{}, false
 }

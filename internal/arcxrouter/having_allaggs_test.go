@@ -70,10 +70,9 @@ func TestHavingAllAggsDecline(t *testing.T) {
 		// A number against the timestamp bucket alias.
 		b + "count(*) FROM cpu GROUP BY 1 HAVING t > 5",
 		b + "count(*) FROM cpu GROUP BY 1 HAVING t > 2.5",
-		// Hidden aggregates / unknown names / different predicate literal.
-		"SELECT host, count(*) AS n FROM cpu GROUP BY host HAVING sum(x) > 3",
+		// Unknown names (hidden aggregates and a different predicate literal route
+		// since res-3b — having_grammar_test.go).
 		"SELECT host, count(*) AS n FROM cpu GROUP BY host HAVING m > 3",
-		b + "count_if(x > 1) FROM cpu GROUP BY 1 HAVING count_if(x > 2) > 2",
 		// A decimal wider than 15 significant digits (the engine's exactness bound).
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) > 1234567890123456.5",
 		// Unstable HAVING with LIMIT or an aggregate ORDER BY target (review H3).

@@ -78,3 +78,22 @@ func TestCompareGroupedKeyOrderedUnstableHaving(t *testing.T) {
 		t.Fatalf("an aggregate ORDER BY target is a recognizer invariant breach (skip), got %q", diff)
 	}
 }
+
+// res-3b: a select list without an aggregate builds only when the HAVING carries
+// one (a hidden item) — never a bare DISTINCT, even from a hand-made Decision.
+func TestBuildGroupedSQLHiddenOnly(t *testing.T) {
+	paths := "['/p.parquet']"
+	if got, ok := buildGroupedSQL(Decision{AggItems: []string{"host"}, GroupKey: "host"}, paths); ok {
+		t.Fatalf("bare DISTINCT must not build: %q", got)
+	}
+	if got, ok := buildGroupedSQL(Decision{AggItems: []string{"host"}, GroupKey: "host", HavingHidden: 1}, paths); ok {
+		t.Fatalf("a hidden count without HAVING text must not build: %q", got)
+	}
+	got, ok := buildGroupedSQL(Decision{
+		AggItems: []string{"host"}, GroupKey: "host", HavingHidden: 1, HavingText: "count(*) > 100",
+	}, paths)
+	want := "SELECT host FROM read_parquet(['/p.parquet']) GROUP BY 1 HAVING count(*) > 100"
+	if !ok || got != want {
+		t.Fatalf("got (%q, %t), want %q", got, ok, want)
+	}
+}
