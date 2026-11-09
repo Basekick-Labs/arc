@@ -228,6 +228,8 @@ func TestCopyResponse(t *testing.T) {
 			Header: http.Header{
 				"Content-Type":      []string{"application/json"},
 				"X-Custom-Header":   []string{"custom-value"},
+				"Set-Cookie":        []string{"a=1; Path=/", "b=2; Path=/"},
+				"Trailer":           []string{"X-Stream-Status"},
 				"Connection":        []string{"keep-alive"}, // Should be filtered out (hop-by-hop)
 				"Transfer-Encoding": []string{"chunked"},    // Should be filtered out (hop-by-hop)
 			},
@@ -249,10 +251,12 @@ func TestCopyResponse(t *testing.T) {
 	// Verify regular headers are copied
 	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 	assert.Equal(t, "custom-value", resp.Header.Get("X-Custom-Header"))
+	assert.Equal(t, []string{"a=1; Path=/", "b=2; Path=/"}, resp.Header.Values("Set-Cookie"))
 
 	// Verify hop-by-hop headers are NOT copied
 	assert.Empty(t, resp.Header.Get("Connection"))
 	assert.Empty(t, resp.Header.Get("Transfer-Encoding"))
+	assert.Empty(t, resp.Header.Get("Trailer"))
 }
 
 func TestShouldForwardWrite(t *testing.T) {

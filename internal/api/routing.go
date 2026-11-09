@@ -27,6 +27,7 @@ var hopByHopHeaders = map[string]bool{
 	"Proxy-Authenticate":  true,
 	"Proxy-Authorization": true,
 	"Te":                  true,
+	"Trailer":             true,
 	"Trailers":            true,
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
@@ -263,7 +264,7 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 	for key, values := range resp.Header {
 		if !isHopByHop(key) {
 			for _, v := range values {
-				c.Set(key, v)
+				c.Context().Response.Header.Add(key, v)
 			}
 		}
 	}
