@@ -171,16 +171,17 @@ func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 		// the hub. The spoke presents the token from ARC_EDGE_SYNC_HUB_TOKEN.
 		//
 		// The coarse RequireWrite, NOT the RBAC-aware door the ingest
-		// endpoints moved to (#1559): these handlers check no RBAC grant per
-		// database, so this middleware is the only gate, and admitting a
-		// token on an RBAC grant for one database would let it write any.
+		// endpoints moved to (#1559): these handlers check no RBAC grant on
+		// the database a file lands in (the spoke's namespace, {spoke_id}),
+		// so this middleware is the only token gate, and admitting a token on
+		// an RBAC grant for some other database would let it push into any
+		// spoke namespace whose HMAC secret the caller holds.
 		//
 		// That is not RBAC enforcement either. A token that holds the coarse
-		// "write" bit AND is a team member is not narrowed to its team's
-		// databases here, unlike on every ingest route, where RBAC is
-		// authoritative for team members. Closing that needs a per-database
-		// check in these handlers; until then, give spokes a token that is in
-		// no team.
+		// "write" bit AND is a team member is not narrowed by its team's
+		// grants here, unlike on every ingest route, where RBAC is
+		// authoritative for team members (#1561). Until these handlers check
+		// the spoke's database, give spokes a token that is in no team.
 		group.Use(auth.RequireWrite(h.authManager))
 	}
 

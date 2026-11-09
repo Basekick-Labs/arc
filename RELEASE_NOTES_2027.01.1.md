@@ -119,9 +119,11 @@ upgraded yet is checked by that node the old way, so an RBAC-only token can
 see a 403 until every node runs this version.
 
 The edge-sync hub endpoints still require the token's own `write`
-permission: they do not check RBAC per database, so that check is the only
-one they have. It also means RBAC does not narrow a team-member token there;
-give edge-sync spokes a token that is in no team.
+permission (together with the spoke's HMAC secret). They do not check RBAC
+on the spoke's database, so that check is the only token check they have.
+It also means RBAC does not narrow a team-member token there
+([#1561](https://github.com/Basekick-Labs/arc/issues/1561)); give edge-sync
+spokes a token that is in no team.
 
 ## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
 
