@@ -286,6 +286,17 @@ type ColdSource interface {
 	RecordRestoredHotFiles(ctx context.Context, sizes map[string]int64) (quarantined, failed []string, err error)
 }
 
+// coldRestoreGuard is an optional ColdSource capability (#1550): told before
+// a restore that may write to the cold tier starts and after it ends, so the
+// cold source can stop trusting its cold rows across the restore.
+// tiering.Manager implements it.
+type coldRestoreGuard interface {
+	// BeginColdRestore's error refuses the restore: the cold source could
+	// not record that its rows may become incomplete (#1550).
+	BeginColdRestore() error
+	EndColdRestore()
+}
+
 // SetColdSource wires this node's cold tier for the cold walk and the cold
 // restore. Nil is ignored, as SetColdCounter; a caller holding a typed nil
 // pointer must check for nil itself (#713).

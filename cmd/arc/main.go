@@ -290,7 +290,17 @@ func main() {
 				bootIcebergCatalog = cfg.Auth.DBPath
 			}
 		}
-		backup.ApplyPendingRestores(logger.Get("backup"), cfg.Auth.DBPath, bootIcebergCatalog)
+		// A restored arc.db carries the backup's tier_files: files migrated
+		// to cold since then have no row until a cold sync records them, so
+		// those rows must not vouch for an empty cold range (#1550). Marked
+		// before the swap; the marker is harmless if the swap then fails.
+		bootTieringDB := cfg.Auth.DBPath
+		backup.ApplyPendingRestoresWith(logger.Get("backup"), func(dbPath string) error {
+			if dbPath != bootTieringDB {
+				return nil
+			}
+			return tiering.MarkColdMetadataUnverified(dbPath, tiering.ColdMetadataReasonRestored)
+		}, cfg.Auth.DBPath, bootIcebergCatalog)
 	}
 
 	// Validate Enterprise License early (before component initialization)
@@ -4788,7 +4798,13 @@ func main() {
 					LicenseClient: licenseClient,
 					ClusterGate:   tieringGate,
 					Manifest:      tieringManifest,
-					Logger:        logger.Get("tiering"),
+					// The same database ApplyPendingRestoresWith marks (#1550).
+					ColdMetadataMarkerPath: tiering.ColdMetadataMarkerPath(tieringDBPath),
+					// From config, not from clusterCoordinator: a cluster node
+					// whose coordinator failed to start, or whose licence lacks
+					// clustering, still shares storage with nodes that do (#1550).
+					ClusteredDeployment: cfg.Cluster.Enabled || cfg.Cluster.SharedStorageMode,
+					Logger:              logger.Get("tiering"),
 				})
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to create tiering manager - feature disabled")

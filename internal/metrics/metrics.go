@@ -60,8 +60,12 @@ type Metrics struct {
 	queryTimeoutsTotal atomic.Int64
 	queryRowsTotal     atomic.Int64
 	querySlowTotal     atomic.Int64
-	queryLatencySum    atomic.Int64 // microseconds
-	queryLatencyCount  atomic.Int64
+	// queryColdUnlistedSkipped counts reads that left out cold partitions
+	// the cold tier could not list, because this node's tier metadata holds
+	// no cold rows for the range (#1550).
+	queryColdUnlistedSkipped atomic.Int64
+	queryLatencySum          atomic.Int64 // microseconds
+	queryLatencyCount        atomic.Int64
 
 	// Client-disconnect mid-stream counters, broken out by streaming
 	// handler so operators can disambiguate "Grafana panels giving up"
@@ -509,12 +513,17 @@ func (m *Metrics) IncLineProtocolRecords(count int64) { m.lineprotocolRecordsTot
 func (m *Metrics) IncLineProtocolBytes(bytes int64)   { m.lineprotocolBytesTotal.Add(bytes) }
 
 // Query Metrics
-func (m *Metrics) IncQueryRequests()        { m.queryRequestsTotal.Add(1) }
-func (m *Metrics) IncQuerySuccess()         { m.querySuccessTotal.Add(1) }
-func (m *Metrics) IncQueryErrors()          { m.queryErrorsTotal.Add(1) }
-func (m *Metrics) IncQueryTimeouts()        { m.queryTimeoutsTotal.Add(1) }
-func (m *Metrics) IncSlowQueries()          { m.querySlowTotal.Add(1) }
-func (m *Metrics) IncQueryRows(count int64) { m.queryRowsTotal.Add(count) }
+func (m *Metrics) IncQueryRequests() { m.queryRequestsTotal.Add(1) }
+func (m *Metrics) IncQuerySuccess()  { m.querySuccessTotal.Add(1) }
+func (m *Metrics) IncQueryErrors()   { m.queryErrorsTotal.Add(1) }
+func (m *Metrics) IncQueryTimeouts() { m.queryTimeoutsTotal.Add(1) }
+func (m *Metrics) IncSlowQueries()   { m.querySlowTotal.Add(1) }
+
+// IncQueryColdUnlistedSkipped counts a read that left out cold partitions the
+// cold tier could not list, on tier metadata's word that the range has no
+// cold rows (#1550).
+func (m *Metrics) IncQueryColdUnlistedSkipped() { m.queryColdUnlistedSkipped.Add(1) }
+func (m *Metrics) IncQueryRows(count int64)     { m.queryRowsTotal.Add(count) }
 
 // RecordQueryLatency records query latency in microseconds
 func (m *Metrics) RecordQueryLatency(durationMicros int64) {
@@ -1240,14 +1249,15 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"lineprotocol_bytes_total":    m.lineprotocolBytesTotal.Load(),
 
 		// Query
-		"query_requests_total": m.queryRequestsTotal.Load(),
-		"query_success_total":  m.querySuccessTotal.Load(),
-		"query_errors_total":   m.queryErrorsTotal.Load(),
-		"query_timeouts_total": m.queryTimeoutsTotal.Load(),
-		"query_slow_total":     m.querySlowTotal.Load(),
-		"query_rows_total":     m.queryRowsTotal.Load(),
-		"query_latency_sum_us": m.queryLatencySum.Load(),
-		"query_latency_count":  m.queryLatencyCount.Load(),
+		"query_requests_total":              m.queryRequestsTotal.Load(),
+		"query_success_total":               m.querySuccessTotal.Load(),
+		"query_errors_total":                m.queryErrorsTotal.Load(),
+		"query_timeouts_total":              m.queryTimeoutsTotal.Load(),
+		"query_slow_total":                  m.querySlowTotal.Load(),
+		"query_cold_unlisted_skipped_total": m.queryColdUnlistedSkipped.Load(),
+		"query_rows_total":                  m.queryRowsTotal.Load(),
+		"query_latency_sum_us":              m.queryLatencySum.Load(),
+		"query_latency_count":               m.queryLatencyCount.Load(),
 
 		"query_client_disconnects_arrow_ipc_total":  m.queryDisconnectsArrowIPC.Load(),
 		"query_client_disconnects_arrow_json_total": m.queryDisconnectsArrowJSON.Load(),
@@ -1581,6 +1591,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_slow_queries_total Queries that exceeded slow query threshold\n"...)
 	b = append(b, "# TYPE arc_slow_queries_total counter\n"...)
 	b = appendMetric(b, "arc_slow_queries_total", float64(m.querySlowTotal.Load()))
+
+	b = append(b, "# HELP arc_query_cold_unlisted_skipped_total Reads that left out cold partitions the cold tier could not list, because tier metadata holds no cold rows for the range\n"...)
+	b = append(b, "# TYPE arc_query_cold_unlisted_skipped_total counter\n"...)
+	b = appendMetric(b, "arc_query_cold_unlisted_skipped_total", float64(m.queryColdUnlistedSkipped.Load()))
 
 	b = append(b, "# HELP arc_query_rows_total Total rows returned by queries\n"...)
 	b = append(b, "# TYPE arc_query_rows_total counter\n"...)

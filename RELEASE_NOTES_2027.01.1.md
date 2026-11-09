@@ -74,6 +74,76 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
+
+When the cold tier could not be listed (expired or missing credentials, a
+network failure, an unreachable endpoint), a query on any measurement with
+data in the cold tier failed, even if its time range only covered hot data.
+Arc tried to check the cold tier for every partition in the range and then
+read those it could not check, which hit the same error. A cold-tier outage
+took down recent-data dashboards along with archive queries.
+
+On a standalone node, Arc now uses its tier metadata when the cold tier cannot
+be listed. If no cold file is recorded for the query's time range, the read
+leaves the cold tier out and answers from hot data. The query fails as before
+in every other case:
+- cold files are recorded for the range, so the answer would be incomplete;
+- the metadata lookup fails;
+- the query has no time range and the measurement has cold data;
+- a listing that did answer found cold data the metadata does not record.
+
+Arc only uses this shortcut while its tier metadata is a complete record of
+the cold tier:
+- **Never on a node configured for a cluster.** This covers
+  `cluster.enabled` and `cluster.shared_storage_mode`, including a node whose
+  cluster coordinator did not start. Cluster nodes keep the previous
+  behaviour ([#1552](https://github.com/Basekick-Labs/arc/issues/1552)).
+- **Only after a complete cold-tier metadata sync on this version.** The sync
+  must record every cold object against the node's current database. A new,
+  lost or moved database starts without that record.
+- **Not after a metadata restore,** until the next complete sync. The
+  restored rows predate files migrated since the backup.
+- **Not during or after a data restore on a node with a cold tier,** until
+  the next complete sync. This holds even when the restore succeeds.
+- **Not after a sync that could not record some cold objects,** until a later
+  complete sync. This includes a `.parquet` object under a measurement with
+  cold data whose key Arc cannot parse. A failure that repeats on every sync
+  keeps the shortcut off. The warning it logs names sample objects.
+
+A quarantined cold row counts as cold data for the range: its object is still
+read on a healthy cold tier, so the read keeps the cold tier and fails.
+
+If a data restore cannot record that the tier metadata may become incomplete
+(neither the marker file next to the database nor the database itself can be
+written), the restore is refused before it writes anything.
+
+`GET /api/v1/tiering/status` reports the state as
+`cold_metadata.authoritative`, with the reason when it is false.
+
+**Upgrading:** the shortcut is available only after the first complete
+cold-tier metadata sync on this version. That sync runs with the startup tier
+scan. A node whose cold tier is already unreachable when it starts on this
+version keeps the previous behaviour until the cold tier is reachable again.
+
+Other changes:
+- **Fewer timeouts during an outage.** On a node where the shortcut is
+  available, once a cold-tier listing fails, Arc stops listing the cold tier
+  for the rest of that read. An unreachable cold endpoint then costs one
+  listing timeout (5 s) per tiered measurement in each query, instead of one
+  per day in the range. Arc does not remember the failure between queries, so
+  each query pays it again. Cluster nodes, nodes whose metadata is not yet
+  trusted, and hot-tier listings are unchanged.
+- **Visibility.** Each read that leaves the cold tier out this way increments
+  `arc_query_cold_unlisted_skipped_total`. Arc also logs a warning at most
+  once a minute per measurement.
+- **Not cached.** These reads are not cached, so the cold tier is read again
+  as soon as it can be listed.
+
+Thanks to [@officialasishkumar](https://github.com/officialasishkumar) for the
+first fix of this issue in
+[#1553](https://github.com/Basekick-Labs/arc/pull/1553). Its unverified
+listing outcome and its 403-backed S3 test shaped this one.
+
 ## Fix: names that differ only in case stay apart on case-insensitive volumes ([#1509](https://github.com/Basekick-Labs/arc/issues/1509))
 
 On a volume that does not distinguish names by case (macOS APFS by default,
