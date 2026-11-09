@@ -32,6 +32,11 @@ import (
 // lifecycle rule that emptied the bucket leaves every row a candidate.
 const coldMissingCheckLimit = 1000
 
+// coldMissingCheckBudget bounds the time the check takes out of the scan's
+// budget: the hot scan runs after it on the same context, and a diagnostic
+// must not truncate it. Candidates left when it runs out are unchecked.
+const coldMissingCheckBudget = 30 * time.Second
+
 // ColdMissingObjectsStatus is the last check of cold rows whose object is gone.
 type ColdMissingObjectsStatus struct {
 	// Lost counts cold rows whose object is gone from cold storage and that
@@ -40,8 +45,8 @@ type ColdMissingObjectsStatus struct {
 	// HotCopy counts cold rows whose cold object is gone but whose hot copy is
 	// still read through the hot tier: no data is missing.
 	HotCopy int `json:"hot_copy"`
-	// Unchecked counts candidates not checked: over the per-sync limit, or a
-	// stat or row read that failed.
+	// Unchecked counts candidates not checked: over the per-sync limit or
+	// time budget, or a stat or row read that failed.
 	Unchecked int `json:"unchecked,omitempty"`
 	// Sample names up to five lost rows.
 	Sample    []string  `json:"sample,omitempty"`
@@ -87,6 +92,8 @@ func (m *Manager) checkMissingColdObjects(ctx context.Context, unseen map[string
 		return
 	}
 	gen := m.coldRemovalGen.Load()
+	ctx, cancel := context.WithTimeout(ctx, coldMissingCheckBudget)
+	defer cancel()
 	st := &ColdMissingObjectsStatus{}
 	checked := 0
 	for path := range unseen {
