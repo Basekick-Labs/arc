@@ -129,7 +129,11 @@ var collationTokens = []string{"collate", "default_collation"}
 // filtered footer-agg shape never emits a NULL bucket (a time filter drops NULL rows),
 // so this only bites the unfiltered date_trunc agg — but the guard is cheap and
 // covers both.
-var nullOrderTokens = []string{"default_null_order", "null_order"}
+//
+// res-2 adds `default_order`: the engine SQL spells every key's direction and null
+// order explicitly, but the user's `ORDER BY 2` — what DuckDB actually serves —
+// follows an in-query `SET default_order = 'desc'`. Same out-of-band caveat.
+var nullOrderTokens = []string{"default_null_order", "null_order", "default_order"}
 
 // matchResult is what eligibleShape resolves a recognized query into. `unit` is
 // set only for the date_trunc agg; `col` only for the scalar column aggregates
@@ -147,7 +151,7 @@ type matchResult struct {
 	// can't represent the WHERE (2b-2). buildScanSQL emits it verbatim; the engine is
 	// the tree authority.
 	orderBy []scanOrderKey // scan only: ORDER BY keys
-	limit   int            // scan only: LIMIT n (0 = none)
+	limit   int            // LIMIT n: scan (0 = none); grouped only under hasLimit (res-2)
 	// scan_agg only: re-serialized aggregate items ("count(*)", "sum(colAsWritten)"),
 	// in select-list order — validated token-by-token in matchScanAgg.
 	aggItems []string
@@ -162,9 +166,10 @@ type matchResult struct {
 	// The SQL builder re-emits from THESE, never from groupKey's text.
 	bucketUnit string
 	bucketCol  string
-	// agg-3c: the ordered KEY's 1-based select position (0 = no ORDER BY);
-	// the builder emits `ORDER BY <this position>` ascending.
-	orderByItem int
+	// res-2 grouped ORDER BY keys (1-based positions; replaced agg-3c's single
+	// ascending key) and an explicit LIMIT.
+	orderKeys []OrderKey
+	hasLimit  bool
 	// agg-3c: rebuilt bucket item text ("" = no bucket key). groupKey holds
 	// the TAG key's spelling ("" = no tag key); at least one is set.
 	bucketText string
@@ -239,7 +244,9 @@ func eligibleShape(sql string) (matchResult, bool) {
 			bucketCol:      gm.bucketCol,
 			epochWidthSecs: gm.epochWidthSecs,
 			bucketAlias:    gm.bucketAlias,
-			orderByItem:    gm.orderByItem,
+			orderKeys:      gm.orderKeys,
+			limit:          gm.limit,
+			hasLimit:       gm.hasLimit,
 			whereText:      gm.whereText,
 			havingText:     gm.havingText,
 			measurement:    gm.meas,

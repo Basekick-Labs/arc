@@ -35,6 +35,9 @@ import "sync/atomic"
 //	                agg-6b' Kahan sums), or ANY difference — value, NULL-ness,
 //	                NaN-ness — on the agg-8 shape statistics (skewness, kurtosis,
 //	                kurtosis_pop), where 1.5.6's raw power sums are unreliable
+//	tiediff       — a grouped top-N (ORDER BY … LIMIT) whose cut fell inside a tie
+//	                class returned a different, equally valid member of it: DuckDB
+//	                picks among tied groups arbitrarily, arcx by group key (res-2)
 //	declined      — the engine declined an eligible shape (eligibility over-claimed)
 //	error         — the SHADOW engine run failed
 //	oracle_error  — the DuckDB oracle failed; says nothing about arcx
@@ -52,6 +55,7 @@ var arcxShadowOutcomes = [...]string{
 	"mismatch",
 	"argdiff",
 	"oraclediff",
+	"tiediff",
 	"declined",
 	"error",
 	"oracle_error",
@@ -70,6 +74,7 @@ const (
 	ShadowMismatch    = "mismatch"
 	ShadowArgDiff     = "argdiff"
 	ShadowOracleDiff  = "oraclediff"
+	ShadowTieDiff     = "tiediff"
 	ShadowDeclined    = "declined"
 	ShadowError       = "error"
 	ShadowOracleError = "oracle_error"

@@ -79,13 +79,13 @@ func TestBuildGroupedSQL(t *testing.T) {
 	// agg-3 bucket key + ORDER BY: the bucket text is REBUILT from the validated
 	// parts (BucketUnit/BucketCol), never taken from GroupKey.
 	got, ok = buildGroupedSQL(Decision{
-		AggItems:    []string{"date_trunc('minute', time)", "count(*)", "avg(cpu_user)"},
-		BucketUnit:  "minute",
-		BucketCol:   "time",
-		WhereText:   "time >= '2026-01-01T00:00:00Z'",
-		OrderByItem: 1,
+		AggItems:   []string{"date_trunc('minute', time)", "count(*)", "avg(cpu_user)"},
+		BucketUnit: "minute",
+		BucketCol:  "time",
+		WhereText:  "time >= '2026-01-01T00:00:00Z'",
+		OrderKeys:  []OrderKey{{Pos: 1}},
 	}, paths)
-	want = "SELECT date_trunc('minute', time), count(*), avg(cpu_user) FROM read_parquet(['/p.parquet']) WHERE time >= '2026-01-01T00:00:00Z' GROUP BY 1 ORDER BY 1"
+	want = "SELECT date_trunc('minute', time), count(*), avg(cpu_user) FROM read_parquet(['/p.parquet']) WHERE time >= '2026-01-01T00:00:00Z' GROUP BY 1 ORDER BY 1 ASC NULLS LAST"
 	if !ok || got != want {
 		t.Fatalf("got (%q, %t), want %q", got, ok, want)
 	}
@@ -95,9 +95,9 @@ func TestBuildGroupedSQL(t *testing.T) {
 		EpochWidthSecs: 300,
 		BucketCol:      "time",
 		BucketAlias:    "time",
-		OrderByItem:    1,
+		OrderKeys:      []OrderKey{{Pos: 1}},
 	}, paths)
-	want = "SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time, avg(cpu_user) FROM read_parquet(['/p.parquet']) GROUP BY 1 ORDER BY 1"
+	want = "SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time, avg(cpu_user) FROM read_parquet(['/p.parquet']) GROUP BY 1 ORDER BY 1 ASC NULLS LAST"
 	if !ok || got != want {
 		t.Fatalf("got (%q, %t), want %q", got, ok, want)
 	}
@@ -141,21 +141,61 @@ func TestBuildGroupedSQLComposite(t *testing.T) {
 		EpochWidthSecs: 300,
 		BucketCol:      "time",
 		BucketAlias:    "time",
-		OrderByItem:    1,
+		OrderKeys:      []OrderKey{{Pos: 1}},
 	}, paths)
-	want := "SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time, host, avg(cpu_user) FROM read_parquet(['/p.parquet']) GROUP BY 1, 2 ORDER BY 1"
+	want := "SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time, host, avg(cpu_user) FROM read_parquet(['/p.parquet']) GROUP BY 1, 2 ORDER BY 1 ASC NULLS LAST"
 	if !ok || got != want {
 		t.Fatalf("got (%q, %t), want %q", got, ok, want)
 	}
-	// ORDER BY pointing at a NON-key position must decline.
-	if _, ok := buildGroupedSQL(Decision{
-		AggItems:    []string{"date_trunc('hour', time)", "host", "count(*)"},
-		GroupKey:    "host",
-		BucketUnit:  "hour",
-		BucketCol:   "time",
-		OrderByItem: 3,
-	}, paths); ok {
-		t.Fatal("ORDER BY on an aggregate position must decline")
+	// res-2: ORDER BY an aggregate position, multi-key, DESC / NULLS FIRST and
+	// an explicit LIMIT (LIMIT 0 included — adversarial B2).
+	got, ok = buildGroupedSQL(Decision{
+		AggItems:   []string{"date_trunc('hour', time)", "host", "count(*)"},
+		GroupKey:   "host",
+		BucketUnit: "hour",
+		BucketCol:  "time",
+		OrderKeys:  []OrderKey{{Pos: 3, Desc: true}, {Pos: 2, NullsFirst: true}},
+		HasLimit:   true,
+		Limit:      0,
+	}, paths)
+	want = "SELECT date_trunc('hour', time), host, count(*) FROM read_parquet(['/p.parquet']) GROUP BY 1, 2 ORDER BY 3 DESC NULLS LAST, 2 ASC NULLS FIRST LIMIT 0"
+	if !ok || got != want {
+		t.Fatalf("got (%q, %t), want %q", got, ok, want)
+	}
+	// Review H1: the shadow tie-verification variant appends the engine's
+	// tie-break (every key position, GROUP BY order, ASC NULLS LAST) before the
+	// LIMIT and reads with union_by_name like Arc's own queries.
+	got, ok = buildGroupedSQL(Decision{
+		AggItems:       []string{"date_trunc('hour', time)", "host", "count(*)"},
+		GroupKey:       "host",
+		BucketUnit:     "hour",
+		BucketCol:      "time",
+		OrderKeys:      []OrderKey{{Pos: 3, Desc: true}},
+		HasLimit:       true,
+		Limit:          5,
+		tieBreakOracle: true,
+	}, paths)
+	want = "SELECT date_trunc('hour', time), host, count(*) FROM read_parquet(['/p.parquet'], union_by_name=true) GROUP BY 1, 2 ORDER BY 3 DESC NULLS LAST, 1 ASC NULLS LAST, 2 ASC NULLS LAST LIMIT 5"
+	if !ok || got != want {
+		t.Fatalf("got (%q, %t), want %q", got, ok, want)
+	}
+	base := func() Decision {
+		return Decision{AggItems: []string{"host", "count(*)", "arg_max(v, time)"}, GroupKey: "host"}
+	}
+	for name, mut := range map[string]func(*Decision){
+		"refused target":  func(d *Decision) { d.OrderKeys = []OrderKey{{Pos: 3}} },
+		"position 0":      func(d *Decision) { d.OrderKeys = []OrderKey{{Pos: 0}} },
+		"position past":   func(d *Decision) { d.OrderKeys = []OrderKey{{Pos: 4}} },
+		"limit, no order": func(d *Decision) { d.HasLimit, d.Limit = true, 5 },
+		"negative limit":  func(d *Decision) { d.OrderKeys, d.HasLimit, d.Limit = []OrderKey{{Pos: 2}}, true, -1 },
+		"oversized limit": func(d *Decision) { d.OrderKeys, d.HasLimit, d.Limit = []OrderKey{{Pos: 2}}, true, maxTopNLimit+1 },
+		"five keys":       func(d *Decision) { d.OrderKeys = []OrderKey{{Pos: 1}, {Pos: 2}, {Pos: 1}, {Pos: 2}, {Pos: 1}} },
+	} {
+		d := base()
+		mut(&d)
+		if got, ok := buildGroupedSQL(d, paths); ok {
+			t.Fatalf("%s: must decline, got %q", name, got)
+		}
 	}
 }
 

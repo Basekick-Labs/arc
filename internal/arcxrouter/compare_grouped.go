@@ -279,33 +279,7 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 	if len(got) != len(oracle) {
 		return fmt.Sprintf("grouped row count differs (arcx=%d duckdb=%d)", len(got), len(oracle))
 	}
-	// Cell policies in CELL order (items minus the keys, order preserved).
-	// cellItems carries the item text per cell for the agg-4 arg-tie deferral.
-	var tolerant []bool
-	var cellItems []string
-	for i, item := range items {
-		if isKeyCol(keyCols, i) {
-			continue
-		}
-		tolerant = append(tolerant, aggItemTolerant(item))
-		cellItems = append(cellItems, item)
-	}
-	// agg-4 tie policy: VALUE (and NaN-ness) diffs on arg cells are deferred —
-	// surfaced tagged "argdiff:" only when nothing else differs, so the caller
-	// WARNs instead of alarming. Structural diffs (row count, keys, null-ness,
-	// kind) always alarm: ties cannot cause them (a NULL payload never wins in
-	// either engine — the both-non-NULL participation rule).
-	argDiff := ""
-	oracleDiff := ""
-	deferArg := func(c int, msg string) bool {
-		if c < len(cellItems) && isArgItem(cellItems[c]) {
-			if argDiff == "" {
-				argDiff = msg
-			}
-			return true
-		}
-		return false
-	}
+	gc := newGroupedCmp(items, keyCols, len(got))
 	normalizeNullParts(got)
 	normalizeNullParts(oracle)
 	sort.Slice(got, func(i, j int) bool { return groupedLess(&got[i], &got[j]) })
@@ -315,105 +289,158 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 		if !groupedKeyEq(a, d) {
 			return fmt.Sprintf("grouped row %d of %d differs (key, values withheld)", i, len(got))
 		}
-		if len(a.cells) != len(d.cells) || len(a.cells) != len(tolerant) {
-			return fmt.Sprintf("grouped row %d differs (agg-column arity)", i)
-		}
-		for c := range a.cells {
-			ac, dc := &a.cells[c], &d.cells[c]
-			// agg-8: any shape-statistic difference is an oracle defect (WARN).
-			if c < len(cellItems) && isShapeItem(cellItems[c]) {
-				if shapeKindDiffers(*ac, *dc) {
-					return fmt.Sprintf("grouped row %d differs (agg col %d kind on a shape statistic)", i, c)
-				}
-				if shapeCellDiffers(*ac, *dc) && oracleDiff == "" {
-					oracleDiff = fmt.Sprintf("grouped row %d of %d differs (agg col %d shape statistic vs DuckDB 1.5.6, values withheld)", i, len(got), c)
-				}
-				continue
-			}
-			if ac.isNull != dc.isNull {
-				return fmt.Sprintf("grouped row %d differs (agg col %d null-ness)", i, c)
-			}
-			if ac.isNull {
-				continue
-			}
-			if ac.isBool != dc.isBool {
-				return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
-			}
-			if ac.isBool {
-				if ac.b != dc.b {
-					return fmt.Sprintf("grouped row %d of %d differs (agg col %d boolean, values withheld)", i, len(got), c)
-				}
-				continue
-			}
-			if ac.isStr != dc.isStr {
-				return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
-			}
-			if ac.isStr {
-				if ac.s != dc.s {
-					return fmt.Sprintf("grouped row %d of %d differs (agg col %d string, values withheld)", i, len(got), c)
-				}
-				continue
-			}
-			if ac.isInt != dc.isInt {
-				return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
-			}
-			if ac.isInt {
-				if ac.i.Cmp(dc.i) != 0 {
-					msg := fmt.Sprintf("grouped row %d of %d differs (agg col %d, values withheld)", i, len(got), c)
-					if deferArg(c, msg) {
-						continue
-					}
-					return msg
-				}
-				continue
-			}
-			if math.IsNaN(ac.f) || math.IsNaN(dc.f) {
-				if math.IsNaN(ac.f) && math.IsNaN(dc.f) {
-					continue
-				}
-				msg := fmt.Sprintf("grouped row %d differs (agg col %d NaN-ness)", i, c)
-				if deferArg(c, msg) {
-					continue
-				}
-				return msg
-			}
-			// ±Inf compares exactly — the tolerance test cannot see it (see compareAgg).
-			if math.IsInf(ac.f, 0) || math.IsInf(dc.f, 0) {
-				if ac.f == dc.f {
-					continue
-				}
-				msg := fmt.Sprintf("grouped row %d differs (agg col %d Inf-ness)", i, c)
-				if deferArg(c, msg) {
-					continue
-				}
-				return msg
-			}
-			if tolerant[c] {
-				scale := math.Max(math.Abs(ac.f), math.Abs(dc.f))
-				if math.Abs(ac.f-dc.f) > aggFloatRelTol*math.Max(scale, 1.0) {
-					msg := fmt.Sprintf("grouped row %d differs (agg col %d beyond 1e-9 tolerance, values withheld)", i, c)
-					if c < len(cellItems) && isOracleUnstableItem(cellItems[c]) {
-						if oracleDiff == "" {
-							oracleDiff = msg
-						}
-						continue
-					}
-					return msg
-				}
-			} else if ac.f != dc.f {
-				msg := fmt.Sprintf("grouped row %d of %d differs (agg col %d float, values withheld)", i, len(got), c)
-				if deferArg(c, msg) {
-					continue
-				}
-				return msg
-			}
+		if msg := gc.rowCells(i, a, d); msg != "" {
+			return msg
 		}
 	}
-	if argDiff != "" {
-		return "argdiff:" + argDiff
+	return gc.deferred()
+}
+
+// groupedCmp carries the per-cell policies of one grouped comparison and the
+// deferred (WARN-class) diffs it has seen. `rowCells` is the single source of the
+// cell rules, shared by the unordered and the ordered (res-2) comparisons.
+type groupedCmp struct {
+	tolerant   []bool
+	cellItems  []string
+	total      int
+	argDiff    string
+	oracleDiff string
+}
+
+func newGroupedCmp(items []string, keyCols []int, total int) *groupedCmp {
+	gc := &groupedCmp{total: total}
+	// Cell policies in CELL order (items minus the keys, order preserved).
+	// cellItems carries the item text per cell for the agg-4 arg-tie deferral.
+	for i, item := range items {
+		if isKeyCol(keyCols, i) {
+			continue
+		}
+		gc.tolerant = append(gc.tolerant, aggItemTolerant(item))
+		gc.cellItems = append(gc.cellItems, item)
 	}
-	if oracleDiff != "" {
-		return "oraclediff:" + oracleDiff
+	return gc
+}
+
+// deferArg: agg-4 tie policy — VALUE (and NaN-ness) diffs on arg cells are
+// deferred, surfaced tagged "argdiff:" only when nothing else differs. Structural
+// diffs (row count, keys, null-ness, kind) always alarm.
+func (gc *groupedCmp) deferArg(c int, msg string) bool {
+	if c < len(gc.cellItems) && isArgItem(gc.cellItems[c]) {
+		if gc.argDiff == "" {
+			gc.argDiff = msg
+		}
+		return true
+	}
+	return false
+}
+
+// deferred returns the WARN-class diff, if any ("" = full match).
+func (gc *groupedCmp) deferred() string {
+	if gc.argDiff != "" {
+		return "argdiff:" + gc.argDiff
+	}
+	if gc.oracleDiff != "" {
+		return "oraclediff:" + gc.oracleDiff
+	}
+	return ""
+}
+
+// rowCells compares the aggregate cells of two rows whose keys already match;
+// returns an alarm message, or "" (deferred diffs are recorded on gc).
+func (gc *groupedCmp) rowCells(i int, a, d *groupedRow) string {
+	tolerant, cellItems := gc.tolerant, gc.cellItems
+	if len(a.cells) != len(d.cells) || len(a.cells) != len(tolerant) {
+		return fmt.Sprintf("grouped row %d differs (agg-column arity)", i)
+	}
+	for c := range a.cells {
+		ac, dc := &a.cells[c], &d.cells[c]
+		// agg-8: any shape-statistic difference is an oracle defect (WARN).
+		if c < len(cellItems) && isShapeItem(cellItems[c]) {
+			if shapeKindDiffers(*ac, *dc) {
+				return fmt.Sprintf("grouped row %d differs (agg col %d kind on a shape statistic)", i, c)
+			}
+			if shapeCellDiffers(*ac, *dc) && gc.oracleDiff == "" {
+				gc.oracleDiff = fmt.Sprintf("grouped row %d of %d differs (agg col %d shape statistic vs DuckDB 1.5.6, values withheld)", i, gc.total, c)
+			}
+			continue
+		}
+		if ac.isNull != dc.isNull {
+			return fmt.Sprintf("grouped row %d differs (agg col %d null-ness)", i, c)
+		}
+		if ac.isNull {
+			continue
+		}
+		if ac.isBool != dc.isBool {
+			return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
+		}
+		if ac.isBool {
+			if ac.b != dc.b {
+				return fmt.Sprintf("grouped row %d of %d differs (agg col %d boolean, values withheld)", i, gc.total, c)
+			}
+			continue
+		}
+		if ac.isStr != dc.isStr {
+			return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
+		}
+		if ac.isStr {
+			if ac.s != dc.s {
+				return fmt.Sprintf("grouped row %d of %d differs (agg col %d string, values withheld)", i, gc.total, c)
+			}
+			continue
+		}
+		if ac.isInt != dc.isInt {
+			return fmt.Sprintf("grouped row %d differs (agg col %d kind)", i, c)
+		}
+		if ac.isInt {
+			if ac.i.Cmp(dc.i) != 0 {
+				msg := fmt.Sprintf("grouped row %d of %d differs (agg col %d, values withheld)", i, gc.total, c)
+				if gc.deferArg(c, msg) {
+					continue
+				}
+				return msg
+			}
+			continue
+		}
+		if math.IsNaN(ac.f) || math.IsNaN(dc.f) {
+			if math.IsNaN(ac.f) && math.IsNaN(dc.f) {
+				continue
+			}
+			msg := fmt.Sprintf("grouped row %d differs (agg col %d NaN-ness)", i, c)
+			if gc.deferArg(c, msg) {
+				continue
+			}
+			return msg
+		}
+		// ±Inf compares exactly — the tolerance test cannot see it (see compareAgg).
+		if math.IsInf(ac.f, 0) || math.IsInf(dc.f, 0) {
+			if ac.f == dc.f {
+				continue
+			}
+			msg := fmt.Sprintf("grouped row %d differs (agg col %d Inf-ness)", i, c)
+			if gc.deferArg(c, msg) {
+				continue
+			}
+			return msg
+		}
+		if tolerant[c] {
+			scale := math.Max(math.Abs(ac.f), math.Abs(dc.f))
+			if math.Abs(ac.f-dc.f) > aggFloatRelTol*math.Max(scale, 1.0) {
+				msg := fmt.Sprintf("grouped row %d differs (agg col %d beyond 1e-9 tolerance, values withheld)", i, c)
+				if c < len(cellItems) && isOracleUnstableItem(cellItems[c]) {
+					if gc.oracleDiff == "" {
+						gc.oracleDiff = msg
+					}
+					continue
+				}
+				return msg
+			}
+		} else if ac.f != dc.f {
+			msg := fmt.Sprintf("grouped row %d of %d differs (agg col %d float, values withheld)", i, gc.total, c)
+			if gc.deferArg(c, msg) {
+				continue
+			}
+			return msg
+		}
 	}
 	return ""
 }

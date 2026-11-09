@@ -202,6 +202,38 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: grouped top-N (`ORDER BY … LIMIT`) routes to the engine
+
+Grouped aggregates with an `ORDER BY` over aggregates, `DESC`, `NULLS FIRST`/`LAST`, up to four
+sort keys and a `LIMIT` now route to the arcx engine (arcX feat/res-2-topn). This covers the
+"top 10 hosts by error count" panel, `SELECT host, count(*) AS n … GROUP BY host ORDER BY n DESC
+LIMIT 10`, and multi-key orders such as `ORDER BY count(*) DESC, host`. Until now only
+`ORDER BY` a group key, ascending, routed.
+
+A sort key can be a select-list position, the group key, the bucket alias, an aggregate's alias, or
+an aggregate written exactly as it is in the select list. Ordering follows DuckDB: `NULLS LAST` by
+default in both directions, NaN above every number, and -0 equal to +0. When groups tie on every
+sort key, the engine breaks the tie by group key; DuckDB returns tied groups in no fixed order.
+
+These forms still run on DuckDB:
+- `LIMIT` without `ORDER BY`, `OFFSET`, and sort expressions (`ORDER BY count(*) + 1`);
+- an aggregate that is not in the select list;
+- sorting by `arg_max`/`arg_min`/`max_by`/`min_by`, `skewness`/`kurtosis`, `covar_pop`,
+  `covar_samp`, `regr_sxy`, `regr_intercept` or the Kahan sums (`fsum`, `favg`, …): DuckDB
+  1.5.6's results for these vary between runs or drift on real data, so its order would too;
+- an aggregate whose result carries a floating-point tolerance (`sum`, `avg`, the variance and
+  standard-deviation family, `median`, `quantile_cont`, `mad`, …) as any key but the last;
+- a query that mentions `default_order` or `default_null_order`.
+
+In shadow mode the order of the rows is compared as part of the answer. Groups that tie on every sort
+key may come back in a different order without counting as a difference. When the `LIMIT` cut falls
+inside a run of tied groups, the two engines can legitimately keep different groups from that run.
+Shadow mode then asks DuckDB again, this time with the engine's tie-break appended, so the answer is
+deterministic. The engine's rows must match that answer exactly, values included. Only then is the
+difference recorded under a new `tiediff` outcome (a WARN). A wrong row at the cut, or any other
+difference in membership, order or values, is a mismatch. The second query runs only when a tie falls
+at the cut.
+
 ## arcx router: aliased aggregates route to the engine
 
 Aggregates with an `AS` alias now route to the arcx engine
@@ -216,8 +248,9 @@ These forms still run on DuckDB:
 - a quoted alias (`AS "time"`);
 - in a grouped query, an alias that matches the group key, the bucket alias or another alias;
 - an alias that is a SQL clause word (`AS from`, `AS where`), which DuckDB accepts;
-- a `HAVING` or `ORDER BY` that names an aggregate's alias, because DuckDB resolves those names
-  differently in each clause. `HAVING avg(value) > 5` (the aggregate written out) still routes.
+- a `HAVING` that names an aggregate's alias, because DuckDB resolves alias names differently
+  in `HAVING`. `HAVING avg(value) > 5` (the aggregate written out) still routes. `ORDER BY` an
+  alias routes since the top-N change below.
 
 Shadow mode now also compares result column names, since aliases make them user-controlled. One
 existing difference is exempted. When DuckDB serves an unaliased `date_trunc` bucket (grouped,

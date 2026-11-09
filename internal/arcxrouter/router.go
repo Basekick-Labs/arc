@@ -102,6 +102,9 @@ type Metrics interface {
 	// (agg-6b: covar_pop, covar_samp, regr_sxy, regr_intercept under
 	// cancellation). WARN + metric, never the mismatch alarm.
 	ArcxShadowOracleDivergence(shape string)
+	// ArcxShadowTieDivergence: a grouped top-N whose LIMIT cut fell inside a tie
+	// class returned a different (equally valid) member of that class (res-2).
+	ArcxShadowTieDivergence(shape string)
 	ArcxShadowError(shape string)
 	// ArcxServeError: an engine failure on the SERVE path. Separate from
 	// ArcxShadowError because feeding both into one counter made a serve-mode
@@ -137,7 +140,7 @@ type Decision struct {
 	Preds     []scanPred     // scan only: AND-conjoined WHERE predicates (flat case)
 	WhereText string         // re-serialized WHERE: boolean tree for scan (2b-2), or a time-range filter for date_trunc agg (PR-A)
 	OrderBy   []scanOrderKey // scan only: ORDER BY keys
-	Limit     int            // scan only: LIMIT n (0 = none)
+	Limit     int            // LIMIT n: scan (0 = none); grouped only under HasLimit (res-2)
 	AggItems  []string       // scan_agg only: re-serialized aggregate items, select-list order
 	// res-1: per-item `AS` alias ("" = none), parallel to AggItems; AggItems stay
 	// the bare call text (HAVING matching, tolerance and key detection read them).
@@ -149,10 +152,17 @@ type Decision struct {
 	// these validated parts, never from GroupKey's text.
 	BucketUnit string
 	BucketCol  string
-	// agg-3c: the ordered KEY's 1-based select position (0 = no ORDER BY);
-	// the builder emits `ORDER BY <this position>` ascending after validating
-	// it points at a key item.
-	OrderByItem int
+	// res-2 (was agg-3c's single ascending OrderByItem): grouped ORDER BY keys
+	// by 1-based select position. The builder re-validates each position and
+	// emits direction and null order explicitly. HasLimit carries an explicit
+	// grouped LIMIT in Limit (LIMIT 0 is a real limit — adversarial B2).
+	OrderKeys []OrderKey
+	HasLimit  bool
+	// tieBreakOracle (shadow only, never set by the recognizer): build the
+	// DuckDB verification query for a top-N tie at the cut — the engine SQL with
+	// union_by_name=true and the engine's tie-break (every group key, GROUP BY
+	// order, ASC NULLS LAST) appended, so DuckDB's answer is deterministic.
+	tieBreakOracle bool
 	// agg-3c: the rebuilt bucket item text is NOT carried — the builder
 	// rebuilds it from the validated parts below; GroupKey holds the TAG key
 	// ("" = no tag key).
@@ -209,7 +219,8 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		GroupKey:       m.groupKey,
 		BucketUnit:     m.bucketUnit,
 		BucketCol:      m.bucketCol,
-		OrderByItem:    m.orderByItem,
+		OrderKeys:      m.orderKeys,
+		HasLimit:       m.hasLimit,
 		EpochWidthSecs: m.epochWidthSecs,
 		BucketAlias:    m.bucketAlias,
 	}
@@ -506,13 +517,16 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	}
 	b.WriteString(" FROM read_parquet(")
 	b.WriteString(pathArray)
+	if d.tieBreakOracle {
+		b.WriteString(", union_by_name=true") // what Arc's own reads use
+	}
 	b.WriteString(")")
 	if d.WhereText != "" {
 		b.WriteString(" WHERE ")
 		b.WriteString(d.WhereText)
 	}
 	// GROUP BY / ORDER BY by POSITION: valid for every key form and emits no
-	// identifier text at all. ORDER BY must point at a KEY position.
+	// identifier text at all.
 	b.WriteString(" GROUP BY ")
 	for i, kp := range keyPositions {
 		if i > 0 {
@@ -528,18 +542,48 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 		b.WriteString(" HAVING ")
 		b.WriteString(d.HavingText)
 	}
-	if d.OrderByItem != 0 {
-		ok := false
-		for _, kp := range keyPositions {
-			if d.OrderByItem == kp {
-				ok = true
-			}
-		}
-		if !ok {
+	if len(d.OrderKeys) > maxOrderKeys || (d.HasLimit && len(d.OrderKeys) == 0) {
+		return "", false
+	}
+	for i, k := range d.OrderKeys {
+		if k.Pos < 1 || k.Pos > len(d.AggItems) || orderTargetRefused(d.AggItems[k.Pos-1]) {
 			return "", false
 		}
-		b.WriteString(" ORDER BY ")
-		b.WriteString(strconv.Itoa(d.OrderByItem))
+		if i == 0 {
+			b.WriteString(" ORDER BY ")
+		} else {
+			b.WriteString(", ")
+		}
+		b.WriteString(strconv.Itoa(k.Pos))
+		// Direction and null order always explicit (DuckDB's defaults are
+		// ASC / NULLS LAST; the engine assumes exactly those).
+		if k.Desc {
+			b.WriteString(" DESC")
+		} else {
+			b.WriteString(" ASC")
+		}
+		if k.NullsFirst {
+			b.WriteString(" NULLS FIRST")
+		} else {
+			b.WriteString(" NULLS LAST")
+		}
+	}
+	if d.tieBreakOracle {
+		if len(d.OrderKeys) == 0 {
+			return "", false
+		}
+		for _, kp := range keyPositions {
+			b.WriteString(", ")
+			b.WriteString(strconv.Itoa(kp))
+			b.WriteString(" ASC NULLS LAST")
+		}
+	}
+	if d.HasLimit {
+		if d.Limit < 0 || d.Limit > maxTopNLimit {
+			return "", false
+		}
+		b.WriteString(" LIMIT ")
+		b.WriteString(strconv.Itoa(d.Limit))
 	}
 	return b.String(), true
 }
@@ -867,6 +911,17 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 			h.Metrics.ArcxShadowOracleDivergence(d.Shape)
 			return
 		}
+		if strings.HasPrefix(diff, "tiediff:") {
+			// res-2: a top-N whose LIMIT cut falls inside a tie class. DuckDB
+			// picks among tied groups arbitrarily; arcx breaks ties by group key.
+			// Every row outside the cut's tie class matched.
+			h.Logger.Warn().
+				Str("shape", d.Shape).
+				Str("diff", strings.TrimPrefix(diff, "tiediff:")).
+				Msg("arcx shadow: top-N tie at the LIMIT cut (values withheld)")
+			h.Metrics.ArcxShadowTieDivergence(d.Shape)
+			return
+		}
 		if strings.HasPrefix(diff, "argdiff:") {
 			h.Logger.Warn().
 				Str("shape", d.Shape).
@@ -910,6 +965,42 @@ func columnNameDiff(oracleCols []string, rec arrow.Record) string {
 		return "result column " + strconv.Itoa(i) + " name differs (names withheld)"
 	}
 	return ""
+}
+
+// verifyTopNTie: the user's query (DuckDB's answer) kept a different member of
+// the tie class at the LIMIT cut. Rows only arcx returned were never checked
+// against anything (review H1: a top-N heap that keeps the evicted value puts
+// a WRONG row exactly there), so re-ask DuckDB deterministically — the engine
+// SQL with the engine's own tie-break — and require a row-for-row match. Only
+// then is the divergence the legitimate tie choice (`tiediff`). Runs only on a
+// tie at the cut; any other ordered result needs no second query.
+func (h Deps) verifyTopNTie(ctx context.Context, d Decision, rec arrow.Record, keyCols []int, tieDiff string) (string, error) {
+	vd := d
+	vd.tieBreakOracle = true
+	sql, ok := h.buildEngineSQL(ctx, vd)
+	if !ok {
+		return skipPrefix + "could not build the top-N tie verification query", nil
+	}
+	rows, err := h.DB.QueryContext(ctx, sql)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	oracle, err := groupedFromRows(rows, keyCols)
+	if err != nil {
+		return "", err
+	}
+	switch v := compareGroupedOrderedMode(rec, oracle, d.AggItems, keyCols, d.OrderKeys, d.HasLimit, d.Limit, true); {
+	case strings.HasPrefix(v, "argdiff:"), strings.HasPrefix(v, "oraclediff:"), strings.HasPrefix(v, skipPrefix):
+		return v, nil // a WARN-class cell policy, or our own failure: never upgraded
+	case v == "", strings.HasPrefix(v, "tiediff:"):
+		// "" — exact match under the tie-break; tiediff here can only be a
+		// near-tie on a tolerant float last key, where the engines may round
+		// apart by the documented tolerance.
+		return tieDiff, nil
+	default:
+		return "top-N tie verification: " + v, nil
+	}
 }
 
 // compareToOracle runs the DuckDB oracle for this query and compares its result to
@@ -959,6 +1050,14 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		oracle, err := groupedFromRows(rows, keyCols)
 		if err != nil {
 			return "", err
+		}
+		if len(d.OrderKeys) > 0 {
+			// res-2: the order is part of the answer — never re-sorted.
+			diff := compareGroupedOrdered(rec, oracle, d.AggItems, keyCols, d.OrderKeys, d.HasLimit, d.Limit)
+			if strings.HasPrefix(diff, "tiediff:") {
+				return h.verifyTopNTie(ctx, d, rec, keyCols, diff)
+			}
+			return diff, nil
 		}
 		return compareGrouped(rec, oracle, d.AggItems, keyCols), nil
 	}
