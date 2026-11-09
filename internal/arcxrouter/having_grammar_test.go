@@ -23,6 +23,9 @@ func TestHavingGrammarRecognized(t *testing.T) {
 		{"SELECT date_trunc('hour', time) AS t FROM cpu GROUP BY 1 HAVING stddev(x) > 2 ORDER BY 1", "stddev(x) > 2", 1, ""},
 		{b + "count(*) FROM cpu GROUP BY 1 HAVING median(x) > 3 AND quantile_cont(x, 0.9) < 9", "median(x) > 3 AND quantile_cont(x, 0.9) < 9", 2, ""},
 		{b + "count(*) FROM cpu GROUP BY 1 HAVING count_if(x > 1) > 2", "count_if(x > 1) > 2", 1, ""},
+		{"SELECT date_trunc('hour', time), count(*) FROM cpu GROUP BY 1 HAVING corr(y, x) > 0", "corr(y, x) > 0", 1, ""},
+		{"SELECT date_trunc('hour', time), count(*) FROM cpu GROUP BY 1 HAVING stddev(v) > 1", "stddev(v) > 1", 1, ""},
+		{b + "count(*) FROM cpu GROUP BY 1 HAVING max(time) > '2026-01-01T00:00:00Z'", "max(time) > '2026-01-01T00:00:00Z'", 1, ""},
 		{b + "count(*) FROM cpu GROUP BY 1 HAVING skewness(x) > 0", "skewness(x) > 0", 1, "oracle"},
 		{"SELECT host FROM cpu GROUP BY host HAVING arg_max(x, time) > 1 ORDER BY 1", "arg_max(x, time) > 1", 1, "arg"},
 		// NOT, IS NULL, BETWEEN, IN, literal-left.
@@ -84,6 +87,9 @@ func TestHavingGrammarDecline(t *testing.T) {
 		b + "bool_and(ok), count(*) FROM cpu GROUP BY 1 HAVING bool_and(ok) = count(*)",
 		b + "max(time), count(*) FROM cpu GROUP BY 1 HAVING max(time) > count(*)",
 		b + "count(*) FROM cpu GROUP BY 1 HAVING t < max(x)",
+		// min/max over the bucket's own column is a timestamp (review M2).
+		b + "count(*) FROM cpu GROUP BY 1 HAVING max(time) > 5",
+		b + "count(*) FROM cpu GROUP BY 1 HAVING min(time) BETWEEN 1 AND 2",
 		// IN / BETWEEN forms the engine declines.
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING host NOT IN ('a', NULL)",
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) IN (1, code)",

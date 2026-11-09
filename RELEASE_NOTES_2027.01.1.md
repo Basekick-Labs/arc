@@ -218,9 +218,9 @@ These `HAVING` forms now route to the arcx engine (arcX feat/having-grammar):
   time column.
 
 An aggregate compared with another aggregate routes only when both sides are exact:
-- group keys;
-- `count`, `count_if`, `regr_count`, `min`, `max`, the bitwise and Boolean aggregates, and
-  `quantile_disc`.
+`count`, `count_if`, `regr_count`, `min`, `max`, the bitwise and Boolean aggregates, and
+`quantile_disc`. The time bucket can be compared with `min`/`max` of its own time column. A tag
+column compared with an aggregate stays on DuckDB.
 
 `avg`, `sum`, the variance family, `median`, `quantile_cont`, `mad`, the Kahan sums, the
 regression and correlation aggregates, `skewness`/`kurtosis` and `arg_max`/`arg_min` stay on
@@ -239,7 +239,13 @@ These forms still run on DuckDB:
   aggregates, predicate aggregates).
 
 When a hidden integer `sum` overflows 64 bits, the engine sends the query back to DuckDB, which
-computes the `HAVING` in 128 bits. A selected sum that overflows still errors, as before.
+computes the `HAVING` in 128 bits. In a query that has a hidden aggregate, an overflow in a selected
+sum is also sent back; DuckDB then reports the overflow, as before.
+
+A float aggregate compared with a literal equal to a constant group's value (`HAVING avg(x) > 0.1`
+over a gauge stuck at 0.1) can be answered either way by DuckDB itself, depending on the thread
+count. This was possible since the `HAVING` change below and is easier to reach now that the
+aggregate does not have to be selected. Shadow mode can report it as a mismatch.
 
 ## arcx router: `HAVING` routes over every aggregate the engine serves
 
@@ -269,7 +275,8 @@ These forms still run on DuckDB:
   literal on the left and two aggregates compared with each other (all route since the change
   above), and arithmetic;
 - a decimal literal with more than 15 significant digits;
-- `bool_and` / `bool_or` compared with anything but `TRUE` / `FALSE`, or with `<` / `>`;
+- `bool_and` / `bool_or` compared with a number or a string, or with `<` / `>` against `TRUE` /
+  `FALSE` (comparing two Boolean aggregates routes since the change above);
 - a number compared with the time bucket;
 - a `HAVING` or `ORDER BY` name that DuckDB reads as something other than a column or alias: a
   keyword (`AS true … HAVING true > 5` compares the literal `true`) or a SQL value function

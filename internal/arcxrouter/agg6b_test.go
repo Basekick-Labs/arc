@@ -63,7 +63,6 @@ func TestBinaryMomentsDecline(t *testing.T) {
 		"SELECT corr(y + 1, x) FROM cpu",
 		"SELECT corr(y, 1) FROM cpu",
 		"SELECT corr(m['a'], x) FROM cpu",
-		// HAVING on an aggregate that is not selected
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline (%s): %s", m.shape, sql)

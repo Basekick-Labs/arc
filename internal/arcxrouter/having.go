@@ -5,23 +5,33 @@ import (
 )
 
 // agg-5a HAVING recognition and re-serialization; res-3 (arcX
-// feat/having-all-aggs) widens it to every served aggregate.
+// feat/having-all-aggs) widens it to every served aggregate, res-3b (arcX
+// feat/having-grammar) to the grammar below.
 //
-// The grammar is deliberately the SAME narrow one the engine accepts, so the router
-// sends no FORM the engine's parser declines (a served-then-declined query is a
-// wasted DuckDB re-execution plus a shadow decline, per gotcha #4). Column TYPES are
-// invisible here, so a literal of the wrong type for its target (a decimal against a
-// VARCHAR key or `max(time)`, a string against `count(*)`, a timestamp written without
-// the `T…Z` form) still reaches the engine and declines at bind:
+// The grammar is deliberately the SAME one the engine accepts, so the router sends
+// no FORM the engine's parser declines (a served-then-declined query is a wasted
+// DuckDB re-execution plus a shadow decline, per gotcha #4). Column TYPES are
+// invisible here, so a literal or reference of the wrong type for its target (a
+// decimal against a VARCHAR key, a string against `count(*)`, a timestamp written
+// without the `T…Z` form, `max(<string or time column>)` against a number) still
+// reaches the engine and declines at bind:
 //
 //	having     := hAnd (OR hAnd)*
-//	hAnd       := hAtom (AND hAtom)*
-//	hAtom      := '(' having ')' | hRef <cmp op> <literal> | hRef <eq op> TRUE|FALSE | hRef
+//	hAnd       := hNot (AND hNot)*
+//	hNot       := NOT hNot | '(' having ')' | hAtom
+//	hAtom      := hRef <cmp> <literal> | <literal> <cmp> hRef | hRef <cmp> hRef
+//	            | hRef IS [NOT] NULL | hRef [NOT] BETWEEN <lit> AND <lit>
+//	            | hRef [NOT] IN (<lit>, …) | hRef <eq op> TRUE|FALSE | hRef
 //	hRef       := <aggregate item re-spelled> | <tag key> | <bucket alias> | <aggregate alias>
 //
+// An aggregate that is not in the select list is a HIDDEN item (res-3b): parsed
+// with the select list's own item parsers, emitted as item text, computed by the
+// engine and projected away.
+//
 // Every emitted byte comes from a VALIDATED part: an aggregate reference is matched
-// against the already-re-serialized select items and the ITEM TEXT is what gets
-// written, never the user's spelling — an aggregate ALIAS is emitted as its item
+// against the already-re-serialized select items (or becomes a hidden item) and the
+// ITEM TEXT is what gets written, never the user's spelling — an aggregate ALIAS is
+// emitted as its item
 // text too (res-3 review M5), so a routed query never depends on the engine's alias
 // resolution; a key reference is re-emitted from the validated bare identifier; a
 // literal is re-emitted from its token. Nothing is copied out of the source string.
@@ -417,7 +427,8 @@ func havingItemInfo(item string, hc havingCtx, st *havingState) havingRefInfo {
 		info.cmp = cmpNum
 	case "min", "max":
 		if hc.bucketCol != "" && strings.EqualFold(arg, hc.bucketCol) {
-			info.cmp = cmpTime
+			// A timestamp: string literals only, like the bucket alias (review M2).
+			info.kind, info.cmp = refTime, cmpTime
 		} else {
 			info.cmp = cmpNum
 		}
