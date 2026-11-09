@@ -1,6 +1,8 @@
 package arcxrouter
 
 import (
+	"math"
+	"strconv"
 	"strings"
 )
 
@@ -18,11 +20,20 @@ import (
 //
 //	having     := hAnd (OR hAnd)*
 //	hAnd       := hNot (AND hNot)*
-//	hNot       := NOT hNot | '(' having ')' | hAtom
-//	hAtom      := hRef <cmp> <literal> | <literal> <cmp> hRef | hRef <cmp> hRef
-//	            | hRef IS [NOT] NULL | hRef [NOT] BETWEEN <lit> AND <lit>
-//	            | hRef [NOT] IN (<lit>, …) | hRef <eq op> TRUE|FALSE | hRef
+//	hNot       := NOT hNot | '(' having ')' | hAtom      -- '(' is an operand when the token
+//	                                                       after its ')' says so (havingParenIsOperand)
+//	hAtom      := operand <cmp> operand
+//	            | operand IS [NOT] NULL | operand IS [NOT] DISTINCT FROM (operand | NULL)
+//	            | hRef IS [NOT] TRUE|FALSE | <tag key> [NOT] LIKE '<pattern>'
+//	            | operand [NOT] BETWEEN <lit> AND <lit> | operand [NOT] IN (<lit>, …) | hRef
+//	operand    := term (('+' | '-') term)*      -- res-3c; a signed number after an operand is a binary minus
+//	term       := unary (('*' | '/') unary)*
+//	unary      := '-' unary | '(' operand ')' | <literal> | hRef
 //	hRef       := <aggregate item re-spelled> | <tag key> | <bucket alias> | <aggregate alias>
+//
+// A bare reference against a plain literal or another bare reference keeps the
+// res-3 / res-3b rules (havingLiteral, refsComparable); every other comparison is a
+// derived one and passes derivedOK.
 //
 // An aggregate that is not in the select list is a HIDDEN item (res-3b): parsed
 // with the select list's own item parsers, emitted as item text, computed by the
@@ -158,7 +169,7 @@ func havingAtomOrParen(c *cursor, b *strings.Builder, hc havingCtx, st *havingSt
 		st.depth--
 		return true
 	}
-	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' && !havingParenIsOperand(c) {
 		st.depth++
 		// Same cap as the WHERE tree: untrusted text must not be able to recurse the
 		// engine's parser to death across the in-process FFI boundary (gotcha #1).
@@ -246,52 +257,374 @@ func refsComparable(a, b havingRefInfo) bool {
 	return a.cmp != cmpNone && a.cmp == b.cmp
 }
 
-// havingAtom (res-3b grammar, mirroring the engine's parse_having_atom):
+// res-3c operands. hNode is one node of a parsed HAVING operand: a reference, a
+// literal, unary minus, a parenthesised operand or a binary `+ - * /`. Its text is
+// what gets emitted — built from validated parts, tokens separated by spaces (a
+// `-` next to another `-` would otherwise form a `--` comment), literals in their
+// original spelling (review L4).
+type hNodeKind int
+
+const (
+	hRef hNodeKind = iota
+	hLit
+	hNeg
+	hParen
+	hBin
+)
+
+type hNode struct {
+	kind hNodeKind
+	op   byte   // hBin: '+', '-', '*', '/'
+	l, r *hNode // hBin children; l is the operand of hNeg / hParen
+	text string // the emitted text of the whole node
+	info havingRefInfo
+	tag  bool  // hRef: the bare tag key
+	tok  token // hLit
+}
+
+func (n *hNode) hasRef() bool {
+	switch n.kind {
+	case hRef:
+		return true
+	case hLit:
+		return false
+	case hBin:
+		return n.l.hasRef() || n.r.hasRef()
+	}
+	return n.l.hasRef()
+}
+
+// contains: does the subtree reference the item emitted as text?
+func (n *hNode) contains(text string) bool {
+	switch n.kind {
+	case hRef:
+		return n.text == text
+	case hLit:
+		return false
+	case hBin:
+		return n.l.contains(text) || n.r.contains(text)
+	}
+	return n.l.contains(text)
+}
+
+func (n *hNode) refs(out []*hNode) []*hNode {
+	switch n.kind {
+	case hRef:
+		return append(out, n)
+	case hLit:
+		return out
+	case hBin:
+		return n.r.refs(n.l.refs(out))
+	}
+	return n.l.refs(out)
+}
+
+// operandCx is the per-comparison operand state: one node budget shared by both
+// sides, the engine's MAX_ARITH_NODES.
+type operandCx struct{ nodes int }
+
+const maxHavingNodes = 64
+
+func (cx *operandCx) bump() bool {
+	cx.nodes++
+	return cx.nodes <= maxHavingNodes
+}
+
+// signedNumber: a numeric literal token carrying a leading '-'. After an operand
+// DuckDB (and the engine) read it as a BINARY minus of the positive term with full
+// precedence: `min(x) -2 * min(x)` is `min(x) - (2 * min(x))` (arcX res-3c review M2).
+func signedNumber(c *cursor) bool {
+	if c.i >= len(c.toks) {
+		return false
+	}
+	t := c.toks[c.i]
+	return (t.kind == tokNum || t.kind == tokFloat || t.kind == tokSci) && strings.HasPrefix(t.orig, "-")
+}
+
+func litNode(t token) *hNode {
+	text := t.orig
+	switch {
+	case t.kind == tokStr:
+		// Re-emitted from the UNESCAPED content with quote doubling, as the WHERE path.
+		text = "'" + strings.ReplaceAll(t.str, "'", "''") + "'"
+	case t.kind == tokIdent:
+		text = strings.ToUpper(t.lower) // TRUE / FALSE
+	}
+	return &hNode{kind: hLit, tok: t, text: text}
+}
+
+// havingSum: `term (('+' | '-') term | <signed number> term-rest)*`.
+func havingSum(c *cursor, hc havingCtx, st *havingState, cx *operandCx) (*hNode, bool) {
+	lhs, ok := havingTerm(c, hc, st, cx, nil)
+	if !ok {
+		return nil, false
+	}
+	for c.i < len(c.toks) {
+		t := c.toks[c.i]
+		var op byte
+		var first *hNode
+		switch {
+		case t.kind == tokPunct && (t.punct == '+' || t.punct == '-'):
+			c.i++
+			op = t.punct
+		case signedNumber(c):
+			c.i++
+			pos := t
+			pos.orig = t.orig[1:]
+			if !cx.bump() {
+				return nil, false
+			}
+			op, first = '-', litNode(pos)
+		default:
+			return lhs, true
+		}
+		rhs, ok := havingTerm(c, hc, st, cx, first)
+		if !ok || !cx.bump() {
+			return nil, false
+		}
+		lhs = &hNode{kind: hBin, op: op, l: lhs, r: rhs, text: lhs.text + " " + string(op) + " " + rhs.text}
+	}
+	return lhs, true
+}
+
+// havingTerm: `unary (('*' | '/') unary)*`; `//` refuses (the engine declines it).
+func havingTerm(c *cursor, hc havingCtx, st *havingState, cx *operandCx, first *hNode) (*hNode, bool) {
+	lhs := first
+	if lhs == nil {
+		var ok bool
+		if lhs, ok = havingUnary(c, hc, st, cx); !ok {
+			return nil, false
+		}
+	}
+	for c.i < len(c.toks) {
+		t := c.toks[c.i]
+		if t.kind == tokIntDiv {
+			return nil, false
+		}
+		if t.kind != tokPunct || (t.punct != '*' && t.punct != '/') {
+			break
+		}
+		c.i++
+		rhs, ok := havingUnary(c, hc, st, cx)
+		if !ok || !cx.bump() {
+			return nil, false
+		}
+		lhs = &hNode{kind: hBin, op: t.punct, l: lhs, r: rhs, text: lhs.text + " " + string(t.punct) + " " + rhs.text}
+	}
+	return lhs, true
+}
+
+// havingUnary: `'-' unary | primary`.
+func havingUnary(c *cursor, hc havingCtx, st *havingState, cx *operandCx) (*hNode, bool) {
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '-' {
+		c.i++
+		if !cx.bump() {
+			return nil, false
+		}
+		inner, ok := havingUnary(c, hc, st, cx)
+		if !ok {
+			return nil, false
+		}
+		return &hNode{kind: hNeg, l: inner, text: "- " + inner.text}, true
+	}
+	return havingPrimary(c, hc, st, cx)
+}
+
+// havingPrimary: `literal | reference | '(' sum ')'`. A parenthesis counts toward
+// the predicate depth cap (arcX res-3c review M4); NULL inside an operand refuses
+// (review L3).
+func havingPrimary(c *cursor, hc havingCtx, st *havingState, cx *operandCx) (*hNode, bool) {
+	if !cx.bump() || c.i >= len(c.toks) {
+		return nil, false
+	}
+	t := c.toks[c.i]
+	switch {
+	case t.kind == tokPunct && t.punct == '(':
+		st.depth++
+		if st.depth > maxWhereDepth {
+			return nil, false
+		}
+		c.i++
+		inner, ok := havingSum(c, hc, st, cx)
+		if !ok || !c.punct(')') {
+			return nil, false
+		}
+		st.depth--
+		return &hNode{kind: hParen, l: inner, text: "(" + inner.text + ")"}, true
+	case t.kind == tokNum || t.kind == tokFloat || t.kind == tokSci || t.kind == tokStr:
+		c.i++
+		return litNode(t), true
+	case t.kind == tokIdent && (t.lower == "true" || t.lower == "false"):
+		c.i++
+		return litNode(t), true
+	case t.kind == tokIdent && t.lower == "null":
+		return nil, false
+	}
+	text, info, ok := havingRef(c, hc, st)
+	if !ok {
+		return nil, false
+	}
+	return &hNode{kind: hRef, text: text, info: info, tag: hc.tagKey != "" && text == hc.tagKey}, true
+}
+
+// arithLiteralOK: may this literal leaf sit in a derived comparison? Integers in
+// int64 range except int64's minimum (arcX res-3c review H1: DuckDB's
+// MoveConstantsRule answers FALSE for every operator when `i64::MIN / -1` does not
+// fit); decimals (the tokenizer already capped them at 15 digits); finite scientific
+// literals that are not negative zero (review M1: DuckDB merges −0.0 and +0.0
+// constants within a query).
+func arithLiteralOK(t token) bool {
+	switch t.kind {
+	case tokNum:
+		v, err := strconv.ParseInt(t.orig, 10, 64)
+		return err == nil && v != math.MinInt64
+	case tokFloat:
+		return true
+	case tokSci:
+		f, err := strconv.ParseFloat(t.orig, 64)
+		return err == nil && !math.IsInf(f, 0) && !(f == 0 && math.Signbit(f))
+	}
+	return false // strings, TRUE/FALSE: the engine declines them beside arithmetic
+}
+
+// isZeroSci: a scientific literal equal to zero, through parentheses (unary minus of
+// it is the negative-zero literal the engine folds and declines).
+func isZeroSci(n *hNode) bool {
+	for n.kind == hParen {
+		n = n.l
+	}
+	if n.kind != hLit || n.tok.kind != tokSci {
+		return false
+	}
+	f, err := strconv.ParseFloat(n.tok.orig, 64)
+	return err == nil && f == 0
+}
+
+// arithNodeOK checks every node of a derived-comparison operand: references the
+// engine can type in arithmetic (an aggregate item other than bool_*, regr_count
+// and the time-typed min/max; never the tag key — Arc tags are VARCHAR — nor the
+// bucket alias), servable literals, no constant-only binary node (DuckDB folds it
+// in INTEGER/DECIMAL), no negative-zero DOUBLE.
+func arithNodeOK(n *hNode) bool {
+	switch n.kind {
+	case hRef:
+		return !n.tag && n.info.kind == refAny && !strings.HasPrefix(n.text, "regr_count(")
+	case hLit:
+		return arithLiteralOK(n.tok)
+	case hNeg:
+		return !isZeroSci(n.l) && arithNodeOK(n.l)
+	case hParen:
+		return arithNodeOK(n.l)
+	}
+	return (n.l.hasRef() || n.r.hasRef()) && arithNodeOK(n.l) && arithNodeOK(n.r)
+}
+
+// additiveMix: does a `+`/`-` node combine the subtree holding item `x` with another
+// item-bearing subtree?
+func additiveMix(n *hNode, x string) bool {
+	switch n.kind {
+	case hRef, hLit:
+		return false
+	case hBin:
+		here := (n.op == '+' || n.op == '-') &&
+			((n.l.contains(x) && n.r.hasRef()) || (n.r.contains(x) && n.l.hasRef()))
+		return here || additiveMix(n.l, x) || additiveMix(n.r, x)
+	}
+	return additiveMix(n.l, x)
+}
+
+// derivedOK: the engine's rules for a derived comparison (or `<expr> IS NULL`) over
+// these sides. Besides the node checks, arcX res-3c review H3: a float-accumulated
+// item (anything not order-exact — the router cannot tell an integer `sum` from a
+// float one, so `sum` counts as one) may appear at most once per comparison, may meet
+// another item-bearing subtree only through `*` or `/`, and not at all when both
+// sides carry items.
+func derivedOK(sides ...*hNode) bool {
+	anyRef := false
+	for _, s := range sides {
+		if !arithNodeOK(s) {
+			return false
+		}
+		anyRef = anyRef || s.hasRef()
+	}
+	if !anyRef {
+		return false // literal-only comparison
+	}
+	inexact := ""
+	for _, s := range sides {
+		for _, r := range s.refs(nil) {
+			if r.info.cmp == cmpNum {
+				continue
+			}
+			if inexact != "" && inexact != r.text {
+				return false
+			}
+			inexact = r.text
+		}
+	}
+	if inexact == "" {
+		return true
+	}
+	if len(sides) == 2 && sides[0].hasRef() && sides[1].hasRef() {
+		return false
+	}
+	for _, s := range sides {
+		if additiveMix(s, inexact) {
+			return false
+		}
+	}
+	return true
+}
+
+// plainLiteral: a literal leaf the res-3 atom path takes (not a scientific one).
+func plainLiteral(n *hNode) bool {
+	return n.kind == hLit && n.tok.kind != tokSci
+}
+
+// havingCompare validates `<l> <op> <r>` and returns its text. A bare reference
+// against a plain literal or another bare reference keeps the res-3 / res-3b rules;
+// anything else is a derived comparison (derivedOK).
+func havingCompare(l *hNode, op string, r *hNode) (string, bool) {
+	text := l.text + " " + op + " " + r.text
+	switch {
+	case l.kind == hRef && r.kind == hRef:
+		return text, refsComparable(l.info, r.info)
+	case l.kind == hRef && plainLiteral(r):
+		_, ok := havingLiteral(r.tok, l.info.kind, op)
+		return text, ok
+	case r.kind == hRef && plainLiteral(l):
+		_, ok := havingLiteral(l.tok, r.info.kind, op)
+		return text, ok
+	}
+	return text, derivedOK(l, r)
+}
+
+// havingAtom (res-3b grammar, res-3c operands; mirrors the engine's parse_having_atom):
 //
-//	<ref> <cmp> <literal> | <literal> <cmp> <ref> | <ref> <cmp> <ref>
-//	<ref> IS [NOT] NULL | <ref> [NOT] BETWEEN <lit> AND <lit> | <ref> [NOT] IN (<lit>, …)
+//	<operand> <cmp> <operand>
+//	<operand> IS [NOT] NULL | <operand> IS [NOT] DISTINCT FROM <operand|NULL>
+//	<bool item> IS [NOT] TRUE|FALSE | <tag key> [NOT] LIKE '<pattern>'
+//	<operand> [NOT] BETWEEN <lit> AND <lit> | <operand> [NOT] IN (<lit>, …)
 //	<ref>                                    -- bare: a Boolean item
 //
-// Atom accounting matches the engine's: one per atom, plus one for a BETWEEN's
-// second bound and one per extra IN element.
+// Atom accounting matches the engine's: one per comparison, plus one for a
+// BETWEEN's second bound and one per extra IN element.
 func havingAtom(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bool {
 	if !st.bumpAtoms(1) {
 		return false
 	}
-	// Literal on the left: `5 < count(*)`.
-	if c.i < len(c.toks) && havingIsLiteral(c.toks[c.i]) {
-		litT, _ := c.next()
-		opT, tok := c.next()
-		if !tok || opT.kind != tokOp || !isCmpOp(opT.op) {
-			return false
-		}
-		if c.i < len(c.toks) && havingIsLiteral(c.toks[c.i]) {
-			return false // literal vs literal
-		}
-		refText, info, ok := havingRef(c, hc, st)
-		if !ok {
-			return false
-		}
-		litText, lok := havingLiteral(litT, info.kind, opT.op)
-		if !lok {
-			return false
-		}
-		b.WriteString(litText + " " + opT.op + " " + refText)
-		return true
-	}
-	refText, info, ok := havingRef(c, hc, st)
+	cx := &operandCx{}
+	lhs, ok := havingSum(c, hc, st, cx)
 	if !ok {
 		return false
 	}
-	kind := info.kind
 	if havingAtomEnds(c) {
-		if kind != refBool {
+		if lhs.kind != hRef || lhs.info.kind != refBool {
 			return false
 		}
-		b.WriteString(refText)
+		b.WriteString(lhs.text)
 		return true
 	}
-	// IS [NOT] NULL — any reference.
 	if c.peekIdentLower() == "is" {
 		c.next()
 		not := ""
@@ -299,10 +632,44 @@ func havingAtom(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bo
 			c.next()
 			not = "NOT "
 		}
-		if !c.ident("null") {
+		switch c.peekIdentLower() {
+		case "null":
+			c.next()
+			if lhs.kind != hRef && !derivedOK(lhs) {
+				return false
+			}
+			b.WriteString(lhs.text + " IS " + not + "NULL")
+			return true
+		case "true", "false":
+			// IS [NOT] TRUE|FALSE on a Boolean item only (DuckDB casts anything else).
+			v, _ := c.next()
+			if lhs.kind != hRef || lhs.info.kind != refBool {
+				return false
+			}
+			b.WriteString(lhs.text + " IS " + not + strings.ToUpper(v.lower))
+			return true
+		}
+		if !c.ident("distinct") || !c.ident("from") {
 			return false
 		}
-		b.WriteString(refText + " IS " + not + "NULL")
+		if c.peekIdentLower() == "null" {
+			c.next()
+			if lhs.kind != hRef && !derivedOK(lhs) {
+				return false
+			}
+			b.WriteString(lhs.text + " IS " + not + "DISTINCT FROM NULL")
+			return true
+		}
+		rhs, ok := havingSum(c, hc, st, cx)
+		if !ok {
+			return false
+		}
+		// The engine desugars a bare reference against a plain literal onto the
+		// `IS [NOT] NULL` and `=` / `<>` atoms; havingCompare checks it as `=`.
+		if _, ok := havingCompare(lhs, "=", rhs); !ok {
+			return false
+		}
+		b.WriteString(lhs.text + " IS " + not + "DISTINCT FROM " + rhs.text)
 		return true
 	}
 	not := ""
@@ -311,61 +678,96 @@ func havingAtom(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bo
 		not = "NOT "
 	}
 	switch c.peekIdentLower() {
-	case "between":
-		c.next()
-		if kind == refBool {
-			return false
+	case "between", "in":
+		kw, _ := c.next()
+		var bounds []*hNode
+		if kw.lower == "between" {
+			lo, tok := c.next()
+			if !tok || !c.ident("and") {
+				return false
+			}
+			hi, tok := c.next()
+			if !tok || !st.bumpAtoms(1) {
+				return false
+			}
+			bounds = []*hNode{litNode(lo), litNode(hi)}
+		} else {
+			if !c.punct('(') {
+				return false
+			}
+			for {
+				lt, tok := c.next()
+				if !tok {
+					return false
+				}
+				bounds = append(bounds, litNode(lt))
+				if len(bounds) > 1 && !st.bumpAtoms(1) {
+					return false
+				}
+				// `c.punct` consumes even on a miss: peek before choosing.
+				if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+					c.i++
+					continue
+				}
+				if !c.punct(')') {
+					return false
+				}
+				break
+			}
 		}
-		lo, tok := c.next()
-		if !tok {
-			return false
+		// Bounds and elements are literal tokens: a NULL / column / TRUE in the list
+		// is an identifier and refuses (`NOT IN (…, NULL)` is never TRUE in DuckDB).
+		sci := false
+		texts := make([]string, len(bounds))
+		for i, bd := range bounds {
+			t := bd.tok
+			if t.kind != tokNum && t.kind != tokFloat && t.kind != tokSci && t.kind != tokStr {
+				return false
+			}
+			sci = sci || t.kind == tokSci
+			texts[i] = bd.text
 		}
-		loText, lok := havingLiteral(lo, kind, "")
-		if !lok || !c.ident("and") {
-			return false
+		if lhs.kind == hRef && !sci {
+			if lhs.info.kind == refBool {
+				return false
+			}
+			for _, bd := range bounds {
+				if _, ok := havingLiteral(bd.tok, lhs.info.kind, ""); !ok {
+					return false
+				}
+			}
+		} else {
+			// A DOUBLE bound makes the common type DOUBLE (arcX res-3c review H2):
+			// a derived comparison even over a bare reference.
+			for _, bd := range bounds {
+				if !arithLiteralOK(bd.tok) {
+					return false
+				}
+			}
+			if !derivedOK(lhs) {
+				return false
+			}
 		}
-		hi, tok := c.next()
-		if !tok {
-			return false
+		if kw.lower == "between" {
+			b.WriteString(lhs.text + " " + not + "BETWEEN " + texts[0] + " AND " + texts[1])
+		} else {
+			b.WriteString(lhs.text + " " + not + "IN (" + strings.Join(texts, ", ") + ")")
 		}
-		hiText, hok := havingLiteral(hi, kind, "")
-		if !hok || !st.bumpAtoms(1) {
-			return false
-		}
-		b.WriteString(refText + " " + not + "BETWEEN " + loText + " AND " + hiText)
 		return true
-	case "in":
+	case "like":
 		c.next()
-		if kind == refBool || !c.punct('(') {
+		// `<tag key> [NOT] LIKE '<pattern>'` — the one string output the engine serves
+		// (min/max over strings is outside its aggregate matrix, so LIKE on an aggregate
+		// would only cost a DuckDB re-run). The WHERE pattern rules: a string literal,
+		// no backslash, no ESCAPE.
+		pt, tok := c.next()
+		if !tok || pt.kind != tokStr || strings.Contains(pt.str, "\\") || c.peekIdentLower() == "escape" {
 			return false
 		}
-		var elems []string
-		for {
-			lt, tok := c.next()
-			// A NULL / column / TRUE in the list is an identifier: refused, as the
-			// engine declines it (`NOT IN (…, NULL)` is never TRUE in DuckDB).
-			if !tok || lt.kind == tokIdent {
-				return false
-			}
-			et, eok := havingLiteral(lt, kind, "")
-			if !eok {
-				return false
-			}
-			elems = append(elems, et)
-			if len(elems) > 1 && !st.bumpAtoms(1) {
-				return false
-			}
-			// `c.punct` consumes even on a miss: peek before choosing.
-			if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
-				c.i++
-				continue
-			}
-			if !c.punct(')') {
-				return false
-			}
-			break
+		if lhs.kind != hRef || !lhs.tag {
+			return false
 		}
-		b.WriteString(refText + " " + not + "IN (" + strings.Join(elems, ", ") + ")")
+		b.WriteString(lhs.text + " " + not + "LIKE " + litNode(pt).text)
 		return true
 	}
 	if not != "" {
@@ -377,22 +779,57 @@ func havingAtom(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bo
 	if !tok || opT.kind != tokOp || !isCmpOp(opT.op) {
 		return false
 	}
-	if c.i < len(c.toks) && havingIsLiteral(c.toks[c.i]) {
-		litT, _ := c.next()
-		litText, lok := havingLiteral(litT, kind, opT.op)
-		if !lok {
-			return false
-		}
-		b.WriteString(refText + " " + opT.op + " " + litText)
-		return true
-	}
-	// res-3b: reference vs reference — order-exact, compatible kinds only.
-	rhsText, rhs, rok := havingRef(c, hc, st)
-	if !rok || !refsComparable(info, rhs) {
+	rhs, ok := havingSum(c, hc, st, cx)
+	if !ok {
 		return false
 	}
-	b.WriteString(refText + " " + opT.op + " " + rhsText)
+	text, ok := havingCompare(lhs, opT.op, rhs)
+	if !ok {
+		return false
+	}
+	b.WriteString(text)
 	return true
+}
+
+// havingParenIsOperand: is the `(` at the cursor an operand's parenthesis rather than
+// a predicate group? The token after its matching `)` decides, as in the engine: a
+// comparison or arithmetic operator, `//`, a signed number (a binary minus), or IS /
+// BETWEEN / IN / LIKE / NOT.
+func havingParenIsOperand(c *cursor) bool {
+	open := 0
+	j := c.i
+	for ; j < len(c.toks); j++ {
+		t := c.toks[j]
+		if t.kind != tokPunct {
+			continue
+		}
+		if t.punct == '(' {
+			open++
+		} else if t.punct == ')' {
+			open--
+			if open == 0 {
+				break
+			}
+		}
+	}
+	if open != 0 || j+1 >= len(c.toks) {
+		return false
+	}
+	t := c.toks[j+1]
+	switch t.kind {
+	case tokOp, tokIntDiv:
+		return true
+	case tokPunct:
+		return t.punct == '+' || t.punct == '-' || t.punct == '*' || t.punct == '/'
+	case tokIdent:
+		switch t.lower {
+		case "is", "between", "in", "like", "not":
+			return true
+		}
+	case tokNum, tokFloat, tokSci:
+		return strings.HasPrefix(t.orig, "-")
+	}
+	return false
 }
 
 // havingItemKind classifies a resolved aggregate item for literal typing, and

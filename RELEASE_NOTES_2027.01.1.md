@@ -202,6 +202,43 @@ write_page_index = false      # true writes column + offset indexes (no reader i
 Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
 Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
 
+## arcx router: arithmetic and more predicates in `HAVING` route to the engine
+
+These `HAVING` forms now route to the arcx engine (arcX feat/res-3c):
+- arithmetic: `+`, `-`, `*`, `/`, unary minus and parentheses, over aggregates (selected or not),
+  aggregate aliases and numeric literals: `HAVING sum(bytes) / count(*) > 1024`,
+  `HAVING max(x) - min(x) > 10`, `HAVING (count(*) + 1) * 2 BETWEEN 4 AND 10`;
+- scientific-notation literals (`HAVING count(*) > 1e3`, `2.5E-1`);
+- `IS DISTINCT FROM` and `IS NOT DISTINCT FROM`, against a literal, `NULL`, another aggregate or
+  an expression;
+- `IS TRUE`, `IS NOT TRUE`, `IS FALSE` and `IS NOT FALSE` on `bool_and` / `bool_or`;
+- `LIKE` and `NOT LIKE` with a string pattern, on the tag column.
+
+The engine types and evaluates arithmetic the way DuckDB 1.5.6 does: exact 64- and 128-bit
+integers, exact decimals, `/` always a double, and DuckDB's own rounding when it converts a
+128-bit sum or a decimal to a double. An integer overflow sends the query back to DuckDB, which
+reports it, as before.
+
+These forms still run on DuckDB:
+- `%`, `//` and `^`; a negative-zero (`-0e0`) or out-of-range (`1e400`) scientific literal;
+- arithmetic over the tag column, the time bucket, `min`/`max` of the time column, `bool_and` /
+  `bool_or` or `regr_count`;
+- two float-accumulated aggregates in one comparison (`sum(x) - sum(y) > 0`), or one of them added
+  to or subtracted from another aggregate (`avg(x) - max(x) < 0`, `avg(x) + count(*) > 3`).
+  DuckDB 1.5.6's value for these depends on the thread count, and a subtraction turns those last
+  digits into the sign of the answer: `sum(x) - sum(y) > 0` returned between 7 and 15 groups across
+  runs of the same query. Multiplying or dividing one of them (`sum(bytes) / count(*) > 1024`,
+  `avg(x) * 2 > 5`) routes. The router counts `sum` as float-accumulated because it cannot tell
+  an integer `sum` from a float one;
+- a comparison with aggregates on both sides when any of them is float-accumulated, as for a plain
+  aggregate-vs-aggregate comparison;
+- a decimal past 2^53 with a fractional part converted to a double (`sum(i) + 0.5 > max(x)` with
+  sums above about 10^15): DuckDB 1.5.6 and 2.0 round it differently, so the engine sends the
+  query back;
+- the literal `-9223372036854775808` next to arithmetic: DuckDB 1.5.6 answers `max(x) * -1 >
+  -9223372036854775808` as false for every group;
+- `ORDER BY` an expression or an aggregate that is not in the select list.
+
 ## arcx router: more `HAVING` forms route to the engine
 
 These `HAVING` forms now route to the arcx engine (arcX feat/having-grammar):
@@ -232,8 +269,7 @@ stable answer to compare.
 These forms still run on DuckDB:
 - `ORDER BY` an aggregate that is not in the select list (shadow mode cannot check an order whose
   values are not in the result);
-- arithmetic over aggregates (`sum(bytes) / count(*) > 1000`);
-- `LIKE`, `IS DISTINCT FROM`, and `IN` with `NULL` or a column in the list;
+- `IN` with `NULL` or a column in the list;
 - an aggregate that is not in the select list and that is grouped by a tag column, when the same
   aggregate would stay on DuckDB if selected (the variance family, order statistics, regression
   aggregates, predicate aggregates).

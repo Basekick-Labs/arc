@@ -99,10 +99,10 @@ func TestHavingGrammarDecline(t *testing.T) {
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) NOT > 5",
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING 1 = 1",
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) IS 5",
-		// Still out of scope: arithmetic, LIKE, IS DISTINCT FROM.
-		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) * 2 > 5",
-		"SELECT host, count(*) FROM cpu GROUP BY host HAVING host LIKE 'a%'",
-		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) IS DISTINCT FROM 5",
+		// Still out of scope after res-3c: `//`, ILIKE, IS TRUE on a non-Boolean.
+		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) // 2 > 5",
+		"SELECT host, count(*) FROM cpu GROUP BY host HAVING host ILIKE 'a%'",
+		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) IS TRUE",
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline: %s (having %q)", sql, m.havingText)

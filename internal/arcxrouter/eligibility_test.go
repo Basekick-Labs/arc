@@ -146,7 +146,7 @@ func TestEligibleShape_Declines(t *testing.T) {
 		// (plain `HAVING count(*) > 1` became ELIGIBLE at agg-5a — see
 		// TestHavingEligibility. These HAVING forms still decline.)
 		{"having on an unknown name", "SELECT host, count(*) FROM cpu GROUP BY host HAVING nope > 1"},
-		{"having with an expression over an agg", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) + 1 > 2"},
+		{"having with an integer division over an agg", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) // 2 > 2"},
 		{"having comparing two aggs", "SELECT host, count(*), sum(x) FROM cpu GROUP BY host HAVING count(*) > sum(x)"},
 		{"having count(DISTINCT)", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(DISTINCT x) > 1"},
 		{"ungrouped having", "SELECT count(*) FROM cpu HAVING count(*) > 1"},
