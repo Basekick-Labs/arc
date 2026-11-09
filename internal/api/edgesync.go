@@ -311,7 +311,7 @@ func (h *EdgeSyncHandler) receiveFile(c *fiber.Ctx) error {
 	// only a caller holding this spoke's secret learns anything from the
 	// answer; before Receive, so a refused file is neither stored nor
 	// reported already present.
-	_, measurement, err := edgesync.SpokeNamespace(spokeID, filePath)
+	measurement, err := spokeMeasurement(spokeID, filePath)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -444,10 +444,10 @@ func (h *EdgeSyncHandler) reconcile(c *fiber.Ctx) error {
 	var allow edgesync.ReconcileAllow
 	if h.rbac != nil && auth.GetTokenInfo(c) != nil {
 		allow = func(p string) (bool, error) {
-			_, measurement, err := edgesync.SpokeNamespace(spokeID, p)
+			measurement, err := spokeMeasurement(spokeID, p)
 			if err != nil {
-				// Validation already ran; only the single-segment refusal
-				// can remain, and such a path names nothing to grant.
+				// Validation already ran, so this cannot happen; refuse
+				// rather than disclose if it ever does.
 				return false, nil
 			}
 			allowed, unavailable := h.pushAllowed(c, spokeID, measurement)
@@ -517,6 +517,19 @@ type reconcileResponse struct {
 	Conflicts []edgesync.Conflict `json:"conflicts"`
 }
 
+// spokeMeasurement is the measurement RBAC checks a spoke path against:
+// the spoke's database segment (edgesync.SpokeNamespace). A root-level file
+// ({spoke_id}/x.parquet) sits in no measurement, so it needs write on the
+// whole spoke database, "*". Spoke discovery offers such files, so they are
+// checked, not refused.
+func spokeMeasurement(spokeID, sourcePath string) (string, error) {
+	_, measurement, err := edgesync.SpokeNamespace(spokeID, sourcePath)
+	if errors.Is(err, edgesync.ErrSpokePathNoMeasurement) {
+		return "*", nil
+	}
+	return measurement, err
+}
+
 // errPermissionStoreUnavailable: a reconcile could not read the token's
 // grants. Answered 503 so the spoke retries rather than reading a denial.
 var errPermissionStoreUnavailable = errors.New("permission store unavailable")
@@ -544,8 +557,9 @@ func (h *EdgeSyncHandler) pushAllowed(c *fiber.Ctx, spokeID, measurement string)
 }
 
 // pushRefused answers a push or reconcile the token may not make. An
-// unreadable permission store is 503, which the spoke retries without
-// spending one of a file's attempts; a denial is 403.
+// unreadable permission store is 503 hub_unavailable, the hub's answer for
+// any hub-side failure; a denial is 403. On /file either one spends one of
+// the file's attempts on the spoke, as every non-success outcome does.
 func (h *EdgeSyncHandler) pushRefused(c *fiber.Ctx, spokeID, measurement string, unavailable bool) error {
 	if unavailable {
 		h.logger.Error().Str("spoke_id", spokeID).

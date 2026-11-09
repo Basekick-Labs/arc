@@ -642,9 +642,10 @@ func (r *Receiver) hashStored(ctx context.Context, p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// ErrSpokePathNoMeasurement refuses a spoke path with a single segment: it
-// names no {database}/{measurement} pair, so no RBAC grant can be checked
-// for it (#1561), and it is not a layout Arc writes.
+// ErrSpokePathNoMeasurement reports a spoke path with a single segment
+// (x.parquet): it lands at {spoke_id}/x.parquet, in no measurement. Spoke
+// discovery offers such root-level files, so callers decide what to check
+// rather than refuse them (#1561).
 var ErrSpokePathNoMeasurement = errors.New("edgesync: path must start with {database}/{measurement}/; a single segment names no measurement")
 
 // SpokeNamespace is the database and measurement a spoke's file is served

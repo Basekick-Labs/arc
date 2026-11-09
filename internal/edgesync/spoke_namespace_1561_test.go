@@ -87,6 +87,17 @@ func TestReconcileAllowed(t *testing.T) {
 		t.Error("a duplicated denied entry was accepted")
 	}
 
+	// A denied entry's stale index row (no file behind it) is not forgotten:
+	// the stale sweep runs only over permitted entries.
+	stale := ReconcileEntry{Path: "logs/app/2026/08/07/14/stale.parquet", SHA256: sha256Hex([]byte("s"))}
+	recordFile(t, idx, "rocket-01", stale.Path, stale.SHA256)
+	if _, err := rec.ReconcileAllowed(ctx, "rocket-01", []ReconcileEntry{granted, stale}, onlyMetrics); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := idx.Lookup(ctx, "rocket-01", []string{stale.Path}); err != nil || len(held) != 1 {
+		t.Errorf("denied stale row: held %v, %v; want it kept", held, err)
+	}
+
 	// A decision that cannot be made fails the whole reconcile.
 	boom := errors.New("store down")
 	if _, err := rec.ReconcileAllowed(ctx, "rocket-01", []ReconcileEntry{granted}, func(string) (bool, error) { return false, boom }); !errors.Is(err, boom) {

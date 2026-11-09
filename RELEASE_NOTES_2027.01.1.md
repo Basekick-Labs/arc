@@ -97,9 +97,9 @@ request's signature is verified and before anything is stored:
   as the other ingest endpoints do since #1559.
 - **Tokens in no team:** unchanged. Their own `write` permission decides, as
   before.
-- **Single-segment spoke paths:** a path such as `x.parquet` names no
-  database or measurement and is refused with 400. Arc never writes such
-  paths.
+- **Root-level spoke files:** a file at the root of a spoke's storage
+  (`x.parquet`) is in no measurement, so it needs `write` on the whole
+  database `{spoke_id}`. A grant on one measurement is not enough.
 
 **What operators may see.** A spoke whose token is in a team without a
 `write` grant on its namespace now gets 403 on those files. Each 403 counts
@@ -156,7 +156,8 @@ a token, because it might have been added to a team.
 upgraded yet is checked by that node the old way, so an RBAC-only token can
 see a 403 until every node runs this version.
 
-The edge-sync hub endpoints moved to RBAC as well; see the next section
+The edge-sync hub endpoints moved to RBAC as well; see
+"Fix: edge-sync pushes are decided by RBAC on the spoke's database"
 ([#1561](https://github.com/Basekick-Labs/arc/issues/1561)).
 
 ## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))

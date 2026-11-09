@@ -115,7 +115,8 @@ func TestEdgeSyncPushIsDecidedByRBACOnTheSpokeNamespace(t *testing.T) {
 		{"rbac-spoke-metrics", logsPath, 403},
 		{"rbac-other-db", metricsPath, 403},
 		{"coarse-team-other-db", metricsPath, 403},
-		// Refused at the door: no write grant anywhere.
+		// Refused at the door: no write grant anywhere (the door's body has
+		// no "reason"; the handler's has "permission_denied").
 		{"none", metricsPath, 403},
 	} {
 		path := fmt.Sprintf(c.path, i)
@@ -124,6 +125,15 @@ func TestEdgeSyncPushIsDecidedByRBACOnTheSpokeNamespace(t *testing.T) {
 			status, got := r.push(t, c.token, path, body)
 			if status != c.status {
 				t.Fatalf("status %d, want %d: %v", status, c.status, got)
+			}
+			if status == 403 {
+				wantReason := "permission_denied"
+				if c.token == "none" {
+					wantReason = ""
+				}
+				if reason, _ := got["reason"].(string); reason != wantReason {
+					t.Fatalf("refused by the wrong gate: reason %q, want %q: %v", reason, wantReason, got)
+				}
 			}
 			stored, err := r.rig.backend.Exists(context.Background(), edgesync.NamespacedPath(testSpokeID, path))
 			if err != nil {
@@ -149,11 +159,23 @@ func TestEdgeSyncRBACCheckRunsAfterTheMAC(t *testing.T) {
 	}
 }
 
-// A single-segment spoke path names no measurement to check a grant for.
-func TestEdgeSyncRefusesAPathWithNoMeasurement(t *testing.T) {
+// A root-level spoke file (x.parquet) sits in no measurement, so it needs
+// write on the whole spoke database: a measurement grant is not enough, a
+// database-wide grant or a coarse token without a team is.
+func TestEdgeSyncRootLevelFileNeedsTheWholeSpokeDatabase(t *testing.T) {
 	r := newSyncRBACRig(t)
-	if status, got := r.push(t, "coarse-no-team", "x.parquet", []byte("x")); status != fiber.StatusBadRequest {
-		t.Fatalf("status %d, want 400: %v", status, got)
+	for i, c := range []struct {
+		token  string
+		status int
+	}{
+		{"coarse-no-team", 200},
+		{"rbac-spoke", 200},
+		{"rbac-spoke-metrics", 403},
+	} {
+		p := fmt.Sprintf("root_%d.parquet", i)
+		if status, got := r.push(t, c.token, p, []byte("x "+p)); status != c.status {
+			t.Errorf("%s: status %d, want %d: %v", c.token, status, c.status, got)
+		}
 	}
 }
 

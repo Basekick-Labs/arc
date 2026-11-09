@@ -427,6 +427,7 @@ func RequireAnyResourcePermission(am *AuthManager, rm AnyResourcePermissionCheck
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"success": false,
 					"error":   "Permission store unavailable; retry later",
+					"reason":  "hub_unavailable",
 				})
 			}
 		}
