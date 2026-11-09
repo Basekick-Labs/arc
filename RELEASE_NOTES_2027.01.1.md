@@ -3447,7 +3447,7 @@ a metadata error, or a range with no start (`WHERE time < ...`, or no time
 filter). Nothing changes while the cold tier lists normally.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
-[#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+[#1553](https://github.com/Basekick-Labs/arc/pull/1553).
 
 ### Fix: a governance 429 says when a retry can succeed ([#1519](https://github.com/Basekick-Labs/arc/issues/1519))
 
