@@ -23,8 +23,8 @@ func TestCensusClassifySeparatesShapes(t *testing.T) {
 		{"WITH t AS (SELECT host FROM cpu) SELECT host FROM t", "cte"},
 		{"SELECT host FROM cpu UNION SELECT host FROM mem", "set_op"},
 		{"SELECT host, row_number() OVER (ORDER BY value) FROM cpu", "window"},
-		// (a hidden HAVING aggregate routes since res-3b; arithmetic still declines)
-		{"SELECT host FROM cpu GROUP BY host HAVING count(host) * 2 > 1", "having"},
+		// (hidden HAVING aggregates route since res-3b, `+ - * /` since res-3c; `//` declines)
+		{"SELECT host FROM cpu GROUP BY host HAVING count(host) // 2 > 1", "having"},
 		{"SELECT DISTINCT host FROM cpu", "distinct"},
 		{"SELECT host FROM cpu LIMIT 10 OFFSET 5", "offset"},
 		{"SELECT * FROM cpu", "star_projection"},

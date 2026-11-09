@@ -28,6 +28,11 @@ const (
 	tokPunct                 // one of ( ) * ,
 	tokOp                    // comparison operator: = != <> < <= > >= (scan WHERE)
 	tokIntDiv                // `//` — DuckDB integer (trunc) division, lexed GREEDILY (agg-3b)
+	// tokSci is a scientific-notation literal `d[.d](e|E)[+-]d+` (res-3c), optional
+	// leading -. DuckDB types it DOUBLE. Only the HAVING operand grammar consumes it;
+	// every other shape refuses it as an unexpected token, as `1e3` was refused before
+	// (tokNum then the identifier `e3`).
+	tokSci
 )
 
 type token struct {
@@ -178,19 +183,35 @@ func tokenize(sql string) ([]token, bool) {
 // IMMEDIATELY followed by a digit — the fractional part, producing a tokFloat.
 // Otherwise it's a tokNum (integer). This mirrors the arcx engine's lexer: only
 // `digit.digit` is a float; `5.` and `.5` are not (the '.' is left for the next
-// step, which then fails to match → decline). No exponent / inf / nan spelling.
+// step, which then fails to match → decline). No inf / nan spelling. res-3c: an
+// exponent `(e|E)[+-]?digit+` right after makes a tokSci; a digit must follow the
+// `e` or its sign (`1e`, `1e+` stay tokNum then an identifier / `+`), as in the
+// engine.
 func lexNumber(sql string, b []byte, start, i, n int) (token, int) {
 	for i < n && isDigit(b[i]) {
 		i++
 	}
+	kind := tokNum
 	if i+1 < n && b[i] == '.' && isDigit(b[i+1]) {
 		i++ // consume '.'
 		for i < n && isDigit(b[i]) {
 			i++
 		}
-		return token{kind: tokFloat, orig: sql[start:i]}, i
+		kind = tokFloat
 	}
-	return token{kind: tokNum, orig: sql[start:i]}, i
+	if i < n && (b[i] == 'e' || b[i] == 'E') {
+		j := i + 1
+		if j < n && (b[j] == '+' || b[j] == '-') {
+			j++
+		}
+		if j < n && isDigit(b[j]) {
+			for j < n && isDigit(b[j]) {
+				j++
+			}
+			return token{kind: tokSci, orig: sql[start:j]}, j
+		}
+	}
+	return token{kind: kind, orig: sql[start:i]}, i
 }
 
 // decimalTooWide mirrors the engine lexer's agg-6b2 M1 rule: DuckDB 1.5.6 binds
