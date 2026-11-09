@@ -594,7 +594,7 @@ func havingCompare(l *hNode, op string, r *hNode) (string, bool) {
 //
 //	<operand> <cmp> <operand>
 //	<operand> IS [NOT] NULL | <operand> IS [NOT] DISTINCT FROM <operand|NULL>
-//	<ref> IS [NOT] TRUE|FALSE | <ref> [NOT] LIKE '<pattern>'
+//	<bool item> IS [NOT] TRUE|FALSE | <tag key> [NOT] LIKE '<pattern>'
 //	<operand> [NOT] BETWEEN <lit> AND <lit> | <operand> [NOT] IN (<lit>, …)
 //	<ref>                                    -- bare: a Boolean item
 //
@@ -747,14 +747,15 @@ func havingAtom(c *cursor, b *strings.Builder, hc havingCtx, st *havingState) bo
 		return true
 	case "like":
 		c.next()
-		// `<ref> [NOT] LIKE '<pattern>'`: the tag key or an aggregate item (the engine
-		// type-checks a string output). The WHERE pattern rules: a string literal,
+		// `<tag key> [NOT] LIKE '<pattern>'` — the one string output the engine serves
+		// (min/max over strings is outside its aggregate matrix, so LIKE on an aggregate
+		// would only cost a DuckDB re-run). The WHERE pattern rules: a string literal,
 		// no backslash, no ESCAPE.
 		pt, tok := c.next()
 		if !tok || pt.kind != tokStr || strings.Contains(pt.str, "\\") || c.peekIdentLower() == "escape" {
 			return false
 		}
-		if lhs.kind != hRef || lhs.info.kind != refAny {
+		if lhs.kind != hRef || !lhs.tag {
 			return false
 		}
 		b.WriteString(lhs.text + " " + not + "LIKE " + litNode(pt).text)

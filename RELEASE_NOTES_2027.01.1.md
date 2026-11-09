@@ -212,7 +212,7 @@ These `HAVING` forms now route to the arcx engine (arcX feat/res-3c):
 - `IS DISTINCT FROM` and `IS NOT DISTINCT FROM`, against a literal, `NULL`, another aggregate or
   an expression;
 - `IS TRUE`, `IS NOT TRUE`, `IS FALSE` and `IS NOT FALSE` on `bool_and` / `bool_or`;
-- `LIKE` and `NOT LIKE` with a string pattern, on the tag column or a string aggregate.
+- `LIKE` and `NOT LIKE` with a string pattern, on the tag column.
 
 The engine types and evaluates arithmetic the way DuckDB 1.5.6 does: exact 64- and 128-bit
 integers, exact decimals, `/` always a double, and DuckDB's own rounding when it converts a

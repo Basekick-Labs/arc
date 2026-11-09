@@ -113,6 +113,7 @@ func TestHavingExprDecline(t *testing.T) {
 		// Forms outside the grammar.
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) + 1 LIKE '1%'",
 		b + "count(*) FROM cpu GROUP BY 1 HAVING bool_and(ok) LIKE 't%'",
+		b + "count(*) FROM cpu GROUP BY 1 HAVING max(host) LIKE 'h%'",
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING host LIKE 'a\\%'",
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING host LIKE 'a%' ESCAPE '!'",
 		"SELECT host, count(*) FROM cpu GROUP BY host HAVING host LIKE host",
