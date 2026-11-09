@@ -103,10 +103,11 @@ the cold tier:
   lost or moved database starts without that record.
 - **Not after a metadata restore,** until the next complete sync. The
   restored rows predate files migrated since the backup.
-- **Not while a data restore into the cold tier is running,** nor after one
-  that stopped part way, until the next complete sync.
+- **Not during or after a data restore on a node with a cold tier,** until
+  the next complete sync. This holds even when the restore succeeds.
 - **Not after a sync that could not record some cold objects,** until a later
-  complete sync.
+  complete sync. A failure that repeats on every sync keeps the shortcut off.
+  The warning it logs names sample objects.
 
 `GET /api/v1/tiering/status` reports the state as
 `cold_metadata.authoritative`, with the reason when it is false.

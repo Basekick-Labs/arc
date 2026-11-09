@@ -1214,6 +1214,13 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// write that failed, or a hot-only object whose hot copy could not be
 	// checked. Either keeps cold rows marked incomplete.
 	notRecorded := 0
+	var notRecordedSample []string
+	noteNotRecorded := func(path string) {
+		notRecorded++
+		if len(notRecordedSample) < 5 {
+			notRecordedSample = append(notRecordedSample, path)
+		}
+	}
 	lister, ok := m.coldBackend.(storage.ObjectLister)
 	if !ok {
 		return 0, fmt.Errorf("cold backend does not support ListObjects")
@@ -1279,7 +1286,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 						return ctxErr
 					}
 					m.logger.Warn().Str("path", file.Path).Err(err).Msg("Failed to record cold file, skipping")
-					notRecorded++
+					noteNotRecorded(file.Path)
 					continue
 				}
 				if !wrote {
@@ -1356,7 +1363,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 			if present, existsErr := m.hotBackend.Exists(ctx, obj.Path); existsErr != nil || present {
 				if existsErr != nil {
 					m.logger.Warn().Err(existsErr).Str("path", obj.Path).Msg("Could not verify local hot copy for a hot-only cold object; preserving it")
-					notRecorded++
+					noteNotRecorded(obj.Path)
 				}
 				delete(unseen, obj.Path)
 				continue
@@ -1447,7 +1454,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		Int("quarantined_skipped", quarantined).
 		Int("not_recorded", notRecorded).
 		Msg("Cold tier metadata sync completed")
-	m.coldSyncCompleted(authGen, notRecorded)
+	m.coldSyncCompleted(authGen, notRecorded, notRecordedSample)
 	return synced, nil
 }
 

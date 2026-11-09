@@ -282,11 +282,13 @@ func (m *Manager) EndColdRestore() {
 
 // coldSyncCompleted is called by a cold-tier metadata sync that listed the
 // whole cold store and returned no error. notRecorded counts the objects it
-// listed but could not record.
-func (m *Manager) coldSyncCompleted(startGen uint64, notRecorded int) {
+// listed but could not record, sample names a few of them. A failure that
+// repeats every cycle keeps the rows untrusted until it is fixed; the sample
+// is how an operator finds what is pinning them.
+func (m *Manager) coldSyncCompleted(startGen uint64, notRecorded int, sample []string) {
 	if notRecorded > 0 {
-		m.logger.Warn().Int("objects_not_recorded", notRecorded).
-			Msg("Cold tier metadata sync could not record every cold object; cold tier rows are marked incomplete until a sync records them all")
+		m.logger.Warn().Int("objects_not_recorded", notRecorded).Strs("sample", sample).
+			Msg("Cold tier metadata sync could not record every cold object; cold tier rows are marked incomplete until a sync records them all, so a read the cold tier cannot list fails rather than answer from them")
 		m.markColdMetadataUnverified(coldAuthorityReasonUnrecorded)
 		return
 	}
