@@ -642,6 +642,35 @@ func (r *Receiver) hashStored(ctx context.Context, p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// ErrSpokePathNoMeasurement refuses a spoke path with a single segment: it
+// names no {database}/{measurement} pair, so no RBAC grant can be checked
+// for it (#1561), and it is not a layout Arc writes.
+var ErrSpokePathNoMeasurement = errors.New("edgesync: path must start with {database}/{measurement}/; a single segment names no measurement")
+
+// SpokeNamespace is the database and measurement a spoke's file is served
+// under on this hub, which is what RBAC is checked against (#1561). The file
+// lands at NamespacedPath = {spoke_id}/{spoke db}/{measurement}/..., and the
+// query layer reads FROM "{spoke_id}".{spoke db} over it (see the spoke
+// branch of tiering's parseFilePath), so: database = the spoke ID,
+// measurement = the spoke's database segment.
+//
+// The path is validated first, with the receiver's own rules, so the name
+// checked is exactly the segment the file lands under: validation refuses
+// empty, "." and ".." segments, so path.Join in NamespacedPath cleans nothing.
+func SpokeNamespace(spokeID, sourcePath string) (database, measurement string, err error) {
+	if err := validateSpokeID(spokeID); err != nil {
+		return "", "", err
+	}
+	if err := validateSyncPathForSpoke(spokeID, sourcePath); err != nil {
+		return "", "", err
+	}
+	first, rest, ok := strings.Cut(sourcePath, "/")
+	if !ok || rest == "" {
+		return "", "", ErrSpokePathNoMeasurement
+	}
+	return spokeID, first, nil
+}
+
 // NamespacedPath rewrites a spoke's path into the hub's namespace.
 //
 // This is a HUB-SIDE rewrite by design: the spoke sends its own native paths

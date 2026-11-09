@@ -92,6 +92,26 @@ func (r *Reconciler) MaxEntries() int { return r.maxEntries }
 // from a long outage. §6.1's identity rule decides each entry: absent is
 // missing, a matching digest is present, and a differing digest is a conflict.
 func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []ReconcileEntry) (*ReconcileResult, error) {
+	return r.ReconcileAllowed(ctx, spokeID, entries, nil)
+}
+
+// ReconcileAllow decides whether the caller may learn what the hub holds at a
+// spoke path. An error means it could not decide (a permission store that
+// cannot be read): the whole reconcile fails with it.
+type ReconcileAllow func(path string) (bool, error)
+
+// ReconcileAllowed is Reconcile with entries the caller may not write answered
+// as missing without being looked up (#1561): nothing about what the hub holds
+// at such a path is disclosed, and no stale index row of it is forgotten. The
+// spoke then pushes the file, and the push is refused on its own.
+//
+// Answering denied entries rather than refusing the batch is deliberate: the
+// spoke's agent aborts its whole pass on a failed reconcile and offers the
+// same first page again, so one measurement the token cannot write would stall
+// every other one. A nil allow permits every entry. Validation (paths, digests,
+// duplicates, the batch cap) covers every entry, denied or not, so a batch is
+// accepted or refused exactly as without a filter.
+func (r *Reconciler) ReconcileAllowed(ctx context.Context, spokeID string, entries []ReconcileEntry, allow ReconcileAllow) (*ReconcileResult, error) {
 	if err := validateSpokeID(spokeID); err != nil {
 		return nil, err
 	}
@@ -118,7 +138,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 			return nil, fmt.Errorf("edgesync: reconcile batch contains %q twice", e.Path)
 		}
 		seen[e.Path] = struct{}{}
+	}
+
+	// Decided after validation, so a denied entry cannot turn a malformed
+	// batch into an accepted one.
+	denied := make(map[string]struct{})
+	for _, e := range entries {
+		if allow != nil {
+			ok, err := allow(e.Path)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				denied[e.Path] = struct{}{}
+				continue
+			}
+		}
 		paths = append(paths, e.Path)
+	}
+	permitted := entries
+	if len(denied) > 0 {
+		permitted = make([]ReconcileEntry, 0, len(entries)-len(denied))
+		for _, e := range entries {
+			if _, no := denied[e.Path]; !no {
+				permitted = append(permitted, e)
+			}
+		}
 	}
 
 	held, err := r.index.Lookup(ctx, spokeID, paths)
@@ -130,7 +175,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 	// it concurrently. The index records receipts, not deletions, so a stale
 	// row would otherwise make the hub claim a file it no longer holds — see
 	// ReconcilerConfig.Backend.
-	stale, err := r.confirmPresent(ctx, spokeID, entries, held)
+	stale, err := r.confirmPresent(ctx, spokeID, permitted, held)
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +195,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 
 	res := &ReconcileResult{}
 	for _, e := range entries {
+		if _, no := denied[e.Path]; no {
+			res.Missing = append(res.Missing, e.Path)
+			continue
+		}
 		existing, ok := held[e.Path]
 
 		switch {

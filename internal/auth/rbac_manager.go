@@ -1838,6 +1838,8 @@ func hasCoarseAdmin(info *TokenInfo) bool {
 // RequireAnyResourcePermission for routes whose resources are in the body —
 // query SQL and ingest payloads (#1559: those routes kept the coarse door
 // after the first fix, so an RBAC-only token could not query or ingest).
+// Edge-sync pushes are checked on the spoke's namespace ({spoke_id}, the
+// spoke's database) after the request MAC (#1561).
 
 // checkOSSPermission checks permissions using OSS token model
 func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *PermissionCheckResult {
