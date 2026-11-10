@@ -241,7 +241,7 @@ sudo systemctl enable arc && sudo systemctl start arc
 
 ### RHEL/Fedora
 
-The RPMs are signed with the Basekick Labs package key (from 26.09.4; earlier RPMs are unsigned and `dnf` installs them with a warning). Fedora 45 and later refuse an unsigned package with plain `rpm -i`.
+The RPMs are signed with the Basekick Labs package key from 26.09.4, fingerprint `3E39 9CF8 F5D2 EF9A A9A5 36EF 7629 7AF0 8CBA B6FE` (check it with `gpg --show-keys RPM-GPG-KEY-basekick`). Earlier RPMs are unsigned, and `dnf` installs them with a warning. Fedora 45 and later refuse an unsigned package with plain `rpm -i`.
 
 ```bash
 sudo rpm --import https://raw.githubusercontent.com/Basekick-Labs/arc/main/deploy/packaging/RPM-GPG-KEY-basekick
