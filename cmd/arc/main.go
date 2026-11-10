@@ -4828,6 +4828,11 @@ func main() {
 					// /health "tiering": cold rows whose object is gone (#1551).
 					// ColdMissingObjects is nil until a cold sync has checked.
 					server.SetColdMissingObjects(tieringManager.ColdMissingObjects)
+					// The cluster's cold mark is trusted only for the cold
+					// store it was seeded from (#1552).
+					if clusterCoordinator != nil {
+						clusterCoordinator.SetColdMarkIdentity(tieringManager.ColdBackendIdentity)
+					}
 					// Cluster-wide tiering policies (#1324): once the cluster
 					// has seeded them, every node reads and writes the same
 					// policies through Raft instead of its own table.
@@ -6066,6 +6071,22 @@ func (a *tieringManifestAdapter) HasRewriteSibling(path string) bool {
 }
 
 var _ tiering.RewriteSiblingChecker = (*tieringManifestAdapter)(nil)
+
+// The cluster's cold mark (#1552): tiering raises it before every cold write
+// and seeds it from a cold listing.
+func (a *tieringManifestAdapter) ColdWrite(ctx context.Context, marks map[string]int32, write func() error) error {
+	return a.coordinator.ColdWrite(ctx, marks, write)
+}
+
+func (a *tieringManifestAdapter) ColdMarkSeedState() (fenced, seeded bool) {
+	return a.coordinator.ColdMarkSeedState()
+}
+
+func (a *tieringManifestAdapter) SeedColdMarks(ctx context.Context, marks map[string]int32, backend string) error {
+	return a.coordinator.SeedColdMarks(ctx, marks, backend)
+}
+
+var _ tiering.ColdMarker = (*tieringManifestAdapter)(nil)
 
 func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
 	return a.coordinator.CompactionOwns(path)

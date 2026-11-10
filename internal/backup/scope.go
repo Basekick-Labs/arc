@@ -297,6 +297,13 @@ type coldRestoreGuard interface {
 	EndColdRestore()
 }
 
+// coldWriteGuard is an optional ColdSource capability (#1552): a restore's
+// cold write runs inside it, which raises the cluster's cold mark first.
+// tiering.Manager implements it; its error refuses the write.
+type coldWriteGuard interface {
+	GuardColdWrite(ctx context.Context, keys []string, write func() error) error
+}
+
 // SetColdSource wires this node's cold tier for the cold walk and the cold
 // restore. Nil is ignored, as SetColdCounter; a caller holding a typed nil
 // pointer must check for nil itself (#713).
