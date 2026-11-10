@@ -650,7 +650,18 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	}
 
 	// Perform the migration using streaming to avoid loading entire files into memory
-	migrationErr := m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, size)
+	copyFile := func() error {
+		return m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, size)
+	}
+	var migrationErr error
+	if candidate.TargetTier == TierCold {
+		// The cluster's cold mark is raised before the object exists, so a
+		// reader that cannot list cold never rules this file's day out
+		// (#1552). When the mark cannot be raised the copy does not start.
+		migrationErr = m.manager.GuardColdWrite(ctx, []string{candidate.Path}, copyFile)
+	} else {
+		migrationErr = copyFile()
+	}
 
 	if migrationErr != nil {
 		// Record failure

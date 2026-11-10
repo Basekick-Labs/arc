@@ -1,0 +1,264 @@
+package cluster
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/basekick-labs/arc/internal/cluster/raft"
+)
+
+// Cold mark, coordinator side (#1552). See raft/cold_mark.go.
+//
+// The flag follows the compaction commit pattern: every build that maintains
+// the mark advertises the capability, the leader enables it once every node
+// in the FSM table and every Raft server advertised it, and from then on (or
+// while an enable proposal may still commit) a join without the capability
+// is refused before the node enters the Raft configuration. As with the other
+// capability flags, a member is not removed when it comes back without it:
+// its join is refused and logged at Error.
+//
+// The fence: ColdWrite holds coldWriteMu shared across its decision and the
+// write. A node acks Enable only after taking it exclusively once Enable is
+// applied here, so no write that began unmarked can still be running.
+
+const coldMarkEvery = 10 * time.Second
+
+// coldMarkGate serializes the join gate with the enable proposal, as
+// compactionCommitGate does.
+type coldMarkGate struct {
+	mu       sync.Mutex
+	inFlight bool
+	blockers atomic.Pointer[[]string]
+}
+
+// coldMarkJoinGate is compactionCommitJoinGate for the cold mark.
+func (c *Coordinator) coldMarkJoinGate(req interface {
+	GetNodeID() string
+	GetCapabilities() []string
+}) (why string, release func()) {
+	fsm := c.raftNode.FSM()
+	g := &c.coldMarkGate
+	g.mu.Lock()
+	if hasCapability(req.GetCapabilities(), raft.CapabilityColdMark) {
+		return "", g.mu.Unlock
+	}
+	enabled := fsm != nil && fsm.ColdMarkStatus().Enabled
+	if !enabled && g.inFlight {
+		if err := c.barrierWithin(streamClaimsJoinBarrier); err != nil {
+			g.mu.Unlock()
+			return "the cluster could not confirm its cold mark state; retry the join", nil
+		}
+		enabled = fsm != nil && fsm.ColdMarkStatus().Enabled
+	}
+	if !enabled {
+		return "", g.mu.Unlock
+	}
+	g.mu.Unlock()
+	return "the cold mark is enabled in this cluster: the node must run a release that supports it", nil
+}
+
+// coldMarkLoop enables the mark from the leader once every node supports it,
+// and acks it from every node once its unmarked cold writes drained.
+func (c *Coordinator) coldMarkLoop(ctx context.Context) {
+	t := time.NewTicker(coldMarkEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			c.maybeEnableColdMark()
+			c.maybeAckColdMark(ctx)
+		}
+	}
+}
+
+func (c *Coordinator) maybeEnableColdMark() {
+	if c.raftNode == nil {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil || fsm.ColdMarkStatus().Enabled || !c.raftNode.IsLeader() {
+		return
+	}
+	g := &c.coldMarkGate
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	nodes, blockers := capabilityCandidates(fsm.GetAllNodes(), c.raftNode.ConfigurationServerIDs, raft.CapabilityColdMark)
+	g.blockers.Store(&blockers)
+	if len(blockers) > 0 {
+		return
+	}
+	raw, err := json.Marshal(raft.EnableColdMarkPayload{Nodes: nodes})
+	if err != nil {
+		return
+	}
+	g.inFlight = true
+	if err := c.raftNode.Apply(&raft.Command{Type: raft.CommandEnableColdMark, Payload: raw}, 5*time.Second); err != nil {
+		c.logger.Warn().Err(err).Msg("Proposing the cold mark failed; retrying")
+	}
+}
+
+// maybeAckColdMark acks once Enable is applied here: taking coldWriteMu
+// exclusively waits out every cold write that may have begun unmarked.
+func (c *Coordinator) maybeAckColdMark(ctx context.Context) {
+	if c.raftNode == nil {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil || !fsm.ColdMarkStatus().Enabled || fsm.ColdMarkAcked(c.localNode.ID) {
+		return
+	}
+	c.coldWriteMu.Lock()
+	c.coldWriteMu.Unlock() //nolint:staticcheck // the drain is the point
+	raw, err := json.Marshal(raft.ColdMarkAckPayload{NodeID: c.localNode.ID})
+	if err != nil {
+		return
+	}
+	if err := c.applyOrForward(ctx, &raft.Command{Type: raft.CommandColdMarkAck, Payload: raw}); err != nil {
+		c.logger.Warn().Err(err).Msg("Acking the cold mark failed; retrying")
+	}
+}
+
+// coldMarkRequired reports whether a cold write must raise the mark first:
+// the mark is enabled, or every node in the table supports it (Enable can
+// then commit while the write runs, and only a node that was unmarked-capable
+// before Enable is drained by the fence). Vacuously true on an empty table.
+func coldMarkRequired(fsm *raft.ClusterFSM) bool {
+	if fsm.ColdMarkStatus().Enabled {
+		return true
+	}
+	for _, n := range fsm.GetAllNodes() {
+		if !hasCapability(n.Capabilities, raft.CapabilityColdMark) {
+			return false
+		}
+	}
+	return true
+}
+
+// ColdWrite raises the cold mark of each scope to its day before running
+// write, which writes cold objects of those days. When the mark is required
+// and cannot be raised, write does not run. Scopes whose mark already covers
+// the day are not proposed again.
+func (c *Coordinator) ColdWrite(ctx context.Context, marks map[string]int32, write func() error) error {
+	if c == nil || c.raftNode == nil {
+		return write()
+	}
+	c.coldWriteMu.RLock()
+	defer c.coldWriteMu.RUnlock()
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return write()
+	}
+	required := coldMarkRequired(fsm)
+	if err := c.raiseColdMarks(ctx, fsm, marks); err != nil {
+		if required {
+			return fmt.Errorf("cold mark not raised, cold write not started: %w", err)
+		}
+		c.logger.Debug().Err(err).Msg("Cold mark not raised; the cluster does not maintain it yet")
+	}
+	return write()
+}
+
+func (c *Coordinator) raiseColdMarks(ctx context.Context, fsm *raft.ClusterFSM, marks map[string]int32) error {
+	need := make(map[string]int32, len(marks))
+	for scope, day := range marks {
+		if !fsm.ColdMarkCovers(scope, day) {
+			need[scope] = day
+		}
+	}
+	return c.proposeColdMarkChunks(ctx, need, func(chunk map[string]int32, _ bool) (*raft.Command, error) {
+		raw, err := json.Marshal(raft.ColdMarkAddPayload{Marks: chunk})
+		return &raft.Command{Type: raft.CommandColdMarkAdd, Payload: raw}, err
+	})
+}
+
+// proposeColdMarkChunks proposes marks in sorted chunks of at most 1000; last
+// is set on the final chunk (also when marks is empty and build accepts it).
+func (c *Coordinator) proposeColdMarkChunks(ctx context.Context, marks map[string]int32, build func(chunk map[string]int32, last bool) (*raft.Command, error)) error {
+	scopes := make([]string, 0, len(marks))
+	for s := range marks {
+		scopes = append(scopes, s)
+	}
+	sort.Strings(scopes)
+	const chunkSize = 1000
+	for start := 0; start < len(scopes); start += chunkSize {
+		end := min(start+chunkSize, len(scopes))
+		chunk := make(map[string]int32, end-start)
+		for _, s := range scopes[start:end] {
+			chunk[s] = marks[s]
+		}
+		cmd, err := build(chunk, end == len(scopes))
+		if err != nil {
+			return err
+		}
+		if cmd == nil {
+			continue
+		}
+		if err := c.applyOrForward(ctx, cmd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ColdMarkSeedState reports whether the mark is fenced (a listing started
+// now may seed it) and seeded.
+func (c *Coordinator) ColdMarkSeedState() (fenced, seeded bool) {
+	if c == nil || c.raftNode == nil {
+		return false, false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false, false
+	}
+	st := fsm.ColdMarkStatus()
+	return st.Fenced, st.Seeded
+}
+
+// SeedColdMarks folds a complete cold listing, started after the fence, into
+// the marks and marks them seeded from backend.
+func (c *Coordinator) SeedColdMarks(ctx context.Context, marks map[string]int32, backend string) error {
+	if c == nil || c.raftNode == nil {
+		return errors.New("seed cold marks: no raft")
+	}
+	if backend == "" {
+		return errors.New("seed cold marks: no backend identity")
+	}
+	build := func(chunk map[string]int32, last bool) (*raft.Command, error) {
+		p := raft.ColdMarkSeedPayload{Marks: chunk}
+		if last {
+			p.Final, p.Backend = true, backend
+		}
+		raw, err := json.Marshal(p)
+		return &raft.Command{Type: raft.CommandColdMarkSeed, Payload: raw}, err
+	}
+	if len(marks) == 0 {
+		cmd, err := build(nil, true)
+		if err != nil {
+			return err
+		}
+		return c.applyOrForward(ctx, cmd)
+	}
+	return c.proposeColdMarkChunks(ctx, marks, build)
+}
+
+// ColdMarkStatus is the /cluster status view.
+func (c *Coordinator) ColdMarkStatus() (st raft.ColdMarkStatus, blocking []string) {
+	if c == nil || c.raftNode == nil {
+		return st, nil
+	}
+	if fsm := c.raftNode.FSM(); fsm != nil {
+		st = fsm.ColdMarkStatus()
+	}
+	if b := c.coldMarkGate.blockers.Load(); b != nil && !st.Enabled {
+		blocking = append(blocking, *b...)
+	}
+	return st, blocking
+}

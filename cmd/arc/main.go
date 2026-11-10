@@ -6067,6 +6067,22 @@ func (a *tieringManifestAdapter) HasRewriteSibling(path string) bool {
 
 var _ tiering.RewriteSiblingChecker = (*tieringManifestAdapter)(nil)
 
+// The cluster's cold mark (#1552): tiering raises it before every cold write
+// and seeds it from a cold listing.
+func (a *tieringManifestAdapter) ColdWrite(ctx context.Context, marks map[string]int32, write func() error) error {
+	return a.coordinator.ColdWrite(ctx, marks, write)
+}
+
+func (a *tieringManifestAdapter) ColdMarkSeedState() (fenced, seeded bool) {
+	return a.coordinator.ColdMarkSeedState()
+}
+
+func (a *tieringManifestAdapter) SeedColdMarks(ctx context.Context, marks map[string]int32, backend string) error {
+	return a.coordinator.SeedColdMarks(ctx, marks, backend)
+}
+
+var _ tiering.ColdMarker = (*tieringManifestAdapter)(nil)
+
 func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
 	return a.coordinator.CompactionOwns(path)
 }

@@ -1,0 +1,366 @@
+package raft
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+)
+
+// Cold mark (#1552).
+//
+// For each "database/measurement" scope, the latest UTC day that may hold an
+// object in the cold tier. A cluster reader whose cold listing fails can use
+// it to tell that a range starting after the mark needs no cold data, which
+// its own tier rows cannot tell it (they lag the cold store in several ways).
+//
+// Invariant: the mark is at or after the day of every cold object of its
+// scope. It holds because
+//   - every cold writer (the migrator, a restore) raises the mark, through a
+//     committed Add, before it writes the object;
+//   - nothing ever lowers it (retention, DELETE and policy changes leave it
+//     high, which only costs what a read costs without it);
+//   - objects written before the mark existed are covered by a seed: a cold
+//     listing that started after the fence below, folded in with Seed.
+//
+// MarkUnknownDay is the mark of a scope holding an object whose day cannot be
+// read from its key: such a scope is never hot-only.
+//
+// State machine, the same pure function of the log on every node:
+//
+//	off ──Enable──▶ enabled ──acks of every node at enable──▶ fenced ──Seed(final)──▶ seeded
+//
+//   - Enable is proposed by the leader once every node advertises
+//     CapabilityColdMark; it records the node table as AckWanted.
+//   - A node acks once it applied Enable and no cold write it began without a
+//     committed Add can still be running (cluster.coldWriteMu): before Enable,
+//     a writer in a cluster that still has older builds writes unmarked.
+//   - Fenced latches when every AckWanted node still in the table acked; a
+//     node removal rechecks it.
+//   - Seed is refused before the fence; its final chunk sets Seeded and the
+//     cold backend identity it listed. Seeds from two different identities
+//     set BackendConflict, and the mark is never trusted.
+//
+// Add and Seed apply in any state: both only raise marks.
+
+// CapabilityColdMark is advertised at join by every build that maintains the
+// cold mark.
+const CapabilityColdMark = "cold_mark_v1"
+
+// MarkUnknownDay marks a scope whose cold objects' days are not all known.
+const MarkUnknownDay = int32(math.MaxInt32)
+
+// maxColdMarkEntries bounds one Add or Seed command; maxColdMarkScopes the
+// replicated state.
+const (
+	maxColdMarkEntries = 1000
+	maxColdMarkScopes  = 1 << 20
+)
+
+// EnableColdMarkPayload turns the cold mark on. Nodes lists the node ids the
+// proposer saw advertising the capability; Apply refuses unless every node in
+// this FSM's table is among them.
+type EnableColdMarkPayload struct {
+	Nodes []string `json:"nodes"`
+}
+
+// ColdMarkAddPayload raises marks: scope -> UTC day (days since the epoch).
+type ColdMarkAddPayload struct {
+	Marks map[string]int32 `json:"marks"`
+}
+
+// ColdMarkAckPayload is a node reporting that it applied Enable and drained
+// its unmarked cold writes.
+type ColdMarkAckPayload struct {
+	NodeID string `json:"node_id"`
+}
+
+// ColdMarkSeedPayload folds a cold listing into the marks. Final sets Seeded,
+// with Backend the identity of the cold store listed.
+type ColdMarkSeedPayload struct {
+	Marks   map[string]int32 `json:"marks"`
+	Final   bool             `json:"final,omitempty"`
+	Backend string           `json:"backend,omitempty"`
+}
+
+// coldMarkState is the replicated state and its snapshot form.
+type coldMarkState struct {
+	Enabled         bool             `json:"enabled,omitempty"`
+	AckWanted       []string         `json:"ack_wanted,omitempty"`
+	Acked           map[string]bool  `json:"acked,omitempty"`
+	Fenced          bool             `json:"fenced,omitempty"`
+	Seeded          bool             `json:"seeded,omitempty"`
+	Backend         string           `json:"backend,omitempty"`
+	BackendConflict bool             `json:"backend_conflict,omitempty"`
+	Marks           map[string]int32 `json:"marks,omitempty"`
+}
+
+// ColdMarkStatus is a copy of the flags, for status and the coordinator.
+type ColdMarkStatus struct {
+	Enabled         bool     `json:"enabled"`
+	Fenced          bool     `json:"fenced"`
+	Seeded          bool     `json:"seeded"`
+	BackendConflict bool     `json:"backend_conflict,omitempty"`
+	Backend         string   `json:"backend,omitempty"`
+	Scopes          int      `json:"scopes"`
+	AckPending      []string `json:"ack_pending,omitempty"`
+}
+
+func (f *ClusterFSM) coldMarkLocked() *coldMarkState {
+	if f.coldMark == nil {
+		f.coldMark = &coldMarkState{}
+	}
+	return f.coldMark
+}
+
+// validColdMarkScope accepts "database/measurement" with two non-empty
+// segments and no traversal.
+func validColdMarkScope(scope string) bool {
+	db, meas, ok := strings.Cut(scope, "/")
+	if !ok || db == "" || meas == "" || strings.Contains(meas, "/") {
+		return false
+	}
+	return !strings.Contains(scope, "..") && !strings.ContainsAny(scope, "\\\x00")
+}
+
+// raiseColdMarksLocked raises the marks in m. Validates everything first so a
+// refused command changes nothing.
+func (f *ClusterFSM) raiseColdMarksLocked(m map[string]int32) error {
+	if len(m) > maxColdMarkEntries {
+		return fmt.Errorf("cold mark: %d entries, at most %d", len(m), maxColdMarkEntries)
+	}
+	st := f.coldMarkLocked()
+	added := 0
+	for scope, day := range m {
+		if !validColdMarkScope(scope) {
+			return fmt.Errorf("cold mark: invalid scope %q", scope)
+		}
+		if day < 0 {
+			return fmt.Errorf("cold mark: invalid day %d for %q", day, scope)
+		}
+		if _, ok := st.Marks[scope]; !ok {
+			added++
+		}
+	}
+	if len(st.Marks)+added > maxColdMarkScopes {
+		return fmt.Errorf("cold mark: more than %d scopes", maxColdMarkScopes)
+	}
+	if st.Marks == nil {
+		st.Marks = make(map[string]int32, len(m))
+	}
+	for scope, day := range m {
+		if cur, ok := st.Marks[scope]; !ok || day > cur {
+			st.Marks[scope] = day
+		}
+	}
+	return nil
+}
+
+func (f *ClusterFSM) applyEnableColdMark(payload []byte) interface{} {
+	var p EnableColdMarkPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal enable cold mark payload: %w", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st := f.coldMarkLocked()
+	if st.Enabled {
+		return nil
+	}
+	listed := make(map[string]bool, len(p.Nodes))
+	for _, n := range p.Nodes {
+		listed[n] = true
+	}
+	wanted := make([]string, 0, len(f.nodes))
+	for id := range f.nodes {
+		if !listed[id] {
+			return fmt.Errorf("enable cold mark: node %s is not known to support it", id)
+		}
+		wanted = append(wanted, id)
+	}
+	sort.Strings(wanted)
+	st.Enabled = true
+	st.AckWanted = wanted
+	st.Acked = map[string]bool{}
+	f.updateColdMarkFenceLocked()
+	f.logger.Info().Int("nodes", len(wanted)).Msg("Cold mark enabled: every node supports it")
+	return nil
+}
+
+func (f *ClusterFSM) applyColdMarkAdd(payload []byte) interface{} {
+	var p ColdMarkAddPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal cold mark add payload: %w", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.raiseColdMarksLocked(p.Marks)
+}
+
+func (f *ClusterFSM) applyColdMarkAck(payload []byte) interface{} {
+	var p ColdMarkAckPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal cold mark ack payload: %w", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st := f.coldMarkLocked()
+	if !st.Enabled {
+		return errors.New("cold mark ack: not enabled")
+	}
+	if _, ok := f.nodes[p.NodeID]; !ok {
+		return fmt.Errorf("cold mark ack: unknown node %q", p.NodeID)
+	}
+	st.Acked[p.NodeID] = true
+	f.updateColdMarkFenceLocked()
+	return nil
+}
+
+// updateColdMarkFenceLocked latches Fenced once every AckWanted node still
+// in the node table acked.
+func (f *ClusterFSM) updateColdMarkFenceLocked() {
+	st := f.coldMark
+	if st == nil || !st.Enabled || st.Fenced {
+		return
+	}
+	for _, id := range st.AckWanted {
+		if _, member := f.nodes[id]; member && !st.Acked[id] {
+			return
+		}
+	}
+	st.Fenced = true
+	f.logger.Info().Msg("Cold mark fenced: no node can still be writing to the cold tier without raising it")
+}
+
+func (f *ClusterFSM) applyColdMarkSeed(payload []byte) interface{} {
+	var p ColdMarkSeedPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal cold mark seed payload: %w", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st := f.coldMarkLocked()
+	if !st.Fenced {
+		return errors.New("cold mark seed: not fenced")
+	}
+	if p.Final && p.Backend == "" {
+		return errors.New("cold mark seed: final chunk without a backend identity")
+	}
+	if err := f.raiseColdMarksLocked(p.Marks); err != nil {
+		return err
+	}
+	if !p.Final {
+		return nil
+	}
+	switch {
+	case st.Backend == "":
+		st.Backend = p.Backend
+	case st.Backend != p.Backend && !st.BackendConflict:
+		st.BackendConflict = true
+		f.logger.Error().Str("seeded", st.Backend).Str("listed", p.Backend).
+			Msg("Cold mark seeded from two different cold stores; it is not trusted. Every node must use the same cold tier bucket and prefix")
+	}
+	if !st.Seeded {
+		st.Seeded = true
+		f.logger.Info().Int("scopes", len(st.Marks)).Msg("Cold mark seeded")
+	}
+	return nil
+}
+
+// ColdMark returns the mark of scope ("database/measurement"): has is false
+// when no cold object of the scope has been marked, trusted when the mark is
+// enabled, fenced, seeded and from one cold store. A mark of MarkUnknownDay
+// means the scope's days are not known.
+func (f *ClusterFSM) ColdMark(scope string) (day int32, has, trusted bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	st := f.coldMark
+	if st == nil {
+		return 0, false, false
+	}
+	day, has = st.Marks[scope]
+	return day, has, st.Enabled && st.Fenced && st.Seeded && !st.BackendConflict
+}
+
+// ColdMarkCovers reports whether scope's mark is already at or after day.
+func (f *ClusterFSM) ColdMarkCovers(scope string, day int32) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.coldMark == nil {
+		return false
+	}
+	cur, ok := f.coldMark.Marks[scope]
+	return ok && cur >= day
+}
+
+// ColdMarkStatus returns the flags and the nodes the fence waits for.
+func (f *ClusterFSM) ColdMarkStatus() ColdMarkStatus {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	st := f.coldMark
+	if st == nil {
+		return ColdMarkStatus{}
+	}
+	out := ColdMarkStatus{
+		Enabled: st.Enabled, Fenced: st.Fenced, Seeded: st.Seeded,
+		BackendConflict: st.BackendConflict, Backend: st.Backend, Scopes: len(st.Marks),
+	}
+	if st.Enabled && !st.Fenced {
+		for _, id := range st.AckWanted {
+			if _, member := f.nodes[id]; member && !st.Acked[id] {
+				out.AckPending = append(out.AckPending, id)
+			}
+		}
+	}
+	return out
+}
+
+// ColdMarkAcked reports whether nodeID acked.
+func (f *ClusterFSM) ColdMarkAcked(nodeID string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.coldMark != nil && f.coldMark.Acked[nodeID]
+}
+
+func (f *ClusterFSM) snapshotColdMarkLocked() *coldMarkState {
+	st := f.coldMark
+	if st == nil || (!st.Enabled && len(st.Marks) == 0) {
+		return nil
+	}
+	cp := *st
+	cp.AckWanted = append([]string(nil), st.AckWanted...)
+	cp.Acked = make(map[string]bool, len(st.Acked))
+	for k, v := range st.Acked {
+		cp.Acked[k] = v
+	}
+	cp.Marks = make(map[string]int32, len(st.Marks))
+	for k, v := range st.Marks {
+		cp.Marks[k] = v
+	}
+	return &cp
+}
+
+// restoreColdMarkLocked installs a snapshot's state, dropping invalid scopes.
+func (f *ClusterFSM) restoreColdMarkLocked(st *coldMarkState) {
+	if st == nil {
+		f.coldMark = nil
+		return
+	}
+	cp := *st
+	if cp.Acked == nil {
+		cp.Acked = map[string]bool{}
+	}
+	cp.Marks = make(map[string]int32, len(st.Marks))
+	for scope, day := range st.Marks {
+		if !validColdMarkScope(scope) || day < 0 {
+			f.logger.Error().Str("scope", scope).Msg("Invalid cold mark scope in snapshot; refused")
+			// A dropped scope could hide a cold object: stop trusting.
+			cp.BackendConflict = true
+			continue
+		}
+		cp.Marks[scope] = day
+	}
+	f.coldMark = &cp
+}

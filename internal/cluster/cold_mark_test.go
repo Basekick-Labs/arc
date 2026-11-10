@@ -1,0 +1,139 @@
+package cluster
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/basekick-labs/arc/internal/cluster/protocol"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
+)
+
+// #1552: the cold mark, coordinator side.
+
+var cmList = []string{raft.CapabilityColdMark}
+
+func coldMarkRig(t *testing.T, readerCaps []string) *Coordinator {
+	t.Helper()
+	c := originRig(t, "writer-1", RoleWriter)
+	capNodes(t, c, map[string][]string{"raft-1": cmList, "writer-1": cmList, "writer-2": cmList, "reader-1": readerCaps})
+	return c
+}
+
+func coldMarkEnabled(c *Coordinator) func() bool {
+	return func() bool { st, _ := c.ColdMarkStatus(); return st.Enabled }
+}
+
+func TestColdMarkEnableWaitsForEveryNode(t *testing.T) {
+	c := coldMarkRig(t, nil)
+	c.maybeEnableColdMark()
+	if st, blocking := c.ColdMarkStatus(); st.Enabled || len(blocking) != 1 || blocking[0] != "reader-1" {
+		t.Fatalf("status %+v blocking %v, want reader-1 blocking", st, blocking)
+	}
+	capNodes(t, c, map[string][]string{"reader-1": cmList})
+	c.maybeEnableColdMark()
+	waitFSM(t, coldMarkEnabled(c))
+
+	// Once on, an older build cannot join.
+	if why, _ := c.coldMarkJoinGate(&protocol.JoinRequest{NodeID: "w9"}); why == "" {
+		t.Fatal("a build without the cold mark joined a cluster that has it on")
+	}
+	why, release := c.coldMarkJoinGate(&protocol.JoinRequest{NodeID: "w9", Capabilities: cmList})
+	if why != "" {
+		t.Fatalf("a capable node refused: %s", why)
+	}
+	release()
+}
+
+// The mark is raised, and committed, before the write runs.
+func TestColdWriteRaisesTheMarkFirst(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	fsm := c.raftNode.FSM()
+	ran := false
+	err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 42}, func() error {
+		ran = true
+		if !fsm.ColdMarkCovers("db/cpu", 42) {
+			t.Fatal("write ran before the mark covered its day")
+		}
+		return nil
+	})
+	if err != nil || !ran {
+		t.Fatalf("err %v ran %v", err, ran)
+	}
+}
+
+// Every node supports the mark: one that cannot be raised stops the write.
+// A covered day needs no proposal.
+func TestColdWriteRefusedWhenTheMarkIsRequired(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	if err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 10}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 11}, func() error { ran = true; return nil })
+	if err == nil || ran {
+		t.Fatalf("err %v ran %v: a write whose mark could not be raised ran", err, ran)
+	}
+	if err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 10}, func() error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("a covered day: err %v ran %v", err, ran)
+	}
+}
+
+// A node without the capability: the cluster does not maintain the mark yet,
+// so a write runs unmarked when the mark cannot be raised.
+func TestColdWriteUnmarkedBeforeEveryNodeSupportsIt(t *testing.T) {
+	c := coldMarkRig(t, nil)
+	if err := c.raftNode.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	if err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 11}, func() error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("err %v ran %v", err, ran)
+	}
+}
+
+// The ack waits for a cold write in flight: the fence.
+func TestColdMarkAckWaitsForWritesInFlight(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	started, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 1}, func() error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+	c.maybeEnableColdMark()
+	waitFSM(t, coldMarkEnabled(c))
+	acked := make(chan struct{})
+	go func() { c.maybeAckColdMark(context.Background()); close(acked) }()
+	select {
+	case <-acked:
+		t.Fatal("acked while a cold write was in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	<-acked
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	waitFSM(t, func() bool { return c.raftNode.FSM().ColdMarkAcked("writer-1") })
+}
+
+func TestSeedColdMarksNeedsABackend(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	if err := c.SeedColdMarks(context.Background(), nil, ""); err == nil {
+		t.Fatal("seeded without a backend identity")
+	}
+	// Before the fence the FSM refuses it.
+	err := c.SeedColdMarks(context.Background(), map[string]int32{"db/cpu": 1}, "s3://b/")
+	if err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("seed before the fence: %v", err)
+	}
+}

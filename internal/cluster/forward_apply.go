@@ -699,6 +699,25 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// local mode), and any forwarded one in shared-storage mode, where the
 	// primary is the leader itself.
 	isWatermark := cmd.Type == clusterraft.CommandSetCQWatermark
+	// The cold mark (#1552): a cold write raises it (the migrator on the
+	// primary writer, a restore on any node) and a cold listing seeds it
+	// (any node whose tiering is not role-gated, readers included in a
+	// local-storage cluster without replication), so any known peer may
+	// forward them. Both only ever raise marks; a seed is refused by the FSM
+	// before the fence. An ack must name the requesting node, like the
+	// compaction pause ack: it is what the fence waits for. Enable is
+	// leader-only and never accepted from a peer.
+	isColdMark := cmd.Type == clusterraft.CommandColdMarkAdd ||
+		cmd.Type == clusterraft.CommandColdMarkSeed
+	isColdMarkAck := cmd.Type == clusterraft.CommandColdMarkAck
+	if isColdMarkAck {
+		var p clusterraft.ColdMarkAckPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil || p.NodeID != req.NodeID {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: cold mark ack names another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "cold mark ack must name the requesting node")
+			return
+		}
+	}
 	if isWatermark {
 		if why := c.watermarkForwardRefusal(&cmd, req.NodeID); why != "" {
 			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: " + why)
@@ -706,7 +725,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			return
 		}
 	}
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark {
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).

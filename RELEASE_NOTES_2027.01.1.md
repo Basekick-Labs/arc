@@ -272,6 +272,20 @@ The edge-sync hub endpoints moved to RBAC as well; see
 "Fix: edge-sync pushes are decided by RBAC on the spoke's database"
 ([#1561](https://github.com/Basekick-Labs/arc/issues/1561)).
 
+## Cluster: a replicated record of which days may be in the cold tier ([#1552](https://github.com/Basekick-Labs/arc/issues/1552), part 1 of 2)
+
+Groundwork for answering recent-data queries on cluster nodes while the cold tier cannot be listed (the standalone case is #1550). This release changes no query behaviour.
+
+The cluster now keeps, through Raft, a **cold mark** per database and measurement: the latest day that may have data in the cold tier.
+
+- The migrator, and a restore that writes to the cold tier, raise it before writing the object. When the mark cannot be raised (no Raft quorum), the cold write does not start; the file is migrated or restored on a later attempt.
+- It never goes down. Retention, DELETE and policy changes leave it where it is.
+- Existing cold data is folded in from a complete cold listing, taken after every node has confirmed it has no unmarked cold write in flight.
+- It turns on by itself once every node runs this release. From then on a node on an older release cannot join, as with the other cluster capability flags.
+- `GET /api/v1/cluster` reports it under `cold_mark` (enabled, fenced, seeded, nodes still to confirm).
+
+Performance: one small Raft entry the first time a migration or restore writes a newer day for a measurement (at most one per measurement per day in steady state); one seed per cluster, in entries of up to 1,000 measurements; state of one integer per measurement. Queries are unchanged.
+
 ## New: cold tier files deleted outside Arc are reported ([#1551](https://github.com/Basekick-Labs/arc/issues/1551))
 
 A cold tier object deleted outside Arc, for example by a bucket lifecycle or expiry rule, used to show up only as a `Warn` line in each tier scan. Queries over that data still answer `200` with the rows that remain (this is unchanged, #1364), so nothing an operator monitors reported the gap.
