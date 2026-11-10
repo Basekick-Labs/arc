@@ -62,23 +62,24 @@ func zstdEncodeForTest(t *testing.T, b []byte) []byte {
 	return enc.EncodeAll(b, nil)
 }
 
-// Control: the frame does make this module's zstd decoder panic, so
-// TestDecompressZstdCraftedFrameIsAnError exercises the recover rather than
-// passing because the frame is rejected earlier. This fails, by design, once
-// klauspost/compress is upgraded past 1.20.1 (which fixed the bug): the
-// recover then needs an injected panic to stay tested.
-func TestZstdCraftedFramePanicsTheDecoder(t *testing.T) {
-	d, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
-	if err != nil {
-		t.Fatal(err)
+// A decoder panic is an error, and the decoder that panicked is not
+// returned to the pool. The crafted frame no longer panics since
+// klauspost/compress 1.20.2, so the panic is injected.
+func TestDecompressZstdRecoversADecoderPanic(t *testing.T) {
+	prev := zstdDecodeAll
+	t.Cleanup(func() { zstdDecodeAll = prev })
+	var panicked *zstd.Decoder
+	zstdDecodeAll = func(d *zstd.Decoder, data []byte) ([]byte, error) {
+		panicked = d
+		panic("injected")
 	}
-	panicked := func() (p bool) {
-		defer func() { p = recover() != nil }()
-		_, _ = d.DecodeAll(ghsaFpmhFrame, nil)
-		return false
-	}()
-	if !panicked {
-		t.Fatal("the crafted frame no longer panics this decoder: replace the frame with an injected panic")
+	const limit = 3 << 20 // a pool of its own
+	if _, err := decompressZstdPooled(ghsaFpmhFrame, limit); err == nil || !strings.Contains(err.Error(), "corrupt input") {
+		t.Fatalf("err = %v, want a corrupt-input error", err)
+	}
+	zstdDecodeAll = prev
+	if d, _ := zstdDecoderPool(limit).Get().(*zstd.Decoder); d != nil && d == panicked {
+		t.Fatal("the decoder that panicked went back to the pool")
 	}
 }
 

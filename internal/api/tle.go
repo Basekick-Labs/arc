@@ -395,6 +395,14 @@ const zstdMaxWindow = 32 << 20
 // <= 1.20.1 panics on a crafted frame (GHSA-fpmh-frq8-7rj8), and one request
 // crashed Arc. Here a panic is recovered and returned as a decode error, and
 // that decoder is dropped. DecodeAll is also faster than the stream was.
+// zstdDecodeAll is the decode decompressZstdPooled recovers around; a var so
+// a test can make it panic. klauspost/compress 1.20.2 fixed the crafted
+// frame that used to (GHSA-fpmh-frq8-7rj8), so no real input is known to
+// reach the recover any more.
+var zstdDecodeAll = func(d *zstd.Decoder, data []byte) ([]byte, error) {
+	return d.DecodeAll(data, nil)
+}
+
 func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 	if maxSize <= 0 {
 		maxSize = 100 * 1024 * 1024 // 100MB default
@@ -424,7 +432,7 @@ func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 		}
 	}()
 
-	out, err = decoder.DecodeAll(data, nil)
+	out, err = zstdDecodeAll(decoder, data)
 	// DecodeAll leaves the decoder reusable after an error (its block
 	// decoders go back in a defer), so it returns to the pool either way.
 	pool.Put(decoder)
