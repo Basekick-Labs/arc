@@ -19,9 +19,13 @@ import (
 type listErrMock struct {
 	*tierMock
 	listErr map[string]bool
+	// listCalls records every object (day-level) listing, failed or not;
+	// requested also holds the directory (hour-level) listings.
+	listCalls []string
 }
 
 func (m *listErrMock) List(ctx context.Context, prefix string) ([]string, error) {
+	m.listCalls = append(m.listCalls, prefix)
 	if m.listErr[prefix] {
 		m.requested = append(m.requested, prefix)
 		return nil, fmt.Errorf("injected object listing error for %s", prefix)
@@ -171,6 +175,10 @@ func sameSet(a, b []string) bool {
 
 // The day-level object listing can be the first to fail: the next day's is
 // then not issued either.
+//
+// Both days' object listings fail, so whichever day the pruner lists first
+// fails: the order it visits days in is not fixed, and an earlier version of
+// this test that failed only the 14th flaked whenever the 15th came first.
 func TestPruneTierPathsDetail_StopsAfterADayLevelFailure(t *testing.T) {
 	p := NewPartitionPruner(zerolog.Nop())
 	backend := &listErrMock{
@@ -178,20 +186,13 @@ func TestPruneTierPathsDetail_StopsAfterADayLevelFailure(t *testing.T) {
 			mockS3Backend: &mockS3Backend{existingDirs: map[string][]string{}},
 			files:         map[string][]string{},
 		},
-		listErr: map[string]bool{"db/cpu/2024/03/14/": true},
+		listErr: map[string]bool{"db/cpu/2024/03/14/": true, "db/cpu/2024/03/15/": true},
 	}
 	p.PruneTierPathsDetail(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu",
 		tierRange(t, "2024-03-14T22:00:00Z", "2024-03-15T01:00:00Z"), backend, false, true)
 
-	n := 0
-	for _, r := range backend.requested {
-		if r == "db/cpu/2024/03/15/" {
-			n++
-		}
-	}
-	// One for the hour listing of the 15th, none for its day-level listing.
-	if n != 1 {
-		t.Fatalf("db/cpu/2024/03/15/ listed %d times (%v), want only the hour listing", n, backend.requested)
+	if len(backend.listCalls) != 1 {
+		t.Fatalf("issued %d day-level listings %v, want one: none after the first failed", len(backend.listCalls), backend.listCalls)
 	}
 }
 
