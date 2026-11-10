@@ -254,6 +254,12 @@ func forwardableRoute(method, rawPath string) bool {
 	if p == "" || path.Clean(p) != p {
 		return false
 	}
+	// Fiber routes case-insensitively and answers HEAD with the GET handler,
+	// so the match does the same.
+	p = strings.ToLower(p)
+	if method == fiber.MethodHead {
+		method = fiber.MethodGet
+	}
 	if forwardedRoutes[method+" "+p] {
 		return true
 	}

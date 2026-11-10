@@ -103,10 +103,12 @@ the queries it forwarded:
 - `DELETE /api/v1/queries/:id` cancels the forward. That stops the query on the
   answering node when it cancels queries on client disconnect
   (`query.cancel_on_client_disconnect`, on by default).
-- The entry's ID is the compactor's, not the answering node's.
+- The entry's ID is the compactor's. A forwarded response's `X-Arc-Query-ID`
+  header carries that ID, so it can be cancelled on the compactor. The
+  answering node's ID is in `X-Arc-Forwarded-Query-ID`.
 - History records whether the forward succeeded, not a row count.
 - A client that disconnects from a compactor now also cancels its forwarded
-  query, as it cancels a local one.
+  read, as it cancels a local one, with or without query management.
 
 `POST /api/v1/databases` (create) still runs on the compactor; it is a write.
 

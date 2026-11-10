@@ -2306,9 +2306,15 @@ func (h *QueryHandler) readForwardOpts(route func(context.Context, *http.Request
 // forwardedQueryDescription is the registry's description of a forwarded
 // query: its SQL when the body carries one, else the method and URI.
 func forwardedQueryDescription(c *fiber.Ctx) string {
-	var req QueryRequest
-	if err := json.Unmarshal(c.Body(), &req); err == nil && req.SQL != "" {
-		return req.SQL
+	// The raw body only: c.Body() would decompress an encoded body without
+	// the caps the answering node applies, which BuildHTTPRequest avoids
+	// for the forward itself (#1270). An encoded body is described by its
+	// method and URI.
+	if len(c.Request().Header.ContentEncoding()) == 0 {
+		var req QueryRequest
+		if err := json.Unmarshal(c.Request().Body(), &req); err == nil && req.SQL != "" {
+			return req.SQL
+		}
 	}
 	return c.Method() + " " + string(c.Request().RequestURI())
 }
@@ -2324,7 +2330,7 @@ func (h *QueryHandler) queryForwardHeaderBound() time.Duration {
 }
 
 // listingForwardTimeout bounds a forwarded listing as a local one is bounded.
-const listingForwardTimeout = 30 * time.Second
+var listingForwardTimeout = 30 * time.Second // a var so a test can shorten it
 
 // executeQuery handles POST /api/v1/query - returns JSON response
 func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {

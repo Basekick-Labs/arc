@@ -14,6 +14,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 )
@@ -138,8 +139,13 @@ func TestOnlyTheIntendedRoutesAreForwardable(t *testing.T) {
 			}
 		}
 		key := rt.Method + " " + rt.Path
-		if got := forwardableRoute(rt.Method, concrete); got != want[key] {
-			t.Errorf("%s: forwardable = %v, want %v", key, got, want[key])
+		// HEAD is served by the GET handler, so it follows its GET route.
+		expect := want[key]
+		if rt.Method == "HEAD" {
+			expect = want["GET "+rt.Path]
+		}
+		if got := forwardableRoute(rt.Method, concrete); got != expect {
+			t.Errorf("%s: forwardable = %v, want %v", key, got, expect)
 		}
 		if want[key] {
 			seen++
@@ -196,4 +202,94 @@ func TestForwardedQueryIsListedAndCancellable(t *testing.T) {
 		t.Fatal("the forwarded request did not end after cancel")
 	}
 	require.Empty(t, reg.GetActive())
+}
+
+// A read that falls back to this node (no capable peer) leaves no phantom
+// "running" entry: the forward's registration is discarded. (/query itself
+// is not capability-gated, so an estimate exercises the fallback.)
+func TestForwardFallbackLeavesNoPhantomEntry(t *testing.T) {
+	r := newDoorRig(t)
+	reg := queryregistry.NewRegistry(nil, zerolog.Nop())
+	r.qh.queryRegistry = reg
+	srv := httptest.NewServer(&readPeer{})
+	defer srv.Close()
+	r.qh.SetRouter(readRouter(t, srv.URL, false, true))
+
+	_, body := r.read(t, "POST", "/api/v1/query/estimate", `{"sql":"SELECT 7"}`)
+	require.NotContains(t, body, `"from":"peer"`)
+	require.Empty(t, reg.GetActive(), "a discarded forward registration is still active")
+	for _, q := range reg.GetHistory(10) {
+		require.Empty(t, q.ForwardedTo, "a local answer recorded as forwarded: %+v", q)
+	}
+}
+
+// The X-Arc-Query-ID a client gets from a forwarded query is this node's, so
+// DELETE /api/v1/queries/<it> here finds it; the answering node's ID goes in
+// X-Arc-Forwarded-Query-ID.
+func TestForwardedQueryCarriesThisNodesQueryID(t *testing.T) {
+	r := newDoorRig(t)
+	reg := queryregistry.NewRegistry(nil, zerolog.Nop())
+	r.qh.queryRegistry = reg
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_, _ = io.ReadAll(req.Body)
+		w.Header().Set("X-Arc-Query-ID", "peer-id-123")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+	r.qh.SetRouter(readRouter(t, srv.URL, true, true))
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"sql":"SELECT 9"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+r.tokens["coarse-no-team"])
+	resp, err := r.app.Test(req, -1)
+	require.NoError(t, err)
+	hist := reg.GetHistory(1)
+	require.Len(t, hist, 1)
+	require.Equal(t, hist[0].ID, resp.Header.Get("X-Arc-Query-ID"))
+	require.Equal(t, "peer-id-123", resp.Header.Get("X-Arc-Forwarded-Query-ID"))
+}
+
+// A forwarded listing is bounded as a local one is: a hung peer gets 504.
+func TestForwardedListingIsBounded(t *testing.T) {
+	r := newDoorRig(t)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer srv.Close()
+	defer close(release)
+	r.qh.SetRouter(readRouter(t, srv.URL, true, true))
+	old := listingForwardTimeout
+	listingForwardTimeout = 200 * time.Millisecond
+	defer func() { listingForwardTimeout = old }()
+
+	start := time.Now()
+	status, _ := r.read(t, "GET", "/api/v1/measurements", "")
+	require.Equal(t, http.StatusGatewayTimeout, status)
+	require.Less(t, time.Since(start), 5*time.Second)
+}
+
+// The header timer answers 504 (a timeout), not the 502 a cancelled context
+// would map to.
+func TestForwardedQueryHeaderTimeoutIs504(t *testing.T) {
+	r := newDoorRig(t)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_, _ = io.ReadAll(req.Body)
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+	r.qh.SetRouter(readRouter(t, srv.URL, true, true))
+	r.qh.queryTimeout = 100 * time.Millisecond
+	// queryForwardHeaderBound adds 30 s of slack: estimate's bound is then
+	// too long for a test, so drive the timer through the Arrow-independent
+	// helper with a zero-slack bound.
+	o := r.qh.readForwardOpts(r.qh.router.RouteReadQuery, "")
+	o.headerBound = 150 * time.Millisecond
+	r.app.Get("/zz-test-forward", func(c *fiber.Ctx) error {
+		_, err := forwardRead(c, r.qh.router, o)
+		return err
+	})
+	status, body := r.read(t, "GET", "/zz-test-forward", "")
+	require.Equal(t, http.StatusGatewayTimeout, status, body)
 }

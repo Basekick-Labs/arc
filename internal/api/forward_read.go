@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -101,9 +102,12 @@ func forwardRead(c *fiber.Ctx, router *cluster.Router, o forwardReadOpts) (handl
 		queryID, ctx = o.registry.Register(ctx, o.description, tokenID, tokenName, c.IP())
 		id := queryID
 		ctx = cluster.WithForwardTargetHook(ctx, func(node string) { o.registry.SetForwardedTo(id, node) })
-		if o.watch != nil {
-			o.watch(ctx, c, queryID, cancel)
-		}
+	}
+	// Watched whether or not the forward is registered: a client leaving
+	// ends its forward as it ends a local query, licensed query management
+	// or not.
+	if o.watch != nil {
+		o.watch(ctx, c, queryID, cancel)
 	}
 	var headerTimer *time.Timer
 	if o.headerBound > 0 {
@@ -111,8 +115,12 @@ func forwardRead(c *fiber.Ctx, router *cluster.Router, o forwardReadOpts) (handl
 	}
 
 	resp, err := o.route(ctx, httpReq.WithContext(ctx))
-	if headerTimer != nil && !headerTimer.Stop() && err == nil {
-		_ = resp.Body.Close()
+	if headerTimer != nil && !headerTimer.Stop() {
+		// The timer fired: whatever the router saw (a cancelled context, or
+		// headers that arrived just after), this is a timeout.
+		if err == nil {
+			_ = resp.Body.Close()
+		}
 		err = context.DeadlineExceeded
 	}
 	switch {
@@ -125,9 +133,16 @@ func forwardRead(c *fiber.Ctx, router *cluster.Router, o forwardReadOpts) (handl
 		if queryID != "" {
 			o.registry.Discard(queryID)
 		}
-		o.logger.Warn().Str("path", c.Path()).
-			Msg("No peer accepts this forwarded read (rolling upgrade); answering it on this node")
+		warnNoCapablePeer(o.logger)
 		return false, nil
+	case errors.Is(err, context.Canceled):
+		// Cancelled: the client left, or DELETE /api/v1/queries/:id. Not a
+		// forwarding failure; the registry already records the cancel.
+		o.logger.Info().Str("path", c.Path()).Str("query_id", queryID).Msg("Forwarded request cancelled")
+		return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Query cancelled",
+		})
 	case err != nil:
 		if queryID != "" {
 			o.registry.Fail(queryID, "forward failed")
@@ -146,7 +161,16 @@ func forwardRead(c *fiber.Ctx, router *cluster.Router, o forwardReadOpts) (handl
 	}
 
 	status := resp.StatusCode
+	peerQueryID := resp.Header.Get("X-Arc-Query-ID")
 	err = CopyResponse(c, resp)
+	if queryID != "" {
+		// The ID a client can cancel here is this node's; the answering
+		// node's goes alongside.
+		c.Set("X-Arc-Query-ID", queryID)
+		if peerQueryID != "" {
+			c.Set("X-Arc-Forwarded-Query-ID", peerQueryID)
+		}
+	}
 	if queryID != "" {
 		switch {
 		case err != nil:
@@ -159,4 +183,21 @@ func forwardRead(c *fiber.Ctx, router *cluster.Router, o forwardReadOpts) (handl
 		}
 	}
 	return true, err
+}
+
+// noCapablePeerLogEvery limits the rolling-upgrade warning: UIs poll the
+// listings, and every forwarded read would otherwise log it.
+const noCapablePeerLogEvery = time.Minute
+
+var lastNoCapablePeerLog atomic.Int64
+
+// warnNoCapablePeer logs, at most once a minute, that reads are answered
+// locally because no peer accepts them yet.
+func warnNoCapablePeer(logger zerolog.Logger) {
+	now := time.Now().UnixNano()
+	last := lastNoCapablePeerLog.Load()
+	if now-last < int64(noCapablePeerLogEvery) || !lastNoCapablePeerLog.CompareAndSwap(last, now) {
+		return
+	}
+	logger.Warn().Msg("No peer accepts forwarded reads yet (rolling upgrade); this node answers them itself (logged at most once a minute)")
 }

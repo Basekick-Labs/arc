@@ -98,28 +98,37 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 		queryID, ctx = h.queryRegistry.Register(ctx, forwardedQueryDescription(c), tokenID, tokenName, c.IP())
 		id := queryID
 		ctx = cluster.WithForwardTargetHook(ctx, func(node string) { h.queryRegistry.SetForwardedTo(id, node) })
-		h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathArrowIPC)
 	}
+	// Watched whether or not the forward is registered (licensed query
+	// management): a client leaving ends its forward as it ends a local query.
+	h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathArrowIPC)
+	// finish records the forward's outcome once, whichever path ends it
+	// (including a relay panic).
+	var finishOnce sync.Once
 	finish := func(failure string) {
 		if queryID == "" {
 			return
 		}
-		if failure != "" {
-			h.queryRegistry.Fail(queryID, failure)
-		} else {
-			h.queryRegistry.Complete(queryID, 0)
-		}
+		finishOnce.Do(func() {
+			if failure != "" {
+				h.queryRegistry.Fail(queryID, failure)
+			} else {
+				h.queryRegistry.Complete(queryID, 0)
+			}
+		})
 	}
 	var headerTimer *time.Timer
 	if h.queryTimeout > 0 {
 		headerTimer = time.AfterFunc(h.queryTimeout+arrowForwardSlack, cancel)
 	}
 	resp, err := h.router.RouteReadQuery(ctx, httpReq.WithContext(ctx))
-	if headerTimer != nil && !headerTimer.Stop() && err == nil {
-		// The timer fired after the headers arrived: ctx is cancelled, so the
-		// body would fail on its first read. Answer now, before a 200 is
-		// committed.
-		_ = resp.Body.Close()
+	if headerTimer != nil && !headerTimer.Stop() {
+		// The timer fired: whatever the router saw (a cancelled context, or
+		// headers that arrived just after), this is a timeout. Answer now,
+		// before a 200 is committed.
+		if err == nil {
+			_ = resp.Body.Close()
+		}
 		cancel()
 		m.IncQueryErrors()
 		finish("timed out waiting for the forwarded query to start")
@@ -140,8 +149,18 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 		if queryID != "" {
 			h.queryRegistry.Discard(queryID)
 		}
-		h.logger.Warn().Msg("No peer accepts a forwarded Arrow query (rolling upgrade); answering it on this node")
+		warnNoCapablePeer(h.logger)
 		return false, nil
+	}
+	if errors.Is(err, context.Canceled) {
+		// The client left, or DELETE /api/v1/queries/:id: not a forwarding
+		// failure; the registry already records the cancel.
+		cancel()
+		h.logger.Info().Str("query_id", queryID).Msg("Forwarded Arrow query cancelled")
+		return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Query cancelled",
+		})
 	}
 	if err != nil {
 		cancel()
@@ -160,6 +179,14 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 
 	c.Status(resp.StatusCode)
 	copyForwardedHeaders(c, resp)
+	if queryID != "" {
+		// The ID a client can cancel here is this node's; the answering
+		// node's goes alongside.
+		if peer := resp.Header.Get("X-Arc-Query-ID"); peer != "" {
+			c.Set("X-Arc-Forwarded-Query-ID", peer)
+		}
+		c.Set("X-Arc-Query-ID", queryID)
+	}
 	fctx := c.Context()
 	// Declared before the body, as executeQueryArrow does; the upstream's
 	// own Trailer header is hop-by-hop and not copied.
@@ -193,6 +220,7 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 		closeUpstream()
 	}, trailers, abort, "forwarded_arrow_ipc", func() {
 		abort.set(errForwardedArrowPanicked)
+		finish("forwarded stream relay panicked")
 	}, func(w *bufio.Writer) {
 		defer closeUpstream()
 		if err := relayArrowBody(w, body); err != nil {

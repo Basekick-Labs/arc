@@ -69,6 +69,9 @@ func TestForwardIdentityVerifier_OnlyOnForwardedRoutes(t *testing.T) {
 		{"GET", "/api/v1/databases/../measurements", "refused", true},
 		{"GET", "/api/v1//measurements", "refused", true},
 		{"GET", "/api/v1/queries/active", "refused", true},
+		// Fiber routes case-insensitively and answers HEAD with the GET
+		// handler: the match follows it.
+		{"GET", "/API/v1/Databases/db", "accepted", true},
 		{"POST", "/api/v1/auth/tokens", "refused", true},
 		{"DELETE", "/api/v1/databases/x", "refused", true},
 		{"GET", "/api/v1/query", "refused", true},
