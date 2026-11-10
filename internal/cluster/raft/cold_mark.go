@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Cold mark (#1552).
@@ -44,10 +45,28 @@ import (
 //     set BackendConflict, and the mark is never trusted.
 //
 // Add and Seed apply in any state: both only raise marks.
+//
+// Liveness (rolled-back members): a node on an older build is refused at
+// join but can stay in the Raft configuration and the node table, and such a
+// node writes cold objects without raising the mark. Every node on this build
+// therefore proposes Alive every ColdMarkAliveEvery once the mark is enabled,
+// and the mark is trusted (ColdMarkTrustedFor) only while every node in the
+// table and every Raft server has an Alive no older than ColdMarkAliveMaxAge.
+// A member that stops proposing it, whatever the reason, makes the mark
+// untrusted; a removed node stops counting. Alive carries the proposer's
+// time: Apply never reads the clock.
 
 // CapabilityColdMark is advertised at join by every build that maintains the
 // cold mark.
 const CapabilityColdMark = "cold_mark_v1"
+
+// Liveness timing: each node proposes Alive every ColdMarkAliveEvery; the
+// mark is trusted while every member's last Alive is within
+// ColdMarkAliveMaxAge.
+const (
+	ColdMarkAliveEvery  = 5 * time.Minute
+	ColdMarkAliveMaxAge = 15 * time.Minute
+)
 
 // MarkUnknownDay marks a scope whose cold objects' days are not all known.
 const MarkUnknownDay = int32(math.MaxInt32)
@@ -77,6 +96,13 @@ type ColdMarkAckPayload struct {
 	NodeID string `json:"node_id"`
 }
 
+// ColdMarkAlivePayload is a node on a build that maintains the mark saying
+// so, at At (the proposer's clock).
+type ColdMarkAlivePayload struct {
+	NodeID string    `json:"node_id"`
+	At     time.Time `json:"at"`
+}
+
 // ColdMarkSeedPayload folds a cold listing into the marks. Final sets Seeded,
 // with Backend the identity of the cold store listed.
 type ColdMarkSeedPayload struct {
@@ -95,6 +121,8 @@ type coldMarkState struct {
 	Backend         string           `json:"backend,omitempty"`
 	BackendConflict bool             `json:"backend_conflict,omitempty"`
 	Marks           map[string]int32 `json:"marks,omitempty"`
+	// Alive: each node's latest Alive time.
+	Alive map[string]time.Time `json:"alive,omitempty"`
 }
 
 // ColdMarkStatus is a copy of the flags, for status and the coordinator.
@@ -218,6 +246,80 @@ func (f *ClusterFSM) applyColdMarkAck(payload []byte) interface{} {
 	return nil
 }
 
+func (f *ClusterFSM) applyColdMarkAlive(payload []byte) interface{} {
+	var p ColdMarkAlivePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal cold mark alive payload: %w", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st := f.coldMarkLocked()
+	if !st.Enabled {
+		return errors.New("cold mark alive: not enabled")
+	}
+	if _, ok := f.nodes[p.NodeID]; !ok {
+		return fmt.Errorf("cold mark alive: unknown node %q", p.NodeID)
+	}
+	if p.At.IsZero() {
+		return errors.New("cold mark alive: no time")
+	}
+	if st.Alive == nil {
+		st.Alive = map[string]time.Time{}
+	}
+	if p.At.After(st.Alive[p.NodeID]) {
+		st.Alive[p.NodeID] = p.At.UTC()
+	}
+	return nil
+}
+
+// ColdMarkLastAlive returns nodeID's latest Alive time (zero if none).
+func (f *ClusterFSM) ColdMarkLastAlive(nodeID string) time.Time {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.coldMark == nil {
+		return time.Time{}
+	}
+	return f.coldMark.Alive[nodeID]
+}
+
+// ColdMarkTrustedFor reports whether readers may use the mark at now: enabled,
+// fenced, seeded from one cold store, and every node in the table and every
+// id in servers (the Raft configuration) has an Alive within maxAge of now.
+// why names the first reason it is not.
+func (f *ClusterFSM) ColdMarkTrustedFor(now time.Time, maxAge time.Duration, servers []string) (trusted bool, why string) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	st := f.coldMark
+	switch {
+	case st == nil || !st.Enabled:
+		return false, "the cold mark is not enabled"
+	case !st.Fenced:
+		return false, "the cold mark is not fenced yet"
+	case !st.Seeded:
+		return false, "the cold mark is not seeded yet"
+	case st.BackendConflict:
+		return false, "the cold mark was seeded from two different cold stores"
+	}
+	oldest := now.Add(-maxAge)
+	check := func(id string) string {
+		if at := st.Alive[id]; at.Before(oldest) {
+			return "node " + id + " has not confirmed it maintains the cold mark within " + maxAge.String()
+		}
+		return ""
+	}
+	ids := make([]string, 0, len(f.nodes))
+	for id := range f.nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range append(ids, servers...) {
+		if w := check(id); w != "" {
+			return false, w
+		}
+	}
+	return true, ""
+}
+
 // updateColdMarkFenceLocked latches Fenced once every AckWanted node still
 // in the node table acked.
 func (f *ClusterFSM) updateColdMarkFenceLocked() {
@@ -338,6 +440,10 @@ func (f *ClusterFSM) snapshotColdMarkLocked() *coldMarkState {
 	cp.Marks = make(map[string]int32, len(st.Marks))
 	for k, v := range st.Marks {
 		cp.Marks[k] = v
+	}
+	cp.Alive = make(map[string]time.Time, len(st.Alive))
+	for k, v := range st.Alive {
+		cp.Alive[k] = v
 	}
 	return &cp
 }

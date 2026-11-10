@@ -137,3 +137,32 @@ func TestSeedColdMarksNeedsABackend(t *testing.T) {
 		t.Fatalf("seed before the fence: %v", err)
 	}
 }
+
+// This node confirms it maintains the mark once enabled, at most every
+// ColdMarkAliveEvery.
+func TestColdMarkAliveIsProposedPeriodically(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	fsm := c.raftNode.FSM()
+	now := time.Now()
+	c.maybeColdMarkAlive(context.Background(), now)
+	if !fsm.ColdMarkLastAlive("writer-1").IsZero() {
+		t.Fatal("alive proposed before the mark is enabled")
+	}
+	c.maybeEnableColdMark()
+	waitFSM(t, coldMarkEnabled(c))
+	c.maybeColdMarkAlive(context.Background(), now)
+	waitFSM(t, func() bool { return fsm.ColdMarkLastAlive("writer-1").Equal(now.UTC()) })
+	c.maybeColdMarkAlive(context.Background(), now.Add(raft.ColdMarkAliveEvery-time.Second))
+	time.Sleep(100 * time.Millisecond)
+	if !fsm.ColdMarkLastAlive("writer-1").Equal(now.UTC()) {
+		t.Fatal("alive proposed again within the interval")
+	}
+	next := now.Add(raft.ColdMarkAliveEvery)
+	c.maybeColdMarkAlive(context.Background(), next)
+	waitFSM(t, func() bool { return fsm.ColdMarkLastAlive("writer-1").Equal(next.UTC()) })
+
+	// Not trusted: not seeded, and the other nodes never confirmed.
+	if ok, why := c.ColdMarkTrusted(next, raft.ColdMarkAliveMaxAge); ok || why == "" {
+		t.Fatalf("trusted: %v %q", ok, why)
+	}
+}

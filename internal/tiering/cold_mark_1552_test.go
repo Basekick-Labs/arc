@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // #1552: tiering raises the cluster's cold mark before every cold write and
@@ -176,5 +178,35 @@ func TestColdWriterInventory(t *testing.T) {
 		if _, ok := allowed[k]; !ok {
 			t.Errorf("new storage write %s: decide whether it can write to the cold tier and, if so, guard it with GuardColdWrite", k)
 		}
+	}
+}
+
+// fenceDuringListing flips the marker to fenced while the cold listing runs.
+type fenceDuringListing struct {
+	*listedColdObjects
+	fm *fakeColdMarker
+}
+
+func (l *fenceDuringListing) ListObjects(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	l.fm.fenced = true
+	return l.listedColdObjects.ListObjects(ctx, prefix)
+}
+
+// The seed decision is taken before the listing: a listing that began before
+// the fence may have missed a write the fence drained, so it must not seed.
+func TestColdSyncSeedDecisionPrecedesTheListing(t *testing.T) {
+	m, hot, cold, cleanup := setupIntegrationTest(t, true)
+	defer cleanup()
+	fm := &fakeColdMarker{fakeManifest: &fakeManifest{hot: hot, entries: map[string]int64{}}}
+	m.manifest = fm
+	m.coldBackend = &fenceDuringListing{
+		listedColdObjects: &listedColdObjects{mockBackend: cold, objects: coldObjects("db1/cpu/2024/03/15/cpu_a_daily.parquet")},
+		fm:                fm,
+	}
+	if _, err := m.syncColdTierMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fm.seededMarks != nil {
+		t.Fatal("seeded from a listing that started before the fence")
 	}
 }

@@ -3226,7 +3226,8 @@ func (c *Coordinator) Status() map[string]interface{} {
 		status["stream_claims"] = c.StreamClaimsStatus()
 		status["compaction_commit"] = c.CompactionCommitStatus()
 		cm, blocking := c.ColdMarkStatus()
-		status["cold_mark"] = map[string]any{"state": cm, "blocking_nodes": blocking}
+		trusted, why := c.ColdMarkTrusted(time.Now(), raft.ColdMarkAliveMaxAge)
+		status["cold_mark"] = map[string]any{"state": cm, "blocking_nodes": blocking, "trusted": trusted, "untrusted_reason": why}
 		status["cluster_policies"] = c.ClusterPoliciesStatus()
 	}
 	// The stale-local sweep's last pass (#1071), where it runs.

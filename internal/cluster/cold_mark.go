@@ -75,6 +75,7 @@ func (c *Coordinator) coldMarkLoop(ctx context.Context) {
 		case <-t.C:
 			c.maybeEnableColdMark()
 			c.maybeAckColdMark(ctx)
+			c.maybeColdMarkAlive(ctx, time.Now())
 		}
 	}
 }
@@ -124,6 +125,48 @@ func (c *Coordinator) maybeAckColdMark(ctx context.Context) {
 	if err := c.applyOrForward(ctx, &raft.Command{Type: raft.CommandColdMarkAck, Payload: raw}); err != nil {
 		c.logger.Warn().Err(err).Msg("Acking the cold mark failed; retrying")
 	}
+}
+
+// maybeColdMarkAlive proposes Alive for this node once the mark is enabled
+// and its last Alive in the FSM is raft.ColdMarkAliveEvery old. Read from the
+// FSM, not a local timer, so a restart resumes on time.
+func (c *Coordinator) maybeColdMarkAlive(ctx context.Context, now time.Time) {
+	if c.raftNode == nil {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil || !fsm.ColdMarkStatus().Enabled {
+		return
+	}
+	if last := fsm.ColdMarkLastAlive(c.localNode.ID); now.Sub(last) < raft.ColdMarkAliveEvery {
+		return
+	}
+	raw, err := json.Marshal(raft.ColdMarkAlivePayload{NodeID: c.localNode.ID, At: now.UTC()})
+	if err != nil {
+		return
+	}
+	if err := c.applyOrForward(ctx, &raft.Command{Type: raft.CommandColdMarkAlive, Payload: raw}); err != nil {
+		c.logger.Warn().Err(err).Msg("Confirming the cold mark failed; retrying")
+	}
+}
+
+// ColdMarkTrusted reports whether a reader may use the cold mark at now:
+// enabled, fenced, seeded from one cold store, and every node in the table
+// and every Raft server confirmed it maintains the mark within maxAge
+// (raft.ColdMarkAliveMaxAge in production).
+func (c *Coordinator) ColdMarkTrusted(now time.Time, maxAge time.Duration) (bool, string) {
+	if c == nil || c.raftNode == nil {
+		return false, "no cluster"
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false, "no cluster state"
+	}
+	servers, err := c.raftNode.ConfigurationServerIDs()
+	if err != nil {
+		return false, "raft configuration unavailable"
+	}
+	return fsm.ColdMarkTrustedFor(now, maxAge, servers)
 }
 
 // coldMarkRequired reports whether a cold write must raise the mark first:

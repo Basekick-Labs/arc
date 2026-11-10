@@ -704,17 +704,19 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// (any node whose tiering is not role-gated, readers included in a
 	// local-storage cluster without replication), so any known peer may
 	// forward them. Both only ever raise marks; a seed is refused by the FSM
-	// before the fence. An ack must name the requesting node, like the
-	// compaction pause ack: it is what the fence waits for. Enable is
+	// before the fence. An ack, and an alive, must name the requesting node,
+	// like the compaction pause ack: the fence and the trust check wait for
+	// them. Enable is
 	// leader-only and never accepted from a peer.
 	isColdMark := cmd.Type == clusterraft.CommandColdMarkAdd ||
 		cmd.Type == clusterraft.CommandColdMarkSeed
-	isColdMarkAck := cmd.Type == clusterraft.CommandColdMarkAck
+	isColdMarkAck := cmd.Type == clusterraft.CommandColdMarkAck || cmd.Type == clusterraft.CommandColdMarkAlive
 	if isColdMarkAck {
+		// Ack and Alive have the same node_id field.
 		var p clusterraft.ColdMarkAckPayload
 		if err := json.Unmarshal(cmd.Payload, &p); err != nil || p.NodeID != req.NodeID {
-			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: cold mark ack names another node")
-			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "cold mark ack must name the requesting node")
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: cold mark ack or alive names another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "cold mark ack or alive must name the requesting node")
 			return
 		}
 	}

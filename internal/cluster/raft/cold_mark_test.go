@@ -3,7 +3,10 @@ package raft
 import (
 	"bytes"
 	"io"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 // #1552: the cold mark only rises, is trusted only once enabled, fenced and
@@ -151,5 +154,87 @@ func TestColdMarkSnapshot(t *testing.T) {
 	}
 	if !f2.ColdMarkAcked("w1") {
 		t.Fatal("acks lost")
+	}
+}
+
+// trustedFSM is enabled, fenced and seeded, with no Alive yet.
+func trustedFSM(t *testing.T) *tkFSM {
+	t.Helper()
+	x := coldMarkFSM(t)
+	ackAll(x)
+	x.ok(CommandColdMarkSeed, ColdMarkSeedPayload{Final: true, Backend: "s3://b/"})
+	return x
+}
+
+func aliveAll(x *tkFSM, at time.Time, except ...string) {
+	for _, n := range coldMarkNodes {
+		if !slices.Contains(except, n) {
+			x.ok(CommandColdMarkAlive, ColdMarkAlivePayload{NodeID: n, At: at})
+		}
+	}
+}
+
+// Trusted only while every member's Alive is fresh; a member that stops
+// confirming makes it untrusted after maxAge; a removed one stops counting.
+func TestColdMarkTrustNeedsFreshAliveFromEveryMember(t *testing.T) {
+	x := trustedFSM(t)
+	now := t0.Add(time.Hour)
+	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil); ok || why == "" {
+		t.Fatal("trusted with no Alive at all")
+	}
+	aliveAll(x, now)
+	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil); !ok {
+		t.Fatalf("not trusted with every Alive fresh: %s", why)
+	}
+	// Exactly maxAge old is still fresh; one second more is not.
+	if ok, _ := x.f.ColdMarkTrustedFor(now.Add(ColdMarkAliveMaxAge), ColdMarkAliveMaxAge, nil); !ok {
+		t.Fatal("untrusted at exactly maxAge")
+	}
+	// r1 stops confirming (a rolled-back build): untrusted after maxAge.
+	later := now.Add(ColdMarkAliveMaxAge + time.Second)
+	aliveAll(x, later, "r1")
+	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, nil); ok || !strings.Contains(why, "r1") {
+		t.Fatalf("trusted with r1 silent past maxAge: %v %q", ok, why)
+	}
+	x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "r1"})
+	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, nil); !ok {
+		t.Fatalf("a removed node still blocks: %s", why)
+	}
+	// A Raft server outside the node table counts too.
+	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, []string{"w1", "raft-x"}); ok || !strings.Contains(why, "raft-x") {
+		t.Fatalf("trusted with a silent Raft server: %v %q", ok, why)
+	}
+	// An older Alive never moves a newer one back.
+	x.ok(CommandColdMarkAlive, ColdMarkAlivePayload{NodeID: "w1", At: now})
+	if got := x.f.ColdMarkLastAlive("w1"); !got.Equal(later) {
+		t.Fatalf("last alive %v, want %v", got, later)
+	}
+}
+
+func TestColdMarkAliveRefusals(t *testing.T) {
+	x := takeoverFSM(t)
+	x.refused(CommandColdMarkAlive, ColdMarkAlivePayload{NodeID: "w1", At: t0}) // not enabled
+	x.ok(CommandEnableColdMark, EnableColdMarkPayload{Nodes: coldMarkNodes})
+	x.refused(CommandColdMarkAlive, ColdMarkAlivePayload{NodeID: "ghost", At: t0})
+	x.refused(CommandColdMarkAlive, ColdMarkAlivePayload{NodeID: "w1"})
+}
+
+func TestColdMarkAliveSnapshot(t *testing.T) {
+	x := trustedFSM(t)
+	aliveAll(x, t0)
+	snap, err := x.f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := snap.Persist(&testSnapshotSink{Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	f2 := newTestFSM()
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if got := f2.ColdMarkLastAlive("r1"); !got.Equal(t0) {
+		t.Fatalf("restored alive %v, want %v", got, t0)
 	}
 }

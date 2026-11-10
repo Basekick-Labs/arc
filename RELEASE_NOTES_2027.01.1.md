@@ -282,9 +282,10 @@ The cluster now keeps, through Raft, a **cold mark** per database and measuremen
 - It never goes down. Retention, DELETE and policy changes leave it where it is.
 - Existing cold data is folded in from a complete cold listing, taken after every node has confirmed it has no unmarked cold write in flight.
 - It turns on by itself once every node runs this release. From then on a node on an older release cannot join, as with the other cluster capability flags.
-- `GET /api/v1/cluster` reports it under `cold_mark` (enabled, fenced, seeded, nodes still to confirm).
+- Every node confirms every 5 minutes that it maintains the mark. The mark counts as trusted only while every node and every Raft server has confirmed within the last 15 minutes, so a member that comes back on an older release, which would write to the cold tier without raising it, makes it untrusted until it is upgraded or removed.
+- `GET /api/v1/cluster` reports it under `cold_mark` (enabled, fenced, seeded, nodes still to confirm, trusted and why not).
 
-Performance: one small Raft entry the first time a migration or restore writes a newer day for a measurement (at most one per measurement per day in steady state); one seed per cluster, in entries of up to 1,000 measurements; state of one integer per measurement. Queries are unchanged.
+Performance: one small Raft entry the first time a migration or restore writes a newer day for a measurement (at most one per measurement per day in steady state); one small Raft entry per node every 5 minutes for the liveness confirmation; one seed per cluster, in entries of up to 1,000 measurements; state of one integer per measurement and one timestamp per node. Queries are unchanged.
 
 ## New: cold tier files deleted outside Arc are reported ([#1551](https://github.com/Basekick-Labs/arc/issues/1551))
 
