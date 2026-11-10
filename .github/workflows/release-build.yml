@@ -1010,8 +1010,52 @@ jobs:
           # Copy to current directory
           cp ~/rpmbuild/RPMS/${ARCH}/${PKG_NAME}-${VERSION}-1.*.rpm .
 
-          # Create checksum
-          sha256sum ${PKG_NAME}-${VERSION}-1.*.rpm > ${PKG_NAME}-${VERSION}-1.${ARCH}.rpm.sha256
+      # Sign the RPM. rpm 6.1 (Fedora 45) refuses an unsigned package by
+      # default (%_pkgverify_level all), and every Arc RPM through 26.09.3 was
+      # unsigned. The key is a Basekick Labs OpenPGP key held in the
+      # RPM_SIGNING_KEY secret (armored, passphrase in RPM_SIGNING_PASSPHRASE);
+      # its public half is deploy/packaging/RPM-GPG-KEY-basekick, which users
+      # import and which the check below verifies against, so a secret that
+      # does not match the published key fails the release. A missing secret
+      # fails it too: an unsigned RPM must not ship by accident.
+      - name: Sign RPM package
+        env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+          RPM_SIGNING_PASSPHRASE: ${{ secrets.RPM_SIGNING_PASSPHRASE }}
+        run: |
+          if [ -z "${RPM_SIGNING_KEY}" ]; then
+            echo "::error::RPM_SIGNING_KEY is not set; refusing to publish an unsigned RPM"
+            exit 1
+          fi
+          export GNUPGHOME="${RUNNER_TEMP}/rpm-gnupg"
+          mkdir -p "${GNUPGHOME}" && chmod 700 "${GNUPGHOME}"
+          printf '%s\n' "${RPM_SIGNING_KEY}" | gpg --batch --import
+          FPR=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+          printf '%s' "${RPM_SIGNING_PASSPHRASE}" > "${GNUPGHOME}/passphrase"
+          cat > ~/.rpmmacros << MACROS
+          %_gpg_name ${FPR}
+          %__gpg /usr/bin/gpg
+          %_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback --passphrase-file ${GNUPGHOME}/passphrase
+          MACROS
+          rpmsign --addsign ./*.rpm
+
+          # Verify against the published public key, in a throwaway rpm db.
+          DB=$(mktemp -d)
+          rpm --dbpath "${DB}" --initdb
+          rpm --dbpath "${DB}" --import deploy/packaging/RPM-GPG-KEY-basekick
+          for f in ./*.rpm; do
+            rpm --dbpath "${DB}" -K "$f" | tee /dev/stderr | grep -q "digests signatures OK" ||
+              { echo "::error::$f is not signed by deploy/packaging/RPM-GPG-KEY-basekick"; exit 1; }
+          done
+          rm -rf "${GNUPGHOME}"
+
+          # Checksums after signing: signing rewrites the file.
+          for f in ./*.rpm; do sha256sum "$(basename "$f")" > "$(basename "$f").sha256"; done
+
+          # The public key ships with the release, once (from one leg).
+          if [ "${{ matrix.arch }}" = "x86_64" ] && [ "${{ matrix.variant }}" = "standard" ]; then
+            cp deploy/packaging/RPM-GPG-KEY-basekick .
+          fi
 
       # The oldest supported RPM systems (glibc 2.34): 26.09.3's RPM required
       # glibc 2.38 and dnf refused it on RHEL 9 and Amazon Linux 2023 (#1579).
@@ -1019,9 +1063,16 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           RPM=$(ls ./*.x86_64.rpm)
-          for IMAGE in rockylinux:9 amazonlinux:2023; do
-            docker run --rm -v "$PWD:/pkg:ro" -e ARC_TELEMETRY_ENABLED=false "$IMAGE" bash -c '
-              dnf install -y -q /pkg/'"$(basename "$RPM")"' || exit 1
+          # fedora:latest is rpm 6.1+, which refuses an unsigned or
+          # unverifiable package: plain rpm -i there proves the signature.
+          for IMAGE in rockylinux:9 amazonlinux:2023 fedora:latest; do
+            docker run --rm -v "$PWD:/pkg:ro" -v "$PWD/deploy/packaging:/key:ro" -e ARC_TELEMETRY_ENABLED=false "$IMAGE" bash -c '
+              rpm --import /key/RPM-GPG-KEY-basekick || exit 1
+              if [ "$(rpm --eval %_pkgverify_level)" = all ]; then
+                dnf install -y -q shadow-utils >/dev/null && rpm -i /pkg/'"$(basename "$RPM")"' || exit 1
+              else
+                dnf install -y -q /pkg/'"$(basename "$RPM")"' || exit 1
+              fi
               timeout 8 /usr/bin/arc > /tmp/arc.log 2>&1
               cat /tmp/arc.log | head -5
               grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
@@ -1036,6 +1087,8 @@ jobs:
           path: |
             *.rpm
             *.rpm.sha256
+            RPM-GPG-KEY-basekick
+          if-no-files-found: error
           retention-days: 7
 
   # Build Arch Linux packages (pacman .pkg.tar.zst) — covers Arch and
@@ -1822,9 +1875,10 @@ jobs:
           ### RHEL/Fedora/Rocky (x86_64, aarch64)
 
           ```bash
-          # Download and install
+          # Trust the Basekick Labs package key, then download and install
+          sudo rpm --import https://github.com/basekick-labs/arc/releases/download/v${{ needs.prepare.outputs.version }}/RPM-GPG-KEY-basekick
           wget https://github.com/basekick-labs/arc/releases/download/v${{ needs.prepare.outputs.version }}/arc-${{ needs.prepare.outputs.version }}-1.x86_64.rpm
-          sudo rpm -i arc-${{ needs.prepare.outputs.version }}-1.x86_64.rpm
+          sudo dnf install -y ./arc-${{ needs.prepare.outputs.version }}-1.x86_64.rpm
 
           # Start and enable
           sudo systemctl enable arc
@@ -1902,6 +1956,7 @@ jobs:
             release-artifacts/**/*.deb.sha256
             release-artifacts/**/*.rpm
             release-artifacts/**/*.rpm.sha256
+            release-artifacts/**/RPM-GPG-KEY-basekick
             release-artifacts/**/*.pkg.tar.zst
             release-artifacts/**/*.pkg.tar.zst.sha256
             release-artifacts/**/*.spdx.json
