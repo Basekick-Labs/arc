@@ -28,6 +28,13 @@ const CapabilityForwardIdentity = "forward_identity_v1"
 // never sends one to a reader that would refuse the forwarded identity.
 const CapabilityForwardReadQueries = "forward_read_queries_v1"
 
+// CapabilityForwardDatabaseCreate is advertised by builds that accept
+// POST /api/v1/databases forwarded from a node that does not ingest (a
+// reader or compactor). Router.RouteDatabaseCreate forwards it only to a
+// writer that advertises it; otherwise the database is created locally, as
+// older builds did.
+const CapabilityForwardDatabaseCreate = "forward_database_create_v1"
+
 type forwardTokenKey struct{}
 
 // ForwardToken is the token the forwarding node verified for a request: its
@@ -177,6 +184,21 @@ func (c *Coordinator) peerReadQueries(nodeID string) bool {
 	}
 	n, ok := fsm.GetNode(nodeID)
 	return ok && hasCapability(n.Capabilities, CapabilityForwardReadQueries)
+}
+
+// peerDatabaseCreate reports whether a peer advertises
+// CapabilityForwardDatabaseCreate. A peer this node has no record of is not
+// assumed capable: the fallback, creating locally, is what older builds do.
+func (c *Coordinator) peerDatabaseCreate(nodeID string) bool {
+	if c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	n, ok := fsm.GetNode(nodeID)
+	return ok && hasCapability(n.Capabilities, CapabilityForwardDatabaseCreate)
 }
 
 // ForwardIdentityHeaderValues returns every value of a request header.

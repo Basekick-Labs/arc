@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -43,11 +44,13 @@ type DatabasesHandler struct {
 	flusher DeleteFlusher
 	pending DatabasePendingRegistrations
 	// router forwards the listings from a node that cannot serve queries (a
-	// compactor) to one that can; nil outside a cluster.
+	// compactor) to one that can, and a create from a node that does not
+	// ingest to the writer; nil outside a cluster.
 	router *cluster.Router
 }
 
-// SetRouter installs the cluster router the listings forward through.
+// SetRouter installs the cluster router the listings and creates forward
+// through.
 func (h *DatabasesHandler) SetRouter(r *cluster.Router) { h.router = r }
 
 // forwardListing forwards a listing from a node that cannot serve queries;
@@ -361,6 +364,13 @@ func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
 
 // handleCreate handles POST /api/v1/databases
 func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
+	// A node that does not ingest (a reader or compactor) sends the create to
+	// the writer, where the database's writes land. Before the body is read,
+	// as every forwarded write: the writer validates it.
+	if handled, err := h.forwardCreate(c); handled {
+		return err
+	}
+
 	var req CreateDatabaseRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -428,6 +438,74 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 		MeasurementCount: 0,
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// forwardCreate forwards a create to the writer when this node does not
+// ingest. handled=false: create locally — no cluster, a node that ingests,
+// or a writer too old to accept it (cluster.ErrNoCapablePeer).
+func (h *DatabasesHandler) forwardCreate(c *fiber.Ctx) (bool, error) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		return true, RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		req, err := BuildHTTPRequest(c)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to build database create request for forwarding")
+			return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare request for forwarding",
+			})
+		}
+		resp, err := h.router.RouteDatabaseCreate(c.Context(), req)
+		if errors.Is(err, cluster.ErrLocalNodeCanHandle) {
+			return false, nil
+		}
+		if errors.Is(err, cluster.ErrNoCapablePeer) {
+			warnCreateNoCapableWriter(h.logger)
+			return false, nil
+		}
+		if err != nil {
+			return true, h.respondCreateForwardError(c, err)
+		}
+		return true, CopyResponse(c, resp)
+	}
+	return false, nil
+}
+
+// respondCreateForwardError answers a forwarded create that failed. The
+// statuses are a forwarded write's (respondWriteForwardError), the wording a
+// create's, and without the ingest-fence header: this is not an ingest
+// refusal.
+func (h *DatabasesHandler) respondCreateForwardError(c *fiber.Ctx, err error) error {
+	switch {
+	case errors.Is(err, cluster.ErrWriteForwardUnavailable):
+		h.logger.Warn().Err(err).Msg("Database create could not be forwarded to the writer")
+		c.Set(fiber.HeaderRetryAfter, "5")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Database not created: the writer could not be reached; retry",
+		})
+	case errors.Is(err, cluster.ErrWriteForwardAmbiguous):
+		h.logger.Warn().Err(err).Msg("Database create forwarded to the writer got no answer")
+		return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
+			"error": "Database create forwarded to the writer got no answer; it may have been created (a retry answers 409 if so)",
+		})
+	case errors.Is(err, cluster.ErrNoWriterAvailable):
+	default:
+		h.logger.Error().Err(err).Msg("Failed to route database create request")
+	}
+	return HandleRoutingError(c, err)
+}
+
+var lastCreateNoCapableLog atomic.Int64
+
+// warnCreateNoCapableWriter logs, at most once a minute, that creates are
+// made locally because the writer does not accept them forwarded yet.
+func warnCreateNoCapableWriter(logger zerolog.Logger) {
+	now := time.Now().UnixNano()
+	last := lastCreateNoCapableLog.Load()
+	if now-last < int64(noCapablePeerLogEvery) || !lastCreateNoCapableLog.CompareAndSwap(last, now) {
+		return
+	}
+	logger.Warn().Msg("The writer does not accept forwarded database creates yet (rolling upgrade); this node creates them itself (logged at most once a minute)")
 }
 
 // handleGet handles GET /api/v1/databases/:name
