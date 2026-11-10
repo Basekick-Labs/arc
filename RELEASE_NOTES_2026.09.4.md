@@ -66,6 +66,20 @@ declares `Requires(pre): shadow-utils`. Each release now installs and starts
 its packages on Debian 12, Ubuntu 22.04, Rocky 9 and Amazon Linux 2023 before
 publishing.
 
+## Changed: continuous queries are enabled in the packaged configuration
+
+The `arc.toml` shipped in the `.deb`, RPM, Arch package and Docker image set
+`[continuous_query] enabled = false`, unlike the code default and the
+documentation. On a fresh package install, every continuous-query API call
+answered 404 and every `arcli cq` command failed with "continuous queries are
+disabled on this server". It is now `enabled = true`. No continuous query runs
+until one is created.
+
+The 26.09.x packages replace `/etc/arc/arc.toml` on upgrade, so an upgrade to
+26.09.4 enables continuous queries unless the file is edited back. To keep them
+off, set `[continuous_query] enabled = false` or
+`ARC_CONTINUOUS_QUERY_ENABLED=false`.
+
 ## Security: Go 1.26.10 and dependency updates
 
 - **A crafted zstd request body no longer crashes Arc.**
