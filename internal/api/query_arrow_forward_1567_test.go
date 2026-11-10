@@ -219,7 +219,8 @@ func TestForwardedArrowQueryHungPeerIsBounded(t *testing.T) {
 	start := time.Now()
 	resp := r.arrowQuery(t)
 	_, _ = io.ReadAll(resp.Body)
-	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	// A timeout, not a routing failure.
+	require.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
 	require.Less(t, time.Since(start), 5*time.Second)
 }
 
