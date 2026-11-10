@@ -37,6 +37,11 @@ func setupTestRBACManager(t *testing.T) (*RBACManager, *AuthManager, func()) {
 	})
 
 	cleanup := func() {
+		// Stop the cache-cleanup goroutine NewRBACManager starts. Left
+		// running past its test, it calls time.Now on every tick and races
+		// TestOSS_RBACWrites_StampUTC, which swaps time.Local (seen under
+		// -race in CI once more tests used this helper).
+		rm.Close()
 		am.Close()
 		os.RemoveAll(tmpDir)
 	}
