@@ -247,7 +247,7 @@ jobs:
             docker run --rm -v "$PWD:/b:ro" -e ARC_TELEMETRY_ENABLED=false "$IMAGE" bash -c '
               cd /tmp && timeout 8 /b/arc > /tmp/arc.log 2>&1
               head -3 /tmp/arc.log
-              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "GLIBC\|not found" /tmp/arc.log
+              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
             ' || { echo "::error::arc does not start on ${IMAGE}"; exit 1; }
             echo "starts on ${IMAGE}"
           done

@@ -836,7 +836,7 @@ jobs:
               dpkg -i /pkg/'"$(basename "$DEB")"' || exit 1
               timeout 8 /usr/bin/arc > /tmp/arc.log 2>&1
               cat /tmp/arc.log | head -5
-              grep -q "Starting Arc" /tmp/arc.log && ! grep -q GLIBC /tmp/arc.log
+              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
             ' || { echo "::error::the .deb does not install and start on ${IMAGE}"; exit 1; }
             echo "✅ starts on ${IMAGE}"
           done
@@ -933,6 +933,9 @@ jobs:
           URL:            https://github.com/basekick-labs/arc
           Source0:        ${PKG_NAME}-${VERSION}.tar.gz
           Source1:        arc.service
+          # %pre runs useradd: minimal images (amazonlinux:2023) lack it, and a
+          # failing %pre aborts the install.
+          Requires(pre):  shadow-utils
 
           %description
           Arc is a high-performance time-series database built on DuckDB,
@@ -1021,7 +1024,7 @@ jobs:
               dnf install -y -q /pkg/'"$(basename "$RPM")"' || exit 1
               timeout 8 /usr/bin/arc > /tmp/arc.log 2>&1
               cat /tmp/arc.log | head -5
-              grep -q "Starting Arc" /tmp/arc.log && ! grep -q GLIBC /tmp/arc.log
+              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
             ' || { echo "::error::the RPM does not install and start on ${IMAGE}"; exit 1; }
             echo "✅ starts on ${IMAGE}"
           done

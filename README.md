@@ -178,7 +178,7 @@ The MessagePack endpoint is **stable** as of 26.09.1: its response shape and typ
 
 ## Single binary. Zero dependencies.
 
-Arc deploys as one self-contained executable: DuckDB and its dependencies are linked in, and on Linux it needs only the system C library (glibc 2.34 or newer). No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
+Arc deploys as one self-contained executable: DuckDB and its dependencies are linked in, and on Linux it needs only the system C library (glibc 2.34 or newer) and `libgcc_s`, which every distro ships. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
 
 - **Air-gap ready**: No external services required at runtime. No license server, no cloud dependency.
 - **Edge to cloud**: Deploy at the tactical edge, in a sovereign cloud, or on-premises.
