@@ -1128,18 +1128,13 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		}
 	}
 
-	// Decide whether to mark this output for time-only dedup (#521). This ONLY
-	// matters when there are no tag columns — with tags, arc:tags already drives
-	// dedup on (tags, time). The marker makes compaction dedup on time ALONE, so
-	// it is safe ONLY if time is a unique key in the output (one row per window).
-	//
-	// CRITICAL: we must NOT assume "no tag columns" means "one row per window". A
-	// grouped CQ (e.g. GROUP BY host) whose operator forgot to declare
-	// tag_columns produces MULTIPLE rows per timestamp with no tags — marking it
-	// for time-only dedup would make compaction keep one row per timestamp and
-	// silently DELETE every series but one. So we verify uniqueness against the
-	// actual output and, if time repeats without tags, skip the marker and warn
-	// the operator to declare tag_columns.
+	// Decide whether to mark this tagless output (arc:dedup_exact, #521) so
+	// compaction removes rows identical in every column (#1232). Exact-row
+	// dedup never deletes distinct rows, so the mark would be safe on any
+	// output; it is still limited to output whose time is unique, as before
+	// 26.09.4. Builds before 26.09.4 deduped marked output on time alone, and
+	// this keeps a file with several rows per time unmarked in case one of
+	// them compacts it after a rollback.
 	dedupTime := false
 	if len(tagColumns) == 0 {
 		if timeColumnIsUnique(columnarData["time"]) {
@@ -1148,7 +1143,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 			h.logger.Warn().
 				Str("query_name", cq.Name).
 				Msg("CQ output has multiple rows per timestamp but no tag_columns declared; " +
-					"skipping time-only dedup to avoid data loss. Declare tag_columns for the " +
+					"leaving it unmarked for compaction dedup. Declare tag_columns for the " +
 					"grouping dimensions to make this CQ idempotent (#521).")
 		}
 	}
@@ -1401,9 +1396,10 @@ const maxUniquenessCheckRows = 100_000
 
 // timeColumnIsUnique reports whether the time column has no duplicate values —
 // i.e. time alone is a unique key for the output. Used to decide whether a
-// tagless CQ is safe to mark for time-only dedup (#521): if two rows share a
-// timestamp with no tag to distinguish them, time-only dedup would lose one, so
-// the marker must be withheld. An empty/absent column is trivially unique.
+// tagless CQ is marked for compaction dedup (#521). Since 26.09.4 that dedup
+// keeps every distinct row (#1232); the check remains so that a build before
+// 26.09.4, which deduped marked output on time alone, never sees a marked file
+// with several rows per time. An empty/absent column is trivially unique.
 //
 // Fails closed: an output larger than maxUniquenessCheckRows returns false
 // (not dedup-safe) rather than building an unbounded map — a tagless CQ that big

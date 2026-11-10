@@ -471,7 +471,7 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 	}
 
 	// Create cache key (includes tag columns and the dedup-time marker to ensure
-	// metadata correctness — the flag changes the emitted arc:dedup_time key)
+	// metadata correctness — the flag changes the emitted arc:dedup_exact key)
 	cacheKey := fmt.Sprintf("%s:%v:%v:%v:%t", measurement, colNames, typeNames, tagColumns, dedupTime)
 
 	// Check LRU cache
@@ -565,12 +565,13 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 		metaValues = append(metaValues, strings.Join(sorted, ","))
 	}
 
-	// Mark data as safe to dedup on time even without tag columns. Written only
-	// by producers whose data model is one-row-per-(tags,time) — continuous
-	// queries (#521). Compaction reads this to dedup a no-group-by CQ's duplicate
-	// window emissions (PARTITION BY "time" alone). Raw ingest never sets it.
+	// Mark continuous-query output without tag columns (#521): it opts the
+	// file into exact-row dedup at compaction, keyed by time (#1232). Raw
+	// ingest never sets it. Not the older arc:dedup_time key: builds before
+	// #1232 read that as "dedup on time alone" and would delete rows from
+	// this output if a node were rolled back.
 	if dedupTime {
-		metaKeys = append(metaKeys, "arc:dedup_time")
+		metaKeys = append(metaKeys, "arc:dedup_exact")
 		metaValues = append(metaValues, "true")
 	}
 
@@ -598,7 +599,7 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 // validity is an optional map of column name → []bool where false means null.
 // Columns without a validity entry (or when validity is nil) are treated as fully valid.
 // tagColumns optionally lists which columns are tags (stored as Parquet metadata for compaction dedup).
-// dedupTime, when true, marks the file with arc:dedup_time so compaction dedups on time even with no tags.
+// dedupTime, when true, marks the file with arc:dedup_exact: continuous-query output (see ColumnarRecord.DedupTime).
 // decimalCols optionally maps column names to DecimalSpec for Decimal128 type inference.
 func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec) ([]byte, error) {
 	data, _, err := w.writeParquetColumnarWithSchema(ctx, measurement, columns, validity, tagColumns, dedupTime, decimalCols)
@@ -771,7 +772,7 @@ type TypedColumnBatch struct {
 	Validity   map[string][]bool      // per-column null bitmap; nil entry = all valid
 	TagColumns []string               // tag column names (for Parquet metadata, enables auto-dedup)
 	// DedupTime propagates ColumnarRecord.DedupTime: when true, the Parquet
-	// footer gets an arc:dedup_time marker so compaction dedups on time even with
+	// footer gets an arc:dedup_exact marker so compaction removes exact duplicate rows even with
 	// no tag columns. See ColumnarRecord.DedupTime — CQ output only (#521).
 	DedupTime bool
 	Signature string   // sorted column-name string; cached to avoid per-write recomputation
@@ -1708,7 +1709,7 @@ func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, 
 //
 // Note (#521): the WAL stores flattened rows and does NOT carry TagColumns or
 // the DedupTime marker (both are json:"-"), so a Parquet file produced purely
-// from WAL replay has neither arc:tags nor arc:dedup_time. In practice this
+// from WAL replay has neither arc:tags nor arc:dedup_exact. In practice this
 // self-heals: compaction unions metadata across all files in a partition, so
 // a replayed file dedups against any marked sibling written normally for the
 // same window. It only fails to dedup if the replayed copy and a marked copy
