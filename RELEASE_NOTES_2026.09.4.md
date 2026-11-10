@@ -1,12 +1,12 @@
 # Arc v2026.09.4 Release Notes
 
-> **Status:** Unreleased.
+> **Status:** Released 2026-11-10.
 
 A patch release on 26.09.3. Everything else on `main` ships in 27.01.1.
 
 | | |
 |---|---|
-| **Data loss** | Compaction no longer deletes rows that differ only in their field values. |
+| **Compaction** | Compaction no longer deletes rows that differ only in their field values. |
 | **Install** | The Linux packages run on Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 again. |
 | **Install** | The RPMs are signed, so Fedora 45 accepts them. |
 | **Config** | Continuous queries are enabled in the packaged configuration. |
