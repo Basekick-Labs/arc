@@ -320,7 +320,8 @@ type BackupSummary struct {
 	// SkippedReconciled is the part of SkippedFiles whose file had left the
 	// cluster manifest by the end of the run, so it is not missing data: a
 	// client deciding whether the backup is incomplete counts
-	// SkippedFiles - SkippedReconciled, the same as restore does (#1555).
+	// SkippedFiles - SkippedReconciled, the same as a replace-mode restore
+	// does (#1555).
 	// ClusterManifestChecked says the run cross-checked against the cluster
 	// manifest at all; it is omitted, never sent as false, on a backup that
 	// did not (a standalone node, or a manifest written before #1083).

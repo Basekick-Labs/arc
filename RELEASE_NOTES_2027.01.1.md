@@ -220,18 +220,18 @@ The other read endpoints are forwarded too; see the previous section.
 `cluster_manifest_checked`, which until now only the full manifest
 (`GET /api/v1/backup/:id`) had. `skipped_reconciled` is the part of
 `skipped_files` whose file had left the cluster manifest by the end of the run
-(compaction, retention or tiering removed it), so it is not missing data, and
-a replace-mode restore already did not count those skips as a gap. Without it a
-client had to count every skipped file in the listing as a gap, while the same
-backup's manifest said otherwise. A client checking completeness from the
-listing now counts `skipped_files - skipped_reconciled`, as a replace-mode
-restore does.
+(compaction, retention or tiering removed it), so it is not missing data.
+Without it a client had to count every skipped file in the listing as a gap,
+while the same backup's manifest said otherwise. A client checking completeness
+from the listing now counts `skipped_files - skipped_reconciled`, as a
+replace-mode restore already did.
 
 Both fields are omitted when zero or false, so a standalone backup's listing
 entry is unchanged. `cluster_manifest_checked` is never sent as `false`: it is
 absent on a backup that did not cross-check against the cluster manifest. On a
-multi-target run whose listing could read only some targets, both counts cover
-the targets it read, the same as `GET /api/v1/backup/:id`.
+multi-target run whose listing could read only some targets, `skipped_files`
+and `skipped_reconciled` cover the targets it read, the same as
+`GET /api/v1/backup/:id`.
 
 ## Fix: forwarded responses keep every value of a repeated header ([#1556](https://github.com/Basekick-Labs/arc/pull/1556))
 
