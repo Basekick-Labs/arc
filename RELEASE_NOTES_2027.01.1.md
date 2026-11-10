@@ -1571,9 +1571,13 @@ compress at level 3 or with gzip. Decoders are also pooled per size limit, so
 a msgpack payload is no longer rejected because a decoder last served an
 endpoint with a smaller limit.
 
-Arc is now built with Go 1.26.9 and golang.org/x/net 0.60, which fix eleven
-vulnerabilities in Go's HTTP, TLS and template packages that `govulncheck`
-reports as reachable from Arc.
+Arc is now built with Go 1.26.10 and golang.org/x/net 0.61, which fix
+vulnerabilities in Go's HTTP, TLS, X.509 and template packages that
+`govulncheck` reports as reachable from Arc. klauspost/compress is at 1.20.4,
+which fixes the crafted-frame panic in the library itself, and
+andybalholm/brotli at 1.2.7, which fixes excessive allocation on crafted
+streams (GO-2026-6888). Go 1.26.10, compress 1.20.4 and brotli 1.2.7 also
+ship in 26.09.4.
 
 ## Security: the query API runs read statements only
 
@@ -2588,10 +2592,14 @@ visible to clients:
   truncated, or capped. A client that checked for the trailer's presence
   rather than its value has to check the value.
 
-`klauspost/compress` stays at 1.19.2: 1.20 (which fasthttp 1.76 asks for)
-encodes snappy on arm64 with new assembly that cut line-protocol ingest by
-about 14% and msgpack+gzip ingest by about 11% on Apple silicon, because every
-Parquet file Arc writes is snappy-compressed.
+`klauspost/compress` was held at 1.19.2 here because 1.20 (which fasthttp
+1.76 asks for) encodes snappy on arm64 with new assembly, and every Parquet
+file Arc writes is snappy-compressed. It is now at 1.20.4, since the security
+fix above exists only in 1.20.2 and later. The measured cost at Arc's default
+Parquet page size was small: on an Apple M3 Max with 1.20.3, line-protocol
+ingest was 3.2% slower and MessagePack+gzip unchanged (+0.2%), with files 2-4%
+larger ([klauspost/compress#1271](https://github.com/klauspost/compress/issues/1271)).
+64 KiB data pages recovered both in the same benchmark.
 
 ## Upgrade note: DuckDB 1.5.6 ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
 
