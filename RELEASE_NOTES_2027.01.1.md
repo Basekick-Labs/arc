@@ -74,6 +74,27 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: an MQTT subscription created with `auto_start` starts at once ([#1585](https://github.com/Basekick-Labs/arc/issues/1585))
+
+`auto_start` is documented as "start on creation and on server restart", but
+only the restart half ran. `POST /api/v1/mqtt/subscriptions` with
+`"auto_start": true` answered `"status": "stopped"`, and nothing was ingested
+until `POST /api/v1/mqtt/subscriptions/{id}/start` or a restart.
+
+The create now starts the subscription and answers with its status:
+
+- **`running`** once connected. While writes are refused on the node (fenced,
+  WAL disk pressure and the other suspend reasons) it starts suspended, as
+  `POST .../start` does, and the status still reads `running`.
+- **`error`**, with the reason in `error_message`, when it cannot connect. The
+  subscription is still created (201): fix the broker or credentials, then
+  `POST .../start`.
+
+The create waits for the connection, up to `connect_timeout_seconds`
+(default 30). A client or proxy that gives up sooner sees a failure, although
+the subscription was created: list the subscriptions before creating it again.
+Without `auto_start` nothing changes.
+
 ## Changed: continuous queries are enabled in the packaged configuration
 
 The `arc.toml` shipped in the `.deb`, RPM, Arch package and Docker image set

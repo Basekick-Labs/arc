@@ -415,6 +415,34 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 		Strs("topics", sub.Topics).
 		Msg("Created MQTT subscription")
 
+	if !sub.AutoStart {
+		return sub, nil
+	}
+
+	// auto_start means "start on creation and on server restart", but only
+	// Start ever read it, so a new subscription stayed stopped until a
+	// restart (#1585). A start failure does not fail the create: the
+	// subscription is stored either way, and StartSubscription has recorded
+	// status error with the reason, which the caller sees below and can act
+	// on with POST /start.
+	if err := m.StartSubscription(ctx, sub.ID); err != nil {
+		m.logger.Warn().
+			Err(err).
+			Str("id", sub.ID).
+			Str("name", sub.Name).
+			Msg("Created MQTT subscription with auto_start, but it failed to start")
+		sub.Status = StatusError
+		sub.ErrorMessage = err.Error()
+	} else {
+		sub.Status = StatusRunning
+	}
+	// Report the stored row: a Delete racing the start leaves none, and the
+	// fields Create did not set (timestamps) come back as stored. Only a
+	// read: if it fails, the status set above stands. A start that suspends
+	// at once (writes fenced, WAL disk pressure) still reads running.
+	if got, err := m.repo.Get(ctx, sub.ID); err == nil && got != nil {
+		return got, nil
+	}
 	return sub, nil
 }
 
