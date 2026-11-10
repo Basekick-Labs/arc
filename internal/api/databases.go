@@ -361,6 +361,13 @@ func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
 
 // handleCreate handles POST /api/v1/databases
 func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
+	// A node that does not ingest (a reader or compactor) sends the create to
+	// the writer, where the database's writes land. Before the body is read,
+	// as every forwarded write: the writer validates it.
+	if handled, err := h.forwardCreate(c); handled {
+		return err
+	}
+
 	var req CreateDatabaseRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -428,6 +435,36 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 		MeasurementCount: 0,
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// forwardCreate forwards a create to the writer when this node does not
+// ingest. handled=false: create locally — no cluster, a node that ingests,
+// or a writer too old to accept it (cluster.ErrNoCapablePeer).
+func (h *DatabasesHandler) forwardCreate(c *fiber.Ctx) (bool, error) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		return true, RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		req, err := BuildHTTPRequest(c)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to build database create request for forwarding")
+			return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare request for forwarding",
+			})
+		}
+		resp, err := h.router.RouteDatabaseCreate(c.Context(), req)
+		if errors.Is(err, cluster.ErrLocalNodeCanHandle) || errors.Is(err, cluster.ErrNoCapablePeer) {
+			return false, nil
+		}
+		if err != nil {
+			if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+				h.logger.Error().Err(err).Msg("Failed to route database create request")
+			}
+			return true, respondWriteForwardError(c, err)
+		}
+		return true, CopyResponse(c, resp)
+	}
+	return false, nil
 }
 
 // handleGet handles GET /api/v1/databases/:name

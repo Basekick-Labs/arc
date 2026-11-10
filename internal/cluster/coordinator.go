@@ -605,6 +605,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		ClusterName:         cfg.Config.ClusterName,
 		PeerForwardIdentity: c.peerForwardIdentity,
 		PeerReadQueries:     c.peerReadQueries,
+		PeerDatabaseCreate:  c.peerDatabaseCreate,
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft.

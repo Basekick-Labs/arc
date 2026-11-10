@@ -89,3 +89,43 @@ func TestRouteReadQueryWithNoPeersIsUnavailable(t *testing.T) {
 		t.Fatalf("err = %v, want ErrNoReaderAvailable", err)
 	}
 }
+
+// Every build that forwards a database create accepts one, and says so.
+func TestForwardDatabaseCreateCapabilityIsAdvertised(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	if !hasCapability(c.localCapabilities(), CapabilityForwardDatabaseCreate) {
+		t.Fatalf("capabilities %v lack %s", c.localCapabilities(), CapabilityForwardDatabaseCreate)
+	}
+	if (&Coordinator{}).peerDatabaseCreate("anyone") {
+		t.Fatal("a peer was assumed to accept a forwarded create with no Raft state")
+	}
+}
+
+// RouteDatabaseCreate forwards only to a capable writer; a node that ingests
+// never forwards; with no writer it is ErrNoWriterAvailable.
+func TestRouteDatabaseCreateNeedsACapableWriter(t *testing.T) {
+	local := NewNode("local", "Local", RoleCompactor, "c")
+	registry := NewRegistry(&RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
+	req, _ := http.NewRequest(http.MethodPost, "http://x/api/v1/databases", nil)
+	r := NewRouter(&RouterConfig{Registry: registry, LocalNode: local, Logger: zerolog.Nop(), PeerDatabaseCreate: func(string) bool { return true }})
+	if _, err := r.RouteDatabaseCreate(context.Background(), req); !errors.Is(err, ErrNoWriterAvailable) {
+		t.Fatalf("no writer: err = %v, want ErrNoWriterAvailable", err)
+	}
+	writer := NewNode("writer", "W", RoleWriter, "c")
+	writer.UpdateState(StateHealthy)
+	writer.APIAddress = "127.0.0.1:1"
+	if err := registry.Register(writer); err != nil {
+		t.Fatal(err)
+	}
+	for _, peer := range []func(string) bool{nil, func(string) bool { return false }} {
+		r := NewRouter(&RouterConfig{Registry: registry, LocalNode: local, Logger: zerolog.Nop(), PeerDatabaseCreate: peer})
+		if _, err := r.RouteDatabaseCreate(context.Background(), req); !errors.Is(err, ErrNoCapablePeer) {
+			t.Fatalf("err = %v, want ErrNoCapablePeer", err)
+		}
+	}
+	writerLocal := NewNode("wl", "WL", RoleWriter, "c")
+	r = NewRouter(&RouterConfig{Registry: registry, LocalNode: writerLocal, Logger: zerolog.Nop(), PeerDatabaseCreate: func(string) bool { return true }})
+	if _, err := r.RouteDatabaseCreate(context.Background(), req); !errors.Is(err, ErrLocalNodeCanHandle) {
+		t.Fatalf("a writer: err = %v, want ErrLocalNodeCanHandle", err)
+	}
+}

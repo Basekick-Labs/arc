@@ -59,9 +59,11 @@ func TestForwardIdentityVerifier_OnlyOnForwardedRoutes(t *testing.T) {
 		{"GET", "/api/v1/databases", "accepted", true},
 		{"GET", "/api/v1/databases/db", "accepted", true},
 		{"GET", "/api/v1/databases/db/measurements", "accepted", true},
+		{"POST", "/api/v1/databases", "accepted", true},
 		// Near misses: another method on the same shape, an extra or missing
 		// segment, a path that cleaning would change.
-		{"POST", "/api/v1/databases", "refused", true},
+		{"POST", "/api/v1/databases/db", "refused", true},
+		{"PUT", "/api/v1/databases", "refused", true},
 		{"POST", "/api/v1/databases/db/measurements/cpu/schema/rebuild", "refused", true},
 		{"POST", "/api/v1/query/cpu", "refused", true},
 		{"GET", "/api/v1/query/cpu/extra", "refused", true},

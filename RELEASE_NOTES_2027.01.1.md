@@ -110,7 +110,31 @@ the queries it forwarded:
 - A client that disconnects from a compactor now also cancels its forwarded
   read, as it cancels a local one, with or without query management.
 
-`POST /api/v1/databases` (create) still runs on the compactor; it is a write.
+`POST /api/v1/databases` (create) is a write; see the next section.
+
+## Fix: a database created on a compactor or reader is created by the writer
+
+`POST /api/v1/databases` ran on whichever node received it. On a compactor or
+reader, the database's marker was written to that node's storage, and the
+"already exists" check read that node's storage too. On shared object storage
+that was visible to every node anyway. On a cluster where each node has its
+own storage, the database was created somewhere its writes never land.
+
+A node that does not ingest now forwards the create to the writer, as it does
+every other write: the same writer a write would go to (the primary, when
+there is one), sent once and never retried. The writer validates the request
+and checks the caller's admin permission itself. The response, including
+`409` for a database that already exists, is the writer's.
+
+- With no healthy writer, the answer is `503` ("No writer node available in
+  the cluster"). Before, the database was created locally.
+- **Rolling upgrades.** A compactor or reader forwards the create only to a
+  writer that advertises it at join (`forward_database_create_v1`). With a
+  writer that has not been upgraded yet, the database is created locally, as
+  before.
+- `DELETE /api/v1/databases/:name` is unchanged.
+- A standby writer still creates the database itself rather than forwarding
+  it to the primary.
 
 ## Fix: Arrow queries sent to a compactor are answered by a reader ([#1567](https://github.com/Basekick-Labs/arc/issues/1567))
 

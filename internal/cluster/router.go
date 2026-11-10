@@ -128,6 +128,12 @@ type RouterConfig struct {
 	// routes (CapabilityForwardReadQueries). RouteReadQuery forwards only to
 	// such peers; nil, or no such peer, runs the request locally.
 	PeerReadQueries func(nodeID string) bool
+
+	// PeerDatabaseCreate reports whether a peer accepts a forwarded
+	// POST /api/v1/databases (CapabilityForwardDatabaseCreate).
+	// RouteDatabaseCreate forwards only to such a writer; nil, or a writer
+	// without it, creates the database locally.
+	PeerDatabaseCreate func(nodeID string) bool
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -234,6 +240,24 @@ func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Respo
 	writer, err := r.writeTarget()
 	if err != nil {
 		return nil, err
+	}
+	return r.ForwardWriteTo(ctx, writer, req)
+}
+
+// RouteDatabaseCreate forwards POST /api/v1/databases from a node that does
+// not ingest (a reader or compactor) to the writer RouteWrite would pick, so
+// the database is created where its writes land. Only to a writer that
+// advertises CapabilityForwardDatabaseCreate: an older one would refuse the
+// forwarded identity on that route, so ErrNoCapablePeer tells the caller to
+// create it locally, as before. The target is not shopped for: a write goes
+// to the primary for a reason. Sent once, never retried (ForwardWriteTo).
+func (r *Router) RouteDatabaseCreate(ctx context.Context, req *http.Request) (*http.Response, error) {
+	writer, err := r.writeTarget()
+	if err != nil {
+		return nil, err
+	}
+	if r.cfg.PeerDatabaseCreate == nil || !r.cfg.PeerDatabaseCreate(writer.ID) {
+		return nil, ErrNoCapablePeer
 	}
 	return r.ForwardWriteTo(ctx, writer, req)
 }
@@ -480,12 +504,14 @@ func WithForwardTargetHook(ctx context.Context, hook func(nodeID string)) contex
 }
 
 // ErrNoCapablePeer reports that the cluster has nodes that could serve a
-// read but none advertises CapabilityForwardReadQueries (a rolling upgrade):
-// the caller answers the request itself rather than send it to a peer that
-// would refuse it. With no node to serve it at all, RouteReadQuery returns
-// ErrNoReaderAvailable instead, which the caller answers 503, as
-// /api/v1/query does.
-var ErrNoCapablePeer = errors.New("no peer accepts this forwarded read")
+// request but none advertises the capability to accept it forwarded
+// (CapabilityForwardReadQueries for RouteReadQuery,
+// CapabilityForwardDatabaseCreate for RouteDatabaseCreate; a rolling
+// upgrade): the caller answers the request itself rather than send it to a
+// peer that would refuse it. With no node to serve it at all, the route
+// returns ErrNoReaderAvailable or ErrNoWriterAvailable instead, which the
+// caller answers 503.
+var ErrNoCapablePeer = errors.New("no peer accepts this forwarded request")
 
 // RouteReadQuery forwards a read that a node which cannot serve queries
 // received (#1567 and its follow-up): /query/arrow, /query/estimate,
