@@ -95,69 +95,14 @@ The create waits for the connection, up to `connect_timeout_seconds`
 the subscription was created: list the subscriptions before creating it again.
 Without `auto_start` nothing changes.
 
-## Changed: continuous queries are enabled in the packaged configuration
+## Upgrade note: continuous queries stay as configured in an existing `arc.toml`
 
-The `arc.toml` shipped in the `.deb`, RPM, Arch package and Docker image set
-`[continuous_query] enabled = false`, unlike the code default and the
-documentation, so on a fresh package install every continuous-query API call
-answered 404 and every `arcli cq` command failed. It is now `enabled = true`
-(also in 26.09.4). No continuous query runs until one is created.
-
-Since this release a package upgrade no longer replaces an existing
-`/etc/arc/arc.toml` ([#1465](https://github.com/Basekick-Labs/arc/issues/1465)),
-so an install that already has the file keeps its setting. To turn continuous
-queries on there, set `[continuous_query] enabled = true` (or
-`ARC_CONTINUOUS_QUERY_ENABLED=true`) and restart.
-
-## Changed: the RPMs are signed
-
-rpm 6.1, which Fedora 45 ships, refuses an unsigned package by default
-(`%_pkgverify_level all`), and every Arc RPM up to 26.09.3 was unsigned:
-`package arc-26.09.3-1.x86_64 does not verify: no signature`. From 26.09.4
-the Arc and arc-fips RPMs are signed with the Basekick Labs package
-key. Its fingerprint is
-`3E39 9CF8 F5D2 EF9A A9A5 36EF 7629 7AF0 8CBA B6FE`, and it is published
-with every release and in the repository at
-`deploy/packaging/RPM-GPG-KEY-basekick`. Import it once, then install:
-
-```bash
-sudo rpm --import https://raw.githubusercontent.com/Basekick-Labs/arc/main/deploy/packaging/RPM-GPG-KEY-basekick
-sudo dnf install -y ./arc-<version>-1.x86_64.rpm
-```
-
-`dnf install ./file.rpm` also installs the older unsigned RPMs, with a
-warning. arcli's RPMs are signed with the same key from arcli's next
-release.
-
-## Fix: the Linux packages run on Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 again ([#1579](https://github.com/Basekick-Labs/arc/issues/1579))
-
-The 26.09.3 Linux binary needed glibc 2.38, because it was built on the
-newest GitHub runner:
-
-- On Debian 12 and Ubuntu 22.04 the `.deb` installed and then failed to start
-  (``version `GLIBC_2.38' not found``).
-- On RHEL/Rocky/Alma 9 and Amazon Linux 2023 the RPM refused to install. On
-  RHEL 9 it also needed a newer libstdc++ (`GLIBCXX_3.4.30`) than the system
-  ships.
-
-The binaries are now built on Ubuntu 22.04 with libstdc++ linked in, so they
-need only glibc 2.34 or newer and the system's `libgcc_s`.
-
-- **Supported:** Ubuntu 22.04+, Debian 12+, RHEL/Rocky/Alma 9+, Amazon Linux
-  2023, Fedora 35+.
-- **Not supported:** Ubuntu 20.04 and RHEL 8 (glibc 2.31 and 2.28).
-- The `.deb` now declares `Depends: libc6 (>= 2.34), libgcc-s1`, so `dpkg`
-  refuses an older system up front instead of installing a binary that cannot
-  start.
-
-The release build now:
-
-- fails if the binary needs anything above glibc 2.34 or links libstdc++
-  dynamically;
-- installs and starts each package on Debian 12, Ubuntu 22.04, Rocky 9 and
-  Amazon Linux 2023.
-
-Every PR builds the Linux binary the same way, on both architectures.
+26.09.4 turned continuous queries on in the packaged `arc.toml`. From this
+release a package upgrade no longer replaces an existing `/etc/arc/arc.toml`
+([#1465](https://github.com/Basekick-Labs/arc/issues/1465)), so an install that
+already has the file keeps its setting. To turn continuous queries on there,
+set `[continuous_query] enabled = true` (or `ARC_CONTINUOUS_QUERY_ENABLED=true`)
+and restart.
 
 ## Fix: every read sent to a compactor is answered by a reader, and `/api/v1/queries` covers what it forwarded
 
@@ -1599,11 +1544,10 @@ affecting every release up to 1.20.1). Arc decoded those bodies on a goroutine
 of the decoder's own, where the panic could not be caught, so a single
 `POST` with `Content-Encoding: zstd` (or a zstd body without the header) to
 `/api/v1/write/msgpack`, `/api/v1/write/line-protocol`, `/write`,
-`/api/v2/write` or `/api/v1/write/tle` ended the process. Every release
-through 26.09.3 is affected; any client allowed to write, or anyone when auth
-is off, could do it. Arc now decodes request bodies on the request's own
-goroutine and answers `400` to a frame the decoder cannot handle, whatever
-the library version. (A zstd-compressed Parquet file uploaded to the import
+`/api/v2/write` or `/api/v1/write/tle` ended the process. 26.09.4 fixed it
+by moving to klauspost/compress 1.20.4. Arc now also decodes request bodies on
+the request's own goroutine and answers `400` to a frame the decoder cannot
+handle, whatever the library version. (A zstd-compressed Parquet file uploaded to the import
 endpoint could hit the same panic; there it already failed only that request,
 with a `500`, and it is now answered `422` like any other corrupt file.)
 
@@ -1626,13 +1570,8 @@ compress at level 3 or with gzip. Decoders are also pooled per size limit, so
 a msgpack payload is no longer rejected because a decoder last served an
 endpoint with a smaller limit.
 
-Arc is now built with Go 1.26.10 and golang.org/x/net 0.61, which fix
-vulnerabilities in Go's HTTP, TLS, X.509 and template packages that
-`govulncheck` reports as reachable from Arc. klauspost/compress is at 1.20.4,
-which fixes the crafted-frame panic in the library itself, and
-andybalholm/brotli at 1.2.7, which fixes excessive allocation on crafted
-streams (GO-2026-6888). Go 1.26.10, compress 1.20.4 and brotli 1.2.7 also
-ship in 26.09.4.
+golang.org/x/net is at 0.61. Go 1.26.10, klauspost/compress 1.20.4 and
+andybalholm/brotli 1.2.7 shipped in 26.09.4.
 
 ## Security: the query API runs read statements only
 
@@ -2647,14 +2586,9 @@ visible to clients:
   truncated, or capped. A client that checked for the trailer's presence
   rather than its value has to check the value.
 
-`klauspost/compress` was held at 1.19.2 here because 1.20 (which fasthttp
-1.76 asks for) encodes snappy on arm64 with new assembly, and every Parquet
-file Arc writes is snappy-compressed. It is now at 1.20.4, since the security
-fix above exists only in 1.20.2 and later. The measured cost at Arc's default
-Parquet page size was small: on an Apple M3 Max with 1.20.3, line-protocol
-ingest was 3.2% slower and MessagePack+gzip unchanged (+0.2%), with files 2-4%
-larger ([klauspost/compress#1271](https://github.com/klauspost/compress/issues/1271)).
-64 KiB data pages recovered both in the same benchmark.
+`klauspost/compress`, which fasthttp 1.76 asks for at 1.20, has been at 1.20.4
+since 26.09.4; its notes give the arm64 snappy cost
+([#1582](https://github.com/Basekick-Labs/arc/issues/1582)).
 
 ## Upgrade note: DuckDB 1.5.6 ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
 
