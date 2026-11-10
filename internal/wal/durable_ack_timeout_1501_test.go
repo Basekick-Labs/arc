@@ -221,9 +221,10 @@ func TestDurableAckTimeoutOnAMultiChunkAppendDoesNotWaitOnTheDevice(t *testing.T
 
 // A durable entry is admitted when the queue has room, even with its deadline
 // already past: the deadline can run out while a large entry is built, and a
-// select with both cases ready picks one at random, refusing the write as a
-// stalled device and suspending MQTT for nothing (#1577). Repeated, so the
-// random pick cannot pass by luck.
+// select with both cases ready picked one at random, so whether a multi-chunk
+// append's first chunk was admitted was a coin toss (#1577). Repeated, so the
+// random pick cannot pass by luck. Admission only: the append is still
+// refused afterwards, by awaitDone, if its deadline has passed.
 func TestDurableAdmissionTakesRoomPastTheDeadline(t *testing.T) {
 	w := newTimeoutWriter(t, 1, time.Hour)
 	release, held := stallWriterLoop(t)
