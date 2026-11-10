@@ -24,6 +24,7 @@ package api
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,14 +38,23 @@ import (
 type clusterColdMark interface {
 	ColdMarkTrusted(now time.Time, maxAge time.Duration, localIdentity string) (bool, string)
 	ColdMarkIdentity() string
-	ColdMarkDay(scope string) (day int32, has bool)
+	ColdMarkDay(scope string) (day int32, raisedAt time.Time, has bool)
 	ColdMarkReadBarrier(ctx context.Context) error
 }
 
 // coldMarkTrustTTL bounds how long a read reuses another's trust check: the
-// check reads the Raft configuration, and every tiered read on a cluster node
-// asks whether it may stop listing after a failure.
+// check reads the Raft configuration.
 const coldMarkTrustTTL = 5 * time.Second
+
+// coldMarkRecentRaise bounds use 2: a scope whose mark was last raised longer
+// ago than this is read as before PR #1552 part 2. A reader's tier rows catch
+// up with a cold write at its next cold-tier metadata sync, which runs every
+// migration cycle (daily by default) and at startup; two of those is the
+// window in which its rows may not know of a recent cold write. Without the
+// bound, a measurement whose cold data was all deleted later (the mark never
+// goes down) would make every healthy read list cold and skip the transform
+// cache forever.
+const coldMarkRecentRaise = 48 * time.Hour
 
 type coldMarkTrust struct {
 	at      time.Time
@@ -52,99 +62,159 @@ type coldMarkTrust struct {
 	why     string
 }
 
-// clusterColdMarkTrusted is the cached trust check; false off a cluster.
-func (h *QueryHandler) clusterColdMarkTrusted() (bool, string) {
+// coldMarkState is the QueryHandler's cache of the trust check, with a mutex
+// so concurrent expiries refresh it once, and the read barrier coalescer.
+type coldMarkState struct {
+	trust     atomic.Pointer[coldMarkTrust]
+	refreshMu sync.Mutex
+	barrier   barrierCoalescer
+}
+
+// clusterColdMarkTrusted is the trust check, reusing a result taken at or
+// after notBefore and less than coldMarkTrustTTL old; false off a cluster.
+func (h *QueryHandler) clusterColdMarkTrusted(notBefore time.Time) bool {
 	if h.coldMark == nil {
-		return false, "not a cluster node"
+		return false
+	}
+	fresh := func(c *coldMarkTrust) bool {
+		return c != nil && !c.at.Before(notBefore) && time.Since(c.at) < coldMarkTrustTTL
+	}
+	if c := h.coldMarkState.trust.Load(); fresh(c) {
+		return c.trusted
+	}
+	h.coldMarkState.refreshMu.Lock()
+	defer h.coldMarkState.refreshMu.Unlock()
+	if c := h.coldMarkState.trust.Load(); fresh(c) {
+		return c.trusted
 	}
 	now := time.Now()
-	if c := h.coldMarkTrust.Load(); c != nil && now.Sub(c.at) < coldMarkTrustTTL {
-		return c.trusted, c.why
-	}
 	ok, why := h.coldMark.ColdMarkTrusted(now, raft.ColdMarkAliveMaxAge, h.coldMark.ColdMarkIdentity())
-	h.coldMarkTrust.Store(&coldMarkTrust{at: now, trusted: ok, why: why})
-	return ok, why
+	h.coldMarkState.trust.Store(&coldMarkTrust{at: now, trusted: ok, why: why})
+	return ok
 }
 
 // utcDay is t's UTC day as days since the epoch, the mark's unit (the
-// storage layout's day directories are UTC).
+// storage layout's day directories are UTC). Floor division: a time before
+// the epoch is on day -1, not 0.
 func utcDay(t time.Time) int32 {
-	return int32(t.UTC().Unix() / 86400)
+	s := t.UTC().Unix()
+	d := s / 86400
+	if s%86400 < 0 {
+		d--
+	}
+	return int32(d)
 }
 
-// clusterColdRangeEmpty reports whether the trusted cold mark rules out cold
-// data for this read: its stated start is on a day after the scope's mark, or
-// the scope was never marked. An assumed start, an unknown-day scope, a mark
-// not trusted, or a read barrier that does not complete answer false. The
-// end is ignored: a read open at the end needs every day from its start.
-//
-// The cost — a trust check and one Raft read barrier — is paid only by a read
-// whose cold listing already failed.
-func (h *QueryHandler) clusterColdRangeEmpty(ctx context.Context, database, measurement string, timeRange *pruning.TimeRange) bool {
+// coldMarkMayDrop reports, with no barrier, whether the cold mark could let
+// this read leave out cold partitions it cannot list: a cluster node, a
+// trusted mark, a stated start, and the scope unmarked or its mark before the
+// start's day (raft.MarkUnknownDay is MaxInt32: never before). The end is
+// ignored: a read open at the end needs every day from its start.
+func (h *QueryHandler) coldMarkMayDrop(database, measurement string, timeRange *pruning.TimeRange) bool {
 	if h.coldMark == nil {
 		return false
 	}
 	start, _ := statedBounds(timeRange)
-	if start == nil {
+	if start == nil || !h.clusterColdMarkTrusted(time.Time{}) {
 		return false
 	}
-	if ok, _ := h.clusterColdMarkTrusted(); !ok {
+	day, _, has := h.coldMark.ColdMarkDay(database + "/" + measurement)
+	return !has || utcDay(*start) > day
+}
+
+// clusterColdRangeEmpty reports whether the trusted cold mark rules out cold
+// data for this read. coldMarkMayDrop first, at no Raft cost: a read it
+// rules out pays no barrier. Then one coalesced read barrier, so the mark is
+// not older than the cluster's, and the trust check and the mark again, read
+// after it.
+func (h *QueryHandler) clusterColdRangeEmpty(ctx context.Context, database, measurement string, timeRange *pruning.TimeRange) bool {
+	if !h.coldMarkMayDrop(database, measurement, timeRange) {
 		return false
 	}
-	if err := h.coldMark.ColdMarkReadBarrier(ctx); err != nil {
+	barrierAt := time.Now()
+	if err := h.coldMarkState.barrier.do(ctx, h.coldMark.ColdMarkReadBarrier); err != nil {
 		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
 			Msg("Could not confirm this node is caught up with the cluster; keeping the cold partitions the cold tier could not list")
 		return false
 	}
-	// Read after the barrier, uncached: the barrier may have applied a change.
-	if ok, _ := h.coldMark.ColdMarkTrusted(time.Now(), raft.ColdMarkAliveMaxAge, h.coldMark.ColdMarkIdentity()); !ok {
+	if !h.clusterColdMarkTrusted(barrierAt) {
 		return false
 	}
-	day, has := h.coldMark.ColdMarkDay(database + "/" + measurement)
-	if !has {
-		return true
-	}
-	// raft.MarkUnknownDay is MaxInt32: no start is after it.
-	return utcDay(*start) > day
+	start, _ := statedBounds(timeRange)
+	day, _, has := h.coldMark.ColdMarkDay(database + "/" + measurement)
+	return !has || utcDay(*start) > day
 }
 
 // clusterColdMayHaveData reports whether a cluster node must read the cold
 // tier for a measurement its tier rows hold no cold row for: the trusted mark
-// says the read's range may hold cold data (a marked scope, and no stated
-// start or one on or before the mark's day). Untrusted, or off a cluster: the
-// rows decide, as before. No barrier: a lagging mark can only answer as the
-// rows did before this change.
+// was raised within coldMarkRecentRaise (a cold write this node's rows may
+// not know of yet) and the read's range may reach it (no stated start, an
+// unknown day, or a start on or before the mark's day). Otherwise the rows
+// decide, as before. No barrier: a lagging mark can only answer as the rows
+// did before this change.
 func (h *QueryHandler) clusterColdMayHaveData(database, measurement string, timeRange *pruning.TimeRange) bool {
 	if h.coldMark == nil {
 		return false
 	}
-	if ok, _ := h.clusterColdMarkTrusted(); !ok {
+	day, raisedAt, has := h.coldMark.ColdMarkDay(database + "/" + measurement)
+	if !has || raisedAt.IsZero() || time.Since(raisedAt) > coldMarkRecentRaise {
 		return false
 	}
-	day, has := h.coldMark.ColdMarkDay(database + "/" + measurement)
-	if !has {
+	if !h.clusterColdMarkTrusted(time.Time{}) {
 		return false
 	}
 	start, _ := statedBounds(timeRange)
-	return day == raft.MarkUnknownDay || start == nil || utcDay(*start) <= day
+	return start == nil || utcDay(*start) <= day
 }
 
-// clusterColdMarkUsable reports whether a cluster read may stop listing cold
-// after the first failure: only when the mark it would then fall back on is
-// trusted. Cached check; no barrier.
-func (h *QueryHandler) clusterColdMarkUsable() bool {
-	ok, _ := h.clusterColdMarkTrusted()
-	return ok
+// barrierCoalescer runs one read barrier for every caller that arrives while
+// none is running, and one more, started after it, for callers that arrive
+// while one runs: a caller only ever joins a barrier that began after it
+// arrived, which is what makes sharing it correct. At most one barrier per
+// node is in flight, back to back under load.
+type barrierCoalescer struct {
+	mu      sync.Mutex
+	running bool
+	next    *barrierCall
 }
 
-// coldRangeEmpty is the one question both drop sites ask: may this read leave
-// out cold partitions the cold tier could not list? Standalone: tier rows
-// (#1550). Cluster: the cold mark.
-func (h *QueryHandler) coldRangeEmpty(ctx context.Context, database, measurement string, timeRange *pruning.TimeRange) (bool, bool) {
-	if h.coldMetadataTrusted() {
-		return h.coldRangeHasNoRows(ctx, database, measurement, timeRange), false
+type barrierCall struct {
+	done chan struct{}
+	err  error
+}
+
+func (b *barrierCoalescer) do(ctx context.Context, fn func(context.Context) error) error {
+	b.mu.Lock()
+	if b.next == nil {
+		b.next = &barrierCall{done: make(chan struct{})}
 	}
-	return h.clusterColdRangeEmpty(ctx, database, measurement, timeRange), true
+	c := b.next
+	if !b.running {
+		b.running, b.next = true, nil
+		go b.run(c, fn)
+	}
+	b.mu.Unlock()
+	select {
+	case <-c.done:
+		return c.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *barrierCoalescer) run(c *barrierCall, fn func(context.Context) error) {
+	for {
+		c.err = fn(context.Background()) // bounded by the barrier's own timeout
+		close(c.done)
+		b.mu.Lock()
+		if b.next == nil {
+			b.running = false
+			b.mu.Unlock()
+			return
+		}
+		c, b.next = b.next, nil
+		b.mu.Unlock()
+	}
 }
 
 // noteColdSkipped records a read that left cold partitions out: the #1550
@@ -168,5 +238,12 @@ func (h *QueryHandler) noteColdSkipped(database, measurement string, partitions 
 		Msg("The cold tier could not be listed; answering this read without its cold partitions because the cluster's cold mark says its range holds no cold data (logged at most once a minute per measurement)")
 }
 
-// coldMarkTrustCache is the QueryHandler field type.
-type coldMarkTrustCache = atomic.Pointer[coldMarkTrust]
+// coldRangeEmpty is the pruner drop site's question: may this read leave out
+// cold partitions the cold tier could not list? Standalone: tier rows
+// (#1550). Cluster: the cold mark. viaMark says which answered.
+func (h *QueryHandler) coldRangeEmpty(ctx context.Context, database, measurement string, timeRange *pruning.TimeRange) (empty, viaMark bool) {
+	if h.coldMetadataTrusted() {
+		return h.coldRangeHasNoRows(ctx, database, measurement, timeRange), false
+	}
+	return h.clusterColdRangeEmpty(ctx, database, measurement, timeRange), true
+}

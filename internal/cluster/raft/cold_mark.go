@@ -107,8 +107,11 @@ type EnableColdMarkPayload struct {
 }
 
 // ColdMarkAddPayload raises marks: scope -> UTC day (days since the epoch).
+// At is the proposer's time, recorded as the scope's last raise (Apply
+// never reads the clock); zero from an older proposer.
 type ColdMarkAddPayload struct {
 	Marks map[string]int32 `json:"marks"`
+	At    time.Time        `json:"at,omitempty"`
 }
 
 // ColdMarkAckPayload is a node reporting that it applied Enable and drained
@@ -135,6 +138,7 @@ type ColdMarkResetPayload struct {
 // with Backend the identity of the cold store listed.
 type ColdMarkSeedPayload struct {
 	Marks   map[string]int32 `json:"marks"`
+	At      time.Time        `json:"at,omitempty"`
 	Final   bool             `json:"final,omitempty"`
 	Backend string           `json:"backend,omitempty"`
 }
@@ -151,6 +155,10 @@ type coldMarkState struct {
 	Marks           map[string]int32 `json:"marks,omitempty"`
 	// Alive: each node's latest Alive time.
 	Alive map[string]time.Time `json:"alive,omitempty"`
+	// Raised: each scope's last raise, the proposer's time from the Add or
+	// Seed that set or raised it. A reader uses it to tell a recent cold
+	// write its own tier rows may not know of yet from an old one.
+	Raised map[string]time.Time `json:"raised,omitempty"`
 }
 
 // ColdMarkStatus is a copy of the flags, for status and the coordinator.
@@ -186,7 +194,7 @@ func validColdMarkScope(scope string) bool {
 
 // raiseColdMarksLocked raises the marks in m. Validates everything first so a
 // refused command changes nothing.
-func (f *ClusterFSM) raiseColdMarksLocked(m map[string]int32) error {
+func (f *ClusterFSM) raiseColdMarksLocked(m map[string]int32, at time.Time) error {
 	if len(m) > maxColdMarkEntries {
 		return fmt.Errorf("cold mark: %d entries, at most %d", len(m), maxColdMarkEntries)
 	}
@@ -212,6 +220,12 @@ func (f *ClusterFSM) raiseColdMarksLocked(m map[string]int32) error {
 	for scope, day := range m {
 		if cur, ok := st.Marks[scope]; !ok || day > cur {
 			st.Marks[scope] = day
+			if !at.IsZero() {
+				if st.Raised == nil {
+					st.Raised = map[string]time.Time{}
+				}
+				st.Raised[scope] = at.UTC()
+			}
 		}
 	}
 	return nil
@@ -255,7 +269,7 @@ func (f *ClusterFSM) applyColdMarkAdd(payload []byte) interface{} {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.raiseColdMarksLocked(p.Marks)
+	return f.raiseColdMarksLocked(p.Marks, p.At)
 }
 
 func (f *ClusterFSM) applyColdMarkAck(payload []byte) interface{} {
@@ -399,7 +413,7 @@ func (f *ClusterFSM) applyColdMarkSeed(payload []byte) interface{} {
 	if p.Final && p.Backend == "" {
 		return errors.New("cold mark seed: final chunk without a backend identity")
 	}
-	if err := f.raiseColdMarksLocked(p.Marks); err != nil {
+	if err := f.raiseColdMarksLocked(p.Marks, p.At); err != nil {
 		return err
 	}
 	if !p.Final {
@@ -428,6 +442,9 @@ func (f *ClusterFSM) applyColdMarkReset(payload []byte) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	st := f.coldMarkLocked()
+	if !st.Enabled {
+		return errors.New("cold mark reset: the cold mark is not enabled")
+	}
 	st.Seeded, st.Backend, st.BackendConflict = false, "", false
 	f.logger.Warn().Str("by", p.By).Str("reason", p.Reason).
 		Msg("Cold mark seed reset by an admin: readers stop using it until the next cold listing seeds it again")
@@ -447,6 +464,16 @@ func (f *ClusterFSM) ColdMark(scope string) (day int32, has, trusted bool) {
 	}
 	day, has = st.Marks[scope]
 	return day, has, st.Enabled && st.Fenced && st.Seeded && !st.BackendConflict
+}
+
+// ColdMarkRaisedAt is scope's last raise (zero when unknown).
+func (f *ClusterFSM) ColdMarkRaisedAt(scope string) time.Time {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.coldMark == nil {
+		return time.Time{}
+	}
+	return f.coldMark.Raised[scope]
 }
 
 // ColdMarkCovers reports whether scope's mark is already at or after day.
@@ -507,6 +534,10 @@ func (f *ClusterFSM) snapshotColdMarkLocked() *coldMarkState {
 	cp.Alive = make(map[string]time.Time, len(st.Alive))
 	for k, v := range st.Alive {
 		cp.Alive[k] = v
+	}
+	cp.Raised = make(map[string]time.Time, len(st.Raised))
+	for k, v := range st.Raised {
+		cp.Raised[k] = v
 	}
 	return &cp
 }

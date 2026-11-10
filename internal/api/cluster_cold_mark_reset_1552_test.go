@@ -40,3 +40,12 @@ func TestColdMarkResetWithoutClustering(t *testing.T) {
 		t.Fatalf("reset without clustering returned %d, want 409", resp.StatusCode)
 	}
 }
+
+func TestTruncateRunesKeepsRunesWhole(t *testing.T) {
+	if got := truncateRunes("aé", 2); got != "a" {
+		t.Fatalf("truncateRunes split a rune: %q", got)
+	}
+	if got := truncateRunes("abc", 5); got != "abc" {
+		t.Fatalf("%q", got)
+	}
+}

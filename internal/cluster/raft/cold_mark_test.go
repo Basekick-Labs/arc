@@ -327,3 +327,18 @@ func TestColdMarkResetReseeds(t *testing.T) {
 		t.Fatalf("not trusted after reseed: %s", why)
 	}
 }
+
+// The last raise is the proposer's time, set only when the mark moves up.
+func TestColdMarkRaisedAt(t *testing.T) {
+	x := takeoverFSM(t)
+	x.ok(CommandColdMarkAdd, ColdMarkAddPayload{Marks: map[string]int32{"db/cpu": 10}, At: t0})
+	x.ok(CommandColdMarkAdd, ColdMarkAddPayload{Marks: map[string]int32{"db/cpu": 9}, At: t0.Add(time.Hour)})
+	if got := x.f.ColdMarkRaisedAt("db/cpu"); !got.Equal(t0) {
+		t.Fatalf("raised %v after a lower add, want %v", got, t0)
+	}
+	x.ok(CommandColdMarkAdd, ColdMarkAddPayload{Marks: map[string]int32{"db/cpu": 11}, At: t0.Add(2 * time.Hour)})
+	if got := x.f.ColdMarkRaisedAt("db/cpu"); !got.Equal(t0.Add(2 * time.Hour)) {
+		t.Fatalf("raised %v", got)
+	}
+	x.refused(CommandColdMarkReset, ColdMarkResetPayload{}) // not enabled
+}

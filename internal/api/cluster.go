@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/basekick-labs/arc/internal/audit"
 	"github.com/basekick-labs/arc/internal/auth"
@@ -506,27 +507,6 @@ func (h *ClusterHandler) handleAssignCompactor(c *fiber.Ctx) error {
 // applies the selection rules. On a cluster with automatic failover this is a
 // way to drain a writer deliberately; on one without, it is the only way to
 // recover after the primary is gone for good.
-func (h *ClusterHandler) handleResetColdMark(c *fiber.Ctx) error {
-	if h.coordinator == nil {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-			"success": false,
-			"error":   "clustering is not enabled on this node, so there is no cold mark to reset",
-		})
-	}
-	reason := c.Query("reason")
-	if len(reason) > maxDeleteReasonLen {
-		reason = reason[:maxDeleteReasonLen]
-	}
-	reason = utils.CopyString(reason)
-	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
-	defer cancel()
-	if err := h.coordinator.ResetColdMark(ctx, "admin-api", reason); err != nil {
-		h.logger.Error().Err(err).Msg("Failed to reset the cold mark")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"success": false, "error": err.Error()})
-	}
-	return c.JSON(fiber.Map{"success": true, "message": "cold mark seed reset; the next cold-tier metadata sync on the primary seeds it again"})
-}
-
 func (h *ClusterHandler) handleDemoteWriter(c *fiber.Ctx) error {
 	// Validate the input before anything else, so a malformed request is
 	// rejected the same way whether or not this node is clustered.
@@ -592,6 +572,48 @@ func (h *ClusterHandler) handleDemoteWriter(c *fiber.Ctx) error {
 		"new_primary": newPrimary,
 		"message":     "primary writer handed over",
 	})
+}
+
+// handleResetColdMark clears the cluster cold mark's seed, cold store identity
+// and backend conflict (#1552). Fix every node's cold tier config first: the
+// first complete cold listing after the reset, on any node whose tiering is
+// not role-gated, seeds it again from that node's store. Marks are kept.
+func (h *ClusterHandler) handleResetColdMark(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node, so there is no cold mark to reset",
+		})
+	}
+	reason := c.Query("reason")
+	if len(reason) > maxDeleteReasonLen {
+		reason = truncateRunes(reason, maxDeleteReasonLen)
+	}
+	reason = utils.CopyString(reason)
+	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	defer cancel()
+	if err := h.coordinator.ResetColdMark(ctx, "admin-api", reason); err != nil {
+		if errors.Is(err, cluster.ErrColdMarkNotEnabled) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"success": false, "error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("Failed to reset the cold mark")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "cold mark seed reset; make sure every node uses the same cold tier: the first complete cold-tier metadata sync on a node whose tiering is not role-gated seeds it again, and reads do not use it until then",
+	})
+}
+
+// truncateRunes cuts s to at most n bytes without splitting a UTF-8 rune.
+func truncateRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // handleGetStatus returns the overall cluster status.

@@ -277,19 +277,21 @@ The edge-sync hub endpoints moved to RBAC as well; see
 The cluster counterpart of #1550. On a cluster node, a read whose cold tier listing fails now answers from hot data when the cluster's cold mark (part 1, below) shows the read cannot need cold data:
 
 - the mark is trusted: enabled, fenced, seeded from this node's own cold store, and every node and Raft server confirmed it within 15 minutes;
-- this node is caught up with the leader (a Raft read barrier, at most 2 seconds);
 - the read states a start (`time >= ...`), and that start is on a UTC day after the measurement's mark, or the measurement was never marked;
-- every cold partition the read kept is one whose listing failed, as in #1550.
+- this node is caught up with the leader: a Raft read barrier (at most 2 seconds), after which the trust and the mark are read again;
+- every cold partition the read kept is one whose listing failed, as in #1550. Only that site drops cold partitions: a read the pruner could not prune (no time range, only an end, pruning off, or a range over the path cap) keeps them.
 
-Otherwise the read fails as it did. A read with only an end, or no time range, keeps failing during an outage. Standalone nodes keep #1550's rule.
+Otherwise the read fails as it did; on a cluster node that includes every read with no stated start. Standalone nodes keep #1550's rule.
 
-Also on cluster nodes: a measurement this node holds no cold-tier rows for (its rows lag the cold store) used to be read from hot only, silently leaving out cold data the cluster had. With a trusted mark that says the range may hold cold data, the read now includes the cold tier. With an untrusted mark the old behaviour stays.
+Also on cluster nodes: a measurement this node holds no cold-tier rows for used to be read from hot only, silently leaving out cold data the cluster had (its rows lag the cold store until its next cold-tier metadata sync). The read now includes the cold tier when the trusted mark says the range may hold cold data and the mark was raised within the last 48 hours: two default migration cycles, the window in which this node's rows may not know of a recent cold write. Outside that window, or with an untrusted mark, reads are as before.
 
-Admins can reset the mark's seed with `POST /api/v1/cluster/cold-mark/reset` (admin token), for example after fixing a node whose cold tier pointed at another store. Reads stop using the mark until the next cold-tier metadata sync on the primary seeds it again.
+Admins can reset the mark's seed with `POST /api/v1/cluster/cold-mark/reset` (admin token), for example after fixing a node whose cold tier pointed at another store. Fix every node's cold tier config first: the first complete cold-tier metadata sync after the reset, on any node whose tiering is not role-gated, seeds it again from that node's store, and reads do not use the mark until then. A reset on a cluster that never enabled the mark answers 409.
 
 Observability: `arc_query_cold_mark_skipped_total` counts reads answered this way, with a `Warn` at most once a minute per measurement; `GET /api/v1/cluster` shows `cold_mark.trusted` and why not.
 
-Performance: healthy reads run one cached trust check (refreshed at most every 5 seconds; it reads the Raft configuration) to decide whether listing may stop after a failure, plus one map lookup for a measurement with no cold rows. Only a read whose cold listing already failed pays the read barrier, a Raft round trip of at most 2 seconds.
+Performance, healthy reads (cold listing succeeds): on a cluster node, one cached trust check (refreshed at most every 5 seconds per process, by one caller; it reads the Raft configuration) and one in-memory mark lookup per tiered read. A measurement with no local cold rows reads cold, uncached, only within 48 hours of a raise of its mark that its range reaches. Standalone and non-tiered reads run none of this.
+
+Performance, outage path (a cold listing failed): only a read the mark could drop pays a Raft read barrier, and concurrent reads share one: at most one barrier per node is in flight, the next one starting when it ends (about one per 2-second window under load, not one per read). That rate stays far below the 256 recent barrier tokens Raft keeps, so a node's own barrier token cannot be evicted before it sees it.
 
 ## Cluster: a replicated record of which days may be in the cold tier ([#1552](https://github.com/Basekick-Labs/arc/issues/1552), part 1 of 2)
 

@@ -538,6 +538,8 @@ func (m *Metrics) IncQueryColdUnlistedSkipped() { m.queryColdUnlistedSkipped.Add
 // IncQueryColdMarkSkipped counts one cluster read answered without the cold
 // partitions it could not list, on the cold mark's word (#1552).
 func (m *Metrics) IncQueryColdMarkSkipped() { m.queryColdMarkSkipped.Add(1) }
+
+// IncQueryRows adds count to the rows queries returned.
 func (m *Metrics) IncQueryRows(count int64) { m.queryRowsTotal.Add(count) }
 
 // RecordQueryLatency records query latency in microseconds

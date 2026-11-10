@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,9 +25,11 @@ type fakeColdMark struct {
 	identity   string
 	gotID      string
 	marks      map[string]int32
+	raised     time.Time // zero: now
 	barrierErr error
 	barriers   int
 	trustCalls int
+	onBarrier  func(*fakeColdMark)
 }
 
 func (f *fakeColdMark) ColdMarkTrusted(_ time.Time, _ time.Duration, id string) (bool, string) {
@@ -35,12 +38,19 @@ func (f *fakeColdMark) ColdMarkTrusted(_ time.Time, _ time.Duration, id string) 
 	return f.trusted && id != "" && id == f.identity, f.why
 }
 func (f *fakeColdMark) ColdMarkIdentity() string { return f.identity }
-func (f *fakeColdMark) ColdMarkDay(scope string) (int32, bool) {
+func (f *fakeColdMark) ColdMarkDay(scope string) (int32, time.Time, bool) {
 	d, ok := f.marks[scope]
-	return d, ok
+	r := f.raised
+	if r.IsZero() {
+		r = time.Now()
+	}
+	return d, r, ok
 }
 func (f *fakeColdMark) ColdMarkReadBarrier(context.Context) error {
 	f.barriers++
+	if f.onBarrier != nil {
+		f.onBarrier(f)
+	}
 	return f.barrierErr
 }
 
@@ -104,9 +114,11 @@ func TestClusterColdKeptOnAnyDoubt(t *testing.T) {
 			}
 		})
 	}
-	// An untrusted mark costs no read barrier.
-	if m := cases["not trusted"]; m.barriers != 0 {
-		t.Fatalf("untrusted mark paid %d read barriers", m.barriers)
+	// A read the mark cannot drop pays no read barrier.
+	for _, name := range []string{"not trusted", "mark on the start day", "mark after the start", "unknown scope"} {
+		if m := cases[name]; m.barriers != 0 {
+			t.Fatalf("%s: paid %d read barriers", name, m.barriers)
+		}
 	}
 }
 
@@ -195,7 +207,7 @@ func TestClusterColdMayHaveDataBoundaries(t *testing.T) {
 		{markJan1 - 1, &pruning.TimeRange{Start: at, End: at, StartAssumed: true}, true},
 	} {
 		e.h.coldMark = trustedMark(c.day)
-		e.h.coldMarkTrust.Store(nil)
+		e.h.coldMarkState.trust.Store(nil)
 		if got := e.h.clusterColdMayHaveData("sch", "m", c.tr); got != c.want {
 			t.Fatalf("mark %d range %+v: %v, want %v", c.day, c.tr, got, c.want)
 		}
@@ -208,7 +220,7 @@ func TestClusterColdMarkTrustIsCached(t *testing.T) {
 	mark := trustedMark(1)
 	e.h.coldMark = mark
 	for i := 0; i < 5; i++ {
-		e.h.clusterColdMarkUsable()
+		e.h.clusterColdMarkTrusted(time.Time{})
 	}
 	if mark.trustCalls != 1 {
 		t.Fatalf("trust checked %d times, want 1", mark.trustCalls)
@@ -231,10 +243,12 @@ func TestClusterColdListingStopsOnlyWhenTheMarkIsTrusted(t *testing.T) {
 		mark *fakeColdMark
 		want func(int64) bool
 	}{
-		// The mark covers the range, so cold is kept either way: this pins
-		// the listing count alone.
-		{"trusted", trustedMark(markJan1 + 5), func(n int64) bool { return n == 1 }},
-		{"not trusted", &fakeColdMark{identity: "s3://x", marks: map[string]int32{"sch/m": markJan1 + 5}}, func(n int64) bool { return n >= 5 }},
+		// Droppable by the mark (start after it): stop after one failure.
+		{"trusted, droppable", trustedMark(markJan1 - 10), func(n int64) bool { return n == 1 }},
+		// The mark covers the range, so the read cannot be dropped: keep
+		// listing each day, as before.
+		{"trusted, not droppable", trustedMark(markJan1 + 5), func(n int64) bool { return n >= 5 }},
+		{"not trusted", &fakeColdMark{identity: "s3://x", marks: map[string]int32{"sch/m": markJan1 - 10}}, func(n int64) bool { return n >= 5 }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			e := unlistedEnv(t)
@@ -247,9 +261,7 @@ func TestClusterColdListingStopsOnlyWhenTheMarkIsTrusted(t *testing.T) {
 				tiering.TierHot:  e.h.getStoragePath(ctx, "sch", "m"),
 				tiering.TierCold: e.h.storagePathForBackend(ctx, cold, "sch", "m"),
 			}
-			if from := e.h.buildMultiTierReadParquet(ctx, "sch", "m", sql, paths, "FROM"); !strings.Contains(from, "s3://") {
-				t.Fatalf("read %s left cold out; the mark covers the range", from)
-			}
+			e.h.buildMultiTierReadParquet(ctx, "sch", "m", sql, paths, "FROM")
 			if n := requests.Load(); !c.want(n) {
 				t.Fatalf("cold listing requests = %d", n)
 			}
@@ -257,19 +269,105 @@ func TestClusterColdListingStopsOnlyWhenTheMarkIsTrusted(t *testing.T) {
 	}
 }
 
-// flipOnBarrier stops being trusted while the read barrier runs, as when the
-// barrier applies a seed reset or a stale member's Alive ages out.
-type flipOnBarrier struct{ *fakeColdMark }
-
-func (f flipOnBarrier) ColdMarkReadBarrier(ctx context.Context) error {
-	f.trusted = false
-	return f.fakeColdMark.ColdMarkReadBarrier(ctx)
-}
-
 // Trust is checked again after the barrier, not only from the cache.
 func TestClusterColdMarkRecheckedAfterTheBarrier(t *testing.T) {
 	mark := trustedMark(markJan1 - 1)
-	if from, _ := clusterRead(t, flipOnBarrier{mark}, bothTiers, hotRangeSQL); !strings.Contains(from, "s3://") {
+	mark.onBarrier = func(f *fakeColdMark) { f.trusted = false }
+	if from, _ := clusterRead(t, mark, bothTiers, hotRangeSQL); !strings.Contains(from, "s3://") {
 		t.Fatalf("left cold out on a mark no longer trusted after the barrier: %s", from)
+	}
+}
+
+// The mark is read again after the barrier: a raise the barrier applied
+// (a cold write just committed) keeps the cold partitions.
+func TestClusterColdMarkDayReadAfterTheBarrier(t *testing.T) {
+	mark := trustedMark(markJan1 - 1)
+	mark.onBarrier = func(f *fakeColdMark) { f.marks["sch/m"] = markJan1 }
+	if from, _ := clusterRead(t, mark, bothTiers, hotRangeSQL); !strings.Contains(from, "s3://") {
+		t.Fatalf("left cold out on a mark raised by the barrier: %s", from)
+	}
+}
+
+// C8 applies only to a recent raise: an old mark (cold data perhaps all
+// deleted since) leaves healthy reads as before.
+func TestClusterReadsColdOnlyForARecentRaise(t *testing.T) {
+	hotOnly := map[tiering.Tier]bool{tiering.TierHot: true}
+	old := trustedMark(markJan1)
+	old.raised = time.Now().Add(-coldMarkRecentRaise - time.Minute)
+	if from, volatile := clusterRead(t, old, hotOnly, hotRangeSQL); strings.Contains(from, "s3://") || volatile {
+		t.Fatalf("an old raise changed a healthy read: %s volatile %v", from, volatile)
+	}
+	recent := trustedMark(markJan1)
+	recent.raised = time.Now().Add(-coldMarkRecentRaise + time.Minute)
+	if from, _ := clusterRead(t, recent, hotOnly, hotRangeSQL); !strings.Contains(from, "s3://") {
+		t.Fatalf("a recent raise did not add cold: %s", from)
+	}
+}
+
+// The fallback site (no pruned partitions: here a range past the pruner's
+// path cap) never drops on the mark.
+func TestClusterFallbackReadNeverDropsOnTheMark(t *testing.T) {
+	mark := trustedMark(utcDay(time.Date(2018, 12, 1, 0, 0, 0, 0, time.UTC)))
+	sql := "SELECT count(*) FROM sch.m WHERE time >= '2019-01-01T00:00:00Z' AND time < '2026-01-01T11:00:00Z'"
+	if from, _ := clusterRead(t, mark, bothTiers, sql); !strings.Contains(from, "s3://") {
+		t.Fatalf("a fallback read dropped cold on the mark: %s", from)
+	}
+}
+
+// One barrier serves every caller that arrived while none ran; a caller that
+// arrives while one runs joins the next, which starts after it, never the
+// running one.
+func TestBarrierCoalescer(t *testing.T) {
+	var b barrierCoalescer
+	release := make(chan struct{})
+	calls := 0
+	var mu sync.Mutex
+	fn := func(context.Context) error {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			<-release
+			return errors.New("first")
+		}
+		return nil
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- b.do(context.Background(), fn) }()
+	for {
+		mu.Lock()
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	late := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func() { late <- b.do(context.Background(), fn) }()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	if err := <-firstDone; err == nil || err.Error() != "first" {
+		t.Fatalf("first caller got %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := <-late; err != nil {
+			t.Fatalf("a caller that arrived during the first barrier got its result: %v", err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("%d barriers for 4 callers, want 2", calls)
+	}
+}
+
+func TestUTCDayBeforeTheEpoch(t *testing.T) {
+	if d := utcDay(time.Date(1969, 12, 31, 23, 0, 0, 0, time.UTC)); d != -1 {
+		t.Fatalf("utcDay before the epoch = %d, want -1", d)
+	}
+	if d := utcDay(time.Unix(0, 0)); d != 0 {
+		t.Fatalf("utcDay(epoch) = %d", d)
 	}
 }

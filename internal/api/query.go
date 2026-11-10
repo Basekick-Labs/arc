@@ -863,9 +863,10 @@ type QueryHandler struct {
 	queryGateOnCatchup bool
 
 	// coldMark: the cluster's cold mark (#1552), nil off a cluster;
-	// coldMarkTrust caches its trust check. See query_cold_mark.go.
+	// coldMarkState caches its trust check and coalesces read barriers.
+	// See query_cold_mark.go.
 	coldMark      clusterColdMark
-	coldMarkTrust coldMarkTrustCache
+	coldMarkState coldMarkState
 
 	// gate503LogLastNano rate-limits the "gate fired" Warn to at most one per
 	// second under sustained 503 storms. Without sampling a high-RPS catch-up
@@ -4788,11 +4789,13 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		}
 		isCold := src.tier == tiering.TierCold
 		// Stop listing after the first failure only where the unlisted
-		// partitions may then be left out. Elsewhere (a cluster node, rows
-		// not yet trusted) one transient failure would turn every later day
-		// into an unchecked glob, and a day with no cold data into a "no
-		// files" 503 on a healthy store (#1550).
-		stopAfterFailure := isCold && (h.coldMetadataTrusted() || h.clusterColdMarkUsable())
+		// partitions may then be left out: trusted tier rows on a standalone
+		// node (#1550), or on a cluster node a trusted cold mark that could
+		// rule this read's range out (#1552, checked without a barrier).
+		// Elsewhere one transient failure would turn every later day into an
+		// unchecked glob, and a day with no cold data into a "no files" 503
+		// on a healthy store.
+		stopAfterFailure := isCold && (h.coldMetadataTrusted() || h.coldMarkMayDrop(database, measurement, timeRange))
 		d := h.pruner.PruneTierPathsDetail(ctx, src.glob, database, measurement, timeRange, src.backend, !isCold, stopAfterFailure)
 		if isCold && allColdPathsUnlisted(d) {
 			empty, viaMark := h.coldRangeEmpty(ctx, database, measurement, timeRange)
@@ -4828,13 +4831,14 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// the tier, as before. A transform that dropped a tier is volatile: the
 	// next flush into that tier must not wait out the cache TTL.
 	//
-	// A cold tier whose listing failed here is left out on the same terms
-	// as above (#1550): only when tier metadata, a complete record of the
-	// cold store on this node, holds no cold row for the range. With no
-	// range, or only an end, that is a measurement with no cold rows before
-	// the end, which TiersForMeasurement has mostly ruled out already; the
-	// branch matters for reads the pruner did not prune (path cap, pruning
-	// off) and for cold rows that are all quarantined.
+	// A cold tier whose listing failed here is left out only on standalone
+	// terms (#1550): when tier metadata, a complete record of the cold store
+	// on this node, holds no cold row for the range. With no range, or only
+	// an end, that is a measurement with no cold rows before the end, which
+	// TiersForMeasurement has mostly ruled out already; the branch matters
+	// for reads the pruner did not prune (path cap, pruning off) and for cold
+	// rows that are all quarantined. The cluster's cold mark never drops a
+	// tier here (#1552): only the pruner site above may.
 	kept := results[:0]
 	droppedEmpty := 0
 	for i, r := range results {
@@ -4850,13 +4854,13 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 				droppedEmpty++
 				continue
 			}
-			if !verified && src.tier == tiering.TierCold {
-				if empty, viaMark := h.coldRangeEmpty(ctx, database, measurement, timeRange); empty {
-					h.noteColdSkipped(database, measurement, 1, viaMark)
-					droppedUnlisted++
-					skippedUnlisted = true
-					continue
-				}
+			// Tier rows only (#1550): the cold mark never drops a fallback
+			// read, which has no pruned partitions to vouch for (#1552).
+			if !verified && src.tier == tiering.TierCold && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
+				h.noteColdUnlistedSkipped(database, measurement, 1)
+				droppedUnlisted++
+				skippedUnlisted = true
+				continue
 			}
 		}
 		kept = append(kept, r)
