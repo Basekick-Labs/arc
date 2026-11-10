@@ -21,6 +21,10 @@ permissions:
   id-token: write   # required for OIDC keyless signing via Sigstore/cosign
 
 env:
+  # Oldest glibc the Linux binaries may require: Ubuntu 22.04, Debian 12,
+  # RHEL/Rocky/Alma 9 and Amazon Linux 2023 (#1579). Enforced after each
+  # Linux build; the .deb's Depends is the binary's actual requirement.
+  GLIBC_FLOOR: "2.34"
   REGISTRY_GHCR: ghcr.io
   IMAGE_NAME: basekick-labs/arc
   # Docker Hub mirror — published alongside GHCR on every release.
@@ -309,6 +313,17 @@ jobs:
   # (GOFIPS140=v1.0.0). It is NOT a different version — the FIPS-ness lives in
   # the artifact NAME (arc-fips-<suffix>), never in the version string. Both
   # variants reuse the same govulncheck + cosign signing machinery.
+  #
+  # Linux legs are pinned to Ubuntu 22.04 (glibc 2.35), NOT ubuntu-latest: a
+  # CGO binary needs the glibc it was linked against, and 26.09.3, built on
+  # 24.04, needed 2.38 for fmod/fmodf alone, so it would not start on Debian
+  # 12 or Ubuntu 22.04 and would not install on RHEL 9 or Amazon Linux 2023
+  # (#1579). libstdc++ is linked in statically (see
+  # scripts/setup-linux-release-toolchain.sh). The "Check glibc floor" step
+  # below fails the build if the binary needs anything above GLIBC_FLOOR or
+  # links libstdc++ dynamically. When GitHub retires the 22.04 runners,
+  # build inside a debian:bookworm (or older) container instead; the check is
+  # what tells you if a replacement raised the floor.
   build-binaries:
     name: Build Binaries
     needs: prepare
@@ -316,25 +331,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             suffix: linux-amd64
             variant: standard
             artifact: arc-linux-amd64
             build_tags: duckdb_arrow
             gofips: ""
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             suffix: linux-arm64
             variant: standard
             artifact: arc-linux-arm64
             build_tags: duckdb_arrow
             gofips: ""
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             suffix: linux-amd64
             variant: fips
             artifact: arc-fips-linux-amd64
             build_tags: duckdb_arrow,fips
             gofips: "v1.0.0"
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             suffix: linux-arm64
             variant: fips
             artifact: arc-fips-linux-arm64
@@ -383,6 +398,10 @@ jobs:
           fi
           echo "✅ FIPS import-graph clean: no x/crypto/bcrypt or x/crypto/hkdf"
 
+      - name: Set up the Linux release toolchain
+        if: runner.os == 'Linux'
+        run: scripts/setup-linux-release-toolchain.sh
+
       - name: Build binary
         env:
           CGO_ENABLED: 1
@@ -400,6 +419,17 @@ jobs:
           # Show binary info
           file ${{ matrix.artifact }}
           ls -lh ${{ matrix.artifact }}
+
+      - name: Check glibc floor
+        if: runner.os == 'Linux'
+        run: |
+          readelf -d ${{ matrix.artifact }} | grep NEEDED
+          if readelf -d ${{ matrix.artifact }} | grep -q 'libstdc++'; then
+            echo "::error::${{ matrix.artifact }} links libstdc++ dynamically; RHEL 9 and Amazon Linux 2023 lack the version DuckDB needs (#1579)"
+            exit 1
+          fi
+          NEED=$(scripts/check-glibc-floor.sh ${{ matrix.artifact }} "${GLIBC_FLOOR}")
+          echo "✅ ${{ matrix.artifact }} requires glibc ${NEED} (floor ${GLIBC_FLOOR})" >> $GITHUB_STEP_SUMMARY
 
       # FIPS variant only: boot the freshly built binary and assert it is
       # actually running with the Go Cryptographic Module in FIPS mode. The
@@ -570,13 +600,17 @@ jobs:
           else
             DESC_SUFFIX=""
           fi
+          # The glibc the binary actually needs (at most GLIBC_FLOOR, which the
+          # build enforces), so dpkg refuses an older system up front instead
+          # of installing a binary that cannot start (#1579).
+          LIBC_MIN=$(scripts/check-glibc-floor.sh "${SRC_BIN}")
           cat > ${PKG_DIR}/DEBIAN/control << EOF
           Package: ${PKG_NAME}
           Version: ${VERSION}
           Section: database
           Priority: optional
           Architecture: ${ARCH}
-          Depends: libc6
+          Depends: libc6 (>= ${LIBC_MIN}), libgcc-s1
           Maintainer: Basekick Labs <contact@basekick.com>
           Description: Arc - High-Performance Time-Series Database${DESC_SUFFIX}
            Arc is a high-performance time-series database built on DuckDB,
@@ -789,6 +823,24 @@ jobs:
           echo "deb package smoke test passed"
           sudo systemctl stop arc
 
+      # The runner is newer than the oldest systems Arc supports, so the test
+      # above cannot see a binary that needs a newer glibc than they have:
+      # 26.09.3 passed it and then would not start on Debian 12 or Ubuntu 22.04
+      # (#1579). Install on the oldest supported releases and start the binary.
+      - name: Smoke-test the package on the oldest supported distros
+        if: matrix.arch == 'amd64'
+        run: |
+          DEB=$(ls ./*_amd64.deb)
+          for IMAGE in debian:12 ubuntu:22.04; do
+            docker run --rm -v "$PWD:/pkg:ro" -e ARC_TELEMETRY_ENABLED=false "$IMAGE" bash -c '
+              dpkg -i /pkg/'"$(basename "$DEB")"' || exit 1
+              timeout 8 /usr/bin/arc > /tmp/arc.log 2>&1
+              cat /tmp/arc.log | head -5
+              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
+            ' || { echo "::error::the .deb does not install and start on ${IMAGE}"; exit 1; }
+            echo "✅ starts on ${IMAGE}"
+          done
+
       - name: Upload Debian package
         uses: actions/upload-artifact@v6
         with:
@@ -881,6 +933,9 @@ jobs:
           URL:            https://github.com/basekick-labs/arc
           Source0:        ${PKG_NAME}-${VERSION}.tar.gz
           Source1:        arc.service
+          # %pre runs useradd: minimal images (amazonlinux:2023) lack it, and a
+          # failing %pre aborts the install.
+          Requires(pre):  shadow-utils
 
           %description
           Arc is a high-performance time-series database built on DuckDB,
@@ -957,6 +1012,22 @@ jobs:
 
           # Create checksum
           sha256sum ${PKG_NAME}-${VERSION}-1.*.rpm > ${PKG_NAME}-${VERSION}-1.${ARCH}.rpm.sha256
+
+      # The oldest supported RPM systems (glibc 2.34): 26.09.3's RPM required
+      # glibc 2.38 and dnf refused it on RHEL 9 and Amazon Linux 2023 (#1579).
+      - name: Smoke-test the package on the oldest supported distros
+        if: matrix.arch == 'x86_64'
+        run: |
+          RPM=$(ls ./*.x86_64.rpm)
+          for IMAGE in rockylinux:9 amazonlinux:2023; do
+            docker run --rm -v "$PWD:/pkg:ro" -e ARC_TELEMETRY_ENABLED=false "$IMAGE" bash -c '
+              dnf install -y -q /pkg/'"$(basename "$RPM")"' || exit 1
+              timeout 8 /usr/bin/arc > /tmp/arc.log 2>&1
+              cat /tmp/arc.log | head -5
+              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
+            ' || { echo "::error::the RPM does not install and start on ${IMAGE}"; exit 1; }
+            echo "✅ starts on ${IMAGE}"
+          done
 
       - name: Upload RPM package
         uses: actions/upload-artifact@v6
