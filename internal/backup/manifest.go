@@ -317,9 +317,18 @@ type BackupSummary struct {
 	UnaddressableFiles   int64 `json:"unaddressable_files,omitempty"`
 	// Cluster cross-check counts (#1083), see Manifest. ManifestOnlyFiles is
 	// a real gap; UnregisteredSkipped is a deliberate exclusion.
-	UnregisteredSkipped   int64 `json:"unregistered_skipped,omitempty"`
-	ManifestOnlyFiles     int64 `json:"manifest_only_files,omitempty"`
-	LeftManifestDuringRun int64 `json:"left_manifest_during_run,omitempty"`
+	// SkippedReconciled is the part of SkippedFiles whose file had left the
+	// cluster manifest by the end of the run, so it is not missing data: a
+	// client deciding whether the backup is incomplete counts
+	// SkippedFiles - SkippedReconciled, the same as restore does (#1555).
+	// ClusterManifestChecked says the run cross-checked against the cluster
+	// manifest at all; it is omitted, never sent as false, on a backup that
+	// did not (a standalone node, or a manifest written before #1083).
+	ClusterManifestChecked bool  `json:"cluster_manifest_checked,omitempty"`
+	UnregisteredSkipped    int64 `json:"unregistered_skipped,omitempty"`
+	ManifestOnlyFiles      int64 `json:"manifest_only_files,omitempty"`
+	LeftManifestDuringRun  int64 `json:"left_manifest_during_run,omitempty"`
+	SkippedReconciled      int64 `json:"skipped_reconciled,omitempty"`
 	// Target and OwnerInstanceID mirror the manifest's (#1085 stage B2b-1):
 	// which configured destination holds the backup, and which instance wrote
 	// it. ForeignOwner says the second belongs to a different instance than
@@ -699,22 +708,24 @@ func UnmarshalManifest(data []byte) (*Manifest, error) {
 // SummaryFromManifest creates a compact summary from a full manifest.
 func SummaryFromManifest(m *Manifest) BackupSummary {
 	return BackupSummary{
-		BackupID:              m.BackupID,
-		CreatedAt:             m.CreatedAt,
-		BackupType:            m.BackupType,
-		Scope:                 m.Scope,
-		TotalFiles:            m.TotalFiles,
-		TotalBytes:            m.TotalSizeBytes,
-		DatabaseCount:         len(m.Databases),
-		SkippedFiles:          m.SkippedFiles,
-		SkippedMetadataFiles:  m.SkippedMetadataFiles,
-		UnaddressableFiles:    m.UnaddressableFiles,
-		UnregisteredSkipped:   m.UnregisteredSkipped,
-		ManifestOnlyFiles:     m.ManifestOnlyFiles,
-		LeftManifestDuringRun: m.LeftManifestDuringRun,
-		Target:                m.Target,
-		OwnerInstanceID:       m.OwnerInstanceID,
-		ColdFilesExcluded:     m.ColdFilesExcluded,
-		ColdFiles:             m.ColdFiles,
+		BackupID:               m.BackupID,
+		CreatedAt:              m.CreatedAt,
+		BackupType:             m.BackupType,
+		Scope:                  m.Scope,
+		TotalFiles:             m.TotalFiles,
+		TotalBytes:             m.TotalSizeBytes,
+		DatabaseCount:          len(m.Databases),
+		SkippedFiles:           m.SkippedFiles,
+		SkippedMetadataFiles:   m.SkippedMetadataFiles,
+		UnaddressableFiles:     m.UnaddressableFiles,
+		ClusterManifestChecked: m.ClusterManifestChecked,
+		UnregisteredSkipped:    m.UnregisteredSkipped,
+		ManifestOnlyFiles:      m.ManifestOnlyFiles,
+		LeftManifestDuringRun:  m.LeftManifestDuringRun,
+		SkippedReconciled:      m.SkippedReconciled,
+		Target:                 m.Target,
+		OwnerInstanceID:        m.OwnerInstanceID,
+		ColdFilesExcluded:      m.ColdFilesExcluded,
+		ColdFiles:              m.ColdFiles,
 	}
 }
