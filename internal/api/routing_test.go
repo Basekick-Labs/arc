@@ -1,6 +1,7 @@
 package api
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -474,6 +475,11 @@ func TestHandleRoutingError(t *testing.T) {
 	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusBadGateway, resp.StatusCode)
+	// The cause stays in the log: a wrapped routing error names the peer's
+	// internal URL (#1567).
+	body, _ := io.ReadAll(resp.Body)
+	assert.NotContains(t, string(body), "connection refused")
+	assert.Contains(t, string(body), "Failed to route request to cluster node")
 }
 
 // The forwarding node's own middleware sets headers before CopyResponse runs,

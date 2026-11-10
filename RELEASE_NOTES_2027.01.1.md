@@ -88,20 +88,25 @@ A forwarded Arrow result is streamed, not buffered, and keeps its trailers:
 - `Arc-Execution-Time-Ms`
 
 So a client sees a truncated or capped result as such, as it does when it asks
-the reader directly. The stream is bounded by the query timeout, not by
-`cluster.route_timeout`: that 5-second default would cut any longer result.
+the reader directly. `cluster.route_timeout` does not apply to the stream:
+that 5-second default would cut any longer result. The answering node bounds
+the query, with its query timeout and any governance limit on the token. The
+compactor only bounds the wait for the answer to start, by its own query
+timeout plus 30 s.
 
 If the answering node fails partway through, the forwarded response ends as a
 broken transfer (the connection closes before the end of the body), not as a
 short result that looks complete.
 
-**Rolling upgrades.** A compactor forwards an Arrow query only to readers that
-advertise the new `forward_arrow_query_v1` capability. Until one does, it runs
-the query itself, as before.
+**Rolling upgrades.** A compactor forwards an Arrow query only to nodes that
+advertise the new `forward_arrow_query_v1` capability: readers, or writers
+when the cluster has no readers. Until one does, it runs the query itself, as
+before. It also runs the query itself while no capable reader is healthy,
+where `/api/v1/query` answers 503 instead.
 
 A routing error no longer includes the peer's internal address in the
-response body: it is "Failed to route request to cluster node" for every
-route.
+response body. A failed forward now answers "Failed to route request to
+cluster node"; "no reader/writer available" keeps its own message.
 
 Other read endpoints still run locally on a compactor: `/api/v1/query/estimate`,
 `GET /api/v1/query/:measurement`, `/api/v1/measurements` and the measurement

@@ -496,9 +496,15 @@ func (r *Router) RouteArrowQuery(ctx context.Context, req *http.Request) (*http.
 		}
 		return out
 	}
-	// Readers first, writers when there are none, as RouteQuery does.
-	nodes := capable(r.cfg.Registry.GetReaders())
-	if len(nodes) == 0 {
+	// Readers first; writers only when there are no readers at all, as
+	// RouteQuery does. Readers that all lack the capability (a rolling
+	// upgrade that reached a writer first) do not send the query to the
+	// writer: it runs locally instead.
+	readers := r.cfg.Registry.GetReaders()
+	var nodes []*Node
+	if len(readers) > 0 {
+		nodes = capable(readers)
+	} else {
 		nodes = capable(r.cfg.Registry.GetWriters())
 	}
 	if len(nodes) == 0 {

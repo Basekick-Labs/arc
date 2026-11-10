@@ -91,12 +91,14 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // forwarding via the router.
 //
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// import.go, tle.go, query.go) invokes the returned *http.Request synchronously
-// within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
-// (which blocks on http.Client.Do; queries are buffered for retries, writes
-// are streamed once and never retried, see internal/cluster/router.go), then
-// read+close the response
-// body inside CopyResponse, then return. fasthttp does not recycle the
+// import.go, tle.go, query.go, query_arrow_forward.go) invokes the returned
+// *http.Request synchronously within the Fiber handler — they pass it to
+// router.RouteWrite/RouteQuery/RouteArrowQuery (which blocks on
+// http.Client.Do; queries are buffered for retries, writes are streamed once
+// and never retried, see internal/cluster/router.go). All but the Arrow
+// forward then read+close the response body inside CopyResponse and return;
+// the Arrow forward streams the response body after the handler returns
+// (see below). fasthttp does not recycle the
 // RequestCtx until after the handler returns (fasthttp server.go
 // releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
 // directly is safe and avoids a copy that can be large at max payload

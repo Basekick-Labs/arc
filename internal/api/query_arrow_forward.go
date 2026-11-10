@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster"
@@ -28,7 +29,11 @@ import (
 //     (Arc-Stream-Truncated, Arc-Rows-Capped, Arc-Execution-Time-Ms) arrive
 //     only after the body, and fasthttp sends trailers only on a streamed
 //     (chunked) response. The router's streaming client has no whole-response
-//     timeout; the request is bounded by the query timeout instead.
+//     timeout. Only the wait for the answer's headers is bounded here (a peer
+//     that accepts and never answers); the body is bounded by the answering
+//     node, which applies the query timeout and any governance MaxDuration
+//     the token carries (this node does not know them, and asking governance
+//     here would count the request twice).
 //   - An upstream failure partway through the body ends this response as a
 //     failed transfer (streamAbort): no terminating chunk, connection closed.
 //     The Arrow endpoint's in-band truncation marker (poisonArrowStream) is
@@ -40,14 +45,18 @@ import (
 // none (an older reader in a rolling upgrade, no Raft) the query runs locally,
 // as before.
 
-// arrowForwardSlack is added to the query timeout to bound a forwarded Arrow
-// query: the answering node enforces the query timeout itself, so the forward
-// only has to outlast it by the time to deliver the end of the stream.
-const arrowForwardSlack = 30 * time.Second
+// arrowForwardSlack is added to this node's query timeout to bound the wait
+// for a forwarded Arrow query's headers. The answering node sends them once
+// the query has produced its result schema, within its own timeout.
+var arrowForwardSlack = 30 * time.Second // a var so a test can shorten it
 
 // arrowTrailerNames are the trailers the Arrow endpoint declares; a forward
 // declares and relays exactly these.
 var arrowTrailerNames = []string{arrowStreamTruncatedTrailer, arrowExecutionTimeTrailer, arrowRowsCappedTrailer}
+
+// arrowForwardTrailerWarnOnce gates the forward's own trailer-registration
+// warning, separately from the local Arrow path's.
+var arrowForwardTrailerWarnOnce sync.Once
 
 // errForwardedArrowPanicked aborts a forwarded stream whose relay panicked.
 var errForwardedArrowPanicked = errors.New("forwarded Arrow stream relay panicked")
@@ -68,17 +77,17 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 	}
 
 	// The request's context carries the forwarded identity
-	// (BuildHTTPRequest); the timeout is layered on it, not substituted.
-	parent := httpReq.Context()
-	var ctx context.Context
-	var cancel context.CancelFunc
+	// (BuildHTTPRequest); cancellation is layered on it, not substituted.
+	// The header timer bounds only the wait for the answer to start.
+	ctx, cancel := context.WithCancel(httpReq.Context())
+	var headerTimer *time.Timer
 	if h.queryTimeout > 0 {
-		ctx, cancel = context.WithTimeout(parent, h.queryTimeout+arrowForwardSlack)
-	} else {
-		ctx, cancel = context.WithCancel(parent)
+		headerTimer = time.AfterFunc(h.queryTimeout+arrowForwardSlack, cancel)
 	}
-
 	resp, err := h.router.RouteArrowQuery(ctx, httpReq.WithContext(ctx))
+	if headerTimer != nil {
+		headerTimer.Stop()
+	}
 	if errors.Is(err, cluster.ErrLocalNodeCanHandle) || errors.Is(err, cluster.ErrNoArrowQueryPeer) {
 		cancel()
 		return false, nil
@@ -103,7 +112,7 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 	// own Trailer header is hop-by-hop and not copied.
 	for _, name := range arrowTrailerNames {
 		if err := fctx.Response.Header.AddTrailer(name); err != nil {
-			arrowTrailerWarnOnce.Do(func() {
+			arrowForwardTrailerWarnOnce.Do(func() {
 				h.logger.Warn().Err(err).Str("trailer", name).
 					Msg("Failed to register an Arrow trailer on a forwarded response; clients will not see it")
 			})
@@ -122,8 +131,10 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 		defer closeUpstream()
 		if err := relayArrowBody(w, resp.Body); err != nil {
 			var clientGone *clientWriteError
-			if errors.As(err, &clientGone) {
-				// The client left; closing the upstream body stops its query.
+			if errors.As(err, &clientGone) || ctx.Err() != nil {
+				// The client left, or the response was dropped before its
+				// body (Close cancels and closes the upstream first): not an
+				// upstream failure. Closing the upstream body stops its query.
 				return
 			}
 			m.IncQueryErrors()

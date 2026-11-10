@@ -198,3 +198,26 @@ func TestArrowQueryIsNotForwardedWithoutACapablePeer(t *testing.T) {
 func TestArrowQueryRouteAcceptsAForwardedIdentity(t *testing.T) {
 	require.True(t, forwardedRoutes["POST /api/v1/query/arrow"])
 }
+
+// A peer that accepts the connection and never answers is bounded by the
+// header timer (this node's query timeout + slack), not left to hang.
+func TestForwardedArrowQueryHungPeerIsBounded(t *testing.T) {
+	r := newDoorRig(t)
+	release := make(chan struct{})
+	peer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	defer peer.Close()
+	defer close(release)
+	r.qh.SetRouter(arrowForwardRouter(t, peer.URL, cluster.RoleCompactor, true))
+	r.qh.queryTimeout = 200 * time.Millisecond
+	old := arrowForwardSlack
+	arrowForwardSlack = 0
+	defer func() { arrowForwardSlack = old }()
+
+	start := time.Now()
+	resp := r.arrowQuery(t)
+	_, _ = io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	require.Less(t, time.Since(start), 5*time.Second)
+}

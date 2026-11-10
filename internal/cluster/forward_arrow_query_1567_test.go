@@ -51,3 +51,28 @@ func TestRouteArrowQueryNeedsACapablePeer(t *testing.T) {
 		t.Fatalf("a reader: err = %v, want ErrLocalNodeCanHandle", err)
 	}
 }
+
+// Readers that all lack the capability (a rolling upgrade that reached a
+// writer first) do not send Arrow queries to the writer: writers are used only
+// when the cluster has no readers, as RouteQuery does.
+func TestRouteArrowQueryDoesNotFallBackToAWriterPastIncapableReaders(t *testing.T) {
+	local := NewNode("local", "Local", RoleCompactor, "c")
+	registry := NewRegistry(&RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
+	reader := NewNode("old-reader", "R", RoleReader, "c")
+	reader.UpdateState(StateHealthy)
+	reader.APIAddress = "127.0.0.1:1"
+	writer := NewNode("new-writer", "W", RoleWriter, "c")
+	writer.UpdateState(StateHealthy)
+	writer.APIAddress = "127.0.0.1:2"
+	for _, n := range []*Node{reader, writer} {
+		if err := registry.Register(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := NewRouter(&RouterConfig{Registry: registry, LocalNode: local, Logger: zerolog.Nop(),
+		PeerArrowQuery: func(id string) bool { return id == "new-writer" }})
+	req, _ := http.NewRequest(http.MethodPost, "http://x/api/v1/query/arrow", nil)
+	if _, err := r.RouteArrowQuery(context.Background(), req); !errors.Is(err, ErrNoArrowQueryPeer) {
+		t.Fatalf("err = %v, want ErrNoArrowQueryPeer (no fallback to the writer)", err)
+	}
+}
