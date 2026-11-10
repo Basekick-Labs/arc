@@ -85,13 +85,15 @@ The create now starts the subscription and answers with its status:
 
 - **`running`** once connected. While writes are refused on the node (fenced,
   WAL disk pressure and the other suspend reasons) it starts suspended, as
-  `POST .../start` does.
+  `POST .../start` does, and the status still reads `running`.
 - **`error`**, with the reason in `error_message`, when it cannot connect. The
   subscription is still created (201): fix the broker or credentials, then
   `POST .../start`.
 
 The create waits for the connection, up to `connect_timeout_seconds`
-(default 30). Without `auto_start` nothing changes.
+(default 30). A client or proxy that gives up sooner sees a failure, although
+the subscription was created: list the subscriptions before creating it again.
+Without `auto_start` nothing changes.
 
 ## Changed: continuous queries are enabled in the packaged configuration
 

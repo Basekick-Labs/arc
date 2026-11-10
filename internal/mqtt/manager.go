@@ -436,9 +436,10 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 	} else {
 		sub.Status = StatusRunning
 	}
-	// Report the stored status, which a start that suspends at once (writes
-	// fenced, WAL disk pressure) may already have changed. Only a read: if
-	// it fails, the status set above stands.
+	// Report the stored row: a Delete racing the start leaves none, and the
+	// fields Create did not set (timestamps) come back as stored. Only a
+	// read: if it fails, the status set above stands. A start that suspends
+	// at once (writes fenced, WAL disk pressure) still reads running.
 	if got, err := m.repo.Get(ctx, sub.ID); err == nil && got != nil {
 		return got, nil
 	}
