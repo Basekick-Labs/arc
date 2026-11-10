@@ -66,6 +66,21 @@ declares `Requires(pre): shadow-utils`. Each release now installs and starts
 its packages on Debian 12, Ubuntu 22.04, Rocky 9 and Amazon Linux 2023 before
 publishing.
 
+## Changed: the RPMs are signed
+
+rpm 6.1, which Fedora 45 ships, refuses an unsigned package by default
+(`%_pkgverify_level all`), and every Arc RPM up to 26.09.3 was unsigned:
+`package arc-26.09.3-1.x86_64 does not verify: no signature`. The RPMs (arc
+and arc-fips) are now signed with the Basekick Labs package key. Its
+fingerprint is `3E39 9CF8 F5D2 EF9A A9A5 36EF 7629 7AF0 8CBA B6FE`, and it is
+published with this release as `RPM-GPG-KEY-basekick`. Import it once, then
+install:
+
+```bash
+sudo rpm --import https://github.com/basekick-labs/arc/releases/download/v26.09.4/RPM-GPG-KEY-basekick
+sudo dnf install -y ./arc-26.09.4-1.x86_64.rpm
+```
+
 ## Changed: continuous queries are enabled in the packaged configuration
 
 The `arc.toml` shipped in the `.deb`, RPM, Arch package and Docker image set
