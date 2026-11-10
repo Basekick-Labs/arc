@@ -862,6 +862,11 @@ type QueryHandler struct {
 	coordinator        replicationReadiness
 	queryGateOnCatchup bool
 
+	// coldMark: the cluster's cold mark (#1552), nil off a cluster;
+	// coldMarkTrust caches its trust check. See query_cold_mark.go.
+	coldMark      clusterColdMark
+	coldMarkTrust coldMarkTrustCache
+
 	// gate503LogLastNano rate-limits the "gate fired" Warn to at most one per
 	// second under sustained 503 storms. Without sampling a high-RPS catch-up
 	// would flood operator logs.
@@ -1331,8 +1336,10 @@ type replicationReadiness interface {
 func (h *QueryHandler) SetCluster(coordinator *cluster.Coordinator, queryGateOnCatchup bool) {
 	if coordinator == nil {
 		h.coordinator = nil
+		h.coldMark = nil
 	} else {
 		h.coordinator = coordinator
+		h.coldMark = coordinator
 	}
 	h.queryGateOnCatchup = queryGateOnCatchup
 }
@@ -4680,6 +4687,27 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		return readParquetExpr(keyword, h.anchorFor(ctx, database, measurement), []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
 
+	timeRange := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL)
+	// A cluster node whose rows hold no cold row for this measurement still
+	// reads the cold tier when the trusted cold mark says the range may hold
+	// cold data: the rows lag the cold store on a reader (#1552).
+	if !actualTiers[tiering.TierCold] && tiers.GetBackendForTier(tiering.TierCold) != nil {
+		if _, ok := tieredPaths[tiering.TierCold]; ok && h.clusterColdMayHaveData(database, measurement, timeRange) {
+			// A copy: the map can be the tier cache's own.
+			withCold := map[tiering.Tier]bool{tiering.TierCold: true}
+			for tier, has := range actualTiers {
+				withCold[tier] = withCold[tier] || has
+			}
+			if len(actualTiers) == 0 {
+				// No rows at all: read hot as the fallback below would.
+				withCold[tiering.TierHot] = true
+			}
+			actualTiers = withCold
+			// The rows will catch up; this transform must not outlive that.
+			pruning.MarkVolatile(ctx)
+		}
+	}
+
 	// If no metadata found, fall back to hot tier (data might not be registered yet)
 	if len(actualTiers) == 0 {
 		h.logger.Debug().
@@ -4740,7 +4768,6 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// backend; a tier verified to hold no data for the time range is dropped
 	// entirely (a recent-range dashboard query never lists or reads cold
 	// object storage beyond the cached parent listings).
-	timeRange := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL)
 	results := make([]tierPruneResult, 0, len(sources))
 	// resultSources[i] is the source of results[i]: a cold tier left out
 	// below has no result, so the two no longer line up with sources.
@@ -4765,9 +4792,15 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		// not yet trusted) one transient failure would turn every later day
 		// into an unchecked glob, and a day with no cold data into a "no
 		// files" 503 on a healthy store (#1550).
-		stopAfterFailure := isCold && h.coldMetadataTrusted()
+		stopAfterFailure := isCold && (h.coldMetadataTrusted() || h.clusterColdMarkUsable())
 		d := h.pruner.PruneTierPathsDetail(ctx, src.glob, database, measurement, timeRange, src.backend, !isCold, stopAfterFailure)
-		if isCold && allColdPathsUnlisted(d) && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
+		if isCold && allColdPathsUnlisted(d) {
+			empty, viaMark := h.coldRangeEmpty(ctx, database, measurement, timeRange)
+			if !empty {
+				results = append(results, tierPruneResult{glob: src.glob, paths: d.Paths, outcome: d.Outcome})
+				resultSources = append(resultSources, src)
+				continue
+			}
 			// The cold tier could not be listed for any of these partitions,
 			// and this node's tier metadata, a complete record of the cold
 			// store, holds no cold row in the range: they cannot hold data,
@@ -4775,7 +4808,9 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			// (#1550). Dropped as a source, not reported Empty:
 			// combineTierPruneResults keeps an Empty tier's full glob unless
 			// another tier pruned, and that glob is the read this avoids.
-			h.noteColdUnlistedSkipped(database, measurement, len(d.Paths))
+			// On a cluster node the cluster's cold mark answers instead of
+			// the rows (#1552).
+			h.noteColdSkipped(database, measurement, len(d.Paths), viaMark)
 			skippedUnlisted = true
 			droppedUnlisted++
 			continue
@@ -4815,11 +4850,13 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 				droppedEmpty++
 				continue
 			}
-			if !verified && src.tier == tiering.TierCold && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
-				h.noteColdUnlistedSkipped(database, measurement, 1)
-				droppedUnlisted++
-				skippedUnlisted = true
-				continue
+			if !verified && src.tier == tiering.TierCold {
+				if empty, viaMark := h.coldRangeEmpty(ctx, database, measurement, timeRange); empty {
+					h.noteColdSkipped(database, measurement, 1, viaMark)
+					droppedUnlisted++
+					skippedUnlisted = true
+					continue
+				}
 			}
 		}
 		kept = append(kept, r)

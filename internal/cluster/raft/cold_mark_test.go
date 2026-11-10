@@ -302,3 +302,28 @@ func TestColdMarkAliveSnapshot(t *testing.T) {
 		t.Fatalf("restored alive %v, want %v", got, t0)
 	}
 }
+
+// An admin reset clears the seed and a backend conflict, keeps the marks, and
+// the next seed after the fence trusts again.
+func TestColdMarkResetReseeds(t *testing.T) {
+	x := trustedFSM(t)
+	x.ok(CommandColdMarkAdd, ColdMarkAddPayload{Marks: map[string]int32{"db/cpu": 9}})
+	x.ok(CommandColdMarkSeed, ColdMarkSeedPayload{Final: true, Backend: "s3://other/"})
+	if !x.f.ColdMarkStatus().BackendConflict {
+		t.Fatal("setup: no conflict")
+	}
+	x.ok(CommandColdMarkReset, ColdMarkResetPayload{By: "admin"})
+	st := x.f.ColdMarkStatus()
+	if st.Seeded || st.BackendConflict || !st.Fenced {
+		t.Fatalf("after reset: %+v", st)
+	}
+	if day, has, _ := x.f.ColdMark("db/cpu"); !has || day != 9 {
+		t.Fatal("reset dropped a mark")
+	}
+	x.ok(CommandColdMarkSeed, ColdMarkSeedPayload{Final: true, Backend: "s3://other/"})
+	now := t0.Add(time.Hour)
+	aliveAll(x, now)
+	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil, "s3://other/"); !ok {
+		t.Fatalf("not trusted after reseed: %s", why)
+	}
+}

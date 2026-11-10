@@ -188,6 +188,46 @@ func (c *Coordinator) ColdMarkTrusted(now time.Time, maxAge time.Duration, local
 	return fsm.ColdMarkTrustedFor(now, maxAge, servers, localIdentity)
 }
 
+// ColdMarkDay returns scope's mark ("database/measurement") as days since the
+// epoch; has is false when no cold object of the scope was ever marked.
+func (c *Coordinator) ColdMarkDay(scope string) (day int32, has bool) {
+	if c == nil || c.raftNode == nil {
+		return 0, false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return 0, false
+	}
+	day, has, _ = fsm.ColdMark(scope)
+	return day, has
+}
+
+// coldMarkReadBarrierTimeout bounds the catch-up check a read makes before it
+// trusts the mark; only reads whose cold listing failed make it.
+const coldMarkReadBarrierTimeout = 2 * time.Second
+
+// ColdMarkReadBarrier returns once this node's FSM has applied everything the
+// leader had committed when it was called, so a mark read afterwards is not
+// older than the cluster's (a lagging reader would otherwise trust a mark
+// below a cold write already committed).
+func (c *Coordinator) ColdMarkReadBarrier(ctx context.Context) error {
+	return c.readBarrier(ctx, coldMarkReadBarrierTimeout)
+}
+
+// ResetColdMark clears the mark's seed, identity and backend conflict (an
+// admin action, after fixing a node's cold tier config). Marks are kept; the
+// next cold listing after the fence seeds again.
+func (c *Coordinator) ResetColdMark(ctx context.Context, by, reason string) error {
+	if c == nil || c.raftNode == nil {
+		return errors.New("clustering is not enabled on this node")
+	}
+	raw, err := json.Marshal(raft.ColdMarkResetPayload{By: by, Reason: reason})
+	if err != nil {
+		return err
+	}
+	return c.applyOrForward(ctx, &raft.Command{Type: raft.CommandColdMarkReset, Payload: raw})
+}
+
 // SetColdMarkIdentity wires this node's cold store identity (tiering's
 // ColdBackendIdentity); "" while it has no cold tier.
 func (c *Coordinator) SetColdMarkIdentity(fn func() string) {

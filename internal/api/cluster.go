@@ -165,6 +165,15 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 	}
 	compactorGroup.Post("/assign", h.handleAssignCompactor)
 
+	// Admin-only: reset the cold mark's seed (#1552), after fixing a node
+	// whose cold tier pointed at another store. Marks are kept; the next cold
+	// listing seeds again, and reads stop using the mark until then.
+	coldMarkGroup := app.Group("/api/v1/cluster/cold-mark")
+	if h.authManager != nil {
+		coldMarkGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	coldMarkGroup.Post("/reset", h.handleResetColdMark)
+
 	// Admin-only: converge the Raft voter set onto the role-based rule
 	// (#880). Named "converge" rather than "reconcile" because
 	// internal/reconciliation is already the manifest-vs-storage reconciler,
@@ -497,6 +506,27 @@ func (h *ClusterHandler) handleAssignCompactor(c *fiber.Ctx) error {
 // applies the selection rules. On a cluster with automatic failover this is a
 // way to drain a writer deliberately; on one without, it is the only way to
 // recover after the primary is gone for good.
+func (h *ClusterHandler) handleResetColdMark(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node, so there is no cold mark to reset",
+		})
+	}
+	reason := c.Query("reason")
+	if len(reason) > maxDeleteReasonLen {
+		reason = reason[:maxDeleteReasonLen]
+	}
+	reason = utils.CopyString(reason)
+	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	defer cancel()
+	if err := h.coordinator.ResetColdMark(ctx, "admin-api", reason); err != nil {
+		h.logger.Error().Err(err).Msg("Failed to reset the cold mark")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"success": true, "message": "cold mark seed reset; the next cold-tier metadata sync on the primary seeds it again"})
+}
+
 func (h *ClusterHandler) handleDemoteWriter(c *fiber.Ctx) error {
 	// Validate the input before anything else, so a malformed request is
 	// rejected the same way whether or not this node is clustered.

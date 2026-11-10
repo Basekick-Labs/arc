@@ -63,8 +63,10 @@ import (
 // still commit); the liveness check covers every other case.
 //
 // A reader also checks that its own cold store is the one the mark was
-// seeded from (ColdMarkTrustedFor's localIdentity). BackendConflict is
-// permanent: there is no reset path yet.
+// seeded from (ColdMarkTrustedFor's localIdentity). BackendConflict stays
+// until an admin resets the seed (CommandColdMarkReset): that clears Seeded,
+// the identity and the conflict, keeps every mark (they stay a superset), and
+// the next cold listing after the fence seeds again.
 
 // CapabilityColdMark is advertised at join by every build that maintains the
 // cold mark.
@@ -120,6 +122,13 @@ type ColdMarkAckPayload struct {
 type ColdMarkAlivePayload struct {
 	NodeID string    `json:"node_id"`
 	At     time.Time `json:"at"`
+}
+
+// ColdMarkResetPayload is an admin resetting the seed, with who and why for
+// the log.
+type ColdMarkResetPayload struct {
+	By     string `json:"by,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // ColdMarkSeedPayload folds a cold listing into the marks. Final sets Seeded,
@@ -408,6 +417,20 @@ func (f *ClusterFSM) applyColdMarkSeed(payload []byte) interface{} {
 		st.Seeded = true
 		f.logger.Info().Int("scopes", len(st.Marks)).Msg("Cold mark seeded")
 	}
+	return nil
+}
+
+func (f *ClusterFSM) applyColdMarkReset(payload []byte) interface{} {
+	var p ColdMarkResetPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal cold mark reset payload: %w", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st := f.coldMarkLocked()
+	st.Seeded, st.Backend, st.BackendConflict = false, "", false
+	f.logger.Warn().Str("by", p.By).Str("reason", p.Reason).
+		Msg("Cold mark seed reset by an admin: readers stop using it until the next cold listing seeds it again")
 	return nil
 }
 

@@ -238,3 +238,29 @@ func TestColdMarkAliveReplacesAFutureAlive(t *testing.T) {
 	c.maybeColdMarkAlive(context.Background(), now)
 	waitFSM(t, func() bool { return fsm.ColdMarkLastAlive("writer-1").Equal(now.UTC()) })
 }
+
+// ColdMarkDay reads the FSM; the read barrier and reset go through Raft.
+func TestColdMarkDayBarrierAndReset(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	if _, has := c.ColdMarkDay("db/cpu"); has {
+		t.Fatal("mark before any write")
+	}
+	if err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 77}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ColdMarkReadBarrier(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if day, has := c.ColdMarkDay("db/cpu"); !has || day != 77 {
+		t.Fatalf("day %d %v", day, has)
+	}
+	if err := c.ResetColdMark(context.Background(), "admin", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ColdMarkReadBarrier(context.Background()); err == nil {
+		t.Fatal("a barrier succeeded with Raft stopped")
+	}
+}

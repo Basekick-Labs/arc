@@ -272,6 +272,25 @@ The edge-sync hub endpoints moved to RBAC as well; see
 "Fix: edge-sync pushes are decided by RBAC on the spoke's database"
 ([#1561](https://github.com/Basekick-Labs/arc/issues/1561)).
 
+## Fix: recent-data queries keep working on cluster nodes while the cold tier is unreachable ([#1552](https://github.com/Basekick-Labs/arc/issues/1552), part 2 of 2)
+
+The cluster counterpart of #1550. On a cluster node, a read whose cold tier listing fails now answers from hot data when the cluster's cold mark (part 1, below) shows the read cannot need cold data:
+
+- the mark is trusted: enabled, fenced, seeded from this node's own cold store, and every node and Raft server confirmed it within 15 minutes;
+- this node is caught up with the leader (a Raft read barrier, at most 2 seconds);
+- the read states a start (`time >= ...`), and that start is on a UTC day after the measurement's mark, or the measurement was never marked;
+- every cold partition the read kept is one whose listing failed, as in #1550.
+
+Otherwise the read fails as it did. A read with only an end, or no time range, keeps failing during an outage. Standalone nodes keep #1550's rule.
+
+Also on cluster nodes: a measurement this node holds no cold-tier rows for (its rows lag the cold store) used to be read from hot only, silently leaving out cold data the cluster had. With a trusted mark that says the range may hold cold data, the read now includes the cold tier. With an untrusted mark the old behaviour stays.
+
+Admins can reset the mark's seed with `POST /api/v1/cluster/cold-mark/reset` (admin token), for example after fixing a node whose cold tier pointed at another store. Reads stop using the mark until the next cold-tier metadata sync on the primary seeds it again.
+
+Observability: `arc_query_cold_mark_skipped_total` counts reads answered this way, with a `Warn` at most once a minute per measurement; `GET /api/v1/cluster` shows `cold_mark.trusted` and why not.
+
+Performance: healthy reads run one cached trust check (refreshed at most every 5 seconds; it reads the Raft configuration) to decide whether listing may stop after a failure, plus one map lookup for a measurement with no cold rows. Only a read whose cold listing already failed pays the read barrier, a Raft round trip of at most 2 seconds.
+
 ## Cluster: a replicated record of which days may be in the cold tier ([#1552](https://github.com/Basekick-Labs/arc/issues/1552), part 1 of 2)
 
 Groundwork for answering recent-data queries on cluster nodes while the cold tier cannot be listed (the standalone case is #1550). This release changes no query behaviour.
