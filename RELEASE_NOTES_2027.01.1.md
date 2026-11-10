@@ -74,6 +74,44 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: Arrow queries sent to a compactor are answered by a reader ([#1567](https://github.com/Basekick-Labs/arc/issues/1567))
+
+A node that cannot serve queries (a compactor) forwarded `POST /api/v1/query`
+and `/api/v1/query/msgpack` to a reader, but ran `POST /api/v1/query/arrow`
+itself. The Arrow endpoint now forwards too, so query load stays off
+compactors whichever endpoint a client uses.
+
+A forwarded Arrow result is streamed, not buffered, and keeps its trailers:
+
+- `Arc-Stream-Truncated`
+- `Arc-Rows-Capped`
+- `Arc-Execution-Time-Ms`
+
+So a client sees a truncated or capped result as such, as it does when it asks
+the reader directly. `cluster.route_timeout` does not apply to the stream:
+that 5-second default would cut any longer result. The answering node bounds
+the query, with its query timeout and any governance limit on the token. The
+compactor only bounds the wait for the answer to start, by its own query
+timeout plus 30 s.
+
+If the answering node fails partway through, the forwarded response ends as a
+broken transfer (the connection closes before the end of the body), not as a
+short result that looks complete.
+
+**Rolling upgrades.** A compactor forwards an Arrow query only to nodes that
+advertise the new `forward_arrow_query_v1` capability: readers, or writers
+when the cluster has no readers. Until one does, it runs the query itself, as
+before. It also runs the query itself while no capable reader is healthy,
+where `/api/v1/query` answers 503 instead.
+
+A routing error no longer includes the peer's internal address in the
+response body. A failed forward now answers "Failed to route request to
+cluster node"; "no reader/writer available" keeps its own message.
+
+Other read endpoints still run locally on a compactor: `/api/v1/query/estimate`,
+`GET /api/v1/query/:measurement`, `/api/v1/measurements` and the measurement
+schema route.
+
 ## Fix: forwarded responses keep every value of a repeated header ([#1556](https://github.com/Basekick-Labs/arc/pull/1556))
 
 When a cluster node forwards a request to another node, the response

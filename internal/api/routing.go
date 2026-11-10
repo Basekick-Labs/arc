@@ -91,12 +91,14 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // forwarding via the router.
 //
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// import.go, tle.go, query.go) invokes the returned *http.Request synchronously
-// within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
-// (which blocks on http.Client.Do; queries are buffered for retries, writes
-// are streamed once and never retried, see internal/cluster/router.go), then
-// read+close the response
-// body inside CopyResponse, then return. fasthttp does not recycle the
+// import.go, tle.go, query.go, query_arrow_forward.go) invokes the returned
+// *http.Request synchronously within the Fiber handler — they pass it to
+// router.RouteWrite/RouteQuery/RouteArrowQuery (which blocks on
+// http.Client.Do; queries are buffered for retries, writes are streamed once
+// and never retried, see internal/cluster/router.go). All but the Arrow
+// forward then read+close the response body inside CopyResponse and return;
+// the Arrow forward streams the response body after the handler returns
+// (see below). fasthttp does not recycle the
 // RequestCtx until after the handler returns (fasthttp server.go
 // releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
 // directly is safe and avoids a copy that can be large at max payload
@@ -104,10 +106,13 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // on server shutdown, so a forward keeps running after its client leaves, as a
 // local write would. Its value is only a parent for the forward's timeout.
 //
-// If a future refactor moves any of this work to a background goroutine
-// or stream writer, those properties no longer hold and the caller
-// must take a defensive copy + use a non-pooled context. Today's
-// callers are all synchronous; revisit this if that changes.
+// If a future refactor moves the REQUEST body's reading to a background
+// goroutine or stream writer, those properties no longer hold and the
+// caller must take a defensive copy + use a non-pooled context. The
+// forwarded Arrow query (#1567) streams the RESPONSE from a stream writer,
+// which is fine: the router reads the request body synchronously
+// (io.ReadAll in doForward) before the handler returns, and the fasthttp
+// ctx outlives the response body write.
 func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Build full URL from Fiber context
 	// c.BaseURL() returns scheme://host, c.OriginalURL() returns path + query
@@ -217,6 +222,9 @@ var forwardedRoutes = map[string]bool{
 	"POST /api/v1/import/tle":          true,
 	"POST /api/v1/query":               true,
 	"POST /api/v1/query/msgpack":       true,
+	// Forwarded only to peers advertising CapabilityForwardArrowQuery
+	// (#1567), so no older peer is sent it.
+	"POST /api/v1/query/arrow": true,
 }
 
 // ForwardIdentityChecker verifies a forwarded request's signed identity
@@ -259,8 +267,35 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 
 	// Set status code
 	c.Status(resp.StatusCode)
+	copyForwardedHeaders(c, resp)
 
-	// Copy headers (excluding hop-by-hop headers). The upstream's values
+	// Copy body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// A fence refusal from the node the write was forwarded to is the expected
+	// answer during a failover: logged here by reason, not per request (#1268).
+	// Only once the body arrived: a failed copy is a real proxy error.
+	if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestFencedHeader) != "" {
+		c.Locals(ingestFencedLocal, true)
+		ingest.LogRefusal("forwarded "+c.Path(), &ingest.RefusalError{Reason: "forwarded", Text: "the node this write was forwarded to refused it (503)"})
+	} else if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestRefusedHeader) != "" {
+		// Likewise a node-local refusal there, such as WAL disk pressure
+		// (#676), logged by the reason it sent.
+		c.Locals(ingestRefusedLocal, true)
+		reason := forwardedRefusalReason(resp.Header.Get(IngestRefusedHeader))
+		ingest.LogRefusal("forwarded "+c.Path(), &ingest.WriteRefusal{Reason: reason, Text: "the node this write was forwarded to refused it (503, " + reason + ")"})
+	}
+
+	return c.Send(body)
+}
+
+// copyForwardedHeaders copies a forwarded response's end-to-end headers onto
+// c's response.
+func copyForwardedHeaders(c *fiber.Ctx, resp *http.Response) {
+	// Hop-by-hop headers are skipped. The upstream's values
 	// replace any this node already set, as c.Set did: the forwarding node's
 	// own middleware (CORS, security headers) runs before this, and the
 	// upstream node ran the same middleware, so appending would send
@@ -284,28 +319,6 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 			h.Add(key, v)
 		}
 	}
-
-	// Copy body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	// A fence refusal from the node the write was forwarded to is the expected
-	// answer during a failover: logged here by reason, not per request (#1268).
-	// Only once the body arrived: a failed copy is a real proxy error.
-	if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestFencedHeader) != "" {
-		c.Locals(ingestFencedLocal, true)
-		ingest.LogRefusal("forwarded "+c.Path(), &ingest.RefusalError{Reason: "forwarded", Text: "the node this write was forwarded to refused it (503)"})
-	} else if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestRefusedHeader) != "" {
-		// Likewise a node-local refusal there, such as WAL disk pressure
-		// (#676), logged by the reason it sent.
-		c.Locals(ingestRefusedLocal, true)
-		reason := forwardedRefusalReason(resp.Header.Get(IngestRefusedHeader))
-		ingest.LogRefusal("forwarded "+c.Path(), &ingest.WriteRefusal{Reason: reason, Text: "the node this write was forwarded to refused it (503, " + reason + ")"})
-	}
-
-	return c.Send(body)
 }
 
 // ForwardDecision is the outcome of the pre-handler routing check. It
@@ -547,22 +560,21 @@ func respondWriteRefused(c *fiber.Ctx, err error) error {
 
 // HandleRoutingError returns an appropriate error response for routing failures.
 func HandleRoutingError(c *fiber.Ctx, err error) error {
-	switch err {
-	case cluster.ErrNoWriterAvailable:
+	// errors.Is, not ==: forwardRequest wraps ErrRoutingFailed with the last
+	// attempt's error, which names the peer's internal URL. Compared with ==
+	// it fell to the default branch, which sent that text to the client.
+	switch {
+	case errors.Is(err, cluster.ErrNoWriterAvailable):
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "No writer node available in the cluster",
 		})
-	case cluster.ErrNoReaderAvailable:
+	case errors.Is(err, cluster.ErrNoReaderAvailable):
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "No reader node available in the cluster",
 		})
-	case cluster.ErrRoutingFailed:
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-			"error": "Failed to route request to cluster node",
-		})
 	default:
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-			"error": "Routing error: " + err.Error(),
+			"error": "Failed to route request to cluster node",
 		})
 	}
 }
