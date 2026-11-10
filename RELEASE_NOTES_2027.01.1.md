@@ -93,7 +93,7 @@ queries on there, set `[continuous_query] enabled = true` (or
 rpm 6.1, which Fedora 45 ships, refuses an unsigned package by default
 (`%_pkgverify_level all`), and every Arc RPM up to 26.09.3 was unsigned:
 `package arc-26.09.3-1.x86_64 does not verify: no signature`. From 26.09.4
-the RPMs (Arc, arc-fips and arcli) are signed with the Basekick Labs package
+the Arc and arc-fips RPMs are signed with the Basekick Labs package
 key. Its fingerprint is
 `3E39 9CF8 F5D2 EF9A A9A5 36EF 7629 7AF0 8CBA B6FE`, and it is published
 with every release and in the repository at
@@ -105,7 +105,8 @@ sudo dnf install -y ./arc-<version>-1.x86_64.rpm
 ```
 
 `dnf install ./file.rpm` also installs the older unsigned RPMs, with a
-warning.
+warning. arcli's RPMs are signed with the same key from arcli's next
+release.
 
 ## Fix: the Linux packages run on Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 again ([#1579](https://github.com/Basekick-Labs/arc/issues/1579))
 

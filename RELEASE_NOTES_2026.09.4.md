@@ -20,8 +20,9 @@ A patch release on 26.09.3. Everything else on `main` ships in 27.01.1.
   on, upgrade the writers too, because a writer can take over compaction.
 - **RPM installs:** import the package key once:
   `sudo rpm --import https://github.com/basekick-labs/arc/releases/download/v26.09.4/RPM-GPG-KEY-basekick`.
-- **Continuous queries turn on** after an upgrade, unless you set them off
-  again (the packages replace `/etc/arc/arc.toml`).
+- **Continuous queries:** on by default in the packaged `arc.toml`. A `.deb`
+  upgrade replaces `/etc/arc/arc.toml`, so they turn on; the RPM and Arch
+  packages keep an edited file. See the section below.
 - **Linux now needs glibc 2.34 or newer.** Ubuntu 20.04 and RHEL 8 are not
   supported. 26.09.3 needed 2.38, so no system that ran 26.09.3 loses support.
 
@@ -129,10 +130,18 @@ disabled on this server".
 
 It is now `enabled = true`. No continuous query runs until one is created.
 
-The 26.09.x packages replace `/etc/arc/arc.toml` on upgrade, so an upgrade to
-26.09.4 enables continuous queries unless the file is edited back. To keep them
-off, set `[continuous_query] enabled = false` or
-`ARC_CONTINUOUS_QUERY_ENABLED=false`.
+What an upgrade does depends on the package:
+
+- **`.deb`:** the package replaces `/etc/arc/arc.toml`, so continuous queries
+  turn on (and any other edit to the file is lost, as with every 26.09.x
+  upgrade).
+- **RPM and Arch:** the file is marked as configuration. If it was never
+  edited, it is replaced and continuous queries turn on. If it was edited, it
+  is kept, and the new file is written next to it as `arc.toml.rpmnew` or
+  `arc.toml.pacnew`.
+
+To choose explicitly, set `[continuous_query] enabled = true` or `false` in
+`/etc/arc/arc.toml`, or `ARC_CONTINUOUS_QUERY_ENABLED`, and restart.
 
 ## Security: a crafted zstd request can no longer crash Arc; Go 1.26.10 and dependency updates
 
