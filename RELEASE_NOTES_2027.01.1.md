@@ -2871,8 +2871,8 @@ gcs_bucket = "my-arc-data"
   `storage.backend`, `tiered_storage.cold.backend` and a backup target's
   `type` set to `"gcs"` when it loads its config, naming the key. A FIPS
   deployment on Google Cloud uses GCS through its S3-compatible endpoint
-  (`storage.backend = "s3"`, `s3_endpoint = "storage.googleapis.com"`, HMAC
-  keys) instead.
+  instead: type `"s3"` with the corresponding `s3_endpoint` set to
+  `storage.googleapis.com` and HMAC keys.
 
 ### MessagePack binary values are stored as binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 

@@ -70,8 +70,9 @@ jobs:
       # The FIPS variant, checked on every PR rather than first at release
       # time (#1587: the GCS backend pulled x/crypto/hkdf into the FIPS build
       # and nothing saw it until the release dry run). fips-check is the
-      # release workflow's import-graph guard; vet type-checks the fips build
-      # and its tests; the tests are the packages with fips-only paths.
+      # release workflow's import-graph guard (go list, which resolves imports
+      # but does not type-check); vet type-checks the fips build and its
+      # tests; the tests run the packages whose fips-only paths have tests.
       - name: FIPS build checks
         run: |
           make fips-check

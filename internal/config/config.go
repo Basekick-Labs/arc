@@ -2546,12 +2546,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("backup.operation_timeout", "2h")
 }
 
-// checkGCSEndpoint validates storage.gcs_endpoint at load, so a bad value is
-// reported before the logger exists rather than as a failed boot. https only:
-// DuckDB reads GCS over https on the endpoint's host whatever the scheme
-// given here (it takes a bare host, #1105), so an http endpoint would send
-// the storage backend and query reads to different places, and an emulator
-// that serves only http cannot serve DuckDB at all.
 // fipsBuild is fips.BuildTagged; a variable so the refusal below can be
 // tested in the default build.
 var fipsBuild = fips.BuildTagged
@@ -2567,6 +2561,12 @@ func refuseGCSInFIPSBuild(key string) error {
 	return fmt.Errorf("%s is \"gcs\": %w", key, storage.ErrGCSNotInFIPSBuild)
 }
 
+// checkGCSEndpoint validates storage.gcs_endpoint at load, so a bad value is
+// reported before the logger exists rather than as a failed boot. https only:
+// DuckDB reads GCS over https on the endpoint's host whatever the scheme
+// given here (it takes a bare host, #1105), so an http endpoint would send
+// the storage backend and query reads to different places, and an emulator
+// that serves only http cannot serve DuckDB at all.
 func checkGCSEndpoint(key, endpoint string) error {
 	if endpoint == "" {
 		return nil
