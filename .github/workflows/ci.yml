@@ -67,6 +67,17 @@ jobs:
       - name: Vet
         run: go vet -tags=duckdb_arrow ./...
 
+      # The FIPS variant, checked on every PR rather than first at release
+      # time (#1587: the GCS backend pulled x/crypto/hkdf into the FIPS build
+      # and nothing saw it until the release dry run). fips-check is the
+      # release workflow's import-graph guard; vet type-checks the fips build
+      # and its tests; the tests are the packages with fips-only paths.
+      - name: FIPS build checks
+        run: |
+          make fips-check
+          go vet -tags=duckdb_arrow,fips ./...
+          go test -tags=duckdb_arrow,fips ./internal/config/ ./internal/storage/ ./internal/auth/ ./internal/fips/
+
       # -timeout is per package binary; Go's default is 10 minutes, and
       # internal/cluster alone takes about 520 s under -race on these
       # runners (650 s on a laptop). A package that hits the default panics

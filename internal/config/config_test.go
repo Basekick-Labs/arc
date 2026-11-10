@@ -378,6 +378,9 @@ func TestLoad_IcebergBackends(t *testing.T) {
 			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c", "ARC_TIERED_STORAGE_COLD_S3_ENDPOINT", "storage.googleapis.com"), "Google Cloud Storage"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.env["ARC_TIERED_STORAGE_COLD_BACKEND"] == "gcs" || tc.env["ARC_STORAGE_BACKEND"] == "gcs" {
+				skipGCSInFIPSBuild(t)
+			}
 			t.Chdir(t.TempDir())
 			for k, v := range tc.env {
 				t.Setenv(k, v)
@@ -1611,6 +1614,7 @@ func TestLoad_DatabaseExtensionsTOMLArray(t *testing.T) {
 // TestLoad_GCSPrimaryValidation (#1105): storage.backend="gcs" is accepted with
 // a bucket, and each refusal names the key at fault.
 func TestLoad_GCSPrimaryValidation(t *testing.T) {
+	skipGCSInFIPSBuild(t)
 	cases := []struct {
 		name    string
 		env     map[string]string
@@ -1665,6 +1669,7 @@ func TestLoad_GCSPrimaryValidation(t *testing.T) {
 // "gcs" with every key, its refusals naming the key, and the overlap refusal
 // between cold and primary storage, which applies to every backend.
 func TestLoad_GCSColdTierValidation(t *testing.T) {
+	skipGCSInFIPSBuild(t)
 	cold := func(kv ...string) map[string]string {
 		m := map[string]string{
 			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",

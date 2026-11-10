@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/basekick-labs/arc/internal/sysmem"
@@ -1671,6 +1672,9 @@ func Load() (*Config, error) {
 			return nil, err
 		}
 	case "gcs":
+		if err := refuseGCSInFIPSBuild("storage.backend"); err != nil {
+			return nil, err
+		}
 		// Same reasons as the S3 bucket guard: an empty bucket would build an
 		// empty gs:// allowlist entry and a secret scoped to nothing.
 		if cfg.Storage.GCSBucket == "" {
@@ -1742,6 +1746,11 @@ func Load() (*Config, error) {
 				return nil, err
 			}
 		case "gcs":
+			// Refused here, not left to the factory: a cold backend that fails
+			// to build leaves the node running without its cold tier.
+			if err := refuseGCSInFIPSBuild("tiered_storage.cold.backend"); err != nil {
+				return nil, err
+			}
 			if cold.GCSBucket == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"gcs\" but tiered_storage.cold.gcs_bucket is empty; set tiered_storage.cold.gcs_bucket")
 			}
@@ -2543,6 +2552,21 @@ func setDefaults(v *viper.Viper) {
 // given here (it takes a bare host, #1105), so an http endpoint would send
 // the storage backend and query reads to different places, and an emulator
 // that serves only http cannot serve DuckDB at all.
+// fipsBuild is fips.BuildTagged; a variable so the refusal below can be
+// tested in the default build.
+var fipsBuild = fips.BuildTagged
+
+// refuseGCSInFIPSBuild refuses a "gcs" backend at key in the FIPS build, which
+// has no native GCS backend (#1587). Config load is where this has to happen:
+// the factory's own refusal would stop a primary at startup, but would leave a
+// node running without its cold tier, or without the backup API.
+func refuseGCSInFIPSBuild(key string) error {
+	if !fipsBuild {
+		return nil
+	}
+	return fmt.Errorf("%s is \"gcs\": %w", key, storage.ErrGCSNotInFIPSBuild)
+}
+
 func checkGCSEndpoint(key, endpoint string) error {
 	if endpoint == "" {
 		return nil
