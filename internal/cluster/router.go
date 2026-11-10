@@ -123,6 +123,11 @@ type RouterConfig struct {
 	// requests by their signed identity; nil, or false for a peer, forwards
 	// the caller's credential as before (no Raft, or an older peer).
 	PeerForwardIdentity func(nodeID string) bool
+
+	// PeerArrowQuery reports whether a peer accepts a forwarded Arrow query
+	// (CapabilityForwardArrowQuery, #1567). RouteArrowQuery forwards only to
+	// such peers; nil, or no such peer, runs the query locally.
+	PeerArrowQuery func(nodeID string) bool
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -130,6 +135,7 @@ type RouterConfig struct {
 type Router struct {
 	cfg          *RouterConfig
 	httpClient   *http.Client
+	streamClient *http.Client // RouteArrowQuery: no whole-response timeout
 	writeClient  *http.Client
 	importClient *http.Client
 	logger       zerolog.Logger
@@ -180,6 +186,14 @@ func NewRouter(cfg *RouterConfig) *Router {
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout:   cfg.Timeout,
+			Transport: transport,
+		},
+		// A forwarded Arrow query streams its result for as long as the
+		// query runs: http.Client.Timeout covers reading the body, so
+		// cfg.Timeout (route_timeout, default 5 s) would cut any longer
+		// stream partway (#1567). The caller bounds the request with its
+		// context instead (the query timeout).
+		streamClient: &http.Client{
 			Transport: transport,
 		},
 		writeClient: &http.Client{
@@ -455,6 +469,48 @@ func (r *Router) RouteQuery(ctx context.Context, req *http.Request) (*http.Respo
 	return r.forwardRequest(ctx, reader, req)
 }
 
+// ErrNoArrowQueryPeer reports that no peer accepts a forwarded Arrow query
+// (CapabilityForwardArrowQuery): the caller runs the query locally, as before
+// #1567, rather than send it to a peer that would refuse it.
+var ErrNoArrowQueryPeer = errors.New("no peer accepts a forwarded Arrow query")
+
+// RouteArrowQuery is RouteQuery for POST /api/v1/query/arrow (#1567). It
+// forwards only to peers that advertise CapabilityForwardArrowQuery, so an
+// older reader in a rolling upgrade is never sent a route it would refuse,
+// and it uses streamClient, which has no whole-response timeout: the result
+// streams for as long as the query runs, bounded by ctx. The caller must close
+// the response body.
+func (r *Router) RouteArrowQuery(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanQuery {
+		return nil, ErrLocalNodeCanHandle
+	}
+	capable := func(nodes []*Node) []*Node {
+		if r.cfg.PeerArrowQuery == nil {
+			return nil
+		}
+		out := make([]*Node, 0, len(nodes))
+		for _, n := range nodes {
+			if r.cfg.PeerArrowQuery(n.ID) {
+				out = append(out, n)
+			}
+		}
+		return out
+	}
+	// Readers first, writers when there are none, as RouteQuery does.
+	nodes := capable(r.cfg.Registry.GetReaders())
+	if len(nodes) == 0 {
+		nodes = capable(r.cfg.Registry.GetWriters())
+	}
+	if len(nodes) == 0 {
+		return nil, ErrNoArrowQueryPeer
+	}
+	node := r.selectNode(nodes)
+	if node == nil {
+		return nil, ErrNoArrowQueryPeer
+	}
+	return r.forwardRequestWith(ctx, r.streamClient, node, req)
+}
+
 // selectNode selects a node from the list based on the configured strategy.
 func (r *Router) selectNode(nodes []*Node) *Node {
 	if len(nodes) == 0 {
@@ -506,6 +562,11 @@ func (r *Router) selectLeastConnections(nodes []*Node) *Node {
 
 // forwardRequest forwards an HTTP request to the specified node.
 func (r *Router) forwardRequest(ctx context.Context, node *Node, req *http.Request) (*http.Response, error) {
+	return r.forwardRequestWith(ctx, r.httpClient, node, req)
+}
+
+// forwardRequestWith is forwardRequest with the client chosen by the caller.
+func (r *Router) forwardRequestWith(ctx context.Context, client *http.Client, node *Node, req *http.Request) (*http.Response, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= r.cfg.Retries; attempt++ {
@@ -516,7 +577,7 @@ func (r *Router) forwardRequest(ctx context.Context, node *Node, req *http.Reque
 				Msg("Retrying request forward")
 		}
 
-		resp, err := r.doForward(ctx, r.httpClient, node, req)
+		resp, err := r.doForward(ctx, client, node, req)
 		if err == nil {
 			return resp, nil
 		}

@@ -18,6 +18,14 @@ import (
 // rolling upgrade keeps forwarding.
 const CapabilityForwardIdentity = "forward_identity_v1"
 
+// CapabilityForwardArrowQuery is advertised by builds that accept
+// POST /api/v1/query/arrow forwarded by a node that cannot serve queries
+// (#1567): its route is in forwardedRoutes and its handler streams the
+// result with its trailers. A compactor forwards Arrow queries only to peers
+// that advertise it and otherwise runs them locally, so a rolling upgrade
+// never sends one to a reader that would refuse the forwarded identity.
+const CapabilityForwardArrowQuery = "forward_arrow_query_v1"
+
 type forwardTokenKey struct{}
 
 // ForwardToken is the token the forwarding node verified for a request: its
@@ -151,6 +159,22 @@ func (c *Coordinator) peerForwardIdentity(nodeID string) bool {
 		return true
 	}
 	return hasCapability(n.Capabilities, CapabilityForwardIdentity)
+}
+
+// peerArrowQuery reports whether a peer advertises
+// CapabilityForwardArrowQuery. Unlike peerForwardIdentity, a peer this node
+// has no record of is not assumed capable: the fallback is running the query
+// locally, which is always safe.
+func (c *Coordinator) peerArrowQuery(nodeID string) bool {
+	if c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	n, ok := fsm.GetNode(nodeID)
+	return ok && hasCapability(n.Capabilities, CapabilityForwardArrowQuery)
 }
 
 // ForwardIdentityHeaderValues returns every value of a request header.

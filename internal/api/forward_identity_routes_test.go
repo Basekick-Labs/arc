@@ -50,7 +50,8 @@ func TestForwardIdentityVerifier_OnlyOnForwardedRoutes(t *testing.T) {
 		{"POST", "/api/v1/import/tle", "accepted", true},
 		{"POST", "/api/v1/query", "accepted", true},
 		{"POST", "/api/v1/query/msgpack", "accepted", true},
-		{"POST", "/api/v1/query/arrow", "refused", true},
+		{"POST", "/api/v1/query/arrow", "accepted", true}, // forwarded since #1567
+		{"POST", "/api/v1/query/estimate", "refused", true},
 		{"POST", "/api/v1/auth/tokens", "refused", true},
 		{"DELETE", "/api/v1/databases/x", "refused", true},
 		{"GET", "/api/v1/query", "refused", true},

@@ -390,6 +390,19 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// could exceed 1 — or divide by zero — on an Arrow-only workload (#801).
 	m.IncQueryRequests()
 
+	// A node that cannot serve queries (a compactor) forwards, as
+	// executeQuery does (#1567); with no peer that accepts a forwarded Arrow
+	// query it runs the query here, as before.
+	switch QueryForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		m.IncQueryErrors()
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		if handled, err := h.forwardArrowQuery(c); handled {
+			return err
+		}
+	}
+
 	// Parse request body
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {
