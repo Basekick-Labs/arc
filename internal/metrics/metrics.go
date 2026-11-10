@@ -370,6 +370,13 @@ type Metrics struct {
 	// leaves the previous value.
 	backupSkippedFiles atomic.Int64
 
+	// tieringColdRowsMissingObjects / ...HotCopy are the last cold-tier
+	// metadata sync's count of cold rows whose object is gone from cold
+	// storage, without and with a hot copy (#1551). Gauges: restoring the
+	// objects or retiring the rows clears them on the next sync.
+	tieringColdRowsMissingObjects        atomic.Int64
+	tieringColdRowsMissingObjectsHotCopy atomic.Int64
+
 	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
 	// of a token command). clusterAuthApplyTotal increments per applied
 	// command type so operators can see "create vs update vs revoke"
@@ -1126,6 +1133,14 @@ func (m *Metrics) SetBackupSkippedFiles(n int64) {
 	m.backupSkippedFiles.Store(n)
 }
 
+// SetTieringColdRowsMissingObjects records the last cold-tier metadata sync's
+// cold rows whose object is gone from cold storage: lost (no hot copy either)
+// and hotCopy (still read from hot storage) (#1551).
+func (m *Metrics) SetTieringColdRowsMissingObjects(lost, hotCopy int64) {
+	m.tieringColdRowsMissingObjects.Store(lost)
+	m.tieringColdRowsMissingObjectsHotCopy.Store(hotCopy)
+}
+
 // Cluster Auth metrics — incremented from the FSM apply path on every
 // Token command. apply_* counts successful applies per type;
 // IncClusterAuthRejected counts applier-side validation refusals.
@@ -1430,6 +1445,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
 		"storage_unaddressable_files":                   m.storageUnaddressableFiles.Load(),
 		"backup_skipped_files":                          m.backupSkippedFiles.Load(),
+		"tiering_cold_rows_missing_objects":             m.tieringColdRowsMissingObjects.Load(),
+		"tiering_cold_rows_missing_objects_hot_copy":    m.tieringColdRowsMissingObjectsHotCopy.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
@@ -2158,6 +2175,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_backup_skipped_files Files the most recent backup inventoried but could not store: unreadable at copy time, or a backup destination key over the storage key limit. Counts every file group the backup copies, the same total the backup status endpoint reports as skipped_files; the backup's manifest and status name up to 32 of the skipped data and Iceberg metadata files in skipped_sample, while a skipped compaction recovery manifest or outside-root warehouse file is counted here and named only in the log. Set by every backup that finishes its copy phases, including one the skip ratio then fails; a backup that fails earlier leaves the previous value. A clean backup sets it to 0.\n"...)
 	b = append(b, "# TYPE arc_backup_skipped_files gauge\n"...)
 	b = appendMetric(b, "arc_backup_skipped_files", float64(m.backupSkippedFiles.Load()))
+
+	b = append(b, "# HELP arc_tiering_cold_rows_missing_objects Cold tier rows whose object is gone from cold storage and that have no hot copy, as of the last cold-tier metadata sync on a standalone node or the cluster's primary writer (0 on readers, from a demoted primary's next sync). Non-zero means data the tier metadata lists cannot be read, typically a bucket lifecycle/expiry rule or a delete outside Arc on the cold prefix; the log and GET /api/v1/tiering/status name a sample.\n"...)
+	b = append(b, "# TYPE arc_tiering_cold_rows_missing_objects gauge\n"...)
+	b = appendMetric(b, "arc_tiering_cold_rows_missing_objects", float64(m.tieringColdRowsMissingObjects.Load()))
+
+	b = append(b, "# HELP arc_tiering_cold_rows_missing_objects_hot_copy Cold tier rows whose cold object is gone but whose hot copy still exists and is read, as of the last cold-tier metadata sync. No data is missing.\n"...)
+	b = append(b, "# TYPE arc_tiering_cold_rows_missing_objects_hot_copy gauge\n"...)
+	b = appendMetric(b, "arc_tiering_cold_rows_missing_objects_hot_copy", float64(m.tieringColdRowsMissingObjectsHotCopy.Load()))
 
 	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
 	// apply_* counters increment per applied token command, per node — so

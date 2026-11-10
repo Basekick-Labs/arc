@@ -133,6 +133,10 @@ type StatusResponse struct {
 	// listing failed answer from hot data for a range with no cold rows;
 	// otherwise that read fails (#1550). Absent without a cold tier.
 	ColdMetadata *ColdMetadataStatus `json:"cold_metadata,omitempty"`
+	// ColdMissingObjects is the last check of cold rows whose object is gone
+	// from cold storage (#1551). Absent without a usable cold tier, before
+	// the first cold sync, and on a cluster reader (#1563).
+	ColdMissingObjects *ColdMissingObjectsStatus `json:"cold_missing_objects,omitempty"`
 }
 
 // ColdMetadataStatus is StatusResponse.ColdMetadata.

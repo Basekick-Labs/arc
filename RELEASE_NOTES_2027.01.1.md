@@ -198,6 +198,25 @@ The edge-sync hub endpoints moved to RBAC as well; see
 "Fix: edge-sync pushes are decided by RBAC on the spoke's database"
 ([#1561](https://github.com/Basekick-Labs/arc/issues/1561)).
 
+## New: cold tier files deleted outside Arc are reported ([#1551](https://github.com/Basekick-Labs/arc/issues/1551))
+
+A cold tier object deleted outside Arc, for example by a bucket lifecycle or expiry rule, used to show up only as a `Warn` line in each tier scan. Queries over that data still answer `200` with the rows that remain (this is unchanged, #1364), so nothing an operator monitors reported the gap.
+
+At the end of each cold-tier metadata sync, Arc now checks again each cold row whose object the listing did not return: it stats the cold object, re-reads the row and stats the hot copy, so an object written or a row retired while the sync ran is not counted. It reports:
+
+- `arc_tiering_cold_rows_missing_objects`: rows with no cold object and no hot copy. These files cannot be read and nothing in Arc restores them. Alert on this one. Arc also logs an `Error` with a sample of paths.
+- `arc_tiering_cold_rows_missing_objects_hot_copy`: rows whose cold object is gone while the hot copy is still read. No data is missing.
+- `GET /api/v1/tiering/status` → `cold_missing_objects` (`lost`, `hot_copy`, `unchecked`, `sample`, `checked_at`).
+- `/health` → `tiering` with the two counts and the check time, no paths.
+
+Notes:
+
+- Reported on standalone nodes and on the cluster's primary writer only. A reader keeps the cold rows of files the primary deleted ([#1563](https://github.com/Basekick-Labs/arc/issues/1563)), so there it would report every normal DELETE or retention as missing; the fields are absent on readers, and the gauges are 0 (on a demoted primary, from its next sync). A reader promoted by failover can report the rows it inherited until #1563 is fixed.
+- A sync that overlaps a cold DELETE, retention run or database delete keeps the previous result rather than count rows that run is about to retire. A DELETE or retention whose row retirement failed (it logs that) leaves rows that are counted as lost until a later run retires them.
+- At most 1,000 rows, within 30 seconds, are checked per sync, in no fixed order; the rest are reported as `unchecked`. A check that could not examine every row never lowers the lost count: it keeps the previous result, so an alert clears only once a check has seen every row.
+- The fields are absent, and the gauges 0, until the first cold sync after startup. With the default `migration_schedule` that sync runs at startup and then daily.
+- Do not apply lifecycle or expiry rules, or deletes outside Arc, to Arc's cold prefix. Remove data through Arc (DELETE, retention, database delete) so its rows are retired with it.
+
 ## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
 
 When the cold tier could not be listed (expired or missing credentials, a
