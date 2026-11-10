@@ -42,6 +42,22 @@ type DatabasesHandler struct {
 	// before it and withdraws its pending registrations (#1207 d1).
 	flusher DeleteFlusher
 	pending DatabasePendingRegistrations
+	// router forwards the listings from a node that cannot serve queries (a
+	// compactor) to one that can; nil outside a cluster.
+	router *cluster.Router
+}
+
+// SetRouter installs the cluster router the listings forward through.
+func (h *DatabasesHandler) SetRouter(r *cluster.Router) { h.router = r }
+
+// forwardListing forwards a listing from a node that cannot serve queries;
+// handled is false when it is answered here.
+func (h *DatabasesHandler) forwardListing(c *fiber.Ctx) (bool, error) {
+	return forwardRead(c, h.router, forwardReadOpts{
+		route:   h.router.RouteReadQuery,
+		timeout: h.requestTimeout,
+		logger:  h.logger,
+	})
 }
 
 // DatabasePendingRegistrations withdraws every pending registration of a
@@ -301,6 +317,11 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 
 // handleList handles GET /api/v1/databases
 func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
 	// A caller with a grant covering every database sees them all; any
 	// other sees the databases it can read something in, each counted by the
 	// measurements it can read, as GET /api/v1/databases/:name counts them
@@ -411,6 +432,11 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 
 // handleGet handles GET /api/v1/databases/:name
 func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
 	name := c.Params("name")
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -482,6 +508,11 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 
 // handleListMeasurements handles GET /api/v1/databases/:name/measurements
 func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
 	name := c.Params("name")
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{

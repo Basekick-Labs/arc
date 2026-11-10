@@ -18,13 +18,15 @@ import (
 // rolling upgrade keeps forwarding.
 const CapabilityForwardIdentity = "forward_identity_v1"
 
-// CapabilityForwardArrowQuery is advertised by builds that accept
-// POST /api/v1/query/arrow forwarded by a node that cannot serve queries
-// (#1567): its route is in forwardedRoutes and its handler streams the
-// result with its trailers. A compactor forwards Arrow queries only to peers
-// that advertise it and otherwise runs them locally, so a rolling upgrade
+// CapabilityForwardReadQueries is advertised by builds that accept the read
+// routes a node that cannot serve queries (a compactor) forwards beyond
+// /api/v1/query and /query/msgpack: /query/arrow (#1567), /query/estimate,
+// GET /query/:measurement, the measurements listing and schema, and the
+// databases listings. Their routes are forwardable (forwardableRoute in
+// internal/api). A compactor forwards them only to peers that advertise it;
+// with peers but none capable it answers them itself, so a rolling upgrade
 // never sends one to a reader that would refuse the forwarded identity.
-const CapabilityForwardArrowQuery = "forward_arrow_query_v1"
+const CapabilityForwardReadQueries = "forward_read_queries_v1"
 
 type forwardTokenKey struct{}
 
@@ -161,11 +163,11 @@ func (c *Coordinator) peerForwardIdentity(nodeID string) bool {
 	return hasCapability(n.Capabilities, CapabilityForwardIdentity)
 }
 
-// peerArrowQuery reports whether a peer advertises
-// CapabilityForwardArrowQuery. Unlike peerForwardIdentity, a peer this node
+// peerReadQueries reports whether a peer advertises
+// CapabilityForwardReadQueries. Unlike peerForwardIdentity, a peer this node
 // has no record of is not assumed capable: the fallback is running the query
 // locally, which is always safe.
-func (c *Coordinator) peerArrowQuery(nodeID string) bool {
+func (c *Coordinator) peerReadQueries(nodeID string) bool {
 	if c.raftNode == nil {
 		return false
 	}
@@ -174,7 +176,7 @@ func (c *Coordinator) peerArrowQuery(nodeID string) bool {
 		return false
 	}
 	n, ok := fsm.GetNode(nodeID)
-	return ok && hasCapability(n.Capabilities, CapabilityForwardArrowQuery)
+	return ok && hasCapability(n.Capabilities, CapabilityForwardReadQueries)
 }
 
 // ForwardIdentityHeaderValues returns every value of a request header.

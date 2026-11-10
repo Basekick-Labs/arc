@@ -93,7 +93,7 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
 // import.go, tle.go, query.go, query_arrow_forward.go) invokes the returned
 // *http.Request synchronously within the Fiber handler — they pass it to
-// router.RouteWrite/RouteQuery/RouteArrowQuery (which blocks on
+// router.RouteWrite/RouteQuery/RouteReadQuery (which blocks on
 // http.Client.Do; queries are buffered for retries, writes are streamed once
 // and never retried, see internal/cluster/router.go). All but the Arrow
 // forward then read+close the response body inside CopyResponse and return;
@@ -222,9 +222,63 @@ var forwardedRoutes = map[string]bool{
 	"POST /api/v1/import/tle":          true,
 	"POST /api/v1/query":               true,
 	"POST /api/v1/query/msgpack":       true,
-	// Forwarded only to peers advertising CapabilityForwardArrowQuery
-	// (#1567), so no older peer is sent it.
-	"POST /api/v1/query/arrow": true,
+	// The rest are forwarded only to peers advertising
+	// CapabilityForwardReadQueries (#1567 and its follow-up), so no older
+	// peer is sent them.
+	"POST /api/v1/query/arrow":    true,
+	"POST /api/v1/query/estimate": true,
+	"GET /api/v1/measurements":    true,
+	"GET /api/v1/databases":       true,
+}
+
+// forwardedRoutePatterns are the forwardable routes with path parameters: a
+// method and the exact segments, "*" standing for one non-empty segment.
+var forwardedRoutePatterns = []struct {
+	method   string
+	segments []string
+}{
+	{"GET", []string{"api", "v1", "query", "*"}},
+	{"GET", []string{"api", "v1", "databases", "*"}},
+	{"GET", []string{"api", "v1", "databases", "*", "measurements"}},
+	{"GET", []string{"api", "v1", "databases", "*", "measurements", "*", "schema"}},
+}
+
+// forwardableRoute reports whether a forwarded identity may stand in for a
+// token on method + rawPath. It matches the path Fiber routes on, not a
+// cleaned form of it: a path that cleaning would change (".", "..", "//") is
+// refused outright, because Fiber and a cleaned match can disagree about the
+// handler it reaches (/api/v1/databases/../measurements cleans to an allowed
+// route but reaches the databases handler).
+func forwardableRoute(method, rawPath string) bool {
+	p := strings.TrimRight(rawPath, "/")
+	if p == "" || path.Clean(p) != p {
+		return false
+	}
+	if forwardedRoutes[method+" "+p] {
+		return true
+	}
+	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	for _, pat := range forwardedRoutePatterns {
+		if pat.method != method || len(pat.segments) != len(segs) {
+			continue
+		}
+		ok := true
+		for i, want := range pat.segments {
+			if want == "*" {
+				if segs[i] == "" {
+					ok = false
+					break
+				}
+			} else if segs[i] != want {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ForwardIdentityChecker verifies a forwarded request's signed identity
@@ -253,7 +307,7 @@ func ForwardIdentityVerifier(coord ForwardIdentityChecker) func(c *fiber.Ctx) (b
 		if !present {
 			return false, 0, "", nil
 		}
-		if err == nil && !forwardedRoutes[c.Method()+" "+path.Clean(c.Path())] {
+		if err == nil && !forwardableRoute(c.Method(), c.Path()) {
 			err = security.ErrForwardIdentity
 		}
 		return true, tok.ID, tok.Fingerprint, err

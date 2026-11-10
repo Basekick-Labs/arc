@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/metrics"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
@@ -42,9 +43,9 @@ import (
 //     byte, where the marker could complete a half message and decode as a
 //     clean end. A broken transfer cannot be mistaken for a complete result.
 //
-// Only peers that advertise cluster.CapabilityForwardArrowQuery are used; with
-// none (an older reader in a rolling upgrade, no Raft) the query runs locally,
-// as before.
+// Only peers that advertise cluster.CapabilityForwardReadQueries are used;
+// with peers but none capable (an older reader in a rolling upgrade, no Raft)
+// the query runs locally, as before; with no peer at all it is 503.
 
 // arrowForwardSlack is added to this node's query timeout to bound the wait
 // for a forwarded Arrow query's headers. The answering node sends them once
@@ -85,11 +86,35 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 	// (BuildHTTPRequest); cancellation is layered on it, not substituted.
 	// The header timer bounds only the wait for the answer to start.
 	ctx, cancel := context.WithCancel(httpReq.Context())
+	// Registered so /api/v1/queries on this node lists and cancels the
+	// forward; cancelled when the client disconnects, as a local query is.
+	queryID := ""
+	if h.queryRegistry != nil {
+		var tokenID int64
+		var tokenName string
+		if info := auth.GetTokenInfo(c); info != nil {
+			tokenID, tokenName = info.ID, info.Name
+		}
+		queryID, ctx = h.queryRegistry.Register(ctx, forwardedQueryDescription(c), tokenID, tokenName, c.IP())
+		id := queryID
+		ctx = cluster.WithForwardTargetHook(ctx, func(node string) { h.queryRegistry.SetForwardedTo(id, node) })
+		h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathArrowIPC)
+	}
+	finish := func(failure string) {
+		if queryID == "" {
+			return
+		}
+		if failure != "" {
+			h.queryRegistry.Fail(queryID, failure)
+		} else {
+			h.queryRegistry.Complete(queryID, 0)
+		}
+	}
 	var headerTimer *time.Timer
 	if h.queryTimeout > 0 {
 		headerTimer = time.AfterFunc(h.queryTimeout+arrowForwardSlack, cancel)
 	}
-	resp, err := h.router.RouteArrowQuery(ctx, httpReq.WithContext(ctx))
+	resp, err := h.router.RouteReadQuery(ctx, httpReq.WithContext(ctx))
 	if headerTimer != nil && !headerTimer.Stop() && err == nil {
 		// The timer fired after the headers arrived: ctx is cancelled, so the
 		// body would fail on its first read. Answer now, before a 200 is
@@ -97,25 +122,39 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 		_ = resp.Body.Close()
 		cancel()
 		m.IncQueryErrors()
+		finish("timed out waiting for the forwarded query to start")
 		return true, c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
 			"success": false,
 			"error":   "Timed out waiting for the forwarded Arrow query to start",
 		})
 	}
-	if errors.Is(err, cluster.ErrLocalNodeCanHandle) || errors.Is(err, cluster.ErrNoArrowQueryPeer) {
+	if errors.Is(err, cluster.ErrLocalNodeCanHandle) {
 		cancel()
+		if queryID != "" {
+			h.queryRegistry.Discard(queryID)
+		}
+		return false, nil
+	}
+	if errors.Is(err, cluster.ErrNoCapablePeer) {
+		cancel()
+		if queryID != "" {
+			h.queryRegistry.Discard(queryID)
+		}
+		h.logger.Warn().Msg("No peer accepts a forwarded Arrow query (rolling upgrade); answering it on this node")
 		return false, nil
 	}
 	if err != nil {
 		cancel()
 		h.logger.Error().Err(err).Msg("Failed to route an Arrow query request")
 		m.IncQueryErrors()
+		finish("forward failed")
 		return true, HandleRoutingError(c, err)
 	}
 
 	// An error answer (JSON, small) is relayed as every other forward is.
 	if resp.StatusCode != http.StatusOK {
 		defer cancel()
+		finish(http.StatusText(resp.StatusCode))
 		return true, CopyResponse(c, resp)
 	}
 
@@ -160,6 +199,7 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 			var clientGone *clientWriteError
 			if errors.As(err, &clientGone) {
 				// The client left; closing the upstream body stops its query.
+				finish("client disconnected")
 				return
 			}
 			// Any other failure ends the response as a failed transfer,
@@ -167,12 +207,14 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 			// finishing it cleanly would hand the client a short result
 			// that reads as complete.
 			abort.set(fmt.Errorf("forwarded Arrow stream failed: %s", sqlutil.SanitizeErrText(err.Error())))
+			finish("forwarded stream failed")
 			if !dropped.Load() {
 				m.IncQueryErrors()
 				h.logger.Warn().Err(err).Msg("Forwarded Arrow stream failed partway; ending the response as a failed transfer")
 			}
 			return
 		}
+		finish("")
 		// Upstream trailer values exist only after a clean end of body.
 		for _, name := range arrowTrailerNames {
 			if v := resp.Trailer.Get(name); v != "" {

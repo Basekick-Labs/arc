@@ -74,6 +74,42 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: every read sent to a compactor is answered by a reader, and `/api/v1/queries` covers what it forwarded
+
+A compactor answered several reads itself, from its own storage and field
+schema, instead of forwarding them as it forwards `/api/v1/query`. It now
+forwards them all:
+
+- `POST /api/v1/query/estimate`
+- `GET /api/v1/query/:measurement`
+- `GET /api/v1/measurements`
+- `GET /api/v1/databases/:database/measurements/:measurement/schema`
+- `GET /api/v1/databases`, `GET /api/v1/databases/:name` and
+  `GET /api/v1/databases/:name/measurements`
+
+Forwarding rules are the same as for Arrow queries (next section). The
+target must advertise `forward_read_queries_v1`. While nodes exist but none
+does, the compactor answers itself; with no reader or writer at all it
+answers 503. Forwarded estimates and `GET /api/v1/query/:measurement` are not
+cut by `cluster.route_timeout`. The listings are bounded at 30 s, as they are
+locally.
+
+**`/api/v1/queries` on a compactor** (licensed query management) now lists
+the queries it forwarded:
+
+- `/api/v1/query`, `/query/msgpack`, `/query/arrow`, estimates and
+  `GET /api/v1/query/:measurement`.
+- Each entry carries `forwarded_to`, the node it was sent to.
+- `DELETE /api/v1/queries/:id` cancels the forward. That stops the query on the
+  answering node when it cancels queries on client disconnect
+  (`query.cancel_on_client_disconnect`, on by default).
+- The entry's ID is the compactor's, not the answering node's.
+- History records whether the forward succeeded, not a row count.
+- A client that disconnects from a compactor now also cancels its forwarded
+  query, as it cancels a local one.
+
+`POST /api/v1/databases` (create) still runs on the compactor; it is a write.
+
 ## Fix: Arrow queries sent to a compactor are answered by a reader ([#1567](https://github.com/Basekick-Labs/arc/issues/1567))
 
 A node that cannot serve queries (a compactor) forwarded `POST /api/v1/query`
@@ -99,18 +135,16 @@ broken transfer (the connection closes before the end of the body), not as a
 short result that looks complete.
 
 **Rolling upgrades.** A compactor forwards an Arrow query only to nodes that
-advertise the new `forward_arrow_query_v1` capability: readers, or writers
-when the cluster has no readers. Until one does, it runs the query itself, as
-before. It also runs the query itself while no capable reader is healthy,
-where `/api/v1/query` answers 503 instead.
+advertise the new `forward_read_queries_v1` capability: readers, or writers
+when the cluster has no readers. While nodes exist but none advertises it, it
+runs the query itself, as before. With no reader or writer at all it answers
+503, as `/api/v1/query` does.
 
 A routing error no longer includes the peer's internal address in the
 response body. A failed forward now answers "Failed to route request to
 cluster node"; "no reader/writer available" keeps its own message.
 
-Other read endpoints still run locally on a compactor: `/api/v1/query/estimate`,
-`GET /api/v1/query/:measurement`, `/api/v1/measurements` and the measurement
-schema route.
+The other read endpoints are forwarded too; see the previous section.
 
 ## Fix: forwarded responses keep every value of a repeated header ([#1556](https://github.com/Basekick-Labs/arc/pull/1556))
 

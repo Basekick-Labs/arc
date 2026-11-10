@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1474,6 +1476,15 @@ func readParquetExpr(keyword, anchor string, paths []string, options string) str
 
 // getMeasurementSchema serves GET /api/v1/databases/:database/measurements/:measurement/schema.
 func (h *QueryHandler) getMeasurementSchema(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards it: the registered field
+	// schema readers bind is theirs.
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, "")
+		o.timeout = listingForwardTimeout
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
+	}
 	database, measurement, ok := h.schemaRouteParams(c)
 	if !ok {
 		return nil
@@ -2277,6 +2288,44 @@ func (h *QueryHandler) executeQueryMsgPack(c *fiber.Ctx) error {
 	return h.executeQuery(c)
 }
 
+// readForwardOpts is forwardReadOpts for a QueryHandler route: registered in
+// this node's query registry under description (empty: not registered), and
+// cancelled when its client disconnects.
+func (h *QueryHandler) readForwardOpts(route func(context.Context, *http.Request) (*http.Response, error), description string) forwardReadOpts {
+	return forwardReadOpts{
+		route:       route,
+		registry:    h.queryRegistry,
+		description: description,
+		watch: func(ctx context.Context, c *fiber.Ctx, queryID string, cancel context.CancelFunc) {
+			h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
+		},
+		logger: h.logger,
+	}
+}
+
+// forwardedQueryDescription is the registry's description of a forwarded
+// query: its SQL when the body carries one, else the method and URI.
+func forwardedQueryDescription(c *fiber.Ctx) string {
+	var req QueryRequest
+	if err := json.Unmarshal(c.Body(), &req); err == nil && req.SQL != "" {
+		return req.SQL
+	}
+	return c.Method() + " " + string(c.Request().RequestURI())
+}
+
+// queryForwardHeaderBound bounds the wait for a forwarded query's answer to
+// start: the peer bounds the query itself, with its timeout and any
+// governance limit on the token.
+func (h *QueryHandler) queryForwardHeaderBound() time.Duration {
+	if h.queryTimeout <= 0 {
+		return 0
+	}
+	return h.queryTimeout + 30*time.Second
+}
+
+// listingForwardTimeout bounds a forwarded listing as a local one is bounded.
+const listingForwardTimeout = 30 * time.Second
+
 // executeQuery handles POST /api/v1/query - returns JSON response
 func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	start := time.Now()
@@ -2296,26 +2345,15 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		return RespondAlreadyForwarded(c)
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding query request to reader/writer node")
-
-		httpReq, err := BuildHTTPRequest(c)
-		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
-			m.IncQueryErrors()
-			return respondError(c, fiber.StatusInternalServerError, "Failed to prepare request for forwarding", timestamp, start)
+		// RouteQuery, not RouteReadQuery: every build accepts a forwarded
+		// /query, so no capability gates it. Registered here so
+		// /api/v1/queries lists and cancels it.
+		o := h.readForwardOpts(h.router.RouteQuery, forwardedQueryDescription(c))
+		o.onError = m.IncQueryErrors
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
 		}
-
-		resp, err := h.router.RouteQuery(c.Context(), httpReq)
-		if err == cluster.ErrLocalNodeCanHandle {
-			// Fall through to local processing
-			goto localProcessing
-		}
-		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to route query request")
-			m.IncQueryErrors()
-			return HandleRoutingError(c, err)
-		}
-
-		return CopyResponse(c, resp)
+		goto localProcessing
 	}
 
 localProcessing:
@@ -5615,6 +5653,16 @@ type EstimateResponse struct {
 func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	start := time.Now()
 
+	// A node that cannot serve queries forwards (before governance, so the
+	// request is counted once, on the node that answers it).
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, forwardedQueryDescription(c))
+		o.headerBound = h.queryForwardHeaderBound()
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
+	}
+
 	// Parse request body
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -5921,6 +5969,16 @@ type MeasurementInfo struct {
 func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	start := time.Now()
 
+	// A node that cannot serve queries forwards the listing: its own
+	// storage view is not the readers'.
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, "")
+		o.timeout = listingForwardTimeout
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
+	}
+
 	// Optional database filter
 	dbFilter := c.Query("database", "")
 
@@ -6164,6 +6222,16 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	start := time.Now()
 	m := metrics.Get()
 	m.IncQueryRequests()
+
+	// A node that cannot serve queries forwards it, as /api/v1/query.
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, forwardedQueryDescription(c))
+		o.headerBound = h.queryForwardHeaderBound()
+		o.onError = m.IncQueryErrors
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
+	}
 
 	measurement := c.Params("measurement")
 	if measurement == "" {
