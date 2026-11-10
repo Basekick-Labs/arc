@@ -72,11 +72,11 @@ func arrowForwardRouter(t *testing.T, peerURL string, role cluster.NodeRole, cap
 	require.NoError(t, registry.Register(writer))
 	return cluster.NewRouter(&cluster.RouterConfig{
 		// The whole-response route timeout must not cut a streamed answer.
-		Timeout:        50 * time.Millisecond,
-		Registry:       registry,
-		LocalNode:      local,
-		Logger:         zerolog.Nop(),
-		PeerArrowQuery: func(string) bool { return capable },
+		Timeout:         50 * time.Millisecond,
+		Registry:        registry,
+		LocalNode:       local,
+		Logger:          zerolog.Nop(),
+		PeerReadQueries: func(string) bool { return capable },
 	})
 }
 
@@ -219,7 +219,8 @@ func TestForwardedArrowQueryHungPeerIsBounded(t *testing.T) {
 	start := time.Now()
 	resp := r.arrowQuery(t)
 	_, _ = io.ReadAll(resp.Body)
-	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	// A timeout, not a routing failure.
+	require.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
 	require.Less(t, time.Since(start), 5*time.Second)
 }
 

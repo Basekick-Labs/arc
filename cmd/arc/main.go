@@ -4190,6 +4190,11 @@ func main() {
 	}
 	if clusterCoordinator != nil {
 		databasesHandler.SetCoordinator(clusterCoordinator, cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled)
+		// The listings forward from a node that cannot serve queries, as the
+		// query routes do.
+		if router := clusterCoordinator.GetRouter(); router != nil {
+			databasesHandler.SetRouter(router)
+		}
 	}
 	// Guarded the same way every other SetAuthAndRBAC call is: assigning a nil
 	// *auth.RBACManager into the handler's RBACChecker interface would make its

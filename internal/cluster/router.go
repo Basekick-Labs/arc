@@ -124,10 +124,10 @@ type RouterConfig struct {
 	// the caller's credential as before (no Raft, or an older peer).
 	PeerForwardIdentity func(nodeID string) bool
 
-	// PeerArrowQuery reports whether a peer accepts a forwarded Arrow query
-	// (CapabilityForwardArrowQuery, #1567). RouteArrowQuery forwards only to
-	// such peers; nil, or no such peer, runs the query locally.
-	PeerArrowQuery func(nodeID string) bool
+	// PeerReadQueries reports whether a peer accepts the forwarded read
+	// routes (CapabilityForwardReadQueries). RouteReadQuery forwards only to
+	// such peers; nil, or no such peer, runs the request locally.
+	PeerReadQueries func(nodeID string) bool
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -135,7 +135,7 @@ type RouterConfig struct {
 type Router struct {
 	cfg          *RouterConfig
 	httpClient   *http.Client
-	streamClient *http.Client // RouteArrowQuery: no whole-response timeout
+	streamClient *http.Client // RouteReadQuery: no whole-response timeout
 	writeClient  *http.Client
 	importClient *http.Client
 	logger       zerolog.Logger
@@ -469,28 +469,42 @@ func (r *Router) RouteQuery(ctx context.Context, req *http.Request) (*http.Respo
 	return r.forwardRequest(ctx, reader, req)
 }
 
-// ErrNoArrowQueryPeer reports that no peer accepts a forwarded Arrow query
-// (CapabilityForwardArrowQuery): the caller runs the query locally, as before
-// #1567, rather than send it to a peer that would refuse it.
-var ErrNoArrowQueryPeer = errors.New("no peer accepts a forwarded Arrow query")
+type forwardTargetHookKey struct{}
 
-// RouteArrowQuery is RouteQuery for POST /api/v1/query/arrow (#1567). It
-// forwards only to peers that advertise CapabilityForwardArrowQuery, so an
-// older reader in a rolling upgrade is never sent a route it would refuse,
-// and it uses streamClient, which has no whole-response timeout: the result
-// streams for as long as the query runs, bounded by ctx. The caller must close
-// the response body.
-func (r *Router) RouteArrowQuery(ctx context.Context, req *http.Request) (*http.Response, error) {
+// WithForwardTargetHook returns a context whose forwards report the node they
+// are sent to, before the request goes out: a caller tracking a forward (the
+// query registry's forwarded_to) learns the target while the peer is still
+// working, not only once its answer starts.
+func WithForwardTargetHook(ctx context.Context, hook func(nodeID string)) context.Context {
+	return context.WithValue(ctx, forwardTargetHookKey{}, hook)
+}
+
+// ErrNoCapablePeer reports that the cluster has nodes that could serve a
+// read but none advertises CapabilityForwardReadQueries (a rolling upgrade):
+// the caller answers the request itself rather than send it to a peer that
+// would refuse it. With no node to serve it at all, RouteReadQuery returns
+// ErrNoReaderAvailable instead, which the caller answers 503, as
+// /api/v1/query does.
+var ErrNoCapablePeer = errors.New("no peer accepts this forwarded read")
+
+// RouteReadQuery forwards a read that a node which cannot serve queries
+// received (#1567 and its follow-up): /query/arrow, /query/estimate,
+// GET /query/:measurement, the measurements listing and schema, and the
+// databases listings. It forwards only to peers that advertise
+// CapabilityForwardReadQueries, and it uses streamClient, which has no
+// whole-response timeout: the caller bounds the request with ctx. The caller
+// must close the response body.
+func (r *Router) RouteReadQuery(ctx context.Context, req *http.Request) (*http.Response, error) {
 	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanQuery {
 		return nil, ErrLocalNodeCanHandle
 	}
 	capable := func(nodes []*Node) []*Node {
-		if r.cfg.PeerArrowQuery == nil {
+		if r.cfg.PeerReadQueries == nil {
 			return nil
 		}
 		out := make([]*Node, 0, len(nodes))
 		for _, n := range nodes {
-			if r.cfg.PeerArrowQuery(n.ID) {
+			if r.cfg.PeerReadQueries(n.ID) {
 				out = append(out, n)
 			}
 		}
@@ -498,21 +512,22 @@ func (r *Router) RouteArrowQuery(ctx context.Context, req *http.Request) (*http.
 	}
 	// Readers first; writers only when there are no readers at all, as
 	// RouteQuery does. Readers that all lack the capability (a rolling
-	// upgrade that reached a writer first) do not send the query to the
-	// writer: it runs locally instead.
-	readers := r.cfg.Registry.GetReaders()
-	var nodes []*Node
-	if len(readers) > 0 {
-		nodes = capable(readers)
-	} else {
-		nodes = capable(r.cfg.Registry.GetWriters())
+	// upgrade that reached a writer first) do not send the request to the
+	// writer: it is answered locally instead.
+	candidates := r.cfg.Registry.GetReaders()
+	if len(candidates) == 0 {
+		candidates = r.cfg.Registry.GetWriters()
 	}
+	if len(candidates) == 0 {
+		return nil, ErrNoReaderAvailable
+	}
+	nodes := capable(candidates)
 	if len(nodes) == 0 {
-		return nil, ErrNoArrowQueryPeer
+		return nil, ErrNoCapablePeer
 	}
 	node := r.selectNode(nodes)
 	if node == nil {
-		return nil, ErrNoArrowQueryPeer
+		return nil, ErrNoCapablePeer
 	}
 	return r.forwardRequestWith(ctx, r.streamClient, node, req)
 }
@@ -661,6 +676,9 @@ func (r *Router) doForward(ctx context.Context, client *http.Client, node *Node,
 	}
 
 	// Execute the request
+	if hook, ok := ctx.Value(forwardTargetHookKey{}).(func(string)); ok && hook != nil {
+		hook(node.ID)
+	}
 	start := time.Now()
 	resp, err := client.Do(forwardReq)
 	elapsed := time.Since(start)
