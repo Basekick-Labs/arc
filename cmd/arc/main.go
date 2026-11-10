@@ -4828,6 +4828,11 @@ func main() {
 					// /health "tiering": cold rows whose object is gone (#1551).
 					// ColdMissingObjects is nil until a cold sync has checked.
 					server.SetColdMissingObjects(tieringManager.ColdMissingObjects)
+					// The cluster's cold mark is trusted only for the cold
+					// store it was seeded from (#1552).
+					if clusterCoordinator != nil {
+						clusterCoordinator.SetColdMarkIdentity(tieringManager.ColdBackendIdentity)
+					}
 					// Cluster-wide tiering policies (#1324): once the cluster
 					// has seeded them, every node reads and writes the same
 					// policies through Raft instead of its own table.

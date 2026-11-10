@@ -47,7 +47,10 @@ func (m *Manager) coldMarker() ColdMarker {
 // under no scope is read by no query and gets ok=false.
 func (m *Manager) coldMarkDay(key string) (scope string, day int32, ok bool) {
 	scope, ok = measurementScope(key)
-	if !ok {
+	if !ok || !validColdMarkScope(scope) {
+		// A scope the cluster refuses is one no query reads (names over 128
+		// bytes, traversal): dropping it keeps one stray object from
+		// refusing a whole seed or Add.
 		return "", 0, false
 	}
 	info, err := m.parseFilePath(key)
@@ -55,6 +58,16 @@ func (m *Manager) coldMarkDay(key string) (scope string, day int32, ok bool) {
 		return scope, coldMarkUnknownDay, true
 	}
 	return scope, int32(info.PartitionTime.UTC().Unix() / int64(24*time.Hour/time.Second)), true
+}
+
+// validColdMarkScope mirrors raft.ValidColdMarkScope (no import between the
+// packages): two non-empty segments of at most 128 bytes, no traversal.
+func validColdMarkScope(scope string) bool {
+	db, meas, ok := strings.Cut(scope, "/")
+	if !ok || db == "" || meas == "" || strings.Contains(meas, "/") || len(db) > 128 || len(meas) > 128 {
+		return false
+	}
+	return !strings.Contains(scope, "..") && !strings.ContainsAny(scope, "\\\x00")
 }
 
 // addColdMark raises marks[scope] to day.
@@ -87,21 +100,33 @@ func coldBackendIdentity(c *config.ColdTierConfig) string {
 	if c == nil {
 		return ""
 	}
-	var bucket, prefix string
+	// The endpoint (and S3 region, Azure account) are part of it: the same
+	// bucket name on another endpoint or account is another store.
+	var where, bucket, prefix string
 	switch c.Backend {
 	case "s3":
-		bucket, prefix = c.S3Bucket, c.S3Prefix
+		where, bucket, prefix = c.S3Endpoint+"|"+c.S3Region, c.S3Bucket, c.S3Prefix
 	case "azure":
-		bucket, prefix = c.AzureContainer, c.AzurePrefix
+		where, bucket, prefix = c.AzureEndpoint+"|"+c.AzureAccountName, c.AzureContainer, c.AzurePrefix
 	case "gcs":
-		bucket, prefix = c.GCSBucket, c.GCSPrefix
+		where, bucket, prefix = c.GCSEndpoint, c.GCSBucket, c.GCSPrefix
 	default:
 		return ""
 	}
 	if bucket == "" {
 		return ""
 	}
-	return c.Backend + "://" + bucket + "/" + strings.Trim(prefix, "/")
+	return c.Backend + "://" + where + "/" + bucket + "/" + strings.Trim(prefix, "/")
+}
+
+// ColdBackendIdentity is this node's cold store identity for the cluster's
+// cold mark, "" without a usable cold tier. A reader trusts the mark only
+// when it was seeded from this same store.
+func (m *Manager) ColdBackendIdentity() string {
+	if !m.coldTierUsable() {
+		return ""
+	}
+	return coldBackendIdentity(&m.config.Cold)
 }
 
 // coldMarkSeed is the seed a cold sync collects: started only when the mark

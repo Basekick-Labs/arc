@@ -1,7 +1,6 @@
 package tiering
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -108,7 +107,9 @@ func TestColdSyncSeedsTheMark(t *testing.T) {
 	m.manifest = fm
 	sync := func() {
 		t.Helper()
-		syncListing(t, m, cold, "db1/cpu/2024/03/15/cpu_a_daily.parquet", "db1/cpu/2024/03/17/14/b.parquet", "db1/mem/x/y.parquet")
+		// A scope no query reads (a 129-byte measurement) is dropped, not
+		// allowed to refuse the whole seed.
+		syncListing(t, m, cold, "db1/cpu/2024/03/15/cpu_a_daily.parquet", "db1/cpu/2024/03/17/14/b.parquet", "db1/mem/x/y.parquet", "db1/"+strings.Repeat("m", 129)+"/2024/03/15/c_daily.parquet")
 	}
 
 	sync()
@@ -125,8 +126,8 @@ func TestColdSyncSeedsTheMark(t *testing.T) {
 	gate.primary.Store(true)
 	sync()
 	want := map[string]int32{"db1/cpu": 19799, "db1/mem": coldMarkUnknownDay}
-	if len(fm.seededMarks) != 2 || fm.seededMarks["db1/cpu"] != want["db1/cpu"] || fm.seededMarks["db1/mem"] != want["db1/mem"] || fm.seededBackend != "s3://arc-archive-test/p" {
-		t.Fatalf("seed %v %q, want %v s3://arc-archive-test/p", fm.seededMarks, fm.seededBackend, want)
+	if len(fm.seededMarks) != 2 || fm.seededMarks["db1/cpu"] != want["db1/cpu"] || fm.seededMarks["db1/mem"] != want["db1/mem"] || fm.seededBackend != "s3://|us-east-1/arc-archive-test/p" {
+		t.Fatalf("seed %v %q, want %v s3://|us-east-1/arc-archive-test/p", fm.seededMarks, fm.seededBackend, want)
 	}
 	fm.seededMarks, fm.seeded = nil, true
 	sync()
@@ -135,49 +136,65 @@ func TestColdSyncSeedsTheMark(t *testing.T) {
 	}
 }
 
-// Cold-writer inventory: every storage write in tiering and backup, with
-// whether it can write to the cold tier. A cold write must go through
-// GuardColdWrite (#1552); a new write here must be added with that decision.
+// Cold-writer inventory: every non-test file under internal/ and cmd/ that
+// reaches a cold backend (ColdBackend(), GetBackendForTier(...TierCold),
+// coldBackendOrNil(), m.coldBackend) and also writes to storage. A cold
+// write must go through GuardColdWrite (#1552); a new such file must be
+// reviewed and added here.
 func TestColdWriterInventory(t *testing.T) {
-	allowed := map[string]string{
-		"tiering/migrator.go:dst.Write(ctx":                "copyFile: unused, no caller (cold write would need GuardColdWrite)",
-		"tiering/migrator.go:dst.WriteReader(ctx":          "copyFileStreaming: cold write, guarded in copyAndFlip",
-		"backup/restore.go:dest.WriteReader(ctx":           "streamRestoreFile: cold write, guarded in the restore loop",
-		"backup/cluster.go:dest.backend.WriteReader(ctx":   "backup target, not cold",
-		"backup/warehouse.go:dest.backend.WriteReader(ctx": "backup target, not cold",
-		"backup/backup.go:dest.backend.WriteReader(ctx":    "backup target, not cold",
+	reviewed := map[string]string{
+		"internal/tiering/migrator.go": "copyFileStreaming: guarded in copyAndFlip; copyFile unused",
+		"internal/backup/restore.go":   "streamRestoreFile: guarded in the restore loop",
+		"internal/backup/backup.go":    "writes go to the backup target, not cold",
 	}
-	re := regexp.MustCompile(`[A-Za-z_.]+\.(WriteReader|Write)\(ctx`)
-	pkg := map[string]string{".": "tiering", "../backup": "backup"}
-	var found []string
-	for _, dir := range []string{".", "../backup"} {
-		files, _ := filepath.Glob(filepath.Join(dir, "*.go"))
-		for _, f := range files {
-			if strings.HasSuffix(f, "_test.go") {
-				continue
+	coldRef := regexp.MustCompile(`ColdBackend\(\)|GetBackendForTier\((tiering\.)?TierCold\)|coldBackendOrNil\(\)|m\.coldBackend\b`)
+	write := regexp.MustCompile(`\.(WriteReader|Write)\(ctx`)
+	var flagged []string
+	for _, root := range []string{"../../internal", "../../cmd"} {
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return err
 			}
-			fh, err := os.Open(f)
+			b, err := os.ReadFile(path)
 			if err != nil {
-				t.Fatal(err)
+				return err
 			}
-			s := bufio.NewScanner(fh)
-			for s.Scan() {
-				for _, call := range re.FindAllString(s.Text(), -1) {
-					key := pkg[dir] + "/" + filepath.Base(f) + ":" + call
-					found = append(found, key)
-				}
+			if coldRef.Match(b) && write.Match(b) {
+				rel, _ := filepath.Rel("../..", path)
+				flagged = append(flagged, filepath.ToSlash(rel))
 			}
-			fh.Close()
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
 		}
 	}
-	sort.Strings(found)
-	if len(found) < len(allowed) {
-		t.Fatalf("found %v: the scan missed known writes", found)
+	sort.Strings(flagged)
+	if len(flagged) == 0 {
+		t.Fatal("the scan found nothing: it is broken")
 	}
-	for _, k := range found {
-		if _, ok := allowed[k]; !ok {
-			t.Errorf("new storage write %s: decide whether it can write to the cold tier and, if so, guard it with GuardColdWrite", k)
+	for _, f := range flagged {
+		if _, ok := reviewed[f]; !ok {
+			t.Errorf("%s reaches the cold tier and writes to storage: if it can write a cold object, guard it with GuardColdWrite, then add it here", f)
 		}
+	}
+}
+
+func TestColdBackendIdentityNamesTheStore(t *testing.T) {
+	m, _, _, cleanup := setupIntegrationTest(t, true)
+	defer cleanup()
+	base := m.ColdBackendIdentity()
+	m.config.Cold.S3Endpoint = "minio.local:9000"
+	if m.ColdBackendIdentity() == base {
+		t.Fatal("another endpoint gave the same identity")
+	}
+	m.config.Cold.S3Endpoint, m.config.Cold.S3Region = "", "eu-west-1"
+	if m.ColdBackendIdentity() == base {
+		t.Fatal("another region gave the same identity")
+	}
+	m.coldBackend = nil
+	if m.ColdBackendIdentity() != "" {
+		t.Fatal("identity without a usable cold tier")
 	}
 }
 

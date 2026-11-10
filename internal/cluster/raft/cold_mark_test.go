@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"slices"
 	"strings"
@@ -179,35 +180,98 @@ func aliveAll(x *tkFSM, at time.Time, except ...string) {
 func TestColdMarkTrustNeedsFreshAliveFromEveryMember(t *testing.T) {
 	x := trustedFSM(t)
 	now := t0.Add(time.Hour)
-	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil); ok || why == "" {
+	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil, "s3://b/"); ok || why == "" {
 		t.Fatal("trusted with no Alive at all")
 	}
 	aliveAll(x, now)
-	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil); !ok {
+	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil, "s3://b/"); !ok {
 		t.Fatalf("not trusted with every Alive fresh: %s", why)
 	}
 	// Exactly maxAge old is still fresh; one second more is not.
-	if ok, _ := x.f.ColdMarkTrustedFor(now.Add(ColdMarkAliveMaxAge), ColdMarkAliveMaxAge, nil); !ok {
+	if ok, _ := x.f.ColdMarkTrustedFor(now.Add(ColdMarkAliveMaxAge), ColdMarkAliveMaxAge, nil, "s3://b/"); !ok {
 		t.Fatal("untrusted at exactly maxAge")
 	}
 	// r1 stops confirming (a rolled-back build): untrusted after maxAge.
 	later := now.Add(ColdMarkAliveMaxAge + time.Second)
 	aliveAll(x, later, "r1")
-	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, nil); ok || !strings.Contains(why, "r1") {
+	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, nil, "s3://b/"); ok || !strings.Contains(why, "r1") {
 		t.Fatalf("trusted with r1 silent past maxAge: %v %q", ok, why)
 	}
 	x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "r1"})
-	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, nil); !ok {
+	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, nil, "s3://b/"); !ok {
 		t.Fatalf("a removed node still blocks: %s", why)
 	}
 	// A Raft server outside the node table counts too.
-	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, []string{"w1", "raft-x"}); ok || !strings.Contains(why, "raft-x") {
+	if ok, why := x.f.ColdMarkTrustedFor(later, ColdMarkAliveMaxAge, []string{"w1", "raft-x"}, "s3://b/"); ok || !strings.Contains(why, "raft-x") {
 		t.Fatalf("trusted with a silent Raft server: %v %q", ok, why)
 	}
-	// An older Alive never moves a newer one back.
+	// The latest Alive in log order wins, so a clock that ran ahead and was
+	// corrected brings its Alive back.
 	x.ok(CommandColdMarkAlive, ColdMarkAlivePayload{NodeID: "w1", At: now})
-	if got := x.f.ColdMarkLastAlive("w1"); !got.Equal(later) {
-		t.Fatalf("last alive %v, want %v", got, later)
+	if got := x.f.ColdMarkLastAlive("w1"); !got.Equal(now) {
+		t.Fatalf("last alive %v, want %v", got, now)
+	}
+}
+
+// An Alive in the reader's future beyond the skew bound is not alive.
+func TestColdMarkFutureAliveIsNotAlive(t *testing.T) {
+	x := trustedFSM(t)
+	now := t0.Add(time.Hour)
+	aliveAll(x, now)
+	x.ok(CommandColdMarkAlive, ColdMarkAlivePayload{NodeID: "w2", At: now.Add(ColdMarkAliveSkew + time.Second)})
+	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil, "s3://b/"); ok || !strings.Contains(why, "clock") {
+		t.Fatalf("trusted with an Alive in the future: %v %q", ok, why)
+	}
+	x.ok(CommandColdMarkAlive, ColdMarkAlivePayload{NodeID: "w2", At: now.Add(ColdMarkAliveSkew)})
+	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil, "s3://b/"); !ok {
+		t.Fatalf("untrusted within the skew bound: %s", why)
+	}
+}
+
+// The mark is trusted only for the cold store it was seeded from.
+func TestColdMarkTrustNeedsTheSameColdStore(t *testing.T) {
+	x := trustedFSM(t)
+	now := t0.Add(time.Hour)
+	aliveAll(x, now)
+	for _, id := range []string{"", "s3://other/"} {
+		if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil, id); ok || !strings.Contains(why, "cold store") {
+			t.Fatalf("identity %q: trusted %v %q", id, ok, why)
+		}
+	}
+}
+
+// A removed node's Alive and Ack are forgotten: rejoining, it must confirm
+// again.
+func TestColdMarkRemovalForgetsAliveAndAck(t *testing.T) {
+	x := trustedFSM(t)
+	now := t0.Add(time.Hour)
+	aliveAll(x, now)
+	x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "r1"})
+	x.ok(CommandAddNode, AddNodePayload{Node: NodeInfo{ID: "r1", Role: "reader", State: "healthy"}})
+	if x.f.ColdMarkAcked("r1") || !x.f.ColdMarkLastAlive("r1").IsZero() {
+		t.Fatal("a rejoined node kept its Ack or Alive")
+	}
+	if ok, _ := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil, "s3://b/"); ok {
+		t.Fatal("trusted with a rejoined node that has not confirmed")
+	}
+}
+
+// The status never names the cold store: read-level tokens see it.
+func TestColdMarkStatusHidesTheBackend(t *testing.T) {
+	x := trustedFSM(t)
+	raw, err := json.Marshal(x.f.ColdMarkStatus())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "s3://") {
+		t.Fatalf("status names the cold store: %s", raw)
+	}
+}
+
+func TestColdMarkScopeLengthCap(t *testing.T) {
+	long := strings.Repeat("m", maxColdMarkSegmentLen+1)
+	if validColdMarkScope("db/"+long) || validColdMarkScope(long+"/cpu") || !validColdMarkScope("db/"+long[:maxColdMarkSegmentLen]) {
+		t.Fatal("segment length cap wrong")
 	}
 }
 

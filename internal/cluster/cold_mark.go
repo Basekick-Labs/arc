@@ -25,7 +25,13 @@ import (
 //
 // The fence: ColdWrite holds coldWriteMu shared across its decision and the
 // write. A node acks Enable only after taking it exclusively once Enable is
-// applied here, so no write that began unmarked can still be running.
+// applied here (once; a sticky flag makes every later write raise the mark),
+// so no write that began unmarked can still be running.
+//
+// The join gate's barrier ("an enable proposal may still commit") holds only
+// on the leader that proposed it. A member that later runs an older build is
+// covered by the liveness check instead (raft/cold_mark.go): it stops
+// confirming, and readers stop trusting the mark.
 
 const coldMarkEvery = 10 * time.Second
 
@@ -113,11 +119,20 @@ func (c *Coordinator) maybeAckColdMark(ctx context.Context) {
 		return
 	}
 	fsm := c.raftNode.FSM()
-	if fsm == nil || !fsm.ColdMarkStatus().Enabled || fsm.ColdMarkAcked(c.localNode.ID) {
+	if fsm == nil || !fsm.ColdMarkStatus().Enabled {
 		return
 	}
-	c.coldWriteMu.Lock()
-	c.coldWriteMu.Unlock() //nolint:staticcheck // the drain is the point
+	c.coldMarkSeenEnabled.Store(true)
+	if fsm.ColdMarkAcked(c.localNode.ID) {
+		return
+	}
+	if !c.coldMarkDrained.Load() {
+		// Once: every later ColdWrite on this node sees the sticky flag and
+		// raises the mark, so there is nothing more to drain.
+		c.coldWriteMu.Lock()
+		c.coldWriteMu.Unlock() //nolint:staticcheck // the drain is the point
+		c.coldMarkDrained.Store(true)
+	}
 	raw, err := json.Marshal(raft.ColdMarkAckPayload{NodeID: c.localNode.ID})
 	if err != nil {
 		return
@@ -138,7 +153,9 @@ func (c *Coordinator) maybeColdMarkAlive(ctx context.Context, now time.Time) {
 	if fsm == nil || !fsm.ColdMarkStatus().Enabled {
 		return
 	}
-	if last := fsm.ColdMarkLastAlive(c.localNode.ID); now.Sub(last) < raft.ColdMarkAliveEvery {
+	// A last Alive in the future (this clock was ahead and was corrected)
+	// is replaced at once: readers treat it as not alive.
+	if last := fsm.ColdMarkLastAlive(c.localNode.ID); !last.After(now) && now.Sub(last) < raft.ColdMarkAliveEvery {
 		return
 	}
 	raw, err := json.Marshal(raft.ColdMarkAlivePayload{NodeID: c.localNode.ID, At: now.UTC()})
@@ -154,7 +171,9 @@ func (c *Coordinator) maybeColdMarkAlive(ctx context.Context, now time.Time) {
 // enabled, fenced, seeded from one cold store, and every node in the table
 // and every Raft server confirmed it maintains the mark within maxAge
 // (raft.ColdMarkAliveMaxAge in production).
-func (c *Coordinator) ColdMarkTrusted(now time.Time, maxAge time.Duration) (bool, string) {
+//
+// localIdentity is this node's cold store identity (ColdMarkIdentity).
+func (c *Coordinator) ColdMarkTrusted(now time.Time, maxAge time.Duration, localIdentity string) (bool, string) {
 	if c == nil || c.raftNode == nil {
 		return false, "no cluster"
 	}
@@ -166,10 +185,30 @@ func (c *Coordinator) ColdMarkTrusted(now time.Time, maxAge time.Duration) (bool
 	if err != nil {
 		return false, "raft configuration unavailable"
 	}
-	return fsm.ColdMarkTrustedFor(now, maxAge, servers)
+	return fsm.ColdMarkTrustedFor(now, maxAge, servers, localIdentity)
 }
 
-// coldMarkRequired reports whether a cold write must raise the mark first:
+// SetColdMarkIdentity wires this node's cold store identity (tiering's
+// ColdBackendIdentity); "" while it has no cold tier.
+func (c *Coordinator) SetColdMarkIdentity(fn func() string) {
+	if c != nil {
+		c.coldMarkIdentity.Store(&fn)
+	}
+}
+
+// ColdMarkIdentity is this node's cold store identity, "" when unknown.
+func (c *Coordinator) ColdMarkIdentity() string {
+	if c == nil {
+		return ""
+	}
+	if fn := c.coldMarkIdentity.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return ""
+}
+
+// coldMarkRequired reports whether a cold write must raise the mark first
+// (with the sticky flag, see ColdWrite):
 // the mark is enabled, or every node in the table supports it (Enable can
 // then commit while the write runs, and only a node that was unmarked-capable
 // before Enable is drained by the fence). Vacuously true on an empty table.
@@ -199,12 +238,19 @@ func (c *Coordinator) ColdWrite(ctx context.Context, marks map[string]int32, wri
 	if fsm == nil {
 		return write()
 	}
-	required := coldMarkRequired(fsm)
+	// Sticky: once this node has seen Enable applied, a restarted FSM still
+	// catching up must not make the mark optional again.
+	if fsm.ColdMarkStatus().Enabled {
+		c.coldMarkSeenEnabled.Store(true)
+	}
+	if !c.coldMarkSeenEnabled.Load() && !coldMarkRequired(fsm) {
+		// A node on an older build may still apply the log: proposing a
+		// command it does not know would only diverge, and the fence drains
+		// this write before any seed.
+		return write()
+	}
 	if err := c.raiseColdMarks(ctx, fsm, marks); err != nil {
-		if required {
-			return fmt.Errorf("cold mark not raised, cold write not started: %w", err)
-		}
-		c.logger.Debug().Err(err).Msg("Cold mark not raised; the cluster does not maintain it yet")
+		return fmt.Errorf("cold mark not raised, cold write not started: %w", err)
 	}
 	return write()
 }
@@ -217,6 +263,9 @@ func (c *Coordinator) raiseColdMarks(ctx context.Context, fsm *raft.ClusterFSM, 
 		}
 	}
 	return c.proposeColdMarkChunks(ctx, need, func(chunk map[string]int32, _ bool) (*raft.Command, error) {
+		if len(chunk) == 0 {
+			return nil, nil
+		}
 		raw, err := json.Marshal(raft.ColdMarkAddPayload{Marks: chunk})
 		return &raft.Command{Type: raft.CommandColdMarkAdd, Payload: raw}, err
 	})
@@ -227,9 +276,21 @@ func (c *Coordinator) raiseColdMarks(ctx context.Context, fsm *raft.ClusterFSM, 
 func (c *Coordinator) proposeColdMarkChunks(ctx context.Context, marks map[string]int32, build func(chunk map[string]int32, last bool) (*raft.Command, error)) error {
 	scopes := make([]string, 0, len(marks))
 	for s := range marks {
-		scopes = append(scopes, s)
+		// A scope the FSM refuses would refuse the whole chunk; no query
+		// reads it.
+		if raft.ValidColdMarkScope(s) {
+			scopes = append(scopes, s)
+		}
 	}
 	sort.Strings(scopes)
+	if len(scopes) == 0 {
+		// Nothing to raise; a seed still needs its final chunk.
+		cmd, err := build(nil, true)
+		if err != nil || cmd == nil {
+			return err
+		}
+		return c.applyOrForward(ctx, cmd)
+	}
 	const chunkSize = 1000
 	for start := 0; start < len(scopes); start += chunkSize {
 		end := min(start+chunkSize, len(scopes))
@@ -281,13 +342,6 @@ func (c *Coordinator) SeedColdMarks(ctx context.Context, marks map[string]int32,
 		}
 		raw, err := json.Marshal(p)
 		return &raft.Command{Type: raft.CommandColdMarkSeed, Payload: raw}, err
-	}
-	if len(marks) == 0 {
-		cmd, err := build(nil, true)
-		if err != nil {
-			return err
-		}
-		return c.applyOrForward(ctx, cmd)
 	}
 	return c.proposeColdMarkChunks(ctx, marks, build)
 }

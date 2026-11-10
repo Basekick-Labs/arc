@@ -166,6 +166,12 @@ type Coordinator struct {
 	// fence (cold_mark.go).
 	coldMarkGate coldMarkGate
 	coldWriteMu  sync.RWMutex
+	// coldMarkSeenEnabled: this node has seen Enable applied (sticky);
+	// coldMarkDrained: its one fence drain is done; coldMarkIdentity: its
+	// cold store identity getter.
+	coldMarkSeenEnabled atomic.Bool
+	coldMarkDrained     atomic.Bool
+	coldMarkIdentity    atomic.Pointer[func() string]
 	// clusterPolicies: the #1324 flag's join gate and blockers;
 	// policyListers read this node's own rows of each kind for adoption.
 	clusterPolicies clusterPoliciesGate
@@ -3226,7 +3232,7 @@ func (c *Coordinator) Status() map[string]interface{} {
 		status["stream_claims"] = c.StreamClaimsStatus()
 		status["compaction_commit"] = c.CompactionCommitStatus()
 		cm, blocking := c.ColdMarkStatus()
-		trusted, why := c.ColdMarkTrusted(time.Now(), raft.ColdMarkAliveMaxAge)
+		trusted, why := c.ColdMarkTrusted(time.Now(), raft.ColdMarkAliveMaxAge, c.ColdMarkIdentity())
 		status["cold_mark"] = map[string]any{"state": cm, "blocking_nodes": blocking, "trusted": trusted, "untrusted_reason": why}
 		status["cluster_policies"] = c.ClusterPoliciesStatus()
 	}

@@ -162,7 +162,79 @@ func TestColdMarkAliveIsProposedPeriodically(t *testing.T) {
 	waitFSM(t, func() bool { return fsm.ColdMarkLastAlive("writer-1").Equal(next.UTC()) })
 
 	// Not trusted: not seeded, and the other nodes never confirmed.
-	if ok, why := c.ColdMarkTrusted(next, raft.ColdMarkAliveMaxAge); ok || why == "" {
+	if ok, why := c.ColdMarkTrusted(next, raft.ColdMarkAliveMaxAge, "s3://b/"); ok || why == "" {
 		t.Fatalf("trusted: %v %q", ok, why)
 	}
+}
+
+// A reader's maxAge must outlast a confirmation interval plus a loop tick.
+func TestColdMarkTimingConstants(t *testing.T) {
+	if !(coldMarkEvery < raft.ColdMarkAliveMaxAge-raft.ColdMarkAliveEvery) {
+		t.Fatal("coldMarkEvery must be shorter than ColdMarkAliveMaxAge - ColdMarkAliveEvery")
+	}
+}
+
+// Before the mark is required (a node lacks the capability), a cold write
+// proposes nothing: an older build would refuse the command.
+func TestColdWriteProposesNothingBeforeRequired(t *testing.T) {
+	c := coldMarkRig(t, nil)
+	if err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 5}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, has, _ := c.raftNode.FSM().ColdMark("db/cpu"); has {
+		t.Fatal("a mark was proposed before every node supports it")
+	}
+}
+
+// Once this node saw Enable applied, a failed raise refuses the write even if
+// its FSM says the mark is not required (a restarted, lagging FSM).
+func TestColdWriteStickyOnceEnabledSeen(t *testing.T) {
+	c := coldMarkRig(t, nil) // reader-1 lacks the capability: not required
+	c.coldMarkSeenEnabled.Store(true)
+	if err := c.raftNode.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	if err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 5}, func() error { ran = true; return nil }); err == nil || ran {
+		t.Fatalf("err %v ran %v: a write ran unmarked after Enable was seen", err, ran)
+	}
+}
+
+// The fence drains once: when the first Ack proposal fails after the drain,
+// the retry does not wait for cold writes in flight.
+func TestColdMarkFenceDrainsOnce(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	c.maybeEnableColdMark()
+	waitFSM(t, coldMarkEnabled(c))
+	if err := c.raftNode.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	c.maybeAckColdMark(context.Background()) // drains, then the proposal fails
+	if !c.coldMarkDrained.Load() {
+		t.Fatal("not marked drained")
+	}
+	c.coldWriteMu.RLock() // a cold write in flight
+	defer c.coldWriteMu.RUnlock()
+	done := make(chan struct{})
+	go func() { c.maybeAckColdMark(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the retried ack waited for a cold write")
+	}
+}
+
+// An Alive this node left in the future (its clock was ahead) is replaced at
+// once.
+func TestColdMarkAliveReplacesAFutureAlive(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	fsm := c.raftNode.FSM()
+	c.maybeEnableColdMark()
+	waitFSM(t, coldMarkEnabled(c))
+	now := time.Now()
+	c.maybeColdMarkAlive(context.Background(), now.Add(time.Hour))
+	waitFSM(t, func() bool { return fsm.ColdMarkLastAlive("writer-1").After(now) })
+	c.maybeColdMarkAlive(context.Background(), now)
+	waitFSM(t, func() bool { return fsm.ColdMarkLastAlive("writer-1").Equal(now.UTC()) })
 }

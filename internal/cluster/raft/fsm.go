@@ -1720,8 +1720,9 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	removed := f.nodes[p.NodeID]
 	delete(f.nodes, p.NodeID)
 	f.compactionNodeRemovedLocked(p.NodeID)
-	// A removed node no longer holds the cold mark fence (#1552).
-	f.updateColdMarkFenceLocked()
+	// A removed node no longer holds the cold mark fence or counts toward
+	// its liveness (#1552).
+	f.coldMarkNodeRemovedLocked(p.NodeID)
 	// Removing the designated primary has to release the designation, or the
 	// record names a node that no longer exists and the election — which only
 	// runs when nothing is designated — never fires again. Removing the dead

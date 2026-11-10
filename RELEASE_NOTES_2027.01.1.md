@@ -278,12 +278,13 @@ Groundwork for answering recent-data queries on cluster nodes while the cold tie
 
 The cluster now keeps, through Raft, a **cold mark** per database and measurement: the latest day that may have data in the cold tier.
 
-- The migrator, and a restore that writes to the cold tier, raise it before writing the object. When the mark cannot be raised (no Raft quorum), the cold write does not start; the file is migrated or restored on a later attempt.
+- The migrator, and a restore that writes to the cold tier, raise it before writing the object: one synchronous Raft round trip before the copy, only the first time a measurement gets a newer day. Once every node runs this release, a cold write whose mark cannot be raised (no Raft quorum) does not start; the file is migrated on a later cycle, and a restore fails. Before that, cold writes run as they do today and propose nothing.
 - It never goes down. Retention, DELETE and policy changes leave it where it is.
 - Existing cold data is folded in from a complete cold listing, taken after every node has confirmed it has no unmarked cold write in flight.
 - It turns on by itself once every node runs this release. From then on a node on an older release cannot join, as with the other cluster capability flags.
-- Every node confirms every 5 minutes that it maintains the mark. The mark counts as trusted only while every node and every Raft server has confirmed within the last 15 minutes, so a member that comes back on an older release, which would write to the cold tier without raising it, makes it untrusted until it is upgraded or removed.
-- `GET /api/v1/cluster` reports it under `cold_mark` (enabled, fenced, seeded, nodes still to confirm, trusted and why not).
+- Every node confirms every 5 minutes that it maintains the mark. The mark counts as trusted only while every node and every Raft server has confirmed within the last 15 minutes, so a member that comes back on an older release, which would write to the cold tier without raising it, makes it untrusted until it is upgraded or removed. That leaves a window of up to 15 minutes in which such a member can write unmarked while the mark is still trusted. A confirmation more than 1 minute in a reader's future counts as missing, so node clocks must agree to within a minute.
+- A node trusts the mark only if its own cold tier (backend, endpoint, region or account, bucket and prefix) is the store the mark was seeded from. If two nodes seed it from different stores, it is never trusted again; this release has no way to reset that (part 2 adds one).
+- `GET /api/v1/cluster` reports it under `cold_mark` (enabled, fenced, seeded, nodes still to confirm, trusted and why not). It does not name the cold store.
 
 Performance: one small Raft entry the first time a migration or restore writes a newer day for a measurement (at most one per measurement per day in steady state); one small Raft entry per node every 5 minutes for the liveness confirmation; one seed per cluster, in entries of up to 1,000 measurements; state of one integer per measurement and one timestamp per node. Queries are unchanged.
 
