@@ -74,6 +74,36 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: the Linux packages run on Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 again ([#1579](https://github.com/Basekick-Labs/arc/issues/1579))
+
+The 26.09.3 Linux binary needed glibc 2.38, because it was built on the
+newest GitHub runner:
+
+- On Debian 12 and Ubuntu 22.04 the `.deb` installed and then failed to start
+  (``version `GLIBC_2.38' not found``).
+- On RHEL/Rocky/Alma 9 and Amazon Linux 2023 the RPM refused to install. On
+  RHEL 9 it also needed a newer libstdc++ (`GLIBCXX_3.4.30`) than the system
+  ships.
+
+The binaries are now built on Ubuntu 22.04 with libstdc++ linked in, so they
+need only glibc 2.34 or newer and the system's `libgcc_s`.
+
+- **Supported:** Ubuntu 22.04+, Debian 12+, RHEL/Rocky/Alma 9+, Amazon Linux
+  2023, Fedora 35+.
+- **Not supported:** Ubuntu 20.04 and RHEL 8 (glibc 2.31 and 2.28).
+- The `.deb` now declares `Depends: libc6 (>= 2.34), libgcc-s1`, so `dpkg`
+  refuses an older system up front instead of installing a binary that cannot
+  start.
+
+The release build now:
+
+- fails if the binary needs anything above glibc 2.34 or links libstdc++
+  dynamically;
+- installs and starts each package on Debian 12, Ubuntu 22.04, Rocky 9 and
+  Amazon Linux 2023.
+
+Every PR builds the Linux binary the same way, on both architectures.
+
 ## Fix: every read sent to a compactor is answered by a reader, and `/api/v1/queries` covers what it forwarded
 
 A compactor answered several reads itself, from its own storage and field

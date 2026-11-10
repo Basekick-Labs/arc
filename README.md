@@ -178,7 +178,7 @@ The MessagePack endpoint is **stable** as of 26.09.1: its response shape and typ
 
 ## Single binary. Zero dependencies.
 
-Arc deploys as one statically-linked executable. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
+Arc deploys as one self-contained executable: DuckDB and its dependencies are linked in, and on Linux it needs only the system C library (glibc 2.34 or newer). No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
 
 - **Air-gap ready**: No external services required at runtime. No license server, no cloud dependency.
 - **Edge to cloud**: Deploy at the tactical edge, in a sovereign cloud, or on-premises.
@@ -228,6 +228,8 @@ brew install basekick-labs/tap/arc
 ```
 
 Apple Silicon. DuckDB is statically linked, so there are no runtime dependencies. (Use `brew install --formula arc` if you tap first, to disambiguate from the `arc` browser cask.)
+
+Linux packages run on glibc 2.34 or newer: Ubuntu 22.04+, Debian 12+, RHEL/Rocky/Alma 9+, Amazon Linux 2023, Fedora 35+. Ubuntu 20.04 and RHEL 8 are not supported.
 
 ### Debian/Ubuntu
 
