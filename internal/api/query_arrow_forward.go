@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster"
@@ -58,6 +59,10 @@ var arrowTrailerNames = []string{arrowStreamTruncatedTrailer, arrowExecutionTime
 // warning, separately from the local Arrow path's.
 var arrowForwardTrailerWarnOnce sync.Once
 
+// arrowForwardBodyHook, when set by a test, wraps the upstream body; it
+// receives the forward's cancel. Nil in production.
+var arrowForwardBodyHook func(cancel context.CancelFunc, body io.ReadCloser) io.ReadCloser
+
 // errForwardedArrowPanicked aborts a forwarded stream whose relay panicked.
 var errForwardedArrowPanicked = errors.New("forwarded Arrow stream relay panicked")
 
@@ -85,8 +90,17 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 		headerTimer = time.AfterFunc(h.queryTimeout+arrowForwardSlack, cancel)
 	}
 	resp, err := h.router.RouteArrowQuery(ctx, httpReq.WithContext(ctx))
-	if headerTimer != nil {
-		headerTimer.Stop()
+	if headerTimer != nil && !headerTimer.Stop() && err == nil {
+		// The timer fired after the headers arrived: ctx is cancelled, so the
+		// body would fail on its first read. Answer now, before a 200 is
+		// committed.
+		_ = resp.Body.Close()
+		cancel()
+		m.IncQueryErrors()
+		return true, c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
+			"success": false,
+			"error":   "Timed out waiting for the forwarded Arrow query to start",
+		})
 	}
 	if errors.Is(err, cluster.ErrLocalNodeCanHandle) || errors.Is(err, cluster.ErrNoArrowQueryPeer) {
 		cancel()
@@ -125,21 +139,38 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 		_ = resp.Body.Close()
 		cancel()
 	}
-	h.setAbortableBodyStream(fctx, closeUpstream, trailers, abort, "forwarded_arrow_ipc", func() {
+	// dropped is set when fasthttp drops the response before its body
+	// (directBodyStream.Close runs the stream's cancel, then the writer
+	// against a refusing sink): the writer's failure then is not an
+	// upstream failure. Only this flag says so; a cancelled ctx does not,
+	// since server shutdown cancels it mid-stream too.
+	var dropped atomic.Bool
+	body := resp.Body
+	if arrowForwardBodyHook != nil {
+		body = arrowForwardBodyHook(cancel, body)
+	}
+	h.setAbortableBodyStream(fctx, func() {
+		dropped.Store(true)
+		closeUpstream()
+	}, trailers, abort, "forwarded_arrow_ipc", func() {
 		abort.set(errForwardedArrowPanicked)
 	}, func(w *bufio.Writer) {
 		defer closeUpstream()
-		if err := relayArrowBody(w, resp.Body); err != nil {
+		if err := relayArrowBody(w, body); err != nil {
 			var clientGone *clientWriteError
-			if errors.As(err, &clientGone) || ctx.Err() != nil {
-				// The client left, or the response was dropped before its
-				// body (Close cancels and closes the upstream first): not an
-				// upstream failure. Closing the upstream body stops its query.
+			if errors.As(err, &clientGone) {
+				// The client left; closing the upstream body stops its query.
 				return
 			}
-			m.IncQueryErrors()
-			h.logger.Warn().Err(err).Msg("Forwarded Arrow stream failed partway; ending the response as a failed transfer")
+			// Any other failure ends the response as a failed transfer,
+			// whatever cut it (the peer, this node's shutdown, a timer):
+			// finishing it cleanly would hand the client a short result
+			// that reads as complete.
 			abort.set(fmt.Errorf("forwarded Arrow stream failed: %s", sqlutil.SanitizeErrText(err.Error())))
+			if !dropped.Load() {
+				m.IncQueryErrors()
+				h.logger.Warn().Err(err).Msg("Forwarded Arrow stream failed partway; ending the response as a failed transfer")
+			}
 			return
 		}
 		// Upstream trailer values exist only after a clean end of body.

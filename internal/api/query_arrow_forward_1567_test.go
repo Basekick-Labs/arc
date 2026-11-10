@@ -4,6 +4,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -220,4 +221,44 @@ func TestForwardedArrowQueryHungPeerIsBounded(t *testing.T) {
 	_, _ = io.ReadAll(resp.Body)
 	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
 	require.Less(t, time.Since(start), 5*time.Second)
+}
+
+// cancelMidBody yields some bytes, then cancels the forward's context and
+// fails the read the way a cancelled request does: this node's shutdown, or a
+// timer, cutting the stream while the peer is healthy.
+type cancelMidBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (b *cancelMidBody) Read(p []byte) (int, error) {
+	b.reads++
+	if b.reads > 1 {
+		b.cancel()
+		return 0, context.Canceled
+	}
+	return b.ReadCloser.Read(p)
+}
+
+// A stream cut by a cancelled context (not the client leaving) must still end
+// as a failed transfer, never as a clean end that reads as complete.
+func TestForwardedArrowQueryCancelledMidStreamIsABrokenTransfer(t *testing.T) {
+	r := newDoorRig(t)
+	peer := httptest.NewServer(&arrowUpstream{body: bytes.Repeat([]byte("y"), 1<<20)})
+	defer peer.Close()
+	r.qh.SetRouter(arrowForwardRouter(t, peer.URL, cluster.RoleCompactor, true))
+	arrowForwardBodyHook = func(cancel context.CancelFunc, body io.ReadCloser) io.ReadCloser {
+		return &cancelMidBody{ReadCloser: body, cancel: cancel}
+	}
+	defer func() { arrowForwardBodyHook = nil }()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query/arrow", strings.NewReader(`{"sql":"SELECT 1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+r.tokens["coarse-no-team"])
+	resp, err := r.app.Test(req, -1)
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+	}
+	require.Error(t, err, "a stream cut by a cancelled context must not read as complete")
 }
