@@ -302,3 +302,43 @@ func TestColdMarkAliveSnapshot(t *testing.T) {
 		t.Fatalf("restored alive %v, want %v", got, t0)
 	}
 }
+
+// An admin reset clears the seed and a backend conflict, keeps the marks, and
+// the next seed after the fence trusts again.
+func TestColdMarkResetReseeds(t *testing.T) {
+	x := trustedFSM(t)
+	x.ok(CommandColdMarkAdd, ColdMarkAddPayload{Marks: map[string]int32{"db/cpu": 9}})
+	x.ok(CommandColdMarkSeed, ColdMarkSeedPayload{Final: true, Backend: "s3://other/"})
+	if !x.f.ColdMarkStatus().BackendConflict {
+		t.Fatal("setup: no conflict")
+	}
+	x.ok(CommandColdMarkReset, ColdMarkResetPayload{By: "admin"})
+	st := x.f.ColdMarkStatus()
+	if st.Seeded || st.BackendConflict || !st.Fenced {
+		t.Fatalf("after reset: %+v", st)
+	}
+	if day, has, _ := x.f.ColdMark("db/cpu"); !has || day != 9 {
+		t.Fatal("reset dropped a mark")
+	}
+	x.ok(CommandColdMarkSeed, ColdMarkSeedPayload{Final: true, Backend: "s3://other/"})
+	now := t0.Add(time.Hour)
+	aliveAll(x, now)
+	if ok, why := x.f.ColdMarkTrustedFor(now, ColdMarkAliveMaxAge, nil, "s3://other/"); !ok {
+		t.Fatalf("not trusted after reseed: %s", why)
+	}
+}
+
+// The last raise is the proposer's time, set only when the mark moves up.
+func TestColdMarkRaisedAt(t *testing.T) {
+	x := takeoverFSM(t)
+	x.ok(CommandColdMarkAdd, ColdMarkAddPayload{Marks: map[string]int32{"db/cpu": 10}, At: t0})
+	x.ok(CommandColdMarkAdd, ColdMarkAddPayload{Marks: map[string]int32{"db/cpu": 9}, At: t0.Add(time.Hour)})
+	if got := x.f.ColdMarkRaisedAt("db/cpu"); !got.Equal(t0) {
+		t.Fatalf("raised %v after a lower add, want %v", got, t0)
+	}
+	x.ok(CommandColdMarkAdd, ColdMarkAddPayload{Marks: map[string]int32{"db/cpu": 11}, At: t0.Add(2 * time.Hour)})
+	if got := x.f.ColdMarkRaisedAt("db/cpu"); !got.Equal(t0.Add(2 * time.Hour)) {
+		t.Fatalf("raised %v", got)
+	}
+	x.refused(CommandColdMarkReset, ColdMarkResetPayload{}) // not enabled
+}

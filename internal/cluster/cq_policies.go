@@ -152,11 +152,17 @@ func (c *Coordinator) SetCQWatermark(ctx context.Context, id int64, from *time.T
 // (a new leader, or a primary that was cut off, could otherwise run from a
 // stale one and aggregate a committed window again).
 func (c *Coordinator) CQReadBarrier(ctx context.Context) error {
+	return c.readBarrier(ctx, policyProposeTimeout)
+}
+
+// readBarrier returns once this node's FSM has applied everything the leader
+// had committed when it was called, within d.
+func (c *Coordinator) readBarrier(ctx context.Context, d time.Duration) error {
 	if c.raftNode == nil {
 		return errors.New("raft not initialized")
 	}
 	if c.raftNode.IsLeader() {
-		return c.barrierWithin(policyProposeTimeout)
+		return c.barrierWithin(d)
 	}
 	token, err := security.GenerateNonce()
 	if err != nil {
@@ -166,7 +172,7 @@ func (c *Coordinator) CQReadBarrier(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, policyProposeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
 	index, err := c.forwardApplyToLeaderIndex(ctx, &raft.Command{Type: raft.CommandBarrier, Payload: raw}, true)
 	if err != nil {

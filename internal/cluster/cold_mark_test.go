@@ -238,3 +238,37 @@ func TestColdMarkAliveReplacesAFutureAlive(t *testing.T) {
 	c.maybeColdMarkAlive(context.Background(), now)
 	waitFSM(t, func() bool { return fsm.ColdMarkLastAlive("writer-1").Equal(now.UTC()) })
 }
+
+// ColdMarkDay reads the FSM with the raise time; the read barrier and reset
+// go through Raft; a reset before enable is refused.
+func TestColdMarkDayBarrierAndReset(t *testing.T) {
+	c := coldMarkRig(t, cmList)
+	if _, _, has := c.ColdMarkDay("db/cpu"); has {
+		t.Fatal("mark before any write")
+	}
+	if err := c.ResetColdMark(context.Background(), "admin", "test"); !errors.Is(err, ErrColdMarkNotEnabled) {
+		t.Fatalf("reset before enable: %v", err)
+	}
+	before := time.Now()
+	if err := c.ColdWrite(context.Background(), map[string]int32{"db/cpu": 77}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ColdMarkReadBarrier(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	day, raised, has := c.ColdMarkDay("db/cpu")
+	if !has || day != 77 || raised.Before(before.Add(-time.Second)) {
+		t.Fatalf("day %d raised %v has %v", day, raised, has)
+	}
+	c.maybeEnableColdMark()
+	waitFSM(t, coldMarkEnabled(c))
+	if err := c.ResetColdMark(context.Background(), "admin", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ColdMarkReadBarrier(context.Background()); err == nil {
+		t.Fatal("a barrier succeeded with Raft stopped")
+	}
+}

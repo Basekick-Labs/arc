@@ -246,6 +246,9 @@ const (
 	CommandColdMarkSeed
 	// CommandColdMarkAlive: a node confirming it maintains the cold mark.
 	CommandColdMarkAlive
+	// CommandColdMarkReset: an admin clearing the seed (and a backend
+	// conflict) so the next cold listing seeds again.
+	CommandColdMarkReset
 )
 
 // Command represents a command to be applied to the FSM.
@@ -1421,6 +1424,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyColdMarkSeed(cmd.Payload)
 	case CommandColdMarkAlive:
 		return f.applyColdMarkAlive(cmd.Payload)
+	case CommandColdMarkReset:
+		return f.applyColdMarkReset(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:

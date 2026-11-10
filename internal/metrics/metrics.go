@@ -64,8 +64,12 @@ type Metrics struct {
 	// the cold tier could not list, because this node's tier metadata holds
 	// no cold rows for the range (#1550).
 	queryColdUnlistedSkipped atomic.Int64
-	queryLatencySum          atomic.Int64 // microseconds
-	queryLatencyCount        atomic.Int64
+	// queryColdMarkSkipped counts cluster reads that left out cold
+	// partitions the cold tier could not list because the cluster's cold
+	// mark says the range holds no cold data (#1552).
+	queryColdMarkSkipped atomic.Int64
+	queryLatencySum      atomic.Int64 // microseconds
+	queryLatencyCount    atomic.Int64
 
 	// Client-disconnect mid-stream counters, broken out by streaming
 	// handler so operators can disambiguate "Grafana panels giving up"
@@ -530,7 +534,13 @@ func (m *Metrics) IncSlowQueries()   { m.querySlowTotal.Add(1) }
 // cold tier could not list, on tier metadata's word that the range has no
 // cold rows (#1550).
 func (m *Metrics) IncQueryColdUnlistedSkipped() { m.queryColdUnlistedSkipped.Add(1) }
-func (m *Metrics) IncQueryRows(count int64)     { m.queryRowsTotal.Add(count) }
+
+// IncQueryColdMarkSkipped counts one cluster read answered without the cold
+// partitions it could not list, on the cold mark's word (#1552).
+func (m *Metrics) IncQueryColdMarkSkipped() { m.queryColdMarkSkipped.Add(1) }
+
+// IncQueryRows adds count to the rows queries returned.
+func (m *Metrics) IncQueryRows(count int64) { m.queryRowsTotal.Add(count) }
 
 // RecordQueryLatency records query latency in microseconds
 func (m *Metrics) RecordQueryLatency(durationMicros int64) {
@@ -1270,6 +1280,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_timeouts_total":              m.queryTimeoutsTotal.Load(),
 		"query_slow_total":                  m.querySlowTotal.Load(),
 		"query_cold_unlisted_skipped_total": m.queryColdUnlistedSkipped.Load(),
+		"query_cold_mark_skipped_total":     m.queryColdMarkSkipped.Load(),
 		"query_rows_total":                  m.queryRowsTotal.Load(),
 		"query_latency_sum_us":              m.queryLatencySum.Load(),
 		"query_latency_count":               m.queryLatencyCount.Load(),
@@ -1612,6 +1623,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_cold_unlisted_skipped_total Reads that left out cold partitions the cold tier could not list, because tier metadata holds no cold rows for the range\n"...)
 	b = append(b, "# TYPE arc_query_cold_unlisted_skipped_total counter\n"...)
 	b = appendMetric(b, "arc_query_cold_unlisted_skipped_total", float64(m.queryColdUnlistedSkipped.Load()))
+
+	b = append(b, "# HELP arc_query_cold_mark_skipped_total Cluster reads answered without cold partitions the cold tier could not list, because the cluster's cold mark says the read's range holds no cold data.\n"...)
+	b = append(b, "# TYPE arc_query_cold_mark_skipped_total counter\n"...)
+	b = appendMetric(b, "arc_query_cold_mark_skipped_total", float64(m.queryColdMarkSkipped.Load()))
 
 	b = append(b, "# HELP arc_query_rows_total Total rows returned by queries\n"...)
 	b = append(b, "# TYPE arc_query_rows_total counter\n"...)

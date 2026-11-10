@@ -188,6 +188,54 @@ func (c *Coordinator) ColdMarkTrusted(now time.Time, maxAge time.Duration, local
 	return fsm.ColdMarkTrustedFor(now, maxAge, servers, localIdentity)
 }
 
+// ColdMarkDay returns scope's mark ("database/measurement") as days since the
+// epoch and the proposer time of its last raise; has is false when no cold
+// object of the scope was ever marked.
+func (c *Coordinator) ColdMarkDay(scope string) (day int32, raisedAt time.Time, has bool) {
+	if c == nil || c.raftNode == nil {
+		return 0, time.Time{}, false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return 0, time.Time{}, false
+	}
+	day, has, _ = fsm.ColdMark(scope)
+	return day, fsm.ColdMarkRaisedAt(scope), has
+}
+
+// ErrColdMarkNotEnabled: a reset of a cold mark this cluster never enabled.
+var ErrColdMarkNotEnabled = errors.New("the cold mark is not enabled in this cluster, so there is nothing to reset")
+
+// coldMarkReadBarrierTimeout bounds the catch-up check a read makes before it
+// trusts the mark; only reads whose cold listing failed make it.
+const coldMarkReadBarrierTimeout = 2 * time.Second
+
+// ColdMarkReadBarrier returns once this node's FSM has applied everything the
+// leader had committed when it was called, so a mark read afterwards is not
+// older than the cluster's (a lagging reader would otherwise trust a mark
+// below a cold write already committed).
+func (c *Coordinator) ColdMarkReadBarrier(ctx context.Context) error {
+	return c.readBarrier(ctx, coldMarkReadBarrierTimeout)
+}
+
+// ResetColdMark clears the mark's seed, identity and backend conflict (an
+// admin action, after fixing every node's cold tier config). Marks are kept;
+// the first complete cold listing after it, on any node whose tiering is not
+// role-gated, seeds again.
+func (c *Coordinator) ResetColdMark(ctx context.Context, by, reason string) error {
+	if c == nil || c.raftNode == nil {
+		return errors.New("clustering is not enabled on this node")
+	}
+	if fsm := c.raftNode.FSM(); fsm == nil || !fsm.ColdMarkStatus().Enabled {
+		return ErrColdMarkNotEnabled
+	}
+	raw, err := json.Marshal(raft.ColdMarkResetPayload{By: by, Reason: reason})
+	if err != nil {
+		return err
+	}
+	return c.applyOrForward(ctx, &raft.Command{Type: raft.CommandColdMarkReset, Payload: raw})
+}
+
 // SetColdMarkIdentity wires this node's cold store identity (tiering's
 // ColdBackendIdentity); "" while it has no cold tier.
 func (c *Coordinator) SetColdMarkIdentity(fn func() string) {
@@ -266,7 +314,7 @@ func (c *Coordinator) raiseColdMarks(ctx context.Context, fsm *raft.ClusterFSM, 
 		if len(chunk) == 0 {
 			return nil, nil
 		}
-		raw, err := json.Marshal(raft.ColdMarkAddPayload{Marks: chunk})
+		raw, err := json.Marshal(raft.ColdMarkAddPayload{Marks: chunk, At: time.Now().UTC()})
 		return &raft.Command{Type: raft.CommandColdMarkAdd, Payload: raw}, err
 	})
 }
@@ -336,7 +384,7 @@ func (c *Coordinator) SeedColdMarks(ctx context.Context, marks map[string]int32,
 		return errors.New("seed cold marks: no backend identity")
 	}
 	build := func(chunk map[string]int32, last bool) (*raft.Command, error) {
-		p := raft.ColdMarkSeedPayload{Marks: chunk}
+		p := raft.ColdMarkSeedPayload{Marks: chunk, At: time.Now().UTC()}
 		if last {
 			p.Final, p.Backend = true, backend
 		}

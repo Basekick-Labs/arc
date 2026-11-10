@@ -708,8 +708,11 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// like the compaction pause ack: the fence and the trust check wait for
 	// them. Enable is
 	// leader-only and never accepted from a peer.
+	// A reset is an admin action taken on any node's HTTP API (RequireAdmin
+	// there), forwarded like the auth and policy commands.
 	isColdMark := cmd.Type == clusterraft.CommandColdMarkAdd ||
-		cmd.Type == clusterraft.CommandColdMarkSeed
+		cmd.Type == clusterraft.CommandColdMarkSeed ||
+		cmd.Type == clusterraft.CommandColdMarkReset
 	isColdMarkAck := cmd.Type == clusterraft.CommandColdMarkAck || cmd.Type == clusterraft.CommandColdMarkAlive
 	if isColdMarkAck {
 		// Ack and Alive have the same node_id field.
