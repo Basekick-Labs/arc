@@ -127,14 +127,26 @@ and checks the caller's admin permission itself. The response, including
 `409` for a database that already exists, is the writer's.
 
 - With no healthy writer, the answer is `503` ("No writer node available in
-  the cluster"). Before, the database was created locally.
+  the cluster"); with a writer that cannot be reached, `503` ("Database not
+  created: the writer could not be reached; retry"). Nothing is created in
+  either case. Before, the database was created locally. A writer that takes
+  the create but whose answer is lost gives `504`; a retry answers `409` if
+  the database was created.
+- **Failover.** While a designated primary writer is unreachable, the create
+  answers `503` instead of going to another writer, which may be a standby.
+  Retry once the primary is back or a new one is promoted.
 - **Rolling upgrades.** A compactor or reader forwards the create only to a
   writer that advertises it at join (`forward_database_create_v1`). With a
   writer that has not been upgraded yet, the database is created locally, as
-  before.
+  before, and the node logs a warning at most once a minute.
+- A compactor or reader with authentication disabled, in front of a writer
+  with it enabled, now gets `401` for a create, as it already did for writes.
+- On a cluster where each node has its own storage, an empty database exists
+  only on the writer until data arrives, as before: database markers are not
+  replicated, so a listing answered by a reader does not show it yet.
 - `DELETE /api/v1/databases/:name` is unchanged.
-- A standby writer still creates the database itself rather than forwarding
-  it to the primary.
+- A create sent directly to a standby writer is still made by that writer
+  rather than forwarded to the primary.
 
 ## Fix: Arrow queries sent to a compactor are answered by a reader ([#1567](https://github.com/Basekick-Labs/arc/issues/1567))
 

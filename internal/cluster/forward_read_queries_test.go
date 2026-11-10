@@ -129,3 +129,29 @@ func TestRouteDatabaseCreateNeedsACapableWriter(t *testing.T) {
 		t.Fatalf("a writer: err = %v, want ErrLocalNodeCanHandle", err)
 	}
 }
+
+// With a primary designated but unreachable (a failover window), a create is
+// not sent to another writer, which may be a standby that would create the
+// database on its own storage: ErrNoWriterAvailable until the primary is back.
+// With no designation (shared storage, or no failover), any writer will do.
+func TestRouteDatabaseCreateWaitsForTheDesignatedPrimary(t *testing.T) {
+	local := NewNode("local", "Local", RoleCompactor, "c")
+	registry := NewRegistry(&RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
+	standby := NewNode("standby", "S", RoleWriter, "c")
+	standby.UpdateState(StateHealthy)
+	standby.APIAddress = "127.0.0.1:1"
+	if err := registry.Register(standby); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, "http://x/api/v1/databases", nil)
+	r := NewRouter(&RouterConfig{Registry: registry, LocalNode: local, Logger: zerolog.Nop(),
+		Designated: func() string { return "primary-down" }, PeerDatabaseCreate: func(string) bool { return true }})
+	if _, err := r.RouteDatabaseCreate(context.Background(), req); !errors.Is(err, ErrNoWriterAvailable) {
+		t.Fatalf("designated primary down: err = %v, want ErrNoWriterAvailable", err)
+	}
+	r = NewRouter(&RouterConfig{Registry: registry, LocalNode: local, Logger: zerolog.Nop(),
+		Designated: func() string { return "" }, PeerDatabaseCreate: func(string) bool { return true }})
+	if _, err := r.RouteDatabaseCreate(context.Background(), req); errors.Is(err, ErrNoWriterAvailable) || errors.Is(err, ErrNoCapablePeer) {
+		t.Fatalf("no designation: err = %v, want a forward attempt to the writer", err)
+	}
+}

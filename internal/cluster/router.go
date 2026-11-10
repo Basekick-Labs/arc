@@ -251,10 +251,19 @@ func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Respo
 // forwarded identity on that route, so ErrNoCapablePeer tells the caller to
 // create it locally, as before. The target is not shopped for: a write goes
 // to the primary for a reason. Sent once, never retried (ForwardWriteTo).
+//
+// With a primary designated but not reachable (a failover window),
+// writeTarget falls back to any healthy writer, which may be a standby. A
+// write sent there is fenced and retried; a create is not, and the standby
+// would create the database on its own storage, the very node it should not
+// be on. So a create waits for the primary: ErrNoWriterAvailable (503).
 func (r *Router) RouteDatabaseCreate(ctx context.Context, req *http.Request) (*http.Response, error) {
 	writer, err := r.writeTarget()
 	if err != nil {
 		return nil, err
+	}
+	if r.cfg.Designated != nil && r.cfg.Designated() != "" && r.designatedWriter() == nil {
+		return nil, ErrNoWriterAvailable
 	}
 	if r.cfg.PeerDatabaseCreate == nil || !r.cfg.PeerDatabaseCreate(writer.ID) {
 		return nil, ErrNoCapablePeer

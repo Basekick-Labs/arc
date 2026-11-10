@@ -104,6 +104,39 @@ func TestNonIngestingNodeForwardsDatabaseCreate(t *testing.T) {
 	}
 }
 
+// A create already marked as forwarded, arriving at a node that does not
+// ingest, is a loop or a spoofed header: 508, nothing created. A writer that
+// cannot be reached: 503 in a create's words, nothing created.
+func TestDatabaseCreateForwardFailures(t *testing.T) {
+	r := newDoorRig(t)
+	tok, err := r.am.CreateToken(context.Background(), "admin", "admin", "admin", nil)
+	require.NoError(t, err)
+	r.tokens["admin"] = tok
+	create := func(name string, marked bool) (int, string) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/databases", strings.NewReader(`{"name":"`+name+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		if marked {
+			req.Header.Set(ForwardedByHeader, "other-node")
+		}
+		return r.do(t, "admin", req)
+	}
+
+	r.dbs.SetRouter(createRouter(t, cluster.RoleCompactor, "http://127.0.0.1:1", true, true))
+	status, body := create("looped", true)
+	require.Equal(t, http.StatusLoopDetected, status, body)
+
+	// Nothing listens on the writer's address.
+	status, body = create("unreached", false)
+	require.Equal(t, http.StatusServiceUnavailable, status, body)
+	require.Contains(t, body, "Database not created")
+
+	for _, name := range []string{"looped", "unreached"} {
+		exists, err := r.dbs.databaseExists(context.Background(), name)
+		require.NoError(t, err)
+		require.False(t, exists, name)
+	}
+}
+
 // A writer creates the database itself, whatever the router says.
 func TestWriterCreatesDatabaseLocally(t *testing.T) {
 	r := newDoorRig(t)

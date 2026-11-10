@@ -4191,7 +4191,8 @@ func main() {
 	if clusterCoordinator != nil {
 		databasesHandler.SetCoordinator(clusterCoordinator, cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled)
 		// The listings forward from a node that cannot serve queries, as the
-		// query routes do.
+		// query routes do; a create, from a node that does not ingest, to
+		// the writer.
 		if router := clusterCoordinator.GetRouter(); router != nil {
 			databasesHandler.SetRouter(router)
 		}
