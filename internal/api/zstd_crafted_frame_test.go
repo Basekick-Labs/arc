@@ -29,8 +29,9 @@ var ghsaFpmhFrame = slices.Concat(
 )
 
 // A crafted zstd request body is rejected with an error. Before, the
-// decoder panicked on a goroutine of its own and the process exited; such a
-// panic would kill this test binary too, so a pass means it no longer can.
+// decoder panicked on a goroutine of its own and the process exited. Since
+// klauspost/compress 1.20.2 the frame is a plain decode error, so this tests
+// the error path; TestDecompressZstdRecoversADecoderPanic covers the recover.
 func TestDecompressZstdCraftedFrameIsAnError(t *testing.T) {
 	// Whether the bug panics depends on what the decoder's scratch tables
 	// held before, so decode a valid payload first, then the frame repeatedly.

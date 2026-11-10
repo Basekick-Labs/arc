@@ -378,6 +378,14 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 // that way is refused (errZstdWindow).
 const zstdMaxWindow = 32 << 20
 
+// zstdDecodeAll is the decode decompressZstdPooled recovers around; a var so
+// a test can make it panic. klauspost/compress 1.20.2 fixed the crafted
+// frame that used to (GHSA-fpmh-frq8-7rj8), so no real input is known to
+// reach the recover any more.
+var zstdDecodeAll = func(d *zstd.Decoder, data []byte) ([]byte, error) {
+	return d.DecodeAll(data, nil)
+}
+
 // decompressZstdPooled decompresses an untrusted zstd request body with a
 // pooled decoder for maxSize (zstdDecoderPool in msgpack.go), into a fresh
 // []byte the caller owns.
@@ -395,14 +403,6 @@ const zstdMaxWindow = 32 << 20
 // <= 1.20.1 panics on a crafted frame (GHSA-fpmh-frq8-7rj8), and one request
 // crashed Arc. Here a panic is recovered and returned as a decode error, and
 // that decoder is dropped. DecodeAll is also faster than the stream was.
-// zstdDecodeAll is the decode decompressZstdPooled recovers around; a var so
-// a test can make it panic. klauspost/compress 1.20.2 fixed the crafted
-// frame that used to (GHSA-fpmh-frq8-7rj8), so no real input is known to
-// reach the recover any more.
-var zstdDecodeAll = func(d *zstd.Decoder, data []byte) ([]byte, error) {
-	return d.DecodeAll(data, nil)
-}
-
 func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 	if maxSize <= 0 {
 		maxSize = 100 * 1024 * 1024 // 100MB default
