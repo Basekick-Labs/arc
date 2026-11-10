@@ -134,3 +134,30 @@ func TestMQTTSubscriptionHandler_DisabledManager(t *testing.T) {
 		})
 	}
 }
+
+// A body the decoder refuses names what is wrong (#479): the bare "Invalid
+// request body" was the whole answer a user following the docs got, and it
+// told them nothing about which topic_mapping rule to fix.
+func TestMQTTSubscriptionHandler_BadBodyNamesTheProblem(t *testing.T) {
+	h := &MQTTSubscriptionHandler{manager: &stubMQTTManager{}, logger: zerolog.Nop()}
+	app := fiber.New()
+	h.RegisterRoutes(app)
+
+	for _, tc := range []struct{ method, path string }{
+		{"POST", "/api/v1/mqtt/subscriptions"},
+		{"PUT", "/api/v1/mqtt/subscriptions/test-id"},
+	} {
+		body := `{"name":"x","topic_mapping":{"factory/+":{"tags_from_topic":[{"tag_name":"line"}]}}}`
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req, testRequestTimeoutMS)
+		if err != nil {
+			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != fiber.StatusBadRequest || !strings.Contains(string(raw), "position is required") {
+			t.Errorf("%s %s: status %d body %s, want 400 naming the missing position", tc.method, tc.path, resp.StatusCode, raw)
+		}
+	}
+}

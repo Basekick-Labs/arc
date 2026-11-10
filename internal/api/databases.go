@@ -19,6 +19,7 @@ import (
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
 // DatabasesHandler handles database management API endpoints
@@ -41,6 +42,22 @@ type DatabasesHandler struct {
 	// before it and withdraws its pending registrations (#1207 d1).
 	flusher DeleteFlusher
 	pending DatabasePendingRegistrations
+	// router forwards the listings from a node that cannot serve queries (a
+	// compactor) to one that can; nil outside a cluster.
+	router *cluster.Router
+}
+
+// SetRouter installs the cluster router the listings forward through.
+func (h *DatabasesHandler) SetRouter(r *cluster.Router) { h.router = r }
+
+// forwardListing forwards a listing from a node that cannot serve queries;
+// handled is false when it is answered here.
+func (h *DatabasesHandler) forwardListing(c *fiber.Ctx) (bool, error) {
+	return forwardRead(c, h.router, forwardReadOpts{
+		route:   h.router.RouteReadQuery,
+		timeout: h.requestTimeout,
+		logger:  h.logger,
+	})
 }
 
 // DatabasePendingRegistrations withdraws every pending registration of a
@@ -117,15 +134,6 @@ func (h *DatabasesHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSche
 // nil` true for a typed nil and defeat the guards below.
 func (h *DatabasesHandler) SetRBACManager(rm RBACChecker) { h.rbacManager = rm }
 
-// checkDatabasePermission gates a listing on the caller's read grant for a
-// database, mirroring QueryHandler.checkMeasurementPermission — which is what
-// the equivalent query-path endpoints use (`SHOW DATABASES`, `SHOW TABLES
-// FROM db`, GET /api/v1/measurements). database may be "*" for the
-// list-everything endpoint, matching the `SHOW DATABASES` gate.
-//
-// Returns nil when RBAC is disabled or no token is present: the route
-// middleware has already decided whether an unauthenticated request is
-// allowed, exactly as the query path does.
 // filterReadableMeasurements returns only the measurements the caller may
 // read, preserving order.
 //
@@ -187,38 +195,6 @@ func (h *DatabasesHandler) checkDatabasePermissionScoped(c *fiber.Ctx, database,
 		Int64("token_id", tokenInfo.ID).
 		Msg("RBAC denied listing")
 	return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
-}
-
-func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, measurement, permission string) error {
-	// Gated on the checker being WIRED, not on the license. Enforcement must
-	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
-	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
-	// three cases (admin break-glass, memberships -> RBAC authoritative, no
-	// memberships -> coarse permissions), so a deployment without RBAC
-	// configured is unaffected.
-	if h.rbacManager == nil {
-		return nil
-	}
-	tokenInfo := auth.GetTokenInfo(c)
-	if tokenInfo == nil {
-		return nil
-	}
-	result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
-		TokenInfo:   tokenInfo,
-		Database:    database,
-		Measurement: measurement,
-		Permission:  permission,
-	})
-	if !result.Allowed {
-		h.logger.Warn().
-			Str("database", database).
-			Str("permission", permission).
-			Str("reason", result.Reason).
-			Int64("token_id", tokenInfo.ID).
-			Msg("RBAC permission denied")
-		return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
-	}
-	return nil
 }
 
 // CreateDatabaseRequest represents a request to create a new database
@@ -326,8 +302,13 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 	// the middleware asks "does this token have read authority at all, coarse
 	// or granted", the handler asks "for THIS database, or for all of them".
 	readAuth := withResourceReadAuth(h.authManager, h.rbacManager)
+	// The list-everything route names no database, so the per-database door
+	// above would ask about database "" and refuse every tenant token. It
+	// asks "may this token read anything" instead, and handleList shows the
+	// databases the token can read (#1562).
+	listAuth := withAnyResourceReadAuth(h.authManager, h.rbacManager)
 
-	app.Get("/api/v1/databases", readAuth, h.handleList)
+	app.Get("/api/v1/databases", listAuth, h.handleList)
 	app.Get("/api/v1/databases/:name", readAuth, h.handleGet)
 	app.Get("/api/v1/databases/:name/measurements", readAuth, h.handleListMeasurements)
 	app.Post("/api/v1/databases", adminAuth, h.handleCreate)
@@ -336,22 +317,33 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 
 // handleList handles GET /api/v1/databases
 func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
-	// Listing every database asks for a grant covering every database, the
-	// same bar `SHOW DATABASES` applies (handleShowDatabases in query.go).
-	//
-	// A caller without a grant covering every database is refused here and
-	// must name its database via GET /api/v1/databases/<name>, which asks the
-	// weaker "may you enumerate inside it" question and filters the names it
-	// returns. Same bar `SHOW DATABASES` applies.
-	if err := h.checkDatabasePermission(c, "*", "*", "read"); err != nil {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
+	// A caller with a grant covering every database sees them all; any
+	// other sees the databases it can read something in, each counted by the
+	// measurements it can read, as GET /api/v1/databases/:name counts them
+	// (#1562). Same rule as SHOW DATABASES (databaseListingFilter).
+	visible, unavailable := databaseListingFilter(c, h.rbacManager)
+	if unavailable {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Permission store unavailable; retry later",
+		})
+	}
+	var count func(db string, names []string) int
+	if visible != nil {
+		count = func(db string, names []string) int {
+			return len(h.filterReadableMeasurements(c, db, names))
+		}
 	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
 
 	// Optimized: Single storage call to get all databases with measurement counts
-	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx)
+	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx, visible, count)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -398,6 +390,10 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
 
+	if err := databaseSpellingError(h.storage, req.Name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
 	// Check if database already exists
 	exists, err := h.databaseExists(ctx, req.Name)
 	if err != nil {
@@ -436,6 +432,11 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 
 // handleGet handles GET /api/v1/databases/:name
 func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
 	name := c.Params("name")
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -466,6 +467,10 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
+
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -503,6 +508,11 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 
 // handleListMeasurements handles GET /api/v1/databases/:name/measurements
 func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
 	name := c.Params("name")
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -563,6 +573,24 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
+	}
+	// Measurements found as directories are not content: a store that keeps
+	// empty prefixes keeps a deleted database's, which GET answers 404 for
+	// (#1425). A measurement left that way inside a live database is still
+	// listed; only a database with nothing in it is refused here.
+	if !markerExists {
+		hasContent, err := h.databaseHasContent(ctx, name)
+		if err != nil {
+			h.logger.Error().Err(err).Str("database", name).Msg("Failed to check database content")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to check database",
+			})
+		}
+		if !hasContent {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Database '" + name + "' not found",
+			})
+		}
 	}
 
 	// Existence was decided above on the UNFILTERED list, so filtering cannot
@@ -679,6 +707,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer func() { cancel() }()
 
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
 	if err != nil {
@@ -692,7 +724,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// Converge re-runs (#639 item 3): a previous DELETE may have removed
 		// the files then crashed before catalog cleanup. Best-effort here so
 		// repeating the DELETE clears the residue; the 404 contract stands.
+		// That residue includes the empty directories an earlier version's
+		// delete left on local storage, which keep the database listed (#1425).
 		h.dropIcebergCatalog(ctx, name)
+		removeEmptyDirectories(ctx, h.storage, name, h.logger)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -887,18 +922,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 				paths = append(paths, u.Path)
 			}
 			h.logger.Warn().Str("database", name).Int("files", len(left)).Strs("paths", paths).
-				Msg("Dropped database left files no listing addresses; they keep the database visible and must be removed by hand")
+				Msg("Dropped database left files no listing addresses; they keep its directories and must be removed by hand")
 		}
 	}
 
-	// Try to remove the empty database directory
-	// This is a best-effort operation - for local storage, we try to remove the directory
-	// For S3/Azure, directories don't exist as actual objects, so this is a no-op
-	if dirRemover, ok := h.storage.(storage.DirectoryRemover); ok {
-		if err := dirRemover.RemoveDirectory(ctx, name); err != nil {
-			h.logger.Debug().Err(err).Str("database", name).Msg("Could not remove database directory (may not be empty)")
-		}
-	}
+	// Remove the directory tree the deleted files leave behind on local
+	// storage (#1425). An object store's prefixes cannot be removed through
+	// the backend; the listings leave out a database with nothing in it.
+	removeEmptyDirectories(ctx, h.storage, name, h.logger)
 
 	// Cached pruned path lists may name the removed files, partial or not.
 	if h.onFilesRemoved != nil {
@@ -1126,7 +1157,11 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 // using minimal storage calls instead of N+1 calls.
 // Strategy: Get list of databases first (1 call), then get all files (1 call) to count measurements.
 // Also checks tiering metadata for databases that may only have data in cold storage.
-func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Context) ([]DatabaseInfo, error) {
+//
+// visible, when non-nil, drops the databases the caller may not see before
+// anything else is asked of storage about them (#1562); count, when non-nil,
+// replaces len(measurements) for each database shown.
+func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Context, visible func(string) bool, count func(db string, names []string) int) ([]DatabaseInfo, error) {
 	// First, get list of all databases from hot tier (includes empty databases with just .arc-database marker)
 	databases, err := h.listDatabases(ctx)
 	if err != nil {
@@ -1135,6 +1170,11 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 
 	// Build a map of database -> set of measurements from files
 	dbMeasurements := make(map[string]map[string]bool)
+	// hasContent marks the databases known to hold something: a hot file or
+	// a cold-tier row. The rest were found only as directories, which a
+	// deleted database leaves behind on a store that keeps empty prefixes
+	// (#1425), and are listed only if databaseExists says so.
+	hasContent := make(map[string]bool)
 
 	// Initialize all known databases from hot tier (some may be empty)
 	for _, db := range databases {
@@ -1154,7 +1194,16 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 					if dbMeasurements[db] == nil {
 						dbMeasurements[db] = make(map[string]bool)
 					}
+					hasContent[db] = true
 				}
+			}
+		}
+	}
+
+	if visible != nil {
+		for db := range dbMeasurements {
+			if !visible(db) {
+				delete(dbMeasurements, db)
 			}
 		}
 	}
@@ -1184,6 +1233,7 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 		if dbMeasurements[db] == nil {
 			continue
 		}
+		hasContent[db] = true
 
 		// Skip hidden measurements (like .arc-database marker)
 		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") {
@@ -1191,6 +1241,33 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 		}
 
 		dbMeasurements[db][measurement] = true
+	}
+
+	// A database found only as a directory is listed if it exists by the
+	// rule GET answers with: its marker, a cold-tier row, or (in a cluster) a
+	// manifest entry. Otherwise it is what a delete left behind, which GET
+	// answers 404 for and the list must not show (#1425). Only these
+	// databases cost a check; one with a file or a cold row costs nothing.
+	// On a store that keeps empty prefixes every deleted database stays one
+	// of these, so they are checked concurrently, as SHOW DATABASES does.
+	unchecked := make([]string, 0)
+	for db := range dbMeasurements {
+		if !hasContent[db] {
+			unchecked = append(unchecked, db)
+		}
+	}
+	for db, exists := range checkDatabases(unchecked, func(db string) (bool, error) {
+		exists, err := h.databaseExists(ctx, db)
+		if err != nil {
+			// Listed, as before this check: a failed check is not an absence.
+			h.logger.Warn().Err(err).Str("database", db).Msg("Failed to check whether a database with no files exists; listing it")
+			return true, nil
+		}
+		return exists, nil
+	}) {
+		if !exists {
+			delete(dbMeasurements, db)
+		}
 	}
 
 	// Also get measurements from tiering metadata (for cold-only measurements)
@@ -1221,9 +1298,17 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 
 	result := make([]DatabaseInfo, 0, len(sortedDatabases))
 	for _, db := range sortedDatabases {
+		n := len(dbMeasurements[db])
+		if count != nil {
+			names := make([]string, 0, n)
+			for m := range dbMeasurements[db] {
+				names = append(names, m)
+			}
+			n = count(db, names)
+		}
 		result = append(result, DatabaseInfo{
 			Name:             db,
-			MeasurementCount: len(dbMeasurements[db]),
+			MeasurementCount: n,
 		})
 	}
 
@@ -1285,6 +1370,22 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	return filtered, nil
 }
 
+// databaseSpellingError refuses a database name that exists in storage under
+// another spelling on a volume that folds names (#1509). Checked before
+// databaseExists, whose marker lookup would follow the fold: a delete would
+// otherwise flush, record and withdraw under the requested spelling before
+// its listing refused it.
+func databaseSpellingError(backend storage.Backend, name string) error {
+	g, ok := backend.(storage.NameSpellingGuard)
+	if !ok {
+		return nil
+	}
+	if err := g.CheckNameSpelling(name); storage.IsNameSpellingError(err) {
+		return err
+	}
+	return nil
+}
+
 func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (bool, error) {
 	// Optimized: Check for database marker file directly instead of listing all databases.
 	// A database exists if it has a .arc-database marker file OR has any content.
@@ -1302,13 +1403,41 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 		return true, nil
 	}
 
-	// Fallback: Check if there's any content in the database directory
-	// (for databases created before marker files were introduced)
-	files, err := h.storage.List(ctx, name+"/")
+	return h.databaseHasContent(ctx, name)
+}
+
+// databaseHasHotFiles reports whether the backend holds a listable file under
+// the database, stopping at the first (storage.PrefixProber) where the backend
+// can. A store that does not exist yet holds none (#945).
+func databaseHasHotFiles(ctx context.Context, backend storage.Backend, name string) (bool, error) {
+	if pp, ok := backend.(storage.PrefixProber); ok {
+		hit, err := pp.HasObjectsUnderPrefix(ctx, name+"/")
+		if err != nil && !storage.IsStoreNotFound(err) {
+			return false, err
+		}
+		return hit, nil
+	}
+	files, err := backend.List(ctx, name+"/")
 	if err != nil && !storage.IsStoreNotFound(err) {
 		return false, err
 	}
-	if len(files) > 0 {
+	return len(files) > 0, nil
+}
+
+// databaseHasContent reports whether the database holds anything: a hot file,
+// a cold-tier row, or (in a cluster) a manifest entry. Its directories do not
+// count: a store that keeps empty prefixes (SeaweedFS) keeps a deleted
+// database's (#1425). A database written by ingest has no marker, so this is
+// how most databases are found.
+func (h *DatabasesHandler) databaseHasContent(ctx context.Context, name string) (bool, error) {
+	// The first file answers: a database can hold millions, and listing them
+	// all to ask whether there is one was the cost of every GET of a
+	// database without a marker.
+	found, err := databaseHasHotFiles(ctx, h.storage, name)
+	if err != nil {
+		return false, err
+	}
+	if found {
 		return true, nil
 	}
 	if h.tieringManager != nil {
@@ -1319,7 +1448,46 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	}
 	// A cluster node may hold none of the database's files locally while the
 	// manifest still lists them on peers (#1094).
-	return h.coordinator != nil && len(h.databaseManifestPaths(name, h.coordinator.GetFileManifestByDatabase(name))) > 0, nil
+	return h.coordinator != nil && manifestHasDatabasePath(name, h.coordinator.GetFileManifestByDatabase(name)), nil
+}
+
+// manifestHasDatabasePath reports whether any manifest entry's path is under
+// the database, by the rule databaseManifestPaths applies, stopping at the
+// first: a database can have millions of entries.
+func manifestHasDatabasePath(database string, entries []*raft.FileEntry) bool {
+	prefix := database + "/"
+	for _, entry := range entries {
+		if entry != nil && strings.HasPrefix(entry.Path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// databaseCheckParallelism bounds the per-database storage checks of the
+// database listings (GET /api/v1/databases, SHOW DATABASES).
+const databaseCheckParallelism = 16
+
+// checkDatabases runs check for each database, databaseCheckParallelism at a
+// time, and returns its answers. check reports a failure its own way and
+// answers what the caller should do with the database.
+func checkDatabases(dbs []string, check func(string) (bool, error)) map[string]bool {
+	answers := make([]bool, len(dbs))
+	var g errgroup.Group
+	g.SetLimit(databaseCheckParallelism)
+	for i, db := range dbs {
+		g.Go(func() error {
+			ok, err := check(db)
+			answers[i] = ok
+			return err
+		})
+	}
+	_ = g.Wait()
+	out := make(map[string]bool, len(dbs))
+	for i, db := range dbs {
+		out[db] = answers[i]
+	}
+	return out
 }
 
 // databaseManifestPaths returns the manifest paths that belong to the database
@@ -1440,6 +1608,40 @@ func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) 
 			Msg("Iceberg catalog cleanup after database drop failed; re-running the DELETE retries it")
 	} else {
 		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
+	}
+}
+
+// removeEmptyDirectories removes dir and every directory under it that holds
+// nothing, deepest first, on a backend with real directories (local storage).
+// Deleting a database's files leaves its measurement/YYYY/MM/DD/HH tree behind,
+// and the database listing reads directories, so an empty tree kept a deleted
+// database listed while GET answered 404 for it (#1425). A directory that
+// still holds a file stays, and so does every directory above it. Best
+// effort: a failure is logged at Debug, as removing the top directory always
+// was.
+func removeEmptyDirectories(ctx context.Context, backend storage.Backend, dir string, logger zerolog.Logger) {
+	lister, ok := backend.(storage.DirectoryLister)
+	if !ok {
+		return
+	}
+	remover, ok := backend.(storage.DirectoryRemover)
+	if !ok {
+		return
+	}
+	removeEmptyDirectoryTree(ctx, lister, remover, dir, logger)
+}
+
+func removeEmptyDirectoryTree(ctx context.Context, lister storage.DirectoryLister, remover storage.DirectoryRemover, dir string, logger zerolog.Logger) {
+	subdirs, err := lister.ListDirectories(ctx, dir+"/")
+	if err != nil {
+		logger.Debug().Err(err).Str("dir", dir).Msg("Could not list directory to remove it")
+		return
+	}
+	for _, sub := range subdirs {
+		removeEmptyDirectoryTree(ctx, lister, remover, dir+"/"+sub, logger)
+	}
+	if err := remover.RemoveDirectory(ctx, dir); err != nil {
+		logger.Debug().Err(err).Str("dir", dir).Msg("Could not remove directory (may not be empty)")
 	}
 }
 

@@ -59,6 +59,30 @@ func TestValidateSQLRequest_LiteralBoundariesDoNotHideTheRest(t *testing.T) {
 			want: "table position",
 		},
 		{
+			name: "file I/O function after a non-ASCII dollar-quote tag",
+			sql:  `SELECT $é$'$é$ AS a, * FROM read_parquet('/other/x.parquet') --'`,
+			want: "read_parquet",
+		},
+		{
+			name: "table-position literal after a non-ASCII dollar-quote tag",
+			sql:  `SELECT $é$'$é$ AS a UNION ALL SELECT * FROM '/other/x.parquet' --'`,
+			want: "table position",
+		},
+		{
+			name: "second statement after an identifier ending in $e",
+			sql:  `SELECT a$e'\' ; SELECT 2 --'`,
+			want: "Multiple SQL statements",
+		},
+		{
+			// An E-string continued across a newline. The continued segment's
+			// backslash-escaped quote is where the old masker mis-set the end,
+			// scanning on and hiding the reader; DuckDB ends the string there
+			// and runs the reader. The gate must see it as DuckDB does.
+			name: "file I/O function after an E-string continuation",
+			sql:  "SELECT E'p'\n'\\'' AS a, * FROM read_parquet('/other/x.parquet') --'",
+			want: "read_parquet",
+		},
+		{
 			name: "file I/O function hidden by a quote inside a quoted identifier",
 			sql:  `SELECT 1 AS "a'b", (SELECT count(*) FROM read_parquet('/other/x.parquet')) AS n`,
 			want: "read_parquet",
@@ -93,6 +117,7 @@ func TestValidateSQLRequest_LiteralBoundariesDoNotHideTheRest(t *testing.T) {
 		`SELECT * FROM cpu WHERE note = E'it\'s here'`,
 		`SELECT * FROM cpu WHERE pattern = 'a\\b'`,
 		`SELECT * FROM cpu WHERE note = $tag$body$tag$`,
+		`SELECT * FROM cpu WHERE note = $é$it's here$é$`,
 		`SELECT * FROM cpu AS t$x -- a comment with an apostrophe: don't`,
 		`SELECT 1 AS "a'b" FROM cpu`,
 		"SELECT 1 /* it's fine */ FROM cpu",

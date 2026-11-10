@@ -94,10 +94,10 @@ func TestScanAggDeclines(t *testing.T) {
 		"SELECT count(DISTINCT x) FROM cpu",
 		"SELECT sum(a * b) FROM cpu",
 		"SELECT sum(*) FROM cpu",
-		"SELECT host, count(*) FROM cpu",          // mixed list
-		"SELECT count(*) AS c FROM cpu WHERE x=1", // alias
-		"SELECT median(x) FROM cpu WHERE x > 1",   // unsupported aggregate
-		"SELECT sum(x) FROM cpu WHERE",            // dangling WHERE
+		"SELECT host, count(*) FROM cpu",                       // mixed list
+		"SELECT count(*) c FROM cpu WHERE x=1",                 // bare alias (no AS) — res-1 serves AS only
+		"SELECT approx_count_distinct(x) FROM cpu WHERE x > 1", // unsupported aggregate
+		"SELECT sum(x) FROM cpu WHERE",                         // dangling WHERE
 	} {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAgg {
 			t.Fatalf("must not match scan_agg: %s", sql)
@@ -192,10 +192,8 @@ func TestGroupedAggDeclines(t *testing.T) {
 		"SELECT count(*) FROM cpu GROUP BY host",                       // key not projected
 		"SELECT host, count(*) FROM cpu GROUP BY region",               // wrong key
 		"SELECT host, count(*) FROM cpu GROUP BY 2",                    // position at count
-		// `ORDER BY 1` on the key became eligible at agg-3 (see the Recognized
-		// test); DESC and ORDER on an aggregate still decline.
-		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 1 DESC",
-		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 2",
+		// ORDER BY keys / aggregates and DESC are served since res-2 (see
+		// topn_test.go); LIMIT without ORDER BY still declines.
 		"SELECT host, count(*) FROM cpu GROUP BY host LIMIT 5",
 		// WHERE joined the class (mimalloc slice) — but ONLY through the shared
 		// reserializeWhere vocabulary; anything it declines stays declined here.
@@ -231,8 +229,14 @@ func TestEpochMathBucketRecognized(t *testing.T) {
 		if m.epochWidthSecs != 300 || m.bucketCol != "time" || m.bucketAlias != "time" {
 			t.Fatalf("parts = %d/%q/%q: %s", m.epochWidthSecs, m.bucketCol, m.bucketAlias, c.sql)
 		}
-		if m.orderByItem != c.orderByItem {
-			t.Fatalf("orderByItem = %d, want %d: %s", m.orderByItem, c.orderByItem, c.sql)
+		got := 0
+		if len(m.orderKeys) == 1 && !m.orderKeys[0].Desc && !m.orderKeys[0].NullsFirst {
+			got = m.orderKeys[0].Pos
+		} else if len(m.orderKeys) > 1 {
+			got = -1
+		}
+		if got != c.orderByItem {
+			t.Fatalf("order key = %d, want %d: %s", got, c.orderByItem, c.sql)
 		}
 	}
 }
@@ -258,7 +262,6 @@ func TestEpochMathBucketDeclines(t *testing.T) {
 		// Two bucket items.
 		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS a, date_trunc('minute', time), avg(x) FROM cpu GROUP BY 1, 2",
 		// ORDER BY DESC still declines.
-		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time, avg(x) FROM cpu GROUP BY 1 ORDER BY time DESC",
 	} {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGrouped {
 			t.Fatalf("must not match scan_agg_grouped: %s", sql)
@@ -282,7 +285,6 @@ func TestCompositeKeyDeclines(t *testing.T) {
 		// GROUP BY naming the bucket ALIAS (binds the raw column in DuckDB).
 		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS b, host, count(*) FROM cpu GROUP BY b, host",
 		// ORDER BY an aggregate position.
-		"SELECT date_trunc('hour', time), host, count(*) FROM cpu GROUP BY 1, 2 ORDER BY 3",
 	} {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGrouped {
 			t.Fatalf("must not match scan_agg_grouped: %s", sql)

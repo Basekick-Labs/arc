@@ -255,10 +255,11 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		}
 	}
 
-	// Refuse the whole import up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676); the admitted context keeps
+	// Refuse the whole import up front if writes are fenced (#1207), the WAL
+	// volume is under disk pressure (#676), or the rows waiting to be flushed
+	// are near ingest.max_buffered_bytes (#1468); the admitted context keeps
 	// pressure that starts part-way from splitting it.
-	writeCtx, release, err := h.arrowBuffer.AdmitRequest(c.Context(), scan.bytes)
+	writeCtx, release, err := h.arrowBuffer.AdmitImport(c.Context(), scan.bytes)
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
@@ -269,6 +270,9 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	w, err := newImportWriter(writeCtx, h.arrowBuffer, database)
 	if err != nil {
 		h.totalErrors.Add(1)
+		if ingest.IsWriteRefusal(err) { // every write slot stayed busy (#1429)
+			return respondWriteRefused(c, err)
+		}
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "import rejected (retry): " + err.Error()})
 	}
 	defer w.close()
@@ -293,6 +297,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		if errors.Is(err, ingest.ErrColumnTypeChange) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Msg("LP import refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: failed to write to buffer")
 		// 503 for the two retryable buffer states: nothing of this import
 		// was written (a partial import answered above).
@@ -308,10 +316,11 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	totalRows := w.rows
 	importedMeasurements := w.order
 
-	// Hand what is still buffered to the flush. The rows are in the buffer
+	// Hand what is still buffered of the import to the flush, its write slot
+	// already free for the next import (#1429). The rows are in the buffer
 	// and the WAL (when enabled) already; files follow as their flushes
 	// finish, so a 200 does not mean every file is written.
-	if err := h.arrowBuffer.FlushAll(c.Context()); err != nil {
+	if err := w.finalFlush(c.Context()); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -532,8 +541,9 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	// Write directly to the ArrowBuffer ingest pipeline (typed path)
 	totalRows := int64(numRecords)
 	// Admit the whole request, its size reserved against the WAL volume's
-	// free space (#676); a fence or disk pressure refuses it here.
-	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	// free space (#676); a fence, disk pressure or the buffered-bytes limit
+	// (#1468) refuses it here.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitImport(c.Context(), int64(len(data)))
 	if aerr != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, aerr)

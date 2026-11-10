@@ -49,6 +49,29 @@ type deleteColdTier interface {
 	ColdFilesForMeasurement(ctx context.Context, database, measurement string) ([]tiering.FileMetadata, error)
 	RetireColdRows(ctx context.Context, paths []string) (int, error)
 	RevertColdRowToHot(ctx context.Context, path string) error
+	// NotifyColdFilesRemoved tells tiering's listeners (query caches, the Iceberg export's
+	// cold listing, #939) that cold objects are gone.
+	NotifyColdFilesRemoved(n int)
+}
+
+// coldRemovalGuard is implemented by *tiering.Manager: a run that deletes
+// cold objects before retiring their rows brackets itself, so the cold
+// sync's missing-object check does not count rows it is about to retire
+// (#1551).
+type coldRemovalGuard interface {
+	BeginColdRemoval()
+	EndColdRemoval()
+}
+
+// beginColdRemoval begins a bracket on tier when it supports one and returns
+// its end.
+func beginColdRemoval(tier any) func() {
+	g, ok := tier.(coldRemovalGuard)
+	if !ok {
+		return func() {}
+	}
+	g.BeginColdRemoval()
+	return g.EndColdRemoval
 }
 
 // coldFile is one cold object a DELETE counted.
@@ -365,6 +388,7 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 	if c == nil || c.backend == nil {
 		return
 	}
+	defer beginColdRemoval(h.coldTier)()
 	var retire []string
 	for _, f := range c.whole {
 		if ctx.Err() != nil {
@@ -454,6 +478,9 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			h.logger.Warn().Err(err).Int("removed", n).Int("rows", len(retire)).
 				Msg("Failed to retire cold tier rows; the next DELETE or retention run retires them")
 		}
+	}
+	if len(c.deleted) > 0 {
+		h.coldTier.NotifyColdFilesRemoved(len(c.deleted))
 	}
 }
 

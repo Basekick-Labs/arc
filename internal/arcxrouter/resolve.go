@@ -63,6 +63,23 @@ func isBareIdent(col string) bool {
 	return bareIdent.MatchString(col)
 }
 
+// subscriptRef matches the ONE map-subscript form the engine serves (map-1):
+// `ident['key']` with a bare identifier (no dots — the engine's identifier lexer
+// has none) and a key free of `'` and `\`, so the literal cannot break out of its
+// quotes. `isSubscriptRef` is the SQL-boundary re-check that a projection item or
+// predicate column came from readColumnRef, the same role isBareIdent plays for
+// bare columns.
+var subscriptRef = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*\['[^'\\]*'\]$`)
+
+func isSubscriptRef(col string) bool {
+	return subscriptRef.MatchString(col)
+}
+
+// isColumnRef accepts either form a scan column position may carry.
+func isColumnRef(col string) bool {
+	return isBareIdent(col) || isSubscriptRef(col)
+}
+
 // projFuncItem matches a re-serialized computed-projection item — the ONLY non-bare-
 // column forms buildScanSQL emits: `length(host)` (2f-0), `substr(host, 1, 3)` (2f-1),
 // and `starts_with(host, 'web')` / `ends_with`/`contains` (2f-2). The function name and

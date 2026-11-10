@@ -81,7 +81,7 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	}
 	// Atomic: read all bytes into a staging key. On success, promote to final key.
 	// On error, leave bytes in the ".part" staging key (same as real LocalBackend)
-	// so resume tests can discover them via StagingInspector/ReadTo.
+	// so resume tests can discover them through StagingInspector.
 	stagingKey := path + ".part"
 	var buf []byte
 	tmp := make([]byte, 4096)
@@ -130,15 +130,11 @@ func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer)
 	if err := checkKey(path); err != nil {
 		return err
 	}
-	// Fall back to staging file so tryResumeFromPartial can hash a partial prefix.
 	f.mu.Lock()
 	data, ok := f.files[path]
-	if !ok {
-		data, ok = f.files[path+".part"]
-	}
 	f.mu.Unlock()
 	if !ok {
-		return errors.New("not found")
+		return storage.ErrObjectNotFound
 	}
 	_, err := writer.Write(data)
 	return err
@@ -150,12 +146,9 @@ func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Write
 	}
 	f.mu.Lock()
 	data, ok := f.files[path]
-	if !ok {
-		data, ok = f.files[path+".part"]
-	}
 	f.mu.Unlock()
 	if !ok {
-		return errors.New("not found")
+		return storage.ErrObjectNotFound
 	}
 	if offset < 0 || offset > int64(len(data)) {
 		return fmt.Errorf("offset %d out of range for file size %d", offset, len(data))
@@ -1419,6 +1412,55 @@ func TestPuller_ResumeOnRetry(t *testing.T) {
 	}
 }
 
+// A new enqueue resumes a partial an earlier enqueue left, on its first
+// attempt (#397). Before, only attempts 2..N resumed, so under a low
+// replication bandwidth cap every FSM callback, catch-up or recheck pulled the
+// file from zero, and a file larger than one enqueue's attempts could carry
+// never completed.
+func TestPuller_NewEnqueueResumesPartialOnFirstAttempt(t *testing.T) {
+	fullBody := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	entry := makeEntry("db/cpu/resume-enqueue.parquet", "writer-1", int64(len(fullBody)))
+	backend := newFakeBackend()
+	// The first enqueue's only attempt drops mid-body; everything after works.
+	fetcher := newResumeAwareFetcher(fullBody, errors.New("transport: connection reset"))
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        multiPeerResolver{addrs: []string{"peer-1:9999"}},
+		Workers:             1,
+		QueueSize:           8,
+		RetryMaxAttempts:    1,
+		RetryInitialBackoff: time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(entry)
+	waitStats(t, p, func(s map[string]int64) bool { return s["failed"] >= 1 })
+	p.Enqueue(entry)
+	waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] >= 1 })
+
+	fetcher.mu.Lock()
+	offsets := append([]int64(nil), fetcher.offsets...)
+	fetcher.mu.Unlock()
+	if len(offsets) != 2 {
+		t.Fatalf("Fetch calls = %d (offsets %v), want 2", len(offsets), offsets)
+	}
+	if offsets[0] != 0 {
+		t.Errorf("first enqueue offset = %d, want 0", offsets[0])
+	}
+	if offsets[1] <= 0 {
+		t.Errorf("second enqueue offset = %d, want > 0: its first attempt must resume the partial", offsets[1])
+	}
+}
+
 // TestPuller_BadOffsetDeletesPartialAndRetries verifies that when the fetcher
 // returns ErrBadOffset, the puller deletes the partial file, increments the
 // bad_offset counter, and continues to retry from zero.
@@ -2136,9 +2178,9 @@ func TestPuller_CatchUpStatus_KeySemantics(t *testing.T) {
 // TestTryResumeFromPartialRefusesCommittedFile pins the guard that makes
 // keeping the committed file on a rejected fetch (#999) safe.
 //
-// A resume hashes a prefix and appends a tail. ReadToAt prefers the committed
-// object and falls back to the staging file, while the tail is appended to the
-// staging file. So once a rejected fetch stops deleting the committed object,
+// A resume hashes a prefix and appends a tail. ReadToAt used to prefer the
+// committed object and fall back to the staging file (until #1199), while the
+// tail is appended to the staging file. So once a rejected fetch stops deleting the committed object,
 // a shorter previous generation on disk could be hashed as the "prefix" of the
 // file being fetched while the tail landed in a different file. Whenever the
 // old generation happened to be a byte prefix of the new one the combined

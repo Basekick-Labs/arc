@@ -9,8 +9,12 @@ name: CI
 
 on:
   pull_request:
+  # Only main on push. A branch with an open PR is already tested by the
+  # pull_request run (against its merge with main); pushing on every branch
+  # ran the same suite twice per push, and the two runs never cancelled each
+  # other because their refs (refs/heads/... vs refs/pull/N/merge) differ.
   push:
-    branches: ['**']
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -160,6 +164,15 @@ jobs:
           ARC_TEST_S3_BUCKET: arctest
           ARC_TEST_S3_ENDPOINT: http://localhost:9000
         run: go test -tags="duckdb_arrow objectstore" ./internal/api/ -run '^TestReplaceManifestAfterRewriteDeletesOriginalS3Object$'
+
+      # Iceberg export on an S3 primary (#939): the exporter publishes through
+      # iceberg-go's S3 FileIO with Arc's own credentials, reads footers from
+      # the object tail, and reads the table back through the same FileIO.
+      - name: Test Iceberg export against real object storage
+        env:
+          ARC_TEST_S3_BUCKET: arctest
+          ARC_TEST_S3_ENDPOINT: http://localhost:9000
+        run: go test -tags="duckdb_arrow objectstore" ./internal/iceberg/
 
       - name: Stop SeaweedFS
         if: always()

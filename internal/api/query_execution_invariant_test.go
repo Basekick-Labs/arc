@@ -3,7 +3,9 @@
 package api
 
 import (
+	"context"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/require"
 	"testing"
 	"time"
@@ -61,9 +63,36 @@ func TestQueryExecutionOutcomeInvariant(t *testing.T) {
 				require.Equal(t, before+1, queryMetricInt(t, "query_latency_count"))
 			}
 			if tc.name == "arrow_ipc" {
+				// The shared deadline now bounds SQL transformation too. A
+				// timeout there never reaches an engine, so only aggregate
+				// error and timeout counters advance.
 				h.queryTimeout = time.Nanosecond
+				a, b, c, d := counts()
 				before := queryMetricInt(t, "query_timeouts_total")
-				check("SELECT sum(i) FROM range(100000000) t(i)", 504, false)
+				// An uncached FROM query avoids both transform-cache and
+				// no-transform fast paths, which skip the deadline check.
+				got, _, _, msg, _ := r.query(tc.route, "SELECT sum(i) FROM range(100000000) t(i)")
+				require.Equal(t, 504, got, msg)
+				aa, bb, cc, dd := counts()
+				require.Equal(t, a, aa)
+				require.Equal(t, b, bb)
+				require.Equal(t, c, cc)
+				require.Equal(t, d+1, dd)
+				require.Equal(t, before+1, queryMetricInt(t, "query_timeouts_total"))
+
+				// Let transformation finish, then expire the context at the
+				// existing dispatch seam before falling through to DuckDB.
+				// This exercises execution-timeout accounting deterministically.
+				originalDispatch := arcxArrowDispatch
+				t.Cleanup(func() { arcxArrowDispatch = originalDispatch })
+				h.queryTimeout = time.Second
+				arcxArrowDispatch = func(_ *QueryHandler, _ *fiber.Ctx, ctx context.Context,
+					_ context.CancelFunc, _, _, _ string, _ func(int), _ func(string)) bool {
+					<-ctx.Done()
+					return false
+				}
+				before = queryMetricInt(t, "query_timeouts_total")
+				check("SELECT 1", 504, false)
 				require.Equal(t, before+1, queryMetricInt(t, "query_timeouts_total"))
 			}
 		})

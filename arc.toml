@@ -141,6 +141,30 @@ default_sort_keys = ""
 # use_dictionary = false
 # numeric_dictionary = false
 
+# Bulk imports (/api/v1/import/lp, csv, parquet) write in parallel up to
+# import_write_concurrency on this node. 0 (default) = auto: as many as fit
+# an eighth of the memory limit at one import allowance each (an eighth of the
+# memory limit, 64-512 MB), at most the CPUs Arc runs on, at least 1. Each
+# writing import may hold about one allowance plus its upload.
+# import_queue_timeout_ms: an import that waits this long for a slot is
+# refused with 503 and X-Arc-Ingest-Refused: import_queue, nothing written,
+# safe to retry. 0 = wait until a slot frees (the server does not see a client
+# that gives up). An explicit import_write_concurrency (1-1024) is used as is.
+# import_write_concurrency = 0
+# import_queue_timeout_ms = 30000
+#
+# Buffered-bytes limit (#1468). When storage falls behind, rows waiting to be
+# flushed stay in memory; once they reach max_buffered_bytes (the estimate in
+# arc_buffer_bytes_buffered), new write requests are refused with a retryable
+# 503 (header X-Arc-Ingest-Refused: buffer_full) until flushes catch up, and
+# MQTT subscriptions pause so the broker holds their messages. Bulk imports are
+# refused from 90% of it and pace their writes below that. Off by default
+# ("0"); "auto" is half the detected memory limit (off when none is detected).
+# A backstop, not a heap bound: the estimate leaves out a flush's copies.
+# A refusal does not start a flush: keep an explicit value well above what
+# buffers hold before their size/age flush, or writes wait for the next one.
+# max_buffered_bytes = "0"   # or "auto", or a size such as "4GB"
+
 # -----------------------------------------------------------------------------
 # Compaction
 # -----------------------------------------------------------------------------
@@ -504,9 +528,15 @@ include_reads = false           # Log GET/query requests (high volume)
 # primary storage, and with no target configured the destination is
 # local_path. A deployment whose local_path sits inside storage.local_path — or
 # whose storage.local_path is a parent of it, such as "./data" — boots today
-# and will not boot after the upgrade. The defaults below are disjoint and are
-# unaffected. An empty local_path with no target is refused too, where it used
-# to boot with the backup API quietly skipped.
+# and will not boot after the upgrade. The defaults in this file are disjoint
+# ("./data/arc" beside "./data/backups"). The .deb/.rpm/Arch packages are not
+# laid out that way: their systemd unit puts storage at /var/lib/arc/data, which
+# is a parent of "./data/backups" resolved from /var/lib/arc, so the unit also
+# sets ARC_BACKUP_LOCAL_PATH=/var/lib/arc/backups (#1463). That environment
+# variable overrides the value here; to change the backup directory on a
+# packaged install, override it with `systemctl edit arc`. An empty local_path
+# with no target is refused too, where it used to boot with the backup API
+# quietly skipped.
 enabled = true
 local_path = "./data/backups"           # Directory for local backups; see the refusal note above
 # How long one backup or one restore may run before its context is cancelled.
@@ -674,9 +704,26 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # enabled = false
 # history_size = 100              # Number of completed queries to keep in memory
 
+# Peer file replication (Enterprise, cluster mode).
+# [cluster]
+# Aggregate inbound bandwidth of this node's pull workers, in bytes per second
+# or a size such as "10MB" (1 MB = 1024 KB). 0 = unlimited. Staged compaction
+# fetches are not capped. A file whose transfer outlasts one fetch resumes from
+# the bytes it already has; replication_fetch_timeout_ms (this node) and
+# replication_serve_timeout_ms (the node serving the file) bound each fetch.
+# replication_pull_bytes_per_second = 0
+
 [wal]
 enabled = false
 # sync_mode = "fdatasync"   # fdatasync (default), fsync, or async (no sync; a flush checkpoint is still synced)
+# ack_mode = "auto"         # When a write is acknowledged: "durable" once a sync covering its WAL entry has
+#                           # completed (a crash loses no acknowledged write; a write the WAL cannot make
+#                           # durable is refused with 503), or "queued" once the entry is queued (acknowledged
+#                           # sooner; a crash can lose entries still queued or unsynced). "auto", the default,
+#                           # is durable with the WAL on, and queued with cluster.wal_coverage set.
+# ack_timeout_seconds = 30  # A durable write waits at most this long for the sync covering its WAL entry;
+#                           # past it the write is refused (503, wal_not_durable) and its entry retracted
+#                           # without waiting on the device. 0 = no bound (the wait ends only with the sync).
 # sync_bytes = 1048576      # Request a sync once this many WAL bytes are unsynced (default 1 MiB).
 #                           # Syncs run beside the WAL writer, so this bounds how much written data a
 #                           # sync can leave behind, not ingest throughput. A sync also runs every 100 ms

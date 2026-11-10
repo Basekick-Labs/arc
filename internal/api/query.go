@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +22,8 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/governance"
@@ -44,6 +49,10 @@ type RBACChecker interface {
 	// only question a listing gate should ask. See its doc comment in
 	// internal/auth.
 	CanAccessAnythingIn(tokenInfo *auth.TokenInfo, database, permission string) bool
+	// HasPermissionAnywhere answers "does this caller hold the permission on
+	// anything", the door question for routes whose resources are in the
+	// body (#1559). The handler must still check each resource.
+	HasPermissionAnywhere(tokenInfo *auth.TokenInfo, permission string) (bool, error)
 }
 
 // TableReference represents a database.measurement reference extracted from SQL
@@ -278,12 +287,17 @@ func isFunctionCallAt(sql string, pos int) bool {
 	return pos < len(sql) && sql[pos] == '('
 }
 
-// maskedQuoteForBacktick lets MaskStringLiterals (which only recognises ' and ")
-// also protect backtick-quoted identifiers: we map ` to " before masking so a
-// comment marker, semicolon, or keyword inside a backtick-quoted name does not
-// leak into comment-stripping / statement-splitting / denylist scanning. The
-// content inside is what matters for those scans; the exact quote character is
-// irrelevant downstream (the SHOW regex's capture excludes quotes either way).
+// backticksToDoubleQuotes maps every backtick to a double quote. Only
+// normalizeSQLForShow uses it, for a SHOW TABLES FROM with a backtick-quoted
+// name, which Arc answers itself and DuckDB never sees.
+//
+// SECURITY: never use it on SQL that DuckDB will run, or to normalise SQL for
+// a validator. DuckDB does not quote identifiers with backticks: an unquoted
+// backtick is an operator character, and a backtick-quoted column fails to
+// bind. The mapping also rewrites a backtick that sits inside a "…"
+// identifier or a '…' literal, which moves where the masker thinks quoted text
+// ends, so the validator and DuckDB disagree about the statement (#1480). The validators refuse unquoted
+// backticks instead (hasUnquotedBacktick) and mask the SQL as written.
 func backticksToDoubleQuotes(sql string) string {
 	if !strings.ContainsRune(sql, '`') {
 		return sql
@@ -301,12 +315,50 @@ func backticksToDoubleQuotes(sql string) string {
 // double quotes first so backtick-quoted names are masked too (MaskStringLiterals
 // only knows ' and "). The captured database name excludes the surrounding
 // quotes, so the quote-character swap does not change the resolved db.
+//
+// The output is used only to match the SHOW patterns (#1480). A query this
+// mapping makes look like a SHOW still passes every check in
+// ValidateSQLRequest on its unmapped text, and a routed SHOW is answered by
+// Arc, never by DuckDB.
 func normalizeSQLForShow(sql string) string {
 	sql = backticksToDoubleQuotes(sql)
 	features := scanSQLFeatures(sql)
 	masked, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 	stripped := stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
 	return strings.TrimSpace(sqlutil.UnmaskStringLiterals(stripped, masks))
+}
+
+// errUnquotedBacktick is the reason the validators give for an unquoted
+// backtick (hasUnquotedBacktick).
+const errUnquotedBacktick = "backticks are not identifier quotes in DuckDB; quote identifiers with double quotes (\"name\")"
+
+// errReservedPlaceholder refuses caller SQL that spells a placeholder the
+// SQL maskers generate, outside a string literal or quoted identifier
+// (sqlutil.HasCallerPlaceholder).
+const errReservedPlaceholder = "SQL must not contain the reserved sequences __STR_, __IDENT_ or __FROM_MASK_ outside a string literal or quoted identifier"
+
+// hasUnquotedBacktick reports whether sql has a backtick outside a string
+// literal, a quoted identifier, a dollar-quoted string or a comment.
+//
+// DuckDB never reads a backtick as an identifier quote; outside quoted text it
+// is an operator character, so a query carrying one does not run anyway. The
+// validators refuse it up front, so that they never have to guess how DuckDB
+// will tokenise it (#1480).
+func hasUnquotedBacktick(sql string) bool {
+	if !strings.ContainsRune(sql, '`') {
+		return false
+	}
+	features := scanSQLFeatures(sql)
+	masked, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	masked = stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
+	return strings.ContainsRune(masked, '`')
+}
+
+// isArcAnsweredShow reports whether sql is a SHOW DATABASES or SHOW TABLES
+// command, which the query handlers answer themselves.
+func isArcAnsweredShow(sql string) bool {
+	s := normalizeSQLForShow(sql)
+	return showDatabasesPattern.MatchString(s) || showTablesPattern.MatchString(s)
 }
 
 // isSingleTableQuery returns true if query has exactly one FROM naming a
@@ -423,6 +475,66 @@ func extractCTENames(sql string) map[string]bool {
 	return cteNames
 }
 
+// replaceMatchesOutsideSpans rewrites each match of re whose start is outside
+// every string-literal and comment span of sql, using fn; a match that begins
+// inside such a span is left unchanged, so these text rewrites never alter the
+// content of a literal or comment and the SQL keeps the structure
+// ValidateSQLRequest approved (#1488). parts[0] is the whole match; fn returns
+// the replacement, or parts[0] to decline. Spans and match offsets are both
+// taken from this same sql, so they line up.
+func replaceMatchesOutsideSpans(sql string, re *regexp.Regexp, fn func(parts []string) string) string {
+	return replaceMatchesOutsideSpansIdx(sql, re, func(parts []string, _ []int, _ []sqlutil.Span) string {
+		return fn(parts)
+	})
+}
+
+// replaceMatchesOutsideSpansIdx is replaceMatchesOutsideSpans with the match's
+// submatch indices (m, as FindAllStringSubmatchIndex returns) and the sql's
+// protected spans handed to fn, for a rewrite that moves text and must check
+// that no literal or comment straddles a group boundary.
+func replaceMatchesOutsideSpansIdx(sql string, re *regexp.Regexp, fn func(parts []string, m []int, spans []sqlutil.Span) string) string {
+	matches := re.FindAllStringSubmatchIndex(sql, -1)
+	if len(matches) == 0 {
+		return sql
+	}
+	spans := sqlutil.ProtectedSpans(sql)
+	var b strings.Builder
+	b.Grow(len(sql))
+	last := 0
+	for _, m := range matches {
+		if sqlutil.InProtectedSpan(spans, m[0]) {
+			continue
+		}
+		parts := make([]string, len(m)/2)
+		for i := range parts {
+			if m[2*i] >= 0 {
+				parts[i] = sql[m[2*i]:m[2*i+1]]
+			}
+		}
+		b.WriteString(sql[last:m[0]])
+		b.WriteString(fn(parts, m, spans))
+		last = m[1]
+	}
+	b.WriteString(sql[last:])
+	return b.String()
+}
+
+// spanStraddles reports whether any span strictly contains pos (s.Start < pos
+// < s.End): a literal or comment is cut at pos. A boundary that only touches a
+// span edge is not a straddle. Reordering text across a straddle would change
+// where that literal or comment ends.
+func spanStraddles(spans []sqlutil.Span, pos int) bool {
+	for _, s := range spans {
+		if pos <= s.Start {
+			return false
+		}
+		if pos < s.End {
+			return true
+		}
+	}
+	return false
+}
+
 // rewriteTimeBucket converts time_bucket() to epoch-based arithmetic.
 // All intervals are converted to epoch-based arithmetic for consistent ~2.5x performance improvement.
 // Handles both 2-arg and 3-arg (with origin) forms.
@@ -433,8 +545,8 @@ func rewriteTimeBucket(sql string) string {
 	}
 
 	// First handle 3-argument form (with origin) - must come first to avoid partial matches
-	sql = patternTimeBucket3Args.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternTimeBucket3Args.FindStringSubmatch(match)
+	sql = replaceMatchesOutsideSpans(sql, patternTimeBucket3Args, func(parts []string) string {
+		match := parts[0]
 		if len(parts) < 5 {
 			return match
 		}
@@ -446,10 +558,15 @@ func rewriteTimeBucket(sql string) string {
 
 		// Paren-blind guard (#535): if the column arg contains parentheses the
 		// regex capture may be truncated at the wrong ')'. Leave the call
-		// unrewritten so DuckDB handles it natively. (For time_bucket the
-		// capture already fails to match most nested args, so this is belt-and-
-		// suspenders — but it keeps every rewrite path consistently safe.)
+		// unrewritten so DuckDB handles it natively.
 		if strings.Contains(column, "(") {
+			return match
+		}
+		// The column is emitted twice (epochBucket); if it carries a quote or
+		// comment marker, duplicating it would change the statement's literal/
+		// comment structure. Leave such a call unrewritten so DuckDB parses it
+		// exactly as the validator read it (#1488).
+		if !sqlutil.IsMaskerClean(column) {
 			return match
 		}
 
@@ -470,8 +587,8 @@ func rewriteTimeBucket(sql string) string {
 	})
 
 	// Then handle 2-argument form (no origin)
-	sql = patternTimeBucket2Args.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternTimeBucket2Args.FindStringSubmatch(match)
+	sql = replaceMatchesOutsideSpans(sql, patternTimeBucket2Args, func(parts []string) string {
+		match := parts[0]
 		if len(parts) < 4 {
 			return match
 		}
@@ -483,6 +600,11 @@ func rewriteTimeBucket(sql string) string {
 		// Paren-blind guard (#535): see the 3-arg form above. If the column arg
 		// contains parentheses the capture may be truncated; leave it for DuckDB.
 		if strings.Contains(column, "(") {
+			return match
+		}
+		// See the 3-arg form: a quote/comment marker in the column would
+		// desync the statement when duplicated (#1488).
+		if !sqlutil.IsMaskerClean(column) {
 			return match
 		}
 
@@ -528,8 +650,8 @@ func rewriteDateTrunc(sql string) string {
 		return sql
 	}
 
-	return patternDateTrunc.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternDateTrunc.FindStringSubmatch(match)
+	return replaceMatchesOutsideSpans(sql, patternDateTrunc, func(parts []string) string {
+		match := parts[0]
 		if len(parts) < 3 {
 			return match
 		}
@@ -548,6 +670,11 @@ func rewriteDateTrunc(sql string) string {
 		// column and leave the call unrewritten — DuckDB runs date_trunc()
 		// natively (correct, just without the epoch optimization).
 		if strings.Contains(column, "(") {
+			return match
+		}
+		// A quote/comment marker in the column would desync the statement when
+		// the column is duplicated by epochBucket (#1488).
+		if !sqlutil.IsMaskerClean(column) {
 			return match
 		}
 
@@ -746,6 +873,8 @@ type QueryHandler struct {
 
 	// Tiering support for multi-tier query routing (hot/cold)
 	tieringManager *tiering.Manager
+	// coldDatabases overrides coldDatabaseSource in tests.
+	coldDatabases func(context.Context) ([]string, error)
 
 	// Query governance (Enterprise feature - rate limiting and quotas)
 	governanceManager *governance.Manager
@@ -916,7 +1045,18 @@ func validateIdentifier(name string) error {
 	if !validIdentifierPattern.MatchString(name) {
 		return fmt.Errorf("name contains invalid characters (allowed: alphanumeric, underscore, hyphen)")
 	}
+	if containsMaskPlaceholder(name) {
+		return fmt.Errorf("name contains a reserved sequence (__STR_, __IDENT_ or __FROM_MASK_)")
+	}
 	return nil
+}
+
+// containsMaskPlaceholder reports whether name carries the text of a
+// placeholder the SQL maskers generate. Such names are
+// reserved: the SQL transform builds storage paths from names while the
+// SQL is still masked, and restores placeholders by their text.
+func containsMaskPlaceholder(name string) bool {
+	return sqlutil.ContainsReservedPlaceholder(name)
 }
 
 // validateHeaderDatabase validates the value of the x-arc-database HTTP
@@ -958,15 +1098,17 @@ func validateWhereClauseQuery(where string) error {
 		return fmt.Errorf("where clause too long (max 4096 characters)")
 	}
 
+	// Refused before anything is masked: a backtick is not a quote, so the
+	// masker must see the clause exactly as DuckDB will (#1480).
+	if hasUnquotedBacktick(where) {
+		return errors.New(errUnquotedBacktick)
+	}
+
 	// Scan a string-literal-masked copy (#987): a keyword or comment marker
-	// inside a value is data, not SQL. Backtick identifiers are normalised to
-	// double quotes first, as ValidateSQLRequest does, because the masker does
-	// not know backticks and a quote inside one would otherwise open a
-	// spurious literal that hides whatever follows it. The raw clause is what
-	// the quote and parenthesis counts below check and what reaches the SQL
-	// assembly; ValidateSQLRequest then validates the assembled statement.
-	maskInput := backticksToDoubleQuotes(where)
-	whereMasked, _ := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// inside a value is data, not SQL. The raw clause is what the quote and
+	// parenthesis counts below check and what reaches the SQL assembly;
+	// ValidateSQLRequest then validates the assembled statement.
+	whereMasked, _ := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
 	// DuckDB lexes a number glued to a word as two tokens (`1UNION` is `1`
 	// then `UNION`), while the whole-word scan below treats digits as
 	// identifier bytes and would not see the keyword. Split a number that
@@ -1334,6 +1476,15 @@ func readParquetExpr(keyword, anchor string, paths []string, options string) str
 
 // getMeasurementSchema serves GET /api/v1/databases/:database/measurements/:measurement/schema.
 func (h *QueryHandler) getMeasurementSchema(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards it: the registered field
+	// schema readers bind is theirs.
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, "")
+		o.timeout = listingForwardTimeout
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
+	}
 	database, measurement, ok := h.schemaRouteParams(c)
 	if !ok {
 		return nil
@@ -1760,7 +1911,10 @@ func extractTableReferences(sql string, identNames map[string]string) []TableRef
 func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission string) error {
 	// The x-arc-database header is what the query transform resolves bare
 	// names against on this path, so it is also what the check must use.
-	return h.checkQueryPermissionsForDefaultDB(c, sql, permission, c.Get("x-arc-database"))
+	// Copied, as defence in depth: c.Get points into the request buffer the
+	// next request on the connection reuses. The permission cache copies what
+	// it stores itself.
+	return h.checkQueryPermissionsForDefaultDB(c, sql, permission, strings.Clone(c.Get("x-arc-database")))
 }
 
 // checkQueryPermissionsForDefaultDB is checkQueryPermissions with the database
@@ -1814,10 +1968,6 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 	// table rides along so quoted references are checked under their real
 	// names — the same resolution the query transform applies.
 	tableRefs := extractTableReferences(normalisedSQL, sqlutil.IdentifierNames(permMasks))
-	if len(tableRefs) == 0 {
-		// No tables referenced (e.g., SELECT 1+1)
-		return nil
-	}
 
 	// Re-point bare "default" references at the database the TRANSFORM will
 	// resolve them against. Without this, a user with default.cpu:read could
@@ -1832,6 +1982,11 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 				tableRefs[i].Database = defaultDB
 			}
 		}
+	}
+	c.Locals(queryPermissionRefsCtxKey{}, tableRefs)
+	if len(tableRefs) == 0 {
+		// No tables referenced (e.g., SELECT 1+1)
+		return nil
 	}
 
 	if h.debugEnabled {
@@ -1879,6 +2034,50 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 		}
 	}
 
+	return nil
+}
+
+type queryPermissionRefsCtxKey struct{}
+
+// checkEmittedQueryPermissions checks the scopes the query transform read
+// that the source-SQL permission check (checkQueryPermissionsForDefaultDB,
+// which leaves its references in c.Locals) did not cover (#764). When the two
+// agree, which is every query today, it makes no RBAC call; a scope the
+// extractor missed is checked here, and refused, before anything runs.
+func (h *QueryHandler) checkEmittedQueryPermissions(c *fiber.Ctx, permission string, emitted []TableReference) error {
+	if h.rbacManager == nil || len(emitted) == 0 {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	checkedRefs, _ := c.Locals(queryPermissionRefsCtxKey{}).([]TableReference)
+	var missing []TableReference
+	for _, ref := range emitted {
+		if !slices.Contains(checkedRefs, ref) && !slices.Contains(missing, ref) {
+			missing = append(missing, ref)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	reqs := make([]*auth.PermissionCheckRequest, len(missing))
+	for i, ref := range missing {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo: tokenInfo, Database: ref.Database, Measurement: ref.Measurement, Permission: permission,
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	for i, ref := range missing {
+		if i >= len(results) || results[i] == nil || !results[i].Allowed {
+			h.logger.Warn().Str("database", ref.Database).Str("measurement", ref.Measurement).
+				Str("permission", permission).Int64("token_id", tokenInfo.ID).
+				Msg("RBAC denied storage scope emitted by query transform")
+			return fmt.Errorf("access denied: no %s permission for %s.%s", permission, ref.Database, ref.Measurement)
+		}
+	}
 	return nil
 }
 
@@ -2020,17 +2219,20 @@ func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measur
 // RegisterRoutes registers query endpoints
 func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// User-facing read endpoints get the read-auth + catch-up gate (#392) as
-	// route-level middleware. The read-auth middleware enforces that the token
-	// has read-level permission (not just any valid token). The catch-up gate
-	// is a no-op unless cluster.query_gate_on_catchup is true AND the
-	// coordinator reports peer file replication is still drifting.
+	// route-level middleware. The read-auth middleware admits a token that
+	// holds read on anything (not just any valid token); each handler then
+	// checks every table it reads (checkQueryPermissions and friends). The
+	// catch-up gate is a no-op unless cluster.query_gate_on_catchup is true
+	// AND the coordinator reports peer file replication is still drifting.
 	//
-	// withReadAuth resolves to auth.RequireRead(h.authManager), or a no-op
-	// passthrough when auth is disabled (h.authManager == nil). SetAuthAndRBAC
-	// runs before RegisterRoutes (cmd/arc/main.go), so h.authManager is already
-	// set here — no lazy resolution needed. Same pattern as the ingest handlers'
-	// withWriteAuth (internal/api/auth_middleware.go).
-	readAuth := withReadAuth(h.authManager)
+	// withAnyResourceReadAuth resolves to auth.RequireAnyResourcePermission,
+	// which asks RBAC when it is wired, or a no-op passthrough when auth is
+	// disabled (h.authManager == nil). It replaced withReadAuth, which asked
+	// only the token's coarse permissions and so refused tokens whose read
+	// authority comes from RBAC alone (#1559). SetAuthAndRBAC runs before
+	// RegisterRoutes (cmd/arc/main.go), so both managers are already set here:
+	// the checker is captured now, not looked up per request.
+	readAuth := withAnyResourceReadAuth(h.authManager, h.rbacManager)
 	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Same execution pipeline as /api/v1/query, but the response is
 	// streamed as MessagePack instead of JSON — columnar, typed, and
@@ -2086,6 +2288,50 @@ func (h *QueryHandler) executeQueryMsgPack(c *fiber.Ctx) error {
 	return h.executeQuery(c)
 }
 
+// readForwardOpts is forwardReadOpts for a QueryHandler route: registered in
+// this node's query registry under description (empty: not registered), and
+// cancelled when its client disconnects.
+func (h *QueryHandler) readForwardOpts(route func(context.Context, *http.Request) (*http.Response, error), description string) forwardReadOpts {
+	return forwardReadOpts{
+		route:       route,
+		registry:    h.queryRegistry,
+		description: description,
+		watch: func(ctx context.Context, c *fiber.Ctx, queryID string, cancel context.CancelFunc) {
+			h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
+		},
+		logger: h.logger,
+	}
+}
+
+// forwardedQueryDescription is the registry's description of a forwarded
+// query: its SQL when the body carries one, else the method and URI.
+func forwardedQueryDescription(c *fiber.Ctx) string {
+	// The raw body only: c.Body() would decompress an encoded body without
+	// the caps the answering node applies, which BuildHTTPRequest avoids
+	// for the forward itself (#1270). An encoded body is described by its
+	// method and URI.
+	if len(c.Request().Header.ContentEncoding()) == 0 {
+		var req QueryRequest
+		if err := json.Unmarshal(c.Request().Body(), &req); err == nil && req.SQL != "" {
+			return req.SQL
+		}
+	}
+	return c.Method() + " " + string(c.Request().RequestURI())
+}
+
+// queryForwardHeaderBound bounds the wait for a forwarded query's answer to
+// start: the peer bounds the query itself, with its timeout and any
+// governance limit on the token.
+func (h *QueryHandler) queryForwardHeaderBound() time.Duration {
+	if h.queryTimeout <= 0 {
+		return 0
+	}
+	return h.queryTimeout + 30*time.Second
+}
+
+// listingForwardTimeout bounds a forwarded listing as a local one is bounded.
+var listingForwardTimeout = 30 * time.Second // a var so a test can shorten it
+
 // executeQuery handles POST /api/v1/query - returns JSON response
 func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	start := time.Now()
@@ -2105,26 +2351,15 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		return RespondAlreadyForwarded(c)
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding query request to reader/writer node")
-
-		httpReq, err := BuildHTTPRequest(c)
-		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
-			m.IncQueryErrors()
-			return respondError(c, fiber.StatusInternalServerError, "Failed to prepare request for forwarding", timestamp, start)
+		// RouteQuery, not RouteReadQuery: every build accepts a forwarded
+		// /query, so no capability gates it. Registered here so
+		// /api/v1/queries lists and cancels it.
+		o := h.readForwardOpts(h.router.RouteQuery, forwardedQueryDescription(c))
+		o.onError = m.IncQueryErrors
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
 		}
-
-		resp, err := h.router.RouteQuery(c.Context(), httpReq)
-		if err == cluster.ErrLocalNodeCanHandle {
-			// Fall through to local processing
-			goto localProcessing
-		}
-		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to route query request")
-			m.IncQueryErrors()
-			return HandleRoutingError(c, err)
-		}
-
-		return CopyResponse(c, resp)
+		goto localProcessing
 	}
 
 localProcessing:
@@ -2169,14 +2404,17 @@ localProcessing:
 	// the SHOW RBAC gate would have denied. SECURITY: RBAC bypass.
 	showNormalised := normalizeSQLForShow(req.SQL)
 
-	// Handle SHOW DATABASES command
+	// Handle SHOW DATABASES command. A caller with a grant covering every
+	// database sees them all; any other sees the databases it can read
+	// something in (#1562). The route door has already required read
+	// somewhere.
 	if showDatabasesPattern.MatchString(showNormalised) {
-		// Check RBAC - user needs at least some read permission to see databases
-		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
+		visible, unavailable := databaseListingFilter(c, h.rbacManager)
+		if unavailable {
 			m.IncQueryErrors()
-			return respondError(c, fiber.StatusForbidden, "access denied: no read permission to list databases", timestamp, start)
+			return respondError(c, fiber.StatusServiceUnavailable, "permission store unavailable; retry later", timestamp, start)
 		}
-		return h.handleShowDatabases(c, start)
+		return h.handleShowDatabases(c, start, visible)
 	}
 
 	// Handle SHOW TABLES/MEASUREMENTS command
@@ -2206,7 +2444,8 @@ localProcessing:
 		// it (Measurement: "*"). Asking "*" denies every token whose role carries
 		// measurement-level grants — the canonical tenant shape, and the whole
 		// reason rbac_measurement_permissions exists — because matchPattern("cpu",
-		// "*") is false. Listing EVERYTHING still requires ("*","*").
+		// "*") is false. Listing every database shows only those the caller
+		// can read something in (databaseListingFilter, #1562).
 		if err := h.checkListingPermission(c, database); err != nil {
 			m.IncQueryErrors()
 			return respondError(c, fiber.StatusForbidden, fmt.Sprintf("access denied: no read permission for database '%s'", database), timestamp, start)
@@ -2220,11 +2459,29 @@ localProcessing:
 		return respondError(c, fiber.StatusForbidden, err.Error(), timestamp, start)
 	}
 
+	// Compute effective timeout. Its deadline bounds the transform below and
+	// the execution after it (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+
 	// Convert SQL to storage paths
-	convertedSQL, cached, err := h.getTransformedSQLForQuery(c.Context(), req.SQL, headerDB)
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(transformCtx, req.SQL, headerDB)
+	cancelTransform()
 	if err != nil {
 		m.IncQueryErrors()
+		if errors.Is(err, errQueryTimedOut) {
+			m.IncQueryTimeouts()
+			h.logTransformTimeout(req.SQL, effectiveTimeout)
+		}
 		return respondError(c, transformErrorStatus(err), err.Error(), timestamp, start)
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		m.IncQueryErrors()
+		return respondError(c, fiber.StatusForbidden, err.Error(), timestamp, start)
 	}
 
 	// arcx decline census (no-op stub in stock builds; no query text is emitted).
@@ -2258,12 +2515,6 @@ localProcessing:
 		c.Set("X-Arc-Query-ID", queryID)
 	}
 
-	// Compute effective timeout
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
-
 	// Check for profiling mode
 	profileMode := c.Get("x-arc-profile") == "true"
 
@@ -2276,8 +2527,8 @@ localProcessing:
 		ctx = queryCtx
 	}
 	var cancel context.CancelFunc
-	if effectiveTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
+	if !deadline.IsZero() {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
 		// Note: cancel is called inside the stream writer callback, not deferred here,
 		// because the stream writer runs after this function returns.
 	}
@@ -2794,30 +3045,91 @@ func (e *SQLValidationError) Error() string {
 // `\b...\b` token boundary) and string literals masked (so `SELECT
 // 'DROP TABLE x'` does not false-positive). The cost is one full pass
 // over the SQL; for the 10KB cap that's microseconds.
+// transformCacheMaxSQLLength is the longest statement whose transform is
+// cached: the default SQL cap, so a raised cap leaves the cache's memory
+// bound where it was.
+const transformCacheMaxSQLLength = config.DefaultMaxSQLLength
+
+// maxSQLLength is query.max_sql_length (#1448). Zero, before main sets it
+// and in tests that never do, means config.DefaultMaxSQLLength.
+var maxSQLLength atomic.Int64
+
+// SetMaxSQLLength sets the SQL length cap ValidateSQLRequest enforces. Load
+// has already checked the value's range; n <= 0 restores the default.
+func SetMaxSQLLength(n int) { maxSQLLength.Store(int64(n)) }
+
+// MaxSQLLength is the SQL length cap in force.
+func MaxSQLLength() int {
+	if n := maxSQLLength.Load(); n > 0 {
+		return int(n)
+	}
+	return config.DefaultMaxSQLLength
+}
+
 func ValidateSQLRequest(sql string) error {
 	if strings.TrimSpace(sql) == "" {
 		return &SQLValidationError{Message: "SQL query is required"}
 	}
 
-	if len(sql) > 10000 {
-		return &SQLValidationError{Message: "SQL query exceeds maximum length (10000 characters)"}
+	if max := MaxSQLLength(); len(sql) > max {
+		return &SQLValidationError{Message: fmt.Sprintf("SQL query exceeds maximum length (%d characters; query.max_sql_length)", max)}
+	}
+
+	// DuckDB reads a statement as a C string and stops at the first NUL, in
+	// a string literal or anywhere else, so it would run a different query
+	// from the one checked here. The storage-path rewrite also uses NUL as
+	// its marker for a rewritten reference (#1482) and refuses one itself.
+	if strings.IndexByte(sql, 0) >= 0 {
+		return &SQLValidationError{Message: "SQL query must not contain a NUL byte"}
 	}
 
 	// Normalise before denylist check: mask string literals so keywords
 	// inside literals don't false-positive, then strip comments so
 	// keywords interleaved with comments don't slip past token
-	// boundaries (`DROP /* */ TABLE x`). Map backticks to double quotes first
-	// so backtick-quoted identifiers are masked too — otherwise a semicolon
-	// inside `a;b` would false-trip the multi-statement check below, and a
-	// keyword inside `select` could be scanned. `normalised` is only ever read
-	// (never reconstructed into executable SQL), so the swap is safe here.
-	maskInput := backticksToDoubleQuotes(sql)
-	features := scanSQLFeatures(maskInput)
-	normalised, vMasks := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	// boundaries (`DROP /* */ TABLE x`).
+	//
+	// SECURITY: the SQL is masked exactly as written. Backticks were once
+	// mapped to double quotes first, on the belief that DuckDB quotes
+	// identifiers with them; it does not. The mapping also rewrote a backtick
+	// inside a "…" identifier or a '…' literal, so every check below scanned a
+	// different statement from the one DuckDB runs (#1480). An unquoted
+	// backtick is refused instead. The one exception is SHOW TABLES FROM a
+	// backtick-quoted name, which the query handlers answer or refuse before
+	// DuckDB; the checks below still run on it unmapped.
+	if hasUnquotedBacktick(sql) && !isArcAnsweredShow(sql) {
+		return &SQLValidationError{Message: errUnquotedBacktick}
+	}
+	features := scanSQLFeatures(sql)
+	normalised, vMasks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	// The transform restores placeholders by their text after the checks
+	// below have run on the masked form, so placeholder text the caller
+	// wrote outside a literal or quoted identifier is refused: it would be
+	// restored with the real ones, and the statement DuckDB runs would not
+	// be the one checked. Text inside a literal is hidden by the literal's
+	// own placeholder and stays data.
+	if sqlutil.HasCallerPlaceholder(normalised, vMasks) {
+		return &SQLValidationError{Message: errReservedPlaceholder}
+	}
 	if features.hasBlockComment && hasNestedBlockComment(normalised) {
 		return &SQLValidationError{Message: "Nested block comments are not allowed"}
 	}
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	// The table-position guards below read their own copy, with the FROM of
+	// EXTRACT/SUBSTRING/TRIM/OVERLAY and of `IS [NOT] DISTINCT FROM` masked, as
+	// the rewriters and the RBAC extractor already see it: without it,
+	// `host IS DISTINCT FROM 'a'` and `trim(BOTH FROM '  x  ')` put a literal
+	// in "table position" and were refused (#1472).
+	//
+	// SECURITY: the copy is masked AFTER the comments are stripped and BEFORE
+	// Unicode spaces are folded, and both orders matter. Before stripping, a
+	// comment could open a masking frame (`/* trim( */ FROM '…' /* ) */`) and
+	// hide a real FROM from the replacement-scan guard. After folding, a code
+	// point DuckDB does NOT treat as a separator (U+0085, U+2028, …) would
+	// read as one: DuckDB parses `is<U+0085>distinct FROM 'f.csv'` as an alias
+	// and a replacement scan, which the masker must not mistake for the
+	// operator. The other checks keep reading the unmasked form.
+	tablePosNormalised, _ := sqlutil.MaskFromKeywordsInFunctionBodies(normalised)
+	tablePosNormalised = foldUnicodeSpace(tablePosNormalised)
 	normalised = foldUnicodeSpace(normalised)
 
 	// SECURITY: reject multi-statement queries. A second statement smuggled
@@ -2879,11 +3191,10 @@ func ValidateSQLRequest(sql string) error {
 	// before this runs (see ioDenylistNormalise).
 	//
 	// IMPORTANT: this uses a DIFFERENT normalisation than `normalised` above.
-	// The shared `normalised` masks double-quoted/backtick identifiers, but
-	// DuckDB executes `"parquet_scan"(...)` / `` `read_parquet`(...) ``
-	// identically to the unquoted call — so matching the denylist against
-	// `normalised` lets a quoted spelling slip past (the name is hidden inside
-	// a `__STR__` placeholder). Confirmed live: `SELECT * FROM
+	// The shared `normalised` masks double-quoted identifiers, but DuckDB
+	// executes `"parquet_scan"(...)` identically to the unquoted call — so
+	// matching the denylist against `normalised` lets a quoted spelling slip
+	// past (the name is hidden inside a `__STR__` placeholder). Confirmed live: `SELECT * FROM
 	// "parquet_scan"('…/other-db/…')` executed and returned cross-tenant rows
 	// (GHSA-93cm-2v4m-c56c review round 2). ioDenylistNormalise strips
 	// identifier quoting so quoted function names are exposed to the regex,
@@ -2904,6 +3215,9 @@ func ValidateSQLRequest(sql string) error {
 	// (logging, checkpoints, sequences, settings), checked on the same form.
 	if name := sideEffectFunction(ioCheckNormalised); name != "" {
 		return &SQLValidationError{Message: "Function not allowed in user SQL: " + name}
+	}
+	if name := queryTableMacroInTablePosition(normalised, sqlutil.IdentifierNames(vMasks)); name != "" {
+		return &SQLValidationError{Message: "Table function not allowed in user SQL: " + name + "()"}
 	}
 
 	// SECURITY: reject a bare single-quoted string in table position — a
@@ -2929,9 +3243,9 @@ func ValidateSQLRequest(sql string) error {
 	// FROM clause's table list via a cross-join comma) trips it.
 	//
 	// The check must distinguish a single-quoted STRING from a quoted
-	// IDENTIFIER: DuckDB uses `'` for strings and `"`/backtick for identifiers,
-	// and a quoted identifier in table position (`FROM "my table"`,
-	// `` FROM `my;db` ``) is legitimate — not a replacement scan. The shared
+	// IDENTIFIER: DuckDB uses `'` for strings and `"` for identifiers (a
+	// backtick is not a quote, and is refused above), and a quoted identifier
+	// in table position (`FROM "my table"`) is legitimate — not a replacement scan. The shared
 	// `normalised` form keeps the two apart as distinct placeholder classes
 	// (`__STR_n__` vs `__IDENT_n__`), and the scanner flags only the string
 	// class, so a quoted identifier never trips it.
@@ -2941,7 +3255,7 @@ func ValidateSQLRequest(sql string) error {
 	// alias (`FROM cpu "where", '…'`) came back as the keyword `where`, which
 	// terminates the table list in the scanner and hid the string after the
 	// comma from this guard (#978 review).
-	if stringLiteralInTablePosition(normalised) {
+	if stringLiteralInTablePosition(tablePosNormalised) {
 		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
 	}
 
@@ -2955,7 +3269,7 @@ func ValidateSQLRequest(sql string) error {
 	// pass. Runs on the shared normalisation, where quoted identifiers are
 	// distinct __IDENT__ placeholders. (2026-08 edge-sync audit follow-up to
 	// GHSA-w8x2.)
-	if name := invalidQuotedIdentifierInTablePosition(normalised, sqlutil.IdentifierNames(vMasks)); name != "" {
+	if name := invalidQuotedIdentifierInTablePosition(tablePosNormalised, sqlutil.IdentifierNames(vMasks)); name != "" {
 		return &SQLValidationError{Message: "Quoted identifier in table position is not a valid database or measurement name (replacement scans are disabled): " + name}
 	}
 
@@ -3113,10 +3427,6 @@ func ioDenylistNormalise(sql string) string {
 			masked = strings.ReplaceAll(masked, placeholder, name)
 		}
 	}
-	// Backticks are DuckDB's other identifier quote and the masker does not
-	// treat them as one, so they are dropped here; a backtick inside a string
-	// literal is already behind a placeholder and is not touched.
-	masked = strings.ReplaceAll(masked, "`", "")
 	masked = stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
 	return masked
 }
@@ -3161,8 +3471,11 @@ var unicodeEscapePattern = regexp.MustCompile(`(?i)\bu&__(?:STR|IDENT)_\d+__`)
 // substring of a longer identifier.
 //
 // Maintenance: when DuckDB adds a new path-taking table function, add it here.
-// TestIOTableFunctionPattern_Family documents the set we verified against the
-// pinned DuckDB release. An extension's functions are not listed here: they
+// TestCoreTableFunctionsReviewed enumerates the linked DuckDB's table
+// functions and fails on one that is neither refused nor reviewed, so an
+// upgrade cannot add a reader silently (GHSA-r7vm-9hcg-xgf7: DuckDB added
+// parquet_full_metadata and read_duckdb after this list was written).
+// TestIOTableFunctionPattern_Family pins the names. An extension's functions are not listed here: they
 // come from database.DeniedExtensionFunctions, and an extension is loadable
 // only once its function surface is reviewed there (#440).
 var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
@@ -3173,6 +3486,9 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 	"parquet_file_metadata",
 	"parquet_kv_metadata",
 	"parquet_bloom_probe",
+	"parquet_full_metadata", // GHSA-r7vm-9hcg-xgf7
+	"read_duckdb",           // reads a DuckDB database file
+	"sql_auto_complete",     // suggests file names from the filesystem
 	"read_csv",
 	"read_csv_auto",
 	"sniff_csv",
@@ -3192,6 +3508,10 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 	"iceberg_metadata",
 	"iceberg_snapshots",
 	"arc_partition_agg",
+	// Scan an Arrow stream at a raw memory address. No SQL type can spell
+	// the POINTER arguments today; denied rather than reviewed as safe.
+	"arrow_scan",
+	"arrow_scan_dumb",
 	// The file readers of the DuckDB extensions database.extensions may load
 	// (#440), denied whether or not this node loads them.
 }, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
@@ -3221,22 +3541,78 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 // and is the reason this is not just {query, query_table}. When DuckDB or a
 // loaded extension adds another string-executing table function, add it here;
 // TestDynamicSQLFunctionPattern_Family pins the set.
-var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|json_execute_serialized_sql)\s*\(`)
+//
+// json_serialize_plan is a scalar that BINDS its SQL argument: binding a reader
+// expands its glob and reads Parquet footers, so it listed every database's
+// files and schemas (GHSA-r7vm-9hcg-xgf7). histogram_values is a system table
+// macro whose body is query_table(source): `histogram_values('<path>', col)`
+// returned another database's column values. Its sibling histogram shares the
+// name of the histogram() aggregate, so it is refused in table position only
+// (queryTableMacroInTablePosition).
+var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|json_execute_serialized_sql|json_serialize_plan|histogram_values)\s*\(`)
+
+// queryTableMacros are the system table macros that read whatever their string
+// argument names through query_table, under a name an aggregate also uses.
+// histogram(col) the aggregate is ordinary SQL; histogram('<path>', col) the
+// table macro reads the file (GHSA-r7vm-9hcg-xgf7). A table macro stands only
+// in table position and an aggregate never does, so position tells them apart.
+var queryTableMacros = map[string]bool{"histogram": true}
+
+var lateralKeyword = regexp.MustCompile(`(?i)\blateral\b`)
+
+// queryTableMacroInTablePosition returns the queryTableMacros member called in
+// table position (after FROM, JOIN, LATERAL, a cross-join comma, or as the
+// last part of a qualified name), or "". normalised is the shared validator
+// normalisation with identifier placeholders intact; identNames resolves them,
+// so `FROM "histogram"(…)` is seen. It walks with walkTablePositions, the same
+// state machine RBAC extraction uses.
+func queryTableMacroInTablePosition(normalised string, identNames map[string]string) string {
+	isolated := tablePosPlaceholder.ReplaceAllString(foldUnicodeSpace(normalised), " $0 ")
+	// LATERAL only prefixes a table reference; the walker reports LATERAL
+	// itself as the table-position token, so drop it here (`FROM cpu,
+	// LATERAL histogram(…)`). A quoted "lateral" is a placeholder, untouched.
+	isolated = lateralKeyword.ReplaceAllString(isolated, " ")
+	found := ""
+	walkTablePositions(isolated, func(p tablePosition) bool {
+		name := p.tok
+		if strings.HasPrefix(name, "__IDENT_") {
+			name = identNames[name]
+		}
+		if queryTableMacros[strings.ToLower(name)] && strings.HasPrefix(strings.TrimLeft(isolated[p.end:], " \t\n\r\f\v"), "(") {
+			found = strings.ToLower(name)
+			return true
+		}
+		return false
+	})
+	return found
+}
+
+func (h *QueryHandler) queryTransformCacheKey(sql, headerDB string) string {
+	cacheKey := h.pruner.CacheEpoch(sql) + ":" + strconv.FormatUint(h.openCompactionsGeneration(), 10) + ":" + sql
+	if headerDB != "" {
+		cacheKey = headerDB + ":" + cacheKey
+	}
+	return cacheKey
+}
 
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
-func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool, error) {
+func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
-		return sql, true, nil // Return as "hit" since no work needed
+		// Run untransformed, so nothing Arc emitted and no scope to report.
+		// A user-supplied reader is refused before this by ValidateSQLRequest
+		// on every endpoint; what reaches here names "read_parquet" only in
+		// a literal, alias or comment, and reads no Arc table.
+		return sql, true, nil, nil
 	}
 
 	// Fast path: queries without FROM or JOIN don't need table transformation
 	// (e.g., SELECT 1+1, SELECT NOW(), SHOW commands handled elsewhere)
 	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
-		return sql, true, nil
+		return sql, true, nil, nil
 	}
 
 	// Build cache key - include header database if provided, the current
@@ -3244,14 +3620,18 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	// before an hour started is never served after it (the pruner leaves out
 	// hours that have not started and have no files), including an hour a
 	// relative end has just reached (CacheEpoch).
-	cacheKey := h.pruner.CacheEpoch(sql) + ":" + strconv.FormatUint(h.openCompactionsGeneration(), 10) + ":" + sql
-	if headerDB != "" {
-		cacheKey = headerDB + ":" + cacheKey
-	}
+	cacheKey := h.queryTransformCacheKey(sql, headerDB)
 
 	// Check cache
-	if transformed, ok := h.queryCache.Get(cacheKey); ok {
-		return transformed, true, nil
+	if transformed, metadata, ok := h.queryCache.GetWithMetadata(cacheKey); ok {
+		refs, err := decodeStoragePathReferences(metadata)
+		if err != nil {
+			return "", true, nil, err
+		}
+		if err := checkTransformProvenance(transformed, refs); err != nil {
+			return "", true, nil, err
+		}
+		return transformed, true, refs, nil
 	}
 
 	// Attach the volatility flag: file-level time pruning may embed an
@@ -3272,44 +3652,68 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 		transformed = h.convertSQLToStoragePaths(ctx, sql)
 	}
 
+	// Never cache, and never execute, SQL the transform did not finish: a
+	// reference it left unrewritten can keep a path-shaped quoted name.
+	if err := transformContextErr(ctx); err != nil {
+		return "", false, nil, err
+	}
 	// Never cache, and never execute, SQL built around a rejected name: the
 	// transform leaves an empty path behind, which would read the backend root.
 	if pathFailure.err != nil {
-		return "", false, pathFailure.err
+		return "", false, nil, pathFailure.err
+	}
+	refs := storagePathReferences(pathFailure)
+	if err := checkTransformProvenance(transformed, refs); err != nil {
+		return "", false, nil, err
 	}
 
-	if !volatile.Volatile {
-		h.queryCache.Set(cacheKey, transformed)
+	// The cache is bounded by entry count and holds each statement twice (key
+	// and transform), so statements longer than the default cap are not
+	// cached: a raised query.max_sql_length would otherwise multiply its
+	// memory bound. Transforming is linear, so re-running it is cheap.
+	if !volatile.Volatile && len(sql) <= transformCacheMaxSQLLength && !storageFoldsNames(h.storage) {
+		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
 	}
-	return transformed, false, nil
+	return transformed, false, refs, nil
+}
+
+// storageFoldsNames reports whether backend is a local volume that folds
+// names (#1509). Such a backend's transforms are not cached: a name accepted
+// while no spelling of it existed would keep its glob after another spelling
+// is created, and DuckDB's glob would then read that one's files.
+func storageFoldsNames(backend storage.Backend) bool {
+	f, ok := backend.(interface{ NamesFold() bool })
+	return ok && f.NamesFold()
 }
 
 // getTransformedSQLForQuery returns the transformed SQL for a query. Simple
 // single-table queries with a header database take an uncached fast path
 // (their time-relative partition list must not outlive the request); the
 // rest go through the cached getTransformedSQL.
-func (h *QueryHandler) getTransformedSQLForQuery(ctx context.Context, sql string, headerDB string) (string, bool, error) {
+func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution
 	if strings.Contains(sqlLower, "read_parquet") {
-		return sql, true, nil
+		return sql, true, nil, nil
 	}
 	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
-		return sql, true, nil
+		return sql, true, nil, nil
 	}
 
 	// The fast path takes simple single-table queries with a header DB;
 	// complex queries (JOINs, subqueries, CTEs) take the cached path.
 	if headerDB == "" || !isSingleTableQuery(sqlLower) || containsSQLWord(sqlLower, "with") {
-		return h.getTransformedSQL(ctx, sql, headerDB)
+		return h.getTransformedSQLWithRefs(ctx, sql, headerDB)
 	}
 
 	// Bail to slow path for features the fast path can't handle. EXTRACT/
-	// SUBSTRING/TRIM/OVERLAY need the slow path's FROM-keyword mask.
+	// SUBSTRING/TRIM/OVERLAY and `IS [NOT] DISTINCT FROM` need the slow
+	// path's FROM-keyword mask: the fast path rewrites whatever follows the
+	// first FROM, which for `x IS DISTINCT FROM y` is the operand (#1472).
 	features := scanSQLFeatures(sql)
-	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsFromKeywordFunction(sql) {
-		return h.getTransformedSQL(ctx, sql, headerDB)
+	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsMaskableFromKeyword(sql) {
+		return h.getTransformedSQLWithRefs(ctx, sql, headerDB)
 	}
 
 	// Rewrite time functions if present
@@ -3321,10 +3725,18 @@ func (h *QueryHandler) getTransformedSQLForQuery(ctx context.Context, sql string
 
 	ctx, pathFailure := withStoragePathFailure(ctx)
 	convertedSQL := h.convertSingleTableQuery(ctx, sql, sqlLower, headerDB)
-	if pathFailure.err != nil {
-		return "", false, pathFailure.err
+	// See getTransformedSQLWithRefs.
+	if err := transformContextErr(ctx); err != nil {
+		return "", false, nil, err
 	}
-	return convertedSQL, false, nil
+	if pathFailure.err != nil {
+		return "", false, nil, pathFailure.err
+	}
+	refs := storagePathReferences(pathFailure)
+	if err := checkTransformProvenance(convertedSQL, refs); err != nil {
+		return "", false, nil, err
+	}
+	return convertedSQL, false, refs, nil
 }
 
 // convertSQLToStoragePaths converts table references to storage paths
@@ -3336,6 +3748,9 @@ func (h *QueryHandler) getTransformedSQLForQuery(ctx context.Context, sql string
 // CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
 // String literals and comments are protected from regex matching.
 func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string) string {
+	// One scan of the SQL for the pruner's SQL-only facts, shared by every
+	// table reference the rewrite below visits (#1479).
+	ctx = pruning.WithQueryFacts(ctx)
 	originalSQL := sql
 
 	// Phase 0a: Rewrite regex functions to faster string functions BEFORE masking
@@ -3360,6 +3775,9 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// Phase 1: Mask string literals to prevent regex from matching inside them
 	// e.g., WHERE msg = 'SELECT * FROM mydb.cpu' should not convert the string content
 	sql, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	if reservedPlaceholderInTransform(ctx, sql) {
+		return sql
+	}
 
 	// Phase 1b: Mask bare FROM inside EXTRACT/SUBSTRING/TRIM/OVERLAY so the
 	// table-rewriter regex below does not treat e.g. `time` in
@@ -3387,133 +3805,154 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
 
+	// Names the query qualifies columns with (#1447), and names it gives
+	// other relations (#1450), collected before any rewrite.
+	qualified, otherAliases := qualifierAndAliasNames(sql, resolveIdent)
+
+	// Each pass below writes a one-byte sentinel for the reference it
+	// rewrites and keeps the expression aside; expand puts them in at the
+	// end, so no pass scans another's output (#1482, deferred_refs.go).
+	refs := newDeferredRefs(ctx, cteNames, qualified, otherAliases, bareNameCounts(sql, resolveIdent))
+	if refs.refuseNUL(sql) {
+		return sql
+	}
+
 	// Handle tables continuing the FROM list after a cross-join comma:
 	// `FROM a, b` and `FROM a, db.b` (#978). Runs FIRST, on masked SQL the
-	// FROM/JOIN passes have not touched, so the storage paths they emit are
-	// never tokenised (a storage root containing a paren or a comma would
-	// otherwise confuse the walker). Its own output starts with "," — the
-	// clause keyword, re-emitted the way FROM/JOIN are — so the FROM/JOIN
-	// patterns below never match inside it.
-	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
+	// FROM/JOIN passes have not touched. Its references start at the comma,
+	// which the emitted expression re-emits as its clause keyword.
+	sql = refs.replaceComma(sql, func(ref commaJoinRef) (deferredRef, bool) {
 		if ref.db != "" {
 			db, _ := resolveIdent(ref.db)
-			table, _ := resolveIdent(ref.table)
+			table, tableOK := resolveIdent(ref.table)
 			path := h.getStoragePath(ctx, db, table)
-			return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+			return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, table, tableOK, false), true
 		}
 		// Same guard chain as the FROM handler below.
 		if cteNames[strings.ToLower(ref.table)] {
-			return "", false
+			return deferredRef{}, false
 		}
-		resolved, _ := resolveIdent(ref.table)
+		resolved, resolvedOK := resolveIdent(ref.table)
 		if cteNames[strings.ToLower(resolved)] {
-			return "", false
+			return deferredRef{}, false
 		}
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return "", false
+			return deferredRef{}, false
 		}
 		path := h.getStoragePath(ctx, "default", resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, resolved, resolvedOK, true), true
 	})
 
 	// Handle FROM database.table references
-	sql = patternDBTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternDBTable.FindStringSubmatch(match)
+	sql = refs.replace(sql, patternDBTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 3 {
-			return match
+			return deferredRef{}, false
 		}
 		db, _ := resolveIdent(parts[1])
-		table, _ := resolveIdent(parts[2])
+		table, tableOK := resolveIdent(parts[2])
 		path := h.getStoragePath(ctx, db, table)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, table, tableOK, false), true
 	})
 
 	// Handle JOIN database.table references (includes LATERAL JOIN)
-	sql = patternJoinDBTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternJoinDBTable.FindStringSubmatch(match)
+	sql = refs.replace(sql, patternJoinDBTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 4 {
-			return match
+			return deferredRef{}, false
 		}
 		db, _ := resolveIdent(parts[2])
-		table, _ := resolveIdent(parts[3])
+		table, tableOK := resolveIdent(parts[3])
 		path := h.getStoragePath(ctx, db, table)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, table, tableOK, false), true
 	})
 
 	// Handle FROM simple_table references
-	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternSimpleTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 2 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		table := strings.ToLower(parts[1])
 
 		// Skip if this is a CTE name - CTEs are virtual tables, not physical storage
 		if cteNames[table] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// A quoted name resolves before the skip/CTE checks below run against
 		// it — a placeholder token would never match either. The CTE check
 		// runs on BOTH forms: `WITH x AS (…) SELECT * FROM "x"` names the
 		// same virtual table in DuckDB whether or not the reference is quoted.
-		resolved, _ := resolveIdent(parts[1])
+		resolved, resolvedOK := resolveIdent(parts[1])
 		if cteNames[strings.ToLower(resolved)] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
-		// Skip already converted read_parquet, system tables, etc.
+		// Skip system tables, etc.
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Check if followed by a dot (database.table already handled) or parenthesis (function call)
 		if isDotOrCallAt(sql, end) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		path := h.getStoragePath(ctx, "default", resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK, true), true
 	})
 
 	// Handle JOIN simple_table references (includes LATERAL JOIN)
-	sql = replaceTableRefs(sql, patternJoinSimpleTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternJoinSimpleTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 3 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		table := strings.ToLower(parts[2])
 
 		// Skip if this is a CTE name - CTEs are virtual tables, not physical storage
 		if cteNames[table] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Same resolve-then-check ordering as the FROM handler above.
-		resolved, _ := resolveIdent(parts[2])
+		resolved, resolvedOK := resolveIdent(parts[2])
 		if cteNames[strings.ToLower(resolved)] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
-		// Skip already converted read_parquet, system tables, etc.
+		// Skip system tables, etc.
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Check if followed by a dot or parenthesis
 		if isDotOrCallAt(sql, end) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		path := h.getStoragePath(ctx, "default", resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK, true), true
 	})
 
-	// Restore masked FROM keywords and string literals. Both use content-
-	// addressed placeholders, so the intermediate length-changing regex
-	// rewrites above are safe. Identifier placeholders consumed by the table
-	// rewrites above are gone from the SQL (their names went into storage
-	// paths); the unmask restores only the ones that remain — quoted column
-	// names, aliases, and any reference left unrewritten.
+	// A request that ended during the passes has its error recorded; the
+	// caller refuses the partly rewritten SQL.
+	if refs.cancelled() {
+		return sql
+	}
+
+	// Restore masked FROM keywords, put the expressions in, then restore
+	// string literals, in that order. The FROM restore runs before expand so
+	// it never reads the storage paths expand inserts. Here that is a second
+	// line: the identifier resolver already refuses a name carrying
+	// placeholder text. Under a header database the database name comes
+	// from the header, so the order is what keeps it out of the restore. String literals
+	// go last because a literal can hold a NUL, which expand would read as a
+	// sentinel. Both masks use content-addressed placeholders, so the
+	// length-changing rewrites above are safe. Identifier placeholders
+	// consumed by the table rewrites above are gone from the SQL (their
+	// names went into storage paths); the unmask restores only the ones that
+	// remain — quoted column names, aliases, and any reference left
+	// unrewritten.
 	sql = sqlutil.UnmaskFromKeywordsInFunctionBodies(sql, fromMasks)
+	sql = refs.expand(sql)
 	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
 	return sql
@@ -3537,8 +3976,8 @@ const arcInvalidIdentifierSentinel = ".arc-invalid-quoted-identifier"
 // still receives a safe segment to build a path from.
 //
 // A placeholder-shaped token this mask table did not produce is a masked
-// STRING literal (`__STR_n__`, or a name shaped like one) and resolves to the
-// sentinel as well. It must never become a path segment: the segment is
+// STRING literal (`__STR_n__`, or a name that contains one) and resolves to
+// the sentinel as well. It must never become a path segment: the segment is
 // quoted into read_parquet('…') while still a placeholder, and
 // UnmaskStringLiterals would then restore the raw literal, quotes and all,
 // INSIDE that quoted path — turning `FROM db.'…'` into a path expression
@@ -3548,7 +3987,7 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 	return func(name string) (string, bool) {
 		orig, isPlaceholder := identNames[name]
 		if !isPlaceholder {
-			if strings.HasPrefix(name, "__STR_") || strings.HasPrefix(name, "__IDENT_") {
+			if containsMaskPlaceholder(name) {
 				return arcInvalidIdentifierSentinel, false
 			}
 			return name, true
@@ -3575,7 +4014,8 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 // name would be reported to the client as a successful query over an empty
 // table. A name Arc cannot turn into a path is an error, not an empty result.
 type storagePathFailure struct {
-	err error
+	err     error
+	emitted map[TableReference]struct{}
 }
 
 // errColdTierUnavailable refuses a read that needs the cold tier on a node
@@ -3590,10 +4030,66 @@ var errColdTierUnavailable = errors.New("this query reads data in the cold stora
 // transform: 503 for a cold tier this node cannot read, 400 otherwise (a name
 // that cannot become a storage path).
 func transformErrorStatus(err error) int {
+	if errors.Is(err, errQueryTimedOut) {
+		return fiber.StatusGatewayTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return fiber.StatusServiceUnavailable
+	}
 	if errors.Is(err, errColdTierUnavailable) {
 		return fiber.StatusServiceUnavailable
 	}
+	if errors.Is(err, errTransformProvenance) {
+		return fiber.StatusInternalServerError
+	}
 	return fiber.StatusBadRequest
+}
+
+// errQueryTimedOut answers a request whose deadline passed while its SQL was
+// being rewritten, with the message and status (504) an execution timeout
+// gets. The rewrite is linear but not free: at query.max_sql_length's ceiling
+// it can take seconds, and query.timeout bounds the whole request (#1482).
+var errQueryTimedOut = errors.New("Query timed out")
+
+// transformContextErr is the error a transform run under ctx must be refused
+// with, or nil. It is checked before the storage-path failure: a deadline
+// that passes inside a lookup can make that lookup refuse the read (a cold
+// tier it could not ask), and the refusal must still be reported as the
+// timeout that caused it.
+func transformContextErr(ctx context.Context) error {
+	switch err := ctx.Err(); {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.DeadlineExceeded):
+		return errQueryTimedOut
+	default:
+		return err
+	}
+}
+
+// logTransformTimeout logs a request whose deadline passed while its SQL was
+// being rewritten, as an execution timeout is logged.
+func (h *QueryHandler) logTransformTimeout(sql string, timeout time.Duration) {
+	h.logger.Error().Str("sql", sqlutil.ForLog(sql)).Dur("timeout", timeout).Msg("Query timed out while its SQL was prepared")
+}
+
+// requestDeadline is the time by which a request with the given timeout must
+// be answered, or zero for none. The SQL transform and the query's execution
+// share it, so query.timeout bounds the request rather than each half.
+func requestDeadline(timeout time.Duration) time.Time {
+	if timeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(timeout)
+}
+
+// transformContext bounds the SQL transform by deadline. Without one the
+// transform runs on parent, as it always did.
+func transformContext(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return parent, func() {}
+	}
+	return context.WithDeadline(parent, deadline)
 }
 
 // refuseReadWithoutColdTier records errColdTierUnavailable on ctx and reports
@@ -3611,17 +4107,7 @@ func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, 
 	// migration replicated in, a restore). A cached hot-only read would then
 	// skip them without asking again.
 	pruning.MarkVolatile(ctx)
-	var start, end *time.Time
-	if tr := h.pruner.ExtractTimeRange(originalSQL); tr != nil {
-		if !tr.StartAssumed {
-			s := tr.Start
-			start = &s
-		}
-		if !tr.EndAssumed {
-			e := tr.End
-			end = &e
-		}
-	}
+	start, end := statedBounds(h.pruner.ExtractTimeRangeCtx(ctx, originalSQL))
 	has, err := guard.HasColdFilesInRange(ctx, database, measurement, start, end)
 	if err != nil {
 		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
@@ -3634,12 +4120,105 @@ func (h *QueryHandler) refuseReadWithoutColdTier(ctx context.Context, database, 
 	return true
 }
 
+// statedBounds is a query's time range as tier metadata may be asked about
+// it: a bound the extractor only assumed is left open (nil), so a lookup
+// never excludes rows the query did not exclude. No range: both open.
+func statedBounds(tr *pruning.TimeRange) (start, end *time.Time) {
+	if tr == nil {
+		return nil, nil
+	}
+	if !tr.StartAssumed {
+		s := tr.Start
+		start = &s
+	}
+	if !tr.EndAssumed {
+		e := tr.End
+		end = &e
+	}
+	return start, end
+}
+
+// coldRangeHasNoRows reports whether this read may leave out cold partitions
+// the cold tier could not list (#1550): only on a node whose tier metadata is
+// a complete record of the cold store (tiering.Manager.ColdMetadataAuthority:
+// standalone, and not since a restore that left cold files without rows),
+// and only when that metadata holds no cold row for the read's range. Any
+// doubt — a cluster node, an incomplete record, a metadata error — answers
+// false, and the read keeps the unlisted partitions and fails as it did.
+//
+// The cost is one SQLite lookup, and only on a read whose cold listing
+// already failed.
+func (h *QueryHandler) coldRangeHasNoRows(ctx context.Context, database, measurement string, timeRange *pruning.TimeRange) bool {
+	if !h.coldMetadataTrusted() {
+		return false
+	}
+	guard := h.coldTierGuard()
+	start, end := statedBounds(timeRange)
+	// Quarantined rows count: their objects are still read through the glob
+	// on a healthy store, so leaving them out would drop real rows.
+	has, err := guard.HasAnyColdRowsInRange(ctx, database, measurement, start, end)
+	if err != nil {
+		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Could not check tier metadata for cold rows in this read's range; keeping the cold partitions the cold tier could not list")
+		return false
+	}
+	return !has
+}
+
+// coldMetadataTrusted reports whether this node's tier metadata may stand in
+// for a cold listing that failed (tiering.Manager.ColdMetadataAuthority).
+// Atomic loads only; asked on every tiered read.
+func (h *QueryHandler) coldMetadataTrusted() bool {
+	guard := h.coldTierGuard()
+	return guard != nil && guard.ColdMetadataAuthoritative()
+}
+
+// coldUnlistedLog limits the Warn coldRangeHasNoRows' callers log when they
+// leave cold partitions out, to one per measurement per minute: during an
+// outage every read of every tiered measurement would otherwise log.
+var coldUnlistedLog sync.Map // "db/measurement" -> time.Time
+
+const coldUnlistedLogEvery = time.Minute
+
+// noteColdUnlistedSkipped counts and (rate-limited) logs a read that left out
+// cold partitions the cold tier could not list.
+func (h *QueryHandler) noteColdUnlistedSkipped(database, measurement string, partitions int) {
+	metrics.Get().IncQueryColdUnlistedSkipped()
+	key := database + "/" + measurement
+	now := time.Now()
+	if last, ok := coldUnlistedLog.Load(key); ok && now.Sub(last.(time.Time)) < coldUnlistedLogEvery {
+		return
+	}
+	coldUnlistedLog.Store(key, now)
+	h.logger.Warn().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("cold_partitions_skipped", partitions).
+		Msg("The cold tier could not be listed; answering this read without its cold partitions because tier metadata holds no cold rows for its range (logged at most once a minute per measurement)")
+}
+
 type storagePathCtxKey struct{}
 
 // withStoragePathFailure attaches a collector for storage-path rejections.
 func withStoragePathFailure(ctx context.Context) (context.Context, *storagePathFailure) {
-	f := &storagePathFailure{}
+	f := &storagePathFailure{emitted: make(map[TableReference]struct{})}
 	return context.WithValue(ctx, storagePathCtxKey{}, f), f
+}
+
+// reservedPlaceholderInTransform refuses, through the storage-path failure
+// collector, a statement whose string-masked form spells a function-body
+// FROM placeholder, which UnmaskFromKeywordsInFunctionBodies would restore
+// as a FROM. ValidateSQLRequest refuses it first on every endpoint; this
+// keeps the transform from restoring caller text into a checked statement
+// if a path ever reaches it without that gate. (Literal and identifier
+// placeholder text is refused per name by the rewriters' identifier
+// resolver; see reserved_names_test.go.)
+func reservedPlaceholderInTransform(ctx context.Context, masked string) bool {
+	if sqlutil.ContainsFromMaskPlaceholder(masked) {
+		recordStoragePathFailure(ctx, errors.New(errReservedPlaceholder))
+		return true
+	}
+	return false
 }
 
 // recordStoragePathFailure keeps the FIRST rejection. One malformed name can
@@ -3648,6 +4227,62 @@ func recordStoragePathFailure(ctx context.Context, err error) {
 	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok && f.err == nil {
 		f.err = err
 	}
+}
+
+func recordStoragePathEmission(ctx context.Context, database, measurement string) {
+	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
+		f.emitted[TableReference{Database: database, Measurement: measurement}] = struct{}{}
+	}
+}
+
+// errTransformProvenance refuses a transform that reads storage but recorded
+// no database or measurement for it (#764): its reads cannot be checked
+// against RBAC. Arc's own inconsistency, so a 500, not the caller's 400.
+var errTransformProvenance = errors.New("SQL transformation reads storage without recording what it reads")
+
+// checkTransformProvenance refuses transformed SQL that reads storage while
+// no scope was recorded for it. Every storage path the transform builds
+// records its scope, so this fires only on a transform branch that builds a
+// path some other way; the check is then refused rather than skipped.
+func checkTransformProvenance(transformed string, refs []TableReference) error {
+	if len(refs) == 0 && ioTableFunctionPattern.MatchString(ioDenylistNormalise(transformed)) {
+		return errTransformProvenance
+	}
+	return nil
+}
+
+func storagePathReferences(f *storagePathFailure) []TableReference {
+	refs := make([]TableReference, 0, len(f.emitted))
+	for ref := range f.emitted {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Database != refs[j].Database {
+			return refs[i].Database < refs[j].Database
+		}
+		return refs[i].Measurement < refs[j].Measurement
+	})
+	return refs
+}
+
+func encodeStoragePathReferences(refs []TableReference) []string {
+	encoded := make([]string, len(refs))
+	for i, ref := range refs {
+		encoded[i] = ref.Database + "\x00" + ref.Measurement
+	}
+	return encoded
+}
+
+func decodeStoragePathReferences(encoded []string) ([]TableReference, error) {
+	refs := make([]TableReference, 0, len(encoded))
+	for _, value := range encoded {
+		database, measurement, ok := strings.Cut(value, "\x00")
+		if !ok || database == "" || measurement == "" {
+			return nil, fmt.Errorf("%w: invalid scope metadata in SQL transform cache", errTransformProvenance)
+		}
+		refs = append(refs, TableReference{Database: database, Measurement: measurement})
+	}
+	return refs, nil
 }
 
 // getStoragePath returns the storage path for a database.table, recording a
@@ -3687,6 +4322,7 @@ func (h *QueryHandler) storagePathForBackend(ctx context.Context, backend storag
 		recordStoragePathFailure(ctx, err)
 		return ""
 	}
+	recordStoragePathEmission(ctx, database, table)
 	return path
 }
 
@@ -3705,48 +4341,6 @@ func quotePath(path string) string {
 // DuckDB handles projection pushdown internally when it sees which columns are actually used.
 func buildReadParquetOptions() string {
 	return "union_by_name=true"
-}
-
-// replaceTableRefs rewrites every match of re in sql using fn.
-//
-// It exists because the rewriter's "is this identifier followed by '.' or '('?"
-// lookahead needs the offset of the match within the CURRENT string. The
-// obvious implementation — regexp.ReplaceAllStringFunc plus
-// strings.Index(sqlLower, match) to recover the offset — is wrong: sqlLower is
-// computed once, before the earlier FROM/JOIN passes rewrite sql, so the
-// recovered index refers to the pre-rewrite string. Slicing the post-rewrite
-// string at that stale offset lands inside an already-emitted
-// read_parquet('…') and the '(' there trips the function-call guard, silently
-// leaving a legitimate table un-rewritten (`FROM a JOIN cross` left `cross`
-// alone, while the longer `crossx` happened to land on a different character
-// and worked).
-//
-// fn receives the submatch strings and the byte offset just past the match in
-// the string being scanned, and returns the replacement text. parts[0] is
-// always the full match, so callers can `return parts[0]` to leave a match
-// untouched; parts for groups that did not participate are empty strings.
-func replaceTableRefs(sql string, re *regexp.Regexp, fn func(parts []string, end int) string) string {
-	matches := re.FindAllStringSubmatchIndex(sql, -1)
-	if len(matches) == 0 {
-		return sql
-	}
-
-	var b strings.Builder
-	b.Grow(len(sql))
-	last := 0
-	for _, m := range matches {
-		parts := make([]string, len(m)/2)
-		for i := range parts {
-			if m[2*i] >= 0 {
-				parts[i] = sql[m[2*i]:m[2*i+1]]
-			}
-		}
-		b.WriteString(sql[last:m[0]])
-		b.WriteString(fn(parts, m[1]))
-		last = m[1]
-	}
-	b.WriteString(sql[last:])
-	return b.String()
 }
 
 // isDotOrCallAt reports whether the first non-blank byte at or after end is a
@@ -4059,6 +4653,15 @@ func combineTierPruneResults(results []tierPruneResult) ([]string, int) {
 	return paths, prunedTiers
 }
 
+// allColdPathsUnlisted reports whether every cold path the pruner kept rests
+// only on a failed listing. A path a listing confirmed (or a cached listing
+// did) is evidence of cold data in the range; if tier metadata says there is
+// none, the metadata is the incomplete one, and the read keeps everything
+// rather than trust it (#1550).
+func allColdPathsUnlisted(d pruning.TierPruneDetail) bool {
+	return len(d.Paths) > 0 && len(d.Unverified) == len(d.Paths)
+}
+
 // buildMultiTierReadParquet builds a read_parquet expression that queries tiers with actual data.
 // Queries the tiering metadata to determine which tiers have files for this database/measurement,
 // then only includes paths for tiers that actually have data.
@@ -4137,18 +4740,48 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// backend; a tier verified to hold no data for the time range is dropped
 	// entirely (a recent-range dashboard query never lists or reads cold
 	// object storage beyond the cached parent listings).
-	timeRange := h.pruner.ExtractTimeRange(originalSQL)
+	timeRange := h.pruner.ExtractTimeRangeCtx(ctx, originalSQL)
 	results := make([]tierPruneResult, 0, len(sources))
+	// resultSources[i] is the source of results[i]: a cold tier left out
+	// below has no result, so the two no longer line up with sources.
+	resultSources := make([]tierSource, 0, len(sources))
+	droppedUnlisted := 0
+	// skippedUnlisted: cold partitions were left out on tier metadata's word
+	// (#1550), whether or not the whole tier went; the transform must not be
+	// cached past the cold tier coming back.
+	skippedUnlisted := false
 	for _, src := range sources {
 		if src.tier == tiering.TierCold && timeRange != nil && timeRange.StartAssumed {
 			// An end-only predicate's assumed start (the 1970 floor) must not
 			// exclude cold-archive data that can legitimately be older; scan
 			// the full cold glob instead.
 			results = append(results, tierPruneResult{glob: src.glob, outcome: pruning.TierPruneFallback})
+			resultSources = append(resultSources, src)
 			continue
 		}
-		tierPaths, outcome := h.pruner.PruneTierPaths(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
-		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome})
+		isCold := src.tier == tiering.TierCold
+		// Stop listing after the first failure only where the unlisted
+		// partitions may then be left out. Elsewhere (a cluster node, rows
+		// not yet trusted) one transient failure would turn every later day
+		// into an unchecked glob, and a day with no cold data into a "no
+		// files" 503 on a healthy store (#1550).
+		stopAfterFailure := isCold && h.coldMetadataTrusted()
+		d := h.pruner.PruneTierPathsDetail(ctx, src.glob, database, measurement, timeRange, src.backend, !isCold, stopAfterFailure)
+		if isCold && allColdPathsUnlisted(d) && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
+			// The cold tier could not be listed for any of these partitions,
+			// and this node's tier metadata, a complete record of the cold
+			// store, holds no cold row in the range: they cannot hold data,
+			// and reading them would fail the whole query on the same outage
+			// (#1550). Dropped as a source, not reported Empty:
+			// combineTierPruneResults keeps an Empty tier's full glob unless
+			// another tier pruned, and that glob is the read this avoids.
+			h.noteColdUnlistedSkipped(database, measurement, len(d.Paths))
+			skippedUnlisted = true
+			droppedUnlisted++
+			continue
+		}
+		results = append(results, tierPruneResult{glob: src.glob, paths: d.Paths, outcome: d.Outcome})
+		resultSources = append(resultSources, src)
 	}
 	// A tier that could not be pruned (no time range, or the cold end-only
 	// fallback) goes to DuckDB as its full glob. If that glob matches
@@ -4159,34 +4792,50 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// file at all before keeping it; a listing that cannot be trusted keeps
 	// the tier, as before. A transform that dropped a tier is volatile: the
 	// next flush into that tier must not wait out the cache TTL.
+	//
+	// A cold tier whose listing failed here is left out on the same terms
+	// as above (#1550): only when tier metadata, a complete record of the
+	// cold store on this node, holds no cold row for the range. With no
+	// range, or only an end, that is a measurement with no cold rows before
+	// the end, which TiersForMeasurement has mostly ruled out already; the
+	// branch matters for reads the pruner did not prune (path cap, pruning
+	// off) and for cold rows that are all quarantined.
 	kept := results[:0]
 	droppedEmpty := 0
 	for i, r := range results {
+		src := resultSources[i]
 		if r.outcome == pruning.TierPruneFallback {
-			if has, verified := pruning.TierHasFiles(ctx, sources[i].backend, database, measurement); verified && !has {
+			has, verified := pruning.TierHasFiles(ctx, src.backend, database, measurement)
+			if verified && !has {
 				h.logger.Debug().
 					Str("database", database).
 					Str("measurement", measurement).
-					Str("tier", string(sources[i].tier)).
+					Str("tier", string(src.tier)).
 					Msg("Tier holds no files for this measurement; dropped from the read")
 				droppedEmpty++
+				continue
+			}
+			if !verified && src.tier == tiering.TierCold && h.coldRangeHasNoRows(ctx, database, measurement, timeRange) {
+				h.noteColdUnlistedSkipped(database, measurement, 1)
+				droppedUnlisted++
+				skippedUnlisted = true
 				continue
 			}
 		}
 		kept = append(kept, r)
 	}
 	results = kept
-	if droppedEmpty > 0 {
+	if droppedEmpty > 0 || skippedUnlisted {
 		pruning.MarkVolatile(ctx)
 	}
 
 	paths, prunedTiers := combineTierPruneResults(results)
-	if prunedTiers > 0 || droppedEmpty > 0 {
+	if prunedTiers > 0 || droppedEmpty > 0 || droppedUnlisted > 0 {
 		h.logger.Info().
 			Str("database", database).
 			Str("measurement", measurement).
 			Int("tiers", len(sources)).
-			Int("pruned_tiers", prunedTiers+droppedEmpty).
+			Int("pruned_tiers", prunedTiers+droppedEmpty+droppedUnlisted).
 			Int("path_count", len(paths)).
 			Msg("Multi-tier partition pruning applied")
 	}
@@ -4245,13 +4894,22 @@ func (h *QueryHandler) noTierRead(ctx context.Context, database, measurement, ke
 		Str("database", database).
 		Str("measurement", measurement).
 		Msg("No tier holds a file of this measurement; reading it as empty")
+	// What this reads is this measurement's, as empty: record that scope
+	// (#764), never the sentinel's, which no grant names and would turn an
+	// empty result into a 403 for a token granted only this measurement.
+	recordStoragePathEmission(ctx, database, measurement)
 	if anchor := h.anchorFor(ctx, database, measurement); anchor != "" {
 		return readParquetExpr(keyword, anchor, nil, options)
 	}
 	if hotWasSource {
 		return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
-	return readParquetExpr(keyword, "", []string{h.getStoragePath(ctx, database, arcInvalidIdentifierSentinel)}, options)
+	empty, err := storage.GetStoragePath(h.storage, database, arcInvalidIdentifierSentinel)
+	if err != nil {
+		recordStoragePathFailure(ctx, err)
+		return ""
+	}
+	return readParquetExpr(keyword, "", []string{empty}, options)
 }
 
 // multiTierView is what buildMultiTierReadParquet reads from tiering: which
@@ -4277,6 +4935,11 @@ func (v tieringTierView) GetBackendForTier(tier tiering.Tier) storage.Backend {
 type coldTierGuard interface {
 	ColdTierMissing() bool
 	HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error)
+	// HasAnyColdRowsInRange: HasColdFilesInRange with quarantined rows (#1550).
+	HasAnyColdRowsInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error)
+	// ColdMetadataAuthoritative: this node's cold rows are a complete record
+	// of the cold store (#1550).
+	ColdMetadataAuthoritative() bool
 }
 
 func (h *QueryHandler) coldTierGuard() coldTierGuard {
@@ -4334,6 +4997,11 @@ func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLowe
 	// Build replacement - use tiering-aware method that checks both hot and cold tiers
 	replacement := h.buildReadParquetExprForMeasurement(ctx, database, tableName, sql, "FROM")
 
+	// Both callers keep SQL with quotes or comments off this path, so the
+	// qualifier scan can read it as is (#1447).
+	qualified := qualifierNames(sql, func(name string) (string, bool) { return name, true })
+	replacement = aliasTableRef(replacement, sql, end, tableName, true, qualified)
+
 	return sql[:idx] + replacement + sql[end:]
 }
 
@@ -4342,6 +5010,8 @@ func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLowe
 // skips the database.table regex patterns since all tables use the header-specified database.
 // This provides ~50% reduction in regex operations compared to convertSQLToStoragePaths.
 func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context, sql string, database string) string {
+	// See convertSQLToStoragePaths (#1479).
+	ctx = pruning.WithQueryFacts(ctx)
 	originalSQL := sql
 	sqlLower := strings.ToLower(sql)
 
@@ -4352,10 +5022,11 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	}
 
 	// FAST PATH: skip all regex machinery for simple single-table queries.
-	// Bail when the SQL has a bare FROM inside EXTRACT/SUBSTRING/TRIM/OVERLAY
-	// — `SELECT EXTRACT(YEAR FROM CURRENT_DATE)` slips past isSingleTableQuery
-	// with fromCount==1, so the slow path's mask helper must run.
-	if isSingleTableQuery(sqlLower) && !containsSQLWord(sqlLower, "with") && !sqlutil.ContainsFromKeywordFunction(sql) {
+	// Bail when the SQL has a FROM the slow path's mask helper hides: inside
+	// EXTRACT/SUBSTRING/TRIM/OVERLAY, or of `IS [NOT] DISTINCT FROM` (#1472).
+	// `SELECT EXTRACT(YEAR FROM CURRENT_DATE)` and `SELECT 1 IS DISTINCT FROM
+	// 2` slip past isSingleTableQuery with fromCount==1.
+	if isSingleTableQuery(sqlLower) && !containsSQLWord(sqlLower, "with") && !sqlutil.ContainsMaskableFromKeyword(sql) {
 		features := scanSQLFeatures(sql)
 		if !features.hasQuotes && !features.hasDashComment && !features.hasBlockComment {
 			// Also need to rewrite time functions if present
@@ -4380,6 +5051,9 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 	// Phase 1: Mask string literals to prevent regex from matching inside them
 	sql, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	if reservedPlaceholderInTransform(ctx, sql) {
+		return sql
+	}
 
 	// Phase 1b: see convertSQLToStoragePaths.
 	sql, fromMasks := sqlutil.MaskFromKeywordsInFunctionBodies(sql)
@@ -4404,98 +5078,109 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
 
+	// See convertSQLToStoragePaths (#1447, #1450, #1482).
+	qualified, otherAliases := qualifierAndAliasNames(sql, resolveIdent)
+	refs := newDeferredRefs(ctx, cteNames, qualified, otherAliases, bareNameCounts(sql, resolveIdent))
+	if refs.refuseNUL(sql) {
+		return sql
+	}
+
 	// Handle tables continuing the FROM list after a cross-join comma (#978);
 	// runs first, see convertSQLToStoragePaths. A qualified name is left alone
 	// here, as the other passes of this path leave db.table alone:
 	// hasCrossDatabaseSyntax rejects it before the transform runs under a
 	// header database.
-	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
+	sql = refs.replaceComma(sql, func(ref commaJoinRef) (deferredRef, bool) {
 		if ref.db != "" {
-			return "", false
+			return deferredRef{}, false
 		}
 		if cteNames[strings.ToLower(ref.table)] {
-			return "", false
+			return deferredRef{}, false
 		}
-		resolved, _ := resolveIdent(ref.table)
+		resolved, resolvedOK := resolveIdent(ref.table)
 		if cteNames[strings.ToLower(resolved)] {
-			return "", false
+			return deferredRef{}, false
 		}
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return "", false
+			return deferredRef{}, false
 		}
 		path := h.getStoragePath(ctx, database, resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, ","), sql, ref.end, resolved, resolvedOK, true), true
 	})
 
 	// Handle FROM simple_table references - apply header database
-	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternSimpleTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 2 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		table := strings.ToLower(parts[1])
 
 		// Skip if this is a CTE name
 		if cteNames[table] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Resolve-then-check, matching convertSQLToStoragePaths: the CTE and
 		// skip checks must see the clean name, never a placeholder token.
-		resolved, _ := resolveIdent(parts[1])
+		resolved, resolvedOK := resolveIdent(parts[1])
 		if cteNames[strings.ToLower(resolved)] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
-		// Skip already converted read_parquet, system tables, etc.
+		// Skip system tables, etc.
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Check if followed by a dot (function call like db.func()) or parenthesis
 		if isDotOrCallAt(sql, end) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(ctx, database, resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, "FROM"), sql, end, resolved, resolvedOK, true), true
 	})
 
 	// Handle JOIN simple_table references - apply header database
-	sql = replaceTableRefs(sql, patternJoinSimpleTable, func(parts []string, end int) string {
+	sql = refs.replace(sql, patternJoinSimpleTable, func(parts []string, end int) (deferredRef, bool) {
 		if len(parts) < 3 {
-			return parts[0]
+			return deferredRef{}, false
 		}
 		table := strings.ToLower(parts[2])
 
 		// Skip if this is a CTE name
 		if cteNames[table] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Same resolve-then-check ordering as the FROM handler above.
-		resolved, _ := resolveIdent(parts[2])
+		resolved, resolvedOK := resolveIdent(parts[2])
 		if cteNames[strings.ToLower(resolved)] {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
-		// Skip already converted read_parquet, system tables, etc.
+		// Skip system tables, etc.
 		if shouldSkipTableConversion(strings.ToLower(resolved)) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Check if followed by a dot or parenthesis
 		if isDotOrCallAt(sql, end) {
-			return parts[0]
+			return deferredRef{}, false
 		}
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(ctx, database, resolved)
-		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
+		return refs.ref(h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1])), sql, end, resolved, resolvedOK, true), true
 	})
 
-	// Restore masked FROM keywords and original string literals.
+	// See convertSQLToStoragePaths for the order of these.
+	if refs.cancelled() {
+		return sql
+	}
 	sql = sqlutil.UnmaskFromKeywordsInFunctionBodies(sql, fromMasks)
+	sql = refs.expand(sql)
 	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
 	return sql
@@ -4570,8 +5255,28 @@ func (h *QueryHandler) convertValue(v interface{}) interface{} {
 	}
 }
 
-// handleShowDatabases handles SHOW DATABASES command by scanning storage
-func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error {
+// coldDatabaseSource lists the databases tier metadata records, which a
+// cold-only database appears in alone; nil without tiering. A test sets
+// QueryHandler.coldDatabases.
+func (h *QueryHandler) coldDatabaseSource() func(context.Context) ([]string, error) {
+	if h.coldDatabases != nil {
+		return h.coldDatabases
+	}
+	if h.tieringManager == nil {
+		return nil
+	}
+	metadata := h.tieringManager.GetMetadata()
+	if metadata == nil {
+		return nil
+	}
+	return metadata.GetAllDatabases
+}
+
+// handleShowDatabases handles SHOW DATABASES command by scanning storage.
+// visible, when non-nil, keeps only the databases the caller may see
+// (databaseListingFilter); it is applied before any per-database storage or
+// metadata lookup, so a hidden database costs the caller nothing observable.
+func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visible func(string) bool) error {
 	h.logger.Debug().Msg("Handling SHOW DATABASES")
 
 	// Include tier column if tiering is enabled. The types slice is
@@ -4597,7 +5302,8 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	var databases []string
 	var err error
 
-	if lister, ok := h.storage.(storage.DirectoryLister); ok {
+	lister, fromDirectories := h.storage.(storage.DirectoryLister)
+	if fromDirectories {
 		databases, err = lister.ListDirectories(ctx, "")
 	} else {
 		// Fall back to List and extract unique top-level directories
@@ -4615,6 +5321,10 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	if storage.IsStoreNotFound(err) {
 		databases, err = nil, nil
 	}
+	databases = keepVisible(databases, visible)
+	if err == nil && fromDirectories {
+		databases = h.dropEmptyDatabaseDirectories(ctx, databases)
+	}
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
@@ -4622,26 +5332,23 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	}
 
 	// Also get databases from tiering metadata (for cold-only databases)
-	if h.tieringManager != nil {
-		metadata := h.tieringManager.GetMetadata()
-		if metadata != nil {
-			coldDatabases, coldErr := metadata.GetAllDatabases(ctx)
-			if coldErr != nil {
-				h.logger.Warn().Err(coldErr).Msg("Failed to get databases from tiering metadata")
-			} else {
-				// Merge into a set to deduplicate
-				dbSet := make(map[string]bool)
-				for _, db := range databases {
-					dbSet[db] = true
-				}
-				for _, db := range coldDatabases {
-					dbSet[db] = true
-				}
-				// Convert back to slice
-				databases = make([]string, 0, len(dbSet))
-				for db := range dbSet {
-					databases = append(databases, db)
-				}
+	if coldSource := h.coldDatabaseSource(); coldSource != nil {
+		coldDatabases, coldErr := coldSource(ctx)
+		if coldErr != nil {
+			h.logger.Warn().Err(coldErr).Msg("Failed to get databases from tiering metadata")
+		} else {
+			// Merge into a set to deduplicate
+			dbSet := make(map[string]bool)
+			for _, db := range databases {
+				dbSet[db] = true
+			}
+			for _, db := range keepVisible(coldDatabases, visible) {
+				dbSet[db] = true
+			}
+			// Convert back to slice
+			databases = make([]string, 0, len(dbSet))
+			for db := range dbSet {
+				databases = append(databases, db)
 			}
 		}
 	}
@@ -4684,6 +5391,51 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 		Msg("SHOW DATABASES completed")
 
 	return respondSuccessRows(c, columns, types, data, time.Now().UTC().Format(time.RFC3339), start)
+}
+
+// dropEmptyDatabaseDirectories drops the directories that hold no database: a
+// store that keeps empty prefixes (SeaweedFS) keeps a deleted database's, and
+// GET /api/v1/databases/:name answers 404 for it (#1425). A database is shown
+// if it holds a hot file, its marker, or (in a cluster) a manifest entry, as
+// GET /api/v1/databases lists it; a cold-only database is added from the
+// tiering metadata after this. A failed check keeps the database, as it was
+// shown before the check existed. One storage request per database (two for
+// one with only its marker), databaseCheckParallelism at a time.
+func (h *QueryHandler) dropEmptyDatabaseDirectories(ctx context.Context, dirs []string) []string {
+	manifest, _ := h.coordinator.(interface {
+		GetFileManifestByDatabase(database string) []*raft.FileEntry
+	})
+	visible := make([]string, 0, len(dirs))
+	for _, db := range dirs {
+		// Hidden directories (_schema and the like) are dropped below anyway.
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+			visible = append(visible, db)
+		}
+	}
+	answers := checkDatabases(visible, func(db string) (bool, error) {
+		found, err := databaseHasHotFiles(ctx, h.storage, db)
+		if err == nil && !found {
+			found, err = h.storage.Exists(ctx, db+"/.arc-database")
+			if storage.IsStoreNotFound(err) {
+				found, err = false, nil
+			}
+		}
+		if err != nil {
+			h.logger.Warn().Err(err).Str("database", db).Msg("SHOW DATABASES: failed to check whether a database directory holds anything; showing it")
+			return true, nil
+		}
+		if !found && manifest != nil {
+			found = manifestHasDatabasePath(db, manifest.GetFileManifestByDatabase(db))
+		}
+		return found, nil
+	})
+	kept := make([]string, 0, len(visible))
+	for _, db := range visible {
+		if answers[db] {
+			kept = append(kept, db)
+		}
+	}
+	return kept
 }
 
 // handleShowTables handles SHOW TABLES/MEASUREMENTS command by scanning storage
@@ -4907,6 +5659,16 @@ type EstimateResponse struct {
 func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	start := time.Now()
 
+	// A node that cannot serve queries forwards (before governance, so the
+	// request is counted once, on the node that answers it).
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, forwardedQueryDescription(c))
+		o.headerBound = h.queryForwardHeaderBound()
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
+	}
+
 	// Parse request body
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -4951,15 +5713,10 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	// the comment and execute the SHOW).
 	normalised := normalizeSQLForShow(req.SQL)
 
+	// SHOW DATABASES is answered only by /api/v1/query, which shows each
+	// caller the databases it may see (#1562); the route door has already
+	// required read somewhere, so there is nothing left to refuse here.
 	if showDatabasesPattern.MatchString(normalised) {
-		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
-			metrics.Get().IncQueryErrors()
-			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
-				Success:      false,
-				Error:        "access denied: no read permission to list databases",
-				WarningLevel: "error",
-			})
-		}
 		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
 			Success:      false,
 			Error:        "SHOW DATABASES is not supported on the estimate endpoint; use /api/v1/query instead",
@@ -4994,7 +5751,8 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		// it (Measurement: "*"). Asking "*" denies every token whose role carries
 		// measurement-level grants — the canonical tenant shape, and the whole
 		// reason rbac_measurement_permissions exists — because matchPattern("cpu",
-		// "*") is false. Listing EVERYTHING still requires ("*","*").
+		// "*") is false. Listing every database shows only those the caller
+		// can read something in (databaseListingFilter, #1562).
 		if err := h.checkListingPermission(c, database); err != nil {
 			metrics.Get().IncQueryErrors()
 			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
@@ -5048,11 +5806,36 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// Create context with timeout if configured; a governance policy's
+	// MaxDuration overrides the global timeout (#702). Its deadline bounds
+	// the transform and the count query (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
+	cancelTransform()
 	if err != nil {
-		metrics.Get().IncQueryErrors()
+		if errors.Is(err, errQueryTimedOut) {
+			metrics.Get().IncQueryTimeouts()
+			h.logTransformTimeout(req.SQL, effectiveTimeout)
+		} else {
+			metrics.Get().IncQueryErrors()
+		}
 		return c.Status(transformErrorStatus(err)).JSON(EstimateResponse{
+			Success:         false,
+			Error:           err.Error(),
+			WarningLevel:    "error",
+			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+		})
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
 			Success:         false,
 			Error:           err.Error(),
 			WarningLevel:    "error",
@@ -5070,16 +5853,10 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 
 	m := metrics.Get()
 
-	// Create context with timeout if configured; a governance policy's
-	// MaxDuration overrides the global timeout (#702).
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
 	ctx := c.UserContext()
 	var cancel context.CancelFunc
-	if effectiveTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
+	if !deadline.IsZero() {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
 
@@ -5198,6 +5975,16 @@ type MeasurementInfo struct {
 func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	start := time.Now()
 
+	// A node that cannot serve queries forwards the listing: its own
+	// storage view is not the readers'.
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, "")
+		o.timeout = listingForwardTimeout
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
+	}
+
 	// Optional database filter
 	dbFilter := c.Query("database", "")
 
@@ -5212,19 +5999,27 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 		}
 	}
 
-	// RBAC permission check - user needs at least some read permission to list measurements.
-	// When a database filter is specified, check against that specific database instead of
-	// requiring wildcard access — users with single-database permissions should be able to
-	// list measurements scoped to that database.
-	// Scoped to one database: "some read grant inside it" (see the note on the
-	// SHOW TABLES gate above). Unscoped: a grant covering everything.
-	// Scoped to one database: the listing question. Unscoped: a grant
-	// covering everything, the same bar SHOW DATABASES applies.
+	// RBAC: scoped to one database, the listing question ("some read grant
+	// inside it"; see the note on the SHOW TABLES gate above).
+	//
+	// Unscoped, the databases are those the caller may see
+	// (databaseListingFilter, #1562): all of them with a grant covering
+	// everything, otherwise the ones it can read something in. The per-pair
+	// filter below then keeps the measurements it can read.
 	var permErr error
+	var visible func(string) bool
 	if dbFilter != "" {
 		permErr = h.checkListingPermission(c, dbFilter)
 	} else {
-		permErr = h.checkMeasurementPermission(c, "*", "*", "read")
+		var unavailable bool
+		visible, unavailable = databaseListingFilter(c, h.rbacManager)
+		if unavailable {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   "permission store unavailable; retry later",
+			})
+		}
 	}
 	if err := permErr; err != nil {
 		metrics.Get().IncQueryErrors()
@@ -5274,6 +6069,12 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 		if dbFilter != "" && dbName != dbFilter {
 			continue
 		}
+		// Not the correctness guard (the per-pair filter below hides every
+		// measurement of a database the caller cannot read): it keeps this
+		// listing from walking those databases at all.
+		if visible != nil && !visible(dbName) {
+			continue
+		}
 
 		dbPath := filepath.Join(basePath, dbName)
 
@@ -5304,9 +6105,10 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 
 	// Drop the (database, measurement) pairs the caller may not read. This
 	// endpoint can span several databases, so it filters per pair rather than
-	// per name. Unscoped callers had to clear the ("*","*") bar above to get
-	// here, so in practice this trims the scoped case; it is applied
-	// unconditionally so the result can never exceed the caller's grants.
+	// per name. It is the correctness guard for both cases: a scoped call, and
+	// an unscoped call by a caller without a grant covering everything
+	// (#1562), whose visible databases can still hold measurements it cannot
+	// read. Never narrow it to one case.
 	measurements = h.filterReadableMeasurementInfos(c, measurements)
 
 	// Sort by database, then measurement
@@ -5334,14 +6136,15 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 
 // governanceRejection describes a request rejected by query governance.
 // When it is returned, metrics and logging are already recorded and the
-// Retry-After header (rate limits only) is already set on the response;
+// Retry-After header is already set on the response;
 // the caller renders the 429 body in its endpoint's own error shape.
 type governanceRejection struct {
 	reason string
 }
 
 // checkQueryGovernance runs the Enterprise query-governance checks (rate
-// limit, then quota) for the request's token. A non-nil rejection means the
+// limits and quotas, one decision: a refused request is counted against none
+// of them, #1524) for the request's token. A non-nil rejection means the
 // request must be answered with 429 and the returned reason; otherwise the
 // returned policy limits apply to the query: maxRows caps streamed rows and
 // timeout overrides the global query timeout (zero values mean no policy
@@ -5364,27 +6167,25 @@ func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout 
 		return 0, 0, nil
 	}
 	m := metrics.Get()
-	if result := h.governanceManager.CheckRateLimit(tokenInfo.ID); !result.Allowed {
+	// One decision over every limit: a refused query is counted against none
+	// of them (#1524).
+	result := h.governanceManager.Admit(tokenInfo.ID)
+	if !result.Allowed {
 		c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
 		m.IncQueryErrors()
-		m.IncGovernanceRateLimited()
+		msg := "Query rejected: rate limit exceeded"
+		if result.Kind == governance.KindQuota {
+			m.IncGovernanceQuotaExhausted()
+			msg = "Query rejected: quota exhausted"
+		} else {
+			m.IncGovernanceRateLimited()
+		}
 		h.logger.Warn().
 			Int64("token_id", tokenInfo.ID).
 			Str("token_name", tokenInfo.Name).
 			Str("reason", result.Reason).
 			Int("retry_after_sec", result.RetryAfterSec).
-			Msg("Query rejected: rate limit exceeded")
-		return 0, 0, &governanceRejection{reason: result.Reason}
-	}
-	result := h.governanceManager.CheckQuota(tokenInfo.ID)
-	if !result.Allowed {
-		m.IncQueryErrors()
-		m.IncGovernanceQuotaExhausted()
-		h.logger.Warn().
-			Int64("token_id", tokenInfo.ID).
-			Str("token_name", tokenInfo.Name).
-			Str("reason", result.Reason).
-			Msg("Query rejected: quota exhausted")
+			Msg(msg)
 		return 0, 0, &governanceRejection{reason: result.Reason}
 	}
 	return result.MaxRows, result.MaxDuration, nil
@@ -5427,6 +6228,16 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	start := time.Now()
 	m := metrics.Get()
 	m.IncQueryRequests()
+
+	// A node that cannot serve queries forwards it, as /api/v1/query.
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, forwardedQueryDescription(c))
+		o.headerBound = h.queryForwardHeaderBound()
+		o.onError = m.IncQueryErrors
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
+	}
 
 	measurement := c.Params("measurement")
 	if measurement == "" {
@@ -5596,18 +6407,41 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		})
 	}
 
+	// A governance policy's MaxDuration overrides the global timeout (#702),
+	// matching the POST handler's effectiveTimeout semantics. Its deadline
+	// bounds the transform and the execution (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
-	convertedSQL, _, err := h.getTransformedSQL(c.Context(), sql, "")
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, sql, "")
+	cancelTransform()
 	if err != nil {
 		m.IncQueryErrors()
 		msg := "Invalid query: " + err.Error()
-		if errors.Is(err, errColdTierUnavailable) {
+		if errors.Is(err, errColdTierUnavailable) || errors.Is(err, errQueryTimedOut) || errors.Is(err, context.Canceled) {
 			msg = err.Error()
+		}
+		if errors.Is(err, errQueryTimedOut) {
+			m.IncQueryTimeouts()
+			h.logTransformTimeout(sql, effectiveTimeout)
 		}
 		return c.Status(transformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,
 			Error:     msg,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
+			Success:   false,
+			Error:     err.Error(),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}
@@ -5622,13 +6456,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Create context with timeout if configured (0 = no timeout).
 	// Same pattern as POST /api/v1/query: start from UserContext, watch the
-	// client connection for disconnects, then wrap with queryTimeout (#308).
-	// A governance policy's MaxDuration overrides the global timeout (#702),
-	// matching the POST handler's effectiveTimeout semantics.
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
+	// client connection for disconnects, then wrap with the request's
+	// deadline (#308, #1482).
 
 	// Register with the query registry so this endpoint appears in
 	// /api/v1/queries and can be cancelled (#731). The registered statement is
@@ -5674,8 +6503,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	ctx := baseCtx
 	var cancel context.CancelFunc
-	if effectiveTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
+	if !deadline.IsZero() {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
 		// cancel is invoked inside the stream writer callback (or on error
 		// paths below), not deferred here, because the stream writer runs
 		// after this function returns.

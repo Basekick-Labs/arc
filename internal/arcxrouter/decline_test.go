@@ -23,11 +23,12 @@ func TestCensusClassifySeparatesShapes(t *testing.T) {
 		{"WITH t AS (SELECT host FROM cpu) SELECT host FROM t", "cte"},
 		{"SELECT host FROM cpu UNION SELECT host FROM mem", "set_op"},
 		{"SELECT host, row_number() OVER (ORDER BY value) FROM cpu", "window"},
-		{"SELECT host FROM cpu GROUP BY host HAVING count(host) > 1", "having"},
+		// (hidden HAVING aggregates route since res-3b, `+ - * /` since res-3c; `//` declines)
+		{"SELECT host FROM cpu GROUP BY host HAVING count(host) // 2 > 1", "having"},
 		{"SELECT DISTINCT host FROM cpu", "distinct"},
 		{"SELECT host FROM cpu LIMIT 10 OFFSET 5", "offset"},
 		{"SELECT * FROM cpu", "star_projection"},
-		{"SELECT median(value) FROM cpu", "agg_fn"},
+		{"SELECT approx_quantile(value, 0.5) FROM cpu", "agg_fn"},
 		{"SELECT upper(host) FROM cpu", "fn_other"},
 		// Guards keep their own buckets (correctness gates, not missing features).
 		{"SELECT host FROM cpu WHERE t AT TIME ZONE 'UTC' > 1", "tz_setting"},

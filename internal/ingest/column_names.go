@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode/utf8"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // Field and tag names Arc refuses at ingest (#1342).
@@ -156,6 +159,35 @@ func quoteColumnNames(names []string) []string {
 // or refuses such names first, so it means a path that does not.
 var ErrUnstorableColumnName = errors.New("column name cannot be stored")
 
+// ErrUnstorableMeasurementName and ErrUnstorableDatabaseName are returned by
+// the buffer for a measurement or database name containing "/" (#1475).
+// Buffer and coverage keys are database + "/" + measurement, and ingest
+// (splitBufferKey) and cluster code split them at the first "/", which needs
+// a database with no "/". Tier-cache keys are the same string used for exact
+// lookup only, and storage paths are built the same way; those need a
+// measurement with no "/". Every ingest path validates both names first
+// (isValidDatabaseName, isValidMeasurementName; MQTT's isValidStorageSegment
+// and isValidMeasurementSegment), so either error means a path that does not:
+// entry points have missed the database check before (#300, #993, #1010).
+// Edge-sync spoke namespaces, whose database does contain "/", reach storage
+// as files and never pass through the buffer.
+var (
+	ErrUnstorableMeasurementName = errors.New("measurement name cannot be stored")
+	ErrUnstorableDatabaseName    = errors.New("database name cannot be stored")
+)
+
+// unstorableKeyError refuses a database or measurement name the buffer's
+// keys cannot hold unambiguously; nil for any other.
+func unstorableKeyError(database, measurement string) error {
+	if strings.Contains(database, "/") {
+		return fmt.Errorf("%w: database %s contains \"/\"", ErrUnstorableDatabaseName, strconv.Quote(database))
+	}
+	if strings.Contains(measurement, "/") {
+		return fmt.Errorf("%w: measurement %s contains \"/\"", ErrUnstorableMeasurementName, strconv.Quote(measurement))
+	}
+	return nil
+}
+
 func unstorableColumnError(measurement, name string) error {
 	if name == "time" {
 		return nil
@@ -164,4 +196,36 @@ func unstorableColumnError(measurement, name string) error {
 		return fmt.Errorf("%w: measurement %q column %s: %s", ErrUnstorableColumnName, measurement, strconv.Quote(name), p)
 	}
 	return nil
+}
+
+// nameSpellingRefusal refuses a live write to a database or measurement that
+// exists in storage under another spelling, on a volume that folds names
+// (#1509). It creates the directories of a new name, so the filesystem
+// decides which of two racing first spellings exists. It is a content
+// refusal: nothing of the measurement has reached the WAL.
+//
+// Only a spelling conflict refuses. An I/O error from the check (storage not
+// writable or readable right now) admits the write as before the guard
+// existed: the flush reports the storage failure where it always has, and
+// a write that could be buffered is not turned away by the check.
+func (b *ArrowBuffer) nameSpellingRefusal(database, measurement string) error {
+	g, ok := b.storage.(storage.NameSpellingGuard)
+	if !ok {
+		return nil
+	}
+	err := g.AdmitNameSpelling(database, measurement)
+	var se *storage.NameSpellingError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &se):
+		if se.What == "database" {
+			return fmt.Errorf("%w: %v", ErrUnstorableDatabaseName, se)
+		}
+		return fmt.Errorf("%w: %v", ErrUnstorableMeasurementName, se)
+	default:
+		b.logger.Debug().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Could not check the name's spelling in storage; write admitted")
+		return nil
+	}
 }

@@ -87,6 +87,7 @@ var aggFns = map[string]bool{
 	"variance": true, "var_samp": true, "var_pop": true,
 	"first": true, "last": true, "mode": true, "percentile_cont": true,
 	"percentile_disc": true, "approx_quantile": true,
+	"quantile_cont": true, "quantile_disc": true, "quantile": true, "mad": true,
 }
 
 // knownFns: functions the router/engine already handle in SOME form — their

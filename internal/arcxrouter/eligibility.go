@@ -129,7 +129,11 @@ var collationTokens = []string{"collate", "default_collation"}
 // filtered footer-agg shape never emits a NULL bucket (a time filter drops NULL rows),
 // so this only bites the unfiltered date_trunc agg — but the guard is cheap and
 // covers both.
-var nullOrderTokens = []string{"default_null_order", "null_order"}
+//
+// res-2 adds `default_order`: the engine SQL spells every key's direction and null
+// order explicitly, but the user's `ORDER BY 2` — what DuckDB actually serves —
+// follows an in-query `SET default_order = 'desc'`. Same out-of-band caveat.
+var nullOrderTokens = []string{"default_null_order", "null_order", "default_order"}
 
 // matchResult is what eligibleShape resolves a recognized query into. `unit` is
 // set only for the date_trunc agg; `col` only for the scalar column aggregates
@@ -143,14 +147,21 @@ type matchResult struct {
 	preds       []scanPred // scan only: AND-conjoined WHERE predicates (flat case)
 	whereText   string     // re-serialized WHERE: boolean tree (scan, 2b-2) OR time-range (date_trunc agg, PR-A)
 	havingText  string     // agg-5a: re-serialized HAVING over the grouped select items ("" = none)
+	// res-3: shadow class of an unstable item the HAVING references ("", "arg", "oracle").
+	havingUnstable string
+	havingHidden   int // res-3b
 	// (OR / parens). Mutually exclusive with preds — set only when the flat AND-list
 	// can't represent the WHERE (2b-2). buildScanSQL emits it verbatim; the engine is
 	// the tree authority.
 	orderBy []scanOrderKey // scan only: ORDER BY keys
-	limit   int            // scan only: LIMIT n (0 = none)
+	limit   int            // LIMIT n: scan (0 = none); grouped only under hasLimit (res-2)
 	// scan_agg only: re-serialized aggregate items ("count(*)", "sum(colAsWritten)"),
 	// in select-list order — validated token-by-token in matchScanAgg.
 	aggItems []string
+	// res-1: per-item `AS` alias ("" = none), parallel to aggItems; and the
+	// alias of the single aggregate of a footer shape (count(*), min/max/count).
+	aggAliases []string
+	aggAlias   string
 	// scan_agg_grouped_count only: the single group-key column (as written).
 	// aggItems then holds the select list ("count(*)" or the key), in order.
 	groupKey string
@@ -158,9 +169,10 @@ type matchResult struct {
 	// The SQL builder re-emits from THESE, never from groupKey's text.
 	bucketUnit string
 	bucketCol  string
-	// agg-3c: the ordered KEY's 1-based select position (0 = no ORDER BY);
-	// the builder emits `ORDER BY <this position>` ascending.
-	orderByItem int
+	// res-2 grouped ORDER BY keys (1-based positions; replaced agg-3c's single
+	// ascending key) and an explicit LIMIT.
+	orderKeys []OrderKey
+	hasLimit  bool
 	// agg-3c: rebuilt bucket item text ("" = no bucket key). groupKey holds
 	// the TAG key's spelling ("" = no tag key); at least one is set.
 	bucketText string
@@ -206,19 +218,19 @@ func eligibleShape(sql string) (matchResult, bool) {
 	if u, meas, whereText, ok := matchDateTruncCount(toks); ok {
 		return matchResult{shape: ShapeDateTruncCent, unit: u, measurement: meas, whereText: whereText}, true
 	}
-	if meas, ok := matchCountStar(toks); ok {
-		return matchResult{shape: ShapeCountStar, measurement: meas}, true
+	if meas, alias, ok := matchCountStar(toks); ok {
+		return matchResult{shape: ShapeCountStar, measurement: meas, aggAlias: alias}, true
 	}
-	if fn, col, meas, ok := matchScalarAgg(toks); ok {
+	if fn, col, meas, alias, ok := matchScalarAgg(toks); ok {
 		shape := map[string]string{"min": ShapeMinCol, "max": ShapeMaxCol, "count": ShapeCountCol}[fn]
-		return matchResult{shape: shape, col: col, measurement: meas}, true
+		return matchResult{shape: shape, col: col, measurement: meas, aggAlias: alias}, true
 	}
 	// Agg-1 ungrouped aggregation: tried after the footer shapes (they keep first
 	// refusal — the engine itself routes footer-first) and before the scan. Catches
 	// the shapes the footer matchers just declined (a WHERE, a multi-agg list,
 	// sum/avg) — the engine's parse-level fall-through, mirrored.
-	if items, whereText, meas, ok := matchScanAgg(toks); ok {
-		return matchResult{shape: ShapeScanAgg, aggItems: items, whereText: whereText, measurement: meas}, true
+	if items, aliases, whereText, meas, ok := matchScanAgg(toks); ok {
+		return matchResult{shape: ShapeScanAgg, aggItems: items, aggAliases: aliases, whereText: whereText, measurement: meas}, true
 	}
 	// The allow-listed grouped shape (agg-2b → agg-2c full agg set → mimalloc
 	// slice optional WHERE). Tried before the scan (a bare-column-led grouped
@@ -228,15 +240,20 @@ func eligibleShape(sql string) (matchResult, bool) {
 		return matchResult{
 			shape:          ShapeScanAggGrouped,
 			aggItems:       gm.items,
+			aggAliases:     gm.aggAliases,
 			groupKey:       gm.tagKey,
 			bucketText:     gm.bucketText,
 			bucketUnit:     gm.bucketUnit,
 			bucketCol:      gm.bucketCol,
 			epochWidthSecs: gm.epochWidthSecs,
 			bucketAlias:    gm.bucketAlias,
-			orderByItem:    gm.orderByItem,
+			orderKeys:      gm.orderKeys,
+			limit:          gm.limit,
+			hasLimit:       gm.hasLimit,
 			whereText:      gm.whereText,
 			havingText:     gm.havingText,
+			havingUnstable: gm.havingUnstable,
+			havingHidden:   gm.havingHidden,
 			measurement:    gm.meas,
 		}, true
 	}

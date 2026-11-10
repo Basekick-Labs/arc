@@ -230,6 +230,11 @@ func (i *Importer) Import(ctx context.Context, dir string) (*ImportResult, error
 
 	secret, err := i.registry.Secret(ctx, m.SpokeID)
 	if err != nil {
+		// An unknown, disabled or colliding spoke is a bundle this hub refuses
+		// (422, as the import handler documents), not a server failure.
+		if errors.Is(err, ErrSpokeNotFound) || errors.Is(err, ErrSpokeDisabled) || errors.Is(err, ErrSpokeIDCollision) {
+			return nil, fmt.Errorf("%w: spoke %q: %w", ErrBundleInvalid, m.SpokeID, err)
+		}
 		return nil, fmt.Errorf("edgesync: read spoke secret: %w", err)
 	}
 	if err := r.Verify(ctx, secret); err != nil {

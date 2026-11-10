@@ -1,7 +1,9 @@
 package pruning
 
 import (
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,8 +24,10 @@ import (
 //
 // The rule now: a bound is taken only from a top-level AND term of the one
 // WHERE clause of a single-table query, and only when that whole term is a
-// bare comparison of the time column with a literal or with now() plus or
-// minus one interval. Every other term is ignored, which can only widen the
+// bare comparison of the time column with a literal, with now() plus or
+// minus one interval, or with epoch_ms(n), make_timestamp(n) or
+// to_timestamp(x) of one numeric literal (#1491). Every other term is
+// ignored, which can only widen the
 // range (each term of an AND narrows the result), so ignoring is always
 // safe. A top-level OR, or a query shape where the WHERE does not belong to
 // exactly one table, yields no range at all.
@@ -54,11 +58,17 @@ var (
 
 	// A bare bound term: the time column (optionally qualified, optionally
 	// parenthesised) compared with one operand, in either order.
-	timeCol    = `(?:[a-z_][a-z0-9_]*\s*\.\s*)?(?:\(\s*time\s*\)|time)`
-	operand    = `(__STR_\d+__(?:\s*::\s*timestamp(?:tz)?)?|timestamp\s+__STR_\d+__|(?:now\s*\(\s*\)|current_timestamp)(?:\s*([+-])\s*interval\s*(?:(__STR_\d+__)|(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)))?)`
-	colOpRHS   = regexp.MustCompile(`(?i)^` + timeCol + `\s*(>=|<=|>|<)\s*` + operand + `$`)
-	lhsOpCol   = regexp.MustCompile(`(?i)^` + operand + `\s*(>=|<=|>|<)\s*` + timeCol + `$`)
-	betweenRHS = regexp.MustCompile(`(?i)^` + timeCol + `\s+between\s+` + operand + `\s+and\s+` + operand + `$`)
+	// epochCall is epoch_ms(n), make_timestamp(n) or to_timestamp(x) with
+	// one plain numeric literal and nothing else (#1491). No groups: the
+	// operand's capture layout is shared with betweenRHS. epochCallParts
+	// reads the call back from the operand's text.
+	epochCall      = `(?:epoch_ms|make_timestamp|to_timestamp)\s*\(\s*-?\d+(?:\.\d+)?\s*\)`
+	epochCallParts = regexp.MustCompile(`(?i)^(epoch_ms|make_timestamp|to_timestamp)\s*\(\s*(-?\d+(?:\.\d+)?)\s*\)$`)
+	timeCol        = `(?:[a-z_][a-z0-9_]*\s*\.\s*)?(?:\(\s*time\s*\)|time)`
+	operand        = `(__STR_\d+__(?:\s*::\s*timestamp(?:tz)?)?|timestamp\s+__STR_\d+__|` + epochCall + `|(?:now\s*\(\s*\)|current_timestamp)(?:\s*([+-])\s*interval\s*(?:(__STR_\d+__)|(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)))?)`
+	colOpRHS       = regexp.MustCompile(`(?i)^` + timeCol + `\s*(>=|<=|>|<)\s*` + operand + `$`)
+	lhsOpCol       = regexp.MustCompile(`(?i)^` + operand + `\s*(>=|<=|>|<)\s*` + timeCol + `$`)
+	betweenRHS     = regexp.MustCompile(`(?i)^` + timeCol + `\s+between\s+` + operand + `\s+and\s+` + operand + `$`)
 
 	quotedInterval = regexp.MustCompile(`(?i)^\s*(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\s*$`)
 )
@@ -73,6 +83,7 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 // scanTimeBoundsAt is scanTimeBounds with now() and current_timestamp read as
 // now.
 func scanTimeBoundsAt(sqlStr string, now time.Time) (timeBounds, bool) {
+	timeRangeScans.Add(1)
 	masked, masks := sql.MaskStringLiterals(sqlStr, sql.HasQuotes(sqlStr))
 	masked, ok := stripMaskedComments(masked)
 	if !ok {
@@ -202,11 +213,35 @@ func (b *timeBounds) addTerms(terms []string, literals map[string]string, now ti
 // microsecond (Arc's timestamp precision) past its literal, so the hour it
 // falls on is read.
 func readBoundTerm(term string, literals map[string]string, now time.Time) (lo, hi *time.Time, ok, proofSafe bool) {
+	lo, hi, ok, proofSafe = readBoundTermUnchecked(term, literals, now)
+	// The year limit applies to the bound as returned, after an inclusive
+	// end's microsecond and a to_timestamp bound's slack: either can carry
+	// 9999-12-31 into year 10000, which HasColdFilesInRange (it compares
+	// the range as text) reads as earlier than every real partition.
+	if ok && (!inBoundYears(lo) || !inBoundYears(hi)) {
+		return nil, nil, false, false
+	}
+	return lo, hi, ok, proofSafe
+}
+
+// inBoundYears reports whether a bound lies in years 0001-9999 (nil is a
+// side the term does not bound).
+func inBoundYears(t *time.Time) bool {
+	return t == nil || (!t.Before(minEpochCallTime) && t.Before(maxEpochCallTime))
+}
+
+func readBoundTermUnchecked(term string, literals map[string]string, now time.Time) (lo, hi *time.Time, ok, proofSafe bool) {
 	if m := betweenRHS.FindStringSubmatch(term); m != nil {
 		a, okA := operandTime(m[1:6], literals, now)
 		z, okZ := operandTime(m[6:11], literals, now)
 		if !okA || !okZ {
 			return nil, nil, false, false
+		}
+		if isToTimestampCall(m[1]) {
+			a = a.Add(-epochCallSlack)
+		}
+		if isToTimestampCall(m[6]) {
+			z = z.Add(epochCallSlack)
 		}
 		z = z.Add(time.Microsecond)
 		return &a, &z, true, false
@@ -225,6 +260,14 @@ func readBoundTerm(term string, literals map[string]string, now time.Time) (lo, 
 		return nil, nil, false, false
 	}
 	safe := operandProofSafe(opnd)
+	if isToTimestampCall(opnd[0]) {
+		// Widen on the open side: a start earlier, an end later.
+		if op == ">=" || op == ">" {
+			t = t.Add(-epochCallSlack)
+		} else {
+			t = t.Add(epochCallSlack)
+		}
+	}
 	switch op {
 	case ">=", ">":
 		return &t, nil, true, safe
@@ -274,7 +317,14 @@ func operandTime(m []string, literals map[string]string, now time.Time) (time.Ti
 		t, err := parseDateTime(lit)
 		return t, err == nil
 	}
-	// now() or current_timestamp, with at most one interval.
+	if strings.HasSuffix(whole, ")") && epochCallParts.MatchString(whole) {
+		return epochCallTime(whole)
+	}
+	// now() or current_timestamp, with at most one interval. Anything else
+	// is not a bound: reading an unknown operand as now() narrows the range.
+	if lw := strings.ToLower(whole); !strings.HasPrefix(lw, "now") && !strings.HasPrefix(lw, "current_timestamp") {
+		return time.Time{}, false
+	}
 	if m[1] == "" {
 		return now, true
 	}
@@ -292,6 +342,80 @@ func operandTime(m []string, literals map[string]string, now time.Time) (time.Ti
 	}
 	t, err := evaluateRelativeTimeAt(now, amount, unit, m[1] == "+")
 	return t, err == nil
+}
+
+// epochCallTime evaluates an epochCall operand (#1491) to the instant DuckDB
+// compares the time column with, or reports it is not a bound:
+//
+//   - epoch_ms(BIGINT) and make_timestamp(BIGINT) (microseconds) return a
+//     TIMESTAMP, exactly; a decimal argument is a binder error in DuckDB.
+//   - to_timestamp(DOUBLE) returns a TIMESTAMPTZ, compared in the session
+//     time zone, which Arc pins to UTC (database/duckdb.go). DuckDB goes
+//     through a double, so its instant can be off from the exact one by
+//     tens of microseconds near year 9999 (a double's spacing at 2.5e11 s
+//     is about 30 µs): epochCallSlack widens the bound by a second on its
+//     open side (readBoundTerm), far more than that.
+//
+// An instant outside years 0001-9999 is not a bound, and neither is a bound
+// that leaves them once adjusted (readBoundTerm). A literal cannot
+// spell one (parseDateTime takes four-digit years), and a consumer that
+// stores the range as text compares it as text: HasColdFilesInRange reads
+// "10000-01-01" as earlier than "2026-…".
+func epochCallTime(whole string) (time.Time, bool) {
+	p := epochCallParts.FindStringSubmatch(whole)
+	if p == nil {
+		return time.Time{}, false
+	}
+	var t time.Time
+	// Each name exactly, lowered: (?i) folds Unicode, so the regex also
+	// matches names that are none of the three (epoch_mſ), which DuckDB
+	// does not have. EqualFold would fold them the same way.
+	switch name := strings.ToLower(p[1]); {
+	case name == "epoch_ms" || name == "make_timestamp":
+		n, err := strconv.ParseInt(p[2], 10, 64)
+		if err != nil {
+			return time.Time{}, false
+		}
+		if name == "epoch_ms" {
+			t = time.UnixMilli(n)
+		} else {
+			t = time.UnixMicro(n)
+		}
+	case name == "to_timestamp":
+		f, err := strconv.ParseFloat(p[2], 64)
+		// Bound the seconds before converting; past this the year check
+		// below fails anyway, and int64 conversion of a huge float is not.
+		if err != nil || math.Abs(f) > maxEpochCallSeconds {
+			return time.Time{}, false
+		}
+		sec := math.Floor(f) // floor, not truncation: -1.9 is -2 s + 0.1 s
+		t = time.Unix(int64(sec), int64((f-sec)*1e9))
+	default:
+		return time.Time{}, false
+	}
+	t = t.UTC()
+	if t.Before(minEpochCallTime) || !t.Before(maxEpochCallTime) {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// epochCallSlack widens a to_timestamp bound (see epochCallTime).
+const epochCallSlack = time.Second
+
+// maxEpochCallSeconds bounds to_timestamp's argument: about year 9999.
+const maxEpochCallSeconds = 253402300800
+
+var (
+	minEpochCallTime = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxEpochCallTime = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+// isToTimestampCall reports whether an operand is a to_timestamp call, the
+// one epochCall shape whose instant is approximate.
+func isToTimestampCall(whole string) bool {
+	p := epochCallParts.FindStringSubmatch(strings.TrimSpace(whole))
+	return p != nil && strings.ToLower(p[1]) == "to_timestamp"
 }
 
 var placeholderPattern = regexp.MustCompile(`__STR_\d+__`)

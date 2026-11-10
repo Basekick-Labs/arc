@@ -13,6 +13,7 @@
 package arcxrouter
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -27,6 +28,11 @@ const (
 	tokPunct                 // one of ( ) * ,
 	tokOp                    // comparison operator: = != <> < <= > >= (scan WHERE)
 	tokIntDiv                // `//` — DuckDB integer (trunc) division, lexed GREEDILY (agg-3b)
+	// tokSci is a scientific-notation literal `d[.d](e|E)[+-]d+` (res-3c), optional
+	// leading -. DuckDB types it DOUBLE. Only the HAVING operand grammar consumes it;
+	// every other shape refuses it as an unexpected token, as `1e3` was refused before
+	// (tokNum then the identifier `e3`).
+	tokSci
 )
 
 type token struct {
@@ -69,9 +75,12 @@ func tokenize(sql string) ([]token, bool) {
 			// shape consumes them, so it declines.
 			toks = append(toks, token{kind: tokIntDiv})
 			i += 2
-		case c == '(' || c == ')' || c == '*' || c == ',' || c == '+' || c == '/':
+		case c == '(' || c == ')' || c == '*' || c == ',' || c == '+' || c == '/' || c == '[' || c == ']':
 			// `+`/`/` for 2e DOUBLE arith in WHERE (`*` was already here for SELECT *
 			// / count(*) AND doubles as arith-multiply by position, same as the engine).
+			// `[`/`]` for the map subscript `col['key']` (map-1); only readColumnRef
+			// consumes them, so a bracket anywhere else leaves an unconsumed token and
+			// the shape declines, exactly as before they were lexable.
 			toks = append(toks, token{kind: tokPunct, punct: c})
 			i++
 		case c == '=':
@@ -99,6 +108,12 @@ func tokenize(sql string) ([]token, bool) {
 			}
 		case c == '!':
 			if i+1 < n && b[i+1] == '=' {
+				// DuckDB lexes an operator run containing `!` greedily: `x!=-2` is
+				// the unknown operator `!=-` (an error on both oracles), and the
+				// engine declines it (agg-6b2 adversarial M4).
+				if i+2 < n && (b[i+2] == '-' || b[i+2] == '+') {
+					return nil, false
+				}
 				toks = append(toks, token{kind: tokOp, op: "!="})
 				i += 2
 			} else {
@@ -150,8 +165,13 @@ func tokenize(sql string) ([]token, bool) {
 			toks = append(toks, token{kind: tokStr, str: lit})
 			i = next
 		default:
-			// Anything else (operators, quotes, unicode, brackets) is outside the
+			// Anything else (operators, quotes, unicode, braces) is outside the
 			// vocabulary — decline rather than guess.
+			return nil, false
+		}
+	}
+	for _, t := range toks {
+		if t.kind == tokFloat && decimalTooWide(t.orig) {
 			return nil, false
 		}
 	}
@@ -163,19 +183,51 @@ func tokenize(sql string) ([]token, bool) {
 // IMMEDIATELY followed by a digit — the fractional part, producing a tokFloat.
 // Otherwise it's a tokNum (integer). This mirrors the arcx engine's lexer: only
 // `digit.digit` is a float; `5.` and `.5` are not (the '.' is left for the next
-// step, which then fails to match → decline). No exponent / inf / nan spelling.
+// step, which then fails to match → decline). No inf / nan spelling. res-3c: an
+// exponent `(e|E)[+-]?digit+` right after makes a tokSci; a digit must follow the
+// `e` or its sign (`1e`, `1e+` stay tokNum then an identifier / `+`), as in the
+// engine.
 func lexNumber(sql string, b []byte, start, i, n int) (token, int) {
 	for i < n && isDigit(b[i]) {
 		i++
 	}
+	kind := tokNum
 	if i+1 < n && b[i] == '.' && isDigit(b[i+1]) {
 		i++ // consume '.'
 		for i < n && isDigit(b[i]) {
 			i++
 		}
-		return token{kind: tokFloat, orig: sql[start:i]}, i
+		kind = tokFloat
 	}
-	return token{kind: tokNum, orig: sql[start:i]}, i
+	if i < n && (b[i] == 'e' || b[i] == 'E') {
+		j := i + 1
+		if j < n && (b[j] == '+' || b[j] == '-') {
+			j++
+		}
+		if j < n && isDigit(b[j]) {
+			for j < n && isDigit(b[j]) {
+				j++
+			}
+			return token{kind: tokSci, orig: sql[start:j]}, j
+		}
+	}
+	return token{kind: kind, orig: sql[start:i]}, i
+}
+
+// decimalTooWide mirrors the engine lexer's agg-6b2 M1 rule: DuckDB 1.5.6 binds
+// a DECIMAL literal against a DOUBLE in two roundings, so a wide literal can be a
+// different double than the engine's parse. The rule counts every digit after the
+// integer part's leading zeros (`0.0000000000000001` counts 16) — conservative, and
+// exactly the engine's — and over 15 the engine declines the query, as does the router.
+func decimalTooWide(orig string) bool {
+	digits := strings.TrimLeft(strings.TrimPrefix(orig, "-"), "0")
+	n := 0
+	for i := 0; i < len(digits); i++ {
+		if isDigit(digits[i]) {
+			n++
+		}
+	}
+	return n > 15
 }
 
 // lexString reads a single-quoted literal starting at start (a '). ” is an
@@ -261,6 +313,48 @@ func isZeroFloatLiteral(s string) bool {
 type cursor struct {
 	toks []token
 	i    int
+	// sawSubscript records that readColumnRef produced a map subscript somewhere in
+	// this cursor's walk. Shapes the engine does not serve derived columns in (the
+	// grouped aggregate) check it after re-serializing their WHERE and decline.
+	sawSubscript bool
+}
+
+// readColumnRef completes a column reference whose identifier token `t` was just
+// consumed: with no `[` following it is the bare identifier; with `[ 'key' ]` it is
+// the map subscript spelled `ident['key']` — the engine's canonical form
+// (arcx/src/parse.rs finish_column_ref) and DuckDB's output column name for it.
+// Mirrors the engine's declines exactly: the key must be a string literal without
+// `'` or `\` (no escaping rules to get wrong), the subscript must close, and a
+// second `[` (nested) is not a column reference. A bracket that does not complete
+// a subscript leaves the cursor consumed past it and returns false, so the caller
+// declines.
+func readColumnRef(c *cursor, t token) (string, bool) {
+	// A bare reserved keyword is not a column in DuckDB; the engine declines it.
+	if duckdbNonColumnKeywords[t.lower] {
+		return "", false
+	}
+	if c.i >= len(c.toks) || c.toks[c.i].kind != tokPunct || c.toks[c.i].punct != '[' {
+		return t.orig, true
+	}
+	// The engine's identifier lexer has no `.`, so a dotted base (`a.b['k']`) would
+	// be emitted and then declined by the engine, or refused at the SQL boundary
+	// (isSubscriptRef has no dot either) with no log or metric. Refuse it here.
+	if strings.IndexByte(t.orig, '.') >= 0 {
+		return "", false
+	}
+	c.i++ // consume `[`
+	keyT, ok := c.next()
+	if !ok || keyT.kind != tokStr || strings.ContainsAny(keyT.str, "'\\") {
+		return "", false
+	}
+	if !c.punct(']') {
+		return "", false
+	}
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '[' {
+		return "", false
+	}
+	c.sawSubscript = true
+	return t.orig + "['" + keyT.str + "']", true
 }
 
 func (c *cursor) next() (token, bool) {
@@ -290,24 +384,203 @@ func (c *cursor) numOne() bool {
 	return ok && t.kind == tokNum && t.orig == "1"
 }
 
-// matchCountStar matches: select count ( * ) from <measurement-ident>
-// with nothing after. Returns the measurement token (as written) and ok.
-func matchCountStar(toks []token) (string, bool) {
-	c := &cursor{toks: toks}
-	if !c.ident("select") || !c.ident("count") || !c.punct('(') || !c.punct('*') || !c.punct(')') || !c.ident("from") {
+// Moved from compare_agg.go (engine-tagged) so the untagged grouped matcher
+// can apply res-2's float-only-last rule.
+// tolerantAggFns: aggregates whose float result is an order-dependent reduction
+// and so compares within the documented 1e-9 tolerance — sum/avg (and the mean
+// alias) and the agg-6a moment family (Welford partials combined in work-list
+// order on the engine, thread order on DuckDB). min/max/count stay exact.
+var tolerantAggFns = map[string]bool{
+	"sum": true, "avg": true, "mean": true,
+	"var_pop": true, "var_samp": true, "variance": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+	// agg-6b (regr_count is an integer and stays exact)
+	"covar_pop": true, "covar_samp": true, "corr": true,
+	"regr_avgx": true, "regr_avgy": true, "regr_slope": true, "regr_intercept": true,
+	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
+	// agg-6b' (bit_*, bool_*, count_if compare exact)
+	"product": true, "fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	// agg-7: the interpolating order statistics (the discrete ones and mode are
+	// exact). DuckDB's arm64 build fuses the interpolation into an FMA, so a
+	// 1-ulp difference is architecture, not a bug (arcX agg-7 adversarial B1).
+	"median": true, "quantile_cont": true, "mad": true,
+	// agg-8: the shape statistics. Kept for aggItemTolerant callers only: both
+	// comparators file any shape-cell difference as oraclediff before reaching
+	// the tolerance branch (isShapeItem).
+	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
+}
+
+// aggItemTolerant reports whether the item's float result carries the documented
+// tolerance (see tolerantAggFns).
+func aggItemTolerant(item string) bool {
+	fn, _, ok := strings.Cut(item, "(")
+	return ok && tolerantAggFns[fn]
+}
+
+// OrderKey is one grouped ORDER BY key (res-2): a 1-based output position, the
+// direction and the null order (DuckDB default NULLS LAST for both directions).
+type OrderKey struct {
+	Pos        int
+	Desc       bool
+	NullsFirst bool
+}
+
+const (
+	maxOrderKeys = 4             // the engine's MAX_ORDER_KEYS (duplicates count)
+	maxTopNLimit = (1 << 31) - 1 // the engine's MAX_TOPN_LIMIT
+)
+
+// orderTargetRefused mirrors the engine's order_target_refused (arcX res-2 B1):
+// arg_* (DuckDB's tie choice is nondeterministic), the shape statistics and the
+// agg-6b cancellation-prone bivariates (DuckDB 1.5.6's value is not stable
+// enough to order by). The router additionally refuses the agg-6b' Kahan sums,
+// which the engine serves: DuckDB's own fsum/favg swing by orders of magnitude
+// across thread counts on cancelling data, so the oracle's ORDER would move
+// with them and every disagreement would read as a mismatch.
+var orderTargetRefusedPrefixes = []string{"fsum(", "sumkahan(", "kahan_sum(", "favg(",
+	"arg_max(", "arg_min(", "max_by(", "min_by(", "skewness(", "kurtosis(",
+	"kurtosis_pop(", "covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept("}
+
+func orderTargetRefused(item string) bool {
+	for _, p := range orderTargetRefusedPrefixes {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// orderKeyRef resolves one grouped ORDER BY reference to a select-item index:
+// a position, a key / bucket alias (orderRef), an aggregate alias, or an aggregate
+// expression whose re-serialization equals an item (case-insensitive, the HAVING
+// matcher's rule). A hidden aggregate (not in the select list) and refused
+// targets fail.
+func orderKeyRef(c *cursor, items []string, orderRef func(token) int, aliases []string) (int, bool) {
+	t, ok := c.next()
+	if !ok {
+		return -1, false
+	}
+	idx := -1
+	switch {
+	case t.kind == tokNum:
+		p, err := strconv.Atoi(t.orig)
+		if err != nil || p < 1 || p > len(items) {
+			return -1, false
+		}
+		idx = p - 1
+	case t.kind == tokIdent && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(':
+		var text string
+		switch {
+		case quantileAggFns[t.lower]:
+			txt, qok := parseQuantileAggItem(c, t.lower)
+			if !qok {
+				return -1, false
+			}
+			text = txt
+		case unaryAggFns[t.lower]:
+			c.i++ // '('
+			if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
+				c.i++
+				if !c.punct(')') {
+					return -1, false
+				}
+				text = "count(*)"
+			} else {
+				a, aok := c.next()
+				if !aok || a.kind != tokIdent || !isBareIdent(a.orig) || !c.punct(')') {
+					return -1, false // predicate arguments / expressions: not matched
+				}
+				text = t.lower + "(" + a.orig + ")"
+			}
+		default:
+			return -1, false
+		}
+		for i, it := range items {
+			if strings.EqualFold(it, text) {
+				idx = i
+				break
+			}
+		}
+	case t.kind == tokIdent:
+		if t.lower == "asc" || t.lower == "desc" {
+			// `max(x) AS desc … ORDER BY desc` is a DuckDB parser error (review
+			// M2); an alias of that spelling never resolves here.
+			return -1, false
+		}
+		if !aliasRefBindable(t.lower) {
+			// res-3 review: `ORDER BY true` sorts by a constant and `ORDER BY
+			// current_timestamp` by now() — never by a key or alias of that name.
+			return -1, false
+		}
+		if r := orderRef(t); r >= 0 {
+			idx = r
+		} else {
+			for i, a := range aliases {
+				if a != "" && strings.EqualFold(a, t.orig) {
+					idx = i
+					break
+				}
+			}
+		}
+	}
+	if idx < 0 || orderTargetRefused(items[idx]) {
+		return -1, false
+	}
+	return idx, true
+}
+
+// readAggAlias consumes an optional `AS <alias>` after a select-list aggregate
+// (res-1, arcX feat/res-1-agg-aliases). The alias is a bare identifier with no
+// dot that is neither one of the router's clause keywords nor the engine's
+// (between, like) — the union, so a shape the router accepts is one the engine
+// parses. Returns ("", true) when there is no alias, ok=false on a malformed one.
+// Quoted aliases do not lex (the engine has no quoted identifiers either).
+func readAggAlias(c *cursor) (string, bool) {
+	if c.peekIdentLower() != "as" {
+		return "", true
+	}
+	c.next()
+	a, ok := c.next()
+	if !ok || a.kind != tokIdent || !isBareIdent(a.orig) || strings.Contains(a.orig, ".") ||
+		isScanKeyword(a.lower) || a.lower == "between" || a.lower == "like" {
 		return "", false
+	}
+	return a.orig, true
+}
+
+// isAggAlias re-validates an alias at the SQL boundary (defense in depth).
+func isAggAlias(a string) bool {
+	if a == "" || !isBareIdent(a) || strings.Contains(a, ".") {
+		return false
+	}
+	l := strings.ToLower(a)
+	return !isScanKeyword(l) && l != "between" && l != "like"
+}
+
+// matchCountStar matches: select count ( * ) [AS <alias>] from <measurement-ident>
+// with nothing after. Returns the measurement token (as written), the res-1 alias
+// ("" = none) and ok.
+func matchCountStar(toks []token) (meas, alias string, ok bool) {
+	c := &cursor{toks: toks}
+	if !c.ident("select") || !c.ident("count") || !c.punct('(') || !c.punct('*') || !c.punct(')') {
+		return "", "", false
+	}
+	// res-1: `count(*) AS n` keeps the footer path (the engine's matcher accepts it).
+	alias, ok = readAggAlias(c)
+	if !ok || !c.ident("from") {
+		return "", "", false
 	}
 	t, ok := c.next()
 	if !ok || t.kind != tokIdent {
-		return "", false
+		return "", "", false
 	}
-	meas := t.orig
-	// Nothing may follow — a WHERE/GROUP BY/alias/JOIN means this isn't the bare
+	meas = t.orig
+	// Nothing may follow — a WHERE/GROUP BY/JOIN means this isn't the bare
 	// count-all shape; the footer path would silently ignore it. Decline.
 	if !c.atEnd() {
-		return "", false
+		return "", "", false
 	}
-	return meas, true
+	return meas, alias, true
 }
 
 // matchScalarAgg matches a single-scalar footer aggregate over a bare column:
@@ -317,45 +590,51 @@ func matchCountStar(toks []token) (string, bool) {
 // with nothing after. `count(*)` is NOT matched here — that's matchCountStar; the
 // arg must be a bare identifier, not `*`. Returns (func, col-as-written,
 // measurement, ok). `func` is one of "min", "max", "count".
-func matchScalarAgg(toks []token) (fn, col, meas string, ok bool) {
+//
+// res-1: an optional `AS <alias>` before FROM is returned as `alias` ("" = none).
+func matchScalarAgg(toks []token) (fn, col, meas, alias string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	f, ok := c.next()
 	if !ok || f.kind != tokIdent {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	switch f.lower {
 	case "min", "max", "count":
 		fn = f.lower
 	default:
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	if !c.punct('(') {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	// The argument must be a bare column identifier — NOT `*` (count(*) is the
 	// existing CountStar shape) and NOT an expression.
 	arg, ok := c.next()
 	if !ok || arg.kind != tokIdent {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	col = arg.orig
-	if !c.punct(')') || !c.ident("from") {
-		return "", "", "", false
+	if !c.punct(')') {
+		return "", "", "", "", false
+	}
+	alias, ok = readAggAlias(c) // res-1
+	if !ok || !c.ident("from") {
+		return "", "", "", "", false
 	}
 	m, ok := c.next()
 	if !ok || m.kind != tokIdent {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
 	meas = m.orig
-	// Nothing may follow — a WHERE/GROUP BY/alias means the footer scalar path
-	// would silently ignore it. Decline.
+	// Nothing may follow — a WHERE/GROUP BY means the footer scalar path would
+	// silently ignore it. Decline.
 	if !c.atEnd() {
-		return "", "", "", false
+		return "", "", "", "", false
 	}
-	return fn, col, meas, true
+	return fn, col, meas, alias, true
 }
 
 // matchDateTruncCount matches:
@@ -522,7 +801,8 @@ func (c *cursor) peekIdentLower() string {
 //
 // Deliberately narrow, mirroring the engine's 2a grammar and its decline-harder
 // posture — the router recognizes only what the engine answers green:
-//   - projection is an explicit, non-empty BARE-COLUMN list. `*` is NOT routed
+//   - projection is an explicit, non-empty list of bare columns, map subscripts
+//     `col['key']` (map-1) or recognized projection functions. `*` is NOT routed
 //     (the engine declines SELECT * under schema drift, which the router can't
 //     detect ahead of the files — so star scans stay on DuckDB).
 //   - WHERE is AND-conjoined `<col> <op> <literal>` / `<col> IS [NOT] NULL` /
@@ -633,32 +913,33 @@ func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 //
 //	select <agg> [, <agg>]* from <measurement> [where <pred tree>]
 //
-// where <agg> is `count(*)` or `{count|sum|min|max|avg}(<bare column>)`. Each item
+// where <agg> is `count(*)`, `{count|sum|min|max|avg}(<bare column>)` or, for count
+// only, `count(<col>['<key>'])` (map-2). Each item
 // is re-serialized from its VALIDATED tokens as `fn(colAsWritten)` — the function
 // name lowercased (both engines lowercase it in the derived output name anyway),
 // the argument's typed spelling preserved (DuckDB and arcx both echo it verbatim
 // in the derived name, so canonicalizing the arg would change the client-visible
 // column name). The WHERE reuses the scan's boolean-tree re-serialization — the
 // same injection-proof construction, the engine is the tree authority. Anything
-// after the WHERE (GROUP BY / ORDER BY / LIMIT / aliases) declines: those are
+// after the WHERE (GROUP BY / ORDER BY / LIMIT) declines: those are
 // later slices and the engine declines them too.
 //
 // Tried AFTER the footer matchers (count(*)/scalar agg get first refusal — the
 // engine routes footer-first for those) and BEFORE matchScan.
-func matchScanAgg(toks []token) (items []string, whereText string, meas string, ok bool) {
+func matchScanAgg(toks []token) (items, aliases []string, whereText string, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
-		return nil, "", "", false
+		return nil, nil, "", "", false
 	}
-	fail := func() ([]string, string, string, bool) { return nil, "", "", false }
+	fail := func() ([]string, []string, string, string, bool) { return nil, nil, "", "", false }
 
 	for {
 		f, ok := c.next()
 		if !ok || f.kind != tokIdent {
 			return fail()
 		}
-		switch f.lower {
-		case "count", "sum", "min", "max", "avg":
+		switch {
+		case unaryAggFns[f.lower]:
 			if !c.punct('(') {
 				return fail()
 			}
@@ -670,9 +951,26 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 					return fail()
 				}
 				items = append(items, "count(*)")
+			} else if predArgAggFns[f.lower] && predArgFollows(c) {
+				// agg-6b2: a predicate argument (pred_arg.go).
+				text, ok := reserializePredArg(c)
+				if !ok || !c.punct(')') {
+					return fail()
+				}
+				items = append(items, f.lower+"("+text+")")
 			} else {
 				arg, ok := c.next()
-				if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" {
+				// A bare reserved keyword is not a column in DuckDB (`count_if(true)`,
+				// `sum(end)`); the engine declines it (agg-6b2 adversarial M3).
+				if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" ||
+					duckdbNonColumnKeywords[arg.lower] {
+					return fail()
+				}
+				// A map subscript argument (map-2) serves for `count` only: the engine
+				// counts a derived Utf8 column but declines min/max/sum/avg over Utf8
+				// (agg-1 matrix), so only `count(m['k'])` is routed.
+				argRef, ok := readColumnRef(c, arg)
+				if !ok || (argRef != arg.orig && f.lower != "count") {
 					return fail()
 				}
 				// The immediately-following `)` requirement declines expressions
@@ -680,9 +978,15 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 				if !c.punct(')') {
 					return fail()
 				}
-				items = append(items, f.lower+"("+arg.orig+")")
+				items = append(items, f.lower+"("+argRef+")")
 			}
-		case "arg_max", "arg_min", "max_by", "min_by":
+		case quantileAggFns[f.lower]:
+			item, ok := parseQuantileAggItem(c, f.lower)
+			if !ok {
+				return fail()
+			}
+			items = append(items, item)
+		case twoArgAggFns[f.lower] || binaryMomentFns[f.lower]:
 			// agg-4 two-arg by-time aggregates: `fn(payload, orderkey)` — both
 			// bare idents, re-serialized `fn(a, b)` (fn lowercased, spellings
 			// preserved). The 3-arg top-N form and any other arg-shape fall to
@@ -696,6 +1000,12 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 		default:
 			return fail()
 		}
+		// res-1: optional `AS <alias>` after the aggregate (parallel slice).
+		alias, aok := readAggAlias(c)
+		if !aok {
+			return fail()
+		}
+		aliases = append(aliases, alias)
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
 			continue
@@ -725,7 +1035,7 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 	if !c.atEnd() {
 		return fail()
 	}
-	return items, whereText, meas, true
+	return items, aliases, whereText, meas, true
 }
 
 // matchGroupedAgg matches the grouped class the engine's perf gate has cleared
@@ -748,10 +1058,11 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 // `date_trunc('<unit>', <bare col>)` with unit in the engine's fixed-width set
 // (second/minute/hour/day — bucketUnit/bucketCol return the validated parts and
 // the builder re-emits them, never the source text). An optional trailing
-// `ORDER BY <key pos|key name> [ASC]` is accepted (the engine sorts ascending,
-// NULLS LAST); DESC/LIMIT/multi-key ORDER decline. Non-UTC sessions never get
+// `ORDER BY … [LIMIT n]` follows (res-2; see the ORDER BY loop below). Non-UTC
+// sessions never get
 // here — the M3 tz-injection gate runs before shape matching (gotcha #3).
 func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
+	var aggAliases []string // res-1: per-item alias ("" = none / key item)
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
 		return groupedMatch{}, false
@@ -759,6 +1070,12 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	fail := func() (groupedMatch, bool) { return groupedMatch{}, false }
 	var items []string
 	var bucketText, tagKey, whereText, meas string
+	// agg-6a: a moment aggregate is served grouped ONLY under a bucket key.
+	// Measured on the production cpu corpus (3.95B rows, through Arc): hourly
+	// bucket + var_samp 6.1 s vs DuckDB 8.9 s (the engine folds bucket RUNS as
+	// two-pass partials); host + stddev 18.3 s vs 6.7 s (interleaved tag keys
+	// pay a per-row Welford chain) — a known loss, not routed (gotcha #5).
+	hasMoment := false
 
 	bucketItem := -1
 	tagItem := -1
@@ -785,7 +1102,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				return fail()
 			}
 			bc, tok := c.next()
-			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) {
+			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) || duckdbNonColumnKeywords[bc.lower] {
 				return fail()
 			}
 			if !c.punct(')') {
@@ -850,7 +1167,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				return fail()
 			}
 			bc, tok := c.next()
-			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) {
+			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) || duckdbNonColumnKeywords[bc.lower] {
 				return fail()
 			}
 			if !c.punct(')') {
@@ -891,19 +1208,35 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 				bucketText += " AS " + alias
 			}
 			items = append(items, bucketText)
-		} else if isCall && (t.lower == "arg_max" || t.lower == "arg_min" || t.lower == "max_by" || t.lower == "min_by") {
-			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm).
+		} else if isCall && quantileAggFns[t.lower] {
+			// agg-7: gated on tag keys like the moments (momentAggFns).
+			item, iok := parseQuantileAggItem(c, t.lower)
+			if !iok {
+				return fail()
+			}
+			hasMoment = true
+			items = append(items, item)
+			nAggs++
+		} else if isCall && (twoArgAggFns[t.lower] || binaryMomentFns[t.lower]) {
+			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm), and the
+			// agg-6b fn(y, x) family — which gates tag-keyed shapes like the
+			// moments (agg-6b plan-adversarial M2: the gate lives here too).
 			item, iok := parseTwoArgAggItem(c, t.lower)
 			if !iok {
 				return fail()
 			}
+			if binaryMomentFns[t.lower] {
+				hasMoment = true
+			}
 			items = append(items, item)
 			nAggs++
 		} else if isCall {
-			switch t.lower {
-			case "count", "sum", "min", "max", "avg":
-			default:
+			// agg-7: grouped `mode` is not routed (see unaryAggFns).
+			if !unaryAggFns[t.lower] || t.lower == "mode" {
 				return fail()
+			}
+			if momentAggFns[t.lower] {
+				hasMoment = true
 			}
 			c.i++ // consume '('
 			if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
@@ -912,9 +1245,17 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 					return fail()
 				}
 				items = append(items, "count(*)")
+			} else if predArgAggFns[t.lower] && predArgFollows(c) {
+				// agg-6b2: a predicate argument (pred_arg.go); the tag-key gate
+				// above (hasMoment) still applies — these names are momentAggFns.
+				text, tok := reserializePredArg(c)
+				if !tok || !c.punct(')') {
+					return fail()
+				}
+				items = append(items, t.lower+"("+text+")")
 			} else {
 				arg, tok := c.next()
-				if !tok || arg.kind != tokIdent || isScanKeyword(arg.lower) {
+				if !tok || arg.kind != tokIdent || isScanKeyword(arg.lower) || duckdbNonColumnKeywords[arg.lower] {
 					return fail()
 				}
 				if !c.punct(')') {
@@ -928,12 +1269,24 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			// (alongside an optional bucket): a second tag would ride the
 			// generic engine path that measured 1.4-2.4x BEHIND at corpus
 			// scale — allow-listing it routes a known loss (gotcha #5).
-			if tagItem >= 0 {
+			if tagItem >= 0 || duckdbNonColumnKeywords[t.lower] {
 				return fail()
 			}
 			tagItem = len(items)
 			tagKey = t.orig
 			items = append(items, t.orig)
+		}
+		// res-1: optional `AS <alias>` after an AGGREGATE item (keys carry their
+		// own alias forms in their arms; an alias on a tag key declines).
+		if last := len(items) - 1; last >= 0 && last != bucketItem && last != tagItem {
+			alias, aok := readAggAlias(c)
+			if !aok {
+				return fail()
+			}
+			for len(aggAliases) < last {
+				aggAliases = append(aggAliases, "")
+			}
+			aggAliases = append(aggAliases, alias)
 		}
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
@@ -941,8 +1294,10 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		}
 		break
 	}
-	// At least one key of either kind + at least one aggregate.
-	if (bucketItem < 0 && tagItem < 0) || nAggs == 0 {
+	// At least one key of either kind; at least one aggregate is checked after the
+	// HAVING (res-3b: `SELECT host … GROUP BY host HAVING count(*) > 100` carries
+	// its only aggregate there).
+	if bucketItem < 0 && tagItem < 0 {
 		return fail()
 	}
 	if !c.ident("from") {
@@ -960,6 +1315,12 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		c.next()
 		wt, wok := reserializeWhere(c)
 		if !wok {
+			return fail()
+		}
+		// The engine does not serve a map subscript in a grouped shape (map-1:
+		// `bind_grouped_agg` never extends the union with derived columns) — do not
+		// route what it will decline.
+		if c.sawSubscript {
 			return fail()
 		}
 		whereText = wt
@@ -1025,43 +1386,150 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	// Optional `HAVING <tree>` (agg-5a) — clause order is GROUP BY, HAVING,
 	// ORDER BY. Re-serialized from validated parts; the grammar is the engine's,
 	// so a shape accepted here cannot be one the engine declines.
-	havingText := ""
+	havingText, havingUnstable := "", ""
 	if c.peekIdentLower() == "having" {
 		c.next()
-		ht, hok := reserializeHaving(c, havingCtx{
+		// res-3: aggregate aliases resolve in HAVING; the alias slice is padded to
+		// the item count here (it is otherwise padded after ORDER BY below).
+		aliases := append([]string(nil), aggAliases...)
+		for len(aliases) < len(items) {
+			aliases = append(aliases, "")
+		}
+		ht, hst, hok := reserializeHaving(c, havingCtx{
 			items:       items,
 			tagKey:      tagKey,
 			bucketAlias: m.bucketAlias,
+			aliases:     aliases,
+			bucketCol:   m.bucketCol,
 		})
 		if !hok {
 			return fail()
 		}
-		havingText = ht
+		havingText, havingUnstable = ht, hst.unstable
+		m.havingHidden = len(hst.hidden)
+		hasMoment = hasMoment || hst.hiddenMoment
+	}
+	// res-3b: moved after the HAVING so a hidden moment / order statistic / binary
+	// statistic is gated like a selected one.
+	if hasMoment && tagKey != "" {
+		return fail() // agg-6a: tag-keyed moments are a measured loss (see hasMoment)
+	}
+	if nAggs == 0 && m.havingHidden == 0 {
+		return fail() // a grouped select with no aggregate anywhere (bare DISTINCT)
 	}
 
-	// Optional `ORDER BY <key ref> [ASC]` (agg-3): the engine sorts that single
-	// key ascending, NULLS LAST. DESC / LIMIT / multi-key ORDER decline.
+	// Optional `ORDER BY <ref> [ASC|DESC] [NULLS FIRST|LAST] (, <ref>){0,3}
+	// [LIMIT n]` (agg-3 single ascending key; res-2 top-N, arcX
+	// feat/res-2-topn). Mirrors the engine: a ref is a 1-based position, the tag
+	// key, the bucket alias, an aggregate alias, or an aggregate expression equal
+	// to a select item; an arg/shape/oracle-unstable aggregate is refused as a
+	// target (its shadow policy tolerates differences that would reorder rows);
+	// a tolerant (float) aggregate only as the LAST key; LIMIT without ORDER BY,
+	// OFFSET and expressions decline.
 	if c.peekIdentLower() == "order" {
 		c.next()
 		if !c.ident("by") {
 			return fail()
 		}
-		ot, tok := c.next()
-		if !tok {
+		for {
+			oi, rok := orderKeyRef(c, items, orderRef, aggAliases)
+			if !rok {
+				return fail()
+			}
+			k := OrderKey{Pos: oi + 1}
+			switch c.peekIdentLower() {
+			case "asc":
+				c.next()
+			case "desc":
+				c.next()
+				k.Desc = true
+			}
+			if c.peekIdentLower() == "nulls" {
+				c.next()
+				switch c.peekIdentLower() {
+				case "first":
+					k.NullsFirst = true
+				case "last":
+				default:
+					return fail()
+				}
+				c.next()
+			}
+			m.orderKeys = append(m.orderKeys, k)
+			if len(m.orderKeys) > maxOrderKeys {
+				return fail()
+			}
+			if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+				c.i++
+				continue
+			}
+			break
+		}
+		// A tolerant (float) aggregate only as the last key (arcX res-2 M2).
+		for _, k := range m.orderKeys[:len(m.orderKeys)-1] {
+			if p := k.Pos - 1; p != bucketItem && p != tagItem && aggItemTolerant(items[p]) {
+				return fail()
+			}
+		}
+	}
+	if c.peekIdentLower() == "limit" {
+		if len(m.orderKeys) == 0 {
+			return fail() // unordered LIMIT is nondeterministic
+		}
+		c.next()
+		lt, tok := c.next()
+		if !tok || lt.kind != tokNum {
 			return fail()
 		}
-		oi := orderRef(ot)
-		if oi < 0 {
+		n, err := strconv.Atoi(lt.orig)
+		if err != nil || n < 0 || n > maxTopNLimit {
 			return fail()
 		}
-		if c.peekIdentLower() == "asc" {
-			c.next()
-		}
-		m.orderByItem = oi + 1 // 1-based select-list position
+		m.limit, m.hasLimit = n, true
 	}
 	if !c.atEnd() {
 		return fail()
 	}
+	// res-3 (review H3/H4): a HAVING over an unstable item can flip a group in or
+	// out of DuckDB's result. The unordered comparator tolerates that (one-sided
+	// groups → WARN), and so does a key-only ORDER BY without LIMIT (the order of
+	// unique keys is not in question); the res-2 ordered comparator and the tie
+	// verification re-run DuckDB strictly, so ordering by an aggregate or cutting
+	// with LIMIT is refused — the same set res-2 refuses as ORDER BY targets.
+	if havingUnstable != "" {
+		if m.hasLimit {
+			return fail()
+		}
+		for _, k := range m.orderKeys {
+			if p := k.Pos - 1; p != bucketItem && p != tagItem {
+				return fail()
+			}
+		}
+	}
+	for len(aggAliases) < len(items) {
+		aggAliases = append(aggAliases, "")
+	}
+	// res-1: mirror the engine's collision decline — an aggregate alias equal
+	// (case-insensitively) to the tag key, the bucket alias or another alias.
+	{
+		seen := map[string]bool{}
+		if tagKey != "" {
+			seen[strings.ToLower(tagKey)] = true
+		}
+		if m.bucketAlias != "" {
+			seen[strings.ToLower(m.bucketAlias)] = true
+		}
+		for _, a := range aggAliases {
+			if a == "" {
+				continue
+			}
+			if seen[strings.ToLower(a)] {
+				return fail()
+			}
+			seen[strings.ToLower(a)] = true
+		}
+	}
+	m.aggAliases = aggAliases
 	m.items = items
 	m.bucketText = bucketText
 	m.bucketItem = bucketItem
@@ -1069,6 +1537,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	m.tagItem = tagItem
 	m.whereText = whereText
 	m.havingText = havingText
+	m.havingUnstable = havingUnstable
 	m.meas = meas
 	return m, true
 }
@@ -1078,7 +1547,14 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 // one bare TAG key, at least one of either), their select-list indices, and the
 // validated bucket parts the SQL builder re-emits (never source text).
 type groupedMatch struct {
-	items      []string
+	// res-2: ORDER BY keys (1-based positions) and an explicit LIMIT (hasLimit
+	// distinguishes LIMIT 0 from "no limit" — adversarial B2).
+	orderKeys []OrderKey
+	limit     int
+	hasLimit  bool
+	items     []string
+	// res-1: per-item `AS` alias of an aggregate item ("" = none / a key item).
+	aggAliases []string
 	bucketText string // rebuilt bucket item text ("" = no bucket key)
 	bucketItem int    // select-list index of the bucket (-1 = none)
 	tagKey     string // the bare tag key's spelling ("" = no tag key)
@@ -1086,11 +1562,14 @@ type groupedMatch struct {
 	whereText  string
 	// agg-5a: re-serialized HAVING over the select items ("" = none).
 	havingText string
-	meas       string
-	bucketUnit string
-	bucketCol  string
-	// ORDER BY: the ordered KEY's 1-based select-list position (0 = none).
-	orderByItem int
+	// res-3: shadow class of an unstable item the HAVING references ("" none,
+	// "arg", "oracle") — see Decision.HavingUnstable.
+	havingUnstable string
+	// res-3b: number of hidden HAVING aggregates (not in the select list).
+	havingHidden int
+	meas         string
+	bucketUnit   string
+	bucketCol    string
 	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
 	// the MANDATORY alias — validated parts the builder re-emits.
 	epochWidthSecs int
@@ -1100,19 +1579,131 @@ type groupedMatch struct {
 // parseTwoArgAggItem consumes `( <bare ident> , <bare ident> )` after an agg-4
 // function name and re-serializes it as `fn(a, b)` — validated tokens only,
 // never source text. Anything else (star, expression, a third argument) fails.
+// unaryAggFns: the single-bare-column aggregates the engine serves — the agg-1
+// set, the `mean` alias of `avg`, and the agg-6a moment family (arcX
+// feat/agg6-moments: var_pop, var_samp, variance, stddev, stddev_samp,
+// stddev_pop, sem). `count(*)` is the one star form and is special-cased at
+// each site. Every select-list, HAVING and re-validation arm consults THIS map,
+// so adding a unary aggregate the engine has proven in its differential harness
+// is a one-line router change. Not here: the binary covariance/correlation
+// family (twoArgAggFns/binaryMomentFns) and every sketch/collection aggregate.
+// skewness/kurtosis ARE here since agg-8 (arcx computes central moments; DuckDB
+// 1.5.6's raw-sum differences are filed as oraclediff — see isShapeItem).
+var unaryAggFns = map[string]bool{
+	"count": true, "sum": true, "min": true, "max": true, "avg": true, "mean": true,
+	"var_pop": true, "var_samp": true, "variance": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+	// agg-6b': the Kahan sums, bitwise, and the Boolean-column forms of
+	// bool_and / bool_or / count_if (predicate arguments are not accepted here:
+	// the bare-column requirement declines `count_if(x > 0)`, as the engine does).
+	// `product` is served by the engine but NOT routed: through Arc it measured
+	// 64 ms vs DuckDB's 34 on 132 M rows (the overflow-band bookkeeping), and a
+	// known loss is not routed.
+	"fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	"bit_and": true, "bit_or": true, "bit_xor": true,
+	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
+	// agg-7 (arcX feat/agg-7-order-stats): the single-argument order statistics.
+	// `mode` is routed UNGROUPED only (matchGroupedAgg refuses it): one tied group
+	// declines the whole query in the engine, and small groups tie often.
+	"median": true, "mad": true, "mode": true,
+	// agg-8 (arcX feat/agg-8-skew-kurt): the shape statistics.
+	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
+}
+
+// quantileAggFns: agg-7 `fn(<bare col>, <fraction literal>)`.
+var quantileAggFns = map[string]bool{
+	"quantile_cont": true, "quantile_disc": true, "quantile": true,
+}
+
+// momentAggFns: the agg-6a subset of unaryAggFns whose grouped form is gated to
+// bucket-keyed shapes (see matchGroupedAgg's hasMoment).
+var momentAggFns = map[string]bool{
+	"var_pop": true, "var_samp": true, "variance": true,
+	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
+	// agg-6b': same gate — tag-keyed grouping measured 1.1–1.4× behind DuckDB
+	// (host, fsum 125 vs 111 ms; count_if 84 vs 61; bit_or 63 vs 54), while the
+	// time-bucket form wins (250 vs 360 ms).
+	"fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
+	"bit_and": true, "bit_or": true, "bit_xor": true,
+	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
+	// agg-7: tag-keyed order statistics take the engine's generic hash path (the
+	// dictionary paths are off for value-list states) — gated like the moments.
+	// (Grouped `mode` is refused outright, and the quantile arm sets the gate
+	// itself, so only median/mad are read here.)
+	"median": true, "mad": true,
+	// agg-8: tag-keyed shape statistics are per-row central-moment chains.
+	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
+}
+
+// binaryMomentFns: the agg-6b two-argument family, `fn(y, x)` over two bare
+// columns (arcX feat/agg6b-binary). Served ungrouped and under a date_trunc
+// bucket key; a tag key with any of them declines (matchGroupedAgg's
+// hasMoment gate — per-row recurrences on interleaved slots are the measured
+// loss class from agg-6a).
+var binaryMomentFns = map[string]bool{
+	"covar_pop": true, "covar_samp": true, "corr": true, "regr_count": true,
+	"regr_avgx": true, "regr_avgy": true, "regr_slope": true, "regr_intercept": true,
+	"regr_r2": true, "regr_sxx": true, "regr_syy": true, "regr_sxy": true,
+}
+
+// twoArgAggFns: the agg-4 by-time aggregates — `fn(payload, orderkey)`.
+var twoArgAggFns = map[string]bool{
+	"arg_max": true, "arg_min": true, "max_by": true, "min_by": true,
+}
+
+// parseQuantileAggItem consumes `( <bare ident> , <fraction> )` after an agg-7
+// quantile name and re-serializes it as `fn(col, q)`. The fraction mirrors the
+// engine's parse_quantile_lit: `0`, `1`, or a canonical decimal `0.d…` / `1.0…` in
+// [0, 1] (≤15 digits — the lexer already declines wider decimals). A list, a
+// negative fraction, a cast or anything else fails.
+func parseQuantileAggItem(c *cursor, fnLower string) (string, bool) {
+	if !c.punct('(') {
+		return "", false
+	}
+	a, ok := c.next()
+	if !ok || a.kind != tokIdent || isScanKeyword(a.lower) || !isBareIdent(a.orig) ||
+		strings.Contains(a.orig, ".") || duckdbNonColumnKeywords[a.lower] {
+		return "", false
+	}
+	if !c.punct(',') {
+		return "", false
+	}
+	q, ok := c.next()
+	if !ok || !isQuantileLit(q) {
+		return "", false
+	}
+	if !c.punct(')') {
+		return "", false
+	}
+	return fnLower + "(" + a.orig + ", " + q.orig + ")", true
+}
+
+var quantileDecimal = regexp.MustCompile(`^(0\.[0-9]+|1\.0+)$`)
+
+// isQuantileLit: the fraction spellings both DuckDB versions echo verbatim.
+func isQuantileLit(t token) bool {
+	switch t.kind {
+	case tokNum:
+		return t.orig == "0" || t.orig == "1"
+	case tokFloat:
+		return quantileDecimal.MatchString(t.orig)
+	}
+	return false
+}
+
 func parseTwoArgAggItem(c *cursor, fnLower string) (string, bool) {
 	if !c.punct('(') {
 		return "", false
 	}
 	a1, ok := c.next()
-	if !ok || a1.kind != tokIdent || isScanKeyword(a1.lower) || !isBareIdent(a1.orig) {
+	if !ok || a1.kind != tokIdent || isScanKeyword(a1.lower) || !isBareIdent(a1.orig) || duckdbNonColumnKeywords[a1.lower] {
 		return "", false
 	}
 	if !c.punct(',') {
 		return "", false
 	}
 	a2, ok := c.next()
-	if !ok || a2.kind != tokIdent || isScanKeyword(a2.lower) || !isBareIdent(a2.orig) {
+	if !ok || a2.kind != tokIdent || isScanKeyword(a2.lower) || !isBareIdent(a2.orig) || duckdbNonColumnKeywords[a2.lower] {
 		return "", false
 	}
 	if !c.punct(')') {
@@ -1159,7 +1750,12 @@ func matchScan(toks []token) (cols []string, preds []scanPred, whereText string,
 			}
 			cols = append(cols, item)
 		} else {
-			cols = append(cols, t.orig)
+			// A bare column or a map subscript `col['key']` (map-1).
+			ref, ok := readColumnRef(c, t)
+			if !ok {
+				return fail()
+			}
+			cols = append(cols, ref)
 		}
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
@@ -1193,9 +1789,16 @@ func matchScan(toks []token) (cols []string, preds []scanPred, whereText string,
 		}
 		for {
 			colT, ok := c.next()
-			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
+			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || duckdbNonColumnKeywords[colT.lower] {
 				return fail()
 			}
+			// A map subscript `col['key']` is a column reference here too (map-1); the
+			// pred carries its spelling and buildScanSQL re-validates it.
+			colRef, ok := readColumnRef(c, colT)
+			if !ok {
+				return fail()
+			}
+			colT.orig = colRef
 			// Branch: `IS [NOT] NULL` / `BETWEEN lo AND hi` / `<op> <literal>`.
 			if c.peekIdentLower() == "is" {
 				c.next() // consume `is`
@@ -1296,7 +1899,7 @@ afterWhere:
 		}
 		for {
 			colT, ok := c.next()
-			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
+			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || duckdbNonColumnKeywords[colT.lower] {
 				return fail()
 			}
 			desc := false
@@ -1612,7 +2215,7 @@ func arithPrimary(c *cursor, ap *arithParse) (bool, bool) {
 		}
 		ap.litCount++
 		return true, true // a literal leaf is constant
-	case t.kind == tokIdent && !isScanKeyword(t.lower) && isBareIdent(t.orig):
+	case t.kind == tokIdent && !isScanKeyword(t.lower) && isBareIdent(t.orig) && !duckdbNonColumnKeywords[t.lower]:
 		// A `(` right after the ident is a function call — no functions in arith.
 		if c.i+1 < len(c.toks) && c.toks[c.i+1].kind == tokPunct && c.toks[c.i+1].punct == '(' {
 			return false, false
@@ -1671,22 +2274,33 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 		return false
 	}
 	colT, ok := c.next()
-	if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || !isBareIdent(colT.orig) {
+	if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || !isBareIdent(colT.orig) ||
+		duckdbNonColumnKeywords[colT.lower] {
 		return false
 	}
 	// A `(` right after the ident is a function call — decline (no expression atoms).
 	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
 		return false
 	}
-	b.WriteString(colT.orig)
+	// A map subscript `col['key']` (map-1) is an atom head like a bare column.
+	colRef, ok := readColumnRef(c, colT)
+	if !ok {
+		return false
+	}
+	isSubscript := colRef != colT.orig
+	b.WriteString(colRef)
 
 	// 2e: `<col> (+|-|*|/) <num> <op> <num>` — an arith punct right after the column. Re-emit
 	// verbatim (both engines parse identically); the engine owns the Float64 type-gate, the
 	// signed-zero normalization, AND the `-0.0`-divisor fold. `/` is true division (any divisor
 	// incl. zero); `//` (floor-div) declines because its lexed second `/` fails isNumericTok —
-	// exactly mirroring the engine's match_arith_literal decline.
+	// exactly mirroring the engine's match_arith_literal decline. Arithmetic on a map
+	// subscript (a VARCHAR) declines in the engine; decline it here too.
 	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct {
 		if ap := c.toks[c.i].punct; ap == '+' || ap == '-' || ap == '*' || ap == '/' {
+			if isSubscript {
+				return false
+			}
 			c.next() // consume the arith punct
 			arithLit, ok := c.next()
 			if !ok || !isNumericTok(arithLit) {

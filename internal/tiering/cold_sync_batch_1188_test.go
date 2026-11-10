@@ -191,6 +191,19 @@ func TestSyncColdTierMetadataCancellationInvalidatesCommittedAndFallbackWrites(t
 		t.Fatalf("create test trigger: %v", err)
 	}
 
+	// Cancel right after the per-row fallback writes its FIRST row. The former
+	// version polled for that row every millisecond and cancelled when it saw
+	// it; on a fast runner the fallback could write every remaining row between
+	// two polls and the sync returned nil before cancel() (CI flake, 2026-11-08).
+	// The seam makes the cancellation point exact: the next row's ctx check fails.
+	firstFallbackPath := objects[coldTierMetadataBatchSize].Path
+	fallbackRows := 0
+	m.afterColdFallbackRow = func() {
+		fallbackRows++
+		if fallbackRows == 1 {
+			cancel()
+		}
+	}
 	type syncResult struct {
 		synced int
 		err    error
@@ -200,37 +213,15 @@ func TestSyncColdTierMetadataCancellationInvalidatesCommittedAndFallbackWrites(t
 		synced, err := m.syncColdTierMetadata(ctx)
 		done <- syncResult{synced: synced, err: err}
 	}()
-
-	firstFallbackPath := objects[coldTierMetadataBatchSize].Path
-	deadline := time.NewTimer(5 * time.Second)
-	ticker := time.NewTicker(time.Millisecond)
-	defer deadline.Stop()
-	defer ticker.Stop()
-	for {
-		row, err := m.metadata.GetFile(context.Background(), firstFallbackPath)
-		if err != nil {
-			t.Fatalf("poll first fallback row: %v", err)
-		}
-		if row != nil {
-			cancel()
-			break
-		}
-		select {
-		case result := <-done:
-			t.Fatalf("sync finished before the fallback row appeared: synced=%d err=%v", result.synced, result.err)
-		case <-deadline.C:
-			cancel()
-			select {
-			case result := <-done:
-				t.Fatalf("fallback row was not written before timeout: synced=%d err=%v", result.synced, result.err)
-			case <-time.After(5 * time.Second):
-				t.Fatal("sync did not stop after cancellation")
-			}
-		case <-ticker.C:
-		}
+	var result syncResult
+	select {
+	case result = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("sync did not return after cancellation")
 	}
-
-	result := <-done
+	if fallbackRows != 1 {
+		t.Fatalf("fallback wrote %d rows after cancellation point; want exactly 1", fallbackRows)
+	}
 	if !errors.Is(result.err, context.Canceled) {
 		t.Fatalf("sync error = %v, want context.Canceled", result.err)
 	}

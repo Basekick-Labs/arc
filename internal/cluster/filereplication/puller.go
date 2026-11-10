@@ -1472,6 +1472,18 @@ func (p *Puller) CatchUpCompleted() bool {
 // explicitly opted out of the bootstrap safety net; in that case the
 // coordinator should treat ReplicationReady() as always true (the
 // configuration check in main.go enforces this).
+// Pending reports whether path is enqueued or being pulled, or has an update
+// waiting behind the pull in progress: a file on its way to this node.
+func (p *Puller) Pending(path string) bool {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if _, ok := p.inflight[path]; ok {
+		return true
+	}
+	_, ok := p.pending[path]
+	return ok
+}
+
 func (p *Puller) FullyCaughtUp() bool {
 	return p.catchupCompletedAt.Load() != 0 &&
 		p.catchupInflight.Load() == 0 &&
@@ -1945,21 +1957,41 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 	return
 }
 
-// pullOnce performs a single fetch attempt end-to-end. On attempt > 1 it
-// checks for a partial file and resumes from the byte offset already written,
-// avoiding re-transferring bytes already on disk. The Fetcher verifies SHA-256
+// pullOnce performs a single fetch attempt end-to-end. It checks for a
+// partial file and resumes from the byte offset already written, avoiding
+// re-transferring bytes already on disk. The Fetcher verifies SHA-256
 // across the full file (prefix + tail); this function only tracks counters.
 func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr string, attempt int) error {
+	// Resume from a partial file already on disk, on the first attempt too:
+	// a new enqueue (FSM callback, catch-up, recheck) used to start from zero,
+	// so a file that takes longer than the attempts of one enqueue to transfer
+	// (a low cluster.replication_pull_bytes_per_second, #397, or a slow link)
+	// never completed. byteOffset > 0 means [0, byteOffset) is written and
+	// only the tail is needed.
+	byteOffset, prefixHasher := p.tryResumeFromPartial(log, entry)
+	err := p.fetchFrom(log, entry, peerAddr, byteOffset, prefixHasher)
+	if byteOffset > 0 && errors.Is(err, ErrChecksumMismatch) {
+		// The checksum covers prefix + tail, so a resumed fetch that fails it
+		// most likely failed on the prefix: a partial left by an older
+		// generation of this path. fetchFrom discarded it; pull from zero
+		// from the same peer before blaming the peer. Only a from-zero
+		// mismatch says the peer does not hold the manifest's checksum, so
+		// only that one reaches the content-mismatch accounting.
+		log.Debug().
+			Str("path", entry.Path).
+			Str("peer", peerAddr).
+			Int64("byte_offset", byteOffset).
+			Msg("Resumed pull failed its checksum; discarded the partial and pulling from zero")
+		return p.fetchFrom(log, entry, peerAddr, 0, nil)
+	}
+	return err
+}
+
+// fetchFrom is one fetch from peerAddr starting at byteOffset, bounded by
+// FetchTimeout.
+func (p *Puller) fetchFrom(log zerolog.Logger, entry *raft.FileEntry, peerAddr string, byteOffset int64, prefixHasher hash.Hash) error {
 	fetchCtx, cancel := context.WithTimeout(p.ctx, p.cfg.FetchTimeout)
 	defer cancel()
-
-	// On retries, attempt to resume from a partial file already on disk.
-	// byteOffset > 0 means [0, byteOffset) is written and only the tail is needed.
-	var byteOffset int64
-	var prefixHasher hash.Hash
-	if attempt > 1 {
-		byteOffset, prefixHasher = p.tryResumeFromPartial(log, entry)
-	}
 
 	tailBytes := entry.SizeBytes - byteOffset
 
@@ -2001,7 +2033,11 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 
 	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrChecksumMismatch) {
-			p.totalChecksumMismatch.Add(1)
+			if byteOffset == 0 {
+				// A resumed fetch's mismatch is the partial's until a
+				// from-zero fetch says otherwise (pullOnce).
+				p.totalChecksumMismatch.Add(1)
+			}
 			// Discard only the unverified bytes, never the committed file.
 			// On a staging backend the failed WriteReader left the rejected
 			// bytes in the ".part" and never renamed, so the committed file is
@@ -2063,9 +2099,10 @@ const (
 var localHashStall = 30 * time.Second
 
 // verifyLocalCopy hashes the committed local copy of entry.Path and reports
-// whether it is the manifest's version. ReadTo, never ReadToAt: ReadToAt falls
-// back to the staged ".part" file (#1199), which is not the copy a query
-// reads. LocalBackend.ReadTo does not watch the context, so the hasher does:
+// whether it is the manifest's version, reading the whole committed file with
+// ReadTo (never a staged ".part", which is not the copy a query reads; since
+// #1199 no read method returns one). LocalBackend.ReadTo does not watch the
+// context, so the hasher does:
 // a read past the deadline or a Stop fails. The read counts in the storage
 // read-bytes metric like any other local read.
 //
@@ -2183,8 +2220,7 @@ func (w *progressWriter) Write(b []byte) (int, error) {
 // committed file, and is refused outright when a committed file exists. Using
 // the staging interface for both operations also prevents a committed file
 // appearing between the size and read calls from changing which bytes are
-// hashed. ReadToAt can read staged data when no committed file exists, so it
-// must not be paired with a committed-file size when building a resume hash.
+// hashed.
 func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
 	si, ok := p.cfg.Backend.(storage.StagingInspector)
 	if !ok {

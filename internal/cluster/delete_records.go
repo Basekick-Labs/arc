@@ -116,6 +116,8 @@ func (c *Coordinator) deleteAckLoop(ctx context.Context, fsm *raft.ClusterFSM) {
 		for _, r := range fsm.UnackedDeleteRecords(inst) {
 			// Writes are refused from the moment the record applied here, so
 			// what the flush hands off is everything acknowledged before it.
+			// A line-protocol request is refused at admission, not per
+			// measurement (#1422).
 			actx, cancel := context.WithTimeout(ctx, claimantSyncBudget)
 			marks, err := st.buffer.FlushScopeAndWait(actx, r.Database, r.Measurement)
 			if err != nil {
@@ -240,6 +242,24 @@ func (c *Coordinator) ManifestHotFiles(database, measurement string) []raft.File
 		}
 	}
 	return out
+}
+
+// FileArriving reports whether something is delivering path to this node:
+// the replication puller has it enqueued or in progress, or, on a shared
+// object store, a staged compaction holds it as an output. A DELETE run with
+// allow_unreachable stops waiting for a missing file nothing is delivering
+// (#1426).
+func (c *Coordinator) FileArriving(path string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	puller := c.puller
+	c.mu.RUnlock()
+	if puller != nil && puller.Pending(path) {
+		return true
+	}
+	return c.SharedObjectStore() && c.CompactionOutputHeld(path)
 }
 
 // WaitLocalFiles waits, up to budget, until MissingLocalFiles is empty, and

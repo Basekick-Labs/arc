@@ -20,6 +20,7 @@ import (
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -83,6 +84,8 @@ type Server struct {
 	// (the invisible state behind the 27-restart field incident). Absent for
 	// deployments with no license configured at all.
 	licenseStatus func() license.LicenseHealth
+	// coldMissingObjects supplies the /health "tiering" field (#1551).
+	coldMissingObjects func() *tiering.ColdMissingObjectsStatus
 }
 
 // ServerConfig holds server configuration
@@ -108,7 +111,8 @@ type ServerConfig struct {
 	TLSKeyFile  string
 
 	// ClientRecorder, when set, receives the installation id + version
-	// of arcli clients (Arcli-Installation-Id header) for telemetry.
+	// of arcli and SDK clients (Arc-Client-Installation-Id, or arcli's
+	// legacy Arcli-Installation-Id header) for telemetry.
 	// nil (telemetry disabled) installs no middleware.
 	ClientRecorder ClientRecorder
 	// AuthRequired tells the client-identity middleware that the auth
@@ -169,7 +173,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id",
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id",
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)
@@ -179,7 +183,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// (request_encoding.go).
 	app.Use(rejectEncodedBodies)
 
-	// arcli installation ids for telemetry (see client_identity.go).
+	// Client (arcli, SDK) installation ids for telemetry (see client_identity.go).
 	if config.ClientRecorder != nil {
 		app.Use(clientIdentity(config.ClientRecorder, config.AuthRequired))
 	}
@@ -248,6 +252,13 @@ func (s *Server) RegisterRoutes() {
 // is nil (authentication disabled), preserving no-auth deployment behaviour.
 func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
 	s.app.Get("/api/v1/logs", withAdminAuth(authManager), s.logsHandler)
+}
+
+// SetColdMissingObjects wires the /health "tiering" field source: the last
+// check of cold tier rows whose object is gone (#1551). fn returns nil while
+// there is nothing to report, and the field is then absent.
+func (s *Server) SetColdMissingObjects(fn func() *tiering.ColdMissingObjectsStatus) {
+	s.coldMissingObjects = fn
 }
 
 // SetLicenseStatus wires the /health "license" field source.
@@ -360,6 +371,16 @@ func (s *Server) healthHandler(c *fiber.Ctx) error {
 	}
 	if s.licenseStatus != nil {
 		payload["license"] = s.licenseStatus()
+	}
+	if s.coldMissingObjects != nil {
+		// Counts only: /health is unauthenticated, so no paths (#1551).
+		if st := s.coldMissingObjects(); st != nil {
+			payload["tiering"] = fiber.Map{
+				"cold_rows_missing_objects":          st.Lost,
+				"cold_rows_missing_objects_hot_copy": st.HotCopy,
+				"cold_missing_checked_at":            st.CheckedAt,
+			}
+		}
 	}
 	return c.JSON(payload)
 }
@@ -628,14 +649,15 @@ func (s *Server) endpointMetricsHandler(c *fiber.Ctx) error {
 			"latency_avg_ms": queryLatencyAvgMs,
 		},
 		"buffer": fiber.Map{
-			"records_buffered":     snapshot["buffer_records_buffered"],
-			"records_queued":       snapshot["buffer_records_queued"],
-			"records_inflight":     snapshot["buffer_records_inflight"],
-			"records_written":      snapshot["buffer_records_written"],
-			"flushes_total":        snapshot["buffer_flushes_total"],
-			"errors_total":         snapshot["buffer_errors_total"],
-			"flush_failures_total": snapshot["buffer_flush_failures_total"],
-			"queue_depth":          snapshot["buffer_queue_depth"],
+			"records_buffered":      snapshot["buffer_records_buffered"],
+			"records_queued":        snapshot["buffer_records_queued"],
+			"records_inflight":      snapshot["buffer_records_inflight"],
+			"records_written":       snapshot["buffer_records_written"],
+			"records_dropped_total": snapshot["buffer_records_dropped_total"],
+			"flushes_total":         snapshot["buffer_flushes_total"],
+			"errors_total":          snapshot["buffer_errors_total"],
+			"flush_failures_total":  snapshot["buffer_flush_failures_total"],
+			"queue_depth":           snapshot["buffer_queue_depth"],
 		},
 		"storage": fiber.Map{
 			"writes_total":      snapshot["storage_writes_total"],

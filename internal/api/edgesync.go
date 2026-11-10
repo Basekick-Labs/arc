@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"strconv"
 	"time"
 
@@ -47,14 +48,19 @@ type SpokeSecretLookup func(ctx context.Context, spokeID string) (secret string,
 
 // EdgeSyncHandler serves the hub side of edge-to-cloud sync.
 type EdgeSyncHandler struct {
-	receiver     *edgesync.Receiver
-	reconciler   *edgesync.Reconciler
-	lookup       SpokeSecretLookup
-	replay       security.ReplayGuard
-	authManager  *auth.AuthManager
+	receiver    *edgesync.Receiver
+	reconciler  *edgesync.Reconciler
+	lookup      SpokeSecretLookup
+	replay      security.ReplayGuard
+	authManager *auth.AuthManager
+	// rbac decides a team-member token's write on the spoke's namespace
+	// (#1561). nil when no RBAC checker is wired (auth disabled).
+	rbac         RBACChecker
 	hubID        string
 	maxFileBytes int64
 	logger       zerolog.Logger
+	// writesStopped: see EdgeSyncHandlerConfig.WritesStopped.
+	writesStopped func() bool
 }
 
 // EdgeSyncHandlerConfig configures the handler.
@@ -81,7 +87,18 @@ type EdgeSyncHandlerConfig struct {
 	MaxFileBytes int64
 
 	AuthManager *auth.AuthManager
-	Logger      zerolog.Logger
+	// RBAC checks a token's write grant on the database and measurement a
+	// pushed file is served under ({spoke_id}, the spoke's database). Set
+	// with AuthManager; nil (no RBAC wired) leaves the coarse permissions to
+	// decide. Never assign a nil *auth.RBACManager here: the typed nil would
+	// pass the nil checks and then be called.
+	RBAC   RBACChecker
+	Logger zerolog.Logger
+
+	// WritesStopped, when set, reports whether the expired license's grace
+	// period stops ingestion (days 7-14); a pushed file is then refused like
+	// any live write. nil never refuses.
+	WritesStopped func() bool
 }
 
 // NewEdgeSyncHandler validates configuration and returns a ready handler.
@@ -115,10 +132,12 @@ func NewEdgeSyncHandler(cfg EdgeSyncHandlerConfig) (*EdgeSyncHandler, error) {
 		lookup:       cfg.SpokeSecrets,
 		replay:       cfg.Replay,
 		authManager:  cfg.AuthManager,
+		rbac:         cfg.RBAC,
 		hubID:        cfg.HubID,
 		maxFileBytes: cfg.MaxFileBytes,
 		// logger.Get already sets component; adding it again duplicates the key.
-		logger: cfg.Logger,
+		logger:        cfg.Logger,
+		writesStopped: cfg.WritesStopped,
 	}, nil
 }
 
@@ -155,14 +174,17 @@ func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 		return c.Next()
 	})
 
-	if h.authManager != nil {
-		// Write-level, not admin: these endpoints are ingest-shaped (a spoke
-		// pushes data files), and the ingest endpoints gate on RequireWrite.
-		// Requiring admin here would force every spoke to hold a credential
-		// that can also rotate tokens and delete data on the hub. The spoke
-		// presents the token from ARC_EDGE_SYNC_HUB_TOKEN.
-		group.Use(auth.RequireWrite(h.authManager))
-	}
+	// Write-level, not admin: these endpoints are ingest-shaped (a spoke
+	// pushes data files). Requiring admin here would force every spoke to
+	// hold a credential that can also rotate tokens and delete data on the
+	// hub. The spoke presents the token from ARC_EDGE_SYNC_HUB_TOKEN.
+	//
+	// The door admits a token holding write on anything, RBAC included, as
+	// the ingest routes do (#1559); each handler then checks the token's
+	// write grant on the namespace the files land in, {spoke_id} / the
+	// spoke's database (#1561), after the request MAC. nil authManager (auth
+	// disabled) is a passthrough.
+	group.Use(withAnyResourceWriteAuth(h.authManager, h.rbac))
 
 	group.Post("/file", h.receiveFile)
 	group.Post("/reconcile", h.reconcile)
@@ -175,6 +197,11 @@ func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 
 // receiveFile handles POST /api/v1/sync/file.
 func (h *EdgeSyncHandler) receiveFile(c *fiber.Ctx) error {
+	// A pushed file is ingestion: refused on grace days 7-14 of an expired
+	// license, as every live write is, before anything is read or stored.
+	if h.writesStopped != nil && h.writesStopped() {
+		return respondIngestRefused(c, ingest.ErrLicenseWritesStopped)
+	}
 	// Size check FIRST, before anything else touches the request.
 	//
 	// The Fiber app runs with StreamRequestBody=false, so fasthttp has already
@@ -278,6 +305,18 @@ func (h *EdgeSyncHandler) receiveFile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "hub ID mismatch",
 		})
+	}
+
+	// RBAC on the namespace the file lands in (#1561). After the MAC, so
+	// only a caller holding this spoke's secret learns anything from the
+	// answer; before Receive, so a refused file is neither stored nor
+	// reported already present.
+	measurement, err := spokeMeasurement(spokeID, filePath)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	if allowed, unavailable := h.pushAllowed(c, spokeID, measurement); !allowed {
+		return h.pushRefused(c, spokeID, measurement, unavailable)
 	}
 
 	// The body is fully buffered, not streamed: the Fiber app is constructed
@@ -398,8 +437,31 @@ func (h *EdgeSyncHandler) reconcile(c *fiber.Ctx) error {
 		})
 	}
 
-	res, err := h.reconciler.Reconcile(ctx, spokeID, req.Entries)
+	// Entries the token may not write are answered as missing without being
+	// looked up (#1561); the spoke then pushes them and /file refuses each
+	// one. Filtering rather than refusing the batch keeps one ungranted
+	// measurement from stalling the spoke's whole queue.
+	var allow edgesync.ReconcileAllow
+	if h.rbac != nil && auth.GetTokenInfo(c) != nil {
+		allow = func(p string) (bool, error) {
+			measurement, err := spokeMeasurement(spokeID, p)
+			if err != nil {
+				// Validation already ran, so this cannot happen; refuse
+				// rather than disclose if it ever does.
+				return false, nil
+			}
+			allowed, unavailable := h.pushAllowed(c, spokeID, measurement)
+			if unavailable {
+				return false, errPermissionStoreUnavailable
+			}
+			return allowed, nil
+		}
+	}
+	res, err := h.reconciler.ReconcileAllowed(ctx, spokeID, req.Entries, allow)
 	if err != nil {
+		if errors.Is(err, errPermissionStoreUnavailable) {
+			return h.pushRefused(c, spokeID, "", true)
+		}
 		if errors.Is(err, edgesync.ErrReconcileTooLarge) {
 			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
 				"error":       err.Error(),
@@ -453,6 +515,67 @@ type reconcileResponse struct {
 	Missing   []string            `json:"missing"`
 	Present   []string            `json:"present"`
 	Conflicts []edgesync.Conflict `json:"conflicts"`
+}
+
+// spokeMeasurement is the measurement RBAC checks a spoke path against:
+// the spoke's database segment (edgesync.SpokeNamespace). A root-level file
+// ({spoke_id}/x.parquet) sits in no measurement, so it needs write on the
+// whole spoke database, "*". Spoke discovery offers such files, so they are
+// checked, not refused.
+func spokeMeasurement(spokeID, sourcePath string) (string, error) {
+	_, measurement, err := edgesync.SpokeNamespace(spokeID, sourcePath)
+	if errors.Is(err, edgesync.ErrSpokePathNoMeasurement) {
+		return "*", nil
+	}
+	return measurement, err
+}
+
+// errPermissionStoreUnavailable: a reconcile could not read the token's
+// grants. Answered 503 so the spoke retries rather than reading a denial.
+var errPermissionStoreUnavailable = errors.New("permission store unavailable")
+
+// pushAllowed reports whether the request's token may write the spoke's
+// namespace: database {spoke_id}, measurement the spoke's database (see
+// edgesync.SpokeNamespace). unavailable is set when the grants could not be
+// read. With no RBAC wired or no token (auth disabled) the push is allowed:
+// the route door has already decided.
+func (h *EdgeSyncHandler) pushAllowed(c *fiber.Ctx, spokeID, measurement string) (allowed, unavailable bool) {
+	tokenInfo := auth.GetTokenInfo(c)
+	if h.rbac == nil || tokenInfo == nil {
+		return true, false
+	}
+	result := h.rbac.CheckPermission(&auth.PermissionCheckRequest{
+		TokenInfo:   tokenInfo,
+		Database:    spokeID,
+		Measurement: measurement,
+		Permission:  "write",
+	})
+	if result.Allowed {
+		return true, false
+	}
+	return false, result.Source == auth.SourceUnavailable
+}
+
+// pushRefused answers a push or reconcile the token may not make. An
+// unreadable permission store is 503 hub_unavailable, the hub's answer for
+// any hub-side failure; a denial is 403. On /file either one spends one of
+// the file's attempts on the spoke, as every non-success outcome does.
+func (h *EdgeSyncHandler) pushRefused(c *fiber.Ctx, spokeID, measurement string, unavailable bool) error {
+	if unavailable {
+		h.logger.Error().Str("spoke_id", spokeID).
+			Msg("Sync refused: the token's RBAC grants could not be read (fail closed)")
+		c.Set(fiber.HeaderRetryAfter, "30")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":  "hub temporarily unable to check permissions",
+			"reason": "hub_unavailable",
+		})
+	}
+	h.logger.Warn().Str("spoke_id", spokeID).Str("measurement", measurement).
+		Msg("Sync refused: the token has no write grant on this spoke's namespace")
+	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+		"error":  "no write permission for " + spokeID + "." + measurement,
+		"reason": "permission_denied",
+	})
 }
 
 func orEmpty(s []string) []string {
@@ -542,10 +665,10 @@ func (h *EdgeSyncHandler) writeOutcome(c *fiber.Ctx, res *edgesync.PutResult) er
 
 // RegistrySpokeSecrets adapts a spoke registry to the lookup the handler needs.
 //
-// Every failure — unregistered, disabled, or an undecryptable secret — is
-// collapsed into a single `false`. The handler turns that into the same 401 a
-// bad MAC produces, so an attacker cannot use the response to learn which
-// spoke IDs exist. The reason is logged hub-side, where an operator can see it.
+// Every failure — unregistered, disabled, colliding, or an undecryptable
+// secret — is collapsed into a single `false`. The handler turns that into the
+// same 401 a bad MAC produces, so an attacker cannot use the response to learn
+// which spoke IDs exist. The reason is logged hub-side for the operator.
 func RegistrySpokeSecrets(reg *edgesync.Registry, logger zerolog.Logger) SpokeSecretLookup {
 	return func(ctx context.Context, spokeID string) (string, bool) {
 		secret, err := reg.Secret(ctx, spokeID)
@@ -560,7 +683,13 @@ func RegistrySpokeSecrets(reg *edgesync.Registry, logger zerolog.Logger) SpokeSe
 			// endpoints keep returning 200 with a full spoke list because
 			// metadata is not encrypted. Without this branch the hub looks
 			// healthy while nothing can authenticate.
-			if errors.Is(err, edgesync.ErrSpokeNotFound) || errors.Is(err, edgesync.ErrSpokeDisabled) {
+			if errors.Is(err, edgesync.ErrRegisteredSpokeCollides) {
+				// A registered spoke refused because another enabled ID shares
+				// its directory on this storage (#740): the operator has to act,
+				// and only a registered ID gets here, so it is not attacker-driven.
+				logger.Warn().Err(err).Str("spoke_id", spokeID).
+					Msg("Sync refused: this spoke ID shares a directory with another registered ID on this storage; delete or disable one of them")
+			} else if errors.Is(err, edgesync.ErrSpokeNotFound) || errors.Is(err, edgesync.ErrSpokeDisabled) || errors.Is(err, edgesync.ErrSpokeIDCollision) {
 				logger.Debug().Err(err).Str("spoke_id", spokeID).Msg("Spoke secret lookup failed")
 			} else {
 				logger.Warn().Err(err).Str("spoke_id", spokeID).

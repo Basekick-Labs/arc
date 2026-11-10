@@ -2,6 +2,1339 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
+
+`wal.ack_mode` now defaults to `"auto"`, which is `"durable"` on every node
+with `wal.enabled = true`: a 2xx means a sync covering the write's WAL entry
+has completed, so a crash loses no acknowledged write. Before, the default was
+`"queued"`: a write was acknowledged once its entry was queued for the WAL
+writer, and a kill -9 right after the acknowledgement could lose it. #1492's
+crash harness lost the last acknowledged request, 50,000 rows, in one of seven
+runs that way. Nothing in `arc.toml` or the docs' defaults said that "WAL on"
+did not mean "acknowledged means durable"; now it does.
+
+`"auto"` resolves to `"queued"` where durable is not available: with the WAL
+off (the key has no effect) and where `cluster.wal_coverage = true` is in
+effect, on a clustered local-storage writer (experimental,
+[#1207](https://github.com/Basekick-Labs/arc/issues/1207)), whose covered append
+commits under the ingest shard lock, where a durable wait would stall every
+writer to the measurement. A standalone node with the key set ignores it and
+stays durable. The coverage case is logged as a config warning; the resolved
+mode is in the `WAL enabled` startup line (`ack_mode`, `ack_mode_auto`).
+Setting `wal.ack_mode = "queued"` restores the old behaviour; `"durable"`
+with `cluster.wal_coverage` is still refused at startup.
+
+What changes with the WAL on:
+
+- **Latency.** Each request waits for the sync that covers its entry, about
+  one `fsync` (shared between the requests in flight: a durable entry starts a
+  sync at once, it does not wait for the 100 ms interval). Sequential small
+  writers feel it most. Measured on an M3 Max (`fdatasync` falls back to a
+  full `fsync` there), 8.7M rows of MessagePack columnar writes: 50,000-row
+  requests from one client 4.7M rows/s → 2.9M rows/s; 5,000-row requests from
+  one client 2.8M → 0.66M rows/s; 5,000-row requests from eight clients 9.4M →
+  2.4M rows/s. Throughput-first benchmarks should set `wal.ack_mode =
+  "queued"` to stay comparable with earlier numbers.
+- **A write the WAL cannot make durable is refused**, with `503`,
+  `Retry-After` and `X-Arc-Ingest-Refused: wal_not_durable`, counted in the
+  new `arc_wal_not_durable_rejections_total`. Before, the write was
+  acknowledged and the entry dropped (`arc_wal_dropped_entries_total`) or
+  lost at the crash. The refusal comes after the append: the entry may still
+  reach the WAL file and replay at the next start, so a client's retry can
+  duplicate rows (at-least-once). A request spanning several measurements is
+  written one at a time; a failure after some were buffered answers `500`
+  naming what was written, as for other refusals.
+- **A stalled WAL device refuses writes instead of losing them.** With
+  `"queued"`, a hung disk meant the WAL queue filled, entries were dropped and
+  ingest kept answering 204 for writes that were never durable. With
+  `"durable"` a request waits for its sync for at most
+  `wal.ack_timeout_seconds` (default 30; `0` = no bound,
+  [#1501](https://github.com/Basekick-Labs/arc/issues/1501)); past that it is
+  refused (`503`, `wal_not_durable`) and its WAL entry retracted without
+  waiting on the device, so the client retries and nothing is left pinned.
+  The disk-pressure gate (#676) covers low free space, not a hung device.
+  Watch `arc_wal_durable_ack_timeouts_total` (a stalled device),
+  `arc_wal_failed_syncs_total` (a failing one),
+  `arc_wal_not_durable_rejections_total` and the `wal_not_durable` refusal
+  log. The HTTP request context plays no part: in Fiber it has no deadline
+  and ends only at server shutdown.
+- **MQTT.** While the WAL refuses writes as not durable (a timed-out or failed
+  sync: the device is stalled or failing), MQTT subscriptions are suspended,
+  as they are for a fence, WAL disk pressure and a full buffer
+  ([#1502](https://github.com/Basekick-Labs/arc/issues/1502)), and resume
+  once a sync succeeds; the writer syncs the WAL file once a second
+  meanwhile, so an idle node recovers too. With `clean_session=false`
+  and QoS 1 or 2 the broker holds the messages. The message in flight when
+  the refusal starts is still briefly retried and then dropped, as for the
+  other reasons, and a merely slow device alternates between suspended and
+  resumed at about the ack timeout. `arc_wal_durable_ack_failing` is 1 while
+  the state holds.
+- **The shipped examples that enable the WAL** (`deploy/docker-compose/`
+  `oss-local`, `oss-s3`, `oss-traefik` and `enterprise-shared`, and
+  `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
+  WAL off.
+
+## Fix: every read sent to a compactor is answered by a reader, and `/api/v1/queries` covers what it forwarded
+
+A compactor answered several reads itself, from its own storage and field
+schema, instead of forwarding them as it forwards `/api/v1/query`. It now
+forwards them all:
+
+- `POST /api/v1/query/estimate`
+- `GET /api/v1/query/:measurement`
+- `GET /api/v1/measurements`
+- `GET /api/v1/databases/:database/measurements/:measurement/schema`
+- `GET /api/v1/databases`, `GET /api/v1/databases/:name` and
+  `GET /api/v1/databases/:name/measurements`
+
+Forwarding rules are the same as for Arrow queries (next section). The
+target must advertise `forward_read_queries_v1`. While nodes exist but none
+does, the compactor answers itself; with no reader or writer at all it
+answers 503. Forwarded estimates and `GET /api/v1/query/:measurement` are not
+cut by `cluster.route_timeout`. The listings are bounded at 30 s, as they are
+locally.
+
+**`/api/v1/queries` on a compactor** (licensed query management) now lists
+the queries it forwarded:
+
+- `/api/v1/query`, `/query/msgpack`, `/query/arrow`, estimates and
+  `GET /api/v1/query/:measurement`.
+- Each entry carries `forwarded_to`, the node it was sent to.
+- `DELETE /api/v1/queries/:id` cancels the forward. That stops the query on the
+  answering node when it cancels queries on client disconnect
+  (`query.cancel_on_client_disconnect`, on by default).
+- The entry's ID is the compactor's. A forwarded response's `X-Arc-Query-ID`
+  header carries that ID, so it can be cancelled on the compactor. The
+  answering node's ID is in `X-Arc-Forwarded-Query-ID`.
+- History records whether the forward succeeded, not a row count.
+- A client that disconnects from a compactor now also cancels its forwarded
+  read, as it cancels a local one, with or without query management.
+
+`POST /api/v1/databases` (create) still runs on the compactor; it is a write.
+
+## Fix: Arrow queries sent to a compactor are answered by a reader ([#1567](https://github.com/Basekick-Labs/arc/issues/1567))
+
+A node that cannot serve queries (a compactor) forwarded `POST /api/v1/query`
+and `/api/v1/query/msgpack` to a reader, but ran `POST /api/v1/query/arrow`
+itself. The Arrow endpoint now forwards too, so query load stays off
+compactors whichever endpoint a client uses.
+
+A forwarded Arrow result is streamed, not buffered, and keeps its trailers:
+
+- `Arc-Stream-Truncated`
+- `Arc-Rows-Capped`
+- `Arc-Execution-Time-Ms`
+
+So a client sees a truncated or capped result as such, as it does when it asks
+the reader directly. `cluster.route_timeout` does not apply to the stream:
+that 5-second default would cut any longer result. The answering node bounds
+the query, with its query timeout and any governance limit on the token. The
+compactor only bounds the wait for the answer to start, by its own query
+timeout plus 30 s.
+
+If the answering node fails partway through, the forwarded response ends as a
+broken transfer (the connection closes before the end of the body), not as a
+short result that looks complete.
+
+**Rolling upgrades.** A compactor forwards an Arrow query only to nodes that
+advertise the new `forward_read_queries_v1` capability: readers, or writers
+when the cluster has no readers. While nodes exist but none advertises it, it
+runs the query itself, as before. With no reader or writer at all it answers
+503, as `/api/v1/query` does.
+
+A routing error no longer includes the peer's internal address in the
+response body. A failed forward now answers "Failed to route request to
+cluster node"; "no reader/writer available" keeps its own message.
+
+The other read endpoints are forwarded too; see the previous section.
+
+## Fix: forwarded responses keep every value of a repeated header ([#1556](https://github.com/Basekick-Labs/arc/pull/1556))
+
+When a cluster node forwards a request to another node, the response
+returned to the client kept only the last value of an end-to-end header that
+appeared more than once (`Vary`, `Link`, `WWW-Authenticate`, …). Every value
+now reaches the client, in order. `Set-Cookie` was not affected. A header
+both nodes set, such as `Access-Control-Allow-Origin`, is still sent once,
+with the answering node's value.
+
+Thanks to [@lecodev-26](https://github.com/lecodev-26) for the fix.
+## Fix: a token limited to some databases can list them ([#1562](https://github.com/Basekick-Labs/arc/issues/1562))
+
+Listing every database required a read grant covering every database, so a
+token whose RBAC role names specific databases got 403 from
+`GET /api/v1/databases`, from `SHOW DATABASES`, and from
+`GET /api/v1/measurements` without `?database=`, even though it could query
+its databases. (2026.09.3 introduced that bar when these listings gained RBAC.)
+
+These listings now show each caller the databases it can read something in:
+
+- **What a scoped token sees:** a token limited to some databases sees those
+  databases and no others. A token whose role is limited to some measurements
+  sees every database its role's database pattern matches, as
+  `GET /api/v1/databases/:name` already answered for each of them; a database
+  where it can read none of the measurements shows `measurement_count` 0.
+- **Counts:** in `GET /api/v1/databases`, `measurement_count` counts only the
+  measurements the caller can read, as `GET /api/v1/databases/:name` already
+  did.
+- **Unchanged for full access:** a token that can read every database, a token
+  that is in no team, and any request with auth disabled see the full list,
+  as before.
+- **No read grant anywhere:** still 403.
+- **Grants unreadable:** if the permission store cannot be read, the listings
+  answer 503 instead of an empty list.
+- **Other endpoints:** `SHOW DATABASES` sent to `/api/v1/query/estimate` or
+  `/api/v1/query/arrow` answers 400 "use /api/v1/query" for every caller.
+  Before, a token without the all-databases grant got 403 there.
+
+## Fix: edge-sync pushes are decided by RBAC on the spoke's database ([#1561](https://github.com/Basekick-Labs/arc/issues/1561))
+
+The edge-sync hub endpoints (`POST /api/v1/sync/file` and
+`/api/v1/sync/reconcile`) checked only the token's own `write` permission and
+no RBAC grant. A push also needs the spoke's HMAC secret, and a pushed file
+always lands in that spoke's namespace, which queries read as database
+`{spoke_id}` with the spoke's own database as the measurement
+(`FROM "rocket-01".metrics`). So a token in an RBAC team was not limited by
+its team's grants there, unlike on every other ingest endpoint.
+
+Both endpoints now check the token's `write` grant on that pair, after the
+request's signature is verified and before anything is stored:
+
+- **`/file`:** a push the token may not make is refused with 403 and
+  `"reason":"permission_denied"`, and nothing is stored.
+- **`/reconcile`:** a file the token may not write is reported as missing,
+  without looking up whether the hub holds it. The other files in the batch are
+  answered as usual, so a spoke with one ungranted measurement keeps syncing
+  the rest.
+- **Admission:** the endpoints admit a token whose access comes only from RBAC,
+  as the other ingest endpoints do since #1559.
+- **Tokens in no team:** unchanged. Their own `write` permission decides, as
+  before.
+- **Root-level spoke files:** a file at the root of a spoke's storage
+  (`x.parquet`) is in no measurement, so it needs `write` on the whole
+  database `{spoke_id}`. A grant on one measurement is not enough.
+
+**What operators may see.** A spoke whose token is in a team without a
+`write` grant on its namespace now gets 403 on those files. Each 403 counts
+against the file's attempts (five by default), after which the spoke stops
+offering it. Grant the team `write` on database `{spoke_id}` (or the spoke's
+database as the measurement), then requeue the files with
+`POST /api/v1/spoke-sync/ledger/requeue` on the spoke. Giving the spoke a
+token that is in no team also works.
+
+If the hub cannot read the permission store, the endpoints answer 503
+`hub_unavailable`. A spoke treats that like any other hub-side failure.
+
+## Fix: tokens whose access comes from RBAC can query and ingest ([#1559](https://github.com/Basekick-Labs/arc/issues/1559))
+
+A token with no permissions of its own, given access through an RBAC team
+(`POST /api/v1/auth/tokens` with `permissions: []`), was refused with 403 by
+the query and ingest endpoints, even though RBAC granted the access,
+`GET /api/v1/databases` accepted it, and
+`GET /api/v1/auth/tokens/:id/permissions` reported the grant. These
+endpoints first checked the token's own `read` or `write` permission and did
+not ask RBAC. A token could therefore only be limited by RBAC if it also held
+that permission.
+
+The endpoints now admit a token that holds the permission anywhere,
+through RBAC or its own permissions. Each endpoint then checks every table a
+query reads and every measurement a write names, as before:
+
+- `POST /api/v1/query`, `/api/v1/query/msgpack`, `/api/v1/query/arrow` and
+  `/api/v1/query/estimate`
+- `GET /api/v1/measurements`, `GET /api/v1/query/:measurement` and
+  `GET /api/v1/databases/:database/measurements/:measurement/schema`
+- `POST /write`, `/api/v2/write`, `/api/v1/write/line-protocol`,
+  `/api/v1/write/msgpack` and `/api/v1/write/tle`
+
+Tokens that are in no team are unchanged: their own permissions decide, as
+they always have.
+
+**Behaviour change for team members.** A token in a team is decided by RBAC
+on these endpoints, as it already was for every table and measurement. A
+token that holds `read` itself but whose teams grant `read` on nothing is now
+refused before the query runs. Before, it got through, every table it named
+was refused, and only a query with no table (`SELECT 1`) succeeded. The same
+applies to `write`. A health check that runs `SELECT 1` with such a token
+gets 403: grant its team `read`, or use a token that is in no team.
+
+**When the permission store cannot be read** (the SQLite database holding
+tokens and RBAC grants), these endpoints now answer 503 "Permission store
+unavailable" once a token's cached grants expire, for every token except
+admin tokens. Before, a token that is in no team kept passing this first
+check, because it never read the store. The store is not bypassed for such
+a token, because it might have been added to a team.
+
+**Rolling upgrades.** A request forwarded to a node that has not been
+upgraded yet is checked by that node the old way, so an RBAC-only token can
+see a 403 until every node runs this version.
+
+The edge-sync hub endpoints moved to RBAC as well; see
+"Fix: edge-sync pushes are decided by RBAC on the spoke's database"
+([#1561](https://github.com/Basekick-Labs/arc/issues/1561)).
+
+## New: cold tier files deleted outside Arc are reported ([#1551](https://github.com/Basekick-Labs/arc/issues/1551))
+
+A cold tier object deleted outside Arc, for example by a bucket lifecycle or expiry rule, used to show up only as a `Warn` line in each tier scan. Queries over that data still answer `200` with the rows that remain (this is unchanged, #1364), so nothing an operator monitors reported the gap.
+
+At the end of each cold-tier metadata sync, Arc now checks again each cold row whose object the listing did not return: it stats the cold object, re-reads the row and stats the hot copy, so an object written or a row retired while the sync ran is not counted. It reports:
+
+- `arc_tiering_cold_rows_missing_objects`: rows with no cold object and no hot copy. These files cannot be read and nothing in Arc restores them. Alert on this one. Arc also logs an `Error` with a sample of paths.
+- `arc_tiering_cold_rows_missing_objects_hot_copy`: rows whose cold object is gone while the hot copy is still read. No data is missing.
+- `GET /api/v1/tiering/status` → `cold_missing_objects` (`lost`, `hot_copy`, `unchecked`, `sample`, `checked_at`).
+- `/health` → `tiering` with the two counts and the check time, no paths.
+
+Notes:
+
+- Reported on standalone nodes and on the cluster's primary writer only. A reader keeps the cold rows of files the primary deleted ([#1563](https://github.com/Basekick-Labs/arc/issues/1563)), so there it would report every normal DELETE or retention as missing; the fields are absent on readers, and the gauges are 0 (on a demoted primary, from its next sync). A reader promoted by failover can report the rows it inherited until #1563 is fixed.
+- A sync that overlaps a cold DELETE, retention run or database delete keeps the previous result rather than count rows that run is about to retire. A DELETE or retention whose row retirement failed (it logs that) leaves rows that are counted as lost until a later run retires them.
+- At most 1,000 rows, within 30 seconds, are checked per sync, in no fixed order; the rest are reported as `unchecked`. A check that could not examine every row never lowers the lost count: it keeps the previous result, so an alert clears only once a check has seen every row.
+- The fields are absent, and the gauges 0, until the first cold sync after startup. With the default `migration_schedule` that sync runs at startup and then daily.
+- Do not apply lifecycle or expiry rules, or deletes outside Arc, to Arc's cold prefix. Remove data through Arc (DELETE, retention, database delete) so its rows are retired with it.
+
+## Fix: recent-data queries keep working while the cold tier is unreachable, on standalone nodes ([#1550](https://github.com/Basekick-Labs/arc/issues/1550))
+
+When the cold tier could not be listed (expired or missing credentials, a
+network failure, an unreachable endpoint), a query on any measurement with
+data in the cold tier failed, even if its time range only covered hot data.
+Arc tried to check the cold tier for every partition in the range and then
+read those it could not check, which hit the same error. A cold-tier outage
+took down recent-data dashboards along with archive queries.
+
+On a standalone node, Arc now uses its tier metadata when the cold tier cannot
+be listed. If no cold file is recorded for the query's time range, the read
+leaves the cold tier out and answers from hot data. The query fails as before
+in every other case:
+- cold files are recorded for the range, so the answer would be incomplete;
+- the metadata lookup fails;
+- the query has no time range and the measurement has cold data;
+- a listing that did answer found cold data the metadata does not record.
+
+Arc only uses this shortcut while its tier metadata is a complete record of
+the cold tier:
+- **Never on a node configured for a cluster.** This covers
+  `cluster.enabled` and `cluster.shared_storage_mode`, including a node whose
+  cluster coordinator did not start. Cluster nodes keep the previous
+  behaviour ([#1552](https://github.com/Basekick-Labs/arc/issues/1552)).
+- **Only after a complete cold-tier metadata sync on this version.** The sync
+  must record every cold object against the node's current database. A new,
+  lost or moved database starts without that record.
+- **Not after a metadata restore,** until the next complete sync. The
+  restored rows predate files migrated since the backup.
+- **Not during or after a data restore on a node with a cold tier,** until
+  the next complete sync. This holds even when the restore succeeds.
+- **Not after a sync that could not record some cold objects,** until a later
+  complete sync. This includes a `.parquet` object under a measurement with
+  cold data whose key Arc cannot parse. A failure that repeats on every sync
+  keeps the shortcut off. The warning it logs names sample objects.
+
+A quarantined cold row counts as cold data for the range: its object is still
+read on a healthy cold tier, so the read keeps the cold tier and fails.
+
+If a data restore cannot record that the tier metadata may become incomplete
+(neither the marker file next to the database nor the database itself can be
+written), the restore is refused before it writes anything.
+
+`GET /api/v1/tiering/status` reports the state as
+`cold_metadata.authoritative`, with the reason when it is false.
+
+**Upgrading:** the shortcut is available only after the first complete
+cold-tier metadata sync on this version. That sync runs with the startup tier
+scan. A node whose cold tier is already unreachable when it starts on this
+version keeps the previous behaviour until the cold tier is reachable again.
+
+Other changes:
+- **Fewer timeouts during an outage.** On a node where the shortcut is
+  available, once a cold-tier listing fails, Arc stops listing the cold tier
+  for the rest of that read. An unreachable cold endpoint then costs one
+  listing timeout (5 s) per tiered measurement in each query, instead of one
+  per day in the range. Arc does not remember the failure between queries, so
+  each query pays it again. Cluster nodes, nodes whose metadata is not yet
+  trusted, and hot-tier listings are unchanged.
+- **Visibility.** Each read that leaves the cold tier out this way increments
+  `arc_query_cold_unlisted_skipped_total`. Arc also logs a warning at most
+  once a minute per measurement.
+- **Not cached.** These reads are not cached, so the cold tier is read again
+  as soon as it can be listed.
+
+Thanks to [@officialasishkumar](https://github.com/officialasishkumar) for the
+first fix of this issue in
+[#1553](https://github.com/Basekick-Labs/arc/pull/1553). Its unverified
+listing outcome and its 403-backed S3 test shaped this one.
+
+## Fix: names that differ only in case stay apart on case-insensitive volumes ([#1509](https://github.com/Basekick-Labs/arc/issues/1509))
+
+On a volume that does not distinguish names by case (macOS APFS by default,
+Docker Desktop bind mounts from a Mac, NTFS), `cpu` and `CPU` were one
+directory. A write, query or delete under either name acted on the same
+files, while permissions matched names exactly. Arc now checks the local
+storage volume at startup. If it folds names, a database or measurement is
+only accepted in the spelling it already has on disk:
+- **Ingest** to another spelling of an existing database or measurement is
+  refused and reported like other unstorable names, before anything reaches
+  the WAL. Two first writes racing with different spellings can't both win,
+  first writes racing with the same spelling are all accepted, and a write
+  refused for its columns or values doesn't claim a spelling.
+- **Queries** are refused with a 400 that names the existing spelling.
+  Before, `FROM CPU` on a Mac returned `cpu`'s rows. On such a volume,
+  rewritten SQL is no longer cached, so a spelling accepted before another
+  one existed is checked again on every query.
+- **Database get, create and delete** under another spelling are refused
+  with a 400 before anything else runs.
+- **Measurement deletes, retention and listings** under another spelling
+  are refused instead of acting on the existing directory.
+
+Linux filesystems, S3 and Azure are unaffected, and the check is skipped
+there. If the startup check itself fails (for example a read-only storage
+root), Arc assumes names fold. A startup warning says when case folding was
+detected. To keep names that differ only by case, use a case-sensitive
+volume.
+
+**Upgrading on macOS:** a retention policy, continuous query or client that
+names a database or measurement in a different case from its directory now
+fails instead of acting on that directory. Check them after upgrading.
+Retention that fails lets disk usage grow.
+
+Known limits:
+- Only ingest is checked on the write side. Restores, edge-sync imports,
+  cluster file replication and WAL replay write what they were given.
+- Several nodes sharing one case-insensitive network volume are not
+  coordinated with each other.
+- An empty measurement directory removed by a cleanup while its rows are
+  still buffered can be re-created in another spelling before those rows
+  flush. The rows then land in that directory.
+- Data already stored under mixed spellings before the upgrade isn't
+  migrated. With tiering, files moved to a case-sensitive cold store under
+  the other spelling are not reachable by either name.
+
+## Docs: the cluster trust model is written down ([#1510](https://github.com/Basekick-Labs/arc/issues/1510))
+
+A new `SECURITY.md` explains how to report a vulnerability privately and what
+the cluster's shared secret guarantees. Every node holding
+`cluster.shared_secret` is a fully trusted member, and a node ID in a peer
+message is a claim, not a proven identity. Cluster TLS with a CA proves that
+a peer belongs to the cluster, not which node it is.
+- **Code comments** that described some peer checks as authenticating the
+  sender now call them what they are: consistency checks on the node ID
+  the request claims.
+- **The startup warning** for cluster TLS without `cluster.tls_ca_file` now
+  says that client certificates are not verified and that cluster
+  membership, not node identity, rests on the shared secret.
+- **A new Info log** appears when a standby's origin-stream session is
+  replaced by a connection from a different address. The replacement itself
+  is unchanged: the primary cannot tell a live session from a half-open one,
+  and a standby that restarts with a new address must still be able to
+  reconnect.
+
+Per-node peer identity remains open in #1510.
+
+## Security: Arc's internal SQL placeholder text is reserved
+
+Before its checks, Arc swaps string literals, quoted names and some keywords
+for generated placeholders, for example the `FROM` inside
+`EXTRACT(YEAR FROM time)`. It restores them by matching their text once the
+checks have run. Text a caller wrote that matched a placeholder was restored
+too, so the statement that ran could differ from the one that was checked.
+- **Queries** are refused with a 400 when `__STR_`, `__IDENT_` or
+  `__FROM_MASK_` appears outside a string literal or quoted identifier,
+  comments included. The
+  rule also catches text that only forms once a literal is masked. Inside a
+  literal or quoted name these sequences remain ordinary data. The check
+  runs on every query endpoint, including continuous queries, and the FROM
+  part runs again inside the storage-path rewrite.
+- **DELETE `WHERE` clauses** follow the same rule. Before, they had no such
+  check.
+- **Database names**, including the `x-arc-database` header, also refuse
+  `__FROM_MASK_`, in addition to the existing `__STR_` and `__IDENT_`.
+- **The DELETE time pin** used with stream takeover restores each string
+  literal once, where it was. Before, it replaced every copy of the
+  literal's placeholder text.
+- **The storage-path rewrite** restores `FROM` keywords before it inserts
+  storage paths, so a path is never read by that restore.
+
+Matching is exact and case-sensitive, as the restore itself is. Queries that
+don't contain these sequences outside literals are unaffected.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
+
+## Ingest: Parquet row groups capped at 524,288 rows (page index available, off)
+
+Each ingest flush used to become one Parquet row group (arrow-go's default cap is
+64 Mi rows), so an hourly file was a single 3.3 M-row group: no row-group
+min/max pruning inside the file, and one unit of parallel decode per file for
+every reader. Ingest now caps row groups at 524,288 rows. Measured on the
+sustained msgpack benchmark (iot, 12 workers, 60 s, 5 M-row flushes) this cap
+is free — 36.9 M rec/s against 36.1 M on the previous build, within run-to-run
+noise — where compaction's 122,880 cost 1.7 % alone and 3.7 % together with the
+page index. Through the arcx engine on 40 M rows, a time-ordered
+`ORDER BY time DESC LIMIT 100` with a tag filter goes from 70 ms to 5 ms, an
+hourly `date_trunc` bucket from 67 to 58 ms, filtered scans 10–20 % faster;
+DuckDB gains less because it prunes fewer shapes by row-group statistics.
+
+The Parquet page index (column and offset index) can be written too, but it is
+off by default: nothing in Arc reads it yet, and its write cost grows with the
+row-group count (−3.7 % at 41 groups per flush). Compaction's DuckDB `COPY`
+does not preserve it, tiering moves files whole, and continuous-query output
+and `/api/v1/import` go through the same writer and get both settings. The
+column index needs `write_statistics = true` (the default); the offset index
+is always written when enabled. Values of `max_row_group_rows` between 1 and
+1023, or negative, are rejected at startup.
+
+```toml
+[ingest]
+max_row_group_rows = 524288   # 0 restores one row group per flush; 122880 matches compaction (−1.7 % sustained ingest)
+write_page_index = false      # true writes column + offset indexes (no reader in Arc yet)
+```
+
+Env vars: `ARC_INGEST_MAX_ROW_GROUP_ROWS`, `ARC_INGEST_WRITE_PAGE_INDEX`.
+Measurements: plannings `Arc/Arc_research_ingest_writer_knobs.md`.
+
+## arcx router: arithmetic and more predicates in `HAVING` route to the engine
+
+These `HAVING` forms now route to the arcx engine (arcX feat/res-3c):
+- arithmetic: `+`, `-`, `*`, `/`, unary minus and parentheses, over aggregates (selected or not),
+  aggregate aliases and numeric literals: `HAVING sum(bytes) / count(*) > 1024`,
+  `HAVING max(x) - min(x) > 10`, `HAVING (count(*) + 1) * 2 BETWEEN 4 AND 10`;
+- scientific-notation literals (`HAVING count(*) > 1e3`, `2.5E-1`);
+- `IS DISTINCT FROM` and `IS NOT DISTINCT FROM`, against a literal, `NULL`, another aggregate or
+  an expression;
+- `IS TRUE`, `IS NOT TRUE`, `IS FALSE` and `IS NOT FALSE` on `bool_and` / `bool_or`;
+- `LIKE` and `NOT LIKE` with a string pattern, on the tag column.
+
+The engine types and evaluates arithmetic the way DuckDB 1.5.6 does: exact 64- and 128-bit
+integers, exact decimals, `/` always a double, and DuckDB's own rounding when it converts a
+128-bit sum or a decimal to a double. An integer overflow sends the query back to DuckDB, which
+reports it, as before.
+
+These forms still run on DuckDB:
+- `%`, `//` and `^`; a negative-zero (`-0e0`) or out-of-range (`1e400`) scientific literal;
+- arithmetic over the tag column, the time bucket, `min`/`max` of the time column, `bool_and` /
+  `bool_or` or `regr_count`;
+- two float-accumulated aggregates in one comparison (`sum(x) - sum(y) > 0`), or one of them added
+  to or subtracted from another aggregate (`avg(x) - max(x) < 0`, `avg(x) + count(*) > 3`).
+  DuckDB 1.5.6's value for these depends on the thread count, and a subtraction turns those last
+  digits into the sign of the answer: `sum(x) - sum(y) > 0` returned between 7 and 15 groups across
+  runs of the same query. Multiplying or dividing one of them (`sum(bytes) / count(*) > 1024`,
+  `avg(x) * 2 > 5`) routes. The router counts `sum` as float-accumulated because it cannot tell
+  an integer `sum` from a float one;
+- a comparison with aggregates on both sides when any of them is float-accumulated, as for a plain
+  aggregate-vs-aggregate comparison;
+- a decimal past 2^53 with a fractional part converted to a double (`sum(i) + 0.5 > max(x)` with
+  sums above about 10^15): DuckDB 1.5.6 and 2.0 round it differently, so the engine sends the
+  query back;
+- the literal `-9223372036854775808` next to arithmetic: DuckDB 1.5.6 answers `max(x) * -1 >
+  -9223372036854775808` as false for every group;
+- `ORDER BY` an expression or an aggregate that is not in the select list.
+
+## arcx router: more `HAVING` forms route to the engine
+
+These `HAVING` forms now route to the arcx engine (arcX feat/having-grammar):
+- an aggregate that is not in the select list, including a select list with no aggregate at
+  all: `SELECT host FROM cpu GROUP BY host HAVING count(*) > 100`. The engine computes it and
+  leaves it out of the result;
+- `NOT`, at any depth;
+- `IS NULL` and `IS NOT NULL`;
+- `BETWEEN` and `NOT BETWEEN` with literal bounds;
+- `IN` and `NOT IN` with a list of literals;
+- a literal on the left (`100 < count(*)`);
+- one aggregate compared with another (`count(*) > max(retries)`, `max(x) > min(x)`,
+  `bool_and(ok) <> bool_or(ok)`), or a time bucket compared with `min`/`max` of its own
+  time column.
+
+An aggregate compared with another aggregate routes only when both sides are exact:
+`count`, `count_if`, `regr_count`, `min`, `max`, the bitwise and Boolean aggregates, and
+`quantile_disc`. The time bucket can be compared with `min`/`max` of its own time column. A tag
+column compared with an aggregate stays on DuckDB.
+
+`avg`, `sum`, the variance family, `median`, `quantile_cont`, `mad`, the Kahan sums, the
+regression and correlation aggregates, `skewness`/`kurtosis` and `arg_max`/`arg_min` stay on
+DuckDB in that position. DuckDB 1.5.6 accumulates those in floating point, and the last digits
+depend on how many threads ran the query. On 3 million rows of a constant 0.1, `avg(x)` came out
+above `max(x)` with 1 thread, below it with 4, and above it again with 14, so neither engine has a
+stable answer to compare.
+
+These forms still run on DuckDB:
+- `ORDER BY` an aggregate that is not in the select list (shadow mode cannot check an order whose
+  values are not in the result);
+- `IN` with `NULL` or a column in the list;
+- an aggregate that is not in the select list and that is grouped by a tag column, when the same
+  aggregate would stay on DuckDB if selected (the variance family, order statistics, regression
+  aggregates, predicate aggregates).
+
+When a hidden integer `sum` overflows 64 bits, the engine sends the query back to DuckDB, which
+computes the `HAVING` in 128 bits. In a query that has a hidden aggregate, an overflow in a selected
+sum is also sent back; DuckDB then reports the overflow, as before.
+
+A float aggregate compared with a literal equal to a constant group's value (`HAVING avg(x) > 0.1`
+over a gauge stuck at 0.1) can be answered either way by DuckDB itself, depending on the thread
+count. This was possible since the `HAVING` change below and is easier to reach now that the
+aggregate does not have to be selected. Shadow mode can report it as a mismatch.
+
+## arcx router: `HAVING` routes over every aggregate the engine serves
+
+A grouped query's `HAVING` now routes to the arcx engine for every aggregate the engine serves
+(arcX feat/having-all-aggs). Until now the router sent these to DuckDB:
+- `median`, `quantile_cont`, `quantile_disc`, `quantile` and `mad`;
+- `skewness`, `kurtosis` and `kurtosis_pop`;
+- `bool_and` / `bool_or`, bare (`HAVING bool_and(ok)`) or compared with `= TRUE`, `= FALSE`,
+  `<> TRUE` or `<> FALSE`;
+- `count_if`, `bool_and` and `bool_or` with a predicate argument (`HAVING count_if(status >= 500)
+  > 10`), when written the same way as in the select list;
+- a decimal literal (`HAVING count(*) > 2.5`, `HAVING avg(value) > 0.25`);
+- an aggregate's alias (`count(*) AS n … HAVING n > 100`).
+
+A decimal compared with a whole-number aggregate (`count`, `sum`, `min` or `max` of a `BIGINT`,
+`regr_count`) is compared exactly, as DuckDB does, without going through floating point. The same
+applies to `WHERE`: `WHERE status > 2.5` on a `BIGINT` column now runs on the engine instead of
+falling back. An alias in `HAVING` is resolved the way DuckDB 1.5.6 resolves it. A group key wins
+over an alias, and an alias wins over a table column of the same name that is not grouped. The
+router sends the aggregate itself to the engine in place of the alias.
+
+`HAVING regr_count(…)` was routed before but always fell back, costing a second run on DuckDB. It
+now runs on the engine.
+
+These forms still run on DuckDB:
+- an aggregate in `HAVING` that is not in the select list, `IS NULL`, `BETWEEN`, `NOT`, `IN`, a
+  literal on the left and two aggregates compared with each other (all route since the change
+  above), and arithmetic;
+- a decimal literal with more than 15 significant digits;
+- `bool_and` / `bool_or` compared with a number or a string, or with `<` / `>` against `TRUE` /
+  `FALSE` (comparing two Boolean aggregates routes since the change above);
+- a number compared with the time bucket;
+- a `HAVING` or `ORDER BY` name that DuckDB reads as something other than a column or alias: a
+  keyword (`AS true … HAVING true > 5` compares the literal `true`) or a SQL value function
+  (`current_timestamp`, `current_date`, `localtimestamp`, `user`, …, which DuckDB evaluates);
+- `HAVING` over `arg_max`/`arg_min`/`max_by`/`min_by`, `skewness`/`kurtosis`/`kurtosis_pop`, the Kahan sums,
+  `covar_pop`, `covar_samp`, `regr_sxy` or `regr_intercept`, when the query also has a `LIMIT` or
+  orders by an aggregate. Ordering by the group keys still routes.
+
+DuckDB 1.5.6's results for those last aggregates vary between runs or drift on real data. When such
+a value sits close to the `HAVING` literal, a group can be in one engine's result and not the
+other's. Shadow mode records a group present on only one side under `argdiff` or `oraclediff` (a
+WARN), not as a mismatch. Groups present on both sides are still compared value by value. A
+difference in any other column is a mismatch, as is a group key that appears twice, or a result
+with no group in common with DuckDB's. `median`, `quantile_cont` and `mad` are not treated this
+way: DuckDB's ARM build can differ from the engine in the last bit of an interpolated value, so a
+value sitting exactly on the `HAVING` literal could in principle show as a mismatch.
+
+The same change fixes a router check for top-N queries. An aggregate that carries a floating-point
+tolerance must be the last sort key, but the check did not apply when that aggregate came first in
+the select list (`SELECT avg(x), host … ORDER BY 1, 2`). The engine declined those queries, so
+DuckDB ran them a second time. They now go to DuckDB directly.
+
+## arcx router: grouped top-N (`ORDER BY … LIMIT`) routes to the engine
+
+Grouped aggregates with an `ORDER BY` over aggregates, `DESC`, `NULLS FIRST`/`LAST`, up to four
+sort keys and a `LIMIT` now route to the arcx engine (arcX feat/res-2-topn). This covers the
+"top 10 hosts by error count" panel, `SELECT host, count(*) AS n … GROUP BY host ORDER BY n DESC
+LIMIT 10`, and multi-key orders such as `ORDER BY count(*) DESC, host`. Until now only
+`ORDER BY` a group key, ascending, routed.
+
+A sort key can be a select-list position, the group key, the bucket alias, an aggregate's alias, or
+an aggregate written exactly as it is in the select list. Ordering follows DuckDB: `NULLS LAST` by
+default in both directions, NaN above every number, and -0 equal to +0. When groups tie on every
+sort key, the engine breaks the tie by group key; DuckDB returns tied groups in no fixed order.
+
+These forms still run on DuckDB:
+- `LIMIT` without `ORDER BY`, `OFFSET`, and sort expressions (`ORDER BY count(*) + 1`);
+- an aggregate that is not in the select list;
+- sorting by `arg_max`/`arg_min`/`max_by`/`min_by`, `skewness`/`kurtosis`, `covar_pop`,
+  `covar_samp`, `regr_sxy`, `regr_intercept` or the Kahan sums (`fsum`, `favg`, …): DuckDB
+  1.5.6's results for these vary between runs or drift on real data, so its order would too;
+- an aggregate whose result carries a floating-point tolerance (`sum`, `avg`, the variance and
+  standard-deviation family, `median`, `quantile_cont`, `mad`, …) as any key but the last;
+- a query that mentions `default_order` or `default_null_order`.
+
+In shadow mode the order of the rows is compared as part of the answer. Groups that tie on every sort
+key may come back in a different order without counting as a difference. When the `LIMIT` cut falls
+inside a run of tied groups, the two engines can legitimately keep different groups from that run.
+Shadow mode then asks DuckDB again, this time with the engine's tie-break appended, so the answer is
+deterministic. The engine's rows must match that answer exactly, values included. Only then is the
+difference recorded under a new `tiediff` outcome (a WARN). A wrong row at the cut, or any other
+difference in membership, order or values, is a mismatch. The second query runs only when a tie falls
+at the cut.
+
+## arcx router: aliased aggregates route to the engine
+
+Aggregates with an `AS` alias now route to the arcx engine
+(arcX feat/res-1-agg-aliases). This covers `SELECT avg(value) AS value, count(*) AS n …`,
+grouped queries such as `SELECT date_trunc('hour', time) AS time, avg(value) AS value …
+GROUP BY 1`, and the footer fast paths (`SELECT count(*) AS n FROM cpu`, `max(time) AS newest`).
+Until now any alias on an aggregate sent the query to DuckDB, and most dashboard panels alias
+their aggregates. The output column carries the alias exactly as written.
+
+These forms still run on DuckDB:
+- an alias without `AS` (`min(x) mx`);
+- a quoted alias (`AS "time"`);
+- in a grouped query, an alias that matches the group key, the bucket alias or another alias;
+- an alias that is a SQL clause word (`AS from`, `AS where`), which DuckDB accepts;
+- a `HAVING` that names an aggregate's alias. That routes since the `HAVING` change above,
+  and `ORDER BY` an alias since the top-N change above.
+
+Shadow mode now also compares result column names, since aliases make them user-controlled. One
+existing difference is exempted. When DuckDB serves an unaliased `date_trunc` bucket (grouped,
+or the plain `date_trunc(…), count(*)` form), Arc's rewrite of the bucket expression names that
+column after the rewritten expression (`make_timestamptz(…)`). The engine names it
+`date_trunc('hour', "time")`. Aliased buckets (`AS time`) are named identically on both paths.
+
+## arcx router: skewness and kurtosis route to the engine
+
+The arcx engine now serves `skewness(x)`, `kurtosis(x)` and `kurtosis_pop(x)` over `BIGINT` and
+`DOUBLE` columns (arcX feat/agg-8-skew-kurt). The recognizer routes them in ungrouped aggregates
+and under a time bucket; grouped by a tag column they stay on DuckDB. A `HAVING` that
+references one of them stayed on DuckDB too, until the `HAVING` change above.
+
+Measured through Arc on a synthetic 132-million-row corpus (DuckDB → engine): `skewness`
+155 → 90 ms, `kurtosis` 233 → 90 ms, all three together 555 → 157 ms, an hourly-bucket
+`skewness` + `kurtosis` 555 → 216 ms.
+
+The engine computes these with central moments. DuckDB 1.5.6 uses raw power sums, which lose
+precision when values are large compared with their spread. That covers most telemetry, from a
+12 V rail to a temperature sensor or an epoch-scale counter. In those cases the engine is exact
+where DuckDB's answer drifts or comes back NULL or NaN. On a constant column (a stuck sensor) the
+engine returns NULL; DuckDB 1.5.6 returns a value that depends on the CPU architecture.
+`skewness` of a constant column is NULL rather than DuckDB 1.5.6's NaN, so stuck sensors no longer
+sort above every real value. Shadow mode therefore records any difference on these three functions
+under the `oraclediff` outcome (a WARN), not as a mismatch.
+
+## arcx router: median, quantiles, mad and mode route to the engine
+
+The arcx engine now serves DuckDB's order statistics (arcX feat/agg-7-order-stats):
+`median(x)`, `quantile_cont(x, q)`, `quantile_disc(x, q)` and its alias `quantile(x, q)` and
+`mad(x)` over `BIGINT` and `DOUBLE` columns, and `mode(x)` over `BIGINT` and `VARCHAR` columns. `q` is a single
+literal between 0 and 1. The recognizer routes these in ungrouped aggregates and under a time
+bucket. Grouped by a tag column they stay on DuckDB, as does `mode` in any grouped query. A
+`HAVING` that references one of these functions stayed on DuckDB too, until the `HAVING` change
+above. A list of fractions, a negative
+fraction, `mode` over `DOUBLE`, and timestamp or text arguments to the other functions also stay
+on DuckDB; the router cannot see column types, so these reach the engine and fall back
+immediately.
+
+Measured through Arc on a 33-million-row window of a synthetic corpus (DuckDB → engine):
+`median` 436 → 53 ms, `quantile_cont(…, 0.99)` 271 → 58 ms, `quantile_disc` 218 → 50 ms,
+`mad` 1074 → 54 ms, `mode` 43 → 32 ms, an hourly-bucket `median` + p99 375 → 90 ms.
+DuckDB finalizes each of these with a single-threaded selection; the engine selects in
+parallel.
+
+Like DuckDB, the engine keeps every value in memory for these functions. It refuses a query
+whose values would exceed 1 GiB — for example a median over 132 million rows, or three
+quantiles over 33 million — using the Parquet row counts, before reading any data, and
+DuckDB serves it instead.
+
+`mode` falls back to DuckDB whenever two values tie for most frequent, because DuckDB 1.5.6
+and 2.0 pick different winners in that case. A tie is only known after the engine has counted
+every value, so a tied `mode` costs the engine's scan plus DuckDB's. Shadow mode compares `median`, `quantile_cont` and
+`mad` within the usual 1e-9 tolerance, since DuckDB's ARM build can differ from its x86 build in
+the last bit of an interpolated value. `quantile_disc` and `mode` compare exactly.
+
+## arcx router: count_if / bool_and / bool_or with a predicate argument route to the engine
+
+The arcx engine now serves the predicate form of the Boolean aggregates (arcX
+feat/agg-6b2-predicate): `count_if(status >= 500)`, `countif(...)`, `bool_and(cpu_user < 90)`,
+`bool_or(host = 'web-1')`. The argument may combine comparisons, `IS [NOT] NULL`,
+`BETWEEN`, `[NOT] LIKE`, `AND`, `OR` and parentheses. The recognizer routes these in
+ungrouped aggregates and under a time bucket (`date_trunc` or the epoch-math form); grouped by a tag column they
+stay on DuckDB, as the column forms do. Forms whose output column name DuckDB 1.5.6 and
+2.0 render differently stay on DuckDB: `IN`, `NOT`, arithmetic, timestamp literals, and
+non-canonical number spellings such as `007` or `-0.0`. A `HAVING` that references a
+predicate aggregate also stayed on DuckDB, until the `HAVING` change above.
+
+Measured through Arc on a synthetic 132-million-row corpus (DuckDB → engine):
+`count_if(cpu_user > 90)` 103 → 76 ms, `count_if(code >= 400)` 34 → 19 ms,
+`count_if(host = '…')` 38 → 24 ms, `bool_or(…) + bool_and(…)` 145 → 98 ms, three predicate
+counts in one query 184 → 93 ms, an hourly-bucket `count_if` + `bool_or` 405 → 235 ms;
+`count_if(host LIKE '…')` at parity (27 → 25 ms). A string column read only by predicate
+arguments is evaluated on its Parquet dictionary.
+
+The engine now names derived columns with DuckDB 1.5.6's full keyword table, so a column
+named like a keyword is quoted exactly as DuckDB quotes it. Two names changed: `sum(level)`
+is now `sum("level")`, and `sum(date)` is now `sum(date)` rather than `sum("date")`, since
+`date` is not a DuckDB keyword. A grouped `date_trunc` over a non-keyword column also lost
+its quotes (`date_trunc('hour', ts)`). These are the names DuckDB has always returned for
+the same queries, so served results now carry the same column names as DuckDB fallbacks.
+
+The engine and the recognizer now decline three things DuckDB rejects or binds
+differently: a bare reserved keyword used as a column (`sum(end)`), `!=` written directly
+against a sign (`x!=-2`, which DuckDB reads as an unknown operator), and decimal literals
+with more than 15 digits (counted after any leading zeros of the integer part). DuckDB 1.5.6 converts the last of these to a slightly
+different double, which can change the match.
+
+## arcx router: product, Kahan sums, bitwise and boolean aggregates route to the engine
+
+The arcx engine now serves `fsum` / `sumkahan` / `kahan_sum`, `favg`, `bit_and`, `bit_or`,
+`bit_xor`, and — over a `BOOLEAN` column — `bool_and`, `bool_or` and `count_if` / `countif`
+(arcX feat/agg6bp-numeric). The recognizer routes them in ungrouped aggregates and under a
+`date_trunc` time bucket. Grouped by a tag column they stay on DuckDB (measured 1.1–1.4×
+slower in the engine). The engine also implements `product`, but it is not routed: it
+measured slower than DuckDB. Predicate arguments (`count_if(status >= 500)`) still run on
+DuckDB; they are the next engine slice. `bool_and` / `bool_or` in `HAVING` stayed on DuckDB as
+well, until the `HAVING` change above.
+
+Measured through Arc on a synthetic 132-million-row corpus: `bit_and` / `bit_or` / `bit_xor`
+46 → 25 ms, `count_if` / `bool_or` / `bool_and` 40 → 36 ms, an hourly-bucket
+`fsum` + `bit_or` 360 → 250 ms; `fsum` + `favg` at parity.
+
+The engine declines a Kahan sum that comes out non-finite (DuckDB's own result there depends
+on how it splits the work). Shadow mode compares the Kahan sums within the 1e-9 tolerance; on
+cancelling data DuckDB's Kahan sums swing between thread counts, so a value-only difference on
+them is a WARN under the `oraclediff` outcome. The bitwise, boolean and `count_if` results
+compare exactly.
+
+**Shadow comparator fix:** a difference between a finite value and ±Inf, or between +Inf and
+−Inf, passed the tolerance test as a match, because the tolerance itself became infinite. Such
+differences are now reported (`Inf-ness`) in both the ungrouped and grouped comparators.
+
+## arcx router: covariance, correlation and regression aggregates route to the engine
+
+The arcx engine now serves DuckDB's two-argument statistics family, `fn(y, x)` over two
+`BIGINT` or `DOUBLE` columns (arcX feat/agg6b-binary): `covar_pop`, `covar_samp`, `corr`,
+`regr_count`, `regr_avgx`, `regr_avgy`, `regr_slope`, `regr_intercept`, `regr_r2`,
+`regr_sxx`, `regr_syy` and `regr_sxy`. The recognizer routes them in ungrouped aggregates,
+in aggregates grouped by a `date_trunc` time bucket, and in `HAVING` when the same
+aggregate is selected (`HAVING regr_count(…)` fell back to DuckDB until the `HAVING` change
+above). Grouped by a tag column they stay on DuckDB, like the variance
+family. A NaN or ±Inf in either argument makes the engine decline the query; DuckDB then
+answers (or raises its own out-of-range error) exactly as before.
+
+Shadow mode compares the new columns within the same 1e-9 tolerance as `sum` and `avg`;
+`regr_count` (an unsigned 32-bit integer in DuckDB) compares exactly. On four of these
+functions DuckDB 1.5.6 itself returns values that move by more than the tolerance between
+thread counts on data with heavy cancellation (`covar_pop`, `covar_samp` and `regr_sxy`
+near zero at large magnitudes, `regr_intercept` far from the data's mean). A value-only
+difference on those four is logged at WARN and counted under a new `oraclediff` shadow
+outcome instead of the mismatch alarm, the same treatment `arg_max` ties already get under
+`argdiff`. A NULL-ness, NaN-ness or type difference on them still raises the alarm.
+
+Nothing changes for a deployment without the engine linked in (`arcx_engine` build tag) or
+with `ARC_ROUTER=off`.
+
+## arcx router: variance and standard deviation aggregates route to the engine
+
+The arcx engine now serves the unary moment aggregates `var_pop`, `var_samp`,
+`variance`, `stddev`, `stddev_samp`, `stddev_pop` and `sem`, plus `mean` as an
+alias of `avg`, over `BIGINT` and `DOUBLE` columns (arcX feat/agg6-moments). The
+eligibility recognizer accepts them in ungrouped aggregates, in aggregates
+grouped by a `date_trunc` time bucket, and in `HAVING` when the same aggregate
+is also selected. Grouped by a tag column they stay on DuckDB: measured on a
+3.95-billion-row production corpus the engine folds bucket runs 1.5× faster
+than DuckDB but is 2.7× slower per host, and a known loss is not routed. The function name is lowercased in the derived
+column name and the argument keeps its spelling (`VARIANCE(X)` → `variance(X)`),
+as DuckDB does.
+
+A column holding `NaN` or `±Inf` makes DuckDB raise an out-of-range error for
+these functions; the engine declines such a query instead, so the router falls
+back and DuckDB raises its own error. The user sees the same outcome either way,
+and shadow mode counts a decline, not an engine error.
+
+Over a constant column (a stuck sensor) they return exactly `0`, as DuckDB does — including for
+values with no exact binary form, such as `0.1` repeated.
+
+Still on DuckDB, deliberately: `DISTINCT` and expression arguments, and map-subscript arguments
+(`skewness`/`kurtosis` and the covariance family route since — see their sections). In shadow
+mode the new columns compare within the same 1e-9 tolerance as `sum` and `avg`.
+
+Nothing changes for a deployment without the engine linked in (`arcx_engine`
+build tag) or with `ARC_ROUTER=off`.
+
+## arcx router: map subscripts `col['key']` route to the engine
+
+The arcx engine now serves `col['key']` over `MAP(VARCHAR, VARCHAR)` columns in
+projection and WHERE (arcX #72), the shape OpenTelemetry logs need for
+`ResourceAttributes`, `ScopeAttributes` and `LogAttributes`. Arc's eligibility
+recognizer previously declined any query containing `[`, so none of those
+queries could reach the engine. It now recognizes the subscript exactly where
+the engine serves it: as a select item, as the head of a WHERE atom (`=`,
+`<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN`,
+`BETWEEN`) in single-table scans and ungrouped aggregates, and as the argument
+of `count(...)` in an ungrouped aggregate (arcX #73). Subscripts in ORDER BY,
+under any other aggregate, in grouped aggregates, in arithmetic or inside a
+projection function stay on DuckDB, as do keys containing `'` or `\`.
+
+Nothing changes for a deployment without the engine linked in (`arcx_engine`
+build tag) or with `ARC_ROUTER=off`; the DuckDB path runs the user's SQL
+unchanged. In shadow mode the derived column is named `col['key']` on both
+engines and compares cell for cell; a mismatch log names the column with the
+key masked (`col['...']`), since a key is user data. One metrics detail for
+engine builds: the shape census now files any query containing brackets
+(`arr[1]`, `m['a']['b']`) under a shape reason instead of `unlexable`.
+
+## Fix: a crash during a multi-hour flush no longer replays the hours already stored ([#1492](https://github.com/Basekick-Labs/arc/issues/1492))
+
+A flush whose rows span several hours writes one Parquet file per hour. The
+WAL checkpoint that stops those rows replaying was written once, after the
+last file, so a crash (kill -9, OOM, power loss of the process) between the
+first file and that checkpoint replayed every row of the flush on restart: the
+hours already in storage were stored twice. Compaction removes the duplicates
+of a tagged measurement at its next pass; a tagless measurement kept them
+([#948](https://github.com/Basekick-Labs/arc/issues/948)). How many rows that
+is depends on how many hours one flush spans: with the sample `arc.toml`
+(`max_buffer_size = 5000000`, `max_buffer_age_ms = 100`) a kill -9 during a
+backfill duplicated 21–23% of the rows acknowledged in the run, eleven whole
+hours each stored twice.
+
+Each hour file's rows are now checkpointed in the WAL as soon as that file is
+stored and registered, with the row-range checkpoint recovery already used
+for its own split replays. A crash replays only the rows of the files not yet
+written, and recovery replays a columnar entry's uncovered rows alone. The
+duplicate window is now at most the rows of the hour file each in-flight flush
+was writing when the process died.
+
+What changes for an operator:
+- fewer duplicates after a crash, and for a tagless measurement no longer
+  whole hours of them;
+- one durable WAL write per hour file of a multi-hour flush, before the
+  flush's own checkpoint, so a backfill flush spanning 30 hours writes 30
+  small checkpoints where it wrote one; on a cluster node each hour file also
+  makes its registration durable (one outbox sync) before its checkpoint. A
+  flush within one hour (live ingest) is unchanged;
+- `arc_wal_row_checkpoints_written_total` and
+  `arc_wal_row_checkpoints_dropped_total`: a dropped checkpoint (the WAL
+  writer refused it or it timed out) only means those rows replay as before;
+- a flush that fails part-way now reports the rows and files it did store
+  (`records_stored`, `files_stored`) and counts as lost only rows with no WAL
+  copy that reached no file.
+
+Downgrade: an Arc without this change replays an entry with row-range
+checkpoints in full, which is today's duplicate window, not a loss. The gauge
+`arc_wal_partial_row_recovery_pending` reports only ranges left by a recovery
+pass, not those a live flush leaves.
+
+On a writer with WAL coverage (`cluster.wal_coverage`,
+[#1207](https://github.com/Basekick-Labs/arc/issues/1207),
+[#1498](https://github.com/Basekick-Labs/arc/issues/1498)) each hour file
+registers with the group's coverage for that file as before, only as soon as
+it is stored. For a flush that fails part-way, the registered-floor tracker
+counts the stored rows once those files' registrations settle, never earlier,
+and the floor advances once recovery's replay of the other rows completes each
+batch; the flush's WAL entries are kept until then.
+
+## Fix: a time bound written with `epoch_ms()`, `make_timestamp()` or `to_timestamp()` prunes ([#1491](https://github.com/Basekick-Labs/arc/issues/1491))
+
+A query bounded by an epoch number read every partition of the measurement.
+It now reads only the partitions and files of its range, the same as one
+written with a `TIMESTAMP` literal. Clients that keep event time as epoch
+milliseconds usually write it this way:
+
+```sql
+SELECT ... FROM market.quotes
+WHERE time >= epoch_ms(1790856000000) AND time < epoch_ms(1790856060000)
+```
+
+On 8.7M forex ticks the one-minute query above went from 97 ms to 1.8 ms on
+freshly ingested data (656 files), and from 9.7 ms to 3.1 ms after compaction
+(43 files): the same as the `TIMESTAMP` literal.
+
+Accepted, with one plain number as the argument:
+- `epoch_ms(n)`: milliseconds;
+- `make_timestamp(n)`: microseconds;
+- `to_timestamp(x)`: seconds, whole or decimal.
+
+Anything else in the call, such as arithmetic, a cast, a column or a second
+argument, gives no bound from that term, as before. So does a bound outside
+years 0001 to 9999, counting the second added to a `to_timestamp` bound and
+the microsecond added to an inclusive end. This also applies to a literal:
+`time <= '9999-12-31 23:59:59.999999'` no longer gives an end in year 10000,
+which a query that needs an unavailable cold tier read as "no cold data"
+instead of answering 503. A DELETE with such a bound now also reads only the files
+of its range (`delete.time_pruning`).
+
+`to_timestamp` is computed through a double and compared in the session time
+zone, which Arc pins to UTC. Its bound is widened by one second. These bounds
+narrow what is read but are not used to answer a query as empty without
+reading it.
+## Fix: query pre-processing rewrites stay inside their own text ([#1488](https://github.com/Basekick-Labs/arc/issues/1488))
+
+Before running a query, Arc applies a few text rewrites that speed common
+shapes up — `time_bucket`/`date_trunc` to epoch arithmetic, some
+`REGEXP_REPLACE`/`REGEXP_EXTRACT` to string functions, and a reorder of `LIKE`
+predicates. These ran on the raw query text, so a rewrite could match a string
+literal's content or a comment, or copy a column argument that contained a
+quote, and the rewritten query no longer matched the text that was validated.
+
+The rewrites now skip any match that begins inside a string literal (`'…'`,
+`E'…'`, `"…"`, `$tag$…$tag$`) or a comment, and `time_bucket`/`date_trunc` are
+left unchanged when their column argument is not a plain unquoted expression.
+No query's result changes. A query whose `time_bucket`/`date_trunc` column is a
+quoted identifier (for example `"my col"`) is now evaluated by DuckDB natively
+rather than through the epoch-arithmetic rewrite — the same answer, without that
+speedup. A query that would have been rewritten into something other than what
+was validated is now run as written.
+
+## New: Iceberg export keeps files moved to an S3 cold tier ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Iceberg export and cold-tier tiering can now run together when the cold tier is
+S3 (`tiered_storage.cold.backend = "s3"`). A file that tiering moves to cold
+stays in the Iceberg table under its cold URI, with the same rows and
+statistics. External readers see the same data before, during and after a
+migration. Supported with a local or an S3 primary.
+
+- **Mixed-location tables:** with a local primary, an exported table holds
+  `file://` paths for hot data and `s3://` paths for cold data. A reader needs
+  access to both, so it must run on the Arc host with S3 credentials.
+- **Which copy is exported:** the one Arc's own queries read. When a file is
+  on both tiers (during a migration, or a hot-only database's cold copy), the
+  hot copy is exported until Arc's tier record says the file is cold.
+- **No extra reads:** a migrated file's entry is copied from the hot one, and
+  the cold object is not read. Only cold data the table never held hot is
+  read, once, with the cold tier's own credentials.
+- **Cost:** the cold tier is listed per measurement and the listing is cached.
+  Arc re-lists after every change it makes to the cold tier: a tiering cycle,
+  cold retention, a DELETE of a cold file, a database delete. Otherwise it
+  re-lists every `iceberg.cold_rescan_interval` seconds (new, default `3600`),
+  which bounds changes made outside Arc. Before the table drops a file that
+  left the hot tier, Arc checks the cold tier for it (one HEAD), so a
+  migration never makes the table lose a file.
+- **Window:** during the one pass between the hot copy's delete and the table
+  moving to the cold URI, a reader that already resolved the old URI can get
+  a not-found error. It never gets wrong rows. Compaction and retention
+  already have the same window.
+- **Refused at startup:** an Azure or GCS cold tier, or S3 cold on Google
+  Cloud Storage's interop endpoint, with Iceberg enabled.
+- **Unavailable cold tier:** if the cold tier is configured but cannot be
+  built, the export does not start, and the tables keep their last snapshot.
+- **Licensing:** tiering requires an Enterprise license and Iceberg export does
+  not. Without the license Arc disables tiering, so with a cold tier still
+  configured the export does not start (as for an unavailable cold tier) and
+  the tables keep their last snapshot until the license is restored.
+
+DELETE of a whole cold file now also drops the query caches, as cold retention
+already did.
+
+## New: Iceberg export on S3 primary storage ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Iceberg export now runs with `storage.backend = "s3"` (AWS S3 and S3-compatible
+stores), not only on local storage. Tables are written under the storage root
+(`s3://<bucket>/<prefix>/arc_<database>.db/<measurement>/`) and read by
+Iceberg engines with S3 access (verified with PyIceberg and DuckDB
+`iceberg_scan`).
+
+- **Credentials:** the export uses Arc's own S3 credentials and renews them the
+  same way: static keys, the default chain, IRSA on EKS, or an assumed role. No
+  credential is written into Iceberg metadata, the catalog or the logs.
+  Readers need their own read access to the bucket.
+- **Endpoint:** `storage.s3_endpoint` and `storage.s3_path_style` apply to the
+  export too. The `AWS_S3_ENDPOINT` environment variable no longer changes
+  where it writes.
+- **Cost:** schemas are read from each new file's footer (the last 64 KiB of
+  the object), never the whole file, and sizes come from the listing. After a
+  restart an unchanged table reads no footers.
+
+**Refused at startup with Iceberg enabled:**
+- `storage.backend` other than `local` or `s3` (Azure, GCS);
+- `storage.backend = "s3"` on Google Cloud Storage's S3-compatible endpoint;
+- an `iceberg.warehouse` outside the storage root (another bucket, another
+  prefix, or a local path with an S3 backend);
+- `cluster.shared_storage_mode = true` without `cluster.failover_enabled =
+  true`;
+- cold-tier tiering, as before.
+
+**Shared-storage clusters:** only the node holding the compactor lease
+exports, with no fallback to the static compactor role, and the lease is
+re-checked for each measurement. The table's current version is the one
+published in the warehouse, not the node's own catalog row:
+- a node that takes over, or comes back after a failover, continues from
+  the published version;
+- if two nodes commit the same version, the second one's publish is refused,
+  its pass fails, and it adopts the published version on the next pass,
+  logged as `another writer published this table version first`;
+- a node that lost its catalog (a new node, a deleted SQLite) continues the
+  existing table instead of creating a second one in the same directory. On
+  local storage too.
+
+**Upgrade:** nothing to do for local-storage deployments. To export an existing
+S3 deployment, set `iceberg.enabled = true`. The first pass registers every
+existing data file, reading each file's footer twice (once for the schema,
+once for its statistics); expect two ranged GETs per file on that pass.
+
+## Fix: Iceberg export counts each row once during a DELETE or a compaction ([#939](https://github.com/Basekick-Labs/arc/issues/939))
+
+Arc's queries leave out a file whose rows another file already holds, such as
+the file a row DELETE replaced while it is still in storage next to its
+rewrite. On a standalone node the Iceberg export did not: a reconcile pass
+between a partial DELETE publishing its rewrite and removing the old file
+published both, and external readers (PyIceberg, DuckDB `iceberg_scan`)
+counted the surviving rows twice. The window is normally milliseconds; if the
+removal failed, it lasted until the leftover drainer removed the old file.
+
+The export now leaves out exactly the files Arc's queries leave out (DELETE
+rewrites, compactions in flight, and on a cluster the same set its queries
+use). Where a query would guess (a stat that fails, an unreadable DELETE
+journal, the stale-local breaker), the export does not: that measurement's
+pass fails, keeps the previous snapshot, and is retried on the next pass.
+
+**A file removed while a measurement is being listed** (a compaction or DELETE
+finishing mid-listing) no longer drops its rows from that pass: the
+measurement is listed again, up to three times. If the files keep changing,
+the pass fails for that measurement and keeps the previous snapshot, logged
+as `file set of <db>/<measurement> kept changing under the listing`.
+
+## New: an opt-in limit on unflushed ingest data, refusing writes with 503 ([#1468](https://github.com/Basekick-Labs/arc/issues/1468))
+
+When storage falls behind (a slow disk or object store), the flush queue
+fills and each measurement's buffer keeps growing in memory with no limit,
+until the process runs out of memory. The new `ingest.max_buffered_bytes`
+makes Arc stop taking new writes first. It is **off by default**; nothing
+changes until you set it. Once the rows waiting to be flushed
+(`arc_buffer_bytes_buffered`) reach the limit, every write request is refused
+before any of it is written:
+
+- HTTP writes (MessagePack, line protocol, TLE, imports) answer **503** with
+  `Retry-After: 5` and `X-Arc-Ingest-Refused: buffer_full`. Nothing of a
+  refused request is stored, so retrying it is safe. Clients that already
+  retry the other 503 refusals (WAL disk pressure, cluster fencing) need no
+  change.
+- Bulk imports are refused from 90% of the limit, and a running import paces
+  its writes to stay below that level (each grouped write can still add up to
+  a few tens of MB at once). The limit never refuses an import part-way, but
+  while other writers keep the node near it a running import can wait out its
+  2-minute flush wait and end with a partial write, as it could before when
+  flushes did not keep up.
+- MQTT subscriptions are suspended until the buffer drains below 90% of the
+  limit (and for at least 5 seconds), as they are for WAL disk pressure. With
+  `clean_session = false` and QoS 1 or 2 the broker holds the messages; a
+  `clean_session = true` subscription loses what is published meanwhile. A
+  message already being handled when the limit is reached is retried for 2
+  seconds and then dropped (counted as failed).
+- WAL replay and continuous-query writes are never refused.
+- New counter `arc_ingest_buffer_full_rejections_total` (one per refused
+  request, imports refused from 90% included), and a warning in the log at
+  80% of the limit.
+
+Set `"auto"` for half the memory limit Arc detects (the container limit where
+there is one; off when none is detected), or a size (`"4GB"`, at least `1MB`).
+The default, `"0"`, keeps the limit off. Startup logs the value in use:
+
+```toml
+[ingest]
+max_buffered_bytes = "auto"   # or "4GB"; "0" (default) is off
+```
+
+Or `ARC_INGEST_MAX_BUFFERED_BYTES`. A refusal does not itself start a flush:
+an explicit limit below what buffers normally hold before their size or age
+flush (`max_buffer_size`, `max_buffer_age_ms`) refuses writes until the next
+one, even with storage keeping up, so set it well above that. It is a
+backstop, not a bound on memory:
+the estimate is a MessagePack request's payload size and leaves out the
+copies a flush makes, requests admitted at the same time can each overshoot it
+by their own size (up to `server.max_payload_size`), and WAL replay at startup
+can put a node over it until the replayed rows are flushed. The existing
+`arc_buffer_memory_pressure` gauge and its warning at 50% of the memory limit
+are unchanged.
+
+## Fix: a flush with more than 2 GiB in one text column is written instead of failing ([#1284](https://github.com/Basekick-Labs/arc/issues/1284))
+
+When storage fell behind and the flush queue stayed full, a measurement's
+buffer kept growing until one string or binary column of its flush held more
+than 2 GiB. Arrow addresses such a column with 32-bit offsets, so the flush
+failed with `failed to write Parquet: failed to write record batch: ...
+slice bounds out of range [:-2147483616]`. With the WAL on the rows stayed in
+the WAL and were replayed later; with it off they were lost. One MessagePack
+request could get there alone too: invalid UTF-8 is stored as U+FFFD, three
+bytes for each invalid byte, so a request under the 1 GiB payload limit could
+hold more than 2 GiB of text, and its flush failed on every replay until the
+WAL quarantined it.
+
+A flush now writes its rows as several row groups of the same file, cutting
+before any row that would take a string or binary column of the row group
+past 1 GiB. Files, WAL checkpoints and cluster file registration are as
+before: one flush still writes the same files. Flushes within the limit are
+written exactly as before. A flush that is cut holds the Arrow arrays of one
+row group at a time instead of the whole flush's.
+
+What a buffer retains while storage is behind is bounded separately, by
+`ingest.max_buffered_bytes` ([#1468](https://github.com/Basekick-Labs/arc/issues/1468),
+see its entry).
+
+Thanks to [@efegokdemir](https://github.com/efegokdemir), who traced the
+overflow to buffers retained under flush-queue backpressure and proposed the
+first fix in [#1321](https://github.com/Basekick-Labs/arc/pull/1321); its
+tests are the basis of this change's.
+## Fix: license gates expire while Arc is running (#1442)
+
+License checks now use the signed expiry at the time of each check. A final
+definitive server rejection clears the current license and attempts to remove
+its disk cache. Removal failures are logged; if deletion fails, a restart
+during an outage may still reuse the rejected cache. Transient network or
+protocol failures preserve the license until that signed
+expiry. Both machine-reactivation responses still attempt activation before
+the final result determines whether to invalidate the license. Health status
+and days remaining use the same expiry calculation.
+
+Existing RBAC restrictions remain enforced when a license lapses.
+
+## New: a grace period after a paid license expires
+
+A paid license keeps its Enterprise features for fourteen grace days after it
+expires, counted from the midnight UTC that follows its expiry. Grace days 1-6
+run as usual; days 4-6 log a warning every hour. On grace days 7-14 Enterprise
+features stay on and live ingestion is refused with `503`,
+`X-Arc-Ingest-Refused: license_grace` and `Retry-After: 300`, counted in
+`arc_license_write_refusals_total`, and so are files pushed to an edge-sync
+hub; MQTT subscriptions are suspended so the
+broker holds messages (QoS 1 or 2, `clean_session=false`, within the broker's
+own limits). WAL replay, continuous queries, compaction and retention keep
+running. At the start of day 15 the license expires and every Enterprise gate
+closes; the node then accepts writes again, without Enterprise features. A
+self-serve trial ends at its expiry, with no grace.
+
+`/health` reports `grace_period`, `writes_stopped` or `expired`, with
+`grace_day`, `writes_stop_at` and `cutoff` during grace; `days_remaining`
+counts to the expiry while the license is active and to the cutoff during
+grace. The schedule is computed in Arc from the signed license, the same way
+online and for license files, and needs no license-server change. A restart
+during grace keeps the license (from the verified cache, or the license file),
+and so does the license server refusing to re-activate a license past its
+term. A machine whose fingerprint changed (a rescheduled pod, new hardware),
+or whose license cache was lost, cannot activate during grace and starts
+without Enterprise features. A renewal takes effect at the next periodic
+license check (every 4 hours) or a restart.
+
+Setting the host clock back does not extend a license: the license clock
+never goes below a high-water mark kept in `license_clock.json` beside the
+auth database. The mark comes only from the license server's clock (or a
+license file's signed issue time) and advances by elapsed time, so a host
+clock that is wrong, ahead or behind, is never written into it. Arc logs a
+warning at startup when the host clock reads earlier than the mark; deleting
+the file resets the guard.
+
+## Fix: the MessagePack spec endpoint describes the endpoint as it is ([#1434](https://github.com/Basekick-Labs/arc/issues/1434))
+
+`GET /api/v1/write/msgpack/spec` said authentication was "not yet
+implemented", although the route it describes (and the spec route itself)
+requires a token. The document now matches the code:
+
+- `authentication`: `Authorization: Bearer <token>`, also `Token <token>`, a bare `Authorization: <token>`,
+  `x-api-key` and the deprecated `?p=`; write permission is required.
+- New sections: `database` (the `x-arc-database` header, default `default`),
+  `time` (seconds, milliseconds, microseconds or nanoseconds, detected from the
+  first value; nanoseconds were missing), `responses` (status codes), and
+  `method`.
+- Columnar format documents `tag_keys`, and the columnar example now uses it.
+- `compression` is now an object: detection by magic bytes and the payload
+  limits. `content_type` notes that the server does not check it.
+- The `performance` section is removed. Its throughput figures were years out
+  of date; current numbers are in the README.
+
+Clients that read `authentication.header` now get `Authorization` instead of
+`x-api-key`. Clients that read `compression` as a string need to read the new
+object.
+
+**Behaviour change: a bad item in a MessagePack batch is reported.** In a
+`batch`, or a top-level array of items, an item that could not be decoded (no
+`fields`, columns of different lengths, a time that is not a number, an item
+that is not a map) was logged and skipped, and the request answered **204** as
+if everything had been written. It is now dropped the way any other point that
+cannot be written is: the other items are still written, and the request
+answers **400** `partial write: N points dropped: ... an item of the batch or
+array could not be decoded: <reason>; the other points were written`. Each
+dropped item counts as one point, however many rows it held. A client that treated 204 as "all written"
+was silently losing those items; one that retries on 400 should not retry a
+partial write, since the rest is already stored. A batch nested inside a
+batch or array, which answered 500 and stored nothing, is now written like a
+top-level one.
+
+## Fix: a cluster node stalled for 15 seconds or more rejoins Raft ([#1431](https://github.com/Basekick-Labs/arc/issues/1431))
+
+A Raft node that stopped responding for about 15 seconds or longer (a paused
+container, a long GC or I/O stall, a VM migration) never rejoined once it
+resumed. It logged `raft auth handshake (accept): read client mac: EOF` and
+`pre-vote campaign failed` about once a second until it was restarted, while
+`/health`, `/ready` and `/api/v1/cluster/nodes` still reported it healthy. Raft
+stopped applying its file registrations, and on shared storage every `DELETE`
+and database drop answered 503 unless `allow_unreachable=true` was passed.
+
+The cause was the interaction between the Raft peer-authentication handshake
+and hashicorp/raft's accept loop. The connections that queued up during the
+stall had already been abandoned by their peers, so each one failed its
+handshake. raft then waited up to a second before accepting the next one, and
+by the time it did, that peer had given up too.
+
+Handshakes now run alongside each other, off raft's accept loop, and raft
+only ever receives connections that passed. Abandoned connections drain at
+once, and a peer that connects without speaking no longer delays the others.
+In testing, nodes paused for 15 s and for 40 s both rejoined without a restart.
+
+What operators see in logs changes:
+
+- A peer that answers and is refused — a full handshake response that does not
+  verify (a wrong `cluster.shared_secret` or cluster name), or a TLS client
+  certificate that fails verification (`cluster.tls_enabled`) — is logged
+  as a Warn, `Rejected Raft connection: peer failed authentication`, with the
+  error and remote address. Each source host is logged at most once every
+  10 seconds, and the Warn carries a count of the rejections suppressed since
+  the previous one. These used to appear as a raft
+  `failed to accept connection` error line per attempt.
+- A connection whose peer hung up, went silent or sent only part of a
+  handshake response, which is routine after a stall, is logged at Debug only.
+  A port scan, or a probe that sends fewer bytes than a handshake response, is
+  therefore no longer visible at the default log level.
+
+A node whose Raft startup fails before the Raft instance is created (for example,
+an unopenable log store) now releases the Raft port instead of holding it
+until the process exits.
+
+No configuration change. Every node can be upgraded independently; the
+handshake on the wire is unchanged.
+
+## Fix: Google Cloud Storage through the S3-compatible endpoint (#1399)
+
+GCS S3 interoperability now leaves `Accept-Encoding` out of request signatures
+while preserving the SDK's identity encoding on the wire. Optional upload
+checksum trailers are disabled for `storage.googleapis.com`, allowing object
+writes without the SDK's streaming trailer format. Other S3 endpoints retain
+their existing signing and checksum behavior.
+
+## New: MQTT topic mappings can set measurements and tags (#479)
+
+`topic_mapping` still accepts the existing topic-to-database strings and now
+also accepts rule objects:
+
+```json
+"topic_mapping": {
+  "factory/+/+/metrics": {
+    "measurement": "machine_metrics",
+    "tags_from_topic": [
+      {"position": 1, "tag_name": "line"},
+      {"position": 2, "tag_name": "machine_id"}
+    ]
+  },
+  "legacy/topic": "otherdb"
+}
+```
+
+- A key is an MQTT topic filter: `+` matches one level, a trailing `#` any
+  number. An exact key wins; then the filter with more literal levels, then
+  more `+`, then fewer `#`. A leading wildcard does not match `$`-prefixed
+  topics.
+- `database`, `measurement` and `tags_from_topic` are each optional; a rule
+  sets at least one. What a rule leaves out still comes from the payload.
+- `position` counts levels of the full topic from 0. A position past the
+  filter's last level is refused, unless the filter ends in `#`, where a topic
+  without that level is written without the tag.
+- A topic tag replaces a payload tag of the same name, in any letter case. A
+  payload field of exactly that name is stored as `<name>_value`; one that
+  differs only in letter case, or a column already stored under another
+  spelling, is a case clash resolved as for any write: one of the two names is
+  dropped, with a warning.
+- An unknown key in a rule is refused, and a refused request body now says
+  what is wrong instead of only `Invalid request body`.
+
+**Existing mappings.** A stored key containing `+` or `#` used to match only a
+topic spelled exactly like it, which a published topic never is; it is now a
+wildcard and starts routing the topics it matches. Check stored mappings for
+such keys before upgrading. A stored key that is not a valid filter (for
+example `sensors/temp+x`, which no published topic can equal, or one longer
+than 1024 characters) now matches nothing: the subscription keeps running and
+logs a warning naming the key. An API update that leaves `topic_mapping` out is
+accepted; one that sets it requires valid filters, so remove such a key with
+the first edit that touches the mapping (`{}` clears it).
+
+**Downgrading.** An earlier release cannot read a rule object: with one stored,
+it fails to list or auto-start any MQTT subscription. Before downgrading,
+change every rule object back to a database string, or remove it.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1402](https://github.com/Basekick-Labs/arc/pull/1402).
+
 ## Fix: cluster cache invalidation reaches peers with wildcard API addresses (#1398)
 
 Cache-invalidation fan-out now resolves hostless and wildcard API addresses
@@ -10,6 +1343,40 @@ retaining the API port. Previously these requests could reach the sender
 itself and be rejected with 403, leaving peer caches stale after compaction,
 retention, DELETE or database/measurement removal. Explicit API hosts remain
 unchanged. Forwarded requests and invalidation now share the same resolver.
+
+## New: a configurable SQL length limit ([#1448](https://github.com/Basekick-Labs/arc/issues/1448))
+
+Arc refused any query longer than 10,000 characters, a fixed limit. A query
+naming many series, for example the latest value of 2,500 channels listed in
+an `IN (...)`, needs far more. The limit is now `query.max_sql_length`
+(env `ARC_QUERY_MAX_SQL_LENGTH`), in bytes:
+
+```toml
+[query]
+max_sql_length = 200000
+```
+
+- The default stays 10000. Values from 1000 to 1048576 (1 MiB) are accepted,
+  and the value must be smaller than `server.max_payload_size`, which limits
+  the request body that carries the SQL. Anything else refuses to start,
+  naming the key.
+- It applies to every endpoint that runs SQL (JSON, MessagePack, Arrow and the
+  row estimate) and to continuous query definitions. A continuous query is
+  checked again at every run, so lowering the limit below a stored
+  definition's length makes that query fail until it is shortened.
+- Preparing a long query now takes time in proportion to its length. Before,
+  restoring its string literals copied the whole statement once per literal,
+  so a 1 MB query with 50,000 literals spent 9.3 s there, and a 2.3 MB one
+  34 s. Both now take under 0.6 s. Validation and rewriting are linear in
+  the query's length (since [#1479](https://github.com/Basekick-Labs/arc/issues/1479)),
+  but their cost depends on the query's shape. At the 1 MiB ceiling one
+  request costs about 1.7 s of CPU for a JOIN chain, and up to about 4.1 s
+  for a comma join of many short references (`FROM x,x,x…`; see
+  [#1482](https://github.com/Basekick-Labs/arc/issues/1482)). At the 10 KB
+  default, about 0.2 s at worst. `query.timeout` covers that preparation
+  too.
+- Queries longer than 10,000 characters are not kept in the SQL transform
+  cache, so a raised limit leaves the cache's memory bound unchanged.
 
 ## New: MessagePack columnar tag keys (#275)
 
@@ -23,6 +1390,47 @@ data, is left out with a warning, and the write succeeds
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#905](https://github.com/Basekick-Labs/arc/pull/905).
+
+## Changed: telemetry also reports Python SDK installations
+
+Arc's opt-out telemetry `clients` section, which lists the arcli
+installations an instance served, gains a `python_sdk` entry for the
+[Python SDK](https://github.com/Basekick-Labs/arc-client-python). The SDK
+sends a random per-installation UUID in a new, generic
+`Arc-Client-Installation-Id` header; arcli's `Arcli-Installation-Id` header
+is still accepted, and the new header wins when both are present. The client
+kind comes from the User-Agent (`arcli/...` or `arc-client-python/...`). Per
+SDK installation Arc reports the id, the SDK version, the Python version and
+the `os/arch` platform from the SDK's User-Agent (`unknown` when the
+User-Agent comment is absent or malformed), and the time it was last seen.
+Runtime and platform are limited to letters, digits and `. _ + / -`; anything
+else is reported as `unknown`.
+
+The same gates as for arcli apply: only requests that succeeded and, with
+authentication configured, carried a valid token count; public routes never
+do. Each client kind is capped at 256 distinct installations per report,
+independently, with its own `truncated` flag, so containers minting a new SDK
+id on every start cannot push arcli installations out of the report. The
+`clients.arcli` object is unchanged. Both installation headers are stripped
+when a cluster node forwards a request, so a forwarded request is counted
+once, by the node that received it.
+
+One behaviour change for arcli: a request carrying an installation id whose
+User-Agent names neither arcli nor the SDK is no longer counted (it used to be
+recorded with version `unknown`), so foreign traffic cannot inflate the
+counts. arcli always sends its own User-Agent, so its counts are unaffected.
+
+The SDK's own switches (`DO_NOT_TRACK=1`, `ARC_CLIENT_SEND_INSTALLATION_ID=0`,
+or `send_installation_id=False`) stop it sending the id, and
+`telemetry.enabled = false` / `ARC_TELEMETRY_ENABLED=false` on the node
+disables the whole section. In ephemeral containers, setting
+`ARC_CLIENT_INSTALLATION_ID` to a fixed UUID keeps each start from counting
+as a new installation.
+
+As with arcli, the counts are only as trustworthy as the callers: any token
+holder (any caller, without authentication) can send 256 random ids with an
+SDK User-Agent and fill that kind's slots for one report, which sets
+`truncated`. The per-kind cap keeps that from affecting arcli's counts.
 
 ## Security: a crafted request can no longer crash Arc or exhaust its memory
 
@@ -77,6 +1485,88 @@ not a read statement fails its runs from this release.
 
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
+
+## Security: more relation keywords are checked in user SQL
+
+A string literal in table position is refused because DuckDB would read it as
+a file. The check now also covers `PIVOT_WIDER`, `PIVOT_LONGER`, `DESC` and
+`SHOW`, DuckDB's other spellings of `PIVOT`, `UNPIVOT` and `DESCRIBE`, which
+read a file the same way (`SHOW` at the top level too, the others inside a
+subquery), and `ONLY` between such a keyword and the relation
+(`FROM ONLY …`). Such a query is answered `400` on every query endpoint, in
+continuous queries and in `DELETE` predicates. Queries that use these keywords
+on a measurement are unaffected, and a column of one of these names referenced
+through a table qualifier (`c.show = 'a'`) is no longer refused.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@garnetarc](https://github.com/garnetarc)**.
+## Security: a malformed Parquet footer no longer stops Iceberg export
+
+Some malformed Parquet footers make the library Arc reads them with panic
+instead of returning an error. With Iceberg export on, the export pass reads
+the footer of every file it publishes, including files EdgeSync spokes send,
+so one such file stopped the process, and again on every restart while the
+file stayed in storage. The footer reads now return the panic as an error:
+the measurement holding the file fails its export pass, is logged with the
+file's name, and stays blocked until the file is removed, while every other
+measurement is exported. A panic elsewhere on the export goroutine is
+contained to its measurement the same way and logged with its stack. Footers
+over 16 MiB are refused before they are read (Arc's own are a few KiB). A
+Parquet import whose footer panics is answered `422` instead of `500`, and a
+schema anchor whose footer panics is treated as undecodable.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@glacieraxiom](https://github.com/glacieraxiom)**.
+## Security: a write with a new key on every point is refused instead of exhausting memory
+
+Arc builds a write's columns dense: every column holds a value or a NULL for
+every row. A write in which each point brought a tag or field key no other
+point had built rows x rows cells from a body linear in rows, so a few hundred
+KB of line protocol could hold more than a GB while it was parsed. A write may
+now leave at most eight cells empty for each cell it fills, or about four
+million, whichever is more, counting keys sent only as NULLs and room
+reserved for the first row's columns; past that it is answered `413` and
+nothing of it is written. The bound follows the values a write carries, not
+its size, so padding or compressing a body buys nothing. This covers line
+protocol and MessagePack rows, with or without `ingest.decimal_columns`, MQTT
+messages (refused and logged at most once per topic per interval) and line
+protocol imports, where the chunks before the refused one may already be
+written, as for any import that stops part-way. A dense write leaves no cell
+empty; a sparse one is admitted down to columns about 11% filled past the
+floor. Send points with different keys as separate writes or measurements.
+Parsing also builds each column at its final size once, roughly halving its
+peak memory for wide batches.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@glyphanchor](https://github.com/glyphanchor)**.
+
+## Security: a cached RBAC decision can no longer apply to another database
+
+The RBAC permission cache stored the database and measurement names of a check
+without copying them. On a keep-alive connection the HTTP framework reuses the
+request buffer those names point into, so a cached allow could come to match a
+different name of the same length, and a token scoped by RBAC could read a
+database it was not granted. The cache now stores its own copy of each name.
+Deployments without RBAC roles were not affected.
+
+The tiered-storage policy cache had the same shape for the database name of a
+policy. It now stores its own copy too.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@gablealder823](https://github.com/gablealder823)**.
+
+## Security: more DuckDB functions are refused in user SQL
+
+Some functions of the DuckDB release Arc links were not covered by the checks
+Arc runs on query text, and could reach data or state outside the caller's
+scope. They are now refused with `400` on every query endpoint, in continuous
+queries and in `DELETE` predicates; a stored continuous query that calls one
+fails its runs. `DELETE` predicates now apply exactly the checks queries do.
+A test now reviews the linked DuckDB's functions so an upgrade cannot add one
+unnoticed.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@harsh-prajapati1312](https://github.com/harsh-prajapati1312)**.
 
 ## Security: a cluster node that took a Raft snapshot no longer keeps revoked tokens ([#1336](https://github.com/Basekick-Labs/arc/issues/1336))
 
@@ -225,6 +1715,369 @@ success. Queries that need no cold data are served as before, and the
 failed cold tier is absent from `/health` (it was reported from a secret
 nothing read through).
 
+## Upgrade note: packaged installs keep backups in `/var/lib/arc/backups` ([#1463](https://github.com/Basekick-Labs/arc/issues/1463))
+
+Applies to the .deb, .rpm and Arch packages. The container image, Helm charts
+and Kubernetes manifests are unaffected.
+
+The packages' systemd unit runs Arc from `/var/lib/arc` with storage at
+`/var/lib/arc/data`. The packaged `arc.toml` puts backups at `./data/backups`,
+which from there is `/var/lib/arc/data/backups`, inside the storage root. The
+new overlap refusal (next note) rejects that, so without this fix a packaged
+install did not start: a fresh install and an upgrade both crash-looped under
+systemd. The unit now also sets
+`ARC_BACKUP_LOCAL_PATH=/var/lib/arc/backups`, and Arc creates that directory on
+first start.
+
+The unit sets the variable rather than the packaged `arc.toml`, because an rpm
+or Arch upgrade keeps an existing `/etc/arc/arc.toml`. The same environment
+variable also beats the file:
+
+- **If you changed `backup.local_path` in `/etc/arc/arc.toml`,** the unit now
+  overrides it, and Arc logs a warning at startup naming both paths. All three
+  packages now keep your `arc.toml` across the upgrade (the .deb from this
+  release on, see the next note); an edit that an earlier .deb upgrade already
+  reset is gone and draws no warning. Keep your directory with a drop-in:
+
+  ```
+  sudo systemctl edit arc
+  # add:
+  [Service]
+  Environment="ARC_BACKUP_LOCAL_PATH=/your/backup/dir"
+  ```
+
+  A drop-in survives upgrades. (`storage.local_path` already worked this way on
+  packaged installs.)
+
+- **Backups taken by an earlier release are still in
+  `/var/lib/arc/data/backups`**, whatever the primary storage backend: an
+  install with S3, Azure or GCS primary storage started before this fix and
+  wrote its backups there. Arc logs a warning at startup when it finds them.
+  The backup API does not list them until they are moved. With local primary
+  storage they are also inside the storage root, so:
+  - the next backup copies their data files as data;
+  - on a cluster with reconciliation enabled and `manifest_only_dry_run` off,
+    the sweep deletes their data files, leaving backups that look complete and
+    cannot be restored;
+  - each of them already holds a copy of the ones taken before it.
+
+  Move them before starting 27.01.1. The loop moves only directories that
+  contain a `manifest.json`, so a database named `backups` stays where it is:
+
+  ```
+  sudo systemctl stop arc
+  sudo mkdir -p /var/lib/arc/backups
+  sudo sh -c 'for d in /var/lib/arc/data/backups/*/; do
+    if [ -f "$d/manifest.json" ]; then mv "$d" /var/lib/arc/backups/; fi
+  done'
+  # Fails, harmlessly, if anything is left: a database named backups, or a
+  # partial backup with no manifest.json. Inspect what is left before deleting it.
+  sudo rmdir /var/lib/arc/data/backups
+  sudo chown -R arc:arc /var/lib/arc/backups
+  sudo chmod 700 /var/lib/arc/backups
+  ```
+
+  With local primary storage, restoring one of these older backups with
+  `restore_data` writes the data files of the backups nested in it back to
+  `/var/lib/arc/data/backups/<id>/data/...`, without their `manifest.json`.
+  Arc does not warn about those; delete them by hand.
+
+- **After upgrading a .deb or .rpm from 26.09.x, re-enable the service.** The
+  26.09 package's remove script stops and disables `arc.service` on every
+  upgrade, and on an upgrade that script comes from the old package. Run
+  `sudo systemctl enable --now arc` after the upgrade. From this release on,
+  the deb and rpm scripts stop and disable the service only on removal, and
+  an upgrade restarts a running service with the new binary. Arch upgrades
+  never stopped the service and still do not restart it.
+
+The release pipeline now installs the .deb, starts it under systemd and
+reinstalls it over itself to check the service survives an upgrade, and it
+boots the Arch package with its unit's user, working directory and environment.
+Before, every boot test ran the binary from a directory of its own choosing,
+and none of them saw the packaged layout. The three packages now share one unit
+file, `deploy/systemd/arc.service`.
+
+## Fix: .deb upgrades keep `/etc/arc/arc.toml` ([#1465](https://github.com/Basekick-Labs/arc/issues/1465))
+
+Every .deb upgrade used to replace `/etc/arc/arc.toml` with the stock file,
+discarding the operator's edits (auth, retention, credentials, ports) without
+a prompt or a backup copy. The rpm and Arch packages already kept the file.
+
+From this release the .deb ships the stock config at `/usr/share/arc/arc.toml`
+and installs it at `/etc/arc/arc.toml` only when that file does not exist. The
+content of an existing file is never changed, including on the upgrade from
+26.09.x: the config you have now is the one 27.01.1 starts with. A symlinked
+`/etc/arc/arc.toml` stays a symlink. As before, the package sets the file's
+owner to `arc:arc`. Keys that are not in your file take Arc's built-in
+defaults, so a config from an older release keeps working; diff it against
+`/usr/share/arc/arc.toml` to see what the new stock file documents.
+
+Upgrades never prompt, so non-interactive installs (`apt-get install -y`,
+configuration management) keep working without `--force-confold`. The file
+is not a dpkg conffile: an edited conffile prompts on every upgrade whose
+stock file changed, which is nearly every release, and the upgrade from 26.09.x
+failed non-interactively even for an unedited file.
+
+- `dpkg --remove` leaves `/etc/arc/arc.toml`. `dpkg --purge` removes it,
+  unless the other variant (`arc` or `arc-fips`) is installed and still uses
+  it.
+- `dpkg -S /etc/arc/arc.toml` no longer names a package, because no package
+  owns the file.
+- Downgrading to 26.09.x or earlier replaces `/etc/arc/arc.toml` with that
+  release's stock file, as every upgrade used to. Back it up first.
+
+## Fix: backups include, and restores replace, the config file Arc actually loaded ([#1466](https://github.com/Basekick-Labs/arc/issues/1466))
+
+`include_config` and `restore_config` used `arc.toml` in the working
+directory. Arc finds its config through a search path (the working directory,
+then `/etc/arc/`, then `~/.arc/`), so on any install whose config lives
+elsewhere both were wrong. On the .deb/.rpm/Arch packages the working
+directory is `/var/lib/arc` and the config is `/etc/arc/arc.toml`:
+
+- A backup never held the config. The backup succeeded, and the only sign
+  was a `Failed to backup config file` warning in the log.
+- A config restore wrote `/var/lib/arc/arc.toml`. The working directory is
+  searched first, so from the next start that file was the config, and edits
+  to `/etc/arc/arc.toml` had no effect.
+
+Both now use the file Arc loaded at startup. The startup line
+`Backup/restore enabled` shows it as `config_file`, and `config_restore`
+says whether this node can restore a config at all.
+
+**Backups on a package install now hold the config, and its credentials.**
+`include_config` defaults to true for a backup to a local target, so every
+default backup now contains `/etc/arc/arc.toml`, with any S3, Azure or GCS
+keys and the cluster shared secret in it. Before, these backups silently held
+no config. Treat the backup directory as secret, or send
+`"include_config": false`.
+
+**`restore_config` is refused with 400 before anything is restored** when
+the backup holds a config and the node cannot write it. The config step runs
+last, so where the write failed (a read-only ConfigMap, for example) the
+restore used to fail after the data had been restored. It is refused when:
+
+- Arc started without a config file. Arc logs a warning at startup, and each
+  backup logs that it holds no config.
+- The config file is not writable by the Arc process. This covers the rpm and
+  Arch packages, where `/etc/arc/arc.toml` is root's, and a Kubernetes
+  ConfigMap mount, which is read-only.
+- Arc cannot create the safety copy next to the config file. On the .deb,
+  `/etc/arc` is root's.
+
+**This changes what `restore_config` does on a package install.** It used to
+"work" by writing the shadow file described above; it is now refused. Restore
+the config by hand from `<backup_id>/config/arc.toml` in the backup instead.
+Docker is unaffected: the config there is `/app/arc.toml`, in the working
+directory. Note that it is in the container layer, not the `/app/data` volume,
+so a restored config does not survive recreating the container.
+
+Before overwriting, Arc copies the current config to
+`<config>.before-restore-<backup_id>`. A failed copy now fails the config
+restore, instead of logging a warning and overwriting anyway. An existing copy
+is never replaced, so neither a restore of another backup nor a retry of the
+same one overwrites the copy of the config it first replaced.
+
+**If you ran `restore_config` on a package install before this release,**
+`/var/lib/arc/arc.toml` is still your config, and `/etc/arc/arc.toml` is
+ignored. Arc now logs a warning at startup naming both files. Merge what you
+need into `/etc/arc/arc.toml`, then remove `/var/lib/arc/arc.toml`. The
+storage and backup paths are set by the systemd unit and override either file.
+
+## Fix: `IS [NOT] DISTINCT FROM` works in queries ([#1472](https://github.com/Basekick-Labs/arc/issues/1472))
+
+Arc read the `FROM` in `x IS [NOT] DISTINCT FROM y` as the start of a table
+reference, so standard SQL using the operator failed:
+
+- A literal operand (`host IS DISTINCT FROM 'a'`) was refused with "String
+  literal not allowed in table position".
+- A column or `NULL` operand was rewritten into a table scan, and DuckDB
+  failed with `Binder Error: Function "read_parquet" is a table function`.
+- With RBAC on, the operand was checked as a table, so a query could be
+  refused for a grant it does not need.
+- A comma after the operand (`SELECT a IS DISTINCT FROM b, c FROM cpu`)
+  turned `c` into a cross-join table.
+- `DELETE … WHERE host IS DISTINCT FROM 'a'` was refused.
+- Time-range pruning skipped queries that used the operator.
+
+All of these now treat the operator as a comparison. The same change fixes a
+literal after the `FROM` of a function form, such as
+`trim(BOTH FROM '  x  ')`, which was refused the same way.
+
+Arc also no longer reads a parenthesis or `FROM` inside a SQL comment as part
+of `EXTRACT`, `SUBSTRING`, `TRIM` or `OVERLAY`. A comment such as
+`/* trim( */` could previously make a real table reference after it invisible
+to the RBAC check and to the query rewrite, and the query then failed.
+
+The scan behind all of this is now one linear pass. It used to rescan each
+line once per keyword: at the default `query.max_sql_length` (10 KB) a
+crafted single-line query cost tens of milliseconds, and with the limit raised
+to 1 MiB it cost minutes. It now costs milliseconds at 1 MiB.
+
+Two spellings still fail as before, because Arc reads them as one word:
+an operand glued to the keyword (`IS DISTINCT FROM'a'`, `'a'IS DISTINCT FROM
+x`), and a non-ASCII space between the words. Put an ASCII space there.
+
+The workaround for earlier releases is `(x != 'a' OR x IS NULL)`.
+
+## Fix: a long comma join is prepared without rescanning its own rewrite ([#1482](https://github.com/Basekick-Labs/arc/issues/1482))
+
+Before running a query, Arc rewrites each table reference into a read of its
+files, in several passes. The comma-join pass ran first, and its output is
+about 30 times as long as the references it replaced, so every later pass
+scanned tens of MB for a 1 MiB query. Each pass now leaves a one-byte marker
+and the reads are put in once at the end, so every pass scans text about as
+long as the query. A whole request at the 1 MiB `query.max_sql_length`
+ceiling, before and after, measured the same way (in-process, one
+machine; earlier figures for these shapes came from a different setup):
+
+| Query (1 MiB) | Before | After |
+|---|---|---|
+| Comma join, `SELECT 1 FROM x,x,x,…` | 14.3 s | 4.1 s |
+| Comma join, `SELECT 1 FROM x, x, x, …` | 9.8 s | 2.9 s |
+| `SELECT 1 FROM x from x from …` | 3.4 s | 2.3 s |
+| `JOIN x USING (a)` repeated | 1.7 s | 1.7 s |
+
+The rest is validation and DuckDB's own parse. At the 10 KB default the worst
+shape goes from 0.31 s to 0.20 s.
+
+- `query.timeout` (or a governance policy's maximum duration) now bounds the
+  whole request, preparing the query included. Before, preparation ran
+  outside it and could not be stopped. A request whose deadline passes while
+  its query is prepared is answered `504 Query timed out`, as one that times
+  out while running is, on every query endpoint (JSON, MessagePack, Arrow,
+  the row estimate and `GET /api/v1/query/{measurement}`).
+- A query containing a NUL byte is refused with 400, on every query
+  endpoint. DuckDB stops reading a statement at the first NUL, in a string
+  literal or anywhere else, so such a query used to run cut short at that
+  byte: a different query from the one Arc validated. Continuous query
+  definitions are checked too, at creation and at every run, so a stored
+  definition containing a NUL now fails instead of running cut short.
+- A storage path that contains `from` or `join` followed by a word is no
+  longer rewritten inside the read Arc emits for it.
+
+## Fix: joins of two measurements bind unqualified columns ([#1483](https://github.com/Basekick-Labs/arc/issues/1483))
+
+A join of two measurements failed with `Binder Error: Ambiguous reference to
+table "read_parquet"` whenever DuckDB had to resolve an unqualified column or
+`*` across them, with or without an `x-arc-database` header:
+
+```sql
+SELECT count(*) FROM cpu JOIN mem USING (time, host) WHERE host = 'a';
+SELECT * FROM cpu JOIN mem ON cpu.host = mem.host;
+SELECT * FROM cpu, mem;
+```
+
+DuckDB names every unaliased file read `read_parquet`, so the two sides had
+the same name. Arc gave a table its own name only when the query qualified a
+column with it (`cpu.host`, since
+[#1447](https://github.com/Basekick-Labs/arc/issues/1447)). Now, when one
+FROM clause reads two or more measurements, each is named after itself,
+unless:
+
+- you gave it an alias, which it keeps;
+- the query already uses that name for something else: a CTE, another
+  relation, a column, a SELECT-list alias (`SELECT x AS mem … GROUP BY mem`),
+  or an outer query's column. DuckDB would bind the name to the table first,
+  so that measurement keeps its old naming. If the join is then still
+  ambiguous, give it an alias.
+
+Queries reading one measurement per FROM clause, including those with
+subqueries over another, are rewritten exactly as before.
+
+Joining a measurement to itself, or to the measurement of the same name in
+another database, still needs an alias on at least one side
+(`FROM cpu a JOIN plant.cpu b USING (time)`): both sides have the same name
+either way.
+
+## Fix: a query naming many tables no longer takes quadratic time to prepare ([#1479](https://github.com/Basekick-Labs/arc/issues/1479))
+
+Before running a query, Arc rewrites each table reference into a read of its
+files and works out which time partitions that read needs. For every
+reference it re-read the whole query: its time range, whether that range is
+relative to `now()`, and a hash for the partition cache. None of these depend
+on the table. A query made of many short references therefore took time
+quadratic in its length. Any user with query rights could hold a CPU core
+with one request:
+
+| Crafted query (whole request) | 10 KB (default limit) | 20 KB |
+|---|---|---|
+| Comma join, `SELECT 1 FROM x,x,x,…` | 9.8 s → 0.21 s | |
+| Comma join, `SELECT 1 FROM x, x, x, …` | 5.6 s → 0.15 s | 21.8 s → 0.29 s |
+| `SELECT 1 x from x from …` | 1.6 s → 0.06 s | 6.6 s → 0.10 s |
+
+Arc now reads them once per query and shares them across its references.
+Results are unchanged. A time range is only ever found for a single-table
+query, so no query's pruning differs.
+
+## Fix: a backtick in SQL is refused with a clear error ([#1480](https://github.com/Basekick-Labs/arc/issues/1480))
+
+DuckDB does not quote identifiers with backticks; outside quoted text a
+backtick is an operator character, so `` SELECT `value` FROM cpu `` has never
+run. Arc's own checks on query text, however, read backticks as quotes, so
+Arc and DuckDB could disagree about what a query said. One result was the
+reported query, which answered `success: true` with no columns instead of an
+error.
+
+A backtick outside a string literal, a `"…"` identifier or a comment is now
+refused with `400` and `backticks are not identifier quotes in DuckDB; quote
+identifiers with double quotes ("name")`. This applies to every query
+endpoint, continuous queries, the `where` parameter of
+`/api/v1/query/:measurement`, and `DELETE` predicates. Arc's checks now read
+the query exactly as DuckDB will. `` SHOW TABLES FROM `mydb` `` still works,
+because Arc answers it itself. A backtick inside a literal or a quoted
+identifier is unaffected.
+
+Two related fixes:
+- **Stream takeover `DELETE` with a backtick in a string literal.** With
+  stream takeover on, a `DELETE` whose predicate had both a backtick in a
+  string literal and a time function such as `now()` (`WHERE msg = 'a`b' AND
+  time < now()`) ran with the backtick turned into a double quote, so it
+  matched the wrong rows. It now runs as written.
+- **Stored `DELETE` records.** A record applied to a pending file is checked
+  again before it runs. A record the current checks refuse is skipped, so
+  the rows that `DELETE` removed elsewhere remain in that file. The error in
+  the log names the file and the predicate; issue the `DELETE` again with a
+  predicate the current checks accept.
+
+## Fix: continuous queries rewrite only the source reference itself ([#1487](https://github.com/Basekick-Labs/arc/issues/1487))
+
+Before a continuous query runs, Arc replaces its `FROM <database>.<measurement>`
+with a read of the measurement's files. It found that text anywhere in the
+query, including inside a string literal, a quoted identifier or a comment,
+and rewrote those occurrences too. In a `'…'` literal that made the query fail
+to parse. In a dollar-quoted string (`$$…$$`) or a quoted identifier, the query
+ran, and the storage path ended up inside the string value or the output
+column's name. Arc now rewrites only a real table reference and leaves
+everything else exactly as written.
+
+Related fixes:
+- A comment between `FROM` and the name (`FROM /* c */ db.cpu`,
+  `FROM -- c` then a newline and `db.cpu`) no longer stops the rewrite. Such
+  queries used to fail with `Table with name "db.cpu" does not exist`.
+- A query with a CTE named after its source measurement now runs, e.g.
+  `WITH cpu AS (SELECT … FROM db.cpu …) SELECT … FROM cpu`. Before, Arc
+  skipped the rewrite for it, and the query failed with `Table db.cpu does not
+  exist`.
+
+## Fix: SQL checks read three more string spellings as DuckDB does
+
+Arc masks string literals before its read-only checks run, so anything the
+masker counts as a literal is invisible to them. Three spellings were masked
+differently from how DuckDB reads them, which could leave part of a statement
+outside a literal for the checks while DuckDB kept it inside one, or the
+reverse:
+- **A dollar-quoted tag with a non-ASCII letter** (`$é$…$é$`) now opens a
+  string. DuckDB accepts these tags, as Postgres does.
+- **`e'…'` after a name that contains `$`.** In `a$e'…'` the `e` belongs to
+  the name, so the quote opens a plain string, not an escape string.
+- **An escape string continued across a newline** (`E'a'` newline `'b'`, which
+  DuckDB joins into one string) is now read as one string, so a backslash in
+  the continued part still escapes and the string ends where DuckDB ends it.
+
+This covers every query endpoint, continuous queries and `DELETE` predicates,
+and the masking of SQL in logs. A query that does not use these spellings is
+unaffected.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
@@ -277,10 +2130,12 @@ To fix either: move one path outside the other, point `backup.default_target` at
 a configured target, or set `backup.enabled = false`, which skips the check
 entirely.
 
-**Every shipped artifact is unaffected.** The stock `arc.toml` uses `./data/arc`
-and `./data/backups`; the Helm charts and Kubernetes manifests set
-`/app/data/storage` or `/app/data/arc` and leave `backup.local_path` at its
-default.
+**The container image, Helm charts and Kubernetes manifests are unaffected.**
+The stock `arc.toml` uses `./data/arc` and `./data/backups`; the Helm charts and
+Kubernetes manifests set `/app/data/storage` or `/app/data/arc` and leave
+`backup.local_path` at its default. **The .deb, .rpm and Arch packages were
+affected**, and their systemd unit now sets the backup directory itself: see
+the packaged-installs note above.
 
 Why the refusal exists: a backup destination inside the storage root makes each
 backup copy the previous one, so the inventory compounds every run. Worse, those
@@ -758,6 +2613,35 @@ During a rolling upgrade, a node still on an earlier release reads a
 GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
+
+### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
+
+`cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a
+node's peer file replication: one budget shared by all its pull workers, so
+reactive pulls, the startup catch-up and the periodic recheck together stay
+under it. It takes bytes per second or a size such as `"10MB"` (1 MB = 1024 KB);
+the default `0` is unlimited. A negative or unparseable value fails startup,
+instead of reading as unlimited. Helm: `cluster.replication.pullBytesPerSecond`.
+
+The cap does not apply to the staged compaction commit: a compacted output is
+fetched from the start every time, so a capped fetch could never deliver one
+larger than the cap allows within `cluster.replication_serve_timeout_ms`, and
+the partition would be compacted and aborted again on every cycle.
+
+Under a low cap a large file can take longer than one fetch. Each fetch is
+still bounded by `cluster.replication_fetch_timeout_ms` on the pulling node and
+by `cluster.replication_serve_timeout_ms` on the node serving the file; when
+either ends it, the next attempt resumes from the bytes already received. That
+now includes the first attempt of a new pull: before, only retries within one
+pull resumed, and every new pull of the same file (a manifest callback, the
+catch-up, the recheck) started again from zero, so a file too large for one
+pull's attempts never completed.
+A partial left by an older version of the same file fails the checksum when
+resumed; it is discarded and the same peer is asked again from the start, and
+the mismatch is not counted against that peer.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1404](https://github.com/Basekick-Labs/arc/pull/1404).
 
 ### Google Cloud Storage: primary storage, cold tier and backup target ([#1105](https://github.com/Basekick-Labs/arc/issues/1105))
 
@@ -1831,6 +3715,498 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: a governance 429 says when a retry can succeed ([#1519](https://github.com/Basekick-Labs/arc/issues/1519))
+
+With query governance on, a refused query's `Retry-After` was wrong or missing:
+
+- **A rate limit** answered with the time left in the window's current slot, so
+  `Retry-After: 1` after a burst on a per-minute limit and about `60` at most on
+  a per-hour limit, whatever the limit's real state. A client that honoured it
+  was refused again each time it came back, about 60 times per window, each a
+  log warning and a count in the rate-limit metric. It now answers with the
+  time until enough of the oldest requests have left the window to bring the
+  count under the limit: about 60 seconds after a burst on a per-minute limit.
+  When the per-minute and per-hour limits are both exhausted, it answers with
+  the longer of the two waits.
+- **A quota** (`max_queries_per_hour`, `max_queries_per_day`) answered with no
+  `Retry-After` at all. It now carries the seconds until the exhausted quota
+  resets, or until the daily reset when both are exhausted. The rejection's log
+  line gains the `retry_after_sec` field the rate-limit line already has.
+
+A quota now resets exactly on the hour or day boundary, not just after it, so a
+client that waits exactly `Retry-After` is not refused. `Retry-After` is always
+at least 1. See also #1524 below: a refused query no longer counts against any
+limit. Clients that retry on `Retry-After` will retry
+later than they did, and less often.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1520](https://github.com/Basekick-Labs/arc/pull/1520).
+
+### Fix: a governance-refused query is counted against no limit ([#1524](https://github.com/Basekick-Labs/arc/issues/1524))
+
+The rate limits and quotas were checked one after another, each counting the
+query as it passed: a query refused by the per-hour limit had already used a
+per-minute slot, and one refused by a quota had used both rate limits. A client
+that kept retrying after a refusal used up the earlier limits too, and could be
+refused by one of those when it came back on time. The limits are now checked
+together and a query is counted against all of them only when every one admits
+it: a refused query spends nothing, and a client that waits `Retry-After` finds
+every limit as it was told. A refusal names the limit with the longest wait
+(the reason in the 429, the log line, and `arc_governance_rate_limited_total`
+or `arc_governance_quota_exhausted_total`), and `Retry-After` is that wait.
+Refused queries no longer appear in the counts the governance usage endpoint
+reports. When the hourly and daily quotas are both exhausted, the refusal now
+names the daily one, whose reset it waits for. A client that keeps hammering
+after a refusal is still refused on every request until the wait has passed.
+
+### A scheduled compaction that finds a cycle running runs when it ends ([#220](https://github.com/Basekick-Labs/arc/issues/220))
+
+The hourly and daily compaction schedulers share one cycle claim with the manual
+trigger. A tick that found the claim held logged an Info line and did nothing
+until its next tick, which costs the hourly tier an hour and the daily tier a
+day. If the collision repeats, daily compaction never runs. At the default
+schedules it happens whenever the 03:00 daily cycle is still running at the
+03:05 hourly tick; schedules that share a minute, a raised
+`compaction.cycle_timeout` or a manual cycle at the tick cause it too.
+
+Such a tick now runs once, as soon as the claim is released. It passes the same
+compactor lease and cluster-wide pause checks as any tick when it does. It gives
+up at the scheduler's next tick, and a tick lost that way is logged at Warn and
+counted in the new `arc_compaction_scheduled_skips_total{tier}`. If the claim is
+released just before that next tick, the deferred run starts and the next tick
+waits behind it, so the tier runs twice in a row. Stopping compaction, at
+shutdown or when this node loses the compactor lease, tells both schedulers to
+stop before waiting for either, so a waiting tick never starts a cycle then.
+The schedules, the per-tier API trigger and the status endpoint are
+unchanged.
+
+This also removes a rare deadlock: `Stop` could wait forever for a tick that had
+just started, which was itself waiting for the lock `Stop` held.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar)
+([#1507](https://github.com/Basekick-Labs/arc/pull/1507)).
+
+### `allow_unreachable=true` stops waiting for files nothing is delivering ([#1426](https://github.com/Basekick-Labs/arc/issues/1426))
+
+On a cluster, a DELETE waits for files the manifest lists that are not on the
+primary yet: replicated files and compaction outputs still on their way. It
+waits up to 30 seconds, then answers `503` naming them in
+`unreachable_files`, or with `allow_unreachable=true` runs without them. With
+the flag it still waited the full 30 seconds first, once per scan, even for a
+file no node holds any more. A DELETE can scan several times, before and after
+it is recorded and after a compaction replaced a file it read, so it could
+take minutes. A client with a 30-second timeout saw a connection failure for
+a DELETE that ran, and lost the list of files it skipped.
+
+With `allow_unreachable=true`, a missing file is now waited for only while
+something is delivering it: the replication puller has it queued or in
+progress, or on shared storage a staged compaction holds it. A file missing
+for 5 seconds with nothing delivering it is given up for the rest of the
+request and reported in `unreachable_files`. A file still on its way is waited
+for up to 30 seconds, as before. Without the flag nothing changes.
+
+The rows of a file in `unreachable_files` are not deleted. Run the DELETE
+again once the file is on the primary to remove them. On shared storage, the
+flush of the other nodes before a DELETE keeps its own timeouts.
+
+### Storage errors stay readable in the log ([#1113](https://github.com/Basekick-Labs/arc/issues/1113))
+
+Arc masks every quoted span in a logged error, because engine errors quote the
+values they refuse, and it logs only an error's first line. Storage errors that
+quoted the offending value lost exactly that part in the log, and a value with
+a quote in it masked the rest of the line:
+`storage prefix "..." contains an unsupported character '...'`.
+
+Storage errors no longer quote values. They say what is wrong instead:
+
+- An unsupported character in an object-store prefix, or a glob metacharacter
+  in a path, is named by its code point (`U+0027`), and the prefix error lists
+  the allowed characters.
+- Key and prefix errors describe the problem (an empty, `.` or `..` segment, a
+  trailing separator, the write-staging suffix, a length over the limit)
+  without repeating the key. A database name starting with `_` is refused as
+  reserved.
+- An unknown backend type, a GCS endpoint that is not an http(s) URL, and a
+  GCS bucket Arc cannot use are described, and the bucket is named unquoted.
+- A batch delete on S3, Azure or GCS logs each key it refuses as a warning
+  with the key as a `key` field, and names the key in front of its reason in
+  the returned error. Only the first line of the batch error reaches the log.
+
+Contributed in part by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+
+### A delete's WHERE may qualify columns by the measurement name ([#1451](https://github.com/Basekick-Labs/arc/issues/1451))
+
+`POST /api/v1/delete` with `"where": "cpu.host = 'web-1'"` on measurement `cpu`
+failed with `Referenced table "cpu" not found`, while `"where": "host = 'web-1'"`
+worked. The caller sends only the predicate, so there was no alias to give the
+measurement either. A qualifier naming the measurement is now dropped before
+the clause is validated, recorded or run: `cpu.host`, `"cpu".host` and
+`CPU.host` all mean the column `host`. A name used bare (`cpu = 'x'`), one
+deeper in a path (`x.cpu.host`), and text inside string literals are left as
+written.
+
+The rows read are not renamed after the measurement, on purpose. A
+measurement often has a field named like itself, and in a file without that
+field the name would then stand for the whole row: `temperature IS NOT NULL`
+would match every row of such a file and delete it.
+
+As with a query's table-name qualifier
+([#1447](https://github.com/Basekick-Labs/arc/issues/1447)), a struct column
+named like its measurement is no longer reached through that name with a
+field (`cpu.x` now means the column `x`).
+
+### A column qualified by its table's name binds ([#1447](https://github.com/Basekick-Labs/arc/issues/1447), [#1450](https://github.com/Basekick-Labs/arc/issues/1450))
+
+`SELECT readings.value FROM readings` failed with `Referenced table "readings"
+not found`. Arc replaces a table reference with a `read_parquet(...)` read, and
+DuckDB names that relation `read_parquet`, so a column qualified by the table's
+own name no longer matched it. The query worked only when it gave the table an
+alias of its own (`FROM readings r ... r.value`). Postgres and TimescaleDB SQL
+qualifies columns this way all the time, for example the LATERAL subquery that
+reads the latest value of each channel at a point in time:
+
+```sql
+SELECT c.ch, r.time, r.value
+FROM (VALUES ('x'), ('y'), ('z')) c(ch)
+LEFT JOIN LATERAL (
+  SELECT time, value FROM readings
+  WHERE readings.channel_id = c.ch AND time <= TIMESTAMP '2026-11-03 16:22:00'
+  ORDER BY time DESC LIMIT 1
+) r ON true
+```
+
+The rewritten read now carries the table's name (`AS "readings"`) whenever the
+query qualifies a column with it and the reference has no alias of its own.
+This covers `FROM`, every `JOIN` form, comma joins, `database.table` references
+(named by the table), and queries with or without the `x-arc-database` header.
+It also covers continuous queries, whose source read is named after the source
+measurement: a body such as
+`SELECT cpu.host, avg(cpu.usage) AS usage FROM prod.cpu WHERE time >= {start_time} AND time < {end_time} GROUP BY 1`
+failed at every scheduled run and now writes its rows. A query that never qualifies by
+table name is rewritten exactly as before.
+
+A query that also gives the name to another relation, as in
+`FROM readings JOIN (SELECT ...) readings USING (channel_id)` or
+`FROM (...) readings WHERE EXISTS (SELECT 1 FROM readings WHERE readings.value = 100)`,
+keeps the unaliased read: naming the table as well would be a duplicate alias
+in the first, and would change which relation `readings.value` reads in the
+second. This holds wherever the other relation is in the query, including a
+subquery or `LATERAL` join aliased with the table's name
+(`LEFT JOIN LATERAL (SELECT ... FROM readings ...) readings ON true`); give one
+of the two a different alias to qualify by the table's name there. A column named like the table, such as Telegraf's `cpu` tag on the
+`cpu` measurement, is not an alias wherever it appears, so it does not stop
+the table being named.
+
+Two things now behave the way Postgres does, where before they relied on the
+relation having no name:
+
+- **A struct column named like its table.** In a query that also qualifies by
+  the table name, `readings.value` now names the table's column `value`, not a
+  field of a struct column called `readings`.
+- **`read_parquet.col`.** A query that qualified columns with the internal name
+  `read_parquet` keeps working unless it also qualifies by the table name.
+
+A table reference followed by `WITH ORDINALITY` keeps its old form, because
+DuckDB accepts that clause only before an alias. A delete's `WHERE` may
+qualify columns by the measurement name too; see
+[#1451](https://github.com/Basekick-Labs/arc/issues/1451) above.
+
+### A MessagePack value its column cannot hold is a client error, not a 500 ([#1424](https://github.com/Basekick-Labs/arc/issues/1424))
+
+A columnar MessagePack record with a value of the wrong type for its column,
+such as `{"m": "cpu", "columns": {"time": [1, 2], "v": [1, "oops"]}}`, was
+answered `500 Failed to write records`, while the same conflict in row records
+or over line protocol is a `400` partial write. Clients take a 500 for a server
+failure: the Python SDK's buffered writer, for one, could not tell whether the
+batch was written. The record is now refused for its content, like a column
+that changes between string and binary: a request whose only record it is gets
+a `400` naming the measurement and column, and in a batch the record is
+dropped, the others are written, and the answer is the `400` partial write.
+Nothing of the refused record reaches the WAL, so it is not replayed at the
+next start. The same applies to a value outside a decimal column's precision,
+which over line protocol on a node with `ingest.decimal_columns` also answered
+500. An MQTT message is handled the same way: its other records are written
+and the refused one is logged as dropped points, and a message refused whole
+is logged as refused for its content, at most once per topic every ten
+minutes, instead of as an error each time.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1444](https://github.com/Basekick-Labs/arc/pull/1444).
+
+### The tiering file list applies the tier and database filters together ([#1430](https://github.com/Basekick-Labs/arc/issues/1430))
+
+`GET /api/v1/tiering/files?tier=cold&database=X` returned the database's files
+in every tier: with `database` set, `tier` was ignored. With both set, the list
+is now the database's files in that tier, newest partition first as for
+`database` alone, read from SQLite on its `(database, tier)` index. `limit`
+applies to that list as before. Either filter alone is unchanged. A `tier`
+other than `hot` or `cold`, such as `COLD` or `warm`, used to list the hot
+files with a `200`; it is now answered `400 invalid tier`, with or without
+`database`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1446](https://github.com/Basekick-Labs/arc/pull/1446).
+
+### The scheduler control routes say why a scheduler is not running ([#1433](https://github.com/Basekick-Labs/arc/issues/1433))
+
+`POST /api/v1/schedulers/cq/reload` and `POST
+/api/v1/schedulers/retention/trigger` answered `503 "... is not running -
+enterprise license required"` whenever the scheduler was not running, also on
+a licensed node with `continuous_query.enabled` or `retention.enabled` set to
+false. They now give the reason `GET /api/v1/schedulers/` gives: without a
+valid license, or with a tier that does not include the scheduler, a `403`, as
+other license-gated routes answer; with the license in order, a `503` saying
+the feature is not enabled or the scheduler failed to start, which the startup
+log reports. `GET /api/v1/schedulers/` now names that second cause too.
+
+A retention trigger the scheduler refuses without running anything is no
+longer a `500`: on a cluster node that is not the primary writer, or while a
+retention cycle is running, it is a `409`. A trigger after the license stopped
+including the scheduler, which answered `200 "Retention triggered
+successfully"` without running anything, is a `403`. A CQ reload after the
+license stopped including the scheduler stopped every continuous query and
+answered `200 "CQ scheduler reloaded successfully"`; it is now a `403` and
+leaves the running continuous queries as they were.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1445](https://github.com/Basekick-Labs/arc/pull/1445).
+
+### A query reads only what its permission check authorised ([#764](https://github.com/Basekick-Labs/arc/issues/764))
+
+With RBAC on, a query's permission check reads the table names in the SQL it
+receives, and the query transform separately turns those names into the
+storage paths that are read. Where the two disagreed about a name, the query
+read a database and measurement that nobody checked (#986 fixed three such
+cases). The transform now records the database and measurement of every
+storage path it builds, including on a cached transform, and any the
+permission check did not cover is checked before the query runs. A query
+refused there answers 403, on `/api/v1/query` (JSON and MessagePack),
+`/api/v1/query/arrow`, `/api/v1/query/estimate` and `GET
+/api/v1/query/:measurement`. A transform that reads storage without recording
+what it reads is refused with a 500 rather than run unchecked.
+
+When the permission check saw everything the transform reads, which is the
+case for every query today, the new check makes no RBAC call; recording the
+reads adds about 3-5% to the transform.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
+
+### Time-bounded arcx queries avoid listing unrelated partitions ([#661](https://github.com/Basekick-Labs/arc/issues/661))
+
+The arcx router listed every file of the measurement for each routed query. A
+date-trunc or flat-scan query whose `WHERE` bounds `time` on both sides now
+lists only the hour and day partitions of that range, as the DuckDB path does.
+On a local measurement with a year of hourly partitions, a one-hour window
+went from 198 ms to 0.1 ms and a seven-day window to 5.4 ms. A query bounded
+only by a start (`time > now() - INTERVAL '1 hour'`) still lists the whole
+measurement, so rows stamped ahead of the clock are never left out. Other
+query shapes, and object storage, keep the full listing.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1293](https://github.com/Basekick-Labs/arc/pull/1293).
+
+### A line-protocol write is no longer refused part-way by the ingest gate ([#1422](https://github.com/Basekick-Labs/arc/issues/1422))
+
+A line-protocol body with several measurements is buffered one measurement at
+a time, and the ingest gate (the fence and stream-takeover pauses, #1207) was
+checked again for each one. When the gate closed part-way, during a writer
+failover or a stream takeover, the write stopped after its first measurements
+were already buffered, and a client that resent the request, such as Telegraf
+or an InfluxDB client, wrote those rows twice. The gate is now checked once
+for the whole request, before anything is written, as it already was for a
+MessagePack batch: a request admitted before the gate closes is no longer
+refused part-way by it. Other failures can still stop a request part-way, and
+are answered with what was written (#1437). The line-protocol, CSV and Parquet
+imports still check the gate for each buffer call, so it stops a long import
+part-way.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1428](https://github.com/Basekick-Labs/arc/pull/1428).
+
+### A refused write is no longer replayed from the WAL ([#1438](https://github.com/Basekick-Labs/arc/issues/1438))
+
+With the WAL enabled and `cluster.wal_coverage` off (every standalone node, and
+clusters that leave it off), a live write appended its WAL entry before the
+checks that can still refuse it: schema churn on the measurement, a request
+cancelled by its client, a node shutting down, and (for columnar MessagePack)
+a column that could not be converted. The client got the refusal, usually a
+`503` it resent, but the entry stayed in the WAL. A crash before the next
+purge, or for a shutdown refusal the next start, replayed it, so the rows were
+stored twice.
+
+- **`wal.ack_mode = "queued"`** (the default until [#1499](https://github.com/Basekick-Labs/arc/issues/1499) made `"auto"`, durable with the WAL on, the default): the WAL entry is now built
+  before the shard lock, as before, but only queued for the WAL file after
+  those checks pass, under the same lock that puts the batch in the buffer.
+  WAL coverage already worked this way. A refused write leaves nothing in the
+  WAL. The on-disk format is unchanged.
+- **`wal.ack_mode = "durable"`:** a write is acknowledged only once its entry
+  is synced, and that wait cannot happen under the shard lock, so the entry is
+  still written first. A refusal after it now retracts the entry with a
+  checkpoint, the same record a flush writes, so recovery never replays it.
+  The same applies when one chunk of a split payload fails after the others
+  were written, and when the sync itself fails (the checkpoint is then
+  attempted, and usually fails with it). A retraction that cannot be written
+  leaves the old behaviour: the write may come back at the next start. Each
+  one is counted in `arc_wal_retractions_failed_total` and logged at Error, at
+  most once every 10 seconds.
+- **The conversion now runs before the WAL append** in every mode, so a value
+  it refuses never reaches the WAL.
+- **A full WAL queue** that drops a later chunk of a large write at commit
+  keeps the chunks already queued tracked, so their flush checkpoints them.
+  Before, they were replayed at the next start next to the rows the buffer had
+  already stored.
+
+In queued mode this also closes a race with the flush-failure recovery pass.
+A write's WAL entry and its batch now enter the WAL queue and the buffer in
+one step, so the pass can no longer replay an entry whose rows are still in
+the live buffer.
+
+### Filesystem-equivalent spoke IDs cannot share a sync namespace ([#740](https://github.com/Basekick-Labs/arc/issues/740))
+
+Spoke IDs that differ only in letter case or Unicode normalization
+(`rocket_01` and `ROCKET_01`, or `café` in NFC and NFD) are one directory on
+storage that folds names: a local root on macOS APFS (by default) or Windows.
+There either spoke could write into the other's namespace.
+
+- Registering an ID that collides this way with one registered on the same
+  hub node is refused with `409`, on every storage backend. The comparison
+  folds case the way APFS does, including scripts whose cases plain Unicode
+  folding leaves apart (Cherokee).
+- An existing pair is handled by what the hub's storage does, which Arc
+  probes at startup on the local storage root, for case and for
+  normalization separately. A pair that is one directory there is refused for
+  sync, every member of it (`401`, logged on the hub), and reported at
+  startup. A pair that is two directories there keeps syncing, and the startup
+  log names it, since moving that storage to a volume that folds the
+  difference would merge them: any pair on Linux filesystems, S3, Azure and
+  GCS, and a case-only pair on case-sensitive APFS, which still normalizes.
+- A refused member logs a warning on the hub at every sync attempt. Disabling
+  or deleting the other member of the pair lets it sync again; re-register the
+  edge box you moved under a distinct ID. On a volume that folds names the
+  remaining spoke's directory already holds both spokes' files: deleting a
+  registration keeps its data.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1401](https://github.com/Basekick-Labs/arc/pull/1401).
+
+### A write that fails part-way says what was written ([#1437](https://github.com/Basekick-Labs/arc/issues/1437))
+
+A line-protocol or MessagePack request with several measurements is buffered
+one measurement at a time. If one failed after the earlier ones were buffered,
+the answer read as if nothing had been written. For a fence or a WAL entry that
+could not be made durable, that was a 503 with `Retry-After` and
+`X-Arc-Ingest-Fenced` or `X-Arc-Ingest-Refused`. For schema churn or a shutdown,
+it was a 503 "Write rejected". Otherwise it was a 500. A client that resent the
+request, as Telegraf and the InfluxDB clients do on any 5xx, wrote the buffered
+measurements twice. MQTT subscriptions resent a message refused with
+`wal_not_durable` the same way.
+
+- **A failure after part of the request was buffered is now a `500` that says
+  what was written.** The body has `rows_written`, `written_measurements` and
+  `stopped_at_measurement`, the fields an import that stops part-way already
+  answers with. Points left out for good (a field named `time`, a value that
+  does not fit its column, a measurement refused for its content) add
+  `points_dropped` and `dropped`. The answer has no `Retry-After` and no
+  `X-Arc-Ingest-*` header. The part of the request it stopped at, and every part
+  after it, was not buffered. With the WAL enabled, the part it stopped at may
+  still come back from the WAL at the next start.
+- **Why 500 and not a 4xx.** Telegraf and the InfluxDB clients drop a batch
+  answered `4xx` for good, which would lose the measurements that were not
+  written. They do still resend a `500`, which duplicates the written part.
+  Compaction collapses rows identical in every column, so timestamped lines
+  converge. Lines without a timestamp get a new server time when resent, so
+  their duplicates remain. A client that reads the body can resend only the
+  measurements not listed in `written_measurements`.
+- **MQTT:** a message stopped part-way is no longer resent whole. It is counted
+  in the failed messages and logged with what was written.
+- **A measurement refused for its content during the write** (a column changed
+  between string and binary since the request was checked, or a column name
+  that cannot be stored) is now dropped, and the other measurements are written.
+  The answer is the usual `400` `partial write: N points dropped: ... the other
+  points were written`. Before, the request stopped there with a `400` that read
+  as if nothing had been written.
+- **Unchanged:** a failure before anything was buffered keeps its answer, so a
+  `503` with `Retry-After` still means nothing was written. A request refused
+  up front (a fence, WAL disk pressure, a column type change caught before the
+  write) is also unchanged.
+
+The record path that deployments with decimal columns use now writes
+measurements in name order, as the default path already did. The
+`wal_not_durable` refusal text no longer says earlier parts of the request may
+already be stored: a refusal is now only answered when nothing was buffered.
+
+### Failed flushes report rows without a WAL copy ([#1377](https://github.com/Basekick-Labs/arc/issues/1377))
+
+With `wal.enabled = false` (the default) a failed flush loses the rows it
+held: nothing else has a copy, and nothing retries it. Arc logged them as
+"data preserved in WAL for recovery". It now says what happened:
+
+- A failed flush logs `Flush failed; rows without a WAL copy were lost` with
+  `records_without_wal`, and adds them to the new counter
+  `arc_buffer_records_dropped_total` (also in `/api/v1/metrics` and the
+  metrics time series). With the WAL on, rows whose WAL append succeeded are
+  not counted, and the message says they are replayed by the next recovery
+  pass (`wal.recovery_interval_seconds`) or on restart; rows whose append
+  failed have no copy and are counted. A flush that fails after writing some
+  of its hours counts all of its rows without a copy, including those hours.
+- Shutdown does the same for rows it cannot write in its time budget: those
+  without a WAL copy are logged and counted as lost, not as "remain in the
+  WAL", and `arc_wal_records_preserved_total` counts only rows the WAL holds.
+- One failed flush logs one Error, not two.
+
+Alert on `increase(arc_buffer_records_dropped_total[5m]) > 0`. To keep rows
+across a failed flush, enable the WAL.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1379](https://github.com/Basekick-Labs/arc/pull/1379).
+
+### A deleted database disappears from the database list ([#1425](https://github.com/Basekick-Labs/arc/issues/1425))
+
+`GET /api/v1/databases` and `SHOW DATABASES` built their lists from
+directories, so a deleted database whose directories outlived its files stayed
+listed, with `measurement_count: 0`, and `GET
+/api/v1/databases/:name/measurements` still listed its measurements, while
+`GET /api/v1/databases/:name` answered 404. Two stores do that:
+
+- **Local storage.** The delete removed the files but left their
+  `measurement/YYYY/MM/DD/HH` directories. It now removes the empty
+  directories, deepest first; a directory that still holds a file stays, with
+  the directories above it. Deleting a database an earlier version left
+  behind still answers 404, and now removes its directories too.
+- **Object stores that keep empty prefixes** (SeaweedFS). A prefix outlives
+  its last object, and Arc cannot remove it through the storage API.
+
+So all three now answer by the rule `GET /api/v1/databases/:name` uses: a
+database is its marker, a file, a tiering metadata row, or a cluster manifest
+entry, and directories alone are not one.
+
+What that costs:
+
+- `GET /api/v1/databases` already reads every file, so a database with a file
+  or a tiering row costs nothing extra. Each other database is checked, 16 at
+  a time. On a store that keeps empty prefixes every database ever deleted
+  stays one of those, so the list's cost grows with them.
+- `SHOW DATABASES` read only directories, and now looks for each database's
+  first file, 16 at a time: usually one listing request on an object store,
+  plus one for a database with only its marker.
+- The measurements endpoint, for a database without a marker, now also looks
+  for its first file.
+- `GET /api/v1/databases/:name`, for a database without a marker, now stops at
+  its first file instead of listing all of them. That is every database
+  created by a write rather than by `POST /api/v1/databases`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1427](https://github.com/Basekick-Labs/arc/pull/1427).
+
+### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
+
+The execution-history endpoint now includes runs whose duration is still
+`NULL`. Their existing numeric `execution_duration_ms` field is `0` until the
+run completes; completed and failed durations are unchanged. Runs started in
+the same second are listed newest first, matching `last_execution_status`, and
+a row the endpoint cannot read is logged instead of being dropped silently.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1417](https://github.com/Basekick-Labs/arc/pull/1417).
+
 ### Compaction keeps sort-key files ordered by hour, and compacts a partition that lacks a sort-key column ([#1409](https://github.com/Basekick-Labs/arc/pull/1409))
 
 With `ingest.sort_keys` (or `ingest.default_sort_keys`) set, ingest writes each
@@ -2873,8 +5249,9 @@ settings, these queries returned too few rows, with `success: true`:
 
 A range is now read only from the query's single WHERE clause, and only from
 its top-level `AND` terms that are exactly a comparison of `time` with a
-literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
-`BETWEEN`. Other terms are ignored, which only widens the range. A top-level
+literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, with
+an epoch call of one number (since
+[#1491](https://github.com/Basekick-Labs/arc/issues/1491)), or a `BETWEEN`. Other terms are ignored, which only widens the range. A top-level
 `OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
 the whole measurement, correctly but without pruning.
 
@@ -2886,6 +5263,8 @@ subquery, or a FROM or JOIN, inside a FILTER still means no range.
 Accepted spellings:
 - the column as `time`, `"time"`, `alias.time` or Grafana's `(time)`;
 - the literal as `'…'`, `'…'::timestamp` or `TIMESTAMP '…'`;
+- (since [#1491](https://github.com/Basekick-Labs/arc/issues/1491)) `epoch_ms(n)`,
+  `make_timestamp(n)` or `to_timestamp(x)` of one numeric literal;
 - the reversed form `'…' <= time`;
 - one trailing `;`.
 
@@ -3575,6 +5954,59 @@ outside the writer's WAL, and a standby writer refused it with `503`.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
 
+### Bulk imports write in parallel, and wait for a slot at most 30 seconds
+
+Earlier builds of this release let one bulk import (`/api/v1/import/lp`, `csv`,
+`parquet`) write at a time per node, whatever its size: a 46-core writer
+loading 64 MB line-protocol files with tsm2arc ran at about 85 MB/s, against
+about 1,250 MB/s on 26.09.2, with the CPUs mostly idle. More requests in flight
+only made each wait longer. A request that waited could not be abandoned: the
+server does not see a client that gives up, so the import later wrote all its
+rows, and a client retry wrote them a second time.
+
+Measured on a 14-core laptop, 64 MB line-protocol files, 16 in flight:
+
+| | Before | Now |
+|---|---|---|
+| Throughput | 67 MB/s | 319 MB/s |
+| Median import | 15.4 s | 3.0 s |
+| Peak memory | 4.5 GB | 5.7 GB |
+
+- New `ingest.import_write_concurrency` (default `0` = auto): how many imports
+  write at once. Auto is as many as fit an eighth of the memory limit at one
+  import allowance each (an eighth of the memory limit, 64 MB to 512 MB), at
+  most the CPUs Arc runs on (`GOMAXPROCS`, which a licence's core count can
+  lower), at least one: one on a 3 GiB writer, nine on a 36 GiB laptop, 46 on
+  a 46-core, 320 GiB writer licensed for all its cores. The value is logged at
+  startup ("Bulk import write slots configured"). Each writing import may hold
+  about one allowance plus its upload, and each import that wakes from a wait
+  writes one batch before it paces again; set a lower value to bound memory
+  more tightly. An explicit value (1 to 1024) is used as is. `1` restores one
+  import writing at a time; the next one starts while the previous one is
+  still flushing, within the same allowance.
+- New `ingest.import_queue_timeout_ms` (default `30000`; `0` = until a slot
+  frees, since the server does not see a client that gives up): an import that waited this long for a slot is refused with
+  `503`, `X-Arc-Ingest-Refused: import_queue` and `Retry-After`. Nothing of it
+  was written, so it is safe to retry. Keep it well under the client's own
+  timeout.
+- A client that times out while its import is writing still gets no answer,
+  and the import still completes: treat such an attempt as possibly written
+  before retrying it.
+- An import ends by flushing its own measurements' buffers, not every buffer
+  on the node, and it gives its slot (and its allowance) to the next import
+  before that flush. An import that stops part-way flushes what it wrote
+  before it answers. While an import waits for flushes it flushes its own
+  measurements again every second; a flush that fails there stops it part-way
+  (`500`), as the first one did.
+  The `200` contract is unchanged: the rows are in the buffer and the WAL
+  (when enabled), files follow as their flushes finish.
+- A write refused because other writers of the same measurement keep
+  changing its columns (`ErrSchemaChurnExceeded`) is tried again up to five
+  times inside the import before it fails (not for line-protocol imports on
+  deployments with `ingest.decimal_columns`, which write records). With imports running side by
+  side, two imports into one measurement whose columns change type can now
+  meet more often; that still fails part-way, as before.
+
 ### Bulk imports no longer hold the whole file in memory several times
 
 The import endpoints (`/api/v1/import/csv`, `parquet`, `lp`, `tle`) read the
@@ -3608,12 +6040,12 @@ peaked at 2.2 GiB.
   what the buffer held when it started. Over that it flushes its database's
   buffers and waits; if the buffered rows stay above the limit for two
   minutes, it stops (a failure part-way, below).
-- One import writes at a time on a node. Imports sent together are validated
-  together and written one after the other: concurrent write passes would add
-  up their allowances. Every request body is held in memory while it waits.
-  A forwarded import waiting its turn on the writer still counts down
-  `cluster.import_forward_timeout_ms` on the node that forwarded it, so a
-  `504` there can mean it was still queued.
+- Imports write in parallel, up to `ingest.import_write_concurrency` at once
+  on a node (#1429, above). Each writing import paces against one limit
+  shared by all of them: the lowest buffered level any of them started at,
+  plus the allowance of every import holding a slot. Every request body is held in memory while it waits for a slot.
+  A forwarded import waiting for a slot on the writer still counts down
+  `cluster.import_forward_timeout_ms` on the node that forwarded it.
 - A validation pass reads the whole file, chunk by chunk, before anything is
   written, so a bad file is still refused with nothing written: a bad time
   value, an invalid measurement name, a measurement the token may not write,
@@ -4627,6 +7059,17 @@ New metrics: `arc_manifest_repair_dropped_total`,
 the last repair under `compaction_commit.manifest_repair` (`dropped`,
 `adopted`, `retiered`, `pending`, `error`).
 
+### Local `ReadToAt` no longer returns staged partials ([#1199](https://github.com/Basekick-Labs/arc/issues/1199))
+
+No operator-visible change. On local storage, a ranged read of a file (the
+peer file fetch that replication uses, and edge sync resuming a transfer) could
+return the bytes of an interrupted transfer when the committed file was
+missing. It now reads committed files only, like the size and existence checks;
+a missing file is reported as not found. Resuming an interrupted replication
+pull still works: it reads the partial through the staging interface.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1203](https://github.com/Basekick-Labs/arc/pull/1203).
+
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 
 The delete endpoint's keyword scan used `\b` directly on the masked WHERE
@@ -4997,6 +7440,16 @@ leader writer, or compaction and reconciliation on the active compactor
 ([#1214](https://github.com/Basekick-Labs/arc/issues/1214)). Files already left
 unregistered by earlier versions are not picked up retroactively.
 
+### Legacy standalone restores preserve unverifiable cold objects ([#1189](https://github.com/Basekick-Labs/arc/issues/1189))
+
+Standalone tier scans rebuild cold metadata from the cold listing. When a
+pre-stage-C backup has no per-file sidecar row for an object already held in
+cold storage, restore leaves that object untouched and reports
+`cold_rows_skipped_unverifiable` instead of replacing the only cold copy with
+bytes it cannot verify.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1205](https://github.com/Basekick-Labs/arc/pull/1205).
+
 ### The cold-tier storage backend closes during shutdown ([#1103](https://github.com/Basekick-Labs/arc/issues/1103))
 
 The S3 or Azure backend used by tiering is now closed with the other storage
@@ -5077,14 +7530,32 @@ can see change with it, all in the safe direction:
 - a backup counts such a path as absent — and says so in its incomplete
   sample — instead of recording a partial's size and then failing to copy it.
 
-One asymmetry to know about, because it is the thing most easily got wrong
-from the sentence above: **`ReadToAt` still serves staged data** when no
-committed file exists. The resume path depends on that. So a caller must not
-pair a committed-only `StatFile` size with a `ReadToAt` read and assume both
-saw the same bytes; the interface comments now say so, and making `ReadToAt`
-honest too is tracked separately.
+Ranged reads (`ReadToAt`) now read committed files only as well
+([#1199](https://github.com/Basekick-Labs/arc/issues/1199)), so every local
+read and size answers about the same committed file.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1190](https://github.com/Basekick-Labs/arc/pull/1190).
+
+### Telemetry reports the machine's memory, and what the process may use ([#1412](https://github.com/Basekick-Labs/arc/issues/1412))
+
+Telemetry's `memory.total_gb` was documented as the machine's RAM but was
+`runtime.MemStats.Sys`: the memory the Arc process itself had obtained from the
+OS. A freshly started node reported a few tens of MB whatever the host had, so
+every earlier `total_gb` value is the process footprint, not a machine size.
+
+- `total_gb` is now the machine's memory: `/proc/meminfo` `MemTotal` on Linux,
+  `hw.memsize` on macOS. The unit is GiB, as before.
+- A new `usable_gb` is what a cgroup limit leaves the process, the memory
+  counterpart of `usable_cores`. It is the same detection the ingest buffer
+  sizes itself from: the lower of `memory.max` and `memory.high`, so with the
+  Kubernetes MemoryQoS feature gate enabled a 2Gi pod reports about 1.8. With
+  no limit it equals `total_gb`.
+
+Inside a container `total_gb` is the host's memory, unless lxcfs is mounted
+over `/proc/meminfo`, in which case it reads as the container limit. Both values
+are read once at startup, like `usable_cores`, so a limit changed in place is
+reported from the next restart. A value that cannot be read is sent as `null`,
+never a guess.
 
 ### Reported core counts account for the CPU quota ([#1039](https://github.com/Basekick-Labs/arc/issues/1039))
 
@@ -6247,8 +8718,8 @@ holds Raft-replicated tokens, this node's tier rows and the audit log, and
 the shared secret, so either one from a backup would give the node another
 node's state. A client that sends `restore_metadata: true` explicitly by
 default will be refused on every cluster node and must stop sending it. A
-standalone config restore still writes the literal `arc.toml` in the working
-directory, not the path the server was started with.
+standalone config restore writes the config file the server loaded at
+startup; see [#1466](https://github.com/Basekick-Labs/arc/issues/1466).
 
 ### Cluster restores pause compaction cluster-wide ([#1087](https://github.com/Basekick-Labs/arc/issues/1087))
 
@@ -6731,6 +9202,25 @@ These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
+
+### The buffer refuses a database or measurement name containing "/" ([#1475](https://github.com/Basekick-Labs/arc/issues/1475))
+
+Buffer, coverage and tier-cache keys are `database + "/" + measurement`, and
+storage paths are built the same way. Ingest and cluster code split buffer
+keys at the first `/`, which needs a database name with no `/`; exact lookups
+and storage paths need a measurement name with no `/`. Every ingest entry
+point already guarantees both by validating names, but entry points have
+missed the database check before (#300, #993, #1010). The buffer now refuses
+either name itself, before any WAL work, as a content refusal, so a future
+entry point that skipped validation cannot make two series share a key. No
+supported write path can reach it: edge-sync spoke namespaces, whose database
+names do contain `/`, reach storage as files and never pass through the
+buffer.
+
+A test now also pins how the Iceberg exporter reads a metadata file's version
+(`00004-<uuid>.metadata.json` and `v4.metadata.json` are both version `4`): it
+is the integer `version-hint.text` holds, so the leading zeros are dropped on
+purpose. Both are the hardening #750 handed to #1475.
 
 ### Hourly compaction file-count guidance (#793)
 

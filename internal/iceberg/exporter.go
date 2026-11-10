@@ -32,8 +32,11 @@ import (
 	iceberg "github.com/apache/iceberg-go"
 	icecatalog "github.com/apache/iceberg-go/catalog"
 	sqlcat "github.com/apache/iceberg-go/catalog/sql"
+	iceio "github.com/apache/iceberg-go/io"
 	icetable "github.com/apache/iceberg-go/table"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/basekick-labs/arc/internal/storage"
 )
@@ -47,6 +50,14 @@ import (
 type FileRef struct {
 	PhysicalPath string
 	SizeBytes    int64
+	// Key and LocalPath are where the source found the file: its storage key,
+	// and its path on this node's disk ("" on an object store). Only schema
+	// derivation reads them (FileSchema); the reconcile key is PhysicalPath
+	// and SizeBytes.
+	Key       string
+	LocalPath string
+	// Cold: the file is on the cold tier (#939 B2); PhysicalPath is its cold URI.
+	Cold bool
 }
 
 // Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One Exporter per
@@ -56,10 +67,15 @@ type Exporter struct {
 	catalog     *sqlcat.Catalog
 	catalogName string
 	backend     storage.Backend // for writing version-hint.text alongside table metadata
-	warehouse   string          // warehouse root URI (file://… or s3://bucket/prefix)
-	nsPrefix    string          // namespace for Iceberg tables (e.g. "arc")
-	retain      int             // snapshots + metadata versions to keep per table (0 = keep all)
-	logger      zerolog.Logger
+	// awsCfg, with an S3 backend, is the backend's aws.Config, handed to
+	// iceberg-go's S3 FileIO through the context (withAWS); nil otherwise.
+	awsCfg *aws.Config
+	// cold, when set, is the S3 cold tier whose files the table also holds (cold_export.go).
+	cold      *coldExport
+	warehouse string // warehouse root URI (file://… or s3://bucket/prefix)
+	nsPrefix  string // namespace for Iceberg tables (e.g. "arc")
+	retain    int    // snapshots + metadata versions to keep per table (0 = keep all)
+	logger    zerolog.Logger
 	// namespaceMigrationDryRun is set once during wiring, before the scheduler starts.
 	namespaceMigrationDryRun bool
 
@@ -84,6 +100,14 @@ type Exporter struct {
 	// against a future concurrent caller.
 	hintFailMu  sync.Mutex
 	hintFailure bool
+	// fenced is set when a publish found another writer's v<N> (adopt.go); cleared with
+	// hintFailure. The pass that sees it stops before pruning or sweeping.
+	fenced error
+
+	// warehouseAuthoritative, published: see adopt.go.
+	warehouseAuthoritative bool
+	publishedMu            sync.Mutex
+	published              map[string]string
 
 	// collapseThreshold is the manifest count at which a pass also collapses the manifest set
 	// (see manifestCollapseThreshold). A field rather than a bare constant so a test can raise it
@@ -103,7 +127,15 @@ type Exporter struct {
 func (e *Exporter) resetHintFailure() {
 	e.hintFailMu.Lock()
 	e.hintFailure = false
+	e.fenced = nil
 	e.hintFailMu.Unlock()
+}
+
+// fencedErr returns the fence refusal recorded since the last reset, if any.
+func (e *Exporter) fencedErr() error {
+	e.hintFailMu.Lock()
+	defer e.hintFailMu.Unlock()
+	return e.fenced
 }
 
 // noteHintFailure records that a discovery-file write failed.
@@ -131,9 +163,12 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 	if nsPrefix == "" {
 		nsPrefix = "arc"
 	}
-	cat, err := sqlcat.NewCatalog("arc", db, sqlcat.SQLite, iceberg.Properties{
-		"warehouse": warehouse,
-	})
+	props := iceberg.Properties{"warehouse": warehouse}
+	awsCfg, s3Props := awsConfigOf(backend)
+	for k, v := range s3Props {
+		props[k] = v
+	}
+	cat, err := sqlcat.NewCatalog("arc", db, sqlcat.SQLite, props)
 	if err != nil {
 		return nil, fmt.Errorf("create iceberg sql catalog: %w", err)
 	}
@@ -142,6 +177,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		catalog:     cat,
 		catalogName: "arc",
 		backend:     backend,
+		awsCfg:      awsCfg,
 		warehouse:   strings.TrimSuffix(warehouse, "/"),
 		// resolvedWarehouse/resolvedRoot are computed lazily on first
 		// warehouseRelKey call (the directories may not exist yet here).
@@ -253,6 +289,7 @@ type ArcField struct {
 // TableExists reports whether the Iceberg table for (database, measurement) exists, swallowing
 // catalog lookup errors and returning false.
 func (e *Exporter) TableExists(ctx context.Context, database, measurement string) bool {
+	ctx = e.withAWS(ctx)
 	exists, _ := e.tableExists(ctx, database, measurement)
 	return exists
 }
@@ -261,6 +298,7 @@ func (e *Exporter) TableExists(ctx context.Context, database, measurement string
 // need the (bool, error) form so a transient catalog error is not interpreted and cached as a
 // confirmed missing table.
 func (e *Exporter) tableExists(ctx context.Context, database, measurement string) (bool, error) {
+	ctx = e.withAWS(ctx)
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
 		return false, err
 	}
@@ -285,6 +323,7 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 // A catalog row that exists but cannot be loaded (its metadata file is missing or unreadable)
 // is an error, never a create: see the load gate below (#637).
 func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string, sc ArcSchema) (*icetable.Table, error) {
+	ctx = e.withAWS(ctx)
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
 		return nil, err
 	}
@@ -294,6 +333,12 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	// Namespace create is idempotent-ish; ignore "already exists".
 	if err := e.catalog.CreateNamespace(ctx, ns, nil); err != nil && !isAlreadyExists(err) {
 		return nil, fmt.Errorf("create namespace %v: %w", ns, err)
+	}
+
+	// The warehouse is the authority on the table's version (adopt.go): adopt what another node
+	// published before loading, or this load would start a fork from a stale row.
+	if _, err := e.adoptPublished(ctx, ident, catalogNamespaceKey(ns), ident[len(ident)-1]); err != nil {
+		return nil, err
 	}
 
 	tbl, err := e.catalog.LoadTable(ctx, ident)
@@ -532,6 +577,7 @@ func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Ta
 // table but absent from Arc. One transaction. Idempotent — if the sets already match, it is a
 // no-op (no new snapshot). This is the core of the reconciler design.
 func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) error {
+	ctx = e.withAWS(ctx)
 	_, err := e.ReconcileMeasurementWithHint(ctx, database, measurement, sc, current)
 	return err
 }
@@ -549,6 +595,7 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 // The return is true when there was nothing to do for either step, which is the ordinary
 // converged case.
 func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) (settled bool, err error) {
+	ctx = e.withAWS(ctx)
 	// EnsureTable publishes the discovery files itself when it creates or evolves
 	// the table, so start from whether those writes succeeded. Otherwise a
 	// creation-time failure would be invisible here and the fingerprint would be
@@ -558,15 +605,22 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	if err != nil {
 		return false, err
 	}
+	if err := e.fencedErr(); err != nil {
+		return false, err // EnsureTable's create or evolve lost a publish race (adopt.go)
+	}
 	hintOK := !e.hintFailed()
 
 	want := make(map[string]int64, len(current))
 	for _, f := range current {
 		want[f.PhysicalPath] = f.SizeBytes
 	}
-	have, err := e.tableDataFiles(ctx, tbl)
+	live, err := e.tableLiveFiles(ctx, tbl)
 	if err != nil {
 		return false, fmt.Errorf("read current iceberg data files: %w", err)
+	}
+	have := make(map[string]int64, len(live))
+	for p, df := range live {
+		have[p] = df.FileSizeBytes()
 	}
 
 	// The diff key is (path, size). A path on both sides with a different size is a file
@@ -605,23 +659,39 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 		// skipped by the scheduler's fingerprint gate before it ever reaches this
 		// function, so for such a table THIS is the pass that reclaims: the first
 		// one after a restart, whose fingerprint cache is cold.
+		published := e.writeVersionHint(ctx, tbl)
+		if err := e.fencedErr(); err != nil {
+			return false, err
+		}
 		e.sweepOrphanMetadata(ctx, tbl)
-		return e.writeVersionHint(ctx, tbl) && hintOK, nil
+		return published && hintOK, nil
 	}
 
-	// Metadata-only: files are dropped and added by path in one commit. (Transaction.Delete
+	// Metadata-only: files are dropped and added as DataFiles in one commit. (Transaction.Delete
 	// is a ROW-level predicate that rewrites partially-matching files — wrong here; we drop
-	// whole files that Arc already removed from storage.) A rewritten path appears in both
-	// lists and is removed before it is added, inside the same transaction.
-	//
-	// The manifest collapse (#1106) is decided HERE, not inside, for two reasons: it reads the
-	// CURRENT snapshot and the pass cannot be re-driven once ReplaceDataFiles has staged, and
-	// len(want) — the live file set this pass is driving the table to — is only in scope here.
-	collapse := e.shouldCollapse(ctx, tbl, len(want), database, measurement)
-	committed, skipped, err := e.replaceDataFilesResilient(ctx, tbl, toRemove, toAdd, database, measurement, collapse, len(want))
+	// whole files that Arc already removed from storage.) The removes are the table's own
+	// entries; the adds are built from their footers first, which is also where a file whose
+	// rows straddle a UTC day is found. A rewritten path appears in both lists and is removed
+	// before it is added, inside the same transaction.
+	removes := make([]iceberg.DataFile, 0, len(toRemove))
+	for _, p := range toRemove {
+		removes = append(removes, live[p])
+	}
+	// A file that moved tiers is the same file under another URI: its DataFile is the table's
+	// own entry with the new path, and the moved object is never read (cold_export.go).
+	keyOf := make(map[string]string, len(current))
+	for _, f := range current {
+		keyOf[f.PhysicalPath] = f.Key
+	}
+	cloned, toBuild, err := cloneFromTable(tbl, live, toAdd, keyOf, want)
 	if err != nil {
 		return false, err
 	}
+	adds, skipped, err := e.buildDataFiles(ctx, tbl, toBuild, want)
+	if err != nil {
+		return false, err
+	}
+	adds = append(cloned, adds...)
 	if len(skipped) > 0 {
 		// Some files could not be partitioned (day-straddling data — see day() spec). They are
 		// omitted from the table but logged loudly; the rest of the measurement still exports.
@@ -629,6 +699,26 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 			Str("database", database).Str("measurement", measurement).
 			Int("skipped", len(skipped)).Strs("files", skipped).
 			Msg("Iceberg: skipped files that could not be partition-mapped (day-straddling time range)")
+	}
+	if len(adds) == 0 && len(removes) == 0 {
+		// Every add was skipped: nothing to commit, so this pass converged like the branch above.
+		published := e.writeVersionHint(ctx, tbl)
+		if err := e.fencedErr(); err != nil {
+			return false, err
+		}
+		e.sweepOrphanMetadata(ctx, tbl)
+		return published && hintOK, nil
+	}
+
+	// The manifest collapse (#1106) is decided HERE, not inside, for two reasons: it reads the
+	// CURRENT snapshot and the pass cannot be re-driven once the diff has staged, and the live
+	// file set this pass drives the table to — want, less the files it could not partition — is
+	// only known here. A pass whose every survivor is unmappable leaves the table empty after
+	// all and must not collapse; see shouldCollapse for what an all-DELETED merge does.
+	collapse := e.shouldCollapse(ctx, tbl, len(want)-len(skipped), database, measurement)
+	committed, err := e.commitDiff(ctx, tbl, removes, adds, database, measurement, collapse)
+	if err != nil {
+		return false, err
 	}
 	// Expire old snapshots so snapshot history and metadata don't grow unbounded, and floor
 	// history to the current snapshot when this pass removed any path. A removed path is one
@@ -646,6 +736,9 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	// because only a pass that removes something asks to floor, so there may be no next pass.
 	committed, expireOK := e.expireSnapshots(ctx, committed, database, measurement, expireModeFor(len(toRemove)))
 	hintOK = e.writeVersionHint(ctx, committed) && !e.hintFailed()
+	if err := e.fencedErr(); err != nil {
+		return false, err
+	}
 	e.pruneOldVersionFiles(ctx, committed)
 	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
 	// reachability is the one this pass settled on, not one version stale.
@@ -675,50 +768,49 @@ func expireModeFor(removed int) expireMode {
 	return retainConfigured
 }
 
-// replaceDataFilesResilient applies the reconcile diff in ONE commit. The ordinary pass is a
-// single ReplaceDataFiles (one overwrite snapshot for removes and adds together, or a plain
-// append when nothing is removed), exactly as before #633. It tolerates two iceberg-go
-// refusals:
-//
-//   - Partition inference. iceberg-go infers each file's day() partition value from its
-//     Parquet time min/max and ERRORS ("more than one value for partition field") when one
-//     file's data straddles a UTC-day boundary (rare: backfill or a flush crossing midnight).
-//     Left unhandled, one such file wedges the whole measurement's export on every pass. The
-//     fallback adds files one at a time and skips (and returns) the ones that can't be mapped.
+// commitDiff applies the reconcile diff in ONE commit, from pre-built DataFiles: removes are
+// the table's own entries for the paths leaving it, adds were built by buildDataFiles. Nothing
+// here opens a data file, so the files may live outside the table's FileIO (#939: a cold tier
+// in another bucket). The ordinary pass is a single ReplaceDataFilesWithDataFiles (one overwrite
+// snapshot for removes and adds together, or a plain append when nothing is removed). It
+// tolerates one iceberg-go refusal:
 //
 //   - Stale DELETED history ("cannot add files that are already referenced by table").
 //     A removed file's DELETED manifest entry is checked against new adds, so a path that left
-//     the table and comes back is refused: an in-place rewrite (#633), a backup restore of a key
-//     that had been removed, or history from before this release. On iceberg-go v0.6.0 the
-//     tombstone was carried into EVERY later snapshot, so such a path could never come back at
-//     all; since v0.7.0 the overwrite producer drops a manifest with no surviving entries, so a
-//     tombstone is shed on the next overwrite and the refusal is rare rather than permanent. The
-//     refusal wording is unchanged, so this branch still fires when it applies. For those adds the transaction
-//     enables Iceberg manifest merging (commit.manifest-merge.enabled) and retries with the
-//     duplicate check off: the merge-append rewrites the manifests keeping DELETED entries
-//     only of its own snapshot, so the stale entries are gone once the commit lands and a later
-//     removal of the path sees exactly one entry again. Such a pass lands as two snapshots in
-//     the one commit (the removes as an overwrite, then the merged append), so readers of the
-//     current snapshot never see the path absent; only time travel to the intermediate
-//     snapshot does, until it expires. The property is switched back off in the same
-//     transaction — see manifestMergeOn for why it must not stay on.
+//     the table and comes back is refused: a file rewritten at its own path (#633), a backup
+//     restore of a key that had been removed, or history from before this release. On
+//     iceberg-go v0.6.0 the tombstone was carried into EVERY later snapshot, so such a path could
+//     never come back at all; since v0.7.0 the overwrite producer drops a manifest with no
+//     surviving entries, so a tombstone is shed on the next overwrite and the refusal is rare
+//     rather than permanent. A path in both lists (a rewrite) is refused the same way, since the
+//     entry being removed still names it. For those adds the transaction stages the removes on
+//     their own, then enables Iceberg manifest merging (commit.manifest-merge.enabled) and adds
+//     with the duplicate check off: the merge-append rewrites the manifests keeping DELETED
+//     entries only of its own snapshot, so the stale entries are gone once the commit lands and
+//     a later removal of the path sees exactly one entry again. Such a pass lands as two
+//     snapshots in the one commit (the removes as an overwrite, then the merged append), so
+//     readers of the current snapshot never see the path absent; only time travel to the
+//     intermediate snapshot does, until it expires. The property is switched back off in the
+//     same transaction — see manifestMergeOn for why it must not stay on.
+//
+// A file whose day() partition cannot be inferred never reaches here: buildDataFiles reports it
+// and the caller leaves it out, so no fallback transaction is needed for it.
 //
 // When collapse is set the transaction also gets a merge-enabled append that rewrites the whole
-// manifest set into one (#1106), staged after the diff and before Commit, whichever of the paths
-// above staged it. The caller decides — see shouldCollapse for the conditions. It is cleared if
-// the "already referenced" branch ran, because that branch's merged add has already done it.
-//
-// Returns the committed table and the paths skipped for partition reasons.
-func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string, collapse bool, liveAfter int) (*icetable.Table, []string, error) {
+// manifest set into one (#1106), staged after the diff and before Commit. The caller decides —
+// see shouldCollapse for the conditions. It is cleared if the "already referenced" branch ran,
+// because that branch's merged add has already done it.
+func (e *Exporter) commitDiff(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []iceberg.DataFile, database, measurement string, collapse bool) (*icetable.Table, error) {
 	txn := tbl.NewTransaction()
-	// ReplaceDataFiles validates both lists against the current snapshot before it stages
-	// anything, so on the "already referenced" refusal the transaction is still clean and can
-	// be re-driven as remove-then-merged-add.
-	err := txn.ReplaceDataFiles(ctx, toRemove, toAdd, nil)
+	// ReplaceDataFilesWithDataFiles (and AddDataFiles, which it delegates to with no removes)
+	// validates both lists against the current snapshot before it stages anything, so on the
+	// "already referenced" refusal the transaction is still clean and can be re-driven as
+	// remove-then-merged-add.
+	err := txn.ReplaceDataFilesWithDataFiles(ctx, toRemove, toAdd, nil)
 	if isAlreadyReferencedError(err) {
 		err = nil
 		if len(toRemove) > 0 {
-			err = txn.ReplaceDataFiles(ctx, toRemove, nil, nil)
+			err = txn.ReplaceDataFilesWithDataFiles(ctx, toRemove, nil, nil)
 		}
 		if err == nil {
 			err = e.addFilesMerging(ctx, txn, toAdd, database, measurement)
@@ -732,109 +824,93 @@ func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.
 		}
 	}
 	if err != nil {
-		if !isPartitionInferenceError(err) {
-			return nil, nil, fmt.Errorf("iceberg ReplaceDataFiles (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
-		}
-		// The staged transaction is dropped: iceberg-go already wrote its manifests to the
-		// warehouse, and no commit will ever reference them. sweepOrphanMetadata reclaims them
-		// once they pass its grace window (#835) — it names this case as a reason it exists. The
-		// collapse adds nothing here: it is staged only after staging succeeded, so a transaction
-		// dropped on this branch contains no collapse work. The property toggle lives only in the
-		// dropped transaction.
-		return e.replaceDataFilesOneByOne(ctx, tbl, toRemove, toAdd, database, measurement, collapse, liveAfter)
+		return nil, fmt.Errorf("iceberg replace data files (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
 	}
 	if collapse {
 		if err := e.collapseManifests(ctx, txn, database, measurement); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
 	committed, err := txn.Commit(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("iceberg commit (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
+		return nil, fmt.Errorf("iceberg commit (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
 	}
-	return committed, nil, nil
+	return committed, nil
 }
 
-// replaceDataFilesOneByOne is the partition-inference fallback: a fresh transaction with the
-// removes, then one AddFiles per file so a straddling file is skipped instead of failing the
-// batch. Files refused for stale DELETED history are collected and added in ONE merged step at
-// the end (each merged add rewrites the manifest set, so they must not go one by one).
-//
-// collapse carries the caller's manifest-collapse decision (#1106) into this path, and is honoured
-// here for the reason given at its use below. A merged add for stale DELETED history clears it,
-// since that add already collapses the set.
-func (e *Exporter) replaceDataFilesOneByOne(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string, collapse bool, liveAfter int) (*icetable.Table, []string, error) {
-	txn := tbl.NewTransaction()
-	if len(toRemove) > 0 {
-		if err := txn.ReplaceDataFiles(ctx, toRemove, nil, nil); err != nil {
-			return nil, nil, fmt.Errorf("iceberg remove-only (remove=%d): %w", len(toRemove), err)
-		}
-	}
-	var skipped, referenced []string
-	for _, f := range toAdd {
-		err := txn.AddFiles(ctx, []string{f}, nil, false)
-		switch {
-		case err == nil:
-		case isPartitionInferenceError(err):
-			skipped = append(skipped, f)
-		case isAlreadyReferencedError(err):
-			referenced = append(referenced, f)
-		default:
-			return nil, nil, fmt.Errorf("iceberg AddFiles(%s): %w", f, err)
-		}
-	}
-	if len(referenced) > 0 {
-		// A straddling file is never registered, so it never carries DELETED history: a
-		// partition error here is not expected, and if it ever happens the pass fails like
-		// any other add error and is retried next tick.
-		if err := e.addFilesMerging(ctx, txn, referenced, database, measurement); err != nil {
-			return nil, nil, fmt.Errorf("iceberg add with merge (files=%d): %w", len(referenced), err)
-		}
-		collapse = false // the merged add already collapsed the set — see replaceDataFilesResilient
-	}
-	// liveAfter counted the files the pass INTENDED to register; the ones skipped here never make
-	// it into the table, so a pass whose every survivor is unmappable leaves the table empty after
-	// all and must not collapse — see shouldCollapse for what an all-DELETED merge does. The
-	// caller's guard cannot see this: it runs before the skips are known.
-	if collapse && liveAfter-len(skipped) <= 0 {
-		collapse = false
-	}
-	if collapse {
-		// This path is the package's heaviest manifest producer — one snapshot AND one manifest
-		// per added file — and it is sticky: a straddling file is never registered, so it is back
-		// in toAdd on every later pass and the measurement takes this path for good. Exempting it
-		// from the collapse would exempt exactly the table that needs it most.
-		if err := e.collapseManifests(ctx, txn, database, measurement); err != nil {
-			return nil, nil, err
-		}
-	}
-	committed, err := txn.Commit(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("iceberg commit (resilient, skipped=%d): %w", len(skipped), err)
-	}
-	return committed, skipped, nil
-}
-
-// addFilesMerging adds paths that iceberg-go refused as "already referenced" (stale DELETED
+// addFilesMerging adds DataFiles that iceberg-go refused as "already referenced" (stale DELETED
 // history) by enabling manifest merging for this transaction only and adding with the
 // duplicate check off. The reconcile diff is the authority on the live file set (it comes from
 // PlanFiles, which yields live entries only), so the check can only be tripped by DELETED
 // history — including the removal staged one call earlier in this same transaction, which is
 // the rewrite case. The toggle is staged metadata: a dropped transaction leaves the table as it was.
-func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transaction, paths []string, database, measurement string) error {
+func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transaction, files []iceberg.DataFile, database, measurement string) error {
 	if err := txn.SetProperties(manifestMergeOn()); err != nil {
 		return fmt.Errorf("enable manifest merge: %w", err)
 	}
-	if err := txn.AddFiles(ctx, paths, nil, true); err != nil {
-		return err // keep the partition-inference identity for the caller
+	if err := txn.AddDataFiles(ctx, files, nil, icetable.WithoutDuplicateCheck()); err != nil {
+		return err
 	}
 	if err := txn.SetProperties(manifestMergeOff()); err != nil {
 		return fmt.Errorf("disable manifest merge: %w", err)
 	}
 	e.logger.Info().
-		Str("database", database).Str("measurement", measurement).Int("files", len(paths)).
+		Str("database", database).Str("measurement", measurement).Int("files", len(files)).
 		Msg("Iceberg: re-registered paths that still had DELETED manifest history (merged manifests for this commit)")
 	return nil
+}
+
+// buildDataFiles builds the DataFile for each added path from the file's footer through
+// FileToDataFile — record count, column stats and the day() partition value, exactly what
+// AddFiles used to compute, with the same table schema, spec and properties. want gives each path's size
+// from the listing; a footer that disagrees (the file was replaced since it was listed) fails
+// the pass rather than register stats for bytes that are no longer there.
+//
+// A file whose day() partition cannot be inferred (its rows straddle a UTC day) is returned in
+// skipped instead of failing the pass, so one such file does not wedge the measurement. Any
+// other error fails the pass.
+func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, paths []string, want map[string]int64) (built []iceberg.DataFile, skipped []string, err error) {
+	if len(paths) == 0 {
+		return nil, nil, nil
+	}
+	out := make([]iceberg.DataFile, len(paths))
+	errs := make([]error, len(paths))
+	ios := make([]iceio.IO, len(paths))
+	for i, p := range paths {
+		if ios[i], err = e.fileIOFor(ctx, tbl, p); err != nil {
+			return nil, nil, err
+		}
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(unionSchemaConcurrency)
+	for i := range paths {
+		g.Go(func() error {
+			df, err := icetable.FileToDataFile(gctx, ios[i], paths[i], tbl.Schema(), tbl.Spec(), 0, tbl.Properties())
+			if err != nil {
+				if isPartitionInferenceError(err) {
+					errs[i] = err
+					return nil
+				}
+				return fmt.Errorf("build data file for %s: %w", paths[i], err)
+			}
+			if size, ok := want[paths[i]]; ok && df.FileSizeBytes() != size {
+				return fmt.Errorf("build data file for %s: %d bytes, listed as %d (the file changed since it was listed)", paths[i], df.FileSizeBytes(), size)
+			}
+			out[i] = df
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, nil, err
+	}
+	for i, p := range paths {
+		if errs[i] != nil {
+			skipped = append(skipped, p)
+			continue
+		}
+		built = append(built, out[i])
+	}
+	return built, skipped, nil
 }
 
 // manifestCollapseThreshold is the number of data manifests in the current snapshot at which a
@@ -1555,8 +1631,18 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 			okAll = false
 		} else {
 			vKey := path.Join(dirKey, "v"+version+".metadata.json")
-			if err := e.backend.Write(ctx, vKey, body); err != nil {
-				e.logger.Warn().Err(err).Str("key", vKey).Msg("Failed to write v<N>.metadata.json (will retry next pass)")
+			if err := e.publishMetadataCopy(ctx, vKey, body); err != nil {
+				if errors.Is(err, errFenced) {
+					// Another node published this version first: this commit forked the table.
+					// No hint, no prune, no sweep; the next pass adopts the published lineage.
+					e.logger.Error().Err(err).Str("key", vKey).
+						Msg("Iceberg: another writer published this table version first; this pass stops and the next one adopts the published version")
+					e.hintFailMu.Lock()
+					e.fenced = err
+					e.hintFailMu.Unlock()
+				} else {
+					e.logger.Warn().Err(err).Str("key", vKey).Msg("Failed to write v<N>.metadata.json (will retry next pass)")
+				}
 				okAll = false
 			}
 		}
@@ -1570,6 +1656,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	if err := e.backend.Write(ctx, hintKey, []byte(version)); err != nil {
 		e.logger.Warn().Err(err).Str("key", hintKey).Msg("Failed to write version-hint.text (will retry next pass)")
 		okAll = false
+	}
+	if okAll {
+		e.markPublished(tbl.Identifier(), metaLoc)
 	}
 	return okAll
 }
@@ -1745,9 +1834,15 @@ func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey strin
 	if !strings.HasSuffix(base, ".metadata.json") {
 		return "", "", false
 	}
+	// A table adopted from the warehouse (adopt.go) points at Arc's own v<N>.metadata.json copy
+	// until its next commit, which iceberg-go names 000<N+1>-<uuid> again.
 	prefix, _, found := strings.Cut(base, "-") // "00004"
 	if !found {
-		return "", "", false
+		legacy := strings.TrimSuffix(base, ".metadata.json")
+		if !strings.HasPrefix(legacy, "v") {
+			return "", "", false
+		}
+		prefix = strings.TrimPrefix(legacy, "v")
 	}
 	n, err := strconv.Atoi(prefix)
 	if err != nil {
@@ -1756,13 +1851,53 @@ func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey strin
 	return strconv.Itoa(n), path.Dir(rel), true
 }
 
+// tableSeed returns what an existing table already says about a measurement:
+// its current schema and its current snapshot's data files (path -> size).
+// A scheduler with nothing cached (a restart) reads footers only for the
+// files this does not list at their size. ok is false when there is no table.
+func (e *Exporter) tableSeed(ctx context.Context, database, measurement string) (sc ArcSchema, files map[string]int64, ok bool, err error) {
+	ctx = e.withAWS(ctx)
+	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
+		return ArcSchema{}, nil, false, err
+	}
+	tbl, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
+	if errors.Is(err, icecatalog.ErrNoSuchTable) {
+		return ArcSchema{}, nil, false, nil
+	}
+	if err != nil {
+		return ArcSchema{}, nil, false, err
+	}
+	files, err = e.tableDataFiles(ctx, tbl)
+	if err != nil {
+		return ArcSchema{}, nil, false, err
+	}
+	for _, f := range tbl.Schema().Fields() {
+		sc.Fields = append(sc.Fields, ArcField{Name: f.Name, Type: f.Type})
+	}
+	return sc, files, true, nil
+}
+
 // tableDataFiles returns the LIVE physical data-file paths in the table's current snapshot,
 // each with the file_size_in_bytes its manifest entry recorded at registration. Uses
 // Scan().PlanFiles, which resolves the current snapshot's live files honoring deletes across
 // snapshots — NOT AllManifests, which returns manifests from superseded snapshots too and
 // would report files a later removal has already dropped.
 func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map[string]int64, error) {
-	out := make(map[string]int64)
+	live, err := e.tableLiveFiles(ctx, tbl)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(live))
+	for p, df := range live {
+		out[p] = df.FileSizeBytes()
+	}
+	return out, nil
+}
+
+// tableLiveFiles returns the current snapshot's data files by path, as the table's own
+// DataFile entries: what a removal hands back to ReplaceDataFilesWithDataFiles.
+func (e *Exporter) tableLiveFiles(ctx context.Context, tbl *icetable.Table) (map[string]iceberg.DataFile, error) {
+	out := make(map[string]iceberg.DataFile)
 	if tbl.CurrentSnapshot() == nil {
 		return out, nil // empty table
 	}
@@ -1772,11 +1907,11 @@ func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map
 	}
 	// One data file can yield SEVERAL tasks since iceberg-go v0.7.0: a Parquet file above
 	// read.split.target-size (128 MiB) with at least two split offsets is planned as one task per
-	// byte range. This stays correct only because it is a map keyed on the path storing the FILE's
-	// size, which is identical across a file's splits — len(tasks), a slice, or task.Length would
-	// each double-count. Arc's own files are far below that size; bulk-imported Parquet need not be.
+	// byte range. This stays correct only because it is a map keyed on the path, and every split
+	// of a file carries the same DataFile — len(tasks), a slice, or task.Length would each
+	// double-count. Arc's own files are far below that size; bulk-imported Parquet need not be.
 	for _, task := range tasks {
-		out[task.File.FilePath()] = task.File.FileSizeBytes()
+		out[task.File.FilePath()] = task.File
 	}
 	return out, nil
 }
@@ -1805,6 +1940,7 @@ func isAlreadyExists(err error) bool {
 // their namespace naming does not follow this mapping, and their lifecycle is
 // owned by edge-sync.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
+	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
 		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
 	}

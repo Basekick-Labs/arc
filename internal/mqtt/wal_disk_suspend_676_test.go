@@ -61,11 +61,11 @@ func eventually(t *testing.T, what string, cond func() bool) {
 func settle(t *testing.T, m *SubscriptionManager) {
 	t.Helper()
 	eventually(t, "a disk pressure change never applied", func() bool {
-		m.diskMu.Lock()
-		defer m.diskMu.Unlock()
-		return m.diskTimer == nil
+		m.disk.mu.Lock()
+		defer m.disk.mu.Unlock()
+		return m.disk.timer == nil
 	})
-	m.applyMu.Lock() // an apply that cleared diskTimer has finished
+	m.applyMu.Lock() // an apply that cleared disk.timer has finished
 	m.applyMu.Unlock()
 }
 
@@ -90,9 +90,9 @@ func TestUnfenceDoesNotResumeUnderDiskPressure(t *testing.T) {
 	if !s.suspended.Load() || client.connects.Load() != 0 {
 		t.Fatal("a cluster unfence resumed the subscription while the WAL volume is under disk pressure")
 	}
-	m.diskMu.Lock()
-	m.diskChanged = time.Time{} // past the minimum time in the state
-	m.diskMu.Unlock()
+	m.disk.mu.Lock()
+	m.disk.changed = time.Time{} // past the minimum time in the state
+	m.disk.mu.Unlock()
 	m.SetWALDiskPressure(false)
 	settle(t, m)
 	if s.suspended.Load() || client.connects.Load() != 1 {
@@ -105,9 +105,9 @@ func TestDiskPressureClearDoesNotResumeWhileFenced(t *testing.T) {
 	m.SetWALDiskPressure(true)
 	settle(t, m)
 	m.SetIngestFenced(true)
-	m.diskMu.Lock()
-	m.diskChanged = time.Time{}
-	m.diskMu.Unlock()
+	m.disk.mu.Lock()
+	m.disk.changed = time.Time{}
+	m.disk.mu.Unlock()
 	m.SetWALDiskPressure(false)
 	settle(t, m)
 	if !s.suspended.Load() || client.connects.Load() != 0 {
@@ -122,7 +122,7 @@ func TestDiskPressureClearDoesNotResumeWhileFenced(t *testing.T) {
 // the minimum time, and a clear undone inside it never resumes them.
 func TestDiskPressureSuspendsAtOnceAndResumesAfterTheMinimumTime(t *testing.T) {
 	m, s, client := newSuspendableManager(t)
-	m.diskMinState = 300 * time.Millisecond
+	m.disk.minState = 300 * time.Millisecond
 	m.SetWALDiskPressure(true)
 	eventually(t, "suspension not applied", s.suspended.Load)
 	m.SetWALDiskPressure(false) // inside the minimum time: deferred
@@ -138,7 +138,7 @@ func TestDiskPressureSuspendsAtOnceAndResumesAfterTheMinimumTime(t *testing.T) {
 	began := time.Now()
 	m.SetWALDiskPressure(true)
 	eventually(t, "suspension delayed", s.suspended.Load)
-	if took := time.Since(began); took >= m.diskMinState {
+	if took := time.Since(began); took >= m.disk.minState {
 		t.Fatalf("suspension took %v: delayed by a minimum time in the resumed state", took)
 	}
 	settle(t, m)
@@ -146,7 +146,7 @@ func TestDiskPressureSuspendsAtOnceAndResumesAfterTheMinimumTime(t *testing.T) {
 	// A clear undone inside the minimum time never resumes.
 	m.SetWALDiskPressure(false)
 	m.SetWALDiskPressure(true)
-	time.Sleep(2 * m.diskMinState)
+	time.Sleep(2 * m.disk.minState)
 	settle(t, m)
 	if !s.suspended.Load() || client.connects.Load() != 1 {
 		t.Fatalf("a clear undone in time resumed the subscription (connects=%d)", client.connects.Load())
@@ -194,7 +194,7 @@ func TestSuspendReasonsDescribe(t *testing.T) {
 	for r, want := range map[suspendReasons]string{
 		suspendFenced:                  "fenced",
 		suspendWALDisk:                 "disk pressure",
-		suspendFenced | suspendWALDisk: "and its WAL volume",
+		suspendFenced | suspendWALDisk: "fenced on this node and the WAL volume",
 	} {
 		if !strings.Contains(r.describe(), want) {
 			t.Errorf("%d: %q lacks %q", r, r.describe(), want)

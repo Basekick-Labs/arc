@@ -31,6 +31,10 @@ type LocalBackend struct {
 	// causing filesystem lock contention. This cache eliminates that.
 	dirCache map[string]bool
 	dirMu    sync.RWMutex
+
+	// spelling refuses database and measurement names that exist on disk
+	// in another spelling, armed only when the root folds names (#1509).
+	spelling nameSpelling
 }
 
 // NewLocalBackend creates a new local filesystem storage backend
@@ -52,12 +56,25 @@ func NewLocalBackend(basePath string, logger zerolog.Logger) (*LocalBackend, err
 		prefix += storagePathSeparator
 	}
 
-	return &LocalBackend{
+	b := &LocalBackend{
 		basePath:   absPath,
 		pathPrefix: prefix,
 		logger:     logger.With().Str("component", "local-storage").Logger(),
 		dirCache:   make(map[string]bool),
-	}, nil
+	}
+	folds, err := probeNamesFold(absPath)
+	b.spelling = nameSpelling{armed: folds.Case || folds.Normalization, folds: folds, listings: make(map[string]dirListing)}
+	switch {
+	case err != nil:
+		b.logger.Warn().Err(err).Msg("Could not tell whether the storage volume distinguishes names by case; database and measurement names are only accepted in the spelling they have on disk")
+	case folds.Case:
+		b.logger.Warn().Str("path", absPath).Msg("The storage volume does not distinguish names that differ only in case (for example macOS APFS by default); database and measurement names are only accepted in the spelling they have on disk. Use a case-sensitive volume if names may differ only by case")
+	case folds.Normalization:
+		// Case-sensitive APFS: ingest names are ASCII, so only an existing
+		// non-ASCII name can meet this fold.
+		b.logger.Debug().Str("path", absPath).Msg("The storage volume folds Unicode normalization; names are only accepted in the spelling they have on disk")
+	}
+	return b, nil
 }
 
 // ensureDir creates the directory if it doesn't exist, using a cache to avoid
@@ -157,11 +174,50 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	return nil
 }
 
+// WriteIfAbsent writes data at path unless a file is already there
+// (ConditionalWriter). The bytes go to a temporary file first and are linked
+// into place: link fails when the target exists and never exposes a partial
+// file, which a plain O_EXCL create of the target would.
+func (b *LocalBackend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return false, fmt.Errorf("invalid path: %w", err)
+	}
+	dir := filepath.Dir(fullPath)
+	if err := b.ensureDir(dir); err != nil {
+		return false, err
+	}
+	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
+	if err != nil {
+		return false, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	_, writeErr := tmpFile.Write(data)
+	closeErr := tmpFile.Close()
+	if writeErr != nil {
+		return false, fmt.Errorf("failed to write temp file: %w", writeErr)
+	}
+	if closeErr != nil {
+		return false, fmt.Errorf("failed to close temp file: %w", closeErr)
+	}
+	if err := os.Link(tmpPath, fullPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		metrics.Get().IncStorageErrors()
+		return false, fmt.Errorf("failed to link file into place: %w", err)
+	}
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
+	return true, nil
+}
+
 // partPath returns the persistent in-progress path for a file being written by
 // WriteReader or AppendReader. Using a deterministic name (rather than a
 // random .tmp) means a partial write that survives a crash or transport error
-// is discoverable through StagingInspector and ReadToAt, enabling the puller
-// to resume from the last committed byte on the next attempt.
+// is discoverable through StagingInspector, enabling the puller to resume from
+// the last staged byte on the next attempt.
 func partPath(fullPath string) string {
 	return fullPath + PartSuffix
 }
@@ -422,10 +478,8 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	return nil
 }
 
-// ReadToAt reads data from path starting at the given byte offset and writes
-// to writer. offset=0 starts at the beginning. Falls back to the ".part"
-// staging file if the final file does not exist (allows the puller to hash a
-// partial prefix before resuming a transfer).
+// ReadToAt reads the committed file at path starting at the given byte offset
+// and writes to writer. offset=0 starts at the beginning.
 func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
@@ -435,12 +489,7 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 		return fmt.Errorf("negative offset: %d", offset)
 	}
 
-	// Prefer the final file; fall back to the staging file so tryResumeFromPartial
-	// can hash a prefix even before the transfer completes.
 	file, err := os.Open(fullPath)
-	if os.IsNotExist(err) {
-		file, err = os.Open(partPath(fullPath))
-	}
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
@@ -1017,7 +1066,7 @@ func ValidateKey(key string) error {
 		return fmt.Errorf("%w: key is empty", ErrInvalidPath)
 	}
 	if key[len(key)-1] == '/' {
-		return fmt.Errorf("%w: %q ends in a separator, which names the same object as %q", ErrInvalidPath, key, key[:len(key)-1])
+		return fmt.Errorf("%w: key ends in a separator, which names the same object as the key without it", ErrInvalidPath)
 	}
 	// PartSuffix is reserved because LocalBackend stages every write at
 	// key+PartSuffix. Without this the staging file of key "x" IS the
@@ -1031,7 +1080,7 @@ func ValidateKey(key string) error {
 	// key remains portable between backends, which is the property #743
 	// established.
 	if strings.HasSuffix(key, PartSuffix) {
-		return fmt.Errorf("%w: %q ends in %q, which is reserved for write staging", ErrInvalidPath, key, PartSuffix)
+		return fmt.Errorf("%w: key ends in %s, which is reserved for write staging", ErrInvalidPath, PartSuffix)
 	}
 	return validateKeyBody(key)
 }
@@ -1057,7 +1106,7 @@ func ValidateListPrefix(prefix string) error {
 		return nil
 	}
 	if prefix == "/" {
-		return fmt.Errorf("%w: %q is not a relative prefix; use \"\" for everything", ErrInvalidPath, prefix)
+		return fmt.Errorf("%w: root separator is not a relative prefix; use an empty prefix for everything", ErrInvalidPath)
 	}
 	if prefix[len(prefix)-1] == '/' {
 		prefix = prefix[:len(prefix)-1]
@@ -1076,7 +1125,7 @@ func validateKeyBody(p string) error {
 		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxUsableKeyLen)
 	}
 	if p[0] == '/' {
-		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, p)
+		return fmt.Errorf("%w: path must be relative to the backend root", ErrInvalidPath)
 	}
 	start := 0
 	for i := 0; i <= len(p); i++ {
@@ -1086,14 +1135,14 @@ func validateKeyBody(p string) error {
 				return fmt.Errorf("%w: contains a NUL byte", ErrInvalidPath)
 			}
 			if c == '\\' {
-				return fmt.Errorf("%w: %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, p)
+				return fmt.Errorf("%w: path contains a backslash, which Azure treats as a separator", ErrInvalidPath)
 			}
 			if c != '/' {
 				continue
 			}
 		}
 		if err := checkSegment(p[start:i]); err != nil {
-			return fmt.Errorf("%w (in %q)", err, p)
+			return err
 		}
 		start = i + 1
 	}
@@ -1108,8 +1157,10 @@ func checkSegment(seg string) error {
 	switch seg {
 	case "":
 		return fmt.Errorf("%w: contains an empty segment", ErrInvalidPath)
-	case ".", "..":
-		return fmt.Errorf("%w: contains a %q segment", ErrInvalidPath, seg)
+	case ".":
+		return fmt.Errorf("%w: contains a single-dot segment", ErrInvalidPath)
+	case "..":
+		return fmt.Errorf("%w: contains a double-dot segment", ErrInvalidPath)
 	}
 	if len(seg) > MaxUsableKeySegmentLen {
 		return fmt.Errorf("%w: has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, len(seg), MaxUsableKeySegmentLen)
@@ -1142,9 +1193,9 @@ func ValidateKeySegment(seg string) error {
 		case 0:
 			return fmt.Errorf("%w: segment contains a NUL byte", ErrInvalidPath)
 		case '\\':
-			return fmt.Errorf("%w: segment %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, seg)
+			return fmt.Errorf("%w: segment contains a backslash, which Azure treats as a separator", ErrInvalidPath)
 		case '/':
-			return fmt.Errorf("%w: segment %q contains a separator, so it names more than one path component", ErrInvalidPath, seg)
+			return fmt.Errorf("%w: segment contains a separator, so it names more than one path component", ErrInvalidPath)
 		}
 	}
 	return checkSegment(seg)
@@ -1172,7 +1223,7 @@ const globMetacharacters = `*?[]{}`
 // segment of everything that spoke writes into the hub's storage root.
 func ValidateGlobSafe(s string) error {
 	if i := strings.IndexAny(s, globMetacharacters); i >= 0 {
-		return fmt.Errorf("%w: %q contains the glob metacharacter %q, which would match more than one path", ErrInvalidPath, s, s[i])
+		return fmt.Errorf("%w: contains the glob metacharacter %U, which would match more than one path", ErrInvalidPath, rune(s[i]))
 	}
 	return nil
 }
@@ -1191,7 +1242,7 @@ func (b *LocalBackend) stagedPath(key string) (string, error) {
 		return "", fmt.Errorf("%w: key is empty", ErrInvalidPath)
 	}
 	if key[len(key)-1] == '/' {
-		return "", fmt.Errorf("%w: %q ends in a separator", ErrInvalidPath, key)
+		return "", fmt.Errorf("%w: key ends in a separator", ErrInvalidPath)
 	}
 	if err := validateKeyBody(key); err != nil {
 		return "", err
@@ -1451,6 +1502,18 @@ func (b *LocalBackend) validateListPath(prefix string) (string, error) {
 	}
 	if prefix[len(prefix)-1] == '/' {
 		prefix = prefix[:len(prefix)-1]
+	}
+	// The prefix names a directory; its database and measurement segments
+	// must have their on-disk spelling on a volume that folds names, or
+	// a delete or retention pass under `CPU` would act on `cpu` (#1509).
+	if b.spelling.armed {
+		segs := strings.SplitN(prefix, "/", 3)
+		if len(segs) > 2 {
+			segs = segs[:2]
+		}
+		if _, err := b.checkSpelling(segs); err != nil {
+			return "", err
+		}
 	}
 	return b.pathPrefix + prefix, nil
 }

@@ -33,7 +33,13 @@ var memoryLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 type Config struct {
 	// Warnings are load-time advisories about accepted values (see
 	// LoadWarning). Emitted by cmd/arc/main.go right after Load; never fatal.
-	Warnings        []LoadWarning
+	Warnings []LoadWarning
+	// ConfigFile is the config file Load read, as an absolute path (viper's
+	// ConfigFileUsed), or "" when none was found and Arc runs on defaults and
+	// environment variables. Backup's include_config and restore_config use
+	// it (#1466): the file is found through a search path, so "arc.toml"
+	// relative to the working directory is not it.
+	ConfigFile      string
 	Server          ServerConfig
 	Database        DatabaseConfig
 	Storage         StorageConfig
@@ -157,6 +163,8 @@ type IngestConfig struct {
 	NumericDictionary     bool     // With UseDictionary, also dictionary-encode numeric/timestamp columns (pre-26.09.1 behavior; costs hashing+boxing per value)
 	WriteStatistics       bool     // Write Parquet statistics
 	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
+	MaxRowGroupRows       int      // Rows per Parquet row group at ingest (default 524288, free on the sustained benchmark; 0 = one row group per flush; 1..1023 and negatives rejected by Load)
+	WritePageIndex        bool     // Write the Parquet page index at ingest (default false: no reader yet, cost grows with row-group count). Offset index always; column index only where statistics exist (needs write_statistics) and fit the stats size cap
 	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
@@ -165,7 +173,29 @@ type IngestConfig struct {
 	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
+	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
+	// csv, parquet) write at once on this node (#1429). 0 = auto: as many
+	// as fit an eighth of the memory limit at one import allowance each,
+	// at most the CPUs Arc runs on, at least 1. An explicit value (at most
+	// 1024) is used as is, without the memory calculation.
+	ImportWriteConcurrency int
+	// ImportQueueTimeoutMS is how long an import waits for a write slot
+	// before it is refused with 503 and nothing written (#1429). 0 = until a
+	// slot frees: the server does not see a client that gives up.
+	ImportQueueTimeoutMS int
+	// MaxBufferedBytes is ingest.max_buffered_bytes resolved to bytes (#1468):
+	// once the rows held for flushing (arc_buffer_bytes_buffered) reach it, new
+	// write requests are refused with a retryable 503. 0 = off (the default),
+	// unless MaxBufferedBytesAuto ("auto"), which the buffer resolves against
+	// the memory limit it detects.
+	MaxBufferedBytes     int64
+	MaxBufferedBytesAuto bool
 }
+
+// minMaxBufferedBytes is the smallest explicit ingest.max_buffered_bytes: a
+// limit below one ordinary request refuses every write once anything is
+// buffered.
+const minMaxBufferedBytes = 1 << 20
 
 type CacheConfig struct {
 	Enabled    bool
@@ -482,10 +512,21 @@ type WALConfig struct {
 	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
 	// much written data a sync may leave behind, not the writer's throughput.
 	SyncBytes int64
-	// AckMode is when a write is acknowledged with the WAL on: "queued" (the
-	// default) once its entry is queued for the WAL writer, or "durable" once
-	// a sync covering it has completed. See wal.AckMode.
+	// AckMode is when a write is acknowledged with the WAL on: "durable" once
+	// a sync covering its entry has completed, or "queued" once the entry is
+	// queued for the WAL writer. Always resolved here to one of the two: the
+	// default "auto" (#1499) is durable with the WAL on, and queued with the
+	// WAL off or with cluster.wal_coverage set (the covered append commits
+	// under the ingest shard lock, where a durable wait would stall every
+	// writer to the measurement). See wal.AckMode.
 	AckMode string
+	// AckModeAuto records that AckMode was resolved from "auto".
+	AckModeAuto bool
+	// AckTimeoutSeconds bounds a durable write's wait for its covering sync
+	// (#1501): past it the write is refused (503, wal_not_durable) and its
+	// entries retracted without waiting on the device. Default 30; 0 = no
+	// bound. See wal.WriterConfig.AckTimeout.
+	AckTimeoutSeconds int
 	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
 	// volume is low on free space, and keeps the WAL reserve file (#676).
 	// Default true; only acts with the WAL enabled.
@@ -552,6 +593,10 @@ type IcebergConfig struct {
 	// nothing regenerates, so it gets an off switch; turning it off restores the pre-#835
 	// behaviour, where that metadata grows without bound and is copied into every backup.
 	OrphanSweepEnabled bool
+	// ColdRescanInterval (seconds) is how long the export trusts a measurement's cached cold-tier
+	// listing when nothing invalidated it (#939): Arc's own cold changes invalidate it at once,
+	// so this bounds only changes made behind Arc's back.
+	ColdRescanInterval int
 }
 
 type ContinuousQueryConfig struct {
@@ -588,6 +633,10 @@ type QueryConfig struct {
 	// FileTimePruningMarginSeconds widens the keep-window below the query's
 	// lower bound to absorb writer clock skew (default 300).
 	FileTimePruningMarginSeconds int
+	// MaxSQLLength caps the length in bytes of a query's SQL (#1448), on every
+	// endpoint that runs user SQL and on continuous query definitions.
+	// Default 10000; MaxSQLLengthCeiling at most.
+	MaxSQLLength int
 	// StableSchema (26.09.2, #914) lists a measurement's zero-row field
 	// schema anchor first in every read_parquet, so a field absent from
 	// the files a time range selects binds as a typed NULL column instead of
@@ -845,11 +894,12 @@ type ClusterConfig struct {
 	// These gate and tune the background puller that replicates Parquet files
 	// between nodes over the coordinator TCP protocol. Only takes effect when
 	// ReplicationEnabled && Enabled and FeatureClustering is licensed.
-	ReplicationPullWorkers      int // Number of concurrent fetch workers per node (default: 4)
-	ReplicationQueueSize        int // Buffered FSM callback queue size (default: 1024)
-	ReplicationFetchTimeoutMs   int // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
-	ReplicationServeTimeoutMs   int // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
-	ReplicationRetryMaxAttempts int // Max immediate retry attempts per enqueue (default: 3)
+	ReplicationPullWorkers        int   // Number of concurrent fetch workers per node (default: 4)
+	ReplicationPullBytesPerSecond int64 // Aggregate inbound puller bandwidth per node, bytes/s (0 = unlimited; staged compaction fetches are not capped)
+	ReplicationQueueSize          int   // Buffered FSM callback queue size (default: 1024)
+	ReplicationFetchTimeoutMs     int   // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
+	ReplicationServeTimeoutMs     int   // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
+	ReplicationRetryMaxAttempts   int   // Max immediate retry attempts per enqueue (default: 3)
 
 	// Peer file replication catch-up and periodic reconciliation (Phase 3).
 	// These control the startup walker and the repeatable manifest rechecks
@@ -989,9 +1039,9 @@ func Load() (*Config, error) {
 	// Load config file
 	v.SetConfigName("arc")
 	v.SetConfigType("toml")
-	v.AddConfigPath(".")
-	v.AddConfigPath("/etc/arc/")
-	v.AddConfigPath("$HOME/.arc/")
+	for _, p := range configSearchPaths {
+		v.AddConfigPath(p)
+	}
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -1033,6 +1083,14 @@ func Load() (*Config, error) {
 	departedTTL, err := time.ParseDuration(v.GetString("cluster.stream_takeover_departed_ttl"))
 	if err != nil || departedTTL < time.Minute {
 		return nil, fmt.Errorf("invalid cluster.stream_takeover_departed_ttl %q: must be a Go duration of at least 1m", v.GetString("cluster.stream_takeover_departed_ttl"))
+	}
+
+	// Peer replication bandwidth cap (#397). Parsed as a size so "10MB" means
+	// what it says: GetInt64 turns anything it cannot parse into 0, which is
+	// "unlimited", and a negative value used to switch replication off.
+	pullBytesPerSecond, err := ParseSize(v.GetString("cluster.replication_pull_bytes_per_second"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid cluster.replication_pull_bytes_per_second %q: must be 0 (unlimited) or a positive size such as 10MB: %w", v.GetString("cluster.replication_pull_bytes_per_second"), err)
 	}
 
 	// math.IsNaN via self-comparison: NaN would disable the breaker silently.
@@ -1121,21 +1179,25 @@ func Load() (*Config, error) {
 			GCSEndpoint:        v.GetString("storage.gcs_endpoint"),
 		},
 		Ingest: IngestConfig{
-			MaxBufferSize:         v.GetInt("ingest.max_buffer_size"),
-			MaxBufferAgeMS:        v.GetInt("ingest.max_buffer_age_ms"),
-			Compression:           v.GetString("ingest.compression"),
-			UseDictionary:         v.GetBool("ingest.use_dictionary"),
-			NumericDictionary:     v.GetBool("ingest.numeric_dictionary"),
-			WriteStatistics:       v.GetBool("ingest.write_statistics"),
-			DataPageVersion:       v.GetString("ingest.data_page_version"),
-			FlushWorkers:          v.GetInt("ingest.flush_workers"),
-			FlushQueueSize:        v.GetInt("ingest.flush_queue_size"),
-			FlushTimeoutSeconds:   v.GetInt("ingest.flush_timeout_seconds"),
-			ShardCount:            v.GetInt("ingest.shard_count"),
-			SortKeys:              v.GetStringSlice("ingest.sort_keys"),
-			DefaultSortKeys:       v.GetString("ingest.default_sort_keys"),
-			DecimalColumns:        v.GetStringSlice("ingest.decimal_columns"),
-			DefaultDecimalColumns: v.GetString("ingest.default_decimal_columns"),
+			MaxBufferSize:          v.GetInt("ingest.max_buffer_size"),
+			MaxBufferAgeMS:         v.GetInt("ingest.max_buffer_age_ms"),
+			Compression:            v.GetString("ingest.compression"),
+			UseDictionary:          v.GetBool("ingest.use_dictionary"),
+			NumericDictionary:      v.GetBool("ingest.numeric_dictionary"),
+			WriteStatistics:        v.GetBool("ingest.write_statistics"),
+			DataPageVersion:        v.GetString("ingest.data_page_version"),
+			MaxRowGroupRows:        v.GetInt("ingest.max_row_group_rows"),
+			WritePageIndex:         v.GetBool("ingest.write_page_index"),
+			FlushWorkers:           v.GetInt("ingest.flush_workers"),
+			FlushQueueSize:         v.GetInt("ingest.flush_queue_size"),
+			FlushTimeoutSeconds:    v.GetInt("ingest.flush_timeout_seconds"),
+			ShardCount:             v.GetInt("ingest.shard_count"),
+			SortKeys:               v.GetStringSlice("ingest.sort_keys"),
+			DefaultSortKeys:        v.GetString("ingest.default_sort_keys"),
+			DecimalColumns:         v.GetStringSlice("ingest.decimal_columns"),
+			DefaultDecimalColumns:  v.GetString("ingest.default_decimal_columns"),
+			ImportWriteConcurrency: v.GetInt("ingest.import_write_concurrency"),
+			ImportQueueTimeoutMS:   v.GetInt("ingest.import_queue_timeout_ms"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -1221,6 +1283,7 @@ func Load() (*Config, error) {
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
 			AckMode:                 v.GetString("wal.ack_mode"),
+			AckTimeoutSeconds:       v.GetInt("wal.ack_timeout_seconds"),
 			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
 			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
 			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
@@ -1249,6 +1312,7 @@ func Load() (*Config, error) {
 			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
+			ColdRescanInterval:       v.GetInt("iceberg.cold_rescan_interval"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -1274,6 +1338,7 @@ func Load() (*Config, error) {
 			SlowQueryThresholdMs:          v.GetInt("query.slow_query_threshold_ms"),
 			FileTimePruning:               v.GetBool("query.file_time_pruning"),
 			FileTimePruningMarginSeconds:  v.GetInt("query.file_time_pruning_margin_seconds"),
+			MaxSQLLength:                  v.GetInt("query.max_sql_length"),
 			StableSchema:                  v.GetBool("query.stable_schema"),
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
@@ -1346,6 +1411,7 @@ func Load() (*Config, error) {
 			ReplicationEnabled: v.GetBool("cluster.replication_enabled"),
 			// Peer file replication (Enterprise Phase 2)
 			ReplicationPullWorkers:                   v.GetInt("cluster.replication_pull_workers"),
+			ReplicationPullBytesPerSecond:            pullBytesPerSecond,
 			ReplicationQueueSize:                     v.GetInt("cluster.replication_queue_size"),
 			ReplicationFetchTimeoutMs:                v.GetInt("cluster.replication_fetch_timeout_ms"),
 			ReplicationServeTimeoutMs:                v.GetInt("cluster.replication_serve_timeout_ms"),
@@ -1444,9 +1510,33 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	switch cfg.WAL.AckMode {
-	case "queued", "durable":
+	case "auto", "queued", "durable":
 	default:
-		return nil, fmt.Errorf("wal.ack_mode must be queued or durable, got %q", cfg.WAL.AckMode)
+		return nil, fmt.Errorf("wal.ack_mode must be auto, queued or durable, got %q", cfg.WAL.AckMode)
+	}
+	// "auto" is resolved first, so no later check ever sees it (#1499):
+	// durable with the WAL on; queued with the WAL off (the key has no
+	// effect) or with cluster.wal_coverage set, which durable does not
+	// support (below). The explicit values keep their checks.
+	// Coverage takes effect only on a clustered, local-storage writer with
+	// the WAL on (enableWALCoverage in cmd/arc); the key alone is ignored,
+	// with a warning, everywhere else.
+	coverageInEffect := cfg.WAL.Enabled && cfg.Cluster.Enabled && cfg.Cluster.WALCoverage && !cfg.Cluster.SharedStorageMode
+	if cfg.WAL.AckMode == "auto" {
+		cfg.WAL.AckModeAuto = true
+		switch {
+		case !cfg.WAL.Enabled:
+			cfg.WAL.AckMode = "queued"
+		case coverageInEffect:
+			cfg.WAL.AckMode = "queued"
+			cfg.Warnings = append(cfg.Warnings, LoadWarning{
+				Key:     "wal.ack_mode",
+				Value:   "auto",
+				Message: "wal.ack_mode = \"auto\" resolves to \"queued\" because cluster.wal_coverage is in effect on this writer: writes are acknowledged before their WAL entry is synced, and a crash can lose entries still queued or unsynced",
+			})
+		default:
+			cfg.WAL.AckMode = "durable"
+		}
 	}
 	// The covered append (cluster.wal_coverage) commits under the ingest shard
 	// lock, where waiting for a sync would stall every writer to that
@@ -1458,8 +1548,11 @@ func Load() (*Config, error) {
 			Message: "wal.ack_mode = \"durable\" has no effect while wal.enabled = false: writes are acknowledged without a WAL",
 		})
 	}
-	if cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" && cfg.Cluster.WALCoverage {
-		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true")
+	if cfg.WAL.AckMode == "durable" && coverageInEffect {
+		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true on a clustered writer")
+	}
+	if cfg.WAL.AckTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("wal.ack_timeout_seconds must be 0 (no bound) or positive, got %d", cfg.WAL.AckTimeoutSeconds)
 	}
 	if cfg.WAL.DiskMinFreeMB < 0 {
 		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
@@ -1479,6 +1572,22 @@ func Load() (*Config, error) {
 	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
+	}
+	if cfg.Ingest.ImportWriteConcurrency < 0 || cfg.Ingest.ImportWriteConcurrency > 1024 {
+		return nil, fmt.Errorf("invalid ingest.import_write_concurrency value: %d (must be 0-1024; 0 = auto)", cfg.Ingest.ImportWriteConcurrency)
+	}
+	// 0 keeps the writer's own cap (one row group per flush). Anything else
+	// below 1024 is a footer footgun — a cap of 1 writes one row group AND one
+	// page-index entry per row (probe: 300 rows → 780 KB) — so it is rejected
+	// like a negative value rather than silently clamped.
+	if cfg.Ingest.MaxRowGroupRows != 0 && cfg.Ingest.MaxRowGroupRows < 1024 {
+		return nil, fmt.Errorf("invalid ingest.max_row_group_rows value: %d (must be 0 or >= 1024; 0 = one row group per flush)", cfg.Ingest.MaxRowGroupRows)
+	}
+	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
+		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
+	}
+	if cfg.Ingest.MaxBufferedBytes, cfg.Ingest.MaxBufferedBytesAuto, err = parseMaxBufferedBytes(v.GetString("ingest.max_buffered_bytes")); err != nil {
+		return nil, err
 	}
 	// A negative max_concurrent would reach make(chan struct{}, m.MaxConcurrent)
 	// in the compaction manager's cycle loop and panic the process at the first
@@ -1678,20 +1787,38 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	// Iceberg export is LOCAL-ONLY in v1. The reconciler walks the single configured storage
-	// backend and derives schemas by reading Parquet footers from the local filesystem, and the
-	// export was verified only against a local backend. Refuse non-local primary backends and
-	// cold-tier tiering (a file migrated to object storage would leave the Iceberg table) at
-	// load time rather than run an unsupported/corrupting configuration.
+	// The packaged layout's two silent consequences (#1463): the unit's
+	// ARC_BACKUP_LOCAL_PATH overriding an edited arc.toml, and backups an
+	// earlier release left where this boot no longer looks.
+	if w := backupLocalPathOverrideWarning(v, cfg); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+	if w := legacyBackupsWarning(v, cfg); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+
+	cfg.ConfigFile = v.ConfigFileUsed()
+	if w := shadowedConfigFilesWarning(cfg.ConfigFile); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+
+	// Iceberg export runs on a local or an S3 primary backend (#939). The reconciler walks the
+	// single configured storage backend and publishes through iceberg-go's FileIO, which Arc
+	// links for s3:// only, so Azure and GCS primaries are refused, as is a cold tier on anything
+	// but S3 (a file migrated there would leave the Iceberg table). Refused at load time rather
+	// than run an unsupported or corrupting configuration.
 	if cfg.Iceberg.Enabled {
-		if cfg.Storage.Backend != "local" {
-			return nil, fmt.Errorf("iceberg.enabled=true requires storage.backend=\"local\" (got %q); "+
-				"Iceberg export is local-only in this release", cfg.Storage.Backend)
+		if err := cfg.checkIcebergBackend(); err != nil {
+			return nil, err
 		}
 		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
-			return nil, fmt.Errorf("iceberg.enabled=true is not supported with cold-tier tiering " +
-				"(tiered_storage.cold.enabled): files migrated to the cold tier would be removed from the " +
-				"Iceberg table. Disable one of them")
+			if err := cfg.checkIcebergColdTier(); err != nil {
+				return nil, err
+			}
+		}
+		if cfg.Iceberg.ColdRescanInterval < 1 {
+			return nil, fmt.Errorf("iceberg.cold_rescan_interval must be >= 1 (got %d): it is how long, in seconds, "+
+				"a cached cold-tier listing is trusted", cfg.Iceberg.ColdRescanInterval)
 		}
 		if cfg.Iceberg.ReconcileInterval < 1 {
 			return nil, fmt.Errorf("iceberg.reconcile_interval must be >= 1 (got %d): "+
@@ -1912,7 +2039,44 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if err := checkMaxSQLLength(cfg.Query.MaxSQLLength, cfg.Server.MaxPayloadSize); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// DefaultMaxSQLLength is query.max_sql_length's default, the cap Arc always
+// had. MinMaxSQLLength and MaxSQLLengthCeiling bound what it accepts: below
+// the floor ordinary queries stop fitting, and above the ceiling one query's
+// validation and rewrite cost too much CPU before DuckDB starts.
+//
+// That cost is linear in the query's length since #1479, but depends on its
+// shape. Measured for a whole request at the ceiling (1 MiB): a JOIN chain
+// about 1.7 s, a run of `FROM x` about 2.3 s, and a comma join of 2-byte
+// references (`FROM x,x,x…`, the worst shape) about 4.1 s, of which
+// validation, the rewrite and DuckDB's parse each take about a third. No
+// rewrite pass scans another's output since #1482, and query.timeout stops
+// the rewrite. At the 10 KB default the worst shape costs about 0.2 s.
+// Raising the cap trades that CPU for longer queries.
+const (
+	DefaultMaxSQLLength = 10000
+	MinMaxSQLLength     = 1000
+	MaxSQLLengthCeiling = 1 << 20
+)
+
+func checkMaxSQLLength(n int, maxPayload int64) error {
+	if n < MinMaxSQLLength || n > MaxSQLLengthCeiling {
+		return fmt.Errorf("query.max_sql_length is %d; it must be between %d and %d bytes",
+			n, MinMaxSQLLength, MaxSQLLengthCeiling)
+	}
+	// The body limit is enforced before the handler runs, and the SQL travels
+	// inside a JSON or MessagePack body, so a cap at or above it never applies.
+	if maxPayload > 0 && int64(n) >= maxPayload {
+		return fmt.Errorf("query.max_sql_length (%d) must be smaller than server.max_payload_size (%d); "+
+			"the request body carrying the SQL is limited first", n, maxPayload)
+	}
+	return nil
 }
 
 func setDefaults(v *viper.Viper) {
@@ -2000,6 +2164,23 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.numeric_dictionary", false) // only relevant with use_dictionary=true; see IngestConfig
 	v.SetDefault("ingest.write_statistics", true)
 	v.SetDefault("ingest.data_page_version", "2.0")
+	// Row groups are the unit of parallelism and of min/max pruning for every
+	// reader. One flush used to become one row group (arrow-go's default cap is
+	// 64 Mi rows), so an hourly file was ONE group: nothing to prune, one task
+	// per file. 524288 measured FREE on the sustained msgpack benchmark (36.9 M
+	// vs 36.1 M rec/s on main, within noise) where compaction's 122880 cost
+	// 1.7 % alone and 3.7 % with the page index; through arcx a time-ordered
+	// top-N still goes 70 → 5 ms and an hourly bucket 67 → 58 ms (plannings:
+	// Arc_research_ingest_writer_knobs, 2026-11-07).
+	v.SetDefault("ingest.max_row_group_rows", 524288)
+	// Page index: nothing in Arc reads it yet and its write cost grows with the
+	// row-group count (−3.7 % at 41 groups per 5 M-row flush on the sustained
+	// benchmark), so it is off until a consumer exists. When on, the offset
+	// index is always written; the column index needs write_statistics and is
+	// dropped for a chunk whose page stats are missing or over the stats size
+	// cap (arrow-go discards, never errors). Compaction (DuckDB COPY) does not
+	// preserve it.
+	v.SetDefault("ingest.write_page_index", false)
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
 	v.SetDefault("ingest.shard_count", 32)
@@ -2008,6 +2189,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
 	v.SetDefault("ingest.decimal_columns", []string{})
 	v.SetDefault("ingest.default_decimal_columns", "")
+	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
+	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
+	v.SetDefault("ingest.max_buffered_bytes", "0") // off; "auto" = half the memory limit (#1468)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -2105,7 +2289,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
-	v.SetDefault("wal.ack_mode", "queued")             // Acknowledge once queued; "durable" waits for the covering sync
+	v.SetDefault("wal.ack_mode", "auto")               // durable with the WAL on (#1499); queued with it off or with cluster.wal_coverage
+	v.SetDefault("wal.ack_timeout_seconds", 30)        // A durable write waits at most this long for its sync (#1501); 0 = no bound
 	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
 	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
 	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes
@@ -2133,6 +2318,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
+	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
 	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults
@@ -2152,6 +2338,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
 	v.SetDefault("query.file_time_pruning", true)                // On by default since 27.01.1 (#659); false turns it off
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
+	v.SetDefault("query.max_sql_length", DefaultMaxSQLLength)    // #1448: bytes of SQL per query
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
 	v.SetDefault("query.stable_schema_bootstrap", true)          // Build anchors for pre-26.09.2 measurements on first query
 	v.SetDefault("query.stable_schema_bootstrap_max_files", 500) // Footers sampled per bootstrap (newest days, compacted files first)
@@ -2230,6 +2417,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_enabled", false) // Disabled by default
 	// Peer file replication (Enterprise Phase 2)
 	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
+	v.SetDefault("cluster.replication_pull_bytes_per_second", 0) // Unlimited aggregate inbound bytes per second
 	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue
 	v.SetDefault("cluster.replication_fetch_timeout_ms", 60000)  // 60s puller-side per-fetch timeout
 	v.SetDefault("cluster.replication_serve_timeout_ms", 120000) // 120s origin-side body-stream timeout
@@ -2334,7 +2522,7 @@ func setDefaults(v *viper.Viper) {
 
 	// Backup defaults
 	v.SetDefault("backup.enabled", true)
-	v.SetDefault("backup.local_path", "./data/backups")
+	v.SetDefault("backup.local_path", defaultBackupLocalPath)
 	// Backup targets (#1085 stage B2b-1). Only the two keys whose names are
 	// fixed can be defaulted here: a target's own fields are
 	// backup.targets.<name>.*, and no name exists until a config file has been
@@ -2802,6 +2990,22 @@ func (cfg *ServerConfig) ValidateTLS() error {
 	return nil
 }
 
+// parseMaxBufferedBytes parses ingest.max_buffered_bytes: "auto", a size of
+// at least 1MB, or a size of 0 (off).
+func parseMaxBufferedBytes(s string) (n int64, auto bool, err error) {
+	if strings.EqualFold(strings.TrimSpace(s), "auto") {
+		return 0, true, nil
+	}
+	n, err = ParseSize(s)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid ingest.max_buffered_bytes: %w (use \"auto\", a size such as \"2GB\", or \"0\" for off)", err)
+	}
+	if n > 0 && n < minMaxBufferedBytes {
+		return 0, false, fmt.Errorf("invalid ingest.max_buffered_bytes value %q: must be at least 1MB, \"auto\", or 0 for off", s)
+	}
+	return n, false, nil
+}
+
 // ParseSize parses a human-readable size string (e.g., "1GB", "500MB", "100KB") to bytes.
 // Supports: B, KB, MB, GB (case-insensitive).
 // Returns the size in bytes or an error if the format is invalid.
@@ -2843,6 +3047,12 @@ func ParseSize(sizeStr string) (int64, error) {
 			if num < 0 {
 				return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
 			}
+			// Bound before converting: an out-of-range float-to-int64
+			// conversion is implementation-defined, and on amd64 gives
+			// MinInt64, a negative size the checks above have already passed.
+			if num*float64(unit.multiplier) >= math.MaxInt64 {
+				return 0, fmt.Errorf("size too large: %s", sizeStr)
+			}
 			return int64(num * float64(unit.multiplier)), nil
 		}
 	}
@@ -2858,4 +3068,101 @@ func ParseSize(sizeStr string) (int64, error) {
 		return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
 	}
 	return num, nil
+}
+
+// checkIcebergBackend refuses the primary-backend shapes Iceberg export does not support (#939).
+//
+//   - storage.backend other than "local" or "s3": the exporter publishes through iceberg-go's
+//     FileIO, and Arc links its s3:// driver only.
+//   - storage.backend="s3" on Google Cloud Storage's S3-compatible endpoint: Arc reaches GCS
+//     through a request signer and checksum policy set on its own S3 client, which iceberg-go's
+//     client does not get, so its writes would be refused.
+//   - storage.backend="s3" with an iceberg.warehouse outside the storage root: iceberg-go opens
+//     every added data file through the table's FileIO, which is bound to the warehouse's bucket,
+//     so a warehouse in another bucket fails the first add; one under another prefix of the same
+//     bucket is outside what backups and the orphan sweep treat as Arc's.
+//   - a cold tier other than S3 (checkIcebergColdTier).
+//   - cluster.shared_storage_mode without cluster.failover_enabled: without the compactor lease
+//     every compactor-role node exports, and two exporters writing one table's metadata fork it.
+func (cfg *Config) checkIcebergBackend() error {
+	switch cfg.Storage.Backend {
+	case "local":
+	case "s3":
+		if storage.IsGCSEndpoint(cfg.Storage.S3Endpoint) {
+			return fmt.Errorf("iceberg.enabled=true is not supported with storage.backend=\"s3\" on Google Cloud Storage's " +
+				"S3-compatible endpoint (storage.s3_endpoint=storage.googleapis.com): Iceberg export supports local and S3 primary storage")
+		}
+		if err := checkIcebergWarehouseUnderS3Root(cfg.Iceberg.Warehouse, cfg.Storage.S3Bucket, cfg.Storage.S3Prefix); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("iceberg.enabled=true requires storage.backend=\"local\" or \"s3\" (got %q): "+
+			"Iceberg export does not support %s primary storage", cfg.Storage.Backend, cfg.Storage.Backend)
+	}
+	if cfg.Cluster.Enabled && cfg.Cluster.SharedStorageMode && !cfg.Cluster.FailoverEnabled {
+		return fmt.Errorf("iceberg.enabled=true with cluster.shared_storage_mode=true requires cluster.failover_enabled=true: " +
+			"the compactor lease is what keeps a single node exporting, and two exporters writing the same table's " +
+			"metadata in shared storage fork its history")
+	}
+	return nil
+}
+
+// checkIcebergColdTier refuses a cold tier Iceberg export cannot track (#939): it follows files
+// migrated to an S3 cold tier into the table, and the cold URIs are registered through iceberg-go,
+// which Arc links for s3:// only. An Azure or GCS cold tier would drop migrated files from the
+// table, and so would S3 on Google Cloud Storage's interop endpoint, whose signer iceberg-go's
+// client does not get.
+func (cfg *Config) checkIcebergColdTier() error {
+	cold := cfg.TieredStorage.Cold
+	if cold.Backend != "s3" {
+		return fmt.Errorf("iceberg.enabled=true with cold-tier tiering requires tiered_storage.cold.backend=\"s3\" (got %q): "+
+			"files migrated to a %s cold tier would leave the Iceberg table. Disable one of them", cold.Backend, cold.Backend)
+	}
+	if storage.IsGCSEndpoint(cold.S3Endpoint) {
+		return fmt.Errorf("iceberg.enabled=true is not supported with an S3 cold tier on Google Cloud Storage's " +
+			"S3-compatible endpoint (tiered_storage.cold.s3_endpoint=storage.googleapis.com)")
+	}
+	return nil
+}
+
+// checkIcebergWarehouseUnderS3Root refuses an explicit iceberg.warehouse that is not
+// s3://<storage.s3_bucket>/ under storage.s3_prefix, compared on whole path segments
+// (s3://b/ab is not under s3://b/a). An empty warehouse means the default, the storage root.
+func checkIcebergWarehouseUnderS3Root(warehouse, bucket, prefix string) error {
+	warehouse = strings.TrimSpace(warehouse)
+	if warehouse == "" {
+		return nil
+	}
+	root := "s3://" + bucket + "/" + strings.TrimSuffix(prefix, "/")
+	refuse := func(why string) error {
+		return fmt.Errorf("iceberg.warehouse=%q must be inside the storage root %s (%s): Iceberg data files are opened "+
+			"through the warehouse's bucket, and metadata outside the root is not covered by backups", warehouse, strings.TrimSuffix(root, "/"), why)
+	}
+	u, err := url.Parse(warehouse)
+	if err != nil {
+		return refuse("not a URI")
+	}
+	if u.Scheme != "s3" {
+		return refuse("not an s3:// URI")
+	}
+	if u.Host != bucket {
+		return refuse("a different bucket")
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return refuse("a URI with a query, fragment or user")
+	}
+	path := strings.TrimPrefix(u.Path, "/")
+	if path != "" {
+		if _, err := storage.ValidateObjectPrefix(path); err != nil {
+			return refuse(err.Error())
+		}
+	}
+	want, err := storage.ValidateObjectPrefix(prefix)
+	if err != nil {
+		return refuse(err.Error())
+	}
+	if !strings.HasPrefix(strings.TrimSuffix(path, "/")+"/", want) && want != "" {
+		return refuse("a path outside storage.s3_prefix")
+	}
+	return nil
 }
