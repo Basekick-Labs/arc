@@ -1824,6 +1824,16 @@ func (w *Writer) enqueueDurable(entry walEntry, deadline <-chan time.Time) error
 	if w.closedFlag.Load() {
 		return errors.New("WAL writer is closed")
 	}
+	// Room in the queue admits the entry even past the deadline: the
+	// deadline can run out while the entry is built (a large chunk under
+	// -race), and a select with both cases ready picks one at random. Only a
+	// full queue is a stalled device (#1577).
+	select {
+	case w.entryChan <- entry:
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
+		return nil
+	default:
+	}
 	select {
 	case w.entryChan <- entry:
 		w.enqueuedBytes.Add(uint64(len(entry.data)))
@@ -1831,10 +1841,11 @@ func (w *Writer) enqueueDurable(entry walEntry, deadline <-chan time.Time) error
 	case <-w.done:
 		return errors.New("WAL writer is closed")
 	case <-deadline:
-		// Admission waited AckTimeout on a full queue: the device is as
-		// stalled as a sync that never completes. The caller's error path
-		// counts and retracts (retractTimedOut); the state is set here, so
-		// the suspend is not delayed by that (#1502).
+		// Admission waited on a full queue until AckTimeout ran out (room
+		// was taken above, so the queue was full when this wait began): the
+		// device is as stalled as a sync that never completes. The caller's
+		// error path counts and retracts (retractTimedOut); the state is set
+		// here, so the suspend is not delayed by that (#1502).
 		w.setAckFailing(true)
 		return errAckTimeout
 	}

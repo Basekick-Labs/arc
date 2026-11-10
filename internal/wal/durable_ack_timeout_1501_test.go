@@ -218,3 +218,29 @@ func TestDurableAckTimeoutOnAMultiChunkAppendDoesNotWaitOnTheDevice(t *testing.T
 	released = true
 	close(release)
 }
+
+// A durable entry is admitted when the queue has room, even with its deadline
+// already past: the deadline can run out while a large entry is built, and a
+// select with both cases ready picks one at random, refusing the write as a
+// stalled device and suspending MQTT for nothing (#1577). Repeated, so the
+// random pick cannot pass by luck.
+func TestDurableAdmissionTakesRoomPastTheDeadline(t *testing.T) {
+	w := newTimeoutWriter(t, 1, time.Hour)
+	release, held := stallWriterLoop(t)
+	defer func() {
+		close(release)
+		_ = w.Close()
+	}()
+	require.NoError(t, w.AppendRawWithMeta("iot", durablePayload(t)))
+	for !held.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	fired := make(chan time.Time)
+	close(fired)
+	for i := 0; i < 64; i++ {
+		entry := walEntry{data: []byte{1}, durable: true, done: make(chan error, 1)}
+		require.NoError(t, w.enqueueDurable(entry, fired), "attempt %d: refused with room in the queue", i)
+		<-w.entryChan // the stalled loop never takes it
+	}
+	require.False(t, w.ackFailing.Load(), "acknowledgements reported failing with room in the queue")
+}

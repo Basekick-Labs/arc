@@ -57,7 +57,11 @@ What changes with the WAL on:
   `arc_wal_failed_syncs_total` (a failing one),
   `arc_wal_not_durable_rejections_total` and the `wal_not_durable` refusal
   log. The HTTP request context plays no part: in Fiber it has no deadline
-  and ends only at server shutdown.
+  and ends only at server shutdown. Only a full queue counts as a stalled
+  device: an entry whose timeout ran out while it was being built (a very
+  large chunk) is still admitted when the queue has room, rather than
+  refused at random and reported as failing acknowledgements
+  ([#1577](https://github.com/Basekick-Labs/arc/issues/1577)).
 - **MQTT.** While the WAL refuses writes as not durable (a timed-out or failed
   sync: the device is stalled or failing), MQTT subscriptions are suspended,
   as they are for a fence, WAL disk pressure and a full buffer
