@@ -302,7 +302,7 @@ The FIPS build reports the same version as the standard build and logs
 tokens must be rotated when moving to the FIPS build (it stores new tokens with
 PBKDF2 and fails bcrypt verification closed). The Go Cryptographic Module is
 CMVP-certified; Arc itself is not a CMVP-listed module. See the
-[FIPS 140-3 mode guide](https://docs.basekick.net/docs/configuration/fips).
+[FIPS 140-3 mode guide](https://docs.basekick.net/arc/configuration/fips/).
 
 ---
 
@@ -358,7 +358,7 @@ backend = "local"        # local, s3, minio
 local_path = "./data/arc"
 
 [ingest]
-flush_interval = "5s"
+max_buffer_age_ms = 5000   # flush a buffer at most this old
 max_buffer_size = 50000
 
 [auth]

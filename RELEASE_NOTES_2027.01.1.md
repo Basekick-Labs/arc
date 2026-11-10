@@ -74,6 +74,20 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Changed: continuous queries are enabled in the packaged configuration
+
+The `arc.toml` shipped in the `.deb`, RPM, Arch package and Docker image set
+`[continuous_query] enabled = false`, unlike the code default and the
+documentation, so on a fresh package install every continuous-query API call
+answered 404 and every `arcli cq` command failed. It is now `enabled = true`
+(also in 26.09.4). No continuous query runs until one is created.
+
+Since this release a package upgrade no longer replaces an existing
+`/etc/arc/arc.toml` ([#1465](https://github.com/Basekick-Labs/arc/issues/1465)),
+so an install that already has the file keeps its setting. To turn continuous
+queries on there, set `[continuous_query] enabled = true` (or
+`ARC_CONTINUOUS_QUERY_ENABLED=true`) and restart.
+
 ## Fix: the Linux packages run on Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 again ([#1579](https://github.com/Basekick-Labs/arc/issues/1579))
 
 The 26.09.3 Linux binary needed glibc 2.38, because it was built on the
