@@ -1242,9 +1242,19 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("cold backend does not support ListObjects")
 	}
+	// Decided before the listing: only a listing that started after the
+	// cold mark's fence may seed it (#1552).
+	seed := m.beginColdMarkSeed()
 	objects, err := lister.ListObjects(ctx, "")
 	if err != nil {
 		return 0, fmt.Errorf("failed to list cold objects: %w", err)
+	}
+	if seed != nil {
+		for _, obj := range objects {
+			if first, _, _ := strings.Cut(obj.Path, "/"); !storage.IsReservedRootDir(first) {
+				seed.note(m, obj.Path)
+			}
+		}
 	}
 
 	// One query for the cold row set, as the hot scan does. Skipping rows
@@ -1491,6 +1501,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read)")
 	}
 	m.checkMissingColdObjects(ctx, unseen)
+	seed.finish(ctx, m)
 
 	// Debug: the cycle summary already reports cold_synced.
 	m.logger.Debug().

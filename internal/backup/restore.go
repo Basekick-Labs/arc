@@ -1087,7 +1087,20 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			}
 
 			// Stream via temp file to avoid loading entire Parquet file into memory
-			bytesWritten, err := m.streamRestoreFile(ctx, leg.target, srcPath, destPath, expect, dest, destName)
+			var bytesWritten int64
+			restoreFile := func() error {
+				var werr error
+				bytesWritten, werr = m.streamRestoreFile(ctx, leg.target, srcPath, destPath, expect, dest, destName)
+				return werr
+			}
+			var err error
+			if g, ok := m.coldSource.(coldWriteGuard); ok && toCold {
+				// Raise the cluster's cold mark before the object exists
+				// (#1552); refused, the file is not written.
+				err = g.GuardColdWrite(ctx, []string{destPath}, restoreFile)
+			} else {
+				err = restoreFile()
+			}
 			if err != nil {
 				if errors.Is(err, errSidecarMismatch) {
 					progress.SidecarMismatches++

@@ -378,6 +378,14 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 // that way is refused (errZstdWindow).
 const zstdMaxWindow = 32 << 20
 
+// zstdDecodeAll is the decode decompressZstdPooled recovers around; a var so
+// a test can make it panic. klauspost/compress 1.20.2 fixed the crafted
+// frame that used to (GHSA-fpmh-frq8-7rj8), so no real input is known to
+// reach the recover any more.
+var zstdDecodeAll = func(d *zstd.Decoder, data []byte) ([]byte, error) {
+	return d.DecodeAll(data, nil)
+}
+
 // decompressZstdPooled decompresses an untrusted zstd request body with a
 // pooled decoder for maxSize (zstdDecoderPool in msgpack.go), into a fresh
 // []byte the caller owns.
@@ -424,7 +432,7 @@ func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 		}
 	}()
 
-	out, err = decoder.DecodeAll(data, nil)
+	out, err = zstdDecodeAll(decoder, data)
 	// DecodeAll leaves the decoder reusable after an error (its block
 	// decoders go back in a defer), so it returns to the pool either way.
 	pool.Put(decoder)

@@ -91,9 +91,10 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // forwarding via the router.
 //
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// import.go, tle.go, query.go, query_arrow_forward.go) invokes the returned
+// import.go, tle.go, query.go, query_arrow_forward.go, forward_read.go,
+// databases.go) invokes the returned
 // *http.Request synchronously within the Fiber handler — they pass it to
-// router.RouteWrite/RouteQuery/RouteReadQuery (which blocks on
+// router.RouteWrite/RouteQuery/RouteReadQuery/RouteDatabaseCreate (which blocks on
 // http.Client.Do; queries are buffered for retries, writes are streamed once
 // and never retried, see internal/cluster/router.go). All but the Arrow
 // forward then read+close the response body inside CopyResponse and return;
@@ -206,10 +207,11 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	return req, nil
 }
 
-// forwardedRoutes are the requests a peer forwards (writes, imports and
-// queries; see the RouteWrite/RouteImport/RouteQuery callers). A forwarded
-// identity is accepted only on these, so it cannot stand in for a token
-// anywhere else.
+// forwardedRoutes are the requests a peer forwards (writes, imports, queries
+// and database creation; see the RouteWrite/RouteImport/RouteQuery/
+// RouteReadQuery/RouteDatabaseCreate callers). A forwarded identity is
+// accepted only on these, so it cannot stand in for a token anywhere else;
+// the route's own permission check still applies to the forwarded token.
 var forwardedRoutes = map[string]bool{
 	"POST /write":                      true,
 	"POST /api/v2/write":               true,
@@ -229,6 +231,10 @@ var forwardedRoutes = map[string]bool{
 	"POST /api/v1/query/estimate": true,
 	"GET /api/v1/measurements":    true,
 	"GET /api/v1/databases":       true,
+	// Forwarded only to a writer advertising CapabilityForwardDatabaseCreate.
+	// Creation only: DELETE /api/v1/databases/:name is not forwarded and
+	// stays refused.
+	"POST /api/v1/databases": true,
 }
 
 // forwardedRoutePatterns are the forwardable routes with path parameters: a

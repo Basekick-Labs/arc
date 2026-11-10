@@ -178,7 +178,7 @@ The MessagePack endpoint is **stable** as of 26.09.1: its response shape and typ
 
 ## Single binary. Zero dependencies.
 
-Arc deploys as one statically-linked executable. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
+Arc deploys as one self-contained executable: DuckDB and its dependencies are linked in, and on Linux it needs only the system C library (glibc 2.34 or newer) and `libgcc_s`, which every distro ships. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
 
 - **Air-gap ready**: No external services required at runtime. No license server, no cloud dependency.
 - **Edge to cloud**: Deploy at the tactical edge, in a sovereign cloud, or on-premises.
@@ -229,6 +229,8 @@ brew install basekick-labs/tap/arc
 
 Apple Silicon. DuckDB is statically linked, so there are no runtime dependencies. (Use `brew install --formula arc` if you tap first, to disambiguate from the `arc` browser cask.)
 
+Linux packages run on glibc 2.34 or newer: Ubuntu 22.04+, Debian 12+, RHEL/Rocky/Alma 9+, Amazon Linux 2023, Fedora 35+. Ubuntu 20.04 and RHEL 8 are not supported.
+
 ### Debian/Ubuntu
 
 ```bash
@@ -239,9 +241,12 @@ sudo systemctl enable arc && sudo systemctl start arc
 
 ### RHEL/Fedora
 
+The RPMs are signed with the Basekick Labs package key from 26.09.4, fingerprint `3E39 9CF8 F5D2 EF9A A9A5 36EF 7629 7AF0 8CBA B6FE` (check it with `gpg --show-keys RPM-GPG-KEY-basekick`). Earlier RPMs are unsigned, and `dnf` installs them with a warning. Fedora 45 and later refuse an unsigned package with plain `rpm -i`.
+
 ```bash
+sudo rpm --import https://raw.githubusercontent.com/Basekick-Labs/arc/main/deploy/packaging/RPM-GPG-KEY-basekick
 wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3-1.x86_64.rpm
-sudo rpm -i arc-26.09.3-1.x86_64.rpm
+sudo dnf install -y ./arc-26.09.3-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
@@ -300,7 +305,7 @@ The FIPS build reports the same version as the standard build and logs
 tokens must be rotated when moving to the FIPS build (it stores new tokens with
 PBKDF2 and fails bcrypt verification closed). The Go Cryptographic Module is
 CMVP-certified; Arc itself is not a CMVP-listed module. See the
-[FIPS 140-3 mode guide](https://docs.basekick.net/docs/configuration/fips).
+[FIPS 140-3 mode guide](https://docs.basekick.net/arc/configuration/fips/).
 
 ---
 
@@ -356,7 +361,7 @@ backend = "local"        # local, s3, minio
 local_path = "./data/arc"
 
 [ingest]
-flush_interval = "5s"
+max_buffer_age_ms = 5000   # flush a buffer at most this old
 max_buffer_size = 50000
 
 [auth]

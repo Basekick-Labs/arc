@@ -162,6 +162,16 @@ type Coordinator struct {
 	streamClaimsBlockers atomic.Pointer[[]string]
 	// compactionCommit: the #1207 d2 flag's join gate and blockers.
 	compactionCommit compactionCommitGate
+	// coldMarkGate / coldWriteMu: the #1552 cold mark's join gate and write
+	// fence (cold_mark.go).
+	coldMarkGate coldMarkGate
+	coldWriteMu  sync.RWMutex
+	// coldMarkSeenEnabled: this node has seen Enable applied (sticky);
+	// coldMarkDrained: its one fence drain is done; coldMarkIdentity: its
+	// cold store identity getter.
+	coldMarkSeenEnabled atomic.Bool
+	coldMarkDrained     atomic.Bool
+	coldMarkIdentity    atomic.Pointer[func() string]
 	// clusterPolicies: the #1324 flag's join gate and blockers;
 	// policyListers read this node's own rows of each kind for adoption.
 	clusterPolicies clusterPoliciesGate
@@ -595,6 +605,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		ClusterName:         cfg.Config.ClusterName,
 		PeerForwardIdentity: c.peerForwardIdentity,
 		PeerReadQueries:     c.peerReadQueries,
+		PeerDatabaseCreate:  c.peerDatabaseCreate,
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft.
@@ -836,6 +847,7 @@ func (c *Coordinator) Start() error {
 	if c.raftNode != nil {
 		go c.compactionCommitEnableLoop(c.ctx)
 		go c.clusterPoliciesEnableLoop(c.ctx)
+		go c.coldMarkLoop(c.ctx)
 	}
 	// The staged compaction commit on an object store (#1207 d2a2b): the
 	// leader aborts jobs of a compactor that is gone, and committed jobs are
@@ -2317,10 +2329,21 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, cpWhy)
 			return
 		}
+		cmWhy, cmRelease := c.coldMarkJoinGate(req)
+		if cmWhy != "" {
+			cpRelease()
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", cmWhy).
+				Msg("Join refused: the node does not support the cold mark")
+			c.sendJoinError(conn, req, cmWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				cmRelease()
 				cpRelease()
 				ccRelease()
 				release()
@@ -3209,6 +3232,9 @@ func (c *Coordinator) Status() map[string]interface{} {
 	if c.raftNode != nil {
 		status["stream_claims"] = c.StreamClaimsStatus()
 		status["compaction_commit"] = c.CompactionCommitStatus()
+		cm, blocking := c.ColdMarkStatus()
+		trusted, why := c.ColdMarkTrusted(time.Now(), raft.ColdMarkAliveMaxAge, c.ColdMarkIdentity())
+		status["cold_mark"] = map[string]any{"state": cm, "blocking_nodes": blocking, "trusted": trusted, "untrusted_reason": why}
 		status["cluster_policies"] = c.ClusterPoliciesStatus()
 	}
 	// The stale-local sweep's last pass (#1071), where it runs.

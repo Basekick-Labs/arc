@@ -74,6 +74,69 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Changed: continuous queries are enabled in the packaged configuration
+
+The `arc.toml` shipped in the `.deb`, RPM, Arch package and Docker image set
+`[continuous_query] enabled = false`, unlike the code default and the
+documentation, so on a fresh package install every continuous-query API call
+answered 404 and every `arcli cq` command failed. It is now `enabled = true`
+(also in 26.09.4). No continuous query runs until one is created.
+
+Since this release a package upgrade no longer replaces an existing
+`/etc/arc/arc.toml` ([#1465](https://github.com/Basekick-Labs/arc/issues/1465)),
+so an install that already has the file keeps its setting. To turn continuous
+queries on there, set `[continuous_query] enabled = true` (or
+`ARC_CONTINUOUS_QUERY_ENABLED=true`) and restart.
+
+## Changed: the RPMs are signed
+
+rpm 6.1, which Fedora 45 ships, refuses an unsigned package by default
+(`%_pkgverify_level all`), and every Arc RPM up to 26.09.3 was unsigned:
+`package arc-26.09.3-1.x86_64 does not verify: no signature`. From 26.09.4
+the RPMs (Arc, arc-fips and arcli) are signed with the Basekick Labs package
+key. Its fingerprint is
+`3E39 9CF8 F5D2 EF9A A9A5 36EF 7629 7AF0 8CBA B6FE`, and it is published
+with every release and in the repository at
+`deploy/packaging/RPM-GPG-KEY-basekick`. Import it once, then install:
+
+```bash
+sudo rpm --import https://raw.githubusercontent.com/Basekick-Labs/arc/main/deploy/packaging/RPM-GPG-KEY-basekick
+sudo dnf install -y ./arc-<version>-1.x86_64.rpm
+```
+
+`dnf install ./file.rpm` also installs the older unsigned RPMs, with a
+warning.
+
+## Fix: the Linux packages run on Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 again ([#1579](https://github.com/Basekick-Labs/arc/issues/1579))
+
+The 26.09.3 Linux binary needed glibc 2.38, because it was built on the
+newest GitHub runner:
+
+- On Debian 12 and Ubuntu 22.04 the `.deb` installed and then failed to start
+  (``version `GLIBC_2.38' not found``).
+- On RHEL/Rocky/Alma 9 and Amazon Linux 2023 the RPM refused to install. On
+  RHEL 9 it also needed a newer libstdc++ (`GLIBCXX_3.4.30`) than the system
+  ships.
+
+The binaries are now built on Ubuntu 22.04 with libstdc++ linked in, so they
+need only glibc 2.34 or newer and the system's `libgcc_s`.
+
+- **Supported:** Ubuntu 22.04+, Debian 12+, RHEL/Rocky/Alma 9+, Amazon Linux
+  2023, Fedora 35+.
+- **Not supported:** Ubuntu 20.04 and RHEL 8 (glibc 2.31 and 2.28).
+- The `.deb` now declares `Depends: libc6 (>= 2.34), libgcc-s1`, so `dpkg`
+  refuses an older system up front instead of installing a binary that cannot
+  start.
+
+The release build now:
+
+- fails if the binary needs anything above glibc 2.34 or links libstdc++
+  dynamically;
+- installs and starts each package on Debian 12, Ubuntu 22.04, Rocky 9 and
+  Amazon Linux 2023.
+
+Every PR builds the Linux binary the same way, on both architectures.
+
 ## Fix: every read sent to a compactor is answered by a reader, and `/api/v1/queries` covers what it forwarded
 
 A compactor answered several reads itself, from its own storage and field
@@ -110,7 +173,43 @@ the queries it forwarded:
 - A client that disconnects from a compactor now also cancels its forwarded
   read, as it cancels a local one, with or without query management.
 
-`POST /api/v1/databases` (create) still runs on the compactor; it is a write.
+`POST /api/v1/databases` (create) is a write; see the next section.
+
+## Fix: a database created on a compactor or reader is created by the writer
+
+`POST /api/v1/databases` ran on whichever node received it. On a compactor or
+reader, the database's marker was written to that node's storage, and the
+"already exists" check read that node's storage too. On shared object storage
+that was visible to every node anyway. On a cluster where each node has its
+own storage, the database was created somewhere its writes never land.
+
+A node that does not ingest now forwards the create to the writer, as it does
+every other write: the same writer a write would go to (the primary, when
+there is one), sent once and never retried. The writer validates the request
+and checks the caller's admin permission itself. The response, including
+`409` for a database that already exists, is the writer's.
+
+- With no healthy writer, the answer is `503` ("No writer node available in
+  the cluster"); with a writer that cannot be reached, `503` ("Database not
+  created: the writer could not be reached; retry"). Nothing is created in
+  either case. Before, the database was created locally. A writer that takes
+  the create but whose answer is lost gives `504`; a retry answers `409` if
+  the database was created.
+- **Failover.** While a designated primary writer is unreachable, the create
+  answers `503` instead of going to another writer, which may be a standby.
+  Retry once the primary is back or a new one is promoted.
+- **Rolling upgrades.** A compactor or reader forwards the create only to a
+  writer that advertises it at join (`forward_database_create_v1`). With a
+  writer that has not been upgraded yet, the database is created locally, as
+  before, and the node logs a warning at most once a minute.
+- A compactor or reader with authentication disabled, in front of a writer
+  with it enabled, now gets `401` for a create, as it already did for writes.
+- On a cluster where each node has its own storage, an empty database exists
+  only on the writer until data arrives, as before: database markers are not
+  replicated, so a listing answered by a reader does not show it yet.
+- `DELETE /api/v1/databases/:name` is unchanged.
+- A create sent directly to a standby writer is still made by that writer
+  rather than forwarded to the primary.
 
 ## Fix: Arrow queries sent to a compactor are answered by a reader ([#1567](https://github.com/Basekick-Labs/arc/issues/1567))
 
@@ -271,6 +370,43 @@ see a 403 until every node runs this version.
 The edge-sync hub endpoints moved to RBAC as well; see
 "Fix: edge-sync pushes are decided by RBAC on the spoke's database"
 ([#1561](https://github.com/Basekick-Labs/arc/issues/1561)).
+
+## Fix: recent-data queries keep working on cluster nodes while the cold tier is unreachable ([#1552](https://github.com/Basekick-Labs/arc/issues/1552), part 2 of 2)
+
+The cluster counterpart of #1550. On a cluster node, a read whose cold tier listing fails now answers from hot data when the cluster's cold mark (part 1, below) shows the read cannot need cold data:
+
+- the mark is trusted: enabled, fenced, seeded from this node's own cold store, and every node and Raft server confirmed it within 15 minutes;
+- the read states a start (`time >= ...`), and that start is on a UTC day after the measurement's mark, or the measurement was never marked;
+- this node is caught up with the leader: a Raft read barrier (at most 2 seconds), after which the trust and the mark are read again;
+- every cold partition the read kept is one whose listing failed, as in #1550. Only that site drops cold partitions: a read the pruner could not prune (no time range, only an end, pruning off, or a range over the path cap) keeps them.
+
+Otherwise the read fails as it did; on a cluster node that includes every read with no stated start. Standalone nodes keep #1550's rule.
+
+Also on cluster nodes: a measurement this node holds no cold-tier rows for used to be read from hot only, silently leaving out cold data the cluster had (its rows lag the cold store until its next cold-tier metadata sync). The read now includes the cold tier when the trusted mark says the range may hold cold data and the mark was raised within the last 48 hours: two default migration cycles, the window in which this node's rows may not know of a recent cold write. Outside that window, or with an untrusted mark, reads are as before.
+
+Admins can reset the mark's seed with `POST /api/v1/cluster/cold-mark/reset` (admin token), for example after fixing a node whose cold tier pointed at another store. Fix every node's cold tier config first: the first complete cold-tier metadata sync after the reset, on any node whose tiering is not role-gated, seeds it again from that node's store, and reads do not use the mark until then. A reset on a cluster that never enabled the mark answers 409.
+
+Observability: `arc_query_cold_mark_skipped_total` counts reads answered this way, with a `Warn` at most once a minute per measurement; `GET /api/v1/cluster` shows `cold_mark.trusted` and why not.
+
+Performance, healthy reads (cold listing succeeds): on a cluster node, one cached trust check (refreshed at most every 5 seconds per process, by one caller; it reads the Raft configuration) and one in-memory mark lookup per tiered read. A measurement with no local cold rows reads cold, uncached, only within 48 hours of a raise of its mark that its range reaches. Standalone and non-tiered reads run none of this.
+
+Performance, outage path (a cold listing failed): only a read the mark could drop pays a Raft read barrier, and concurrent reads share one: at most one barrier per node is in flight, the next one starting when it ends (about one per 2-second window under load, not one per read). That rate stays far below the 256 recent barrier tokens Raft keeps, so a node's own barrier token cannot be evicted before it sees it.
+
+## Cluster: a replicated record of which days may be in the cold tier ([#1552](https://github.com/Basekick-Labs/arc/issues/1552), part 1 of 2)
+
+Groundwork for answering recent-data queries on cluster nodes while the cold tier cannot be listed (the standalone case is #1550). This release changes no query behaviour.
+
+The cluster now keeps, through Raft, a **cold mark** per database and measurement: the latest day that may have data in the cold tier.
+
+- The migrator, and a restore that writes to the cold tier, raise it before writing the object: one synchronous Raft round trip before the copy, only the first time a measurement gets a newer day. Once every node runs this release, a cold write whose mark cannot be raised (no Raft quorum) does not start; the file is migrated on a later cycle, and a restore fails. Before that, cold writes run as they do today and propose nothing.
+- It never goes down. Retention, DELETE and policy changes leave it where it is.
+- Existing cold data is folded in from a complete cold listing, taken after every node has confirmed it has no unmarked cold write in flight.
+- It turns on by itself once every node runs this release. From then on a node on an older release cannot join, as with the other cluster capability flags.
+- Every node confirms every 5 minutes that it maintains the mark. The mark counts as trusted only while every node and every Raft server has confirmed within the last 15 minutes, so a member that comes back on an older release, which would write to the cold tier without raising it, makes it untrusted until it is upgraded or removed. That leaves a window of up to 15 minutes in which such a member can write unmarked while the mark is still trusted. A confirmation more than 1 minute in a reader's future counts as missing, so node clocks must agree to within a minute.
+- A node trusts the mark only if its own cold tier (backend, endpoint, region or account, bucket and prefix) is the store the mark was seeded from. If two nodes seed it from different stores, it is never trusted again; this release has no way to reset that (part 2 adds one).
+- `GET /api/v1/cluster` reports it under `cold_mark` (enabled, fenced, seeded, nodes still to confirm, trusted and why not). It does not name the cold store.
+
+Performance: one small Raft entry the first time a migration or restore writes a newer day for a measurement (at most one per measurement per day in steady state); one small Raft entry per node every 5 minutes for the liveness confirmation; one seed per cluster, in entries of up to 1,000 measurements; state of one integer per measurement and one timestamp per node. Queries are unchanged.
 
 ## New: cold tier files deleted outside Arc are reported ([#1551](https://github.com/Basekick-Labs/arc/issues/1551))
 
@@ -1468,9 +1604,13 @@ compress at level 3 or with gzip. Decoders are also pooled per size limit, so
 a msgpack payload is no longer rejected because a decoder last served an
 endpoint with a smaller limit.
 
-Arc is now built with Go 1.26.9 and golang.org/x/net 0.60, which fix eleven
-vulnerabilities in Go's HTTP, TLS and template packages that `govulncheck`
-reports as reachable from Arc.
+Arc is now built with Go 1.26.10 and golang.org/x/net 0.61, which fix
+vulnerabilities in Go's HTTP, TLS, X.509 and template packages that
+`govulncheck` reports as reachable from Arc. klauspost/compress is at 1.20.4,
+which fixes the crafted-frame panic in the library itself, and
+andybalholm/brotli at 1.2.7, which fixes excessive allocation on crafted
+streams (GO-2026-6888). Go 1.26.10, compress 1.20.4 and brotli 1.2.7 also
+ship in 26.09.4.
 
 ## Security: the query API runs read statements only
 
@@ -2485,10 +2625,14 @@ visible to clients:
   truncated, or capped. A client that checked for the trailer's presence
   rather than its value has to check the value.
 
-`klauspost/compress` stays at 1.19.2: 1.20 (which fasthttp 1.76 asks for)
-encodes snappy on arm64 with new assembly that cut line-protocol ingest by
-about 14% and msgpack+gzip ingest by about 11% on Apple silicon, because every
-Parquet file Arc writes is snappy-compressed.
+`klauspost/compress` was held at 1.19.2 here because 1.20 (which fasthttp
+1.76 asks for) encodes snappy on arm64 with new assembly, and every Parquet
+file Arc writes is snappy-compressed. It is now at 1.20.4, since the security
+fix above exists only in 1.20.2 and later. The measured cost at Arc's default
+Parquet page size was small: on an Apple M3 Max with 1.20.3, line-protocol
+ingest was 3.2% slower and MessagePack+gzip unchanged (+0.2%), with files 2-4%
+larger ([klauspost/compress#1271](https://github.com/klauspost/compress/issues/1271)).
+64 KiB data pages recovered both in the same benchmark.
 
 ## Upgrade note: DuckDB 1.5.6 ([#1372](https://github.com/Basekick-Labs/arc/issues/1372))
 

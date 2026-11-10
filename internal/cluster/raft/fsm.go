@@ -236,6 +236,19 @@ const (
 	CommandUpdateCQ
 	CommandDeleteCQ
 	CommandSetCQWatermark
+	// Cold mark (#1552), see cold_mark.go. CommandEnableColdMark turns it
+	// on once every node supports it; CommandColdMarkAdd raises marks before
+	// a cold write; CommandColdMarkAck is a node's fence ack;
+	// CommandColdMarkSeed folds a cold listing in.
+	CommandEnableColdMark
+	CommandColdMarkAdd
+	CommandColdMarkAck
+	CommandColdMarkSeed
+	// CommandColdMarkAlive: a node confirming it maintains the cold mark.
+	CommandColdMarkAlive
+	// CommandColdMarkReset: an admin clearing the seed (and a backend
+	// conflict) so the next cold listing seeds again.
+	CommandColdMarkReset
 )
 
 // Command represents a command to be applied to the FSM.
@@ -625,6 +638,8 @@ type FSMSnapshot struct {
 	// ClusterPolicies: the flag and the policies (#1324). nil in an older
 	// snapshot, or before the flag was applied.
 	ClusterPolicies *clusterPoliciesState `json:"cluster_policies,omitempty"`
+	// ColdMark: the #1552 cold mark. nil in an older snapshot.
+	ColdMark *coldMarkState `json:"cold_mark,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -848,6 +863,9 @@ type ClusterFSM struct {
 	// policies live here; tieringPolicies by database. See
 	// cluster_policies.go.
 	clusterPolicies bool
+	// coldMark is the #1552 cold high-water mark; nil until a command
+	// touches it. See cold_mark.go.
+	coldMark        *coldMarkState
 	policiesSeeded  map[string]bool
 	tieringPolicies map[string]*TieringPolicyEntry
 	// policyCollecting / policyAwaiting: kinds with an open collect, and
@@ -1396,6 +1414,18 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		// No mirror signal: a watermark moves at every run, and the mirrors
 		// pick it up on their periodic pass.
 		return f.applySetCQWatermark(cmd.Payload)
+	case CommandEnableColdMark:
+		return f.applyEnableColdMark(cmd.Payload)
+	case CommandColdMarkAdd:
+		return f.applyColdMarkAdd(cmd.Payload)
+	case CommandColdMarkAck:
+		return f.applyColdMarkAck(cmd.Payload)
+	case CommandColdMarkSeed:
+		return f.applyColdMarkSeed(cmd.Payload)
+	case CommandColdMarkAlive:
+		return f.applyColdMarkAlive(cmd.Payload)
+	case CommandColdMarkReset:
+		return f.applyColdMarkReset(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -1695,6 +1725,9 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	removed := f.nodes[p.NodeID]
 	delete(f.nodes, p.NodeID)
 	f.compactionNodeRemovedLocked(p.NodeID)
+	// A removed node no longer holds the cold mark fence or counts toward
+	// its liveness (#1552).
+	f.coldMarkNodeRemovedLocked(p.NodeID)
 	// Removing the designated primary has to release the designation, or the
 	// record names a node that no longer exists and the election — which only
 	// runs when nothing is designated — never fires again. Removing the dead
@@ -2932,6 +2965,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &fsmSnapshot{
 		compactionCommit: f.snapshotCompactionCommitLocked(),
 		clusterPolicies:  f.snapshotClusterPoliciesLocked(),
+		coldMark:         f.snapshotColdMarkLocked(),
 		streamClaims:     claimsState,
 		// Raft does not call Apply and Snapshot concurrently, so the two
 		// counters agree here.
@@ -3297,6 +3331,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.refreshUnackedDeletesLocked()
 	f.restoreCompactionCommitLocked(snapshot.CompactionCommit)
 	f.restoreClusterPoliciesLocked(snapshot.ClusterPolicies)
+	f.restoreColdMarkLocked(snapshot.ColdMark)
 	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
@@ -3814,6 +3849,7 @@ type fsmSnapshot struct {
 	streamClaims           *streamClaimsState
 	compactionCommit       *compactionCommitState
 	clusterPolicies        *clusterPoliciesState
+	coldMark               *coldMarkState
 }
 
 // Persist writes the snapshot to the given sink.
@@ -3835,6 +3871,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		StreamClaims:           s.streamClaims,
 		CompactionCommit:       s.compactionCommit,
 		ClusterPolicies:        s.clusterPolicies,
+		ColdMark:               s.coldMark,
 	}
 
 	data, err := json.Marshal(snapshot)
