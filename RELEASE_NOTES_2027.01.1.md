@@ -2864,6 +2864,15 @@ gcs_bucket = "my-arc-data"
   fails the backup rather than completing it.
 - An S3-typed target or cold tier pointed at the same bucket through
   `storage.googleapis.com` is the same storage for the overlap checks.
+- **Not in the FIPS build (`arc-fips`)**
+  ([#1587](https://github.com/Basekick-Labs/arc/issues/1587)). The Google API
+  client links `golang.org/x/crypto/hkdf`, outside the Go Cryptographic
+  Module the FIPS build is limited to. `arc-fips` refuses
+  `storage.backend`, `tiered_storage.cold.backend` and a backup target's
+  `type` set to `"gcs"` when it loads its config, naming the key. A FIPS
+  deployment on Google Cloud uses GCS through its S3-compatible endpoint
+  instead: type `"s3"` with the corresponding `s3_endpoint` set to
+  `storage.googleapis.com` and HMAC keys.
 
 ### MessagePack binary values are stored as binary columns ([#440](https://github.com/Basekick-Labs/arc/issues/440))
 

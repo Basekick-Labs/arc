@@ -477,6 +477,9 @@ func (c *Config) validateBackupTargets() error {
 				return err
 			}
 		case "gcs":
+			if err := refuseGCSInFIPSBuild(key + "type"); err != nil {
+				return err
+			}
 			if t.GCSBucket == "" {
 				return fmt.Errorf("%stype is \"gcs\" but %sgcs_bucket is empty; set %sgcs_bucket", key, key, key)
 			}
