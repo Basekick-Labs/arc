@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -325,5 +326,57 @@ func TestRestoreBehind_NoFallbackWhileTheTableIsBeingDropped(t *testing.T) {
 	}
 	if got := rowLocation(t, db); got != rows[head-3] {
 		t.Fatalf("catalog row moved to %s during a drop", got)
+	}
+}
+
+// A DROP that failed part way can leave an older incarnation's v<N> above a
+// recreated table's hint. The first check's listing must not adopt it: its
+// table-uuid is not the row's.
+func TestRestoreBehind_LeftoverVersionOfAnotherIncarnationIsNotAdopted(t *testing.T) {
+	r, db, _ := exportedRestoreRig(t, 3)
+	head := r.hint()
+	body, err := os.ReadFile(filepath.Join(r.metaDir(), "v"+strconv.Itoa(head)+".metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(body, &meta); err != nil {
+		t.Fatal(err)
+	}
+	meta["table-uuid"] = "00000000-0000-0000-0000-000000000099"
+	leftover, _ := json.Marshal(meta)
+	if err := os.WriteFile(filepath.Join(r.metaDir(), "v99.metadata.json"), leftover, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := rowLocation(t, db)
+	exp := restoredNode(t, r, db)
+	if _, err := exp.adoptPublished(context.Background(), exp.tableIdent("mydb", "cpu"), "arc_mydb", "cpu"); err != nil {
+		t.Fatalf("adoptPublished: %v", err)
+	}
+	if got := rowLocation(t, db); got != before {
+		t.Fatalf("catalog row moved to %s: adopted another incarnation's v99", got)
+	}
+}
+
+// recoverDeadRow's guard: the row's own file and v<hint> are gone and an
+// older v<N> is left, mid-DROP (the marker is set). Adoption finds nothing
+// (the row's version is not published), the load fails, and recovery must
+// not follow the leftover: the pass fails and the row stays.
+func TestRestoreBehind_DeadRowNotRecoveredWhileTheTableIsBeingDropped(t *testing.T) {
+	r, db, rows := exportedRestoreRig(t, 5)
+	head := r.hint()
+	restoreRow(t, db, rows[head])
+	removeVersion(t, r, head, rows[head])
+	exp := restoredNode(t, r, db)
+	exp.SetForgetDroppedRows(true)
+	if err := r.backend.Write(context.Background(), droppedMarkerKey("arc_mydb", "cpu"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	r.addFile()
+	if err := r.reconcile(exp); err == nil {
+		t.Fatal("reconcile: nil error; want the pass to fail while the drop marker is set")
+	}
+	if got := rowLocation(t, db); got != rows[head] {
+		t.Fatalf("dead row moved to %s during a drop", got)
 	}
 }

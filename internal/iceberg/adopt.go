@@ -117,14 +117,24 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 		// move, a restored catalog): the hint alone can be behind. A restore
 		// writes the backup's hint over a newer live one while the newer
 		// v<N> stay (#1613), and a writer can stop between v<N> and the
-		// hint. Every v<N> is fenced, so the newest is the published
-		// lineage. One listing per table per process; once this node
-		// publishes or confirms the row, the hint is enough.
+		// hint. A v<N> above the hint is taken only when it is this table's
+		// lineage (the same table-uuid as the row's metadata): a database
+		// DROP that failed part way can leave an older incarnation's v<N>
+		// behind a recreated table. One listing per table per process, until
+		// this node publishes or confirms the row; then the hint is enough.
 		newest, err := e.newestPublished(ctx, dirKey)
 		if err != nil {
 			return false, err
 		}
-		hintN = max(hintN, newest)
+		if newest > hintN {
+			same, err := e.sameTableLineage(ctx, dirKey, rowLoc, hintN, newest)
+			if err != nil {
+				return false, err
+			}
+			if same {
+				hintN = newest
+			}
+		}
 	}
 
 	// decide picks the version to adopt for a published hint, or -1.
@@ -202,6 +212,54 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 		Bool("had_row", rowExists).
 		Msg("Iceberg: adopted the table version published in the warehouse (another node advanced the table, or this node's catalog row was missing)")
 	return true, nil
+}
+
+// sameTableLineage reports whether v<newest> carries the table-uuid of the
+// row's own metadata, or of v<hintN> when the row's file is gone. With
+// neither readable it answers false: nothing to compare against.
+func (e *Exporter) sameTableLineage(ctx context.Context, dirKey, rowLoc string, hintN, newest int) (bool, error) {
+	want := ""
+	if key, ok := e.warehouseRelKey(rowLoc); ok {
+		u, err := e.tableUUIDAt(ctx, key)
+		if err != nil {
+			return false, err
+		}
+		want = u
+	}
+	if want == "" && hintN >= 0 {
+		u, err := e.tableUUIDAt(ctx, path.Join(dirKey, "v"+strconv.Itoa(hintN)+".metadata.json"))
+		if err != nil {
+			return false, err
+		}
+		want = u
+	}
+	if want == "" {
+		return false, nil
+	}
+	got, err := e.tableUUIDAt(ctx, path.Join(dirKey, "v"+strconv.Itoa(newest)+".metadata.json"))
+	if err != nil {
+		return false, err
+	}
+	return got == want, nil
+}
+
+// tableUUIDAt returns the table-uuid of the metadata at key, or "" when the
+// file is gone or carries none.
+func (e *Exporter) tableUUIDAt(ctx context.Context, key string) (string, error) {
+	body, err := e.backend.Read(ctx, key)
+	if err != nil {
+		if storage.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read Iceberg metadata %s: %w", key, err)
+	}
+	var meta struct {
+		TableUUID string `json:"table-uuid"`
+	}
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return "", fmt.Errorf("Iceberg metadata %s is not valid JSON: %w", key, err)
+	}
+	return meta.TableUUID, nil
 }
 
 // readHint returns the version version-hint.text names, or -1 when there is none.
