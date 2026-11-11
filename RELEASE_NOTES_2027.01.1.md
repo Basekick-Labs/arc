@@ -3843,6 +3843,34 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: Iceberg export on a shared bucket without `shared_storage_mode` ([#1609](https://github.com/Basekick-Labs/arc/issues/1609))
+
+On a cluster whose nodes share an S3 bucket without
+`cluster.shared_storage_mode` (single-writer shared storage, #1603/#1606),
+Iceberg export treated the warehouse as one node's. Three decisions keyed on
+the flag rather than on the bucket.
+- **Adoption.** The version published in the warehouse was not adopted before
+  a node loaded its own catalog row. After the export moved between nodes
+  with the compactor lease, a node with a stale row committed from it, lost
+  the create-only fence on each pass, and then published its own lineage once
+  it caught up. The data stayed current, but the snapshot history skipped the
+  other node's versions, which breaks incremental readers.
+- **Manifest barrier.** Files this node's manifest did not know yet were
+  exported without the barrier.
+- **Gate.** The export gate fell back to the static compactor role.
+
+Iceberg now decides "shared" from the bucket.
+- **Adoption** runs on every S3 warehouse. That includes a standalone S3 node,
+  whose catalog a backup restore can leave behind its warehouse.
+- **Adoption before the first load.** The scheduler's first loads after a
+  restart now adopt too. A catalog row whose metadata file another node had
+  pruned used to fail that measurement on every pass, even in
+  `shared_storage_mode`.
+- **The manifest barrier** applies on any shared bucket.
+- **The compactor lease** gates the export where compactor failover runs.
+  Without it, every compactor-role node exports, and a startup Warn says to
+  run exactly one or to enable `cluster.failover_enabled`.
+
 ### Fix: `cluster.replication_enabled` is ignored on an object-store backend ([#1605](https://github.com/Basekick-Labs/arc/issues/1605))
 
 Peer file replication copies Parquet files between nodes' own disks. On a

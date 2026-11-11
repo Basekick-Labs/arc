@@ -4329,10 +4329,14 @@ func main() {
 		if !cfg.Iceberg.OrphanSweepEnabled {
 			log.Warn().Msg("Iceberg orphan metadata sweep is disabled (iceberg.orphan_sweep_enabled=false): the manifest files of expired snapshots are retained indefinitely and are copied into every backup")
 		}
-		// Shared storage: every node sees the same tables and the export moves with the
-		// compactor lease, so the published version, not this node's catalog row, is current
-		// (#939). Elsewhere it is consulted only for a table with no catalog row.
-		exporter.SetWarehouseAuthoritative(cfg.Cluster.SharedStorageMode)
+		// A shared bucket, with or without shared_storage_mode (#1609): every node sees the
+		// same tables and the export moves with the compactor lease, so the published
+		// version, not this node's catalog row, is current (#939). A standalone S3 node too:
+		// its catalog can be restored behind its warehouse. Elsewhere the published version
+		// is consulted only for a table with no catalog row.
+		icebergTopo := icebergTopologyFor(cfg.Cluster.SharedStorageMode, cluster.IsSharedObjectStore(storageBackend),
+			clusterCoordinator != nil, clusterCoordinator != nil && clusterCoordinator.HasCompactorFailover(), compactionGate != nil)
+		exporter.SetWarehouseAuthoritative(icebergTopo.authoritative)
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
@@ -4354,9 +4358,9 @@ func main() {
 			}
 			icebergSource.SetExclusions(strict)
 		}
-		// Shared storage: the exclusions above come from this node's manifest, so a listed file
-		// it does not know yet waits for it to catch up before export (#939).
-		if cfg.Cluster.SharedStorageMode && clusterCoordinator != nil {
+		// Shared bucket: the exclusions above come from this node's manifest, so a listed file
+		// it does not know yet waits for it to catch up before export (#939, #1609).
+		if icebergTopo.barrier {
 			icebergSource.SetManifestBarrier(func(p string) bool {
 				node := clusterCoordinator.GetRaftNode()
 				if node == nil || node.FSM() == nil {
@@ -4394,12 +4398,18 @@ func main() {
 		// sees, so the gate is the compactor lease itself, with no static-role fallback: before
 		// the first lease is assigned no node exports. Config refuses shared-storage Iceberg
 		// without cluster.failover_enabled, which is what assigns the lease.
+		//
+		// A shared bucket without shared_storage_mode (#1609) takes the lease gate too when
+		// compactor failover exists; without it, the compaction gate and a warning.
 		var icebergGate iceberg.WriterGate
-		switch {
-		case cfg.Cluster.SharedStorageMode && clusterCoordinator != nil:
+		switch icebergTopo.gate {
+		case "lease":
 			icebergGate = icebergLeaseGate{clusterCoordinator}
-		case compactionGate != nil:
+		case "compaction":
 			icebergGate = icebergWriterGate{compactionGate}
+		}
+		if icebergTopo.warnNoElection && compactionGate.CanCompact() {
+			log.Warn().Msg(icebergNoElectionWarning)
 		}
 		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
 			Exporter: exporter,

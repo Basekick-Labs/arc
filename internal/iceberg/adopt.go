@@ -19,8 +19,9 @@ import (
 // The warehouse, not this node's catalog row, is the authority on a table's current version
 // (#939 A2).
 //
-// The SQLite catalog is node-local. In shared-storage mode the tables live in the one bucket
-// every node sees, and the export moves with the compactor lease, so a node can come back to a
+// The SQLite catalog is node-local. On a shared bucket (with or without shared_storage_mode,
+// #1609) the tables live in the one bucket every node sees, and the export moves with the
+// compactor lease, so a node can come back to a
 // table with a catalog row that is versions behind what another node published since — or with
 // no row at all. Committing from that row forks the table's history: iceberg-go writes the next
 // version from the stale metadata, Arc's version-hint goes backwards, and the orphan sweep then
@@ -34,10 +35,13 @@ import (
 //   - Adoption: before loading a table, the exporter reads the published version-hint and moves
 //     its catalog row onto the newest published version when the row is behind it, or is the
 //     same version number with different content (the losing side of a fence). Done every pass
-//     in shared-storage mode, and on any backend when the row is missing.
+//     on an object-store warehouse (SetWarehouseAuthoritative), including the scheduler's first
+//     loads after a restart, and on any backend when the row is missing.
 
 // SetWarehouseAuthoritative makes every pass check the published version before loading a
-// table (shared-storage mode). Without it the check runs only for a table with no catalog row.
+// table: on any shared object-store warehouse, with or without shared_storage_mode, and on a
+// standalone S3 node, whose catalog can be restored behind its warehouse (#1609). Without it the
+// check runs only for a table with no catalog row.
 func (e *Exporter) SetWarehouseAuthoritative(on bool) {
 	e.warehouseAuthoritative = on
 }

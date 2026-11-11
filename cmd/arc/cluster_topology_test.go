@@ -106,3 +106,27 @@ func TestIgnoreReplicationOnObjectStore(t *testing.T) {
 		}
 	}
 }
+
+func TestIcebergTopologyFor(t *testing.T) {
+	type in struct{ sharedMode, sharedBucket, coord, failover, compactionGate bool }
+	for _, tc := range []struct {
+		name string
+		in   in
+		want icebergTopology
+	}{
+		{"OSS local", in{false, false, false, false, false}, icebergTopology{gate: "none"}},
+		{"standalone S3 (restore can leave the catalog behind)", in{false, true, false, false, false}, icebergTopology{authoritative: true, gate: "none"}},
+		{"local cluster", in{false, false, true, true, true}, icebergTopology{gate: "compaction"}},
+		{"multi-writer with failover", in{true, true, true, true, true}, icebergTopology{authoritative: true, barrier: true, gate: "lease"}},
+		// Blocker row: no failover manager (licence or Raft) must not drop a
+		// multi-writer bucket to the static gate.
+		{"multi-writer without a failover manager", in{true, true, true, false, true}, icebergTopology{authoritative: true, barrier: true, gate: "lease"}},
+		{"single-writer bucket with failover (#1609)", in{false, true, true, true, true}, icebergTopology{authoritative: true, barrier: true, gate: "lease"}},
+		{"single-writer bucket without failover", in{false, true, true, false, true}, icebergTopology{authoritative: true, barrier: true, gate: "compaction", warnNoElection: true}},
+	} {
+		got := icebergTopologyFor(tc.in.sharedMode, tc.in.sharedBucket, tc.in.coord, tc.in.failover, tc.in.compactionGate)
+		if got != tc.want {
+			t.Errorf("%s: %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}

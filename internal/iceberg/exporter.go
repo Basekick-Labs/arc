@@ -302,6 +302,9 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
 		return false, err
 	}
+	if err := e.adoptBeforeLoad(ctx, database, measurement); err != nil {
+		return false, err
+	}
 	_, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
 	if err == nil {
 		return true, nil
@@ -310,6 +313,21 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 		return false, nil
 	}
 	return false, err
+}
+
+// adoptBeforeLoad adopts the version published in the warehouse before a
+// catalog load, where the warehouse is authoritative (a shared bucket). The
+// scheduler's first loads after a restart (tableSeed, tableExists) ran before
+// EnsureTable's adoption, so a stale row whose metadata another node had since
+// pruned failed every pass, and a node with no row never saw a table another
+// node published (#1609).
+func (e *Exporter) adoptBeforeLoad(ctx context.Context, database, measurement string) error {
+	if !e.warehouseAuthoritative {
+		return nil
+	}
+	ident := e.tableIdent(database, measurement)
+	_, err := e.adoptPublished(ctx, ident, catalogNamespaceKey(ident[:len(ident)-1]), ident[len(ident)-1])
+	return err
 }
 
 // EnsureTable creates the Iceberg table for (database, measurement) if absent, using the
@@ -1634,9 +1652,10 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 			if err := e.publishMetadataCopy(ctx, vKey, body); err != nil {
 				if errors.Is(err, errFenced) {
 					// Another node published this version first: this commit forked the table.
-					// No hint, no prune, no sweep; the next pass adopts the published lineage.
-					e.logger.Error().Err(err).Str("key", vKey).
-						Msg("Iceberg: another writer published this table version first; this pass stops and the next one adopts the published version")
+					// No hint, no prune, no sweep. Where the warehouse is authoritative (a
+					// shared bucket) the next pass adopts the published lineage.
+					e.logger.Error().Err(err).Str("key", vKey).Bool("adopts_next_pass", e.warehouseAuthoritative).
+						Msg("Iceberg: another writer published this table version first; this pass stops (the next one adopts the published version when the warehouse is shared)")
 					e.hintFailMu.Lock()
 					e.fenced = err
 					e.hintFailMu.Unlock()
@@ -1858,6 +1877,9 @@ func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey strin
 func (e *Exporter) tableSeed(ctx context.Context, database, measurement string) (sc ArcSchema, files map[string]int64, ok bool, err error) {
 	ctx = e.withAWS(ctx)
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
+		return ArcSchema{}, nil, false, err
+	}
+	if err := e.adoptBeforeLoad(ctx, database, measurement); err != nil {
 		return ArcSchema{}, nil, false, err
 	}
 	tbl, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
