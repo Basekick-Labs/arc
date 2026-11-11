@@ -3863,6 +3863,24 @@ deleted subscription.
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1596](https://github.com/Basekick-Labs/arc/pull/1596).
 
+### Fix: an MQTT subscription request racing its `DELETE` answers `404` ([#1597](https://github.com/Basekick-Labs/arc/issues/1597))
+
+A stop, pause, start or restart of a subscription that a concurrent `DELETE`
+removed mid-request answered `500` and logged an error, instead of the `404`
+every route gives an unknown ID. A start could also go the other way: if the
+`DELETE` completed between the start reading the subscription and reserving
+it, the start answered `200` and ran a subscriber for a subscription that no
+longer existed.
+
+`DELETE` now removes the stored subscription first and then stops whatever
+runs under it. A start reserves the subscription before reading it, and once
+its subscriber is running it reads the subscription again, stopping the
+subscriber if it is gone. A request that loses this race answers `404`, and
+no subscriber outlives its subscription unless that last read fails (logged
+at Warn). A `DELETE` that fails to remove the subscription no longer stops
+it first, so it stays stored and running. The status write of a subscriber
+stopped after its subscription was deleted is logged at Debug, not Error.
+
 ### Fix: a governance 429 says when a retry can succeed ([#1519](https://github.com/Basekick-Labs/arc/issues/1519))
 
 With query governance on, a refused query's `Retry-After` was wrong or missing:
