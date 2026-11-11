@@ -3843,6 +3843,29 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: `cluster.replication_enabled` is ignored on an object-store backend ([#1605](https://github.com/Basekick-Labs/arc/issues/1605))
+
+Peer file replication copies Parquet files between nodes' own disks. On a
+shared object-store bucket, every node already reads every file, yet the
+puller still started when `cluster.replication_enabled` was set.
+- **Load:** every catch-up pass (at startup and every 5 minutes by default)
+  stat'ed the manifest's files, one S3 `HEAD` per file, per node, per pass.
+- **Blocked reads:** a file no peer could serve kept catch-up unfinished, so
+  with `cluster.query_gate_on_catchup` set that node answered queries `503`.
+  A `DELETE` with `allow_unreachable` could also wait on such a file.
+
+Arc now ignores the setting on an object-store backend, with a startup Warn,
+as the Helm chart's shared mode already does. Such nodes now behave as
+shared-storage nodes with replication off already did:
+- `/api/v1/cluster/status` reports no catch-up status;
+- the catch-up query gate never closes;
+- a stream takeover no longer probes peers for a registered file missing from
+  the bucket;
+- staged compaction adopts outputs without the puller;
+- the "no compactor" startup Warn for replicating clusters does not apply. The example
+`deploy/docker-compose/enterprise-shared` stack no longer sets it on its
+reader.
+
 ### Fix: a single-writer cluster on an object store runs tiering on the primary only ([#1603](https://github.com/Basekick-Labs/arc/issues/1603))
 
 A cluster on an object-store backend without `cluster.shared_storage_mode` is
