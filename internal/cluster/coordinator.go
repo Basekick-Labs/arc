@@ -1321,7 +1321,12 @@ const tierReasonAbandonedPull = "replication:abandoned"
 // delete-only callbacks every such node needs. Split out of Start so a test
 // drives the same decision Start makes.
 func (c *Coordinator) startManifestCallbacksLocked() {
-	if c.cfg.ReplicationEnabled && c.raftNode != nil {
+	// cmd/arc turns replication off on a shared object store (#1605); a
+	// coordinator that still sees it on was configured some other way.
+	if c.cfg.ReplicationEnabled && c.raftNode != nil && IsSharedObjectStore(c.storage) {
+		c.logger.Error().Str("backend", c.storage.Type()).
+			Msg("Peer file replication is configured on a shared object store; not starting the puller (every node already reads the bucket)")
+	} else if c.cfg.ReplicationEnabled && c.raftNode != nil {
 		if err := c.startFilePullerLocked(); err != nil {
 			// Do not fail cluster startup if the puller can't start —
 			// replication is best-effort and the rest of the cluster can

@@ -232,7 +232,6 @@ arc-reader2:
     ARC_CLUSTER_NODE_ID: "arc-reader2"
     ARC_CLUSTER_ROLE: "reader"
     ARC_CLUSTER_ADVERTISE_ADDR: "arc-reader2:9100"
-    ARC_CLUSTER_REPLICATION_ENABLED: "true"
   labels:
     <<: *traefik-reader-labels
   depends_on:
