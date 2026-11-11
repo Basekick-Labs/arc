@@ -2,6 +2,8 @@ package backup
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -67,9 +69,28 @@ func (c *commitDuringBackup) ListObjects(ctx context.Context, prefix string) ([]
 
 // #1613: step 3b lists the in-root metadata after the SQLite snapshot, not
 // from the step-1 listing, so a commit made during the data copy is in the
-// backup; and the hint stored names a v<N> the backup holds.
+// backup; and the hint stored names a v<N> the backup holds. Without a
+// snapshot (include_metadata off) there are no rows to match, and the
+// step-1 listing serves.
 func TestBackup_InRootIcebergMetadataListedAfterTheSnapshot(t *testing.T) {
+	for _, withMeta := range []bool{true, false} {
+		t.Run(map[bool]string{true: "with the SQLite snapshot", false: "without metadata"}[withMeta], func(t *testing.T) {
+			testInRootRelist(t, withMeta)
+		})
+	}
+}
+
+func testInRootRelist(t *testing.T, withMeta bool) {
 	ctx := context.Background()
+	sqlitePath := filepath.Join(t.TempDir(), "arc.db")
+	db, err := sql.Open("sqlite3", sqlitePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
 	dataDir, backupDir := t.TempDir(), t.TempDir()
 	local, err := storage.NewLocalBackend(dataDir, zerolog.Nop())
 	if err != nil {
@@ -86,14 +107,15 @@ func TestBackup_InRootIcebergMetadataListedAfterTheSnapshot(t *testing.T) {
 		}
 	}
 	mgr, err := NewManager(&ManagerConfig{
-		DataStorage: &commitDuringBackup{LocalBackend: local, t: t},
-		BackupPath:  backupDir,
-		Logger:      zerolog.Nop(),
+		DataStorage:  &commitDuringBackup{LocalBackend: local, t: t},
+		BackupPath:   backupDir,
+		SQLiteDBPath: sqlitePath,
+		Logger:       zerolog.Nop(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := mgr.CreateBackup(ctx, BackupOptions{})
+	res, err := mgr.CreateBackup(ctx, BackupOptions{IncludeMetadata: withMeta})
 	if err != nil {
 		t.Fatalf("CreateBackup: %v", err)
 	}
@@ -105,6 +127,15 @@ func TestBackup_InRootIcebergMetadataListedAfterTheSnapshot(t *testing.T) {
 			t.Fatalf("%s not in the backup: %v", k, err)
 		}
 		return string(b)
+	}
+	if !withMeta {
+		if _, err := backup.Read(ctx, res.Manifest.BackupID+"/data/arc_prod.db/sensors/metadata/00002-uuid.metadata.json"); err == nil {
+			t.Fatal("00002 is in a backup without metadata: the relist ran with no snapshot to match")
+		}
+		if got := read("arc_prod.db/sensors/metadata/version-hint.text"); got != "1" {
+			t.Fatalf("stored version hint %q, want 1: the newest version the step-1 listing holds", got)
+		}
+		return
 	}
 	read("arc_prod.db/sensors/metadata/00002-uuid.metadata.json")
 	read("arc_prod.db/sensors/metadata/v2.metadata.json")

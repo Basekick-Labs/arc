@@ -114,29 +114,62 @@ func removeVersion(t *testing.T, r *warehouseRig, n int, rowLoc string) {
 	}
 }
 
-// Restore in place on a quiet table: the restored row and the published
-// v<row> are the same bytes, so nothing fences, and committing from the row
-// rolled the hint back silently; the orphan sweep then treated the newer
-// manifests as unreachable. Adoption moves the row forward first.
-func TestRestoreBehind_QuietTableAdoptsForward(t *testing.T) {
-	r, db, rows := exportedRestoreRig(t, 5)
-	head := r.hint()
-	restoreRow(t, db, rows[head-3])
-	exp := restoredNode(t, r, db)
-	if err := r.reconcile(exp); err != nil { // no new files: a quiet pass
-		t.Fatalf("reconcile after the restore: %v", err)
-	}
-	if got := r.hint(); got < head {
-		t.Fatalf("version hint rolled back from %d to %d", head, got)
-	}
-	if got := versionOf(t, rowLocation(t, db)); got < head {
-		t.Fatalf("catalog row at version %d, want at least the published %d", got, head)
-	}
-	if f := r.forkedVersions(); len(f) != 0 {
-		t.Fatalf("forked versions %v", f)
-	}
-	if n := r.live(exp); n != len(r.files()) {
-		t.Fatalf("table holds %d files, want %d", n, len(r.files()))
+// Restore in place: the catalog row goes back to an older version while the
+// live warehouse keeps the newer v<N>. A merge restore also writes the
+// backup's hint over the live one (seen in a binary run), so the hint can
+// agree with the stale row. Committing from it forked the table: on a quiet
+// table the hint rolled back and the orphan sweep took the newer manifests;
+// with new files the stale lineage published its own versions until it ran
+// into the newer v<N>. Adoption moves the row forward first, from the newest
+// v<N> present, not only the hint. These set the exporter authoritative
+// directly; that every node is wired so is pinned by TestIcebergTopologyFor.
+func TestRestoreBehind_AdoptsForward(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		hintRestored bool // the backup's hint written over the live one
+		newFiles     bool
+	}{
+		{"quiet table, live hint kept", false, false},
+		{"quiet table, hint restored with the catalog", true, false},
+		{"new files, hint restored with the catalog", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, db, rows := exportedRestoreRig(t, 5)
+			head := r.hint()
+			restoreRow(t, db, rows[head-3])
+			if tc.hintRestored {
+				if err := os.WriteFile(filepath.Join(r.metaDir(), "version-hint.text"), []byte(strconv.Itoa(head-3)), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				// The backup held v<head-3>: a v<N> copy is published for it.
+				body, err := os.ReadFile(filepath.Join(r.metaDir(), rows[head-3][strings.LastIndex(rows[head-3], "/")+1:]))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(r.metaDir(), "v"+strconv.Itoa(head-3)+".metadata.json"), body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exp := restoredNode(t, r, db)
+			if tc.newFiles {
+				r.addFile()
+			}
+			if err := r.reconcile(exp); err != nil {
+				t.Fatalf("reconcile after the restore: %v", err)
+			}
+			if got := r.hint(); got < head {
+				t.Fatalf("version hint at %d, below the published %d: the table continued from the restored row", got, head)
+			}
+			if got := versionOf(t, rowLocation(t, db)); got < head {
+				t.Fatalf("catalog row at version %d, want at least the published %d", got, head)
+			}
+			if f := r.forkedVersions(); len(f) != 0 {
+				t.Fatalf("forked versions %v", f)
+			}
+			if n := r.live(exp); n != len(r.files()) {
+				t.Fatalf("table holds %d files, want %d", n, len(r.files()))
+			}
+		})
 	}
 }
 
@@ -182,9 +215,11 @@ func TestRestoreBehind_HintNamesAMissingVersion(t *testing.T) {
 }
 
 // The restored row's own metadata is gone too (pruned before the backup
-// copied it), and the hint names a version the backup lacks: the dead row
-// is recovered onto the newest version present.
-func TestRestoreBehind_DeadRowWithAHintAheadOfTheBackup(t *testing.T) {
+// copied it), and the hint names a version the backup lacks. The row's v<N>
+// is present, so adoption's missing-hint fallback recovers it before the
+// load (publishedMatchesRow: published, own file gone); recoverDeadRow's
+// fallback is pinned by DeadRowAboveEveryVersionTheBackupHolds.
+func TestRestoreBehind_DeadRowWithAHintAheadOfTheBackupIsAdopted(t *testing.T) {
 	r, db, rows := exportedRestoreRig(t, 5)
 	head := r.hint()
 	removeVersion(t, r, head, rows[head])
@@ -268,5 +303,27 @@ func TestRestoreBehind_NoRowNeverFallsBackBelowTheHint(t *testing.T) {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM iceberg_tables WHERE table_name = 'cpu'`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("catalog rows for the table: %d (%v), want none", n, err)
+	}
+}
+
+// A database DROP in progress on a shared bucket deletes v<N> files before
+// the hint, and the table carries a drop marker: the missing-hint fallbacks
+// do not follow an arbitrary leftover v<N>. The pass fails and retries.
+func TestRestoreBehind_NoFallbackWhileTheTableIsBeingDropped(t *testing.T) {
+	r, db, rows := exportedRestoreRig(t, 5)
+	head := r.hint()
+	removeVersion(t, r, head, rows[head])
+	restoreRow(t, db, rows[head-3])
+	exp := restoredNode(t, r, db)
+	exp.SetForgetDroppedRows(true)
+	if err := r.backend.Write(context.Background(), droppedMarkerKey("arc_mydb", "cpu"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	r.addFile()
+	if err := r.reconcile(exp); err == nil {
+		t.Fatal("reconcile: nil error; want the pass to fail while the drop marker is set")
+	}
+	if got := rowLocation(t, db); got != rows[head-3] {
+		t.Fatalf("catalog row moved to %s during a drop", got)
 	}
 }

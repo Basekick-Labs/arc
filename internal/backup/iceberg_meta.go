@@ -97,37 +97,51 @@ func backupHintBody(live []byte, listed map[int]bool) (body []byte, rewritten, o
 }
 
 // copyIcebergHints copies each table's version hint after its v<N> files, so
-// the hint stored names a v<N> the backup holds (backupHintBody). It returns
-// the number of hints skipped.
+// the hint stored names a v<N> the backup holds (backupHintBody). versions is
+// what was LISTED, not what was copied: a v<N> pruned between the listing and
+// its copy still validates its hint, and a restore then falls back to the
+// newest v<N> it does hold (iceberg adoptPublished). A hint that cannot be
+// read is skipped as copyDataFiles skips a data file: the restored table's
+// next export pass publishes a hint again. It returns the number skipped.
 func (m *Manager) copyIcebergHints(ctx context.Context, leg *backupLeg, hints []storage.ObjectInfo, versions map[string]map[int]bool) (int64, error) {
 	run := leg.run
 	progress := run.progress
 	var skipped int64
+	skip := func(p string, overlong bool, msg string, err error) {
+		skipped++
+		atomic.AddInt64(&leg.skipped, 1)
+		leg.tally.record(p, overlong, false)
+		m.logger.Warn().Err(err).Str("path", p).Msg(msg)
+	}
 	for _, h := range hints {
 		if err := ctx.Err(); err != nil {
 			return skipped, err
 		}
 		destPath := run.id + "/data/" + h.Path
+		if leg.target.keyTooLong(destPath) {
+			skip(h.Path, true, "Backup destination key too long; skipping the Iceberg version hint", nil)
+			continue
+		}
 		live, err := m.dataStorage.Read(ctx, h.Path)
 		if err != nil {
-			if storage.IsNotFound(err) {
-				// Dropped since the listing: a restore finds no table there,
-				// as the live warehouse does.
-				skipped++
-				continue
-			}
-			return skipped, fmt.Errorf("failed to read Iceberg version hint %s: %w", h.Path, err)
+			// Gone: the table was dropped since the listing. Otherwise a
+			// failed read, skipped as copyDataFiles skips a data file.
+			skip(h.Path, false, "Failed to read Iceberg version hint, skipping", err)
+			continue
 		}
 		body, rewritten, ok := backupHintBody(live, versions[path.Dir(h.Path)])
-		if !ok || leg.target.keyTooLong(destPath) {
-			skipped++
+		if !ok {
+			skip(h.Path, false, "Iceberg version hint names no version this backup holds, skipping it", nil)
 			continue
 		}
 		if rewritten {
 			m.logger.Info().Str("path", h.Path).Str("live", strings.TrimSpace(string(live))).Str("stored", string(body)).
 				Msg("Iceberg version hint is ahead of the metadata this backup listed (the export committed during the backup); storing the newest version the backup holds")
 		}
-		if err := leg.target.backend.Write(ctx, destPath, body); err != nil {
+		writeCtx, cancel := withDestinationTimeout(ctx)
+		err = leg.target.backend.Write(writeCtx, destPath, body)
+		cancel()
+		if err != nil {
 			m.cleanupPartialBackupWrite(ctx, leg.target, destPath)
 			return skipped, fmt.Errorf("failed to write Iceberg version hint to %s: %w", leg.target.describe(), err)
 		}
@@ -136,10 +150,7 @@ func (m *Manager) copyIcebergHints(ctx context.Context, leg *backupLeg, hints []
 		atomic.AddInt64(&leg.files, 1)
 		atomic.AddInt64(&leg.bytes, int64(len(body)))
 	}
-	if skipped > 0 {
-		atomic.AddInt64(&progress.SkippedFiles, skipped)
-		atomic.AddInt64(&leg.skipped, skipped)
-	}
+	atomic.AddInt64(&progress.SkippedFiles, skipped)
 	run.publishTargets()
 	return skipped, nil
 }

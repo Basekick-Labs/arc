@@ -151,7 +151,7 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 	if target >= 0 {
 		vKey = path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
 		body, err = e.backend.Read(ctx, vKey)
-		if err != nil && storage.IsNotFound(err) && target > newest {
+		if err != nil && storage.IsNotFound(err) && target > newest && !e.dropInProgress(ctx, nsKey, measurement) {
 			// The hint names a version that is not there: a backup copies
 			// the hint as it is at copy time, which can be newer than the
 			// v<N> files it listed (#1613). The newest present one, even
@@ -202,6 +202,20 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 		return true, err
 	}
 	return true, nil
+}
+
+// dropInProgress reports whether ident carries a drop marker, where markers
+// are written (forgetDroppedRows). A database DROP deletes the v<N> files in
+// lexical order and the hint last, so while it runs a hint can name a missing
+// version and the newest v<N> left is arbitrary: the missing-hint fallbacks
+// must not follow it. A marker that cannot be read counts as set: the pass
+// fails as it did before the fallback existed and retries.
+func (e *Exporter) dropInProgress(ctx context.Context, nsKey, measurement string) bool {
+	if !e.forgetDroppedRows || e.backend == nil {
+		return false
+	}
+	set, err := e.backend.Exists(ctx, droppedMarkerKey(nsKey, measurement))
+	return err != nil || set
 }
 
 // forgetCatalogRow deletes the row only while it still points at loc.

@@ -986,15 +986,19 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// the listing could reference a file the backup never held (#637). Both
 	// 3b and 3c list after this snapshot (3b re-lists: the step-1 listing
 	// predates it, and the export keeps committing through the data copy,
-	// #1613), so every file a snapshotted row references already existed when
-	// the listing ran. Not a consistent cut: the export is not paused, so the
-	// warehouse copied can be AHEAD of the rows (newer metadata, a newer
-	// version hint). A restore adopts forward to the newest published version
-	// (iceberg adoptPublished, every warehouse is authoritative since #1613).
-	// The one exception is a retain_snapshots=1 table that commits twice
-	// between the snapshot and the copy: its row's metadata file is pruned
-	// before it is copied, and the restore recovers the row onto the newest
-	// version the backup holds (recoverDeadRow).
+	// #1613), so every METADATA file a snapshotted row references already
+	// existed when the listing ran. Not a consistent cut: the export is not
+	// paused, so the warehouse copied can be AHEAD of the rows (newer
+	// metadata, a newer version hint). A restore adopts forward to the newest
+	// published version (iceberg adoptPublished, every warehouse is
+	// authoritative since #1613). Two gaps remain, both healed after a
+	// restore: a table that commits more than retain_snapshots times between
+	// the listing and the copy of its row's file loses that file to the prune
+	// (a skip; recoverDeadRow moves the row onto the newest version the
+	// backup holds), and Parquet flushed after the step-1 listing is
+	// referenced by the rows and the hint but not in the backup (the next
+	// export pass drops it from the table; directory readers fail on it until
+	// then).
 	//
 	// The default leg, because the SQLite database is instance-wide: it holds
 	// every database's tier rows, the tokens, the continuous queries and the
@@ -1047,11 +1051,12 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// restore puts it back at its original key, from the default target); it
 	// is simply not on the routed database's target.
 	//
-	// Re-listed here, after the snapshot (see step 3); the step-1 listing
-	// only sized the progress total. A scoped backup carries none (#1084).
+	// Re-listed here, after the snapshot (see step 3), when one was taken;
+	// otherwise the step-1 listing serves, as there are no rows to match.
+	// A scoped backup carries none (#1084).
 	// The version hints are copied last, each checked against the v<N>
 	// files listed beside it (copyIcebergHints).
-	if sc.empty() && (len(icebergMetaFiles) > 0 || m.icebergEnabled) {
+	if sc.empty() && (run.def.manifest.HasMetadata || run.def.manifest.HasIcebergCatalog) && (len(icebergMetaFiles) > 0 || m.icebergEnabled) {
 		relisted, err := listInRootIcebergMetadata(ctx, objectLister)
 		if err != nil {
 			progress.Status = "failed"

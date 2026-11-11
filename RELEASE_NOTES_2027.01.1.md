@@ -3861,13 +3861,19 @@ newer manifests as unreachable. S3 warehouses already avoided this.
 
 Now:
 - **Backup:** the in-root Iceberg metadata is listed after the SQLite
-  snapshot, so every file a backed-up row references is in the backup. Each
-  table's version hint is copied last, pointed at the newest `v<N>` the backup
-  holds when the live hint is ahead of it (logged at Info).
+  snapshot, so the metadata a backed-up row references is in the backup
+  (unless the table commits more than `retain_snapshots` times during the
+  copy; the restore then recovers the row onto the newest version the backup
+  holds). Each table's version hint is copied last, pointed at the newest
+  `v<N>` the backup holds when the live hint is ahead of it (logged at Info).
+  A hint that cannot be read is skipped like a data file.
 - **Every warehouse adopts forward:** each pass moves a table's catalog row
   onto the newest version published in its warehouse when the row is behind,
-  on local storage as on S3. This costs one hint read per table per pass. A
-  warehouse outside the storage root publishes no hint and is unaffected.
+  on local storage as on S3. A restore writes the backup's version hint over
+  the live one, so the first check of each table after a restart also lists
+  its `v<N>` files and takes the newest. This costs one hint read per table
+  per pass, plus one listing per table per process. A warehouse outside the
+  storage root publishes no hint and is unaffected.
 - **A hint naming a missing version:** adoption and dead-row recovery fall
   back to the newest `v<N>` present instead of failing every pass. A live row
   is never moved to an older version, and a table with no catalog row still

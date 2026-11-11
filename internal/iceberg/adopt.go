@@ -112,6 +112,20 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 			rowN, _ = strconv.Atoi(v)
 		}
 	}
+	if rowExists && !e.isPublishedHere(ident, rowLoc) {
+		// The first check of this row in this process (a restart, a lease
+		// move, a restored catalog): the hint alone can be behind. A restore
+		// writes the backup's hint over a newer live one while the newer
+		// v<N> stay (#1613), and a writer can stop between v<N> and the
+		// hint. Every v<N> is fenced, so the newest is the published
+		// lineage. One listing per table per process; once this node
+		// publishes or confirms the row, the hint is enough.
+		newest, err := e.newestPublished(ctx, dirKey)
+		if err != nil {
+			return false, err
+		}
+		hintN = max(hintN, newest)
+	}
 
 	// decide picks the version to adopt for a published hint, or -1.
 	decide := func(hintN int) (int, error) {
@@ -150,13 +164,14 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 
 	vKey := path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
 	body, err := e.backend.Read(ctx, vKey)
-	if err != nil && storage.IsNotFound(err) && rowExists && target == hintN {
+	if err != nil && storage.IsNotFound(err) && rowExists && target == hintN && !e.dropInProgress(ctx, nsKey, measurement) {
 		// The hint names a version that is not there: a backup copies the
 		// hint as it is at copy time, which can be newer than the v<N> files
 		// it listed (#1613). Decide again, once, from the newest v<N>
-		// present; one below the row adopts nothing. Not without a row:
-		// DropDatabase deletes v<N> files before the hint, and a pass in that
-		// window would insert a row for the dropped table.
+		// present; one below the row adopts nothing. Not without a row, nor
+		// while the table's drop marker is set: DropDatabase deletes v<N>
+		// files in lexical order before the hint, so mid-drop the newest one
+		// left can be any old version, whose manifests are already gone.
 		newest, nerr := e.newestPublished(ctx, dirKey)
 		if nerr != nil {
 			return false, nerr
