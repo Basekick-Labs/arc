@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -446,6 +447,11 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 	return sub, nil
 }
 
+// errSubscriptionNotFound reports that no subscription is stored under id.
+func errSubscriptionNotFound(id string) error {
+	return fmt.Errorf("%w: %s", ErrSubscriptionNotFound, id)
+}
+
 // Get retrieves a subscription by ID
 func (m *SubscriptionManager) Get(ctx context.Context, id string) (*Subscription, error) {
 	sub, err := m.repo.Get(ctx, id)
@@ -453,7 +459,7 @@ func (m *SubscriptionManager) Get(ctx context.Context, id string) (*Subscription
 		return nil, err
 	}
 	if sub == nil {
-		return nil, fmt.Errorf("subscription not found: %s", id)
+		return nil, errSubscriptionNotFound(id)
 	}
 	return sub, nil
 }
@@ -471,7 +477,7 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 		return nil, err
 	}
 	if sub == nil {
-		return nil, fmt.Errorf("subscription not found: %s", id)
+		return nil, errSubscriptionNotFound(id)
 	}
 
 	// Check if running - must stop first
@@ -559,6 +565,10 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 	}
 
 	if err := m.repo.Update(ctx, sub); err != nil {
+		// Deleted between the read above and this write.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errSubscriptionNotFound(id)
+		}
 		return nil, err
 	}
 
@@ -580,6 +590,9 @@ func (m *SubscriptionManager) Delete(ctx context.Context, id string) error {
 	m.mu.Unlock()
 
 	if err := m.repo.Delete(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errSubscriptionNotFound(id)
+		}
 		return err
 	}
 
@@ -594,7 +607,7 @@ func (m *SubscriptionManager) StartSubscription(ctx context.Context, id string) 
 		return err
 	}
 	if sub == nil {
-		return fmt.Errorf("subscription not found: %s", id)
+		return errSubscriptionNotFound(id)
 	}
 
 	// Reserve the slot under lock to prevent concurrent starts (TOCTOU).
@@ -625,7 +638,7 @@ func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) e
 	subscriber, ok := m.subscribers[id]
 	if !ok || subscriber == nil {
 		m.mu.Unlock()
-		return ErrSubscriptionNotRunning
+		return m.notRunningError(ctx, id)
 	}
 	delete(m.subscribers, id)
 	m.mu.Unlock()
@@ -637,13 +650,24 @@ func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) e
 	return errors.Join(stopErr, statusErr)
 }
 
+// notRunningError is the error for a stop or pause of a subscription with no
+// running subscriber: ErrSubscriptionNotFound when no subscription is stored
+// under id, ErrSubscriptionNotRunning otherwise. A failed lookup answers not
+// running, which is true either way.
+func (m *SubscriptionManager) notRunningError(ctx context.Context, id string) error {
+	if sub, err := m.repo.Get(ctx, id); err == nil && sub == nil {
+		return errSubscriptionNotFound(id)
+	}
+	return ErrSubscriptionNotRunning
+}
+
 // PauseSubscription pauses a subscription (stops without clearing error state)
 func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) error {
 	m.mu.Lock()
 	subscriber, ok := m.subscribers[id]
 	if !ok || subscriber == nil {
 		m.mu.Unlock()
-		return ErrSubscriptionNotRunning
+		return m.notRunningError(ctx, id)
 	}
 	delete(m.subscribers, id)
 	m.mu.Unlock()
@@ -689,7 +713,7 @@ func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string
 		return err
 	}
 	if sub == nil {
-		return fmt.Errorf("subscription not found: %s", id)
+		return errSubscriptionNotFound(id)
 	}
 
 	// Start it
@@ -716,7 +740,7 @@ func (m *SubscriptionManager) GetStats(ctx context.Context, id string) (*Subscri
 			return nil, err
 		}
 		if sub == nil {
-			return nil, fmt.Errorf("subscription not found: %s", id)
+			return nil, errSubscriptionNotFound(id)
 		}
 
 		return &SubscriptionStats{
