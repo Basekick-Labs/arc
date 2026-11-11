@@ -57,6 +57,11 @@ spec:
               value: ":9200"
             - name: ARC_CLUSTER_RAFT_ADVERTISE_ADDR
               value: "$(POD_NAME).arc-writer-headless.arc.svc.cluster.local:9200"
+            # Peer file replication, as on the readers. Local storage without
+            # it is neither supported cluster pattern: no node reads another's
+            # disk (#1599).
+            - name: ARC_CLUSTER_REPLICATION_ENABLED
+              value: "true"
             # Storage — set explicitly so data lands on the mounted volume.
             # The default (./data/arc) is relative to the container working
             # directory and is NOT guaranteed to be under the PVC mount.

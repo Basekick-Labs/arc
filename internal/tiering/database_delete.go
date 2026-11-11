@@ -22,9 +22,10 @@ func (m *Manager) BeginDatabaseDelete() (func(), error) {
 	// the node that migrates, and the cycle can copy a hot file to cold after
 	// this delete has already swept that tier. Gating here rather than on the
 	// route keeps the no-gate modes correct by construction: roleGated() is
-	// false when no cluster gate is wired, which is deliberate for a
-	// local-storage cluster without replication, where each node's metadata is
-	// authoritative for its own disk and a delete on any node is legitimate.
+	// false when no cluster gate is wired. In a local-storage cluster without
+	// replication that is every writer; the databases handler refuses a
+	// writer that is not the primary before it gets here (#1599), since the
+	// cold tier and the manifest are shared even there.
 	if m.roleGated() {
 		return nil, ErrMigrationRoleGated
 	}
