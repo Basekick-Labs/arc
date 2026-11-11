@@ -106,8 +106,10 @@ type Exporter struct {
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
-	publishedMu            sync.Mutex
-	published              map[string]string
+	// forgetDroppedRows: see dropped.go (#1611).
+	forgetDroppedRows bool
+	publishedMu       sync.Mutex
+	published         map[string]string
 
 	// collapseThreshold is the manifest count at which a pass also collapses the manifest set
 	// (see manifestCollapseThreshold). A field rather than a bare constant so a test can raise it
@@ -306,7 +308,7 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 	if err := e.adoptBeforeLoad(ctx, database, measurement); err != nil {
 		return false, err
 	}
-	_, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
+	_, err := e.loadTableRecovering(ctx, e.tableIdent(database, measurement))
 	if err == nil {
 		return true, nil
 	}
@@ -360,7 +362,7 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 		return nil, err
 	}
 
-	tbl, err := e.catalog.LoadTable(ctx, ident)
+	tbl, err := e.loadTableRecovering(ctx, ident)
 	if err == nil {
 		// Table exists — evolve its schema to cover any new columns in `sc` (Arc's
 		// per-measurement schema can grow over time). Missing columns are added as optional,
@@ -1823,13 +1825,21 @@ func resolveFileURI(uri string) string {
 		return uri
 	}
 	p := filepath.FromSlash(parsed.Path)
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		return localFileURI(resolved)
+	// Resolve the nearest ancestor that exists and rejoin the rest: a path
+	// whose directories are gone (a table another node dropped, #1611) must
+	// still compare in the same spelling as the warehouse it lived in.
+	rest := ""
+	for dir := p; ; {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return localFileURI(filepath.Join(resolved, rest))
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return uri
+		}
+		rest = filepath.Join(filepath.Base(dir), rest)
+		dir = parent
 	}
-	if resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
-		return localFileURI(filepath.Join(resolvedDir, filepath.Base(p)))
-	}
-	return uri
 }
 
 // isUnderDir reports whether p is dir itself or lies beneath it, matching only at a path
@@ -1883,7 +1893,7 @@ func (e *Exporter) tableSeed(ctx context.Context, database, measurement string) 
 	if err := e.adoptBeforeLoad(ctx, database, measurement); err != nil {
 		return ArcSchema{}, nil, false, err
 	}
-	tbl, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
+	tbl, err := e.loadTableRecovering(ctx, e.tableIdent(database, measurement))
 	if errors.Is(err, icecatalog.ErrNoSuchTable) {
 		return ArcSchema{}, nil, false, nil
 	}
@@ -1973,10 +1983,16 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	// every table first. Collect the first error but keep going: partial
 	// cleanup converges on the next delete attempt.
 	var firstErr error
+	// A node that never exported the database has no namespace in its own
+	// catalog, but on a shared bucket another node's tables are in the
+	// warehouse: the drop goes on to delete them (#1611). The primary writer,
+	// which runs the drop, is often not the node that exports.
+	hadLocalNamespace := true
 	for ident, err := range e.catalog.ListTables(ctx, ns) {
 		if err != nil {
 			if errors.Is(err, icecatalog.ErrNoSuchNamespace) {
-				return nil // never exported; nothing to clean
+				hadLocalNamespace = false
+				break
 			}
 			return fmt.Errorf("list tables for drop: %w", err)
 		}
@@ -1984,8 +2000,10 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 			firstErr = fmt.Errorf("drop table %v: %w", ident, err)
 		}
 	}
-	if err := e.catalog.DropNamespace(ctx, ns); err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
-		firstErr = fmt.Errorf("drop namespace: %w", err)
+	if hadLocalNamespace {
+		if err := e.catalog.DropNamespace(ctx, ns); err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
+			firstErr = fmt.Errorf("drop namespace: %w", err)
+		}
 	}
 
 	// Warehouse holds ONLY metadata (data files are Arc's own tree, already
@@ -2025,6 +2043,16 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 				sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
 				for _, d := range ordered {
 					_ = remover.RemoveDirectory(ctx, d)
+				}
+			}
+			// Tell nodes still holding catalog rows for these tables that
+			// the database was dropped, so a dead row with nothing published
+			// is forgotten rather than refused (dropped.go). Only when there
+			// was something to drop: a database Iceberg never exported gets
+			// no marker.
+			if err == nil && (len(keys) > 0 || hadLocalNamespace) {
+				if werr := e.backend.Write(ctx, path.Join(relDir, droppedMarker), []byte(time.Now().UTC().Format(time.RFC3339)+"\n")); werr != nil && firstErr == nil {
+					firstErr = fmt.Errorf("write the Iceberg drop marker: %w", werr)
 				}
 			}
 		}

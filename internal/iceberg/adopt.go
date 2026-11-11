@@ -211,6 +211,11 @@ func (e *Exporter) publishedMatchesRow(ctx context.Context, dirKey string, rowN 
 	}
 	own, err := e.backend.Read(ctx, rowKey)
 	if err != nil {
+		if storage.IsNotFound(err) {
+			// The row's own file is gone (#1611: the table was dropped and recreated by
+			// another node): it is not the published version, so the caller takes that.
+			return false, true, nil
+		}
 		return false, true, fmt.Errorf("read the catalog's Iceberg metadata %s: %w", rowKey, err)
 	}
 	return bytes.Equal(own, published), true, nil
