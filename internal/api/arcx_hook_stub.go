@@ -32,6 +32,9 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	execCtx context.Context,
 	cancel context.CancelFunc,
 	rawSQL, headerDB, convertedSQL string,
+	governanceMaxRows int,
+	onRows func(int64),
+	onDisconnect func(),
 	onComplete func(int),
 	onFail func(string),
 ) (handled bool) {

@@ -3843,6 +3843,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### ArcX Arrow IPC honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
+
+ArcX-served Arrow IPC responses now enforce `MaxRows` and declare trailers for
+truncation, execution time and capped rows, consistent with the DuckDB path.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1294](https://github.com/Basekick-Labs/arc/pull/1294).
+
 ### Fix: a governance 429 says when a retry can succeed ([#1519](https://github.com/Basekick-Labs/arc/issues/1519))
 
 With query governance on, a refused query's `Retry-After` was wrong or missing:
