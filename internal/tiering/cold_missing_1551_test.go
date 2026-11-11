@@ -103,7 +103,7 @@ func TestColdMissingObjects_ObjectWrittenAfterTheListing(t *testing.T) {
 	}
 }
 
-// A cluster reader keeps rows the primary deleted (#1563): nothing is
+// A cluster reader cannot tell a primary delete from a loss (#1563): nothing is
 // reported there, and a node that becomes a reader drops its last result.
 func TestColdMissingObjects_ReaderReportsNothing(t *testing.T) {
 	m, _, cold := missingRig(t)
