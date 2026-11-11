@@ -248,8 +248,9 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 		}
 	}
 
-	// Rows whose object is gone (#1350 review M2): cold sync never retires
-	// them, so a DELETE that looked would otherwise stat them on every run.
+	// Rows whose object is gone (#1350 review M2): on the primary the cold
+	// sync never retires them (only a reader's does, #1563), so a DELETE that
+	// looked would otherwise stat them on every run.
 	rows, err := tier.ColdFilesForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Debug().Err(err).Msg("Could not read cold rows to find ones whose object is gone")

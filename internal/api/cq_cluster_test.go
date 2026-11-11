@@ -29,6 +29,7 @@ type fakeJobSyncer struct {
 
 func (f *fakeJobSyncer) ReloadCQ(int64) error                             { return nil }
 func (f *fakeJobSyncer) StartJobDirect(int64, string, string, bool) error { return nil }
+func (f *fakeJobSyncer) StopJob(int64)                                    {}
 func (f *fakeJobSyncer) SyncJobs(d []CQJobDef) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

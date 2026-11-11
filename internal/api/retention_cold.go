@@ -37,8 +37,9 @@ type coldRetention struct {
 	discoveryErr string // the candidate query itself failed
 	samples      []string
 
-	// Rows whose cold object was already gone. Not an error: the cold sync
-	// keeps such rows (it never retires one), so retention cleans them up.
+	// Rows whose cold object was already gone. Not an error: on the primary
+	// the cold sync keeps such rows (only a reader's retires them, #1563), so
+	// retention cleans them up.
 	staleRetired  int
 	staleReverted int // the file is in hot storage; the row now says hot
 

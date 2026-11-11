@@ -487,6 +487,19 @@ func (f *ClusterFSM) ColdMarkCovers(scope string, day int32) bool {
 	return ok && cur >= day
 }
 
+// ColdMarkBackend returns the cold store identity the mark was seeded from,
+// whether a final seed applied, and whether seeds from two different stores
+// conflicted (#1563: a reader retires a cold row only when its own cold store
+// is the one the cluster seeded from).
+func (f *ClusterFSM) ColdMarkBackend() (backend string, seeded, conflict bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.coldMark == nil {
+		return "", false, false
+	}
+	return f.coldMark.Backend, f.coldMark.Seeded, f.coldMark.BackendConflict
+}
+
 // ColdMarkStatus returns the flags and the nodes the fence waits for.
 func (f *ClusterFSM) ColdMarkStatus() ColdMarkStatus {
 	f.mu.RLock()

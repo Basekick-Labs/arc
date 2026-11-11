@@ -380,6 +380,9 @@ type Metrics struct {
 	// objects or retiring the rows clears them on the next sync.
 	tieringColdRowsMissingObjects        atomic.Int64
 	tieringColdRowsMissingObjectsHotCopy atomic.Int64
+	// tieringColdRowsRetiredByReader counts cold rows a cluster reader
+	// retired because the cold object and the hot copy were both gone (#1563).
+	tieringColdRowsRetiredByReader atomic.Int64
 
 	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
 	// of a token command). clusterAuthApplyTotal increments per applied
@@ -1143,6 +1146,12 @@ func (m *Metrics) SetBackupSkippedFiles(n int64) {
 	m.backupSkippedFiles.Store(n)
 }
 
+// AddTieringColdRowsRetiredByReader counts cold rows a cluster reader retired
+// after their object and hot copy were confirmed gone (#1563).
+func (m *Metrics) AddTieringColdRowsRetiredByReader(n int64) {
+	m.tieringColdRowsRetiredByReader.Add(n)
+}
+
 // SetTieringColdRowsMissingObjects records the last cold-tier metadata sync's
 // cold rows whose object is gone from cold storage: lost (no hot copy either)
 // and hotCopy (still read from hot storage) (#1551).
@@ -1458,6 +1467,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"backup_skipped_files":                          m.backupSkippedFiles.Load(),
 		"tiering_cold_rows_missing_objects":             m.tieringColdRowsMissingObjects.Load(),
 		"tiering_cold_rows_missing_objects_hot_copy":    m.tieringColdRowsMissingObjectsHotCopy.Load(),
+		"tiering_cold_rows_retired_by_reader_total":     m.tieringColdRowsRetiredByReader.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
@@ -2198,6 +2208,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_tiering_cold_rows_missing_objects_hot_copy Cold tier rows whose cold object is gone but whose hot copy still exists and is read, as of the last cold-tier metadata sync. No data is missing.\n"...)
 	b = append(b, "# TYPE arc_tiering_cold_rows_missing_objects_hot_copy gauge\n"...)
 	b = appendMetric(b, "arc_tiering_cold_rows_missing_objects_hot_copy", float64(m.tieringColdRowsMissingObjectsHotCopy.Load()))
+	b = append(b, "# HELP arc_tiering_cold_rows_retired_by_reader_total Cold tier rows a cluster reader retired because their cold object and hot copy were both gone, normally after the primary's DELETE, retention run or database delete. A reader cannot tell that from an object removed outside Arc.\n"...)
+	b = append(b, "# TYPE arc_tiering_cold_rows_retired_by_reader_total counter\n"...)
+	b = appendMetric(b, "arc_tiering_cold_rows_retired_by_reader_total", float64(m.tieringColdRowsRetiredByReader.Load()))
 
 	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
 	// apply_* counters increment per applied token command, per node — so

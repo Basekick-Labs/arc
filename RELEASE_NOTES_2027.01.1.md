@@ -3843,6 +3843,64 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: cluster readers retire cold rows the primary removed ([#1563](https://github.com/Basekick-Labs/arc/issues/1563))
+
+A cold `DELETE`, a retention run or a database delete runs on the primary
+writer. It removed the cold objects and the primary's own tier rows, and
+nothing removed the rows on readers. Every reader kept them for good. Each
+cycle it logged `Cold tier rows have no object in cold storage`, and a reader
+promoted by failover reported those rows as lost data (#1551).
+
+A reader's cold-tier sync now retires such a row itself. It acts only when the
+cold object and the hot copy are both still absent at the moment it acts, and
+the row is still cold and not quarantined, the same evidence the primary's
+`DELETE` and retention act on. After each retirement it checks the cold
+object again: if the object is there, a writer raced the check, and the row
+is written back.
+
+A reader retires nothing in these cases, and logs why:
+- a restore is running on it;
+- the cluster's cold mark was seeded from a different cold store than its own
+  (#1552);
+- the store identity is unknown and the cold listing came back empty.
+
+The pass is bounded by time, not by row count, so a day of retention clears in
+one sync. It never takes more than half of what is left of the scan's budget.
+It deletes rows in batches, one tier-cache invalidation per measurement. The
+first syncs after an upgrade may take several cycles to clear the backlog of
+everything the primary ever removed; each logs how many rows are left. The
+reader compares cold stores by their configured identity (backend, endpoint,
+region or account, bucket and prefix), so every node's `tiered_storage.cold`
+settings must be spelled identically.
+
+A cold row whose object is gone but whose hot copy the manifest still lists
+(the primary rolled a move back before unlinking the hot copy, for example
+after a compaction took the file over) is now pointed back at hot on readers
+too. Before, that happened only for hot-only databases. A reader that kept such a row cold
+refused its own hot registration over it, so a measurement whose only hot file
+it was could not be read on that reader.
+
+New counter: `arc_tiering_cold_rows_retired_by_reader_total`. A reader cannot
+tell the primary's removal from an object deleted outside Arc (a bucket
+lifecycle rule). The primary still reports the latter as lost for as long as it
+leads. After a failover, the new primary no longer does, because its rows were
+retired while it was a reader.
+
+### Fix: deleting a continuous query stops its scheduled runs
+
+On a standalone node, `DELETE /api/v1/continuous_queries/{id}` removed the
+continuous query but left its scheduler job running. The job kept firing at
+the query's interval until the next restart or `POST
+/api/v1/schedulers/cq/reload`. Each run failed on the missing definition and
+logged `Scheduled CQ execution failed` at Error, and `GET /api/v1/schedulers`
+kept listing the deleted query among its jobs. The delete now stops the job,
+and an update or `POST /api/v1/schedulers/cq/reload` that runs at the same
+moment can no longer start it again. In a cluster, the job of a deleted
+continuous query was already stopped.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1600](https://github.com/Basekick-Labs/arc/pull/1600).
+
 ### Fix: governance policy routes answer `409` and `404` instead of `500` and `200`
 
 `POST /api/v1/governance/policies` for a token that already had a policy
