@@ -3,6 +3,7 @@ package governance
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,6 +12,14 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
+
+// ErrPolicyExists is returned by CreatePolicy for a token that already has a
+// policy: a token has at most one, changed with UpdatePolicy.
+var ErrPolicyExists = errors.New("governance policy already exists for this token")
+
+// ErrPolicyNotFound is returned by UpdatePolicy and DeletePolicy for a token
+// with no stored policy.
+var ErrPolicyNotFound = errors.New("no governance policy for this token")
 
 // Policy represents a governance policy for a specific token.
 type Policy struct {
@@ -205,14 +214,25 @@ func (m *Manager) cleanupLoop() {
 
 // CreatePolicy creates a governance policy for a token.
 func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) {
+	// token_id is UNIQUE. A second policy for the token inserts nothing
+	// rather than failing, so it is told apart from a store failure without
+	// matching driver error text.
 	result, err := m.db.ExecContext(ctx, `
 		INSERT INTO governance_policies (token_id, rate_limit_per_minute, rate_limit_per_hour,
 			max_queries_per_hour, max_queries_per_day, max_rows_per_query, max_scan_duration_sec)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(token_id) DO NOTHING`,
 		p.TokenID, p.RateLimitPerMinute, p.RateLimitPerHour,
 		p.MaxQueriesPerHour, p.MaxQueriesPerDay, p.MaxRowsPerQuery, p.MaxScanDurationSec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create governance policy: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create governance policy: %w", err)
+	}
+	if inserted == 0 {
+		return nil, fmt.Errorf("%w: token %d", ErrPolicyExists, p.TokenID)
 	}
 
 	id, err := result.LastInsertId()
@@ -244,7 +264,7 @@ func (m *Manager) GetPolicy(ctx context.Context, tokenID int64) (*Policy, error)
 
 // UpdatePolicy updates an existing governance policy.
 func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) {
-	_, err := m.db.ExecContext(ctx, `
+	result, err := m.db.ExecContext(ctx, `
 		UPDATE governance_policies SET
 			rate_limit_per_minute = ?, rate_limit_per_hour = ?,
 			max_queries_per_hour = ?, max_queries_per_day = ?,
@@ -258,6 +278,16 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to update governance policy: %w", err)
 	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to update governance policy: %w", err)
+	}
+	// No row: there is no policy to update (a DELETE can land between the
+	// caller's check and this write). Publishing p would enforce a policy
+	// that is not stored, until a restart reloads the cache.
+	if updated == 0 {
+		return nil, fmt.Errorf("%w: token %d", ErrPolicyNotFound, p.TokenID)
+	}
 
 	p.UpdatedAt = time.Now()
 
@@ -269,11 +299,18 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 
 // DeletePolicy removes the governance policy for a token.
 func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
-	_, err := m.db.ExecContext(ctx, `DELETE FROM governance_policies WHERE token_id = ?`, tokenID)
+	result, err := m.db.ExecContext(ctx, `DELETE FROM governance_policies WHERE token_id = ?`, tokenID)
+	if err != nil {
+		return fmt.Errorf("failed to delete governance policy: %w", err)
+	}
+	deleted, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("failed to delete governance policy: %w", err)
 	}
 
+	// The in-memory state is cleared even when no row was deleted: whatever
+	// it holds for the token is not stored, so it must not stay enforced.
+	//
 	// The cache entry and the limiters go together under admitMu: an Admit
 	// that read the policy before this must not recreate a limiter on its
 	// limits after it (#1524).
@@ -298,6 +335,9 @@ func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
 
 	metrics.Get().SetGovernancePoliciesActive(int64(m.policyCount()))
 
+	if deleted == 0 {
+		return fmt.Errorf("%w: token %d", ErrPolicyNotFound, tokenID)
+	}
 	m.logger.Info().Int64("token_id", tokenID).Msg("Governance policy deleted")
 	return nil
 }
