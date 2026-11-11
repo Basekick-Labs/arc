@@ -143,11 +143,14 @@ type icebergTopology struct {
 // icebergTopologyFor decides it. sharedBucket is cluster.IsSharedObjectStore
 // of the built backend: Iceberg export runs on local or s3 storage only, and
 // an S3 warehouse is shared by every node that reads the bucket, with or
-// without shared_storage_mode. A standalone S3 node is authoritative too: its
-// catalog can be restored from a backup behind its warehouse.
+// without shared_storage_mode. Every warehouse is authoritative: a catalog
+// restored from a backup sits behind the warehouse it was restored next to,
+// on S3 (#1609) and on local storage (#1613), where committing from the stale
+// row rolls the hint back. A warehouse outside the storage root publishes
+// nothing, so adoption has nothing to read there.
 func icebergTopologyFor(sharedMode, sharedBucket, hasCoordinator, hasCompactorFailover, hasCompactionGate bool) icebergTopology {
 	t := icebergTopology{
-		authoritative: sharedMode || sharedBucket,
+		authoritative: true,
 		barrier:       (sharedMode || sharedBucket) && hasCoordinator,
 		gate:          icebergGateNone,
 	}

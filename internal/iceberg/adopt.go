@@ -34,13 +34,15 @@ import (
 //   - Adoption: before loading a table, the exporter reads the published version-hint and moves
 //     its catalog row onto the newest published version when the row is behind it, or is the
 //     same version number with different content (the losing side of a fence). Done every pass
-//     on an object-store warehouse (SetWarehouseAuthoritative), including the scheduler's first
-//     loads after a restart, and on any backend when the row is missing.
+//     where the warehouse is authoritative (SetWarehouseAuthoritative, set on every node since
+//     #1613), including the scheduler's first loads after a restart; otherwise only when the
+//     row is missing.
 
 // SetWarehouseAuthoritative makes every pass check the published version before loading a
-// table: on any shared object-store warehouse, with or without shared_storage_mode, and on a
-// standalone S3 node, whose catalog can be restored behind its warehouse (#1609). Without it the
-// check runs only for a table with no catalog row.
+// table. Arc sets it on every node: a shared bucket's published version is current (#1609),
+// and any catalog can be restored from a backup behind its warehouse, S3 or local (#1613),
+// where committing from the stale row would roll the version-hint back. Without it the check
+// runs only for a table with no catalog row.
 func (e *Exporter) SetWarehouseAuthoritative(on bool) {
 	e.warehouseAuthoritative = on
 }
@@ -110,32 +112,61 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 			rowN, _ = strconv.Atoi(v)
 		}
 	}
-
-	target := -1
-	switch {
-	case !rowExists:
-		target = hintN
-		if target < 0 {
-			if target, err = e.newestPublished(ctx, dirKey); err != nil {
+	if rowExists && !e.isPublishedHere(ident, rowLoc) {
+		// The first check of this row in this process (a restart, a lease
+		// move, a restored catalog): the hint alone can be behind. A restore
+		// writes the backup's hint over a newer live one while the newer
+		// v<N> stay (#1613), and a writer can stop between v<N> and the
+		// hint. A v<N> above the hint is taken only when it is this table's
+		// lineage (the same table-uuid as the row's metadata): a database
+		// DROP that failed part way can leave an older incarnation's v<N>
+		// behind a recreated table. One listing per table per process, until
+		// this node publishes or confirms the row; then the hint is enough.
+		newest, err := e.newestPublished(ctx, dirKey)
+		if err != nil {
+			return false, err
+		}
+		if newest > hintN {
+			same, err := e.sameTableLineage(ctx, dirKey, rowLoc, hintN, newest)
+			if err != nil {
 				return false, err
 			}
+			if same {
+				hintN = newest
+			}
 		}
-	case hintN > rowN:
-		target = hintN
-	case e.isPublishedHere(ident, rowLoc):
-		// This node published the row's version itself: nothing newer, nothing to compare.
-	default:
+	}
+
+	// decide picks the version to adopt for a published hint, or -1.
+	decide := func(hintN int) (int, error) {
+		switch {
+		case !rowExists:
+			if hintN >= 0 {
+				return hintN, nil
+			}
+			return e.newestPublished(ctx, dirKey)
+		case hintN > rowN:
+			return hintN, nil
+		case e.isPublishedHere(ident, rowLoc):
+			// This node published the row's version itself: nothing newer, nothing to compare.
+			return -1, nil
+		}
 		// Same or older hint: is the row's own version published, and is it this row's?
 		same, exists, err := e.publishedMatchesRow(ctx, dirKey, rowN, rowLoc)
 		if err != nil {
-			return false, err
+			return -1, err
 		}
 		switch {
 		case exists && same:
 			e.markPublished(ident, rowLoc)
 		case exists:
-			target = max(hintN, rowN) // the fence's losing side: take the published lineage
+			return max(hintN, rowN), nil // the fence's losing side: take the published lineage
 		}
+		return -1, nil
+	}
+	target, err := decide(hintN)
+	if err != nil {
+		return false, err
 	}
 	if target < 0 {
 		return false, nil
@@ -143,6 +174,29 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 
 	vKey := path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
 	body, err := e.backend.Read(ctx, vKey)
+	if err != nil && storage.IsNotFound(err) && rowExists && target == hintN && !e.dropInProgress(ctx, nsKey, measurement) {
+		// The hint names a version that is not there: a backup copies the
+		// hint as it is at copy time, which can be newer than the v<N> files
+		// it listed (#1613). Decide again, once, from the newest v<N>
+		// present; one below the row adopts nothing. Not without a row, nor
+		// while the table's drop marker is set: DropDatabase deletes v<N>
+		// files in lexical order before the hint, so mid-drop the newest one
+		// left can be any old version, whose manifests are already gone.
+		newest, nerr := e.newestPublished(ctx, dirKey)
+		if nerr != nil {
+			return false, nerr
+		}
+		if newest < hintN {
+			if target, err = decide(newest); err != nil {
+				return false, err
+			}
+			if target < 0 {
+				return false, nil
+			}
+			vKey = path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
+			body, err = e.backend.Read(ctx, vKey)
+		}
+	}
 	if err != nil {
 		return false, fmt.Errorf("read published Iceberg metadata %s: %w", vKey, err)
 	}
@@ -158,6 +212,54 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 		Bool("had_row", rowExists).
 		Msg("Iceberg: adopted the table version published in the warehouse (another node advanced the table, or this node's catalog row was missing)")
 	return true, nil
+}
+
+// sameTableLineage reports whether v<newest> carries the table-uuid of the
+// row's own metadata, or of v<hintN> when the row's file is gone. With
+// neither readable it answers false: nothing to compare against.
+func (e *Exporter) sameTableLineage(ctx context.Context, dirKey, rowLoc string, hintN, newest int) (bool, error) {
+	want := ""
+	if key, ok := e.warehouseRelKey(rowLoc); ok {
+		u, err := e.tableUUIDAt(ctx, key)
+		if err != nil {
+			return false, err
+		}
+		want = u
+	}
+	if want == "" && hintN >= 0 {
+		u, err := e.tableUUIDAt(ctx, path.Join(dirKey, "v"+strconv.Itoa(hintN)+".metadata.json"))
+		if err != nil {
+			return false, err
+		}
+		want = u
+	}
+	if want == "" {
+		return false, nil
+	}
+	got, err := e.tableUUIDAt(ctx, path.Join(dirKey, "v"+strconv.Itoa(newest)+".metadata.json"))
+	if err != nil {
+		return false, err
+	}
+	return got == want, nil
+}
+
+// tableUUIDAt returns the table-uuid of the metadata at key, or "" when the
+// file is gone or carries none.
+func (e *Exporter) tableUUIDAt(ctx context.Context, key string) (string, error) {
+	body, err := e.backend.Read(ctx, key)
+	if err != nil {
+		if storage.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read Iceberg metadata %s: %w", key, err)
+	}
+	var meta struct {
+		TableUUID string `json:"table-uuid"`
+	}
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return "", fmt.Errorf("Iceberg metadata %s is not valid JSON: %w", key, err)
+	}
+	return meta.TableUUID, nil
 }
 
 // readHint returns the version version-hint.text names, or -1 when there is none.
