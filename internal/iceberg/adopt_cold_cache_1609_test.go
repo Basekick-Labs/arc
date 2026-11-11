@@ -54,7 +54,7 @@ func TestTableSeed_AdoptsBeforeLoadingAPrunedRow(t *testing.T) {
 	}
 }
 
-// Without an authoritative warehouse (local storage) a row whose metadata is
+// Without an authoritative warehouse (no longer wired since #1613) a row whose metadata is
 // gone is still recovered when the warehouse publishes the table: the load
 // fails, and recoverDeadRow moves the row onto the published version (#1611).
 func TestTableSeed_NonAuthoritativeRecoversAPrunedRowFromThePublishedVersion(t *testing.T) {

@@ -13,11 +13,13 @@ package iceberg
 //
 // recoverDeadRow runs when a load fails that way:
 //
-//   - Anything published for the table (version-hint.text, else the newest
-//     v<N>.metadata.json): the row is moved onto it whatever its version number
+//   - Anything published for the table (the newer of version-hint.text and the
+//     newest v<N>.metadata.json, or the newest v<N> when the hint names one that
+//     is missing): the row is moved onto it whatever its version number
 //     relative to the row's. The warehouse is the authority; a recreated table
 //     starts again at v0, below the dead row. Safe in every topology, and it
-//     also heals a row a backup restored without its file (#1613).
+//     also heals a row a backup restored without its file, where the backup
+//     holds a hint newer than its v<N> files (#1613).
 //   - Nothing published: the row is forgotten (and the table re-adopted or
 //     created) only where forgetDroppedRows is set (a shared bucket with a
 //     cluster coordinator) and the table carries a drop marker. Elsewhere, a
@@ -144,12 +146,27 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 		return false, err
 	}
 	target := max(hint, newest)
+	var body []byte
+	var vKey string
 	if target >= 0 {
-		vKey := path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
-		body, err := e.backend.Read(ctx, vKey)
+		vKey = path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
+		body, err = e.backend.Read(ctx, vKey)
+		if err != nil && storage.IsNotFound(err) && target > newest {
+			// The hint names a version that is not there: a backup copies
+			// the hint as it is at copy time, which can be newer than the
+			// v<N> files it listed (#1613). The newest present one, even
+			// below the dead row (a recreated table starts again at v0).
+			target, err = newest, nil
+			if target >= 0 {
+				vKey = path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
+				body, err = e.backend.Read(ctx, vKey)
+			}
+		}
 		if err != nil {
 			return false, fmt.Errorf("read published Iceberg metadata %s: %w", vKey, err)
 		}
+	}
+	if target >= 0 {
 		if !json.Valid(body) {
 			return false, fmt.Errorf("published Iceberg metadata %s is not valid JSON", vKey)
 		}

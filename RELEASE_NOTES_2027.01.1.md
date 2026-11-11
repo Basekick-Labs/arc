@@ -3843,6 +3843,39 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: a backup's Iceberg metadata matches its catalog, and a restored catalog never rolls a table back ([#1613](https://github.com/Basekick-Labs/arc/issues/1613))
+
+A whole-instance backup listed the in-root Iceberg warehouse at the start,
+copied the data, snapshotted the SQLite catalog, and only then copied the
+metadata from that early listing. The export keeps committing through the
+data copy, so the backup could hold catalog rows pointing at metadata it never
+copied. The version hint, read at copy time, could also name a `v<N>` the
+backup did not hold. A restored node then failed to export that table on every
+pass.
+
+Separately, restoring a catalog behind its warehouse on **local storage** (a
+restore in place, or any restore whose warehouse is newer than its catalog)
+let the export commit from the stale row. On a table with no new files it
+quietly moved the version hint back, and the orphan sweep then deleted the
+newer manifests as unreachable. S3 warehouses already avoided this.
+
+Now:
+- **Backup:** the in-root Iceberg metadata is listed after the SQLite
+  snapshot, so every file a backed-up row references is in the backup. Each
+  table's version hint is copied last, pointed at the newest `v<N>` the backup
+  holds when the live hint is ahead of it (logged at Info).
+- **Every warehouse adopts forward:** each pass moves a table's catalog row
+  onto the newest version published in its warehouse when the row is behind,
+  on local storage as on S3. This costs one hint read per table per pass. A
+  warehouse outside the storage root publishes no hint and is unaffected.
+- **A hint naming a missing version:** adoption and dead-row recovery fall
+  back to the newest `v<N>` present instead of failing every pass. A live row
+  is never moved to an older version, and a table with no catalog row still
+  fails rather than adopt an older version (a database delete in progress
+  removes the `v<N>` files before the hint).
+- The export is not paused for a backup, so the backed-up warehouse can be
+  ahead of its catalog. A restore adopts forward to it.
+
 ### Fix: Iceberg export recovers after a database is dropped and recreated on a shared bucket ([#1611](https://github.com/Basekick-Labs/arc/issues/1611))
 
 A database delete runs on the primary writer. On a shared bucket it deleted
@@ -3862,7 +3895,7 @@ Now:
 - **Missing metadata:** when a catalog row's metadata file is gone and the
   warehouse publishes the table, the row moves onto the published version,
   whatever its version number. This holds on every backend, and also heals a
-  row restored ahead of its warehouse files (#1613).
+  row restored ahead of its warehouse files (see #1613 below).
 - **Nothing published:** the row is forgotten and the table exported anew,
   but only on a shared bucket in a cluster, and only when the delete left a
   drop marker for that table. Markers live under the reserved

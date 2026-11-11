@@ -980,12 +980,21 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	}
 
 	// ── 3. Copy SQLite metadata, on the DEFAULT leg ─────────────────────
-	// Snapshotted BEFORE the Iceberg warehouse metadata below, on purpose: a
-	// reconcile commit writes a new metadata file and only then points the
-	// catalog row at it, so a catalog snapshotted after the file copy could
-	// reference a file the backup never held (#637). Snapshotting the rows
-	// first means every referenced file already existed, immutable, when its
-	// row was written, and is copied by the passes that follow.
+	// Snapshotted BEFORE the Iceberg warehouse metadata below is LISTED and
+	// copied, on purpose: a reconcile commit writes a new metadata file and
+	// only then points the catalog row at it, so a catalog snapshotted after
+	// the listing could reference a file the backup never held (#637). Both
+	// 3b and 3c list after this snapshot (3b re-lists: the step-1 listing
+	// predates it, and the export keeps committing through the data copy,
+	// #1613), so every file a snapshotted row references already existed when
+	// the listing ran. Not a consistent cut: the export is not paused, so the
+	// warehouse copied can be AHEAD of the rows (newer metadata, a newer
+	// version hint). A restore adopts forward to the newest published version
+	// (iceberg adoptPublished, every warehouse is authoritative since #1613).
+	// The one exception is a retain_snapshots=1 table that commits twice
+	// between the snapshot and the copy: its row's metadata file is pruned
+	// before it is copied, and the restore recovers the row onto the newest
+	// version the backup holds (recoverDeadRow).
 	//
 	// The default leg, because the SQLite database is instance-wide: it holds
 	// every database's tier rows, the tokens, the continuous queries and the
@@ -1037,8 +1046,30 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// this group and therefore on the default target. No data is lost (a
 	// restore puts it back at its original key, from the default target); it
 	// is simply not on the routed database's target.
+	//
+	// Re-listed here, after the snapshot (see step 3); the step-1 listing
+	// only sized the progress total. A scoped backup carries none (#1084).
+	// The version hints are copied last, each checked against the v<N>
+	// files listed beside it (copyIcebergHints).
+	if sc.empty() && (len(icebergMetaFiles) > 0 || m.icebergEnabled) {
+		relisted, err := listInRootIcebergMetadata(ctx, objectLister)
+		if err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			run.fail(run.def)
+			return nil, fmt.Errorf("failed to list Iceberg warehouse metadata: %w", err)
+		}
+		progress.TotalFiles += int64(len(relisted)) - int64(len(icebergMetaFiles))
+		icebergMetaFiles = relisted
+	}
 	if len(icebergMetaFiles) > 0 {
-		skipped, err := m.copyDataFiles(ctx, run.def, icebergMetaFiles, nil, m.dataStorage, "data storage", "")
+		rest, hints := splitIcebergHints(icebergMetaFiles)
+		skipped, err := m.copyDataFiles(ctx, run.def, rest, nil, m.dataStorage, "data storage", "")
+		if err == nil {
+			var hintSkipped int64
+			hintSkipped, err = m.copyIcebergHints(ctx, run.def, hints, publishedVersionsByDir(rest))
+			skipped += hintSkipped
+		}
 		if err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()

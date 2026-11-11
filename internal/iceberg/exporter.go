@@ -320,7 +320,8 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 }
 
 // adoptBeforeLoad adopts the version published in the warehouse before a
-// catalog load, where the warehouse is authoritative (any S3 warehouse). The
+// catalog load, where the warehouse is authoritative (every warehouse Arc
+// publishes to; SetWarehouseAuthoritative). The
 // scheduler's first loads after a restart (tableSeed, tableExists) ran before
 // EnsureTable's adoption, so a stale row whose metadata another node had since
 // pruned failed every pass, and a node with no row never saw a table another
@@ -1656,8 +1657,8 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 			if err := e.publishMetadataCopy(ctx, vKey, body); err != nil {
 				if errors.Is(err, errFenced) {
 					// Another node published this version first: this commit forked the table.
-					// No hint, no prune, no sweep. Where the warehouse is authoritative (an S3
-					// warehouse) the next pass adopts the published lineage.
+					// No hint, no prune, no sweep. Where the warehouse is authoritative (every
+					// node Arc wires, SetWarehouseAuthoritative) the next pass adopts the published lineage.
 					e.logger.Error().Err(err).Str("key", vKey).Bool("adopts_next_pass", e.warehouseAuthoritative).
 						Msg("Iceberg: another writer published this table version first; this pass stops (the next one adopts the published version where the warehouse is authoritative)")
 					e.hintFailMu.Lock()

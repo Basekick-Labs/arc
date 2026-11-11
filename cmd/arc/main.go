@@ -4331,9 +4331,8 @@ func main() {
 		}
 		// A shared bucket, with or without shared_storage_mode (#1609): every node sees the
 		// same tables and the export moves with the compactor lease, so the published
-		// version, not this node's catalog row, is current (#939). A standalone S3 node too:
-		// its catalog can be restored behind its warehouse. Elsewhere the published version
-		// is consulted only for a table with no catalog row.
+		// version, not this node's catalog row, is current (#939). Every other node too: its
+		// catalog can be restored behind its warehouse, on S3 (#1609) and local storage (#1613).
 		icebergTopo := icebergTopologyFor(cfg.Cluster.SharedStorageMode, cluster.IsSharedObjectStore(storageBackend),
 			clusterCoordinator != nil, clusterCoordinator != nil && clusterCoordinator.HasCompactorFailover(), compactionGate != nil)
 		exporter.SetWarehouseAuthoritative(icebergTopo.authoritative)

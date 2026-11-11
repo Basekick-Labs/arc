@@ -114,9 +114,9 @@ func TestIcebergTopologyFor(t *testing.T) {
 		in   in
 		want icebergTopology
 	}{
-		{"OSS local", in{false, false, false, false, false}, icebergTopology{gate: icebergGateNone}},
+		{"OSS local (restore can leave the catalog behind, #1613)", in{false, false, false, false, false}, icebergTopology{authoritative: true, gate: icebergGateNone}},
 		{"standalone S3 (restore can leave the catalog behind)", in{false, true, false, false, false}, icebergTopology{authoritative: true, gate: icebergGateNone}},
-		{"local cluster", in{false, false, true, true, true}, icebergTopology{gate: icebergGateCompaction}},
+		{"local cluster", in{false, false, true, true, true}, icebergTopology{authoritative: true, gate: icebergGateCompaction}},
 		{"multi-writer with failover", in{true, true, true, true, true}, icebergTopology{authoritative: true, barrier: true, gate: icebergGateLease}},
 		// Blocker row: no failover manager (licence or Raft) must not drop a
 		// multi-writer bucket to the static gate.
