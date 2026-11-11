@@ -117,6 +117,11 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 	if err != nil || !rowExists {
 		return false, err
 	}
+	// The table's lineage changed under this node: its next publish must try
+	// the drop marker again, even if it cleared (none) before the drop.
+	e.publishedMu.Lock()
+	delete(e.markerCleared, strings.Join(ident, "\x00"))
+	e.publishedMu.Unlock()
 	slash := strings.LastIndex(rowLoc, "/")
 	if slash < 0 {
 		return false, nil // not a location this exporter wrote

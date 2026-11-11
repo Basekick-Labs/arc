@@ -254,3 +254,28 @@ func TestDeadRow_LocationWithoutASlashIsAnError(t *testing.T) {
 		t.Fatal("tableSeed succeeded on a row with an unusable location")
 	}
 }
+
+// The node that recovers is one that published the table before the drop:
+// its once-per-process "marker cleared" note must not stop it clearing the
+// marker after it re-publishes the recreated table (found in the binary run).
+func TestDropMarker_ClearedByAnExporterThatPublishedBeforeTheDrop(t *testing.T) {
+	r := newWarehouseRig(t)
+	a, b := r.node(true), r.node(true)
+	a.SetForgetDroppedRows(true)
+	b.SetForgetDroppedRows(true)
+	r.addFile()
+	if err := r.reconcile(b); err != nil { // b publishes (and notes its marker cleared)
+		t.Fatal(err)
+	}
+	if err := a.DropDatabase(context.Background(), "mydb"); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(r.root, filepath.FromSlash(droppedMarkerKey("arc_mydb", "cpu")))
+	r.addFile()
+	if err := r.reconcile(b); err != nil { // dead row: forgotten, table recreated and published
+		t.Fatalf("b after the drop: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("marker still there after b re-published the recreated table (stat err %v)", err)
+	}
+}
