@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/rs/zerolog"
 
@@ -52,6 +53,14 @@ type StorageWalkSource struct {
 	// manifest's view of a listed file and its read barrier (see SetManifestBarrier).
 	manifestKnows func(path string) bool
 	manifestSync  func(ctx context.Context) error
+	// unmanagedMu guards unmanaged: per measurement, the listed files still
+	// unknown to the manifest after a barrier. They are objects the manifest
+	// never learns of (written before the cluster existed, say), and a
+	// barrier per pass for them would be a replicated log entry per pass
+	// (#1609). Replaced on every barrier, so it holds only what is still
+	// listed; a file the manifest later learns of is dropped from it.
+	unmanagedMu sync.Mutex
+	unmanaged   map[string]map[string]struct{}
 	// cold, when set, is the cold tier the source lists next to the primary (cold.go).
 	cold   *coldTier
 	logger zerolog.Logger
@@ -315,7 +324,10 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 		if moved {
 			err = nil
 		}
-		if err == nil && len(vanished) == 0 && !moved && !synced && s.manifestKnows != nil && s.unknownToManifest(files) {
+		if err == nil && len(vanished) == 0 && !moved && synced && s.manifestKnows != nil {
+			s.recordUnmanaged(m, files)
+		}
+		if err == nil && len(vanished) == 0 && !moved && !synced && s.manifestKnows != nil && s.unknownToManifest(m, files) {
 			// At most once per call: a file the manifest never learns of (an unmanaged
 			// object) must not turn every pass into a barrier per listing.
 			synced = true
@@ -382,13 +394,42 @@ func listSizes(ctx context.Context, lister storage.ObjectLister, prefix string) 
 }
 
 // unknownToManifest reports whether any listed file is unknown to the replicated manifest.
-func (s *StorageWalkSource) unknownToManifest(files []FileRef) bool {
+// unknownToManifest reports whether a listed file is unknown to the manifest
+// and not already known to stay so after an earlier barrier (unmanaged).
+func (s *StorageWalkSource) unknownToManifest(m Measurement, files []FileRef) bool {
+	s.unmanagedMu.Lock()
+	defer s.unmanagedMu.Unlock()
+	known := s.unmanaged[measurementKey(m.Database, m.Measurement)]
 	for _, f := range files {
-		if !s.manifestKnows(f.Key) {
+		if s.manifestKnows(f.Key) {
+			delete(known, f.Key)
+			continue
+		}
+		if _, ok := known[f.Key]; !ok {
 			return true
 		}
 	}
 	return false
+}
+
+// recordUnmanaged remembers the listed files a barrier did not make known.
+func (s *StorageWalkSource) recordUnmanaged(m Measurement, files []FileRef) {
+	still := make(map[string]struct{})
+	for _, f := range files {
+		if !s.manifestKnows(f.Key) {
+			still[f.Key] = struct{}{}
+		}
+	}
+	s.unmanagedMu.Lock()
+	defer s.unmanagedMu.Unlock()
+	if s.unmanaged == nil {
+		s.unmanaged = make(map[string]map[string]struct{})
+	}
+	if len(still) == 0 {
+		delete(s.unmanaged, measurementKey(m.Database, m.Measurement))
+		return
+	}
+	s.unmanaged[measurementKey(m.Database, m.Measurement)] = still
 }
 
 // vanishRetries bounds FilesAndLocal's attempts at a stable listing.
