@@ -27,19 +27,24 @@ func TestLocalClusterWithoutReplication(t *testing.T) {
 	}
 }
 
-func TestLocalClusterWithoutReplicationWarningBranchesOnFailover(t *testing.T) {
-	without := localClusterWithoutReplicationWarning(false)
-	with := localClusterWithoutReplicationWarning(true)
-	if !strings.Contains(without, "every writer-role node acts as a primary writer") || strings.Contains(without, "promoted") ||
-		!strings.Contains(without, "report cold rows another node deleted as lost") {
-		t.Errorf("without failover: %q", without)
+func TestLocalClusterWithoutReplicationWarning(t *testing.T) {
+	w := localClusterWithoutReplicationWarning()
+	for _, want := range []string{
+		"each writer keeps only the data it ingested",
+		"primary writer reach only its own files",
+		"report cold rows another node deleted as lost",
+		"cluster.replication_enabled=true",
+	} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warning lacks %q: %q", want, w)
+		}
 	}
-	if !strings.Contains(with, "promoted by failover has only the files it wrote itself") {
-		t.Errorf("with failover: %q", with)
-	}
-	for _, w := range []string{without, with} {
-		if !strings.Contains(w, "cluster.replication_enabled=true") || strings.Contains(w, "prefix") {
-			t.Errorf("advice: %q; want replication, and no per-node cold prefix (the cold mark requires one store)", w)
+	// One primary is elected whenever Raft runs (#872), and the cold mark
+	// requires one cold store everywhere (#1552): neither "every writer is a
+	// primary" nor a per-node cold prefix is true or good advice.
+	for _, bad := range []string{"every writer-role node acts as a primary", "prefix"} {
+		if strings.Contains(w, bad) {
+			t.Errorf("warning says %q: %q", bad, w)
 		}
 	}
 }

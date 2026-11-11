@@ -4190,7 +4190,7 @@ func main() {
 	}
 	if clusterCoordinator != nil {
 		if localClusterWithoutReplication(true, cfg.Storage.Backend, cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled) {
-			log.Warn().Str("role", clusterCoordinator.Role()).Msg(localClusterWithoutReplicationWarning(cfg.Cluster.FailoverEnabled))
+			log.Warn().Str("role", clusterCoordinator.Role()).Msg(localClusterWithoutReplicationWarning())
 		}
 		// Gated to the primary writer in every cluster: even nodes that share
 		// no hot storage share the cold tier, and a database delete removes

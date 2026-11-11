@@ -22,18 +22,15 @@ func localClusterWithoutReplication(hasCoordinator bool, storageBackend string, 
 }
 
 // localClusterWithoutReplicationWarning is the startup warning for that
-// configuration. Without writer failover every writer-role node is a primary;
-// with it, a promoted writer has only its own files. Either way the writers
-// stay ungated and keep reporting a peer's cold deletes as lost (#1551), which
-// the warning says.
-func localClusterWithoutReplicationWarning(failover bool) string {
-	what := "every writer-role node acts as a primary writer"
-	if failover {
-		what = "a writer promoted by failover has only the files it wrote itself"
-	}
+// configuration. Writes are spread across the writers and each keeps only what
+// it ingested. One primary writer is elected whenever Raft runs, failover or
+// not (#872): it runs retention, DELETE and continuous queries, but reaches
+// only its own files plus the shared cold tier. The writers stay ungated and
+// keep reporting a peer's cold deletes as lost (#1551); the warning says so.
+func localClusterWithoutReplicationWarning() string {
 	return "This cluster runs on local storage with cluster.replication_enabled=false, which is neither supported cluster pattern: " +
-		"no node reads another's disk, so a query sees only the receiving node's own files (plus the cold tier, which every node shares), readers hold no hot data, and " +
-		what + ". Writers here also report cold rows another node deleted as lost data. " +
+		"no node reads another's disk, so each writer keeps only the data it ingested, a query sees only the receiving node's own files (plus the cold tier, which every node shares), readers hold no hot data, " +
+		"and retention, DELETE and continuous queries on the primary writer reach only its own files. Writers here also report cold rows another node deleted as lost data. " +
 		"Set cluster.replication_enabled=true on every node (per-node local storage with peer replication), or use cluster.shared_storage_mode with an object store"
 }
 
