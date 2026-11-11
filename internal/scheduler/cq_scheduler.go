@@ -222,6 +222,16 @@ func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive
 	return s.startJob(cqID, name, interval)
 }
 
+// StopJob stops the job of a deleted CQ (call after CQ delete). It does not
+// wait for a run in flight: stopping cancels its context, and no job replaces
+// it, so there is nothing to wait for. SyncJobs stops the job of a CQ deleted
+// in a cluster the same way.
+func (s *CQScheduler) StopJob(cqID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopJobLocked(cqID)
+}
+
 // ReloadAll reloads all CQ schedules from the database
 func (s *CQScheduler) ReloadAll() error {
 	// Check license - require valid license for CQ scheduler. This ran after

@@ -32,6 +32,8 @@ func (s *recordingCQScheduler) StartJobDirect(_ int64, _, _ string, isActive boo
 	return nil
 }
 
+func (s *recordingCQScheduler) StopJob(int64) {}
+
 // The six fields PUT requires, as a JSON object body without the braces.
 const cqRequiredFields = `"name":"cq1","database":"db","source_measurement":"src","destination_measurement":"dst",` +
 	`"query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"`
