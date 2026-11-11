@@ -4189,7 +4189,14 @@ func main() {
 		databasesHandler.SetPendingRegistrations(registrationOutbox)
 	}
 	if clusterCoordinator != nil {
-		databasesHandler.SetCoordinator(clusterCoordinator, cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled)
+		if localClusterWithoutReplication(true, cfg.Storage.Backend, cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled) {
+			log.Warn().Str("role", clusterCoordinator.Role()).Msg(localClusterWithoutReplicationWarning())
+		}
+		// Gated to the primary writer in every cluster: even nodes that share
+		// no hot storage share the cold tier, and a database delete removes
+		// every cold object under the database and the database's manifest
+		// entries for every node (#1599).
+		databasesHandler.SetCoordinator(clusterCoordinator)
 		// The listings forward from a node that cannot serve queries, as the
 		// query routes do; a create, from a node that does not ingest, to
 		// the writer.
@@ -4786,11 +4793,18 @@ func main() {
 				// syncs its tier metadata each cycle because queries route
 				// from it; and every hot copy tiering removes leaves the
 				// cluster manifest first, so peer replication does not pull
-				// it back. A local-storage cluster without replication
-				// shares nothing and stays ungated: each node's metadata is
-				// authoritative for its own disk. The manifest seam is wired
-				// whenever a coordinator exists, since files are registered
-				// in the manifest either way.
+				// it back.
+				//
+				// A local-storage cluster without replication is neither
+				// shipped pattern (cluster_topology.go, #1599). Its writers
+				// stay ungated, each migrating the hot files on its own
+				// disk. Its readers and compactors, which hold none, are
+				// gated: they only sync, as in the shipped patterns, and so
+				// retire the cold rows a writer removed rather than report
+				// them as lost. The cold store is shared either way: the
+				// cold mark requires one store on every node (#1552). The
+				// manifest seam is wired whenever a coordinator exists, since
+				// files are registered in the manifest either way.
 				var tieringGate tiering.ClusterGate
 				var tieringManifest tiering.ManifestCoordinator
 				if clusterCoordinator != nil {
@@ -4798,7 +4812,9 @@ func main() {
 						coordinator: clusterCoordinator,
 						logger:      logger.Get("tiering-manifest"),
 					}
-					if cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled {
+					if cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled ||
+						(localClusterWithoutReplication(true, cfg.Storage.Backend, cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled) &&
+							gateTieringInLocalClusterWithoutReplication(clusterCoordinator.Role())) {
 						tieringGate = newWriterClusterGate(clusterCoordinator)
 					}
 				}

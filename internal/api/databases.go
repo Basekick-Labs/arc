@@ -32,7 +32,6 @@ type DatabasesHandler struct {
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
 	coordinator    DatabaseDeleteCoordinator
-	gateNonPrimary bool
 	tieringManager databaseTieringManager
 	authManager    *auth.AuthManager
 	rbacManager    RBACChecker
@@ -108,18 +107,17 @@ const databaseDeleteManifestChunkSize = 200
 const databaseDeleteManifestReason = "database:delete"
 
 // SetCoordinator wires cluster manifest updates into database deletion, and
-// with gateNonPrimary the primary-writer admission check. Pass gateNonPrimary
-// under the same condition the tiering manager's writer gate is wired
-// (shared storage or replication), so a cluster answers the same way whether
-// tiered storage is enabled or not: without either, nodes share nothing, the
-// manifest delete unlinks nothing on peers, and each node may delete its own
-// files. Call before RegisterRoutes, alongside the other handler wiring.
-func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator, gateNonPrimary bool) {
+// the primary-writer admission check. Every cluster gets the check: even a
+// local-storage cluster without replication shares the cold tier, and a
+// database delete removes every cold object of the database and its manifest
+// entries for every node, so it is one node's job, like a row DELETE or
+// retention (#1599). It runs whether or not tiered storage is enabled. Call
+// before RegisterRoutes, alongside the other handler wiring.
+func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator) {
 	if c == nil {
 		return
 	}
 	h.coordinator = c
-	h.gateNonPrimary = gateNonPrimary
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -740,6 +738,20 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
 	}
+	// Refuse a node that is not the primary writer, as the row delete API and
+	// retention do (#1094). Checked before the tier reservation, and whether
+	// or not tiering runs here: in a local-storage cluster without
+	// replication a writer's tiering is ungated, so BeginDatabaseDelete alone
+	// would admit a standby writer (#1599).
+	if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		role := h.coordinator.Role()
+		h.logger.Warn().Str("database", name).Str("role", role).
+			Msg("Database deletion rejected: this node is not the primary writer")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
+			"role":  role,
+		})
+	}
 	if h.tieringManager != nil {
 		release, err := h.tieringManager.BeginDatabaseDelete()
 		if err != nil {
@@ -768,18 +780,6 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			})
 		}
 		defer release()
-	} else if h.coordinator != nil && h.gateNonPrimary && !h.coordinator.IsPrimaryWriter() {
-		// No tiering manager: nothing above gated the request, so refuse a
-		// node that is not the primary writer here, as the row delete API and
-		// retention do (#1094). With tiering enabled, BeginDatabaseDelete
-		// already answers this case.
-		role := h.coordinator.Role()
-		h.logger.Warn().Str("database", name).Str("role", role).
-			Msg("Database deletion rejected: this node is not the primary writer")
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
-			"role":  role,
-		})
 	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)

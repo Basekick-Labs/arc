@@ -192,8 +192,10 @@ type ManagerConfig struct {
 	// orphan reconciliation) to the primary writer. main.go wires it where
 	// nodes share data — shared-storage mode, and per-node storage with file
 	// replication: there the primary's manifest deletes unlink every
-	// replica, so only one node may migrate. A local-storage cluster
-	// without replication shares nothing and stays ungated.
+	// replica, so only one node may migrate. In a local-storage cluster
+	// without replication, which is neither supported pattern, only its
+	// readers and compactors are gated (#1599): each writer migrates the hot
+	// files on its own disk.
 	//
 	// It does NOT switch the cold-tier metadata sync on or off. That used to
 	// be written here and was the one place in the package claiming it; the

@@ -111,7 +111,7 @@ func TestDatabasesHandler_DeleteRetriesTransientLeaderChangeWithoutTiering(t *te
 		primary: true, role: "writer", entries: []*raft.FileEntry{{Path: path, Database: "db"}},
 		backend: backend, probePath: path, transientFailures: 1,
 	}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestDatabasesHandler_Delete1094RejectsNonPrimaryWriter(t *testing.T) {
 			handler, app, tmpDir := setupTestDatabasesHandler(t, true)
 			t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
 			coordinator := &databaseDeleteCoordinatorFake{role: role, primary: false}
-			handler.SetCoordinator(coordinator, true)
+			handler.SetCoordinator(coordinator)
 
 			resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 			if err != nil {
@@ -206,7 +206,7 @@ func TestDatabasesHandler_Delete1094ManifestFirstChunkedAndRetryable(t *testing.
 		failOnBatch: 2,
 	}
 	handler.storage = &databaseDeleteRecordingBackend{Backend: backend, events: &events}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -311,7 +311,7 @@ func TestDatabasesHandler_Delete1094SkipsEdgeSyncSpokeEntries(t *testing.T) {
 			{Path: "rocket-01/telemetry/cpu/b.parquet", Database: "telemetry"},
 		},
 	}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/telemetry?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -346,14 +346,14 @@ func TestDatabasesHandler_Delete1094TieringManagerOwnsManifestRemoval(t *testing
 	events := []string{}
 	tm := &fakeDatabaseTieringManager{events: &events}
 	handler.tieringManager = tm
-	// A non-primary coordinator: with a tiering manager wired, its gate is
-	// BeginDatabaseDelete's, not this one, so the request proceeds here.
+	// The primary writer: the request is admitted, and the tiering manager
+	// then owns the manifest removal.
 	coordinator := &databaseDeleteCoordinatorFake{
-		primary: false,
-		role:    "reader",
+		primary: true,
+		role:    "writer",
 		entries: []*raft.FileEntry{{Path: "db/cpu/a.parquet", Database: "db"}},
 	}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -387,7 +387,7 @@ func TestDatabasesHandler_Delete1094ProposesLocalFilesMissingFromTheManifest(t *
 	}
 	coordinator := &databaseDeleteCoordinatorFake{primary: true, role: "writer",
 		entries: []*raft.FileEntry{{Path: "rocket-01/telemetry/cpu/a.parquet", Database: "telemetry"}}}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/rocket-01?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -409,9 +409,7 @@ func TestDatabasesHandler_Delete1094ProposesLocalFilesMissingFromTheManifest(t *
 	}
 }
 
-// Without shared storage or replication the cluster gate is off, as the
-// tiering manager's is: nodes share nothing and each may delete its own files.
-func TestDatabasesHandler_Delete1094UngatedWithoutSharedStorageOrReplication(t *testing.T) {
+func TestDatabasesHandler_Delete1599NonPrimaryRefusedWithTiering(t *testing.T) {
 	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
 	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
 	ctx := context.Background()
@@ -421,16 +419,22 @@ func TestDatabasesHandler_Delete1094UngatedWithoutSharedStorageOrReplication(t *
 	if err := handler.storage.Write(ctx, "db/cpu/a.parquet", []byte("hot")); err != nil {
 		t.Fatal(err)
 	}
-	coordinator := &databaseDeleteCoordinatorFake{primary: false, role: "reader",
-		entries: []*raft.FileEntry{{Path: "db/cpu/a.parquet", Database: "db"}}}
-	handler.SetCoordinator(coordinator, false)
+	events := []string{}
+	handler.tieringManager = &fakeDatabaseTieringManager{events: &events}
+	handler.SetCoordinator(&databaseDeleteCoordinatorFake{primary: false, role: "writer"})
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != fiber.StatusOK {
-		t.Fatalf("status = %d, want 200 on an ungated cluster", resp.StatusCode)
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for a writer that is not the primary", resp.StatusCode)
+	}
+	if len(events) != 0 {
+		t.Fatalf("tiering events = %v, want none: the refusal comes before the tier reservation", events)
+	}
+	if ok, _ := handler.storage.Exists(ctx, "db/cpu/a.parquet"); !ok {
+		t.Fatal("a refused delete removed a file")
 	}
 }

@@ -354,7 +354,7 @@ func TestDatabaseDeletionFlushesRecordsAndWithdraws(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := &[]string{}
-	handler.SetCoordinator(&recordingDatabaseCoordinator{databaseDeleteCoordinatorFake: databaseDeleteCoordinatorFake{primary: true, role: "writer"}, events: events}, true)
+	handler.SetCoordinator(&recordingDatabaseCoordinator{databaseDeleteCoordinatorFake: databaseDeleteCoordinatorFake{primary: true, role: "writer"}, events: events})
 	handler.SetFlusher(&recordingFlusher{events: events})
 	handler.SetPendingRegistrations(recordingPending{events: events})
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
