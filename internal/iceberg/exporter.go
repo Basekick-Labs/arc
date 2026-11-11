@@ -1733,12 +1733,7 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 	// an unclean path), and raw string comparison then lands every commit in
 	// warn-once "hint unaddressable" mode. Resolution must be SYMMETRIC —
 	// all three values or none — and the two constant sides are cached.
-	e.resolveOnce.Do(func() {
-		e.resolvedWarehouse = decodedURIPath(resolveFileURI(e.warehouse))
-		if e.backend != nil {
-			e.resolvedRoot = decodedURIPath(resolveFileURI(DefaultWarehouse(e.backend)))
-		}
-	})
+	e.resolveBases()
 	loc := decodedURIPath(resolveFileURI(metaLoc))
 	if !isUnderDir(loc, e.resolvedWarehouse) {
 		return "", false
@@ -1752,6 +1747,16 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimPrefix(strings.TrimPrefix(loc, e.resolvedRoot), "/"), true
+}
+
+// resolveBases computes the symlink-resolved warehouse and storage root once.
+func (e *Exporter) resolveBases() {
+	e.resolveOnce.Do(func() {
+		e.resolvedWarehouse = decodedURIPath(resolveFileURI(e.warehouse))
+		if e.backend != nil {
+			e.resolvedRoot = decodedURIPath(resolveFileURI(DefaultWarehouse(e.backend)))
+		}
+	})
 }
 
 // decodedURIPath returns the URI's logical path without percent escapes for comparisons and
@@ -1778,6 +1783,13 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	// iceberg-go's 0644 metadata world-readable.
 	resolved := decodedURIPath(resolveFileURI(metaLoc))
 	if !strings.HasPrefix(resolved, scheme) {
+		return
+	}
+	// Only inside the configured warehouse: the walk below chmods the
+	// metadata directory and two ancestors, so a location that resolved
+	// somewhere else must never reach it (#1616).
+	e.resolveBases()
+	if !isUnderDir(resolved, e.resolvedWarehouse) {
 		return
 	}
 	metaDir := filepath.Dir(filepath.FromSlash(strings.TrimPrefix(resolved, scheme)))
@@ -1812,37 +1824,26 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	}
 }
 
-// resolveFileURI canonicalizes a file:// URI for path comparison: scheme
-// stripped, symlinks resolved, re-URI'd via localFileURI. When the full path
-// does not exist yet, its parent directory is resolved and the base rejoined,
-// so a not-yet-written metadata location still canonicalizes consistently
-// with its directory. Non-file schemes (s3://, azure://) return unchanged:
-// object keys have no symlinks and must keep exact string semantics.
+// resolveFileURI canonicalizes a local location for path comparison: a
+// file:// URI (any case of the scheme, one slash or three) or a bare path
+// (#1616: a bare iceberg.warehouse makes iceberg-go write bare locations),
+// made absolute, symlinks resolved through the nearest existing ancestor
+// (storage.ResolveExistingPath, as backup resolves the warehouse), and
+// re-URI'd via localFileURI. A bare path is taken literally, never
+// percent-decoded: iceberg-go writes it to the directory its literal name
+// spells. A location whose directories are gone (a table another node
+// dropped, #1611) still compares in the same spelling as its warehouse.
+// Non-file schemes (s3://, azure://) return unchanged: object keys have no
+// symlinks and must keep exact string semantics.
 func resolveFileURI(uri string) string {
-	const scheme = "file://"
-	if !strings.HasPrefix(uri, scheme) {
+	if isBareLocalPath(uri) {
+		return localFileURI(storage.ResolveExistingPath(filepath.FromSlash(uri)))
+	}
+	parsed, ok := isFileURI(uri)
+	if !ok {
 		return uri
 	}
-	parsed, err := url.Parse(uri)
-	if err != nil || parsed.Scheme != "file" || parsed.Host != "" {
-		return uri
-	}
-	p := filepath.FromSlash(parsed.Path)
-	// Resolve the nearest ancestor that exists and rejoin the rest: a path
-	// whose directories are gone (a table another node dropped, #1611) must
-	// still compare in the same spelling as the warehouse it lived in.
-	rest := ""
-	for dir := p; ; {
-		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-			return localFileURI(filepath.Join(resolved, rest))
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return uri
-		}
-		rest = filepath.Join(filepath.Base(dir), rest)
-		dir = parent
-	}
+	return localFileURI(storage.ResolveExistingPath(filepath.FromSlash(parsed.Path)))
 }
 
 // isUnderDir reports whether p is dir itself or lies beneath it, matching only at a path

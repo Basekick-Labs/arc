@@ -4312,6 +4312,10 @@ func main() {
 		if warehouse == "" {
 			warehouse = iceberg.DefaultWarehouse(storageBackend)
 		}
+		// A bare path becomes the file:// URI of its absolute directory, so new
+		// tables get file:// locations (#1616). Tables created before keep the
+		// bare locations in their catalog rows, which the exporter resolves too.
+		warehouse = iceberg.NormalizeLocalWarehouse(warehouse)
 		exporter, err := iceberg.NewExporter(icebergDB, storageBackend, warehouse, cfg.Iceberg.NamespacePrefix, cfg.Iceberg.RetainSnapshots, logger.Get("iceberg"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
