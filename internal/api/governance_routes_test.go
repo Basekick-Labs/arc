@@ -87,3 +87,17 @@ func TestGovernanceDeletePolicyOfATokenWithoutOneIsNotFound(t *testing.T) {
 	notFound("GET", "/policies/1", "")
 	notFound("PUT", "/policies/1", `{"rate_limit_per_minute":20}`)
 }
+
+// A PUT with the values the policy already has is a 200, not a 404: SQLite
+// counts the row the UPDATE matched, not whether a value changed.
+func TestGovernanceUpdatePolicyWithIdenticalValuesIsOK(t *testing.T) {
+	app := newGovernanceRoutesApp(t)
+	if status, body := sendGovernance(t, app, "POST", "/policies", `{"token_id":1,"rate_limit_per_minute":10}`); status != fiber.StatusCreated {
+		t.Fatalf("create: %d %v", status, body)
+	}
+	for i := 0; i < 2; i++ {
+		if status, body := sendGovernance(t, app, "PUT", "/policies/1", `{"rate_limit_per_minute":10}`); status != fiber.StatusOK {
+			t.Fatalf("PUT %d with unchanged values: %d %v; want 200", i+1, status, body)
+		}
+	}
+}

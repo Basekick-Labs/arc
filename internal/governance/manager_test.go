@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -457,5 +459,75 @@ func TestManager_CheckRateLimit_BothLimitsExhausted(t *testing.T) {
 	// which clears 59-60 minutes from now.
 	if r.RetryAfterSec < 3500 || r.RetryAfterSec > 3600 {
 		t.Fatalf("RetryAfterSec = %d, want the hour limiter's wait (~3540-3600)", r.RetryAfterSec)
+	}
+}
+
+// storedPolicy reports whether tokenID has a row.
+func storedPolicy(t *testing.T, m *Manager, tokenID int64) bool {
+	t.Helper()
+	var n int
+	if err := m.db.QueryRow(`SELECT count(*) FROM governance_policies WHERE token_id = ?`, tokenID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n > 0
+}
+
+// A policy write and its cache update are not interleaved with another policy
+// write: the cache ends up enforcing exactly what is stored. Each case runs
+// the second write from inside the first, between its SQLite write and its
+// cache update, which is where the race used to land.
+func TestManager_PolicyWritesDoNotInterleave(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		setup  bool   // a policy exists before the first write
+		first  string // the write that is interrupted
+		second string // the write that lands inside it
+	}{
+		{"delete inside create", false, "create", "delete"},
+		{"delete inside update", true, "update", "delete"},
+		{"create inside a delete of nothing", false, "delete", "create"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := setupTestManager(t, nil)
+			ctx := context.Background()
+			const tok = 7
+			if tc.setup {
+				if _, err := m.CreatePolicy(ctx, &Policy{TokenID: tok, RateLimitPerMinute: 5}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			run := func(op string) {
+				switch op {
+				case "create":
+					_, _ = m.CreatePolicy(ctx, &Policy{TokenID: tok, RateLimitPerMinute: 1})
+				case "update":
+					_, _ = m.UpdatePolicy(ctx, &Policy{TokenID: tok, RateLimitPerMinute: 2})
+				case "delete":
+					_ = m.DeletePolicy(ctx, tok)
+				}
+			}
+			secondDone := make(chan struct{})
+			var once sync.Once
+			m.afterPolicyWrite = func(op string) {
+				if op != tc.first {
+					return
+				}
+				once.Do(func() {
+					go func() { run(tc.second); close(secondDone) }()
+					// Without serialization the second write completes here.
+					select {
+					case <-secondDone:
+					case <-time.After(200 * time.Millisecond):
+					}
+				})
+			}
+			run(tc.first)
+			<-secondDone
+
+			cached, _ := m.GetPolicy(ctx, tok)
+			if stored := storedPolicy(t, m, tok); stored != (cached != nil) {
+				t.Fatalf("stored %v, cached %+v: the cache must enforce exactly what is stored", stored, cached)
+			}
+		})
 	}
 }

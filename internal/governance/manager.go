@@ -72,6 +72,18 @@ type Manager struct {
 	config *config.GovernanceConfig
 	logger zerolog.Logger
 
+	// policyWriteMu serializes CreatePolicy, UpdatePolicy and DeletePolicy,
+	// each held across its SQLite write and its cache update. Without it a
+	// write and its publish could interleave with another write and leave the
+	// cache enforcing a policy that is not stored, or not enforcing one that
+	// is, until a restart reloads it. Only admin policy writes take it:
+	// Admit, GetPolicy and ListPolicies never do, so it costs queries nothing.
+	// Lock order: policyWriteMu, then admitMu.
+	policyWriteMu sync.Mutex
+	// afterPolicyWrite is a test seam: when set, each policy write calls it
+	// between its SQLite write and its cache update.
+	afterPolicyWrite func(op string)
+
 	// In-memory rate limiters keyed by token ID
 	minuteLimiters   map[int64]*slidingWindowCounter
 	minuteLimitersMu sync.RWMutex
@@ -214,6 +226,8 @@ func (m *Manager) cleanupLoop() {
 
 // CreatePolicy creates a governance policy for a token.
 func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) {
+	m.policyWriteMu.Lock()
+	defer m.policyWriteMu.Unlock()
 	// token_id is UNIQUE. A second policy for the token inserts nothing
 	// rather than failing, so it is told apart from a store failure without
 	// matching driver error text.
@@ -233,6 +247,9 @@ func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 	}
 	if inserted == 0 {
 		return nil, fmt.Errorf("%w: token %d", ErrPolicyExists, p.TokenID)
+	}
+	if m.afterPolicyWrite != nil {
+		m.afterPolicyWrite("create")
 	}
 
 	id, err := result.LastInsertId()
@@ -264,6 +281,8 @@ func (m *Manager) GetPolicy(ctx context.Context, tokenID int64) (*Policy, error)
 
 // UpdatePolicy updates an existing governance policy.
 func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) {
+	m.policyWriteMu.Lock()
+	defer m.policyWriteMu.Unlock()
 	result, err := m.db.ExecContext(ctx, `
 		UPDATE governance_policies SET
 			rate_limit_per_minute = ?, rate_limit_per_hour = ?,
@@ -288,6 +307,9 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 	if updated == 0 {
 		return nil, fmt.Errorf("%w: token %d", ErrPolicyNotFound, p.TokenID)
 	}
+	if m.afterPolicyWrite != nil {
+		m.afterPolicyWrite("update")
+	}
 
 	p.UpdatedAt = time.Now()
 
@@ -299,6 +321,8 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 
 // DeletePolicy removes the governance policy for a token.
 func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
+	m.policyWriteMu.Lock()
+	defer m.policyWriteMu.Unlock()
 	result, err := m.db.ExecContext(ctx, `DELETE FROM governance_policies WHERE token_id = ?`, tokenID)
 	if err != nil {
 		return fmt.Errorf("failed to delete governance policy: %w", err)
@@ -308,8 +332,13 @@ func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
 		return fmt.Errorf("failed to delete governance policy: %w", err)
 	}
 
+	if m.afterPolicyWrite != nil {
+		m.afterPolicyWrite("delete")
+	}
+
 	// The in-memory state is cleared even when no row was deleted: whatever
-	// it holds for the token is not stored, so it must not stay enforced.
+	// it holds for the token is not stored (policyWriteMu keeps a concurrent
+	// create from storing one meanwhile), so it must not stay enforced.
 	//
 	// The cache entry and the limiters go together under admitMu: an Admit
 	// that read the policy before this must not recreate a limiter on its
@@ -317,8 +346,13 @@ func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
 	m.admitMu.Lock()
 	defer m.admitMu.Unlock()
 	m.policiesMu.Lock()
+	_, wasCached := m.policies[tokenID]
 	delete(m.policies, tokenID)
 	m.policiesMu.Unlock()
+	if deleted == 0 && wasCached {
+		m.logger.Warn().Int64("token_id", tokenID).
+			Msg("Governance policy was enforced from the cache with no stored row; cleared")
+	}
 
 	// Remove in-memory trackers
 	m.minuteLimitersMu.Lock()
