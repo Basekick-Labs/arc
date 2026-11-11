@@ -304,6 +304,9 @@ jobs:
           bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
             -f helm/arc-enterprise/values-local-storage.yaml
 
+      - name: Enterprise chart shared storage, multi-writer and single-writer
+        run: bash scripts/test_enterprise_shared_mode.sh helm/arc-enterprise
+
       - name: Every clustered role can join Raft (shared storage preset)
         run: |
           bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \

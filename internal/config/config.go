@@ -1016,9 +1016,8 @@ type ClusterConfig struct {
 	//     refuses if licenseClient.CanUseSharedStorageMultiWriter()
 	//     is false. Requires FeatureSharedStorageMultiWriter license.
 	//
-	// Default false: today's single-writer-per-cluster behavior. Single
-	// writer pointed at S3 continues to work unchanged with this flag
-	// false (the flag only matters for N>1 writers).
+	// Default false: single-writer shared storage, one elected primary
+	// (#1603, #1606). The Helm chart sets it from storage.shared.multiWriter.
 	//
 	// See docs/progress/2026-05-26-multi-writer-pattern2.md.
 	SharedStorageMode bool

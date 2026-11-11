@@ -1,6 +1,6 @@
 # Arc Enterprise Helm Chart
 
-Multi-node Arc Enterprise deployment for Kubernetes with role separation (writer / reader / compactor), high availability, and a choice of storage pattern (shared object storage with Pattern 2 multi-writer, or per-node local storage with Pattern 1 single-writer + writer-failover).
+Multi-node Arc Enterprise deployment for Kubernetes with role separation (writer / reader / compactor), high availability, and a choice of storage pattern (shared object storage, multi-writer or single-writer, or per-node local storage with Pattern 1 single-writer + writer-failover).
 
 ## Prerequisites
 
@@ -242,7 +242,36 @@ automatically by the chart (see `templates/_helpers.tpl`). This:
   deletes) to gate on the cluster Raft leader instead of on a singleton
   "primary writer." Leader change is sub-second on healthy clusters.
 - Requires the Enterprise license to include the
-  `shared_storage_multi_writer` feature; startup refuses otherwise.
+  `shared_storage_multi_writer` feature, at any writer count; startup
+  refuses otherwise.
+
+#### Shared storage, single writer — `storage.shared.multiWriter: false`
+
+Without the multi-writer licence feature, run shared storage as a single
+writer:
+
+```yaml
+storage:
+  mode: shared
+  shared:
+    multiWriter: false
+writer:
+  replicas: 3                              # one primary, two standbys
+cluster:
+  failover:
+    enabled: true                          # replaces a lost primary (writer_failover feature)
+```
+
+Arc elects one primary writer, which takes every write; the other writer
+pods are standbys that forward writes reaching them to the primary. The
+singleton tasks (retention, continuous queries, deletes, tiering migration)
+run on the primary. With `cluster.failover.enabled` (and the
+`writer_failover` licence feature) a lost primary is replaced; without it,
+ingest stops until an operator restores it. This needs the `clustering`
+licence feature, not `shared_storage_multi_writer`.
+
+Switching a running multi-writer cluster to `multiWriter: false` (or back)
+is disruptive: writes pause until a primary is elected under the new mode.
 
 #### Local storage (Pattern 1) — `storage.mode: local`
 

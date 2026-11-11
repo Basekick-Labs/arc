@@ -307,17 +307,16 @@ Call as: include "arc-enterprise.commonClusterEnv" .
 - name: ARC_CLUSTER_FAILOVER_ENABLED
   value: "true"
 {{- end }}
-{{- if eq .Values.storage.mode "shared" }}
+{{- if eq (include "arc-enterprise.sharedMultiWriter" .) "true" }}
 {{- /*
-Pattern 2 multi-writer: all RoleWriter pods accept writes
-concurrently and PUT to the shared object-storage bucket. Writer
-failover is suppressed (LB does failover via Kubernetes Service
-load-balancing + /ready). Singleton background tasks (retention,
-CQ, delete, tiering migration) run on whichever pod is the cluster Raft leader.
-Requires Enterprise license with the shared_storage_multi_writer
-feature. Single-writer deployments (writer.replicas=1) with shared
-storage continue to work unchanged — Pattern 2 mode is a no-op for
-them. See docs/progress/2026-05-26-multi-writer-pattern2.md.
+Pattern 2 multi-writer: all RoleWriter pods accept writes concurrently and
+PUT to the shared object-storage bucket. Writer failover is suppressed (the
+Kubernetes Service and /ready do failover). Singleton background tasks
+(retention, CQ, delete, tiering migration) run on the cluster Raft leader.
+Requires the shared_storage_multi_writer licence feature, at any writer
+count. With storage.shared.multiWriter=false the flag is not set: one
+elected primary writer takes writes, and no multi-writer licence is needed
+(#1606). See docs/progress/2026-05-26-multi-writer-pattern2.md.
 */}}
 - name: ARC_CLUSTER_SHARED_STORAGE_MODE
   value: "true"
@@ -477,3 +476,20 @@ args:
     esac
     cd /app && exec ./arc
 {{- end }}
+
+{{/*
+"true" when this is a shared-storage install running Pattern 2 multi-writer
+(storage.shared.multiWriter, default true), "false" otherwise. An explicit
+false is tested with kindIs: `default` would turn false into the default,
+and helm 3 and 4 treat an absent and a null value differently.
+*/}}
+{{- define "arc-enterprise.sharedMultiWriter" -}}
+{{- $shared := .Values.storage.shared | default dict -}}
+{{- if ne .Values.storage.mode "shared" -}}
+false
+{{- else if and (kindIs "bool" $shared.multiWriter) (not $shared.multiWriter) -}}
+false
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}

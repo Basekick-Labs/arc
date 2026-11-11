@@ -81,11 +81,9 @@ const objectStoreClusterNoRaftWarning = "This cluster shares an object-store buc
 	"Set cluster.raft_data_dir on every node"
 
 // objectStoreClusterNoCoordinatorWarning is logged when cluster.enabled is set
-// on an object-store backend but the coordinator is not running (no
-// clustering licence, or it failed to start, see the errors above). Shared-
-// storage mode refuses to start in that state; this configuration runs, with
-// nothing gating it.
-const objectStoreClusterNoCoordinatorWarning = "cluster.enabled is set on an object-store backend but the cluster coordinator is not running (see the log above): " +
+// on an object-store backend but no coordinator is built because the licence
+// lacks clustering: the node runs standalone, with nothing gating it.
+const objectStoreClusterNoCoordinatorWarning = "cluster.enabled is set on an object-store backend but the licence does not include clustering, so the cluster coordinator is not running: " +
 	"this node runs tiering migration, retention, continuous queries and deletes against the shared bucket unconditionally, as if no other node used it"
 
 // tieringGateWired reports whether a cluster node's tiering gets the writer
@@ -106,3 +104,11 @@ func tieringGateWired(sharedMode, replication, sharedObjectStore bool, backend, 
 func ignoreReplicationOnObjectStore(clusterEnabled, replication, sharedObjectStore bool) bool {
 	return clusterEnabled && replication && sharedObjectStore
 }
+
+// objectStoreClusterCoordinatorFailedError refuses a node licensed for
+// clustering whose coordinator did not start (Raft or TLS, see the errors
+// above) on a shared bucket: it would run tiering, retention, continuous
+// queries and deletes ungated against the bucket every other node uses.
+// Shared-storage mode refuses the same state (#1606).
+const objectStoreClusterCoordinatorFailedError = "the cluster coordinator did not start (see the errors above) on a shared object-store bucket; " +
+	"without it tiering migration, retention, continuous queries and deletes would run on this node unconditionally against the shared bucket"

@@ -3866,6 +3866,29 @@ shared-storage nodes with replication off already did:
 `deploy/docker-compose/enterprise-shared` stack no longer sets it on its
 reader.
 
+### Fix: the Helm chart can run shared storage without the multi-writer licence ([#1606](https://github.com/Basekick-Labs/arc/issues/1606))
+
+The Enterprise chart's `storage.mode: shared` always set
+`cluster.shared_storage_mode`, which refuses to start without the
+`shared_storage_multi_writer` licence feature, even with a single writer.
+Its comment called the flag a no-op for one writer; it was not.
+
+The new value `storage.shared.multiWriter` chooses:
+- **`true`** (default, unchanged): Pattern 2 multi-writer.
+- **`false`**: single-writer shared storage. One elected primary takes every
+  write, the other writer pods are standbys that forward writes to it, and
+  `cluster.failover.enabled` replaces a lost primary. It needs the
+  `clustering` licence feature (and `writer_failover` for failover), not
+  `shared_storage_multi_writer`.
+
+The README documents both modes, and `NOTES.txt` names the one rendered.
+
+In that single-writer configuration, Arc now refuses to start a node licensed
+for clustering whose cluster coordinator did not start (Raft or TLS). It used
+to log a Warn and run tiering, retention, continuous queries and deletes
+ungated against the shared bucket. Shared-storage mode already refused this
+state. A node without a clustering licence still only warns.
+
 ### Fix: a single-writer cluster on an object store runs tiering on the primary only ([#1603](https://github.com/Basekick-Labs/arc/issues/1603))
 
 A cluster on an object-store backend without `cluster.shared_storage_mode` is
