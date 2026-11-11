@@ -91,3 +91,18 @@ func TestTieringGateWired(t *testing.T) {
 		}
 	}
 }
+
+func TestIgnoreReplicationOnObjectStore(t *testing.T) {
+	for _, tc := range []struct {
+		enabled, repl, objectStore, want bool
+	}{
+		{true, true, true, true},   // the shipped enterprise-shared reader
+		{true, true, false, false}, // Pattern 1: replication between disks
+		{true, false, true, false}, // nothing to ignore
+		{false, true, true, false}, // no cluster
+	} {
+		if got := ignoreReplicationOnObjectStore(tc.enabled, tc.repl, tc.objectStore); got != tc.want {
+			t.Errorf("cluster=%v replication=%v objectStore=%v: %v, want %v", tc.enabled, tc.repl, tc.objectStore, got, tc.want)
+		}
+	}
+}

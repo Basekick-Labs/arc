@@ -232,6 +232,9 @@ arc-reader2:
     ARC_CLUSTER_NODE_ID: "arc-reader2"
     ARC_CLUSTER_ROLE: "reader"
     ARC_CLUSTER_ADVERTISE_ADDR: "arc-reader2:9100"
+    # Readers join the cluster Raft too (replicated auth/RBAC); without
+    # this the reader falls back to standalone.
+    ARC_CLUSTER_RAFT_ADVERTISE_ADDR: "arc-reader2:9200"
   labels:
     <<: *traefik-reader-labels
   depends_on:

@@ -1035,7 +1035,7 @@ func main() {
 	// HEADs the whole manifest every catch-up interval and can hold the
 	// catch-up query gate shut on a file no peer can serve (#1605). Ignored
 	// here, before anything reads the flag, as Helm's shared mode does.
-	if cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled && cluster.IsSharedObjectStore(storageBackend) {
+	if ignoreReplicationOnObjectStore(cfg.Cluster.Enabled, cfg.Cluster.ReplicationEnabled, cluster.IsSharedObjectStore(storageBackend)) {
 		log.Warn().Str("backend", cfg.Storage.Backend).
 			Msg("cluster.replication_enabled is ignored on an object-store backend: every node already reads the shared bucket, so there is nothing to replicate. Set it to false to silence this")
 		cfg.Cluster.ReplicationEnabled = false
@@ -3948,7 +3948,9 @@ func main() {
 			gateEnabled = false
 		}
 		queryHandler.SetCluster(clusterCoordinator, gateEnabled)
-		if gateEnabled {
+		// Without replication (always the case on a shared object store,
+		// #1605) there is no catch-up batch and the gate never closes.
+		if gateEnabled && cfg.Cluster.ReplicationEnabled {
 			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until the startup catch-up batch settles")
 		}
 

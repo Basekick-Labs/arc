@@ -97,3 +97,12 @@ func tieringGateWired(sharedMode, replication, sharedObjectStore bool, backend, 
 		(localClusterWithoutReplication(true, backend, sharedMode, replication) &&
 			gateTieringInLocalClusterWithoutReplication(role))
 }
+
+// ignoreReplicationOnObjectStore reports whether cluster.replication_enabled
+// is turned off at startup: peer file replication copies files between
+// per-node disks, and on a shared object store every node already reads
+// every file (#1605). sharedObjectStore is cluster.IsSharedObjectStore of the
+// backend that was built.
+func ignoreReplicationOnObjectStore(clusterEnabled, replication, sharedObjectStore bool) bool {
+	return clusterEnabled && replication && sharedObjectStore
+}

@@ -1337,8 +1337,8 @@ func (c *Coordinator) startManifestCallbacksLocked() {
 			return
 		}
 	}
-	// A shared object store needs no puller (shared-storage deployments run
-	// with replication off: the Helm chart sets it), but every node still has
+	// A shared object store needs no puller (cmd/arc turns replication off
+	// there, #1605, as the Helm chart's shared mode does), but every node still has
 	// to hear the manifest's deletes: tiering's cold rows (#1349) and a DELETE
 	// rewrite's old file left out of reads (#1348) are per-node state. Both
 	// used to live only in the puller's callback, so they never ran there.
