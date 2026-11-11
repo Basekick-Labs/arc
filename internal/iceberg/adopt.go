@@ -88,7 +88,11 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 	dirLoc := strings.TrimSuffix(e.warehouse, "/") + "/" + nsKey + ".db/" + measurement + "/metadata"
 	if rowExists {
 		// Not path.Dir: it cleans "file:///x" to "file:/x" and "s3://b/x" to "s3:/b/x".
-		dirLoc = rowLoc[:strings.LastIndex(rowLoc, "/")]
+		slash := strings.LastIndex(rowLoc, "/")
+		if slash < 0 {
+			return false, nil // not a location this exporter wrote
+		}
+		dirLoc = rowLoc[:slash]
 	}
 	dirKey, ok := e.warehouseRelKey(dirLoc + "/version-hint.text")
 	if !ok {

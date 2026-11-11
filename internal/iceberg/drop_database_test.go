@@ -55,15 +55,11 @@ func TestDropDatabase_RemovesCatalogAndWarehouse(t *testing.T) {
 	if err := db.QueryRow("SELECT count(*) FROM iceberg_namespace_properties").Scan(&namespaces); err == nil && namespaces != 0 {
 		t.Fatalf("namespace properties = %d, want 0 after drop", namespaces)
 	}
-	// Only the drop marker is left (#1611): it tells other nodes still holding
-	// rows for these tables that the database was dropped.
 	entries, _ := os.ReadDir(nsDir)
-	if len(entries) != 1 || entries[0].Name() != droppedMarker {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
+	if len(entries) != 0 {
+		if _, statErr := os.Stat(nsDir); statErr == nil {
+			t.Fatalf("warehouse namespace dir still holds %d entries after drop", len(entries))
 		}
-		t.Fatalf("warehouse namespace dir holds %v after drop, want only %s", names, droppedMarker)
 	}
 
 	// Idempotence: dropping again, and dropping a never-exported database.

@@ -3864,11 +3864,15 @@ Now:
   whatever its version number. This holds on every backend, and also heals a
   row restored ahead of its warehouse files (#1613).
 - **Nothing published:** the row is forgotten and the table exported anew,
-  but only on a shared bucket in a cluster, and only when the delete left its
-  marker in the namespace. A standalone node keeps the existing error (restore
-  the warehouse: its whole-instance backup holds it).
+  but only on a shared bucket in a cluster, and only when the delete left a
+  drop marker for that table. Markers live under the reserved
+  `_iceberg_dropped/` root directory, which listings ignore and backups do not
+  copy. The delete writes them before deleting anything, so a failed delete,
+  re-run, writes them again. A table's marker is removed by its next
+  successful publish. A standalone node keeps the existing error (restore the
+  warehouse: its whole-instance backup holds it).
 - **Database delete:** removes the shared warehouse objects even on a node
-  that never exported the database, and leaves that marker.
+  that never exported the database.
 - **Paths:** a local warehouse path whose directories are gone is now matched
   through the same symlink resolution as the warehouse, so it is recognised.
 

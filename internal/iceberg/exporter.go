@@ -106,8 +106,9 @@ type Exporter struct {
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
-	// forgetDroppedRows: see dropped.go (#1611).
+	// forgetDroppedRows, markerCleared (guarded by publishedMu): see dropped.go (#1611).
 	forgetDroppedRows bool
+	markerCleared     map[string]struct{}
 	publishedMu       sync.Mutex
 	published         map[string]string
 
@@ -1681,6 +1682,7 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	}
 	if okAll {
 		e.markPublished(tbl.Identifier(), metaLoc)
+		e.clearDropMarker(ctx, tbl.Identifier())
 	}
 	return okAll
 }
@@ -1969,6 +1971,12 @@ func isAlreadyExists(err error) bool {
 // exported (or already cleaned) returns nil, so a re-run of the delete
 // converges.
 //
+// On a shared bucket (SetForgetDroppedRows) it first writes a drop marker per
+// table (dropped.go), so another node still holding a catalog row for one of
+// these tables forgets it instead of failing on its missing metadata; it then
+// deletes the warehouse objects even when this node never exported the
+// database, which is the usual case for the primary writer (#1611).
+//
 // Spoke-namespace pseudo-databases contain a path separator and are refused:
 // their namespace naming does not follow this mapping, and their lifecycle is
 // owned by edge-sync.
@@ -1978,15 +1986,14 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
 	}
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
+	nsKey := catalogNamespaceKey(ns)
 
-	// The SQL catalog's DropNamespace refuses non-empty namespaces, so drop
-	// every table first. Collect the first error but keep going: partial
-	// cleanup converges on the next delete attempt.
-	var firstErr error
-	// A node that never exported the database has no namespace in its own
-	// catalog, but on a shared bucket another node's tables are in the
-	// warehouse: the drop goes on to delete them (#1611). The primary writer,
-	// which runs the drop, is often not the node that exports.
+	// This node's tables. A node that never exported the database has no
+	// namespace in its own catalog, but on a shared bucket another node's
+	// tables are in the warehouse: the drop goes on to delete them (#1611).
+	// The primary writer, which runs the drop, is often not the node that
+	// exports.
+	var localTables []icetable.Identifier
 	hadLocalNamespace := true
 	for ident, err := range e.catalog.ListTables(ctx, ns) {
 		if err != nil {
@@ -1996,6 +2003,59 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 			}
 			return fmt.Errorf("list tables for drop: %w", err)
 		}
+		localTables = append(localTables, ident)
+	}
+
+	// The namespace's warehouse objects. Warehouse holds ONLY metadata (data
+	// files are Arc's own tree, already deleted by the caller).
+	//
+	// catalogNamespaceKey, not a second concatenation of nsPrefix and the database: the SQL
+	// catalog names a namespace directory after the key it stores, and for a namespace whose
+	// component contains a dot that key is JSON-encoded (#1129). Re-deriving the plain form
+	// here would list a directory that does not exist and leave the real one behind.
+	//
+	// relDir == "" means the namespace directory IS the storage root, so relDir+"/" would be
+	// "/", which the storage key contract refuses (#743); skip it.
+	var relDir string
+	var keys []string
+	if e.backend != nil {
+		if rd, ok := e.warehouseRelKey(e.warehouse + "/" + nsKey + ".db"); ok && rd != "" {
+			relDir = rd
+			var err error
+			if keys, err = e.backend.List(ctx, relDir+"/"); err != nil {
+				return fmt.Errorf("list warehouse metadata: %w", err)
+			}
+		}
+	}
+
+	// Drop markers first (dropped.go): a drop that fails after this point,
+	// re-run, lists what is left and writes them again; one that wrote none
+	// deleted nothing yet.
+	if e.forgetDroppedRows && e.backend != nil {
+		tables := map[string]struct{}{}
+		for _, ident := range localTables {
+			tables[ident[len(ident)-1]] = struct{}{}
+		}
+		for _, k := range keys {
+			if rest, ok := strings.CutPrefix(k, relDir+"/"); ok {
+				if table, _, ok := strings.Cut(rest, "/"); ok && table != "" {
+					tables[table] = struct{}{}
+				}
+			}
+		}
+		stamp := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
+		for table := range tables {
+			if err := e.backend.Write(ctx, droppedMarkerKey(nsKey, table), stamp); err != nil {
+				return fmt.Errorf("write the Iceberg drop marker for %s.%s: %w", nsKey, table, err)
+			}
+		}
+	}
+
+	// The SQL catalog's DropNamespace refuses non-empty namespaces, so drop
+	// every table first. Collect the first error but keep going: partial
+	// cleanup converges on the next delete attempt.
+	var firstErr error
+	for _, ident := range localTables {
 		if err := e.catalog.DropTable(ctx, ident); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("drop table %v: %w", ident, err)
 		}
@@ -2006,54 +2066,28 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
-	// Warehouse holds ONLY metadata (data files are Arc's own tree, already
-	// deleted by the caller); remove the namespace directory's objects via
-	// the backend so local and object-store warehouses behave alike.
-	if e.backend != nil {
-		// catalogNamespaceKey, not a second concatenation of nsPrefix and the database: the SQL
-		// catalog names a namespace directory after the key it stores, and for a namespace whose
-		// component contains a dot that key is JSON-encoded (#1129). Re-deriving the plain form
-		// here would list a directory that does not exist and leave the real one behind.
-		nsDirURI := e.warehouse + "/" + catalogNamespaceKey(ns) + ".db"
-		// relDir == "" means the namespace directory IS the storage root, so
-		// relDir+"/" would be "/", which the storage key contract refuses
-		// (#743). It listed empty before, and enumerating the whole root to
-		// delete it is not what this is for, so skip it.
-		if relDir, ok := e.warehouseRelKey(nsDirURI); ok && relDir != "" {
-			keys, err := e.backend.List(ctx, relDir+"/")
-			if err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("list warehouse metadata: %w", err)
+	// Remove the namespace directory's objects via the backend so local and
+	// object-store warehouses behave alike.
+	if relDir != "" {
+		dirs := map[string]bool{relDir: true}
+		for _, key := range keys {
+			if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
 			}
-			dirs := map[string]bool{relDir: true}
-			for _, key := range keys {
-				if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
-					firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
-				}
-				for d := path.Dir(key); len(d) > len(relDir); d = path.Dir(d) {
-					dirs[d] = true
-				}
+			for d := path.Dir(key); len(d) > len(relDir); d = path.Dir(d) {
+				dirs[d] = true
 			}
-			// RemoveDirectory is non-recursive, so sweep the now-empty
-			// directory tree deepest-first (object stores no-op here).
-			if remover, ok := e.backend.(storage.DirectoryRemover); ok {
-				ordered := make([]string, 0, len(dirs))
-				for d := range dirs {
-					ordered = append(ordered, d)
-				}
-				sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
-				for _, d := range ordered {
-					_ = remover.RemoveDirectory(ctx, d)
-				}
+		}
+		// RemoveDirectory is non-recursive, so sweep the now-empty
+		// directory tree deepest-first (object stores no-op here).
+		if remover, ok := e.backend.(storage.DirectoryRemover); ok {
+			ordered := make([]string, 0, len(dirs))
+			for d := range dirs {
+				ordered = append(ordered, d)
 			}
-			// Tell nodes still holding catalog rows for these tables that
-			// the database was dropped, so a dead row with nothing published
-			// is forgotten rather than refused (dropped.go). Only when there
-			// was something to drop: a database Iceberg never exported gets
-			// no marker.
-			if err == nil && (len(keys) > 0 || hadLocalNamespace) {
-				if werr := e.backend.Write(ctx, path.Join(relDir, droppedMarker), []byte(time.Now().UTC().Format(time.RFC3339)+"\n")); werr != nil && firstErr == nil {
-					firstErr = fmt.Errorf("write the Iceberg drop marker: %w", werr)
-				}
+			sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+			for _, d := range ordered {
+				_ = remover.RemoveDirectory(ctx, d)
 			}
 		}
 	}

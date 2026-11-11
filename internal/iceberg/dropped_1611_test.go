@@ -29,6 +29,7 @@ func exportedThenDropped(t *testing.T, passes int) (*warehouseRig, *Exporter, *E
 			t.Fatal(err)
 		}
 	}
+	a.SetForgetDroppedRows(true) // a shared bucket: the drop leaves markers
 	if err := a.DropDatabase(context.Background(), "mydb"); err != nil {
 		t.Fatalf("DropDatabase: %v", err)
 	}
@@ -99,7 +100,7 @@ func TestDeadRow_NothingPublished(t *testing.T) {
 			r, _, b := exportedThenDropped(t, 2)
 			b.SetForgetDroppedRows(tc.forget)
 			if tc.removeMarker {
-				if err := os.Remove(filepath.Join(r.root, "arc_mydb.db", droppedMarker)); err != nil {
+				if err := os.Remove(filepath.Join(r.root, filepath.FromSlash(droppedMarkerKey("arc_mydb", "cpu")))); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -127,6 +128,7 @@ func TestDeadRow_NothingPublished(t *testing.T) {
 func TestDropDatabase_WithoutALocalNamespaceDropsTheSharedWarehouse(t *testing.T) {
 	r := newWarehouseRig(t)
 	exporter, primary := r.node(true), r.node(true)
+	primary.SetForgetDroppedRows(true)
 	r.addFile()
 	if err := r.reconcile(exporter); err != nil {
 		t.Fatal(err)
@@ -137,18 +139,118 @@ func TestDropDatabase_WithoutALocalNamespaceDropsTheSharedWarehouse(t *testing.T
 	if _, err := os.Stat(r.metaDir()); !os.IsNotExist(err) {
 		t.Fatalf("table metadata still in the warehouse after the drop (stat err %v)", err)
 	}
-	if _, err := os.Stat(filepath.Join(r.root, "arc_mydb.db", droppedMarker)); err != nil {
+	if _, err := os.Stat(filepath.Join(r.root, filepath.FromSlash(droppedMarkerKey("arc_mydb", "cpu")))); err != nil {
 		t.Fatalf("no drop marker: %v", err)
+	}
+	// The namespace directory is gone: no ghost database in the listings.
+	if _, err := os.Stat(filepath.Join(r.root, "arc_mydb.db")); !os.IsNotExist(err) {
+		t.Fatalf("namespace directory left behind (stat err %v)", err)
 	}
 }
 
 // A database Iceberg never exported gets no marker.
 func TestDropDatabase_NeverExportedLeavesNoMarker(t *testing.T) {
 	r := newWarehouseRig(t)
-	if err := r.node(true).DropDatabase(context.Background(), "neverexported"); err != nil {
+	n := r.node(true)
+	n.SetForgetDroppedRows(true)
+	if err := n.DropDatabase(context.Background(), "neverexported"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(r.root, "arc_neverexported.db")); !os.IsNotExist(err) {
 		t.Fatalf("a never-exported database left a warehouse directory (stat err %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, droppedMarkerRoot)); !os.IsNotExist(err) {
+		t.Fatalf("a never-exported database left a drop marker (stat err %v)", err)
+	}
+}
+
+// A table's drop marker is removed by its next successful publish: from then
+// on a lagging node follows the published version, and a later loss of the
+// table is the #637 error again.
+func TestDropMarker_ClearedByTheNextPublish(t *testing.T) {
+	r, a, _ := exportedThenDropped(t, 2)
+	marker := filepath.Join(r.root, filepath.FromSlash(droppedMarkerKey("arc_mydb", "cpu")))
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("no marker after the drop: %v", err)
+	}
+	r.addFile()
+	if err := r.reconcile(a); err != nil { // the recreated table's first publish
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("marker still there after the table was published again (stat err %v)", err)
+	}
+}
+
+// Markers are written before anything is deleted: a drop whose marker write
+// fails deletes nothing, and the re-run writes the marker and deletes.
+func TestDropDatabase_MarkerFailureDeletesNothingAndTheRerunConverges(t *testing.T) {
+	r := newWarehouseRig(t)
+	exporter := r.node(true)
+	r.addFile()
+	if err := r.reconcile(exporter); err != nil {
+		t.Fatal(err)
+	}
+	// A plain file where the marker root directory should be: the marker
+	// write cannot create its directory.
+	blocker := filepath.Join(r.root, droppedMarkerRoot)
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	primary := r.node(true)
+	primary.SetForgetDroppedRows(true)
+	if err := primary.DropDatabase(context.Background(), "mydb"); err == nil {
+		t.Fatal("DropDatabase succeeded although its marker write failed")
+	}
+	if _, err := os.Stat(r.metaDir()); err != nil {
+		t.Fatalf("the failed drop deleted warehouse objects: %v", err)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := primary.DropDatabase(context.Background(), "mydb"); err != nil {
+		t.Fatalf("re-run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, filepath.FromSlash(droppedMarkerKey("arc_mydb", "cpu")))); err != nil {
+		t.Fatalf("re-run wrote no marker: %v", err)
+	}
+	if _, err := os.Stat(r.metaDir()); !os.IsNotExist(err) {
+		t.Fatalf("re-run left the table's metadata (stat err %v)", err)
+	}
+}
+
+// A path under a symlinked warehouse whose directories are gone resolves in
+// the warehouse's spelling, on any OS (#1611: a dropped table's row).
+func TestResolveFileURI_ResolvesTheNearestExistingAncestor(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	realResolved, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resolveFileURI(localFileURI(filepath.Join(link, "gone", "deeper", "00001-x.metadata.json")))
+	want := localFileURI(filepath.Join(realResolved, "gone", "deeper", "00001-x.metadata.json"))
+	if got != want {
+		t.Fatalf("resolveFileURI = %q, want %q", got, want)
+	}
+}
+
+// A catalog row whose location has no "/" (not one this exporter wrote) is
+// reported, not a panic in the recovery path.
+func TestDeadRow_LocationWithoutASlashIsAnError(t *testing.T) {
+	r := newWarehouseRig(t)
+	b := r.node(true)
+	r.addFile()
+	if err := r.reconcile(b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.db.Exec(`UPDATE iceberg_tables SET metadata_location = 'x'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := b.tableSeed(context.Background(), "mydb", "cpu"); err == nil {
+		t.Fatal("tableSeed succeeded on a row with an unusable location")
 	}
 }

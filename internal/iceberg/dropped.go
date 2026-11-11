@@ -20,10 +20,19 @@ package iceberg
 //     also heals a row a backup restored without its file (#1613).
 //   - Nothing published: the row is forgotten (and the table re-adopted or
 //     created) only where forgetDroppedRows is set (a shared bucket with a
-//     cluster coordinator) and DropDatabase left its marker in the namespace
-//     directory. Elsewhere, a standalone node above all, the #637 error stands:
-//     no other node can drop its rows, and its whole-instance backup holds the
-//     warehouse, so "restore it" is the right answer.
+//     cluster coordinator) and the table carries a drop marker. Elsewhere, a
+//     standalone node above all, the #637 error stands: no other node can drop
+//     its rows, and its whole-instance backup holds the warehouse, so "restore
+//     it" is the right answer.
+//
+// The drop marker is one object per dropped table under a reserved root
+// directory (droppedMarkerRoot): reserved roots are not databases to any
+// listing, and backups do not copy them, so a restore never brings one back.
+// DropDatabase writes the markers before it deletes anything, so a drop that
+// fails part way, re-run, writes them again; and only where forgetDroppedRows
+// is set. A table's marker is removed by its next successful publish: from
+// then on a lagging node follows the published version and needs no marker,
+// and a later loss of that table (a wiped prefix) is the #637 error again.
 
 import (
 	"context"
@@ -31,18 +40,47 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
 
 	icetable "github.com/apache/iceberg-go/table"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
-// droppedMarker is written by DropDatabase into the namespace directory once
-// it has deleted the namespace's warehouse objects. The data walk skips the
-// namespace directory and backups copy only metadata/ directories, so a
-// restore never brings one back.
-const droppedMarker = "_arc_dropped"
+// droppedMarkerRoot is the reserved root directory holding drop markers,
+// <root>/<escaped namespace key>/<escaped table>.
+const droppedMarkerRoot = "_iceberg_dropped"
+
+// droppedMarkerKey is the storage key of a table's drop marker.
+func droppedMarkerKey(nsKey, measurement string) string {
+	return droppedMarkerRoot + "/" + url.PathEscape(nsKey) + "/" + url.PathEscape(measurement)
+}
+
+// clearDropMarker removes a table's drop marker after a successful publish,
+// at most once per table per process.
+func (e *Exporter) clearDropMarker(ctx context.Context, ident icetable.Identifier) {
+	if !e.forgetDroppedRows || e.backend == nil {
+		return
+	}
+	key := strings.Join(ident, "\x00")
+	e.publishedMu.Lock()
+	if e.markerCleared == nil {
+		e.markerCleared = make(map[string]struct{})
+	}
+	_, done := e.markerCleared[key]
+	e.markerCleared[key] = struct{}{}
+	e.publishedMu.Unlock()
+	if done {
+		return
+	}
+	marker := droppedMarkerKey(catalogNamespaceKey(ident[:len(ident)-1]), ident[len(ident)-1])
+	if err := e.backend.Delete(ctx, marker); err != nil && !storage.IsNotFound(err) {
+		e.logger.Debug().Err(err).Str("key", marker).Msg("Iceberg: could not remove a drop marker after publishing; retried next process")
+	}
+}
 
 // SetForgetDroppedRows lets a dead catalog row with nothing published be
 // forgotten when the namespace carries DropDatabase's marker (a shared bucket
@@ -79,22 +117,28 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 	if err != nil || !rowExists {
 		return false, err
 	}
-	dirLoc := rowLoc[:strings.LastIndex(rowLoc, "/")]
+	slash := strings.LastIndex(rowLoc, "/")
+	if slash < 0 {
+		return false, nil // not a location this exporter wrote
+	}
+	dirLoc := rowLoc[:slash]
 	dirKey, ok := e.warehouseRelKey(dirLoc + "/version-hint.text")
 	if !ok {
 		return false, nil // a warehouse outside the storage root: nothing to read
 	}
 	dirKey = path.Dir(dirKey)
 
-	target, err := e.readHint(ctx, dirKey)
+	// The newer of the hint and the newest v<N>: a writer that published
+	// v<N> and failed to write the hint left the hint behind.
+	hint, err := e.readHint(ctx, dirKey)
 	if err != nil {
 		return false, err
 	}
-	if target < 0 {
-		if target, err = e.newestPublished(ctx, dirKey); err != nil {
-			return false, err
-		}
+	newest, err := e.newestPublished(ctx, dirKey)
+	if err != nil {
+		return false, err
 	}
+	target := max(hint, newest)
 	if target >= 0 {
 		vKey := path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
 		body, err := e.backend.Read(ctx, vKey)
@@ -117,8 +161,7 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 	if !e.forgetDroppedRows {
 		return false, nil
 	}
-	// The namespace directory: <ns>.db/<measurement>/metadata.
-	marker := path.Join(path.Dir(path.Dir(dirKey)), droppedMarker)
+	marker := droppedMarkerKey(nsKey, measurement)
 	dropped, err := e.backend.Exists(ctx, marker)
 	if err != nil {
 		return false, fmt.Errorf("check Iceberg drop marker %s: %w", marker, err)
@@ -131,8 +174,8 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 	}
 	e.logger.Warn().Str("table", strings.Join(ident, ".")).Str("missing", rowLoc).
 		Msg("Iceberg: forgot this node's catalog row for a table whose database another node dropped; the table is exported again as a new table")
-	// A migrated (#1129) row lived in a legacy directory: look for a table
-	// published at the canonical one before a load creates one.
+	// With no row, a table published at the canonical directory since is
+	// adopted before a load creates one.
 	if _, err := e.adoptPublished(ctx, ident, nsKey, measurement); err != nil {
 		return true, err
 	}
