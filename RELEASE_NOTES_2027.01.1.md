@@ -3843,6 +3843,39 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: Iceberg export recovers after a database is dropped and recreated on a shared bucket ([#1611](https://github.com/Basekick-Labs/arc/issues/1611))
+
+A database delete runs on the primary writer. On a shared bucket it deleted
+the database's Iceberg warehouse objects, which every node shares, but only
+the primary's own catalog rows. Another node that had exported the table (a
+former compactor-lease holder) kept rows pointing at deleted metadata. Once
+the database was recreated, that node's export of the table failed on every
+pass with "the table is in the catalog but its metadata file is missing",
+until an operator deleted the row by hand.
+
+When a node had never exported the database, which is the usual case for a
+primary writer when another node holds the export, the delete did nothing to
+Iceberg at all: the old table's history carried on after a recreate. It still
+logged that the Iceberg artefacts had been removed.
+
+Now:
+- **Missing metadata:** when a catalog row's metadata file is gone and the
+  warehouse publishes the table, the row moves onto the published version,
+  whatever its version number. This holds on every backend, and also heals a
+  row restored ahead of its warehouse files (#1613).
+- **Nothing published:** the row is forgotten and the table exported anew,
+  but only on a shared bucket in a cluster, and only when the delete left a
+  drop marker for that table. Markers live under the reserved
+  `_iceberg_dropped/` root directory, which listings ignore and backups do not
+  copy. The delete writes them before deleting anything, so a failed delete,
+  re-run, writes them again. A table's marker is removed by its next
+  successful publish. A standalone node keeps the existing error (restore the
+  warehouse: its whole-instance backup holds it).
+- **Database delete:** removes the shared warehouse objects even on a node
+  that never exported the database.
+- **Paths:** a local warehouse path whose directories are gone is now matched
+  through the same symlink resolution as the warehouse, so it is recognised.
+
 ### Fix: Iceberg export on a shared bucket without `shared_storage_mode` ([#1609](https://github.com/Basekick-Labs/arc/issues/1609))
 
 On a cluster whose nodes share an S3 bucket without

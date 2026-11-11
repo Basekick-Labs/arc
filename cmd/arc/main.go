@@ -4337,6 +4337,10 @@ func main() {
 		icebergTopo := icebergTopologyFor(cfg.Cluster.SharedStorageMode, cluster.IsSharedObjectStore(storageBackend),
 			clusterCoordinator != nil, clusterCoordinator != nil && clusterCoordinator.HasCompactorFailover(), compactionGate != nil)
 		exporter.SetWarehouseAuthoritative(icebergTopo.authoritative)
+		// A catalog row whose metadata another node's database DROP removed is forgotten,
+		// not refused, on a shared bucket with a coordinator (#1611); a standalone node keeps
+		// the #637 error. Same condition as the manifest barrier.
+		exporter.SetForgetDroppedRows(icebergTopo.barrier)
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))

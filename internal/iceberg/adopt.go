@@ -88,7 +88,11 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 	dirLoc := strings.TrimSuffix(e.warehouse, "/") + "/" + nsKey + ".db/" + measurement + "/metadata"
 	if rowExists {
 		// Not path.Dir: it cleans "file:///x" to "file:/x" and "s3://b/x" to "s3:/b/x".
-		dirLoc = rowLoc[:strings.LastIndex(rowLoc, "/")]
+		slash := strings.LastIndex(rowLoc, "/")
+		if slash < 0 {
+			return false, nil // not a location this exporter wrote
+		}
+		dirLoc = rowLoc[:slash]
 	}
 	dirKey, ok := e.warehouseRelKey(dirLoc + "/version-hint.text")
 	if !ok {
@@ -211,6 +215,11 @@ func (e *Exporter) publishedMatchesRow(ctx context.Context, dirKey string, rowN 
 	}
 	own, err := e.backend.Read(ctx, rowKey)
 	if err != nil {
+		if storage.IsNotFound(err) {
+			// The row's own file is gone (#1611: the table was dropped and recreated by
+			// another node): it is not the published version, so the caller takes that.
+			return false, true, nil
+		}
 		return false, true, fmt.Errorf("read the catalog's Iceberg metadata %s: %w", rowKey, err)
 	}
 	return bytes.Equal(own, published), true, nil

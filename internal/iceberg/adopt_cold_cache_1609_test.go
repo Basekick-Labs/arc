@@ -54,12 +54,14 @@ func TestTableSeed_AdoptsBeforeLoadingAPrunedRow(t *testing.T) {
 	}
 }
 
-// Without an authoritative warehouse (local storage) nothing changes: the
-// load of a row whose metadata is gone still fails, as before.
-func TestTableSeed_NonAuthoritativeStillFailsOnAPrunedRow(t *testing.T) {
-	_, b := staleRowWithPrunedMetadata(t, false)
-	if _, _, _, err := b.tableSeed(context.Background(), "mydb", "cpu"); err == nil {
-		t.Fatal("tableSeed succeeded without adoption on a row whose metadata is gone")
+// Without an authoritative warehouse (local storage) a row whose metadata is
+// gone is still recovered when the warehouse publishes the table: the load
+// fails, and recoverDeadRow moves the row onto the published version (#1611).
+func TestTableSeed_NonAuthoritativeRecoversAPrunedRowFromThePublishedVersion(t *testing.T) {
+	r, b := staleRowWithPrunedMetadata(t, false)
+	_, files, ok, err := b.tableSeed(context.Background(), "mydb", "cpu")
+	if err != nil || !ok || len(files) != len(r.files()) {
+		t.Fatalf("tableSeed: ok %v, %d files, err %v; want the published table", ok, len(files), err)
 	}
 }
 
