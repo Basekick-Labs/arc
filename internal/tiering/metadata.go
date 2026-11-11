@@ -1281,6 +1281,26 @@ func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier 
 	return true, nil
 }
 
+// RetireColdRowIfUnquarantined deletes path's row only while it is cold and
+// not quarantined, and invalidates its tier-cache scope. Reports whether a
+// row was deleted. A quarantined row is the record that a key is unusable
+// (#758) and is never retired here.
+func (s *MetadataStore) RetireColdRowIfUnquarantined(ctx context.Context, path string) (bool, error) {
+	database, measurement, found, err := s.deleteReturningScope(ctx,
+		`DELETE FROM tier_files WHERE path = ? AND tier = ? AND quarantined_at IS NULL RETURNING database, measurement`,
+		path, string(TierCold))
+	if err != nil {
+		return false, fmt.Errorf("failed to retire cold row: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+	if database != "" && measurement != "" {
+		s.invalidateTierCache(database, measurement)
+	}
+	return true, nil
+}
+
 // hotRowsPage returns up to limit hot rows that are not quarantined, with an
 // id above afterID, in id order: the stale-row walk reads them a page at a
 // time rather than every hot row in one statement, which held the store's

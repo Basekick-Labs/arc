@@ -29,6 +29,9 @@ type Manager struct {
 	// production. It lets a test cancel at an exact point inside the fallback
 	// instead of polling for a row that a fast runner may finish past.
 	afterColdFallbackRow func()
+	// beforeReaderColdRetire is a test seam: when set, a reader's retirement
+	// pass calls it between its check of a cold row and the delete (#1563).
+	beforeReaderColdRetire func(path string)
 
 	// onMigrationComplete, when set, runs after a migration cycle that moved
 	// or deleted at least one tier file. The query layer uses it to invalidate
@@ -1211,10 +1214,15 @@ const coldTierMetadataBatchSize = 1000
 // already-migrated files as candidates.
 //
 // Rows are normally only added or flipped to cold. A cold row whose object is
-// gone is reported, never reverted, for the same reason the hot scan never
-// downgrades (#683): the object may be mid-move, and a hot copy is still
-// read through the hot glob. Redundant cold objects are removed only when
-// this node is the primary and the metadata row is still hot.
+// gone is left to the primary on a standalone node or the primary writer,
+// whose DELETE and retention runs retire it, and is reported there (#1551).
+// On a cluster reader, nothing else ever would: it is pointed back at a hot
+// copy that the manifest still lists, or retired when neither copy exists
+// (#1563, cold_retire_reader.go). Neither can act on an object that is
+// mid-move, because every cold writer writes the object before the row and
+// both re-check the object at the moment they act. Redundant cold objects are
+// removed only when this node is the primary and the metadata row is still
+// hot.
 // Returns how many rows changed.
 //
 // Rows are written in transactions of coldTierMetadataBatchSize, and the tier
@@ -1272,9 +1280,12 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// db/measurement/**/*.parquet, so an object under one of them that this
 	// sync cannot parse is cold data with no row (#1550).
 	coldScopes := make(map[string]struct{})
+	// Cold rows per scope, for the share a reader's retirement takes (#1563).
+	coldRowsByScope := make(map[string]int)
 	for path := range unseen {
 		if scope, ok := measurementScope(path); ok {
 			coldScopes[scope] = struct{}{}
+			coldRowsByScope[scope]++
 		}
 	}
 	cleaned := m.cleanupHotOnlyColdCopies(ctx, objects, unseen)
@@ -1458,9 +1469,17 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// unseen now holds exactly those: every listed path was deleted from it
 	// above, and it never held a quarantined row. The database is the key's
 	// first segment, as every writer of a tier row lays it out.
+	//
+	// For every database on a cluster reader, not only hot-only ones (#1563):
+	// the primary's DELETE and retention point such a row back at its hot
+	// copy, and nothing tells a reader. A reader that kept it cold refused its
+	// own hot registration over it, and a measurement whose only hot file it
+	// was lost its hot glob on that reader. During a migration the cold
+	// object exists, so the row is not in unseen; once the primary flips the
+	// row, the manifest entry is gone, so the size match below fails.
 	for path, size := range unseen {
 		database, _, _ := strings.Cut(path, "/")
-		if !m.IsHotOnly(ctx, database) {
+		if !m.IsHotOnly(ctx, database) && !m.roleGated() {
 			continue
 		}
 		if m.manifest != nil {
@@ -1487,6 +1506,27 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		}
 	}
 
+	// A cluster reader retires what the primary removed (#1563).
+	if len(unseen) > 0 && m.roleGated() {
+		if ok, why := m.readerRetireAllowed(authGen, objectCount); !ok {
+			m.logger.Warn().Int("rows", len(unseen)).Str("reason", why).
+				Msg("Cold tier rows have no object in cold storage; not retiring them on this reader")
+		} else {
+			res := m.retireUnseenColdRows(ctx, unseen)
+			synced += res.retired
+			if res.retired > 0 {
+				m.logger.Info().Int("retired", res.retired).Strs("sample", res.sample).
+					Int("left", res.kept+res.unchecked).Int("unchecked", res.unchecked).
+					Msg("Retired cold tier rows whose cold object and hot copy are both gone (removed by the primary, or outside Arc)")
+			}
+			for scope, n := range res.byScope {
+				if total := coldRowsByScope[scope]; total > 0 && 2*n > total {
+					m.logger.Warn().Str("scope", scope).Int("retired", n).Int("cold_rows", total).
+						Msg("This sync retired more than half of a measurement's cold rows. Expected after a large DELETE or retention run on the primary; otherwise check for a bucket lifecycle/expiry rule or deletes outside Arc on the cold prefix")
+				}
+			}
+		}
+	}
 	if len(unseen) > 0 {
 		sample := make([]string, 0, 5)
 		for p := range unseen {
@@ -1498,7 +1538,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		m.logger.Warn().
 			Int("count", len(unseen)).
 			Strs("sample", sample).
-			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read)")
+			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read). A cluster reader retires those with no hot copy once it can confirm both are gone")
 	}
 	m.checkMissingColdObjects(ctx, unseen)
 	seed.finish(ctx, m)

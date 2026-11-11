@@ -12,9 +12,9 @@ package tiering
 // counted, split by whether a hot copy still serves it.
 //
 // Counted only where this node's rows follow the store: a standalone node or
-// the cluster's primary writer. A reader never removes a cold row the primary
-// deleted (#1563), so on a reader every normal cold DELETE or retention would
-// read as data loss.
+// the cluster's primary writer. A reader cannot tell the primary's cold
+// DELETE or retention from a loss: it retires such rows instead, once both
+// copies are confirmed gone (#1563, cold_retire_reader.go).
 //
 // A cold DELETE, retention run or database delete removes each object
 // before its row, and so does the migrator when a compaction took a file
@@ -162,23 +162,30 @@ func (m *Manager) publishColdMissing(st *ColdMissingObjectsStatus, started time.
 // neither copy exists. hotCopy: the row is still cold, its cold object is
 // gone and the hot copy exists. ok is false when a check failed.
 func (m *Manager) recheckColdRow(ctx context.Context, path string) (lost, hotCopy, ok bool) {
+	_, lost, hotCopy, ok = m.recheckColdRowFull(ctx, path)
+	return lost, hotCopy, ok
+}
+
+// recheckColdRowFull is recheckColdRow, also returning the row it read when
+// that row is still a cold, unquarantined one.
+func (m *Manager) recheckColdRowFull(ctx context.Context, path string) (row *FileMetadata, lost, hotCopy, ok bool) {
 	inCold, err := m.coldBackend.Exists(ctx, path)
 	if err != nil {
-		return false, false, false
+		return nil, false, false, false
 	}
 	if inCold {
-		return false, false, true // written after the listing
+		return nil, false, false, true // written after the listing
 	}
-	row, err := m.metadata.GetFile(ctx, path)
+	row, err = m.metadata.GetFile(ctx, path)
 	if err != nil {
-		return false, false, false
+		return nil, false, false, false
 	}
 	if row == nil || row.Tier != TierCold || row.QuarantinedAt != nil {
-		return false, false, true // retired, reverted or quarantined since
+		return nil, false, false, true // retired, reverted or quarantined since
 	}
 	inHot, err := m.hotBackend.Exists(ctx, path)
 	if err != nil {
-		return false, false, false
+		return nil, false, false, false
 	}
-	return !inHot, inHot, true
+	return row, !inHot, inHot, true
 }

@@ -90,7 +90,8 @@ func (m *Manager) PrepareDatabaseDelete(ctx context.Context, database string, ho
 	// manifestReasonDatabaseDelete deliberately omits manifestReasonPrefix:
 	// the prefix is what makes a peer treat an unlink as a migration and probe
 	// the cold tier, which would mark this file cold moments before the cold
-	// object is deleted -- a permanent orphan row. Without it the peer goes
+	// object is deleted -- an orphan row that stays until the peer's next cold
+	// sync retires it (#1563), and forever on a peer that does not. Without it the peer goes
 	// straight to retireHotRow, which is what a genuine removal wants. Do not
 	// "fix" the inconsistency with its neighbours.
 	for start := 0; start < len(ordered); start += manifestChunk {

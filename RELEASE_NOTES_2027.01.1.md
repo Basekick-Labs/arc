@@ -3843,6 +3843,42 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: cluster readers retire cold rows the primary removed ([#1563](https://github.com/Basekick-Labs/arc/issues/1563))
+
+A cold `DELETE`, a retention run or a database delete runs on the primary
+writer. It removed the cold objects and the primary's own tier rows, and
+nothing removed the rows on readers. Every reader kept them for good. Each
+cycle it logged `Cold tier rows have no object in cold storage`, and a reader
+promoted by failover reported those rows as lost data (#1551).
+
+A reader's cold-tier sync now retires such a row itself. It acts only when the
+cold object and the hot copy are both still absent at the moment it acts, and
+the row is still cold and not quarantined, the same evidence the primary's
+`DELETE` and retention act on. After each retirement it checks the cold
+object again: if the object is there, a writer raced the check, and the row
+is written back.
+
+A reader retires nothing in these cases, and logs why:
+- a restore is running on it;
+- the cluster's cold mark was seeded from a different cold store than its own
+  (#1552);
+- the store identity is unknown and the cold listing came back empty.
+
+The pass is bounded by time, not by row count, so a day of retention clears in
+one sync.
+
+A cold row whose object is gone but whose hot copy the manifest still lists is
+now pointed back at hot on readers too, as the primary does. Before, that
+happened only for hot-only databases. A reader that kept such a row cold
+refused its own hot registration over it, so a measurement whose only hot file
+it was could not be read on that reader.
+
+New counter: `arc_tiering_cold_rows_retired_by_reader_total`. A reader cannot
+tell the primary's removal from an object deleted outside Arc (a bucket
+lifecycle rule). The primary still reports the latter as lost for as long as it
+leads. After a failover, the new primary no longer does, because its rows were
+retired while it was a reader.
+
 ### Fix: an unknown MQTT subscription ID is answered `404`
 
 `/api/v1/mqtt/subscriptions/{id}` answered an ID with no stored subscription
