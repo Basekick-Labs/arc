@@ -56,3 +56,38 @@ func TestGateTieringInLocalClusterWithoutReplication(t *testing.T) {
 		}
 	}
 }
+
+func TestObjectStoreCluster(t *testing.T) {
+	for _, tc := range []struct {
+		enabled bool
+		backend string
+		want    bool
+	}{
+		{false, "s3", false}, {true, "local", false}, {true, "", false},
+		{true, "s3", true}, {true, "minio", true}, {true, "azure", true}, {true, "azblob", true}, {true, "gcs", true},
+	} {
+		if got := objectStoreCluster(tc.enabled, tc.backend); got != tc.want {
+			t.Errorf("enabled=%v backend=%q: %v, want %v", tc.enabled, tc.backend, got, tc.want)
+		}
+	}
+}
+
+func TestTieringGateWired(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		shared, repl, objectStore bool
+		backend, role             string
+		want                      bool
+	}{
+		{"Pattern 2 (flag)", true, false, true, "s3", "writer", true},
+		{"single-writer Pattern 2, no flag (#1603)", false, false, true, "s3", "writer", true},
+		{"single-writer Pattern 2, no flag, reader", false, false, true, "minio", "reader", true},
+		{"Pattern 1 (replication)", false, true, false, "local", "writer", true},
+		{"local, no replication, writer (#1599)", false, false, false, "local", "writer", false},
+		{"local, no replication, reader (#1599)", false, false, false, "local", "reader", true},
+	} {
+		if got := tieringGateWired(tc.shared, tc.repl, tc.objectStore, tc.backend, tc.role); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

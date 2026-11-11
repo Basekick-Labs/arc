@@ -45,3 +45,55 @@ func localClusterWithoutReplicationWarning() string {
 func gateTieringInLocalClusterWithoutReplication(role string) bool {
 	return role == "reader" || role == "compactor"
 }
+
+// A cluster on an object-store backend without cluster.shared_storage_mode
+// (#1603) is the single-writer form of Pattern 2: every node reads and writes
+// one bucket, one primary writer is elected through Raft, and the router and
+// the ingest fence send writes to it. It needs no multi-writer licence
+// (internal/license: "Single-writer Pattern 2 deployments do NOT require this
+// flag"). The bucket is shared, so tiering is gated as in shared-storage mode:
+// main.go decides that from the backend it built, as reconciliation and the
+// manifest delete callbacks already do, not from the flag.
+
+// objectStoreCluster reports a cluster whose hot storage is an object store,
+// whatever cluster.shared_storage_mode says. backend is the configured
+// storage.backend, lowercased at load. "Not local" is safe as a test because
+// the set is closed: any other value is refused at load, so every non-local
+// value is an object store.
+func objectStoreCluster(clusterEnabled bool, backend string) bool {
+	return clusterEnabled && backend != "" && backend != "local"
+}
+
+// objectStoreClusterStandaloneRoleError is the startup refusal for a
+// standalone-role node in an object-store cluster without shared-storage
+// mode, which refuses that role itself. Such a node never passes the
+// primary-writer gate, so tiering, retention, continuous queries and deletes
+// would run on no node.
+const objectStoreClusterStandaloneRoleError = "a cluster on an object-store backend requires cluster.role to be writer, reader or compactor; " +
+	"a standalone-role node never passes the primary-writer gate, so tiering migration, retention, continuous queries and deletes would run on no node"
+
+// objectStoreClusterNoRaftWarning is logged when such a cluster has no Raft
+// (cluster.raft_data_dir empty): no primary writer is elected, so every
+// writer-role node accepts writes and runs tiering, retention, continuous
+// queries and deletes against the one bucket.
+const objectStoreClusterNoRaftWarning = "This cluster shares an object-store bucket but cluster.raft_data_dir is empty, so no primary writer is elected: " +
+	"every writer-role node accepts writes and runs tiering migration, retention, continuous queries and deletes against the shared bucket. " +
+	"Set cluster.raft_data_dir on every node"
+
+// objectStoreClusterNoCoordinatorWarning is logged when cluster.enabled is set
+// on an object-store backend but the coordinator is not running (no
+// clustering licence, or it failed to start, see the errors above). Shared-
+// storage mode refuses to start in that state; this configuration runs, with
+// nothing gating it.
+const objectStoreClusterNoCoordinatorWarning = "cluster.enabled is set on an object-store backend but the cluster coordinator is not running (see the log above): " +
+	"this node runs tiering migration, retention, continuous queries and deletes against the shared bucket unconditionally, as if no other node used it"
+
+// tieringGateWired reports whether a cluster node's tiering gets the writer
+// gate. sharedObjectStore is cluster.IsSharedObjectStore of the backend that
+// was built: a hot bucket is shared whether or not shared_storage_mode is set
+// (#1603). role is the node's resolved role.
+func tieringGateWired(sharedMode, replication, sharedObjectStore bool, backend, role string) bool {
+	return sharedMode || replication || sharedObjectStore ||
+		(localClusterWithoutReplication(true, backend, sharedMode, replication) &&
+			gateTieringInLocalClusterWithoutReplication(role))
+}

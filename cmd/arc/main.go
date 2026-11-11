@@ -1079,6 +1079,20 @@ func main() {
 			Str("backend", cfg.Storage.Backend).
 			Msg("Pattern 2 shared-storage multi-writer mode enabled (singleton tasks gate on Raft leader; writer failover suppressed)")
 	}
+	// The single-writer form of Pattern 2: an object-store cluster without
+	// the flag (#1603). Shared-storage mode refuses a standalone role above;
+	// so does this, for the same reason, but only with a clustering licence:
+	// without one no coordinator is built, nothing is gated, and the node
+	// runs as a standalone node does (the no-coordinator Warn below says so).
+	// No Raft means no elected primary.
+	if objectStoreCluster(cfg.Cluster.Enabled, cfg.Storage.Backend) && !cfg.Cluster.SharedStorageMode {
+		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone && licenseHasClustering(licenseClient) {
+			log.Fatal().Str("role", cfg.Cluster.Role).Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterStandaloneRoleError)
+		}
+		if cfg.Cluster.RaftDataDir == "" {
+			log.Warn().Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterNoRaftWarning)
+		}
+	}
 
 	// Initialize WAL writer (if enabled) - recovery happens after ArrowBuffer is ready
 	var walWriter *wal.Writer
@@ -4444,6 +4458,9 @@ func main() {
 		log.Fatal().
 			Msg("cluster.shared_storage_mode=true but the cluster coordinator is not running (see the errors above); without it retention, CQ and tiering migration would run on this node unconditionally against the shared bucket")
 	}
+	if !cfg.Cluster.SharedStorageMode && objectStoreCluster(cfg.Cluster.Enabled, cfg.Storage.Backend) && clusterCoordinator == nil {
+		log.Warn().Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterNoCoordinatorWarning)
+	}
 
 	// Initialize CQ Scheduler (Enterprise feature - requires valid license)
 	// Scheduler is enabled when continuous_query.enabled=true AND license allows it
@@ -4786,14 +4803,19 @@ func main() {
 				// the backend's transport open until process teardown.
 				registerTieringColdBackendShutdown(shutdownCoordinator, coldBackend)
 
-				// Where nodes share data — one hot bucket (shared-storage
-				// mode), or per-node disks kept in step by file replication
-				// — only the primary writer among them moves and deletes
-				// files (the gate retention and CQ use); every node still
-				// syncs its tier metadata each cycle because queries route
-				// from it; and every hot copy tiering removes leaves the
-				// cluster manifest first, so peer replication does not pull
-				// it back.
+				// Where nodes share data — one hot bucket, or per-node disks
+				// kept in step by file replication — only the primary writer
+				// among them moves and deletes files (the gate retention and
+				// CQ use); every node still syncs its tier metadata each cycle
+				// because queries route from it; and every hot copy tiering
+				// removes leaves the cluster manifest first, so peer
+				// replication does not pull it back. A hot bucket is shared
+				// whether or not cluster.shared_storage_mode is set: without
+				// the flag it is the single-writer form of Pattern 2, whose
+				// primary the writer-failover manager elects (#1603). So the
+				// bucket is recognised from the backend that was built, as
+				// reconciliation (IsSharedObjectStore) and the manifest delete
+				// callbacks (the storage type) already decide it.
 				//
 				// A local-storage cluster without replication is neither
 				// shipped pattern (cluster_topology.go, #1599). Its writers
@@ -4812,9 +4834,8 @@ func main() {
 						coordinator: clusterCoordinator,
 						logger:      logger.Get("tiering-manifest"),
 					}
-					if cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled ||
-						(localClusterWithoutReplication(true, cfg.Storage.Backend, cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled) &&
-							gateTieringInLocalClusterWithoutReplication(clusterCoordinator.Role())) {
+					if tieringGateWired(cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled,
+						cluster.IsSharedObjectStore(storageBackend), cfg.Storage.Backend, clusterCoordinator.Role()) {
 						tieringGate = newWriterClusterGate(clusterCoordinator)
 					}
 				}
