@@ -41,6 +41,49 @@ func localFileURI(p string) string {
 	return (&url.URL{Scheme: "file", Path: slashed}).String()
 }
 
+// isBareLocalPath reports whether a warehouse or metadata location is a plain
+// filesystem path rather than a URI (#1616): no scheme, or an absolute path
+// whose drive letter url.Parse would read as one (C:\x on Windows).
+func isBareLocalPath(s string) bool {
+	if s == "" {
+		return false
+	}
+	if filepath.IsAbs(s) {
+		return true
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		// Not a parseable URI (a bare path with a stray %): a path unless it
+		// names a scheme.
+		return !strings.Contains(s, "://")
+	}
+	return u.Scheme == ""
+}
+
+// isFileURI reports whether s is a file URI, in any case of the scheme and
+// with one slash or three (file:/x, FILE:///x), as iceberg-go accepts.
+func isFileURI(s string) (*url.URL, bool) {
+	u, err := url.Parse(s)
+	if err != nil || !strings.EqualFold(u.Scheme, "file") || u.Host != "" {
+		return nil, false
+	}
+	return u, true
+}
+
+// NormalizeLocalWarehouse turns a bare iceberg.warehouse path into the
+// file:// URI of its absolute directory, so the tables Arc creates carry
+// file:// locations like the default warehouse's (#1616). A relative path is
+// resolved against the working directory here, as storage.local_path is;
+// iceberg-go would otherwise clean a leading "../" away. Any other value is
+// returned as it is.
+func NormalizeLocalWarehouse(raw string) string {
+	p := strings.TrimSpace(raw)
+	if !isBareLocalPath(p) {
+		return raw
+	}
+	return localFileURI(filepath.FromSlash(p))
+}
+
 // DefaultWarehouse returns the Iceberg warehouse root for a backend when none is configured:
 // the storage root, so table metadata lands alongside the data (file:// local, s3://bucket/
 // prefix for object storage). Iceberg writes {warehouse}/{namespace}.db/{table}/metadata/...

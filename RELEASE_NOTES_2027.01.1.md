@@ -3843,6 +3843,32 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
+
+On local storage, `iceberg.warehouse` set to a plain path (for example
+`/data/wh`, without `file://`) was treated as outside the storage root even
+when it was inside it. Arc published no `version-hint.text` or
+`v<N>.metadata.json`, so DuckDB and Spark could not find the tables by
+directory, and logged that the warehouse was not under the storage root. It
+also skipped tightening the metadata files' permissions, which stayed
+world-readable (`0644`).
+
+Now:
+- A plain path, absolute or relative to the working directory, is turned
+  into the `file://` URI of its directory at startup, so new tables get
+  `file://` locations like the default warehouse's.
+- Tables created before keep their plain-path locations, which Arc now
+  recognises: their version hints are published, their metadata permissions
+  tightened, and old versions pruned, on the next export pass.
+- **A database delete now removes these tables' warehouse metadata**, as it
+  always did for a `file://` warehouse. Before, it left the metadata behind.
+- The `file` scheme is matched in any case and with one slash (`file:/data`),
+  as iceberg-go accepts.
+- A plain path with a space, a leading `../`, or a dotted namespace (#1129)
+  was written by iceberg-go to a directory spelled differently from the
+  configured one (`my%20wh`, the `..` dropped). Existing tables there stay
+  where they are; new tables go to the configured directory.
+
 ### Fix: a backup's Iceberg metadata matches its catalog, and a restored catalog never rolls a table back ([#1613](https://github.com/Basekick-Labs/arc/issues/1613))
 
 A whole-instance backup listed the in-root Iceberg warehouse at the start,
