@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -88,6 +89,12 @@ func (h *GovernanceHandler) CreatePolicy(c *fiber.Ctx) error {
 	}
 
 	policy, err := h.manager.CreatePolicy(ctx, &req)
+	if errors.Is(err, governance.ErrPolicyExists) {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "A policy already exists for this token",
+		})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Int64("token_id", req.TokenID).Msg("Failed to create governance policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -148,10 +155,7 @@ func (h *GovernanceHandler) GetPolicy(c *fiber.Ctx) error {
 	}
 
 	if policy == nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"success": false,
-			"error":   "No policy found for this token",
-		})
+		return policyNotFound(c)
 	}
 
 	return c.JSON(fiber.Map{
@@ -184,10 +188,7 @@ func (h *GovernanceHandler) UpdatePolicy(c *fiber.Ctx) error {
 		})
 	}
 	if existing == nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"success": false,
-			"error":   "No policy found for this token",
-		})
+		return policyNotFound(c)
 	}
 
 	var req governance.Policy
@@ -212,6 +213,9 @@ func (h *GovernanceHandler) UpdatePolicy(c *fiber.Ctx) error {
 	req.CreatedAt = existing.CreatedAt
 
 	policy, err := h.manager.UpdatePolicy(ctx, &req)
+	if errors.Is(err, governance.ErrPolicyNotFound) {
+		return policyNotFound(c)
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to update governance policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -241,6 +245,9 @@ func (h *GovernanceHandler) DeletePolicy(c *fiber.Ctx) error {
 	}
 
 	if err := h.manager.DeletePolicy(ctx, tokenID); err != nil {
+		if errors.Is(err, governance.ErrPolicyNotFound) {
+			return policyNotFound(c)
+		}
 		h.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to delete governance policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -251,6 +258,14 @@ func (h *GovernanceHandler) DeletePolicy(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"success": true,
 		"message": "Policy deleted",
+	})
+}
+
+// policyNotFound answers a route naming a token that has no policy.
+func policyNotFound(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+		"success": false,
+		"error":   "No policy found for this token",
 	})
 }
 

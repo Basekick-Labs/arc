@@ -3901,6 +3901,28 @@ continuous query was already stopped.
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1600](https://github.com/Basekick-Labs/arc/pull/1600).
 
+### Fix: governance policy routes answer `409` and `404` instead of `500` and `200`
+
+`POST /api/v1/governance/policies` for a token that already had a policy
+answered `500 "Failed to create policy"` and logged an error, so an ordinary
+mistake looked like a server fault. It now answers `409 "A policy already
+exists for this token"`; change the existing policy with `PUT`.
+`DELETE /api/v1/governance/policies/{token_id}` for a token with no policy
+answered `200 "Policy deleted"`. It now answers `404 "No policy found for this
+token"`, as `GET` and `PUT` already did, so a second `DELETE` is a `404`.
+Automation that deletes a policy unconditionally should accept `404`.
+
+A `PUT` whose policy is deleted between its existence check and its write
+now answers `404` too. It used to answer `200` and put the deleted policy back
+into the in-memory cache, where it was enforced until a restart. More
+generally, policy creates, updates and deletes no longer interleave, so the
+enforced policies always match the stored ones. Before, a `DELETE` racing a
+`POST` or `PUT` of the same token could leave a deleted policy enforced, or a
+stored one not enforced, until a restart.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1601](https://github.com/Basekick-Labs/arc/pull/1601).
+
 ### Fix: an unknown MQTT subscription ID is answered `404`
 
 `/api/v1/mqtt/subscriptions/{id}` answered an ID with no stored subscription
