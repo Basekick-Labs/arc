@@ -3843,6 +3843,26 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: an unknown MQTT subscription ID is answered `404`
+
+`/api/v1/mqtt/subscriptions/{id}` answered an ID with no stored subscription
+in three different ways. `GET` answered `404`. `PUT`, `DELETE`, `POST
+.../start`, `POST .../restart` and `GET .../stats` answered `500 "Failed to
+... subscription"` and logged an error, so a typo, or a subscription another
+admin had already deleted, looked like a server fault. `POST .../stop` and
+`POST .../pause` answered `409 "subscription not running"`, as if the
+subscription existed.
+
+Every one of these routes now answers `404 "Subscription not found"` for such
+an ID, logged at Debug. A second `DELETE` of the same subscription is a
+`404`. A stored subscription that is not running still answers `409` to
+stop and pause. `GET` on a subscription the store cannot read is now a
+`500`. It answered `404` for any failure, so a store fault looked like a
+deleted subscription.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1596](https://github.com/Basekick-Labs/arc/pull/1596).
+
 ### Fix: a governance 429 says when a retry can succeed ([#1519](https://github.com/Basekick-Labs/arc/issues/1519))
 
 With query governance on, a refused query's `Retry-After` was wrong or missing:
