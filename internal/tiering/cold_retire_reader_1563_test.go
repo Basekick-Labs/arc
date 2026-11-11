@@ -169,6 +169,46 @@ func TestReaderWritesBackARowWhenThePostDeleteStatFails(t *testing.T) {
 	}
 }
 
+// statHangsCold answers Exists normally and blocks every StatFile until its
+// context ends: a cold store that slowed down after the checks.
+type statHangsCold struct{ *listedColdObjects }
+
+func (statHangsCold) StatFile(ctx context.Context, _ string) (int64, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
+// The stats after the delete have their own deadline: rows not confirmed by
+// then are written back, not left deleted while the store is slow.
+func TestReaderWritesBackRowsTheStatDeadlineLeft(t *testing.T) {
+	defer func(d time.Duration) { readerColdStatTimeout = d }(readerColdStatTimeout)
+	readerColdStatTimeout = 50 * time.Millisecond
+	m, _, cold := readerRig(t)
+	// More rows than workers, so some are never stat'd before the deadline.
+	extra := make([]string, 3*readerColdRetireWorkers)
+	for i := range extra {
+		extra[i] = fmt.Sprintf("db1/disk/2024/03/15/disk_%04d_daily.parquet", i)
+	}
+	m.clusterGate.(*mockGate).primary.Store(true)
+	syncListing(t, m, cold, append(extra, otherCold, missA, missB)...)
+	m.clusterGate.(*mockGate).primary.Store(false)
+	m.coldBackend = statHangsCold{&listedColdObjects{mockBackend: cold, objects: coldObjects(otherCold)}}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(started); d > 5*time.Second {
+		t.Fatalf("pass took %v: step 3 is not bounded", d)
+	}
+	for _, p := range append(extra, missA, missB) {
+		if coldRow(t, m, p) == nil {
+			t.Fatalf("%s left deleted although its stat never completed", p)
+		}
+	}
+}
+
 // The checks never take more than half of what is left of the scan's budget.
 func TestReaderRetireBudgetLeavesTheHotScanHalf(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)

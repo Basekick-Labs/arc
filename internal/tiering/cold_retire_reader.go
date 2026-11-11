@@ -58,10 +58,11 @@ const readerColdRetireWorkers = 8
 // budget: the hot scan runs after it on the same context.
 const readerColdRetireBudget = 5 * time.Minute
 
-// readerColdStatTimeout bounds each stat or write made after the check
-// budget, which runs detached: the rows are deleted by then, and leaving the
-// pass part way would drop rows whose object a writer just put back.
-const readerColdStatTimeout = 30 * time.Second
+// readerColdStatTimeout bounds each stat, the write-back, and each 500-row
+// chunk of the DELETE. These run detached from the scan's context: the rows
+// are deleted by then, and leaving the pass part way would drop rows whose
+// object a writer just put back.
+var readerColdStatTimeout = 30 * time.Second // a variable so tests can shrink it
 
 // readerColdRetireResult is what one pass did.
 type readerColdRetireResult struct {
@@ -147,7 +148,7 @@ func (m *Manager) retireUnseenColdRows(ctx context.Context, unseen map[string]in
 		default:
 			res.kept++
 		}
-	}, func() {
+	}, func(string) {
 		mu.Lock()
 		res.unchecked++
 		mu.Unlock()
@@ -165,7 +166,8 @@ func (m *Manager) retireUnseenColdRows(ctx context.Context, unseen map[string]in
 		}
 		paths = append(paths, p)
 	}
-	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), readerColdStatTimeout)
+	chunks := (len(paths) + retireColdRowsChunk - 1) / retireColdRowsChunk
+	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(chunks)*readerColdStatTimeout)
 	deleted, err := m.metadata.RetireColdRowsIfUnquarantined(delCtx, paths)
 	delCancel()
 	if err != nil {
@@ -177,11 +179,15 @@ func (m *Manager) retireUnseenColdRows(ctx context.Context, unseen map[string]in
 
 	// 3. Every cold writer writes the object before the row: an object that
 	// is there now was written after the check, and its row goes back, with
-	// the size the store reports. A stat that fails writes the row back too;
-	// the next sync decides again.
+	// the size the store reports. A stat that fails writes the row back too,
+	// and so does a path not stat'd before step 3's own deadline: the rows
+	// are invisible on this reader until then, so this step is bounded like
+	// the checks. The next sync decides again.
 	var writeBack []FileMetadata
-	m.forEachConcurrently(context.WithoutCancel(ctx), deleted, func(path string) {
-		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), readerColdStatTimeout)
+	statCtx, statCancel := context.WithTimeout(context.WithoutCancel(ctx), max(readerRetireBudget(ctx), readerColdStatTimeout))
+	defer statCancel()
+	m.forEachConcurrently(statCtx, deleted, func(path string) {
+		sctx, scancel := context.WithTimeout(statCtx, readerColdStatTimeout)
 		size, serr := m.coldBackend.StatFile(sctx, path)
 		scancel()
 		mu.Lock()
@@ -203,7 +209,12 @@ func (m *Manager) retireUnseenColdRows(ctx context.Context, unseen map[string]in
 		}
 		writeBack = append(writeBack, row)
 		res.kept++
-	}, nil)
+	}, func(path string) {
+		mu.Lock()
+		writeBack = append(writeBack, *candidates[path])
+		res.unchecked++
+		mu.Unlock()
+	})
 	if len(writeBack) > 0 {
 		wctx, wcancel := context.WithTimeout(context.WithoutCancel(ctx), readerColdStatTimeout)
 		if _, werr := m.metadata.RecordColdFilesBatch(wctx, writeBack, time.Now()); werr != nil {
@@ -219,9 +230,8 @@ func (m *Manager) retireUnseenColdRows(ctx context.Context, unseen map[string]in
 }
 
 // forEachConcurrently calls fn for each item on readerColdRetireWorkers
-// goroutines. Items left when ctx ends are passed to skipped (if set)
-// instead.
-func (m *Manager) forEachConcurrently(ctx context.Context, items []string, fn func(string), skipped func()) {
+// goroutines. Items left when ctx ends are passed to skipped instead.
+func (m *Manager) forEachConcurrently(ctx context.Context, items []string, fn func(string), skipped func(string)) {
 	ch := make(chan string)
 	var wg sync.WaitGroup
 	for range min(readerColdRetireWorkers, len(items)) {
@@ -235,9 +245,7 @@ func (m *Manager) forEachConcurrently(ctx context.Context, items []string, fn fu
 	}
 	for _, it := range items {
 		if ctx.Err() != nil {
-			if skipped != nil {
-				skipped()
-			}
+			skipped(it)
 			continue
 		}
 		ch <- it
