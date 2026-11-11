@@ -21,9 +21,8 @@ import (
 //
 // The SQLite catalog is node-local. On a shared bucket (with or without shared_storage_mode,
 // #1609) the tables live in the one bucket every node sees, and the export moves with the
-// compactor lease, so a node can come back to a
-// table with a catalog row that is versions behind what another node published since — or with
-// no row at all. Committing from that row forks the table's history: iceberg-go writes the next
+// compactor lease, so a node can come back to a table with a catalog row that is versions
+// behind what another node published since — or with no row at all. Committing from that row forks the table's history: iceberg-go writes the next
 // version from the stale metadata, Arc's version-hint goes backwards, and the orphan sweep then
 // deletes the other lineage's manifests as unreachable.
 //

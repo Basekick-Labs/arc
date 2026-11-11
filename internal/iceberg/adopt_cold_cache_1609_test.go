@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -85,25 +86,48 @@ func TestTableExists_RowlessNodeSeesThePublishedTable(t *testing.T) {
 	}
 }
 
-// Across many passes an authoritative node that falls behind never forks the
-// table: it adopts the published version before every load.
-func TestAdopt_AuthoritativeNodesNeverFork(t *testing.T) {
-	r := newWarehouseRig(t)
-	a, b := r.node(true), r.node(true)
-	for i := 0; i < 8; i++ {
+// The fork this fixes on a shared bucket without shared_storage_mode (#1609):
+// a node that is not authoritative and holds a stale catalog row is fenced
+// pass after pass, until its own commits pass the published version. Then it
+// publishes its own lineage, and the warehouse holds two metadata files for
+// the same version numbers. With adoption on, the same sequence never forks.
+func TestAdopt_StaleWriterForksWithoutAdoptionOnly(t *testing.T) {
+	for _, authoritative := range []bool{false, true} {
+		r := newWarehouseRig(t)
+		a, b := r.node(true), r.node(authoritative)
 		r.addFile()
-		exp := a
-		if i%3 == 2 {
-			exp = b
+		if err := r.reconcile(a); err != nil {
+			t.Fatal(err)
 		}
-		if err := r.reconcile(exp); err != nil {
-			t.Fatalf("pass %d: %v", i, err)
+		r.addFile()
+		if err := r.reconcile(b); err != nil { // no row: b adopts, then commits
+			t.Fatal(err)
 		}
-	}
-	if f := r.forkedVersions(); len(f) != 0 {
-		t.Fatalf("forked versions %v", f)
-	}
-	if n := r.live(a); n != len(r.files()) {
-		t.Fatalf("live = %d, want %d", n, len(r.files()))
+		for i := 0; i < 3; i++ { // the export moves to a, which advances the table
+			r.addFile()
+			if err := r.reconcile(a); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The export moves back to b, whose row is now several versions behind.
+		fenced := 0
+		for pass := 0; pass < 10; pass++ {
+			r.addFile()
+			err := r.reconcile(b)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, errFenced) {
+				t.Fatalf("authoritative=%v, pass %d: %v", authoritative, pass, err)
+			}
+			fenced++
+		}
+		forked := r.forkedVersions()
+		if authoritative && (fenced != 0 || len(forked) != 0) {
+			t.Fatalf("with adoption: %d fenced passes, forked versions %v; want none", fenced, forked)
+		}
+		if !authoritative && (fenced == 0 || len(forked) == 0) {
+			t.Fatalf("without adoption: %d fenced passes, forked versions %v; want the climb and the fork this guards against", fenced, forked)
+		}
 	}
 }

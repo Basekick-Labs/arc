@@ -113,6 +113,19 @@ func ignoreReplicationOnObjectStore(clusterEnabled, replication, sharedObjectSto
 const objectStoreClusterCoordinatorFailedError = "the cluster coordinator did not start (see the errors above) on a shared object-store bucket; " +
 	"without it tiering migration, retention, continuous queries and deletes would run on this node unconditionally against the shared bucket"
 
+// icebergGateKind is the Iceberg export gate on this node.
+type icebergGateKind int
+
+const (
+	// icebergGateNone: no gate, the export always runs (OSS, one node).
+	icebergGateNone icebergGateKind = iota
+	// icebergGateLease: the compactor lease, with no static-role fallback.
+	icebergGateLease
+	// icebergGateCompaction: the compaction gate, the lease when one is held,
+	// else the static role.
+	icebergGateCompaction
+)
+
 // icebergTopology is how Iceberg export is wired on this node (#1609).
 type icebergTopology struct {
 	// authoritative: every pass adopts the version published in the warehouse
@@ -121,10 +134,7 @@ type icebergTopology struct {
 	// barrier: a listed file this node's manifest does not know yet waits for
 	// the manifest before export.
 	barrier bool
-	// gate: "lease" (the compactor lease, no static fallback), "compaction"
-	// (the compaction gate: the lease when one is held, else the static
-	// role), or "none" (OSS: always runs).
-	gate string
+	gate    icebergGateKind
 	// warnNoElection: a shared bucket with no compactor failover, where
 	// nothing elects the exporter.
 	warnNoElection bool
@@ -139,19 +149,21 @@ func icebergTopologyFor(sharedMode, sharedBucket, hasCoordinator, hasCompactorFa
 	t := icebergTopology{
 		authoritative: sharedMode || sharedBucket,
 		barrier:       (sharedMode || sharedBucket) && hasCoordinator,
-		gate:          "none",
+		gate:          icebergGateNone,
 	}
 	switch {
 	case sharedMode && hasCoordinator:
 		// Multi-writer: the lease, unconditionally. Config refuses this without
 		// failover_enabled; a licence or Raft that leaves no failover manager
 		// pauses export rather than letting every compactor export.
-		t.gate = "lease"
+		t.gate = icebergGateLease
 	case sharedBucket && hasCoordinator && hasCompactorFailover:
-		t.gate = "lease"
+		t.gate = icebergGateLease
 	case hasCompactionGate:
-		t.gate = "compaction"
-		t.warnNoElection = sharedBucket && hasCoordinator
+		t.gate = icebergGateCompaction
+		// No coordinator (cluster.enabled without a clustering licence) is
+		// the same hazard: the static role decides on every node.
+		t.warnNoElection = sharedBucket
 	}
 	return t
 }
@@ -160,4 +172,4 @@ func icebergTopologyFor(sharedMode, sharedBucket, hasCoordinator, hasCompactorFa
 // bucket with no compactor failover: nothing elects the Iceberg exporter.
 const icebergNoElectionWarning = "Iceberg export on a shared bucket without compactor failover (cluster.failover_enabled and the writer_failover licence feature): " +
 	"every compactor-role node exports, unless a compactor lease is already held. Run exactly one compactor-role node, or enable failover: " +
-	"two exporters leave orphaned table metadata and can step the version hint back. With no compactor-role node, nothing exports"
+	"two exporters leave orphaned table metadata and can step the version hint back"

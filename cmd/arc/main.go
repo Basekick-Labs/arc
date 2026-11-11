@@ -4403,10 +4403,14 @@ func main() {
 		// compactor failover exists; without it, the compaction gate and a warning.
 		var icebergGate iceberg.WriterGate
 		switch icebergTopo.gate {
-		case "lease":
+		case icebergGateLease:
 			icebergGate = icebergLeaseGate{clusterCoordinator}
-		case "compaction":
+		case icebergGateCompaction:
 			icebergGate = icebergWriterGate{compactionGate}
+		case icebergGateNone:
+		default:
+			// A nil gate always runs: an unknown kind must not fail open.
+			log.Fatal().Int("gate", int(icebergTopo.gate)).Msg("Iceberg export: unknown gate kind")
 		}
 		if icebergTopo.warnNoElection && compactionGate.CanCompact() {
 			log.Warn().Msg(icebergNoElectionWarning)

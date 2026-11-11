@@ -3861,15 +3861,23 @@ the flag rather than on the bucket.
 
 Iceberg now decides "shared" from the bucket.
 - **Adoption** runs on every S3 warehouse. That includes a standalone S3 node,
-  whose catalog a backup restore can leave behind its warehouse.
+  whose catalog a backup restore can leave behind its warehouse. It costs one
+  catalog read and one version-hint `GET` per changed table per pass. A
+  version hint that is not a number (only an outside writer can produce one)
+  now stops that table's export until it is fixed, instead of being
+  overwritten.
 - **Adoption before the first load.** The scheduler's first loads after a
   restart now adopt too. A catalog row whose metadata file another node had
   pruned used to fail that measurement on every pass, even in
   `shared_storage_mode`.
-- **The manifest barrier** applies on any shared bucket.
+- **The manifest barrier** applies on any shared bucket. A listed file the
+  manifest still does not know after one barrier (for example, written before
+  the cluster existed) is remembered, so it no longer costs a Raft barrier on
+  every pass.
 - **The compactor lease** gates the export where compactor failover runs.
-  Without it, every compactor-role node exports, and a startup Warn says to
-  run exactly one or to enable `cluster.failover_enabled`.
+  Without it (or on a cluster node without a clustering licence), every
+  compactor-role node exports, and a startup Warn says to run exactly one or
+  to enable `cluster.failover_enabled`.
 
 ### Fix: `cluster.replication_enabled` is ignored on an object-store backend ([#1605](https://github.com/Basekick-Labs/arc/issues/1605))
 
