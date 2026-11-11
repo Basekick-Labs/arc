@@ -3860,7 +3860,8 @@ stop and pause. `GET` on a subscription the store cannot read is now a
 `500`. It answered `404` for any failure, so a store fault looked like a
 deleted subscription.
 
-Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1596](https://github.com/Basekick-Labs/arc/pull/1596).
 
 ### Fix: a governance 429 says when a retry can succeed ([#1519](https://github.com/Basekick-Labs/arc/issues/1519))
 

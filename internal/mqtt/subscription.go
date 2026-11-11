@@ -36,9 +36,9 @@ var (
 	ErrSubscriptionNotRunning        = errors.New("subscription not running")
 	ErrSubscriptionRunningCantUpdate = errors.New("cannot update running subscription - stop it first")
 	ErrSubscriptionUniqueConstraint  = errors.New("subscription name already exists")
-	// ErrSubscriptionNotFound wraps a request naming a subscription ID that is
-	// not stored. Handlers map it to 404 Not Found, so a wrong or stale ID is
-	// told apart from a server fault.
+	// ErrSubscriptionNotFound is wrapped for a request naming a subscription
+	// ID that is not stored. Handlers map it to 404 Not Found, so a wrong or
+	// stale ID is told apart from a server fault.
 	ErrSubscriptionNotFound = errors.New("subscription not found")
 	// ErrValidation wraps a request that failed validation (bad QoS, broker URL,
 	// missing field, …). Handlers map it to 400 Bad Request rather than 500 —
