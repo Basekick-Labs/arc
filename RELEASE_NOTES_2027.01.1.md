@@ -3873,9 +3873,11 @@ it, the start answered `200` and ran a subscriber for a subscription that no
 longer existed.
 
 `DELETE` now removes the stored subscription first and then stops whatever
-runs under it, and a start reserves the subscription before reading it. A
-request that loses this race answers `404`, and no subscriber outlives its
-subscription. A `DELETE` that fails to remove the subscription no longer stops
+runs under it. A start reserves the subscription before reading it, and once
+its subscriber is running it reads the subscription again, stopping the
+subscriber if it is gone. A request that loses this race answers `404`, and
+no subscriber outlives its subscription unless that last read fails (logged
+at Warn). A `DELETE` that fails to remove the subscription no longer stops
 it first, so it stays stored and running. The status write of a subscriber
 stopped after its subscription was deleted is logged at Debug, not Error.
 

@@ -128,19 +128,85 @@ func TestManager_StartFailedOnDeletedRowIsNotFound(t *testing.T) {
 	}
 }
 
-// #1597: StartSubscription reserves its slot before it reads the row. Read
-// first, a Delete could complete between the read and the reservation and the
-// start would run a subscriber with no stored row. The reservation check
-// running first is what this observes: an ID whose slot is already taken is
-// refused as already running before any lookup.
-func TestManager_StartReservesBeforeReading(t *testing.T) {
-	mgr := newTestManager(t)
-	const id = "reserved-unknown"
+// reserve puts a start's nil placeholder in the slot for id, as
+// StartSubscription and RestartSubscription do before they read the row.
+func reserve(mgr *SubscriptionManager, id string) {
 	mgr.mu.Lock()
 	mgr.subscribers[id] = nil
 	mgr.mu.Unlock()
+}
 
-	if err := mgr.StartSubscription(context.Background(), id); !errors.Is(err, ErrSubscriptionAlreadyRunning) {
-		t.Fatalf("err = %v, want ErrSubscriptionAlreadyRunning from the reservation, ahead of the lookup", err)
+// #1597: a start whose reservation a Delete took, after the start had read the
+// row, fails to register. Through the real start path it answers not found,
+// and nothing is left running.
+func TestManager_StartWhoseReservationADeleteTookIsNotFound(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+	sub, err := mgr.Create(ctx, createReq("taken", newMockMQTTBroker(t), false), "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	reserve(mgr, sub.ID) // the start has reserved and read the row
+	if err := mgr.Delete(ctx, sub.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if err := mgr.runReserved(ctx, sub); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("err = %v, want ErrSubscriptionNotFound", err)
+	}
+	mgr.mu.Lock()
+	running := mgr.subscribers[sub.ID]
+	mgr.mu.Unlock()
+	if running != nil {
+		t.Error("a subscriber is running for a deleted subscription")
+	}
+}
+
+// #1597: a Delete takes start A's reservation after A read the row, and a
+// second start reserves the slot again before A registers. A then registers
+// into the second start's placeholder. Its re-read finds no row, so it stops
+// the subscriber and answers not found instead of running it with nothing
+// stored.
+func TestManager_StartRegisteringIntoAnotherReservationOfADeletedRowIsNotFound(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+	sub, err := mgr.Create(ctx, createReq("hijacked", newMockMQTTBroker(t), false), "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	reserve(mgr, sub.ID) // start A has reserved and read the row
+	if err := mgr.Delete(ctx, sub.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	reserve(mgr, sub.ID) // start B reserves the slot again
+
+	if err := mgr.runReserved(ctx, sub); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("start A err = %v, want ErrSubscriptionNotFound", err)
+	}
+	mgr.mu.Lock()
+	running := mgr.subscribers[sub.ID]
+	mgr.mu.Unlock()
+	if running != nil {
+		t.Error("start A left a subscriber running for a deleted subscription")
+	}
+}
+
+// #1597: StartSubscription reserves its slot before it reads the row. Read
+// first, a Delete could complete between the read and the reservation and the
+// start would run a subscriber with no stored row. Observed with a stored
+// subscription whose slot is already reserved and a store that fails every
+// read: the start is refused as already running without reading the row.
+func TestManager_StartReservesBeforeReading(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+	sub, err := mgr.Create(ctx, createReq("busy", "tcp://localhost:1883", false), "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	reserve(mgr, sub.ID)
+	_ = mgr.repo.db.Close() // a read would fail
+
+	if err := mgr.StartSubscription(ctx, sub.ID); !errors.Is(err, ErrSubscriptionAlreadyRunning) {
+		t.Fatalf("err = %v, want ErrSubscriptionAlreadyRunning before any read", err)
 	}
 }

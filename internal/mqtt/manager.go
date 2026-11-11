@@ -579,13 +579,13 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 
 // Delete deletes a subscription
 //
-// The row goes first, then whatever runs under the ID is stopped. In that
-// order a start racing the delete either registers before the slot is taken
-// here, and is stopped below, or loses its reservation after the row is
-// gone, so its own status write finds no row and it answers not found
-// (#1597). Stopping first let a start lose its reservation while the row
-// still existed, which it could not tell from any other failure. A delete
-// that fails stops nothing: the subscription stays stored and running.
+// The row goes first, then whatever runs under the ID is stopped. A start
+// racing the delete therefore always meets a missing row: its registration
+// fails after the row is gone and its status write finds none, or it
+// registers and runReserved's re-read finds none (#1597). Stopping first let
+// a start lose its reservation while the row still existed, which it could
+// not tell from any other failure. A delete that fails stops nothing: the
+// subscription stays stored and running.
 func (m *SubscriptionManager) Delete(ctx context.Context, id string) error {
 	delErr := m.repo.Delete(ctx, id)
 	if delErr != nil && !errors.Is(delErr, sql.ErrNoRows) {
@@ -634,7 +634,9 @@ func (m *SubscriptionManager) startFailed(ctx context.Context, id string, err er
 
 // stoppedResult is the result of a stop or pause whose subscriber has been
 // stopped. A status write that finds no row means a Delete removed the
-// subscription meanwhile, which is answered as not found (#1597).
+// subscription meanwhile, which is answered as not found (#1597). Not found
+// wins over an unsubscribe error joined with it: the subscription is gone
+// either way, and the error is still in the handler's Debug log.
 func stoppedResult(id string, stopErr, statusErr error) error {
 	if errors.Is(statusErr, sql.ErrNoRows) {
 		return errors.Join(stopErr, errSubscriptionNotFound(id))
@@ -648,9 +650,8 @@ func (m *SubscriptionManager) StartSubscription(ctx context.Context, id string) 
 	// We insert a nil placeholder; startSubscriber replaces it on success.
 	// The slot is reserved before the row is read, as RestartSubscription
 	// does: reading first let a Delete complete in between, and the start
-	// then ran a subscriber with no stored subscription (#1597). Reserved
-	// first, a Delete either removes the row before the read, which finds
-	// none, or takes the reservation, so the registration fails.
+	// then ran a subscriber with no stored subscription (#1597). A Delete
+	// that runs after the read is handled by runReserved.
 	m.mu.Lock()
 	if _, ok := m.subscribers[id]; ok {
 		m.mu.Unlock()
@@ -669,11 +670,48 @@ func (m *SubscriptionManager) StartSubscription(ctx context.Context, id string) 
 		return errSubscriptionNotFound(id)
 	}
 
-	if err := m.startSubscriber(sub); err != nil {
+	if err := m.runReserved(ctx, sub); err != nil {
+		// After runReserved has recorded the failure: released first, a
+		// second start could reserve, run and record running, and this
+		// start's status error would then land on a running subscription.
 		m.releaseReservation(id)
-		return m.startFailed(ctx, id, err)
+		return err
 	}
 
+	return nil
+}
+
+// runReserved starts sub in the slot its caller reserved, and returns the
+// error to report. A start that fails is recorded by startFailed.
+//
+// A start that registers reads the row again. Registering does not prove the
+// subscription is still stored: a Delete can take this start's reservation
+// after its read, and a second start can then reserve the slot again, so this
+// subscriber registers into the second start's placeholder (#1597). Delete
+// removes the row before it takes the map entry, so a re-read that finds the
+// row means any later Delete finds this subscriber and stops it. A re-read
+// that finds none stops it here.
+func (m *SubscriptionManager) runReserved(ctx context.Context, sub *Subscription) error {
+	subscriber, err := m.startRegistered(sub)
+	if err != nil {
+		return m.startFailed(ctx, sub.ID, err)
+	}
+
+	stored, err := m.repo.Get(ctx, sub.ID)
+	if err != nil {
+		// The start succeeded; only the check could not be made.
+		m.logger.Warn().Err(err).Str("id", sub.ID).Msg("Started MQTT subscription, but could not confirm it is still stored")
+		return nil
+	}
+	if stored == nil {
+		m.mu.Lock()
+		if m.subscribers[sub.ID] == subscriber {
+			delete(m.subscribers, sub.ID)
+		}
+		m.mu.Unlock()
+		_ = subscriber.Stop()
+		return errSubscriptionNotFound(sub.ID)
+	}
 	return nil
 }
 
@@ -690,9 +728,11 @@ func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) e
 
 	stopErr := subscriber.Stop()
 	statusErr := m.repo.UpdateStatus(ctx, id, StatusStopped, "")
-	m.logger.Info().Str("id", id).Msg("Stopped MQTT subscription")
-
-	return stoppedResult(id, stopErr, statusErr)
+	err := stoppedResult(id, stopErr, statusErr)
+	if !errors.Is(err, ErrSubscriptionNotFound) {
+		m.logger.Info().Str("id", id).Msg("Stopped MQTT subscription")
+	}
+	return err
 }
 
 // notRunningError is the error for a stop or pause of a subscription with no
@@ -719,9 +759,11 @@ func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) 
 
 	stopErr := subscriber.Stop()
 	statusErr := m.repo.UpdateStatus(ctx, id, StatusPaused, "")
-	m.logger.Info().Str("id", id).Msg("Paused MQTT subscription")
-
-	return stoppedResult(id, stopErr, statusErr)
+	err := stoppedResult(id, stopErr, statusErr)
+	if !errors.Is(err, ErrSubscriptionNotFound) {
+		m.logger.Info().Str("id", id).Msg("Paused MQTT subscription")
+	}
+	return err
 }
 
 // RestartSubscription stops and starts a subscription
@@ -762,8 +804,8 @@ func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string
 	}
 
 	// Start it
-	if err := m.startSubscriber(sub); err != nil {
-		return m.startFailed(ctx, id, err)
+	if err := m.runReserved(ctx, sub); err != nil {
+		return err
 	}
 
 	success = true
@@ -825,13 +867,19 @@ func (m *SubscriptionManager) GetAllStats(ctx context.Context) ([]*SubscriptionS
 
 // startSubscriber creates and starts a subscriber
 func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
+	_, err := m.startRegistered(sub)
+	return err
+}
+
+// startRegistered is startSubscriber, returning the subscriber it registered.
+func (m *SubscriptionManager) startRegistered(sub *Subscription) (*Subscriber, error) {
 	// Rows loaded from SQLite may predate the storage-segment rule or have
 	// been edited there. Refuse to run one whose targets cannot be written,
 	// so the subscription shows an error status instead of running and
 	// dropping every message (#300). onMessage keeps its own check as the
 	// last line.
 	if err := validateSubscriptionTargets(sub, false); err != nil {
-		return fmt.Errorf("subscription targets cannot be written: %w", err)
+		return nil, fmt.Errorf("subscription targets cannot be written: %w", err)
 	}
 	for _, dead := range deadTopicFilters(sub.TopicMapping) {
 		m.logger.Warn().
@@ -850,12 +898,12 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 	)
 
 	if err := subscriber.Start(); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := m.registerStarted(sub.ID, subscriber); err != nil {
 		_ = subscriber.Stop()
-		return err
+		return nil, err
 	}
 
 	m.logger.Info().
@@ -863,7 +911,7 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 		Str("name", sub.Name).
 		Msg("Started MQTT subscription")
 
-	return nil
+	return subscriber, nil
 }
 
 // onStatusChange handles status changes from subscribers
