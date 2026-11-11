@@ -6089,6 +6089,14 @@ func (a *tieringManifestAdapter) SeedColdMarks(ctx context.Context, marks map[st
 
 var _ tiering.ColdMarker = (*tieringManifestAdapter)(nil)
 
+// ColdMarkBackend: the cold store the cluster's cold mark was seeded from,
+// which a reader compares with its own before retiring cold rows (#1563).
+func (a *tieringManifestAdapter) ColdMarkBackend() (backend string, seeded, conflict bool) {
+	return a.coordinator.ColdMarkBackend()
+}
+
+var _ tiering.ColdStoreIdentity = (*tieringManifestAdapter)(nil)
+
 func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
 	return a.coordinator.CompactionOwns(path)
 }
