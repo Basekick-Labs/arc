@@ -1733,12 +1733,7 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 	// an unclean path), and raw string comparison then lands every commit in
 	// warn-once "hint unaddressable" mode. Resolution must be SYMMETRIC —
 	// all three values or none — and the two constant sides are cached.
-	e.resolveOnce.Do(func() {
-		e.resolvedWarehouse = decodedURIPath(resolveFileURI(e.warehouse))
-		if e.backend != nil {
-			e.resolvedRoot = decodedURIPath(resolveFileURI(DefaultWarehouse(e.backend)))
-		}
-	})
+	e.resolveBases()
 	loc := decodedURIPath(resolveFileURI(metaLoc))
 	if !isUnderDir(loc, e.resolvedWarehouse) {
 		return "", false
@@ -1752,6 +1747,16 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimPrefix(strings.TrimPrefix(loc, e.resolvedRoot), "/"), true
+}
+
+// resolveBases computes the symlink-resolved warehouse and storage root once.
+func (e *Exporter) resolveBases() {
+	e.resolveOnce.Do(func() {
+		e.resolvedWarehouse = decodedURIPath(resolveFileURI(e.warehouse))
+		if e.backend != nil {
+			e.resolvedRoot = decodedURIPath(resolveFileURI(DefaultWarehouse(e.backend)))
+		}
+	})
 }
 
 // decodedURIPath returns the URI's logical path without percent escapes for comparisons and
@@ -1778,6 +1783,13 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	// iceberg-go's 0644 metadata world-readable.
 	resolved := decodedURIPath(resolveFileURI(metaLoc))
 	if !strings.HasPrefix(resolved, scheme) {
+		return
+	}
+	// Only inside the configured warehouse: the walk below chmods the
+	// metadata directory and two ancestors, so a location that resolved
+	// somewhere else must never reach it (#1616).
+	e.resolveBases()
+	if !isUnderDir(resolved, e.resolvedWarehouse) {
 		return
 	}
 	metaDir := filepath.Dir(filepath.FromSlash(strings.TrimPrefix(resolved, scheme)))

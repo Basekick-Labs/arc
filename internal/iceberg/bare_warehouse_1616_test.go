@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -29,7 +30,7 @@ func TestNormalizeLocalWarehouse(t *testing.T) {
 		{"rel/wh", localFileURI(filepath.Join(cwd, "rel", "wh"))},
 		// iceberg-go's url.JoinPath would clean the leading ../ away.
 		{"../wh", localFileURI(filepath.Join(filepath.Dir(cwd), "wh"))},
-		{"/data/my wh", localFileURI("/data/my wh")},
+		{"/data/my wh", "file:///data/my%20wh"},
 		{"file:///data/wh", "file:///data/wh"},
 		{"s3://bucket/prefix", "s3://bucket/prefix"},
 		{"", ""},
@@ -55,11 +56,15 @@ func TestResolveFileURI_BarePathsAndSchemeSpellings(t *testing.T) {
 	// A bare path is literal: iceberg-go writes "my%20wh" to a directory of
 	// that name, so it must not be decoded to "my wh".
 	literal := filepath.Join(dir, "my%20wh", "x.json")
-	if got, decoded := decodedURIPath(resolveFileURI(literal)), decodedURIPath(localFileURI(filepath.Join(dir, "my wh", "x.json"))); got == decoded {
-		t.Errorf("a bare %q was percent-decoded to %q", literal, got)
+	if got := decodedURIPath(resolveFileURI(literal)); !strings.HasSuffix(got, "/my%20wh/x.json") {
+		t.Errorf("a bare %q resolved to %q: percent-decoded", literal, got)
 	}
-	if got := resolveFileURI("s3://bucket/a/b"); got != "s3://bucket/a/b" {
-		t.Errorf("s3 location changed: %q", got)
+	// Unchanged: other schemes, and an opaque file:wh (url.Parse leaves its
+	// path empty, which would resolve to the working directory).
+	for _, in := range []string{"s3://bucket/a/b", "file:wh/metadata/00001-x.metadata.json", "file:"} {
+		if got := resolveFileURI(in); got != in {
+			t.Errorf("resolveFileURI(%q) = %q, want it unchanged", in, got)
+		}
 	}
 }
 
@@ -138,5 +143,39 @@ func TestBareWarehouse_SiblingOfTheRootPublishesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "arc_mydb.db")); err == nil {
 		t.Fatal("metadata leaked into the storage root")
+	}
+}
+
+// Hardening chmods the metadata directory and two ancestors, so it must only
+// touch locations inside the configured warehouse, whatever they resolve to.
+func TestHardenLocalMetadataPerms_OnlyInsideTheWarehouse(t *testing.T) {
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(filepath.Join(root, "data"), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	exp, err := NewExporter(db, backend, NormalizeLocalWarehouse(filepath.Join(root, "data", "wh")), "arc", 3, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(root, "otherapp", "ns.db", "t", "metadata")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(other, "00001-x.metadata.json")
+	if err := os.WriteFile(f, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exp.hardenLocalMetadataPerms(f)
+	if info, err := os.Stat(f); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("a file outside the warehouse was chmodded: %v %v", info.Mode().Perm(), err)
+	}
+	if info, err := os.Stat(filepath.Join(root, "otherapp")); err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("a directory outside the warehouse was chmodded: %v %v", info.Mode().Perm(), err)
 	}
 }

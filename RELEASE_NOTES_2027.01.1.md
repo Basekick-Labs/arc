@@ -3862,8 +3862,11 @@ Now:
   tightened, and old versions pruned, on the next export pass.
 - **A database delete now removes these tables' warehouse metadata**, as it
   always did for a `file://` warehouse. Before, it left the metadata behind.
+  Tables in the misspelled directories of the last bullet are still left.
 - The `file` scheme is matched in any case and with one slash (`file:/data`),
-  as iceberg-go accepts.
+  as iceberg-go accepts, by the export and by backup. `file:data` (no slash)
+  is not a path and is left alone.
+- Metadata permissions are tightened only inside the configured warehouse.
 - A plain path with a space, a leading `../`, or a dotted namespace (#1129)
   was written by iceberg-go to a directory spelled differently from the
   configured one (`my%20wh`, the `..` dropped). Existing tables there stay

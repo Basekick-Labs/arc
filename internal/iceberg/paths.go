@@ -62,9 +62,11 @@ func isBareLocalPath(s string) bool {
 
 // isFileURI reports whether s is a file URI, in any case of the scheme and
 // with one slash or three (file:/x, FILE:///x), as iceberg-go accepts.
+// An opaque one (file:wh, no slash) is not: url.Parse leaves its Path empty,
+// which would resolve to the working directory.
 func isFileURI(s string) (*url.URL, bool) {
 	u, err := url.Parse(s)
-	if err != nil || !strings.EqualFold(u.Scheme, "file") || u.Host != "" {
+	if err != nil || u.Scheme != "file" || u.Host != "" || u.Opaque != "" || u.Path == "" {
 		return nil, false
 	}
 	return u, true
@@ -167,12 +169,11 @@ func (r *PathResolver) LocalPath(relativeKey string) string {
 // other scheme, which no local backend can address.
 func LocalWarehousePath(raw string) (string, bool) {
 	p := strings.TrimSpace(raw)
-	if p == "" {
-		return "", false
-	}
 	if strings.HasPrefix(p, "file://") {
 		p = strings.TrimPrefix(p, "file://")
-	} else if strings.Contains(p, "://") {
+	} else if u, ok := isFileURI(p); ok {
+		p = u.Path // FILE:///x, file:/x: spellings iceberg-go accepts (#1616)
+	} else if !isBareLocalPath(p) {
 		return "", false
 	}
 	if p == "" {

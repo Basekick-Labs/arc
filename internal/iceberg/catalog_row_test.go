@@ -78,6 +78,10 @@ func TestLocalWarehousePath(t *testing.T) {
 		{"azure://container", "", false},
 		{"", "", false},
 		{"file://", "", false},
+		// #1616: spellings iceberg-go accepts; an opaque file:wh is not a path.
+		{"file:/var/lib/arc/wh", filepath.Clean("/var/lib/arc/wh"), true},
+		{"FILE:///var/lib/arc/wh", filepath.Clean("/var/lib/arc/wh"), true},
+		{"file:wh", "", false},
 	}
 	for _, c := range cases {
 		got, ok := LocalWarehousePath(c.raw)
