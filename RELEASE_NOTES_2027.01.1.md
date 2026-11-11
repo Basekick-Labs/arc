@@ -3856,11 +3856,18 @@ storage backend, as reconciliation already did. Only the primary writer
 migrates; the other nodes sync their tier metadata and retire cold rows the
 primary removed (#1563).
 
+Tiering now follows the primary's availability, like retention and
+continuous queries: it pauses until the first primary is elected, and with
+writer failover off, after the primary is lost until an operator promotes
+another.
+
 In that configuration:
-- A node with the default `cluster.role` (`standalone`) now refuses to start,
-  as it already does with `cluster.shared_storage_mode`. It could never pass
-  the primary-writer gate, so tiering, retention, continuous queries and
-  deletes ran on no node.
+- A node with the default `cluster.role` (`standalone`) and a clustering
+  licence now refuses to start, as it already does with
+  `cluster.shared_storage_mode`. It never passes the primary-writer gate:
+  retention, continuous queries and deletes already ran on no node, and with
+  this fix tiering would too. Without a clustering licence no coordinator is
+  built and the node is not refused.
 - An empty `cluster.raft_data_dir` (no primary is elected, so every writer
   acts as primary) logs a Warn.
 - So does a node whose cluster coordinator is not running (no clustering

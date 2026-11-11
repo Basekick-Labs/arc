@@ -57,7 +57,9 @@ func gateTieringInLocalClusterWithoutReplication(role string) bool {
 
 // objectStoreCluster reports a cluster whose hot storage is an object store,
 // whatever cluster.shared_storage_mode says. backend is the configured
-// storage.backend, lowercased at load.
+// storage.backend, lowercased at load. "Not local" is safe as a test because
+// the set is closed: any other value is refused at load, so every non-local
+// value is an object store.
 func objectStoreCluster(clusterEnabled bool, backend string) bool {
 	return clusterEnabled && backend != "" && backend != "local"
 }
@@ -83,5 +85,15 @@ const objectStoreClusterNoRaftWarning = "This cluster shares an object-store buc
 // clustering licence, or it failed to start, see the errors above). Shared-
 // storage mode refuses to start in that state; this configuration runs, with
 // nothing gating it.
-const objectStoreClusterNoCoordinatorWarning = "cluster.enabled is set on an object-store backend but the cluster coordinator is not running (see the errors above): " +
+const objectStoreClusterNoCoordinatorWarning = "cluster.enabled is set on an object-store backend but the cluster coordinator is not running (see the log above): " +
 	"this node runs tiering migration, retention, continuous queries and deletes against the shared bucket unconditionally, as if no other node used it"
+
+// tieringGateWired reports whether a cluster node's tiering gets the writer
+// gate. sharedObjectStore is cluster.IsSharedObjectStore of the backend that
+// was built: a hot bucket is shared whether or not shared_storage_mode is set
+// (#1603). role is the node's resolved role.
+func tieringGateWired(sharedMode, replication, sharedObjectStore bool, backend, role string) bool {
+	return sharedMode || replication || sharedObjectStore ||
+		(localClusterWithoutReplication(true, backend, sharedMode, replication) &&
+			gateTieringInLocalClusterWithoutReplication(role))
+}

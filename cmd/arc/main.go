@@ -1081,9 +1081,12 @@ func main() {
 	}
 	// The single-writer form of Pattern 2: an object-store cluster without
 	// the flag (#1603). Shared-storage mode refuses a standalone role above;
-	// so does this, for the same reason. No Raft means no elected primary.
+	// so does this, for the same reason, but only with a clustering licence:
+	// without one no coordinator is built, nothing is gated, and the node
+	// runs as a standalone node does (the no-coordinator Warn below says so).
+	// No Raft means no elected primary.
 	if objectStoreCluster(cfg.Cluster.Enabled, cfg.Storage.Backend) && !cfg.Cluster.SharedStorageMode {
-		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone {
+		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone && licenseHasClustering(licenseClient) {
 			log.Fatal().Str("role", cfg.Cluster.Role).Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterStandaloneRoleError)
 		}
 		if cfg.Cluster.RaftDataDir == "" {
@@ -4811,8 +4814,8 @@ func main() {
 				// the flag it is the single-writer form of Pattern 2, whose
 				// primary the writer-failover manager elects (#1603). So the
 				// bucket is recognised from the backend that was built, as
-				// reconciliation and the manifest delete callbacks
-				// (startSharedManifestCallbacks) already decide it.
+				// reconciliation (IsSharedObjectStore) and the manifest delete
+				// callbacks (the storage type) already decide it.
 				//
 				// A local-storage cluster without replication is neither
 				// shipped pattern (cluster_topology.go, #1599). Its writers
@@ -4831,10 +4834,8 @@ func main() {
 						coordinator: clusterCoordinator,
 						logger:      logger.Get("tiering-manifest"),
 					}
-					if cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled ||
-						cluster.IsSharedObjectStore(storageBackend) ||
-						(localClusterWithoutReplication(true, cfg.Storage.Backend, cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled) &&
-							gateTieringInLocalClusterWithoutReplication(clusterCoordinator.Role())) {
+					if tieringGateWired(cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled,
+						cluster.IsSharedObjectStore(storageBackend), cfg.Storage.Backend, clusterCoordinator.Role()) {
 						tieringGate = newWriterClusterGate(clusterCoordinator)
 					}
 				}
