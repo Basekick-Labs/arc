@@ -161,6 +161,10 @@
         "shared": {
           "type": "object",
           "properties": {
+            "multiWriter": {
+              "type": "boolean",
+              "description": "true = Pattern 2 multi-writer (sets cluster.shared_storage_mode; needs the shared_storage_multi_writer licence feature). false = single-writer shared storage: one elected primary, standbys forward writes, no multi-writer licence."
+            },
             "backend": {
               "type": "string",
               "enum": [

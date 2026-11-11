@@ -4472,6 +4472,12 @@ func main() {
 			Msg("cluster.shared_storage_mode=true but the cluster coordinator is not running (see the errors above); without it retention, CQ and tiering migration would run on this node unconditionally against the shared bucket")
 	}
 	if !cfg.Cluster.SharedStorageMode && objectStoreCluster(cfg.Cluster.Enabled, cfg.Storage.Backend) && clusterCoordinator == nil {
+		// Licensed for clustering, so the coordinator failed to start (Raft,
+		// TLS): refused, as shared-storage mode refuses it above. Without
+		// the licence the node is plainly standalone and only warned (#1606).
+		if licenseHasClustering(licenseClient) {
+			log.Fatal().Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterCoordinatorFailedError)
+		}
 		log.Warn().Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterNoCoordinatorWarning)
 	}
 
