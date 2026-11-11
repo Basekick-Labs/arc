@@ -131,19 +131,53 @@ func TestReaderWritesBackARowReRecordedDuringTheRetire(t *testing.T) {
 		if path != missA {
 			return
 		}
-		cold.seedRaw(missA, []byte("x"))
+		cold.seedRaw(missA, []byte("xyz"))
 		if _, err := m.metadata.RecordColdFilesBatch(context.Background(), []FileMetadata{{
-			Path: missA, Database: "db1", Measurement: "cpu", Tier: TierCold, SizeBytes: 1,
+			Path: missA, Database: "db1", Measurement: "cpu", Tier: TierCold, SizeBytes: 3,
 		}}, time.Time{}); err != nil {
 			t.Error(err)
 		}
 	}
 	syncListing(t, m, cold, otherCold)
-	if row := coldRow(t, m, missA); row == nil || row.Tier != TierCold {
-		t.Fatalf("missA row = %+v, want it written back", row)
+	// Written back with the size the store reports, not the stale row's.
+	if row := coldRow(t, m, missA); row == nil || row.Tier != TierCold || row.SizeBytes != 3 {
+		t.Fatalf("missA row = %+v, want it written back cold with size 3", row)
 	}
 	if coldRow(t, m, missB) != nil {
 		t.Fatal("missB not retired")
+	}
+}
+
+// statFailsCold answers Exists normally and fails every StatFile: the stat
+// after the delete cannot tell whether the object is back.
+type statFailsCold struct{ *listedColdObjects }
+
+func (statFailsCold) StatFile(context.Context, string) (int64, error) {
+	return -1, errors.New("cold stat failed") // -1: the error alone must decide
+}
+
+// A stat after the delete that fails writes the row back: the next sync
+// decides again.
+func TestReaderWritesBackARowWhenThePostDeleteStatFails(t *testing.T) {
+	m, _, cold := readerRig(t)
+	m.coldBackend = statFailsCold{&listedColdObjects{mockBackend: cold, objects: coldObjects(otherCold)}}
+	if _, err := m.syncColdTierMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if coldRow(t, m, missA) == nil || coldRow(t, m, missB) == nil {
+		t.Fatal("a row was left retired although the stat after its delete failed")
+	}
+}
+
+// The checks never take more than half of what is left of the scan's budget.
+func TestReaderRetireBudgetLeavesTheHotScanHalf(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	if b := readerRetireBudget(ctx); b > 2*time.Minute || b < 119*time.Second {
+		t.Fatalf("budget %v with 4m left, want about 2m", b)
+	}
+	if b := readerRetireBudget(context.Background()); b != readerColdRetireBudget {
+		t.Fatalf("budget %v without a deadline, want %v", b, readerColdRetireBudget)
 	}
 }
 
@@ -243,11 +277,9 @@ func TestRetireColdRowIfUnquarantinedSkipsQuarantined(t *testing.T) {
 	if err := m.metadata.QuarantineFile(ctx, missA, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := m.metadata.RetireColdRowIfUnquarantined(ctx, missA); err != nil || ok {
-		t.Fatalf("retired a quarantined row: %v %v", ok, err)
-	}
-	if ok, err := m.metadata.RetireColdRowIfUnquarantined(ctx, missB); err != nil || !ok {
-		t.Fatalf("did not retire an ordinary cold row: %v %v", ok, err)
+	got, err := m.metadata.RetireColdRowsIfUnquarantined(ctx, []string{missA, missB})
+	if err != nil || len(got) != 1 || got[0] != missB {
+		t.Fatalf("retired %v (%v), want only missB: a quarantined row is never retired", got, err)
 	}
 }
 

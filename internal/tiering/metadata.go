@@ -1281,24 +1281,53 @@ func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier 
 	return true, nil
 }
 
-// RetireColdRowIfUnquarantined deletes path's row only while it is cold and
-// not quarantined, and invalidates its tier-cache scope. Reports whether a
-// row was deleted. A quarantined row is the record that a key is unusable
-// (#758) and is never retired here.
-func (s *MetadataStore) RetireColdRowIfUnquarantined(ctx context.Context, path string) (bool, error) {
-	database, measurement, found, err := s.deleteReturningScope(ctx,
-		`DELETE FROM tier_files WHERE path = ? AND tier = ? AND quarantined_at IS NULL RETURNING database, measurement`,
-		path, string(TierCold))
-	if err != nil {
-		return false, fmt.Errorf("failed to retire cold row: %w", err)
+// retireColdRowsChunk bounds one DELETE's IN list.
+const retireColdRowsChunk = 500
+
+// RetireColdRowsIfUnquarantined deletes the rows of paths that are still cold
+// and not quarantined, one statement per chunk of retireColdRowsChunk, and
+// invalidates the tier cache once per database/measurement it touched (one
+// invalidation per row would discard every concurrent tier-cache fill on a
+// node serving queries, #1188). Returns the paths it deleted, including those
+// deleted before an error. A quarantined row is the record that a key is
+// unusable (#758) and is never retired here.
+func (s *MetadataStore) RetireColdRowsIfUnquarantined(ctx context.Context, paths []string) ([]string, error) {
+	touched := make(map[tierCacheScope]struct{})
+	defer s.invalidateTierCacheScopes(touched)
+	var deleted []string
+	for start := 0; start < len(paths); start += retireColdRowsChunk {
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		chunk := paths[start:min(start+retireColdRowsChunk, len(paths))]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, string(TierCold))
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		rows, err := s.db.QueryContext(ctx, `DELETE FROM tier_files WHERE tier = ? AND quarantined_at IS NULL AND path IN (?`+
+			strings.Repeat(",?", len(chunk)-1)+`) RETURNING path, database, measurement`, args...)
+		if err != nil {
+			return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+		}
+		for rows.Next() {
+			var path, database, measurement string
+			if err := rows.Scan(&path, &database, &measurement); err != nil {
+				rows.Close()
+				return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+			}
+			deleted = append(deleted, path)
+			if database != "" && measurement != "" {
+				touched[tierCacheScope{database: database, measurement: measurement}] = struct{}{}
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+		}
 	}
-	if !found {
-		return false, nil
-	}
-	if database != "" && measurement != "" {
-		s.invalidateTierCache(database, measurement)
-	}
-	return true, nil
+	return deleted, nil
 }
 
 // hotRowsPage returns up to limit hot rows that are not quarantined, with an

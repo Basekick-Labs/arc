@@ -1470,16 +1470,19 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// above, and it never held a quarantined row. The database is the key's
 	// first segment, as every writer of a tier row lays it out.
 	//
-	// For every database on a cluster reader, not only hot-only ones (#1563):
-	// the primary's DELETE and retention point such a row back at its hot
-	// copy, and nothing tells a reader. A reader that kept it cold refused its
-	// own hot registration over it, and a measurement whose only hot file it
-	// was lost its hot glob on that reader. During a migration the cold
-	// object exists, so the row is not in unseen; once the primary flips the
-	// row, the manifest entry is gone, so the size match below fails.
+	// For every database on a cluster reader, not only hot-only ones (#1563).
+	// A row lands here with its hot path still in the manifest when the
+	// primary rolled a move back before unlinking the hot copy: a compaction
+	// took the file over (dropTakenOver), a copy failed and was cleaned up,
+	// or it stopped between the flip and the unlink. Nothing tells a reader,
+	// which then refused its own hot registration over the cold row, and a
+	// measurement whose only hot file it was lost its hot glob there. During
+	// a migration the cold object exists, so the row is not in unseen; after
+	// a completed one the manifest entry is gone, so the size match below
+	// fails and the row is left to retirement.
 	for path, size := range unseen {
 		database, _, _ := strings.Cut(path, "/")
-		if !m.IsHotOnly(ctx, database) && !m.roleGated() {
+		if !m.roleGated() && !m.IsHotOnly(ctx, database) {
 			continue
 		}
 		if m.manifest != nil {
@@ -1514,10 +1517,14 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		} else {
 			res := m.retireUnseenColdRows(ctx, unseen)
 			synced += res.retired
-			if res.retired > 0 {
+			switch {
+			case res.retired > 0:
 				m.logger.Info().Int("retired", res.retired).Strs("sample", res.sample).
-					Int("left", res.kept+res.unchecked).Int("unchecked", res.unchecked).
-					Msg("Retired cold tier rows whose cold object and hot copy are both gone (removed by the primary, or outside Arc)")
+					Int("left", len(unseen)).Int("unchecked", res.unchecked).Int("failed", res.failed).
+					Msg("Retired cold tier rows whose cold object and hot copy are both gone (removed by the primary, or outside Arc); rows left are retried by the next cold sync")
+			case res.unchecked > 0 || res.failed > 0:
+				m.logger.Warn().Int("unchecked", res.unchecked).Int("failed", res.failed).
+					Msg("Could not check or retire cold tier rows whose object is gone; the next cold sync tries again")
 			}
 			for scope, n := range res.byScope {
 				if total := coldRowsByScope[scope]; total > 0 && 2*n > total {

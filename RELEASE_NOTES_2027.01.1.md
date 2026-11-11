@@ -3865,11 +3865,18 @@ A reader retires nothing in these cases, and logs why:
 - the store identity is unknown and the cold listing came back empty.
 
 The pass is bounded by time, not by row count, so a day of retention clears in
-one sync.
+one sync. It never takes more than half of what is left of the scan's budget.
+It deletes rows in batches, one tier-cache invalidation per measurement. The
+first syncs after an upgrade may take several cycles to clear the backlog of
+everything the primary ever removed; each logs how many rows are left. The
+reader compares cold stores by their configured identity (backend, endpoint,
+region or account, bucket and prefix), so every node's `tiered_storage.cold`
+settings must be spelled identically.
 
-A cold row whose object is gone but whose hot copy the manifest still lists is
-now pointed back at hot on readers too, as the primary does. Before, that
-happened only for hot-only databases. A reader that kept such a row cold
+A cold row whose object is gone but whose hot copy the manifest still lists
+(the primary rolled a move back before unlinking the hot copy, for example
+after a compaction took the file over) is now pointed back at hot on readers
+too. Before, that happened only for hot-only databases. A reader that kept such a row cold
 refused its own hot registration over it, so a measurement whose only hot file
 it was could not be read on that reader.
 
