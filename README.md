@@ -4,6 +4,7 @@
 [![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![Grump found nothing to complain about](https://grump.run/badge.svg)](https://grump.run/?utm_source=github&utm_medium=readme&utm_campaign=basekick-arc)
 
 [![Docs](https://img.shields.io/badge/docs-basekick.net-blue?logo=gitbook)](https://docs.basekick.net/arc)
 [![Website](https://img.shields.io/badge/website-basekick.net-orange?logo=firefox)](https://basekick.net)
