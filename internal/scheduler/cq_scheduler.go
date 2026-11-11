@@ -28,7 +28,14 @@ type CQScheduler struct {
 	wg               sync.WaitGroup
 	stopCh           chan struct{}
 	running          bool
-	logger           zerolog.Logger
+	// deleted holds the CQs StopJob was called for: their rows are gone, and
+	// startJob refuses them. A reload that read a row before its delete
+	// committed (ReloadCQ waits for the old job outside the lock, ReloadAll
+	// lists before it takes the lock) would otherwise start a job for it
+	// after StopJob ran. IDs are AUTOINCREMENT and never reused, so the set
+	// is never cleared. Guarded by mu.
+	deleted map[int64]struct{}
+	logger  zerolog.Logger
 }
 
 // cqJob represents a scheduled CQ job
@@ -56,6 +63,7 @@ func NewCQScheduler(cfg *CQSchedulerConfig) (*CQScheduler, error) {
 		licenseClient: cfg.LicenseClient,
 		clusterGate:   cfg.ClusterGate,
 		jobs:          make(map[int64]*cqJob),
+		deleted:       make(map[int64]struct{}),
 		stopCh:        make(chan struct{}),
 		logger:        cfg.Logger.With().Str("component", "cq-scheduler").Logger(),
 	}
@@ -222,13 +230,15 @@ func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive
 	return s.startJob(cqID, name, interval)
 }
 
-// StopJob stops the job of a deleted CQ (call after CQ delete). It does not
-// wait for a run in flight: stopping cancels its context, and no job replaces
-// it, so there is nothing to wait for. SyncJobs stops the job of a CQ deleted
-// in a cluster the same way.
+// StopJob stops the job of a deleted CQ (call after the row delete commits)
+// and records the ID, so no reload that read the row earlier can start a job
+// for it again. A no-op for an ID with no job. It does not wait for a run in
+// flight: stopping cancels its context. SyncJobs stops the job of a CQ
+// deleted in a cluster, where StopJob is not called.
 func (s *CQScheduler) StopJob(cqID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.deleted[cqID] = struct{}{}
 	s.stopJobLocked(cqID)
 }
 
@@ -300,6 +310,12 @@ func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
 	// a job already running for the CQ is replaced, never orphaned: Reload*
 	// and SyncJobs can both reach here for the same CQ.
 	if !s.running {
+		return nil
+	}
+	if _, gone := s.deleted[cqID]; gone {
+		// Deleted after the caller read its row: StopJob ran first, under
+		// this lock, so this is the stale start it guards against.
+		s.logger.Debug().Int64("cq_id", cqID).Str("cq_name", cqName).Msg("Not starting a job for a deleted CQ")
 		return nil
 	}
 	s.stopJobLocked(cqID)

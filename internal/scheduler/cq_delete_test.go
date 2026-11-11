@@ -76,3 +76,45 @@ func TestDeletingACQStopsItsJob(t *testing.T) {
 		t.Fatalf("%d jobs after a 404 delete; want only the other CQ's, unchanged", s.JobCount())
 	}
 }
+
+// A reload that read a CQ's row before its delete committed, and starts the
+// job after StopJob ran, does not bring the job back. ReloadCQ waits for the
+// old job outside the lock and ReloadAll lists before it takes the lock, so
+// either can start from a stale row; StartJobDirect stands in for that start.
+func TestADeletedCQIsNotRestartedByAStaleReload(t *testing.T) {
+	h, err := api.NewContinuousQueryHandler(nil, nil, nil,
+		&config.ContinuousQueryConfig{Enabled: true, DBPath: filepath.Join(t.TempDir(), "cq.db")}, nil, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { h.Close() })
+	s := runningCQScheduler(t)
+	h.SetScheduler(s)
+	app := fiber.New()
+	h.RegisterRoutes(app)
+
+	body := `{"name":"a","database":"db","source_measurement":"src","destination_measurement":"dst",` +
+		`"query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"}`
+	if status := sendCQRequest(t, app, "POST", "/api/v1/continuous_queries", body); status != fiber.StatusCreated {
+		t.Fatalf("create: status %d", status)
+	}
+	if status := sendCQRequest(t, app, "DELETE", "/api/v1/continuous_queries/1", ""); status != fiber.StatusOK {
+		t.Fatalf("delete: status %d", status)
+	}
+
+	// The reload's start, with the row it read before the delete.
+	if err := s.StartJobDirect(1, "a", "1h", true); err != nil {
+		t.Fatal(err)
+	}
+	if j := s.jobFor(1); j != nil {
+		t.Fatalf("a stale reload restarted the deleted CQ's job: %+v", j)
+	}
+
+	// Other CQs still start.
+	if err := s.StartJobDirect(2, "b", "1h", true); err != nil {
+		t.Fatal(err)
+	}
+	if s.jobFor(2) == nil {
+		t.Fatal("a CQ that was never deleted did not start")
+	}
+}

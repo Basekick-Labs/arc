@@ -34,7 +34,9 @@ type CQSchedulerReloader interface {
 	// StartJobDirect schedules a job using data already in hand, avoiding a
 	// redundant SQLite read that could race with the just-committed INSERT.
 	StartJobDirect(cqID int64, name, interval string, isActive bool) error
-	// StopJob stops the job of a CQ that was deleted.
+	// StopJob stops the job of a CQ that was deleted, and keeps any later
+	// start for that ID from scheduling it again. A no-op when the CQ has no
+	// job or the scheduler is not running.
 	StopJob(cqID int64)
 }
 

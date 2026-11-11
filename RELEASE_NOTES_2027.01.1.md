@@ -3850,8 +3850,10 @@ continuous query but left its scheduler job running. The job kept firing at
 the query's interval until the next restart or `POST
 /api/v1/schedulers/cq/reload`. Each run failed on the missing definition and
 logged `Scheduled CQ execution failed` at Error, and `GET /api/v1/schedulers`
-kept listing the deleted query among its jobs. The delete now stops the job.
-In a cluster, the job of a deleted continuous query was already stopped.
+kept listing the deleted query among its jobs. The delete now stops the job,
+and an update or `POST /api/v1/schedulers/cq/reload` that runs at the same
+moment can no longer start it again. In a cluster, the job of a deleted
+continuous query was already stopped.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1600](https://github.com/Basekick-Labs/arc/pull/1600).
