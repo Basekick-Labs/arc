@@ -480,8 +480,9 @@ args:
 {{/*
 "true" when this is a shared-storage install running Pattern 2 multi-writer
 (storage.shared.multiWriter, default true), "false" otherwise. An explicit
-false is tested with kindIs: `default` would turn false into the default,
-and helm 3 and 4 treat an absent and a null value differently.
+false is tested with kindIs: `default` would turn false into the default.
+An absent or null value (an upgrade with --reuse-values from a release
+without it) means true.
 */}}
 {{- define "arc-enterprise.sharedMultiWriter" -}}
 {{- $shared := .Values.storage.shared | default dict -}}

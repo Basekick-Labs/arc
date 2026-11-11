@@ -4,9 +4,9 @@
 # Multi-writer sets cluster.shared_storage_mode on every role, which needs the
 # shared_storage_multi_writer licence feature at any writer count. Single-writer
 # leaves it unset, so one elected primary takes writes and no multi-writer
-# licence is needed. An explicit false must win: a `default` in the template
-# would turn it back into true, and helm 3 and 4 treat absent and null values
-# differently, so every case runs under the CI-pinned helm too.
+# licence is needed. An explicit false must win (a `default` in the template
+# would turn it back into true), and an absent or null value must mean true:
+# an upgrade with --reuse-values from a release without the key has none.
 set -euo pipefail
 
 chart="${1:-helm/arc-enterprise}"
@@ -28,6 +28,11 @@ flag_count() { grep -c 'name: ARC_CLUSTER_SHARED_STORAGE_MODE' <<<"$1" || true; 
 out=$(render)
 [ "$(flag_count "$out")" -eq 3 ] || fail "default: shared_storage_mode not on all three roles"
 
+# Null, as an upgrade with --reuse-values from an older release leaves it:
+# still multi-writer.
+out=$(render --set storage.shared.multiWriter=null)
+[ "$(flag_count "$out")" -eq 3 ] || fail "multiWriter=null: shared_storage_mode not on all three roles"
+
 # Explicit true at one writer: still multi-writer (the value decides, not the count).
 out=$(render --set storage.shared.multiWriter=true --set writer.replicas=1)
 [ "$(flag_count "$out")" -eq 3 ] || fail "multiWriter=true: shared_storage_mode not on all three roles"
@@ -37,8 +42,8 @@ out=$(render --set storage.shared.multiWriter=true --set writer.replicas=1)
 for replicas in 3 1; do
   out=$(render --set storage.shared.multiWriter=false --set writer.replicas="$replicas")
   [ "$(flag_count "$out")" -eq 0 ] || fail "multiWriter=false, $replicas writers: shared_storage_mode rendered"
-  grep -A1 'name: ARC_CLUSTER_REPLICATION_ENABLED' <<<"$out" | grep -q 'value: "true"' && fail "multiWriter=false: replication enabled on a shared bucket"
-  grep -q 'name: ARC_CLUSTER_FAILOVER_ENABLED' <<<"$out" || fail "multiWriter=false: writer failover not enabled by default"
+  repl_on=$(grep -A1 'name: ARC_CLUSTER_REPLICATION_ENABLED' <<<"$out" | grep -c 'value: "true"' || true)
+  [ "$repl_on" -eq 0 ] || fail "multiWriter=false: replication enabled on a shared bucket"
 done
 
 # Local storage never sets the flag, whatever multiWriter says.

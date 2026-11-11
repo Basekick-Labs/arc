@@ -3916,9 +3916,10 @@ In that configuration:
   built and the node is not refused.
 - An empty `cluster.raft_data_dir` (no primary is elected, so every writer
   acts as primary) logs a Warn.
-- So does a node whose cluster coordinator is not running (no clustering
-  licence, or it failed to start), which then runs everything ungated
-  against the shared bucket.
+- So does a node whose cluster coordinator is not running because the
+  licence lacks clustering, which then runs everything ungated against the
+  shared bucket. A licensed node whose coordinator failed to start is refused
+  (#1606).
 
 ### Fix: a local-storage cluster without replication warns, and its readers stop reporting a writer's deletes as lost ([#1599](https://github.com/Basekick-Labs/arc/issues/1599))
 

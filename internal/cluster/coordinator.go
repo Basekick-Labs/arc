@@ -617,7 +617,8 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// docs/progress/2026-05-26-multi-writer-pattern2.md.
 	if c.raftNode != nil && !cfg.Config.SharedStorageMode {
 		// Built whenever Raft runs without shared_storage_mode (local
-		// storage, or a single-writer shared bucket, #1603), not only when failover is
+		// storage, or a single-writer shared bucket, #1603), not only when
+		// failover is
 		// enabled and licensed. It is a goroutine on every node whose loop
 		// returns unless this node is the Raft leader, so there is no cost to
 		// having it — and without it nothing ever issues CommandPromoteWriter,

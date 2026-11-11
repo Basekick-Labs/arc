@@ -1016,8 +1016,9 @@ type ClusterConfig struct {
 	//     refuses if licenseClient.CanUseSharedStorageMultiWriter()
 	//     is false. Requires FeatureSharedStorageMultiWriter license.
 	//
-	// Default false: single-writer shared storage, one elected primary
-	// (#1603, #1606). The Helm chart sets it from storage.shared.multiWriter.
+	// Default false: one elected primary writer (local storage, or a
+	// single-writer shared bucket, #1603). The Helm chart sets it from
+	// storage.shared.multiWriter (#1606).
 	//
 	// See docs/progress/2026-05-26-multi-writer-pattern2.md.
 	SharedStorageMode bool
