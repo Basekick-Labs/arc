@@ -3843,6 +3843,30 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: a single-writer cluster on an object store runs tiering on the primary only ([#1603](https://github.com/Basekick-Labs/arc/issues/1603))
+
+A cluster on an object-store backend without `cluster.shared_storage_mode` is
+the single-writer form of Pattern 2. Every node shares one bucket, one primary
+writer is elected, and writes go to it. It needs no multi-writer licence. Its
+tiered storage was not gated, because the gate was keyed on the flag rather
+than on the bucket. Every node, readers included, migrated the shared bucket,
+ran the hot-only cold cleanup and orphan reconciliation, and reported the
+other nodes' moves as missing. Tiering now recognises a shared bucket from the
+storage backend, as reconciliation already did. Only the primary writer
+migrates; the other nodes sync their tier metadata and retire cold rows the
+primary removed (#1563).
+
+In that configuration:
+- A node with the default `cluster.role` (`standalone`) now refuses to start,
+  as it already does with `cluster.shared_storage_mode`. It could never pass
+  the primary-writer gate, so tiering, retention, continuous queries and
+  deletes ran on no node.
+- An empty `cluster.raft_data_dir` (no primary is elected, so every writer
+  acts as primary) logs a Warn.
+- So does a node whose cluster coordinator is not running (no clustering
+  licence, or it failed to start), which then runs everything ungated
+  against the shared bucket.
+
 ### Fix: a local-storage cluster without replication warns, and its readers stop reporting a writer's deletes as lost ([#1599](https://github.com/Basekick-Labs/arc/issues/1599))
 
 A cluster on local storage with `cluster.replication_enabled=false` (the

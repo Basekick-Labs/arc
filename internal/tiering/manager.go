@@ -190,7 +190,8 @@ type ManagerConfig struct {
 
 	// ClusterGate, when non-nil, restricts storage mutation (migrate, delete,
 	// orphan reconciliation) to the primary writer. main.go wires it where
-	// nodes share data — shared-storage mode, and per-node storage with file
+	// nodes share data — a hot bucket (with or without
+	// cluster.shared_storage_mode, #1603), and per-node storage with file
 	// replication: there the primary's manifest deletes unlink every
 	// replica, so only one node may migrate. In a local-storage cluster
 	// without replication, which is neither supported pattern, only its

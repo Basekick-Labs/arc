@@ -56,3 +56,18 @@ func TestGateTieringInLocalClusterWithoutReplication(t *testing.T) {
 		}
 	}
 }
+
+func TestObjectStoreCluster(t *testing.T) {
+	for _, tc := range []struct {
+		enabled bool
+		backend string
+		want    bool
+	}{
+		{false, "s3", false}, {true, "local", false}, {true, "", false},
+		{true, "s3", true}, {true, "minio", true}, {true, "azure", true}, {true, "azblob", true}, {true, "gcs", true},
+	} {
+		if got := objectStoreCluster(tc.enabled, tc.backend); got != tc.want {
+			t.Errorf("enabled=%v backend=%q: %v, want %v", tc.enabled, tc.backend, got, tc.want)
+		}
+	}
+}
