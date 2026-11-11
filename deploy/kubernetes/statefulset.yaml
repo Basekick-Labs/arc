@@ -81,6 +81,15 @@ spec:
                 secretKeyRef:
                   name: arc-license
                   key: license-key
+            # Authenticates cluster join and heartbeat messages; a node with
+            # cluster.enabled refuses to start without it. Same value on every
+            # node: kubectl -n arc create secret generic arc-cluster \
+            #   --from-literal=shared-secret="$(openssl rand -hex 32)"
+            - name: ARC_CLUSTER_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: arc-cluster
+                  key: shared-secret
           volumeMounts:
             - name: data
               mountPath: /app/data
@@ -186,6 +195,15 @@ spec:
                 secretKeyRef:
                   name: arc-license
                   key: license-key
+            # Authenticates cluster join and heartbeat messages; a node with
+            # cluster.enabled refuses to start without it. Same value on every
+            # node: kubectl -n arc create secret generic arc-cluster \
+            #   --from-literal=shared-secret="$(openssl rand -hex 32)"
+            - name: ARC_CLUSTER_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: arc-cluster
+                  key: shared-secret
           volumeMounts:
             - name: data
               mountPath: /app/data

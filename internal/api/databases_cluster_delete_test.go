@@ -111,7 +111,7 @@ func TestDatabasesHandler_DeleteRetriesTransientLeaderChangeWithoutTiering(t *te
 		primary: true, role: "writer", entries: []*raft.FileEntry{{Path: path, Database: "db"}},
 		backend: backend, probePath: path, transientFailures: 1,
 	}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestDatabasesHandler_Delete1094RejectsNonPrimaryWriter(t *testing.T) {
 			handler, app, tmpDir := setupTestDatabasesHandler(t, true)
 			t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
 			coordinator := &databaseDeleteCoordinatorFake{role: role, primary: false}
-			handler.SetCoordinator(coordinator, true)
+			handler.SetCoordinator(coordinator)
 
 			resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 			if err != nil {
@@ -206,7 +206,7 @@ func TestDatabasesHandler_Delete1094ManifestFirstChunkedAndRetryable(t *testing.
 		failOnBatch: 2,
 	}
 	handler.storage = &databaseDeleteRecordingBackend{Backend: backend, events: &events}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -311,7 +311,7 @@ func TestDatabasesHandler_Delete1094SkipsEdgeSyncSpokeEntries(t *testing.T) {
 			{Path: "rocket-01/telemetry/cpu/b.parquet", Database: "telemetry"},
 		},
 	}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/telemetry?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -353,7 +353,7 @@ func TestDatabasesHandler_Delete1094TieringManagerOwnsManifestRemoval(t *testing
 		role:    "writer",
 		entries: []*raft.FileEntry{{Path: "db/cpu/a.parquet", Database: "db"}},
 	}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -387,7 +387,7 @@ func TestDatabasesHandler_Delete1094ProposesLocalFilesMissingFromTheManifest(t *
 	}
 	coordinator := &databaseDeleteCoordinatorFake{primary: true, role: "writer",
 		entries: []*raft.FileEntry{{Path: "rocket-01/telemetry/cpu/a.parquet", Database: "telemetry"}}}
-	handler.SetCoordinator(coordinator, true)
+	handler.SetCoordinator(coordinator)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/rocket-01?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -409,37 +409,6 @@ func TestDatabasesHandler_Delete1094ProposesLocalFilesMissingFromTheManifest(t *
 	}
 }
 
-// Without shared storage or replication the cluster gate is off, as the
-// tiering manager's is: nodes share nothing and each may delete its own files.
-func TestDatabasesHandler_Delete1094UngatedWithoutSharedStorageOrReplication(t *testing.T) {
-	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
-	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
-	ctx := context.Background()
-	if err := handler.storage.Write(ctx, "db/.arc-database", []byte("marker")); err != nil {
-		t.Fatal(err)
-	}
-	if err := handler.storage.Write(ctx, "db/cpu/a.parquet", []byte("hot")); err != nil {
-		t.Fatal(err)
-	}
-	coordinator := &databaseDeleteCoordinatorFake{primary: false, role: "reader",
-		entries: []*raft.FileEntry{{Path: "db/cpu/a.parquet", Database: "db"}}}
-	handler.SetCoordinator(coordinator, false)
-
-	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != fiber.StatusOK {
-		t.Fatalf("status = %d, want 200 on an ungated cluster", resp.StatusCode)
-	}
-}
-
-// #1599: the primary-writer check runs even with a tiering manager wired. In a
-// local-storage cluster without replication a writer's tiering is ungated, so
-// BeginDatabaseDelete alone (the fake below refuses nothing) would admit a
-// standby writer, which would then delete the shared cold objects and every
-// node's manifest entries for the database.
 func TestDatabasesHandler_Delete1599NonPrimaryRefusedWithTiering(t *testing.T) {
 	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
 	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
@@ -452,7 +421,7 @@ func TestDatabasesHandler_Delete1599NonPrimaryRefusedWithTiering(t *testing.T) {
 	}
 	events := []string{}
 	handler.tieringManager = &fakeDatabaseTieringManager{events: &events}
-	handler.SetCoordinator(&databaseDeleteCoordinatorFake{primary: false, role: "writer"}, true)
+	handler.SetCoordinator(&databaseDeleteCoordinatorFake{primary: false, role: "writer"})
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {

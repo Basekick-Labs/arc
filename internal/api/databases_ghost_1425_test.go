@@ -385,7 +385,7 @@ func TestDatabasesHandler_ManifestOnlyDatabaseIsListed(t *testing.T) {
 	entries := []*raft.FileEntry{{Path: "peerdb/cpu/2026/01/01/00/a.parquet", Database: "peerdb", Measurement: "cpu"}}
 
 	h := NewDatabasesHandler(backend, &config.DeleteConfig{Enabled: true}, nil, zerolog.Nop())
-	h.SetCoordinator(&databaseDeleteCoordinatorFake{primary: true, entries: entries}, false)
+	h.SetCoordinator(&databaseDeleteCoordinatorFake{primary: true, entries: entries})
 	app := fiber.New()
 	h.RegisterRoutes(app)
 	if got := listedDatabases(t, app); !equalStrings(got, []string{"peerdb"}) {

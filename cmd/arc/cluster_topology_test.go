@@ -30,10 +30,11 @@ func TestLocalClusterWithoutReplication(t *testing.T) {
 func TestLocalClusterWithoutReplicationWarningBranchesOnFailover(t *testing.T) {
 	without := localClusterWithoutReplicationWarning(false)
 	with := localClusterWithoutReplicationWarning(true)
-	if !strings.Contains(without, "every writer-role node acts as a primary writer") || strings.Contains(without, "promoted") {
+	if !strings.Contains(without, "every writer-role node acts as a primary writer") || strings.Contains(without, "promoted") ||
+		!strings.Contains(without, "report cold rows another node deleted as lost") {
 		t.Errorf("without failover: %q", without)
 	}
-	if !strings.Contains(with, "promoted by failover starts from an empty disk") {
+	if !strings.Contains(with, "promoted by failover has only the files it wrote itself") {
 		t.Errorf("with failover: %q", with)
 	}
 	for _, w := range []string{without, with} {

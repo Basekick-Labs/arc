@@ -4190,13 +4190,13 @@ func main() {
 	}
 	if clusterCoordinator != nil {
 		if localClusterWithoutReplication(true, cfg.Storage.Backend, cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled) {
-			log.Warn().Str("role", cfg.Cluster.Role).Msg(localClusterWithoutReplicationWarning(cfg.Cluster.FailoverEnabled))
+			log.Warn().Str("role", clusterCoordinator.Role()).Msg(localClusterWithoutReplicationWarning(cfg.Cluster.FailoverEnabled))
 		}
 		// Gated to the primary writer in every cluster: even nodes that share
 		// no hot storage share the cold tier, and a database delete removes
 		// every cold object under the database and the database's manifest
 		// entries for every node (#1599).
-		databasesHandler.SetCoordinator(clusterCoordinator, true)
+		databasesHandler.SetCoordinator(clusterCoordinator)
 		// The listings forward from a node that cannot serve queries, as the
 		// query routes do; a create, from a node that does not ingest, to
 		// the writer.
@@ -4813,8 +4813,8 @@ func main() {
 						logger:      logger.Get("tiering-manifest"),
 					}
 					if cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled ||
-						(localClusterWithoutReplication(true, cfg.Storage.Backend, false, false) &&
-							gateTieringInLocalClusterWithoutReplication(cfg.Cluster.Role)) {
+						(localClusterWithoutReplication(true, cfg.Storage.Backend, cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled) &&
+							gateTieringInLocalClusterWithoutReplication(clusterCoordinator.Role())) {
 						tieringGate = newWriterClusterGate(clusterCoordinator)
 					}
 				}

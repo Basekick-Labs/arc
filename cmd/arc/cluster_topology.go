@@ -22,16 +22,19 @@ func localClusterWithoutReplication(hasCoordinator bool, storageBackend string, 
 }
 
 // localClusterWithoutReplicationWarning is the startup warning for that
-// configuration. Without writer failover every writer-role node is a primary,
-// with failover a promoted writer starts empty; the advice is the same.
+// configuration. Without writer failover every writer-role node is a primary;
+// with it, a promoted writer has only its own files. Either way the writers
+// stay ungated and keep reporting a peer's cold deletes as lost (#1551), which
+// the warning says.
 func localClusterWithoutReplicationWarning(failover bool) string {
-	what := "every writer-role node acts as a primary writer, and each answers queries from its own disk only"
+	what := "every writer-role node acts as a primary writer"
 	if failover {
-		what = "a writer promoted by failover starts from an empty disk"
+		what = "a writer promoted by failover has only the files it wrote itself"
 	}
 	return "This cluster runs on local storage with cluster.replication_enabled=false, which is neither supported cluster pattern: " +
-		"no node reads another's disk, so queries see only the receiving node's own files plus the shared cold tier, readers hold no hot data, and " +
-		what + ". Set cluster.replication_enabled=true on every node (per-node local storage with peer replication), or use cluster.shared_storage_mode with an object store"
+		"no node reads another's disk, so a query sees only the receiving node's own files (plus the cold tier, which every node shares), readers hold no hot data, and " +
+		what + ". Writers here also report cold rows another node deleted as lost data. " +
+		"Set cluster.replication_enabled=true on every node (per-node local storage with peer replication), or use cluster.shared_storage_mode with an object store"
 }
 
 // gateTieringInLocalClusterWithoutReplication reports whether a node of that
@@ -40,8 +43,8 @@ func localClusterWithoutReplicationWarning(failover bool) string {
 // that does not ingest has no hot files to migrate. Gated, it only syncs its
 // tier metadata, as a reader does in the shipped patterns, and so retires the
 // cold rows a writer's DELETE or retention removed instead of reporting them
-// as lost (#1563). The gate is the writer gate, so a reader that failover
-// promotes to writer becomes ungated with no restart.
+// as lost (#1563). Roles are static and failover promotes only writers, so
+// such a node stays gated.
 func gateTieringInLocalClusterWithoutReplication(role string) bool {
 	return role == "reader" || role == "compactor"
 }

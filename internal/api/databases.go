@@ -32,7 +32,6 @@ type DatabasesHandler struct {
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
 	coordinator    DatabaseDeleteCoordinator
-	gateNonPrimary bool
 	tieringManager databaseTieringManager
 	authManager    *auth.AuthManager
 	rbacManager    RBACChecker
@@ -108,19 +107,17 @@ const databaseDeleteManifestChunkSize = 200
 const databaseDeleteManifestReason = "database:delete"
 
 // SetCoordinator wires cluster manifest updates into database deletion, and
-// with gateNonPrimary the primary-writer admission check. cmd/arc passes true
-// for every cluster: even a local-storage cluster without replication shares
-// the cold tier, and a database delete removes every cold object of the
-// database and its manifest entries for every node, so it is one node's job,
-// like a row DELETE or retention (#1599). The check runs whether or not tiered
-// storage is enabled. Call before RegisterRoutes, alongside the other handler
-// wiring.
-func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator, gateNonPrimary bool) {
+// the primary-writer admission check. Every cluster gets the check: even a
+// local-storage cluster without replication shares the cold tier, and a
+// database delete removes every cold object of the database and its manifest
+// entries for every node, so it is one node's job, like a row DELETE or
+// retention (#1599). It runs whether or not tiered storage is enabled. Call
+// before RegisterRoutes, alongside the other handler wiring.
+func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator) {
 	if c == nil {
 		return
 	}
 	h.coordinator = c
-	h.gateNonPrimary = gateNonPrimary
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -746,7 +743,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// or not tiering runs here: in a local-storage cluster without
 	// replication a writer's tiering is ungated, so BeginDatabaseDelete alone
 	// would admit a standby writer (#1599).
-	if h.coordinator != nil && h.gateNonPrimary && !h.coordinator.IsPrimaryWriter() {
+	if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
 		role := h.coordinator.Role()
 		h.logger.Warn().Str("database", name).Str("role", role).
 			Msg("Database deletion rejected: this node is not the primary writer")

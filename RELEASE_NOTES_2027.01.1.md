@@ -3856,12 +3856,18 @@ cold objects as its own rows. After a writer's `DELETE` or retention removed
 them, the reader kept the rows for good and reported them as lost data
 (#1551). Readers and compactors there are now gated like readers in the
 supported patterns. They only sync their tier metadata, and retire such rows
-(#1563). Writers stay ungated, each migrating the files on its own disk.
+(#1563). Writers stay ungated, each migrating the files on its own disk, and
+so still report cold rows another node deleted as lost; the warning says so.
+Enabling replication is the fix.
 
 `DELETE /api/v1/databases/{name}` now runs only on the primary writer in every
 cluster. In that configuration any node could run it, a reader included,
 deleting every cold object of the database and every node's manifest entries
-for it. Elsewhere, the check now also applies when tiered storage is enabled.
+for it. Two configurations now refuse it where they did not:
+- a cluster node on the default `cluster.role` (`standalone`), where row
+  `DELETE`, retention and continuous queries were already refused;
+- a cluster on an object-store backend without `cluster.shared_storage_mode`
+  (#1603).
 
 The example Kubernetes manifest (`deploy/kubernetes/statefulset.yaml`) ran its
 writers without replication while its reader had it on. It now enables
