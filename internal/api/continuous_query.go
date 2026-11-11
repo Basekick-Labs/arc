@@ -34,6 +34,10 @@ type CQSchedulerReloader interface {
 	// StartJobDirect schedules a job using data already in hand, avoiding a
 	// redundant SQLite read that could race with the just-committed INSERT.
 	StartJobDirect(cqID int64, name, interval string, isActive bool) error
+	// StopJob stops the job of a CQ that was deleted, and keeps any later
+	// start for that ID from scheduling it again. A no-op when the CQ has no
+	// job or the scheduler is not running.
+	StopJob(cqID int64)
 }
 
 // CQCoordinator is the minimal cluster interface the CQ handler needs to gate
@@ -757,6 +761,13 @@ func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
+	}
+
+	// Stop its job. Left running, it would fire at the CQ's interval until a
+	// restart or reload, every run failing on the missing row and logged at
+	// Error. In a cluster, SyncJobs stops it when the delete is mirrored.
+	if h.scheduler != nil {
+		h.scheduler.StopJob(int64(queryID))
 	}
 
 	h.logger.Info().Int("query_id", queryID).Msg("Deleted continuous query")

@@ -3886,6 +3886,21 @@ lifecycle rule). The primary still reports the latter as lost for as long as it
 leads. After a failover, the new primary no longer does, because its rows were
 retired while it was a reader.
 
+### Fix: deleting a continuous query stops its scheduled runs
+
+On a standalone node, `DELETE /api/v1/continuous_queries/{id}` removed the
+continuous query but left its scheduler job running. The job kept firing at
+the query's interval until the next restart or `POST
+/api/v1/schedulers/cq/reload`. Each run failed on the missing definition and
+logged `Scheduled CQ execution failed` at Error, and `GET /api/v1/schedulers`
+kept listing the deleted query among its jobs. The delete now stops the job,
+and an update or `POST /api/v1/schedulers/cq/reload` that runs at the same
+moment can no longer start it again. In a cluster, the job of a deleted
+continuous query was already stopped.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
+[#1600](https://github.com/Basekick-Labs/arc/pull/1600).
+
 ### Fix: an unknown MQTT subscription ID is answered `404`
 
 `/api/v1/mqtt/subscriptions/{id}` answered an ID with no stored subscription
