@@ -160,6 +160,12 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 
 	token, err := h.authManager.CreateToken(c.UserContext(), req.Name, req.Description, permissions, expiresAt)
 	if err != nil {
+		if errors.Is(err, auth.ErrNameConflict) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
+		}
 		h.logger.Error().Err(err).Str("name", req.Name).Msg("Failed to create token")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -303,10 +309,16 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 
 	err = h.authManager.UpdateToken(c.UserContext(), id, req.Name, req.Description, permissions, expiresAt)
 	if err != nil {
-		if err.Error() == "token not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",
+			})
+		}
+		if errors.Is(err, auth.ErrNameConflict) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
 			})
 		}
 		h.logger.Error().Err(err).Int64("token_id", id).Msg("Failed to update token")
@@ -336,7 +348,7 @@ func (h *AuthHandler) deleteToken(c *fiber.Ctx) error {
 
 	err = h.authManager.DeleteToken(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "token not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",
@@ -369,7 +381,7 @@ func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 
 	newToken, err := h.authManager.RotateToken(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "token not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",
@@ -403,7 +415,7 @@ func (h *AuthHandler) revokeToken(c *fiber.Ctx) error {
 
 	err = h.authManager.RevokeToken(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "token not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",

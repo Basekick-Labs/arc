@@ -838,7 +838,7 @@ func (am *AuthManager) insertToken(hash, prefix, name, description, permissions 
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return fmt.Errorf("token with name '%s' already exists", name)
+			return errTokenNameExists(name)
 		}
 		return fmt.Errorf("failed to create token: %w", err)
 	}
@@ -899,6 +899,11 @@ func (am *AuthManager) CreateToken(ctx context.Context, name, description, permi
 			},
 		}
 		if err := am.proposeCommand(ctx, ProposalCommandCreateToken, payload); err != nil {
+			// The FSM refuses a duplicate name ("token name %q already
+			// exists"); report it as the standalone path does.
+			if strings.Contains(err.Error(), "already exists") {
+				return "", errTokenNameExists(name)
+			}
 			return "", fmt.Errorf("create token: %w", err)
 		}
 		am.logger.Info().
@@ -1223,6 +1228,41 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 	return info, nil
 }
 
+// errTokenNotFound is the error every token write returns for an ID with no
+// token. Tagged ErrNotFound so the HTTP handlers map it with errors.Is; the
+// message is the one the API has always reported.
+func errTokenNotFound() error {
+	return tagError(ErrNotFound, errors.New("token not found"))
+}
+
+// errTokenNameExists is the error a token create or rename returns for a name
+// another token holds, on both the SQLite path (UNIQUE constraint) and the
+// cluster path (the FSM's "already exists" refusal). Tagged ErrNameConflict:
+// a duplicate name is a client error, not a server fault.
+func errTokenNameExists(name string) error {
+	return tagError(ErrNameConflict, fmt.Errorf("token with name '%s' already exists", name))
+}
+
+// requireLocalToken returns errTokenNotFound when the local SQLite copy holds
+// no token with this ID.
+//
+// The cluster write paths call it before proposing. The FSM treats an update,
+// revoke, rotate or delete of an unknown ID as an idempotent no-op so that log
+// replay after a delete stays clean, so the proposal itself cannot report it:
+// without this check each of those routes answered 200 for an ID that never
+// existed. The same pre-check, and the same short window on a follower that has
+// not yet applied a token created elsewhere, as RBACManager.DeleteOrganization.
+func (am *AuthManager) requireLocalToken(id int64) error {
+	info, err := am.GetTokenByID(id)
+	if err != nil {
+		return fmt.Errorf("failed to look up token: %w", err)
+	}
+	if info == nil {
+		return errTokenNotFound()
+	}
+	return nil
+}
+
 // UpdateToken updates token metadata.
 //
 // The context bounds the cluster-mode Raft proposal wait. In OSS mode
@@ -1232,6 +1272,9 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 	// Cluster mode: propose via Raft with a ChangedFields list so the FSM
 	// applier knows which fields are "leave alone" vs "set to empty".
 	if am.getProposer() != nil {
+		if err := am.requireLocalToken(id); err != nil {
+			return err
+		}
 		var changed []string
 		payload := struct {
 			ID                int64    `json:"id"`
@@ -1262,6 +1305,9 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 		}
 		payload.ChangedFields = changed
 		if err := am.proposeCommand(ctx, ProposalCommandUpdateToken, payload); err != nil {
+			if name != nil && strings.Contains(err.Error(), "already exists") {
+				return errTokenNameExists(*name)
+			}
 			return fmt.Errorf("update token: %w", err)
 		}
 		return nil
@@ -1292,7 +1338,8 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 	}
 
 	if len(updates) == 0 {
-		return nil
+		// Nothing to write, but an unknown ID is still not found.
+		return am.requireLocalToken(id)
 	}
 
 	args = append(args, id)
@@ -1300,12 +1347,15 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 
 	result, err := am.db.Exec(query, args...)
 	if err != nil {
+		if name != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return errTokenNameExists(*name)
+		}
 		return err
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errors.New("token not found")
+		return errTokenNotFound()
 	}
 
 	am.InvalidateCache()
@@ -1316,6 +1366,9 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 // Raft proposal wait. Gemini #451 round-3 review.
 func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
 	if am.getProposer() != nil {
+		if err := am.requireLocalToken(id); err != nil {
+			return err
+		}
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
@@ -1334,7 +1387,7 @@ func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errors.New("token not found")
+		return errTokenNotFound()
 	}
 
 	am.InvalidateCache()
@@ -1346,6 +1399,9 @@ func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
 // Raft proposal wait. Gemini #451 round-3 review.
 func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
 	if am.getProposer() != nil {
+		if err := am.requireLocalToken(id); err != nil {
+			return err
+		}
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
@@ -1364,7 +1420,7 @@ func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errors.New("token not found")
+		return errTokenNotFound()
 	}
 
 	am.InvalidateCache()
@@ -1376,6 +1432,15 @@ func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
 // context bounds the cluster-mode Raft proposal wait. Gemini #451
 // round-3 review.
 func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error) {
+	// Checked before a value is generated: in cluster mode the FSM drops a
+	// rotate of an unknown ID, and the caller would be handed a token that
+	// authenticates nothing.
+	if am.getProposer() != nil {
+		if err := am.requireLocalToken(id); err != nil {
+			return "", err
+		}
+	}
+
 	token, err := generateToken()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate token: %w", err)
@@ -1412,7 +1477,7 @@ func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return "", errors.New("token not found")
+		return "", errTokenNotFound()
 	}
 
 	am.InvalidateCache()

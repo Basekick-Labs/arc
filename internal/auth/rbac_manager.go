@@ -2375,12 +2375,12 @@ func (rm *RBACManager) countTeamCascadeDescendants(ctx context.Context, teamID i
 // map it to 409 Conflict. Phase A.2 Item 2.
 var ErrCascadeCapExceeded = errors.New("cascade exceeds configured limit")
 
-// ErrNameConflict is the sentinel tagging every organization/team
-// name-collision error, on both the OSS direct-SQLite path (UNIQUE
-// constraint violation) and the cluster Raft path ("already exists"
-// from the FSM apply). HTTP handlers detect it via errors.Is and map it
-// to 409 Conflict — a duplicate name is a client error, not a server
-// fault. Issue #549.
+// ErrNameConflict is the sentinel tagging every organization/team and
+// API token name-collision error, on both the OSS direct-SQLite path
+// (UNIQUE constraint violation) and the cluster Raft path ("already
+// exists" from the FSM apply). HTTP handlers detect it via errors.Is and
+// map it to 409 Conflict — a duplicate name is a client error, not a
+// server fault. Issue #549.
 var ErrNameConflict = errors.New("name already exists")
 
 // ErrInvalidName is the sentinel tagging validateName failures on the
@@ -2398,7 +2398,8 @@ var ErrInvalidRoleInput = errors.New("invalid role input")
 
 // ErrNotFound is the sentinel tagging every "entity does not exist" error
 // returned by RBACManager — organizations, teams, roles, and measurement
-// permissions, on both the OSS direct-SQLite and cluster Raft paths.
+// permissions, on both the OSS direct-SQLite and cluster Raft paths — and
+// by the AuthManager token writes (update, revoke, rotate, delete).
 //
 // Handlers must NOT map this to a status code centrally. The same error
 // means different things depending on where the missing ID sits in the

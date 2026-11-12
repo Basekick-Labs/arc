@@ -3920,6 +3920,23 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: token routes answer `409` for a taken name and `404` for an unknown ID in a cluster
+
+`POST /api/v1/auth/tokens` with a name another token already has answered
+`500` and logged an error, and so did `PATCH /api/v1/auth/tokens/{id}` renaming
+a token to such a name. Both now answer `409 "token with name '<name>' already
+exists"`, with the same text as before. The first token is unchanged.
+
+On a cluster node, `PATCH`, `DELETE`, `POST .../rotate` and `POST .../revoke`
+for an ID with no token answered `200`, because the cluster applies a write to
+an unknown token as a no-op. `rotate` even returned a `new_token` that
+authenticated nothing. They now answer `404 "Token not found"`, as a standalone
+node already did, and propose nothing. A `PATCH` with no fields for an unknown
+ID is now a `404` on both. As with the RBAC routes, a follower that has not yet
+applied a token created elsewhere answers `404` for it for that short moment.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
+
 ### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
 
 On local storage, `iceberg.warehouse` set to a plain path (for example
