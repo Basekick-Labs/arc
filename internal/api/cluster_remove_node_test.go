@@ -28,7 +28,8 @@ type fakeNodeRemover struct {
 func (f *fakeNodeRemover) GetLocalNode() *cluster.Node { return f.local }
 
 func (f *fakeNodeRemover) RemoveNodeViaRaft(id string) error {
-	f.removed = append(f.removed, id)
+	// id is Fiber's buffer-backed c.Params string: copy it.
+	f.removed = append(f.removed, strings.Clone(id))
 	return f.err
 }
 

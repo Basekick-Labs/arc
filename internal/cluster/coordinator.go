@@ -5298,6 +5298,11 @@ func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 // fail. If it cannot be read, id counts as a member and the removal goes
 // ahead as it always did: the check exists to refuse a typo, and must not
 // turn a removal the operator needs into a failure.
+//
+// Known limitation: the registry read is the leader's own. A stale entry only
+// a follower's registry holds (an old leader's registration whose FSM AddNode
+// failed, then a leadership change) used to be cleared cluster-wide by any
+// removal; it now gets 404 here and "not the leader" on that follower.
 func (c *Coordinator) isRemovableMember(id string) bool {
 	if _, ok := c.registry.Get(id); ok {
 		return true

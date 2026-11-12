@@ -92,7 +92,12 @@ names it.
 
 - On a node that is not the Raft leader the answer is unchanged: 500 with
   "not the leader", checked before membership.
-- A 404 on a retry means the earlier removal took effect.
+- A 404 on a retry means the earlier removal took effect. A removed node that
+  still holds the compactor lease, or a compaction-pause acknowledgement,
+  keeps answering 200 until the lease moves or the pause ends.
+- Membership is read from the leader's registry, so a stale entry that only a
+  follower's registry holds (left by an earlier leader whose cluster-state
+  update failed) is no longer cleared by this call: it answers 404.
 - Self-removal is still a 400.
 - With clustering on but Raft not configured, the call still only unregisters
   the node locally and answers 200 for any ID, as before.

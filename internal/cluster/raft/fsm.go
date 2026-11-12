@@ -1722,6 +1722,9 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 			}
 		}
 	}
+	// Anything cleared here for p.NodeID must also be counted by
+	// ReferencesNode, or the operator removal 404s for exactly the IDs this
+	// would clean up (#1619; TestReferencesNodeFalseAfterRemoval).
 	removed := f.nodes[p.NodeID]
 	delete(f.nodes, p.NodeID)
 	f.compactionNodeRemovedLocked(p.NodeID)
@@ -1780,7 +1783,15 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 // a retired instance's Origin, an ended claim's By, ReportedBy, delete
 // records, policy sources and adoption choices, the cold mark's AckWanted and
 // the pause's RequestedBy. Counting those would keep every removed node a
-// member forever.
+// member forever. For the same reason an instance a removal already orphaned
+// (OriginGone) does not count.
+//
+// Two sources are wider than the removal on purpose: the compactor lease and
+// the pause acks are keyed by node ID but applyRemoveNode does not clear them,
+// so a removed node that still holds either answers 200 (a no-op removal) on a
+// retry until the lease moves or the pause ends. Counting them is the
+// conservative side: the old behaviour. Do not "fix" that by dropping them
+// unless applyRemoveNode starts clearing them.
 func (f *ClusterFSM) ReferencesNode(id string) bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -1823,7 +1834,7 @@ func (f *ClusterFSM) ReferencesNode(id string) bool {
 			return true
 		}
 		for _, in := range t.instances {
-			if in.Origin == id && in.Status != InstanceRetired {
+			if in.Origin == id && in.Status != InstanceRetired && !in.OriginGone {
 				return true
 			}
 		}

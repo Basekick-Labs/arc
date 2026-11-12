@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -34,6 +35,10 @@ func TestReferencesNodeSources(t *testing.T) {
 			f.takeover.instances[7] = &StreamInstance{Instance: 7, Origin: id, Status: InstanceOrphaned}
 		}, true},
 		{"active claim", func(f *ClusterFSM) { f.takeover.claims[7] = &StreamClaim{Instance: 7, By: id} }, true},
+		// An instance an earlier removal already orphaned: the removal acted.
+		{"orphaned instance of a removed origin", func(f *ClusterFSM) {
+			f.takeover.instances[7] = &StreamInstance{Instance: 7, Origin: id, Status: InstanceOrphaned, OriginGone: true}
+		}, false},
 		// History a removal does not touch.
 		{"retired instance origin", func(f *ClusterFSM) {
 			f.takeover.instances[7] = &StreamInstance{Instance: 7, Origin: id, Status: InstanceRetired}
@@ -51,5 +56,45 @@ func TestReferencesNodeSources(t *testing.T) {
 				t.Errorf("ReferencesNode = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// The other half of the contract: after an operator removal of id, nothing
+// ReferencesNode counts still names it, so a retry answers 404 instead of
+// re-proposing. Every source that applyRemoveNode clears is set for id.
+//
+// Deliberate exceptions, which removal does not clear and ReferencesNode still
+// counts (conservative: a retry is a no-op 200): the compactor lease and the
+// pause acks. They are set to another node here and checked untouched.
+func TestReferencesNodeFalseAfterRemoval(t *testing.T) {
+	const id, other = "n-1", "n-2"
+	f := NewClusterFSM(zerolog.Nop())
+	f.streamClaims = true
+	f.nodes[id] = &NodeInfo{ID: id, Role: "writer"}
+	f.nodes[other] = &NodeInfo{ID: other, Role: "writer"}
+	f.primaryWriterID = id
+	f.activeCompactorID = other
+	f.compactionPause.Acks = map[string]uint64{other: 1}
+	f.staged["j1"] = &StagedCompaction{Job: "j1", Origin: id}
+	f.staged["j2"] = &StagedCompaction{Job: "j2", Origin: other, Holders: []string{id, other}}
+	f.coldMark = &coldMarkState{Alive: map[string]time.Time{id: time.Now()}, Acked: map[string]bool{id: true}}
+	f.takeover.departed[id] = time.Now()
+	f.takeover.current[id] = 7
+	f.takeover.instances[7] = &StreamInstance{Instance: 7, Origin: id, Status: InstanceCurrent}
+	f.takeover.instances[8] = &StreamInstance{Instance: 8, Origin: id, Status: InstanceClosed}
+	f.takeover.claims[9] = &StreamClaim{Instance: 9, Origin: other, By: id}
+
+	if !f.ReferencesNode(id) {
+		t.Fatal("ReferencesNode = false before the removal")
+	}
+	raw, _ := json.Marshal(RemoveNodePayload{NodeID: id})
+	if err, _ := f.applyRemoveNode(raw).(error); err != nil {
+		t.Fatalf("applyRemoveNode: %v", err)
+	}
+	if f.ReferencesNode(id) {
+		t.Errorf("ReferencesNode = true after the operator removal: a retry would re-propose instead of answering 404")
+	}
+	if f.activeCompactorID != other || f.compactionPause.Acks[other] != 1 {
+		t.Errorf("the removal touched another node's lease or pause ack")
 	}
 }

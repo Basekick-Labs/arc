@@ -45,7 +45,7 @@ func TestRemoveUnknownNodeIsNotFoundAndProposesNothing(t *testing.T) {
 	if err := c.raftNode.Barrier(5 * time.Second); err != nil {
 		t.Fatal(err)
 	}
-	before := c.raftNode.LastIndex()
+	before, appliedBefore := c.raftNode.LastIndex(), c.raftNode.AppliedIndex()
 	cfgBefore, _ := c.raftNode.ConfigurationServerIDs()
 
 	err := c.RemoveNodeViaRaft("no-such-node")
@@ -58,6 +58,9 @@ func TestRemoveUnknownNodeIsNotFoundAndProposesNothing(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if after := c.raftNode.LastIndex(); after != before {
 		t.Errorf("an unknown ID was proposed: last index %d -> %d", before, after)
+	}
+	if after := c.raftNode.AppliedIndex(); after != appliedBefore {
+		t.Errorf("an unknown ID was applied: applied index %d -> %d", appliedBefore, after)
 	}
 	cfgAfter, _ := c.raftNode.ConfigurationServerIDs()
 	if strings.Join(cfgAfter, ",") != strings.Join(cfgBefore, ",") {
