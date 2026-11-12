@@ -3,7 +3,9 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
 	"strings"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/wal"
 )
 
@@ -60,24 +63,32 @@ func (b *ArrowBuffer) recordFlushIntent(path string, size int64, ids []string) {
 // name is unique in its process, so the object at that path with that size
 // is the file the flush wrote.
 //
-// The crash may also have cut the flush's field-schema registration short,
-// which a replay would have redone: the adopted file's schema is read from
-// its footer and registered. A tiering manager, when there is one, registers
-// files present in storage itself when it starts.
+// The crash may also have cut the flush's registrations short, which a replay
+// would have redone: the adopted file's schema is read from its footer and
+// registered, and the file is registered in tiering metadata when a tiering
+// manager is set (it is not yet at startup recovery; the manager's own startup
+// scan registers files present in storage). A file adopted by a periodic pass
+// is usually a #1635 late-landed write, which never reached registration.
 func (b *ArrowBuffer) AdoptFlushedFile(ctx context.Context, intent wal.FlushIntent) bool {
 	if b.clusterMode.Load() || b.storage == nil {
 		return false
 	}
 	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
 	size, err := b.storage.StatFile(sctx, intent.Path)
+	cancel()
+	if err != nil && !storage.IsNotFound(err) {
+		b.logger.Warn().Err(err).Str("storage_path", intent.Path).Msg("Could not check the file of an interrupted flush; replaying its rows")
+	}
 	if err != nil || size != intent.Size {
-		if err != nil {
-			b.logger.Warn().Err(err).Str("storage_path", intent.Path).Msg("Could not check the file of an interrupted flush; replaying its rows")
-		}
 		return false
 	}
-	b.registerAdoptedSchema(sctx, intent.Path)
+	database, measurement, partition, ok := partitionOfPath(intent.Path)
+	if ok {
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		b.registerAdoptedSchema(rctx, intent.Path, size, database, measurement)
+		b.registerFileInTiering(rctx, database, measurement, intent.Path, partition, size, "", nil)
+		cancel()
+	}
 	if b.ambiguous != nil {
 		b.ambiguous.forget(intent.Path) // #1635: this is the copy that holds the rows
 	}
@@ -85,24 +96,37 @@ func (b *ArrowBuffer) AdoptFlushedFile(ctx context.Context, intent wal.FlushInte
 	return true
 }
 
-// registerAdoptedSchema registers the schema of an adopted file, read from its
-// footer. Best effort, as registerFieldSchema is.
-func (b *ArrowBuffer) registerAdoptedSchema(ctx context.Context, path string) {
-	if b.fieldSchema == nil {
+// registerAdoptedSchema registers the schema of an adopted file, read from
+// its footer only (the tail of the object). Best effort, as
+// registerFieldSchema is. The tags are the file's arc:tags, the subset of the
+// flush's tag names that compaction can use.
+func (b *ArrowBuffer) registerAdoptedSchema(ctx context.Context, path string, size int64, database, measurement string) {
+	if b.fieldSchema == nil || size < 12 {
 		return
 	}
-	parts := strings.SplitN(path, "/", 3)
-	if len(parts) < 3 {
+	tail := func(n int64) ([]byte, error) {
+		var buf bytes.Buffer
+		if err := b.storage.ReadToAt(ctx, path, &buf, size-n); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	end, err := tail(8)
+	if err != nil || len(end) != 8 || string(end[4:]) != "PAR1" {
+		b.logger.Warn().Err(err).Str("storage_path", path).Msg("Could not read an adopted file's footer to register its field schema")
 		return
 	}
-	data, err := b.storage.Read(ctx, path)
+	footer := int64(binary.LittleEndian.Uint32(end[:4])) + 8
+	if footer > size-4 {
+		return
+	}
+	data, err := tail(footer)
+	if err != nil || int64(len(data)) != footer {
+		return
+	}
+	rdr, err := file.NewParquetReader(&tailReader{tail: data, base: size - footer, size: size})
 	if err != nil {
-		b.logger.Warn().Err(err).Str("storage_path", path).Msg("Could not read an adopted file to register its field schema")
-		return
-	}
-	rdr, err := file.NewParquetReader(bytes.NewReader(data))
-	if err != nil {
-		b.logger.Warn().Err(err).Str("storage_path", path).Msg("Could not open an adopted file to register its field schema")
+		b.logger.Warn().Err(err).Str("storage_path", path).Msg("Could not open an adopted file's footer to register its field schema")
 		return
 	}
 	defer rdr.Close()
@@ -118,5 +142,58 @@ func (b *ArrowBuffer) registerAdoptedSchema(ctx context.Context, path string) {
 	if v := rdr.MetaData().KeyValueMetadata().FindValue("arc:tags"); v != nil && *v != "" {
 		tags = strings.Split(*v, ",")
 	}
-	b.registerFieldSchema(ctx, parts[0], parts[1], schema, tags, path)
+	b.registerFieldSchema(ctx, database, measurement, schema, tags, path)
 }
+
+// tailReader serves the last bytes of a file as if it were the whole file:
+// enough for a Parquet reader to read the footer, and an error for anything
+// before it.
+type tailReader struct {
+	tail []byte
+	base int64 // file offset of tail[0]
+	size int64
+	pos  int64
+}
+
+func (r *tailReader) ReadAt(p []byte, off int64) (int, error) {
+	if off < r.base {
+		return 0, errors.New("read before the footer")
+	}
+	if off >= r.size {
+		return 0, io.EOF
+	}
+	n := copy(p, r.tail[off-r.base:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (r *tailReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		r.pos = offset
+	case io.SeekCurrent:
+		r.pos += offset
+	case io.SeekEnd:
+		r.pos = r.size + offset
+	}
+	return r.pos, nil
+}
+
+// partitionOfPath reads database, measurement and partition hour from a
+// flush's storage path: {db}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{file}.
+func partitionOfPath(path string) (database, measurement string, hour time.Time, ok bool) {
+	parts := strings.Split(path, "/")
+	if len(parts) != 7 {
+		return "", "", time.Time{}, false
+	}
+	t, err := time.Parse("2006/01/02/15", strings.Join(parts[2:6], "/"))
+	if err != nil {
+		return "", "", time.Time{}, false
+	}
+	return parts[0], parts[1], t.UTC(), true
+}
+
+// *wal.Writer must keep writing intents for the buffer to find them.
+var _ flushIntentRecorder = (*wal.Writer)(nil)

@@ -2,9 +2,12 @@ package wal
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
 )
@@ -25,8 +28,10 @@ import (
 // replay (RecoveryOptions.AdoptIntent decides; this package only carries the
 // intent).
 //
-// The intent is written without waiting for it: a crash before it is durable
-// is the duplicate there always was, never a loss. It is a checkpoint frame
+// The intent forces no sync of its own (the flush's checkpoint, written after
+// it, syncs it), and the flush waits for it at most flushIntentAdmission for
+// a slot in the WAL queue: a crash before it is durable, or an intent that
+// found no slot, is the duplicate there always was, never a loss. It is a checkpoint frame
 // holding one string, arc:intent:v1:<msgpack>, so a binary without this
 // change reads it as a checkpoint identity that matches no entry.
 
@@ -73,16 +78,35 @@ func ParseFlushIntent(s string) (FlushIntent, bool) {
 	return in, true
 }
 
-// RecordFlushIntent appends an intent if the WAL queue has room now; it never
-// waits, so the flush pays nothing for it. A full queue drops the intent.
+// flushIntentAdmission bounds the flush's wait for a WAL queue slot. Under
+// durable ack the queue is full most of the time and slots are handed to
+// waiting senders, so taking only a free slot would drop nearly every intent
+// (see markFlushed); a short wait gets one without holding the flush up.
+const flushIntentAdmission = 100 * time.Millisecond
+
+// RecordFlushIntent appends an intent, waiting at most flushIntentAdmission
+// for room in the WAL queue and never for a sync.
 func (w *Writer) RecordFlushIntent(in FlushIntent) error {
 	s, err := EncodeFlushIntent(in)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // take a free slot, never wait for one
-	return w.enqueueCheckpointNoWait(ctx, []string{s})
+	payload, err := msgpack.Marshal([]string{s})
+	if err != nil {
+		return err
+	}
+	frame := append([]byte{WALCheckpointMarker}, payload...)
+	data := make([]byte, WALEntryHeaderSize+len(frame))
+	binary.BigEndian.PutUint32(data[0:4], uint32(len(frame)))
+	binary.BigEndian.PutUint64(data[4:12], uint64(time.Now().UnixMicro()))
+	binary.BigEndian.PutUint32(data[12:16], crc32.ChecksumIEEE(frame))
+	copy(data[WALEntryHeaderSize:], frame)
+	if w.closedFlag.Load() {
+		return errors.New("WAL writer is closed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), flushIntentAdmission)
+	defer cancel()
+	return w.enqueueEntryBlocking(ctx, walEntry{data: data, flushIntent: true})
 }
 
 // intentState is one intent seen by a recovery pass.

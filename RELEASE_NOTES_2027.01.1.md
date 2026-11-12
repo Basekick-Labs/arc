@@ -112,12 +112,16 @@ names the file, its size, and the WAL entries the file holds. At recovery, when
 an entry has no checkpoint but such a record names it, and the file is in
 storage at that size, Arc does not replay the entry. It writes the missing
 checkpoint and keeps the file as the stored copy, re-registering its field
-schema from the file's footer. Arc treats the file as all or nothing: if any
+schema from the file's footer and, with tiering, its tiering metadata. Arc treats the file as all or nothing: if any
 of its entries was already checkpointed, it replays the rest, as before.
 
-The record costs almost nothing. It is queued without waiting, and a record
-that never reaches disk only means the replay there always was. Arc skips the
-record when the queue is full or the record is over 1 MiB.
+The record costs almost nothing. It forces no disk sync of its own (the
+flush's checkpoint, written after it, syncs it). A flush waits at most 100 ms
+for room in the WAL queue to write it. Under durable acknowledgements at
+100 ms flushes, every flush wrote its record and ingest throughput was
+unchanged. A record that never reaches disk only means the replay there
+always was. Arc skips the record when it finds no room in the queue in time,
+or when it would be over 1 MiB.
 
 Not in a cluster: there a stored file also needs its manifest registration,
 which the crash may have cut short. A cluster node writes no records and

@@ -3,8 +3,12 @@ package ingest
 import (
 	"context"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
 
 	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -181,4 +185,88 @@ func TestSizeMismatchIsNotAdopted(t *testing.T) {
 	require.True(t, b.AdoptFlushedFile(context.Background(), wal.FlushIntent{Path: "db/m/x.parquet", Size: 4, IDs: []string{"x"}}))
 	require.False(t, b.AdoptFlushedFile(context.Background(), wal.FlushIntent{Path: "db/m/x.parquet", Size: 5, IDs: []string{"x"}}))
 	require.False(t, b.AdoptFlushedFile(context.Background(), wal.FlushIntent{Path: "db/m/y.parquet", Size: 4, IDs: []string{"x"}}))
+}
+
+type schemaRecorder struct {
+	mu    sync.Mutex
+	files map[string][]string // storage key -> field names
+}
+
+func (r *schemaRecorder) EnsureFile(_ context.Context, _, _ string, schema *arrow.Schema, _ []string, key string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var names []string
+	for _, f := range schema.Fields() {
+		names = append(names, f.Name)
+	}
+	r.files[key] = names
+	return nil
+}
+
+// Adoption registers the adopted file's field schema, read from its footer
+// alone: the crash may have cut the flush's own registration short.
+func TestAdoptionRegistersTheFileSchemaFromItsFooter(t *testing.T) {
+	f := newIntentFixture(t, false)
+	f.write(t, time.Now().UTC().Truncate(time.Hour).UnixMicro(), 10)
+	f.crash(t)
+	paths := parquetPaths(t, f.dataDir)
+	require.Len(t, paths, 1)
+	key := filepath.ToSlash(paths[0])
+	size, err := f.local.StatFile(context.Background(), key)
+	require.NoError(t, err)
+
+	b := newReplayTestBuffer(t, t.TempDir())
+	b.storage = f.local
+	rec := &schemaRecorder{files: map[string][]string{}}
+	b.SetFieldSchema(rec)
+	require.True(t, b.AdoptFlushedFile(context.Background(), wal.FlushIntent{Path: key, Size: size, IDs: []string{"x"}}))
+	require.ElementsMatch(t, []string{"time", "v"}, rec.files[key])
+}
+
+// An adopted file a #1635 ledger entry was waiting on is the stored copy:
+// the entry is dropped, so the sweeper can never remove the file.
+func TestAdoptionDropsTheLedgerEntry(t *testing.T) {
+	dir := t.TempDir()
+	local, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	require.NoError(t, err)
+	defer local.Close()
+	require.NoError(t, local.Write(context.Background(), "db/m/2026/10/01/10/x.parquet", []byte("12345678")))
+	b := newReplayTestBuffer(t, t.TempDir())
+	b.storage = local
+	require.True(t, b.ambiguous.record("db/m/2026/10/01/10/x.parquet", 8, []string{"00000000000000010000000000000001"}))
+	require.True(t, b.AdoptFlushedFile(context.Background(), wal.FlushIntent{Path: "db/m/2026/10/01/10/x.parquet", Size: 8, IDs: []string{"x"}}))
+	require.Zero(t, b.ambiguous.count.Load())
+}
+
+// One hour file of a multi-hour flush is gone: its rows are replayed, the
+// other hour's file is adopted.
+func TestPartialMultiHourAdoption(t *testing.T) {
+	f := newIntentFixture(t, false)
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC).UnixMicro()
+	f.write(t, base, 10)
+	f.write(t, base+int64(time.Hour/time.Microsecond), 6)
+	f.crash(t)
+	paths := parquetPaths(t, f.dataDir)
+	require.Len(t, paths, 2)
+	var gone string
+	for _, p := range paths {
+		if strings.Contains(filepath.ToSlash(p), "/11/") {
+			gone = filepath.ToSlash(p)
+		}
+	}
+	require.NotEmpty(t, gone)
+	require.NoError(t, f.local.Delete(context.Background(), gone))
+	stats, rows := f.restart(t, false)
+	require.Equal(t, 1, stats.AdoptedFiles)
+	require.Equal(t, 6, rows, "only the missing hour's rows replay")
+}
+
+func TestPartitionOfPath(t *testing.T) {
+	db, m, h, ok := partitionOfPath("db/cpu/2026/10/01/10/cpu_x.parquet")
+	require.True(t, ok)
+	require.Equal(t, "db", db)
+	require.Equal(t, "cpu", m)
+	require.Equal(t, time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC), h)
+	_, _, _, ok = partitionOfPath("db/cpu/x.parquet")
+	require.False(t, ok)
 }
