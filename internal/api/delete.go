@@ -1482,6 +1482,20 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 	// Try to clean up temp directory if empty
 	os.Remove(tempDir) // Ignore error, directory might not be empty
 
+	// DuckDB does not fsync what it COPYs, and the caller removes the old file
+	// next: make the rewrite durable first, or a power loss could leave
+	// neither (#1618). Fails closed on a backend that cannot: only the local
+	// backend reaches here, and it can.
+	mover, ok := h.storage.(storage.ObjectMover)
+	if !ok {
+		os.Remove(newFilePath)
+		return 0, "", fmt.Errorf("cannot make the rewritten file durable: %T does not support sync", h.storage)
+	}
+	if err := mover.Sync(ctx, newRelativePath); err != nil {
+		os.Remove(newFilePath)
+		return 0, "", fmt.Errorf("failed to make rewritten file durable: %w", err)
+	}
+
 	h.logger.Info().
 		Str("file", filepath.Base(filePath)).
 		Int64("rows_before", rowsBefore).
