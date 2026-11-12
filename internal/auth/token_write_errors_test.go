@@ -24,12 +24,18 @@ type fsmLikeTokenProposer struct {
 	mu       sync.Mutex
 	proposed []uint8
 	refuse   error // returned for every proposal when set
+	// onPropose, when set, runs inside Propose, after the command counts as
+	// committed.
+	onPropose func(cmdType uint8)
 }
 
 func (p *fsmLikeTokenProposer) Propose(_ context.Context, cmdType uint8, _ []byte, _ time.Duration) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.proposed = append(p.proposed, cmdType)
+	if p.onPropose != nil {
+		p.onPropose(cmdType)
+	}
 	if p.refuse != nil {
 		return fmt.Errorf("%w: %w", ErrApplyFailed, p.refuse)
 	}

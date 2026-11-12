@@ -3925,9 +3925,11 @@ an unbounded operation.
 `POST /api/v1/auth/tokens` with a name another token already has answered
 `500` and logged an error, and so did `PATCH /api/v1/auth/tokens/{id}` renaming
 a token to such a name. Both now answer `409 "token with name '<name>' already
-exists"`, with the same text as before, on a standalone node and in a cluster.
-The rename's message loses its `Failed to update token: ` prefix. The first
-token is unchanged.
+exists"` on a standalone node and in a cluster. Before, only a standalone create
+used that text: a standalone rename answered `Failed to update token: UNIQUE
+constraint failed: api_tokens.name`, and in a cluster the message carried the
+`cluster apply failed` wrapping (and, on a follower, the `forward apply: leader
+rejected` prefix). The first token is unchanged.
 
 On a cluster node, `PATCH`, `DELETE`, `POST .../rotate` and `POST .../revoke`
 for an ID with no token answered `200`, because the cluster applies a write to
@@ -3939,12 +3941,22 @@ applied a token created elsewhere answers `404` for it for that short moment.
 
 `POST .../rotate` on a revoked token answered `200` with a `new_token` that
 could never authenticate: revocation is permanent and no route re-enables a
-token. It now answers `409`, and the token is left as it was. Create a new
-token instead; a new token has a new ID, so re-attach its governance policies
-and team memberships. Expired tokens can still be rotated, and revoking an
-already revoked token still answers `200`. In a cluster, a revoke that commits
-on another node in the moment between the check and the rotate can still let
-one such rotate through.
+token. It now answers `409`, and the token stays revoked. Create a new token
+instead; a new token has a new ID, so re-attach its governance policies and
+team memberships. Expired tokens can still be rotated, and revoking an already
+revoked token still answers `200`.
+
+In a cluster, a rotate is checked against the node's own copy of the token
+before it is proposed, and again after it has been applied: if the token was
+revoked or deleted on another node just before, the rotate answers `409` or
+`404` instead of a `new_token` that never authenticates. On the node that leads
+the cluster, and on any node once cluster policies are enabled, that second
+check sees every revoke and delete ordered before the rotate. On a follower
+before cluster policies are enabled, one that has not yet applied a revoke or
+delete made elsewhere, even one already acknowledged, can still answer `200`
+with a `new_token` that never authenticates, for a revoke, or for a delete,
+where it would otherwise answer `404`. The revoked or deleted token stays
+unusable either way.
 
 Duplicate-name and unknown-ID parts contributed by
 [@officialasishkumar](https://github.com/officialasishkumar) in

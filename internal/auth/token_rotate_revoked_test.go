@@ -3,7 +3,12 @@ package auth
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // #1625: a revoked token is not rotated. Revocation is permanent (no route
@@ -72,5 +77,43 @@ func TestRotateRevokedTokenClustered(t *testing.T) {
 	}
 	if got := prop.proposals(); len(got) != 0 {
 		t.Errorf("proposed %v for a revoked token, want nothing", got)
+	}
+}
+
+// TestClusterRotateReReadFailureKeepsTheRotate: once the rotate has committed,
+// a failed re-read of the local row must not turn it into an error, which
+// would discard a valid new secret. The value is returned and the failure
+// logged at Warn.
+func TestClusterRotateReReadFailureKeepsTheRotate(t *testing.T) {
+	logs := &syncBuffer{}
+	am, err := NewAuthManager(filepath.Join(t.TempDir(), "auth.db"), time.Minute, 100, zerolog.New(logs))
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	t.Cleanup(func() {
+		am.SetRaftProposer(nil)
+		_ = am.Close()
+	})
+	ctx := context.Background()
+	if _, err := am.CreateToken(ctx, "svc", "", "read", nil); err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	id := tokenIDByName(t, am, "svc")
+	prop := &fsmLikeTokenProposer{onPropose: func(cmdType uint8) {
+		if cmdType == ProposalCommandRotateToken {
+			// Every later read of the row fails.
+			if _, err := am.db.Exec(`ALTER TABLE api_tokens RENAME TO api_tokens_gone`); err != nil {
+				t.Errorf("break the table: %v", err)
+			}
+		}
+	}}
+	am.SetRaftProposer(prop)
+
+	value, err := am.RotateToken(ctx, id)
+	if err != nil || value == "" {
+		t.Fatalf("rotate whose re-read fails: value %q, err %v, want the new value and no error", value, err)
+	}
+	if out := logs.String(); !strings.Contains(out, `"level":"warn"`) || !strings.Contains(out, "could not re-read") {
+		t.Errorf("no Warn for the failed re-read; logs:\n%s", out)
 	}
 }

@@ -1271,7 +1271,10 @@ func errTokenRevoked() error {
 // requireLocalToken returns the local SQLite copy of the token with this ID,
 // or errTokenNotFound when it holds none.
 //
-// The cluster write paths call it before proposing. The FSM treats an update,
+// The cluster write paths call it before proposing, RotateToken before it
+// generates a value in both modes, and the standalone UpdateToken and
+// RotateToken after a write that changed no row, to tell "not found" from a
+// name conflict or a revoked token. The FSM treats an update,
 // revoke, rotate or delete of an unknown ID as an idempotent no-op so that log
 // replay after a delete stays clean, so the proposal itself cannot report it:
 // without this check each of those routes answered 200 for an ID that never
@@ -1474,19 +1477,20 @@ func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
 // context bounds the cluster-mode Raft proposal wait. Gemini #451
 // round-3 review.
 func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error) {
-	// Checked before a value is generated: in cluster mode the FSM drops a
-	// rotate of an unknown ID and applies a rotate of a revoked one, and
-	// either way the caller would be handed a token that authenticates
-	// nothing. A revoke that commits between this check and the proposal
-	// still gets through; the FSM's rotate apply is unchanged (#1625).
-	if am.getProposer() != nil {
-		info, err := am.requireLocalToken(id)
-		if err != nil {
-			return "", err
-		}
-		if !info.Enabled {
-			return "", errTokenRevoked()
-		}
+	// Checked before a value is generated, in both modes: an unknown or
+	// revoked token is refused without the cost of a new secret. In cluster
+	// mode the FSM drops a rotate of an unknown ID and applies a rotate of a
+	// revoked one, and either way the caller would be handed a token that
+	// authenticates nothing; the re-read after the proposal (below) covers a
+	// revoke or delete that this check could not see yet. Standalone, the
+	// UPDATE's own enabled = 1 is the atomic guard and this is the fast
+	// path. #1625.
+	info, err := am.requireLocalToken(id)
+	if err != nil {
+		return "", err
+	}
+	if !info.Enabled {
+		return "", errTokenRevoked()
 	}
 
 	token, err := generateToken()
@@ -1513,8 +1517,7 @@ func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error
 		if err := am.proposeCommand(ctx, ProposalCommandRotateToken, payload); err != nil {
 			return "", fmt.Errorf("rotate token: %w", err)
 		}
-		am.logger.Info().Int64("token_id", id).Msg("Rotated API token via Raft")
-		return token, nil
+		return am.confirmClusterRotate(id, token)
 	}
 	_ = ctx
 
@@ -1530,7 +1533,7 @@ func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error
 		return "", err
 	}
 	if rowsAffected == 0 {
-		// No row: either the ID is unknown or the token is revoked.
+		// No row: the token was deleted or revoked after the check above.
 		if _, err := am.requireLocalToken(id); err != nil {
 			return "", err
 		}
@@ -1539,6 +1542,43 @@ func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error
 
 	am.InvalidateCache()
 	am.logger.Info().Int64("token_id", id).Msg("Rotated API token")
+	return token, nil
+}
+
+// confirmClusterRotate re-reads the local row after a committed cluster rotate,
+// and refuses the new value when the token is gone (404) or revoked (409): the
+// FSM applies a rotate of a revoked token and drops one of a deleted token, so
+// in either case the value would never authenticate. #1625.
+//
+// How exact this is depends on where the proposal ran:
+//   - Leader: Apply returns after the FSM applied every entry up to the rotate,
+//     and the apply callbacks write this node's SQLite synchronously, so any
+//     revoke or delete ordered before the rotate is visible. A revoke ordered
+//     just after it may be visible too; the 409 is still true, since the value
+//     is dead.
+//   - Follower with cluster policies enabled: the forwarded proposal waits
+//     until this node has applied the rotate's index (forwardAndWaitHere), so
+//     the same holds.
+//   - Follower before cluster policies are enabled, or when that wait times
+//     out (it logs and carries on): this node may not yet have applied a
+//     revoke or delete ordered before the rotate, and the rotate answers 200
+//     with a value that never authenticates.
+//
+// A failed re-read does not fail the rotate: it has committed, and a 500
+// would discard a valid new secret. The value is returned and the failure
+// logged at Warn.
+func (am *AuthManager) confirmClusterRotate(id int64, token string) (string, error) {
+	after, err := am.GetTokenByID(id)
+	switch {
+	case err != nil:
+		am.logger.Warn().Err(err).Int64("token_id", id).
+			Msg("Rotated API token via Raft, but could not re-read it to confirm it is still enabled; returning the new value")
+	case after == nil:
+		return "", errTokenNotFound()
+	case !after.Enabled:
+		return "", errTokenRevoked()
+	}
+	am.logger.Info().Int64("token_id", id).Msg("Rotated API token via Raft")
 	return token, nil
 }
 

@@ -2783,7 +2783,16 @@ func (f *ClusterFSM) applyUpdateToken(payload []byte, logIndex uint64) interface
 		// loop, so a linear scan was a future scaling bottleneck).
 		if otherID, exists := f.tokensByName[p.Name]; exists && otherID != p.ID {
 			f.mu.Unlock()
-			return f.rejectToken("update", p.ID, logIndex, &tokenNameExistsError{name: p.Name})
+			// A taken name is a client error (409), not a malformed
+			// command: logged at Debug and not counted as a rejected
+			// token, as the create's duplicate-name refusal. Same text as
+			// rejectToken produced. #1625.
+			f.logger.Debug().
+				Str("name", p.Name).
+				Int64("token_id", p.ID).
+				Uint64("log_index", logIndex).
+				Msg("Duplicate token name rename refused")
+			return fmt.Errorf("update token: %w", &tokenNameExistsError{name: p.Name})
 		}
 		// Maintain the name index: drop the old binding, add the new one.
 		delete(f.tokensByName, entry.Name)

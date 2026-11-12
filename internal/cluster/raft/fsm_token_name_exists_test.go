@@ -49,6 +49,12 @@ func TestTokenNameRefusalIsTypedWithUnchangedText(t *testing.T) {
 		}
 	}
 
+	// A taken name is a client error, not a malformed command: neither
+	// refusal counts as a rejected token.
+	if n := fsm.RejectedTokensCount(); n != 0 {
+		t.Errorf("rejected-token count after two name refusals = %d, want 0", n)
+	}
+
 	// Other token refusals are not name conflicts.
 	bad := makeTokenEntry("c")
 	bad.Permissions = "nope"

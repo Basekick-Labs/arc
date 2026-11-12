@@ -30,24 +30,40 @@ type fsmProposer struct {
 	forwarded bool
 	logIdx    atomic.Uint64
 	proposals atomic.Int64
+	// beforeRotate, when set, is a command committed and applied just ahead
+	// of the next rotate: a revoke or delete from another node that the
+	// rotate's pre-check could not see yet.
+	beforeRotate *raft.Command
+}
+
+func (p *fsmProposer) apply(cmd raft.Command) interface{} {
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+	return p.fsm.Apply(&hraft.Log{Index: p.logIdx.Add(1), Data: data})
 }
 
 func (p *fsmProposer) Propose(_ context.Context, cmdType uint8, payload []byte, _ time.Duration) error {
 	p.proposals.Add(1)
-	data, err := json.Marshal(raft.Command{Type: raft.CommandType(cmdType), Payload: payload})
-	if err != nil {
-		return err
+	ct := raft.CommandType(cmdType)
+	if ct == raft.CommandRotateToken && p.beforeRotate != nil {
+		if res, _ := p.apply(*p.beforeRotate).(error); res != nil {
+			return res
+		}
+		p.beforeRotate = nil
 	}
-	res := p.fsm.Apply(&hraft.Log{Index: p.logIdx.Add(1), Data: data})
-	refusal, _ := res.(error)
+	refusal, _ := p.apply(raft.Command{Type: ct, Payload: payload}).(error)
 	if refusal == nil {
 		return nil
 	}
+	// Production wraps the leader's refusal in raft's unexported
+	// commandRefused, whose Unwrap keeps the chain; the raw error stands in.
 	if p.forwarded {
 		// handleForwardApply sends err.Error() with apply_failed.
-		return wrapApplyError(&ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: refusal.Error()})
+		return wrapApplyError(ct, &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: refusal.Error()})
 	}
-	return wrapApplyError(refusal)
+	return wrapApplyError(ct, refusal)
 }
 
 func (p *fsmProposer) IsLeader() bool { return !p.forwarded }
@@ -122,18 +138,20 @@ func TestWrapApplyErrorTagsOnlyTokenNameRefusals(t *testing.T) {
 	const tokenText = `update token: token name "a" already exists`
 	for _, tc := range []struct {
 		name string
+		cmd  raft.CommandType
 		err  error
 		want bool
 	}{
-		{"forwarded token rename", &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: tokenText}, true},
-		{"forwarded token create", &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: `create token: token name "a" already exists`}, true},
-		{"same text, another code", &ForwardRejectedError{Code: protocol.ForwardCodeClaimConflict, Message: tokenText}, false},
-		{"forwarded organization name", &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: `create_organization: organization name "a" already exists`}, false},
-		{"forwarded team name", &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: `create_team: team name "a" already exists in organization 1`}, false},
-		{"untyped leader text", errors.New(tokenText), false},
+		{"forwarded token rename", raft.CommandUpdateToken, &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: tokenText}, true},
+		{"forwarded token create", raft.CommandCreateToken, &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: `create token: token name "a" already exists`}, true},
+		{"same text, another code", raft.CommandUpdateToken, &ForwardRejectedError{Code: protocol.ForwardCodeClaimConflict, Message: tokenText}, false},
+		{"token text on another command", raft.CommandCreateOrganization, &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: tokenText}, false},
+		{"forwarded organization name", raft.CommandCreateOrganization, &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: `create_organization: organization name "a" already exists`}, false},
+		{"forwarded team name", raft.CommandCreateTeam, &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: `create_team: team name "a" already exists in organization 1`}, false},
+		{"untyped leader text", raft.CommandUpdateToken, errors.New(tokenText), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := wrapApplyError(tc.err)
+			got := wrapApplyError(tc.cmd, tc.err)
 			if errors.Is(got, auth.ErrNameConflict) != tc.want {
 				t.Errorf("ErrNameConflict = %v, want %v (%v)", !tc.want, tc.want, got)
 			}
@@ -146,7 +164,7 @@ func TestWrapApplyErrorTagsOnlyTokenNameRefusals(t *testing.T) {
 			}
 		})
 	}
-	if got := wrapApplyError(ErrNoLeaderKnown); got != auth.ErrLeaderUnknown {
+	if got := wrapApplyError(raft.CommandCreateToken, ErrNoLeaderKnown); got != auth.ErrLeaderUnknown {
 		t.Errorf("no leader: %v, want ErrLeaderUnknown", got)
 	}
 }
@@ -176,5 +194,49 @@ func TestClusterRotateOfRevokedTokenIsRefused(t *testing.T) {
 	}
 	if am.VerifyToken(secret) != nil {
 		t.Error("the revoked token authenticates")
+	}
+}
+
+// TestClusterRotateAfterAnUnseenRevokeOrDeleteIsRefused: a revoke or delete
+// committed elsewhere just ahead of the rotate passes the pre-check, which
+// reads this node's SQLite before it applied it. The FSM then applies the
+// rotate to the revoked token, or drops it for the deleted one; either way the
+// new value never authenticates. The re-read after the proposal refuses it.
+func TestClusterRotateAfterAnUnseenRevokeOrDeleteIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmd  raft.CommandType
+		want error
+	}{
+		{"revoke", raft.CommandRevokeToken, auth.ErrTokenRevoked},
+		{"delete", raft.CommandDeleteToken, auth.ErrNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			am, prop := newFSMAuthRig(t, false)
+			ctx := context.Background()
+			secret, err := am.CreateToken(ctx, "svc", "", "read", nil)
+			if err != nil {
+				t.Fatalf("CreateToken: %v", err)
+			}
+			id := clusterTokenID(t, am, "svc")
+			payload, err := json.Marshal(struct {
+				ID int64 `json:"id"`
+			}{id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			prop.beforeRotate = &raft.Command{Type: tc.cmd, Payload: payload}
+
+			value, err := am.RotateToken(ctx, id)
+			if !errors.Is(err, tc.want) || value != "" {
+				t.Fatalf("rotate after an unseen %s: value %q, err %v, want %v", tc.name, value, err, tc.want)
+			}
+			if prop.beforeRotate != nil {
+				t.Fatal("the rotate was not proposed, so the test did not reach the re-read")
+			}
+			if am.VerifyToken(secret) != nil {
+				t.Errorf("the old secret authenticates after the %s", tc.name)
+			}
+		})
 	}
 }

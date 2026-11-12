@@ -86,7 +86,7 @@ func (p *CoordinatorAuthProposer) Propose(ctx context.Context, cmdType uint8, pa
 	// materialise is done).
 	if p.coord.raftNode.IsLeader() {
 		if err := p.coord.raftNode.Apply(cmd, timeout); err != nil {
-			return wrapApplyError(err)
+			return wrapApplyError(cmd.Type, err)
 		}
 		return nil
 	}
@@ -103,7 +103,7 @@ func (p *CoordinatorAuthProposer) Propose(ctx context.Context, cmdType uint8, pa
 	mergedCtx, mergedCancel := mergeContexts(ctx, forwardCtx)
 	defer mergedCancel()
 	if err := p.coord.forwardAndWaitHere(mergedCtx, cmd); err != nil {
-		return wrapApplyError(err)
+		return wrapApplyError(cmd.Type, err)
 	}
 	return nil
 }
@@ -116,8 +116,10 @@ func (p *CoordinatorAuthProposer) Propose(ctx context.Context, cmdType uint8, pa
 //
 // A refusal of a token name another token holds is also tagged
 // auth.ErrNameConflict, so a create or rename of a taken name answers 409
-// rather than 500 (#1625). The message is unchanged either way.
-func wrapApplyError(err error) error {
+// rather than 500 (#1625). Only for a token create or update command, so no
+// other command's text can match by accident. The message is unchanged
+// either way.
+func wrapApplyError(cmdType raft.CommandType, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -129,7 +131,7 @@ func wrapApplyError(err error) error {
 	// message so the auth-side "already exists" detection in
 	// ensureFirstToken keeps working.
 	wrapped := fmt.Errorf("%w: %w", auth.ErrApplyFailed, err)
-	if isTokenNameRefusal(err) {
+	if (cmdType == raft.CommandCreateToken || cmdType == raft.CommandUpdateToken) && isTokenNameRefusal(err) {
 		return &tokenNameConflictError{err: wrapped}
 	}
 	return wrapped
@@ -140,7 +142,9 @@ func wrapApplyError(err error) error {
 // ForwardRejectedError, so it is recognised there by the apply-failed code and
 // the two fixed parts of the FSM's text ("token name %q already exists"), with
 // the name between them — as classifyPolicyError recognises a forwarded policy
-// refusal.
+// refusal. %q escapes quotes in the name, so a name cannot forge the fixed
+// parts; if the FSM ever adds another token error that carries a name, check
+// it cannot match here.
 func isTokenNameRefusal(err error) bool {
 	if errors.Is(err, raft.ErrTokenNameExists) {
 		return true
