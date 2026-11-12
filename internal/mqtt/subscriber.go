@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -154,7 +155,13 @@ func newBrokerConnectError(err error) error {
 // A URL that does not parse is not logged at all.
 func redactBrokerURL(broker string) string {
 	u, err := url.Parse(broker)
-	if err != nil {
+	// A password containing "/", "?" or "#" ends the authority early, so
+	// url.Parse finds no userinfo and leaves the password in the host, path,
+	// query or fragment ("tcp://u:p/w@host" parses as host "u:p", path
+	// "/w@host"). An "@" past the authority, or an opaque URL, means the
+	// URL cannot be split safely: log nothing of it.
+	if err != nil || u.Opaque != "" || strings.Contains(u.Host, "@") ||
+		strings.Contains(u.Path, "@") || strings.Contains(u.RawQuery, "@") || strings.Contains(u.Fragment, "@") {
 		return "(unparsable broker URL)"
 	}
 	if _, hasPassword := u.User.Password(); hasPassword {

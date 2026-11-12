@@ -335,6 +335,10 @@ func TestRedactBrokerURL(t *testing.T) {
 		"wss://h/mqtt?a=1&b=2":                   "wss://h/mqtt?a=REDACTED&b=REDACTED",
 		"ssl://u:p%40ss@[::1]:8883/x?k=v#secret": "ssl://u:REDACTED@[::1]:8883/x?k=REDACTED",
 		"tcp://bad host:1883":                    "(unparsable broker URL)",
+		"tcp://u:1234/ss@host:1883":              "(unparsable broker URL)",
+		"tcp://u:12?34@host:1883":                "(unparsable broker URL)",
+		"tcp://u:12#34@host:1883":                "(unparsable broker URL)",
+		"tcp:u:p@host":                           "(unparsable broker URL)",
 	} {
 		if got := redactBrokerURL(in); got != want {
 			t.Errorf("redactBrokerURL(%q) = %q, want %q", in, got, want)
