@@ -4216,6 +4216,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: compressed MessagePack writes over the decompressed-size limit return `413` ([#3](https://github.com/Basekick-Labs/node-red-arc/issues/3))
+
+Compressed MessagePack requests whose decoded payload exceeds
+`server.max_payload_size` now return `413`, allowing clients to split and retry
+the batch. Invalid or corrupt compressed data still returns `400`.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+
 ### Fix: a token's `expires_in` must be in the future, and a rename cannot clear its name ([#1623](https://github.com/Basekick-Labs/arc/pull/1623))
 
 `POST /api/v1/auth/tokens` and `PATCH /api/v1/auth/tokens/{id}` accepted a

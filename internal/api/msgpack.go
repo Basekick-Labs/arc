@@ -286,6 +286,12 @@ localProcessing:
 	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
 		decompressed, derr := decompressGzipPooled(rawBody, int(h.maxPayloadSize))
 		if derr != nil {
+			var sizeErr *decompressedPayloadTooLargeError
+			if errors.As(derr, &sizeErr) {
+				return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+					"error": fmt.Sprintf("Payload too large (max %s). Consider batching into smaller requests.", formatBytes(h.maxPayloadSize)),
+				})
+			}
 			h.logger.Error().Err(derr).Msg("Failed to decompress gzip data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": fmt.Sprintf("Invalid gzip compression: %v", derr),
@@ -296,6 +302,12 @@ localProcessing:
 	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
 		decompressed, derr := decompressZstdPooled(rawBody, int(h.maxPayloadSize))
 		if derr != nil {
+			var sizeErr *decompressedPayloadTooLargeError
+			if errors.As(derr, &sizeErr) {
+				return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+					"error": fmt.Sprintf("Payload too large (max %s). Consider batching into smaller requests.", formatBytes(h.maxPayloadSize)),
+				})
+			}
 			h.logger.Error().Err(derr).Msg("Failed to decompress zstd data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": fmt.Sprintf("Invalid zstd compression: %v", derr),
@@ -560,7 +572,7 @@ func msgPackSpecDocument() fiber.Map {
 		"compression": fiber.Map{
 			"formats":   []string{"zstd (recommended)", "gzip", "none"},
 			"detection": "by the body's magic bytes; no Content-Encoding header is needed",
-			"limits":    "server.max_payload_size (default 1GB) bounds the request body (413) and the decompressed payload (400); zstd frames declaring a window over 32MB (--long, --ultra) are refused",
+			"limits":    "server.max_payload_size (default 1GB) bounds the request body (413) and the decompressed payload (413); zstd frames declaring a window over 32MB (--long, --ultra) are refused",
 		},
 		"authentication": fiber.Map{
 			"header":        "Authorization",

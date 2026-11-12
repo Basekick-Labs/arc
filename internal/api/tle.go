@@ -345,6 +345,14 @@ func decompressRequest(rawBody []byte, maxSize int) (body []byte, codec string, 
 // decompressGzipPooled decompresses gzip data using pooled readers to minimize allocations.
 // Shared across handlers — uses lpGzipReaderPool (declared in lineprotocol.go).
 // maxSize limits the decompressed output; pass 0 for the default 100MB limit.
+type decompressedPayloadTooLargeError struct {
+	maxSize int
+}
+
+func (e *decompressedPayloadTooLargeError) Error() string {
+	return fmt.Sprintf("decompressed payload exceeds %s limit", formatBytes(int64(e.maxSize)))
+}
+
 func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 	if maxSize <= 0 {
 		maxSize = 100 * 1024 * 1024 // 100MB default
@@ -373,7 +381,7 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 
 	if len(result) > maxSize {
 		lpGzipReaderPool.Put(reader)
-		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
+		return nil, &decompressedPayloadTooLargeError{maxSize: maxSize}
 	}
 
 	lpGzipReaderPool.Put(reader)
@@ -450,7 +458,7 @@ func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 	case errors.Is(err, zstd.ErrWindowSizeExceeded):
 		return nil, fmt.Errorf("failed to decompress zstd: %w", errZstdWindow)
 	case errors.Is(err, zstd.ErrDecoderSizeExceeded):
-		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
+		return nil, &decompressedPayloadTooLargeError{maxSize: maxSize}
 	case err != nil:
 		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
 	}
