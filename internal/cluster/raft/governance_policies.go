@@ -16,7 +16,12 @@ import (
 // so a policy set on one node did not apply on another. With the governance
 // flag on and the kind seeded, the policies live here, one per cluster token,
 // keyed by the token's ID, which is its FSM ID (a log index): every entry's
-// token is in f.tokens, and a token delete drops its entry.
+// token exists in f.tokens, and a token delete drops its entry. Existence is
+// all the FSM can check. That the row a node holds for token N was written
+// for this cluster token N, and not for a pre-cluster local token that
+// happens to share the ID, is decided before the seed, by the leader's merge
+// (#1627 part 2), from each node's report of the token's materialisation and
+// hash fingerprint.
 //
 // Governance has its own flag and capability, for the reason retention does:
 // a build without them would refuse these commands and drop this state from
@@ -51,9 +56,9 @@ type GovernancePolicyEntry struct {
 
 // SetGovernancePolicyPayload creates (Create) or replaces a token's policy.
 // A create of a token that has one is ErrGovernancePolicyExists; a replace of
-// one that has none is ErrPolicyNotFound. Decided here, against the state the
-// command applies to, so two nodes' writes cannot both pass a check made
-// before either applied (#1601).
+// one that has none is ErrPolicyNotFound: the API's 409 and 404 (#1601).
+// Decided here, against the state the command applies to, so two nodes'
+// writes cannot both pass a check made before either applied.
 type SetGovernancePolicyPayload struct {
 	TokenID            int64     `json:"token_id"`
 	Create             bool      `json:"create,omitempty"`
@@ -214,6 +219,17 @@ func (f *ClusterFSM) dropGovernancePolicyLocked(tokenID int64) bool {
 	}
 	delete(f.governancePolicies, tokenID)
 	return true
+}
+
+// dropOrphanGovernancePoliciesLocked removes the policies whose token the
+// state does not hold. Restore runs it once the tokens are in place.
+func (f *ClusterFSM) dropOrphanGovernancePoliciesLocked() {
+	for tokenID := range f.governancePolicies {
+		if _, ok := f.tokens[tokenID]; !ok {
+			delete(f.governancePolicies, tokenID)
+			f.logger.Warn().Int64("token_id", tokenID).Msg("Snapshot restore: dropped a governance policy whose token is not in the cluster")
+		}
+	}
 }
 
 // validGovernanceSeed checks a governance seed before it is applied: the

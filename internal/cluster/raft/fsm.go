@@ -3504,6 +3504,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], id)
 		f.tokensByName[entry.Name] = id
 	}
+	// A governance policy never outlives its token (#1627), even in a
+	// snapshot that says otherwise: nothing would ever drop it.
+	f.dropOrphanGovernancePoliciesLocked()
 
 	// Phase A.1: install RBAC primary maps + rebuild all secondary
 	// indices from scratch (we never persist them — they're derived).

@@ -152,30 +152,29 @@ func knownPolicyKind(kind string) bool {
 }
 
 // policyKindFlagSpec is a kind with a flag of its own on top of the cluster
-// policies flag (#1324 stages 2 and 3, #1627): what its enable command's
-// refusals call it and what the apply logs.
+// policies flag (#1324 stages 2 and 3, #1627): the field holding the flag,
+// what its enable command's refusals call it and what the apply logs.
 type policyKindFlagSpec struct {
+	flag    func(f *ClusterFSM) *bool
 	noun    string
 	enabled string
 }
 
 var policyKindFlags = map[string]policyKindFlagSpec{
-	PolicyKindRetention:  {noun: "retention policies", enabled: "Cluster-wide retention policies enabled"},
-	PolicyKindCQ:         {noun: "continuous query policies", enabled: "Cluster-wide continuous queries enabled"},
-	PolicyKindGovernance: {noun: "governance policies", enabled: "Cluster-wide governance policies enabled"},
+	PolicyKindRetention: {func(f *ClusterFSM) *bool { return &f.retentionEnabled },
+		"retention policies", "Cluster-wide retention policies enabled"},
+	PolicyKindCQ: {func(f *ClusterFSM) *bool { return &f.cqEnabled },
+		"continuous query policies", "Cluster-wide continuous queries enabled"},
+	PolicyKindGovernance: {func(f *ClusterFSM) *bool { return &f.governanceEnabled },
+		"governance policies", "Cluster-wide governance policies enabled"},
 }
 
 // policyKindFlag returns the field holding kind's own flag, or nil for a kind
 // without one (tiering, which needs only the cluster policies flag) or an
 // unknown kind. It reads nothing: callers read the field under f.mu.
 func (f *ClusterFSM) policyKindFlag(kind string) *bool {
-	switch kind {
-	case PolicyKindRetention:
-		return &f.retentionEnabled
-	case PolicyKindCQ:
-		return &f.cqEnabled
-	case PolicyKindGovernance:
-		return &f.governanceEnabled
+	if spec, ok := policyKindFlags[kind]; ok {
+		return spec.flag(f)
 	}
 	return nil
 }
@@ -221,7 +220,7 @@ func (f *ClusterFSM) applyEnablePolicyKind(kind string, payload []byte) interfac
 	if !f.clusterPolicies {
 		return fmt.Errorf("enable %s: cluster policies are not enabled", spec.noun)
 	}
-	flag := f.policyKindFlag(kind)
+	flag := spec.flag(f)
 	if *flag {
 		return nil
 	}

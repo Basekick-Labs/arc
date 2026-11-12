@@ -96,13 +96,14 @@ func BenchmarkAdmitParallel(b *testing.B) {
 		fsm := raft.NewClusterFSM(zerolog.Nop())
 		var idx uint64
 		apply := func(typ raft.CommandType, p any) (uint64, interface{}) {
+			// Also runs on the apply goroutine: Error, not Fatal.
 			raw, err := json.Marshal(p)
 			if err != nil {
-				b.Fatal(err)
+				b.Error(err)
 			}
 			data, err := json.Marshal(raft.Command{Type: typ, Payload: raw})
 			if err != nil {
-				b.Fatal(err)
+				b.Error(err)
 			}
 			idx++
 			return idx, fsm.Apply(&hraft.Log{Index: idx, Data: data})
@@ -142,14 +143,16 @@ func BenchmarkAdmitParallel(b *testing.B) {
 		}()
 
 		var next atomic.Int64
-		b.ReportAllocs()
+		// No ReportAllocs: it would count the apply goroutine's allocations
+		// too. Admit's own are BenchmarkAdmit's.
 		start := time.Now()
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
 			tok := next.Add(1)%tokens + 1
 			for pb.Next() {
 				if r := m.Admit(tok); !r.Allowed {
-					b.Fatalf("%+v", r)
+					b.Errorf("%+v", r)
+					return
 				}
 			}
 		})

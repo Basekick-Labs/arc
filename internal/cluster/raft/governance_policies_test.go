@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"testing"
+
+	"github.com/hashicorp/raft"
 )
 
 // gpFSM: cluster policies and the governance flag enabled.
@@ -274,6 +277,40 @@ func TestGovernancePoliciesSnapshot(t *testing.T) {
 	if !f2.ClusterPoliciesEnabled() || !f2.PoliciesSeeded(PolicyKindGovernance) {
 		t.Fatal("the older snapshot's other cluster policies state was not restored")
 	}
+	// Seeded but without the flag (that older snapshot): no write applies.
+	if res := f2.Apply(govLog(t, 1<<20, CommandSetGovernancePolicy, govSet(a, true, 1))); res == nil {
+		t.Fatal("a governance write applied without the governance flag")
+	}
+
+	// A snapshot holding a policy whose token it does not hold restores
+	// without it: nothing would ever drop it.
+	var toks map[string]json.RawMessage
+	raw = nil
+	if err := json.Unmarshal(snap, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw["tokens"], &toks); err != nil {
+		t.Fatalf("tokens field: %v", err)
+	}
+	delete(toks, strconv.FormatInt(b, 10))
+	raw["tokens"], _ = json.Marshal(toks)
+	orphan, _ := json.Marshal(raw)
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(orphan))); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f2.GovernancePolicy(b); ok {
+		t.Fatal("a restored policy outlived its token")
+	}
+	if _, ok := f2.GovernancePolicy(a); !ok {
+		t.Fatal("a policy whose token is restored was dropped")
+	}
+}
+
+func govLog(t *testing.T, idx uint64, typ CommandType, p any) *raft.Log {
+	t.Helper()
+	raw, _ := json.Marshal(p)
+	data, _ := json.Marshal(Command{Type: typ, Payload: raw})
+	return &raft.Log{Index: idx, Data: data}
 }
 
 // A token delete drops the token's governance policy and signals the

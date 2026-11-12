@@ -188,7 +188,9 @@ func (c *Coordinator) maybeEnablePolicyKinds() {
 	}
 }
 
-// maybeEnableRetentionPolicies / maybeEnableCQPolicies: one kind's pass.
+// maybeEnableRetentionPolicies / maybeEnableCQPolicies: one kind's pass. No
+// production caller (the loop runs maybeEnablePolicyKinds); kept for the
+// retention and CQ tests, which predate the table.
 func (c *Coordinator) maybeEnableRetentionPolicies() {
 	c.maybeEnablePolicyKind(policyKindSpecFor(raft.PolicyKindRetention))
 }
@@ -215,7 +217,8 @@ func (c *Coordinator) policyKindActive(kind string) bool {
 }
 
 // policyKindNotEnabled is the error an admin's choice of kind gets before the
-// kind is active.
+// kind is active. A kind outside the table keeps the retention error it got
+// before the table; the API validates the kind before it gets here.
 func policyKindNotEnabled(kind string) error {
 	if s := policyKindSpecFor(kind); s != nil {
 		return s.notEnabled
