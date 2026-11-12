@@ -42,6 +42,7 @@ type Config struct {
 	// relative to the working directory is not it.
 	ConfigFile      string
 	Server          ServerConfig
+	FlightSQL       FlightSQLConfig
 	Database        DatabaseConfig
 	Storage         StorageConfig
 	Iceberg         IcebergConfig
@@ -87,6 +88,11 @@ type ServerConfig struct {
 	TLSEnabled  bool   // Enable HTTPS/TLS
 	TLSCertFile string // Path to TLS certificate file (PEM format)
 	TLSKeyFile  string // Path to TLS private key file (PEM format)
+}
+
+type FlightSQLConfig struct {
+	Enabled bool
+	Port    int
 }
 
 type DatabaseConfig struct {
@@ -1138,6 +1144,10 @@ func Load() (*Config, error) {
 			TLSCertFile:                 v.GetString("server.tls_cert_file"),
 			TLSKeyFile:                  v.GetString("server.tls_key_file"),
 		},
+		FlightSQL: FlightSQLConfig{
+			Enabled: v.GetBool("flight_sql.enabled"),
+			Port:    v.GetInt("flight_sql.port"),
+		},
 		Database: DatabaseConfig{
 			MaxConnections:         v.GetInt("database.max_connections"),
 			MemoryLimit:            v.GetString("database.memory_limit"),
@@ -2051,6 +2061,9 @@ func Load() (*Config, error) {
 	if err := checkMaxSQLLength(cfg.Query.MaxSQLLength, cfg.Server.MaxPayloadSize); err != nil {
 		return nil, err
 	}
+	if err := validateFlightSQLConfig(cfg.FlightSQL, cfg.Server); err != nil {
+		return nil, err
+	}
 
 	return cfg, nil
 }
@@ -2088,6 +2101,19 @@ func checkMaxSQLLength(n int, maxPayload int64) error {
 	return nil
 }
 
+func validateFlightSQLConfig(flight FlightSQLConfig, server ServerConfig) error {
+	if !flight.Enabled {
+		return nil
+	}
+	if flight.Port < 1 || flight.Port > 65535 {
+		return fmt.Errorf("flight_sql.port must be between 1 and 65535 (got %d)", flight.Port)
+	}
+	if flight.Port == server.Port {
+		return fmt.Errorf("flight_sql.port must differ from server.port (%d)", server.Port)
+	}
+	return nil
+}
+
 func setDefaults(v *viper.Viper) {
 	// Server defaults.
 	//
@@ -2110,6 +2136,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.tls_enabled", false)
 	v.SetDefault("server.tls_cert_file", "")
 	v.SetDefault("server.tls_key_file", "")
+	v.SetDefault("flight_sql.enabled", false)
+	v.SetDefault("flight_sql.port", 50051)
 
 	// Database defaults - dynamically calculated based on system resources
 	v.SetDefault("database.max_connections", getDefaultMaxConnections())

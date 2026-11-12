@@ -47,6 +47,7 @@ import (
 	"github.com/basekick-labs/arc/internal/telemetry"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
+	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -2998,6 +2999,9 @@ func main() {
 	// Initialize Audit Logging (Enterprise feature - requires valid license)
 	// Must be registered before API routes so the middleware captures all requests
 	var auditLogger *audit.Logger
+	// Middleware the Flight SQL bridge runs after auth, as the main app does
+	// (internal/api/flight_sql.go): the audit middleware when audit is on.
+	var flightSQLMiddleware []fiber.Handler
 	if cfg.AuditLog.Enabled {
 		if licenseClient == nil {
 			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
@@ -3034,8 +3038,11 @@ func main() {
 						return nil
 					}, shutdown.PriorityCompaction)
 
-					// Register audit middleware BEFORE API routes
-					server.GetApp().Use(audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads))
+					// Register audit middleware BEFORE API routes. The Flight SQL
+					// bridge gets the same middleware (flightSQLMiddleware).
+					auditMiddleware := audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads)
+					server.GetApp().Use(auditMiddleware)
+					flightSQLMiddleware = append(flightSQLMiddleware, auditMiddleware)
 
 					log.Info().
 						Int("retention_days", cfg.AuditLog.RetentionDays).
@@ -5551,6 +5558,30 @@ func main() {
 		return nil
 	}, 5)
 
+	var flightSQLServer *api.FlightSQLServer
+	if cfg.FlightSQL.Enabled {
+		flightSQLServer, err = api.NewFlightSQLServer(queryHandler, api.FlightSQLServerConfig{
+			Host:        cfg.Server.Host,
+			Port:        cfg.FlightSQL.Port,
+			TLSEnabled:  cfg.Server.TLSEnabled,
+			TLSCertFile: cfg.Server.TLSCertFile,
+			TLSKeyFile:  cfg.Server.TLSKeyFile,
+			Middleware:  flightSQLMiddleware,
+		}, logger.Get("flight-sql"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize Flight SQL server")
+		}
+		// Bound now, served once the HTTP server is up: a port conflict
+		// exits before the node reports ready. Like an HTTP start failure,
+		// the exit skips the shutdown hooks.
+		if err := flightSQLServer.Listen(); err != nil {
+			log.Fatal().Err(err).Msg("Failed to start Flight SQL server")
+		}
+		shutdownCoordinator.RegisterHook("flight-sql-server", func(ctx context.Context) error {
+			return flightSQLServer.Shutdown(ctx)
+		}, shutdown.PriorityHTTPServer-1)
+	}
+
 	// Register HTTP server shutdown hook (first to stop accepting new
 	// requests). The arg is the HTTP server's INTERNAL drain timeout —
 	// independent of shutdownCoordinator's own budget, though both now derive
@@ -5584,6 +5615,11 @@ func main() {
 	// Start server
 	if err := server.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
+	}
+	if flightSQLServer != nil {
+		if err := flightSQLServer.Serve(); err != nil {
+			log.Fatal().Err(err).Msg("Failed to start Flight SQL server")
+		}
 	}
 
 	protocol := "HTTP"

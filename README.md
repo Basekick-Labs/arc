@@ -149,6 +149,8 @@ Benefits:
 
 Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (columnar, stable as of 26.09.1) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
 
+An optional Arrow Flight SQL listener exposes the same read-only query path over gRPC for ADBC and other Flight SQL clients. See the [Flight SQL guide](docs/operations/flight-sql.md) for setup and authentication.
+
 Benchmark: Arc 27.01.1 (main at b4d98a31, October 2026), M3 Max, `query_suite` from arc-benchmarks, 5 iterations per query, latency is p50 in milliseconds. One session, one dataset: a 532.6M-row `cpu` measurement (60 s of `sustained_bench` msgpack ingest spread over 24 hours, hourly-compacted: 25 hour partitions, 100 files), so the three columns are apples-to-apples.
 
 | Query | JSON (ms) | MessagePack (ms) | Arrow IPC (ms) | msgpack vs JSON | Arrow vs JSON |
