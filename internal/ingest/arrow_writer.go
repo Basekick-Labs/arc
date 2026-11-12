@@ -5049,8 +5049,9 @@ func (b *ArrowBuffer) completeFlush(walHashes []string, group *flushGroup) {
 // syncRegistrations makes the registrations appended so far durable, before
 // the checkpoint that stops their rows replaying (#1209). Without a WAL there
 // is no checkpoint to order the sync before, and the unsynced append already
-// survives a process crash; skipping it keeps serial flushes (Close, the aged
-// sweep) from paying a fsync each.
+// survives a process crash; skipping it saves serial flushes (Close, the aged
+// sweep) one more fsync each, on top of the file and directory fsyncs the
+// local backend's Write already pays (#1618).
 func (b *ArrowBuffer) syncRegistrations() {
 	ref := b.fileRegistrar.Load()
 	if ref == nil || b.wal == nil {
@@ -5082,8 +5083,10 @@ func (b *ArrowBuffer) syncRegistrations() {
 // counted and dropped: its rows replay as they did before, nothing is lost.
 //
 // "Stored" is storage.Write having returned, the same standard the flush's
-// own checkpoint has always relied on: the local backend renames a closed
-// file without fsync, so this survives a process crash, not a power loss.
+// own checkpoint relies on: the local backend fsyncs the file and its
+// directory before it returns (#1618), and an object store has the object
+// once the PUT returns, so the checkpoint never outlives the data in a power
+// loss.
 //
 // The wait counts against the flush's context (ingest.flush_timeout_seconds)
 // like the storage writes do: a backfill flush of many hours pays one WAL

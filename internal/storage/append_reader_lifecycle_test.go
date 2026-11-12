@@ -118,6 +118,20 @@ func TestAppendReaderLifecycle(t *testing.T) {
 				}
 				return
 			}
+			if tc.closeFails && !tc.partial && !tc.copyFails {
+				// A promoting append fsyncs before it closes (#1618), so the
+				// descriptor closed under it fails the sync first, and a failed
+				// sync removes the staging file: its bytes are not known to be
+				// on disk, and a resume must not build on them.
+				if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("staging file kept after a failed sync: %v", err)
+				}
+				data, err := os.ReadFile(committedPath)
+				if err != nil || string(data) != committed {
+					t.Errorf("committed data changed: %q, error = %v", data, err)
+				}
+				return
+			}
 			data, err := os.ReadFile(staging)
 			if err != nil || string(data) != "prefix-tail" {
 				t.Errorf("staging data = %q, error = %v", data, err)

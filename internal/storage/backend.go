@@ -218,7 +218,10 @@ var ErrAdoptUnsupported = errors.New("storage: local file cannot be adopted in p
 // the caller must not read it afterwards. That is the point of the interface
 // and the reason it is opt-in rather than part of Backend. A backend that
 // copies bytes must not implement it, and a caller that still needs the file
-// must not use it.
+// must not use it. The source is also consumed by a failure after the move,
+// when the moved file could not be made durable and was removed (#1618): the
+// caller must treat any error other than ErrAdoptUnsupported as "the source
+// may be gone".
 //
 // ErrAdoptUnsupported means "this pair of paths cannot be adopted, copy
 // instead" and is not a failure. Any other error is a real one.

@@ -113,6 +113,115 @@ New counters: `arc_ingest_ambiguous_writes_recorded_total`,
 `arc_ingest_ambiguous_writes_abandoned_total` (no longer tracked without a
 removal: rows not seen stored again within a day, or an object of another
 size at the key). No new configuration.
+## Fix: local storage fsyncs what it writes, so a power loss cannot take acknowledged rows ([#1618](https://github.com/Basekick-Labs/arc/issues/1618))
+
+The local storage backend renamed each written file into place without
+fsyncing it or its directory. With the WAL on, a flush checkpoints the WAL
+as soon as the file is written, and recovery skips checkpointed entries. A
+power loss or kernel crash before the kernel wrote the file back therefore
+lost rows that had been acknowledged as `durable`. A process crash (`kill -9`)
+was never affected, because the page cache survives it. Compaction and the
+DELETE rewrite had the same gap: both remove their source files once the new
+file is written, so a power loss could leave neither.
+
+Every write to local storage now fsyncs the file before it gets its final
+name, and fsyncs the directory after. This covers ingest flushes, compaction
+output, the DELETE rewrite, tiering's cold-to-hot copies, cluster peer
+fetches, backup and restore, and Iceberg metadata. New partition directories
+are synced into their parents. Object storage (S3, Azure, GCS) is unchanged:
+an object is durable once its upload returns.
+
+Behaviour on failure:
+
+- **A failed file fsync fails the write.** Nothing is published. A
+  `.part` staging file is removed rather than resumed, because after a failed
+  fsync its bytes cannot be trusted.
+- **A failed directory fsync after the rename also fails the write**, and
+  the file stays in place: its bytes are already on disk, only its name could
+  be lost. With the WAL on, the flush's rows replay, so they can be read twice
+  until compaction removes the duplicates. A duplicate, never a loss.
+- **The exception is a copy into a new key** (compaction output, tiering and
+  peer copies). The copied file is removed, because the caller still has the
+  source and retries.
+- **Directory fsync refused outright.** Volumes that refuse directory fsync
+  (`EINVAL`, `ENOTSUP` or `ENOSYS`, e.g. some FUSE and CIFS mounts) are
+  accepted, with one warning.
+
+**Cost.** Each flushed file costs two more fsyncs on the flush worker. On
+Linux the cost is unmeasured so far. Measured on an M3 Max, where Go's
+`File.Sync` is `F_FULLFSYNC` (the worst case), with the sustained MessagePack
+bench (`arc.toml`, 12 workers, alternating runs):
+
+| Configuration | Before | After |
+|---|---|---|
+| WAL off | 34.3M rec/s | 34.0M rec/s (noise) |
+| WAL on, `ack_mode = "queued"` | 32.0M rec/s | 32.0M rec/s (noise) |
+| WAL on, `ack_mode = "durable"` | 1.22M rec/s | 0.90M rec/s (−26%) |
+
+The cost scales with files written per second, not rows.
+
+- **Many measurements flushed by age.** Small buffers flushed often pay the
+  most. With 1,000 measurements each receiving one row a second, the aged
+  sweep (every 5 s, one buffer after another) took about 30 s to flush them
+  all on macOS instead of about 2 s. Buffers wait longer and files get larger.
+  Ingest requests were not slowed (p50 about 20 ms either way), and no rows
+  were lost.
+- **Restore and tiering.** Copies of many files (backup restore, tiering
+  cold-to-hot) are slower by two fsyncs per file.
+
+## Fix: a tiering policy needs an existing database; an Iceberg warehouse inside the storage root is not a database ([#1626](https://github.com/Basekick-Labs/arc/issues/1626))
+
+**Behaviour change: `PUT /api/v1/tiering/policies/{database}` now answers
+404 `Database '<name>' not found` for a database that does not exist.** It
+used to store the policy. A database exists by the rule `GET
+/api/v1/databases/{name}` answers with: its marker, a file, a cold-tier row
+or (in a cluster) a manifest entry. If you set policies before the first
+write, create the database first with `POST /api/v1/databases`. The PUT also
+answers:
+
+- **400** `invalid database name "<name>"` for a name that is not a valid
+  storage segment (before: stored);
+- **400** with the name-spelling text for a name that exists in another
+  spelling on a volume that folds case ([#1509](https://github.com/Basekick-Labs/arc/issues/1509));
+- **500** `Failed to check database` when the check itself fails.
+
+`GET`, `DELETE` and `/effective` are unchanged: `DELETE` still removes a
+policy left behind by a deleted database. The check runs on the node that
+answers: on a cluster that keeps data per node, a database that so far holds
+only the marker made by `POST /api/v1/databases` exists only on the writer, so
+set its policy on the writer, or after the first write.
+
+With Iceberg export on, the warehouse's directories in the storage root are
+no longer treated as databases: the namespace directories (`arc_<db>.db`), and
+a warehouse set to a subdirectory of the storage root
+(`iceberg.warehouse=<root>/lv_wh`, on local storage or an S3 prefix).
+`GET /api/v1/databases`, `SHOW DATABASES`, `SHOW TABLES` and
+`GET /api/v1/measurements` leave them out; `GET /api/v1/databases/{name}` and
+its `/measurements` answer 404, `DELETE` answers 403, and
+`POST /api/v1/databases` answers 400 `Database name '<name>' is reserved`. A
+write to a database named after the subdirectory warehouse (line protocol,
+MessagePack, TLE, every `/api/v1/import/*` format, a continuous query's
+database, an MQTT subscription or `topic_mapping` target) is refused with 400
+`database name "<name>" is reserved for the Iceberg warehouse`, so writes
+cannot land inside a subdirectory warehouse. A directory whose name only
+starts with the warehouse's (`lv_wh-other`) is an ordinary database. A
+warehouse nested deeper (`<root>/a/b`) hides measurement `b` of database `a`,
+and `a` stays listed; `DELETE` of database `a` answers 403, because it would
+delete the warehouse with it. Writes to measurement `b` of database `a` are
+**not** refused: they land inside the warehouse directory, are hidden from the
+listings and are not exported, so do not write there (a startup warning names
+that measurement). The export walk applies the same rule, so it no longer walks a
+subdirectory warehouse as a database. Configure Iceberg the same way on every
+node: a node with Iceberg off lists the warehouse and accepts writes to it.
+
+`/api/v1/import/csv` and `/api/v1/import/parquet` now honour their own
+refusals of an invalid database or measurement name and of an RBAC denial:
+they answer the 400 or 403 they wrote, where they used to carry on with an
+empty database name and answer a later 500 or 422.
+
+Cost: one existence check per policy PUT (an admin call); an in-memory name
+comparison per listed directory; one atomic load and string comparison per
+write request (per message for MQTT), never per row.
 
 ## Fix: an MQTT start or restart that cannot connect to the broker answers 502 with the reason ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
 
@@ -3959,6 +4068,67 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### Fix: a token's `expires_in` must be in the future, and a rename cannot clear its name ([#1623](https://github.com/Basekick-Labs/arc/pull/1623))
+
+`POST /api/v1/auth/tokens` and `PATCH /api/v1/auth/tokens/{id}` accepted a
+zero or negative `expires_in` (`"-24h"`, `"0d"`) and answered success for a
+token that had already expired, so it could not authenticate. A day count too
+large for Go's duration type, positive or negative, overflowed into an
+arbitrary expiry, past or future (`"99999999d"` gave 2246, `"-177004d"`
+2126). Both routes now answer `400`: `"expires_in must be positive"`, or
+`"expires_in is too long: at most 36500d (100 years)..."` for anything over
+100 years, and store nothing. A token that should not expire omits
+`expires_in`, as before. An unreadable `expires_in` on `PATCH` now gets the
+same message as on create, naming the accepted forms.
+
+`PATCH` with `"name": ""` renamed the token to an empty name, which create
+refuses. It now answers `400 "Token name cannot be empty"`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
+
+### Fix: token routes answer `409` for a taken name or a revoked token, and `404` for an unknown ID ([#1625](https://github.com/Basekick-Labs/arc/issues/1625))
+
+`POST /api/v1/auth/tokens` with a name another token already has answered
+`500` and logged an error, and so did `PATCH /api/v1/auth/tokens/{id}` renaming
+a token to such a name. Both now answer `409 "token with name '<name>' already
+exists"` on a standalone node and in a cluster. Before, only a standalone create
+used that text: a standalone rename answered `Failed to update token: UNIQUE
+constraint failed: api_tokens.name`, and in a cluster the message carried the
+`cluster apply failed` wrapping (and, on a follower, the `forward apply: leader
+rejected` prefix). The first token is unchanged.
+
+On a cluster node, `PATCH`, `DELETE`, `POST .../rotate` and `POST .../revoke`
+for an ID with no token answered `200`, because the cluster applies a write to
+an unknown token as a no-op. `rotate` even returned a `new_token` that
+authenticated nothing. They now answer `404 "Token not found"`, as a standalone
+node already did, and propose nothing. A `PATCH` with no fields for an unknown
+ID is now a `404` on both. As with the RBAC routes, a follower that has not yet
+applied a token created elsewhere answers `404` for it for that short moment.
+
+`POST .../rotate` on a revoked token answered `200` with a `new_token` that
+could never authenticate: revocation is permanent and no route re-enables a
+token. It now answers `409`, and the token stays revoked. Create a new token
+instead; a new token has a new ID, so re-attach its governance policies and
+team memberships. Expired tokens can still be rotated, and revoking an already
+revoked token still answers `200`.
+
+In a cluster, a rotate is checked against the node's own copy of the token
+before it is proposed, and again after it has been applied: if the token was
+revoked or deleted on another node just before, the rotate answers `409` or
+`404` instead of a `new_token` that never authenticates. On the node that leads
+the cluster, that second check sees every revoke and delete ordered before the
+rotate. On a follower it does too once cluster policies are enabled, as long as
+the follower's wait to apply the rotate itself does not time out. A follower
+that has not yet applied a revoke or delete made elsewhere, even one already
+acknowledged, can still answer `200` with a `new_token` that never
+authenticates, for a revoke, or for a delete, where it would otherwise answer
+`404`: before cluster policies are enabled, or when that wait times out. The
+revoked or deleted token stays unusable either way.
+
+Duplicate-name and unknown-ID parts contributed by
+[@officialasishkumar](https://github.com/officialasishkumar) in
+[#1622](https://github.com/Basekick-Labs/arc/pull/1622).
 
 ### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
 

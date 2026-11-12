@@ -429,6 +429,8 @@ func validateCQDefinition(req *ContinuousQueryRequest, create bool) error {
 		return err
 	} else if ok && !isValidDatabaseName(req.Database.Value) {
 		return errors.New("invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)")
+	} else if ok && storage.IsWarehouseRootName(req.Database.Value) {
+		return errors.New(warehouseDatabaseError(req.Database.Value))
 	}
 	if ok, err := required("source_measurement", req.SourceMeasurement); err != nil {
 		return err
@@ -1399,6 +1401,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// through the recorded execution, which is not sanitized.
 	if !isValidDatabaseName(cq.Database) {
 		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid database name: %q", cq.Name, cq.Database)
+	}
+	if storage.IsWarehouseRootName(cq.Database) {
+		return 0, fmt.Errorf("stored continuous-query definition %q targets database %q, which is reserved for the Iceberg warehouse", cq.Name, cq.Database)
 	}
 
 	// SECURITY: and the stored measurement names, for the same reason and in
