@@ -423,6 +423,12 @@ func (r *contextArrowRecordReader) RecordBatch() arrow.RecordBatch {
 	return record
 }
 
+// Record is the deprecated spelling of RecordBatch. Without this override a
+// caller using it would reach the embedded reader directly, rowsRead would stay
+// zero, and Err would report a deadline that expired after a capped result as a
+// truncation.
+func (r *contextArrowRecordReader) Record() arrow.RecordBatch { return r.RecordBatch() }
+
 func (r *contextArrowRecordReader) Err() error {
 	if err := r.RecordReader.Err(); err != nil {
 		return err
@@ -440,6 +446,19 @@ func (r *contextArrowRecordReader) Err() error {
 // used by DuckDB. Keeping the cap and trailer handling here lets the ArcX hook
 // use the tested streaming semantics without linking its private engine into
 // the ordinary test build.
+//
+// Invariants carried over from the inline writer it replaces (#717, #731):
+//   - FFI cliff: the ArcX reader's Release is a no-op and its buffers are
+//     freed by a GC finalizer, so runtime.KeepAlive(reader) must stay the
+//     LAST statement of the writer's deferred block, after the final read.
+//   - The async writer OWNS cancel. It runs after the handler returned; a
+//     caller that cancelled eagerly would end streamCtx before the first
+//     batch (schema-only body plus a spurious mid-stream cancel).
+//   - fctx is the fasthttp RequestCtx captured by the caller. The pooled
+//     fiber.Ctx is recycled once the handler returns, so nothing here may
+//     reach for it (use-after-free).
+//   - The registry entry was registered before the engine was chosen (#731);
+//     onComplete/onFail are its only disposition, including on a panic.
 func (h *QueryHandler) serveArcxArrowIPCResult(
 	fctx *fasthttp.RequestCtx,
 	streamCtx context.Context,

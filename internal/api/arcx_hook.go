@@ -22,7 +22,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/basekick-labs/arc/internal/arcxrouter"
 	"github.com/basekick-labs/arc/internal/metrics"
-	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )

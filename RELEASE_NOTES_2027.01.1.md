@@ -3920,10 +3920,25 @@ an unbounded operation.
 
 ## Bug fixes
 
-### ArcX Arrow IPC honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
+### Fix: an Arrow query served by arcx honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
 
-ArcX-served Arrow IPC responses now enforce `MaxRows` and declare trailers for
-truncation, execution time and capped rows, consistent with the DuckDB path.
+A `POST /api/v1/query/arrow` query that arcx served ignored the token's
+governance `max_rows_per_query` and streamed every row; only the DuckDB path
+stopped at the cap. It also declared only the `Arc-Stream-Truncated` trailer,
+so a client, or a compactor forwarding the query (#1567), never saw
+`Arc-Rows-Capped` or `Arc-Execution-Time-Ms` from it.
+
+Now the arcx path streams through the same writer as the DuckDB path:
+- The result stops at the cap, `Arc-Rows-Capped` names it, and the query's
+  history entry records it, as on DuckDB.
+- All three trailers are declared, and `Arc-Execution-Time-Ms` is set on
+  every response, including a failed one.
+- A deadline that expires mid-stream counts in `arc_query_timeouts_total`,
+  and a timeout or cancel counts as a client disconnect, as on DuckDB.
+- A client that has gone away gets no truncation marker or trailer written
+  to its closed connection.
+- The truncation reason reads like DuckDB's (`stream cancelled at row N: …`)
+  instead of the bare error.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1294](https://github.com/Basekick-Labs/arc/pull/1294).
