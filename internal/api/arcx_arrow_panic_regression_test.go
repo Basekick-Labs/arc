@@ -58,8 +58,15 @@ func TestArcxArrowPanicWiring(t *testing.T) {
 	if streamCall == nil {
 		t.Fatal("arcx Arrow path bypasses the panic-safe trailer stream")
 	}
-	if len(streamCall.Args) != 6 {
-		t.Fatalf("stream wrapper has %d arguments, want 6", len(streamCall.Args))
+	if len(streamCall.Args) != 7 {
+		t.Fatalf("stream wrapper has %d arguments, want 7", len(streamCall.Args))
+	}
+	metric, ok := streamCall.Args[6].(*ast.SelectorExpr)
+	if !ok || metric.Sel.Name != "fail" {
+		t.Fatal("arcx Arrow stream lacks terminal panic metric")
+	}
+	if owner, ok := metric.X.(*ast.Ident); !ok || owner.Name != "outcome" {
+		t.Fatal("panic metric must share normal terminal outcome")
 	}
 	if id, ok := streamCall.Args[2].(*ast.Ident); !ok || id.Name != "trailers" {
 		t.Fatal("arcx Arrow stream does not publish its trailers")

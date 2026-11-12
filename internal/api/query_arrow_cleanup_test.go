@@ -130,6 +130,7 @@ func TestExecuteQueryArrowReturnsConnectionOnPanic(t *testing.T) {
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Post("/api/v1/query/arrow", h.executeQueryArrow)
 
+	metricBefore := metrics.Get().Snapshot()
 	before := duckdb.Stats()
 	req := httptest.NewRequest("POST", "/api/v1/query/arrow", strings.NewReader(`{"sql":"SELECT 1 AS id"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -141,6 +142,12 @@ func TestExecuteQueryArrowReturnsConnectionOnPanic(t *testing.T) {
 	// is where the panic and the recovery happen.
 	_, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
+	metricAfter := metrics.Get().Snapshot()
+	aggregateDelta := metricAfter["query_errors_total"].(int64) - metricBefore["query_errors_total"].(int64)
+	engineDelta := metricAfter["query_engine_executions"].(map[string]map[string]int64)["duckdb"]["error"] - metricBefore["query_engine_executions"].(map[string]map[string]int64)["duckdb"]["error"]
+	if aggregateDelta != 1 || engineDelta != 1 {
+		t.Errorf("panic invariant: aggregate errors delta=%d engine errors delta=%d, want 1/1", aggregateDelta, engineDelta)
+	}
 
 	// The pool is the operational impact: a leaked connection is gone for the
 	// life of the process, so repeated panics starve the endpoint.

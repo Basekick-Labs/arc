@@ -74,6 +74,7 @@ func TestExecuteQueryArrow_CountsRequestAndSuccess(t *testing.T) {
 
 	requestsBefore := queryMetricInt(t, "query_requests_total")
 	successBefore := queryMetricInt(t, "query_success_total")
+	engineBefore := metrics.Get().Snapshot()["query_engine_executions"].(map[string]map[string]int64)[metrics.QueryEngineDuckDB]["success"]
 
 	req := httptest.NewRequest("POST", "/api/v1/query/arrow", strings.NewReader(`{"sql":"SELECT 1 AS id"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -97,5 +98,29 @@ func TestExecuteQueryArrow_CountsRequestAndSuccess(t *testing.T) {
 	if got := queryMetricInt(t, "query_success_total"); got != successBefore+1 {
 		t.Errorf("query_success_total = %d, want %d: a successful Arrow query is invisible to the query counters (#801)",
 			got, successBefore+1)
+	}
+	if got := metrics.Get().Snapshot()["query_engine_executions"].(map[string]map[string]int64)[metrics.QueryEngineDuckDB]["success"]; got != engineBefore+1 {
+		t.Errorf("DuckDB engine successes = %d, want %d", got, engineBefore+1)
+	}
+
+	prom := metrics.Get().PrometheusFormat()
+	if !strings.Contains(prom, `arc_query_latency_seconds_count{engine="duckdb"}`) {
+		t.Fatal("query latency histogram is missing the DuckDB series")
+	}
+
+	engineErrorsBefore := metrics.Get().Snapshot()["query_engine_executions"].(map[string]map[string]int64)[metrics.QueryEngineDuckDB]["error"]
+	errReq := httptest.NewRequest("POST", "/api/v1/query/arrow", strings.NewReader(`{"sql":"SELECT missing_column FROM range(1)"}`))
+	errReq.Header.Set("Content-Type", "application/json")
+	errResp, err := app.Test(errReq, 10000)
+	if err != nil {
+		t.Fatalf("app.Test error query: %v", err)
+	}
+	_, _ = io.ReadAll(errResp.Body)
+	errResp.Body.Close()
+	if errResp.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("error query status = %d, want 500", errResp.StatusCode)
+	}
+	if got := metrics.Get().Snapshot()["query_engine_executions"].(map[string]map[string]int64)[metrics.QueryEngineDuckDB]["error"]; got != engineErrorsBefore+1 {
+		t.Errorf("DuckDB engine errors = %d, want %d", got, engineErrorsBefore+1)
 	}
 }
