@@ -106,7 +106,12 @@ func parseExpiresIn(s string) (time.Duration, error) {
 		if err != nil {
 			return 0, invalid
 		}
-		// Compared before multiplying, so a large count cannot overflow.
+		// Both bounds are checked before multiplying, so no count can
+		// overflow: a negative one such as "-177004d" used to wrap round to
+		// an expiry about 100 years out.
+		if n <= 0 {
+			return 0, errors.New("expires_in must be positive")
+		}
 		if n > int64(maxExpiresIn/(24*time.Hour)) {
 			return 0, tooLong
 		}

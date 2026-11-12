@@ -39,6 +39,10 @@ func TestParseExpiresIn(t *testing.T) {
 		// years out (2246).
 		{in: "99999999d", wantErr: tooLong},
 		{in: "-99999999d", wantErr: "expires_in must be positive"},
+		// Unchecked, this count wrapped round to a positive duration of
+		// about 100 years.
+		{in: "-177004d", wantErr: "expires_in must be positive"},
+		{in: "-9223372036854775808d", wantErr: "expires_in must be positive"},
 
 		{in: "", wantErr: invalid},
 		{in: "d", wantErr: invalid},
@@ -97,7 +101,7 @@ func tokenNamed(t *testing.T, am *auth.AuthManager, name string) *auth.TokenInfo
 func TestTokenRoutesRefuseAnExpiryNotInTheFuture(t *testing.T) {
 	app, am := setupTokenExpiresInTest(t)
 
-	for _, in := range []string{"-24h", "0d", "-7d", "99999999d"} {
+	for _, in := range []string{"-24h", "0d", "-7d", "99999999d", "-177004d"} {
 		body := fmt.Sprintf(`{"name":"t%s","expires_in":%q}`, in, in)
 		if status, msg := doRBACRequest(t, app, "POST", "/tokens", body); status != http.StatusBadRequest {
 			t.Errorf("create with expires_in %q: %d %q, want 400", in, status, msg)
@@ -117,7 +121,7 @@ func TestTokenRoutesRefuseAnExpiryNotInTheFuture(t *testing.T) {
 	stored := *svc.ExpiresAt
 
 	path := fmt.Sprintf("/tokens/%d", svc.ID)
-	for _, in := range []string{"-24h", "0s", "0d", "99999999d"} {
+	for _, in := range []string{"-24h", "0s", "0d", "99999999d", "-177004d"} {
 		body := fmt.Sprintf(`{"expires_in":%q}`, in)
 		if status, msg := doRBACRequest(t, app, "PATCH", path, body); status != http.StatusBadRequest {
 			t.Errorf("update with expires_in %q: %d %q, want 400", in, status, msg)
