@@ -252,9 +252,11 @@ its `/measurements` answer 404, `DELETE` answers 403, and
 `POST /api/v1/databases` answers 400 `Database name '<name>' is reserved`. A
 write to a database named after the subdirectory warehouse (line protocol,
 MessagePack, TLE, every `/api/v1/import/*` format, a continuous query's
-database, an MQTT subscription or `topic_mapping` target) is refused with 400
-`database name "<name>" is reserved for the Iceberg warehouse`, so writes
-cannot land inside a subdirectory warehouse. A directory whose name only
+database) is refused with 400 `database name "<name>" is reserved for the
+Iceberg warehouse`, so writes cannot land inside a subdirectory warehouse.
+Creating or updating an MQTT subscription whose database or `topic_mapping`
+target is that name is refused the same way; an incoming MQTT message that
+still maps to it is dropped, logged and counted as a failed message. A directory whose name only
 starts with the warehouse's (`lv_wh-other`) is an ordinary database. A
 warehouse nested deeper (`<root>/a/b`) hides measurement `b` of database `a`,
 and `a` stays listed; `DELETE` of database `a` answers 403, because it would
