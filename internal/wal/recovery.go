@@ -48,6 +48,9 @@ type RecoveryStats struct {
 	KeptFiles        int
 	BarrierFailures  int
 	QuarantinedFiles int
+	// AdoptedFiles counts files a flush stored before a crash took its
+	// checkpoint, found by their intent and not replayed (#1646).
+	AdoptedFiles int
 	// PartialRowEntries counts the WAL files this pass left on disk for which at
 	// least one row RANGE of a parent entry was handed off. Their checkpoints
 	// land on the next flush, and a binary without row-range support treats
@@ -151,6 +154,15 @@ type RecoveryOptions struct {
 	// OnQuarantine is called after a WAL file is moved to quarantinedAs, so
 	// the writer can stop waiting for the entries in it (#1225).
 	OnQuarantine func(path, quarantinedAs string)
+
+	// AdoptIntent decides whether the file a flush intent names (#1646,
+	// intent.go) is in storage, so its entries need no replay. Asked at most
+	// once per intent per pass, when the replay reaches an entry the intent
+	// names and none of the intent's identities is checkpointed yet. On true,
+	// the intent's identities are checkpointed through CheckpointRecovered
+	// before the entries are skipped; without CheckpointRecovered, or when it
+	// fails, the entries are replayed as before. nil: never adopt.
+	AdoptIntent func(ctx context.Context, intent FlushIntent) bool
 }
 
 // Recovery manages WAL recovery operations
@@ -483,6 +495,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 	}
 
 	rowCoverage := recoveryRowCoverage(flushed)
+	adopt := r.intentAdopter(ctx, opts, flushed, rowCoverage, stats)
 	// Process each WAL file
 	for fileIndex, walFile := range walFiles {
 		select {
@@ -545,6 +558,9 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			// until its file registers, like one replayed now.
 			if entry.Coverage != nil {
 				fileCov.add(entry.Coverage.Instance, entry.Coverage.Key, entry.Coverage.CSeq)
+			}
+			if _, ok := flushed[entry.PayloadHash]; !ok {
+				adopt(entry.PayloadHash) // #1646: may checkpoint it now
 			}
 			if _, ok := flushed[entry.PayloadHash]; ok {
 				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")

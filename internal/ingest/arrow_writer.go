@@ -1145,6 +1145,10 @@ type TypedColumnBatch struct {
 	// a slice, a sort), so a multi-hour flush can only checkpoint rows it can
 	// name exactly.
 	walSpans *walRowSpans
+	// flushIDs are the identities the flush of this merged batch checkpoints
+	// when it completes (its walHashes), set by the flush caller. A
+	// single-hour file's flush intent names them (#1646, flush_intent.go).
+	flushIDs []string
 }
 
 type bufferShard struct {
@@ -1476,7 +1480,9 @@ type ArrowBuffer struct {
 	// Flush failure tracking for WAL maintenance.
 	// Set when a storage write fails (S3 outage etc.), cleared after successful recovery.
 	// The periodic WAL goroutine checks this to decide whether WAL replay is needed.
-	hasFlushFailure        atomic.Bool
+	hasFlushFailure atomic.Bool
+	// clusterMode: no flush intents written or adopted (#1646, flush_intent.go).
+	clusterMode            atomic.Bool
 	flushFailureGeneration atomic.Uint64
 
 	// ambiguous holds the keys of failed storage writes that may land after
@@ -5000,6 +5006,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 	}
 
 	// Flush with data timestamp partitioning
+	merged.flushIDs = walHashes // #1646
 	if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
 		need, named := walNeedParts(needParts)
 		b.noteFailedWrite(err, need, named)
@@ -5247,6 +5254,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSum := sha256.Sum256(parquetData)
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
+		b.recordFlushIntent(storagePath, int64(len(parquetData)), merged.flushIDs)
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			// The write may still land (#1635): name the key for noteFailedWrite.
 			return &failedStorageWrite{err: fmt.Errorf("failed to write to storage: %w", err), path: storagePath, size: int64(len(parquetData))}
@@ -5373,6 +5381,12 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSum := sha256.Sum256(parquetData)
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
+		if perHour {
+			// Only with the row map: the file's own rows are named. Without
+			// it the flush's identities name rows of every hour file, and
+			// adopting one file would skip the others' rows (#1646).
+			b.recordFlushIntent(storagePath, int64(len(parquetData)), spans.rangesIn(bucket.indices))
+		}
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			// The write may still land (#1635). With the row map, name this
 			// file's rows; without it the flush's identities cover them.
@@ -5474,6 +5488,7 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 		p.group.failed()
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
+	merged.flushIDs = p.walHashes // #1646
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, p.rows, time.Now().UTC(), p.group); err != nil {
 		need, named := walNeedOf(p.records)
 		b.noteFailedWrite(err, need, named)
@@ -5570,6 +5585,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 
 	// Flush with data timestamp partitioning
 	startTime := time.Now().UTC()
+	merged.flushIDs = walHashes // #1646
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
 		need, named := walNeedOf(recordsToFlush)
 		b.noteFailedWrite(err, need, named)

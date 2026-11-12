@@ -289,6 +289,16 @@ func (l *ambiguousLedger) stored(ids []string) {
 	}
 }
 
+// forget drops the entry for path, if any, without removing anything: its
+// file was adopted as the stored copy of its rows (#1646).
+func (l *ambiguousLedger) forget(path string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e := l.entries[path]; e != nil {
+		l.dropLocked(e)
+	}
+}
+
 func (l *ambiguousLedger) dropLocked(e *ambiguousWrite) {
 	delete(l.entries, e.path)
 	l.parents -= e.parents

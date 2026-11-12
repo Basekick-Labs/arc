@@ -1201,6 +1201,10 @@ func main() {
 	arrowBuffer.SetFutureStampMargin(time.Duration(cfg.Query.FileTimePruningMarginSeconds) * time.Second)
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
+		// Before WAL recovery: a cluster node neither writes nor adopts flush
+		// intents (#1646); there an adopted file would also need the manifest
+		// registration a crash may have skipped.
+		arrowBuffer.SetClusterMode(cfg.Cluster.Enabled)
 	}
 	if walDisk != nil {
 		arrowBuffer.SetWALDiskGate(walDisk)
@@ -1416,6 +1420,7 @@ func main() {
 			TrackedRowCallback:             createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
 			ValidateTrackedRows:            validateTrackedWALRecoveryRows,
 			CheckpointRecovered:            checkpointRecovered,
+			AdoptIntent:                    arrowBuffer.AdoptFlushedFile,
 			BeforeDelete:                   arrowBuffer.NewRecoveryFlushBarrier(),
 			BarrierBatchFiles:              16,
 			BarrierBatchRows:               cfg.Ingest.MaxBufferSize,
@@ -1593,6 +1598,7 @@ func main() {
 							TrackedRowCallback:             createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
 							ValidateTrackedRows:            validateTrackedWALRecoveryRows,
 							CheckpointRecovered:            checkpointRecovered,
+							AdoptIntent:                    arrowBuffer.AdoptFlushedFile,
 							BeforeDelete:                   arrowBuffer.NewRecoveryFlushBarrier(),
 							BarrierBatchFiles:              16,
 							BarrierBatchRows:               cfg.Ingest.MaxBufferSize,
