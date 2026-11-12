@@ -137,24 +137,30 @@ being replayed twice.
 
 The entry's header also stores the checksum of its payload. When only the
 length is damaged, the payload is intact and its checksum matches at exactly
-the true length. Arc now looks for that length, and accepts it only if what
-follows confirms it: the end of the file, an entry that checks out on its own,
-or the torn end of a write. The repaired entry is then read like any other.
-All of the WAL's readers use the same repair, so the replay, the checkpoint
-scan and the identity scan agree on where every entry is. The same repair
-applies when a damaged length is too long but still inside the file, or is
-above the entry size limit.
+the true length. Arc now looks for that length when a length points past the
+end of the file or above the entry size limit. It accepts the length only if
+what follows confirms it: the end of the file exactly, or a next entry that
+fits in the file and passes its own checksum. The repaired entry is then read
+like any other. All of the WAL's readers use the same repair, so the replay,
+the checkpoint scan and the identity scan agree on where every entry is.
 
 Arc logs a warning for each file with a repaired entry. New counter:
 `arc_wal_repaired_length_entries_total`.
 
-Two cases are still not repaired:
+These cases are still not repaired:
 
 - **The length and the payload (or checksum) of one entry are both
-  damaged.** Nothing matches the checksum, so the entry still reads as a torn
-  write.
+  damaged,** or the damaged entry is followed directly by a torn write.
+  Nothing confirms a length, so the entry still reads as a torn write.
+- **A length damaged to be longer but still inside the file.** The entry
+  fails its checksum and counts as damaged, so the file is kept. Repairing it
+  would make the replay and the checkpoint scan disagree about where entries
+  start, because the checkpoint scan steps over entries by their stated
+  length without reading them. An entry could then be replayed twice.
 - **A length damaged to be shorter than the payload.** The entry fails its
   checksum, and the reads after it are misaligned.
+- **Each file gets one repair attempt.** A second damaged length in the same
+  file reads as before.
 
 ## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
 

@@ -522,7 +522,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			// and worth looking at (#1641).
 			metrics.Get().AddWALRepairedLengths(reader.RepairedLengths)
 			r.logger.Warn().Str("file", filepath.Base(walFile)).Int64("entries", reader.RepairedLengths).
-				Msg("WAL entries had a damaged length field; their true length was found by their checksum and confirmed by the next entry, and they are replayed. Check the disk")
+				Msg("WAL entries had a damaged length field; their true length was found by their checksum and confirmed by the next entry or the end of the file, and they are replayed. Check the disk")
 		}
 
 		// Replay entries - track if all succeed

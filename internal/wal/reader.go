@@ -39,8 +39,13 @@ type Reader struct {
 	// follows (#1641, length_repair.go). They are read like intact frames.
 	RepairedLengths int64
 
-	// fileSize is the size of the file being read, for length repair.
-	fileSize int64
+	// fileSize is the size of the file being read, for length repair; 0
+	// disables it. pos is readFrame's offset in the file. repairTried: a
+	// file gets one repair attempt (#1641), so a walk misaligned by other
+	// damage does not search the rest of the file at every step.
+	fileSize    int64
+	pos         int64
+	repairTried bool
 }
 
 // NewReader creates a new WAL reader
@@ -100,6 +105,7 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 	if info, err := f.Stat(); err == nil {
 		r.fileSize = info.Size() // for length repair (#1641)
 	}
+	r.pos = WALFileHeaderSize
 
 	// Check version
 	version := binary.BigEndian.Uint16(header[4:6])
@@ -256,7 +262,7 @@ func (r *Reader) ReadCheckpointHashes() ([]string, error) {
 			// Possibly a damaged length field rather than a torn tail
 			// (#1641): the same repair ReadAll applies, so both scans see
 			// the same frames. A repaired frame is a checkpoint or skipped.
-			if payload, ok := r.repairLength(f, payloadOffset, expectedChecksum, 0); ok {
+			if payload, ok := r.repairLength(f, payloadOffset, expectedChecksum); ok {
 				r.TotalEntries++
 				if len(payload) > 0 && payload[0] == WALCheckpointMarker {
 					var checkpointHashes []string
@@ -348,17 +354,14 @@ func (r *Reader) readFrame(f *os.File) (uint64, []byte, error) {
 	payloadLen := binary.BigEndian.Uint32(header[0:4])
 	timestampUS := binary.BigEndian.Uint64(header[4:12])
 	expectedChecksum := binary.BigEndian.Uint32(header[12:16])
-	payloadStart, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to locate WAL payload: %w", err)
-	}
+	r.pos += WALEntryHeaderSize
+	payloadStart := r.pos
 
 	// A length past the limit or past the end of the file may be a damaged
 	// length field rather than a torn tail (#1641): read what is there and
 	// look for the frame's true end before giving up on the rest of the file.
-	remaining := r.fileSize - payloadStart
-	if payloadLen > MaxWALPayloadSize || (r.fileSize > 0 && int64(payloadLen) > remaining) {
-		if payload, ok := r.repairLength(f, payloadStart, expectedChecksum, 0); ok {
+	if payloadLen > MaxWALPayloadSize || (r.fileSize > 0 && int64(payloadLen) > r.fileSize-payloadStart) {
+		if payload, ok := r.repairLength(f, payloadStart, expectedChecksum); ok {
 			return timestampUS, payload, nil
 		}
 		if payloadLen > MaxWALPayloadSize {
@@ -374,6 +377,7 @@ func (r *Reader) readFrame(f *os.File) (uint64, []byte, error) {
 	// Read payload
 	payload := make([]byte, payloadLen)
 	n, err := io.ReadFull(f, payload)
+	r.pos += int64(n)
 	if err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			r.TruncatedEntries++
@@ -387,17 +391,6 @@ func (r *Reader) readFrame(f *os.File) (uint64, []byte, error) {
 	// Verify checksum
 	actualChecksum := crc32.ChecksumIEEE(payload)
 	if actualChecksum != expectedChecksum {
-		// A length damaged to be longer, still inside the file (#1641).
-		if r.fileSize > 0 {
-			if l := repairFrameLength(f, r.fileSize, payloadStart, expectedChecksum, payload, len(payload)); l > 0 {
-				if _, err := f.Seek(payloadStart+int64(l), io.SeekStart); err != nil {
-					return 0, nil, fmt.Errorf("failed to seek past a repaired WAL entry: %w", err)
-				}
-				r.RepairedLengths++
-				r.TotalBytes -= int64(len(payload) - l)
-				return timestampUS, payload[:l], nil
-			}
-		}
 		return 0, nil, fmt.Errorf("%w: expected %d, got %d", errChecksumMismatch, expectedChecksum, actualChecksum)
 	}
 	return timestampUS, payload, nil
@@ -406,10 +399,11 @@ func (r *Reader) readFrame(f *os.File) (uint64, []byte, error) {
 // repairLength reads the rest of the file from payloadStart (at most
 // MaxWALPayloadSize bytes) and looks for the frame's true end (#1641). On
 // success the file is positioned after the frame.
-func (r *Reader) repairLength(f *os.File, payloadStart int64, expected uint32, exclusive int) ([]byte, bool) {
-	if r.fileSize <= payloadStart {
+func (r *Reader) repairLength(f *os.File, payloadStart int64, expected uint32) ([]byte, bool) {
+	if r.repairTried || r.fileSize <= payloadStart {
 		return nil, false
 	}
+	r.repairTried = true
 	size := r.fileSize - payloadStart
 	if size > MaxWALPayloadSize {
 		size = MaxWALPayloadSize
@@ -419,13 +413,14 @@ func (r *Reader) repairLength(f *os.File, payloadStart int64, expected uint32, e
 	if err != nil && err != io.EOF {
 		return nil, false
 	}
-	l := repairFrameLength(f, r.fileSize, payloadStart, expected, have[:n], exclusive)
+	l := repairFrameLength(f, r.fileSize, payloadStart, expected, have[:n])
 	if l == 0 {
 		return nil, false
 	}
 	if _, err := f.Seek(payloadStart+int64(l), io.SeekStart); err != nil {
 		return nil, false
 	}
+	r.pos = payloadStart + int64(l)
 	r.RepairedLengths++
 	r.TotalBytes += int64(WALEntryHeaderSize + l)
 	return have[:l], true
@@ -456,6 +451,7 @@ func (r *Reader) openFrames() (*os.File, []byte, error) {
 		return nil, nil, fmt.Errorf("failed to stat WAL file: %w", err)
 	}
 	r.fileSize = info.Size()
+	r.pos = WALFileHeaderSize
 	return f, header, nil
 }
 
@@ -598,6 +594,7 @@ func (r *Reader) ScanCovered(match func(Coverage) bool, fn func(*Entry) error) e
 	if info, err := f.Stat(); err == nil {
 		r.fileSize = info.Size() // for length repair (#1641)
 	}
+	r.pos = WALFileHeaderSize
 	for {
 		ts, payload, err := r.readFrame(f)
 		if err == io.EOF {

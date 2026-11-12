@@ -75,14 +75,7 @@ func readAllValues(t *testing.T, path string) ([]int, *Reader) {
 	var vs []int
 	for _, e := range entries {
 		for _, rec := range e.Records {
-			switch v := rec["v"].(type) {
-			case int8:
-				vs = append(vs, int(v))
-			case int64:
-				vs = append(vs, int(v))
-			case uint8:
-				vs = append(vs, int(v))
-			}
+			vs = append(vs, rowValue(rec))
 		}
 	}
 	return vs, r
@@ -124,16 +117,49 @@ func TestLengthPastEOFIsRepairedAndLaterFramesRecovered(t *testing.T) {
 	}
 }
 
-// A length damaged to be longer but still inside the file: the payload read
-// spans into the next frames, its checksum mismatches, and the true length is
-// found the same way.
-func TestLengthTooLongInsideTheFileIsRepaired(t *testing.T) {
+// A length damaged to be longer but still inside the file is NOT repaired:
+// the checkpoint scan skips data frames by their stated length without
+// reading them, so a repair in ReadAll alone would make the two disagree and
+// replay an entry whose checkpoint the scan missed. It stays a damaged entry,
+// the file is kept, and the flushed entry is not replayed (review of #1641).
+func TestLengthTooLongInsideTheFileIsDamageNotRepair(t *testing.T) {
 	path, data, offs := lengthFixture(t, 3)
-	trueLen := offs[2] - offs[1] - WALEntryHeaderSize
-	write(t, path, setLength(data, offs[1], uint32(trueLen+WALEntryHeaderSize+5)))
-	vs, r := readAllValues(t, path)
-	if len(vs) != 3 || r.RepairedLengths != 1 || r.CorruptedEntries != 0 {
-		t.Fatalf("values %v repaired %d corrupted %d", vs, r.RepairedLengths, r.CorruptedEntries)
+	trueLen := offs[1] - offs[0] - WALEntryHeaderSize
+	write(t, path, setLength(data, offs[0], uint32(trueLen+21)))
+	_, r := readAllValues(t, path)
+	if r.RepairedLengths != 0 || r.CorruptedEntries == 0 {
+		t.Fatalf("repaired %d corrupted %d", r.RepairedLengths, r.CorruptedEntries)
+	}
+	var replayed []int
+	stats, _ := NewRecovery(filepath.Dir(path), zerolog.Nop()).RecoverWithOptions(context.Background(),
+		func(_ context.Context, rows []map[string]interface{}) error {
+			for _, row := range rows {
+				replayed = append(replayed, rowValue(row))
+			}
+			return nil
+		},
+		&RecoveryOptions{BeforeDelete: func(context.Context) error { return nil }})
+	for _, v := range replayed {
+		if v == 0 {
+			t.Fatalf("the checkpointed entry was replayed: %v", replayed)
+		}
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("damaged file deleted: stats %+v", stats)
+	}
+}
+
+// A candidate end followed only by a torn tail does not confirm a repair:
+// random bytes read as a plausible torn header too often.
+func TestRepairFollowedByTornTailIsNotConfirmed(t *testing.T) {
+	path, data, offs := lengthFixture(t, 3)
+	// Damage frame 1's length past the end, then tear the file inside frame 2.
+	bad := setLength(data, offs[1], uint32(len(data)))
+	bad = bad[:offs[2]+WALEntryHeaderSize+2]
+	write(t, path, bad)
+	_, r := readAllValues(t, path)
+	if r.RepairedLengths != 0 || r.TruncatedEntries != 1 {
+		t.Fatalf("repaired %d truncated %d", r.RepairedLengths, r.TruncatedEntries)
 	}
 }
 
@@ -202,4 +228,27 @@ func TestZeroHeaderDoesNotConfirm(t *testing.T) {
 	if frameEndConfirmed(f, 64, 8) {
 		t.Fatal("a zero header confirmed a frame end")
 	}
+}
+
+// rowValue is the "v" of a replayed row, whatever integer type msgpack chose.
+func rowValue(row map[string]interface{}) int {
+	switch v := row["v"].(type) {
+	case int8:
+		return int(v)
+	case int16:
+		return int(v)
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case uint8:
+		return int(v)
+	case uint16:
+		return int(v)
+	case uint32:
+		return int(v)
+	case uint64:
+		return int(v)
+	}
+	return -1
 }
