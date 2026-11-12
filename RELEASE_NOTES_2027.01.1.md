@@ -125,6 +125,37 @@ New counter: `arc_wal_damaged_entries_total`, the damaged entries in files
 quarantined on the first pass. `arc_wal_quarantined_files_total` counts these files as
 well.
 
+## Fix: a damaged WAL length field no longer drops the entries after it ([#1641](https://github.com/Basekick-Labs/arc/issues/1641))
+
+Each WAL entry starts with its length. If that field was damaged so it pointed
+past the end of the file, the reader took the entry for a write that was torn
+by a crash and stopped reading the file there. Recovery replayed the entries
+before it and then **deleted the file**. Every later entry in the file was lost
+without an error, a quarantine or a metric. Those entries included
+acknowledged, unflushed rows and the flush checkpoints that keep entries from
+being replayed twice.
+
+The entry's header also stores the checksum of its payload. When only the
+length is damaged, the payload is intact and its checksum matches at exactly
+the true length. Arc now looks for that length, and accepts it only if what
+follows confirms it: the end of the file, an entry that checks out on its own,
+or the torn end of a write. The repaired entry is then read like any other.
+All of the WAL's readers use the same repair, so the replay, the checkpoint
+scan and the identity scan agree on where every entry is. The same repair
+applies when a damaged length is too long but still inside the file, or is
+above the entry size limit.
+
+Arc logs a warning for each file with a repaired entry. New counter:
+`arc_wal_repaired_length_entries_total`.
+
+Two cases are still not repaired:
+
+- **The length and the payload (or checksum) of one entry are both
+  damaged.** Nothing matches the checksum, so the entry still reads as a torn
+  write.
+- **A length damaged to be shorter than the payload.** The entry fails its
+  checksum, and the reads after it are misaligned.
+
 ## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
 
 With the WAL on and object storage as the backend, a flush whose upload hit

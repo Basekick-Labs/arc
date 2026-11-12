@@ -256,6 +256,7 @@ type Metrics struct {
 	writesForwarded       [len(WriteForwardResults)]atomic.Int64 // writes forwarded to a writer, by result (#1270)
 	walQuarantinedFiles   atomic.Int64                           // WAL files isolated after repeated recovery failures
 	walDamagedEntries     atomic.Int64                           // damaged WAL frames in files quarantined for damage (#1634)
+	walRepairedLengths    atomic.Int64                           // WAL entries read past a damaged length field (#1641)
 	walQuarantineReleased atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
@@ -983,6 +984,13 @@ func (m *Metrics) AddWALDamagedEntries(n int64) { m.walDamagedEntries.Add(n) }
 // GetWALDamagedEntries reads arc_wal_damaged_entries_total.
 func (m *Metrics) GetWALDamagedEntries() int64 { return m.walDamagedEntries.Load() }
 
+// AddWALRepairedLengths counts WAL entries recovery read past a damaged
+// length field, by their checksum (#1641).
+func (m *Metrics) AddWALRepairedLengths(n int64) { m.walRepairedLengths.Add(n) }
+
+// GetWALRepairedLengths reads arc_wal_repaired_length_entries_total.
+func (m *Metrics) GetWALRepairedLengths() int64 { return m.walRepairedLengths.Load() }
+
 // AddWALQuarantineReleased counts pending WAL entries the writer stopped
 // waiting for because recovery quarantined their file (#1225).
 func (m *Metrics) AddWALQuarantineReleased(n int64) { m.walQuarantineReleased.Add(n) }
@@ -1443,6 +1451,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_fenced_writes":              m.ingestFencedWritesTotal(),
 		"wal_quarantined_files":             m.walQuarantinedFiles.Load(),
 		"wal_damaged_entries":               m.walDamagedEntries.Load(),
+		"wal_repaired_length_entries":       m.walRepairedLengths.Load(),
 		"wal_quarantine_released_entries":   m.walQuarantineReleased.Load(),
 		"wal_partial_row_recovery_pending":  m.walPartialRowRecovery.Load(),
 
@@ -2123,6 +2132,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_damaged_entries_total Damaged WAL entries (checksum mismatch) in files recovery quarantined on the first pass; their rows cannot be replayed\n"...)
 	b = append(b, "# TYPE arc_wal_damaged_entries_total counter\n"...)
 	b = appendMetric(b, "arc_wal_damaged_entries_total", float64(m.walDamagedEntries.Load()))
+	b = append(b, "# HELP arc_wal_repaired_length_entries_total WAL entries recovery read past a damaged length field, found by their checksum and confirmed by the next entry\n"...)
+	b = append(b, "# TYPE arc_wal_repaired_length_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_repaired_length_entries_total", float64(m.walRepairedLengths.Load()))
 
 	b = append(b, "# HELP arc_wal_quarantine_released_entries_total Pending WAL entries the writer stopped waiting for because their file was quarantined\n"...)
 	b = append(b, "# TYPE arc_wal_quarantine_released_entries_total counter\n"...)
