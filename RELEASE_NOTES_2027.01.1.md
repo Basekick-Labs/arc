@@ -3920,6 +3920,21 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: execution history answers `404` for an unknown continuous query or retention policy
+
+`GET /api/v1/continuous_queries/{id}/executions` and
+`GET /api/v1/retention/{id}/executions` answered `200 {"executions": null}`
+for an ID with no continuous query or policy behind it, so a typo or a deleted
+definition looked like one that had never run. In a cluster, a deleted
+continuous query's history was still listed, because the delete leaves this
+node's history rows in place. Both routes now answer `404 "Continuous query not
+found"` or `404 "Retention policy not found"`, as `GET /{id}` already did, and
+`503` while the node is not yet able to read the cluster's definitions, as
+`GET /{id}` does. A definition that has not run yet lists `"executions": []`
+instead of `null`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
+
 ### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
 
 On local storage, `iceberg.warehouse` set to a plain path (for example
