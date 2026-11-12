@@ -23,6 +23,11 @@ type Reader struct {
 	TotalEntries     int64
 	TotalBytes       int64
 	CorruptedEntries int64
+	// ChecksumMismatches is the part of CorruptedEntries read whole whose
+	// checksum did not match: bytes on disk, where the other damage (a read
+	// error, a length past the limit, a trailer or checkpoint that does not
+	// parse) may be transient or a format this build cannot read (#1634).
+	ChecksumMismatches int64
 	// TruncatedEntries counts incomplete entries at EOF after an interrupted
 	// append. These are not corrupt complete entries and cannot be replayed.
 	TruncatedEntries int64
@@ -105,6 +110,9 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 		if err != nil {
 			r.logger.Warn().Err(err).Msg("Skipping unreadable WAL entry")
 			r.CorruptedEntries++
+			if errors.Is(err, errChecksumMismatch) {
+				r.ChecksumMismatches++
+			}
 			continue
 		}
 

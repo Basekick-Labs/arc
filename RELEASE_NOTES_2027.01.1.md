@@ -84,6 +84,47 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: a damaged WAL entry no longer holds back replay of newer WAL files ([#1634](https://github.com/Basekick-Labs/arc/issues/1634))
+
+When one WAL entry was damaged (a checksum mismatch, for example from bit rot
+or a torn sector), recovery kept that file and stopped there. Every newer WAL
+file stayed unreplayed until the damaged file was quarantined after three
+failed passes: startup plus two periodic passes, about 10 minutes at the
+default `wal.recovery_interval_seconds`. Acknowledged rows from those newer
+files were missing from queries in the meantime, and the WAL directory kept
+growing. Nothing was lost, but the only sign was a field on a log line.
+
+A WAL file whose only problem is damaged entries is now quarantined on the
+first pass, in this order:
+
+1. The entries read intact are replayed.
+2. They are flushed by the same barrier used before a recovered file is
+   deleted.
+3. The file is renamed to `.wal.failed` and kept for inspection.
+
+Recovery then replays the newer files in the same pass. The damaged entries
+cannot be replayed, and neither can any entries the damage made unreadable.
+
+This applies only to checksum mismatches, which are bytes on disk.
+
+Files that fail for any other reason keep the three-pass rule, and recovery
+still stops at them:
+
+- **A replay that fails**, such as a refused buffer or unreachable storage.
+  The cause may be transient, and continuing would charge every newer file
+  with the same failure.
+- **An intact entry this build cannot decode.** A later build may be able
+  to decode it.
+- **Any other damage**: a read error, a length past the limit, or a frame
+  that does not parse. A read error can be transient, and after a broken
+  length field the reader cannot find the next entry.
+- **A file under the cluster registration hold.** It is struck instead, and
+  no newer file of the pass is deleted.
+
+New counter: `arc_wal_damaged_entries_total`, the damaged entries in files
+quarantined on the first pass. `arc_wal_quarantined_files_total` counts these files as
+well.
+
 ## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
 
 With the WAL on and object storage as the backend, a flush whose upload hit

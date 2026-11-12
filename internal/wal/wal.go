@@ -2504,7 +2504,9 @@ func (w *Writer) forgetFileLocked(path string) {
 }
 
 // Quarantined tells the writer that recovery moved path to quarantinedAs
-// after repeated replay failures (#1225). If this process wrote it, entries in
+// after repeated replay failures (#1225), or on the first pass when its only
+// failure is checksum-damaged entries, once the recovery barrier has stored
+// its intact ones (#1634). If this process wrote it, entries in
 // it may still be waiting for a flush: recovery can no longer replay them
 // from it, so keeping them pending would hold the purge floor at this file for
 // the life of the process, and no WAL file would be reclaimed again (#676).
