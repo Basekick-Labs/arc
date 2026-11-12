@@ -5246,6 +5246,11 @@ func (c *Coordinator) AddNodeViaRaft(node *Node) error {
 // It removes the node from both the Raft voting configuration and the
 // cluster FSM state, then unregisters it from the local registry.
 // Must be called on the leader.
+//
+// An ID that is not a member returns an error wrapping ErrNodeNotFound, and
+// nothing is proposed (#1619). Membership is deliberately wide; see
+// isRemovableMember. Without Raft the call only unregisters locally and
+// still succeeds for an unknown ID, as before.
 func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 	if c.raftNode == nil {
 		// No Raft, just unregister locally
@@ -5253,8 +5258,15 @@ func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 		return nil
 	}
 
+	// The leader check comes first: a follower's view of membership can lag
+	// the leader's, so it must not answer "not a member" from it. arcli
+	// matches the "not the leader" text, so it stays as it is.
 	if !c.raftNode.IsLeader() {
 		return fmt.Errorf("not the leader")
+	}
+
+	if !c.isRemovableMember(nodeID) {
+		return fmt.Errorf("%w: %q", ErrNodeNotFound, nodeID)
 	}
 
 	// Remove from Raft voting configuration. Warn on failure (node may
@@ -5274,6 +5286,42 @@ func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 
 	c.logger.Info().Str("node_id", nodeID).Msg("Node removed from cluster")
 	return nil
+}
+
+// isRemovableMember reports whether a removal of id would act on anything:
+// id is in the registry, in the Raft configuration, or named by the cluster
+// state (raft.ClusterFSM.ReferencesNode, which covers the node table, a
+// departed writer, its stream instances and claims, staged compactions and
+// the cold mark). Only an ID in none of them is unknown (#1619).
+//
+// The Raft configuration is read last because it is the only source that can
+// fail. If it cannot be read, id counts as a member and the removal goes
+// ahead as it always did: the check exists to refuse a typo, and must not
+// turn a removal the operator needs into a failure.
+//
+// Known limitation: the registry read is the leader's own. A stale entry only
+// a follower's registry holds (an old leader's registration whose FSM AddNode
+// failed, then a leadership change) used to be cleared cluster-wide by any
+// removal; it now gets 404 here and "not the leader" on that follower.
+func (c *Coordinator) isRemovableMember(id string) bool {
+	if _, ok := c.registry.Get(id); ok {
+		return true
+	}
+	if fsm := c.raftNode.FSM(); fsm != nil && fsm.ReferencesNode(id) {
+		return true
+	}
+	ids, err := c.raftNode.ConfigurationServerIDs()
+	if err != nil {
+		c.logger.Warn().Err(err).Str("node_id", id).
+			Msg("Could not read the Raft configuration to check the node is a member; removing it anyway")
+		return true
+	}
+	for _, s := range ids {
+		if s == id {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateNodeStateViaRaft updates a node's state via Raft consensus.

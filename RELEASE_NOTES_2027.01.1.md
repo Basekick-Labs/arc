@@ -123,6 +123,34 @@ PUT keeps the id and `created_at`. On a standalone node the write reads them
 back in the same statement (no extra query); on a cluster they come from the
 cluster's copy of the policy.
 
+## Fix: removing a node that is not a member answers 404 ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
+
+`DELETE /api/v1/cluster/nodes/:id` answered 200 "node removed from cluster"
+for any ID, including a typo, after proposing a removal that changed nothing.
+It now answers **404** `{"success":false,"error":"node <id> is not a member of
+the cluster"}` and proposes nothing.
+
+A node still counts as a member, and is removed as before, when it is in any
+of: the node registry, the cluster state, or the Raft configuration (a stale
+voter missing from the other two is exactly the dead node the endpoint is
+for). It also counts when the cluster state still holds something for it: a
+writer that left gracefully (listed under `departed` by
+`GET /api/v1/cluster/stream-claims`) and whose instances and claims the
+removal gives up, or a staged compaction, cold-mark entry or designation that
+names it.
+
+- On a node that is not the Raft leader the answer is unchanged: 500 with
+  "not the leader", checked before membership.
+- A 404 on a retry means the earlier removal took effect. A removed node that
+  still holds the compactor lease, or a compaction-pause acknowledgement,
+  keeps answering 200 until the lease moves or the pause ends.
+- Membership is read from the leader's registry, so a stale entry that only a
+  follower's registry holds (left by an earlier leader whose cluster-state
+  update failed) is no longer cleared by this call: it answers 404.
+- Self-removal is still a 400.
+- With clustering on but Raft not configured, the call still only unregisters
+  the node locally and answers 200 for any ID, as before.
+
 ## Fix: an MQTT subscription created with `auto_start` starts at once ([#1585](https://github.com/Basekick-Labs/arc/issues/1585))
 
 `auto_start` is documented as "start on creation and on server restart", but
