@@ -44,12 +44,6 @@ type policyKindSpec struct {
 var ErrGovernancePoliciesNotEnabled = errors.New("cluster-wide governance policies are not enabled yet: every node must run a release that supports them")
 
 // policyKindSpecs, in the order their join gates are taken.
-//
-// Governance's capability is not advertised by this build
-// (localCapabilities) and it is not in policyKinds: its flag cannot be turned
-// on, and nothing adopts it, until the build that reads the cluster's
-// governance policies (#1627 part 2) advertises it. Its join gate is in place
-// so that once it is on no build without it can join.
 var policyKindSpecs = []policyKindSpec{
 	{
 		kind:          raft.PolicyKindRetention,

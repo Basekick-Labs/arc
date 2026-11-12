@@ -2,15 +2,27 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Cluster: groundwork for cluster-wide query governance policies ([#1627](https://github.com/Basekick-Labs/arc/issues/1627), part 1 of 2)
+## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
-Groundwork for making query governance policies (rate limits, quotas, row and scan-time caps per token) apply on every node of a cluster. This release changes no governance behaviour: each node still enforces only the policies created on it.
+Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table, on nodes where governance is off too, is kept equal to it as a backup and is never read again.
 
-- The cluster state can now hold governance policies, one per cluster token. A token delete also deletes its policy there, and a policy whose token is gone is never kept.
-- They have their own cluster flag, as retention policies and continuous queries do. This release cannot turn it on, and nothing adopts the nodes' policies yet; part 2, in the same release, does both once every node runs it. From then on a node on an older release cannot join.
-- Internal: retention policies, continuous queries and governance policies now share one per-kind table for their flag, their join check and the enable step. Retention and continuous queries behave as before.
+- **Adoption.**
+  - The cluster takes the union of the nodes' policies, so a policy set on one node now applies on all of them.
+  - Policies whose token no longer exists are dropped, and each one is logged.
+  - A node that is away (restarting) when the cluster adopts the policies is not asked. When it comes back, its own policies that the cluster did not adopt are kept in its `governance_policies_dormant` table and logged with their token IDs, never enforced. That table can also hold policies deleted in the cluster while the node was away, so check before recreating any through the API.
+  - If two nodes define the same token's policy differently, an admin chooses one node's set with `POST /api/v1/cluster/policies/adopt` (`"kind": "governance"`). `GET /api/v1/cluster/policies?kind=governance` lists each node's policies and the hash to name. The other nodes' own governance policies are then no longer enforced; each node keeps them in its `governance_policies_dormant` table.
+  - Adoption waits while a node holds a policy for a token created on that node before it joined the cluster (before v26.06.1), or a token the node cannot report on. The wait names the node and the token: re-issue the token through the cluster, or delete that policy. `GET /api/v1/cluster` shows it under `cluster_policies.kinds.governance`.
+- **After adoption.**
+  - Policies apply to cluster tokens only. A create or delete for any other token answers 404, "not a cluster token"; a change answers 404, no policy.
+  - A policy applies only to the token it was set for: a different token that a node keeps at the same ID gets that node's defaults.
+  - A node that restarts never enforces its own table again. Until its cluster state holds the adopted policies it applies only `governance.default_*`: policy creates, changes, deletes, the list and a policy GET answer 503 (retry), while the usage endpoint answers 200 with `"scope": "node"` and the defaults. It then applies its last Raft snapshot's policies, and the changes made since as it replays them from the leader.
+  - A node that joins after the adoption enforces its own table's policies, as before, until its cluster state has caught up; its table is then replaced by the cluster's, and its own policies that the cluster does not hold as they are go to `governance_policies_dormant`.
+  - Deleting a token deletes its governance policy.
+  - The policy list, get and usage answers carry `"scope": "cluster"` when the cluster's policies are what this node enforces, and `"node"` otherwise (standalone, before adoption, or a node that has not caught up). Nothing else in them changes; a policy with `id` 0 is still the server defaults.
+- **What applies where.** `max_rows_per_query` and `max_scan_duration_sec` apply identically everywhere. Rate limits and quotas are counted per node: a policy of 60 per minute allows 60 per minute on each node that runs queries. `governance.default_*` stays per node, so set it the same on every node; adoption logs a warning naming nodes that differ. A query forwarded to another node is governed once, by the node that runs it.
+- **Rollback.** The governance flag (`cluster_policies.governance_enabled` in `GET /api/v1/cluster`; until then the leader's `governance_blocking_nodes` names the nodes still on an earlier release) turns on by itself once every node runs this release, and stays on, like the other cluster policy flags. After that, any node on an earlier Arc release is refused at join, wiped or not: the cluster can go back to an earlier release only by restoring the whole cluster from a backup taken before the upgrade. Removing a node, wiping its data directory and joining it fresh is for rejoining a node on this same release, for example one run for a while with `cluster.enabled=false`; do that before such a node rejoins: unlike retention, which sorts unadopted rows into its dormant tables at every pass, governance copies a node's own policies to `governance_policies_dormant` only the first time its table becomes the cluster's, so policies created on such a node after that are replaced, not kept, when it rejoins.
 
-Performance: none on query, ingest or import. No governance code runs on those paths, and the query path is unchanged. The Raft state machine gains one map lookup per token delete. New benchmarks, `BenchmarkAdmit` and `BenchmarkAdmitParallel` (`Admit` while file registrations are applied continuously), give the baseline part 2 is measured against; run against `main` with the same files, `Admit` allocations and the apply rate are unchanged and time per call is within 1% (the `Admit` code is identical in both builds).
+Performance: on the query path, once adopted, `Admit` reads the cluster's policies from an immutable in-memory snapshot (one atomic load, one map lookup, one string compare), without the lock it took before. `Admit` also no longer allocates per limit: one allocation per admitted query instead of 13 to 16. Measured on Atila against `main`, 16 alternating runs each: a token with a policy 1.26 µs to 0.74 µs (standalone and cluster-wide alike), a token on the defaults 1.31 µs to 0.78 µs, and `Admit` from every core while file registrations are applied 1.53 µs to 0.84 µs per call, with the apply rate unchanged or better (70.4k to 73.8k per second). Ingest and import run no governance code; the snapshot is rebuilt (one map of the governance policies) only when a cluster policy of any kind changes, a token with a governance policy is rotated or deleted, or a Raft snapshot is restored, never on a file registration.
 
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 
@@ -2768,17 +2780,19 @@ on, and a node running an earlier release can no longer join.
 
 Do not roll a node back to an earlier release in place after that. The earlier
 release skips the new cluster log commands and ignores their checks, so its
-view of the cluster manifest silently diverges from the other nodes. To run an
-earlier release on a node, remove the node from the cluster, wipe its data
-directory, and join it fresh. To roll back the whole cluster, restore it from a
-backup taken before the upgrade.
+view of the cluster manifest silently diverges from the other nodes. A node on
+an earlier release is refused at join whether or not its data directory was
+wiped, so the cluster can go back to an earlier release only by restoring the
+whole cluster from a backup taken before the upgrade. Removing a node, wiping
+its data directory and joining it fresh is for a node on this same release.
 
 ## Upgrade note: cluster-wide tiering policies ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
 
 A cluster turns on cluster policies by itself once every node runs this
 release (`cluster_policies.enabled` in `GET /api/v1/cluster`). Like compaction
 commit, the flag stays on, and a node running an earlier release can no longer
-join. Roll back the same way: never one node in place.
+join, wiped or not. Roll back the same way: only by restoring the whole
+cluster from a backup taken before the upgrade, never one node in place.
 
 Right after that, the cluster takes over the tiering policies each node holds
 in its own database. During the takeover a tiering policy write answers `503`

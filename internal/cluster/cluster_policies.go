@@ -137,6 +137,10 @@ type ClusterPoliciesStatus struct {
 	// CQEnabled / CQBlocking: the continuous query flag, likewise.
 	CQEnabled  bool     `json:"cq_enabled"`
 	CQBlocking []string `json:"cq_blocking_nodes,omitempty"`
+	// GovernanceEnabled / GovernanceBlocking: the governance flag (#1627),
+	// likewise.
+	GovernanceEnabled  bool     `json:"governance_enabled"`
+	GovernanceBlocking []string `json:"governance_blocking_nodes,omitempty"`
 }
 
 // PolicyKindStatus is one kind's adoption: seeded (the cluster holds it),
@@ -172,6 +176,10 @@ func (c *Coordinator) ClusterPoliciesStatus() ClusterPoliciesStatus {
 		st.CQEnabled = fsm.CQPoliciesEnabled()
 		if b := c.cqPolicies.blockers.Load(); b != nil && !st.CQEnabled && c.raftNode.IsLeader() {
 			st.CQBlocking = *b
+		}
+		st.GovernanceEnabled = fsm.GovernancePoliciesEnabled()
+		if b := c.governancePolicies.blockers.Load(); b != nil && !st.GovernanceEnabled && c.raftNode.IsLeader() {
+			st.GovernanceBlocking = *b
 		}
 		st.Kinds = map[string]PolicyKindStatus{}
 		for _, kind := range policyKinds {

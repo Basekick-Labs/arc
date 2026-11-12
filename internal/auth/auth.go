@@ -77,6 +77,11 @@ type TokenInfo struct {
 	Fingerprint string `json:"-"`
 }
 
+// TokenFingerprint is the hex SHA-256 of a token's stored hash: what
+// TokenInfo.Fingerprint carries, computable from the cluster state's copy of
+// the hash too (#1627).
+func TokenFingerprint(tokenHash string) string { return tokenFingerprint(tokenHash) }
+
 // tokenFingerprint is the hex SHA-256 of a token's stored hash.
 func tokenFingerprint(tokenHash string) string {
 	sum := sha256.Sum256([]byte(tokenHash))

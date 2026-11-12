@@ -355,3 +355,26 @@ func TestGovernanceWritesSignalTheCallbacks(t *testing.T) {
 		t.Fatalf("fired %d, want 3", fired)
 	}
 }
+
+// A rotate changes the hash a token's governance policy is enforced for: the
+// callbacks are signalled so the view is rebuilt. A token without a policy
+// signals nothing.
+func TestTokenRotateSignalsGovernance(t *testing.T) {
+	x := gpFSM(t)
+	a, b := x.token("a"), x.token("b")
+	x.seedGovernance(false, 1, GovernancePolicyEntry{TokenID: a, MaxRowsPerQuery: 1})
+	fired := 0
+	x.f.AddPoliciesChangedCallback(func() { fired++ })
+	x.ok(CommandRotateToken, RotateTokenPayload{ID: b, NewHash: "new-b", NewPrefix: "nb"})
+	if fired != 0 {
+		t.Fatalf("rotating a token without a policy fired %d callbacks", fired)
+	}
+	x.ok(CommandRotateToken, RotateTokenPayload{ID: a, NewHash: "new-a", NewPrefix: "na"})
+	if fired != 1 {
+		t.Fatalf("rotating a token with a policy fired %d callbacks, want 1", fired)
+	}
+	seeded, entries := x.f.GovernanceView()
+	if !seeded || len(entries) != 1 || entries[0].TokenHash != "new-a" {
+		t.Fatalf("view after the rotate: %v %+v", seeded, entries)
+	}
+}

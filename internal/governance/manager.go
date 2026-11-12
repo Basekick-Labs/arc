@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -64,6 +65,12 @@ type ManagerConfig struct {
 	DB     *sql.DB
 	Config *config.GovernanceConfig
 	Logger zerolog.Logger
+	// Cluster: this node is in a cluster, whose state may own the policies
+	// (#1627). A table that the cluster marked as its backup copy is then
+	// never loaded: until this node's cluster state has caught up, only the
+	// defaults apply. A standalone node ignores the marker (a backup restored
+	// there loads the table).
+	Cluster bool
 }
 
 // Manager orchestrates governance policies and enforcement.
@@ -108,6 +115,9 @@ type Manager struct {
 	// recording the query.
 	afterAdmitCheckForTest func()
 
+	// cluster: the cluster-wide policies (#1627), see cluster.go.
+	cluster clusterState
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -135,6 +145,22 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		return nil, fmt.Errorf("failed to initialize governance schema: %w", err)
 	}
 
+	if cfg.Cluster {
+		owned, err := readOwnedMarker(m.db)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read the governance cluster marker: %w", err)
+		}
+		if owned {
+			// The table is the cluster's backup copy, possibly stale (a
+			// policy deleted while this node was down): never loaded.
+			// Defaults only until the cluster state catches up.
+			m.cluster.owned.Store(true)
+			m.cluster.view.Store(&clusterView{})
+			m.logger.Info().Msg("Governance policies are owned by the cluster: defaults only until this node catches up")
+			return m, nil
+		}
+	}
+
 	if err := m.loadPolicies(); err != nil {
 		return nil, fmt.Errorf("failed to load governance policies: %w", err)
 	}
@@ -159,8 +185,8 @@ func (m *Manager) Stop() error {
 	return nil
 }
 
-func (m *Manager) initSchema() error {
-	_, err := m.db.Exec(`
+// governancePoliciesTable is the policies table, with its index.
+const governancePoliciesTable = `
 		CREATE TABLE IF NOT EXISTS governance_policies (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			token_id INTEGER NOT NULL UNIQUE,
@@ -174,8 +200,10 @@ func (m *Manager) initSchema() error {
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE INDEX IF NOT EXISTS idx_governance_token_id ON governance_policies(token_id);
-	`)
-	return err
+	`
+
+func (m *Manager) initSchema() error {
+	return EnsureSchema(m.db)
 }
 
 func (m *Manager) loadPolicies() error {
@@ -226,7 +254,20 @@ func (m *Manager) cleanupLoop() {
 
 // CreatePolicy creates a governance policy for a token.
 func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) {
-	m.policyWriteMu.Lock()
+	return m.CreatePolicyFor(ctx, p, "")
+}
+
+// CreatePolicyFor is CreatePolicy for the token whose stored hash has
+// fingerprint tokenFP: once the cluster owns the policies, the policy is the
+// cluster token's, and tokenFP must be that token's (ErrTokenNotCluster).
+func (m *Manager) CreatePolicyFor(ctx context.Context, p *Policy, tokenFP string) (*Policy, error) {
+	src, err := m.clusterWrite()
+	if err != nil {
+		return nil, err
+	}
+	if src != nil {
+		return m.setInCluster(ctx, src, p, true, tokenFP)
+	}
 	defer m.policyWriteMu.Unlock()
 	// token_id is UNIQUE. A second policy for the token inserts nothing
 	// rather than failing, so it is told apart from a store failure without
@@ -270,6 +311,22 @@ func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 
 // GetPolicy returns the governance policy for a token, or nil if none exists.
 func (m *Manager) GetPolicy(ctx context.Context, tokenID int64) (*Policy, error) {
+	return m.GetPolicyFor(ctx, tokenID, "")
+}
+
+// GetPolicyFor is GetPolicy for the token with fingerprint tokenFP: once the
+// cluster owns the policies, the cluster's policy when tokenFP is its token's,
+// and none otherwise; ErrNotCaughtUp before this node caught up.
+func (m *Manager) GetPolicyFor(ctx context.Context, tokenID int64, tokenFP string) (*Policy, error) {
+	if v := m.cluster.view.Load(); v != nil {
+		if !v.caughtUp {
+			return nil, ErrNotCaughtUp
+		}
+		if p := v.policyFor(tokenID, tokenFP); p != nil {
+			return copyPolicy(p), nil
+		}
+		return nil, nil
+	}
 	m.policiesMu.RLock()
 	p, ok := m.policies[tokenID]
 	m.policiesMu.RUnlock()
@@ -281,7 +338,19 @@ func (m *Manager) GetPolicy(ctx context.Context, tokenID int64) (*Policy, error)
 
 // UpdatePolicy updates an existing governance policy.
 func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) {
-	m.policyWriteMu.Lock()
+	return m.UpdatePolicyFor(ctx, p, "")
+}
+
+// UpdatePolicyFor is UpdatePolicy for the token with fingerprint tokenFP (see
+// CreatePolicyFor).
+func (m *Manager) UpdatePolicyFor(ctx context.Context, p *Policy, tokenFP string) (*Policy, error) {
+	src, err := m.clusterWrite()
+	if err != nil {
+		return nil, err
+	}
+	if src != nil {
+		return m.setInCluster(ctx, src, p, false, tokenFP)
+	}
 	defer m.policyWriteMu.Unlock()
 	result, err := m.db.ExecContext(ctx, `
 		UPDATE governance_policies SET
@@ -321,7 +390,23 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 
 // DeletePolicy removes the governance policy for a token.
 func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
-	m.policyWriteMu.Lock()
+	return m.DeletePolicyFor(ctx, tokenID, "")
+}
+
+// DeletePolicyFor is DeletePolicy for the token with fingerprint tokenFP (see
+// CreatePolicyFor).
+func (m *Manager) DeletePolicyFor(ctx context.Context, tokenID int64, tokenFP string) error {
+	src, err := m.clusterWrite()
+	if err != nil {
+		return err
+	}
+	if src != nil {
+		if err := src.Delete(ctx, tokenID, tokenFP); err != nil {
+			return err
+		}
+		m.logger.Info().Int64("token_id", tokenID).Msg("Governance policy deleted cluster-wide")
+		return nil
+	}
 	defer m.policyWriteMu.Unlock()
 	result, err := m.db.ExecContext(ctx, `DELETE FROM governance_policies WHERE token_id = ?`, tokenID)
 	if err != nil {
@@ -378,6 +463,17 @@ func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
 
 // ListPolicies returns all governance policies.
 func (m *Manager) ListPolicies(ctx context.Context) ([]*Policy, error) {
+	if v := m.cluster.view.Load(); v != nil {
+		if !v.caughtUp {
+			return nil, ErrNotCaughtUp
+		}
+		result := make([]*Policy, 0, len(v.byToken))
+		for _, cp := range v.byToken {
+			result = append(result, copyPolicy(cp.policy))
+		}
+		sort.Slice(result, func(i, j int) bool { return result[i].TokenID < result[j].TokenID })
+		return result, nil
+	}
 	m.policiesMu.RLock()
 	defer m.policiesMu.RUnlock()
 
@@ -393,14 +489,33 @@ func (m *Manager) ListPolicies(ctx context.Context) ([]*Policy, error) {
 // getEffectivePolicy returns the policy for a token. If no per-token policy exists,
 // returns a policy built from the config defaults. Returns nil only if all defaults are 0.
 func (m *Manager) getEffectivePolicy(tokenID int64) *Policy {
+	return m.effectivePolicy(tokenID, "")
+}
+
+// effectivePolicy is getEffectivePolicy for the token with fingerprint
+// tokenFP. Once the cluster owns the policies it reads only the cluster's
+// view: one atomic load, one map lookup, one compare, no lock.
+func (m *Manager) effectivePolicy(tokenID int64, tokenFP string) *Policy {
+	if v := m.cluster.view.Load(); v != nil {
+		if v.caughtUp {
+			if p := v.policyFor(tokenID, tokenFP); p != nil {
+				return p
+			}
+		}
+		return m.defaultPolicy(tokenID)
+	}
 	m.policiesMu.RLock()
 	p, ok := m.policies[tokenID]
 	m.policiesMu.RUnlock()
 	if ok {
 		return p
 	}
+	return m.defaultPolicy(tokenID)
+}
 
-	// Use config defaults
+// defaultPolicy is this node's governance.default_* as token tokenID's
+// policy, or nil when every default is 0.
+func (m *Manager) defaultPolicy(tokenID int64) *Policy {
 	cfg := m.config
 	if cfg.DefaultRateLimitPerMin == 0 && cfg.DefaultRateLimitPerHour == 0 &&
 		cfg.DefaultMaxQueriesPerHour == 0 && cfg.DefaultMaxQueriesPerDay == 0 &&
@@ -423,6 +538,12 @@ func (m *Manager) GetCachedPolicy(tokenID int64) *Policy {
 	return m.getEffectivePolicy(tokenID)
 }
 
+// GetCachedPolicyFor is GetCachedPolicy for the token with fingerprint
+// tokenFP: what AdmitToken applies to it.
+func (m *Manager) GetCachedPolicyFor(tokenID int64, tokenFP string) *Policy {
+	return m.effectivePolicy(tokenID, tokenFP)
+}
+
 // Kinds of limit an EnforcementResult can be refused by.
 const (
 	KindRateLimit = "rate_limit"
@@ -440,53 +561,50 @@ const (
 // 1). On a tie the limit checked first (minute, hour, quota) is named. Check and record run under admitMu, so two concurrent queries cannot
 // both pass a limit with one slot left.
 func (m *Manager) Admit(tokenID int64) *EnforcementResult {
+	return m.AdmitToken(tokenID, "")
+}
+
+// AdmitToken is Admit for the token whose stored hash has fingerprint tokenFP
+// (TokenInfo.Fingerprint). Once the cluster owns the policies, the token gets
+// its cluster policy only when tokenFP is the cluster token's; otherwise this
+// node's defaults.
+func (m *Manager) AdmitToken(tokenID int64, tokenFP string) *EnforcementResult {
 	m.admitMu.Lock()
 	defer m.admitMu.Unlock()
 
-	policy := m.getEffectivePolicy(tokenID)
+	policy := m.effectivePolicy(tokenID, tokenFP)
 	if policy == nil {
 		return &EnforcementResult{Allowed: true}
 	}
 
-	type gate struct {
-		admits func() (bool, string)
-		record func()
-		wait   func() int
-		kind   string
-	}
-	var gates []gate
+	// The gates live in an array on the stack: no allocation per query for
+	// the limits a policy sets (#1627, rule 4).
+	var buf [3]admitGate
+	gates := buf[:0]
 	if policy.RateLimitPerMinute > 0 {
 		l := m.getOrCreateMinuteLimiter(tokenID, policy.RateLimitPerMinute)
-		limit := policy.RateLimitPerMinute
-		gates = append(gates, gate{func() (bool, string) {
-			if l.admits() {
-				return true, ""
-			}
-			return false, fmt.Sprintf("Rate limit exceeded: %d queries per minute", limit)
-		}, l.record, l.RetryAfterSec, KindRateLimit})
+		l.applyLimit(policy.RateLimitPerMinute)
+		gates = append(gates, admitGate{window: l, limit: policy.RateLimitPerMinute, per: "minute"})
 	}
 	if policy.RateLimitPerHour > 0 {
 		l := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
-		limit := policy.RateLimitPerHour
-		gates = append(gates, gate{func() (bool, string) {
-			if l.admits() {
-				return true, ""
-			}
-			return false, fmt.Sprintf("Rate limit exceeded: %d queries per hour", limit)
-		}, l.record, l.RetryAfterSec, KindRateLimit})
+		l.applyLimit(policy.RateLimitPerHour)
+		gates = append(gates, admitGate{window: l, limit: policy.RateLimitPerHour, per: "hour"})
 	}
 	if policy.MaxQueriesPerHour > 0 || policy.MaxQueriesPerDay > 0 {
 		t := m.getOrCreateQuotaTracker(tokenID, policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
-		gates = append(gates, gate{t.admits, t.record, t.RetryAfterSec, KindQuota})
+		t.applyLimits(policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
+		gates = append(gates, admitGate{quota: t})
 	}
 
 	var refused *EnforcementResult
 	longest := -1
-	for _, g := range gates {
+	for i := range gates {
+		g := &gates[i]
 		if ok, reason := g.admits(); !ok {
 			if w := g.wait(); w > longest {
 				longest = w
-				refused = &EnforcementResult{Allowed: false, Reason: reason, Kind: g.kind}
+				refused = &EnforcementResult{Allowed: false, Reason: reason, Kind: g.kind()}
 			}
 		}
 	}
@@ -497,8 +615,8 @@ func (m *Manager) Admit(tokenID int64) *EnforcementResult {
 	if m.afterAdmitCheckForTest != nil {
 		m.afterAdmitCheckForTest()
 	}
-	for _, g := range gates {
-		g.record()
+	for i := range gates {
+		gates[i].record()
 	}
 
 	result := &EnforcementResult{Allowed: true}
@@ -511,6 +629,47 @@ func (m *Manager) Admit(tokenID int64) *EnforcementResult {
 	return result
 }
 
+// admitGate is one limit Admit checks: a rate limit (window, with its limit
+// and period for the refusal's reason) or the quotas.
+type admitGate struct {
+	window *slidingWindowCounter
+	limit  int
+	per    string
+	quota  *quotaTracker
+}
+
+func (g *admitGate) admits() (bool, string) {
+	if g.quota != nil {
+		return g.quota.admits()
+	}
+	if g.window.admits() {
+		return true, ""
+	}
+	return false, fmt.Sprintf("Rate limit exceeded: %d queries per %s", g.limit, g.per)
+}
+
+func (g *admitGate) record() {
+	if g.quota != nil {
+		g.quota.record()
+		return
+	}
+	g.window.record()
+}
+
+func (g *admitGate) wait() int {
+	if g.quota != nil {
+		return g.quota.RetryAfterSec()
+	}
+	return g.window.RetryAfterSec()
+}
+
+func (g *admitGate) kind() string {
+	if g.quota != nil {
+		return KindQuota
+	}
+	return KindRateLimit
+}
+
 // RecordQueryCompletion records that a query completed for a token.
 // Currently a no-op since Admit counts a query when it admits it.
 func (m *Manager) RecordQueryCompletion(tokenID int64, rowCount int) {
@@ -519,9 +678,18 @@ func (m *Manager) RecordQueryCompletion(tokenID int64, rowCount int) {
 
 // GetTokenUsage returns current usage statistics for a token.
 func (m *Manager) GetTokenUsage(tokenID int64) *TokenUsage {
+	return m.GetTokenUsageFor(tokenID, "")
+}
+
+// GetTokenUsageFor is GetTokenUsage for the token with fingerprint tokenFP.
+// Once the cluster owns the policies, a changed limit reaches the token's
+// counters at its next query on this node, and the remaining counts until
+// then are against the limit last applied; a deleted policy's counters are
+// kept (its token falls back to the defaults, counted on the same counters).
+func (m *Manager) GetTokenUsageFor(tokenID int64, tokenFP string) *TokenUsage {
 	usage := &TokenUsage{TokenID: tokenID}
 
-	policy := m.getEffectivePolicy(tokenID)
+	policy := m.effectivePolicy(tokenID, tokenFP)
 
 	// Get quota usage
 	m.quotaTrackersMu.RLock()
@@ -578,6 +746,7 @@ func (m *Manager) getOrCreateMinuteLimiter(tokenID int64, limit int) *slidingWin
 		return limiter
 	}
 	limiter = newSlidingWindowCounterWithClock(time.Minute, 60, limit, m.now)
+	limiter.applied = limit
 	m.minuteLimiters[tokenID] = limiter
 	return limiter
 }
@@ -596,6 +765,7 @@ func (m *Manager) getOrCreateHourLimiter(tokenID int64, limit int) *slidingWindo
 		return limiter
 	}
 	limiter = newSlidingWindowCounterWithClock(time.Hour, 60, limit, m.now)
+	limiter.applied = limit
 	m.hourLimiters[tokenID] = limiter
 	return limiter
 }
@@ -614,6 +784,7 @@ func (m *Manager) getOrCreateQuotaTracker(tokenID int64, maxPerHour, maxPerDay i
 		return tracker
 	}
 	tracker = newQuotaTrackerWithClock(maxPerHour, maxPerDay, m.now)
+	tracker.appliedHour, tracker.appliedDay = maxPerHour, maxPerDay
 	m.quotaTrackers[tokenID] = tracker
 	return tracker
 }
@@ -637,21 +808,21 @@ func (m *Manager) updateTrackersForToken(tokenID int64, p *Policy) {
 	// Update minute limiter
 	m.minuteLimitersMu.Lock()
 	if limiter, ok := m.minuteLimiters[tokenID]; ok {
-		limiter.UpdateLimit(p.RateLimitPerMinute)
+		limiter.applyLimit(p.RateLimitPerMinute)
 	}
 	m.minuteLimitersMu.Unlock()
 
 	// Update hour limiter
 	m.hourLimitersMu.Lock()
 	if limiter, ok := m.hourLimiters[tokenID]; ok {
-		limiter.UpdateLimit(p.RateLimitPerHour)
+		limiter.applyLimit(p.RateLimitPerHour)
 	}
 	m.hourLimitersMu.Unlock()
 
 	// Update quota tracker
 	m.quotaTrackersMu.Lock()
 	if tracker, ok := m.quotaTrackers[tokenID]; ok {
-		tracker.UpdateLimits(p.MaxQueriesPerHour, p.MaxQueriesPerDay)
+		tracker.applyLimits(p.MaxQueriesPerHour, p.MaxQueriesPerDay)
 	}
 	m.quotaTrackersMu.Unlock()
 }

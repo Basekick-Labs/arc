@@ -688,7 +688,9 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandDeleteRetentionPolicy ||
 		cmd.Type == clusterraft.CommandCreateCQ ||
 		cmd.Type == clusterraft.CommandUpdateCQ ||
-		cmd.Type == clusterraft.CommandDeleteCQ
+		cmd.Type == clusterraft.CommandDeleteCQ ||
+		cmd.Type == clusterraft.CommandSetGovernancePolicy ||
+		cmd.Type == clusterraft.CommandDeleteGovernancePolicy
 	// A continuous query's watermark is set by the primary writer, which in
 	// local-storage mode need not be the Raft leader. The FSM decides who
 	// may set it (applySetCQWatermark); refused here early are a watermark
