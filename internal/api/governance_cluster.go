@@ -10,6 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/governance"
+	"github.com/rs/zerolog/log"
 )
 
 // GovernanceTableLister answers the cluster's adoption of governance policies
@@ -71,7 +72,11 @@ func GovernanceTableMirror(authManager *auth.AuthManager, dbPath string, src gov
 		if err := governance.EnsureSchema(db); err != nil {
 			return err
 		}
-		_, err := governance.MirrorTable(ctx, db, src)
+		_, dormant, err := governance.MirrorTable(ctx, db, src)
+		if dormant > 0 {
+			log.Warn().Int("dormant", dormant).
+				Msg("Governance policies this node held that the cluster did not adopt were moved to governance_policies_dormant; they are not enforced")
+		}
 		return err
 	}
 }

@@ -368,6 +368,10 @@ func TestMirrorWritesOnlyChanges(t *testing.T) {
 	if n, _ := countRows(db); n != 1 {
 		t.Fatalf("before the seed the mirror changed the table (%d rows)", n)
 	}
+	// This node's own policy for token a, adopted as it is: not dormant.
+	if _, err := db.Exec(`INSERT INTO governance_policies (token_id, max_rows_per_query) VALUES (?, 1)`, a); err != nil {
+		t.Fatal(err)
+	}
 	g.seed(raft.GovernancePolicyEntry{TokenID: a, MaxRowsPerQuery: 1}, raft.GovernancePolicyEntry{TokenID: b, MaxScanDurationSec: 4})
 	if err := m.MirrorClusterPolicies(context.Background(), g.f); err != nil {
 		t.Fatal(err)
@@ -378,6 +382,13 @@ func TestMirrorWritesOnlyChanges(t *testing.T) {
 	}
 	if owned, _ := readOwnedMarker(db); !owned {
 		t.Fatal("no owned marker")
+	}
+	// This node's own row the cluster did not adopt (token 99) is kept,
+	// dormant, never enforced.
+	var dormant, dormantTok int64
+	db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(token_id), 0) FROM governance_policies_dormant`).Scan(&dormant, &dormantTok)
+	if dormant != 1 || dormantTok != 99 {
+		t.Fatalf("dormant rows %d (token %d), want token 99's", dormant, dormantTok)
 	}
 	if _, err := db.Exec(`CREATE TABLE writes (n INTEGER); CREATE TRIGGER count_del AFTER DELETE ON governance_policies BEGIN INSERT INTO writes VALUES (1); END;
 		CREATE TRIGGER count_ins AFTER INSERT ON governance_policies BEGIN INSERT INTO writes VALUES (1); END;`); err != nil {
@@ -398,6 +409,10 @@ func TestMirrorWritesOnlyChanges(t *testing.T) {
 	db.QueryRow(`SELECT COUNT(*) FROM writes`).Scan(&writes)
 	if writes == 0 {
 		t.Fatal("a changed policy was not mirrored")
+	}
+	db.QueryRow(`SELECT COUNT(*) FROM governance_policies_dormant`).Scan(&dormant)
+	if dormant != 1 {
+		t.Fatalf("a later pass moved the cluster's own rows to dormant (%d rows)", dormant)
 	}
 }
 

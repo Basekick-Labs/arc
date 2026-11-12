@@ -9,7 +9,8 @@ Once every node runs this version, the cluster adopts the nodes' query governanc
 - **Adoption.**
   - The cluster takes the union of the nodes' policies, so a policy set on one node now applies on all of them.
   - Policies whose token no longer exists are dropped, and each one is logged.
-  - If two nodes define the same token's policy differently, an admin chooses one node's set with `POST /api/v1/cluster/policies/adopt` (`"kind": "governance"`). `GET /api/v1/cluster/policies?kind=governance` lists each node's policies and the hash to name. The other nodes' governance policies are then removed from their databases too, so take a backup first.
+  - A node that is away (restarting) when the cluster adopts the policies is not asked. When it comes back, its own policies that the cluster did not adopt are kept in its `governance_policies_dormant` table and logged, never enforced; recreate any you still want through the API.
+  - If two nodes define the same token's policy differently, an admin chooses one node's set with `POST /api/v1/cluster/policies/adopt` (`"kind": "governance"`). `GET /api/v1/cluster/policies?kind=governance` lists each node's policies and the hash to name. The other nodes' own governance policies are then no longer enforced; each node keeps them in its `governance_policies_dormant` table.
   - Adoption waits while a node holds a policy for a token created on that node before it joined the cluster (before v26.06.1), or a token the node cannot report on. The wait names the node and the token: re-issue the token through the cluster, or delete that policy. `GET /api/v1/cluster` shows it under `cluster_policies.kinds.governance`.
 - **After adoption.**
   - Policies apply to cluster tokens only. A create or delete for any other token answers 404, "not a cluster token"; a change answers 404, no policy.

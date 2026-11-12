@@ -113,11 +113,12 @@ func (h *ClusterHandler) handleAdoptPolicies(c *fiber.Ctx) error {
 	}
 	h.logger.Info().Str("kind", req.Kind).Str("node", req.Node).Str("by", by).Msg("Policy adoption chosen")
 	if req.Kind == "governance" {
-		// The governance mirror rewrites each node's table to the cluster's:
-		// the other nodes' own policies are removed, not kept.
+		// The governance mirror rewrites each node's table to the cluster's;
+		// a node's own policies the cluster did not adopt are kept in
+		// governance_policies_dormant.
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 			"success": true,
-			"message": "the leader adopts the node's governance policies if it still holds exactly these; every other node's own governance policies are then removed from its database. GET /api/v1/cluster shows the outcome under cluster_policies",
+			"message": "the leader adopts the node's governance policies if it still holds exactly these; every other node's own governance policies are then no longer enforced, and are kept in its governance_policies_dormant table. GET /api/v1/cluster shows the outcome under cluster_policies",
 		})
 	}
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
