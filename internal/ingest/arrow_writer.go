@@ -1479,6 +1479,11 @@ type ArrowBuffer struct {
 	hasFlushFailure        atomic.Bool
 	flushFailureGeneration atomic.Uint64
 
+	// ambiguous holds the keys of failed storage writes that may land after
+	// all, until their rows are stored by another flush (#1635,
+	// ambiguous_writes.go).
+	ambiguous *ambiguousLedger
+
 	// walRecoveryPending arms the same recovery as hasFlushFailure, for a
 	// reason that is NOT a flush failure: a recovery pass that kept a file or
 	// failed a barrier. It is a separate flag because hasFlushFailure's other
@@ -2117,6 +2122,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		decimalConfig:        decimalConfig,
 		defaultDecimalConfig: defaultDecimalConfig,
 		logger:               logger.With().Str("component", "arrow-buffer").Logger(),
+		ambiguous:            newAmbiguousLedger(),
 	}
 
 	// Initialize shards
@@ -2149,6 +2155,11 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	// Publish buffer gauges on a fixed cadence (#802)
 	buffer.wg.Add(1)
 	go buffer.metricsSampler()
+
+	// Removes late-landed copies of failed flush writes (#1635). Idle while
+	// nothing is tracked, which is always without a WAL.
+	buffer.wg.Add(1)
+	go buffer.ambiguousSweeper()
 
 	buffer.logger.Info().
 		Int("max_buffer_size", cfg.MaxBufferSize).
@@ -4966,6 +4977,10 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 	}
 	startTime := time.Now()
 	noWALRows := recordsWithoutWALCopy(records, recordCount)
+	var needParts []walNeedPart // #1635; read before the records are released
+	if b.wal != nil {
+		needParts = walNeedPartsOf(records)
+	}
 
 	// Merge typed column batches
 	merged, err := b.mergeBatchesForFlush(measurement, records)
@@ -4986,6 +5001,8 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 
 	// Flush with data timestamp partitioning
 	if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
+		need, named := walNeedParts(needParts)
+		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, recordCount, noWALRows)
 		b.markFlushFailure()
 		group.failed()
@@ -5013,6 +5030,10 @@ type FileRegistrationSyncer interface {
 // group releases its WAL entries once every file has settled in the outbox.
 func (b *ArrowBuffer) completeFlush(walHashes []string, group *flushGroup) {
 	b.syncRegistrations()
+	// The rows of walHashes are stored and registered: a failed write that
+	// was waiting for them may now have its late copy removed (#1635). On
+	// that evidence alone, as the checkpoint below is, whatever its outcome.
+	b.ambiguous.stored(walHashes)
 	if group != nil {
 		if len(walHashes) > 0 {
 			if err := group.cs.wal.MarkFlushedRetained(walHashes); err != nil {
@@ -5227,7 +5248,8 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage: %w", err)
+			// The write may still land (#1635): name the key for noteFailedWrite.
+			return &failedStorageWrite{err: fmt.Errorf("failed to write to storage: %w", err), path: storagePath, size: int64(len(parquetData))}
 		}
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
@@ -5352,7 +5374,18 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return partial(fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err))
+			// The write may still land (#1635). With the row map, name this
+			// file's rows; without it the flush's identities cover them.
+			fw := &failedStorageWrite{err: fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err), path: storagePath, size: int64(len(parquetData))}
+			if perHour {
+				// Every row of the file named, or none: a row left out
+				// would be deleted with the file once the others are
+				// stored again. Empty is never recorded.
+				if fw.rows = spans.rangesIn(bucket.indices); rangeRows(fw.rows) != len(bucket.indices) {
+					fw.rows = []string{}
+				}
+			}
+			return partial(fw)
 		}
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
@@ -5363,6 +5396,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, cov.forFile(group.piecesAt(bucket.indices)))
 			b.syncRegistrations()
 			ranges := spans.rangesIn(bucket.indices)
+			b.ambiguous.stored(ranges) // #1635, as in completeFlush
 			checkpointed := b.checkpointRows(ctx, ranges)
 			for _, i := range bucket.indices {
 				writtenAt[i] = true
@@ -5441,6 +5475,8 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, p.rows, time.Now().UTC(), p.group); err != nil {
+		need, named := walNeedOf(p.records)
+		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, p.rows, recordsWithoutWALCopy(p.records, p.rows))
 		b.markFlushFailure()
 		p.group.failed()
@@ -5535,6 +5571,8 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// Flush with data timestamp partitioning
 	startTime := time.Now().UTC()
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
+		need, named := walNeedOf(recordsToFlush)
+		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, recordCount, recordsWithoutWALCopy(recordsToFlush, recordCount))
 		b.markFlushFailure()
 		group.failed()
@@ -7134,6 +7172,15 @@ func (b *ArrowBuffer) Close() error {
 		b.closeFailed.Store(true)
 	}
 	b.closeFlushClean.Store(!b.closeFailed.Load())
+
+	// The flushes above may have stored the replayed rows of a failed write
+	// whose late copy is now due for removal (#1635). What is left of the
+	// budget, at most 10 s: storage is still open (it closes after the buffer).
+	sweepBudget := time.Until(deadline)
+	if sweepBudget > 10*time.Second {
+		sweepBudget = 10 * time.Second
+	}
+	b.closeAmbiguousWrites(sweepBudget)
 
 	b.logger.Info().
 		Int64("total_records_written", b.totalRecordsWritten.Load()).

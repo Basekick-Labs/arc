@@ -74,6 +74,45 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
+
+With the WAL on and object storage as the backend, a flush whose upload hit
+`ingest.flush_timeout_seconds` was treated as failed: its rows stayed in the
+WAL and the next recovery pass wrote them to a new file. An object store that
+had already received the upload could still finish it after Arc gave up (a
+stalled S3, a slow network, an overloaded gateway). That left two files with
+the same rows, and queries read both. Acknowledged rows were never lost.
+
+Arc now keeps the key of a failed flush write together with the WAL entries
+whose rows it held. When another flush has stored all of those rows, usually
+the recovery pass's replay, Arc checks the key. If the object is there and is
+the size the failed upload sent, Arc deletes it and logs a warning. It checks
+again 1, 5 and 15 minutes later, because the abandoned upload can land after
+the first check.
+
+Arc deletes the object only when every row in it is provably stored in
+another file. A flush that does not meet this condition is not tracked, and a
+duplicate is still possible, as before:
+
+- The WAL is off.
+- Some of its rows have no WAL copy.
+- It names rows by identities that replay does not carry.
+
+Other limits:
+
+- **Restart.** The list of failed keys is kept in memory. After a restart,
+  the startup replay leaves a copy that already landed in place. On shutdown,
+  Arc logs a warning for each key it is still tracking.
+- **Compaction.** If compaction merges the late copy before Arc deletes it,
+  the duplicate rows become part of the compacted file.
+- **Brief duplicates.** Between the late upload landing and the check, queries
+  see the rows twice.
+
+New counters: `arc_ingest_ambiguous_writes_recorded_total`,
+`arc_ingest_ambiguous_writes_removed_total` and
+`arc_ingest_ambiguous_writes_abandoned_total` (no longer tracked without a
+removal: rows not seen stored again within a day, or an object of another
+size at the key). No new configuration.
 ## Fix: local storage fsyncs what it writes, so a power loss cannot take acknowledged rows ([#1618](https://github.com/Basekick-Labs/arc/issues/1618))
 
 The local storage backend renamed each written file into place without
