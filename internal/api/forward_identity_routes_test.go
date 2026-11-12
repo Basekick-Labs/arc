@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http/httptest"
 	"testing"
 
@@ -122,7 +123,7 @@ func TestBuildHTTPRequest_CarriesVerifiedTokenID(t *testing.T) {
 	var got cluster.ForwardToken
 	app.Post("/w", func(c *fiber.Ctx) error {
 		c.Locals("token_info", &auth.TokenInfo{ID: 42, Fingerprint: "fp"})
-		req, err := BuildHTTPRequest(c)
+		req, _, err := BuildHTTPRequest(c, context.Background())
 		if err != nil {
 			return err
 		}

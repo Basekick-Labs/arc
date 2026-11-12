@@ -487,14 +487,18 @@ func (h *DatabasesHandler) forwardCreate(c *fiber.Ctx) (bool, error) {
 	case ForwardAlreadyForwarded:
 		return true, RespondAlreadyForwarded(c)
 	case ForwardToPeer:
-		req, err := BuildHTTPRequest(c)
+		// Built only here, once the create is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		req, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build database create request for forwarding")
 			return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Failed to prepare request for forwarding",
 			})
 		}
-		resp, err := h.router.RouteDatabaseCreate(c.Context(), req)
+		defer release()
+		resp, err := h.router.RouteDatabaseCreate(fctx, req)
 		if errors.Is(err, cluster.ErrLocalNodeCanHandle) {
 			return false, nil
 		}

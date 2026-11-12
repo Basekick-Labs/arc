@@ -3941,6 +3941,10 @@ func main() {
 			importHandler.SetRouter(router)
 			tleHandler.SetRouter(router)
 			queryHandler.SetRouter(router)
+			// Forwards run on the router's own context, not their request's
+			// (#1629); it ends where fasthttp ends request contexts: when the
+			// HTTP server starts shutting down.
+			server.OnShutdownStart(router.StopForwards)
 			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
 		}
 

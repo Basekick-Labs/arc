@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -86,6 +87,10 @@ type Server struct {
 	licenseStatus func() license.LicenseHealth
 	// coldMissingObjects supplies the /health "tiering" field (#1551).
 	coldMissingObjects func() *tiering.ColdMissingObjectsStatus
+
+	// onShutdownStart runs first in Shutdown (OnShutdownStart).
+	onShutdownStartMu sync.Mutex
+	onShutdownStart   []func()
 }
 
 // ServerConfig holds server configuration
@@ -784,9 +789,26 @@ func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	return tls.NewListener(ln, tlsCfg), nil
 }
 
+// OnShutdownStart registers fn to run when Shutdown starts, before the HTTP
+// server drains: the point at which fasthttp ends its requests' contexts. The
+// cluster router's StopForwards is registered here, so a forward, which does
+// not run on its request's context (#1629), ends when it used to.
+func (s *Server) OnShutdownStart(fn func()) {
+	s.onShutdownStartMu.Lock()
+	s.onShutdownStart = append(s.onShutdownStart, fn)
+	s.onShutdownStartMu.Unlock()
+}
+
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(timeout time.Duration) error {
 	s.logger.Info().Msg("Shutting down server gracefully...")
+
+	s.onShutdownStartMu.Lock()
+	fns := s.onShutdownStart
+	s.onShutdownStartMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
