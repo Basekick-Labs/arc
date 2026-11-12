@@ -74,6 +74,25 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: re-running a continuous query with nothing new to process answers 200 ([#1628](https://github.com/Basekick-Labs/arc/issues/1628))
+
+`POST /api/v1/continuous_queries/{id}/execute` answered `400 start_time must be
+before end_time` when the window it derived was empty: a second run within the
+same second, or a run within a minute of a watermark an earlier `end_time` set
+ahead of the clock. The scheduler logged the same case at Error as "Scheduled
+CQ execution failed".
+- Such a run now answers 200 with `records_written: 0`, and `start_time` and
+  `end_time` both at the watermark. It writes no execution row and leaves
+  `last_processed_time` as it is (no Raft proposal in a cluster). The
+  scheduler logs it at Debug.
+- A watermark more than a minute ahead of the clock is still refused (the same
+  400, and Error in the scheduler), so a CQ stuck behind clock skew stays
+  visible.
+- An explicit `start_time` not before `end_time`, or an explicit `end_time`
+  before the watermark, is still a 400 with the same text.
+- Python SDK: such a re-run returns a normal result instead of raising
+  `ArcError`.
+
 ## Fix: an MQTT start or restart that cannot connect to the broker answers 502 with the reason ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
 
 `POST /api/v1/mqtt/subscriptions/{id}/start` and `.../restart` answered 500
