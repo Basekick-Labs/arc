@@ -172,7 +172,7 @@ close, from running. HTTP draining now uses at most half the remaining budget;
 when that window expires, in-flight request contexts are cancelled and the
 coordinator can continue with the remaining hooks.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1650](https://github.com/Basekick-Labs/arc/pull/1650).
 
 ## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
 
