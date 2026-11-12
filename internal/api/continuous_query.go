@@ -184,6 +184,9 @@ type ExecuteCQResponse struct {
 	// primary moved it meanwhile; theirs is kept) or "pending" (the cluster
 	// has not taken it yet; the next run settles it).
 	WatermarkStatus string `json:"watermark_status,omitempty"`
+	// Skipped: the run had no new window (see quietEmptyWindow) and did
+	// nothing. Not serialized; the scheduler reads it to log at Debug.
+	Skipped bool `json:"-"`
 }
 
 // CQExecution represents an execution history record
@@ -777,6 +780,51 @@ func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Continuous query deleted successfully"})
 }
 
+// cqNow is the clock a run derives its window from (a test seam).
+var cqNow = time.Now
+
+// quietEmptyWindow reports whether a run's empty window is simply nothing new
+// to process, answered with 0 records rather than an error (#1628): both
+// bounds were derived (the start from the watermark, the end from now), and
+// the watermark is at most cqEndTimeSkew ahead of now. That is a second run
+// within the same second, or a watermark an earlier manual end_time set up to
+// the minute ahead it may. A watermark further ahead (clock skew, a failover)
+// stays an error, so a CQ stuck behind it is not silent; so does an empty
+// window the caller asked for.
+func quietEmptyWindow(start, end, now time.Time, startFromWatermark, endGiven bool) bool {
+	return startFromWatermark && !endGiven &&
+		!start.Before(end) &&
+		!start.After(now.Add(cqEndTimeSkew))
+}
+
+// emptyCQWindowResponse is the answer to a run quietEmptyWindow skipped: the
+// window it reports is empty (start and end at the watermark) and nothing was
+// written. No run happened, so there is no execution to name: execution_id is
+// "" (present, as clients require the key) and no history row has it. Every
+// other field the clients require is set.
+func emptyCQWindowResponse(queryID int64, cq *ContinuousQuery, watermark time.Time, began time.Time, dryRun bool, executedQuery string) ExecuteCQResponse {
+	status := "completed"
+	if dryRun {
+		status = "dry_run"
+	}
+	return ExecuteCQResponse{
+		QueryID:                queryID,
+		QueryName:              cq.Name,
+		ExecutionID:            "",
+		Status:                 status,
+		StartTime:              watermark.Format(time.RFC3339),
+		EndTime:                watermark.Format(time.RFC3339),
+		RecordsRead:            nil,
+		RecordsWritten:         0,
+		ExecutionTimeSeconds:   time.Since(began).Seconds(),
+		DestinationMeasurement: cq.DestinationMeasurement,
+		DryRun:                 dryRun,
+		ExecutedAt:             time.Now().UTC().Format(time.RFC3339),
+		ExecutedQuery:          executedQuery,
+		Skipped:                true,
+	}
+}
+
 // ExecuteCQ executes a continuous query by ID programmatically (used by scheduler)
 // Returns the execution response and any error
 func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (*ExecuteCQResponse, error) {
@@ -816,13 +864,21 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
 		startTime = startTime.UTC()
 	} else {
-		startTime = time.Now().UTC().Add(-1 * time.Hour)
+		startTime = cqNow().UTC().Add(-1 * time.Hour)
 	}
 	// Whole seconds: the window bounds go into the query as RFC3339, and the
 	// watermark is stored at that precision.
-	endTime = time.Now().UTC().Truncate(time.Second)
+	now := cqNow()
+	endTime = now.UTC().Truncate(time.Second)
 
 	if !startTime.Before(endTime) {
+		if quietEmptyWindow(startTime, endTime, now, cq.LastProcessedTime != nil, false) {
+			// Nothing new since the last run (#1628): no aggregation, no
+			// execution row, the watermark left as it is. The scheduler logs
+			// it (Debug), from Skipped.
+			resp := emptyCQWindowResponse(queryID, cq, startTime, start, false, "")
+			return &resp, nil
+		}
 		return nil, fmt.Errorf("start_time must be before end_time")
 	}
 
@@ -972,6 +1028,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 
 	// Determine time range
 	var startTime, endTime time.Time
+	startFromWatermark := false
 
 	if req.StartTime != nil && *req.StartTime != "" {
 		startTime, err = time.Parse(time.RFC3339, *req.StartTime)
@@ -982,11 +1039,14 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	} else if cq.LastProcessedTime != nil {
 		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
 		startTime = startTime.UTC()
+		startFromWatermark = true
 	} else {
-		startTime = time.Now().UTC().Add(-1 * time.Hour)
+		startTime = cqNow().UTC().Add(-1 * time.Hour)
 	}
 
-	if req.EndTime != nil && *req.EndTime != "" {
+	endGiven := req.EndTime != nil && *req.EndTime != ""
+	now := cqNow()
+	if endGiven {
 		endTime, err = time.Parse(time.RFC3339, *req.EndTime)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid end_time format"})
@@ -994,16 +1054,28 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		endTime = endTime.UTC()
 		// The run's end becomes the watermark: one in the future would make
 		// every later run fail until the clock caught up (#1324).
-		if !req.DryRun && endTime.After(time.Now().Add(cqEndTimeSkew)) {
+		if !req.DryRun && endTime.After(now.Add(cqEndTimeSkew)) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "end_time may not be more than a minute in the future"})
 		}
 	} else {
-		endTime = time.Now().UTC()
+		endTime = now.UTC()
 	}
 	endTime = endTime.Truncate(time.Second)
 
 	if !startTime.Before(endTime) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start_time must be before end_time"})
+		if !quietEmptyWindow(startTime, endTime, now, startFromWatermark, endGiven) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start_time must be before end_time"})
+		}
+		// Nothing new since the last run (#1628): 200 with 0 records, no
+		// aggregation, no execution row, the watermark left as it is.
+		executedQuery := ""
+		if req.DryRun {
+			executedQuery = strings.ReplaceAll(cq.Query, "{start_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+			executedQuery = strings.ReplaceAll(executedQuery, "{end_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+		}
+		h.logger.Debug().Str("query_name", cq.Name).Time("watermark", startTime).Bool("dry_run", req.DryRun).
+			Msg("No new window for continuous query")
+		return c.JSON(emptyCQWindowResponse(int64(queryID), cq, startTime, start, req.DryRun, executedQuery))
 	}
 
 	// Replace placeholders in query
