@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -290,13 +291,24 @@ func TestForwardedQueryDoesNotReachTheRequestContext(t *testing.T) {
 	probe.requireClean(t)
 }
 
-// A request served here never builds the forward's context (it is set up
-// only behind the forward decision): a standalone node (no router) and a
-// writer that ingests itself. A forwarded write builds exactly one.
+// countForwardSetups counts forward setups (forwardSetupHook) for the rest
+// of the test. Not parallel: the hook is package state.
+func countForwardSetups(t *testing.T) *atomic.Int64 {
+	t.Helper()
+	var n atomic.Int64
+	forwardSetupHook = func() { n.Add(1) }
+	t.Cleanup(func() { forwardSetupHook = nil })
+	return &n
+}
+
+// A request served here never builds a forward's context or request (they
+// are set up only behind the forward decision): a standalone node (no
+// router) and a writer that ingests itself. A forwarded write builds its
+// request (1); a forwarded query its context and its request (2).
 func TestForwardSetupOnlyBehindTheDecision(t *testing.T) {
 	lpBody := "cpu,host=a value=1 1700000000000000000\n"
 	local := func(t *testing.T, router *cluster.Router) {
-		before := forwardContextsBuilt.Load()
+		n := countForwardSetups(t)
 		app := writeApp(t, router)
 		qh := NewQueryHandler(nil, nil, zerolog.Nop(), 0, 0)
 		if router != nil {
@@ -308,7 +320,7 @@ func TestForwardSetupOnlyBehindTheDecision(t *testing.T) {
 			require.NoError(t, err)
 			_ = resp.Body.Close()
 		}
-		require.Equal(t, before, forwardContextsBuilt.Load(), "a request served here built a forward context")
+		require.Zero(t, n.Load(), "a request served here built a forward")
 	}
 	t.Run("standalone", func(t *testing.T) { local(t, nil) })
 	t.Run("writer", func(t *testing.T) {
@@ -320,11 +332,20 @@ func TestForwardSetupOnlyBehindTheDecision(t *testing.T) {
 		srv := httptest.NewServer(&probePeer{status: http.StatusOK})
 		defer srv.Close()
 		app := writeApp(t, probeRouter(t, cluster.RoleReader, cluster.RoleWriter, srv, &dialProbe{}, false))
-		before := forwardContextsBuilt.Load()
+		n := countForwardSetups(t)
 		resp, err := app.Test(mustProbeRequest(t, "/api/v1/write/line-protocol", lpBody), 10000)
 		require.NoError(t, err)
 		_ = resp.Body.Close()
-		require.Equal(t, before+1, forwardContextsBuilt.Load())
+		require.Equal(t, int64(1), n.Load())
+
+		qh := NewQueryHandler(nil, nil, zerolog.Nop(), 0, 0)
+		qh.SetRouter(probeRouter(t, cluster.RoleCompactor, cluster.RoleReader, srv, &dialProbe{}, false))
+		qapp := fiber.New(fiber.Config{DisableStartupMessage: true})
+		qh.RegisterRoutes(qapp)
+		resp, err = qapp.Test(mustProbeRequest(t, "/api/v1/query", `{"sql":"SELECT 1"}`), 10000)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		require.Equal(t, int64(3), n.Load())
 	})
 }
 
@@ -443,42 +464,71 @@ func routerRegistry(t *testing.T, srv *httptest.Server) *cluster.Registry {
 }
 
 // StopForwards (wired to the HTTP server's shutdown start) ends a forward in
-// flight, as fasthttp's request context ending at shutdown used to.
+// flight, as fasthttp's request context ending at shutdown used to: every
+// write-class forward (on the router's lifetime itself) and a query forward
+// (on a child of it).
 func TestStopForwardsEndsAForwardInFlight(t *testing.T) {
-	entered := make(chan struct{})
-	var once sync.Once
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		once.Do(func() { close(entered) })
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
-	router := probeRouter(t, cluster.RoleReader, cluster.RoleWriter, srv, &dialProbe{}, false)
-	app := writeApp(t, router)
-
-	s := &Server{app: fiber.New(fiber.Config{DisableStartupMessage: true}), logger: zerolog.Nop()}
-	s.OnShutdownStart(router.StopForwards)
-	done := make(chan int, 1)
-	go func() {
-		resp, err := app.Test(mustProbeRequest(t, "/api/v1/write/line-protocol", "cpu value=1\n"), -1)
-		if err != nil {
-			done <- -1
-			return
-		}
-		_ = resp.Body.Close()
-		done <- resp.StatusCode
-	}()
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the forward never reached the writer")
-	}
-	require.NoError(t, s.Shutdown(time.Second))
-	select {
-	case status := <-done:
+	for _, tc := range []struct {
+		name, path, body string
+		local, peer      cluster.NodeRole
+		standby          bool
+		want             int
+	}{
 		// Sent, then cut: ambiguous, 504.
-		require.Equal(t, http.StatusGatewayTimeout, status)
-	case <-time.After(5 * time.Second):
-		t.Fatal("StopForwards did not end the forward in flight")
+		{"line protocol", "/api/v1/write/line-protocol", "cpu value=1\n", cluster.RoleReader, cluster.RoleWriter, false, http.StatusGatewayTimeout},
+		{"msgpack", "/api/v1/write/msgpack", "\x81\xa1m\xa3cpu", cluster.RoleReader, cluster.RoleWriter, false, http.StatusGatewayTimeout},
+		{"tle", "/api/v1/write/tle", "ISS\n1 25544U\n2 25544\n", cluster.RoleReader, cluster.RoleWriter, false, http.StatusGatewayTimeout},
+		{"import", "/api/v1/import/lp", "cpu value=1\n", cluster.RoleReader, cluster.RoleWriter, false, http.StatusGatewayTimeout},
+		{"large import", "/api/v1/import/lp", lpOfLen(1 << 20), cluster.RoleReader, cluster.RoleWriter, false, http.StatusGatewayTimeout},
+		{"database create", "/api/v1/databases", `{"name":"stop"}`, cluster.RoleReader, cluster.RoleWriter, false, http.StatusGatewayTimeout},
+		{"standby write", "/api/v1/write/line-protocol", "cpu value=1\n", cluster.RoleWriter, cluster.RoleWriter, true, http.StatusGatewayTimeout},
+		{"standby import", "/api/v1/import/lp", "cpu value=1\n", cluster.RoleWriter, cluster.RoleWriter, true, http.StatusGatewayTimeout},
+		// A cancelled query forward answers "Query cancelled".
+		{"query", "/api/v1/query", `{"sql":"SELECT 1"}`, cluster.RoleCompactor, cluster.RoleReader, false, http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entered := make(chan struct{})
+			var once sync.Once
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				once.Do(func() { close(entered) })
+				<-r.Context().Done()
+			}))
+			defer srv.Close()
+			// On a failure, cut the forward's connection first, so Close does
+			// not wait for a handler the forward still holds open.
+			defer srv.CloseClientConnections()
+			router := probeRouter(t, tc.local, tc.peer, srv, &dialProbe{}, tc.standby)
+			app := writeApp(t, router)
+			qh := NewQueryHandler(nil, nil, zerolog.Nop(), 0, 0)
+			qh.SetRouter(router)
+			qh.RegisterRoutes(app)
+
+			s := &Server{app: fiber.New(fiber.Config{DisableStartupMessage: true}), logger: zerolog.Nop()}
+			s.OnShutdownStart(router.StopForwards)
+			done := make(chan int, 1)
+			req := mustProbeRequest(t, tc.path, tc.body)
+			go func() {
+				resp, err := app.Test(req, -1)
+				if err != nil {
+					done <- -1
+					return
+				}
+				_ = resp.Body.Close()
+				done <- resp.StatusCode
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the forward never reached the peer")
+			}
+			require.NoError(t, s.Shutdown(time.Second))
+			select {
+			case status := <-done:
+				require.Equal(t, tc.want, status)
+			case <-time.After(5 * time.Second):
+				t.Fatal("StopForwards did not end the forward in flight")
+			}
+		})
 	}
 }

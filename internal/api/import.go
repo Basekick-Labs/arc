@@ -114,9 +114,9 @@ func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 			h.totalErrors.Add(1)
 			return true, respondImportTooLarge(c)
 		}
-		// Built only here, once the import is forwarded (#1629).
-		fctx, cancel := forwardContext(h.router)
-		defer cancel()
+		// Built only here, once the import is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
 		req, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.totalErrors.Add(1)

@@ -205,9 +205,9 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding Line Protocol write request to writer node")
 
-		// Built only here, once the write is forwarded (#1629).
-		fctx, cancel := forwardContext(h.router)
-		defer cancel()
+		// Built only here, once the write is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
 		httpReq, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")

@@ -9,7 +9,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
@@ -94,23 +93,32 @@ func isClientForwardingHeader(canonicalKey string) bool {
 	return clientForwardingHeaders[canonicalKey] || strings.HasPrefix(canonicalKey, security.ForwardIdentityHeaderPfx)
 }
 
-// forwardContextsBuilt counts forwardContext calls. A test seam: the forward
+// forwardSetupHook, when set by a test, is called each time a forward's
+// context or request is built (forwardContext, BuildHTTPRequest): the forward
 // setup runs only behind a forward decision, never on a request served here.
-var forwardContextsBuilt atomic.Int64
+// Nil in production.
+var forwardSetupHook func()
 
-// forwardContext is the context a forward runs on (#1629): a child of the
-// router's lifetime, which ends when the server starts shutting down
+// forwardContext is the context a query forward runs on (#1629): a child of
+// the router's lifetime, which ends when the server starts shutting down
 // (Router.StopForwards), as the request context of a forward used to. It
 // holds no reference to the pooled *fasthttp.RequestCtx: net/http dials,
 // and writes a request body, in goroutines that can outlive the handler,
 // and RequestCtx.Value reads the request's user values (fiber Locals) after
 // fasthttp has reset and reused it. Not cancelled when the client leaves
 // (neither was the request context); the query forwards watch for that
-// themselves. The caller cancels it on every exit, or it stays registered
-// on the router's lifetime until shutdown. Call it only once the request is
+// themselves, and cancel it on every exit, or it would stay registered on
+// the router's lifetime until shutdown. Call it only once the request is
 // being forwarded.
+//
+// The write-class forwards (writes, imports, database creation, the
+// standby forward) need no cancel of their own and run on
+// router.Lifetime() itself: nothing but shutdown and the client's timeout
+// ends them, and the child would cost allocations per forward.
 func forwardContext(router *cluster.Router) (context.Context, context.CancelFunc) {
-	forwardContextsBuilt.Add(1)
+	if forwardSetupHook != nil {
+		forwardSetupHook()
+	}
 	return context.WithCancel(router.Lifetime())
 }
 
@@ -118,16 +126,17 @@ func forwardContext(router *cluster.Router) (context.Context, context.CancelFunc
 // it through a forwardBody. net/http writes the headers of a body that is not
 // one of its in-memory readers in a TCP write of their own (FlushHeaders), so
 // a small forward would take an extra write; a copy this small costs less
-// than that (#1629 benchmarks). Above it the headers and body do not fit the
-// transport's 4KB write buffer together anyway.
+// than that (#1629 benchmarks). Above it the separate header write is at most
+// one extra small syscall per forward, against a body of at least 4KB.
 const forwardBodyCopyMax = 4 << 10
 
 // forwardBody is the request body of a forward larger than
 // forwardBodyCopyMax: fasthttp's body slice, not a copy (a write or import
-// can be up to 1GB), readable only until the forward is released. net/http may go on reading a request body after RoundTrip has
-// returned (the transport writes it from its own goroutine: an early answer
-// such as a 413, a cancel, a timeout), and once the handler returns fasthttp
-// reuses that slice for a later request. After release a read fails and the
+// can be up to 1GB), readable only until the forward is released. net/http
+// may go on reading a request body after RoundTrip has returned (the
+// transport writes it from its own goroutine: an early answer such as a 413,
+// a cancel, a timeout), and once the handler returns fasthttp reuses that
+// slice for a later request. After release a read fails and the
 // peer gets a truncated body for a request whose forward already ended.
 type forwardBody struct {
 	mu       sync.Mutex
@@ -163,10 +172,14 @@ func (r *forwardBodyReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// Close is a no-op on purpose: Read never blocks, so there is nothing to
+// unblock, and cutting the body off is release's job (after the forward
+// returned), not the transport's.
 func (r *forwardBodyReader) Close() error { return nil }
 
 // BuildHTTPRequest converts a Fiber context to a net/http Request for
-// forwarding via the router, on ctx (forwardContext). release ends the
+// forwarding via the router, on ctx (forwardContext, or router.Lifetime()
+// for a write-class forward). release ends the
 // request's access to c's body; the caller defers it right after a
 // successful call, in the forward branch.
 //
@@ -174,8 +187,8 @@ func (r *forwardBodyReader) Close() error { return nil }
 // handler returns, and net/http may use both from its own goroutines after
 // the router call returned (a dial outliving a cancel; the body written
 // after an early answer, a cancel or a timeout):
-//   - the context: ctx is forwardContext's, never c.Context(), so no value
-//     lookup reaches the pooled RequestCtx;
+//   - the context: ctx is rooted on the router's lifetime, never on
+//     c.Context(), so no value lookup reaches the pooled RequestCtx;
 //   - the body: c's raw body slice, not copied (up to 1GB), read through a
 //     forwardBody that release cuts off; a body of at most
 //     forwardBodyCopyMax is copied instead.
@@ -187,6 +200,9 @@ func (r *forwardBodyReader) Close() error { return nil }
 // returns: its request body is already copied by then, and its context is
 // cancelled by the stream writer, not by the handler.
 func BuildHTTPRequest(c *fiber.Ctx, ctx context.Context) (req *http.Request, release func(), err error) {
+	if forwardSetupHook != nil {
+		forwardSetupHook()
+	}
 	// Build full URL from Fiber context
 	// c.BaseURL() returns scheme://host, c.OriginalURL() returns path + query
 	url := c.BaseURL() + c.OriginalURL()
@@ -624,8 +640,8 @@ func forwardStandby(router *cluster.Router, c *fiber.Ctx, forward func(context.C
 	if !ok {
 		return false, nil
 	}
-	ctx, cancel := forwardContext(router)
-	defer cancel()
+	// The router's lifetime, not a per-forward child (forwardContext).
+	ctx := router.Lifetime()
 	req, release, err := BuildHTTPRequest(c, ctx)
 	if err != nil {
 		return false, nil

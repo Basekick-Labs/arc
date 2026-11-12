@@ -789,7 +789,6 @@ func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	return tls.NewListener(ln, tlsCfg), nil
 }
 
-// Shutdown gracefully shuts down the server
 // OnShutdownStart registers fn to run when Shutdown starts, before the HTTP
 // server drains: the point at which fasthttp ends its requests' contexts. The
 // cluster router's StopForwards is registered here, so a forward, which does
@@ -800,6 +799,7 @@ func (s *Server) OnShutdownStart(fn func()) {
 	s.onShutdownStartMu.Unlock()
 }
 
+// Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(timeout time.Duration) error {
 	s.logger.Info().Msg("Shutting down server gracefully...")
 

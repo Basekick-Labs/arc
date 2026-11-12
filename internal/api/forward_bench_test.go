@@ -246,3 +246,62 @@ func BenchmarkForwardQuery(b *testing.B) {
 	ctx := benchRequest("POST", "/api/v1/query", []byte(`{"sql":"SELECT 42 AS x"}`), map[string]string{"Content-Type": "application/json"})
 	runBench(b, app.Handler(), ctx, http.StatusOK)
 }
+
+// runParallelBench is runBench from every goroutine, each with its own
+// request (a fasthttp.RequestCtx serves one request at a time).
+func runParallelBench(b *testing.B, h fasthttp.RequestHandler, newCtx func() *fasthttp.RequestCtx, want int) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		ctx := newCtx()
+		for pb.Next() {
+			ctx.Response.Reset()
+			h(ctx)
+			if got := ctx.Response.StatusCode(); got != want {
+				b.Errorf("status %d, want %d", got, want)
+				return
+			}
+		}
+	})
+}
+
+// BenchmarkForwardWriteParallel: concurrent forwarded writes, every one
+// rooted on the same router (its lifetime context and transport).
+func BenchmarkForwardWriteParallel(b *testing.B) {
+	metrics.Init(zerolog.Nop())
+	for _, size := range []struct {
+		name string
+		n    int
+	}{{"1KB", 1 << 10}, {"64KB", 64 << 10}} {
+		b.Run(size.name, func(b *testing.B) {
+			srv := drainPeer(b, http.StatusNoContent, "")
+			h := NewLineProtocolHandler(benchBuffer(b), zerolog.Nop())
+			h.SetRouter(benchRouter(b, cluster.RoleReader, cluster.RoleWriter, srv.URL))
+			app := fiber.New(fiber.Config{DisableStartupMessage: true})
+			h.RegisterRoutes(app)
+			body := make([]byte, size.n)
+			for i := range body {
+				body[i] = 'a' + byte(i%26)
+			}
+			b.SetBytes(int64(size.n))
+			runParallelBench(b, app.Handler(), func() *fasthttp.RequestCtx {
+				return benchRequest("POST", "/api/v1/write/line-protocol", body, map[string]string{"x-arc-database": "bench"})
+			}, http.StatusNoContent)
+		})
+	}
+}
+
+// BenchmarkForwardQueryParallel: concurrent forwarded queries, each with its
+// own child of the router's lifetime.
+func BenchmarkForwardQueryParallel(b *testing.B) {
+	metrics.Init(zerolog.Nop())
+	srv := drainPeer(b, http.StatusOK, `{"success":true,"columns":["x"],"data":[[42]],"row_count":1}`)
+	qh := benchQueryHandler(b)
+	qh.SetRouter(benchRouter(b, cluster.RoleCompactor, cluster.RoleReader, srv.URL))
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	qh.RegisterRoutes(app)
+	runParallelBench(b, app.Handler(), func() *fasthttp.RequestCtx {
+		return benchRequest("POST", "/api/v1/query", []byte(`{"sql":"SELECT 42 AS x"}`), map[string]string{"Content-Type": "application/json"})
+	}, http.StatusOK)
+}
