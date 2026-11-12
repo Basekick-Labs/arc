@@ -43,20 +43,13 @@ func (c *Coordinator) clusterPoliciesJoinGate(req interface {
 	g := &c.clusterPolicies
 	g.mu.Lock()
 	if hasCapability(req.GetCapabilities(), raft.CapabilityClusterPolicies) {
-		// Retention's own flag gates the join too.
-		rWhy, rRelease := c.retentionPoliciesJoinGate(req)
-		if rWhy != "" {
+		// Each kind's own flag gates the join too (policy_kinds.go).
+		kWhy, kRelease := c.policyKindsJoinGate(req)
+		if kWhy != "" {
 			g.mu.Unlock()
-			return rWhy, nil
+			return kWhy, nil
 		}
-		// And the continuous query flag.
-		qWhy, qRelease := c.cqPoliciesJoinGate(req)
-		if qWhy != "" {
-			rRelease()
-			g.mu.Unlock()
-			return qWhy, nil
-		}
-		return "", func() { qRelease(); rRelease(); g.mu.Unlock() }
+		return "", func() { kRelease(); g.mu.Unlock() }
 	}
 	enabled := fsm != nil && fsm.ClusterPoliciesEnabled()
 	if !enabled && g.inFlight {
@@ -86,8 +79,7 @@ func (c *Coordinator) clusterPoliciesEnableLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			c.maybeEnableClusterPolicies()
-			c.maybeEnableRetentionPolicies()
-			c.maybeEnableCQPolicies()
+			c.maybeEnablePolicyKinds()
 			c.maybeSeedPolicies(ctx)
 		}
 	}

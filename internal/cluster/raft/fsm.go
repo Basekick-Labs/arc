@@ -250,6 +250,14 @@ const (
 	// CommandColdMarkReset: an admin clearing the seed (and a backend
 	// conflict) so the next cold listing seeds again.
 	CommandColdMarkReset
+	// Query governance policies (#1627), see governance_policies.go.
+	// CommandEnableGovernancePolicies turns their flag on once every node
+	// supports them; CommandSetGovernancePolicy creates or replaces a
+	// token's policy and CommandDeleteGovernancePolicy removes it, once
+	// seeded.
+	CommandEnableGovernancePolicies
+	CommandSetGovernancePolicy
+	CommandDeleteGovernancePolicy
 )
 
 // Command represents a command to be applied to the FSM.
@@ -885,6 +893,10 @@ type ClusterFSM struct {
 	cqEnabled bool
 	cqs       map[int64]*CQEntry
 	cqSeq     int64
+	// Governance policies (#1627) by token ID, see governance_policies.go.
+	governanceEnabled  bool
+	governancePolicies map[int64]*GovernancePolicyEntry
+	governanceSeq      int64
 	// policyAdoptChoice: an admin's pending choice of node, per kind.
 	policyAdoptChoice map[string]*PolicyAdoptChoice
 	// onPoliciesChanged: AddPoliciesChangedCallback.
@@ -985,6 +997,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		retentionSeededIDs:      map[int64]bool{},
 		policyAdoptChoice:       map[string]*PolicyAdoptChoice{},
 		cqs:                     map[int64]*CQEntry{},
+		governancePolicies:      map[int64]*GovernancePolicyEntry{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1394,7 +1407,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandAwaitAdoption:
 		return f.applyAwaitAdoption(cmd.Payload)
 	case CommandEnableRetentionPolicies:
-		return f.applyEnableRetentionPolicies(cmd.Payload)
+		return f.applyEnablePolicyKind(PolicyKindRetention, cmd.Payload)
 	case CommandCreateRetentionPolicy:
 		return f.policiesChangedIfApplied(f.applyCreateRetentionPolicy(cmd.Payload))
 	case CommandUpdateRetentionPolicy:
@@ -1404,7 +1417,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandChoosePolicyAdoption:
 		return f.applyChoosePolicyAdoption(cmd.Payload)
 	case CommandEnableCQPolicies:
-		return f.applyEnableCQPolicies(cmd.Payload)
+		return f.applyEnablePolicyKind(PolicyKindCQ, cmd.Payload)
 	case CommandCreateCQ:
 		return f.policiesChangedIfApplied(f.applyCreateCQ(cmd.Payload))
 	case CommandUpdateCQ:
@@ -1415,6 +1428,12 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		// No mirror signal: a watermark moves at every run, and the mirrors
 		// pick it up on their periodic pass.
 		return f.applySetCQWatermark(cmd.Payload)
+	case CommandEnableGovernancePolicies:
+		return f.applyEnablePolicyKind(PolicyKindGovernance, cmd.Payload)
+	case CommandSetGovernancePolicy:
+		return f.policiesChangedIfApplied(f.applySetGovernancePolicy(cmd.Payload))
+	case CommandDeleteGovernancePolicy:
+		return f.policiesChangedIfApplied(f.applyDeleteGovernancePolicy(cmd.Payload))
 	case CommandEnableColdMark:
 		return f.applyEnableColdMark(cmd.Payload)
 	case CommandColdMarkAdd:
@@ -2928,14 +2947,24 @@ func (f *ClusterFSM) applyDeleteToken(payload []byte, logIndex uint64) interface
 		}
 		delete(f.tokenMembershipsByToken, p.ID)
 	}
+	// A governance policy never outlives its token (#1627): the token's ID
+	// is a log index, and a later token can never take it, but a policy
+	// left behind would be listed and mirrored for no one.
+	droppedGovernance := f.dropGovernancePolicyLocked(p.ID)
 
 	callback := f.onTokenDeleted
 	f.mu.Unlock()
+	if droppedGovernance {
+		f.firePoliciesChanged()
+	}
 
 	metrics.Get().IncClusterAuthApplyDelete()
 	logEvt := f.logger.Info().Int64("token_id", p.ID)
 	if cascadedMemberships > 0 {
 		logEvt = logEvt.Int("cascaded_memberships", cascadedMemberships)
+	}
+	if droppedGovernance {
+		logEvt = logEvt.Bool("governance_policy_dropped", true)
 	}
 	logEvt.Msg("Token deleted from cluster auth state")
 	// Serialised with the reconcile against SQLite (#1336).
@@ -3475,6 +3504,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], id)
 		f.tokensByName[entry.Name] = id
 	}
+	// A governance policy never outlives its token (#1627), even in a
+	// snapshot that says otherwise: nothing would ever drop it.
+	f.dropOrphanGovernancePoliciesLocked()
 
 	// Phase A.1: install RBAC primary maps + rebuild all secondary
 	// indices from scratch (we never persist them — they're derived).
