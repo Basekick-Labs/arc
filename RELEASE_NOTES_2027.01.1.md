@@ -3038,6 +3038,13 @@ certificate, and maps databases and measurements to Flight SQL catalogs and
 tables for ADBC clients. Results stopped at a governance row cap end with a
 `ResourceExhausted` status rather than appearing to be complete.
 
+Flight queries are audited and logged like HTTP queries, with the client's
+address. Metadata calls run one query per database, plus one per measurement
+when schemas are requested, and count against governance limits. Prepared
+statements and SqlInfo are not implemented yet, so JDBC-based BI tools are not
+expected to work; the ADBC drivers are the tested clients. See
+`docs/operations/flight-sql.md`.
+
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https://github.com/Basekick-Labs/arc/pull/1419).
 
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))

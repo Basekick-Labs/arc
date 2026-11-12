@@ -27,12 +27,16 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -42,18 +46,49 @@ type FlightSQLServerConfig struct {
 	TLSEnabled  bool
 	TLSCertFile string
 	TLSKeyFile  string
+	// Middleware runs on the internal bridge after authentication, in order,
+	// as it does on the main app: cmd/arc/main.go passes the audit
+	// middleware here when audit logging is on, so Flight queries are
+	// audited like HTTP ones.
+	Middleware []fiber.Handler
 }
 
+// flightSQLPeerHeader carries the Flight client's address across the bridge
+// hop. The bridge reads it as its ProxyHeader, so c.IP() in the query
+// registry, the audit log and the request log is the client's address, not
+// the loopback one. Only a request holding the internal key gets that far.
+const flightSQLPeerHeader = "X-Arc-Flight-Peer"
+
+// flightSQLInternalKeyHeader authenticates the gRPC side to the bridge.
+const flightSQLInternalKeyHeader = "X-Arc-Flight-Internal-Key"
+
+// Shutdown bounds. The shutdown coordinator gives every hook and component
+// one context and skips everything left once it expires, including the
+// ingest buffer and WAL flushes, so this hook keeps its own deadline well
+// inside it: in-flight queries get flightSQLShutdownGrace to finish, are then
+// cancelled, and connections still open flightSQLShutdownForce later (a
+// client that stopped reading a stream) are closed.
+// Variables so a test can shorten them.
+var (
+	flightSQLShutdownGrace = 5 * time.Second
+	flightSQLShutdownForce = 2 * time.Second
+	flightSQLBridgeDrain   = 2 * time.Second
+)
+
 type FlightSQLServer struct {
-	bridge            *fiber.App
-	bridgeLn          net.Listener
-	flight            flight.Server
-	service           *flightSQLService
-	config            FlightSQLServerConfig
-	logger            zerolog.Logger
-	serveDone         chan error
+	bridge     *fiber.App
+	bridgeLn   net.Listener
+	flight     flight.Server
+	flightLn   *flightSQLConnTracker
+	service    *flightSQLService
+	config     FlightSQLServerConfig
+	logger     zerolog.Logger
+	serveDone  chan error
+	cancelBase context.CancelFunc
+
 	startMu           sync.Mutex
-	started           bool
+	listening         bool
+	serving           bool
 	shutdownMu        sync.Mutex
 	shutdownDone      chan struct{}
 	shutdownErr       error
@@ -66,6 +101,9 @@ type flightSQLService struct {
 	internalKey  string
 	baseURL      string
 	client       *http.Client
+	// baseCtx is cancelled during shutdown: every bridge request ends with
+	// it, which ends the RPCs waiting on them.
+	baseCtx context.Context
 }
 
 type flightSQLIdentity struct {
@@ -91,6 +129,9 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 	if queryHandler == nil {
 		return nil, fmt.Errorf("Flight SQL requires a query handler")
 	}
+	if !database.ArrowEnabled {
+		return nil, fmt.Errorf("Flight SQL requires a build with the Arrow query path (-tags=duckdb_arrow)")
+	}
 	if config.Port < 1 || config.Port > 65535 {
 		return nil, fmt.Errorf("Flight SQL port must be between 1 and 65535")
 	}
@@ -99,29 +140,55 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 	if _, err := rand.Read(secret); err != nil {
 		return nil, fmt.Errorf("generate internal Flight SQL credential: %w", err)
 	}
-
-	bridge := fiber.New(fiber.Config{DisableStartupMessage: true})
 	internalKey := hex.EncodeToString(secret)
+
+	// The bridge serves the query handler's routes to the gRPC side only.
+	// Its middleware mirrors the main app's (internal/api/server.go,
+	// cmd/arc/main.go) for what a query needs: recover first, so a handler
+	// panic is a failed RPC and not a dead process; then the key; then
+	// request logging, auth and the configured middleware (audit). All of
+	// it is registered before the routes: Fiber runs a Use added after a
+	// route that answers without calling Next for nothing.
+	bridge := fiber.New(fiber.Config{
+		DisableStartupMessage: true,
+		ProxyHeader:           flightSQLPeerHeader,
+		// A query body is one JSON-escaped SQL string; escaping can grow
+		// it several times over (Fiber's default is 4 MiB).
+		BodyLimit: 64 << 20,
+	})
+	bridge.Use(recover.New(recover.Config{EnableStackTrace: true}))
 	bridge.Use(func(c *fiber.Ctx) error {
-		if subtle.ConstantTimeCompare([]byte(c.Get("X-Arc-Flight-Internal-Key")), []byte(internalKey)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(c.Get(flightSQLInternalKeyHeader)), []byte(internalKey)) != 1 {
 			return c.SendStatus(fiber.StatusUnauthorized)
 		}
+		// Forwarding copies every request header to a cluster peer
+		// (routing.go); the key never leaves this process.
+		c.Request().Header.Del(flightSQLInternalKeyHeader)
 		return c.Next()
 	})
+	bridge.Use(requestLogger(logger))
 	bridge.Use(auth.NewMiddleware(auth.MiddlewareConfig{AuthManager: queryHandler.authManager}))
+	for _, m := range config.Middleware {
+		if m != nil {
+			bridge.Use(m)
+		}
+	}
 	queryHandler.RegisterRoutes(bridge)
 
-	transport := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 4}
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	transport := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 64}
 	service := &flightSQLService{
 		queryHandler: queryHandler,
 		internalKey:  internalKey,
 		client:       &http.Client{Transport: transport},
+		baseCtx:      baseCtx,
 	}
 
 	var options []grpc.ServerOption
 	if config.TLSEnabled {
 		cert, err := tls.LoadX509KeyPair(config.TLSCertFile, config.TLSKeyFile)
 		if err != nil {
+			cancelBase()
 			return nil, fmt.Errorf("load Flight SQL TLS keypair: %w", err)
 		}
 		tlsConfig := fips.HardenTLSConfig(&tls.Config{
@@ -139,45 +206,80 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 	flightServer.RegisterFlightService(flightsql.NewFlightServer(service))
 
 	return &FlightSQLServer{
-		bridge:    bridge,
-		flight:    flightServer,
-		service:   service,
-		config:    config,
-		logger:    logger,
-		serveDone: make(chan error, 1),
+		bridge:     bridge,
+		flight:     flightServer,
+		service:    service,
+		config:     config,
+		logger:     logger,
+		serveDone:  make(chan error, 1),
+		cancelBase: cancelBase,
 	}, nil
 }
 
-func (s *FlightSQLServer) Start() error {
+// Listen binds the bridge and the Flight SQL port without serving them, so
+// cmd/arc can bind before the node reports ready (a port conflict exits
+// first) and serve once the HTTP server is up.
+func (s *FlightSQLServer) Listen() error {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
-	if s.started {
-		return fmt.Errorf("Flight SQL server is already started")
+	if s.listening {
+		return fmt.Errorf("Flight SQL server is already listening")
 	}
 	if s.shutdownRequested {
 		return fmt.Errorf("Flight SQL server is shutting down")
 	}
 
-	bridgeLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	bridgeLn, err := listenLoopback()
 	if err != nil {
 		return fmt.Errorf("listen for internal Flight SQL query bridge: %w", err)
 	}
+	_, addr := ListenAddr(s.config.Host, s.config.Port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		_ = bridgeLn.Close()
+		return fmt.Errorf("listen for Flight SQL on %s: %w", addr, err)
+	}
 	s.bridgeLn = bridgeLn
 	s.service.baseURL = "http://" + bridgeLn.Addr().String()
+	s.flightLn = newFlightSQLConnTracker(ln)
+	s.flight.InitListener(s.flightLn)
+	s.listening = true
+	return nil
+}
+
+// listenLoopback listens on IPv4 loopback, or IPv6 loopback on a host
+// without IPv4.
+func listenLoopback() (net.Listener, error) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err == nil {
+		return ln, nil
+	}
+	if ln6, err6 := net.Listen("tcp6", "[::1]:0"); err6 == nil {
+		return ln6, nil
+	}
+	return nil, err
+}
+
+// Serve starts serving what Listen bound.
+func (s *FlightSQLServer) Serve() error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	if !s.listening {
+		return fmt.Errorf("Flight SQL server is not listening")
+	}
+	if s.serving {
+		return fmt.Errorf("Flight SQL server is already started")
+	}
+	if s.shutdownRequested {
+		return fmt.Errorf("Flight SQL server is shutting down")
+	}
+	s.serving = true
+	bridgeLn := s.bridgeLn
 	go func() {
 		if err := s.bridge.Listener(bridgeLn); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.logger.Error().Err(err).Msg("Internal Flight SQL query bridge stopped")
 		}
 	}()
-
-	_, addr := ListenAddr(s.config.Host, s.config.Port)
-	if err := s.flight.Init(addr); err != nil {
-		_ = s.bridge.Shutdown()
-		_ = bridgeLn.Close()
-		s.bridgeLn = nil
-		return fmt.Errorf("listen for Flight SQL on %s: %w", addr, err)
-	}
-	s.started = true
 	go func() {
 		err := s.flight.Serve()
 		s.serveDone <- err
@@ -188,23 +290,43 @@ func (s *FlightSQLServer) Start() error {
 	if s.config.TLSEnabled {
 		protocol = "grpcs"
 	}
-	s.logger.Info().Str("address", addr).Str("protocol", protocol).Msg("Arrow Flight SQL server started")
+	s.logger.Info().Str("address", s.flightLn.Addr().String()).Str("protocol", protocol).Msg("Arrow Flight SQL server started")
 	return nil
 }
 
+// Start is Listen then Serve.
+func (s *FlightSQLServer) Start() error {
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	return s.Serve()
+}
+
+// Shutdown stops the server within its own bound (see flightSQLShutdownGrace),
+// which it shortens to half of ctx's remaining time when that is less, so the
+// hooks and components after it still run.
 func (s *FlightSQLServer) Shutdown(ctx context.Context) error {
 	s.startMu.Lock()
 	s.shutdownRequested = true
-	started := s.started
+	listening, serving := s.listening, s.serving
 	s.startMu.Unlock()
-	if !started {
+	if !listening {
+		s.cancelBase()
 		return nil
+	}
+
+	grace, force := flightSQLShutdownGrace, flightSQLShutdownForce
+	if deadline, ok := ctx.Deadline(); ok {
+		if half := time.Until(deadline) / 2; half < grace+force {
+			force = half / 3
+			grace = half - force
+		}
 	}
 
 	s.shutdownMu.Lock()
 	if s.shutdownDone == nil {
 		s.shutdownDone = make(chan struct{})
-		go s.finishShutdown()
+		go s.finishShutdown(serving, grace, force)
 	}
 	done := s.shutdownDone
 	s.shutdownMu.Unlock()
@@ -220,10 +342,38 @@ func (s *FlightSQLServer) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (s *FlightSQLServer) finishShutdown() {
+func (s *FlightSQLServer) finishShutdown(serving bool, grace, force time.Duration) {
 	var shutdownErr error
-	s.flight.Shutdown()
-	if err := s.bridge.Shutdown(); err != nil {
+	if serving {
+		stopped := make(chan struct{})
+		go func() {
+			s.flight.Shutdown() // GracefulStop: no new RPCs, waits for the rest
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(grace):
+			// In-flight queries end with their bridge requests.
+			s.cancelBase()
+			select {
+			case <-stopped:
+			case <-time.After(force):
+				// A stream blocked on a client that stopped reading does
+				// not see a cancelled context: close its connection.
+				n := s.flightLn.closeAll()
+				s.logger.Warn().Int("connections", n).Msg("Flight SQL shutdown: closed connections still open after in-flight queries were cancelled")
+				select {
+				case <-stopped:
+				case <-time.After(force):
+					shutdownErr = errors.Join(shutdownErr, errors.New("Flight SQL server did not stop after its connections were closed"))
+				}
+			}
+		}
+	} else if s.flightLn != nil {
+		_ = s.flightLn.Close()
+	}
+	s.cancelBase()
+	if err := s.bridge.ShutdownWithTimeout(flightSQLBridgeDrain); err != nil {
 		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown internal Flight SQL query bridge: %w", err))
 	}
 	if s.bridgeLn != nil {
@@ -232,14 +382,69 @@ func (s *FlightSQLServer) finishShutdown() {
 	if transport, ok := s.service.client.Transport.(*http.Transport); ok {
 		transport.CloseIdleConnections()
 	}
-	if err := <-s.serveDone; err != nil {
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("Flight SQL server stopped: %w", err))
+	if serving && shutdownErr == nil {
+		if err := <-s.serveDone; err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("Flight SQL server stopped: %w", err))
+		}
 	}
 
 	s.shutdownMu.Lock()
 	s.shutdownErr = shutdownErr
 	close(s.shutdownDone)
 	s.shutdownMu.Unlock()
+}
+
+// flightSQLConnTracker records the connections it accepts, so shutdown can
+// close the ones a graceful stop would otherwise wait on forever.
+type flightSQLConnTracker struct {
+	net.Listener
+	mu    sync.Mutex
+	conns map[*flightSQLTrackedConn]struct{}
+}
+
+type flightSQLTrackedConn struct {
+	net.Conn
+	tracker *flightSQLConnTracker
+	once    sync.Once
+}
+
+func newFlightSQLConnTracker(ln net.Listener) *flightSQLConnTracker {
+	return &flightSQLConnTracker{Listener: ln, conns: map[*flightSQLTrackedConn]struct{}{}}
+}
+
+func (t *flightSQLConnTracker) Accept() (net.Conn, error) {
+	c, err := t.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	tc := &flightSQLTrackedConn{Conn: c, tracker: t}
+	t.mu.Lock()
+	t.conns[tc] = struct{}{}
+	t.mu.Unlock()
+	return tc, nil
+}
+
+func (c *flightSQLTrackedConn) Close() error {
+	c.once.Do(func() {
+		c.tracker.mu.Lock()
+		delete(c.tracker.conns, c)
+		c.tracker.mu.Unlock()
+	})
+	return c.Conn.Close()
+}
+
+// closeAll closes every connection still open and reports how many.
+func (t *flightSQLConnTracker) closeAll() int {
+	t.mu.Lock()
+	conns := make([]*flightSQLTrackedConn, 0, len(t.conns))
+	for c := range t.conns {
+		conns = append(conns, c)
+	}
+	t.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	return len(conns)
 }
 
 func (a *flightSQLAuth) Validate(username, password string) (string, error) {
@@ -369,13 +574,13 @@ func flightSQLResponseCompletion(ctx context.Context, response *http.Response) e
 		return status.Error(codes.Internal, "Arc query stream was truncated")
 	}
 	if value := response.Trailer.Get(arrowRowsCappedTrailer); value != "" {
-		cap, err := strconv.ParseUint(value, 10, 64)
-		if err != nil || cap == 0 {
+		rowCap, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || rowCap == 0 {
 			return status.Error(codes.Internal, "invalid Arc query row-cap trailer")
 		}
 		// Standard Flight clients observe terminal RPC errors via reader.Err();
 		// custom application metadata is not universally consumed by SQL clients.
-		return status.Errorf(codes.ResourceExhausted, "Arc query reached its governance row cap (%d); result may be incomplete", cap)
+		return status.Errorf(codes.ResourceExhausted, "Arc query reached its governance row cap (%d); result may be incomplete", rowCap)
 	}
 	return nil
 }
@@ -473,20 +678,50 @@ func (s *flightSQLService) query(ctx context.Context, path, sql, token string) (
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode query: %v", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+path, bytes.NewReader(body))
+	// The request ends with the RPC or with shutdown, whichever is first.
+	base := s.baseCtx
+	if base == nil {
+		base = context.Background()
+	}
+	reqCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(base, cancel)
+	release := func() { stop(); cancel() }
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, s.baseURL+path, bytes.NewReader(body))
 	if err != nil {
+		release()
 		return nil, status.Errorf(codes.Internal, "prepare query: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Arc-Flight-Internal-Key", s.internalKey)
+	req.Header.Set(flightSQLInternalKeyHeader, s.internalKey)
 	if token != "" {
 		req.Header.Set(fiber.HeaderAuthorization, "Bearer "+token)
 	}
+	// Who is asking, for the query registry, the audit log and forwarding.
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		host := p.Addr.String()
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		req.Header.Set(flightSQLPeerHeader, host)
+	}
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if ua := md.Get("user-agent"); len(ua) > 0 {
+			req.Header.Set(fiber.HeaderUserAgent, ua[0])
+		}
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "Arc query request failed: %v", err)
+		release()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
+		}
+		if base.Err() != nil {
+			return nil, status.Error(codes.Unavailable, "Arc is shutting down")
+		}
+		return nil, status.Error(codes.Unavailable, "Arc query request failed")
 	}
 	if resp.StatusCode != http.StatusOK {
+		defer release()
 		defer resp.Body.Close()
 		var message struct {
 			Error string `json:"error"`
@@ -497,7 +732,22 @@ func (s *flightSQLService) query(ctx context.Context, path, sql, token string) (
 		}
 		return nil, status.Error(flightCodeForHTTP(resp.StatusCode), message.Error)
 	}
+	resp.Body = &flightSQLReleasingBody{ReadCloser: resp.Body, release: release}
 	return resp, nil
+}
+
+// flightSQLReleasingBody releases a bridge request's cancellation when its
+// body is closed.
+type flightSQLReleasingBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *flightSQLReleasingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
 }
 
 func flightCodeForHTTP(code int) codes.Code {
@@ -508,6 +758,8 @@ func flightCodeForHTTP(code int) codes.Code {
 		return codes.Unauthenticated
 	case http.StatusForbidden:
 		return codes.PermissionDenied
+	case http.StatusNotFound:
+		return codes.NotFound
 	case http.StatusTooManyRequests:
 		return codes.ResourceExhausted
 	case http.StatusServiceUnavailable:
@@ -608,20 +860,47 @@ func (s *flightSQLService) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 			if !matchesFlightPattern(measurement, tableNamePattern) || !flightTableTypeMatches(cmd.GetTableTypes()) {
 				continue
 			}
+			// The schema first: a row is all five columns or none.
+			var schemaBytes []byte
+			if cmd.GetIncludeSchema() {
+				var err error
+				schemaBytes, err = s.measurementSchema(ctx, database, measurement, token)
+				if err != nil {
+					if skipFlightTableSchemaError(ctx, err) {
+						continue
+					}
+					return nil, nil, err
+				}
+			}
 			builder.Field(0).(*array.StringBuilder).Append(database)
 			builder.Field(1).(*array.StringBuilder).Append("")
 			builder.Field(2).(*array.StringBuilder).Append(measurement)
 			builder.Field(3).(*array.StringBuilder).Append("TABLE")
 			if cmd.GetIncludeSchema() {
-				schemaBytes, err := s.measurementSchema(ctx, database, measurement, token)
-				if err != nil {
-					return nil, nil, err
-				}
 				builder.Field(4).(*array.BinaryBuilder).Append(schemaBytes)
 			}
 		}
 	}
 	return flightRecordStream(ctx, tableSchema, builder)
+}
+
+// skipFlightTableSchemaError reports whether a measurement whose schema query
+// failed is left out of a GetTables listing rather than failing it: one the
+// token may not read (SHOW TABLES lists every measurement; RBAC applies per
+// measurement), or one gone or unreadable since the listing. A refusal that
+// is about the caller and not the measurement aborts the listing instead,
+// so a BI tool is never handed a quietly partial catalogue: a governance
+// limit, an expired token, shutdown, or the RPC itself ending.
+func skipFlightTableSchemaError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	switch status.Code(err) {
+	case codes.PermissionDenied, codes.NotFound, codes.Internal, codes.InvalidArgument:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *flightSQLService) GetFlightInfoTableTypes(_ context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {

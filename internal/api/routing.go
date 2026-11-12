@@ -65,6 +65,11 @@ var clientForwardingHeaders = map[string]bool{
 	"Forwarded":           true, // RFC 7239
 	"X-Arc-Forwarded-By":  true, // internal loop marker; only the peer may set it
 	"X-Arc-Original-Host": true,
+	// The Flight SQL bridge's client-address ProxyHeader and its internal
+	// key (flight_sql.go): the bridge already deletes the key, and a peer
+	// learns the client address from RemoteAddr like any forward.
+	"X-Arc-Flight-Peer":         true,
+	"X-Arc-Flight-Internal-Key": true,
 	// Client installation ids (arcli's legacy header and the generic one
 	// the SDKs send) are recorded by the node that received the request
 	// (telemetry, client_identity.go); stripped here so a forwarded

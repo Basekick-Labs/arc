@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/gofiber/fiber/v2"
 	"io"
 	"net/http"
 	"os"
@@ -2998,6 +2999,9 @@ func main() {
 	// Initialize Audit Logging (Enterprise feature - requires valid license)
 	// Must be registered before API routes so the middleware captures all requests
 	var auditLogger *audit.Logger
+	// Middleware the Flight SQL bridge runs after auth, as the main app does
+	// (internal/api/flight_sql.go): the audit middleware when audit is on.
+	var flightSQLMiddleware []fiber.Handler
 	if cfg.AuditLog.Enabled {
 		if licenseClient == nil {
 			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
@@ -3034,8 +3038,11 @@ func main() {
 						return nil
 					}, shutdown.PriorityCompaction)
 
-					// Register audit middleware BEFORE API routes
-					server.GetApp().Use(audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads))
+					// Register audit middleware BEFORE API routes. The Flight SQL
+					// bridge gets the same middleware (flightSQLMiddleware).
+					auditMiddleware := audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads)
+					server.GetApp().Use(auditMiddleware)
+					flightSQLMiddleware = append(flightSQLMiddleware, auditMiddleware)
 
 					log.Info().
 						Int("retention_days", cfg.AuditLog.RetentionDays).
@@ -5559,9 +5566,16 @@ func main() {
 			TLSEnabled:  cfg.Server.TLSEnabled,
 			TLSCertFile: cfg.Server.TLSCertFile,
 			TLSKeyFile:  cfg.Server.TLSKeyFile,
+			Middleware:  flightSQLMiddleware,
 		}, logger.Get("flight-sql"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Flight SQL server")
+		}
+		// Bound now, served once the HTTP server is up: a port conflict
+		// exits before the node reports ready. Like an HTTP start failure,
+		// the exit skips the shutdown hooks.
+		if err := flightSQLServer.Listen(); err != nil {
+			log.Fatal().Err(err).Msg("Failed to start Flight SQL server")
 		}
 		shutdownCoordinator.RegisterHook("flight-sql-server", func(ctx context.Context) error {
 			return flightSQLServer.Shutdown(ctx)
@@ -5603,7 +5617,7 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
 	}
 	if flightSQLServer != nil {
-		if err := flightSQLServer.Start(); err != nil {
+		if err := flightSQLServer.Serve(); err != nil {
 			log.Fatal().Err(err).Msg("Failed to start Flight SQL server")
 		}
 	}

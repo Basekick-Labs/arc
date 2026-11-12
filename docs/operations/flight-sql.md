@@ -22,7 +22,38 @@ supported.
 Flight SQL metadata maps Arc databases to catalogs, the empty schema to each
 catalog, and measurements to tables. Table metadata can include the Arrow
 schema. A catalog-scoped metadata request uses Arc's normal database and
-measurement permission checks.
+measurement permission checks; a measurement the token cannot read is left
+out of a table listing that includes schemas.
+
+Metadata calls run ordinary queries: listing tables runs one per database,
+and including schemas adds one per measurement. Each counts against the
+token's governance rate limits and quotas like any other query, so a client
+that browses a large catalogue can be throttled, and the listing then fails
+with `ResourceExhausted` rather than returning part of it.
+
+## What is supported
+
+Statement queries (`SELECT`, `SHOW DATABASES`, `SHOW TABLES`) and the catalog,
+schema, table and table-type metadata calls. Prepared statements, SqlInfo,
+transactions and writes are not implemented. Clients that require prepared
+statements, which includes the Arrow Flight SQL JDBC driver and the BI tools
+built on it, are not expected to work yet; the ADBC drivers are the tested
+clients.
+
+## Logging, audit and shutdown
+
+Flight queries go through the same request logging and, when audit logging is
+on, the same audit records as HTTP queries, with the Flight client's address
+and User-Agent. In the audit log they appear under the HTTP query paths they
+run on (`/api/v1/query`, `/api/v1/query/arrow`). A connection refused by
+Flight authentication is not audited, as a refused HTTP request is not. The
+HTTP request metrics also count Flight queries.
+
+On shutdown, in-flight Flight queries get 5 seconds to finish, are then
+cancelled, and connections still open 2 seconds later are closed, so a client
+that stops reading a result cannot hold shutdown up. The listener sets no
+limit on concurrent streams per connection; authentication is what bounds
+who can open them.
 
 For Python, install `adbc-driver-flightsql`, `adbc-driver-manager` and
 `pyarrow`, then connect with a bearer token:
