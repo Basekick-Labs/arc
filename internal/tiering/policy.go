@@ -245,8 +245,11 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 		policy.HotMaxAgeDays,
 	).Scan(&id, &createdAt, &updatedAt)
 	if err != nil {
-		// Whether the row changed is unknown: drop the cached entry so the
-		// next Get reads the table.
+		// An error does not prove the row was not written: when ctx ends
+		// after the upsert stepped, the driver still returns ctx.Err(), and
+		// resetting the statement commits it. Drop the cached entry so the
+		// next Get reads the table. (A failed read there makes IsHotOnly
+		// answer false, as for any uncached database.)
 		delete(s.cache, policy.Database)
 		s.gen++
 		return fmt.Errorf("failed to set policy: %w", err)

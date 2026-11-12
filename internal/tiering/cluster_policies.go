@@ -96,11 +96,19 @@ func (s *PolicyStore) setInCluster(ctx context.Context, src ClusterPolicySource,
 	}
 	// Report the stored row: the cluster assigns the id and keeps created_at,
 	// and the caller's policy carried zeros (#1619). src.Set returns once this
-	// node sees the policy, so the read finds it. Only a report: a miss (a
+	// node sees the policy, so the read finds it. The whole row is copied, so
+	// a second write that landed in between is reported as one consistent row
+	// rather than mixed with this request's values. Only a report: a miss (a
 	// Delete landed meanwhile) leaves the fields as they were, and the write
 	// still succeeded.
 	if stored, ok := src.Get(policy.Database); ok && stored != nil {
 		policy.ID = stored.ID
+		policy.HotOnly = stored.HotOnly
+		policy.HotMaxAgeDays = nil
+		if stored.HotMaxAgeDays != nil {
+			days := *stored.HotMaxAgeDays
+			policy.HotMaxAgeDays = &days
+		}
 		policy.CreatedAt = stored.CreatedAt
 		policy.UpdatedAt = stored.UpdatedAt
 	}

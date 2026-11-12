@@ -113,13 +113,17 @@ func TestPolicyStore_SetInClusterReportsTheStoredRow(t *testing.T) {
 
 	created := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
 	updated := created.Add(time.Hour)
-	store.SetClusterSource(storedRowSource{row: &DatabasePolicy{ID: 7, Database: "db1", CreatedAt: created, UpdatedAt: updated}})
-	policy := &DatabasePolicy{Database: "db1", HotOnly: true}
+	// The stored row is a second write that landed after this one: the
+	// report is that row, not this request's values with its timestamps.
+	days := 9
+	store.SetClusterSource(storedRowSource{row: &DatabasePolicy{ID: 7, Database: "db1", HotOnly: true, HotMaxAgeDays: &days, CreatedAt: created, UpdatedAt: updated}})
+	policy := &DatabasePolicy{Database: "db1"}
 	if err := store.Set(ctx, policy); err != nil {
 		t.Fatal(err)
 	}
-	if policy.ID != 7 || !policy.CreatedAt.Equal(created) || !policy.UpdatedAt.Equal(updated) || !policy.HotOnly {
-		t.Fatalf("Set on a cluster = %+v, want id 7 with the cluster's timestamps", policy)
+	if policy.ID != 7 || !policy.CreatedAt.Equal(created) || !policy.UpdatedAt.Equal(updated) || !policy.HotOnly ||
+		policy.HotMaxAgeDays == nil || *policy.HotMaxAgeDays != 9 || policy.HotMaxAgeDays == &days {
+		t.Fatalf("Set on a cluster = %+v, want the cluster's row (id 7, hot_only, 9 days, its timestamps), copied", policy)
 	}
 
 	store.SetClusterSource(storedRowSource{})

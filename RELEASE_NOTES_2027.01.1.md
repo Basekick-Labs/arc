@@ -91,7 +91,7 @@ reason was only in the subscription's `error_message`. They now answer
 The text names at most the dialled host and port, never the broker URL or its
 credentials. The subscription is left with status `error` and is not running,
 also after a restart, which stopped the old connection first; stop still
-answers 409. Every other start failure is still a 500.
+answers 409. Other start failures answer as before (404, 409 or 500).
 
 The stored `error_message` for these failures reads the same, where it read
 `connection failed: ...` or `connection timeout after N seconds`; this
@@ -101,7 +101,13 @@ A start that timed out also left the MQTT client connecting in the
 background. A broker that answered late (paho retries once with MQTT 3.1, with
 a fresh handshake deadline) then had a client subscribed and ingesting for a
 subscription stored as `error`, which stop could not reach. A failed connect
-now disconnects the client.
+now disconnects the client, and a connection that still completes is refused
+without subscribing and without setting `arc_mqtt_connected` to 1. A
+reconnect after writes resume (a suspended subscription) that fails is
+disconnected the same way.
+
+The "Connecting to MQTT broker" log line no longer carries the broker URL's
+password or query values: they read `REDACTED`.
 
 ## Fix: a tiering policy PUT reports the stored row ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
 
