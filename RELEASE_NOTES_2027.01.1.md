@@ -3950,13 +3950,14 @@ In a cluster, a rotate is checked against the node's own copy of the token
 before it is proposed, and again after it has been applied: if the token was
 revoked or deleted on another node just before, the rotate answers `409` or
 `404` instead of a `new_token` that never authenticates. On the node that leads
-the cluster, and on any node once cluster policies are enabled, that second
-check sees every revoke and delete ordered before the rotate. On a follower
-before cluster policies are enabled, one that has not yet applied a revoke or
-delete made elsewhere, even one already acknowledged, can still answer `200`
-with a `new_token` that never authenticates, for a revoke, or for a delete,
-where it would otherwise answer `404`. The revoked or deleted token stays
-unusable either way.
+the cluster, that second check sees every revoke and delete ordered before the
+rotate. On a follower it does too once cluster policies are enabled, as long as
+the follower's wait to apply the rotate itself does not time out. A follower
+that has not yet applied a revoke or delete made elsewhere, even one already
+acknowledged, can still answer `200` with a `new_token` that never
+authenticates, for a revoke, or for a delete, where it would otherwise answer
+`404`: before cluster policies are enabled, or when that wait times out. The
+revoked or deleted token stays unusable either way.
 
 Duplicate-name and unknown-ID parts contributed by
 [@officialasishkumar](https://github.com/officialasishkumar) in

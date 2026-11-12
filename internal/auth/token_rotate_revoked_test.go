@@ -117,3 +117,30 @@ func TestClusterRotateReReadFailureKeepsTheRotate(t *testing.T) {
 		t.Errorf("no Warn for the failed re-read; logs:\n%s", out)
 	}
 }
+
+// TestWriteRotatedTokenGuardsRevoked pins the standalone rotate's write on its
+// own: RotateToken's pre-check refuses a revoked token before this write is
+// reached, so only a revoke landing while the value is hashed gets here, and
+// the write itself must refuse it.
+func TestWriteRotatedTokenGuardsRevoked(t *testing.T) {
+	am := newTokenWriteTestManager(t)
+	ctx := context.Background()
+	if _, err := am.CreateToken(ctx, "svc", "", "read", nil); err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	id := tokenIDByName(t, am, "svc")
+	if err := am.RevokeToken(ctx, id); err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+	hash, prefix := tokenHashOf(t, am, id)
+
+	if err := am.writeRotatedToken(id, "new-hash", "new-prefix"); !errors.Is(err, ErrTokenRevoked) {
+		t.Errorf("write to a revoked token: %v, want ErrTokenRevoked", err)
+	}
+	if h, p := tokenHashOf(t, am, id); h != hash || p != prefix {
+		t.Error("the write replaced a revoked token's hash or prefix")
+	}
+	if err := am.writeRotatedToken(4242, "new-hash", "new-prefix"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("write to an unknown ID: %v, want ErrNotFound", err)
+	}
+}

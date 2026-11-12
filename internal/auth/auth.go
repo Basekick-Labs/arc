@@ -1521,28 +1521,38 @@ func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error
 	}
 	_ = ctx
 
-	// enabled = 1: a revoked token is not rotated (#1625). No route
-	// re-enables one, so its new secret could never authenticate.
-	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ? AND enabled = 1", hash, prefix, id)
-	if err != nil {
+	if err := am.writeRotatedToken(id, hash, prefix); err != nil {
 		return "", err
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return "", err
-	}
-	if rowsAffected == 0 {
-		// No row: the token was deleted or revoked after the check above.
-		if _, err := am.requireLocalToken(id); err != nil {
-			return "", err
-		}
-		return "", errTokenRevoked()
 	}
 
 	am.InvalidateCache()
 	am.logger.Info().Int64("token_id", id).Msg("Rotated API token")
 	return token, nil
+}
+
+// writeRotatedToken is the standalone rotate's write. enabled = 1 in the same
+// statement is the atomic guard: RotateToken's pre-check runs before the new
+// value is hashed, and a revoke that lands in between must not get its hash
+// replaced and a dead secret returned (#1625). No route re-enables a token,
+// so a rotated revoked token could never authenticate. On no row changed it
+// returns errTokenNotFound for a deleted token and errTokenRevoked for a
+// revoked one.
+func (am *AuthManager) writeRotatedToken(id int64, hash, prefix string) error {
+	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ? AND enabled = 1", hash, prefix, id)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		if _, err := am.requireLocalToken(id); err != nil {
+			return err
+		}
+		return errTokenRevoked()
+	}
+	return nil
 }
 
 // confirmClusterRotate re-reads the local row after a committed cluster rotate,
