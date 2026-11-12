@@ -13,6 +13,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/rs/zerolog"
 )
 
 // Governance policies in a cluster (#1627).
@@ -266,11 +267,18 @@ func (m *Manager) MirrorClusterPolicies(ctx context.Context, src ClusterViewSour
 	if owned {
 		m.cluster.owned.Store(true)
 	}
-	if dormant > 0 {
-		m.logger.Warn().Int("dormant", dormant).
-			Msg("Governance policies this node held that the cluster did not adopt were moved to governance_policies_dormant; they are no longer enforced")
-	}
+	LogDormant(m.logger, dormant)
 	return err
+}
+
+// LogDormant reports, in one line, the tokens whose policies of this node's
+// own the first mirror pass kept in governance_policies_dormant.
+func LogDormant(logger zerolog.Logger, tokens []int64) {
+	if len(tokens) == 0 {
+		return
+	}
+	logger.Warn().Ints64("token_ids", tokens).
+		Msg("Governance policies this node held that the cluster did not adopt were moved to governance_policies_dormant; they are not enforced")
 }
 
 // EnsureSchema creates the governance tables in db if they are missing.
@@ -303,42 +311,47 @@ const governanceDormantTable = `CREATE TABLE IF NOT EXISTS governance_policies_d
 
 // MirrorTable makes db's governance table equal the cluster's policies once
 // adopted, and marks it as the cluster's backup copy; owned reports that it
-// is. It writes nothing when the table already matches. Also run on a node
-// where governance does not run (#1627), so every node's table is the
+// is. It writes nothing when the table already matches. On the first pass,
+// before the table is marked, this node's own rows that the cluster did not
+// adopt as they are are copied to governance_policies_dormant (never
+// enforced); dormant names their tokens. Later passes rewrite the table
+// without that copy: it holds only the cluster's rows by then. (Retention
+// sorts rows into its dormant tables on every pass instead.) Also run on a
+// node where governance does not run (#1627), so every node's table is the
 // cluster's: one turned back on later never enforces policies the cluster
 // dropped.
-func MirrorTable(ctx context.Context, db *sql.DB, src ClusterViewSource) (owned bool, dormant int, err error) {
+func MirrorTable(ctx context.Context, db *sql.DB, src ClusterViewSource) (owned bool, dormant []int64, err error) {
 	seeded, entries := src.GovernanceView()
 	if !seeded {
-		return false, 0, nil
+		return false, nil, nil
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].TokenID < entries[j].TokenID })
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, 0, fmt.Errorf("mirror governance policies: %w", err)
+		return false, nil, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	same, err := mirrorMatches(ctx, tx, entries)
 	if err != nil {
-		return false, 0, fmt.Errorf("mirror governance policies: %w", err)
+		return false, nil, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	if same {
-		return true, 0, nil
+		return true, nil, nil
 	}
 	var marked int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM governance_cluster_state WHERE name = 'owned'`).Scan(&marked); err != nil {
-		return false, 0, fmt.Errorf("mirror governance policies: %w", err)
+		return false, nil, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	if marked == 0 {
 		// The first pass on this node: its own rows that the cluster did not
 		// adopt as they are are kept dormant, never enforced, before the
 		// table becomes the cluster's.
 		if dormant, err = keepDormant(ctx, tx, entries); err != nil {
-			return false, 0, fmt.Errorf("mirror governance policies: %w", err)
+			return false, nil, fmt.Errorf("mirror governance policies: %w", err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM governance_policies`); err != nil {
-		return false, 0, fmt.Errorf("mirror governance policies: %w", err)
+		return false, nil, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	for _, e := range entries {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO governance_policies (id, token_id, rate_limit_per_minute, rate_limit_per_hour,
@@ -347,21 +360,22 @@ func MirrorTable(ctx context.Context, db *sql.DB, src ClusterViewSource) (owned 
 			e.ID, e.TokenID, e.RateLimitPerMinute, e.RateLimitPerHour, e.MaxQueriesPerHour, e.MaxQueriesPerDay,
 			e.MaxRowsPerQuery, e.MaxScanDurationSec,
 			e.CreatedAt.UTC().Format(sqliteTimestamp), e.UpdatedAt.UTC().Format(sqliteTimestamp)); err != nil {
-			return false, 0, fmt.Errorf("mirror governance policies: %w", err)
+			return false, nil, fmt.Errorf("mirror governance policies: %w", err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO governance_cluster_state (name, value) VALUES ('owned', '1')`); err != nil {
-		return false, 0, fmt.Errorf("mirror governance policies: %w", err)
+		return false, nil, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return false, 0, fmt.Errorf("mirror governance policies: %w", err)
+		return false, nil, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	return true, dormant, nil
 }
 
 // keepDormant copies the rows of governance_policies whose token the cluster
-// state does not hold with the same limits into governance_policies_dormant.
-func keepDormant(ctx context.Context, tx *sql.Tx, entries []raft.GovernanceViewEntry) (int, error) {
+// state does not hold with the same limits into governance_policies_dormant,
+// and returns their tokens.
+func keepDormant(ctx context.Context, tx *sql.Tx, entries []raft.GovernanceViewEntry) ([]int64, error) {
 	adopted := make(map[int64]raft.GovernancePolicyEntry, len(entries))
 	for _, e := range entries {
 		adopted[e.TokenID] = e.GovernancePolicyEntry
@@ -370,36 +384,37 @@ func keepDormant(ctx context.Context, tx *sql.Tx, entries []raft.GovernanceViewE
 		COALESCE(max_queries_per_hour, 0), COALESCE(max_queries_per_day, 0), COALESCE(max_rows_per_query, 0),
 		COALESCE(max_scan_duration_sec, 0) FROM governance_policies`)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	var keep []int64
+	var keep, tokens []int64
 	for rows.Next() {
 		var p Policy
 		if err := rows.Scan(&p.ID, &p.TokenID, &p.RateLimitPerMinute, &p.RateLimitPerHour, &p.MaxQueriesPerHour,
 			&p.MaxQueriesPerDay, &p.MaxRowsPerQuery, &p.MaxScanDurationSec); err != nil {
 			rows.Close()
-			return 0, err
+			return nil, err
 		}
 		e, ok := adopted[p.TokenID]
 		if !ok || e.RateLimitPerMinute != p.RateLimitPerMinute || e.RateLimitPerHour != p.RateLimitPerHour ||
 			e.MaxQueriesPerHour != p.MaxQueriesPerHour || e.MaxQueriesPerDay != p.MaxQueriesPerDay ||
 			e.MaxRowsPerQuery != p.MaxRowsPerQuery || e.MaxScanDurationSec != p.MaxScanDurationSec {
 			keep = append(keep, p.ID)
+			tokens = append(tokens, p.TokenID)
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	for _, id := range keep {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO governance_policies_dormant (policy_id, token_id, rate_limit_per_minute,
 			rate_limit_per_hour, max_queries_per_hour, max_queries_per_day, max_rows_per_query, max_scan_duration_sec, created_at, updated_at)
 			SELECT id, token_id, rate_limit_per_minute, rate_limit_per_hour, max_queries_per_hour, max_queries_per_day,
 			max_rows_per_query, max_scan_duration_sec, created_at, updated_at FROM governance_policies WHERE id = ?`, id); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
-	return len(keep), nil
+	return tokens, nil
 }
 
 // mirrorMatches reports whether the table already holds exactly entries

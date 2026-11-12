@@ -176,7 +176,7 @@ func TestGovernanceTableListerAndMirror(t *testing.T) {
 		t.Fatalf("no database: %s %v", raw, err)
 	}
 
-	mirror := GovernanceTableMirror(nil, path, entriesView{{GovernancePolicyEntry: raft.GovernancePolicyEntry{ID: 9, TokenID: 3, MaxRowsPerQuery: 33}, TokenHash: "h"}})
+	mirror := GovernanceTableMirror(nil, path, entriesView{{GovernancePolicyEntry: raft.GovernancePolicyEntry{ID: 9, TokenID: 3, MaxRowsPerQuery: 33}, TokenHash: "h"}}, zerolog.Nop())
 	if err := mirror(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,26 @@ func TestGovernanceTableListerAndMirror(t *testing.T) {
 	if owned != 1 {
 		t.Fatal("the mirrored table is not marked as the cluster's")
 	}
-	if err := GovernanceTableMirror(nil, path, stubGovernanceView{})(context.Background()); err != nil {
+	// This node's own rows the cluster did not adopt as they are are kept,
+	// dormant: token 3 (the cluster holds it with other limits) and token 4.
+	type dormantRow struct{ token, rows int64 }
+	var dormant []dormantRow
+	drows, err := db.Query(`SELECT token_id, max_rows_per_query FROM governance_policies_dormant ORDER BY token_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for drows.Next() {
+		var d dormantRow
+		if err := drows.Scan(&d.token, &d.rows); err != nil {
+			t.Fatal(err)
+		}
+		dormant = append(dormant, d)
+	}
+	drows.Close()
+	if len(dormant) != 2 || dormant[0] != (dormantRow{3, 30}) || dormant[1] != (dormantRow{4, 40}) {
+		t.Fatalf("dormant rows %+v, want token 3 at 30 and token 4 at 40", dormant)
+	}
+	if err := GovernanceTableMirror(nil, path, stubGovernanceView{}, zerolog.Nop())(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }

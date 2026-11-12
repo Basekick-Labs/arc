@@ -4096,7 +4096,7 @@ func main() {
 			governanceDBPath = "./data/arc.db"
 		}
 		clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindGovernance, api.GovernanceTableLister(authManager, governanceDBPath))
-		clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindGovernance, api.GovernanceTableMirror(authManager, governanceDBPath, governanceViewSource))
+		clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindGovernance, api.GovernanceTableMirror(authManager, governanceDBPath, governanceViewSource, logger.Get("governance")))
 	}
 
 	// Initialize Query Management (Enterprise feature - requires valid license)

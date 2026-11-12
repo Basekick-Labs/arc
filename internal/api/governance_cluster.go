@@ -10,7 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/governance"
-	"github.com/rs/zerolog/log"
+	"github.com/rs/zerolog"
 )
 
 // GovernanceTableLister answers the cluster's adoption of governance policies
@@ -50,7 +50,8 @@ func GovernanceTableLister(authManager *auth.AuthManager, dbPath string) cluster
 // adoption choice discarded. The database is opened for each pass (a pass
 // with nothing to change writes nothing); a node with no database file is
 // left without one.
-func GovernanceTableMirror(authManager *auth.AuthManager, dbPath string, src governance.ClusterViewSource) func(ctx context.Context) error {
+func GovernanceTableMirror(authManager *auth.AuthManager, dbPath string, src governance.ClusterViewSource, logger zerolog.Logger) func(ctx context.Context) error {
+	logger = logger.With().Str("component", "governance-mirror").Logger()
 	return func(ctx context.Context) error {
 		if seeded, _ := src.GovernanceView(); !seeded {
 			return nil
@@ -73,10 +74,7 @@ func GovernanceTableMirror(authManager *auth.AuthManager, dbPath string, src gov
 			return err
 		}
 		_, dormant, err := governance.MirrorTable(ctx, db, src)
-		if dormant > 0 {
-			log.Warn().Int("dormant", dormant).
-				Msg("Governance policies this node held that the cluster did not adopt were moved to governance_policies_dormant; they are not enforced")
-		}
+		governance.LogDormant(logger, dormant)
 		return err
 	}
 }

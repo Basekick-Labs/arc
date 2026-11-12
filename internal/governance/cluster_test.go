@@ -1,10 +1,12 @@
 package governance
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -373,8 +375,13 @@ func TestMirrorWritesOnlyChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.seed(raft.GovernancePolicyEntry{TokenID: a, MaxRowsPerQuery: 1}, raft.GovernancePolicyEntry{TokenID: b, MaxScanDurationSec: 4})
+	var logged bytes.Buffer
+	m.logger = zerolog.New(&logged)
 	if err := m.MirrorClusterPolicies(context.Background(), g.f); err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(logged.String(), `"token_ids":[99]`) {
+		t.Fatalf("the dormant policies' tokens are not logged: %s", logged.String())
 	}
 	rows, err := ReadLocalRows(context.Background(), db)
 	if err != nil || len(rows.Policies) != 2 || rows.Policies[0].TokenID != a || rows.Policies[1].MaxScanDurationSec != 4 {
