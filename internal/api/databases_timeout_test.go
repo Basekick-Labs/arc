@@ -133,7 +133,10 @@ func TestDatabasesHandlerDeleteReportsMarkerFailure(t *testing.T) {
 					apiBackend = &databaseTimeoutBatchBackend{wrapped}
 				}
 				handler := NewDatabasesHandler(apiBackend, &config.DeleteConfig{Enabled: true}, nil, zerolog.Nop())
-				handler.requestTimeout = 10 * time.Millisecond
+				// Only the marker delete waits for the deadline, so the timeout
+				// must leave room for listing and deleting the data files on a
+				// loaded CI runner (10ms failed the listing under -race).
+				handler.requestTimeout = 500 * time.Millisecond
 				app := fiber.New()
 				handler.RegisterRoutes(app)
 				resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/testdb?confirm=true", nil), testRequestTimeoutMS)
