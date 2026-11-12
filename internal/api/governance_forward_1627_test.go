@@ -3,7 +3,6 @@
 package api
 
 import (
-	"context"
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
@@ -68,5 +67,4 @@ func TestForwardedQueriesAreGovernedOnce(t *testing.T) {
 		require.Less(t, status, 500, rt.path+": "+body)
 		require.Equal(t, i+1, queries(), "a query answered here was not governed once: "+rt.path)
 	}
-	_ = context.Background
 }

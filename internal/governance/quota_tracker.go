@@ -133,7 +133,6 @@ func (q *quotaTracker) GetUsage() (hourUsed, dayUsed int, hourReset, dayReset ti
 	return q.queriesThisHour, q.queriesThisDay, q.hourResetAt, q.dayResetAt
 }
 
-// UpdateLimits changes the quota limits. Takes effect immediately.
 // applyLimits makes these the tracker's limits, if they are not already.
 // Called with Manager.admitMu held. The counts are kept.
 func (q *quotaTracker) applyLimits(maxPerHour, maxPerDay int) {
@@ -143,6 +142,7 @@ func (q *quotaTracker) applyLimits(maxPerHour, maxPerDay int) {
 	}
 }
 
+// UpdateLimits changes the quota limits. Takes effect immediately.
 func (q *quotaTracker) UpdateLimits(maxPerHour, maxPerDay int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()

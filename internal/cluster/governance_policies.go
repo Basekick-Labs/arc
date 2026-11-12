@@ -51,6 +51,16 @@ func (c *Coordinator) UseGovernance(m *governance.Manager) {
 	})
 }
 
+// GovernanceViewSource returns the cluster state governance policies are read
+// from, when this node has one (a coordinator without Raft has none).
+func (c *Coordinator) GovernanceViewSource() (governance.ClusterViewSource, bool) {
+	fsm := c.fsmOrNil()
+	if fsm == nil {
+		return nil, false
+	}
+	return fsm, true
+}
+
 // governancePolicySource is the cluster state governance reads and writes.
 type governancePolicySource struct{ c *Coordinator }
 
@@ -162,6 +172,9 @@ func limitsOf(r governance.LocalRow) governanceLimits {
 	return governanceLimits{r.RateLimitPerMinute, r.RateLimitPerHour, r.MaxQueriesPerHour, r.MaxQueriesPerDay, r.MaxRowsPerQuery, r.MaxScanDurationSec}
 }
 
+// adoptChoiceHint names the route an admin chooses one node's policies with.
+const adoptChoiceHint = `POST /api/v1/cluster/policies/adopt with "kind": "governance"`
+
 // planGovernanceSeed decides a governance seed from every node's rows, or why
 // none can be made yet. clusterToken returns the fingerprint of cluster token
 // id's stored hash. warnings are worth logging when the seed is applied.
@@ -175,7 +188,7 @@ func limitsOf(r governance.LocalRow) governanceLimits {
 // cluster's at that ID (a pre-cluster local token), a cluster token not yet
 // on the node. Two nodes defining one token differently wait for an admin's
 // choice of one node's policies. IDs are kept or renumbered as retention's.
-func planGovernanceSeed(perNode map[string]governance.LocalRows, choice *raft.PolicyAdoptChoice, clusterToken func(id int64) (string, bool)) (seed raft.SeedPoliciesPayload, why string, warnings []string) {
+func planGovernanceSeed(perNode map[string]governance.LocalRows, choice *raft.PolicyAdoptChoice, clusterToken func(id int64) (string, time.Time, bool)) (seed raft.SeedPoliciesPayload, why string, warnings []string) {
 	var maxID int64
 	issued := make(map[string]int64, len(perNode))
 	reported := map[int64]string{} // token -> a node that holds it
@@ -211,23 +224,29 @@ func planGovernanceSeed(perNode map[string]governance.LocalRows, choice *raft.Po
 	byToken := map[int64]*acc{}
 	for _, node := range considered {
 		for _, r := range perNode[node].Policies {
-			fp, inCluster := clusterToken(r.TokenID)
+			fp, created, inCluster := clusterToken(r.TokenID)
 			switch r.Token {
 			case governance.TokenPresent:
 				if !inCluster || !r.RaftMaterialised || r.TokenFP != fp {
-					return seed, fmt.Sprintf("node %s holds a governance policy for token %d, which is not the cluster's token %d there (a token created on that node before it joined the cluster); re-issue the token through the cluster, or delete that policy on %s", node, r.TokenID, r.TokenID, node), nil
+					return seed, fmt.Sprintf("node %s holds a governance policy for token %d, which is not the cluster's token %d there (a token created on that node before it joined the cluster); re-issue the token through the cluster, delete that policy on %s, or choose another node's policies (%s)", node, r.TokenID, r.TokenID, node, adoptChoiceHint), nil
+				}
+				// A policy older than the cluster token was set for an
+				// earlier token at that ID (a local token since deleted,
+				// whose policy stayed): never the cluster token's.
+				if r.CreatedAt.IsZero() || r.CreatedAt.Before(created.Add(-policyClockSkew)) {
+					return seed, fmt.Sprintf("node %s holds a governance policy for token %d created before cluster token %d existed (it was set for an earlier token at that ID); delete that policy on %s, or choose another node's policies (%s)", node, r.TokenID, r.TokenID, node, adoptChoiceHint), nil
 				}
 			case governance.TokenAbsent:
 				if inCluster {
-					return seed, fmt.Sprintf("cluster token %d is not on node %s yet; retrying", r.TokenID, node), nil
+					return seed, fmt.Sprintf("cluster token %d is not on node %s yet; retrying (if it never arrives there, choose another node's policies: %s)", r.TokenID, node, adoptChoiceHint), nil
 				}
 				if other, ok := reported[r.TokenID]; ok {
-					return seed, fmt.Sprintf("node %s holds a governance policy for token %d, which only node %s has and the cluster does not; re-issue the token through the cluster, or delete those policies", node, r.TokenID, other), nil
+					return seed, fmt.Sprintf("node %s holds a governance policy for token %d, which only node %s has and the cluster does not; re-issue the token through the cluster, delete those policies, or choose another node's policies (%s)", node, r.TokenID, other, adoptChoiceHint), nil
 				}
 				warnings = append(warnings, fmt.Sprintf("dropped node %s's governance policy %d: its token %d no longer exists", node, r.ID, r.TokenID))
 				continue
 			default:
-				return seed, fmt.Sprintf("node %s cannot tell whether token %d exists (it has no token table)", node, r.TokenID), nil
+				return seed, fmt.Sprintf("node %s cannot tell whether token %d exists (it has no token table); choose another node's policies (%s)", node, r.TokenID, adoptChoiceHint), nil
 			}
 			if err := validLimits(r); err != nil {
 				return seed, fmt.Sprintf("governance policy %d on %s cannot be adopted (%v); fix it on that node first", r.ID, node, err), nil
@@ -336,18 +355,24 @@ func differingDefaults(perNode map[string]governance.LocalRows) []string {
 	return out
 }
 
-// clusterTokenFP is planGovernanceSeed's view of the cluster tokens.
-func (c *Coordinator) clusterTokenFP(id int64) (string, bool) {
+// clusterTokenFP is planGovernanceSeed's view of the cluster tokens: the
+// fingerprint of cluster token id's stored hash, and when it was created.
+func (c *Coordinator) clusterTokenFP(id int64) (string, time.Time, bool) {
 	fsm := c.fsmOrNil()
 	if fsm == nil {
-		return "", false
+		return "", time.Time{}, false
 	}
-	hash, ok := fsm.GovernanceTokenHash(id)
+	hash, created, ok := fsm.GovernanceToken(id)
 	if !ok {
-		return "", false
+		return "", time.Time{}, false
 	}
-	return auth.TokenFingerprint(hash), true
+	return auth.TokenFingerprint(hash), created, true
 }
+
+// policyClockSkew is how far a policy's created_at, on its node's clock, may
+// precede its cluster token's creation, on the proposer's clock, and still be
+// taken as that token's.
+const policyClockSkew = time.Minute
 
 // mergeAnswers is mergePolicyAnswers with the cluster state the governance
 // merge needs; logged says to log the merge's warnings (the collect's merge,

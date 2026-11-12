@@ -41,3 +41,37 @@ func GovernanceTableLister(authManager *auth.AuthManager, dbPath string) cluster
 		return json.Marshal(rows)
 	}
 }
+
+// GovernanceTableMirror keeps the governance table of a node where governance
+// does not run equal to the cluster's policies once adopted, and marks it as
+// the cluster's backup copy (#1627): if governance is turned on there later,
+// that node never enforces policies the cluster dropped or an admin's
+// adoption choice discarded. The database is opened for each pass (a pass
+// with nothing to change writes nothing); a node with no database file is
+// left without one.
+func GovernanceTableMirror(authManager *auth.AuthManager, dbPath string, src governance.ClusterViewSource) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		if seeded, _ := src.GovernanceView(); !seeded {
+			return nil
+		}
+		db := (*sql.DB)(nil)
+		if authManager != nil && authManager.SharesDBPath(dbPath) {
+			db = authManager.GetDB()
+		} else {
+			if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+				return nil // no database, no policies to be enforced later
+			}
+			opened, err := sql.Open("sqlite3", dbPath+dsnSep(dbPath)+"_busy_timeout=5000")
+			if err != nil {
+				return err
+			}
+			defer opened.Close()
+			db = opened
+		}
+		if err := governance.EnsureSchema(db); err != nil {
+			return err
+		}
+		_, err := governance.MirrorTable(ctx, db, src)
+		return err
+	}
+}

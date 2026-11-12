@@ -185,8 +185,8 @@ func (m *Manager) Stop() error {
 	return nil
 }
 
-func (m *Manager) initSchema() error {
-	_, err := m.db.Exec(`
+// governancePoliciesTable is the policies table, with its index.
+const governancePoliciesTable = `
 		CREATE TABLE IF NOT EXISTS governance_policies (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			token_id INTEGER NOT NULL UNIQUE,
@@ -200,12 +200,10 @@ func (m *Manager) initSchema() error {
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE INDEX IF NOT EXISTS idx_governance_token_id ON governance_policies(token_id);
-	`)
-	if err != nil {
-		return err
-	}
-	_, err = m.db.Exec(governanceClusterStateTable)
-	return err
+	`
+
+func (m *Manager) initSchema() error {
+	return EnsureSchema(m.db)
 }
 
 func (m *Manager) loadPolicies() error {
@@ -657,6 +655,10 @@ func (m *Manager) GetTokenUsage(tokenID int64) *TokenUsage {
 }
 
 // GetTokenUsageFor is GetTokenUsage for the token with fingerprint tokenFP.
+// Once the cluster owns the policies, a changed limit reaches the token's
+// counters at its next query on this node, and the remaining counts until
+// then are against the limit last applied; a deleted policy's counters are
+// kept (its token falls back to the defaults, counted on the same counters).
 func (m *Manager) GetTokenUsageFor(tokenID int64, tokenFP string) *TokenUsage {
 	usage := &TokenUsage{TokenID: tokenID}
 

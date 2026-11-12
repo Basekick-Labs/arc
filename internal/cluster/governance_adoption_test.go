@@ -18,15 +18,18 @@ import (
 // token tok (hash "h<tok>").
 func grow(id, tok int64, rows int) governance.LocalRow {
 	return governance.LocalRow{ID: id, TokenID: tok, MaxRowsPerQuery: rows, Token: governance.TokenPresent,
-		RaftMaterialised: true, TokenFP: auth.TokenFingerprint("h" + string(rune('0'+tok)))}
+		RaftMaterialised: true, TokenFP: auth.TokenFingerprint("h" + string(rune('0'+tok))), CreatedAt: tokensCreated.Add(time.Hour)}
 }
 
+// tokensCreated is when clusterTokens' tokens were created.
+var tokensCreated = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
 // clusterTokens: cluster tokens 1..5 with hash "h<id>".
-func clusterTokens(id int64) (string, bool) {
+func clusterTokens(id int64) (string, time.Time, bool) {
 	if id < 1 || id > 5 {
-		return "", false
+		return "", time.Time{}, false
 	}
-	return auth.TokenFingerprint("h" + string(rune('0'+id))), true
+	return auth.TokenFingerprint("h" + string(rune('0'+id))), tokensCreated, true
 }
 
 func gnode(rows ...governance.LocalRow) governance.LocalRows {
@@ -96,6 +99,10 @@ func TestPlanGovernanceSeedTokenRules(t *testing.T) {
 	notHere.Token, notHere.TokenFP = governance.TokenAbsent, ""
 	unknown := grow(1, 4, 1)
 	unknown.Token = governance.TokenUnknown
+	older := grow(1, 5, 1) // set for an earlier token at ID 5
+	older.CreatedAt = tokensCreated.Add(-24 * time.Hour)
+	skewed := grow(1, 5, 1) // a node clock 30 s behind the proposer's
+	skewed.CreatedAt = tokensCreated.Add(-30 * time.Second)
 	elsewhere := orphan
 	elsewhere.TokenID = 9
 	other := grow(2, 9, 1) // node b holds token 9, which is not the cluster's
@@ -108,6 +115,8 @@ func TestPlanGovernanceSeedTokenRules(t *testing.T) {
 		"another token at the ID":    {map[string]governance.LocalRows{"a": gnode(collision)}, "not the cluster's token 2"},
 		"cluster token not here yet": {map[string]governance.LocalRows{"a": gnode(notHere)}, "token 3 is not on node a yet"},
 		"no token table":             {map[string]governance.LocalRows{"a": gnode(unknown)}, "cannot tell whether token 4"},
+		"older than the token":       {map[string]governance.LocalRows{"a": gnode(older)}, "created before cluster token 5"},
+		"within the clock skew":      {map[string]governance.LocalRows{"a": gnode(skewed)}, ""},
 		"token only on another node": {map[string]governance.LocalRows{"a": gnode(elsewhere), "b": gnode()}, ""},
 		"held as legacy elsewhere":   {map[string]governance.LocalRows{"a": gnode(elsewhere), "b": gnode(other)}, "only node b has"},
 	} {
@@ -249,7 +258,7 @@ func (r *adoptRig) enableGovernance(t *testing.T, rows map[string]governance.Loc
 
 func tokRow(id int64, rows int, materialised bool) governance.LocalRow {
 	return governance.LocalRow{ID: id, MaxRowsPerQuery: rows, Token: governance.TokenPresent,
-		RaftMaterialised: materialised, TokenFP: auth.TokenFingerprint("tok-hash")}
+		RaftMaterialised: materialised, TokenFP: auth.TokenFingerprint("tok-hash"), CreatedAt: time.Now().UTC()}
 }
 
 // End to end on a real Raft pair: the nodes' policies for a cluster token are
@@ -281,5 +290,29 @@ func TestAdoptGovernance(t *testing.T) {
 	}
 	if r2.cqCollectSeen.Load() {
 		t.Fatal("a collect opened for an adoption the probe could tell would wait")
+	}
+}
+
+// A follower gets the leader's refusal as text: it is still answered as the
+// refusal it is (409, 404, 400), and anything else is the cluster being
+// unavailable (503).
+func TestClassifyForwardedGovernanceRefusals(t *testing.T) {
+	refused := func(msg string) error {
+		return &ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: msg}
+	}
+	for _, c := range []struct {
+		err  error
+		want error
+	}{
+		{refused("set governance policy for token 5: " + raft.ErrGovernancePolicyExists.Error()), governance.ErrPolicyExists},
+		{refused("set governance policy for token 5: " + raft.ErrPolicyNotFound.Error()), governance.ErrPolicyNotFound},
+		{refused("set governance policy for token 5: " + raft.ErrGovernanceTokenNotCluster.Error()), governance.ErrTokenNotCluster},
+		{refused("set governance policy: " + raft.ErrInvalidGovernancePolicy.Error() + ": limits must be non-negative"), governance.ErrInvalidPolicy},
+		{&ForwardRejectedError{Code: protocol.ForwardCodeAuth, Message: "governance policy"}, governance.ErrClusterUnavailable},
+		{errors.New("no leader"), governance.ErrClusterUnavailable},
+	} {
+		if got := classifyGovernanceError(c.err); !errors.Is(got, c.want) {
+			t.Errorf("%v: classified %v, want %v", c.err, got, c.want)
+		}
 	}
 }

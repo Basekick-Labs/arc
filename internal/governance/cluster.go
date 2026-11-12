@@ -26,9 +26,9 @@ import (
 //
 // The query path reads a view of the cluster state: an immutable map from
 // token ID to a prebuilt *Policy, rebuilt by the FSM's policies-changed
-// callback (SyncClusterView) and swapped in atomically. Admit then costs one
-// atomic load, one map lookup and one string compare: no lock, no
-// allocation.
+// callback (SyncClusterView) and swapped in atomically. Finding a token's
+// policy then costs one atomic load, one map lookup and one string compare:
+// no lock beyond Admit's own admitMu, no allocation.
 //
 // A policy applies only to the token it was set for. Token IDs are the
 // cluster's log indexes, and a node may keep a pre-cluster local token at the
@@ -260,28 +260,50 @@ const sqliteTimestamp = "2006-01-02 15:04:05"
 // cluster's, so a restart never enforces it again. It writes nothing when the
 // table already matches. Run on a worker, never on the FSM goroutine.
 func (m *Manager) MirrorClusterPolicies(ctx context.Context, src ClusterViewSource) error {
-	seeded, entries := src.GovernanceView()
-	if !seeded {
-		return nil
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].TokenID < entries[j].TokenID })
 	m.policyWriteMu.Lock()
 	defer m.policyWriteMu.Unlock()
-	tx, err := m.db.BeginTx(ctx, nil)
+	owned, err := MirrorTable(ctx, m.db, src)
+	if owned {
+		m.cluster.owned.Store(true)
+	}
+	return err
+}
+
+// EnsureSchema creates the governance tables in db if they are missing.
+func EnsureSchema(db *sql.DB) error {
+	if _, err := db.Exec(governancePoliciesTable); err != nil {
+		return err
+	}
+	_, err := db.Exec(governanceClusterStateTable)
+	return err
+}
+
+// MirrorTable makes db's governance table equal the cluster's policies once
+// adopted, and marks it as the cluster's backup copy; owned reports that it
+// is. It writes nothing when the table already matches. Also run on a node
+// where governance does not run (#1627), so every node's table is the
+// cluster's: one turned back on later never enforces policies the cluster
+// dropped.
+func MirrorTable(ctx context.Context, db *sql.DB, src ClusterViewSource) (owned bool, err error) {
+	seeded, entries := src.GovernanceView()
+	if !seeded {
+		return false, nil
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].TokenID < entries[j].TokenID })
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("mirror governance policies: %w", err)
+		return false, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	same, err := mirrorMatches(ctx, tx, entries)
 	if err != nil {
-		return fmt.Errorf("mirror governance policies: %w", err)
+		return false, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	if same {
-		m.cluster.owned.Store(true)
-		return nil
+		return true, nil
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM governance_policies`); err != nil {
-		return fmt.Errorf("mirror governance policies: %w", err)
+		return false, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	for _, e := range entries {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO governance_policies (id, token_id, rate_limit_per_minute, rate_limit_per_hour,
@@ -290,17 +312,16 @@ func (m *Manager) MirrorClusterPolicies(ctx context.Context, src ClusterViewSour
 			e.ID, e.TokenID, e.RateLimitPerMinute, e.RateLimitPerHour, e.MaxQueriesPerHour, e.MaxQueriesPerDay,
 			e.MaxRowsPerQuery, e.MaxScanDurationSec,
 			e.CreatedAt.UTC().Format(sqliteTimestamp), e.UpdatedAt.UTC().Format(sqliteTimestamp)); err != nil {
-			return fmt.Errorf("mirror governance policies: %w", err)
+			return false, fmt.Errorf("mirror governance policies: %w", err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO governance_cluster_state (name, value) VALUES ('owned', '1')`); err != nil {
-		return fmt.Errorf("mirror governance policies: %w", err)
+		return false, fmt.Errorf("mirror governance policies: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("mirror governance policies: %w", err)
+		return false, fmt.Errorf("mirror governance policies: %w", err)
 	}
-	m.cluster.owned.Store(true)
-	return nil
+	return true, nil
 }
 
 // mirrorMatches reports whether the table already holds exactly entries

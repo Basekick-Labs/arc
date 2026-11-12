@@ -89,6 +89,11 @@ func (h *GovernanceHandler) CreatePolicy(c *fiber.Ctx) error {
 	}
 
 	policy, err := h.manager.CreatePolicyFor(ctx, &req, h.tokenFP(req.TokenID))
+	if errors.Is(err, governance.ErrPolicyNotFound) {
+		// Created in the cluster, and deleted again before it could be read
+		// back here.
+		return policyNotFound(c)
+	}
 	if errors.Is(err, governance.ErrPolicyExists) {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"success": false,

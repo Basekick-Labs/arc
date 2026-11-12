@@ -159,7 +159,6 @@ func (s *slidingWindowCounter) RetryAfterSec() int {
 	return retryAfterSeconds(s.lastSlotTime.Add(time.Duration(steps) * s.slotDuration).Sub(s.now()))
 }
 
-// UpdateLimit changes the rate limit. Takes effect immediately.
 // applyLimit makes limit the counter's limit, if it is not already. Called
 // with Manager.admitMu held. The counts are kept.
 func (s *slidingWindowCounter) applyLimit(limit int) {
@@ -169,6 +168,7 @@ func (s *slidingWindowCounter) applyLimit(limit int) {
 	}
 }
 
+// UpdateLimit changes the rate limit. Takes effect immediately.
 func (s *slidingWindowCounter) UpdateLimit(limit int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

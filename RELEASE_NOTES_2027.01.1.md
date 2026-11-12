@@ -4,7 +4,7 @@
 
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
-Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table is kept equal to it as a backup.
+Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table, on nodes where governance is off too, is kept equal to it as a backup and is never read again.
 
 - **Adoption.**
   - The cluster takes the union of the nodes' policies, so a policy set on one node now applies on all of them.
@@ -12,9 +12,10 @@ Once every node runs this version, the cluster adopts the nodes' query governanc
   - If two nodes define the same token's policy differently, an admin chooses one node's set with `POST /api/v1/cluster/policies/adopt` (`"kind": "governance"`). `GET /api/v1/cluster/policies?kind=governance` lists each node's policies and the hash to name. The other nodes' governance policies are then removed from their databases too, so take a backup first.
   - Adoption waits while a node holds a policy for a token created on that node before it joined the cluster (before v26.06.1), or a token the node cannot report on. The wait names the node and the token: re-issue the token through the cluster, or delete that policy. `GET /api/v1/cluster` shows it under `cluster_policies.kinds.governance`.
 - **After adoption.**
-  - Policies apply to cluster tokens only. A create, change or delete for any other token answers 404, "not a cluster token".
+  - Policies apply to cluster tokens only. A create or delete for any other token answers 404, "not a cluster token"; a change answers 404, no policy.
   - A policy applies only to the token it was set for: a different token that a node keeps at the same ID gets that node's defaults.
-  - A node that restarts applies only `governance.default_*` until it has caught up with the cluster. Policy writes and lists answer 503 until then; retry.
+  - A node that restarts never enforces its own table again. Until its cluster state holds the adopted policies it applies only `governance.default_*`, and policy writes and lists answer 503 (retry). It then applies its last Raft snapshot's policies, and the changes made since as it replays them from the leader.
+  - A node that joins after the adoption enforces its own table's policies, as before, until its cluster state has caught up; its table is then replaced by the cluster's.
   - Deleting a token deletes its governance policy.
 - **What applies where.** `max_rows_per_query` and `max_scan_duration_sec` apply identically everywhere. Rate limits and quotas are counted per node: a policy of 60 per minute allows 60 per minute on each node that runs queries. `governance.default_*` stays per node, so set it the same on every node; adoption logs a warning naming nodes that differ. A query forwarded to another node is governed once, by the node that runs it.
 - From then on, a node on an older release cannot join.

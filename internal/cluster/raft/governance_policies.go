@@ -155,13 +155,20 @@ func (f *ClusterFSM) GovernanceView() (seeded bool, entries []GovernanceViewEntr
 
 // GovernanceTokenHash returns the stored hash of cluster token id.
 func (f *ClusterFSM) GovernanceTokenHash(id int64) (string, bool) {
+	hash, _, ok := f.GovernanceToken(id)
+	return hash, ok
+}
+
+// GovernanceToken returns the stored hash of cluster token id and when it was
+// created (the proposer's clock).
+func (f *ClusterFSM) GovernanceToken(id int64) (hash string, created time.Time, ok bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	t, ok := f.tokens[id]
 	if !ok {
-		return "", false
+		return "", time.Time{}, false
 	}
-	return t.TokenHash, true
+	return t.TokenHash, time.Unix(0, t.CreatedAtUnixNano).UTC(), true
 }
 
 func (f *ClusterFSM) governancePoliciesLocked() []GovernancePolicyEntry {

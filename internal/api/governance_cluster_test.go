@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,5 +146,50 @@ func TestGovernanceUsesTheTokensFingerprint(t *testing.T) {
 	resp.Body.Close()
 	if gotMaxRows != 42 {
 		t.Fatalf("the query ran with max rows %d, want the cluster policy's 42", gotMaxRows)
+	}
+}
+
+// A node where governance does not run answers the adoption from its table,
+// and once adopted keeps that table equal to the cluster's, marked as the
+// cluster's backup copy.
+func TestGovernanceTableListerAndMirror(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "arc.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := governance.EnsureSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO governance_policies (token_id, max_rows_per_query) VALUES (3, 30), (4, 40)`); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := GovernanceTableLister(nil, path)(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"token_id":3`) || !strings.Contains(string(raw), `"token":"unknown"`) {
+		t.Fatalf("lister answered %s", raw)
+	}
+	if raw, err := GovernanceTableLister(nil, filepath.Join(t.TempDir(), "none.db"))(context.Background()); err != nil || !strings.Contains(string(raw), `"policies":[]`) {
+		t.Fatalf("no database: %s %v", raw, err)
+	}
+
+	mirror := GovernanceTableMirror(nil, path, entriesView{{GovernancePolicyEntry: raft.GovernancePolicyEntry{ID: 9, TokenID: 3, MaxRowsPerQuery: 33}, TokenHash: "h"}})
+	if err := mirror(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := governance.ReadLocalRows(context.Background(), db)
+	if err != nil || len(rows.Policies) != 1 || rows.Policies[0].ID != 9 || rows.Policies[0].MaxRowsPerQuery != 33 {
+		t.Fatalf("after the mirror %+v %v", rows, err)
+	}
+	var owned int
+	db.QueryRow(`SELECT COUNT(*) FROM governance_cluster_state WHERE name = 'owned'`).Scan(&owned)
+	if owned != 1 {
+		t.Fatal("the mirrored table is not marked as the cluster's")
+	}
+	if err := GovernanceTableMirror(nil, path, stubGovernanceView{})(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

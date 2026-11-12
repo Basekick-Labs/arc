@@ -429,3 +429,49 @@ func TestReadLocalRowsReportsTheToken(t *testing.T) {
 		t.Fatalf("token reports %+v (max %d)", r, rows.MaxIssuedID)
 	}
 }
+
+// The adoption's read of this node's policies takes the lock local writes
+// hold: a write in progress is either in the answer or, once the collect is
+// open, refused (this is the first half).
+func TestLocalRowsWaitForAWriteInProgress(t *testing.T) {
+	m := clusterManager(t, openDB(t), nil)
+	inWrite := make(chan struct{})
+	release := make(chan struct{})
+	m.afterPolicyWrite = func(string) {
+		close(inWrite)
+		<-release
+	}
+	go m.CreatePolicy(context.Background(), &Policy{TokenID: 4, MaxRowsPerQuery: 1})
+	<-inWrite
+	got := make(chan LocalRows, 1)
+	go func() {
+		rows, _ := m.LocalPolicyRows(context.Background())
+		got <- rows
+	}()
+	select {
+	case <-got:
+		t.Fatal("the adoption read this node's policies while a write was in progress")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if rows := <-got; len(rows.Policies) != 1 || rows.Policies[0].TokenID != 4 {
+		t.Fatalf("the read after the write: %+v", rows)
+	}
+}
+
+// Reading the cluster's policies adds no allocation to Admit: the seeded path
+// allocates exactly what the standalone path does.
+func TestSeededAdmitAddsNoAllocation(t *testing.T) {
+	g := newGovFSM(t)
+	a, fpA := g.token("a")
+	m := clusterManager(t, openDB(t), nil)
+	wire(m, g)
+	g.seed(raft.GovernancePolicyEntry{TokenID: a, RateLimitPerMinute: 1 << 30, MaxQueriesPerDay: 1 << 30, MaxRowsPerQuery: 5})
+	solo := setupTestManager(t, nil)
+	solo.CreatePolicy(context.Background(), &Policy{TokenID: 1, RateLimitPerMinute: 1 << 30, MaxQueriesPerDay: 1 << 30, MaxRowsPerQuery: 5})
+	seeded := testing.AllocsPerRun(200, func() { m.AdmitToken(a, fpA) })
+	standalone := testing.AllocsPerRun(200, func() { solo.Admit(1) })
+	if seeded != standalone {
+		t.Fatalf("seeded Admit allocates %.0f, standalone %.0f", seeded, standalone)
+	}
+}

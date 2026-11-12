@@ -4005,6 +4005,12 @@ func main() {
 
 	// Initialize Query Governance (Enterprise feature - requires valid license)
 	governanceInCluster := false
+	// The cluster's policies need its state: a coordinator without Raft
+	// (no cluster.raft_data_dir) keeps governance per node, as before.
+	governanceViewSource, governanceClustered := governance.ClusterViewSource(nil), false
+	if clusterCoordinator != nil {
+		governanceViewSource, governanceClustered = clusterCoordinator.GovernanceViewSource()
+	}
 	if cfg.Governance.Enabled {
 		if licenseClient == nil {
 			log.Warn().Msg("Query governance requires enterprise license - feature disabled")
@@ -4031,7 +4037,7 @@ func main() {
 					// In a cluster the policies become cluster-wide once
 					// adopted (#1627); a table the cluster marked as its
 					// backup copy is never loaded again.
-					Cluster: clusterCoordinator != nil,
+					Cluster: governanceClustered,
 				})
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to create governance manager - feature disabled")
@@ -4039,7 +4045,7 @@ func main() {
 						governanceDB.Close()
 					}
 				} else {
-					if clusterCoordinator != nil {
+					if governanceClustered {
 						// Before the query handler gets it: from here on it
 						// reads the cluster's policies once they are adopted.
 						clusterCoordinator.UseGovernance(governanceManager)
@@ -4078,15 +4084,19 @@ func main() {
 		}
 	}
 
-	if clusterCoordinator != nil && !governanceInCluster {
+	if governanceClustered && !governanceInCluster {
 		// Governance does not run here (disabled, unlicensed or failed), but
 		// this node's database may hold the policies of when it did: they
-		// count in the cluster's adoption, and the node must answer it.
+		// count in the cluster's adoption, and the node must answer it. Once
+		// adopted, its table is kept equal to the cluster's like every other
+		// node's, so turning governance on here later never enforces a
+		// policy the cluster dropped.
 		governanceDBPath := cfg.Auth.DBPath
 		if governanceDBPath == "" {
 			governanceDBPath = "./data/arc.db"
 		}
 		clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindGovernance, api.GovernanceTableLister(authManager, governanceDBPath))
+		clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindGovernance, api.GovernanceTableMirror(authManager, governanceDBPath, governanceViewSource))
 	}
 
 	// Initialize Query Management (Enterprise feature - requires valid license)
