@@ -577,48 +577,34 @@ func (m *Manager) AdmitToken(tokenID int64, tokenFP string) *EnforcementResult {
 		return &EnforcementResult{Allowed: true}
 	}
 
-	type gate struct {
-		admits func() (bool, string)
-		record func()
-		wait   func() int
-		kind   string
-	}
-	var gates []gate
+	// The gates live in an array on the stack: no allocation per query for
+	// the limits a policy sets (#1627, rule 4).
+	var buf [3]admitGate
+	gates := buf[:0]
 	if policy.RateLimitPerMinute > 0 {
 		l := m.getOrCreateMinuteLimiter(tokenID, policy.RateLimitPerMinute)
-		limit := policy.RateLimitPerMinute
-		l.applyLimit(limit)
-		gates = append(gates, gate{func() (bool, string) {
-			if l.admits() {
-				return true, ""
-			}
-			return false, fmt.Sprintf("Rate limit exceeded: %d queries per minute", limit)
-		}, l.record, l.RetryAfterSec, KindRateLimit})
+		l.applyLimit(policy.RateLimitPerMinute)
+		gates = append(gates, admitGate{window: l, limit: policy.RateLimitPerMinute, per: "minute"})
 	}
 	if policy.RateLimitPerHour > 0 {
 		l := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
-		limit := policy.RateLimitPerHour
-		l.applyLimit(limit)
-		gates = append(gates, gate{func() (bool, string) {
-			if l.admits() {
-				return true, ""
-			}
-			return false, fmt.Sprintf("Rate limit exceeded: %d queries per hour", limit)
-		}, l.record, l.RetryAfterSec, KindRateLimit})
+		l.applyLimit(policy.RateLimitPerHour)
+		gates = append(gates, admitGate{window: l, limit: policy.RateLimitPerHour, per: "hour"})
 	}
 	if policy.MaxQueriesPerHour > 0 || policy.MaxQueriesPerDay > 0 {
 		t := m.getOrCreateQuotaTracker(tokenID, policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
 		t.applyLimits(policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
-		gates = append(gates, gate{t.admits, t.record, t.RetryAfterSec, KindQuota})
+		gates = append(gates, admitGate{quota: t})
 	}
 
 	var refused *EnforcementResult
 	longest := -1
-	for _, g := range gates {
+	for i := range gates {
+		g := &gates[i]
 		if ok, reason := g.admits(); !ok {
 			if w := g.wait(); w > longest {
 				longest = w
-				refused = &EnforcementResult{Allowed: false, Reason: reason, Kind: g.kind}
+				refused = &EnforcementResult{Allowed: false, Reason: reason, Kind: g.kind()}
 			}
 		}
 	}
@@ -629,8 +615,8 @@ func (m *Manager) AdmitToken(tokenID int64, tokenFP string) *EnforcementResult {
 	if m.afterAdmitCheckForTest != nil {
 		m.afterAdmitCheckForTest()
 	}
-	for _, g := range gates {
-		g.record()
+	for i := range gates {
+		gates[i].record()
 	}
 
 	result := &EnforcementResult{Allowed: true}
@@ -641,6 +627,47 @@ func (m *Manager) AdmitToken(tokenID int64, tokenFP string) *EnforcementResult {
 		result.MaxDuration = time.Duration(policy.MaxScanDurationSec) * time.Second
 	}
 	return result
+}
+
+// admitGate is one limit Admit checks: a rate limit (window, with its limit
+// and period for the refusal's reason) or the quotas.
+type admitGate struct {
+	window *slidingWindowCounter
+	limit  int
+	per    string
+	quota  *quotaTracker
+}
+
+func (g *admitGate) admits() (bool, string) {
+	if g.quota != nil {
+		return g.quota.admits()
+	}
+	if g.window.admits() {
+		return true, ""
+	}
+	return false, fmt.Sprintf("Rate limit exceeded: %d queries per %s", g.limit, g.per)
+}
+
+func (g *admitGate) record() {
+	if g.quota != nil {
+		g.quota.record()
+		return
+	}
+	g.window.record()
+}
+
+func (g *admitGate) wait() int {
+	if g.quota != nil {
+		return g.quota.RetryAfterSec()
+	}
+	return g.window.RetryAfterSec()
+}
+
+func (g *admitGate) kind() string {
+	if g.quota != nil {
+		return KindQuota
+	}
+	return KindRateLimit
 }
 
 // RecordQueryCompletion records that a query completed for a token.
