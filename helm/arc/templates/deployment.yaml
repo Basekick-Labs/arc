@@ -48,6 +48,11 @@ spec:
             - name: http
               containerPort: 8000
               protocol: TCP
+            {{- if .Values.flightSql.enabled }}
+            - name: flight-sql
+              containerPort: {{ include "arc.flightSqlPort" . }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: ARC_STORAGE_BACKEND
               value: {{ .Values.arc.storageBackend | quote }}
@@ -70,6 +75,12 @@ spec:
               value: {{ .Values.arc.wal.diskMinFreeMB | default 0 | int | quote }}
             - name: ARC_WAL_MAX_DIRECTORY_MB
               value: {{ include "arc.walMaxDirectoryMB" . | quote }}
+            {{- if .Values.flightSql.enabled }}
+            - name: ARC_FLIGHT_SQL_ENABLED
+              value: "true"
+            - name: ARC_FLIGHT_SQL_PORT
+              value: {{ include "arc.flightSqlPort" . | quote }}
+            {{- end }}
             {{- with .Values.arc.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
