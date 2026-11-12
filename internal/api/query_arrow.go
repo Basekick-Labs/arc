@@ -789,12 +789,22 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, rows))
 		}
 	}
-	var arcxOnComplete func(int)
-	var arcxOnFail func(string)
-	if h.queryRegistry != nil && queryID != "" {
-		arcxOnComplete = func(rows int) {
+	// A completed arcx stream logs what a completed DuckDB stream logs (the
+	// Info line and logSlowQuery at the end of the DuckDB writer below), with
+	// the same fields, measured from the same start. Built here rather than in
+	// the hook so the arcx_engine-only file does not need its own copy.
+	arcxOnComplete := func(rows int) {
+		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Complete(queryID, rows)
 		}
+		h.logger.Info().
+			Int64("row_count", int64(rows)).
+			Int64("execution_time_ms", time.Since(start).Milliseconds()).
+			Msg("Arrow streaming query completed")
+		h.logSlowQuery(convertedSQL, start, rows, tokenName)
+	}
+	var arcxOnFail func(string)
+	if h.queryRegistry != nil && queryID != "" {
 		arcxOnFail = func(message string) {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				h.queryRegistry.TimedOut(queryID)

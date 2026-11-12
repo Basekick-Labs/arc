@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -15,8 +16,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -551,4 +554,124 @@ func runArcxHelper(t *testing.T, h *QueryHandler, ctx context.Context, cancel co
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	return resp
+}
+
+// syncBuffer is a goroutine-safe log sink.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// entries returns the JSON log lines whose message is msg.
+func (b *syncBuffer) entries(t *testing.T, msg string) []map[string]interface{} {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []map[string]interface{}
+	for _, line := range strings.Split(strings.TrimSpace(b.buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var e map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("log line is not JSON: %q", line)
+		}
+		if e["message"] == msg {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func logKeys(e map[string]interface{}) []string {
+	keys := make([]string, 0, len(e))
+	for k := range e {
+		if k != "time" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// A completed arcx Arrow query logs exactly what a completed DuckDB Arrow
+// query logs: the Info completion line and, past
+// query.slow_query_threshold_ms, the Warn slow-query line, with the same
+// fields. The DuckDB lines are taken from the same handler with the arcx hook
+// declining, so the comparison follows the DuckDB path if it ever changes.
+func TestArcxArrowLogsCompletionAndSlowQueryLikeDuckDB(t *testing.T) {
+	run := func(t *testing.T, serveArcx bool) *syncBuffer {
+		h, app, _ := newArcxArrowHandlerRig(t, nil, 0)
+		var logs syncBuffer
+		h.logger = zerolog.New(&logs).Level(zerolog.InfoLevel)
+		h.slowQueryThreshold = time.Nanosecond
+		// No query registry (query management unlicensed): the logs must not
+		// depend on it, as they do not on the DuckDB path.
+		h.queryRegistry = nil
+
+		schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
+		alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+		defer alloc.AssertSize(t, 0)
+		reader := newSimpleRecordReader(schema, []arrow.Record{buildArrowBatch(alloc, schema, [][]interface{}{{int64(1)}})})
+
+		original := arcxArrowDispatch
+		t.Cleanup(func() { arcxArrowDispatch = original })
+		arcxArrowDispatch = func(
+			h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc,
+			start time.Time, _, _, _ string, governanceMaxRows int,
+			onRows func(int64), onDisconnect func(), onComplete func(int), onFail func(string),
+		) bool {
+			if !serveArcx {
+				reader.Release()
+				return false
+			}
+			return h.serveArcxArrowIPCResult(
+				c.Context(), ctx, cancel, reader, governanceMaxRows, start,
+				onRows, onDisconnect, onComplete, onFail,
+			)
+		}
+		slowBefore := metricValue(t, "query_slow_total")
+		resp, _ := postArrowQuery(t, app)
+		if resp.StatusCode != fiber.StatusOK {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		if d := metricValue(t, "query_slow_total") - slowBefore; d != 1 {
+			t.Errorf("query_slow_total moved by %d, want 1", d)
+		}
+		return &logs
+	}
+
+	duck := run(t, false)
+	arcx := run(t, true)
+	for _, tc := range []struct{ msg, level string }{
+		{"Arrow streaming query completed", "info"},
+		{"Slow query detected", "warn"},
+	} {
+		d, a := duck.entries(t, tc.msg), arcx.entries(t, tc.msg)
+		if len(d) != 1 {
+			t.Fatalf("DuckDB path logged %q %d times, want 1; the comparison would be vacuous", tc.msg, len(d))
+		}
+		if len(a) != 1 {
+			t.Errorf("arcx path logged %q %d times, want 1", tc.msg, len(a))
+			continue
+		}
+		if a[0]["level"] != tc.level {
+			t.Errorf("arcx %q at level %v, want %s", tc.msg, a[0]["level"], tc.level)
+		}
+		if dk, ak := logKeys(d[0]), logKeys(a[0]); strings.Join(dk, ",") != strings.Join(ak, ",") {
+			t.Errorf("arcx %q fields %v, DuckDB's %v", tc.msg, ak, dk)
+		}
+		if a[0]["row_count"] != float64(1) {
+			t.Errorf("arcx %q row_count = %v, want 1", tc.msg, a[0]["row_count"])
+		}
+	}
+	if got := arcx.entries(t, "Slow query detected"); len(got) == 1 && got[0]["token_name"] != "capped" {
+		t.Errorf("slow-query token_name = %v, want capped", got[0]["token_name"])
+	}
 }

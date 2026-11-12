@@ -3940,6 +3940,10 @@ Now the arcx path streams through the same writer as the DuckDB path:
 - A deadline that expires mid-stream counts in `arc_query_timeouts_total`, and
   the stream's error, disconnect and truncation-reason accounting is the
   DuckDB path's.
+- A completed query logs the `Arrow streaming query completed` line, and one
+  slower than `query.slow_query_threshold_ms` logs `Slow query detected` and
+  counts in `arc_slow_queries_total`, as on DuckDB. Neither happened for an
+  arcx-served Arrow query.
 - The arcx reader is released as soon as the response ends. A result stopped
   early (at the cap, on a cancel or an error) used to keep its last batch of
   native memory and park arcx's decode workers until a Go garbage collection;
