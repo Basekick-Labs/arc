@@ -18,6 +18,10 @@ type slidingWindowCounter struct {
 	total        int
 	limit        int
 	now          func() time.Time
+	// applied is the limit Manager last set, read and written only under
+	// Manager.admitMu: Admit compares it with its policy's limit and calls
+	// UpdateLimit only when they differ (#1627), without taking mu.
+	applied int
 }
 
 func newSlidingWindowCounter(windowSize time.Duration, slotCount int, limit int) *slidingWindowCounter {
@@ -156,6 +160,15 @@ func (s *slidingWindowCounter) RetryAfterSec() int {
 }
 
 // UpdateLimit changes the rate limit. Takes effect immediately.
+// applyLimit makes limit the counter's limit, if it is not already. Called
+// with Manager.admitMu held. The counts are kept.
+func (s *slidingWindowCounter) applyLimit(limit int) {
+	if s.applied != limit {
+		s.UpdateLimit(limit)
+		s.applied = limit
+	}
+}
+
 func (s *slidingWindowCounter) UpdateLimit(limit int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

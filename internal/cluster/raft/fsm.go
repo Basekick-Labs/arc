@@ -3018,8 +3018,15 @@ func (f *ClusterFSM) applyRotateToken(payload []byte, logIndex uint64) interface
 		}
 		f.tokensByPrefix[p.NewPrefix] = append(f.tokensByPrefix[p.NewPrefix], p.ID)
 	}
+	// A token's governance policy is enforced only for the token whose hash
+	// it was set for (#1627): a rotate changes that hash, so the readers of
+	// the governance state rebuild.
+	_, hasGovernance := f.governancePolicies[p.ID]
 	callback := f.onTokenRotated
 	f.mu.Unlock()
+	if hasGovernance {
+		f.firePoliciesChanged()
+	}
 
 	metrics.Get().IncClusterAuthApplyRotate()
 	f.logger.Info().Int64("token_id", p.ID).Uint64("lsn", logIndex).Msg("Token rotated in cluster auth state")

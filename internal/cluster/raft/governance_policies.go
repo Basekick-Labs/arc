@@ -125,6 +125,45 @@ func (f *ClusterFSM) GovernancePolicies() []GovernancePolicyEntry {
 	return f.governancePoliciesLocked()
 }
 
+// GovernanceViewEntry is a governance policy with the stored hash of the
+// cluster token it limits: a node enforces it only for a request whose token
+// row carries that same hash.
+type GovernanceViewEntry struct {
+	GovernancePolicyEntry
+	TokenHash string
+}
+
+// GovernanceView returns, under one read lock, whether the governance kind is
+// seeded and every governance policy with its token's stored hash.
+func (f *ClusterFSM) GovernanceView() (seeded bool, entries []GovernanceViewEntry) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	seeded = f.clusterPolicies && f.governanceEnabled && f.policiesSeeded[PolicyKindGovernance]
+	if !seeded {
+		return false, nil
+	}
+	entries = make([]GovernanceViewEntry, 0, len(f.governancePolicies))
+	for _, e := range f.governancePolicies {
+		v := GovernanceViewEntry{GovernancePolicyEntry: *e}
+		if t, ok := f.tokens[e.TokenID]; ok {
+			v.TokenHash = t.TokenHash
+		}
+		entries = append(entries, v)
+	}
+	return true, entries
+}
+
+// GovernanceTokenHash returns the stored hash of cluster token id.
+func (f *ClusterFSM) GovernanceTokenHash(id int64) (string, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	t, ok := f.tokens[id]
+	if !ok {
+		return "", false
+	}
+	return t.TokenHash, true
+}
+
 func (f *ClusterFSM) governancePoliciesLocked() []GovernancePolicyEntry {
 	out := make([]GovernancePolicyEntry, 0, len(f.governancePolicies))
 	for _, e := range f.governancePolicies {

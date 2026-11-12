@@ -58,13 +58,13 @@ var (
 )
 
 // policyKinds are the kinds this build adopts, in order.
-var policyKinds = []string{raft.PolicyKindTiering, raft.PolicyKindRetention, raft.PolicyKindCQ}
+var policyKinds = []string{raft.PolicyKindTiering, raft.PolicyKindRetention, raft.PolicyKindCQ, raft.PolicyKindGovernance}
 
-// probesFirst reports kinds whose merge can refuse the rows (retention): the
+// probesFirst reports kinds whose merge can refuse the rows (all but tiering): the
 // leader reads every node's rows with a read-only probe first and opens a
 // collect, with its window of refused writes, only when the merge would seed.
 func probesFirst(kind string) bool {
-	return kind == raft.PolicyKindRetention || kind == raft.PolicyKindCQ
+	return kind == raft.PolicyKindRetention || kind == raft.PolicyKindCQ || kind == raft.PolicyKindGovernance
 }
 
 // EmptyPolicyLister answers that this node holds no policies of a kind: for a
@@ -358,7 +358,7 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 		why := ""
 		if len(missing) > 0 {
 			why = "no answer to the probe"
-		} else if _, err := mergePolicyAnswers(kind, rows, nil); err != nil {
+		} else if _, err := c.mergeAnswers(kind, rows, nil, false); err != nil {
 			why = err.Error()
 		}
 		if why != "" {
@@ -382,7 +382,7 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 	if len(missing) > 0 {
 		lastError = "no answer to the collect"
 	} else {
-		seed, err = mergePolicyAnswers(kind, rows, choice)
+		seed, err = c.mergeAnswers(kind, rows, choice, true)
 		if err != nil {
 			c.logger.Warn().Err(err).Str("kind", kind).Msg("Policy collect: the nodes' policies cannot be merged")
 			lastError = "merge: " + err.Error()
@@ -403,7 +403,7 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 	if _, err := c.proposeLeader(raft.CommandSeedPolicies, seed); err != nil {
 		return fmt.Errorf("seed: %w", err)
 	}
-	ev := c.logger.Info().Str("kind", kind).Int("nodes", len(answers)).Int("policies", len(seed.Tiering)+len(seed.Retention)+len(seed.CQ))
+	ev := c.logger.Info().Str("kind", kind).Int("nodes", len(answers)).Int("policies", len(seed.Tiering)+len(seed.Retention)+len(seed.CQ)+len(seed.Governance))
 	if choice != nil {
 		ev = ev.Str("chosen_node", choice.Node).Str("chosen_by", choice.By)
 	}

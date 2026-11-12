@@ -2,15 +2,24 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Cluster: groundwork for cluster-wide query governance policies ([#1627](https://github.com/Basekick-Labs/arc/issues/1627), part 1 of 2)
+## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
-Groundwork for making query governance policies (rate limits, quotas, row and scan-time caps per token) apply on every node of a cluster. This release changes no governance behaviour: each node still enforces only the policies created on it.
+Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table is kept equal to it as a backup.
 
-- The cluster state can now hold governance policies, one per cluster token. A token delete also deletes its policy there, and a policy whose token is gone is never kept.
-- They have their own cluster flag, as retention policies and continuous queries do. This release cannot turn it on, and nothing adopts the nodes' policies yet; part 2, in the same release, does both once every node runs it. From then on a node on an older release cannot join.
-- Internal: retention policies, continuous queries and governance policies now share one per-kind table for their flag, their join check and the enable step. Retention and continuous queries behave as before.
+- **Adoption.**
+  - The cluster takes the union of the nodes' policies, so a policy set on one node now applies on all of them.
+  - Policies whose token no longer exists are dropped, and each one is logged.
+  - If two nodes define the same token's policy differently, an admin chooses one node's set with `POST /api/v1/cluster/policies/adopt` (`"kind": "governance"`). `GET /api/v1/cluster/policies?kind=governance` lists each node's policies and the hash to name. The other nodes' governance policies are then removed from their databases too, so take a backup first.
+  - Adoption waits while a node holds a policy for a token created on that node before it joined the cluster (before v26.06.1), or a token the node cannot report on. The wait names the node and the token: re-issue the token through the cluster, or delete that policy. `GET /api/v1/cluster` shows it under `cluster_policies.kinds.governance`.
+- **After adoption.**
+  - Policies apply to cluster tokens only. A create, change or delete for any other token answers 404, "not a cluster token".
+  - A policy applies only to the token it was set for: a different token that a node keeps at the same ID gets that node's defaults.
+  - A node that restarts applies only `governance.default_*` until it has caught up with the cluster. Policy writes and lists answer 503 until then; retry.
+  - Deleting a token deletes its governance policy.
+- **What applies where.** `max_rows_per_query` and `max_scan_duration_sec` apply identically everywhere. Rate limits and quotas are counted per node: a policy of 60 per minute allows 60 per minute on each node that runs queries. `governance.default_*` stays per node, so set it the same on every node; adoption logs a warning naming nodes that differ. A query forwarded to another node is governed once, by the node that runs it.
+- From then on, a node on an older release cannot join.
 
-Performance: none on query, ingest or import. No governance code runs on those paths, and the query path is unchanged. The Raft state machine gains one map lookup per token delete. New benchmarks, `BenchmarkAdmit` and `BenchmarkAdmitParallel` (`Admit` while file registrations are applied continuously), give the baseline part 2 is measured against; run against `main` with the same files, `Admit` allocations and the apply rate are unchanged and time per call is within 1% (the `Admit` code is identical in both builds).
+Performance: on the query path, once adopted, `Admit` reads the cluster's policies from an immutable in-memory snapshot (one atomic load, one map lookup, one string compare), without the lock it took before. Measured on Atila against `main`: PERF_PLACEHOLDER. Ingest and import run no governance code; the snapshot is rebuilt (one map of the governance policies) only when a cluster policy of any kind changes, a token with a governance policy is rotated or deleted, or a Raft snapshot is restored, never on a file registration.
 
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 

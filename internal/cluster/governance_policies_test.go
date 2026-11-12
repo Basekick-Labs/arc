@@ -11,39 +11,45 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
 
-// #1627 part 1: this build carries the governance kind's FSM state and its
-// table row, but cannot turn it on. It does not advertise the capability, so
-// even with every node on this build the flag stays off, the kind is never
-// active, and nothing adopts it.
-func TestGovernancePoliciesCannotEnableInThisBuild(t *testing.T) {
+// #1627: this build advertises governance and adopts it. With every node on
+// it, the enable pass turns the governance flag on, the kind is active, and
+// the adoption loop collects it after a read-only probe.
+func TestGovernancePoliciesEnableWhenEveryNodeAdvertises(t *testing.T) {
 	c := originRig(t, "writer-1", RoleWriter)
 	local := c.localCapabilities()
-	if hasCapability(local, raft.CapabilityClusterGovernance) {
-		t.Fatalf("this build advertises %s", raft.CapabilityClusterGovernance)
+	if !hasCapability(local, raft.CapabilityClusterGovernance) {
+		t.Fatalf("this build does not advertise %s", raft.CapabilityClusterGovernance)
 	}
+	inKinds := false
 	for _, k := range policyKinds {
-		if k == raft.PolicyKindGovernance {
-			t.Fatal("governance is in policyKinds: the adoption loop would collect it")
-		}
+		inKinds = inKinds || k == raft.PolicyKindGovernance
 	}
-	capNodes(t, c, map[string][]string{"raft-1": local, "writer-1": local, "writer-2": local, "reader-1": local})
+	if !inKinds || !probesFirst(raft.PolicyKindGovernance) {
+		t.Fatal("governance is not adopted, or not probed before a collect")
+	}
+	older := []string{raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention, raft.CapabilityClusterCQ}
+	capNodes(t, c, map[string][]string{"raft-1": local, "writer-1": local, "writer-2": local, "reader-1": older})
 	c.maybeEnableClusterPolicies()
 	waitFSM(t, c.ClusterPoliciesActive)
 	c.maybeEnablePolicyKinds()
-	// The same pass turns the other kinds on: it ran.
-	waitFSM(t, func() bool { return c.fsmOrNil().RetentionPoliciesEnabled() && c.fsmOrNil().CQPoliciesEnabled() })
-	time.Sleep(100 * time.Millisecond)
-	if c.fsmOrNil().GovernancePoliciesEnabled() || c.policyKindActive(raft.PolicyKindGovernance) {
-		t.Fatal("governance enabled by a build that does not advertise it")
+	waitFSM(t, func() bool { return c.fsmOrNil().CQPoliciesEnabled() })
+	if c.fsmOrNil().GovernancePoliciesEnabled() {
+		t.Fatal("governance enabled while reader-1 runs an older build")
 	}
-	if b := c.governancePolicies.blockers.Load(); b == nil || len(*b) != 4 {
-		t.Fatalf("governance blockers %v, want every node", b)
+	if st := c.ClusterPoliciesStatus(); st.GovernanceEnabled || len(st.GovernanceBlocking) != 1 || st.GovernanceBlocking[0] != "reader-1" {
+		t.Fatalf("status %+v", st)
 	}
 	if err := c.ChoosePolicyAdoption(raft.PolicyKindGovernance, "writer-2", "h", "admin"); !errors.Is(err, ErrGovernancePoliciesNotEnabled) {
 		t.Fatalf("choice before the governance flag: %v", err)
 	}
-	if _, ok := c.ClusterPoliciesStatus().Kinds[raft.PolicyKindGovernance]; ok {
-		t.Fatal("status lists governance")
+	capNodes(t, c, map[string][]string{"reader-1": local})
+	c.maybeEnablePolicyKinds()
+	waitFSM(t, c.fsmOrNil().GovernancePoliciesEnabled)
+	if !c.policyKindActive(raft.PolicyKindGovernance) || !c.ClusterPoliciesStatus().GovernanceEnabled {
+		t.Fatal("governance not active with its flag on")
+	}
+	if _, ok := c.ClusterPoliciesStatus().Kinds[raft.PolicyKindGovernance]; !ok {
+		t.Fatal("status does not list governance")
 	}
 }
 

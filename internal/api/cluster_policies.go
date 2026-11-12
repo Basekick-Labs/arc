@@ -17,6 +17,13 @@ type adoptPoliciesRequest struct {
 	Hash string `json:"hash"`
 }
 
+// adoptableKind reports a kind an admin can choose a node's policies of.
+func adoptableKind(kind string) bool {
+	return kind == "retention" || kind == "cq" || kind == "governance"
+}
+
+const adoptableKindsError = `kind must be "retention", "cq" or "governance"`
+
 // clusterPoliciesError answers the leader-only policy endpoints' errors.
 func (h *ClusterHandler) clusterPoliciesError(c *fiber.Ctx, err error) error {
 	status := fiber.StatusServiceUnavailable
@@ -25,7 +32,7 @@ func (h *ClusterHandler) clusterPoliciesError(c *fiber.Ctx, err error) error {
 	case errors.Is(err, cluster.ErrNotLeaderForTopology):
 		status = fiber.StatusConflict
 		msg = "run this on the Raft leader"
-	case errors.Is(err, cluster.ErrPolicyAdoptionNotNeeded), errors.Is(err, cluster.ErrRetentionPoliciesNotEnabled), errors.Is(err, cluster.ErrCQPoliciesNotEnabled):
+	case errors.Is(err, cluster.ErrPolicyAdoptionNotNeeded), errors.Is(err, cluster.ErrRetentionPoliciesNotEnabled), errors.Is(err, cluster.ErrCQPoliciesNotEnabled), errors.Is(err, cluster.ErrGovernancePoliciesNotEnabled):
 		status = fiber.StatusConflict
 	case errors.Is(err, cluster.ErrUnknownPolicyNode):
 		status = fiber.StatusBadRequest
@@ -40,10 +47,10 @@ func (h *ClusterHandler) handleGetPolicyCandidates(c *fiber.Ctx) error {
 	if h.coordinator == nil {
 		return h.respondNotEnabled(c)
 	}
-	// ?kind= narrows it to one kind; by default both are read.
+	// ?kind= narrows it to one kind; by default every kind is read.
 	kind := c.Query("kind")
-	if kind != "" && kind != "retention" && kind != "cq" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": `kind must be "retention" or "cq"`})
+	if kind != "" && !adoptableKind(kind) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": adoptableKindsError})
 	}
 	resp := fiber.Map{"success": true}
 	if kind == "" || kind == "retention" {
@@ -64,7 +71,16 @@ func (h *ClusterHandler) handleGetPolicyCandidates(c *fiber.Ctx) error {
 			resp["cq"] = out
 		}
 	}
-	if resp["retention"] == nil && resp["cq"] == nil {
+	if kind == "" || kind == "governance" {
+		out, err := h.coordinator.GovernanceCandidates(c.UserContext())
+		if err != nil && (kind != "" || !errors.Is(err, cluster.ErrGovernancePoliciesNotEnabled)) {
+			return h.clusterPoliciesError(c, err)
+		}
+		if err == nil {
+			resp["governance"] = out
+		}
+	}
+	if resp["retention"] == nil && resp["cq"] == nil && resp["governance"] == nil {
 		return h.clusterPoliciesError(c, cluster.ErrRetentionPoliciesNotEnabled)
 	}
 	return c.JSON(resp)
@@ -82,8 +98,8 @@ func (h *ClusterHandler) handleAdoptPolicies(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "Invalid request body: " + err.Error()})
 	}
-	if req.Kind != "retention" && req.Kind != "cq" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": `kind must be "retention" or "cq"`})
+	if !adoptableKind(req.Kind) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": adoptableKindsError})
 	}
 	if req.Node == "" || strings.TrimSpace(req.Hash) == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "node and hash are required (GET /api/v1/cluster/policies lists them)"})
@@ -96,6 +112,14 @@ func (h *ClusterHandler) handleAdoptPolicies(c *fiber.Ctx) error {
 		return h.clusterPoliciesError(c, err)
 	}
 	h.logger.Info().Str("kind", req.Kind).Str("node", req.Node).Str("by", by).Msg("Policy adoption chosen")
+	if req.Kind == "governance" {
+		// The governance mirror rewrites each node's table to the cluster's:
+		// the other nodes' own policies are removed, not kept.
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+			"success": true,
+			"message": "the leader adopts the node's governance policies if it still holds exactly these; every other node's own governance policies are then removed from its database. GET /api/v1/cluster shows the outcome under cluster_policies",
+		})
+	}
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 		"success": true,
 		"message": "the leader adopts the node's " + req.Kind + " policies if it still holds exactly these; every other node's own policies of that kind then stop running and are kept as dormant rows. GET /api/v1/cluster shows the outcome under cluster_policies",

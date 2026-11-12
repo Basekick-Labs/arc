@@ -6229,7 +6229,10 @@ func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout 
 	m := metrics.Get()
 	// One decision over every limit: a refused query is counted against none
 	// of them (#1524).
-	result := h.governanceManager.Admit(tokenInfo.ID)
+	// The token's stored-hash fingerprint names it to the cluster's policies
+	// (#1627): a pre-cluster local token sharing a cluster token's ID gets
+	// this node's defaults, not that token's policy.
+	result := h.governanceManager.AdmitToken(tokenInfo.ID, tokenInfo.Fingerprint)
 	if !result.Allowed {
 		c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
 		m.IncQueryErrors()

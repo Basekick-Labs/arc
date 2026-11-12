@@ -61,7 +61,7 @@ func (h *GovernanceHandler) requireGovernanceLicense(c *fiber.Ctx) error {
 // CreatePolicy creates a governance policy for a token.
 // POST /api/v1/governance/policies
 func (h *GovernanceHandler) CreatePolicy(c *fiber.Ctx) error {
-	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.UserContext(), 30*time.Second)
 	defer cancel()
 
 	var req governance.Policy
@@ -88,12 +88,15 @@ func (h *GovernanceHandler) CreatePolicy(c *fiber.Ctx) error {
 		})
 	}
 
-	policy, err := h.manager.CreatePolicy(ctx, &req)
+	policy, err := h.manager.CreatePolicyFor(ctx, &req, h.tokenFP(req.TokenID))
 	if errors.Is(err, governance.ErrPolicyExists) {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"success": false,
 			"error":   "A policy already exists for this token",
 		})
+	}
+	if handled, resp := h.clusterError(c, err, req.TokenID); handled {
+		return resp
 	}
 	if err != nil {
 		h.logger.Error().Err(err).Int64("token_id", req.TokenID).Msg("Failed to create governance policy")
@@ -112,10 +115,13 @@ func (h *GovernanceHandler) CreatePolicy(c *fiber.Ctx) error {
 // ListPolicies returns all governance policies.
 // GET /api/v1/governance/policies
 func (h *GovernanceHandler) ListPolicies(c *fiber.Ctx) error {
-	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.UserContext(), 30*time.Second)
 	defer cancel()
 
 	policies, err := h.manager.ListPolicies(ctx)
+	if handled, resp := h.clusterError(c, err, 0); handled {
+		return resp
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list governance policies")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -134,7 +140,7 @@ func (h *GovernanceHandler) ListPolicies(c *fiber.Ctx) error {
 // GetPolicy returns the governance policy for a specific token.
 // GET /api/v1/governance/policies/:token_id
 func (h *GovernanceHandler) GetPolicy(c *fiber.Ctx) error {
-	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.UserContext(), 30*time.Second)
 	defer cancel()
 
 	tokenID, err := strconv.ParseInt(c.Params("token_id"), 10, 64)
@@ -145,7 +151,10 @@ func (h *GovernanceHandler) GetPolicy(c *fiber.Ctx) error {
 		})
 	}
 
-	policy, err := h.manager.GetPolicy(ctx, tokenID)
+	policy, err := h.manager.GetPolicyFor(ctx, tokenID, h.tokenFP(tokenID))
+	if handled, resp := h.clusterError(c, err, tokenID); handled {
+		return resp
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to get governance policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -167,7 +176,7 @@ func (h *GovernanceHandler) GetPolicy(c *fiber.Ctx) error {
 // UpdatePolicy updates the governance policy for a specific token.
 // PUT /api/v1/governance/policies/:token_id
 func (h *GovernanceHandler) UpdatePolicy(c *fiber.Ctx) error {
-	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.UserContext(), 30*time.Second)
 	defer cancel()
 
 	tokenID, err := strconv.ParseInt(c.Params("token_id"), 10, 64)
@@ -179,7 +188,11 @@ func (h *GovernanceHandler) UpdatePolicy(c *fiber.Ctx) error {
 	}
 
 	// Verify policy exists
-	existing, err := h.manager.GetPolicy(ctx, tokenID)
+	tokenFP := h.tokenFP(tokenID)
+	existing, err := h.manager.GetPolicyFor(ctx, tokenID, tokenFP)
+	if handled, resp := h.clusterError(c, err, tokenID); handled {
+		return resp
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to get governance policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -212,9 +225,12 @@ func (h *GovernanceHandler) UpdatePolicy(c *fiber.Ctx) error {
 	req.ID = existing.ID
 	req.CreatedAt = existing.CreatedAt
 
-	policy, err := h.manager.UpdatePolicy(ctx, &req)
+	policy, err := h.manager.UpdatePolicyFor(ctx, &req, tokenFP)
 	if errors.Is(err, governance.ErrPolicyNotFound) {
 		return policyNotFound(c)
+	}
+	if handled, resp := h.clusterError(c, err, tokenID); handled {
+		return resp
 	}
 	if err != nil {
 		h.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to update governance policy")
@@ -233,7 +249,7 @@ func (h *GovernanceHandler) UpdatePolicy(c *fiber.Ctx) error {
 // DeletePolicy removes the governance policy for a specific token.
 // DELETE /api/v1/governance/policies/:token_id
 func (h *GovernanceHandler) DeletePolicy(c *fiber.Ctx) error {
-	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.UserContext(), 30*time.Second)
 	defer cancel()
 
 	tokenID, err := strconv.ParseInt(c.Params("token_id"), 10, 64)
@@ -244,9 +260,12 @@ func (h *GovernanceHandler) DeletePolicy(c *fiber.Ctx) error {
 		})
 	}
 
-	if err := h.manager.DeletePolicy(ctx, tokenID); err != nil {
+	if err := h.manager.DeletePolicyFor(ctx, tokenID, h.tokenFP(tokenID)); err != nil {
 		if errors.Is(err, governance.ErrPolicyNotFound) {
 			return policyNotFound(c)
+		}
+		if handled, resp := h.clusterError(c, err, tokenID); handled {
+			return resp
 		}
 		h.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to delete governance policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -259,6 +278,47 @@ func (h *GovernanceHandler) DeletePolicy(c *fiber.Ctx) error {
 		"success": true,
 		"message": "Policy deleted",
 	})
+}
+
+// tokenFP is the fingerprint of token id's stored hash on this node, which
+// names the token to the cluster's policies (#1627): an ID alone can be a
+// pre-cluster local token sharing a cluster token's ID. "" outside a cluster,
+// without auth, or for a token this node does not hold.
+func (h *GovernanceHandler) tokenFP(id int64) string {
+	if h.authManager == nil || !h.manager.ClusterMode() {
+		return ""
+	}
+	info, err := h.authManager.GetTokenByID(id)
+	if err != nil || info == nil {
+		return ""
+	}
+	return info.Fingerprint
+}
+
+// clusterError answers the errors of the cluster-wide policies (#1627);
+// handled is false for any other error.
+func (h *GovernanceHandler) clusterError(c *fiber.Ctx, err error, tokenID int64) (handled bool, resp error) {
+	var status int
+	msg := ""
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, governance.ErrPoliciesBeingAdopted), errors.Is(err, governance.ErrNotCaughtUp):
+		status, msg = fiber.StatusServiceUnavailable, err.Error()
+	case errors.Is(err, governance.ErrClusterUnavailable):
+		h.logger.Warn().Err(err).Int64("token_id", tokenID).Msg("The cluster did not take the governance policy write")
+		status, msg = fiber.StatusServiceUnavailable, governance.ErrClusterUnavailable.Error()
+	case errors.Is(err, governance.ErrTokenNotCluster):
+		status, msg = fiber.StatusNotFound, "token "+strconv.FormatInt(tokenID, 10)+" is not a cluster token; governance policies apply to cluster tokens only"
+	case errors.Is(err, governance.ErrInvalidPolicy):
+		status, msg = fiber.StatusBadRequest, err.Error()
+	default:
+		return false, nil
+	}
+	if status == fiber.StatusServiceUnavailable {
+		c.Set("Retry-After", "2")
+	}
+	return true, c.Status(status).JSON(fiber.Map{"success": false, "error": msg})
 }
 
 // policyNotFound answers a route naming a token that has no policy.
@@ -280,8 +340,9 @@ func (h *GovernanceHandler) GetUsage(c *fiber.Ctx) error {
 		})
 	}
 
-	usage := h.manager.GetTokenUsage(tokenID)
-	policy := h.manager.GetCachedPolicy(tokenID)
+	tokenFP := h.tokenFP(tokenID)
+	usage := h.manager.GetTokenUsageFor(tokenID, tokenFP)
+	policy := h.manager.GetCachedPolicyFor(tokenID, tokenFP)
 
 	return c.JSON(fiber.Map{
 		"success": true,
