@@ -114,7 +114,10 @@ func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 			h.totalErrors.Add(1)
 			return true, respondImportTooLarge(c)
 		}
-		req, err := BuildHTTPRequest(c)
+		// Built only here, once the import is forwarded (#1629).
+		fctx, cancel := forwardContext(h.router)
+		defer cancel()
+		req, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to build import request for forwarding")
@@ -123,7 +126,9 @@ func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 			})
 		}
 
-		resp, err := h.router.RouteImport(c.Context(), req)
+		defer release()
+
+		resp, err := h.router.RouteImport(fctx, req)
 		if err == cluster.ErrLocalNodeCanHandle {
 			break
 		}

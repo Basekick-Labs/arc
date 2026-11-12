@@ -204,7 +204,10 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding write request to writer node")
 
-		httpReq, err := BuildHTTPRequest(c)
+		// Built only here, once the write is forwarded (#1629).
+		fctx, cancel := forwardContext(h.router)
+		defer cancel()
+		httpReq, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -212,7 +215,9 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 			})
 		}
 
-		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		defer release()
+
+		resp, err := h.router.RouteWrite(fctx, httpReq)
 		if err == cluster.ErrLocalNodeCanHandle {
 			// Fall through to local processing
 			goto localProcessing

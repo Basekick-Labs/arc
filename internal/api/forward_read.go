@@ -69,7 +69,11 @@ func forwardRead(c *fiber.Ctx, router *cluster.Router, o forwardReadOpts) (handl
 		return true, RespondAlreadyForwarded(c)
 	}
 
-	httpReq, err := BuildHTTPRequest(c)
+	// Built only here, past the forward decision (#1629). cancel ends the
+	// forward and everything layered on it below.
+	ctx, cancel := forwardContext(router)
+	defer cancel()
+	httpReq, release, err := BuildHTTPRequest(c, ctx)
 	if err != nil {
 		o.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
 		if o.onError != nil {
@@ -81,10 +85,11 @@ func forwardRead(c *fiber.Ctx, router *cluster.Router, o forwardReadOpts) (handl
 		})
 	}
 
+	defer release()
+
 	// The request's context carries the forwarded identity; every bound and
 	// cancellation is layered on it.
-	ctx, cancel := context.WithCancel(httpReq.Context())
-	defer cancel()
+	ctx = httpReq.Context()
 	if o.timeout > 0 {
 		var cancelTimeout context.CancelFunc
 		ctx, cancelTimeout = context.WithTimeout(ctx, o.timeout)

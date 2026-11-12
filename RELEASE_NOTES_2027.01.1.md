@@ -84,6 +84,18 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: forwarded requests no longer read freed request state ([#1629](https://github.com/Basekick-Labs/arc/issues/1629))
+
+On a compactor, a reader or a standby writer, a forward that was cancelled or
+timed out, or whose peer answered before reading the whole body (a 413, for
+example), could leave a background read of the original request's recycled
+context, or of its body buffer. The race detector reported it, and in
+principle the peer could receive bytes of a later request. Forwards now run
+on a context of their own, which ends at server shutdown, at the forward's
+timeout, or when the query is cancelled or its client leaves, as before. A
+body larger than 4KB is not copied: it is released when the forward returns.
+`TestForwardedQueryIsListedAndCancellable` is no longer flaky.
+
 ## Fix: a damaged WAL entry no longer holds back replay of newer WAL files ([#1634](https://github.com/Basekick-Labs/arc/issues/1634))
 
 When one WAL entry was damaged (a checksum mismatch, for example from bit rot

@@ -159,20 +159,42 @@ func TestOnlyTheIntendedRoutesAreForwardable(t *testing.T) {
 // A forward is registered in the compactor's query registry, so
 // /api/v1/queries lists it (with its target) and can cancel it; cancelling
 // closes the connection to the peer.
+//
+// Cancelled only once the peer has the request (#1629): the target is
+// recorded before the router dials, so "listed with its target" does not mean
+// the peer has it, and a cancel before then never reaches the peer. The
+// router's timeout is far above the test's waits, so a slow run never sees a
+// timeout and a retry; the peer's signals close once either way.
 func TestForwardedQueryIsListedAndCancellable(t *testing.T) {
 	r := newDoorRig(t)
 	reg := queryregistry.NewRegistry(nil, zerolog.Nop())
 	r.qh.queryRegistry = reg
+	peerReceived := make(chan struct{})
 	peerCancelled := make(chan struct{})
+	var receivedOnce, cancelledOnce sync.Once
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// Read the body first, as a real peer does before running the query:
 		// net/http notices a dropped connection only after that.
 		_, _ = io.ReadAll(req.Body)
+		receivedOnce.Do(func() { close(peerReceived) })
 		<-req.Context().Done() // a long query; ends when the forward is cut
-		close(peerCancelled)
+		cancelledOnce.Do(func() { close(peerCancelled) })
 	}))
 	defer srv.Close()
-	r.qh.SetRouter(readRouter(t, srv.URL, true, true))
+	local := cluster.NewNode("local", "Local", cluster.RoleCompactor, "test-cluster")
+	registry := cluster.NewRegistry(&cluster.RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
+	reader := cluster.NewNode("reader-1", "Reader", cluster.RoleReader, "test-cluster")
+	reader.UpdateState(cluster.StateHealthy)
+	reader.APIAddress = strings.TrimPrefix(srv.URL, "http://")
+	require.NoError(t, registry.Register(reader))
+	router := cluster.NewRouter(&cluster.RouterConfig{
+		Timeout:         5 * time.Minute,
+		Registry:        registry,
+		LocalNode:       local,
+		Logger:          zerolog.Nop(),
+		PeerReadQueries: func(string) bool { return true },
+	})
+	r.qh.SetRouter(router)
 
 	done := make(chan int)
 	go func() {
@@ -180,6 +202,11 @@ func TestForwardedQueryIsListedAndCancellable(t *testing.T) {
 		done <- status
 	}()
 
+	select {
+	case <-peerReceived:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the forward never reached the peer")
+	}
 	var entry *queryregistry.TrackedQuery
 	require.Eventually(t, func() bool {
 		for _, q := range reg.GetActive() {

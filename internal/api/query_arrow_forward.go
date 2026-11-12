@@ -72,8 +72,13 @@ var errForwardedArrowPanicked = errors.New("forwarded Arrow stream relay panicke
 // runs the query locally.
 func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error) {
 	m := metrics.Get()
-	httpReq, err := BuildHTTPRequest(c)
+	// Built only here, past the forward decision (#1629). cancel is called
+	// on every early return below, and otherwise by the stream writer
+	// (closeUpstream), which outlives this handler.
+	ctx, cancel := forwardContext(h.router)
+	httpReq, release, err := BuildHTTPRequest(c, ctx)
 	if err != nil {
+		cancel()
 		h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding an Arrow query")
 		m.IncQueryErrors()
 		return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -82,10 +87,14 @@ func (h *QueryHandler) forwardArrowQuery(c *fiber.Ctx) (handled bool, err error)
 		})
 	}
 
+	// The router reads the request body before it sends anything (doForward
+	// buffers it for retries), so the body is released when this handler
+	// returns, even while the stream writer relays the answer.
+	defer release()
 	// The request's context carries the forwarded identity
 	// (BuildHTTPRequest); cancellation is layered on it, not substituted.
 	// The header timer bounds only the wait for the answer to start.
-	ctx, cancel := context.WithCancel(httpReq.Context())
+	ctx = httpReq.Context()
 	// Registered so /api/v1/queries on this node lists and cancels the
 	// forward; cancelled when the client disconnects, as a local query is.
 	queryID := ""
