@@ -123,6 +123,7 @@ func (h *GovernanceHandler) ListPolicies(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.UserContext(), 30*time.Second)
 	defer cancel()
 
+	scope := h.manager.PolicyScope() // before the read: it only moves node -> cluster
 	policies, err := h.manager.ListPolicies(ctx)
 	if handled, resp := h.clusterError(c, err, 0); handled {
 		return resp
@@ -139,6 +140,7 @@ func (h *GovernanceHandler) ListPolicies(c *fiber.Ctx) error {
 		"success":  true,
 		"policies": policies,
 		"count":    len(policies),
+		"scope":    scope,
 	})
 }
 
@@ -156,6 +158,7 @@ func (h *GovernanceHandler) GetPolicy(c *fiber.Ctx) error {
 		})
 	}
 
+	scope := h.manager.PolicyScope()
 	policy, err := h.manager.GetPolicyFor(ctx, tokenID, h.tokenFP(tokenID))
 	if handled, resp := h.clusterError(c, err, tokenID); handled {
 		return resp
@@ -175,6 +178,7 @@ func (h *GovernanceHandler) GetPolicy(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"success": true,
 		"policy":  policy,
+		"scope":   scope,
 	})
 }
 
@@ -346,6 +350,7 @@ func (h *GovernanceHandler) GetUsage(c *fiber.Ctx) error {
 	}
 
 	tokenFP := h.tokenFP(tokenID)
+	scope := h.manager.PolicyScope()
 	usage := h.manager.GetTokenUsageFor(tokenID, tokenFP)
 	policy := h.manager.GetCachedPolicyFor(tokenID, tokenFP)
 
@@ -353,5 +358,8 @@ func (h *GovernanceHandler) GetUsage(c *fiber.Ctx) error {
 		"success": true,
 		"usage":   usage,
 		"policy":  policy,
+		// scope: whose policies apply to the token on this node (#1627).
+		// A policy with id 0 is still the server defaults.
+		"scope": scope,
 	})
 }

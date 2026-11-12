@@ -132,7 +132,7 @@ func TestGovernanceUsesTheTokensFingerprint(t *testing.T) {
 	app.Get("/policies/:token_id", h.GetPolicy)
 	status, body := sendGovernance(t, app, "GET", "/policies/"+strconv.FormatInt(info.ID, 10), "")
 	policy, _ := body["policy"].(map[string]any)
-	if status != fiber.StatusOK || policy["max_rows_per_query"] != float64(42) {
+	if status != fiber.StatusOK || policy["max_rows_per_query"] != float64(42) || body["scope"] != "cluster" {
 		t.Fatalf("GET of the cluster token's policy: %d %v", status, body)
 	}
 
@@ -211,4 +211,81 @@ func TestGovernanceTableListerAndMirror(t *testing.T) {
 	if err := GovernanceTableMirror(nil, path, stubGovernanceView{}, zerolog.Nop())(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// The policy list, get and usage answers say whose policies this node
+// enforces: "node" standalone or before it caught up with the cluster that
+// owns them, "cluster" once it has. Nothing else in them changes.
+func TestGovernanceAnswersCarryTheScope(t *testing.T) {
+	routes := func(m *governance.Manager) *fiber.App {
+		h := NewGovernanceHandler(m, nil, nil, zerolog.Nop())
+		app := fiber.New()
+		app.Get("/policies", h.ListPolicies)
+		app.Get("/policies/:token_id", h.GetPolicy)
+		app.Get("/usage/:token_id", h.GetUsage)
+		return app
+	}
+	check := func(t *testing.T, app *fiber.App, path, want string) map[string]any {
+		t.Helper()
+		status, body := sendGovernance(t, app, "GET", path, "")
+		if status != fiber.StatusOK || body["scope"] != want {
+			t.Fatalf("GET %s: %d %v, want scope %q", path, status, body, want)
+		}
+		return body
+	}
+
+	t.Run("standalone", func(t *testing.T) {
+		app := routes(newGovernanceTestManager(t, &governance.Policy{TokenID: 7, MaxRowsPerQuery: 9}))
+		if body := check(t, app, "/policies", "node"); body["count"] != float64(1) {
+			t.Fatalf("list %v", body)
+		}
+		check(t, app, "/policies/7", "node")
+		check(t, app, "/usage/7", "node")
+	})
+
+	newClusterManager := func(t *testing.T, db *sql.DB) *governance.Manager {
+		m, err := governance.NewManager(&governance.ManagerConfig{DB: db, Config: &config.GovernanceConfig{DefaultMaxRowsPerQuery: 3}, Logger: zerolog.Nop(), Cluster: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.SetClusterSource(&stubGovernanceCluster{seeded: true})
+		return m
+	}
+	t.Run("cluster", func(t *testing.T) {
+		db, _ := sql.Open("sqlite3", ":memory:")
+		t.Cleanup(func() { db.Close() })
+		m := newClusterManager(t, db)
+		m.SyncClusterView(entriesView{{GovernancePolicyEntry: raft.GovernancePolicyEntry{ID: 4, TokenID: 7, MaxRowsPerQuery: 9}, TokenHash: "h"}})
+		app := routes(m)
+		if body := check(t, app, "/policies", "cluster"); body["count"] != float64(1) {
+			t.Fatalf("list %v", body)
+		}
+		// No auth here: the token's fingerprint is unknown, so GET finds no
+		// policy for it and usage shows the defaults (id 0).
+		body := check(t, app, "/usage/7", "cluster")
+		if p, _ := body["policy"].(map[string]any); p["id"] != float64(0) || p["max_rows_per_query"] != float64(3) {
+			t.Fatalf("usage policy %v, want the defaults with id 0", body["policy"])
+		}
+	})
+
+	t.Run("not caught up", func(t *testing.T) {
+		db, _ := sql.Open("sqlite3", ":memory:")
+		t.Cleanup(func() { db.Close() })
+		if err := governance.EnsureSchema(db); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO governance_cluster_state (name, value) VALUES ('owned', '1')`); err != nil {
+			t.Fatal(err)
+		}
+		m := newClusterManager(t, db)
+		m.SyncClusterView(stubGovernanceView{})
+		app := routes(m)
+		if status, _ := sendGovernance(t, app, "GET", "/policies", ""); status != fiber.StatusServiceUnavailable {
+			t.Fatalf("list before catching up: %d", status)
+		}
+		body := check(t, app, "/usage/7", "node")
+		if p, _ := body["policy"].(map[string]any); p["id"] != float64(0) || p["max_rows_per_query"] != float64(3) {
+			t.Fatalf("usage policy %v, want the defaults with id 0", body["policy"])
+		}
+	})
 }

@@ -125,6 +125,25 @@ func (m *Manager) clusterSource() ClusterSource {
 	return nil
 }
 
+// Scopes a policy answer reports: what this node enforces.
+const (
+	ScopeCluster = "cluster" // the cluster's policies (adopted, caught up)
+	ScopeNode    = "node"    // this node's own table, or only its defaults
+)
+
+// PolicyScope reports whose policies this node enforces now: the cluster's
+// once it owns them and this node has caught up, this node's otherwise
+// (standalone, before adoption, or a restart not caught up yet, when only
+// the defaults apply). It only ever moves from node to cluster, so a caller
+// that reads it before the policies never labels this node's as the
+// cluster's.
+func (m *Manager) PolicyScope() string {
+	if v := m.cluster.view.Load(); v != nil && v.caughtUp {
+		return ScopeCluster
+	}
+	return ScopeNode
+}
+
 // ClusterMode reports whether a cluster source is installed: the cluster may
 // own the policies, and reads and writes then name a token by its ID and the
 // fingerprint of its stored hash.
