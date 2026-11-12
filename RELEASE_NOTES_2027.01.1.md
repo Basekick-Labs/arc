@@ -153,7 +153,8 @@ These cases are still not repaired:
   damaged,** or the damaged entry is followed directly by a torn write.
   Nothing confirms a length, so the entry still reads as a torn write.
 - **A length damaged to be longer but still inside the file.** The entry
-  fails its checksum and counts as damaged, so the file is kept. Repairing it
+  fails its checksum and counts as damaged, so the file is kept or
+  quarantined (see #1634 above), never deleted. Repairing it
   would make the replay and the checkpoint scan disagree about where entries
   start, because the checkpoint scan steps over entries by their stated
   length without reading them. An entry could then be replayed twice.

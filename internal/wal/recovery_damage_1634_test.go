@@ -235,8 +235,9 @@ func TestNonChecksumDamageKeepsStrikes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Undo the checksum flip, then break the second frame's length instead.
-	flipSecondEntry(t, paths[0])
+	// Break the second frame's length as well as its payload: past the limit,
+	// and unrepairable, since no prefix matches the damaged payload's checksum
+	// (an intact payload's length is repaired, #1641).
 	data, err = os.ReadFile(paths[0])
 	if err != nil {
 		t.Fatal(err)
