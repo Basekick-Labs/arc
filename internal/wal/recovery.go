@@ -280,10 +280,12 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 	// same bytes, and waiting for three strikes only kept every newer file
 	// unreplayed. Its checkpoints stay proof: quarantined files are scanned.
 	// Under the registration hold the file is kept and struck instead, as
-	// before, since every later file of the pass is kept too. Reports whether
-	// the pass can go on.
+	// before, and retaining is set so no later file of the pass is deleted:
+	// a later file's checkpoints can be the only proof for its entries.
+	// Reports whether the pass can go on.
 	quarantineDamaged := func(path string, damaged int64, hold bool) bool {
 		if hold {
+			retaining = true
 			quarantinedAs, err := r.noteReplayFailure(path, maxReplayFailures)
 			if quarantinedAs == "" {
 				if err != nil {
@@ -296,7 +298,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		}
 		quarantinedAs, err := r.quarantine(path)
 		if quarantinedAs == "" {
-			stats.KeptFiles++
+			// KeptFiles: the caller counts this file with the rest.
 			recoveryErr = fmt.Errorf("quarantine damaged WAL file %q: %w", path, err)
 			r.logger.Error().Err(err).Str("file", path).Msg("Failed to quarantine a WAL file with damaged entries; keeping it")
 			return false
@@ -800,14 +802,17 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			allEntriesSucceeded = false
 		}
 
-		if !allEntriesSucceeded && !entryFailed && reader.CorruptedEntries > 0 {
-			// Damaged frames and nothing else (#1634): quarantine after the
-			// barrier, and go on to the newer files in this pass.
+		if !allEntriesSucceeded && !entryFailed && reader.CorruptedEntries > 0 && reader.ChecksumMismatches == reader.CorruptedEntries {
+			// Checksum mismatches and nothing else (#1634): quarantine after
+			// the barrier, and go on to the newer files in this pass. Any
+			// other damage keeps the strikes: a read error can be transient,
+			// and a frame that does not parse may be a format a later build
+			// reads.
 			r.logger.Error().
 				Str("file", filepath.Base(walFile)).
 				Int64("damaged_entries", reader.CorruptedEntries).
 				Int("recovered_entries", fileRecoveredEntries).
-				Msg("WAL file has damaged entries (checksum mismatch): its intact entries are replayed, and it is quarantined once they are stored. The damaged entries cannot be recovered")
+				Msg("WAL file has damaged entries (checksum mismatch): the entries read intact are replayed, and the file is quarantined once they are stored. The damaged entries, and any the damage made unreadable, cannot be replayed")
 			pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents, cov: fileCov, quarantine: true, damaged: reader.CorruptedEntries})
 			pendingRows += fileRecoveredEntries
 			if !flushPending() {

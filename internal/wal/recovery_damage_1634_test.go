@@ -224,3 +224,78 @@ func TestUndecodableEntryStillTakesThreePasses(t *testing.T) {
 		t.Fatal("not quarantined after three passes")
 	}
 }
+
+// Damage that is not a checksum mismatch (here a length past the limit, the
+// shape a read error or a damaged length field takes) keeps the strikes: it
+// may be transient, and the reader cannot resync after it.
+func TestNonChecksumDamageKeepsStrikes(t *testing.T) {
+	dir := t.TempDir()
+	paths := damageWALs(t, dir, 2)
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Undo the checksum flip, then break the second frame's length instead.
+	flipSecondEntry(t, paths[0])
+	data, err = os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := WALFileHeaderSize + WALEntryHeaderSize + int(binary.BigEndian.Uint32(data[WALFileHeaderSize:WALFileHeaderSize+4]))
+	binary.BigEndian.PutUint32(data[second:second+4], MaxWALPayloadSize+1)
+	if err := os.WriteFile(paths[0], data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var log replayLog
+	stats, _ := NewRecovery(dir, zerolog.Nop()).RecoverWithOptions(context.Background(), log.callback, &RecoveryOptions{BeforeDelete: log.barrier})
+	if stats.QuarantinedFiles != 0 || !exists(paths[0]) || !exists(paths[1]) {
+		t.Fatalf("non-checksum damage quarantined at once: stats %+v", stats)
+	}
+	if n, _ := readReplayAttempts(paths[0]); n != 1 {
+		t.Fatalf("strikes %d, want 1", n)
+	}
+}
+
+// Under the registration hold the damaged file is kept and struck, and no
+// later file of the pass is deleted: a later file holds the only checkpoint
+// for a batch of the damaged file, which must not be replayed again.
+func TestDamagedFileUnderTheHoldKeepsLaterProof(t *testing.T) {
+	dir := t.TempDir()
+	w := crashRecoveryWriter(t, dir)
+	first := w.CurrentFile()
+	tokens := commitCovered(t, w, "db1/cpu", 1) // flushed before the crash
+	commitCovered(t, w, "db1/cpu", 2)           // its frame is damaged below
+	if err := w.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	second := w.CurrentFile()
+	if err := w.MarkFlushed(tokens); err != nil { // the checkpoint lands in the second file
+		t.Fatal(err)
+	}
+	inst := w.TrackedInstance()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	flipSecondEntry(t, first)
+
+	hold := newFakeHold()
+	hold.set(inst, "db1/cpu", 1, true)
+	replays := 0
+	run := func() *RecoveryStats {
+		stats, _ := NewRecovery(dir, zerolog.Nop()).RecoverWithOptions(context.Background(), nil, &RecoveryOptions{
+			ColumnarCallback: func(context.Context, string, string, map[string][]interface{}, string) error { replays++; return nil },
+			BeforeDelete:     func(context.Context) error { return nil },
+			Held:             hold.source(),
+		})
+		return stats
+	}
+	stats := run()
+	if !exists(first) || !exists(second) {
+		t.Fatalf("pass 1 deleted proof: stats %+v", stats)
+	}
+	replays = 0
+	run()
+	if replays != 0 {
+		t.Fatalf("a flushed batch was replayed again (%d)", replays)
+	}
+}

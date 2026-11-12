@@ -975,8 +975,9 @@ func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 }
 func (m *Metrics) IncWALQuarantinedFiles() { m.walQuarantinedFiles.Add(1) }
 
-// AddWALDamagedEntries counts the damaged frames of a WAL file quarantined
-// for damage (#1634): rows recovery cannot bring back.
+// AddWALDamagedEntries counts the damaged frames (checksum mismatches) of a
+// WAL file quarantined on the first pass (#1634): entries recovery cannot
+// replay. Files quarantined after three strikes are not counted here.
 func (m *Metrics) AddWALDamagedEntries(n int64) { m.walDamagedEntries.Add(n) }
 
 // GetWALDamagedEntries reads arc_wal_damaged_entries_total.
@@ -2119,7 +2120,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures, or at once when their only failure is damaged entries\n"...)
 	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
 	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
-	b = append(b, "# HELP arc_wal_damaged_entries_total Damaged WAL entries (checksum mismatch) in files recovery quarantined; their rows cannot be replayed\n"...)
+	b = append(b, "# HELP arc_wal_damaged_entries_total Damaged WAL entries (checksum mismatch) in files recovery quarantined on the first pass; their rows cannot be replayed\n"...)
 	b = append(b, "# TYPE arc_wal_damaged_entries_total counter\n"...)
 	b = appendMetric(b, "arc_wal_damaged_entries_total", float64(m.walDamagedEntries.Load()))
 
