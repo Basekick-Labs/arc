@@ -822,6 +822,9 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
+	// lifetime is the context read requests run on (SetLifetime); nil
+	// leaves them on Fiber's background context.
+	lifetime context.Context
 	// warehouse names the Iceberg warehouse's directories in the storage
 	// root, which the listings leave out (#1626); nil with Iceberg off.
 	warehouse   WarehouseDirs
@@ -1628,6 +1631,29 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
 }
 
+// SetLifetime sets the context the read endpoints run their queries on when
+// the request carries none of its own: api.Server.QueryLifetime, which
+// shutdown cancels once its grace is over (#1644). Call before serving.
+// Without it a query ends only at its timeout or its client's disconnect.
+func (h *QueryHandler) SetLifetime(ctx context.Context) {
+	h.lifetime = ctx
+}
+
+// bindQueryLifetime wraps next (the read-auth middleware) so the request's
+// user context is the handler's lifetime. Every query derives its DuckDB
+// context from c.UserContext(), so ending the lifetime ends the query, and
+// the Arrow and MessagePack streams that run after the handler returns. A
+// context already set is kept: the Flight SQL bridge sets its own, which its
+// shutdown cancels.
+func (h *QueryHandler) bindQueryLifetime(next fiber.Handler) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if h.lifetime != nil && c.UserContext() == context.Background() {
+			c.SetUserContext(h.lifetime)
+		}
+		return next(c)
+	}
+}
+
 // OpenCompactions is what the query layer needs from the compactions a read
 // must account for: compaction.OpenJobs on this node, and in a cluster the
 // coordinator's committed jobs and pending local deletes
@@ -2256,7 +2282,11 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// authority comes from RBAC alone (#1559). SetAuthAndRBAC runs before
 	// RegisterRoutes (cmd/arc/main.go), so both managers are already set here:
 	// the checker is captured now, not looked up per request.
-	readAuth := withAnyResourceReadAuth(h.authManager, h.rbacManager)
+	//
+	// Each read also runs on the handler's lifetime (bindQueryLifetime), so
+	// shutdown can end the queries still running when its grace is over
+	// (#1644). The rebuild route is a write and keeps its own context.
+	readAuth := h.bindQueryLifetime(withAnyResourceReadAuth(h.authManager, h.rbacManager))
 	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Same execution pipeline as /api/v1/query, but the response is
 	// streamed as MessagePack instead of JSON — columnar, typed, and
