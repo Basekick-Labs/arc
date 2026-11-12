@@ -68,7 +68,9 @@ type Deps struct {
 	// the single-batch concat is the serial tail this slice removes). The api side
 	// owns the governance cap/timeout, the metrics/onComplete callbacks, and the
 	// runtime.KeepAlive that holds the FFI-backed reader alive across the async wire
-	// writer (its Release is a no-op; the arcx buffers free on a GC finalizer). `start`
+	// writer, and it releases the reader when the writer is done (Release frees the
+	// current batch and drops the engine stream; only the stream struct has a GC
+	// cleanup). `start`
 	// is when the query began (BEFORE the engine ran) so execution_time_ms covers the
 	// engine work. Returns true if it served. nil in shadow-only wiring.
 	ServeStream func(c *fiber.Ctx, reader array.RecordReader, start time.Time) bool
@@ -295,9 +297,11 @@ func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (reader arr
 			}
 			return nil, false
 		}
-		// caller owns r: it drains the reader to the IPC wire and MUST
-		// runtime.KeepAlive(r) past the last batch (the FFI-backed batches free on a
-		// GC finalizer; Release is a no-op) — the FFI use-after-free cliff.
+		// caller owns r: it streams the reader to the IPC wire, MUST Release it
+		// when done (a reader stopped before EOF, at the governance cap or on a
+		// cancel, otherwise leaks its current batch and keeps the engine's
+		// workers until a GC), and MUST runtime.KeepAlive(r) past the last batch
+		// — the FFI use-after-free cliff.
 		return r, true
 	default:
 		return nil, false
@@ -854,9 +858,13 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	}
 	rec, err := drainReaderToRecord(reader, ShadowMaxRows)
 	// KeepAlive: the reader (holding FFI-backed arcx buffers) must stay reachable until
-	// AFTER the drain reads the last batch — Release is a no-op; the stream frees on a GC
-	// finalizer, so an early finalize is a use-after-free.
+	// AFTER the drain reads the last batch, so an early collection is a use-after-free.
+	// Release afterwards: a drain stopped at ShadowMaxRows has not reached EOF, and the
+	// reader's current batch (no GC cleanup of its own) and the engine stream (whose
+	// Drop stops arcx's workers) are freed only by Release. drainReaderToRecord has
+	// already copied what it needs into rec.
 	runtime.KeepAlive(reader)
+	reader.Release()
 	if errors.Is(err, errShadowTruncated) {
 		// Too big to compare in memory. A SKIP, not an error and not a mismatch — arcx
 		// may well be correct here; we simply declined to hold the result. Alarming would
@@ -1111,16 +1119,16 @@ func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL 
 		return false
 	}
 	if h.ServeStream == nil {
-		// No streamer wired (shadow-only build/config) — release the reader (its
-		// Release is a no-op; the stream frees on GC finalizer) and fall back.
+		// No streamer wired (shadow-only build/config) — release the reader (this
+		// frees its current batch and drops the engine stream) and fall back.
 		reader.Release()
 		return false
 	}
 	// ServeStream owns the reader across the async wire writer: it must
-	// runtime.KeepAlive(reader) until AFTER the last batch is encoded, because the
-	// imported reader's Release is a no-op and the FFI-backed batches free on a GC
-	// finalizer — a reader that goes unreachable mid-encode is the design doc's FFI
-	// use-after-free cliff. The router does NOT defer-release here; the reader's
-	// lifetime is the streamer's, held for the in-flight response.
+	// runtime.KeepAlive(reader) until AFTER the last batch is encoded — a reader
+	// that goes unreachable mid-encode is the design doc's FFI use-after-free
+	// cliff — and it releases the reader when the writer is done. The router does
+	// NOT defer-release here; the reader's lifetime is the streamer's, held for the
+	// in-flight response.
 	return h.ServeStream(c, reader, start)
 }

@@ -125,20 +125,22 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 	}
 
 	queryArrow, _ := load("query_arrow.go", "executeQueryArrow")
-	var dispatchHasCap, dispatchHasCallbacks bool
+	var dispatchHasCap, dispatchHasCallbacks, dispatchHasStart bool
 	ast.Inspect(queryArrow.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
-		if !ok || len(call.Args) <= 9 {
+		if !ok || len(call.Args) <= 10 {
 			return true
 		}
 		fn, ok := call.Fun.(*ast.Ident)
 		if !ok || fn.Name != "arcxArrowDispatch" {
 			return true
 		}
-		capArg, ok := call.Args[7].(*ast.Ident)
+		startArg, ok := call.Args[4].(*ast.Ident)
+		dispatchHasStart = ok && startArg.Name == "start"
+		capArg, ok := call.Args[8].(*ast.Ident)
 		dispatchHasCap = ok && capArg.Name == "governanceMaxRows"
-		rowsArg, rowsOK := call.Args[8].(*ast.Ident)
-		disconnectArg, disconnectOK := call.Args[9].(*ast.Ident)
+		rowsArg, rowsOK := call.Args[9].(*ast.Ident)
+		disconnectArg, disconnectOK := call.Args[10].(*ast.Ident)
 		dispatchHasCallbacks = rowsOK && rowsArg.Name == "arcxOnRows" &&
 			disconnectOK && disconnectArg.Name == "recordDisconnect"
 		return false
@@ -149,6 +151,123 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 	if !dispatchHasCallbacks {
 		t.Error("Arrow query handler does not pass row and disconnect callbacks to the ArcX hook")
 	}
+	if !dispatchHasStart {
+		t.Error("Arrow query handler does not pass its start time to the ArcX hook")
+	}
+
+	// The hook times the query from the handler's start (as the DuckDB path
+	// does), so it must not take a start of its own, and it must answer with
+	// the helper's verdict (the helper declines a context that already ended).
+	ast.Inspect(real.Body, func(node ast.Node) bool {
+		if assign, ok := node.(*ast.AssignStmt); ok {
+			for _, lhs := range assign.Lhs {
+				if id, ok := lhs.(*ast.Ident); ok && id.Name == "start" {
+					t.Error("native arcx Arrow hook assigns its own start; Arc-Execution-Time-Ms would not match DuckDB's origin")
+				}
+			}
+		}
+		return true
+	})
+	returnsHelper := false
+	ast.Inspect(real.Body, func(node ast.Node) bool {
+		ret, ok := node.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			return true
+		}
+		if call, ok := ret.Results[0].(*ast.CallExpr); ok {
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "serveArcxArrowIPCResult" {
+				returnsHelper = true
+				if len(call.Args) < 6 || !isIdent(call.Args[5], "start") {
+					t.Error("native arcx Arrow hook does not hand the handler's start to the helper")
+				}
+			}
+		}
+		return true
+	})
+	if !returnsHelper {
+		t.Error("native arcx Arrow hook does not return the helper's served/declined result")
+	}
+
+	// FFI lifetime: every arcx stream writer releases its reader and keeps it
+	// reachable to the very end. The deferred block's LAST statement must be
+	// runtime.KeepAlive(reader), after releaseArrowStreamResourcesFunc.
+	checkWriterDefers := func(where string, fn *ast.FuncDecl) {
+		t.Helper()
+		writers := 0
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "setDirectBodyStream" || len(call.Args) != 6 {
+				return true
+			}
+			writer, ok := call.Args[5].(*ast.FuncLit)
+			if !ok {
+				t.Errorf("%s: a stream writer is not a function literal", where)
+				return true
+			}
+			writers++
+			var deferred *ast.FuncLit
+			for _, stmt := range writer.Body.List {
+				if d, ok := stmt.(*ast.DeferStmt); ok {
+					if lit, ok := d.Call.Fun.(*ast.FuncLit); ok {
+						deferred = lit
+						break
+					}
+				}
+			}
+			if deferred == nil || len(deferred.Body.List) == 0 {
+				t.Errorf("%s: stream writer has no deferred cleanup block", where)
+				return true
+			}
+			stmts := deferred.Body.List
+			isCall := func(stmt ast.Stmt, pkg, name string) bool {
+				es, ok := stmt.(*ast.ExprStmt)
+				if !ok {
+					return false
+				}
+				c, ok := es.X.(*ast.CallExpr)
+				if !ok {
+					return false
+				}
+				switch f := c.Fun.(type) {
+				case *ast.SelectorExpr:
+					x, ok := f.X.(*ast.Ident)
+					return ok && x.Name == pkg && f.Sel.Name == name &&
+						len(c.Args) == 1 && isIdent(c.Args[0], "reader")
+				case *ast.Ident:
+					return pkg == "" && f.Name == name
+				}
+				return false
+			}
+			if !isCall(stmts[len(stmts)-1], "runtime", "KeepAlive") {
+				t.Errorf("%s: runtime.KeepAlive(reader) is not the last statement of the writer's deferred block", where)
+			}
+			released := false
+			for _, stmt := range stmts[:len(stmts)-1] {
+				if es, ok := stmt.(*ast.ExprStmt); ok {
+					if c, ok := es.X.(*ast.CallExpr); ok {
+						if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "releaseArrowStreamResourcesFunc" &&
+							len(c.Args) > 0 && isIdent(c.Args[0], "reader") {
+							released = true
+						}
+					}
+				}
+			}
+			if !released {
+				t.Errorf("%s: the writer's deferred block does not release the reader before KeepAlive", where)
+			}
+			return true
+		})
+		if writers == 0 {
+			t.Errorf("%s: no stream writer found", where)
+		}
+	}
+	checkWriterDefers("serveArcxArrowIPCResult", helper)
+	serveResult, _ := load("arcx_hook.go", "serveArcxResult")
+	checkWriterDefers("serveArcxResult", serveResult)
 
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "arcx_hook.go", nil, parser.AllErrors)
@@ -177,4 +296,9 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 		return
 	}
 	t.Error("tryArcxRouter missing from arcx_hook.go")
+}
+
+func isIdent(expr ast.Expr, name string) bool {
+	id, ok := expr.(*ast.Ident)
+	return ok && id.Name == name
 }

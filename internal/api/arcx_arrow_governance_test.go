@@ -90,7 +90,6 @@ func TestServeArcxArrowIPCResultAppliesGovernanceCap(t *testing.T) {
 		records[batch] = buildArrowBatch(alloc, schema, rows)
 	}
 	reader := newSimpleRecordReader(schema, records)
-	defer reader.Release()
 
 	var rowsReported int64
 	var completed int
@@ -141,7 +140,6 @@ func TestServeArcxArrowIPCResultKeepsCapSuccessfulWhenContextExpiresAfterBatch(t
 		rows[i] = []interface{}{int64(i)}
 	}
 	base := newSimpleRecordReader(schema, []arrow.Record{buildArrowBatch(alloc, schema, rows)})
-	defer base.Release()
 	ctx, cancel := context.WithCancel(context.Background())
 	reader := &cancelOnRecordReader{RecordReader: base, cancel: cancel}
 
@@ -170,7 +168,6 @@ func TestServeArcxArrowIPCResultLeavesCapTrailerEmptyWithoutCap(t *testing.T) {
 	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
 	record := buildArrowBatch(alloc, schema, [][]interface{}{{int64(1)}, {int64(2)}})
 	reader := newSimpleRecordReader(schema, []arrow.Record{record})
-	defer reader.Release()
 
 	resp, body := writeArcxArrowResponse(t, reader, context.Background(), 0, nil, nil, nil, func(string) {
 		t.Error("uncapped successful stream reported an error")
@@ -200,7 +197,6 @@ func TestServeArcxArrowIPCResultMarksCappedFailureAsTruncated(t *testing.T) {
 	}
 	base := newSimpleRecordReader(schema, []arrow.Record{buildArrowBatch(alloc, schema, rows)})
 	reader := &failingRecordReader{simpleRecordReader: base, err: errors.New("reader failed after cap")}
-	defer reader.Release()
 
 	var rowsReported int64
 	var completed, failed bool
@@ -233,22 +229,26 @@ func TestServeArcxArrowIPCResultMarksCancellationAsTruncated(t *testing.T) {
 	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
 	defer alloc.AssertSize(t, 0)
 	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
-	record := buildArrowBatch(alloc, schema, [][]interface{}{{int64(1)}})
-	reader := newSimpleRecordReader(schema, []arrow.Record{record})
-	defer reader.Release()
+	// Cancelled while streaming, after the first of two batches. A context
+	// that has ended before the stream starts is declined instead (see
+	// TestArcxArrowExpiredBeforeStreamDeclines).
+	records := []arrow.Record{
+		buildArrowBatch(alloc, schema, [][]interface{}{{int64(1)}}),
+		buildArrowBatch(alloc, schema, [][]interface{}{{int64(2)}}),
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	reader := &cancelOnRecordReader{RecordReader: newSimpleRecordReader(schema, records), cancel: cancel}
 
 	var rows int64
 	var disconnects, completed, failed int
 	resp, body := writeArcxArrowResponse(
-		t, reader, ctx, 1,
+		t, reader, ctx, 2,
 		func(got int64) { rows = got },
 		func() { disconnects++ },
 		func(int) { completed++ },
 		func(string) { failed++ },
 	)
-	if rows != 0 || disconnects != 1 || completed != 0 || failed != 1 {
+	if rows != 1 || disconnects != 1 || completed != 0 || failed != 1 {
 		t.Fatalf("callbacks: rows %d, disconnects %d, completed %d, failed %d", rows, disconnects, completed, failed)
 	}
 	if got := resp.Trailer.Get(arrowRowsCappedTrailer); got != "" {

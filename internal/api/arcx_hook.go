@@ -96,11 +96,13 @@ func (h *QueryHandler) tryArcxRouter(
 // shadow mode it runs the compare and returns false; declines/errors return false
 // so the caller's DuckDB IPC path serves. execCtx must be the caller's
 // background-derived context (NOT the pooled Fiber ctx — used inside the async
-// stream writer).
+// stream writer). start is the handler's start, so Arc-Execution-Time-Ms and the
+// latency histogram measure from the same origin as the DuckDB Arrow path.
 func (h *QueryHandler) tryArcxRouterArrow(
 	c *fiber.Ctx,
 	execCtx context.Context,
 	cancel context.CancelFunc,
+	start time.Time,
 	rawSQL, headerDB, convertedSQL string,
 	governanceMaxRows int,
 	onRows func(int64),
@@ -108,9 +110,6 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	onComplete func(int),
 	onFail func(string),
 ) (handled bool) {
-	// Captured for RecordQueryLatency (F1): this path previously recorded no latency at
-	// all, so arcx-served Arrow-IPC queries were invisible in the latency histogram.
-	start := time.Now()
 	mode := arcxMode()
 	if mode == arcxrouter.ModeOff {
 		return false
@@ -138,14 +137,15 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	if !served {
 		return false
 	}
-	// The helper owns the asynchronous stream and keeps ArcX's FFI-backed
-	// batches alive until the final read. It also applies the governance cap
-	// and publishes the same trailers as the DuckDB Arrow path.
-	h.serveArcxArrowIPCResult(
+	// The helper owns the reader and the asynchronous stream: it releases the
+	// reader and keeps it reachable until the final read, applies the
+	// governance cap and publishes the DuckDB Arrow path's trailers. It
+	// declines, with the reader released, when execCtx ended while the engine
+	// ran; DuckDB then answers 504 or 500 before any body.
+	return h.serveArcxArrowIPCResult(
 		c.Context(), execCtx, cancel, reader, governanceMaxRows, start,
 		onRows, onDisconnect, onComplete, onFail,
 	)
-	return true
 }
 
 // serveArcxResult streams a single arcx arrow.Record to the response in the
@@ -165,10 +165,14 @@ func (h *QueryHandler) tryArcxRouterArrow(
 // governance cap and records the same metrics/registry completion as the DuckDB path.
 //
 // FFI MEMORY CLIFF: the reader is backed by arcx-owned Arrow buffers imported over the C
-// Data Interface. Its Release() is a NO-OP (arrow-go v18); the buffers free on a GC
-// FINALIZER. So a reader that goes unreachable while the async encoder still reads is a
-// use-after-free (process-fatal, in-process cgo). The load-bearing guarantee is
-// runtime.KeepAlive(reader) as the LAST statement of each async callback. `cancel` is the
+// Data Interface. Only the C stream struct has a GC cleanup, so a reader that goes
+// unreachable while the async encoder still reads is a use-after-free (process-fatal,
+// in-process cgo). The load-bearing guarantee is runtime.KeepAlive(reader) as the LAST
+// statement of each async callback. This function owns the reader and releases it on
+// every path: Release (arrow-go v18 cdata) is NOT a no-op. It frees the current batch,
+// which has no cleanup of its own, and drops the engine stream, whose Drop stops arcx's
+// decode workers. A reader abandoned before EOF (the governance cap, a drain error, a
+// cancel) and never released leaks that batch and parks the workers until a GC runs. `cancel` is the
 // request's timeout cancel — owned here (called after the async writer finishes), not by
 // the caller, because the stream writer runs after the handler returns.
 func (h *QueryHandler) serveArcxResult(
@@ -212,9 +216,8 @@ func (h *QueryHandler) serveArcxResult(
 			for _, b := range batches {
 				b.Release()
 			}
-			if cancel != nil {
-				cancel()
-			}
+			releaseArrowStreamResourcesFunc(reader, nil, cancel, h.logger)
+			runtime.KeepAlive(reader)
 			if onFail != nil {
 				onFail(derr.Error())
 			}
@@ -234,9 +237,9 @@ func (h *QueryHandler) serveArcxResult(
 				for _, b := range batches {
 					b.Release()
 				}
-				if cancel != nil {
-					cancel()
-				}
+				// drainArrowBatches stops at the cap without reaching EOF,
+				// so the reader still holds its current batch and stream.
+				releaseArrowStreamResourcesFunc(reader, nil, cancel, h.logger)
 				// LAST: hold the FFI buffers past the final read (the
 				// encoder goroutines read the batches until the stream
 				// returns), as the JSON callback does.
@@ -292,11 +295,12 @@ func (h *QueryHandler) serveArcxResult(
 		}
 	}, func(w *bufio.Writer) {
 		defer func() {
-			if cancel != nil {
-				cancel()
-			}
+			// streamArrowJSON stops at the governance cap without reaching EOF:
+			// release the reader so its current batch and engine stream are freed
+			// now, not left to a GC cleanup (only the stream struct has one).
+			releaseArrowStreamResourcesFunc(reader, nil, cancel, h.logger)
 			// LAST: keep the FFI-backed reader reachable until after the encoder's final
-			// read. Release is a no-op; the finalizer frees the arcx buffers.
+			// read.
 			runtime.KeepAlive(reader)
 		}()
 		rc, serr := streamArrowJSON(streamCtx, w, reader, governanceMaxRows, nil, start, timestamp)

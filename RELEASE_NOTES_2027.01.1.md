@@ -3931,14 +3931,20 @@ so a client, or a compactor forwarding the query (#1567), never saw
 Now the arcx path streams through the same writer as the DuckDB path:
 - The result stops at the cap, `Arc-Rows-Capped` names it, and the query's
   history entry records it, as on DuckDB.
-- All three trailers are declared, and `Arc-Execution-Time-Ms` is set on
-  every response, including a failed one.
-- A deadline that expires mid-stream counts in `arc_query_timeouts_total`,
-  and a timeout or cancel counts as a client disconnect, as on DuckDB.
-- A client that has gone away gets no truncation marker or trailer written
-  to its closed connection.
-- The truncation reason reads like DuckDB's (`stream cancelled at row N: …`)
-  instead of the bare error.
+- All three trailers are declared. `Arc-Execution-Time-Ms` is measured from
+  the same point as on DuckDB (when the request arrived), and is set on every
+  response, including a failed one.
+- A query whose timeout passes, or that is cancelled, while arcx is still
+  computing the result now answers `504` (or `500` for a cancel) before any
+  body, as on DuckDB. Before, it answered `200` with a body marked truncated.
+- A deadline that expires mid-stream counts in `arc_query_timeouts_total`, and
+  the stream's error, disconnect and truncation-reason accounting is the
+  DuckDB path's.
+- The arcx reader is released as soon as the response ends. A result stopped
+  early (at the cap, on a cancel or an error) used to keep its last batch of
+  native memory and park arcx's decode workers until a Go garbage collection;
+  the same applied to arcx JSON, msgpack and shadow queries, which now
+  release theirs too.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1294](https://github.com/Basekick-Labs/arc/pull/1294).

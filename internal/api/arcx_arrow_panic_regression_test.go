@@ -93,6 +93,34 @@ func TestArcxArrowPanicWiring(t *testing.T) {
 	if !hasCall(onPanic.Body, "poisonArrowStream") || !hasCall(onPanic.Body, "setIfAbsent") {
 		t.Error("panic callback does not poison the body and record the truncation reason")
 	}
+	if id, ok := streamCall.Args[2].(*ast.Ident); !ok || id.Name != "trailers" {
+		t.Error("ArcX Arrow stream does not publish its trailers")
+	}
+	// The panic callback can only poison the body through the writer the
+	// stream writer captured: streamW = w must stay.
+	writer, ok := streamCall.Args[5].(*ast.FuncLit)
+	if !ok {
+		t.Fatal("ArcX Arrow stream has no writer callback")
+	}
+	capturesWriter := false
+	ast.Inspect(writer.Body, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for i, lhs := range assign.Lhs {
+			id, ok := lhs.(*ast.Ident)
+			if !ok || id.Name != "streamW" || i >= len(assign.Rhs) {
+				continue
+			}
+			rhs, ok := assign.Rhs[i].(*ast.Ident)
+			capturesWriter = capturesWriter || ok && rhs.Name == "w"
+		}
+		return true
+	})
+	if !capturesWriter {
+		t.Error("stream writer is not captured for panic poisoning")
+	}
 }
 
 // Exercise the real shared stream/trailer implementation without the private
@@ -129,7 +157,6 @@ func TestArcxArrowPanicMarkerAndTrailer(t *testing.T) {
 
 	schema := arrow.NewSchema(nil, nil)
 	reader := newSimpleRecordReader(schema, nil)
-	defer reader.Release()
 	var ctx fasthttp.RequestCtx
 	ctx.Response.Header.SetStatusCode(fasthttp.StatusOK)
 	h := &QueryHandler{logger: zerolog.Nop()}

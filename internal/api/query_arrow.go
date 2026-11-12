@@ -123,28 +123,22 @@ func poisonArrowStream(w *bufio.Writer, logger zerolog.Logger) {
 	}
 }
 
+// arrowTrailerRegistrationWarnings is the warning logged when fasthttp refuses
+// to register a trailer, keyed by trailer name.
+var arrowTrailerRegistrationWarnings = map[string]string{
+	arrowStreamTruncatedTrailer: "Failed to register Arrow truncation trailer; clients will not see the reason a stream was cut",
+	arrowExecutionTimeTrailer:   "Failed to register Arrow execution-time trailer; clients will not see server-side timing",
+	arrowRowsCappedTrailer:      "Failed to register Arrow row-cap trailer; clients will not see that a governance cap truncated the result",
+}
+
+// registerArrowResponseTrailers declares every Arrow IPC trailer before the
+// body starts. It walks arrowTrailerNames, the list a #1570 forward relays, so
+// a trailer cannot be declared here without also being forwarded.
 func registerArrowResponseTrailers(header *fasthttp.ResponseHeader, logger zerolog.Logger) {
-	trailers := []struct {
-		name    string
-		message string
-	}{
-		{
-			name:    arrowStreamTruncatedTrailer,
-			message: "Failed to register Arrow truncation trailer; clients will not see the reason a stream was cut",
-		},
-		{
-			name:    arrowExecutionTimeTrailer,
-			message: "Failed to register Arrow execution-time trailer; clients will not see server-side timing",
-		},
-		{
-			name:    arrowRowsCappedTrailer,
-			message: "Failed to register Arrow row-cap trailer; clients will not see that a governance cap truncated the result",
-		},
-	}
-	for _, trailer := range trailers {
-		if err := header.AddTrailer(trailer.name); err != nil {
+	for _, name := range arrowTrailerNames {
+		if err := header.AddTrailer(name); err != nil {
 			arrowTrailerWarnOnce.Do(func() {
-				logger.Warn().Err(err).Str("trailer", trailer.name).Msg(trailer.message)
+				logger.Warn().Err(err).Str("trailer", name).Msg(arrowTrailerRegistrationWarnings[name])
 			})
 		}
 	}
@@ -447,10 +441,23 @@ func (r *contextArrowRecordReader) Err() error {
 // use the tested streaming semantics without linking its private engine into
 // the ordinary test build.
 //
+// It returns false, having released reader and touched nothing else, when
+// streamCtx has already ended: arcxengine.QueryStream takes no context, so a
+// deadline or cancel that lands while the engine runs is only noticed here. The
+// caller then falls back to DuckDB with the same context, whose execution
+// fails at once and answers 504 (deadline) or 500 (cancel) before any body,
+// with the same registry disposition and metrics as a DuckDB query.
+//
 // Invariants carried over from the inline writer it replaces (#717, #731):
-//   - FFI cliff: the ArcX reader's Release is a no-op and its buffers are
-//     freed by a GC finalizer, so runtime.KeepAlive(reader) must stay the
-//     LAST statement of the writer's deferred block, after the final read.
+//   - The helper owns reader. The imported C stream reader's Release is NOT a
+//     no-op: it frees the current batch and drops the engine stream, whose
+//     Drop stops arcx's decode workers. Only the stream struct has a GC
+//     cleanup, so a reader abandoned before EOF (the governance cap, a cancel,
+//     an error) leaks that batch and parks the workers until a GC runs.
+//     The writer's deferred block releases it through
+//     releaseArrowStreamResourcesFunc, which recovers during a panic unwind.
+//   - FFI cliff: runtime.KeepAlive(reader) stays the LAST statement of that
+//     deferred block, so nothing can collect the reader before the final read.
 //   - The async writer OWNS cancel. It runs after the handler returned; a
 //     caller that cancelled eagerly would end streamCtx before the first
 //     batch (schema-only body plus a spurious mid-stream cancel).
@@ -470,7 +477,11 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 	onDisconnect func(),
 	onComplete func(int),
 	onFail func(string),
-) {
+) (served bool) {
+	if streamCtx.Err() != nil {
+		releaseArrowStreamResourcesFunc(reader, nil, nil, h.logger)
+		return false
+	}
 	schema := reader.Schema()
 	fctx.Response.Header.SetContentType("application/vnd.apache.arrow.stream")
 	registerArrowResponseTrailers(&fctx.Response.Header, h.logger)
@@ -490,10 +501,8 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 	}, func(w *bufio.Writer) {
 		streamW = w
 		defer func() {
-			if cancel != nil {
-				cancel()
-			}
-			runtime.KeepAlive(reader) // Keep ArcX's FFI-backed batches alive through the final read.
+			releaseArrowStreamResourcesFunc(reader, nil, cancel, h.logger)
+			runtime.KeepAlive(reader) // LAST: nothing may collect the FFI-backed reader before this.
 		}()
 
 		m := metrics.Get()
@@ -542,6 +551,7 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 			onComplete(int(rows))
 		}
 	})
+	return true
 }
 
 // executeQueryArrow handles POST /api/v1/query/arrow - returns Arrow IPC stream
@@ -809,7 +819,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			}
 		}()
 		return arcxArrowDispatch(
-			h, c, ctx, cancel, req.SQL, headerDB, convertedSQL,
+			h, c, ctx, cancel, start, req.SQL, headerDB, convertedSQL,
 			governanceMaxRows, arcxOnRows, recordDisconnect, arcxOnComplete, arcxOnFail,
 		)
 	}()
