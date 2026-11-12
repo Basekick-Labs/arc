@@ -106,8 +106,11 @@ without subscribing and without setting `arc_mqtt_connected` to 1. A
 reconnect after writes resume (a suspended subscription) that fails is
 disconnected the same way.
 
-The "Connecting to MQTT broker" log line no longer carries the broker URL's
-password or query values: they read `REDACTED`.
+The "Connecting to MQTT broker" and "Created MQTT subscription" log lines no
+longer carry the broker URL's password or query values: they read `REDACTED`,
+and a URL that cannot be split safely is logged as `(unparsable broker URL)`.
+Creating or updating a subscription with a broker URL that does not parse now
+answers 400 `not a valid URL` instead of quoting the URL, password included.
 
 ## Fix: a tiering policy PUT reports the stored row ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
 

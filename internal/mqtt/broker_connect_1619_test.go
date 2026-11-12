@@ -345,3 +345,22 @@ func TestRedactBrokerURL(t *testing.T) {
 		}
 	}
 }
+
+// The validation error of an unparsable broker URL reaches the 400 body and
+// the log, so it must not quote the URL or any piece of it (#1619).
+func TestValidateBrokerURLDoesNotEchoTheURL(t *testing.T) {
+	for _, in := range []string{
+		"tcp://u:s3cr%zz@broker:1883",
+		"tcp://u:s3cr et@broker:1883",
+	} {
+		err := validateBrokerURL(in)
+		if err == nil {
+			t.Fatalf("validateBrokerURL(%q) = nil, want an error", in)
+		}
+		for _, piece := range []string{"s3cr", "zz", "broker", in} {
+			if strings.Contains(err.Error(), piece) {
+				t.Errorf("validateBrokerURL(%q) error %q quotes %q", in, err, piece)
+			}
+		}
+	}
+}

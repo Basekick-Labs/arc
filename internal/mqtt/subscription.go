@@ -303,7 +303,10 @@ func validateBrokerURL(brokerURL string) error {
 	// Parse as URL to validate structure
 	parsed, err := url.Parse(brokerURL)
 	if err != nil {
-		return err
+		// url.Parse's error quotes the whole URL, and its detail can quote
+		// pieces of it ("invalid URL escape \"%zz\""), password included; this
+		// text reaches the 400 body and the log (#1619).
+		return errors.New("not a valid URL")
 	}
 
 	if parsed.Host == "" {
