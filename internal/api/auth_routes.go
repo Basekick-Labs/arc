@@ -160,6 +160,12 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 
 	token, err := h.authManager.CreateToken(c.UserContext(), req.Name, req.Description, permissions, expiresAt)
 	if err != nil {
+		if errors.Is(err, auth.ErrNameConflict) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
+		}
 		h.logger.Error().Err(err).Str("name", req.Name).Msg("Failed to create token")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -303,10 +309,16 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 
 	err = h.authManager.UpdateToken(c.UserContext(), id, req.Name, req.Description, permissions, expiresAt)
 	if err != nil {
-		if err.Error() == "token not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",
+			})
+		}
+		if errors.Is(err, auth.ErrNameConflict) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
 			})
 		}
 		h.logger.Error().Err(err).Int64("token_id", id).Msg("Failed to update token")
@@ -336,7 +348,7 @@ func (h *AuthHandler) deleteToken(c *fiber.Ctx) error {
 
 	err = h.authManager.DeleteToken(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "token not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",
@@ -357,6 +369,11 @@ func (h *AuthHandler) deleteToken(c *fiber.Ctx) error {
 	})
 }
 
+// tokenRevokedRotateMessage is the 409 body of a rotate of a revoked token. A
+// new token has a new ID, and governance policies and team memberships are
+// keyed by token ID, so the message says to re-attach them.
+const tokenRevokedRotateMessage = "Token is revoked and cannot be rotated. Create a new token; a new token has a new ID, so re-attach governance policies and team memberships"
+
 // rotateToken handles POST /api/v1/auth/tokens/:id/rotate
 func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 	id, err := strconv.ParseInt(c.Params("id"), 10, 64)
@@ -369,10 +386,18 @@ func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 
 	newToken, err := h.authManager.RotateToken(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "token not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",
+			})
+		}
+		// Revocation is permanent, so a rotated secret could never
+		// authenticate. A client error, not logged. #1625.
+		if errors.Is(err, auth.ErrTokenRevoked) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   tokenRevokedRotateMessage,
 			})
 		}
 		h.logger.Error().Err(err).Int64("token_id", id).Msg("Failed to rotate token")
@@ -403,7 +428,7 @@ func (h *AuthHandler) revokeToken(c *fiber.Ctx) error {
 
 	err = h.authManager.RevokeToken(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "token not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",
