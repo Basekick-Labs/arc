@@ -4222,7 +4222,7 @@ Compressed MessagePack requests whose decoded payload exceeds
 `server.max_payload_size` now return `413`, allowing clients to split and retry
 the batch. Invalid or corrupt compressed data still returns `400`.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1651](https://github.com/Basekick-Labs/arc/pull/1651).
 
 ### Fix: a token's `expires_in` must be in the future, and a rename cannot clear its name ([#1623](https://github.com/Basekick-Labs/arc/pull/1623))
 
