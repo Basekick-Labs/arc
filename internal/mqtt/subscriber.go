@@ -7,13 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.mqtt.golang/packets"
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/fips"
@@ -36,7 +39,10 @@ type Subscriber struct {
 	// onMessage so a persistent misconfiguration logs once, not per message.
 	invalidDatabaseLogged sync.Map
 	client                pahomqtt.Client
-	arrowBuffer           *ingest.ArrowBuffer
+	// newClient builds the paho client; a test seam, pahomqtt.NewClient
+	// otherwise.
+	newClient   func(*pahomqtt.ClientOptions) pahomqtt.Client
+	arrowBuffer *ingest.ArrowBuffer
 	// nameWarned rate-limits the warning for a dropped field name (#1342).
 	nameWarnMu     sync.Mutex
 	nameWarned     map[string]time.Time
@@ -88,7 +94,91 @@ func NewSubscriber(
 		logger:            logger.With().Str("subscription_id", config.ID).Str("subscription_name", config.Name).Logger(),
 		ctx:               ctx,
 		cancel:            cancel,
+		newClient:         pahomqtt.NewClient,
 	}
+}
+
+// brokerConnectError is a failed connect to the broker (#1619). Its text is
+// the whole message the API answers and stores as error_message, so it
+// matches ErrBrokerConnect without carrying that text as a prefix. Neither
+// form carries the broker URL: paho's errors name only the dialled host:port
+// (the URL's userinfo is not part of it) or a CONNACK code.
+type brokerConnectError struct {
+	msg   string
+	cause error
+}
+
+func (e *brokerConnectError) Error() string { return e.msg }
+
+func (e *brokerConnectError) Unwrap() []error {
+	if e.cause == nil {
+		return []error{ErrBrokerConnect}
+	}
+	return []error{ErrBrokerConnect, e.cause}
+}
+
+// BrokerConnectMessage returns the message of a failed connect to the
+// broker in err's chain, which is the text startFailed stored as the
+// subscription's error_message, and whether there is one.
+func BrokerConnectMessage(err error) (string, bool) {
+	var connectErr *brokerConnectError
+	if errors.As(err, &connectErr) {
+		return connectErr.msg, true
+	}
+	return "", false
+}
+
+// newBrokerConnectError classifies a connect token's error. A network error
+// (DNS, refused or reset connection, TLS handshake, handshake deadline) or
+// any other failure to complete the handshake could not connect; one of the
+// CONNACK refusal codes means the broker was reached and refused. paho
+// reports the CONNACK of its last attempt, the MQTT 3.1 fallback, so a broker
+// that refuses 3.1 reads "unacceptable protocol version" even where the 3.1.1
+// attempt was refused for its credentials; it is a refusal either way.
+func newBrokerConnectError(err error) error {
+	for _, refused := range []error{
+		packets.ErrorRefusedBadProtocolVersion,
+		packets.ErrorRefusedIDRejected,
+		packets.ErrorRefusedServerUnavailable,
+		packets.ErrorRefusedBadUsernameOrPassword,
+		packets.ErrorRefusedNotAuthorised,
+	} {
+		if errors.Is(err, refused) {
+			return &brokerConnectError{msg: "the broker refused the connection: " + err.Error(), cause: err}
+		}
+	}
+	return &brokerConnectError{msg: "could not connect to the broker: " + err.Error(), cause: err}
+}
+
+// redactBrokerURL returns broker for a log line: the password replaced and
+// every query value replaced, the scheme, user name, host, port and path kept.
+// A URL that does not parse is not logged at all.
+func redactBrokerURL(broker string) string {
+	u, err := url.Parse(broker)
+	// A password containing "/", "?" or "#" ends the authority early, so
+	// url.Parse finds no userinfo and leaves the password in the host, path,
+	// query or fragment ("tcp://u:p/w@host" parses as host "u:p", path
+	// "/w@host"). An "@" past the authority, or an opaque URL, means the
+	// URL cannot be split safely: log nothing of it.
+	if err != nil || u.Opaque != "" || strings.Contains(u.Host, "@") ||
+		strings.Contains(u.Path, "@") || strings.Contains(u.RawQuery, "@") || strings.Contains(u.Fragment, "@") {
+		return "(unparsable broker URL)"
+	}
+	if _, hasPassword := u.User.Password(); hasPassword {
+		u.User = url.UserPassword(u.User.Username(), "REDACTED")
+	}
+	if u.RawQuery != "" {
+		q := u.Query()
+		for key, values := range q {
+			for i := range values {
+				values[i] = "REDACTED"
+			}
+			q[key] = values
+		}
+		u.RawQuery = q.Encode()
+	}
+	u.Fragment, u.RawFragment = "", ""
+	return u.String()
 }
 
 // Start connects to the MQTT broker and begins message processing
@@ -111,17 +201,33 @@ func (s *Subscriber) Start() error {
 	}
 
 	// Create client
-	s.client = pahomqtt.NewClient(opts)
+	newClient := s.newClient
+	if newClient == nil {
+		newClient = pahomqtt.NewClient
+	}
+	s.client = newClient(opts)
 
-	// Connect
-	s.logger.Info().Str("broker", s.config.Broker).Bool("clean_session", s.config.CleanSession).Msg("Connecting to MQTT broker")
+	// Connect. The broker URL is logged without its password or query
+	// values: validateBrokerURL accepts userinfo (#1619).
+	s.logger.Info().Str("broker", redactBrokerURL(s.config.Broker)).Bool("clean_session", s.config.CleanSession).Msg("Connecting to MQTT broker")
 
+	// A failed connect disconnects the client on both returns (#1619). After
+	// a timeout paho is still connecting: its MQTT 3.1 retry gets a fresh
+	// handshake deadline, so a slow broker could still accept, and onConnect
+	// would subscribe and ingest for a subscription with no subscriber,
+	// stored as error, that stop answers "not running". After Disconnect,
+	// paho refuses the connection if the attempt still succeeds: it never
+	// becomes connected, Subscribe fails and the socket is closed. paho still
+	// calls OnConnect for it (see onConnect). With quiesce 0 Disconnect does
+	// not wait for the attempt.
 	token := s.client.Connect()
 	if !token.WaitTimeout(time.Duration(s.config.ConnectTimeoutSeconds) * time.Second) {
-		return fmt.Errorf("connection timeout after %d seconds", s.config.ConnectTimeoutSeconds)
+		s.client.Disconnect(0)
+		return &brokerConnectError{msg: fmt.Sprintf("could not connect to the broker: connection timeout after %d seconds", s.config.ConnectTimeoutSeconds)}
 	}
 	if err := token.Error(); err != nil {
-		return fmt.Errorf("connection failed: %w", err)
+		s.client.Disconnect(0)
+		return newBrokerConnectError(err)
 	}
 
 	s.mu.Lock()
@@ -317,6 +423,14 @@ func (s *Subscriber) buildTLSConfig() (*tls.Config, error) {
 
 // onConnect is called when connection is established
 func (s *Subscriber) onConnect(client pahomqtt.Client) {
+	// paho runs OnConnect even for a connection a Disconnect refused while it
+	// was being established (paho issue 675): a start or resume that timed
+	// out gave up on it (#1619). It never became connected, so nothing would
+	// reset the connected gauge set below.
+	if !client.IsConnectionOpen() {
+		s.logger.Debug().Msg("MQTT connection aborted before it was established; not subscribing")
+		return
+	}
 	s.logger.Info().Msg("MQTT connection established, subscribing to topics")
 
 	// Subscribe to all topics
@@ -477,8 +591,12 @@ func (s *Subscriber) resume() {
 	if !running || client == nil || !s.suspended.CompareAndSwap(true, false) {
 		return
 	}
+	// A failed reconnect disconnects the client, as a failed Start does
+	// (#1619): after a timeout paho is still connecting, and a late connect
+	// would subscribe while the status reads error.
 	token := client.Connect()
 	if !token.WaitTimeout(time.Duration(s.config.ConnectTimeoutSeconds)*time.Second) || token.Error() != nil {
+		client.Disconnect(0)
 		s.logger.Error().Err(token.Error()).Msg("MQTT subscription could not reconnect after writes resumed")
 		s.updateStatus(StatusError, "reconnect after writes resumed failed")
 		return
