@@ -45,7 +45,10 @@ func TestRemoveUnknownNodeIsNotFoundAndProposesNothing(t *testing.T) {
 	if err := c.raftNode.Barrier(5 * time.Second); err != nil {
 		t.Fatal(err)
 	}
-	before, appliedBefore := c.raftNode.LastIndex(), c.raftNode.AppliedIndex()
+	// AppliedIndex can still trail LastIndex right after Barrier returns
+	// (CI saw 6 -> 7 with LastIndex already 7), so the bound for "nothing
+	// was applied" is the last index that existed before the call.
+	before := c.raftNode.LastIndex()
 	cfgBefore, _ := c.raftNode.ConfigurationServerIDs()
 
 	err := c.RemoveNodeViaRaft("no-such-node")
@@ -59,8 +62,8 @@ func TestRemoveUnknownNodeIsNotFoundAndProposesNothing(t *testing.T) {
 	if after := c.raftNode.LastIndex(); after != before {
 		t.Errorf("an unknown ID was proposed: last index %d -> %d", before, after)
 	}
-	if after := c.raftNode.AppliedIndex(); after != appliedBefore {
-		t.Errorf("an unknown ID was applied: applied index %d -> %d", appliedBefore, after)
+	if after := c.raftNode.AppliedIndex(); after > before {
+		t.Errorf("an unknown ID was applied: applied index %d, last index before the call %d", after, before)
 	}
 	cfgAfter, _ := c.raftNode.ConfigurationServerIDs()
 	if strings.Join(cfgAfter, ",") != strings.Join(cfgBefore, ",") {

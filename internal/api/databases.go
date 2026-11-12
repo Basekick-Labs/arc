@@ -46,6 +46,45 @@ type DatabasesHandler struct {
 	// compactor) to one that can, and a create from a node that does not
 	// ingest to the writer; nil outside a cluster.
 	router *cluster.Router
+	// warehouse names the Iceberg warehouse's directories in the storage root,
+	// which are not databases (#1626); nil when Iceberg export is off.
+	warehouse WarehouseDirs
+}
+
+// WarehouseDirs names the directories the Iceberg warehouse occupies in the
+// storage root (iceberg.WarehouseLayout). Both methods must answer false on a
+// nil receiver.
+type WarehouseDirs interface {
+	// IsWarehouseRootDir: a top-level directory that is the warehouse's, not a
+	// database: a namespace directory, or a subdirectory warehouse.
+	IsWarehouseRootDir(name string) bool
+	// IsWarehouseMeasurement: the measurement directory a nested warehouse
+	// ("<root>/db/m/…") occupies.
+	IsWarehouseMeasurement(db, m string) bool
+	// ContainsWarehouse: database db holds a nested warehouse; its path
+	// relative to the storage root.
+	ContainsWarehouse(db string) (string, bool)
+}
+
+// SetWarehouseLayout hides the Iceberg warehouse's directories from the
+// database routes (#1626): not listed, 404 to GET, 403 to DELETE, 400 to a
+// create. Wired only with Iceberg export on.
+func (h *DatabasesHandler) SetWarehouseLayout(l WarehouseDirs) { h.warehouse = l }
+
+func (h *DatabasesHandler) isWarehouseDir(name string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseRootDir(name)
+}
+
+func (h *DatabasesHandler) isWarehouseMeasurement(db, m string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseMeasurement(db, m)
+}
+
+// warehouseDatabaseError is the refusal every writer gives a database named
+// after the Iceberg warehouse directory, whose files would land inside the
+// warehouse (#1626). No apostrophe: see continuous_query.go's note on the
+// log masking of quoted spans.
+func warehouseDatabaseError(name string) string {
+	return fmt.Sprintf("database name %q is reserved for the Iceberg warehouse", name)
 }
 
 // SetRouter installs the cluster router the listings and creates forward
@@ -389,7 +428,9 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 		})
 	}
 
-	if reservedDatabaseNames[strings.ToLower(req.Name)] {
+	// The Iceberg warehouse directory is refused like a reserved name: the
+	// marker would be written inside the warehouse (#1626).
+	if reservedDatabaseNames[strings.ToLower(req.Name)] || h.isWarehouseDir(req.Name) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Database name '" + req.Name + "' is reserved",
 		})
@@ -527,8 +568,9 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
-	// Arc's own state, not a database: the list hides it, so this does too (#1012).
-	if storage.IsReservedRootDir(name) {
+	// Arc's own state, not a database: the list hides it, so this does too
+	// (#1012). The Iceberg warehouse's directories likewise (#1626).
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -603,7 +645,7 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
-	if storage.IsReservedRootDir(name) {
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -733,10 +775,23 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// _schema and _compaction_state included). The second matters more now
 	// than it did: this handler no longer only unlinks local hot files, it
 	// also deletes cold objects and proposes cluster-wide manifest removals.
-	if reservedDatabaseNames[strings.ToLower(name)] || storage.IsReservedRootDir(name) {
+	// The Iceberg warehouse's directories are a third: deleting one would
+	// remove the exported tables' metadata (#1626).
+	if reservedDatabaseNames[strings.ToLower(name)] || storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
+	}
+	// A database holding a nested Iceberg warehouse ("<root>/db/m/…") is
+	// refused whole: its delete lists and removes every file under it, the
+	// warehouse's metadata for every exported table included. Filtering the
+	// warehouse out instead is not safe: user files can land under it too.
+	if h.warehouse != nil {
+		if rel, ok := h.warehouse.ContainsWarehouse(name); ok {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": "Cannot delete database '" + name + "': it contains the Iceberg warehouse '" + rel + "' (iceberg.warehouse); move the warehouse first",
+			})
+		}
 	}
 	// Refuse a node that is not the primary writer, as the row delete API and
 	// retention do (#1094). Checked before the tier reservation, and whether
@@ -1222,7 +1277,7 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 	// Filter out hidden directories and sort
 	filtered := make([]string, 0, len(databases))
 	for _, db := range databases {
-		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") && !h.isWarehouseDir(db) {
 			filtered = append(filtered, db)
 		}
 	}
@@ -1269,6 +1324,9 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 			} else {
 				// Add any databases that only exist in cold tier
 				for _, db := range coldDatabases {
+					if h.isWarehouseDir(db) {
+						continue // not a database, as listDatabases (#1626)
+					}
 					if dbMeasurements[db] == nil {
 						dbMeasurements[db] = make(map[string]bool)
 					}
@@ -1313,8 +1371,9 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 		}
 		hasContent[db] = true
 
-		// Skip hidden measurements (like .arc-database marker)
-		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") {
+		// Skip hidden measurements (like .arc-database marker), and the
+		// directory a nested Iceberg warehouse occupies (#1626).
+		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") || h.isWarehouseMeasurement(db, measurement) {
 			continue
 		}
 
@@ -1359,7 +1418,7 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 					continue
 				}
 				for _, m := range coldMeasurements {
-					if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") {
+					if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") && !h.isWarehouseMeasurement(db, m) {
 						dbMeasurements[db][m] = true
 					}
 				}
@@ -1439,7 +1498,7 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	// Filter out hidden directories and sort
 	filtered := make([]string, 0, len(measurementSet))
 	for m := range measurementSet {
-		if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") {
+		if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") && !h.isWarehouseMeasurement(database, m) {
 			filtered = append(filtered, m)
 		}
 	}
@@ -1482,6 +1541,44 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	}
 
 	return h.databaseHasContent(ctx, name)
+}
+
+// ErrDatabaseNotFound and ErrInvalidDatabaseName are CheckDatabase's
+// answers, so a caller keeps the database routes' statuses: 404 and 400.
+var (
+	ErrDatabaseNotFound    = errors.New("database not found")
+	ErrInvalidDatabaseName = errors.New("invalid database name")
+)
+
+// CheckDatabase reports whether a database exists by the rule GET
+// /api/v1/databases/:name answers with, in its order (#1626):
+//   - ErrInvalidDatabaseName: not a safe storage segment (GET: 400);
+//   - the storage name-spelling error, as is (GET: 400 with its text, #1509);
+//   - ErrDatabaseNotFound: a reserved root directory, an Iceberg warehouse
+//     directory, or no marker, file, cold-tier row or manifest entry (404);
+//   - any other error: the check itself failed (500).
+//
+// It looks only at this node: on a cluster that keeps data per node, a
+// database created through POST /api/v1/databases is a marker on the
+// writer's disk, which a reader or compactor does not see.
+func (h *DatabasesHandler) CheckDatabase(ctx context.Context, name string) error {
+	if !isSafeStoragePathSegment(name) {
+		return ErrInvalidDatabaseName
+	}
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
+		return ErrDatabaseNotFound
+	}
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return err
+	}
+	exists, err := h.databaseExists(ctx, name)
+	if err != nil {
+		return fmt.Errorf("check database %q: %w", name, err)
+	}
+	if !exists {
+		return ErrDatabaseNotFound
+	}
+	return nil
 }
 
 // databaseHasHotFiles reports whether the backend holds a listable file under

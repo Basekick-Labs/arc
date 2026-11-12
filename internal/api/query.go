@@ -822,6 +822,9 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
+	// warehouse names the Iceberg warehouse's directories in the storage
+	// root, which the listings leave out (#1626); nil with Iceberg off.
+	warehouse   WarehouseDirs
 	db          *database.DuckDB
 	storage     storage.Backend
 	pruner      *pruning.PartitionPruner
@@ -1405,6 +1408,19 @@ func (h *QueryHandler) checkReplicationReady(c *fiber.Ctx) error {
 // rate without inferring from HTTP error logs.
 func (h *QueryHandler) QueryGate503Total() int64 {
 	return h.gate503Total.Load()
+}
+
+// SetWarehouseLayout hides the Iceberg warehouse's directories from SHOW
+// DATABASES, SHOW TABLES and GET /api/v1/measurements (#1626), as
+// DatabasesHandler.SetWarehouseLayout does from the database routes.
+func (h *QueryHandler) SetWarehouseLayout(l WarehouseDirs) { h.warehouse = l }
+
+func (h *QueryHandler) isWarehouseDir(name string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseRootDir(name)
+}
+
+func (h *QueryHandler) isWarehouseMeasurement(db, m string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseMeasurement(db, m)
 }
 
 // SetTieringManager sets the tiering manager for multi-tier query routing.
@@ -5394,10 +5410,10 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visibl
 		}
 	}
 
-	// Filter out hidden directories
+	// Filter out hidden directories, and the Iceberg warehouse's (#1626)
 	filtered := make([]string, 0)
 	for _, db := range databases {
-		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") && !h.isWarehouseDir(db) {
 			filtered = append(filtered, db)
 		}
 	}
@@ -5544,10 +5560,13 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		}
 	}
 
-	// Filter out hidden tables
+	// Filter out hidden tables. An Iceberg warehouse directory is not a
+	// database, so it has no tables, as an unknown database has none; a nested
+	// warehouse is not a table of the database it sits in (#1626).
 	filtered := make([]string, 0)
+	warehouseDB := h.isWarehouseDir(database)
 	for _, table := range tables {
-		if !strings.HasPrefix(table, ".") && !strings.HasPrefix(table, "_") {
+		if !warehouseDB && !strings.HasPrefix(table, ".") && !strings.HasPrefix(table, "_") && !h.isWarehouseMeasurement(database, table) {
 			filtered = append(filtered, table)
 		}
 	}
@@ -6100,7 +6119,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	}
 
 	for _, dbEntry := range dbEntries {
-		if !dbEntry.IsDir() || strings.HasPrefix(dbEntry.Name(), ".") || strings.HasPrefix(dbEntry.Name(), "_") {
+		if !dbEntry.IsDir() || strings.HasPrefix(dbEntry.Name(), ".") || strings.HasPrefix(dbEntry.Name(), "_") || h.isWarehouseDir(dbEntry.Name()) {
 			continue
 		}
 
@@ -6126,7 +6145,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 		}
 
 		for _, measurementEntry := range measurementEntries {
-			if !measurementEntry.IsDir() || strings.HasPrefix(measurementEntry.Name(), ".") || strings.HasPrefix(measurementEntry.Name(), "_") {
+			if !measurementEntry.IsDir() || strings.HasPrefix(measurementEntry.Name(), ".") || strings.HasPrefix(measurementEntry.Name(), "_") || h.isWarehouseMeasurement(dbName, measurementEntry.Name()) {
 				continue
 			}
 

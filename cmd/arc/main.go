@@ -1030,6 +1030,14 @@ func main() {
 	shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
 	logStorageReady()
 
+	// #1626: a database named after a subdirectory Iceberg warehouse would
+	// write inside it. Set before any writer starts (MQTT subscriptions start
+	// below, long before the Iceberg block), from the same warehouse URI the
+	// exporter is given.
+	if cfg.Iceberg.Enabled {
+		storage.SetWarehouseRootName(iceberg.LayoutFor(storageBackend, icebergWarehouseURI(cfg.Iceberg.Warehouse, storageBackend), cfg.Iceberg.NamespacePrefix).RootName())
+	}
+
 	// Peer file replication copies files between per-node disks. On a shared
 	// object store every node already reads every file, and the puller only
 	// HEADs the whole manifest every catch-up interval and can hold the
@@ -4306,16 +4314,7 @@ func main() {
 				log.Fatal().Err(err).Str("path", icebergDBPath).Msg("Failed to open Iceberg catalog DB")
 			}
 		}
-		// Default the warehouse to the storage root when unset, so table metadata lands
-		// alongside the data (file:// for local; s3://bucket/prefix for object storage).
-		warehouse := cfg.Iceberg.Warehouse
-		if warehouse == "" {
-			warehouse = iceberg.DefaultWarehouse(storageBackend)
-		}
-		// A bare path becomes the file:// URI of its absolute directory, so new
-		// tables get file:// locations (#1616). Tables created before keep the
-		// bare locations in their catalog rows, which the exporter resolves too.
-		warehouse = iceberg.NormalizeLocalWarehouse(warehouse)
+		warehouse := icebergWarehouseURI(cfg.Iceberg.Warehouse, storageBackend)
 		exporter, err := iceberg.NewExporter(icebergDB, storageBackend, warehouse, cfg.Iceberg.NamespacePrefix, cfg.Iceberg.RetainSnapshots, logger.Get("iceberg"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
@@ -4346,7 +4345,25 @@ func main() {
 		exporter.SetForgetDroppedRows(icebergTopo.barrier)
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
+		// #1626: the warehouse's directories in the storage root are not
+		// databases: not listed, not deletable, not written to. One layout for
+		// the listings, the writers and the export walk.
+		warehouseLayout := exporter.WarehouseLayout()
+		databasesHandler.SetWarehouseLayout(warehouseLayout)
+		queryHandler.SetWarehouseLayout(warehouseLayout)
+		// The writers' name was set right after the storage backend, from
+		// the same URI; this is the same value.
+		storage.SetWarehouseRootName(warehouseLayout.RootName())
+		if name := warehouseLayout.RootName(); name != "" {
+			log.Info().Str("warehouse_dir", name).Msg("Iceberg warehouse is a subdirectory of the storage root: it is not listed as a database, and writes to a database of that name are refused")
+		}
+		{
+			wctx, wcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			iceberg.WarnWarehouseShadowing(wctx, storageBackend, warehouseLayout, logger.Get("iceberg"))
+			wcancel()
+		}
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
+		icebergSource.SetWarehouseLayout(warehouseLayout)
 		// A compacted file is exported only once its compaction has replaced
 		// the sources; until then the crash-recovery manifest names it (#638).
 		// Read through a manager of its own rather than the compaction
@@ -5117,6 +5134,9 @@ func main() {
 		tieringHandler.RegisterRoutes(server.GetApp())
 
 		tieringPoliciesHandler := api.NewTieringPoliciesHandler(tieringManager, authManager, licenseClient, logger.Get("tiering-policies-api"))
+		// A policy PUT for a database that does not exist answers 404, by the
+		// rule GET /api/v1/databases/:name answers with (#1626).
+		tieringPoliciesHandler.SetDatabaseCheck(databasesHandler.CheckDatabase)
 		tieringPoliciesHandler.RegisterRoutes(server.GetApp())
 
 		// Wire tiering manager to query handler for multi-tier query routing
@@ -6281,6 +6301,20 @@ func (g *compactionClusterGate) CompactionPauseReason() string {
 // Role returns the node's role string for log messages.
 func (g *compactionClusterGate) Role() string {
 	return string(g.role)
+}
+
+// icebergWarehouseURI is the warehouse the exporter is given: the storage root
+// when unset, so table metadata lands alongside the data (file:// for local;
+// s3://bucket/prefix for object storage), and a bare path as the file:// URI
+// of its absolute directory, so new tables get file:// locations (#1616).
+// Tables created before keep the bare locations in their catalog rows, which
+// the exporter resolves too.
+func icebergWarehouseURI(configured string, backend storage.Backend) string {
+	warehouse := configured
+	if warehouse == "" {
+		warehouse = iceberg.DefaultWarehouse(backend)
+	}
+	return iceberg.NormalizeLocalWarehouse(warehouse)
 }
 
 // icebergWriterGate adapts the compaction cluster gate to iceberg.WriterGate: the Iceberg

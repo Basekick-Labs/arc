@@ -39,7 +39,10 @@ type FileSetSource interface {
 type StorageWalkSource struct {
 	backend  storage.Backend
 	resolver *PathResolver
-	nsPrefix string // Iceberg namespace prefix; warehouse dirs "<nsPrefix>_*.db" are excluded
+	// layout names the warehouse's directories in the storage root, which the walk skips. Never
+	// nil: NewStorageWalkSource starts with the namespace-directory rule alone, and
+	// SetWarehouseLayout adds a subdirectory or nested warehouse (#1626).
+	layout *WarehouseLayout
 	// pendingOutputs, when set, names compaction outputs whose sources still
 	// exist; they are excluded from the file set (#638).
 	pendingOutputs func(ctx context.Context, prefix string) (map[string]struct{}, error)
@@ -147,29 +150,26 @@ func NewStorageWalkSource(backend storage.Backend, nsPrefix string, logger zerol
 	return &StorageWalkSource{
 		backend:  backend,
 		resolver: NewPathResolver(backend),
-		nsPrefix: nsPrefix,
+		layout:   NewWarehouseLayout("", "", nsPrefix),
 		logger:   logger,
 	}
 }
 
-// isWarehouseDir reports whether a top-level directory is an Iceberg warehouse namespace
-// directory ("<nsPrefix>_<db>.db") written by the exporter, which must be excluded from the
-// data-file walk. Iceberg's SQL catalog names namespace dirs "<namespace>.db".
+// SetWarehouseLayout makes the walk skip the directories the exporter's warehouse occupies in
+// the storage root, by the rule the database listings apply (#1626): a subdirectory warehouse
+// ("<root>/lv_wh") is not walked as a database, nor a nested one as a measurement. The
+// namespace-directory rule holds either way. Call during wiring, before the scheduler starts.
+func (s *StorageWalkSource) SetWarehouseLayout(l *WarehouseLayout) {
+	if l != nil {
+		s.layout = l
+	}
+}
+
+// isWarehouseDir reports whether a top-level directory belongs to the Iceberg warehouse the
+// exporter writes ("<nsPrefix>_<db>.db" namespace directories, and a subdirectory warehouse once
+// SetWarehouseLayout names it), which must be excluded from the data-file walk.
 func (s *StorageWalkSource) isWarehouseDir(name string) bool {
-	if strings.HasPrefix(name, s.nsPrefix+"_") && strings.HasSuffix(name, ".db") {
-		return true
-	}
-	// iceberg-go v0.7.0 JSON-encodes a namespace whose component contains a dot, and an edge-sync
-	// spoke ID may contain one (#1129), so that directory does not start with "<prefix>_" at all.
-	// Decoding through catalogNamespaceKey's own inverse is deliberate: a second, local copy of
-	// the encoding rule is how the exporter would come to disagree with the catalog about which
-	// directories are its own, and a directory it fails to recognise here is walked back in as a
-	// user database -- the harm the whole namespace scheme exists to prevent (#634).
-	if !strings.HasSuffix(name, ".db") {
-		return false
-	}
-	namespace, ok := decodeCatalogNamespace(strings.TrimSuffix(name, ".db"))
-	return ok && namespaceBelongsToPrefix(namespace, s.nsPrefix)
+	return s.layout.IsWarehouseRootDir(name)
 }
 
 // dirLister is the subset of storage backends that can enumerate immediate subdirectories.
@@ -230,8 +230,8 @@ func (s *StorageWalkSource) measurementsOn(ctx context.Context, dl dirLister) ([
 		}
 		for _, m := range measurements {
 			m = strings.Trim(m, "/")
-			if m == "" {
-				continue
+			if m == "" || s.layout.IsWarehouseMeasurement(db, m) {
+				continue // a nested warehouse ("<root>/db/m/…") is not a measurement
 			}
 			out = append(out, Measurement{Database: db, Measurement: m})
 		}
