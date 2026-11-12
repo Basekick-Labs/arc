@@ -688,8 +688,9 @@ func (m *ManifestManager) parkManifestCopy(ctx context.Context, manifestPath, pa
 // which is the only remaining pointer to the partition to inspect.
 //
 // It is parked rather than deleted because the manifest's absence is not
-// proof that nothing happened: LocalBackend never fsyncs, so after a power
-// loss the manifest can be empty while the output rename and some input
+// proof that nothing happened: a manifest written before LocalBackend fsynced
+// its writes (#1618), or by a filesystem that loses a write some other way,
+// can be empty after a power loss while the output rename and some input
 // unlinks that followed it are already journaled. A decodable manifest would
 // repair either state (delete a short output, finish the input deletes); an
 // undecodable one cannot, and the log line plus the parked path are what an
