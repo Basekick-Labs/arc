@@ -96,6 +96,42 @@ timeout, or when the query is cancelled or its client leaves, as before. A
 body larger than 4KB is not copied: it is released when the forward returns.
 `TestForwardedQueryIsListedAndCancellable` is no longer flaky.
 
+## Fix: a crash right after a flush no longer stores its rows twice ([#1646](https://github.com/Basekick-Labs/arc/issues/1646))
+
+With the WAL on, a flush stores its Parquet file and then writes the WAL
+checkpoint that stops recovery from replaying those rows. A crash between the
+two (a kill, an OOM kill, a power loss) left the file in storage with its WAL
+entries unchecked, so the restart replayed them into a second file. Every row
+of that flush was stored twice. On a tagged measurement, compaction removes
+the second copy; on a tagless one it stays. In crash tests with
+frequent flushes, about one SIGKILL in five did this. No acknowledged row was
+lost.
+
+Before storing a file, a flush now writes a small record into the WAL. It
+names the file, its size, and the WAL entries the file holds. At recovery, when
+an entry has no checkpoint but such a record names it, and the file is in
+storage at that size, Arc does not replay the entry. It writes the missing
+checkpoint and keeps the file as the stored copy, re-registering its field
+schema from the file's footer. Arc treats the file as all or nothing: if any
+of its entries was already checkpointed, it replays the rest, as before.
+
+The record costs almost nothing. It is queued without waiting, and a record
+that never reaches disk only means the replay there always was. Arc skips the
+record when the queue is full or the record is over 1 MiB.
+
+Not in a cluster: there a stored file also needs its manifest registration,
+which the crash may have cut short. A cluster node writes no records and
+replays, as before.
+
+Old binaries read these records as checkpoints that match nothing, so
+downgrading is safe.
+
+New counters:
+
+- `arc_wal_flush_intents_written_total`
+- `arc_wal_flush_intents_dropped_total`
+- `arc_wal_flush_intents_adopted_total`
+
 ## Fix: a damaged WAL entry no longer holds back replay of newer WAL files ([#1634](https://github.com/Basekick-Labs/arc/issues/1634))
 
 When one WAL entry was damaged (a checksum mismatch, for example from bit rot
