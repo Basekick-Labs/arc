@@ -104,7 +104,12 @@ func checkSDKShape(t *testing.T, raw []byte) map[string]any {
 	if err := json.Unmarshal(raw, &out); err != nil {
 		t.Fatalf("body %s: %v", raw, err)
 	}
-	for _, k := range []string{"query_name", "execution_id", "status", "start_time", "end_time", "destination_measurement", "executed_at"} {
+	// No run happened, so no execution is named; the key stays, as the SDK
+	// requires it (a str).
+	if id, ok := out["execution_id"].(string); !ok || id != "" {
+		t.Fatalf("execution_id should be present and empty: %s", raw)
+	}
+	for _, k := range []string{"query_name", "status", "start_time", "end_time", "destination_measurement", "executed_at"} {
 		if s, ok := out[k].(string); !ok || s == "" {
 			t.Fatalf("%q missing or not a non-empty string in %s", k, raw)
 		}
@@ -177,7 +182,7 @@ func TestCQSameSecondRerunIsAnEmptyWindow(t *testing.T) {
 
 			// And the scheduled path, in the same second.
 			resp, err := r.h.ExecuteCQ(context.Background(), 1)
-			if err != nil || resp == nil || !resp.Skipped || resp.RecordsWritten != 0 || resp.StartTime != ws || resp.EndTime != ws || resp.Status != "completed" {
+			if err != nil || resp == nil || !resp.Skipped || resp.RecordsWritten != 0 || resp.StartTime != ws || resp.EndTime != ws || resp.Status != "completed" || resp.ExecutionID != "" {
 				t.Fatalf("scheduled same-second run: %+v %v", resp, err)
 			}
 

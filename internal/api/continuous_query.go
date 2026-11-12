@@ -797,8 +797,10 @@ func quietEmptyWindow(start, end, now time.Time, startFromWatermark, endGiven bo
 
 // emptyCQWindowResponse is the answer to a run quietEmptyWindow skipped: the
 // window it reports is empty (start and end at the watermark) and nothing was
-// written. Every field the clients require is set.
-func emptyCQWindowResponse(queryID int64, cq *ContinuousQuery, executionID string, watermark time.Time, began time.Time, dryRun bool, executedQuery string) ExecuteCQResponse {
+// written. No run happened, so there is no execution to name: execution_id is
+// "" (present, as clients require the key) and no history row has it. Every
+// other field the clients require is set.
+func emptyCQWindowResponse(queryID int64, cq *ContinuousQuery, watermark time.Time, began time.Time, dryRun bool, executedQuery string) ExecuteCQResponse {
 	status := "completed"
 	if dryRun {
 		status = "dry_run"
@@ -806,7 +808,7 @@ func emptyCQWindowResponse(queryID int64, cq *ContinuousQuery, executionID strin
 	return ExecuteCQResponse{
 		QueryID:                queryID,
 		QueryName:              cq.Name,
-		ExecutionID:            executionID,
+		ExecutionID:            "",
 		Status:                 status,
 		StartTime:              watermark.Format(time.RFC3339),
 		EndTime:                watermark.Format(time.RFC3339),
@@ -870,10 +872,9 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 	if !startTime.Before(endTime) {
 		if quietEmptyWindow(startTime, endTime, now, cq.LastProcessedTime != nil, false) {
 			// Nothing new since the last run (#1628): no aggregation, no
-			// execution row, the watermark left as it is.
-			h.logger.Debug().Str("query_name", cq.Name).Time("watermark", startTime).
-				Msg("No new window for scheduled continuous query")
-			resp := emptyCQWindowResponse(queryID, cq, fmt.Sprintf("cq-sched-%s", uuid.New().String()[:8]), startTime, start, false, "")
+			// execution row, the watermark left as it is. The scheduler logs
+			// it (Debug), from Skipped.
+			resp := emptyCQWindowResponse(queryID, cq, startTime, start, false, "")
 			return &resp, nil
 		}
 		return nil, fmt.Errorf("start_time must be before end_time")
@@ -1072,7 +1073,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		}
 		h.logger.Debug().Str("query_name", cq.Name).Time("watermark", startTime).Bool("dry_run", req.DryRun).
 			Msg("No new window for continuous query")
-		return c.JSON(emptyCQWindowResponse(int64(queryID), cq, fmt.Sprintf("cq-exec-%s", uuid.New().String()[:8]), startTime, start, req.DryRun, executedQuery))
+		return c.JSON(emptyCQWindowResponse(int64(queryID), cq, startTime, start, req.DryRun, executedQuery))
 	}
 
 	// Replace placeholders in query

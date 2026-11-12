@@ -82,9 +82,10 @@ same second, or a run within a minute of a watermark an earlier `end_time` set
 ahead of the clock. The scheduler logged the same case at Error as "Scheduled
 CQ execution failed".
 - Such a run now answers 200 with `records_written: 0`, and `start_time` and
-  `end_time` both at the watermark. It writes no execution row and leaves
-  `last_processed_time` as it is (no Raft proposal in a cluster). The
-  scheduler logs it at Debug.
+  `end_time` both at the watermark. Nothing runs: `execution_id` is `""`
+  (no execution history row is written for it), `watermark_status` is absent,
+  and `last_processed_time` is left as it is. In a cluster it proposes no
+  watermark of its own. The scheduler logs it at Debug.
 - A watermark more than a minute ahead of the clock is still refused (the same
   400, and Error in the scheduler), so a CQ stuck behind clock skew stays
   visible.

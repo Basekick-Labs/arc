@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"bytes"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -47,15 +48,41 @@ func TestCQSchedulerEmptyWindow(t *testing.T) {
 			s, _ := NewCQScheduler(&CQSchedulerConfig{CQHandler: h, Logger: zerolog.New(&buf).Level(zerolog.DebugLevel)})
 			s.executeJob(&cqJob{cqID: 1, cqName: "q", stopCh: make(chan struct{})})
 
-			logs := buf.String()
-			failed := strings.Contains(logs, `"level":"error"`) && strings.Contains(logs, "Scheduled CQ execution failed")
-			if c.quiet {
-				if failed || strings.Contains(logs, "Scheduled CQ execution completed") ||
-					!strings.Contains(logs, `"level":"debug","component":"cq-scheduler","cq_id":1,"cq_name":"q","message":"Scheduled CQ: no new window"`) {
-					t.Fatalf("logs:\n%s", logs)
+			// Each line is one JSON event; match on fields, not key order.
+			type event struct {
+				Level, Message, Error string
+				CQID                  int64 `json:"cq_id"`
+			}
+			var events []event
+			for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+				var e event
+				if err := json.Unmarshal([]byte(line), &e); err != nil {
+					t.Fatalf("log line %q: %v", line, err)
 				}
-			} else if !failed || !strings.Contains(logs, "start_time must be before end_time") {
-				t.Fatalf("want today's Error, logs:\n%s", logs)
+				events = append(events, e)
+			}
+			has := func(level, msg string) bool {
+				for _, e := range events {
+					if e.Level == level && e.Message == msg && e.CQID == 1 {
+						return true
+					}
+				}
+				return false
+			}
+			failed := has("error", "Scheduled CQ execution failed")
+			if c.quiet {
+				if failed || has("info", "Scheduled CQ execution completed") || !has("debug", "Scheduled CQ: no new window") {
+					t.Fatalf("logs:\n%s", buf.String())
+				}
+			} else {
+				if !failed || has("debug", "Scheduled CQ: no new window") {
+					t.Fatalf("want today's Error, logs:\n%s", buf.String())
+				}
+				for _, e := range events {
+					if e.Level == "error" && e.Error != "start_time must be before end_time" {
+						t.Fatalf("error %q, want today's text", e.Error)
+					}
+				}
 			}
 		})
 	}
