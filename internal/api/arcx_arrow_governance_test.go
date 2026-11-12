@@ -31,6 +31,8 @@ func (r *cancelOnRecordReader) RecordBatch() arrow.RecordBatch {
 	return record
 }
 
+func (r *cancelOnRecordReader) Record() arrow.RecordBatch { return r.RecordBatch() }
+
 func writeArcxArrowResponse(
 	t *testing.T,
 	reader array.RecordReader,
