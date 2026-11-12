@@ -19,8 +19,10 @@ func SetWarehouseRootName(name string) {
 
 // IsWarehouseRootName reports whether a database name is the Iceberg warehouse's directory under
 // the storage root. Only a subdirectory warehouse has such a name: a namespace directory's name
-// carries a dot, which no database name may. The comparison is exact; on a volume that folds
-// names, another spelling of an existing directory is refused by the name-spelling guard.
+// carries a dot, which no database name may. The comparison is exact. On a volume that folds
+// names, another spelling ("LV_WH") is refused by the name-spelling guard only once the
+// warehouse directory exists; before the first export it would create the directory the
+// exporter then writes into.
 func IsWarehouseRootName(name string) bool {
 	p := warehouseRootName.Load()
 	return p != nil && *p == name

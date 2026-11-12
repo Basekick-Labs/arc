@@ -28,8 +28,8 @@ type WarehouseLayout struct {
 	// rootName is the warehouse directory directly under the storage root ("lv_wh"), or "".
 	rootName string
 	// nestedDB, nestedMeasurement are the first two segments of a warehouse nested at least
-	// two levels under the root, or "".
-	nestedDB, nestedMeasurement string
+	// two levels under the root, or ""; nestedRel is its whole path relative to the root.
+	nestedDB, nestedMeasurement, nestedRel string
 }
 
 // NewWarehouseLayout computes the layout from the storage root and the warehouse, both already
@@ -61,7 +61,7 @@ func NewWarehouseLayout(root, warehouse, nsPrefix string) *WarehouseLayout {
 		l.rootName = segs[0]
 		return l
 	}
-	l.nestedDB, l.nestedMeasurement = segs[0], segs[1]
+	l.nestedDB, l.nestedMeasurement, l.nestedRel = segs[0], segs[1], rel
 	return l
 }
 
@@ -90,6 +90,17 @@ func (l *WarehouseLayout) IsWarehouseMeasurement(db, m string) bool {
 		return false
 	}
 	return strings.Trim(db, "/") == l.nestedDB && strings.Trim(m, "/") == l.nestedMeasurement
+}
+
+// ContainsWarehouse reports whether database db holds a nested warehouse ("<root>/db/m/…"),
+// and its path relative to the storage root. Deleting db would delete the warehouse with it,
+// the metadata of every exported table included (#1626). db is a single path segment, so the
+// exact compare is a boundary match ("a-other" is not "a").
+func (l *WarehouseLayout) ContainsWarehouse(db string) (string, bool) {
+	if l == nil || l.nestedDB == "" || strings.Trim(db, "/") != l.nestedDB {
+		return "", false
+	}
+	return l.nestedRel, true
 }
 
 // RootName returns the subdirectory warehouse's name directly under the storage root, or "".
@@ -160,7 +171,7 @@ func WarnWarehouseShadowing(ctx context.Context, backend storage.Backend, l *War
 	}
 	if db, m := l.Nested(); db != "" {
 		logger.Warn().Str("database", db).Str("measurement", m).
-			Msg("The Iceberg warehouse is nested inside the storage root: the measurement it sits under is not listed for that database, and the database itself stays listed")
+			Msg("The Iceberg warehouse is nested inside the storage root, under a database and measurement: writes to that measurement of that database are not refused and land inside the warehouse directory, where they are hidden from the listings and not exported; do not write there. The database itself stays listed, and deleting it is refused while it holds the warehouse")
 	}
 	name := l.RootName()
 	if name == "" || backend == nil {

@@ -155,7 +155,7 @@ set its policy on the writer, or after the first write.
 With Iceberg export on, the warehouse's directories in the storage root are
 no longer treated as databases: the namespace directories (`arc_<db>.db`), and
 a warehouse set to a subdirectory of the storage root
-(`iceberg.warehouse=<root>/lv_wh`, on local storage or an S3/Azure prefix).
+(`iceberg.warehouse=<root>/lv_wh`, on local storage or an S3 prefix).
 `GET /api/v1/databases`, `SHOW DATABASES`, `SHOW TABLES` and
 `GET /api/v1/measurements` leave them out; `GET /api/v1/databases/{name}` and
 its `/measurements` answer 404, `DELETE` answers 403, and
@@ -163,11 +163,15 @@ its `/measurements` answer 404, `DELETE` answers 403, and
 write to a database named after the subdirectory warehouse (line protocol,
 MessagePack, TLE, every `/api/v1/import/*` format, a continuous query's
 database, an MQTT subscription or `topic_mapping` target) is refused with 400
-`database name "<name>" is reserved for the Iceberg warehouse`, so no file
-lands inside the warehouse. A directory whose name only starts with the
-warehouse's (`lv_wh-other`) is an ordinary database. A warehouse nested
-deeper (`<root>/a/b`) hides measurement `b` of database `a`, and `a` stays
-listed. The export walk applies the same rule, so it no longer walks a
+`database name "<name>" is reserved for the Iceberg warehouse`, so writes
+cannot land inside a subdirectory warehouse. A directory whose name only
+starts with the warehouse's (`lv_wh-other`) is an ordinary database. A
+warehouse nested deeper (`<root>/a/b`) hides measurement `b` of database `a`,
+and `a` stays listed; `DELETE` of database `a` answers 403, because it would
+delete the warehouse with it. Writes to measurement `b` of database `a` are
+**not** refused: they land inside the warehouse directory, are hidden from the
+listings and are not exported, so do not write there (a startup warning names
+that measurement). The export walk applies the same rule, so it no longer walks a
 subdirectory warehouse as a database. Configure Iceberg the same way on every
 node: a node with Iceberg off lists the warehouse and accepts writes to it.
 

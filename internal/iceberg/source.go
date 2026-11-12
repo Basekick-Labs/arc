@@ -39,7 +39,6 @@ type FileSetSource interface {
 type StorageWalkSource struct {
 	backend  storage.Backend
 	resolver *PathResolver
-	nsPrefix string // Iceberg namespace prefix; warehouse dirs "<nsPrefix>_*.db" are excluded
 	// layout names the warehouse's directories in the storage root, which the walk skips. Never
 	// nil: NewStorageWalkSource starts with the namespace-directory rule alone, and
 	// SetWarehouseLayout adds a subdirectory or nested warehouse (#1626).
@@ -151,7 +150,6 @@ func NewStorageWalkSource(backend storage.Backend, nsPrefix string, logger zerol
 	return &StorageWalkSource{
 		backend:  backend,
 		resolver: NewPathResolver(backend),
-		nsPrefix: nsPrefix,
 		layout:   NewWarehouseLayout("", "", nsPrefix),
 		logger:   logger,
 	}

@@ -61,6 +61,9 @@ type WarehouseDirs interface {
 	// IsWarehouseMeasurement: the measurement directory a nested warehouse
 	// ("<root>/db/m/…") occupies.
 	IsWarehouseMeasurement(db, m string) bool
+	// ContainsWarehouse: database db holds a nested warehouse; its path
+	// relative to the storage root.
+	ContainsWarehouse(db string) (string, bool)
 }
 
 // SetWarehouseLayout hides the Iceberg warehouse's directories from the
@@ -778,6 +781,17 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
+	}
+	// A database holding a nested Iceberg warehouse ("<root>/db/m/…") is
+	// refused whole: its delete lists and removes every file under it, the
+	// warehouse's metadata for every exported table included. Filtering the
+	// warehouse out instead is not safe: user files can land under it too.
+	if h.warehouse != nil {
+		if rel, ok := h.warehouse.ContainsWarehouse(name); ok {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": "Cannot delete database '" + name + "': it contains the Iceberg warehouse '" + rel + "' (iceberg.warehouse); move the warehouse first",
+			})
+		}
 	}
 	// Refuse a node that is not the primary writer, as the row delete API and
 	// retention do (#1094). Checked before the tier reservation, and whether

@@ -143,6 +143,7 @@ func TestWarehouseLayoutObjectStore_Issue1626(t *testing.T) {
 			layoutWant{root: "lv_wh", hidden: []string{"lv_wh"}}},
 		{"s3 root with a trailing slash, warehouse the root", "s3://bucket/prefix/", "s3://bucket/prefix",
 			layoutWant{shown: []string{"prefix", "s3:", "lv_wh"}}},
+		// Future-proofing: config refuses Iceberg on an Azure primary today (checkIcebergBackend).
 		{"azure prefix, subdirectory", "azure://container/p", "azure://container/p/lv_wh",
 			layoutWant{root: "lv_wh", hidden: []string{"lv_wh"}}},
 	} {
@@ -160,6 +161,20 @@ func TestWarehouseLayoutNilAndMeasurement_Issue1626(t *testing.T) {
 	l := NewWarehouseLayout("s3://bucket/p", "s3://bucket/p/a/b", "arc")
 	if !l.IsWarehouseMeasurement("a", "b") {
 		t.Error("IsWarehouseMeasurement(a, b) = false for a warehouse at <root>/a/b")
+	}
+	if rel, ok := l.ContainsWarehouse("a"); !ok || rel != "a/b" {
+		t.Errorf("ContainsWarehouse(a) = %q, %v; want a/b, true", rel, ok)
+	}
+	for _, db := range []string{"a-other", "b", "aa", ""} {
+		if _, ok := l.ContainsWarehouse(db); ok {
+			t.Errorf("ContainsWarehouse(%q) = true", db)
+		}
+	}
+	if _, ok := NewWarehouseLayout("s3://bucket/p", "s3://bucket/p/lv_wh", "arc").ContainsWarehouse("lv_wh"); ok {
+		t.Error("a one-segment warehouse is not nested: ContainsWarehouse must be false (the root-dir guard covers it)")
+	}
+	if _, ok := nilLayout.ContainsWarehouse("a"); ok {
+		t.Error("nil layout: ContainsWarehouse true")
 	}
 	for _, pair := range [][2]string{{"a", "c"}, {"b", "b"}, {"a", "b-other"}} {
 		if l.IsWarehouseMeasurement(pair[0], pair[1]) {

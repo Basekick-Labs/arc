@@ -392,3 +392,37 @@ func TestDatabaseListColdRowsHideWarehouse_Issue1626(t *testing.T) {
 		}
 	}
 }
+
+// A database holding a nested warehouse is not deletable: its delete removes every file under
+// it, the warehouse's metadata included. A sibling whose name extends it still deletes (#1626).
+func TestDeleteRefusesDatabaseHoldingNestedWarehouse_Issue1626(t *testing.T) {
+	for _, rel := range []string{"a/b", "a/b/", "a/b/c"} {
+		t.Run(rel, func(t *testing.T) {
+			backend := warehouseTree(t)
+			ctx := context.Background()
+			if err := backend.Write(ctx, "a-other/cpu/2026/07/14/15/a.parquet", []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			h := NewDatabasesHandler(backend, &config.DeleteConfig{Enabled: true}, nil, zerolog.Nop())
+			h.SetWarehouseLayout(warehouseAt(rel))
+			app := fiber.New()
+			h.RegisterRoutes(app)
+
+			status, body := doJSON(t, app, http.MethodDelete, "/api/v1/databases/a?confirm=true", "")
+			if status != fiber.StatusForbidden || !strings.Contains(body, "contains the Iceberg warehouse") {
+				t.Fatalf("DELETE a: %d %s, want 403 naming the warehouse", status, body)
+			}
+			for _, k := range []string{"a/b/arc_x.db/t/metadata/v1.metadata.json", "a/mem/2026/07/14/15/a.parquet"} {
+				if ok, err := backend.Exists(ctx, k); err != nil || !ok {
+					t.Errorf("%s gone after the refused delete (exists=%v err=%v)", k, ok, err)
+				}
+			}
+			if status, body := doJSON(t, app, http.MethodDelete, "/api/v1/databases/a-other?confirm=true", ""); status != fiber.StatusOK {
+				t.Errorf("DELETE a-other (a sibling): %d %s, want 200", status, body)
+			}
+			if ok, _ := backend.Exists(ctx, "a-other/cpu/2026/07/14/15/a.parquet"); ok {
+				t.Error("a-other was not deleted")
+			}
+		})
+	}
+}
