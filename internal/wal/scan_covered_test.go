@@ -102,9 +102,23 @@ func TestScanCoveredDamage(t *testing.T) {
 	}); err != nil || len(got) != 1 || got[0] != 2 || r.CorruptedEntries != 1 {
 		t.Fatalf("got %v err %v corrupted %d", got, err, r.CorruptedEntries)
 	}
-	// An impossible length on the first entry.
+	// An impossible length on an intact first entry: its true length is
+	// found by its checksum and confirmed by the next frame (#1641).
 	huge := append([]byte(nil), raw...)
 	binary.BigEndian.PutUint32(huge[WALFileHeaderSize:], MaxWALPayloadSize+1)
+	if err := os.WriteFile(path, huge, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	r = NewReader(path, writer.logger)
+	if err := r.ScanCovered(func(Coverage) bool { return true }, func(e *Entry) error {
+		got = append(got, e.Coverage.CSeq)
+		return nil
+	}); err != nil || len(got) != 2 || r.RepairedLengths != 1 {
+		t.Fatalf("repaired length: got %v err %v repaired %d", got, err, r.RepairedLengths)
+	}
+	// The same length on a damaged entry cannot be repaired: the scan ends.
+	huge[first-1] ^= 0xff
 	if err := os.WriteFile(path, huge, 0o600); err != nil {
 		t.Fatal(err)
 	}
