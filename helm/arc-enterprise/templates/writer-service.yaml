@@ -16,7 +16,7 @@ spec:
       targetPort: 8000
     {{- if .Values.flightSql.enabled }}
     - name: flight-sql
-      port: {{ .Values.flightSql.servicePort | default 50051 | int }}
+      port: {{ int .Values.flightSql.servicePort }}
       targetPort: flight-sql
       appProtocol: grpc
     {{- end }}

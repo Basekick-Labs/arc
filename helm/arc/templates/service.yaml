@@ -12,7 +12,7 @@ spec:
       protocol: TCP
       name: http
     {{- if .Values.flightSql.enabled }}
-    - port: {{ .Values.flightSql.servicePort | default 50051 | int }}
+    - port: {{ int .Values.flightSql.servicePort }}
       targetPort: flight-sql
       protocol: TCP
       name: flight-sql

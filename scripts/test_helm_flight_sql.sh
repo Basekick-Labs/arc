@@ -40,6 +40,9 @@ grep -q 'appProtocol: grpc' <<<"$svc" || fail "helm/arc: Service port lacks appP
 
 # OSS chart, colliding port.
 refused helm/arc --set flightSql.enabled=true --set flightSql.port=8000
+refused helm/arc --set flightSql.enabled=true --set flightSql.port=0
+refused helm/arc --set flightSql.enabled=true --set flightSql.servicePort=70000
+refused helm/arc --set flightSql.enabled=true --set 'arc.env[0].name=ARC_FLIGHT_SQL_PORT' --set-string 'arc.env[0].value=1234'
 
 # Enterprise chart, default: nothing Flight anywhere.
 out=$(render helm/arc-enterprise)
@@ -62,5 +65,8 @@ grep -qi 'flight' <<<"$comp" && fail "the compactor got the Flight SQL listener"
 for p in 8000 9100 9200; do
   refused helm/arc-enterprise --set flightSql.enabled=true --set flightSql.port=$p
 done
+refused helm/arc-enterprise --set flightSql.enabled=true --set 'reader.extraEnv[0].name=ARC_FLIGHT_SQL_PORT' --set-string 'reader.extraEnv[0].value=1234'
+# Disabled, a user env naming the variable is the user's business.
+render helm/arc --set 'arc.env[0].name=ARC_FLIGHT_SQL_ENABLED' --set-string 'arc.env[0].value=false' >/dev/null
 
 echo "Flight SQL chart checks passed"

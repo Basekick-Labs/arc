@@ -101,9 +101,12 @@ enterprise chart adds it to the writers and readers and to their Services;
 compactors have no client Service and are not given the listener. Both mark
 the Service port `appProtocol: grpc`. A port that collides with one of Arc's
 (8000, and in the enterprise chart 9100 and 9200) is refused when the chart
-renders. The charts' Ingress routes HTTP only: expose the port through the
-Service (for example a LoadBalancer) or an ingress controller that proxies
-gRPC.
+renders, as is an `ARC_FLIGHT_SQL_*` variable in `arc.env` or a role's
+`extraEnv`: it would move the listener away from the container and Service
+ports. Enabling the listener in a custom `arc.toml` instead of `flightSql`
+opens it without a container or Service port. The charts' Ingress routes HTTP
+only: expose the port through the Service (for example a LoadBalancer) or an
+ingress controller that proxies gRPC.
 
 ## Governance row limits
 
