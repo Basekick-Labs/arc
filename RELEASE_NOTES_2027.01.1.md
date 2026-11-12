@@ -163,6 +163,17 @@ These cases are still not repaired:
 - **Each file gets one repair attempt.** A second damaged length in the same
   file reads as before.
 
+## Fix: HTTP shutdown leaves time to flush buffers and close storage ([#1644](https://github.com/Basekick-Labs/arc/issues/1644))
+
+The HTTP server used a fresh shutdown timeout instead of the shutdown
+coordinator's context. A long-running request could therefore consume the full
+shutdown budget and prevent later hooks, including the buffer flush and WAL
+close, from running. HTTP draining now uses at most half the remaining budget;
+when that window expires, in-flight request contexts are cancelled and the
+coordinator can continue with the remaining hooks.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+
 ## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
 
 With the WAL on and object storage as the backend, a flush whose upload hit

@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,9 +13,73 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/license"
+	"github.com/basekick-labs/arc/internal/shutdown"
+	"github.com/gofiber/fiber/v2"
 
 	"github.com/rs/zerolog"
 )
+
+func TestShutdownWithContextLeavesBudgetForLaterHooks(t *testing.T) {
+	logger := zerolog.New(io.Discard)
+	server := NewServer(DefaultServerConfig(), logger)
+	requestStarted := make(chan struct{})
+	requestCancelled := make(chan struct{})
+	server.GetApp().Get("/long-running", func(c *fiber.Ctx) error {
+		close(requestStarted)
+		<-c.UserContext().Done()
+		close(requestCancelled)
+		return c.SendStatus(http.StatusNoContent)
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = server.GetApp().Listener(listener) }()
+
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		resp, err := http.Get("http://" + listener.Addr().String() + "/long-running")
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach handler")
+	}
+
+	coordinator := shutdown.New(500*time.Millisecond, logger)
+	coordinator.RegisterHook("http-server", server.ShutdownWithContext, shutdown.PriorityHTTPServer)
+	laterHookRan := false
+	coordinator.RegisterHook("buffer-flush", func(context.Context) error {
+		laterHookRan = true
+		return nil
+	}, shutdown.PriorityHTTPServer+1)
+
+	started := time.Now()
+	if err := coordinator.Shutdown(); err != nil {
+		t.Fatalf("shutdown coordinator: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("shutdown took %s; want it to leave time for later hooks", elapsed)
+	}
+	if !laterHookRan {
+		t.Fatal("later buffer-flush hook was skipped")
+	}
+	select {
+	case <-requestCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight request context was not cancelled")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP request did not finish after shutdown")
+	}
+}
 
 // TestListenAddrForHost pins the listener-address construction shape
 // the Start path uses. Every shape an operator might configure is

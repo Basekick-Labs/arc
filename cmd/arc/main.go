@@ -5583,17 +5583,14 @@ func main() {
 	}
 
 	// Register HTTP server shutdown hook (first to stop accepting new
-	// requests). The arg is the HTTP server's INTERNAL drain timeout —
-	// independent of shutdownCoordinator's own budget, though both now derive
-	// from server.shutdown_timeout (#805), so raising that key gives the drain
-	// and the overall shutdown the same extra room. If the coordinator ctx
-	// expires before this hook completes, the coordinator skips remaining
-	// hooks; the internal timeout is a best-effort upper bound on this hook's
-	// slice of that budget. The debug-pprof hook (registered earlier in main,
-	// same priority) uses srv.Close() instead of Shutdown(ctx) to avoid
+	// requests). The server uses at most half of the coordinator's remaining
+	// budget to drain requests, then cancels lingering handlers so later hooks
+	// and components retain time to flush buffers and close storage. The
+	// debug-pprof hook (registered earlier in main, same priority) uses
+	// srv.Close() instead of Shutdown(ctx) to avoid
 	// letting a long /debug/pprof/profile?seconds=N capture starve this hook.
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {
-		return server.Shutdown(shutdownTimeout)
+		return server.ShutdownWithContext(ctx)
 	}, shutdown.PriorityHTTPServer)
 
 	// Clear credential material that earlier versions could leave in stored

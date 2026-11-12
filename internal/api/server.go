@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -31,6 +32,7 @@ import (
 type Server struct {
 	app            *fiber.App
 	logger         zerolog.Logger
+	cancelRequests context.CancelFunc
 	host           string
 	port           int
 	maxPayloadSize int64
@@ -164,8 +166,14 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 
 	// Create Fiber app with config
 	app := fiber.New(appConfig(config, logger))
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
 
 	// Middleware
+	app.Use(func(c *fiber.Ctx) error {
+		c.SetUserContext(requestCtx)
+		return c.Next()
+	})
+
 	app.Use(recover.New(recover.Config{
 		EnableStackTrace: true,
 	}))
@@ -205,6 +213,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	return &Server{
 		app:            app,
 		logger:         logger.With().Str("component", "api-server").Logger(),
+		cancelRequests: cancelRequests,
 		host:           config.Host,
 		port:           config.Port,
 		maxPayloadSize: config.MaxPayloadSize,
@@ -784,14 +793,43 @@ func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	return tls.NewListener(ln, tlsCfg), nil
 }
 
-// Shutdown gracefully shuts down the server
+// Shutdown gracefully shuts down the server within timeout.
 func (s *Server) Shutdown(timeout time.Duration) error {
-	s.logger.Info().Msg("Shutting down server gracefully...")
-
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return s.ShutdownWithContext(ctx)
+}
 
-	if err := s.app.ShutdownWithContext(ctx); err != nil {
+// ShutdownWithContext drains HTTP requests using at most half of the
+// coordinator's remaining shutdown budget. When that drain window expires,
+// in-flight handlers' user contexts are cancelled and Fiber closes lingering
+// connections, leaving time for later shutdown hooks and components.
+func (s *Server) ShutdownWithContext(ctx context.Context) error {
+	s.logger.Info().Msg("Shutting down server gracefully...")
+
+	drainCtx := ctx
+	var cancel context.CancelFunc
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			s.cancelRequests()
+			return ctx.Err()
+		}
+		drainCtx, cancel = context.WithTimeout(ctx, remaining/2)
+	} else {
+		drainCtx, cancel = context.WithCancel(ctx)
+	}
+	stopCancelRequests := context.AfterFunc(drainCtx, s.cancelRequests)
+	err := s.app.ShutdownWithContext(drainCtx)
+	cancel()
+	stopCancelRequests()
+	s.cancelRequests()
+
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			s.logger.Warn().Msg("HTTP request drain window expired; continuing shutdown")
+			return nil
+		}
 		return fmt.Errorf("server shutdown failed: %w", err)
 	}
 
