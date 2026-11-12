@@ -48,15 +48,6 @@ type failedStorageWrite struct {
 	// identities, rangesIn); empty when they cannot all be named. nil: the
 	// flush's need covers the file.
 	rows []string
-	// stored lists hour files a multi-hour flush without a row map stored
-	// before this one failed. They are not registered and their rows replay:
-	// a duplicate for certain, not only if the write lands.
-	stored []storedFile
-}
-
-type storedFile struct {
-	path string
-	size int64
 }
 
 func (e *failedStorageWrite) Error() string { return e.err.Error() }
@@ -113,7 +104,7 @@ type ambiguousLedger struct {
 	count    atomic.Int64                   // len(entries), read without mu
 	parents  int                            // sum of the entries' parents
 	now      func() time.Time               // tests
-	full     atomic.Int64                   // unix nanos of the last "full" warning
+	warned   atomic.Int64                   // unix nanos of the last "not tracked" warning
 }
 
 func newAmbiguousLedger() *ambiguousLedger {
@@ -316,7 +307,6 @@ func (l *ambiguousLedger) dropLocked(e *ambiguousWrite) {
 type ambiguousCheck struct {
 	path string
 	size int64
-	last bool // the final look: the entry is dropped after it
 }
 
 // due returns the looks due now, and drops entries that expired unsatisfied.
@@ -334,7 +324,7 @@ func (l *ambiguousLedger) due() (checks []ambiguousCheck, expired []string) {
 			continue
 		}
 		if e.checks < len(ambiguousCheckAfter) && now.Sub(e.satisfiedAt) >= ambiguousCheckAfter[e.checks] {
-			checks = append(checks, ambiguousCheck{path: e.path, size: e.size, last: e.checks == len(ambiguousCheckAfter)-1})
+			checks = append(checks, ambiguousCheck{path: e.path, size: e.size})
 		}
 	}
 	return checks, expired
@@ -367,27 +357,53 @@ func (l *ambiguousLedger) checked(path string, drop bool) {
 // where a whole-entry need would only be met by the whole entry. A chunked
 // payload (several identities) needs each chunk entry whole.
 func walNeedOf(records []interface{}) (need []string, ok bool) {
-	if len(records) == 0 {
-		return nil, false
-	}
-	for _, record := range records {
+	return walNeedParts(walNeedPartsOf(records))
+}
+
+// walNeedPart is what walNeedOf reads of one record, kept so a flush can
+// release its records and still name their rows if it fails. ok false: the
+// record is not a batch with a WAL copy and rows.
+type walNeedPart struct {
+	ids  []string
+	rows int
+	ok   bool
+}
+
+// walNeedPartsOf is the cheap half of walNeedOf: no identity is formatted
+// until a write has failed.
+func walNeedPartsOf(records []interface{}) []walNeedPart {
+	parts := make([]walNeedPart, len(records))
+	for i, record := range records {
 		batch, isBatch := record.(*TypedColumnBatch)
 		if !isBatch || batch == nil || !batch.hasWALCopy || len(batch.WALHashes) == 0 {
+			continue
+		}
+		times, hasTime := batch.Data["time"].([]int64)
+		if !hasTime || len(times) == 0 {
+			continue
+		}
+		parts[i] = walNeedPart{ids: batch.WALHashes, rows: len(times), ok: true}
+	}
+	return parts
+}
+
+func walNeedParts(parts []walNeedPart) (need []string, ok bool) {
+	if len(parts) == 0 {
+		return nil, false
+	}
+	for _, part := range parts {
+		if !part.ok {
 			return nil, false
 		}
-		if len(batch.WALHashes) == 1 {
-			times, hasTime := batch.Data["time"].([]int64)
-			if !hasTime || len(times) == 0 {
-				return nil, false
-			}
-			parent, base := rowSpanParent(batch.WALHashes[0], len(times))
+		if len(part.ids) == 1 {
+			parent, base := rowSpanParent(part.ids[0], part.rows)
 			if parent == "" {
 				return nil, false
 			}
-			need = append(need, wal.RecoveryRowIdentity(parent, base, base+len(times)))
+			need = append(need, wal.RecoveryRowIdentity(parent, base, base+part.rows))
 			continue
 		}
-		for _, id := range batch.WALHashes {
+		for _, id := range part.ids {
 			if !isTrackedIdentity(id) {
 				return nil, false
 			}
@@ -397,31 +413,25 @@ func walNeedOf(records []interface{}) (need []string, ok bool) {
 	return need, true
 }
 
-// noteFailedWrite records the keys of a failed flush that may hold its rows
-// after all (#1635): the write that failed, which can still land, and on a
-// multi-hour flush without a row map the hour files it had already stored,
-// which are unregistered and will be replayed. need is walNeedOf of the
-// flush's records.
+// noteFailedWrite records the key of a failed storage write, which can still
+// land (#1635). need is walNeedOf of the flush's records.
 func (b *ArrowBuffer) noteFailedWrite(err error, need []string, ok bool) {
 	var fw *failedStorageWrite
 	if b.wal == nil || b.ambiguous == nil || !errors.As(err, &fw) {
 		return
 	}
-	files := append([]storedFile{{fw.path, fw.size}}, fw.stored...)
-	for i, f := range files {
-		ids, named := need, ok
-		if i == 0 && fw.rows != nil {
-			ids, named = fw.rows, len(fw.rows) > 0
-		}
-		if named && b.ambiguous.record(f.path, f.size, ids) {
-			metrics.Get().IncIngestAmbiguousWritesRecorded()
-			continue
-		}
-		now := time.Now().UnixNano()
-		if last := b.ambiguous.full.Load(); now-last >= int64(time.Minute) && b.ambiguous.full.CompareAndSwap(last, now) {
-			b.logger.Warn().Str("storage_path", f.path).
-				Msg("Failed flush write not tracked for late-landing cleanup (rows replay cannot name, or the tracker is full): if the file is in storage, its rows are stored twice after WAL replay")
-		}
+	ids, named := need, ok
+	if fw.rows != nil {
+		ids, named = fw.rows, len(fw.rows) > 0
+	}
+	if named && b.ambiguous.record(fw.path, fw.size, ids) {
+		metrics.Get().IncIngestAmbiguousWritesRecorded()
+		return
+	}
+	now := time.Now().UnixNano()
+	if last := b.ambiguous.warned.Load(); now-last >= int64(time.Minute) && b.ambiguous.warned.CompareAndSwap(last, now) {
+		b.logger.Warn().Str("storage_path", fw.path).
+			Msg("Failed flush write not tracked for late-landing cleanup (rows replay cannot name, or the tracker is full): if the write lands after all, its rows are stored twice after WAL replay")
 	}
 }
 
@@ -507,9 +517,17 @@ func (b *ArrowBuffer) closeAmbiguousWrites(budget time.Duration) {
 		cancel()
 	}
 	b.ambiguous.mu.Lock()
-	defer b.ambiguous.mu.Unlock()
+	held := len(b.ambiguous.entries)
+	var samples []string
 	for _, e := range b.ambiguous.entries {
-		b.logger.Warn().Str("storage_path", e.path).Bool("rows_stored_elsewhere", !e.satisfiedAt.IsZero()).
-			Msg("Shutting down with a failed flush write still tracked: if the file is in storage, its rows are stored twice once they are replayed")
+		if len(samples) == 5 {
+			break
+		}
+		samples = append(samples, e.path)
+	}
+	b.ambiguous.mu.Unlock()
+	if held > 0 {
+		b.logger.Warn().Int("tracked", held).Strs("sample_paths", samples).
+			Msg("Shutting down with failed flush writes still tracked: any of them in storage holds rows that are stored twice once they are replayed")
 	}
 }

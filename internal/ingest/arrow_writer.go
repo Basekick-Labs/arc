@@ -4977,7 +4977,10 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 	}
 	startTime := time.Now()
 	noWALRows := recordsWithoutWALCopy(records, recordCount)
-	need, named := walNeedOf(records) // #1635; before the records are released
+	var needParts []walNeedPart // #1635; read before the records are released
+	if b.wal != nil {
+		needParts = walNeedPartsOf(records)
+	}
 
 	// Merge typed column batches
 	merged, err := b.mergeBatchesForFlush(measurement, records)
@@ -4998,6 +5001,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 
 	// Flush with data timestamp partitioning
 	if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
+		need, named := walNeedParts(needParts)
 		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, recordCount, noWALRows)
 		b.markFlushFailure()
@@ -5376,12 +5380,6 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				// stored again. Empty is never recorded.
 				if fw.rows = spans.rangesIn(bucket.indices); rangeRows(fw.rows) != len(bucket.indices) {
 					fw.rows = []string{}
-				}
-			} else {
-				// Hours already stored are not registered and replay with
-				// the rest: name them too (#1635).
-				for _, e := range written {
-					fw.stored = append(fw.stored, storedFile{e.storagePath, e.sizeBytes})
 				}
 			}
 			return partial(fw)

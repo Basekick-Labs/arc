@@ -108,11 +108,6 @@ Other limits:
 - **Brief duplicates.** Between the late upload landing and the check, queries
   see the rows twice.
 
-A related case is fixed as well. A flush that spans several hours, made
-without a row map (the sorted-merge path), stores its hour files one at a
-time. If one hour failed, the hours already stored were left unregistered
-and were replayed again. Those files are now tracked and removed the same way.
-
 New counters: `arc_ingest_ambiguous_writes_recorded_total`,
 `arc_ingest_ambiguous_writes_removed_total` and
 `arc_ingest_ambiguous_writes_abandoned_total` (no longer tracked without a

@@ -24,11 +24,18 @@ type lateLandingStorage struct {
 	storage.Backend
 	mu       sync.Mutex
 	failNext bool
+	failAt   int // fail the failAt-th write from now (1: the next); 0: none
 	pending  map[string][]byte
 }
 
 func (s *lateLandingStorage) Write(ctx context.Context, path string, data []byte) error {
 	s.mu.Lock()
+	if s.failAt > 0 {
+		s.failAt--
+		if s.failAt == 0 {
+			s.failNext = true
+		}
+	}
 	if s.failNext {
 		s.failNext = false
 		s.pending[path] = append([]byte(nil), data...)
@@ -462,4 +469,79 @@ func TestRangeArithmetic(t *testing.T) {
 	r = subtractRange(r, rowRange{5, 35})
 	require.Equal(t, []rowRange{{0, 5}, {35, 40}}, r)
 	require.Empty(t, subtractRange(r, rowRange{0, 40}))
+}
+
+// writeHours sends a msgpack batch with rows in two past hours, so the flush
+// is multi-hour with a row map (per-hour files, #1492).
+func (f *ambiguousFixture) writeHours(t *testing.T, i int) {
+	t.Helper()
+	base := timeMicros(2026, 10, 1, 10, 0)
+	var times, vals []interface{}
+	for h := 0; h < 2; h++ {
+		for r := 0; r < 3; r++ {
+			times = append(times, base+int64(h)*microsPerHour+int64(i*100+r))
+			vals = append(vals, float64(i*1000+h*10+r))
+		}
+	}
+	payload, err := msgpack.Marshal(map[string]interface{}{"m": "probe", "columns": map[string]interface{}{"time": times, "v": vals}})
+	require.NoError(t, err)
+	decoded, err := NewMessagePackDecoder(zerolog.Nop()).Decode(payload)
+	require.NoError(t, err)
+	require.NoError(t, f.buffer.Write(context.Background(), "db", decoded))
+}
+
+func (f *ambiguousFixture) failSecondWrite(t *testing.T) string {
+	t.Helper()
+	f.storage.mu.Lock()
+	f.storage.failAt = 2
+	f.storage.mu.Unlock()
+	require.Error(t, f.buffer.FlushAll(context.Background()))
+	f.storage.mu.Lock()
+	defer f.storage.mu.Unlock()
+	require.Len(t, f.storage.pending, 1)
+	for p := range f.storage.pending {
+		return p
+	}
+	return ""
+}
+
+// A multi-hour flush stores one hour file and fails the other, which lands.
+// The failed file's need is its own rows only; recovery replays exactly
+// those as row ranges, and the landed copy is removed. The stored hour stays.
+func TestFailedHourFileOfMultiHourFlushIsRemovedAfterRangeReplay(t *testing.T) {
+	f := newAmbiguousFixture(t)
+	f.writeHours(t, 0)
+	f.writeHours(t, 1)
+	failed := f.failSecondWrite(t)
+	require.Equal(t, int64(1), f.buffer.ambiguous.count.Load())
+	f.storage.land(t)
+	require.Len(t, f.files(t), 2)
+
+	f.replay(t)
+	require.Len(t, f.files(t), 3, "stored hour + landed copy + replay")
+	f.sweep(0)
+	files := f.files(t)
+	require.Len(t, files, 2)
+	for _, p := range files {
+		require.NotEqual(t, failed, filepath.ToSlash(p))
+	}
+}
+
+// A row of the failed hour file that no WAL entry names (no WAL copy) leaves
+// the file unrecorded: deleting it would delete that row's only copy.
+func TestFailedHourFileWithUnnamedRowIsNotRecorded(t *testing.T) {
+	f := newAmbiguousFixture(t)
+	f.writeHours(t, 0)
+	key := "db/probe"
+	shard := f.buffer.getShard(key)
+	shard.mu.Lock()
+	src := shard.buffers[key][0].(*TypedColumnBatch)
+	copied := *src
+	copied.WALHashes = nil
+	copied.hasWALCopy = false
+	shard.buffers[key] = append(shard.buffers[key], &copied)
+	shard.bufferRecordCounts[key] += len(src.Data["time"].([]int64))
+	shard.mu.Unlock()
+	f.failSecondWrite(t)
+	require.Zero(t, f.buffer.ambiguous.count.Load())
 }
