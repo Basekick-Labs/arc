@@ -45,17 +45,27 @@ func StagePath(dbPath string) string { return dbPath + PendingRestoreSuffix }
 // current database, logged loudly. A staged restore must never boot-loop the
 // server or apply garbage over a working database.
 func ApplyPendingRestores(logger zerolog.Logger, dbPaths ...string) {
+	ApplyPendingRestoresWith(logger, nil, dbPaths...)
+}
+
+// ApplyPendingRestoresWith is ApplyPendingRestores with a hook that runs for
+// each database once its staged restore has passed validation and before
+// anything is moved. A hook error leaves that restore staged, untouched, for
+// the next boot. main.go uses it to record that the restored tier_files may
+// be missing cold files (#1550) before the swap, so no crash between the
+// swap and the record can lose it.
+func ApplyPendingRestoresWith(logger zerolog.Logger, beforeApply func(dbPath string) error, dbPaths ...string) {
 	seen := make(map[string]bool, len(dbPaths))
 	for _, dbPath := range dbPaths {
 		if dbPath == "" || seen[dbPath] {
 			continue
 		}
 		seen[dbPath] = true
-		applyPendingRestore(logger, dbPath)
+		applyPendingRestore(logger, dbPath, beforeApply)
 	}
 }
 
-func applyPendingRestore(logger zerolog.Logger, dbPath string) {
+func applyPendingRestore(logger zerolog.Logger, dbPath string, beforeApply func(dbPath string) error) {
 	pending := StagePath(dbPath)
 	if _, err := os.Stat(pending); err != nil {
 		return
@@ -73,6 +83,13 @@ func applyPendingRestore(logger zerolog.Logger, dbPath string) {
 				Msg("Staged restore failed validation; quarantined, booting with the current database")
 		}
 		return
+	}
+
+	if beforeApply != nil {
+		if err := beforeApply(dbPath); err != nil {
+			log.Error().Err(err).Msg("Staged restore NOT applied: a step that must precede it failed; it remains staged for the next boot, booting with the current database")
+			return
+		}
 	}
 
 	before := dbPath + ".before-restore"

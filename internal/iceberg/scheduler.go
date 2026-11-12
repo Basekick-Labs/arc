@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -218,7 +219,7 @@ func (s *Scheduler) runPass(ctx context.Context) {
 			return
 		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-		changed, err := s.reconcileOne(mctx, m, key)
+		changed, err := s.reconcileOneRecovered(mctx, m, key)
 		cancel()
 		switch {
 		case err != nil:
@@ -244,6 +245,25 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		event = event.Int("awaiting_namespace_migration", awaitingMigration)
 	}
 	event.Msg("Iceberg reconcile pass complete")
+}
+
+// reconcileOneRecovered runs reconcileOne and returns a panic on this
+// goroutine as the measurement's error, so one measurement whose files trip a
+// bug fails its pass instead of ending the process (the reconcile loop has no
+// other recover). Footer reads recover their own panics too (schemaFromReader),
+// including on worker goroutines this cannot reach.
+func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, key string) (changed bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// The stack is logged here, where it is; the returned error is
+			// logged by runPass as the measurement's failure.
+			s.logger.Error().Str("database", m.Database).Str("measurement", m.Measurement).
+				Str("panic", fmt.Sprint(r)).Str("stack", string(debug.Stack())).
+				Msg("Iceberg reconcile: recovered a panic")
+			changed, err = false, fmt.Errorf("reconcile panicked: %v", r)
+		}
+	}()
+	return s.reconcileOne(ctx, m, key)
 }
 
 // reconcileOne reconciles one measurement, returning whether it did work (changed=true) or was

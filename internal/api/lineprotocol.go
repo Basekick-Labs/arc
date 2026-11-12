@@ -13,6 +13,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -27,8 +28,8 @@ type LineProtocolHandler struct {
 	parser *ingest.LineProtocolParser
 	logger zerolog.Logger
 
-	// authManager holds the concrete *auth.AuthManager so route-level
-	// auth.RequireWrite / RequireAdmin can be wired without the
+	// authManager holds the concrete *auth.AuthManager so the route-level
+	// write and admin middleware can be wired without the
 	// silent-miss type-assert pattern. See MsgPackHandler.authManager
 	// for full rationale. nil = OSS no-auth.
 	authManager *auth.AuthManager
@@ -85,12 +86,14 @@ func (h *LineProtocolHandler) checkWritePermissions(c *fiber.Ctx, database strin
 }
 
 // RegisterRoutes registers Line Protocol routes. All write endpoints
-// are gated by auth.RequireWrite when auth is enabled; the /flush
-// endpoint is admin-gated because it forces a global flush across
-// all shards (operationally heavy + spammable). Per CLAUDE.md,
-// mutating endpoints MUST have an explicit auth middleware.
+// are gated by withAnyResourceWriteAuth when auth is enabled: a token
+// holding write on anything, RBAC included (#1559), with every
+// measurement in the payload then checked by checkWritePermissions. The
+// /flush endpoint is admin-gated because it forces a global flush across
+// all shards (operationally heavy + spammable). Per CLAUDE.md, mutating
+// endpoints MUST have an explicit auth middleware.
 func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
-	writeAuth := withWriteAuth(h.authManager)
+	writeAuth := withAnyResourceWriteAuth(h.authManager, h.rbacManager)
 	adminAuth := withAdminAuth(h.authManager)
 
 	// InfluxDB 1.x compatible endpoint
@@ -173,6 +176,10 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	// Validate precision parameter
@@ -330,6 +337,12 @@ localProcessing:
 	h.totalRecords.Add(int64(len(records)))
 
 	// Convert to columnar format grouped by measurement
+	if err := ingest.CheckDenseCells(records); err != nil {
+		h.totalErrors.Add(1)
+		metrics.Get().IncIngestErrors()
+		h.logger.Warn().Err(err).Str("database", database).Msg("Line protocol write refused")
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+	}
 	columnarByMeasurement := ingest.BatchToColumnar(records)
 
 	// The measurements in a fixed order: RBAC reads them, and the write loop
@@ -432,6 +445,10 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 	if err != nil {
 		h.totalErrors.Add(1)
 		metrics.Get().IncIngestErrors()
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Int("body_bytes", len(body)).Msg("Line protocol write refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Str("database", database).Msg("Failed to parse line protocol")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
 	}
@@ -669,7 +686,7 @@ func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *
 	if ingest.IsWriteRefusal(err) {
 		return respondWriteRefused(c, err)
 	}
-	// A client error (#440, #1342, #1424), refused before the WAL.
+	// A client error (#440, #1342, #1424, #1475), refused before the WAL.
 	if ingest.IsContentRefusal(err) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}

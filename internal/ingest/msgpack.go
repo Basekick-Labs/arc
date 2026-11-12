@@ -70,14 +70,20 @@ func (d *MessagePackDecoder) DecodeWithDropsKnown(data []byte, known KnownColumn
 	// row-format payloads decode straight into typed column slices, skipping
 	// the per-value interface boxing of the generic path (~12% of write CPU
 	// at sustained 26M rec/s for columnar). Any shape they don't handle falls
-	// through to the generic path, the authority on accept/reject.
+	// through to the generic path, the authority on accept/reject, except a
+	// write over the cell budget (ErrLPCellBudget), refused here because the
+	// generic path would build the same dense batch.
 	if d.typedEnabled && len(data) > 0 {
 		if recs, ok := d.tryDecodeTyped(data); ok {
 			d.typedHits.Add(1)
 			d.totalDecoded.Add(uint64(len(recs)))
 			return recs, len(recs), nil, nil
 		}
-		if recs, rows, dropped, ok := d.tryDecodeRowsTyped(data, known); ok {
+		recs, rows, dropped, ok, err := d.tryDecodeRowsTyped(data, known)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if ok {
 			d.typedHits.Add(1)
 			d.totalDecoded.Add(uint64(rows))
 			return recs, rows, dropped, nil

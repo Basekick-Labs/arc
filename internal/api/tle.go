@@ -12,6 +12,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
@@ -64,10 +65,12 @@ func (h *TLEHandler) SetRouter(router *cluster.Router) {
 }
 
 // RegisterRoutes registers TLE routes. The write endpoint is gated by
-// auth.RequireWrite when auth is enabled — per CLAUDE.md, mutating
-// endpoints MUST have an explicit write-tier auth middleware.
+// withAnyResourceWriteAuth when auth is enabled — per CLAUDE.md, mutating
+// endpoints MUST have an explicit write-tier auth middleware. It admits a
+// token holding write on anything, RBAC included (#1559); handleWrite then
+// checks the measurement it writes.
 func (h *TLEHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/tle", withWriteAuth(h.authManager), h.handleWrite)
+	app.Post("/api/v1/write/tle", withAnyResourceWriteAuth(h.authManager, h.rbacManager), h.handleWrite)
 	app.Get("/api/v1/write/tle/stats", h.Stats)
 
 	h.logger.Info().Msg("TLE routes registered")
@@ -96,6 +99,10 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	// Check if this request should be forwarded to a writer node
@@ -376,6 +383,14 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 // that way is refused (errZstdWindow).
 const zstdMaxWindow = 32 << 20
 
+// zstdDecodeAll is the decode decompressZstdPooled recovers around; a var so
+// a test can make it panic. klauspost/compress 1.20.2 fixed the crafted
+// frame that used to (GHSA-fpmh-frq8-7rj8), so no real input is known to
+// reach the recover any more.
+var zstdDecodeAll = func(d *zstd.Decoder, data []byte) ([]byte, error) {
+	return d.DecodeAll(data, nil)
+}
+
 // decompressZstdPooled decompresses an untrusted zstd request body with a
 // pooled decoder for maxSize (zstdDecoderPool in msgpack.go), into a fresh
 // []byte the caller owns.
@@ -422,7 +437,7 @@ func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 		}
 	}()
 
-	out, err = decoder.DecodeAll(data, nil)
+	out, err = zstdDecodeAll(decoder, data)
 	// DecodeAll leaves the decoder reusable after an error (its block
 	// decoders go back in a defer), so it returns to the pool either way.
 	pool.Put(decoder)

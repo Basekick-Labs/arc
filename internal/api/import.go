@@ -10,6 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -206,6 +207,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
+	}
 
 	if h.arrowBuffer == nil {
 		h.totalErrors.Add(1)
@@ -255,10 +260,11 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		}
 	}
 
-	// Refuse the whole import up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676); the admitted context keeps
+	// Refuse the whole import up front if writes are fenced (#1207), the WAL
+	// volume is under disk pressure (#676), or the rows waiting to be flushed
+	// are near ingest.max_buffered_bytes (#1468); the admitted context keeps
 	// pressure that starts part-way from splitting it.
-	writeCtx, release, err := h.arrowBuffer.AdmitRequest(c.Context(), scan.bytes)
+	writeCtx, release, err := h.arrowBuffer.AdmitImport(c.Context(), scan.bytes)
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
@@ -295,6 +301,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		}
 		if errors.Is(err, ingest.ErrColumnTypeChange) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Msg("LP import refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
 		}
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: failed to write to buffer")
 		// 503 for the two retryable buffer states: nothing of this import
@@ -432,6 +442,10 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
+	}
 
 	if h.arrowBuffer == nil {
 		h.totalErrors.Add(1)
@@ -536,8 +550,9 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	// Write directly to the ArrowBuffer ingest pipeline (typed path)
 	totalRows := int64(numRecords)
 	// Admit the whole request, its size reserved against the WAL volume's
-	// free space (#676); a fence or disk pressure refuses it here.
-	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	// free space (#676); a fence, disk pressure or the buffered-bytes limit
+	// (#1468) refuses it here.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitImport(c.Context(), int64(len(data)))
 	if aerr != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, aerr)

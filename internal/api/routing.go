@@ -27,6 +27,7 @@ var hopByHopHeaders = map[string]bool{
 	"Proxy-Authenticate":  true,
 	"Proxy-Authorization": true,
 	"Te":                  true,
+	"Trailer":             true,
 	"Trailers":            true,
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
@@ -90,12 +91,15 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // forwarding via the router.
 //
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// import.go, tle.go, query.go) invokes the returned *http.Request synchronously
-// within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
-// (which blocks on http.Client.Do; queries are buffered for retries, writes
-// are streamed once and never retried, see internal/cluster/router.go), then
-// read+close the response
-// body inside CopyResponse, then return. fasthttp does not recycle the
+// import.go, tle.go, query.go, query_arrow_forward.go, forward_read.go,
+// databases.go) invokes the returned
+// *http.Request synchronously within the Fiber handler — they pass it to
+// router.RouteWrite/RouteQuery/RouteReadQuery/RouteDatabaseCreate (which blocks on
+// http.Client.Do; queries are buffered for retries, writes are streamed once
+// and never retried, see internal/cluster/router.go). All but the Arrow
+// forward then read+close the response body inside CopyResponse and return;
+// the Arrow forward streams the response body after the handler returns
+// (see below). fasthttp does not recycle the
 // RequestCtx until after the handler returns (fasthttp server.go
 // releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
 // directly is safe and avoids a copy that can be large at max payload
@@ -103,10 +107,13 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // on server shutdown, so a forward keeps running after its client leaves, as a
 // local write would. Its value is only a parent for the forward's timeout.
 //
-// If a future refactor moves any of this work to a background goroutine
-// or stream writer, those properties no longer hold and the caller
-// must take a defensive copy + use a non-pooled context. Today's
-// callers are all synchronous; revisit this if that changes.
+// If a future refactor moves the REQUEST body's reading to a background
+// goroutine or stream writer, those properties no longer hold and the
+// caller must take a defensive copy + use a non-pooled context. The
+// forwarded Arrow query (#1567) streams the RESPONSE from a stream writer,
+// which is fine: the router reads the request body synchronously
+// (io.ReadAll in doForward) before the handler returns, and the fasthttp
+// ctx outlives the response body write.
 func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Build full URL from Fiber context
 	// c.BaseURL() returns scheme://host, c.OriginalURL() returns path + query
@@ -200,10 +207,11 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	return req, nil
 }
 
-// forwardedRoutes are the requests a peer forwards (writes, imports and
-// queries; see the RouteWrite/RouteImport/RouteQuery callers). A forwarded
-// identity is accepted only on these, so it cannot stand in for a token
-// anywhere else.
+// forwardedRoutes are the requests a peer forwards (writes, imports, queries
+// and database creation; see the RouteWrite/RouteImport/RouteQuery/
+// RouteReadQuery/RouteDatabaseCreate callers). A forwarded identity is
+// accepted only on these, so it cannot stand in for a token anywhere else;
+// the route's own permission check still applies to the forwarded token.
 var forwardedRoutes = map[string]bool{
 	"POST /write":                      true,
 	"POST /api/v2/write":               true,
@@ -216,6 +224,73 @@ var forwardedRoutes = map[string]bool{
 	"POST /api/v1/import/tle":          true,
 	"POST /api/v1/query":               true,
 	"POST /api/v1/query/msgpack":       true,
+	// The rest are forwarded only to peers advertising
+	// CapabilityForwardReadQueries (#1567 and its follow-up), so no older
+	// peer is sent them.
+	"POST /api/v1/query/arrow":    true,
+	"POST /api/v1/query/estimate": true,
+	"GET /api/v1/measurements":    true,
+	"GET /api/v1/databases":       true,
+	// Forwarded only to a writer advertising CapabilityForwardDatabaseCreate.
+	// Creation only: DELETE /api/v1/databases/:name is not forwarded and
+	// stays refused.
+	"POST /api/v1/databases": true,
+}
+
+// forwardedRoutePatterns are the forwardable routes with path parameters: a
+// method and the exact segments, "*" standing for one non-empty segment.
+var forwardedRoutePatterns = []struct {
+	method   string
+	segments []string
+}{
+	{"GET", []string{"api", "v1", "query", "*"}},
+	{"GET", []string{"api", "v1", "databases", "*"}},
+	{"GET", []string{"api", "v1", "databases", "*", "measurements"}},
+	{"GET", []string{"api", "v1", "databases", "*", "measurements", "*", "schema"}},
+}
+
+// forwardableRoute reports whether a forwarded identity may stand in for a
+// token on method + rawPath. It matches the path Fiber routes on, not a
+// cleaned form of it: a path that cleaning would change (".", "..", "//") is
+// refused outright, because Fiber and a cleaned match can disagree about the
+// handler it reaches (/api/v1/databases/../measurements cleans to an allowed
+// route but reaches the databases handler).
+func forwardableRoute(method, rawPath string) bool {
+	p := strings.TrimRight(rawPath, "/")
+	if p == "" || path.Clean(p) != p {
+		return false
+	}
+	// Fiber routes case-insensitively and answers HEAD with the GET handler,
+	// so the match does the same.
+	p = strings.ToLower(p)
+	if method == fiber.MethodHead {
+		method = fiber.MethodGet
+	}
+	if forwardedRoutes[method+" "+p] {
+		return true
+	}
+	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	for _, pat := range forwardedRoutePatterns {
+		if pat.method != method || len(pat.segments) != len(segs) {
+			continue
+		}
+		ok := true
+		for i, want := range pat.segments {
+			if want == "*" {
+				if segs[i] == "" {
+					ok = false
+					break
+				}
+			} else if segs[i] != want {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ForwardIdentityChecker verifies a forwarded request's signed identity
@@ -244,7 +319,7 @@ func ForwardIdentityVerifier(coord ForwardIdentityChecker) func(c *fiber.Ctx) (b
 		if !present {
 			return false, 0, "", nil
 		}
-		if err == nil && !forwardedRoutes[c.Method()+" "+path.Clean(c.Path())] {
+		if err == nil && !forwardableRoute(c.Method(), c.Path()) {
 			err = security.ErrForwardIdentity
 		}
 		return true, tok.ID, tok.Fingerprint, err
@@ -258,15 +333,7 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 
 	// Set status code
 	c.Status(resp.StatusCode)
-
-	// Copy headers (excluding hop-by-hop headers)
-	for key, values := range resp.Header {
-		if !isHopByHop(key) {
-			for _, v := range values {
-				c.Set(key, v)
-			}
-		}
-	}
+	copyForwardedHeaders(c, resp)
 
 	// Copy body
 	body, err := io.ReadAll(resp.Body)
@@ -289,6 +356,35 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 	}
 
 	return c.Send(body)
+}
+
+// copyForwardedHeaders copies a forwarded response's end-to-end headers onto
+// c's response.
+func copyForwardedHeaders(c *fiber.Ctx, resp *http.Response) {
+	// Hop-by-hop headers are skipped. The upstream's values
+	// replace any this node already set, as c.Set did: the forwarding node's
+	// own middleware (CORS, security headers) runs before this, and the
+	// upstream node ran the same middleware, so appending would send
+	// Access-Control-Allow-Origin twice and browsers reject that. Every
+	// upstream value of a repeated header is kept, in order (#1556): c.Set
+	// kept only the last.
+	//
+	// Two passes: fasthttp deletes a header by moving the last one into its
+	// slot, so a Del between Adds could reorder values already added.
+	h := &c.Context().Response.Header
+	for key := range resp.Header {
+		if !isHopByHop(key) {
+			h.Del(key)
+		}
+	}
+	for key, values := range resp.Header {
+		if isHopByHop(key) {
+			continue
+		}
+		for _, v := range values {
+			h.Add(key, v)
+		}
+	}
 }
 
 // ForwardDecision is the outcome of the pre-handler routing check. It
@@ -506,6 +602,13 @@ func respondIngestRefused(c *fiber.Ctx, err error) error {
 	ingest.LogRefusal(c.Path(), err)
 	c.Locals(ingestRefusedLocal, true)
 	c.Set(IngestRefusedHeader, reason)
+	if reason == ingest.RefusalLicenseGrace {
+		// Not a moment's condition: it lasts until the license is renewed or
+		// its grace period ends. A long Retry-After keeps clients from
+		// hammering, and 503 keeps them retrying rather than dropping data.
+		c.Set(fiber.HeaderRetryAfter, "300")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected: " + err.Error()})
+	}
 	c.Set(fiber.HeaderRetryAfter, "5")
 	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 		"error": "Write rejected (retry): " + err.Error(),
@@ -523,22 +626,21 @@ func respondWriteRefused(c *fiber.Ctx, err error) error {
 
 // HandleRoutingError returns an appropriate error response for routing failures.
 func HandleRoutingError(c *fiber.Ctx, err error) error {
-	switch err {
-	case cluster.ErrNoWriterAvailable:
+	// errors.Is, not ==: forwardRequest wraps ErrRoutingFailed with the last
+	// attempt's error, which names the peer's internal URL. Compared with ==
+	// it fell to the default branch, which sent that text to the client.
+	switch {
+	case errors.Is(err, cluster.ErrNoWriterAvailable):
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "No writer node available in the cluster",
 		})
-	case cluster.ErrNoReaderAvailable:
+	case errors.Is(err, cluster.ErrNoReaderAvailable):
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "No reader node available in the cluster",
 		})
-	case cluster.ErrRoutingFailed:
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-			"error": "Failed to route request to cluster node",
-		})
 	default:
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-			"error": "Routing error: " + err.Error(),
+			"error": "Failed to route request to cluster node",
 		})
 	}
 }

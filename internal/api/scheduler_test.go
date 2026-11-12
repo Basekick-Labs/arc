@@ -60,7 +60,7 @@ func validLicense() *license.License {
 }
 
 func expiredLicense() *license.License {
-	return &license.License{Status: "expired", ExpiresAt: time.Now().Add(-time.Hour)}
+	return &license.License{Status: "expired", ExpiresAt: time.Now().Add(-30 * 24 * time.Hour)} // past any grace cutoff
 }
 
 func schedulerRequest(t *testing.T, h *SchedulerHandler, method, path string) (int, map[string]interface{}) {

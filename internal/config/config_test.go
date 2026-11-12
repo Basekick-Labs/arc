@@ -276,6 +276,12 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	// compaction re-encodes via DuckDB anyway. A silent revert of either
 	// SetDefault would ship unnoticed otherwise: every ingest test constructs
 	// IngestConfig by hand and the bool zero values coincide with these.
+	if cfg.Ingest.MaxRowGroupRows != 524288 {
+		t.Errorf("Ingest.MaxRowGroupRows default = %d, want 524288 (free on the sustained msgpack benchmark; 122880 cost 1.7%%)", cfg.Ingest.MaxRowGroupRows)
+	}
+	if cfg.Ingest.WritePageIndex {
+		t.Error("Ingest.WritePageIndex default = true, want false (no reader yet; cost grows with row-group count)")
+	}
 	if cfg.Ingest.UseDictionary {
 		t.Error("Ingest.UseDictionary default = true, want false (26.09.1 default flip)")
 	}
@@ -408,6 +414,9 @@ func TestLoad_IcebergBackends(t *testing.T) {
 			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c", "ARC_TIERED_STORAGE_COLD_S3_ENDPOINT", "storage.googleapis.com"), "Google Cloud Storage"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.env["ARC_TIERED_STORAGE_COLD_BACKEND"] == "gcs" || tc.env["ARC_STORAGE_BACKEND"] == "gcs" {
+				skipGCSInFIPSBuild(t)
+			}
 			t.Chdir(t.TempDir())
 			for k, v := range tc.env {
 				t.Setenv(k, v)
@@ -1641,6 +1650,7 @@ func TestLoad_DatabaseExtensionsTOMLArray(t *testing.T) {
 // TestLoad_GCSPrimaryValidation (#1105): storage.backend="gcs" is accepted with
 // a bucket, and each refusal names the key at fault.
 func TestLoad_GCSPrimaryValidation(t *testing.T) {
+	skipGCSInFIPSBuild(t)
 	cases := []struct {
 		name    string
 		env     map[string]string
@@ -1695,6 +1705,7 @@ func TestLoad_GCSPrimaryValidation(t *testing.T) {
 // "gcs" with every key, its refusals naming the key, and the overlap refusal
 // between cold and primary storage, which applies to every backend.
 func TestLoad_GCSColdTierValidation(t *testing.T) {
+	skipGCSInFIPSBuild(t)
 	cold := func(kv ...string) map[string]string {
 		m := map[string]string{
 			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
@@ -1792,5 +1803,21 @@ func TestLoad_AzureCredentialsTrimmed(t *testing.T) {
 	}
 	if cfg.Storage.AzureSASToken != "sv=1&sig=abc" || cfg.Storage.AzureAccountKey != "key==" {
 		t.Fatalf("not trimmed: %q %q", cfg.Storage.AzureSASToken, cfg.Storage.AzureAccountKey)
+	}
+}
+
+// ingest.max_row_group_rows: 0 keeps one row group per flush; 1..1023 and
+// negatives are rejected (a cap of 1 writes a row group and a page-index entry
+// per row); 1024 and up are accepted.
+func TestLoad_MaxRowGroupRowsValidation(t *testing.T) {
+	for _, c := range []struct {
+		v  string
+		ok bool
+	}{{"0", true}, {"1024", true}, {"122880", true}, {"1", false}, {"1023", false}, {"-5", false}} {
+		t.Setenv("ARC_INGEST_MAX_ROW_GROUP_ROWS", c.v)
+		_, err := Load()
+		if (err == nil) != c.ok {
+			t.Errorf("max_row_group_rows=%s: err=%v, want ok=%v", c.v, err, c.ok)
+		}
 	}
 }

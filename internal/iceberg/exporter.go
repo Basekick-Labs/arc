@@ -106,8 +106,11 @@ type Exporter struct {
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
-	publishedMu            sync.Mutex
-	published              map[string]string
+	// forgetDroppedRows, markerCleared (guarded by publishedMu): see dropped.go (#1611).
+	forgetDroppedRows bool
+	markerCleared     map[string]struct{}
+	publishedMu       sync.Mutex
+	published         map[string]string
 
 	// collapseThreshold is the manifest count at which a pass also collapses the manifest set
 	// (see manifestCollapseThreshold). A field rather than a bare constant so a test can raise it
@@ -287,7 +290,8 @@ type ArcField struct {
 }
 
 // TableExists reports whether the Iceberg table for (database, measurement) exists, swallowing
-// catalog lookup errors and returning false.
+// catalog lookup errors and returning false. Where the warehouse is authoritative it first
+// adopts the published version, which can write this node's catalog row (#1609).
 func (e *Exporter) TableExists(ctx context.Context, database, measurement string) bool {
 	ctx = e.withAWS(ctx)
 	exists, _ := e.tableExists(ctx, database, measurement)
@@ -302,7 +306,10 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
 		return false, err
 	}
-	_, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
+	if err := e.adoptBeforeLoad(ctx, database, measurement); err != nil {
+		return false, err
+	}
+	_, err := e.loadTableRecovering(ctx, e.tableIdent(database, measurement))
 	if err == nil {
 		return true, nil
 	}
@@ -310,6 +317,22 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 		return false, nil
 	}
 	return false, err
+}
+
+// adoptBeforeLoad adopts the version published in the warehouse before a
+// catalog load, where the warehouse is authoritative (every warehouse Arc
+// publishes to; SetWarehouseAuthoritative). The
+// scheduler's first loads after a restart (tableSeed, tableExists) ran before
+// EnsureTable's adoption, so a stale row whose metadata another node had since
+// pruned failed every pass, and a node with no row never saw a table another
+// node published (#1609).
+func (e *Exporter) adoptBeforeLoad(ctx context.Context, database, measurement string) error {
+	if !e.warehouseAuthoritative {
+		return nil
+	}
+	ident := e.tableIdent(database, measurement)
+	_, err := e.adoptPublished(ctx, ident, catalogNamespaceKey(ident[:len(ident)-1]), ident[len(ident)-1])
+	return err
 }
 
 // EnsureTable creates the Iceberg table for (database, measurement) if absent, using the
@@ -341,7 +364,7 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 		return nil, err
 	}
 
-	tbl, err := e.catalog.LoadTable(ctx, ident)
+	tbl, err := e.loadTableRecovering(ctx, ident)
 	if err == nil {
 		// Table exists — evolve its schema to cover any new columns in `sc` (Arc's
 		// per-measurement schema can grow over time). Missing columns are added as optional,
@@ -1634,9 +1657,10 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 			if err := e.publishMetadataCopy(ctx, vKey, body); err != nil {
 				if errors.Is(err, errFenced) {
 					// Another node published this version first: this commit forked the table.
-					// No hint, no prune, no sweep; the next pass adopts the published lineage.
-					e.logger.Error().Err(err).Str("key", vKey).
-						Msg("Iceberg: another writer published this table version first; this pass stops and the next one adopts the published version")
+					// No hint, no prune, no sweep. Where the warehouse is authoritative (every
+					// node Arc wires, SetWarehouseAuthoritative) the next pass adopts the published lineage.
+					e.logger.Error().Err(err).Str("key", vKey).Bool("adopts_next_pass", e.warehouseAuthoritative).
+						Msg("Iceberg: another writer published this table version first; this pass stops (the next one adopts the published version where the warehouse is authoritative)")
 					e.hintFailMu.Lock()
 					e.fenced = err
 					e.hintFailMu.Unlock()
@@ -1659,6 +1683,7 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	}
 	if okAll {
 		e.markPublished(tbl.Identifier(), metaLoc)
+		e.clearDropMarker(ctx, tbl.Identifier())
 	}
 	return okAll
 }
@@ -1708,12 +1733,7 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 	// an unclean path), and raw string comparison then lands every commit in
 	// warn-once "hint unaddressable" mode. Resolution must be SYMMETRIC —
 	// all three values or none — and the two constant sides are cached.
-	e.resolveOnce.Do(func() {
-		e.resolvedWarehouse = decodedURIPath(resolveFileURI(e.warehouse))
-		if e.backend != nil {
-			e.resolvedRoot = decodedURIPath(resolveFileURI(DefaultWarehouse(e.backend)))
-		}
-	})
+	e.resolveBases()
 	loc := decodedURIPath(resolveFileURI(metaLoc))
 	if !isUnderDir(loc, e.resolvedWarehouse) {
 		return "", false
@@ -1727,6 +1747,16 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimPrefix(strings.TrimPrefix(loc, e.resolvedRoot), "/"), true
+}
+
+// resolveBases computes the symlink-resolved warehouse and storage root once.
+func (e *Exporter) resolveBases() {
+	e.resolveOnce.Do(func() {
+		e.resolvedWarehouse = decodedURIPath(resolveFileURI(e.warehouse))
+		if e.backend != nil {
+			e.resolvedRoot = decodedURIPath(resolveFileURI(DefaultWarehouse(e.backend)))
+		}
+	})
 }
 
 // decodedURIPath returns the URI's logical path without percent escapes for comparisons and
@@ -1753,6 +1783,13 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	// iceberg-go's 0644 metadata world-readable.
 	resolved := decodedURIPath(resolveFileURI(metaLoc))
 	if !strings.HasPrefix(resolved, scheme) {
+		return
+	}
+	// Only inside the configured warehouse: the walk below chmods the
+	// metadata directory and two ancestors, so a location that resolved
+	// somewhere else must never reach it (#1616).
+	e.resolveBases()
+	if !isUnderDir(resolved, e.resolvedWarehouse) {
 		return
 	}
 	metaDir := filepath.Dir(filepath.FromSlash(strings.TrimPrefix(resolved, scheme)))
@@ -1787,29 +1824,26 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	}
 }
 
-// resolveFileURI canonicalizes a file:// URI for path comparison: scheme
-// stripped, symlinks resolved, re-URI'd via localFileURI. When the full path
-// does not exist yet, its parent directory is resolved and the base rejoined,
-// so a not-yet-written metadata location still canonicalizes consistently
-// with its directory. Non-file schemes (s3://, azure://) return unchanged:
-// object keys have no symlinks and must keep exact string semantics.
+// resolveFileURI canonicalizes a local location for path comparison: a
+// file:// URI (any case of the scheme, one slash or three) or a bare path
+// (#1616: a bare iceberg.warehouse makes iceberg-go write bare locations),
+// made absolute, symlinks resolved through the nearest existing ancestor
+// (storage.ResolveExistingPath, as backup resolves the warehouse), and
+// re-URI'd via localFileURI. A bare path is taken literally, never
+// percent-decoded: iceberg-go writes it to the directory its literal name
+// spells. A location whose directories are gone (a table another node
+// dropped, #1611) still compares in the same spelling as its warehouse.
+// Non-file schemes (s3://, azure://) return unchanged: object keys have no
+// symlinks and must keep exact string semantics.
 func resolveFileURI(uri string) string {
-	const scheme = "file://"
-	if !strings.HasPrefix(uri, scheme) {
+	if isBareLocalPath(uri) {
+		return localFileURI(storage.ResolveExistingPath(filepath.FromSlash(uri)))
+	}
+	parsed, ok := isFileURI(uri)
+	if !ok {
 		return uri
 	}
-	parsed, err := url.Parse(uri)
-	if err != nil || parsed.Scheme != "file" || parsed.Host != "" {
-		return uri
-	}
-	p := filepath.FromSlash(parsed.Path)
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		return localFileURI(resolved)
-	}
-	if resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
-		return localFileURI(filepath.Join(resolvedDir, filepath.Base(p)))
-	}
-	return uri
+	return localFileURI(storage.ResolveExistingPath(filepath.FromSlash(parsed.Path)))
 }
 
 // isUnderDir reports whether p is dir itself or lies beneath it, matching only at a path
@@ -1860,7 +1894,10 @@ func (e *Exporter) tableSeed(ctx context.Context, database, measurement string) 
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
 		return ArcSchema{}, nil, false, err
 	}
-	tbl, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
+	if err := e.adoptBeforeLoad(ctx, database, measurement); err != nil {
+		return ArcSchema{}, nil, false, err
+	}
+	tbl, err := e.loadTableRecovering(ctx, e.tableIdent(database, measurement))
 	if errors.Is(err, icecatalog.ErrNoSuchTable) {
 		return ArcSchema{}, nil, false, nil
 	}
@@ -1936,6 +1973,12 @@ func isAlreadyExists(err error) bool {
 // exported (or already cleaned) returns nil, so a re-run of the delete
 // converges.
 //
+// On a shared bucket (SetForgetDroppedRows) it first writes a drop marker per
+// table (dropped.go), so another node still holding a catalog row for one of
+// these tables forgets it instead of failing on its missing metadata; it then
+// deletes the warehouse objects even when this node never exported the
+// database, which is the usual case for the primary writer (#1611).
+//
 // Spoke-namespace pseudo-databases contain a path separator and are refused:
 // their namespace naming does not follow this mapping, and their lifecycle is
 // owned by edge-sync.
@@ -1945,64 +1988,108 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
 	}
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
+	nsKey := catalogNamespaceKey(ns)
+
+	// This node's tables. A node that never exported the database has no
+	// namespace in its own catalog, but on a shared bucket another node's
+	// tables are in the warehouse: the drop goes on to delete them (#1611).
+	// The primary writer, which runs the drop, is often not the node that
+	// exports.
+	var localTables []icetable.Identifier
+	hadLocalNamespace := true
+	for ident, err := range e.catalog.ListTables(ctx, ns) {
+		if err != nil {
+			if errors.Is(err, icecatalog.ErrNoSuchNamespace) {
+				hadLocalNamespace = false
+				break
+			}
+			return fmt.Errorf("list tables for drop: %w", err)
+		}
+		localTables = append(localTables, ident)
+	}
+
+	// The namespace's warehouse objects. Warehouse holds ONLY metadata (data
+	// files are Arc's own tree, already deleted by the caller).
+	//
+	// catalogNamespaceKey, not a second concatenation of nsPrefix and the database: the SQL
+	// catalog names a namespace directory after the key it stores, and for a namespace whose
+	// component contains a dot that key is JSON-encoded (#1129). Re-deriving the plain form
+	// here would list a directory that does not exist and leave the real one behind.
+	//
+	// relDir == "" means the namespace directory IS the storage root, so relDir+"/" would be
+	// "/", which the storage key contract refuses (#743); skip it.
+	var relDir string
+	var keys []string
+	if e.backend != nil {
+		if rd, ok := e.warehouseRelKey(e.warehouse + "/" + nsKey + ".db"); ok && rd != "" {
+			relDir = rd
+			var err error
+			if keys, err = e.backend.List(ctx, relDir+"/"); err != nil {
+				return fmt.Errorf("list warehouse metadata: %w", err)
+			}
+		}
+	}
+
+	// Drop markers first (dropped.go): a drop that fails after this point,
+	// re-run, lists what is left and writes them again; one that wrote none
+	// deleted nothing yet.
+	if e.forgetDroppedRows && e.backend != nil {
+		tables := map[string]struct{}{}
+		for _, ident := range localTables {
+			tables[ident[len(ident)-1]] = struct{}{}
+		}
+		for _, k := range keys {
+			if rest, ok := strings.CutPrefix(k, relDir+"/"); ok {
+				if table, _, ok := strings.Cut(rest, "/"); ok && table != "" {
+					tables[table] = struct{}{}
+				}
+			}
+		}
+		stamp := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
+		for table := range tables {
+			if err := e.backend.Write(ctx, droppedMarkerKey(nsKey, table), stamp); err != nil {
+				return fmt.Errorf("write the Iceberg drop marker for %s.%s: %w", nsKey, table, err)
+			}
+		}
+	}
 
 	// The SQL catalog's DropNamespace refuses non-empty namespaces, so drop
 	// every table first. Collect the first error but keep going: partial
 	// cleanup converges on the next delete attempt.
 	var firstErr error
-	for ident, err := range e.catalog.ListTables(ctx, ns) {
-		if err != nil {
-			if errors.Is(err, icecatalog.ErrNoSuchNamespace) {
-				return nil // never exported; nothing to clean
-			}
-			return fmt.Errorf("list tables for drop: %w", err)
-		}
+	for _, ident := range localTables {
 		if err := e.catalog.DropTable(ctx, ident); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("drop table %v: %w", ident, err)
 		}
 	}
-	if err := e.catalog.DropNamespace(ctx, ns); err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
-		firstErr = fmt.Errorf("drop namespace: %w", err)
+	if hadLocalNamespace {
+		if err := e.catalog.DropNamespace(ctx, ns); err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
+			firstErr = fmt.Errorf("drop namespace: %w", err)
+		}
 	}
 
-	// Warehouse holds ONLY metadata (data files are Arc's own tree, already
-	// deleted by the caller); remove the namespace directory's objects via
-	// the backend so local and object-store warehouses behave alike.
-	if e.backend != nil {
-		// catalogNamespaceKey, not a second concatenation of nsPrefix and the database: the SQL
-		// catalog names a namespace directory after the key it stores, and for a namespace whose
-		// component contains a dot that key is JSON-encoded (#1129). Re-deriving the plain form
-		// here would list a directory that does not exist and leave the real one behind.
-		nsDirURI := e.warehouse + "/" + catalogNamespaceKey(ns) + ".db"
-		// relDir == "" means the namespace directory IS the storage root, so
-		// relDir+"/" would be "/", which the storage key contract refuses
-		// (#743). It listed empty before, and enumerating the whole root to
-		// delete it is not what this is for, so skip it.
-		if relDir, ok := e.warehouseRelKey(nsDirURI); ok && relDir != "" {
-			keys, err := e.backend.List(ctx, relDir+"/")
-			if err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("list warehouse metadata: %w", err)
+	// Remove the namespace directory's objects via the backend so local and
+	// object-store warehouses behave alike.
+	if relDir != "" {
+		dirs := map[string]bool{relDir: true}
+		for _, key := range keys {
+			if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
 			}
-			dirs := map[string]bool{relDir: true}
-			for _, key := range keys {
-				if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
-					firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
-				}
-				for d := path.Dir(key); len(d) > len(relDir); d = path.Dir(d) {
-					dirs[d] = true
-				}
+			for d := path.Dir(key); len(d) > len(relDir); d = path.Dir(d) {
+				dirs[d] = true
 			}
-			// RemoveDirectory is non-recursive, so sweep the now-empty
-			// directory tree deepest-first (object stores no-op here).
-			if remover, ok := e.backend.(storage.DirectoryRemover); ok {
-				ordered := make([]string, 0, len(dirs))
-				for d := range dirs {
-					ordered = append(ordered, d)
-				}
-				sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
-				for _, d := range ordered {
-					_ = remover.RemoveDirectory(ctx, d)
-				}
+		}
+		// RemoveDirectory is non-recursive, so sweep the now-empty
+		// directory tree deepest-first (object stores no-op here).
+		if remover, ok := e.backend.(storage.DirectoryRemover); ok {
+			ordered := make([]string, 0, len(dirs))
+			for d := range dirs {
+				ordered = append(ordered, d)
+			}
+			sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+			for _, d := range ordered {
+				_ = remover.RemoveDirectory(ctx, d)
 			}
 		}
 	}

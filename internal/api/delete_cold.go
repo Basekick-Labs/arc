@@ -54,6 +54,26 @@ type deleteColdTier interface {
 	NotifyColdFilesRemoved(n int)
 }
 
+// coldRemovalGuard is implemented by *tiering.Manager: a run that deletes
+// cold objects before retiring their rows brackets itself, so the cold
+// sync's missing-object check does not count rows it is about to retire
+// (#1551).
+type coldRemovalGuard interface {
+	BeginColdRemoval()
+	EndColdRemoval()
+}
+
+// beginColdRemoval begins a bracket on tier when it supports one and returns
+// its end.
+func beginColdRemoval(tier any) func() {
+	g, ok := tier.(coldRemovalGuard)
+	if !ok {
+		return func() {}
+	}
+	g.BeginColdRemoval()
+	return g.EndColdRemoval
+}
+
 // coldFile is one cold object a DELETE counted.
 type coldFile struct {
 	path      string // storage key (the hot path the file had)
@@ -228,8 +248,9 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 		}
 	}
 
-	// Rows whose object is gone (#1350 review M2): cold sync never retires
-	// them, so a DELETE that looked would otherwise stat them on every run.
+	// Rows whose object is gone (#1350 review M2): on the primary the cold
+	// sync never retires them (only a reader's does, #1563), so a DELETE that
+	// looked would otherwise stat them on every run.
 	rows, err := tier.ColdFilesForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Debug().Err(err).Msg("Could not read cold rows to find ones whose object is gone")
@@ -368,6 +389,7 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 	if c == nil || c.backend == nil {
 		return
 	}
+	defer beginColdRemoval(h.coldTier)()
 	var retire []string
 	for _, f := range c.whole {
 		if ctx.Err() != nil {

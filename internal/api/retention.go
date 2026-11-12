@@ -1117,6 +1117,14 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid policy ID"})
 	}
 
+	// An ID with no policy has no history to list: 404, as GET /:id answers,
+	// rather than a 200 with an empty one.
+	if _, err := h.getPolicy(int64(policyID)); errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
+	}
+
 	limit := c.QueryInt("limit", 50)
 
 	rows, err := h.db.Query(`
@@ -1133,7 +1141,8 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	var executions []RetentionExecution
+	// Non-nil, so a policy that has not run yet lists [], not null.
+	executions := []RetentionExecution{}
 	for rows.Next() {
 		var ex RetentionExecution
 		var executionDurationMs sql.NullFloat64

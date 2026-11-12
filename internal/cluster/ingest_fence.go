@@ -310,7 +310,8 @@ const (
 func IngestRefusalReason(err error) string { return ingest.RefusalReason(err) }
 
 // startIngestFenceLocked builds and runs the fence where a primary is elected:
-// Raft with local storage. The contact rule also needs automatic failover. The
+// Raft without shared_storage_mode (local storage, or a single-writer shared
+// bucket, #1603). The contact rule also needs automatic failover. The
 // caller holds c.mu: it runs from Start, which holds it throughout.
 func (c *Coordinator) startIngestFenceLocked() {
 	if c.raftNode == nil || c.raftFSM == nil || c.cfg.SharedStorageMode || c.writerFailoverMgr == nil {

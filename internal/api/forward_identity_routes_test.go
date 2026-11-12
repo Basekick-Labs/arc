@@ -50,7 +50,30 @@ func TestForwardIdentityVerifier_OnlyOnForwardedRoutes(t *testing.T) {
 		{"POST", "/api/v1/import/tle", "accepted", true},
 		{"POST", "/api/v1/query", "accepted", true},
 		{"POST", "/api/v1/query/msgpack", "accepted", true},
-		{"POST", "/api/v1/query/arrow", "refused", true},
+		{"POST", "/api/v1/query/arrow", "accepted", true}, // forwarded since #1567
+		// The compactor's other reads, forwarded since #1567's follow-up.
+		{"POST", "/api/v1/query/estimate", "accepted", true},
+		{"GET", "/api/v1/query/cpu", "accepted", true},
+		{"GET", "/api/v1/measurements", "accepted", true},
+		{"GET", "/api/v1/databases/db/measurements/cpu/schema", "accepted", true},
+		{"GET", "/api/v1/databases", "accepted", true},
+		{"GET", "/api/v1/databases/db", "accepted", true},
+		{"GET", "/api/v1/databases/db/measurements", "accepted", true},
+		{"POST", "/api/v1/databases", "accepted", true},
+		// Near misses: another method on the same shape, an extra or missing
+		// segment, a path that cleaning would change.
+		{"POST", "/api/v1/databases/db", "refused", true},
+		{"PUT", "/api/v1/databases", "refused", true},
+		{"POST", "/api/v1/databases/db/measurements/cpu/schema/rebuild", "refused", true},
+		{"POST", "/api/v1/query/cpu", "refused", true},
+		{"GET", "/api/v1/query/cpu/extra", "refused", true},
+		{"GET", "/api/v1/databases/db/measurements/cpu", "refused", true},
+		{"GET", "/api/v1/databases/../measurements", "refused", true},
+		{"GET", "/api/v1//measurements", "refused", true},
+		{"GET", "/api/v1/queries/active", "refused", true},
+		// Fiber routes case-insensitively and answers HEAD with the GET
+		// handler: the match follows it.
+		{"GET", "/API/v1/Databases/db", "accepted", true},
 		{"POST", "/api/v1/auth/tokens", "refused", true},
 		{"DELETE", "/api/v1/databases/x", "refused", true},
 		{"GET", "/api/v1/query", "refused", true},

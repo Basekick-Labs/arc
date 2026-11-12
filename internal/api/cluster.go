@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/basekick-labs/arc/internal/audit"
 	"github.com/basekick-labs/arc/internal/auth"
@@ -51,10 +52,19 @@ type clusterFilesCoordinator interface {
 	DeleteFileFromManifest(ctx context.Context, path, reason string) error
 }
 
+// clusterNodeRemover is the part of the coordinator a node removal uses; a
+// seam so the handler's status mapping is testable without a licensed
+// coordinator.
+type clusterNodeRemover interface {
+	GetLocalNode() *cluster.Node
+	RemoveNodeViaRaft(nodeID string) error
+}
+
 // ClusterHandler handles cluster management API endpoints.
 type ClusterHandler struct {
 	coordinator      *cluster.Coordinator
 	filesCoordinator clusterFilesCoordinator
+	nodeRemover      clusterNodeRemover
 	authManager      *auth.AuthManager
 	licenseClient    *license.Client
 	logger           zerolog.Logger
@@ -68,13 +78,18 @@ func NewClusterHandler(
 	licenseClient *license.Client,
 	logger zerolog.Logger,
 ) *ClusterHandler {
+	// Assigned only when non-nil, so a nil coordinator leaves nil
+	// interfaces rather than typed nils.
 	var fc clusterFilesCoordinator
+	var nr clusterNodeRemover
 	if coordinator != nil {
 		fc = coordinator
+		nr = coordinator
 	}
 	return &ClusterHandler{
 		coordinator:      coordinator,
 		filesCoordinator: fc,
+		nodeRemover:      nr,
 		authManager:      authManager,
 		licenseClient:    licenseClient,
 		logger:           logger.With().Str("component", "cluster-handler").Logger(),
@@ -164,6 +179,15 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		compactorGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	compactorGroup.Post("/assign", h.handleAssignCompactor)
+
+	// Admin-only: reset the cold mark's seed (#1552), after fixing a node
+	// whose cold tier pointed at another store. Marks are kept; the next cold
+	// listing seeds again, and reads stop using the mark until then.
+	coldMarkGroup := app.Group("/api/v1/cluster/cold-mark")
+	if h.authManager != nil {
+		coldMarkGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	coldMarkGroup.Post("/reset", h.handleResetColdMark)
 
 	// Admin-only: converge the Raft voter set onto the role-based rule
 	// (#880). Named "converge" rather than "reconcile" because
@@ -564,6 +588,48 @@ func (h *ClusterHandler) handleDemoteWriter(c *fiber.Ctx) error {
 	})
 }
 
+// handleResetColdMark clears the cluster cold mark's seed, cold store identity
+// and backend conflict (#1552). Fix every node's cold tier config first: the
+// first complete cold listing after the reset, on any node whose tiering is
+// not role-gated, seeds it again from that node's store. Marks are kept.
+func (h *ClusterHandler) handleResetColdMark(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node, so there is no cold mark to reset",
+		})
+	}
+	reason := c.Query("reason")
+	if len(reason) > maxDeleteReasonLen {
+		reason = truncateRunes(reason, maxDeleteReasonLen)
+	}
+	reason = utils.CopyString(reason)
+	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	defer cancel()
+	if err := h.coordinator.ResetColdMark(ctx, "admin-api", reason); err != nil {
+		if errors.Is(err, cluster.ErrColdMarkNotEnabled) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"success": false, "error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("Failed to reset the cold mark")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "cold mark seed reset; make sure every node uses the same cold tier: the first complete cold-tier metadata sync on a node whose tiering is not role-gated seeds it again, and reads do not use it until then",
+	})
+}
+
+// truncateRunes cuts s to at most n bytes without splitting a UTF-8 rune.
+func truncateRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
 // handleGetStatus returns the overall cluster status.
 func (h *ClusterHandler) handleGetStatus(c *fiber.Ctx) error {
 	// Check if clustering is enabled and licensed
@@ -776,8 +842,15 @@ func (h *ClusterHandler) nodeToMapWithLease(node *cluster.Node, activeCompactorI
 // handleRemoveNode removes a dead or unresponsive node from the cluster.
 // This is an admin-only destructive operation — it removes the node from
 // Raft voting, the cluster FSM state, and the local registry.
+//
+// An ID that is not a member answers 404 and proposes nothing (#1619). A
+// member here is anything a removal would act on (see
+// cluster.Coordinator.isRemovableMember): a stale Raft voter missing from the
+// registry and a writer that left gracefully are both still removable. On a
+// non-leader the answer stays the 500 "not the leader", checked before
+// membership.
 func (h *ClusterHandler) handleRemoveNode(c *fiber.Ctx) error {
-	if h.coordinator == nil {
+	if h.nodeRemover == nil {
 		return h.respondNotEnabled(c)
 	}
 
@@ -790,7 +863,7 @@ func (h *ClusterHandler) handleRemoveNode(c *fiber.Ctx) error {
 	}
 
 	// Prevent self-removal
-	localNode := h.coordinator.GetLocalNode()
+	localNode := h.nodeRemover.GetLocalNode()
 	if localNode != nil && localNode.ID == nodeID {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
@@ -798,7 +871,16 @@ func (h *ClusterHandler) handleRemoveNode(c *fiber.Ctx) error {
 		})
 	}
 
-	if err := h.coordinator.RemoveNodeViaRaft(nodeID); err != nil {
+	if err := h.nodeRemover.RemoveNodeViaRaft(nodeID); err != nil {
+		if errors.Is(err, cluster.ErrNodeNotFound) {
+			// Not "not the leader": arcli matches that text to retry on the
+			// leader, and this answer must not send it there.
+			h.logger.Warn().Str("node_id", nodeID).Msg("Refused to remove a node that is not a member of the cluster")
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"success": false,
+				"error":   "node " + nodeID + " is not a member of the cluster",
+			})
+		}
 		h.logger.Error().Err(err).Str("node_id", nodeID).Msg("Failed to remove node from cluster")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,

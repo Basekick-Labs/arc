@@ -84,8 +84,8 @@ func TestValidateWhereClauseRejectsKeywordsGluedToNumbersOrLiterals(t *testing.T
 // Edge cases the review added on top of the masking: literals that mention a
 // file-I/O function or an identifier that is a keyword stay data; the escaped
 // quote, trailing comment and dollar-tag shapes the masker was hardened
-// against stay refused; and a quote inside a backtick identifier must not
-// open a literal that swallows the call after it.
+// against stay refused; and a backtick, which is not a quote in DuckDB, is
+// refused rather than guessed at (#1480).
 func TestValidateWhereClauseMaskingEdgeCases(t *testing.T) {
 	h := &DeleteHandler{}
 	for _, where := range []string{
@@ -168,5 +168,36 @@ func TestValidateWhereClauseRejectsSideEffectFunctions(t *testing.T) {
 	}
 	if _, err := h.validateWhereClause(`host = 'enable_logging(x)'`); err != nil {
 		t.Errorf("a function name inside a literal was refused: %v", err)
+	}
+}
+
+// A DELETE predicate refuses every function the query validator refuses. It
+// kept its own copy of the reader list, which missed the readers added after
+// it was written and never checked dynamic SQL; under `EXISTS (FROM ...)`
+// these ran with no SELECT for the keyword list to catch (GHSA-r7vm-9hcg-xgf7).
+func TestValidateWhereClauseRefusesQueryDeniedFunctions(t *testing.T) {
+	h := &DeleteHandler{}
+	for _, where := range []string{
+		"time > 0 AND EXISTS (FROM parquet_full_metadata('/x'))",
+		"time > 0 AND EXISTS (FROM read_duckdb('/x'))",
+		"time > 0 AND EXISTS (FROM query('SELECT 1'))",
+		"time > 0 AND EXISTS (FROM query_table('t'))",
+		"time > 0 AND EXISTS (FROM sniff_csv('/x'))",
+		"time > 0 AND EXISTS (FROM read_json_objects('/x'))",
+		"time > 0 AND EXISTS (FROM read_ndjson_objects('/x'))",
+		"time > 0 AND EXISTS (FROM enable_profiling(format := 'json', save_location := '/x.json'))",
+		"time > 0 AND EXISTS (FROM \"PARQUET_FULL_METADATA\"('/x'))",
+		"time > 0 AND EXISTS (FROM duckdb_external_file_cache())",
+		"time > 0 AND EXISTS (FROM histogram_values('/x', v) WHERE bin = 'S')",
+		"time > 0 AND EXISTS (FROM histogram('/x', v))",
+		"time > 0 AND json_serialize_plan('SELECT * FROM read_parquet(''/x'')') IS NOT NULL",
+	} {
+		if _, err := h.validateWhereClause(where); err == nil {
+			t.Errorf("validateWhereClause accepted %q", where)
+		}
+	}
+	// A column that shares a refused function's name is still a column.
+	if _, err := h.validateWhereClause("enable_profiling = 1 AND query > 0 AND histogram > 0"); err != nil {
+		t.Errorf("validateWhereClause refused plain columns: %v", err)
 	}
 }

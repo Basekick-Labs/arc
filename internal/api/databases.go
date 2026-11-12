@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -31,7 +32,6 @@ type DatabasesHandler struct {
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
 	coordinator    DatabaseDeleteCoordinator
-	gateNonPrimary bool
 	tieringManager databaseTieringManager
 	authManager    *auth.AuthManager
 	rbacManager    RBACChecker
@@ -42,6 +42,63 @@ type DatabasesHandler struct {
 	// before it and withdraws its pending registrations (#1207 d1).
 	flusher DeleteFlusher
 	pending DatabasePendingRegistrations
+	// router forwards the listings from a node that cannot serve queries (a
+	// compactor) to one that can, and a create from a node that does not
+	// ingest to the writer; nil outside a cluster.
+	router *cluster.Router
+	// warehouse names the Iceberg warehouse's directories in the storage root,
+	// which are not databases (#1626); nil when Iceberg export is off.
+	warehouse WarehouseDirs
+}
+
+// WarehouseDirs names the directories the Iceberg warehouse occupies in the
+// storage root (iceberg.WarehouseLayout). Both methods must answer false on a
+// nil receiver.
+type WarehouseDirs interface {
+	// IsWarehouseRootDir: a top-level directory that is the warehouse's, not a
+	// database: a namespace directory, or a subdirectory warehouse.
+	IsWarehouseRootDir(name string) bool
+	// IsWarehouseMeasurement: the measurement directory a nested warehouse
+	// ("<root>/db/m/…") occupies.
+	IsWarehouseMeasurement(db, m string) bool
+	// ContainsWarehouse: database db holds a nested warehouse; its path
+	// relative to the storage root.
+	ContainsWarehouse(db string) (string, bool)
+}
+
+// SetWarehouseLayout hides the Iceberg warehouse's directories from the
+// database routes (#1626): not listed, 404 to GET, 403 to DELETE, 400 to a
+// create. Wired only with Iceberg export on.
+func (h *DatabasesHandler) SetWarehouseLayout(l WarehouseDirs) { h.warehouse = l }
+
+func (h *DatabasesHandler) isWarehouseDir(name string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseRootDir(name)
+}
+
+func (h *DatabasesHandler) isWarehouseMeasurement(db, m string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseMeasurement(db, m)
+}
+
+// warehouseDatabaseError is the refusal every writer gives a database named
+// after the Iceberg warehouse directory, whose files would land inside the
+// warehouse (#1626). No apostrophe: see continuous_query.go's note on the
+// log masking of quoted spans.
+func warehouseDatabaseError(name string) string {
+	return fmt.Sprintf("database name %q is reserved for the Iceberg warehouse", name)
+}
+
+// SetRouter installs the cluster router the listings and creates forward
+// through.
+func (h *DatabasesHandler) SetRouter(r *cluster.Router) { h.router = r }
+
+// forwardListing forwards a listing from a node that cannot serve queries;
+// handled is false when it is answered here.
+func (h *DatabasesHandler) forwardListing(c *fiber.Ctx) (bool, error) {
+	return forwardRead(c, h.router, forwardReadOpts{
+		route:   h.router.RouteReadQuery,
+		timeout: h.requestTimeout,
+		logger:  h.logger,
+	})
 }
 
 // DatabasePendingRegistrations withdraws every pending registration of a
@@ -89,18 +146,17 @@ const databaseDeleteManifestChunkSize = 200
 const databaseDeleteManifestReason = "database:delete"
 
 // SetCoordinator wires cluster manifest updates into database deletion, and
-// with gateNonPrimary the primary-writer admission check. Pass gateNonPrimary
-// under the same condition the tiering manager's writer gate is wired
-// (shared storage or replication), so a cluster answers the same way whether
-// tiered storage is enabled or not: without either, nodes share nothing, the
-// manifest delete unlinks nothing on peers, and each node may delete its own
-// files. Call before RegisterRoutes, alongside the other handler wiring.
-func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator, gateNonPrimary bool) {
+// the primary-writer admission check. Every cluster gets the check: even a
+// local-storage cluster without replication shares the cold tier, and a
+// database delete removes every cold object of the database and its manifest
+// entries for every node, so it is one node's job, like a row DELETE or
+// retention (#1599). It runs whether or not tiered storage is enabled. Call
+// before RegisterRoutes, alongside the other handler wiring.
+func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator) {
 	if c == nil {
 		return
 	}
 	h.coordinator = c
-	h.gateNonPrimary = gateNonPrimary
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -118,15 +174,6 @@ func (h *DatabasesHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSche
 // nil` true for a typed nil and defeat the guards below.
 func (h *DatabasesHandler) SetRBACManager(rm RBACChecker) { h.rbacManager = rm }
 
-// checkDatabasePermission gates a listing on the caller's read grant for a
-// database, mirroring QueryHandler.checkMeasurementPermission — which is what
-// the equivalent query-path endpoints use (`SHOW DATABASES`, `SHOW TABLES
-// FROM db`, GET /api/v1/measurements). database may be "*" for the
-// list-everything endpoint, matching the `SHOW DATABASES` gate.
-//
-// Returns nil when RBAC is disabled or no token is present: the route
-// middleware has already decided whether an unauthenticated request is
-// allowed, exactly as the query path does.
 // filterReadableMeasurements returns only the measurements the caller may
 // read, preserving order.
 //
@@ -188,38 +235,6 @@ func (h *DatabasesHandler) checkDatabasePermissionScoped(c *fiber.Ctx, database,
 		Int64("token_id", tokenInfo.ID).
 		Msg("RBAC denied listing")
 	return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
-}
-
-func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, measurement, permission string) error {
-	// Gated on the checker being WIRED, not on the license. Enforcement must
-	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
-	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
-	// three cases (admin break-glass, memberships -> RBAC authoritative, no
-	// memberships -> coarse permissions), so a deployment without RBAC
-	// configured is unaffected.
-	if h.rbacManager == nil {
-		return nil
-	}
-	tokenInfo := auth.GetTokenInfo(c)
-	if tokenInfo == nil {
-		return nil
-	}
-	result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
-		TokenInfo:   tokenInfo,
-		Database:    database,
-		Measurement: measurement,
-		Permission:  permission,
-	})
-	if !result.Allowed {
-		h.logger.Warn().
-			Str("database", database).
-			Str("permission", permission).
-			Str("reason", result.Reason).
-			Int64("token_id", tokenInfo.ID).
-			Msg("RBAC permission denied")
-		return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
-	}
-	return nil
 }
 
 // CreateDatabaseRequest represents a request to create a new database
@@ -327,8 +342,13 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 	// the middleware asks "does this token have read authority at all, coarse
 	// or granted", the handler asks "for THIS database, or for all of them".
 	readAuth := withResourceReadAuth(h.authManager, h.rbacManager)
+	// The list-everything route names no database, so the per-database door
+	// above would ask about database "" and refuse every tenant token. It
+	// asks "may this token read anything" instead, and handleList shows the
+	// databases the token can read (#1562).
+	listAuth := withAnyResourceReadAuth(h.authManager, h.rbacManager)
 
-	app.Get("/api/v1/databases", readAuth, h.handleList)
+	app.Get("/api/v1/databases", listAuth, h.handleList)
 	app.Get("/api/v1/databases/:name", readAuth, h.handleGet)
 	app.Get("/api/v1/databases/:name/measurements", readAuth, h.handleListMeasurements)
 	app.Post("/api/v1/databases", adminAuth, h.handleCreate)
@@ -337,22 +357,33 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 
 // handleList handles GET /api/v1/databases
 func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
-	// Listing every database asks for a grant covering every database, the
-	// same bar `SHOW DATABASES` applies (handleShowDatabases in query.go).
-	//
-	// A caller without a grant covering every database is refused here and
-	// must name its database via GET /api/v1/databases/<name>, which asks the
-	// weaker "may you enumerate inside it" question and filters the names it
-	// returns. Same bar `SHOW DATABASES` applies.
-	if err := h.checkDatabasePermission(c, "*", "*", "read"); err != nil {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
+	// A caller with a grant covering every database sees them all; any
+	// other sees the databases it can read something in, each counted by the
+	// measurements it can read, as GET /api/v1/databases/:name counts them
+	// (#1562). Same rule as SHOW DATABASES (databaseListingFilter).
+	visible, unavailable := databaseListingFilter(c, h.rbacManager)
+	if unavailable {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Permission store unavailable; retry later",
+		})
+	}
+	var count func(db string, names []string) int
+	if visible != nil {
+		count = func(db string, names []string) int {
+			return len(h.filterReadableMeasurements(c, db, names))
+		}
 	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
 
 	// Optimized: Single storage call to get all databases with measurement counts
-	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx)
+	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx, visible, count)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -370,6 +401,13 @@ func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
 
 // handleCreate handles POST /api/v1/databases
 func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
+	// A node that does not ingest (a reader or compactor) sends the create to
+	// the writer, where the database's writes land. Before the body is read,
+	// as every forwarded write: the writer validates it.
+	if handled, err := h.forwardCreate(c); handled {
+		return err
+	}
+
 	var req CreateDatabaseRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -390,7 +428,9 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 		})
 	}
 
-	if reservedDatabaseNames[strings.ToLower(req.Name)] {
+	// The Iceberg warehouse directory is refused like a reserved name: the
+	// marker would be written inside the warehouse (#1626).
+	if reservedDatabaseNames[strings.ToLower(req.Name)] || h.isWarehouseDir(req.Name) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Database name '" + req.Name + "' is reserved",
 		})
@@ -398,6 +438,10 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
+
+	if err := databaseSpellingError(h.storage, req.Name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	// Check if database already exists
 	exists, err := h.databaseExists(ctx, req.Name)
@@ -435,8 +479,81 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 	})
 }
 
+// forwardCreate forwards a create to the writer when this node does not
+// ingest. handled=false: create locally — no cluster, a node that ingests,
+// or a writer too old to accept it (cluster.ErrNoCapablePeer).
+func (h *DatabasesHandler) forwardCreate(c *fiber.Ctx) (bool, error) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		return true, RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		req, err := BuildHTTPRequest(c)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to build database create request for forwarding")
+			return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare request for forwarding",
+			})
+		}
+		resp, err := h.router.RouteDatabaseCreate(c.Context(), req)
+		if errors.Is(err, cluster.ErrLocalNodeCanHandle) {
+			return false, nil
+		}
+		if errors.Is(err, cluster.ErrNoCapablePeer) {
+			warnCreateNoCapableWriter(h.logger)
+			return false, nil
+		}
+		if err != nil {
+			return true, h.respondCreateForwardError(c, err)
+		}
+		return true, CopyResponse(c, resp)
+	}
+	return false, nil
+}
+
+// respondCreateForwardError answers a forwarded create that failed. The
+// statuses are a forwarded write's (respondWriteForwardError), the wording a
+// create's, and without the ingest-fence header: this is not an ingest
+// refusal.
+func (h *DatabasesHandler) respondCreateForwardError(c *fiber.Ctx, err error) error {
+	switch {
+	case errors.Is(err, cluster.ErrWriteForwardUnavailable):
+		h.logger.Warn().Err(err).Msg("Database create could not be forwarded to the writer")
+		c.Set(fiber.HeaderRetryAfter, "5")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Database not created: the writer could not be reached; retry",
+		})
+	case errors.Is(err, cluster.ErrWriteForwardAmbiguous):
+		h.logger.Warn().Err(err).Msg("Database create forwarded to the writer got no answer")
+		return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
+			"error": "Database create forwarded to the writer got no answer; it may have been created (a retry answers 409 if so)",
+		})
+	case errors.Is(err, cluster.ErrNoWriterAvailable):
+	default:
+		h.logger.Error().Err(err).Msg("Failed to route database create request")
+	}
+	return HandleRoutingError(c, err)
+}
+
+var lastCreateNoCapableLog atomic.Int64
+
+// warnCreateNoCapableWriter logs, at most once a minute, that creates are
+// made locally because the writer does not accept them forwarded yet.
+func warnCreateNoCapableWriter(logger zerolog.Logger) {
+	now := time.Now().UnixNano()
+	last := lastCreateNoCapableLog.Load()
+	if now-last < int64(noCapablePeerLogEvery) || !lastCreateNoCapableLog.CompareAndSwap(last, now) {
+		return
+	}
+	logger.Warn().Msg("The writer does not accept forwarded database creates yet (rolling upgrade); this node creates them itself (logged at most once a minute)")
+}
+
 // handleGet handles GET /api/v1/databases/:name
 func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
 	name := c.Params("name")
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -451,8 +568,9 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
-	// Arc's own state, not a database: the list hides it, so this does too (#1012).
-	if storage.IsReservedRootDir(name) {
+	// Arc's own state, not a database: the list hides it, so this does too
+	// (#1012). The Iceberg warehouse's directories likewise (#1626).
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -467,6 +585,10 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer cancel()
+
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -504,6 +626,11 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 
 // handleListMeasurements handles GET /api/v1/databases/:name/measurements
 func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
+	// A node that cannot serve queries forwards the listing: its own view of
+	// the databases is not the readers'.
+	if handled, err := h.forwardListing(c); handled {
+		return err
+	}
 	name := c.Params("name")
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -518,7 +645,7 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
-	if storage.IsReservedRootDir(name) {
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -648,9 +775,36 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// _schema and _compaction_state included). The second matters more now
 	// than it did: this handler no longer only unlinks local hot files, it
 	// also deletes cold objects and proposes cluster-wide manifest removals.
-	if reservedDatabaseNames[strings.ToLower(name)] || storage.IsReservedRootDir(name) {
+	// The Iceberg warehouse's directories are a third: deleting one would
+	// remove the exported tables' metadata (#1626).
+	if reservedDatabaseNames[strings.ToLower(name)] || storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "Cannot delete reserved database '" + name + "'",
+		})
+	}
+	// A database holding a nested Iceberg warehouse ("<root>/db/m/…") is
+	// refused whole: its delete lists and removes every file under it, the
+	// warehouse's metadata for every exported table included. Filtering the
+	// warehouse out instead is not safe: user files can land under it too.
+	if h.warehouse != nil {
+		if rel, ok := h.warehouse.ContainsWarehouse(name); ok {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": "Cannot delete database '" + name + "': it contains the Iceberg warehouse '" + rel + "' (iceberg.warehouse); move the warehouse first",
+			})
+		}
+	}
+	// Refuse a node that is not the primary writer, as the row delete API and
+	// retention do (#1094). Checked before the tier reservation, and whether
+	// or not tiering runs here: in a local-storage cluster without
+	// replication a writer's tiering is ungated, so BeginDatabaseDelete alone
+	// would admit a standby writer (#1599).
+	if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		role := h.coordinator.Role()
+		h.logger.Warn().Str("database", name).Str("role", role).
+			Msg("Database deletion rejected: this node is not the primary writer")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
+			"role":  role,
 		})
 	}
 	if h.tieringManager != nil {
@@ -681,22 +835,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			})
 		}
 		defer release()
-	} else if h.coordinator != nil && h.gateNonPrimary && !h.coordinator.IsPrimaryWriter() {
-		// No tiering manager: nothing above gated the request, so refuse a
-		// node that is not the primary writer here, as the row delete API and
-		// retention do (#1094). With tiering enabled, BeginDatabaseDelete
-		// already answers this case.
-		role := h.coordinator.Role()
-		h.logger.Warn().Str("database", name).Str("role", role).
-			Msg("Database deletion rejected: this node is not the primary writer")
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
-			"role":  role,
-		})
 	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer func() { cancel() }()
+
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -1131,7 +1277,7 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 	// Filter out hidden directories and sort
 	filtered := make([]string, 0, len(databases))
 	for _, db := range databases {
-		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") && !h.isWarehouseDir(db) {
 			filtered = append(filtered, db)
 		}
 	}
@@ -1144,7 +1290,11 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 // using minimal storage calls instead of N+1 calls.
 // Strategy: Get list of databases first (1 call), then get all files (1 call) to count measurements.
 // Also checks tiering metadata for databases that may only have data in cold storage.
-func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Context) ([]DatabaseInfo, error) {
+//
+// visible, when non-nil, drops the databases the caller may not see before
+// anything else is asked of storage about them (#1562); count, when non-nil,
+// replaces len(measurements) for each database shown.
+func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Context, visible func(string) bool, count func(db string, names []string) int) ([]DatabaseInfo, error) {
 	// First, get list of all databases from hot tier (includes empty databases with just .arc-database marker)
 	databases, err := h.listDatabases(ctx)
 	if err != nil {
@@ -1174,11 +1324,22 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 			} else {
 				// Add any databases that only exist in cold tier
 				for _, db := range coldDatabases {
+					if h.isWarehouseDir(db) {
+						continue // not a database, as listDatabases (#1626)
+					}
 					if dbMeasurements[db] == nil {
 						dbMeasurements[db] = make(map[string]bool)
 					}
 					hasContent[db] = true
 				}
+			}
+		}
+	}
+
+	if visible != nil {
+		for db := range dbMeasurements {
+			if !visible(db) {
+				delete(dbMeasurements, db)
 			}
 		}
 	}
@@ -1210,8 +1371,9 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 		}
 		hasContent[db] = true
 
-		// Skip hidden measurements (like .arc-database marker)
-		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") {
+		// Skip hidden measurements (like .arc-database marker), and the
+		// directory a nested Iceberg warehouse occupies (#1626).
+		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") || h.isWarehouseMeasurement(db, measurement) {
 			continue
 		}
 
@@ -1256,7 +1418,7 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 					continue
 				}
 				for _, m := range coldMeasurements {
-					if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") {
+					if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") && !h.isWarehouseMeasurement(db, m) {
 						dbMeasurements[db][m] = true
 					}
 				}
@@ -1273,9 +1435,17 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 
 	result := make([]DatabaseInfo, 0, len(sortedDatabases))
 	for _, db := range sortedDatabases {
+		n := len(dbMeasurements[db])
+		if count != nil {
+			names := make([]string, 0, n)
+			for m := range dbMeasurements[db] {
+				names = append(names, m)
+			}
+			n = count(db, names)
+		}
 		result = append(result, DatabaseInfo{
 			Name:             db,
-			MeasurementCount: len(dbMeasurements[db]),
+			MeasurementCount: n,
 		})
 	}
 
@@ -1328,13 +1498,29 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	// Filter out hidden directories and sort
 	filtered := make([]string, 0, len(measurementSet))
 	for m := range measurementSet {
-		if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") {
+		if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") && !h.isWarehouseMeasurement(database, m) {
 			filtered = append(filtered, m)
 		}
 	}
 	sort.Strings(filtered)
 
 	return filtered, nil
+}
+
+// databaseSpellingError refuses a database name that exists in storage under
+// another spelling on a volume that folds names (#1509). Checked before
+// databaseExists, whose marker lookup would follow the fold: a delete would
+// otherwise flush, record and withdraw under the requested spelling before
+// its listing refused it.
+func databaseSpellingError(backend storage.Backend, name string) error {
+	g, ok := backend.(storage.NameSpellingGuard)
+	if !ok {
+		return nil
+	}
+	if err := g.CheckNameSpelling(name); storage.IsNameSpellingError(err) {
+		return err
+	}
+	return nil
 }
 
 func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (bool, error) {
@@ -1355,6 +1541,44 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	}
 
 	return h.databaseHasContent(ctx, name)
+}
+
+// ErrDatabaseNotFound and ErrInvalidDatabaseName are CheckDatabase's
+// answers, so a caller keeps the database routes' statuses: 404 and 400.
+var (
+	ErrDatabaseNotFound    = errors.New("database not found")
+	ErrInvalidDatabaseName = errors.New("invalid database name")
+)
+
+// CheckDatabase reports whether a database exists by the rule GET
+// /api/v1/databases/:name answers with, in its order (#1626):
+//   - ErrInvalidDatabaseName: not a safe storage segment (GET: 400);
+//   - the storage name-spelling error, as is (GET: 400 with its text, #1509);
+//   - ErrDatabaseNotFound: a reserved root directory, an Iceberg warehouse
+//     directory, or no marker, file, cold-tier row or manifest entry (404);
+//   - any other error: the check itself failed (500).
+//
+// It looks only at this node: on a cluster that keeps data per node, a
+// database created through POST /api/v1/databases is a marker on the
+// writer's disk, which a reader or compactor does not see.
+func (h *DatabasesHandler) CheckDatabase(ctx context.Context, name string) error {
+	if !isSafeStoragePathSegment(name) {
+		return ErrInvalidDatabaseName
+	}
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
+		return ErrDatabaseNotFound
+	}
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return err
+	}
+	exists, err := h.databaseExists(ctx, name)
+	if err != nil {
+		return fmt.Errorf("check database %q: %w", name, err)
+	}
+	if !exists {
+		return ErrDatabaseNotFound
+	}
+	return nil
 }
 
 // databaseHasHotFiles reports whether the backend holds a listable file under

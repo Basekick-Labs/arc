@@ -845,9 +845,9 @@ func TestValidateWhereClauseQuery(t *testing.T) {
 
 // Edge cases added in review: identifiers that merely contain the former
 // xp_/sp_ prefixes or a keyword pass; the escaped-quote, trailing-comment and
-// dollar-tag shapes the masker was hardened against stay refused; and a quote
-// inside a backtick identifier must not open a literal that swallows the
-// statement after it.
+// dollar-tag shapes the masker was hardened against stay refused; and a
+// backtick, which is not a quote in DuckDB, is refused rather than guessed at
+// (#1480).
 func TestValidateWhereClauseQueryMaskingEdgeCases(t *testing.T) {
 	// Every keyword in the list is still refused as a bare word.
 	for _, kw := range dangerousQueryKeywords {
@@ -1271,7 +1271,7 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		// statement separator) is preserved by the column-position case
 		// below, which must stay allowed.
 		{name: "semicolon inside backtick identifier in table position rejected as invalid name", sql: "SELECT * FROM `my;db`", shouldFail: true},
-		{name: "semicolon inside backtick identifier in column position allowed", sql: "SELECT `my;col` FROM cpu", shouldFail: false},
+		{name: "backtick-quoted column refused: DuckDB does not quote with backticks (#1480)", sql: "SELECT `my;col` FROM cpu", shouldFail: true},
 		{name: "SHOW smuggled behind semicolon in backtick db", sql: "SHOW TABLES FROM `db`; SELECT 1", shouldFail: true},
 	}
 
@@ -1303,6 +1303,8 @@ func TestIOTableFunctionPattern_Family(t *testing.T) {
 		"read_text", "read_blob", "read_xlsx", "glob",
 		"delta_scan", "iceberg_scan", "iceberg_metadata", "iceberg_snapshots",
 		"arc_partition_agg",
+		// GHSA-r7vm-9hcg-xgf7.
+		"parquet_full_metadata", "read_duckdb", "arrow_scan", "arrow_scan_dumb",
 	}
 	for _, fn := range mustBlock {
 		// Each must be rejected as a call, anywhere, case-insensitively.
@@ -1318,6 +1320,66 @@ func TestIOTableFunctionPattern_Family(t *testing.T) {
 		// Bare identifier with the same prefix but no call form must NOT match.
 		if err := ValidateSQLRequest("SELECT * FROM " + fn + "_notacall_x"); err != nil {
 			t.Errorf("ValidateSQLRequest: false positive on identifier %q_notacall_x: %v", fn, err)
+		}
+	}
+}
+
+// The payloads confirmed live against main in GHSA-r7vm-9hcg-xgf7: each read
+// another database's files, or wrote a file, through a function the
+// validator did not know.
+func TestValidateSQLRequest_GHSAr7vmPayloads(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT * FROM parquet_full_metadata('./data/arc/db2/m2/*.parquet')",
+		`SELECT * FROM "PARQUET_FULL_METADATA"('./data/arc/db2/m2/*.parquet')`,
+		"SELECT (SELECT count(*) FROM parquet_full_metadata('./data/arc/db2/m2/*.parquet')) AS n",
+		"SELECT * FROM read_duckdb('./data/arc/db2/m2/side.duckdb', table_name => 't')",
+		"SELECT * FROM enable_profiling(format := 'json', save_location := './data/arc/db2/prof.json')",
+		"SELECT * FROM enable_profiling()",
+		"SELECT * FROM disable_profiling()",
+		"SELECT * FROM duckdb_external_file_cache()",
+		"SELECT * FROM duckdb_temporary_files()",
+		"SELECT * FROM duckdb_prepared_statements()",
+		"SELECT * FROM enable_peg_parser()",
+	} {
+		if err := ValidateSQLRequest(sql); err == nil {
+			t.Errorf("ValidateSQLRequest accepted %q", sql)
+		}
+	}
+	// Found while fixing it: a table macro over query_table, and a scalar
+	// that binds the SQL it is given.
+	const p = "'./data/arc/db2/m2/*.parquet'"
+	for _, sql := range []string{
+		"SELECT * FROM histogram_values(" + p + ", secret)",
+		"SELECT * FROM histogram(" + p + ", secret)",
+		"FROM histogram(" + p + ", secret)",
+		"SELECT * FROM main.histogram(" + p + ", secret)",
+		`SELECT * FROM "HISTOGRAM"(` + p + ", secret)",
+		"SELECT * FROM cpu, histogram(" + p + ", secret)",
+		"SELECT * FROM cpu, LATERAL histogram(" + p + ", secret)",
+		"SELECT * FROM cpu JOIN histogram(" + p + ", secret) h ON true",
+		"SELECT * FROM cpu \"where\", histogram(" + p + ", secret)",
+		"SELECT (SELECT bin FROM histogram (" + p + ", secret) LIMIT 1)",
+		"SELECT * FROM histogram\u00a0(" + p + ", secret)",
+		"SELECT json_serialize_plan('SELECT * FROM read_parquet(''./data/arc/**/*.parquet'')')",
+		"SELECT * FROM pg_prepared_statements",
+		"SELECT * FROM sql_auto_complete('SELECT * FROM ''./data/')",
+	} {
+		if err := ValidateSQLRequest(sql); err == nil {
+			t.Errorf("ValidateSQLRequest accepted %q", sql)
+		}
+	}
+	// Columns that share those names are still columns, the histogram
+	// aggregate is still an aggregate, and a measurement may be called
+	// histogram.
+	for _, sql := range []string{
+		"SELECT enable_profiling, read_duckdb FROM cpu",
+		"SELECT histogram(usage) FROM cpu",
+		"SELECT histogram(usage, [10, 50, 90]) FROM cpu GROUP BY host",
+		"SELECT * FROM histogram",
+		"SELECT * FROM cpu, histogram WHERE cpu.time = histogram.time",
+	} {
+		if err := ValidateSQLRequest(sql); err != nil {
+			t.Errorf("ValidateSQLRequest refused %q: %v", sql, err)
 		}
 	}
 }

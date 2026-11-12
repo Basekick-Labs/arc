@@ -20,6 +20,7 @@ import (
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -83,6 +84,8 @@ type Server struct {
 	// (the invisible state behind the 27-restart field incident). Absent for
 	// deployments with no license configured at all.
 	licenseStatus func() license.LicenseHealth
+	// coldMissingObjects supplies the /health "tiering" field (#1551).
+	coldMissingObjects func() *tiering.ColdMissingObjectsStatus
 }
 
 // ServerConfig holds server configuration
@@ -251,6 +254,13 @@ func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
 	s.app.Get("/api/v1/logs", withAdminAuth(authManager), s.logsHandler)
 }
 
+// SetColdMissingObjects wires the /health "tiering" field source: the last
+// check of cold tier rows whose object is gone (#1551). fn returns nil while
+// there is nothing to report, and the field is then absent.
+func (s *Server) SetColdMissingObjects(fn func() *tiering.ColdMissingObjectsStatus) {
+	s.coldMissingObjects = fn
+}
+
 // SetLicenseStatus wires the /health "license" field source.
 func (s *Server) SetLicenseStatus(fn func() license.LicenseHealth) {
 	s.licenseStatus = fn
@@ -361,6 +371,16 @@ func (s *Server) healthHandler(c *fiber.Ctx) error {
 	}
 	if s.licenseStatus != nil {
 		payload["license"] = s.licenseStatus()
+	}
+	if s.coldMissingObjects != nil {
+		// Counts only: /health is unauthenticated, so no paths (#1551).
+		if st := s.coldMissingObjects(); st != nil {
+			payload["tiering"] = fiber.Map{
+				"cold_rows_missing_objects":          st.Lost,
+				"cold_rows_missing_objects_hot_copy": st.HotCopy,
+				"cold_missing_checked_at":            st.CheckedAt,
+			}
+		}
 	}
 	return c.JSON(payload)
 }

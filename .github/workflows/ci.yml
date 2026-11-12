@@ -67,6 +67,18 @@ jobs:
       - name: Vet
         run: go vet -tags=duckdb_arrow ./...
 
+      # The FIPS variant, checked on every PR rather than first at release
+      # time (#1587: the GCS backend pulled x/crypto/hkdf into the FIPS build
+      # and nothing saw it until the release dry run). fips-check is the
+      # release workflow's import-graph guard (go list, which resolves imports
+      # but does not type-check); vet type-checks the fips build and its
+      # tests; the tests run the packages whose fips-only paths have tests.
+      - name: FIPS build checks
+        run: |
+          make fips-check
+          go vet -tags=duckdb_arrow,fips ./...
+          go test -tags=duckdb_arrow,fips ./internal/config/ ./internal/storage/ ./internal/auth/ ./internal/fips/
+
       # -timeout is per package binary; Go's default is 10 minutes, and
       # internal/cluster alone takes about 520 s under -race on these
       # runners (650 s on a laptop). A package that hits the default panics
@@ -203,6 +215,55 @@ jobs:
             exit 1
           fi
 
+  # The Linux release binary must run on the oldest supported distros (glibc
+  # 2.34: Ubuntu 22.04, Debian 12, RHEL 9, Amazon Linux 2023). 26.09.3 did not
+  # (#1579). Built here exactly as release-build.yml builds it, on both
+  # architectures, so a dependency bump that raises the floor fails its PR
+  # rather than the next release.
+  linux-floor:
+    name: Linux release binary (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up the Linux release toolchain
+        run: scripts/setup-linux-release-toolchain.sh
+
+      - name: Build
+        env:
+          CGO_ENABLED: 1
+        run: go build -tags=duckdb_arrow -ldflags "-s -w" -o arc ./cmd/arc
+
+      - name: Check glibc floor and libstdc++
+        run: |
+          readelf -d arc | grep NEEDED
+          if readelf -d arc | grep -q 'libstdc++'; then
+            echo "::error::arc links libstdc++ dynamically (#1579)"
+            exit 1
+          fi
+          scripts/check-glibc-floor.sh arc 2.34
+
+      - name: Starts on the oldest supported distros
+        run: |
+          for IMAGE in debian:12 ubuntu:22.04 rockylinux:9 amazonlinux:2023; do
+            docker run --rm -v "$PWD:/b:ro" -e ARC_TELEMETRY_ENABLED=false "$IMAGE" bash -c '
+              cd /tmp && timeout 8 /b/arc > /tmp/arc.log 2>&1
+              head -3 /tmp/arc.log
+              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
+            ' || { echo "::error::arc does not start on ${IMAGE}"; exit 1; }
+            echo "starts on ${IMAGE}"
+          done
+
   # A rendered-template check, in its own job because it needs helm and not Go.
   # It is fast and has no build step, so it reports long before Build & Test.
   chart:
@@ -242,6 +303,9 @@ jobs:
         run: |
           bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
             -f helm/arc-enterprise/values-local-storage.yaml
+
+      - name: Enterprise chart shared storage, multi-writer and single-writer
+        run: bash scripts/test_enterprise_shared_mode.sh helm/arc-enterprise
 
       - name: Every clustered role can join Raft (shared storage preset)
         run: |

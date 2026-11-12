@@ -2,7 +2,7 @@ module github.com/basekick-labs/arc
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
@@ -22,7 +22,7 @@ require (
 	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.0
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/mattn/go-sqlite3 v1.14.34
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/rs/zerolog v1.34.0
@@ -56,7 +56,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.12.0 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.8.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.26.0 // indirect
-	github.com/andybalholm/brotli v1.2.3 // indirect
+	github.com/andybalholm/brotli v1.2.7 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/apache/thrift v0.24.0 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
@@ -166,11 +166,3 @@ require (
 	gopkg.in/ini.v1 v1.67.3 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-// klauspost/compress is held at 1.19.2 (fasthttp 1.76 asks for >= 1.20.3):
-// 1.20 moved snappy encoding on arm64 from Go to new assembly that costs
-// about 3x the CPU on Parquet pages (arrow-go writes Parquet with
-// snappy.Encode), which cut line-protocol ingest by ~14% and msgpack+gzip by
-// ~11% on an M3 Max. Lift once a release fixes it (klauspost/compress#1271);
-// re-run the ingest A/B.
-replace github.com/klauspost/compress => github.com/klauspost/compress v1.19.2

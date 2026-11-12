@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/basekick-labs/arc/internal/sysmem"
@@ -33,7 +34,13 @@ var memoryLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 type Config struct {
 	// Warnings are load-time advisories about accepted values (see
 	// LoadWarning). Emitted by cmd/arc/main.go right after Load; never fatal.
-	Warnings        []LoadWarning
+	Warnings []LoadWarning
+	// ConfigFile is the config file Load read, as an absolute path (viper's
+	// ConfigFileUsed), or "" when none was found and Arc runs on defaults and
+	// environment variables. Backup's include_config and restore_config use
+	// it (#1466): the file is found through a search path, so "arc.toml"
+	// relative to the working directory is not it.
+	ConfigFile      string
 	Server          ServerConfig
 	FlightSQL       FlightSQLConfig
 	Database        DatabaseConfig
@@ -163,6 +170,8 @@ type IngestConfig struct {
 	NumericDictionary     bool     // With UseDictionary, also dictionary-encode numeric/timestamp columns (pre-26.09.1 behavior; costs hashing+boxing per value)
 	WriteStatistics       bool     // Write Parquet statistics
 	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
+	MaxRowGroupRows       int      // Rows per Parquet row group at ingest (default 524288, free on the sustained benchmark; 0 = one row group per flush; 1..1023 and negatives rejected by Load)
+	WritePageIndex        bool     // Write the Parquet page index at ingest (default false: no reader yet, cost grows with row-group count). Offset index always; column index only where statistics exist (needs write_statistics) and fit the stats size cap
 	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
@@ -181,7 +190,19 @@ type IngestConfig struct {
 	// before it is refused with 503 and nothing written (#1429). 0 = until a
 	// slot frees: the server does not see a client that gives up.
 	ImportQueueTimeoutMS int
+	// MaxBufferedBytes is ingest.max_buffered_bytes resolved to bytes (#1468):
+	// once the rows held for flushing (arc_buffer_bytes_buffered) reach it, new
+	// write requests are refused with a retryable 503. 0 = off (the default),
+	// unless MaxBufferedBytesAuto ("auto"), which the buffer resolves against
+	// the memory limit it detects.
+	MaxBufferedBytes     int64
+	MaxBufferedBytesAuto bool
 }
+
+// minMaxBufferedBytes is the smallest explicit ingest.max_buffered_bytes: a
+// limit below one ordinary request refuses every write once anything is
+// buffered.
+const minMaxBufferedBytes = 1 << 20
 
 type CacheConfig struct {
 	Enabled    bool
@@ -498,10 +519,21 @@ type WALConfig struct {
 	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
 	// much written data a sync may leave behind, not the writer's throughput.
 	SyncBytes int64
-	// AckMode is when a write is acknowledged with the WAL on: "queued" (the
-	// default) once its entry is queued for the WAL writer, or "durable" once
-	// a sync covering it has completed. See wal.AckMode.
+	// AckMode is when a write is acknowledged with the WAL on: "durable" once
+	// a sync covering its entry has completed, or "queued" once the entry is
+	// queued for the WAL writer. Always resolved here to one of the two: the
+	// default "auto" (#1499) is durable with the WAL on, and queued with the
+	// WAL off or with cluster.wal_coverage set (the covered append commits
+	// under the ingest shard lock, where a durable wait would stall every
+	// writer to the measurement). See wal.AckMode.
 	AckMode string
+	// AckModeAuto records that AckMode was resolved from "auto".
+	AckModeAuto bool
+	// AckTimeoutSeconds bounds a durable write's wait for its covering sync
+	// (#1501): past it the write is refused (503, wal_not_durable) and its
+	// entries retracted without waiting on the device. Default 30; 0 = no
+	// bound. See wal.WriterConfig.AckTimeout.
+	AckTimeoutSeconds int
 	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
 	// volume is low on free space, and keeps the WAL reserve file (#676).
 	// Default true; only acts with the WAL enabled.
@@ -990,9 +1022,9 @@ type ClusterConfig struct {
 	//     refuses if licenseClient.CanUseSharedStorageMultiWriter()
 	//     is false. Requires FeatureSharedStorageMultiWriter license.
 	//
-	// Default false: today's single-writer-per-cluster behavior. Single
-	// writer pointed at S3 continues to work unchanged with this flag
-	// false (the flag only matters for N>1 writers).
+	// Default false: one elected primary writer (local storage, or a
+	// single-writer shared bucket, #1603). The Helm chart sets it from
+	// storage.shared.multiWriter (#1606).
 	//
 	// See docs/progress/2026-05-26-multi-writer-pattern2.md.
 	SharedStorageMode bool
@@ -1014,9 +1046,9 @@ func Load() (*Config, error) {
 	// Load config file
 	v.SetConfigName("arc")
 	v.SetConfigType("toml")
-	v.AddConfigPath(".")
-	v.AddConfigPath("/etc/arc/")
-	v.AddConfigPath("$HOME/.arc/")
+	for _, p := range configSearchPaths {
+		v.AddConfigPath(p)
+	}
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -1165,6 +1197,8 @@ func Load() (*Config, error) {
 			NumericDictionary:      v.GetBool("ingest.numeric_dictionary"),
 			WriteStatistics:        v.GetBool("ingest.write_statistics"),
 			DataPageVersion:        v.GetString("ingest.data_page_version"),
+			MaxRowGroupRows:        v.GetInt("ingest.max_row_group_rows"),
+			WritePageIndex:         v.GetBool("ingest.write_page_index"),
 			FlushWorkers:           v.GetInt("ingest.flush_workers"),
 			FlushQueueSize:         v.GetInt("ingest.flush_queue_size"),
 			FlushTimeoutSeconds:    v.GetInt("ingest.flush_timeout_seconds"),
@@ -1260,6 +1294,7 @@ func Load() (*Config, error) {
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
 			AckMode:                 v.GetString("wal.ack_mode"),
+			AckTimeoutSeconds:       v.GetInt("wal.ack_timeout_seconds"),
 			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
 			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
 			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
@@ -1486,9 +1521,33 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	switch cfg.WAL.AckMode {
-	case "queued", "durable":
+	case "auto", "queued", "durable":
 	default:
-		return nil, fmt.Errorf("wal.ack_mode must be queued or durable, got %q", cfg.WAL.AckMode)
+		return nil, fmt.Errorf("wal.ack_mode must be auto, queued or durable, got %q", cfg.WAL.AckMode)
+	}
+	// "auto" is resolved first, so no later check ever sees it (#1499):
+	// durable with the WAL on; queued with the WAL off (the key has no
+	// effect) or with cluster.wal_coverage set, which durable does not
+	// support (below). The explicit values keep their checks.
+	// Coverage takes effect only on a clustered, local-storage writer with
+	// the WAL on (enableWALCoverage in cmd/arc); the key alone is ignored,
+	// with a warning, everywhere else.
+	coverageInEffect := cfg.WAL.Enabled && cfg.Cluster.Enabled && cfg.Cluster.WALCoverage && !cfg.Cluster.SharedStorageMode
+	if cfg.WAL.AckMode == "auto" {
+		cfg.WAL.AckModeAuto = true
+		switch {
+		case !cfg.WAL.Enabled:
+			cfg.WAL.AckMode = "queued"
+		case coverageInEffect:
+			cfg.WAL.AckMode = "queued"
+			cfg.Warnings = append(cfg.Warnings, LoadWarning{
+				Key:     "wal.ack_mode",
+				Value:   "auto",
+				Message: "wal.ack_mode = \"auto\" resolves to \"queued\" because cluster.wal_coverage is in effect on this writer: writes are acknowledged before their WAL entry is synced, and a crash can lose entries still queued or unsynced",
+			})
+		default:
+			cfg.WAL.AckMode = "durable"
+		}
 	}
 	// The covered append (cluster.wal_coverage) commits under the ingest shard
 	// lock, where waiting for a sync would stall every writer to that
@@ -1500,8 +1559,11 @@ func Load() (*Config, error) {
 			Message: "wal.ack_mode = \"durable\" has no effect while wal.enabled = false: writes are acknowledged without a WAL",
 		})
 	}
-	if cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" && cfg.Cluster.WALCoverage {
-		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true")
+	if cfg.WAL.AckMode == "durable" && coverageInEffect {
+		return nil, fmt.Errorf("wal.ack_mode = \"durable\" is not supported with cluster.wal_coverage = true on a clustered writer")
+	}
+	if cfg.WAL.AckTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("wal.ack_timeout_seconds must be 0 (no bound) or positive, got %d", cfg.WAL.AckTimeoutSeconds)
 	}
 	if cfg.WAL.DiskMinFreeMB < 0 {
 		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
@@ -1525,8 +1587,18 @@ func Load() (*Config, error) {
 	if cfg.Ingest.ImportWriteConcurrency < 0 || cfg.Ingest.ImportWriteConcurrency > 1024 {
 		return nil, fmt.Errorf("invalid ingest.import_write_concurrency value: %d (must be 0-1024; 0 = auto)", cfg.Ingest.ImportWriteConcurrency)
 	}
+	// 0 keeps the writer's own cap (one row group per flush). Anything else
+	// below 1024 is a footer footgun — a cap of 1 writes one row group AND one
+	// page-index entry per row (probe: 300 rows → 780 KB) — so it is rejected
+	// like a negative value rather than silently clamped.
+	if cfg.Ingest.MaxRowGroupRows != 0 && cfg.Ingest.MaxRowGroupRows < 1024 {
+		return nil, fmt.Errorf("invalid ingest.max_row_group_rows value: %d (must be 0 or >= 1024; 0 = one row group per flush)", cfg.Ingest.MaxRowGroupRows)
+	}
 	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
 		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
+	}
+	if cfg.Ingest.MaxBufferedBytes, cfg.Ingest.MaxBufferedBytesAuto, err = parseMaxBufferedBytes(v.GetString("ingest.max_buffered_bytes")); err != nil {
+		return nil, err
 	}
 	// A negative max_concurrent would reach make(chan struct{}, m.MaxConcurrent)
 	// in the compaction manager's cycle loop and panic the process at the first
@@ -1610,6 +1682,9 @@ func Load() (*Config, error) {
 			return nil, err
 		}
 	case "gcs":
+		if err := refuseGCSInFIPSBuild("storage.backend"); err != nil {
+			return nil, err
+		}
 		// Same reasons as the S3 bucket guard: an empty bucket would build an
 		// empty gs:// allowlist entry and a secret scoped to nothing.
 		if cfg.Storage.GCSBucket == "" {
@@ -1681,6 +1756,11 @@ func Load() (*Config, error) {
 				return nil, err
 			}
 		case "gcs":
+			// Refused here, not left to the factory: a cold backend that fails
+			// to build leaves the node running without its cold tier.
+			if err := refuseGCSInFIPSBuild("tiered_storage.cold.backend"); err != nil {
+				return nil, err
+			}
 			if cold.GCSBucket == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"gcs\" but tiered_storage.cold.gcs_bucket is empty; set tiered_storage.cold.gcs_bucket")
 			}
@@ -1724,6 +1804,21 @@ func Load() (*Config, error) {
 	// do not touch these two keys.
 	if err := cfg.checkParquetReadRootsGlobSafe(); err != nil {
 		return nil, err
+	}
+
+	// The packaged layout's two silent consequences (#1463): the unit's
+	// ARC_BACKUP_LOCAL_PATH overriding an edited arc.toml, and backups an
+	// earlier release left where this boot no longer looks.
+	if w := backupLocalPathOverrideWarning(v, cfg); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+	if w := legacyBackupsWarning(v, cfg); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+
+	cfg.ConfigFile = v.ConfigFileUsed()
+	if w := shadowedConfigFilesWarning(cfg.ConfigFile); w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 
 	// Iceberg export runs on a local or an S3 primary backend (#939). The reconciler walks the
@@ -1976,8 +2071,16 @@ func Load() (*Config, error) {
 // DefaultMaxSQLLength is query.max_sql_length's default, the cap Arc always
 // had. MinMaxSQLLength and MaxSQLLengthCeiling bound what it accepts: below
 // the floor ordinary queries stop fitting, and above the ceiling one query's
-// validation and rewrite cost more than half a second of CPU before DuckDB
-// starts (about 0.5 s per MiB, linear).
+// validation and rewrite cost too much CPU before DuckDB starts.
+//
+// That cost is linear in the query's length since #1479, but depends on its
+// shape. Measured for a whole request at the ceiling (1 MiB): a JOIN chain
+// about 1.7 s, a run of `FROM x` about 2.3 s, and a comma join of 2-byte
+// references (`FROM x,x,x…`, the worst shape) about 4.1 s, of which
+// validation, the rewrite and DuckDB's parse each take about a third. No
+// rewrite pass scans another's output since #1482, and query.timeout stops
+// the rewrite. At the 10 KB default the worst shape costs about 0.2 s.
+// Raising the cap trades that CPU for longer queries.
 const (
 	DefaultMaxSQLLength = 10000
 	MinMaxSQLLength     = 1000
@@ -2098,6 +2201,23 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.numeric_dictionary", false) // only relevant with use_dictionary=true; see IngestConfig
 	v.SetDefault("ingest.write_statistics", true)
 	v.SetDefault("ingest.data_page_version", "2.0")
+	// Row groups are the unit of parallelism and of min/max pruning for every
+	// reader. One flush used to become one row group (arrow-go's default cap is
+	// 64 Mi rows), so an hourly file was ONE group: nothing to prune, one task
+	// per file. 524288 measured FREE on the sustained msgpack benchmark (36.9 M
+	// vs 36.1 M rec/s on main, within noise) where compaction's 122880 cost
+	// 1.7 % alone and 3.7 % with the page index; through arcx a time-ordered
+	// top-N still goes 70 → 5 ms and an hourly bucket 67 → 58 ms (plannings:
+	// Arc_research_ingest_writer_knobs, 2026-11-07).
+	v.SetDefault("ingest.max_row_group_rows", 524288)
+	// Page index: nothing in Arc reads it yet and its write cost grows with the
+	// row-group count (−3.7 % at 41 groups per 5 M-row flush on the sustained
+	// benchmark), so it is off until a consumer exists. When on, the offset
+	// index is always written; the column index needs write_statistics and is
+	// dropped for a chunk whose page stats are missing or over the stats size
+	// cap (arrow-go discards, never errors). Compaction (DuckDB COPY) does not
+	// preserve it.
+	v.SetDefault("ingest.write_page_index", false)
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
 	v.SetDefault("ingest.shard_count", 32)
@@ -2108,6 +2228,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.default_decimal_columns", "")
 	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
 	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
+	v.SetDefault("ingest.max_buffered_bytes", "0") // off; "auto" = half the memory limit (#1468)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -2205,7 +2326,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
-	v.SetDefault("wal.ack_mode", "queued")             // Acknowledge once queued; "durable" waits for the covering sync
+	v.SetDefault("wal.ack_mode", "auto")               // durable with the WAL on (#1499); queued with it off or with cluster.wal_coverage
+	v.SetDefault("wal.ack_timeout_seconds", 30)        // A durable write waits at most this long for its sync (#1501); 0 = no bound
 	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
 	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
 	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes
@@ -2437,7 +2559,7 @@ func setDefaults(v *viper.Viper) {
 
 	// Backup defaults
 	v.SetDefault("backup.enabled", true)
-	v.SetDefault("backup.local_path", "./data/backups")
+	v.SetDefault("backup.local_path", defaultBackupLocalPath)
 	// Backup targets (#1085 stage B2b-1). Only the two keys whose names are
 	// fixed can be defaulted here: a target's own fields are
 	// backup.targets.<name>.*, and no name exists until a config file has been
@@ -2450,6 +2572,21 @@ func setDefaults(v *viper.Viper) {
 	// The value both backup and restore were hardcoded to before #1085, so
 	// leaving it unset changes nothing.
 	v.SetDefault("backup.operation_timeout", "2h")
+}
+
+// fipsBuild is fips.BuildTagged; a variable so the refusal below can be
+// tested in the default build.
+var fipsBuild = fips.BuildTagged
+
+// refuseGCSInFIPSBuild refuses a "gcs" backend at key in the FIPS build, which
+// has no native GCS backend (#1587). Config load is where this has to happen:
+// the factory's own refusal would stop a primary at startup, but would leave a
+// node running without its cold tier, or without the backup API.
+func refuseGCSInFIPSBuild(key string) error {
+	if !fipsBuild {
+		return nil
+	}
+	return fmt.Errorf("%s is \"gcs\": %w", key, storage.ErrGCSNotInFIPSBuild)
 }
 
 // checkGCSEndpoint validates storage.gcs_endpoint at load, so a bad value is
@@ -2903,6 +3040,22 @@ func (cfg *ServerConfig) ValidateTLS() error {
 	}
 
 	return nil
+}
+
+// parseMaxBufferedBytes parses ingest.max_buffered_bytes: "auto", a size of
+// at least 1MB, or a size of 0 (off).
+func parseMaxBufferedBytes(s string) (n int64, auto bool, err error) {
+	if strings.EqualFold(strings.TrimSpace(s), "auto") {
+		return 0, true, nil
+	}
+	n, err = ParseSize(s)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid ingest.max_buffered_bytes: %w (use \"auto\", a size such as \"2GB\", or \"0\" for off)", err)
+	}
+	if n > 0 && n < minMaxBufferedBytes {
+		return 0, false, fmt.Errorf("invalid ingest.max_buffered_bytes value %q: must be at least 1MB, \"auto\", or 0 for off", s)
+	}
+	return n, false, nil
 }
 
 // ParseSize parses a human-readable size string (e.g., "1GB", "500MB", "100KB") to bytes.

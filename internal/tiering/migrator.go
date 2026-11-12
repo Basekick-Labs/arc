@@ -244,6 +244,9 @@ func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate
 			kept = append(kept, c)
 			continue
 		}
+		// The cold copy goes while the row is still cold: keep the
+		// missing-object check off it until the row is hot again (#1551).
+		m.manager.BeginColdRemoval()
 		if dst := m.manager.GetBackendForTier(c.TargetTier); dst != nil {
 			if err := dst.Delete(ctx, c.Path); err != nil && !storage.IsNotFound(err) {
 				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not remove the cold copy of a file a compaction took over")
@@ -252,6 +255,7 @@ func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate
 		if err := m.manager.metadata.UpdateTier(ctx, c.Path, c.CurrentTier); err != nil {
 			m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not record a file a compaction took over as hot again")
 		}
+		m.manager.EndColdRemoval()
 		m.logger.Info().Str("path", c.Path).Msg("A compaction took over a file during its migration; its cold copy was removed")
 	}
 	return kept
@@ -646,7 +650,18 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	}
 
 	// Perform the migration using streaming to avoid loading entire files into memory
-	migrationErr := m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, size)
+	copyFile := func() error {
+		return m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, size)
+	}
+	var migrationErr error
+	if candidate.TargetTier == TierCold {
+		// The cluster's cold mark is raised before the object exists, so a
+		// reader that cannot list cold never rules this file's day out
+		// (#1552). When the mark cannot be raised the copy does not start.
+		migrationErr = m.manager.GuardColdWrite(ctx, []string{candidate.Path}, copyFile)
+	} else {
+		migrationErr = copyFile()
+	}
 
 	if migrationErr != nil {
 		// Record failure

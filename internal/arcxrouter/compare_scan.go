@@ -81,12 +81,23 @@ func firstDiffColumn(a, o scanRow, cols []string) string {
 		}
 		if a[i] != o[i] {
 			if i < len(cols) {
-				return cols[i]
+				return logColumnName(cols[i])
 			}
 			return fmt.Sprintf("#%d", i)
 		}
 	}
 	return "(row length)"
+}
+
+// logColumnName is the column name as it may appear in a log line. A bare column
+// is an identifier and prints as is. A map subscript `col['key']` (map-1) carries
+// the KEY — user data, the one literal the SQL masker hides in the same log entry
+// — so the key is replaced, keeping the base column: `col['...']`.
+func logColumnName(name string) string {
+	if !isSubscriptRef(name) {
+		return name
+	}
+	return name[:strings.IndexByte(name, '[')] + "['...']"
 }
 
 // scanRowsFromArcx renders the arcx record to name-keyed, per-row string cells.

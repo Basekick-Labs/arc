@@ -87,10 +87,7 @@ type DeleteRetentionPolicyPayload struct {
 
 // EnableRetentionPoliciesPayload turns retention's flag on; Nodes as in
 // EnableClusterPoliciesPayload.
-type EnableRetentionPoliciesPayload struct {
-	Nodes []string  `json:"nodes"`
-	Now   time.Time `json:"now"`
-}
+type EnableRetentionPoliciesPayload = EnablePolicyKindPayload
 
 // ChoosePolicyAdoptionPayload is an admin choosing Node's policies of Kind
 // for the cluster. Hash is the hash of the rows the admin saw: the leader
@@ -136,38 +133,6 @@ func (f *ClusterFSM) RetentionPoliciesEnabled() bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.clusterPolicies && f.retentionEnabled
-}
-
-func (f *ClusterFSM) applyEnableRetentionPolicies(payload []byte) interface{} {
-	var p EnableRetentionPoliciesPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
-		return fmt.Errorf("failed to unmarshal enable retention policies payload: %w", err)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !f.clusterPolicies {
-		return errors.New("enable retention policies: cluster policies are not enabled")
-	}
-	if f.retentionEnabled {
-		return nil
-	}
-	listed := map[string]bool{}
-	for _, n := range p.Nodes {
-		listed[n] = true
-	}
-	var missing []string
-	for id := range f.nodes {
-		if !listed[id] {
-			missing = append(missing, id)
-		}
-	}
-	if len(missing) > 0 {
-		sort.Strings(missing)
-		return fmt.Errorf("enable retention policies: nodes %v are not known to support it", missing)
-	}
-	f.retentionEnabled = true
-	f.logger.Info().Int("nodes", len(f.nodes)).Msg("Cluster-wide retention policies enabled")
-	return nil
 }
 
 // RetentionPolicy returns a copy of retention policy id.
@@ -400,10 +365,10 @@ func (f *ClusterFSM) applyChoosePolicyAdoption(payload []byte) interface{} {
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal choose policy adoption payload: %w", err)
 	}
-	// Tiering always seeds on its own (its merge never refuses): only
-	// retention waits for a choice.
-	if (p.Kind != PolicyKindRetention && p.Kind != PolicyKindCQ) || p.Node == "" || p.Hash == "" {
-		return fmt.Errorf("choose policy adoption: the retention or cq kind, a node and a hash are required (kind %q)", p.Kind)
+	// Tiering always seeds on its own (its merge never refuses): only the
+	// kinds with a flag of their own wait for a choice.
+	if f.policyKindFlag(p.Kind) == nil || p.Node == "" || p.Hash == "" {
+		return fmt.Errorf("choose policy adoption: the retention, cq or governance kind, a node and a hash are required (kind %q)", p.Kind)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -424,8 +389,8 @@ func (f *ClusterFSM) applyChoosePolicyAdoption(payload []byte) interface{} {
 // unique names, and with kept IDs, unique IDs below the floor. The day rules
 // are not re-checked: the leader seeds only rows that pass them.
 func validRetentionSeed(p *SeedPoliciesPayload) error {
-	if len(p.Tiering) > 0 || len(p.CQ) > 0 {
-		return errors.New("tiering or continuous query rows in a retention seed")
+	if len(p.Tiering) > 0 || len(p.CQ) > 0 || len(p.Governance) > 0 {
+		return errors.New("tiering, continuous query or governance rows in a retention seed")
 	}
 	if len(p.Retention) > MaxSeedRetentionPolicies {
 		return fmt.Errorf("%d retention policies exceed %d", len(p.Retention), MaxSeedRetentionPolicies)

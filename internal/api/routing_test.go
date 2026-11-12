@@ -1,12 +1,14 @@
 package api
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -226,8 +228,14 @@ func TestCopyResponse(t *testing.T) {
 		mockResp := &http.Response{
 			StatusCode: http.StatusCreated,
 			Header: http.Header{
-				"Content-Type":      []string{"application/json"},
-				"X-Custom-Header":   []string{"custom-value"},
+				"Content-Type":    []string{"application/json"},
+				"X-Custom-Header": []string{"custom-value"},
+				"Set-Cookie":      []string{"a=1; Path=/", "b=2; Path=/"},
+				// An ordinary header with two values: c.Set kept only the
+				// last one (#1556). Set-Cookie above was never affected:
+				// fasthttp appends cookies even on Set.
+				"Vary":              []string{"Accept", "Accept-Encoding"},
+				"Trailer":           []string{"X-Stream-Status"},
 				"Connection":        []string{"keep-alive"}, // Should be filtered out (hop-by-hop)
 				"Transfer-Encoding": []string{"chunked"},    // Should be filtered out (hop-by-hop)
 			},
@@ -249,10 +257,14 @@ func TestCopyResponse(t *testing.T) {
 	// Verify regular headers are copied
 	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 	assert.Equal(t, "custom-value", resp.Header.Get("X-Custom-Header"))
+	assert.Equal(t, []string{"a=1; Path=/", "b=2; Path=/"}, resp.Header.Values("Set-Cookie"))
+	assert.Equal(t, []string{"Accept", "Accept-Encoding"}, resp.Header.Values("Vary"),
+		"every value of a repeated end-to-end header must reach the client")
 
 	// Verify hop-by-hop headers are NOT copied
 	assert.Empty(t, resp.Header.Get("Connection"))
 	assert.Empty(t, resp.Header.Get("Transfer-Encoding"))
+	assert.Empty(t, resp.Header.Get("Trailer"))
 }
 
 func TestShouldForwardWrite(t *testing.T) {
@@ -463,4 +475,43 @@ func TestHandleRoutingError(t *testing.T) {
 	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusBadGateway, resp.StatusCode)
+	// The cause stays in the log: a wrapped routing error names the peer's
+	// internal URL (#1567).
+	body, _ := io.ReadAll(resp.Body)
+	assert.NotContains(t, string(body), "connection refused")
+	assert.Contains(t, string(body), "Failed to route request to cluster node")
+}
+
+// The forwarding node's own middleware sets headers before CopyResponse runs,
+// and the upstream node ran the same middleware, so the upstream response
+// carries them too. Each must reach the client once: two
+// Access-Control-Allow-Origin values make a browser reject the response.
+func TestCopyResponseDoesNotDuplicateHeadersTheForwarderSet(t *testing.T) {
+	app := fiber.New()
+	app.Use(cors.New(cors.Config{AllowOrigins: "*"}))
+	app.Use(securityHeaders(true))
+	app.Get("/test", func(c *fiber.Ctx) error {
+		return CopyResponse(c, &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Access-Control-Allow-Origin": []string{"*"},
+				"X-Frame-Options":             []string{"DENY"},
+				"Vary":                        []string{"Accept", "Accept-Encoding"},
+			},
+			Body: http.NoBody,
+		})
+	})
+	// Repeated: Go's map order decides which header CopyResponse handles
+	// first, and a delete between adds reorders values only for some
+	// orders. Fifty requests make an order-dependent regression show.
+	for i := 0; i < 50; i++ {
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Origin", "https://app.example")
+		resp, err := app.Test(req, testRequestTimeoutMS)
+		require.NoError(t, err)
+		require.Equal(t, []string{"*"}, resp.Header.Values("Access-Control-Allow-Origin"))
+		require.Equal(t, []string{"DENY"}, resp.Header.Values("X-Frame-Options"))
+		require.Equal(t, []string{"Accept", "Accept-Encoding"}, resp.Header.Values("Vary"),
+			"repeated values keep their order")
+	}
 }

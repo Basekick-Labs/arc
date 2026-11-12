@@ -3,6 +3,7 @@ package governance
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,6 +12,14 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
+
+// ErrPolicyExists is returned by CreatePolicy for a token that already has a
+// policy: a token has at most one, changed with UpdatePolicy.
+var ErrPolicyExists = errors.New("governance policy already exists for this token")
+
+// ErrPolicyNotFound is returned by UpdatePolicy and DeletePolicy for a token
+// with no stored policy.
+var ErrPolicyNotFound = errors.New("no governance policy for this token")
 
 // Policy represents a governance policy for a specific token.
 type Policy struct {
@@ -45,6 +54,9 @@ type EnforcementResult struct {
 	RetryAfterSec int           `json:"retry_after_sec,omitempty"`
 	MaxRows       int           `json:"max_rows,omitempty"`
 	MaxDuration   time.Duration `json:"-"`
+	// Kind is KindRateLimit or KindQuota on a refusal: the limit with the
+	// longest wait.
+	Kind string `json:"-"`
 }
 
 // ManagerConfig holds configuration for creating a Manager.
@@ -60,6 +72,18 @@ type Manager struct {
 	config *config.GovernanceConfig
 	logger zerolog.Logger
 
+	// policyWriteMu serializes CreatePolicy, UpdatePolicy and DeletePolicy,
+	// each held across its SQLite write and its cache update. Without it a
+	// write and its publish could interleave with another write and leave the
+	// cache enforcing a policy that is not stored, or not enforcing one that
+	// is, until a restart reloads it. Only admin policy writes take it:
+	// Admit, GetPolicy and ListPolicies never do, so it costs queries nothing.
+	// Lock order: policyWriteMu, then admitMu.
+	policyWriteMu sync.Mutex
+	// afterPolicyWrite is a test seam: when set, each policy write calls it
+	// between its SQLite write and its cache update.
+	afterPolicyWrite func(op string)
+
 	// In-memory rate limiters keyed by token ID
 	minuteLimiters   map[int64]*slidingWindowCounter
 	minuteLimitersMu sync.RWMutex
@@ -73,6 +97,16 @@ type Manager struct {
 	// Policy cache keyed by token ID
 	policies   map[int64]*Policy
 	policiesMu sync.RWMutex
+
+	// admitMu serialises Admit's check-then-record, and policy updates of the
+	// limiters (#1524). Taken before any other lock here; nothing that holds
+	// another of these locks takes it.
+	admitMu sync.Mutex
+	// now is the clock new limiters and trackers read; time.Now outside tests.
+	now func() time.Time
+	// afterAdmitCheckForTest runs in Admit between checking every limit and
+	// recording the query.
+	afterAdmitCheckForTest func()
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -94,6 +128,7 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		quotaTrackers:  make(map[int64]*quotaTracker),
 		policies:       make(map[int64]*Policy),
 		stopCh:         make(chan struct{}),
+		now:            time.Now,
 	}
 
 	if err := m.initSchema(); err != nil {
@@ -191,14 +226,30 @@ func (m *Manager) cleanupLoop() {
 
 // CreatePolicy creates a governance policy for a token.
 func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) {
+	m.policyWriteMu.Lock()
+	defer m.policyWriteMu.Unlock()
+	// token_id is UNIQUE. A second policy for the token inserts nothing
+	// rather than failing, so it is told apart from a store failure without
+	// matching driver error text.
 	result, err := m.db.ExecContext(ctx, `
 		INSERT INTO governance_policies (token_id, rate_limit_per_minute, rate_limit_per_hour,
 			max_queries_per_hour, max_queries_per_day, max_rows_per_query, max_scan_duration_sec)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(token_id) DO NOTHING`,
 		p.TokenID, p.RateLimitPerMinute, p.RateLimitPerHour,
 		p.MaxQueriesPerHour, p.MaxQueriesPerDay, p.MaxRowsPerQuery, p.MaxScanDurationSec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create governance policy: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create governance policy: %w", err)
+	}
+	if inserted == 0 {
+		return nil, fmt.Errorf("%w: token %d", ErrPolicyExists, p.TokenID)
+	}
+	if m.afterPolicyWrite != nil {
+		m.afterPolicyWrite("create")
 	}
 
 	id, err := result.LastInsertId()
@@ -210,11 +261,7 @@ func (m *Manager) CreatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 	p.UpdatedAt = p.CreatedAt
 
 	// Update cache and in-memory trackers
-	m.policiesMu.Lock()
-	m.policies[p.TokenID] = p
-	m.policiesMu.Unlock()
-
-	m.updateTrackersForToken(p.TokenID, p)
+	m.publishPolicy(p)
 	metrics.Get().SetGovernancePoliciesActive(int64(m.policyCount()))
 
 	m.logger.Info().Int64("token_id", p.TokenID).Msg("Governance policy created")
@@ -234,7 +281,9 @@ func (m *Manager) GetPolicy(ctx context.Context, tokenID int64) (*Policy, error)
 
 // UpdatePolicy updates an existing governance policy.
 func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) {
-	_, err := m.db.ExecContext(ctx, `
+	m.policyWriteMu.Lock()
+	defer m.policyWriteMu.Unlock()
+	result, err := m.db.ExecContext(ctx, `
 		UPDATE governance_policies SET
 			rate_limit_per_minute = ?, rate_limit_per_hour = ?,
 			max_queries_per_hour = ?, max_queries_per_day = ?,
@@ -248,14 +297,23 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to update governance policy: %w", err)
 	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to update governance policy: %w", err)
+	}
+	// No row: there is no policy to update (a DELETE can land between the
+	// caller's check and this write). Publishing p would enforce a policy
+	// that is not stored, until a restart reloads the cache.
+	if updated == 0 {
+		return nil, fmt.Errorf("%w: token %d", ErrPolicyNotFound, p.TokenID)
+	}
+	if m.afterPolicyWrite != nil {
+		m.afterPolicyWrite("update")
+	}
 
 	p.UpdatedAt = time.Now()
 
-	m.policiesMu.Lock()
-	m.policies[p.TokenID] = p
-	m.policiesMu.Unlock()
-
-	m.updateTrackersForToken(p.TokenID, p)
+	m.publishPolicy(p)
 
 	m.logger.Info().Int64("token_id", p.TokenID).Msg("Governance policy updated")
 	return p, nil
@@ -263,14 +321,38 @@ func (m *Manager) UpdatePolicy(ctx context.Context, p *Policy) (*Policy, error) 
 
 // DeletePolicy removes the governance policy for a token.
 func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
-	_, err := m.db.ExecContext(ctx, `DELETE FROM governance_policies WHERE token_id = ?`, tokenID)
+	m.policyWriteMu.Lock()
+	defer m.policyWriteMu.Unlock()
+	result, err := m.db.ExecContext(ctx, `DELETE FROM governance_policies WHERE token_id = ?`, tokenID)
+	if err != nil {
+		return fmt.Errorf("failed to delete governance policy: %w", err)
+	}
+	deleted, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("failed to delete governance policy: %w", err)
 	}
 
+	if m.afterPolicyWrite != nil {
+		m.afterPolicyWrite("delete")
+	}
+
+	// The in-memory state is cleared even when no row was deleted: whatever
+	// it holds for the token is not stored (policyWriteMu keeps a concurrent
+	// create from storing one meanwhile), so it must not stay enforced.
+	//
+	// The cache entry and the limiters go together under admitMu: an Admit
+	// that read the policy before this must not recreate a limiter on its
+	// limits after it (#1524).
+	m.admitMu.Lock()
+	defer m.admitMu.Unlock()
 	m.policiesMu.Lock()
+	_, wasCached := m.policies[tokenID]
 	delete(m.policies, tokenID)
 	m.policiesMu.Unlock()
+	if deleted == 0 && wasCached {
+		m.logger.Warn().Int64("token_id", tokenID).
+			Msg("Governance policy was enforced from the cache with no stored row; cleared")
+	}
 
 	// Remove in-memory trackers
 	m.minuteLimitersMu.Lock()
@@ -287,6 +369,9 @@ func (m *Manager) DeletePolicy(ctx context.Context, tokenID int64) error {
 
 	metrics.Get().SetGovernancePoliciesActive(int64(m.policyCount()))
 
+	if deleted == 0 {
+		return fmt.Errorf("%w: token %d", ErrPolicyNotFound, tokenID)
+	}
 	m.logger.Info().Int64("token_id", tokenID).Msg("Governance policy deleted")
 	return nil
 }
@@ -338,60 +423,82 @@ func (m *Manager) GetCachedPolicy(tokenID int64) *Policy {
 	return m.getEffectivePolicy(tokenID)
 }
 
-// CheckRateLimit checks if the token's query rate is within limits.
-func (m *Manager) CheckRateLimit(tokenID int64) *EnforcementResult {
+// Kinds of limit an EnforcementResult can be refused by.
+const (
+	KindRateLimit = "rate_limit"
+	KindQuota     = "quota"
+)
+
+// Admit decides whether the token may run a query now, against every limit
+// its policy sets: the per-minute and per-hour rate limits and the hourly and
+// daily quotas. A query is counted against all of them only when every one
+// admits it (#1524): a refused query spends nothing, so a client that waits
+// out the refusal's RetryAfterSec finds every limit as it was told.
+//
+// A refusal names the limit with the longest wait, which is the one that
+// decides when a retry can succeed, and RetryAfterSec is that wait (at least
+// 1). On a tie the limit checked first (minute, hour, quota) is named. Check and record run under admitMu, so two concurrent queries cannot
+// both pass a limit with one slot left.
+func (m *Manager) Admit(tokenID int64) *EnforcementResult {
+	m.admitMu.Lock()
+	defer m.admitMu.Unlock()
+
 	policy := m.getEffectivePolicy(tokenID)
 	if policy == nil {
 		return &EnforcementResult{Allowed: true}
 	}
 
-	// Check per-minute rate limit
+	type gate struct {
+		admits func() (bool, string)
+		record func()
+		wait   func() int
+		kind   string
+	}
+	var gates []gate
 	if policy.RateLimitPerMinute > 0 {
-		limiter := m.getOrCreateMinuteLimiter(tokenID, policy.RateLimitPerMinute)
-		if !limiter.Allow() {
-			retryAfter := limiter.RetryAfterSec()
-			return &EnforcementResult{
-				Allowed:       false,
-				Reason:        fmt.Sprintf("Rate limit exceeded: %d queries per minute", policy.RateLimitPerMinute),
-				RetryAfterSec: retryAfter,
+		l := m.getOrCreateMinuteLimiter(tokenID, policy.RateLimitPerMinute)
+		limit := policy.RateLimitPerMinute
+		gates = append(gates, gate{func() (bool, string) {
+			if l.admits() {
+				return true, ""
 			}
-		}
+			return false, fmt.Sprintf("Rate limit exceeded: %d queries per minute", limit)
+		}, l.record, l.RetryAfterSec, KindRateLimit})
 	}
-
-	// Check per-hour rate limit
 	if policy.RateLimitPerHour > 0 {
-		limiter := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
-		if !limiter.Allow() {
-			retryAfter := limiter.RetryAfterSec()
-			return &EnforcementResult{
-				Allowed:       false,
-				Reason:        fmt.Sprintf("Rate limit exceeded: %d queries per hour", policy.RateLimitPerHour),
-				RetryAfterSec: retryAfter,
+		l := m.getOrCreateHourLimiter(tokenID, policy.RateLimitPerHour)
+		limit := policy.RateLimitPerHour
+		gates = append(gates, gate{func() (bool, string) {
+			if l.admits() {
+				return true, ""
 			}
-		}
+			return false, fmt.Sprintf("Rate limit exceeded: %d queries per hour", limit)
+		}, l.record, l.RetryAfterSec, KindRateLimit})
 	}
-
-	return &EnforcementResult{Allowed: true}
-}
-
-// CheckQuota checks if the token's query quota is within limits.
-// Returns an EnforcementResult with MaxRows and MaxDuration if applicable.
-func (m *Manager) CheckQuota(tokenID int64) *EnforcementResult {
-	policy := m.getEffectivePolicy(tokenID)
-	if policy == nil {
-		return &EnforcementResult{Allowed: true}
-	}
-
-	// Check hourly/daily quotas
 	if policy.MaxQueriesPerHour > 0 || policy.MaxQueriesPerDay > 0 {
-		tracker := m.getOrCreateQuotaTracker(tokenID, policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
-		allowed, reason := tracker.AllowQuery()
-		if !allowed {
-			return &EnforcementResult{
-				Allowed: false,
-				Reason:  reason,
+		t := m.getOrCreateQuotaTracker(tokenID, policy.MaxQueriesPerHour, policy.MaxQueriesPerDay)
+		gates = append(gates, gate{t.admits, t.record, t.RetryAfterSec, KindQuota})
+	}
+
+	var refused *EnforcementResult
+	longest := -1
+	for _, g := range gates {
+		if ok, reason := g.admits(); !ok {
+			if w := g.wait(); w > longest {
+				longest = w
+				refused = &EnforcementResult{Allowed: false, Reason: reason, Kind: g.kind}
 			}
 		}
+	}
+	if refused != nil {
+		refused.RetryAfterSec = max(longest, 1)
+		return refused
+	}
+	if m.afterAdmitCheckForTest != nil {
+		m.afterAdmitCheckForTest()
+	}
+	for _, g := range gates {
+		g.record()
 	}
 
 	result := &EnforcementResult{Allowed: true}
@@ -405,7 +512,7 @@ func (m *Manager) CheckQuota(tokenID int64) *EnforcementResult {
 }
 
 // RecordQueryCompletion records that a query completed for a token.
-// Currently a no-op since quota tracking increments on AllowQuery.
+// Currently a no-op since Admit counts a query when it admits it.
 func (m *Manager) RecordQueryCompletion(tokenID int64, rowCount int) {
 	// Future: track row counts for analytics
 }
@@ -470,7 +577,7 @@ func (m *Manager) getOrCreateMinuteLimiter(tokenID int64, limit int) *slidingWin
 	if limiter, ok = m.minuteLimiters[tokenID]; ok {
 		return limiter
 	}
-	limiter = newSlidingWindowCounter(time.Minute, 60, limit)
+	limiter = newSlidingWindowCounterWithClock(time.Minute, 60, limit, m.now)
 	m.minuteLimiters[tokenID] = limiter
 	return limiter
 }
@@ -488,7 +595,7 @@ func (m *Manager) getOrCreateHourLimiter(tokenID int64, limit int) *slidingWindo
 	if limiter, ok = m.hourLimiters[tokenID]; ok {
 		return limiter
 	}
-	limiter = newSlidingWindowCounter(time.Hour, 60, limit)
+	limiter = newSlidingWindowCounterWithClock(time.Hour, 60, limit, m.now)
 	m.hourLimiters[tokenID] = limiter
 	return limiter
 }
@@ -506,11 +613,26 @@ func (m *Manager) getOrCreateQuotaTracker(tokenID int64, maxPerHour, maxPerDay i
 	if tracker, ok = m.quotaTrackers[tokenID]; ok {
 		return tracker
 	}
-	tracker = newQuotaTracker(maxPerHour, maxPerDay)
+	tracker = newQuotaTrackerWithClock(maxPerHour, maxPerDay, m.now)
 	m.quotaTrackers[tokenID] = tracker
 	return tracker
 }
 
+// publishPolicy puts p in the cache and applies its limits to the token's
+// limiters in one step under admitMu, so an Admit sees the policy and the
+// limits it enforces together, and two writes for one token cannot leave the
+// cache on one and the limiters on the other (#1524).
+func (m *Manager) publishPolicy(p *Policy) {
+	m.admitMu.Lock()
+	defer m.admitMu.Unlock()
+	m.policiesMu.Lock()
+	m.policies[p.TokenID] = p
+	m.policiesMu.Unlock()
+	m.updateTrackersForToken(p.TokenID, p)
+}
+
+// updateTrackersForToken applies p's limits to the token's limiters. Called
+// with admitMu held.
 func (m *Manager) updateTrackersForToken(tokenID int64, p *Policy) {
 	// Update minute limiter
 	m.minuteLimitersMu.Lock()

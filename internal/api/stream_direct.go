@@ -50,6 +50,35 @@ type directBodyStream struct {
 	trailers *responseTrailers   // nil when the response has no trailers
 	header   *fasthttp.ResponseHeader
 	ran      atomic.Bool
+	abort    *streamAbort // nil when the writer cannot abort the response
+}
+
+// streamAbort lets a writer end its response as a failed transfer: WriteTo
+// returns the error, so fasthttp writes no terminating chunk and closes the
+// connection, and the client reads a broken response, not a short complete
+// one. For a body relayed from elsewhere (a forwarded Arrow query, #1567),
+// where a cut can fall mid-message and no in-band marker is reliable.
+type streamAbort struct {
+	mu  sync.Mutex
+	err error
+}
+
+// set records the first abort error.
+func (a *streamAbort) set(err error) {
+	a.mu.Lock()
+	if a.err == nil {
+		a.err = err
+	}
+	a.mu.Unlock()
+}
+
+func (a *streamAbort) get() error {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.err
 }
 
 // directStreamBufSize is the stream's buffer: writers flush it per batch (the
@@ -95,6 +124,9 @@ func (d *directBodyStream) WriteTo(w io.Writer) (int64, error) {
 	defer d.publishTrailers()
 	d.sw(bw)
 	_ = bw.Flush()
+	if err := d.abort.get(); err != nil && cw.err == nil {
+		return cw.n, err
+	}
 	return cw.n, cw.err
 }
 
@@ -148,9 +180,15 @@ func (refusingWriter) Write([]byte) (int, error) { return 0, errResponseBodyNotS
 // body (see directBodyStream). cancel cancels the query when the body is
 // never written; trailers, when not nil, are published after the body.
 //
-// This is the only place in the package that installs a body stream, and the
-// call below is on one line with safeStream so the CI panic-safety guard can
+// This file is the only place in the package that installs a body stream, and
+// each call is on one line with safeStream so the CI panic-safety guard can
 // see both.
 func (h *QueryHandler) setDirectBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, stream string, onPanic func(), sw func(*bufio.Writer)) {
 	fctx.Response.SetBodyStream(&directBodyStream{sw: h.safeStream(stream, onPanic, sw), cancel: cancel, trailers: trailers, header: &fctx.Response.Header}, -1)
+}
+
+// setAbortableBodyStream is setDirectBodyStream for a writer that may end
+// the response as a failed transfer through abort (see streamAbort).
+func (h *QueryHandler) setAbortableBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, abort *streamAbort, stream string, onPanic func(), sw func(*bufio.Writer)) {
+	fctx.Response.SetBodyStream(&directBodyStream{sw: h.safeStream(stream, onPanic, sw), cancel: cancel, trailers: trailers, abort: abort, header: &fctx.Response.Header}, -1)
 }

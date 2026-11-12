@@ -2,8 +2,10 @@ package mqtt
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,7 +48,7 @@ type SubscriptionManager struct {
 	mu          sync.RWMutex
 	subscribers map[string]*Subscriber
 	// suspended holds the reasons this node refuses writes (suspendFenced,
-	// suspendWALDisk); while any is set, subscribers stay disconnected so
+	// suspendWALDisk, suspendBufferFull); while any is set, subscribers stay disconnected so
 	// messages wait at the broker instead of being acknowledged and lost. A
 	// set, not a bool: a cluster unfence must not resume subscriptions while
 	// the WAL volume is still under disk pressure (#676). Guarded by mu.
@@ -55,15 +57,24 @@ type SubscriptionManager struct {
 	// cannot apply their results out of order.
 	applyMu sync.Mutex
 
-	// WAL disk pressure, with a minimum time in each state (#676): a gate
-	// that flaps would otherwise disconnect and reconnect every subscription
-	// with it. Guarded by diskMu.
-	diskMu       sync.Mutex
-	diskOn       bool        // the state applied to suspended
-	diskWant     bool        // the latest state reported
-	diskChanged  time.Time   // when diskOn last changed
-	diskTimer    *time.Timer // a pending apply; nil when none
-	diskMinState time.Duration
+	// WAL disk pressure (#676) and the buffered-bytes limit (#1468), each
+	// with a minimum time in each state: a condition that flaps would
+	// otherwise disconnect and reconnect every subscription with it.
+	disk       heldReason
+	bufferFull heldReason
+	notDurable heldReason
+}
+
+// heldReason is a suspend reason applied at once when it sets and, when it
+// clears, only after it has held for its minimum time. Its fields are
+// guarded by its own mu.
+type heldReason struct {
+	mu       sync.Mutex
+	on       bool        // the state applied to suspended
+	want     bool        // the latest state reported
+	changed  time.Time   // when on last changed
+	timer    *time.Timer // a pending apply; nil when none
+	minState time.Duration
 }
 
 // registerStarted publishes a started subscriber and suspends it if any
@@ -92,24 +103,41 @@ func (m *SubscriptionManager) registerStarted(id string, subscriber *Subscriber)
 type suspendReasons uint8
 
 const (
-	suspendFenced  suspendReasons = 1 << iota // writes fenced (#1207)
-	suspendWALDisk                            // WAL volume disk pressure (#676)
+	suspendFenced        suspendReasons = 1 << iota // writes fenced (#1207)
+	suspendWALDisk                                  // WAL volume disk pressure (#676)
+	suspendBufferFull                               // ingest.max_buffered_bytes reached (#1468)
+	suspendWALNotDurable                            // the WAL refuses durable acknowledgements (#1502)
+	suspendLicense                                  // the license's grace period stops ingestion (days 7-14)
 )
 
 // mqttDiskMinState is the least time subscriptions stay suspended for WAL disk
-// pressure before they resume (#676). Suspending is never delayed: every
-// message accepted while writes are refused would be lost.
+// pressure (#676) or the buffered-bytes limit (#1468) before they resume.
+// Suspending is never delayed: every message accepted while writes are
+// refused would be lost.
 const mqttDiskMinState = 5 * time.Second
 
+// describe names every reason in r, joined with "and".
 func (r suspendReasons) describe() string {
-	switch {
-	case r&suspendFenced != 0 && r&suspendWALDisk != 0:
-		return "writes are fenced on this node and its WAL volume is under disk pressure"
-	case r&suspendWALDisk != 0:
-		return "the WAL volume is under disk pressure"
-	default:
-		return "writes are fenced on this node"
+	var parts []string
+	if r&suspendFenced != 0 {
+		parts = append(parts, "writes are fenced on this node")
 	}
+	if r&suspendWALDisk != 0 {
+		parts = append(parts, "the WAL volume is under disk pressure")
+	}
+	if r&suspendBufferFull != 0 {
+		parts = append(parts, "rows waiting to be flushed reached ingest.max_buffered_bytes")
+	}
+	if r&suspendWALNotDurable != 0 {
+		parts = append(parts, "the WAL is not acknowledging writes as durable")
+	}
+	if r&suspendLicense != 0 {
+		parts = append(parts, "the expired license's grace period stops ingestion")
+	}
+	if len(parts) == 0 {
+		return "writes are refused on this node"
+	}
+	return strings.Join(parts, " and ")
 }
 
 // SetIngestFenced suspends every subscription while this node's writes are
@@ -119,6 +147,15 @@ func (r suspendReasons) describe() string {
 // messages until the subscription resumes.
 func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
 	m.setSuspendReason(suspendFenced, fenced)
+}
+
+// SetLicenseWritesStopped suspends every subscription while the expired
+// license's grace period refuses ingestion (days 7-14), and resumes them when
+// it ends: on renewal, or at the cutoff, when the node runs without
+// Enterprise features. The broker holds messages meanwhile (QoS 1 or 2,
+// clean_session=false), within its own session and queue limits.
+func (m *SubscriptionManager) SetLicenseWritesStopped(stopped bool) {
+	m.setSuspendReason(suspendLicense, stopped)
 }
 
 // SetWALDiskPressure suspends every subscription while the WAL volume is
@@ -131,42 +168,67 @@ func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
 // while it is suspended: the broker keeps no session for it. Only
 // clean_session=false (with QoS 1 or 2) queues them at the broker.
 func (m *SubscriptionManager) SetWALDiskPressure(on bool) {
-	m.diskMu.Lock()
-	defer m.diskMu.Unlock()
-	m.diskWant = on
-	if on == m.diskOn || m.diskTimer != nil {
-		// Nothing to change, or a pending apply reads diskWant when it runs.
+	m.setHeld(&m.disk, suspendWALDisk, on)
+}
+
+// SetBufferFull suspends every subscription while the rows waiting to be
+// flushed are at ingest.max_buffered_bytes and resumes them once that clears
+// and no other reason holds them (#1468): a refused message would otherwise be
+// acknowledged and lost. Timed as SetWALDiskPressure is. It can be called on
+// a write's goroutine (an MQTT handler's among them): the change is applied on
+// another.
+func (m *SubscriptionManager) SetBufferFull(on bool) {
+	m.setHeld(&m.bufferFull, suspendBufferFull, on)
+}
+
+// SetWALNotDurable suspends every subscription while the WAL refuses writes
+// as not durable (a stalled or failing device: a timed-out or failed sync,
+// #1501, #1502) and resumes them once a sync succeeds and no other reason
+// holds them. Timed as SetWALDiskPressure is. The message in flight when the
+// refusal starts is still briefly retried and then dropped, as for the other
+// reasons; the ones that follow wait at the broker (QoS 1 or 2,
+// clean_session=false).
+func (m *SubscriptionManager) SetWALNotDurable(on bool) {
+	m.setHeld(&m.notDurable, suspendWALNotDurable, on)
+}
+
+func (m *SubscriptionManager) setHeld(h *heldReason, reason suspendReasons, on bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.want = on
+	if on == h.on || h.timer != nil {
+		// Nothing to change, or a pending apply reads want when it runs.
 		return
 	}
 	var wait time.Duration
 	if !on {
-		minState := m.diskMinState
+		minState := h.minState
 		if minState == 0 {
 			minState = mqttDiskMinState
 		}
-		wait = max(0, minState-time.Since(m.diskChanged))
+		wait = max(0, minState-time.Since(h.changed))
 	}
-	// Applied off the caller's goroutine: the caller is the WAL disk monitor,
-	// and suspending disconnects every subscription in turn.
-	m.diskTimer = time.AfterFunc(wait, m.applyPendingDisk)
+	// Applied off the caller's goroutine: the caller is the WAL disk monitor
+	// or a write, and suspending disconnects every subscription in turn.
+	h.timer = time.AfterFunc(wait, func() { m.applyPendingHeld(h, reason) })
 }
 
-// applyPendingDisk applies the latest reported disk pressure state, unless it
-// was undone before the minimum time ran out.
-func (m *SubscriptionManager) applyPendingDisk() {
+// applyPendingHeld applies the latest reported state of h, unless it was
+// undone before the minimum time ran out.
+func (m *SubscriptionManager) applyPendingHeld(h *heldReason, reason suspendReasons) {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
-	m.diskMu.Lock()
-	m.diskTimer = nil
-	if m.diskWant == m.diskOn {
-		m.diskMu.Unlock()
+	h.mu.Lock()
+	h.timer = nil
+	if h.want == h.on {
+		h.mu.Unlock()
 		return
 	}
-	on := m.diskWant
-	m.diskOn = on
-	m.diskChanged = time.Now()
-	m.diskMu.Unlock()
-	m.setSuspendReasonLocked(suspendWALDisk, on)
+	on := h.want
+	h.on = on
+	h.changed = time.Now()
+	h.mu.Unlock()
+	m.setSuspendReasonLocked(reason, on)
 }
 
 // setSuspendReason sets or clears one reason and suspends or resumes every
@@ -178,7 +240,7 @@ func (m *SubscriptionManager) setSuspendReason(reason suspendReasons, set bool) 
 }
 
 // setSuspendReasonLocked is setSuspendReason with applyMu held. Lock order:
-// applyMu, then diskMu or mu.
+// applyMu, then a heldReason's mu or mu.
 func (m *SubscriptionManager) setSuspendReasonLocked(reason suspendReasons, set bool) {
 	m.mu.Lock()
 	if set {
@@ -350,11 +412,44 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 	m.logger.Info().
 		Str("id", sub.ID).
 		Str("name", sub.Name).
-		Str("broker", sub.Broker).
+		Str("broker", redactBrokerURL(sub.Broker)).
 		Strs("topics", sub.Topics).
 		Msg("Created MQTT subscription")
 
+	if !sub.AutoStart {
+		return sub, nil
+	}
+
+	// auto_start means "start on creation and on server restart", but only
+	// Start ever read it, so a new subscription stayed stopped until a
+	// restart (#1585). A start failure does not fail the create: the
+	// subscription is stored either way, and StartSubscription has recorded
+	// status error with the reason, which the caller sees below and can act
+	// on with POST /start.
+	if err := m.StartSubscription(ctx, sub.ID); err != nil {
+		m.logger.Warn().
+			Err(err).
+			Str("id", sub.ID).
+			Str("name", sub.Name).
+			Msg("Created MQTT subscription with auto_start, but it failed to start")
+		sub.Status = StatusError
+		sub.ErrorMessage = err.Error()
+	} else {
+		sub.Status = StatusRunning
+	}
+	// Report the stored row: a Delete racing the start leaves none, and the
+	// fields Create did not set (timestamps) come back as stored. Only a
+	// read: if it fails, the status set above stands. A start that suspends
+	// at once (writes fenced, WAL disk pressure) still reads running.
+	if got, err := m.repo.Get(ctx, sub.ID); err == nil && got != nil {
+		return got, nil
+	}
 	return sub, nil
+}
+
+// errSubscriptionNotFound reports that no subscription is stored under id.
+func errSubscriptionNotFound(id string) error {
+	return fmt.Errorf("%w: %s", ErrSubscriptionNotFound, id)
 }
 
 // Get retrieves a subscription by ID
@@ -364,7 +459,7 @@ func (m *SubscriptionManager) Get(ctx context.Context, id string) (*Subscription
 		return nil, err
 	}
 	if sub == nil {
-		return nil, fmt.Errorf("subscription not found: %s", id)
+		return nil, errSubscriptionNotFound(id)
 	}
 	return sub, nil
 }
@@ -382,7 +477,7 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 		return nil, err
 	}
 	if sub == nil {
-		return nil, fmt.Errorf("subscription not found: %s", id)
+		return nil, errSubscriptionNotFound(id)
 	}
 
 	// Check if running - must stop first
@@ -470,6 +565,10 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 	}
 
 	if err := m.repo.Update(ctx, sub); err != nil {
+		// Deleted between the read above and this write.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errSubscriptionNotFound(id)
+		}
 		return nil, err
 	}
 
@@ -479,37 +578,80 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 }
 
 // Delete deletes a subscription
+//
+// The row goes first, then whatever runs under the ID is stopped. A start
+// racing the delete therefore always meets a missing row: its registration
+// fails after the row is gone and its status write finds none, or it
+// registers and runReserved's re-read finds none (#1597). Stopping first let
+// a start lose its reservation while the row still existed, which it could
+// not tell from any other failure. A delete that fails stops nothing: the
+// subscription stays stored and running.
 func (m *SubscriptionManager) Delete(ctx context.Context, id string) error {
-	// Stop if running
+	delErr := m.repo.Delete(ctx, id)
+	if delErr != nil && !errors.Is(delErr, sql.ErrNoRows) {
+		return delErr
+	}
+
+	// Also on sql.ErrNoRows: a subscriber running with no stored row is
+	// stopped rather than left behind.
 	m.mu.Lock()
-	if subscriber, ok := m.subscribers[id]; ok {
-		if subscriber != nil {
-			subscriber.Stop()
-		}
-		delete(m.subscribers, id)
-	}
+	subscriber := m.subscribers[id]
+	delete(m.subscribers, id)
 	m.mu.Unlock()
-
-	if err := m.repo.Delete(ctx, id); err != nil {
-		return err
+	if subscriber != nil {
+		// Outside the lock: Stop waits on the broker and writes the status.
+		_ = subscriber.Stop()
 	}
 
+	if delErr != nil {
+		return errSubscriptionNotFound(id)
+	}
 	m.logger.Info().Str("id", id).Msg("Deleted MQTT subscription")
 	return nil
 }
 
+// releaseReservation removes the nil placeholder a start reserved for id, if
+// it is still there. A running subscriber, or a slot a Delete already took,
+// is left alone.
+func (m *SubscriptionManager) releaseReservation(id string) {
+	m.mu.Lock()
+	if cur, ok := m.subscribers[id]; ok && cur == nil {
+		delete(m.subscribers, id)
+	}
+	m.mu.Unlock()
+}
+
+// startFailed records a failed start as status error and returns the error
+// to report. When that write finds no row, a Delete removed the
+// subscription while it was starting, and the start answers not found rather
+// than with the failure the delete caused (#1597).
+func (m *SubscriptionManager) startFailed(ctx context.Context, id string, err error) error {
+	if statusErr := m.repo.UpdateStatus(ctx, id, StatusError, err.Error()); errors.Is(statusErr, sql.ErrNoRows) {
+		return errSubscriptionNotFound(id)
+	}
+	return err
+}
+
+// stoppedResult is the result of a stop or pause whose subscriber has been
+// stopped. A status write that finds no row means a Delete removed the
+// subscription meanwhile, which is answered as not found (#1597). Not found
+// wins over an unsubscribe error joined with it: the subscription is gone
+// either way, and the error is still in the handler's Debug log.
+func stoppedResult(id string, stopErr, statusErr error) error {
+	if errors.Is(statusErr, sql.ErrNoRows) {
+		return errors.Join(stopErr, errSubscriptionNotFound(id))
+	}
+	return errors.Join(stopErr, statusErr)
+}
+
 // StartSubscription starts a subscription
 func (m *SubscriptionManager) StartSubscription(ctx context.Context, id string) error {
-	sub, err := m.repo.Get(ctx, id)
-	if err != nil {
-		return err
-	}
-	if sub == nil {
-		return fmt.Errorf("subscription not found: %s", id)
-	}
-
 	// Reserve the slot under lock to prevent concurrent starts (TOCTOU).
 	// We insert a nil placeholder; startSubscriber replaces it on success.
+	// The slot is reserved before the row is read, as RestartSubscription
+	// does: reading first let a Delete complete in between, and the start
+	// then ran a subscriber with no stored subscription (#1597). A Delete
+	// that runs after the read is handled by runReserved.
 	m.mu.Lock()
 	if _, ok := m.subscribers[id]; ok {
 		m.mu.Unlock()
@@ -518,15 +660,58 @@ func (m *SubscriptionManager) StartSubscription(ctx context.Context, id string) 
 	m.subscribers[id] = nil // placeholder — slot is reserved
 	m.mu.Unlock()
 
-	if err := m.startSubscriber(sub); err != nil {
-		// Remove the placeholder on failure
-		m.mu.Lock()
-		delete(m.subscribers, id)
-		m.mu.Unlock()
-		m.repo.UpdateStatus(ctx, id, StatusError, err.Error())
+	sub, err := m.repo.Get(ctx, id)
+	if err != nil {
+		m.releaseReservation(id)
+		return err
+	}
+	if sub == nil {
+		m.releaseReservation(id)
+		return errSubscriptionNotFound(id)
+	}
+
+	if err := m.runReserved(ctx, sub); err != nil {
+		// After runReserved has recorded the failure: released first, a
+		// second start could reserve, run and record running, and this
+		// start's status error would then land on a running subscription.
+		m.releaseReservation(id)
 		return err
 	}
 
+	return nil
+}
+
+// runReserved starts sub in the slot its caller reserved, and returns the
+// error to report. A start that fails is recorded by startFailed.
+//
+// A start that registers reads the row again. Registering does not prove the
+// subscription is still stored: a Delete can take this start's reservation
+// after its read, and a second start can then reserve the slot again, so this
+// subscriber registers into the second start's placeholder (#1597). Delete
+// removes the row before it takes the map entry, so a re-read that finds the
+// row means any later Delete finds this subscriber and stops it. A re-read
+// that finds none stops it here.
+func (m *SubscriptionManager) runReserved(ctx context.Context, sub *Subscription) error {
+	subscriber, err := m.startRegistered(sub)
+	if err != nil {
+		return m.startFailed(ctx, sub.ID, err)
+	}
+
+	stored, err := m.repo.Get(ctx, sub.ID)
+	if err != nil {
+		// The start succeeded; only the check could not be made.
+		m.logger.Warn().Err(err).Str("id", sub.ID).Msg("Started MQTT subscription, but could not confirm it is still stored")
+		return nil
+	}
+	if stored == nil {
+		m.mu.Lock()
+		if m.subscribers[sub.ID] == subscriber {
+			delete(m.subscribers, sub.ID)
+		}
+		m.mu.Unlock()
+		_ = subscriber.Stop()
+		return errSubscriptionNotFound(sub.ID)
+	}
 	return nil
 }
 
@@ -536,16 +721,29 @@ func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) e
 	subscriber, ok := m.subscribers[id]
 	if !ok || subscriber == nil {
 		m.mu.Unlock()
-		return ErrSubscriptionNotRunning
+		return m.notRunningError(ctx, id)
 	}
 	delete(m.subscribers, id)
 	m.mu.Unlock()
 
 	stopErr := subscriber.Stop()
 	statusErr := m.repo.UpdateStatus(ctx, id, StatusStopped, "")
-	m.logger.Info().Str("id", id).Msg("Stopped MQTT subscription")
+	err := stoppedResult(id, stopErr, statusErr)
+	if !errors.Is(err, ErrSubscriptionNotFound) {
+		m.logger.Info().Str("id", id).Msg("Stopped MQTT subscription")
+	}
+	return err
+}
 
-	return errors.Join(stopErr, statusErr)
+// notRunningError is the error for a stop or pause of a subscription with no
+// running subscriber: ErrSubscriptionNotFound when no subscription is stored
+// under id, ErrSubscriptionNotRunning otherwise. A failed lookup answers not
+// running, which is true either way.
+func (m *SubscriptionManager) notRunningError(ctx context.Context, id string) error {
+	if sub, err := m.repo.Get(ctx, id); err == nil && sub == nil {
+		return errSubscriptionNotFound(id)
+	}
+	return ErrSubscriptionNotRunning
 }
 
 // PauseSubscription pauses a subscription (stops without clearing error state)
@@ -554,16 +752,18 @@ func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) 
 	subscriber, ok := m.subscribers[id]
 	if !ok || subscriber == nil {
 		m.mu.Unlock()
-		return ErrSubscriptionNotRunning
+		return m.notRunningError(ctx, id)
 	}
 	delete(m.subscribers, id)
 	m.mu.Unlock()
 
 	stopErr := subscriber.Stop()
 	statusErr := m.repo.UpdateStatus(ctx, id, StatusPaused, "")
-	m.logger.Info().Str("id", id).Msg("Paused MQTT subscription")
-
-	return errors.Join(stopErr, statusErr)
+	err := stoppedResult(id, stopErr, statusErr)
+	if !errors.Is(err, ErrSubscriptionNotFound) {
+		m.logger.Info().Str("id", id).Msg("Paused MQTT subscription")
+	}
+	return err
 }
 
 // RestartSubscription stops and starts a subscription
@@ -600,12 +800,11 @@ func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string
 		return err
 	}
 	if sub == nil {
-		return fmt.Errorf("subscription not found: %s", id)
+		return errSubscriptionNotFound(id)
 	}
 
 	// Start it
-	if err := m.startSubscriber(sub); err != nil {
-		m.repo.UpdateStatus(ctx, id, StatusError, err.Error())
+	if err := m.runReserved(ctx, sub); err != nil {
 		return err
 	}
 
@@ -627,7 +826,7 @@ func (m *SubscriptionManager) GetStats(ctx context.Context, id string) (*Subscri
 			return nil, err
 		}
 		if sub == nil {
-			return nil, fmt.Errorf("subscription not found: %s", id)
+			return nil, errSubscriptionNotFound(id)
 		}
 
 		return &SubscriptionStats{
@@ -668,13 +867,19 @@ func (m *SubscriptionManager) GetAllStats(ctx context.Context) ([]*SubscriptionS
 
 // startSubscriber creates and starts a subscriber
 func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
+	_, err := m.startRegistered(sub)
+	return err
+}
+
+// startRegistered is startSubscriber, returning the subscriber it registered.
+func (m *SubscriptionManager) startRegistered(sub *Subscription) (*Subscriber, error) {
 	// Rows loaded from SQLite may predate the storage-segment rule or have
 	// been edited there. Refuse to run one whose targets cannot be written,
 	// so the subscription shows an error status instead of running and
 	// dropping every message (#300). onMessage keeps its own check as the
 	// last line.
 	if err := validateSubscriptionTargets(sub, false); err != nil {
-		return fmt.Errorf("subscription targets cannot be written: %w", err)
+		return nil, fmt.Errorf("subscription targets cannot be written: %w", err)
 	}
 	for _, dead := range deadTopicFilters(sub.TopicMapping) {
 		m.logger.Warn().
@@ -693,12 +898,12 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 	)
 
 	if err := subscriber.Start(); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := m.registerStarted(sub.ID, subscriber); err != nil {
 		_ = subscriber.Stop()
-		return err
+		return nil, err
 	}
 
 	m.logger.Info().
@@ -706,13 +911,20 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 		Str("name", sub.Name).
 		Msg("Started MQTT subscription")
 
-	return nil
+	return subscriber, nil
 }
 
 // onStatusChange handles status changes from subscribers
 func (m *SubscriptionManager) onStatusChange(id string, status SubscriptionStatus, errMsg string) {
 	ctx := context.Background()
-	if err := m.repo.UpdateStatus(ctx, id, status, errMsg); err != nil {
+	err := m.repo.UpdateStatus(ctx, id, status, errMsg)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The subscription was deleted: Delete removes the row before it
+		// stops the subscriber, whose stop then reports here (#1597).
+		m.logger.Debug().Str("id", id).Str("status", string(status)).Msg("Subscription deleted; status not recorded")
+		return
+	}
+	if err != nil {
 		m.logger.Error().
 			Err(err).
 			Str("id", id).

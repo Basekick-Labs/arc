@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -235,5 +236,22 @@ func TestQueryManagement_LicenseRequired(t *testing.T) {
 	}
 	if resp.StatusCode != 403 {
 		t.Fatalf("expected 403 without license, got %d", resp.StatusCode)
+	}
+}
+
+// A query a compactor forwarded shows its target in the active listing, not
+// only once it reaches history.
+func TestQueryManagement_ListActiveQueries_ShowsForwardedTo(t *testing.T) {
+	app, registry := setupQueryManagementTest(t)
+	id, _ := registry.Register(context.Background(), "SELECT 1", 1, "t", "127.0.0.1")
+	registry.SetForwardedTo(id, "reader-1")
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/api/v1/queries/active", nil), -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"forwarded_to":"reader-1"`) {
+		t.Fatalf("active listing lacks forwarded_to: %s", body)
 	}
 }
