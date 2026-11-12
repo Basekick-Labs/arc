@@ -10,7 +10,7 @@ Groundwork for making query governance policies (rate limits, quotas, row and sc
 - They have their own cluster flag, as retention policies and continuous queries do. This release cannot turn it on, and nothing adopts the nodes' policies yet; part 2, in the same release, does both once every node runs it. From then on a node on an older release cannot join.
 - Internal: retention policies, continuous queries and governance policies now share one per-kind table for their flag, their join check and the enable step. Retention and continuous queries behave as before.
 
-Performance: none on query, ingest or import. No governance code runs on those paths, and the query path is unchanged. The Raft state machine gains one map lookup per token delete. New benchmarks, `BenchmarkAdmit` and `BenchmarkAdmitParallel` (`Admit` while file registrations are applied continuously), give the baseline part 2 is measured against; run against `main` with the same files, they show no difference.
+Performance: none on query, ingest or import. No governance code runs on those paths, and the query path is unchanged. The Raft state machine gains one map lookup per token delete. New benchmarks, `BenchmarkAdmit` and `BenchmarkAdmitParallel` (`Admit` while file registrations are applied continuously), give the baseline part 2 is measured against; run against `main` with the same files, `Admit` allocations and the apply rate are unchanged and time per call is within 1% (the `Admit` code is identical in both builds).
 
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 
