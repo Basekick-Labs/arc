@@ -831,16 +831,27 @@ func (am *AuthManager) insertToken(hash, prefix, name, description, permissions 
 		expiresAtVal = expiresAt.UTC()
 	}
 
-	_, err := am.db.Exec(`
+	// ON CONFLICT DO NOTHING turns a taken name into "0 rows inserted"
+	// instead of a driver error whose text would have to be matched. It is
+	// untargeted on purpose: it names no constraint, so it cannot fail with
+	// "ON CONFLICT clause does not match" on a table created by an older
+	// release. api_tokens has two uniqueness constraints, the AUTOINCREMENT
+	// id this INSERT does not set and name, so 0 rows means the name is
+	// taken. #1625.
+	result, err := am.db.Exec(`
 		INSERT INTO api_tokens (name, token_hash, token_prefix, description, permissions, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT DO NOTHING
 	`, name, hash, prefix, description, permissions, expiresAtVal)
-
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return fmt.Errorf("token with name '%s' already exists", name)
-		}
 		return fmt.Errorf("failed to create token: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to create token: %w", err)
+	}
+	if inserted == 0 {
+		return errTokenNameExists(name)
 	}
 
 	return nil
@@ -899,6 +910,12 @@ func (am *AuthManager) CreateToken(ctx context.Context, name, description, permi
 			},
 		}
 		if err := am.proposeCommand(ctx, ProposalCommandCreateToken, payload); err != nil {
+			// The FSM refuses a duplicate name; the cluster proposer tags
+			// that refusal ErrNameConflict. Report it as the standalone path
+			// does.
+			if errors.Is(err, ErrNameConflict) {
+				return "", errTokenNameExists(name)
+			}
 			return "", fmt.Errorf("create token: %w", err)
 		}
 		am.logger.Info().
@@ -1223,6 +1240,57 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 	return info, nil
 }
 
+// errTokenNotFound is the error every token write returns for an ID with no
+// token. Tagged ErrNotFound so the HTTP handlers map it with errors.Is; the
+// message is the one the API has always reported.
+func errTokenNotFound() error {
+	return tagError(ErrNotFound, errors.New("token not found"))
+}
+
+// errTokenNameExists is the error a token create or rename returns for a name
+// another token holds, on both the SQLite path (a write that changed no row
+// because of the name) and the cluster path (the FSM's refusal, which the
+// cluster proposer tags ErrNameConflict). Tagged ErrNameConflict: a duplicate
+// name is a client error, not a server fault. The message is the one the API
+// has always reported, and ForceAddRecoveryToken matches "already exists" in
+// it.
+func errTokenNameExists(name string) error {
+	return tagError(ErrNameConflict, fmt.Errorf("token with name '%s' already exists", name))
+}
+
+// ErrTokenRevoked tags a rotate of a revoked token. Revocation is permanent:
+// no route re-enables a token, so a rotated secret could never authenticate.
+// The rotate handler maps it to 409. #1625.
+var ErrTokenRevoked = errors.New("token is revoked")
+
+// errTokenRevoked is the error RotateToken returns for a revoked token.
+func errTokenRevoked() error {
+	return tagError(ErrTokenRevoked, errors.New("token is revoked and cannot be rotated"))
+}
+
+// requireLocalToken returns the local SQLite copy of the token with this ID,
+// or errTokenNotFound when it holds none.
+//
+// The cluster write paths call it before proposing, RotateToken before it
+// generates a value in both modes, and the standalone UpdateToken and
+// RotateToken after a write that changed no row, to tell "not found" from a
+// name conflict or a revoked token. The FSM treats an update,
+// revoke, rotate or delete of an unknown ID as an idempotent no-op so that log
+// replay after a delete stays clean, so the proposal itself cannot report it:
+// without this check each of those routes answered 200 for an ID that never
+// existed. The same pre-check, and the same short window on a follower that has
+// not yet applied a token created elsewhere, as RBACManager.DeleteOrganization.
+func (am *AuthManager) requireLocalToken(id int64) (*TokenInfo, error) {
+	info, err := am.GetTokenByID(id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up token: %w", err)
+	}
+	if info == nil {
+		return nil, errTokenNotFound()
+	}
+	return info, nil
+}
+
 // UpdateToken updates token metadata.
 //
 // The context bounds the cluster-mode Raft proposal wait. In OSS mode
@@ -1232,6 +1300,9 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 	// Cluster mode: propose via Raft with a ChangedFields list so the FSM
 	// applier knows which fields are "leave alone" vs "set to empty".
 	if am.getProposer() != nil {
+		if _, err := am.requireLocalToken(id); err != nil {
+			return err
+		}
 		var changed []string
 		payload := struct {
 			ID                int64    `json:"id"`
@@ -1262,6 +1333,9 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 		}
 		payload.ChangedFields = changed
 		if err := am.proposeCommand(ctx, ProposalCommandUpdateToken, payload); err != nil {
+			if name != nil && errors.Is(err, ErrNameConflict) {
+				return errTokenNameExists(*name)
+			}
 			return fmt.Errorf("update token: %w", err)
 		}
 		return nil
@@ -1292,20 +1366,41 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 	}
 
 	if len(updates) == 0 {
-		return nil
+		// Nothing to write, but an unknown ID is still not found.
+		_, err := am.requireLocalToken(id)
+		return err
 	}
 
 	args = append(args, id)
 	query := fmt.Sprintf("UPDATE api_tokens SET %s WHERE id = ?", strings.Join(updates, ", "))
+	if name != nil {
+		// A rename to a name another token holds changes no row, instead of
+		// failing with a driver error whose text would have to be matched.
+		// One statement, so SQLite's single writer leaves no window between
+		// the check and the write. #1625.
+		query += " AND NOT EXISTS (SELECT 1 FROM api_tokens WHERE name = ? AND id <> ?)"
+		args = append(args, *name, id)
+	}
 
 	result, err := am.db.Exec(query, args...)
 	if err != nil {
 		return err
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if rowsAffected == 0 {
-		return errors.New("token not found")
+		if name == nil {
+			return errTokenNotFound()
+		}
+		// A rename that changed no row: the ID is unknown or the name is
+		// taken.
+		if _, err := am.requireLocalToken(id); err != nil {
+			return err
+		}
+		return errTokenNameExists(*name)
 	}
 
 	am.InvalidateCache()
@@ -1316,6 +1411,9 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 // Raft proposal wait. Gemini #451 round-3 review.
 func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
 	if am.getProposer() != nil {
+		if _, err := am.requireLocalToken(id); err != nil {
+			return err
+		}
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
@@ -1334,7 +1432,7 @@ func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errors.New("token not found")
+		return errTokenNotFound()
 	}
 
 	am.InvalidateCache()
@@ -1346,6 +1444,9 @@ func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
 // Raft proposal wait. Gemini #451 round-3 review.
 func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
 	if am.getProposer() != nil {
+		if _, err := am.requireLocalToken(id); err != nil {
+			return err
+		}
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
@@ -1364,7 +1465,7 @@ func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errors.New("token not found")
+		return errTokenNotFound()
 	}
 
 	am.InvalidateCache()
@@ -1376,6 +1477,22 @@ func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
 // context bounds the cluster-mode Raft proposal wait. Gemini #451
 // round-3 review.
 func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error) {
+	// Checked before a value is generated, in both modes: an unknown or
+	// revoked token is refused without the cost of a new secret. In cluster
+	// mode the FSM drops a rotate of an unknown ID and applies a rotate of a
+	// revoked one, and either way the caller would be handed a token that
+	// authenticates nothing; the re-read after the proposal (below) covers a
+	// revoke or delete that this check could not see yet. Standalone, the
+	// UPDATE's own enabled = 1 is the atomic guard and this is the fast
+	// path. #1625.
+	info, err := am.requireLocalToken(id)
+	if err != nil {
+		return "", err
+	}
+	if !info.Enabled {
+		return "", errTokenRevoked()
+	}
+
 	token, err := generateToken()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate token: %w", err)
@@ -1400,23 +1517,78 @@ func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error
 		if err := am.proposeCommand(ctx, ProposalCommandRotateToken, payload); err != nil {
 			return "", fmt.Errorf("rotate token: %w", err)
 		}
-		am.logger.Info().Int64("token_id", id).Msg("Rotated API token via Raft")
-		return token, nil
+		return am.confirmClusterRotate(id, token)
 	}
 	_ = ctx
 
-	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ?", hash, prefix, id)
-	if err != nil {
+	if err := am.writeRotatedToken(id, hash, prefix); err != nil {
 		return "", err
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return "", errors.New("token not found")
 	}
 
 	am.InvalidateCache()
 	am.logger.Info().Int64("token_id", id).Msg("Rotated API token")
+	return token, nil
+}
+
+// writeRotatedToken is the standalone rotate's write. enabled = 1 in the same
+// statement is the atomic guard: RotateToken's pre-check runs before the new
+// value is hashed, and a revoke that lands in between must not get its hash
+// replaced and a dead secret returned (#1625). No route re-enables a token,
+// so a rotated revoked token could never authenticate. On no row changed it
+// returns errTokenNotFound for a deleted token and errTokenRevoked for a
+// revoked one.
+func (am *AuthManager) writeRotatedToken(id int64, hash, prefix string) error {
+	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ? AND enabled = 1", hash, prefix, id)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		if _, err := am.requireLocalToken(id); err != nil {
+			return err
+		}
+		return errTokenRevoked()
+	}
+	return nil
+}
+
+// confirmClusterRotate re-reads the local row after a committed cluster rotate,
+// and refuses the new value when the token is gone (404) or revoked (409): the
+// FSM applies a rotate of a revoked token and drops one of a deleted token, so
+// in either case the value would never authenticate. #1625.
+//
+// How exact this is depends on where the proposal ran:
+//   - Leader: Apply returns after the FSM applied every entry up to the rotate,
+//     and the apply callbacks write this node's SQLite synchronously, so any
+//     revoke or delete ordered before the rotate is visible. A revoke ordered
+//     just after it may be visible too; the 409 is still true, since the value
+//     is dead.
+//   - Follower with cluster policies enabled: the forwarded proposal waits
+//     until this node has applied the rotate's index (forwardAndWaitHere), so
+//     the same holds.
+//   - Follower before cluster policies are enabled, or when that wait times
+//     out (it logs and carries on): this node may not yet have applied a
+//     revoke or delete ordered before the rotate, and the rotate answers 200
+//     with a value that never authenticates.
+//
+// A failed re-read does not fail the rotate: it has committed, and a 500
+// would discard a valid new secret. The value is returned and the failure
+// logged at Warn.
+func (am *AuthManager) confirmClusterRotate(id int64, token string) (string, error) {
+	after, err := am.GetTokenByID(id)
+	switch {
+	case err != nil:
+		am.logger.Warn().Err(err).Int64("token_id", id).
+			Msg("Rotated API token via Raft, but could not re-read it to confirm it is still enabled; returning the new value")
+	case after == nil:
+		return "", errTokenNotFound()
+	case !after.Enabled:
+		return "", errTokenRevoked()
+	}
+	am.logger.Info().Int64("token_id", id).Msg("Rotated API token via Raft")
 	return token, nil
 }
 

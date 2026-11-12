@@ -3938,6 +3938,49 @@ refuses. It now answers `400 "Token name cannot be empty"`.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
 
+### Fix: token routes answer `409` for a taken name or a revoked token, and `404` for an unknown ID ([#1625](https://github.com/Basekick-Labs/arc/issues/1625))
+
+`POST /api/v1/auth/tokens` with a name another token already has answered
+`500` and logged an error, and so did `PATCH /api/v1/auth/tokens/{id}` renaming
+a token to such a name. Both now answer `409 "token with name '<name>' already
+exists"` on a standalone node and in a cluster. Before, only a standalone create
+used that text: a standalone rename answered `Failed to update token: UNIQUE
+constraint failed: api_tokens.name`, and in a cluster the message carried the
+`cluster apply failed` wrapping (and, on a follower, the `forward apply: leader
+rejected` prefix). The first token is unchanged.
+
+On a cluster node, `PATCH`, `DELETE`, `POST .../rotate` and `POST .../revoke`
+for an ID with no token answered `200`, because the cluster applies a write to
+an unknown token as a no-op. `rotate` even returned a `new_token` that
+authenticated nothing. They now answer `404 "Token not found"`, as a standalone
+node already did, and propose nothing. A `PATCH` with no fields for an unknown
+ID is now a `404` on both. As with the RBAC routes, a follower that has not yet
+applied a token created elsewhere answers `404` for it for that short moment.
+
+`POST .../rotate` on a revoked token answered `200` with a `new_token` that
+could never authenticate: revocation is permanent and no route re-enables a
+token. It now answers `409`, and the token stays revoked. Create a new token
+instead; a new token has a new ID, so re-attach its governance policies and
+team memberships. Expired tokens can still be rotated, and revoking an already
+revoked token still answers `200`.
+
+In a cluster, a rotate is checked against the node's own copy of the token
+before it is proposed, and again after it has been applied: if the token was
+revoked or deleted on another node just before, the rotate answers `409` or
+`404` instead of a `new_token` that never authenticates. On the node that leads
+the cluster, that second check sees every revoke and delete ordered before the
+rotate. On a follower it does too once cluster policies are enabled, as long as
+the follower's wait to apply the rotate itself does not time out. A follower
+that has not yet applied a revoke or delete made elsewhere, even one already
+acknowledged, can still answer `200` with a `new_token` that never
+authenticates, for a revoke, or for a delete, where it would otherwise answer
+`404`: before cluster policies are enabled, or when that wait times out. The
+revoked or deleted token stays unusable either way.
+
+Duplicate-name and unknown-ID parts contributed by
+[@officialasishkumar](https://github.com/officialasishkumar) in
+[#1622](https://github.com/Basekick-Labs/arc/pull/1622).
+
 ### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
 
 On local storage, `iceberg.warehouse` set to a plain path (for example
