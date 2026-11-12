@@ -4150,6 +4150,20 @@ Duplicate-name and unknown-ID parts contributed by
 [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1622](https://github.com/Basekick-Labs/arc/pull/1622).
 
+### Fix: execution history answers `404` for an unknown continuous query or retention policy ([#1624](https://github.com/Basekick-Labs/arc/pull/1624))
+
+`GET /api/v1/continuous_queries/{id}/executions` and
+`GET /api/v1/retention/{id}/executions` answered `200 {"executions": null}`
+for an ID with no continuous query or policy behind it, so a typo or a deleted
+definition looked like one that had never run. In a cluster, a deleted
+definition's history could still be listed for a moment after the delete,
+until the node's own tables caught up with the cluster. Both routes now answer
+`404 "Continuous query not found"` or `404 "Retention policy not found"`, as
+`GET /{id}` already did, and `503` while the node is not yet able to read the cluster's definitions, as
+`GET /{id}` does. A definition that has not run yet lists `"executions": []`
+instead of `null`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
 ### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
 
 On local storage, `iceberg.warehouse` set to a plain path (for example

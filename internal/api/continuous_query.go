@@ -1692,6 +1692,14 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query ID"})
 	}
 
+	// An ID with no continuous query has no history to list: 404, as GET
+	// /:id answers, rather than a 200 with an empty one.
+	if _, err := h.getQuery(int64(queryID)); isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
+	}
+
 	limit := c.QueryInt("limit", 50)
 
 	rows, err := h.sqliteDB.Query(`
@@ -1708,7 +1716,8 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	var executions []CQExecution
+	// Non-nil, so a continuous query that has not run yet lists [], not null.
+	executions := []CQExecution{}
 	for rows.Next() {
 		var ex CQExecution
 		if err := rows.Scan(&ex.ID, &ex.QueryID, &ex.ExecutionID, &ex.ExecutionTime, &ex.Status, &ex.StartTime, &ex.EndTime, &ex.RecordsRead, &ex.RecordsWritten, &ex.ExecutionDurationSeconds, &ex.ErrorMessage); err != nil {
