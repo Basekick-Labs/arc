@@ -200,8 +200,9 @@ func TestSkipFlightTableSchemaError(t *testing.T) {
 	for code, skip := range map[codes.Code]bool{
 		codes.PermissionDenied:  true,
 		codes.NotFound:          true,
-		codes.Internal:          true,
-		codes.InvalidArgument:   true,
+		codes.Internal:          false,
+		codes.InvalidArgument:   false,
+		codes.DeadlineExceeded:  false,
 		codes.ResourceExhausted: false,
 		codes.Unauthenticated:   false,
 		codes.Unavailable:       false,
@@ -211,6 +212,67 @@ func TestSkipFlightTableSchemaError(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	require.False(t, skipFlightTableSchemaError(cancelled, status.Error(codes.Internal, "x")), "a cancelled RPC aborts")
+	require.False(t, skipFlightTableSchemaError(cancelled, status.Error(codes.PermissionDenied, "x")), "a cancelled RPC aborts")
 	require.False(t, skipFlightTableSchemaError(ctx, errors.New("plain")))
+}
+
+// Every stage of a shutdown fits in the budget Shutdown is given.
+func TestFlightSQLShutdownStagesFitTheBudget(t *testing.T) {
+	st := flightSQLShutdownStages{grace: 5 * time.Second, force: 2 * time.Second, drain: 2 * time.Second}
+	require.Equal(t, 11*time.Second, st.total())
+	require.Equal(t, st, st.within(20*time.Second))
+	for _, budget := range []time.Duration{10 * time.Second, 3 * time.Second, 100 * time.Millisecond, 0} {
+		require.LessOrEqual(t, st.within(budget).total(), budget, budget.String())
+	}
+}
+
+// With a short context, a stalled connection and a hung bridge handler,
+// Shutdown still returns before the context ends, so the coordinator runs
+// the hooks and components after it.
+func TestFlightSQLShutdownReturnsWithinAShortContext(t *testing.T) {
+	s := newBridgeTestServer(t, nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s.bridge.Post("/test/hang", func(c *fiber.Ctx) error {
+		close(entered)
+		<-release
+		return c.SendString("{}")
+	})
+	defer close(release)
+	require.NoError(t, s.Start())
+	conn, err := net.Dial("tcp", s.flightLn.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+	go func() { _, _ = s.service.query(context.Background(), "/test/hang", "SELECT 1", "") }()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	err = s.Shutdown(ctx)
+	require.NoError(t, ctx.Err(), "Shutdown must return before its context ends")
+	_ = err // the bridge drain may report the hung handler; returning in time is what counts
+}
+
+// Bridge handlers run under the server's base context, so shutdown cancels
+// the query itself.
+func TestFlightSQLBridgeHandlersRunUnderTheBaseContext(t *testing.T) {
+	s := newBridgeTestServer(t, nil)
+	done := make(chan error, 1)
+	s.bridge.Post("/test/ctx", func(c *fiber.Ctx) error {
+		select {
+		case <-c.UserContext().Done():
+			done <- c.UserContext().Err()
+		case <-time.After(5 * time.Second):
+			done <- errors.New("handler context was not cancelled")
+		}
+		return nil
+	})
+	require.NoError(t, s.Start())
+	go func() { _, _ = s.service.query(context.Background(), "/test/ctx", "SELECT 1", "") }()
+	time.Sleep(100 * time.Millisecond)
+	s.cancelBase()
+	require.ErrorIs(t, <-done, context.Canceled)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = s.Shutdown(ctx)
 }

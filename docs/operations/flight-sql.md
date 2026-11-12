@@ -23,7 +23,8 @@ Flight SQL metadata maps Arc databases to catalogs, the empty schema to each
 catalog, and measurements to tables. Table metadata can include the Arrow
 schema. A catalog-scoped metadata request uses Arc's normal database and
 measurement permission checks; a measurement the token cannot read is left
-out of a table listing that includes schemas.
+out of a table listing that includes schemas. Any other failure of a schema
+query fails the listing.
 
 Metadata calls run ordinary queries: listing tables runs one per database,
 and including schemas adds one per measurement. Each counts against the
@@ -49,11 +50,14 @@ run on (`/api/v1/query`, `/api/v1/query/arrow`). A connection refused by
 Flight authentication is not audited, as a refused HTTP request is not. The
 HTTP request metrics also count Flight queries.
 
-On shutdown, in-flight Flight queries get 5 seconds to finish, are then
-cancelled, and connections still open 2 seconds later are closed, so a client
-that stops reading a result cannot hold shutdown up. The listener sets no
-limit on concurrent streams per connection; authentication is what bounds
-who can open them.
+On shutdown, in-flight Flight queries get 5 seconds to finish and are then
+cancelled, the queries included; connections still open 2 seconds later are
+closed, so a client that stops reading a result cannot hold shutdown up. With
+the internal drain after it, the listener takes at most about 11 seconds to
+stop, and less when `server.shutdown_timeout` leaves less: every stage is
+scaled to fit in half of the shutdown time remaining when it starts. The
+listener sets no limit on concurrent streams per connection; every call needs
+a valid token when authentication is on.
 
 For Python, install `adbc-driver-flightsql`, `adbc-driver-manager` and
 `pyarrow`, then connect with a bearer token:

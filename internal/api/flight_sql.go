@@ -62,12 +62,15 @@ const flightSQLPeerHeader = "X-Arc-Flight-Peer"
 // flightSQLInternalKeyHeader authenticates the gRPC side to the bridge.
 const flightSQLInternalKeyHeader = "X-Arc-Flight-Internal-Key"
 
-// Shutdown bounds. The shutdown coordinator gives every hook and component
+// Shutdown stages. The shutdown coordinator gives every hook and component
 // one context and skips everything left once it expires, including the
 // ingest buffer and WAL flushes, so this hook keeps its own deadline well
-// inside it: in-flight queries get flightSQLShutdownGrace to finish, are then
-// cancelled, and connections still open flightSQLShutdownForce later (a
-// client that stopped reading a stream) are closed.
+// inside it: in-flight queries get flightSQLShutdownGrace to finish and are
+// then cancelled; connections still open flightSQLShutdownForce later (a
+// client that stopped reading a stream) are closed, and the server gets
+// flightSQLShutdownForce more to stop; the bridge then drains for up to
+// flightSQLBridgeDrain. Together at most 11 s; Shutdown scales every stage
+// down when half of its context's remaining time is less.
 // Variables so a test can shorten them.
 var (
 	flightSQLShutdownGrace = 5 * time.Second
@@ -141,6 +144,7 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 		return nil, fmt.Errorf("generate internal Flight SQL credential: %w", err)
 	}
 	internalKey := hex.EncodeToString(secret)
+	baseCtx, cancelBase := context.WithCancel(context.Background())
 
 	// The bridge serves the query handler's routes to the gRPC side only.
 	// Its middleware mirrors the main app's (internal/api/server.go,
@@ -168,6 +172,14 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 	})
 	bridge.Use(requestLogger(logger))
 	bridge.Use(auth.NewMiddleware(auth.MiddlewareConfig{AuthManager: queryHandler.authManager}))
+	// Handlers hand c.UserContext() to DuckDB. On the bridge it is the
+	// server's base context, so shutdown cancels the query itself and not
+	// only the loopback request carrying it. Not cancelled per request: the
+	// Arrow path streams after the handler returns.
+	bridge.Use(func(c *fiber.Ctx) error {
+		c.SetUserContext(baseCtx)
+		return c.Next()
+	})
 	for _, m := range config.Middleware {
 		if m != nil {
 			bridge.Use(m)
@@ -175,7 +187,6 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 	}
 	queryHandler.RegisterRoutes(bridge)
 
-	baseCtx, cancelBase := context.WithCancel(context.Background())
 	transport := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 64}
 	service := &flightSQLService{
 		queryHandler: queryHandler,
@@ -315,18 +326,15 @@ func (s *FlightSQLServer) Shutdown(ctx context.Context) error {
 		return nil
 	}
 
-	grace, force := flightSQLShutdownGrace, flightSQLShutdownForce
+	st := flightSQLShutdownStages{grace: flightSQLShutdownGrace, force: flightSQLShutdownForce, drain: flightSQLBridgeDrain}
 	if deadline, ok := ctx.Deadline(); ok {
-		if half := time.Until(deadline) / 2; half < grace+force {
-			force = half / 3
-			grace = half - force
-		}
+		st = st.within(time.Until(deadline) / 2)
 	}
 
 	s.shutdownMu.Lock()
 	if s.shutdownDone == nil {
 		s.shutdownDone = make(chan struct{})
-		go s.finishShutdown(serving, grace, force)
+		go s.finishShutdown(serving, st)
 	}
 	done := s.shutdownDone
 	s.shutdownMu.Unlock()
@@ -342,7 +350,31 @@ func (s *FlightSQLServer) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (s *FlightSQLServer) finishShutdown(serving bool, grace, force time.Duration) {
+// flightSQLShutdownStages are the waits of one shutdown. Their worst case is
+// grace + 2*force + drain.
+type flightSQLShutdownStages struct {
+	grace, force, drain time.Duration
+}
+
+func (st flightSQLShutdownStages) total() time.Duration {
+	return st.grace + 2*st.force + st.drain
+}
+
+// within scales every stage so the worst case fits in budget.
+func (st flightSQLShutdownStages) within(budget time.Duration) flightSQLShutdownStages {
+	total := st.total()
+	if budget >= total {
+		return st
+	}
+	if budget < 0 {
+		budget = 0
+	}
+	scale := func(d time.Duration) time.Duration { return time.Duration(int64(d) * int64(budget) / int64(total)) }
+	return flightSQLShutdownStages{grace: scale(st.grace), force: scale(st.force), drain: scale(st.drain)}
+}
+
+func (s *FlightSQLServer) finishShutdown(serving bool, st flightSQLShutdownStages) {
+	grace, force := st.grace, st.force
 	var shutdownErr error
 	if serving {
 		stopped := make(chan struct{})
@@ -373,7 +405,7 @@ func (s *FlightSQLServer) finishShutdown(serving bool, grace, force time.Duratio
 		_ = s.flightLn.Close()
 	}
 	s.cancelBase()
-	if err := s.bridge.ShutdownWithTimeout(flightSQLBridgeDrain); err != nil {
+	if err := s.bridge.ShutdownWithTimeout(st.drain); err != nil {
 		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown internal Flight SQL query bridge: %w", err))
 	}
 	if s.bridgeLn != nil {
@@ -718,6 +750,7 @@ func (s *flightSQLService) query(ctx context.Context, path, sql, token string) (
 		if base.Err() != nil {
 			return nil, status.Error(codes.Unavailable, "Arc is shutting down")
 		}
+		s.queryHandler.logger.Warn().Err(err).Str("path", path).Msg("Flight SQL: the internal query bridge request failed")
 		return nil, status.Error(codes.Unavailable, "Arc query request failed")
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -764,6 +797,8 @@ func flightCodeForHTTP(code int) codes.Code {
 		return codes.ResourceExhausted
 	case http.StatusServiceUnavailable:
 		return codes.Unavailable
+	case http.StatusGatewayTimeout:
+		return codes.DeadlineExceeded
 	default:
 		return codes.Internal
 	}
@@ -885,18 +920,17 @@ func (s *flightSQLService) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 }
 
 // skipFlightTableSchemaError reports whether a measurement whose schema query
-// failed is left out of a GetTables listing rather than failing it: one the
-// token may not read (SHOW TABLES lists every measurement; RBAC applies per
-// measurement), or one gone or unreadable since the listing. A refusal that
-// is about the caller and not the measurement aborts the listing instead,
-// so a BI tool is never handed a quietly partial catalogue: a governance
-// limit, an expired token, shutdown, or the RPC itself ending.
+// failed is left out of a GetTables listing rather than failing it: only one
+// the token may not read (SHOW TABLES lists every measurement; RBAC applies
+// per measurement) or one that is gone. Anything else fails the listing, so
+// a BI tool is never handed a quietly partial catalogue: a governance limit
+// or timeout, an expired token, a query error, shutdown, or the RPC ending.
 func skipFlightTableSchemaError(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
 	}
 	switch status.Code(err) {
-	case codes.PermissionDenied, codes.NotFound, codes.Internal, codes.InvalidArgument:
+	case codes.PermissionDenied, codes.NotFound:
 		return true
 	default:
 		return false
