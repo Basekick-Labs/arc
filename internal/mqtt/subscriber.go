@@ -22,6 +22,7 @@ import (
 	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
 )
 
@@ -498,6 +499,19 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 				Str("topic", msg.Topic()).
 				Str("database", database).
 				Msg("Dropping MQTT messages: the mapped database is not a valid storage segment (letters, digits, underscore, hyphen; letter first); fix the subscription's database or topic_mapping")
+		}
+		return
+	}
+	// A database named after the Iceberg warehouse directory would write
+	// inside the warehouse (#1626): dropped and counted the same way.
+	if storage.IsWarehouseRootName(database) {
+		s.messagesFailed.Add(1)
+		metrics.Get().IncMQTTMessagesFailed()
+		if _, seen := s.invalidDatabaseLogged.LoadOrStore(database, struct{}{}); !seen {
+			s.logger.Error().
+				Str("topic", msg.Topic()).
+				Str("database", database).
+				Msg("Dropping MQTT messages: the mapped database is the Iceberg warehouse directory (iceberg.warehouse); fix the subscription's database or topic_mapping")
 		}
 		return
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -42,7 +43,9 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	start := time.Now()
 
 	database, measurement, errResp := h.importPreamble(c)
-	if errResp != nil {
+	if errResp != nil || database == "" {
+		// A refusal is already written: its JSON call returns nil, so the
+		// empty database is what tells it from a pass (#1626).
 		return errResp
 	}
 
@@ -392,7 +395,9 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 	start := time.Now()
 
 	database, measurement, errResp := h.importPreamble(c)
-	if errResp != nil {
+	if errResp != nil || database == "" {
+		// A refusal is already written: its JSON call returns nil, so the
+		// empty database is what tells it from a pass (#1626).
 		return errResp
 	}
 
@@ -737,7 +742,9 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 type fiberContext = context.Context
 
 // importPreamble validates the database/measurement and RBAC, returning a ready
-// error response if validation fails. Shared by CSV and Parquet handlers.
+// error response if validation fails. Shared by CSV and Parquet handlers. On a
+// refusal the response is already written and database is "": the error is
+// that of writing it, nil when it was sent, so callers test database too.
 func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 	// c.Get / c.Query are zero-copy aliases into the fasthttp request buffer.
 	// The database and measurement returned here are retained past the handler by
@@ -757,6 +764,10 @@ func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 	if !isValidDatabaseName(database) {
 		h.totalErrors.Add(1)
 		return "", "", c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)"})
+	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return "", "", c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	measurement := strings.Clone(c.Query("measurement"))

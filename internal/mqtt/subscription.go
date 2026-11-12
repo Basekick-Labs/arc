@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // Validation limits
@@ -359,6 +361,9 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 func validateSubscriptionTargets(s *Subscription, strictFilters bool) error {
 	if !isValidStorageSegment(s.Database) {
 		return fmt.Errorf("database %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens", s.Database)
+	}
+	if storage.IsWarehouseRootName(s.Database) {
+		return fmt.Errorf("database name %q is reserved for the Iceberg warehouse", s.Database)
 	}
 	if err := validateTopicMapping(s.TopicMapping, strictFilters); err != nil {
 		return err

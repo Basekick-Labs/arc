@@ -2,7 +2,9 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -79,6 +81,51 @@ func (h *AuthHandler) verifyToken(c *fiber.Ctx) error {
 	})
 }
 
+// maxExpiresIn is the longest expires_in a token accepts: 100 years, written
+// "36500d". A token that should not expire omits expires_in. The bound keeps
+// the expiry within what a cluster can replicate (the Raft entry carries it as
+// Unix nanoseconds, which end in 2262) and keeps a day count from overflowing
+// time.Duration, which used to turn "99999999d" into an arbitrary expiry.
+const maxExpiresIn = 36500 * 24 * time.Hour
+
+// parseExpiresIn reads a token's expires_in: a Go duration ("24h", "90m") or a
+// whole number of days ("7d"). The duration must be positive: a zero or
+// negative one used to create, or move, a token to an expiry already in the
+// past, so the route answered success for a token that could not authenticate.
+// The error text is the API's response body.
+func parseExpiresIn(s string) (time.Duration, error) {
+	invalid := errors.New("Invalid expires_in format. Use duration like '24h' or '7d'")
+	tooLong := fmt.Errorf("expires_in is too long: at most %dd (100 years); omit it for a token that does not expire", maxExpiresIn/(24*time.Hour))
+	duration, err := time.ParseDuration(s)
+	if err != nil {
+		days, ok := strings.CutSuffix(s, "d")
+		if !ok || days == "" {
+			return 0, invalid
+		}
+		n, err := strconv.ParseInt(days, 10, 64)
+		if err != nil {
+			return 0, invalid
+		}
+		// Both bounds are checked before multiplying, so no count can
+		// overflow: a negative one such as "-177004d" used to wrap round to
+		// an expiry about 100 years out.
+		if n <= 0 {
+			return 0, errors.New("expires_in must be positive")
+		}
+		if n > int64(maxExpiresIn/(24*time.Hour)) {
+			return 0, tooLong
+		}
+		duration = time.Duration(n) * 24 * time.Hour
+	}
+	if duration <= 0 {
+		return 0, errors.New("expires_in must be positive")
+	}
+	if duration > maxExpiresIn {
+		return 0, tooLong
+	}
+	return duration, nil
+}
+
 // CreateTokenRequest represents a token creation request
 type CreateTokenRequest struct {
 	Name        string    `json:"name"`
@@ -135,24 +182,12 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 	// Parse expiration
 	var expiresAt *time.Time
 	if req.ExpiresIn != "" {
-		duration, err := time.ParseDuration(req.ExpiresIn)
+		duration, err := parseExpiresIn(req.ExpiresIn)
 		if err != nil {
-			// Try parsing as days (e.g., "7d")
-			if len(req.ExpiresIn) > 1 && req.ExpiresIn[len(req.ExpiresIn)-1] == 'd' {
-				days, err := strconv.Atoi(req.ExpiresIn[:len(req.ExpiresIn)-1])
-				if err != nil {
-					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-						"success": false,
-						"error":   "Invalid expires_in format. Use duration like '24h' or '7d'",
-					})
-				}
-				duration = time.Duration(days) * 24 * time.Hour
-			} else {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"success": false,
-					"error":   "Invalid expires_in format. Use duration like '24h' or '7d'",
-				})
-			}
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
 		}
 		t := time.Now().Add(duration)
 		expiresAt = &t
@@ -258,6 +293,14 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 		})
 	}
 
+	// Create refuses an empty name; a rename must not reach one either.
+	if req.Name != nil && *req.Name == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Token name cannot be empty",
+		})
+	}
+
 	// Convert permissions array to string if provided
 	// nil = don't change, empty array = clear permissions (RBAC-only token)
 	var permissions *string
@@ -285,23 +328,12 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 	// Parse expiration if provided
 	var expiresAt *time.Time
 	if req.ExpiresIn != nil {
-		duration, err := time.ParseDuration(*req.ExpiresIn)
+		duration, err := parseExpiresIn(*req.ExpiresIn)
 		if err != nil {
-			if len(*req.ExpiresIn) > 1 && (*req.ExpiresIn)[len(*req.ExpiresIn)-1] == 'd' {
-				days, err := strconv.Atoi((*req.ExpiresIn)[:len(*req.ExpiresIn)-1])
-				if err != nil {
-					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-						"success": false,
-						"error":   "Invalid expires_in format",
-					})
-				}
-				duration = time.Duration(days) * 24 * time.Hour
-			} else {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"success": false,
-					"error":   "Invalid expires_in format",
-				})
-			}
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
 		}
 		t := time.Now().Add(duration)
 		expiresAt = &t

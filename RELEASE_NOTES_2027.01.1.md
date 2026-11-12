@@ -74,6 +74,45 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
+
+With the WAL on and object storage as the backend, a flush whose upload hit
+`ingest.flush_timeout_seconds` was treated as failed: its rows stayed in the
+WAL and the next recovery pass wrote them to a new file. An object store that
+had already received the upload could still finish it after Arc gave up (a
+stalled S3, a slow network, an overloaded gateway). That left two files with
+the same rows, and queries read both. Acknowledged rows were never lost.
+
+Arc now keeps the key of a failed flush write together with the WAL entries
+whose rows it held. When another flush has stored all of those rows, usually
+the recovery pass's replay, Arc checks the key. If the object is there and is
+the size the failed upload sent, Arc deletes it and logs a warning. It checks
+again 1, 5 and 15 minutes later, because the abandoned upload can land after
+the first check.
+
+Arc deletes the object only when every row in it is provably stored in
+another file. A flush that does not meet this condition is not tracked, and a
+duplicate is still possible, as before:
+
+- The WAL is off.
+- Some of its rows have no WAL copy.
+- It names rows by identities that replay does not carry.
+
+Other limits:
+
+- **Restart.** The list of failed keys is kept in memory. After a restart,
+  the startup replay leaves a copy that already landed in place. On shutdown,
+  Arc logs a warning for each key it is still tracking.
+- **Compaction.** If compaction merges the late copy before Arc deletes it,
+  the duplicate rows become part of the compacted file.
+- **Brief duplicates.** Between the late upload landing and the check, queries
+  see the rows twice.
+
+New counters: `arc_ingest_ambiguous_writes_recorded_total`,
+`arc_ingest_ambiguous_writes_removed_total` and
+`arc_ingest_ambiguous_writes_abandoned_total` (no longer tracked without a
+removal: rows not seen stored again within a day, or an object of another
+size at the key). No new configuration.
 ## Fix: local storage fsyncs what it writes, so a power loss cannot take acknowledged rows ([#1618](https://github.com/Basekick-Labs/arc/issues/1618))
 
 The local storage backend renamed each written file into place without
@@ -129,6 +168,60 @@ The cost scales with files written per second, not rows.
   were lost.
 - **Restore and tiering.** Copies of many files (backup restore, tiering
   cold-to-hot) are slower by two fsyncs per file.
+
+## Fix: a tiering policy needs an existing database; an Iceberg warehouse inside the storage root is not a database ([#1626](https://github.com/Basekick-Labs/arc/issues/1626))
+
+**Behaviour change: `PUT /api/v1/tiering/policies/{database}` now answers
+404 `Database '<name>' not found` for a database that does not exist.** It
+used to store the policy. A database exists by the rule `GET
+/api/v1/databases/{name}` answers with: its marker, a file, a cold-tier row
+or (in a cluster) a manifest entry. If you set policies before the first
+write, create the database first with `POST /api/v1/databases`. The PUT also
+answers:
+
+- **400** `invalid database name "<name>"` for a name that is not a valid
+  storage segment (before: stored);
+- **400** with the name-spelling text for a name that exists in another
+  spelling on a volume that folds case ([#1509](https://github.com/Basekick-Labs/arc/issues/1509));
+- **500** `Failed to check database` when the check itself fails.
+
+`GET`, `DELETE` and `/effective` are unchanged: `DELETE` still removes a
+policy left behind by a deleted database. The check runs on the node that
+answers: on a cluster that keeps data per node, a database that so far holds
+only the marker made by `POST /api/v1/databases` exists only on the writer, so
+set its policy on the writer, or after the first write.
+
+With Iceberg export on, the warehouse's directories in the storage root are
+no longer treated as databases: the namespace directories (`arc_<db>.db`), and
+a warehouse set to a subdirectory of the storage root
+(`iceberg.warehouse=<root>/lv_wh`, on local storage or an S3 prefix).
+`GET /api/v1/databases`, `SHOW DATABASES`, `SHOW TABLES` and
+`GET /api/v1/measurements` leave them out; `GET /api/v1/databases/{name}` and
+its `/measurements` answer 404, `DELETE` answers 403, and
+`POST /api/v1/databases` answers 400 `Database name '<name>' is reserved`. A
+write to a database named after the subdirectory warehouse (line protocol,
+MessagePack, TLE, every `/api/v1/import/*` format, a continuous query's
+database, an MQTT subscription or `topic_mapping` target) is refused with 400
+`database name "<name>" is reserved for the Iceberg warehouse`, so writes
+cannot land inside a subdirectory warehouse. A directory whose name only
+starts with the warehouse's (`lv_wh-other`) is an ordinary database. A
+warehouse nested deeper (`<root>/a/b`) hides measurement `b` of database `a`,
+and `a` stays listed; `DELETE` of database `a` answers 403, because it would
+delete the warehouse with it. Writes to measurement `b` of database `a` are
+**not** refused: they land inside the warehouse directory, are hidden from the
+listings and are not exported, so do not write there (a startup warning names
+that measurement). The export walk applies the same rule, so it no longer walks a
+subdirectory warehouse as a database. Configure Iceberg the same way on every
+node: a node with Iceberg off lists the warehouse and accepts writes to it.
+
+`/api/v1/import/csv` and `/api/v1/import/parquet` now honour their own
+refusals of an invalid database or measurement name and of an RBAC denial:
+they answer the 400 or 403 they wrote, where they used to carry on with an
+empty database name and answer a later 500 or 422.
+
+Cost: one existence check per policy PUT (an admin call); an in-memory name
+comparison per listed directory; one atomic load and string comparison per
+write request (per message for MQTT), never per row.
 
 ## Fix: re-running a continuous query with nothing new to process answers 200 ([#1628](https://github.com/Basekick-Labs/arc/issues/1628))
 
@@ -3995,6 +4088,24 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### Fix: a token's `expires_in` must be in the future, and a rename cannot clear its name ([#1623](https://github.com/Basekick-Labs/arc/pull/1623))
+
+`POST /api/v1/auth/tokens` and `PATCH /api/v1/auth/tokens/{id}` accepted a
+zero or negative `expires_in` (`"-24h"`, `"0d"`) and answered success for a
+token that had already expired, so it could not authenticate. A day count too
+large for Go's duration type, positive or negative, overflowed into an
+arbitrary expiry, past or future (`"99999999d"` gave 2246, `"-177004d"`
+2126). Both routes now answer `400`: `"expires_in must be positive"`, or
+`"expires_in is too long: at most 36500d (100 years)..."` for anything over
+100 years, and store nothing. A token that should not expire omits
+`expires_in`, as before. An unreadable `expires_in` on `PATCH` now gets the
+same message as on create, naming the accepted forms.
+
+`PATCH` with `"name": ""` renamed the token to an empty name, which create
+refuses. It now answers `400 "Token name cannot be empty"`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
 
 ### Fix: token routes answer `409` for a taken name or a revoked token, and `404` for an unknown ID ([#1625](https://github.com/Basekick-Labs/arc/issues/1625))
 

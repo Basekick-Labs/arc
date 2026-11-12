@@ -232,8 +232,13 @@ type Metrics struct {
 	// dropped (the WAL writer refused or timed out; those rows replay).
 	walRowCheckpointsWritten atomic.Int64
 	walRowCheckpointsDropped atomic.Int64
-	bufferFullRejections     atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
-	walDiskStatErrors        atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
+
+	// #1635: keys of failed flush writes that may land after all.
+	ingestAmbiguousWritesRecorded  atomic.Int64
+	ingestAmbiguousWritesRemoved   atomic.Int64
+	ingestAmbiguousWritesAbandoned atomic.Int64
+	bufferFullRejections           atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
+	walDiskStatErrors              atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -858,8 +863,12 @@ func (m *Metrics) IncWALNotDurableRejections()     { m.walNotDurableRejections.A
 func (m *Metrics) IncWALDurableAckTimeouts()       { m.walDurableAckTimeouts.Add(1) }
 func (m *Metrics) IncWALRowCheckpointsWritten()    { m.walRowCheckpointsWritten.Add(1) }
 func (m *Metrics) IncWALRowCheckpointsDropped()    { m.walRowCheckpointsDropped.Add(1) }
-func (m *Metrics) IncBufferFullRejections()        { m.bufferFullRejections.Add(1) }
-func (m *Metrics) IncWALDiskStatErrors()           { m.walDiskStatErrors.Add(1) }
+
+func (m *Metrics) IncIngestAmbiguousWritesRecorded()  { m.ingestAmbiguousWritesRecorded.Add(1) }
+func (m *Metrics) IncIngestAmbiguousWritesRemoved()   { m.ingestAmbiguousWritesRemoved.Add(1) }
+func (m *Metrics) IncIngestAmbiguousWritesAbandoned() { m.ingestAmbiguousWritesAbandoned.Add(1) }
+func (m *Metrics) IncBufferFullRejections()           { m.bufferFullRejections.Add(1) }
+func (m *Metrics) IncWALDiskStatErrors()              { m.walDiskStatErrors.Add(1) }
 
 // SetReconciliationStorageSweepHeld records whether the last reconciliation
 // run held its orphan-storage sweep (#1214).
@@ -1412,6 +1421,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_durable_ack_timeouts":          m.walDurableAckTimeouts.Load(),
 		"wal_row_checkpoints_written":       m.walRowCheckpointsWritten.Load(),
 		"wal_row_checkpoints_dropped":       m.walRowCheckpointsDropped.Load(),
+		"ingest_ambiguous_writes_recorded":  m.ingestAmbiguousWritesRecorded.Load(),
+		"ingest_ambiguous_writes_removed":   m.ingestAmbiguousWritesRemoved.Load(),
+		"ingest_ambiguous_writes_abandoned": m.ingestAmbiguousWritesAbandoned.Load(),
 		"ingest_buffer_full_rejections":     m.bufferFullRejections.Load(),
 		"wal_disk_stat_errors":              m.walDiskStatErrors.Load(),
 		"file_registrations_pending":        m.fileRegistrationsPending.Load(),
@@ -2043,6 +2055,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_row_checkpoints_dropped_total Row-range checkpoints the WAL writer refused or timed out on; those rows replay after a crash\n"...)
 	b = append(b, "# TYPE arc_wal_row_checkpoints_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_wal_row_checkpoints_dropped_total", float64(m.walRowCheckpointsDropped.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_recorded_total Flush writes that failed but may still land in storage, tracked so a late copy is removed once WAL replay stores the rows (#1635)\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_recorded_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_recorded_total", float64(m.ingestAmbiguousWritesRecorded.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_removed_total Late-landed copies of failed flush writes removed after their rows were replayed into another file\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_removed_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_removed_total", float64(m.ingestAmbiguousWritesRemoved.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_abandoned_total Failed flush writes no longer tracked without a removal (rows never seen stored again, or a foreign object at the key); a late copy there duplicates rows\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_abandoned_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_abandoned_total", float64(m.ingestAmbiguousWritesAbandoned.Load()))
 	b = append(b, "# HELP arc_ingest_buffer_full_rejections_total Write requests refused because rows waiting to be flushed reached ingest.max_buffered_bytes (bulk imports: 90 percent of it); nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_ingest_buffer_full_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_buffer_full_rejections_total", float64(m.bufferFullRejections.Load()))
