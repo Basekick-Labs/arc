@@ -307,6 +307,9 @@ jobs:
       - name: Enterprise chart shared storage, multi-writer and single-writer
         run: bash scripts/test_enterprise_shared_mode.sh helm/arc-enterprise
 
+      - name: Flight SQL listener in both charts (off by default, ports when on)
+        run: bash scripts/test_helm_flight_sql.sh
+
       - name: Every clustered role can join Raft (shared storage preset)
         run: |
           bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \

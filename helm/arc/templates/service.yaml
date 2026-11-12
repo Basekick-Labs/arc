@@ -11,5 +11,12 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+    {{- if .Values.flightSql.enabled }}
+    - port: {{ .Values.flightSql.servicePort | default 50051 | int }}
+      targetPort: flight-sql
+      protocol: TCP
+      name: flight-sql
+      appProtocol: grpc
+    {{- end }}
   selector:
     {{- include "arc.selectorLabels" . | nindent 4 }}

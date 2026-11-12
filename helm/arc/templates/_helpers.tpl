@@ -89,3 +89,19 @@ the PVC's free space is the signal).
 0
 {{- end -}}
 {{- end }}
+
+{{/*
+The Flight SQL container port (flight_sql.port). Refused at render time when
+it is not a valid port or collides with the HTTP port, rather than leaving
+Arc to refuse it at startup in a crash loop.
+*/}}
+{{- define "arc.flightSqlPort" -}}
+{{- $p := int (.Values.flightSql.port | default 50051) -}}
+{{- if or (lt $p 1) (gt $p 65535) -}}
+{{- fail (printf "flightSql.port must be between 1 and 65535 (got %d)" $p) -}}
+{{- end -}}
+{{- if eq $p 8000 -}}
+{{- fail "flightSql.port must differ from the HTTP port 8000" -}}
+{{- end -}}
+{{- $p -}}
+{{- end -}}

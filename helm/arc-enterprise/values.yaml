@@ -306,6 +306,20 @@ service:
     annotations: {}
 
 # -----------------------------------------------------------------------------
+# Arrow Flight SQL listener (Arc 27.01.1+)
+# -----------------------------------------------------------------------------
+# A gRPC port for ADBC clients on the writers and readers, serving the same
+# read-only query path as the HTTP API, with RBAC, governance and audit
+# (docs/operations/flight-sql.md). Off by default: with enabled: false no
+# port is opened. When on, the writer and reader Services get a flight-sql
+# port. Compactors have no client Service and are not given the listener.
+# TLS follows the HTTP API's server.tls_* settings.
+flightSql:
+  enabled: false
+  port: 50051          # container port (flight_sql.port); must not be 8000, 9100 or 9200
+  servicePort: 50051   # port on the writer and reader Services
+
+# -----------------------------------------------------------------------------
 # Telemetry — disable for air-gapped / defense deployments
 # -----------------------------------------------------------------------------
 telemetry:

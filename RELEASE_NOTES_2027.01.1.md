@@ -3085,6 +3085,13 @@ statements and SqlInfo are not implemented yet, so JDBC-based BI tools are not
 expected to work; the ADBC drivers are the tested clients. See
 `docs/operations/flight-sql.md`.
 
+Both Helm charts can turn it on: `flightSql.enabled` (default `false`),
+`flightSql.port` (default 50051) and `flightSql.servicePort`. When on, the OSS
+chart's Deployment and Service, and the enterprise chart's writers and readers
+with their Services, get a `flight-sql` port (`appProtocol: grpc`); compactors
+are not given the listener. A port that collides with one of Arc's is refused
+when the chart renders.
+
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https://github.com/Basekick-Labs/arc/pull/1419).
 
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))

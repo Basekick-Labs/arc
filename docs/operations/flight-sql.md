@@ -85,6 +85,26 @@ The `grpc://` URI uses plaintext transport. For TLS, use
 Arc's server certificate. The listener is read-only; use Arc's HTTP write APIs
 or an ingestion client for writes.
 
+## Kubernetes (Helm)
+
+Both charts turn the listener on with the same values:
+
+```yaml
+flightSql:
+  enabled: true        # default false: no port in the container or on the Service
+  port: 50051          # container port (flight_sql.port)
+  servicePort: 50051   # port on the Service
+```
+
+The OSS chart adds a `flight-sql` port to its Deployment and Service. The
+enterprise chart adds it to the writers and readers and to their Services;
+compactors have no client Service and are not given the listener. Both mark
+the Service port `appProtocol: grpc`. A port that collides with one of Arc's
+(8000, and in the enterprise chart 9100 and 9200) is refused when the chart
+renders. The charts' Ingress routes HTTP only: expose the port through the
+Service (for example a LoadBalancer) or an ingress controller that proxies
+gRPC.
+
 ## Governance row limits
 
 If a query reaches its configured governance row cap, Flight SQL returns the
