@@ -3920,6 +3920,23 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: a token's `expires_in` must be in the future, and a rename cannot clear its name
+
+`POST /api/v1/auth/tokens` and `PATCH /api/v1/auth/tokens/{id}` accepted a
+zero or negative `expires_in` (`"-24h"`, `"0d"`) and answered success for a
+token that had already expired, so it could not authenticate. A day count too
+large for Go's duration type (`"99999999d"`) overflowed into an arbitrary
+expiry. Both routes now answer `400`: `"expires_in must be positive"`, or
+`"expires_in is too long: at most 36500d (100 years)..."` for anything over
+100 years, and store nothing. A token that should not expire omits
+`expires_in`, as before. An unreadable `expires_in` on `PATCH` now gets the
+same message as on create, naming the accepted forms.
+
+`PATCH` with `"name": ""` renamed the token to an empty name, which create
+refuses. It now answers `400 "Token name cannot be empty"`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
+
 ### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
 
 On local storage, `iceberg.warehouse` set to a plain path (for example
