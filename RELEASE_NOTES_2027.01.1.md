@@ -130,6 +130,56 @@ The cost scales with files written per second, not rows.
 - **Restore and tiering.** Copies of many files (backup restore, tiering
   cold-to-hot) are slower by two fsyncs per file.
 
+## Fix: a tiering policy needs an existing database; an Iceberg warehouse inside the storage root is not a database ([#1626](https://github.com/Basekick-Labs/arc/issues/1626))
+
+**Behaviour change: `PUT /api/v1/tiering/policies/{database}` now answers
+404 `Database '<name>' not found` for a database that does not exist.** It
+used to store the policy. A database exists by the rule `GET
+/api/v1/databases/{name}` answers with: its marker, a file, a cold-tier row
+or (in a cluster) a manifest entry. If you set policies before the first
+write, create the database first with `POST /api/v1/databases`. The PUT also
+answers:
+
+- **400** `invalid database name "<name>"` for a name that is not a valid
+  storage segment (before: stored);
+- **400** with the name-spelling text for a name that exists in another
+  spelling on a volume that folds case ([#1509](https://github.com/Basekick-Labs/arc/issues/1509));
+- **500** `Failed to check database` when the check itself fails.
+
+`GET`, `DELETE` and `/effective` are unchanged: `DELETE` still removes a
+policy left behind by a deleted database. The check runs on the node that
+answers: on a cluster that keeps data per node, a database that so far holds
+only the marker made by `POST /api/v1/databases` exists only on the writer, so
+set its policy on the writer, or after the first write.
+
+With Iceberg export on, the warehouse's directories in the storage root are
+no longer treated as databases: the namespace directories (`arc_<db>.db`), and
+a warehouse set to a subdirectory of the storage root
+(`iceberg.warehouse=<root>/lv_wh`, on local storage or an S3/Azure prefix).
+`GET /api/v1/databases`, `SHOW DATABASES`, `SHOW TABLES` and
+`GET /api/v1/measurements` leave them out; `GET /api/v1/databases/{name}` and
+its `/measurements` answer 404, `DELETE` answers 403, and
+`POST /api/v1/databases` answers 400 `Database name '<name>' is reserved`. A
+write to a database named after the subdirectory warehouse (line protocol,
+MessagePack, TLE, every `/api/v1/import/*` format, a continuous query's
+database, an MQTT subscription or `topic_mapping` target) is refused with 400
+`database name "<name>" is reserved for the Iceberg warehouse`, so no file
+lands inside the warehouse. A directory whose name only starts with the
+warehouse's (`lv_wh-other`) is an ordinary database. A warehouse nested
+deeper (`<root>/a/b`) hides measurement `b` of database `a`, and `a` stays
+listed. The export walk applies the same rule, so it no longer walks a
+subdirectory warehouse as a database. Configure Iceberg the same way on every
+node: a node with Iceberg off lists the warehouse and accepts writes to it.
+
+`/api/v1/import/csv` and `/api/v1/import/parquet` now honour their own
+refusals of an invalid database or measurement name and of an RBAC denial:
+they answer the 400 or 403 they wrote, where they used to carry on with an
+empty database name and answer a later 500 or 422.
+
+Cost: one existence check per policy PUT (an admin call); an in-memory name
+comparison per listed directory; one atomic load and string comparison per
+write request (per message for MQTT), never per row.
+
 ## Fix: an MQTT start or restart that cannot connect to the broker answers 502 with the reason ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
 
 `POST /api/v1/mqtt/subscriptions/{id}/start` and `.../restart` answered 500
