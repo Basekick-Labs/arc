@@ -2377,10 +2377,11 @@ var ErrCascadeCapExceeded = errors.New("cascade exceeds configured limit")
 
 // ErrNameConflict is the sentinel tagging every organization/team and
 // API token name-collision error, on both the OSS direct-SQLite path
-// (UNIQUE constraint violation) and the cluster Raft path ("already
-// exists" from the FSM apply). HTTP handlers detect it via errors.Is and
-// map it to 409 Conflict — a duplicate name is a client error, not a
-// server fault. Issue #549.
+// (UNIQUE constraint violation; for tokens, a write that changed no row
+// because of the name) and the cluster Raft path ("already exists" from
+// the FSM apply; for tokens, tagged by the cluster proposer). HTTP
+// handlers detect it via errors.Is and map it to 409 Conflict — a
+// duplicate name is a client error, not a server fault. Issue #549, #1625.
 var ErrNameConflict = errors.New("name already exists")
 
 // ErrInvalidName is the sentinel tagging validateName failures on the

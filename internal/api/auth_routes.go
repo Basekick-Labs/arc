@@ -369,6 +369,11 @@ func (h *AuthHandler) deleteToken(c *fiber.Ctx) error {
 	})
 }
 
+// tokenRevokedRotateMessage is the 409 body of a rotate of a revoked token. A
+// new token has a new ID, and governance policies and team memberships are
+// keyed by token ID, so the message says to re-attach them.
+const tokenRevokedRotateMessage = "Token is revoked and cannot be rotated. Create a new token; a new token has a new ID, so re-attach governance policies and team memberships"
+
 // rotateToken handles POST /api/v1/auth/tokens/:id/rotate
 func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 	id, err := strconv.ParseInt(c.Params("id"), 10, 64)
@@ -385,6 +390,14 @@ func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token not found",
+			})
+		}
+		// Revocation is permanent, so a rotated secret could never
+		// authenticate. A client error, not logged. #1625.
+		if errors.Is(err, auth.ErrTokenRevoked) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   tokenRevokedRotateMessage,
 			})
 		}
 		h.logger.Error().Err(err).Int64("token_id", id).Msg("Failed to rotate token")

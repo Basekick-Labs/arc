@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
 
@@ -111,6 +113,10 @@ func (p *CoordinatorAuthProposer) Propose(ctx context.Context, cmdType uint8, pa
 // uniformly. Apply failures from the FSM's applier-side validation
 // (e.g. "token name already exists") come back wrapped — preserve them
 // via errors.Is for the AuthManager's ensureFirstToken caller.
+//
+// A refusal of a token name another token holds is also tagged
+// auth.ErrNameConflict, so a create or rename of a taken name answers 409
+// rather than 500 (#1625). The message is unchanged either way.
 func wrapApplyError(err error) error {
 	if err == nil {
 		return nil
@@ -122,8 +128,34 @@ func wrapApplyError(err error) error {
 	// timeout). Wrap with ErrApplyFailed but preserve the original
 	// message so the auth-side "already exists" detection in
 	// ensureFirstToken keeps working.
-	return fmt.Errorf("%w: %w", auth.ErrApplyFailed, err)
+	wrapped := fmt.Errorf("%w: %w", auth.ErrApplyFailed, err)
+	if isTokenNameRefusal(err) {
+		return &tokenNameConflictError{err: wrapped}
+	}
+	return wrapped
 }
+
+// isTokenNameRefusal reports the FSM's refusal of a taken token name. On the
+// leader it arrives typed. On a follower it arrives as the leader's text in a
+// ForwardRejectedError, so it is recognised there by the apply-failed code and
+// the two fixed parts of the FSM's text ("token name %q already exists"), with
+// the name between them — as classifyPolicyError recognises a forwarded policy
+// refusal.
+func isTokenNameRefusal(err error) bool {
+	if errors.Is(err, raft.ErrTokenNameExists) {
+		return true
+	}
+	var fr *ForwardRejectedError
+	return errors.As(err, &fr) && fr.Code == protocol.ForwardCodeApplyFailed &&
+		strings.Contains(fr.Message, `token name "`) && strings.Contains(fr.Message, `" already exists`)
+}
+
+// tokenNameConflictError adds auth.ErrNameConflict to an apply failure without
+// changing its message: a third %w would prepend the sentinel's text.
+type tokenNameConflictError struct{ err error }
+
+func (e *tokenNameConflictError) Error() string   { return e.err.Error() }
+func (e *tokenNameConflictError) Unwrap() []error { return []error{auth.ErrNameConflict, e.err} }
 
 // mergeContexts returns a context that cancels when EITHER input
 // cancels, plus a CancelFunc the caller MUST defer.

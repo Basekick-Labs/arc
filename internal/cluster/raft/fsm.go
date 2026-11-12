@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -2498,6 +2499,23 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	return nil
 }
 
+// ErrTokenNameExists matches (errors.Is) the FSM's refusal of a token create
+// or rename to a name another token holds. On the leader the refusal reaches
+// the proposer typed; a follower gets only its text from the leader's
+// forward-apply ack, which internal/cluster's wrapApplyError recognises. #1625.
+var ErrTokenNameExists = errors.New("token name already exists")
+
+// tokenNameExistsError is that refusal. Its text is the one the FSM has always
+// returned, byte for byte: older followers, ensureFirstToken and the recovery
+// token match "already exists" in it, so it must not change.
+type tokenNameExistsError struct{ name string }
+
+func (e *tokenNameExistsError) Error() string {
+	return fmt.Sprintf("token name %q already exists", e.name)
+}
+
+func (e *tokenNameExistsError) Is(target error) bool { return target == ErrTokenNameExists }
+
 // rejectToken centralises FSM-side rejection of a malformed token command.
 // Same shape as rejectManifestPath: log at Error, bump counters, return a
 // wrapped validation error. The security property — entry does NOT land in
@@ -2697,7 +2715,7 @@ func (f *ClusterFSM) applyCreateToken(payload []byte, logIndex uint64) interface
 			Str("name", entry.Name).
 			Uint64("log_index", logIndex).
 			Msg("Duplicate token name create refused")
-		return fmt.Errorf("create token: token name %q already exists", entry.Name)
+		return fmt.Errorf("create token: %w", &tokenNameExistsError{name: entry.Name})
 	}
 	f.tokens[entry.ID] = &entry
 	f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], entry.ID)
@@ -2765,7 +2783,7 @@ func (f *ClusterFSM) applyUpdateToken(payload []byte, logIndex uint64) interface
 		// loop, so a linear scan was a future scaling bottleneck).
 		if otherID, exists := f.tokensByName[p.Name]; exists && otherID != p.ID {
 			f.mu.Unlock()
-			return f.rejectToken("update", p.ID, logIndex, fmt.Errorf("token name %q already exists", p.Name))
+			return f.rejectToken("update", p.ID, logIndex, &tokenNameExistsError{name: p.Name})
 		}
 		// Maintain the name index: drop the old binding, add the new one.
 		delete(f.tokensByName, entry.Name)

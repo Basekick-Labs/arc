@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -39,6 +41,7 @@ func setupTokenStatusTest(t *testing.T) (*fiber.App, *auth.AuthManager) {
 	app.Delete("/tokens/:id", h.deleteToken)
 	app.Post("/tokens/:id/rotate", h.rotateToken)
 	app.Post("/tokens/:id/revoke", h.revokeToken)
+	app.Get("/tokens/:id", h.getToken)
 	return app, am
 }
 
@@ -135,5 +138,51 @@ func TestTokenRoutesDeleteTwice(t *testing.T) {
 	}
 	if status, msg := doRBACRequest(t, app, "DELETE", path, ""); status != http.StatusNotFound || msg != "Token not found" {
 		t.Errorf("second delete: %d %q, want 404", status, msg)
+	}
+}
+
+// TestTokenRoutesRotateRevokedIsConflict: rotating a revoked token answered
+// 200 with a secret that could never authenticate. It is a 409 now, and the
+// token is still there, revoked (#1625).
+func TestTokenRoutesRotateRevokedIsConflict(t *testing.T) {
+	app, am := setupTokenStatusTest(t)
+	if status, msg := doRBACRequest(t, app, "POST", "/tokens", `{"name":"svc"}`); status != http.StatusCreated {
+		t.Fatalf("create: status %d (%s)", status, msg)
+	}
+	path := fmt.Sprintf("/tokens/%d", tokenIDNamed(t, am, "svc"))
+	if status, msg := doRBACRequest(t, app, "POST", path+"/revoke", ""); status != http.StatusOK {
+		t.Fatalf("revoke: %d %q, want 200", status, msg)
+	}
+
+	status, msg := doRBACRequest(t, app, "POST", path+"/rotate", "")
+	if status != http.StatusConflict || msg != tokenRevokedRotateMessage {
+		t.Errorf("rotate of a revoked token: %d %q, want 409 %q", status, msg, tokenRevokedRotateMessage)
+	}
+
+	req := httptest.NewRequest("GET", path, nil)
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Token struct {
+			Enabled *bool `json:"enabled"`
+		} `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode GET %s: %v", path, err)
+	}
+	if resp.StatusCode != http.StatusOK || got.Token.Enabled == nil || *got.Token.Enabled {
+		t.Errorf("GET after the refused rotate: status %d, enabled %v, want 200 and false", resp.StatusCode, got.Token.Enabled)
+	}
+
+	// An enabled token still rotates.
+	if status, msg := doRBACRequest(t, app, "POST", "/tokens", `{"name":"live"}`); status != http.StatusCreated {
+		t.Fatalf("create: status %d (%s)", status, msg)
+	}
+	live := fmt.Sprintf("/tokens/%d/rotate", tokenIDNamed(t, am, "live"))
+	if status, msg := doRBACRequest(t, app, "POST", live, ""); status != http.StatusOK {
+		t.Errorf("rotate of an enabled token: %d %q, want 200", status, msg)
 	}
 }

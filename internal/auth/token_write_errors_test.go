@@ -15,9 +15,11 @@ import (
 // fsmLikeTokenProposer answers token commands the way the cluster FSM does
 // for the cases these tests need: an update, revoke, rotate or delete of an
 // ID it does not hold is dropped as an idempotent no-op (Propose returns nil,
-// nothing applied), and a duplicate name is refused with the FSM's own text
-// wrapped in ErrApplyFailed. It records every proposal so a test can require
-// that nothing was proposed at all.
+// nothing applied), and a refusal is returned wrapped in ErrApplyFailed, as
+// cluster.wrapApplyError does. A name-conflict refusal must be set already
+// tagged ErrNameConflict (nameRefusal), the shape wrapApplyError gives it; the
+// tagging itself is tested in internal/cluster against a real FSM. It records
+// every proposal so a test can require that nothing was proposed at all.
 type fsmLikeTokenProposer struct {
 	mu       sync.Mutex
 	proposed []uint8
@@ -35,6 +37,12 @@ func (p *fsmLikeTokenProposer) Propose(_ context.Context, cmdType uint8, _ []byt
 }
 
 func (p *fsmLikeTokenProposer) IsLeader() bool { return true }
+
+// nameRefusal is the FSM's refusal of a taken token name as the cluster
+// proposer hands it on: the FSM's text, tagged ErrNameConflict.
+func nameRefusal(op, name string) error {
+	return tagError(ErrNameConflict, fmt.Errorf("%s token: token name %q already exists", op, name))
+}
 
 func (p *fsmLikeTokenProposer) proposals() []uint8 {
 	p.mu.Lock()
@@ -123,17 +131,18 @@ func TestTokenWritesOfExistingIDStillSucceed(t *testing.T) {
 			if err := am.UpdateToken(ctx, id, nil, nil, nil, nil); err != nil {
 				t.Errorf("no-op update: %v", err)
 			}
-			if err := am.RevokeToken(ctx, id); err != nil {
-				t.Errorf("revoke: %v", err)
-			}
+			// Rotate before revoke: a revoked token is not rotated (#1625).
 			if v, err := am.RotateToken(ctx, id); err != nil || v == "" {
 				t.Errorf("rotate: value %q, err %v", v, err)
+			}
+			if err := am.RevokeToken(ctx, id); err != nil {
+				t.Errorf("revoke: %v", err)
 			}
 			if err := am.DeleteToken(ctx, id); err != nil {
 				t.Errorf("delete: %v", err)
 			}
 			if clustered {
-				want := []uint8{ProposalCommandUpdateToken, ProposalCommandRevokeToken, ProposalCommandRotateToken, ProposalCommandDeleteToken}
+				want := []uint8{ProposalCommandUpdateToken, ProposalCommandRotateToken, ProposalCommandRevokeToken, ProposalCommandDeleteToken}
 				if got := prop.proposals(); fmt.Sprint(got) != fmt.Sprint(want) {
 					t.Errorf("proposed %v, want %v", got, want)
 				}
@@ -162,6 +171,16 @@ func TestTokenNameConflictIsTagged(t *testing.T) {
 		if id := tokenIDByName(t, am, "b"); id == 0 {
 			t.Error("the refused rename changed the token's name")
 		}
+
+		// Renaming a token to its own name is not a conflict.
+		own := "b"
+		if err := am.UpdateToken(ctx, tokenIDByName(t, am, "b"), &own, nil, nil, nil); err != nil {
+			t.Errorf("rename to its own name: %v", err)
+		}
+		// A rename of an unknown ID is not found, not a conflict.
+		if err := am.UpdateToken(ctx, 4242, &taken, nil, nil, nil); !errors.Is(err, ErrNotFound) {
+			t.Errorf("rename of an unknown ID to a taken name: %v, want ErrNotFound", err)
+		}
 	})
 
 	t.Run("clustered", func(t *testing.T) {
@@ -174,14 +193,21 @@ func TestTokenNameConflictIsTagged(t *testing.T) {
 		am.SetRaftProposer(prop)
 
 		// The FSM's refusal texts (applyCreateToken, applyUpdateToken).
-		prop.refuse = fmt.Errorf("create token: token name %q already exists", "a")
+		prop.refuse = nameRefusal("create", "a")
 		_, err := am.CreateToken(ctx, "a", "", "read", nil)
 		requireNameConflict(t, "create", err, "a")
 
-		prop.refuse = fmt.Errorf("update token: token name %q already exists", "a")
+		prop.refuse = nameRefusal("update", "a")
 		taken := "a"
 		err = am.UpdateToken(ctx, id, &taken, nil, nil, nil)
 		requireNameConflict(t, "rename", err, "a")
+
+		// The FSM's text alone, untagged, is no longer read as a conflict:
+		// the cluster proposer is the one place that classifies it.
+		prop.refuse = fmt.Errorf("create token: token name %q already exists", "a")
+		if _, err := am.CreateToken(ctx, "a", "", "read", nil); err == nil || errors.Is(err, ErrNameConflict) {
+			t.Errorf("an untagged refusal: err = %v, want an untagged error", err)
+		}
 
 		// Any other refusal is not a name conflict.
 		prop.refuse = errors.New("update token: invalid permission \"x\"")
