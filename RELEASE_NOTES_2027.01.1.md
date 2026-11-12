@@ -2740,17 +2740,19 @@ on, and a node running an earlier release can no longer join.
 
 Do not roll a node back to an earlier release in place after that. The earlier
 release skips the new cluster log commands and ignores their checks, so its
-view of the cluster manifest silently diverges from the other nodes. To run an
-earlier release on a node, remove the node from the cluster, wipe its data
-directory, and join it fresh. To roll back the whole cluster, restore it from a
-backup taken before the upgrade.
+view of the cluster manifest silently diverges from the other nodes. A node on
+an earlier release is refused at join whether or not its data directory was
+wiped, so the cluster can go back to an earlier release only by restoring the
+whole cluster from a backup taken before the upgrade. Removing a node, wiping
+its data directory and joining it fresh is for a node on this same release.
 
 ## Upgrade note: cluster-wide tiering policies ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
 
 A cluster turns on cluster policies by itself once every node runs this
 release (`cluster_policies.enabled` in `GET /api/v1/cluster`). Like compaction
 commit, the flag stays on, and a node running an earlier release can no longer
-join. Roll back the same way: never one node in place.
+join, wiped or not. Roll back the same way: only by restoring the whole
+cluster from a backup taken before the upgrade, never one node in place.
 
 Right after that, the cluster takes over the tiering policies each node holds
 in its own database. During the takeover a tiering policy write answers `503`
