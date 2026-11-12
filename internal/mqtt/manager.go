@@ -412,7 +412,7 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 	m.logger.Info().
 		Str("id", sub.ID).
 		Str("name", sub.Name).
-		Str("broker", sub.Broker).
+		Str("broker", redactBrokerURL(sub.Broker)).
 		Strs("topics", sub.Topics).
 		Msg("Created MQTT subscription")
 
