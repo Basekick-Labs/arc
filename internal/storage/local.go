@@ -13,6 +13,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 )
 
 const maxDirCacheEntries = 1024
@@ -31,6 +32,11 @@ type LocalBackend struct {
 	// causing filesystem lock contention. This cache eliminates that.
 	dirCache map[string]bool
 	dirMu    sync.RWMutex
+	// dirFlight shares one durable creation among concurrent writers that
+	// miss the cache for the same directory (ensureDir).
+	dirFlight singleflight.Group
+	// dirSyncWarn logs once that the volume refuses directory fsync.
+	dirSyncWarn sync.Once
 
 	// spelling refuses database and measurement names that exist on disk
 	// in another spelling, armed only when the root folds names (#1509).
@@ -77,38 +83,6 @@ func NewLocalBackend(basePath string, logger zerolog.Logger) (*LocalBackend, err
 	return b, nil
 }
 
-// ensureDir creates the directory if it doesn't exist, using a cache to avoid
-// redundant os.MkdirAll calls under sustained load.
-func (b *LocalBackend) ensureDir(dir string) error {
-	// Fast path: check if directory already exists in cache (RLock)
-	b.dirMu.RLock()
-	exists := b.dirCache[dir]
-	b.dirMu.RUnlock()
-
-	if exists {
-		return nil
-	}
-
-	// Slow path: create directory and update cache (Lock)
-	b.dirMu.Lock()
-	defer b.dirMu.Unlock()
-	// Double-check after acquiring write lock
-	if !b.dirCache[dir] {
-		// Use 0700 for owner-only access (security best practice)
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return fmt.Errorf("failed to create directory: %w", err)
-		}
-		if len(b.dirCache) >= maxDirCacheEntries {
-			for cachedDir := range b.dirCache {
-				delete(b.dirCache, cachedDir)
-				break
-			}
-		}
-		b.dirCache[dir] = true
-	}
-	return nil
-}
-
 // Write writes data to the specified path with atomic write (write to temp, then rename)
 func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) error {
 	// Reject the key unless it names something inside the root
@@ -127,9 +101,7 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	if err != nil {
 		// Directory might have been deleted externally — invalidate cache and retry
 		if os.IsNotExist(err) {
-			b.dirMu.Lock()
-			delete(b.dirCache, dir)
-			b.dirMu.Unlock()
+			b.forgetDir(dir)
 			if err := b.ensureDir(dir); err != nil {
 				return err
 			}
@@ -143,23 +115,37 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	}
 	tmpPath := tmpFile.Name()
 
-	// Write data and close the file
+	// Write the data, make it durable, and close the file
 	_, writeErr := tmpFile.Write(data)
+	var syncErr error
+	if writeErr == nil {
+		syncErr = syncFileFn(tmpFile)
+	}
 	closeErr := tmpFile.Close()
 	if writeErr != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
 		return fmt.Errorf("failed to write temp file: %w", writeErr)
+	}
+	if syncErr != nil {
+		os.Remove(tmpPath)
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to sync temp file: %w", syncErr)
 	}
 	if closeErr != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
 		return fmt.Errorf("failed to close temp file: %w", closeErr)
 	}
 
-	// Atomic rename
+	// Atomic rename, then make the name durable (local_durable.go)
 	if err := os.Rename(tmpPath, fullPath); err != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+	if err := b.syncDir(dir); err != nil {
+		b.unpublish(fullPath, err)
+		metrics.Get().IncStorageErrors()
+		return err
 	}
 
 	// Record metrics
@@ -194,9 +180,17 @@ func (b *LocalBackend) WriteIfAbsent(ctx context.Context, path string, data []by
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 	_, writeErr := tmpFile.Write(data)
+	var syncErr error
+	if writeErr == nil {
+		syncErr = syncFileFn(tmpFile)
+	}
 	closeErr := tmpFile.Close()
 	if writeErr != nil {
 		return false, fmt.Errorf("failed to write temp file: %w", writeErr)
+	}
+	if syncErr != nil {
+		metrics.Get().IncStorageErrors()
+		return false, fmt.Errorf("failed to sync temp file: %w", syncErr)
 	}
 	if closeErr != nil {
 		return false, fmt.Errorf("failed to close temp file: %w", closeErr)
@@ -207,6 +201,13 @@ func (b *LocalBackend) WriteIfAbsent(ctx context.Context, path string, data []by
 		}
 		metrics.Get().IncStorageErrors()
 		return false, fmt.Errorf("failed to link file into place: %w", err)
+	}
+	// Unlike the other writes, a failure here does not unpublish: this is the
+	// Iceberg publish fence, and a reader may already have adopted the
+	// version. The caller's retry finds the file in place.
+	if err := b.syncDir(dir); err != nil {
+		metrics.Get().IncStorageErrors()
+		return false, err
 	}
 	metrics.Get().IncStorageWrites()
 	metrics.Get().IncStorageWriteBytes(int64(len(data)))
@@ -226,8 +227,10 @@ func partPath(fullPath string) string {
 //
 // Writes proceed to a deterministic "<path>.part" staging file so that a
 // partial transfer interrupted by a transport error leaves recoverable bytes
-// on disk. On success the staging file is atomically renamed to the final path.
-// On error the staging file is left in place so the puller can resume from it.
+// on disk. On success the staging file is fsynced and atomically renamed to the
+// final path, and the directory is fsynced (local_durable.go). On a copy error
+// the staging file is left in place so the puller can resume from it; on an
+// fsync error it is removed (see below).
 func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
@@ -243,9 +246,7 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 	stagingFile, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		if os.IsNotExist(err) {
-			b.dirMu.Lock()
-			delete(b.dirCache, dir)
-			b.dirMu.Unlock()
+			b.forgetDir(dir)
 			if err := b.ensureDir(dir); err != nil {
 				return err
 			}
@@ -259,6 +260,10 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 	}
 
 	written, copyErr := io.Copy(stagingFile, reader)
+	var syncErr error
+	if copyErr == nil {
+		syncErr = syncFileFn(stagingFile)
+	}
 	closeErr := stagingFile.Close()
 
 	if copyErr != nil {
@@ -266,15 +271,29 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to write data: %w", copyErr)
 	}
+	if syncErr != nil {
+		// Unlike a copy error, remove the staging file: after a failed fsync
+		// the page cache can still hold bytes the disk does not, so a resume
+		// that hashes them back proves nothing. The puller restarts a missing
+		// .part from offset zero.
+		os.Remove(stagingPath)
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to sync staging file: %w", syncErr)
+	}
 	if closeErr != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// Atomic promotion: rename staging → final.
+	// Atomic promotion: rename staging → final, then make the name durable.
 	if err := os.Rename(stagingPath, fullPath); err != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to promote staging file: %w", err)
+	}
+	if err := b.syncDir(dir); err != nil {
+		b.unpublish(fullPath, err)
+		metrics.Get().IncStorageErrors()
+		return err
 	}
 
 	metrics.Get().IncStorageWrites()
@@ -353,6 +372,16 @@ func (b *LocalBackend) AdoptFile(ctx context.Context, path, localPath string) er
 		return fmt.Errorf("%w: cannot set mode 0600 on %s: %w", ErrAdoptUnsupported, localPath, err)
 	}
 
+	// The source was written by DuckDB, which does not fsync it. Make the
+	// bytes durable before the rename publishes them, or a power loss after
+	// the job deletes its inputs could leave neither (#1618). A hard error,
+	// not ErrAdoptUnsupported: the copy fallback would read the same unsynced
+	// bytes.
+	if err := syncFileAt(localPath); err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to sync %s before adopting it: %w", localPath, err)
+	}
+
 	if err := renameFile(localPath, fullPath); err != nil {
 		// ENOENT first, and it is the only errno worth retrying: it is also the
 		// only one WriteReader retries, for the same cause -- a cached
@@ -360,9 +389,7 @@ func (b *LocalBackend) AdoptFile(ctx context.Context, path, localPath string) er
 		// ambiguous in a way it is not from OpenFile, because the SOURCE may be
 		// the missing path, so the message below asserts only what is known.
 		if os.IsNotExist(err) {
-			b.dirMu.Lock()
-			delete(b.dirCache, dir)
-			b.dirMu.Unlock()
+			b.forgetDir(dir)
 			if mkErr := b.ensureDir(dir); mkErr != nil {
 				metrics.Get().IncStorageErrors()
 				return mkErr
@@ -372,7 +399,7 @@ func (b *LocalBackend) AdoptFile(ctx context.Context, path, localPath string) er
 				return fmt.Errorf("failed to adopt local file into %s after re-creating its parent directory: %w",
 					fullPath, retryErr)
 			}
-			// fall through to the success accounting below
+			// fall through to the directory sync below
 		} else {
 			// Every other refusal means "copy instead", not "fail". EXDEV is
 			// the common one -- Linux rename returns it for any cross-MOUNT
@@ -387,6 +414,15 @@ func (b *LocalBackend) AdoptFile(ctx context.Context, path, localPath string) er
 			return fmt.Errorf("%w: cannot rename %s to %s: %w",
 				ErrAdoptUnsupported, localPath, fullPath, err)
 		}
+	}
+
+	// The rename is a new name in dir; make it durable too. A failure removes
+	// the adopted file, consuming the source: the caller fails the job and the
+	// next cycle compacts again from the inputs, which are untouched.
+	if err := b.syncDir(dir); err != nil {
+		b.unpublish(fullPath, err)
+		metrics.Get().IncStorageErrors()
+		return err
 	}
 
 	// Accounting parity with WriteReader. These bytes were committed to the
@@ -565,21 +601,42 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 	// Close exactly once on every path, including a failed copy. Closing
 	// before promotion also makes close errors visible to the caller.
 	written, copyErr := io.Copy(file, reader)
+	promote := copyErr == nil && written == appendSize
+	var syncErr error
+	if promote {
+		// fsync is per inode, so this also covers the bytes earlier
+		// WriteReader/AppendReader calls wrote through other descriptors.
+		// Appends that do not promote are resumable staging, not data, and
+		// are not synced.
+		syncErr = syncFileFn(file)
+	}
 	closeErr := file.Close()
 	if copyErr != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to append file data: %w", copyErr)
+	}
+	if syncErr != nil {
+		// Removed for the reason WriteReader removes it on a failed fsync.
+		os.Remove(stagingPath)
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to sync staging file: %w", syncErr)
 	}
 	if closeErr != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// Promote only after a successful copy and close.
-	if written == appendSize {
+	// Promote only after a successful copy, sync and close, then make the
+	// name durable.
+	if promote {
 		if err := os.Rename(stagingPath, fullPath); err != nil {
 			metrics.Get().IncStorageErrors()
 			return fmt.Errorf("failed to promote staging file after append: %w", err)
+		}
+		if err := b.syncDir(filepath.Dir(fullPath)); err != nil {
+			b.unpublish(fullPath, err)
+			metrics.Get().IncStorageErrors()
+			return err
 		}
 	}
 
