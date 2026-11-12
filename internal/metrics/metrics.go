@@ -255,6 +255,7 @@ type Metrics struct {
 	ingestFencedWrites    [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
 	writesForwarded       [len(WriteForwardResults)]atomic.Int64 // writes forwarded to a writer, by result (#1270)
 	walQuarantinedFiles   atomic.Int64                           // WAL files isolated after repeated recovery failures
+	walDamagedEntries     atomic.Int64                           // damaged WAL frames in files quarantined for damage (#1634)
 	walQuarantineReleased atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
@@ -974,6 +975,13 @@ func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 }
 func (m *Metrics) IncWALQuarantinedFiles() { m.walQuarantinedFiles.Add(1) }
 
+// AddWALDamagedEntries counts the damaged frames of a WAL file quarantined
+// for damage (#1634): rows recovery cannot bring back.
+func (m *Metrics) AddWALDamagedEntries(n int64) { m.walDamagedEntries.Add(n) }
+
+// GetWALDamagedEntries reads arc_wal_damaged_entries_total.
+func (m *Metrics) GetWALDamagedEntries() int64 { return m.walDamagedEntries.Load() }
+
 // AddWALQuarantineReleased counts pending WAL entries the writer stopped
 // waiting for because recovery quarantined their file (#1225).
 func (m *Metrics) AddWALQuarantineReleased(n int64) { m.walQuarantineReleased.Add(n) }
@@ -1433,6 +1441,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_fenced":                     m.ingestFenced.Load(),
 		"ingest_fenced_writes":              m.ingestFencedWritesTotal(),
 		"wal_quarantined_files":             m.walQuarantinedFiles.Load(),
+		"wal_damaged_entries":               m.walDamagedEntries.Load(),
 		"wal_quarantine_released_entries":   m.walQuarantineReleased.Load(),
 		"wal_partial_row_recovery_pending":  m.walPartialRowRecovery.Load(),
 
@@ -2107,9 +2116,12 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_file_registration_journal_errors_total", float64(m.fileRegistrationJournalErrs.Load()))
 
-	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
+	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures, or at once when their only failure is damaged entries\n"...)
 	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
 	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
+	b = append(b, "# HELP arc_wal_damaged_entries_total Damaged WAL entries (checksum mismatch) in files recovery quarantined; their rows cannot be replayed\n"...)
+	b = append(b, "# TYPE arc_wal_damaged_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_damaged_entries_total", float64(m.walDamagedEntries.Load()))
 
 	b = append(b, "# HELP arc_wal_quarantine_released_entries_total Pending WAL entries the writer stopped waiting for because their file was quarantined\n"...)
 	b = append(b, "# TYPE arc_wal_quarantine_released_entries_total counter\n"...)
