@@ -272,6 +272,9 @@ func (h *MQTTSubscriptionHandler) handleStart(c *fiber.Ctx) error {
 		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
 			return h.notFound(c, id, err)
 		}
+		if msg, ok := mqtt.BrokerConnectMessage(err); ok {
+			return h.brokerConnectFailed(c, id, "start", msg)
+		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to start subscription")
 
 		if errors.Is(err, mqtt.ErrSubscriptionAlreadyRunning) {
@@ -292,6 +295,21 @@ func (h *MQTTSubscriptionHandler) handleStart(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"success": true,
 		"message": "Subscription started",
+	})
+}
+
+// brokerConnectFailed answers a start or restart whose connect to the broker
+// failed: 502, an upstream failure, not a fault of this server (#1619). The
+// error is the message stored as the subscription's error_message, so the
+// response and a later GET agree; it never carries the broker URL. Not 503,
+// which clients read as the MQTT subsystem being disabled. The subscription is
+// left with status error and is not running, also after a restart, which
+// stopped the old subscriber first.
+func (h *MQTTSubscriptionHandler) brokerConnectFailed(c *fiber.Ctx, id, action, msg string) error {
+	h.logger.Warn().Str("id", id).Str("error", msg).Msg("Failed to " + action + " subscription: could not connect to the broker")
+	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+		"success": false,
+		"error":   msg,
 	})
 }
 
@@ -364,6 +382,9 @@ func (h *MQTTSubscriptionHandler) handleRestart(c *fiber.Ctx) error {
 	if err := h.manager.RestartSubscription(c.Context(), id); err != nil {
 		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
 			return h.notFound(c, id, err)
+		}
+		if msg, ok := mqtt.BrokerConnectMessage(err); ok {
+			return h.brokerConnectFailed(c, id, "restart", msg)
 		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to restart subscription")
 

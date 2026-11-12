@@ -14,6 +14,7 @@ import (
 
 	"github.com/Basekick-Labs/msgpack/v6"
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.mqtt.golang/packets"
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/fips"
@@ -36,7 +37,10 @@ type Subscriber struct {
 	// onMessage so a persistent misconfiguration logs once, not per message.
 	invalidDatabaseLogged sync.Map
 	client                pahomqtt.Client
-	arrowBuffer           *ingest.ArrowBuffer
+	// newClient builds the paho client; a test seam, pahomqtt.NewClient
+	// otherwise.
+	newClient   func(*pahomqtt.ClientOptions) pahomqtt.Client
+	arrowBuffer *ingest.ArrowBuffer
 	// nameWarned rate-limits the warning for a dropped field name (#1342).
 	nameWarnMu     sync.Mutex
 	nameWarned     map[string]time.Time
@@ -88,7 +92,57 @@ func NewSubscriber(
 		logger:            logger.With().Str("subscription_id", config.ID).Str("subscription_name", config.Name).Logger(),
 		ctx:               ctx,
 		cancel:            cancel,
+		newClient:         pahomqtt.NewClient,
 	}
+}
+
+// brokerConnectError is a failed connect to the broker (#1619). Its text is
+// the whole message the API answers and stores as error_message, so it
+// matches ErrBrokerConnect without carrying that text as a prefix. Neither
+// form carries the broker URL: paho's errors name only the dialled host:port
+// (the URL's userinfo is not part of it) or a CONNACK code.
+type brokerConnectError struct {
+	msg   string
+	cause error
+}
+
+func (e *brokerConnectError) Error() string { return e.msg }
+
+func (e *brokerConnectError) Unwrap() []error {
+	if e.cause == nil {
+		return []error{ErrBrokerConnect}
+	}
+	return []error{ErrBrokerConnect, e.cause}
+}
+
+// BrokerConnectMessage returns the message of a failed connect to the
+// broker in err's chain, which is the text startFailed stored as the
+// subscription's error_message, and whether there is one.
+func BrokerConnectMessage(err error) (string, bool) {
+	var connectErr *brokerConnectError
+	if errors.As(err, &connectErr) {
+		return connectErr.msg, true
+	}
+	return "", false
+}
+
+// newBrokerConnectError classifies a connect token's error. A network error
+// (DNS, refused or reset connection, TLS handshake, handshake deadline) or
+// any other failure to complete the handshake could not connect; one of the
+// CONNACK refusal codes means the broker was reached and refused.
+func newBrokerConnectError(err error) error {
+	for _, refused := range []error{
+		packets.ErrorRefusedBadProtocolVersion,
+		packets.ErrorRefusedIDRejected,
+		packets.ErrorRefusedServerUnavailable,
+		packets.ErrorRefusedBadUsernameOrPassword,
+		packets.ErrorRefusedNotAuthorised,
+	} {
+		if errors.Is(err, refused) {
+			return &brokerConnectError{msg: "the broker refused the connection: " + err.Error(), cause: err}
+		}
+	}
+	return &brokerConnectError{msg: "could not connect to the broker: " + err.Error(), cause: err}
 }
 
 // Start connects to the MQTT broker and begins message processing
@@ -111,17 +165,25 @@ func (s *Subscriber) Start() error {
 	}
 
 	// Create client
-	s.client = pahomqtt.NewClient(opts)
+	s.client = s.newClient(opts)
 
 	// Connect
 	s.logger.Info().Str("broker", s.config.Broker).Bool("clean_session", s.config.CleanSession).Msg("Connecting to MQTT broker")
 
+	// A failed connect disconnects the client on both returns (#1619). After
+	// a timeout paho is still connecting: its MQTT 3.1 retry gets a fresh
+	// handshake deadline, so a slow broker could still accept, and onConnect
+	// would subscribe and ingest for a subscription with no subscriber,
+	// stored as error, that stop answers "not running". Disconnect aborts
+	// that attempt; with quiesce 0 it does not wait for it.
 	token := s.client.Connect()
 	if !token.WaitTimeout(time.Duration(s.config.ConnectTimeoutSeconds) * time.Second) {
-		return fmt.Errorf("connection timeout after %d seconds", s.config.ConnectTimeoutSeconds)
+		s.client.Disconnect(0)
+		return &brokerConnectError{msg: fmt.Sprintf("could not connect to the broker: connection timeout after %d seconds", s.config.ConnectTimeoutSeconds)}
 	}
 	if err := token.Error(); err != nil {
-		return fmt.Errorf("connection failed: %w", err)
+		s.client.Disconnect(0)
+		return newBrokerConnectError(err)
 	}
 
 	s.mu.Lock()

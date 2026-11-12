@@ -217,6 +217,12 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 	}
 	defer s.mu.Unlock()
 
+	// RETURNING reports the stored id and timestamps in the same statement,
+	// under the same lock: the caller's policy and the cache carried zeros,
+	// so a GET after a PUT answered id 0 until a restart (#1619). A second
+	// read after the write would open a window for a Delete to land in, and
+	// caching what it read before the delete would resurrect the policy
+	// (#499).
 	query := `
 		INSERT INTO tiering_policies (database, hot_only, hot_max_age_days, updated_at)
 		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -224,22 +230,37 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 			hot_only = excluded.hot_only,
 			hot_max_age_days = excluded.hot_max_age_days,
 			updated_at = CURRENT_TIMESTAMP
+		RETURNING id, created_at, updated_at
 	`
 
-	_, err := s.db.ExecContext(ctx, query,
+	// Scanned into any: the row is written before Scan converts the values,
+	// so a conversion error (a NULL or unparsable timestamp, written outside
+	// Arc or by an older version) must not fail a write that happened.
+	// Reporting the row is observability; a value that does not convert is
+	// left zero. An error here is the statement's own.
+	var id, createdAt, updatedAt any
+	err := s.db.QueryRowContext(ctx, query,
 		policy.Database,
 		policy.HotOnly,
 		policy.HotMaxAgeDays,
-	)
+	).Scan(&id, &createdAt, &updatedAt)
 	if err != nil {
+		// Whether the row changed is unknown: drop the cached entry so the
+		// next Get reads the table.
+		delete(s.cache, policy.Database)
+		s.gen++
 		return fmt.Errorf("failed to set policy: %w", err)
 	}
+	policy.ID, _ = id.(int64)
+	policy.CreatedAt, _ = createdAt.(time.Time)
+	policy.UpdatedAt, _ = updatedAt.(time.Time)
 
 	// Update cache. The name is copied: it can point into a request buffer
 	// the HTTP framework reuses, and both the key and the cached policy
-	// outlive the request.
+	// outlive the request. The cache holds its own copy, so a caller that
+	// changes its policy afterwards does not change what Get returns.
 	policy.Database = strings.Clone(policy.Database)
-	s.cache[policy.Database] = policy
+	s.cache[policy.Database] = copyPolicy(policy)
 	s.gen++
 
 	s.logger.Info().
@@ -248,6 +269,16 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 		Msg("Tiering policy updated")
 
 	return nil
+}
+
+// copyPolicy returns a copy of p that shares no memory with it.
+func copyPolicy(p *DatabasePolicy) *DatabasePolicy {
+	cp := *p
+	if p.HotMaxAgeDays != nil {
+		days := *p.HotMaxAgeDays
+		cp.HotMaxAgeDays = &days
+	}
+	return &cp
 }
 
 // Delete removes a policy for a database (reverts to global defaults)

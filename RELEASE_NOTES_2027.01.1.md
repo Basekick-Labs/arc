@@ -74,6 +74,46 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: an MQTT start or restart that cannot connect to the broker answers 502 with the reason ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
+
+`POST /api/v1/mqtt/subscriptions/{id}/start` and `.../restart` answered 500
+`"Failed to start subscription"` when the broker could not be reached, and the
+reason was only in the subscription's `error_message`. They now answer
+**502** with the reason in `error`, the same text as `error_message`:
+
+- **`could not connect to the broker: ...`** when the broker cannot be reached:
+  DNS, a refused or reset connection, a TLS handshake failure (a wrong CA
+  included), or `connection timeout after N seconds`.
+- **`the broker refused the connection: ...`** when the broker answered and
+  refused it (`bad user name or password`, `not Authorized`, and the other
+  CONNACK refusals).
+
+The text names at most the dialled host and port, never the broker URL or its
+credentials. The subscription is left with status `error` and is not running,
+also after a restart, which stopped the old connection first; stop still
+answers 409. Every other start failure is still a 500.
+
+The stored `error_message` for these failures reads the same, where it read
+`connection failed: ...` or `connection timeout after N seconds`; this
+includes the create response with `auto_start`.
+
+A start that timed out also left the MQTT client connecting in the
+background. A broker that answered late (paho retries once with MQTT 3.1, with
+a fresh handshake deadline) then had a client subscribed and ingesting for a
+subscription stored as `error`, which stop could not reach. A failed connect
+now disconnects the client.
+
+## Fix: a tiering policy PUT reports the stored row ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
+
+`PUT /api/v1/tiering/policies/{database}` answered `"id": 0` and zero
+`created_at`/`updated_at`, on a standalone node and on a cluster. On a
+standalone node a `GET` of the policy did the same until a restart, because
+the policy store cached the request instead of the stored row. The PUT
+response and the `GET` now carry the stored id and timestamps, and a second
+PUT keeps the id and `created_at`. On a standalone node the write reads them
+back in the same statement (no extra query); on a cluster they come from the
+cluster's copy of the policy.
+
 ## Fix: an MQTT subscription created with `auto_start` starts at once ([#1585](https://github.com/Basekick-Labs/arc/issues/1585))
 
 `auto_start` is documented as "start on creation and on server restart", but

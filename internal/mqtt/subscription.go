@@ -44,6 +44,12 @@ var (
 	// missing field, …). Handlers map it to 400 Bad Request rather than 500 —
 	// it's a client error, not a server fault.
 	ErrValidation = errors.New("validation error")
+	// ErrBrokerConnect matches a start that could not connect to the broker:
+	// unreachable, timed out, or the broker refused the connection (#1619).
+	// Handlers map it to 502 Bad Gateway with the error's own text, which is
+	// also the status error_message. It is matched only by the connect itself,
+	// never by a failure before it (topic mapping, password, TLS files).
+	ErrBrokerConnect = errors.New("could not connect to the broker")
 )
 
 // Subscription represents an MQTT subscription configuration
