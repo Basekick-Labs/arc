@@ -1761,6 +1761,81 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	return nil
 }
 
+// ReferencesNode reports whether the cluster state still names id as a node:
+// the node table, a designation (primary writer, compactor lease), a map keyed
+// by node ID, or anything applyRemoveNode and its helpers clear for a removed
+// node. The operator removal (DELETE /api/v1/cluster/nodes/:id) answers 404
+// only for an ID this returns false for and that the registry and the Raft
+// configuration do not hold either (#1619), so the two must stay in step: a
+// structure applyRemoveNode starts acting on belongs here too, or that removal
+// is refused for exactly the IDs it would clean up.
+//
+// A departed writer is the case that needs this most: after a graceful leave
+// it is in none of the node table, the registry or the Raft configuration, yet
+// its instances and claims stay pinned to it until an operator removal (or the
+// departed TTL) gives them up.
+//
+// Attribution kept as history is deliberately not membership, because a
+// removal leaves it as it is and it outlives the node: FileEntry.OriginNodeID,
+// a retired instance's Origin, an ended claim's By, ReportedBy, delete
+// records, policy sources and adoption choices, the cold mark's AckWanted and
+// the pause's RequestedBy. Counting those would keep every removed node a
+// member forever.
+func (f *ClusterFSM) ReferencesNode(id string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if _, ok := f.nodes[id]; ok {
+		return true
+	}
+	if id == f.primaryWriterID || id == f.activeCompactorID {
+		return true
+	}
+	if _, ok := f.compactionPause.Acks[id]; ok {
+		return true
+	}
+	// compactionNodeRemovedLocked
+	for _, s := range f.staged {
+		if s.Origin == id {
+			return true
+		}
+		for _, h := range s.Holders {
+			if h == id {
+				return true
+			}
+		}
+	}
+	// coldMarkNodeRemovedLocked
+	if st := f.coldMark; st != nil {
+		if _, ok := st.Alive[id]; ok {
+			return true
+		}
+		if _, ok := st.Acked[id]; ok {
+			return true
+		}
+	}
+	// takeoverNodeRemovedLocked
+	if t := f.takeover; t != nil {
+		if _, ok := t.departed[id]; ok {
+			return true
+		}
+		if _, ok := t.current[id]; ok {
+			return true
+		}
+		for _, in := range t.instances {
+			if in.Origin == id && in.Status != InstanceRetired {
+				return true
+			}
+		}
+		for _, c := range t.claims {
+			if c.By == id && !c.Done && !c.Released {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (f *ClusterFSM) applyUpdateNode(payload []byte) interface{} {
 	var p UpdateNodePayload
 	if err := json.Unmarshal(payload, &p); err != nil {
