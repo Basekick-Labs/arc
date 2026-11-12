@@ -233,37 +233,73 @@ func TestAdoptFileSyncFailureIsAHardErrorAndKeepsTheSource(t *testing.T) {
 	}
 }
 
-// A directory sync that fails after the rename unpublishes the file: every
-// caller reads an error as "nothing was written".
-func TestDirectorySyncFailureUnpublishes(t *testing.T) {
-	for name, write := range map[string]func(*LocalBackend) error{
-		"Write": func(b *LocalBackend) error { return b.Write(context.Background(), durableKey, []byte("data")) },
-		"WriteReader": func(b *LocalBackend) error {
+// A directory sync that fails after the rename: the bytes are durable, only
+// the name is in doubt. Write keeps the file (WAL-off ingest has no other
+// copy; overwriters would lose the previous version). The copy-in writes,
+// whose callers keep a source, remove a NEW key and keep an existing one.
+func TestDirectorySyncFailureAfterRename(t *testing.T) {
+	src := func(t *testing.T) string {
+		p := filepath.Join(t.TempDir(), "out.parquet")
+		if err := os.WriteFile(p, []byte("data"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	for _, tc := range []struct {
+		name        string
+		write       func(*testing.T, *LocalBackend) error
+		keepsNewKey bool
+	}{
+		{"Write", func(t *testing.T, b *LocalBackend) error {
+			return b.Write(context.Background(), durableKey, []byte("data"))
+		}, true},
+		{"WriteReader", func(t *testing.T, b *LocalBackend) error {
 			return b.WriteReader(context.Background(), durableKey, strings.NewReader("data"), 4)
-		},
-		"AdoptFile": func(b *LocalBackend) error {
-			src := filepath.Join(t.TempDir(), "out.parquet")
-			if err := os.WriteFile(src, []byte("data"), 0600); err != nil {
-				t.Fatal(err)
-			}
-			return b.AdoptFile(context.Background(), durableKey, src)
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			b := newDurableBackend(t)
+		}, false},
+		{"AdoptFile", func(t *testing.T, b *LocalBackend) error {
+			return b.AdoptFile(context.Background(), durableKey, src(t))
+		}, false},
+		{"AppendReader", func(t *testing.T, b *LocalBackend) error {
 			full := filepath.Join(b.basePath, durableKey)
-			// Create the directory chain first so only the post-rename sync fails.
-			if err := b.ensureDir(filepath.Dir(full)); err != nil {
+			if err := os.WriteFile(partPath(full), []byte("da"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			recordSyncs(t, nil, syscall.EIO)
-			if err := write(b); !errors.Is(err, syscall.EIO) {
-				t.Fatalf("%s = %v, want EIO", name, err)
+			return b.AppendReader(context.Background(), durableKey, strings.NewReader("ta"), 2)
+		}, false},
+	} {
+		for _, overwrite := range []bool{false, true} {
+			name := tc.name + "/new"
+			if overwrite {
+				name = tc.name + "/overwrite"
 			}
-			if _, err := os.Stat(full); !os.IsNotExist(err) {
-				t.Fatalf("a write whose directory sync failed is still published: stat = %v", err)
-			}
-		})
+			t.Run(name, func(t *testing.T) {
+				b := newDurableBackend(t)
+				full := filepath.Join(b.basePath, durableKey)
+				// Create the chain first so only the post-rename sync fails.
+				if err := b.ensureDir(filepath.Dir(full)); err != nil {
+					t.Fatal(err)
+				}
+				if overwrite {
+					if err := os.WriteFile(full, []byte("old!"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				recordSyncs(t, nil, syscall.EIO)
+				if err := tc.write(t, b); !errors.Is(err, syscall.EIO) {
+					t.Fatalf("%s = %v, want EIO", tc.name, err)
+				}
+				got, err := os.ReadFile(full)
+				if tc.keepsNewKey || overwrite {
+					if err != nil || string(got) != "data" {
+						t.Fatalf("the written file should stay in place: %q, %v", got, err)
+					}
+					return
+				}
+				if !os.IsNotExist(err) {
+					t.Fatalf("a new key whose directory sync failed is still published: %q, %v", got, err)
+				}
+			})
+		}
 	}
 }
 
@@ -356,7 +392,7 @@ func TestEnsureDirSyncsParentOfAnExistingUncachedDirectory(t *testing.T) {
 }
 
 // Concurrent writers that miss the cache for the same new directory all
-// succeed, and none returns before the directory is synced into its parent.
+// succeed, and the directory is synced into its parent.
 func TestEnsureDirConcurrentMissesShareOneDurableCreation(t *testing.T) {
 	b := newDurableBackend(t)
 	r := recordSyncs(t, nil, nil)
@@ -421,5 +457,110 @@ func assertDirHoldsNothing(t *testing.T, dir string) {
 			names = append(names, e.Name())
 		}
 		t.Fatalf("%s should hold nothing after a failed write, holds %v", dir, names)
+	}
+}
+
+// Two hours under one new day, created concurrently: each writer syncs the
+// levels of its own chain, including the shared day it may not have created,
+// before it returns. Observed from inside the rename's directory sync: by the
+// time a file's hour directory is synced, the day must already have been
+// synced into the month and the hour into the day.
+func TestEnsureDirSiblingHoursEachSyncTheirChain(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		b := newDurableBackend(t)
+		j := func(p string) string { return filepath.Join(b.basePath, filepath.FromSlash(p)) }
+		var mu sync.Mutex
+		synced := map[string]int{}
+		bad := ""
+		orig := syncDirFn
+		syncDirFn = func(dir string) error {
+			mu.Lock()
+			synced[dir]++
+			for _, hour := range []string{"db/m/2026/11/12/10", "db/m/2026/11/12/11"} {
+				// The rename's sync of an hour directory with a file in it.
+				if dir == j(hour) {
+					if entries, _ := os.ReadDir(dir); len(entries) > 0 && (synced[j("db/m/2026/11")] == 0 || synced[j("db/m/2026/11/12")] == 0) {
+						bad = hour
+					}
+				}
+			}
+			mu.Unlock()
+			return orig(dir)
+		}
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		for _, h := range []string{"10", "11"} {
+			wg.Add(1)
+			go func(h string) {
+				defer wg.Done()
+				errs <- b.Write(context.Background(), "db/m/2026/11/12/"+h+"/f.parquet", []byte("data"))
+			}(h)
+		}
+		wg.Wait()
+		syncDirFn = orig
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if bad != "" {
+			t.Fatalf("round %d: %s was published before its day was synced into the month and itself into the day", round, bad)
+		}
+	}
+}
+
+// A removal that runs while a chain is being created outside the lock keeps
+// that chain out of the cache: it may have taken part of it.
+func TestEnsureDirDoesNotCacheAChainARemovalRacedWith(t *testing.T) {
+	b := newDurableBackend(t)
+	hour := filepath.Join(b.basePath, filepath.FromSlash("db/m/2026/11/12/10"))
+	orig := syncDirFn
+	t.Cleanup(func() { syncDirFn = orig })
+	removed := false
+	syncDirFn = func(dir string) error {
+		if !removed && dir == filepath.Dir(hour) {
+			removed = true
+			if err := b.RemoveAll(context.Background(), "db/m/2026/11/12/10"); err != nil {
+				t.Error(err)
+			}
+		}
+		return orig(dir)
+	}
+	if err := b.ensureDir(hour); err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("the removal hook never ran")
+	}
+	if b.dirCached(hour) {
+		t.Fatal("cached a directory a concurrent RemoveAll removed")
+	}
+	// The next write recreates it.
+	syncDirFn = orig
+	if err := b.Write(context.Background(), durableKey, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A WriteIfAbsent retry that finds the file already linked (by an attempt
+// whose directory sync failed) syncs the directory before it reports absent.
+func TestWriteIfAbsentExistingFileSyncsTheDirectory(t *testing.T) {
+	b := newDurableBackend(t)
+	full := filepath.Join(b.basePath, durableKey)
+	if err := b.ensureDir(filepath.Dir(full)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := recordSyncs(t, nil, nil)
+	r.final = full
+	ok, err := b.WriteIfAbsent(context.Background(), durableKey, []byte("data"))
+	if err != nil || ok {
+		t.Fatalf("WriteIfAbsent = %v, %v; want false, nil", ok, err)
+	}
+	if _, synced := r.finalExistedAtDirSync[filepath.Dir(full)]; !synced {
+		t.Fatal("the directory was not synced on the existing-file path")
 	}
 }

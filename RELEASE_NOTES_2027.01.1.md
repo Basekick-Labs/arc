@@ -74,6 +74,62 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: local storage fsyncs what it writes, so a power loss cannot take acknowledged rows ([#1618](https://github.com/Basekick-Labs/arc/issues/1618))
+
+The local storage backend renamed each written file into place without
+fsyncing it or its directory. With the WAL on, a flush checkpoints the WAL
+as soon as the file is written, and recovery skips checkpointed entries. A
+power loss or kernel crash before the kernel wrote the file back therefore
+lost rows that had been acknowledged as `durable`. A process crash (`kill -9`)
+was never affected, because the page cache survives it. Compaction and the
+DELETE rewrite had the same gap: both remove their source files once the new
+file is written, so a power loss could leave neither.
+
+Every write to local storage now fsyncs the file before it gets its final
+name, and fsyncs the directory after. This covers ingest flushes, compaction
+output, the DELETE rewrite, tiering's cold-to-hot copies, cluster peer
+fetches, backup and restore, and Iceberg metadata. New partition directories
+are synced into their parents. Object storage (S3, Azure, GCS) is unchanged:
+an object is durable once its upload returns.
+
+Behaviour on failure:
+
+- **A failed file fsync fails the write.** Nothing is published. A
+  `.part` staging file is removed rather than resumed, because after a failed
+  fsync its bytes cannot be trusted.
+- **A failed directory fsync after the rename also fails the write**, and
+  the file stays in place: its bytes are already on disk, only its name could
+  be lost. With the WAL on, the flush's rows replay, so they can be read twice
+  until compaction removes the duplicates. A duplicate, never a loss.
+- **The exception is a copy into a new key** (compaction output, tiering and
+  peer copies). The copied file is removed, because the caller still has the
+  source and retries.
+- **Directory fsync refused outright.** Volumes that refuse directory fsync
+  (`EINVAL`, `ENOTSUP` or `ENOSYS`, e.g. some FUSE and CIFS mounts) are
+  accepted, with one warning.
+
+**Cost.** Each flushed file costs two more fsyncs on the flush worker. On
+Linux the cost is unmeasured so far. Measured on an M3 Max, where Go's
+`File.Sync` is `F_FULLFSYNC` (the worst case), with the sustained MessagePack
+bench (`arc.toml`, 12 workers, alternating runs):
+
+| Configuration | Before | After |
+|---|---|---|
+| WAL off | 34.3M rec/s | 34.0M rec/s (noise) |
+| WAL on, `ack_mode = "queued"` | 32.0M rec/s | 32.0M rec/s (noise) |
+| WAL on, `ack_mode = "durable"` | 1.22M rec/s | 0.90M rec/s (−26%) |
+
+The cost scales with files written per second, not rows.
+
+- **Many measurements flushed by age.** Small buffers flushed often pay the
+  most. With 1,000 measurements each receiving one row a second, the aged
+  sweep (every 5 s, one buffer after another) took about 30 s to flush them
+  all on macOS instead of about 2 s. Buffers wait longer and files get larger.
+  Ingest requests were not slowed (p50 about 20 ms either way), and no rows
+  were lost.
+- **Restore and tiering.** Copies of many files (backup restore, tiering
+  cold-to-hot) are slower by two fsyncs per file.
+
 ## Fix: an MQTT start or restart that cannot connect to the broker answers 502 with the reason ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
 
 `POST /api/v1/mqtt/subscriptions/{id}/start` and `.../restart` answered 500

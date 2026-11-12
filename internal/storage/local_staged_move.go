@@ -111,6 +111,7 @@ func (b *LocalBackend) RemoveAll(ctx context.Context, key string) error {
 			delete(b.dirCache, d)
 		}
 	}
+	b.dirGen++
 	b.dirMu.Unlock()
 	return nil
 }

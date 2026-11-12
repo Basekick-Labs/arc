@@ -20,12 +20,24 @@ import (
 // Every publishing write therefore fsyncs the file before it is renamed or
 // linked to its final name, and fsyncs the directory after, so both the bytes
 // and the name are on disk when the call returns. Directories created for a
-// write are synced into their parents (ensureDir). A write that cannot make
-// its result durable reports an error and leaves nothing published at the
-// final name (unpublish), because every caller reads an error as "nothing was
-// written": compaction drops its manifest and keeps the sources, ingest keeps
-// the rows in the WAL and replays them. A file left in place would be read
-// twice next to its replacement.
+// write are synced into their parents (ensureDir).
+//
+// When the directory fsync fails after the rename, the bytes are durable and
+// only the name is in doubt, and what to do with the file depends on whether
+// the caller still holds another copy:
+//
+//   - Write keeps it and returns the error (notDurable). Its callers include
+//     the ingest flush with the WAL off, where the file is the only copy of
+//     the rows, and writers that overwrite a fixed key (Iceberg's
+//     version-hint, schema anchors, backup indexes), where deleting it would
+//     delete the previous version too. With the WAL on, the flush then
+//     replays the rows, so they are read twice until compaction dedups them:
+//     a duplicate, never a loss.
+//   - WriteReader, AppendReader and AdoptFile remove it when the key did not
+//     exist before the rename (unpublish). Their callers keep the source
+//     (compaction inputs, the cold copy, a peer, a backup) and retry, and a
+//     file left in place would be read beside the inputs it replaces. A key
+//     that existed is kept, for the same reason as Write.
 
 // syncFileFn fsyncs an open file. A variable so tests can order and fail it.
 var syncFileFn = func(f *os.File) error { return f.Sync() }
@@ -86,15 +98,33 @@ func syncFileAt(path string) error {
 	return err
 }
 
+// notDurable reports a file left in place whose directory entry could not be
+// made durable.
+func (b *LocalBackend) notDurable(fullPath string, cause error) {
+	b.logger.Error().Err(cause).Str("path", fullPath).
+		Msg("Wrote a file but could not sync its directory: the file is in place and its bytes are on disk, but a power loss could lose its name")
+}
+
 // unpublish removes a file that was renamed into place but could not be made
-// durable, so the failed write leaves nothing behind for readers to see beside
-// whatever the caller writes on retry. Best effort: the error being returned
-// is the directory sync's, and a removal that also fails is logged.
-func (b *LocalBackend) unpublish(fullPath string, cause error) {
+// durable, unless existed says the key held a file before the rename: that
+// one is kept (notDurable), because removing it would also remove the
+// version it replaced. Best effort: the error being returned is the
+// directory sync's, and a removal that also fails is logged.
+func (b *LocalBackend) unpublish(fullPath string, existed bool, cause error) {
+	if existed {
+		b.notDurable(fullPath, cause)
+		return
+	}
 	if err := os.Remove(fullPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		b.logger.Error().Err(err).AnErr("cause", cause).Str("path", fullPath).
 			Msg("Could not remove a file whose write failed to become durable; it stays visible to queries")
 	}
+}
+
+// keyExists reports whether something is at fullPath, for unpublish.
+func keyExists(fullPath string) bool {
+	_, err := os.Lstat(fullPath)
+	return err == nil
 }
 
 // ensureDir creates dir (and any missing parent below the storage root) and
@@ -129,6 +159,9 @@ func (b *LocalBackend) ensureDir(dir string) error {
 // already exists still has its parent synced: it may have been created by
 // another process, or by this one before a restart, without that sync.
 func (b *LocalBackend) createDurable(dir string) error {
+	b.dirMu.RLock()
+	gen := b.dirGen
+	b.dirMu.RUnlock()
 	root := b.basePath
 	var chain []string // deepest first
 	for d := dir; len(d) > len(root) && !b.dirCached(d); d = filepath.Dir(d) {
@@ -149,6 +182,13 @@ func (b *LocalBackend) createDurable(dir string) error {
 		}
 	}
 	b.dirMu.Lock()
+	defer b.dirMu.Unlock()
+	if b.dirGen != gen {
+		// A removal ran while this chain was created outside the lock, and
+		// may have taken part of it. Caching it now could vouch for a
+		// directory that is gone; the next write re-checks instead.
+		return nil
+	}
 	for _, d := range chain {
 		if len(b.dirCache) >= maxDirCacheEntries {
 			for cachedDir := range b.dirCache {
@@ -158,7 +198,6 @@ func (b *LocalBackend) createDurable(dir string) error {
 		}
 		b.dirCache[d] = true
 	}
-	b.dirMu.Unlock()
 	return nil
 }
 
@@ -176,5 +215,6 @@ func (b *LocalBackend) forgetDir(dir string) {
 	for d := dir; len(d) > len(root); d = filepath.Dir(d) {
 		delete(b.dirCache, d)
 	}
+	b.dirGen++
 	b.dirMu.Unlock()
 }

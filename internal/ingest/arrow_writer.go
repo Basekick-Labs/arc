@@ -5028,8 +5028,9 @@ func (b *ArrowBuffer) completeFlush(walHashes []string, group *flushGroup) {
 // syncRegistrations makes the registrations appended so far durable, before
 // the checkpoint that stops their rows replaying (#1209). Without a WAL there
 // is no checkpoint to order the sync before, and the unsynced append already
-// survives a process crash; skipping it keeps serial flushes (Close, the aged
-// sweep) from paying a fsync each.
+// survives a process crash; skipping it saves serial flushes (Close, the aged
+// sweep) one more fsync each, on top of the file and directory fsyncs the
+// local backend's Write already pays (#1618).
 func (b *ArrowBuffer) syncRegistrations() {
 	ref := b.fileRegistrar.Load()
 	if ref == nil || b.wal == nil {
