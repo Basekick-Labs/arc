@@ -54,10 +54,10 @@ On an edge-sync hub, `DELETE` with a `WHERE` clause on a spoke's data either rew
 
 The hub now updates the receipt before it changes the file:
 
-- After a rewrite, the original is recorded as merged into the new file.
-- After a full removal, it is recorded as removed (reason `row_delete`).
+- For a rewrite, the original is recorded as merged into the new file.
+- For a full removal, it is recorded as removed (reason `row_delete`).
 
-Either way the spoke does not send the original again. This also covers cold-tier files whose rows all match.
+Either way the spoke does not send the original again. This also covers cold-tier files whose rows all match. If the receipt cannot be updated, the file is left unchanged and listed under `failed_files`.
 
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 

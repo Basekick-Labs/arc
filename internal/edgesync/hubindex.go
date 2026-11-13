@@ -232,11 +232,18 @@ func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (
 // receipt was not received from this spoke and gets no bookkeeping. Chunked
 // like Lookup.
 //
-// Reached from two places, both through cmd/arc's receipt marker, and both
-// preserve the content: compaction's consumed inputs and tiering's hot-file
-// removals (migration, #687). Content removed on purpose is MarkRemoved
+// Reached from three places, all through cmd/arc's receipt marker, and all
+// preserve the content: compaction's consumed inputs, tiering's hot-file
+// removals (migration, #687), and a row-level DELETE's partial rewrite (#1666). Content removed on purpose is MarkRemoved
 // (#1186); see Forget for the contract.
 func (h *HubIndex) MarkCompacted(ctx context.Context, spokeID string, sourcePaths []string) error {
+	if len(sourcePaths) > 0 {
+		// A DELETE rewrites ordinary databases' files on a hub too; only a
+		// spoke namespace holds receipts.
+		if has, err := h.hasReceipts(ctx, spokeID); err != nil || !has {
+			return err
+		}
+	}
 	if len(sourcePaths) == 0 {
 		return nil
 	}

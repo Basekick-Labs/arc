@@ -329,11 +329,19 @@ func (h *DeleteHandler) SetReceiptMarkers(removed func(ctx context.Context, path
 // vouched receipt over a file that still exists, which reconcile and receive
 // treat as present either way. Marking after the rewrite instead left a window
 // in which the leftover sweep removes the old file unmarked.
+// receiptMarkTimeout bounds one receipt mark, as cmd/arc's compacted marker
+// bounds its own.
+const receiptMarkTimeout = 60 * time.Second
+
 func (h *DeleteHandler) markReceipt(ctx context.Context, relativePath string, whole bool) error {
 	var err error
 	switch {
 	case whole && h.receiptRemoved != nil:
-		err = h.receiptRemoved(context.WithoutCancel(ctx), []string{relativePath})
+		// Not cut short by a client disconnect, but bounded: it runs under
+		// rewriteMu. A mark cut off part way is harmless (see above).
+		mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), receiptMarkTimeout)
+		err = h.receiptRemoved(mctx, []string{relativePath})
+		cancel()
 	case !whole && h.receiptRewritten != nil:
 		err = h.receiptRewritten([]string{relativePath})
 	}

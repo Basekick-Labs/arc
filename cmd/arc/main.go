@@ -3261,7 +3261,7 @@ func main() {
 			for ns, paths := range byNamespace {
 				if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
 					markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
-						Msg("Could not mark consumed receipts; the caller retries or aborts")
+						Msg("Could not mark receipts compacted; the caller retries, aborts or reports the file failed")
 					if firstErr == nil {
 						firstErr = err
 					}
@@ -5922,14 +5922,6 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	return db, true, nil
 }
 
-// receivedNamespaces returns a Discoverer namespace excluder backed by the
-// hub's spoke registry: on a dual-role (hub+spoke) node, top-level segments
-// matching registered spoke IDs are OTHER edges' data held here as a hub,
-// and this node's own sync must not forward them upstream (an undocumented,
-// unbounded relay otherwise — 2026-08-19 audit M2). A namespace left behind
-// by a DELETED registration is not excluded; deleting a registration keeps
-// the files deliberately, so document that dual-role operators should keep
-// registrations for as long as the data sits in storage.
 // hubRemovalMarkerFor returns a marker that records hub-side removal of
 // spoke files with the given reason (#1186, #1666): paths are storage paths,
 // "{spoke}/{source path}", grouped by namespace. A path outside any spoke
@@ -5953,6 +5945,14 @@ func hubRemovalMarkerFor(idx *edgesync.HubIndex, reason string) func(ctx context
 	}
 }
 
+// receivedNamespaces returns a Discoverer namespace excluder backed by the
+// hub's spoke registry: on a dual-role (hub+spoke) node, top-level segments
+// matching registered spoke IDs are OTHER edges' data held here as a hub,
+// and this node's own sync must not forward them upstream (an undocumented,
+// unbounded relay otherwise — 2026-08-19 audit M2). A namespace left behind
+// by a DELETED registration is not excluded; deleting a registration keeps
+// the files deliberately, so document that dual-role operators should keep
+// registrations for as long as the data sits in storage.
 func receivedNamespaces(registry *edgesync.Registry) func(ctx context.Context) (map[string]struct{}, error) {
 	return func(ctx context.Context) (map[string]struct{}, error) {
 		spokes, err := registry.List(ctx)
