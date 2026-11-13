@@ -990,8 +990,8 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefInfo,
 		}
 		// res-3b: an aggregate not in the select list is a HIDDEN item — the engine
 		// computes it, filters on it and projects it away. It was parsed by the
-		// select list's own item parsers above (so it is a routable item), and the
-		// bucket-gated families are recorded for matchGroupedAgg's tag-key gate.
+		// select list's own item parsers above (so it is a routable item), and a name
+		// in tagGatedFns is recorded for matchGroupedAgg's tag-key refusal.
 		found := false
 		for _, h := range st.hidden {
 			if h == itemText {

@@ -70,3 +70,26 @@ func TestTagKeyedStillDeclines(t *testing.T) {
 		}
 	}
 }
+
+// The per-name lever still works: a name put back into tagGatedFns refuses its
+// tag-keyed form as a select item and as a hidden HAVING item, and only there.
+func TestTagGatedFnsLever(t *testing.T) {
+	tagGatedFns["stddev"] = true
+	t.Cleanup(func() { delete(tagGatedFns, "stddev") })
+	for _, sql := range []string{
+		"SELECT host, stddev(v) FROM cpu GROUP BY host",
+		"SELECT host, count(*) FROM cpu GROUP BY host HAVING stddev(x) > 1",
+	} {
+		if m, ok := eligibleShape(sql); ok {
+			t.Fatalf("lever should refuse (%s): %s", m.shape, sql)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT date_trunc('hour', time), stddev(v) FROM cpu GROUP BY 1",
+		"SELECT host, var_pop(v) FROM cpu GROUP BY host",
+	} {
+		if _, ok := eligibleShape(sql); !ok {
+			t.Fatalf("lever should not refuse: %s", sql)
+		}
+	}
+}

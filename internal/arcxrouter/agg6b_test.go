@@ -1,7 +1,6 @@
 // agg-6b companion: the fn(y, x) covariance / correlation / regression family
 // routes ungrouped and under either key kind (tag keys since C2 — tag_keyed_test.go).
-// Pure tokenizer
-// tests — no engine, no cgo.
+// Pure tokenizer tests — no engine, no cgo.
 
 package arcxrouter
 

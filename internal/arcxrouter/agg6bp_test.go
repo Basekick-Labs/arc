@@ -1,6 +1,6 @@
 // agg-6b' companion: the Kahan sums, bitwise, and Boolean-column bool_and /
 // bool_or / count_if route ungrouped and under either key kind (tag keys since C2);
-// product, predicate arguments and Boolean aggregates in HAVING decline.
+// `product` and the HAVING forms the agg6bp tests list still decline.
 
 package arcxrouter
 

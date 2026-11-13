@@ -1663,15 +1663,11 @@ var quantileAggFns = map[string]bool{
 }
 
 // tagGatedFns: aggregates whose tag-keyed grouped form is refused (sent to DuckDB),
-// read for select items and hidden HAVING items alike. EMPTY since C2 (arcX
-// docs/2026-11-13-c2-tag-keyed-families.md): agg-6a gated the moment, shape, binary,
-// numeric, predicate-argument and order-statistic families here after `host,
-// stddev` measured 2.7× behind on production `cpu`; gp-1 removed that loss, and on
-// chain-hostile layouts (round-robin, 5-row bursts, 2 hosts alternating) each
-// family's cost over `host, count(*)` now matches DuckDB's — what remains is the
-// string-key path routed `avg` pays too. A name whose measured tag-keyed loss
-// exceeds routed `avg`'s goes back in by name. Grouped `mode` is refused
-// separately (unaryAggFns), for a different reason.
+// read for select items and hidden HAVING items alike. EMPTY since C2: the agg-6a
+// per-row-chain loss that filled it is gone (measurements: arcX
+// docs/2026-11-13-c2-tag-keyed-families.md). A name goes back in only if its
+// tag-keyed form measures a loss of its own beyond the routed `avg` reference.
+// Grouped `mode` is refused separately (unaryAggFns).
 var tagGatedFns = map[string]bool{}
 
 // binaryMomentFns: the agg-6b two-argument family, `fn(y, x)` over two bare
