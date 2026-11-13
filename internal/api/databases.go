@@ -309,8 +309,6 @@ func (h *DatabasesHandler) storageContext(c *fiber.Ctx, timeout time.Duration) (
 	return context.WithTimeout(c.Context(), timeout)
 }
 
-// SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
-// This is called after initialization when tiering is enabled and licensed.
 // SetOnSpokeNamespaceRemoved wires the edge-sync hub's receipt marking into
 // database delete (#1186). It runs before anything is removed, whether or not
 // tiering is wired, so a confirmed delete of a spoke namespace sticks: the
@@ -321,6 +319,8 @@ func (h *DatabasesHandler) SetOnSpokeNamespaceRemoved(fn func(ctx context.Contex
 	h.onSpokeNamespaceRemoved = fn
 }
 
+// SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
+// This is called after initialization when tiering is enabled and licensed.
 func (h *DatabasesHandler) SetTieringManager(tm databaseTieringManager) {
 	h.tieringManager = tm
 }

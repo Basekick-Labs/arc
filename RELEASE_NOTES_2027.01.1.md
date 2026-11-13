@@ -44,7 +44,7 @@ POST /api/v1/sync-spokes/{spoke_id}/forget
 {"database": "<the spoke's database>"}
 ```
 
-This is admin-only. The hub forgets the removed receipts under that database, and the spoke sends those files again at its next reconcile. Receipts for content the hub still holds, inside a compacted file, are kept. The call is refused with 409 while files remain under `{spoke}/{database}/`, because sending the originals back next to those files would duplicate rows.
+This is admin-only. The hub forgets the removed receipts under that database, and the spoke sends those files again at its next reconcile. Receipts for content the hub still holds, inside a compacted file, are kept. The call is refused with 409 while files remain under `{spoke}/{database}/` in hot or cold storage, because sending the originals back next to those files would duplicate rows. In practice that makes it the recovery from a whole-database delete. After retention it is refused for as long as newer files remain under the database.
 
 Known limits:
 

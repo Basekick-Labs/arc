@@ -271,6 +271,20 @@ const (
 	RemovedByRetention      = "retention"
 )
 
+// hasReceipts reports whether the spoke has any receipt, from the
+// UNIQUE(spoke_id, source_path) index.
+func (h *HubIndex) hasReceipts(ctx context.Context, spokeID string) (bool, error) {
+	var one int
+	err := h.db.QueryRowContext(ctx, `SELECT 1 FROM sync_received WHERE spoke_id = ? LIMIT 1`, spokeID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("edgesync: probe receipts of %q: %w", spokeID, err)
+	}
+	return true, nil
+}
+
 // removalChunk bounds one UPDATE or DELETE on the SQLite handle shared with
 // ingest file registration, auth and audit (SQLite checklist: <= 1000 rows).
 const removalChunk = 900
@@ -291,6 +305,11 @@ const removalChunk = 900
 func (h *HubIndex) MarkRemoved(ctx context.Context, spokeID string, sourcePaths []string, reason string) error {
 	if len(sourcePaths) == 0 {
 		return nil
+	}
+	// One indexed probe first: on a hub, retention and deletes reach every
+	// database, and only spoke namespaces hold receipts.
+	if has, err := h.hasReceipts(ctx, spokeID); err != nil || !has {
+		return err
 	}
 	held, err := h.Lookup(ctx, spokeID, sourcePaths)
 	if err != nil {
@@ -342,7 +361,7 @@ func (h *HubIndex) MarkRemoved(ctx context.Context, spokeID string, sourcePaths 
 
 // MarkSpokeRemoved marks every receipt of a spoke removed: a confirmed delete
 // of the spoke's whole namespace on the hub (a database delete takes one path
-// segment, which for a spoke namespace is the spoke). Batched, ordered by id,
+// segment, which for a spoke namespace is the spoke). Batched, ordered by source_path (the UNIQUE index),
 // so a spoke with millions of receipts does not hold the shared writer.
 func (h *HubIndex) MarkSpokeRemoved(ctx context.Context, spokeID, reason string) error {
 	now := time.Now().UTC()
@@ -352,13 +371,17 @@ func (h *HubIndex) MarkSpokeRemoved(ctx context.Context, spokeID, reason string)
 		}
 		res, err := h.db.ExecContext(ctx,
 			`UPDATE sync_received SET removed_at = ?, removed_reason = ?
-			 WHERE id IN (SELECT id FROM sync_received WHERE spoke_id = ? AND removed_at IS NULL ORDER BY id LIMIT ?)`,
+			 WHERE id IN (SELECT id FROM sync_received WHERE spoke_id = ? AND removed_at IS NULL ORDER BY source_path LIMIT ?)`,
 			now, reason, spokeID, removalChunk)
 		if err != nil {
 			return fmt.Errorf("edgesync: mark spoke %q removed: %w", spokeID, err)
 		}
-		if n, err := res.RowsAffected(); err != nil || n < removalChunk {
+		n, err := res.RowsAffected()
+		if err != nil {
 			return err
+		}
+		if n < removalChunk {
+			return nil
 		}
 	}
 }
@@ -369,7 +392,7 @@ func (h *HubIndex) MarkSpokeRemoved(ctx context.Context, spokeID, reason string)
 // backup-free recovery from a delete (#1186). Receipts that are only
 // compacted are kept: their content still exists on the hub, and forgetting
 // them would re-accept duplicates next to the compacted output (#611).
-// Batched, ordered by id. Returns how many receipts were forgotten.
+// Batched, ordered by source_path (the UNIQUE index). Returns how many receipts were forgotten.
 func (h *HubIndex) ForgetRemoved(ctx context.Context, spokeID, database string) (int64, error) {
 	lower := database + "/"
 	upper := database + "0"
@@ -382,7 +405,7 @@ func (h *HubIndex) ForgetRemoved(ctx context.Context, spokeID, database string) 
 			`DELETE FROM sync_received WHERE id IN (
 			   SELECT id FROM sync_received
 			   WHERE spoke_id = ? AND source_path >= ? AND source_path < ? AND removed_at IS NOT NULL
-			   ORDER BY id LIMIT ?)`,
+			   ORDER BY source_path LIMIT ?)`,
 			spokeID, lower, upper, removalChunk)
 		if err != nil {
 			return total, fmt.Errorf("edgesync: forget removed receipts of %s/%s: %w", spokeID, database, err)
@@ -415,6 +438,11 @@ func (h *HubIndex) ForgetRemoved(ctx context.Context, spokeID, database string) 
 //     cold, in every configuration. Reconcile keeps answering "present", so
 //     the delete sticks; the explicit recovery is ForgetRemoved, behind
 //     POST /api/v1/sync-spokes/:spokeID/forget.
+//
+// A narrow race remains: a receive that looked its receipt up before a
+// database delete marked the spoke, and records after it, leaves an unmarked
+// receipt over a deleted file, which reconcile then forgets. The spoke
+// re-sends that one file. Re-running the delete removes it again.
 //
 // Known gaps, tracked: the row-level delete API rewrites or removes spoke
 // files without any mark (#1666), and on a cluster hub the removal marks run

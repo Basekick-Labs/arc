@@ -179,3 +179,50 @@ func TestEdgeSyncForget_RequiresAdmin(t *testing.T) {
 		t.Fatalf("status %d without a token, want 401/403", resp.StatusCode)
 	}
 }
+
+// The guard sees the cold tier too: a hot prefix that is empty while a cold
+// copy of the namespace survives (a delete whose cold cleanup failed part way)
+// is refused, since the spoke's re-sent files would sit next to that copy.
+func TestEdgeSyncForget_RefusedWhileColdTierHoldsFiles(t *testing.T) {
+	r := newForgetRig(t, false)
+	dir := t.TempDir()
+	cold, err := storage.NewLocalBackend(filepath.Join(dir, "cold"), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	reg, err := edgesync.NewRegistry(db, newAdminTestCipher(t), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewEdgeSyncAdminHandler(reg, nil, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetReceiptRecovery(r.idx, r.backend)
+	h.SetColdStorage(func() storage.Backend { return cold })
+	r.app = fiber.New(fiber.Config{DisableStartupMessage: true})
+	h.RegisterRoutes(r.app)
+
+	ctx := context.Background()
+	r.record(t, "rocket01", "telemetry/cpu/a.parquet")
+	if err := r.idx.MarkSpokeRemoved(ctx, "rocket01", edgesync.RemovedByOperatorDelete); err != nil {
+		t.Fatal(err)
+	}
+	if err := cold.Write(ctx, "rocket01/telemetry/cpu/2026/01/01/00/compacted.parquet", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := r.forget(t, "rocket01", map[string]string{"database": "telemetry"}); code != fiber.StatusConflict {
+		t.Fatalf("status %d with a cold copy present, want 409", code)
+	}
+	if err := cold.Delete(ctx, "rocket01/telemetry/cpu/2026/01/01/00/compacted.parquet"); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := r.forget(t, "rocket01", map[string]string{"database": "telemetry"}); code != fiber.StatusOK || body["forgotten"] != float64(1) {
+		t.Fatalf("status %d body %v, want 200 forgotten=1 once cold is empty", code, body)
+	}
+}

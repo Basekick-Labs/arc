@@ -3136,6 +3136,10 @@ func main() {
 	var (
 		hubNamespaceRemover func(ctx context.Context, name string) error
 		hubRemovalMarker    func(ctx context.Context, paths []string) error
+		// hubColdTier is the tiering manager once it is wired below, so the
+		// forget route's guard can see the cold tier (#1186). Atomic: the
+		// route can be called once the server is up, before or after that.
+		hubColdTier atomic.Pointer[tiering.Manager]
 	)
 	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
@@ -3323,6 +3327,12 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync admin handler; refusing to start")
 		}
 		syncAdminHandler.SetReceiptRecovery(hubIndex, storageBackend)
+		syncAdminHandler.SetColdStorage(func() storage.Backend {
+			if tm := hubColdTier.Load(); tm != nil {
+				return tm.ColdBackend()
+			}
+			return nil
+		})
 		syncAdminHandler.RegisterRoutes(server.GetApp())
 
 		// The spoke-facing receive endpoints mount ONLY for a network hub. An
@@ -5286,6 +5296,7 @@ func main() {
 		// Wiring this also lifts the migrator's spoke-namespace gate.
 		if hubReceiptMarker != nil {
 			tieringManager.SetOnHotFilesRemoved(hubReceiptMarker)
+			hubColdTier.Store(tieringManager)
 			log.Info().Msg("Tiering hot-file removals wired to edge-sync receipt marking; spoke cold migration enabled")
 		}
 		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")

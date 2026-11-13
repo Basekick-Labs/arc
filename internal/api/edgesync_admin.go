@@ -32,6 +32,9 @@ type EdgeSyncAdminHandler struct {
 	// that never wired them, where the route answers 503.
 	receipts receiptForgetter
 	storage  storage.Backend
+	// coldStorage returns this node's cold tier, or nil when it has none. A
+	// function because tiering is wired after this handler is built.
+	coldStorage func() storage.Backend
 }
 
 // receiptForgetter is the part of edgesync.HubIndex the forget route uses.
@@ -46,6 +49,14 @@ func (h *EdgeSyncAdminHandler) SetReceiptRecovery(receipts receiptForgetter, bac
 		return
 	}
 	h.receipts, h.storage = receipts, backend
+}
+
+// SetColdStorage lets the forget route's guard see the cold tier too: after
+// a delete whose cold cleanup failed part way, or a hot retention pass over a
+// compacted output whose sibling output has migrated, the hot prefix is empty
+// while content of the removed receipts survives in cold.
+func (h *EdgeSyncAdminHandler) SetColdStorage(fn func() storage.Backend) {
+	h.coldStorage = fn
 }
 
 // NewEdgeSyncAdminHandler validates configuration and returns a ready handler.
@@ -272,14 +283,16 @@ type forgetReceiptsRequest struct {
 // those files missing and the spoke re-sends them. Receipts that are only
 // compacted are kept (their content is still on the hub).
 //
-// Refused with 409 while the namespace still holds files: removal marks are
-// written before the files are deleted, so a delete that failed part way can
-// leave removed receipts next to a compacted output that holds their content,
-// and re-accepting the raw files there would duplicate rows (#611).
+// Refused with 409 while the namespace still holds files, hot or cold:
+// removal marks are written before the files are deleted, so a delete that
+// failed part way can leave removed receipts next to a compacted output that
+// holds their content, and re-accepting the raw files there would duplicate
+// rows (#611). In practice it is the recovery from a whole-database delete;
+// after retention it is refused while newer files remain under the database.
 func (h *EdgeSyncAdminHandler) forget(c *fiber.Ctx) error {
 	if h.receipts == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": "receipt recovery is not available on this node (edge sync receive is not enabled)",
+			"error": "receipt recovery is not available on this node (no edge-sync hub index)",
 		})
 	}
 	spokeID := c.Params("spokeID")
@@ -298,7 +311,12 @@ func (h *EdgeSyncAdminHandler) forget(c *fiber.Ctx) error {
 	defer cancel()
 
 	prefix := spokeID + "/" + req.Database + "/"
-	present, err := h.namespaceHasFiles(ctx, prefix)
+	present, err := namespaceHasFiles(ctx, h.storage, prefix)
+	if err == nil && !present && h.coldStorage != nil {
+		if cold := h.coldStorage(); cold != nil {
+			present, err = namespaceHasFiles(ctx, cold, prefix)
+		}
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Str("spoke_id", spokeID).Str("database", req.Database).Msg("Could not check the namespace before forgetting receipts")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not check the namespace"})
@@ -321,16 +339,16 @@ func (h *EdgeSyncAdminHandler) forget(c *fiber.Ctx) error {
 
 // namespaceHasFiles answers whether any object sits under prefix, with the
 // bounded probe when the backend has one.
-func (h *EdgeSyncAdminHandler) namespaceHasFiles(ctx context.Context, prefix string) (bool, error) {
+func namespaceHasFiles(ctx context.Context, backend storage.Backend, prefix string) (bool, error) {
 	var (
 		found bool
 		err   error
 	)
-	if p, ok := h.storage.(storage.PrefixProber); ok {
+	if p, ok := backend.(storage.PrefixProber); ok {
 		found, err = p.HasObjectsUnderPrefix(ctx, prefix)
 	} else {
 		var keys []string
-		keys, err = h.storage.List(ctx, prefix)
+		keys, err = backend.List(ctx, prefix)
 		found = len(keys) > 0
 	}
 	if storage.IsStoreNotFound(err) {
