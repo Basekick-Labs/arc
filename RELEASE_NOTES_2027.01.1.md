@@ -2,6 +2,40 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a backfill flush is no longer cut off at 30 seconds in total ([#1692](https://github.com/Basekick-Labs/arc/issues/1692))
+
+`ingest.flush_timeout_seconds` (default 30) is documented as the timeout for
+storage writes during a flush, but it bounded the **whole** flush. A write whose
+rows span many hours flushes as one Parquet file per hour, uploaded one after
+another, so a backfill hit the deadline part-way however healthy each upload
+was. Measured on S3 in the same region (~25 ms per file), any single write
+spanning more than about 1,100 hours failed; over a slower link far fewer. With
+the WAL off the rows not yet uploaded were lost after the write had been
+acknowledged; with the WAL on they were kept but replayed only at the next
+restart.
+
+The timeout now applies to **each hour file** of a flush, and covers
+everything done for that file: the Parquet encode, the storage write, the
+field-schema registration (which reads and writes storage), the tiering and
+cluster-manifest registration, and the WAL row checkpoint. A single-hour
+flush, which is every flush in live ingest, is bounded exactly as before. A
+flush of N hour files can take up to N × the timeout and has no cap on N.
+
+- One stuck upload is still cut off at the timeout, as before.
+- At shutdown, Arc stops a flush between hour files once its shutdown budget
+  runs out (it already cancelled uploads in progress then); previously a flush
+  on local storage kept writing its remaining files.
+- What can now take longer than ~30 s during a large backfill, bounded by the
+  timeout per hour file: a write request that triggers a schema-change flush,
+  the age-based flush sweep, import and flush-all calls. The WAL-recovery
+  barrier still waits at most one timeout for an in-flight flush; during a long
+  backfill it gives up and keeps its WAL files, and a later pass completes.
+- The config comment said `0 = no timeout`; a value of 0 or less has always
+  meant 30 s. The comment now says so.
+
+No configuration change. Throughput of live ingest is unchanged: one extra
+context per flush, not per row.
+
 ## Fix: `cluster.seeds` written as a TOML array is read ([#1675](https://github.com/Basekick-Labs/arc/issues/1675))
 
 `seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]` in `arc.toml` now gives the node those seeds. Before, Arc read the TOML array as no seeds at all and gave no warning. The node started with `seed_count: 0`, logged `no known peers, aborting election`, and never joined. Only the comma-separated string worked. An array element that contains commas is split into one seed per address.

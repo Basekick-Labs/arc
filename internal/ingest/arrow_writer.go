@@ -1175,8 +1175,9 @@ type bufferShard struct {
 	//
 	// It is deliberately PER SHARD rather than the global b.closing flag.
 	// b.closing is set as Close()'s first statement, but the shard loop does
-	// not start until after b.cancel() and b.wg.Wait() — a full flushTimeout
-	// later in the worst case. Refusing on the global flag would reject every
+	// not start until after b.cancel() and b.wg.Wait() — up to half the close
+	// budget later in the worst case (a flush is no longer capped at one
+	// flushTimeout, #1692; Close cancels flushParent at that point). Refusing on the global flag would reject every
 	// write in that window, including replicated entries that have no WAL
 	// copy of their own (WriteColumnarDirectNoWAL passes skipWAL), where today
 	// Close() flushes them successfully.
@@ -1446,7 +1447,9 @@ type ArrowBuffer struct {
 	decimalConfig        map[string]map[string]config.DecimalSpec // measurement -> column -> spec
 	defaultDecimalConfig map[string]config.DecimalSpec            // default decimal columns
 
-	// Flush timeout for storage writes (prevents workers from blocking forever on S3 hangs)
+	// Flush timeout per file of a flush: its write, registrations and WAL
+	// checkpoint (fileContext; prevents workers from blocking forever on S3
+	// hangs). Not a bound on the whole flush (#1692).
 	flushTimeout time.Duration
 	maxBufferAge time.Duration // pre-calculated from cfg.MaxBufferAgeMS
 
@@ -1933,29 +1936,53 @@ func (b *ArrowBuffer) currentBufferedRecords() int64 {
 	return total
 }
 
-// newFlushContext returns the context every flush I/O must use: derived from
+// newFlushContext returns the context a flush runs under: derived from
 // flushParent, so neither Close()'s b.cancel() nor a client disconnect can
-// abort a write whose records are already out of the buffer, and bounded by
-// flushTimeout.
+// abort a write whose records are already out of the buffer.
+//
+// It carries no deadline of its own (#1692). flushTimeout bounds each FILE of
+// the flush instead (fileContext): a multi-hour flush writes one file per hour,
+// one after another, and a single deadline over all of them failed any flush
+// of more than ~1,100 hours at ~25 ms per same-region S3 PUT, however healthy
+// each write was. The flush as a whole is bounded by Close(), which cancels
+// flushParent when its own budget runs out, and flushPartitionedData stops
+// between hour files once that happens.
 //
 // The nil guard covers tests that hand-build &ArrowBuffer{} without calling
-// NewArrowBuffer: context.WithTimeout(nil, d) panics, and none of those tests
-// should have to know that a flush needs a parent.
-//
-// NOTE on what the timeout actually bounds: it is only as effective as the
-// backend. LocalBackend.Write ignores its context entirely, so on the OSS
-// default backend a write in progress runs to completion regardless. The
-// timeout is a real bound for S3 and Azure, whose SDKs are context-aware.
+// NewArrowBuffer, and none of those tests should have to know that a flush
+// needs a parent.
 func (b *ArrowBuffer) newFlushContext() (context.Context, context.CancelFunc) {
 	parent := b.flushParent
 	if parent == nil {
 		parent = context.Background()
 	}
+	return context.WithCancel(parent)
+}
+
+// fileContext bounds the work for one file of a flush by flushTimeout: its
+// Parquet encode, the storage write, the field-schema registration (whose
+// registry reads and writes storage), the tiering/manifest registration and
+// the WAL row checkpoint (#1692). Before #1692 one flushTimeout covered all of
+// that for every file of the flush together; a single-file flush is bounded
+// exactly as before.
+//
+// It derives from the ctx it is given, never from b.flushParent: Close()'s own
+// flushes run on closeFlushContext (WithoutCancel(flushParent) plus the close
+// budget) after flushParent may already be cancelled.
+//
+// NOTE on what the timeout actually bounds: it is only as effective as the
+// backend. LocalBackend.Write ignores its context entirely, so on the OSS
+// default backend a write in progress runs to completion regardless. The
+// timeout is a real bound for S3 and Azure, whose SDKs are context-aware.
+func (b *ArrowBuffer) fileContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	timeout := b.flushTimeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	return context.WithTimeout(parent, timeout)
+	return context.WithTimeout(ctx, timeout)
 }
 
 // SetCloseBudget bounds how long Close() may take in total, including the wait
@@ -4932,9 +4959,9 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				Int64("queue_depth", b.queueDepth.Load()).
 				Msg("Worker processing flush task")
 
-			// Build the timeout HERE, not at enqueue: it must measure the
-			// storage write, not the time this task waited in the queue
-			// (#1006). It derives from flushParent, so Close() cancelling
+			// Build the context HERE, not at enqueue: the per-file timeouts
+			// (fileContext, #1692) must measure the storage work, not the time
+			// this task waited in the queue (#1006). It derives from flushParent, so Close() cancelling
 			// b.ctx does not abort a write already in progress (#1007).
 			flushCtx, flushCancel := b.newFlushContext()
 			func() {
@@ -5153,9 +5180,10 @@ func (b *ArrowBuffer) syncRegistrations() {
 // once the PUT returns, so the checkpoint never outlives the data in a power
 // loss.
 //
-// The wait counts against the flush's context (ingest.flush_timeout_seconds)
-// like the storage writes do: a backfill flush of many hours pays one WAL
-// sync per hour here. Reports whether a checkpoint was written; false with no
+// The wait counts against the hour file's context (fileContext,
+// ingest.flush_timeout_seconds) like its storage write does: a backfill flush
+// of many hours pays one WAL sync per hour here, each within its own file's
+// bound (#1692). Reports whether a checkpoint was written; false with no
 // ids means the file had no rows the map could name (walRowSpans).
 func (b *ArrowBuffer) checkpointRows(ctx context.Context, ids []string) bool {
 	if len(ids) == 0 || b.wal == nil {
@@ -5298,6 +5326,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Single hour - sort once and write one file
 		sorted := b.sortFlushBatch(database, measurement, merged, sortKeys)
 
+		ctx, cancelFile := b.fileContext(ctx) // #1692: one file, one flushTimeout, as before
+		defer cancelFile()
+
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet: %w", err)
@@ -5415,96 +5446,112 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	written := make([]tieringEntry, 0, len(hourBuckets))
 
 	for hourID, bucket := range hourBuckets {
-		// Save count before clearing indices
-		splitRecordCount := len(bucket.indices)
-
-		// Extract rows for this hour using the index list
-		hourBatch := sliceTypedColumnBatchByIndices(merged, bucket.indices)
-
-		// Sort this hour's data by configured sort keys
-		sorted := b.sortFlushBatch(database, measurement, hourBatch, sortKeys)
-
-		// Write Parquet file for this hour
-		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
-		if err != nil {
-			return partial(fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err))
+		// Stop between hour files once the flush is cancelled (Close() cancels
+		// flushParent when its budget runs out): LocalBackend.Write ignores its
+		// context, so without this the loop would keep storing files whose
+		// registration and checkpoint then fail on the cancelled context.
+		if err := ctx.Err(); err != nil {
+			return partial(fmt.Errorf("flush stopped before hour %d: %w", hourID, err))
 		}
+		// Each hour file has its own flushTimeout (#1692).
+		fileCtx, cancelFile := b.fileContext(ctx)
+		err := func(ctx context.Context) error {
+			// Save count before clearing indices
+			splitRecordCount := len(bucket.indices)
 
-		// Use bucket's minTime for path generation (convert hourID to time only here)
-		bucketTime := hourIDToTime(hourID)
-		storagePath := b.generateStoragePath(database, measurement, bucketTime)
+			// Extract rows for this hour using the index list
+			hourBatch := sliceTypedColumnBatchByIndices(merged, bucket.indices)
 
-		// Compute SHA-256 of the Parquet buffer for peer replication checksum.
-		// See the single-hour branch above for rationale.
-		parquetSum := sha256.Sum256(parquetData)
-		parquetSumHex := hex.EncodeToString(parquetSum[:])
+			// Sort this hour's data by configured sort keys
+			sorted := b.sortFlushBatch(database, measurement, hourBatch, sortKeys)
 
-		if perHour {
-			// Only with the row map: the file's own rows are named. Without
-			// it the flush's identities name rows of every hour file, and
-			// adopting one file would skip the others' rows (#1646).
-			b.recordFlushIntent(storagePath, int64(len(parquetData)), spans.rangesIn(bucket.indices))
-		}
-		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			// The write may still land (#1635). With the row map, name this
-			// file's rows; without it the flush's identities cover them.
-			fw := &failedStorageWrite{err: fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err), path: storagePath, size: int64(len(parquetData))}
+			// Write Parquet file for this hour
+			parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
+			if err != nil {
+				return partial(fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err))
+			}
+
+			// Use bucket's minTime for path generation (convert hourID to time only here)
+			bucketTime := hourIDToTime(hourID)
+			storagePath := b.generateStoragePath(database, measurement, bucketTime)
+
+			// Compute SHA-256 of the Parquet buffer for peer replication checksum.
+			// See the single-hour branch above for rationale.
+			parquetSum := sha256.Sum256(parquetData)
+			parquetSumHex := hex.EncodeToString(parquetSum[:])
+
 			if perHour {
-				// Every row of the file named, or none: a row left out
-				// would be deleted with the file once the others are
-				// stored again. Empty is never recorded.
-				if fw.rows = spans.rangesIn(bucket.indices); rangeRows(fw.rows) != len(bucket.indices) {
-					fw.rows = []string{}
+				// Only with the row map: the file's own rows are named. Without
+				// it the flush's identities name rows of every hour file, and
+				// adopting one file would skip the others' rows (#1646).
+				b.recordFlushIntent(storagePath, int64(len(parquetData)), spans.rangesIn(bucket.indices))
+			}
+			if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+				// The write may still land (#1635). With the row map, name this
+				// file's rows; without it the flush's identities cover them.
+				fw := &failedStorageWrite{err: fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err), path: storagePath, size: int64(len(parquetData))}
+				if perHour {
+					// Every row of the file named, or none: a row left out
+					// would be deleted with the file once the others are
+					// stored again. Empty is never recorded.
+					if fw.rows = spans.rangesIn(bucket.indices); rangeRows(fw.rows) != len(bucket.indices) {
+						fw.rows = []string{}
+					}
 				}
+				return partial(fw)
 			}
-			return partial(fw)
-		}
-		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
+			b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
-		if perHour {
-			if cov == nil {
-				cov = groupCoverage(group, len(hourBuckets)) // nil without coverage
+			if perHour {
+				if cov == nil {
+					cov = groupCoverage(group, len(hourBuckets)) // nil without coverage
+				}
+				b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, cov.forFile(group.piecesAt(bucket.indices)))
+				b.syncRegistrations()
+				ranges := spans.rangesIn(bucket.indices)
+				b.ambiguous.stored(ranges) // #1635, as in completeFlush
+				checkpointed := b.checkpointRows(ctx, ranges)
+				for _, i := range bucket.indices {
+					writtenAt[i] = true
+				}
+				storedRows += splitRecordCount
+				storedFiles++
+				b.totalRecordsWritten.Add(int64(splitRecordCount))
+				b.totalFlushes.Add(1)
+				b.logger.Info().
+					Str("buffer_key", bufferKey).
+					Str("storage_path", storagePath).
+					Int64("hour_id", hourID).
+					Int("records", splitRecordCount).
+					Int("size_bytes", len(parquetData)).
+					Int("row_ranges", len(ranges)).
+					Bool("rows_checkpointed", checkpointed).
+					Msg("Wrote hour partition and registered it")
+				return nil
 			}
-			b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, cov.forFile(group.piecesAt(bucket.indices)))
-			b.syncRegistrations()
-			ranges := spans.rangesIn(bucket.indices)
-			b.ambiguous.stored(ranges) // #1635, as in completeFlush
-			checkpointed := b.checkpointRows(ctx, ranges)
-			for _, i := range bucket.indices {
-				writtenAt[i] = true
-			}
-			storedRows += splitRecordCount
-			storedFiles++
-			b.totalRecordsWritten.Add(int64(splitRecordCount))
-			b.totalFlushes.Add(1)
+
+			written = append(written, tieringEntry{
+				storagePath: storagePath,
+				bucketTime:  bucketTime,
+				sizeBytes:   int64(len(parquetData)),
+				sha256Hex:   parquetSumHex,
+				records:     splitRecordCount,
+				pieces:      group.piecesAt(bucket.indices),
+			})
+
 			b.logger.Info().
 				Str("buffer_key", bufferKey).
 				Str("storage_path", storagePath).
 				Int64("hour_id", hourID).
 				Int("records", splitRecordCount).
 				Int("size_bytes", len(parquetData)).
-				Int("row_ranges", len(ranges)).
-				Bool("rows_checkpointed", checkpointed).
-				Msg("Wrote hour partition and registered it")
-			continue
+				Msg("Wrote hour partition")
+			return nil
+		}(fileCtx)
+		cancelFile()
+		if err != nil {
+			return err
 		}
-
-		written = append(written, tieringEntry{
-			storagePath: storagePath,
-			bucketTime:  bucketTime,
-			sizeBytes:   int64(len(parquetData)),
-			sha256Hex:   parquetSumHex,
-			records:     splitRecordCount,
-			pieces:      group.piecesAt(bucket.indices),
-		})
-
-		b.logger.Info().
-			Str("buffer_key", bufferKey).
-			Str("storage_path", storagePath).
-			Int64("hour_id", hourID).
-			Int("records", splitRecordCount).
-			Int("size_bytes", len(parquetData)).
-			Msg("Wrote hour partition")
 	}
 
 	// All hours written successfully — now register in tiering and cluster manifest.
@@ -5514,7 +5561,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		cov = groupCoverage(group, len(written))
 	}
 	for _, e := range written {
-		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
+		fileCtx, cancelFile := b.fileContext(ctx) // #1692: each registration its own bound
+		b.registerFileInTiering(fileCtx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
+		cancelFile()
 		totalWritten += e.records
 	}
 
@@ -6877,7 +6926,10 @@ func (b *ArrowBuffer) NewRecoveryFlushBarrier() func(context.Context) error {
 // or first flush failure stops admission: unsubmitted records stay in buffers;
 // admitted tasks keep their normal independent I/O deadlines and WAL identities.
 // The barrier's total wait budget is one flushTimeout (or the caller's earlier
-// deadline), not one timeout per measurement. Returning an error never proves
+// deadline), not one timeout per measurement. A flush is no longer capped at
+// one flushTimeout (#1692): a backfill flush of many hour files can outlast
+// this budget, and the barrier then fails and the caller keeps its WAL files,
+// which is the safe direction; a later pass completes once the flush is done. Returning an error never proves
 // durability and must not permit WAL deletion. Recovery must also use
 // NewRecoveryFlushBarrier to cover failures that completed before this call.
 func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
@@ -7102,8 +7154,9 @@ func (b *ArrowBuffer) Close() error {
 	//
 	// Flush I/O no longer derives from b.ctx, so b.cancel() above does NOT
 	// abort a storage write in progress — that is the point of the change. The
-	// consequence is that this wait is bounded by flushTimeout rather than
-	// being instant, which is why it has to respect the budget: on expiry,
+	// consequence is that this wait is not instant: a flush is bounded per file
+	// (fileContext), not as a whole (#1692), which is why it has to respect the
+	// budget: on expiry,
 	// cancel flushParent so context-aware backends abandon their writes and the
 	// workers return.
 	//
