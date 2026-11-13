@@ -1,6 +1,6 @@
 // agg-7 companion: the recognizer routes the order statistics exactly where the
 // engine serves them and the perf gate measured a win — ungrouped and under a time
-// bucket; tag-keyed grouping, grouped mode and HAVING stay on DuckDB. Pure
+// bucket, and tag-keyed since C2; grouped mode stays on DuckDB. Pure
 // tokenizer tests.
 
 package arcxrouter
@@ -59,9 +59,6 @@ func TestOrderStatsDecline(t *testing.T) {
 		"SELECT quantile_cont(end, 0.5) FROM t",
 		"SELECT median(DISTINCT x) FROM t",
 		"SELECT median(x * 2) FROM t",
-		// Tag-keyed grouping: gated.
-		"SELECT host, median(x) FROM t GROUP BY host",
-		"SELECT host, quantile_cont(x, 0.9) FROM t GROUP BY host",
 		// Grouped mode: not routed in v1 (ties decline the whole query).
 		"SELECT date_trunc('hour', time), mode(code) FROM t GROUP BY 1",
 	} {

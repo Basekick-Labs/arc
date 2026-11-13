@@ -3126,8 +3126,9 @@ func main() {
 	// files (grouped by namespace). Built whenever the edge-sync receive or
 	// import side is enabled (both write receipts); shared by compaction's
 	// consumed-inputs observer (#619) and tiering's hot-file-removal hook
-	// (#687). Remains nil otherwise, which keeps tiering's spoke-migration
-	// gate closed.
+	// (#687), which a database delete also reaches (#1166: a mark although
+	// the content is gone; see edgesync.HubIndex.Forget and #1186). Remains
+	// nil otherwise, which keeps tiering's spoke-migration gate closed.
 	var hubReceiptMarker func(paths []string) error
 	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error

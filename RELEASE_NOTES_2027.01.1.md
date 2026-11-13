@@ -31,6 +31,15 @@ Once every node runs this version, the cluster adopts the nodes' query governanc
 
 Performance: on the query path, once adopted, `Admit` reads the cluster's policies from an immutable in-memory snapshot (one atomic load, one map lookup, one string compare), without the lock it took before. `Admit` also no longer allocates per limit: one allocation per admitted query instead of 13 to 16. Measured on Atila against `main`, 16 alternating runs each: a token with a policy 1.26 µs to 0.74 µs (standalone and cluster-wide alike), a token on the defaults 1.31 µs to 0.78 µs, and `Admit` from every core while file registrations are applied 1.53 µs to 0.84 µs per call, with the apply rate unchanged or better (70.4k to 73.8k per second). Ingest and import run no governance code; the snapshot is rebuilt (one map of the governance policies) only when a cluster policy of any kind changes, a token with a governance policy is rotated or deleted, or a Raft snapshot is restored, never on a file registration.
 
+## Note: re-syncing a deleted spoke database from the spoke ([#1186](https://github.com/Basekick-Labs/arc/issues/1186))
+
+No behaviour change. This documents what happens on an edge-sync hub after `DELETE /api/v1/databases/{spoke}?confirm=true`, so operators know which recovery path to use:
+
+- **Tiering active** (`tiered_storage.enabled` with a licence that includes it): the hub keeps reporting the deleted files as received, so the spoke does not send them again. To get the data back, restore a backup. The receipts are in `arc.db`, which a full backup carries.
+- **Tiering not active:** at the next reconcile the hub notices the files are gone and the spoke sends them again. Files that hub compaction had already merged are the exception (compaction of received namespaces is on by default): the hub still reports those as received. A re-sync therefore brings back only part of the namespace. To get all of it back, restore a backup. With `edge_sync.compact_received_namespaces=false` or `compaction.enabled=false`, the whole namespace re-syncs.
+
+Which behaviour a confirmed delete should have is still open in #1186.
+
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 
 `wal.ack_mode` now defaults to `"auto"`, which is `"durable"` on every node
@@ -171,6 +180,14 @@ on a context of their own, which ends at server shutdown, at the forward's
 timeout, or when the query is cancelled or its client leaves, as before. A
 body larger than 4KB is not copied: it is released when the forward returns.
 `TestForwardedQueryIsListedAndCancellable` is no longer flaky.
+
+## Ingest: buffers that reach `max_buffer_age_ms` are flushed in parallel ([#1632](https://github.com/Basekick-Labs/arc/issues/1632))
+
+Since #1618 every local flush syncs its file and directory to disk. The periodic flush of aged buffers wrote them one at a time, so with many low-rate measurements a single sweep paid for every sync back to back. Buffers then waited several sweep periods past `max_buffer_age_ms`, and files grew larger than intended.
+
+The sweep now writes aged buffers in batches of up to `ingest.flush_workers`, in parallel, and does not hold the shard lock while it writes. Storage can therefore see up to twice `flush_workers` writes at once: the worker pool's plus the sweep's. It does not use the flush queue, so aged data never waits behind size-triggered flushes and never takes a queue slot from a writer. Measured on macOS (APFS, full sync) with 1,000 measurements at one row per second: about 84 aged flushes per second against 23 before, and the backlog clears within about 2 s of the load stopping instead of about 11 s. Gains depend on how well the disk overlaps syncs.
+
+Nothing else changes: what is flushed, when a buffer counts as aged, and how a flush interacts with the WAL and with shutdown. When shutdown begins during a sweep, the sweep finishes the batch it is writing and leaves the rest to shutdown's own flush. A shutdown therefore waits for at most one batch, as it waited for at most one write before.
 
 ## Fix: a crash right after a flush no longer stores its rows twice ([#1646](https://github.com/Basekick-Labs/arc/issues/1646))
 
@@ -3268,6 +3285,22 @@ prepared statements, which are not implemented yet. See
 `docs/operations/flight-sql.md`.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.
+
+### Flight SQL accepts an Arc token in a bearer-token handshake ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener accepts a `Handshake` that carries the Arc token as
+`authorization: Bearer <token>`, and answers it with the same header. The
+Arrow Flight SQL JDBC driver opens the connection that way when given its
+`token` property (`jdbc:arrow-flight-sql://host:50051?token=<token>`, with
+the token's trailing `=` written as `%3D`), and
+every such connection failed with `UNAUTHENTICATED: only Basic Auth
+implemented`: only a Basic handshake, with the token as the password, was
+accepted. An unknown token is refused with `invalid Arc token`, as on any
+other call. Basic handshakes and calls that send the bearer header without a
+handshake (the ADBC drivers) are unchanged. See
+`docs/operations/flight-sql.md`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1658](https://github.com/Basekick-Labs/arc/pull/1658).
 
 ### Prometheus Remote Write 1.0 ingestion (#1383)
 
