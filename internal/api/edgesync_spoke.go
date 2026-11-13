@@ -164,6 +164,7 @@ func (h *EdgeSyncSpokeHandler) run(c *fiber.Ctx) error {
 		"verify_kept":        res.VerifyKept,
 		"verify_requeued":    res.VerifyRequeued,
 		"verify_unsupported": res.VerifyUnsupported,
+		"verify_error":       res.VerifyError,
 		"bytes_sent":         res.BytesSent,
 		"partial":            res.Partial,
 		"failed":             res.Failed,
