@@ -57,6 +57,9 @@ func TestMsgPackDecompressedPayloadLimitReturns413(t *testing.T) {
 			responseBody, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode, string(responseBody))
+			// The text the 400 carried before stays in the message, so a
+			// client matching it keeps working.
+			require.Contains(t, string(responseBody), "decompressed payload exceeds 2KB limit")
 		})
 	}
 }

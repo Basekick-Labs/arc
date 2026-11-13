@@ -85,6 +85,7 @@ func TestMsgPackSpecDescribesAuthentication(t *testing.T) {
 		Compression struct {
 			Limits string `json:"limits"`
 		} `json:"compression"`
+		Responses      map[string]string `json:"responses"`
 		Authentication struct {
 			Header string `json:"header"`
 			Scheme string `json:"scheme"`
@@ -98,6 +99,7 @@ func TestMsgPackSpecDescribesAuthentication(t *testing.T) {
 	require.Equal(t, "Bearer <token>", spec.Authentication.Scheme)
 	require.Equal(t, "x-arc-database", spec.Database.Header)
 	require.Contains(t, spec.Compression.Limits, "decompressed payload (413)")
+	require.Contains(t, spec.Responses["413"], "decompresses to")
 }
 
 // The spec is not a public route: it needs a token like the endpoint it

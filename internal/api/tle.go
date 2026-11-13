@@ -342,9 +342,10 @@ func decompressRequest(rawBody []byte, maxSize int) (body []byte, codec string, 
 	}
 }
 
-// decompressGzipPooled decompresses gzip data using pooled readers to minimize allocations.
-// Shared across handlers — uses lpGzipReaderPool (declared in lineprotocol.go).
-// maxSize limits the decompressed output; pass 0 for the default 100MB limit.
+// decompressedPayloadTooLargeError is what decompressGzipPooled and
+// decompressZstdPooled return when the decompressed body passes maxSize, so a
+// handler can answer 413 for it and 400 for a corrupt body. Its text is the
+// one these helpers returned before it existed.
 type decompressedPayloadTooLargeError struct {
 	maxSize int
 }
@@ -353,6 +354,9 @@ func (e *decompressedPayloadTooLargeError) Error() string {
 	return fmt.Sprintf("decompressed payload exceeds %s limit", formatBytes(int64(e.maxSize)))
 }
 
+// decompressGzipPooled decompresses gzip data using pooled readers to minimize allocations.
+// Shared across handlers — uses lpGzipReaderPool (declared in lineprotocol.go).
+// maxSize limits the decompressed output; pass 0 for the default 100MB limit.
 func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 	if maxSize <= 0 {
 		maxSize = 100 * 1024 * 1024 // 100MB default

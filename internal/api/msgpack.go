@@ -289,7 +289,7 @@ localProcessing:
 			var sizeErr *decompressedPayloadTooLargeError
 			if errors.As(derr, &sizeErr) {
 				return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-					"error": fmt.Sprintf("Payload too large (max %s). Consider batching into smaller requests.", formatBytes(h.maxPayloadSize)),
+					"error": fmt.Sprintf("Payload too large: %v. Consider batching into smaller requests.", sizeErr),
 				})
 			}
 			h.logger.Error().Err(derr).Msg("Failed to decompress gzip data")
@@ -305,7 +305,7 @@ localProcessing:
 			var sizeErr *decompressedPayloadTooLargeError
 			if errors.As(derr, &sizeErr) {
 				return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-					"error": fmt.Sprintf("Payload too large (max %s). Consider batching into smaller requests.", formatBytes(h.maxPayloadSize)),
+					"error": fmt.Sprintf("Payload too large: %v. Consider batching into smaller requests.", sizeErr),
 				})
 			}
 			h.logger.Error().Err(derr).Msg("Failed to decompress zstd data")
@@ -615,7 +615,7 @@ func msgPackSpecDocument() fiber.Map {
 			"400": "empty body, bad compression, malformed MessagePack, a payload missing m or fields/f, columns of different lengths, a non-numeric time, an invalid database or measurement name, a column whose type conflicts with stored data, or \"partial write: N points dropped\" when some points or batch/array items could not be written (the message says whether the others were)",
 			"401": "missing or invalid token",
 			"403": "token lacks write permission",
-			"413": "request body larger than server.max_payload_size",
+			"413": "request body, or the payload it decompresses to, larger than server.max_payload_size; split the batch and retry",
 			"500": "unexpected server error",
 			"502": "cluster: the write could not be routed to a writer",
 			"503": "temporarily refusing writes (shutdown, WAL disk pressure, schema churn, cluster write fence, no writer reachable); retry",

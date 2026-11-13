@@ -175,6 +175,26 @@ These cases are still not repaired:
 - **Each file gets one repair attempt.** A second damaged length in the same
   file reads as before.
 
+## Fix: a compressed MessagePack write over the size limit answers 413 ([#1651](https://github.com/Basekick-Labs/arc/pull/1651))
+
+A gzip or zstd MessagePack body that fits `server.max_payload_size` but
+decompresses past it was answered `400`, the status for a malformed request.
+A client that splits a batch on `413` (the Node-RED node, [node-red-arc#3](https://github.com/Basekick-Labs/node-red-arc/issues/3))
+therefore failed the whole batch instead of splitting it. It now answers `413`,
+as an oversized uncompressed body already did:
+
+```
+413 {"error":"Payload too large: decompressed payload exceeds 4MB limit. Consider batching into smaller requests."}
+```
+
+The message keeps the text the `400` carried (`decompressed payload exceeds
+<limit> limit`); its `Invalid gzip compression:` / `Invalid zstd compression:`
+prefix is gone. A corrupt body, and a zstd frame whose window is over the
+limit, still answer `400`. `GET /api/v1/write/msgpack/spec` says so. Line
+Protocol and TLE writes are unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir).
+
 ## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
 
 With the WAL on and object storage as the backend, a flush whose upload hit
@@ -4215,14 +4235,6 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
-
-### Fix: compressed MessagePack writes over the decompressed-size limit return `413` ([#3](https://github.com/Basekick-Labs/node-red-arc/issues/3))
-
-Compressed MessagePack requests whose decoded payload exceeds
-`server.max_payload_size` now return `413`, allowing clients to split and retry
-the batch. Invalid or corrupt compressed data still returns `400`.
-
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1651](https://github.com/Basekick-Labs/arc/pull/1651).
 
 ### Fix: a token's `expires_in` must be in the future, and a rename cannot clear its name ([#1623](https://github.com/Basekick-Labs/arc/pull/1623))
 
