@@ -142,6 +142,47 @@ func isWarehouseNamespaceDir(name, nsPrefix string) bool {
 	return ok && namespaceBelongsToPrefix(namespace, nsPrefix)
 }
 
+// IsWarehouseNamespaceDir is isWarehouseNamespaceDir for callers outside this package, so they
+// recognise the exporter's namespace directories -- the JSON-encoded spelling included -- by the
+// exporter's own rule rather than a copy of it (#1202).
+func IsWarehouseNamespaceDir(name, nsPrefix string) bool {
+	return isWarehouseNamespaceDir(name, nsPrefix)
+}
+
+// NamespaceDirOwnedBy reports whether a warehouse namespace directory ("<namespace>.db", one path
+// segment) holds tables of root, a storage-root segment: a plain database or an edge-sync spoke.
+//
+// A plain database's namespace is one component, "<nsPrefix>_<db>". A spoke's is two,
+// "<nsPrefix>_<spoke>" and the dot-free inner database (namespaceIdentifier), stored either as the
+// dot-joined key or, when a component contains a dot (#1129), as the JSON-encoded key; a legacy
+// table the #1129 migration rekeyed keeps its dot-joined directory, because the migration moves
+// nothing on disk. So root owns:
+//
+//   - "<nsPrefix>_<root>.db"                      its plain database namespace
+//   - "<nsPrefix>_<root>.<inner>.db", inner dot-free  a spoke database, dot-joined
+//   - an encoded key whose first component is "<nsPrefix>_<root>"
+//
+// The dot-free rule on inner is what keeps root "rocket" from claiming spoke "rocket.01"'s
+// "arc_rocket.01.telemetry.db". What it cannot resolve is "arc_a.b.db", which is both root "a"'s
+// spoke database "b" and, read literally, root "a.b"'s plain namespace (#750): both claim it. The
+// caller this exists for reports what a scoped backup left out, where over-reporting is the safe
+// direction.
+func NamespaceDirOwnedBy(dir, nsPrefix, root string) bool {
+	key, ok := strings.CutSuffix(dir, ".db")
+	if !ok || root == "" {
+		return false
+	}
+	first := nsPrefix + "_" + root
+	if parts, ok := decodeCatalogNamespace(key); ok {
+		return parts[0] == first
+	}
+	if key == first {
+		return true
+	}
+	inner, ok := strings.CutPrefix(key, first+".")
+	return ok && inner != "" && !strings.Contains(inner, ".")
+}
+
 // WarehouseLayout returns where this exporter's warehouse sits in the storage root. It resolves
 // the two bases itself rather than through resolveBases, so calling it at startup does not
 // freeze warehouseRelKey's lazily cached resolution earlier than before.
