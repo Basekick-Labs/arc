@@ -560,7 +560,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// The registry must not be completed here: streaming starts after this
 	// handler returns, so the stream writer owns the terminal disposition.
 	var queryID string
-	baseCtx := context.Background()
+	// The request's context, not Background: with SetLifetime it is the
+	// handler's lifetime, which shutdown cancels (#1644).
+	baseCtx := c.UserContext()
 	if h.queryRegistry != nil {
 		var queryCtx context.Context
 		queryID, queryCtx = h.queryRegistry.Register(
@@ -666,6 +668,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
 				"success": false,
 				"error":   "Query timed out",
+			})
+		}
+		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled at shutdown")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   "Server shutting down",
 			})
 		}
 		if ctxErr == context.Canceled {

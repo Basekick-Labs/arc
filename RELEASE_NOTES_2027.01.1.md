@@ -96,6 +96,42 @@ What changes with the WAL on:
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
 
+## Fix: a long query no longer costs the buffer flush and WAL close at shutdown ([#1644](https://github.com/Basekick-Labs/arc/issues/1644))
+
+At shutdown the HTTP server waited for in-flight requests for the whole
+`server.shutdown_timeout`, and nothing ended a running query. One query that
+outlived the budget, or an Arrow stream to a slow client, used all of it. Arc
+then skipped everything left: the ingest buffer flush, the WAL close and the
+database close. With the WAL off, the rows acknowledged since the last flush
+were lost. With it on, they were replayed at the next start, and the process
+exited 1. In a cluster the 10 s ready drain ran first and left even less.
+
+Shutdown now keeps a share of the budget for the buffer flush, the WAL and the
+database: 60% of `server.shutdown_timeout`, half for the buffer flush as
+before and a tenth for what closes after it. The HTTP drain, the Flight SQL
+drain, the cluster ready drain and the scheduler stops share the rest:
+
+- the HTTP drain gives in-flight requests a grace, then cancels the queries
+  still running, and then closes the connections still open, such as a stream
+  to a client that stopped reading;
+- the cluster ready drain takes at most half of what is left, so the HTTP
+  drain keeps a grace of its own. At the default 30 s that is 6 s rather than
+  10 s, so a load balancer that polls `/ready` every 10 s may still route a
+  request or two to the closing node. Set `server.shutdown_timeout` to 50 s or
+  more to keep the full 10 s;
+- a hook that runs past its share no longer skips the components. The hooks
+  after it still run, on an expired context.
+
+At the default 30 s, a request has about 8 s to finish once shutdown starts on
+a standalone node, and about 3.5 s in a cluster, where a 6 s ready drain comes
+first. It used to have the whole 30 s, with the flush and WAL close as the
+price. A client whose query is cancelled at shutdown gets a 503 ("Server
+shutting down"). Admin writes (tokens, RBAC, cluster policies) are not
+cancelled. The HTTP drain fails the shutdown (exit 1) only when a request
+waits on neither its query nor its connection. Below a
+`server.shutdown_timeout` of 2 s the drain's last stages can still run into
+the share kept for the WAL close.
+
 ## Fix: forwarded requests no longer read freed request state ([#1629](https://github.com/Basekick-Labs/arc/issues/1629))
 
 On a compactor, a reader or a standby writer, a forward that was cancelled or

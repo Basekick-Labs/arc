@@ -81,6 +81,29 @@ const cacheInvalidateHMACTolerance = security.HMACTimestampTolerance
 // own default (internal/config/config.go, setDefaults).
 const defaultShutdownTimeout = 30 * time.Second
 
+// shutdownComponentReserve is the part of the shutdown budget the components
+// keep (shutdown.Coordinator.SetComponentReserve): half for the arrow
+// buffer's Close, whose budget is also half, plus a tenth for the WAL's final
+// sync and the closes after it (#1644).
+func shutdownComponentReserve(timeout time.Duration) time.Duration {
+	return timeout/2 + timeout/10
+}
+
+// readyDrainGraceWithin bounds the cluster ready drain to half of what is
+// left of the hooks' share, so the HTTP drain after it keeps a grace of its
+// own (#1644).
+func readyDrainGraceWithin(ctx context.Context, grace time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		if half := time.Until(deadline) / 2; half < grace {
+			grace = half
+		}
+	}
+	if grace < 0 {
+		grace = 0
+	}
+	return grace
+}
+
 // Seams for applyLicenseCoreLimits' tests. CI runners cannot be given a CPU
 // quota, and runtime.NumCPU() cannot be set at all, so without these the
 // license-clamp tests silently lose their teeth on a runner whose core count
@@ -445,6 +468,12 @@ func main() {
 		shutdownTimeout = defaultShutdownTimeout
 	}
 	shutdownCoordinator := shutdown.New(shutdownTimeout, logger.Get("shutdown"))
+	// The components (buffer flush, WAL, database) keep their share of the
+	// budget whatever the hooks spend (#1644): half for the arrow buffer's
+	// Close (SetCloseBudget below) and a tenth for what closes after it. The
+	// hooks — the cluster ready drain, the Flight SQL and HTTP drains, the
+	// scheduler stops — share the rest.
+	shutdownCoordinator.SetComponentReserve(shutdownComponentReserve(shutdownTimeout))
 
 	// Opt-in pprof on a localhost listener (no-op unless ARC_DEBUG_PPROF=1).
 	// Replaces the previous behaviour where pprof was unconditionally
@@ -1273,9 +1302,12 @@ func main() {
 	// time only means more records stay in the WAL to be replayed, which is
 	// recoverable; starving the WAL writer's sync is not.
 	//
-	// Note this does not account for what the hooks already spent before any
-	// component ran — in cluster mode ready-flag-off alone holds 10s. Close
-	// bounds itself; it cannot see the coordinator's remaining time.
+	// The coordinator keeps this half, plus a tenth for what closes after
+	// the buffer, out of the hooks' reach (SetComponentReserve, #1644): the
+	// hooks run on a deadline that leaves it, so a long HTTP drain or the
+	// cluster ready drain no longer eats into it. A hook that overruns that
+	// deadline by more than the tenth still can; Close bounds itself and
+	// cannot see the coordinator's remaining time.
 	//
 	// shutdownTimeout is the validated duration (server.shutdown_timeout with
 	// the non-positive fallback already applied above), not the raw config int.
@@ -3859,6 +3891,9 @@ func main() {
 
 	// Register Query handler with dedicated query timeout and slow query logging
 	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout, cfg.Query.SlowQueryThresholdMs)
+	// Reads run on the server's query lifetime, which the HTTP drain cancels
+	// once its grace is over, so a long query cannot hold the shutdown (#1644).
+	queryHandler.SetLifetime(server.QueryLifetime())
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
@@ -5567,8 +5602,9 @@ func main() {
 	// accordingly; a future PR may expose this as an env var
 	// (ARC_SHUTDOWN_READY_DRAIN_SECONDS) if customers ask.
 	//
-	// In-flight requests that arrived BEFORE MarkNotReady drain via Fiber's
-	// normal shutdown handling — they complete; only NEW requests get
+	// In-flight requests that arrived BEFORE MarkNotReady drain in the
+	// http-server hook: they get its grace to complete, after which the
+	// queries still running are cancelled (#1644); only NEW requests get
 	// rejected by the LB once it observes the 503.
 	// Drain grace: 10s in clustered mode gives the LB one poll cycle to
 	// observe /ready=503 and stop routing before the listener closes.
@@ -5581,14 +5617,19 @@ func main() {
 	}
 	shutdownCoordinator.RegisterHook("ready-flag-off", func(ctx context.Context) error {
 		server.MarkNotReady()
-		if readyDrainGrace == 0 {
+		// At most half of the hooks' remaining share: the HTTP drain after
+		// this needs a grace too (#1644). The hooks get 40% of
+		// server.shutdown_timeout, so the full 10 s needs 50 s or more; at
+		// the default 30 s the LB gets 6 s, less than one 10 s poll cycle.
+		grace := readyDrainGraceWithin(ctx, readyDrainGrace)
+		if grace == 0 {
 			return nil
 		}
 		// time.NewTimer + defer Stop instead of time.After: if ctx.Done
 		// wins the select, time.After would leak the underlying timer
 		// until the deadline expires. Bounded leak in a shutdown hook,
 		// but using the standard idiom anyway.
-		timer := time.NewTimer(readyDrainGrace)
+		timer := time.NewTimer(grace)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
@@ -5625,17 +5666,17 @@ func main() {
 	}
 
 	// Register HTTP server shutdown hook (first to stop accepting new
-	// requests). The arg is the HTTP server's INTERNAL drain timeout —
-	// independent of shutdownCoordinator's own budget, though both now derive
-	// from server.shutdown_timeout (#805), so raising that key gives the drain
-	// and the overall shutdown the same extra room. If the coordinator ctx
-	// expires before this hook completes, the coordinator skips remaining
-	// hooks; the internal timeout is a best-effort upper bound on this hook's
-	// slice of that budget. The debug-pprof hook (registered earlier in main,
-	// same priority) uses srv.Close() instead of Shutdown(ctx) to avoid
-	// letting a long /debug/pprof/profile?seconds=N capture starve this hook.
+	// requests). It drains within ctx's deadline, which is the hooks' share
+	// of server.shutdown_timeout (SetComponentReserve above): a grace for
+	// in-flight requests, then the queries still running are cancelled and
+	// the connections still open are closed (api.Server.ShutdownContext).
+	// It used to drain for the whole budget, so one long query left no time
+	// for the buffer flush or the WAL close (#1644). The debug-pprof hook
+	// (registered earlier in main, same priority) uses srv.Close() instead
+	// of Shutdown(ctx) to avoid letting a long /debug/pprof/profile?seconds=N
+	// capture starve this hook.
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {
-		return server.Shutdown(shutdownTimeout)
+		return server.ShutdownContext(ctx, shutdownTimeout)
 	}, shutdown.PriorityHTTPServer)
 
 	// Clear credential material that earlier versions could leave in stored

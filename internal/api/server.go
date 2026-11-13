@@ -91,6 +91,13 @@ type Server struct {
 	// onShutdownStart runs first in Shutdown (OnShutdownStart).
 	onShutdownStartMu sync.Mutex
 	onShutdownStart   []func()
+
+	// queryLifetime ends the queries still running once the shutdown grace
+	// is over (QueryLifetime, ShutdownContext); conns tracks the open
+	// connections that shutdown closes after that (#1644).
+	queryLifetime context.Context
+	cancelQueries context.CancelFunc
+	conns         *connTracker
 }
 
 // ServerConfig holds server configuration
@@ -207,7 +214,16 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// Request logging middleware
 	app.Use(requestLogger(logger))
 
+	queryLifetime, cancelQueries := context.WithCancel(context.Background())
+	conns := newConnTracker()
+	// Fiber never sets ConnState, and app.Server() is the server Listen,
+	// ListenTLS and Listener all serve on.
+	app.Server().ConnState = conns.connState
+
 	return &Server{
+		queryLifetime:  queryLifetime,
+		cancelQueries:  cancelQueries,
+		conns:          conns,
 		app:            app,
 		logger:         logger.With().Str("component", "api-server").Logger(),
 		host:           config.Host,
@@ -799,26 +815,10 @@ func (s *Server) OnShutdownStart(fn func()) {
 	s.onShutdownStartMu.Unlock()
 }
 
-// Shutdown gracefully shuts down the server
+// Shutdown drains the server within timeout: ShutdownContext with that
+// budget.
 func (s *Server) Shutdown(timeout time.Duration) error {
-	s.logger.Info().Msg("Shutting down server gracefully...")
-
-	s.onShutdownStartMu.Lock()
-	fns := s.onShutdownStart
-	s.onShutdownStartMu.Unlock()
-	for _, fn := range fns {
-		fn()
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := s.app.ShutdownWithContext(ctx); err != nil {
-		return fmt.Errorf("server shutdown failed: %w", err)
-	}
-
-	s.logger.Info().Msg("Server stopped")
-	return nil
+	return s.ShutdownContext(context.Background(), timeout)
 }
 
 // WaitForShutdown blocks until shutdown signal is received
