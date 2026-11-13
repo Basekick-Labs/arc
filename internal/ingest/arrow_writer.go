@@ -4774,62 +4774,79 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 
 	threshold := maxAge
 
+	limit := b.flushWorkers
+	if limit <= 0 {
+		limit = 1
+	}
+
 	// Iterate over all shards
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
 
-		// Extract every aged buffer of this shard under one lock hold, then
-		// write them concurrently without it (#1632). Writing them one at a
-		// time under the lock, as this sweep did, cost N x (write + file fsync
-		// + directory fsync) per sweep once #1618 made every flush durable:
-		// about 30 s for 1,000 low-rate measurements on macOS. The writes go
-		// straight to storage, not through flushQueue, so aged data never
-		// waits behind size-triggered flushes and never takes a slot a writer
-		// needs, and "the sweep returned" still means "the aged data was
-		// written".
-		var aged []agedFlush
-		closing := false
+		// Extract up to flush_workers aged buffers under one lock hold, write
+		// them concurrently without the lock, and repeat until the shard has
+		// none left (#1632). Writing them one at a time under the lock, as
+		// this sweep did, cost N x (write + file fsync + directory fsync) per
+		// sweep once #1618 made every flush durable: about 30 s for 1,000
+		// low-rate measurements on macOS. The writes go straight to storage,
+		// not through flushQueue, so aged data never waits behind
+		// size-triggered flushes and never takes a slot a writer needs, and
+		// "the sweep returned" still means "the aged data was written".
+		//
+		// Chunked rather than extracting the whole shard at once so the
+		// closing check below runs between batches: Close waits for this
+		// sweep via b.wg.Wait(), and a sweep that had taken every aged buffer
+		// of a large shard would write them all before Close's own loop could
+		// run, past the shutdown budget (LocalBackend ignores the cancel).
+		for {
+			aged := make([]agedFlush, 0, limit)
+			closing := false
 
-		shard.mu.Lock()
-		for key, startTime := range shard.bufferStartTimes {
-			// Stop extracting once Close() has begun and leave the rest to
-			// Close()'s own shard loop: Close waits for this sweep via
-			// b.wg.Wait(), and with many aged buffers on slow storage a full
-			// sweep can outlast the shutdown budget. What is already extracted
-			// is still written below -- it is no longer in the buffer.
-			if b.closing.Load() {
-				closing = true
-				break
+			shard.mu.Lock()
+			for key, startTime := range shard.bufferStartTimes {
+				if len(aged) == limit {
+					break
+				}
+				// Stop extracting once Close() has begun and leave the rest
+				// to Close()'s own shard loop. What is already extracted is
+				// still written below -- it is no longer in the buffer.
+				if b.closing.Load() {
+					closing = true
+					break
+				}
+				age := now.Sub(startTime)
+				if age < threshold {
+					continue
+				}
+				// Parse buffer key to get database and measurement
+				parts := splitBufferKey(key)
+				if len(parts) != 2 {
+					b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format")
+					continue
+				}
+				b.logger.Info().
+					Str("buffer_key", key).
+					Dur("age", age).
+					Dur("threshold", threshold).
+					Int("shard", shardIdx).
+					Msg("Flushing aged buffer")
+				if e := b.extractBufferLocked(shard, key); e != nil {
+					aged = append(aged, agedFlush{e: e, key: key, database: parts[0], measurement: parts[1]})
+				}
 			}
-			age := now.Sub(startTime)
-			if age < threshold {
-				continue
-			}
-			// Parse buffer key to get database and measurement
-			parts := splitBufferKey(key)
-			if len(parts) != 2 {
-				b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format")
-				continue
-			}
-			b.logger.Info().
-				Str("buffer_key", key).
-				Dur("age", age).
-				Dur("threshold", threshold).
-				Int("shard", shardIdx).
-				Msg("Flushing aged buffer")
-			if e := b.extractBufferLocked(shard, key); e != nil {
-				aged = append(aged, agedFlush{e: e, key: key, database: parts[0], measurement: parts[1]})
-			}
-		}
-		shard.mu.Unlock()
+			shard.mu.Unlock()
 
-		b.writeAgedConcurrently(aged)
+			b.writeAgedConcurrently(aged)
 
-		if closing {
-			b.logger.Info().
-				Int("shard", shardIdx).
-				Msg("Aged-buffer sweep stopping: buffer is closing, remaining buffers left to Close()")
-			return
+			if closing || b.closing.Load() {
+				b.logger.Info().
+					Int("shard", shardIdx).
+					Msg("Aged-buffer sweep stopping: buffer is closing, remaining buffers left to Close()")
+				return
+			}
+			if len(aged) < limit {
+				break // the shard has no aged buffer left
+			}
 		}
 	}
 }
@@ -4840,9 +4857,9 @@ type agedFlush struct {
 	key, database, measurement string
 }
 
-// writeAgedConcurrently writes the aged buffers of one shard, at most
-// flushWorkers at a time so storage sees the same concurrency the worker pool
-// can produce, and returns when all are written. Each write gets its own
+// writeAgedConcurrently writes one batch of aged buffers (at most
+// flush_workers, which flushAgedBuffers enforces) all at once, and returns
+// when all are written. Each write gets its own
 // flushParent-derived context: Close() cancelling b.ctx must not abort an
 // aged write mid-way, because the buffer entry is already gone (#1007).
 func (b *ArrowBuffer) writeAgedConcurrently(aged []agedFlush) {
@@ -4853,22 +4870,18 @@ func (b *ArrowBuffer) writeAgedConcurrently(aged []agedFlush) {
 			b.logger.Debug().Err(err).Str("buffer_key", a.key).Msg("Failed to flush aged buffer") // writeExtracted logged it (#1377)
 		}
 	}
-	if len(aged) == 1 {
+	switch len(aged) {
+	case 0:
+		return
+	case 1:
 		write(aged[0])
 		return
 	}
-	limit := b.flushWorkers
-	if limit <= 0 {
-		limit = 1
-	}
-	slots := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	for _, a := range aged {
-		slots <- struct{}{}
 		wg.Add(1)
 		go func(a agedFlush) {
 			defer wg.Done()
-			defer func() { <-slots }()
 			write(a)
 		}(a)
 	}

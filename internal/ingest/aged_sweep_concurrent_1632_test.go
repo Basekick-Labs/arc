@@ -76,6 +76,11 @@ func TestAgedSweepWritesConcurrently(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Stop the background loops so the only sweep is the one under test: a
+	// new-buffer signal still pending would otherwise let periodicFlush see
+	// the aged start times below and sweep concurrently. Flush I/O derives
+	// from flushParent, not b.ctx, so the sweep itself is unaffected.
+	buf.cancel()
 	// Age every buffer past the threshold.
 	shard := buf.shards[0]
 	shard.mu.Lock()
@@ -130,6 +135,7 @@ func TestAgedSweepLeavesBuffersToCloseOnceClosing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	buf.cancel() // only the sweep under test runs
 	for _, sh := range buf.shards {
 		sh.mu.Lock()
 		for k := range sh.bufferStartTimes {
@@ -153,5 +159,68 @@ func TestAgedSweepLeavesBuffersToCloseOnceClosing(t *testing.T) {
 	}
 	if !buf.CloseFlushedCleanly() {
 		t.Error("Close did not report a clean flush")
+	}
+}
+
+// closingStorage sets closing on the buffer from inside the first write: Close
+// beginning while the sweep is writing, the window that matters.
+type closingStorage struct {
+	*latencyStorage
+	buf  *ArrowBuffer
+	once sync.Once
+}
+
+func (s *closingStorage) Write(ctx context.Context, path string, data []byte) error {
+	s.once.Do(func() { s.buf.closing.Store(true) })
+	return s.latencyStorage.Write(ctx, path, data)
+}
+
+func (s *closingStorage) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	data, _ := io.ReadAll(r)
+	return s.Write(ctx, path, data)
+}
+
+// Close starting mid-sweep stops the sweep after the batch in flight: at most
+// flush_workers writes, not every aged buffer of the shard, so Close's own
+// loop gets the rest within its budget.
+func TestAgedSweepStopsAfterCurrentBatchWhenCloseBegins(t *testing.T) {
+	const workers, n = 4, 40
+	inner := &latencyStorage{hangingStorageBackend: newHangingStorage(1<<30, 0), latency: 20 * time.Millisecond}
+	st := &closingStorage{latencyStorage: inner}
+	cfg := &config.IngestConfig{
+		MaxBufferSize: 1 << 20, MaxBufferAgeMS: 3_600_000, Compression: "snappy",
+		FlushWorkers: workers, FlushQueueSize: 4, ShardCount: 1,
+	}
+	buf := NewArrowBuffer(cfg, st, zerolog.Nop())
+	st.buf = buf
+	base := time.Now().UTC().Truncate(time.Hour).UnixMicro()
+	for i := 0; i < n; i++ {
+		cols := map[string][]interface{}{"time": {base + int64(i)}, "v": {float64(i)}}
+		if err := buf.WriteColumnarDirect(context.Background(), "db", fmt.Sprintf("m%02d", i), cols); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf.cancel() // only the sweep under test runs; see TestAgedSweepWritesConcurrently
+	shard := buf.shards[0]
+	shard.mu.Lock()
+	for k := range shard.bufferStartTimes {
+		shard.bufferStartTimes[k] = time.Now().UTC().Add(-2 * time.Hour)
+	}
+	shard.mu.Unlock()
+
+	buf.flushAgedBuffers()
+	if got := inner.writes.Load(); got < 1 || got > workers {
+		t.Fatalf("sweep wrote %d buffers after Close began, want 1..%d (the batch in flight)", got, workers)
+	}
+	shard.mu.RLock()
+	left := len(shard.buffers)
+	shard.mu.RUnlock()
+	if left != n-int(inner.writes.Load()) {
+		t.Fatalf("%d buffers left in the shard, want %d: a buffer is in neither place", left, n-int(inner.writes.Load()))
+	}
+	buf.closing.Store(false)
+	_ = buf.Close()
+	if got := inner.writes.Load(); got != n {
+		t.Fatalf("%d of %d written after Close", got, n)
 	}
 }

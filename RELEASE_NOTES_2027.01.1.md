@@ -148,9 +148,9 @@ body larger than 4KB is not copied: it is released when the forward returns.
 
 Since #1618 every local flush syncs its file and directory to disk. The periodic flush of aged buffers wrote them one at a time, so with many low-rate measurements a single sweep paid for every sync back to back. Buffers then waited several sweep periods past `max_buffer_age_ms`, and files grew larger than intended.
 
-The sweep now writes the aged buffers of each shard concurrently, at most `ingest.flush_workers` at a time, and does not hold the shard lock while it writes. It does not use the flush queue, so aged data never waits behind size-triggered flushes and never takes a queue slot from a writer. Measured on macOS (APFS, full sync) with 1,000 measurements at one row per second: about 84 aged flushes per second against 23 before, and the backlog clears within about 2 s of the load stopping instead of about 11 s. Gains depend on how well the disk overlaps syncs.
+The sweep now writes aged buffers in batches of up to `ingest.flush_workers`, in parallel, and does not hold the shard lock while it writes. Storage can therefore see up to twice `flush_workers` writes at once: the worker pool's plus the sweep's. It does not use the flush queue, so aged data never waits behind size-triggered flushes and never takes a queue slot from a writer. Measured on macOS (APFS, full sync) with 1,000 measurements at one row per second: about 84 aged flushes per second against 23 before, and the backlog clears within about 2 s of the load stopping instead of about 11 s. Gains depend on how well the disk overlaps syncs.
 
-Nothing else changes: what is flushed, when a buffer counts as aged, and how a flush interacts with the WAL and with shutdown. A sweep that finds shutdown under way stops taking buffers, finishes writing the ones it already took, and leaves the rest to shutdown's own flush.
+Nothing else changes: what is flushed, when a buffer counts as aged, and how a flush interacts with the WAL and with shutdown. When shutdown begins during a sweep, the sweep finishes the batch it is writing and leaves the rest to shutdown's own flush. A shutdown therefore waits for at most one batch, as it waited for at most one write before.
 
 ## Fix: a crash right after a flush no longer stores its rows twice ([#1646](https://github.com/Basekick-Labs/arc/issues/1646))
 
