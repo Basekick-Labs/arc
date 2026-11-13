@@ -179,7 +179,7 @@ type IngestConfig struct {
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
 	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
-	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
+	FlushTimeoutSeconds   int      // Timeout per file of a flush: its storage write, registrations and WAL checkpoint (default: 30s; <= 0 means 30s). Not a cap on the whole flush (#1692).
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
 	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
@@ -2459,7 +2459,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.shard_count", 32)
 	v.SetDefault("ingest.sort_keys", []string{})     // No custom sort keys by default
 	v.SetDefault("ingest.default_sort_keys", "time") // Default to time-only sorting
-	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
+	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s per file of a flush (#1692)
 	v.SetDefault("ingest.decimal_columns", []string{})
 	v.SetDefault("ingest.default_decimal_columns", "")
 	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)

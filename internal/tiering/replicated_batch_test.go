@@ -128,39 +128,40 @@ func (b *slowExistsBackend) Exists(ctx context.Context, path string) (bool, erro
 // sequentially, would take several times its deadline.
 func TestApplyTierEventBatch_AppliesAMigrationChunkTheProbeLatencyWouldTimeOut(t *testing.T) {
 	// The budget, as arithmetic rather than as a round number, because this
-	// test has now been widened twice for the same reason and guessing is
-	// what put it here.
+	// test has been widened twice for the same reason and guessing is what put
+	// it here. The deadline covers two things: the cold-tier probes, which are
+	// what this test is about, and the SQLite writes (one upsert per event on
+	// the single connection, under -race), which are what failed on contended
+	// CI runners (386/400, then 381/400 applied). So the test now shapes the
+	// work to make the writes a small, cheap part of it and the probes the
+	// part that decides:
 	//
-	// Probes: n*probe = 8 s if they run sequentially, and n/16*probe = 0.5 s
-	// at the 16-way parallelism the fix introduced. Writes: 400 SQLite
-	// upserts on one connection (SetMaxOpenConns(1)), under -race, on a
-	// shared 2-vCPU runner with the rest of the suite competing for it.
+	//   - n = 64 events, all in one chunk (tierEventChunk = 256), so one
+	//     deadline covers the whole batch;
+	//   - probe = 250 ms, so sequential probes take n*probe = 16 s, twice the
+	//     8 s deadline: a regression to one-at-a-time still fails loudly;
+	//   - parallel probes take n/16*probe = 1 s, leaving 7 s for 64 writes,
+	//     ~110 ms each, against ~11 ms per write in the version that flaked.
 	//
-	// The 2 s deadline this used to carry left 1.5 s for those writes once
-	// the probes had taken their 0.5 s — 3.75 ms each, which is inside the
-	// range a contended runner actually costs. CI duly failed with 386 of
-	// 400 applied. 5 s leaves 4.5 s, or 11 ms per write, and still fails
-	// loudly if the probes ever serialize again: 8 s is well past it.
-	//
-	// Note that rerunning locally proves nothing about this. It is 20/20 on
-	// a 14-core machine; the failure needs the contention.
-	const n = 400
-	const probe = 20 * time.Millisecond
+	// Rerunning locally proves nothing about this. The failure needs the
+	// contention of a shared 2-vCPU runner with the rest of the suite.
+	const n = 64
+	const probe = 250 * time.Millisecond
 
 	restore := tierEventDrainTimeout
-	tierEventDrainTimeout = 5 * time.Second
+	tierEventDrainTimeout = 8 * time.Second
 	t.Cleanup(func() { tierEventDrainTimeout = restore })
 
 	cold := &slowExistsBackend{mockBackend: newMockBackend("s3"), delay: probe}
 	m := newTierEventManager(t, nil, true)
 	m.coldBackend = cold
 
-	// 20 measurements x 20 files, in measurement order — the order a
+	// 4 measurements x 16 files, in measurement order — the order a
 	// migration proposes its deletes in.
 	paths := make([]string, 0, n)
 	batch := make([]tierEvent, 0, n)
 	for i := 0; i < n; i++ {
-		p := fmt.Sprintf("db1/m%02d/2026/10/03/%02d/f%03d.parquet", i/20, i%20, i)
+		p := fmt.Sprintf("db1/m%02d/2026/10/03/%02d/f%03d.parquet", i/16, i%16, i)
 		paths = append(paths, p)
 		cold.seedRaw(p, []byte("cold copy"))
 		hotRowFor(t, m, p)
