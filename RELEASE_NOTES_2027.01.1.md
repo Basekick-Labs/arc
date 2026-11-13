@@ -369,6 +369,22 @@ row is not replayed.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1674](https://github.com/Basekick-Labs/arc/pull/1674).
 
+## Tests: two intermittent CI failures fixed ([#1671](https://github.com/Basekick-Labs/arc/issues/1671), [#1672](https://github.com/Basekick-Labs/arc/issues/1672))
+
+Test-only; no product behaviour changes.
+
+- `TestASyncDoesNotAnswerACheckpointWrittenAfterItStarted` could hang
+  `internal/wal` until the 30-minute package timeout. It read its entry count
+  after an append the writer loop may already have counted, then waited for
+  two more that never came, and the failure's cleanup blocked on a sync the
+  test still held. The count is read before the append, held syncs are
+  released before the writer closes, and every wait is bounded.
+- `TestSlowStandbyOnlyLosesItsOwn` reported gaps on the healthy standby on a
+  loaded runner. The server keeps each standby's queue separate; the test's
+  fixed-rate producer let a slowed healthy standby overflow its own queue.
+  The producer now stays within 32 entries of what the healthy standby has
+  stored, so a gap can only come from the stuck one.
+
 ## Fix: a compressed MessagePack write over the size limit answers 413 ([#1651](https://github.com/Basekick-Labs/arc/pull/1651))
 
 A gzip or zstd MessagePack body that fits `server.max_payload_size` but

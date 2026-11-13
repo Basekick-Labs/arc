@@ -374,30 +374,70 @@ func TestASyncDoesNotAnswerACheckpointWrittenAfterItStarted(t *testing.T) {
 	}
 	t.Cleanup(func() { syncFileFn = prev })
 	w := groupCommitWriter(t, SyncModeFdatasync, 100*1024*1024)
+	// Registered after the writer, so it runs before the writer's Close: a
+	// failure while a sync is held must not leave Close waiting on it for
+	// the package timeout (#1671).
+	var releaseOnce [2]sync.Once
+	release := func(i int) { releaseOnce[i].Do(func() { close(rel[i]) }) }
+	t.Cleanup(func() { release(0); release(1) })
+	recv := func(what string, ch <-chan error) error {
+		t.Helper()
+		select {
+		case err := <-ch:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+			return nil
+		}
+	}
+	nextStart := func() int {
+		t.Helper()
+		select {
+		case n := <-started:
+			return n
+		case <-time.After(5 * time.Second):
+			t.Fatal("no sync started")
+			return 0
+		}
+	}
 
 	first, err := w.AppendTracked([]map[string]interface{}{{"v": 1}})
 	require.NoError(t, err)
 	mark1 := make(chan error, 1)
 	go func() { mark1 <- w.MarkFlushed(first) }()
-	require.Equal(t, 1, <-started)
+	require.Equal(t, 1, nextStart())
 
+	// The sync started for the first checkpoint, so that checkpoint and every
+	// entry before it are counted. TotalEntries moves when the writer loop
+	// writes an entry, not when AppendTracked returns, so the baseline must
+	// be read before the second append: read after it, it may or may not
+	// include that entry, and waiting for two more would never end (#1671).
+	entries := atomic.LoadInt64(&w.TotalEntries)
 	second, err := w.AppendTracked([]map[string]interface{}{{"v": 2}})
 	require.NoError(t, err)
-	entries := atomic.LoadInt64(&w.TotalEntries)
 	mark2 := make(chan error, 1)
 	go func() { mark2 <- w.MarkFlushed(second) }()
-	waitFor(t, "the second checkpoint written", func() bool { return atomic.LoadInt64(&w.TotalEntries) >= entries+2 })
+	waitFor(t, "the second entry and its checkpoint written", func() bool { return atomic.LoadInt64(&w.TotalEntries) >= entries+2 })
+	// TotalEntries moves just before the checkpoint's waiter is handed to the
+	// syncer; wait for the handoff too, so the release below cannot land
+	// before the syncer knows of the second checkpoint. Waiters stay listed
+	// until their sync completes, so two means both are registered.
+	waitFor(t, "the second checkpoint handed to the syncer", func() bool {
+		w.syncMu.Lock()
+		defer w.syncMu.Unlock()
+		return len(w.syncWaiters) == 2
+	})
 
-	close(rel[0])
-	require.NoError(t, <-mark1)
+	release(0)
+	require.NoError(t, recv("the first checkpoint", mark1))
 	select {
 	case err := <-mark2:
 		t.Fatalf("a checkpoint written after a sync started was answered by it (%v)", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	require.Equal(t, 2, <-started)
-	close(rel[1])
-	require.NoError(t, <-mark2)
+	require.Equal(t, 2, nextStart())
+	release(1)
+	require.NoError(t, recv("the second checkpoint", mark2))
 	require.NoError(t, w.Close())
 }
 
