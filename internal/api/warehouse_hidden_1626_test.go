@@ -313,7 +313,7 @@ func TestIngestRefusesWarehouseDatabase_Issue1626(t *testing.T) {
 			t.Errorf("%s into 1bad: %d %s, want 400 invalid database name", path, resp.StatusCode, b)
 		}
 	}
-	for _, path := range []string{"/api/v1/import/lp", "/api/v1/import/tle", "/api/v1/import/csv?measurement=m", "/api/v1/import/parquet?measurement=m", "/api/v1/write/tle"} {
+	for _, path := range []string{"/api/v1/import/lp", "/api/v1/import/tle", "/api/v1/import/csv?measurement=m", "/api/v1/import/parquet?measurement=m", "/api/v1/write/tle", "/api/v1/write/prometheus"} {
 		var form bytes.Buffer
 		mw := multipart.NewWriter(&form)
 		fw, _ := mw.CreateFormFile("file", "data")

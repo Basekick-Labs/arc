@@ -5,21 +5,57 @@ Arc accepts Prometheus Remote Write 1.0 samples at
 defaults to `default`. When authentication is enabled, use a token with write
 permission for the target database.
 
-Arc stores `__name__` as the measurement, every other label as a tag, and each
-sample as a float64 `value`. Remote Write timestamps are milliseconds; Arc
-stores them at microsecond resolution. The receiver accepts the v1
-`prometheus.WriteRequest` protobuf format and Snappy block compression. Both
-the compressed body and decoded protobuf are capped at 100 MiB. Metric
-metadata is ignored.
-To keep sparse label sets from expanding into an unbounded in-memory column
-matrix, a request is also limited to 100,000 time series, 1 million samples,
-1 million labels and 4 million materialised column cells.
+Arc stores each metric as its own measurement (table), every other label as a
+tag column, and each sample as a float64 `value`. This is the layout
+[arc-opentelemetry-exporter](https://github.com/basekick-labs/arc-opentelemetry-exporter)
+writes for OTLP metrics, so a metric that arrives by either path lands in the
+same table. Remote Write timestamps are milliseconds; Arc stores them at
+microsecond resolution. The receiver accepts the v1 `prometheus.WriteRequest`
+protobuf format and Snappy block compression; a Remote Write 2.0 request
+(`proto=io.prometheus.write.v2.Request`) is answered 415. Both the compressed body and
+decoded protobuf are capped at 100 MiB. Metric metadata is ignored. To keep
+sparse label sets from expanding into an unbounded in-memory column matrix, a
+request is also limited to 100,000 time series, 1 million samples, 1 million
+labels and 4 million materialised column cells.
 
-Arc's measurement and column rules are stricter than Prometheus': measurement
-names must start with a letter and contain only letters, digits, `_` or `-`
-(up to 128 characters). Labels named `time` or `value` are rejected, as are
-label names that conflict with existing column names. Native histograms and
-exemplars are not supported and cause the request to be rejected.
+### Names
+
+- The measurement is the metric name with every character other than an ASCII
+  letter, digit or `_` replaced by `_`, as arc-opentelemetry-exporter does: a
+  recording rule's `job:http_requests:rate5m` is stored as
+  `job_http_requests_rate5m`. Two metric names that differ only there share a
+  table.
+- Label names are kept as sent, including Prometheus 3 UTF-8 names such as
+  `service.name`. An empty label value means the label is absent.
+- A series Arc cannot store is dropped and the rest of the request is
+  written: a metric name that does not start with a letter or is longer than
+  128 characters, a label named `value` or `time` (in any letter case), or
+  a series without `__name__`. A label that differs only in letter case from
+  another column of the measurement drops that measurement's samples in the
+  request. The answer is then a 400
+  `partial write` naming what was dropped, as for line protocol; Prometheus
+  logs it and does not resend the batch, and the other series are stored.
+
+### Samples
+
+- Staleness markers (the NaN Prometheus sends when a series stops) are not
+  stored: a NaN in `value` would make `avg(value)` and `sum(value)` NaN. Any
+  other NaN sample is stored as sent; filter it with `WHERE NOT isnan(value)`.
+- Samples are stored as sent, in any order. A batch Prometheus resends after
+  a 5xx or a timeout can store its samples twice; compaction later removes
+  rows identical in every column for a measurement with tag columns, which is
+  any metric with a label besides `__name__`.
+- Native histograms and exemplars are not supported. A native histogram
+  series is dropped; the samples of a series with exemplars are stored and
+  the exemplars reported as dropped.
+
+### Files
+
+Every metric is a table, so each buffer flush writes one Parquet file per
+metric that received samples. A Prometheus scraping node_exporter sends
+several hundred metric names, which is several hundred small files per flush
+until [compaction](../operations/compaction.md) merges them; raising
+`ingest.max_buffer_age_ms` lowers the count.
 
 ## Prometheus
 
@@ -51,8 +87,9 @@ prometheus.remote_write "arc" {
 ```
 
 Omit `bearer_token_file` when Arc authentication is disabled. Alloy enables
-exemplar sending by default, so the explicit setting above is required for
-this receiver.
+exemplar sending by default; with it on, every batch that carries an exemplar
+is answered with a `partial write` 400 (its samples are stored), so turn it
+off as above.
 
 Query the resulting data with SQL, for example:
 

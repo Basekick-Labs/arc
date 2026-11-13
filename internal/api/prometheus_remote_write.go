@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"mime"
-	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -13,6 +12,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang/snappy"
@@ -31,8 +31,6 @@ const (
 )
 
 var (
-	prometheusMetricName         = regexp.MustCompile("^[a-zA-Z_:][a-zA-Z0-9_:]*$")
-	prometheusLabelName          = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
 	errRemoteWriteTooBig         = errors.New("remote write payload exceeds 100 MiB limit")
 	errRemoteWriteTooManyCells   = errors.New("remote write request exceeds 4 million column cells")
 	errRemoteWriteTooManySeries  = errors.New("remote write request exceeds 100,000 time series")
@@ -59,6 +57,10 @@ func (h *LineProtocolHandler) WritePrometheusRemoteWrite(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+
+	if storage.IsWarehouseRootName(database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	if status, message := validatePrometheusRemoteWriteHeaders(c); status != 0 {
@@ -107,7 +109,11 @@ localProcessing:
 		return c.Status(status).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	records, sampleCount, err := prometheusRemoteWriteRecords(request)
+	// A series Arc cannot store is dropped and the others are written, as
+	// line protocol drops a point (#1342). Prometheus discards a batch
+	// answered 4xx without retrying, so refusing the request for one series
+	// lost every other series sent with it.
+	records, drops, err := prometheusRemoteWriteRecords(request)
 	if err != nil {
 		status := fiber.StatusBadRequest
 		if isRemoteWriteTooLarge(err) {
@@ -115,31 +121,39 @@ localProcessing:
 		}
 		return c.Status(status).JSON(fiber.Map{"error": err.Error()})
 	}
-	if sampleCount == 0 {
-		return c.SendStatus(fiber.StatusNoContent)
-	}
 
+	// In name order: RBAC reads them, and a write that stops part-way says
+	// which were written (#1437).
 	measurements := make([]string, 0, len(records))
 	for measurement := range records {
 		measurements = append(measurements, measurement)
 	}
 	sort.Strings(measurements)
-
 	names := ingest.NewRecordNameFilter(writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)))
+	kept := measurements[:0]
 	for _, measurement := range measurements {
-		if !names.Keep(records[measurement]) {
-			drops := names.Drops()
-			if len(drops) == 0 {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid Prometheus label names"})
-			}
-			drop := drops[len(drops)-1]
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("invalid label name %q for measurement %q: %s", ingest.TruncateColumnName(drop.Column), drop.Measurement, drop.Reason),
-			})
+		if names.Keep(records[measurement]) {
+			kept = append(kept, measurement)
 		}
 	}
+	measurements = kept
+	drops = append(drops, names.Drops()...)
+	dropped := droppedPoints(drops)
 
-	if h.rbacManager != nil {
+	rows := 0
+	for _, measurement := range measurements {
+		rows += len(records[measurement].Columns["time"])
+	}
+	if rows == 0 {
+		if dropped > 0 {
+			logPointDrops(h.logger, "Prometheus remote write", database, drops)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})
+		}
+		// An empty request, or one that carries only staleness markers.
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		if err := h.checkWritePermissions(c, database, measurements); err != nil {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -151,39 +165,31 @@ localProcessing:
 		}
 	}
 
-	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(decodedSize))
+	// The whole request is admitted once, as handleWrite admits it (#1422),
+	// and a failure part-way answers with what was written (#1437).
+	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(decodedSize))
 	if err != nil {
 		return respondWriteRefused(c, err)
 	}
 	defer release()
 
-	for _, measurement := range measurements {
-		record := records[measurement]
-		if err := h.buffer.WriteColumnarRecord(writeCtx, database, record); err != nil {
-			if ingest.IsWriteRefusal(err) {
-				return respondWriteRefused(c, err)
-			}
-			if errors.Is(err, ingest.ErrColumnTypeChange) {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
-			}
-			if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected: " + err.Error()})
-			}
-			metrics.Get().IncIngestErrors()
-			h.logger.Error().Err(err).
-				Str("database", database).
-				Str("measurement", measurement).
-				Int("samples", len(record.Columns["time"])).
-				Msg("Failed to write Prometheus remote write samples to Arrow buffer")
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
-		}
+	written, dropped, drops, stop := h.writeLPMeasurements(measurements, rows, dropped, drops, func(m string) (int, error) {
+		record := records[m]
+		return len(record.Columns["time"]), lpWriteRecord(h.buffer, writeCtx, database, record)
+	})
+	if stop != nil {
+		return h.answerLPStop(c, database, stop, drops)
 	}
 
 	m := metrics.Get()
-	m.IncIngestRecords(int64(sampleCount))
+	m.IncIngestRecords(int64(written))
 	m.IncIngestBytes(int64(decodedSize))
 	m.IncIngestBatches()
-	h.totalRecords.Add(int64(sampleCount))
+	h.totalRecords.Add(int64(written))
+	if dropped > 0 {
+		logPointDrops(h.logger, "Prometheus remote write", database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
+	}
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -205,9 +211,14 @@ func validatePrometheusRemoteWriteHeaders(c *fiber.Ctx) (int, string) {
 	if !ok {
 		return fiber.StatusUnsupportedMediaType, "Content-Type must be application/x-protobuf"
 	}
-	mediaType, _, err := mime.ParseMediaType(contentType)
+	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil || !strings.EqualFold(mediaType, "application/x-protobuf") {
 		return fiber.StatusUnsupportedMediaType, "Content-Type must be application/x-protobuf"
+	}
+	// Remote Write 2.0 names its message here; its spec has a receiver
+	// answer 415 to a message it does not take.
+	if proto, ok := params["proto"]; ok && proto != "prometheus.WriteRequest" {
+		return fiber.StatusUnsupportedMediaType, "only Remote Write 1.0 (proto=prometheus.WriteRequest) is supported; set protobuf_message: prometheus.WriteRequest"
 	}
 
 	version, ok := oneRequestHeader(c, "X-Prometheus-Remote-Write-Version")
@@ -238,10 +249,10 @@ type remoteWriteRequest struct {
 }
 
 type remoteWriteTimeSeries struct {
-	Labels        []remoteWriteLabel
-	Samples       []remoteWriteSample
-	HasExemplars  bool
-	HasHistograms bool
+	Labels     []remoteWriteLabel
+	Samples    []remoteWriteSample
+	Exemplars  int
+	Histograms int
 }
 
 type remoteWriteLabel struct {
@@ -363,9 +374,9 @@ func unmarshalRemoteWriteTimeSeries(data []byte, budget *remoteWriteParseBudget)
 				return nil, err
 			}
 			if number == 3 {
-				series.HasExemplars = true
+				series.Exemplars++
 			} else {
-				series.HasHistograms = true
+				series.Histograms++
 			}
 			data = rest
 		default:
@@ -469,35 +480,86 @@ func consumeRemoteWriteString(wireType protowire.Type, data []byte) (string, []b
 	return string(message), rest, nil
 }
 
-func prometheusRemoteWriteRecords(request *remoteWriteRequest) (map[string]*models.ColumnarRecord, int, error) {
+// prometheusStaleNaN is the value Prometheus sends as a staleness marker: the
+// series stopped (its target went away, or its rule stopped producing it). It
+// is a signal, not a sample. Stored, it is a NaN in value, and avg or sum over
+// the series is NaN from then on. Any other NaN is a sample and is kept.
+const prometheusStaleNaN uint64 = 0x7ff0000000000002
+
+// Reasons a series is dropped, for the partial-write answer.
+const (
+	remoteWriteDropNoName     = "series has no __name__ label"
+	remoteWriteDropEmptyLabel = "series has a label with an empty name"
+	remoteWriteDropDupLabel   = "series has the same label twice"
+	remoteWriteDropValueLabel = "label conflicts with the sample column \"value\""
+	remoteWriteDropLabelUTF8  = "label value is not valid UTF-8"
+	remoteWriteDropTimestamp  = "sample timestamp is outside Arc's supported range"
+	remoteWriteDropHistograms = "native histograms are not supported"
+	remoteWriteDropExemplars  = "exemplars are not supported"
+)
+
+// prometheusRemoteWriteRecords maps a request to one columnar record per
+// measurement. A series Arc cannot store is left out and listed in drops;
+// its exemplars and native histograms are listed too, and its float samples
+// are kept. Staleness markers are skipped. err is set only when the request
+// as a whole is over a limit.
+func prometheusRemoteWriteRecords(request *remoteWriteRequest) (map[string]*models.ColumnarRecord, []ingest.LPDrop, error) {
 	records := make(map[string]*models.ColumnarRecord)
 	tagNames := make(map[string]map[string]struct{})
-	sampleCount := 0
+	var drops []ingest.LPDrop
+	dropAt := make(map[[3]string]int)
+	drop := func(measurement, column, reason string, points int) {
+		key := [3]string{measurement, column, reason}
+		if i, ok := dropAt[key]; ok {
+			drops[i].Points += points
+			return
+		}
+		dropAt[key] = len(drops)
+		drops = append(drops, ingest.LPDrop{Measurement: measurement, Column: column, Reason: reason, Points: points})
+	}
 	columnCells := 0
 
 	for _, series := range request.Timeseries {
-		if series.HasHistograms {
-			return nil, 0, errors.New("native histograms are not supported")
+		measurement, tags, column, reason := prometheusSeriesLabels(series.Labels)
+		if series.Histograms > 0 {
+			drop(measurement, "", remoteWriteDropHistograms, series.Histograms)
 		}
-		if series.HasExemplars {
-			return nil, 0, errors.New("exemplars are not supported")
+		if series.Exemplars > 0 {
+			drop(measurement, "", remoteWriteDropExemplars, series.Exemplars)
 		}
-		if len(series.Samples) == 0 {
+		samples := 0
+		for _, sample := range series.Samples {
+			if math.Float64bits(sample.Value) != prometheusStaleNaN {
+				samples++
+			}
+		}
+		if samples == 0 {
+			continue
+		}
+		if reason != "" {
+			drop(measurement, column, reason, samples)
+			continue
+		}
+		inRange := true
+		for _, sample := range series.Samples {
+			if sample.Timestamp < math.MinInt64/1000 || sample.Timestamp > math.MaxInt64/1000 {
+				inRange = false
+				break
+			}
+		}
+		if !inRange {
+			drop(measurement, "", remoteWriteDropTimestamp, samples)
 			continue
 		}
 
-		measurement, tags, err := prometheusSeriesLabels(series.Labels)
-		if err != nil {
-			return nil, 0, err
-		}
 		record := records[measurement]
 		if record == nil {
 			record = &models.ColumnarRecord{
 				Measurement: measurement,
 				Columnar:    true,
 				Columns: map[string][]interface{}{
-					"time":  {},
-					"value": {},
+					"time":                {},
+					prometheusValueColumn: {},
 				},
 			}
 			records[measurement] = record
@@ -512,26 +574,21 @@ func prometheusRemoteWriteRecords(request *remoteWriteRequest) (map[string]*mode
 				newColumns++
 			}
 		}
-		newCellCount := (rowCount+len(series.Samples))*(columnCount+newColumns) - rowCount*columnCount
+		newCellCount := (rowCount+samples)*(columnCount+newColumns) - rowCount*columnCount
 		if newCellCount > maxRemoteWriteColumnCells-columnCells {
-			return nil, 0, errRemoteWriteTooManyCells
+			return nil, nil, errRemoteWriteTooManyCells
 		}
 		columnCells += newCellCount
 
-		for i, sample := range series.Samples {
-			if i > 0 && sample.Timestamp < series.Samples[i-1].Timestamp {
-				return nil, 0, fmt.Errorf("samples for measurement %q are not ordered by timestamp", measurement)
+		for name := range tags {
+			if _, exists := record.Columns[name]; !exists {
+				record.Columns[name] = make([]interface{}, rowCount)
 			}
-			if sample.Timestamp < math.MinInt64/1000 || sample.Timestamp > math.MaxInt64/1000 {
-				return nil, 0, fmt.Errorf("sample timestamp %d ms is outside Arc's supported range", sample.Timestamp)
-			}
-
-			row := len(record.Columns["time"])
-			for name := range tags {
-				if _, exists := record.Columns[name]; !exists {
-					record.Columns[name] = make([]interface{}, row)
-				}
-				tagNames[measurement][name] = struct{}{}
+			tagNames[measurement][name] = struct{}{}
+		}
+		for _, sample := range series.Samples {
+			if math.Float64bits(sample.Value) == prometheusStaleNaN {
+				continue
 			}
 			record.Columns["time"] = append(record.Columns["time"], sample.Timestamp*1000)
 			record.Columns[prometheusValueColumn] = append(record.Columns[prometheusValueColumn], sample.Value)
@@ -545,7 +602,6 @@ func prometheusRemoteWriteRecords(request *remoteWriteRequest) (map[string]*mode
 					record.Columns[name] = append(values, nil)
 				}
 			}
-			sampleCount++
 		}
 	}
 
@@ -555,49 +611,72 @@ func prometheusRemoteWriteRecords(request *remoteWriteRequest) (map[string]*mode
 		}
 		sort.Strings(record.TagColumns)
 	}
-	return records, sampleCount, nil
+	return records, drops, nil
 }
 
-func prometheusSeriesLabels(labels []remoteWriteLabel) (string, map[string]string, error) {
+// prometheusSeriesLabels is a series' measurement and tags. When the series
+// cannot be stored, reason says why (and column names the label at fault);
+// measurement is then the best name for the answer.
+func prometheusSeriesLabels(labels []remoteWriteLabel) (measurement string, tags map[string]string, column, reason string) {
 	metricName := ""
-	tags := make(map[string]string, len(labels))
-	previous := ""
-	for i, label := range labels {
-		if label.Name == "" || label.Value == "" {
-			return "", nil, errors.New("Prometheus labels must have non-empty names and values")
-		}
-		if !prometheusLabelName.MatchString(label.Name) {
-			return "", nil, fmt.Errorf("invalid Prometheus label name %q", ingest.TruncateColumnName(label.Name))
-		}
-		if !utf8.ValidString(label.Value) {
-			return "", nil, fmt.Errorf("Prometheus label %q has a value that is not valid UTF-8", ingest.TruncateColumnName(label.Name))
-		}
-		if i > 0 && label.Name <= previous {
-			return "", nil, errors.New("Prometheus labels must be sorted by name with no duplicates")
-		}
-		previous = label.Name
-
+	tags = make(map[string]string, len(labels))
+	seen := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
 		if label.Name == "__name__" {
 			metricName = label.Value
+		}
+	}
+	measurement = prometheusMeasurementName(metricName)
+	if metricName == "" {
+		return "", nil, "", remoteWriteDropNoName
+	}
+	if !isValidMeasurementName(measurement) {
+		return ingest.QuoteColumnName(metricName), nil, "", "metric name is not a valid Arc measurement name (letters, digits and _, starting with a letter, up to 128 characters)"
+	}
+	for _, label := range labels {
+		if label.Name == "" {
+			return measurement, nil, "", remoteWriteDropEmptyLabel
+		}
+		if _, dup := seen[label.Name]; dup {
+			return measurement, nil, label.Name, remoteWriteDropDupLabel
+		}
+		seen[label.Name] = struct{}{}
+		if label.Name == "__name__" || label.Value == "" {
+			// An empty label value is the same as no label (Prometheus data model).
 			continue
 		}
 		if problem := ingest.ColumnNameProblem(label.Name); problem != "" {
-			return "", nil, fmt.Errorf("invalid Prometheus label name %q: %s", ingest.TruncateColumnName(label.Name), problem)
+			return measurement, nil, label.Name, problem
 		}
 		if ingest.FoldColumnName(label.Name) == ingest.FoldColumnName(prometheusValueColumn) {
-			return "", nil, fmt.Errorf("Prometheus label name %q conflicts with Arc's sample value column %q", ingest.TruncateColumnName(label.Name), prometheusValueColumn)
+			return measurement, nil, label.Name, remoteWriteDropValueLabel
+		}
+		if !utf8.ValidString(label.Value) {
+			return measurement, nil, label.Name, remoteWriteDropLabelUTF8
 		}
 		tags[label.Name] = label.Value
 	}
+	return measurement, tags, "", ""
+}
 
-	if metricName == "" {
-		return "", nil, errors.New("Prometheus time series must include a non-empty __name__ label")
+// prometheusMeasurementName is the measurement for a metric name: every
+// character other than an ASCII letter, digit or _ becomes _, the rule
+// arc-opentelemetry-exporter applies to OTLP metric names, so a recording
+// rule's job:http_requests:rate5m is stored as job_http_requests_rate5m.
+func prometheusMeasurementName(metric string) string {
+	for i := 0; i < len(metric); i++ {
+		if !prometheusMeasurementByte(metric[i]) {
+			return strings.Map(func(r rune) rune {
+				if r < utf8.RuneSelf && prometheusMeasurementByte(byte(r)) {
+					return r
+				}
+				return '_'
+			}, metric)
+		}
 	}
-	if !prometheusMetricName.MatchString(metricName) {
-		return "", nil, fmt.Errorf("invalid Prometheus metric name %q", ingest.TruncateColumnName(metricName))
-	}
-	if !isValidMeasurementName(metricName) {
-		return "", nil, fmt.Errorf("Prometheus metric name %q is not a valid Arc measurement name", ingest.TruncateColumnName(metricName))
-	}
-	return metricName, tags, nil
+	return metric
+}
+
+func prometheusMeasurementByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }

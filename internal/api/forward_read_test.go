@@ -125,7 +125,7 @@ func TestOnlyTheIntendedRoutesAreForwardable(t *testing.T) {
 		"GET /api/v1/measurements": true, "GET /api/v1/databases/:database/measurements/:measurement/schema": true,
 		"GET /api/v1/databases": true, "GET /api/v1/databases/:name": true, "GET /api/v1/databases/:name/measurements": true,
 		"POST /write": true, "POST /api/v2/write": true, "POST /api/v1/write/line-protocol": true,
-		"POST /api/v1/write/msgpack": true, "POST /api/v1/write/tle": true,
+		"POST /api/v1/write/msgpack": true, "POST /api/v1/write/tle": true, "POST /api/v1/write/prometheus": true,
 		// Creation only; DELETE /api/v1/databases/:name stays refused.
 		"POST /api/v1/databases": true,
 	}

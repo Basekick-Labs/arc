@@ -156,6 +156,7 @@ var forwardedWrites = []struct{ path, body string }{
 	{"/write?db=db", "cpu,host=a value=1 1700000000000000000\n"},
 	{"/api/v1/write/msgpack", "\x81\xa1m\xa3cpu"},
 	{"/api/v1/write/tle", "ISS\n1 25544U\n2 25544\n"},
+	{prometheusRemoteWritePath, "\x00"},
 	{"/api/v1/import/lp", "cpu value=1\n"},
 	{"/api/v1/import/csv", "a,b\n1,2\n"},
 	{"/api/v1/databases", `{"name":"probe"}`},
@@ -184,10 +185,17 @@ func probeRequest(t *testing.T, path, body string) (req *http.Request, n int) {
 		raw, contentType = multipartUpload(t, raw)
 	case strings.Contains(path, "msgpack"):
 		contentType = "application/msgpack"
+	case strings.HasPrefix(path, prometheusRemoteWritePath):
+		contentType = "application/x-protobuf"
 	}
 	req = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
 	req.Header.Set("x-arc-database", "db")
 	req.Header.Set("Content-Type", contentType)
+	if strings.HasPrefix(path, prometheusRemoteWritePath) {
+		req.Header.Set("Content-Encoding", "snappy")
+		req.Header.Set("X-Prometheus-Remote-Write-Version", prometheusRemoteWriteVersion)
+		req.Header.Set("User-Agent", "Prometheus/3.7.3")
+	}
 	return req, len(raw)
 }
 

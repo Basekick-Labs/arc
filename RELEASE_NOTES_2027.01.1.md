@@ -3222,11 +3222,17 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https:/
 ### Prometheus Remote Write 1.0 ingestion (#1383)
 
 Arc accepts Prometheus Remote Write 1.0 samples at `/api/v1/write/prometheus`,
-mapping metric names to measurements, labels to tag columns and samples to a
-float64 `value` column. The receiver bounds decoded payload and materialised
-column memory, ignores metric metadata, and rejects exemplars and native
-histograms rather than silently dropping them. Prometheus and Grafana Alloy
-configuration examples are in the [integration guide](docs/integrations/prometheus-remote-write.md).
+so Prometheus, Grafana Alloy and other remote-write senders can ship metrics to
+Arc. Each metric is a measurement, named as arc-opentelemetry-exporter names an
+OTLP metric (characters other than letters, digits and `_` become `_`, so a
+recording rule's `job:up:sum` is `job_up_sum`); labels are tag columns and
+samples a float64 `value` column. Staleness markers are not stored. A series
+Arc cannot store (a label named `value` or `time`, no `__name__`) is dropped
+and the rest written, answered with a `partial write` 400 as for line protocol.
+The receiver bounds decoded payload and materialised column memory, ignores
+metric metadata, and does not store exemplars or native histograms. Prometheus
+and Grafana Alloy configuration examples are in the
+[integration guide](docs/integrations/prometheus-remote-write.md).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
 

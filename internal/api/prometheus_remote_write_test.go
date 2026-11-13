@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/database"
@@ -123,9 +124,9 @@ func TestPrometheusRemoteWriteDecodesAndMapsSamples(t *testing.T) {
 	decoded, decodedSize, err := decodePrometheusRemoteWrite(remoteWriteTestBody(request))
 	require.NoError(t, err)
 	require.Equal(t, len(request), decodedSize)
-	records, sampleCount, err := prometheusRemoteWriteRecords(decoded)
+	records, drops, err := prometheusRemoteWriteRecords(decoded)
 	require.NoError(t, err)
-	require.Equal(t, 3, sampleCount)
+	require.Empty(t, drops)
 	require.Equal(t, []string{"host", "region"}, records["cpu"].TagColumns)
 	require.Equal(t, []interface{}{int64(1_700_000_000_000_000), int64(1_700_000_001_000_000), int64(1_700_000_002_000_000)}, records["cpu"].Columns["time"])
 	require.Equal(t, []interface{}{12.5, 13.5, 7.0}, records["cpu"].Columns["value"])
@@ -189,30 +190,8 @@ func TestPrometheusRemoteWriteRejectsInvalidRequestsWithoutWriting(t *testing.T)
 		[]remoteWriteTestSample{{value: 1, time: 1}},
 		false, false,
 	)))
-	validThenNoName := remoteWriteTestBody(remoteWriteTestRequest(
-		remoteWriteTestSeries(
-			[]remoteWriteTestLabel{{name: "__name__", value: "cpu"}},
-			[]remoteWriteTestSample{{value: 1, time: 1}},
-			false, false,
-		),
-		remoteWriteTestSeries(
-			[]remoteWriteTestLabel{{name: "host", value: "a"}},
-			[]remoteWriteTestSample{{value: 2, time: 2}},
-			false, false,
-		),
-	))
-	unsorted := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
-		[]remoteWriteTestLabel{{name: "host", value: "a"}, {name: "__name__", value: "cpu"}},
-		[]remoteWriteTestSample{{value: 1, time: 1}},
-		false, false,
-	)))
 	duplicate := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
 		[]remoteWriteTestLabel{{name: "__name__", value: "cpu"}, {name: "host", value: "a"}, {name: "host", value: "b"}},
-		[]remoteWriteTestSample{{value: 1, time: 1}},
-		false, false,
-	)))
-	colonMetric := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
-		[]remoteWriteTestLabel{{name: "__name__", value: "process_cpu:seconds"}},
 		[]remoteWriteTestSample{{value: 1, time: 1}},
 		false, false,
 	)))
@@ -226,24 +205,9 @@ func TestPrometheusRemoteWriteRejectsInvalidRequestsWithoutWriting(t *testing.T)
 		[]remoteWriteTestSample{{value: 1, time: 1}},
 		false, false,
 	)))
-	exemplar := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
-		[]remoteWriteTestLabel{{name: "__name__", value: "cpu"}},
-		[]remoteWriteTestSample{{value: 1, time: 1}},
-		true, false,
-	)))
-	histogram := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
-		[]remoteWriteTestLabel{{name: "__name__", value: "cpu"}},
-		[]remoteWriteTestSample{{value: 1, time: 1}},
-		false, true,
-	)))
 	tooLargeTimestamp := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
 		[]remoteWriteTestLabel{{name: "__name__", value: "cpu"}},
 		[]remoteWriteTestSample{{value: 1, time: math.MaxInt64}},
-		false, false,
-	)))
-	outOfOrder := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
-		[]remoteWriteTestLabel{{name: "__name__", value: "cpu"}},
-		[]remoteWriteTestSample{{value: 1, time: 2}, {value: 2, time: 1}},
 		false, false,
 	)))
 
@@ -256,22 +220,17 @@ func TestPrometheusRemoteWriteRejectsInvalidRequestsWithoutWriting(t *testing.T)
 	}{
 		{name: "wrong content encoding", body: valid, headers: map[string]string{fiberHeaderContentEncoding: "gzip"}, status: http.StatusUnsupportedMediaType, message: "Content-Encoding"},
 		{name: "wrong content type", body: valid, headers: map[string]string{fiberHeaderContentType: "application/json"}, status: http.StatusUnsupportedMediaType, message: "Content-Type"},
+		{name: "remote write 2.0 message", body: valid, headers: map[string]string{fiberHeaderContentType: "application/x-protobuf;proto=io.prometheus.write.v2.Request"}, status: http.StatusUnsupportedMediaType, message: "Remote Write 1.0"},
 		{name: "missing version", body: valid, headers: map[string]string{"X-Prometheus-Remote-Write-Version": ""}, status: http.StatusBadRequest, message: "Version"},
 		{name: "missing user agent", body: valid, headers: map[string]string{fiberHeaderUserAgent: ""}, status: http.StatusBadRequest, message: "User-Agent"},
 		{name: "malformed snappy", body: []byte{0xff}, headers: nil, status: http.StatusBadRequest, message: "snappy"},
 		{name: "malformed protobuf", body: badProto, headers: nil, status: http.StatusBadRequest, message: "protobuf"},
 		{name: "decoded body limit", body: largeDecoded, headers: nil, status: http.StatusRequestEntityTooLarge, message: "100 MiB"},
-		{name: "missing metric name", body: noName, headers: nil, status: http.StatusBadRequest, message: "__name__"},
-		{name: "valid series before invalid series", body: validThenNoName, headers: nil, status: http.StatusBadRequest, message: "__name__"},
-		{name: "unsorted labels", body: unsorted, headers: nil, status: http.StatusBadRequest, message: "sorted"},
-		{name: "duplicate label", body: duplicate, headers: nil, status: http.StatusBadRequest, message: "duplicates"},
-		{name: "Arc-incompatible metric name", body: colonMetric, headers: nil, status: http.StatusBadRequest, message: "Arc measurement"},
+		{name: "missing metric name", body: noName, headers: nil, status: http.StatusBadRequest, message: "partial write: 1 points dropped"},
+		{name: "duplicate label", body: duplicate, headers: nil, status: http.StatusBadRequest, message: "same label twice"},
 		{name: "timestamp label", body: timeLabel, headers: nil, status: http.StatusBadRequest, message: "time"},
-		{name: "value label", body: valueLabel, headers: nil, status: http.StatusBadRequest, message: "value column"},
-		{name: "exemplar", body: exemplar, headers: nil, status: http.StatusBadRequest, message: "exemplars"},
-		{name: "native histogram", body: histogram, headers: nil, status: http.StatusBadRequest, message: "histograms"},
+		{name: "value label", body: valueLabel, headers: nil, status: http.StatusBadRequest, message: "conflicts with the sample column"},
 		{name: "timestamp overflow", body: tooLargeTimestamp, headers: nil, status: http.StatusBadRequest, message: "outside Arc"},
-		{name: "out-of-order samples", body: outOfOrder, headers: nil, status: http.StatusBadRequest, message: "ordered"},
 	}
 
 	trig := newLPWriteRig(t, nil)
@@ -344,4 +303,125 @@ func TestPrometheusRemoteWriteBoundsProtoElements(t *testing.T) {
 		require.ErrorIs(t, err, errRemoteWriteTooManyLabels)
 		require.True(t, isRemoteWriteTooLarge(err))
 	})
+}
+
+// One batch as Prometheus sends it: scraped series, a recording rule, series
+// Arc cannot store, staleness markers and exemplars. Only what cannot be
+// stored is left out; Prometheus drops a 4xx batch without retrying, so a
+// refusal of the whole request lost every other series in it.
+func TestPrometheusRemoteWriteDropsOnlyTheSeriesItCannotStore(t *testing.T) {
+	const ts = int64(1_763_037_600_000) // ms
+	stale := math.Float64frombits(prometheusStaleNaN)
+	series := func(labels []remoteWriteTestLabel, samples []remoteWriteTestSample, exemplars bool) []byte {
+		return remoteWriteTestSeries(labels, samples, exemplars, false)
+	}
+	request := remoteWriteTestRequest(
+		series([]remoteWriteTestLabel{{"__name__", "node_load1"}, {"instance", "host-01:9100"}, {"job", "node"}},
+			[]remoteWriteTestSample{{0.18, ts}, {stale, ts + 5000}}, false),
+		// A recording rule: colons become underscores.
+		series([]remoteWriteTestLabel{{"__name__", "job:up:sum"}, {"job", "node"}},
+			[]remoteWriteTestSample{{1, ts}}, false),
+		// A UTF-8 label name (Prometheus 3) is a valid Arc column.
+		series([]remoteWriteTestLabel{{"__name__", "http_server_duration_seconds_count"}, {"service.name", "checkout"}},
+			[]remoteWriteTestSample{{42, ts}}, false),
+		// Samples out of order are stored as sent.
+		series([]remoteWriteTestLabel{{"__name__", "up"}, {"instance", "host-02:9100"}, {"job", "node"}},
+			[]remoteWriteTestSample{{1, ts + 1000}, {0, ts}}, false),
+		// Only a staleness marker: nothing to store, nothing dropped.
+		series([]remoteWriteTestLabel{{"__name__", "node_cpu_seconds_total"}, {"cpu", "0"}, {"mode", "idle"}},
+			[]remoteWriteTestSample{{stale, ts}}, false),
+		// An empty label value is the same as no label.
+		series([]remoteWriteTestLabel{{"__name__", "up"}, {"instance", "host-03:9100"}, {"job", "node"}, {"zone", ""}},
+			[]remoteWriteTestSample{{1, ts}}, false),
+		// Dropped: a label named value, a label named time, no __name__.
+		series([]remoteWriteTestLabel{{"__name__", "kube_pod_labels"}, {"value", "x"}},
+			[]remoteWriteTestSample{{1, ts}}, false),
+		series([]remoteWriteTestLabel{{"__name__", "kube_pod_labels"}, {"Time", "x"}},
+			[]remoteWriteTestSample{{1, ts}, {1, ts + 1}}, false),
+		series([]remoteWriteTestLabel{{"instance", "host-01:9100"}},
+			[]remoteWriteTestSample{{1, ts}}, false),
+		// The exemplar is reported; the sample is stored.
+		series([]remoteWriteTestLabel{{"__name__", "http_requests_total"}, {"code", "200"}},
+			[]remoteWriteTestSample{{7, ts}}, true),
+	)
+
+	r := newLPWriteRig(t, nil)
+	status, out := remoteWriteTestPost(t, r, remoteWriteTestBody(request), remoteWriteTestHeaders())
+	require.Equal(t, http.StatusBadRequest, status, out)
+	require.Contains(t, out, "partial write: 5 points dropped")
+	require.Contains(t, out, `column \"value\"`)
+	require.Contains(t, out, `column \"Time\"`)
+	require.Contains(t, out, "no __name__ label")
+	require.Contains(t, out, "exemplars are not supported")
+	require.Contains(t, out, "the other points were written")
+
+	rows, types := r.stored(t)
+	require.Equal(t, map[string]int64{
+		"node_load1":                         1,
+		"job_up_sum":                         1,
+		"http_server_duration_seconds_count": 1,
+		"up":                                 3,
+		"http_requests_total":                1,
+	}, rows)
+	require.Equal(t, "utf8", types["http_server_duration_seconds_count"]["service.name"])
+	require.NotContains(t, types["up"], "zone")
+}
+
+func TestPrometheusMeasurementName(t *testing.T) {
+	for in, want := range map[string]string{
+		"node_load1":               "node_load1",
+		"job:http_requests:rate5m": "job_http_requests_rate5m",
+		"http.server.duration":     "http_server_duration",
+		"temp_°c":                  "temp__c",
+		"a-b":                      "a_b",
+	} {
+		require.Equal(t, want, prometheusMeasurementName(in), in)
+	}
+	// Still refused after the mapping: Arc measurements start with a letter.
+	for _, name := range []string{":up", "_x", "1x"} {
+		require.False(t, isValidMeasurementName(prometheusMeasurementName(name)), name)
+	}
+}
+
+// #1422 on this route: the ingest gate is checked once for the request, so a
+// fence closing after the first measurement does not split a batch that
+// Prometheus would then resend whole.
+func TestPrometheusRemoteWriteFenceClosingMidRequestDoesNotSplitIt(t *testing.T) {
+	r := newLPWriteRig(t, nil)
+	var mu sync.Mutex
+	calls := 0
+	r.buf.SetIngestGate(func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls <= 2 {
+			return nil
+		}
+		return fencedErr(t)
+	})
+	request := remoteWriteTestRequest(
+		remoteWriteTestSeries([]remoteWriteTestLabel{{"__name__", "node_load1"}, {"instance", "host-01:9100"}},
+			[]remoteWriteTestSample{{0.18, 1_763_037_600_000}}, false, false),
+		remoteWriteTestSeries([]remoteWriteTestLabel{{"__name__", "up"}, {"instance", "host-01:9100"}},
+			[]remoteWriteTestSample{{1, 1_763_037_600_000}}, false, false),
+	)
+	status, out := remoteWriteTestPost(t, r, remoteWriteTestBody(request), remoteWriteTestHeaders())
+	require.Equal(t, http.StatusNoContent, status, out)
+	mu.Lock()
+	require.Equal(t, 1, calls, "the ingest gate is checked once per request")
+	mu.Unlock()
+	rows, _ := r.stored(t)
+	require.Equal(t, map[string]int64{"node_load1": 1, "up": 1}, rows)
+}
+
+// Remote Write 1.0 senders may name their message in the Content-Type.
+func TestPrometheusRemoteWriteAcceptsTheNamedV1Message(t *testing.T) {
+	r := newLPWriteRig(t, nil)
+	headers := remoteWriteTestHeaders()
+	headers[fiberHeaderContentType] = "application/x-protobuf;proto=prometheus.WriteRequest"
+	body := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
+		[]remoteWriteTestLabel{{"__name__", "up"}, {"instance", "host-01:9100"}},
+		[]remoteWriteTestSample{{1, 1_763_037_600_000}}, false, false)))
+	status, out := remoteWriteTestPost(t, r, body, headers)
+	require.Equal(t, http.StatusNoContent, status, out)
 }
