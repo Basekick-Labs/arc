@@ -263,6 +263,29 @@ These cases are still not repaired:
 - **Each file gets one repair attempt.** A second damaged length in the same
   file reads as before.
 
+## Fix: a compressed MessagePack write over the size limit answers 413 ([#1651](https://github.com/Basekick-Labs/arc/pull/1651))
+
+A gzip or zstd MessagePack body that fits `server.max_payload_size` but
+decompresses past it was answered `400`, the status for a malformed request.
+A client that splits a batch on `413` (the Node-RED node, [node-red-arc#3](https://github.com/Basekick-Labs/node-red-arc/issues/3))
+therefore failed the whole batch instead of splitting it. It now answers `413`,
+as an oversized uncompressed body already did:
+
+```
+413 {"error":"Payload too large: decompressed payload exceeds 4MB limit. Consider batching into smaller requests."}
+```
+
+The message keeps the text the `400` carried (`decompressed payload exceeds
+<limit> limit`); its `Invalid gzip compression:` / `Invalid zstd compression:`
+prefix is gone. Under a limit below 32 MB, a zstd frame whose window is over
+the limit answers `413` too (`the zstd frame's 2MB window exceeds the 1MB
+limit`): `zstd -3`, and Node's `zstdCompressSync`, give a large batch a 2 MB
+window, and a smaller batch gets a smaller one. A corrupt body, and a frame
+whose window is over 32 MB (`--ultra`, `--long`), still answer `400`. `GET /api/v1/write/msgpack/spec` says so. Line
+Protocol and TLE writes are unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir).
+
 ## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
 
 With the WAL on and object storage as the backend, a flush whose upload hit
