@@ -2,10 +2,6 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Fix: S3 batch-delete errors name the key Arc knows ([#1111](https://github.com/Basekick-Labs/arc/issues/1111))
-
-With an S3 object prefix configured, a failed object in a batch delete (compaction cleanup, a database delete, backup deletion and restore, the reconciliation sweep) was reported under the prefixed object name, a name that appears in no manifest, listing or other log line. The `key` log field and the error now carry the key Arc uses, as Azure and GCS already did. The request sent to S3 is unchanged.
-
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
 Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table, on nodes where governance is off too, is kept equal to it as a backup and is never read again.
@@ -99,6 +95,10 @@ What changes with the WAL on:
   `oss-local`, `oss-s3`, `oss-traefik` and `enterprise-shared`, and
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
+
+## Fix: S3 batch-delete errors name the key Arc knows ([#1111](https://github.com/Basekick-Labs/arc/issues/1111))
+
+With an S3 object prefix configured, a failed object in a batch delete (compaction cleanup, a database delete, backup deletion and restore, the reconciliation sweep) was reported under the prefixed object name, a name that appears in no manifest, listing or other log line. The `key` log field and the error now carry the key Arc uses, as Azure and GCS already did. The request sent to S3 is unchanged.
 
 ## Fix: a long query no longer costs the buffer flush and WAL close at shutdown ([#1644](https://github.com/Basekick-Labs/arc/issues/1644))
 
