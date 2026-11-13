@@ -3201,7 +3201,12 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https:/
 The Flight SQL listener answers `GetSqlInfo` with the server name (`Arc`), the
 Arc and Arrow versions, that it is read-only and takes SQL but not Substrait,
 transactions, cancellation, bulk ingestion or DDL, the identifier quote (`"`),
-the metadata search-pattern escape (`\`) and the catalog term (`database`).
+the metadata search-pattern escape (`\`), the catalog term (`database`), and
+the query grammar it supports: column and table aliases, `GROUP BY`, `UNION`
+and `UNION ALL`, full outer joins, subqueries (correlated too), expressions and
+unrelated columns in `ORDER BY`, and `LIKE ... ESCAPE`. The JDBC driver reads a
+value the server leaves out as `false`, so without these it would report that
+Arc has no `GROUP BY`, `UNION`, joins or subqueries.
 Before, every SqlInfo request failed with `NotFound`: ADBC's `GetInfo` failed
 with it (`adbc_get_info()` in Python), and with the Arrow Flight SQL JDBC driver
 every `DatabaseMetaData` call that reads SqlInfo threw, such as
@@ -3211,7 +3216,7 @@ range, is answered with the rest. Queries through the JDBC driver still need
 prepared statements, which are not implemented yet. See
 `docs/operations/flight-sql.md`.
 
-Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657).
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.
 
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 

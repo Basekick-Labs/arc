@@ -817,8 +817,8 @@ func flightCodeForHTTP(code int) codes.Code {
 }
 
 // flightSQLInfo is what GetSqlInfo answers: who the server is, that it is
-// read-only, how identifiers are quoted and search patterns escaped, and which
-// kinds of statement it takes. The JDBC driver answers DatabaseMetaData from
+// read-only, how identifiers are quoted and search patterns escaped, which
+// kinds of statement it takes and which query grammar it supports. The JDBC driver answers DatabaseMetaData from
 // it, and ADBC's GetInfo reads the server name and versions from it.
 func flightSQLInfo(version string) map[flightsql.SqlInfo]interface{} {
 	info := map[flightsql.SqlInfo]interface{}{
@@ -837,12 +837,63 @@ func flightSQLInfo(version string) map[flightsql.SqlInfo]interface{} {
 		// The escape compileFlightPattern applies to metadata patterns.
 		flightsql.SqlInfoSearchStringEscape: `\`,
 		flightsql.SqlInfoCatalogTerm:        "database",
+		// database.measurement: the catalog comes first.
+		flightsql.SqlInfoCatalogAtStart: true,
+
+		// What the query grammar supports, every one checked through Flight
+		// against Arc's db.table rewrite. A client that is not told reads
+		// these as false: the JDBC driver (19.0.0) answers an ID the server
+		// leaves out with false, 0 or "", so leaving one out claims that Arc
+		// has no GROUP BY, UNION, outer join or subqueries.
+		flightsql.SqlInfoSupportsColumnAliasing:        true,
+		flightsql.SqlInfoNullPlusNullIsNull:            true,
+		flightsql.SqlInfoSupportsTableCorrelationNames: true,
+		flightsql.SqlInfoSupportsExpressionsInOrderBy:  true,
+		flightsql.SqlInfoSupportsOrderByUnrelated:      true,
+		flightsql.SqlInfoSupportsLikeEscapeClause:      true,
+		flightsql.SqlInfoCorrelatedSubqueriesSupported: true,
+		// Bitmasks: bit n is the enum value n.
+		flightsql.SqlInfoSupportedGroupBy:    int32(flightSQLGroupByUnrelated | flightSQLGroupByBeyondSelect),
+		flightsql.SqlInfoSupportedSubqueries: int32(flightSQLSubqueriesInComparisons | flightSQLSubqueriesInExists | flightSQLSubqueriesInIns | flightSQLSubqueriesInQuantifieds),
+		flightsql.SqlInfoSupportedUnions:     int32(flightSQLUnion | flightSQLUnionAll),
+		// Results stream forward only; there are no transactions, so the only
+		// isolation level is none.
+		flightsql.SqlInfoSupportedResultSetTypes:              int32(flightSQLResultSetForwardOnly),
+		flightsql.SqlInfoSupportedTransactionsIsolationlevels: int32(flightSQLTransactionIsolationNone),
+		// An ordinal, not a bitmask: full outer joins.
+		flightsql.SqlInfoOuterJoinsSupportLevel: int32(flightSQLFullOuterJoins),
+		// The ODBC minimum grammar, whose writes a read-only source may leave
+		// out (ODBC reference, appendix C). Not the core or extended grammar,
+		// and no ANSI-92 level: those are full levels including DDL and DML.
+		flightsql.SqlInfoSupportedGrammar: int32(flightSQLMinimumGrammar),
 	}
 	if version != "" {
 		info[flightsql.SqlInfoFlightSqlServerVersion] = version
 	}
 	return info
 }
+
+// SqlInfo enum values from the Flight SQL protocol (FlightSql.proto); the
+// bitmask ones are 1 << the enum value. arrow-go exports no Go names for them.
+const (
+	flightSQLGroupByUnrelated    = 1 << 0 // SQL_GROUP_BY_UNRELATED
+	flightSQLGroupByBeyondSelect = 1 << 1 // SQL_GROUP_BY_BEYOND_SELECT
+
+	flightSQLSubqueriesInComparisons = 1 << 0 // SQL_SUBQUERIES_IN_COMPARISONS
+	flightSQLSubqueriesInExists      = 1 << 1 // SQL_SUBQUERIES_IN_EXISTS
+	flightSQLSubqueriesInIns         = 1 << 2 // SQL_SUBQUERIES_IN_INS
+	flightSQLSubqueriesInQuantifieds = 1 << 3 // SQL_SUBQUERIES_IN_QUANTIFIEDS
+
+	flightSQLUnion    = 1 << 0 // SQL_UNION
+	flightSQLUnionAll = 1 << 1 // SQL_UNION_ALL
+
+	flightSQLResultSetForwardOnly     = 1 << 1 // SQL_RESULT_SET_TYPE_FORWARD_ONLY
+	flightSQLTransactionIsolationNone = 1 << 0 // SQL_TRANSACTION_NONE
+
+	flightSQLFullOuterJoins = 2 // SqlOuterJoinsSupportLevel.SQL_FULL_OUTER_JOINS (ordinal)
+
+	flightSQLMinimumGrammar = 1 << 0 // SQL_MINIMUM_GRAMMAR
+)
 
 func (s *flightSQLService) registerSqlInfo(info map[flightsql.SqlInfo]interface{}) error {
 	s.sqlInfo = make(map[uint32]struct{}, len(info))

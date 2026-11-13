@@ -108,6 +108,27 @@ func TestFlightSQLGetSqlInfoAnswersEveryRegisteredValue(t *testing.T) {
 		flightsql.SqlInfoIdentifierQuoteChar:          `"`,
 		flightsql.SqlInfoSearchStringEscape:           `\`,
 		flightsql.SqlInfoCatalogTerm:                  "database",
+		flightsql.SqlInfoCatalogAtStart:               true,
+
+		flightsql.SqlInfoSupportsColumnAliasing:        true,
+		flightsql.SqlInfoNullPlusNullIsNull:            true,
+		flightsql.SqlInfoSupportsTableCorrelationNames: true,
+		flightsql.SqlInfoSupportsExpressionsInOrderBy:  true,
+		flightsql.SqlInfoSupportsOrderByUnrelated:      true,
+		flightsql.SqlInfoSupportsLikeEscapeClause:      true,
+		flightsql.SqlInfoCorrelatedSubqueriesSupported: true,
+		// GROUP BY unrelated and beyond select; subqueries in comparisons,
+		// EXISTS, IN and quantified comparisons; UNION and UNION ALL.
+		flightsql.SqlInfoSupportedGroupBy:    int32(0b11),
+		flightsql.SqlInfoSupportedSubqueries: int32(0b1111),
+		flightsql.SqlInfoSupportedUnions:     int32(0b11),
+		// Forward-only result sets; isolation level none.
+		flightsql.SqlInfoSupportedResultSetTypes:              int32(0b10),
+		flightsql.SqlInfoSupportedTransactionsIsolationlevels: int32(0b1),
+		// SQL_FULL_OUTER_JOINS, an ordinal.
+		flightsql.SqlInfoOuterJoinsSupportLevel: int32(2),
+		// The ODBC minimum grammar only.
+		flightsql.SqlInfoSupportedGrammar: int32(0b1),
 	}, readSqlInfo(ctx, t, client))
 }
 
