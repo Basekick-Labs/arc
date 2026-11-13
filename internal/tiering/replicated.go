@@ -339,6 +339,13 @@ func (m *Manager) RecordRestoredColdFiles(ctx context.Context, sizes map[string]
 	now := time.Now()
 	files, failed := m.restoredFileRows(sizes, now)
 	quarantined, err := m.metadata.RecordColdFilesBatch(ctx, files, now)
+	if err != nil || len(failed) > 0 {
+		// Bytes in the cold store with no row: until a complete cold sync
+		// records them, these rows cannot vouch for an empty range (#1550).
+		// Logged inside if it cannot be persisted; untrusted in memory
+		// regardless.
+		_ = m.markColdMetadataUnverified(coldAuthorityReasonRestore)
+	}
 	if err != nil {
 		return nil, failed, err
 	}
@@ -1153,10 +1160,11 @@ func (m *Manager) logRefusedHotRegistration(ctx context.Context, path string) {
 // The reason is a hint only, and must be: the operator manifest-delete
 // endpoint passes whatever ?reason= it is given, so a reason that looks like a
 // migration is not proof of one. Treating it as proof would insert a cold row
-// for a path with no cold object — and nothing retires such a row, because
-// orphan reconciliation only examines cold rows whose hot copy still exists
-// and the cold sync reports a missing object rather than reverting the row.
-// The measurement would then lose its hot glob: the very bug this file fixes.
+// for a path with no cold object. Orphan reconciliation only examines cold
+// rows whose hot copy still exists, and on a primary or standalone node the
+// cold sync reports a missing object rather than reverting the row; a reader
+// retires it only at its next cold sync (#1563). Until then the measurement
+// would lose its hot glob: the very bug this file fixes.
 //
 // So a migration-shaped reason buys one existence check against the cold
 // backend, and the check decides:

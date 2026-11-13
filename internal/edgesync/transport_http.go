@@ -312,7 +312,7 @@ func (t *HTTPTransport) statusError(resp *http.Response, op string) error {
 			msg += " (the ARC_EDGE_SYNC_HUB_TOKEN on this spoke was rejected by the hub, or the request MAC failed; check the token, then the spoke secret and hub_id)"
 		}
 	case http.StatusForbidden:
-		msg += " (the ARC_EDGE_SYNC_HUB_TOKEN on this spoke lacks write permission on the hub)"
+		msg += " (the ARC_EDGE_SYNC_HUB_TOKEN on this spoke lacks write permission on the hub: its own write permission, or, for a token in an RBAC team, a write grant on database {spoke_id} for this spoke's database as the measurement)"
 	}
 	return fmt.Errorf("edgesync: %s failed with %d: %s", op, resp.StatusCode, msg)
 }

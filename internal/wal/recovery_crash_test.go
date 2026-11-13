@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -58,6 +59,10 @@ func testRecoveryTornTail(t *testing.T, rows []map[string]interface{}) {
 			}
 			wantRows := 2 * len(rows)
 			wantKept := false
+			// A damaged frame is quarantined on the first pass, after the
+			// barrier stored the intact entries (#1634): kept on disk as
+			// .failed, never deleted.
+			wantQuarantined := false
 			switch mode {
 			case "payload", "failed_barrier":
 				data = data[:len(data)-4]
@@ -69,14 +74,14 @@ func testRecoveryTornTail(t *testing.T, rows []map[string]interface{}) {
 				wantRows = 0
 			case "middle_checksum", "middle_checksum_and_tail":
 				data[offsets[1]+WALEntryHeaderSize] ^= 0xff
-				wantKept = true
+				wantQuarantined = true
 				if mode == "middle_checksum_and_tail" {
 					data = data[:len(data)-4]
 					wantRows = len(rows)
 				}
 			case "last_checksum":
 				data[offsets[2]+WALEntryHeaderSize] ^= 0xff
-				wantKept = true
+				wantQuarantined = true
 			}
 			if err := os.WriteFile(path, data, 0600); err != nil {
 				t.Fatal(err)
@@ -100,6 +105,16 @@ func testRecoveryTornTail(t *testing.T, rows []map[string]interface{}) {
 				t.Fatalf("replayed %d rows, want %d", replayed, wantRows)
 			}
 			_, statErr := os.Stat(path)
+			if wantQuarantined {
+				kept, readErr := os.ReadFile(path + ".failed")
+				if readErr != nil || !bytes.Equal(kept, data) || !os.IsNotExist(statErr) || stats.QuarantinedFiles != 1 || stats.KeptFiles != 0 {
+					t.Fatalf("damaged file not quarantined intact: read=%v stat=%v stats=%+v", readErr, statErr, stats)
+				}
+				if wantRows > 0 && barriers != 1 {
+					t.Fatalf("intact rows were not fenced before the quarantine: barriers=%d", barriers)
+				}
+				return
+			}
 			if wantKept {
 				if statErr != nil || stats.KeptFiles != 1 {
 					t.Fatalf("unsafe deletion: stat=%v stats=%+v", statErr, stats)

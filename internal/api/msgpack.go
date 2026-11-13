@@ -10,6 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -87,10 +88,10 @@ type MsgPackHandler struct {
 	maxPayloadSize int64 // Maximum payload size in bytes (applies to both compressed and decompressed)
 
 	// authManager holds the concrete *auth.AuthManager so we can wire
-	// auth.RequireWrite as route-level middleware AND so RBAC checks
-	// at request time use the same instance. Concrete (not the local
-	// AuthManager interface) because auth.RequireWrite is implemented
-	// against the struct; using the interface required a type
+	// the write-tier route middleware AND so RBAC checks at request time
+	// use the same instance. Concrete (not the local AuthManager
+	// interface) because the auth middleware is implemented against the
+	// struct; using the interface required a type
 	// assertion that could silently miss on a mock and disable route
 	// protection.
 	authManager *auth.AuthManager
@@ -116,8 +117,8 @@ func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, m
 }
 
 // SetAuthAndRBAC sets the auth and RBAC managers. Takes the concrete
-// *auth.AuthManager (not the local AuthManager interface) so route-
-// level auth.RequireWrite middleware can be wired without a type
+// *auth.AuthManager (not the local AuthManager interface) so the route-
+// level write middleware can be wired without a type
 // assertion that could silently miss on a mock and disable
 // protection. nil = auth disabled (OSS default).
 func (h *MsgPackHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
@@ -177,13 +178,15 @@ func (h *MsgPackHandler) checkWritePermissions(c *fiber.Ctx, database string, me
 	return CheckWritePermissions(c, h.rbacManager, h.logger, database, measurements)
 }
 
-// RegisterRoutes registers MessagePack endpoints. The write endpoint
-// is gated by auth.RequireWrite when an auth manager is configured —
-// per CLAUDE.md, mutating endpoints MUST have an explicit write-tier
-// auth middleware. Stats and spec remain at any-authenticated-token
-// level (gated by the global auth middleware in main.go).
+// RegisterRoutes registers MessagePack endpoints. The write endpoint is
+// gated by withAnyResourceWriteAuth when an auth manager is configured —
+// per CLAUDE.md, mutating endpoints MUST have an explicit write-tier auth
+// middleware. It admits a token holding write on anything, RBAC included
+// (#1559); checkWritePermissions then checks every measurement in the
+// payload. Stats and spec remain at any-authenticated-token level (gated
+// by the global auth middleware in main.go).
 func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/msgpack", withWriteAuth(h.authManager), h.writeMsgPack)
+	app.Post("/api/v1/write/msgpack", withAnyResourceWriteAuth(h.authManager, h.rbacManager), h.writeMsgPack)
 	app.Get("/api/v1/write/msgpack/stats", h.msgPackStats)
 	app.Get("/api/v1/write/msgpack/spec", h.msgPackSpec)
 }
@@ -201,7 +204,10 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding write request to writer node")
 
-		httpReq, err := BuildHTTPRequest(c)
+		// Built only here, once the write is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		httpReq, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -209,7 +215,9 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 			})
 		}
 
-		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		defer release()
+
+		resp, err := h.router.RouteWrite(fctx, httpReq)
 		if err == cluster.ErrLocalNodeCanHandle {
 			// Fall through to local processing
 			goto localProcessing
@@ -278,6 +286,12 @@ localProcessing:
 	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
 		decompressed, derr := decompressGzipPooled(rawBody, int(h.maxPayloadSize))
 		if derr != nil {
+			var sizeErr *decompressedPayloadTooLargeError
+			if errors.As(derr, &sizeErr) {
+				return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+					"error": fmt.Sprintf("Payload too large: %v. Consider batching into smaller requests.", sizeErr),
+				})
+			}
 			h.logger.Error().Err(derr).Msg("Failed to decompress gzip data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": fmt.Sprintf("Invalid gzip compression: %v", derr),
@@ -288,6 +302,12 @@ localProcessing:
 	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
 		decompressed, derr := decompressZstdPooled(rawBody, int(h.maxPayloadSize))
 		if derr != nil {
+			var sizeErr *decompressedPayloadTooLargeError
+			if errors.As(derr, &sizeErr) {
+				return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+					"error": fmt.Sprintf("Payload too large: %v. Consider batching into smaller requests.", sizeErr),
+				})
+			}
 			h.logger.Error().Err(derr).Msg("Failed to decompress zstd data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": fmt.Sprintf("Invalid zstd compression: %v", derr),
@@ -323,6 +343,10 @@ localProcessing:
 	knownDB = strings.Clone(knownDB)
 	known := writableKnownColumns(c, h.rbacManager, knownDB, h.arrowBuffer.KnownColumns(knownDB))
 	records, recordCount, drops, err := h.decoder.DecodeWithDropsKnown(payload, known)
+	if errors.Is(err, ingest.ErrLPCellBudget) {
+		h.logger.Warn().Err(err).Int("body_bytes", len(payload)).Msg("MessagePack write refused")
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to decode MessagePack")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -368,6 +392,9 @@ localProcessing:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+	if storage.IsWarehouseRootName(database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	// A record whose tag or field names Arc could not read back is dropped,
@@ -449,10 +476,14 @@ localProcessing:
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err)
 		}
-		// A client error (#440, #1342), refused before the WAL; nothing was
-		// written.
+		// A client error (#440, #1342, #1424, #1475), refused before the WAL; nothing
+		// was written.
 		if ingest.IsContentRefusal(err) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Msg("MessagePack write refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
 		metrics.Get().IncIngestErrors()
@@ -541,7 +572,7 @@ func msgPackSpecDocument() fiber.Map {
 		"compression": fiber.Map{
 			"formats":   []string{"zstd (recommended)", "gzip", "none"},
 			"detection": "by the body's magic bytes; no Content-Encoding header is needed",
-			"limits":    "server.max_payload_size (default 1GB) bounds the request body (413) and the decompressed payload (400); zstd frames declaring a window over 32MB (--long, --ultra) are refused",
+			"limits":    "server.max_payload_size (default 1GB) bounds the request body (413) and the decompressed payload (413); zstd frames declaring a window over 32MB (--long, --ultra) are refused",
 		},
 		"authentication": fiber.Map{
 			"header":        "Authorization",
@@ -584,7 +615,7 @@ func msgPackSpecDocument() fiber.Map {
 			"400": "empty body, bad compression, malformed MessagePack, a payload missing m or fields/f, columns of different lengths, a non-numeric time, an invalid database or measurement name, a column whose type conflicts with stored data, or \"partial write: N points dropped\" when some points or batch/array items could not be written (the message says whether the others were)",
 			"401": "missing or invalid token",
 			"403": "token lacks write permission",
-			"413": "request body larger than server.max_payload_size",
+			"413": "request body, or the payload it decompresses to, larger than server.max_payload_size; split the batch and retry",
 			"500": "unexpected server error",
 			"502": "cluster: the write could not be routed to a writer",
 			"503": "temporarily refusing writes (shutdown, WAL disk pressure, schema churn, cluster write fence, no writer reachable); retry",

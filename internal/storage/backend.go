@@ -218,7 +218,10 @@ var ErrAdoptUnsupported = errors.New("storage: local file cannot be adopted in p
 // the caller must not read it afterwards. That is the point of the interface
 // and the reason it is opt-in rather than part of Backend. A backend that
 // copies bytes must not implement it, and a caller that still needs the file
-// must not use it.
+// must not use it. The source is also consumed by a failure after the move,
+// when the moved file could not be made durable and was removed (#1618): the
+// caller must treat any error other than ErrAdoptUnsupported as "the source
+// may be gone".
 //
 // ErrAdoptUnsupported means "this pair of paths cannot be adopted, copy
 // instead" and is not a failure. Any other error is a real one.
@@ -231,6 +234,16 @@ type ObjectInfo struct {
 	Path         string
 	Size         int64
 	LastModified time.Time
+}
+
+// ConditionalWriter writes an object only when nothing is at its path yet: a
+// compare-and-set on existence, so two writers racing for one path cannot
+// both believe they created it.
+type ConditionalWriter interface {
+	// WriteIfAbsent writes data at path unless an object already exists there.
+	// created is false, with a nil error, when one did; it is left untouched.
+	// A reader never sees a partial object at path.
+	WriteIfAbsent(ctx context.Context, path string, data []byte) (created bool, err error)
 }
 
 // ObjectLister lists objects with their metadata.
@@ -255,7 +268,8 @@ type ObjectLister interface {
 //
 // Optional: callers type-assert and fall back to ListObjects when the backend
 // does not implement it (test fakes that embed the Backend interface, for
-// instance). LocalBackend, S3Backend and AzureBlobBackend all implement it.
+// instance). LocalBackend, S3Backend, AzureBlobBackend and GCSBackend all
+// implement it.
 type PrefixProber interface {
 	HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error)
 }

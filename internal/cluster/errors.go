@@ -19,7 +19,10 @@ var (
 	// ErrNotRunning indicates the coordinator is not running.
 	ErrNotRunning = errors.New("cluster coordinator not running")
 
-	// ErrNodeNotFound indicates the requested node was not found in the registry.
+	// ErrNodeNotFound indicates the requested node was not found in the
+	// registry. RemoveNodeViaRaft also returns it (wrapped) for an ID that is in
+	// none of the registry, the Raft configuration and the cluster state
+	// (#1619).
 	ErrNodeNotFound = errors.New("node not found")
 
 	// ErrNodeAlreadyExists indicates a node with the same ID already exists.

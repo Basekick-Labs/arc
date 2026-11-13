@@ -55,18 +55,21 @@ func TestHavingLiteralIsReEmittedNotCopied(t *testing.T) {
 }
 
 // An aggregate spelled differently than the select list must NOT half-match: DuckDB
-// canonicalises `max_by` to `arg_max`, our text match does not, so it declines.
-func TestHavingAggSpellingMismatchDeclines(t *testing.T) {
-	for _, sql := range []string{
-		"SELECT host, arg_max(value, time) FROM cpu GROUP BY host HAVING max_by(value, time) > 1",
-		"SELECT host, count(*) FROM cpu GROUP BY host HAVING avg(value) > 1",
+// canonicalises `max_by` to `arg_max`, our text match does not. Since res-3b the
+// differently spelled call is a HIDDEN item, emitted with its own spelling and
+// computed separately — never resolved to the selected item.
+func TestHavingAggSpellingMismatchIsHidden(t *testing.T) {
+	for _, tc := range []struct{ sql, having string }{
+		{"SELECT host, arg_max(value, time) FROM cpu GROUP BY host HAVING max_by(value, time) > 1", "max_by(value, time) > 1"},
+		{"SELECT host, count(*) FROM cpu GROUP BY host HAVING avg(value) > 1", "avg(value) > 1"},
 	} {
-		toks, lexed := tokenize(sql)
+		toks, lexed := tokenize(tc.sql)
 		if !lexed {
-			continue
+			t.Fatalf("tokenize: %q", tc.sql)
 		}
-		if _, ok := matchGroupedAgg(toks); ok {
-			t.Fatalf("spelling mismatch must decline: %q", sql)
+		gm, ok := matchGroupedAgg(toks)
+		if !ok || gm.havingText != tc.having || gm.havingHidden != 1 {
+			t.Fatalf("%q: ok=%v having=%q hidden=%d", tc.sql, ok, gm.havingText, gm.havingHidden)
 		}
 	}
 }

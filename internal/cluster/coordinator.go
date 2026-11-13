@@ -162,6 +162,16 @@ type Coordinator struct {
 	streamClaimsBlockers atomic.Pointer[[]string]
 	// compactionCommit: the #1207 d2 flag's join gate and blockers.
 	compactionCommit compactionCommitGate
+	// coldMarkGate / coldWriteMu: the #1552 cold mark's join gate and write
+	// fence (cold_mark.go).
+	coldMarkGate coldMarkGate
+	coldWriteMu  sync.RWMutex
+	// coldMarkSeenEnabled: this node has seen Enable applied (sticky);
+	// coldMarkDrained: its one fence drain is done; coldMarkIdentity: its
+	// cold store identity getter.
+	coldMarkSeenEnabled atomic.Bool
+	coldMarkDrained     atomic.Bool
+	coldMarkIdentity    atomic.Pointer[func() string]
 	// clusterPolicies: the #1324 flag's join gate and blockers;
 	// policyListers read this node's own rows of each kind for adoption.
 	clusterPolicies clusterPoliciesGate
@@ -169,6 +179,8 @@ type Coordinator struct {
 	retentionPolicies clusterPoliciesGate
 	// cqPolicies: the same for the continuous query flag (#1324 stage 3).
 	cqPolicies clusterPoliciesGate
+	// governancePolicies: the same for the governance flag (#1627).
+	governancePolicies clusterPoliciesGate
 	// adoptMu serializes adoption passes: the loop's and an admin's nudge.
 	adoptMu         sync.Mutex
 	policyListersMu sync.Mutex
@@ -441,14 +453,18 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// Warn when cluster TLS is enabled but no CA is configured
 	// (GHSA-wwfh-qrfq-6f8g defense-in-depth). Without a CA, client-cert
 	// verification is off (RequireAndVerifyClientCert is only set when
-	// tls_ca_file is non-empty), so TLS provides encryption but not peer
-	// identity — inter-node connections are not mutually authenticated at the
-	// TLS layer. Peer identity in that mode rests on the shared-secret HMAC
-	// (the Raft handshake and the coordinator channels). This is a warning, not
-	// a hard error: TLS-for-encryption + HMAC-for-identity is a supported
-	// posture, but operators should know mTLS is not in effect.
+	// tls_ca_file is non-empty), so inter-node connections are not mutually
+	// authenticated at the TLS layer; servers are still verified, against the
+	// system roots (see the next warning for the same condition).
+	// Cluster membership in that mode rests on the shared-secret HMAC (the
+	// Raft handshake and the coordinator channels). With a CA, mTLS proves a
+	// peer holds a certificate from the cluster CA, which is membership too:
+	// certificates are not bound to node IDs, so in either mode which node a
+	// message comes from is a claim (SECURITY.md, #1510). This is a warning,
+	// not a hard error: TLS for encryption plus HMAC for membership is a
+	// supported posture, but operators should know mTLS is not in effect.
 	if cfg.Config.TLSEnabled && cfg.Config.TLSCAFile == "" {
-		logger.Warn().Msg("Cluster TLS enabled without tls_ca_file — peer certificates are NOT verified (no mTLS); inter-node identity rests on the shared-secret HMAC. Set cluster.tls_ca_file to enable mutual TLS authentication.")
+		logger.Warn().Msg("Cluster TLS enabled without tls_ca_file — client certificates are NOT verified (no mTLS); cluster membership rests on the shared-secret HMAC. Set cluster.tls_ca_file to enable mutual TLS authentication.")
 	}
 
 	// Warn when the public Fiber listener serves HTTPS but cluster TLS
@@ -590,6 +606,8 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		SharedSecret:        cfg.Config.SharedSecret,
 		ClusterName:         cfg.Config.ClusterName,
 		PeerForwardIdentity: c.peerForwardIdentity,
+		PeerReadQueries:     c.peerReadQueries,
+		PeerDatabaseCreate:  c.peerDatabaseCreate,
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft.
@@ -600,7 +618,9 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// retry handles writer-crash failover instead. See
 	// docs/progress/2026-05-26-multi-writer-pattern2.md.
 	if c.raftNode != nil && !cfg.Config.SharedStorageMode {
-		// Built whenever local storage has Raft, not only when failover is
+		// Built whenever Raft runs without shared_storage_mode (local
+		// storage, or a single-writer shared bucket, #1603), not only when
+		// failover is
 		// enabled and licensed. It is a goroutine on every node whose loop
 		// returns unless this node is the Raft leader, so there is no cost to
 		// having it — and without it nothing ever issues CommandPromoteWriter,
@@ -831,6 +851,7 @@ func (c *Coordinator) Start() error {
 	if c.raftNode != nil {
 		go c.compactionCommitEnableLoop(c.ctx)
 		go c.clusterPoliciesEnableLoop(c.ctx)
+		go c.coldMarkLoop(c.ctx)
 	}
 	// The staged compaction commit on an object store (#1207 d2a2b): the
 	// leader aborts jobs of a compactor that is gone, and committed jobs are
@@ -1304,7 +1325,12 @@ const tierReasonAbandonedPull = "replication:abandoned"
 // delete-only callbacks every such node needs. Split out of Start so a test
 // drives the same decision Start makes.
 func (c *Coordinator) startManifestCallbacksLocked() {
-	if c.cfg.ReplicationEnabled && c.raftNode != nil {
+	// cmd/arc turns replication off on a shared object store (#1605); a
+	// coordinator that still sees it on was configured some other way.
+	if c.cfg.ReplicationEnabled && c.raftNode != nil && IsSharedObjectStore(c.storage) {
+		c.logger.Error().Str("backend", c.storage.Type()).
+			Msg("Peer file replication is configured on a shared object store; not starting the puller (every node already reads the bucket)")
+	} else if c.cfg.ReplicationEnabled && c.raftNode != nil {
 		if err := c.startFilePullerLocked(); err != nil {
 			// Do not fail cluster startup if the puller can't start —
 			// replication is best-effort and the rest of the cluster can
@@ -1315,8 +1341,8 @@ func (c *Coordinator) startManifestCallbacksLocked() {
 			return
 		}
 	}
-	// A shared object store needs no puller (shared-storage deployments run
-	// with replication off: the Helm chart sets it), but every node still has
+	// A shared object store needs no puller (cmd/arc turns replication off
+	// there, #1605, as the Helm chart's shared mode does), but every node still has
 	// to hear the manifest's deletes: tiering's cold rows (#1349) and a DELETE
 	// rewrite's old file left out of reads (#1348) are per-node state. Both
 	// used to live only in the puller's callback, so they never ran there.
@@ -2312,10 +2338,21 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, cpWhy)
 			return
 		}
+		cmWhy, cmRelease := c.coldMarkJoinGate(req)
+		if cmWhy != "" {
+			cpRelease()
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", cmWhy).
+				Msg("Join refused: the node does not support the cold mark")
+			c.sendJoinError(conn, req, cmWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				cmRelease()
 				cpRelease()
 				ccRelease()
 				release()
@@ -3204,6 +3241,9 @@ func (c *Coordinator) Status() map[string]interface{} {
 	if c.raftNode != nil {
 		status["stream_claims"] = c.StreamClaimsStatus()
 		status["compaction_commit"] = c.CompactionCommitStatus()
+		cm, blocking := c.ColdMarkStatus()
+		trusted, why := c.ColdMarkTrusted(time.Now(), raft.ColdMarkAliveMaxAge, c.ColdMarkIdentity())
+		status["cold_mark"] = map[string]any{"state": cm, "blocking_nodes": blocking, "trusted": trusted, "untrusted_reason": why}
 		status["cluster_policies"] = c.ClusterPoliciesStatus()
 	}
 	// The stale-local sweep's last pass (#1071), where it runs.
@@ -3246,11 +3286,13 @@ func (c *Coordinator) Status() map[string]interface{} {
 		totalCores := c.raftFSM.TotalCores()
 		status["total_cores"] = totalCores
 
-		if c.licenseClient != nil && c.licenseClient.GetLicense() != nil {
-			maxCores := c.licenseClient.GetLicense().MaxCores
-			status["max_cores"] = maxCores
-			if maxCores > 0 {
-				status["cores_remaining"] = maxCores - totalCores
+		if c.licenseClient != nil {
+			if lic := c.licenseClient.GetLicense(); lic != nil {
+				maxCores := lic.MaxCores
+				status["max_cores"] = maxCores
+				if maxCores > 0 {
+					status["cores_remaining"] = maxCores - totalCores
+				}
 			}
 		}
 	}
@@ -5206,6 +5248,11 @@ func (c *Coordinator) AddNodeViaRaft(node *Node) error {
 // It removes the node from both the Raft voting configuration and the
 // cluster FSM state, then unregisters it from the local registry.
 // Must be called on the leader.
+//
+// An ID that is not a member returns an error wrapping ErrNodeNotFound, and
+// nothing is proposed (#1619). Membership is deliberately wide; see
+// isRemovableMember. Without Raft the call only unregisters locally and
+// still succeeds for an unknown ID, as before.
 func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 	if c.raftNode == nil {
 		// No Raft, just unregister locally
@@ -5213,8 +5260,15 @@ func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 		return nil
 	}
 
+	// The leader check comes first: a follower's view of membership can lag
+	// the leader's, so it must not answer "not a member" from it. arcli
+	// matches the "not the leader" text, so it stays as it is.
 	if !c.raftNode.IsLeader() {
 		return fmt.Errorf("not the leader")
+	}
+
+	if !c.isRemovableMember(nodeID) {
+		return fmt.Errorf("%w: %q", ErrNodeNotFound, nodeID)
 	}
 
 	// Remove from Raft voting configuration. Warn on failure (node may
@@ -5234,6 +5288,42 @@ func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 
 	c.logger.Info().Str("node_id", nodeID).Msg("Node removed from cluster")
 	return nil
+}
+
+// isRemovableMember reports whether a removal of id would act on anything:
+// id is in the registry, in the Raft configuration, or named by the cluster
+// state (raft.ClusterFSM.ReferencesNode, which covers the node table, a
+// departed writer, its stream instances and claims, staged compactions and
+// the cold mark). Only an ID in none of them is unknown (#1619).
+//
+// The Raft configuration is read last because it is the only source that can
+// fail. If it cannot be read, id counts as a member and the removal goes
+// ahead as it always did: the check exists to refuse a typo, and must not
+// turn a removal the operator needs into a failure.
+//
+// Known limitation: the registry read is the leader's own. A stale entry only
+// a follower's registry holds (an old leader's registration whose FSM AddNode
+// failed, then a leadership change) used to be cleared cluster-wide by any
+// removal; it now gets 404 here and "not the leader" on that follower.
+func (c *Coordinator) isRemovableMember(id string) bool {
+	if _, ok := c.registry.Get(id); ok {
+		return true
+	}
+	if fsm := c.raftNode.FSM(); fsm != nil && fsm.ReferencesNode(id) {
+		return true
+	}
+	ids, err := c.raftNode.ConfigurationServerIDs()
+	if err != nil {
+		c.logger.Warn().Err(err).Str("node_id", id).
+			Msg("Could not read the Raft configuration to check the node is a member; removing it anyway")
+		return true
+	}
+	for _, s := range ids {
+		if s == id {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateNodeStateViaRaft updates a node's state via Raft consensus.

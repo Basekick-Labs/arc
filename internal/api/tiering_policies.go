@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/license"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -18,6 +20,17 @@ type TieringPoliciesHandler struct {
 	authManager   *auth.AuthManager
 	licenseClient *license.Client
 	logger        zerolog.Logger
+	// checkDatabase, when set, refuses a policy PUT for a database that does
+	// not exist (#1626). DatabasesHandler.CheckDatabase.
+	checkDatabase func(ctx context.Context, name string) error
+}
+
+// SetDatabaseCheck makes a policy PUT answer as the database routes do for a
+// database that does not exist (404) or a malformed name (400). GET, DELETE
+// and /effective are not checked: DELETE must still remove the policy a
+// deleted database left behind.
+func (h *TieringPoliciesHandler) SetDatabaseCheck(check func(ctx context.Context, name string) error) {
+	h.checkDatabase = check
 }
 
 type tieringPolicyManager interface {
@@ -112,6 +125,27 @@ func (h *TieringPoliciesHandler) SetPolicy(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid request body",
 		})
+	}
+
+	if h.checkDatabase != nil {
+		if err := h.checkDatabase(ctx, database); err != nil {
+			switch {
+			case errors.Is(err, ErrDatabaseNotFound):
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+					"error": "Database '" + database + "' not found",
+				})
+			case errors.Is(err, ErrInvalidDatabaseName):
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+					"error": fmt.Sprintf("invalid database name %q", database),
+				})
+			case storage.IsNameSpellingError(err):
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+			}
+			h.logger.Error().Err(err).Str("database", database).Msg("Failed to check database for tiering policy")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to check database",
+			})
+		}
 	}
 
 	policy := &tiering.DatabasePolicy{

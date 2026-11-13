@@ -204,10 +204,9 @@ type Manifest struct {
 	// because it is also a report about the node: cold metadata that does not
 	// match the store.
 	//
-	// Not necessarily transient. The tiering cold sync that would record the
-	// missing rows only runs on a cluster with shared storage or replication,
-	// so on a standalone node, and on a local-storage cluster without
-	// replication, nothing will ever record them.
+	// The next successful tier scan can record missing rows on any node with a
+	// usable cold tier, including a standalone node. Until that scan succeeds,
+	// this count records the mismatch seen by the backup.
 	ColdObjectsUnrecorded int64 `json:"cold_objects_unrecorded,omitempty"`
 	// ColdDedupSkipped counts paths that were in BOTH the hot and the cold
 	// listing — the window a migration opens by copying to cold before
@@ -318,9 +317,19 @@ type BackupSummary struct {
 	UnaddressableFiles   int64 `json:"unaddressable_files,omitempty"`
 	// Cluster cross-check counts (#1083), see Manifest. ManifestOnlyFiles is
 	// a real gap; UnregisteredSkipped is a deliberate exclusion.
-	UnregisteredSkipped   int64 `json:"unregistered_skipped,omitempty"`
-	ManifestOnlyFiles     int64 `json:"manifest_only_files,omitempty"`
-	LeftManifestDuringRun int64 `json:"left_manifest_during_run,omitempty"`
+	// SkippedReconciled is the part of SkippedFiles whose file had left the
+	// cluster manifest by the end of the run, so it is not missing data: a
+	// client deciding whether the backup is incomplete counts
+	// SkippedFiles - SkippedReconciled, the same as a replace-mode restore
+	// does (#1555).
+	// ClusterManifestChecked says the run cross-checked against the cluster
+	// manifest at all; it is omitted, never sent as false, on a backup that
+	// did not (a standalone node, or a manifest written before #1083).
+	ClusterManifestChecked bool  `json:"cluster_manifest_checked,omitempty"`
+	UnregisteredSkipped    int64 `json:"unregistered_skipped,omitempty"`
+	ManifestOnlyFiles      int64 `json:"manifest_only_files,omitempty"`
+	LeftManifestDuringRun  int64 `json:"left_manifest_during_run,omitempty"`
+	SkippedReconciled      int64 `json:"skipped_reconciled,omitempty"`
 	// Target and OwnerInstanceID mirror the manifest's (#1085 stage B2b-1):
 	// which configured destination holds the backup, and which instance wrote
 	// it. ForeignOwner says the second belongs to a different instance than
@@ -428,10 +437,9 @@ type Progress struct {
 	// — the bytes were written, the row was left alone, and the file is not
 	// queryable until an operator clears the quarantine.
 	// ColdRowsNotRecorded counts files whose bytes reached the cold store but
-	// whose row could not be written, which is the same unqueryable outcome
-	// from a different cause — and on a node where the cold-metadata sync
-	// never runs (standalone, or a cluster without shared storage or
-	// replication) nothing will write that row later either.
+	// whose row could not be written. Those files are not queryable until a
+	// later successful tier scan records the missing rows; the scan also runs
+	// on standalone nodes.
 	ColdFilesRestoredToCold int64 `json:"cold_files_restored_to_cold,omitempty"`
 	ColdFilesRestoredToHot  int64 `json:"cold_files_restored_to_hot,omitempty"`
 	// ColdFilesSkippedAlreadyCold counts hot-backup files whose matching cold
@@ -701,22 +709,24 @@ func UnmarshalManifest(data []byte) (*Manifest, error) {
 // SummaryFromManifest creates a compact summary from a full manifest.
 func SummaryFromManifest(m *Manifest) BackupSummary {
 	return BackupSummary{
-		BackupID:              m.BackupID,
-		CreatedAt:             m.CreatedAt,
-		BackupType:            m.BackupType,
-		Scope:                 m.Scope,
-		TotalFiles:            m.TotalFiles,
-		TotalBytes:            m.TotalSizeBytes,
-		DatabaseCount:         len(m.Databases),
-		SkippedFiles:          m.SkippedFiles,
-		SkippedMetadataFiles:  m.SkippedMetadataFiles,
-		UnaddressableFiles:    m.UnaddressableFiles,
-		UnregisteredSkipped:   m.UnregisteredSkipped,
-		ManifestOnlyFiles:     m.ManifestOnlyFiles,
-		LeftManifestDuringRun: m.LeftManifestDuringRun,
-		Target:                m.Target,
-		OwnerInstanceID:       m.OwnerInstanceID,
-		ColdFilesExcluded:     m.ColdFilesExcluded,
-		ColdFiles:             m.ColdFiles,
+		BackupID:               m.BackupID,
+		CreatedAt:              m.CreatedAt,
+		BackupType:             m.BackupType,
+		Scope:                  m.Scope,
+		TotalFiles:             m.TotalFiles,
+		TotalBytes:             m.TotalSizeBytes,
+		DatabaseCount:          len(m.Databases),
+		SkippedFiles:           m.SkippedFiles,
+		SkippedMetadataFiles:   m.SkippedMetadataFiles,
+		UnaddressableFiles:     m.UnaddressableFiles,
+		ClusterManifestChecked: m.ClusterManifestChecked,
+		UnregisteredSkipped:    m.UnregisteredSkipped,
+		ManifestOnlyFiles:      m.ManifestOnlyFiles,
+		LeftManifestDuringRun:  m.LeftManifestDuringRun,
+		SkippedReconciled:      m.SkippedReconciled,
+		Target:                 m.Target,
+		OwnerInstanceID:        m.OwnerInstanceID,
+		ColdFilesExcluded:      m.ColdFilesExcluded,
+		ColdFiles:              m.ColdFiles,
 	}
 }

@@ -21,6 +21,10 @@ permissions:
   id-token: write   # required for OIDC keyless signing via Sigstore/cosign
 
 env:
+  # Oldest glibc the Linux binaries may require: Ubuntu 22.04, Debian 12,
+  # RHEL/Rocky/Alma 9 and Amazon Linux 2023 (#1579). Enforced after each
+  # Linux build; the .deb's Depends is the binary's actual requirement.
+  GLIBC_FLOOR: "2.34"
   REGISTRY_GHCR: ghcr.io
   IMAGE_NAME: basekick-labs/arc
   # Docker Hub mirror — published alongside GHCR on every release.
@@ -309,6 +313,17 @@ jobs:
   # (GOFIPS140=v1.0.0). It is NOT a different version — the FIPS-ness lives in
   # the artifact NAME (arc-fips-<suffix>), never in the version string. Both
   # variants reuse the same govulncheck + cosign signing machinery.
+  #
+  # Linux legs are pinned to Ubuntu 22.04 (glibc 2.35), NOT ubuntu-latest: a
+  # CGO binary needs the glibc it was linked against, and 26.09.3, built on
+  # 24.04, needed 2.38 for fmod/fmodf alone, so it would not start on Debian
+  # 12 or Ubuntu 22.04 and would not install on RHEL 9 or Amazon Linux 2023
+  # (#1579). libstdc++ is linked in statically (see
+  # scripts/setup-linux-release-toolchain.sh). The "Check glibc floor" step
+  # below fails the build if the binary needs anything above GLIBC_FLOOR or
+  # links libstdc++ dynamically. When GitHub retires the 22.04 runners,
+  # build inside a debian:bookworm (or older) container instead; the check is
+  # what tells you if a replacement raised the floor.
   build-binaries:
     name: Build Binaries
     needs: prepare
@@ -316,25 +331,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             suffix: linux-amd64
             variant: standard
             artifact: arc-linux-amd64
             build_tags: duckdb_arrow
             gofips: ""
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             suffix: linux-arm64
             variant: standard
             artifact: arc-linux-arm64
             build_tags: duckdb_arrow
             gofips: ""
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             suffix: linux-amd64
             variant: fips
             artifact: arc-fips-linux-amd64
             build_tags: duckdb_arrow,fips
             gofips: "v1.0.0"
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             suffix: linux-arm64
             variant: fips
             artifact: arc-fips-linux-arm64
@@ -349,7 +364,11 @@ jobs:
           # Apple stopped shipping Intel Macs years ago, and GitHub's macos-13
           # runners are a scarce, sunsetting tier that stalled the release waiting
           # on capacity. Homebrew on macOS is Apple-Silicon-only.
-          - runner: macos-14
+          # macos-15: GitHub retired the macos-14 image ("The configuration
+          # 'macos-14-arm64-us-default' is not supported"). The binary keeps
+          # macOS 14 as its minimum through MACOSX_DEPLOYMENT_TARGET in the
+          # build step, checked after it.
+          - runner: macos-15
             suffix: darwin-arm64
             variant: standard
             artifact: arc-darwin-arm64
@@ -363,7 +382,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
           cache: true
 
       - name: Run govulncheck
@@ -383,9 +402,16 @@ jobs:
           fi
           echo "✅ FIPS import-graph clean: no x/crypto/bcrypt or x/crypto/hkdf"
 
+      - name: Set up the Linux release toolchain
+        if: runner.os == 'Linux'
+        run: scripts/setup-linux-release-toolchain.sh
+
       - name: Build binary
         env:
           CGO_ENABLED: 1
+          # Oldest macOS the darwin binary runs on, whatever the runner's
+          # SDK; 26.09.3 was built for 14.0. Ignored on Linux.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
           GOFIPS140: ${{ matrix.gofips }}
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
@@ -400,6 +426,28 @@ jobs:
           # Show binary info
           file ${{ matrix.artifact }}
           ls -lh ${{ matrix.artifact }}
+
+      - name: Check macOS floor
+        if: runner.os == 'macOS'
+        run: |
+          MINOS=$(otool -l ${{ matrix.artifact }} | awk '/LC_BUILD_VERSION/ {f=1} f && /minos/ {print $2; exit}')
+          echo "minos=${MINOS}"
+          if [ "$(printf '%s\n%s\n' "${MINOS}" "14.0" | sort -V | tail -1)" != "14.0" ]; then
+            echo "::error::${{ matrix.artifact }} requires macOS ${MINOS}, above the supported 14.0"
+            exit 1
+          fi
+          echo "✅ ${{ matrix.artifact }} requires macOS ${MINOS}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check glibc floor
+        if: runner.os == 'Linux'
+        run: |
+          readelf -d ${{ matrix.artifact }} | grep NEEDED
+          if readelf -d ${{ matrix.artifact }} | grep -q 'libstdc++'; then
+            echo "::error::${{ matrix.artifact }} links libstdc++ dynamically; RHEL 9 and Amazon Linux 2023 lack the version DuckDB needs (#1579)"
+            exit 1
+          fi
+          NEED=$(scripts/check-glibc-floor.sh ${{ matrix.artifact }} "${GLIBC_FLOOR}")
+          echo "✅ ${{ matrix.artifact }} requires glibc ${NEED} (floor ${GLIBC_FLOOR})" >> $GITHUB_STEP_SUMMARY
 
       # FIPS variant only: boot the freshly built binary and assert it is
       # actually running with the Go Cryptographic Module in FIPS mode. The
@@ -538,6 +586,7 @@ jobs:
           mkdir -p ${PKG_DIR}/DEBIAN
           mkdir -p ${PKG_DIR}/usr/bin
           mkdir -p ${PKG_DIR}/etc/arc
+          mkdir -p ${PKG_DIR}/usr/share/arc
           mkdir -p ${PKG_DIR}/lib/systemd/system
           mkdir -p ${PKG_DIR}/var/lib/arc
 
@@ -545,31 +594,21 @@ jobs:
           cp "${SRC_BIN}" ${PKG_DIR}/usr/bin/arc
           chmod +x ${PKG_DIR}/usr/bin/arc
 
-          # Copy config
-          cp arc.toml ${PKG_DIR}/etc/arc/arc.toml
+          # Stock config. NOT shipped at /etc/arc/arc.toml: a file the package
+          # ships there is replaced on every upgrade, discarding the operator's
+          # edits (#1465). postinst installs this copy at /etc/arc/arc.toml only
+          # when that file does not exist, and never touches it afterwards.
+          #
+          # Not a dpkg conffile either: a conffile the operator edited prompts on
+          # every upgrade whose stock file changed (nearly every release), and a
+          # non-interactive `apt-get install -y` then fails without
+          # --force-confold. The upgrade from a release
+          # that shipped the file as a plain file prompts even when it is
+          # unedited, because dpkg has no recorded checksum for it. Tested.
+          cp arc.toml ${PKG_DIR}/usr/share/arc/arc.toml
 
-          # Create systemd service
-          cat > ${PKG_DIR}/lib/systemd/system/arc.service << 'SERVICE'
-          [Unit]
-          Description=Arc Time-Series Database
-          After=network.target
-
-          [Service]
-          Type=simple
-          User=arc
-          Group=arc
-          ExecStart=/usr/bin/arc
-          WorkingDirectory=/var/lib/arc
-          Restart=on-failure
-          RestartSec=5
-          LimitNOFILE=65535
-
-          # Environment
-          Environment="ARC_STORAGE_LOCAL_PATH=/var/lib/arc/data"
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
+          # The unit is one file in the repo shared by deb, rpm and Arch (#1463).
+          cp deploy/systemd/arc.service ${PKG_DIR}/lib/systemd/system/arc.service
 
           # Create control file. The FIPS package conflicts with / provides /
           # replaces the standard "arc" package (same binary path + service), so
@@ -579,13 +618,17 @@ jobs:
           else
             DESC_SUFFIX=""
           fi
+          # The glibc the binary actually needs (at most GLIBC_FLOOR, which the
+          # build enforces), so dpkg refuses an older system up front instead
+          # of installing a binary that cannot start (#1579).
+          LIBC_MIN=$(scripts/check-glibc-floor.sh "${SRC_BIN}")
           cat > ${PKG_DIR}/DEBIAN/control << EOF
           Package: ${PKG_NAME}
           Version: ${VERSION}
           Section: database
           Priority: optional
           Architecture: ${ARCH}
-          Depends: libc6
+          Depends: libc6 (>= ${LIBC_MIN}), libgcc-s1
           Maintainer: Basekick Labs <contact@basekick.com>
           Description: Arc - High-Performance Time-Series Database${DESC_SUFFIX}
            Arc is a high-performance time-series database built on DuckDB,
@@ -613,13 +656,39 @@ jobs:
             useradd --system --home-dir /var/lib/arc --no-create-home --shell /bin/false arc
           fi
 
+          # /etc/arc/arc.toml belongs to the operator, not the package (#1465).
+          # Restore the copy preinst saved, if dpkg removed it during this
+          # upgrade: a release up to 26.09 shipped it as a package file, and
+          # dpkg deletes a package file the new version no longer ships. Else
+          # install the stock copy if there is none. An existing file's content
+          # is never changed; only its owner is set, below, as it always was.
+          # -L as well as -e: a dangling symlink is the operator's, not absent.
+          CONF=/etc/arc/arc.toml
+          SAVED=/etc/arc/.arc.toml.dpkg-save
+          if [ ! -e "${CONF}" ] && [ ! -L "${CONF}" ]; then
+            if [ -e "${SAVED}" ] || [ -L "${SAVED}" ]; then
+              mv "${SAVED}" "${CONF}"
+            else
+              cp /usr/share/arc/arc.toml "${CONF}"
+              chmod 644 "${CONF}"
+            fi
+          fi
+          rm -f "${SAVED}"
+
           # Set ownership
           chown -R arc:arc /var/lib/arc
-          chown arc:arc /etc/arc/arc.toml
+          if [ -e "${CONF}" ]; then
+            chown arc:arc "${CONF}"
+          fi
 
           # Reload systemd
           if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload
+            # On an upgrade ($2 = the old version) restart a running service so
+            # the new binary takes over; prerm no longer stops it on upgrade.
+            if [ "$1" = configure ] && [ -n "${2:-}" ]; then
+              systemctl try-restart arc.service || true
+            fi
             echo ""
             echo "Arc installed successfully!"
             echo "  Start:  sudo systemctl start arc"
@@ -629,14 +698,59 @@ jobs:
           POSTINST
           chmod +x ${PKG_DIR}/DEBIAN/postinst
 
+          # Save the operator's config before dpkg unpacks: when the installed
+          # package shipped /etc/arc/arc.toml as a package file (every release
+          # up to 26.09) dpkg deletes it during this upgrade, or when that
+          # package is removed in favour of this variant. postinst restores it.
+          # cp -a, not -p: a symlinked config must be restored as the symlink,
+          # not as a copy of its target that later edits would not reach.
+          cat > ${PKG_DIR}/DEBIAN/preinst << 'PREINST'
+          #!/bin/bash
+          set -e
+          if [ -f /etc/arc/arc.toml ] || [ -L /etc/arc/arc.toml ]; then
+            rm -f /etc/arc/.arc.toml.dpkg-save
+            cp -a /etc/arc/arc.toml /etc/arc/.arc.toml.dpkg-save
+          fi
+          PREINST
+          chmod +x ${PKG_DIR}/DEBIAN/preinst
+
+          # purge removes the config, which dpkg does not own, unless the other
+          # variant (arc / arc-fips) is installed and still uses it; asked of
+          # the package database, not inferred from /usr/bin/arc. A failed
+          # install or upgrade drops preinst's save, or a later postinst would
+          # restore that stale copy over a file the operator removed since.
+          cat > ${PKG_DIR}/DEBIAN/postrm << 'POSTRM'
+          #!/bin/bash
+          set -e
+          case "$1" in
+            purge)
+              if ! dpkg-query -W -f='${db:Status-Abbrev}\n' arc arc-fips 2>/dev/null | grep -q '^ii'; then
+                rm -f /etc/arc/arc.toml /etc/arc/.arc.toml.dpkg-save
+                rmdir /etc/arc 2>/dev/null || true
+              fi
+              ;;
+            abort-install|abort-upgrade)
+              rm -f /etc/arc/.arc.toml.dpkg-save
+              ;;
+          esac
+          POSTRM
+          chmod +x ${PKG_DIR}/DEBIAN/postrm
+
           # Create prerm script
+          # Stop and disable only on removal. On an upgrade this used to
+          # disable the service too, so it stayed down after every upgrade;
+          # postinst now restarts it instead.
           cat > ${PKG_DIR}/DEBIAN/prerm << 'PRERM'
           #!/bin/bash
           set -e
-          if command -v systemctl >/dev/null 2>&1; then
-            systemctl stop arc.service || true
-            systemctl disable arc.service || true
-          fi
+          case "$1" in
+            remove|deconfigure)
+              if command -v systemctl >/dev/null 2>&1; then
+                systemctl stop arc.service || true
+                systemctl disable arc.service || true
+              fi
+              ;;
+          esac
           PRERM
           chmod +x ${PKG_DIR}/DEBIAN/prerm
 
@@ -645,6 +759,105 @@ jobs:
 
           # Create checksum
           sha256sum ${PKG_DIR}.deb > ${PKG_DIR}.deb.sha256
+
+      # Upgrade from the latest published release, the path every existing
+      # install takes. Releases up to 26.09 shipped /etc/arc/arc.toml as a
+      # package file, so dpkg deletes it during this upgrade and only the
+      # preinst save / postinst restore keeps the operator's edits (#1465). A
+      # reinstall over the same version never exercises that: nothing owns
+      # the file then. Purged afterwards, so the next step is a fresh install.
+      - name: Smoke-test the upgrade from the previous release
+        if: matrix.arch == 'amd64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DEB=$(ls ./*_amd64.deb)
+          PKG=$(basename "${DEB}" | cut -d_ -f1)
+          PREV_TAG=$(gh release list --repo "${GITHUB_REPOSITORY}" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName')
+          mkdir -p prev
+          gh release download "${PREV_TAG}" --repo "${GITHUB_REPOSITORY}" --pattern "${PKG}_*_amd64.deb" --dir prev
+          PREV_DEB=$(ls prev/*.deb)
+          echo "upgrading ${PREV_DEB} (${PREV_TAG}) -> ${DEB}"
+
+          sudo dpkg -i "${PREV_DEB}" < /dev/null
+          echo "# upgrade-marker" | sudo tee -a /etc/arc/arc.toml > /dev/null
+          sudo dpkg -i "${DEB}" < /dev/null
+          grep -q "upgrade-marker" /etc/arc/arc.toml || { echo "upgrade from ${PREV_TAG} replaced /etc/arc/arc.toml"; exit 1; }
+          test ! -e /etc/arc/.arc.toml.dpkg-save || { echo "upgrade left /etc/arc/.arc.toml.dpkg-save behind"; exit 1; }
+
+          sudo dpkg -P "${PKG}" < /dev/null
+          test ! -e /etc/arc/arc.toml || { echo "purge left /etc/arc/arc.toml"; exit 1; }
+          rm -rf prev
+          echo "upgrade smoke test passed"
+
+      # Install the package and start it under the runner's real systemd: the
+      # only test that runs the binary with the packaged unit AND the packaged
+      # arc.toml together. Every other boot test runs the binary from a
+      # directory of its own choosing, which is how a unit whose storage path
+      # contains arc.toml's backup path crash-looped every .deb/.rpm/Arch
+      # install unnoticed (#1463). amd64 only: the runner cannot execute arm64.
+      # `systemctl start` returns success for Type=simple even when Arc exits
+      # straight away, so poll /health instead of trusting it.
+      - name: Smoke-test the installed package under systemd
+        if: matrix.arch == 'amd64'
+        run: |
+          DEB=$(ls ./*_amd64.deb)
+          sudo dpkg -i "${DEB}"
+          # Telemetry off for CI; a drop-in, so the unit under test is unchanged.
+          sudo mkdir -p /etc/systemd/system/arc.service.d
+          printf '[Service]\nEnvironment="ARC_TELEMETRY_ENABLED=false"\n' | sudo tee /etc/systemd/system/arc.service.d/ci.conf
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now arc
+
+          wait_healthy() {
+            for _ in $(seq 1 30); do
+              curl -sf http://localhost:8000/health && echo "" && return 0
+              sleep 2
+            done
+            return 1
+          }
+          fail() {
+            echo "deb package smoke test FAILED: $1"
+            systemctl status arc --no-pager || true
+            sudo journalctl -u arc --no-pager -n 200 || true
+            exit 1
+          }
+
+          wait_healthy || fail "no /health on a fresh install"
+          # The backup directory must be the unit's, outside the storage root.
+          sudo test -d /var/lib/arc/backups || fail "/var/lib/arc/backups was not created"
+          sudo test ! -e /var/lib/arc/data/backups || fail "a backup directory exists inside the storage root"
+
+          # Reinstall over itself: dpkg runs prerm "upgrade" and postinst
+          # "configure <old version>", the upgrade path. The service must come
+          # back enabled and healthy, not stopped and disabled, and an edit to
+          # /etc/arc/arc.toml must survive it (#1465).
+          echo "# smoke-test-marker" | sudo tee -a /etc/arc/arc.toml > /dev/null
+          sudo dpkg -i "${DEB}" < /dev/null || fail "non-interactive upgrade failed"
+          grep -q "smoke-test-marker" /etc/arc/arc.toml || fail "upgrade replaced the operator's /etc/arc/arc.toml"
+          systemctl is-enabled arc || fail "upgrade left the service disabled"
+          wait_healthy || fail "no /health after an upgrade"
+
+          echo "deb package smoke test passed"
+          sudo systemctl stop arc
+
+      # The runner is newer than the oldest systems Arc supports, so the test
+      # above cannot see a binary that needs a newer glibc than they have:
+      # 26.09.3 passed it and then would not start on Debian 12 or Ubuntu 22.04
+      # (#1579). Install on the oldest supported releases and start the binary.
+      - name: Smoke-test the package on the oldest supported distros
+        if: matrix.arch == 'amd64'
+        run: |
+          DEB=$(ls ./*_amd64.deb)
+          for IMAGE in debian:12 ubuntu:22.04; do
+            docker run --rm -v "$PWD:/pkg:ro" -e ARC_TELEMETRY_ENABLED=false "$IMAGE" bash -c '
+              dpkg -i /pkg/'"$(basename "$DEB")"' || exit 1
+              timeout 8 /usr/bin/arc > /tmp/arc.log 2>&1
+              cat /tmp/arc.log | head -5
+              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
+            ' || { echo "::error::the .deb does not install and start on ${IMAGE}"; exit 1; }
+            echo "✅ starts on ${IMAGE}"
+          done
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v6
@@ -716,26 +929,8 @@ jobs:
           cp arc.toml ${PKG_NAME}-${VERSION}/
           tar -czf ~/rpmbuild/SOURCES/${PKG_NAME}-${VERSION}.tar.gz ${PKG_NAME}-${VERSION}
 
-          # Create systemd service in SOURCES
-          cat > ~/rpmbuild/SOURCES/arc.service << 'SERVICE'
-          [Unit]
-          Description=Arc Time-Series Database
-          After=network.target
-
-          [Service]
-          Type=simple
-          User=arc
-          Group=arc
-          ExecStart=/usr/bin/arc
-          WorkingDirectory=/var/lib/arc
-          Restart=on-failure
-          RestartSec=5
-          LimitNOFILE=65535
-          Environment="ARC_STORAGE_LOCAL_PATH=/var/lib/arc/data"
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
+          # The unit is one file in the repo shared by deb, rpm and Arch (#1463).
+          cp deploy/systemd/arc.service ~/rpmbuild/SOURCES/arc.service
 
           # FIPS package coexistence directives (empty for standard). Kept on a
           # single physical line each; emitted only for the FIPS variant so the
@@ -756,6 +951,9 @@ jobs:
           URL:            https://github.com/basekick-labs/arc
           Source0:        ${PKG_NAME}-${VERSION}.tar.gz
           Source1:        arc.service
+          # %pre runs useradd: minimal images (amazonlinux:2023) lack it, and a
+          # failing %pre aborts the install.
+          Requires(pre):  shadow-utils
 
           %description
           Arc is a high-performance time-series database built on DuckDB,
@@ -799,8 +997,18 @@ jobs:
           echo "  Logs:   sudo journalctl -u arc -f"
 
           %preun
-          systemctl stop arc.service || true
-          systemctl disable arc.service || true
+          # \$1 is 0 on erase, 1 on upgrade: stop and disable only on erase,
+          # or every upgrade leaves the service disabled.
+          if [ \$1 -eq 0 ]; then
+            systemctl stop arc.service || true
+            systemctl disable arc.service || true
+          fi
+
+          %postun
+          # On upgrade, restart a running service so the new binary takes over.
+          if [ \$1 -ge 1 ]; then
+            systemctl try-restart arc.service || true
+          fi
 
           %changelog
           * $(date "+%a %b %d %Y") Basekick Labs <contact@basekick.com> - ${VERSION}-1
@@ -820,8 +1028,79 @@ jobs:
           # Copy to current directory
           cp ~/rpmbuild/RPMS/${ARCH}/${PKG_NAME}-${VERSION}-1.*.rpm .
 
-          # Create checksum
-          sha256sum ${PKG_NAME}-${VERSION}-1.*.rpm > ${PKG_NAME}-${VERSION}-1.${ARCH}.rpm.sha256
+      # Sign the RPM. rpm 6.1 (Fedora 45) refuses an unsigned package by
+      # default (%_pkgverify_level all), and every Arc RPM through 26.09.3 was
+      # unsigned. The key is a Basekick Labs OpenPGP key held in the
+      # RPM_SIGNING_KEY secret (armored, passphrase in RPM_SIGNING_PASSPHRASE);
+      # its public half is deploy/packaging/RPM-GPG-KEY-basekick, which users
+      # import and which the check below verifies against, so a secret that
+      # does not match the published key fails the release. A missing secret
+      # fails it too: an unsigned RPM must not ship by accident.
+      - name: Sign RPM package
+        env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+          RPM_SIGNING_PASSPHRASE: ${{ secrets.RPM_SIGNING_PASSPHRASE }}
+        run: |
+          if [ -z "${RPM_SIGNING_KEY}" ]; then
+            echo "::error::RPM_SIGNING_KEY is not set; refusing to publish an unsigned RPM"
+            exit 1
+          fi
+          export GNUPGHOME="${RUNNER_TEMP}/rpm-gnupg"
+          mkdir -p "${GNUPGHOME}" && chmod 700 "${GNUPGHOME}"
+          trap 'rm -rf "${GNUPGHOME}"' EXIT
+          printf '%s\n' "${RPM_SIGNING_KEY}" | gpg --batch --import
+          FPR=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+          printf '%s' "${RPM_SIGNING_PASSPHRASE}" > "${GNUPGHOME}/passphrase"
+          cat > ~/.rpmmacros << MACROS
+          %_gpg_name ${FPR}
+          %__gpg /usr/bin/gpg
+          %_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback --passphrase-file ${GNUPGHOME}/passphrase
+          MACROS
+          rpmsign --addsign ./*.rpm
+
+          # Verify against the published public key, in a throwaway rpm db.
+          DB=$(mktemp -d)
+          rpm --dbpath "${DB}" --initdb
+          rpm --dbpath "${DB}" --import deploy/packaging/RPM-GPG-KEY-basekick
+          for f in ./*.rpm; do
+            # The text, not the exit code: an unsigned package is
+            # "digests OK" with exit 0.
+            out=$(rpm --dbpath "${DB}" -K "$f")
+            echo "${out}"
+            echo "${out}" | grep -q "digests signatures OK" ||
+              { echo "::error::$f is not signed by deploy/packaging/RPM-GPG-KEY-basekick"; exit 1; }
+          done
+
+          # Checksums after signing: signing rewrites the file.
+          for f in ./*.rpm; do sha256sum "$(basename "$f")" > "$(basename "$f").sha256"; done
+
+          # The public key ships with the release, once (from one leg).
+          if [ "${{ matrix.arch }}" = "x86_64" ] && [ "${{ matrix.variant }}" = "standard" ]; then
+            cp deploy/packaging/RPM-GPG-KEY-basekick .
+          fi
+
+      # The oldest supported RPM systems (glibc 2.34): 26.09.3's RPM required
+      # glibc 2.38 and dnf refused it on RHEL 9 and Amazon Linux 2023 (#1579).
+      - name: Smoke-test the package on the oldest supported distros
+        if: matrix.arch == 'x86_64'
+        run: |
+          RPM=$(ls ./*.x86_64.rpm)
+          # fedora:latest is rpm 6.1+, which refuses an unsigned or
+          # unverifiable package: plain rpm -i there proves the signature.
+          for IMAGE in rockylinux:9 amazonlinux:2023 fedora:latest; do
+            docker run --rm -v "$PWD:/pkg:ro" -v "$PWD/deploy/packaging:/key:ro" -e ARC_TELEMETRY_ENABLED=false "$IMAGE" bash -c '
+              rpm --import /key/RPM-GPG-KEY-basekick || exit 1
+              if [ "$(rpm --eval %_pkgverify_level)" = all ]; then
+                dnf install -y -q shadow-utils >/dev/null && rpm -i /pkg/'"$(basename "$RPM")"' || exit 1
+              else
+                dnf install -y -q /pkg/'"$(basename "$RPM")"' || exit 1
+              fi
+              timeout 8 /usr/bin/arc > /tmp/arc.log 2>&1
+              cat /tmp/arc.log | head -5
+              grep -q "Starting Arc" /tmp/arc.log && ! grep -q "error while loading shared libraries\|version .GLIBC" /tmp/arc.log
+            ' || { echo "::error::the RPM does not install and start on ${IMAGE}"; exit 1; }
+            echo "✅ starts on ${IMAGE}"
+          done
 
       - name: Upload RPM package
         uses: actions/upload-artifact@v6
@@ -830,6 +1109,8 @@ jobs:
           path: |
             *.rpm
             *.rpm.sha256
+            RPM-GPG-KEY-basekick
+          if-no-files-found: error
           retention-days: 7
 
   # Build Arch Linux packages (pacman .pkg.tar.zst) — covers Arch and
@@ -879,27 +1160,9 @@ jobs:
           chmod +x pkgbuild/arc-bin
           cp arc.toml pkgbuild/arc.toml
 
-          # systemd unit — same content as the deb/rpm service, but installed
-          # under /usr/lib/systemd/system (Arch does not use /lib).
-          cat > pkgbuild/arc.service << 'SERVICE'
-          [Unit]
-          Description=Arc Time-Series Database
-          After=network.target
-
-          [Service]
-          Type=simple
-          User=arc
-          Group=arc
-          ExecStart=/usr/bin/arc
-          WorkingDirectory=/var/lib/arc
-          Restart=on-failure
-          RestartSec=5
-          LimitNOFILE=65535
-          Environment="ARC_STORAGE_LOCAL_PATH=/var/lib/arc/data"
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
+          # systemd unit: the same file as the deb/rpm service (#1463), but
+          # installed under /usr/lib/systemd/system (Arch does not use /lib).
+          cp deploy/systemd/arc.service pkgbuild/arc.service
 
           # Arch-native user/dir management: sysusers.d creates the arc system
           # user, tmpfiles.d creates /var/lib/arc owned by it. pacman's stock
@@ -992,16 +1255,36 @@ jobs:
 
           # Native-arch leg only: install the package and boot the binary to
           # prove the glibc-linked build runs on Arch userland.
+          #
+          # Boot it the way the INSTALLED unit does: its User, its
+          # WorkingDirectory and its Environment lines, read from the unit
+          # file rather than copied here. Booting as root from /tmp (as this
+          # test used to) never sees the packaged layout, which is how a unit
+          # whose storage path contains the backup path shipped (#1463). There
+          # is no systemd in the container, so this is the closest stand-in.
           if [ "$(uname -m)" = "${TARGET_ARCH}" ]; then
             pacman -U --noconfirm "${PKG}"
             id arc   # sysusers hook must have created the service user
             test -d /var/lib/arc   # tmpfiles hook must have created the state dir
-            cd /tmp
-            /usr/bin/arc > /tmp/arc-boot.log 2>&1 &
+            UNIT=/usr/lib/systemd/system/arc.service
+            UNIT_USER=$(sed -n 's/^User=//p' "${UNIT}")
+            UNIT_WD=$(sed -n 's/^WorkingDirectory=//p' "${UNIT}")
+            mapfile -t UNIT_ENV < <(sed -n 's/^Environment="\(.*\)"$/\1/p' "${UNIT}")
+            # Separate lines: a failing non-final element of an && list does
+            # not trip set -e.
+            test -n "${UNIT_USER}"
+            test -n "${UNIT_WD}"
+            test "${#UNIT_ENV[@]}" -gt 0
+            cd "${UNIT_WD}"
+            runuser -u "${UNIT_USER}" -- env ARC_TELEMETRY_ENABLED=false "${UNIT_ENV[@]}" \
+              /usr/bin/arc > /tmp/arc-boot.log 2>&1 &
             ARC_PID=$!
             for i in $(seq 1 20); do
               if curl -sf http://localhost:8000/health; then
                 echo ""
+                # The backup directory must be the unit's, outside the storage root.
+                test -d /var/lib/arc/backups
+                test ! -e /var/lib/arc/data/backups
                 echo "arch package smoke test passed"
                 kill ${ARC_PID} || true
                 exit 0
@@ -1614,9 +1897,10 @@ jobs:
           ### RHEL/Fedora/Rocky (x86_64, aarch64)
 
           ```bash
-          # Download and install
+          # Trust the Basekick Labs package key, then download and install
+          sudo rpm --import https://github.com/basekick-labs/arc/releases/download/v${{ needs.prepare.outputs.version }}/RPM-GPG-KEY-basekick
           wget https://github.com/basekick-labs/arc/releases/download/v${{ needs.prepare.outputs.version }}/arc-${{ needs.prepare.outputs.version }}-1.x86_64.rpm
-          sudo rpm -i arc-${{ needs.prepare.outputs.version }}-1.x86_64.rpm
+          sudo dnf install -y ./arc-${{ needs.prepare.outputs.version }}-1.x86_64.rpm
 
           # Start and enable
           sudo systemctl enable arc
@@ -1694,6 +1978,7 @@ jobs:
             release-artifacts/**/*.deb.sha256
             release-artifacts/**/*.rpm
             release-artifacts/**/*.rpm.sha256
+            release-artifacts/**/RPM-GPG-KEY-basekick
             release-artifacts/**/*.pkg.tar.zst
             release-artifacts/**/*.pkg.tar.zst.sha256
             release-artifacts/**/*.spdx.json

@@ -30,6 +30,42 @@ func TestDatabaseThreadCountDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestFlightSQLDefaults(t *testing.T) {
+	v := viper.New()
+	setDefaults(v)
+	if v.GetBool("flight_sql.enabled") {
+		t.Fatal("flight_sql.enabled default = true, want false")
+	}
+	if got := v.GetInt("flight_sql.port"); got != 50051 {
+		t.Fatalf("flight_sql.port default = %d, want 50051", got)
+	}
+}
+
+func TestValidateFlightSQLConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		flight  FlightSQLConfig
+		server  ServerConfig
+		wantErr bool
+	}{
+		{name: "disabled ignores port", flight: FlightSQLConfig{Port: -1}, server: ServerConfig{Port: 8000}},
+		{name: "valid", flight: FlightSQLConfig{Enabled: true, Port: 50051}, server: ServerConfig{Port: 8000}},
+		{name: "minimum port", flight: FlightSQLConfig{Enabled: true, Port: 1}, server: ServerConfig{Port: 8000}},
+		{name: "maximum port", flight: FlightSQLConfig{Enabled: true, Port: 65535}, server: ServerConfig{Port: 8000}},
+		{name: "zero port", flight: FlightSQLConfig{Enabled: true, Port: 0}, server: ServerConfig{Port: 8000}, wantErr: true},
+		{name: "large port", flight: FlightSQLConfig{Enabled: true, Port: 65536}, server: ServerConfig{Port: 8000}, wantErr: true},
+		{name: "HTTP port conflict", flight: FlightSQLConfig{Enabled: true, Port: 8000}, server: ServerConfig{Port: 8000}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateFlightSQLConfig(tc.flight, tc.server)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateFlightSQLConfig() error = %v, wantErr %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestEffectiveCores_ForwardsToSyscpu pins that config's exported form is the
 // same answer as the package that owns the implementation. The table-driven
 // coverage of the pure form lives in internal/syscpu with the function.
@@ -240,6 +276,12 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	// compaction re-encodes via DuckDB anyway. A silent revert of either
 	// SetDefault would ship unnoticed otherwise: every ingest test constructs
 	// IngestConfig by hand and the bool zero values coincide with these.
+	if cfg.Ingest.MaxRowGroupRows != 524288 {
+		t.Errorf("Ingest.MaxRowGroupRows default = %d, want 524288 (free on the sustained msgpack benchmark; 122880 cost 1.7%%)", cfg.Ingest.MaxRowGroupRows)
+	}
+	if cfg.Ingest.WritePageIndex {
+		t.Error("Ingest.WritePageIndex default = true, want false (no reader yet; cost grows with row-group count)")
+	}
 	if cfg.Ingest.UseDictionary {
 		t.Error("Ingest.UseDictionary default = true, want false (26.09.1 default flip)")
 	}
@@ -325,57 +367,71 @@ func TestLoad_BackupConfigPopulated(t *testing.T) {
 	}
 }
 
-func TestLoad_IcebergRejectsColdTiering(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "arc-config-test")
-	if err != nil {
-		t.Fatal(err)
+// Iceberg export runs on a local or an S3 primary (#939); everything else is refused at load.
+func TestLoad_IcebergBackends(t *testing.T) {
+	s3 := map[string]string{"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b", "ARC_STORAGE_S3_PREFIX": "inst/a/"}
+	with := func(base map[string]string, kv ...string) map[string]string {
+		out := map[string]string{"ARC_ICEBERG_ENABLED": "true"}
+		for k, v := range base {
+			out[k] = v
+		}
+		for i := 0; i+1 < len(kv); i += 2 {
+			out[kv[i]] = kv[i+1]
+		}
+		return out
 	}
-	defer os.RemoveAll(tmpDir)
-	oldWd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(oldWd)
-
-	// iceberg + cold-tier tiering must be rejected (cold files would be deleted from the table).
-	os.Setenv("ARC_ICEBERG_ENABLED", "true")
-	os.Setenv("ARC_TIERED_STORAGE_ENABLED", "true")
-	os.Setenv("ARC_TIERED_STORAGE_COLD_ENABLED", "true")
-	os.Setenv("ARC_TIERED_STORAGE_COLD_BACKEND", "s3")
-	os.Setenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET", "b")
-	defer func() {
-		os.Unsetenv("ARC_ICEBERG_ENABLED")
-		os.Unsetenv("ARC_TIERED_STORAGE_ENABLED")
-		os.Unsetenv("ARC_TIERED_STORAGE_COLD_ENABLED")
-		os.Unsetenv("ARC_TIERED_STORAGE_COLD_BACKEND")
-		os.Unsetenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET")
-	}()
-
-	if _, err := Load(); err == nil {
-		t.Fatal("expected error for iceberg.enabled + cold-tier tiering, got nil")
-	}
-}
-
-func TestLoad_IcebergRequiresLocalBackend(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "arc-config-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-	oldWd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(oldWd)
-
-	// iceberg + non-local primary backend must be rejected (local-only in v1).
-	os.Setenv("ARC_ICEBERG_ENABLED", "true")
-	os.Setenv("ARC_STORAGE_BACKEND", "s3")
-	os.Setenv("ARC_STORAGE_S3_BUCKET", "b")
-	defer func() {
-		os.Unsetenv("ARC_ICEBERG_ENABLED")
-		os.Unsetenv("ARC_STORAGE_BACKEND")
-		os.Unsetenv("ARC_STORAGE_S3_BUCKET")
-	}()
-
-	if _, err := Load(); err == nil {
-		t.Fatal("expected error for iceberg.enabled + non-local backend, got nil")
+	shared := []string{"ARC_CLUSTER_ENABLED", "true", "ARC_CLUSTER_SHARED_STORAGE_MODE", "true"}
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		wantErr string // "" = must load
+	}{
+		{"local", with(nil), ""},
+		{"s3", with(s3), ""},
+		{"s3 custom endpoint, path style", with(s3, "ARC_STORAGE_S3_ENDPOINT", "localhost:9000", "ARC_STORAGE_S3_PATH_STYLE", "true"), ""},
+		{"s3 warehouse at the root", with(s3, "ARC_ICEBERG_WAREHOUSE", "s3://b/inst/a"), ""},
+		{"s3 warehouse under the root", with(s3, "ARC_ICEBERG_WAREHOUSE", "s3://b/inst/a/lake/"), ""},
+		{"s3 no prefix, any path in the bucket", with(map[string]string{"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b"}, "ARC_ICEBERG_WAREHOUSE", "s3://b/x"), ""},
+		{"s3 warehouse in another bucket", with(s3, "ARC_ICEBERG_WAREHOUSE", "s3://other/inst/a"), "a different bucket"},
+		{"s3 warehouse a sibling prefix sharing a stem", with(s3, "ARC_ICEBERG_WAREHOUSE", "s3://b/inst/ab"), "outside storage.s3_prefix"},
+		{"s3 warehouse above the prefix", with(s3, "ARC_ICEBERG_WAREHOUSE", "s3://b/inst"), "outside storage.s3_prefix"},
+		{"s3 warehouse on local disk", with(s3, "ARC_ICEBERG_WAREHOUSE", "file:///var/lib/arc/wh"), "not an s3:// URI"},
+		{"s3 warehouse with dot segments", with(s3, "ARC_ICEBERG_WAREHOUSE", "s3://b/inst/a/../x"), "must be inside the storage root"},
+		{"s3 on the GCS interop endpoint", with(s3, "ARC_STORAGE_S3_ENDPOINT", "storage.googleapis.com"), "Google Cloud Storage"},
+		{"s3 on the GCS interop endpoint with scheme", with(s3, "ARC_STORAGE_S3_ENDPOINT", "https://storage.googleapis.com"), "Google Cloud Storage"},
+		{"azure", with(map[string]string{"ARC_STORAGE_BACKEND": "azure", "ARC_STORAGE_AZURE_CONTAINER": "c", "ARC_STORAGE_AZURE_ACCOUNT_NAME": "a"}), "does not support azure"},
+		{"shared storage without failover", with(s3, shared...), "requires cluster.failover_enabled=true"},
+		{"shared storage with failover", with(s3, append(shared, "ARC_CLUSTER_FAILOVER_ENABLED", "true")...), ""},
+		{"s3 with an S3 cold tier", with(s3, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c"), ""},
+		{"local with an S3 cold tier", with(nil, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c"), ""},
+		{"an Azure cold tier", with(nil, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "azure", "ARC_TIERED_STORAGE_COLD_AZURE_CONTAINER", "c", "ARC_TIERED_STORAGE_COLD_AZURE_ACCOUNT_NAME", "a"), "requires tiered_storage.cold.backend=\"s3\""},
+		{"a GCS cold tier", with(nil, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "gcs", "ARC_TIERED_STORAGE_COLD_GCS_BUCKET", "c"), "requires tiered_storage.cold.backend=\"s3\""},
+		{"an S3 cold tier on the GCS interop endpoint", with(nil, "ARC_TIERED_STORAGE_ENABLED", "true", "ARC_TIERED_STORAGE_COLD_ENABLED", "true",
+			"ARC_TIERED_STORAGE_COLD_BACKEND", "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET", "c", "ARC_TIERED_STORAGE_COLD_S3_ENDPOINT", "storage.googleapis.com"), "Google Cloud Storage"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env["ARC_TIERED_STORAGE_COLD_BACKEND"] == "gcs" || tc.env["ARC_STORAGE_BACKEND"] == "gcs" {
+				skipGCSInFIPSBuild(t)
+			}
+			t.Chdir(t.TempDir())
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			_, err := Load()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load() error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -1594,6 +1650,7 @@ func TestLoad_DatabaseExtensionsTOMLArray(t *testing.T) {
 // TestLoad_GCSPrimaryValidation (#1105): storage.backend="gcs" is accepted with
 // a bucket, and each refusal names the key at fault.
 func TestLoad_GCSPrimaryValidation(t *testing.T) {
+	skipGCSInFIPSBuild(t)
 	cases := []struct {
 		name    string
 		env     map[string]string
@@ -1648,6 +1705,7 @@ func TestLoad_GCSPrimaryValidation(t *testing.T) {
 // "gcs" with every key, its refusals naming the key, and the overlap refusal
 // between cold and primary storage, which applies to every backend.
 func TestLoad_GCSColdTierValidation(t *testing.T) {
+	skipGCSInFIPSBuild(t)
 	cold := func(kv ...string) map[string]string {
 		m := map[string]string{
 			"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true",
@@ -1745,5 +1803,21 @@ func TestLoad_AzureCredentialsTrimmed(t *testing.T) {
 	}
 	if cfg.Storage.AzureSASToken != "sv=1&sig=abc" || cfg.Storage.AzureAccountKey != "key==" {
 		t.Fatalf("not trimmed: %q %q", cfg.Storage.AzureSASToken, cfg.Storage.AzureAccountKey)
+	}
+}
+
+// ingest.max_row_group_rows: 0 keeps one row group per flush; 1..1023 and
+// negatives are rejected (a cap of 1 writes a row group and a page-index entry
+// per row); 1024 and up are accepted.
+func TestLoad_MaxRowGroupRowsValidation(t *testing.T) {
+	for _, c := range []struct {
+		v  string
+		ok bool
+	}{{"0", true}, {"1024", true}, {"122880", true}, {"1", false}, {"1023", false}, {"-5", false}} {
+		t.Setenv("ARC_INGEST_MAX_ROW_GROUP_ROWS", c.v)
+		_, err := Load()
+		if (err == nil) != c.ok {
+			t.Errorf("max_row_group_rows=%s: err=%v, want ok=%v", c.v, err, c.ok)
+		}
 	}
 }

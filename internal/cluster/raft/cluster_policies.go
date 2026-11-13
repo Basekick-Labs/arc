@@ -16,7 +16,9 @@ import (
 // primary writer runs them. A policy created anywhere else never ran, and a
 // failover left the new primary with none of them. With the flag on, the
 // definitions live here: every node materialises them into its own SQLite,
-// and execution stays primary-only.
+// and execution stays primary-only. Query governance policies (#1627) join
+// them, enforced by every node rather than the primary: see
+// governance_policies.go.
 //
 // The flag is applied only when every node supports it: an older build skips
 // the new commands and drops the new snapshot field, so its policies would
@@ -81,7 +83,13 @@ type SeedPoliciesPayload struct {
 	CQKeepIDs      bool      `json:"cq_keep_ids,omitempty"`
 	CQFloor        int64     `json:"cq_floor,omitempty"`
 	RetentionFloor int64     `json:"retention_floor,omitempty"`
-	Now            time.Time `json:"now"`
+	// Governance, GovernanceKeepIDs, GovernanceFloor: the adopted governance
+	// policies (#1627), one per token, with IDs kept or renumbered as
+	// Retention's.
+	Governance        []GovernancePolicyEntry `json:"governance,omitempty"`
+	GovernanceKeepIDs bool                    `json:"governance_keep_ids,omitempty"`
+	GovernanceFloor   int64                   `json:"governance_floor,omitempty"`
+	Now               time.Time               `json:"now"`
 }
 
 // CollectPoliciesPayload opens a collect of a kind: until it ends (a seed, or
@@ -140,23 +148,99 @@ const maxAwaitingMissing = 256
 
 // knownPolicyKind reports a kind this build can seed.
 func knownPolicyKind(kind string) bool {
-	return kind == PolicyKindTiering || kind == PolicyKindRetention || kind == PolicyKindCQ
+	return kind == PolicyKindTiering || kind == PolicyKindRetention || kind == PolicyKindCQ || kind == PolicyKindGovernance
+}
+
+// policyKindFlagSpec is a kind with a flag of its own on top of the cluster
+// policies flag (#1324 stages 2 and 3, #1627): the field holding the flag,
+// what its enable command's refusals call it and what the apply logs.
+type policyKindFlagSpec struct {
+	flag    func(f *ClusterFSM) *bool
+	noun    string
+	enabled string
+}
+
+var policyKindFlags = map[string]policyKindFlagSpec{
+	PolicyKindRetention: {func(f *ClusterFSM) *bool { return &f.retentionEnabled },
+		"retention policies", "Cluster-wide retention policies enabled"},
+	PolicyKindCQ: {func(f *ClusterFSM) *bool { return &f.cqEnabled },
+		"continuous query policies", "Cluster-wide continuous queries enabled"},
+	PolicyKindGovernance: {func(f *ClusterFSM) *bool { return &f.governanceEnabled },
+		"governance policies", "Cluster-wide governance policies enabled"},
+}
+
+// policyKindFlag returns the field holding kind's own flag, or nil for a kind
+// without one (tiering, which needs only the cluster policies flag) or an
+// unknown kind. It reads nothing: callers read the field under f.mu.
+func (f *ClusterFSM) policyKindFlag(kind string) *bool {
+	if spec, ok := policyKindFlags[kind]; ok {
+		return spec.flag(f)
+	}
+	return nil
 }
 
 // policyKindEnabledLocked reports whether kind may be collected and seeded:
-// tiering with the flag, retention once its own flag is on too (a build
-// without retention support can no longer be in the cluster).
+// tiering with the flag, a kind with a flag of its own once that flag is on
+// too (a build without that kind can no longer be in the cluster). An unknown
+// kind never is.
 func (f *ClusterFSM) policyKindEnabledLocked(kind string) bool {
 	if !f.clusterPolicies {
 		return false
 	}
-	if kind == PolicyKindCQ {
-		return f.cqEnabled
+	if kind == PolicyKindTiering {
+		return true
 	}
-	if kind == PolicyKindRetention {
-		return f.retentionEnabled
+	if flag := f.policyKindFlag(kind); flag != nil {
+		return *flag
 	}
-	return true
+	return false
+}
+
+// EnablePolicyKindPayload turns one kind's own flag on (retention, cq,
+// governance); Nodes as in EnableClusterPoliciesPayload.
+type EnablePolicyKindPayload struct {
+	Nodes []string  `json:"nodes"`
+	Now   time.Time `json:"now"`
+}
+
+// applyEnablePolicyKind is the enable command of every kind with a flag of
+// its own: once the cluster policies flag is on, and only with every node in
+// the FSM listed as supporting the kind.
+func (f *ClusterFSM) applyEnablePolicyKind(kind string, payload []byte) interface{} {
+	spec, ok := policyKindFlags[kind]
+	if !ok {
+		return fmt.Errorf("enable policies: kind %q has no flag of its own", kind)
+	}
+	var p EnablePolicyKindPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal enable %s payload: %w", spec.noun, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.clusterPolicies {
+		return fmt.Errorf("enable %s: cluster policies are not enabled", spec.noun)
+	}
+	flag := spec.flag(f)
+	if *flag {
+		return nil
+	}
+	listed := map[string]bool{}
+	for _, n := range p.Nodes {
+		listed[n] = true
+	}
+	var missing []string
+	for id := range f.nodes {
+		if !listed[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("enable %s: nodes %v are not known to support it", spec.noun, missing)
+	}
+	*flag = true
+	f.logger.Info().Int("nodes", len(f.nodes)).Msg(spec.enabled)
+	return nil
 }
 
 // ErrPolicyNotFound: a delete of a policy that does not exist.
@@ -192,6 +276,10 @@ type clusterPoliciesState struct {
 	CQEnabled bool       `json:"cq_enabled,omitempty"`
 	CQSeq     int64      `json:"cq_seq,omitempty"`
 	CQs       []*CQEntry `json:"cqs,omitempty"`
+	// Governance policies (#1627). Written only once their flag is on.
+	GovernanceEnabled bool                     `json:"governance_enabled,omitempty"`
+	GovernanceSeq     int64                    `json:"governance_seq,omitempty"`
+	Governance        []*GovernancePolicyEntry `json:"governance,omitempty"`
 }
 
 // EnableClusterPoliciesPayload turns the flag on; see
@@ -475,9 +563,13 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte) interface{} {
 		if err := validCQSeed(&p); err != nil {
 			return fmt.Errorf("seed policies: %w", err)
 		}
+	case PolicyKindGovernance:
+		if err := validGovernanceSeed(&p); err != nil {
+			return fmt.Errorf("seed policies: %w", err)
+		}
 	default:
-		if len(p.Retention) > 0 || len(p.CQ) > 0 {
-			return fmt.Errorf("seed policies: retention or continuous query rows in a %s seed", p.Kind)
+		if len(p.Retention) > 0 || len(p.CQ) > 0 || len(p.Governance) > 0 {
+			return fmt.Errorf("seed policies: retention, continuous query or governance rows in a %s seed", p.Kind)
 		}
 	}
 	seen := make(map[string]bool, len(p.Tiering))
@@ -523,11 +615,14 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte) interface{} {
 	if p.Kind == PolicyKindCQ {
 		f.seedCQLocked(&p)
 	}
+	if p.Kind == PolicyKindGovernance {
+		f.seedGovernanceLocked(&p)
+	}
 	f.policiesSeeded[p.Kind] = true
 	delete(f.policyCollecting, p.Kind)
 	delete(f.policyAwaiting, p.Kind)
 	delete(f.policyAdoptChoice, p.Kind)
-	f.logger.Info().Str("kind", p.Kind).Int("policies", len(p.Tiering)+len(p.Retention)+len(p.CQ)).Msg("Cluster policies seeded")
+	f.logger.Info().Str("kind", p.Kind).Int("policies", len(p.Tiering)+len(p.Retention)+len(p.CQ)+len(p.Governance)).Msg("Cluster policies seeded")
 	return nil
 }
 
@@ -559,6 +654,7 @@ func (f *ClusterFSM) snapshotClusterPoliciesLocked() *clusterPoliciesState {
 	sort.Slice(st.Awaiting, func(i, j int) bool { return st.Awaiting[i].Kind < st.Awaiting[j].Kind })
 	f.snapshotRetentionLocked(st)
 	f.snapshotCQLocked(st)
+	f.snapshotGovernanceLocked(st)
 	return st
 }
 
@@ -581,6 +677,7 @@ func (f *ClusterFSM) restoreClusterPoliciesLocked(st *clusterPoliciesState) {
 	f.tieringPolicySeq = 0
 	f.restoreRetentionLocked(st)
 	f.restoreCQLocked(st)
+	f.restoreGovernanceLocked(st)
 	if st == nil {
 		return
 	}

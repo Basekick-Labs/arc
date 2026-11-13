@@ -293,12 +293,17 @@ func (b *AzureBlobBackend) prefixedListPrefix(prefix string) (string, error) {
 // so failing the batch on one key would leave every other file undeleted
 // forever. Split out as a function because AzureBlobBackend cannot be built
 // without live credentials, and this behaviour deserves a test that needs none.
-func partitionValidKeys(prefix string, batch []string) (usable []string, rejected []error) {
+//
+// A refusal is wrapped with the key it is about, as the batch's SDK failures
+// are, and logged with the key as a field: the joined batch error is logged
+// only up to its first line, and a key in error text is masked (#1113).
+func partitionValidKeys(prefix string, batch []string, logger zerolog.Logger, backend string) (usable []string, rejected []error) {
 	usable = make([]string, 0, len(batch))
 	for _, path := range batch {
 		objectName, err := prefixObjectKey(prefix, path)
 		if err != nil {
-			rejected = append(rejected, err)
+			logger.Warn().Err(err).Str("key", path).Msg(backend + " batch: key refused before the delete")
+			rejected = append(rejected, fmt.Errorf("%s: %w", path, err))
 			continue
 		}
 		usable = append(usable, objectName)
@@ -596,13 +601,13 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) (ret
 			return fmt.Errorf("failed to create Azure batch builder: %w", err)
 		}
 
-		usable, rejected := partitionValidKeys(b.prefix, batch)
+		usable, rejected := partitionValidKeys(b.prefix, batch, b.logger, "Azure")
 		nonFatalErrs = append(nonFatalErrs, rejected...)
 		for _, key := range usable {
 			if err := bb.Delete(key, nil); err != nil {
 				// Reported on the UNPREFIXED spelling: the caller passed that
 				// one and has no reason to know the blob name (#1111).
-				return fmt.Errorf("failed to add delete to Azure batch for %q: %w", strings.TrimPrefix(key, b.prefix), err)
+				return fmt.Errorf("failed to add delete to Azure batch for %s: %w", strings.TrimPrefix(key, b.prefix), err)
 			}
 		}
 		if len(usable) == 0 {

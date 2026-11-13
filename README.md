@@ -10,6 +10,8 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
+[![Grump found nothing to complain about](https://grump.run/badge.svg)](https://grump.run/?utm_source=github&utm_medium=readme&utm_campaign=basekick-arc)
+
 Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 38M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
@@ -147,6 +149,8 @@ Benefits:
 
 Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (columnar, stable as of 26.09.1) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
 
+An optional Arrow Flight SQL listener exposes the same read-only query path over gRPC for ADBC and other Flight SQL clients. See the [Flight SQL guide](docs/operations/flight-sql.md) for setup and authentication.
+
 Benchmark: Arc 27.01.1 (main at b4d98a31, October 2026), M3 Max, `query_suite` from arc-benchmarks, 5 iterations per query, latency is p50 in milliseconds. One session, one dataset: a 532.6M-row `cpu` measurement (60 s of `sustained_bench` msgpack ingest spread over 24 hours, hourly-compacted: 25 hour partitions, 100 files), so the three columns are apples-to-apples.
 
 | Query | JSON (ms) | MessagePack (ms) | Arrow IPC (ms) | msgpack vs JSON | Arrow vs JSON |
@@ -178,7 +182,7 @@ The MessagePack endpoint is **stable** as of 26.09.1: its response shape and typ
 
 ## Single binary. Zero dependencies.
 
-Arc deploys as one statically-linked executable. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
+Arc deploys as one self-contained executable: DuckDB and its dependencies are linked in, and on Linux it needs only the system C library (glibc 2.34 or newer) and `libgcc_s`, which every distro ships. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
 
 - **Air-gap ready**: No external services required at runtime. No license server, no cloud dependency.
 - **Edge to cloud**: Deploy at the tactical edge, in a sovereign cloud, or on-premises.
@@ -229,19 +233,24 @@ brew install basekick-labs/tap/arc
 
 Apple Silicon. DuckDB is statically linked, so there are no runtime dependencies. (Use `brew install --formula arc` if you tap first, to disambiguate from the `arc` browser cask.)
 
+Linux packages run on glibc 2.34 or newer: Ubuntu 22.04+, Debian 12+, RHEL/Rocky/Alma 9+, Amazon Linux 2023, Fedora 35+. Ubuntu 20.04 and RHEL 8 are not supported.
+
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc_26.09.3_amd64.deb
-sudo dpkg -i arc_26.09.3_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.4/arc_26.09.4_amd64.deb
+sudo dpkg -i arc_26.09.4_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
+The RPMs are signed with the Basekick Labs package key from 26.09.4, fingerprint `3E39 9CF8 F5D2 EF9A A9A5 36EF 7629 7AF0 8CBA B6FE` (check it with `gpg --show-keys RPM-GPG-KEY-basekick`). Earlier RPMs are unsigned, and `dnf` installs them with a warning. Fedora 45 and later refuse an unsigned package with plain `rpm -i`.
+
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3-1.x86_64.rpm
-sudo rpm -i arc-26.09.3-1.x86_64.rpm
+sudo rpm --import https://raw.githubusercontent.com/Basekick-Labs/arc/main/deploy/packaging/RPM-GPG-KEY-basekick
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.4/arc-26.09.4-1.x86_64.rpm
+sudo dnf install -y ./arc-26.09.4-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
@@ -250,15 +259,15 @@ sudo systemctl enable arc && sudo systemctl start arc
 Works on Arch Linux and Arch-based distros such as Omarchy (x86_64 and aarch64).
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3-1-x86_64.pkg.tar.zst
-sudo pacman -U arc-26.09.3-1-x86_64.pkg.tar.zst
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.4/arc-26.09.4-1-x86_64.pkg.tar.zst
+sudo pacman -U arc-26.09.4-1-x86_64.pkg.tar.zst
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.4/arc-26.09.4.tgz
 ```
 
 ### Build from Source
@@ -300,7 +309,7 @@ The FIPS build reports the same version as the standard build and logs
 tokens must be rotated when moving to the FIPS build (it stores new tokens with
 PBKDF2 and fails bcrypt verification closed). The Go Cryptographic Module is
 CMVP-certified; Arc itself is not a CMVP-listed module. See the
-[FIPS 140-3 mode guide](https://docs.basekick.net/docs/configuration/fips).
+[FIPS 140-3 mode guide](https://docs.basekick.net/arc/configuration/fips/).
 
 ---
 
@@ -356,7 +365,7 @@ backend = "local"        # local, s3, minio
 local_path = "./data/arc"
 
 [ingest]
-flush_interval = "5s"
+max_buffer_age_ms = 5000   # flush a buffer at most this old
 max_buffer_size = 50000
 
 [auth]

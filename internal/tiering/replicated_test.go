@@ -251,7 +251,20 @@ func TestRecordManifestUnlinkedFile_UsesColdObjectSizeWhenRowIsMissing(t *testin
 	if tier != string(TierCold) || size != int64(len(body)) {
 		t.Fatalf("row = (%q, %d), want cold with size %d", tier, size, len(body))
 	}
-	tiers, err := m.metadata.GetTiersForMeasurement(context.Background(), "db1", "cpu")
+	// tierEventsProcessed counts the event when its row is written; the
+	// drainer invalidates the tier cache only at the end of the batch, and its
+	// before-snapshot cached this measurement's empty set. Until then a read
+	// can be served that stale entry, so wait for the invalidation (#1529).
+	var tiers map[Tier]bool
+	var err error
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		tiers, err = m.metadata.GetTiersForMeasurement(context.Background(), "db1", "cpu")
+		if (err == nil && tiers[TierCold]) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	if err != nil || !tiers[TierCold] {
 		t.Fatalf("measurement tiers = %v, err=%v; want cold so queries include the migrated object", tiers, err)
 	}

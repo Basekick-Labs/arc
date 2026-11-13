@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -27,10 +28,9 @@ import (
 //     there, and the two paths cannot be confused into weakening each other.
 //
 // Offline mode is network-free, full stop: no activation, no verification
-// calls, no periodic re-validation, no cache. Expiry is enforced AT LOAD —
-// a file that expires mid-process keeps its features until the next restart
-// rejects it (consistent with the boot-only enforcement philosophy of the
-// resilience work; do not claim runtime expiry enforcement in docs).
+// calls, no periodic re-validation, no cache. Expiry is checked at load and
+// by feature gates at read time, so a signed file cannot keep those gates
+// open after its expiry while the process remains running.
 // Fail-closed: any error → OSS.
 
 // offlineFile is the accepted file shape; unknown fields (summary) ignored.
@@ -80,9 +80,12 @@ func NewOfflineClient(path string, logger zerolog.Logger) (*Client, error) {
 			return nil, fmt.Errorf("offline license verification failed: %w", err)
 		}
 	}
+	AdvanceClock(signed.IssuedAt) // signed server time: a floor for the license clock
 	now := time.Now().UTC()
-	if !now.Before(signed.ExpiresAt) {
-		return nil, fmt.Errorf("offline license expired at %s", signed.ExpiresAt.UTC().Format(time.RFC3339))
+	// Loadable until the cutoff, grace included (grace.go): an air-gapped
+	// site restarted during grace keeps its license.
+	if !validAt(signed.ExpiresAt, strings.HasPrefix(signed.CustomerID, TrialCustomerPrefix), licenseNow()) {
+		return nil, fmt.Errorf("offline license expired (signed expiry %s, grace included)", signed.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 
 	lic := signed.ToRuntimeLicense(now)

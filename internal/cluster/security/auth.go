@@ -159,8 +159,8 @@ func ValidateForwardHMAC(sharedSecret, nonce, nodeID, clusterName string, payloa
 // ComputeCacheInvalidateHMAC computes HMAC-SHA256 for the post-compaction
 // cluster cache-invalidation broadcast (POST /api/v1/internal/cache/invalidate).
 // The request body is empty by design — the only state the endpoint needs is
-// "clear your caches now" — so the signed material binds sender identity and
-// freshness rather than payload bytes.
+// "clear your caches now" — so the signed material binds the claimed sender
+// and freshness rather than payload bytes.
 //
 // The "cache-invalidate" label is the first field of the canonical input,
 // distinct from Forward/Fetch/Join so a leaked MAC for one endpoint cannot

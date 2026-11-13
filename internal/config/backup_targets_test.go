@@ -844,6 +844,9 @@ func TestBackupTargetRequiredFields(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			if strings.Contains(c.stanza, `"gcs"`) {
+				skipGCSInFIPSBuild(t)
+			}
 			writeArcToml(t, "[backup]\ndefault_target = \"audit\"\n[backup.targets.audit]\n"+c.stanza+"\n")
 			mustLoadError(t, c.want)
 		})
@@ -1064,6 +1067,7 @@ local_path = "./data/backups"
 // same bucket through GCS's S3 interoperability endpoint is refused — at the
 // default prefix and at a non-default one — while another bucket is allowed.
 func TestBackupTargetOverS3InteropIntoAGCSPrimaryIsRefused(t *testing.T) {
+	skipGCSInFIPSBuild(t)
 	for _, c := range []struct{ gcsPrefix, targetPrefix string }{
 		{"", "backups"},
 		{"inst/a", "inst/a/backups"},
@@ -1128,6 +1132,7 @@ s3_endpoint = "https://storage.googleapis.com"
 // prefix, renders a GCS backend spec in the backup role, and is refused when
 // it overlaps a GCS cold tier or primary; a sibling prefix is allowed.
 func TestGCSBackupTarget(t *testing.T) {
+	skipGCSInFIPSBuild(t)
 	writeArcToml(t, `
 [backup]
 default_target = "audit"

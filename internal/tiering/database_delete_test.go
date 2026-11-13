@@ -286,9 +286,10 @@ func TestCleanupDatabaseDeleteRetainsColdRowsWhenColdIsDisabled(t *testing.T) {
 // by a reader reserves nothing on the node that migrates, and the cycle can
 // copy a hot file to cold after the delete has already swept that tier.
 //
-// The nil-gate case is the other half, and it must NOT refuse: a local-storage
-// cluster without replication wires no gate deliberately, because each node's
-// metadata is authoritative for its own disk.
+// The nil-gate case is the other half, and it must NOT refuse here: a
+// standalone node has no gate, and neither does a writer in a local-storage
+// cluster without replication. In a cluster, the databases handler refuses a
+// writer that is not the primary before it reaches this (#1599).
 func TestBeginDatabaseDeleteRefusesWhenRoleGated(t *testing.T) {
 	m, _, _, cleanup := setupIntegrationTest(t, true)
 	defer cleanup()

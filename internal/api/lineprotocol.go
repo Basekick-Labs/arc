@@ -13,6 +13,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -27,8 +28,8 @@ type LineProtocolHandler struct {
 	parser *ingest.LineProtocolParser
 	logger zerolog.Logger
 
-	// authManager holds the concrete *auth.AuthManager so route-level
-	// auth.RequireWrite / RequireAdmin can be wired without the
+	// authManager holds the concrete *auth.AuthManager so the route-level
+	// write and admin middleware can be wired without the
 	// silent-miss type-assert pattern. See MsgPackHandler.authManager
 	// for full rationale. nil = OSS no-auth.
 	authManager *auth.AuthManager
@@ -85,12 +86,14 @@ func (h *LineProtocolHandler) checkWritePermissions(c *fiber.Ctx, database strin
 }
 
 // RegisterRoutes registers Line Protocol routes. All write endpoints
-// are gated by auth.RequireWrite when auth is enabled; the /flush
-// endpoint is admin-gated because it forces a global flush across
-// all shards (operationally heavy + spammable). Per CLAUDE.md,
-// mutating endpoints MUST have an explicit auth middleware.
+// are gated by withAnyResourceWriteAuth when auth is enabled: a token
+// holding write on anything, RBAC included (#1559), with every
+// measurement in the payload then checked by checkWritePermissions. The
+// /flush endpoint is admin-gated because it forces a global flush across
+// all shards (operationally heavy + spammable). Per CLAUDE.md, mutating
+// endpoints MUST have an explicit auth middleware.
 func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
-	writeAuth := withWriteAuth(h.authManager)
+	writeAuth := withAnyResourceWriteAuth(h.authManager, h.rbacManager)
 	adminAuth := withAdminAuth(h.authManager)
 
 	// InfluxDB 1.x compatible endpoint
@@ -176,6 +179,10 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
+	}
 
 	// Validate precision parameter
 	switch precision {
@@ -200,7 +207,10 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding Line Protocol write request to writer node")
 
-		httpReq, err := BuildHTTPRequest(c)
+		// Built only here, once the write is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		httpReq, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
 			h.totalErrors.Add(1)
@@ -209,7 +219,9 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 			})
 		}
 
-		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		defer release()
+
+		resp, err := h.router.RouteWrite(fctx, httpReq)
 		if err == cluster.ErrLocalNodeCanHandle {
 			// Fall through to local processing
 			goto localProcessing
@@ -332,6 +344,12 @@ localProcessing:
 	h.totalRecords.Add(int64(len(records)))
 
 	// Convert to columnar format grouped by measurement
+	if err := ingest.CheckDenseCells(records); err != nil {
+		h.totalErrors.Add(1)
+		metrics.Get().IncIngestErrors()
+		h.logger.Warn().Err(err).Str("database", database).Msg("Line protocol write refused")
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+	}
 	columnarByMeasurement := ingest.BatchToColumnar(records)
 
 	// The measurements in a fixed order: RBAC reads them, and the write loop
@@ -376,13 +394,14 @@ localProcessing:
 		}
 	}
 
-	// Refuse the whole request up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676), rather than part-way through
-	// the measurements below. The admitted context skips the per-call disk
-	// pressure check, so pressure starting mid-request cannot split it. The
-	// fence is still checked per call: one that closes part-way stops the
-	// write, answered with what was written (writeLPMeasurements, #1437).
-	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	// Refuse the whole request up front if the ingest gate is closed (the
+	// fence and stream-takeover pauses, #1207) or the WAL volume is under disk
+	// pressure (#676), rather than part-way through the measurements below.
+	// The admitted context skips the per-call gate and disk pressure checks,
+	// so neither closing mid-request can split it (#1422). Any other failure
+	// part-way stops the write, answered with what was written
+	// (writeLPMeasurements, #1437).
+	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
@@ -433,6 +452,10 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 	if err != nil {
 		h.totalErrors.Add(1)
 		metrics.Get().IncIngestErrors()
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Int("body_bytes", len(body)).Msg("Line protocol write refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Str("database", database).Msg("Failed to parse line protocol")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
 	}
@@ -483,9 +506,11 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 		}
 	}
 
-	// Refuse the whole request up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676); see the record path above.
-	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	// Refuse the whole request up front if the ingest gate is closed (the
+	// fence and stream-takeover pauses, #1207) or the WAL volume is under disk
+	// pressure (#676), and check neither again per measurement (#1422); see
+	// the record path above.
+	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
@@ -600,12 +625,12 @@ type lpStop struct {
 // one buffer call each (write returns the measurement's rows and the call's
 // error), and returns rows, dropped and drops updated for what it left out.
 //
-// A measurement refused for its content before the WAL (#440, #1342) is
-// dropped and the others are still written: a partial write, as for a point
-// that cannot be stored. Any other failure stops the write: the stop says
-// what was buffered before it, because an answer that reads as "nothing was
-// written" would have the client resend, and write the buffered part again
-// (#1437). When every measurement was refused for its content, the stop
+// A measurement refused for its content before the WAL (#440, #1342, #1424)
+// is dropped and the others are still written: a partial write, as for a
+// point that cannot be stored. Any other failure stops the write: the stop
+// says what was buffered before it, because an answer that reads as "nothing
+// was written" would have the client resend, and write the buffered part
+// again (#1437). When every measurement was refused for its content, the stop
 // carries the first refusal and nothing written.
 //
 // The success path adds rows and moves on: what was written is worked out
@@ -668,7 +693,7 @@ func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *
 	if ingest.IsWriteRefusal(err) {
 		return respondWriteRefused(c, err)
 	}
-	// A client error (#440, #1342), refused before the WAL.
+	// A client error (#440, #1342, #1424, #1475), refused before the WAL.
 	if ingest.IsContentRefusal(err) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}

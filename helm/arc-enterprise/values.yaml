@@ -4,7 +4,9 @@
 #   - shared: all Arc nodes read/write the same object store (S3-compatible
 #             or Azure). Set storage.mode=shared (with seaweedfs.enabled=true
 #             for the bundled SeaweedFS, or storage.shared.external=true to
-#             point at your own S3/Azure).
+#             point at your own S3/Azure). storage.shared.multiWriter picks
+#             multi-writer (default; needs the shared_storage_multi_writer
+#             licence feature) or single-writer (one elected primary).
 #
 #   - local:  each Arc node has its own PersistentVolume and peer replication
 #             keeps the cluster in sync. Set storage.mode=local.
@@ -114,6 +116,15 @@ storage:
     # "gcs" (Google Cloud Storage, through its own API; requires
     # external=true). bucket and prefix below apply to both.
     backend: s3
+    # multiWriter: true = Pattern 2 multi-writer, every writer pod accepts
+    # writes (sets cluster.shared_storage_mode; the licence must include
+    # shared_storage_multi_writer). false = single-writer shared storage: one
+    # elected primary takes writes, the other writer pods are standbys that
+    # forward writes to it, and cluster.failover.enabled (writer_failover
+    # licence feature) replaces a lost primary. Needs no multi-writer
+    # licence. Changing it on a running multi-writer cluster is disruptive:
+    # writes pause until a primary is elected.
+    multiWriter: true
     external: false                # true = use existing object store; false = bundled SeaweedFS (s3 only)
     bucket: arc-data
     region: us-east-1
@@ -293,6 +304,20 @@ service:
     type: ClusterIP
     port: 8000
     annotations: {}
+
+# -----------------------------------------------------------------------------
+# Arrow Flight SQL listener (Arc 27.01.1+)
+# -----------------------------------------------------------------------------
+# A gRPC port for ADBC clients on the writers and readers, serving the same
+# read-only query path as the HTTP API, with RBAC, governance and audit
+# (docs/operations/flight-sql.md). Off by default: with enabled: false no
+# port is opened. When on, the writer and reader Services get a flight-sql
+# port. Compactors have no client Service and are not given the listener.
+# TLS follows the HTTP API's server.tls_* settings.
+flightSql:
+  enabled: false
+  port: 50051          # container port (flight_sql.port); must not be 8000, 9100 or 9200
+  servicePort: 50051   # port on the writer and reader Services
 
 # -----------------------------------------------------------------------------
 # Telemetry — disable for air-gapped / defense deployments

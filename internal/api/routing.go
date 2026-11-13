@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
@@ -27,6 +28,7 @@ var hopByHopHeaders = map[string]bool{
 	"Proxy-Authenticate":  true,
 	"Proxy-Authorization": true,
 	"Te":                  true,
+	"Trailer":             true,
 	"Trailers":            true,
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
@@ -64,6 +66,11 @@ var clientForwardingHeaders = map[string]bool{
 	"Forwarded":           true, // RFC 7239
 	"X-Arc-Forwarded-By":  true, // internal loop marker; only the peer may set it
 	"X-Arc-Original-Host": true,
+	// The Flight SQL bridge's client-address ProxyHeader and its internal
+	// key (flight_sql.go): the bridge already deletes the key, and a peer
+	// learns the client address from RemoteAddr like any forward.
+	"X-Arc-Flight-Peer":         true,
+	"X-Arc-Flight-Internal-Key": true,
 	// Client installation ids (arcli's legacy header and the generic one
 	// the SDKs send) are recorded by the node that received the request
 	// (telemetry, client_identity.go); stripped here so a forwarded
@@ -86,46 +93,154 @@ func isClientForwardingHeader(canonicalKey string) bool {
 	return clientForwardingHeaders[canonicalKey] || strings.HasPrefix(canonicalKey, security.ForwardIdentityHeaderPfx)
 }
 
+// forwardSetupHook, when set by a test, is called each time a forward's
+// context or request is built (forwardContext, BuildHTTPRequest): the forward
+// setup runs only behind a forward decision, never on a request served here.
+// Nil in production.
+var forwardSetupHook func()
+
+// forwardContext is the context a query forward runs on (#1629): a child of
+// the router's lifetime, which ends when the server starts shutting down
+// (Router.StopForwards), as the request context of a forward used to. It
+// holds no reference to the pooled *fasthttp.RequestCtx: net/http dials,
+// and writes a request body, in goroutines that can outlive the handler,
+// and RequestCtx.Value reads the request's user values (fiber Locals) after
+// fasthttp has reset and reused it. Not cancelled when the client leaves
+// (neither was the request context); the query forwards watch for that
+// themselves, and cancel it on every exit, or it would stay registered on
+// the router's lifetime until shutdown. Call it only once the request is
+// being forwarded.
+//
+// The write-class forwards (writes, imports, database creation, the
+// standby forward) need no cancel of their own and run on
+// router.Lifetime() itself: nothing but shutdown and the client's timeout
+// ends them, and the child would cost allocations per forward.
+func forwardContext(router *cluster.Router) (context.Context, context.CancelFunc) {
+	if forwardSetupHook != nil {
+		forwardSetupHook()
+	}
+	return context.WithCancel(router.Lifetime())
+}
+
+// forwardBodyCopyMax is the largest body a forward copies instead of reading
+// it through a forwardBody. net/http writes the headers of a body that is not
+// one of its in-memory readers in a TCP write of their own (FlushHeaders), so
+// a small forward would take an extra write; a copy this small costs less
+// than that (#1629 benchmarks). Above it the separate header write is at most
+// one extra small syscall per forward, against a body of at least 4KB.
+const forwardBodyCopyMax = 4 << 10
+
+// forwardBody is the request body of a forward larger than
+// forwardBodyCopyMax: fasthttp's body slice, not a copy (a write or import
+// can be up to 1GB), readable only until the forward is released. net/http
+// may go on reading a request body after RoundTrip has returned (the
+// transport writes it from its own goroutine: an early answer such as a 413,
+// a cancel, a timeout), and once the handler returns fasthttp reuses that
+// slice for a later request. After release a read fails and the
+// peer gets a truncated body for a request whose forward already ended.
+type forwardBody struct {
+	mu       sync.Mutex
+	buf      []byte // nil once released
+	released bool
+}
+
+func (b *forwardBody) release() {
+	b.mu.Lock()
+	b.buf, b.released = nil, true
+	b.mu.Unlock()
+}
+
+// reader is one pass over the body (the request's Body, or GetBody's).
+func (b *forwardBody) reader() io.ReadCloser { return &forwardBodyReader{b: b} }
+
+type forwardBodyReader struct {
+	b   *forwardBody
+	off int
+}
+
+func (r *forwardBodyReader) Read(p []byte) (int, error) {
+	r.b.mu.Lock()
+	defer r.b.mu.Unlock()
+	if r.b.released {
+		return 0, io.ErrClosedPipe
+	}
+	if r.off >= len(r.b.buf) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b.buf[r.off:])
+	r.off += n
+	return n, nil
+}
+
+// Close is a no-op on purpose: Read never blocks, so there is nothing to
+// unblock, and cutting the body off is release's job (after the forward
+// returned), not the transport's.
+func (r *forwardBodyReader) Close() error { return nil }
+
 // BuildHTTPRequest converts a Fiber context to a net/http Request for
-// forwarding via the router.
+// forwarding via the router, on ctx (forwardContext, or router.Lifetime()
+// for a write-class forward). release ends the
+// request's access to c's body; the caller defers it right after a
+// successful call, in the forward branch.
 //
-// Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// import.go, tle.go, query.go) invokes the returned *http.Request synchronously
-// within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
-// (which blocks on http.Client.Do; queries are buffered for retries, writes
-// are streamed once and never retried, see internal/cluster/router.go), then
-// read+close the response
-// body inside CopyResponse, then return. fasthttp does not recycle the
-// RequestCtx until after the handler returns (fasthttp server.go
-// releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
-// directly is safe and avoids a copy that can be large at max payload
-// (up to 1GB). c.Context() is a *fasthttp.RequestCtx; its Done() closes only
-// on server shutdown, so a forward keeps running after its client leaves, as a
-// local write would. Its value is only a parent for the forward's timeout.
+// Lifecycle (#1629): the request holds two things fasthttp recycles once the
+// handler returns, and net/http may use both from its own goroutines after
+// the router call returned (a dial outliving a cancel; the body written
+// after an early answer, a cancel or a timeout):
+//   - the context: ctx is rooted on the router's lifetime, never on
+//     c.Context(), so no value lookup reaches the pooled RequestCtx;
+//   - the body: c's raw body slice, not copied (up to 1GB), read through a
+//     forwardBody that release cuts off; a body of at most
+//     forwardBodyCopyMax is copied instead.
 //
-// If a future refactor moves any of this work to a background goroutine
-// or stream writer, those properties no longer hold and the caller
-// must take a defensive copy + use a non-pooled context. Today's
-// callers are all synchronous; revisit this if that changes.
-func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
+// Queries are buffered for retries by the router (io.ReadAll in doForward)
+// before it sends anything; writes, imports, database creation and the
+// standby forward stream the body once (doForwardOnce). The Arrow forward
+// (#1567) streams the RESPONSE from a stream writer after the handler
+// returns: its request body is already copied by then, and its context is
+// cancelled by the stream writer, not by the handler.
+func BuildHTTPRequest(c *fiber.Ctx, ctx context.Context) (req *http.Request, release func(), err error) {
+	if forwardSetupHook != nil {
+		forwardSetupHook()
+	}
 	// Build full URL from Fiber context
 	// c.BaseURL() returns scheme://host, c.OriginalURL() returns path + query
 	url := c.BaseURL() + c.OriginalURL()
 
-	// Wrap fasthttp's body slice directly — synchronous-handler lifecycle
-	// argument above. The RAW body, as received: c.Body() would decompress a
-	// gzip/deflate/brotli body without the size cap the write handlers apply,
-	// then forward it under its original Content-Encoding (#1270). The peer
-	// decodes it with its own caps.
-	body := bytes.NewReader(c.Request().Body())
+	// The token this node verified for the caller: the router asserts it to
+	// a peer instead of forwarding the caller's credential (#1305).
+	var tok cluster.ForwardToken
+	if info := auth.GetTokenInfo(c); info != nil {
+		tok = cluster.ForwardToken{ID: info.ID, Fingerprint: info.Fingerprint}
+	}
+	ctx = cluster.WithForwardToken(ctx, tok)
 
-	// c.Context() ends the forwarded request when this server shuts down.
-	// It does NOT end it when the client disconnects: fasthttp closes a
-	// request's Done() only at shutdown, so a forward runs until the peer
-	// answers or the router's client timeout (#1070).
-	req, err := http.NewRequestWithContext(c.Context(), c.Method(), url, body)
+	// The RAW body, as received: c.Body() would decompress a gzip/deflate/
+	// brotli body without the size cap the write handlers apply, then
+	// forward it under its original Content-Encoding (#1270). The peer
+	// decodes it with its own caps. A small body is copied; a larger one is
+	// read through a forwardBody, for which ContentLength and GetBody are set
+	// here: net/http derives them only for its own reader types, and without
+	// a length the body would go out chunked.
+	raw := c.Request().Body()
+	var fb *forwardBody
+	var body io.Reader = http.NoBody
+	switch {
+	case len(raw) > forwardBodyCopyMax:
+		fb = &forwardBody{buf: raw}
+		body = fb.reader()
+	case len(raw) > 0:
+		body = bytes.NewReader(bytes.Clone(raw))
+	}
+	req, err = http.NewRequestWithContext(ctx, c.Method(), url, body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	release = func() {}
+	if fb != nil {
+		req.ContentLength = int64(len(raw))
+		req.GetBody = func() (io.ReadCloser, error) { return fb.reader(), nil }
+		release = fb.release
 	}
 
 	// Copy headers from Fiber request, filtering connection-specific
@@ -138,10 +253,9 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	//     forwarded by intermediaries. CopyResponse already filters
 	//     them on the response path via the same isHopByHop helper;
 	//     the request path was missing this filter.
-	//   - Content-Length: net/http sets req.ContentLength from the
-	//     body (it knows the body is *bytes.Reader and gets its
-	//     length), then writes Content-Length on the wire from
-	//     ContentLength. Forwarding a Content-Length from the
+	//   - Content-Length: req.ContentLength is set above from the
+	//     body's length, and net/http writes Content-Length on the
+	//     wire from it. Forwarding a Content-Length from the
 	//     upstream header would duplicate the header or send a stale
 	//     value mismatched with the actual body size.
 	//
@@ -189,21 +303,14 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Set remote address for X-Forwarded-For handling in router
 	req.RemoteAddr = c.IP()
 
-	// The token this node verified for the caller: the router asserts it to
-	// a peer instead of forwarding the caller's credential (#1305).
-	var tok cluster.ForwardToken
-	if info := auth.GetTokenInfo(c); info != nil {
-		tok = cluster.ForwardToken{ID: info.ID, Fingerprint: info.Fingerprint}
-	}
-	req = req.WithContext(cluster.WithForwardToken(req.Context(), tok))
-
-	return req, nil
+	return req, release, nil
 }
 
-// forwardedRoutes are the requests a peer forwards (writes, imports and
-// queries; see the RouteWrite/RouteImport/RouteQuery callers). A forwarded
-// identity is accepted only on these, so it cannot stand in for a token
-// anywhere else.
+// forwardedRoutes are the requests a peer forwards (writes, imports, queries
+// and database creation; see the RouteWrite/RouteImport/RouteQuery/
+// RouteReadQuery/RouteDatabaseCreate callers). A forwarded identity is
+// accepted only on these, so it cannot stand in for a token anywhere else;
+// the route's own permission check still applies to the forwarded token.
 var forwardedRoutes = map[string]bool{
 	"POST /write":                      true,
 	"POST /api/v2/write":               true,
@@ -217,6 +324,73 @@ var forwardedRoutes = map[string]bool{
 	"POST /api/v1/import/tle":          true,
 	"POST /api/v1/query":               true,
 	"POST /api/v1/query/msgpack":       true,
+	// The rest are forwarded only to peers advertising
+	// CapabilityForwardReadQueries (#1567 and its follow-up), so no older
+	// peer is sent them.
+	"POST /api/v1/query/arrow":    true,
+	"POST /api/v1/query/estimate": true,
+	"GET /api/v1/measurements":    true,
+	"GET /api/v1/databases":       true,
+	// Forwarded only to a writer advertising CapabilityForwardDatabaseCreate.
+	// Creation only: DELETE /api/v1/databases/:name is not forwarded and
+	// stays refused.
+	"POST /api/v1/databases": true,
+}
+
+// forwardedRoutePatterns are the forwardable routes with path parameters: a
+// method and the exact segments, "*" standing for one non-empty segment.
+var forwardedRoutePatterns = []struct {
+	method   string
+	segments []string
+}{
+	{"GET", []string{"api", "v1", "query", "*"}},
+	{"GET", []string{"api", "v1", "databases", "*"}},
+	{"GET", []string{"api", "v1", "databases", "*", "measurements"}},
+	{"GET", []string{"api", "v1", "databases", "*", "measurements", "*", "schema"}},
+}
+
+// forwardableRoute reports whether a forwarded identity may stand in for a
+// token on method + rawPath. It matches the path Fiber routes on, not a
+// cleaned form of it: a path that cleaning would change (".", "..", "//") is
+// refused outright, because Fiber and a cleaned match can disagree about the
+// handler it reaches (/api/v1/databases/../measurements cleans to an allowed
+// route but reaches the databases handler).
+func forwardableRoute(method, rawPath string) bool {
+	p := strings.TrimRight(rawPath, "/")
+	if p == "" || path.Clean(p) != p {
+		return false
+	}
+	// Fiber routes case-insensitively and answers HEAD with the GET handler,
+	// so the match does the same.
+	p = strings.ToLower(p)
+	if method == fiber.MethodHead {
+		method = fiber.MethodGet
+	}
+	if forwardedRoutes[method+" "+p] {
+		return true
+	}
+	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	for _, pat := range forwardedRoutePatterns {
+		if pat.method != method || len(pat.segments) != len(segs) {
+			continue
+		}
+		ok := true
+		for i, want := range pat.segments {
+			if want == "*" {
+				if segs[i] == "" {
+					ok = false
+					break
+				}
+			} else if segs[i] != want {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ForwardIdentityChecker verifies a forwarded request's signed identity
@@ -245,7 +419,7 @@ func ForwardIdentityVerifier(coord ForwardIdentityChecker) func(c *fiber.Ctx) (b
 		if !present {
 			return false, 0, "", nil
 		}
-		if err == nil && !forwardedRoutes[c.Method()+" "+path.Clean(c.Path())] {
+		if err == nil && !forwardableRoute(c.Method(), c.Path()) {
 			err = security.ErrForwardIdentity
 		}
 		return true, tok.ID, tok.Fingerprint, err
@@ -259,15 +433,7 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 
 	// Set status code
 	c.Status(resp.StatusCode)
-
-	// Copy headers (excluding hop-by-hop headers)
-	for key, values := range resp.Header {
-		if !isHopByHop(key) {
-			for _, v := range values {
-				c.Set(key, v)
-			}
-		}
-	}
+	copyForwardedHeaders(c, resp)
 
 	// Copy body
 	body, err := io.ReadAll(resp.Body)
@@ -290,6 +456,35 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 	}
 
 	return c.Send(body)
+}
+
+// copyForwardedHeaders copies a forwarded response's end-to-end headers onto
+// c's response.
+func copyForwardedHeaders(c *fiber.Ctx, resp *http.Response) {
+	// Hop-by-hop headers are skipped. The upstream's values
+	// replace any this node already set, as c.Set did: the forwarding node's
+	// own middleware (CORS, security headers) runs before this, and the
+	// upstream node ran the same middleware, so appending would send
+	// Access-Control-Allow-Origin twice and browsers reject that. Every
+	// upstream value of a repeated header is kept, in order (#1556): c.Set
+	// kept only the last.
+	//
+	// Two passes: fasthttp deletes a header by moving the last one into its
+	// slot, so a Del between Adds could reorder values already added.
+	h := &c.Context().Response.Header
+	for key := range resp.Header {
+		if !isHopByHop(key) {
+			h.Del(key)
+		}
+	}
+	for key, values := range resp.Header {
+		if isHopByHop(key) {
+			continue
+		}
+		for _, v := range values {
+			h.Add(key, v)
+		}
+	}
 }
 
 // ForwardDecision is the outcome of the pre-handler routing check. It
@@ -446,11 +641,14 @@ func forwardStandby(router *cluster.Router, c *fiber.Ctx, forward func(context.C
 	if !ok {
 		return false, nil
 	}
-	req, err := BuildHTTPRequest(c)
+	// The router's lifetime, not a per-forward child (forwardContext).
+	ctx := router.Lifetime()
+	req, release, err := BuildHTTPRequest(c, ctx)
 	if err != nil {
 		return false, nil
 	}
-	resp, err := forward(c.Context(), node, req)
+	defer release()
+	resp, err := forward(ctx, node, req)
 	if err != nil {
 		return true, respondWriteForwardError(c, err)
 	}
@@ -507,6 +705,13 @@ func respondIngestRefused(c *fiber.Ctx, err error) error {
 	ingest.LogRefusal(c.Path(), err)
 	c.Locals(ingestRefusedLocal, true)
 	c.Set(IngestRefusedHeader, reason)
+	if reason == ingest.RefusalLicenseGrace {
+		// Not a moment's condition: it lasts until the license is renewed or
+		// its grace period ends. A long Retry-After keeps clients from
+		// hammering, and 503 keeps them retrying rather than dropping data.
+		c.Set(fiber.HeaderRetryAfter, "300")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected: " + err.Error()})
+	}
 	c.Set(fiber.HeaderRetryAfter, "5")
 	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 		"error": "Write rejected (retry): " + err.Error(),
@@ -524,22 +729,21 @@ func respondWriteRefused(c *fiber.Ctx, err error) error {
 
 // HandleRoutingError returns an appropriate error response for routing failures.
 func HandleRoutingError(c *fiber.Ctx, err error) error {
-	switch err {
-	case cluster.ErrNoWriterAvailable:
+	// errors.Is, not ==: forwardRequest wraps ErrRoutingFailed with the last
+	// attempt's error, which names the peer's internal URL. Compared with ==
+	// it fell to the default branch, which sent that text to the client.
+	switch {
+	case errors.Is(err, cluster.ErrNoWriterAvailable):
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "No writer node available in the cluster",
 		})
-	case cluster.ErrNoReaderAvailable:
+	case errors.Is(err, cluster.ErrNoReaderAvailable):
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "No reader node available in the cluster",
 		})
-	case cluster.ErrRoutingFailed:
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-			"error": "Failed to route request to cluster node",
-		})
 	default:
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-			"error": "Routing error: " + err.Error(),
+			"error": "Failed to route request to cluster node",
 		})
 	}
 }

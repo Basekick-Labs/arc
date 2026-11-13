@@ -1472,6 +1472,18 @@ func (p *Puller) CatchUpCompleted() bool {
 // explicitly opted out of the bootstrap safety net; in that case the
 // coordinator should treat ReplicationReady() as always true (the
 // configuration check in main.go enforces this).
+// Pending reports whether path is enqueued or being pulled, or has an update
+// waiting behind the pull in progress: a file on its way to this node.
+func (p *Puller) Pending(path string) bool {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if _, ok := p.inflight[path]; ok {
+		return true
+	}
+	_, ok := p.pending[path]
+	return ok
+}
+
 func (p *Puller) FullyCaughtUp() bool {
 	return p.catchupCompletedAt.Load() != 0 &&
 		p.catchupInflight.Load() == 0 &&

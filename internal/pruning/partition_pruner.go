@@ -249,10 +249,11 @@ func newPartitionCache(ttl time.Duration) *partitionCache {
 // cacheKey generates a cache key from the original path, the SQL query and
 // the live epoch (the start of the current hour, see live_hours.go): a list
 // pruned before an hour started is never served after it.
-func (c *partitionCache) cacheKey(originalPath, sql string, epoch string) string {
+func (c *partitionCache) cacheKey(originalPath string, sqlHash [sha256.Size]byte, epoch string) string {
 	// epoch is CacheEpoch's: the current hour, and a relative range's hours.
-	// Use hash of SQL to avoid storing full query text
-	h := fmt.Sprintf("%s:%s:%x", originalPath, epoch, sha256.Sum256([]byte(sql)))
+	// The SQL enters as its hash, to avoid storing full query text; the
+	// caller computes it once per query (queryFacts, #1479).
+	h := fmt.Sprintf("%s:%s:%x", originalPath, epoch, sqlHash)
 	return h
 }
 
@@ -485,8 +486,10 @@ func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
 // top-level AND terms of a single-table query's one WHERE clause that are a
 // bare comparison of the time column (time, "time", alias.time, (time)) with
 // a literal ('…', '…'::timestamp, TIMESTAMP '…'), now()/CURRENT_TIMESTAMP
-// plus or minus one interval, or a BETWEEN; either operand order. An
-// inclusive end is returned one microsecond past its literal.
+// plus or minus one interval, epoch_ms(n), make_timestamp(n) or
+// to_timestamp(x) of one numeric literal (#1491), or a BETWEEN; either
+// operand order. An inclusive end is returned one microsecond past its
+// literal; a to_timestamp bound is widened by a second (epochCallSlack).
 func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	return ExtractTimeRangeAt(sqlStr, time.Now().UTC())
 }
@@ -667,13 +670,15 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	}
 
 	// The range is read once and keys the cache: a relative range's hours
-	// move with now() (CacheEpoch).
-	timeRange := p.ExtractTimeRange(sql)
+	// move with now() (CacheEpoch). Range, relative flag and hash depend on
+	// the SQL alone, so they come from the per-query memo: this runs once
+	// per table reference (#1479). The epoch stays per call.
+	timeRange, relative, sqlHash := p.facts(ctx, sql)
 	epoch := strconv.FormatInt(p.liveEpoch(), 10)
-	if relativeTimeWord.MatchString(sql) {
+	if relative {
 		epoch = p.epochFor(timeRange)
 	}
-	cacheKey := p.partitionCache.cacheKey(originalPath, sql, epoch)
+	cacheKey := p.partitionCache.cacheKey(originalPath, sqlHash, epoch)
 	if result, optimized, ok := p.partitionCache.get(cacheKey); ok {
 		// A cached fallback verdict is exactly the stale-empty case the proof
 		// exists for: with wantProof, re-derive instead of trusting it.

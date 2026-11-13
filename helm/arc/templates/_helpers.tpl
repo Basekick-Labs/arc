@@ -89,3 +89,31 @@ the PVC's free space is the signal).
 0
 {{- end -}}
 {{- end }}
+
+{{/*
+The Flight SQL container port (flight_sql.port), checked at render time rather
+than left to fail at startup in a crash loop: a valid port, not the chart's
+HTTP container port 8000 (Arc itself refuses flight_sql.port == server.port;
+the chart only knows its own 8000), a valid servicePort, and no ARC_FLIGHT_SQL_*
+in arc.env, which would override the listener's port while the container and
+Service ports still point at flightSql.port.
+*/}}
+{{- define "arc.flightSqlPort" -}}
+{{- $p := int .Values.flightSql.port -}}
+{{- if or (lt $p 1) (gt $p 65535) -}}
+{{- fail (printf "flightSql.port must be between 1 and 65535 (got %v)" .Values.flightSql.port) -}}
+{{- end -}}
+{{- if eq $p 8000 -}}
+{{- fail "flightSql.port must differ from the chart's HTTP port 8000" -}}
+{{- end -}}
+{{- $sp := int .Values.flightSql.servicePort -}}
+{{- if or (lt $sp 1) (gt $sp 65535) -}}
+{{- fail (printf "flightSql.servicePort must be between 1 and 65535 (got %v)" .Values.flightSql.servicePort) -}}
+{{- end -}}
+{{- range .Values.arc.env -}}
+{{- if hasPrefix "ARC_FLIGHT_SQL_" (toString .name) -}}
+{{- fail (printf "set the Flight SQL listener with flightSql.*, not arc.env (%s)" .name) -}}
+{{- end -}}
+{{- end -}}
+{{- $p -}}
+{{- end -}}

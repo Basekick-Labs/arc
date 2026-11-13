@@ -133,6 +133,20 @@ func executeArrowJSONQuery(
 		if cancel != nil {
 			cancel()
 		}
+		if errors.Is(err, context.Canceled) && h.shuttingDown() {
+			// Shutdown cancelled it (#1644); onFail records it as such.
+			if onFail != nil {
+				onFail("server shutting down")
+			}
+			h.logger.Warn().Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query cancelled at shutdown")
+			c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Server shutting down",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+			return -1, true
+		}
 		m.IncQueryErrors()
 		if onFail != nil {
 			onFail(err.Error())

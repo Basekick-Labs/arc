@@ -50,28 +50,6 @@ const arrowExecutionTimeTrailer = "Arc-Execution-Time-Ms"
 // 10K rows is a good balance between overhead and memory efficiency.
 const arrowBatchSize = 10000
 
-// arrowStreamTruncatedTrailer tells the client the Arrow IPC body it received
-// is short. It is a trailer because the status line and headers are long gone
-// by the time a stream fails.
-const arrowStreamTruncatedTrailer = "Arc-Stream-Truncated"
-
-// arrowRowsCappedTrailer tells the client the Arrow IPC body it received
-// stopped at an Enterprise governance row cap and may therefore be missing
-// rows the query matched (#724). The value is the cap.
-//
-// Read it alongside arrowStreamTruncatedTrailer, which means nearly the
-// opposite: that trailer says the body is short because the stream FAILED and
-// must not be trusted, while this one says the body is short because policy
-// said so, and is a complete, valid result up to the cap.
-//
-// A trailer for the same reason the other two are: the cap is only known to
-// have been reached once the last batch has been written, long after the
-// status line and headers went out. Like every registered trailer it is
-// announced in the Trailer header of every response but sent only when Set
-// (since fasthttp 1.76, Arc 27.01.1; before, it was sent empty), so the
-// client contract is "non-empty means capped".
-const arrowRowsCappedTrailer = "Arc-Rows-Capped"
-
 // transportWriter distinguishes "the socket went away" from "the encoder
 // failed". Both surface as an error out of ipc.Writer.Write, and only the
 // former means nobody is listening. Wrapping the sink is the only way to tell:
@@ -390,6 +368,19 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// could exceed 1 — or divide by zero — on an Arrow-only workload (#801).
 	m.IncQueryRequests()
 
+	// A node that cannot serve queries (a compactor) forwards, as
+	// executeQuery does (#1567); with no peer that accepts a forwarded Arrow
+	// query it runs the query here, as before.
+	switch QueryForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		m.IncQueryErrors()
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		if handled, err := h.forwardArrowQuery(c); handled {
+			return err
+		}
+	}
+
 	// Parse request body
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -458,14 +449,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// /api/v1/query. normalizeSQLForShow masks literals before stripping
 	// comments so a comment marker inside a quoted db name can't truncate it.
 	showNormalised := normalizeSQLForShow(req.SQL)
+	// No permission check left to make: the route door required read
+	// somewhere, and /api/v1/query shows each caller only the databases it
+	// may see (#1562).
 	if showDatabasesPattern.MatchString(showNormalised) {
-		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
-			m.IncQueryErrors()
-			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-				"success": false,
-				"error":   "access denied: no read permission to list databases",
-			})
-		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
 			"error":   "SHOW DATABASES is not supported on the Arrow endpoint; use /api/v1/query instead",
@@ -526,10 +513,31 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// ArrowQueryContext: once either commits to a body stream the status
 	// code is already on the wire, and the only way left to report a failure is
 	// a trailer the client may not read.
-	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	//
+	// A governance policy's MaxDuration overrides the global timeout (#702).
+	// Its deadline bounds the transform and the execution (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
+	cancelTransform()
 	if err != nil {
 		m.IncQueryErrors()
+		if errors.Is(err, errQueryTimedOut) {
+			m.IncQueryTimeouts()
+			h.logTransformTimeout(req.SQL, effectiveTimeout)
+		}
 		return c.Status(transformErrorStatus(err)).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
 		})
@@ -547,17 +555,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	tokenName := getTokenName(c)
 	tokenID := getTokenID(c)
 
-	// A governance policy's MaxDuration overrides the global timeout (#702).
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
 	// Register before choosing an engine. An arcx-served query must have
 	// the same query ID, cancellation context and history as a DuckDB query.
 	// The registry must not be completed here: streaming starts after this
 	// handler returns, so the stream writer owns the terminal disposition.
 	var queryID string
-	baseCtx := context.Background()
+	// The request's context, not Background: with SetLifetime it is the
+	// handler's lifetime, which shutdown cancels (#1644).
+	baseCtx := c.UserContext()
 	if h.queryRegistry != nil {
 		var queryCtx context.Context
 		queryID, queryCtx = h.queryRegistry.Register(
@@ -570,8 +575,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	ctx := baseCtx
 	var cancel context.CancelFunc
 	switch {
-	case effectiveTimeout > 0:
-		ctx, cancel = context.WithTimeout(baseCtx, effectiveTimeout)
+	case !deadline.IsZero():
+		ctx, cancel = context.WithDeadline(baseCtx, deadline)
 	case queryID != "":
 		ctx, cancel = context.WithCancel(baseCtx)
 	}
@@ -663,6 +668,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
 				"success": false,
 				"error":   "Query timed out",
+			})
+		}
+		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled at shutdown")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   "Server shutting down",
 			})
 		}
 		if ctxErr == context.Canceled {

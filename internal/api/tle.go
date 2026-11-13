@@ -12,6 +12,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
@@ -64,10 +65,12 @@ func (h *TLEHandler) SetRouter(router *cluster.Router) {
 }
 
 // RegisterRoutes registers TLE routes. The write endpoint is gated by
-// auth.RequireWrite when auth is enabled — per CLAUDE.md, mutating
-// endpoints MUST have an explicit write-tier auth middleware.
+// withAnyResourceWriteAuth when auth is enabled — per CLAUDE.md, mutating
+// endpoints MUST have an explicit write-tier auth middleware. It admits a
+// token holding write on anything, RBAC included (#1559); handleWrite then
+// checks the measurement it writes.
 func (h *TLEHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/tle", withWriteAuth(h.authManager), h.handleWrite)
+	app.Post("/api/v1/write/tle", withAnyResourceWriteAuth(h.authManager, h.rbacManager), h.handleWrite)
 	app.Get("/api/v1/write/tle/stats", h.Stats)
 
 	h.logger.Info().Msg("TLE routes registered")
@@ -97,6 +100,10 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
+	}
 
 	// Check if this request should be forwarded to a writer node
 	switch WriteForwardDecision(h.router, c) {
@@ -109,7 +116,10 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding TLE write request to writer node")
 
-		httpReq, err := BuildHTTPRequest(c)
+		// Built only here, once the write is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		httpReq, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
 			h.totalErrors.Add(1)
@@ -118,7 +128,9 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 			})
 		}
 
-		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		defer release()
+
+		resp, err := h.router.RouteWrite(fctx, httpReq)
 		if err == cluster.ErrLocalNodeCanHandle {
 			goto localProcessing
 		}
@@ -330,6 +342,25 @@ func decompressRequest(rawBody []byte, maxSize int) (body []byte, codec string, 
 	}
 }
 
+// decompressedPayloadTooLargeError is what decompressGzipPooled and
+// decompressZstdPooled return when the decompressed body passes maxSize, so a
+// handler can answer 413 for it and 400 for a corrupt body. Its text is the
+// one these helpers returned before it existed.
+//
+// window is set instead when a zstd frame's window, not its output, is over
+// maxSize (see decompressZstdPooled).
+type decompressedPayloadTooLargeError struct {
+	maxSize int
+	window  uint64
+}
+
+func (e *decompressedPayloadTooLargeError) Error() string {
+	if e.window > 0 {
+		return fmt.Sprintf("the zstd frame's %s window exceeds the %s limit", formatBytes(int64(e.window)), formatBytes(int64(e.maxSize)))
+	}
+	return fmt.Sprintf("decompressed payload exceeds %s limit", formatBytes(int64(e.maxSize)))
+}
+
 // decompressGzipPooled decompresses gzip data using pooled readers to minimize allocations.
 // Shared across handlers — uses lpGzipReaderPool (declared in lineprotocol.go).
 // maxSize limits the decompressed output; pass 0 for the default 100MB limit.
@@ -361,7 +392,7 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 
 	if len(result) > maxSize {
 		lpGzipReaderPool.Put(reader)
-		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
+		return nil, &decompressedPayloadTooLargeError{maxSize: maxSize}
 	}
 
 	lpGzipReaderPool.Put(reader)
@@ -375,6 +406,14 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 // and 22 (--ultra) and --long mode use larger ones, and a body compressed
 // that way is refused (errZstdWindow).
 const zstdMaxWindow = 32 << 20
+
+// zstdDecodeAll is the decode decompressZstdPooled recovers around; a var so
+// a test can make it panic. klauspost/compress 1.20.2 fixed the crafted
+// frame that used to (GHSA-fpmh-frq8-7rj8), so no real input is known to
+// reach the recover any more.
+var zstdDecodeAll = func(d *zstd.Decoder, data []byte) ([]byte, error) {
+	return d.DecodeAll(data, nil)
+}
 
 // decompressZstdPooled decompresses an untrusted zstd request body with a
 // pooled decoder for maxSize (zstdDecoderPool in msgpack.go), into a fresh
@@ -422,19 +461,38 @@ func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 		}
 	}()
 
-	out, err = decoder.DecodeAll(data, nil)
+	out, err = zstdDecodeAll(decoder, data)
 	// DecodeAll leaves the decoder reusable after an error (its block
 	// decoders go back in a defer), so it returns to the pool either way.
 	pool.Put(decoder)
 	switch {
 	case errors.Is(err, zstd.ErrWindowSizeExceeded):
+		// The decoder caps the window at maxSize too: klauspost lowers
+		// WithDecoderMaxWindow to WithDecoderMaxMemory. Under a limit below
+		// zstdMaxWindow, a frame with an ordinary window (zstd -3 on a large
+		// batch uses 2 MB) is refused for its size, not for how it was
+		// compressed. Smaller batches get smaller windows, so it is a 413 a
+		// client can split on; only a window over zstdMaxWindow is a 400.
+		if w := zstdFirstFrameWindow(data); maxSize < zstdMaxWindow && w > uint64(maxSize) && w <= zstdMaxWindow {
+			return nil, &decompressedPayloadTooLargeError{maxSize: maxSize, window: w}
+		}
 		return nil, fmt.Errorf("failed to decompress zstd: %w", errZstdWindow)
 	case errors.Is(err, zstd.ErrDecoderSizeExceeded):
-		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
+		return nil, &decompressedPayloadTooLargeError{maxSize: maxSize}
 	case err != nil:
 		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
 	}
 	return out, nil
+}
+
+// zstdFirstFrameWindow is the window the first frame of data declares, or 0
+// when its header cannot be read.
+func zstdFirstFrameWindow(data []byte) uint64 {
+	var h zstd.Header
+	if h.Decode(data) != nil {
+		return 0
+	}
+	return h.WindowSize
 }
 
 // errZstdWindow names the window limit, so a client compressing with
