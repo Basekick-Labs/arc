@@ -1175,10 +1175,11 @@ type bufferShard struct {
 	//
 	// It is deliberately PER SHARD rather than the global b.closing flag.
 	// b.closing is set as Close()'s first statement, but the shard loop does
-	// not start until after b.cancel() and b.wg.Wait() — up to half the close
-	// budget later in the worst case (a flush is no longer capped at one
-	// flushTimeout, #1692; Close cancels flushParent at that point). Refusing on the global flag would reject every
-	// write in that window, including replicated entries that have no WAL
+	// not start until after b.cancel() and b.wg.Wait() — in the worst case
+	// half the close budget plus the file in progress (a flush is no longer
+	// capped at one flushTimeout, #1692; Close cancels flushParent at that
+	// point and a multi-hour flush stops between files). Refusing on the
+	// global flag would reject every write in that window, including replicated entries that have no WAL
 	// copy of their own (WriteColumnarDirectNoWAL passes skipWAL), where today
 	// Close() flushes them successfully.
 	swept bool
@@ -1963,8 +1964,9 @@ func (b *ArrowBuffer) newFlushContext() (context.Context, context.CancelFunc) {
 // Parquet encode, the storage write, the field-schema registration (whose
 // registry reads and writes storage), the tiering/manifest registration and
 // the WAL row checkpoint (#1692). Before #1692 one flushTimeout covered all of
-// that for every file of the flush together; a single-file flush is bounded
-// exactly as before.
+// that for every file of the flush together (and the merge before it); a
+// single-file flush still gets one flushTimeout, now starting after the merge
+// and sort.
 //
 // It derives from the ctx it is given, never from b.flushParent: Close()'s own
 // flushes run on closeFlushContext (WithoutCancel(flushParent) plus the close
@@ -5456,6 +5458,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Each hour file has its own flushTimeout (#1692).
 		fileCtx, cancelFile := b.fileContext(ctx)
 		err := func(ctx context.Context) error {
+			defer cancelFile()
 			// Save count before clearing indices
 			splitRecordCount := len(bucket.indices)
 
@@ -5548,7 +5551,6 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				Msg("Wrote hour partition")
 			return nil
 		}(fileCtx)
-		cancelFile()
 		if err != nil {
 			return err
 		}
@@ -6927,10 +6929,13 @@ func (b *ArrowBuffer) NewRecoveryFlushBarrier() func(context.Context) error {
 // admitted tasks keep their normal independent I/O deadlines and WAL identities.
 // The barrier's total wait budget is one flushTimeout (or the caller's earlier
 // deadline), not one timeout per measurement. A flush is no longer capped at
-// one flushTimeout (#1692): a backfill flush of many hour files can outlast
-// this budget, and the barrier then fails and the caller keeps its WAL files,
-// which is the safe direction; a later pass completes once the flush is done. Returning an error never proves
-// durability and must not permit WAL deletion. Recovery must also use
+// one flushTimeout (#1692), and the barrier waits for every earlier task, not
+// only the keys in scope: while a backfill flush of many hour files runs, on
+// any database, the barrier fails at its budget. Its callers fail safe: WAL
+// recovery keeps its files and a later pass completes, a row DELETE (local,
+// cluster or peer flush) and a cluster CQ watermark flush answer an error and
+// change nothing. Returning an error never proves durability and must not
+// permit WAL deletion. Recovery must also use
 // NewRecoveryFlushBarrier to cover failures that completed before this call.
 func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 	return b.flushAndWait(ctx, nil, nil)
@@ -7156,13 +7161,13 @@ func (b *ArrowBuffer) Close() error {
 	// abort a storage write in progress — that is the point of the change. The
 	// consequence is that this wait is not instant: a flush is bounded per file
 	// (fileContext), not as a whole (#1692), which is why it has to respect the
-	// budget: on expiry,
-	// cancel flushParent so context-aware backends abandon their writes and the
+	// budget: on expiry, cancel flushParent so context-aware backends abandon
+	// their writes, a multi-hour flush stops before its next hour file, and the
 	// workers return.
 	//
 	// Caveat worth knowing when reading a shutdown log: LocalBackend.Write does
-	// not observe its context, so on the local backend this cancel has no
-	// effect and the wait ends when the filesystem finishes.
+	// not observe its context, so on the local backend the cancel does not cut
+	// the file in progress short; the wait ends when that file is written.
 	workersDone := make(chan struct{})
 	go func() {
 		b.wg.Wait()

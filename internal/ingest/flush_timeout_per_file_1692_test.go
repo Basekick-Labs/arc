@@ -101,14 +101,16 @@ type blockingRegistrar1692 struct {
 	mu        sync.Mutex
 	calls     int
 	deadlines int
+	remaining []time.Duration // time left on the call's deadline when it started
 	errs      []error
 }
 
 func (r *blockingRegistrar1692) EnsureFile(ctx context.Context, _, _ string, _ *arrow.Schema, _ []string, _ string) error {
 	r.mu.Lock()
 	r.calls++
-	if _, ok := ctx.Deadline(); ok {
+	if dl, ok := ctx.Deadline(); ok {
 		r.deadlines++
+		r.remaining = append(r.remaining, time.Until(dl))
 	}
 	r.mu.Unlock()
 	<-ctx.Done()
@@ -139,9 +141,17 @@ func TestMultiHourFlush_FieldSchemaCallBoundedPerFile_1692(t *testing.T) {
 	for _, e := range reg.errs {
 		require.ErrorIs(t, e, context.DeadlineExceeded)
 	}
+	// Per file, not per flush: every call starts with (nearly) a whole
+	// timeout. Under one flush-wide deadline the first call would use it up
+	// and the later ones would start with none left.
+	for i, left := range reg.remaining {
+		require.Greater(t, left, 500*time.Millisecond, "call %d started with only %s of its deadline", i, left)
+	}
 }
 
-// Same for the single-hour flush, which is every live-ingest flush.
+// Same for the single-hour flush, which is every live-ingest flush. (One file:
+// per file and per flush are the same bound here; this pins that the
+// registration is bounded at all, which bounding only storage.Write would not.)
 func TestSingleHourFlush_FieldSchemaCallBounded_1692(t *testing.T) {
 	b := NewArrowBuffer(cfg1692(1), &mockStorageBackend{}, zerolog.Nop())
 	t.Cleanup(func() { _ = b.Close() })
@@ -164,13 +174,18 @@ type blockingRowCheckpointWAL struct {
 	*wal.Writer
 	rowCalls     atomic.Int64
 	rowDeadlines atomic.Int64
+	mu           sync.Mutex
+	remaining    []time.Duration
 }
 
 func (w *blockingRowCheckpointWAL) MarkFlushedContext(ctx context.Context, ids []string) error {
 	if _, _, _, ok := wal.ParseRecoveryRowIdentity(ids[0]); ok {
 		w.rowCalls.Add(1)
-		if _, ok := ctx.Deadline(); ok {
+		if dl, ok := ctx.Deadline(); ok {
 			w.rowDeadlines.Add(1)
+			w.mu.Lock()
+			w.remaining = append(w.remaining, time.Until(dl))
+			w.mu.Unlock()
 		}
 		<-ctx.Done()
 		return ctx.Err()
@@ -193,6 +208,11 @@ func TestMultiHourFlush_RowCheckpointBoundedPerFile_1692(t *testing.T) {
 	require.NoError(t, err, "a dropped row checkpoint is counted, never fails the flush")
 	require.EqualValues(t, 3, bw.rowCalls.Load(), "one row checkpoint per hour file (per-hour path)")
 	require.EqualValues(t, 3, bw.rowDeadlines.Load(), "each under a deadline")
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+	for i, left := range bw.remaining {
+		require.Greater(t, left, 500*time.Millisecond, "row checkpoint %d started with only %s: the bound is not per file", i, left)
+	}
 }
 
 // sleepingBackend1692 ignores its context, as LocalBackend.Write does.

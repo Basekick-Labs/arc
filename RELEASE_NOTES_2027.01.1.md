@@ -18,18 +18,34 @@ The timeout now applies to **each hour file** of a flush, and covers
 everything done for that file: the Parquet encode, the storage write, the
 field-schema registration (which reads and writes storage), the tiering and
 cluster-manifest registration, and the WAL row checkpoint. A single-hour
-flush, which is every flush in live ingest, is bounded exactly as before. A
-flush of N hour files can take up to N × the timeout and has no cap on N.
+flush, which is every flush in live ingest, still gets one timeout (now
+starting after the in-memory merge and sort). A flush of N hour files can take
+up to N × the timeout and has no cap on N. Cluster replay of a claimed WAL
+range, which had no time limit, now also gets the timeout per hour file.
 
 - One stuck upload is still cut off at the timeout, as before.
 - At shutdown, Arc stops a flush between hour files once its shutdown budget
   runs out (it already cancelled uploads in progress then); previously a flush
-  on local storage kept writing its remaining files.
-- What can now take longer than ~30 s during a large backfill, bounded by the
-  timeout per hour file: a write request that triggers a schema-change flush,
-  the age-based flush sweep, import and flush-all calls. The WAL-recovery
-  barrier still waits at most one timeout for an in-flight flush; during a long
-  backfill it gives up and keeps its WAL files, and a later pass completes.
+  on local storage kept writing its remaining files. The hours not yet written
+  stay in the WAL (with the WAL off they are lost, as any unflushed rows are at
+  shutdown).
+- **While a large backfill flushes, other work waits longer than before**, up
+  to the length of the flush instead of ~30 s:
+  - Age-based flushing of **every other buffer on the node**: the age sweep
+    writes its buffers and waits for them, so a backfill flushed by age holds
+    up the next sweep. Size-triggered flushes are not affected. Nothing is
+    lost, but low-rate measurements are written late.
+  - A write request that triggers a schema-change flush, and import and
+    flush-all calls, run until the flush is done.
+  - Calls that wait for in-flight flushes with a budget of one timeout fail
+    safe while a backfill flush runs, on any database: WAL recovery keeps its
+    files and completes on a later pass; a row `DELETE` and a cluster
+    continuous-query run answer an error and change nothing. Retry after the
+    backfill.
+
+  Before this fix the same backfill failed after ~30 s and lost or deferred its
+  rows; follow-up work to keep it from holding up other buffers is tracked in
+  [#1695](https://github.com/Basekick-Labs/arc/issues/1695).
 - The config comment said `0 = no timeout`; a value of 0 or less has always
   meant 30 s. The comment now says so.
 
