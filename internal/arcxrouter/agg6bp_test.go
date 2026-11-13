@@ -1,5 +1,5 @@
 // agg-6b' companion: the Kahan sums, bitwise, and Boolean-column bool_and /
-// bool_or / count_if route ungrouped and under a time bucket; tag-keyed grouping,
+// bool_or / count_if route ungrouped and under either key kind (tag keys since C2);
 // product, predicate arguments and Boolean aggregates in HAVING decline.
 
 package arcxrouter
@@ -48,10 +48,6 @@ func TestNumericAggsDecline(t *testing.T) {
 		"SELECT host, bool_and(b) FROM m GROUP BY host HAVING bool_and(b) > 0",
 		// product: engine-served, not routed (measured loss)
 		"SELECT product(f) FROM m",
-		// tag-keyed grouping: measured loss, gated
-		"SELECT host, fsum(f), count_if(b) FROM m GROUP BY host",
-		"SELECT host, bit_or(i) FROM m GROUP BY host",
-		"SELECT date_trunc('hour', time), host, count_if(b) FROM m GROUP BY 1, host",
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline (%s): %s", m.shape, sql)

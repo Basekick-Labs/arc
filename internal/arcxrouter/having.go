@@ -105,11 +105,10 @@ type havingState struct {
 	// HavingUnstable on Decision.
 	unstable string
 	// res-3b: hidden aggregates (HAVING references not in the select list), as item
-	// text in first-reference order, and whether any of them is a bucket-gated
-	// family (moment / order statistic / binary — the tag-key gate in
-	// matchGroupedAgg applies to them as to select items).
-	hidden       []string
-	hiddenMoment bool
+	// text in first-reference order, and whether any of them is in tagGatedFns
+	// (matchGroupedAgg's tag-key refusal applies to them as to select items).
+	hidden         []string
+	hiddenTagGated bool
 }
 
 // reserializeHaving parses a HAVING clause and rebuilds it from validated parts.
@@ -1005,8 +1004,8 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefInfo,
 				return "", havingRefInfo{}, false
 			}
 			st.hidden = append(st.hidden, itemText)
-			if momentAggFns[t.lower] || quantileAggFns[t.lower] || binaryMomentFns[t.lower] {
-				st.hiddenMoment = true
+			if tagGatedFns[t.lower] {
+				st.hiddenTagGated = true
 			}
 		}
 		return itemText, havingItemInfo(itemText, hc, st), true

@@ -1,8 +1,8 @@
 // agg-6b2 companion: the recognizer accepts predicate arguments of
 // count_if/countif/bool_and/bool_or exactly where the engine serves them
-// (ungrouped, bucket-grouped), re-serialized from validated tokens, and declines
+// (ungrouped, grouped under either key kind), re-serialized from validated tokens, and declines
 // what the engine declines (IN, NOT, arithmetic, non-canonical literals, timestamp
-// strings, tag-keyed grouping, HAVING references). Pure tokenizer tests.
+// strings, HAVING references). Pure tokenizer tests.
 
 package arcxrouter
 
@@ -91,8 +91,6 @@ func TestPredicateArgDeclines(t *testing.T) {
 		"SELECT sum(x > 0) FROM t",
 		"SELECT count(x > 0) FROM t",
 		"SELECT bit_or(i > 0) FROM t",
-		// Tag-keyed grouping stays gated (momentAggFns), as for the column form.
-		"SELECT host, count_if(x > 0) FROM t GROUP BY host",
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline: %s (items %v)", sql, m.aggItems)
