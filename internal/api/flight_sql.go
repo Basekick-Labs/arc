@@ -211,7 +211,7 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 
 	var middleware []flight.ServerMiddleware
 	if queryHandler.authManager != nil {
-		middleware = append(middleware, flight.CreateServerBasicAuthMiddleware(&flightSQLAuth{manager: queryHandler.authManager}))
+		middleware = append(middleware, flightSQLAuthMiddleware(&flightSQLAuth{manager: queryHandler.authManager}))
 	}
 	flightServer := flight.NewServerWithMiddleware(middleware, options...)
 	flightServer.RegisterFlightService(flightsql.NewFlightServer(service))
@@ -477,6 +477,50 @@ func (t *flightSQLConnTracker) closeAll() int {
 		_ = c.Close()
 	}
 	return len(conns)
+}
+
+// flightHandshakeMethod is the gRPC method of a Flight Handshake.
+const flightHandshakeMethod = "/arrow.flight.protocol.FlightService/Handshake"
+
+// flightSQLAuthMiddleware is arrow-go's Basic auth middleware, plus a
+// Handshake that carries an Arc token as a bearer token. The Arrow Flight SQL
+// JDBC driver opens a connection with that handshake when given its `token`
+// property, and sends the same header on every call after it; arrow-go only
+// accepts Basic credentials on a handshake. A valid token answers with the
+// same bearer trailer a Basic handshake does. Every other call, and a
+// handshake without a bearer token, goes through arrow-go's middleware.
+func flightSQLAuthMiddleware(validator *flightSQLAuth) flight.ServerMiddleware {
+	middleware := flight.CreateServerBasicAuthMiddleware(validator)
+	basicStream := middleware.Stream
+	middleware.Stream = func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if info.FullMethod == flightHandshakeMethod {
+			if token, ok := flightBearerToken(stream.Context()); ok {
+				if _, err := validator.IsValid(token); err != nil {
+					return err
+				}
+				stream.SetTrailer(metadata.Pairs("authorization", "Bearer "+token))
+				return handler(srv, stream)
+			}
+		}
+		return basicStream(srv, stream, info, handler)
+	}
+	return middleware
+}
+
+// flightBearerToken returns the token of an `authorization: Bearer <token>`
+// header, parsed as arrow-go parses it for the calls after a handshake.
+func flightBearerToken(ctx context.Context) (string, bool) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	values := md.Get("authorization")
+	if len(values) == 0 {
+		return "", false
+	}
+	scheme, credential, _ := strings.Cut(strings.TrimSpace(values[0]), " ")
+	credential = strings.TrimLeft(credential, " ")
+	if !strings.EqualFold(scheme, "Bearer") || credential == "" {
+		return "", false
+	}
+	return credential, true
 }
 
 func (a *flightSQLAuth) Validate(username, password string) (string, error) {
