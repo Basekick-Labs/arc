@@ -113,6 +113,11 @@ func TestEdgeSyncRelayConfig(t *testing.T) {
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}
+			// The FIPS build has no native GCS backend: every configured
+			// gcs relay is refused there, before its other checks.
+			if fipsBuild && tc.env["ARC_EDGE_SYNC_SPOKE_RELAY_GCS_BUCKET"] != "" {
+				tc.wantErr, tc.check = "FIPS build", nil
+			}
 			cfg, err := Load()
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
