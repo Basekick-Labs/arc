@@ -3,8 +3,10 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -488,6 +490,18 @@ type EdgeSyncSpokeConfig struct {
 	// a pass drains whatever backlog exists (#1112). Scheduled passes do not
 	// read it.
 	SyncTimeout time.Duration
+
+	// DeleteAfterSync makes the spoke delete its own copy of a synced file
+	// once the hub proves, in a later verify reconcile, that it still holds
+	// the content (edge sync phase 3a). Off by default: it deletes edge data.
+	// Requires edge_sync.spoke.enabled and an https (or loopback) hub_url,
+	// and is refused on a cluster node.
+	DeleteAfterSync bool
+
+	// DeleteAfterSyncDelay is the minimum time between a file being marked
+	// synced and the verification that may delete it. Default 0s: verified
+	// on the next pass, which is still a separate round trip.
+	DeleteAfterSyncDelay time.Duration
 
 	// Bundle configures air-gap export.
 	Bundle EdgeSyncBundleConfig
@@ -1145,6 +1159,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	deleteAfterSyncDelay, err := time.ParseDuration(v.GetString("edge_sync.spoke.delete_after_sync_delay"))
+	if err != nil || deleteAfterSyncDelay < 0 {
+		return nil, fmt.Errorf("invalid edge_sync.spoke.delete_after_sync_delay %q: must be a Go duration of 0 or more", v.GetString("edge_sync.spoke.delete_after_sync_delay"))
+	}
 	spokeBundleTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.bundle.timeout")
 	if err != nil {
 		return nil, err
@@ -1277,7 +1295,7 @@ func Load() (*Config, error) {
 			CompactReceivedNamespaces: v.GetBool("edge_sync.compact_received_namespaces"),
 			Import: EdgeSyncImportConfig{
 				Enabled:     v.GetBool("edge_sync.import.enabled"),
-				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
+				AllowedDirs: parseAllowedDirs(v.Get("edge_sync.import.allowed_dirs")),
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
 				Timeout:     hubImportTimeout,
 			},
@@ -1286,6 +1304,8 @@ func Load() (*Config, error) {
 				SyncInterval:               v.GetDuration("edge_sync.spoke.sync_interval"),
 				SyncRetryInterval:          v.GetDuration("edge_sync.spoke.sync_retry_interval"),
 				SyncTimeout:                spokeSyncTimeout,
+				DeleteAfterSync:            v.GetBool("edge_sync.spoke.delete_after_sync"),
+				DeleteAfterSyncDelay:       deleteAfterSyncDelay,
 				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
 				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
 				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
@@ -1298,7 +1318,7 @@ func Load() (*Config, error) {
 				DeferCompactionUntilSynced: v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
 				Bundle: EdgeSyncBundleConfig{
 					Enabled:     v.GetBool("edge_sync.spoke.bundle.enabled"),
-					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
+					AllowedDirs: parseAllowedDirs(v.Get("edge_sync.spoke.bundle.allowed_dirs")),
 					MaxFiles:    v.GetInt("edge_sync.spoke.bundle.max_files"),
 					MaxBytes:    v.GetInt64("edge_sync.spoke.bundle.max_bytes"),
 					Timeout:     spokeBundleTimeout,
@@ -1430,7 +1450,7 @@ func Load() (*Config, error) {
 			NodeID:                     v.GetString("cluster.node_id"),
 			Role:                       v.GetString("cluster.role"),
 			ClusterName:                v.GetString("cluster.cluster_name"),
-			Seeds:                      parseStringSlice(v.GetString("cluster.seeds")),
+			Seeds:                      parseSeeds(v.Get("cluster.seeds")),
 			CoordinatorAddr:            v.GetString("cluster.coordinator_addr"),
 			AdvertiseAddr:              v.GetString("cluster.advertise_addr"),
 			HealthCheckInterval:        v.GetInt("cluster.health_check_interval"),
@@ -1936,6 +1956,12 @@ func Load() (*Config, error) {
 			"is not stored in a file that gets copied, backed up, and committed")
 	}
 
+	if cfg.EdgeSync.Spoke.DeleteAfterSync {
+		if err := checkDeleteAfterSync(cfg); err != nil {
+			return nil, err
+		}
+	}
+
 	if cfg.EdgeSync.Spoke.Enabled {
 		if cfg.EdgeSync.Spoke.SyncInterval < time.Second {
 			return nil, fmt.Errorf("edge_sync.spoke.sync_interval must be at least 1s (got %s)", cfg.EdgeSync.Spoke.SyncInterval)
@@ -2005,6 +2031,9 @@ func Load() (*Config, error) {
 				"edge_sync.import.allowed_dirs: a bundle is read from a raw filesystem path " +
 				"outside the storage root, so the permitted roots must be stated explicitly")
 		}
+		if err := requireAbsoluteAllowedDirs("edge_sync.import.allowed_dirs", cfg.EdgeSync.Import.AllowedDirs); err != nil {
+			return nil, err
+		}
 		if cfg.EdgeSync.HubID == "" {
 			return nil, fmt.Errorf("edge_sync.import.enabled=true requires edge_sync.hub_id: " +
 				"a bundle names the hub it is destined for, and one addressed elsewhere is refused")
@@ -2023,6 +2052,9 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("edge_sync.spoke.bundle.enabled=true requires " +
 				"edge_sync.spoke.bundle.allowed_dirs: a bundle is written to a raw filesystem " +
 				"path outside the storage root, so the permitted roots must be stated explicitly")
+		}
+		if err := requireAbsoluteAllowedDirs("edge_sync.spoke.bundle.allowed_dirs", cfg.EdgeSync.Spoke.Bundle.AllowedDirs); err != nil {
+			return nil, err
 		}
 		// Identity is bound into the bundle MAC, so the hub cannot accept a
 		// bundle that does not name both sides.
@@ -2170,6 +2202,40 @@ func parsePositiveDuration(v *viper.Viper, key string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid %s %q: must be a positive Go duration", key, v.GetString(key))
 	}
 	return d, nil
+}
+
+// checkDeleteAfterSync refuses edge_sync.spoke.delete_after_sync where it
+// cannot be safe (phase 3a). It deletes edge data on the hub's word, so:
+//   - the network path must be on: verification is a reconcile;
+//   - not on a cluster node: a delete there would have to go through the Raft
+//     manifest first, which this does not do;
+//   - the hub must be reached over https or on a loopback host: the verify
+//     response is not signed, and a forged "held" would delete files;
+//   - the delay must be shorter than ledger retention, or rows would be
+//     pruned before they could ever be verified.
+func checkDeleteAfterSync(cfg *Config) error {
+	s := cfg.EdgeSync.Spoke
+	if !s.Enabled {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync requires edge_sync.spoke.enabled: the hub must verify a file before the spoke deletes it")
+	}
+	if cfg.Cluster.Enabled {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync is not supported on a cluster node (cluster.enabled)")
+	}
+	u, err := url.Parse(s.HubURL)
+	if err != nil {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync: invalid edge_sync.spoke.hub_url: %w", err)
+	}
+	if u.Scheme != "https" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("edge_sync.spoke.delete_after_sync requires an https edge_sync.spoke.hub_url (or a loopback host): the hub's verify answer decides which local files are deleted, and it is not signed")
+		}
+	}
+	if s.LedgerRetentionDays > 0 && s.DeleteAfterSyncDelay >= time.Duration(s.LedgerRetentionDays)*24*time.Hour {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.ledger_retention_days (%d days)", s.DeleteAfterSyncDelay, s.LedgerRetentionDays)
+	}
+	return nil
 }
 
 func setDefaults(v *viper.Viper) {
@@ -2322,6 +2388,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.sync_interval", "5m")
 	v.SetDefault("edge_sync.spoke.sync_retry_interval", "30s")
 	v.SetDefault("edge_sync.spoke.sync_timeout", "2h") // one manual sync pass
+	v.SetDefault("edge_sync.spoke.delete_after_sync", false)
+	v.SetDefault("edge_sync.spoke.delete_after_sync_delay", "0s")
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")
@@ -2720,6 +2788,26 @@ func normalizeExtensionNames(names []string) []string {
 	return out
 }
 
+// parseSeeds reads cluster.seeds in every spelling an operator writes: a TOML
+// array, a comma-separated TOML string, or ARC_CLUSTER_SEEDS (#1675).
+//
+// It was parseStringSlice(v.GetString("cluster.seeds")), and viper's GetString
+// returns "" for a TOML array, so seeds = ["a:9100", "b:9100"] read as no seeds
+// at all, with no warning: the node logged "no known peers, aborting election"
+// and never joined. Only the comma string worked, which is the form every
+// shipped deployment (compose, Kubernetes, Helm) passes through the environment.
+//
+// parseTargetDatabases handles the array and scalar shapes; each element is then
+// comma-split as well, because a comma never belongs in host:port, so
+// seeds = ["a:9100,b:9100"] means two seeds rather than one undialable address.
+func parseSeeds(value any) []string {
+	var out []string
+	for _, item := range parseTargetDatabases(value) {
+		out = append(out, parseStringSlice(item)...)
+	}
+	return out
+}
+
 // parseStringSlice parses a comma-separated string into a slice of strings.
 // This is needed because Viper's GetStringSlice doesn't automatically parse
 // comma-separated values from environment variables.
@@ -2736,6 +2824,43 @@ func parseStringSlice(s string) []string {
 		}
 	}
 	return result
+}
+
+// parseAllowedDirs reads edge_sync.import.allowed_dirs and
+// edge_sync.spoke.bundle.allowed_dirs (#1680): a TOML array keeps each path
+// whole, and a string, from arc.toml or the environment, is split on commas
+// only, never on whitespace.
+//
+// It was v.GetStringSlice, which splits a string on whitespace, so
+// ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS="/Volumes/Air Gap" became two allow-list
+// entries, "/Volumes/Air" and "Gap", and the second was then resolved against
+// the working directory by edgesync.NewDestinationPolicy (resolveDir accepts a
+// missing leaf), silently admitting a directory nobody named while refusing
+// the one they did. A path containing a comma needs the array spelling.
+func parseAllowedDirs(value any) []string {
+	return parseTargetDatabases(value)
+}
+
+// requireAbsoluteAllowedDirs refuses a relative allowed_dirs entry (#1680).
+//
+// edgesync.NewDestinationPolicy resolves an entry with filepath.Abs and accepts
+// a missing leaf, so a relative entry silently means "under whatever directory
+// Arc was started from". No documented configuration uses one, and every way
+// an operator ends up with one by accident is a split in the wrong place: a
+// path with a space under the old whitespace split ("/Volumes/Air Gap" ->
+// "Gap"), or a path with a comma in the string spelling now ("/mnt/a,b" ->
+// "b"). Refusing it turns each of those into a startup error that names the
+// fragment, instead of an allow-list entry nobody wrote.
+func requireAbsoluteAllowedDirs(key string, dirs []string) error {
+	for _, d := range dirs {
+		if !filepath.IsAbs(d) {
+			return fmt.Errorf("%s: %q is not an absolute path; every allowed directory must be "+
+				"absolute (a relative one would resolve against Arc's working directory). "+
+				"In the string or environment spelling a comma separates entries, so a path "+
+				"that contains a comma must be written in the TOML array", key, d)
+		}
+	}
+	return nil
 }
 
 // EffectiveCores reports how many CPUs this process may actually use.

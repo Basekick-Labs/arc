@@ -180,23 +180,29 @@ func (t BackupTargetConfig) KeyPrefix() (string, error) {
 
 // discoverBackupTargetNames returns the configured target names, sorted.
 //
-// Two sources, unioned, on the cluster.seeds precedent:
+// Two sources, unioned:
 //
 //   - the keys of the backup.targets map in a config file. This is the only
 //     viper map read in this package; everything else, including every FIELD
 //     of a target, is a literal dotted key so that AutomaticEnv resolves it.
 //     The map is read for NAMES alone.
-//   - backup.target_names, comma-separated. A name cannot be discovered from
+//   - backup.target_names, a TOML array or a comma-separated string. A name
+//     cannot be discovered from
 //     a map that does not exist, so a deployment configured entirely from the
 //     environment needs this to say which names to look for. Parsed through
-//     parseStringSlice for the reason recorded there: GetStringSlice does not
-//     split a comma-separated environment value.
+//     parseTargetDatabases, so it accepts a TOML array as well as a
+//     comma-separated string or environment value. It was
+//     parseStringSlice(v.GetString(...)), which reads a TOML array as nothing
+//     (GetString returns "" for it); GetStringSlice is no better, as it does
+//     not split a comma-separated environment value (#1675). Array elements
+//     are not comma-split (unlike cluster.seeds): a comma is not a legal
+//     target-name character, so ["a,b"] is refused below by name, loudly.
 func discoverBackupTargetNames(v *viper.Viper) ([]string, error) {
 	seen := map[string]bool{}
 	for name := range v.GetStringMap("backup.targets") {
 		seen[name] = true
 	}
-	for _, name := range parseStringSlice(v.GetString("backup.target_names")) {
+	for _, name := range parseTargetDatabases(v.Get("backup.target_names")) {
 		seen[name] = true
 	}
 	names := make([]string, 0, len(seen))
@@ -290,10 +296,9 @@ func setBackupTargetDefaults(v *viper.Viper, name string) {
 //
 // So the array spelling needs a slice accessor and the scalar spellings need a
 // comma split; the env value correctly overrides a file array, so there is no
-// precedence trap. parseStringSlice(v.GetString(k)) — the accessor
-// backup.target_names uses — returns NIL for the TOML array with no error at
-// all, i.e. no routing, silently; that precedent is safe only because a target
-// NAME has a second source (the backup.targets map), and databases has none.
+// precedence trap. parseStringSlice(v.GetString(k)) returns NIL for the TOML
+// array with no error at all, i.e. no routing, silently — the bug cluster.seeds
+// and backup.target_names had until #1675, when both moved to this function.
 //
 // GetStringSlice was the first answer and is WRONG for the scalar spellings:
 // it casts through cast.ToStringSlice, which runs strings.Fields, so it splits

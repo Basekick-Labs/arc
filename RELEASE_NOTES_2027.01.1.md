@@ -2,12 +2,46 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: `cluster.seeds` written as a TOML array is read ([#1675](https://github.com/Basekick-Labs/arc/issues/1675))
+
+`seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]` in `arc.toml` now gives the node those seeds. Before, Arc read the TOML array as no seeds at all and gave no warning. The node started with `seed_count: 0`, logged `no known peers, aborting election`, and never joined. Only the comma-separated string worked. An array element that contains commas is split into one seed per address.
+
+`backup.target_names` had the same bug and is fixed the same way. A target named only in a TOML array, with its fields set from the environment, was never discovered.
+
+For every other spelling nothing changes. The comma-separated string (`seeds = "a:9100,b:9100"`) and the environment variables (`ARC_CLUSTER_SEEDS`, `ARC_BACKUP_TARGET_NAMES`) read exactly as before, and an environment variable still overrides the file. Every shipped deployment (docker-compose, Kubernetes, Helm) passes seeds through `ARC_CLUSTER_SEEDS`, so none of them was affected. `arc.toml` now documents `cluster.seeds` with both spellings.
+
+**Upgrade note:** a TOML array that was ignored before now takes effect. Seeds listed in a `seeds` array are dialled. Every name in a `target_names` array must be a valid target name and, with backups enabled, a fully configured target, or Arc refuses to start. If an old array was left in `arc.toml` by mistake, remove it before upgrading.
+
 ## Fix: backups find the Iceberg metadata of edge-sync spoke databases ([#1202](https://github.com/Basekick-Labs/arc/issues/1202))
 
 Two fixes in how a backup recognises the Iceberg exporter's namespace directories.
 
 - **Unscoped backups, warehouse outside the storage root.** The Iceberg table metadata of an edge-sync spoke whose id contains a dot is now backed up. iceberg-go stores such a namespace under a JSON-encoded directory name (`__iceberg_namespace_v1__:[...].db`), and the backup only walked directories starting with `<prefix>_`. Such a backup carried the catalog rows for those tables but not the metadata they point at. A warehouse under the storage root was not affected, because the data listing covers it. If one of these directory names is too long to store as a backup key, the backup now fails and names it. Before, it left those tables out without saying so. This is the same rule as for any other warehouse file.
 - **Scoped backups.** A backup scoped to an edge-sync spoke now reports the spoke's Iceberg metadata that it leaves out (`iceberg_namespace_files_excluded`, `iceberg_namespaces_excluded`, and the log line that says to take an unscoped backup for the Iceberg tables). Before, it always reported zero. A spoke has one namespace directory per database (`arc_<spoke>.<db>.db`, or the encoded form), and the backup looked for a single `arc_<spoke>.db` that never exists. What a scoped backup copies has not changed: it never copied the warehouse. A directory name that could belong to either of two scoped names (`arc_a.b.db`: spoke `a`'s database `b`, or a name `a.b`) is reported as left out by whichever is in scope. As before, the count is made only when the warehouse is on local storage.
+
+## Fix: an edge-sync `allowed_dirs` path containing a space can be set from the environment ([#1680](https://github.com/Basekick-Labs/arc/issues/1680))
+
+`edge_sync.import.allowed_dirs` and `edge_sync.spoke.bundle.allowed_dirs` now read a string, from `arc.toml` or `ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS` / `ARC_EDGE_SYNC_SPOKE_BUNDLE_ALLOWED_DIRS`, as a **comma-separated** list. Before, a string was split on whitespace, so `"/Volumes/Air Gap"` became two allow-list entries, `/Volumes/Air` and `Gap`. The second resolved against Arc's working directory. Bundles were refused from the directory the operator named, and silently allowed in two nobody named. A comma-separated list (`"/a,/b"`) used to be read as one path; it is now two. TOML arrays read as before. A path that contains a comma needs the array spelling.
+
+Every `allowed_dirs` entry must now be an absolute path. With import or bundle export enabled, Arc refuses to start on a relative entry and names it. A relative entry was resolved against Arc's working directory. The realistic way to end up with one is a separator in the wrong place, such as `"/mnt/a,b"` in the environment, which reads as `/mnt/a` and `b`. A refused bundle path now lists each allowed directory in quotes, so a list that was read differently from how it was written is visible.
+
+**Upgrade note:** a whitespace-separated list in either variable, such as `"/mnt/a /mnt/b"`, is now read as a single path. Arc still starts, but every import or export is refused. Rewrite it as `"/mnt/a,/mnt/b"` or as a TOML array. This form was never documented. A relative `allowed_dirs` entry, also never documented, now stops startup. Make it absolute.
+
+`arc.toml` now documents both spellings of `allowed_dirs`, and the environment form of `ingest.sort_keys` and `ingest.decimal_columns`. Their entries contain commas, so in the environment the entries are separated by whitespace: `ARC_INGEST_SORT_KEYS="cpu:host,region mem:host"`. That behaviour is unchanged, and now pinned by a test. `compaction.exclude_databases` is also unchanged: a comma inside one of its entries is deliberately kept whole, because a spoke ID may contain one.
+## New: a spoke can delete its local copy once the hub has verified it ([#569](https://github.com/Basekick-Labs/arc/issues/569), phase 3a)
+
+With `edge_sync.spoke.delete_after_sync = true`, a spoke reclaims disk space by deleting its own copy of a file after the hub has **verified** that it still holds the file. This is off by default.
+
+- **When a file is deleted.** Verification is a separate request from the one that synced the file, sent on a later pass and at least `edge_sync.spoke.delete_after_sync_delay` after the sync (default `0s`). The hub answers "held" only when it still has the file itself, at the path it received it under, and on a cluster only if the cluster still lists it. Only then is the spoke's copy deleted.
+- **When a file is kept.** The hub may have merged the file into a compacted file (`edge_sync.compact_received_namespaces`, on by default) or removed it on purpose. Either way it cannot prove it still holds the content, so the spoke keeps its copy and asks again a day later. A later release will make files compacted on the hub verifiable too. A file the hub has forgotten entirely (its admin forget route) is sent again.
+- **Older hubs.** The spoke first sends the hub an empty test request. If the hub is too old to verify, the spoke deletes nothing, logs a warning, and asks again a day later. It never sends such a hub its list of synced files.
+- **Turning it on for a spoke that has been syncing for a while** verifies, and may delete, every synced file still in the ledger: up to `ledger_retention_days` (90 days by default) of data on the first passes.
+- **A failed verification** never fails the sync pass and deletes nothing. The pass reports why in `verify_error`.
+- **Refused at startup** without `edge_sync.spoke.enabled`, on a cluster node, or with a `hub_url` that is neither `https://` nor a loopback address. The hub's answer decides which local files are deleted, so it must not be forgeable in transit.
+- **Local queries** on the spoke no longer see data whose files were deleted.
+- **Licence.** The setting itself needs no licence, so manual passes (`POST /api/v1/spoke-sync/run`) delete. Scheduled passes run only with the edge-sync scheduler licence, as before. A pass reports `local_deleted`, `verify_kept`, `verify_requeued` and `verify_unsupported`.
+
+Air-gapped spokes cannot use it yet, because the import acknowledgement does not prove the hub still holds a file.
 
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
@@ -31,14 +65,33 @@ Once every node runs this version, the cluster adopts the nodes' query governanc
 
 Performance: on the query path, once adopted, `Admit` reads the cluster's policies from an immutable in-memory snapshot (one atomic load, one map lookup, one string compare), without the lock it took before. `Admit` also no longer allocates per limit: one allocation per admitted query instead of 13 to 16. Measured on Atila against `main`, 16 alternating runs each: a token with a policy 1.26 µs to 0.74 µs (standalone and cluster-wide alike), a token on the defaults 1.31 µs to 0.78 µs, and `Admit` from every core while file registrations are applied 1.53 µs to 0.84 µs per call, with the apply rate unchanged or better (70.4k to 73.8k per second). Ingest and import run no governance code; the snapshot is rebuilt (one map of the governance policies) only when a cluster policy of any kind changes, a token with a governance policy is rotated or deleted, or a Raft snapshot is restored, never on a file registration.
 
-## Note: re-syncing a deleted spoke database from the spoke ([#1186](https://github.com/Basekick-Labs/arc/issues/1186))
+## Fix: a deleted spoke database stays deleted, and can be re-synced on request ([#1186](https://github.com/Basekick-Labs/arc/issues/1186))
 
-No behaviour change. This documents what happens on an edge-sync hub after `DELETE /api/v1/databases/{spoke}?confirm=true`, so operators know which recovery path to use:
+On an edge-sync hub, what happened after `DELETE /api/v1/databases/{spoke}?confirm=true` depended on configuration. With tiering active the spoke never sent the data again. Without it, a re-sync brought back only part of the namespace: the files hub compaction had not merged. Hub retention over a spoke namespace looped: retention deleted the files, the spoke sent them again, and the next pass deleted them again.
 
-- **Tiering active** (`tiered_storage.enabled` with a licence that includes it): the hub keeps reporting the deleted files as received, so the spoke does not send them again. To get the data back, restore a backup. The receipts are in `arc.db`, which a full backup carries.
-- **Tiering not active:** at the next reconcile the hub notices the files are gone and the spoke sends them again. Files that hub compaction had already merged are the exception (compaction of received namespaces is on by default): the hub still reports those as received. A re-sync therefore brings back only part of the namespace. To get all of it back, restore a backup. With `edge_sync.compact_received_namespaces=false` or `compaction.enabled=false`, the whole namespace re-syncs.
+The hub now records content it deletes on purpose as **removed**, with the reason (`operator_delete` or `retention`), in every configuration. This covers a confirmed database delete of a spoke namespace and hot and cold retention. The spoke does not send that content again, and neither does an old air-gap bundle.
 
-Which behaviour a confirmed delete should have is still open in #1186.
+To get deleted data back from the spoke instead of from a backup, ask for it explicitly:
+
+```
+POST /api/v1/sync-spokes/{spoke_id}/forget
+{"database": "<the spoke's database>"}
+```
+
+This is admin-only. The hub forgets the removed receipts under that database, and the spoke sends those files again the next time it asks about them. A spoke with `delete_after_sync` asks at its next verification, which can be up to a day later for a file it already recorded as kept. A file the spoke already deleted cannot be sent again. Otherwise it asks only after its ledger retention (`ledger_retention_days`) prunes the row and discovery finds the file again. Receipts for content the hub still holds, inside a compacted file, are kept. The call is refused with 409 while files remain under `{spoke}/{database}/` in hot or cold storage, because sending the originals back next to those files would duplicate rows. In practice that makes it the recovery from a whole-database delete. After retention it is refused for as long as newer files remain under the database.
+
+On a **cluster** hub this also holds on the node the spoke syncs to ([#1667](https://github.com/Basekick-Labs/arc/issues/1667)). Before that node forgets a receipt whose file is gone, it checks the cluster's replicated file list. A file the cluster no longer lists is treated as removed cluster-wide, so its receipt is recorded as removed (reason `manifest_removed`) and the spoke does not send the file again. That includes the rare file the cluster dropped from its list because the object was lost (manifest repair, the reconciliation sweep). The admin forget route gets such a file sent again. A file the cluster still lists is a local copy that went missing, and the spoke sends it again, as before. If the node cannot catch up with the cluster within 5 s, the spoke's sync attempt fails and it retries later. A cluster run without Raft (`cluster.raft_data_dir` empty) has no such list, and behaves as a single node. The same applies to the row-level `DELETE` fix below.
+
+## Fix: a row-level DELETE on a spoke database no longer brings the deleted rows back ([#1666](https://github.com/Basekick-Labs/arc/issues/1666))
+
+On an edge-sync hub, `DELETE` with a `WHERE` clause on a spoke's data either rewrites a file without the matching rows, under a new name, or removes the file when every row matches. Neither updated the sync receipt for the original file. At the next reconcile the hub saw that file gone, and the spoke sent the original again: the deleted rows came back, and after a rewrite the surviving rows were stored twice.
+
+The hub now updates the receipt before it changes the file:
+
+- For a rewrite, the original is recorded as merged into the new file.
+- For a full removal, it is recorded as removed (reason `row_delete`).
+
+Either way the spoke does not send the original again. This also covers cold-tier files whose rows all match. If the receipt cannot be updated, the file is left unchanged and listed under `failed_files`.
 
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 
@@ -307,6 +360,30 @@ These cases are still not repaired:
   checksum, and the reads after it are misaligned.
 - **Each file gets one repair attempt.** A second damaged length in the same
   file reads as before.
+
+### WAL length-damage test accepts both safe recovery outcomes ([#1670](https://github.com/Basekick-Labs/arc/issues/1670))
+
+The test now accepts either retention of a damaged WAL at its original path or
+intact quarantine. It checks that the bytes are preserved and the checkpointed
+row is not replayed.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1674](https://github.com/Basekick-Labs/arc/pull/1674).
+
+## Tests: two intermittent CI failures fixed ([#1671](https://github.com/Basekick-Labs/arc/issues/1671), [#1672](https://github.com/Basekick-Labs/arc/issues/1672))
+
+Test-only; no product behaviour changes.
+
+- `TestASyncDoesNotAnswerACheckpointWrittenAfterItStarted` could hang
+  `internal/wal` until the 30-minute package timeout. It read its entry count
+  after an append the writer loop may already have counted, then waited for
+  two more that never came, and the failure's cleanup blocked on a sync the
+  test still held. The count is read before the append, held syncs are
+  released before the writer closes, and every wait is bounded.
+- `TestSlowStandbyOnlyLosesItsOwn` reported gaps on the healthy standby on a
+  loaded runner. The server keeps each standby's queue separate; the test's
+  fixed-rate producer let a slowed healthy standby overflow its own queue.
+  The producer now stays within 32 entries of what the healthy standby has
+  stored, so a gap can only come from the stuck one.
 
 ## Fix: a compressed MessagePack write over the size limit answers 413 ([#1651](https://github.com/Basekick-Labs/arc/pull/1651))
 

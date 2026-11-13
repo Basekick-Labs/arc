@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"hash/crc32"
@@ -120,12 +121,19 @@ func TestLengthPastEOFIsRepairedAndLaterFramesRecovered(t *testing.T) {
 // A length damaged to be longer but still inside the file is NOT repaired:
 // the checkpoint scan skips data frames by their stated length without
 // reading them, so a repair in ReadAll alone would make the two disagree and
-// replay an entry whose checkpoint the scan missed. It stays a damaged entry,
-// the file is kept, and the flushed entry is not replayed (review of #1641).
+// replay an entry whose checkpoint the scan missed. Past the damaged frame the
+// reader parses headers out of the next frame's payload, whose bytes (the
+// generated tracked IDs and timestamps) differ on every run. When they read
+// only as checksum mismatches, recovery quarantines the file on the first
+// pass (#1634); any other damage keeps it for another pass. The outcome is
+// fixed by the bytes (about 1 run in 60 quarantines, #1670), so both are
+// accepted. Either way, the file's bytes must be preserved and the flushed
+// entry must not be replayed (review of #1641).
 func TestLengthTooLongInsideTheFileIsDamageNotRepair(t *testing.T) {
 	path, data, offs := lengthFixture(t, 3)
 	trueLen := offs[1] - offs[0] - WALEntryHeaderSize
-	write(t, path, setLength(data, offs[0], uint32(trueLen+21)))
+	bad := setLength(data, offs[0], uint32(trueLen+21))
+	write(t, path, bad)
 	_, r := readAllValues(t, path)
 	if r.RepairedLengths != 0 || r.CorruptedEntries == 0 {
 		t.Fatalf("repaired %d corrupted %d", r.RepairedLengths, r.CorruptedEntries)
@@ -144,8 +152,28 @@ func TestLengthTooLongInsideTheFileIsDamageNotRepair(t *testing.T) {
 			t.Fatalf("the checkpointed entry was replayed: %v", replayed)
 		}
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("damaged file deleted: stats %+v", stats)
+	kept, pathErr := os.ReadFile(path)
+	quarantined, quarantineErr := os.ReadFile(path + ".failed")
+	pathExists := pathErr == nil
+	quarantineExists := quarantineErr == nil
+	if pathErr != nil && !os.IsNotExist(pathErr) {
+		t.Fatalf("read damaged WAL file: %v", pathErr)
+	}
+	if quarantineErr != nil && !os.IsNotExist(quarantineErr) {
+		t.Fatalf("read quarantined WAL file: %v", quarantineErr)
+	}
+	if pathExists == quarantineExists {
+		t.Fatalf("damaged file must be kept or quarantined, not deleted or duplicated: path err=%v quarantine err=%v stats=%+v", pathErr, quarantineErr, stats)
+	}
+	preserved := kept
+	if quarantineExists {
+		preserved = quarantined
+	}
+	if !bytes.Equal(preserved, bad) {
+		t.Fatal("recovery changed the damaged WAL bytes")
+	}
+	if (stats.QuarantinedFiles == 1) != quarantineExists || stats.QuarantinedFiles > 1 {
+		t.Fatalf("quarantined files=%d, quarantine path exists=%t", stats.QuarantinedFiles, quarantineExists)
 	}
 }
 

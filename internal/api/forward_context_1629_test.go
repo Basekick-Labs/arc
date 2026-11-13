@@ -125,7 +125,7 @@ func probeBuffer(t *testing.T) *ingest.ArrowBuffer {
 }
 
 // writeApp is a forwarding app with every write-class route: line protocol,
-// MessagePack, TLE, imports and database creation.
+// MessagePack, Prometheus Remote Write, TLE, imports and database creation.
 func writeApp(t *testing.T, router *cluster.Router) *fiber.App {
 	t.Helper()
 	buf := probeBuffer(t)
@@ -152,6 +152,8 @@ func writeApp(t *testing.T, router *cluster.Router) *fiber.App {
 }
 
 var forwardedWrites = []struct{ path, body string }{
+	{prometheusRemoteWritePath, string(remoteWriteTestBody(nil))},
+	{prometheusRemoteWritePath + "?n=large", strings.Repeat("x", forwardBodyCopyMax+1)},
 	{"/api/v1/write/line-protocol", "cpu,host=a value=1 1700000000000000000\n"},
 	{"/write?db=db", "cpu,host=a value=1 1700000000000000000\n"},
 	{"/api/v1/write/msgpack", "\x81\xa1m\xa3cpu"},

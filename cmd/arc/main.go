@@ -3125,11 +3125,32 @@ func main() {
 	// hubReceiptMarker marks sync_received receipts for hub-consumed spoke
 	// files (grouped by namespace). Built whenever the edge-sync receive or
 	// import side is enabled (both write receipts); shared by compaction's
-	// consumed-inputs observer (#619) and tiering's hot-file-removal hook
-	// (#687), which a database delete also reaches (#1166: a mark although
-	// the content is gone; see edgesync.HubIndex.Forget and #1186). Remains
-	// nil otherwise, which keeps tiering's spoke-migration gate closed.
+	// consumed-inputs observer (#619), tiering's hot-file-removal hook (#687)
+	// and a DELETE's partial rewrite (#1666), all of which preserve the
+	// content. Remains nil otherwise,
+	// which keeps tiering's spoke-migration gate closed.
 	var hubReceiptMarker func(paths []string) error
+	// spokeDeleteTiering and spokeDeleteInvalidate are filled in once the
+	// tiering manager and the query-cache invalidator exist, after the spoke
+	// block that wires delete_after_sync; the deleter reads them atomically.
+	var (
+		spokeDeleteTiering    atomic.Pointer[tiering.Manager]
+		spokeDeleteInvalidate atomic.Pointer[func()]
+		spokeDeleteReady      atomic.Bool
+	)
+	// hubNamespaceRemover and hubRemovalMarker mark receipts REMOVED for
+	// content the hub deletes on purpose (#1186): a confirmed database delete
+	// of a spoke namespace, and retention. Wired into the databases and
+	// retention handlers below; nil when this node is not an edge-sync hub.
+	var (
+		hubNamespaceRemover func(ctx context.Context, name string) error
+		hubRemovalMarker    func(ctx context.Context, paths []string) error
+		hubRowDeleteMarker  func(ctx context.Context, paths []string) error
+		// hubColdTier is the tiering manager once it is wired below, so the
+		// forget route's guard can see the cold tier (#1186). Atomic: the
+		// route can be called once the server is up, before or after that.
+		hubColdTier atomic.Pointer[tiering.Manager]
+	)
 	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
@@ -3184,6 +3205,17 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync hub index; refusing to start")
 		}
+		// #1667: on a cluster hub, removals run on the writer and mark the
+		// writer's receipts, while this node's receipts belong to the spokes
+		// that sync here. The manifest tells a stale receipt removed
+		// cluster-wide from a local copy that is missing.
+		var hubManifest edgesync.ClusterManifest
+		// Only with Raft: a cluster run without it (cluster.raft_data_dir
+		// empty) has no manifest to ask, and every catch-up would fail and
+		// stall the spokes' sync for good.
+		if clusterCoordinator != nil && clusterCoordinator.HasRaft() {
+			hubManifest = coordinatorManifest{c: clusterCoordinator}
+		}
 
 		// Spoke secrets are encrypted at rest with the same key MQTT uses for
 		// broker passwords. Encrypted rather than hashed because HMAC
@@ -3225,6 +3257,14 @@ func main() {
 		// (deep-review B1), and tiering aborts the migration before any
 		// delete.
 		markLogger := logger.Get("edgesync")
+		// #1186: a database delete takes one path segment, so for a spoke
+		// namespace the name is the spoke and every receipt of it goes. For
+		// any other database the UPDATE matches no receipt.
+		hubNamespaceRemover = func(ctx context.Context, name string) error {
+			return hubIndex.MarkSpokeRemoved(ctx, name, edgesync.RemovedByOperatorDelete)
+		}
+		hubRemovalMarker = hubRemovalMarkerFor(hubIndex, edgesync.RemovedByRetention)
+		hubRowDeleteMarker = hubRemovalMarkerFor(hubIndex, edgesync.RemovedByRowDelete)
 		hubReceiptMarker = func(inputs []string) error {
 			byNamespace := make(map[string][]string)
 			for _, in := range inputs {
@@ -3240,7 +3280,7 @@ func main() {
 			for ns, paths := range byNamespace {
 				if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
 					markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
-						Msg("Could not mark consumed receipts; the caller retries or aborts")
+						Msg("Could not mark receipts compacted; the caller retries, aborts or reports the file failed")
 					if firstErr == nil {
 						firstErr = err
 					}
@@ -3263,6 +3303,7 @@ func main() {
 		receiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 			Backend:      storageBackend,
 			Index:        hubIndex,
+			Manifest:     hubManifest,
 			Logger:       logger.Get("edgesync"),
 			RegisterFile: registerFile,
 			HoldPath:     edgeSyncHoldPath(clusterCoordinator),
@@ -3284,6 +3325,7 @@ func main() {
 			Index:      hubIndex,
 			Backend:    storageBackend,
 			MaxEntries: cfg.EdgeSync.MaxReconcileEntries,
+			Manifest:   hubManifest,
 		})
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync reconciler; refusing to start")
@@ -3293,6 +3335,13 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync admin handler; refusing to start")
 		}
+		syncAdminHandler.SetReceiptRecovery(hubIndex, storageBackend)
+		syncAdminHandler.SetColdStorage(func() storage.Backend {
+			if tm := hubColdTier.Load(); tm != nil {
+				return tm.ColdBackend()
+			}
+			return nil
+		})
 		syncAdminHandler.RegisterRoutes(server.GetApp())
 
 		// The spoke-facing receive endpoints mount ONLY for a network hub. An
@@ -3389,6 +3438,7 @@ func main() {
 			importReceiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 				Backend:      storageBackend,
 				Index:        hubIndex,
+				Manifest:     hubManifest,
 				Logger:       importLogger,
 				RegisterFile: collector.Register,
 				HoldPath:     edgeSyncHoldPath(clusterCoordinator),
@@ -3654,6 +3704,17 @@ func main() {
 			syncAgent.SetCompactionDeferEpoch(compactionDeferEpoch)
 			if spokeRegistry != nil {
 				syncAgent.SetNamespaceExcluder(receivedNamespaces(spokeRegistry))
+			}
+			if cfg.EdgeSync.Spoke.DeleteAfterSync {
+				syncAgent.SetDeleteAfterSync(cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
+					spokeLocalDeleter(storageBackend, &spokeDeleteTiering, &spokeDeleteReady),
+					func() {
+						if f := spokeDeleteInvalidate.Load(); f != nil {
+							(*f)()
+						}
+					})
+				spokeLogger.Warn().Dur("delay", cfg.EdgeSync.Spoke.DeleteAfterSyncDelay).
+					Msg("edge_sync.spoke.delete_after_sync is on: local copies of synced files are deleted once the hub verifies it holds them; local queries no longer see that data")
 			}
 		}
 
@@ -4243,6 +4304,7 @@ func main() {
 			}
 		}
 	}
+	spokeDeleteInvalidate.Store(&invalidateQueryCaches)
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
@@ -4265,6 +4327,11 @@ func main() {
 	// via os.CreateTemp.
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
 	deleteHandler.SetOnFilesRemoved(invalidateQueryCaches)
+	if hubRowDeleteMarker != nil {
+		// #1666: a rewrite keeps the surviving rows (compacted); a file whose
+		// rows all match is removed. Both nil off a hub.
+		deleteHandler.SetReceiptMarkers(hubRowDeleteMarker, hubReceiptMarker)
+	}
 	if registrationOutbox != nil {
 		// A rewrite of a file still pending registration is announced in its
 		// place (#1210).
@@ -4304,6 +4371,9 @@ func main() {
 
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
+	if hubNamespaceRemover != nil {
+		databasesHandler.SetOnSpokeNamespaceRemoved(hubNamespaceRemover)
+	}
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
 	databasesHandler.SetOnFilesRemoved(invalidateQueryCaches)
 	databasesHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
@@ -4347,6 +4417,9 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
 		retentionHandler.SetOnFilesRemoved(invalidateQueryCaches)
+		if hubRemovalMarker != nil {
+			retentionHandler.SetOnSpokeFilesRemoved(hubRemovalMarker)
+		}
 		retentionHandler.RegisterRoutes(server.GetApp())
 		if clusterCoordinator != nil {
 			retentionHandler.SetCoordinator(clusterCoordinator)
@@ -5217,6 +5290,7 @@ func main() {
 		if retentionHandler != nil {
 			retentionHandler.SetTieringManager(tieringManager)
 		}
+		spokeDeleteTiering.Store(tieringManager)
 		tieringHandler := api.NewTieringHandler(tieringManager, authManager, licenseClient, logger.Get("tiering-api"))
 		tieringHandler.RegisterRoutes(server.GetApp())
 
@@ -5250,6 +5324,7 @@ func main() {
 		// Wiring this also lifts the migrator's spoke-namespace gate.
 		if hubReceiptMarker != nil {
 			tieringManager.SetOnHotFilesRemoved(hubReceiptMarker)
+			hubColdTier.Store(tieringManager)
 			log.Info().Msg("Tiering hot-file removals wired to edge-sync receipt marking; spoke cold migration enabled")
 		}
 		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")
@@ -5332,6 +5407,9 @@ func main() {
 			}
 		}
 	}
+	// delete_after_sync may run from here: the cache invalidator exists and
+	// tiering, if on, is wired (its move claim and tier rows are in place).
+	spokeDeleteReady.Store(true)
 
 	// Iceberg export, once tiering is set up: with a cold tier, files migrated to it stay in the
 	// tables (#939), so the export must see the cold tier from its first pass. Exporting without
@@ -5880,6 +5958,88 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 	return db, true, nil
+}
+
+// spokeLocalDeleter deletes a spoke's own copy of a synced file the hub proved
+// it holds (edge sync phase 3a, delete_after_sync). A file already gone is
+// success; a file whose size differs from the ledger's is kept; spoke tiering's
+// move claim keeps it off a file being migrated; the hot tier row goes with
+// the file. The agent drops the query caches once per batch afterwards. Not
+// ready until startup has wired tiering and the cache invalidator.
+func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manager], ready *atomic.Bool) edgesync.LocalDeleter {
+	return func(ctx context.Context, path string, wantSize int64) error {
+		if !ready.Load() {
+			return edgesync.ErrDeleterNotReady
+		}
+		size, err := backend.StatFile(ctx, path)
+		if err != nil {
+			return fmt.Errorf("stat: %w", err)
+		}
+		if size < 0 {
+			return nil
+		}
+		if size != wantSize {
+			return fmt.Errorf("local size %d differs from the synced size %d", size, wantSize)
+		}
+		mgr := tm.Load()
+		if mgr != nil {
+			release, err := mgr.ClaimForDelete(ctx, path)
+			if err != nil {
+				return err
+			}
+			defer release()
+		}
+		if err := backend.Delete(ctx, path); err != nil {
+			if after, serr := backend.StatFile(ctx, path); serr != nil || after >= 0 {
+				return fmt.Errorf("delete: %w", err)
+			}
+		}
+		if mgr != nil {
+			if err := mgr.DeleteFile(ctx, path); err != nil {
+				log.Warn().Err(err).Str("path", path).Msg("delete_after_sync: deleted the local file but not its tier row")
+			}
+		}
+		return nil
+	}
+}
+
+// coordinatorManifest adapts the cluster coordinator to edgesync.ClusterManifest
+// (#1667). The catch-up is bounded short: it runs inside a spoke's reconcile
+// or upload request, and a failure only makes the spoke retry.
+type coordinatorManifest struct{ c *cluster.Coordinator }
+
+const hubManifestSyncTimeout = 5 * time.Second
+
+func (m coordinatorManifest) Sync(ctx context.Context) error {
+	return m.c.SyncManifestWithin(ctx, hubManifestSyncTimeout)
+}
+
+func (m coordinatorManifest) Lists(path string) bool {
+	_, ok := m.c.GetFileEntry(path)
+	return ok
+}
+
+// hubRemovalMarkerFor returns a marker that records hub-side removal of
+// spoke files with the given reason (#1186, #1666): paths are storage paths,
+// "{spoke}/{source path}", grouped by namespace. A path outside any spoke
+// namespace costs one indexed probe and matches nothing.
+func hubRemovalMarkerFor(idx *edgesync.HubIndex, reason string) func(ctx context.Context, paths []string) error {
+	return func(ctx context.Context, paths []string) error {
+		byNamespace := make(map[string][]string)
+		for _, p := range paths {
+			first, rest, found := strings.Cut(p, "/")
+			if !found || first == "" || rest == "" {
+				continue
+			}
+			byNamespace[first] = append(byNamespace[first], rest)
+		}
+		for ns, rest := range byNamespace {
+			if err := idx.MarkRemoved(ctx, ns, rest, reason); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // receivedNamespaces returns a Discoverer namespace excluder backed by the

@@ -436,6 +436,13 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			}
 			continue
 		}
+		// Receipt first (#1666): a cold copy of a spoke file was marked
+		// compacted when it migrated; with every row deleted nothing survives.
+		if err := h.markReceipt(ctx, f.path, true); err != nil {
+			h.logger.Error().Err(err).Str("file", f.path).Msg("Could not mark the edge-sync receipt of a cold file; left as it is")
+			c.failed = append(c.failed, f.path)
+			continue
+		}
 		if err := c.backend.Delete(ctx, f.path); err != nil {
 			// A delete can fail after the object went (a timed-out response).
 			if after, serr := c.backend.StatFile(ctx, f.path); serr != nil || after >= 0 {

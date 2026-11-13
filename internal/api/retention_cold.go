@@ -186,6 +186,16 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 			deleted = append(deleted, f.Path)
 			continue
 		}
+		// Receipts before the delete (#1186). Cold copies of spoke files were
+		// marked compacted when they migrated (#687); deleting them leaves
+		// nothing, so they become removed. On failure keep the file for the
+		// next run rather than delete it unmarked.
+		if h.onSpokeFilesRemoved != nil {
+			if err := h.onSpokeFilesRemoved(ctx, []string{f.Path}); err != nil {
+				c.skip(f.Path, fmt.Errorf("mark edge-sync receipt removed: %w", err))
+				continue
+			}
+		}
 		del := c.backend.Delete
 		if h.coldDeleteHook != nil {
 			del = func(ctx context.Context, path string) error { return h.coldDeleteHook(ctx, c.backend, path) }

@@ -133,6 +133,10 @@ max_buffer_age_ms = 100   # Sample override; built-in default is 5000
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
+# Environment override: entries separated by WHITESPACE, since each entry
+# contains commas; no space inside an entry:
+# ARC_INGEST_SORT_KEYS="cpu:host,region mem:host"
+# (ingest.decimal_columns takes its env override the same way.)
 sort_keys = []
 default_sort_keys = ""
 
@@ -418,6 +422,11 @@ enabled = false
 # sync_retry_interval = "30s"  # Initial retry; doubles up to sync_interval
 #                             # At least 1s and shorter than sync_interval
 # sync_timeout = "2h"          # Bound on one manual pass (POST /api/v1/spoke-sync/run)
+# delete_after_sync = false    # Delete the local copy once the hub VERIFIES it holds it
+#                             # (a later pass than the one that synced it). Deletes edge
+#                             # data: needs an https hub_url (or loopback); refused on a
+#                             # cluster node. Local queries stop seeing deleted data.
+# delete_after_sync_delay = "0s"  # Minimum time from synced to the verify that may delete
 #
 # [edge_sync.spoke.bundle]
 # timeout = "2h"               # Bound on one air-gap export (POST /api/v1/spoke-sync/export)
@@ -425,12 +434,20 @@ enabled = false
 # [edge_sync.import]
 # timeout = "4h"               # Hub side: bound on one air-gap import (POST /api/v1/bundle-import)
 #
+# allowed_dirs (in both [edge_sync.import] and [edge_sync.spoke.bundle]) is a
+# TOML array, or a comma-separated string; a path may contain spaces, and a
+# path containing a comma needs the array. Entries must be absolute paths:
+# allowed_dirs = ["/Volumes/Air Gap", "/mnt/bundles"]
+# ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS="/Volumes/Air Gap,/mnt/bundles"
+#
 # Closing the HTTP connection does not cancel a manual pass, export or import;
 # only these bounds or a server shutdown do. Go durations; must be positive.
 # Environment overrides:
 # ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
 # ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
 # ARC_EDGE_SYNC_SPOKE_SYNC_TIMEOUT
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY
 # ARC_EDGE_SYNC_SPOKE_BUNDLE_TIMEOUT
 # ARC_EDGE_SYNC_IMPORT_TIMEOUT
 #
@@ -727,8 +744,15 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # enabled = false
 # history_size = 100              # Number of completed queries to keep in memory
 
-# Peer file replication (Enterprise, cluster mode).
+# Cluster (Enterprise).
 # [cluster]
+# Static seed nodes (host:port of each peer's coordinator) used to join the
+# cluster. Either spelling works (uncomment ONE; a key may appear only once);
+# ARC_CLUSTER_SEEDS takes the comma form and overrides the file.
+# seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]
+# seeds = "10.0.0.1:9100,10.0.0.2:9100"
+#
+# Peer file replication (cluster mode).
 # Aggregate inbound bandwidth of this node's pull workers, in bytes per second
 # or a size such as "10MB" (1 MB = 1024 KB). 0 = unlimited. Staged compaction
 # fetches are not capped. A file whose transfer outlasts one fetch resumes from

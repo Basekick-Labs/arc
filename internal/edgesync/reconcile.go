@@ -39,6 +39,7 @@ type Reconciler struct {
 	index      *HubIndex
 	backend    storage.Backend
 	maxEntries int
+	manifest   ClusterManifest
 }
 
 // ReconcilerConfig configures a Reconciler.
@@ -63,6 +64,11 @@ type ReconcilerConfig struct {
 
 	// MaxEntries caps one batch. Zero uses MaxReconcileEntriesDefault.
 	MaxEntries int
+
+	// Manifest is the cluster manifest on a cluster hub, nil otherwise
+	// (#1667). A receipt whose file is gone is forgotten only while the
+	// manifest still lists the file; see ClusterManifest.
+	Manifest ClusterManifest
 }
 
 // NewReconciler validates configuration and returns a ready Reconciler.
@@ -77,7 +83,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if max <= 0 {
 		max = MaxReconcileEntriesDefault
 	}
-	return &Reconciler{index: cfg.Index, backend: cfg.Backend, maxEntries: max}, nil
+	return &Reconciler{index: cfg.Index, backend: cfg.Backend, maxEntries: max, manifest: cfg.Manifest}, nil
 }
 
 // MaxEntries reports the configured per-batch cap, so a handler can reject an
@@ -185,10 +191,21 @@ func (r *Reconciler) ReconcileAllowed(ctx context.Context, spokeID string, entri
 	// reconciling after a retention sweep must not turn into a write storm on
 	// the single writer.
 	if len(stale) > 0 {
-		if err := r.index.ForgetBatch(ctx, spokeID, stale); err != nil {
-			return nil, fmt.Errorf("%w: forget stale entries: %w", ErrReceiveInternal, err)
+		// On a cluster hub, only the receipts whose files the manifest still
+		// lists are forgotten; the others were removed cluster-wide and are
+		// now marked so (#1667). An error forgets nothing: the spoke's
+		// reconcile fails and it retries, which beats re-sending deleted
+		// content.
+		forget, err := settleStale(ctx, r.index, r.manifest, spokeID, stale)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrReceiveInternal, err)
 		}
-		for _, p := range stale {
+		if len(forget) > 0 {
+			if err := r.index.ForgetBatch(ctx, spokeID, forget); err != nil {
+				return nil, fmt.Errorf("%w: forget stale entries: %w", ErrReceiveInternal, err)
+			}
+		}
+		for _, p := range forget {
 			delete(held, p)
 		}
 	}
@@ -247,13 +264,16 @@ func (r *Reconciler) confirmPresent(ctx context.Context, spokeID string, entries
 		if !ok {
 			continue
 		}
-		if hf.Compacted {
+		if hf.Vouched() {
 			// The FILE is gone — the hub's own compaction consumed it — but
 			// the CONTENT is delivered and lives inside a compacted output,
 			// so the receipt is not stale. Running the existence check here
 			// would forget the receipt and make the sync protocol re-accept
 			// a re-uploaded raw next to the compacted output: the #611
-			// hazard this marking exists to prevent (#619).
+			// hazard this marking exists to prevent (#619). A REMOVED receipt
+			// (#1186) is skipped for a different reason: the hub deleted the
+			// content on purpose, and forgetting the receipt would make the
+			// spoke re-send what the operator or retention just deleted.
 			continue
 		}
 		candidates = append(candidates, e.Path)
