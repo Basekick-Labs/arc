@@ -751,6 +751,10 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		// beside their output forever. The keys come from List, so they are
 		// whatever is in the bucket, not only what Arc wrote.
 		objects := make([]types.ObjectIdentifier, 0, len(batch))
+		// The service answers with the PREFIXED object name; diagnostics
+		// report the caller's key, which is the one every manifest, listing
+		// and log line names (#1111, as Azure and GCS do).
+		callerKeys := make(map[string]string, len(batch))
 		for _, p := range batch {
 			key, kerr := b.prefixedKey(p)
 			if kerr != nil {
@@ -761,6 +765,7 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 				continue
 			}
 			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+			callerKeys[key] = p
 		}
 		if len(objects) == 0 {
 			continue
@@ -786,7 +791,11 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 			}
 			key := "unknown"
 			if e.Key != nil {
-				key = *e.Key
+				if k, ok := callerKeys[*e.Key]; ok {
+					key = k
+				} else {
+					key = strings.TrimPrefix(*e.Key, b.prefix)
+				}
 			}
 			code := ""
 			if e.Code != nil {
