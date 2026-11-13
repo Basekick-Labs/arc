@@ -3126,10 +3126,21 @@ func main() {
 	// files (grouped by namespace). Built whenever the edge-sync receive or
 	// import side is enabled (both write receipts); shared by compaction's
 	// consumed-inputs observer (#619) and tiering's hot-file-removal hook
-	// (#687), which a database delete also reaches (#1166: a mark although
-	// the content is gone; see edgesync.HubIndex.Forget and #1186). Remains
-	// nil otherwise, which keeps tiering's spoke-migration gate closed.
+	// (#687), both of which preserve the content. Remains nil otherwise,
+	// which keeps tiering's spoke-migration gate closed.
 	var hubReceiptMarker func(paths []string) error
+	// hubNamespaceRemover and hubRemovalMarker mark receipts REMOVED for
+	// content the hub deletes on purpose (#1186): a confirmed database delete
+	// of a spoke namespace, and retention. Wired into the databases and
+	// retention handlers below; nil when this node is not an edge-sync hub.
+	var (
+		hubNamespaceRemover func(ctx context.Context, name string) error
+		hubRemovalMarker    func(ctx context.Context, paths []string) error
+		// hubColdTier is the tiering manager once it is wired below, so the
+		// forget route's guard can see the cold tier (#1186). Atomic: the
+		// route can be called once the server is up, before or after that.
+		hubColdTier atomic.Pointer[tiering.Manager]
+	)
 	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
@@ -3225,6 +3236,28 @@ func main() {
 		// (deep-review B1), and tiering aborts the migration before any
 		// delete.
 		markLogger := logger.Get("edgesync")
+		// #1186: a database delete takes one path segment, so for a spoke
+		// namespace the name is the spoke and every receipt of it goes. For
+		// any other database the UPDATE matches no receipt.
+		hubNamespaceRemover = func(ctx context.Context, name string) error {
+			return hubIndex.MarkSpokeRemoved(ctx, name, edgesync.RemovedByOperatorDelete)
+		}
+		hubRemovalMarker = func(ctx context.Context, paths []string) error {
+			byNamespace := make(map[string][]string)
+			for _, p := range paths {
+				first, rest, found := strings.Cut(p, "/")
+				if !found || first == "" || rest == "" {
+					continue
+				}
+				byNamespace[first] = append(byNamespace[first], rest)
+			}
+			for ns, rest := range byNamespace {
+				if err := hubIndex.MarkRemoved(ctx, ns, rest, edgesync.RemovedByRetention); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		hubReceiptMarker = func(inputs []string) error {
 			byNamespace := make(map[string][]string)
 			for _, in := range inputs {
@@ -3293,6 +3326,13 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync admin handler; refusing to start")
 		}
+		syncAdminHandler.SetReceiptRecovery(hubIndex, storageBackend)
+		syncAdminHandler.SetColdStorage(func() storage.Backend {
+			if tm := hubColdTier.Load(); tm != nil {
+				return tm.ColdBackend()
+			}
+			return nil
+		})
 		syncAdminHandler.RegisterRoutes(server.GetApp())
 
 		// The spoke-facing receive endpoints mount ONLY for a network hub. An
@@ -4304,6 +4344,9 @@ func main() {
 
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
+	if hubNamespaceRemover != nil {
+		databasesHandler.SetOnSpokeNamespaceRemoved(hubNamespaceRemover)
+	}
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
 	databasesHandler.SetOnFilesRemoved(invalidateQueryCaches)
 	databasesHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
@@ -4347,6 +4390,9 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
 		retentionHandler.SetOnFilesRemoved(invalidateQueryCaches)
+		if hubRemovalMarker != nil {
+			retentionHandler.SetOnSpokeFilesRemoved(hubRemovalMarker)
+		}
 		retentionHandler.RegisterRoutes(server.GetApp())
 		if clusterCoordinator != nil {
 			retentionHandler.SetCoordinator(clusterCoordinator)
@@ -5250,6 +5296,7 @@ func main() {
 		// Wiring this also lifts the migrator's spoke-namespace gate.
 		if hubReceiptMarker != nil {
 			tieringManager.SetOnHotFilesRemoved(hubReceiptMarker)
+			hubColdTier.Store(tieringManager)
 			log.Info().Msg("Tiering hot-file removals wired to edge-sync receipt marking; spoke cold migration enabled")
 		}
 		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")

@@ -248,13 +248,17 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 	// different content is the usual conflict, answered from the receipt's
 	// digest. A receipt that is marked compacted while the file ALSO still
 	// exists (a partially failed source deletion) takes this same branch —
-	// the content is delivered either way.
+	// the content is delivered either way. A REMOVED receipt (#1186) takes it
+	// too: a re-sent copy of content the hub deleted on purpose is answered
+	// already-present, so a stale bundle cannot undo the delete. A different
+	// digest is answered as a conflict naming content the hub no longer
+	// holds; the explicit recovery is the admin forget route.
 	if r.index != nil {
 		held, err := r.index.Lookup(ctx, spokeID, []string{sourcePath})
 		if err != nil {
 			return nil, fmt.Errorf("%w: receipt lookup %q: %w", ErrReceiveInternal, sourcePath, err)
 		}
-		if hf, ok := held[sourcePath]; ok && hf.Compacted {
+		if hf, ok := held[sourcePath]; ok && hf.Vouched() {
 			if hf.SHA256 == declaredSHA256 {
 				return &PutResult{Outcome: OutcomeAlreadyPresent, BytesAccepted: declaredSize}, nil
 			}
