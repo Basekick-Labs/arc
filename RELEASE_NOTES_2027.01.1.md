@@ -6,8 +6,8 @@
 
 No behaviour change. This documents what happens on an edge-sync hub after `DELETE /api/v1/databases/{spoke}?confirm=true`, so operators know which recovery path to use:
 
-- **Tiering enabled:** the hub keeps reporting the deleted files as received, so the spoke does not send them again. To get the data back, restore a backup. The receipts are in `arc.db`, which a backup carries.
-- **Tiering disabled:** at the next reconcile the hub notices the files are gone and the spoke sends them again. Files that hub compaction had already merged are the exception: the hub still reports those as received. A re-sync therefore brings back only part of the namespace. To get all of it back, restore a backup.
+- **Tiering active** (`tiered_storage.enabled` with a licence that includes it): the hub keeps reporting the deleted files as received, so the spoke does not send them again. To get the data back, restore a backup. The receipts are in `arc.db`, which a full backup carries.
+- **Tiering not active:** at the next reconcile the hub notices the files are gone and the spoke sends them again. Files that hub compaction had already merged are the exception (compaction of received namespaces is on by default): the hub still reports those as received. A re-sync therefore brings back only part of the namespace. To get all of it back, restore a backup. With `edge_sync.compact_received_namespaces=false` or `compaction.enabled=false`, the whole namespace re-syncs.
 
 Which behaviour a confirmed delete should have is still open in #1186.
 
