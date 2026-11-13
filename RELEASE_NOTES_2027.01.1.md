@@ -3206,8 +3206,8 @@ tables for ADBC clients. Results stopped at a governance row cap end with a
 Flight queries are audited and logged like HTTP queries, with the client's
 address. Metadata calls run one query per database, plus one per measurement
 when schemas are requested, and count against governance limits. Prepared
-statements and SqlInfo are not implemented yet, so JDBC-based BI tools are not
-expected to work; the ADBC drivers are the tested clients. See
+statements are not implemented yet, so JDBC-based BI tools cannot run queries;
+the ADBC drivers are the tested clients. See
 `docs/operations/flight-sql.md`.
 
 Both Helm charts can turn it on: `flightSql.enabled` (default `false`),
@@ -3218,6 +3218,28 @@ are not given the listener. A port that collides with one of Arc's is refused
 when the chart renders.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https://github.com/Basekick-Labs/arc/pull/1419).
+
+### Flight SQL answers SqlInfo ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener answers `GetSqlInfo` with the server name (`Arc`), the
+Arc and Arrow versions, that it is read-only and takes SQL but not Substrait,
+transactions, cancellation, bulk ingestion or DDL, the identifier quote (`"`),
+the metadata search-pattern escape (`\`), the catalog term (`database`), and
+the query grammar it supports: column and table aliases, `GROUP BY`, `UNION`
+and `UNION ALL`, full outer joins, subqueries (correlated too), expressions and
+unrelated columns in `ORDER BY`, and `LIKE ... ESCAPE`. The JDBC driver reads a
+value the server leaves out as `false`, so without these it would report that
+Arc has no `GROUP BY`, `UNION`, joins or subqueries.
+Before, every SqlInfo request failed with `NotFound`: ADBC's `GetInfo` failed
+with it (`adbc_get_info()` in Python), and with the Arrow Flight SQL JDBC driver
+every `DatabaseMetaData` call that reads SqlInfo threw, such as
+`getDatabaseProductName()` and `getIdentifierQuoteString()`. A request that
+includes IDs Arc has no value for, as ADBC's does for the Substrait version
+range, is answered with the rest. Queries through the JDBC driver still need
+prepared statements, which are not implemented yet. See
+`docs/operations/flight-sql.md`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.
 
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 
