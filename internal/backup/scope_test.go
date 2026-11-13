@@ -227,8 +227,21 @@ func TestScopeOwnershipRules(t *testing.T) {
 			t.Errorf("ownsPath(%q) = %v, want %v", p, got, want)
 		}
 	}
-	if !sc.ownsIcebergNamespaceDir("arc_a.db", "arc") || sc.ownsIcebergNamespaceDir("arc_c.db", "arc") || sc.ownsIcebergNamespaceDir("arc_a.db", "other") {
-		t.Error("ownsIcebergNamespaceDir is not keyed on <prefix>_<db>.db")
+	for dir, want := range map[string]bool{
+		"arc_a.db":            true,
+		"arc_c.db":            false,
+		"arc_spoke1.prod.db":  true, // spoke1's database prod (#1202)
+		"arc_spoke1.db":       true, // pre-#634 single-component spoke namespace
+		"arc_spoke10.prod.db": false,
+		`__iceberg_namespace_v1__:["arc_spoke1","prod"].db`: true,
+		`__iceberg_namespace_v1__:["arc_x","prod"].db`:      false,
+	} {
+		if got := sc.ownsIcebergNamespaceDir(dir, "arc"); got != want {
+			t.Errorf("ownsIcebergNamespaceDir(%q) = %v, want %v", dir, got, want)
+		}
+	}
+	if sc.ownsIcebergNamespaceDir("arc_a.db", "other") {
+		t.Error("ownsIcebergNamespaceDir ignores the namespace prefix")
 	}
 	// An empty scope owns everything: the unscoped call sites read as before.
 	var none *scope
