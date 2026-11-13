@@ -2,6 +2,23 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: configurable bounds for migrations, manual edge syncs and bundle transfers ([#1112](https://github.com/Basekick-Labs/arc/issues/1112))
+
+Four long-running operations had a hardcoded time limit. Each now has a setting. The defaults are the old values, so nothing changes unless you set one.
+
+| Setting | Bounds | Default |
+|---|---|---|
+| `tiered_storage.migration_timeout` | one migration cycle, scheduled or `POST /api/v1/tiering/migrate` | `2h` |
+| `edge_sync.spoke.sync_timeout` | one manual sync pass, `POST /api/v1/spoke-sync/run` | `2h` |
+| `edge_sync.spoke.bundle.timeout` | one air-gap export, `POST /api/v1/spoke-sync/export` | `2h` |
+| `edge_sync.import.timeout` | one air-gap import on the hub, `POST /api/v1/bundle-import` | `4h` |
+
+Each takes a Go duration (`45m`, `6h`). A value that does not parse, or that is zero or negative, stops Arc at startup with an error that names the setting and the value. All four are checked even when the feature is off, as `backup.operation_timeout` is.
+
+- Raise `migration_timeout` for a first cold-tier migration of a large dataset. Lower it to make a stuck migration give up and alert sooner.
+- The scan at the start of each migration cycle runs inside the cycle's limit. A `migration_timeout` shorter than `tiered_storage.scan_timeout` therefore cuts that scan short too. Arc logs a warning at startup when you configure that.
+- Closing the HTTP connection does not stop a manual sync, export or import, so these settings are the only limit on how long one runs.
+
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
 Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table, on nodes where governance is off too, is kept equal to it as a backup and is never read again.

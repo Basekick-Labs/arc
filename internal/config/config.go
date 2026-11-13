@@ -393,6 +393,11 @@ type EdgeSyncImportConfig struct {
 	// MaxFiles refuses a manifest declaring more than this, independently of
 	// whatever the exporting spoke was configured with. Zero means 10,000.
 	MaxFiles int64
+
+	// Timeout bounds one POST /api/v1/edge-sync/import. Parsed from
+	// edge_sync.import.timeout; always positive. Default 4h: every file is
+	// hashed twice (verify, then commit), off removable media (#1112).
+	Timeout time.Duration
 }
 
 // EdgeSyncSpokeConfig configures the push side of edge sync (#569).
@@ -478,6 +483,12 @@ type EdgeSyncSpokeConfig struct {
 	// visit. 0 disables pruning. Default 90.
 	LedgerRetentionDays int
 
+	// SyncTimeout bounds one manual sync pass (POST /api/v1/spoke-sync/run).
+	// Parsed from edge_sync.spoke.sync_timeout; always positive. Default 2h:
+	// a pass drains whatever backlog exists (#1112). The scheduled passes are
+	// not bounded by it.
+	SyncTimeout time.Duration
+
 	// Bundle configures air-gap export.
 	Bundle EdgeSyncBundleConfig
 }
@@ -504,6 +515,10 @@ type EdgeSyncBundleConfig struct {
 	// MaxBytes caps one bundle's data. Zero means 64 GiB — roughly a large
 	// removable drive, and a bound on how much a single export can write.
 	MaxBytes int64
+
+	// Timeout bounds one POST /api/v1/spoke-sync/export. Parsed from
+	// edge_sync.spoke.bundle.timeout; always positive. Default 2h (#1112).
+	Timeout time.Duration
 }
 
 type WALConfig struct {
@@ -734,6 +749,14 @@ type TieredStorageConfig struct {
 	// hot-row retirement runs only after the whole walk, so a scan that always
 	// truncates never retires a stale row.
 	ScanTimeout time.Duration
+
+	// MigrationTimeout bounds one migration cycle, scheduled or triggered by
+	// POST /api/v1/tiering/migrate. Parsed from
+	// tiered_storage.migration_timeout; always positive. Default 2h (#1112).
+	//
+	// The cycle's pre-migration scan runs inside this budget (see
+	// ScanTimeout), so a value below scan_timeout also shortens that scan.
+	MigrationTimeout time.Duration
 
 	// Cold tier configuration (remote S3/Azure/GCS storage)
 	Cold ColdTierConfig
@@ -1113,6 +1136,24 @@ func Load() (*Config, error) {
 		)
 	}
 
+	// #1112: same shape as backup.operation_timeout and scan_timeout.
+	migrationTimeout, err := parsePositiveDuration(v, "tiered_storage.migration_timeout")
+	if err != nil {
+		return nil, err
+	}
+	spokeSyncTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.sync_timeout")
+	if err != nil {
+		return nil, err
+	}
+	bundleExportTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.bundle.timeout")
+	if err != nil {
+		return nil, err
+	}
+	bundleImportTimeout, err := parsePositiveDuration(v, "edge_sync.import.timeout")
+	if err != nil {
+		return nil, err
+	}
+
 	backupOperationTimeout, err := time.ParseDuration(v.GetString("backup.operation_timeout"))
 	if err != nil || backupOperationTimeout <= 0 {
 		return nil, fmt.Errorf(
@@ -1238,11 +1279,13 @@ func Load() (*Config, error) {
 				Enabled:     v.GetBool("edge_sync.import.enabled"),
 				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
+				Timeout:     bundleImportTimeout,
 			},
 			Spoke: EdgeSyncSpokeConfig{
 				Enabled:                    v.GetBool("edge_sync.spoke.enabled"),
 				SyncInterval:               v.GetDuration("edge_sync.spoke.sync_interval"),
 				SyncRetryInterval:          v.GetDuration("edge_sync.spoke.sync_retry_interval"),
+				SyncTimeout:                spokeSyncTimeout,
 				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
 				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
 				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
@@ -1258,6 +1301,7 @@ func Load() (*Config, error) {
 					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
 					MaxFiles:    v.GetInt("edge_sync.spoke.bundle.max_files"),
 					MaxBytes:    v.GetInt64("edge_sync.spoke.bundle.max_bytes"),
+					Timeout:     bundleExportTimeout,
 				},
 			},
 		},
@@ -1463,6 +1507,7 @@ func Load() (*Config, error) {
 			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
 			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
 			ScanTimeout:                   scanTimeout,
+			MigrationTimeout:              migrationTimeout,
 			Cold: ColdTierConfig{
 				Enabled: v.GetBool("tiered_storage.cold.enabled"),
 				// Normalized like storage.backend so cold.Backend == "s3"/"azure"
@@ -2114,6 +2159,19 @@ func validateFlightSQLConfig(flight FlightSQLConfig, server ServerConfig) error 
 	return nil
 }
 
+// parsePositiveDuration reads a duration key as a Go duration string and
+// refuses anything that does not parse or is not positive, naming the key and
+// the value. Validated at load whether or not the feature is enabled, as
+// backup.operation_timeout is: the error is printed before the logger exists,
+// so the operator sees the value (#1112).
+func parsePositiveDuration(v *viper.Viper, key string) (time.Duration, error) {
+	d, err := time.ParseDuration(v.GetString(key))
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive Go duration", key, v.GetString(key))
+	}
+	return d, nil
+}
+
 func setDefaults(v *viper.Viper) {
 	// Server defaults.
 	//
@@ -2263,6 +2321,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.enabled", false)
 	v.SetDefault("edge_sync.spoke.sync_interval", "5m")
 	v.SetDefault("edge_sync.spoke.sync_retry_interval", "30s")
+	v.SetDefault("edge_sync.spoke.sync_timeout", "2h") // one manual sync pass
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")
@@ -2288,11 +2347,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.import.enabled", false)
 	v.SetDefault("edge_sync.import.allowed_dirs", []string{})
 	v.SetDefault("edge_sync.import.max_files", 10000)
+	v.SetDefault("edge_sync.import.timeout", "4h") // one bundle import
 
 	v.SetDefault("edge_sync.spoke.bundle.enabled", false)
 	v.SetDefault("edge_sync.spoke.bundle.allowed_dirs", []string{})
 	v.SetDefault("edge_sync.spoke.bundle.max_files", 10000)
 	v.SetDefault("edge_sync.spoke.bundle.max_bytes", int64(64)<<30) // 64 GiB
+	v.SetDefault("edge_sync.spoke.bundle.timeout", "2h")            // one bundle export
 
 	v.SetDefault("compaction.enabled", true)
 	v.SetDefault("compaction.hourly_schedule", "5 * * * *")        // Every hour at :05
@@ -2515,6 +2576,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)         // 30 days in hot tier before archiving
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
+	v.SetDefault("tiered_storage.migration_timeout", "2h")              // One migration cycle; see TieredStorageConfig.MigrationTimeout
 
 	// Cold tier defaults (S3/Azure/GCS). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.

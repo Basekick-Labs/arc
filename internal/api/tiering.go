@@ -155,7 +155,9 @@ type TriggerMigrationRequest struct {
 // TriggerMigration triggers a manual migration
 // POST /api/v1/tiering/migrate
 func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
-	ctx, cancel := context.WithTimeout(c.Context(), 2*time.Hour)
+	// tiered_storage.migration_timeout (#1112), the same budget the scheduled
+	// cycle gets.
+	ctx, cancel := context.WithTimeout(c.Context(), h.manager.MigrationBudget())
 	defer cancel()
 
 	var req TriggerMigrationRequest
