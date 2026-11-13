@@ -327,6 +327,14 @@ These cases are still not repaired:
 - **Each file gets one repair attempt.** A second damaged length in the same
   file reads as before.
 
+### WAL length-damage test accepts both safe recovery outcomes ([#1670](https://github.com/Basekick-Labs/arc/issues/1670))
+
+The test now accepts either retention of a damaged WAL at its original path or
+intact quarantine. It checks that the bytes are preserved and the checkpointed
+row is not replayed.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1674](https://github.com/Basekick-Labs/arc/pull/1674).
+
 ## Fix: a compressed MessagePack write over the size limit answers 413 ([#1651](https://github.com/Basekick-Labs/arc/pull/1651))
 
 A gzip or zstd MessagePack body that fits `server.max_payload_size` but
