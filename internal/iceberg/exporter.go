@@ -78,6 +78,9 @@ type Exporter struct {
 	logger    zerolog.Logger
 	// namespaceMigrationDryRun is set once during wiring, before the scheduler starts.
 	namespaceMigrationDryRun bool
+	// layout is where new tables are created: layoutWarehouse (default) or
+	// layoutColocated (#1676, colocated.go). Set during wiring (SetLayout).
+	layout string
 
 	// hintWarned records metadata directories already warned about for
 	// unaddressable version-hint publishing, so a permanent configuration
@@ -195,6 +198,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		orphanGrace:              minOrphanGrace,
 		collapseThreshold:        manifestCollapseThreshold,
 		namespaceMigrationDryRun: true,
+		layout:                   layoutWarehouse,
 	}, nil
 }
 
@@ -306,6 +310,28 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
 		return false, err
 	}
+	// Called for a measurement with no data files left. A node with no row
+	// adopts the published table so it is emptied for outside readers too
+	// (#1609), except from a colocated directory where that metadata can
+	// only be what a database DROP racing a commit left behind (#1676):
+	// adopting it would revive an empty table and keep the dropped database
+	// listed. That is the case while the table's drop marker is set, and
+	// always off a shared bucket (forgetDroppedRows), where no other node
+	// publishes tables this node has no row for.
+	ident := e.tableIdent(database, measurement)
+	nsKey := catalogNamespaceKey(ident[:len(ident)-1])
+	if _, rowExists, err := e.catalogRow(ctx, nsKey, measurement); err != nil {
+		return false, err
+	} else if !rowExists && e.backend != nil {
+		dir, err := e.noRowMetaDirLoc(ctx, nsKey, database, measurement)
+		if err != nil {
+			return false, err
+		}
+		if coloc, cerr := e.colocatedTableLocation(database, measurement); cerr == nil && sameLocation(dir, coloc+"/metadata") &&
+			(!e.forgetDroppedRows || e.dropInProgress(ctx, nsKey, measurement)) {
+			return false, nil
+		}
+	}
 	if err := e.adoptBeforeLoad(ctx, database, measurement); err != nil {
 		return false, err
 	}
@@ -331,7 +357,7 @@ func (e *Exporter) adoptBeforeLoad(ctx context.Context, database, measurement st
 		return nil
 	}
 	ident := e.tableIdent(database, measurement)
-	_, err := e.adoptPublished(ctx, ident, catalogNamespaceKey(ident[:len(ident)-1]), ident[len(ident)-1])
+	_, err := e.adoptPublished(ctx, ident, catalogNamespaceKey(ident[:len(ident)-1]), database, ident[len(ident)-1])
 	return err
 }
 
@@ -360,7 +386,7 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 
 	// The warehouse is the authority on the table's version (adopt.go): adopt what another node
 	// published before loading, or this load would start a fork from a stale row.
-	if _, err := e.adoptPublished(ctx, ident, catalogNamespaceKey(ns), ident[len(ident)-1]); err != nil {
+	if _, err := e.adoptPublished(ctx, ident, catalogNamespaceKey(ns), database, ident[len(ident)-1]); err != nil {
 		return nil, err
 	}
 
@@ -423,6 +449,15 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 		}))
 	}
 
+	if e.colocatedLayout() {
+		// The measurement's own directory (#1676): metadata lands in
+		// <db>/<measurement>/metadata, beside the data it references.
+		loc, err := e.colocatedTableLocation(database, measurement)
+		if err != nil {
+			return nil, err
+		}
+		createOpts = append(createOpts, icecatalog.WithLocation(loc))
+	}
 	tbl, err = e.catalog.CreateTable(ctx, ident, schema, createOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create iceberg table %v: %w", ident, err)
@@ -1817,7 +1852,14 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	// The metadata dir, its table dir, and the namespace dir are all created
 	// by iceberg-go at umask permissions; the warehouse root itself is left
 	// alone (it may be shared or externally managed).
-	for _, dir := range []string{metaDir, filepath.Dir(metaDir), filepath.Dir(filepath.Dir(metaDir))} {
+	dirs := []string{metaDir, filepath.Dir(metaDir), filepath.Dir(filepath.Dir(metaDir))}
+	if !strings.HasSuffix(filepath.Base(filepath.Dir(filepath.Dir(metaDir))), ".db") {
+		// Not under a <namespace>.db directory: a colocated table (#1676),
+		// whose two ancestors are Arc's own measurement and database
+		// directories, not iceberg-go's umask-wide namespace and table ones.
+		dirs = dirs[:1]
+	}
+	for _, dir := range dirs {
 		if info, err := os.Stat(dir); err == nil {
 			tighten(dir, info.Mode().Perm())
 		}
@@ -2030,6 +2072,18 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
+	// Colocated tables (#1676) keep their metadata in <db>/<m>/metadata. The
+	// database DELETE leaves those keys to this function (OwnsMetadataKey),
+	// so the markers below are written while the metadata still exists, as
+	// for the warehouse layout.
+	var colocated map[string][]string
+	if e.backend != nil {
+		var err error
+		if colocated, err = e.colocatedMetadataByTable(ctx, database); err != nil {
+			return err
+		}
+	}
+
 	// Drop markers first (dropped.go): a drop that fails after this point,
 	// re-run, lists what is left and writes them again; one that wrote none
 	// deleted nothing yet.
@@ -2044,6 +2098,9 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 					tables[table] = struct{}{}
 				}
 			}
+		}
+		for table := range colocated {
+			tables[table] = struct{}{}
 		}
 		stamp := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
 		for table := range tables {
@@ -2065,6 +2122,24 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	if hadLocalNamespace {
 		if err := e.catalog.DropNamespace(ctx, ns); err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
 			firstErr = fmt.Errorf("drop namespace: %w", err)
+		}
+	}
+
+	// Colocated metadata: the version-hint first, so a directory reader
+	// stops resolving the table before its versions go, then the rest, then
+	// the empty metadata directory (the DELETE already removed the data).
+	for table, tkeys := range colocated {
+		sort.Slice(tkeys, func(i, j int) bool {
+			return strings.HasSuffix(tkeys[i], "/version-hint.text") && !strings.HasSuffix(tkeys[j], "/version-hint.text")
+		})
+		for _, key := range tkeys {
+			if err := e.backend.Delete(ctx, key); err != nil && !storage.IsNotFound(err) && firstErr == nil {
+				firstErr = fmt.Errorf("delete colocated Iceberg metadata %s: %w", key, err)
+			}
+		}
+		if remover, ok := e.backend.(storage.DirectoryRemover); ok {
+			_ = remover.RemoveDirectory(ctx, database+"/"+table+"/metadata")
+			_ = remover.RemoveDirectory(ctx, database+"/"+table)
 		}
 	}
 

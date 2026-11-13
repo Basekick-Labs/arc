@@ -285,6 +285,10 @@ var reservedDatabaseNames = map[string]bool{
 // export is disabled.
 type IcebergCatalogDropper interface {
 	DropDatabase(ctx context.Context, database string) error
+	// OwnsMetadataKey reports a key the database DELETE must leave for
+	// DropDatabase: a colocated Iceberg table's metadata (#1676), which
+	// DropDatabase removes after writing its drop markers (#1611).
+	OwnsMetadataKey(key string) bool
 }
 
 // SetIcebergDropper wires catalog cleanup into database deletion.
@@ -957,6 +961,21 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 	files = h.withoutLateFlushes(ctx, name, files, preListed)
+	if h.icebergDropper != nil {
+		// A colocated Iceberg table's metadata sits in the measurement's own
+		// directory (#1676). DropDatabase removes it after writing its drop
+		// markers; deleting it here first would leave another node's catalog
+		// row pointing at metadata that is gone with no marker to say why
+		// (#1611). It is never in the cluster manifest, so leaving it out of
+		// the manifest deletes changes nothing there either.
+		kept := files[:0]
+		for _, f := range files {
+			if !h.icebergDropper.OwnsMetadataKey(f) {
+				kept = append(kept, f)
+			}
+		}
+		files = kept
+	}
 	var manifestEntries []*raft.FileEntry
 	if h.coordinator != nil && h.tieringManager == nil {
 		// The snapshot below is this node's FSM, which can trail the leader;
@@ -1122,6 +1141,11 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// finishes the job, rather than stranding a catalog entry for a database
 	// whose files are half gone.
 	h.dropIcebergCatalog(ctx, name)
+	// The colocated Iceberg metadata DropDatabase just removed kept its
+	// measurement directories, and so the database, listed (#1676, #1425).
+	if h.icebergDropper != nil {
+		removeEmptyDirectories(ctx, h.storage, name, h.logger)
+	}
 
 	h.logger.Info().
 		Str("database", name).

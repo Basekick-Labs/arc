@@ -633,7 +633,21 @@ type IcebergConfig struct {
 	// listing when nothing invalidated it (#939): Arc's own cold changes invalidate it at once,
 	// so this bounds only changes made behind Arc's back.
 	ColdRescanInterval int
+	// Layout decides where the export puts a NEW table's metadata (#1676):
+	// "warehouse" (default) under <warehouse>/<prefix>_<db>.db/<measurement>,
+	// "colocated" in the measurement's own directory,
+	// <storage root>/<db>/<measurement>/metadata, with the table location set
+	// to that directory, so readers that reach data only through the table
+	// folder (OneLake shortcuts) can read Arc's files. Existing tables keep
+	// the location they were created with, whichever layout is set.
+	Layout string
 }
+
+// Iceberg export layouts (IcebergConfig.Layout).
+const (
+	IcebergLayoutWarehouse = "warehouse"
+	IcebergLayoutColocated = "colocated"
+)
 
 type ContinuousQueryConfig struct {
 	Enabled bool   // Enable continuous query management (default: true for CRUD, execution is manual)
@@ -1388,6 +1402,7 @@ func Load() (*Config, error) {
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
 			ColdRescanInterval:       v.GetInt("iceberg.cold_rescan_interval"),
+			Layout:                   strings.ToLower(strings.TrimSpace(v.GetString("iceberg.layout"))),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -1934,6 +1949,16 @@ func Load() (*Config, error) {
 				"Iceberg catalog addresses a dotted component through an encoded key, which would apply "+
 				"to every database on this node; choose a prefix without a dot", cfg.Iceberg.NamespacePrefix)
 		}
+	}
+	// Checked whether or not the export is on, so a typo is caught before
+	// someone turns it on. Whether a colocated layout's warehouse is the
+	// storage root is checked at wiring time, once both are resolved
+	// (cmd/arc), because the default warehouse needs the backend.
+	switch cfg.Iceberg.Layout {
+	case IcebergLayoutWarehouse, IcebergLayoutColocated:
+	default:
+		return nil, fmt.Errorf("iceberg.layout must be %q or %q (got %q)",
+			IcebergLayoutWarehouse, IcebergLayoutColocated, cfg.Iceberg.Layout)
 	}
 
 	// The spoke secret must come from the environment. Refuse rather than
@@ -2485,6 +2510,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.retain_snapshots", 10)
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
 	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
+	v.SetDefault("iceberg.layout", IcebergLayoutWarehouse)
 	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults

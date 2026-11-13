@@ -42,6 +42,11 @@ func (e *Exporter) SetColdTier(cold storage.Backend) error {
 		return fmt.Errorf("the Iceberg export tracks an S3 cold tier only (got %s)", cold.Type())
 	}
 	e.cold = &coldExport{root: strings.TrimSuffix(DefaultWarehouse(cold), "/"), cfg: cfg, props: props}
+	if e.colocatedLayout() {
+		e.logger.Warn().Msg("Iceberg export with iceberg.layout=\"colocated\" and a cold tier: files that move to the cold tier " +
+			"are outside the table's folder, so readers that reach data only through it (OneLake shortcuts) cannot read them; " +
+			"catalog-based readers can")
+	}
 	return nil
 }
 

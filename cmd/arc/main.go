@@ -4479,6 +4479,18 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
 		}
+		// #1676: where new tables are created. Colocated needs the warehouse
+		// to be the storage root, which only the resolved values can tell.
+		if err := exporter.SetLayout(cfg.Iceberg.Layout); err != nil {
+			log.Fatal().Err(err).Msg("Invalid Iceberg export layout")
+		}
+		if cfg.Iceberg.Layout == config.IcebergLayoutColocated {
+			log.Info().Msg("Iceberg export creates new tables in each measurement's directory (iceberg.layout=colocated); existing tables keep their location")
+			if clusterCoordinator != nil && !cluster.IsSharedObjectStore(storageBackend) {
+				log.Warn().Msg("Iceberg export with iceberg.layout=colocated on a cluster with node-local storage: table metadata " +
+					"is written only on the exporting node, and is not removed there by another node's database DELETE")
+			}
+		}
 		exporter.ConfigureNamespaceMigrationDryRun(cfg.Iceberg.NamespaceMigrationDryRun)
 		if cfg.Iceberg.NamespaceMigrationDryRun {
 			log.Info().Msg("Iceberg dotted-namespace migration is in dry-run mode; set iceberg.namespace_migration_dry_run=false after reviewing the migration plan to apply it")

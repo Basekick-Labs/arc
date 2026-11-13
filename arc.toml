@@ -389,6 +389,8 @@ s3_cache_ttl_seconds = 3600
 # catalog_db_path = "./data/arc.db"   # the shared auth database
 # retain_snapshots = 10
 # orphan_sweep_enabled = true
+# layout = "warehouse"               # or "colocated": new tables' metadata in each
+#                                    # measurement's directory (OneLake shortcuts)
 
 # -----------------------------------------------------------------------------
 # Query Governance (Enterprise)
