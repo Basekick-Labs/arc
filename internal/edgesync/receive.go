@@ -9,6 +9,7 @@ import (
 	"hash"
 	"io"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,6 +44,9 @@ var ErrReceiveInternal = errors.New("edgesync: receive failed for a hub-side rea
 type Receiver struct {
 	backend storage.Backend
 	logger  zerolog.Logger
+
+	// manifest: see ReceiverConfig.Manifest.
+	manifest ClusterManifest
 
 	// index records what the hub holds so reconcile can answer without
 	// reading parquet bytes. Nil disables recording — reconcile then reports
@@ -164,6 +168,12 @@ type ReceiverConfig struct {
 	// HoldPath, when set, is held on the final path for the whole receive
 	// (Coordinator.HoldLocalPaths).
 	HoldPath func(path string) (release func())
+
+	// Manifest is the cluster manifest on a cluster hub, nil otherwise
+	// (#1667): a re-sent file whose receipt is not marked, whose file is
+	// gone, and which the manifest no longer lists was removed cluster-wide
+	// and is not accepted again. See ClusterManifest.
+	Manifest ClusterManifest
 }
 
 // NewReceiver validates configuration and returns a ready Receiver.
@@ -174,6 +184,7 @@ func NewReceiver(cfg ReceiverConfig) (*Receiver, error) {
 	return &Receiver{
 		backend:        cfg.Backend,
 		index:          cfg.Index,
+		manifest:       cfg.Manifest,
 		recordActivity: cfg.RecordActivity,
 		// No .Str("component", ...) here: logger.Get already sets it, and a
 		// second one emits a duplicate JSON key that strict parsers and log
@@ -257,6 +268,25 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 		held, err := r.index.Lookup(ctx, spokeID, []string{sourcePath})
 		if err != nil {
 			return nil, fmt.Errorf("%w: receipt lookup %q: %w", ErrReceiveInternal, sourcePath, err)
+		}
+		if hf, ok := held[sourcePath]; ok && !hf.Vouched() && r.manifest != nil {
+			// A cluster hub whose receipt was not marked because the removal
+			// ran on another node (#1667): settle it as reconcile does, so a
+			// stale bundle cannot resurrect content removed cluster-wide.
+			exists, err := r.backend.Exists(ctx, finalPath)
+			if err != nil && !storage.IsStoreNotFound(err) {
+				return nil, fmt.Errorf("%w: stat %q: %w", ErrReceiveInternal, finalPath, err)
+			}
+			if !exists {
+				forget, err := settleStale(ctx, r.index, r.manifest, spokeID, []string{sourcePath})
+				if err != nil {
+					return nil, fmt.Errorf("%w: %w", ErrReceiveInternal, err)
+				}
+				if len(forget) == 0 {
+					hf.Removed = true
+					held[sourcePath] = hf
+				}
+			}
 		}
 		if hf, ok := held[sourcePath]; ok && hf.Vouched() {
 			if hf.SHA256 == declaredSHA256 {
@@ -992,4 +1022,46 @@ func (r *Receiver) SweepStaging(ctx context.Context, maxAge time.Duration, now t
 			Msg("Swept abandoned sync staging files")
 	}
 	return removed, nil
+}
+
+// SettleMissing settles, in one pass, the receipts of paths whose files are
+// gone from this node's storage, as reconcile does (#1667): one manifest
+// catch-up for the whole set rather than one per file. The import path calls
+// it before committing a bundle, so a re-imported bundle does not issue a
+// Raft barrier per entry from the receive pre-check. No-op off a cluster.
+func (r *Receiver) SettleMissing(ctx context.Context, spokeID string, paths []string) error {
+	if r.manifest == nil || r.index == nil || len(paths) == 0 {
+		return nil
+	}
+	held, err := r.index.Lookup(ctx, spokeID, paths)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrReceiveInternal, err)
+	}
+	var missing []string
+	for p, hf := range held {
+		if hf.Vouched() {
+			continue
+		}
+		exists, err := r.backend.Exists(ctx, NamespacedPath(spokeID, p))
+		if err != nil && !storage.IsStoreNotFound(err) {
+			return fmt.Errorf("%w: stat %q: %w", ErrReceiveInternal, p, err)
+		}
+		if !exists {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	forget, err := settleStale(ctx, r.index, r.manifest, spokeID, missing)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrReceiveInternal, err)
+	}
+	if len(forget) > 0 {
+		if err := r.index.ForgetBatch(ctx, spokeID, forget); err != nil {
+			return fmt.Errorf("%w: forget stale entries: %w", ErrReceiveInternal, err)
+		}
+	}
+	return nil
 }
