@@ -3202,7 +3202,10 @@ func main() {
 		// that sync here. The manifest tells a stale receipt removed
 		// cluster-wide from a local copy that is missing.
 		var hubManifest edgesync.ClusterManifest
-		if clusterCoordinator != nil {
+		// Only with Raft: a cluster run without it (cluster.raft_data_dir
+		// empty) has no manifest to ask, and every catch-up would fail and
+		// stall the spokes' sync for good.
+		if clusterCoordinator != nil && clusterCoordinator.HasRaft() {
 			hubManifest = coordinatorManifest{c: clusterCoordinator}
 		}
 

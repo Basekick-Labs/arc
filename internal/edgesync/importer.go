@@ -327,6 +327,16 @@ func (i *Importer) commitAll(ctx context.Context, r *BundleReader, spokeID strin
 		defer release()
 	}
 
+	// One manifest catch-up for the whole bundle (#1667), before the per-file
+	// receive pre-check would otherwise issue one per entry.
+	settle := make([]string, 0, len(entries))
+	for _, e := range entries {
+		settle = append(settle, e.Path)
+	}
+	if err := i.receiver.SettleMissing(ctx, spokeID, settle); err != nil {
+		return err
+	}
+
 	flush := func() error {
 		files := i.collector.Drain()
 		if len(files) == 0 || i.flushManifest == nil {
@@ -336,8 +346,10 @@ func (i *Importer) commitAll(ctx context.Context, r *BundleReader, spokeID strin
 			// The bytes are already committed by the receiver, so a failed
 			// manifest update means files exist in storage the cluster cannot
 			// see. Abort rather than continue: a Raft quorum loss is not
-			// transient, and pressing on would widen the gap. The next import
-			// of this bundle re-registers them, since Record never ran.
+			// transient, and pressing on would widen the gap. The receipts of
+			// this batch were already recorded (the collector registers late);
+			// the next import of the bundle finds the files in storage and
+			// resolveExisting registers them then.
 			return fmt.Errorf("%w: commit manifest batch: %w", ErrReceiveInternal, err)
 		}
 		return nil

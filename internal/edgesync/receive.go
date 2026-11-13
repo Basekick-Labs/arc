@@ -9,6 +9,7 @@ import (
 	"hash"
 	"io"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -1021,4 +1022,46 @@ func (r *Receiver) SweepStaging(ctx context.Context, maxAge time.Duration, now t
 			Msg("Swept abandoned sync staging files")
 	}
 	return removed, nil
+}
+
+// SettleMissing settles, in one pass, the receipts of paths whose files are
+// gone from this node's storage, as reconcile does (#1667): one manifest
+// catch-up for the whole set rather than one per file. The import path calls
+// it before committing a bundle, so a re-imported bundle does not issue a
+// Raft barrier per entry from the receive pre-check. No-op off a cluster.
+func (r *Receiver) SettleMissing(ctx context.Context, spokeID string, paths []string) error {
+	if r.manifest == nil || r.index == nil || len(paths) == 0 {
+		return nil
+	}
+	held, err := r.index.Lookup(ctx, spokeID, paths)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrReceiveInternal, err)
+	}
+	var missing []string
+	for p, hf := range held {
+		if hf.Vouched() {
+			continue
+		}
+		exists, err := r.backend.Exists(ctx, NamespacedPath(spokeID, p))
+		if err != nil && !storage.IsStoreNotFound(err) {
+			return fmt.Errorf("%w: stat %q: %w", ErrReceiveInternal, p, err)
+		}
+		if !exists {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	forget, err := settleStale(ctx, r.index, r.manifest, spokeID, missing)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrReceiveInternal, err)
+	}
+	if len(forget) > 0 {
+		if err := r.index.ForgetBatch(ctx, spokeID, forget); err != nil {
+			return fmt.Errorf("%w: forget stale entries: %w", ErrReceiveInternal, err)
+		}
+	}
+	return nil
 }

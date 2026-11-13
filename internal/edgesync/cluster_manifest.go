@@ -14,11 +14,19 @@ import (
 // receipts, which hold none of that spoke's. So on a cluster a receipt whose
 // file is gone cannot tell, by itself, a file the cluster removed (the spoke
 // must not re-send it) from a copy this node lost (it should). The manifest
-// can: receive registers a file before it records the receipt, so every
-// receipt's file was once listed, and a cluster-wide removal is a manifest
-// delete. The manifest is replicated and survives snapshots, so the answer
-// holds after a crash, a restart or a snapshot install, which an in-memory
-// queue of delete events would not.
+// can: the network receive path registers a file before it records the
+// receipt, and a cluster-wide removal is a manifest delete. The manifest is
+// replicated and survives snapshots, so the answer holds after a crash, a
+// restart or a snapshot install, which an in-memory queue of delete events
+// would not.
+//
+// Known trade-offs: a receipt whose file left the manifest for a reason other
+// than an intended removal is marked removed too, so the spoke does not heal
+// it. That covers manifest repair or the reconciliation sweep dropping a
+// lost object, an air-gap import whose batched registration never flushed,
+// and a receipt recorded before the hub joined a cluster. All are narrow
+// (a spoke only reconciles files it has not marked synced), and the admin
+// forget route recovers them.
 type ClusterManifest interface {
 	// Sync brings this node's view of the manifest up to everything the
 	// cluster committed before the call (a Raft barrier), bounded.

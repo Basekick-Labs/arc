@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -18,7 +19,7 @@ type fakeManifest struct {
 }
 
 func (m *fakeManifest) Sync(context.Context) error { m.syncs++; return m.syncErr }
-func (m *fakeManifest) Lists(p string) bool       { return m.listed[p] }
+func (m *fakeManifest) Lists(p string) bool        { return m.listed[p] }
 
 // On a cluster hub a receipt whose file is gone is forgotten only while the
 // manifest still lists the file (a missing local copy: the re-send heals it).
@@ -129,5 +130,42 @@ func TestReceiver_ClusterManifestBlocksResurrection(t *testing.T) {
 	}
 	if res, err := r.Receive(ctx, "rocket-01", other, digest, int64(len(content)), 0, bytes.NewReader(content)); err != nil || res.Outcome != OutcomeCommitted {
 		t.Fatalf("re-receive of a lost local copy = %v %v, want committed", res, err)
+	}
+}
+
+// SettleMissing settles a whole set with one manifest catch-up: the import
+// path's pre-pass, instead of one Raft barrier per bundle entry.
+func TestReceiver_SettleMissingOneSyncForTheSet(t *testing.T) {
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := newTestHubIndex(t)
+	m := &fakeManifest{listed: map[string]bool{}}
+	r, err := NewReceiver(ReceiverConfig{Backend: backend, Index: idx, Manifest: m, Logger: zerolog.Nop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for i := 0; i < 5; i++ {
+		p := fmt.Sprintf("metrics/cpu/2026/01/01/00/f%d.parquet", i)
+		recordFile(t, idx, "rocket-01", p, sha256Hex([]byte(p))) // files absent from storage
+		paths = append(paths, p)
+	}
+	m.listed[NamespacedPath("rocket-01", paths[0])] = true // one lost local copy
+	if err := r.SettleMissing(ctx, "rocket-01", paths); err != nil {
+		t.Fatal(err)
+	}
+	if m.syncs != 1 {
+		t.Fatalf("manifest synced %d times for 5 missing files, want 1", m.syncs)
+	}
+	if _, ok := receiptState(t, idx, "rocket-01", paths[0]); ok {
+		t.Error("the receipt of a lost local copy was kept")
+	}
+	for _, p := range paths[1:] {
+		if hf, ok := receiptState(t, idx, "rocket-01", p); !ok || !hf.Removed {
+			t.Errorf("%s: %+v ok=%v, want marked removed", p, hf, ok)
+		}
 	}
 }
