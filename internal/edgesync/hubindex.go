@@ -455,9 +455,11 @@ func (h *HubIndex) ForgetRemoved(ctx context.Context, spokeID, database string) 
 // receipt over a deleted file, which reconcile then forgets. The spoke
 // re-sends that one file. Re-running the delete removes it again.
 //
-// Known gap, tracked: on a cluster hub these marks run on the node that
-// performs the operation (the writer) while receipts live on the
-// spoke-facing node (#1667).
+// On a cluster hub these marks run on the node that performs the operation
+// (the writer), while receipts live on the node the spoke syncs to. There the
+// cluster manifest stands in (#1667): before reconcile forgets a receipt whose
+// file is gone, it asks the manifest, and a file the manifest no longer lists
+// is marked removed (manifest_removed) instead. See ClusterManifest.
 //
 // Whoever ships phase 3 (delete_after_sync) must decide what a removed
 // receipt means for the spoke's own copy; until then the spoke keeps it.

@@ -46,7 +46,7 @@ POST /api/v1/sync-spokes/{spoke_id}/forget
 
 This is admin-only. The hub forgets the removed receipts under that database, and the spoke sends those files again at its next reconcile. Receipts for content the hub still holds, inside a compacted file, are kept. The call is refused with 409 while files remain under `{spoke}/{database}/` in hot or cold storage, because sending the originals back next to those files would duplicate rows. In practice that makes it the recovery from a whole-database delete. After retention it is refused for as long as newer files remain under the database.
 
-Known limit: on a **cluster** hub the removal is recorded on the writer, but receipts live on the node the spoke syncs to, so it does not take effect there yet ([#1667](https://github.com/Basekick-Labs/arc/issues/1667)). The same applies to the row-level `DELETE` fix below.
+On a **cluster** hub this also holds on the node the spoke syncs to ([#1667](https://github.com/Basekick-Labs/arc/issues/1667)). Before that node forgets a receipt whose file is gone, it checks the cluster's replicated file list. A file the cluster no longer lists was removed cluster-wide, so its receipt is recorded as removed (reason `manifest_removed`) and the spoke does not send the file again. A file the cluster still lists is a local copy that went missing, and the spoke sends it again, as before. If the node cannot catch up with the cluster within 5 s, the spoke's sync attempt fails and it retries later. The same applies to the row-level `DELETE` fix below.
 
 ## Fix: a row-level DELETE on a spoke database no longer brings the deleted rows back ([#1666](https://github.com/Basekick-Labs/arc/issues/1666))
 

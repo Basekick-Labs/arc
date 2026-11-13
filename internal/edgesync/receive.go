@@ -44,6 +44,9 @@ type Receiver struct {
 	backend storage.Backend
 	logger  zerolog.Logger
 
+	// manifest: see ReceiverConfig.Manifest.
+	manifest ClusterManifest
+
 	// index records what the hub holds so reconcile can answer without
 	// reading parquet bytes. Nil disables recording — reconcile then reports
 	// every file as missing, which is safe (the spoke re-sends and gets
@@ -164,6 +167,12 @@ type ReceiverConfig struct {
 	// HoldPath, when set, is held on the final path for the whole receive
 	// (Coordinator.HoldLocalPaths).
 	HoldPath func(path string) (release func())
+
+	// Manifest is the cluster manifest on a cluster hub, nil otherwise
+	// (#1667): a re-sent file whose receipt is not marked, whose file is
+	// gone, and which the manifest no longer lists was removed cluster-wide
+	// and is not accepted again. See ClusterManifest.
+	Manifest ClusterManifest
 }
 
 // NewReceiver validates configuration and returns a ready Receiver.
@@ -174,6 +183,7 @@ func NewReceiver(cfg ReceiverConfig) (*Receiver, error) {
 	return &Receiver{
 		backend:        cfg.Backend,
 		index:          cfg.Index,
+		manifest:       cfg.Manifest,
 		recordActivity: cfg.RecordActivity,
 		// No .Str("component", ...) here: logger.Get already sets it, and a
 		// second one emits a duplicate JSON key that strict parsers and log
@@ -257,6 +267,25 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 		held, err := r.index.Lookup(ctx, spokeID, []string{sourcePath})
 		if err != nil {
 			return nil, fmt.Errorf("%w: receipt lookup %q: %w", ErrReceiveInternal, sourcePath, err)
+		}
+		if hf, ok := held[sourcePath]; ok && !hf.Vouched() && r.manifest != nil {
+			// A cluster hub whose receipt was not marked because the removal
+			// ran on another node (#1667): settle it as reconcile does, so a
+			// stale bundle cannot resurrect content removed cluster-wide.
+			exists, err := r.backend.Exists(ctx, finalPath)
+			if err != nil && !storage.IsStoreNotFound(err) {
+				return nil, fmt.Errorf("%w: stat %q: %w", ErrReceiveInternal, finalPath, err)
+			}
+			if !exists {
+				forget, err := settleStale(ctx, r.index, r.manifest, spokeID, []string{sourcePath})
+				if err != nil {
+					return nil, fmt.Errorf("%w: %w", ErrReceiveInternal, err)
+				}
+				if len(forget) == 0 {
+					hf.Removed = true
+					held[sourcePath] = hf
+				}
+			}
 		}
 		if hf, ok := held[sourcePath]; ok && hf.Vouched() {
 			if hf.SHA256 == declaredSHA256 {

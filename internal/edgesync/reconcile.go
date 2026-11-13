@@ -39,6 +39,7 @@ type Reconciler struct {
 	index      *HubIndex
 	backend    storage.Backend
 	maxEntries int
+	manifest   ClusterManifest
 }
 
 // ReconcilerConfig configures a Reconciler.
@@ -63,6 +64,11 @@ type ReconcilerConfig struct {
 
 	// MaxEntries caps one batch. Zero uses MaxReconcileEntriesDefault.
 	MaxEntries int
+
+	// Manifest is the cluster manifest on a cluster hub, nil otherwise
+	// (#1667). A receipt whose file is gone is forgotten only while the
+	// manifest still lists the file; see ClusterManifest.
+	Manifest ClusterManifest
 }
 
 // NewReconciler validates configuration and returns a ready Reconciler.
@@ -77,7 +83,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if max <= 0 {
 		max = MaxReconcileEntriesDefault
 	}
-	return &Reconciler{index: cfg.Index, backend: cfg.Backend, maxEntries: max}, nil
+	return &Reconciler{index: cfg.Index, backend: cfg.Backend, maxEntries: max, manifest: cfg.Manifest}, nil
 }
 
 // MaxEntries reports the configured per-batch cap, so a handler can reject an
@@ -185,10 +191,21 @@ func (r *Reconciler) ReconcileAllowed(ctx context.Context, spokeID string, entri
 	// reconciling after a retention sweep must not turn into a write storm on
 	// the single writer.
 	if len(stale) > 0 {
-		if err := r.index.ForgetBatch(ctx, spokeID, stale); err != nil {
-			return nil, fmt.Errorf("%w: forget stale entries: %w", ErrReceiveInternal, err)
+		// On a cluster hub, only the receipts whose files the manifest still
+		// lists are forgotten; the others were removed cluster-wide and are
+		// now marked so (#1667). An error forgets nothing: the spoke's
+		// reconcile fails and it retries, which beats re-sending deleted
+		// content.
+		forget, err := settleStale(ctx, r.index, r.manifest, spokeID, stale)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrReceiveInternal, err)
 		}
-		for _, p := range stale {
+		if len(forget) > 0 {
+			if err := r.index.ForgetBatch(ctx, spokeID, forget); err != nil {
+				return nil, fmt.Errorf("%w: forget stale entries: %w", ErrReceiveInternal, err)
+			}
+		}
+		for _, p := range forget {
 			delete(held, p)
 		}
 	}

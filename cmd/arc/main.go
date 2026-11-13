@@ -3197,6 +3197,14 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync hub index; refusing to start")
 		}
+		// #1667: on a cluster hub, removals run on the writer and mark the
+		// writer's receipts, while this node's receipts belong to the spokes
+		// that sync here. The manifest tells a stale receipt removed
+		// cluster-wide from a local copy that is missing.
+		var hubManifest edgesync.ClusterManifest
+		if clusterCoordinator != nil {
+			hubManifest = coordinatorManifest{c: clusterCoordinator}
+		}
 
 		// Spoke secrets are encrypted at rest with the same key MQTT uses for
 		// broker passwords. Encrypted rather than hashed because HMAC
@@ -3284,6 +3292,7 @@ func main() {
 		receiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 			Backend:      storageBackend,
 			Index:        hubIndex,
+			Manifest:     hubManifest,
 			Logger:       logger.Get("edgesync"),
 			RegisterFile: registerFile,
 			HoldPath:     edgeSyncHoldPath(clusterCoordinator),
@@ -3305,6 +3314,7 @@ func main() {
 			Index:      hubIndex,
 			Backend:    storageBackend,
 			MaxEntries: cfg.EdgeSync.MaxReconcileEntries,
+			Manifest:   hubManifest,
 		})
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync reconciler; refusing to start")
@@ -3417,6 +3427,7 @@ func main() {
 			importReceiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 				Backend:      storageBackend,
 				Index:        hubIndex,
+				Manifest:     hubManifest,
 				Logger:       importLogger,
 				RegisterFile: collector.Register,
 				HoldPath:     edgeSyncHoldPath(clusterCoordinator),
@@ -5920,6 +5931,22 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 	return db, true, nil
+}
+
+// coordinatorManifest adapts the cluster coordinator to edgesync.ClusterManifest
+// (#1667). The catch-up is bounded short: it runs inside a spoke's reconcile
+// or upload request, and a failure only makes the spoke retry.
+type coordinatorManifest struct{ c *cluster.Coordinator }
+
+const hubManifestSyncTimeout = 5 * time.Second
+
+func (m coordinatorManifest) Sync(ctx context.Context) error {
+	return m.c.SyncManifestWithin(ctx, hubManifestSyncTimeout)
+}
+
+func (m coordinatorManifest) Lists(path string) bool {
+	_, ok := m.c.GetFileEntry(path)
+	return ok
 }
 
 // hubRemovalMarkerFor returns a marker that records hub-side removal of
