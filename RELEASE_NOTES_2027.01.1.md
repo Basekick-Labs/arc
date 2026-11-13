@@ -3246,7 +3246,8 @@ Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [
 The Flight SQL listener accepts a `Handshake` that carries the Arc token as
 `authorization: Bearer <token>`, and answers it with the same header. The
 Arrow Flight SQL JDBC driver opens the connection that way when given its
-`token` property (`jdbc:arrow-flight-sql://host:50051?token=<token>`), and
+`token` property (`jdbc:arrow-flight-sql://host:50051?token=<token>`, with
+the token's trailing `=` written as `%3D`), and
 every such connection failed with `UNAUTHENTICATED: only Basic Auth
 implemented`: only a Basic handshake, with the token as the password, was
 accepted. An unknown token is refused with `invalid Arc token`, as on any

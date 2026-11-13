@@ -54,6 +54,11 @@ With the Arrow Flight SQL JDBC driver, for example:
 jdbc:arrow-flight-sql://localhost:50051?useEncryption=false&token=<token>
 ```
 
+An Arc token ends in `=`, which driver 19.0.0 does not accept inside a URL
+value: write it as `%3D`, or pass `token` (or `password`) as a connection
+property instead of in the URL. Left as `=`, the connection is refused with
+`must authenticate first` (`token`) or `invalid Arc token` (`password`).
+
 The driver turns TLS on unless `useEncryption=false` is set, so leave it out
 when `server.tls_enabled = true`. Prepared statements are not implemented yet,
 so the JDBC driver can connect and browse catalogs and tables but cannot run
@@ -103,10 +108,7 @@ reports `supportsOuterJoins()` as `true` but `supportsFullOuterJoins()` as
 `false`; full outer joins work.
 
 A request for IDs Arc has no value for is answered with the ones it has; the
-rest are left out rather than failing the call. With the JDBC driver, pass
-the Arc token as the password (the user name is not checked): the driver's
-`token` property opens the connection with a bearer-token handshake, which the
-listener does not accept.
+rest are left out rather than failing the call.
 
 ## Logging, audit and shutdown
 
