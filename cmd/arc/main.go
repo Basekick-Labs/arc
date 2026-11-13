@@ -3461,6 +3461,7 @@ func main() {
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create the bundle import handler; refusing to start")
 			}
+			importHandler.SetTimeout(cfg.EdgeSync.Import.Timeout)
 			importHandler.RegisterRoutes(server.GetApp())
 
 			importLogger.Info().
@@ -3715,6 +3716,7 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke handler; refusing to start")
 		}
+		spokeHandler.SetTimeouts(cfg.EdgeSync.Spoke.SyncTimeout, cfg.EdgeSync.Spoke.Bundle.Timeout)
 		spokeHandler.RegisterRoutes(server.GetApp())
 
 		// Automatic spoke sync is the paid scheduling phase of edge sync. The
@@ -5649,6 +5651,7 @@ func main() {
 			TLSEnabled:  cfg.Server.TLSEnabled,
 			TLSCertFile: cfg.Server.TLSCertFile,
 			TLSKeyFile:  cfg.Server.TLSKeyFile,
+			Version:     Version,
 			Middleware:  flightSQLMiddleware,
 		}, logger.Get("flight-sql"))
 		if err != nil {

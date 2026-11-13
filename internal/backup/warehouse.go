@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/basekick-labs/arc/internal/iceberg"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -61,7 +62,7 @@ func (m *Manager) configureIcebergWarehouse(cfg *ManagerConfig) {
 		}
 		if pathWithin(root, wh) {
 			m.logger.Warn().Str("warehouse", wh).Str("storage_root", root).
-				Msg("Iceberg warehouse contains the storage root; only its " + m.icebergNSPrefix + "_*.db namespace directories are backed up from it")
+				Msg("Iceberg warehouse contains the storage root; only its namespace directories (" + m.icebergNSPrefix + "_*.db and their encoded form) are backed up from it")
 		}
 	}
 	// Containment against the backup destination is a question only a LOCAL
@@ -73,7 +74,7 @@ func (m *Manager) configureIcebergWarehouse(cfg *ManagerConfig) {
 	// resolves to the WORKING DIRECTORY, which contains almost everything.
 	if bp := localDestinationPath(cfg); bp != "" && pathWithin(bp, wh) {
 		m.logger.Warn().Str("warehouse", wh).Str("backup_path", bp).
-			Msg("Iceberg warehouse contains the backup directory; only its " + m.icebergNSPrefix + "_*.db namespace directories are backed up from it")
+			Msg("Iceberg warehouse contains the backup directory; only its namespace directories (" + m.icebergNSPrefix + "_*.db and their encoded form) are backed up from it")
 	}
 	m.icebergWarehouse = wh
 	m.icebergWarehouseConfigured = filepath.Clean(cfg.IcebergWarehousePath)
@@ -134,7 +135,8 @@ func pathWithin(p, dir string) bool { return storage.PathWithin(p, dir) }
 
 // listIcebergWarehouseFiles walks the outside-root warehouse and returns the
 // exporter's table metadata files. The walk is scoped to the exporter's own
-// layout — <prefix>_<db>.db/<table>/metadata/<file> — and nothing else: a
+// layout — <namespace>.db/<table>/metadata/<file>, where <namespace>.db is
+// <prefix>_<db>.db or its JSON-encoded spelling — and nothing else: a
 // warehouse that contains the storage root or the backup directory would
 // otherwise sweep every earlier backup's SQLite snapshot (backups/<id>/metadata/)
 // and any measurement that happens to be named "metadata" into the copy.
@@ -198,11 +200,16 @@ func (m *Manager) walkIcebergWarehouse(keep func(nsDir string) bool) ([]warehous
 			return nil
 		}
 		switch depth {
-		case 1: // namespace directory: <prefix>_<db>.db
+		case 1: // namespace directory: <prefix>_<db>.db, or the encoded spelling
 			if !d.IsDir() {
 				return nil
 			}
-			if !strings.HasPrefix(name, m.icebergNSPrefix+"_") || !strings.HasSuffix(name, ".db") {
+			// The exporter's own rule, which also recognises the JSON-encoded
+			// directory iceberg-go writes for a namespace with a dotted
+			// component -- an edge-sync spoke whose id has a dot (#1129).
+			// A "<prefix>_" test here skipped those, so an unscoped backup
+			// carried their catalog rows and none of their metadata (#1202).
+			if !iceberg.IsWarehouseNamespaceDir(name, m.icebergNSPrefix) {
 				return fs.SkipDir
 			}
 			if keep != nil && !keep(name) {
@@ -246,18 +253,46 @@ func (m *Manager) walkIcebergWarehouse(keep func(nsDir string) bool) ([]warehous
 
 // countExcludedIcebergNamespaces records, for a scoped backup (#1084), how
 // much Iceberg table metadata of the scoped databases it left out and where it
-// is: the namespace directory <prefix>_<db>.db of each scoped database, found
-// under the storage root (at the root itself or under the configured
-// subdirectory, through icebergWarehouseKeyPrefix) with one prefix listing
-// per database, or in the outside-root warehouse with the scoped walk. The
+// is: every namespace directory a scoped name owns (scope.ownsIcebergNamespaceDir
+// -- a plain database's <prefix>_<db>.db, and each of an edge-sync spoke's
+// per-database directories, #1202), found under the storage root (at the root
+// itself or under the configured subdirectory, through
+// icebergWarehouseKeyPrefix) from one directory listing plus one prefix
+// listing per owned directory, or in the outside-root warehouse with the
+// scoped walk. The
 // in-root listing is of the data store and fails the run like the data
 // listing would; the outside-root walk only counts, so a warehouse that
 // cannot be read is logged and the count left at zero, consistent with the
 // downgraded preflight. Only called when Iceberg export is on.
 func (m *Manager) countExcludedIcebergNamespaces(ctx context.Context, lister storage.ObjectLister, sc *scope, manifest *Manifest) error {
 	if m.icebergWarehouse == "" {
-		for _, name := range sc.names {
-			dir := m.icebergWarehouseKeyPrefix + icebergNamespaceDir(m.icebergNSPrefix, name)
+		// The scoped names cannot be turned into directory names: a spoke
+		// has one namespace directory per inner database (#1202). So list
+		// the warehouse's top level once and keep what the scope owns.
+		// The in-root case is local-only (configureIcebergWarehouse sets it
+		// for a LocalBackend), and LocalBackend is a DirectoryLister. Its
+		// listing drops a name the key rules refuse, so a namespace
+		// directory too long to be a key is not counted here; the data
+		// listing reports it as unaddressable instead.
+		dl, ok := lister.(storage.DirectoryLister)
+		if !ok {
+			// Unreachable with a real backend; a test fake that embeds
+			// storage.Backend lands here. Only a count is lost, as for the
+			// unreadable outside-root warehouse below.
+			m.logger.Warn().Str("warehouse_prefix", m.icebergWarehouseKeyPrefix).
+				Msg("Could not count the Iceberg namespace metadata this scoped backup leaves out: the data storage cannot list directories")
+			return nil
+		}
+		dirs, err := dl.ListDirectories(ctx, m.icebergWarehouseKeyPrefix)
+		if err != nil {
+			return fmt.Errorf("failed to list the Iceberg warehouse directories under %q: %w", m.icebergWarehouseKeyPrefix, err)
+		}
+		sort.Strings(dirs)
+		for _, d := range dirs {
+			if !sc.ownsIcebergNamespaceDir(d, m.icebergNSPrefix) {
+				continue
+			}
+			dir := m.icebergWarehouseKeyPrefix + d
 			objs, err := lister.ListObjects(ctx, dir+"/")
 			if err != nil {
 				return fmt.Errorf("failed to list the Iceberg namespace directory %s: %w", dir, err)

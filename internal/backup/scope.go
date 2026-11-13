@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/basekick-labs/arc/internal/iceberg"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -180,20 +181,18 @@ func (sc *scope) ownsPath(path string) bool {
 	return sc.has(first)
 }
 
-// icebergNamespaceDir is the Iceberg exporter's namespace directory for a
-// database: <nsPrefix>_<db>.db.
-func icebergNamespaceDir(nsPrefix, database string) string {
-	return nsPrefix + "_" + database + ".db"
-}
-
-// ownsIcebergNamespaceDir reports whether a depth-1 warehouse directory is the
-// Iceberg namespace of one of the scoped databases.
+// ownsIcebergNamespaceDir reports whether a depth-1 warehouse directory is an
+// Iceberg namespace of one of the scoped names. The rule is the exporter's
+// (iceberg.NamespaceDirOwnedBy), not a copy of it: a scope name is a storage-
+// root segment, and for an edge-sync spoke that one segment maps to one
+// namespace directory per inner database, none of them "<prefix>_<spoke>.db"
+// (#1202).
 func (sc *scope) ownsIcebergNamespaceDir(dir, nsPrefix string) bool {
 	if sc.empty() {
 		return true
 	}
 	for _, name := range sc.names {
-		if dir == icebergNamespaceDir(nsPrefix, name) {
+		if iceberg.NamespaceDirOwnedBy(dir, nsPrefix, name) {
 			return true
 		}
 	}

@@ -2,6 +2,13 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: backups find the Iceberg metadata of edge-sync spoke databases ([#1202](https://github.com/Basekick-Labs/arc/issues/1202))
+
+Two fixes in how a backup recognises the Iceberg exporter's namespace directories.
+
+- **Unscoped backups, warehouse outside the storage root.** The Iceberg table metadata of an edge-sync spoke whose id contains a dot is now backed up. iceberg-go stores such a namespace under a JSON-encoded directory name (`__iceberg_namespace_v1__:[...].db`), and the backup only walked directories starting with `<prefix>_`. Such a backup carried the catalog rows for those tables but not the metadata they point at. A warehouse under the storage root was not affected, because the data listing covers it. If one of these directory names is too long to store as a backup key, the backup now fails and names it. Before, it left those tables out without saying so. This is the same rule as for any other warehouse file.
+- **Scoped backups.** A backup scoped to an edge-sync spoke now reports the spoke's Iceberg metadata that it leaves out (`iceberg_namespace_files_excluded`, `iceberg_namespaces_excluded`, and the log line that says to take an unscoped backup for the Iceberg tables). Before, it always reported zero. A spoke has one namespace directory per database (`arc_<spoke>.<db>.db`, or the encoded form), and the backup looked for a single `arc_<spoke>.db` that never exists. What a scoped backup copies has not changed: it never copied the warehouse. A directory name that could belong to either of two scoped names (`arc_a.b.db`: spoke `a`'s database `b`, or a name `a.b`) is reported as left out by whichever is in scope. As before, the count is made only when the warehouse is on local storage.
+
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
 Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table, on nodes where governance is off too, is kept equal to it as a backup and is never read again.
@@ -131,6 +138,23 @@ cancelled. The HTTP drain fails the shutdown (exit 1) only when a request
 waits on neither its query nor its connection. Below a
 `server.shutdown_timeout` of 2 s the drain's last stages can still run into
 the share kept for the WAL close.
+
+## New: configurable bounds for migrations, manual edge syncs and bundle transfers ([#1112](https://github.com/Basekick-Labs/arc/issues/1112))
+
+Four long-running operations had a hardcoded time limit. Each now has a setting. The defaults are the old values, so nothing changes unless you set one.
+
+| Setting | Bounds | Default |
+|---|---|---|
+| `tiered_storage.migration_timeout` | one migration cycle, scheduled or `POST /api/v1/tiering/migrate` | `2h` |
+| `edge_sync.spoke.sync_timeout` | one manual sync pass, `POST /api/v1/spoke-sync/run` | `2h` |
+| `edge_sync.spoke.bundle.timeout` | one air-gap export, `POST /api/v1/spoke-sync/export` | `2h` |
+| `edge_sync.import.timeout` | one air-gap import on the hub, `POST /api/v1/bundle-import` | `4h` |
+
+Each takes a Go duration (`45m`, `6h`). A value that does not parse, or that is zero or negative, stops Arc at startup with an error that names the setting and the value. All four are checked even when the feature is off, as `backup.operation_timeout` is.
+
+- Raise `migration_timeout` for a first cold-tier migration of a large dataset. Lower it to make a stuck migration give up and alert sooner.
+- The scan at the start of each migration cycle runs inside the cycle's limit. A `migration_timeout` shorter than `tiered_storage.scan_timeout` therefore cuts that scan short too. Arc logs a warning at startup when you configure that.
+- Closing the HTTP connection does not stop a manual sync, export or import. Only these settings, or shutting the server down, do.
 
 ## Fix: forwarded requests no longer read freed request state ([#1629](https://github.com/Basekick-Labs/arc/issues/1629))
 
@@ -3206,8 +3230,8 @@ tables for ADBC clients. Results stopped at a governance row cap end with a
 Flight queries are audited and logged like HTTP queries, with the client's
 address. Metadata calls run one query per database, plus one per measurement
 when schemas are requested, and count against governance limits. Prepared
-statements and SqlInfo are not implemented yet, so JDBC-based BI tools are not
-expected to work; the ADBC drivers are the tested clients. See
+statements are not implemented yet, so JDBC-based BI tools cannot run queries;
+the ADBC drivers are the tested clients. See
 `docs/operations/flight-sql.md`.
 
 Both Helm charts can turn it on: `flightSql.enabled` (default `false`),
@@ -3218,6 +3242,28 @@ are not given the listener. A port that collides with one of Arc's is refused
 when the chart renders.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https://github.com/Basekick-Labs/arc/pull/1419).
+
+### Flight SQL answers SqlInfo ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener answers `GetSqlInfo` with the server name (`Arc`), the
+Arc and Arrow versions, that it is read-only and takes SQL but not Substrait,
+transactions, cancellation, bulk ingestion or DDL, the identifier quote (`"`),
+the metadata search-pattern escape (`\`), the catalog term (`database`), and
+the query grammar it supports: column and table aliases, `GROUP BY`, `UNION`
+and `UNION ALL`, full outer joins, subqueries (correlated too), expressions and
+unrelated columns in `ORDER BY`, and `LIKE ... ESCAPE`. The JDBC driver reads a
+value the server leaves out as `false`, so without these it would report that
+Arc has no `GROUP BY`, `UNION`, joins or subqueries.
+Before, every SqlInfo request failed with `NotFound`: ADBC's `GetInfo` failed
+with it (`adbc_get_info()` in Python), and with the Arrow Flight SQL JDBC driver
+every `DatabaseMetaData` call that reads SqlInfo threw, such as
+`getDatabaseProductName()` and `getIdentifierQuoteString()`. A request that
+includes IDs Arc has no value for, as ADBC's does for the Substrait version
+range, is answered with the rest. Queries through the JDBC driver still need
+prepared statements, which are not implemented yet. See
+`docs/operations/flight-sql.md`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.
 
 ### Prometheus Remote Write 1.0 ingestion (#1383)
 

@@ -248,6 +248,13 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 	if cfg.Config == nil {
 		return nil, fmt.Errorf("configuration is required")
 	}
+	if mt, st := cfg.Config.MigrationTimeout, cfg.Config.ScanTimeout; mt > 0 && st > mt {
+		// The pre-migration scan runs inside the cycle's context, so it gets
+		// the shorter of the two. Not an error: an operator may want a short
+		// cycle and accept that the in-cycle scan is cut (#1112).
+		logger.Warn().Dur("migration_timeout", mt).Dur("scan_timeout", st).
+			Msg("tiered_storage.migration_timeout is shorter than scan_timeout: the scan inside each migration cycle is cut at migration_timeout, and a scan that never finishes never retires stale hot rows")
+	}
 
 	// Validate license
 	if cfg.LicenseClient == nil {
@@ -1114,6 +1121,21 @@ func (m *Manager) scanBudget() time.Duration {
 // the manager rather than plumbed through a constructor so a hand-built handler
 // cannot carry a zero.
 func (m *Manager) ScanBudget() time.Duration { return m.scanBudget() }
+
+// defaultMigrationTimeout is the budget for one migration cycle when no
+// configuration supplies one, matching the tiered_storage.migration_timeout
+// default for the same reason defaultScanTimeout matches scan_timeout's.
+const defaultMigrationTimeout = 2 * time.Hour
+
+// MigrationBudget is how long one migration cycle may take, scheduled or
+// triggered through the API (#1112). Read through here, never off the config
+// struct, for the reason scanBudget gives; nil-safe for the same reason.
+func (m *Manager) MigrationBudget() time.Duration {
+	if m != nil && m.config != nil && m.config.MigrationTimeout > 0 {
+		return m.config.MigrationTimeout
+	}
+	return defaultMigrationTimeout
+}
 
 // recordScan stores a COPY of the result. The caller keeps the pointer it
 // passed and hands it to HTTP responses and callbacks; storing that pointer
