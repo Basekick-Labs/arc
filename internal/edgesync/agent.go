@@ -67,6 +67,7 @@ type Agent struct {
 	// query-cache invalidation). verifyUnsupportedUntil caches an older hub's
 	// answer to the side-effect-free probe.
 	deleteDelay            time.Duration
+	acceptCompacted        bool
 	deleteLocal            LocalDeleter
 	afterDeletes           func()
 	verifyUnsupportedUntil time.Time
@@ -87,6 +88,12 @@ type LocalDeleter func(ctx context.Context, path string, wantSize int64) error
 // is verified again: a hub that could not prove it held the content may later
 // (3b: verifiable compacted content), and a daily recheck bounds the cost.
 const verifyRecheck = 24 * time.Hour
+
+// SetDeleteAfterSyncAcceptCompacted lets delete_after_sync also delete files
+// the hub holds only inside a compacted file or a cold copy (#1683). Hub
+// compaction transforms rows (drops exact duplicates, widens mixed types,
+// nulls unparseable times), so this trades the spoke's exact copy for space.
+func (a *Agent) SetDeleteAfterSyncAcceptCompacted(accept bool) { a.acceptCompacted = accept }
 
 // SetDeleteAfterSync turns on delete_after_sync: after the pending loop, each
 // pass verifies synced rows at least delay old against the hub and deletes the
@@ -438,9 +445,23 @@ func (a *Agent) applyVerify(ctx context.Context, rows []*LedgerEntry, ans *Verif
 		}
 		held[p] = true
 	}
+	compactedHeld := make(map[string]bool, len(ans.HeldCompacted))
+	for _, p := range ans.HeldCompacted {
+		if _, asked := byPath[p]; !asked {
+			return 0, fmt.Errorf("edgesync: verify answered held_compacted for %q, which was not asked", p)
+		}
+		if held[p] {
+			return 0, fmt.Errorf("edgesync: verify answered %q both held and held_compacted", p)
+		}
+		compactedHeld[p] = true
+		if a.acceptCompacted {
+			held[p] = true
+		}
+		// Otherwise kept: the default case below records it.
+	}
 	missing := make(map[string]bool, len(ans.Missing))
 	for _, p := range ans.Missing {
-		if held[p] {
+		if held[p] || compactedHeld[p] {
 			return 0, fmt.Errorf("edgesync: verify answered %q both held and missing", p)
 		}
 		missing[p] = true

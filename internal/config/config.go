@@ -503,6 +503,13 @@ type EdgeSyncSpokeConfig struct {
 	// on the next pass, which is still a separate round trip.
 	DeleteAfterSyncDelay time.Duration
 
+	// DeleteAfterSyncAcceptCompacted lets delete_after_sync also delete files
+	// the hub holds only inside a compacted file or a cold copy (#1683).
+	// Default false: hub compaction drops exact duplicate rows, widens mixed
+	// BIGINT/DOUBLE columns to DOUBLE and turns unparseable times into NULL,
+	// so the spoke's copy is the only exact one.
+	DeleteAfterSyncAcceptCompacted bool
+
 	// Bundle configures air-gap export.
 	Bundle EdgeSyncBundleConfig
 }
@@ -1314,22 +1321,23 @@ func Load() (*Config, error) {
 				Timeout:     hubImportTimeout,
 			},
 			Spoke: EdgeSyncSpokeConfig{
-				Enabled:                    v.GetBool("edge_sync.spoke.enabled"),
-				SyncInterval:               v.GetDuration("edge_sync.spoke.sync_interval"),
-				SyncRetryInterval:          v.GetDuration("edge_sync.spoke.sync_retry_interval"),
-				SyncTimeout:                spokeSyncTimeout,
-				DeleteAfterSync:            v.GetBool("edge_sync.spoke.delete_after_sync"),
-				DeleteAfterSyncDelay:       deleteAfterSyncDelay,
-				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
-				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
-				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
-				Secret:                     os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
-				HubToken:                   os.Getenv("ARC_EDGE_SYNC_HUB_TOKEN"),
-				MaxAttempts:                v.GetInt("edge_sync.spoke.max_attempts"),
-				MaxConcurrent:              v.GetInt("edge_sync.spoke.max_concurrent"),
-				BatchSize:                  v.GetInt("edge_sync.spoke.batch_size"),
-				LedgerRetentionDays:        v.GetInt("edge_sync.spoke.ledger_retention_days"),
-				DeferCompactionUntilSynced: v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
+				Enabled:                        v.GetBool("edge_sync.spoke.enabled"),
+				SyncInterval:                   v.GetDuration("edge_sync.spoke.sync_interval"),
+				SyncRetryInterval:              v.GetDuration("edge_sync.spoke.sync_retry_interval"),
+				SyncTimeout:                    spokeSyncTimeout,
+				DeleteAfterSync:                v.GetBool("edge_sync.spoke.delete_after_sync"),
+				DeleteAfterSyncDelay:           deleteAfterSyncDelay,
+				DeleteAfterSyncAcceptCompacted: v.GetBool("edge_sync.spoke.delete_after_sync_accept_compacted"),
+				HubURL:                         v.GetString("edge_sync.spoke.hub_url"),
+				SpokeID:                        v.GetString("edge_sync.spoke.spoke_id"),
+				HubID:                          v.GetString("edge_sync.spoke.hub_id"),
+				Secret:                         os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
+				HubToken:                       os.Getenv("ARC_EDGE_SYNC_HUB_TOKEN"),
+				MaxAttempts:                    v.GetInt("edge_sync.spoke.max_attempts"),
+				MaxConcurrent:                  v.GetInt("edge_sync.spoke.max_concurrent"),
+				BatchSize:                      v.GetInt("edge_sync.spoke.batch_size"),
+				LedgerRetentionDays:            v.GetInt("edge_sync.spoke.ledger_retention_days"),
+				DeferCompactionUntilSynced:     v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
 				Bundle: EdgeSyncBundleConfig{
 					Enabled:     v.GetBool("edge_sync.spoke.bundle.enabled"),
 					AllowedDirs: parseAllowedDirs(v.Get("edge_sync.spoke.bundle.allowed_dirs")),
@@ -2417,6 +2425,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.sync_timeout", "2h") // one manual sync pass
 	v.SetDefault("edge_sync.spoke.delete_after_sync", false)
 	v.SetDefault("edge_sync.spoke.delete_after_sync_delay", "0s")
+	v.SetDefault("edge_sync.spoke.delete_after_sync_accept_compacted", false)
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")

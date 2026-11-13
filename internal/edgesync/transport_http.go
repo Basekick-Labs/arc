@@ -125,7 +125,7 @@ func (t *HTTPTransport) Verify(ctx context.Context, hubID string, synced []*Ledg
 	if err != nil {
 		return nil, err
 	}
-	return &VerifyAnswer{Held: out.Held, Missing: out.Missing, HeldKnown: out.Held != nil}, nil
+	return &VerifyAnswer{Held: out.Held, Missing: out.Missing, HeldKnown: out.Held != nil, HeldCompacted: out.HeldCompacted}, nil
 }
 
 // reconcileWire is a reconcile or verify response as decoded. Held is nil
@@ -135,6 +135,8 @@ type reconcileWire struct {
 	Present   []string   `json:"present"`
 	Conflicts []Conflict `json:"conflicts"`
 	Held      []string   `json:"held"`
+	// HeldCompacted is nil from a hub that predates #1683.
+	HeldCompacted []string `json:"held_compacted"`
 }
 
 func (t *HTTPTransport) reconcileRequest(ctx context.Context, hubID string, pending []*LedgerEntry, verify bool) (*reconcileWire, error) {

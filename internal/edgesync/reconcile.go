@@ -40,6 +40,7 @@ type Reconciler struct {
 	backend    storage.Backend
 	maxEntries int
 	manifest   ClusterManifest
+	coldExists func(ctx context.Context, path string) (bool, error)
 }
 
 // ReconcilerConfig configures a Reconciler.
@@ -69,6 +70,11 @@ type ReconcilerConfig struct {
 	// (#1667). A receipt whose file is gone is forgotten only while the
 	// manifest still lists the file; see ClusterManifest.
 	Manifest ClusterManifest
+
+	// ColdExists reports whether the hub's cold tier holds a path, for a
+	// verify of a compacted receipt whose holder migrated (#1683). Nil when
+	// the hub has no cold tier.
+	ColdExists func(ctx context.Context, path string) (bool, error)
 }
 
 // NewReconciler validates configuration and returns a ready Reconciler.
@@ -83,7 +89,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if max <= 0 {
 		max = MaxReconcileEntriesDefault
 	}
-	return &Reconciler{index: cfg.Index, backend: cfg.Backend, maxEntries: max, manifest: cfg.Manifest}, nil
+	return &Reconciler{index: cfg.Index, backend: cfg.Backend, maxEntries: max, manifest: cfg.Manifest, coldExists: cfg.ColdExists}, nil
 }
 
 // MaxEntries reports the configured per-batch cap, so a handler can reject an

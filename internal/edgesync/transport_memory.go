@@ -56,6 +56,9 @@ type MemoryTransport struct {
 	// unheld are paths Verify must not report held although stored, keyed
 	// like scripts: a hub receipt that is compacted or removed.
 	unheld map[string]bool
+	// heldCompacted are paths Verify reports in HeldCompacted instead of
+	// Held: a compacted receipt whose holder exists (#1683).
+	heldCompacted map[string]bool
 
 	// NoVerify makes Verify answer like a hub that predates verification.
 	NoVerify bool
@@ -143,6 +146,16 @@ func (m *MemoryTransport) MarkUnheld(hubID, path string) {
 	m.unheld[scriptKey(hubID, path)] = true
 }
 
+// MarkHeldCompacted makes Verify report a stored path in HeldCompacted.
+func (m *MemoryTransport) MarkHeldCompacted(hubID, path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.heldCompacted == nil {
+		m.heldCompacted = make(map[string]bool)
+	}
+	m.heldCompacted[scriptKey(hubID, path)] = true
+}
+
 // Forget removes a stored path, as the hub's admin forget route does to a
 // receipt.
 func (m *MemoryTransport) Forget(hubID, path string) {
@@ -175,12 +188,14 @@ func (m *MemoryTransport) Verify(ctx context.Context, hubID string, synced []*Le
 		return &VerifyAnswer{}, nil
 	}
 	hub := m.hubLocked(hubID)
-	ans := &VerifyAnswer{Held: []string{}, Missing: []string{}, HeldKnown: true}
+	ans := &VerifyAnswer{Held: []string{}, Missing: []string{}, HeldKnown: true, HeldCompacted: []string{}}
 	for _, e := range synced {
 		f, ok := hub[e.Path]
 		switch {
 		case !ok:
 			ans.Missing = append(ans.Missing, e.Path)
+		case f.sha256 == e.SHA256 && m.heldCompacted[scriptKey(hubID, e.Path)]:
+			ans.HeldCompacted = append(ans.HeldCompacted, e.Path)
 		case f.sha256 == e.SHA256 && !m.unheld[scriptKey(hubID, e.Path)]:
 			ans.Held = append(ans.Held, e.Path)
 		}
