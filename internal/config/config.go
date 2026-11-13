@@ -1277,7 +1277,7 @@ func Load() (*Config, error) {
 			CompactReceivedNamespaces: v.GetBool("edge_sync.compact_received_namespaces"),
 			Import: EdgeSyncImportConfig{
 				Enabled:     v.GetBool("edge_sync.import.enabled"),
-				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
+				AllowedDirs: parseAllowedDirs(v.Get("edge_sync.import.allowed_dirs")),
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
 				Timeout:     hubImportTimeout,
 			},
@@ -1298,7 +1298,7 @@ func Load() (*Config, error) {
 				DeferCompactionUntilSynced: v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
 				Bundle: EdgeSyncBundleConfig{
 					Enabled:     v.GetBool("edge_sync.spoke.bundle.enabled"),
-					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
+					AllowedDirs: parseAllowedDirs(v.Get("edge_sync.spoke.bundle.allowed_dirs")),
 					MaxFiles:    v.GetInt("edge_sync.spoke.bundle.max_files"),
 					MaxBytes:    v.GetInt64("edge_sync.spoke.bundle.max_bytes"),
 					Timeout:     spokeBundleTimeout,
@@ -2736,6 +2736,21 @@ func parseStringSlice(s string) []string {
 		}
 	}
 	return result
+}
+
+// parseAllowedDirs reads edge_sync.import.allowed_dirs and
+// edge_sync.spoke.bundle.allowed_dirs (#1680): a TOML array keeps each path
+// whole, and a string, from arc.toml or the environment, is split on commas
+// only, never on whitespace.
+//
+// It was v.GetStringSlice, which splits a string on whitespace, so
+// ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS="/Volumes/Air Gap" became two allow-list
+// entries, "/Volumes/Air" and "Gap", and the second was then resolved against
+// the working directory by edgesync.NewDestinationPolicy (resolveDir accepts a
+// missing leaf), silently admitting a directory nobody named while refusing
+// the one they did. A path containing a comma needs the array spelling.
+func parseAllowedDirs(value any) []string {
+	return parseTargetDatabases(value)
 }
 
 // EffectiveCores reports how many CPUs this process may actually use.
