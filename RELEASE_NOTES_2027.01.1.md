@@ -46,10 +46,18 @@ POST /api/v1/sync-spokes/{spoke_id}/forget
 
 This is admin-only. The hub forgets the removed receipts under that database, and the spoke sends those files again at its next reconcile. Receipts for content the hub still holds, inside a compacted file, are kept. The call is refused with 409 while files remain under `{spoke}/{database}/` in hot or cold storage, because sending the originals back next to those files would duplicate rows. In practice that makes it the recovery from a whole-database delete. After retention it is refused for as long as newer files remain under the database.
 
-Known limits:
+Known limit: on a **cluster** hub the removal is recorded on the writer, but receipts live on the node the spoke syncs to, so it does not take effect there yet ([#1667](https://github.com/Basekick-Labs/arc/issues/1667)). The same applies to the row-level `DELETE` fix below.
 
-- On a **cluster** hub the removal is recorded on the writer, but receipts live on the node the spoke syncs to, so the removal does not take effect there yet ([#1667](https://github.com/Basekick-Labs/arc/issues/1667)).
-- A **row-level** `DELETE` on a spoke namespace is not covered yet ([#1666](https://github.com/Basekick-Labs/arc/issues/1666)).
+## Fix: a row-level DELETE on a spoke database no longer brings the deleted rows back ([#1666](https://github.com/Basekick-Labs/arc/issues/1666))
+
+On an edge-sync hub, `DELETE` with a `WHERE` clause on a spoke's data either rewrites a file without the matching rows, under a new name, or removes the file when every row matches. Neither updated the sync receipt for the original file. At the next reconcile the hub saw that file gone, and the spoke sent the original again: the deleted rows came back, and after a rewrite the surviving rows were stored twice.
+
+The hub now updates the receipt before it changes the file:
+
+- After a rewrite, the original is recorded as merged into the new file.
+- After a full removal, it is recorded as removed (reason `row_delete`).
+
+Either way the spoke does not send the original again. This also covers cold-tier files whose rows all match.
 
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 

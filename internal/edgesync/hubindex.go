@@ -269,6 +269,7 @@ func (h *HubIndex) MarkCompacted(ctx context.Context, spokeID string, sourcePath
 const (
 	RemovedByOperatorDelete = "operator_delete"
 	RemovedByRetention      = "retention"
+	RemovedByRowDelete      = "row_delete"
 )
 
 // hasReceipts reports whether the spoke has any receipt, from the
@@ -431,11 +432,14 @@ func (h *HubIndex) ForgetRemoved(ctx context.Context, spokeID, database string) 
 // Which mark a hub-side path writes is the contract, so keep it:
 //
 //   - Content preserved elsewhere on the hub: MarkCompacted. Hub compaction of
-//     spoke namespaces (#619) and tiering's hot->cold migration (#687). Do not
-//     "fix" these to Forget: the spoke would re-send and duplicate rows.
+//     spoke namespaces (#619), tiering's hot->cold migration (#687), and a
+//     row-level DELETE that rewrites a file without the matching rows, whose
+//     survivors live in the new file (#1666). Do not "fix" these to Forget:
+//     the spoke would re-send and duplicate rows.
 //   - Content removed on purpose: MarkRemoved / MarkSpokeRemoved (#1186). A
-//     confirmed database delete of a spoke namespace and retention, hot and
-//     cold, in every configuration. Reconcile keeps answering "present", so
+//     confirmed database delete of a spoke namespace, retention, hot and
+//     cold, and a row-level DELETE whose rows all match (row_delete), in every
+//     configuration. Reconcile keeps answering "present", so
 //     the delete sticks; the explicit recovery is ForgetRemoved, behind
 //     POST /api/v1/sync-spokes/:spokeID/forget.
 //
@@ -444,9 +448,9 @@ func (h *HubIndex) ForgetRemoved(ctx context.Context, spokeID, database string) 
 // receipt over a deleted file, which reconcile then forgets. The spoke
 // re-sends that one file. Re-running the delete removes it again.
 //
-// Known gaps, tracked: the row-level delete API rewrites or removes spoke
-// files without any mark (#1666), and on a cluster hub the removal marks run
-// on the writer while receipts live on the spoke-facing node (#1667).
+// Known gap, tracked: on a cluster hub these marks run on the node that
+// performs the operation (the writer) while receipts live on the
+// spoke-facing node (#1667).
 //
 // Whoever ships phase 3 (delete_after_sync) must decide what a removed
 // receipt means for the spoke's own copy; until then the spoke keeps it.

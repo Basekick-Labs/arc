@@ -170,11 +170,16 @@ type DeleteHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// files were removed or rewritten: see SetOnFilesRemoved.
 	onFilesRemoved func()
-	db             *database.DuckDB
-	storage        storage.Backend
-	config         *config.DeleteConfig
-	authManager    *auth.AuthManager
-	coordinator    DeleteCoordinator // nil in standalone mode
+	// receiptRemoved and receiptRewritten mark edge-sync receipts before a
+	// DELETE changes a spoke file (#1666); nil unless this node is a hub.
+	// See SetReceiptMarkers.
+	receiptRemoved   func(ctx context.Context, paths []string) error
+	receiptRewritten func(paths []string) error
+	db               *database.DuckDB
+	storage          storage.Backend
+	config           *config.DeleteConfig
+	authManager      *auth.AuthManager
+	coordinator      DeleteCoordinator // nil in standalone mode
 	// pending is this node's file registration outbox (#1209): a file it
 	// flushed may not be in the manifest yet. nil off ingest nodes.
 	pending        PendingRegistrations
@@ -306,6 +311,37 @@ func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.
 
 // SetRetiredReads wires the standalone read source for replaced files.
 func (h *DeleteHandler) SetRetiredReads(r *RetiredReads) { h.reads = r }
+
+// SetReceiptMarkers wires the edge-sync hub's receipt marking into DELETE
+// (#1666). removed marks the receipt of a file whose rows all match (nothing
+// of it survives; reason row_delete); rewritten marks the receipt of a file
+// rewritten without the matching rows COMPACTED, because its surviving rows
+// live on in the new file. Either way the spoke does not re-send the
+// original, which would bring the deleted rows back and duplicate the rest.
+// Paths outside a spoke namespace match no receipt.
+func (h *DeleteHandler) SetReceiptMarkers(removed func(ctx context.Context, paths []string) error, rewritten func(paths []string) error) {
+	h.receiptRemoved, h.receiptRewritten = removed, rewritten
+}
+
+// markReceipt marks relativePath's edge-sync receipt for a DELETE about to
+// remove it (whole) or rewrite it. Called before anything changes: a failed
+// mark then leaves the file as it was, and a failure after the mark leaves a
+// vouched receipt over a file that still exists, which reconcile and receive
+// treat as present either way. Marking after the rewrite instead left a window
+// in which the leftover sweep removes the old file unmarked.
+func (h *DeleteHandler) markReceipt(ctx context.Context, relativePath string, whole bool) error {
+	var err error
+	switch {
+	case whole && h.receiptRemoved != nil:
+		err = h.receiptRemoved(context.WithoutCancel(ctx), []string{relativePath})
+	case !whole && h.receiptRewritten != nil:
+		err = h.receiptRewritten([]string{relativePath})
+	}
+	if err != nil {
+		return fmt.Errorf("mark edge-sync receipt of %s: %w", filepath.Base(relativePath), err)
+	}
+	return nil
+}
 
 // SetCoordinator wires the cluster coordinator for manifest updates and role
 // gating. Called after construction when cluster mode is enabled.
@@ -1316,6 +1352,9 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		// Nothing matches now (a clause on now() that matched at the scan):
 		// a rewrite would be the same rows under another name.
 		return 0, nil
+	}
+	if err := h.markReceipt(ctx, relativePath, rowsAfter == 0); err != nil {
+		return 0, err
 	}
 
 	// If all rows would be deleted, remove the file entirely.
