@@ -307,7 +307,24 @@ func (r *Registry) measurementHasNoFiles(ctx context.Context, database, measurem
 	if err != nil {
 		return false
 	}
-	return len(dirs) == 0
+	return len(withoutIcebergMetadataDir(dirs)) == 0
+}
+
+// withoutIcebergMetadataDir drops a colocated Iceberg table's metadata
+// directory (#1676) from a measurement directory's children: it holds no
+// data, so it must not make a measurement look like it has files.
+func withoutIcebergMetadataDir(children []string) []string {
+	out := children[:0:0]
+	for _, c := range children {
+		name := strings.TrimSuffix(c, "/")
+		if j := strings.LastIndex(name, "/"); j >= 0 {
+			name = name[j+1:]
+		}
+		if name != "metadata" {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // IsComplete reports whether the measurement's anchor is known to carry
@@ -409,6 +426,9 @@ func (r *Registry) isOnlyFile(ctx context.Context, database, measurement, storag
 	dir := prefix
 	for i := 0; i < len(segs)-1 && i < 3; i++ {
 		children, err := lister.ListDirectories(ctx, dir)
+		if err == nil && i == 0 {
+			children = withoutIcebergMetadataDir(children)
+		}
 		if err != nil || len(children) != 1 {
 			return false
 		}

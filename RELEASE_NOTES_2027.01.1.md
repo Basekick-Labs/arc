@@ -447,6 +447,61 @@ New counters: `arc_ingest_ambiguous_writes_recorded_total`,
 `arc_ingest_ambiguous_writes_abandoned_total` (no longer tracked without a
 removal: rows not seen stored again within a day, or an object of another
 size at the key). No new configuration.
+
+## New: Iceberg tables with their metadata beside the data, for OneLake and Microsoft Fabric ([#1676](https://github.com/Basekick-Labs/arc/issues/1676))
+
+`iceberg.layout = "colocated"` creates each new exported table in the
+measurement's own directory: its metadata goes in
+`{database}/{measurement}/metadata/`, and the table's location is the
+measurement directory, so every data file it references is inside the table
+folder. That is what readers that reach a table only through its folder
+need. A Microsoft Fabric OneLake shortcut is one: with the default layout it
+converts the table's metadata, then Fabric fails on the first data file,
+because the data is outside the shortcut. With the colocated layout the same
+files read in place, still zero-copy, and Power BI reports on them through
+Direct Lake.
+
+- The default stays `"warehouse"` (`<warehouse>/<prefix>_<database>.db/<measurement>`).
+- The layout decides where **new** tables are created. An existing table keeps
+  its location, whichever layout is set, so switching either way moves
+  nothing. To move a table to the configured layout: stop Arc on **every**
+  node, delete the table's row from the `iceberg_tables` table of each node's
+  catalog, delete its metadata directory (`<prefix>_<database>.db/<measurement>/`
+  when moving to colocated, `<database>/<measurement>/metadata/` when moving
+  back), and start Arc again. The next pass recreates the table in the
+  configured layout and registers every file again, reading each file's
+  footer once. A node left with a row whose metadata is gone keeps failing
+  that table until its row is deleted.
+- Every node exporting to the same bucket must use the same layout: two nodes
+  with no row and different layouts would each create the table in their own
+  layout's directory.
+- A node with no catalog row for a table adopts it under whichever layout it
+  was created, rather than creating a second one.
+- `colocated` needs local or S3 storage (the backends the export supports)
+  and the warehouse at the storage root (the default); an `iceberg.warehouse`
+  pointing elsewhere is refused at startup.
+- A database `DELETE` leaves a colocated table's metadata to the Iceberg
+  cleanup, which writes the drop markers first and removes it after
+  ([#1611](https://github.com/Basekick-Labs/arc/issues/1611) still holds).
+  On a hub, deleting a spoke namespace also removes its spoke tables' colocated
+  metadata and catalog rows.
+- Metadata restored from a backup of another storage root (another bucket,
+  prefix or path) is not adopted: Arc logs the directory to delete, and the
+  export recreates the table.
+- A measurement's `metadata/` directory is not data: query pruning and the
+  field-schema registry set it aside.
+- **Do not run orphan-file cleanup** (`remove_orphan_files` in Spark or Trino)
+  against a colocated table. Its location holds Arc's data, including files
+  the export has not registered yet, and that cleanup deletes every
+  unreferenced file under the location.
+- **Caveats:**
+  - Files that move to a cold tier leave the table folder, so folder-scoped
+    readers cannot read them (catalog readers can). Arc warns at startup.
+  - On a cluster with node-local storage the metadata exists only on the
+    exporting node. Arc warns at startup.
+  - On object storage, a measurement whose data is all gone but whose table
+    metadata remains is still listed.
+
 ## Fix: local storage fsyncs what it writes, so a power loss cannot take acknowledged rows ([#1618](https://github.com/Basekick-Labs/arc/issues/1618))
 
 The local storage backend renamed each written file into place without
