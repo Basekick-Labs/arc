@@ -389,6 +389,12 @@ s3_cache_ttl_seconds = 3600
 # catalog_db_path = "./data/arc.db"   # the shared auth database
 # retain_snapshots = 10
 # orphan_sweep_enabled = true
+# layout = "warehouse"               # or "colocated": new tables' metadata in each
+#                                    # measurement's directory, for readers that
+#                                    # reach data only through the table folder
+#                                    # (OneLake shortcuts). Local or S3 storage,
+#                                    # warehouse at the storage root, the same
+#                                    # value on every node.
 
 # -----------------------------------------------------------------------------
 # Query Governance (Enterprise)
@@ -423,16 +429,51 @@ enabled = false
 #                             # At least 1s and shorter than sync_interval
 # sync_timeout = "2h"          # Bound on one manual pass (POST /api/v1/spoke-sync/run)
 # delete_after_sync = false    # Delete the local copy once the hub VERIFIES it holds it
-#                             # (a later pass than the one that synced it). Deletes edge
-#                             # data: needs an https hub_url (or loopback); refused on a
-#                             # cluster node. Local queries stop seeing deleted data.
+#                             # (a later pass than the one that synced it, or a signed
+#                             # bundle acknowledgement). Deletes edge data: with the
+#                             # network path on, needs an https hub_url (or loopback);
+#                             # refused on a cluster node. Local queries stop seeing it.
 # delete_after_sync_delay = "0s"  # Minimum time from synced to the verify that may delete
+# delete_after_sync_ack_max_age = "168h"  # Air-gapped: how long after export a signed
+#                             # bundle acknowledgement may still delete files
+# delete_after_sync_accept_compacted = false  # Also delete files the hub holds only compacted
+#                             # or in cold. Hub compaction drops exact duplicate rows,
+#                             # widens mixed int/float columns, nulls unparseable times:
+#                             # with this on the spoke's exact copy goes.
 #
 # [edge_sync.spoke.bundle]
 # timeout = "2h"               # Bound on one air-gap export (POST /api/v1/spoke-sync/export)
 #
 # [edge_sync.import]
 # timeout = "4h"               # Hub side: bound on one air-gap import (POST /api/v1/bundle-import)
+#
+# Relay transport: spoke and hub exchange bundles and acks through a bucket both
+# can reach (spokes behind NAT, intermittent links, no inbound to the hub).
+# Scheduled passes need the paid license; the manual routes are free:
+# POST /api/v1/spoke-sync/relay/run (spoke), POST /api/v1/bundle-import/relay/run (hub).
+# The target keys are a backup target's: type = "local", "s3", "minio", "azure",
+# "azblob" or "gcs" with local_path / s3_* / azure_* / gcs_*. The target's own prefix is the
+# relay root; it must not overlap primary storage, the cold tier or a backup target.
+# Relay bundles use [edge_sync.spoke.bundle] max_files / max_bytes (10000 / 64 GiB)
+# and its timeout for a manual pass; the hub's staging_dir must hold one bundle.
+#
+# [edge_sync.spoke.relay]
+# enabled = false
+# interval = "5m"              # Between scheduled passes (export, apply acks)
+# ack_timeout = "72h"          # A bundle with no ack this long after export is taken
+#                             # back and its files re-sent; longer than interval
+# type = "s3"
+# s3_bucket = "arc-relay"
+# s3_prefix = "fleet-a/"
+#
+# [edge_sync.import.relay]
+# enabled = false
+# interval = "1m"              # Between scheduled polls of the bucket
+# staging_dir = "./data/edge_sync_relay_staging"  # One bundle at a time, verified
+#                             # before import; not inside storage.local_path
+# type = "s3"
+# s3_bucket = "arc-relay"
+# s3_prefix = "fleet-a/"
 #
 # allowed_dirs (in both [edge_sync.import] and [edge_sync.spoke.bundle]) is a
 # TOML array, or a comma-separated string; a path may contain spaces, and a
@@ -448,8 +489,14 @@ enabled = false
 # ARC_EDGE_SYNC_SPOKE_SYNC_TIMEOUT
 # ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC
 # ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_ACCEPT_COMPACTED
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_ACK_MAX_AGE
 # ARC_EDGE_SYNC_SPOKE_BUNDLE_TIMEOUT
 # ARC_EDGE_SYNC_IMPORT_TIMEOUT
+# ARC_EDGE_SYNC_SPOKE_RELAY_ENABLED, ARC_EDGE_SYNC_SPOKE_RELAY_INTERVAL,
+# ARC_EDGE_SYNC_SPOKE_RELAY_ACK_TIMEOUT, ARC_EDGE_SYNC_SPOKE_RELAY_TYPE, ...
+# ARC_EDGE_SYNC_IMPORT_RELAY_ENABLED, ARC_EDGE_SYNC_IMPORT_RELAY_INTERVAL,
+# ARC_EDGE_SYNC_IMPORT_RELAY_STAGING_DIR, ARC_EDGE_SYNC_IMPORT_RELAY_TYPE, ...
 #
 # -----------------------------------------------------------------------------
 # Telemetry

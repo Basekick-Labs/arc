@@ -45,6 +45,9 @@ type EdgeSyncSpokeHandler struct {
 	// never runs the network path at all.
 	exporter *edgesync.Exporter
 
+	// relay is nil unless edge_sync.spoke.relay.enabled (#1685).
+	relay *edgesync.RelaySpoke
+
 	authManager *auth.AuthManager
 	logger      zerolog.Logger
 
@@ -108,8 +111,36 @@ func (h *EdgeSyncSpokeHandler) RegisterRoutes(app fiber.Router) {
 	group.Post("/export", h.export)
 	group.Post("/export/:bundle_id/revert", h.revertExport)
 	group.Post("/ack", h.applyAck)
+	group.Post("/relay/run", h.relayRun)
 
 	h.logger.Info().Msg("Edge sync spoke routes registered")
+}
+
+// SetRelay wires the relay transport's manual pass (#1685). Call before
+// RegisterRoutes; nil leaves /relay/run answering 503.
+func (h *EdgeSyncSpokeHandler) SetRelay(r *edgesync.RelaySpoke) { h.relay = r }
+
+// relayRun handles POST /api/v1/spoke-sync/relay/run: one relay pass (apply
+// acks, act on refusals, take back timed-out bundles, export). Free, like a
+// manual network sync; the scheduled pass needs the scheduler licence.
+func (h *EdgeSyncSpokeHandler) relayRun(c *fiber.Ctx) error {
+	if h.relay == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "the relay transport is not enabled (edge_sync.spoke.relay.enabled)",
+		})
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), h.exportTimeout)
+	defer cancel()
+	res, err := h.relay.Run(ctx)
+	if errors.Is(err, edgesync.ErrRelayInProgress) {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+	}
+	if err != nil {
+		h.logger.Error().Err(err).Msg("Manual relay pass failed")
+		// A partial result still says what the pass did before failing.
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error(), "result": res})
+	}
+	return c.JSON(res)
 }
 
 // run handles POST /api/v1/spoke-sync/run.
@@ -607,11 +638,13 @@ func (h *EdgeSyncSpokeHandler) applyAck(c *fiber.Ctx) error {
 	}
 
 	out := fiber.Map{
-		"applied":     true,
-		"bundle_id":   res.BundleID,
-		"hub_id":      res.HubID,
-		"imported_at": res.ImportedAt,
-		"synced":      res.Synced,
+		"applied":       true,
+		"bundle_id":     res.BundleID,
+		"hub_id":        res.HubID,
+		"imported_at":   res.ImportedAt,
+		"synced":        res.Synced,
+		"attested":      res.Attested,
+		"local_deleted": res.LocalDeleted,
 	}
 	var warnings []string
 	// The three non-advanced cases mean different things, so they are reported

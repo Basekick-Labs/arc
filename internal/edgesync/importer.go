@@ -2,6 +2,7 @@ package edgesync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -61,6 +62,14 @@ type ImporterConfig struct {
 	// without being written (Coordinator.HoldLocalPaths, #1071).
 	HoldPaths func(paths []string) (release func())
 
+	// Verify, when set, is the hub's verify reconcile (Reconciler.Verify): at
+	// ack time the importer asks which acknowledged files it provably holds
+	// and signs the answer into the ack (#1684), which an air-gapped spoke
+	// with delete_after_sync deletes against. VerifyMaxEntries chunks the
+	// calls (the reconciler's cap). Nil: acks carry no held attestation.
+	Verify           func(ctx context.Context, spokeID string, entries []ReconcileEntry) (*VerifyResult, error)
+	VerifyMaxEntries int
+
 	Logger zerolog.Logger
 }
 
@@ -88,6 +97,8 @@ type Importer struct {
 	hubID         string
 	maxFiles      int64
 	flushManifest func(ctx context.Context, files []*ReceivedFile) error
+	verify        func(ctx context.Context, spokeID string, entries []ReconcileEntry) (*VerifyResult, error)
+	verifyMax     int
 	logger        zerolog.Logger
 }
 
@@ -125,6 +136,8 @@ func NewImporter(cfg ImporterConfig) (*Importer, error) {
 		hubID:         cfg.HubID,
 		maxFiles:      maxFiles,
 		flushManifest: cfg.FlushManifest,
+		verify:        cfg.Verify,
+		verifyMax:     cfg.VerifyMaxEntries,
 		logger:        cfg.Logger.With().Str("component", "edgesync-import").Logger(),
 	}, nil
 }
@@ -183,7 +196,22 @@ func (i *Importer) Import(ctx context.Context, dir string) (*ImportResult, error
 		return nil, ErrImportInProgress
 	}
 	defer i.mu.Unlock()
+	return i.importLocked(ctx, dir)
+}
 
+// tryLock takes the import lock for a caller that must hold it across more
+// than Import itself: the relay poller holds it while it downloads a bundle,
+// so a drive import running meanwhile is not discovered only after the
+// download (#1685). Returns ok=false, holding nothing, when it is taken.
+func (i *Importer) tryLock() (unlock func(), ok bool) {
+	if !i.mu.TryLock() {
+		return nil, false
+	}
+	return i.mu.Unlock, true
+}
+
+// importLocked is Import with the lock already held.
+func (i *Importer) importLocked(ctx context.Context, dir string) (*ImportResult, error) {
 	start := time.Now()
 
 	r, err := OpenBundle(dir, i.logger)
@@ -288,7 +316,7 @@ func (i *Importer) Import(ctx context.Context, dir string) (*ImportResult, error
 	// this hub considers complete. Failure is logged and surfaced, not fatal:
 	// the files are committed either way, and the spoke simply re-sends them
 	// in a later bundle where the hub answers already_present.
-	if err := i.writeAck(ctx, dir, m, res); err != nil {
+	if err := i.writeAck(ctx, dir, m, entries, res); err != nil {
 		i.logger.Error().Err(err).
 			Str("bundle_id", m.BundleID).
 			Msg("Bundle imported but the acknowledgment could not be written; " +
@@ -481,18 +509,52 @@ func (c *CollectingRegistrar) Reset() { c.files = c.files[:0] }
 // symmetric, so the key that lets a spoke prove authorship lets the hub prove
 // receipt. No new key material, and a spoke that can make a bundle can check
 // the answer.
-func (i *Importer) writeAck(ctx context.Context, dir string, m *Manifest, res *ImportResult) error {
-	secret, err := i.registry.Secret(ctx, m.SpokeID)
+func (i *Importer) writeAck(ctx context.Context, dir string, m *Manifest, entries []BundleEntry, res *ImportResult) error {
+	ack, secret, err := i.buildAck(ctx, m, entries, res, time.Now())
 	if err != nil {
-		return fmt.Errorf("read spoke secret: %w", err)
+		return err
 	}
+	return WriteAck(dir, secret, ack)
+}
 
-	return WriteAck(dir, secret, &Ack{
-		BundleID:   m.BundleID,
-		SpokeID:    m.SpokeID,
-		HubID:      i.hubID,
-		ImportedAt: time.Now().UTC().Unix(),
-		Paths:      res.AckPaths,
-		Conflicts:  res.Conflicts,
-	})
+// attestHeld fills the ack's held attestation from the hub's verify answer
+// over the acknowledged paths only (so held is a subset of Paths by
+// construction), chunked by the reconciler's cap. VerifiedAt is taken BEFORE
+// the calls: the attestation must not claim a later time than its evidence.
+func (i *Importer) attestHeld(ctx context.Context, spokeID string, entries []BundleEntry, ack *Ack) error {
+	verifiedAt := time.Now().UTC().Unix()
+	byPath := make(map[string]BundleEntry, len(entries))
+	for _, e := range entries {
+		byPath[e.Path] = e
+	}
+	req := make([]ReconcileEntry, 0, len(ack.Paths))
+	for _, p := range ack.Paths {
+		e, ok := byPath[p]
+		if !ok {
+			continue
+		}
+		req = append(req, ReconcileEntry{Path: e.Path, SHA256: e.SHA256, SizeBytes: e.SizeBytes})
+	}
+	chunk := i.verifyMax
+	if chunk <= 0 {
+		chunk = MaxReconcileEntriesDefault
+	}
+	held, compacted := []string{}, []string{}
+	for start := 0; start < len(req); start += chunk {
+		res, err := i.verify(ctx, spokeID, req[start:min(start+chunk, len(req))])
+		if err != nil {
+			return err
+		}
+		held = append(held, res.Held...)
+		compacted = append(compacted, res.HeldCompacted...)
+	}
+	ack.Held, ack.HeldCompacted, ack.VerifiedAt = held, compacted, verifiedAt
+	return nil
+}
+
+// ackFits reports whether the ack, with its MACs, stays within what ReadAck
+// accepts. The MACs and digests are fixed-size; a margin covers them.
+func ackFits(a *Ack) bool {
+	b, err := json.Marshal(a)
+	return err == nil && len(b)+2048 <= maxAckBytes
 }

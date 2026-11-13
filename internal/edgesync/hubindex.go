@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -94,11 +95,20 @@ func (h *HubIndex) initSchema() error {
 	// Unlike compacted_at nothing survives, but the receipt stays so
 	// reconcile keeps answering "present" and the spoke does not re-send what
 	// was deleted. Recovery is an explicit ForgetRemoved. Same tolerant ALTER.
-	for _, col := range []string{"removed_at TIMESTAMP", "removed_reason TEXT"} {
+	// compacted_into: the hub storage path that now holds a compacted
+	// receipt's content (#1683), so a verify can check that holder exists.
+	for _, col := range []string{"removed_at TIMESTAMP", "removed_reason TEXT", "compacted_into TEXT"} {
 		if _, err := h.db.Exec(`ALTER TABLE sync_received ADD COLUMN ` + col); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("add %s column: %w", col, err)
 		}
+	}
+	// The holder chain (MarkCompactedInto) updates by compacted_into on every
+	// hub compaction job; without this it scans a spoke's receipts under the
+	// shared write lock (#1683).
+	if _, err := h.db.Exec(`CREATE INDEX IF NOT EXISTS idx_sync_received_holder
+		ON sync_received(spoke_id, compacted_into) WHERE compacted_into IS NOT NULL`); err != nil {
+		return fmt.Errorf("create holder index: %w", err)
 	}
 	h.logger.Debug().Msg("Sync hub index schema initialized")
 	return nil
@@ -127,6 +137,7 @@ func (h *HubIndex) Record(ctx context.Context, r *ReceivedRecord) error {
 			size_bytes   = excluded.size_bytes,
 			received_at  = excluded.received_at,
 			compacted_at = NULL,
+			compacted_into = NULL,
 			removed_at   = NULL,
 			removed_reason = NULL`,
 		r.SpokeID, r.SourcePath, r.HubPath, r.SHA256, r.SizeBytes, receivedAt.UTC())
@@ -147,6 +158,9 @@ type HeldFile struct {
 	// receive vouch for it like a compacted receipt, so the spoke does not
 	// re-send it; unlike Compacted, nothing of it survives on the hub.
 	Removed bool
+	// CompactedInto: for a compacted receipt, the hub storage path holding
+	// its content, or "" when unknown (#1683).
+	CompactedInto string
 }
 
 // Vouched reports whether the receipt stands although no file exists at its
@@ -183,7 +197,7 @@ func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (
 		}
 		chunk := paths[start:end]
 
-		query := `SELECT source_path, sha256, compacted_at IS NOT NULL, removed_at IS NOT NULL FROM sync_received WHERE spoke_id = ? AND source_path IN (?` +
+		query := `SELECT source_path, sha256, compacted_at IS NOT NULL, removed_at IS NOT NULL, COALESCE(compacted_into, '') FROM sync_received WHERE spoke_id = ? AND source_path IN (?` +
 			strings.Repeat(",?", len(chunk)-1) + `)`
 
 		args := make([]any, 0, len(chunk)+1)
@@ -206,13 +220,13 @@ func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (
 
 			for rows.Next() {
 				var (
-					p, sha             string
+					p, sha, into       string
 					compacted, removed bool
 				)
-				if err := rows.Scan(&p, &sha, &compacted, &removed); err != nil {
+				if err := rows.Scan(&p, &sha, &compacted, &removed, &into); err != nil {
 					return fmt.Errorf("edgesync: scan received: %w", err)
 				}
-				out[p] = HeldFile{SHA256: sha, Compacted: compacted, Removed: removed}
+				out[p] = HeldFile{SHA256: sha, Compacted: compacted, Removed: removed, CompactedInto: into}
 			}
 			if err := rows.Err(); err != nil {
 				return fmt.Errorf("edgesync: iterate received: %w", err)
@@ -267,6 +281,121 @@ func (h *HubIndex) MarkCompacted(ctx context.Context, spokeID string, sourcePath
 		}
 		if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("edgesync: mark receipts compacted: %w", err)
+		}
+	}
+	return nil
+}
+
+// MarkCompactedNoHolder marks receipts compacted with no known holder,
+// clearing any it had: a row-level DELETE about to rewrite the file (#1666),
+// whose old path is about to go and whose rewrite is not a holder a spoke
+// may be deleted against (#1683). UPDATE only; chunked.
+func (h *HubIndex) MarkCompactedNoHolder(ctx context.Context, spokeID string, sourcePaths []string) error {
+	return h.updateBySourcePath(ctx, spokeID, sourcePaths,
+		`UPDATE sync_received SET compacted_at = ?, compacted_into = NULL WHERE spoke_id = ? AND source_path IN (`,
+		time.Now().UTC())
+}
+
+// MarkCompactedInPlace marks receipts compacted whose content stays at the
+// same key in another tier: tiering's hot->cold migration (#687). A receipt
+// with no holder yet gets its own hub path as holder; one already pointing
+// at a compaction output keeps it, so a later removal of the cold copy cannot
+// leave it pointing at a deleted file (#1683). UPDATE only; chunked.
+func (h *HubIndex) MarkCompactedInPlace(ctx context.Context, spokeID string, sourcePaths []string) error {
+	return h.updateBySourcePath(ctx, spokeID, sourcePaths,
+		`UPDATE sync_received SET compacted_at = ?, compacted_into = COALESCE(compacted_into, ? || '/' || source_path) WHERE spoke_id = ? AND source_path IN (`,
+		time.Now().UTC(), spokeID)
+}
+
+// MarkCompactedInto records a hub compaction job (#619, #1683): the receipts
+// of its consumed inputs are marked compacted with the job's output as their
+// holder, and receipts whose holder was one of the consumed files (a
+// compaction of compactions) move to the new output. sourcePaths are the
+// inputs as source paths (spoke prefix stripped); consumed are the same
+// inputs as full hub storage paths; output is a full hub storage path.
+//
+// A re-fired mark (recovery keeps the manifest after a failure) must not move
+// a receipt back from a later holder to this, deleted, one: an input's
+// receipt is re-pointed only while it has no holder or holds itself (a cold
+// copy). One whose holder was a consumed file moves through the chain update.
+func (h *HubIndex) MarkCompactedInto(ctx context.Context, spokeID string, sourcePaths, consumed []string, output string) error {
+	if len(sourcePaths) == 0 || output == "" {
+		return nil
+	}
+	if has, err := h.hasReceipts(ctx, spokeID); err != nil || !has {
+		return err
+	}
+	now := time.Now().UTC()
+	consumedSet := make(map[string]struct{}, len(consumed))
+	for _, c := range consumed {
+		consumedSet[c] = struct{}{}
+	}
+	for start := 0; start < len(sourcePaths); start += removalChunk {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := sourcePaths[start:min(start+removalChunk, len(sourcePaths))]
+		query := `UPDATE sync_received SET compacted_at = ?, compacted_into = ?
+			WHERE spoke_id = ? AND source_path IN (?` + strings.Repeat(",?", len(chunk)-1) + `)
+			  AND (compacted_into IS NULL OR compacted_into = ? || '/' || source_path)`
+		args := make([]any, 0, len(chunk)+4)
+		args = append(args, now, output, spokeID)
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		args = append(args, spokeID)
+		if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("edgesync: mark receipts compacted into %q: %w", output, err)
+		}
+	}
+	// The chain: receipts whose holder this job consumed.
+	chain := make([]string, 0, len(consumedSet))
+	for c := range consumedSet {
+		chain = append(chain, c)
+	}
+	sort.Strings(chain)
+	for start := 0; start < len(chain); start += removalChunk {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := chain[start:min(start+removalChunk, len(chain))]
+		query := `UPDATE sync_received SET compacted_into = ?
+			WHERE spoke_id = ? AND compacted_into IN (?` + strings.Repeat(",?", len(chunk)-1) + `)`
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, output, spokeID)
+		for _, c := range chunk {
+			args = append(args, c)
+		}
+		if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("edgesync: move receipt holders to %q: %w", output, err)
+		}
+	}
+	return nil
+}
+
+// updateBySourcePath runs prefix + "?,?,...)" over sourcePaths in chunks,
+// with lead args before spokeID. Skips spokes with no receipts.
+func (h *HubIndex) updateBySourcePath(ctx context.Context, spokeID string, sourcePaths []string, prefix string, lead ...any) error {
+	if len(sourcePaths) == 0 {
+		return nil
+	}
+	if has, err := h.hasReceipts(ctx, spokeID); err != nil || !has {
+		return err
+	}
+	for start := 0; start < len(sourcePaths); start += removalChunk {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := sourcePaths[start:min(start+removalChunk, len(sourcePaths))]
+		query := prefix + `?` + strings.Repeat(",?", len(chunk)-1) + `)`
+		args := make([]any, 0, len(chunk)+len(lead)+1)
+		args = append(args, lead...)
+		args = append(args, spokeID)
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("edgesync: mark receipts: %w", err)
 		}
 	}
 	return nil

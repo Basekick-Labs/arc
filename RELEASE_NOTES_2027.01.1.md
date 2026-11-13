@@ -2,6 +2,70 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: without a WAL, a flush that fails part-way keeps track of the hour files it stored ([#1693](https://github.com/Basekick-Labs/arc/issues/1693))
+
+With the WAL off (the default), a write whose rows span several hours is flushed as one Parquet file per hour. If an upload failed part-way, the hour files already stored stayed in storage but were never registered: they were missing from the tiering metadata and, on a cluster, from the file manifest. The flush was also logged and counted as losing **every** row, stored ones included.
+
+Each hour file is now registered as soon as it is stored, so a failure later in the flush leaves the earlier files tracked:
+- **Tiering:** they reach the tier metadata, and are migrated and covered by tier-aware retention.
+- **Cluster:** they are in the manifest, so readers that go by the manifest see them, and the reconciliation sweep does not treat them as orphans to delete. As for every registration made without a WAL, the registration journal entry is not fsynced, so it survives a process crash but not a power loss.
+
+The failure log now reports `records_stored` and `files_stored`, and `records_without_wal` and `arc_buffer_records_dropped_total` count only the rows in no stored file. Two reproductions:
+- On Amazon S3, a 20,000-row backfill over 2,000 hours was cut off by a shutdown. The old binary stored 204 hour files and counted all 20,000 rows as lost. The fixed one stored 205 files and reported 2,050 rows stored and 17,950 lost.
+- On MinIO, paused part-way through a 3,650-row, 365-hour backfill, 337 files were stored, 280 rows were counted lost, and 3,370 rows were queryable.
+
+With the WAL on, nothing changes: each hour file was already registered and checkpointed as it was stored (#1492). The count of rows a shutdown leaves for WAL replay is also corrected for a flush that stored only some of its hour files.
+
+## Fix: a backfill flush is no longer cut off at 30 seconds in total ([#1692](https://github.com/Basekick-Labs/arc/issues/1692))
+
+`ingest.flush_timeout_seconds` (default 30) is documented as the timeout for
+storage writes during a flush, but it bounded the **whole** flush. A write whose
+rows span many hours flushes as one Parquet file per hour, uploaded one after
+another, so a backfill hit the deadline part-way however healthy each upload
+was. Measured on S3 in the same region (~25 ms per file), any single write
+spanning more than about 1,100 hours failed; over a slower link far fewer. With
+the WAL off the rows not yet uploaded were lost after the write had been
+acknowledged; with the WAL on they were kept but replayed only at the next
+restart.
+
+The timeout now applies to **each hour file** of a flush, and covers
+everything done for that file: the Parquet encode, the storage write, the
+field-schema registration (which reads and writes storage), the tiering and
+cluster-manifest registration, and the WAL row checkpoint. A single-hour
+flush, which is every flush in live ingest, still gets one timeout (now
+starting after the in-memory merge and sort). A flush of N hour files can take
+up to N × the timeout and has no cap on N. Cluster replay of a claimed WAL
+range, which had no time limit, now also gets the timeout per hour file.
+
+- One stuck upload is still cut off at the timeout, as before.
+- At shutdown, Arc stops a flush between hour files once its shutdown budget
+  runs out (it already cancelled uploads in progress then); previously a flush
+  on local storage kept writing its remaining files. The hours not yet written
+  stay in the WAL (with the WAL off they are lost, as any unflushed rows are at
+  shutdown).
+- **While a large backfill flushes, other work waits longer than before**, up
+  to the length of the flush instead of ~30 s:
+  - Age-based flushing of **every other buffer on the node**: the age sweep
+    writes its buffers and waits for them, so a backfill flushed by age holds
+    up the next sweep. Size-triggered flushes are not affected. Nothing is
+    lost, but low-rate measurements are written late.
+  - A write request that triggers a schema-change flush, and import and
+    flush-all calls, run until the flush is done.
+  - Calls that wait for in-flight flushes with a budget of one timeout fail
+    safe while a backfill flush runs, on any database: WAL recovery keeps its
+    files and completes on a later pass; a row `DELETE` and a cluster
+    continuous-query run answer an error and change nothing. Retry after the
+    backfill.
+
+  Before this fix the same backfill failed after ~30 s and lost or deferred its
+  rows; follow-up work to keep it from holding up other buffers is tracked in
+  [#1695](https://github.com/Basekick-Labs/arc/issues/1695).
+- The config comment said `0 = no timeout`; a value of 0 or less has always
+  meant 30 s. The comment now says so.
+
+No configuration change. Throughput of live ingest is unchanged: one extra
+context per flush, not per row.
+
 ## Fix: `cluster.seeds` written as a TOML array is read ([#1675](https://github.com/Basekick-Labs/arc/issues/1675))
 
 `seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]` in `arc.toml` now gives the node those seeds. Before, Arc read the TOML array as no seeds at all and gave no warning. The node started with `seed_count: 0`, logged `no known peers, aborting election`, and never joined. Only the comma-separated string worked. An array element that contains commas is split into one seed per address.
@@ -33,15 +97,54 @@ Every `allowed_dirs` entry must now be an absolute path. With import or bundle e
 With `edge_sync.spoke.delete_after_sync = true`, a spoke reclaims disk space by deleting its own copy of a file after the hub has **verified** that it still holds the file. This is off by default.
 
 - **When a file is deleted.** Verification is a separate request from the one that synced the file, sent on a later pass and at least `edge_sync.spoke.delete_after_sync_delay` after the sync (default `0s`). The hub answers "held" only when it still has the file itself, at the path it received it under, and on a cluster only if the cluster still lists it. Only then is the spoke's copy deleted.
-- **When a file is kept.** The hub may have merged the file into a compacted file (`edge_sync.compact_received_namespaces`, on by default) or removed it on purpose. Either way it cannot prove it still holds the content, so the spoke keeps its copy and asks again a day later. A later release will make files compacted on the hub verifiable too. A file the hub has forgotten entirely (its admin forget route) is sent again.
+- **When a file is kept.** The hub may have merged the file into a compacted file (`edge_sync.compact_received_namespaces`, on by default) or removed it on purpose. A removed file is always kept. For a compacted file, see the next section: by default the spoke keeps its copy and asks again a day later. A file the hub has forgotten entirely (its admin forget route) is sent again.
 - **Older hubs.** The spoke first sends the hub an empty test request. If the hub is too old to verify, the spoke deletes nothing, logs a warning, and asks again a day later. It never sends such a hub its list of synced files.
 - **Turning it on for a spoke that has been syncing for a while** verifies, and may delete, every synced file still in the ledger: up to `ledger_retention_days` (90 days by default) of data on the first passes.
 - **A failed verification** never fails the sync pass and deletes nothing. The pass reports why in `verify_error`.
-- **Refused at startup** without `edge_sync.spoke.enabled`, on a cluster node, or with a `hub_url` that is neither `https://` nor a loopback address. The hub's answer decides which local files are deleted, so it must not be forgeable in transit.
+- **Refused at startup** without `edge_sync.spoke.enabled`, bundle export or the relay ([#1685](https://github.com/Basekick-Labs/arc/issues/1685)), on a cluster node, or, with the network path on, with a `hub_url` that is neither `https://` nor a loopback address. The hub's answer decides which local files are deleted, so it must not be forgeable in transit.
 - **Local queries** on the spoke no longer see data whose files were deleted.
 - **Licence.** The setting itself needs no licence, so manual passes (`POST /api/v1/spoke-sync/run`) delete. Scheduled passes run only with the edge-sync scheduler licence, as before. A pass reports `local_deleted`, `verify_kept`, `verify_requeued` and `verify_unsupported`.
 
-Air-gapped spokes cannot use it yet, because the import acknowledgement does not prove the hub still holds a file.
+Air-gapped spokes can use it too: see "`delete_after_sync` for air-gapped spokes" ([#1684](https://github.com/Basekick-Labs/arc/issues/1684)).
+
+## New: a spoke can also delete files the hub has compacted, if it opts in ([#1683](https://github.com/Basekick-Labs/arc/issues/1683))
+
+The hub now records where a spoke file's content went when it compacts the file, when it compacts that compacted file again, and when it migrates it to the cold tier. A verification can then confirm that the hub still holds the file it went into. Before, a file the hub had compacted could never be verified, so a spoke never deleted it. Hub compaction of received data is on by default, which made this the common case.
+
+Such files are reported separately, and a spoke deletes them only with `edge_sync.spoke.delete_after_sync_accept_compacted = true` (default `false`). Hub compaction does not keep the spoke's exact bytes:
+
+- It drops rows that are identical in every column.
+- It widens a column that mixes integers and floats to floating point, which loses precision above 2^53.
+- It turns timestamps it cannot parse into NULL.
+
+With the setting on, the spoke's only exact copy goes. Some files have no recorded destination and are always kept: files the hub compacted or moved to the cold tier before this release, and files a row-level `DELETE` rewrote on the hub. If hub retention later deletes the compacted file a spoke file went into, that spoke file is kept too, and the spoke keeps asking about it once a day.
+
+## New: `delete_after_sync` for air-gapped spokes ([#1684](https://github.com/Basekick-Labs/arc/issues/1684))
+
+An air-gapped spoke can now use `edge_sync.spoke.delete_after_sync` with only bundle export enabled (`edge_sync.spoke.bundle.enabled`).
+
+- **How it works.** When the hub imports a bundle, it checks which of its files it still holds, the same check a networked spoke gets. It signs the answer into the acknowledgement it writes onto the drive. When the spoke applies that acknowledgement (`POST /api/v1/spoke-sync/ack`), it deletes its local copies of those files: right away with the default delay of 0, or later, by the check that runs every 15 minutes, with a longer delay. It applies the same rules as networked spokes: `delete_after_sync_delay` and, for files the hub compacted, `delete_after_sync_accept_compacted`. A check every 15 minutes deletes what the delay held back.
+- **Only the bundle that carried the file.** An acknowledgement deletes only files that left on that very bundle and that nothing has superseded since. Replaying an old drive after the hub forgot a file deletes nothing. Neither does an acknowledgement older than a more recent network check.
+- **A time limit on the acknowledgement.** It rides a drive and cannot see what happens on the hub after the import, such as retention or a forget. So it is honoured only up to `edge_sync.spoke.delete_after_sync_ack_max_age` after the bundle was exported, measured on the spoke's own clock. The default is `168h` (7 days); raise it knowingly. It must be longer than `delete_after_sync_delay`. If the hub cannot fit the attestation within the acknowledgement's size limit (very large bundles), it writes the acknowledgement without it.
+- **On a spoke with both the network path and bundles**, a network check that answers after the bundle went out always wins over the acknowledgement.
+- **Older versions.** An acknowledgement from an older hub carries no such attestation and deletes nothing. An older spoke ignores the attestation and applies the acknowledgement as before. The ack response reports `attested` and `local_deleted`.
+
+## New: edge sync through a shared bucket ([#1685](https://github.com/Basekick-Labs/arc/issues/1685))
+
+A spoke and its hub can now exchange data through an object store both can reach (S3, MinIO, Azure Blob, Google Cloud Storage, or a shared directory), for spokes behind NAT, on intermittent links, or on networks that refuse inbound connections to the hub. It is the air-gap bundle protocol carried by a bucket instead of a drive: the same signed bundles, the same verify-before-commit import, the same signed acknowledgement, and `delete_after_sync` works as for air-gapped spokes. Off by default.
+
+- **Spoke** (`edge_sync.spoke.relay.*`): every `interval` (default `5m`) it applies the acknowledgements waiting in the bucket, then exports pending files as a bundle under `<spoke_id>/outbox/<bundle_id>/`. Each file streams from spoke storage straight into the bucket, hashed on the way, so the edge box keeps no second copy. The manifest is written last, and a bundle without one is never imported.
+- **Hub** (`edge_sync.import.relay.*`): every `interval` (default `1m`) it lists the bucket, one listing per spoke, and checks each new bundle cheapest first. A prefix that names no registered, enabled spoke is skipped without downloading anything. Next it fetches the manifest (at most 64 KiB) and skips a bundle addressed to another hub, remembering it. Then it fetches the entry list (at most 64 MiB) and checks the spoke's signature. Only after that does it download exactly the files the spoke signed, each capped at its declared size, into `staging_dir`, import them as a drive import does, and write the acknowledgement to `<spoke_id>/acks/<bundle_id>.json`. Someone with write access to the bucket but not the spoke's secret can make the hub fetch at most a manifest and an entry list per bundle they plant under a registered spoke's prefix, and each of those is refused once. A drive import in progress is detected before any data is downloaded.
+- **Bundle size.** Relay bundles use the drive export's caps, `edge_sync.spoke.bundle.max_files` and `max_bytes` (default 10,000 files and 64 GiB), even with drive export off. A manual pass is bounded by `edge_sync.spoke.bundle.timeout`. The hub's `staging_dir` must have room for one whole bundle.
+- **Bucket layout and keys.** The relay target takes a backup target's keys: `type` (`local`, `s3`, `minio`, `azure`, `azblob`, `gcs`) and the matching `local_path`, `s3_*`, `azure_*` or `gcs_*` keys (GCS authenticates as for `storage.gcs_*`: a key file, else Application Default Credentials; not in the FIPS build). The target's own prefix (`s3_prefix`, `azure_prefix`, `gcs_prefix`) is the relay root, and spoke and hub must name the same bucket and prefix. Arc refuses to start if the relay overlaps primary storage, the cold tier or a backup target, or if the hub's staging directory is inside `storage.local_path`.
+- **Crash between import and acknowledgement.** A hub that imported a bundle but did not write its acknowledgement rebuilds it on the next poll from its own receipts, without downloading the bundle again.
+- **A bundle nobody answers.** After `edge_sync.spoke.relay.ack_timeout` (default `72h`, longer than `interval`), the spoke takes the bundle back, and its files go in the next bundle. A file the hub already holds is answered `already present` then. A bundle whose manifest or whole prefix disappears from the bucket is taken back on the spoke's next pass. A drive bundle in transit is never affected.
+- **A bundle the hub refuses** gets a refusal note in `<spoke_id>/rejected/`, signed with the spoke's secret. That covers a manifest or entry list whose signature does not verify, one that is malformed, one stored under another key than the one it names, or one over `edge_sync.import.max_files`. The spoke marks the bundle's files failed, so they are not sent again, and logs the reason. Requeue them with `POST /api/v1/spoke-sync/ledger/requeue` once the cause is fixed. The spoke ignores a note that does not verify. Anything found wrong after the signature has verified is retried instead and is never a refusal: a data object that is missing, the wrong size or the wrong content, or a hub-side error. If the hub never accepts the bundle, the spoke re-sends the files after `ack_timeout`. A bundle for an unknown or disabled spoke, or addressed to another hub, is left alone with no note: a bucket can be shared by several hubs.
+- **What the acknowledgement does not advance.** An acknowledgement advances only files that left on that bundle and are still waiting for it, so an old acknowledgement replayed into the bucket advances nothing. A file it reports as a conflict is failed, as on the network path. Any other file in the bundle that it does not acknowledge goes back to pending.
+- **Clean-up order.** The spoke deletes its outbox bundle after applying the acknowledgement or refusal; the hub deletes the acknowledgement or note once that bundle is gone. The hub never deletes a spoke's bundle. Credentials can follow that split: the spoke writes and deletes `outbox/` and reads `acks/` and `rejected/`; the hub reads `outbox/` and writes and deletes `acks/` and `rejected/`.
+- **Licence.** Scheduled passes, on both sides, need the edge-sync scheduler licence, checked at startup and on every pass. Manual passes are free: `POST /api/v1/spoke-sync/relay/run` on the spoke and `POST /api/v1/bundle-import/relay/run` on the hub, both admin-only. On a cluster, only the primary writer runs scheduled passes; like the drive import route, the manual routes are not restricted to it.
+- **Either side can run alone.** A spoke can use the relay with or without the network path and drive export, and a hub can poll a bucket without `edge_sync.import.enabled` (the drive route).
+- **Storage.** Azure Blob storage gains a conditional write (`If-None-Match: *`), used for acknowledgements. A store that does not honour the condition on a write gets a plain write: an acknowledgement written twice is harmless.
 
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
@@ -447,6 +550,61 @@ New counters: `arc_ingest_ambiguous_writes_recorded_total`,
 `arc_ingest_ambiguous_writes_abandoned_total` (no longer tracked without a
 removal: rows not seen stored again within a day, or an object of another
 size at the key). No new configuration.
+
+## New: Iceberg tables with their metadata beside the data, for OneLake and Microsoft Fabric ([#1676](https://github.com/Basekick-Labs/arc/issues/1676))
+
+`iceberg.layout = "colocated"` creates each new exported table in the
+measurement's own directory: its metadata goes in
+`{database}/{measurement}/metadata/`, and the table's location is the
+measurement directory, so every data file it references is inside the table
+folder. That is what readers that reach a table only through its folder
+need. A Microsoft Fabric OneLake shortcut is one: with the default layout it
+converts the table's metadata, then Fabric fails on the first data file,
+because the data is outside the shortcut. With the colocated layout the same
+files read in place, still zero-copy, and Power BI reports on them through
+Direct Lake.
+
+- The default stays `"warehouse"` (`<warehouse>/<prefix>_<database>.db/<measurement>`).
+- The layout decides where **new** tables are created. An existing table keeps
+  its location, whichever layout is set, so switching either way moves
+  nothing. To move a table to the configured layout: stop Arc on **every**
+  node, delete the table's row from the `iceberg_tables` table of each node's
+  catalog, delete its metadata directory (`<prefix>_<database>.db/<measurement>/`
+  when moving to colocated, `<database>/<measurement>/metadata/` when moving
+  back), and start Arc again. The next pass recreates the table in the
+  configured layout and registers every file again, reading each file's
+  footer once. A node left with a row whose metadata is gone keeps failing
+  that table until its row is deleted.
+- Every node exporting to the same bucket must use the same layout: two nodes
+  with no row and different layouts would each create the table in their own
+  layout's directory.
+- A node with no catalog row for a table adopts it under whichever layout it
+  was created, rather than creating a second one.
+- `colocated` needs local or S3 storage (the backends the export supports)
+  and the warehouse at the storage root (the default); an `iceberg.warehouse`
+  pointing elsewhere is refused at startup.
+- A database `DELETE` leaves a colocated table's metadata to the Iceberg
+  cleanup, which writes the drop markers first and removes it after
+  ([#1611](https://github.com/Basekick-Labs/arc/issues/1611) still holds).
+  On a hub, deleting a spoke namespace also removes its spoke tables' colocated
+  metadata and catalog rows.
+- Metadata restored from a backup of another storage root (another bucket,
+  prefix or path) is not adopted: Arc logs the directory to delete, and the
+  export recreates the table.
+- A measurement's `metadata/` directory is not data: query pruning and the
+  field-schema registry set it aside.
+- **Do not run orphan-file cleanup** (`remove_orphan_files` in Spark or Trino)
+  against a colocated table. Its location holds Arc's data, including files
+  the export has not registered yet, and that cleanup deletes every
+  unreferenced file under the location.
+- **Caveats:**
+  - Files that move to a cold tier leave the table folder, so folder-scoped
+    readers cannot read them (catalog readers can). Arc warns at startup.
+  - On a cluster with node-local storage the metadata exists only on the
+    exporting node. Arc warns at startup.
+  - On object storage, a measurement whose data is all gone but whose table
+    metadata remains is still listed.
+
 ## Fix: local storage fsyncs what it writes, so a power loss cannot take acknowledged rows ([#1618](https://github.com/Basekick-Labs/arc/issues/1618))
 
 The local storage backend renamed each written file into place without

@@ -61,6 +61,20 @@ const (
 	// is symmetric, so the same key that lets a spoke prove authorship lets the
 	// hub prove receipt.
 	syncLabelAck = "sync-ack"
+
+	// syncLabelAckHeld marks the hub's held attestation inside an ack (edge
+	// sync 3c, #1684): which acknowledged files it provably holds, at
+	// verification time. Length 13, distinct from 8, 9, 11 and 14. Separate
+	// from the ack MAC so an older spoke keeps validating the ack it knows,
+	// and bound to that ack (imported_at, paths digest) so held lists cannot
+	// move between two genuine acks.
+	syncLabelAckHeld = "sync-ack-held"
+
+	// syncLabelRelayRefusal marks a hub's refusal note for a relay bundle
+	// (edge sync 3d, #1685). Length 18, distinct from 8, 9, 11, 13 and 14.
+	// Signed so that bucket write access alone cannot make a spoke fail its
+	// rows: a forged refusal would otherwise need an operator to undo.
+	syncLabelRelayRefusal = "sync-relay-refusal"
 )
 
 // ErrSyncAuthMalformedField is returned when a field carries a NUL byte.
@@ -357,6 +371,43 @@ func ValidateSyncAckHMAC(sharedSecret, bundleID, spokeID, hubID string, imported
 	return nil
 }
 
+// ComputeSyncAckHeldHMAC signs a hub's held attestation (#1684): the files of
+// an acknowledged bundle it provably held when it verified, split into held
+// (its own file) and held_compacted (inside a compacted file or a cold copy).
+//
+// Binds the same bundle, identities, imported_at and paths digest as the ack
+// MAC, plus when the hub verified and both held digests (AckPathsDigest of
+// each list). No freshness check here: the spoke bounds an attestation's age
+// on its own clock.
+//
+// Format: "sync-ack-held" \x00 bundleID \x00 spokeID \x00 hubID \x00 importedAt
+// \x00 pathsDigest \x00 verifiedAt \x00 heldDigest \x00 heldCompactedDigest
+func ComputeSyncAckHeldHMAC(sharedSecret, bundleID, spokeID, hubID string, importedAt int64, pathsDigest string, verifiedAt int64, heldDigest, heldCompactedDigest string) (string, error) {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, pathsDigest, heldDigest, heldCompactedDigest); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(computeSyncAckHeldHMACRaw(sharedSecret, bundleID, spokeID, hubID, importedAt, pathsDigest, verifiedAt, heldDigest, heldCompactedDigest)), nil
+}
+
+func computeSyncAckHeldHMACRaw(sharedSecret, bundleID, spokeID, hubID string, importedAt int64, pathsDigest string, verifiedAt int64, heldDigest, heldCompactedDigest string) []byte {
+	return computeRawHMAC(sharedSecret, canonicalSyncInput(
+		syncLabelAckHeld, bundleID, spokeID, hubID,
+		strconv.FormatInt(importedAt, 10), pathsDigest,
+		strconv.FormatInt(verifiedAt, 10), heldDigest, heldCompactedDigest))
+}
+
+// ValidateSyncAckHeldHMAC checks a held attestation's MAC.
+func ValidateSyncAckHeldHMAC(sharedSecret, bundleID, spokeID, hubID string, importedAt int64, pathsDigest string, verifiedAt int64, heldDigest, heldCompactedDigest, receivedMAC string) error {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, pathsDigest, heldDigest, heldCompactedDigest); err != nil {
+		return err
+	}
+	expected := computeSyncAckHeldHMACRaw(sharedSecret, bundleID, spokeID, hubID, importedAt, pathsDigest, verifiedAt, heldDigest, heldCompactedDigest)
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return ErrSyncAuthInvalid
+	}
+	return nil
+}
+
 // AckPathsDigest hashes the acknowledged path list into the value the MAC binds.
 //
 // Same canonicalization discipline as BundleEntriesDigest, and for the same
@@ -563,3 +614,31 @@ func SyncNonceKey(spokeID string) (string, error) {
 // Compile-time check that the concrete cache satisfies the interface, so a
 // change to NonceCache.Track cannot silently break sync's replay protection.
 var _ ReplayGuard = (*NonceCache)(nil)
+
+// ComputeSyncRelayRefusalHMAC signs a hub's refusal of a relay bundle (#1685).
+//
+// Format: "sync-relay-refusal" \x00 bundleID \x00 spokeID \x00 hubID \x00
+// refusedAt \x00 reason
+func ComputeSyncRelayRefusalHMAC(sharedSecret, bundleID, spokeID, hubID string, refusedAt int64, reason string) (string, error) {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, reason); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(computeSyncRelayRefusalHMACRaw(sharedSecret, bundleID, spokeID, hubID, refusedAt, reason)), nil
+}
+
+func computeSyncRelayRefusalHMACRaw(sharedSecret, bundleID, spokeID, hubID string, refusedAt int64, reason string) []byte {
+	return computeRawHMAC(sharedSecret, canonicalSyncInput(
+		syncLabelRelayRefusal, bundleID, spokeID, hubID, strconv.FormatInt(refusedAt, 10), reason))
+}
+
+// ValidateSyncRelayRefusalHMAC checks a relay refusal note's MAC.
+func ValidateSyncRelayRefusalHMAC(sharedSecret, bundleID, spokeID, hubID string, refusedAt int64, reason, receivedMAC string) error {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, reason); err != nil {
+		return err
+	}
+	expected := computeSyncRelayRefusalHMACRaw(sharedSecret, bundleID, spokeID, hubID, refusedAt, reason)
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return ErrSyncAuthInvalid
+	}
+	return nil
+}

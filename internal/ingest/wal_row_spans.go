@@ -171,3 +171,24 @@ func (s *walRowSpans) lostWithoutCopy(written []bool) int {
 	}
 	return lost
 }
+
+// storedWithoutCopy counts the rows of records without a WAL copy that are at
+// a written position: stored rows the WAL does not hold, which Close's drain
+// must not count among the rows it still holds (#1693).
+func (s *walRowSpans) storedWithoutCopy(written []bool) int {
+	if s == nil {
+		return 0
+	}
+	n := 0
+	for _, sp := range s.spans {
+		if sp.copied {
+			continue
+		}
+		for p := sp.lo; p < sp.hi && p < len(written); p++ {
+			if written[p] {
+				n++
+			}
+		}
+	}
+	return n
+}
