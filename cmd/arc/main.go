@@ -5649,6 +5649,7 @@ func main() {
 			TLSEnabled:  cfg.Server.TLSEnabled,
 			TLSCertFile: cfg.Server.TLSCertFile,
 			TLSKeyFile:  cfg.Server.TLSKeyFile,
+			Version:     Version,
 			Middleware:  flightSQLMiddleware,
 		}, logger.Get("flight-sql"))
 		if err != nil {

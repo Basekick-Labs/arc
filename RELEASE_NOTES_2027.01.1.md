@@ -263,6 +263,29 @@ These cases are still not repaired:
 - **Each file gets one repair attempt.** A second damaged length in the same
   file reads as before.
 
+## Fix: a compressed MessagePack write over the size limit answers 413 ([#1651](https://github.com/Basekick-Labs/arc/pull/1651))
+
+A gzip or zstd MessagePack body that fits `server.max_payload_size` but
+decompresses past it was answered `400`, the status for a malformed request.
+A client that splits a batch on `413` (the Node-RED node, [node-red-arc#3](https://github.com/Basekick-Labs/node-red-arc/issues/3))
+therefore failed the whole batch instead of splitting it. It now answers `413`,
+as an oversized uncompressed body already did:
+
+```
+413 {"error":"Payload too large: decompressed payload exceeds 4MB limit. Consider batching into smaller requests."}
+```
+
+The message keeps the text the `400` carried (`decompressed payload exceeds
+<limit> limit`); its `Invalid gzip compression:` / `Invalid zstd compression:`
+prefix is gone. Under a limit below 32 MB, a zstd frame whose window is over
+the limit answers `413` too (`the zstd frame's 2MB window exceeds the 1MB
+limit`): `zstd -3`, and Node's `zstdCompressSync`, give a large batch a 2 MB
+window, and a smaller batch gets a smaller one. A corrupt body, and a frame
+whose window is over 32 MB (`--ultra`, `--long`), still answer `400`. `GET /api/v1/write/msgpack/spec` says so. Line
+Protocol and TLE writes are unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir).
+
 ## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
 
 With the WAL on and object storage as the backend, a flush whose upload hit
@@ -3183,8 +3206,8 @@ tables for ADBC clients. Results stopped at a governance row cap end with a
 Flight queries are audited and logged like HTTP queries, with the client's
 address. Metadata calls run one query per database, plus one per measurement
 when schemas are requested, and count against governance limits. Prepared
-statements and SqlInfo are not implemented yet, so JDBC-based BI tools are not
-expected to work; the ADBC drivers are the tested clients. See
+statements are not implemented yet, so JDBC-based BI tools cannot run queries;
+the ADBC drivers are the tested clients. See
 `docs/operations/flight-sql.md`.
 
 Both Helm charts can turn it on: `flightSql.enabled` (default `false`),
@@ -3195,6 +3218,28 @@ are not given the listener. A port that collides with one of Arc's is refused
 when the chart renders.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https://github.com/Basekick-Labs/arc/pull/1419).
+
+### Flight SQL answers SqlInfo ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener answers `GetSqlInfo` with the server name (`Arc`), the
+Arc and Arrow versions, that it is read-only and takes SQL but not Substrait,
+transactions, cancellation, bulk ingestion or DDL, the identifier quote (`"`),
+the metadata search-pattern escape (`\`), the catalog term (`database`), and
+the query grammar it supports: column and table aliases, `GROUP BY`, `UNION`
+and `UNION ALL`, full outer joins, subqueries (correlated too), expressions and
+unrelated columns in `ORDER BY`, and `LIKE ... ESCAPE`. The JDBC driver reads a
+value the server leaves out as `false`, so without these it would report that
+Arc has no `GROUP BY`, `UNION`, joins or subqueries.
+Before, every SqlInfo request failed with `NotFound`: ADBC's `GetInfo` failed
+with it (`adbc_get_info()` in Python), and with the Arrow Flight SQL JDBC driver
+every `DatabaseMetaData` call that reads SqlInfo threw, such as
+`getDatabaseProductName()` and `getIdentifierQuoteString()`. A request that
+includes IDs Arc has no value for, as ADBC's does for the Substrait version
+range, is answered with the rest. Queries through the JDBC driver still need
+prepared statements, which are not implemented yet. See
+`docs/operations/flight-sql.md`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.
 
 ### Flight SQL accepts an Arc token in a bearer-token handshake ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
 
