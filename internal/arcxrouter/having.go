@@ -948,6 +948,14 @@ func havingRef(c *cursor, hc havingCtx, st *havingState) (string, havingRefInfo,
 					return "", havingRefInfo{}, false
 				}
 				itemText = "count(*)"
+			} else if t.lower == "count" && c.peekIdentLower() == "distinct" {
+				// cd-1: the select list's own re-serialization, so a selected
+				// `count(DISTINCT x)` matches and an unselected one is a hidden item.
+				var dok bool
+				itemText, dok = readCountDistinct(c, false)
+				if !dok {
+					return "", havingRefInfo{}, false
+				}
 			} else if predArgAggFns[t.lower] && predArgFollows(c) {
 				// res-3 (review M4): a predicate argument, re-serialized by the select
 				// list's own canonicaliser — a text match here implies the engine's

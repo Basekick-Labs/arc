@@ -178,7 +178,14 @@ func classifyDecline(toks []token) declineReason {
 				hasGroupBy = true
 			}
 		case "distinct":
-			hasDistinct = true
+			// `count(DISTINCT …)` is an aggregate the engine serves (arcX cd-1);
+			// a query declined while carrying one is declined for something else
+			// (`count` already marks it as aggregation), so it does not claim the
+			// select-DISTINCT bucket.
+			if !(i >= 2 && toks[i-1].kind == tokPunct && toks[i-1].punct == '(' &&
+				toks[i-2].kind == tokIdent && toks[i-2].lower == "count") {
+				hasDistinct = true
+			}
 		case "offset":
 			hasOffset = true
 		default:

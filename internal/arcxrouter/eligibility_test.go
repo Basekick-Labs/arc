@@ -148,7 +148,7 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"having on an unknown name", "SELECT host, count(*) FROM cpu GROUP BY host HAVING nope > 1"},
 		{"having with an integer division over an agg", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) // 2 > 2"},
 		{"having comparing two aggs", "SELECT host, count(*), sum(x) FROM cpu GROUP BY host HAVING count(*) > sum(x)"},
-		{"having count(DISTINCT)", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(DISTINCT x) > 1"},
+		{"having sum(DISTINCT)", "SELECT host, count(*) FROM cpu GROUP BY host HAVING sum(DISTINCT x) > 1"},
 		{"ungrouped having", "SELECT count(*) FROM cpu HAVING count(*) > 1"},
 		{"having on a bucket alias that was never declared", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 HAVING h > 1"},
 		// "agg sum not count": the agg-3 surface itself — now eligible (grouped).

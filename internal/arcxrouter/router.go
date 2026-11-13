@@ -621,9 +621,13 @@ func isAggItem(item string) bool {
 	inner := item[open+1 : len(item)-1]
 	fn := item[:open]
 	switch {
-	// `count` also takes a map subscript `m['k']` (map-2); every other unary
+	// `count` also takes a map subscript `m['k']` (map-2) and the cd-1 form
+	// `DISTINCT <col>` (exactly readCountDistinct's emission); every other unary
 	// aggregate (agg-1 set, mean, the agg-6a moments) stays bare.
 	case fn == "count":
+		if col, ok := strings.CutPrefix(inner, "DISTINCT "); ok {
+			return isColumnRef(col)
+		}
 		return isColumnRef(inner)
 	// agg-7: `quantile_*(col, q)` — exactly a bare ident and a fraction.
 	case quantileAggFns[fn]:
