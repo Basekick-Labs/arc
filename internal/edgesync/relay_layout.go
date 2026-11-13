@@ -7,7 +7,7 @@ import (
 )
 
 // Relay bucket layout (edge sync 3d, #1685). Keys are relative to the relay
-// backend, whose own prefix (s3_prefix, azure_prefix, or local_path) is the
+// backend, whose own prefix (s3_prefix, azure_prefix, gcs_prefix, or local_path) is the
 // relay's root: there is no second prefix to compose with it, so a key is
 // built in exactly one place.
 //

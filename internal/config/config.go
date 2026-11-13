@@ -413,7 +413,7 @@ func (c EdgeSyncImportConfig) Active() bool { return c.Enabled || c.Relay.Enable
 
 // EdgeSyncRelayConfig configures one side of the relay transport (#1685): a
 // spoke and its hub exchange bundles and acks through an object store both
-// can reach. The target's own prefix (s3_prefix, azure_prefix) or local_path
+// can reach. The target's own prefix (s3_prefix, azure_prefix, gcs_prefix) or local_path
 // is the relay's root; spoke prefixes sit directly under it.
 type EdgeSyncRelayConfig struct {
 	// Enabled turns the relay on for this side.
@@ -428,7 +428,7 @@ type EdgeSyncRelayConfig struct {
 	// StagingDir (hub only): where a bundle is downloaded to be verified and
 	// imported, one at a time. Default ./data/edge_sync_relay_staging.
 	StagingDir string
-	// Target is the bucket: type (local, s3, minio, azure, azblob) and the
+	// Target is the bucket: type (local, s3, minio, azure, azblob, gcs) and the
 	// same per-backend keys a backup target takes. Name is "relay".
 	Target BackupTargetConfig
 }

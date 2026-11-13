@@ -85,12 +85,20 @@ func (c *Config) checkRelayTarget(k string, t BackupTargetConfig) error {
 		if t.AzureContainer == "" {
 			return fmt.Errorf("%s.type is %q but %s.azure_container is empty", k, t.Type, k)
 		}
-	case "":
-		return fmt.Errorf("%s.enabled=true requires %s.type: \"local\", \"s3\", \"minio\", \"azure\" or \"azblob\"", k, k)
 	case "gcs":
-		return fmt.Errorf("%s.type \"gcs\" is not supported for the relay yet; use \"s3\" (GCS's S3 interoperability API works), \"azure\" or \"local\"", k)
+		if t.GCSBucket == "" {
+			return fmt.Errorf("%s.type is \"gcs\" but %s.gcs_bucket is empty", k, k)
+		}
+		if err := refuseGCSInFIPSBuild(k + ".type"); err != nil {
+			return err
+		}
+		if err := checkGCSEndpoint(k+".gcs_endpoint", t.GCSEndpoint); err != nil {
+			return err
+		}
+	case "":
+		return fmt.Errorf("%s.enabled=true requires %s.type: \"local\", \"s3\", \"minio\", \"azure\", \"azblob\" or \"gcs\"", k, k)
 	default:
-		return fmt.Errorf("%s.type %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\" or \"azblob\"", k, t.Type)
+		return fmt.Errorf("%s.type %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", \"azblob\" or \"gcs\"", k, t.Type)
 	}
 	if _, err := t.KeyPrefix(); err != nil {
 		return fmt.Errorf("%s.%s: %w", k, prefixKeyName(t.Type), err)

@@ -451,8 +451,8 @@ enabled = false
 # can reach (spokes behind NAT, intermittent links, no inbound to the hub).
 # Scheduled passes need the paid license; the manual routes are free:
 # POST /api/v1/spoke-sync/relay/run (spoke), POST /api/v1/bundle-import/relay/run (hub).
-# The target keys are a backup target's: type = "local", "s3", "minio", "azure"
-# or "azblob" with local_path / s3_* / azure_*. The target's own prefix is the
+# The target keys are a backup target's: type = "local", "s3", "minio", "azure",
+# "azblob" or "gcs" with local_path / s3_* / azure_* / gcs_*. The target's own prefix is the
 # relay root; it must not overlap primary storage, the cold tier or a backup target.
 # Relay bundles use [edge_sync.spoke.bundle] max_files / max_bytes (10000 / 64 GiB)
 # and its timeout for a manual pass; the hub's staging_dir must hold one bundle.

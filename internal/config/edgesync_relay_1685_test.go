@@ -76,7 +76,15 @@ func TestEdgeSyncRelayConfig(t *testing.T) {
 		}},
 		{"spoke needs a secret", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_SECRET": ""}), "ARC_EDGE_SYNC_SPOKE_SECRET", nil},
 		{"spoke needs a type", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_RELAY_TYPE": ""}), "relay.type", nil},
-		{"gcs refused", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_RELAY_TYPE": "gcs"}), "not supported", nil},
+		{"gcs needs a bucket", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_RELAY_TYPE": "gcs"}), "gcs_bucket", nil},
+		{"gcs with a prefix", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_RELAY_TYPE": "gcs",
+			"ARC_EDGE_SYNC_SPOKE_RELAY_GCS_BUCKET": "relay", "ARC_EDGE_SYNC_SPOKE_RELAY_GCS_PREFIX": "fleet-c/"}), "", func(t *testing.T, c *Config) {
+			if tg := c.EdgeSync.Spoke.Relay.Target; tg.GCSBucket != "relay" || tg.GCSPrefix != "fleet-c/" {
+				t.Fatalf("target = %+v", tg)
+			}
+		}},
+		{"gcs http endpoint refused", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_RELAY_TYPE": "gcs",
+			"ARC_EDGE_SYNC_SPOKE_RELAY_GCS_BUCKET": "relay", "ARC_EDGE_SYNC_SPOKE_RELAY_GCS_ENDPOINT": "http://example.com"}), "https", nil},
 		{"relative local path refused", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_RELAY_LOCAL_PATH": "relay"}), "absolute", nil},
 		{"ack timeout not past interval", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_RELAY_ACK_TIMEOUT": "5m"}), "ack_timeout", nil},
 		{"bad interval", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_RELAY_INTERVAL": "0s"}), "relay.interval", nil},
