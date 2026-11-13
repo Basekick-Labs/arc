@@ -418,6 +418,15 @@ func TestASyncDoesNotAnswerACheckpointWrittenAfterItStarted(t *testing.T) {
 	mark2 := make(chan error, 1)
 	go func() { mark2 <- w.MarkFlushed(second) }()
 	waitFor(t, "the second entry and its checkpoint written", func() bool { return atomic.LoadInt64(&w.TotalEntries) >= entries+2 })
+	// TotalEntries moves just before the checkpoint's waiter is handed to the
+	// syncer; wait for the handoff too, so the release below cannot land
+	// before the syncer knows of the second checkpoint. Waiters stay listed
+	// until their sync completes, so two means both are registered.
+	waitFor(t, "the second checkpoint handed to the syncer", func() bool {
+		w.syncMu.Lock()
+		defer w.syncMu.Unlock()
+		return len(w.syncWaiters) == 2
+	})
 
 	release(0)
 	require.NoError(t, recv("the first checkpoint", mark1))

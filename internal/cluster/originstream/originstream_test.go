@@ -416,7 +416,10 @@ func TestSlowStandbyOnlyLosesItsOwn(t *testing.T) {
 	// under its 8 MiB queue, so it cannot overflow its own queue however slow
 	// the runner is. A fixed rate let a good standby slowed by a loaded -race
 	// runner overflow its own queue, which read as a gap caused by the stuck
-	// one (#1672). Any gap now is the stuck standby's doing.
+	// one (#1672). Any gap now is the stuck standby's doing. The trade: this
+	// test proves the good standby LOSES nothing; a stuck standby that only
+	// slowed the good one's sender would pass unless it stalled it past the
+	// deadline below.
 	const lag = 32
 	goodLast := func() uint64 {
 		good.mu.Lock()
@@ -427,20 +430,24 @@ func TestSlowStandbyOnlyLosesItsOwn(t *testing.T) {
 		}
 		return d.keys["db/a"].last
 	}
+	// Entries not sent to the good standby leave it short (a run of lag or
+	// more stalls the producer) or with a gap: both report the gaps.
+	waitGood := func(want uint64) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); goodLast() < want; time.Sleep(2 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the good standby stopped at %d, want %d of %d, with gaps %v because another standby is slow",
+					goodLast(), want, n, keyGaps(good, "primary", p.instance, "db/a"))
+			}
+		}
+	}
 	for c := uint64(1); c <= n; c++ {
 		if c > lag {
-			waitFor(t, "the good standby to keep up", func() bool { return goodLast() >= c-lag })
+			waitGood(c - lag)
 		}
 		hook(p, "db/a", c, big)
 	}
-	// An entry not sent to the good standby leaves it short of n, or with a
-	// gap below n: both are reported with the gaps.
-	for deadline := time.Now().Add(5 * time.Second); goodLast() != n; time.Sleep(2 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("the good standby stopped at %d of %d with gaps %v because another standby is slow",
-				goodLast(), n, keyGaps(good, "primary", p.instance, "db/a"))
-		}
-	}
+	waitGood(n)
 	if g := keyGaps(good, "primary", p.instance, "db/a"); len(g) != 0 {
 		t.Fatalf("the good standby has gaps %v because another standby is slow", g)
 	}
