@@ -250,7 +250,9 @@ func TestRelay_RefusalFailsRowsAndStopsResending(t *testing.T) {
 }
 
 // Content the spoke did not sign: a data object swapped for one of the same
-// size verifies the MAC but not the digest. Refused, nothing committed.
+// size verifies the MAC but not the digest. Nothing is committed, and it is
+// NOT a refusal: the spoke re-sending the same files (ack_timeout) cures it,
+// so the hub retries instead of failing the spoke's rows (review H1).
 func TestRelay_SwappedDataObjectRefused(t *testing.T) {
 	r := newRelayRig(t)
 	ctx := context.Background()
@@ -259,16 +261,19 @@ func TestRelay_SwappedDataObjectRefused(t *testing.T) {
 	if err := r.relay.Write(ctx, RelayOutboxPrefix(testSpokeID, id)+"data/"+relayPath(0), []byte("PAYLOAD 0")); err != nil {
 		t.Fatal(err)
 	}
-	if p := r.poll(t); p.Refused != 1 || p.Imported != 0 {
+	if p := r.poll(t); p.Refused != 0 || p.Failed != 1 || p.Imported != 0 {
 		t.Fatalf("poll = %+v", p)
+	}
+	if k := r.keys(t, RelayRejectedDir(testSpokeID)); len(k) != 0 {
+		t.Fatalf("a content error wrote a refusal: %v", k)
 	}
 	if ok, _ := r.hub.hubStore.Exists(ctx, NamespacedPath(testSpokeID, relayPath(0))); ok {
 		t.Fatal("a refused bundle's file was committed")
 	}
 }
 
-// A data object larger than declared is refused while downloading, at its
-// declared size, not after the hub has stored all of it.
+// A data object larger than declared is stopped while downloading, at its
+// declared size, not after the hub has stored all of it; transient, as above.
 func TestRelay_OversizedDataObjectRefused(t *testing.T) {
 	r := newRelayRig(t)
 	ctx := context.Background()
@@ -277,7 +282,7 @@ func TestRelay_OversizedDataObjectRefused(t *testing.T) {
 	if err := r.relay.Write(ctx, RelayOutboxPrefix(testSpokeID, id)+"data/"+relayPath(0), []byte(strings.Repeat("x", 1<<20))); err != nil {
 		t.Fatal(err)
 	}
-	if p := r.poll(t); p.Refused != 1 {
+	if p := r.poll(t); p.Refused != 0 || p.Failed != 1 {
 		t.Fatalf("poll = %+v", p)
 	}
 }
@@ -319,6 +324,10 @@ func TestRelay_OtherHubsBundleLeftAlone(t *testing.T) {
 	}
 	if k := r.keys(t, RelayRejectedDir(testSpokeID)); len(k) != 0 {
 		t.Fatalf("note written for another hub's bundle: %v", k)
+	}
+	// Remembered: the next poll does not fetch it again.
+	if p := r.poll(t); p.Skipped != 0 {
+		t.Fatalf("a foreign bundle was re-fetched: %+v", p)
 	}
 }
 
@@ -463,5 +472,124 @@ func TestWriteIfAbsentFallsBackWhenTheConditionErrors(t *testing.T) {
 	created, err := writeIfAbsent(context.Background(), f, "s/acks/x.json", []byte("ack"))
 	if err != nil || !created || f.plainWrites != 1 {
 		t.Fatalf("created=%v err=%v plain=%d", created, err, f.plainWrites)
+	}
+}
+
+// A refusal note without the hub's signature is ignored: bucket write access
+// alone must not fail a spoke's rows (review H2).
+func TestRelay_ForgedRefusalIgnored(t *testing.T) {
+	r := newRelayRig(t)
+	ctx := context.Background()
+	r.write(t, relayPath(0), "payload 0")
+	id := r.spokePass(t).Exported.BundleID
+	raw, _ := json.Marshal(RelayRefusal{BundleID: id, SpokeID: testSpokeID, HubID: testHubID, Reason: "forged", RefusedAt: 1, MAC: strings.Repeat("0", 64)})
+	if err := r.relay.Write(ctx, RelayRejectedKey(testSpokeID, id), raw); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.spokePass(t); res.Refused != 0 {
+		t.Fatalf("forged refusal acted on: %+v", res)
+	}
+	if got := r.state(t, relayPath(0)); got != StateExported {
+		t.Fatalf("state = %s", got)
+	}
+}
+
+// A replayed genuine ack, put back under its own key beside a planted
+// manifest, advances only rows still exported on that bundle: a row that
+// was re-queued since (pending) stays pending (review M4).
+func TestRelay_ReplayedAckAdvancesOnlyThatBundlesRows(t *testing.T) {
+	r := newRelayRig(t)
+	ctx := context.Background()
+	r.write(t, relayPath(0), "payload 0")
+	id := r.spokePass(t).Exported.BundleID
+	r.poll(t)
+	ack, err := r.relay.Read(ctx, RelayAckKey(testSpokeID, id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := r.relay.Read(ctx, RelayOutboxPrefix(testSpokeID, id)+manifestName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.spokePass(t) // applies, removes the bundle
+	if err := r.ledger.RequeueSynced(ctx, testHubID, relayPath(0)); err != nil {
+		t.Fatal(err)
+	}
+	// The replay: the old ack and a manifest at the bundle's own keys.
+	if err := r.relay.Write(ctx, RelayAckKey(testSpokeID, id), ack); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.relay.Write(ctx, RelayOutboxPrefix(testSpokeID, id)+manifestName, manifest); err != nil {
+		t.Fatal(err)
+	}
+	res := &RelaySpokeResult{}
+	if !r.spoke.applyAck(ctx, testSpokeID, id, res) {
+		t.Fatal("the replayed ack verifies and should be processed")
+	}
+	if res.Synced != 0 {
+		t.Fatalf("replay advanced %d rows", res.Synced)
+	}
+	if got := r.state(t, relayPath(0)); got != StatePending {
+		t.Fatalf("state = %s, want pending", got)
+	}
+}
+
+// A relay bundle that vanished from the bucket is taken back from the
+// ledger; a drive bundle in transit is not touched (review M3).
+func TestRelay_VanishedBundleIsTakenBack(t *testing.T) {
+	r := newRelayRig(t)
+	ctx := context.Background()
+	r.write(t, relayPath(0), "payload 0")
+	r.write(t, relayPath(1), "payload 1")
+	if _, err := r.exporter.discoverer.Discover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ledger.MarkExported(ctx, testHubID, relayPath(1), "DRIVEBUNDLE0000000000000000"); err != nil {
+		t.Fatal(err)
+	}
+	id := r.spokePass(t).Exported.BundleID
+	for _, k := range r.keys(t, RelayOutboxPrefix(testSpokeID, id)) {
+		_ = r.relay.Delete(ctx, k)
+	}
+	pruneEmptyLocalDirs(r.relay, RelayOutboxPrefix(testSpokeID, id))
+	res := r.spokePass(t)
+	if res.Reverted != 1 || res.Exported == nil {
+		t.Fatalf("pass = %+v", res)
+	}
+	if got := r.state(t, relayPath(1)); got != StateExported {
+		t.Fatalf("drive bundle row = %s, want still exported", got)
+	}
+}
+
+// A prefix naming no registered spoke costs no fetch at all.
+func TestRelay_UnregisteredPrefixNotFetched(t *testing.T) {
+	r := newRelayRig(t)
+	ctx := context.Background()
+	id, _ := NewBundleID(time.Now())
+	if err := r.relay.Write(ctx, RelayOutboxPrefix("stranger", id)+manifestName, []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	if p := r.poll(t); p.Skipped != 1 || p.Refused+p.Failed != 0 {
+		t.Fatalf("poll = %+v", p)
+	}
+}
+
+// A drive import holding the importer is found before any data download,
+// and is not a failure.
+func TestRelay_DriveImportInProgressWaits(t *testing.T) {
+	r := newRelayRig(t)
+	r.write(t, relayPath(0), "payload 0")
+	r.spokePass(t)
+	unlock, ok := r.hub.importer.tryLock()
+	if !ok {
+		t.Fatal("lock")
+	}
+	p := r.poll(t)
+	unlock()
+	if p.Failed != 0 || p.Imported != 0 {
+		t.Fatalf("poll = %+v", p)
+	}
+	if p := r.poll(t); p.Imported != 1 {
+		t.Fatalf("after the drive import: %+v", p)
 	}
 }

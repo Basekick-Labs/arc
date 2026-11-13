@@ -166,13 +166,48 @@ func (r *RelaySpoke) Run(ctx context.Context) (*RelaySpokeResult, error) {
 		r.logger.Warn().Str("bundle_id", id).Int64("files", n).Dur("ack_timeout", r.ackTimeout).
 			Msg("Relay: no acknowledgment within edge_sync.spoke.relay.ack_timeout; its files go in the next bundle")
 		r.removeBundle(ctx, spokeID, id)
+		_ = r.exporter.ledger.ForgetRelayBundle(ctx, id)
 	}
 
 	// Single-flight makes every manifest-less prefix a leftover: an export
-	// that failed partway, or a removal that crashed after its manifest.
+	// that failed partway (no row marked yet), or a removal that crashed
+	// after its manifest (rows already settled), or a manifest something
+	// else deleted. Reverting is a no-op for the first two and the recovery
+	// for the third.
 	for _, id := range partial {
+		if n, err := r.exporter.ledger.RevertExported(ctx, r.exporter.hubID, id); err == nil {
+			res.Reverted += int(n)
+		}
 		if r.removeBundle(ctx, spokeID, id) {
 			res.Swept++
+		}
+	}
+
+	// A relay bundle that vanished from the bucket entirely (a lifecycle
+	// rule, an operator): nothing lists it, so only the ledger knows. Its
+	// rows would otherwise stay exported for good. Scoped to bundles this
+	// spoke recorded as relay bundles, so a drive in transit is untouched.
+	listed := map[string]bool{}
+	for _, id := range dirs {
+		listed[id] = true
+	}
+	if recorded, err := r.exporter.ledger.RelayBundles(ctx); err != nil {
+		r.logger.Warn().Err(err).Msg("Relay: could not read the relay bundle record; retrying next pass")
+	} else {
+		for _, id := range recorded {
+			if listed[id] {
+				continue
+			}
+			n, err := r.exporter.ledger.RevertExported(ctx, r.exporter.hubID, id)
+			if err != nil {
+				continue
+			}
+			if n > 0 {
+				res.Reverted += int(n)
+				r.logger.Warn().Str("bundle_id", id).Int64("files", n).
+					Msg("Relay: a bundle disappeared from the bucket before it was answered; its files go in the next bundle")
+			}
+			_ = r.exporter.ledger.ForgetRelayBundle(ctx, id)
 		}
 	}
 
@@ -180,6 +215,10 @@ func (r *RelaySpoke) Run(ctx context.Context) (*RelaySpokeResult, error) {
 	switch {
 	case err == nil:
 		res.Exported = exp
+		if err := r.exporter.ledger.RecordRelayBundle(ctx, exp.BundleID); err != nil {
+			r.logger.Warn().Err(err).Str("bundle_id", exp.BundleID).
+				Msg("Relay: could not record the bundle; if it vanishes from the bucket its files need POST /api/v1/spoke-sync/export/{id}/revert")
+		}
 	case errors.Is(err, ErrNothingToExport):
 	default:
 		return res, fmt.Errorf("edgesync: relay export: %w", err)
@@ -207,7 +246,21 @@ func (r *RelaySpoke) applyAck(ctx context.Context, spokeID, bundleID string, res
 		return false
 	}
 
-	ar, err := r.exporter.applyVerifiedAck(ctx, ack)
+	// Only paths that left on THIS bundle. A signed ack is replayable by
+	// anyone with bucket write, and ApplyAck would otherwise advance any row
+	// at a named path, pending ones included (a file the network verify
+	// re-queued because the hub forgot it would then never be re-sent).
+	onBundle, err := r.exporter.ledger.ExportedOnBundle(ctx, r.exporter.hubID, bundleID)
+	if err != nil {
+		log.Warn().Err(err).Msg("Relay: could not read the bundle's rows; retrying next pass")
+		return false
+	}
+	scoped := *ack
+	scoped.Paths = keepOnBundle(ack.Paths, onBundle)
+	scoped.Held = keepOnBundle(ack.Held, onBundle)
+	scoped.HeldCompacted = keepOnBundle(ack.HeldCompacted, onBundle)
+
+	ar, err := r.exporter.applyVerifiedAck(ctx, &scoped)
 	if err != nil {
 		log.Warn().Err(err).Msg("Relay: could not apply an acknowledgment; retrying next pass")
 		return false
@@ -241,7 +294,18 @@ func (r *RelaySpoke) applyAck(ctx context.Context, spokeID, bundleID string, res
 	}
 	res.Reverted += int(n)
 	r.removeBundle(ctx, spokeID, bundleID)
+	_ = r.exporter.ledger.ForgetRelayBundle(ctx, bundleID)
 	return true
+}
+
+func keepOnBundle(paths []string, on map[string]bool) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if on[p] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // applyRefusal fails a refused bundle's files, so they are not re-sent until
@@ -254,8 +318,16 @@ func (r *RelaySpoke) applyRefusal(ctx context.Context, spokeID, bundleID string,
 		return false
 	}
 	var note RelayRefusal
-	if err := json.Unmarshal(raw, &note); err != nil {
-		note.Reason = "unreadable refusal note"
+	err = json.Unmarshal(raw, &note)
+	if err == nil {
+		err = note.verify(r.exporter.secret, spokeID, r.exporter.hubID, bundleID)
+	}
+	if err != nil {
+		// Not from the hub, or not for this bundle: failing the rows on it
+		// would need an operator to undo. The bundle waits; ack_timeout takes
+		// it back if the hub never answers.
+		log.Error().Err(err).Msg("Relay: refusal note failed verification; ignoring it")
+		return false
 	}
 	reason := truncateReason(strings.TrimSpace(note.Reason))
 	n, err := r.exporter.ledger.FailExported(ctx, r.exporter.hubID, bundleID, nil, "relay: hub refused the bundle: "+reason)
@@ -267,6 +339,7 @@ func (r *RelaySpoke) applyRefusal(ctx context.Context, spokeID, bundleID string,
 	log.Error().Str("reason", reason).Int64("files", n).
 		Msg("Relay: the hub refused this bundle; its files are failed. Fix the cause, then requeue them (POST /api/v1/spoke-sync/ledger/requeue)")
 	r.removeBundle(ctx, spokeID, bundleID)
+	_ = r.exporter.ledger.ForgetRelayBundle(ctx, bundleID)
 	return true
 }
 
@@ -292,6 +365,17 @@ func (r *RelaySpoke) removeBundle(ctx context.Context, spokeID, bundleID string)
 			return deleted
 		}
 		deleted = true
+	}
+	// A local relay stages uploads as hidden partials that List does not
+	// show; an upload that died mid-write leaves one behind.
+	if si, ok := r.relay.(storage.StagingInspector); ok {
+		if staged, err := si.ListStaged(ctx, prefix); err == nil {
+			for _, o := range staged {
+				if strings.HasPrefix(o.Path, prefix) && si.DeleteStaged(ctx, o.Path) == nil {
+					deleted = true
+				}
+			}
+		}
 	}
 	pruneEmptyLocalDirs(r.relay, prefix)
 	return deleted

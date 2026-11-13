@@ -69,6 +69,12 @@ const (
 	// and bound to that ack (imported_at, paths digest) so held lists cannot
 	// move between two genuine acks.
 	syncLabelAckHeld = "sync-ack-held"
+
+	// syncLabelRelayRefusal marks a hub's refusal note for a relay bundle
+	// (edge sync 3d, #1685). Length 18, distinct from 8, 9, 11, 13 and 14.
+	// Signed so that bucket write access alone cannot make a spoke fail its
+	// rows: a forged refusal would otherwise need an operator to undo.
+	syncLabelRelayRefusal = "sync-relay-refusal"
 )
 
 // ErrSyncAuthMalformedField is returned when a field carries a NUL byte.
@@ -608,3 +614,31 @@ func SyncNonceKey(spokeID string) (string, error) {
 // Compile-time check that the concrete cache satisfies the interface, so a
 // change to NonceCache.Track cannot silently break sync's replay protection.
 var _ ReplayGuard = (*NonceCache)(nil)
+
+// ComputeSyncRelayRefusalHMAC signs a hub's refusal of a relay bundle (#1685).
+//
+// Format: "sync-relay-refusal" \x00 bundleID \x00 spokeID \x00 hubID \x00
+// refusedAt \x00 reason
+func ComputeSyncRelayRefusalHMAC(sharedSecret, bundleID, spokeID, hubID string, refusedAt int64, reason string) (string, error) {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, reason); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(computeSyncRelayRefusalHMACRaw(sharedSecret, bundleID, spokeID, hubID, refusedAt, reason)), nil
+}
+
+func computeSyncRelayRefusalHMACRaw(sharedSecret, bundleID, spokeID, hubID string, refusedAt int64, reason string) []byte {
+	return computeRawHMAC(sharedSecret, canonicalSyncInput(
+		syncLabelRelayRefusal, bundleID, spokeID, hubID, strconv.FormatInt(refusedAt, 10), reason))
+}
+
+// ValidateSyncRelayRefusalHMAC checks a relay refusal note's MAC.
+func ValidateSyncRelayRefusalHMAC(sharedSecret, bundleID, spokeID, hubID string, refusedAt int64, reason, receivedMAC string) error {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, reason); err != nil {
+		return err
+	}
+	expected := computeSyncRelayRefusalHMACRaw(sharedSecret, bundleID, spokeID, hubID, refusedAt, reason)
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return ErrSyncAuthInvalid
+	}
+	return nil
+}

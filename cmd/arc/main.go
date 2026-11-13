@@ -3785,8 +3785,13 @@ func main() {
 			if cfg.Storage.Backend == "local" {
 				localRoot = cfg.Storage.LocalPath
 			}
-			policy, err := edgesync.NewDestinationPolicy(
-				cfg.EdgeSync.Spoke.Bundle.AllowedDirs, localRoot)
+			// A relay-only spoke builds the exporter too, but /export and /ack
+			// stay closed unless drive export is on: no allowed directories.
+			var allowedDirs []string
+			if cfg.EdgeSync.Spoke.Bundle.Enabled {
+				allowedDirs = cfg.EdgeSync.Spoke.Bundle.AllowedDirs
+			}
+			policy, err := edgesync.NewDestinationPolicy(allowedDirs, localRoot)
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to resolve the bundle destination policy; refusing to start")
 			}

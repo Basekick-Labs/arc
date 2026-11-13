@@ -8,19 +8,24 @@ import (
 )
 
 // ErrBundleRefused marks a relay bundle this hub refuses for good (#1685):
-// the signature does not verify, the bundle is malformed, or it is over this
-// hub's limits. Re-sending the same bundle cannot fix any of these, so the
-// relay poller writes a refusal note and stops looking at it. Wraps
-// ErrBundleInvalid.
+// its signed metadata does not verify, is malformed, names another key than
+// the one it was found under, or is over this hub's limits. All are facts
+// about what the spoke signed, so re-sending the same bundle cannot change
+// them; the relay poller writes a signed refusal note and stops looking at
+// it. Wraps ErrBundleInvalid.
 //
-// Deliberately narrower than ErrBundleInvalid, which also covers an unknown
-// or disabled spoke and a bundle addressed to another hub. Those can be one
-// registration away from importing, or belong to another hub sharing the
-// bucket, so the poller skips them without a note.
+// Deliberately narrower than ErrBundleInvalid. Nothing found AFTER the
+// metadata verified is a refusal: a data object that is missing, the wrong
+// size or the wrong content, a staging-disk error, or a spoke disabled
+// between precheck and import can all be cured by retrying or by the spoke
+// re-sending (its ack_timeout), and a refusal would instead fail the rows
+// until an operator requeues them.
 var ErrBundleRefused = fmt.Errorf("%w: refused", ErrBundleInvalid)
 
 // errBundleNotOurs marks a relay bundle the poller leaves alone without a
 // refusal note: an unknown or disabled spoke, or a bundle for another hub.
+// Either can be one registration away from importing, or belong to another
+// hub sharing the bucket.
 var errBundleNotOurs = errors.New("edgesync: relay bundle is not for this hub")
 
 // RelayPrecheck is what a relay hub knows about a bundle once its signed
@@ -32,16 +37,28 @@ type RelayPrecheck struct {
 	// Prior is the dedup record when this bundle was already imported, nil
 	// otherwise. A relay hub then rebuilds the ack instead of downloading.
 	Prior *ImportedBundle
+	// Secret is the spoke's, for signing a refusal or an ack.
+	Secret string
 }
 
-// PrecheckRelay authenticates a bundle directory holding only manifest.json
-// and entries.jsonl (#1685): identity, limits, the spoke's registration and
-// the MAC over the entries, so nothing an unauthenticated party wrote to the
-// bucket is downloaded. Then, and only then, the dedup check.
-//
-// Errors: ErrBundleRefused (permanent), errBundleNotOurs (skip), anything
-// else is transient.
-func (i *Importer) PrecheckRelay(ctx context.Context, dir string) (*RelayPrecheck, error) {
+// relaySpokeSecret is the first check on a relay key, before anything is
+// fetched: a prefix that names no enabled, registered spoke costs one
+// registry lookup and no download.
+func (i *Importer) relaySpokeSecret(ctx context.Context, spokeID string) (string, error) {
+	secret, err := i.registry.Secret(ctx, spokeID)
+	if err != nil {
+		if errors.Is(err, ErrSpokeNotFound) || errors.Is(err, ErrSpokeDisabled) || errors.Is(err, ErrSpokeIDCollision) {
+			return "", fmt.Errorf("%w: spoke %q: %w", errBundleNotOurs, spokeID, err)
+		}
+		return "", fmt.Errorf("edgesync: read spoke secret: %w", err)
+	}
+	return secret, nil
+}
+
+// checkRelayManifest checks a staged manifest.json alone, before the entry
+// list is fetched: the hub it names (not ours: skip), the key it was found
+// under, and the declared size.
+func (i *Importer) checkRelayManifest(dir, spokeID, bundleID string) (*Manifest, error) {
 	r, err := OpenBundle(dir, i.logger)
 	if err != nil {
 		if errors.Is(err, ErrBundleInvalid) {
@@ -53,6 +70,13 @@ func (i *Importer) PrecheckRelay(ctx context.Context, dir string) (*RelayPrechec
 	if m.HubID != i.hubID {
 		return nil, fmt.Errorf("%w: addressed to hub %q", errBundleNotOurs, truncateForError(m.HubID))
 	}
+	// The key the bundle was found under must be the bundle it signs: a
+	// manifest copied into another prefix would otherwise be acknowledged
+	// where its spoke never looks.
+	if m.SpokeID != spokeID || m.BundleID != bundleID {
+		return nil, fmt.Errorf("%w: found under %s/%s but signed as spoke %q bundle %q",
+			ErrBundleRefused, spokeID, bundleID, truncateForError(m.SpokeID), truncateForError(m.BundleID))
+	}
 	if m.EntryCount <= 0 {
 		return nil, fmt.Errorf("%w: bundle declares no entries", ErrBundleRefused)
 	}
@@ -60,13 +84,25 @@ func (i *Importer) PrecheckRelay(ctx context.Context, dir string) (*RelayPrechec
 		return nil, fmt.Errorf("%w: bundle declares %d entries, over this hub's limit of %d",
 			ErrBundleRefused, m.EntryCount, i.maxFiles)
 	}
-	secret, err := i.registry.Secret(ctx, m.SpokeID)
+	return m, nil
+}
+
+// PrecheckRelay authenticates a bundle directory holding only manifest.json
+// and entries.jsonl (#1685), after checkRelayManifest passed: the MAC over the
+// entries, so nothing an unauthenticated party wrote is downloaded, and every
+// declared path. Then, and only then, the dedup check.
+//
+// Errors: ErrBundleRefused (permanent), errBundleNotOurs (skip), anything
+// else is transient.
+func (i *Importer) PrecheckRelay(ctx context.Context, dir, secret string) (*RelayPrecheck, error) {
+	r, err := OpenBundle(dir, i.logger)
 	if err != nil {
-		if errors.Is(err, ErrSpokeNotFound) || errors.Is(err, ErrSpokeDisabled) || errors.Is(err, ErrSpokeIDCollision) {
-			return nil, fmt.Errorf("%w: spoke %q: %w", errBundleNotOurs, m.SpokeID, err)
+		if errors.Is(err, ErrBundleInvalid) {
+			return nil, fmt.Errorf("%w: %v", ErrBundleRefused, err)
 		}
-		return nil, fmt.Errorf("edgesync: read spoke secret: %w", err)
+		return nil, err
 	}
+	m := r.Manifest()
 	entries, err := r.VerifyManifest(ctx, secret)
 	if err != nil {
 		if errors.Is(err, ErrBundleInvalid) {
@@ -88,7 +124,7 @@ func (i *Importer) PrecheckRelay(ctx context.Context, dir string) (*RelayPrechec
 	if err != nil {
 		return nil, err
 	}
-	return &RelayPrecheck{Manifest: m, Entries: entries, Prior: prior}, nil
+	return &RelayPrecheck{Manifest: m, Entries: entries, Prior: prior, Secret: secret}, nil
 }
 
 // RebuildAck re-creates the acknowledgment for a bundle this hub already

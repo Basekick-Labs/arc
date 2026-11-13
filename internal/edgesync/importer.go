@@ -196,7 +196,22 @@ func (i *Importer) Import(ctx context.Context, dir string) (*ImportResult, error
 		return nil, ErrImportInProgress
 	}
 	defer i.mu.Unlock()
+	return i.importLocked(ctx, dir)
+}
 
+// tryLock takes the import lock for a caller that must hold it across more
+// than Import itself: the relay poller holds it while it downloads a bundle,
+// so a drive import running meanwhile is not discovered only after the
+// download (#1685). Returns ok=false, holding nothing, when it is taken.
+func (i *Importer) tryLock() (unlock func(), ok bool) {
+	if !i.mu.TryLock() {
+		return nil, false
+	}
+	return i.mu.Unlock, true
+}
+
+// importLocked is Import with the lock already held.
+func (i *Importer) importLocked(ctx context.Context, dir string) (*ImportResult, error) {
 	start := time.Now()
 
 	r, err := OpenBundle(dir, i.logger)

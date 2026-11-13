@@ -45,10 +45,9 @@ func scheduleRelay(name string, runner edgesync.SyncRunner, interval time.Durati
 	if clusterCoordinator != nil {
 		gate = newWriterClusterGate(clusterCoordinator)
 	}
-	retry := 30 * time.Second
-	if retry > interval {
-		retry = interval
-	}
+	// Retry at the interval itself: a bundle that keeps failing must not
+	// make the relay poll (and re-fetch) faster than configured.
+	retry := interval
 	s, err := edgesync.NewScheduler(edgesync.SchedulerConfig{
 		Agent:         runner,
 		LicenseClient: licenseClient,

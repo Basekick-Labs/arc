@@ -1795,3 +1795,65 @@ func (l *Ledger) KeepClaimed(ctx context.Context, hubID, path string) error {
 	}
 	return nil
 }
+
+// metaRelayBundle prefixes the sync_meta keys that record which bundles this
+// spoke put in its relay outbox (#1685). Drive and relay bundles share the
+// ledger's exported state; this is what tells them apart, so a relay bundle
+// that vanished from the bucket can be taken back without touching a drive
+// still in transit.
+const metaRelayBundle = "relay_bundle:"
+
+// RecordRelayBundle notes that bundleID went to the relay outbox.
+func (l *Ledger) RecordRelayBundle(ctx context.Context, bundleID string) error {
+	_, err := l.EnsureMetaOnce(ctx, metaRelayBundle+bundleID, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+// ForgetRelayBundle removes the note once the bundle is settled.
+func (l *Ledger) ForgetRelayBundle(ctx context.Context, bundleID string) error {
+	return l.ClearMeta(ctx, metaRelayBundle+bundleID)
+}
+
+// RelayBundles lists the bundle IDs recorded by RecordRelayBundle.
+func (l *Ledger) RelayBundles(ctx context.Context) ([]string, error) {
+	// A key range, not LIKE: "_" is a LIKE wildcard. ';' follows ':'.
+	rows, err := l.db.QueryContext(ctx,
+		`SELECT key FROM sync_meta WHERE key >= ? AND key < ? ORDER BY key`,
+		metaRelayBundle, strings.TrimSuffix(metaRelayBundle, ":")+";")
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: list relay bundles: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("edgesync: list relay bundles: %w", err)
+		}
+		out = append(out, strings.TrimPrefix(k, metaRelayBundle))
+	}
+	return out, rows.Err()
+}
+
+// ExportedOnBundle returns the paths still exported on bundleID.
+func (l *Ledger) ExportedOnBundle(ctx context.Context, hubID, bundleID string) (map[string]bool, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	rows, err := l.db.QueryContext(ctx,
+		`SELECT path FROM sync_ledger WHERE hub_id = ? AND exported_bundle_id = ? AND state = ?`,
+		hubID, bundleID, string(StateExported))
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: exported on bundle %q: %w", bundleID, err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("edgesync: exported on bundle %q: %w", bundleID, err)
+		}
+		out[p] = true
+	}
+	return out, rows.Err()
+}

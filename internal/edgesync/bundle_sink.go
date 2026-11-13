@@ -158,8 +158,12 @@ func (s *objectSink) abort(ctx context.Context) error {
 	s.mu.Lock()
 	keys := append([]string(nil), s.written...)
 	s.mu.Unlock()
+	// Newest first, so a manifest that committed although its put reported
+	// an error goes before the data it describes: an interrupted abort must
+	// not leave a bundle that looks complete.
 	var first error
-	for _, k := range keys {
+	for i := len(keys) - 1; i >= 0; i-- {
+		k := keys[i]
 		if err := s.backend.Delete(ctx, k); err != nil && !storage.IsNotFound(err) && first == nil {
 			first = err
 		}

@@ -92,6 +92,10 @@ func TestEdgeSyncRelayConfig(t *testing.T) {
 		{"hub staging inside storage refused", merge(hub, map[string]string{
 			"ARC_STORAGE_BACKEND": "local", "ARC_STORAGE_LOCAL_PATH": relayDir,
 			"ARC_EDGE_SYNC_IMPORT_RELAY_STAGING_DIR": filepath.Join(relayDir, "staging")}), "staging_dir", nil},
+		{"hub staging inside a local relay refused", merge(hub, map[string]string{
+			"ARC_EDGE_SYNC_IMPORT_RELAY_TYPE": "local", "ARC_EDGE_SYNC_IMPORT_RELAY_LOCAL_PATH": relayDir,
+			"ARC_EDGE_SYNC_IMPORT_RELAY_STAGING_DIR": filepath.Join(relayDir, "staging")}), "overlaps", nil},
+		{"negative bundle cap refused on a relay-only spoke", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_BUNDLE_MAX_BYTES": "-1"}), "max_bytes", nil},
 		{"delete_after_sync on a relay-only spoke", merge(spoke, map[string]string{"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC": "true"}), "", nil},
 		{"delete_after_sync delay checked against ack max age on a relay spoke", merge(spoke, map[string]string{
 			"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC": "true", "ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY": "200h"}), "delete_after_sync_ack_max_age", nil},

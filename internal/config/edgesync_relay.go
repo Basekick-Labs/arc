@@ -26,6 +26,11 @@ func (c *Config) validateEdgeSyncRelay() error {
 			return fmt.Errorf("%s.ack_timeout (%s) must be longer than %s.interval (%s): a bundle would be taken back before the hub could answer it",
 				k, s.Relay.AckTimeout, k, s.Relay.Interval)
 		}
+		// The relay sends bundles under the drive export's caps.
+		if s.Bundle.MaxFiles < 0 || s.Bundle.MaxBytes < 0 {
+			return fmt.Errorf("edge_sync.spoke.bundle.max_files and max_bytes must be >= 0 (got %d, %d); the relay uses them as its bundle caps, 0 means \"use the default\"",
+				s.Bundle.MaxFiles, s.Bundle.MaxBytes)
+		}
 		if err := c.checkRelayTarget(k, s.Relay.Target); err != nil {
 			return err
 		}
@@ -46,6 +51,14 @@ func (c *Config) validateEdgeSyncRelay() error {
 		}
 		if err := c.checkRelayStagingDir(k, h.StagingDir); err != nil {
 			return err
+		}
+		// Staging inside a local relay, or the relay inside staging, would let
+		// the startup sweep of staging leftovers delete spoke bundles.
+		if h.Target.Type == "local" {
+			if st, err := filepath.Abs(h.StagingDir); err == nil &&
+				(storage.PathWithin(st, h.Target.LocalPath) || storage.PathWithin(h.Target.LocalPath, st)) {
+				return fmt.Errorf("%s.staging_dir %q overlaps %s.local_path %q; keep them apart", k, h.StagingDir, k, h.Target.LocalPath)
+			}
 		}
 	}
 	return nil

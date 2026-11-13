@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -30,14 +31,35 @@ const maxRelayNoteBytes = 64 << 10
 var ErrRelayInProgress = errors.New("edgesync: a relay pass is already in progress")
 
 // RelayRefusal is the note a hub writes to <spoke>/rejected/<bundle>.json
-// when it refuses a relay bundle for good (#1685). Unsigned: it can only make
-// the spoke stop re-sending the bundle and say why, never mark a file synced
-// or delete local data.
+// when it refuses a relay bundle for good (#1685). Signed with the spoke's
+// secret: a spoke fails the bundle's rows on it, which takes an operator to
+// undo, so bucket write access alone must not be able to plant one. A spoke
+// ignores a note that does not verify, and ack_timeout takes the bundle back.
 type RelayRefusal struct {
 	BundleID  string `json:"bundle_id"`
+	SpokeID   string `json:"spoke_id"`
 	HubID     string `json:"hub_id"`
 	Reason    string `json:"reason"`
 	RefusedAt int64  `json:"refused_at"`
+	MAC       string `json:"mac"`
+}
+
+func (n *RelayRefusal) sign(secret string) error {
+	mac, err := security.ComputeSyncRelayRefusalHMAC(secret, n.BundleID, n.SpokeID, n.HubID, n.RefusedAt, n.Reason)
+	if err != nil {
+		return err
+	}
+	n.MAC = mac
+	return nil
+}
+
+// verify checks the note's MAC and that it names this spoke, hub and bundle.
+func (n *RelayRefusal) verify(secret, spokeID, hubID, bundleID string) error {
+	if n.SpokeID != spokeID || n.HubID != hubID || n.BundleID != bundleID {
+		return fmt.Errorf("refusal names spoke %q hub %q bundle %q", truncateForError(n.SpokeID),
+			truncateForError(n.HubID), truncateForError(n.BundleID))
+	}
+	return security.ValidateSyncRelayRefusalHMAC(secret, n.BundleID, n.SpokeID, n.HubID, n.RefusedAt, n.Reason, n.MAC)
 }
 
 // RelayPollerConfig configures the hub side of the relay transport.
@@ -69,6 +91,10 @@ type RelayPoller struct {
 	logger   zerolog.Logger
 
 	mu sync.Mutex
+	// notOurs remembers bundles addressed to another hub ("spoke/bundle"),
+	// so a bucket shared by several hubs costs one manifest fetch per foreign
+	// bundle, not one per poll. Pruned to the bundles still listed.
+	notOurs map[string]bool
 }
 
 // NewRelayPoller validates configuration and prepares the staging directory,
@@ -107,6 +133,7 @@ func NewRelayPoller(cfg RelayPollerConfig) (*RelayPoller, error) {
 		staging:  cfg.StagingDir,
 		hubID:    cfg.HubID,
 		logger:   cfg.Logger.With().Str("component", "edgesync-relay-hub").Logger(),
+		notOurs:  map[string]bool{},
 	}, nil
 }
 
@@ -220,7 +247,7 @@ func (p *RelayPoller) pollSpoke(ctx context.Context, spokeID string, res *RelayP
 	}
 
 	for id := range complete {
-		if acked[id] || refused[id] {
+		if acked[id] || refused[id] || p.notOurs[spokeID+"/"+id] {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -228,12 +255,17 @@ func (p *RelayPoller) pollSpoke(ctx context.Context, spokeID string, res *RelayP
 		}
 		p.processBundle(ctx, spokeID, id, res)
 	}
+	for k := range p.notOurs {
+		if sp, id, _ := strings.Cut(k, "/"); sp == spokeID && !complete[id] {
+			delete(p.notOurs, k)
+		}
+	}
 	return nil
 }
 
 func (p *RelayPoller) processBundle(ctx context.Context, spokeID, bundleID string, res *RelayPollResult) {
 	log := p.logger.With().Str("spoke_id", spokeID).Str("bundle_id", bundleID).Logger()
-	err := p.importOne(ctx, spokeID, bundleID, res)
+	secret, err := p.importOne(ctx, spokeID, bundleID, res)
 	switch {
 	case err == nil:
 	case errors.Is(err, errBundleNotOurs):
@@ -242,20 +274,29 @@ func (p *RelayPoller) processBundle(ctx context.Context, spokeID, bundleID strin
 	case errors.Is(err, ErrBundleRefused):
 		res.Refused++
 		log.Error().Err(err).Msg("Relay: bundle refused; the spoke is told and stops re-sending it")
-		p.refuse(ctx, spokeID, bundleID, err, log)
+		p.refuse(ctx, spokeID, bundleID, secret, err, log)
+	case errors.Is(err, ErrImportInProgress):
+		// A drive import holds the importer: not a failure, the next poll.
+		log.Debug().Msg("Relay: a bundle import is in progress; this bundle waits for the next poll")
 	default:
 		res.Failed++
 		log.Warn().Err(err).Msg("Relay: bundle import failed; retrying next poll")
 	}
 }
 
-func (p *RelayPoller) refuse(ctx context.Context, spokeID, bundleID string, cause error, log zerolog.Logger) {
-	raw, err := json.Marshal(RelayRefusal{
+func (p *RelayPoller) refuse(ctx context.Context, spokeID, bundleID, secret string, cause error, log zerolog.Logger) {
+	note := RelayRefusal{
 		BundleID:  bundleID,
+		SpokeID:   spokeID,
 		HubID:     p.hubID,
-		Reason:    truncateReason(cause.Error()),
+		Reason:    truncateReason(strings.ReplaceAll(cause.Error(), "\x00", "")),
 		RefusedAt: time.Now().UTC().Unix(),
-	})
+	}
+	if err := note.sign(secret); err != nil {
+		log.Warn().Err(err).Msg("Relay: could not sign the refusal note")
+		return
+	}
+	raw, err := json.Marshal(note)
 	if err != nil {
 		return
 	}
@@ -296,94 +337,114 @@ func writeIfAbsent(ctx context.Context, b storage.Backend, key string, data []by
 	return true, nil
 }
 
-func (p *RelayPoller) importOne(ctx context.Context, spokeID, bundleID string, res *RelayPollResult) error {
+// importOne takes one complete bundle through the checks, cheapest and least
+// trusting first, so nothing an unauthenticated party wrote costs more than a
+// small bounded fetch:
+//
+//  1. the spoke prefix names an enabled, registered spoke (no fetch at all);
+//  2. manifest.json (64 KiB cap): addressed to this hub, signed for this key,
+//     within limits;
+//  3. entries.jsonl (64 MiB cap) and the MAC over both;
+//  4. dedup: already imported means rebuild the ack, download nothing;
+//  5. with the importer lock held, every signed data object at its declared
+//     size, then Import.
+//
+// It returns the spoke's secret once known, for signing a refusal. Only steps
+// 2 and 3 refuse (ErrBundleRefused): anything wrong after the MAC verified is
+// transient, since a retry or the spoke re-sending can cure it.
+func (p *RelayPoller) importOne(ctx context.Context, spokeID, bundleID string, res *RelayPollResult) (string, error) {
+	secret, err := p.importer.relaySpokeSecret(ctx, spokeID)
+	if err != nil {
+		return "", err
+	}
+
 	stage, err := os.MkdirTemp(p.staging, "relay-")
 	if err != nil {
-		return fmt.Errorf("edgesync: create relay staging: %w", err)
+		return secret, fmt.Errorf("edgesync: create relay staging: %w", err)
 	}
 	defer os.RemoveAll(stage)
 
 	prefix := RelayOutboxPrefix(spokeID, bundleID)
 	if err := p.fetch(ctx, prefix+manifestName, filepath.Join(stage, manifestName), maxManifestBytes, false); err != nil {
-		return err
+		return secret, err
+	}
+	if _, err := p.importer.checkRelayManifest(stage, spokeID, bundleID); err != nil {
+		if errors.Is(err, errBundleNotOurs) {
+			p.notOurs[spokeID+"/"+bundleID] = true
+		}
+		return secret, err
 	}
 	if err := p.fetch(ctx, prefix+entriesName, filepath.Join(stage, entriesName), maxRelayEntriesBytes, false); err != nil {
-		return err
+		return secret, err
 	}
-
-	pre, err := p.importer.PrecheckRelay(ctx, stage)
+	pre, err := p.importer.PrecheckRelay(ctx, stage, secret)
 	if err != nil {
-		return err
-	}
-	// The key the bundle was found under must be the bundle it signs: a
-	// manifest copied into another spoke's prefix, or under another ID,
-	// would otherwise be acknowledged where its spoke never looks.
-	if pre.Manifest.SpokeID != spokeID || pre.Manifest.BundleID != bundleID {
-		return fmt.Errorf("%w: found under %s but signed as spoke %q bundle %q",
-			ErrBundleRefused, prefix, truncateForError(pre.Manifest.SpokeID), truncateForError(pre.Manifest.BundleID))
+		return secret, err
 	}
 
 	if pre.Prior != nil {
 		// Imported before, ack never landed (B1): rebuild it, download nothing.
 		raw, err := p.importer.RebuildAck(ctx, pre)
 		if err != nil {
-			return err
+			return secret, err
 		}
 		if _, err := writeIfAbsent(ctx, p.relay, RelayAckKey(spokeID, bundleID), raw); err != nil {
-			return fmt.Errorf("edgesync: write rebuilt ack: %w", err)
+			return secret, fmt.Errorf("edgesync: write rebuilt ack: %w", err)
 		}
 		res.Reacked++
 		p.logger.Info().Str("spoke_id", spokeID).Str("bundle_id", bundleID).
 			Msg("Relay: bundle was already imported; its acknowledgment was rebuilt and written")
-		return nil
+		return secret, nil
 	}
+
+	// The importer lock BEFORE the download: a drive import running now is
+	// found before a whole bundle is fetched for nothing.
+	unlock, ok := p.importer.tryLock()
+	if !ok {
+		return secret, ErrImportInProgress
+	}
+	defer unlock()
 
 	// Download what the spoke SIGNED, not what a listing shows: an extra
 	// object in the prefix is never fetched, and a declared one that is
 	// missing or the wrong size is caught here, before Import re-verifies.
 	if err := os.MkdirAll(filepath.Join(stage, dataDir), 0o700); err != nil {
-		return fmt.Errorf("edgesync: create relay staging: %w", err)
+		return secret, fmt.Errorf("edgesync: create relay staging: %w", err)
 	}
 	for _, e := range pre.Entries {
 		if err := ctx.Err(); err != nil {
-			return err
+			return secret, err
 		}
 		dest := filepath.Join(stage, dataDir, filepath.FromSlash(e.Path))
 		if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-			return fmt.Errorf("edgesync: create relay staging: %w", err)
+			return secret, fmt.Errorf("edgesync: create relay staging: %w", err)
 		}
 		if err := p.fetch(ctx, prefix+dataDir+"/"+e.Path, dest, e.SizeBytes, true); err != nil {
-			return err
+			return secret, err
 		}
 	}
 
-	out, err := p.importer.Import(ctx, stage)
+	out, err := p.importer.importLocked(ctx, stage)
 	if err != nil {
-		if errors.Is(err, ErrBundleAlreadyImported) {
-			// Imported between the precheck and here (a drive import of the
-			// same bundle): the next poll rebuilds the ack.
-			return err
+		// After the MAC verified, never a refusal (see ErrBundleRefused):
+		// strip the sentinel so a content or staging error stays transient.
+		if errors.Is(err, ErrBundleInvalid) {
+			return secret, fmt.Errorf("edgesync: import of a verified relay bundle failed (retried; the spoke re-sends after its ack_timeout): %s", err.Error())
 		}
-		if errors.Is(err, ErrBundleInvalid) && !errors.Is(err, ErrBundleRefused) {
-			// Verify found the staged copy is not what the spoke signed:
-			// every object was fetched at its declared size, so a digest
-			// mismatch is content the spoke did not sign.
-			return fmt.Errorf("%w: %v", ErrBundleRefused, err)
-		}
-		return err
+		return secret, err
 	}
 	res.Imported++
 	if !out.AckWritten {
-		return errors.New("edgesync: bundle imported but its acknowledgment could not be written; rebuilt next poll")
+		return secret, errors.New("edgesync: bundle imported but its acknowledgment could not be written; rebuilt next poll")
 	}
 	raw, err := os.ReadFile(filepath.Join(stage, ackName))
 	if err != nil {
-		return fmt.Errorf("edgesync: read staged ack (rebuilt next poll): %w", err)
+		return secret, fmt.Errorf("edgesync: read staged ack (rebuilt next poll): %w", err)
 	}
 	if _, err := writeIfAbsent(ctx, p.relay, RelayAckKey(spokeID, bundleID), raw); err != nil {
-		return fmt.Errorf("edgesync: upload ack (rebuilt next poll): %w", err)
+		return secret, fmt.Errorf("edgesync: upload ack (rebuilt next poll): %w", err)
 	}
-	return nil
+	return secret, nil
 }
 
 // fetch downloads key to dest (0600), refusing more than max bytes. With
@@ -401,7 +462,10 @@ func (p *RelayPoller) fetch(ctx context.Context, key, dest string, max int64, ex
 		return fmt.Errorf("edgesync: %s vanished during the poll", key)
 	}
 	if size > max || (exact && size != max) {
-		return fmt.Errorf("%w: %s is %d bytes, expected %s %d", ErrBundleRefused, key, size,
+		// Metadata over its bound is the spoke's signed shape: refused. A data
+		// object of the wrong size is not what the spoke signed and may be
+		// re-sent correctly: transient.
+		return fmt.Errorf("%w: %s is %d bytes, expected %s %d", oversize(exact), key, size,
 			map[bool]string{true: "exactly", false: "at most"}[exact], max)
 	}
 	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -412,7 +476,7 @@ func (p *RelayPoller) fetch(ctx context.Context, key, dest string, max int64, ex
 	lw := &limitWriter{w: f, left: max}
 	if err := p.relay.ReadTo(ctx, key, lw); err != nil {
 		if lw.over {
-			return fmt.Errorf("%w: %s is larger than %d bytes", ErrBundleRefused, key, max)
+			return fmt.Errorf("%w: %s is larger than %d bytes", oversize(exact), key, max)
 		}
 		if storage.IsNotFound(err) {
 			return fmt.Errorf("edgesync: %s vanished during the poll", key)
@@ -420,9 +484,18 @@ func (p *RelayPoller) fetch(ctx context.Context, key, dest string, max int64, ex
 		return fmt.Errorf("edgesync: download %s: %w", key, err)
 	}
 	if exact && lw.n != max {
-		return fmt.Errorf("%w: %s is %d bytes, declared %d", ErrBundleRefused, key, lw.n, max)
+		return fmt.Errorf("%w: %s is %d bytes, declared %d", oversize(exact), key, lw.n, max)
 	}
 	return nil
+}
+
+var errRelayObjectSize = errors.New("edgesync: relay data object is not the size the spoke signed")
+
+func oversize(data bool) error {
+	if data {
+		return errRelayObjectSize
+	}
+	return ErrBundleRefused
 }
 
 // limitWriter fails a write that would take the total past left.
