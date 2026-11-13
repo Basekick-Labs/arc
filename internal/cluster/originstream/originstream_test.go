@@ -411,16 +411,36 @@ func TestSlowStandbyOnlyLosesItsOwn(t *testing.T) {
 	dropped := metrics.Get().Snapshot()["origin_stream_dropped"].(int64)
 	big := string(bytes.Repeat([]byte("x"), 64<<10))
 	const n = 600 // ~38 MiB: past the stuck connection's socket buffers and its 8 MiB queue
-	for c := uint64(1); c <= n; c++ {
-		hook(p, "db/a", c, big)
-		time.Sleep(time.Millisecond) // ~64 MiB/s: the good standby keeps up, under -race too
-	}
-	waitFor(t, "the good standby to receive everything", func() bool {
+	// The producer is paced by the good standby's progress, never by the
+	// clock: at most lag entries (~2 MiB) ahead of what it has stored, far
+	// under its 8 MiB queue, so it cannot overflow its own queue however slow
+	// the runner is. A fixed rate let a good standby slowed by a loaded -race
+	// runner overflow its own queue, which read as a gap caused by the stuck
+	// one (#1672). Any gap now is the stuck standby's doing.
+	const lag = 32
+	goodLast := func() uint64 {
 		good.mu.Lock()
 		defer good.mu.Unlock()
 		d := good.instances[instanceID{"primary", p.instance}]
-		return d != nil && d.keys["db/a"] != nil && d.keys["db/a"].last == n
-	})
+		if d == nil || d.keys["db/a"] == nil {
+			return 0
+		}
+		return d.keys["db/a"].last
+	}
+	for c := uint64(1); c <= n; c++ {
+		if c > lag {
+			waitFor(t, "the good standby to keep up", func() bool { return goodLast() >= c-lag })
+		}
+		hook(p, "db/a", c, big)
+	}
+	// An entry not sent to the good standby leaves it short of n, or with a
+	// gap below n: both are reported with the gaps.
+	for deadline := time.Now().Add(5 * time.Second); goodLast() != n; time.Sleep(2 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the good standby stopped at %d of %d with gaps %v because another standby is slow",
+				goodLast(), n, keyGaps(good, "primary", p.instance, "db/a"))
+		}
+	}
 	if g := keyGaps(good, "primary", p.instance, "db/a"); len(g) != 0 {
 		t.Fatalf("the good standby has gaps %v because another standby is slow", g)
 	}
