@@ -61,6 +61,29 @@ type Agent struct {
 	// namespaceExcluder is forwarded to the per-pass Discoverer on dual-role
 	// nodes (see Discoverer.SetNamespaceExcluder).
 	namespaceExcluder func(ctx context.Context) (map[string]struct{}, error)
+
+	// delete_after_sync (phase 3a); see SetDeleteAfterSync. deleteLocal nil
+	// means off.
+	deleteDelay time.Duration
+	deleteLocal LocalDeleter
+}
+
+// LocalDeleter removes the spoke's own copy of a synced file the hub proved
+// it holds. wantSize is the ledger's size: an implementation refuses (returns
+// an error, keeping the file) when the local file's size differs, and treats
+// a file already gone as success.
+type LocalDeleter func(ctx context.Context, path string, wantSize int64) error
+
+// verifyRecheck is how long a synced row whose copy was kept waits before it
+// is verified again: a hub that could not prove it held the content may later
+// (3b: verifiable compacted content), and a daily recheck bounds the cost.
+const verifyRecheck = 24 * time.Hour
+
+// SetDeleteAfterSync turns on delete_after_sync: after the pending loop, each
+// pass verifies synced rows at least delay old against the hub and deletes the
+// local copy of those the hub proves it holds. Call before the first Run.
+func (a *Agent) SetDeleteAfterSync(delay time.Duration, del LocalDeleter) {
+	a.deleteDelay, a.deleteLocal = delay, del
 }
 
 // SetNamespaceExcluder forwards the dual-role received-namespace exclusion
@@ -145,6 +168,15 @@ type RunResult struct {
 	// HubContacted is true only after a reconcile response was validated.
 	// An empty backlog performs no network request.
 	HubContacted bool
+
+	// delete_after_sync: local copies deleted after the hub proved it held
+	// them; synced files kept because it could not; synced files re-queued
+	// because the hub no longer had any receipt. VerifyUnsupported: the hub
+	// predates verification, so nothing was deleted.
+	LocalDeleted      int
+	VerifyKept        int
+	VerifyRequeued    int
+	VerifyUnsupported bool
 
 	Duration time.Duration
 }
@@ -269,8 +301,124 @@ func (a *Agent) Run(ctx context.Context) (*RunResult, error) {
 		}
 	}
 
+	if a.deleteLocal != nil {
+		if err := a.verifyAndDelete(ctx, start, res); err != nil {
+			return nil, err
+		}
+	}
+
 	res.Duration = time.Since(start)
 	return res, nil
+}
+
+// verifyAndDelete is delete_after_sync (phase 3a). It asks the hub, in a
+// verify reconcile separate from the one that marked them synced, which synced
+// files it provably holds, and deletes only those local copies. A hub that
+// cannot prove it holds a file (a compacted or removed receipt) keeps the
+// spoke's copy; one with no receipt at all gets the file re-offered if it is
+// still here. Nothing is deleted on any error, or against a hub that predates
+// verification.
+func (a *Agent) verifyAndDelete(ctx context.Context, passStart time.Time, res *RunResult) error {
+	verifier, ok := a.transport.(Verifier)
+	if !ok {
+		res.VerifyUnsupported = true
+		return nil
+	}
+	now := time.Now().UTC()
+	// Never a row this pass synced: the verification that may delete a file
+	// comes on a later pass than the one that delivered it, whatever the delay.
+	syncedBefore := now.Add(-a.deleteDelay)
+	if passStart.UTC().Before(syncedBefore) {
+		syncedBefore = passStart.UTC()
+	}
+	reverifyBefore := now.Add(-verifyRecheck)
+	var afterID int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := a.ledger.VerifyCandidates(ctx, a.hubID, syncedBefore, reverifyBefore, afterID, a.batchSize)
+		if err != nil {
+			return fmt.Errorf("edgesync: read verify candidates: %w", err)
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		afterID = rows[len(rows)-1].ID
+
+		ans, err := verifier.Verify(ctx, a.hubID, rows)
+		if err != nil {
+			return fmt.Errorf("edgesync: verify synced files: %w", err)
+		}
+		if !ans.HeldKnown {
+			a.logger.Warn().Str("hub_id", a.hubID).
+				Msg("delete_after_sync: the hub cannot verify what it holds (it predates verification); no local copy deleted. Upgrade the hub")
+			res.VerifyUnsupported = true
+			return nil
+		}
+		byPath := make(map[string]*LedgerEntry, len(rows))
+		for _, e := range rows {
+			byPath[e.Path] = e
+		}
+		held := make(map[string]bool, len(ans.Held))
+		for _, p := range ans.Held {
+			if _, asked := byPath[p]; !asked {
+				return fmt.Errorf("edgesync: verify answered held for %q, which was not asked", p)
+			}
+			held[p] = true
+		}
+		missing := make(map[string]bool, len(ans.Missing))
+		for _, p := range ans.Missing {
+			if held[p] {
+				return fmt.Errorf("edgesync: verify answered %q both held and missing", p)
+			}
+			missing[p] = true
+		}
+
+		for _, e := range rows {
+			switch {
+			case held[e.Path]:
+				if err := a.deleteLocal(ctx, e.Path, e.SizeBytes); err != nil {
+					// Kept, and asked again after the recheck interval.
+					a.logger.Warn().Err(err).Str("path", e.Path).Msg("delete_after_sync: the hub holds this file but the local copy could not be deleted; kept")
+					if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateKept); err != nil {
+						return err
+					}
+					res.VerifyKept++
+					continue
+				}
+				if err := a.ledger.MarkDeletedLocal(ctx, a.hubID, e.Path); err != nil {
+					return err
+				}
+				res.LocalDeleted++
+			case missing[e.Path]:
+				size, err := a.backend.StatFile(ctx, e.Path)
+				if err != nil {
+					return fmt.Errorf("edgesync: stat %q: %w", e.Path, err)
+				}
+				if size >= 0 {
+					// The hub no longer has any receipt (forgotten on purpose,
+					// for example the admin forget route): send it again.
+					if err := a.ledger.RequeueSynced(ctx, a.hubID, e.Path); err != nil {
+						return err
+					}
+					res.VerifyRequeued++
+					continue
+				}
+				if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateMissing); err != nil {
+					return err
+				}
+			default:
+				if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateKept); err != nil {
+					return err
+				}
+				res.VerifyKept++
+			}
+		}
+		if a.batchSize <= 0 {
+			return nil
+		}
+	}
 }
 
 // runBatch reconciles one page of pending files and sends what the hub lacks.

@@ -279,8 +279,11 @@ type forgetReceiptsRequest struct {
 // forget handles POST /api/v1/sync-spokes/:spokeID/forget (#1186).
 //
 // The explicit recovery from a confirmed hub-side removal: it forgets the
-// spoke's REMOVED receipts under one database, so the next reconcile reports
-// those files missing and the spoke re-sends them. Receipts that are only
+// spoke's REMOVED receipts under one database, so the hub reports those files
+// missing the next time the spoke asks about them. A spoke asks about a file
+// it already synced only when it verifies synced files (delete_after_sync),
+// which re-queues a missing one at once, or after its ledger retention prunes
+// the row and discovery finds the file again. Receipts that are only
 // compacted are kept (their content is still on the hub).
 //
 // Refused with 409 while the namespace still holds files, hot or cold:
@@ -333,7 +336,7 @@ func (h *EdgeSyncAdminHandler) forget(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to forget receipts", "forgotten": n})
 	}
 	h.logger.Info().Str("spoke_id", spokeID).Str("database", req.Database).Int64("forgotten", n).
-		Msg("Forgot removed edge-sync receipts; the spoke re-sends these files at its next reconcile")
+		Msg("Forgot removed edge-sync receipts; the spoke re-sends these files when it next asks about them (its next verification with delete_after_sync, otherwise after its ledger retention)")
 	return c.JSON(fiber.Map{"spoke_id": spokeID, "database": req.Database, "forgotten": n})
 }
 

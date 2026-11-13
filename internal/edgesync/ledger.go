@@ -255,6 +255,18 @@ func (l *Ledger) initSchema() error {
 		}
 	}
 
+	// delete_after_sync (phase 3a): when a synced file was last verified
+	// against the hub, what the hub answered, and when the local copy went.
+	for _, col := range []string{
+		"ALTER TABLE sync_ledger ADD COLUMN verified_at TIMESTAMP",
+		"ALTER TABLE sync_ledger ADD COLUMN hub_state TEXT",
+		"ALTER TABLE sync_ledger ADD COLUMN deleted_at TIMESTAMP",
+	} {
+		if _, err := l.db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add delete-after-sync columns: %w", err)
+		}
+	}
+
 	l.logger.Info().Msg("Sync ledger schema initialized")
 	return nil
 }
@@ -1471,4 +1483,108 @@ func (l *Ledger) checkTransition(ctx context.Context, res sql.Result, hubID, pat
 	}
 	return fmt.Errorf("edgesync: %q: %w: state is %q, expected one of %v",
 		path, ErrInvalidTransition, current, from)
+}
+
+// Hub answers a verify recorded in hub_state (delete_after_sync).
+const (
+	HubStateHeld    = "held"    // the hub provably held it; the local copy was deleted
+	HubStateKept    = "kept"    // the hub has a receipt but cannot prove it holds the content
+	HubStateMissing = "missing" // the hub has no receipt and the local file is gone
+)
+
+// VerifyCandidates returns synced rows whose local copy may be verified
+// against the hub for delete_after_sync: not deleted yet, synced at or before
+// syncedBefore, and never verified or last verified at or before
+// reverifyBefore (so a "kept" row is asked again later rather than frozen).
+// Ordered by id; afterID pages.
+func (l *Ledger) VerifyCandidates(ctx context.Context, hubID string, syncedBefore, reverifyBefore time.Time, afterID int64, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ? AND deleted_at IS NULL AND id > ?
+		  AND synced_at IS NOT NULL AND synced_at <= ?
+		  AND (verified_at IS NULL OR verified_at <= ?)
+		ORDER BY id ASC`
+	args := []any{hubID, string(StateSynced), afterID, syncedBefore.UTC(), reverifyBefore.UTC()}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query verify candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate verify candidates: %w", err)
+	}
+	return out, nil
+}
+
+// MarkVerified records a verify answer on a synced row that keeps its local
+// copy (hubState kept or missing). Only from synced and not deleted.
+func (l *Ledger) MarkVerified(ctx context.Context, hubID, path, hubState string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger SET verified_at = ?, hub_state = ?
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL`,
+		time.Now().UTC(), hubState, hubID, path, string(StateSynced))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark verified %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StateSynced)
+}
+
+// MarkDeletedLocal records that the local copy of a synced file was deleted
+// after the hub proved it held it. The row stays synced, so discovery (which
+// skips tracked paths) and pruning treat it as before; the file is gone and
+// cannot be rediscovered. Only from synced and not deleted.
+func (l *Ledger) MarkDeletedLocal(ctx context.Context, hubID, path string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	now := time.Now().UTC()
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger SET deleted_at = ?, verified_at = ?, hub_state = ?
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL`,
+		now, now, HubStateHeld, hubID, path, string(StateSynced))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark deleted %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StateSynced)
+}
+
+// RequeueSynced moves a synced row back to pending, because the hub no longer
+// has any receipt for it (the admin forget route) while the local copy still
+// exists: the next pass re-offers it. Only from synced and not deleted.
+func (l *Ledger) RequeueSynced(ctx context.Context, hubID, path string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, synced_at = NULL, attempts = 0, bytes_sent = 0, last_error = NULL,
+		    verified_at = NULL, hub_state = NULL
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL`,
+		string(StatePending), hubID, path, string(StateSynced))
+	if err != nil {
+		return fmt.Errorf("edgesync: requeue synced %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StateSynced)
 }

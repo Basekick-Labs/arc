@@ -396,7 +396,7 @@ func (h *HubIndex) MarkSpokeRemoved(ctx context.Context, spokeID, reason string)
 
 // ForgetRemoved deletes a spoke's REMOVED receipts under one of its
 // databases (source paths starting with "<database>/"), so the next
-// reconcile reports them missing and the spoke re-sends them: the explicit,
+// reconcile or verify reports them missing and the spoke re-sends them: the explicit,
 // backup-free recovery from a delete (#1186). Receipts that are only
 // compacted are kept: their content still exists on the hub, and forgetting
 // them would re-accept duplicates next to the compacted output (#611).
@@ -461,8 +461,10 @@ func (h *HubIndex) ForgetRemoved(ctx context.Context, spokeID, database string) 
 // file is gone, it asks the manifest, and a file the manifest no longer lists
 // is marked removed (manifest_removed) instead. See ClusterManifest.
 //
-// Whoever ships phase 3 (delete_after_sync) must decide what a removed
-// receipt means for the spoke's own copy; until then the spoke keeps it.
+// Phase 3a (delete_after_sync) settles what a removed receipt means for the
+// spoke's own copy: it is kept. A spoke deletes only what a verify reconcile
+// answers "held" (Reconciler.Verify), which a removed or compacted receipt
+// never is.
 func (h *HubIndex) Forget(ctx context.Context, spokeID, sourcePath string) error {
 	_, err := h.db.ExecContext(ctx,
 		`DELETE FROM sync_received WHERE spoke_id = ? AND source_path = ?`,

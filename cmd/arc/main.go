@@ -3130,6 +3130,13 @@ func main() {
 	// content. Remains nil otherwise,
 	// which keeps tiering's spoke-migration gate closed.
 	var hubReceiptMarker func(paths []string) error
+	// spokeDeleteTiering and spokeDeleteInvalidate are filled in once the
+	// tiering manager and the query-cache invalidator exist, after the spoke
+	// block that wires delete_after_sync; the deleter reads them atomically.
+	var (
+		spokeDeleteTiering    atomic.Pointer[tiering.Manager]
+		spokeDeleteInvalidate atomic.Pointer[func()]
+	)
 	// hubNamespaceRemover and hubRemovalMarker mark receipts REMOVED for
 	// content the hub deletes on purpose (#1186): a confirmed database delete
 	// of a spoke namespace, and retention. Wired into the databases and
@@ -3696,6 +3703,12 @@ func main() {
 			syncAgent.SetCompactionDeferEpoch(compactionDeferEpoch)
 			if spokeRegistry != nil {
 				syncAgent.SetNamespaceExcluder(receivedNamespaces(spokeRegistry))
+			}
+			if cfg.EdgeSync.Spoke.DeleteAfterSync {
+				syncAgent.SetDeleteAfterSync(cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
+					spokeLocalDeleter(storageBackend, &spokeDeleteTiering, &spokeDeleteInvalidate))
+				spokeLogger.Warn().Dur("delay", cfg.EdgeSync.Spoke.DeleteAfterSyncDelay).
+					Msg("edge_sync.spoke.delete_after_sync is on: local copies of synced files are deleted once the hub verifies it holds them; local queries no longer see that data")
 			}
 		}
 
@@ -4285,6 +4298,7 @@ func main() {
 			}
 		}
 	}
+	spokeDeleteInvalidate.Store(&invalidateQueryCaches)
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
@@ -5270,6 +5284,7 @@ func main() {
 		if retentionHandler != nil {
 			retentionHandler.SetTieringManager(tieringManager)
 		}
+		spokeDeleteTiering.Store(tieringManager)
 		tieringHandler := api.NewTieringHandler(tieringManager, authManager, licenseClient, logger.Get("tiering-api"))
 		tieringHandler.RegisterRoutes(server.GetApp())
 
@@ -5934,6 +5949,49 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 	return db, true, nil
+}
+
+// spokeLocalDeleter deletes a spoke's own copy of a synced file the hub proved
+// it holds (edge sync phase 3a, delete_after_sync). A file already gone is
+// success; a file whose size differs from the ledger's is kept; spoke tiering's
+// move claim keeps it off a file being migrated; the hot tier row goes with
+// the file, and the query caches are dropped so no cached partition list
+// names it.
+func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manager], invalidate *atomic.Pointer[func()]) edgesync.LocalDeleter {
+	return func(ctx context.Context, path string, wantSize int64) error {
+		size, err := backend.StatFile(ctx, path)
+		if err != nil {
+			return fmt.Errorf("stat: %w", err)
+		}
+		if size < 0 {
+			return nil
+		}
+		if size != wantSize {
+			return fmt.Errorf("local size %d differs from the synced size %d", size, wantSize)
+		}
+		mgr := tm.Load()
+		if mgr != nil {
+			release, err := mgr.ClaimForDelete(ctx, path)
+			if err != nil {
+				return err
+			}
+			defer release()
+		}
+		if err := backend.Delete(ctx, path); err != nil {
+			if after, serr := backend.StatFile(ctx, path); serr != nil || after >= 0 {
+				return fmt.Errorf("delete: %w", err)
+			}
+		}
+		if mgr != nil {
+			if err := mgr.DeleteFile(ctx, path); err != nil {
+				log.Warn().Err(err).Str("path", path).Msg("delete_after_sync: deleted the local file but not its tier row")
+			}
+		}
+		if f := invalidate.Load(); f != nil {
+			(*f)()
+		}
+		return nil
+	}
 }
 
 // coordinatorManifest adapts the cluster coordinator to edgesync.ClusterManifest

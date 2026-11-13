@@ -53,6 +53,13 @@ type MemoryTransport struct {
 	// test can assert the agent's newest-first ordering.
 	putOrder []string
 
+	// unheld are paths Verify must not report held although stored, keyed
+	// like scripts: a hub receipt that is compacted or removed.
+	unheld map[string]bool
+
+	// NoVerify makes Verify answer like a hub that predates verification.
+	NoVerify bool
+
 	closed bool
 }
 
@@ -119,6 +126,53 @@ func (m *MemoryTransport) Has(hubID, path string) (string, bool) {
 		return "", false
 	}
 	return f.sha256, true
+}
+
+// MarkUnheld makes Verify treat a stored path as not provably held, as a
+// hub answers for a compacted or removed receipt.
+func (m *MemoryTransport) MarkUnheld(hubID, path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.unheld == nil {
+		m.unheld = make(map[string]bool)
+	}
+	m.unheld[scriptKey(hubID, path)] = true
+}
+
+// Forget removes a stored path, as the hub's admin forget route does to a
+// receipt.
+func (m *MemoryTransport) Forget(hubID, path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.hubLocked(hubID), path)
+}
+
+// Verify answers like a hub's verify reconcile: held when stored with the
+// same digest and not marked unheld, missing when not stored.
+func (m *MemoryTransport) Verify(ctx context.Context, hubID string, synced []*LedgerEntry) (*VerifyAnswer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, ErrTransportClosed
+	}
+	if m.NoVerify {
+		return &VerifyAnswer{}, nil
+	}
+	hub := m.hubLocked(hubID)
+	ans := &VerifyAnswer{Held: []string{}, Missing: []string{}, HeldKnown: true}
+	for _, e := range synced {
+		f, ok := hub[e.Path]
+		switch {
+		case !ok:
+			ans.Missing = append(ans.Missing, e.Path)
+		case f.sha256 == e.SHA256 && !m.unheld[scriptKey(hubID, e.Path)]:
+			ans.Held = append(ans.Held, e.Path)
+		}
+	}
+	return ans, nil
 }
 
 // Close makes every subsequent call return ErrTransportClosed.
