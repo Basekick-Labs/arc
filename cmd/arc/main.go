@@ -3136,6 +3136,7 @@ func main() {
 	var (
 		spokeDeleteTiering    atomic.Pointer[tiering.Manager]
 		spokeDeleteInvalidate atomic.Pointer[func()]
+		spokeDeleteReady      atomic.Bool
 	)
 	// hubNamespaceRemover and hubRemovalMarker mark receipts REMOVED for
 	// content the hub deletes on purpose (#1186): a confirmed database delete
@@ -3706,7 +3707,12 @@ func main() {
 			}
 			if cfg.EdgeSync.Spoke.DeleteAfterSync {
 				syncAgent.SetDeleteAfterSync(cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
-					spokeLocalDeleter(storageBackend, &spokeDeleteTiering, &spokeDeleteInvalidate))
+					spokeLocalDeleter(storageBackend, &spokeDeleteTiering, &spokeDeleteReady),
+					func() {
+						if f := spokeDeleteInvalidate.Load(); f != nil {
+							(*f)()
+						}
+					})
 				spokeLogger.Warn().Dur("delay", cfg.EdgeSync.Spoke.DeleteAfterSyncDelay).
 					Msg("edge_sync.spoke.delete_after_sync is on: local copies of synced files are deleted once the hub verifies it holds them; local queries no longer see that data")
 			}
@@ -5401,6 +5407,9 @@ func main() {
 			}
 		}
 	}
+	// delete_after_sync may run from here: the cache invalidator exists and
+	// tiering, if on, is wired (its move claim and tier rows are in place).
+	spokeDeleteReady.Store(true)
 
 	// Iceberg export, once tiering is set up: with a cold tier, files migrated to it stay in the
 	// tables (#939), so the export must see the cold tier from its first pass. Exporting without
@@ -5955,10 +5964,13 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 // it holds (edge sync phase 3a, delete_after_sync). A file already gone is
 // success; a file whose size differs from the ledger's is kept; spoke tiering's
 // move claim keeps it off a file being migrated; the hot tier row goes with
-// the file, and the query caches are dropped so no cached partition list
-// names it.
-func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manager], invalidate *atomic.Pointer[func()]) edgesync.LocalDeleter {
+// the file. The agent drops the query caches once per batch afterwards. Not
+// ready until startup has wired tiering and the cache invalidator.
+func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manager], ready *atomic.Bool) edgesync.LocalDeleter {
 	return func(ctx context.Context, path string, wantSize int64) error {
+		if !ready.Load() {
+			return edgesync.ErrDeleterNotReady
+		}
 		size, err := backend.StatFile(ctx, path)
 		if err != nil {
 			return fmt.Errorf("stat: %w", err)
@@ -5986,9 +5998,6 @@ func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manag
 			if err := mgr.DeleteFile(ctx, path); err != nil {
 				log.Warn().Err(err).Str("path", path).Msg("delete_after_sync: deleted the local file but not its tier row")
 			}
-		}
-		if f := invalidate.Load(); f != nil {
-			(*f)()
 		}
 		return nil
 	}

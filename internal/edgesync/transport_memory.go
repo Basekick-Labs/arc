@@ -59,6 +59,10 @@ type MemoryTransport struct {
 
 	// NoVerify makes Verify answer like a hub that predates verification.
 	NoVerify bool
+	// VerifyErr fails every Verify that carries entries (not the probe).
+	VerifyErr error
+	// VerifyEntryCalls counts Verify calls that carried entries.
+	VerifyEntryCalls int
 
 	closed bool
 }
@@ -157,6 +161,15 @@ func (m *MemoryTransport) Verify(ctx context.Context, hubID string, synced []*Le
 	defer m.mu.Unlock()
 	if m.closed {
 		return nil, ErrTransportClosed
+	}
+	if len(synced) > 0 {
+		m.VerifyEntryCalls++
+	}
+	if m.VerifyErr != nil && len(synced) > 0 {
+		return nil, m.VerifyErr
+	}
+	if m.MaxReconcileEntries > 0 && len(synced) > m.MaxReconcileEntries {
+		return nil, &ReconcileTooLargeError{MaxEntries: m.MaxReconcileEntries}
 	}
 	if m.NoVerify {
 		return &VerifyAnswer{}, nil

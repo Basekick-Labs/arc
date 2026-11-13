@@ -266,6 +266,11 @@ func (l *Ledger) initSchema() error {
 			return fmt.Errorf("add delete-after-sync columns: %w", err)
 		}
 	}
+	// VerifyCandidates pages synced rows of one hub by id; without this every
+	// page scans and sorts all synced rows, deleted ones included.
+	if _, err := l.db.Exec(`CREATE INDEX IF NOT EXISTS idx_sync_ledger_verify ON sync_ledger(hub_id, state, id)`); err != nil {
+		return fmt.Errorf("create verify index: %w", err)
+	}
 
 	l.logger.Info().Msg("Sync ledger schema initialized")
 	return nil

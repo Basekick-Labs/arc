@@ -63,10 +63,19 @@ type Agent struct {
 	namespaceExcluder func(ctx context.Context) (map[string]struct{}, error)
 
 	// delete_after_sync (phase 3a); see SetDeleteAfterSync. deleteLocal nil
-	// means off.
-	deleteDelay time.Duration
-	deleteLocal LocalDeleter
+	// means off. afterDeletes runs once after a batch that deleted files (the
+	// query-cache invalidation). verifyUnsupportedUntil caches an older hub's
+	// answer to the side-effect-free probe.
+	deleteDelay            time.Duration
+	deleteLocal            LocalDeleter
+	afterDeletes           func()
+	verifyUnsupportedUntil time.Time
 }
+
+// ErrDeleterNotReady is returned by a LocalDeleter that cannot run yet (the
+// node is still starting): the pass stops verifying, deletes nothing and
+// marks nothing, and the next pass tries again.
+var ErrDeleterNotReady = errors.New("edgesync: local deleter not ready")
 
 // LocalDeleter removes the spoke's own copy of a synced file the hub proved
 // it holds. wantSize is the ledger's size: an implementation refuses (returns
@@ -82,8 +91,8 @@ const verifyRecheck = 24 * time.Hour
 // SetDeleteAfterSync turns on delete_after_sync: after the pending loop, each
 // pass verifies synced rows at least delay old against the hub and deletes the
 // local copy of those the hub proves it holds. Call before the first Run.
-func (a *Agent) SetDeleteAfterSync(delay time.Duration, del LocalDeleter) {
-	a.deleteDelay, a.deleteLocal = delay, del
+func (a *Agent) SetDeleteAfterSync(delay time.Duration, del LocalDeleter, afterDeletes func()) {
+	a.deleteDelay, a.deleteLocal, a.afterDeletes = delay, del, afterDeletes
 }
 
 // SetNamespaceExcluder forwards the dual-role received-namespace exclusion
@@ -177,6 +186,9 @@ type RunResult struct {
 	VerifyKept        int
 	VerifyRequeued    int
 	VerifyUnsupported bool
+	// VerifyError is why verification stopped part way this pass, if it did.
+	// It does not fail the pass: the transfers it reports still happened.
+	VerifyError string
 
 	Duration time.Duration
 }
@@ -303,7 +315,14 @@ func (a *Agent) Run(ctx context.Context) (*RunResult, error) {
 
 	if a.deleteLocal != nil {
 		if err := a.verifyAndDelete(ctx, start, res); err != nil {
-			return nil, err
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			// Verification failing must not fail the pass: the files it sent
+			// were sent, and the scheduler's backoff is for transfer trouble.
+			// Nothing was deleted on the failed page.
+			a.logger.Warn().Err(err).Msg("delete_after_sync: verification stopped; nothing more deleted this pass")
+			res.VerifyError = err.Error()
 		}
 	}
 
@@ -325,6 +344,26 @@ func (a *Agent) verifyAndDelete(ctx context.Context, passStart time.Time, res *R
 		return nil
 	}
 	now := time.Now().UTC()
+	if now.Before(a.verifyUnsupportedUntil) {
+		res.VerifyUnsupported = true
+		return nil
+	}
+	// Probe with no entries first. A hub that verifies answers "held": [] and
+	// changes nothing; an older one ignores "verify" and runs an ordinary
+	// reconcile, which on real entries would forget receipts of files this
+	// spoke already synced. With no entries that reconcile is harmless.
+	probe, err := verifier.Verify(ctx, a.hubID, nil)
+	if err != nil {
+		return fmt.Errorf("edgesync: verify probe: %w", err)
+	}
+	if !probe.HeldKnown {
+		a.logger.Warn().Str("hub_id", a.hubID).
+			Msg("delete_after_sync: the hub cannot verify what it holds (it predates verification); no local copy deleted. Upgrade the hub. Asked again in 24h")
+		a.verifyUnsupportedUntil = now.Add(verifyRecheck)
+		res.VerifyUnsupported = true
+		return nil
+	}
+
 	// Never a row this pass synced: the verification that may delete a file
 	// comes on a later pass than the one that delivered it, whatever the delay.
 	syncedBefore := now.Add(-a.deleteDelay)
@@ -332,93 +371,128 @@ func (a *Agent) verifyAndDelete(ctx context.Context, passStart time.Time, res *R
 		syncedBefore = passStart.UTC()
 	}
 	reverifyBefore := now.Add(-verifyRecheck)
+	pageSize := a.batchSize
+	if pageSize <= 0 {
+		pageSize = defaultVerifyPage
+	}
 	var afterID int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rows, err := a.ledger.VerifyCandidates(ctx, a.hubID, syncedBefore, reverifyBefore, afterID, a.batchSize)
+		rows, err := a.ledger.VerifyCandidates(ctx, a.hubID, syncedBefore, reverifyBefore, afterID, pageSize)
 		if err != nil {
 			return fmt.Errorf("edgesync: read verify candidates: %w", err)
 		}
 		if len(rows) == 0 {
 			return nil
 		}
-		afterID = rows[len(rows)-1].ID
 
 		ans, err := verifier.Verify(ctx, a.hubID, rows)
+		var tooLarge *ReconcileTooLargeError
+		if errors.As(err, &tooLarge) {
+			// The hub's cap is the negotiation, as in runBatch: shrink and
+			// ask again for the same rows.
+			next := pageSize / 2
+			if tooLarge.MaxEntries > 0 && tooLarge.MaxEntries < next {
+				next = tooLarge.MaxEntries
+			}
+			if next < 1 || next >= pageSize {
+				return fmt.Errorf("edgesync: verify synced files: %w", err)
+			}
+			pageSize = next
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("edgesync: verify synced files: %w", err)
 		}
 		if !ans.HeldKnown {
-			a.logger.Warn().Str("hub_id", a.hubID).
-				Msg("delete_after_sync: the hub cannot verify what it holds (it predates verification); no local copy deleted. Upgrade the hub")
-			res.VerifyUnsupported = true
-			return nil
+			return errors.New("edgesync: verify answer without held after a probe that had it")
 		}
-		byPath := make(map[string]*LedgerEntry, len(rows))
-		for _, e := range rows {
-			byPath[e.Path] = e
+		afterID = rows[len(rows)-1].ID
+		deleted, err := a.applyVerify(ctx, rows, ans, res)
+		if deleted > 0 && a.afterDeletes != nil {
+			a.afterDeletes()
 		}
-		held := make(map[string]bool, len(ans.Held))
-		for _, p := range ans.Held {
-			if _, asked := byPath[p]; !asked {
-				return fmt.Errorf("edgesync: verify answered held for %q, which was not asked", p)
-			}
-			held[p] = true
-		}
-		missing := make(map[string]bool, len(ans.Missing))
-		for _, p := range ans.Missing {
-			if held[p] {
-				return fmt.Errorf("edgesync: verify answered %q both held and missing", p)
-			}
-			missing[p] = true
-		}
-
-		for _, e := range rows {
-			switch {
-			case held[e.Path]:
-				if err := a.deleteLocal(ctx, e.Path, e.SizeBytes); err != nil {
-					// Kept, and asked again after the recheck interval.
-					a.logger.Warn().Err(err).Str("path", e.Path).Msg("delete_after_sync: the hub holds this file but the local copy could not be deleted; kept")
-					if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateKept); err != nil {
-						return err
-					}
-					res.VerifyKept++
-					continue
-				}
-				if err := a.ledger.MarkDeletedLocal(ctx, a.hubID, e.Path); err != nil {
-					return err
-				}
-				res.LocalDeleted++
-			case missing[e.Path]:
-				size, err := a.backend.StatFile(ctx, e.Path)
-				if err != nil {
-					return fmt.Errorf("edgesync: stat %q: %w", e.Path, err)
-				}
-				if size >= 0 {
-					// The hub no longer has any receipt (forgotten on purpose,
-					// for example the admin forget route): send it again.
-					if err := a.ledger.RequeueSynced(ctx, a.hubID, e.Path); err != nil {
-						return err
-					}
-					res.VerifyRequeued++
-					continue
-				}
-				if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateMissing); err != nil {
-					return err
-				}
-			default:
-				if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateKept); err != nil {
-					return err
-				}
-				res.VerifyKept++
-			}
-		}
-		if a.batchSize <= 0 {
-			return nil
+		if err != nil {
+			return err
 		}
 	}
+}
+
+// defaultVerifyPage bounds one verify request when batch_size is 0 (one page
+// for the pending loop): the hub refuses more than its max_reconcile_entries.
+const defaultVerifyPage = 1000
+
+// applyVerify acts on one page's verify answer. Returns how many local copies
+// it deleted, so the caller drops the query caches once per page.
+func (a *Agent) applyVerify(ctx context.Context, rows []*LedgerEntry, ans *VerifyAnswer, res *RunResult) (int, error) {
+	byPath := make(map[string]*LedgerEntry, len(rows))
+	for _, e := range rows {
+		byPath[e.Path] = e
+	}
+	held := make(map[string]bool, len(ans.Held))
+	for _, p := range ans.Held {
+		if _, asked := byPath[p]; !asked {
+			return 0, fmt.Errorf("edgesync: verify answered held for %q, which was not asked", p)
+		}
+		held[p] = true
+	}
+	missing := make(map[string]bool, len(ans.Missing))
+	for _, p := range ans.Missing {
+		if held[p] {
+			return 0, fmt.Errorf("edgesync: verify answered %q both held and missing", p)
+		}
+		missing[p] = true
+	}
+
+	deleted := 0
+	for _, e := range rows {
+		switch {
+		case held[e.Path]:
+			err := a.deleteLocal(ctx, e.Path, e.SizeBytes)
+			if errors.Is(err, ErrDeleterNotReady) {
+				return deleted, nil
+			}
+			if err != nil {
+				// Kept, and asked again after the recheck interval.
+				a.logger.Warn().Err(err).Str("path", e.Path).Msg("delete_after_sync: the hub holds this file but the local copy could not be deleted; kept")
+				if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateKept); err != nil {
+					return deleted, err
+				}
+				res.VerifyKept++
+				continue
+			}
+			deleted++
+			if err := a.ledger.MarkDeletedLocal(ctx, a.hubID, e.Path); err != nil {
+				return deleted, err
+			}
+			res.LocalDeleted++
+		case missing[e.Path]:
+			size, err := a.backend.StatFile(ctx, e.Path)
+			if err != nil {
+				return deleted, fmt.Errorf("edgesync: stat %q: %w", e.Path, err)
+			}
+			if size >= 0 {
+				// The hub no longer has any receipt (forgotten on purpose,
+				// for example the admin forget route): send it again.
+				if err := a.ledger.RequeueSynced(ctx, a.hubID, e.Path); err != nil {
+					return deleted, err
+				}
+				res.VerifyRequeued++
+				continue
+			}
+			if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateMissing); err != nil {
+				return deleted, err
+			}
+		default:
+			if err := a.ledger.MarkVerified(ctx, a.hubID, e.Path, HubStateKept); err != nil {
+				return deleted, err
+			}
+			res.VerifyKept++
+		}
+	}
+	return deleted, nil
 }
 
 // runBatch reconciles one page of pending files and sends what the hub lacks.

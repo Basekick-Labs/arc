@@ -3,6 +3,7 @@ package edgesync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -55,7 +56,7 @@ func ledgerRow(t *testing.T, r *agentRig, path string) (state string, hubState s
 func TestDeleteAfterSync_DeletesOnlyAfterALaterVerification(t *testing.T) {
 	ctx := context.Background()
 	r := newAgentRig(t)
-	r.agent.SetDeleteAfterSync(0, deleterFor(r, nil))
+	r.agent.SetDeleteAfterSync(0, deleterFor(r, nil), nil)
 	r.writeFile(t, agentPath, []byte("payload"))
 
 	res, err := r.agent.Run(ctx)
@@ -83,7 +84,7 @@ func TestDeleteAfterSync_DeletesOnlyAfterALaterVerification(t *testing.T) {
 func TestDeleteAfterSync_RespectsTheDelay(t *testing.T) {
 	ctx := context.Background()
 	r := newAgentRig(t)
-	r.agent.SetDeleteAfterSync(time.Hour, deleterFor(r, nil))
+	r.agent.SetDeleteAfterSync(time.Hour, deleterFor(r, nil), nil)
 	r.writeFile(t, agentPath, []byte("payload"))
 	for i := 0; i < 2; i++ {
 		if _, err := r.agent.Run(ctx); err != nil {
@@ -105,7 +106,7 @@ func TestDeleteAfterSync_KeepsWhatTheHubCannotProve(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.transport.MarkUnheld(DefaultHubID, agentPath)
-	r.agent.SetDeleteAfterSync(0, deleterFor(r, nil))
+	r.agent.SetDeleteAfterSync(0, deleterFor(r, nil), nil)
 	res, err := r.agent.Run(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +133,7 @@ func TestDeleteAfterSync_RequeuesWhatTheHubForgot(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.transport.Forget(DefaultHubID, agentPath)
-	r.agent.SetDeleteAfterSync(0, deleterFor(r, errors.New("must not be called")))
+	r.agent.SetDeleteAfterSync(0, deleterFor(r, errors.New("must not be called")), nil)
 	res, err := r.agent.Run(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -157,8 +158,8 @@ func TestDeleteAfterSync_RequeuesWhatTheHubForgot(t *testing.T) {
 func TestDeleteAfterSync_NothingDeletedWithoutProof(t *testing.T) {
 	ctx := context.Background()
 	for name, setup := range map[string]func(r *agentRig){
-		"old hub":        func(r *agentRig) { r.transport.NoVerify = true; r.agent.SetDeleteAfterSync(0, deleterFor(r, nil)) },
-		"deleter failed": func(r *agentRig) { r.agent.SetDeleteAfterSync(0, deleterFor(r, errors.New("disk busy"))) },
+		"old hub":        func(r *agentRig) { r.transport.NoVerify = true; r.agent.SetDeleteAfterSync(0, deleterFor(r, nil), nil) },
+		"deleter failed": func(r *agentRig) { r.agent.SetDeleteAfterSync(0, deleterFor(r, errors.New("disk busy")), nil) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newAgentRig(t)
@@ -192,11 +193,102 @@ func TestDeleteAfterSync_AlreadyGoneIsMarked(t *testing.T) {
 	if err := r.backend.Delete(ctx, agentPath); err != nil {
 		t.Fatal(err)
 	}
-	r.agent.SetDeleteAfterSync(0, deleterFor(r, nil))
+	r.agent.SetDeleteAfterSync(0, deleterFor(r, nil), nil)
 	if _, err := r.agent.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, hs, del := ledgerRow(t, r, agentPath); !del || hs != HubStateHeld {
 		t.Fatalf("hub_state=%q deleted=%v, want held and deleted", hs, del)
+	}
+}
+
+func syncFiles(t *testing.T, r *agentRig, n int) []string {
+	t.Helper()
+	var paths []string
+	for i := 0; i < n; i++ {
+		p := fmt.Sprintf("metrics/cpu/2026/08/07/14/cpu_%03d.parquet", i)
+		r.writeFile(t, p, []byte(p))
+		paths = append(paths, p)
+	}
+	if _, err := r.agent.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
+// A hub capping the page (413) gets smaller pages, not a failed pass; the
+// caches are dropped once per page that deleted files, not once per file.
+func TestDeleteAfterSync_SplitsOnTooLargeAndInvalidatesPerPage(t *testing.T) {
+	r := newAgentRigWithBatch(t, 0) // one page for the pending loop
+	syncFiles(t, r, 6)
+	r.transport.MaxReconcileEntries = 2
+	invalidations := 0
+	r.agent.SetDeleteAfterSync(0, deleterFor(r, nil), func() { invalidations++ })
+	res, err := r.agent.Run(context.Background())
+	if err != nil || res.VerifyError != "" {
+		t.Fatalf("err=%v verify_error=%q", err, res.VerifyError)
+	}
+	if res.LocalDeleted != 6 {
+		t.Fatalf("deleted %d, want 6", res.LocalDeleted)
+	}
+	if invalidations != 3 {
+		t.Fatalf("caches dropped %d times, want once per 2-file page (3)", invalidations)
+	}
+}
+
+// A verify failure does not fail the pass or delete anything; an older hub
+// is probed with no entries and never sent the synced list (which it would
+// treat as an ordinary, state-changing reconcile), and is asked again only
+// after a day.
+func TestDeleteAfterSync_VerifyFailureAndOldHubProbe(t *testing.T) {
+	ctx := context.Background()
+	r := newAgentRig(t)
+	paths := syncFiles(t, r, 2)
+	r.transport.VerifyErr = errors.New("hub unavailable")
+	r.agent.SetDeleteAfterSync(0, deleterFor(r, nil), nil)
+	res, err := r.agent.Run(ctx)
+	if err != nil {
+		t.Fatalf("a verify failure failed the pass: %v", err)
+	}
+	if res.VerifyError == "" || res.LocalDeleted != 0 || !localExists(t, r, paths[0]) {
+		t.Fatalf("verify_error=%q deleted=%d", res.VerifyError, res.LocalDeleted)
+	}
+
+	r.transport.VerifyErr = nil
+	r.transport.NoVerify = true
+	before := r.transport.VerifyEntryCalls
+	for i := 0; i < 2; i++ {
+		res, err = r.agent.Run(ctx)
+		if err != nil || !res.VerifyUnsupported {
+			t.Fatalf("old hub: err=%v unsupported=%v", err, res.VerifyUnsupported)
+		}
+	}
+	if r.transport.VerifyEntryCalls != before {
+		t.Fatal("the synced list was sent to a hub that cannot verify")
+	}
+}
+
+// A deleter that is not ready yet (node starting) stops the step without
+// marking anything; the next pass deletes.
+func TestDeleteAfterSync_NotReadyMarksNothing(t *testing.T) {
+	ctx := context.Background()
+	r := newAgentRig(t)
+	paths := syncFiles(t, r, 1)
+	ready := false
+	r.agent.SetDeleteAfterSync(0, func(ctx context.Context, p string, want int64) error {
+		if !ready {
+			return ErrDeleterNotReady
+		}
+		return deleterFor(r, nil)(ctx, p, want)
+	}, nil)
+	if res, err := r.agent.Run(ctx); err != nil || res.LocalDeleted != 0 || res.VerifyKept != 0 {
+		t.Fatalf("not ready: %+v %v", res, err)
+	}
+	if _, hs, _ := ledgerRow(t, r, paths[0]); hs != "" {
+		t.Fatalf("not-ready marked hub_state %q", hs)
+	}
+	ready = true
+	if res, err := r.agent.Run(ctx); err != nil || res.LocalDeleted != 1 {
+		t.Fatalf("ready: %+v %v", res, err)
 	}
 }
