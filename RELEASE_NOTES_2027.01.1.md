@@ -8,11 +8,13 @@ With the WAL off (the default), a write whose rows span several hours is flushed
 
 Each hour file is now registered as soon as it is stored, so a failure later in the flush leaves the earlier files tracked:
 - **Tiering:** they reach the tier metadata, and are migrated and covered by tier-aware retention.
-- **Cluster:** they are in the manifest, so readers that go by the manifest see them, and the reconciliation sweep does not treat them as orphans to delete.
+- **Cluster:** they are in the manifest, so readers that go by the manifest see them, and the reconciliation sweep does not treat them as orphans to delete. As for every registration made without a WAL, the registration journal entry is not fsynced, so it survives a process crash but not a power loss.
 
-The failure log now reports `records_stored` and `files_stored`, and `records_without_wal` and `arc_buffer_records_dropped_total` count only the rows in no stored file. In a reproduction on S3, a 3,650-row backfill over 365 hours that failed at the 338th file used to count 3,650 rows as lost. It now counts the 280 that were lost, with 3,370 stored and queryable.
+The failure log now reports `records_stored` and `files_stored`, and `records_without_wal` and `arc_buffer_records_dropped_total` count only the rows in no stored file. Two reproductions:
+- On Amazon S3, a 20,000-row backfill over 2,000 hours was cut off by a shutdown. The old binary stored 204 hour files and counted all 20,000 rows as lost. The fixed one stored 205 files and reported 2,050 rows stored and 17,950 lost.
+- On MinIO, paused part-way through a 3,650-row, 365-hour backfill, 337 files were stored, 280 rows were counted lost, and 3,370 rows were queryable.
 
-With the WAL on, nothing changes: each hour file was already registered and checkpointed as it was stored (#1492). The one exception is a flush whose rows the WAL row map cannot name. It still registers only after the last hour, because WAL recovery replays the whole flush, and registering early would store those rows twice. The count of rows a shutdown leaves for WAL replay is also corrected for a flush that stored only some of its hour files.
+With the WAL on, nothing changes: each hour file was already registered and checkpointed as it was stored (#1492). The count of rows a shutdown leaves for WAL replay is also corrected for a flush that stored only some of its hour files.
 
 ## Fix: a backfill flush is no longer cut off at 30 seconds in total ([#1692](https://github.com/Basekick-Labs/arc/issues/1692))
 

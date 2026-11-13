@@ -101,7 +101,8 @@ func TestNoWALMultiHourFlushCountsOnce_1693(t *testing.T) {
 	require.EqualValues(t, hours, b.totalFlushes.Load()-flushesBefore)
 }
 
-// With a WAL but rows the row map cannot name, registration still waits for
+// With a WAL and a merged batch that has no row map at all (a layout the
+// merge does not produce today; set by hand), registration still waits for
 // the last hour: recovery replays the whole flush, and an early-registered
 // file beside its replayed twin would double its rows.
 func TestWALWithoutRowMapKeepsDeferredRegistration_1693(t *testing.T) {
@@ -131,6 +132,7 @@ func TestWALWithoutRowMapKeepsDeferredRegistration_1693(t *testing.T) {
 func TestCloseDrainPartialNoWALNotNegative_1693(t *testing.T) {
 	store := &failAtBackend{failAt: 4}
 	b := NewArrowBuffer(cfg1692(5), store, zerolog.New(io.Discard))
+	t.Cleanup(func() { _ = b.Close() })
 	b.SetFileRegistrar(&recordingRegistrar1693{})
 	records := []interface{}{typedHoursBatch1693(t, b, 6)}
 	task := flushTask{bufferKey: "db/backfill", database: "db", measurement: "backfill", records: records, recordCount: 6}
@@ -140,7 +142,35 @@ func TestCloseDrainPartialNoWALNotNegative_1693(t *testing.T) {
 	unwrit, lost := b.drainAndFlushQueue(time.Now().Add(10 * time.Second))
 	require.Zero(t, unwrit, "no WAL: nothing is unwritten-with-a-copy, and never negative")
 	require.Zero(t, lost, "the task was attempted")
-	_ = b.Close()
+}
+
+// The defensive fallback: no WAL and no row map. Every row not stored is
+// lost, and every stored row is copy-less.
+func TestNoWALNoRowMapPartialCountsLoss_1693(t *testing.T) {
+	store := &failAtBackend{failAt: 3}
+	reg := &recordingRegistrar1693{}
+	b := NewArrowBuffer(cfg1692(5), store, zerolog.New(io.Discard))
+	t.Cleanup(func() { _ = b.Close() })
+	b.SetFileRegistrar(reg)
+	merged, err := b.mergeBatchesForFlush("backfill", []interface{}{typedHoursBatch1693(t, b, 5)})
+	require.NoError(t, err)
+	merged.walSpans = nil
+	err = b.flushPartitionedData(context.Background(), "db/backfill", "db", "backfill", merged, 5, flushTypeAsync, time.Now(), nil)
+	var partial *flushPartialError
+	require.True(t, errors.As(err, &partial), "%v", err)
+	require.Equal(t, 2, partial.StoredRows)
+	require.Equal(t, 3, partial.LostWithoutWAL)
+	require.Equal(t, 2, partial.StoredWithoutWAL)
+	require.Equal(t, 2, reg.count())
+}
+
+// storedWithoutCopy counts stored positions of copy-less spans only.
+func TestStoredWithoutCopy_1693(t *testing.T) {
+	s := &walRowSpans{rows: 6, spans: []walRowSpan{{lo: 0, hi: 3, copied: true}, {lo: 3, hi: 6}}}
+	written := []bool{true, true, false, true, false, true}
+	require.Equal(t, 2, s.storedWithoutCopy(written))
+	require.Equal(t, 1, s.lostWithoutCopy(written))
+	require.Zero(t, (*walRowSpans)(nil).storedWithoutCopy(written))
 }
 
 // typedHoursBatch1693 is a TypedColumnBatch with one row in each of n hours,

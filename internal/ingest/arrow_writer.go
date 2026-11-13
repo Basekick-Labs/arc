@@ -5218,11 +5218,12 @@ func (b *ArrowBuffer) checkpointRows(ctx context.Context, ids []string) bool {
 // in those files are not lost and are not replayed; logFlushFailure reports
 // the rest.
 type flushPartialError struct {
-	Err            error
-	StoredRows     int
-	StoredFiles    int
-	LostWithoutWAL int  // rows with no WAL copy that are in no stored file
-	Checkpointed   bool // the stored rows were checkpointed in the WAL
+	Err              error
+	StoredRows       int
+	StoredFiles      int
+	LostWithoutWAL   int  // rows with no WAL copy that are in no stored file
+	StoredWithoutWAL int  // stored rows with no WAL copy (all of them without a WAL)
+	Checkpointed     bool // the stored rows were checkpointed in the WAL
 }
 
 func (e *flushPartialError) Error() string {
@@ -5432,10 +5433,11 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// failing), only hides it from tiering and the cluster manifest. There is
 	// no checkpoint and no coverage then, and no per-hour sync: registrations
 	// are not synced without a WAL (syncRegistrations), an unsynced outbox
-	// append survives a process crash. Only the WAL-on flush whose rows the
-	// row map cannot name (legacy map records) still registers after the
-	// last hour: recovery replays the whole flush into new files, and an
-	// early-registered file beside its replayed twin would double its rows.
+	// append survives a process crash. Only a WAL-on flush whose merged batch
+	// has no row map at all (a layout the merge did not produce: spans nil
+	// above) still registers after the last hour: recovery replays the whole
+	// flush into new files, and an early-registered file beside its replayed
+	// twin would double its rows.
 	spans := merged.walSpans
 	if spans != nil && spans.rows != len(times) {
 		spans = nil // a layout the merge did not produce: name nothing
@@ -5454,12 +5456,16 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		}
 		group.storedPartially(group.storedPieces(spans, writtenAt), storedFiles)
 		lost := spans.lostWithoutCopy(writtenAt)
+		storedNoCopy := spans.storedWithoutCopy(writtenAt)
 		if spans == nil && b.wal == nil {
-			// No row map (legacy map records) and no WAL: every row not in a
-			// stored file is lost, which lostWithoutCopy cannot see.
+			// Defensive: a merged batch with no row map and no WAL (not a
+			// layout the merge produces today). No row has a WAL copy, so
+			// every row not in a stored file is lost, which lostWithoutCopy
+			// cannot see without spans.
 			lost = len(times) - storedRows
+			storedNoCopy = storedRows
 		}
-		return &flushPartialError{Err: err, StoredRows: storedRows, StoredFiles: storedFiles, LostWithoutWAL: lost, Checkpointed: perHour}
+		return &flushPartialError{Err: err, StoredRows: storedRows, StoredFiles: storedFiles, LostWithoutWAL: lost, StoredWithoutWAL: storedNoCopy, Checkpointed: perHour}
 	}
 
 	type tieringEntry struct {
@@ -5538,7 +5544,10 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				// Its own bound, as the deferred loop below gives it: the hour
 				// file's context has been spent on the PUT, and a slow one
 				// must not starve the tiering record.
-				regCtx, cancelReg := b.fileContext(flushCtx)
+				// Not cancelled with the flush either: a PUT that completed
+				// as Close's budget ran out (LocalBackend ignores its
+				// context) is stored, and without a WAL its only copy.
+				regCtx, cancelReg := b.fileContext(context.WithoutCancel(flushCtx))
 				b.registerFileInTiering(regCtx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, cov.forFile(group.piecesAt(bucket.indices)))
 				cancelReg()
 				var ranges []string
@@ -5556,15 +5565,16 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				storedFiles++
 				b.totalRecordsWritten.Add(int64(splitRecordCount))
 				b.totalFlushes.Add(1)
-				b.logger.Info().
+				ev := b.logger.Info().
 					Str("buffer_key", bufferKey).
 					Str("storage_path", storagePath).
 					Int64("hour_id", hourID).
 					Int("records", splitRecordCount).
-					Int("size_bytes", len(parquetData)).
-					Int("row_ranges", len(ranges)).
-					Bool("rows_checkpointed", checkpointed).
-					Msg("Wrote hour partition and registered it")
+					Int("size_bytes", len(parquetData))
+				if perHour {
+					ev = ev.Int("row_ranges", len(ranges)).Bool("rows_checkpointed", checkpointed)
+				}
+				ev.Msg("Wrote hour partition and registered it")
 				return nil
 			}
 
@@ -7486,16 +7496,17 @@ drain:
 
 			b.markFlushTaskInFlight(task)
 			if err := b.flushTrackedTask(flushCtx, task); err != nil {
-				// Unwritten rows that the WAL still holds. For a multi-hour
-				// flush that stored some hour files first (#1492, #1693) that
-				// is what is neither stored nor lost: subtracting the stored
-				// rows from recordCount-noWAL would count stored rows without
-				// a WAL copy twice, and goes negative without a WAL, hiding
-				// other tasks' unwritten rows.
+				// Unwritten rows that the WAL still holds: the rows with a WAL
+				// copy, less those a multi-hour flush stored before failing
+				// (#1492, #1693). Only stored rows WITH a copy come off:
+				// subtracting every stored row counted the copy-less ones
+				// twice and went negative without a WAL, hiding other tasks'
+				// unwritten rows. Per-part safe for a split flush, whose
+				// error is its first failing part's.
 				pending := task.recordCount - noWAL
 				var partial *flushPartialError
 				if errors.As(err, &partial) {
-					pending = task.recordCount - partial.StoredRows - partial.LostWithoutWAL
+					pending -= partial.StoredRows - partial.StoredWithoutWAL
 				}
 				mu.Lock()
 				unwrit += pending
