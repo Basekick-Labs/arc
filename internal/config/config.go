@@ -394,7 +394,7 @@ type EdgeSyncImportConfig struct {
 	// whatever the exporting spoke was configured with. Zero means 10,000.
 	MaxFiles int64
 
-	// Timeout bounds one POST /api/v1/edge-sync/import. Parsed from
+	// Timeout bounds one POST /api/v1/bundle-import. Parsed from
 	// edge_sync.import.timeout; always positive. Default 4h: every file is
 	// hashed twice (verify, then commit), off removable media (#1112).
 	Timeout time.Duration
@@ -485,8 +485,8 @@ type EdgeSyncSpokeConfig struct {
 
 	// SyncTimeout bounds one manual sync pass (POST /api/v1/spoke-sync/run).
 	// Parsed from edge_sync.spoke.sync_timeout; always positive. Default 2h:
-	// a pass drains whatever backlog exists (#1112). The scheduled passes are
-	// not bounded by it.
+	// a pass drains whatever backlog exists (#1112). Scheduled passes do not
+	// read it.
 	SyncTimeout time.Duration
 
 	// Bundle configures air-gap export.
@@ -1145,11 +1145,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	bundleExportTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.bundle.timeout")
+	spokeBundleTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.bundle.timeout")
 	if err != nil {
 		return nil, err
 	}
-	bundleImportTimeout, err := parsePositiveDuration(v, "edge_sync.import.timeout")
+	hubImportTimeout, err := parsePositiveDuration(v, "edge_sync.import.timeout")
 	if err != nil {
 		return nil, err
 	}
@@ -1279,7 +1279,7 @@ func Load() (*Config, error) {
 				Enabled:     v.GetBool("edge_sync.import.enabled"),
 				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
-				Timeout:     bundleImportTimeout,
+				Timeout:     hubImportTimeout,
 			},
 			Spoke: EdgeSyncSpokeConfig{
 				Enabled:                    v.GetBool("edge_sync.spoke.enabled"),
@@ -1301,7 +1301,7 @@ func Load() (*Config, error) {
 					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
 					MaxFiles:    v.GetInt("edge_sync.spoke.bundle.max_files"),
 					MaxBytes:    v.GetInt64("edge_sync.spoke.bundle.max_bytes"),
-					Timeout:     bundleExportTimeout,
+					Timeout:     spokeBundleTimeout,
 				},
 			},
 		},

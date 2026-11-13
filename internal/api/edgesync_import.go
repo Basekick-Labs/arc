@@ -17,9 +17,9 @@ import (
 //
 // Generous for the same reason the export is: a bundle can carry thousands of
 // files off removable media, every one hashed twice (verify, then commit).
-// Configurable since #1112, and the setting is the only bound: closing the
-// HTTP connection does not cancel the import, because Fiber's request context
-// is not cancelled on a client disconnect.
+// Configurable since #1112. Closing the HTTP connection does not cancel the
+// import: Fiber's request context is cancelled only by a server shutdown, not
+// by a client disconnect.
 const defaultBundleImportTimeout = 4 * time.Hour
 
 // EdgeSyncImportHandler exposes the hub's air-gap import controls.

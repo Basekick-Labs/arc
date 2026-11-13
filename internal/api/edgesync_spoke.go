@@ -18,9 +18,9 @@ import (
 // Generous because a pass drains whatever backlog exists: a spoke returning
 // from a long outage may have thousands of files to send, and cutting that
 // short would leave it worse off than not having run at all. Configurable
-// since #1112, and the setting is the only bound: closing the HTTP connection
-// does not cancel the pass, because Fiber's request context is not cancelled
-// on a client disconnect.
+// since #1112. Closing the HTTP connection does not cancel the pass: Fiber's
+// request context is cancelled only by a server shutdown, not by a client
+// disconnect, so this bound and a shutdown are what end a pass.
 const defaultSyncRunTimeout = 2 * time.Hour
 
 // EdgeSyncSpokeHandler exposes the manual sync controls on a spoke.
@@ -444,7 +444,7 @@ func (h *EdgeSyncSpokeHandler) ledger(c *fiber.Ctx) error {
 // Generous for the same reason a sync pass is: a bundle can carry thousands of
 // files to removable media, and cutting that short leaves a partial tree the
 // writer must then clean up. Configurable since #1112; as for a sync pass,
-// the setting is the only bound.
+// a client disconnect does not cancel it, only this bound or a shutdown.
 const defaultBundleExportTimeout = 2 * time.Hour
 
 // export handles POST /api/v1/spoke-sync/export.

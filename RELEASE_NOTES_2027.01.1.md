@@ -17,7 +17,7 @@ Each takes a Go duration (`45m`, `6h`). A value that does not parse, or that is 
 
 - Raise `migration_timeout` for a first cold-tier migration of a large dataset. Lower it to make a stuck migration give up and alert sooner.
 - The scan at the start of each migration cycle runs inside the cycle's limit. A `migration_timeout` shorter than `tiered_storage.scan_timeout` therefore cuts that scan short too. Arc logs a warning at startup when you configure that.
-- Closing the HTTP connection does not stop a manual sync, export or import, so these settings are the only limit on how long one runs.
+- Closing the HTTP connection does not stop a manual sync, export or import. Only these settings, or shutting the server down, do.
 
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 

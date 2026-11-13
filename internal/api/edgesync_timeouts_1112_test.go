@@ -34,6 +34,9 @@ func TestEdgeSyncSpoke_RunHonoursConfiguredTimeout(t *testing.T) {
 	if resp.StatusCode == fiber.StatusOK {
 		t.Fatal("a 1ns sync_timeout let the pass complete; the handler is not using the configured bound")
 	}
+	if _, held := rig.transport.Has("ground-station", "metrics/cpu/2026/08/07/14/f.parquet"); held {
+		t.Fatal("the hub received the file under a 1ns bound; the pass was not stopped by it")
+	}
 
 	// The default handler on the same rig completes the pass.
 	ok, body := rig.do(t, http.MethodPost, "/api/v1/spoke-sync/run")
