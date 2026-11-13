@@ -2968,8 +2968,8 @@ func (b *ArrowBuffer) signalDrain() {
 // Without it a deferred buffer is picked up only by a later write to the same
 // measurement, by the age-based sweep, or by Close. When ingest moves on to
 // other measurements, that buffer sits while flush workers go idle — and the
-// age sweep is a single goroutine that holds each shard's lock across its whole
-// pass, so with many measurements it is the slowest way to drain anything.
+// age sweep waits for a buffer's max age and runs one shard at a time, so it
+// is the slowest way to drain anything.
 //
 // Two properties this loop must have, both learned the hard way:
 //
@@ -4778,56 +4778,101 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
 
-		shard.mu.Lock()
+		// Extract every aged buffer of this shard under one lock hold, then
+		// write them concurrently without it (#1632). Writing them one at a
+		// time under the lock, as this sweep did, cost N x (write + file fsync
+		// + directory fsync) per sweep once #1618 made every flush durable:
+		// about 30 s for 1,000 low-rate measurements on macOS. The writes go
+		// straight to storage, not through flushQueue, so aged data never
+		// waits behind size-triggered flushes and never takes a slot a writer
+		// needs, and "the sweep returned" still means "the aged data was
+		// written".
+		var aged []agedFlush
+		closing := false
 
-		// Check each buffer in this shard for age
+		shard.mu.Lock()
 		for key, startTime := range shard.bufferStartTimes {
-			// Stop the sweep once Close() has begun and leave the rest to
-			// Close()'s own shard loop. This sweep is a single serial goroutine
-			// over every shard, and Close() waits for it via b.wg.Wait(); with
-			// many aged buffers on slow storage, finishing the whole sweep can
-			// outlast the shutdown budget.
-			//
-			// The unlock is REQUIRED: shard.mu is held across this entire loop
-			// (released only inside flushBufferLocked, around its I/O). A bare
-			// return would leak the lock, and Close()'s shard loop — plus every
-			// later write to this shard — would block on it forever.
+			// Stop extracting once Close() has begun and leave the rest to
+			// Close()'s own shard loop: Close waits for this sweep via
+			// b.wg.Wait(), and with many aged buffers on slow storage a full
+			// sweep can outlast the shutdown budget. What is already extracted
+			// is still written below -- it is no longer in the buffer.
 			if b.closing.Load() {
-				shard.mu.Unlock()
-				b.logger.Info().
-					Int("shard", shardIdx).
-					Msg("Aged-buffer sweep stopping: buffer is closing, remaining buffers left to Close()")
-				return
+				closing = true
+				break
 			}
 			age := now.Sub(startTime)
-			if age >= threshold {
-				b.logger.Info().
-					Str("buffer_key", key).
-					Dur("age", age).
-					Dur("threshold", threshold).
-					Int("shard", shardIdx).
-					Msg("Flushing aged buffer")
-
-				// Parse buffer key to get database and measurement
-				parts := splitBufferKey(key)
-				if len(parts) != 2 {
-					b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format")
-					continue
-				}
-
-				// flushParent-derived: Close() cancelling b.ctx must not abort
-				// an aged flush mid-write, because flushBufferLocked has
-				// already deleted the buffer entry (#1007).
-				flushCtx, flushCancel := b.newFlushContext()
-				if err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1]); err != nil {
-					b.logger.Debug().Err(err).Str("buffer_key", key).Msg("Failed to flush aged buffer") // flushBufferLocked logged it (#1377)
-				}
-				flushCancel()
+			if age < threshold {
+				continue
+			}
+			// Parse buffer key to get database and measurement
+			parts := splitBufferKey(key)
+			if len(parts) != 2 {
+				b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format")
+				continue
+			}
+			b.logger.Info().
+				Str("buffer_key", key).
+				Dur("age", age).
+				Dur("threshold", threshold).
+				Int("shard", shardIdx).
+				Msg("Flushing aged buffer")
+			if e := b.extractBufferLocked(shard, key); e != nil {
+				aged = append(aged, agedFlush{e: e, key: key, database: parts[0], measurement: parts[1]})
 			}
 		}
-
 		shard.mu.Unlock()
+
+		b.writeAgedConcurrently(aged)
+
+		if closing {
+			b.logger.Info().
+				Int("shard", shardIdx).
+				Msg("Aged-buffer sweep stopping: buffer is closing, remaining buffers left to Close()")
+			return
+		}
 	}
+}
+
+// agedFlush is one buffer the aged sweep extracted.
+type agedFlush struct {
+	e                          *extractedFlush
+	key, database, measurement string
+}
+
+// writeAgedConcurrently writes the aged buffers of one shard, at most
+// flushWorkers at a time so storage sees the same concurrency the worker pool
+// can produce, and returns when all are written. Each write gets its own
+// flushParent-derived context: Close() cancelling b.ctx must not abort an
+// aged write mid-way, because the buffer entry is already gone (#1007).
+func (b *ArrowBuffer) writeAgedConcurrently(aged []agedFlush) {
+	write := func(a agedFlush) {
+		flushCtx, flushCancel := b.newFlushContext()
+		defer flushCancel()
+		if err := b.writeExtracted(flushCtx, a.e, a.key, a.database, a.measurement); err != nil {
+			b.logger.Debug().Err(err).Str("buffer_key", a.key).Msg("Failed to flush aged buffer") // writeExtracted logged it (#1377)
+		}
+	}
+	if len(aged) == 1 {
+		write(aged[0])
+		return
+	}
+	limit := b.flushWorkers
+	if limit <= 0 {
+		limit = 1
+	}
+	slots := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for _, a := range aged {
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(a agedFlush) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			write(a)
+		}(a)
+	}
+	wg.Wait()
 }
 
 // splitBufferKey splits "database/measurement" into [database, measurement]
@@ -5504,6 +5549,38 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 // flushBufferLocked writes buffered data to Parquet and storage (synchronous version for periodic flush)
 // Note: Caller must hold shard.mu lock
 func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string) error {
+	e := b.extractBufferLocked(shard, bufferKey)
+	if e == nil {
+		return nil
+	}
+	// Release lock before expensive operations
+	shard.mu.Unlock()
+	err := b.writeExtracted(ctx, e, bufferKey, database, measurement)
+	// Re-acquire lock for caller
+	shard.mu.Lock()
+	return err
+}
+
+// extractedFlush is a buffer taken out of its shard for a synchronous write:
+// everything flushBufferLocked does under shard.mu, carried to the I/O that
+// runs without it. Split out so the aged sweep can extract every aged buffer
+// of a shard under one lock hold and then write them concurrently (#1632).
+type extractedFlush struct {
+	records        []interface{}
+	recordCount    int
+	walHashes      []string
+	group          *flushGroup
+	trackingID     uint64
+	estimatedBytes int64
+	taskID         uint64
+}
+
+// extractBufferLocked removes bufferKey's batches from the shard and registers
+// the write that will carry them, or returns nil when there is nothing to
+// write (clearing any stale tracking entries). Caller holds shard.mu and MUST
+// pass a non-nil result to writeExtracted: the records are no longer in the
+// buffer, and the async-flush task registered here is completed only there.
+func (b *ArrowBuffer) extractBufferLocked(shard *bufferShard, bufferKey string) *extractedFlush {
 	batches, exists := shard.buffers[bufferKey]
 	if !exists || len(batches) == 0 {
 		// Clean up stale tracking entries even if buffer is empty.
@@ -5524,18 +5601,17 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// Get record count before clearing buffer
 	recordCount := shard.bufferRecordCounts[bufferKey]
 	walHashes := collectWALHashes(batches)
-	group := b.newFlushGroup(bufferKey, batches, walHashes)
-	bufferStartTime := shard.bufferStartTimes[bufferKey]
-	estimatedBytes := estimateBufferedBatchesBytes(batches)
-	trackingID := b.trackFlush(bufferStartTime)
-	defer func() {
-		b.untrackFlush(trackingID)
-		b.bufferBytesBuffered.Add(-estimatedBytes)
-	}()
+	e := &extractedFlush{
+		recordCount:    recordCount,
+		walHashes:      walHashes,
+		group:          b.newFlushGroup(bufferKey, batches, walHashes),
+		trackingID:     b.trackFlush(shard.bufferStartTimes[bufferKey]),
+		estimatedBytes: estimateBufferedBatchesBytes(batches),
+	}
 
 	// Extract records to flush (hold lock for minimal time)
-	recordsToFlush := make([]interface{}, len(batches))
-	copy(recordsToFlush, batches)
+	e.records = make([]interface{}, len(batches))
+	copy(e.records, batches)
 
 	// Clear buffer immediately
 	delete(shard.deferredKeys, bufferKey)
@@ -5547,17 +5623,25 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// Account for direct (aged/periodic) storage writes as well as queued ones.
 	// Register before releasing shard.mu so a concurrent recovery fence cannot
 	// miss this flush after observing the extracted buffer as empty.
-	taskID := b.beginAsyncFlushTask()
-	completeTask := func() { b.completeAsyncFlushTask(taskID) }
+	e.taskID = b.beginAsyncFlushTask()
 
 	// The records have left the buffer and never enter the flush queue, so
 	// they count as in flight until the write ends; otherwise no gauge sees a
 	// synchronous flush (FlushAll, the flush before a DELETE, Close) at all.
 	b.adjustFlushRecordMetrics(0, int64(recordCount))
-	defer b.adjustFlushRecordMetrics(0, -int64(recordCount))
+	return e
+}
 
-	// Release lock before expensive operations
-	shard.mu.Unlock()
+// writeExtracted writes an extracted buffer. Called WITHOUT shard.mu. Always
+// completes the task and releases the accounting extractBufferLocked took.
+func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, bufferKey, database, measurement string) error {
+	recordCount, recordsToFlush, walHashes, group := e.recordCount, e.records, e.walHashes, e.group
+	defer func() {
+		b.untrackFlush(e.trackingID)
+		b.bufferBytesBuffered.Add(-e.estimatedBytes)
+	}()
+	defer b.adjustFlushRecordMetrics(0, -int64(recordCount))
+	completeTask := func() { b.completeAsyncFlushTask(e.taskID) }
 
 	if parts := b.splitForCoverage(bufferKey, recordsToFlush); parts != nil {
 		// Each class is its own group and file set (flush_split.go).
@@ -5568,7 +5652,6 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 			}
 		}
 		completeTask()
-		shard.mu.Lock() // Re-acquire lock for caller
 		return first
 	}
 
@@ -5579,7 +5662,6 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		b.markFlushFailure()
 		group.failed()
 		completeTask()
-		shard.mu.Lock() // Re-acquire lock for caller
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 
@@ -5593,14 +5675,10 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		b.markFlushFailure()
 		group.failed()
 		completeTask()
-		shard.mu.Lock() // Re-acquire lock for caller
 		return err
 	}
 	b.completeFlush(walHashes, group)
 	completeTask()
-
-	// Re-acquire lock for caller
-	shard.mu.Lock()
 	return nil
 }
 
@@ -6951,7 +7029,8 @@ func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) b
 // Ordering, and why each step is where it is:
 //
 //  1. Set b.closing. tryEnqueueFlush reads it to decide that no worker will take
-//     a task, and the aged sweep reads it to stop between buffers.
+//     a task, and the aged sweep reads it to stop extracting buffers (what it
+//     already extracted it still writes before returning).
 //  2. b.cancel() stops the background loops — the metrics sampler, the periodic
 //     flush, and the workers' receive select. It does NOT reach flush I/O: every
 //     flush context derives from flushParent (context.WithoutCancel), so a write
