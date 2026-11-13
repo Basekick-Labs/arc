@@ -670,6 +670,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				"error":   "Query timed out",
 			})
 		}
+		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled at shutdown")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   "Server shutting down",
+			})
+		}
 		if ctxErr == context.Canceled {
 			// Cancelled through the registry (DELETE /api/v1/queries/:id or a
 			// client disconnect), which already recorded the disposition.

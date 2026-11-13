@@ -13,16 +13,34 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/pruning"
+	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
-// #1644, the issue's reproduction: an OSS node (no query registry) running a
-// long query on /api/v1/query/arrow or /api/v1/query. The HTTP drain cancels
+// #1644, the issue's reproduction: a node running a long query on
+// /api/v1/query/arrow, /api/v1/query or /api/v1/query/msgpack, without (OSS)
+// and with the Enterprise query registry. The HTTP drain cancels
 // the query when its grace is over and returns nil within its budget,
-// instead of waiting for the query.
+// instead of waiting for the query; the client gets a 503 and the registry
+// records the query as cancelled.
 func TestShutdownEndsALongOSSQuery(t *testing.T) {
-	for _, path := range []string{"/api/v1/query/arrow", "/api/v1/query"} {
-		t.Run(strings.TrimPrefix(path, "/api/v1/"), func(t *testing.T) {
+	for _, tc := range []struct {
+		path     string
+		registry bool
+	}{
+		{"/api/v1/query/arrow", false},
+		{"/api/v1/query", false},
+		{"/api/v1/query/arrow", true},
+		{"/api/v1/query", true},
+		{"/api/v1/query/msgpack", false},
+		{"/api/v1/query/msgpack", true},
+	} {
+		path := tc.path
+		name := strings.TrimPrefix(path, "/api/v1/")
+		if tc.registry {
+			name += "/registry"
+		}
+		t.Run(name, func(t *testing.T) {
 			tmpDir := t.TempDir()
 			logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
 			backend, err := storage.NewLocalBackend(tmpDir, logger)
@@ -42,6 +60,11 @@ func TestShutdownEndsALongOSSQuery(t *testing.T) {
 				storage:    backend,
 				queryCache: database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
 				pruner:     pruning.NewPartitionPruner(zerolog.Nop()),
+			}
+			var reg *queryregistry.Registry
+			if tc.registry {
+				reg = queryregistry.NewRegistry(&queryregistry.RegistryConfig{HistorySize: 4}, logger)
+				h.SetQueryRegistry(reg)
 			}
 			h.SetLifetime(s.QueryLifetime())
 			h.RegisterRoutes(s.app)
@@ -69,11 +92,19 @@ func TestShutdownEndsALongOSSQuery(t *testing.T) {
 			}
 			select {
 			case code := <-done:
-				if code == http.StatusOK {
-					t.Fatalf("the query completed (status %d) instead of being cancelled", code)
+				if code != http.StatusServiceUnavailable {
+					t.Fatalf("status %d, want 503 for a query cancelled at shutdown", code)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("client never got an answer")
+			}
+			if reg != nil {
+				if n := reg.ActiveCount(); n != 0 {
+					t.Fatalf("%d queries still active in the registry", n)
+				}
+				if hist := reg.GetHistory(4); len(hist) != 1 || hist[0].Status != queryregistry.StatusCancelled {
+					t.Fatalf("history %+v, want one cancelled entry", hist)
+				}
 			}
 			// The query is over: closing the database does not wait on it.
 			closed := make(chan struct{})

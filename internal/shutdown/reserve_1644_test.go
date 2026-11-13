@@ -79,3 +79,27 @@ func TestSetComponentReserveIgnoresOutOfRangeValues(t *testing.T) {
 		t.Fatalf("reserve %v", c.componentReserve)
 	}
 }
+
+// Once the full deadline has passed, the remaining hooks are skipped every
+// time, not only when a select over both deadlines happens to pick it.
+func TestHooksPastTheFullDeadlineAreAlwaysSkipped(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		c := New(100*time.Millisecond, zerolog.Nop())
+		c.SetComponentReserve(50 * time.Millisecond)
+		c.RegisterHook("overrun", func(ctx context.Context) error {
+			time.Sleep(150 * time.Millisecond)
+			return nil
+		}, PriorityHTTPServer)
+		var later bool
+		c.RegisterHook("later", func(context.Context) error {
+			later = true
+			return nil
+		}, PriorityHTTPServer+1)
+		if err := c.Shutdown(); err == nil {
+			t.Fatal("want the timeout error")
+		}
+		if later {
+			t.Fatalf("run %d: a hook ran after the full deadline", i)
+		}
+	}
+}

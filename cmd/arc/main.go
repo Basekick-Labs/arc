@@ -5618,8 +5618,9 @@ func main() {
 	shutdownCoordinator.RegisterHook("ready-flag-off", func(ctx context.Context) error {
 		server.MarkNotReady()
 		// At most half of the hooks' remaining share: the HTTP drain after
-		// this needs a grace too (#1644). With a short
-		// server.shutdown_timeout the LB gets less than one poll cycle.
+		// this needs a grace too (#1644). The hooks get 40% of
+		// server.shutdown_timeout, so the full 10 s needs 50 s or more; at
+		// the default 30 s the LB gets 6 s, less than one 10 s poll cycle.
 		grace := readyDrainGraceWithin(ctx, readyDrainGrace)
 		if grace == 0 {
 			return nil

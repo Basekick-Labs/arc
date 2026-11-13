@@ -172,8 +172,9 @@ func TestHTTPShutdownStages(t *testing.T) {
 	}{
 		{30 * time.Second, 26 * time.Second, 2 * time.Second},
 		{2 * time.Second, 1200 * time.Millisecond, 400 * time.Millisecond},
-		{500 * time.Millisecond, 0, 250 * time.Millisecond},
-		{-time.Second, 0, 250 * time.Millisecond},
+		{500 * time.Millisecond, 300 * time.Millisecond, 100 * time.Millisecond},
+		{150 * time.Millisecond, 0, 100 * time.Millisecond},
+		{-time.Second, 0, 100 * time.Millisecond},
 	} {
 		st := httpShutdownStagesFor(tc.budget)
 		if st.grace != tc.grace || st.force != tc.force {

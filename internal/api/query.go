@@ -1639,6 +1639,26 @@ func (h *QueryHandler) SetLifetime(ctx context.Context) {
 	h.lifetime = ctx
 }
 
+// shuttingDown reports whether the handler's lifetime is over: shutdown has
+// cancelled the queries still running (#1644).
+func (h *QueryHandler) shuttingDown() bool {
+	return h.lifetime != nil && h.lifetime.Err() != nil
+}
+
+// endedByShutdown reports whether a cancelled query was ended by shutdown
+// (the handler's lifetime is over) rather than by Cancel() or its client.
+// If so, it closes out queryID in the registry, which nothing else does for
+// a shutdown cancel.
+func (h *QueryHandler) endedByShutdown(queryID string) bool {
+	if !h.shuttingDown() {
+		return false
+	}
+	if h.queryRegistry != nil && queryID != "" {
+		h.queryRegistry.CancelWithReason(queryID, "server shutting down")
+	}
+	return true
+}
+
 // bindQueryLifetime wraps next (the read-auth middleware) so the request's
 // user context is the handler's lifetime. Every query derives its DuckDB
 // context from c.UserContext(), so ending the lifetime ends the query, and
@@ -2655,7 +2675,11 @@ localProcessing:
 				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
 				h.queryRegistry.Complete(queryID, rc)
 			}
-			onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+			onFail = func(msg string) {
+				if !h.endedByShutdown(queryID) {
+					h.queryRegistry.Fail(queryID, msg)
+				}
+			}
 			onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
 		}
 		_, handled := arrowDispatch(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
@@ -2741,9 +2765,19 @@ localProcessing:
 				Timestamp:       timestamp,
 			})
 		}
+		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Query cancelled at shutdown")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Server shutting down",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
 		if h.queryRegistry != nil && queryID != "" {
 			if ctxErr == context.Canceled {
-				// Already marked as cancelled by Cancel() — no-op
+				// Cancelled by Cancel() (DELETE /api/v1/queries/:id or a
+				// client disconnect), which recorded it — no-op.
 			} else {
 				h.queryRegistry.Fail(queryID, "Query execution failed")
 			}

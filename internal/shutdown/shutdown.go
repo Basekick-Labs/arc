@@ -175,13 +175,16 @@ func (c *Coordinator) Shutdown() error {
 
 		// Execute hooks first
 		for _, h := range hooks {
-			select {
-			case <-ctx.Done():
+			// The full deadline first: once it passes, hookCtx (its child)
+			// has passed too, and a select over both would pick at random.
+			if ctx.Err() != nil {
 				c.logger.Warn().
 					Str("hook", h.name).
 					Msg("Shutdown timeout reached, skipping remaining hooks")
 				shutdownErr = ctx.Err()
 				return
+			}
+			select {
 			case <-hookCtx.Done():
 				if !hookWindowLogged {
 					hookWindowLogged = true

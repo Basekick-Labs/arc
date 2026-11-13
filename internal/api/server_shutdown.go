@@ -13,9 +13,12 @@ import (
 
 // The force stages of ShutdownContext: each is a fifth of the drain budget,
 // within these bounds. The floor lets a cancelled query or a closed
-// connection unwind even when the budget is already spent.
+// connection unwind even when the budget is already spent; the two stages
+// can then overrun the hooks' share by up to 200 ms, which the components'
+// tenth (cmd/arc shutdownComponentReserve) covers from a
+// server.shutdown_timeout of 2 s up.
 const (
-	shutdownForceMin = 250 * time.Millisecond
+	shutdownForceMin = 100 * time.Millisecond
 	shutdownForceMax = 2 * time.Second
 )
 
@@ -77,8 +80,11 @@ func (t *connTracker) closeAll() int {
 		conns = append(conns, c)
 	}
 	t.mu.Unlock()
+	// Concurrently and without waiting: a tls.Conn's Close sends a
+	// close-notify alert, which can block up to 5 s on a client whose
+	// receive window is full.
 	for _, c := range conns {
-		_ = c.Close()
+		go func(c net.Conn) { _ = c.Close() }(c)
 	}
 	return len(conns)
 }
