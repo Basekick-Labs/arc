@@ -2036,7 +2036,7 @@ func main() {
 		// epoch from an earlier gated period must be invalidated here, or
 		// re-enabling sync later would classify this period's compacted
 		// outputs as delivered when their inputs may never have synced.
-		if !cfg.EdgeSync.Spoke.Enabled && !cfg.EdgeSync.Spoke.Bundle.Enabled {
+		if !cfg.EdgeSync.Spoke.Active() {
 			if metaDB, ownsMetaDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath); err == nil {
 				if _, err := metaDB.Exec(`DELETE FROM sync_meta WHERE key = 'compaction_defer_epoch'`); err != nil &&
 					!strings.Contains(err.Error(), "no such table") {
@@ -2056,7 +2056,7 @@ func main() {
 		// window (slow startup: WAL recovery can take minutes) must defer
 		// everything rather than run one unfiltered cycle that consumes
 		// undelivered raws.
-		if (cfg.EdgeSync.Spoke.Enabled || cfg.EdgeSync.Spoke.Bundle.Enabled) &&
+		if cfg.EdgeSync.Spoke.Active() &&
 			cfg.EdgeSync.Spoke.DeferCompactionUntilSynced {
 			compactionManager.SetSyncEligibility(func(ctx context.Context, paths []string) (map[string]bool, error) {
 				return nil, fmt.Errorf("edge sync ledger not ready yet; deferring compaction (startup)")
@@ -3161,7 +3161,7 @@ func main() {
 		// route can be called once the server is up, before or after that.
 		hubColdTier atomic.Pointer[tiering.Manager]
 	)
-	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
+	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
 			coord := clusterCoordinator
@@ -3451,17 +3451,11 @@ func main() {
 		}
 
 		// Air-gap import, independent of the network receive endpoints.
-		if cfg.EdgeSync.Import.Enabled {
+		// The importer serves both bundle sources: a drive (import.enabled,
+		// the HTTP route below) and a relay bucket (import.relay.enabled,
+		// #1685). Either may be on without the other.
+		if cfg.EdgeSync.Import.Active() {
 			importLogger := logger.Get("edgesync-import")
-
-			localRoot := ""
-			if cfg.Storage.Backend == "local" {
-				localRoot = cfg.Storage.LocalPath
-			}
-			importPolicy, err := edgesync.NewDestinationPolicy(cfg.EdgeSync.Import.AllowedDirs, localRoot)
-			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to resolve the bundle import policy; refusing to start")
-			}
 
 			bundleIndex, err := edgesync.NewBundleIndex(syncDB, importLogger)
 			if err != nil {
@@ -3553,18 +3547,32 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to create the bundle importer; refusing to start")
 			}
 
-			importHandler, err := api.NewEdgeSyncImportHandler(
-				importer, importPolicy, bundleIndex, authManager, importLogger)
-			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to create the bundle import handler; refusing to start")
-			}
-			importHandler.SetTimeout(cfg.EdgeSync.Import.Timeout)
-			importHandler.RegisterRoutes(server.GetApp())
+			if cfg.EdgeSync.Import.Enabled {
+				localRoot := ""
+				if cfg.Storage.Backend == "local" {
+					localRoot = cfg.Storage.LocalPath
+				}
+				importPolicy, err := edgesync.NewDestinationPolicy(cfg.EdgeSync.Import.AllowedDirs, localRoot)
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to resolve the bundle import policy; refusing to start")
+				}
+				importHandler, err := api.NewEdgeSyncImportHandler(
+					importer, importPolicy, bundleIndex, authManager, importLogger)
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to create the bundle import handler; refusing to start")
+				}
+				importHandler.SetTimeout(cfg.EdgeSync.Import.Timeout)
+				importHandler.RegisterRoutes(server.GetApp())
 
-			importLogger.Info().
-				Str("hub_id", cfg.EdgeSync.HubID).
-				Bool("clustered", clusterCoordinator != nil).
-				Msg("Edge sync bundle import enabled; import a drive with POST /api/v1/bundle-import")
+				importLogger.Info().
+					Str("hub_id", cfg.EdgeSync.HubID).
+					Bool("clustered", clusterCoordinator != nil).
+					Msg("Edge sync bundle import enabled; import a drive with POST /api/v1/bundle-import")
+			}
+
+			if cfg.EdgeSync.Import.Relay.Enabled {
+				startHubRelay(cfg, importer, authManager, licenseClient, clusterCoordinator, server, shutdownCoordinator, importLogger)
+			}
 		}
 
 		// A hub with no registered spokes rejects everything, which is correct
@@ -3646,7 +3654,7 @@ func main() {
 	// Either role independently: a spoke with intermittent connectivity runs
 	// the agent, a fully air-gapped one only exports bundles, and a spoke that
 	// does both runs both. The shared ledger is why they live in one block.
-	if cfg.EdgeSync.Spoke.Enabled || cfg.EdgeSync.Spoke.Bundle.Enabled {
+	if cfg.EdgeSync.Spoke.Active() {
 		spokeLogger := logger.Get("edgesync-spoke")
 
 		// The ledger shares the auth database file, like the hub index. With
@@ -3767,7 +3775,7 @@ func main() {
 
 		// Air-gap export, independent of the network agent above.
 		var bundleExporter *edgesync.Exporter
-		if cfg.EdgeSync.Spoke.Bundle.Enabled {
+		if cfg.EdgeSync.Spoke.ExportsBundles() {
 			// The storage root is passed so the policy can refuse it outright:
 			// exporting into it would make the next discovery pass find the
 			// exported copies and queue them for sync.
@@ -3777,8 +3785,13 @@ func main() {
 			if cfg.Storage.Backend == "local" {
 				localRoot = cfg.Storage.LocalPath
 			}
-			policy, err := edgesync.NewDestinationPolicy(
-				cfg.EdgeSync.Spoke.Bundle.AllowedDirs, localRoot)
+			// A relay-only spoke builds the exporter too, but /export and /ack
+			// stay closed unless drive export is on: no allowed directories.
+			var allowedDirs []string
+			if cfg.EdgeSync.Spoke.Bundle.Enabled {
+				allowedDirs = cfg.EdgeSync.Spoke.Bundle.AllowedDirs
+			}
+			policy, err := edgesync.NewDestinationPolicy(allowedDirs, localRoot)
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to resolve the bundle destination policy; refusing to start")
 			}
@@ -3865,10 +3878,18 @@ func main() {
 			}
 		}
 
+		// The relay (#1685) exports through the same exporter as a drive, so
+		// its acks run delete_after_sync through the same AttestedDeleter.
+		var spokeRelay *edgesync.RelaySpoke
+		if cfg.EdgeSync.Spoke.Relay.Enabled {
+			spokeRelay = startSpokeRelay(cfg, bundleExporter, licenseClient, clusterCoordinator, shutdownCoordinator, spokeLogger)
+		}
+
 		spokeHandler, err := api.NewEdgeSyncSpokeHandler(syncAgent, bundleExporter, authManager, spokeLogger)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke handler; refusing to start")
 		}
+		spokeHandler.SetRelay(spokeRelay)
 		spokeHandler.SetTimeouts(cfg.EdgeSync.Spoke.SyncTimeout, cfg.EdgeSync.Spoke.Bundle.Timeout)
 		spokeHandler.RegisterRoutes(server.GetApp())
 
@@ -3921,12 +3942,13 @@ func main() {
 		evt := spokeLogger.Info().
 			Str("spoke_id", cfg.EdgeSync.Spoke.SpokeID).
 			Bool("network_sync", syncAgent != nil).
-			Bool("bundle_export", bundleExporter != nil)
+			Bool("bundle_export", cfg.EdgeSync.Spoke.Bundle.Enabled).
+			Bool("relay", spokeRelay != nil)
 		if syncAgent != nil {
 			evt = evt.Str("hub_url", cfg.EdgeSync.Spoke.HubURL)
 		}
 		switch {
-		case syncAgent != nil && bundleExporter != nil:
+		case syncAgent != nil && cfg.EdgeSync.Spoke.Bundle.Enabled:
 			if automaticSync {
 				evt.Msg("Edge sync spoke enabled; scheduled and manual network sync are available, /export writes an air-gap bundle")
 			} else {
@@ -3938,8 +3960,11 @@ func main() {
 			} else {
 				evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
 			}
-		default:
+		case cfg.EdgeSync.Spoke.Bundle.Enabled:
 			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
+		default:
+			// Relay only: startSpokeRelay already named its route.
+			evt.Msg("Edge sync spoke enabled on the relay transport only")
 		}
 
 		// Periodic ledger maintenance: prune of terminal rows (synced,

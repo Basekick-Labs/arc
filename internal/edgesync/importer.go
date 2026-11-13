@@ -196,7 +196,22 @@ func (i *Importer) Import(ctx context.Context, dir string) (*ImportResult, error
 		return nil, ErrImportInProgress
 	}
 	defer i.mu.Unlock()
+	return i.importLocked(ctx, dir)
+}
 
+// tryLock takes the import lock for a caller that must hold it across more
+// than Import itself: the relay poller holds it while it downloads a bundle,
+// so a drive import running meanwhile is not discovered only after the
+// download (#1685). Returns ok=false, holding nothing, when it is taken.
+func (i *Importer) tryLock() (unlock func(), ok bool) {
+	if !i.mu.TryLock() {
+		return nil, false
+	}
+	return i.mu.Unlock, true
+}
+
+// importLocked is Import with the lock already held.
+func (i *Importer) importLocked(ctx context.Context, dir string) (*ImportResult, error) {
 	start := time.Now()
 
 	r, err := OpenBundle(dir, i.logger)
@@ -495,35 +510,9 @@ func (c *CollectingRegistrar) Reset() { c.files = c.files[:0] }
 // receipt. No new key material, and a spoke that can make a bundle can check
 // the answer.
 func (i *Importer) writeAck(ctx context.Context, dir string, m *Manifest, entries []BundleEntry, res *ImportResult) error {
-	secret, err := i.registry.Secret(ctx, m.SpokeID)
+	ack, secret, err := i.buildAck(ctx, m, entries, res, time.Now())
 	if err != nil {
-		return fmt.Errorf("read spoke secret: %w", err)
-	}
-
-	ack := &Ack{
-		BundleID:   m.BundleID,
-		SpokeID:    m.SpokeID,
-		HubID:      i.hubID,
-		ImportedAt: time.Now().UTC().Unix(),
-		Paths:      res.AckPaths,
-		Conflicts:  res.Conflicts,
-	}
-	if i.verify != nil && len(res.AckPaths) > 0 {
-		if err := i.attestHeld(ctx, m.SpokeID, entries, ack); err != nil {
-			// The ack goes out without an attestation: the spoke advances
-			// its ledger as before and deletes nothing on its strength.
-			i.logger.Warn().Err(err).Str("bundle_id", m.BundleID).
-				Msg("Could not verify what this hub holds of the bundle; the acknowledgment carries no held attestation")
-			ack.Held, ack.HeldCompacted, ack.VerifiedAt = nil, nil, 0
-		}
-		if ack.VerifiedAt != 0 && !ackFits(ack) {
-			// The held lists roughly double the ack. Past the bound a spoke
-			// would reject the WHOLE ack, losing the sync advance too, so
-			// the attestation goes and the ack stays.
-			i.logger.Warn().Str("bundle_id", m.BundleID).Int("files", len(ack.Paths)).
-				Msg("The acknowledgment with a held attestation would exceed the size a spoke accepts; written without it")
-			ack.Held, ack.HeldCompacted, ack.VerifiedAt = nil, nil, 0
-		}
+		return err
 	}
 	return WriteAck(dir, secret, ack)
 }

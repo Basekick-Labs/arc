@@ -93,44 +93,55 @@ func (a *Ack) HeldAttested() bool { return a != nil && a.HeldMAC != "" }
 // the import — the files are committed either way — but it does cost the spoke
 // its chance to advance, so the caller should say so plainly.
 func WriteAck(dir, secret string, a *Ack) error {
+	raw, err := EncodeAck(secret, a)
+	if err != nil {
+		return err
+	}
+	return writeFileSynced(filepath.Join(dir, ackName), raw)
+}
+
+// EncodeAck signs an acknowledgment (filling Version, PathsDigest, MAC and,
+// with VerifiedAt set, HeldMAC) and returns the bytes an ack file holds. The
+// relay transport (#1685) writes these to an object; WriteAck to a file.
+func EncodeAck(secret string, a *Ack) ([]byte, error) {
 	if a == nil {
-		return errors.New("edgesync: write ack: nil acknowledgment")
+		return nil, errors.New("edgesync: write ack: nil acknowledgment")
 	}
 	if err := ValidateBundleID(a.BundleID); err != nil {
-		return err
+		return nil, err
 	}
 
 	digest, err := security.AckPathsDigest(a.Paths)
 	if err != nil {
-		return fmt.Errorf("edgesync: ack paths digest: %w", err)
+		return nil, fmt.Errorf("edgesync: ack paths digest: %w", err)
 	}
 	a.PathsDigest = digest
 	a.Version = BundleVersion
 
 	mac, err := security.ComputeSyncAckHMAC(secret, a.BundleID, a.SpokeID, a.HubID, a.ImportedAt, digest)
 	if err != nil {
-		return fmt.Errorf("edgesync: sign ack: %w", err)
+		return nil, fmt.Errorf("edgesync: sign ack: %w", err)
 	}
 	a.MAC = mac
 
 	if a.VerifiedAt != 0 {
 		heldDigest, err := security.AckPathsDigest(a.Held)
 		if err != nil {
-			return fmt.Errorf("edgesync: ack held digest: %w", err)
+			return nil, fmt.Errorf("edgesync: ack held digest: %w", err)
 		}
 		compactedDigest, err := security.AckPathsDigest(a.HeldCompacted)
 		if err != nil {
-			return fmt.Errorf("edgesync: ack held_compacted digest: %w", err)
+			return nil, fmt.Errorf("edgesync: ack held_compacted digest: %w", err)
 		}
 		heldMAC, err := security.ComputeSyncAckHeldHMAC(secret, a.BundleID, a.SpokeID, a.HubID,
 			a.ImportedAt, digest, a.VerifiedAt, heldDigest, compactedDigest)
 		if err != nil {
-			return fmt.Errorf("edgesync: sign ack held attestation: %w", err)
+			return nil, fmt.Errorf("edgesync: sign ack held attestation: %w", err)
 		}
 		a.HeldMAC = heldMAC
 	}
 
-	return writeJSONFile(filepath.Join(dir, ackName), a)
+	return encodeIndentedJSON(a)
 }
 
 // ReadAck reads and verifies an acknowledgment from a bundle directory.
@@ -145,6 +156,13 @@ func ReadAck(dir, secret, expectSpokeID, expectHubID string) (*Ack, error) {
 		}
 		return nil, fmt.Errorf("edgesync: read ack: %w", err)
 	}
+	return DecodeAck(raw, secret, expectSpokeID, expectHubID)
+}
+
+// DecodeAck parses and verifies acknowledgment bytes, with every check
+// ReadAck makes. The relay transport (#1685) reads an ack object into memory
+// (bounded by MaxAckBytes before the read) and hands the bytes here.
+func DecodeAck(raw []byte, secret, expectSpokeID, expectHubID string) (*Ack, error) {
 	// The same bound the manifest gets: a fixed set of short fields plus a
 	// path list already capped by the bundle's own file limit.
 	if len(raw) > maxAckBytes {
@@ -257,6 +275,10 @@ func verifyHeldAttestation(secret string, a *Ack) error {
 // for the default 10,000-file cap at a generous path length, which is the same
 // order as the entry list it answers.
 const maxAckBytes = 8 << 20
+
+// MaxAckBytes is the largest acknowledgment DecodeAck accepts, for a caller
+// that must bound a read before it happens.
+const MaxAckBytes = maxAckBytes
 
 // AckResult summarizes applying one acknowledgment.
 type AckResult struct {

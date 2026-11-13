@@ -122,7 +122,21 @@ func (e *Exporter) Export(ctx context.Context, dest string, limit int) (*ExportR
 	if err != nil {
 		return nil, err
 	}
+	return e.exportWith(ctx, limit, func(selected []*LedgerEntry) (*ExportResult, error) {
+		return e.writer.Export(ctx, resolved, selected, time.Now())
+	})
+}
 
+// ExportToRelay is Export into a relay bucket (#1685): the same discovery,
+// selection, caps and ledger marking, with the bundle streamed to the relay
+// backend instead of written to a directory.
+func (e *Exporter) ExportToRelay(ctx context.Context, relay storage.Backend, limit int) (*ExportResult, error) {
+	return e.exportWith(ctx, limit, func(selected []*LedgerEntry) (*ExportResult, error) {
+		return e.writer.ExportToRelay(ctx, relay, selected, time.Now())
+	})
+}
+
+func (e *Exporter) exportWith(ctx context.Context, limit int, write func([]*LedgerEntry) (*ExportResult, error)) (*ExportResult, error) {
 	if limit <= 0 || limit > e.maxFiles {
 		limit = e.maxFiles
 	}
@@ -247,7 +261,7 @@ func (e *Exporter) Export(ctx context.Context, dest string, limit int) (*ExportR
 			Msg("Bundle truncated at the byte cap; the remainder goes in the next one")
 	}
 
-	res, err := e.writer.Export(ctx, resolved, selected, time.Now())
+	res, err := write(selected)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +370,13 @@ func (e *Exporter) ApplyAck(ctx context.Context, dir string) (*AckResult, error)
 	if err != nil {
 		return nil, err
 	}
+	return e.applyVerifiedAck(ctx, ack)
+}
 
+// applyVerifiedAck advances the ledger on an ack that ReadAck or DecodeAck
+// verified, and runs delete_after_sync on what it attests. Shared by the
+// drive path above and the relay (#1685).
+func (e *Exporter) applyVerifiedAck(ctx context.Context, ack *Ack) (*AckResult, error) {
 	res, err := ApplyAck(ctx, e.ledger, ack, e.logger)
 	if err != nil {
 		return nil, err
