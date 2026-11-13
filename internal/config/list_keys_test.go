@@ -29,6 +29,8 @@ func TestListKeysReadEverySpelling(t *testing.T) {
 		{name: "import dirs: TOML array", toml: "[edge_sync.import]\nallowed_dirs = [\"/Volumes/Air Gap\", \"/mnt/b\"]\n", get: importDirs, want: []string{"/Volumes/Air Gap", "/mnt/b"}},
 		{name: "import dirs: TOML string comma", toml: "[edge_sync.import]\nallowed_dirs = \"/a,/b\"\n", get: importDirs, want: []string{"/a", "/b"}},
 		{name: "bundle dirs: env path with a space", envKey: "ARC_EDGE_SYNC_SPOKE_BUNDLE_ALLOWED_DIRS", envVal: "/Volumes/Air Gap,/mnt/x", get: bundleDirs, want: []string{"/Volumes/Air Gap", "/mnt/x"}},
+		{name: "import dirs: TOML array element with a comma kept whole", toml: "[edge_sync.import]\nallowed_dirs = [\"/mnt/a,b\"]\n", get: importDirs, want: []string{"/mnt/a,b"}},
+		{name: "import dirs: trailing comma", envKey: "ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS", envVal: "/a,/b,", get: importDirs, want: []string{"/a", "/b"}},
 		{name: "bundle dirs: TOML array", toml: "[edge_sync.spoke.bundle]\nallowed_dirs = [\"/Volumes/Air Gap\"]\n", get: bundleDirs, want: []string{"/Volumes/Air Gap"}},
 
 		// ingest.sort_keys / decimal_columns: unchanged. Entries contain
@@ -63,3 +65,40 @@ func importDirs(c *Config) []string  { return c.EdgeSync.Import.AllowedDirs }
 func bundleDirs(c *Config) []string  { return c.EdgeSync.Spoke.Bundle.AllowedDirs }
 func sortKeys(c *Config) []string    { return c.Ingest.SortKeys }
 func decimalCols(c *Config) []string { return c.Ingest.DecimalColumns }
+
+// TestAllowedDirsRefuseRelativeEntries: a relative allowed_dirs entry would be
+// resolved against Arc's working directory, and the realistic way to get one
+// is a split in the wrong place, e.g. a comma inside a path in the string
+// spelling. Startup must refuse it and name the fragment.
+func TestAllowedDirsRefuseRelativeEntries(t *testing.T) {
+	cases := []struct {
+		name, toml, envKey, envVal, want string
+	}{
+		{
+			name:   "import: comma inside a path in the env spelling",
+			toml:   "[edge_sync]\nhub_id = \"hub1\"\n[edge_sync.import]\nenabled = true\n",
+			envKey: "ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS", envVal: "/mnt/a,b",
+			want: `edge_sync.import.allowed_dirs: "b" is not an absolute path`,
+		},
+		{
+			name: "import: relative entry in the TOML array",
+			toml: "[edge_sync]\nhub_id = \"hub1\"\n[edge_sync.import]\nenabled = true\nallowed_dirs = [\"bundles\"]\n",
+			want: `edge_sync.import.allowed_dirs: "bundles" is not an absolute path`,
+		},
+		{
+			name: "bundle: relative entry",
+			toml: "[edge_sync.spoke]\nspoke_id = \"s1\"\nhub_id = \"hub1\"\n[edge_sync.spoke.bundle]\nenabled = true\nallowed_dirs = [\"/mnt/ok\", \"./out\"]\n",
+			want: `edge_sync.spoke.bundle.allowed_dirs: "./out" is not an absolute path`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeArcToml(t, tc.toml)
+			if tc.envKey != "" {
+				t.Setenv(tc.envKey, tc.envVal)
+			}
+			t.Setenv("ARC_EDGE_SYNC_SPOKE_SECRET", "test-secret")
+			mustLoadError(t, tc.want)
+		})
+	}
+}

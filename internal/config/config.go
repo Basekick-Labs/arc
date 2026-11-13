@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -2005,6 +2006,9 @@ func Load() (*Config, error) {
 				"edge_sync.import.allowed_dirs: a bundle is read from a raw filesystem path " +
 				"outside the storage root, so the permitted roots must be stated explicitly")
 		}
+		if err := requireAbsoluteAllowedDirs("edge_sync.import.allowed_dirs", cfg.EdgeSync.Import.AllowedDirs); err != nil {
+			return nil, err
+		}
 		if cfg.EdgeSync.HubID == "" {
 			return nil, fmt.Errorf("edge_sync.import.enabled=true requires edge_sync.hub_id: " +
 				"a bundle names the hub it is destined for, and one addressed elsewhere is refused")
@@ -2023,6 +2027,9 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("edge_sync.spoke.bundle.enabled=true requires " +
 				"edge_sync.spoke.bundle.allowed_dirs: a bundle is written to a raw filesystem " +
 				"path outside the storage root, so the permitted roots must be stated explicitly")
+		}
+		if err := requireAbsoluteAllowedDirs("edge_sync.spoke.bundle.allowed_dirs", cfg.EdgeSync.Spoke.Bundle.AllowedDirs); err != nil {
+			return nil, err
 		}
 		// Identity is bound into the bundle MAC, so the hub cannot accept a
 		// bundle that does not name both sides.
@@ -2751,6 +2758,28 @@ func parseStringSlice(s string) []string {
 // the one they did. A path containing a comma needs the array spelling.
 func parseAllowedDirs(value any) []string {
 	return parseTargetDatabases(value)
+}
+
+// requireAbsoluteAllowedDirs refuses a relative allowed_dirs entry (#1680).
+//
+// edgesync.NewDestinationPolicy resolves an entry with filepath.Abs and accepts
+// a missing leaf, so a relative entry silently means "under whatever directory
+// Arc was started from". No documented configuration uses one, and every way
+// an operator ends up with one by accident is a split in the wrong place: a
+// path with a space under the old whitespace split ("/Volumes/Air Gap" ->
+// "Gap"), or a path with a comma in the string spelling now ("/mnt/a,b" ->
+// "b"). Refusing it turns each of those into a startup error that names the
+// fragment, instead of an allow-list entry nobody wrote.
+func requireAbsoluteAllowedDirs(key string, dirs []string) error {
+	for _, d := range dirs {
+		if !filepath.IsAbs(d) {
+			return fmt.Errorf("%s: %q is not an absolute path; every allowed directory must be "+
+				"absolute (a relative one would resolve against Arc's working directory). "+
+				"In the string or environment spelling a comma separates entries, so a path "+
+				"that contains a comma must be written in the TOML array", key, d)
+		}
+	}
+	return nil
 }
 
 // EffectiveCores reports how many CPUs this process may actually use.

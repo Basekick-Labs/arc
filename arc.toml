@@ -431,7 +431,7 @@ enabled = false
 #
 # allowed_dirs (in both [edge_sync.import] and [edge_sync.spoke.bundle]) is a
 # TOML array, or a comma-separated string; a path may contain spaces, and a
-# path containing a comma needs the array:
+# path containing a comma needs the array. Entries must be absolute paths:
 # allowed_dirs = ["/Volumes/Air Gap", "/mnt/bundles"]
 # ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS="/Volumes/Air Gap,/mnt/bundles"
 #
