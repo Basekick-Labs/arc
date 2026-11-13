@@ -4,7 +4,7 @@
 
 ## Fix: S3 batch-delete errors name the key Arc knows ([#1111](https://github.com/Basekick-Labs/arc/issues/1111))
 
-With an S3 object prefix configured, a failed object in a batch delete (compaction cleanup, retention, a database delete, backup deletion, the reconciliation sweep) was reported under the prefixed object name, a name that appears in no manifest, listing or other log line. The `key` log field and the error now carry the key Arc uses, as Azure and GCS already did. The request sent to S3 is unchanged.
+With an S3 object prefix configured, a failed object in a batch delete (compaction cleanup, a database delete, backup deletion and restore, the reconciliation sweep) was reported under the prefixed object name, a name that appears in no manifest, listing or other log line. The `key` log field and the error now carry the key Arc uses, as Azure and GCS already did. The request sent to S3 is unchanged.
 
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
