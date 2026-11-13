@@ -1373,7 +1373,7 @@ type ArrowBuffer struct {
 	agedSlots     chan struct{}
 	agedMu        sync.Mutex
 	agedInFlight  map[string]struct{}
-	agedWG        sync.WaitGroup
+	agedWG        sync.WaitGroup // the detached writes alone; tests wait on it (Close waits on b.wg)
 
 	// Buffer memory metrics include batches while in a shard, queued, or being
 	// flushed. Estimates are added on append and removed when a flush completes.
@@ -4825,7 +4825,8 @@ func (b *ArrowBuffer) computeNextFlushDeadline() time.Time {
 // Each aged buffer is written straight to storage, not through flushQueue, so
 // aged data never waits behind size-triggered flushes and never takes a slot a
 // writer needs (#1632). The sweep has flush_workers write slots of its own; it
-// takes a slot BEFORE extracting a buffer, extracts one, and starts its write
+// takes slots BEFORE extracting buffers (as many as are free, one scan of the
+// shard for them), extracts one buffer per slot, and starts each write
 // without waiting for it (#1695). Waiting for each batch of writes, as the
 // sweep did, let one multi-hour backfill (minutes since #1692 bounds each hour
 // file, not the flush) hold up age-based flushing of every buffer on the node.
@@ -4860,31 +4861,57 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 			// b.ctx: Close sets closing before cancelling it, checked above
 			// once a slot frees.
 			slots <- struct{}{}
-			a, ok := b.extractOneAged(shard, shardIdx, now, threshold)
-			if !ok {
-				<-slots
+			// Then every other slot free right now, so one scan of the shard
+			// under its lock extracts up to that many buffers rather than one
+			// scan per buffer.
+			held := 1
+			for held < cap(slots) {
+				select {
+				case slots <- struct{}{}:
+					held++
+					continue
+				default:
+				}
+				break
+			}
+			batch := b.extractAged(shard, shardIdx, now, threshold, held)
+			for i := len(batch); i < held; i++ {
+				<-slots // slots this scan found nothing for
+			}
+			if len(batch) == 0 {
 				break // the shard has no aged buffer left
 			}
-			// Added on the sweep goroutine, which holds its own b.wg count
-			// (periodicFlush), so Close's Wait cannot see zero in between.
-			b.wg.Add(1)
-			b.agedWG.Add(1)
-			go func(a agedFlush) {
-				defer b.wg.Done()
-				defer b.agedWG.Done()
-				defer func() { <-slots }()
-				defer b.agedWriteDone(a.key)
-				// Its own flushParent-derived context: Close() cancelling
-				// b.ctx must not abort an aged write mid-way, because the
-				// buffer entry is already gone (#1007).
-				flushCtx, flushCancel := b.newFlushContext()
-				defer flushCancel()
-				if err := b.writeExtracted(flushCtx, a.e, a.key, a.database, a.measurement); err != nil {
-					b.logger.Debug().Err(err).Str("buffer_key", a.key).Msg("Failed to flush aged buffer") // writeExtracted logged it (#1377)
-				}
-			}(a)
+			for _, a := range batch {
+				b.startAgedWrite(a, slots)
+			}
+			if len(batch) < held {
+				break // fewer aged buffers than free slots: the shard is done
+			}
 		}
 	}
+}
+
+// startAgedWrite writes one extracted aged buffer on its own goroutine, which
+// holds one sweep slot and a b.wg count until the write returns. Called on
+// the sweep goroutine, which holds its own b.wg count (periodicFlush), so
+// Close's Wait cannot see zero in between.
+func (b *ArrowBuffer) startAgedWrite(a agedFlush, slots chan struct{}) {
+	b.wg.Add(1)
+	b.agedWG.Add(1)
+	go func(a agedFlush) {
+		defer b.wg.Done()
+		defer b.agedWG.Done()
+		defer func() { <-slots }()
+		defer b.agedWriteDone(a.key)
+		// Its own flushParent-derived context: Close() cancelling
+		// b.ctx must not abort an aged write mid-way, because the
+		// buffer entry is already gone (#1007).
+		flushCtx, flushCancel := b.newFlushContext()
+		defer flushCancel()
+		if err := b.writeExtracted(flushCtx, a.e, a.key, a.database, a.measurement); err != nil {
+			b.logger.Debug().Err(err).Str("buffer_key", a.key).Msg("Failed to flush aged buffer") // writeExtracted logged it (#1377)
+		}
+	}(a)
 }
 
 // agedFlush is one buffer the aged sweep extracted.
@@ -4904,14 +4931,16 @@ func (b *ArrowBuffer) agedSweepSlots() chan struct{} {
 	return b.agedSlots
 }
 
-// extractOneAged extracts one aged buffer of the shard that has no aged write
-// in flight, and marks its key in flight. ok is false when there is none.
-func (b *ArrowBuffer) extractOneAged(shard *bufferShard, shardIdx int, now time.Time, threshold time.Duration) (agedFlush, bool) {
+// extractAged extracts up to max aged buffers of the shard that have no aged
+// write in flight, under one hold of the shard lock, and marks their keys in
+// flight. Stops early once Close has begun.
+func (b *ArrowBuffer) extractAged(shard *bufferShard, shardIdx int, now time.Time, threshold time.Duration, max int) []agedFlush {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+	var out []agedFlush
 	for key, startTime := range shard.bufferStartTimes {
-		if b.closing.Load() {
-			return agedFlush{}, false
+		if len(out) == max || b.closing.Load() {
+			return out
 		}
 		age := now.Sub(startTime)
 		if age < threshold || b.agedKeyInFlight(key) {
@@ -4938,9 +4967,9 @@ func (b *ArrowBuffer) extractOneAged(shard *bufferShard, shardIdx int, now time.
 		}
 		b.agedInFlight[key] = struct{}{}
 		b.agedMu.Unlock()
-		return agedFlush{e: e, key: key, database: parts[0], measurement: parts[1]}, true
+		out = append(out, agedFlush{e: e, key: key, database: parts[0], measurement: parts[1]})
 	}
-	return agedFlush{}, false
+	return out
 }
 
 func (b *ArrowBuffer) agedKeyInFlight(key string) bool {
@@ -7013,25 +7042,26 @@ func (b *ArrowBuffer) NewRecoveryFlushBarrier() func(context.Context) error {
 }
 
 // FlushAllAndWait snapshots buffer keys, hands their records to the existing
-// bounded worker pool, and fences those tasks plus earlier queued/direct flushes.
-// No shard lock is held while waiting for queue capacity or storage. A timeout
-// or first flush failure stops admission: unsubmitted records stay in buffers;
-// admitted tasks keep their normal independent I/O deadlines and WAL identities.
-// The barrier's total wait budget is one flushTimeout (or the caller's earlier
-// deadline), not one timeout per measurement. A flush is no longer capped at
-// one flushTimeout (#1692), and this unscoped barrier waits for every earlier
-// task: while a backfill flush of many hour files runs, on any database, it
-// fails at its budget, and WAL recovery keeps its files until a later pass
-// completes (so the WAL purge waits for the backfill). FlushScopeAndWait
-// fences only its own keys (#1695), so a row DELETE (local, cluster or peer
-// flush) or a cluster CQ watermark flush waits only for a flush of its own
-// scope, and answers an error naming that scope if one outlasts its budget.
-// Two limits remain: any flush failure, of any key, during the wait fails a
-// scoped barrier too (the failure generation is global), and a worker pool
-// saturated by size-triggered flushes still queues the scope's own tasks
-// behind them. Every caller fails safe and changes nothing. Returning an error never proves durability and must not
-// permit WAL deletion. Recovery must also use
-// NewRecoveryFlushBarrier to cover failures that completed before this call.
+// bounded worker pool, and fences those tasks plus earlier queued/direct
+// flushes. No shard lock is held while waiting for queue capacity or storage.
+// A timeout or first flush failure stops admission: unsubmitted records stay
+// in buffers; admitted tasks keep their normal independent I/O deadlines and
+// WAL identities. The barrier's total wait budget is one flushTimeout (or the
+// caller's earlier deadline), not one timeout per measurement. A flush is no
+// longer capped at one flushTimeout (#1692), and this unscoped barrier waits
+// for every earlier task: while a backfill flush of many hour files runs, on
+// any database, it fails at its budget, and WAL recovery keeps its files until
+// a later pass completes (so the WAL purge waits for the backfill).
+// FlushScopeAndWait fences only its own keys (#1695), so a row DELETE (local,
+// cluster or peer flush) or a cluster CQ watermark flush waits only for a
+// flush of its own scope, and answers an error naming that scope if one
+// outlasts its budget. Two limits remain: any flush failure, of any key,
+// during the wait fails a scoped barrier too (the failure generation is
+// global), and a worker pool saturated by size-triggered flushes still queues
+// the scope's own tasks behind them. Every caller fails safe and changes
+// nothing. Returning an error never proves durability and must not permit WAL
+// deletion. Recovery must also use NewRecoveryFlushBarrier to cover failures
+// that completed before this call.
 func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 	return b.flushAndWait(ctx, nil, nil)
 }
@@ -7091,7 +7121,7 @@ func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) b
 		select {
 		case b.flushBarrierGate <- struct{}{}:
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("waiting for another flush barrier to finish handing off its flushes: %w", ctx.Err())
 		}
 	}
 	// The gate serializes the snapshot and admission below, where two
@@ -7175,7 +7205,7 @@ func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) b
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return fmt.Errorf("waiting for flush queue space for this scope's buffers: %w", ctx.Err())
 			case <-changed:
 			}
 		}
@@ -7195,20 +7225,30 @@ func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) b
 	for {
 		pending, changed := b.asyncFlushState(fence, match)
 		if err := check(); err != nil {
-			if ctx.Err() != nil {
-				return fmt.Errorf("a flush of this scope is still in progress: %w", err)
-			}
-			return err
+			return b.barrierTimeout(err, match, pending)
 		}
 		if !pending {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("a flush of this scope is still in progress: %w", ctx.Err())
+			return b.barrierTimeout(ctx.Err(), match, true)
 		case <-changed:
 		}
 	}
+}
+
+// barrierTimeout names what a barrier was still waiting for when its budget
+// ran out: a flush of its scope (scoped, #1695) or an earlier flush of any
+// key. Other errors are returned as they are.
+func (b *ArrowBuffer) barrierTimeout(err error, match func(string) bool, pending bool) error {
+	if !pending || !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if match != nil {
+		return fmt.Errorf("a flush of this scope is still in progress: %w", err)
+	}
+	return fmt.Errorf("an earlier flush is still in progress: %w", err)
 }
 
 // Close stops the buffer and flushes everything it still holds.

@@ -209,3 +209,65 @@ func TestWaitingBarrierDoesNotHoldTheGate_1695(t *testing.T) {
 	wg.Wait()
 	require.NoError(t, <-aErr, "dbA's barrier returns once its flush completes")
 }
+
+// Close waits for a detached aged write: it does not return, and so cannot
+// report a clean flush, while the backfill's write still runs.
+func TestCloseWaitsForDetachedAgedWrite_1695(t *testing.T) {
+	st := &gatedPathStorage{block: "/slow/", release: make(chan struct{})}
+	b := newSweepBuffer1695(t, st, 4)
+	write1695(t, b, "slow", 3)
+	b.cancel()
+	ageAll1695(b)
+	b.flushAgedBuffers()
+	require.Eventually(t, func() bool { return st.blocked.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() { _ = b.Close(); close(closed) }()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while an aged write was still running")
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(st.release)
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return after the write finished")
+	}
+	require.EqualValues(t, 3, st.slowDone.Load(), "the backfill's hour files were written before Close returned")
+	require.True(t, b.CloseFlushedCleanly())
+}
+
+// With periodicFlush live: rows that reached a key while its aged write ran
+// are written as soon as that write ends (the nudge), not a full
+// max_buffer_age later at the next timer.
+func TestAgedKeyPickedUpWhenItsWriteEnds_1695(t *testing.T) {
+	st := &gatedPathStorage{block: "/slow/", release: make(chan struct{})}
+	cfg := &config.IngestConfig{
+		MaxBufferSize: 1 << 20, MaxBufferAgeMS: 2000, Compression: "snappy",
+		FlushWorkers: 2, FlushQueueSize: 8, ShardCount: 1, FlushTimeoutSeconds: 30,
+	}
+	b := NewArrowBuffer(cfg, st, zerolog.New(io.Discard))
+	t.Cleanup(func() {
+		select {
+		case <-st.release:
+		default:
+			close(st.release)
+		}
+		_ = b.Close()
+	})
+	write1695(t, b, "slow", 1)
+	require.Eventually(t, func() bool { return st.blocked.Load() == 1 }, 6*time.Second, 20*time.Millisecond,
+		"the first aged write starts and hangs")
+	write1695(t, b, "slow", 1) // new rows for the key while its write runs
+	// Past the next sweep, which skips the key and leaves it out of the
+	// deadline, so the timer is armed a full max age ahead.
+	time.Sleep(2300 * time.Millisecond)
+	require.EqualValues(t, 1, st.blocked.Load(), "the key was not extracted again while in flight")
+
+	start := time.Now()
+	close(st.release)
+	require.Eventually(t, func() bool { return st.slowDone.Load() == 2 }, 5*time.Second, 10*time.Millisecond)
+	require.Less(t, time.Since(start), time.Second,
+		"the key's new rows waited for the next timer instead of being picked up when its write ended")
+}
