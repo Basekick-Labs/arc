@@ -156,15 +156,20 @@ func (h *EdgeSyncSpokeHandler) run(c *fiber.Ctx) error {
 		Msg("Manual sync pass complete")
 
 	out := fiber.Map{
-		"discovered":      res.Discovered,
-		"recovered":       res.Recovered,
-		"already_present": res.AlreadyPresent,
-		"sent":            res.Sent,
-		"bytes_sent":      res.BytesSent,
-		"partial":         res.Partial,
-		"failed":          res.Failed,
-		"skipped":         res.Skipped,
-		"duration_ms":     res.Duration.Milliseconds(),
+		"discovered":         res.Discovered,
+		"recovered":          res.Recovered,
+		"already_present":    res.AlreadyPresent,
+		"sent":               res.Sent,
+		"local_deleted":      res.LocalDeleted,
+		"verify_kept":        res.VerifyKept,
+		"verify_requeued":    res.VerifyRequeued,
+		"verify_unsupported": res.VerifyUnsupported,
+		"verify_error":       res.VerifyError,
+		"bytes_sent":         res.BytesSent,
+		"partial":            res.Partial,
+		"failed":             res.Failed,
+		"skipped":            res.Skipped,
+		"duration_ms":        res.Duration.Milliseconds(),
 	}
 
 	// Conflicts are reported in full rather than counted. Each one needs a

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -489,6 +490,18 @@ type EdgeSyncSpokeConfig struct {
 	// a pass drains whatever backlog exists (#1112). Scheduled passes do not
 	// read it.
 	SyncTimeout time.Duration
+
+	// DeleteAfterSync makes the spoke delete its own copy of a synced file
+	// once the hub proves, in a later verify reconcile, that it still holds
+	// the content (edge sync phase 3a). Off by default: it deletes edge data.
+	// Requires edge_sync.spoke.enabled and an https (or loopback) hub_url,
+	// and is refused on a cluster node.
+	DeleteAfterSync bool
+
+	// DeleteAfterSyncDelay is the minimum time between a file being marked
+	// synced and the verification that may delete it. Default 0s: verified
+	// on the next pass, which is still a separate round trip.
+	DeleteAfterSyncDelay time.Duration
 
 	// Bundle configures air-gap export.
 	Bundle EdgeSyncBundleConfig
@@ -1146,6 +1159,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	deleteAfterSyncDelay, err := time.ParseDuration(v.GetString("edge_sync.spoke.delete_after_sync_delay"))
+	if err != nil || deleteAfterSyncDelay < 0 {
+		return nil, fmt.Errorf("invalid edge_sync.spoke.delete_after_sync_delay %q: must be a Go duration of 0 or more", v.GetString("edge_sync.spoke.delete_after_sync_delay"))
+	}
 	spokeBundleTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.bundle.timeout")
 	if err != nil {
 		return nil, err
@@ -1287,6 +1304,8 @@ func Load() (*Config, error) {
 				SyncInterval:               v.GetDuration("edge_sync.spoke.sync_interval"),
 				SyncRetryInterval:          v.GetDuration("edge_sync.spoke.sync_retry_interval"),
 				SyncTimeout:                spokeSyncTimeout,
+				DeleteAfterSync:            v.GetBool("edge_sync.spoke.delete_after_sync"),
+				DeleteAfterSyncDelay:       deleteAfterSyncDelay,
 				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
 				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
 				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
@@ -1937,6 +1956,12 @@ func Load() (*Config, error) {
 			"is not stored in a file that gets copied, backed up, and committed")
 	}
 
+	if cfg.EdgeSync.Spoke.DeleteAfterSync {
+		if err := checkDeleteAfterSync(cfg); err != nil {
+			return nil, err
+		}
+	}
+
 	if cfg.EdgeSync.Spoke.Enabled {
 		if cfg.EdgeSync.Spoke.SyncInterval < time.Second {
 			return nil, fmt.Errorf("edge_sync.spoke.sync_interval must be at least 1s (got %s)", cfg.EdgeSync.Spoke.SyncInterval)
@@ -2179,6 +2204,40 @@ func parsePositiveDuration(v *viper.Viper, key string) (time.Duration, error) {
 	return d, nil
 }
 
+// checkDeleteAfterSync refuses edge_sync.spoke.delete_after_sync where it
+// cannot be safe (phase 3a). It deletes edge data on the hub's word, so:
+//   - the network path must be on: verification is a reconcile;
+//   - not on a cluster node: a delete there would have to go through the Raft
+//     manifest first, which this does not do;
+//   - the hub must be reached over https or on a loopback host: the verify
+//     response is not signed, and a forged "held" would delete files;
+//   - the delay must be shorter than ledger retention, or rows would be
+//     pruned before they could ever be verified.
+func checkDeleteAfterSync(cfg *Config) error {
+	s := cfg.EdgeSync.Spoke
+	if !s.Enabled {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync requires edge_sync.spoke.enabled: the hub must verify a file before the spoke deletes it")
+	}
+	if cfg.Cluster.Enabled {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync is not supported on a cluster node (cluster.enabled)")
+	}
+	u, err := url.Parse(s.HubURL)
+	if err != nil {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync: invalid edge_sync.spoke.hub_url: %w", err)
+	}
+	if u.Scheme != "https" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("edge_sync.spoke.delete_after_sync requires an https edge_sync.spoke.hub_url (or a loopback host): the hub's verify answer decides which local files are deleted, and it is not signed")
+		}
+	}
+	if s.LedgerRetentionDays > 0 && s.DeleteAfterSyncDelay >= time.Duration(s.LedgerRetentionDays)*24*time.Hour {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.ledger_retention_days (%d days)", s.DeleteAfterSyncDelay, s.LedgerRetentionDays)
+	}
+	return nil
+}
+
 func setDefaults(v *viper.Viper) {
 	// Server defaults.
 	//
@@ -2329,6 +2388,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.sync_interval", "5m")
 	v.SetDefault("edge_sync.spoke.sync_retry_interval", "30s")
 	v.SetDefault("edge_sync.spoke.sync_timeout", "2h") // one manual sync pass
+	v.SetDefault("edge_sync.spoke.delete_after_sync", false)
+	v.SetDefault("edge_sync.spoke.delete_after_sync_delay", "0s")
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")
