@@ -163,8 +163,12 @@ func (r *Reconciler) holderHotExists(ctx context.Context, entries []ReconcileEnt
 		wg       sync.WaitGroup
 		firstErr error
 	)
+	holders := make([]string, 0, len(out))
+	for h := range out {
+		holders = append(holders, h)
+	}
 	sem := make(chan struct{}, confirmExistenceConcurrency)
-	for holder := range out {
+	for _, holder := range holders {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(h string) {
