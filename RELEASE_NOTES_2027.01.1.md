@@ -3286,6 +3286,22 @@ prepared statements, which are not implemented yet. See
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.
 
+### Flight SQL accepts an Arc token in a bearer-token handshake ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener accepts a `Handshake` that carries the Arc token as
+`authorization: Bearer <token>`, and answers it with the same header. The
+Arrow Flight SQL JDBC driver opens the connection that way when given its
+`token` property (`jdbc:arrow-flight-sql://host:50051?token=<token>`, with
+the token's trailing `=` written as `%3D`), and
+every such connection failed with `UNAUTHENTICATED: only Basic Auth
+implemented`: only a Basic handshake, with the token as the password, was
+accepted. An unknown token is refused with `invalid Arc token`, as on any
+other call. Basic handshakes and calls that send the bearer header without a
+handshake (the ADBC drivers) are unchanged. See
+`docs/operations/flight-sql.md`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1658](https://github.com/Basekick-Labs/arc/pull/1658).
+
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 
 `cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a
