@@ -2,6 +2,14 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: `cluster.seeds` written as a TOML array is read ([#1675](https://github.com/Basekick-Labs/arc/issues/1675))
+
+`seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]` in `arc.toml` now gives the node those seeds. Before, Arc read the TOML array as no seeds at all and gave no warning. The node started with `seed_count: 0`, logged `no known peers, aborting election`, and never joined. Only the comma-separated string worked. An array element that contains commas is split into one seed per address.
+
+`backup.target_names` had the same bug and is fixed the same way. A target named only in a TOML array, with its fields set from the environment, was never discovered.
+
+Nothing else changes. The comma-separated string (`seeds = "a:9100,b:9100"`) and the environment variables (`ARC_CLUSTER_SEEDS`, `ARC_BACKUP_TARGET_NAMES`) read exactly as before, and an environment variable still overrides the file. Every shipped deployment (docker-compose, Kubernetes, Helm) passes seeds through `ARC_CLUSTER_SEEDS`, so none of them was affected. `arc.toml` now documents `cluster.seeds` with both spellings.
+
 ## Fix: backups find the Iceberg metadata of edge-sync spoke databases ([#1202](https://github.com/Basekick-Labs/arc/issues/1202))
 
 Two fixes in how a backup recognises the Iceberg exporter's namespace directories.

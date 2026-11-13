@@ -1062,6 +1062,45 @@ func TestLoad_ClusterSeedsEnvOverride(t *testing.T) {
 	}
 }
 
+// TestLoad_ClusterSeedsEverySpelling pins #1675: a TOML array of seeds was read
+// through GetString, which returns "" for an array, so the node started with
+// no seeds and never joined. Every spelling an operator writes must land.
+func TestLoad_ClusterSeedsEverySpelling(t *testing.T) {
+	cases := []struct {
+		name   string
+		stanza string
+		env    string
+		want   []string
+	}{
+		{name: "default", want: nil},
+		{name: "TOML array", stanza: `seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]`, want: []string{"10.0.0.1:9100", "10.0.0.2:9100"}},
+		{name: "TOML comma-separated string", stanza: `seeds = "10.0.0.1:9100, 10.0.0.2:9100"`, want: []string{"10.0.0.1:9100", "10.0.0.2:9100"}},
+		{name: "TOML empty array", stanza: `seeds = []`, want: nil},
+		{name: "array element holding a comma is two seeds", stanza: `seeds = ["10.0.0.1:9100,10.0.0.2:9100", " 10.0.0.3:9100 ", ""]`, want: []string{"10.0.0.1:9100", "10.0.0.2:9100", "10.0.0.3:9100"}},
+		{name: "environment variable", env: "e1:9100,e2:9100", want: []string{"e1:9100", "e2:9100"}},
+		{name: "the environment overrides a file array", stanza: `seeds = ["f1:9100"]`, env: "e1:9100,e2:9100", want: []string{"e1:9100", "e2:9100"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := ""
+			if tc.stanza != "" {
+				body = "[cluster]\n" + tc.stanza + "\n"
+			}
+			writeArcToml(t, body)
+			if tc.env != "" {
+				t.Setenv("ARC_CLUSTER_SEEDS", tc.env)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load(): %v", err)
+			}
+			if !reflect.DeepEqual(cfg.Cluster.Seeds, tc.want) {
+				t.Errorf("Cluster.Seeds = %#v, want %#v", cfg.Cluster.Seeds, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_ClusterReplicationReconciliationInterval(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")
 	if err != nil {

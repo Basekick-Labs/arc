@@ -211,10 +211,30 @@ databases = ["audit"]
 	}
 }
 
+// TestBackupTargetNamesReadsTheTOMLArray pins the #1675 sibling: target_names
+// was read through GetString, which returns "" for a TOML array, so a name
+// listed only there (its fields coming from the environment) was never
+// discovered and the target silently did not exist.
+func TestBackupTargetNamesReadsTheTOMLArray(t *testing.T) {
+	writeArcToml(t, "[backup]\ntarget_names = [\"audit\"]\n")
+	t.Setenv("ARC_BACKUP_TARGETS_AUDIT_TYPE", "s3")
+	t.Setenv("ARC_BACKUP_TARGETS_AUDIT_S3_BUCKET", "acme-arc-audit-backups")
+	t.Setenv("ARC_BACKUP_DEFAULT_TARGET", "audit")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	target := cfg.Backup.DefaultBackupTarget()
+	if target == nil || target.Name != "audit" {
+		t.Fatalf("DefaultBackupTarget() = %+v, want the audit target named by the TOML array", target)
+	}
+}
+
 // TestBackupTargetDatabasesReadsEverySpelling is the accessor cell, and it is
 // a table over SPELLINGS rather than one case because the obvious accessor —
-// parseStringSlice(v.GetString(key)), which backup.target_names uses — reads
-// the TOML ARRAY as nothing at all, with no error: no routing, silently, in
+// parseStringSlice(v.GetString(key)), which cluster.seeds and
+// backup.target_names used until #1675 — reads the TOML ARRAY as nothing at all, with no error: no routing, silently, in
 // the spelling the documentation itself writes. Measured, not reasoned about;
 // see parseTargetDatabases.
 func TestBackupTargetDatabasesReadsEverySpelling(t *testing.T) {
