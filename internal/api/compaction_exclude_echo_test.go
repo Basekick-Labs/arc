@@ -17,27 +17,25 @@ import (
 // triggers only: a scoped trigger bypasses the list, so echoing it there
 // would imply a filter that does not apply. The manager has no tiers, so
 // the async cycle each trigger starts returns before touching storage.
+//
+// Each trigger gets its own manager (#1126). The two assertions are
+// independent, and sharing one manager made the second trigger depend on the
+// first one's background cycle having released its claim; the test then had
+// to poll IsCycleRunning() between them, which is exactly the shape that was
+// flaky before #1161 made the handler claim the cycle synchronously. With no
+// previous cycle there is nothing to wait for.
 func TestCompactionTriggerEchoesExclusions(t *testing.T) {
-	manager := compaction.NewManager(&compaction.ManagerConfig{
-		ExcludeDatabases: []string{"staging"},
-		CycleTimeout:     time.Minute,
-		Logger:           zerolog.Nop(),
-	})
-	handler := NewCompactionHandler(manager, nil, nil, nil, nil, zerolog.Nop())
-	app := fiber.New()
-	handler.RegisterRoutes(app)
-
 	trigger := func(path string) map[string]interface{} {
 		t.Helper()
-		// The previous trigger's (empty) cycle must finish first or the
-		// handler answers 409.
-		deadline := time.Now().Add(10 * time.Second)
-		for manager.IsCycleRunning() {
-			if time.Now().After(deadline) {
-				t.Fatal("previous cycle never finished")
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
+		manager := compaction.NewManager(&compaction.ManagerConfig{
+			ExcludeDatabases: []string{"staging"},
+			CycleTimeout:     time.Minute,
+			Logger:           zerolog.Nop(),
+		})
+		handler := NewCompactionHandler(manager, nil, nil, nil, nil, zerolog.Nop())
+		app := fiber.New()
+		handler.RegisterRoutes(app)
+
 		req := httptest.NewRequest(http.MethodPost, path, nil)
 		resp, err := app.Test(req)
 		if err != nil {
