@@ -770,6 +770,49 @@ func (l *Ledger) RevertExported(ctx context.Context, hubID, bundleID string) (in
 	return n, nil
 }
 
+// FailExported terminally fails rows still exported on one bundle, so a
+// refusal that re-sending cannot fix stops re-sending (#1685): the relay's
+// hub refused the bundle for good (wrong hub, over its limit), or its ack
+// reported the path as a conflict. With paths nil every row still exported
+// on the bundle fails; otherwise only those paths. Rows the ack advanced are
+// synced by then and untouched. RequeueFailed brings one back.
+//
+// The bundle binding is cleared like RevertExported's, so a later ack for
+// this bundle cannot attest the row (RecordAckHeld matches on it).
+func (l *Ledger) FailExported(ctx context.Context, hubID, bundleID string, paths []string, errMsg string) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if bundleID == "" {
+		return 0, fmt.Errorf("edgesync: fail exported: a bundle ID is required")
+	}
+	const q = `
+		UPDATE sync_ledger
+		SET state = ?, last_error = ?, exported_at = NULL, exported_bundle_id = NULL
+		WHERE hub_id = ? AND exported_bundle_id = ? AND state = ?`
+	if paths == nil {
+		res, err := l.db.ExecContext(ctx, q, string(StateFailed), errMsg, hubID, bundleID, string(StateExported))
+		if err != nil {
+			return 0, fmt.Errorf("edgesync: fail exported bundle %q: %w", bundleID, err)
+		}
+		return res.RowsAffected()
+	}
+	var total int64
+	for _, p := range paths {
+		res, err := l.db.ExecContext(ctx, q+` AND path = ?`,
+			string(StateFailed), errMsg, hubID, bundleID, string(StateExported), p)
+		if err != nil {
+			return total, fmt.Errorf("edgesync: fail exported %q: %w", p, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("edgesync: fail exported %q: %w", p, err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
 // Unexported returns files eligible for an air-gap bundle, newest first.
 //
 // Distinct from Pending only in intent today — both select pending rows — but
