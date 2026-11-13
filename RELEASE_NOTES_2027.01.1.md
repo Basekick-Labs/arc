@@ -15,6 +15,17 @@ The failure log now reports `records_stored` and `files_stored`, and `records_wi
 - On MinIO, paused part-way through a 3,650-row, 365-hour backfill, 337 files were stored, 280 rows were counted lost, and 3,370 rows were queryable.
 
 With the WAL on, nothing changes: each hour file was already registered and checkpointed as it was stored (#1492). The count of rows a shutdown leaves for WAL replay is also corrected for a flush that stored only some of its hour files.
+## Fix: a long backfill flush no longer holds up age-based flushing, or DELETEs on other databases ([#1695](https://github.com/Basekick-Labs/arc/issues/1695))
+
+Since #1692, a write spanning many hours can legitimately take minutes to flush, one file per hour. Two waits that were implicitly capped at about 30 s now waited for the whole backfill.
+
+- **Age-based flushing.** The periodic sweep writes buffers that have reached `ingest.max_buffer_age_ms`. It used to wait for each batch of those writes, so one backfill held up age-based flushing of every buffer on the node, and low-rate measurements were written late (and, with the WAL off, held in memory longer).
+  - The sweep now starts each write and moves on. It has `ingest.flush_workers` write slots of its own and waits only when all of them are busy.
+  - A measurement whose previous age-based write is still running is not picked up again until that write ends. Its new rows stay buffered, so one slow backfill cannot occupy every slot.
+  - Aged data still never queues behind size-triggered flushes and never takes a writer's slot. Shutdown still waits for every write in progress.
+  - With `flush_workers = 1` the sweep still waits behind a backfill, as before.
+- **Flushes before a DELETE or a CQ watermark.** A row-level DELETE (local, cluster, or the peer flush it asks for) and a cluster continuous query's output flush wait for buffered rows of their own database (or measurement) to be written. They used to wait for every flush in progress on the node, and failed after `ingest.flush_timeout_seconds` while any backfill ran on any database. They now wait only for flushes of their own scope, and two such waits no longer queue behind each other. A timeout now says "a flush of this scope is still in progress".
+  - **What still applies.** The WAL recovery barrier still waits for every flush, so with the WAL on, WAL purging waits for a running backfill to finish. A flush failure on any database during the wait still fails the DELETE. If size-triggered flushes fill every flush worker, a DELETE's own flushes still queue behind them. A DELETE on the database being backfilled still fails if the backfill outlasts its budget, and nothing is deleted.
 
 ## Fix: a backfill flush is no longer cut off at 30 seconds in total ([#1692](https://github.com/Basekick-Labs/arc/issues/1692))
 

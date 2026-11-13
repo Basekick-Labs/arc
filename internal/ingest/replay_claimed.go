@@ -395,7 +395,7 @@ func (b *ArrowBuffer) flushClaimedGroup(ctx context.Context, cs *coverageState, 
 	if group == nil {
 		return ErrReplayCoverageOff
 	}
-	taskID := b.beginAsyncFlushTask()
+	taskID := b.beginAsyncFlushTask(key)
 	defer b.completeAsyncFlushTask(taskID)
 	merged, err := b.mergeBatchesForFlush(r.Measurement, records)
 	if err != nil {
