@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -184,4 +185,47 @@ func typedHoursBatch1693(t *testing.T, b *ArrowBuffer, n int) *TypedColumnBatch 
 		vals[i] = float64(i)
 	}
 	return &TypedColumnBatch{Data: map[string]interface{}{"time": times, "value": vals}}
+}
+
+// tierRecorder1693 records the context each tiering registration ran under.
+type tierRecorder1693 struct {
+	mu   sync.Mutex
+	errs []error // ctx.Err() at each RecordFile call
+}
+
+func (r *tierRecorder1693) RecordFile(ctx context.Context, _ *tiering.FileMetadata) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.errs = append(r.errs, ctx.Err())
+	return ctx.Err()
+}
+
+// A PUT that completes as Close's budget runs out is stored, and without a WAL
+// its only copy: its tiering registration must not run under the cancelled
+// flush context. The backend ignores its context (as LocalBackend.Write does),
+// so the upload straddling the cancel completes; every stored file must be
+// registered with a live context. Reverting to b.fileContext(flushCtx) fails
+// this: the straddling file's RecordFile sees context.Canceled.
+func TestNoWALRegistrationOutlivesCloseCancel_1693(t *testing.T) {
+	store := &sleepingBackend1692{countingBackend: countingBackend{delay: 300 * time.Millisecond}}
+	cfg := cfg1692(30)
+	cfg.MaxBufferSize = 10 // the 10-row write below goes to a worker
+	b := NewArrowBuffer(cfg, store, zerolog.Nop())
+	rec := &tierRecorder1693{}
+	b.tierRecorder = rec
+	b.SetCloseBudget(time.Second) // flushParent cancelled at budget/2, mid-upload
+
+	require.NoError(t, b.writeColumnarInternal(context.Background(), "db", hoursRecord1692(10, 7), true, ""))
+	require.Eventually(t, func() bool { return store.started.Load() >= 1 }, 5*time.Second, 10*time.Millisecond)
+	_ = b.Close()
+
+	stored := store.writes.Load()
+	require.Greater(t, stored, int64(1), "an upload completed after the cancel (the test needs the straddle)")
+	require.Less(t, stored, int64(10), "the flush stopped between files (#1692)")
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	require.Len(t, rec.errs, int(stored), "every stored file reached tiering registration")
+	for i, err := range rec.errs {
+		require.NoError(t, err, "registration %d ran under a cancelled context", i)
+	}
 }

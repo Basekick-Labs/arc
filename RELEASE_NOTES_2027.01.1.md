@@ -14,7 +14,8 @@ The failure log now reports `records_stored` and `files_stored`, and `records_wi
 - On Amazon S3, a 20,000-row backfill over 2,000 hours was cut off by a shutdown. The old binary stored 204 hour files and counted all 20,000 rows as lost. The fixed one stored 205 files and reported 2,050 rows stored and 17,950 lost.
 - On MinIO, paused part-way through a 3,650-row, 365-hour backfill, 337 files were stored, 280 rows were counted lost, and 3,370 rows were queryable.
 
-With the WAL on, nothing changes: each hour file was already registered and checkpointed as it was stored (#1492). The count of rows a shutdown leaves for WAL replay is also corrected for a flush that stored only some of its hour files.
+With the WAL on, each hour file was already registered and checkpointed as it was stored (#1492). One change applies to both: an hour file whose upload completes just as the shutdown budget runs out still gets its tiering record (bounded by `ingest.flush_timeout_seconds`) instead of failing it on the cancelled flush. The cluster manifest registration takes no deadline and already happened in that case, so only the tiering record changes; what happens if that file's WAL checkpoint is dropped is unchanged (a single node adopts the file through its flush intent, #1646; a cluster node replays its rows, at least once, as before). The count of rows a shutdown leaves for WAL replay is also corrected for a flush that stored only some of its hour files.
+
 ## Fix: a long backfill flush no longer holds up age-based flushing, or DELETEs on other databases ([#1695](https://github.com/Basekick-Labs/arc/issues/1695))
 
 Since #1692, a write spanning many hours can legitimately take minutes to flush, one file per hour. Two waits that were implicitly capped at about 30 s now waited for the whole backfill.
