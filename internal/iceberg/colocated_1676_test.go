@@ -396,3 +396,53 @@ func TestSharedBucketRowlessNodeEmptiesAPublishedColocatedTable(t *testing.T) {
 		t.Fatalf("the published table still lists %d deleted files", len(files))
 	}
 }
+
+// A hub deleting a spoke namespace (DELETE /databases/{spoke}): the spoke
+// tables' colocated metadata, <spoke>/<db>/<m>/metadata, which the DELETE
+// leaves to DropDatabase, is collected and removed with its catalog rows,
+// so the namespace does not stay listed and undeletable.
+func TestDropDatabaseOfASpokeNamespaceRemovesItsColocatedTables(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	f := filepath.Join(root, "spoke01/mydb/cpu/2023/11/14/22/cpu_a.parquet")
+	writeArcStyleParquet(t, f, 1_700_000_000_000_000, 50)
+	r := newColocRig(t, root, "a.db", layoutColocated)
+	r.exp.SetForgetDroppedRows(true)
+	sc, err := SchemaFromParquet(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.exp.ReconcileMeasurement(ctx, "spoke01/mydb", "cpu", sc, []FileRef{refOf(t, f)}); err != nil {
+		t.Fatalf("reconcile the spoke table: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "spoke01", "mydb", "cpu", "metadata", "version-hint.text")); err != nil {
+		t.Fatalf("the spoke table is not colocated: %v", err)
+	}
+	keys, err := r.backend.List(ctx, "spoke01/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
+		if !r.exp.OwnsMetadataKey(k) {
+			if err := r.backend.Delete(ctx, k); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := r.exp.DropDatabase(ctx, "spoke01"); err != nil {
+		t.Fatalf("DropDatabase: %v", err)
+	}
+	if left, _ := r.backend.List(ctx, "spoke01/"); len(left) != 0 {
+		t.Fatalf("left under the spoke namespace after the drop: %v", left)
+	}
+	ns2, err := namespaceIdentifier("arc", "spoke01/mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc := r.catalogLoc(t, catalogNamespaceKey(ns2), "cpu"); loc != "" {
+		t.Fatalf("the spoke table's catalog row survived: %q", loc)
+	}
+	if ok, err := r.backend.Exists(ctx, droppedMarkerKey(catalogNamespaceKey(ns2), "cpu")); err != nil || !ok {
+		t.Fatalf("spoke table drop marker = (%v, %v), want written", ok, err)
+	}
+}

@@ -215,7 +215,12 @@ func IsColocatedMetadataKey(key string) bool {
 func (e *Exporter) OwnsMetadataKey(key string) bool { return IsColocatedMetadataKey(key) }
 
 // colocatedMetadataByTable lists a database's colocated table metadata,
-// keyed by measurement: the keys of exactly <database>/<measurement>/metadata/<file>.
+// keyed by the table's directory relative to the database: "<measurement>"
+// for <database>/<measurement>/metadata/<file>, and "<db>/<measurement>" for
+// a hub's spoke tables under a spoke namespace,
+// <spoke>/<db>/<measurement>/metadata/<file>. Those are exactly the keys
+// IsColocatedMetadataKey claims under the database, so everything the
+// database DELETE leaves to DropDatabase is collected here.
 func (e *Exporter) colocatedMetadataByTable(ctx context.Context, database string) (map[string][]string, error) {
 	keys, err := e.backend.List(ctx, database+"/")
 	if err != nil {
@@ -229,10 +234,11 @@ func (e *Exporter) colocatedMetadataByTable(ctx context.Context, database string
 			continue
 		}
 		parts := strings.Split(rest, "/")
-		if len(parts) != 3 || parts[1] != "metadata" || !IsColocatedMetadataKey(k) {
+		if (len(parts) != 3 && len(parts) != 4) || parts[len(parts)-2] != "metadata" || !IsColocatedMetadataKey(k) {
 			continue
 		}
-		out[parts[0]] = append(out[parts[0]], k)
+		dir := strings.Join(parts[:len(parts)-2], "/")
+		out[dir] = append(out[dir], k)
 	}
 	return out, nil
 }

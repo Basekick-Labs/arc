@@ -1955,6 +1955,8 @@ func Load() (*Config, error) {
 	// storage root is checked at wiring time, once both are resolved
 	// (cmd/arc), because the default warehouse needs the backend.
 	switch cfg.Iceberg.Layout {
+	case "":
+		cfg.Iceberg.Layout = IcebergLayoutWarehouse // set but empty, as unset
 	case IcebergLayoutWarehouse, IcebergLayoutColocated:
 	default:
 		return nil, fmt.Errorf("iceberg.layout must be %q or %q (got %q)",

@@ -17,6 +17,7 @@ func TestLoad_IcebergLayout(t *testing.T) {
 		{"warehouse", IcebergLayoutWarehouse, "true", false},
 		{"colocated", IcebergLayoutColocated, "true", false},
 		{" Colocated ", IcebergLayoutColocated, "true", false},
+		{"  ", IcebergLayoutWarehouse, "true", false},
 		{"co-located", "", "true", true},
 		{"colocated-ish", "", "false", true},
 	} {

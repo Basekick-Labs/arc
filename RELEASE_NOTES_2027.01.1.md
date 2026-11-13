@@ -431,6 +431,7 @@ New counters: `arc_ingest_ambiguous_writes_recorded_total`,
 `arc_ingest_ambiguous_writes_abandoned_total` (no longer tracked without a
 removal: rows not seen stored again within a day, or an object of another
 size at the key). No new configuration.
+
 ## New: Iceberg tables with their metadata beside the data, for OneLake and Microsoft Fabric ([#1676](https://github.com/Basekick-Labs/arc/issues/1676))
 
 `iceberg.layout = "colocated"` creates each new exported table in the
@@ -447,17 +448,27 @@ Direct Lake.
 - The default stays `"warehouse"` (`<warehouse>/<prefix>_<database>.db/<measurement>`).
 - The layout decides where **new** tables are created. An existing table keeps
   its location, whichever layout is set, so switching either way moves
-  nothing. To move a table, stop Arc, delete its catalog row and its
-  `<prefix>_<database>.db/<measurement>` directory, and start it again: the
-  next pass recreates the table in the new layout and registers every file
-  again (reading each file's footer once).
+  nothing. To move a table to the configured layout: stop Arc on **every**
+  node, delete the table's row from the `iceberg_tables` table of each node's
+  catalog, delete its metadata directory (`<prefix>_<database>.db/<measurement>/`
+  when moving to colocated, `<database>/<measurement>/metadata/` when moving
+  back), and start Arc again. The next pass recreates the table in the
+  configured layout and registers every file again, reading each file's
+  footer once. A node left with a row whose metadata is gone keeps failing
+  that table until its row is deleted.
+- Every node exporting to the same bucket must use the same layout: two nodes
+  with no row and different layouts would each create the table in their own
+  layout's directory.
 - A node with no catalog row for a table adopts it under whichever layout it
   was created, rather than creating a second one.
-- `colocated` needs the warehouse to be the storage root (the default); an
-  `iceberg.warehouse` pointing elsewhere is refused at startup.
+- `colocated` needs local or S3 storage (the backends the export supports)
+  and the warehouse at the storage root (the default); an `iceberg.warehouse`
+  pointing elsewhere is refused at startup.
 - A database `DELETE` leaves a colocated table's metadata to the Iceberg
   cleanup, which writes the drop markers first and removes it after
   ([#1611](https://github.com/Basekick-Labs/arc/issues/1611) still holds).
+  On a hub, deleting a spoke namespace also removes its spoke tables' colocated
+  metadata and catalog rows.
 - Metadata restored from a backup of another storage root (another bucket,
   prefix or path) is not adopted: Arc logs the directory to delete, and the
   export recreates the table.

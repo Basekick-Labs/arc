@@ -390,7 +390,11 @@ s3_cache_ttl_seconds = 3600
 # retain_snapshots = 10
 # orphan_sweep_enabled = true
 # layout = "warehouse"               # or "colocated": new tables' metadata in each
-#                                    # measurement's directory (OneLake shortcuts)
+#                                    # measurement's directory, for readers that
+#                                    # reach data only through the table folder
+#                                    # (OneLake shortcuts). Local or S3 storage,
+#                                    # warehouse at the storage root, the same
+#                                    # value on every node.
 
 # -----------------------------------------------------------------------------
 # Query Governance (Enterprise)
