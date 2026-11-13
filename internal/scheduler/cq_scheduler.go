@@ -28,7 +28,14 @@ type CQScheduler struct {
 	wg               sync.WaitGroup
 	stopCh           chan struct{}
 	running          bool
-	logger           zerolog.Logger
+	// deleted holds the CQs StopJob was called for: their rows are gone, and
+	// startJob refuses them. A reload that read a row before its delete
+	// committed (ReloadCQ waits for the old job outside the lock, ReloadAll
+	// lists before it takes the lock) would otherwise start a job for it
+	// after StopJob ran. IDs are AUTOINCREMENT and never reused, so the set
+	// is never cleared. Guarded by mu.
+	deleted map[int64]struct{}
+	logger  zerolog.Logger
 }
 
 // cqJob represents a scheduled CQ job
@@ -56,6 +63,7 @@ func NewCQScheduler(cfg *CQSchedulerConfig) (*CQScheduler, error) {
 		licenseClient: cfg.LicenseClient,
 		clusterGate:   cfg.ClusterGate,
 		jobs:          make(map[int64]*cqJob),
+		deleted:       make(map[int64]struct{}),
 		stopCh:        make(chan struct{}),
 		logger:        cfg.Logger.With().Str("component", "cq-scheduler").Logger(),
 	}
@@ -222,8 +230,30 @@ func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive
 	return s.startJob(cqID, name, interval)
 }
 
+// StopJob stops the job of a deleted CQ (call after the row delete commits)
+// and records the ID, so no reload that read the row earlier can start a job
+// for it again. A no-op for an ID with no job. It does not wait for a run in
+// flight: stopping cancels its context. SyncJobs stops the job of a CQ
+// deleted in a cluster, where StopJob is not called.
+func (s *CQScheduler) StopJob(cqID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleted[cqID] = struct{}{}
+	s.stopJobLocked(cqID)
+}
+
 // ReloadAll reloads all CQ schedules from the database
 func (s *CQScheduler) ReloadAll() error {
+	// Check license - require valid license for CQ scheduler. This ran after
+	// every job was stopped and returned nil, which the API answered 200 "CQ
+	// scheduler reloaded successfully" with no CQ left running (#1433). The
+	// scheduler is only created with a license, so this is one that expired
+	// or was revoked since; the jobs it has are left as they are.
+	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
+		s.logger.Warn().Msg("Valid enterprise license required for CQ scheduler reload")
+		return api.ErrCQReloadUnlicensed
+	}
+
 	// Read the CQs first: a node that cannot read them yet (not caught up
 	// with the cluster, #1324) keeps the jobs it has rather than losing all.
 	cqs, err := s.cqHandler.GetActiveCQs()
@@ -255,12 +285,6 @@ func (s *CQScheduler) ReloadAll() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check license - require valid license for CQ scheduler
-	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
-		s.logger.Warn().Msg("Valid enterprise license required for CQ scheduler")
-		return nil
-	}
-
 	// Start all active CQs read above
 	for _, cq := range cqs {
 		if err := s.startJob(cq.ID, cq.Name, cq.Interval); err != nil {
@@ -286,6 +310,12 @@ func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
 	// a job already running for the CQ is replaced, never orphaned: Reload*
 	// and SyncJobs can both reach here for the same CQ.
 	if !s.running {
+		return nil
+	}
+	if _, gone := s.deleted[cqID]; gone {
+		// Deleted after the caller read its row: StopJob ran first, under
+		// this lock, so this is the stale start it guards against.
+		s.logger.Debug().Int64("cq_id", cqID).Str("cq_name", cqName).Msg("Not starting a job for a deleted CQ")
 		return nil
 	}
 	s.stopJobLocked(cqID)
@@ -405,6 +435,14 @@ func (s *CQScheduler) executeJob(job *cqJob) {
 			Int64("cq_id", job.cqID).
 			Str("cq_name", job.cqName).
 			Msg("Scheduled CQ execution failed")
+		return
+	}
+	if resp.Skipped {
+		// No new window since the last run (#1628): nothing to do.
+		s.logger.Debug().
+			Int64("cq_id", job.cqID).
+			Str("cq_name", job.cqName).
+			Msg("Scheduled CQ: no new window")
 		return
 	}
 

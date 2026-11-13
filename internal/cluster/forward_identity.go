@@ -18,6 +18,23 @@ import (
 // rolling upgrade keeps forwarding.
 const CapabilityForwardIdentity = "forward_identity_v1"
 
+// CapabilityForwardReadQueries is advertised by builds that accept the read
+// routes a node that cannot serve queries (a compactor) forwards beyond
+// /api/v1/query and /query/msgpack: /query/arrow (#1567), /query/estimate,
+// GET /query/:measurement, the measurements listing and schema, and the
+// databases listings. Their routes are forwardable (forwardableRoute in
+// internal/api). A compactor forwards them only to peers that advertise it;
+// with peers but none capable it answers them itself, so a rolling upgrade
+// never sends one to a reader that would refuse the forwarded identity.
+const CapabilityForwardReadQueries = "forward_read_queries_v1"
+
+// CapabilityForwardDatabaseCreate is advertised by builds that accept
+// POST /api/v1/databases forwarded from a node that does not ingest (a
+// reader or compactor). Router.RouteDatabaseCreate forwards it only to a
+// writer that advertises it; otherwise the database is created locally, as
+// older builds did.
+const CapabilityForwardDatabaseCreate = "forward_database_create_v1"
+
 type forwardTokenKey struct{}
 
 // ForwardToken is the token the forwarding node verified for a request: its
@@ -153,6 +170,37 @@ func (c *Coordinator) peerForwardIdentity(nodeID string) bool {
 	return hasCapability(n.Capabilities, CapabilityForwardIdentity)
 }
 
+// peerReadQueries reports whether a peer advertises
+// CapabilityForwardReadQueries. Unlike peerForwardIdentity, a peer this node
+// has no record of is not assumed capable: the fallback is running the query
+// locally, which is always safe.
+func (c *Coordinator) peerReadQueries(nodeID string) bool {
+	if c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	n, ok := fsm.GetNode(nodeID)
+	return ok && hasCapability(n.Capabilities, CapabilityForwardReadQueries)
+}
+
+// peerDatabaseCreate reports whether a peer advertises
+// CapabilityForwardDatabaseCreate. A peer this node has no record of is not
+// assumed capable: the fallback, creating locally, is what older builds do.
+func (c *Coordinator) peerDatabaseCreate(nodeID string) bool {
+	if c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	n, ok := fsm.GetNode(nodeID)
+	return ok && hasCapability(n.Capabilities, CapabilityForwardDatabaseCreate)
+}
+
 // ForwardIdentityHeaderValues returns every value of a request header.
 type ForwardIdentityHeaderValues func(name string) []string
 
@@ -188,7 +236,8 @@ func (c *Coordinator) VerifyForwardIdentity(values ForwardIdentityHeaderValues, 
 		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	node := got[security.HeaderForwardNode]
-	// The loop marker names the same sender, so a peer can trust it.
+	// The loop marker must name the same claimed sender as the signed
+	// header (a consistency check, not sender authentication; #1510).
 	if by := values("X-Arc-Forwarded-By"); len(by) != 1 || by[0] != node {
 		return true, ForwardToken{}, security.ErrForwardIdentity
 	}

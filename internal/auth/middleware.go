@@ -374,6 +374,73 @@ func RequireResourcePermission(am *AuthManager, rm ResourcePermissionChecker, pe
 	}
 }
 
+// AnyResourcePermissionChecker is what RequireAnyResourcePermission needs:
+// *RBACManager.HasPermissionAnywhere.
+type AnyResourcePermissionChecker interface {
+	HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) (bool, error)
+}
+
+// RequireAnyResourcePermission is the door for routes whose resources are
+// named in the request body rather than its path or headers: the tables of a
+// query's SQL, the measurements of an ingest payload. It admits a token that
+// holds `permission` on anything at all — through RBAC when rm is wired, the
+// coarse list otherwise — and the handler then decides per resource
+// (checkQueryPermissions, CheckWritePermissions). A route whose handler does
+// not check per resource must not use it.
+//
+// RequirePermission was the door on these routes until #1559, and it consults
+// only the coarse list: a token whose authority comes from RBAC alone (created
+// with no permissions and added to a team) was refused before RBAC was asked.
+// RequireResourcePermission cannot stand in either: with no database in the
+// path or headers it asks about database "", which a tenant role's pattern
+// never matches.
+//
+// With rm wired, RBAC is authoritative for a team member here as everywhere
+// (see the RBAC ENFORCEMENT MODEL in rbac_manager.go): a token holding the
+// coarse bit whose teams grant `permission` nowhere is refused.
+func RequireAnyResourcePermission(am *AuthManager, rm AnyResourcePermissionChecker, permission string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		tokenInfo := GetTokenInfo(c)
+		if tokenInfo == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"success": false,
+				"error":   "Authentication required",
+			})
+		}
+		var allowed bool
+		if rm == nil {
+			// No checker wired (OSS auth-only build): coarse permissions, as
+			// RequirePermission. Not keyed off the license; see
+			// RequireResourcePermission.
+			allowed = am.HasPermission(tokenInfo, permission)
+		} else {
+			var err error
+			allowed, err = rm.HasPermissionAnywhere(tokenInfo, permission)
+			if err != nil {
+				// Refused (fail closed), but not as "permission denied": the
+				// grants could not be read, and that is what the operator
+				// needs to see. Falling back to the coarse list would widen a
+				// team member restricted by RBAC for as long as the store is
+				// down.
+				am.logger.Error().Err(err).Int64("token_id", tokenInfo.ID).
+					Msg("RBAC grants could not be read; refusing the request (fail closed)")
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"success": false,
+					"error":   "Permission store unavailable; retry later",
+					"reason":  "hub_unavailable",
+				})
+			}
+		}
+		if !allowed {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"success": false,
+				"error":   "Permission denied: " + permission + " required",
+			})
+		}
+		return c.Next()
+	}
+}
+
 // extractDatabase extracts the target database from the request.
 // Checks: x-arc-database header, path parameter, query parameter
 func extractDatabase(c *fiber.Ctx) string {

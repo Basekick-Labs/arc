@@ -78,7 +78,7 @@ type Manager struct {
 	// internal/backup/identity.go.
 	instanceID   string
 	sqliteDBPath string // path to shared SQLite database
-	configPath   string // path to arc.toml
+	configPath   string // the config file config.Load read; "" when Arc started without one (#1466)
 	// icebergCatalogDBPath is the Iceberg SQL catalog, backed up separately only
 	// when iceberg.catalog_db_path points somewhere other than the shared DB.
 	// The catalog holds every Iceberg table's schema and snapshot pointers, so a
@@ -168,8 +168,12 @@ type ManagerConfig struct {
 	// IcebergNamespacePrefix is iceberg.namespace_prefix (default "arc"); the
 	// warehouse walk copies only <prefix>_*.db namespace directories.
 	IcebergNamespacePrefix string
-	ConfigPath             string
-	Logger                 zerolog.Logger
+	// ConfigPath is the config file Arc loaded at startup (config.Config.
+	// ConfigFile, an absolute path), or "" when it started without one. Not
+	// a path relative to the working directory: on a packaged install that
+	// is /var/lib/arc, and the config is /etc/arc/arc.toml (#1466).
+	ConfigPath string
+	Logger     zerolog.Logger
 }
 
 // NewManager creates a new backup manager.

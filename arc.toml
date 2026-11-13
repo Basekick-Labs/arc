@@ -13,6 +13,11 @@ tls_enabled = false
 # tls_cert_file = "/etc/letsencrypt/live/example.com/fullchain.pem"
 # tls_key_file = "/etc/letsencrypt/live/example.com/privkey.pem"
 
+# Optional Arrow Flight SQL listener (disabled by default)
+[flight_sql]
+enabled = false
+port = 50051
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
@@ -128,6 +133,10 @@ max_buffer_age_ms = 100   # Sample override; built-in default is 5000
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
+# Environment override: entries separated by WHITESPACE, since each entry
+# contains commas; no space inside an entry:
+# ARC_INGEST_SORT_KEYS="cpu:host,region mem:host"
+# (ingest.decimal_columns takes its env override the same way.)
 sort_keys = []
 default_sort_keys = ""
 
@@ -152,6 +161,18 @@ default_sort_keys = ""
 # that gives up). An explicit import_write_concurrency (1-1024) is used as is.
 # import_write_concurrency = 0
 # import_queue_timeout_ms = 30000
+#
+# Buffered-bytes limit (#1468). When storage falls behind, rows waiting to be
+# flushed stay in memory; once they reach max_buffered_bytes (the estimate in
+# arc_buffer_bytes_buffered), new write requests are refused with a retryable
+# 503 (header X-Arc-Ingest-Refused: buffer_full) until flushes catch up, and
+# MQTT subscriptions pause so the broker holds their messages. Bulk imports are
+# refused from 90% of it and pace their writes below that. Off by default
+# ("0"); "auto" is half the detected memory limit (off when none is detected).
+# A backstop, not a heap bound: the estimate leaves out a flush's copies.
+# A refusal does not start a flush: keep an explicit value well above what
+# buffers hold before their size/age flush, or writes wait for the next one.
+# max_buffered_bytes = "0"   # or "auto", or a size such as "4GB"
 
 # -----------------------------------------------------------------------------
 # Compaction
@@ -298,7 +319,7 @@ enabled = true
 # Continuous Queries
 # -----------------------------------------------------------------------------
 [continuous_query]
-enabled = false
+enabled = true
 
 # -----------------------------------------------------------------------------
 # MQTT
@@ -400,9 +421,35 @@ enabled = false
 # sync_interval = "5m"         # Delay after a completed pass; at least 1s
 # sync_retry_interval = "30s"  # Initial retry; doubles up to sync_interval
 #                             # At least 1s and shorter than sync_interval
+# sync_timeout = "2h"          # Bound on one manual pass (POST /api/v1/spoke-sync/run)
+# delete_after_sync = false    # Delete the local copy once the hub VERIFIES it holds it
+#                             # (a later pass than the one that synced it). Deletes edge
+#                             # data: needs an https hub_url (or loopback); refused on a
+#                             # cluster node. Local queries stop seeing deleted data.
+# delete_after_sync_delay = "0s"  # Minimum time from synced to the verify that may delete
+#
+# [edge_sync.spoke.bundle]
+# timeout = "2h"               # Bound on one air-gap export (POST /api/v1/spoke-sync/export)
+#
+# [edge_sync.import]
+# timeout = "4h"               # Hub side: bound on one air-gap import (POST /api/v1/bundle-import)
+#
+# allowed_dirs (in both [edge_sync.import] and [edge_sync.spoke.bundle]) is a
+# TOML array, or a comma-separated string; a path may contain spaces, and a
+# path containing a comma needs the array. Entries must be absolute paths:
+# allowed_dirs = ["/Volumes/Air Gap", "/mnt/bundles"]
+# ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS="/Volumes/Air Gap,/mnt/bundles"
+#
+# Closing the HTTP connection does not cancel a manual pass, export or import;
+# only these bounds or a server shutdown do. Go durations; must be positive.
 # Environment overrides:
 # ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
 # ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
+# ARC_EDGE_SYNC_SPOKE_SYNC_TIMEOUT
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY
+# ARC_EDGE_SYNC_SPOKE_BUNDLE_TIMEOUT
+# ARC_EDGE_SYNC_IMPORT_TIMEOUT
 #
 # -----------------------------------------------------------------------------
 # Telemetry
@@ -453,6 +500,11 @@ migration_history_retention_days = 90
 # nothing else writes a tier row for a compacted file on the node that produced
 # it.
 # scan_timeout = "2h"
+#
+# How long one migration cycle may run, scheduled or POST /api/v1/tiering/migrate.
+# Go duration; must be positive. The scan at the start of a cycle runs inside
+# this bound, so keep it above scan_timeout (Arc warns at startup if not).
+# migration_timeout = "2h"
 
 [tiered_storage.cold]
 enabled = false
@@ -516,9 +568,15 @@ include_reads = false           # Log GET/query requests (high volume)
 # primary storage, and with no target configured the destination is
 # local_path. A deployment whose local_path sits inside storage.local_path — or
 # whose storage.local_path is a parent of it, such as "./data" — boots today
-# and will not boot after the upgrade. The defaults below are disjoint and are
-# unaffected. An empty local_path with no target is refused too, where it used
-# to boot with the backup API quietly skipped.
+# and will not boot after the upgrade. The defaults in this file are disjoint
+# ("./data/arc" beside "./data/backups"). The .deb/.rpm/Arch packages are not
+# laid out that way: their systemd unit puts storage at /var/lib/arc/data, which
+# is a parent of "./data/backups" resolved from /var/lib/arc, so the unit also
+# sets ARC_BACKUP_LOCAL_PATH=/var/lib/arc/backups (#1463). That environment
+# variable overrides the value here; to change the backup directory on a
+# packaged install, override it with `systemctl edit arc`. An empty local_path
+# with no target is refused too, where it used to boot with the backup API
+# quietly skipped.
 enabled = true
 local_path = "./data/backups"           # Directory for local backups; see the refusal note above
 # How long one backup or one restore may run before its context is cancelled.
@@ -686,8 +744,15 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # enabled = false
 # history_size = 100              # Number of completed queries to keep in memory
 
-# Peer file replication (Enterprise, cluster mode).
+# Cluster (Enterprise).
 # [cluster]
+# Static seed nodes (host:port of each peer's coordinator) used to join the
+# cluster. Either spelling works (uncomment ONE; a key may appear only once);
+# ARC_CLUSTER_SEEDS takes the comma form and overrides the file.
+# seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]
+# seeds = "10.0.0.1:9100,10.0.0.2:9100"
+#
+# Peer file replication (cluster mode).
 # Aggregate inbound bandwidth of this node's pull workers, in bytes per second
 # or a size such as "10MB" (1 MB = 1024 KB). 0 = unlimited. Staged compaction
 # fetches are not capped. A file whose transfer outlasts one fetch resumes from
@@ -698,6 +763,14 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 [wal]
 enabled = false
 # sync_mode = "fdatasync"   # fdatasync (default), fsync, or async (no sync; a flush checkpoint is still synced)
+# ack_mode = "auto"         # When a write is acknowledged: "durable" once a sync covering its WAL entry has
+#                           # completed (a crash loses no acknowledged write; a write the WAL cannot make
+#                           # durable is refused with 503), or "queued" once the entry is queued (acknowledged
+#                           # sooner; a crash can lose entries still queued or unsynced). "auto", the default,
+#                           # is durable with the WAL on, and queued with cluster.wal_coverage set.
+# ack_timeout_seconds = 30  # A durable write waits at most this long for the sync covering its WAL entry;
+#                           # past it the write is refused (503, wal_not_durable) and its entry retracted
+#                           # without waiting on the device. 0 = no bound (the wait ends only with the sync).
 # sync_bytes = 1048576      # Request a sync once this many WAL bytes are unsynced (default 1 MiB).
 #                           # Syncs run beside the WAL writer, so this bounds how much written data a
 #                           # sync can leave behind, not ingest throughput. A sync also runs every 100 ms

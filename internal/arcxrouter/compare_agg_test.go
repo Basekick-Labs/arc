@@ -31,6 +31,11 @@ func aggRec(t *testing.T, cells ...interface{}) arrow.Record {
 			b.Append(v)
 			cols[i] = b.NewArray()
 			fields[i] = arrow.Field{Name: "c", Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+		case string: // agg-7 mode over VARCHAR
+			b := array.NewStringBuilder(pool)
+			b.Append(v)
+			cols[i] = b.NewArray()
+			fields[i] = arrow.Field{Name: "c", Type: arrow.BinaryTypes.String, Nullable: true}
 		case nil:
 			b := array.NewFloat64Builder(pool)
 			b.AppendNull()

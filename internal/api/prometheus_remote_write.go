@@ -69,14 +69,16 @@ func (h *LineProtocolHandler) WritePrometheusRemoteWrite(c *fiber.Ctx) error {
 	case ForwardAlreadyForwarded:
 		return RespondAlreadyForwarded(c)
 	case ForwardToPeer:
-		httpReq, err := BuildHTTPRequest(c)
+		fctx := h.router.Lifetime()
+		httpReq, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for Prometheus remote write forwarding")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Failed to prepare request for forwarding",
 			})
 		}
-		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		defer release()
+		resp, err := h.router.RouteWrite(fctx, httpReq)
 		if err == nil {
 			return CopyResponse(c, resp)
 		}

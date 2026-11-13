@@ -106,6 +106,38 @@ func (e *ReconcileTooLargeError) Error() string {
 
 // Reconcile asks the hub which of the pending files it already holds.
 func (t *HTTPTransport) Reconcile(ctx context.Context, hubID string, pending []*LedgerEntry) (*ReconcileResult, error) {
+	out, err := t.reconcileRequest(ctx, hubID, pending, false)
+	if err != nil {
+		return nil, err
+	}
+	return &ReconcileResult{
+		Missing:   out.Missing,
+		Present:   out.Present,
+		Conflicts: out.Conflicts,
+	}, nil
+}
+
+// Verify asks the hub which of these synced files it provably holds
+// (delete_after_sync). A hub without verify support answers an ordinary
+// reconcile, whose missing "held" key leaves HeldKnown false.
+func (t *HTTPTransport) Verify(ctx context.Context, hubID string, synced []*LedgerEntry) (*VerifyAnswer, error) {
+	out, err := t.reconcileRequest(ctx, hubID, synced, true)
+	if err != nil {
+		return nil, err
+	}
+	return &VerifyAnswer{Held: out.Held, Missing: out.Missing, HeldKnown: out.Held != nil}, nil
+}
+
+// reconcileWire is a reconcile or verify response as decoded. Held is nil
+// when the key is absent or null, and non-nil (possibly empty) when present.
+type reconcileWire struct {
+	Missing   []string   `json:"missing"`
+	Present   []string   `json:"present"`
+	Conflicts []Conflict `json:"conflicts"`
+	Held      []string   `json:"held"`
+}
+
+func (t *HTTPTransport) reconcileRequest(ctx context.Context, hubID string, pending []*LedgerEntry, verify bool) (*reconcileWire, error) {
 	entries := make([]ReconcileEntry, 0, len(pending))
 	for _, e := range pending {
 		entries = append(entries, ReconcileEntry{
@@ -115,7 +147,11 @@ func (t *HTTPTransport) Reconcile(ctx context.Context, hubID string, pending []*
 		})
 	}
 
-	body, err := json.Marshal(map[string]any{"entries": entries})
+	payload := map[string]any{"entries": entries}
+	if verify {
+		payload["verify"] = true
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("edgesync: encode reconcile body: %w", err)
 	}
@@ -161,20 +197,11 @@ func (t *HTTPTransport) Reconcile(ctx context.Context, hubID string, pending []*
 		return nil, t.statusError(resp, "reconcile")
 	}
 
-	var out struct {
-		Missing   []string   `json:"missing"`
-		Present   []string   `json:"present"`
-		Conflicts []Conflict `json:"conflicts"`
-	}
+	var out reconcileWire
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("edgesync: decode reconcile response: %w", err)
 	}
-
-	return &ReconcileResult{
-		Missing:   out.Missing,
-		Present:   out.Present,
-		Conflicts: out.Conflicts,
-	}, nil
+	return &out, nil
 }
 
 // PutFile streams one file to the hub, resuming from offset.
@@ -312,7 +339,7 @@ func (t *HTTPTransport) statusError(resp *http.Response, op string) error {
 			msg += " (the ARC_EDGE_SYNC_HUB_TOKEN on this spoke was rejected by the hub, or the request MAC failed; check the token, then the spoke secret and hub_id)"
 		}
 	case http.StatusForbidden:
-		msg += " (the ARC_EDGE_SYNC_HUB_TOKEN on this spoke lacks write permission on the hub)"
+		msg += " (the ARC_EDGE_SYNC_HUB_TOKEN on this spoke lacks write permission on the hub: its own write permission, or, for a token in an RBAC team, a write grant on database {spoke_id} for this spoke's database as the measurement)"
 	}
 	return fmt.Errorf("edgesync: %s failed with %d: %s", op, resp.StatusCode, msg)
 }

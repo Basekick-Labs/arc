@@ -24,6 +24,15 @@ type Manager struct {
 	hotBackend  storage.Backend
 	coldBackend storage.Backend
 
+	// afterColdFallbackRow is a test seam: when set, syncColdTierMetadata calls it
+	// after each row the per-row fallback writes (after a batch failed). Nil in
+	// production. It lets a test cancel at an exact point inside the fallback
+	// instead of polling for a row that a fast runner may finish past.
+	afterColdFallbackRow func()
+	// beforeReaderColdRetire is a test seam: when set, a reader's retirement
+	// pass calls it between its check of a cold row and the delete (#1563).
+	beforeReaderColdRetire func(path string)
+
 	// onMigrationComplete, when set, runs after a migration cycle that moved
 	// or deleted at least one tier file. The query layer uses it to invalidate
 	// pruner and SQL transform caches, whose cached partition paths go stale
@@ -108,6 +117,19 @@ type Manager struct {
 	manifestMu           sync.Mutex
 	lastManifestProposal time.Time
 
+	// coldAuth: whether cold tier rows may be missing files the cold store
+	// holds (#1550). See cold_authority.go.
+	coldAuth coldAuthority
+
+	// coldMissing is the last check of cold rows whose object is gone;
+	// coldRemovals/coldRemovalGen track cold DELETE and retention runs that
+	// check must not overlap (#1551). See cold_missing.go.
+	coldMissing        atomic.Pointer[ColdMissingObjectsStatus]
+	coldMissingMu      sync.Mutex // orders publishes; guards coldMissingStarted
+	coldMissingStarted time.Time
+	coldRemovals       atomic.Int32
+	coldRemovalGen     atomic.Uint64
+
 	// tierEvent* carry the registration reports the cluster layer makes for
 	// files this node did not write itself — pulled from a peer, or unlinked
 	// because another node migrated them. One drainer applies them so a
@@ -168,10 +190,13 @@ type ManagerConfig struct {
 
 	// ClusterGate, when non-nil, restricts storage mutation (migrate, delete,
 	// orphan reconciliation) to the primary writer. main.go wires it where
-	// nodes share data — shared-storage mode, and per-node storage with file
+	// nodes share data — a hot bucket (with or without
+	// cluster.shared_storage_mode, #1603), and per-node storage with file
 	// replication: there the primary's manifest deletes unlink every
-	// replica, so only one node may migrate. A local-storage cluster
-	// without replication shares nothing and stays ungated.
+	// replica, so only one node may migrate. In a local-storage cluster
+	// without replication, which is neither supported pattern, only its
+	// readers and compactors are gated (#1599): each writer migrates the hot
+	// files on its own disk.
 	//
 	// It does NOT switch the cold-tier metadata sync on or off. That used to
 	// be written here and was the one place in the package claiming it; the
@@ -190,6 +215,21 @@ type ManagerConfig struct {
 	// cluster coordinator exists.
 	Manifest ManifestCoordinator
 
+	// ColdMetadataMarkerPath is where this node records that its cold tier
+	// rows may be missing files the cold store holds (a metadata restore, a
+	// restore writing to cold, a sync that could not record every object);
+	// "" keeps that in memory only. See cold_authority.go (#1550).
+	ColdMetadataMarkerPath string
+
+	// ClusteredDeployment is set when the node is configured as part of a
+	// cluster (cluster.enabled or cluster.shared_storage_mode), whether or
+	// not a coordinator is running: other nodes may then write the cold store
+	// this node reads, so its cold rows are never treated as a complete
+	// record of it (#1550). Manifest alone is not that signal: it is nil
+	// whenever the coordinator is, including a cluster node whose
+	// coordinator failed to start or whose licence lacks clustering.
+	ClusteredDeployment bool
+
 	// Logger
 	Logger zerolog.Logger
 }
@@ -207,6 +247,13 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 	}
 	if cfg.Config == nil {
 		return nil, fmt.Errorf("configuration is required")
+	}
+	if mt, st := cfg.Config.MigrationTimeout, cfg.Config.ScanTimeout; mt > 0 && st > mt {
+		// The pre-migration scan runs inside the cycle's context, so it gets
+		// the shorter of the two. Not an error: an operator may want a short
+		// cycle and accept that the in-cycle scan is cut (#1112).
+		logger.Warn().Dur("migration_timeout", mt).Dur("scan_timeout", st).
+			Msg("tiered_storage.migration_timeout is shorter than scan_timeout: the scan inside each migration cycle is cut at migration_timeout, and a scan that never finishes never retires stale hot rows")
 	}
 
 	// Validate license
@@ -243,6 +290,8 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		tierEventStop: make(chan struct{}),
 		logger:        logger,
 	}
+
+	m.initColdAuthority(cfg)
 
 	// Started here rather than in Start so the cluster layer can report pulls
 	// and unlinks from the moment the manager exists, and so a manager whose
@@ -779,6 +828,13 @@ func (m *Manager) HasColdFilesInRange(ctx context.Context, database, measurement
 	return m.metadata.HasColdFilesInRange(ctx, database, measurement, start, end)
 }
 
+// HasAnyColdRowsInRange is HasColdFilesInRange counting quarantined cold rows
+// too. The query path asks it before leaving out cold partitions the cold
+// tier could not list (#1550).
+func (m *Manager) HasAnyColdRowsInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	return m.metadata.HasAnyColdRowsInRange(ctx, database, measurement, start, end)
+}
+
 // GetBackendForTier returns the storage backend for a tier, or nil when this
 // node has no usable one.
 //
@@ -961,6 +1017,11 @@ func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	coldStats.Enabled = m.coldTierUsable()
 	coldStats.Backend = m.config.Cold.Backend
 	status.Tiers["cold"] = coldStats
+	if m.config.Cold.Enabled {
+		ok, reason := m.ColdMetadataAuthority()
+		status.ColdMetadata = &ColdMetadataStatus{Authoritative: ok, Reason: reason}
+		status.ColdMissingObjects = m.ColdMissingObjects()
+	}
 
 	quarantined, err := m.metadata.CountQuarantinedFiles(ctx)
 	if err != nil {
@@ -1060,6 +1121,21 @@ func (m *Manager) scanBudget() time.Duration {
 // the manager rather than plumbed through a constructor so a hand-built handler
 // cannot carry a zero.
 func (m *Manager) ScanBudget() time.Duration { return m.scanBudget() }
+
+// defaultMigrationTimeout is the budget for one migration cycle when no
+// configuration supplies one, matching the tiered_storage.migration_timeout
+// default for the same reason defaultScanTimeout matches scan_timeout's.
+const defaultMigrationTimeout = 2 * time.Hour
+
+// MigrationBudget is how long one migration cycle may take, scheduled or
+// triggered through the API (#1112). Read through here, never off the config
+// struct, for the reason scanBudget gives; nil-safe for the same reason.
+func (m *Manager) MigrationBudget() time.Duration {
+	if m != nil && m.config != nil && m.config.MigrationTimeout > 0 {
+		return m.config.MigrationTimeout
+	}
+	return defaultMigrationTimeout
+}
 
 // recordScan stores a COPY of the result. The caller keeps the pointer it
 // passed and hands it to HTTP responses and callbacks; storing that pointer
@@ -1163,10 +1239,15 @@ const coldTierMetadataBatchSize = 1000
 // already-migrated files as candidates.
 //
 // Rows are normally only added or flipped to cold. A cold row whose object is
-// gone is reported, never reverted, for the same reason the hot scan never
-// downgrades (#683): the object may be mid-move, and a hot copy is still
-// read through the hot glob. Redundant cold objects are removed only when
-// this node is the primary and the metadata row is still hot.
+// gone is left to the primary on a standalone node or the primary writer,
+// whose DELETE and retention runs retire it, and is reported there (#1551).
+// On a cluster reader, nothing else ever would: it is pointed back at a hot
+// copy that the manifest still lists, or retired when neither copy exists
+// (#1563, cold_retire_reader.go). Neither can act on an object that is
+// mid-move, because every cold writer writes the object before the row and
+// both re-check the object at the moment they act. Redundant cold objects are
+// removed only when this node is the primary and the metadata row is still
+// hot.
 // Returns how many rows changed.
 //
 // Rows are written in transactions of coldTierMetadataBatchSize, and the tier
@@ -1176,13 +1257,37 @@ const coldTierMetadataBatchSize = 1000
 // every object in the bucket is unseen: each invalidation bumps the
 // process-wide generation and discards every concurrent tier-cache fill.
 func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
+	// Read before the listing: a marking after this point may concern objects
+	// the listing snapshot does not hold (#1550).
+	authGen := m.coldAuth.gen.Load()
+	// notRecorded counts listed objects this sync left without a row: a row
+	// write that failed, or a hot-only object whose hot copy could not be
+	// checked. Either keeps cold rows marked incomplete.
+	notRecorded := 0
+	var notRecordedSample []string
+	noteNotRecorded := func(path string) {
+		notRecorded++
+		if len(notRecordedSample) < 5 {
+			notRecordedSample = append(notRecordedSample, path)
+		}
+	}
 	lister, ok := m.coldBackend.(storage.ObjectLister)
 	if !ok {
 		return 0, fmt.Errorf("cold backend does not support ListObjects")
 	}
+	// Decided before the listing: only a listing that started after the
+	// cold mark's fence may seed it (#1552).
+	seed := m.beginColdMarkSeed()
 	objects, err := lister.ListObjects(ctx, "")
 	if err != nil {
 		return 0, fmt.Errorf("failed to list cold objects: %w", err)
+	}
+	if seed != nil {
+		for _, obj := range objects {
+			if first, _, _ := strings.Cut(obj.Path, "/"); !storage.IsReservedRootDir(first) {
+				seed.note(m, obj.Path)
+			}
+		}
 	}
 
 	// One query for the cold row set, as the hot scan does. Skipping rows
@@ -1194,6 +1299,19 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	unseen, err := m.metadata.ColdFilePathsAndSizes(ctx, TierCold)
 	if err != nil {
 		return 0, fmt.Errorf("failed to load cold tier paths: %w", err)
+	}
+	// The measurements this node holds cold rows for, taken before unseen is
+	// whittled down: a query reads their cold tier through the glob
+	// db/measurement/**/*.parquet, so an object under one of them that this
+	// sync cannot parse is cold data with no row (#1550).
+	coldScopes := make(map[string]struct{})
+	// Cold rows per scope, for the share a reader's retirement takes (#1563).
+	coldRowsByScope := make(map[string]int)
+	for path := range unseen {
+		if scope, ok := measurementScope(path); ok {
+			coldScopes[scope] = struct{}{}
+			coldRowsByScope[scope]++
+		}
 	}
 	cleaned := m.cleanupHotOnlyColdCopies(ctx, objects, unseen)
 	for path := range cleaned {
@@ -1241,6 +1359,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 						return ctxErr
 					}
 					m.logger.Warn().Str("path", file.Path).Err(err).Msg("Failed to record cold file, skipping")
+					noteNotRecorded(file.Path)
 					continue
 				}
 				if !wrote {
@@ -1249,6 +1368,9 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 				}
 				touched[tierCacheScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
 				synced++
+				if m.afterColdFallbackRow != nil {
+					m.afterColdFallbackRow()
+				}
 			}
 			return nil
 		}
@@ -1277,6 +1399,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	}
 
 	unparseable := 0
+	var unparsedScoped []string
 	for _, obj := range objects {
 		// Past the deadline every remaining upsert would fail; stop with what
 		// was recorded — at most one staged batch is dropped, and the next
@@ -1299,11 +1422,21 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 			continue
 		}
 		info, err := m.parseFilePath(obj.Path)
+		if err == nil {
+			coldScopes[info.Database+"/"+info.Measurement] = struct{}{}
+		}
 		if err != nil {
 			// Counted, not logged per file: a cold bucket shared with
 			// something else (an Iceberg warehouse, say) would fire on
 			// every object, every cycle.
 			unparseable++
+			// Under a measurement with cold rows, though, the glob a read
+			// falls back to (no range, end-only, path cap) matches it, and
+			// the rows cannot vouch for it. Decided after the loop, once
+			// this sync's own rows are in coldScopes too.
+			if _, ok := measurementScope(obj.Path); ok {
+				unparsedScoped = append(unparsedScoped, obj.Path)
+			}
 			continue
 		}
 		// A cold object for a hot-only database is queryable only when its
@@ -1314,6 +1447,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 			if present, existsErr := m.hotBackend.Exists(ctx, obj.Path); existsErr != nil || present {
 				if existsErr != nil {
 					m.logger.Warn().Err(existsErr).Str("path", obj.Path).Msg("Could not verify local hot copy for a hot-only cold object; preserving it")
+					noteNotRecorded(obj.Path)
 				}
 				delete(unseen, obj.Path)
 				continue
@@ -1347,15 +1481,33 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	objects = nil
 	cleaned = nil
 
+	for _, path := range unparsedScoped {
+		scope, _ := measurementScope(path)
+		if _, tiered := coldScopes[scope]; tiered {
+			noteNotRecorded(path)
+		}
+	}
+
 	// A reader may have recorded a listed cold object before the primary
 	// removed it. Revert that stale row only after this node has the hot copy;
 	// checking only missing cold objects avoids HEADs for steady-state rows.
 	// unseen now holds exactly those: every listed path was deleted from it
 	// above, and it never held a quarantined row. The database is the key's
 	// first segment, as every writer of a tier row lays it out.
+	//
+	// For every database on a cluster reader, not only hot-only ones (#1563).
+	// A row lands here with its hot path still in the manifest when the
+	// primary rolled a move back before unlinking the hot copy: a compaction
+	// took the file over (dropTakenOver), a copy failed and was cleaned up,
+	// or it stopped between the flip and the unlink. Nothing tells a reader,
+	// which then refused its own hot registration over the cold row, and a
+	// measurement whose only hot file it was lost its hot glob there. During
+	// a migration the cold object exists, so the row is not in unseen; after
+	// a completed one the manifest entry is gone, so the size match below
+	// fails and the row is left to retirement.
 	for path, size := range unseen {
 		database, _, _ := strings.Cut(path, "/")
-		if !m.IsHotOnly(ctx, database) {
+		if !m.roleGated() && !m.IsHotOnly(ctx, database) {
 			continue
 		}
 		if m.manifest != nil {
@@ -1382,6 +1534,31 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		}
 	}
 
+	// A cluster reader retires what the primary removed (#1563).
+	if len(unseen) > 0 && m.roleGated() {
+		if ok, why := m.readerRetireAllowed(authGen, objectCount); !ok {
+			m.logger.Warn().Int("rows", len(unseen)).Str("reason", why).
+				Msg("Cold tier rows have no object in cold storage; not retiring them on this reader")
+		} else {
+			res := m.retireUnseenColdRows(ctx, unseen)
+			synced += res.retired
+			switch {
+			case res.retired > 0:
+				m.logger.Info().Int("retired", res.retired).Strs("sample", res.sample).
+					Int("left", len(unseen)).Int("unchecked", res.unchecked).Int("failed", res.failed).
+					Msg("Retired cold tier rows whose cold object and hot copy are both gone (removed by the primary, or outside Arc); rows left are retried by the next cold sync")
+			case res.unchecked > 0 || res.failed > 0:
+				m.logger.Warn().Int("unchecked", res.unchecked).Int("failed", res.failed).
+					Msg("Could not check or retire cold tier rows whose object is gone; the next cold sync tries again")
+			}
+			for scope, n := range res.byScope {
+				if total := coldRowsByScope[scope]; total > 0 && 2*n > total {
+					m.logger.Warn().Str("scope", scope).Int("retired", n).Int("cold_rows", total).
+						Msg("This sync retired more than half of a measurement's cold rows. Expected after a large DELETE or retention run on the primary; otherwise check for a bucket lifecycle/expiry rule or deletes outside Arc on the cold prefix")
+				}
+			}
+		}
+	}
 	if len(unseen) > 0 {
 		sample := make([]string, 0, 5)
 		for p := range unseen {
@@ -1393,8 +1570,10 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		m.logger.Warn().
 			Int("count", len(unseen)).
 			Strs("sample", sample).
-			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read)")
+			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read). A cluster reader retires those with no hot copy once it can confirm both are gone")
 	}
+	m.checkMissingColdObjects(ctx, unseen)
+	seed.finish(ctx, m)
 
 	// Debug: the cycle summary already reports cold_synced.
 	m.logger.Debug().
@@ -1402,7 +1581,9 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		Int("synced", synced).
 		Int("unparseable", unparseable).
 		Int("quarantined_skipped", quarantined).
+		Int("not_recorded", notRecorded).
 		Msg("Cold tier metadata sync completed")
+	m.coldSyncCompleted(authGen, notRecorded, notRecordedSample)
 	return synced, nil
 }
 
@@ -1884,4 +2065,18 @@ func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 		PartitionTime:   partitionTime,
 		SpokeNamespaced: spokeNamespaced,
 	}, nil
+}
+
+// measurementScope is a storage key's "database/measurement" prefix, the
+// first two path segments, when the key has more segments under them.
+func measurementScope(path string) (string, bool) {
+	db, rest, ok := strings.Cut(path, "/")
+	if !ok || db == "" {
+		return "", false
+	}
+	measurement, tail, ok := strings.Cut(rest, "/")
+	if !ok || measurement == "" || tail == "" {
+		return "", false
+	}
+	return db + "/" + measurement, true
 }

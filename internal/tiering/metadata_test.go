@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -351,6 +352,48 @@ func TestMetadataStore_GetFilesInTier(t *testing.T) {
 
 	if len(coldFiles) != 1 {
 		t.Errorf("GetFilesInTier(cold) returned %d files, want 1", len(coldFiles))
+	}
+}
+
+// #1430: the files of one database in one tier, newest partition first.
+func TestMetadataStore_GetFilesInTierForDatabase(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	files := []FileMetadata{
+		{Path: "db1/hot.parquet", Database: "db1", Measurement: "m1", PartitionTime: day, Tier: TierHot, SizeBytes: 100},
+		{Path: "db1/cold_old.parquet", Database: "db1", Measurement: "m1", PartitionTime: day.AddDate(0, 0, -2), Tier: TierCold, SizeBytes: 200},
+		{Path: "db1/cold_new.parquet", Database: "db1", Measurement: "m2", PartitionTime: day.AddDate(0, 0, -1), Tier: TierCold, SizeBytes: 300},
+		{Path: "db2/cold.parquet", Database: "db2", Measurement: "m1", PartitionTime: day, Tier: TierCold, SizeBytes: 400},
+	}
+	for _, f := range files {
+		file := f
+		if err := store.RecordFile(ctx, &file); err != nil {
+			t.Fatalf("RecordFile() error = %v", err)
+		}
+	}
+
+	cold, err := store.GetFilesInTierForDatabase(ctx, "db1", TierCold)
+	if err != nil {
+		t.Fatalf("GetFilesInTierForDatabase() error = %v", err)
+	}
+	var got []string
+	for _, f := range cold {
+		got = append(got, f.Path)
+	}
+	want := []string{"db1/cold_new.parquet", "db1/cold_old.parquet"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("GetFilesInTierForDatabase(db1, cold) = %v, want %v", got, want)
+	}
+
+	hot, err := store.GetFilesInTierForDatabase(ctx, "db2", TierHot)
+	if err != nil {
+		t.Fatalf("GetFilesInTierForDatabase() error = %v", err)
+	}
+	if len(hot) != 0 {
+		t.Errorf("GetFilesInTierForDatabase(db2, hot) returned %d files, want 0", len(hot))
 	}
 }
 

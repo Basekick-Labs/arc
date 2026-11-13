@@ -39,6 +39,7 @@ type Reconciler struct {
 	index      *HubIndex
 	backend    storage.Backend
 	maxEntries int
+	manifest   ClusterManifest
 }
 
 // ReconcilerConfig configures a Reconciler.
@@ -63,6 +64,11 @@ type ReconcilerConfig struct {
 
 	// MaxEntries caps one batch. Zero uses MaxReconcileEntriesDefault.
 	MaxEntries int
+
+	// Manifest is the cluster manifest on a cluster hub, nil otherwise
+	// (#1667). A receipt whose file is gone is forgotten only while the
+	// manifest still lists the file; see ClusterManifest.
+	Manifest ClusterManifest
 }
 
 // NewReconciler validates configuration and returns a ready Reconciler.
@@ -77,7 +83,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if max <= 0 {
 		max = MaxReconcileEntriesDefault
 	}
-	return &Reconciler{index: cfg.Index, backend: cfg.Backend, maxEntries: max}, nil
+	return &Reconciler{index: cfg.Index, backend: cfg.Backend, maxEntries: max, manifest: cfg.Manifest}, nil
 }
 
 // MaxEntries reports the configured per-batch cap, so a handler can reject an
@@ -92,6 +98,26 @@ func (r *Reconciler) MaxEntries() int { return r.maxEntries }
 // from a long outage. §6.1's identity rule decides each entry: absent is
 // missing, a matching digest is present, and a differing digest is a conflict.
 func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []ReconcileEntry) (*ReconcileResult, error) {
+	return r.ReconcileAllowed(ctx, spokeID, entries, nil)
+}
+
+// ReconcileAllow decides whether the caller may learn what the hub holds at a
+// spoke path. An error means it could not decide (a permission store that
+// cannot be read): the whole reconcile fails with it.
+type ReconcileAllow func(path string) (bool, error)
+
+// ReconcileAllowed is Reconcile with entries the caller may not write answered
+// as missing without being looked up (#1561): nothing about what the hub holds
+// at such a path is disclosed, and no stale index row of it is forgotten. The
+// spoke then pushes the file, and the push is refused on its own.
+//
+// Answering denied entries rather than refusing the batch is deliberate: the
+// spoke's agent aborts its whole pass on a failed reconcile and offers the
+// same first page again, so one measurement the token cannot write would stall
+// every other one. A nil allow permits every entry. Validation (paths, digests,
+// duplicates, the batch cap) covers every entry, denied or not, so a batch is
+// accepted or refused exactly as without a filter.
+func (r *Reconciler) ReconcileAllowed(ctx context.Context, spokeID string, entries []ReconcileEntry, allow ReconcileAllow) (*ReconcileResult, error) {
 	if err := validateSpokeID(spokeID); err != nil {
 		return nil, err
 	}
@@ -118,7 +144,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 			return nil, fmt.Errorf("edgesync: reconcile batch contains %q twice", e.Path)
 		}
 		seen[e.Path] = struct{}{}
+	}
+
+	// Decided after validation, so a denied entry cannot turn a malformed
+	// batch into an accepted one.
+	denied := make(map[string]struct{})
+	for _, e := range entries {
+		if allow != nil {
+			ok, err := allow(e.Path)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				denied[e.Path] = struct{}{}
+				continue
+			}
+		}
 		paths = append(paths, e.Path)
+	}
+	permitted := entries
+	if len(denied) > 0 {
+		permitted = make([]ReconcileEntry, 0, len(entries)-len(denied))
+		for _, e := range entries {
+			if _, no := denied[e.Path]; !no {
+				permitted = append(permitted, e)
+			}
+		}
 	}
 
 	held, err := r.index.Lookup(ctx, spokeID, paths)
@@ -130,7 +181,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 	// it concurrently. The index records receipts, not deletions, so a stale
 	// row would otherwise make the hub claim a file it no longer holds — see
 	// ReconcilerConfig.Backend.
-	stale, err := r.confirmPresent(ctx, spokeID, entries, held)
+	stale, err := r.confirmPresent(ctx, spokeID, permitted, held)
 	if err != nil {
 		return nil, err
 	}
@@ -140,16 +191,31 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 	// reconciling after a retention sweep must not turn into a write storm on
 	// the single writer.
 	if len(stale) > 0 {
-		if err := r.index.ForgetBatch(ctx, spokeID, stale); err != nil {
-			return nil, fmt.Errorf("%w: forget stale entries: %w", ErrReceiveInternal, err)
+		// On a cluster hub, only the receipts whose files the manifest still
+		// lists are forgotten; the others were removed cluster-wide and are
+		// now marked so (#1667). An error forgets nothing: the spoke's
+		// reconcile fails and it retries, which beats re-sending deleted
+		// content.
+		forget, err := settleStale(ctx, r.index, r.manifest, spokeID, stale)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrReceiveInternal, err)
 		}
-		for _, p := range stale {
+		if len(forget) > 0 {
+			if err := r.index.ForgetBatch(ctx, spokeID, forget); err != nil {
+				return nil, fmt.Errorf("%w: forget stale entries: %w", ErrReceiveInternal, err)
+			}
+		}
+		for _, p := range forget {
 			delete(held, p)
 		}
 	}
 
 	res := &ReconcileResult{}
 	for _, e := range entries {
+		if _, no := denied[e.Path]; no {
+			res.Missing = append(res.Missing, e.Path)
+			continue
+		}
 		existing, ok := held[e.Path]
 
 		switch {
@@ -198,13 +264,16 @@ func (r *Reconciler) confirmPresent(ctx context.Context, spokeID string, entries
 		if !ok {
 			continue
 		}
-		if hf.Compacted {
+		if hf.Vouched() {
 			// The FILE is gone — the hub's own compaction consumed it — but
 			// the CONTENT is delivered and lives inside a compacted output,
 			// so the receipt is not stale. Running the existence check here
 			// would forget the receipt and make the sync protocol re-accept
 			// a re-uploaded raw next to the compacted output: the #611
-			// hazard this marking exists to prevent (#619).
+			// hazard this marking exists to prevent (#619). A REMOVED receipt
+			// (#1186) is skipped for a different reason: the hub deleted the
+			// content on purpose, and forgetting the receipt would make the
+			// spoke re-send what the operator or retention just deleted.
 			continue
 		}
 		candidates = append(candidates, e.Path)

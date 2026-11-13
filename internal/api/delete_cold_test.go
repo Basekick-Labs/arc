@@ -29,6 +29,7 @@ type fakeDeleteColdTier struct {
 	rows       []tiering.FileMetadata
 	retired    []string
 	reverted   []string
+	notified   int
 }
 
 func (f *fakeDeleteColdTier) ColdBackend() storage.Backend { return f.backend }
@@ -46,6 +47,7 @@ func (f *fakeDeleteColdTier) RetireColdRows(_ context.Context, paths []string) (
 	f.retired = append(f.retired, paths...)
 	return len(paths), nil
 }
+func (f *fakeDeleteColdTier) NotifyColdFilesRemoved(n int) { f.notified += n }
 func (f *fakeDeleteColdTier) RevertColdRowToHot(_ context.Context, path string) error {
 	f.reverted = append(f.reverted, path)
 	return nil
@@ -160,6 +162,9 @@ func TestDeleteRemovesAColdFileWhoseRowsAllMatch(t *testing.T) {
 	if r.coldExists(coldWhole) {
 		t.Fatal("the cold file whose rows all match is still there")
 	}
+	if r.tier.notified != 1 {
+		t.Fatalf("cold removal notified %d files, want 1 (the Iceberg export and query caches listen, #939)", r.tier.notified)
+	}
 	if !slices.Equal(r.tier.retired, []string{coldWhole}) {
 		t.Fatalf("retired %v, want its row", r.tier.retired)
 	}
@@ -211,7 +216,7 @@ func TestDeleteDryRunReportsColdFiles(t *testing.T) {
 	if out.DeletedCount != 1 || out.ColdRowsNotDeleted != 1 || len(out.ColdDeletedFiles) != 1 || len(out.ColdFiles) != 1 {
 		t.Fatalf("dry run %+v, want 1 row to delete from the whole file and 1 left in the partial one", out)
 	}
-	if !r.coldExists(coldWhole) || !r.coldExists(coldPartial) || len(r.tier.retired) != 0 {
+	if !r.coldExists(coldWhole) || !r.coldExists(coldPartial) || len(r.tier.retired) != 0 || r.tier.notified != 0 {
 		t.Fatal("a dry run changed cold storage")
 	}
 }

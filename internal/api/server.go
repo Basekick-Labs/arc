@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -83,6 +85,19 @@ type Server struct {
 	// (the invisible state behind the 27-restart field incident). Absent for
 	// deployments with no license configured at all.
 	licenseStatus func() license.LicenseHealth
+	// coldMissingObjects supplies the /health "tiering" field (#1551).
+	coldMissingObjects func() *tiering.ColdMissingObjectsStatus
+
+	// onShutdownStart runs first in Shutdown (OnShutdownStart).
+	onShutdownStartMu sync.Mutex
+	onShutdownStart   []func()
+
+	// queryLifetime ends the queries still running once the shutdown grace
+	// is over (QueryLifetime, ShutdownContext); conns tracks the open
+	// connections that shutdown closes after that (#1644).
+	queryLifetime context.Context
+	cancelQueries context.CancelFunc
+	conns         *connTracker
 }
 
 // ServerConfig holds server configuration
@@ -199,7 +214,16 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// Request logging middleware
 	app.Use(requestLogger(logger))
 
+	queryLifetime, cancelQueries := context.WithCancel(context.Background())
+	conns := newConnTracker()
+	// Fiber never sets ConnState, and app.Server() is the server Listen,
+	// ListenTLS and Listener all serve on.
+	app.Server().ConnState = conns.connState
+
 	return &Server{
+		queryLifetime:  queryLifetime,
+		cancelQueries:  cancelQueries,
+		conns:          conns,
 		app:            app,
 		logger:         logger.With().Str("component", "api-server").Logger(),
 		host:           config.Host,
@@ -249,6 +273,13 @@ func (s *Server) RegisterRoutes() {
 // is nil (authentication disabled), preserving no-auth deployment behaviour.
 func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
 	s.app.Get("/api/v1/logs", withAdminAuth(authManager), s.logsHandler)
+}
+
+// SetColdMissingObjects wires the /health "tiering" field source: the last
+// check of cold tier rows whose object is gone (#1551). fn returns nil while
+// there is nothing to report, and the field is then absent.
+func (s *Server) SetColdMissingObjects(fn func() *tiering.ColdMissingObjectsStatus) {
+	s.coldMissingObjects = fn
 }
 
 // SetLicenseStatus wires the /health "license" field source.
@@ -361,6 +392,16 @@ func (s *Server) healthHandler(c *fiber.Ctx) error {
 	}
 	if s.licenseStatus != nil {
 		payload["license"] = s.licenseStatus()
+	}
+	if s.coldMissingObjects != nil {
+		// Counts only: /health is unauthenticated, so no paths (#1551).
+		if st := s.coldMissingObjects(); st != nil {
+			payload["tiering"] = fiber.Map{
+				"cold_rows_missing_objects":          st.Lost,
+				"cold_rows_missing_objects_hot_copy": st.HotCopy,
+				"cold_missing_checked_at":            st.CheckedAt,
+			}
+		}
 	}
 	return c.JSON(payload)
 }
@@ -764,19 +805,20 @@ func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	return tls.NewListener(ln, tlsCfg), nil
 }
 
-// Shutdown gracefully shuts down the server
+// OnShutdownStart registers fn to run when Shutdown starts, before the HTTP
+// server drains: the point at which fasthttp ends its requests' contexts. The
+// cluster router's StopForwards is registered here, so a forward, which does
+// not run on its request's context (#1629), ends when it used to.
+func (s *Server) OnShutdownStart(fn func()) {
+	s.onShutdownStartMu.Lock()
+	s.onShutdownStart = append(s.onShutdownStart, fn)
+	s.onShutdownStartMu.Unlock()
+}
+
+// Shutdown drains the server within timeout: ShutdownContext with that
+// budget.
 func (s *Server) Shutdown(timeout time.Duration) error {
-	s.logger.Info().Msg("Shutting down server gracefully...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := s.app.ShutdownWithContext(ctx); err != nil {
-		return fmt.Errorf("server shutdown failed: %w", err)
-	}
-
-	s.logger.Info().Msg("Server stopped")
-	return nil
+	return s.ShutdownContext(context.Background(), timeout)
 }
 
 // WaitForShutdown blocks until shutdown signal is received

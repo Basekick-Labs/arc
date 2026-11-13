@@ -72,7 +72,13 @@ type S3Backend struct {
 	useSSL    bool   // stored for subprocess config passing
 	accessKey string // stored for subprocess credential passing
 	secretKey string // stored for subprocess credential passing
-	logger    zerolog.Logger
+	// awsCfg is the config the client was built from, credential provider
+	// included, so another client (the Iceberg FileIO) can share its
+	// credential cache and renewal; clientEndpoint is the endpoint as the
+	// client uses it (with scheme), "" for the SDK's own resolution.
+	awsCfg         aws.Config
+	clientEndpoint string
+	logger         zerolog.Logger
 	// bucketCheckedAt is when a HeadBucket last answered conclusively
 	// (UnixNano; 0 = not yet), and bucketMissing what it answered. See
 	// confirmObjectAbsent.
@@ -162,6 +168,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	var s3Opts []func(*s3.Options)
 
 	// Custom endpoint for MinIO
+	var clientEndpoint string
 	if cfg.Endpoint != "" {
 		endpoint := cfg.Endpoint
 		// Ensure endpoint has protocol
@@ -173,6 +180,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 			}
 		}
 
+		clientEndpoint = endpoint
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
 			configureGCSS3Options(endpoint, o)
@@ -211,17 +219,19 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	}
 
 	backend := &S3Backend{
-		client:    client,
-		uploader:  uploader,
-		bucket:    cfg.Bucket,
-		prefix:    prefix,
-		region:    region,
-		endpoint:  cfg.Endpoint,
-		pathStyle: cfg.PathStyle,
-		useSSL:    cfg.UseSSL,
-		accessKey: accessKey,
-		secretKey: secretKey,
-		logger:    log,
+		client:         client,
+		uploader:       uploader,
+		bucket:         cfg.Bucket,
+		prefix:         prefix,
+		region:         region,
+		endpoint:       cfg.Endpoint,
+		pathStyle:      cfg.PathStyle,
+		useSSL:         cfg.UseSSL,
+		accessKey:      accessKey,
+		secretKey:      secretKey,
+		awsCfg:         awsCfg,
+		clientEndpoint: clientEndpoint,
+		logger:         log,
 	}
 
 	// Test connection by checking if bucket exists
@@ -243,6 +253,37 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 // Write writes data to S3
 func (b *S3Backend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
+}
+
+// WriteIfAbsent writes data at path unless an object is already there
+// (ConditionalWriter), with a conditional PutObject (If-None-Match: *). S3
+// answers 412 PreconditionFailed when the key exists, which is created=false;
+// a 409 ConditionalRequestConflict (another conditional write to the key in
+// flight) is an error for the caller to retry.
+func (b *S3Backend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return false, err
+	}
+	_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(b.bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		ContentType:   aws.String("application/octet-stream"),
+		IfNoneMatch:   aws.String("*"),
+	})
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+			return false, nil
+		}
+		recordStorageError(ctx, err)
+		return false, fmt.Errorf("failed to write to S3: %w", err)
+	}
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
+	return true, nil
 }
 
 // WriteReader writes data from a reader to S3.
@@ -713,7 +754,10 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		for _, p := range batch {
 			key, kerr := b.prefixedKey(p)
 			if kerr != nil {
-				nonFatalErrs = append(nonFatalErrs, kerr)
+				// Named here, as a field and in the text: the joined error is
+				// logged only up to its first line (#1113).
+				b.logger.Warn().Err(kerr).Str("key", p).Msg("S3 batch: key refused before the delete")
+				nonFatalErrs = append(nonFatalErrs, fmt.Errorf("%s: %w", p, kerr))
 				continue
 			}
 			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
@@ -742,7 +786,11 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 			}
 			key := "unknown"
 			if e.Key != nil {
-				key = *e.Key
+				// The service answers with the PREFIXED object name (exactly
+				// what prefixObjectKey sent: plain concatenation). Report the
+				// caller's key, the one every manifest, listing and log line
+				// names (#1111), as Azure and GCS do.
+				key = strings.TrimPrefix(*e.Key, b.prefix)
 			}
 			code := ""
 			if e.Code != nil {
@@ -1191,4 +1239,35 @@ func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]Unusable
 	}
 
 	return objects, nil
+}
+
+// S3ClientSettings is what another S3 client needs to reach the same bucket
+// the same way this backend does.
+type S3ClientSettings struct {
+	// AWS is the config the backend's client was built from. Its credential
+	// provider is the backend's, cache and renewal included.
+	AWS aws.Config
+	// Region is the bucket's region.
+	Region string
+	// Endpoint is the custom endpoint with its scheme, "" when the SDK
+	// resolves the endpoint itself (AWS).
+	Endpoint string
+	// PathStyle is path-style addressing.
+	PathStyle bool
+	// GCSInterop: the endpoint is Google Cloud Storage's S3-compatible XML
+	// API, which this backend reaches through a client option (a signer)
+	// another client built from AWS alone would not have.
+	GCSInterop bool
+}
+
+// ClientSettings returns the settings another S3 client needs to share this
+// backend's bucket and credentials.
+func (b *S3Backend) ClientSettings() S3ClientSettings {
+	return S3ClientSettings{
+		AWS:        b.awsCfg,
+		Region:     b.region,
+		Endpoint:   b.clientEndpoint,
+		PathStyle:  b.pathStyle,
+		GCSInterop: IsGCSEndpoint(b.clientEndpoint),
+	}
 }

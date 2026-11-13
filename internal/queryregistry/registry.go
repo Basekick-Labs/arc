@@ -44,6 +44,12 @@ type TrackedQuery struct {
 	// compatibility.
 	IsParallel     bool `json:"is_parallel"`
 	PartitionCount int  `json:"partition_count,omitempty"`
+	// ForwardedTo names the node a forwarding node (a compactor) sent this
+	// query to; empty for a query run here. Such an entry records the
+	// forward: its ID is this node's, not the peer's, and it carries no row
+	// count. Cancelling it ends the forward, which stops the peer's query
+	// when the peer cancels on client disconnect (the default).
+	ForwardedTo string `json:"forwarded_to,omitempty"`
 }
 
 // activeEntry stores the tracked query plus its cancel func.
@@ -108,6 +114,28 @@ func (r *Registry) Register(parentCtx context.Context, sql string, tokenID int64
 		Msg("Query registered")
 
 	return queryID, ctx
+}
+
+// SetForwardedTo records the node a registered query was forwarded to.
+func (r *Registry) SetForwardedTo(queryID, node string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.active[queryID]; ok {
+		e.query.ForwardedTo = node
+	}
+}
+
+// Discard drops an active entry without recording it in history: for a
+// forward registered before routing that ends up running locally, where the
+// local path registers the query itself.
+func (r *Registry) Discard(queryID string) {
+	r.mu.Lock()
+	e, ok := r.active[queryID]
+	delete(r.active, queryID)
+	r.mu.Unlock()
+	if ok {
+		e.cancel()
+	}
 }
 
 // RecordRowCap notes that a query reached an Enterprise governance row cap.

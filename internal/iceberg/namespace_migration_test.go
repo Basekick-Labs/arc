@@ -299,6 +299,9 @@ func (s *oneMeasurementSource) LocalFiles(context.Context, Measurement) ([]strin
 func (s *oneMeasurementSource) FilesAndLocal(context.Context, Measurement) ([]FileRef, []string, error) {
 	return s.files, s.local, nil
 }
+func (s *oneMeasurementSource) FileSchema(_ context.Context, f FileRef) (ArcSchema, error) {
+	return SchemaFromParquet(strings.TrimPrefix(f.PhysicalPath, "file://"))
+}
 
 // The scheduler must ACT on the blocked set, not merely receive it.
 //

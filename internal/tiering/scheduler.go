@@ -138,7 +138,7 @@ func (s *Scheduler) runMigration() {
 
 	s.logger.Info().Msg("Scheduled migration cycle starting")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), s.manager.MigrationBudget())
 	defer cancel()
 
 	err := s.manager.RunMigrationCycle(ctx)

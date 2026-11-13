@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
 // measurementState caches per-measurement work between passes so an unchanged measurement is
@@ -18,7 +21,28 @@ import (
 type measurementState struct {
 	fingerprint string              // hash of the sorted file set + local-file set at last successful reconcile
 	schema      ArcSchema           // schema derived at that reconcile (reused/extended while files persist)
-	localFiles  map[string]struct{} // local-file set at that reconcile — to diff for newly-added files
+	schemaFiles map[string]struct{} // schemaKey of every file at that reconcile — to diff for newly-added files
+}
+
+// schemaKey identifies a file for schema derivation: its storage key and size. A different file
+// written at a known path (a restore, an edge-sync promote) has its footer read again rather
+// than inherit the old file's types. The key, not the URI: a file migrated to the cold tier keeps
+// its key and bytes and changes only its URI, and must not cost a cold GET (#939 B2).
+func schemaKey(key string, size int64) string {
+	return key + "\x00" + strconv.FormatInt(size, 10)
+}
+
+// refSchemaKey is schemaKey for a listed file; a source that sets no Key falls back to the URI.
+func refSchemaKey(f FileRef) string {
+	if f.Key != "" {
+		return schemaKey(f.Key, f.SizeBytes)
+	}
+	return schemaKey(f.PhysicalPath, f.SizeBytes)
+}
+
+// keyOfURIer is a source that can map a URI it produced back to its storage key.
+type keyOfURIer interface {
+	KeyOf(uri string) (string, bool)
 }
 
 // WriterGate gates the reconciler to a single node in cluster mode. nil means "no gate,
@@ -71,6 +95,8 @@ type FileSetSourceWithSchema interface {
 	// FilesAndLocal returns the measurement's data-file URIs and on-disk local paths from ONE
 	// backend listing (Files + LocalFiles would list twice).
 	FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error)
+	// FileSchema derives one listed file's schema from its footer, wherever the file is.
+	FileSchema(ctx context.Context, f FileRef) (ArcSchema, error)
 }
 
 // SchedulerConfig configures the reconcile scheduler.
@@ -185,8 +211,15 @@ func (s *Scheduler) runPass(ctx context.Context) {
 			awaitingMigration++
 			continue
 		}
+		// Re-checked per measurement, not only per pass: a pass over many measurements on
+		// object storage takes minutes, and a lease that moved meanwhile would otherwise leave
+		// two nodes writing the same tables until this one finished (#939).
+		if s.gate != nil && !s.gate.CanRun() {
+			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
+			return
+		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-		changed, err := s.reconcileOne(mctx, m, key)
+		changed, err := s.reconcileOneRecovered(mctx, m, key)
 		cancel()
 		switch {
 		case err != nil:
@@ -212,6 +245,25 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		event = event.Int("awaiting_namespace_migration", awaitingMigration)
 	}
 	event.Msg("Iceberg reconcile pass complete")
+}
+
+// reconcileOneRecovered runs reconcileOne and returns a panic on this
+// goroutine as the measurement's error, so one measurement whose files trip a
+// bug fails its pass instead of ending the process (the reconcile loop has no
+// other recover). Footer reads recover their own panics too (schemaFromReader),
+// including on worker goroutines this cannot reach.
+func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, key string) (changed bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// The stack is logged here, where it is; the returned error is
+			// logged by runPass as the measurement's failure.
+			s.logger.Error().Str("database", m.Database).Str("measurement", m.Measurement).
+				Str("panic", fmt.Sprint(r)).Str("stack", string(debug.Stack())).
+				Msg("Iceberg reconcile: recovered a panic")
+			changed, err = false, fmt.Errorf("reconcile panicked: %v", r)
+		}
+	}()
+	return s.reconcileOne(ctx, m, key)
 }
 
 // reconcileOne reconciles one measurement, returning whether it did work (changed=true) or was
@@ -268,14 +320,6 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		s.state[key] = measurementState{fingerprint: fp}
 		return true, nil
 	}
-	if len(localFiles) == 0 {
-		// Files exist but none are local, so we cannot derive a schema (cold-only measurement).
-		// Skip in v1 — documented limitation.
-		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).
-			Msg("Iceberg reconcile: no local file for schema derivation, skipping")
-		return false, nil
-	}
-
 	// Fingerprint the file set. Unchanged fingerprint + a cached schema => guaranteed no-op
 	// (same files in the table already), so skip the footer reads and the diff.
 	fp := fingerprint(files, localFiles)
@@ -284,35 +328,50 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		return false, nil
 	}
 
-	// The set changed (or first sight): derive the union schema. When we have a cached schema,
-	// only read footers of the LOCAL files that are new since last reconcile and merge them into
-	// the cached schema — avoiding an O(N) re-read of every footer every time the set grows.
-	// (Removed files can't remove columns: the table schema is a superset and all fields are
-	// optional, so dropping a file never narrows the schema.) First sight, or a cache with no
-	// remembered local set, falls back to a full UnionSchema.
-	var sc ArcSchema
-	if cached && prev.localFiles != nil {
-		var newLocal []string
-		for _, lp := range localFiles {
-			if _, ok := prev.localFiles[lp]; !ok {
-				newLocal = append(newLocal, lp)
-			}
-		}
-		if len(newLocal) == 0 {
-			sc = prev.schema // only removals — schema unchanged
-		} else {
-			addSc, err := UnionSchema(ctx, newLocal)
-			if err != nil {
-				return false, err
-			}
-			sc, err = MergeSchemas(prev.schema, addSc)
-			if err != nil {
-				return false, err
-			}
-		}
-	} else {
-		sc, err = UnionSchema(ctx, localFiles)
+	// The set changed (or first sight): derive the union schema, reading only the footers of
+	// files not already accounted for — avoiding an O(N) re-read of every footer every time the
+	// set grows, local or remote. (Removed files can't remove columns: the table schema is a
+	// superset and all fields are optional, so dropping a file never narrows the schema.)
+	//
+	// What is accounted for: with a cache, the files of the last reconcile. Without one (first
+	// sight, a restart), the table's own schema and the files its current snapshot holds at
+	// their size: a restart then reads no footer for an unchanged table, and on an object store
+	// it does not GET the tail of every file the measurement has ever exported.
+	base, known := prev.schema, prev.schemaFiles
+	if !cached || known == nil {
+		tableSc, tableFiles, ok, err := s.exporter.tableSeed(ctx, m.Database, m.Measurement)
 		if err != nil {
+			return false, err
+		}
+		base, known = ArcSchema{}, nil
+		if ok {
+			base = tableSc
+			known = make(map[string]struct{}, len(tableFiles))
+			keyer, _ := s.source.(keyOfURIer)
+			for uri, size := range tableFiles {
+				key := uri
+				if keyer != nil {
+					if k, ok := keyer.KeyOf(uri); ok {
+						key = k
+					}
+				}
+				known[schemaKey(key, size)] = struct{}{}
+			}
+		}
+	}
+	var unread []FileRef
+	for _, f := range files {
+		if _, ok := known[refSchemaKey(f)]; !ok {
+			unread = append(unread, f)
+		}
+	}
+	sc := base
+	if len(unread) > 0 {
+		addSc, err := s.unionFileSchemas(ctx, unread)
+		if err != nil {
+			return false, err
+		}
+		if sc, err = MergeSchemas(base, addSc); err != nil {
 			return false, err
 		}
 	}
@@ -340,19 +399,20 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		return true, nil
 	}
 
-	localSet := make(map[string]struct{}, len(localFiles))
-	for _, lp := range localFiles {
-		localSet[lp] = struct{}{}
+	schemaSet := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		schemaSet[refSchemaKey(f)] = struct{}{}
 	}
-	s.state[key] = measurementState{fingerprint: fp, schema: sc, localFiles: localSet}
+	s.state[key] = measurementState{fingerprint: fp, schema: sc, schemaFiles: schemaSet}
 	return true, nil
 }
 
 // fingerprint hashes the sorted union of the data files (path + size) and the local-file
 // paths. Any add, remove, or compaction changes the set and thus the hash; an unchanged set
-// hashes identically. Size is part of the key because the delete API's partial-match branch
-// rewrites a file IN PLACE (same path, fewer rows, #633): with paths alone that measurement
-// looked unchanged forever and the Iceberg manifest kept describing the old content.
+// hashes identically. Size is part of the key because a file can be rewritten at its own path:
+// the delete API's partial-match branch did that before #1073 publishes a fresh path (#633),
+// and restores and edge-sync still do. With paths alone such a measurement looked unchanged
+// forever and the Iceberg manifest kept describing the old content.
 func fingerprint(files []FileRef, localFiles []string) string {
 	parts := make([]string, 0, len(files)+len(localFiles))
 	for _, f := range files {
@@ -362,4 +422,37 @@ func fingerprint(files []FileRef, localFiles []string) string {
 	sort.Strings(parts)
 	h := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return hex.EncodeToString(h[:])
+}
+
+// unionFileSchemas derives the union schema of files through the source's FileSchema, reading
+// footers in parallel (bounded, as UnionSchema does) and folding them in the files' order so
+// column order and conflict detection do not depend on scheduling.
+func (s *Scheduler) unionFileSchemas(ctx context.Context, files []FileRef) (ArcSchema, error) {
+	schemas := make([]ArcSchema, len(files))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(unionSchemaConcurrency)
+	for i, f := range files {
+		g.Go(func() error {
+			if err := gctx.Err(); err != nil {
+				return err
+			}
+			sc, err := s.source.FileSchema(gctx, f)
+			if err != nil {
+				return fmt.Errorf("file %q: %w", f.PhysicalPath, err)
+			}
+			schemas[i] = sc
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return ArcSchema{}, err
+	}
+	var out ArcSchema
+	for _, sc := range schemas {
+		var err error
+		if out, err = MergeSchemas(out, sc); err != nil {
+			return ArcSchema{}, err
+		}
+	}
+	return out, nil
 }

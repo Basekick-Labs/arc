@@ -22,9 +22,10 @@ func (m *Manager) BeginDatabaseDelete() (func(), error) {
 	// the node that migrates, and the cycle can copy a hot file to cold after
 	// this delete has already swept that tier. Gating here rather than on the
 	// route keeps the no-gate modes correct by construction: roleGated() is
-	// false when no cluster gate is wired, which is deliberate for a
-	// local-storage cluster without replication, where each node's metadata is
-	// authoritative for its own disk and a delete on any node is legitimate.
+	// false when no cluster gate is wired. In a local-storage cluster without
+	// replication that is every writer; the databases handler refuses a
+	// writer that is not the primary before it gets here (#1599), since the
+	// cold tier and the manifest are shared even there.
 	if m.roleGated() {
 		return nil, ErrMigrationRoleGated
 	}
@@ -84,14 +85,16 @@ func (m *Manager) PrepareDatabaseDelete(ctx context.Context, database string, ho
 		ordered = append(ordered, path)
 	}
 	sort.Strings(ordered)
-	if err := m.notifyHotFilesRemoved(ordered); err != nil {
-		return fmt.Errorf("mark database files removed: %w", err)
-	}
+	// No notifyHotFilesRemoved here (#1186): that hook marks receipts
+	// COMPACTED, which says the content survives. A database delete marks
+	// the spoke's receipts REMOVED instead, from the databases handler,
+	// whether or not tiering is wired (DatabasesHandler.SetOnSpokeNamespaceRemoved).
 	// manifestReasonDatabaseDelete deliberately omits manifestReasonPrefix:
 	// the prefix is what makes a peer treat an unlink as a migration and probe
 	// the cold tier, which would mark this file cold moments before the cold
-	// object is deleted -- a permanent orphan row. Without it the peer goes
-	// straight to retireHotRow, which is what a genuine removal wants. Do not
+	// object is deleted -- an orphan row that stays until the peer's next cold
+	// sync retires it (#1563), and forever on a peer that does not. Without it
+	// the peer goes straight to retireHotRow, which is what a genuine removal wants. Do not
 	// "fix" the inconsistency with its neighbours.
 	for start := 0; start < len(ordered); start += manifestChunk {
 		end := min(start+manifestChunk, len(ordered))
@@ -111,6 +114,10 @@ func (m *Manager) CleanupDatabaseDelete(ctx context.Context, database string, ho
 	if m == nil || m.metadata == nil {
 		return 0, nil
 	}
+	// Cold objects go before their rows: keep the missing-object check off
+	// them meanwhile (#1551).
+	m.BeginColdRemoval()
+	defer m.EndColdRemoval()
 	rows, err := m.metadata.GetFilesByDatabase(ctx, database)
 	if err != nil {
 		return 0, []error{fmt.Errorf("read tier rows for database %q: %w", database, err)}

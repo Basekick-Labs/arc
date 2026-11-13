@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/edgesync"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -50,6 +51,12 @@ func newSyncTestRig(t *testing.T) *syncTestRig {
 }
 
 func newSyncTestRigWithSecrets(t *testing.T, spokeSecrets SpokeSecretLookup) *syncTestRig {
+	return buildSyncTestRig(t, spokeSecrets, nil, nil)
+}
+
+// buildSyncTestRig is newSyncTestRigWithSecrets with API-token auth: am and
+// rbac non-nil mount the real global auth middleware ahead of the routes.
+func buildSyncTestRig(t *testing.T, spokeSecrets SpokeSecretLookup, am *auth.AuthManager, rbac RBACChecker) *syncTestRig {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("", "api-sync-*")
@@ -81,6 +88,8 @@ func newSyncTestRigWithSecrets(t *testing.T, spokeSecrets SpokeSecretLookup) *sy
 		Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
 		HubID:        testHubID,
 		MaxFileBytes: 8 << 20,
+		AuthManager:  am,
+		RBAC:         rbac,
 		Logger:       zerolog.Nop(),
 	})
 	if err != nil {
@@ -90,6 +99,11 @@ func newSyncTestRigWithSecrets(t *testing.T, spokeSecrets SpokeSecretLookup) *sy
 	// A generous global limit so tests exercise the HANDLER's per-upload cap
 	// rather than fasthttp's default 4MB, which would mask it.
 	app := fiber.New(fiber.Config{DisableStartupMessage: true, BodyLimit: 32 << 20})
+	if am != nil {
+		mw := auth.DefaultMiddlewareConfig()
+		mw.AuthManager = am
+		app.Use(auth.NewMiddleware(mw))
+	}
 	h.RegisterRoutes(app)
 
 	return &syncTestRig{app: app, backend: backend}
@@ -106,6 +120,7 @@ type syncReq struct {
 	body                      []byte
 	macOverride               string
 	secret                    string
+	token                     string // Arc API token; "" sends none
 }
 
 func defaultReq(body []byte) syncReq {
@@ -155,6 +170,9 @@ func (r syncReq) do(t *testing.T, rig *syncTestRig) *http.Response {
 	httpReq.Header.Set(headerMAC, mac)
 	if r.offset > 0 {
 		httpReq.Header.Set(headerOffset, strconv.FormatInt(r.offset, 10))
+	}
+	if r.token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+r.token)
 	}
 
 	resp, err := rig.app.Test(httpReq, testRequestTimeoutMS)
@@ -868,6 +886,7 @@ type reconcileReqSpec struct {
 	body           []byte
 	macOverride    string
 	secret         string
+	token          string // Arc API token; "" sends none
 }
 
 func defaultReconcileReq(entries []edgesync.ReconcileEntry) reconcileReqSpec {
@@ -900,6 +919,9 @@ func (r reconcileReqSpec) do(t *testing.T, rig *syncTestRig) *http.Response {
 	req.Header.Set(headerTS, strconv.FormatInt(r.ts, 10))
 	req.Header.Set(headerMAC, mac)
 	req.Header.Set("Content-Type", "application/json")
+	if r.token != "" {
+		req.Header.Set("Authorization", "Bearer "+r.token)
+	}
 
 	resp, err := rig.app.Test(req, testRequestTimeoutMS)
 	if err != nil {

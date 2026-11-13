@@ -73,9 +73,38 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 		"poisonArrowStream",
 		"onComplete",
 		"onFail",
+		"checkEmittedQueryPermissions",
 	} {
 		if !calls[required] {
 			t.Errorf("native arcx Arrow hook missing call: %s", required)
 		}
 	}
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "arcx_hook.go", nil, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse arcx_hook.go: %v", err)
+	}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "tryArcxRouter" {
+			continue
+		}
+		found := false
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "checkEmittedQueryPermissions" {
+				found = true
+			}
+			return true
+		})
+		if !found {
+			t.Error("native arcx query hook does not recheck the resolved scope")
+		}
+		return
+	}
+	t.Error("tryArcxRouter missing from arcx_hook.go")
 }

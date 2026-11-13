@@ -7,6 +7,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/edgesync"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -26,6 +27,36 @@ type EdgeSyncAdminHandler struct {
 	registry    *edgesync.Registry
 	authManager *auth.AuthManager
 	logger      zerolog.Logger
+
+	// receipts and storage serve POST /:spokeID/forget (#1186); nil on a node
+	// that never wired them, where the route answers 503.
+	receipts receiptForgetter
+	storage  storage.Backend
+	// coldStorage returns this node's cold tier, or nil when it has none. A
+	// function because tiering is wired after this handler is built.
+	coldStorage func() storage.Backend
+}
+
+// receiptForgetter is the part of edgesync.HubIndex the forget route uses.
+type receiptForgetter interface {
+	ForgetRemoved(ctx context.Context, spokeID, database string) (int64, error)
+}
+
+// SetReceiptRecovery wires the hub index and this node's storage into the
+// forget route. Both are required; a nil either leaves the route at 503.
+func (h *EdgeSyncAdminHandler) SetReceiptRecovery(receipts receiptForgetter, backend storage.Backend) {
+	if receipts == nil || backend == nil {
+		return
+	}
+	h.receipts, h.storage = receipts, backend
+}
+
+// SetColdStorage lets the forget route's guard see the cold tier too: after
+// a delete whose cold cleanup failed part way, or a hot retention pass over a
+// compacted output whose sibling output has migrated, the hot prefix is empty
+// while content of the removed receipts survives in cold.
+func (h *EdgeSyncAdminHandler) SetColdStorage(fn func() storage.Backend) {
+	h.coldStorage = fn
 }
 
 // NewEdgeSyncAdminHandler validates configuration and returns a ready handler.
@@ -74,6 +105,7 @@ func (h *EdgeSyncAdminHandler) RegisterRoutes(app fiber.Router) {
 	group.Post("/:spokeID/enable", h.enable)
 	group.Post("/:spokeID/disable", h.disable)
 	group.Delete("/:spokeID", h.delete)
+	group.Post("/:spokeID/forget", h.forget)
 
 	h.logger.Info().Msg("Edge sync spoke admin routes registered")
 }
@@ -236,4 +268,94 @@ func spokeJSON(s *edgesync.Spoke) fiber.Map {
 		m["last_seen_at"] = *s.LastSeenAt
 	}
 	return m
+}
+
+type forgetReceiptsRequest struct {
+	// Database is the spoke-side database whose removed receipts are
+	// forgotten: the hub namespace {spoke}/{database}/.
+	Database string `json:"database"`
+}
+
+// forget handles POST /api/v1/sync-spokes/:spokeID/forget (#1186).
+//
+// The explicit recovery from a confirmed hub-side removal: it forgets the
+// spoke's REMOVED receipts under one database, so the hub reports those files
+// missing the next time the spoke asks about them. A spoke asks about a file
+// it already synced only when it verifies synced files (delete_after_sync),
+// which re-queues a missing one at once, or after its ledger retention prunes
+// the row and discovery finds the file again. Receipts that are only
+// compacted are kept (their content is still on the hub).
+//
+// Refused with 409 while the namespace still holds files, hot or cold:
+// removal marks are written before the files are deleted, so a delete that
+// failed part way can leave removed receipts next to a compacted output that
+// holds their content, and re-accepting the raw files there would duplicate
+// rows (#611). In practice it is the recovery from a whole-database delete;
+// after retention it is refused while newer files remain under the database.
+func (h *EdgeSyncAdminHandler) forget(c *fiber.Ctx) error {
+	if h.receipts == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "receipt recovery is not available on this node (no edge-sync hub index)",
+		})
+	}
+	spokeID := c.Params("spokeID")
+	var req forgetReceiptsRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	if storage.ValidateKeySegment(spokeID) != nil || spokeID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid spoke id"})
+	}
+	if req.Database == "" || storage.ValidateKeySegment(req.Database) != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required and must be one path segment"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), adminTimeout)
+	defer cancel()
+
+	prefix := spokeID + "/" + req.Database + "/"
+	present, err := namespaceHasFiles(ctx, h.storage, prefix)
+	if err == nil && !present && h.coldStorage != nil {
+		if cold := h.coldStorage(); cold != nil {
+			present, err = namespaceHasFiles(ctx, cold, prefix)
+		}
+	}
+	if err != nil {
+		h.logger.Error().Err(err).Str("spoke_id", spokeID).Str("database", req.Database).Msg("Could not check the namespace before forgetting receipts")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not check the namespace"})
+	}
+	if present {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "the namespace still holds files; delete them (or finish the database delete) before forgetting receipts, or the spoke's re-sent files could duplicate rows already on the hub",
+		})
+	}
+
+	n, err := h.receipts.ForgetRemoved(ctx, spokeID, req.Database)
+	if err != nil {
+		h.logger.Error().Err(err).Str("spoke_id", spokeID).Str("database", req.Database).Int64("forgotten", n).Msg("Failed to forget removed receipts")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to forget receipts", "forgotten": n})
+	}
+	h.logger.Info().Str("spoke_id", spokeID).Str("database", req.Database).Int64("forgotten", n).
+		Msg("Forgot removed edge-sync receipts; the spoke re-sends these files when it next asks about them (its next verification with delete_after_sync, otherwise after its ledger retention)")
+	return c.JSON(fiber.Map{"spoke_id": spokeID, "database": req.Database, "forgotten": n})
+}
+
+// namespaceHasFiles answers whether any object sits under prefix, with the
+// bounded probe when the backend has one.
+func namespaceHasFiles(ctx context.Context, backend storage.Backend, prefix string) (bool, error) {
+	var (
+		found bool
+		err   error
+	)
+	if p, ok := backend.(storage.PrefixProber); ok {
+		found, err = p.HasObjectsUnderPrefix(ctx, prefix)
+	} else {
+		var keys []string
+		keys, err = backend.List(ctx, prefix)
+		found = len(keys) > 0
+	}
+	if storage.IsStoreNotFound(err) {
+		return false, nil
+	}
+	return found, err
 }

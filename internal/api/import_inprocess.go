@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -42,7 +43,9 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	start := time.Now()
 
 	database, measurement, errResp := h.importPreamble(c)
-	if errResp != nil {
+	if errResp != nil || database == "" {
+		// A refusal is already written: its JSON call returns nil, so the
+		// empty database is what tells it from a pass (#1626).
 		return errResp
 	}
 
@@ -281,10 +284,11 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 	if len(upload.body) > maxForwardedImportBody {
 		return nil, &importError{StatusCode: fiber.StatusRequestEntityTooLarge, Message: fmt.Sprintf("file exceeds maximum import size of %d bytes", maxImportSize)}
 	}
-	// Admit before parsing the file: refused when fenced (#1207), or when its
+	// Admit before parsing the file: refused when fenced (#1207), when its
 	// size does not fit the WAL volume's free space (#676), which stays
-	// reserved for it until the import ends.
-	writeCtx, release, err := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(upload.body)))
+	// reserved for it until the import ends, or when the rows waiting to be
+	// flushed are near ingest.max_buffered_bytes (#1468).
+	writeCtx, release, err := h.arrowBuffer.AdmitImport(c.Context(), int64(len(upload.body)))
 	if err != nil {
 		return nil, err
 	}
@@ -391,7 +395,9 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 	start := time.Now()
 
 	database, measurement, errResp := h.importPreamble(c)
-	if errResp != nil {
+	if errResp != nil || database == "" {
+		// A refusal is already written: its JSON call returns nil, so the
+		// empty database is what tells it from a pass (#1626).
 		return errResp
 	}
 
@@ -430,10 +436,11 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "file is empty"})
 	}
 
-	// Admit before parsing the file: refused when fenced (#1207), or when
-	// its size does not fit the WAL volume's free space (#676), which stays
-	// reserved for it until the import ends.
-	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	// Admit before parsing the file: refused when fenced (#1207), when its
+	// size does not fit the WAL volume's free space (#676), which stays
+	// reserved for it until the import ends, or when the rows waiting to be
+	// flushed are near ingest.max_buffered_bytes (#1468).
+	writeCtx, release, aerr := h.arrowBuffer.AdmitImport(c.Context(), int64(len(data)))
 	if aerr != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, aerr)
@@ -474,20 +481,36 @@ var (
 	parquetBatchCells = 2_000_000
 )
 
+// openParquetFooter opens an uploaded Parquet file's footer; a test seam.
+var openParquetFooter = file.NewParquetReader
+
 // openImportParquet opens Parquet bytes for batched reads. Buffered streams
 // read a column chunk a buffer at a time; without them each row group's
 // column chunks are read into memory whole, whatever the batch size, and a
 // file written as one row group is read at once. Page streaming stays off:
 // it reuses buffers that string values would alias.
-func openImportParquet(data []byte) (*pqarrow.FileReader, *importError) {
+//
+// A malformed footer can panic inside the Parquet library instead of
+// returning an error; that is a corrupt upload, answered 422 like the others,
+// rather than a 500 from the server's recover middleware.
+func openImportParquet(data []byte) (fr *pqarrow.FileReader, ierr *importError) {
+	var pf *file.Reader
+	defer func() {
+		if r := recover(); r != nil {
+			if pf != nil {
+				_ = pf.Close()
+			}
+			fr, ierr = nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to read parquet file", Err: fmt.Errorf("corrupt file: %v", r)}
+		}
+	}()
 	props := parquet.NewReaderProperties(memory.DefaultAllocator)
 	props.BufferedStreamEnabled = true
-	pf, err := file.NewParquetReader(bytes.NewReader(data), file.WithReadProps(props))
+	pf, err := openParquetFooter(bytes.NewReader(data), file.WithReadProps(props))
 	if err != nil {
 		return nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to read parquet file", Err: err}
 	}
 	batch := chunkRows(parquetBatchRows, parquetBatchCells, pf.MetaData().Schema.NumColumns())
-	fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: int64(batch)}, memory.DefaultAllocator)
+	fr, err = pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: int64(batch)}, memory.DefaultAllocator)
 	if err != nil {
 		_ = pf.Close()
 		return nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to open parquet reader", Err: err}
@@ -719,7 +742,9 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 type fiberContext = context.Context
 
 // importPreamble validates the database/measurement and RBAC, returning a ready
-// error response if validation fails. Shared by CSV and Parquet handlers.
+// error response if validation fails. Shared by CSV and Parquet handlers. On a
+// refusal the response is already written and database is "": the error is
+// that of writing it, nil when it was sent, so callers test database too.
 func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 	// c.Get / c.Query are zero-copy aliases into the fasthttp request buffer.
 	// The database and measurement returned here are retained past the handler by
@@ -739,6 +764,10 @@ func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 	if !isValidDatabaseName(database) {
 		h.totalErrors.Add(1)
 		return "", "", c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)"})
+	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return "", "", c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	measurement := strings.Clone(c.Query("measurement"))

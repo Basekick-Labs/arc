@@ -55,6 +55,10 @@ type scanOpts struct {
 	windowNow   time.Time
 	// window is the range scanFiles read, for scanSet.
 	window *deleteWindow
+	// track is the request's missing-file account with allowUnreachable:
+	// a file nothing is delivering is waited for deleteGiveUpAfter, once per
+	// request (#1426). Nil without the flag.
+	track *missingTracker
 }
 
 func (o scanOpts) whereForWindow(scanned string) string {
@@ -221,7 +225,7 @@ func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement strin
 			kept = append(kept, fileInfo{queryPath: queryPath, relativePath: path})
 			shas[path] = e.SHA256
 		}
-		if len(absent) == 0 || !opts.wait || !time.Now().Before(deadline) {
+		if len(opts.track.waitFor(absent, time.Now())) == 0 || !opts.wait || !time.Now().Before(deadline) {
 			break
 		}
 		select {

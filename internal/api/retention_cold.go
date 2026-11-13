@@ -37,8 +37,9 @@ type coldRetention struct {
 	discoveryErr string // the candidate query itself failed
 	samples      []string
 
-	// Rows whose cold object was already gone. Not an error: the cold sync
-	// keeps such rows (it never retires one), so retention cleans them up.
+	// Rows whose cold object was already gone. Not an error: on the primary
+	// the cold sync keeps such rows (only a reader's retires them, #1563), so
+	// retention cleans them up.
 	staleRetired  int
 	staleReverted int // the file is in hot storage; the row now says hot
 
@@ -117,6 +118,9 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 	if c == nil || c.backend == nil {
 		return 0, 0, nil
 	}
+	if !dryRun {
+		defer beginColdRemoval(h.coldTier)()
+	}
 	var rows int64
 	var deleted, retire []string
 	for _, f := range c.files[measurement] {
@@ -181,6 +185,16 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 			rows += rowCount
 			deleted = append(deleted, f.Path)
 			continue
+		}
+		// Receipts before the delete (#1186). Cold copies of spoke files were
+		// marked compacted when they migrated (#687); deleting them leaves
+		// nothing, so they become removed. On failure keep the file for the
+		// next run rather than delete it unmarked.
+		if h.onSpokeFilesRemoved != nil {
+			if err := h.onSpokeFilesRemoved(ctx, []string{f.Path}); err != nil {
+				c.skip(f.Path, fmt.Errorf("mark edge-sync receipt removed: %w", err))
+				continue
+			}
 		}
 		del := c.backend.Delete
 		if h.coldDeleteHook != nil {

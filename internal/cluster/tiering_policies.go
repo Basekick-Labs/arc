@@ -65,27 +65,45 @@ func (s *TieringPolicySource) Delete(ctx context.Context, database string) error
 	return classifyPolicyError(s.c.DeleteTieringPolicy(ctx, database))
 }
 
-// classifyPolicyError sorts a policy write's error for the API: a missing
+// policyWriteErrors are one kind's API errors for a policy write that failed.
+// text is a fragment of the FSM's refusals of that kind's commands: a refusal
+// reaches a follower as the leader's text.
+type policyWriteErrors struct {
+	notFound, invalid, unavailable error
+	text                           string
+}
+
+var tieringWriteErrors = policyWriteErrors{
+	notFound: tiering.ErrPolicyNotFound, invalid: tiering.ErrInvalidPolicy,
+	unavailable: tiering.ErrClusterUnavailable, text: "tiering policy",
+}
+
+// classifyPolicyError sorts a tiering policy write's error for the API.
+func classifyPolicyError(err error) error {
+	return classifyPolicyErrorFor(err, tieringWriteErrors)
+}
+
+// classifyPolicyErrorFor sorts a policy write's error for the API: a missing
 // policy, a policy the cluster state refused (invalid, not worth retrying),
 // or anything else, which is the cluster not taking writes right now
 // (retry). A refusal reaches a follower as the leader's text, so it is
 // recognised by the apply-failed code and the FSM's own prefix.
-func classifyPolicyError(err error) error {
+func classifyPolicyErrorFor(err error, e policyWriteErrors) error {
 	if err == nil {
 		return nil
 	}
 	if raft.IsPolicyNotFound(err) {
-		return tiering.ErrPolicyNotFound
+		return e.notFound
 	}
 	refused := errors.Is(err, raft.ErrCommandRefused)
 	var fr *ForwardRejectedError
-	if errors.As(err, &fr) && fr.Code == protocol.ForwardCodeApplyFailed && strings.Contains(fr.Message, "tiering policy") {
+	if errors.As(err, &fr) && fr.Code == protocol.ForwardCodeApplyFailed && strings.Contains(fr.Message, e.text) {
 		refused = true
 	}
 	if refused {
-		return fmt.Errorf("%w: %v", tiering.ErrInvalidPolicy, err)
+		return fmt.Errorf("%w: %v", e.invalid, err)
 	}
-	return fmt.Errorf("%w: %v", tiering.ErrClusterUnavailable, err)
+	return fmt.Errorf("%w: %v", e.unavailable, err)
 }
 
 func tieringPolicyFromEntry(e raft.TieringPolicyEntry) tiering.DatabasePolicy {

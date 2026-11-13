@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/basekick-labs/arc/internal/iceberg"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -180,20 +181,18 @@ func (sc *scope) ownsPath(path string) bool {
 	return sc.has(first)
 }
 
-// icebergNamespaceDir is the Iceberg exporter's namespace directory for a
-// database: <nsPrefix>_<db>.db.
-func icebergNamespaceDir(nsPrefix, database string) string {
-	return nsPrefix + "_" + database + ".db"
-}
-
-// ownsIcebergNamespaceDir reports whether a depth-1 warehouse directory is the
-// Iceberg namespace of one of the scoped databases.
+// ownsIcebergNamespaceDir reports whether a depth-1 warehouse directory is an
+// Iceberg namespace of one of the scoped names. The rule is the exporter's
+// (iceberg.NamespaceDirOwnedBy), not a copy of it: a scope name is a storage-
+// root segment, and for an edge-sync spoke that one segment maps to one
+// namespace directory per inner database, none of them "<prefix>_<spoke>.db"
+// (#1202).
 func (sc *scope) ownsIcebergNamespaceDir(dir, nsPrefix string) bool {
 	if sc.empty() {
 		return true
 	}
 	for _, name := range sc.names {
-		if dir == icebergNamespaceDir(nsPrefix, name) {
+		if iceberg.NamespaceDirOwnedBy(dir, nsPrefix, name) {
 			return true
 		}
 	}
@@ -284,6 +283,24 @@ type ColdSource interface {
 	// already say hot, and these rows say cold. Same two-subset report and
 	// same all-or-nothing error as RecordRestoredColdFiles.
 	RecordRestoredHotFiles(ctx context.Context, sizes map[string]int64) (quarantined, failed []string, err error)
+}
+
+// coldRestoreGuard is an optional ColdSource capability (#1550): told before
+// a restore that may write to the cold tier starts and after it ends, so the
+// cold source can stop trusting its cold rows across the restore.
+// tiering.Manager implements it.
+type coldRestoreGuard interface {
+	// BeginColdRestore's error refuses the restore: the cold source could
+	// not record that its rows may become incomplete (#1550).
+	BeginColdRestore() error
+	EndColdRestore()
+}
+
+// coldWriteGuard is an optional ColdSource capability (#1552): a restore's
+// cold write runs inside it, which raises the cluster's cold mark first.
+// tiering.Manager implements it; its error refuses the write.
+type coldWriteGuard interface {
+	GuardColdWrite(ctx context.Context, keys []string, write func() error) error
 }
 
 // SetColdSource wires this node's cold tier for the cold walk and the cold

@@ -17,8 +17,9 @@ import (
 )
 
 // The crafted zstd frame of GHSA-fpmh-frq8-7rj8, sent to every write endpoint
-// that decodes zstd: each answers 400 and the server keeps serving. A decoder
-// panic on a goroutine of its own would kill this test binary.
+// that decodes zstd: each answers 400 and the server keeps serving. Since
+// klauspost/compress 1.20.2 the frame is a plain decode error;
+// TestDecompressZstdRecoversADecoderPanic covers a decoder panic.
 func TestWriteEndpointsRejectTheCraftedZstdFrame(t *testing.T) {
 	nop := zerolog.Nop()
 	backend, err := storage.NewLocalBackend(t.TempDir(), nop)

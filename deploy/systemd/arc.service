@@ -1,0 +1,29 @@
+# systemd unit shipped by the .deb, .rpm and Arch packages. All three
+# release-build jobs copy THIS file; do not inline a copy into the workflow
+# (three hand-kept copies is how #1463 reached all of them unnoticed).
+[Unit]
+Description=Arc Time-Series Database
+After=network.target
+
+[Service]
+Type=simple
+User=arc
+Group=arc
+ExecStart=/usr/bin/arc
+WorkingDirectory=/var/lib/arc
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# Environment
+# Backups must sit OUTSIDE the storage root, or Arc refuses to start
+# (#1463): arc.toml's relative "./data/backups" resolves to
+# /var/lib/arc/data/backups here, inside ARC_STORAGE_LOCAL_PATH.
+# Set in the unit, not arc.toml, so upgrades that keep an old arc.toml
+# (rpm %config(noreplace), pacman backup=) are covered too. Like the
+# storage path, it overrides arc.toml; change it with `systemctl edit arc`.
+Environment="ARC_STORAGE_LOCAL_PATH=/var/lib/arc/data"
+Environment="ARC_BACKUP_LOCAL_PATH=/var/lib/arc/backups"
+
+[Install]
+WantedBy=multi-user.target

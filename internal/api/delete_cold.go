@@ -49,6 +49,29 @@ type deleteColdTier interface {
 	ColdFilesForMeasurement(ctx context.Context, database, measurement string) ([]tiering.FileMetadata, error)
 	RetireColdRows(ctx context.Context, paths []string) (int, error)
 	RevertColdRowToHot(ctx context.Context, path string) error
+	// NotifyColdFilesRemoved tells tiering's listeners (query caches, the Iceberg export's
+	// cold listing, #939) that cold objects are gone.
+	NotifyColdFilesRemoved(n int)
+}
+
+// coldRemovalGuard is implemented by *tiering.Manager: a run that deletes
+// cold objects before retiring their rows brackets itself, so the cold
+// sync's missing-object check does not count rows it is about to retire
+// (#1551).
+type coldRemovalGuard interface {
+	BeginColdRemoval()
+	EndColdRemoval()
+}
+
+// beginColdRemoval begins a bracket on tier when it supports one and returns
+// its end.
+func beginColdRemoval(tier any) func() {
+	g, ok := tier.(coldRemovalGuard)
+	if !ok {
+		return func() {}
+	}
+	g.BeginColdRemoval()
+	return g.EndColdRemoval
 }
 
 // coldFile is one cold object a DELETE counted.
@@ -225,8 +248,9 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 		}
 	}
 
-	// Rows whose object is gone (#1350 review M2): cold sync never retires
-	// them, so a DELETE that looked would otherwise stat them on every run.
+	// Rows whose object is gone (#1350 review M2): on the primary the cold
+	// sync never retires them (only a reader's does, #1563), so a DELETE that
+	// looked would otherwise stat them on every run.
 	rows, err := tier.ColdFilesForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Debug().Err(err).Msg("Could not read cold rows to find ones whose object is gone")
@@ -365,6 +389,7 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 	if c == nil || c.backend == nil {
 		return
 	}
+	defer beginColdRemoval(h.coldTier)()
 	var retire []string
 	for _, f := range c.whole {
 		if ctx.Err() != nil {
@@ -411,6 +436,13 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			}
 			continue
 		}
+		// Receipt first (#1666): a cold copy of a spoke file was marked
+		// compacted when it migrated; with every row deleted nothing survives.
+		if err := h.markReceipt(ctx, f.path, true); err != nil {
+			h.logger.Error().Err(err).Str("file", f.path).Msg("Could not mark the edge-sync receipt of a cold file; left as it is")
+			c.failed = append(c.failed, f.path)
+			continue
+		}
 		if err := c.backend.Delete(ctx, f.path); err != nil {
 			// A delete can fail after the object went (a timed-out response).
 			if after, serr := c.backend.StatFile(ctx, f.path); serr != nil || after >= 0 {
@@ -454,6 +486,9 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			h.logger.Warn().Err(err).Int("removed", n).Int("rows", len(retire)).
 				Msg("Failed to retire cold tier rows; the next DELETE or retention run retires them")
 		}
+	}
+	if len(c.deleted) > 0 {
+		h.coldTier.NotifyColdFilesRemoved(len(c.deleted))
 	}
 }
 

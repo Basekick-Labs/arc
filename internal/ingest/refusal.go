@@ -1,11 +1,13 @@
 package ingest
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/logger"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -27,13 +29,32 @@ const (
 	// directory is at wal.max_directory_mb (#676); counted in
 	// arc_wal_disk_pressure_rejections_total.
 	RefusalWALDisk = "wal_disk"
-	// RefusalWALNotDurable: with wal.ack_mode = "durable", the write's WAL
-	// entry could not be made durable (write or sync failure, shutdown).
+	// RefusalWALNotDurable: with wal.ack_mode = "durable" (the resolved
+	// default with the WAL on, #1499), the write's WAL entry could not be
+	// made durable (write or sync failure, shutdown); counted in
+	// arc_wal_not_durable_rejections_total.
 	RefusalWALNotDurable = "wal_not_durable"
 	// RefusalImportQueue: a bulk import waited ingest.import_queue_timeout_ms
 	// for one of the node's import write slots (#1429).
 	RefusalImportQueue = "import_queue"
+	// RefusalBufferFull: the rows held for flushing reached
+	// ingest.max_buffered_bytes, because storage is not keeping up (#1468);
+	// counted in arc_ingest_buffer_full_rejections_total.
+	RefusalBufferFull = "buffer_full"
+	// RefusalLicenseGrace: the license expired and is on grace days 7-14,
+	// when live ingestion is refused until it is renewed; counted in
+	// arc_license_write_refusals_total.
+	RefusalLicenseGrace = "license_grace"
 )
+
+// ErrLicenseWritesStopped refuses a live write on grace days 7-14 of an
+// expired paid license. Nothing was written. It clears when the license is
+// renewed, or at the end of the grace period, when the node runs without
+// Enterprise features and accepts writes again.
+var ErrLicenseWritesStopped error = &WriteRefusal{
+	Reason: RefusalLicenseGrace,
+	Text:   "write refused: the Enterprise license expired and its grace period has stopped ingestion; renew the license to resume writes (see /health license.cutoff); nothing was written",
+}
 
 // WriteRefusal is a live write this node refuses for a local, transient
 // condition: the write was not accepted and the client should retry (#676).
@@ -74,6 +95,15 @@ var ErrImportQueueTimeout error = &WriteRefusal{
 	Text:   "import refused: every import write slot on this node stayed busy for ingest.import_queue_timeout_ms; nothing was written, retry",
 }
 
+// ErrBufferFull refuses a write request while the rows held for flushing are
+// at ingest.max_buffered_bytes (#1468): flushes are not keeping up, and taking
+// more would grow memory without bound. Retryable: it clears as flushes
+// complete. Checked once per request, before any of it is written.
+var ErrBufferFull error = &WriteRefusal{
+	Reason: RefusalBufferFull,
+	Text:   "write refused: rows waiting to be flushed reached ingest.max_buffered_bytes (storage is not keeping up, see arc_buffer_bytes_buffered); nothing was written, retry",
+}
+
 // ErrWALNotDurable refuses a live write whose WAL entry could not be made
 // durable in wal.ack_mode = "durable". Retryable.
 var ErrWALNotDurable error = &WriteRefusal{
@@ -83,7 +113,13 @@ var ErrWALNotDurable error = &WriteRefusal{
 
 // walNotDurable wraps a WAL ErrNotDurable as a not-durable refusal, keeping
 // the cause in the text.
-func walNotDurable(err error) error {
+// walNotDurable is the refusal of a write whose WAL entry could not be made
+// durable, counted once per write: a retry of the same message under
+// WithRefusalCounted (MQTT) is not counted again, as for the other refusals.
+func walNotDurable(ctx context.Context, err error) error {
+	if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
+		metrics.Get().IncWALNotDurableRejections()
+	}
 	return &WriteRefusal{
 		Reason: RefusalWALNotDurable,
 		Text:   "write refused: the WAL entry could not be made durable (" + err.Error() + "); if it reached the WAL file it may still be replayed at the next start, so a retry can duplicate it",
@@ -207,6 +243,12 @@ func (l *refusalLog) record(reason, source string, err error) {
 func refusalLogMessage(reason string) string {
 	if reason == RefusalWALDisk || reason == "forwarded_"+RefusalWALDisk {
 		return "Writes refused on this node (retryable): WAL volume disk pressure; logged once per reason every 30s, see arc_wal_disk_pressure and arc_wal_disk_pressure_rejections_total"
+	}
+	if reason == RefusalLicenseGrace || reason == "forwarded_"+RefusalLicenseGrace {
+		return "Writes refused on this node: the license expired and its grace period stops ingestion until it is renewed; logged once per reason every 30s, see /health license and arc_license_write_refusals_total"
+	}
+	if reason == RefusalBufferFull || reason == "forwarded_"+RefusalBufferFull {
+		return "Writes refused on this node (retryable): rows waiting to be flushed reached ingest.max_buffered_bytes; logged once per reason every 30s, see arc_buffer_bytes_buffered and arc_ingest_buffer_full_rejections_total"
 	}
 	return "Writes refused on this node (retryable); logged once per reason every 30s, see arc_cluster_ingest_fenced_writes_total"
 }

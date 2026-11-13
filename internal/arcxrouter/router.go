@@ -35,6 +35,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/basekick-labs/arc/internal/arcxengine"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -44,6 +45,7 @@ import (
 // explicitly so query.go exposes no new exported methods.
 type Deps struct {
 	Storage storage.Backend
+	Pruner  *pruning.PartitionPruner
 	// Exclude names storage keys under a "db/measurement/" prefix the engine
 	// must not read: one side of each compaction whose output and inputs are
 	// both in storage (api.wrapOpenCompactions). Optional.
@@ -95,6 +97,14 @@ type Metrics interface {
 	// agg-4: a shadow diff confined to arg_max/arg_min cells (tie-divergence
 	// candidate — WARN-class, never the mismatch alarm).
 	ArcxShadowArgDivergence(shape string)
+	// ArcxShadowOracleDivergence: a value-only difference beyond tolerance on an
+	// aggregate where DuckDB 1.5.6 disagrees with ITSELF across thread counts
+	// (agg-6b: covar_pop, covar_samp, regr_sxy, regr_intercept under
+	// cancellation). WARN + metric, never the mismatch alarm.
+	ArcxShadowOracleDivergence(shape string)
+	// ArcxShadowTieDivergence: a grouped top-N whose LIMIT cut fell inside a tie
+	// class returned a different (equally valid) member of that class (res-2).
+	ArcxShadowTieDivergence(shape string)
 	ArcxShadowError(shape string)
 	// ArcxServeError: an engine failure on the SERVE path. Separate from
 	// ArcxShadowError because feeding both into one counter made a serve-mode
@@ -130,17 +140,29 @@ type Decision struct {
 	Preds     []scanPred     // scan only: AND-conjoined WHERE predicates (flat case)
 	WhereText string         // re-serialized WHERE: boolean tree for scan (2b-2), or a time-range filter for date_trunc agg (PR-A)
 	OrderBy   []scanOrderKey // scan only: ORDER BY keys
-	Limit     int            // scan only: LIMIT n (0 = none)
+	Limit     int            // LIMIT n: scan (0 = none); grouped only under HasLimit (res-2)
 	AggItems  []string       // scan_agg only: re-serialized aggregate items, select-list order
-	GroupKey  string         // scan_agg_grouped only: the single group-key column (or the rebuilt bucket text)
+	// res-1: per-item `AS` alias ("" = none), parallel to AggItems; AggItems stay
+	// the bare call text (HAVING matching, tolerance and key detection read them).
+	AggAliases []string
+	// res-1: alias of the single aggregate of a footer shape (count(*), min/max/count).
+	AggAlias string
+	GroupKey string // scan_agg_grouped only: the single group-key column (or the rebuilt bucket text)
 	// agg-3 bucket key parts (empty = bare tag key) — the builder re-emits from
 	// these validated parts, never from GroupKey's text.
 	BucketUnit string
 	BucketCol  string
-	// agg-3c: the ordered KEY's 1-based select position (0 = no ORDER BY);
-	// the builder emits `ORDER BY <this position>` ascending after validating
-	// it points at a key item.
-	OrderByItem int
+	// res-2 (was agg-3c's single ascending OrderByItem): grouped ORDER BY keys
+	// by 1-based select position. The builder re-validates each position and
+	// emits direction and null order explicitly. HasLimit carries an explicit
+	// grouped LIMIT in Limit (LIMIT 0 is a real limit — adversarial B2).
+	OrderKeys []OrderKey
+	HasLimit  bool
+	// tieBreakOracle (shadow only, never set by the recognizer): build the
+	// DuckDB verification query for a top-N tie at the cut — the engine SQL with
+	// union_by_name=true and the engine's tie-break (every group key, GROUP BY
+	// order, ASC NULLS LAST) appended, so DuckDB's answer is deterministic.
+	tieBreakOracle bool
 	// agg-3c: the rebuilt bucket item text is NOT carried — the builder
 	// rebuilds it from the validated parts below; GroupKey holds the TAG key
 	// ("" = no tag key).
@@ -150,6 +172,19 @@ type Decision struct {
 	BucketAlias    string
 	// agg-5a: re-serialized HAVING over the select items ("" = none).
 	HavingText string
+	// res-3: non-empty when the HAVING references an item whose DuckDB value
+	// legitimately moves between runs — "arg" (arg_*/max_by/min_by ties) or
+	// "oracle" (Kahan sums, covar_pop/covar_samp/regr_sxy/regr_intercept, shape
+	// statistics). Such a HAVING can put a group in one side's result and not the
+	// other's; the shadow files a one-sided group as argdiff/oraclediff (WARN)
+	// instead of a row-count mismatch, while groups on both sides still compare
+	// with the normal cell rules. The recognizer refuses these with LIMIT or an
+	// aggregate ORDER BY target.
+	HavingUnstable string
+	// res-3b: the number of aggregates the HAVING references that are not in the
+	// select list (hidden items the engine computes and projects away). Non-zero
+	// allows a select list with no aggregate at all.
+	HavingHidden int
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -189,13 +224,18 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		Preds:          m.preds,
 		WhereText:      m.whereText,
 		HavingText:     m.havingText,
+		HavingUnstable: m.havingUnstable,
+		HavingHidden:   m.havingHidden,
 		OrderBy:        m.orderBy,
 		Limit:          m.limit,
 		AggItems:       m.aggItems,
+		AggAliases:     m.aggAliases,
+		AggAlias:       m.aggAlias,
 		GroupKey:       m.groupKey,
 		BucketUnit:     m.bucketUnit,
 		BucketCol:      m.bucketCol,
-		OrderByItem:    m.orderByItem,
+		OrderKeys:      m.orderKeys,
+		HasLimit:       m.hasLimit,
 		EpochWidthSecs: m.epochWidthSecs,
 		BucketAlias:    m.bucketAlias,
 	}
@@ -279,18 +319,9 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	basePath := local.GetBasePath()
 
 	prefix := d.Ctx.Database + "/" + d.Ctx.Measurement + "/"
-	// Before the listing: a job's inputs are named only once its output is in
-	// storage, so a listing taken after always holds that output.
-	var skip map[string]struct{}
-	if h.Exclude != nil {
-		for _, k := range h.Exclude(ctx, prefix) {
-			if skip == nil {
-				skip = map[string]struct{}{}
-			}
-			skip[k] = struct{}{}
-		}
-	}
-	entries, err := h.Storage.List(ctx, prefix)
+	entries, err := engineQueryEntries(
+		ctx, local, d.Shape, d.Ctx.Database, d.Ctx.Measurement, d.WhereText, d.Preds, h.Pruner, h.Exclude,
+	)
 	if err != nil {
 		h.Logger.Warn().Err(err).Str("prefix", prefix).Msg("arcx: storage list failed; declining")
 		return "", false
@@ -299,12 +330,6 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	arr.WriteByte('[')
 	n := 0
 	for _, e := range entries {
-		if !strings.HasSuffix(e, ".parquet") {
-			continue
-		}
-		if _, ok := skip[e]; ok {
-			continue
-		}
 		if n > 0 {
 			arr.WriteString(", ")
 		}
@@ -321,7 +346,11 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 
 	switch d.Shape {
 	case ShapeCountStar:
-		return "SELECT count(*) FROM read_parquet(" + arr.String() + ")", true
+		as, ok := aliasSuffix(d.AggAlias)
+		if !ok {
+			return "", false
+		}
+		return "SELECT count(*)" + as + " FROM read_parquet(" + arr.String() + ")", true
 	case ShapeDateTruncCent:
 		// Unit spelling preserved verbatim so the engine reproduces DuckDB's
 		// derived column name. Column is the "time" convention (F1). An optional
@@ -347,7 +376,11 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 			return "", false
 		}
 		fn := map[string]string{ShapeMinCol: "min", ShapeMaxCol: "max", ShapeCountCol: "count"}[d.Shape]
-		return "SELECT " + fn + "(" + d.Col + ") FROM read_parquet(" + arr.String() + ")", true
+		as, ok := aliasSuffix(d.AggAlias)
+		if !ok {
+			return "", false
+		}
+		return "SELECT " + fn + "(" + d.Col + ")" + as + " FROM read_parquet(" + arr.String() + ")", true
 	case ShapeScan:
 		return buildScanSQL(d, arr.String())
 	case ShapeScanAgg:
@@ -357,6 +390,25 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// aliasSuffix renders ` AS <alias>` for a re-validated res-1 alias ("" → "").
+func aliasSuffix(a string) (string, bool) {
+	if a == "" {
+		return "", true
+	}
+	if !isAggAlias(a) {
+		return "", false
+	}
+	return " AS " + a, true
+}
+
+// itemAlias returns the alias for item i ("" when the slice is shorter).
+func itemAlias(aliases []string, i int) string {
+	if i < len(aliases) {
+		return aliases[i]
+	}
+	return ""
 }
 
 // buildScanAggSQL constructs the engine SQL for an ungrouped aggregation (agg-1):
@@ -381,6 +433,11 @@ func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
 			b.WriteString(", ")
 		}
 		b.WriteString(item)
+		as, ok := aliasSuffix(itemAlias(d.AggAliases, i))
+		if !ok {
+			return "", false
+		}
+		b.WriteString(as)
 	}
 	b.WriteString(" FROM read_parquet(")
 	b.WriteString(pathArray)
@@ -437,7 +494,7 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	if bucketText == "" && tagText == "" {
 		return "", false
 	}
-	if len(d.AggItems) < 2 {
+	if len(d.AggItems) < 2 && d.HavingHidden == 0 {
 		return "", false
 	}
 	sawBucket, sawTag, sawAgg := false, false, false
@@ -445,9 +502,12 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	var b strings.Builder
 	b.WriteString("SELECT ")
 	for i, item := range d.AggItems {
+		alias := itemAlias(d.AggAliases, i)
 		switch {
 		case isAggItem(item):
 			sawAgg = true
+		case alias != "":
+			return "", false // res-1: aliases ride aggregate items only
 		case bucketText != "" && item == bucketText && !sawBucket:
 			sawBucket = true
 			keyPositions = append(keyPositions, i+1)
@@ -461,19 +521,29 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 			b.WriteString(", ")
 		}
 		b.WriteString(item)
+		as, ok := aliasSuffix(alias)
+		if !ok {
+			return "", false
+		}
+		b.WriteString(as)
 	}
-	if !sawAgg || (bucketText != "" && !sawBucket) || (tagText != "" && !sawTag) {
+	// res-3b: a select list without an aggregate is valid only when the HAVING
+	// carries one (a hidden item) — never a bare DISTINCT.
+	if (!sawAgg && (d.HavingHidden == 0 || d.HavingText == "")) || (bucketText != "" && !sawBucket) || (tagText != "" && !sawTag) {
 		return "", false
 	}
 	b.WriteString(" FROM read_parquet(")
 	b.WriteString(pathArray)
+	if d.tieBreakOracle {
+		b.WriteString(", union_by_name=true") // what Arc's own reads use
+	}
 	b.WriteString(")")
 	if d.WhereText != "" {
 		b.WriteString(" WHERE ")
 		b.WriteString(d.WhereText)
 	}
 	// GROUP BY / ORDER BY by POSITION: valid for every key form and emits no
-	// identifier text at all. ORDER BY must point at a KEY position.
+	// identifier text at all.
 	b.WriteString(" GROUP BY ")
 	for i, kp := range keyPositions {
 		if i > 0 {
@@ -489,25 +559,57 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 		b.WriteString(" HAVING ")
 		b.WriteString(d.HavingText)
 	}
-	if d.OrderByItem != 0 {
-		ok := false
-		for _, kp := range keyPositions {
-			if d.OrderByItem == kp {
-				ok = true
-			}
-		}
-		if !ok {
+	if len(d.OrderKeys) > maxOrderKeys || (d.HasLimit && len(d.OrderKeys) == 0) {
+		return "", false
+	}
+	for i, k := range d.OrderKeys {
+		if k.Pos < 1 || k.Pos > len(d.AggItems) || orderTargetRefused(d.AggItems[k.Pos-1]) {
 			return "", false
 		}
-		b.WriteString(" ORDER BY ")
-		b.WriteString(strconv.Itoa(d.OrderByItem))
+		if i == 0 {
+			b.WriteString(" ORDER BY ")
+		} else {
+			b.WriteString(", ")
+		}
+		b.WriteString(strconv.Itoa(k.Pos))
+		// Direction and null order always explicit (DuckDB's defaults are
+		// ASC / NULLS LAST; the engine assumes exactly those).
+		if k.Desc {
+			b.WriteString(" DESC")
+		} else {
+			b.WriteString(" ASC")
+		}
+		if k.NullsFirst {
+			b.WriteString(" NULLS FIRST")
+		} else {
+			b.WriteString(" NULLS LAST")
+		}
+	}
+	if d.tieBreakOracle {
+		if len(d.OrderKeys) == 0 {
+			return "", false
+		}
+		for _, kp := range keyPositions {
+			b.WriteString(", ")
+			b.WriteString(strconv.Itoa(kp))
+			b.WriteString(" ASC NULLS LAST")
+		}
+	}
+	if d.HasLimit {
+		if d.Limit < 0 || d.Limit > maxTopNLimit {
+			return "", false
+		}
+		b.WriteString(" LIMIT ")
+		b.WriteString(strconv.Itoa(d.Limit))
 	}
 	return b.String(), true
 }
 
-// isAggItem re-validates one re-serialized aggregate item: `count(*)`, or
-// `{count|sum|min|max|avg}(<bare ident>)` with the fn lowercased — exactly what
-// matchScanAgg emits.
+// isAggItem re-validates one re-serialized aggregate item: `count(*)`,
+// `{count|sum|min|max|avg}(<bare ident>)` or `count(<ident>['<key>'])` (map-2) with
+// the fn lowercased — exactly what matchScanAgg emits. The grouped matcher never
+// emits the subscript form (its agg arm requires `)` right after the ident), so
+// the gate for grouped map aggregates is that matcher, not this re-check.
 func isAggItem(item string) bool {
 	if item == "count(*)" {
 		return true
@@ -517,13 +619,33 @@ func isAggItem(item string) bool {
 		return false
 	}
 	inner := item[open+1 : len(item)-1]
-	switch item[:open] {
-	case "count", "sum", "min", "max", "avg":
+	fn := item[:open]
+	switch {
+	// `count` also takes a map subscript `m['k']` (map-2) and the cd-1 form
+	// `DISTINCT <col>` (exactly readCountDistinct's emission); every other unary
+	// aggregate (agg-1 set, mean, the agg-6a moments) stays bare.
+	case fn == "count":
+		if col, ok := strings.CutPrefix(inner, "DISTINCT "); ok {
+			return isColumnRef(col)
+		}
+		return isColumnRef(inner)
+	// agg-7: `quantile_*(col, q)` — exactly a bare ident and a fraction.
+	case quantileAggFns[fn]:
+		a, q, ok := strings.Cut(inner, ", ")
+		if !ok || !isBareIdent(a) || strings.Contains(a, ".") {
+			return false
+		}
+		toks, tok := tokenize(q)
+		return tok && len(toks) == 1 && isQuantileLit(toks[0]) && toks[0].orig == q
+	// agg-6b2: a predicate argument must re-parse to exactly itself.
+	case predArgAggFns[fn] && !isBareIdent(inner):
+		return isPredArgItem(item)
+	case unaryAggFns[fn]:
 		return isBareIdent(inner)
 	// agg-4: the two-arg by-time aggregates — EXACTLY two bare idents,
 	// re-serialized as `fn(a, b)`. The 3-arg top-N form, arg_max_null, and
 	// no-underscore argmax/argmin exist on DuckDB and must NOT match.
-	case "arg_max", "arg_min", "max_by", "min_by":
+	case twoArgAggFns[fn] || binaryMomentFns[fn]:
 		a, b, ok := strings.Cut(inner, ", ")
 		return ok && isBareIdent(a) && isBareIdent(b)
 	}
@@ -536,6 +658,38 @@ func isAggItem(item string) bool {
 // choice is run-to-run nondeterministic at high thread counts (oracle-probed)
 // while arcx is pinned deterministic, so ambiguous ties diverge legitimately
 // (~0.1% of groups on real data).
+// isOracleUnstableItem reports whether a re-serialized item is one of the four
+// agg-6b aggregates whose DuckDB 1.5.6 result moves across thread counts by more
+// than the 1e-9 tolerance under cancellation (a covariance near zero at large
+// mean/σ; an intercept far smaller than slope·x̄ — measured 2.3e-9 … 1.6e-5,
+// plannings/arcX agg-6b plan, adversarial B1). A value-only difference on these
+// cells is filed as `oraclediff:` (WARN), the `argdiff:` precedent; NULL-ness,
+// NaN-ness and kind differences still alarm.
+func isOracleUnstableItem(item string) bool {
+	// agg-6b' adds the Kahan sums: on cancelling data DuckDB's own fsum swings by
+	// orders of magnitude across thread counts (plan-adversarial M1).
+	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept(",
+		"fsum(", "sumkahan(", "kahan_sum(", "favg("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPinnedNaNItem: the three bivariate aggregates whose DuckDB answer for ±Inf input
+// depends on its own partitioning (arcX moments-nd M3). arcx pins them to NaN on any
+// non-finite input, so arcx NaN vs a DuckDB ±Inf on these is the known divergence and
+// is filed as `oraclediff:` (WARN), not a mismatch alarm.
+func isPinnedNaNItem(item string) bool {
+	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func isArgItem(item string) bool {
 	for _, p := range []string{"arg_max(", "arg_min(", "max_by(", "min_by("} {
 		if strings.HasPrefix(item, p) {
@@ -549,7 +703,8 @@ func isArgItem(item string) bool {
 //
 //	SELECT <cols> FROM read_parquet([<paths>]) [WHERE <col> <op> <lit> AND ...]
 //
-// Every column (projection AND predicate) must be a bare identifier — they came
+// Every column (projection AND predicate) must be a bare identifier or a map
+// subscript `col['key']` (map-1; isColumnRef) — they came
 // from the tokenizer as identifiers, so injection-safe by construction, but we
 // guard defensively. String literals are single-quote escaped; numeric literals
 // are validated as integers. Declines (ok=false) on any non-bare column or
@@ -565,7 +720,7 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 		// re-serialized by matchProjFunc (`length(col)`, 2f-0). Re-validate both here
 		// (defense in depth vs a hand-built Decision) — a bare ident, or a proj-func
 		// item whose form re-parses cleanly.
-		if !isBareIdent(col) && !isProjFuncItem(col) {
+		if !isColumnRef(col) && !isProjFuncItem(col) {
 			return "", false
 		}
 		if i > 0 {
@@ -586,7 +741,7 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	} else if len(d.Preds) > 0 {
 		b.WriteString(" WHERE ")
 		for i, p := range d.Preds {
-			if !isBareIdent(p.col) {
+			if !isColumnRef(p.col) {
 				return "", false
 			}
 			if i > 0 {
@@ -767,12 +922,38 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		// here too) is recorded in the agg-4 plan doc; a WARN-rate spike is
 		// itself the signal, and the differential harness carries the strict
 		// membership checks.
+		//
+		// agg-8 shape statistics (skewness/kurtosis/kurtosis_pop) go further:
+		// ANY cell difference (value, NULL-ness, NaN-ness) is oraclediff, because
+		// DuckDB 1.5.6's raw sums are garbage on constant/high-offset data. The
+		// accepted residual risk: a real engine bug in those three never alarms
+		// here — the engine's exact-reference fixtures are the guard, and an
+		// oraclediff-rate spike (log message names the column) is the signal.
 		if strings.HasPrefix(diff, skipPrefix) {
 			// The comparator could not render the arcx side (host-side failure).
 			// Same reasoning as errShadowAssembly above: never the mismatch alarm.
 			h.Logger.Warn().Str("shape", d.Shape).Str("reason", strings.TrimPrefix(diff, skipPrefix)).
 				Msg("arcx shadow: skipped, could not render the arcx result")
 			h.Metrics.ArcxShadowSkipped(d.Shape, metrics.ShadowSkippedHost)
+			return
+		}
+		if strings.HasPrefix(diff, "oraclediff:") {
+			h.Logger.Warn().
+				Str("shape", d.Shape).
+				Str("diff", strings.TrimPrefix(diff, "oraclediff:")).
+				Msg("arcx shadow: divergence on an oracle-unstable aggregate — value drift, or NULL/NaN-ness on a shape statistic (values withheld)")
+			h.Metrics.ArcxShadowOracleDivergence(d.Shape)
+			return
+		}
+		if strings.HasPrefix(diff, "tiediff:") {
+			// res-2: a top-N whose LIMIT cut falls inside a tie class. DuckDB
+			// picks among tied groups arbitrarily; arcx breaks ties by group key.
+			// Every row outside the cut's tie class matched.
+			h.Logger.Warn().
+				Str("shape", d.Shape).
+				Str("diff", strings.TrimPrefix(diff, "tiediff:")).
+				Msg("arcx shadow: top-N tie at the LIMIT cut (values withheld)")
+			h.Metrics.ArcxShadowTieDivergence(d.Shape)
 			return
 		}
 		if strings.HasPrefix(diff, "argdiff:") {
@@ -795,6 +976,67 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	h.Metrics.ArcxShadowMatch(d.Shape)
 }
 
+// columnNameDiff compares DuckDB's result column names with arcx's ("" = same;
+// index only in the message — names may be data-bearing). One pre-existing
+// divergence is exempted by NAME, so it covers every shape and nothing else: Arc's
+// epoch-math rewrite of a `date_trunc` bucket (internal/api/query.go) makes
+// DuckDB name that column after the rewritten `make_timestamptz(…)` expression
+// while arcx names it `date_trunc(…)` — the unaliased bucket of both the grouped
+// and the `date_trunc_count` shapes (an aliased bucket is named identically).
+// Tracked as a follow-up: the rewrite should alias back to the native name.
+func columnNameDiff(oracleCols []string, rec arrow.Record) string {
+	if len(oracleCols) != int(rec.NumCols()) {
+		return "" // the cell comparators report the arity difference
+	}
+	for i, c := range oracleCols {
+		a := rec.ColumnName(i)
+		if a == c {
+			continue
+		}
+		if strings.HasPrefix(c, "make_timestamptz(") && strings.HasPrefix(a, "date_trunc(") {
+			continue
+		}
+		return "result column " + strconv.Itoa(i) + " name differs (names withheld)"
+	}
+	return ""
+}
+
+// verifyTopNTie: the user's query (DuckDB's answer) kept a different member of
+// the tie class at the LIMIT cut. Rows only arcx returned were never checked
+// against anything (review H1: a top-N heap that keeps the evicted value puts
+// a WRONG row exactly there), so re-ask DuckDB deterministically — the engine
+// SQL with the engine's own tie-break — and require a row-for-row match. Only
+// then is the divergence the legitimate tie choice (`tiediff`). Runs only on a
+// tie at the cut; any other ordered result needs no second query.
+func (h Deps) verifyTopNTie(ctx context.Context, d Decision, rec arrow.Record, keyCols []int, tieDiff string) (string, error) {
+	vd := d
+	vd.tieBreakOracle = true
+	sql, ok := h.buildEngineSQL(ctx, vd)
+	if !ok {
+		return skipPrefix + "could not build the top-N tie verification query", nil
+	}
+	rows, err := h.DB.QueryContext(ctx, sql)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	oracle, err := groupedFromRows(rows, keyCols)
+	if err != nil {
+		return "", err
+	}
+	switch v := compareGroupedOrderedMode(rec, oracle, d.AggItems, keyCols, d.OrderKeys, d.HasLimit, d.Limit, true); {
+	case strings.HasPrefix(v, "argdiff:"), strings.HasPrefix(v, "oraclediff:"), strings.HasPrefix(v, skipPrefix):
+		return v, nil // a WARN-class cell policy, or our own failure: never upgraded
+	case v == "", strings.HasPrefix(v, "tiediff:"):
+		// "" — exact match under the tie-break; tiediff here can only be a
+		// near-tie on a tolerant float last key, where the engines may round
+		// apart by the documented tolerance.
+		return tieDiff, nil
+	default:
+		return "top-N tie verification: " + v, nil
+	}
+}
+
 // compareToOracle runs the DuckDB oracle for this query and compares its result to
 // arcx's `rec`, returning the diff string ("" == match) or an oracle error. Scalar
 // shapes (min/max/count(col)) use the single-cell comparison; count(*)/agg use the
@@ -805,6 +1047,15 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		return "", err
 	}
 	defer rows.Close()
+
+	// res-1 (adversarial M3): result column NAMES reach clients verbatim, and
+	// aliases make them user-controlled — compare them too (the cell comparators
+	// below are positional).
+	if cols, err := rows.Columns(); err == nil {
+		if diff := columnNameDiff(cols, rec); diff != "" {
+			return diff, nil
+		}
+	}
 
 	if d.Shape == ShapeScan {
 		oracle, err := scanRowsFromRows(rows)
@@ -834,7 +1085,19 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		if err != nil {
 			return "", err
 		}
-		return compareGrouped(rec, oracle, d.AggItems, keyCols), nil
+		if len(d.OrderKeys) > 0 && d.HavingUnstable != "" {
+			// res-3: key-only ORDER BY, no LIMIT (recognizer-enforced).
+			return compareGroupedKeyOrdered(rec, oracle, d.AggItems, keyCols, d.OrderKeys, d.HavingUnstable), nil
+		}
+		if len(d.OrderKeys) > 0 {
+			// res-2: the order is part of the answer — never re-sorted.
+			diff := compareGroupedOrdered(rec, oracle, d.AggItems, keyCols, d.OrderKeys, d.HasLimit, d.Limit)
+			if strings.HasPrefix(diff, "tiediff:") {
+				return h.verifyTopNTie(ctx, d, rec, keyCols, diff)
+			}
+			return diff, nil
+		}
+		return compareGrouped(rec, oracle, d.AggItems, keyCols, d.HavingUnstable), nil
 	}
 	if isScalarShape(d.Shape) {
 		oracle, err := scalarFromRows(rows)

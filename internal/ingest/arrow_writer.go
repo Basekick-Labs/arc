@@ -251,6 +251,17 @@ func NewArrowWriter(cfg *config.IngestConfig, logger zerolog.Logger) *ArrowWrite
 	if cfg.DataPageVersion == "2.0" {
 		writerOpts = append(writerOpts, parquet.WithDataPageVersion(parquet.DataPageV2))
 	}
+	// Row-group cap: one flush (one Arrow record) used to be one row group, so
+	// an hourly file had a single 3.3 M-row group — no min/max pruning inside
+	// the file and one work item per file for every reader. 0 keeps that
+	// writer default; the configured default is 524288 (free on the sustained
+	// msgpack benchmark; compaction's 122880 measured 1.7 % there).
+	if cfg.MaxRowGroupRows > 0 {
+		writerOpts = append(writerOpts, parquet.WithMaxRowGroupLength(int64(cfg.MaxRowGroupRows)))
+	}
+	if cfg.WritePageIndex {
+		writerOpts = append(writerOpts, parquet.WithPageIndexEnabled(true))
+	}
 
 	return &ArrowWriter{
 		compression:       comp,
@@ -692,145 +703,26 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 		return nil, nil, fmt.Errorf("failed to get schema: %w", err)
 	}
 
-	// Create Arrow arrays from columns
-	// MEMORY FIX: Use shared allocator instead of creating new one per write
-	mem := sharedArrowAllocator
-	builders := make([]array.Builder, len(schema.Fields()))
-	arrays := make([]arrow.Array, len(schema.Fields()))
-
-	// CRITICAL: Release both builders and arrays to prevent memory leak
-	defer func() {
-		for _, builder := range builders {
-			if builder != nil {
-				builder.Release()
-			}
-		}
-		for _, arr := range arrays {
-			if arr != nil {
-				arr.Release()
-			}
-		}
-	}()
-
-	// Build arrays
-	for i, field := range schema.Fields() {
-		col, ok := columns[field.Name]
-		if !ok {
-			return nil, nil, fmt.Errorf("column %s not found in data", field.Name)
-		}
-
-		// Get validity bitmap for this column (nil means all valid)
-		var colValidity []bool
-		if validity != nil {
-			colValidity = validity[field.Name]
-		}
-
-		switch field.Type.ID() {
-		case arrow.INT64:
-			intCol, ok := col.([]int64)
-			if !ok {
-				return nil, nil, fmt.Errorf("column %s: expected []int64, got %T", field.Name, col)
-			}
-			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
-			if err != nil {
-				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
-			}
-			arrays[i] = array.NewInt64Data(data)
-
-		case arrow.TIMESTAMP:
-			intCol, ok := col.([]int64)
-			if !ok {
-				return nil, nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
-			}
-			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
-			if err != nil {
-				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
-			}
-			arrays[i] = array.NewTimestampData(data)
-
-		case arrow.FLOAT64:
-			floatCol, ok := col.([]float64)
-			if !ok {
-				return nil, nil, fmt.Errorf("column %s: expected []float64, got %T", field.Name, col)
-			}
-			data, err := fixedWidthArrayData(field.Type, arrow.Float64Traits.CastToBytes(floatCol), len(floatCol), colValidity)
-			if err != nil {
-				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
-			}
-			arrays[i] = array.NewFloat64Data(data)
-
-		case arrow.STRING:
-			builder := array.NewStringBuilder(mem)
-			builders[i] = builder
-			if strCol, ok := col.([]string); ok {
-				// Sized once: the builder otherwise grows by doubling.
-				size := 0
-				for _, v := range strCol {
-					size += len(v)
-				}
-				builder.Reserve(len(strCol))
-				builder.ReserveData(size)
-				builder.AppendValues(strCol, colValidity)
-			} else {
-				return nil, nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
-			}
-			arrays[i] = builder.NewArray()
-
-		case arrow.BINARY:
-			builder := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
-			builders[i] = builder
-
-			binaryCol, ok := col.([][]byte)
-			if !ok {
-				return nil, nil, fmt.Errorf(
-					"column %s: expected [][]byte, got %T",
-					field.Name, col,
-				)
-			}
-
-			// Sized once, as the string path is.
-			size := 0
-			for _, v := range binaryCol {
-				size += len(v)
-			}
-			builder.Reserve(len(binaryCol))
-			builder.ReserveData(size)
-			builder.AppendValues(binaryCol, colValidity)
-			arrays[i] = builder.NewArray()
-
-		case arrow.BOOL:
-			builder := array.NewBooleanBuilder(mem)
-			builders[i] = builder
-			if boolCol, ok := col.([]bool); ok {
-				builder.Reserve(len(boolCol))
-				builder.AppendValues(boolCol, colValidity)
-			} else {
-				return nil, nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
-			}
-			arrays[i] = builder.NewArray()
-
-		case arrow.DECIMAL128:
-			dt := field.Type.(*arrow.Decimal128Type)
-			builder := array.NewDecimal128Builder(mem, dt)
-			builders[i] = builder
-			if decCol, ok := col.([]decimal128.Num); ok {
-				builder.Reserve(len(decCol))
-				builder.AppendValues(decCol, colValidity)
-			} else {
-				return nil, nil, fmt.Errorf("column %s: expected []decimal128.Num, got %T", field.Name, col)
-			}
-			arrays[i] = builder.NewArray()
-
-		default:
-			return nil, nil, fmt.Errorf("unsupported Arrow type for column %s: %s", field.Name, field.Type.Name())
-		}
-	}
-
 	rows := 0
-	if len(arrays) > 0 {
-		rows = arrays[0].Len()
+	if fields := schema.Fields(); len(fields) > 0 {
+		rows = max(columnLen(columns[fields[0].Name]), 0)
 	}
-	data, err := w.writeRecordToParquet(schema, arrays, w.parquetSizeHint(measurement, rows, arrays))
+	chunks, err := parquetChunks(schema, columns, rows, maxParquetChunkColumnBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	build := func(lo, hi int) ([]arrow.Array, error) {
+		return buildParquetArrays(schema, columns, validity, rows, lo, hi)
+	}
+	hint := func(first []arrow.Array) int {
+		if len(chunks) > 2 {
+			// The other records' arrays are not built yet, so the hint
+			// cannot be clamped by them.
+			return w.parquetSizeHint(measurement, rows, nil)
+		}
+		return w.parquetSizeHint(measurement, rows, first)
+	}
+	data, err := w.writeRecordToParquet(schema, chunks, build, hint)
 	if err == nil && rows >= minRowsForSizeHint {
 		if w.hintEntries.Load() >= maxSizeHintEntries {
 			w.fileBytesPerRow.Clear()
@@ -841,6 +733,244 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 		}
 	}
 	return data, schema, err
+}
+
+// maxParquetChunkColumnBytes bounds the bytes one string or binary column
+// holds in one Arrow record of a file (#1284). Arrow offsets are int32, so a
+// column built past 2 GiB overflows them, and the Parquet write then fails
+// ("slice bounds out of range [:-2147483616]"). A flush can hold that much:
+// a buffer whose flush the full queue defers keeps growing, and one request
+// can expand up to 3x when invalid UTF-8 becomes U+FFFD. The rows are written
+// as several records of the same file, each its own row group (or several,
+// past the writer's row-count limit, as before). A var for tests.
+var maxParquetChunkColumnBytes int64 = 1 << 30
+
+// parquetChunks returns the row boundaries of the records a file of rows rows
+// is written as: [0, rows] when every string and binary column fits in
+// maxBytes, and otherwise cuts before any row that would take one of them past
+// it. A row whose value alone is larger than maxBytes is a record of its own.
+func parquetChunks(schema *arrow.Schema, columns map[string]interface{}, rows int, maxBytes int64) ([]int, error) {
+	var varWidth [][]int64
+	for _, field := range schema.Fields() {
+		var lens func(yield func(int) bool)
+		switch col := columns[field.Name].(type) {
+		case []string:
+			if field.Type.ID() != arrow.STRING {
+				continue
+			}
+			lens = func(yield func(int) bool) {
+				for _, v := range col {
+					if !yield(len(v)) {
+						return
+					}
+				}
+			}
+		case [][]byte:
+			if field.Type.ID() != arrow.BINARY {
+				continue
+			}
+			lens = func(yield func(int) bool) {
+				for _, v := range col {
+					if !yield(len(v)) {
+						return
+					}
+				}
+			}
+		default:
+			continue
+		}
+		var total int64
+		for n := range lens {
+			total += int64(n)
+		}
+		if total <= maxBytes {
+			continue
+		}
+		sizes := make([]int64, 0, columnLen(columns[field.Name]))
+		for n := range lens {
+			if int64(n) >= math.MaxInt32 {
+				return nil, fmt.Errorf("column %s: a value of %d bytes is larger than a Parquet column can hold", field.Name, n)
+			}
+			sizes = append(sizes, int64(n))
+		}
+		varWidth = append(varWidth, sizes)
+	}
+	if len(varWidth) == 0 {
+		return []int{0, rows}, nil
+	}
+	bounds := []int{0}
+	cur := make([]int64, len(varWidth))
+	for r := 0; r < rows; r++ {
+		cut := false
+		for c, sizes := range varWidth {
+			if r < len(sizes) && cur[c]+sizes[r] > maxBytes {
+				cut = true
+				break
+			}
+		}
+		if cut && r > bounds[len(bounds)-1] {
+			bounds = append(bounds, r)
+			clear(cur)
+		}
+		for c, sizes := range varWidth {
+			if r < len(sizes) {
+				cur[c] += sizes[r]
+			}
+		}
+	}
+	return append(bounds, rows), nil
+}
+
+// buildParquetArrays builds the Arrow arrays of rows [lo, hi) of columns.
+// The caller releases them. A NULL bitmap is sliced with its column when it
+// has one entry per row; a whole-file record ([0, rows)) passes any bitmap on
+// as it is, so a malformed one fails where it always has.
+func buildParquetArrays(schema *arrow.Schema, columns map[string]interface{}, validity map[string][]bool, rows, lo, hi int) (_ []arrow.Array, err error) {
+	// MEMORY FIX: Use shared allocator instead of creating new one per write
+	mem := sharedArrowAllocator
+	arrays := make([]arrow.Array, len(schema.Fields()))
+	defer func() {
+		if err != nil {
+			for _, arr := range arrays {
+				if arr != nil {
+					arr.Release()
+				}
+			}
+		}
+	}()
+	whole := lo == 0 && hi == rows
+
+	for i, field := range schema.Fields() {
+		col, ok := columns[field.Name]
+		if !ok {
+			return nil, fmt.Errorf("column %s not found in data", field.Name)
+		}
+		// A whole-file record takes each column as it is; a chunk needs every
+		// column to have one value per row.
+		lo, hi := lo, hi
+		if whole {
+			hi = columnLen(col)
+		} else if n := columnLen(col); n != rows {
+			return nil, fmt.Errorf("column %s has %d values for %d rows", field.Name, n, rows)
+		}
+
+		// Get validity bitmap for this column (nil means all valid)
+		var colValidity []bool
+		if validity != nil {
+			colValidity = validity[field.Name]
+		}
+		if !whole && len(colValidity) != 0 {
+			if len(colValidity) != rows {
+				return nil, fmt.Errorf("column %s: NULL bitmap has %d entries for %d values", field.Name, len(colValidity), rows)
+			}
+			colValidity = colValidity[lo:hi]
+		}
+
+		switch field.Type.ID() {
+		case arrow.INT64:
+			intCol, ok := col.([]int64)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []int64, got %T", field.Name, col)
+			}
+			intCol = intCol[lo:hi]
+			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
+			if err != nil {
+				return nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewInt64Data(data)
+
+		case arrow.TIMESTAMP:
+			intCol, ok := col.([]int64)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
+			}
+			intCol = intCol[lo:hi]
+			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
+			if err != nil {
+				return nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewTimestampData(data)
+
+		case arrow.FLOAT64:
+			floatCol, ok := col.([]float64)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []float64, got %T", field.Name, col)
+			}
+			floatCol = floatCol[lo:hi]
+			data, err := fixedWidthArrayData(field.Type, arrow.Float64Traits.CastToBytes(floatCol), len(floatCol), colValidity)
+			if err != nil {
+				return nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewFloat64Data(data)
+
+		case arrow.STRING:
+			strCol, ok := col.([]string)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
+			}
+			strCol = strCol[lo:hi]
+			builder := array.NewStringBuilder(mem)
+			// Sized once: the builder otherwise grows by doubling.
+			size := 0
+			for _, v := range strCol {
+				size += len(v)
+			}
+			builder.Reserve(len(strCol))
+			builder.ReserveData(size)
+			builder.AppendValues(strCol, colValidity)
+			arrays[i] = builder.NewArray()
+			builder.Release()
+
+		case arrow.BINARY:
+			binaryCol, ok := col.([][]byte)
+			if !ok {
+				return nil, fmt.Errorf(
+					"column %s: expected [][]byte, got %T",
+					field.Name, col,
+				)
+			}
+			binaryCol = binaryCol[lo:hi]
+			builder := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+			// Sized once, as the string path is.
+			size := 0
+			for _, v := range binaryCol {
+				size += len(v)
+			}
+			builder.Reserve(len(binaryCol))
+			builder.ReserveData(size)
+			builder.AppendValues(binaryCol, colValidity)
+			arrays[i] = builder.NewArray()
+			builder.Release()
+
+		case arrow.BOOL:
+			boolCol, ok := col.([]bool)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
+			}
+			boolCol = boolCol[lo:hi]
+			builder := array.NewBooleanBuilder(mem)
+			builder.Reserve(len(boolCol))
+			builder.AppendValues(boolCol, colValidity)
+			arrays[i] = builder.NewArray()
+			builder.Release()
+
+		case arrow.DECIMAL128:
+			decCol, ok := col.([]decimal128.Num)
+			if !ok {
+				return nil, fmt.Errorf("column %s: expected []decimal128.Num, got %T", field.Name, col)
+			}
+			decCol = decCol[lo:hi]
+			builder := array.NewDecimal128Builder(mem, field.Type.(*arrow.Decimal128Type))
+			builder.Reserve(len(decCol))
+			builder.AppendValues(decCol, colValidity)
+			arrays[i] = builder.NewArray()
+			builder.Release()
+
+		default:
+			return nil, fmt.Errorf("unsupported Arrow type for column %s: %s", field.Name, field.Type.Name())
+		}
+	}
+	return arrays, nil
 }
 
 // Parquet output buffer sizing: a measurement's bytes per row are learned
@@ -856,7 +986,9 @@ const (
 )
 
 // parquetSizeHint is the output buffer size to reserve for a file of rows
-// rows built from arrays, or 0 for none.
+// rows built from arrays, or 0 for none. With arrays nil (a file written as
+// several records, whose arrays are built one record at a time) the hint is
+// not clamped by their size.
 func (w *ArrowWriter) parquetSizeHint(measurement string, rows int, arrays []arrow.Array) int {
 	v, ok := w.fileBytesPerRow.Load(measurement)
 	if !ok || rows == 0 {
@@ -871,6 +1003,9 @@ func (w *ArrowWriter) parquetSizeHint(measurement string, rows int, arrays []arr
 				raw += int64(b.Len())
 			}
 		}
+	}
+	if arrays == nil {
+		return int(min(hint, maxParquetSizeHint))
 	}
 	return int(min(hint, raw+64<<10, maxParquetSizeHint))
 }
@@ -903,35 +1038,53 @@ func fixedWidthArrayData(dt arrow.DataType, values []byte, n int, valid []bool) 
 	return array.NewData(dt, n, []*memory.Buffer{nullBitmap, memory.NewBufferBytes(values)}, nil, nulls, 0), nil
 }
 
-// writeRecordToParquet writes Arrow arrays to Parquet bytes
-func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.Array, sizeHint int) ([]byte, error) {
-	// Create record batch
-	record := array.NewRecord(schema, arrays, -1)
-	defer record.Release()
-
-	// Write to Parquet, into a buffer sized for the file when a hint is known
-	// (growing by doubling allocates about twice the file).
+// writeRecordToParquet writes the rows between consecutive bounds as one
+// record each (each record starts a new row group), building every record's arrays with build just
+// before it is written and releasing them after, so only one record's arrays
+// are held at a time. sizeHint gets the first record's arrays.
+func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, bounds []int, build func(lo, hi int) ([]arrow.Array, error), sizeHint func(first []arrow.Array) int) ([]byte, error) {
 	var buf bytes.Buffer
-	if sizeHint > 0 {
-		buf.Grow(sizeHint)
+	var writer *pqarrow.FileWriter
+	rows := 0
+	for c := 0; c+1 < len(bounds); c++ {
+		arrays, err := build(bounds[c], bounds[c+1])
+		if err != nil {
+			if writer != nil {
+				writer.Close()
+			}
+			return nil, err
+		}
+		if writer == nil {
+			// Write to Parquet, into a buffer sized for the file when a hint is
+			// known (growing by doubling allocates about twice the file).
+			if hint := sizeHint(arrays); hint > 0 {
+				buf.Grow(hint)
+			}
+			// Schema-aware writer properties (see writerPropsFor for the
+			// per-configuration dictionary tiers).
+			writer, err = pqarrow.NewFileWriter(
+				schema,
+				&buf,
+				w.writerPropsFor(schema),
+				w.arrowProps,
+			)
+			if err != nil {
+				releaseArrays(arrays)
+				return nil, fmt.Errorf("failed to create Parquet writer: %w", err)
+			}
+		}
+		record := array.NewRecord(schema, arrays, -1)
+		rows += int(record.NumRows())
+		err = writer.Write(record)
+		record.Release()
+		releaseArrays(arrays)
+		if err != nil {
+			writer.Close()
+			return nil, fmt.Errorf("failed to write record batch: %w", err)
+		}
 	}
-
-	// Schema-aware writer properties (see writerPropsFor for the
-	// per-configuration dictionary tiers).
-	writer, err := pqarrow.NewFileWriter(
-		schema,
-		&buf,
-		w.writerPropsFor(schema),
-		w.arrowProps,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Parquet writer: %w", err)
-	}
-
-	// Write record batch
-	if err := writer.Write(record); err != nil {
-		writer.Close()
-		return nil, fmt.Errorf("failed to write record batch: %w", err)
+	if writer == nil {
+		return nil, fmt.Errorf("failed to write Parquet: no rows")
 	}
 
 	// Close writer
@@ -941,11 +1094,23 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.
 
 	w.logger.Debug().
 		Int("columns", len(schema.Fields())).
-		Int("rows", int(record.NumRows())).
+		Int("rows", rows).
+		// One record per bounds pair; each record splits into ceil(rows/cap)
+		// row groups once `ingest.max_row_group_rows` applies, so this is the
+		// RECORD count — the row-group count is in the file's footer.
+		Int("records", len(bounds)-1).
 		Int("size", buf.Len()).
 		Msg("Wrote Parquet file")
 
 	return buf.Bytes(), nil
+}
+
+func releaseArrays(arrays []arrow.Array) {
+	for _, arr := range arrays {
+		if arr != nil {
+			arr.Release()
+		}
+	}
 }
 
 // bufferShard represents a single shard of the buffer map with its own lock
@@ -974,6 +1139,16 @@ type TypedColumnBatch struct {
 	// estimatedBytes approximates retained column data for the ingest-memory
 	// gauge; it is not used to limit or reject writes.
 	estimatedBytes int64
+	// walSpans is set by mergeBatches on the batch it returns: the WAL entry
+	// and row of every row, by position (#1492, wal_row_spans.go). nil on a
+	// batch whose rows are not the records' concatenation (mergeSortedByTime,
+	// a slice, a sort), so a multi-hour flush can only checkpoint rows it can
+	// name exactly.
+	walSpans *walRowSpans
+	// flushIDs are the identities the flush of this merged batch checkpoints
+	// when it completes (its walHashes), set by the flush caller. A
+	// single-hour file's flush intent names them (#1646, flush_intent.go).
+	flushIDs []string
 }
 
 type bufferShard struct {
@@ -1127,6 +1302,11 @@ type ArrowBuffer struct {
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]
+	// licenseWriteGate refuses live writes on grace days 7-14 of an expired
+	// license. A slot of its own: the cluster wiring owns ingestGate, and this
+	// one is checked only at request admission, never on CQ output, replay or
+	// compaction writes.
+	licenseWriteGate atomic.Pointer[func() bool]
 	// walDiskGate refuses live writes under WAL volume disk pressure (#676).
 	// A slot of its own: the cluster wiring replaces ingestGate. Nil unless
 	// the WAL is enabled with wal.disk_pressure_enabled.
@@ -1188,6 +1368,14 @@ type ArrowBuffer struct {
 	nextFlushID         atomic.Uint64
 	memoryLimitBytes    uint64
 	bufferMemoryWarning atomic.Bool
+	// Buffered-bytes limit (#1468, buffer_full.go): maxBufferedBytes is
+	// ingest.max_buffered_bytes resolved (0 = off), bufferFull the state MQTT
+	// suspends on, bufferFullWarning the latch of the warning before it.
+	maxBufferedBytes   int64
+	bufferFull         atomic.Bool
+	bufferFullMu       sync.Mutex // orders bufferFull changes with their notifications
+	bufferFullWarning  atomic.Bool
+	bufferFullListener atomic.Pointer[func(bool)]
 
 	// closing is the shutdown short-circuit checked by tryEnqueueFlush.
 	// See Close() for the full ordering rationale; senders see this
@@ -1292,8 +1480,15 @@ type ArrowBuffer struct {
 	// Flush failure tracking for WAL maintenance.
 	// Set when a storage write fails (S3 outage etc.), cleared after successful recovery.
 	// The periodic WAL goroutine checks this to decide whether WAL replay is needed.
-	hasFlushFailure        atomic.Bool
+	hasFlushFailure atomic.Bool
+	// clusterMode: no flush intents written or adopted (#1646, flush_intent.go).
+	clusterMode            atomic.Bool
 	flushFailureGeneration atomic.Uint64
+
+	// ambiguous holds the keys of failed storage writes that may land after
+	// all, until their rows are stored by another flush (#1635,
+	// ambiguous_writes.go).
+	ambiguous *ambiguousLedger
 
 	// walRecoveryPending arms the same recovery as hasFlushFailure, for a
 	// reason that is NOT a flush failure: a recovery pass that kept a file or
@@ -1925,6 +2120,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		flushWorkers:         flushWorkers,
 		flushTimes:           make(map[uint64]time.Time),
 		memoryLimitBytes:     memoryLimitBytes,
+		maxBufferedBytes:     resolveMaxBufferedBytes(cfg, memoryLimitBytes),
 		flushTimeout:         flushTimeout,
 		maxBufferAge:         time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
 		sortKeysConfig:       sortKeysConfig,
@@ -1932,6 +2128,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		decimalConfig:        decimalConfig,
 		defaultDecimalConfig: defaultDecimalConfig,
 		logger:               logger.With().Str("component", "arrow-buffer").Logger(),
+		ambiguous:            newAmbiguousLedger(),
 	}
 
 	// Initialize shards
@@ -1964,6 +2161,11 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	// Publish buffer gauges on a fixed cadence (#802)
 	buffer.wg.Add(1)
 	go buffer.metricsSampler()
+
+	// Removes late-landed copies of failed flush writes (#1635). Idle while
+	// nothing is tracked, which is always without a WAL.
+	buffer.wg.Add(1)
+	go buffer.ambiguousSweeper()
 
 	buffer.logger.Info().
 		Int("max_buffer_size", cfg.MaxBufferSize).
@@ -2084,7 +2286,9 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 
 	// Announce to cluster-wide file manifest (peer replication). Called on
 	// the flush path: the registrar must not block on the network. The outbox
-	// only appends here; completeFlush makes it durable once per flush.
+	// only appends here; syncRegistrations makes it durable, once per flush in
+	// completeFlush and, for a multi-hour flush, once per hour file before
+	// that file's row checkpoint (#1492, #1498).
 	if ref := b.fileRegistrar.Load(); ref != nil && ref.FileRegistrar != nil {
 		if cr, ok := ref.FileRegistrar.(CoverageFileRegistrar); ok && cov != nil {
 			cr.RegisterCoveredFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex, cov)
@@ -2299,6 +2503,18 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 			return fmt.Errorf("unknown record type %T in write dispatch (unwired decoder output)", record)
 		}
 	}
+	// Converted dense, every column a cell per row: refused before any of
+	// it is built when its keys would make that far more cells than values.
+	if rowRecordsByMeasurement != nil {
+		var all []*models.Record
+		for _, rowRecords := range rowRecordsByMeasurement {
+			all = append(all, rowRecords...)
+		}
+		if err := CheckDenseCells(all); err != nil {
+			b.totalErrors.Add(1)
+			return err
+		}
+	}
 	// Convert grouped row records to columnar format. The conversion renames
 	// a field named like a tag, so the type check below reads its output.
 	var drops []LPDrop
@@ -2317,12 +2533,13 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 
 	// The batch is written one record at a time, so a failure can follow
 	// records already buffered (#1437). A record refused for its content
-	// before the WAL (#440, #1342) is dropped and the others are written, as
-	// line protocol does. Any other failure once something is buffered stops
-	// the write with a WriteStoppedError, which says what was written: the
-	// error itself would read as "nothing was written" (a refusal promises
-	// that, and the MQTT subscriber resends the whole message on one). A
-	// failure before anything is buffered is returned as it is.
+	// before the WAL (#440, #1342, #1424, #1475) is dropped and the others are
+	// written, as line protocol does. Any other failure once something is
+	// buffered stops the write with a WriteStoppedError, which says what was
+	// written: the error itself would read as "nothing was written" (a
+	// refusal promises that, and the MQTT subscriber resends the whole
+	// message on one). A failure before anything is buffered is returned as
+	// it is.
 	//
 	// Nothing below runs on the success path but the index: what was
 	// written is worked out from the indexes when a write fails.
@@ -2501,6 +2718,10 @@ func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, databas
 		return fmt.Errorf("normalize replayed timestamps for %s: %w", measurement, err)
 	}
 	sanitizeColumnarStrings(columns)
+	// A measurement name with "/" is not dropped like a column: the entry is
+	// refused (writeColumnarInternalWithWALCopy) and handled as any failed
+	// replay (#1475). Entry points validate measurement names, so none is
+	// expected in a WAL.
 	// A column a binary from before #1342 accepted under a name Arc cannot
 	// read back would break the measurement: drop the column, keep the rows.
 	if dropped := dropUnstorableColumns(columns); len(dropped) > 0 {
@@ -2747,8 +2968,8 @@ func (b *ArrowBuffer) signalDrain() {
 // Without it a deferred buffer is picked up only by a later write to the same
 // measurement, by the age-based sweep, or by Close. When ingest moves on to
 // other measurements, that buffer sits while flush workers go idle — and the
-// age sweep is a single goroutine that holds each shard's lock across its whole
-// pass, so with many measurements it is the slowest way to drain anything.
+// age sweep waits for a buffer's max age and runs one shard at a time, so it
+// is the slowest way to drain anything.
 //
 // Two properties this loop must have, both learned the hard way:
 //
@@ -2970,6 +3191,24 @@ var ErrBufferClosing = errors.New("arrow buffer is closing: write refused")
 // written, the WAL included, so a retry against the primary is safe.
 var ErrIngestFenced = errors.New("ingest fenced: this node is not an available primary writer")
 
+// ErrUnstorableColumnValue is returned for a columnar record whose values
+// cannot be converted to typed columns (#1424): a column of mixed types, such
+// as an integer column holding a string, a time column that is not numeric,
+// or a value outside a decimal column's precision. The conversion runs before
+// the WAL append (#1438), so nothing of the record was written, and the same
+// record is refused on every attempt.
+var ErrUnstorableColumnValue = errors.New("column value cannot be stored")
+
+// SetLicenseWriteGate installs the license's ingestion stop: stopped reports
+// whether live writes are refused (grace days 7-14). nil removes it.
+func (b *ArrowBuffer) SetLicenseWriteGate(stopped func() bool) {
+	if stopped == nil {
+		b.licenseWriteGate.Store(nil)
+		return
+	}
+	b.licenseWriteGate.Store(&stopped)
+}
+
 // SetIngestGate installs the check every live write passes before anything is
 // written, the WAL included (#1207). It returns nil to admit, or an error
 // wrapping ErrIngestFenced. Replay, recovery and replication paths are never
@@ -3023,13 +3262,14 @@ func (b *ArrowBuffer) SetWALDiskGate(g WALDiskGate) {
 type walDiskAdmittedKey struct{}
 
 // refusalCountedKey marks a context whose refusal is already counted in
-// arc_wal_disk_pressure_rejections_total: a retry of the same write (MQTT)
+// arc_wal_disk_pressure_rejections_total, arc_wal_not_durable_rejections_total
+// or arc_ingest_buffer_full_rejections_total: a retry of the same write (MQTT)
 // must not count again.
 type refusalCountedKey struct{}
 
-// WithRefusalCounted returns ctx marked so a WAL disk pressure refusal of a
-// write under it is not counted again (#676): a caller retrying one message
-// counts it once.
+// WithRefusalCounted returns ctx marked so a WAL disk pressure (#676) or
+// buffer-full (#1468) refusal of a write under it is not counted again: a
+// caller retrying one message counts it once.
 func WithRefusalCounted(ctx context.Context) context.Context {
 	return context.WithValue(ctx, refusalCountedKey{}, true)
 }
@@ -3081,13 +3321,28 @@ func noRelease() {}
 // several at once, cannot run the volume past its reserve, and released as
 // the request's appends reach the WAL queue, or when release runs. Writes
 // under the context skip their own disk pressure check, so pressure that
-// starts part-way cannot leave the request half written; fencing is still
-// checked per call. With no disk gate ctx is returned unchanged.
+// starts part-way cannot leave the request half written; the ingest gate is
+// still checked per call (AdmitWholeRequest checks it once). With no disk gate
+// ctx is returned unchanged. A request is also refused, with ErrBufferFull,
+// while the rows held for flushing are at ingest.max_buffered_bytes (#1468);
+// that is checked here only, so an admitted request is never stopped by it
+// part-way.
 func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
+	if g := b.licenseWriteGate.Load(); g != nil && *g != nil && (*g)() {
+		if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
+			metrics.Get().IncLicenseWriteRefusals()
+		}
+		return ctx, noRelease, ErrLicenseWritesStopped
+	}
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
 		if err := (*g)(); err != nil {
 			return ctx, noRelease, err
 		}
+	}
+	// Before the disk gate: a standalone node has none and returns below,
+	// and a refusal here must not hold a WAL reservation (#1468).
+	if err := b.admitBufferedBytes(ctx, b.maxBufferedBytes, true); err != nil {
+		return ctx, noRelease, err
 	}
 	gp := b.walDiskGate.Load()
 	if gp == nil {
@@ -3104,6 +3359,35 @@ func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context
 	return context.WithValue(ctx, walDiskAdmittedKey{}, r), r.release, nil
 }
 
+// fenceAdmittedKey marks a context whose request passed the ingest gate (the
+// fence and stream-takeover pauses) as a whole (AdmitWholeRequest).
+type fenceAdmittedKey struct{}
+
+// AdmitWholeRequest is AdmitRequest for a request written as several buffer
+// calls, such as a line-protocol body of several measurements: writes under
+// the returned context skip the ingest gate (the fence and stream-takeover
+// pauses) too, so it is checked once for the whole request, as
+// ArrowBuffer.Write checks it for a MessagePack batch. Checked per call, a
+// gate that closed part-way stopped the request after its earlier
+// measurements were buffered, and a client resending it duplicated them
+// (#1422). A request admitted before the gate closes is not refused by it
+// part-way, however long its buffer calls take (schema-change flushes,
+// durable WAL syncs). Other failures can still stop it part-way.
+//
+// A long-running write (an import) uses AdmitRequest instead, so the gate
+// still stops it part-way. With no ingest gate (a standalone node) there is
+// nothing to skip, and ctx is returned as AdmitRequest returns it.
+func (b *ArrowBuffer) AdmitWholeRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
+	ctx, release, err := b.AdmitRequest(ctx, walBytes)
+	if err != nil {
+		return ctx, release, err
+	}
+	if g := b.ingestGate.Load(); g == nil || *g == nil {
+		return ctx, release, nil
+	}
+	return context.WithValue(ctx, fenceAdmittedKey{}, true), release, nil
+}
+
 func countWALDiskRefusal(ctx context.Context) {
 	if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
 		metrics.Get().IncWALDiskPressureRejections()
@@ -3112,8 +3396,10 @@ func countWALDiskRefusal(ctx context.Context) {
 
 func (b *ArrowBuffer) checkIngestGate(ctx context.Context) error {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
-		if err := (*g)(); err != nil {
-			return err
+		if admitted, _ := ctx.Value(fenceAdmittedKey{}).(bool); !admitted {
+			if err := (*g)(); err != nil {
+				return err
+			}
 		}
 	}
 	// Order matters for the common path: no gate, then no pressure, and only
@@ -3220,9 +3506,13 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 }
 
 func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALHashes []string, inheritedWALCopy bool) error {
-	// Every ingest path refuses these names before here (#1342); this is the
-	// backstop, before any WAL work, so a path that misses the check fails
-	// the write instead of storing a column nothing can read back.
+	// Every ingest path refuses these names before here (#1342, #1475); this
+	// is the backstop, before any WAL work, so a path that misses the check
+	// fails the write instead of storing a column nothing can read back, or
+	// a database or measurement its buffer key cannot tell apart from another.
+	if err := unstorableKeyError(database, record.Measurement); err != nil {
+		return err
+	}
 	for name := range record.Columns {
 		if err := unstorableColumnError(record.Measurement, name); err != nil {
 			return err
@@ -3237,6 +3527,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	}
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
+	// Unambiguous: neither name has a "/" (#1475 backstop above).
 	bufferKey := database + "/" + record.Measurement
 
 	// Convert []interface{} columns to typed arrays (optimized with zero-copy
@@ -3245,7 +3536,16 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// entry appended first would be replayed at the next start (#1438).
 	typedColumns, numRecords, err := b.convertColumnsToTyped(record.Measurement, record.Columns)
 	if err != nil {
-		return fmt.Errorf("failed to convert columns: %w", err)
+		return fmt.Errorf("%w: measurement %q: %v", ErrUnstorableColumnValue, record.Measurement, err)
+	}
+	// #1509, after every other content refusal so a write refused for its
+	// columns or values does not claim the spelling (it creates the
+	// directories). A replayed entry (skipWAL) was accepted where it was
+	// written; only a live write is refused for its spelling.
+	if !skipWAL {
+		if err := b.nameSpellingRefusal(database, record.Measurement); err != nil {
+			return err
+		}
 	}
 	if len(record.RawPayload) > 0 {
 		typedColumns.estimatedBytes = int64(len(record.RawPayload))
@@ -3313,7 +3613,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 				// reached the WAL), so this write is refused (retryable) before
 				// it is buffered.
 				if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
-					return walNotDurable(err)
+					return walNotDurable(ctx, err)
 				}
 				// Don't fail the write — WAL is for durability, not
 				// correctness. recordWALError differentiates backpressure
@@ -3346,7 +3646,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 					// reached the WAL), so this write is refused (retryable) before
 					// it is buffered.
 					if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
-						return walNotDurable(err)
+						return walNotDurable(ctx, err)
 					}
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
@@ -3556,7 +3856,10 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // encoded as row entries (encodeTypedWALRows), NULL cells left out.
 // The typed msgpack decode path always supplies rawPayload.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
-	// The #1342 backstop; see writeColumnarInternalWithWALHashes.
+	// The #1342 and #1475 backstops; see writeColumnarInternalWithWALCopy.
+	if err := unstorableKeyError(database, measurement); err != nil {
+		return err
+	}
 	for name := range typedColumns.Data {
 		if err := unstorableColumnError(measurement, name); err != nil {
 			return err
@@ -3566,7 +3869,12 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		if err := checkTypedTextBinary(b.knownTextBinary(database, measurement), measurement, typedColumns); err != nil {
 			return err
 		}
+		// #1509, last of the content refusals; see writeColumnarInternalWithWALCopy.
+		if err := b.nameSpellingRefusal(database, measurement); err != nil {
+			return err
+		}
 	}
+	// Unambiguous: neither name has a "/" (#1475 backstop above).
 	bufferKey := database + "/" + measurement
 	if len(rawPayload) > 0 {
 		// The payload's size, but at least 8 bytes a cell: a NULL is one
@@ -3618,7 +3926,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 				// reached the WAL), so this write is refused (retryable) before
 				// it is buffered.
 				if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
-					return walNotDurable(err)
+					return walNotDurable(ctx, err)
 				}
 				b.recordWALError(err, func(ev *zerolog.Event) {
 					ev.Str("database", database).
@@ -3646,7 +3954,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 					// reached the WAL), so this write is refused (retryable) before
 					// it is buffered.
 					if errors.Is(err, wal.ErrNotDurable) || b.walDurableAck() {
-						return walNotDurable(err)
+						return walNotDurable(ctx, err)
 					}
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
@@ -4386,6 +4694,7 @@ func (b *ArrowBuffer) metricsSampler() {
 		case <-ticker.C:
 			b.publishBufferMetrics()
 			b.publishBufferMemoryMetrics()
+			b.observeBufferedBytes(b.bufferBytesBuffered.Load())
 			// Only on the sampler, not inside publishBufferMetrics:
 			// publishBufferMetrics also runs once per flushed file, and this
 			// walks every shard under RLock — 32 lock round-trips per flush on
@@ -4465,60 +4774,118 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 
 	threshold := maxAge
 
+	limit := b.flushWorkers
+	if limit <= 0 {
+		limit = 1
+	}
+
 	// Iterate over all shards
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
 
-		shard.mu.Lock()
+		// Extract up to flush_workers aged buffers under one lock hold, write
+		// them concurrently without the lock, and repeat until the shard has
+		// none left (#1632). Writing them one at a time under the lock, as
+		// this sweep did, cost N x (write + file fsync + directory fsync) per
+		// sweep once #1618 made every flush durable: about 30 s for 1,000
+		// low-rate measurements on macOS. The writes go straight to storage,
+		// not through flushQueue, so aged data never waits behind
+		// size-triggered flushes and never takes a slot a writer needs, and
+		// "the sweep returned" still means "the aged data was written".
+		//
+		// Chunked rather than extracting the whole shard at once so the
+		// closing check below runs between batches: Close waits for this
+		// sweep via b.wg.Wait(), and a sweep that had taken every aged buffer
+		// of a large shard would write them all before Close's own loop could
+		// run, past the shutdown budget (LocalBackend ignores the cancel).
+		for {
+			aged := make([]agedFlush, 0, limit)
+			closing := false
 
-		// Check each buffer in this shard for age
-		for key, startTime := range shard.bufferStartTimes {
-			// Stop the sweep once Close() has begun and leave the rest to
-			// Close()'s own shard loop. This sweep is a single serial goroutine
-			// over every shard, and Close() waits for it via b.wg.Wait(); with
-			// many aged buffers on slow storage, finishing the whole sweep can
-			// outlast the shutdown budget.
-			//
-			// The unlock is REQUIRED: shard.mu is held across this entire loop
-			// (released only inside flushBufferLocked, around its I/O). A bare
-			// return would leak the lock, and Close()'s shard loop — plus every
-			// later write to this shard — would block on it forever.
-			if b.closing.Load() {
-				shard.mu.Unlock()
-				b.logger.Info().
-					Int("shard", shardIdx).
-					Msg("Aged-buffer sweep stopping: buffer is closing, remaining buffers left to Close()")
-				return
-			}
-			age := now.Sub(startTime)
-			if age >= threshold {
-				b.logger.Info().
-					Str("buffer_key", key).
-					Dur("age", age).
-					Dur("threshold", threshold).
-					Int("shard", shardIdx).
-					Msg("Flushing aged buffer")
-
+			shard.mu.Lock()
+			for key, startTime := range shard.bufferStartTimes {
+				if len(aged) == limit {
+					break
+				}
+				// Stop extracting once Close() has begun and leave the rest
+				// to Close()'s own shard loop. What is already extracted is
+				// still written below -- it is no longer in the buffer.
+				if b.closing.Load() {
+					closing = true
+					break
+				}
+				age := now.Sub(startTime)
+				if age < threshold {
+					continue
+				}
 				// Parse buffer key to get database and measurement
 				parts := splitBufferKey(key)
 				if len(parts) != 2 {
 					b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format")
 					continue
 				}
-
-				// flushParent-derived: Close() cancelling b.ctx must not abort
-				// an aged flush mid-write, because flushBufferLocked has
-				// already deleted the buffer entry (#1007).
-				flushCtx, flushCancel := b.newFlushContext()
-				if err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1]); err != nil {
-					b.logger.Debug().Err(err).Str("buffer_key", key).Msg("Failed to flush aged buffer") // flushBufferLocked logged it (#1377)
+				b.logger.Info().
+					Str("buffer_key", key).
+					Dur("age", age).
+					Dur("threshold", threshold).
+					Int("shard", shardIdx).
+					Msg("Flushing aged buffer")
+				if e := b.extractBufferLocked(shard, key); e != nil {
+					aged = append(aged, agedFlush{e: e, key: key, database: parts[0], measurement: parts[1]})
 				}
-				flushCancel()
+			}
+			shard.mu.Unlock()
+
+			b.writeAgedConcurrently(aged)
+
+			if closing || b.closing.Load() {
+				b.logger.Info().
+					Int("shard", shardIdx).
+					Msg("Aged-buffer sweep stopping: buffer is closing, remaining buffers left to Close()")
+				return
+			}
+			if len(aged) < limit {
+				break // the shard has no aged buffer left
 			}
 		}
-
-		shard.mu.Unlock()
 	}
+}
+
+// agedFlush is one buffer the aged sweep extracted.
+type agedFlush struct {
+	e                          *extractedFlush
+	key, database, measurement string
+}
+
+// writeAgedConcurrently writes one batch of aged buffers (at most
+// flush_workers, which flushAgedBuffers enforces) all at once, and returns
+// when all are written. Each write gets its own
+// flushParent-derived context: Close() cancelling b.ctx must not abort an
+// aged write mid-way, because the buffer entry is already gone (#1007).
+func (b *ArrowBuffer) writeAgedConcurrently(aged []agedFlush) {
+	write := func(a agedFlush) {
+		flushCtx, flushCancel := b.newFlushContext()
+		defer flushCancel()
+		if err := b.writeExtracted(flushCtx, a.e, a.key, a.database, a.measurement); err != nil {
+			b.logger.Debug().Err(err).Str("buffer_key", a.key).Msg("Failed to flush aged buffer") // writeExtracted logged it (#1377)
+		}
+	}
+	switch len(aged) {
+	case 0:
+		return
+	case 1:
+		write(aged[0])
+		return
+	}
+	var wg sync.WaitGroup
+	for _, a := range aged {
+		wg.Add(1)
+		go func(a agedFlush) {
+			defer wg.Done()
+			write(a)
+		}(a)
+	}
+	wg.Wait()
 }
 
 // splitBufferKey splits "database/measurement" into [database, measurement]
@@ -4629,8 +4996,16 @@ func recordsWithoutWALCopy(records []interface{}, expectedRows int) int {
 
 func (b *ArrowBuffer) logFlushFailure(err error, bufferKey string, recordCount, recordsWithoutWAL int) {
 	event := b.logger.Error().Err(err).
-		Str("buffer_key", bufferKey).
-		Int("records", recordCount)
+		Str("buffer_key", bufferKey)
+	// A multi-hour flush that stored some hour files first (#1492): those rows
+	// are in storage and checkpointed, so they are neither replayed nor lost.
+	var partial *flushPartialError
+	if errors.As(err, &partial) {
+		recordCount -= partial.StoredRows
+		recordsWithoutWAL = partial.LostWithoutWAL
+		event.Int("records_stored", partial.StoredRows).Int("files_stored", partial.StoredFiles)
+	}
+	event.Int("records", recordCount)
 	if recordsWithoutWAL > 0 {
 		metrics.Get().IncBufferRecordsDropped(int64(recordsWithoutWAL))
 		event.Int("records_without_wal", recordsWithoutWAL).
@@ -4666,6 +5041,10 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 	}
 	startTime := time.Now()
 	noWALRows := recordsWithoutWALCopy(records, recordCount)
+	var needParts []walNeedPart // #1635; read before the records are released
+	if b.wal != nil {
+		needParts = walNeedPartsOf(records)
+	}
 
 	// Merge typed column batches
 	merged, err := b.mergeBatchesForFlush(measurement, records)
@@ -4685,7 +5064,10 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 	}
 
 	// Flush with data timestamp partitioning
+	merged.flushIDs = walHashes // #1646
 	if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
+		need, named := walNeedParts(needParts)
+		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, recordCount, noWALRows)
 		b.markFlushFailure()
 		group.failed()
@@ -4705,27 +5087,18 @@ type FileRegistrationSyncer interface {
 // completeFlush runs once a flush's files are written and registered. The
 // registrations are made durable before the WAL checkpoint, so the WAL cannot
 // drop rows whose file the cluster has no durable record of (#1209). One
-// sync per flush, however many hourly files it wrote, and none without a WAL.
+// sync here per flush, and none without a WAL; a multi-hour flush also synced
+// once per hour file, before that file's row checkpoint (#1492, #1498,
+// flushPartitionedData).
 //
 // A covered flush (#1207) checkpoints without releasing the purge floor: the
 // group releases its WAL entries once every file has settled in the outbox.
 func (b *ArrowBuffer) completeFlush(walHashes []string, group *flushGroup) {
-	// Without a WAL there is no checkpoint to order the sync before, and the
-	// unsynced append already survives a process crash; skipping it keeps
-	// serial flushes (Close, the aged sweep) from paying a fsync each.
-	if ref := b.fileRegistrar.Load(); ref != nil && b.wal != nil {
-		if syncer, ok := ref.FileRegistrar.(FileRegistrationSyncer); ok {
-			if err := syncer.SyncRegistrations(); err != nil {
-				// Checkpointing anyway is deliberate. The registrations are
-				// still held in memory and register in this process; only a
-				// crash before that loses them, leaving a file this writer
-				// alone can query. Withholding the checkpoint would replay
-				// these rows into a second file instead: duplicates on every
-				// node.
-				b.logger.Error().Err(err).Msg("Failed to persist file registrations before the WAL checkpoint")
-			}
-		}
-	}
+	b.syncRegistrations()
+	// The rows of walHashes are stored and registered: a failed write that
+	// was waiting for them may now have its late copy removed (#1635). On
+	// that evidence alone, as the checkpoint below is, whatever its outcome.
+	b.ambiguous.stored(walHashes)
 	if group != nil {
 		if len(walHashes) > 0 {
 			if err := group.cs.wal.MarkFlushedRetained(walHashes); err != nil {
@@ -4737,6 +5110,93 @@ func (b *ArrowBuffer) completeFlush(walHashes []string, group *flushGroup) {
 	}
 	b.markWALFlushed(walHashes)
 }
+
+// syncRegistrations makes the registrations appended so far durable, before
+// the checkpoint that stops their rows replaying (#1209). Without a WAL there
+// is no checkpoint to order the sync before, and the unsynced append already
+// survives a process crash; skipping it saves serial flushes (Close, the aged
+// sweep) one more fsync each, on top of the file and directory fsyncs the
+// local backend's Write already pays (#1618).
+func (b *ArrowBuffer) syncRegistrations() {
+	ref := b.fileRegistrar.Load()
+	if ref == nil || b.wal == nil {
+		return
+	}
+	if syncer, ok := ref.FileRegistrar.(FileRegistrationSyncer); ok {
+		if err := syncer.SyncRegistrations(); err != nil {
+			// Checkpointing anyway is deliberate. The registrations are
+			// still held in memory and register in this process; only a
+			// crash before that loses them, leaving a file this writer
+			// alone can query. Withholding the checkpoint would replay
+			// these rows into a second file instead: duplicates on every
+			// node.
+			b.logger.Error().Err(err).Msg("Failed to persist file registrations before the WAL checkpoint")
+		}
+	}
+}
+
+// checkpointRows writes the durable checkpoint for row ranges whose rows are
+// in a stored, registered hour file of a flush still in progress (#1492), so a
+// crash before the flush's own checkpoint replays only the rows of the files
+// not yet written. A row identity never moves the purge floor (the parent's
+// sequence stays pending until completeFlush checkpoints it), so this cannot
+// let the WAL reclaim an unflushed entry.
+//
+// Admission is bounded by ctx and blocks (MarkFlushedContext): the drop-on-full
+// enqueue of MarkFlushed loses nearly every checkpoint under the sustained
+// load a backfill is. A checkpoint that is still refused or times out is
+// counted and dropped: its rows replay as they did before, nothing is lost.
+//
+// "Stored" is storage.Write having returned, the same standard the flush's
+// own checkpoint relies on: the local backend fsyncs the file and its
+// directory before it returns (#1618), and an object store has the object
+// once the PUT returns, so the checkpoint never outlives the data in a power
+// loss.
+//
+// The wait counts against the flush's context (ingest.flush_timeout_seconds)
+// like the storage writes do: a backfill flush of many hours pays one WAL
+// sync per hour here. Reports whether a checkpoint was written; false with no
+// ids means the file had no rows the map could name (walRowSpans).
+func (b *ArrowBuffer) checkpointRows(ctx context.Context, ids []string) bool {
+	if len(ids) == 0 || b.wal == nil {
+		return false
+	}
+	var err error
+	switch w := b.wal.(type) {
+	case interface {
+		MarkFlushedContext(context.Context, []string) error
+	}:
+		err = w.MarkFlushedContext(ctx, ids)
+	case trackedWALWriter:
+		err = w.MarkFlushed(ids)
+	default:
+		return false
+	}
+	if err != nil {
+		metrics.Get().IncWALRowCheckpointsDropped()
+		b.logger.Warn().Err(err).Int("ranges", len(ids)).Msg("WAL row checkpoint for a stored hour file was not written; a crash before the flush completes replays its rows")
+		return false
+	}
+	metrics.Get().IncWALRowCheckpointsWritten()
+	return true
+}
+
+// flushPartialError is a multi-hour flush that failed after storing,
+// registering and checkpointing some of its hour files (#1492). The rows in
+// those files are not lost and are not replayed; logFlushFailure reports the
+// rest.
+type flushPartialError struct {
+	Err            error
+	StoredRows     int
+	StoredFiles    int
+	LostWithoutWAL int // rows with no WAL copy that are in no stored file
+}
+
+func (e *flushPartialError) Error() string {
+	return fmt.Sprintf("%v (after %d rows in %d hour files were stored and checkpointed)", e.Err, e.StoredRows, e.StoredFiles)
+}
+
+func (e *flushPartialError) Unwrap() error { return e.Err }
 
 func (b *ArrowBuffer) markWALFlushed(hashes []string) {
 	if len(hashes) == 0 || b.wal == nil {
@@ -4852,8 +5312,10 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSum := sha256.Sum256(parquetData)
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
+		b.recordFlushIntent(storagePath, int64(len(parquetData)), merged.flushIDs)
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage: %w", err)
+			// The write may still land (#1635): name the key for noteFailedWrite.
+			return &failedStorageWrite{err: fmt.Errorf("failed to write to storage: %w", err), path: storagePath, size: int64(len(parquetData))}
 		}
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
@@ -4894,10 +5356,54 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		Int("total_records", recordCount).
 		Msg("Splitting batch across multiple hour partitions")
 
-	// Collect registration entries after all storage writes succeed.
-	// registerFileInTiering is called only after every hour's storage.Write succeeds
-	// to avoid leaving stale manifest entries when a later hour fails — WAL replay
-	// would otherwise create a duplicate file for the already-registered hour.
+	// Each hour file is registered and its rows checkpointed in the WAL as
+	// soon as it is stored (#1492), so a crash before the flush's own
+	// checkpoint replays only the hours not yet written, not the whole flush.
+	// Registration before the checkpoint, and durable (syncRegistrations),
+	// because a checkpointed row that is in no registered file is a row the
+	// cluster cannot see and nothing replays (#1209).
+	//
+	// Registration used to wait for every hour to succeed, so that a later
+	// hour's failure did not leave a registered file whose rows the WAL then
+	// replayed into a second file. The checkpoint is what makes registering
+	// early safe: the registered hour's rows are no longer replayed. (If the
+	// checkpoint itself is dropped, replay writes them again: the at-least-
+	// once case this used to be for every multi-hour flush.)
+	//
+	// On a coverage-enabled writer (#1207, #1498) each hour file registers
+	// with the group's coverage for that file, as the deferred loop did, so
+	// the manifest sees what it saw before, only sooner. The group announces
+	// its files at the first stored hour and finishes as before when every
+	// file has settled and the checkpoint is written. A flush that fails
+	// after storing some hours tells the group (storedPartially): it settles
+	// the tracker with the stored rows once those files' outcomes are in,
+	// and never releases its tokens, since the other hours are still only in
+	// the WAL; recovery releases the parent sequences once it has replayed
+	// them, and the group releases its tokens through no path (not even a
+	// refused file's resolution). The outbox hold on the group's batches
+	// (every stored file's record carries the whole group's ranges) ends
+	// when the last stored file leaves the outbox, registered or resolved;
+	// from then on the unflushed hours are protected by the parent sequences
+	// alone, as on a writer without coverage.
+	spans := merged.walSpans
+	if spans != nil && spans.rows != len(times) {
+		spans = nil // a layout the merge did not produce: name nothing
+	}
+	perHour := b.wal != nil && spans != nil
+	var storedRows, storedFiles int
+	var writtenAt []bool // positions of the merged batch now in a stored file
+	if perHour {
+		writtenAt = make([]bool, len(times))
+	}
+	var cov *GroupCoverage // announced at the first stored hour
+	partial := func(err error) error {
+		if storedFiles == 0 {
+			return err
+		}
+		group.storedPartially(group.storedPieces(spans, writtenAt), storedFiles)
+		return &flushPartialError{Err: err, StoredRows: storedRows, StoredFiles: storedFiles, LostWithoutWAL: spans.lostWithoutCopy(writtenAt)}
+	}
+
 	type tieringEntry struct {
 		storagePath string
 		bucketTime  time.Time
@@ -4921,7 +5427,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Write Parquet file for this hour
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
 		if err != nil {
-			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
+			return partial(fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err))
 		}
 
 		// Use bucket's minTime for path generation (convert hourID to time only here)
@@ -4933,10 +5439,55 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSum := sha256.Sum256(parquetData)
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
+		if perHour {
+			// Only with the row map: the file's own rows are named. Without
+			// it the flush's identities name rows of every hour file, and
+			// adopting one file would skip the others' rows (#1646).
+			b.recordFlushIntent(storagePath, int64(len(parquetData)), spans.rangesIn(bucket.indices))
+		}
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+			// The write may still land (#1635). With the row map, name this
+			// file's rows; without it the flush's identities cover them.
+			fw := &failedStorageWrite{err: fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err), path: storagePath, size: int64(len(parquetData))}
+			if perHour {
+				// Every row of the file named, or none: a row left out
+				// would be deleted with the file once the others are
+				// stored again. Empty is never recorded.
+				if fw.rows = spans.rangesIn(bucket.indices); rangeRows(fw.rows) != len(bucket.indices) {
+					fw.rows = []string{}
+				}
+			}
+			return partial(fw)
 		}
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
+
+		if perHour {
+			if cov == nil {
+				cov = groupCoverage(group, len(hourBuckets)) // nil without coverage
+			}
+			b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, cov.forFile(group.piecesAt(bucket.indices)))
+			b.syncRegistrations()
+			ranges := spans.rangesIn(bucket.indices)
+			b.ambiguous.stored(ranges) // #1635, as in completeFlush
+			checkpointed := b.checkpointRows(ctx, ranges)
+			for _, i := range bucket.indices {
+				writtenAt[i] = true
+			}
+			storedRows += splitRecordCount
+			storedFiles++
+			b.totalRecordsWritten.Add(int64(splitRecordCount))
+			b.totalFlushes.Add(1)
+			b.logger.Info().
+				Str("buffer_key", bufferKey).
+				Str("storage_path", storagePath).
+				Int64("hour_id", hourID).
+				Int("records", splitRecordCount).
+				Int("size_bytes", len(parquetData)).
+				Int("row_ranges", len(ranges)).
+				Bool("rows_checkpointed", checkpointed).
+				Msg("Wrote hour partition and registered it")
+			continue
+		}
 
 		written = append(written, tieringEntry{
 			storagePath: storagePath,
@@ -4957,15 +5508,20 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	}
 
 	// All hours written successfully — now register in tiering and cluster manifest.
-	totalWritten := 0
-	cov := groupCoverage(group, len(written))
+	// (Already done per hour when perHour: written is then empty.)
+	totalWritten := storedRows
+	if !perHour {
+		cov = groupCoverage(group, len(written))
+	}
 	for _, e := range written {
 		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
 		totalWritten += e.records
 	}
 
-	b.totalRecordsWritten.Add(int64(totalWritten))
-	b.totalFlushes.Add(int64(len(hourBuckets)))
+	if !perHour {
+		b.totalRecordsWritten.Add(int64(totalWritten))
+		b.totalFlushes.Add(int64(len(hourBuckets)))
+	}
 	b.publishBufferMetrics()
 
 	flushDuration := time.Since(startTime)
@@ -4990,7 +5546,10 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 		p.group.failed()
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
+	merged.flushIDs = p.walHashes // #1646
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, p.rows, time.Now().UTC(), p.group); err != nil {
+		need, named := walNeedOf(p.records)
+		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, p.rows, recordsWithoutWALCopy(p.records, p.rows))
 		b.markFlushFailure()
 		p.group.failed()
@@ -5003,6 +5562,38 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 // flushBufferLocked writes buffered data to Parquet and storage (synchronous version for periodic flush)
 // Note: Caller must hold shard.mu lock
 func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string) error {
+	e := b.extractBufferLocked(shard, bufferKey)
+	if e == nil {
+		return nil
+	}
+	// Release lock before expensive operations
+	shard.mu.Unlock()
+	err := b.writeExtracted(ctx, e, bufferKey, database, measurement)
+	// Re-acquire lock for caller
+	shard.mu.Lock()
+	return err
+}
+
+// extractedFlush is a buffer taken out of its shard for a synchronous write:
+// everything flushBufferLocked does under shard.mu, carried to the I/O that
+// runs without it. Split out so the aged sweep can extract every aged buffer
+// of a shard under one lock hold and then write them concurrently (#1632).
+type extractedFlush struct {
+	records        []interface{}
+	recordCount    int
+	walHashes      []string
+	group          *flushGroup
+	trackingID     uint64
+	estimatedBytes int64
+	taskID         uint64
+}
+
+// extractBufferLocked removes bufferKey's batches from the shard and registers
+// the write that will carry them, or returns nil when there is nothing to
+// write (clearing any stale tracking entries). Caller holds shard.mu and MUST
+// pass a non-nil result to writeExtracted: the records are no longer in the
+// buffer, and the async-flush task registered here is completed only there.
+func (b *ArrowBuffer) extractBufferLocked(shard *bufferShard, bufferKey string) *extractedFlush {
 	batches, exists := shard.buffers[bufferKey]
 	if !exists || len(batches) == 0 {
 		// Clean up stale tracking entries even if buffer is empty.
@@ -5023,18 +5614,17 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// Get record count before clearing buffer
 	recordCount := shard.bufferRecordCounts[bufferKey]
 	walHashes := collectWALHashes(batches)
-	group := b.newFlushGroup(bufferKey, batches, walHashes)
-	bufferStartTime := shard.bufferStartTimes[bufferKey]
-	estimatedBytes := estimateBufferedBatchesBytes(batches)
-	trackingID := b.trackFlush(bufferStartTime)
-	defer func() {
-		b.untrackFlush(trackingID)
-		b.bufferBytesBuffered.Add(-estimatedBytes)
-	}()
+	e := &extractedFlush{
+		recordCount:    recordCount,
+		walHashes:      walHashes,
+		group:          b.newFlushGroup(bufferKey, batches, walHashes),
+		trackingID:     b.trackFlush(shard.bufferStartTimes[bufferKey]),
+		estimatedBytes: estimateBufferedBatchesBytes(batches),
+	}
 
 	// Extract records to flush (hold lock for minimal time)
-	recordsToFlush := make([]interface{}, len(batches))
-	copy(recordsToFlush, batches)
+	e.records = make([]interface{}, len(batches))
+	copy(e.records, batches)
 
 	// Clear buffer immediately
 	delete(shard.deferredKeys, bufferKey)
@@ -5046,17 +5636,25 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// Account for direct (aged/periodic) storage writes as well as queued ones.
 	// Register before releasing shard.mu so a concurrent recovery fence cannot
 	// miss this flush after observing the extracted buffer as empty.
-	taskID := b.beginAsyncFlushTask()
-	completeTask := func() { b.completeAsyncFlushTask(taskID) }
+	e.taskID = b.beginAsyncFlushTask()
 
 	// The records have left the buffer and never enter the flush queue, so
 	// they count as in flight until the write ends; otherwise no gauge sees a
 	// synchronous flush (FlushAll, the flush before a DELETE, Close) at all.
 	b.adjustFlushRecordMetrics(0, int64(recordCount))
-	defer b.adjustFlushRecordMetrics(0, -int64(recordCount))
+	return e
+}
 
-	// Release lock before expensive operations
-	shard.mu.Unlock()
+// writeExtracted writes an extracted buffer. Called WITHOUT shard.mu. Always
+// completes the task and releases the accounting extractBufferLocked took.
+func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, bufferKey, database, measurement string) error {
+	recordCount, recordsToFlush, walHashes, group := e.recordCount, e.records, e.walHashes, e.group
+	defer func() {
+		b.untrackFlush(e.trackingID)
+		b.bufferBytesBuffered.Add(-e.estimatedBytes)
+	}()
+	defer b.adjustFlushRecordMetrics(0, -int64(recordCount))
+	completeTask := func() { b.completeAsyncFlushTask(e.taskID) }
 
 	if parts := b.splitForCoverage(bufferKey, recordsToFlush); parts != nil {
 		// Each class is its own group and file set (flush_split.go).
@@ -5067,7 +5665,6 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 			}
 		}
 		completeTask()
-		shard.mu.Lock() // Re-acquire lock for caller
 		return first
 	}
 
@@ -5078,25 +5675,23 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		b.markFlushFailure()
 		group.failed()
 		completeTask()
-		shard.mu.Lock() // Re-acquire lock for caller
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 
 	// Flush with data timestamp partitioning
 	startTime := time.Now().UTC()
+	merged.flushIDs = walHashes // #1646
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
+		need, named := walNeedOf(recordsToFlush)
+		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, recordCount, recordsWithoutWALCopy(recordsToFlush, recordCount))
 		b.markFlushFailure()
 		group.failed()
 		completeTask()
-		shard.mu.Lock() // Re-acquire lock for caller
 		return err
 	}
 	b.completeFlush(walHashes, group)
 	completeTask()
-
-	// Re-acquire lock for caller
-	shard.mu.Lock()
 	return nil
 }
 
@@ -5116,6 +5711,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 	// If only one batch, return it directly
 	if len(batches) == 1 {
 		if tcb, ok := batches[0].(*TypedColumnBatch); ok {
+			tcb.walSpans = walRowSpansOf(batches)
 			return tcb, nil
 		}
 		// Legacy: bare map without validity (e.g. from WAL replay)
@@ -5346,7 +5942,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		}
 	}
 
-	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime}, nil
+	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime, walSpans: walRowSpansOf(batches)}, nil
 }
 
 // sortColumnsByTime sorts all columns by the time column in-place
@@ -6127,7 +6723,7 @@ func (b *ArrowBuffer) countFutureStamped(database, measurement string, times []i
 // warnOncePerMinute rate-limits a warning per kind and measurement. Two
 // flushes racing past the check may both warn; that is harmless.
 func (b *ArrowBuffer) warnOncePerMinute(kind, database, measurement string, now time.Time) bool {
-	key := kind + "|" + database + "/" + measurement
+	key := kind + "|" + database + "/" + measurement // neither name has a "/" (#1475)
 	nowNano := now.UnixNano()
 	if v, ok := b.futureStampWarned.Load(key); ok && nowNano-v.(int64) < int64(time.Minute) {
 		return false
@@ -6446,7 +7042,8 @@ func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) b
 // Ordering, and why each step is where it is:
 //
 //  1. Set b.closing. tryEnqueueFlush reads it to decide that no worker will take
-//     a task, and the aged sweep reads it to stop between buffers.
+//     a task, and the aged sweep reads it to stop extracting buffers (what it
+//     already extracted it still writes before returning).
 //  2. b.cancel() stops the background loops — the metrics sampler, the periodic
 //     flush, and the workers' receive select. It does NOT reach flush I/O: every
 //     flush context derives from flushParent (context.WithoutCancel), so a write
@@ -6684,6 +7281,15 @@ func (b *ArrowBuffer) Close() error {
 	}
 	b.closeFlushClean.Store(!b.closeFailed.Load())
 
+	// The flushes above may have stored the replayed rows of a failed write
+	// whose late copy is now due for removal (#1635). What is left of the
+	// budget, at most 10 s: storage is still open (it closes after the buffer).
+	sweepBudget := time.Until(deadline)
+	if sweepBudget > 10*time.Second {
+		sweepBudget = 10 * time.Second
+	}
+	b.closeAmbiguousWrites(sweepBudget)
+
 	b.logger.Info().
 		Int64("total_records_written", b.totalRecordsWritten.Load()).
 		Int64("total_flushes", b.totalFlushes.Load()).
@@ -6787,8 +7393,16 @@ drain:
 
 			b.markFlushTaskInFlight(task)
 			if err := b.flushTrackedTask(flushCtx, task); err != nil {
+				// A multi-hour flush that stored some hour files first
+				// (#1492): those rows are stored and checkpointed, not
+				// unwritten.
+				stored := 0
+				var partial *flushPartialError
+				if errors.As(err, &partial) {
+					stored = partial.StoredRows
+				}
 				mu.Lock()
-				unwrit += task.recordCount - noWAL
+				unwrit += task.recordCount - noWAL - stored
 				mu.Unlock()
 			}
 		}()

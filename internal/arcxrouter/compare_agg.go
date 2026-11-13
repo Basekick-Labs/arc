@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -40,8 +41,12 @@ const aggFloatRelTol = 1e-9
 type aggCell struct {
 	isNull bool
 	isInt  bool
+	isBool bool     // agg-6b' bool_and / bool_or (exact compare)
 	i      *big.Int // isInt: count, integer sum, timestamp µs
-	f      float64  // !isInt: float sum/avg/min/max
+	f      float64  // !isInt && !isBool: float sum/avg/min/max
+	b      bool     // isBool
+	isStr  bool     // agg-7 mode over VARCHAR (exact compare)
+	s      string   // isStr
 }
 
 // aggFromRows scans DuckDB's single aggregate row. The driver hands back int64
@@ -79,6 +84,12 @@ func aggFromRows(rows *sql.Rows) ([]aggCell, error) {
 			out[i] = aggCell{isNull: true}
 		case int64:
 			out[i] = aggCell{isInt: true, i: big.NewInt(x)}
+		case uint32: // agg-6b regr_count (UINTEGER)
+			out[i] = aggCell{isInt: true, i: big.NewInt(int64(x))}
+		case bool: // agg-6b' bool_and / bool_or
+			out[i] = aggCell{isBool: true, b: x}
+		case string: // agg-7 mode over VARCHAR
+			out[i] = aggCell{isStr: true, s: x}
 		case *big.Int:
 			out[i] = aggCell{isInt: true, i: x}
 		case float64:
@@ -112,6 +123,24 @@ func aggFromArcx(rec arrow.Record) ([]aggCell, error) {
 			} else {
 				out[c] = aggCell{f: col.Value(0)}
 			}
+		case *array.Uint32: // agg-6b regr_count
+			if col.IsNull(0) {
+				out[c] = aggCell{isNull: true}
+			} else {
+				out[c] = aggCell{isInt: true, i: big.NewInt(int64(col.Value(0)))}
+			}
+		case *array.Boolean: // agg-6b' bool_and / bool_or
+			if col.IsNull(0) {
+				out[c] = aggCell{isNull: true}
+			} else {
+				out[c] = aggCell{isBool: true, b: col.Value(0)}
+			}
+		case *array.String: // agg-7 mode over VARCHAR
+			if col.IsNull(0) {
+				out[c] = aggCell{isNull: true}
+			} else {
+				out[c] = aggCell{isStr: true, s: col.Value(0)}
+			}
 		case *array.Timestamp:
 			if col.IsNull(0) {
 				out[c] = aggCell{isNull: true}
@@ -126,10 +155,49 @@ func aggFromArcx(rec arrow.Record) ([]aggCell, error) {
 	return out, nil
 }
 
-// aggItemTolerant reports whether the item's float result carries the documented
-// tolerance (sum/avg — order-dependent reductions). min/max/count stay exact.
-func aggItemTolerant(item string) bool {
-	return len(item) > 4 && (item[:4] == "sum(" || item[:4] == "avg(")
+// isShapeItem reports an agg-8 shape-statistic item. DuckDB 1.5.6 computes these
+// from raw power sums: on constant columns and high-offset data its result is
+// architecture-dependent garbage, NULL or NaN where the true value exists (arcX
+// agg-8 adversarial B2), while arcx computes central moments exactly. So ANY
+// difference on these cells — value, NULL-ness, NaN-ness — is filed as
+// `oraclediff:` (WARN), never a mismatch alarm; their correctness is pinned by
+// the engine's exact-reference fixtures, and the shadow comparison is
+// informational.
+var shapeItemPrefixes = []string{"skewness(", "kurtosis(", "kurtosis_pop("}
+
+func isShapeItem(item string) bool {
+	for _, p := range shapeItemPrefixes {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// shapeKindDiffers: a kind difference (int/bool/string vs float) on a shape cell
+// is a structural engine bug — oracle garbage can't change a value's type — so it
+// still alarms (review M1).
+func shapeKindDiffers(a, d aggCell) bool {
+	if a.isNull || d.isNull {
+		return false
+	}
+	return a.isInt != d.isInt || a.isBool != d.isBool || a.isStr != d.isStr
+}
+
+// shapeCellDiffers: true when two shape cells differ beyond the tolerance in any
+// way (NULL-ness, NaN-ness, Inf-ness, value).
+func shapeCellDiffers(a, d aggCell) bool {
+	if a.isNull || d.isNull {
+		return a.isNull != d.isNull
+	}
+	if math.IsNaN(a.f) || math.IsNaN(d.f) {
+		return !(math.IsNaN(a.f) && math.IsNaN(d.f))
+	}
+	if math.IsInf(a.f, 0) || math.IsInf(d.f, 0) {
+		return a.f != d.f
+	}
+	scale := math.Max(math.Abs(a.f), math.Abs(d.f))
+	return math.Abs(a.f-d.f) > aggFloatRelTol*math.Max(scale, 1.0)
 }
 
 // compareAgg returns "" on match, else a short VALUE-FREE diff.
@@ -147,6 +215,7 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	// nondeterministic; arcx's is pinned). Structural diffs (null-ness/kind)
 	// on arg cells still alarm: ties can't change a cell's type.
 	argDiff := ""
+	oracleDiff := ""
 	deferArg := func(c int, msg string) bool {
 		if c < len(items) && isArgItem(items[c]) {
 			if argDiff == "" {
@@ -158,10 +227,37 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	}
 	for c := range got {
 		a, d := got[c], oracle[c]
+		if c < len(items) && isShapeItem(items[c]) {
+			if shapeKindDiffers(a, d) {
+				return fmt.Sprintf("agg col %d differs (kind on a shape statistic)", c)
+			}
+			if shapeCellDiffers(a, d) && oracleDiff == "" {
+				oracleDiff = fmt.Sprintf("agg col %d differs (shape statistic vs DuckDB 1.5.6 raw sums, values withheld)", c)
+			}
+			continue
+		}
 		if a.isNull != d.isNull {
 			return fmt.Sprintf("agg col %d differs (null-ness: arcx_null=%t duckdb_null=%t)", c, a.isNull, d.isNull)
 		}
 		if a.isNull {
+			continue
+		}
+		if a.isBool != d.isBool {
+			return fmt.Sprintf("agg col %d differs (kind: arcx_bool=%t duckdb_bool=%t)", c, a.isBool, d.isBool)
+		}
+		if a.isBool {
+			if a.b != d.b {
+				return fmt.Sprintf("agg col %d differs (boolean value withheld from log)", c)
+			}
+			continue
+		}
+		if a.isStr != d.isStr {
+			return fmt.Sprintf("agg col %d differs (kind: arcx_str=%t duckdb_str=%t)", c, a.isStr, d.isStr)
+		}
+		if a.isStr {
+			if a.s != d.s {
+				return fmt.Sprintf("agg col %d differs (string value withheld from log)", c)
+			}
 			continue
 		}
 		if a.isInt != d.isInt {
@@ -187,6 +283,26 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 				continue
 			}
 			msg := fmt.Sprintf("agg col %d differs (NaN-ness: arcx_nan=%t duckdb_nan=%t)", c, math.IsNaN(a.f), math.IsNaN(d.f))
+			if math.IsNaN(a.f) && math.IsInf(d.f, 0) && c < len(items) && isPinnedNaNItem(items[c]) {
+				if oracleDiff == "" {
+					oracleDiff = msg
+				}
+				continue
+			}
+			if deferArg(c, msg) {
+				continue
+			}
+			return msg
+		}
+		// ±Inf on either side compares exactly. The tolerance test below cannot
+		// see it: |finite − Inf| = Inf and 1e-9·max(Inf, 1) = Inf, and Inf > Inf
+		// is false — a finite-vs-Inf (or +Inf-vs-−Inf) divergence passed as a
+		// match (found by the agg-6b' plan review).
+		if math.IsInf(a.f, 0) || math.IsInf(d.f, 0) {
+			if a.f == d.f {
+				continue
+			}
+			msg := fmt.Sprintf("agg col %d differs (Inf-ness, values withheld)", c)
 			if deferArg(c, msg) {
 				continue
 			}
@@ -196,7 +312,14 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 		if tolerant {
 			scale := math.Max(math.Abs(a.f), math.Abs(d.f))
 			if math.Abs(a.f-d.f) > aggFloatRelTol*math.Max(scale, 1.0) {
-				return fmt.Sprintf("agg col %d differs (float beyond 1e-9 tolerance, values withheld)", c)
+				msg := fmt.Sprintf("agg col %d differs (float beyond 1e-9 tolerance, values withheld)", c)
+				if c < len(items) && isOracleUnstableItem(items[c]) {
+					if oracleDiff == "" {
+						oracleDiff = msg
+					}
+					continue
+				}
+				return msg
 			}
 		} else if a.f != d.f {
 			msg := fmt.Sprintf("agg col %d differs (float values withheld from log)", c)
@@ -208,6 +331,9 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	}
 	if argDiff != "" {
 		return "argdiff:" + argDiff
+	}
+	if oracleDiff != "" {
+		return "oraclediff:" + oracleDiff
 	}
 	return ""
 }

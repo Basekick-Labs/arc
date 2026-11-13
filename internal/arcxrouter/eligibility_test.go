@@ -77,7 +77,7 @@ func TestEligibleShape_ScalarAggregates(t *testing.T) {
 func TestEligibleShape_ScalarDeclines(t *testing.T) {
 	for _, sql := range []string{
 		"SELECT max(time) FROM cpu GROUP BY 1",
-		"SELECT min(time) AS m FROM cpu",
+		"SELECT min(time) m FROM cpu",
 		"SELECT min(time + 1) FROM cpu",
 		"SELECT min(*) FROM cpu",
 		// NOTE: `sum(value)`, `avg(value)`, `min(a), max(b)`, and WHERE-bearing
@@ -121,7 +121,7 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"count with join", "SELECT count(*) FROM cpu JOIN mem ON cpu.time = mem.time"},
 		// NOTE: `count(x)` is now ELIGIBLE (ShapeCountCol, Phase 1b) — no longer a
 		// decline. Its acceptance is covered by TestEligibleShape_ScalarAggregates.
-		{"count alias", "SELECT count(*) AS n FROM cpu"},
+		{"count alias", "SELECT count(*) n FROM cpu"},
 		{"count two tables", "SELECT count(*) FROM cpu, mem"},
 		// NOTE: `sum(x)` is now ELIGIBLE (ShapeScanAgg, agg-1) — no longer a
 		// decline. Its acceptance is covered by TestScanAggRecognized.
@@ -145,16 +145,12 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"agg extra projection", "SELECT date_trunc('day', time), host, count(*) FROM cpu GROUP BY 1"},
 		// (plain `HAVING count(*) > 1` became ELIGIBLE at agg-5a — see
 		// TestHavingEligibility. These HAVING forms still decline.)
-		{"having on an agg not in the select list", "SELECT host, count(*) FROM cpu GROUP BY host HAVING sum(x) > 1"},
 		{"having on an unknown name", "SELECT host, count(*) FROM cpu GROUP BY host HAVING nope > 1"},
-		{"having with an expression over an agg", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) + 1 > 2"},
+		{"having with an integer division over an agg", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) // 2 > 2"},
 		{"having comparing two aggs", "SELECT host, count(*), sum(x) FROM cpu GROUP BY host HAVING count(*) > sum(x)"},
-		{"having IS NULL", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) IS NULL"},
-		{"having BETWEEN", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) BETWEEN 1 AND 2"},
-		{"having count(DISTINCT)", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(DISTINCT x) > 1"},
+		{"having sum(DISTINCT)", "SELECT host, count(*) FROM cpu GROUP BY host HAVING sum(DISTINCT x) > 1"},
 		{"ungrouped having", "SELECT count(*) FROM cpu HAVING count(*) > 1"},
 		{"having on a bucket alias that was never declared", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 HAVING h > 1"},
-		{"agg order by 2", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 ORDER BY 2"},
 		// "agg sum not count": the agg-3 surface itself — now eligible (grouped).
 
 		// --- TZ-injection declines (M3) ---
