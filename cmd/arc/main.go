@@ -3541,7 +3541,13 @@ func main() {
 				MaxFiles:      cfg.EdgeSync.Import.MaxFiles,
 				FlushManifest: flushManifest,
 				HoldPaths:     edgeSyncHoldPaths(clusterCoordinator),
-				Logger:        importLogger,
+				// #1684: sign the hub's verify answer into each ack, so an
+				// air-gapped spoke can delete what the hub provably holds.
+				Verify: func(ctx context.Context, spokeID string, entries []edgesync.ReconcileEntry) (*edgesync.VerifyResult, error) {
+					return reconciler.Verify(ctx, spokeID, entries, nil)
+				},
+				VerifyMaxEntries: reconciler.MaxEntries(),
+				Logger:           importLogger,
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create the bundle importer; refusing to start")
@@ -3812,6 +3818,50 @@ func main() {
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create the bundle exporter; refusing to start")
+			}
+			if cfg.EdgeSync.Spoke.DeleteAfterSync {
+				// #1684: files a signed ack attests as held are deleted right
+				// after the ack is applied, and on a timer for the delay.
+				attested := &edgesync.AttestedDeleter{
+					Ledger: spokeLedger,
+					HubID:  cfg.EdgeSync.Spoke.HubID,
+					Delete: spokeLocalDeleter(storageBackend, &spokeDeleteTiering, &spokeDeleteReady),
+					AfterDeletes: func() {
+						if f := spokeDeleteInvalidate.Load(); f != nil {
+							(*f)()
+						}
+					},
+					Delay:           cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
+					MaxAge:          cfg.EdgeSync.Spoke.DeleteAfterSyncAckMaxAge,
+					AcceptCompacted: cfg.EdgeSync.Spoke.DeleteAfterSyncAcceptCompacted,
+					Logger:          spokeLogger,
+				}
+				bundleExporter.SetAttestedDeleter(attested)
+				attestedCtx, attestedCancel := context.WithCancel(context.Background())
+				var attestedWG sync.WaitGroup
+				shutdownCoordinator.RegisterHook("edgesync-attested-delete", func(context.Context) error {
+					attestedCancel()
+					attestedWG.Wait() // an in-flight run finishes before the ledger closes
+					return nil
+				}, shutdown.PriorityBuffer)
+				attestedWG.Add(1)
+				go func() {
+					defer attestedWG.Done()
+					ticker := time.NewTicker(15 * time.Minute)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-attestedCtx.Done():
+							return
+						case <-ticker.C:
+							if n, err := attested.Run(attestedCtx); err != nil && attestedCtx.Err() == nil {
+								spokeLogger.Warn().Err(err).Msg("delete_after_sync: deleting attested files stopped; the next run retries")
+							} else if n > 0 {
+								spokeLogger.Info().Int("deleted", n).Msg("delete_after_sync: deleted local copies an acknowledgment attested as held")
+							}
+						}
+					}
+				}()
 			}
 		}
 
@@ -6032,7 +6082,7 @@ func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manag
 			return nil
 		}
 		if size != wantSize {
-			return fmt.Errorf("local size %d differs from the synced size %d", size, wantSize)
+			return fmt.Errorf("%w: local size %d, synced size %d", edgesync.ErrLocalChanged, size, wantSize)
 		}
 		mgr := tm.Load()
 		if mgr != nil {

@@ -34,6 +34,13 @@ func TestDeleteAfterSyncConfig(t *testing.T) {
 		{"plain http refused", map[string]string{"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC": "true", "ARC_EDGE_SYNC_SPOKE_HUB_URL": "http://hub.example:8000"}, "https", nil},
 		{"cluster refused", map[string]string{"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC": "true", "ARC_CLUSTER_ENABLED": "true"}, "cluster", nil},
 		{"needs spoke.enabled", map[string]string{"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC": "true", "ARC_EDGE_SYNC_SPOKE_ENABLED": "false"}, "edge_sync.spoke.enabled", nil},
+		{"air-gapped: bundles only", map[string]string{"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC": "true", "ARC_EDGE_SYNC_SPOKE_ENABLED": "false",
+			"ARC_EDGE_SYNC_SPOKE_BUNDLE_ENABLED": "true", "ARC_EDGE_SYNC_SPOKE_BUNDLE_ALLOWED_DIRS": "/tmp", "ARC_EDGE_SYNC_SPOKE_HUB_URL": "http://hub.example:8000"}, "", func(t *testing.T, c *Config) {
+			if c.EdgeSync.Spoke.DeleteAfterSyncAckMaxAge != 7*24*time.Hour {
+				t.Fatalf("ack max age default = %s, want 168h", c.EdgeSync.Spoke.DeleteAfterSyncAckMaxAge)
+			}
+		}},
+		{"ack max age non-positive", map[string]string{"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_ACK_MAX_AGE": "0s"}, "delete_after_sync_ack_max_age", nil},
 		{"negative delay", map[string]string{"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY": "-1s"}, "delete_after_sync_delay", nil},
 		{"delay beyond retention", map[string]string{"ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC": "true", "ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY": "2400h", "ARC_EDGE_SYNC_SPOKE_LEDGER_RETENTION_DAYS": "90"}, "ledger_retention_days", nil},
 	} {
