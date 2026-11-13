@@ -251,6 +251,20 @@ func suggestTargetName(name string) string {
 // BackupTargetConfig.Type).
 func setBackupTargetDefaults(v *viper.Viper, name string) {
 	k := "backup.targets." + name + "."
+	setObjectTargetDefaults(v, k)
+	// A string default rather than an empty []string, so an unset key reads
+	// back as the scalar spelling rather than as an empty array, which is the
+	// shape parseTargetDatabases treats as "nothing routed" without having to
+	// distinguish the two. Required like every other key (the SQLite checklist
+	// rule): without it the key is invisible to an operator reading the
+	// defaults.
+	v.SetDefault(k+"databases", "")
+}
+
+// setObjectTargetDefaults registers the backend fields of a storage target
+// whose keys start with k (ending in "."): a backup target, or an edge sync
+// relay bucket (#1685).
+func setObjectTargetDefaults(v *viper.Viper, k string) {
 	v.SetDefault(k+"type", "")
 	v.SetDefault(k+"local_path", "")
 	v.SetDefault(k+"s3_bucket", "")
@@ -273,13 +287,37 @@ func setBackupTargetDefaults(v *viper.Viper, name string) {
 	v.SetDefault(k+"gcs_prefix", "")
 	v.SetDefault(k+"gcs_credentials_file", "")
 	v.SetDefault(k+"gcs_endpoint", "")
-	// A string default rather than an empty []string, so an unset key reads
-	// back as the scalar spelling rather than as an empty array, which is the
-	// shape parseTargetDatabases treats as "nothing routed" without having to
-	// distinguish the two. Required like every other key (the SQLite checklist
-	// rule): without it the key is invisible to an operator reading the
-	// defaults.
-	v.SetDefault(k+"databases", "")
+}
+
+// readObjectTarget reads the backend fields of a storage target whose keys
+// start with k (ending in "."). Databases is not read: it is backup routing.
+func readObjectTarget(v *viper.Viper, name, k string) BackupTargetConfig {
+	get := func(field string) string { return strings.TrimSpace(v.GetString(k + field)) }
+	return BackupTargetConfig{
+		Name:                    name,
+		Type:                    strings.ToLower(get("type")),
+		LocalPath:               get("local_path"),
+		S3Bucket:                get("s3_bucket"),
+		S3Region:                get("s3_region"),
+		S3Endpoint:              get("s3_endpoint"),
+		S3AccessKey:             v.GetString(k + "s3_access_key"),
+		S3SecretKey:             v.GetString(k + "s3_secret_key"),
+		S3UseSSL:                v.GetBool(k + "s3_use_ssl"),
+		S3PathStyle:             v.GetBool(k + "s3_path_style"),
+		S3Prefix:                get("s3_prefix"),
+		AzureContainer:          get("azure_container"),
+		AzurePrefix:             get("azure_prefix"),
+		AzureConnectionString:   get("azure_connection_string"),
+		AzureAccountName:        get("azure_account_name"),
+		AzureAccountKey:         get("azure_account_key"),
+		AzureSASToken:           get("azure_sas_token"),
+		AzureEndpoint:           get("azure_endpoint"),
+		AzureUseManagedIdentity: v.GetBool(k + "azure_use_managed_identity"),
+		GCSBucket:               get("gcs_bucket"),
+		GCSPrefix:               get("gcs_prefix"),
+		GCSCredentialsFile:      get("gcs_credentials_file"),
+		GCSEndpoint:             get("gcs_endpoint"),
+	}
 }
 
 // parseTargetDatabases reads backup.targets.<name>.databases.
@@ -374,33 +412,9 @@ func loadBackupTargets(v *viper.Viper) (map[string]BackupTargetConfig, error) {
 	for _, name := range names {
 		setBackupTargetDefaults(v, name)
 		k := "backup.targets." + name + "."
-		get := func(field string) string { return strings.TrimSpace(v.GetString(k + field)) }
-		targets[name] = BackupTargetConfig{
-			Name:                    name,
-			Type:                    strings.ToLower(get("type")),
-			LocalPath:               get("local_path"),
-			S3Bucket:                get("s3_bucket"),
-			S3Region:                get("s3_region"),
-			S3Endpoint:              get("s3_endpoint"),
-			S3AccessKey:             v.GetString(k + "s3_access_key"),
-			S3SecretKey:             v.GetString(k + "s3_secret_key"),
-			S3UseSSL:                v.GetBool(k + "s3_use_ssl"),
-			S3PathStyle:             v.GetBool(k + "s3_path_style"),
-			S3Prefix:                get("s3_prefix"),
-			AzureContainer:          get("azure_container"),
-			AzurePrefix:             get("azure_prefix"),
-			AzureConnectionString:   get("azure_connection_string"),
-			AzureAccountName:        get("azure_account_name"),
-			AzureAccountKey:         get("azure_account_key"),
-			AzureSASToken:           get("azure_sas_token"),
-			AzureEndpoint:           get("azure_endpoint"),
-			AzureUseManagedIdentity: v.GetBool(k + "azure_use_managed_identity"),
-			GCSBucket:               get("gcs_bucket"),
-			GCSPrefix:               get("gcs_prefix"),
-			GCSCredentialsFile:      get("gcs_credentials_file"),
-			GCSEndpoint:             get("gcs_endpoint"),
-			Databases:               parseTargetDatabases(v.Get(k + "databases")),
-		}
+		t := readObjectTarget(v, name, k)
+		t.Databases = parseTargetDatabases(v.Get(k + "databases"))
+		targets[name] = t
 	}
 	return targets, nil
 }
@@ -886,4 +900,29 @@ func (c *Config) coldTierDestination() (storage.Destination, error) {
 			Endpoint: cold.GCSEndpoint,
 		},
 	})
+}
+
+// loadEdgeSyncRelay reads edge_sync.spoke.relay.* or edge_sync.import.relay.*
+// (#1685). k ends in ".". Durations are parsed only when the relay is on, so
+// a malformed value on a disabled side does not stop a node that never reads
+// it.
+func loadEdgeSyncRelay(v *viper.Viper, k string, spoke bool) (EdgeSyncRelayConfig, error) {
+	r := EdgeSyncRelayConfig{
+		Enabled:    v.GetBool(k + "enabled"),
+		StagingDir: strings.TrimSpace(v.GetString(k + "staging_dir")),
+		Target:     readObjectTarget(v, "relay", k),
+	}
+	if !r.Enabled {
+		return r, nil
+	}
+	var err error
+	if r.Interval, err = parsePositiveDuration(v, k+"interval"); err != nil {
+		return r, err
+	}
+	if spoke {
+		if r.AckTimeout, err = parsePositiveDuration(v, k+"ack_timeout"); err != nil {
+			return r, err
+		}
+	}
+	return r, nil
 }

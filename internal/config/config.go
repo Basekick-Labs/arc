@@ -400,6 +400,37 @@ type EdgeSyncImportConfig struct {
 	// edge_sync.import.timeout; always positive. Default 4h: every file is
 	// hashed twice (verify, then commit), off removable media (#1112).
 	Timeout time.Duration
+
+	// Relay polls a bucket shared with spokes for bundles (edge sync 3d,
+	// #1685): edge_sync.import.relay.*. Independent of Enabled, which mounts
+	// the drive-import endpoint.
+	Relay EdgeSyncRelayConfig
+}
+
+// Active reports whether this hub takes bundles at all, from a drive or a
+// relay bucket: both need the importer.
+func (c EdgeSyncImportConfig) Active() bool { return c.Enabled || c.Relay.Enabled }
+
+// EdgeSyncRelayConfig configures one side of the relay transport (#1685): a
+// spoke and its hub exchange bundles and acks through an object store both
+// can reach. The target's own prefix (s3_prefix, azure_prefix) or local_path
+// is the relay's root; spoke prefixes sit directly under it.
+type EdgeSyncRelayConfig struct {
+	// Enabled turns the relay on for this side.
+	Enabled bool
+	// Interval between scheduled passes (spoke: export and apply acks; hub:
+	// poll). Scheduled passes need the edge sync scheduler licence; a manual
+	// pass (POST .../relay/run) does not. Spoke default 5m, hub 1m.
+	Interval time.Duration
+	// AckTimeout (spoke only): a relay bundle with no ack and no refusal this
+	// long after export is taken back and its files re-sent. Default 72h.
+	AckTimeout time.Duration
+	// StagingDir (hub only): where a bundle is downloaded to be verified and
+	// imported, one at a time. Default ./data/edge_sync_relay_staging.
+	StagingDir string
+	// Target is the bucket: type (local, s3, minio, azure, azblob) and the
+	// same per-backend keys a backup target takes. Name is "relay".
+	Target BackupTargetConfig
 }
 
 // EdgeSyncSpokeConfig configures the push side of edge sync (#569).
@@ -518,6 +549,10 @@ type EdgeSyncSpokeConfig struct {
 
 	// Bundle configures air-gap export.
 	Bundle EdgeSyncBundleConfig
+
+	// Relay sends bundles through a bucket shared with the hub (edge sync
+	// 3d, #1685): edge_sync.spoke.relay.*.
+	Relay EdgeSyncRelayConfig
 }
 
 // EdgeSyncBundleConfig configures air-gap bundle export on a spoke.
@@ -547,6 +582,13 @@ type EdgeSyncBundleConfig struct {
 	// edge_sync.spoke.bundle.timeout; always positive. Default 2h (#1112).
 	Timeout time.Duration
 }
+
+// Active reports whether this node acts as a spoke on any transport.
+func (s EdgeSyncSpokeConfig) Active() bool { return s.Enabled || s.Bundle.Enabled || s.Relay.Enabled }
+
+// ExportsBundles reports whether this spoke writes bundles, to a drive or a
+// relay bucket: both need the exporter, and both deliver signed acks.
+func (s EdgeSyncSpokeConfig) ExportsBundles() bool { return s.Bundle.Enabled || s.Relay.Enabled }
 
 type WALConfig struct {
 	Enabled                 bool   // Enable WAL for durability (default: false)
@@ -1202,6 +1244,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	spokeRelay, err := loadEdgeSyncRelay(v, "edge_sync.spoke.relay.", true)
+	if err != nil {
+		return nil, err
+	}
+	hubRelay, err := loadEdgeSyncRelay(v, "edge_sync.import.relay.", false)
+	if err != nil {
+		return nil, err
+	}
 
 	backupOperationTimeout, err := time.ParseDuration(v.GetString("backup.operation_timeout"))
 	if err != nil || backupOperationTimeout <= 0 {
@@ -1329,6 +1379,7 @@ func Load() (*Config, error) {
 				AllowedDirs: parseAllowedDirs(v.Get("edge_sync.import.allowed_dirs")),
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
 				Timeout:     hubImportTimeout,
+				Relay:       hubRelay,
 			},
 			Spoke: EdgeSyncSpokeConfig{
 				Enabled:                        v.GetBool("edge_sync.spoke.enabled"),
@@ -1356,6 +1407,7 @@ func Load() (*Config, error) {
 					MaxBytes:    v.GetInt64("edge_sync.spoke.bundle.max_bytes"),
 					Timeout:     spokeBundleTimeout,
 				},
+				Relay: spokeRelay,
 			},
 		},
 		Compaction: CompactionConfig{
@@ -2131,6 +2183,10 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if err := cfg.validateEdgeSyncRelay(); err != nil {
+		return nil, err
+	}
+
 	// A hub without an ID cannot authenticate anything: hub_id is bound into
 	// every request MAC, so an empty value would mean every spoke signs for
 	// the same anonymous hub and a request captured at one could be replayed
@@ -2252,8 +2308,8 @@ func parsePositiveDuration(v *viper.Viper, key string) (time.Duration, error) {
 
 // checkDeleteAfterSync refuses edge_sync.spoke.delete_after_sync where it
 // cannot be safe (phase 3a). It deletes edge data on the hub's word, so:
-//   - the network path or bundle export must be on: the hub verifies a file
-//     in a reconcile or in a signed bundle acknowledgment;
+//   - the network path, bundle export or the relay must be on: the hub
+//     verifies a file in a reconcile or in a signed bundle acknowledgment;
 //   - not on a cluster node: a delete there would have to go through the Raft
 //     manifest first, which this does not do;
 //   - with the network path on, the hub must be reached over https or on a
@@ -2263,8 +2319,8 @@ func parsePositiveDuration(v *viper.Viper, key string) (time.Duration, error) {
 //     pruned before they could ever be verified.
 func checkDeleteAfterSync(cfg *Config) error {
 	s := cfg.EdgeSync.Spoke
-	if !s.Enabled && !s.Bundle.Enabled {
-		return fmt.Errorf("edge_sync.spoke.delete_after_sync requires edge_sync.spoke.enabled or edge_sync.spoke.bundle.enabled: the hub must verify a file, over the network or in a signed bundle acknowledgment, before the spoke deletes it")
+	if !s.Active() {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync requires edge_sync.spoke.enabled, edge_sync.spoke.bundle.enabled or edge_sync.spoke.relay.enabled: the hub must verify a file, over the network or in a signed bundle acknowledgment, before the spoke deletes it")
 	}
 	if cfg.Cluster.Enabled {
 		return fmt.Errorf("edge_sync.spoke.delete_after_sync is not supported on a cluster node (cluster.enabled)")
@@ -2272,11 +2328,11 @@ func checkDeleteAfterSync(cfg *Config) error {
 	if s.LedgerRetentionDays > 0 && s.DeleteAfterSyncDelay >= time.Duration(s.LedgerRetentionDays)*24*time.Hour {
 		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.ledger_retention_days (%d days)", s.DeleteAfterSyncDelay, s.LedgerRetentionDays)
 	}
-	if s.Bundle.Enabled && s.DeleteAfterSyncDelay >= s.DeleteAfterSyncAckMaxAge {
+	if s.ExportsBundles() && s.DeleteAfterSyncDelay >= s.DeleteAfterSyncAckMaxAge {
 		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.delete_after_sync_ack_max_age (%s): no acknowledged file could ever be deleted", s.DeleteAfterSyncDelay, s.DeleteAfterSyncAckMaxAge)
 	}
 	if !s.Enabled {
-		// Air-gapped: acks are HMAC-signed with the spoke secret, so the
+		// Air-gapped or relay-only: acks are HMAC-signed with the spoke secret, so the
 		// https requirement below (an unsigned network answer) does not apply.
 		return nil
 	}
@@ -2480,6 +2536,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.bundle.max_files", 10000)
 	v.SetDefault("edge_sync.spoke.bundle.max_bytes", int64(64)<<30) // 64 GiB
 	v.SetDefault("edge_sync.spoke.bundle.timeout", "2h")            // one bundle export
+	// Relay transport (#1685). The target keys mirror a backup target's.
+	v.SetDefault("edge_sync.spoke.relay.enabled", false)
+	v.SetDefault("edge_sync.spoke.relay.interval", "5m")
+	v.SetDefault("edge_sync.spoke.relay.ack_timeout", "72h")
+	setObjectTargetDefaults(v, "edge_sync.spoke.relay.")
+	v.SetDefault("edge_sync.import.relay.enabled", false)
+	v.SetDefault("edge_sync.import.relay.interval", "1m")
+	v.SetDefault("edge_sync.import.relay.staging_dir", "./data/edge_sync_relay_staging")
+	setObjectTargetDefaults(v, "edge_sync.import.relay.")
 
 	v.SetDefault("compaction.enabled", true)
 	v.SetDefault("compaction.hourly_schedule", "5 * * * *")        // Every hour at :05
