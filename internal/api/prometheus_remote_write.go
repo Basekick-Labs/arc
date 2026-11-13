@@ -28,14 +28,26 @@ const (
 	maxRemoteWriteLabels         = 1_000_000
 	prometheusRemoteWriteVersion = "0.1.0"
 	prometheusValueColumn        = "value"
+	remoteWriteProtocolName      = "Prometheus remote write"
+	// maxRemoteWriteLabelBytes bounds the label bytes a request materialises:
+	// a series sends its labels once and every sample row repeats them, so a
+	// small body with a long label and many samples would otherwise build
+	// gigabytes of strings at flush and in the WAL. A line-protocol body of
+	// the same rows carries those bytes itself.
+	maxRemoteWriteLabelBytes = maxRemoteWritePayloadBytes
+	// maxSnappyRatio is above the largest ratio a Snappy block reaches (a
+	// 64-byte copy in a 3-byte tag): a block declaring more is corrupt, and
+	// decoding it would allocate the declared length first.
+	maxSnappyRatio = 32
 )
 
 var (
-	errRemoteWriteTooBig         = errors.New("remote write payload exceeds 100 MiB limit")
-	errRemoteWriteTooManyCells   = errors.New("remote write request exceeds 4 million column cells")
-	errRemoteWriteTooManySeries  = errors.New("remote write request exceeds 100,000 time series")
-	errRemoteWriteTooManySamples = errors.New("remote write request exceeds 1 million samples")
-	errRemoteWriteTooManyLabels  = errors.New("remote write request exceeds 1 million labels")
+	errRemoteWriteTooBig            = errors.New("remote write payload exceeds 100 MiB limit")
+	errRemoteWriteTooManyCells      = errors.New("remote write request exceeds 4 million column cells")
+	errRemoteWriteTooManyLabelBytes = errors.New("remote write request repeats more than 100 MiB of label values across its samples")
+	errRemoteWriteTooManySeries     = errors.New("remote write request exceeds 100,000 time series")
+	errRemoteWriteTooManySamples    = errors.New("remote write request exceeds 1 million samples")
+	errRemoteWriteTooManyLabels     = errors.New("remote write request exceeds 1 million labels")
 )
 
 // WritePrometheusRemoteWrite accepts Prometheus Remote Write 1.0 samples.
@@ -178,7 +190,7 @@ localProcessing:
 		return len(record.Columns["time"]), lpWriteRecord(h.buffer, writeCtx, database, record)
 	})
 	if stop != nil {
-		return h.answerLPStop(c, database, stop, drops)
+		return h.answerLPStop(c, remoteWriteProtocolName, database, stop, drops)
 	}
 
 	m := metrics.Get()
@@ -196,6 +208,7 @@ localProcessing:
 func isRemoteWriteTooLarge(err error) bool {
 	return errors.Is(err, errRemoteWriteTooBig) ||
 		errors.Is(err, errRemoteWriteTooManyCells) ||
+		errors.Is(err, errRemoteWriteTooManyLabelBytes) ||
 		errors.Is(err, errRemoteWriteTooManySeries) ||
 		errors.Is(err, errRemoteWriteTooManySamples) ||
 		errors.Is(err, errRemoteWriteTooManyLabels)
@@ -278,6 +291,9 @@ func decodePrometheusRemoteWrite(rawBody []byte) (*remoteWriteRequest, int, erro
 	}
 	if decodedLength > maxRemoteWritePayloadBytes {
 		return nil, 0, errRemoteWriteTooBig
+	}
+	if decodedLength > maxSnappyRatio*len(rawBody)+1024 {
+		return nil, 0, fmt.Errorf("invalid snappy block: declares %d bytes from a %d-byte body", decodedLength, len(rawBody))
 	}
 	decoded, err := snappy.Decode(nil, rawBody)
 	if err != nil {
@@ -493,6 +509,7 @@ const (
 	remoteWriteDropDupLabel   = "series has the same label twice"
 	remoteWriteDropValueLabel = "label conflicts with the sample column \"value\""
 	remoteWriteDropLabelUTF8  = "label value is not valid UTF-8"
+	remoteWriteDropUnderscore = "label names starting with _ are not stored by Arc"
 	remoteWriteDropTimestamp  = "sample timestamp is outside Arc's supported range"
 	remoteWriteDropHistograms = "native histograms are not supported"
 	remoteWriteDropExemplars  = "exemplars are not supported"
@@ -518,6 +535,7 @@ func prometheusRemoteWriteRecords(request *remoteWriteRequest) (map[string]*mode
 		drops = append(drops, ingest.LPDrop{Measurement: measurement, Column: column, Reason: reason, Points: points})
 	}
 	columnCells := 0
+	labelBytes := 0
 
 	for _, series := range request.Timeseries {
 		measurement, tags, column, reason := prometheusSeriesLabels(series.Labels)
@@ -579,6 +597,14 @@ func prometheusRemoteWriteRecords(request *remoteWriteRequest) (map[string]*mode
 			return nil, nil, errRemoteWriteTooManyCells
 		}
 		columnCells += newCellCount
+		seriesLabelBytes := 0
+		for _, value := range tags {
+			seriesLabelBytes += len(value)
+		}
+		if seriesLabelBytes > 0 && samples > (maxRemoteWriteLabelBytes-labelBytes)/seriesLabelBytes {
+			return nil, nil, errRemoteWriteTooManyLabelBytes
+		}
+		labelBytes += samples * seriesLabelBytes
 
 		for name := range tags {
 			if _, exists := record.Columns[name]; !exists {
@@ -647,6 +673,11 @@ func prometheusSeriesLabels(labels []remoteWriteLabel) (measurement string, tags
 		}
 		if problem := ingest.ColumnNameProblem(label.Name); problem != "" {
 			return measurement, nil, label.Name, problem
+		}
+		if label.Name[0] == '_' {
+			// The buffer leaves such columns out (unstoredColumn): stored,
+			// the label would vanish and its series merge with another.
+			return measurement, nil, label.Name, remoteWriteDropUnderscore
 		}
 		if ingest.FoldColumnName(label.Name) == ingest.FoldColumnName(prometheusValueColumn) {
 			return measurement, nil, label.Name, remoteWriteDropValueLabel

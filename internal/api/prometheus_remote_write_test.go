@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -340,6 +341,10 @@ func TestPrometheusRemoteWriteDropsOnlyTheSeriesItCannotStore(t *testing.T) {
 			[]remoteWriteTestSample{{1, ts}, {1, ts + 1}}, false),
 		series([]remoteWriteTestLabel{{"instance", "host-01:9100"}},
 			[]remoteWriteTestSample{{1, ts}}, false),
+		// Dropped: Arc does not store a column whose name starts with _,
+		// so this series would merge with host-01's up.
+		series([]remoteWriteTestLabel{{"__name__", "up"}, {"_tenant", "b"}, {"instance", "host-01:9100"}},
+			[]remoteWriteTestSample{{1, ts}}, false),
 		// The exemplar is reported; the sample is stored.
 		series([]remoteWriteTestLabel{{"__name__", "http_requests_total"}, {"code", "200"}},
 			[]remoteWriteTestSample{{7, ts}}, true),
@@ -348,7 +353,8 @@ func TestPrometheusRemoteWriteDropsOnlyTheSeriesItCannotStore(t *testing.T) {
 	r := newLPWriteRig(t, nil)
 	status, out := remoteWriteTestPost(t, r, remoteWriteTestBody(request), remoteWriteTestHeaders())
 	require.Equal(t, http.StatusBadRequest, status, out)
-	require.Contains(t, out, "partial write: 5 points dropped")
+	require.Contains(t, out, "partial write: 6 points dropped")
+	require.Contains(t, out, `column \"_tenant\"`)
 	require.Contains(t, out, `column \"value\"`)
 	require.Contains(t, out, `column \"Time\"`)
 	require.Contains(t, out, "no __name__ label")
@@ -424,4 +430,65 @@ func TestPrometheusRemoteWriteAcceptsTheNamedV1Message(t *testing.T) {
 		[]remoteWriteTestSample{{1, 1_763_037_600_000}}, false, false)))
 	status, out := remoteWriteTestPost(t, r, body, headers)
 	require.Equal(t, http.StatusNoContent, status, out)
+}
+
+// A measurement dropped whole (a label differing only in letter case from
+// another of the same series) leaves nothing written: the answer must not say
+// the rest was.
+func TestPrometheusRemoteWriteAllDroppedSaysNothingWasWritten(t *testing.T) {
+	r := newLPWriteRig(t, nil)
+	body := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
+		[]remoteWriteTestLabel{{"Instance", "host-01:9100"}, {"__name__", "up"}, {"instance", "host-01:9100"}},
+		[]remoteWriteTestSample{{1, 1_763_037_600_000}}, false, false)))
+	status, out := remoteWriteTestPost(t, r, body, remoteWriteTestHeaders())
+	require.Equal(t, http.StatusBadRequest, status, out)
+	require.Contains(t, out, "partial write: 1 points dropped")
+	require.NotContains(t, out, "the other points were written")
+	rows, _ := r.stored(t)
+	require.Empty(t, rows)
+}
+
+// Labels are sent once per series and repeated on every sample row: a small
+// body must not build an unbounded amount of label bytes.
+func TestPrometheusRemoteWriteBoundsRepeatedLabelBytes(t *testing.T) {
+	big := strings.Repeat("x", 16<<10)
+	samples := make([]remoteWriteSample, 7000) // 7000 x 16 KiB > 100 MiB
+	for i := range samples {
+		samples[i] = remoteWriteSample{Value: 1, Timestamp: int64(1_763_037_600_000 + i)}
+	}
+	request := &remoteWriteRequest{Timeseries: []remoteWriteTimeSeries{{
+		Labels:  []remoteWriteLabel{{Name: "__name__", Value: "up"}, {Name: "pod", Value: big}},
+		Samples: samples,
+	}}}
+	_, _, err := prometheusRemoteWriteRecords(request)
+	require.ErrorIs(t, err, errRemoteWriteTooManyLabelBytes)
+	require.True(t, isRemoteWriteTooLarge(err))
+
+	request.Timeseries[0].Samples = samples[:6000] // 6000 x 16 KiB < 100 MiB
+	_, _, err = prometheusRemoteWriteRecords(request)
+	require.NoError(t, err)
+}
+
+// A Snappy block declaring far more than its body can hold is refused before
+// the decoder allocates the declared length.
+func TestPrometheusRemoteWriteRefusesAnImpossibleSnappyLength(t *testing.T) {
+	_, _, err := decodePrometheusRemoteWrite(binary.AppendUvarint(nil, 50<<20))
+	require.ErrorContains(t, err, "invalid snappy block: declares")
+	require.False(t, isRemoteWriteTooLarge(err))
+}
+
+// The ratio guard refuses only what Snappy cannot produce: a very repetitive
+// valid request, compressed by a real encoder, is accepted.
+func TestPrometheusRemoteWriteAcceptsAHighlyRepetitiveRequest(t *testing.T) {
+	samples := make([]remoteWriteTestSample, 20000)
+	for i := range samples {
+		samples[i] = remoteWriteTestSample{value: 0, time: 1_763_037_600_000}
+	}
+	request := remoteWriteTestRequest(remoteWriteTestSeries(
+		[]remoteWriteTestLabel{{"__name__", "up"}, {"instance", "host-01:9100"}}, samples, false, false))
+	body := remoteWriteTestBody(request)
+	require.Greater(t, len(request)/len(body), 15, "the request must compress close to Snappy's limit")
+	_, decodedSize, err := decodePrometheusRemoteWrite(body)
+	require.NoError(t, err)
+	require.Equal(t, len(request), decodedSize)
 }

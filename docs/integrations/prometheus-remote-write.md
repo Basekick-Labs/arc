@@ -8,15 +8,18 @@ permission for the target database.
 Arc stores each metric as its own measurement (table), every other label as a
 tag column, and each sample as a float64 `value`. This is the layout
 [arc-opentelemetry-exporter](https://github.com/basekick-labs/arc-opentelemetry-exporter)
-writes for OTLP metrics, so a metric that arrives by either path lands in the
-same table. Remote Write timestamps are milliseconds; Arc stores them at
+writes for OTLP metrics, so both paths can be queried the same way. They
+share a table only when the names match: the exporter keeps OTLP names such as
+`system.cpu.time` (stored as `system_cpu_time`), while Prometheus-side names
+usually carry unit suffixes (`node_cpu_seconds_total`). Remote Write timestamps are milliseconds; Arc stores them at
 microsecond resolution. The receiver accepts the v1 `prometheus.WriteRequest`
 protobuf format and Snappy block compression; a Remote Write 2.0 request
 (`proto=io.prometheus.write.v2.Request`) is answered 415. Both the compressed body and
 decoded protobuf are capped at 100 MiB. Metric metadata is ignored. To keep
 sparse label sets from expanding into an unbounded in-memory column matrix, a
 request is also limited to 100,000 time series, 1 million samples, 1 million
-labels and 4 million materialised column cells.
+labels, 4 million materialised column cells and 100 MiB of label values
+repeated across its samples (413 above any of them).
 
 ### Names
 
@@ -29,8 +32,9 @@ labels and 4 million materialised column cells.
   `service.name`. An empty label value means the label is absent.
 - A series Arc cannot store is dropped and the rest of the request is
   written: a metric name that does not start with a letter or is longer than
-  128 characters, a label named `value` or `time` (in any letter case), or
-  a series without `__name__`. A label that differs only in letter case from
+  128 characters, a label named `value` or `time` (in any letter case), a
+  label whose name starts with `_` (Arc does not store such columns), or a
+  series without `__name__`. A label that differs only in letter case from
   another column of the measurement drops that measurement's samples in the
   request. The answer is then a 400
   `partial write` naming what was dropped, as for line protocol; Prometheus
@@ -42,9 +46,10 @@ labels and 4 million materialised column cells.
   stored: a NaN in `value` would make `avg(value)` and `sum(value)` NaN. Any
   other NaN sample is stored as sent; filter it with `WHERE NOT isnan(value)`.
 - Samples are stored as sent, in any order. A batch Prometheus resends after
-  a 5xx or a timeout can store its samples twice; compaction later removes
-  rows identical in every column for a measurement with tag columns, which is
-  any metric with a label besides `__name__`.
+  a 5xx or a timeout can store its samples twice. Compaction later removes
+  rows identical in every column for a measurement whose tag names are all
+  letters, digits, `_` or `-`; with a label such as `service.name`, or no
+  label besides `__name__`, the duplicates stay.
 - Native histograms and exemplars are not supported. A native histogram
   series is dropped; the samples of a series with exemplars are stored and
   the exemplars reported as dropped.
@@ -70,7 +75,9 @@ remote_write:
     send_native_histograms: false
 ```
 
-If Arc authentication is disabled, omit `authorization`.
+If Arc authentication is disabled, omit `authorization`. `protobuf_message`
+exists from Prometheus 2.54; on older versions leave it out (1.0 is the only
+message they send).
 
 ## Grafana Alloy
 
