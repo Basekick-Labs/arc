@@ -1450,7 +1450,7 @@ func Load() (*Config, error) {
 			NodeID:                     v.GetString("cluster.node_id"),
 			Role:                       v.GetString("cluster.role"),
 			ClusterName:                v.GetString("cluster.cluster_name"),
-			Seeds:                      parseStringSlice(v.GetString("cluster.seeds")),
+			Seeds:                      parseSeeds(v.Get("cluster.seeds")),
 			CoordinatorAddr:            v.GetString("cluster.coordinator_addr"),
 			AdvertiseAddr:              v.GetString("cluster.advertise_addr"),
 			HealthCheckInterval:        v.GetInt("cluster.health_check_interval"),
@@ -2784,6 +2784,26 @@ func normalizeExtensionNames(names []string) []string {
 			seen[n] = true
 			out = append(out, n)
 		}
+	}
+	return out
+}
+
+// parseSeeds reads cluster.seeds in every spelling an operator writes: a TOML
+// array, a comma-separated TOML string, or ARC_CLUSTER_SEEDS (#1675).
+//
+// It was parseStringSlice(v.GetString("cluster.seeds")), and viper's GetString
+// returns "" for a TOML array, so seeds = ["a:9100", "b:9100"] read as no seeds
+// at all, with no warning: the node logged "no known peers, aborting election"
+// and never joined. Only the comma string worked, which is the form every
+// shipped deployment (compose, Kubernetes, Helm) passes through the environment.
+//
+// parseTargetDatabases handles the array and scalar shapes; each element is then
+// comma-split as well, because a comma never belongs in host:port, so
+// seeds = ["a:9100,b:9100"] means two seeds rather than one undialable address.
+func parseSeeds(value any) []string {
+	var out []string
+	for _, item := range parseTargetDatabases(value) {
+		out = append(out, parseStringSlice(item)...)
 	}
 	return out
 }
