@@ -136,7 +136,7 @@ func TestCloseDrainPartialNoWALNotNegative_1693(t *testing.T) {
 	b.SetFileRegistrar(&recordingRegistrar1693{})
 	records := []interface{}{typedHoursBatch1693(t, b, 6)}
 	task := flushTask{bufferKey: "db/backfill", database: "db", measurement: "backfill", records: records, recordCount: 6}
-	task.taskID = b.beginAsyncFlushTask()
+	task.taskID = b.beginAsyncFlushTask(task.bufferKey)
 	b.adjustFlushRecordMetrics(int64(task.recordCount), 0) // as enqueue does
 	b.flushQueue <- task
 	unwrit, lost := b.drainAndFlushQueue(time.Now().Add(10 * time.Second))
