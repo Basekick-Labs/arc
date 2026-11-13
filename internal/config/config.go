@@ -2252,11 +2252,13 @@ func parsePositiveDuration(v *viper.Viper, key string) (time.Duration, error) {
 
 // checkDeleteAfterSync refuses edge_sync.spoke.delete_after_sync where it
 // cannot be safe (phase 3a). It deletes edge data on the hub's word, so:
-//   - the network path must be on: verification is a reconcile;
+//   - the network path or bundle export must be on: the hub verifies a file
+//     in a reconcile or in a signed bundle acknowledgment;
 //   - not on a cluster node: a delete there would have to go through the Raft
 //     manifest first, which this does not do;
-//   - the hub must be reached over https or on a loopback host: the verify
-//     response is not signed, and a forged "held" would delete files;
+//   - with the network path on, the hub must be reached over https or on a
+//     loopback host: the verify response is not signed, and a forged "held"
+//     would delete files (a bundle acknowledgment is signed);
 //   - the delay must be shorter than ledger retention, or rows would be
 //     pruned before they could ever be verified.
 func checkDeleteAfterSync(cfg *Config) error {
@@ -2269,6 +2271,9 @@ func checkDeleteAfterSync(cfg *Config) error {
 	}
 	if s.LedgerRetentionDays > 0 && s.DeleteAfterSyncDelay >= time.Duration(s.LedgerRetentionDays)*24*time.Hour {
 		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.ledger_retention_days (%d days)", s.DeleteAfterSyncDelay, s.LedgerRetentionDays)
+	}
+	if s.Bundle.Enabled && s.DeleteAfterSyncDelay >= s.DeleteAfterSyncAckMaxAge {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.delete_after_sync_ack_max_age (%s): no acknowledged file could ever be deleted", s.DeleteAfterSyncDelay, s.DeleteAfterSyncAckMaxAge)
 	}
 	if !s.Enabled {
 		// Air-gapped: acks are HMAC-signed with the spoke secret, so the

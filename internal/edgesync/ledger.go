@@ -140,6 +140,10 @@ type LedgerEntry struct {
 	// in SQL, but an operator needs to READ it to know which ID to revert.
 	ExportedAt       *time.Time
 	ExportedBundleID string
+
+	// HubState is set only by AttestedCandidates (delete_after_sync, #1684):
+	// the attestation the row carries.
+	HubState string
 }
 
 // Ledger is the spoke-side record of sync progress, backed by the shared
@@ -1424,6 +1428,16 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// extraScanner scans the entry columns plus extra trailing ones.
+type extraScanner struct {
+	r     rowScanner
+	extra []any
+}
+
+func (x extraScanner) Scan(dest ...any) error {
+	return x.r.Scan(append(dest, x.extra...)...)
+}
+
 func scanEntry(s rowScanner) (*LedgerEntry, error) {
 	var (
 		e           LedgerEntry
@@ -1497,9 +1511,12 @@ const (
 	HubStateKept    = "kept"    // the hub has a receipt but cannot prove it holds the content
 	HubStateMissing = "missing" // the hub has no receipt and the local file is gone
 
-	// Recorded from a signed air-gap ack (#1684), deleted by DeleteAttested.
+	// Recorded from a signed air-gap ack (#1684), deleted by AttestedDeleter.Run.
 	HubStateAckHeld          = "ack_held"
 	HubStateAckHeldCompacted = "ack_held_compacted"
+	// HubStateDeleting: AttestedDeleter claimed the row and is deleting its
+	// local copy. The network verify neither re-queues nor re-marks it.
+	HubStateDeleting = "deleting"
 )
 
 // VerifyCandidates returns synced rows whose local copy may be verified
@@ -1520,6 +1537,7 @@ func (l *Ledger) VerifyCandidates(ctx context.Context, hubID string, syncedBefor
 		WHERE hub_id = ? AND state = ? AND deleted_at IS NULL AND id > ?
 		  AND synced_at IS NOT NULL AND synced_at <= ?
 		  AND (verified_at IS NULL OR verified_at <= ?)
+		  AND (hub_state IS NULL OR hub_state != 'deleting')
 		ORDER BY id ASC`
 	args := []any{hubID, string(StateSynced), afterID, syncedBefore.UTC(), reverifyBefore.UTC()}
 	if limit > 0 {
@@ -1553,7 +1571,8 @@ func (l *Ledger) MarkVerified(ctx context.Context, hubID, path, hubState string)
 	}
 	res, err := l.db.ExecContext(ctx, `
 		UPDATE sync_ledger SET verified_at = ?, hub_state = ?
-		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL`,
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL
+		  AND (hub_state IS NULL OR hub_state != 'deleting')`,
 		time.Now().UTC(), hubState, hubID, path, string(StateSynced))
 	if err != nil {
 		return fmt.Errorf("edgesync: mark verified %q: %w", path, err)
@@ -1591,7 +1610,8 @@ func (l *Ledger) RequeueSynced(ctx context.Context, hubID, path string) error {
 		UPDATE sync_ledger
 		SET state = ?, synced_at = NULL, attempts = 0, bytes_sent = 0, last_error = NULL,
 		    verified_at = NULL, hub_state = NULL, requeued_at = ?
-		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL`,
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL
+		  AND (hub_state IS NULL OR hub_state != 'deleting')`,
 		string(StatePending), time.Now().UTC(), hubID, path, string(StateSynced))
 	if err != nil {
 		return fmt.Errorf("edgesync: requeue synced %q: %w", path, err)
@@ -1643,7 +1663,7 @@ func (l *Ledger) AttestedCandidates(ctx context.Context, hubID string, states []
 		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
 		       partition_time, discovered_at, state, attempts, last_attempt,
 		       synced_at, bytes_sent, COALESCE(last_error, ''),
-		       exported_at, COALESCE(exported_bundle_id, '')
+		       exported_at, COALESCE(exported_bundle_id, ''), COALESCE(hub_state, '')
 		FROM sync_ledger
 		WHERE hub_id = ? AND state = ? AND deleted_at IS NULL AND id > ?
 		  AND hub_state IN (?` + strings.Repeat(",?", len(states)-1) + `)
@@ -1666,14 +1686,69 @@ func (l *Ledger) AttestedCandidates(ctx context.Context, hubID string, states []
 	defer rows.Close()
 	var out []*LedgerEntry
 	for rows.Next() {
-		e, err := scanEntry(rows)
+		var hubState string
+		e, err := scanEntry(extraScanner{rows, []any{&hubState}})
 		if err != nil {
 			return nil, err
 		}
+		e.HubState = hubState
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("edgesync: iterate attested candidates: %w", err)
 	}
 	return out, nil
+}
+
+// ClaimAttested claims an attested row for deletion, atomically: only while it
+// is still synced, not deleted, in the attested state it was read in, and
+// carries no verification newer than the attestation (verified_at still the
+// export's). A network verify that answered in between (re-queued it, marked
+// it kept or missing) wins, and the claim fails. Reports whether it claimed.
+func (l *Ledger) ClaimAttested(ctx context.Context, hubID, path, hubState string) (bool, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger SET hub_state = ?
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL
+		  AND hub_state = ? AND verified_at = exported_at`,
+		HubStateDeleting, hubID, path, string(StateSynced), hubState)
+	if err != nil {
+		return false, fmt.Errorf("edgesync: claim attested %q: %w", path, err)
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// ReleaseAttested returns a claimed row to its attested state, for a retry
+// after a transient delete failure.
+func (l *Ledger) ReleaseAttested(ctx context.Context, hubID, path, hubState string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	_, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger SET hub_state = ?
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL AND hub_state = ?`,
+		hubState, hubID, path, string(StateSynced), HubStateDeleting)
+	if err != nil {
+		return fmt.Errorf("edgesync: release attested %q: %w", path, err)
+	}
+	return nil
+}
+
+// KeepClaimed records a claimed row as kept for good (its local file no
+// longer matches what was synced). Only from the claim.
+func (l *Ledger) KeepClaimed(ctx context.Context, hubID, path string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	_, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger SET hub_state = ?, verified_at = ?
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL AND hub_state = ?`,
+		HubStateKept, time.Now().UTC(), hubID, path, string(StateSynced), HubStateDeleting)
+	if err != nil {
+		return fmt.Errorf("edgesync: keep claimed %q: %w", path, err)
+	}
+	return nil
 }

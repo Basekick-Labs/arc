@@ -2,6 +2,7 @@ package edgesync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -515,6 +516,14 @@ func (i *Importer) writeAck(ctx context.Context, dir string, m *Manifest, entrie
 				Msg("Could not verify what this hub holds of the bundle; the acknowledgment carries no held attestation")
 			ack.Held, ack.HeldCompacted, ack.VerifiedAt = nil, nil, 0
 		}
+		if ack.VerifiedAt != 0 && !ackFits(ack) {
+			// The held lists roughly double the ack. Past the bound a spoke
+			// would reject the WHOLE ack, losing the sync advance too, so
+			// the attestation goes and the ack stays.
+			i.logger.Warn().Str("bundle_id", m.BundleID).Int("files", len(ack.Paths)).
+				Msg("The acknowledgment with a held attestation would exceed the size a spoke accepts; written without it")
+			ack.Held, ack.HeldCompacted, ack.VerifiedAt = nil, nil, 0
+		}
 	}
 	return WriteAck(dir, secret, ack)
 }
@@ -552,4 +561,11 @@ func (i *Importer) attestHeld(ctx context.Context, spokeID string, entries []Bun
 	}
 	ack.Held, ack.HeldCompacted, ack.VerifiedAt = held, compacted, verifiedAt
 	return nil
+}
+
+// ackFits reports whether the ack, with its MACs, stays within what ReadAck
+// accepts. The MACs and digests are fixed-size; a margin covers them.
+func ackFits(a *Ack) bool {
+	b, err := json.Marshal(a)
+	return err == nil && len(b)+2048 <= maxAckBytes
 }

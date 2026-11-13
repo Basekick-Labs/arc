@@ -3838,11 +3838,15 @@ func main() {
 				}
 				bundleExporter.SetAttestedDeleter(attested)
 				attestedCtx, attestedCancel := context.WithCancel(context.Background())
+				var attestedWG sync.WaitGroup
 				shutdownCoordinator.RegisterHook("edgesync-attested-delete", func(context.Context) error {
 					attestedCancel()
+					attestedWG.Wait() // an in-flight run finishes before the ledger closes
 					return nil
 				}, shutdown.PriorityBuffer)
+				attestedWG.Add(1)
 				go func() {
+					defer attestedWG.Done()
 					ticker := time.NewTicker(15 * time.Minute)
 					defer ticker.Stop()
 					for {
@@ -6078,7 +6082,7 @@ func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manag
 			return nil
 		}
 		if size != wantSize {
-			return fmt.Errorf("local size %d differs from the synced size %d", size, wantSize)
+			return fmt.Errorf("%w: local size %d, synced size %d", edgesync.ErrLocalChanged, size, wantSize)
 		}
 		mgr := tm.Load()
 		if mgr != nil {

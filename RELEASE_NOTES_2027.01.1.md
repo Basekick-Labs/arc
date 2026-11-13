@@ -37,11 +37,11 @@ With `edge_sync.spoke.delete_after_sync = true`, a spoke reclaims disk space by 
 - **Older hubs.** The spoke first sends the hub an empty test request. If the hub is too old to verify, the spoke deletes nothing, logs a warning, and asks again a day later. It never sends such a hub its list of synced files.
 - **Turning it on for a spoke that has been syncing for a while** verifies, and may delete, every synced file still in the ledger: up to `ledger_retention_days` (90 days by default) of data on the first passes.
 - **A failed verification** never fails the sync pass and deletes nothing. The pass reports why in `verify_error`.
-- **Refused at startup** without `edge_sync.spoke.enabled`, on a cluster node, or with a `hub_url` that is neither `https://` nor a loopback address. The hub's answer decides which local files are deleted, so it must not be forgeable in transit.
+- **Refused at startup** without `edge_sync.spoke.enabled` or bundle export, on a cluster node, or, with the network path on, with a `hub_url` that is neither `https://` nor a loopback address. The hub's answer decides which local files are deleted, so it must not be forgeable in transit.
 - **Local queries** on the spoke no longer see data whose files were deleted.
 - **Licence.** The setting itself needs no licence, so manual passes (`POST /api/v1/spoke-sync/run`) delete. Scheduled passes run only with the edge-sync scheduler licence, as before. A pass reports `local_deleted`, `verify_kept`, `verify_requeued` and `verify_unsupported`.
 
-Air-gapped spokes can use it too: see the next section ([#1684](https://github.com/Basekick-Labs/arc/issues/1684)).
+Air-gapped spokes can use it too: see "`delete_after_sync` for air-gapped spokes" ([#1684](https://github.com/Basekick-Labs/arc/issues/1684)).
 
 ## New: a spoke can also delete files the hub has compacted, if it opts in ([#1683](https://github.com/Basekick-Labs/arc/issues/1683))
 
@@ -59,9 +59,10 @@ With the setting on, the spoke's only exact copy goes. Some files have no record
 
 An air-gapped spoke can now use `edge_sync.spoke.delete_after_sync` with only bundle export enabled (`edge_sync.spoke.bundle.enabled`).
 
-- **How it works.** When the hub imports a bundle, it checks which of its files it still holds, the same check a networked spoke gets. It signs the answer into the acknowledgement it writes onto the drive. When the spoke applies that acknowledgement (`POST /api/v1/spoke-sync/ack`), it deletes its local copies of those files. It applies the same rules as networked spokes: `delete_after_sync_delay` and, for files the hub compacted, `delete_after_sync_accept_compacted`. A check every 15 minutes deletes what the delay held back.
+- **How it works.** When the hub imports a bundle, it checks which of its files it still holds, the same check a networked spoke gets. It signs the answer into the acknowledgement it writes onto the drive. When the spoke applies that acknowledgement (`POST /api/v1/spoke-sync/ack`), it deletes its local copies of those files: right away with the default delay of 0, or later, by the check that runs every 15 minutes, with a longer delay. It applies the same rules as networked spokes: `delete_after_sync_delay` and, for files the hub compacted, `delete_after_sync_accept_compacted`. A check every 15 minutes deletes what the delay held back.
 - **Only the bundle that carried the file.** An acknowledgement deletes only files that left on that very bundle and that nothing has superseded since. Replaying an old drive after the hub forgot a file deletes nothing. Neither does an acknowledgement older than a more recent network check.
-- **A time limit on the acknowledgement.** It rides a drive and cannot see what happens on the hub after the import, such as retention or a forget. So it is honoured only up to `edge_sync.spoke.delete_after_sync_ack_max_age` after the bundle was exported, measured on the spoke's own clock. The default is `168h` (7 days); raise it knowingly.
+- **A time limit on the acknowledgement.** It rides a drive and cannot see what happens on the hub after the import, such as retention or a forget. So it is honoured only up to `edge_sync.spoke.delete_after_sync_ack_max_age` after the bundle was exported, measured on the spoke's own clock. The default is `168h` (7 days); raise it knowingly. It must be longer than `delete_after_sync_delay`. If the hub cannot fit the attestation within the acknowledgement's size limit (very large bundles), it writes the acknowledgement without it.
+- **On a spoke with both the network path and bundles**, a network check that answers after the bundle went out always wins over the acknowledgement.
 - **Older versions.** An acknowledgement from an older hub carries no such attestation and deletes nothing. An older spoke ignores the attestation and applies the acknowledgement as before. The ack response reports `attested` and `local_deleted`.
 
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))

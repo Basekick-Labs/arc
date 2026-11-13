@@ -429,9 +429,10 @@ enabled = false
 #                             # At least 1s and shorter than sync_interval
 # sync_timeout = "2h"          # Bound on one manual pass (POST /api/v1/spoke-sync/run)
 # delete_after_sync = false    # Delete the local copy once the hub VERIFIES it holds it
-#                             # (a later pass than the one that synced it). Deletes edge
-#                             # data: needs an https hub_url (or loopback); refused on a
-#                             # cluster node. Local queries stop seeing deleted data.
+#                             # (a later pass than the one that synced it, or a signed
+#                             # bundle acknowledgement). Deletes edge data: with the
+#                             # network path on, needs an https hub_url (or loopback);
+#                             # refused on a cluster node. Local queries stop seeing it.
 # delete_after_sync_delay = "0s"  # Minimum time from synced to the verify that may delete
 # delete_after_sync_ack_max_age = "168h"  # Air-gapped: how long after export a signed
 #                             # bundle acknowledgement may still delete files

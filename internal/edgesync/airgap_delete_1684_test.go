@@ -205,3 +205,64 @@ func mustUnmarshal(t *testing.T, raw []byte, v any) {
 		t.Fatal(err)
 	}
 }
+
+// The two deleters cannot race into deleting a file the network verify
+// re-queued or marked kept: the attested deleter claims each row right before
+// deleting it, and a verify that answered in between wins; while a row is
+// claimed, the verify cannot re-queue it.
+func TestAttestedDeleter_ClaimAgainstNetworkVerify(t *testing.T) {
+	ctx := context.Background()
+	const p = "default/cpu/2026/08/06/14/a.parquet"
+	ack := attestedAck("B1", []string{p}, []string{p}, nil)
+	setup := func(t *testing.T) *airgapRig {
+		r := newAirgapRig(t, p)
+		r.export(t, "B1", p)
+		if res, _ := ApplyAck(ctx, r.l, ack, zerolog.Nop()); res.Attested != 1 {
+			t.Fatal("premise: attested")
+		}
+		return r
+	}
+	t.Run("verify re-queued after the candidates were read", func(t *testing.T) {
+		r := setup(t)
+		inner := r.d.Delete
+		r.d.Delete = func(ctx context.Context, path string, size int64) error { return inner(ctx, path, size) }
+		// The verify answers "missing" between the read and the claim.
+		time.Sleep(2 * time.Millisecond)
+		if err := r.l.RequeueSynced(ctx, testHubID, p); err != nil {
+			t.Fatal(err)
+		}
+		if n, _ := r.d.Run(ctx); n != 0 || !r.files[p] {
+			t.Fatal("deleted a file the network verify re-queued")
+		}
+	})
+	t.Run("claimed row cannot be re-queued", func(t *testing.T) {
+		r := setup(t)
+		if ok, err := r.l.ClaimAttested(ctx, testHubID, p, HubStateAckHeld); err != nil || !ok {
+			t.Fatalf("claim: %v %v", ok, err)
+		}
+		if err := r.l.RequeueSynced(ctx, testHubID, p); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("re-queued a claimed row: %v", err)
+		}
+		if err := r.l.MarkVerified(ctx, testHubID, p, HubStateKept); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("re-marked a claimed row: %v", err)
+		}
+	})
+	t.Run("transient error retries, local change keeps", func(t *testing.T) {
+		r := setup(t)
+		r.d.Delete = func(context.Context, string, int64) error { return errors.New("moving to cold") }
+		if n, _ := r.d.Run(ctx); n != 0 {
+			t.Fatal("deleted on error")
+		}
+		r.d.Delete = func(context.Context, string, int64) error { return nil }
+		if n, _ := r.d.Run(ctx); n != 1 {
+			t.Fatal("a transient error burnt the attestation")
+		}
+		r2 := setup(t)
+		r2.d.Delete = func(context.Context, string, int64) error { return ErrLocalChanged }
+		r2.d.Run(ctx)
+		r2.d.Delete = func(context.Context, string, int64) error { return nil }
+		if n, _ := r2.d.Run(ctx); n != 0 {
+			t.Fatal("a changed local file was deleted on a later run")
+		}
+	})
+}

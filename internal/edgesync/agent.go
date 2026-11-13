@@ -78,6 +78,10 @@ type Agent struct {
 // marks nothing, and the next pass tries again.
 var ErrDeleterNotReady = errors.New("edgesync: local deleter not ready")
 
+// ErrLocalChanged is returned by a LocalDeleter when the local file no longer
+// matches what was synced (its size differs): it is kept for good.
+var ErrLocalChanged = errors.New("edgesync: local file differs from the synced copy")
+
 // LocalDeleter removes the spoke's own copy of a synced file the hub proved
 // it holds. wantSize is the ledger's size: an implementation refuses (returns
 // an error, keeping the file) when the local file's size differs, and treats

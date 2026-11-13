@@ -67,28 +67,45 @@ func (d *AttestedDeleter) Run(ctx context.Context) (int, error) {
 		deleted := 0
 		stop := false
 		for _, e := range rows {
-			err := d.Delete(ctx, e.Path, e.SizeBytes)
-			if errors.Is(err, ErrDeleterNotReady) {
-				stop = true
-				break
-			}
+			hubState := e.HubState
+			claimed, err := d.Ledger.ClaimAttested(ctx, d.HubID, e.Path, hubState)
 			if err != nil {
-				// Kept: a newer verified_at stops this attestation from being
-				// used again, and a network verify may still decide later.
-				d.Logger.Warn().Err(err).Str("path", e.Path).Msg("delete_after_sync: an ack attests this file is held but the local copy could not be deleted; kept")
-				if err := d.Ledger.MarkVerified(ctx, d.HubID, e.Path, HubStateKept); err != nil && !errors.Is(err, ErrInvalidTransition) {
-					return total, err
-				}
+				return total + deleted, err
+			}
+			if !claimed {
+				// A network verify answered in between: it wins.
 				continue
 			}
-			deleted++
-			if err := d.Ledger.MarkDeletedLocal(ctx, d.HubID, e.Path); err != nil && !errors.Is(err, ErrInvalidTransition) {
-				// ErrInvalidTransition: another deleter (the network verify)
-				// marked it first; the file is gone either way.
-				if deleted > 0 && d.AfterDeletes != nil {
-					d.AfterDeletes()
+			err = d.Delete(ctx, e.Path, e.SizeBytes)
+			switch {
+			case errors.Is(err, ErrDeleterNotReady):
+				if rerr := d.Ledger.ReleaseAttested(ctx, d.HubID, e.Path, hubState); rerr != nil {
+					return total + deleted, rerr
 				}
-				return total + deleted, err
+				stop = true
+			case errors.Is(err, ErrLocalChanged):
+				d.Logger.Warn().Err(err).Str("path", e.Path).Msg("delete_after_sync: an ack attests this file is held but the local copy changed; kept")
+				if kerr := d.Ledger.KeepClaimed(ctx, d.HubID, e.Path); kerr != nil {
+					return total + deleted, kerr
+				}
+			case err != nil:
+				// Transient (a tiering move, an I/O error): the attestation
+				// stays and the next run retries.
+				d.Logger.Warn().Err(err).Str("path", e.Path).Msg("delete_after_sync: could not delete an attested file; the next run retries")
+				if rerr := d.Ledger.ReleaseAttested(ctx, d.HubID, e.Path, hubState); rerr != nil {
+					return total + deleted, rerr
+				}
+			default:
+				deleted++
+				if err := d.Ledger.MarkDeletedLocal(ctx, d.HubID, e.Path); err != nil {
+					if deleted > 0 && d.AfterDeletes != nil {
+						d.AfterDeletes()
+					}
+					return total + deleted, err
+				}
+			}
+			if stop {
+				break
 			}
 		}
 		total += deleted
