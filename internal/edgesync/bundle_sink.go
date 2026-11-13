@@ -88,7 +88,7 @@ func (s *dirSink) putBytes(ctx context.Context, rel string, data []byte) error {
 }
 
 func (s *dirSink) abort(context.Context) error { return os.RemoveAll(s.dir) }
-func (s *dirSink) location() string           { return s.dir }
+func (s *dirSink) location() string            { return s.dir }
 
 // objectSink writes a bundle under a key prefix of a storage backend.
 type objectSink struct {
