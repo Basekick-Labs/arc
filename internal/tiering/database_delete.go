@@ -85,14 +85,10 @@ func (m *Manager) PrepareDatabaseDelete(ctx context.Context, database string, ho
 		ordered = append(ordered, path)
 	}
 	sort.Strings(ordered)
-	// On an edge-sync hub this marks the receipts of a deleted spoke
-	// namespace as compacted, so the spoke does not re-send what the operator
-	// just deleted. That is a mark, not a Forget, although nothing is
-	// preserved, and it happens only when tiering is wired: see
-	// edgesync.HubIndex.Forget and #1186 before changing it.
-	if err := m.notifyHotFilesRemoved(ordered); err != nil {
-		return fmt.Errorf("mark database files removed: %w", err)
-	}
+	// No notifyHotFilesRemoved here (#1186): that hook marks receipts
+	// COMPACTED, which says the content survives. A database delete marks
+	// the spoke's receipts REMOVED instead, from the databases handler,
+	// whether or not tiering is wired (DatabasesHandler.SetOnSpokeNamespaceRemoved).
 	// manifestReasonDatabaseDelete deliberately omits manifestReasonPrefix:
 	// the prefix is what makes a peer treat an unlink as a migration and probe
 	// the cold tier, which would mark this file cold moments before the cold

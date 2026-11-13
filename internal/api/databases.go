@@ -28,16 +28,20 @@ type DatabasesHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// a database's files were removed: see SetOnFilesRemoved.
 	onFilesRemoved func()
-	storage        storage.Backend
-	requestTimeout time.Duration
-	deleteConfig   *config.DeleteConfig
-	coordinator    DatabaseDeleteCoordinator
-	tieringManager databaseTieringManager
-	authManager    *auth.AuthManager
-	rbacManager    RBACChecker
-	logger         zerolog.Logger
-	icebergDropper IcebergCatalogDropper
-	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+	// onSpokeNamespaceRemoved marks an edge-sync spoke's receipts removed
+	// before its namespace is deleted (#1186); nil unless this node is an
+	// edge-sync hub. See SetOnSpokeNamespaceRemoved.
+	onSpokeNamespaceRemoved func(ctx context.Context, name string) error
+	storage                 storage.Backend
+	requestTimeout          time.Duration
+	deleteConfig            *config.DeleteConfig
+	coordinator             DatabaseDeleteCoordinator
+	tieringManager          databaseTieringManager
+	authManager             *auth.AuthManager
+	rbacManager             RBACChecker
+	logger                  zerolog.Logger
+	icebergDropper          IcebergCatalogDropper
+	fieldSchema             *fieldschema.Registry // optional, #914: anchors die with their database
 	// flusher and pending: a database deletion flushes the rows acknowledged
 	// before it and withdraws its pending registrations (#1207 d1).
 	flusher DeleteFlusher
@@ -307,6 +311,16 @@ func (h *DatabasesHandler) storageContext(c *fiber.Ctx, timeout time.Duration) (
 
 // SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
 // This is called after initialization when tiering is enabled and licensed.
+// SetOnSpokeNamespaceRemoved wires the edge-sync hub's receipt marking into
+// database delete (#1186). It runs before anything is removed, whether or not
+// tiering is wired, so a confirmed delete of a spoke namespace sticks: the
+// spoke's receipts say removed, reconcile keeps answering "present", and the
+// spoke does not re-send what was deleted. For a name that is not a spoke
+// the mark matches no receipt. A failure refuses the delete.
+func (h *DatabasesHandler) SetOnSpokeNamespaceRemoved(fn func(ctx context.Context, name string) error) {
+	h.onSpokeNamespaceRemoved = fn
+}
+
 func (h *DatabasesHandler) SetTieringManager(tm databaseTieringManager) {
 	h.tieringManager = tm
 }
@@ -959,6 +973,17 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// database is not abandoned after the same fixed timeout as a small one.
 	cancel()
 	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+len(manifestEntries)+2))
+	if h.onSpokeNamespaceRemoved != nil {
+		// Before the manifest and storage removals (#687 ordering): a delete
+		// that fails after this leaves receipts saying removed over files
+		// that still exist, which reconcile answers "present" either way.
+		if err := h.onSpokeNamespaceRemoved(ctx, name); err != nil {
+			h.logger.Error().Err(err).Str("database", name).Msg("Failed to mark edge-sync receipts removed; database not deleted")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare database deletion",
+			})
+		}
+	}
 	if h.tieringManager != nil {
 		// #1091: the tiering manager removes the manifest entries itself
 		// (hot listing plus manifest snapshot, chunked, edge-sync spoke paths

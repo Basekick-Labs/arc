@@ -247,13 +247,16 @@ func (r *Reconciler) confirmPresent(ctx context.Context, spokeID string, entries
 		if !ok {
 			continue
 		}
-		if hf.Compacted {
+		if hf.Vouched() {
 			// The FILE is gone — the hub's own compaction consumed it — but
 			// the CONTENT is delivered and lives inside a compacted output,
 			// so the receipt is not stale. Running the existence check here
 			// would forget the receipt and make the sync protocol re-accept
 			// a re-uploaded raw next to the compacted output: the #611
-			// hazard this marking exists to prevent (#619).
+			// hazard this marking exists to prevent (#619). A REMOVED receipt
+			// (#1186) is skipped for a different reason: the hub deleted the
+			// content on purpose, and forgetting the receipt would make the
+			// spoke re-send what the operator or retention just deleted.
 			continue
 		}
 		candidates = append(candidates, e.Path)
