@@ -346,11 +346,18 @@ func decompressRequest(rawBody []byte, maxSize int) (body []byte, codec string, 
 // decompressZstdPooled return when the decompressed body passes maxSize, so a
 // handler can answer 413 for it and 400 for a corrupt body. Its text is the
 // one these helpers returned before it existed.
+//
+// window is set instead when a zstd frame's window, not its output, is over
+// maxSize (see decompressZstdPooled).
 type decompressedPayloadTooLargeError struct {
 	maxSize int
+	window  uint64
 }
 
 func (e *decompressedPayloadTooLargeError) Error() string {
+	if e.window > 0 {
+		return fmt.Sprintf("the zstd frame's %s window exceeds the %s limit", formatBytes(int64(e.window)), formatBytes(int64(e.maxSize)))
+	}
 	return fmt.Sprintf("decompressed payload exceeds %s limit", formatBytes(int64(e.maxSize)))
 }
 
@@ -460,6 +467,15 @@ func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 	pool.Put(decoder)
 	switch {
 	case errors.Is(err, zstd.ErrWindowSizeExceeded):
+		// The decoder caps the window at maxSize too: klauspost lowers
+		// WithDecoderMaxWindow to WithDecoderMaxMemory. Under a limit below
+		// zstdMaxWindow, a frame with an ordinary window (zstd -3 on a large
+		// batch uses 2 MB) is refused for its size, not for how it was
+		// compressed. Smaller batches get smaller windows, so it is a 413 a
+		// client can split on; only a window over zstdMaxWindow is a 400.
+		if w := zstdFirstFrameWindow(data); maxSize < zstdMaxWindow && w > uint64(maxSize) && w <= zstdMaxWindow {
+			return nil, &decompressedPayloadTooLargeError{maxSize: maxSize, window: w}
+		}
 		return nil, fmt.Errorf("failed to decompress zstd: %w", errZstdWindow)
 	case errors.Is(err, zstd.ErrDecoderSizeExceeded):
 		return nil, &decompressedPayloadTooLargeError{maxSize: maxSize}
@@ -467,6 +483,16 @@ func decompressZstdPooled(data []byte, maxSize int) (out []byte, err error) {
 		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
 	}
 	return out, nil
+}
+
+// zstdFirstFrameWindow is the window the first frame of data declares, or 0
+// when its header cannot be read.
+func zstdFirstFrameWindow(data []byte) uint64 {
+	var h zstd.Header
+	if h.Decode(data) != nil {
+		return 0
+	}
+	return h.WindowSize
 }
 
 // errZstdWindow names the window limit, so a client compressing with

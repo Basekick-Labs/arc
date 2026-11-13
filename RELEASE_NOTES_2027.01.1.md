@@ -189,8 +189,11 @@ as an oversized uncompressed body already did:
 
 The message keeps the text the `400` carried (`decompressed payload exceeds
 <limit> limit`); its `Invalid gzip compression:` / `Invalid zstd compression:`
-prefix is gone. A corrupt body, and a zstd frame whose window is over the
-limit, still answer `400`. `GET /api/v1/write/msgpack/spec` says so. Line
+prefix is gone. Under a limit below 32 MB, a zstd frame whose window is over
+the limit answers `413` too (`the zstd frame's 2MB window exceeds the 1MB
+limit`): `zstd -3`, and Node's `zstdCompressSync`, give a large batch a 2 MB
+window, and a smaller batch gets a smaller one. A corrupt body, and a frame
+whose window is over 32 MB (`--ultra`, `--long`), still answer `400`. `GET /api/v1/write/msgpack/spec` says so. Line
 Protocol and TLE writes are unchanged.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir).
