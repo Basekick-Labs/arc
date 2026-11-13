@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -92,8 +93,14 @@ func (p *DestinationPolicy) Resolve(requested string) (string, error) {
 			return resolved, nil
 		}
 	}
+	// Each entry quoted, so an allow-list that was read differently from how
+	// it was written (one path with a space where two were meant) is visible.
+	quoted := make([]string, len(p.allowed))
+	for i, dir := range p.allowed {
+		quoted[i] = strconv.Quote(dir)
+	}
 	return "", fmt.Errorf("%w: %s is not under any configured allowed directory (%s)",
-		ErrDestinationRefused, resolved, strings.Join(p.allowed, ", "))
+		ErrDestinationRefused, resolved, strings.Join(quoted, ", "))
 }
 
 // resolveDir makes a path absolute and symlink-free.

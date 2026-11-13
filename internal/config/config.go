@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -1294,7 +1295,7 @@ func Load() (*Config, error) {
 			CompactReceivedNamespaces: v.GetBool("edge_sync.compact_received_namespaces"),
 			Import: EdgeSyncImportConfig{
 				Enabled:     v.GetBool("edge_sync.import.enabled"),
-				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
+				AllowedDirs: parseAllowedDirs(v.Get("edge_sync.import.allowed_dirs")),
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
 				Timeout:     hubImportTimeout,
 			},
@@ -1317,7 +1318,7 @@ func Load() (*Config, error) {
 				DeferCompactionUntilSynced: v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
 				Bundle: EdgeSyncBundleConfig{
 					Enabled:     v.GetBool("edge_sync.spoke.bundle.enabled"),
-					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
+					AllowedDirs: parseAllowedDirs(v.Get("edge_sync.spoke.bundle.allowed_dirs")),
 					MaxFiles:    v.GetInt("edge_sync.spoke.bundle.max_files"),
 					MaxBytes:    v.GetInt64("edge_sync.spoke.bundle.max_bytes"),
 					Timeout:     spokeBundleTimeout,
@@ -2030,6 +2031,9 @@ func Load() (*Config, error) {
 				"edge_sync.import.allowed_dirs: a bundle is read from a raw filesystem path " +
 				"outside the storage root, so the permitted roots must be stated explicitly")
 		}
+		if err := requireAbsoluteAllowedDirs("edge_sync.import.allowed_dirs", cfg.EdgeSync.Import.AllowedDirs); err != nil {
+			return nil, err
+		}
 		if cfg.EdgeSync.HubID == "" {
 			return nil, fmt.Errorf("edge_sync.import.enabled=true requires edge_sync.hub_id: " +
 				"a bundle names the hub it is destined for, and one addressed elsewhere is refused")
@@ -2048,6 +2052,9 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("edge_sync.spoke.bundle.enabled=true requires " +
 				"edge_sync.spoke.bundle.allowed_dirs: a bundle is written to a raw filesystem " +
 				"path outside the storage root, so the permitted roots must be stated explicitly")
+		}
+		if err := requireAbsoluteAllowedDirs("edge_sync.spoke.bundle.allowed_dirs", cfg.EdgeSync.Spoke.Bundle.AllowedDirs); err != nil {
+			return nil, err
 		}
 		// Identity is bound into the bundle MAC, so the hub cannot accept a
 		// bundle that does not name both sides.
@@ -2797,6 +2804,43 @@ func parseStringSlice(s string) []string {
 		}
 	}
 	return result
+}
+
+// parseAllowedDirs reads edge_sync.import.allowed_dirs and
+// edge_sync.spoke.bundle.allowed_dirs (#1680): a TOML array keeps each path
+// whole, and a string, from arc.toml or the environment, is split on commas
+// only, never on whitespace.
+//
+// It was v.GetStringSlice, which splits a string on whitespace, so
+// ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS="/Volumes/Air Gap" became two allow-list
+// entries, "/Volumes/Air" and "Gap", and the second was then resolved against
+// the working directory by edgesync.NewDestinationPolicy (resolveDir accepts a
+// missing leaf), silently admitting a directory nobody named while refusing
+// the one they did. A path containing a comma needs the array spelling.
+func parseAllowedDirs(value any) []string {
+	return parseTargetDatabases(value)
+}
+
+// requireAbsoluteAllowedDirs refuses a relative allowed_dirs entry (#1680).
+//
+// edgesync.NewDestinationPolicy resolves an entry with filepath.Abs and accepts
+// a missing leaf, so a relative entry silently means "under whatever directory
+// Arc was started from". No documented configuration uses one, and every way
+// an operator ends up with one by accident is a split in the wrong place: a
+// path with a space under the old whitespace split ("/Volumes/Air Gap" ->
+// "Gap"), or a path with a comma in the string spelling now ("/mnt/a,b" ->
+// "b"). Refusing it turns each of those into a startup error that names the
+// fragment, instead of an allow-list entry nobody wrote.
+func requireAbsoluteAllowedDirs(key string, dirs []string) error {
+	for _, d := range dirs {
+		if !filepath.IsAbs(d) {
+			return fmt.Errorf("%s: %q is not an absolute path; every allowed directory must be "+
+				"absolute (a relative one would resolve against Arc's working directory). "+
+				"In the string or environment spelling a comma separates entries, so a path "+
+				"that contains a comma must be written in the TOML array", key, d)
+		}
+	}
+	return nil
 }
 
 // EffectiveCores reports how many CPUs this process may actually use.
