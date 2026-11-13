@@ -3,6 +3,7 @@ package edgesync
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/basekick-labs/arc/internal/storage"
 )
@@ -105,26 +106,31 @@ func (r *Reconciler) Verify(ctx context.Context, spokeID string, entries []Recon
 	if len(candidates) == 0 && len(compacted) == 0 {
 		return res, nil
 	}
+
+	// ORDER MATTERS on a cluster: every existence check first, then the
+	// manifest catch-up (a Raft barrier), then the manifest lookup. Cluster
+	// deletes update the manifest before storage, so a file that existed
+	// before the barrier and is still listed after it was not removed before
+	// the check. Catching up first would let a removal committed between the
+	// barrier and the stat, not yet applied here, pass as held.
+	gone := map[string]struct{}{}
+	if len(candidates) > 0 {
+		stale, err := r.confirmPresent(ctx, spokeID, candidates, plain)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range stale {
+			gone[p] = struct{}{}
+		}
+	}
+	holders, err := r.holderHotExists(ctx, compacted, held)
+	if err != nil {
+		return nil, err
+	}
 	if r.manifest != nil {
 		if err := r.manifest.Sync(ctx); err != nil {
 			return nil, fmt.Errorf("%w: catch up with the cluster manifest before verifying: %w", ErrReceiveInternal, err)
 		}
-	}
-	if err := r.verifyCompacted(ctx, spokeID, compacted, held, res); err != nil {
-		return nil, err
-	}
-	if len(candidates) == 0 {
-		return res, nil
-	}
-
-	// The existence check reconcile uses, without its forgetting.
-	stale, err := r.confirmPresent(ctx, spokeID, candidates, plain)
-	if err != nil {
-		return nil, err
-	}
-	gone := make(map[string]struct{}, len(stale))
-	for _, p := range stale {
-		gone[p] = struct{}{}
 	}
 	for _, e := range candidates {
 		if _, g := gone[e.Path]; g {
@@ -135,46 +141,83 @@ func (r *Reconciler) Verify(ctx context.Context, spokeID string, entries []Recon
 		}
 		res.Held = append(res.Held, e.Path)
 	}
+	if err := r.verifyCompacted(ctx, compacted, held, holders, res); err != nil {
+		return nil, err
+	}
 	return res, nil
 }
 
+// holderHotExists stats each distinct recorded holder on hot storage, with
+// the bounded concurrency confirmPresent uses: many receipts share one
+// output, and a long backlog can name thousands of outputs.
+func (r *Reconciler) holderHotExists(ctx context.Context, entries []ReconcileEntry, held map[string]HeldFile) (map[string]bool, error) {
+	out := make(map[string]bool)
+	for _, e := range entries {
+		out[held[e.Path].CompactedInto] = false
+	}
+	if len(out) == 0 {
+		return out, nil
+	}
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+	)
+	sem := make(chan struct{}, confirmExistenceConcurrency)
+	for holder := range out {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(h string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ok, err := r.backend.Exists(ctx, h)
+			if storage.IsStoreNotFound(err) {
+				ok, err = false, nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%w: check holder %q: %w", ErrReceiveInternal, h, err)
+				}
+				return
+			}
+			out[h] = ok
+		}(holder)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
 // verifyCompacted answers which compacted receipts' recorded holders exist
-// now (#1683). A holder is a hub storage path whose name is never reused
+// (#1683). A holder is a hub storage path whose name is never reused
 // (compaction outputs carry a UnixNano timestamp; a cold copy keeps the hot
-// key), so an object there is the content. Hot: it exists and, on a cluster,
-// the manifest lists it (a staged output not yet copied to its final key does
-// not count). Cold: it exists in the cold tier, which the manifest does not
-// list. Holders are checked once per request: many receipts share one output.
-func (r *Reconciler) verifyCompacted(ctx context.Context, spokeID string, entries []ReconcileEntry, held map[string]HeldFile, res *VerifyResult) error {
-	exists := make(map[string]bool)
+// key), so an object there is the content. Hot: it existed before the
+// manifest catch-up and, on a cluster, the manifest lists it after (a staged
+// output not yet copied to its final key does not count). Cold: it exists in
+// the cold tier, which the manifest does not list.
+func (r *Reconciler) verifyCompacted(ctx context.Context, entries []ReconcileEntry, held map[string]HeldFile, hot map[string]bool, res *VerifyResult) error {
+	decided := make(map[string]bool)
 	for _, e := range entries {
 		holder := held[e.Path].CompactedInto
-		ok, seen := exists[holder]
+		ok, seen := decided[holder]
 		if !seen {
-			var err error
-			ok, err = r.holderExists(ctx, holder)
-			if err != nil {
-				return fmt.Errorf("%w: check holder %q: %w", ErrReceiveInternal, holder, err)
+			ok = hot[holder] && (r.manifest == nil || r.manifest.Lists(holder))
+			if !ok && r.coldExists != nil {
+				var err error
+				ok, err = r.coldExists(ctx, holder)
+				if err != nil {
+					return fmt.Errorf("%w: check cold holder %q: %w", ErrReceiveInternal, holder, err)
+				}
 			}
-			exists[holder] = ok
+			decided[holder] = ok
 		}
 		if ok {
 			res.HeldCompacted = append(res.HeldCompacted, e.Path)
 		}
 	}
 	return nil
-}
-
-func (r *Reconciler) holderExists(ctx context.Context, holder string) (bool, error) {
-	hot, err := r.backend.Exists(ctx, holder)
-	if err != nil && !storage.IsStoreNotFound(err) {
-		return false, err
-	}
-	if hot && (r.manifest == nil || r.manifest.Lists(holder)) {
-		return true, nil
-	}
-	if r.coldExists != nil {
-		return r.coldExists(ctx, holder)
-	}
-	return false, nil
 }

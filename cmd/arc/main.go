@@ -3286,17 +3286,28 @@ func main() {
 			if !ok || ns == "" {
 				return nil
 			}
+			markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer markCancel()
 			var rest, full []string
 			for _, in := range inputs {
 				first, r, found := strings.Cut(in, "/")
 				if !found || first != ns || r == "" {
 					continue
 				}
+				// An input whose file still exists was not consumed: a staged
+				// commit keeps inputs the manifest lists again, and a re-fire
+				// can follow a forget and re-send. Its receipt belongs to the
+				// file that is there now, not to this output.
+				present, err := storageBackend.Exists(markCtx, in)
+				if err != nil && !storage.IsStoreNotFound(err) {
+					return fmt.Errorf("check compacted input %q: %w", in, err)
+				}
+				if present {
+					continue
+				}
 				rest = append(rest, r)
 				full = append(full, in)
 			}
-			markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer markCancel()
 			if err := hubIndex.MarkCompactedInto(markCtx, ns, rest, full, output); err != nil {
 				markLogger.Warn().Err(err).Str("namespace", ns).Str("output", output).
 					Msg("Could not record the compaction output on the receipts; the caller retries")

@@ -53,7 +53,7 @@ Such files are reported separately, and a spoke deletes them only with `edge_syn
 - It widens a column that mixes integers and floats to floating point, which loses precision above 2^53.
 - It turns timestamps it cannot parse into NULL.
 
-With the setting on, the spoke's only exact copy goes. Files the hub compacted before this release, and files a row-level `DELETE` rewrote on the hub, have no recorded destination and are always kept.
+With the setting on, the spoke's only exact copy goes. Some files have no recorded destination and are always kept: files the hub compacted or moved to the cold tier before this release, and files a row-level `DELETE` rewrote on the hub. If hub retention later deletes the compacted file a spoke file went into, that spoke file is kept too, and the spoke keeps asking about it once a day.
 
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 

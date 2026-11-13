@@ -555,13 +555,13 @@ func errText(err error) string {
 	return err.Error()
 }
 
-// SetStagedObservers sets BeforeCommit and OnCommitted (the manager's
-// observers, which exist once the watcher does). Call before Start.
 // SetStagedIntoObserver sets OnCommittedInto (#1683). Call before Start.
 func (w *CompletionWatcher) SetStagedIntoObserver(fn func(inputs []string, output string) error) {
 	w.cfg.OnCommittedInto = fn
 }
 
+// SetStagedObservers sets BeforeCommit and OnCommitted (the manager's
+// observers, which exist once the watcher does). Call before Start.
 func (w *CompletionWatcher) SetStagedObservers(before func(output string), committed func(inputs []string) error) {
 	w.cfg.BeforeCommit, w.cfg.OnCommitted = before, committed
 }

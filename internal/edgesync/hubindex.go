@@ -103,6 +103,13 @@ func (h *HubIndex) initSchema() error {
 			return fmt.Errorf("add %s column: %w", col, err)
 		}
 	}
+	// The holder chain (MarkCompactedInto) updates by compacted_into on every
+	// hub compaction job; without this it scans a spoke's receipts under the
+	// shared write lock (#1683).
+	if _, err := h.db.Exec(`CREATE INDEX IF NOT EXISTS idx_sync_received_holder
+		ON sync_received(spoke_id, compacted_into) WHERE compacted_into IS NOT NULL`); err != nil {
+		return fmt.Errorf("create holder index: %w", err)
+	}
 	h.logger.Debug().Msg("Sync hub index schema initialized")
 	return nil
 }
