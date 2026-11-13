@@ -46,6 +46,9 @@ type FlightSQLServerConfig struct {
 	TLSEnabled  bool
 	TLSCertFile string
 	TLSKeyFile  string
+	// Version is the Arc version GetSqlInfo reports as the server version
+	// (FLIGHT_SQL_SERVER_VERSION). Left out of the answer when empty.
+	Version string
 	// Middleware runs on the internal bridge after authentication, in order,
 	// as it does on the main app: cmd/arc/main.go passes the audit
 	// middleware here when audit logging is on, so Flight queries are
@@ -107,6 +110,8 @@ type flightSQLService struct {
 	// baseCtx is cancelled during shutdown: every bridge request ends with
 	// it, which ends the RPCs waiting on them.
 	baseCtx context.Context
+	// sqlInfo holds the SqlInfo IDs registered with the base server.
+	sqlInfo map[uint32]struct{}
 }
 
 type flightSQLIdentity struct {
@@ -189,10 +194,17 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 
 	transport := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 64}
 	service := &flightSQLService{
+		// Set here, not left to the base server: its SqlInfo handlers
+		// assign a nil Alloc on every call, a data race between two calls.
+		BaseServer:   flightsql.BaseServer{Alloc: memory.DefaultAllocator},
 		queryHandler: queryHandler,
 		internalKey:  internalKey,
 		client:       &http.Client{Transport: transport},
 		baseCtx:      baseCtx,
+	}
+	if err := service.registerSqlInfo(flightSQLInfo(config.Version)); err != nil {
+		cancelBase()
+		return nil, err
 	}
 
 	var options []grpc.ServerOption
@@ -803,6 +815,75 @@ func flightCodeForHTTP(code int) codes.Code {
 		return codes.Internal
 	}
 }
+
+// flightSQLInfo is what GetSqlInfo answers: who the server is, that it is
+// read-only, how identifiers are quoted and search patterns escaped, and which
+// kinds of statement it takes. The JDBC driver answers DatabaseMetaData from
+// it, and ADBC's GetInfo reads the server name and versions from it.
+func flightSQLInfo(version string) map[flightsql.SqlInfo]interface{} {
+	info := map[flightsql.SqlInfo]interface{}{
+		flightsql.SqlInfoFlightSqlServerName:          "Arc",
+		flightsql.SqlInfoFlightSqlServerArrowVersion:  arrow.PkgVersion,
+		flightsql.SqlInfoFlightSqlServerReadOnly:      true,
+		flightsql.SqlInfoFlightSqlServerSql:           true,
+		flightsql.SqlInfoFlightSqlServerSubstrait:     false,
+		flightsql.SqlInfoFlightSqlServerTransaction:   int32(flightsql.SqlTransactionNone),
+		flightsql.SqlInfoFlightSqlServerCancel:        false,
+		flightsql.SqlInfoFlightSqlServerBulkIngestion: false,
+		flightsql.SqlInfoDDLCatalog:                   false,
+		flightsql.SqlInfoDDLSchema:                    false,
+		flightsql.SqlInfoDDLTable:                     false,
+		flightsql.SqlInfoIdentifierQuoteChar:          `"`,
+		// The escape compileFlightPattern applies to metadata patterns.
+		flightsql.SqlInfoSearchStringEscape: `\`,
+		flightsql.SqlInfoCatalogTerm:        "database",
+	}
+	if version != "" {
+		info[flightsql.SqlInfoFlightSqlServerVersion] = version
+	}
+	return info
+}
+
+func (s *flightSQLService) registerSqlInfo(info map[flightsql.SqlInfo]interface{}) error {
+	s.sqlInfo = make(map[uint32]struct{}, len(info))
+	for id, value := range info {
+		if err := s.RegisterSqlInfo(id, value); err != nil {
+			return fmt.Errorf("register Flight SQL info %d: %w", id, err)
+		}
+		s.sqlInfo[uint32(id)] = struct{}{}
+	}
+	return nil
+}
+
+// DoGetSqlInfo answers the requested IDs Arc has a value for and leaves the
+// others out, where the base server fails the whole request on the first one
+// it lacks. Clients ask for IDs a server may not have: ADBC's GetInfo asks for
+// the Substrait version range, which a server without Substrait has no value
+// for, and must not fail for it. An empty request is answered in full.
+func (s *flightSQLService) DoGetSqlInfo(ctx context.Context, cmd flightsql.GetSqlInfo) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	requested := cmd.GetInfo()
+	if len(requested) == 0 {
+		return s.BaseServer.DoGetSqlInfo(ctx, cmd)
+	}
+	known := make(flightSQLInfoRequest, 0, len(requested))
+	for _, id := range requested {
+		if _, ok := s.sqlInfo[id]; ok {
+			known = append(known, id)
+		}
+	}
+	if len(known) == 0 {
+		// Not handed to the base server: an empty request means every ID.
+		builder := array.NewRecordBuilder(memory.DefaultAllocator, schema_ref.SqlInfo)
+		defer builder.Release()
+		return flightRecordStream(ctx, schema_ref.SqlInfo, builder)
+	}
+	return s.BaseServer.DoGetSqlInfo(ctx, known)
+}
+
+// flightSQLInfoRequest is a GetSqlInfo request for the given IDs.
+type flightSQLInfoRequest []uint32
+
+func (r flightSQLInfoRequest) GetInfo() []uint32 { return r }
 
 func (s *flightSQLService) GetFlightInfoCatalogs(_ context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
 	return s.flightInfo(desc, schema_ref.Catalogs), nil
