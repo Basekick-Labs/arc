@@ -233,7 +233,7 @@ func TestScopeOwnershipRules(t *testing.T) {
 		"arc_spoke1.prod.db":  true, // spoke1's database prod (#1202)
 		"arc_spoke1.db":       true, // pre-#634 single-component spoke namespace
 		"arc_spoke10.prod.db": false,
-		`__iceberg_namespace_v1__:["arc_spoke1","prod"].db`: true,
+		`__iceberg_namespace_v1__:["arc_spoke1","prod"].db`: true, // the exporter encodes only dotted names, but the decoder accepts this
 		`__iceberg_namespace_v1__:["arc_x","prod"].db`:      false,
 	} {
 		if got := sc.ownsIcebergNamespaceDir(dir, "arc"); got != want {

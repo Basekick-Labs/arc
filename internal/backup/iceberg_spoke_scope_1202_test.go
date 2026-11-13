@@ -47,31 +47,33 @@ func TestBackup_ScopedSpokeIcebergNamespacesAreCounted(t *testing.T) {
 		{"dotted spoke", "rocket.01", []string{spokeEncodedNS, spokeLegacyNS}, 2}, // sorted: "_" < "a"
 		{"plain database", "prod", []string{plainNS}, 1},
 	} {
-		t.Run("in-root/"+tc.name, func(t *testing.T) {
-			dataDir := t.TempDir()
-			data := mustLocalBackend(t, dataDir, zerolog.Nop())
-			mustWrite(t, data, tc.scope+"/m/2026/07/14/15/f.parquet", []byte("PAR1"))
-			writeSpokeWarehouse(t, func(rel string) { mustWrite(t, data, "wh/"+rel, []byte("ICE")) })
-			m, err := NewManager(&ManagerConfig{
-				DataStorage: data, BackupPath: t.TempDir(), Logger: zerolog.Nop(),
-				IcebergWarehousePath: filepath.Join(dataDir, "wh"),
+		for _, layout := range []string{"", "wh/"} { // the storage root itself (default), and a subdirectory
+			t.Run("in-root/"+layout+tc.name, func(t *testing.T) {
+				dataDir := t.TempDir()
+				data := mustLocalBackend(t, dataDir, zerolog.Nop())
+				mustWrite(t, data, tc.scope+"/m/2026/07/14/15/f.parquet", []byte("PAR1"))
+				writeSpokeWarehouse(t, func(rel string) { mustWrite(t, data, layout+rel, []byte("ICE")) })
+				m, err := NewManager(&ManagerConfig{
+					DataStorage: data, BackupPath: t.TempDir(), Logger: zerolog.Nop(),
+					IcebergWarehousePath: filepath.Join(dataDir, filepath.FromSlash(layout)),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if m.icebergWarehouse != "" || m.icebergWarehouseKeyPrefix != layout {
+					t.Fatalf("premise: want an in-root warehouse at %q, got warehouse=%q prefix=%q", layout, m.icebergWarehouse, m.icebergWarehouseKeyPrefix)
+				}
+				res, err := m.CreateBackup(ctx, BackupOptions{Databases: []string{tc.scope}})
+				if err != nil {
+					t.Fatalf("CreateBackup: %v", err)
+				}
+				want := make([]string, len(tc.want))
+				for i, ns := range tc.want {
+					want[i] = layout + ns
+				}
+				assertExcluded(t, res.Manifest, want, tc.files)
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if m.icebergWarehouse != "" || m.icebergWarehouseKeyPrefix != "wh/" {
-				t.Fatalf("premise: want an in-root warehouse at wh/, got warehouse=%q prefix=%q", m.icebergWarehouse, m.icebergWarehouseKeyPrefix)
-			}
-			res, err := m.CreateBackup(ctx, BackupOptions{Databases: []string{tc.scope}})
-			if err != nil {
-				t.Fatalf("CreateBackup: %v", err)
-			}
-			want := make([]string, len(tc.want))
-			for i, ns := range tc.want {
-				want[i] = "wh/" + ns
-			}
-			assertExcluded(t, res.Manifest, want, tc.files)
-		})
+		}
 		t.Run("outside-root/"+tc.name, func(t *testing.T) {
 			wh := t.TempDir()
 			writeSpokeWarehouse(t, func(rel string) {

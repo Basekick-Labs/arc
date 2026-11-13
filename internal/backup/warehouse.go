@@ -270,7 +270,10 @@ func (m *Manager) countExcludedIcebergNamespaces(ctx context.Context, lister sto
 		// has one namespace directory per inner database (#1202). So list
 		// the warehouse's top level once and keep what the scope owns.
 		// The in-root case is local-only (configureIcebergWarehouse sets it
-		// for a LocalBackend), and LocalBackend is a DirectoryLister.
+		// for a LocalBackend), and LocalBackend is a DirectoryLister. Its
+		// listing drops a name the key rules refuse, so a namespace
+		// directory too long to be a key is not counted here; the data
+		// listing reports it as unaddressable instead.
 		dl, ok := lister.(storage.DirectoryLister)
 		if !ok {
 			// Unreachable with a real backend; a test fake that embeds
