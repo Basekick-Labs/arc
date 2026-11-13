@@ -417,9 +417,22 @@ enabled = false
 # sync_interval = "5m"         # Delay after a completed pass; at least 1s
 # sync_retry_interval = "30s"  # Initial retry; doubles up to sync_interval
 #                             # At least 1s and shorter than sync_interval
+# sync_timeout = "2h"          # Bound on one manual pass (POST /api/v1/spoke-sync/run)
+#
+# [edge_sync.spoke.bundle]
+# timeout = "2h"               # Bound on one air-gap export (POST /api/v1/spoke-sync/export)
+#
+# [edge_sync.import]
+# timeout = "4h"               # Hub side: bound on one air-gap import (POST /api/v1/bundle-import)
+#
+# Closing the HTTP connection does not cancel a manual pass, export or import;
+# only these bounds or a server shutdown do. Go durations; must be positive.
 # Environment overrides:
 # ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
 # ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
+# ARC_EDGE_SYNC_SPOKE_SYNC_TIMEOUT
+# ARC_EDGE_SYNC_SPOKE_BUNDLE_TIMEOUT
+# ARC_EDGE_SYNC_IMPORT_TIMEOUT
 #
 # -----------------------------------------------------------------------------
 # Telemetry
@@ -470,6 +483,11 @@ migration_history_retention_days = 90
 # nothing else writes a tier row for a compacted file on the node that produced
 # it.
 # scan_timeout = "2h"
+#
+# How long one migration cycle may run, scheduled or POST /api/v1/tiering/migrate.
+# Go duration; must be positive. The scan at the start of a cycle runs inside
+# this bound, so keep it above scan_timeout (Arc warns at startup if not).
+# migration_timeout = "2h"
 
 [tiered_storage.cold]
 enabled = false
