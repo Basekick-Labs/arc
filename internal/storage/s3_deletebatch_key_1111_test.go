@@ -26,6 +26,7 @@ func TestS3DeleteBatchReportsCallerKeys(t *testing.T) {
 	var sent []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		sent = sent[:0]
 		for _, m := range regexp.MustCompile(`<Key>([^<]*)</Key>`).FindAllSubmatch(body, -1) {
 			sent = append(sent, string(m[1]))
 		}
@@ -66,7 +67,7 @@ func TestS3DeleteBatchReportsCallerKeys(t *testing.T) {
 		t.Fatalf("sent %q, want the prefixed object names", sent)
 	}
 	for _, k := range keys {
-		if !strings.Contains(err.Error(), k+": AccessDenied") {
+		if !strings.Contains("\n"+err.Error(), "\n"+k+": AccessDenied") && !strings.Contains(err.Error(), ": "+k+": AccessDenied") {
 			t.Errorf("error %q does not name the caller's key %q", err, k)
 		}
 	}
