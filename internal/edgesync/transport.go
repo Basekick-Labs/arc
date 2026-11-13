@@ -83,6 +83,22 @@ type ReconcileResult struct {
 	Conflicts []Conflict
 }
 
+// Verifier is the optional transport capability delete_after_sync needs
+// (phase 3a): ask the hub which SYNCED files it provably holds. A transport
+// without it (an air-gap bundle) can never authorise a delete.
+type Verifier interface {
+	Verify(ctx context.Context, hubID string, synced []*LedgerEntry) (*VerifyAnswer, error)
+}
+
+// VerifyAnswer is a hub's verify response. HeldKnown is false when the hub
+// predates verification (no "held" key in its answer): the spoke must then
+// delete nothing, since such a hub can vouch for content it has deleted.
+type VerifyAnswer struct {
+	Held      []string
+	Missing   []string
+	HeldKnown bool
+}
+
 // Conflict is one same-path-different-content disagreement between spoke and
 // hub.
 type Conflict struct {

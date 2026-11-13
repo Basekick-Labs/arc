@@ -457,26 +457,25 @@ func (h *EdgeSyncHandler) reconcile(c *fiber.Ctx) error {
 			return allowed, nil
 		}
 	}
+	if req.Verify {
+		// Phase 3a (delete_after_sync): which of these SYNCED files the hub
+		// provably holds. Changes nothing on the hub. An older hub ignores
+		// the field and answers an ordinary reconcile without "held", which
+		// a spoke reads as "cannot verify" and deletes nothing.
+		vres, err := h.reconciler.Verify(ctx, spokeID, req.Entries, allow)
+		if err != nil {
+			return h.reconcileError(c, spokeID, err)
+		}
+		return c.Status(fiber.StatusOK).JSON(verifyResponse{
+			Missing:   orEmpty(vres.Missing),
+			Present:   []string{},
+			Conflicts: []edgesync.Conflict{},
+			Held:      orEmpty(vres.Held),
+		})
+	}
 	res, err := h.reconciler.ReconcileAllowed(ctx, spokeID, req.Entries, allow)
 	if err != nil {
-		if errors.Is(err, errPermissionStoreUnavailable) {
-			return h.pushRefused(c, spokeID, "", true)
-		}
-		if errors.Is(err, edgesync.ErrReconcileTooLarge) {
-			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-				"error":       err.Error(),
-				"max_entries": h.reconciler.MaxEntries(),
-			})
-		}
-		if errors.Is(err, edgesync.ErrReceiveInternal) {
-			h.logger.Error().Err(err).Str("spoke_id", spokeID).Msg("Reconcile failed for a hub-side reason")
-			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-				"error":  "hub temporarily unable to reconcile",
-				"reason": "hub_unavailable",
-			})
-		}
-		h.logger.Warn().Err(err).Str("spoke_id", spokeID).Msg("Reconcile rejected an invalid request")
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		return h.reconcileError(c, spokeID, err)
 	}
 
 	// Empty slices rather than null: a spoke iterating the response should not
@@ -486,6 +485,28 @@ func (h *EdgeSyncHandler) reconcile(c *fiber.Ctx) error {
 		Present:   orEmpty(res.Present),
 		Conflicts: orEmptyConflicts(res.Conflicts),
 	})
+}
+
+// reconcileError answers a failed reconcile or verify.
+func (h *EdgeSyncHandler) reconcileError(c *fiber.Ctx, spokeID string, err error) error {
+	if errors.Is(err, errPermissionStoreUnavailable) {
+		return h.pushRefused(c, spokeID, "", true)
+	}
+	if errors.Is(err, edgesync.ErrReconcileTooLarge) {
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+			"error":       err.Error(),
+			"max_entries": h.reconciler.MaxEntries(),
+		})
+	}
+	if errors.Is(err, edgesync.ErrReceiveInternal) {
+		h.logger.Error().Err(err).Str("spoke_id", spokeID).Msg("Reconcile failed for a hub-side reason")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":  "hub temporarily unable to reconcile",
+			"reason": "hub_unavailable",
+		})
+	}
+	h.logger.Warn().Err(err).Str("spoke_id", spokeID).Msg("Reconcile rejected an invalid request")
+	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 }
 
 // maxReconcileBytes bounds the request body from the entry cap.
@@ -509,6 +530,19 @@ func (h *EdgeSyncHandler) maxReconcileBytes() int64 {
 
 type reconcileRequest struct {
 	Entries []edgesync.ReconcileEntry `json:"entries"`
+	// Verify asks which entries the hub provably holds (phase 3a); see
+	// edgesync.Reconciler.Verify.
+	Verify bool `json:"verify,omitempty"`
+}
+
+// verifyResponse carries "held" always, even empty: its presence is how a
+// spoke knows this hub can verify. present and conflicts stay, empty, so a
+// decoder written for reconcileResponse still reads it.
+type verifyResponse struct {
+	Missing   []string            `json:"missing"`
+	Present   []string            `json:"present"`
+	Conflicts []edgesync.Conflict `json:"conflicts"`
+	Held      []string            `json:"held"`
 }
 
 type reconcileResponse struct {

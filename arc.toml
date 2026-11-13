@@ -418,6 +418,11 @@ enabled = false
 # sync_retry_interval = "30s"  # Initial retry; doubles up to sync_interval
 #                             # At least 1s and shorter than sync_interval
 # sync_timeout = "2h"          # Bound on one manual pass (POST /api/v1/spoke-sync/run)
+# delete_after_sync = false    # Delete the local copy once the hub VERIFIES it holds it
+#                             # (a later pass than the one that synced it). Deletes edge
+#                             # data: needs an https hub_url (or loopback); refused on a
+#                             # cluster node. Local queries stop seeing deleted data.
+# delete_after_sync_delay = "0s"  # Minimum time from synced to the verify that may delete
 #
 # [edge_sync.spoke.bundle]
 # timeout = "2h"               # Bound on one air-gap export (POST /api/v1/spoke-sync/export)
@@ -431,6 +436,8 @@ enabled = false
 # ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
 # ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
 # ARC_EDGE_SYNC_SPOKE_SYNC_TIMEOUT
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY
 # ARC_EDGE_SYNC_SPOKE_BUNDLE_TIMEOUT
 # ARC_EDGE_SYNC_IMPORT_TIMEOUT
 #
