@@ -121,10 +121,14 @@ func TestLengthPastEOFIsRepairedAndLaterFramesRecovered(t *testing.T) {
 // A length damaged to be longer but still inside the file is NOT repaired:
 // the checkpoint scan skips data frames by their stated length without
 // reading them, so a repair in ReadAll alone would make the two disagree and
-// replay an entry whose checkpoint the scan missed. Depending on how the
-// misaligned bytes are classified, recovery may keep the damaged file for
-// another pass or quarantine it immediately. Either way, it must preserve the
-// file and must not replay the flushed entry (review of #1641).
+// replay an entry whose checkpoint the scan missed. Past the damaged frame the
+// reader parses headers out of the next frame's payload, whose bytes (the
+// generated tracked IDs and timestamps) differ on every run. When they read
+// only as checksum mismatches, recovery quarantines the file on the first
+// pass (#1634); any other damage keeps it for another pass. The outcome is
+// fixed by the bytes (about 1 run in 60 quarantines, #1670), so both are
+// accepted. Either way, the file's bytes must be preserved and the flushed
+// entry must not be replayed (review of #1641).
 func TestLengthTooLongInsideTheFileIsDamageNotRepair(t *testing.T) {
 	path, data, offs := lengthFixture(t, 3)
 	trueLen := offs[1] - offs[0] - WALEntryHeaderSize
