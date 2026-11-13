@@ -485,7 +485,8 @@ func (a *Agent) applyVerify(ctx context.Context, rows []*LedgerEntry, ans *Verif
 				continue
 			}
 			deleted++
-			if err := a.ledger.MarkDeletedLocal(ctx, a.hubID, e.Path); err != nil {
+			if err := a.ledger.MarkDeletedLocal(ctx, a.hubID, e.Path); err != nil && !errors.Is(err, ErrInvalidTransition) {
+				// ErrInvalidTransition: the ack deleter marked it first.
 				return deleted, err
 			}
 			res.LocalDeleted++

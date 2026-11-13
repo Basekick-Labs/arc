@@ -59,7 +59,14 @@ type Exporter struct {
 	maxFiles int
 	maxBytes int64
 	logger   zerolog.Logger
+
+	// attested deletes the local copies a signed ack attested as held, right
+	// after the ack is applied (delete_after_sync, #1684). Nil when off.
+	attested *AttestedDeleter
 }
+
+// SetAttestedDeleter wires delete_after_sync into ack application (#1684).
+func (e *Exporter) SetAttestedDeleter(d *AttestedDeleter) { e.attested = d }
 
 // NewExporter validates configuration and returns a ready exporter.
 func NewExporter(cfg ExporterConfig) (*Exporter, error) {
@@ -354,6 +361,15 @@ func (e *Exporter) ApplyAck(ctx context.Context, dir string) (*AckResult, error)
 	if err != nil {
 		return nil, err
 	}
+	if e.attested != nil && res.Attested > 0 {
+		// Never turns an applied ack into a failure: the ledger advanced
+		// either way, and the timer retries what was not deleted.
+		n, derr := e.attested.Run(ctx)
+		res.LocalDeleted = n
+		if derr != nil {
+			e.logger.Warn().Err(derr).Str("bundle_id", res.BundleID).Msg("delete_after_sync: deleting attested files stopped; the next run retries")
+		}
+	}
 
 	e.logger.Info().
 		Str("bundle_id", res.BundleID).
@@ -362,6 +378,8 @@ func (e *Exporter) ApplyAck(ctx context.Context, dir string) (*AckResult, error)
 		Int("untracked", res.Untracked).
 		Int("discrepancies", res.Discrepancies).
 		Int("conflicts", len(res.Conflicts)).
+		Int("attested", res.Attested).
+		Int("local_deleted", res.LocalDeleted).
 		Msg("Acknowledgment applied")
 
 	return res, nil

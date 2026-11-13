@@ -510,6 +510,12 @@ type EdgeSyncSpokeConfig struct {
 	// so the spoke's copy is the only exact one.
 	DeleteAfterSyncAcceptCompacted bool
 
+	// DeleteAfterSyncAckMaxAge bounds how old a signed air-gap ack's held
+	// attestation may be, measured on the spoke's clock from the bundle's
+	// export, for delete_after_sync to act on it (#1684). An ack in transit
+	// cannot see hub retention or forget. Default 7 days; positive.
+	DeleteAfterSyncAckMaxAge time.Duration
+
 	// Bundle configures air-gap export.
 	Bundle EdgeSyncBundleConfig
 }
@@ -1180,6 +1186,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	deleteAfterSyncAckMaxAge, err := parsePositiveDuration(v, "edge_sync.spoke.delete_after_sync_ack_max_age")
+	if err != nil {
+		return nil, err
+	}
 	deleteAfterSyncDelay, err := time.ParseDuration(v.GetString("edge_sync.spoke.delete_after_sync_delay"))
 	if err != nil || deleteAfterSyncDelay < 0 {
 		return nil, fmt.Errorf("invalid edge_sync.spoke.delete_after_sync_delay %q: must be a Go duration of 0 or more", v.GetString("edge_sync.spoke.delete_after_sync_delay"))
@@ -1328,6 +1338,7 @@ func Load() (*Config, error) {
 				DeleteAfterSync:                v.GetBool("edge_sync.spoke.delete_after_sync"),
 				DeleteAfterSyncDelay:           deleteAfterSyncDelay,
 				DeleteAfterSyncAcceptCompacted: v.GetBool("edge_sync.spoke.delete_after_sync_accept_compacted"),
+				DeleteAfterSyncAckMaxAge:       deleteAfterSyncAckMaxAge,
 				HubURL:                         v.GetString("edge_sync.spoke.hub_url"),
 				SpokeID:                        v.GetString("edge_sync.spoke.spoke_id"),
 				HubID:                          v.GetString("edge_sync.spoke.hub_id"),
@@ -2250,11 +2261,19 @@ func parsePositiveDuration(v *viper.Viper, key string) (time.Duration, error) {
 //     pruned before they could ever be verified.
 func checkDeleteAfterSync(cfg *Config) error {
 	s := cfg.EdgeSync.Spoke
-	if !s.Enabled {
-		return fmt.Errorf("edge_sync.spoke.delete_after_sync requires edge_sync.spoke.enabled: the hub must verify a file before the spoke deletes it")
+	if !s.Enabled && !s.Bundle.Enabled {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync requires edge_sync.spoke.enabled or edge_sync.spoke.bundle.enabled: the hub must verify a file, over the network or in a signed bundle acknowledgment, before the spoke deletes it")
 	}
 	if cfg.Cluster.Enabled {
 		return fmt.Errorf("edge_sync.spoke.delete_after_sync is not supported on a cluster node (cluster.enabled)")
+	}
+	if s.LedgerRetentionDays > 0 && s.DeleteAfterSyncDelay >= time.Duration(s.LedgerRetentionDays)*24*time.Hour {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.ledger_retention_days (%d days)", s.DeleteAfterSyncDelay, s.LedgerRetentionDays)
+	}
+	if !s.Enabled {
+		// Air-gapped: acks are HMAC-signed with the spoke secret, so the
+		// https requirement below (an unsigned network answer) does not apply.
+		return nil
 	}
 	u, err := url.Parse(s.HubURL)
 	if err != nil {
@@ -2266,9 +2285,6 @@ func checkDeleteAfterSync(cfg *Config) error {
 		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
 			return fmt.Errorf("edge_sync.spoke.delete_after_sync requires an https edge_sync.spoke.hub_url (or a loopback host): the hub's verify answer decides which local files are deleted, and it is not signed")
 		}
-	}
-	if s.LedgerRetentionDays > 0 && s.DeleteAfterSyncDelay >= time.Duration(s.LedgerRetentionDays)*24*time.Hour {
-		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.ledger_retention_days (%d days)", s.DeleteAfterSyncDelay, s.LedgerRetentionDays)
 	}
 	return nil
 }
@@ -2426,6 +2442,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.delete_after_sync", false)
 	v.SetDefault("edge_sync.spoke.delete_after_sync_delay", "0s")
 	v.SetDefault("edge_sync.spoke.delete_after_sync_accept_compacted", false)
+	v.SetDefault("edge_sync.spoke.delete_after_sync_ack_max_age", "168h")
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")

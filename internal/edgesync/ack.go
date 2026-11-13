@@ -70,7 +70,22 @@ type Ack struct {
 	PathsDigest string `json:"paths_digest"`
 
 	MAC string `json:"mac"`
+
+	// The held attestation (edge sync 3c, #1684): which acknowledged files
+	// the hub provably held when it verified, as its verify reconcile
+	// answers. Optional, under its own MAC, so an older spoke ignores it and
+	// keeps validating the ack above. Held and HeldCompacted are subsets of
+	// Paths and do not overlap; VerifiedAt is the hub's clock, informative
+	// only (the spoke bounds an attestation's age on its own clock).
+	Held          []string `json:"held,omitempty"`
+	HeldCompacted []string `json:"held_compacted,omitempty"`
+	VerifiedAt    int64    `json:"verified_at,omitempty"`
+	HeldMAC       string   `json:"held_mac,omitempty"`
 }
+
+// HeldAttested reports whether the ack carries a held attestation. Only
+// meaningful on an Ack that ReadAck returned (which verified it).
+func (a *Ack) HeldAttested() bool { return a != nil && a.HeldMAC != "" }
 
 // WriteAck signs an acknowledgment and writes it into the bundle directory.
 //
@@ -97,6 +112,23 @@ func WriteAck(dir, secret string, a *Ack) error {
 		return fmt.Errorf("edgesync: sign ack: %w", err)
 	}
 	a.MAC = mac
+
+	if a.VerifiedAt != 0 {
+		heldDigest, err := security.AckPathsDigest(a.Held)
+		if err != nil {
+			return fmt.Errorf("edgesync: ack held digest: %w", err)
+		}
+		compactedDigest, err := security.AckPathsDigest(a.HeldCompacted)
+		if err != nil {
+			return fmt.Errorf("edgesync: ack held_compacted digest: %w", err)
+		}
+		heldMAC, err := security.ComputeSyncAckHeldHMAC(secret, a.BundleID, a.SpokeID, a.HubID,
+			a.ImportedAt, digest, a.VerifiedAt, heldDigest, compactedDigest)
+		if err != nil {
+			return fmt.Errorf("edgesync: sign ack held attestation: %w", err)
+		}
+		a.HeldMAC = heldMAC
+	}
 
 	return writeJSONFile(filepath.Join(dir, ackName), a)
 }
@@ -169,7 +201,54 @@ func ReadAck(dir, secret, expectSpokeID, expectHubID string) (*Ack, error) {
 		}
 	}
 
+	if err := verifyHeldAttestation(secret, &a); err != nil {
+		return nil, err
+	}
+
 	return &a, nil
+}
+
+// verifyHeldAttestation checks the optional held attestation (#1684). A held
+// list without a MAC, a MAC that does not verify, a held path the ack does
+// not acknowledge, or a path in both lists makes the WHOLE ack invalid: a
+// valid ack MAC beside a bad held MAC is tampering, and the held lists decide
+// which local files a spoke deletes.
+func verifyHeldAttestation(secret string, a *Ack) error {
+	if a.HeldMAC == "" {
+		if len(a.Held) > 0 || len(a.HeldCompacted) > 0 || a.VerifiedAt != 0 {
+			return fmt.Errorf("%w: held attestation without its MAC", ErrAckInvalid)
+		}
+		return nil
+	}
+	heldDigest, err := security.AckPathsDigest(a.Held)
+	if err != nil {
+		return fmt.Errorf("%w: held: %v", ErrAckInvalid, err)
+	}
+	compactedDigest, err := security.AckPathsDigest(a.HeldCompacted)
+	if err != nil {
+		return fmt.Errorf("%w: held_compacted: %v", ErrAckInvalid, err)
+	}
+	if err := security.ValidateSyncAckHeldHMAC(secret, a.BundleID, a.SpokeID, a.HubID,
+		a.ImportedAt, a.PathsDigest, a.VerifiedAt, heldDigest, compactedDigest, a.HeldMAC); err != nil {
+		return fmt.Errorf("%w: held attestation: %v", ErrAckInvalid, err)
+	}
+	acked := make(map[string]bool, len(a.Paths))
+	for _, p := range a.Paths {
+		acked[p] = true
+	}
+	seen := make(map[string]bool, len(a.Held)+len(a.HeldCompacted))
+	for _, list := range [][]string{a.Held, a.HeldCompacted} {
+		for _, p := range list {
+			if !acked[p] {
+				return fmt.Errorf("%w: held path %q is not acknowledged", ErrAckInvalid, truncateForError(p))
+			}
+			if seen[p] {
+				return fmt.Errorf("%w: path %q is attested twice", ErrAckInvalid, truncateForError(p))
+			}
+			seen[p] = true
+		}
+	}
+	return nil
 }
 
 // maxAckBytes bounds the acknowledgment read.
@@ -204,6 +283,12 @@ type AckResult struct {
 	Discrepancies int
 
 	Conflicts []Conflict
+
+	// Attested is how many synced entries recorded the hub's held
+	// attestation (#1684); LocalDeleted how many local copies were then
+	// deleted (delete_after_sync). Set by the caller that deletes.
+	Attested     int
+	LocalDeleted int
 }
 
 // ApplyAck advances a ledger using a verified acknowledgment.
@@ -267,6 +352,26 @@ func ApplyAck(ctx context.Context, l *Ledger, a *Ack, logger zerolog.Logger) (*A
 			continue
 		}
 		res.Synced++
+	}
+
+	// The held attestation (#1684), recorded only where the ledger lets it:
+	// a row that left on this very bundle and has not been re-queued or
+	// verified since (Ledger.RecordAckHeld).
+	if a.HeldAttested() {
+		for state, list := range map[string][]string{HubStateAckHeld: a.Held, HubStateAckHeldCompacted: a.HeldCompacted} {
+			for _, p := range list {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				ok, err := l.RecordAckHeld(ctx, a.HubID, p, a.BundleID, state)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					res.Attested++
+				}
+			}
+		}
 	}
 
 	return res, nil

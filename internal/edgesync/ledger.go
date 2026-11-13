@@ -261,6 +261,7 @@ func (l *Ledger) initSchema() error {
 		"ALTER TABLE sync_ledger ADD COLUMN verified_at TIMESTAMP",
 		"ALTER TABLE sync_ledger ADD COLUMN hub_state TEXT",
 		"ALTER TABLE sync_ledger ADD COLUMN deleted_at TIMESTAMP",
+		"ALTER TABLE sync_ledger ADD COLUMN requeued_at TIMESTAMP",
 	} {
 		if _, err := l.db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("add delete-after-sync columns: %w", err)
@@ -1495,6 +1496,10 @@ const (
 	HubStateHeld    = "held"    // the hub provably held it; the local copy was deleted
 	HubStateKept    = "kept"    // the hub has a receipt but cannot prove it holds the content
 	HubStateMissing = "missing" // the hub has no receipt and the local file is gone
+
+	// Recorded from a signed air-gap ack (#1684), deleted by DeleteAttested.
+	HubStateAckHeld          = "ack_held"
+	HubStateAckHeldCompacted = "ack_held_compacted"
 )
 
 // VerifyCandidates returns synced rows whose local copy may be verified
@@ -1585,11 +1590,90 @@ func (l *Ledger) RequeueSynced(ctx context.Context, hubID, path string) error {
 	res, err := l.db.ExecContext(ctx, `
 		UPDATE sync_ledger
 		SET state = ?, synced_at = NULL, attempts = 0, bytes_sent = 0, last_error = NULL,
-		    verified_at = NULL, hub_state = NULL
+		    verified_at = NULL, hub_state = NULL, requeued_at = ?
 		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL`,
-		string(StatePending), hubID, path, string(StateSynced))
+		string(StatePending), time.Now().UTC(), hubID, path, string(StateSynced))
 	if err != nil {
 		return fmt.Errorf("edgesync: requeue synced %q: %w", path, err)
 	}
 	return l.checkTransition(ctx, res, hubID, path, StateSynced)
+}
+
+// RecordAckHeld records a signed air-gap ack's held attestation on a synced
+// row (#1684). Only where it still applies, all on the spoke's own clock:
+//   - the row left on this very bundle (exported_bundle_id);
+//   - it was not re-queued since that export (requeued_at): a re-queue means
+//     the hub forgot it, and an old ack replayed afterwards must not delete;
+//   - no verification is newer than that export (verified_at): a network
+//     verify after the export answered more recently.
+//
+// The attestation's time is the export's (verified_at = exported_at), the
+// earliest the hub could have verified, so its age is measured from there.
+// Reports whether the row took it; never a transition error.
+func (l *Ledger) RecordAckHeld(ctx context.Context, hubID, path, bundleID, hubState string) (bool, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger SET hub_state = ?, verified_at = exported_at
+		WHERE hub_id = ? AND path = ? AND state = ? AND deleted_at IS NULL
+		  AND exported_bundle_id = ? AND exported_at IS NOT NULL
+		  AND (requeued_at IS NULL OR requeued_at < exported_at)
+		  AND (verified_at IS NULL OR verified_at < exported_at)`,
+		hubState, hubID, path, string(StateSynced), bundleID)
+	if err != nil {
+		return false, fmt.Errorf("edgesync: record ack attestation %q: %w", path, err)
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// AttestedCandidates returns synced rows a signed ack attested as held whose
+// local copy may now be deleted: not deleted, hub_state in states, exported
+// at or after exportedAfter (the spoke-clock age bound) and synced at or
+// before syncedBefore (the delay). Ordered by id; afterID pages.
+func (l *Ledger) AttestedCandidates(ctx context.Context, hubID string, states []string, exportedAfter, syncedBefore time.Time, afterID int64, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if len(states) == 0 {
+		return nil, nil
+	}
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ? AND deleted_at IS NULL AND id > ?
+		  AND hub_state IN (?` + strings.Repeat(",?", len(states)-1) + `)
+		  AND exported_at IS NOT NULL AND exported_at >= ?
+		  AND synced_at IS NOT NULL AND synced_at <= ?
+		ORDER BY id ASC`
+	args := []any{hubID, string(StateSynced), afterID}
+	for _, st := range states {
+		args = append(args, st)
+	}
+	args = append(args, exportedAfter.UTC(), syncedBefore.UTC())
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query attested candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate attested candidates: %w", err)
+	}
+	return out, nil
 }

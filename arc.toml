@@ -433,6 +433,8 @@ enabled = false
 #                             # data: needs an https hub_url (or loopback); refused on a
 #                             # cluster node. Local queries stop seeing deleted data.
 # delete_after_sync_delay = "0s"  # Minimum time from synced to the verify that may delete
+# delete_after_sync_ack_max_age = "168h"  # Air-gapped: how long after export a signed
+#                             # bundle acknowledgement may still delete files
 # delete_after_sync_accept_compacted = false  # Also delete files the hub holds only compacted
 #                             # or in cold. Hub compaction drops exact duplicate rows,
 #                             # widens mixed int/float columns, nulls unparseable times:
@@ -459,6 +461,7 @@ enabled = false
 # ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC
 # ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY
 # ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_ACCEPT_COMPACTED
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_ACK_MAX_AGE
 # ARC_EDGE_SYNC_SPOKE_BUNDLE_TIMEOUT
 # ARC_EDGE_SYNC_IMPORT_TIMEOUT
 #

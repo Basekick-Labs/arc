@@ -607,11 +607,13 @@ func (h *EdgeSyncSpokeHandler) applyAck(c *fiber.Ctx) error {
 	}
 
 	out := fiber.Map{
-		"applied":     true,
-		"bundle_id":   res.BundleID,
-		"hub_id":      res.HubID,
-		"imported_at": res.ImportedAt,
-		"synced":      res.Synced,
+		"applied":       true,
+		"bundle_id":     res.BundleID,
+		"hub_id":        res.HubID,
+		"imported_at":   res.ImportedAt,
+		"synced":        res.Synced,
+		"attested":      res.Attested,
+		"local_deleted": res.LocalDeleted,
 	}
 	var warnings []string
 	// The three non-advanced cases mean different things, so they are reported
