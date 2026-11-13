@@ -727,13 +727,15 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # enabled = false
 # history_size = 100              # Number of completed queries to keep in memory
 
-# Peer file replication (Enterprise, cluster mode).
+# Cluster (Enterprise).
 # [cluster]
 # Static seed nodes (host:port of each peer's coordinator) used to join the
-# cluster. Either spelling works; ARC_CLUSTER_SEEDS takes the comma form and
-# overrides the file.
+# cluster. Either spelling works (uncomment ONE; a key may appear only once);
+# ARC_CLUSTER_SEEDS takes the comma form and overrides the file.
 # seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]
 # seeds = "10.0.0.1:9100,10.0.0.2:9100"
+#
+# Peer file replication (cluster mode).
 # Aggregate inbound bandwidth of this node's pull workers, in bytes per second
 # or a size such as "10MB" (1 MB = 1024 KB). 0 = unlimited. Staged compaction
 # fetches are not capped. A file whose transfer outlasts one fetch resumes from

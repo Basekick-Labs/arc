@@ -8,7 +8,9 @@
 
 `backup.target_names` had the same bug and is fixed the same way. A target named only in a TOML array, with its fields set from the environment, was never discovered.
 
-Nothing else changes. The comma-separated string (`seeds = "a:9100,b:9100"`) and the environment variables (`ARC_CLUSTER_SEEDS`, `ARC_BACKUP_TARGET_NAMES`) read exactly as before, and an environment variable still overrides the file. Every shipped deployment (docker-compose, Kubernetes, Helm) passes seeds through `ARC_CLUSTER_SEEDS`, so none of them was affected. `arc.toml` now documents `cluster.seeds` with both spellings.
+For every other spelling nothing changes. The comma-separated string (`seeds = "a:9100,b:9100"`) and the environment variables (`ARC_CLUSTER_SEEDS`, `ARC_BACKUP_TARGET_NAMES`) read exactly as before, and an environment variable still overrides the file. Every shipped deployment (docker-compose, Kubernetes, Helm) passes seeds through `ARC_CLUSTER_SEEDS`, so none of them was affected. `arc.toml` now documents `cluster.seeds` with both spellings.
+
+**Upgrade note:** a TOML array that was ignored before now takes effect. Seeds listed in a `seeds` array are dialled. Every name in a `target_names` array must be a valid target name and, with backups enabled, a fully configured target, or Arc refuses to start. If an old array was left in `arc.toml` by mistake, remove it before upgrading.
 
 ## Fix: backups find the Iceberg metadata of edge-sync spoke databases ([#1202](https://github.com/Basekick-Labs/arc/issues/1202))
 

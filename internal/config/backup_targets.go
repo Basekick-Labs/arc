@@ -186,14 +186,17 @@ func (t BackupTargetConfig) KeyPrefix() (string, error) {
 //     viper map read in this package; everything else, including every FIELD
 //     of a target, is a literal dotted key so that AutomaticEnv resolves it.
 //     The map is read for NAMES alone.
-//   - backup.target_names, comma-separated. A name cannot be discovered from
+//   - backup.target_names, a TOML array or a comma-separated string. A name
+//     cannot be discovered from
 //     a map that does not exist, so a deployment configured entirely from the
 //     environment needs this to say which names to look for. Parsed through
 //     parseTargetDatabases, so it accepts a TOML array as well as a
 //     comma-separated string or environment value. It was
 //     parseStringSlice(v.GetString(...)), which reads a TOML array as nothing
 //     (GetString returns "" for it); GetStringSlice is no better, as it does
-//     not split a comma-separated environment value (#1675).
+//     not split a comma-separated environment value (#1675). Array elements
+//     are not comma-split (unlike cluster.seeds): a comma is not a legal
+//     target-name character, so ["a,b"] is refused below by name, loudly.
 func discoverBackupTargetNames(v *viper.Viper) ([]string, error) {
 	seen := map[string]bool{}
 	for name := range v.GetStringMap("backup.targets") {

@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -231,11 +233,36 @@ func TestBackupTargetNamesReadsTheTOMLArray(t *testing.T) {
 	}
 }
 
+// TestBackupTargetNamesSplitsTheEnvironmentValue: ARC_BACKUP_TARGET_NAMES is
+// a comma string, and v.GetStringSlice would keep "audit,logs" as one name.
+func TestBackupTargetNamesSplitsTheEnvironmentValue(t *testing.T) {
+	writeArcToml(t, "")
+	t.Setenv("ARC_BACKUP_TARGET_NAMES", "audit,logs")
+	for _, n := range []string{"AUDIT", "LOGS"} {
+		t.Setenv("ARC_BACKUP_TARGETS_"+n+"_TYPE", "s3")
+		t.Setenv("ARC_BACKUP_TARGETS_"+n+"_S3_BUCKET", "acme-"+strings.ToLower(n))
+	}
+	t.Setenv("ARC_BACKUP_DEFAULT_TARGET", "audit")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	var names []string
+	for _, target := range cfg.Backup.Targets {
+		names = append(names, target.Name)
+	}
+	sort.Strings(names)
+	if !reflect.DeepEqual(names, []string{"audit", "logs"}) {
+		t.Errorf("target names = %v, want [audit logs]", names)
+	}
+}
+
 // TestBackupTargetDatabasesReadsEverySpelling is the accessor cell, and it is
 // a table over SPELLINGS rather than one case because the obvious accessor —
 // parseStringSlice(v.GetString(key)), which cluster.seeds and
-// backup.target_names used until #1675 — reads the TOML ARRAY as nothing at all, with no error: no routing, silently, in
-// the spelling the documentation itself writes. Measured, not reasoned about;
+// backup.target_names used until #1675 — reads the TOML ARRAY as nothing at
+// all, with no error: no routing, silently, in the spelling the documentation itself writes. Measured, not reasoned about;
 // see parseTargetDatabases.
 func TestBackupTargetDatabasesReadsEverySpelling(t *testing.T) {
 	cases := []struct {
