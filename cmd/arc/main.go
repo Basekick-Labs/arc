@@ -3125,8 +3125,9 @@ func main() {
 	// hubReceiptMarker marks sync_received receipts for hub-consumed spoke
 	// files (grouped by namespace). Built whenever the edge-sync receive or
 	// import side is enabled (both write receipts); shared by compaction's
-	// consumed-inputs observer (#619) and tiering's hot-file-removal hook
-	// (#687), both of which preserve the content. Remains nil otherwise,
+	// consumed-inputs observer (#619), tiering's hot-file-removal hook (#687)
+	// and a DELETE's partial rewrite (#1666), all of which preserve the
+	// content. Remains nil otherwise,
 	// which keeps tiering's spoke-migration gate closed.
 	var hubReceiptMarker func(paths []string) error
 	// hubNamespaceRemover and hubRemovalMarker mark receipts REMOVED for
@@ -3136,6 +3137,7 @@ func main() {
 	var (
 		hubNamespaceRemover func(ctx context.Context, name string) error
 		hubRemovalMarker    func(ctx context.Context, paths []string) error
+		hubRowDeleteMarker  func(ctx context.Context, paths []string) error
 		// hubColdTier is the tiering manager once it is wired below, so the
 		// forget route's guard can see the cold tier (#1186). Atomic: the
 		// route can be called once the server is up, before or after that.
@@ -3242,22 +3244,8 @@ func main() {
 		hubNamespaceRemover = func(ctx context.Context, name string) error {
 			return hubIndex.MarkSpokeRemoved(ctx, name, edgesync.RemovedByOperatorDelete)
 		}
-		hubRemovalMarker = func(ctx context.Context, paths []string) error {
-			byNamespace := make(map[string][]string)
-			for _, p := range paths {
-				first, rest, found := strings.Cut(p, "/")
-				if !found || first == "" || rest == "" {
-					continue
-				}
-				byNamespace[first] = append(byNamespace[first], rest)
-			}
-			for ns, rest := range byNamespace {
-				if err := hubIndex.MarkRemoved(ctx, ns, rest, edgesync.RemovedByRetention); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
+		hubRemovalMarker = hubRemovalMarkerFor(hubIndex, edgesync.RemovedByRetention)
+		hubRowDeleteMarker = hubRemovalMarkerFor(hubIndex, edgesync.RemovedByRowDelete)
 		hubReceiptMarker = func(inputs []string) error {
 			byNamespace := make(map[string][]string)
 			for _, in := range inputs {
@@ -3273,7 +3261,7 @@ func main() {
 			for ns, paths := range byNamespace {
 				if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
 					markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
-						Msg("Could not mark consumed receipts; the caller retries or aborts")
+						Msg("Could not mark receipts compacted; the caller retries, aborts or reports the file failed")
 					if firstErr == nil {
 						firstErr = err
 					}
@@ -4305,6 +4293,11 @@ func main() {
 	// via os.CreateTemp.
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
 	deleteHandler.SetOnFilesRemoved(invalidateQueryCaches)
+	if hubRowDeleteMarker != nil {
+		// #1666: a rewrite keeps the surviving rows (compacted); a file whose
+		// rows all match is removed. Both nil off a hub.
+		deleteHandler.SetReceiptMarkers(hubRowDeleteMarker, hubReceiptMarker)
+	}
 	if registrationOutbox != nil {
 		// A rewrite of a file still pending registration is announced in its
 		// place (#1210).
@@ -5927,6 +5920,29 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 	return db, true, nil
+}
+
+// hubRemovalMarkerFor returns a marker that records hub-side removal of
+// spoke files with the given reason (#1186, #1666): paths are storage paths,
+// "{spoke}/{source path}", grouped by namespace. A path outside any spoke
+// namespace costs one indexed probe and matches nothing.
+func hubRemovalMarkerFor(idx *edgesync.HubIndex, reason string) func(ctx context.Context, paths []string) error {
+	return func(ctx context.Context, paths []string) error {
+		byNamespace := make(map[string][]string)
+		for _, p := range paths {
+			first, rest, found := strings.Cut(p, "/")
+			if !found || first == "" || rest == "" {
+				continue
+			}
+			byNamespace[first] = append(byNamespace[first], rest)
+		}
+		for ns, rest := range byNamespace {
+			if err := idx.MarkRemoved(ctx, ns, rest, reason); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // receivedNamespaces returns a Discoverer namespace excluder backed by the
