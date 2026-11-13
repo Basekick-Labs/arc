@@ -85,6 +85,11 @@ func (m *Manager) PrepareDatabaseDelete(ctx context.Context, database string, ho
 		ordered = append(ordered, path)
 	}
 	sort.Strings(ordered)
+	// On an edge-sync hub this marks the receipts of a deleted spoke
+	// namespace as compacted, so the spoke does not re-send what the operator
+	// just deleted. That is a mark, not a Forget, although nothing is
+	// preserved, and it happens only when tiering is wired: see
+	// edgesync.HubIndex.Forget and #1186 before changing it.
 	if err := m.notifyHotFilesRemoved(ordered); err != nil {
 		return fmt.Errorf("mark database files removed: %w", err)
 	}

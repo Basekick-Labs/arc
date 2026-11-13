@@ -31,6 +31,15 @@ Once every node runs this version, the cluster adopts the nodes' query governanc
 
 Performance: on the query path, once adopted, `Admit` reads the cluster's policies from an immutable in-memory snapshot (one atomic load, one map lookup, one string compare), without the lock it took before. `Admit` also no longer allocates per limit: one allocation per admitted query instead of 13 to 16. Measured on Atila against `main`, 16 alternating runs each: a token with a policy 1.26 µs to 0.74 µs (standalone and cluster-wide alike), a token on the defaults 1.31 µs to 0.78 µs, and `Admit` from every core while file registrations are applied 1.53 µs to 0.84 µs per call, with the apply rate unchanged or better (70.4k to 73.8k per second). Ingest and import run no governance code; the snapshot is rebuilt (one map of the governance policies) only when a cluster policy of any kind changes, a token with a governance policy is rotated or deleted, or a Raft snapshot is restored, never on a file registration.
 
+## Note: re-syncing a deleted spoke database from the spoke ([#1186](https://github.com/Basekick-Labs/arc/issues/1186))
+
+No behaviour change. This documents what happens on an edge-sync hub after `DELETE /api/v1/databases/{spoke}?confirm=true`, so operators know which recovery path to use:
+
+- **Tiering active** (`tiered_storage.enabled` with a licence that includes it): the hub keeps reporting the deleted files as received, so the spoke does not send them again. To get the data back, restore a backup. The receipts are in `arc.db`, which a full backup carries.
+- **Tiering not active:** at the next reconcile the hub notices the files are gone and the spoke sends them again. Files that hub compaction had already merged are the exception (compaction of received namespaces is on by default): the hub still reports those as received. A re-sync therefore brings back only part of the namespace. To get all of it back, restore a backup. With `edge_sync.compact_received_namespaces=false` or `compaction.enabled=false`, the whole namespace re-syncs.
+
+Which behaviour a confirmed delete should have is still open in #1186.
+
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 
 `wal.ack_mode` now defaults to `"auto"`, which is `"durable"` on every node
