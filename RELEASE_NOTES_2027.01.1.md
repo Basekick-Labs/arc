@@ -2,6 +2,15 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Note: re-syncing a deleted spoke database from the spoke ([#1186](https://github.com/Basekick-Labs/arc/issues/1186))
+
+No behaviour change. This documents what happens on an edge-sync hub after `DELETE /api/v1/databases/{spoke}?confirm=true`, so operators know which recovery path to use:
+
+- **Tiering enabled:** the hub keeps reporting the deleted files as received, so the spoke does not send them again. To get the data back, restore a backup. The receipts are in `arc.db`, which a backup carries.
+- **Tiering disabled:** at the next reconcile the hub notices the files are gone and the spoke sends them again. Files that hub compaction had already merged are the exception: the hub still reports those as received. A re-sync therefore brings back only part of the namespace. To get all of it back, restore a backup.
+
+Which behaviour a confirmed delete should have is still open in #1186.
+
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 
 Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table, on nodes where governance is off too, is kept equal to it as a backup and is never read again.

@@ -209,6 +209,11 @@ func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (
 // re-fire it — and deliberately an UPDATE, never an INSERT: a path with no
 // receipt was not received from this spoke and gets no bookkeeping. Chunked
 // like Lookup.
+//
+// Despite the name it is reached from three places, all through cmd/arc's
+// receipt marker: compaction's consumed inputs, tiering's hot-file removals
+// (migration, #687), and a tiering-wired database delete (#1166), the last
+// of which does not preserve the content. See Forget for what that means.
 func (h *HubIndex) MarkCompacted(ctx context.Context, spokeID string, sourcePaths []string) error {
 	if len(sourcePaths) == 0 {
 		return nil
@@ -240,25 +245,43 @@ func (h *HubIndex) MarkCompacted(ctx context.Context, spokeID string, sourcePath
 
 // Forget removes a spoke's record for a path.
 //
-// TODO(#611): NOT YET CALLED IN PRODUCTION, and the gap has teeth. If a
-// GENUINE hub-side removal deletes a synced file without calling this, the
-// index keeps claiming the hub holds it, so reconcile reports it `present`
-// and the spoke marks it synced. A spoke configured with delete_after_sync
-// (phase 3) would then be free to delete its only copy of data the hub no
-// longer has.
+// Not called in production. A receipt whose file is gone is dropped instead
+// by reconcile (confirmPresent, then ForgetBatch), which checks every
+// UNMARKED receipt against storage before vouching for it. A receipt MARKED
+// with MarkCompacted is never checked: the mark says the content lives on
+// somewhere the hub holds, so reconcile keeps answering `present` for it
+// whether or not that is still true.
 //
-// Forget is for genuine removals ONLY — content the hub really no longer
-// holds. Hub-side COMPACTION of spoke namespaces (#619) deletes files too,
-// but it PRESERVES their content inside the compacted output, so it goes
-// through MarkCompacted instead: the receipt stays valid and reconcile
-// keeps vouching, which is correct. Do not "fix" that to Forget.
+// Hub-side COMPACTION of spoke namespaces (#619) deletes files but PRESERVES
+// their content inside the compacted output, so it marks rather than forgets:
+// the receipt stays valid and reconcile keeps vouching, which is correct. Do
+// not "fix" that to Forget. Tiering's hot->cold migration marks for the same
+// reason (#687).
 //
-// What keeps the Forget gap from being a live hazard today:
-// delete_after_sync does not exist yet, and no hub-side path REMOVES spoke
-// content — retention operates on Arc's own ingested databases (and its
-// partition parsing does not currently reach spoke namespaces). Whoever
-// adds hub retention over spoke prefixes, or ships phase 3, MUST wire this
-// first.
+// A DATABASE DELETE of a spoke namespace (#1166) is the first hub-side path
+// that removes spoke content outright, and it does not forget (#1186). What
+// the receipts then say depends on configuration:
+//
+//   - Tiering wired (cmd/arc passes the receipt marker to
+//     SetOnHotFilesRemoved): PrepareDatabaseDelete marks every deleted hot
+//     file, so reconcile keeps reporting the whole namespace `present` and
+//     the spoke never re-sends it. Restoring a backup is the recovery path:
+//     sync_received lives in the shared arc.db, which a backup carries.
+//   - Tiering off: the delete touches no receipt. Reconcile forgets the
+//     unmarked ones as stale and the spoke re-sends those files, but a
+//     receipt hub compaction already marked stays marked, so a re-sync
+//     brings back only the files that had not been compacted.
+//
+// Neither is "content preserved", which is what a mark is meant to say. Which
+// behaviour a confirmed delete should have is an open product decision, see
+// #1186. Until it is made, do not switch the delete to Forget piecemeal.
+//
+// What keeps a vouched-for-but-gone receipt from losing data today:
+// delete_after_sync does not exist yet, so the spoke still holds its own
+// copy. Whoever ships phase 3 (delete_after_sync) MUST settle #1186 first,
+// and whoever adds hub retention over spoke prefixes (retention's partition
+// parsing does not currently reach spoke namespaces) must decide between
+// Forget and a mark the same way.
 func (h *HubIndex) Forget(ctx context.Context, spokeID, sourcePath string) error {
 	_, err := h.db.ExecContext(ctx,
 		`DELETE FROM sync_received WHERE spoke_id = ? AND source_path = ?`,
