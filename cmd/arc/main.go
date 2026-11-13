@@ -2367,6 +2367,7 @@ func main() {
 							completionWatcher = watcher
 							if compactionManager != nil {
 								watcher.SetStagedObservers(compactionManager.BeforeStagedCommit, compactionManager.FinishStaged)
+								watcher.SetStagedIntoObserver(compactionManager.FinishStagedInto)
 								watcher.SetStagedFinished(compactionManager.StagedFinished)
 								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
 									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
@@ -3130,6 +3131,15 @@ func main() {
 	// content. Remains nil otherwise,
 	// which keeps tiering's spoke-migration gate closed.
 	var hubReceiptMarker func(paths []string) error
+	// #1683: the three other receipt markers. hubInPlaceMarker for tiering
+	// (the holder is the same key in cold), hubNoHolderMarker for a row DELETE
+	// about to rewrite (no holder a spoke may be deleted against), and
+	// hubCompactedIntoMarker for compaction, with the job's output.
+	var (
+		hubInPlaceMarker       func(paths []string) error
+		hubNoHolderMarker      func(paths []string) error
+		hubCompactedIntoMarker func(inputs []string, output string) error
+	)
 	// spokeDeleteTiering and spokeDeleteInvalidate are filled in once the
 	// tiering manager and the query-cache invalidator exist, after the spoke
 	// block that wires delete_after_sync; the deleter reads them atomically.
@@ -3265,28 +3275,34 @@ func main() {
 		}
 		hubRemovalMarker = hubRemovalMarkerFor(hubIndex, edgesync.RemovedByRetention)
 		hubRowDeleteMarker = hubRemovalMarkerFor(hubIndex, edgesync.RemovedByRowDelete)
-		hubReceiptMarker = func(inputs []string) error {
-			byNamespace := make(map[string][]string)
+		hubReceiptMarker = hubCompactedMarker(hubIndex.MarkCompacted, markLogger)
+		hubInPlaceMarker = hubCompactedMarker(hubIndex.MarkCompactedInPlace, markLogger)
+		hubNoHolderMarker = hubCompactedMarker(hubIndex.MarkCompactedNoHolder, markLogger)
+		hubCompactedIntoMarker = func(inputs []string, output string) error {
+			// #1683: one job, one output, one spoke namespace (compaction
+			// runs per {spoke}/{db} pseudo-database). An output outside a
+			// spoke namespace, or inputs from another, record nothing.
+			ns, _, ok := strings.Cut(output, "/")
+			if !ok || ns == "" {
+				return nil
+			}
+			var rest, full []string
 			for _, in := range inputs {
-				first, rest, found := strings.Cut(in, "/")
-				if !found || first == "" || rest == "" {
+				first, r, found := strings.Cut(in, "/")
+				if !found || first != ns || r == "" {
 					continue
 				}
-				byNamespace[first] = append(byNamespace[first], rest)
+				rest = append(rest, r)
+				full = append(full, in)
 			}
 			markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer markCancel()
-			var firstErr error
-			for ns, paths := range byNamespace {
-				if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
-					markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
-						Msg("Could not mark receipts compacted; the caller retries, aborts or reports the file failed")
-					if firstErr == nil {
-						firstErr = err
-					}
-				}
+			if err := hubIndex.MarkCompactedInto(markCtx, ns, rest, full, output); err != nil {
+				markLogger.Warn().Err(err).Str("namespace", ns).Str("output", output).
+					Msg("Could not record the compaction output on the receipts; the caller retries")
+				return err
 			}
-			return firstErr
+			return nil
 		}
 
 		// #619: hub compaction of received spoke namespaces. Wiring ORDER is
@@ -3296,6 +3312,7 @@ func main() {
 		// may be nil independently (CLAUDE.md nil rule).
 		if compactionManager != nil && cfg.EdgeSync.CompactReceivedNamespaces {
 			compactionManager.SetOnConsumedInputs(hubReceiptMarker)
+			compactionManager.SetOnConsumedInto(hubCompactedIntoMarker)
 			compactionManager.SetNamespaceExpander(receivedNamespaces(spokeRegistry))
 			log.Info().Msg("Hub compaction of received spoke namespaces enabled (edge_sync.compact_received_namespaces)")
 		}
@@ -3326,6 +3343,18 @@ func main() {
 			Backend:    storageBackend,
 			MaxEntries: cfg.EdgeSync.MaxReconcileEntries,
 			Manifest:   hubManifest,
+			// #1683: a compacted receipt whose holder migrated to cold.
+			ColdExists: func(ctx context.Context, path string) (bool, error) {
+				tm := hubColdTier.Load()
+				if tm == nil {
+					return false, nil
+				}
+				cold := tm.ColdBackend()
+				if cold == nil {
+					return false, nil
+				}
+				return cold.Exists(ctx, path)
+			},
 		})
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync reconciler; refusing to start")
@@ -3706,6 +3735,7 @@ func main() {
 				syncAgent.SetNamespaceExcluder(receivedNamespaces(spokeRegistry))
 			}
 			if cfg.EdgeSync.Spoke.DeleteAfterSync {
+				syncAgent.SetDeleteAfterSyncAcceptCompacted(cfg.EdgeSync.Spoke.DeleteAfterSyncAcceptCompacted)
 				syncAgent.SetDeleteAfterSync(cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
 					spokeLocalDeleter(storageBackend, &spokeDeleteTiering, &spokeDeleteReady),
 					func() {
@@ -4330,7 +4360,7 @@ func main() {
 	if hubRowDeleteMarker != nil {
 		// #1666: a rewrite keeps the surviving rows (compacted); a file whose
 		// rows all match is removed. Both nil off a hub.
-		deleteHandler.SetReceiptMarkers(hubRowDeleteMarker, hubReceiptMarker)
+		deleteHandler.SetReceiptMarkers(hubRowDeleteMarker, hubNoHolderMarker)
 	}
 	if registrationOutbox != nil {
 		// A rewrite of a file still pending registration is announced in its
@@ -5323,7 +5353,7 @@ func main() {
 		// mark their sync receipts first, or the spoke re-uploads duplicates.
 		// Wiring this also lifts the migrator's spoke-namespace gate.
 		if hubReceiptMarker != nil {
-			tieringManager.SetOnHotFilesRemoved(hubReceiptMarker)
+			tieringManager.SetOnHotFilesRemoved(hubInPlaceMarker)
 			hubColdTier.Store(tieringManager)
 			log.Info().Msg("Tiering hot-file removals wired to edge-sync receipt marking; spoke cold migration enabled")
 		}
@@ -6017,6 +6047,36 @@ func (m coordinatorManifest) Sync(ctx context.Context) error {
 func (m coordinatorManifest) Lists(path string) bool {
 	_, ok := m.c.GetFileEntry(path)
 	return ok
+}
+
+// hubCompactedMarker groups storage paths ("{spoke}/{source path}") by spoke
+// namespace and applies one HubIndex compacted-mark to each, under a bounded
+// context. Any failure is returned, so the caller (compaction keeps its
+// manifest, tiering aborts, DELETE reports the file failed) can retry.
+func hubCompactedMarker(mark func(ctx context.Context, spokeID string, sourcePaths []string) error, logger zerolog.Logger) func(paths []string) error {
+	return func(inputs []string) error {
+		byNamespace := make(map[string][]string)
+		for _, in := range inputs {
+			first, rest, found := strings.Cut(in, "/")
+			if !found || first == "" || rest == "" {
+				continue
+			}
+			byNamespace[first] = append(byNamespace[first], rest)
+		}
+		markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer markCancel()
+		var firstErr error
+		for ns, paths := range byNamespace {
+			if err := mark(markCtx, ns, paths); err != nil {
+				logger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
+					Msg("Could not mark receipts compacted; the caller retries, aborts or reports the file failed")
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+		return firstErr
+	}
 }
 
 // hubRemovalMarkerFor returns a marker that records hub-side removal of

@@ -33,7 +33,7 @@ Every `allowed_dirs` entry must now be an absolute path. With import or bundle e
 With `edge_sync.spoke.delete_after_sync = true`, a spoke reclaims disk space by deleting its own copy of a file after the hub has **verified** that it still holds the file. This is off by default.
 
 - **When a file is deleted.** Verification is a separate request from the one that synced the file, sent on a later pass and at least `edge_sync.spoke.delete_after_sync_delay` after the sync (default `0s`). The hub answers "held" only when it still has the file itself, at the path it received it under, and on a cluster only if the cluster still lists it. Only then is the spoke's copy deleted.
-- **When a file is kept.** The hub may have merged the file into a compacted file (`edge_sync.compact_received_namespaces`, on by default) or removed it on purpose. Either way it cannot prove it still holds the content, so the spoke keeps its copy and asks again a day later. A later release will make files compacted on the hub verifiable too. A file the hub has forgotten entirely (its admin forget route) is sent again.
+- **When a file is kept.** The hub may have merged the file into a compacted file (`edge_sync.compact_received_namespaces`, on by default) or removed it on purpose. A removed file is always kept. For a compacted file, see the next section: by default the spoke keeps its copy and asks again a day later. A file the hub has forgotten entirely (its admin forget route) is sent again.
 - **Older hubs.** The spoke first sends the hub an empty test request. If the hub is too old to verify, the spoke deletes nothing, logs a warning, and asks again a day later. It never sends such a hub its list of synced files.
 - **Turning it on for a spoke that has been syncing for a while** verifies, and may delete, every synced file still in the ledger: up to `ledger_retention_days` (90 days by default) of data on the first passes.
 - **A failed verification** never fails the sync pass and deletes nothing. The pass reports why in `verify_error`.
@@ -42,6 +42,18 @@ With `edge_sync.spoke.delete_after_sync = true`, a spoke reclaims disk space by 
 - **Licence.** The setting itself needs no licence, so manual passes (`POST /api/v1/spoke-sync/run`) delete. Scheduled passes run only with the edge-sync scheduler licence, as before. A pass reports `local_deleted`, `verify_kept`, `verify_requeued` and `verify_unsupported`.
 
 Air-gapped spokes cannot use it yet, because the import acknowledgement does not prove the hub still holds a file.
+
+## New: a spoke can also delete files the hub has compacted, if it opts in ([#1683](https://github.com/Basekick-Labs/arc/issues/1683))
+
+The hub now records where a spoke file's content went when it compacts the file, when it compacts that compacted file again, and when it migrates it to the cold tier. A verification can then confirm that the hub still holds the file it went into. Before, a file the hub had compacted could never be verified, so a spoke never deleted it. Hub compaction of received data is on by default, which made this the common case.
+
+Such files are reported separately, and a spoke deletes them only with `edge_sync.spoke.delete_after_sync_accept_compacted = true` (default `false`). Hub compaction does not keep the spoke's exact bytes:
+
+- It drops rows that are identical in every column.
+- It widens a column that mixes integers and floats to floating point, which loses precision above 2^53.
+- It turns timestamps it cannot parse into NULL.
+
+With the setting on, the spoke's only exact copy goes. Files the hub compacted before this release, and files a row-level `DELETE` rewrote on the hub, have no recorded destination and are always kept.
 
 ## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
 

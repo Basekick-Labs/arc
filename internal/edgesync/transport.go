@@ -97,6 +97,9 @@ type VerifyAnswer struct {
 	Held      []string
 	Missing   []string
 	HeldKnown bool
+	// HeldCompacted: files the hub holds only inside a compacted file or a
+	// cold copy (#1683). nil from a hub that predates it.
+	HeldCompacted []string
 }
 
 // Conflict is one same-path-different-content disagreement between spoke and

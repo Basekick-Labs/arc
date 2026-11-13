@@ -344,6 +344,13 @@ type Manager struct {
 	// it anyway would silently lose the marks (deep-review B1). Guarded by mu.
 	onConsumedInputs func(inputs []string) error
 
+	// onConsumedInto, when set, runs right after onConsumedInputs succeeded,
+	// with the job's single output: where the inputs' content now lives.
+	// Edge sync records it on the receipts (#1683) so a hub can later prove
+	// it still holds a compacted spoke file. Same retry rules as
+	// onConsumedInputs: an error keeps the manifest for a re-fire.
+	onConsumedInto func(inputs []string, output string) error
+
 	// onCompactedOutput, when set, receives the storage key of every
 	// compacted output the parent learns about — from a subprocess result
 	// AND from manifest crash-recovery — so the edge sync ledger can mark
@@ -867,6 +874,27 @@ func (m *Manager) SetOnConsumedInputs(fn func(inputs []string) error) {
 	m.onConsumedInputs = fn
 }
 
+// SetOnConsumedInto installs the output-aware consumed-inputs observer (#1683).
+func (m *Manager) SetOnConsumedInto(fn func(inputs []string, output string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onConsumedInto = fn
+}
+
+// notifyConsumedInto invokes the output-aware observer, if any.
+func (m *Manager) notifyConsumedInto(inputs []string, output string) error {
+	if len(inputs) == 0 || output == "" {
+		return nil
+	}
+	m.mu.Lock()
+	fn := m.onConsumedInto
+	m.mu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(inputs, output)
+}
+
 // notifyConsumedInputs invokes the consumed-inputs observer, if any. A
 // returned error means the receipt marks did not all commit.
 func (m *Manager) notifyConsumedInputs(inputs []string) error {
@@ -1080,6 +1108,7 @@ func (m *Manager) recoverOrphanedManifests(ctx context.Context, scope recoverySc
 		hooks.beforeInputDelete = m.writeRecoveredOutputWrittenManifest
 		hooks.afterInputDelete = m.writeRecoveredSourcesDeletedManifest
 	}
+	hooks.consumedInto = m.notifyConsumedInto
 	return m.ManifestManager.recoverOrphanedManifestsWithHooks(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, hooks)
 }
 
@@ -1384,6 +1413,9 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// (deep-review B1).
 	if jobSucceeded && result != nil {
 		markErr := m.notifyConsumedInputs(result.CompactedInputs)
+		if markErr == nil {
+			markErr = m.notifyConsumedInto(result.CompactedInputs, result.OutputFile)
+		}
 		if result.ManifestPath != "" && m.ManifestManager != nil {
 			if markErr != nil {
 				m.logger.Warn().Err(markErr).Str("manifest", result.ManifestPath).

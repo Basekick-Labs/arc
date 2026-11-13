@@ -467,10 +467,11 @@ func (h *EdgeSyncHandler) reconcile(c *fiber.Ctx) error {
 			return h.reconcileError(c, spokeID, err)
 		}
 		return c.Status(fiber.StatusOK).JSON(verifyResponse{
-			Missing:   orEmpty(vres.Missing),
-			Present:   []string{},
-			Conflicts: []edgesync.Conflict{},
-			Held:      orEmpty(vres.Held),
+			Missing:       orEmpty(vres.Missing),
+			Present:       []string{},
+			Conflicts:     []edgesync.Conflict{},
+			Held:          orEmpty(vres.Held),
+			HeldCompacted: orEmpty(vres.HeldCompacted),
 		})
 	}
 	res, err := h.reconciler.ReconcileAllowed(ctx, spokeID, req.Entries, allow)
@@ -543,6 +544,9 @@ type verifyResponse struct {
 	Present   []string            `json:"present"`
 	Conflicts []edgesync.Conflict `json:"conflicts"`
 	Held      []string            `json:"held"`
+	// HeldCompacted: compacted receipts whose recorded holder exists (#1683),
+	// apart from held because hub compaction transforms rows.
+	HeldCompacted []string `json:"held_compacted"`
 }
 
 type reconcileResponse struct {

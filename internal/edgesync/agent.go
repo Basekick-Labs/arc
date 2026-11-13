@@ -67,6 +67,7 @@ type Agent struct {
 	// query-cache invalidation). verifyUnsupportedUntil caches an older hub's
 	// answer to the side-effect-free probe.
 	deleteDelay            time.Duration
+	acceptCompacted        bool
 	deleteLocal            LocalDeleter
 	afterDeletes           func()
 	verifyUnsupportedUntil time.Time
@@ -91,6 +92,12 @@ const verifyRecheck = 24 * time.Hour
 // SetDeleteAfterSync turns on delete_after_sync: after the pending loop, each
 // pass verifies synced rows at least delay old against the hub and deletes the
 // local copy of those the hub proves it holds. Call before the first Run.
+// SetDeleteAfterSyncAcceptCompacted lets delete_after_sync also delete files
+// the hub holds only inside a compacted file or a cold copy (#1683). Hub
+// compaction transforms rows (drops exact duplicates, widens mixed types,
+// nulls unparseable times), so this trades the spoke's exact copy for space.
+func (a *Agent) SetDeleteAfterSyncAcceptCompacted(accept bool) { a.acceptCompacted = accept }
+
 func (a *Agent) SetDeleteAfterSync(delay time.Duration, del LocalDeleter, afterDeletes func()) {
 	a.deleteDelay, a.deleteLocal, a.afterDeletes = delay, del, afterDeletes
 }
@@ -437,6 +444,18 @@ func (a *Agent) applyVerify(ctx context.Context, rows []*LedgerEntry, ans *Verif
 			return 0, fmt.Errorf("edgesync: verify answered held for %q, which was not asked", p)
 		}
 		held[p] = true
+	}
+	for _, p := range ans.HeldCompacted {
+		if _, asked := byPath[p]; !asked {
+			return 0, fmt.Errorf("edgesync: verify answered held_compacted for %q, which was not asked", p)
+		}
+		if held[p] {
+			return 0, fmt.Errorf("edgesync: verify answered %q both held and held_compacted", p)
+		}
+		if a.acceptCompacted {
+			held[p] = true
+		}
+		// Otherwise kept: the default case below records it.
 	}
 	missing := make(map[string]bool, len(ans.Missing))
 	for _, p := range ans.Missing {

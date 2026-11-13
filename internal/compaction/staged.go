@@ -210,6 +210,12 @@ func (m *Manager) BeforeStagedCommit(output string) {
 // FinishStaged runs, for a committed staged job, what a legacy job runs when
 // its subprocess returns: the consumed-inputs observer (its error keeps the
 // job for a retry) and the cache invalidation.
+// FinishStagedInto is the output-aware half of FinishStaged (#1683): the
+// watcher calls it right after FinishStaged succeeded, with the job's output.
+func (m *Manager) FinishStagedInto(inputs []string, output string) error {
+	return m.notifyConsumedInto(inputs, output)
+}
+
 func (m *Manager) FinishStaged(inputs []string) error {
 	if err := m.notifyConsumedInputs(inputs); err != nil {
 		return err

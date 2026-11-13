@@ -342,6 +342,12 @@ func (w *CompletionWatcher) commitStagedObject(ctx context.Context, path string,
 			w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Compaction committed; its observers failed, retrying")
 			return
 		}
+		if w.cfg.OnCommittedInto != nil {
+			if err := w.cfg.OnCommittedInto(inputs, job.Output.Path); err != nil {
+				w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Compaction committed; its observers failed, retrying")
+				return
+			}
+		}
 	}
 	st.consumed = true
 	if status.Finalizing {
@@ -462,6 +468,12 @@ func (w *CompletionWatcher) commitStaged(ctx context.Context, path string, job S
 			return
 		}
 	}
+	if w.cfg.OnCommittedInto != nil {
+		if err := w.cfg.OnCommittedInto(consumed, job.Output.Path); err != nil {
+			w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Compaction committed; its observers failed, retrying")
+			return
+		}
+	}
 	if mover, ok := w.cfg.Storage.(storage.ObjectMover); ok {
 		if err := mover.RemoveAll(ctx, StagedJobDir(job.JobID)); err != nil {
 			w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Could not remove the staged directory; retrying")
@@ -545,6 +557,11 @@ func errText(err error) string {
 
 // SetStagedObservers sets BeforeCommit and OnCommitted (the manager's
 // observers, which exist once the watcher does). Call before Start.
+// SetStagedIntoObserver sets OnCommittedInto (#1683). Call before Start.
+func (w *CompletionWatcher) SetStagedIntoObserver(fn func(inputs []string, output string) error) {
+	w.cfg.OnCommittedInto = fn
+}
+
 func (w *CompletionWatcher) SetStagedObservers(before func(output string), committed func(inputs []string) error) {
 	w.cfg.BeforeCommit, w.cfg.OnCommitted = before, committed
 }

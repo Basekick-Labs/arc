@@ -3,6 +3,8 @@ package edgesync
 import (
 	"context"
 	"fmt"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // VerifyResult is the hub's answer to a verify reconcile (edge sync phase 3a,
@@ -16,6 +18,12 @@ type VerifyResult struct {
 	// Missing: no receipt at all for a permitted entry. The hub forgot it
 	// (the admin forget route) or never had it; the spoke re-offers it.
 	Missing []string
+	// HeldCompacted: a compacted receipt with the spoke's digest whose
+	// recorded holder exists at verify time (#1683). Reported apart from Held
+	// because hub compaction transforms rows (drops exact duplicates, widens
+	// mixed types, nulls unparseable times): a spoke deletes these only when
+	// it opted in.
+	HeldCompacted []string
 }
 
 // Verify answers which entries the hub holds, for a spoke deciding whether
@@ -24,9 +32,10 @@ type VerifyResult struct {
 // spoke already marked synced, and the trade-offs elsewhere (cluster_manifest.go)
 // rest on reconcile only ever acting on files a spoke has not.
 //
-// Compacted receipts are never held: their content lives in a file the
-// receipt does not name, and nothing on a cluster or outside Arc keeps that
-// claim true. Removed receipts are never held: the hub deleted the content.
+// A compacted receipt is never in Held. It is in HeldCompacted when it
+// records its holder (compacted_into, #1683) and that holder exists at
+// verify time; a receipt with no recorded holder is neither. Removed
+// receipts are never held: the hub deleted the content.
 // An entry the caller may not write (allow) is neither held nor missing, so
 // RBAC never reads as a forgotten file.
 func (r *Reconciler) Verify(ctx context.Context, spokeID string, entries []ReconcileEntry, allow ReconcileAllow) (*VerifyResult, error) {
@@ -71,20 +80,38 @@ func (r *Reconciler) Verify(ctx context.Context, spokeID string, entries []Recon
 		return nil, fmt.Errorf("%w: %w", ErrReceiveInternal, err)
 	}
 
-	res := &VerifyResult{Held: []string{}, Missing: []string{}}
+	res := &VerifyResult{Held: []string{}, Missing: []string{}, HeldCompacted: []string{}}
 	plain := make(map[string]HeldFile, len(held))
 	candidates := make([]ReconcileEntry, 0, len(permitted))
+	var compacted []ReconcileEntry
 	for _, e := range permitted {
 		hf, ok := held[e.Path]
 		switch {
 		case !ok:
 			res.Missing = append(res.Missing, e.Path)
-		case hf.Vouched() || hf.SHA256 != e.SHA256:
-			// Compacted, removed, or different content: not provably held.
+		case hf.Removed || hf.SHA256 != e.SHA256:
+			// Removed on purpose, or different content: never held.
+		case hf.Compacted:
+			if hf.CompactedInto != "" {
+				compacted = append(compacted, e)
+			}
+			// A compacted receipt with no recorded holder (one compacted
+			// before #1683, or rewritten by a row-level DELETE) is not held.
 		default:
 			plain[e.Path] = hf
 			candidates = append(candidates, e)
 		}
+	}
+	if len(candidates) == 0 && len(compacted) == 0 {
+		return res, nil
+	}
+	if r.manifest != nil {
+		if err := r.manifest.Sync(ctx); err != nil {
+			return nil, fmt.Errorf("%w: catch up with the cluster manifest before verifying: %w", ErrReceiveInternal, err)
+		}
+	}
+	if err := r.verifyCompacted(ctx, spokeID, compacted, held, res); err != nil {
+		return nil, err
 	}
 	if len(candidates) == 0 {
 		return res, nil
@@ -99,11 +126,6 @@ func (r *Reconciler) Verify(ctx context.Context, spokeID string, entries []Recon
 	for _, p := range stale {
 		gone[p] = struct{}{}
 	}
-	if r.manifest != nil {
-		if err := r.manifest.Sync(ctx); err != nil {
-			return nil, fmt.Errorf("%w: catch up with the cluster manifest before verifying: %w", ErrReceiveInternal, err)
-		}
-	}
 	for _, e := range candidates {
 		if _, g := gone[e.Path]; g {
 			continue
@@ -114,4 +136,45 @@ func (r *Reconciler) Verify(ctx context.Context, spokeID string, entries []Recon
 		res.Held = append(res.Held, e.Path)
 	}
 	return res, nil
+}
+
+// verifyCompacted answers which compacted receipts' recorded holders exist
+// now (#1683). A holder is a hub storage path whose name is never reused
+// (compaction outputs carry a UnixNano timestamp; a cold copy keeps the hot
+// key), so an object there is the content. Hot: it exists and, on a cluster,
+// the manifest lists it (a staged output not yet copied to its final key does
+// not count). Cold: it exists in the cold tier, which the manifest does not
+// list. Holders are checked once per request: many receipts share one output.
+func (r *Reconciler) verifyCompacted(ctx context.Context, spokeID string, entries []ReconcileEntry, held map[string]HeldFile, res *VerifyResult) error {
+	exists := make(map[string]bool)
+	for _, e := range entries {
+		holder := held[e.Path].CompactedInto
+		ok, seen := exists[holder]
+		if !seen {
+			var err error
+			ok, err = r.holderExists(ctx, holder)
+			if err != nil {
+				return fmt.Errorf("%w: check holder %q: %w", ErrReceiveInternal, holder, err)
+			}
+			exists[holder] = ok
+		}
+		if ok {
+			res.HeldCompacted = append(res.HeldCompacted, e.Path)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) holderExists(ctx context.Context, holder string) (bool, error) {
+	hot, err := r.backend.Exists(ctx, holder)
+	if err != nil && !storage.IsStoreNotFound(err) {
+		return false, err
+	}
+	if hot && (r.manifest == nil || r.manifest.Lists(holder)) {
+		return true, nil
+	}
+	if r.coldExists != nil {
+		return r.coldExists(ctx, holder)
+	}
+	return false, nil
 }
