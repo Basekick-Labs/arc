@@ -357,6 +357,39 @@ func readColumnRef(c *cursor, t token) (string, bool) {
 	return t.orig + "['" + keyT.str + "']", true
 }
 
+// readCountDistinct completes `count(DISTINCT <col>)` after `count(` was consumed,
+// mirroring the engine (arcX cd-1): the `distinct` keyword, ONE column reference
+// — a bare identifier, or `m['k']` when subscript is allowed — and the closing
+// `)`. `count(DISTINCT a, b)`, the row form `count(DISTINCT (a, b))`, `*`,
+// expressions and `ORDER BY` inside the call all fail the `)` or column checks,
+// exactly where the engine declines them. Re-serialized as
+// `count(DISTINCT <col as written>)`: both engines echo the keyword upper-case
+// and the column's spelling in the derived name. Returns ok=false (cursor
+// consumed) on anything else; callers check `peekIdentLower() == "distinct"`
+// first, so a non-DISTINCT `count(` is never consumed here.
+func readCountDistinct(c *cursor, subscript bool) (string, bool) {
+	if !c.ident("distinct") {
+		return "", false
+	}
+	arg, ok := c.next()
+	if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" ||
+		duckdbNonColumnKeywords[arg.lower] || !isBareIdent(arg.orig) {
+		return "", false
+	}
+	ref := arg.orig
+	if subscript {
+		r, rok := readColumnRef(c, arg)
+		if !rok {
+			return "", false
+		}
+		ref = r
+	}
+	if !c.punct(')') {
+		return "", false
+	}
+	return "count(DISTINCT " + ref + ")", true
+}
+
 func (c *cursor) next() (token, bool) {
 	if c.i >= len(c.toks) {
 		return token{}, false
@@ -485,6 +518,13 @@ func orderKeyRef(c *cursor, items []string, orderRef func(token) int, aliases []
 					return -1, false
 				}
 				text = "count(*)"
+			} else if t.lower == "count" && c.peekIdentLower() == "distinct" {
+				// cd-1: an exact integer, so a valid ORDER BY target.
+				txt, dok := readCountDistinct(c, false)
+				if !dok {
+					return -1, false
+				}
+				text = txt
 			} else {
 				a, aok := c.next()
 				if !aok || a.kind != tokIdent || !isBareIdent(a.orig) || !c.punct(')') {
@@ -613,7 +653,9 @@ func matchScalarAgg(toks []token) (fn, col, meas, alias string, ok bool) {
 	// The argument must be a bare column identifier — NOT `*` (count(*) is the
 	// existing CountStar shape) and NOT an expression.
 	arg, ok := c.next()
-	if !ok || arg.kind != tokIdent {
+	// A bare keyword is not a column (`count(DISTINCT)` is a DuckDB parser error;
+	// the engine's footer matcher declines it) — never a footer count of `DISTINCT`.
+	if !ok || arg.kind != tokIdent || duckdbNonColumnKeywords[arg.lower] {
 		return "", "", "", "", false
 	}
 	col = arg.orig
@@ -951,6 +993,13 @@ func matchScanAgg(toks []token) (items, aliases []string, whereText string, meas
 					return fail()
 				}
 				items = append(items, "count(*)")
+			} else if f.lower == "count" && c.peekIdentLower() == "distinct" {
+				// cd-1: `count(DISTINCT <col | m['k']>)`.
+				item, ok := readCountDistinct(c, true)
+				if !ok {
+					return fail()
+				}
+				items = append(items, item)
 			} else if predArgAggFns[f.lower] && predArgFollows(c) {
 				// agg-6b2: a predicate argument (pred_arg.go).
 				text, ok := reserializePredArg(c)
@@ -1245,6 +1294,15 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 					return fail()
 				}
 				items = append(items, "count(*)")
+			} else if t.lower == "count" && c.peekIdentLower() == "distinct" {
+				// cd-1: `count(DISTINCT <bare col>)` under either key kind. A map
+				// subscript argument is not routed grouped (the other grouped
+				// aggregates take bare columns only).
+				item, iok := readCountDistinct(c, false)
+				if !iok {
+					return fail()
+				}
+				items = append(items, item)
 			} else if predArgAggFns[t.lower] && predArgFollows(c) {
 				// agg-6b2: a predicate argument (pred_arg.go); the tag-key gate
 				// above (hasMoment) still applies — these names are momentAggFns.

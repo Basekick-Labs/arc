@@ -91,7 +91,8 @@ func TestScanAggDeclines(t *testing.T) {
 		"SELECT count(*) FROM cpu GROUP BY host",
 		"SELECT count(*) FROM cpu WHERE x > 1 ORDER BY 1",
 		"SELECT count(*) FROM cpu WHERE x > 1 LIMIT 1",
-		"SELECT count(DISTINCT x) FROM cpu",
+		"SELECT count(DISTINCT x, y) FROM cpu", // cd-1 serves one bare column only
+		"SELECT sum(DISTINCT x) FROM cpu",
 		"SELECT sum(a * b) FROM cpu",
 		"SELECT sum(*) FROM cpu",
 		"SELECT host, count(*) FROM cpu",                       // mixed list
@@ -186,7 +187,7 @@ func TestGroupedAggDeclines(t *testing.T) {
 		// Outside the allow-listed subclass — the engine serves wider grouped
 		// shapes but they have NOT cleared the perf gate.
 		"SELECT host, sum(a * b) FROM cpu GROUP BY host",               // expression arg
-		"SELECT host, count(DISTINCT x) FROM cpu GROUP BY host",        // DISTINCT
+		"SELECT host, sum(DISTINCT x) FROM cpu GROUP BY host",          // DISTINCT (cd-1 is count only)
 		"SELECT host, region, count(*) FROM cpu GROUP BY host, region", // multi-key
 		"SELECT host FROM cpu GROUP BY host",                           // no count
 		"SELECT count(*) FROM cpu GROUP BY host",                       // key not projected
