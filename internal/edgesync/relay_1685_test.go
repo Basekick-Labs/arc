@@ -415,3 +415,53 @@ func (r *RelaySpoke) removeBundleForTest(ctx context.Context, id string) error {
 	}
 	return nil
 }
+
+// A file that changes between discovery and export is not signed, and the
+// half-uploaded bundle is removed: no outbox objects, the row still pending.
+func TestRelay_ExportAbortsAndCleansUpWhenASourceChanged(t *testing.T) {
+	r := newRelayRig(t)
+	ctx := context.Background()
+	r.write(t, relayPath(0), "payload 0")
+	r.write(t, relayPath(1), "payload 1")
+	if _, err := r.exporter.discoverer.Discover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.write(t, relayPath(1), "PAYLOAD 1") // same size, different digest
+	if _, err := r.spoke.Run(ctx); err == nil || !strings.Contains(err.Error(), "changed while exporting") {
+		t.Fatalf("err = %v, want a changed-while-exporting refusal", err)
+	}
+	if k := r.keys(t, RelayOutboxDir(testSpokeID)); len(k) != 0 {
+		t.Fatalf("partial bundle left in the bucket: %v", k)
+	}
+	if got := r.state(t, relayPath(0)); got != StatePending {
+		t.Fatalf("state = %s, want pending", got)
+	}
+}
+
+type flakyConditional struct {
+	storage.Backend
+	plainWrites int
+}
+
+func (f *flakyConditional) WriteIfAbsent(context.Context, string, []byte) (bool, error) {
+	return false, fmt.Errorf("NoSuchKey: conditional put not understood")
+}
+
+func (f *flakyConditional) Write(ctx context.Context, key string, data []byte) error {
+	f.plainWrites++
+	return f.Backend.Write(ctx, key, data)
+}
+
+// A store that cannot honour If-None-Match (MinIO 2025-09 answers 404) must
+// not stop acks: the conditional write falls back to a plain one.
+func TestWriteIfAbsentFallsBackWhenTheConditionErrors(t *testing.T) {
+	lb, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &flakyConditional{Backend: lb}
+	created, err := writeIfAbsent(context.Background(), f, "s/acks/x.json", []byte("ack"))
+	if err != nil || !created || f.plainWrites != 1 {
+		t.Fatalf("created=%v err=%v plain=%d", created, err, f.plainWrites)
+	}
+}

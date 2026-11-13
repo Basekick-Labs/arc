@@ -273,12 +273,22 @@ func truncateReason(s string) string {
 }
 
 // writeIfAbsent writes data at key unless an object is there already, where
-// the backend can compare-and-set; elsewhere it overwrites, which for an ack
-// or note is harmless (two hubs after a failover write equivalent, signed
-// acks for the same bundle).
+// the backend can compare-and-set; elsewhere it overwrites. Overwriting is
+// harmless for what the relay writes this way: two hubs after a failover
+// write equivalent, independently signed acks for the same bundle, and a
+// refusal note says the same thing twice.
+//
+// A conditional write that ERRORS falls back to a plain one. S3-compatible
+// stores disagree on If-None-Match: * for PUT — MinIO 2025-09 answers it on
+// a missing key with 404 NoSuchKey — and the condition is an optimisation
+// here, not the safety property, so a store that cannot honour it must not
+// stop acks from being written.
 func writeIfAbsent(ctx context.Context, b storage.Backend, key string, data []byte) (bool, error) {
 	if cw, ok := b.(storage.ConditionalWriter); ok {
-		return cw.WriteIfAbsent(ctx, key, data)
+		created, err := cw.WriteIfAbsent(ctx, key, data)
+		if err == nil {
+			return created, nil
+		}
 	}
 	if err := b.Write(ctx, key, data); err != nil {
 		return false, err
