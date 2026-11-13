@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
@@ -373,6 +375,37 @@ func (b *AzureBlobBackend) writeReader(ctx context.Context, path string, reader 
 		Msg("Wrote to Azure Blob Storage")
 
 	return nil
+}
+
+// WriteIfAbsent writes data at path unless a blob is already there
+// (ConditionalWriter), with a conditional Put Blob (If-None-Match: *). Azure
+// answers an existing blob with 409 BlobAlreadyExists; a 412 ConditionNotMet
+// is the same fact on some service versions and on Azurite. Both are
+// created=false. Data goes as one Put Blob, so a reader never sees a partial.
+func (b *AzureBlobBackend) WriteIfAbsent(ctx context.Context, path string, data []byte) (_ bool, retErr error) {
+	defer b.scrub(&retErr)
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return false, err
+	}
+	contentType := "application/octet-stream"
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlockBlobClient(key)
+	_, err = blobClient.UploadBuffer(ctx, data, &azblob.UploadBufferOptions{
+		HTTPHeaders: &blob.HTTPHeaders{BlobContentType: &contentType},
+		AccessConditions: &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)},
+		},
+	})
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobAlreadyExists, bloberror.ConditionNotMet) {
+			return false, nil
+		}
+		recordStorageError(ctx, err)
+		return false, fmt.Errorf("failed to write to Azure Blob Storage: %w", err)
+	}
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
+	return true, nil
 }
 
 // Read reads data from Azure Blob Storage
