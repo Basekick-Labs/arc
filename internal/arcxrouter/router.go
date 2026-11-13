@@ -673,6 +673,19 @@ func isOracleUnstableItem(item string) bool {
 	return false
 }
 
+// isPinnedNaNItem: the three bivariate aggregates whose DuckDB answer for ±Inf input
+// depends on its own partitioning (arcX moments-nd M3). arcx pins them to NaN on any
+// non-finite input, so arcx NaN vs a DuckDB ±Inf on these is the known divergence and
+// is filed as `oraclediff:` (WARN), not a mismatch alarm.
+func isPinnedNaNItem(item string) bool {
+	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func isArgItem(item string) bool {
 	for _, p := range []string{"arg_max(", "arg_min(", "max_by(", "min_by("} {
 		if strings.HasPrefix(item, p) {
