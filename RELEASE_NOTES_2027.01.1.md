@@ -2,6 +2,12 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: every configuration key Arc reads has a declared default ([#1109](https://github.com/Basekick-Labs/arc/issues/1109))
+
+`storage.s3_prefix` and 19 other keys were read without a default declared next to the rest: the S3 and Azure primary-storage keys, `tiered_storage.cold.s3_prefix`, `auth.bootstrap_token`, `auth.force_bootstrap`, `iceberg.warehouse` and `edge_sync.spoke.relay.staging_dir`. They now have one. Every new default is the value an unset key already had (empty, or `false`), so nothing changes at runtime; this keeps the code and the documented defaults from drifting.
+
+A test now fails when a key read in `internal/config` has no default. Four keys are read on purpose without one, each listed with its reason: `backup.targets` (a map a default would merge into) and the edge-sync spoke secrets (`edge_sync.spoke.secret`, `shared_secret`, `hub_token`), which come only from the environment and are refused in the configuration file.
+
 ## Fix: Iceberg export no longer fails a measurement because compaction deleted a file mid-pass ([#1706](https://github.com/Basekick-Labs/arc/pull/1706))
 
 Compaction, a `DELETE`, retention and tier moves delete data files while an Iceberg export pass may be reading them. Two things then failed the measurement, logged at Error and counted as `failed`, until the next pass on the full interval:
