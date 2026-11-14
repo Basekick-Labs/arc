@@ -601,6 +601,15 @@ func (e *Exporter) chunkSizeFor(tkey string) int {
 	if n, ok := e.chunkSize[tkey]; ok {
 		return n
 	}
+	return e.maxChunk()
+}
+
+// maxChunk is e.chunkMax, or dataFileChunkMax for an Exporter not built by NewExporter: a zero
+// chunk size would never advance the chunk loop. Called with chunkMu held or from it.
+func (e *Exporter) maxChunk() int {
+	if e.chunkMax <= 0 {
+		return dataFileChunkMax
+	}
 	return e.chunkMax
 }
 
@@ -609,9 +618,12 @@ func (e *Exporter) shrinkChunk(tkey string) {
 	defer e.chunkMu.Unlock()
 	n, ok := e.chunkSize[tkey]
 	if !ok {
-		n = e.chunkMax
+		n = e.maxChunk()
 	}
-	n = max(n/2, min(dataFileChunkMin, e.chunkMax))
+	n = max(n/2, min(dataFileChunkMin, e.maxChunk()))
+	if e.chunkSize == nil {
+		e.chunkSize = make(map[string]int)
+	}
 	e.chunkSize[tkey] = n
 }
 
@@ -622,7 +634,7 @@ func (e *Exporter) growChunk(tkey string, took time.Duration) {
 	if !ok || took >= chunkGrowBelow {
 		return
 	}
-	if n *= 2; n >= e.chunkMax {
+	if n *= 2; n >= e.maxChunk() {
 		delete(e.chunkSize, tkey) // back at the default; keep the map to shrunk tables only
 		return
 	}
@@ -640,6 +652,9 @@ func (e *Exporter) setFloorOwed(tkey string, owed bool) {
 	e.chunkMu.Lock()
 	defer e.chunkMu.Unlock()
 	if owed {
+		if e.floorDue == nil {
+			e.floorDue = make(map[string]struct{})
+		}
 		e.floorDue[tkey] = struct{}{}
 	} else {
 		delete(e.floorDue, tkey)
