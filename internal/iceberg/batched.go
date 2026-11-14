@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -140,8 +142,16 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			first := append([]FileRef(nil), req.unread...)
 			sortNewestFirst(first, func(f FileRef) string { return chunkSortKey(f.Key, f.PhysicalPath) })
 			first = first[:min(e.chunkSizeFor(tkey), len(first))]
-			add, err := req.readSchemas(ctx, first)
+			// Under the chunk budget like any other chunk, and shrunk the same way when it does
+			// not fit: a new table on a store too slow for a full first chunk must converge too.
+			cctx, cancel := e.chunkContext(ctx)
+			add, err := req.readSchemas(cctx, first)
+			expired := errors.Is(cctx.Err(), context.DeadlineExceeded)
+			cancel()
 			if err != nil {
+				if ctx.Err() == nil && expired && errors.Is(err, context.DeadlineExceeded) {
+					e.shrinkChunk(tkey)
+				}
 				return reconcileResult{}, err
 			}
 			if sc, err = MergeSchemas(sc, add); err != nil {
@@ -209,7 +219,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		// skipped by the scheduler's fingerprint gate before it ever reaches this
 		// function, so for such a table THIS is the pass that reclaims: the first
 		// one after a restart, whose fingerprint cache is cold.
-		tbl, ok, err := e.finishPass(ctx, tbl, tkey, database, measurement, false, 0)
+		tbl, ok, err := e.finishPass(ctx, tbl, tkey, database, measurement, 0, -1)
 		if err != nil {
 			return reconcileResult{}, err
 		}
@@ -241,11 +251,20 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		registered int
 		skippedAll []string
 		loopErr    error
-		removedAny bool
 		stopReason string
 	)
 	liveNow := len(live)
+	passStart := -1 // the first version this pass committed; finishPass's prune keeps it and later ones
 	commit := func(rm, adds []iceberg.DataFile) error {
+		if commits > 0 {
+			// Claim the previous commit's version before making another (adopt.go): a pass of
+			// several commits otherwise publishes only its last version, and a stale writer is
+			// fenced only by colliding with a published one. A single-commit pass claims nothing
+			// here, exactly as before #1686.
+			if err := e.claimVersion(ctx, tbl); err != nil {
+				return err
+			}
+		}
 		// The manifest collapse (#1106) is decided per commit, before it stages anything (it
 		// reads the CURRENT snapshot and the transaction cannot be re-driven once the diff has
 		// staged), against the live count THIS commit drives the table to — not the pass's
@@ -257,11 +276,13 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			return err
 		}
 		tbl, liveNow = committed, after
+		if commits == 0 {
+			passStart = e.metadataVersion(tbl)
+		}
 		commits++
-		// No discovery files here: finishPass publishes once per pass, whether the pass ended
-		// complete, partial or on a chunk error. Publishing a v<N> copy per commit would change
-		// which version numbers exist on disk, and the fence against a stale writer (adopt.go)
-		// is detected by colliding with exactly those copies.
+		// version-hint.text moves once per pass, in finishPass, whether the pass ended complete,
+		// partial or on a chunk error. The v<N> copy of this commit is claimed by the next
+		// commit (above), or published with the hint if this was the last.
 		return nil
 	}
 
@@ -272,22 +293,31 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	if len(removes) > 0 || len(cloned) > 0 || len(anchored) > 0 {
 		var built []iceberg.DataFile
 		var skipped []string
-		tbl, sc, built, skipped, err = e.prepareChunk(ctx, ctx, tbl, sc, anchored, unread, req.readSchemas, want)
-		if err != nil {
+		tbl, sc, built, skipped, err = e.prepareChunk(ctx, ctx, tbl, sc, anchored, unread, req.readSchemas, want, canCommit)
+		if errors.Is(err, errWriterLost) {
+			stopReason = stopWriterLost
+			err = nil
+		} else if err != nil {
 			return reconcileResult{}, err
 		}
 		skippedAll = append(skippedAll, skipped...)
 		adds := append(cloned, built...)
-		switch {
-		case len(adds) == 0 && len(removes) == 0:
-			// every anchored add was unpartitionable: nothing to commit
-		case !canCommit():
+		// len(adds)+len(removes) > 0 here: an anchored add or a clone exists only beside a removal.
+		if !canCommit() {
 			stopReason = stopWriterLost
-		default:
+		} else {
 			if err := commit(removes, adds); err != nil {
 				return reconcileResult{}, err
 			}
-			removedAny = len(removes) > 0
+			// Floor history now, straight after the commit that removed the paths, as before
+			// #1686 — not at the end of the pass, which a node that loses the writer role
+			// mid-pass never reaches, and the next writer, seeing nothing to remove, would never
+			// floor at all. finishPass retries a failed floor.
+			var floorOK bool
+			tbl, floorOK = e.expireSnapshots(ctx, tbl, database, measurement, expireModeFor(len(removes)))
+			if len(removes) > 0 {
+				e.setFloorOwed(tkey, !floorOK)
+			}
 			rewrote := make(map[string]struct{}, len(rewritten))
 			for _, p := range rewritten {
 				rewrote[p] = struct{}{}
@@ -314,12 +344,21 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		start := time.Now()
 		var built []iceberg.DataFile
 		var skipped []string
-		tbl, sc, built, skipped, err = e.prepareChunk(cctx, ctx, tbl, sc, batch, unread, req.readSchemas, want)
+		tbl, sc, built, skipped, err = e.prepareChunk(cctx, ctx, tbl, sc, batch, unread, req.readSchemas, want, canCommit)
 		// Read before cancel(), which would set it on every path.
 		chunkExpired := errors.Is(cctx.Err(), context.DeadlineExceeded)
 		cancel()
+		if errors.Is(err, errWriterLost) {
+			stopReason = stopWriterLost
+			break
+		}
 		if err != nil {
-			if ctx.Err() == nil && chunkExpired {
+			if fe := e.fencedErr(); fe != nil {
+				return reconcileResult{}, fe
+			}
+			// Only a deadline error is "did not fit"; a type conflict that happens to surface
+			// after the chunk's deadline is still an error.
+			if ctx.Err() == nil && chunkExpired && errors.Is(err, context.DeadlineExceeded) {
 				// The chunk's own budget ran out, not the pass's: commit nothing for it, shrink
 				// the next one and stop. Not an error — earlier chunks stand.
 				e.shrinkChunk(tkey)
@@ -336,6 +375,9 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 				break
 			}
 			if err := commit(nil, built); err != nil {
+				if fe := e.fencedErr(); fe != nil {
+					return reconcileResult{}, fe // forked: no hint, no prune, no sweep (adopt.go)
+				}
 				loopErr = err
 				break
 			}
@@ -359,13 +401,21 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	// discovery files, no prune or sweep. The new writer's pass reconciles from the table.
 	finishedOK := false
 	if stopReason != stopWriterLost {
-		tbl, finishedOK, err = e.finishPass(ctx, tbl, tkey, database, measurement, removedAny, commits)
+		tbl, finishedOK, err = e.finishPass(ctx, tbl, tkey, database, measurement, commits, passStart)
 		if err != nil {
 			return reconcileResult{}, err
 		}
 	}
 	partial := len(free) > 0 && loopErr == nil
 	remaining := len(free)
+	if partial && commits == 0 && stopReason != stopWriterLost {
+		// Nothing landed: no time was left for even one chunk (the listing and the table seed
+		// took the deadline), or the smallest chunk still did not fit. That is not progress, and
+		// reporting it as in_progress would also bring every later pass forward to the short
+		// retry interval. A failure, on the normal interval, with the chunk already shrunk.
+		loopErr = fmt.Errorf("no time left in this pass to register any of %d new files (%s); the next pass retries with chunks of %d", remaining, stopReason, e.chunkSizeFor(tkey))
+		partial = false
+	}
 	if stopReason != "" && commits == 0 && len(removes)+len(cloned)+len(anchored) > 0 {
 		// The first commit itself was refused (writer role): nothing of this pass landed.
 		partial, remaining = true, newFiles
@@ -422,11 +472,16 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 // floor, so the next pass may well remove nothing. A failed floor is remembered (floorOwed) and
 // retried by every later pass until it lands, including a pass with nothing to commit; before
 // #1686 the retry pass took the converged branch, which never expired, and the floor was lost.
-// The memory is per process: a restart in between forgets it.
+// The memory is per process: a restart in between forgets it. The floor itself is taken
+// straight after the commit that removed the paths (reconcile), so here it is only the retry.
+//
+// passStart is the first version this pass committed (-1: none). Pruning keeps it and every
+// later v<N> copy, so the versions a multi-commit pass claimed (claimVersion) stay on disk for
+// the fence until the next pass.
 //
 // ok reports that the discovery files were published and any owed floor landed.
-func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, database, measurement string, removed bool, commits int) (*icetable.Table, bool, error) {
-	floor := removed || e.floorOwed(tkey)
+func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, database, measurement string, commits, passStart int) (*icetable.Table, bool, error) {
+	floor := e.floorOwed(tkey)
 	expireOK := true
 	before := tbl.MetadataLocation()
 	switch {
@@ -441,7 +496,7 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 		return tbl, false, err
 	}
 	if commits > 0 || tbl.MetadataLocation() != before {
-		e.pruneOldVersionFiles(ctx, tbl)
+		e.pruneOldVersionFilesFrom(ctx, tbl, passStart)
 	}
 	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
 	// reachability is the one this pass settled on, not one version stale.
@@ -449,11 +504,18 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	return tbl, published && expireOK, nil
 }
 
+// errWriterLost is prepareChunk's report that canCommit turned false before a schema commit.
+var errWriterLost = errors.New("iceberg: this node is no longer the writer")
+
 // prepareChunk reads the schemas of the chunk's unread files (readCtx), evolves the table to
 // cover them (commitCtx: a schema commit is not abandoned halfway because the read budget
 // ended), and builds the chunk's DataFiles (readCtx). Files whose schema is read are removed
 // from unread. On error the returned table and schema are still the current ones.
-func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetable.Table, sc ArcSchema, paths []string, unread map[string]FileRef, readSchemas func(context.Context, []FileRef) (ArcSchema, error), want map[string]int64) (*icetable.Table, ArcSchema, []iceberg.DataFile, []string, error) {
+//
+// A schema evolution is a commit, and it publishes the discovery files (evolveSchema), so it is
+// gated like the data commits: errWriterLost when canCommit is false, and the fence is checked
+// straight after it.
+func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetable.Table, sc ArcSchema, paths []string, unread map[string]FileRef, readSchemas func(context.Context, []FileRef) (ArcSchema, error), want map[string]int64, canCommit func() bool) (*icetable.Table, ArcSchema, []iceberg.DataFile, []string, error) {
 	if len(paths) == 0 {
 		return tbl, sc, nil, nil, nil
 	}
@@ -472,9 +534,15 @@ func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetabl
 		if err != nil {
 			return tbl, sc, nil, nil, err
 		}
+		if !schemaCovers(tbl, merged) && !canCommit() {
+			return tbl, sc, nil, nil, errWriterLost
+		}
 		evolved, err := e.evolveSchema(commitCtx, tbl, merged)
 		if err != nil {
 			return tbl, sc, nil, nil, err
+		}
+		if err := e.fencedErr(); err != nil {
+			return evolved, sc, nil, nil, err
 		}
 		tbl, sc = evolved, merged
 		for _, f := range toRead {
@@ -552,6 +620,69 @@ func chunkSortKey(key, p string) string {
 // is still being registered answers recent queries first.
 func sortNewestFirst[T any](s []T, key func(T) string) {
 	sort.SliceStable(s, func(i, j int) bool { return key(s[i]) > key(s[j]) })
+}
+
+// schemaCovers reports whether the table already has every column of sc (evolveSchema would be
+// a no-op).
+func schemaCovers(tbl *icetable.Table, sc ArcSchema) bool {
+	for _, f := range sc.Fields {
+		if _, ok := tbl.Schema().FindFieldByName(f.Name); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// metadataVersion is the number N of the table's current metadata file (the v<N> it is
+// published as), -1 when the location cannot be parsed.
+func (e *Exporter) metadataVersion(tbl *icetable.Table) int {
+	v, _, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation())
+	if !ok {
+		return -1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// claimVersion publishes the v<N>.metadata.json copy of a commit in the middle of a pass,
+// without moving version-hint.text (finishPass does that once). It is the stale-writer fence
+// (adopt.go) for the versions a multi-commit pass would otherwise never publish: errFenced when
+// another writer already holds this version. Any other failure is logged and ignored; the
+// copy is a claim, not the publish readers use.
+func (e *Exporter) claimVersion(ctx context.Context, tbl *icetable.Table) error {
+	if e.backend == nil {
+		return nil
+	}
+	metaLoc := tbl.MetadataLocation()
+	version, dirKey, ok := e.parseVersionAndMetaDir(metaLoc)
+	if !ok {
+		return nil
+	}
+	metaKey, ok := e.warehouseRelKey(metaLoc)
+	if !ok {
+		return nil
+	}
+	body, err := e.backend.Read(ctx, metaKey)
+	if err != nil {
+		e.logger.Debug().Err(err).Str("key", metaKey).Msg("Iceberg: could not read a mid-pass version to claim it (non-fatal)")
+		return nil
+	}
+	vKey := path.Join(dirKey, "v"+version+".metadata.json")
+	if err := e.publishMetadataCopy(ctx, vKey, body); err != nil {
+		if errors.Is(err, errFenced) {
+			e.logger.Error().Err(err).Str("key", vKey).Bool("adopts_next_pass", e.warehouseAuthoritative).
+				Msg("Iceberg: another writer published this table version first; this pass stops (the next one adopts the published version where the warehouse is authoritative)")
+			e.hintFailMu.Lock()
+			e.fenced = err
+			e.hintFailMu.Unlock()
+			return err
+		}
+		e.logger.Debug().Err(err).Str("key", vKey).Msg("Iceberg: could not claim a mid-pass version (non-fatal)")
+	}
+	return nil
 }
 
 func schemaHasField(sc ArcSchema, name string) bool {

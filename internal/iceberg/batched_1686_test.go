@@ -347,3 +347,110 @@ func keys(m map[string]liveEntry) []string {
 	}
 	return out
 }
+
+// A node that loses the writer role between chunks commits nothing more, not even the schema
+// change the next chunk would need.
+func TestReconcile1686_WriterLostBeforeASchemaChangeCommitsNothing(t *testing.T) {
+	r := newRig1686(t, 3, 1)
+	old := r.write(0, "a")
+	sc := r.schema(old)
+	if _, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, []FileRef{old}); err != nil {
+		t.Fatal(err)
+	}
+	wide := r.write(1, "b") // older of the two new files: registered second
+	writeArcStyleParquet4Col(t, wide.LocalPath, day14+dayMicros, 5)
+	wide = refOf(t, wide.LocalPath)
+	wide.Key, wide.LocalPath = "mydb/cpu/2023/11/15/22/b.parquet", filepath.Join(r.root, "mydb/cpu/2023/11/15/22/b.parquet")
+	narrow := r.write(2, "c")
+
+	var calls atomic.Int32
+	res, err := r.exp.reconcile(context.Background(), reconcileRequest{
+		database: "mydb", measurement: "cpu", schema: sc, current: []FileRef{old, wide, narrow},
+		unread: []FileRef{wide, narrow}, readSchemas: readLocal,
+		canCommit: func() bool { return calls.Add(1) <= 1 },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.partial || res.registered != 1 {
+		t.Fatalf("result %+v, want one chunk registered and the pass stopped", res)
+	}
+	tbl, err := r.exp.EnsureTable(context.Background(), "mydb", "cpu", ArcSchema{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tbl.Schema().FindFieldByName("cpu_idle"); ok {
+		t.Fatal("a node that lost the writer role committed a schema change")
+	}
+}
+
+// A pass of several commits claims each intermediate version, so a version another writer
+// already published stops it at that commit (adopt.go's fence), not only at the last one.
+func TestReconcile1686_MidPassVersionsAreClaimedAndFenced(t *testing.T) {
+	r := newRig1686(t, 3, 1)
+	// Discovery files need a backend: an exporter over the rig's root, warehouse at the root.
+	backend, err := storage.NewLocalBackend(r.root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if r.exp, err = NewExporter(db, backend, DefaultWarehouse(backend), "arc", 3, zerolog.Nop()); err != nil {
+		t.Fatal(err)
+	}
+	r.exp.chunkMax = 1
+	a := r.write(0, "a")
+	sc := r.schema(a)
+	if _, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, []FileRef{a}); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := r.exp.EnsureTable(context.Background(), "mydb", "cpu", sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := r.exp.metadataVersion(tbl)
+	_, dirKey, _ := r.exp.parseVersionAndMetaDir(tbl.MetadataLocation())
+	// Another writer's v<cur+2>: the second commit of the next pass lands on it, and the third
+	// commit's claim of it must collide.
+	foreign := filepath.Join(r.root, dirKey, fmt.Sprintf("v%d.metadata.json", cur+2))
+	if err := os.WriteFile(foreign, []byte(`{"another":"writer"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := []FileRef{a, r.write(1, "b"), r.write(2, "c"), r.write(3, "d")}
+	_, err = r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, files)
+	if !errors.Is(err, errFenced) {
+		t.Fatalf("err %v, want errFenced from the mid-pass claim", err)
+	}
+	if got := len(r.live()); got != 3 {
+		t.Fatalf("live %d, want the 3 files committed before the fence (a and two chunks)", got)
+	}
+	hint, err := os.ReadFile(filepath.Join(r.root, dirKey, "version-hint.text"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(hint) != fmt.Sprint(cur) {
+		t.Fatalf("version-hint %s after a fenced pass, want it left at %d", hint, cur)
+	}
+}
+
+// A pass with no time for even one chunk is a failure, not progress: in_progress would bring
+// every later pass forward.
+func TestReconcile1686_NoChunkFitsIsAFailureNotProgress(t *testing.T) {
+	r := newRig1686(t, 3, 4)
+	a := r.write(0, "a")
+	sc := r.schema(a)
+	if _, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, []FileRef{a}); err != nil {
+		t.Fatal(err)
+	}
+	r.exp.commitReserve = time.Hour // more than the deadline below leaves
+	b := r.write(1, "b")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	res, err := r.exp.reconcile(ctx, reconcileRequest{database: "mydb", measurement: "cpu", schema: sc, current: []FileRef{a, b}, unread: []FileRef{b}, readSchemas: readLocal})
+	if err == nil || res.partial {
+		t.Fatalf("result %+v, err %v; want an error and not partial", res, err)
+	}
+}

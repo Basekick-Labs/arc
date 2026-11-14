@@ -653,7 +653,9 @@ func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Ta
 // ReconcileMeasurement makes the Iceberg table's data-file set equal `current`: it AddFiles
 // the files present in Arc but absent from the table, and Deletes the files present in the
 // table but absent from Arc. Removals and whatever replaces them commit together; new files
-// with no removal in their day commit in chunks (batched.go, #1686). Idempotent — if the sets already match, it is a
+// with no removal in their day commit in chunks (batched.go, #1686). With no deadline on ctx
+// every chunk runs; with one, a pass that runs out of time returns nil having registered part
+// of the new files, and the next call continues. Idempotent — if the sets already match, it is a
 // no-op (no new snapshot). This is the core of the reconciler design.
 func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) error {
 	ctx = e.withAWS(ctx)
@@ -851,8 +853,8 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 const manifestCollapseThreshold = 12
 
 // shouldCollapse reports whether this pass should also collapse the table's manifest set.
-// liveAfter is the number of data files the pass is driving the table to — len(want) at the call
-// site, not the count it has now.
+// liveAfter is the number of data files the commit is driving the table to — the live count
+// after that commit (batched.go), not the count it has now.
 //
 // It reads the manifest list of the CURRENT snapshot: one local file open (Iceberg export requires
 // storage.backend="local"), uncached and side-effect free. It must be called before the pass
@@ -1126,6 +1128,14 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 // by more than one.
 // Best-effort; never deletes the current version.
 func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table) {
+	e.pruneOldVersionFilesFrom(ctx, tbl, -1)
+}
+
+// pruneOldVersionFilesFrom is pruneOldVersionFiles that also keeps every copy numbered keepFrom
+// or higher (keepFrom < 0: none extra). A pass of several commits passes its first version, so
+// the versions it claimed mid-pass (claimVersion) survive to the next pass instead of being
+// pruned the moment they were written: they are what a stale writer's commits collide with.
+func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.Table, keepFrom int) {
 	if e.backend == nil || e.retain <= 0 {
 		return
 	}
@@ -1174,7 +1184,7 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 	sort.Slice(vs, func(i, j int) bool { return vs[i].n > vs[j].n }) // descending
 	curN, _ := strconv.Atoi(cur)
 	for _, v := range vs[keep:] {
-		if v.n == curN {
+		if v.n == curN || (keepFrom >= 0 && v.n >= keepFrom) {
 			continue
 		}
 		if err := e.backend.Delete(ctx, v.key); err != nil {
