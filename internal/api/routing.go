@@ -315,6 +315,7 @@ var forwardedRoutes = map[string]bool{
 	"POST /write":                      true,
 	"POST /api/v2/write":               true,
 	"POST /api/v1/write/line-protocol": true,
+	"POST /api/v1/write/prometheus":    true,
 	"POST /api/v1/write/msgpack":       true,
 	"POST /api/v1/write/tle":           true,
 	"POST /api/v1/import/csv":          true,

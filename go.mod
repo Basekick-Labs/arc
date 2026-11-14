@@ -18,6 +18,7 @@ require (
 	github.com/duckdb/duckdb-go/v2 v2.10506.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/gofiber/fiber/v2 v2.52.13
+	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/raft v1.7.3
@@ -46,6 +47,7 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/sys v0.49.0
 	google.golang.org/api v0.295.0
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
@@ -162,7 +164,6 @@ require (
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/grpc v1.83.2 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/ini.v1 v1.67.3 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

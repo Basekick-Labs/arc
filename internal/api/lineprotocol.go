@@ -102,6 +102,8 @@ func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
 	app.Post("/api/v2/write", writeAuth, h.WriteInfluxDB)
 	// Arc native endpoint (uses x-arc-database header)
 	app.Post("/api/v1/write/line-protocol", writeAuth, h.WriteSimple)
+	// Prometheus Remote Write 1.0 endpoint.
+	app.Post(prometheusRemoteWritePath, writeAuth, h.WritePrometheusRemoteWrite)
 	// Flush endpoint — admin-gated.
 	app.Post("/api/v1/write/line-protocol/flush", adminAuth, h.Flush)
 
@@ -415,7 +417,7 @@ localProcessing:
 		return len(record.Columns["time"]), lpWriteRecord(h.buffer, writeCtx, database, record)
 	})
 	if stop != nil {
-		return h.answerLPStop(c, database, stop, drops)
+		return h.answerLPStop(c, lpProtocolName, database, stop, drops)
 	}
 
 	// Record global metrics
@@ -522,7 +524,7 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 		return rows[m], lpWriteTyped(h.buffer, writeCtx, database, m, batches[m], rows[m])
 	})
 	if stop != nil {
-		return h.answerLPStop(c, database, stop, drops)
+		return h.answerLPStop(c, lpProtocolName, database, stop, drops)
 	}
 
 	m := metrics.Get()
@@ -612,6 +614,9 @@ var (
 // lpStop is a line-protocol write whose buffer call for measurement failed.
 // written are the measurements buffered before it, in write order; empty when
 // nothing was.
+// lpProtocolName is line protocol's name in logs and answers.
+const lpProtocolName = "Line protocol"
+
 type lpStop struct {
 	measurement string
 	err         error
@@ -671,17 +676,25 @@ func (h *LineProtocolHandler) writeLPMeasurements(measurements []string, rows, d
 // answerLPStop answers a line-protocol write that stopped. With nothing
 // written it is the answer the failure always had: nothing was written, so a
 // refusal's "retry" is true. With part written, see respondWriteStopped.
-func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *lpStop, drops []ingest.LPDrop) error {
-	h.totalErrors.Add(1)
+//
+// protocol names the write in logs. The line-protocol counters move only for
+// lpProtocolName: the remote-write handler counts its errors itself.
+func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, protocol, database string, stop *lpStop, drops []ingest.LPDrop) error {
+	lp := protocol == lpProtocolName
+	if lp {
+		h.totalErrors.Add(1)
+	}
 	err := stop.err
 	if len(stop.written) > 0 {
 		if len(drops) > 0 {
-			logPointDrops(h.logger, "Line protocol", database, drops)
+			logPointDrops(h.logger, protocol, database, drops)
 		}
 		m := metrics.Get()
-		m.IncLineProtocolRecords(stop.rowsWritten)
+		if lp {
+			m.IncLineProtocolRecords(stop.rowsWritten)
+		}
 		m.IncIngestRecords(stop.rowsWritten)
-		return respondWriteStopped(c, h.logger, "Line protocol", database, &ingest.WriteStoppedError{
+		return respondWriteStopped(c, h.logger, protocol, database, &ingest.WriteStoppedError{
 			Err: err, RowsWritten: stop.rowsWritten, RecordsWritten: stop.rowsWritten,
 			// In name order already: both paths write the sorted list.
 			Written: stop.written, StoppedAt: stop.measurement, Drops: drops,

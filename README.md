@@ -334,7 +334,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 - **Columnar storage**: Parquet format with full analytical SQL engine
 - **Workloads**: Industrial IoT, manufacturing, energy, fleet telemetry, aerospace, observability, and event analytics
 
-- **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
+- **Ingestion**: MessagePack columnar (fastest), [Prometheus Remote Write 1.0](docs/integrations/prometheus-remote-write.md), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
 - **Query**: Full analytical SQL; JSON, columnar MessagePack, and Apache Arrow IPC responses
 - **Compaction**: Tiered (hourly/daily) automatic Parquet file merging —
   10x storage reduction; see [hourly compaction tuning](docs/operations/compaction.md)

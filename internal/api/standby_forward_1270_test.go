@@ -155,7 +155,7 @@ func TestStandbyForwardFailures(t *testing.T) {
 	}
 }
 
-// Every write route forwards: msgpack, the line-protocol endpoints, TLE.
+// Every write route forwards: msgpack, line protocol, Prometheus remote write, TLE.
 func TestStandbyForwardsOnEveryWriteRoute(t *testing.T) {
 	_, _ = captureRefusals(t)
 	var hits atomic.Int32
@@ -165,10 +165,16 @@ func TestStandbyForwardsOnEveryWriteRoute(t *testing.T) {
 	}))
 	defer primary.Close()
 	app := standbyApp(t, primaryAt(strings.TrimPrefix(primary.URL, "http://")), 0)
-	for _, path := range []string{"/api/v1/write/msgpack", "/api/v1/write/line-protocol", "/write?db=db", "/api/v2/write?bucket=db", "/api/v1/write/tle"} {
+	for _, path := range []string{"/api/v1/write/msgpack", "/api/v1/write/line-protocol", "/api/v1/write/prometheus", "/write?db=db", "/api/v2/write?bucket=db", "/api/v1/write/tle"} {
 		before := hits.Load()
 		req := httptest.NewRequest("POST", path, strings.NewReader("x"))
 		req.Header.Set("x-arc-database", "db")
+		if strings.HasPrefix(path, prometheusRemoteWritePath) {
+			req.Header.Set("Content-Encoding", "snappy")
+			req.Header.Set("Content-Type", "application/x-protobuf")
+			req.Header.Set("X-Prometheus-Remote-Write-Version", prometheusRemoteWriteVersion)
+			req.Header.Set("User-Agent", "prometheus/test")
+		}
 		resp, err := app.Test(req, 10000)
 		if err != nil {
 			t.Fatal(err)

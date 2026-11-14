@@ -3537,6 +3537,25 @@ handshake (the ADBC drivers) are unchanged. See
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1658](https://github.com/Basekick-Labs/arc/pull/1658).
 
+### Prometheus Remote Write 1.0 ingestion (#1383)
+
+Arc accepts Prometheus Remote Write 1.0 samples at `/api/v1/write/prometheus`,
+so Prometheus, Grafana Alloy and other remote-write senders can ship metrics to
+Arc. Each metric is a measurement, in the layout arc-opentelemetry-exporter
+writes for OTLP metrics and named the way it names them (characters other than letters, digits and `_` become `_`, so a
+recording rule's `job:up:sum` is `job_up_sum`); labels are tag columns and
+samples a float64 `value` column. Staleness markers are not stored. A series
+Arc cannot store (a label named `value` or `time`, a label name starting with
+`_`, no `__name__`) is dropped and the rest written, answered with a `partial
+write` 400 as for line protocol. The receiver bounds the decoded payload, the
+materialised columns and the label bytes repeated across samples (413), ignores
+metric metadata, and does not store exemplars or native histograms. A Remote
+Write 2.0 request is answered 415. Prometheus
+and Grafana Alloy configuration examples are in the
+[integration guide](docs/integrations/prometheus-remote-write.md).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
+
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 
 `cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a

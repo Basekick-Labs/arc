@@ -44,6 +44,7 @@ func TestForwardIdentityVerifier_OnlyOnForwardedRoutes(t *testing.T) {
 		{"POST", "/write", "accepted", true},
 		{"POST", "/api/v2/write", "accepted", true},
 		{"POST", "/api/v1/write/line-protocol", "accepted", true},
+		{"POST", "/api/v1/write/prometheus", "accepted", true},
 		{"POST", "/api/v1/write/tle", "accepted", true},
 		{"POST", "/api/v1/import/csv", "accepted", true},
 		{"POST", "/api/v1/import/parquet", "accepted", true},
