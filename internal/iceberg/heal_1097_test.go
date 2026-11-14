@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,8 +132,11 @@ func TestHeal1097_PassStartVersionSurvivesTwoPublishes(t *testing.T) {
 		t.Fatalf("heal pass: settled %v err %v", settled, err)
 	}
 	got := r.vCopies()
-	if len(got) < 3 || got[len(got)-1] < start+2 {
+	if got[len(got)-1] < start+2 {
 		t.Fatalf("v<N> copies %v: expected two heal publishes after v%d", got, start)
+	}
+	if len(got) != 3 {
+		t.Fatalf("v<N> copies %v: want the two newest plus the pass-start v%d", got, start)
 	}
 	if got[0] != start {
 		t.Fatalf("v<N> copies %v: v%d, which the hint named when the pass started, was pruned", got, start)
@@ -145,15 +149,100 @@ func TestHeal1097_LostWriterConvergedPassDoesNotPrune(t *testing.T) {
 	r := newHealRig(t, 10)
 	files, sc := r.history(4)
 	r.exp.retain = 1
+	before := r.vCopies()
+	hintBefore := r.hint()
 	res, err := r.exp.reconcile(context.Background(), reconcileRequest{
 		database: "mydb", measurement: "cpu", schema: sc, current: files,
 		canCommit: func() bool { return false },
 	})
 	if err != nil || res.settled {
-		t.Fatalf("result %+v err %v; want unsettled, no error", res, err)
+		t.Fatalf("lost-writer pass: %+v %v; want unsettled, no error", res, err)
 	}
-	if got := r.vCopies(); len(got) <= 2 {
-		t.Fatalf("v<N> copies %v: a node that lost the writer role pruned", got)
+	if got := r.vCopies(); len(got) != len(before) || len(got) <= 2 {
+		t.Fatalf("v<N> copies %v (before %v): a node that lost the writer role published or pruned", got, before)
+	}
+	if h := r.hint(); h != hintBefore {
+		t.Fatalf("version-hint moved %d -> %d on a node that lost the writer role", hintBefore, h)
+	}
+}
+
+// hint returns the version version-hint.text names.
+func (r *rig1686) hint() int {
+	r.t.Helper()
+	b, err := os.ReadFile(filepath.Join(r.root, "arc_mydb.db", "cpu", "metadata", "version-hint.text"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return n
+}
+
+// A hint that lags the table (an earlier pass committed, then failed its hint write) names a
+// version readers still resolve; a converged heal pass keeps it.
+func TestHeal1097_LaggingHintVersionIsKept(t *testing.T) {
+	r := newHealRig(t, 1)
+	files, sc := r.history(3)
+	top := r.commitDirect(iceberg.Properties{icetable.MetadataPreviousVersionsMaxKey: "5"})
+	lag := top - 1
+	if !slices.Contains(r.vCopies(), lag) {
+		t.Fatalf("setup: v%d not on disk (%v)", lag, r.vCopies())
+	}
+	hintPath := filepath.Join(r.root, "arc_mydb.db", "cpu", "metadata", "version-hint.text")
+	if err := os.WriteFile(hintPath, []byte(strconv.Itoa(lag)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, files); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.vCopies(); !slices.Contains(got, lag) {
+		t.Fatalf("v<N> copies %v: v%d, which version-hint.text named when the pass started, was pruned", got, lag)
+	}
+}
+
+// failHintBackend fails every version-hint.text write.
+type failHintBackend struct{ storage.Backend }
+
+func (f failHintBackend) Write(ctx context.Context, p string, data []byte) error {
+	if strings.HasSuffix(p, "version-hint.text") {
+		return errors.New("disk full")
+	}
+	return f.Backend.Write(ctx, p, data)
+}
+
+// A pass whose publish failed prunes nothing: the hint may still name an old version.
+func TestHeal1097_NoPruneAfterAFailedPublish(t *testing.T) {
+	r := newHealRig(t, 10)
+	files, sc := r.history(4)
+	before := r.vCopies()
+	r.exp.retain = 1
+	r.exp.backend = failHintBackend{r.exp.backend}
+	settled, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, files)
+	if err != nil || settled {
+		t.Fatalf("settled %v err %v; want unsettled", settled, err)
+	}
+	for _, v := range before {
+		if !slices.Contains(r.vCopies(), v) {
+			t.Fatalf("v<N> copies %v (before %v): pruned after a failed publish", r.vCopies(), before)
+		}
+	}
+}
+
+// A heal that fails on a pass that also commits data still leaves the pass unsettled (the
+// second settled site, at the end of reconcile).
+func TestHeal1098_FailedHealOnACommittingPassIsUnsettled(t *testing.T) {
+	r := newHealRig(t, 3)
+	files, sc := r.history(2)
+	r.commitDirect(iceberg.Properties{icetable.DefaultNameMappingKey: "[]"})
+	r.exp.propsCommit = failingCommit
+	files = append(files, r.write(0, "new"))
+	res, err := r.exp.reconcile(context.Background(), reconcileRequest{
+		database: "mydb", measurement: "cpu", schema: sc, current: files,
+	})
+	if err != nil || res.settled || len(r.live()) != len(files) {
+		t.Fatalf("result %+v err %v live %d; want the data committed and the pass unsettled", res, err, len(r.live()))
 	}
 }
 

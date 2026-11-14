@@ -125,6 +125,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	if canCommit == nil {
 		canCommit = func() bool { return true }
 	}
+	e.setPassGate(canCommit)
+	defer e.setPassGate(nil)
 	// EnsureTable publishes the discovery files itself when it creates or evolves
 	// the table, so start from whether those writes succeeded. Otherwise a
 	// creation-time failure would be invisible here and the fingerprint would be
@@ -284,6 +286,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		// writer's mid-pass versions are protected only by that writer's own prune (#1097). The
 		// commit path stops the same way (stopWriterLost).
 		if !canCommit() {
+			e.logger.Info().Str("database", database).Str("measurement", measurement).
+				Msg("Iceberg reconcile: this node stopped being the writer during the pass; published and pruned nothing, the new writer settles the table")
 			return reconcileResult{schema: arcSchemaOf(tbl)}, nil
 		}
 		tbl, ok, err := e.finishPass(ctx, tbl, tkey, database, measurement, 0, -1)
@@ -644,10 +648,11 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	// Every pass that published, including one with no data commit: a heal or a schema evolution
 	// in EnsureTable publishes its own v<N> copy, and a converged pass used to leave it over the
 	// retain+1 bound until some later pass committed data (#1097). Not after a failed publish:
-	// the hint may still name a version this prune would delete. The extra LIST on a zero-commit
-	// pass sits next to the sweep's LIST of the same directory.
+	// the hint may still name a version this prune would delete. A zero-commit pass pays one LIST
+	// of the metadata directory for it (the orphan sweep, when on, lists it too).
 	if published {
-		e.pruneOldVersionFilesFrom(ctx, tbl, passStart, e.passLoadedVersion())
+		loaded, hint := e.passStartVersions()
+		e.pruneOldVersionFilesFrom(ctx, tbl, passStart, loaded, hint)
 	}
 	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
 	// reachability is the one this pass settled on, not one version stale.

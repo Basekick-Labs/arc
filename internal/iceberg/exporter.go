@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -115,11 +116,15 @@ type Exporter struct {
 	// retention properties). Tests only: it is how a failing heal commit is reproduced without
 	// a failing catalog. nil in production.
 	propsCommit func(context.Context, *icetable.Transaction) (*icetable.Table, error)
-	// passLoaded is the table's metadata version when this reconcile first loaded it, before any
-	// heal or evolution committed (-1: not loaded yet). In the steady state it is the version
-	// version-hint.text named when the pass started, which a reader may have just resolved, so
-	// the end-of-pass prune never deletes it (#1097).
-	passLoaded int
+	// passLoaded is the table's metadata version when this reconcile first loaded it, and
+	// passHint the version version-hint.text named then — both before any heal or evolution
+	// committed (-1: not known). A reader may be resolving either, so the end-of-pass prune never
+	// deletes them (#1097). They differ when an earlier pass committed but failed its hint write.
+	passLoaded, passHint int
+	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
+	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
+	// nil outside a reconcile (always allowed).
+	passGate func() bool
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
@@ -160,8 +165,23 @@ func (e *Exporter) resetHintFailure() {
 	e.hintFailure = false
 	e.fenced = nil
 	e.healFailure = false
-	e.passLoaded = -1
+	e.passLoaded, e.passHint = -1, -1
 	e.hintFailMu.Unlock()
+}
+
+// setPassGate installs (or, with nil, removes) the current reconcile's canCommit.
+func (e *Exporter) setPassGate(g func() bool) {
+	e.hintFailMu.Lock()
+	e.passGate = g
+	e.hintFailMu.Unlock()
+}
+
+// passMayCommit reports whether the running reconcile may still commit (true outside one).
+func (e *Exporter) passMayCommit() bool {
+	e.hintFailMu.Lock()
+	g := e.passGate
+	e.hintFailMu.Unlock()
+	return g == nil || g()
 }
 
 // commitProps commits a table-property transaction (see propsCommit).
@@ -186,20 +206,35 @@ func (e *Exporter) healFailed() bool {
 	return e.healFailure
 }
 
-// notePassLoaded records the table's version the first time this reconcile loads it.
-func (e *Exporter) notePassLoaded(v int) {
+// notePassStart records, the first time this reconcile loads the table, its version and the
+// version version-hint.text names (one GET; -1 when there is none or it cannot be read).
+func (e *Exporter) notePassStart(ctx context.Context, tbl *icetable.Table) {
+	e.hintFailMu.Lock()
+	seen := e.passLoaded >= 0
+	e.hintFailMu.Unlock()
+	if seen {
+		return
+	}
+	loaded, hint := e.metadataVersion(tbl), -1
+	if e.backend != nil {
+		if _, dirKey, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation()); ok && dirKey != "" && dirKey != "." {
+			if n, err := e.readHint(ctx, dirKey); err == nil {
+				hint = n
+			}
+		}
+	}
 	e.hintFailMu.Lock()
 	if e.passLoaded < 0 {
-		e.passLoaded = v
+		e.passLoaded, e.passHint = loaded, hint
 	}
 	e.hintFailMu.Unlock()
 }
 
-// passLoadedVersion returns the version recorded by notePassLoaded, or -1.
-func (e *Exporter) passLoadedVersion() int {
+// passStartVersions returns the versions notePassStart recorded (-1 when unknown).
+func (e *Exporter) passStartVersions() (loaded, hint int) {
 	e.hintFailMu.Lock()
 	defer e.hintFailMu.Unlock()
-	return e.passLoaded
+	return e.passLoaded, e.passHint
 }
 
 // fencedErr returns the fence refusal recorded since the last reset, if any.
@@ -244,6 +279,8 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		return nil, fmt.Errorf("create iceberg sql catalog: %w", err)
 	}
 	return &Exporter{
+		passLoaded:  -1,
+		passHint:    -1,
 		db:          db,
 		catalog:     cat,
 		catalogName: "arc",
@@ -466,8 +503,8 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 
 	tbl, err := e.loadTableRecovering(ctx, ident)
 	if err == nil {
-		// Before any heal or evolution below commits: the version a reader may be resolving.
-		e.notePassLoaded(e.metadataVersion(tbl))
+		// Before any heal or evolution below commits: the versions a reader may be resolving.
+		e.notePassStart(ctx, tbl)
 		// Table exists — evolve its schema to cover any new columns in `sc` (Arc's
 		// per-measurement schema can grow over time). Missing columns are added as optional,
 		// so older narrow files stay compatible. No-op when already a superset.
@@ -652,9 +689,17 @@ func (e *Exporter) setNameMappingFromSchema(ctx context.Context, tbl *icetable.T
 // It also leaves the pass unsettled (noteHealFailure), which keeps the scheduler from caching the
 // measurement: the next pass reconciles it again and retries the heal, even when its file set
 // has gone quiet. Before #1098 the pass could settle over a failed heal, and the retry waited for
-// a file change or a restart — possibly never.
+// a file change or a restart — possibly never. The cost, as for a failed version-hint write: a
+// heal that keeps failing makes every tick a full, uncached reconcile of this measurement, with a
+// Warn each time.
 func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*icetable.Table, error) {
 	before := tbl.Properties()[icetable.DefaultNameMappingKey]
+	if nm, err := json.Marshal(tbl.Schema().NameMapping()); err == nil && (string(nm) == before || string(nm) == "null") {
+		return tbl, nil // nothing to heal (the null case is setNameMappingFromSchema's warning)
+	}
+	if !e.passMayCommit() {
+		return tbl, nil // lost the writer role mid-pass: the new writer heals (#1097)
+	}
 	healed, err := e.setNameMappingFromSchema(ctx, tbl)
 	if err != nil {
 		e.noteHealFailure()
@@ -693,6 +738,9 @@ func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Ta
 	}
 	if len(updates) == 0 {
 		return tbl
+	}
+	if !e.passMayCommit() {
+		return tbl // lost the writer role mid-pass: the new writer heals (#1097)
 	}
 
 	txn := tbl.NewTransaction()
@@ -1190,7 +1238,7 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 // by more than one.
 // Best-effort; never deletes the current version.
 func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table) {
-	e.pruneOldVersionFilesFrom(ctx, tbl, -1, -1)
+	e.pruneOldVersionFilesFrom(ctx, tbl, -1)
 }
 
 // pruneOldVersionFilesFrom is pruneOldVersionFiles that also keeps every copy numbered keepFrom
@@ -1198,12 +1246,13 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 // the versions it claimed mid-pass (claimVersion) survive to the next pass instead of being
 // pruned the moment they were written: they are what a stale writer's commits collide with.
 //
-// protect (>= 0) is one more version never deleted: the one the table was at when the pass
-// started (passLoaded), which version-hint.text named and a reader may have just resolved. The
-// retain+1 cushion below covers one publish per pass; a pass that publishes twice before this
-// prune (a schema evolution or name-mapping heal, then a retention heal) would otherwise push
-// that version out of the cushion (#1097).
-func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.Table, keepFrom, protect int) {
+// protect are more versions never deleted (negative entries ignored): the table's version and
+// the version-hint.text version when the pass started, either of which a reader may have just
+// resolved. The retain+1 cushion below covers one publish per pass; a pass that publishes twice
+// before this prune (a name-mapping heal, then a retention heal), or a hint that lagged the
+// table, would otherwise push them out of it (#1097). They are kept beyond retain+1, so such a
+// pass can leave one copy over the bound until a later pass publishes again.
+func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.Table, keepFrom int, protect ...int) {
 	if e.backend == nil || e.retain <= 0 {
 		return
 	}
@@ -1252,7 +1301,7 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	sort.Slice(vs, func(i, j int) bool { return vs[i].n > vs[j].n }) // descending
 	curN, _ := strconv.Atoi(cur)
 	for _, v := range vs[keep:] {
-		if v.n == curN || (keepFrom >= 0 && v.n >= keepFrom) || (protect >= 0 && v.n == protect) {
+		if v.n == curN || (keepFrom >= 0 && v.n >= keepFrom) || slices.Contains(protect, v.n) {
 			continue
 		}
 		if err := e.backend.Delete(ctx, v.key); err != nil {
