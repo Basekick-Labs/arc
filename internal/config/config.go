@@ -2408,10 +2408,22 @@ func setDefaults(v *viper.Viper) {
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")
 	v.SetDefault("storage.local_path", "./data/arc")
+	v.SetDefault("storage.s3_bucket", "") // Must be configured for storage.backend=s3
 	v.SetDefault("storage.s3_region", "us-east-1")
+	v.SetDefault("storage.s3_endpoint", "")   // Empty for AWS; set for MinIO/SeaweedFS
+	v.SetDefault("storage.s3_access_key", "") // Empty = AWS_ACCESS_KEY_ID, then the AWS credential chain
+	v.SetDefault("storage.s3_secret_key", "")
 	v.SetDefault("storage.s3_use_ssl", true)
 	v.SetDefault("storage.s3_path_style", false) // Use virtual-hosted style by default (set true for MinIO)
-	v.SetDefault("storage.azure_prefix", "")     // Container root by default (#1102)
+	v.SetDefault("storage.s3_prefix", "")        // Bucket root by default (#1109)
+	v.SetDefault("storage.azure_connection_string", "")
+	v.SetDefault("storage.azure_account_name", "")
+	v.SetDefault("storage.azure_account_key", "")
+	v.SetDefault("storage.azure_sas_token", "")
+	v.SetDefault("storage.azure_container", "") // Must be configured for storage.backend=azure
+	v.SetDefault("storage.azure_prefix", "")    // Container root by default (#1102)
+	v.SetDefault("storage.azure_endpoint", "")  // Empty = the public endpoint (a connection string carries its own); set for Azurite
+	v.SetDefault("storage.azure_use_managed_identity", false)
 	v.SetDefault("storage.gcs_bucket", "")
 	v.SetDefault("storage.gcs_prefix", "")           // Bucket root by default
 	v.SetDefault("storage.gcs_credentials_file", "") // Empty = Application Default Credentials
@@ -2475,6 +2487,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("auth.db_path", "./data/arc.db") // Shared SQLite DB (same as Python)
 	v.SetDefault("auth.cache_ttl", 300)           // 5 minutes
 	v.SetDefault("auth.max_cache_size", 1000)     // Max cached tokens
+	v.SetDefault("auth.bootstrap_token", "")      // Empty = generate one on first start
+	v.SetDefault("auth.force_bootstrap", false)
 
 	// Compaction defaults
 	// Edge sync: the hub receive side is OFF by default. Enabling it exposes
@@ -2609,7 +2623,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
 	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
 	v.SetDefault("iceberg.layout", IcebergLayoutWarehouse)
-	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
+	v.SetDefault("iceberg.warehouse", "") // Empty = the storage root, resolved at wire time (needs the backend)
 
 	// Continuous query defaults
 	v.SetDefault("continuous_query.enabled", true)            // Enable CQ management by default
@@ -2781,6 +2795,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.cold.s3_secret_key", "")      // Must be configured
 	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)       // HTTPS by default
 	v.SetDefault("tiered_storage.cold.s3_path_style", false)   // Virtual-hosted style for AWS
+	v.SetDefault("tiered_storage.cold.s3_prefix", "")          // Bucket root by default (#1109)
 	v.SetDefault("tiered_storage.cold.azure_container", "")    // Must be configured for Azure
 	v.SetDefault("tiered_storage.cold.azure_prefix", "")       // Container root by default (#1102)
 	v.SetDefault("tiered_storage.cold.azure_connection_string", "")
