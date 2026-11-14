@@ -18,26 +18,65 @@ import (
 // default and the documented default cannot drift and the key is visible with the rest. The read
 // side is taken from the source: every dotted string literal passed to a method of the viper
 // (v.GetString("…"), v.InConfig("…")) or to a helper that takes it (parsePositiveDuration(v,
-// "…")). Keys built from a prefix are listed in prefixedReads. The default side is setDefaults
-// itself, run on an empty viper.
+// "…")). Keys built from a prefix are added by prefixedReads: loadEdgeSyncRelay's own fields, and
+// every field readObjectTarget reads (taken from its source) under each relay prefix. The default
+// side is setDefaults itself, run on an empty viper.
+//
+// Out of scope: backup.targets.<name>.* — those defaults are set at load time for the target
+// names found, not in setDefaults.
+
+// relayPrefixes are the prefixes loadEdgeSyncRelay is called with.
+var relayPrefixes = []string{"edge_sync.spoke.relay.", "edge_sync.import.relay."}
 
 // prefixedReads are keys read as prefix+field, which no string literal names whole.
-var prefixedReads = func() []string {
-	var out []string
-	for _, p := range []string{"edge_sync.spoke.relay.", "edge_sync.import.relay."} { // loadEdgeSyncRelay
-		for _, f := range []string{"enabled", "staging_dir", "interval"} {
+func prefixedReads(t *testing.T, fset *token.FileSet, files []*ast.File) []string {
+	t.Helper()
+	out := []string{
+		"edge_sync.spoke.relay.enabled", "edge_sync.spoke.relay.interval", "edge_sync.spoke.relay.ack_timeout",
+		"edge_sync.import.relay.enabled", "edge_sync.import.relay.interval", "edge_sync.import.relay.staging_dir",
+	}
+	fields := funcFieldLiterals(files, "readObjectTarget")
+	if len(fields) < 20 {
+		t.Fatalf("found %d readObjectTarget fields: the scan is not seeing them", len(fields))
+	}
+	for _, p := range relayPrefixes {
+		for _, f := range fields {
 			out = append(out, p+f)
 		}
 	}
-	return append(out, "edge_sync.spoke.relay.ack_timeout") // spoke side only
-}()
+	return out
+}
+
+var fieldName = regexp.MustCompile(`^[a-z0-9_]+$`)
+
+// funcFieldLiterals returns the field-name string literals in the body of the named function.
+func funcFieldLiterals(files []*ast.File, name string) []string {
+	var out []string
+	for _, f := range files {
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Name.Name != name {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					if s, err := strconv.Unquote(lit.Value); err == nil && fieldName.MatchString(s) {
+						out = append(out, s)
+					}
+				}
+				return true
+			})
+		}
+	}
+	return out
+}
 
 // notDefaulted are keys read on purpose without a default, and why. The test fails when one of
 // them gains a default or is no longer read, so the list cannot go stale.
 var notDefaulted = map[string]string{
-	"backup.targets":                "a map read with GetStringMap: a default map would merge with, or shadow, the targets an operator configures",
-	"edge_sync.spoke.secret":        "env-only secret (os.Getenv); viper only checks it is NOT in the config file (InConfig), and a default would advertise a key Load refuses",
-	"edge_sync.spoke.shared_secret": "same as edge_sync.spoke.secret",
+	"backup.targets":                "a map read with GetStringMap: a non-empty default would be a phantom target when the file has none (an empty-map default does not show in AllKeys, so this list cannot see one)",
+	"edge_sync.spoke.secret":        "env-only secret (ARC_EDGE_SYNC_SPOKE_SECRET, os.Getenv); viper only checks it is NOT in the config file (InConfig), and a default would advertise a key Load refuses",
+	"edge_sync.spoke.shared_secret": "a spelling Load refuses in the config file (InConfig); the secret comes from ARC_EDGE_SYNC_SPOKE_SECRET",
 	"edge_sync.spoke.hub_token":     "env-only secret read from ARC_EDGE_SYNC_HUB_TOKEN; viper only refuses it in the config file",
 }
 
@@ -53,6 +92,7 @@ func readKeys(t *testing.T) map[string]string {
 		t.Fatal(err)
 	}
 	keys := map[string]string{}
+	var parsed []*ast.File
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -62,6 +102,7 @@ func readKeys(t *testing.T) map[string]string {
 		if err != nil {
 			t.Fatal(err)
 		}
+		parsed = append(parsed, f)
 		ast.Inspect(f, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
@@ -94,7 +135,7 @@ func readKeys(t *testing.T) map[string]string {
 			return true
 		})
 	}
-	for _, k := range prefixedReads {
+	for _, k := range prefixedReads(t, fset, parsed) {
 		keys[k] = "prefixedReads"
 	}
 	return keys

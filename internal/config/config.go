@@ -2411,7 +2411,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("storage.s3_bucket", "") // Must be configured for storage.backend=s3
 	v.SetDefault("storage.s3_region", "us-east-1")
 	v.SetDefault("storage.s3_endpoint", "")   // Empty for AWS; set for MinIO/SeaweedFS
-	v.SetDefault("storage.s3_access_key", "") // Empty = the AWS credential chain
+	v.SetDefault("storage.s3_access_key", "") // Empty = AWS_ACCESS_KEY_ID, then the AWS credential chain
 	v.SetDefault("storage.s3_secret_key", "")
 	v.SetDefault("storage.s3_use_ssl", true)
 	v.SetDefault("storage.s3_path_style", false) // Use virtual-hosted style by default (set true for MinIO)
@@ -2422,7 +2422,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("storage.azure_sas_token", "")
 	v.SetDefault("storage.azure_container", "") // Must be configured for storage.backend=azure
 	v.SetDefault("storage.azure_prefix", "")    // Container root by default (#1102)
-	v.SetDefault("storage.azure_endpoint", "")  // Empty = the public endpoint; set for Azurite
+	v.SetDefault("storage.azure_endpoint", "")  // Empty = the public endpoint (a connection string carries its own); set for Azurite
 	v.SetDefault("storage.azure_use_managed_identity", false)
 	v.SetDefault("storage.gcs_bucket", "")
 	v.SetDefault("storage.gcs_prefix", "")           // Bucket root by default
@@ -2554,7 +2554,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.relay.enabled", false)
 	v.SetDefault("edge_sync.spoke.relay.interval", "5m")
 	v.SetDefault("edge_sync.spoke.relay.ack_timeout", "72h")
-	v.SetDefault("edge_sync.spoke.relay.staging_dir", "") // Read by loadEdgeSyncRelay; only the hub stages (#1109)
 	setObjectTargetDefaults(v, "edge_sync.spoke.relay.")
 	v.SetDefault("edge_sync.import.relay.enabled", false)
 	v.SetDefault("edge_sync.import.relay.interval", "1m")

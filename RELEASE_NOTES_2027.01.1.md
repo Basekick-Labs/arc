@@ -4,9 +4,9 @@
 
 ## Fix: every configuration key Arc reads has a declared default ([#1109](https://github.com/Basekick-Labs/arc/issues/1109))
 
-`storage.s3_prefix` and 19 other keys were read without a default declared next to the rest: the S3 and Azure primary-storage keys, `tiered_storage.cold.s3_prefix`, `auth.bootstrap_token`, `auth.force_bootstrap`, `iceberg.warehouse` and `edge_sync.spoke.relay.staging_dir`. They now have one. Every new default is the value an unset key already had (empty, or `false`), so nothing changes at runtime; this keeps the code and the documented defaults from drifting.
+`storage.s3_prefix` and 15 other keys were read without a default declared next to the rest: the other S3 and Azure primary-storage keys, `tiered_storage.cold.s3_prefix`, `auth.bootstrap_token`, `auth.force_bootstrap` and `iceberg.warehouse`. They now have one. A spoke no longer reads `edge_sync.spoke.relay.staging_dir`, which only the hub uses. Every new default is the value an unset key already had (empty, or `false`), so nothing changes at runtime; this keeps the code and the documented defaults from drifting.
 
-A test now fails when a key read in `internal/config` has no default. Four keys are read on purpose without one, each listed with its reason: `backup.targets` (a map a default would merge into) and the edge-sync spoke secrets (`edge_sync.spoke.secret`, `shared_secret`, `hub_token`), which come only from the environment and are refused in the configuration file.
+A test now fails when a key read in `internal/config` has no default, including the target fields of the edge-sync relay. Four keys are read on purpose without one, each listed with its reason: `backup.targets` (a map: a default would be a phantom target) and the edge-sync spoke secrets (`edge_sync.spoke.secret`, `shared_secret`, `hub_token`), which are refused in the configuration file and come from `ARC_EDGE_SYNC_SPOKE_SECRET` / `ARC_EDGE_SYNC_HUB_TOKEN`. Per-target backup keys (`backup.targets.<name>.*`) get their defaults when the targets are loaded, as before.
 
 ## Fix: Iceberg export no longer fails a measurement because compaction deleted a file mid-pass ([#1706](https://github.com/Basekick-Labs/arc/pull/1706))
 

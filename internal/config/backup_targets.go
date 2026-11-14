@@ -908,9 +908,12 @@ func (c *Config) coldTierDestination() (storage.Destination, error) {
 // it.
 func loadEdgeSyncRelay(v *viper.Viper, k string, spoke bool) (EdgeSyncRelayConfig, error) {
 	r := EdgeSyncRelayConfig{
-		Enabled:    v.GetBool(k + "enabled"),
-		StagingDir: strings.TrimSpace(v.GetString(k + "staging_dir")),
-		Target:     readObjectTarget(v, "relay", k),
+		Enabled: v.GetBool(k + "enabled"),
+		Target:  readObjectTarget(v, "relay", k),
+	}
+	if !spoke {
+		// Hub only: a spoke never stages a bundle, so it has no staging_dir key (#1109).
+		r.StagingDir = strings.TrimSpace(v.GetString(k + "staging_dir"))
 	}
 	if !r.Enabled {
 		return r, nil
