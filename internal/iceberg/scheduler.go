@@ -517,11 +517,12 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// its file set then goes quiet (the steady state) it would stay unsettled indefinitely.
 	// Leaving the entry uncached costs one repeated reconcile per tick until it succeeds.
 	//
-	// Two things can leave a pass unsettled, and the exporter has already logged which:
-	// unpublished reader discovery files, or a snapshot expiry that failed on a pass whose
-	// removals made the older snapshots unreadable (#1092). Both need the same retry, so this
-	// does not name either — a message claiming the hint when the expiry failed would send an
-	// operator to the wrong place.
+	// Three things can leave a pass unsettled, and the exporter has already logged which:
+	// unpublished reader discovery files, a snapshot expiry that failed on a pass whose
+	// removals made the older snapshots unreadable (#1092), or a heal commit (name mapping,
+	// retention properties) that failed (#1098). All need the same retry, so this does not name
+	// one — a message claiming the hint when the expiry failed would send an operator to the
+	// wrong place.
 	if !res.settled {
 		delete(s.state, key)
 		s.logger.Warn().

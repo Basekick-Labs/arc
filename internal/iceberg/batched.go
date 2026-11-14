@@ -78,8 +78,9 @@ type reconcileRequest struct {
 
 // reconcileResult reports what one reconcile did.
 type reconcileResult struct {
-	// settled: the table equals the listing, the discovery files are published and any history
-	// floor owed has landed. Only then may the scheduler cache the fingerprint.
+	// settled: the table equals the listing, the discovery files are published, any history
+	// floor owed has landed and no heal commit failed (#1098). Only then may the scheduler cache
+	// the fingerprint.
 	settled bool
 	// partial: new files remain unregistered because the pass ran out of time or lost the
 	// writer role. Not an error: what was committed stays, and the next pass continues.
@@ -99,7 +100,8 @@ type reconcileResult struct {
 
 // ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
 // SETTLED: the reader discovery files (version-hint.text, v<N>.metadata.json) were
-// published, AND any snapshot-history floor this pass owed actually committed.
+// published, any snapshot-history floor this pass owed actually committed, AND no heal commit
+// (name mapping, retention properties) failed (#1098).
 //
 // The scheduler needs this separately from the error. Both steps are best-effort with
 // respect to the committed snapshot, but if either fails the caller must NOT cache the
@@ -276,11 +278,19 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		// skipped by the scheduler's fingerprint gate before it ever reaches this
 		// function, so for such a table THIS is the pass that reclaims: the first
 		// one after a restart, whose fingerprint cache is cold.
+		//
+		// Only while this node is still the writer: the lease can move while EnsureTable and
+		// the manifest read run, and a node that lost it must not publish or prune — the new
+		// writer's mid-pass versions are protected only by that writer's own prune (#1097). The
+		// commit path stops the same way (stopWriterLost).
+		if !canCommit() {
+			return reconcileResult{schema: arcSchemaOf(tbl)}, nil
+		}
 		tbl, ok, err := e.finishPass(ctx, tbl, tkey, database, measurement, 0, -1)
 		if err != nil {
 			return reconcileResult{}, err
 		}
-		return reconcileResult{settled: ok && hintOK, schema: arcSchemaOf(tbl)}, nil
+		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl)}, nil
 	}
 
 	// Metadata-only: files are dropped and added as DataFiles. (Transaction.Delete is a
@@ -554,6 +564,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			Int("commits", commits).Int("remaining", remaining).
 			Bool("hint_published", hintOK).
 			Bool("history_settled", finishedOK).
+			Bool("heal_ok", !e.healFailed()).
 			Msg("Reconciled Iceberg table")
 	}
 	if partial {
@@ -584,7 +595,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	// A failed floor must not be cached as settled. The scheduler keys its skip gate on this
 	// value; reporting not-settled keeps the fingerprint uncached so the next tick re-drives the
 	// measurement, and finishPass retries the owed floor there even if that pass removes nothing.
-	res.settled = !partial && !moved && hintOK && finishedOK
+	res.settled = !partial && !moved && hintOK && finishedOK && !e.healFailed()
 	return res, nil
 }
 
@@ -614,11 +625,11 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 // later v<N> copy, so the versions a multi-commit pass claimed (claimVersion) stay on disk for
 // the fence until the next pass.
 //
-// ok reports that the discovery files were published and any owed floor landed.
+// ok reports that the discovery files were published and any owed floor landed. (A failed heal
+// also leaves the pass unsettled; the callers read that from healFailed, #1098.)
 func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, database, measurement string, commits, passStart int) (*icetable.Table, bool, error) {
 	floor := e.floorOwed(tkey)
 	expireOK := true
-	before := tbl.MetadataLocation()
 	switch {
 	case floor:
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, floorHistory)
@@ -630,8 +641,13 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	if err := e.fencedErr(); err != nil {
 		return tbl, false, err
 	}
-	if commits > 0 || tbl.MetadataLocation() != before {
-		e.pruneOldVersionFilesFrom(ctx, tbl, passStart)
+	// Every pass that published, including one with no data commit: a heal or a schema evolution
+	// in EnsureTable publishes its own v<N> copy, and a converged pass used to leave it over the
+	// retain+1 bound until some later pass committed data (#1097). Not after a failed publish:
+	// the hint may still name a version this prune would delete. The extra LIST on a zero-commit
+	// pass sits next to the sweep's LIST of the same directory.
+	if published {
+		e.pruneOldVersionFilesFrom(ctx, tbl, passStart, e.passLoadedVersion())
 	}
 	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
 	// reachability is the one this pass settled on, not one version stale.

@@ -2,6 +2,13 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Iceberg table repairs are retried, and their metadata copies cleaned up ([#1097](https://github.com/Basekick-Labs/arc/issues/1097), [#1098](https://github.com/Basekick-Labs/arc/issues/1098))
+
+The Iceberg exporter repairs two table properties when they drift: the column name mapping external readers need for columns added later, and the metadata-retention settings after `iceberg.retain_snapshots` changes.
+
+- **A failed repair is now retried on the next pass.** A pass whose repair commit failed could still be recorded as settled, so a measurement whose files had stopped changing was not looked at again until a file changed or Arc restarted, while the log promised "will retry next pass". A failed repair now leaves the pass unsettled, as a failed `version-hint.text` write already does, and the next pass retries it. The Reconciled log line gains `heal_ok`.
+- **A repair's metadata copy is pruned on the same pass.** Each repair publishes its own `v<N>.metadata.json`. On a pass with no data changes nothing pruned it, so the table sat one copy over `retain_snapshots + 1` until the next pass that changed data. Every pass that publishes now prunes. The version `version-hint.text` named when the pass started is always kept, even when the pass publishes twice (a reader may have just resolved it), nothing is pruned after a failed publish, and a node that lost the writer role mid-pass publishes and prunes nothing.
+
 ## Fix: every configuration key Arc reads has a declared default ([#1109](https://github.com/Basekick-Labs/arc/issues/1109))
 
 `storage.s3_prefix` and 15 other keys were read without a default declared next to the rest: the other S3 and Azure primary-storage keys, `tiered_storage.cold.s3_prefix`, `auth.bootstrap_token`, `auth.force_bootstrap` and `iceberg.warehouse`. They now have one. A spoke no longer reads `edge_sync.spoke.relay.staging_dir`, which only the hub uses. Every new default is the value an unset key already had (empty, or `false`), so nothing changes at runtime; this keeps the code and the documented defaults from drifting.
