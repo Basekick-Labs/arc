@@ -347,9 +347,11 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 			return files, local, nil
 		}
 		if attempt == vanishRetries {
+			// Busy, not failed (vanished.go): a writer path is rewriting the measurement. The
+			// guard itself is unchanged; only how the scheduler reports it.
 			return nil, nil, fmt.Errorf(
-				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass",
-				m.Database, m.Measurement, len(vanished), attempt)
+				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass: %w",
+				m.Database, m.Measurement, len(vanished), attempt, errSourcesMoving)
 		}
 		prev = vanished
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("vanished", len(vanished)).
@@ -656,6 +658,25 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 		}
 	}
 	return files, local, vanished, nil
+}
+
+// FileExists reports whether a listed file is still in storage, asked through the backend that
+// holds it: the cold tier for a cold file, this node's disk for a local one, the primary store
+// otherwise. The reconcile asks it after a footer read fails with a not-found (vanished.go), so a
+// file is only ever treated as deleted on its own backend's word.
+func (s *StorageWalkSource) FileExists(ctx context.Context, f FileRef) (bool, error) {
+	if f.Cold {
+		if s.cold == nil {
+			return false, fmt.Errorf("cold file %s listed with no cold tier configured", f.Key)
+		}
+		size, err := s.cold.backend.StatFile(ctx, f.Key)
+		if err != nil {
+			return false, err
+		}
+		return size >= 0, nil
+	}
+	_, present, err := s.statSize(ctx, f.Key, f.LocalPath)
+	return present, err
 }
 
 // statSize returns the file's current byte size, which the reconciler needs

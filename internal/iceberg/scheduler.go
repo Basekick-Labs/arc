@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"sort"
@@ -77,6 +78,10 @@ type Scheduler struct {
 	// does not re-warn; the startup case is the observability gap.
 	gatedWarnOnce bool
 
+	// busySince is when each measurement last stopped making progress while busy: the first busy
+	// pass after one that committed or settled. Loop goroutine only, like state.
+	busySince map[string]time.Time
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -101,7 +106,26 @@ const (
 	outcomeUnchanged  reconcileOutcome = iota // fingerprint unchanged, nothing to do
 	outcomeReconciled                         // did work (settled or not)
 	outcomeInProgress                         // registered part of the new files; continues next pass
+	outcomeBusy                               // source files changed under the pass; nothing committed (vanished.go)
 )
+
+// busyEscalateAfter is how long a measurement may go on being busy — source files changing
+// under every pass, nothing committed and nothing settled — before it is reported as failed. A
+// daily compaction cycle over a large backlog is minutes; this is long enough not to call that a
+// failure and short enough that an export blocked for good is seen the same day. The clock is per
+// process: a restart or a writer failover starts it again.
+const busyEscalateAfter = 30 * time.Minute
+
+// fileExister is a source that can say whether a listed file is still in storage, through the
+// file's own backend. The reconcile needs it to tell a file deleted mid-pass from a read failure.
+type fileExister interface {
+	FileExists(ctx context.Context, f FileRef) (bool, error)
+}
+
+// coldInvalidator is a source with a cached cold-tier listing.
+type coldInvalidator interface {
+	InvalidateCold(database string)
+}
 
 // FileSetSourceWithSchema is a FileSetSource that can also list the local files of a
 // measurement for schema derivation, and (via FilesAndLocal) return both views from a single
@@ -132,12 +156,13 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		cfg.Interval = 5 * time.Minute
 	}
 	return &Scheduler{
-		exporter: cfg.Exporter,
-		source:   cfg.Source,
-		interval: cfg.Interval,
-		gate:     cfg.Gate,
-		logger:   cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
-		state:    make(map[string]measurementState),
+		exporter:  cfg.Exporter,
+		source:    cfg.Source,
+		interval:  cfg.Interval,
+		gate:      cfg.Gate,
+		logger:    cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
+		state:     make(map[string]measurementState),
+		busySince: make(map[string]time.Time),
 	}
 }
 
@@ -197,6 +222,7 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			s.logger.Warn().Msg("Iceberg reconcile is gated off on this node (not the active compactor). If no node in the cluster holds a compactor role, Iceberg export never runs; assign one to enable it")
 		}
 		s.logger.Debug().Msg("Iceberg reconcile skipped: node is not the active writer")
+		clear(s.busySince) // another node exports meanwhile; a later turn starts its own clock
 		return false
 	}
 	measurements, err := s.source.Measurements(ctx)
@@ -220,7 +246,7 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			Msg("Iceberg reconcile: could not read the catalog to plan dotted-namespace migration; continuing without it. A database whose Iceberg namespace contains a dot may get a second table this pass")
 		blocked = nil
 	}
-	var ok, failed, skipped, awaitingMigration, inProgress int
+	var ok, failed, skipped, awaitingMigration, inProgress, busy int
 	seen := make(map[string]struct{}, len(measurements))
 	for _, m := range measurements {
 		if ctx.Err() != nil { // shutdown mid-pass
@@ -242,11 +268,35 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		// two nodes writing the same tables until this one finished (#939).
 		if s.gate != nil && !s.gate.CanRun() {
 			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
+			clear(s.busySince)
 			return false
 		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
 		outcome, err := s.reconcileOneRecovered(mctx, m, key)
 		cancel()
+		if outcome == outcomeBusy {
+			since, seen := s.busySince[key]
+			if !seen {
+				since = time.Now()
+				s.busySince[key] = since
+			}
+			if time.Since(since) < busyEscalateAfter {
+				// Not a failure: another Arc writer path is rewriting this measurement, and the
+				// next pass, which lists again, sees what it left. Soon, on the short interval.
+				s.logger.Info().Err(err).
+					Str("database", m.Database).Str("measurement", m.Measurement).
+					Dur("retry_in", s.partialRetryInterval()).
+					Msg("Iceberg reconcile: this measurement's files are changing under the export (compaction, delete or retention running); retrying soon")
+				busy++
+				continue
+			}
+			if err == nil {
+				err = errSourcesMoving
+			}
+			err = fmt.Errorf("busy for %s without committing or settling (since %s): %w", time.Since(since).Round(time.Second), since.Format(time.RFC3339), err)
+		} else {
+			delete(s.busySince, key)
+		}
 		switch {
 		case err != nil:
 			// Log and continue — one bad measurement must not block the rest; next pass retries.
@@ -270,6 +320,11 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			delete(s.state, k)
 		}
 	}
+	for k := range s.busySince {
+		if _, ok := seen[k]; !ok {
+			delete(s.busySince, k)
+		}
+	}
 	event := s.logger.Info().Int("reconciled", ok).Int("unchanged", skipped).Int("failed", failed)
 	if awaitingMigration > 0 {
 		event = event.Int("awaiting_namespace_migration", awaitingMigration)
@@ -277,8 +332,12 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 	if inProgress > 0 {
 		event = event.Int("in_progress", inProgress)
 	}
+	if busy > 0 {
+		event = event.Int("busy", busy)
+	}
 	event.Msg("Iceberg reconcile pass complete")
-	return inProgress > 0
+	// An escalated measurement counts as failed and does not bring the next pass forward.
+	return inProgress > 0 || busy > 0
 }
 
 // reconcileOneRecovered runs reconcileOne and returns a panic on this
@@ -309,6 +368,11 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// would list the same prefix twice).
 	files, localFiles, err := s.source.FilesAndLocal(ctx, m)
 	if err != nil {
+		if errors.Is(err, errSourcesMoving) {
+			// The listing never held still: nothing was read or committed, and the cached state
+			// (if any) still describes the table, so it is kept.
+			return outcomeBusy, err
+		}
 		return outcomeUnchanged, err
 	}
 	if len(files) == 0 {
@@ -413,6 +477,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		unread:      unread,
 		readSchemas: s.unionFileSchemas,
 		canCommit:   s.canRun,
+		exists:      s.fileExists(),
 	})
 	if err != nil {
 		// Drop the entry: this pass may have committed chunks before failing, and a stale entry's
@@ -420,6 +485,20 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		// table instead (tableSeed), which has them.
 		delete(s.state, key)
 		return outcomeUnchanged, err
+	}
+	if res.droppedCold {
+		// A cold file vanished: its cached cold listing is stale until invalidated.
+		if ci, ok := s.source.(coldInvalidator); ok {
+			ci.InvalidateCold(m.Database)
+		}
+	}
+	if res.moved {
+		// Files vanished and were left for the next pass. Not cached: the table is not the listing.
+		delete(s.state, key)
+		if res.commits > 0 {
+			return outcomeInProgress, nil
+		}
+		return outcomeBusy, nil
 	}
 	if res.partial {
 		// Not cached, for the same reason: the next pass seeds from the table and continues.
@@ -453,6 +532,14 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// covers all of them, and it is exactly what the next pass's EnsureTable compares against.
 	s.state[key] = measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet}
 	return outcomeReconciled, nil
+}
+
+// fileExists is the source's existence check for the reconcile, or nil when it has none.
+func (s *Scheduler) fileExists() func(context.Context, FileRef) (bool, error) {
+	if fe, ok := s.source.(fileExister); ok {
+		return fe.FileExists
+	}
+	return nil
 }
 
 // canRun reports whether this node may still write Iceberg metadata (nil gate = always).
