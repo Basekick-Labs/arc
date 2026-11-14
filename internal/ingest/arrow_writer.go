@@ -1284,6 +1284,10 @@ type ArrowBuffer struct {
 
 	// Optional tiering manager for registering files in tier metadata
 	tieringManager *tiering.Manager
+	// tierRecorder, when set, stands in for the tiering manager's metadata
+	// store in registerFileInTiering. Tests only: building a tiering.Manager
+	// needs a license, and the registration context is what they observe.
+	tierRecorder tierFileRecorder
 
 	// Optional measurement field schema registrar (#914). Every flushed
 	// file's schema is folded into the measurement's stored anchor so the
@@ -2285,6 +2289,12 @@ func (b *ArrowBuffer) registerFieldSchema(ctx context.Context, database, measure
 	}
 }
 
+// tierFileRecorder is the one call registerFileInTiering makes on the tiering
+// metadata store (*tiering.MetadataStore satisfies it).
+type tierFileRecorder interface {
+	RecordFile(ctx context.Context, file *tiering.FileMetadata) error
+}
+
 func (b *ArrowBuffer) SetTieringManager(tm *tiering.Manager) {
 	b.tieringManager = tm
 	b.logger.Info().Msg("Tiering manager enabled for ArrowBuffer - files will be auto-registered")
@@ -2309,25 +2319,28 @@ func (b *ArrowBuffer) SetFileRegistrar(fr FileRegistrar) {
 // against this checksum.
 func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64, sha256Hex string, cov *GroupCoverage) {
 	// Register in local tiering metadata (hot/cold tracking)
-	if b.tieringManager != nil {
-		metadata := b.tieringManager.GetMetadata()
-		if metadata != nil {
-			file := &tiering.FileMetadata{
-				Path:          storagePath,
-				Database:      database,
-				Measurement:   measurement,
-				PartitionTime: partitionTime,
-				Tier:          tiering.TierHot,
-				SizeBytes:     sizeBytes,
-				CreatedAt:     time.Now().UTC(),
-			}
-			if err := metadata.RecordFile(ctx, file); err != nil {
-				b.logger.Warn().Err(err).
-					Str("path", storagePath).
-					Str("database", database).
-					Str("measurement", measurement).
-					Msg("Failed to register file in tiering metadata")
-			}
+	metadata := b.tierRecorder
+	if metadata == nil && b.tieringManager != nil {
+		if md := b.tieringManager.GetMetadata(); md != nil { // not a typed nil in the interface
+			metadata = md
+		}
+	}
+	if metadata != nil {
+		file := &tiering.FileMetadata{
+			Path:          storagePath,
+			Database:      database,
+			Measurement:   measurement,
+			PartitionTime: partitionTime,
+			Tier:          tiering.TierHot,
+			SizeBytes:     sizeBytes,
+			CreatedAt:     time.Now().UTC(),
+		}
+		if err := metadata.RecordFile(ctx, file); err != nil {
+			b.logger.Warn().Err(err).
+				Str("path", storagePath).
+				Str("database", database).
+				Str("measurement", measurement).
+				Msg("Failed to register file in tiering metadata")
 		}
 	}
 
@@ -7633,8 +7646,11 @@ drain:
 				// (#1492, #1693). Only stored rows WITH a copy come off:
 				// subtracting every stored row counted the copy-less ones
 				// twice and went negative without a WAL, hiding other tasks'
-				// unwritten rows. Per-part safe for a split flush, whose
-				// error is its first failing part's.
+				// unwritten rows. For a coverage-split flush the error is its
+				// first failing part's, so the rows of parts that succeeded
+				// are still counted as unwritten: an over-count, which leaves
+				// Close unclean and keeps the WAL (the safe direction), as the
+				// formula before #1693 did. Never an under-count.
 				pending := task.recordCount - noWAL
 				var partial *flushPartialError
 				if errors.As(err, &partial) {
