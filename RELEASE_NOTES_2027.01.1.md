@@ -2,6 +2,23 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: with the WAL on, a flush that fails part-way no longer stores some rows twice ([#1697](https://github.com/Basekick-Labs/arc/issues/1697))
+
+With the WAL on, a write whose rows span several hours is flushed as one Parquet file per hour, and each file is registered and its rows checkpointed in the WAL as soon as it is stored (#1492), so a failure later in the flush replays only the hours not yet written. That relies on the WAL's row checkpoint naming every row of the file. Some files hold rows it cannot name:
+
+- rows of a chunked payload (one batch stored as several WAL entries);
+- every row of a file whose rows came from more batches than one checkpoint names (1,024 ranges). A backfill sent as many small writes, each with rows in the same hours, does this with no special layout.
+
+Those files were registered as stored, with their rows left unchecked. If a later hour then failed, WAL replay wrote those rows again into new files: they were stored twice, in storage and in the cluster manifest. In a reproduction with 1,054 two-hour batches and the second hour file failing, 3,162 rows were stored for 2,108 sent.
+
+Such a file is now **deferred**: stored, but registered only after the flush's last hour (before its WAL checkpoint), and written after the files that can be named. If the flush fails part-way, a deferred file is left unregistered and handed to the cleanup that already removes the late-landing copy of a failed write ([#1635](https://github.com/Basekick-Labs/arc/issues/1635)). It is removed only after WAL replay has stored every one of its rows in another file, never before, so a WAL that accepted an entry and then failed to write it cannot lose those rows. The same reproduction now stores each row once.
+
+- A file that holds a row with no WAL copy (a replicated entry) is that row's only copy and keeps the previous behaviour: registered as stored, with a possible duplicate after replay. So does a file with rows whose WAL identity replay cannot match (a content hash, or a recovery replay with no identity).
+- On a single node, a deferred file gets no flush intent ([#1646](https://github.com/Basekick-Labs/arc/issues/1646)): an intent naming only some of its rows would let recovery adopt the file and keep its other rows twice.
+- Until replay runs (the next WAL recovery pass), the rows of a deferred file are in storage but not registered: on a cluster, readers that go by the manifest do not see them; on a single node, queries list storage and see them, and briefly see the replayed copy too, until the cleanup removes the deferred file.
+- A cluster with coverage on announces the flush's coverage group even when every file is deferred.
+- If the cleanup's tracker is full, a deferred file is left in place and logged: its rows are stored twice after replay, as before.
+
 ## Fix: without a WAL, a flush that fails part-way keeps track of the hour files it stored ([#1693](https://github.com/Basekick-Labs/arc/issues/1693))
 
 With the WAL off (the default), a write whose rows span several hours is flushed as one Parquet file per hour. If an upload failed part-way, the hour files already stored stayed in storage but were never registered: they were missing from the tiering metadata and, on a cluster, from the file manifest. The flush was also logged and counted as losing **every** row, stored ones included.

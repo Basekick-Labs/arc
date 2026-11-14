@@ -49,6 +49,12 @@ type walRowSpan struct {
 	parent string // the WAL entry, or "" when these rows cannot be named
 	base   int    // row lo of the merge is row base of parent
 	copied bool   // the record has a WAL copy (hasWALCopy)
+	// tokens are the record's WAL entries when its rows cannot be named one
+	// by one but every one of its identities is a tracked token (a chunked
+	// payload: one batch, several entries). Replay re-stores those entries
+	// whole, so a file holding these rows can be named by them as a whole
+	// need (#1697). nil otherwise.
+	tokens []string
 }
 
 // maxRowCheckpointRanges bounds one file's checkpoint. A flush whose rows
@@ -84,6 +90,18 @@ func walRowSpansOf(records []interface{}) *walRowSpans {
 			if batch.hasWALCopy && len(batch.WALHashes) == 1 {
 				span.parent, span.base = rowSpanParent(batch.WALHashes[0], n)
 			}
+			if batch.hasWALCopy && span.parent == "" && len(batch.WALHashes) > 0 {
+				tokens := true
+				for _, h := range batch.WALHashes {
+					if !isTrackedIdentity(h) {
+						tokens = false
+						break
+					}
+				}
+				if tokens {
+					span.tokens = append([]string(nil), batch.WALHashes...)
+				}
+			}
 		}
 		out.spans = append(out.spans, span)
 		out.rows += n
@@ -112,6 +130,11 @@ func rowSpanParent(identity string, n int) (parent string, base int) {
 // have nothing to checkpoint). nil when the identities would exceed
 // maxRowCheckpointRanges.
 func (s *walRowSpans) rangesIn(indices []int) []string {
+	return s.rangesInLimit(indices, maxRowCheckpointRanges)
+}
+
+// rangesInLimit is rangesIn with its own bound; limit <= 0 is unbounded.
+func (s *walRowSpans) rangesInLimit(indices []int, limit int) []string {
 	if s == nil || len(indices) == 0 {
 		return nil
 	}
@@ -142,7 +165,7 @@ func (s *walRowSpans) rangesIn(indices []int) []string {
 			continue
 		}
 		flush()
-		if len(out) >= maxRowCheckpointRanges {
+		if limit > 0 && len(out) >= limit {
 			return nil
 		}
 		runStart, runEnd = p, p+1
@@ -191,4 +214,46 @@ func (s *walRowSpans) storedWithoutCopy(written []bool) int {
 		}
 	}
 	return n
+}
+
+// deferredNeed names what must be stored elsewhere before a stored hour file
+// that holds rows the row map cannot name may be removed (#1697): the row
+// ranges of its named rows (unbounded, unlike a checkpoint) and the whole
+// tokens of its unnamed ones. ok is false when the file cannot be named that
+// way: a row with no WAL copy (the file is its only copy), or an unnamed row
+// whose record carries no tracked tokens (a content hash, a recovery replay
+// with no identity). indices are ascending positions of the merged batch.
+func (s *walRowSpans) deferredNeed(indices []int) (ids []string, ok bool) {
+	if s == nil || len(indices) == 0 {
+		return nil, false
+	}
+	seen := map[string]struct{}{}
+	named := make([]int, 0, len(indices))
+	si := 0
+	for _, p := range indices {
+		for si < len(s.spans) && s.spans[si].hi <= p {
+			si++
+		}
+		if si == len(s.spans) {
+			return nil, false
+		}
+		sp := s.spans[si]
+		if !sp.copied {
+			return nil, false
+		}
+		if sp.parent != "" {
+			named = append(named, p)
+			continue
+		}
+		if len(sp.tokens) == 0 {
+			return nil, false
+		}
+		for _, t := range sp.tokens {
+			if _, dup := seen[t]; !dup {
+				seen[t] = struct{}{}
+				ids = append(ids, t)
+			}
+		}
+	}
+	return append(ids, s.rangesInLimit(named, 0)...), true
 }

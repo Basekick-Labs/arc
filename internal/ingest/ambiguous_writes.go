@@ -445,6 +445,40 @@ func (b *ArrowBuffer) noteFailedWrite(err error, need []string, ok bool) {
 	}
 }
 
+// deferredHandOver is a stored hour file a multi-hour flush deferred and then
+// left unregistered when a later hour failed (#1697), with the WAL identities
+// of every row it holds.
+type deferredHandOver struct {
+	path string
+	size int64
+	need []string
+}
+
+// handOverDeferred gives a part-failed flush's deferred files to the ledger.
+// Each is unregistered and its rows are replayed into new files; the ledger
+// removes it once those rows are stored elsewhere, the same proof a
+// late-landing failed write needs (#1635). Never removed on less: the WAL may
+// have accepted an entry it then failed to write, and this file would be the
+// only copy. One that is not recorded (full ledger) stays: its rows are
+// stored twice after replay, as before #1697.
+func (b *ArrowBuffer) handOverDeferred(bufferKey string, files []deferredHandOver) {
+	if len(files) == 0 || b.wal == nil || b.ambiguous == nil {
+		return
+	}
+	recorded := 0
+	for _, f := range files {
+		if b.ambiguous.record(f.path, f.size, f.need) {
+			metrics.Get().IncIngestAmbiguousWritesRecorded()
+			recorded++
+			continue
+		}
+		b.logger.Warn().Str("buffer_key", bufferKey).Str("storage_path", f.path).
+			Msg("Deferred hour file of a failed flush not tracked for cleanup (the tracker is full): its rows are stored twice after WAL replay")
+	}
+	b.logger.Info().Str("buffer_key", bufferKey).Int("files", len(files)).Int("tracked", recorded).
+		Msg("Flush failed after storing deferred hour files: they stay unregistered and are removed once WAL replay has stored their rows")
+}
+
 // ambiguousSweeper removes late-landed copies of failed writes (#1635).
 func (b *ArrowBuffer) ambiguousSweeper() {
 	defer b.wg.Done()
