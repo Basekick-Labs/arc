@@ -177,6 +177,15 @@ func dropVanished(paths, gone []string, database, measurement string) (kept, dro
 	return kept, dropped
 }
 
+// dataFilePaths returns the paths of DataFiles.
+func dataFilePaths(dfs []iceberg.DataFile) []string {
+	out := make([]string, len(dfs))
+	for i, df := range dfs {
+		out[i] = df.FilePath()
+	}
+	return out
+}
+
 // refPaths returns the table URIs of files.
 func refPaths(files []FileRef) []string {
 	out := make([]string, len(files))

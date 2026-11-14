@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"gocloud.dev/blob/memblob"
 
 	"github.com/basekick-labs/arc/internal/storage"
 )
@@ -332,5 +333,55 @@ func TestScheduler_VanishedAfterListingIsBusyThenSettles(t *testing.T) {
 	}
 	if len(sched.busySince) != 0 {
 		t.Fatal("busy clock kept after progress")
+	}
+}
+
+// iceberg-go's S3 FileIO reports a 404 on a range read (after a successful open) as a gocloud
+// error, not fs.ErrNotExist: it must still count as a not-found read, wrapped or not.
+func TestIsReadNotFound_GocloudRangeRead(t *testing.T) {
+	ctx := context.Background()
+	b := memblob.OpenBucket(nil)
+	defer b.Close()
+	_, err := b.NewRangeReader(ctx, "missing.parquet", 0, 8, nil)
+	if err == nil {
+		t.Fatal("range read of a missing object succeeded")
+	}
+	if !isReadNotFound(fmt.Errorf("build data file for x: %w", err)) {
+		t.Fatalf("gocloud not-found not recognised: %v", err)
+	}
+	if isReadNotFound(errors.New("permission denied")) {
+		t.Fatal("an unrelated error recognised as not-found")
+	}
+}
+
+// A commit-0 file whose day cannot be read from its key is anchored to every day: when another
+// file of commit 0 vanishes, it must not commit alone while its day's removals wait.
+func TestVanished_Commit0UnreadableDayDefersEverything(t *testing.T) {
+	r := newRig1686(t, 3, 16)
+	f1, f2 := r.write(0, "f1"), r.write(0, "f2")
+	sc := r.schema(f1)
+	if _, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, []FileRef{f1, f2}); err != nil {
+		t.Fatal(err)
+	}
+	removeFile(t, f1)
+	removeFile(t, f2)
+	c0 := r.write(0, "c0")
+	removeFile(t, c0)
+	oddRel := "mydb/cpu/misc/odd.parquet"
+	oddPath := filepath.Join(r.root, oddRel)
+	writeArcStyleParquet(t, oddPath, day14, 5)
+	odd := refOf(t, oddPath)
+	odd.Key, odd.LocalPath = oddRel, oddPath
+
+	res, err := r.exp.reconcile(context.Background(), reconcileRequest{
+		database: "mydb", measurement: "cpu", schema: sc, current: []FileRef{c0, odd},
+		unread: []FileRef{c0, odd}, readSchemas: readLocal, exists: existsLocal,
+	})
+	if err != nil || !res.moved || res.commits != 0 {
+		t.Fatalf("result %+v err %v; want moved with nothing committed", res, err)
+	}
+	live := r.live()
+	if _, ok := live[odd.PhysicalPath]; ok || len(live) != 2 {
+		t.Fatalf("table holds %v; want f1 and f2 untouched and odd not committed alone", keys(live))
 	}
 }

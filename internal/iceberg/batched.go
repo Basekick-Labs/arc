@@ -376,9 +376,14 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			// that cannot be read from a key, or a third round, defers every day of the commit.
 			moved = true
 			days, byDay := daysOfPaths(ve.paths, database, measurement)
-			if !byDay || round >= maxVanishRounds || anyUnknownDay(toRemove, database, measurement) {
+			if !byDay || round >= maxVanishRounds || anyUnknownDay(toRemove, database, measurement) ||
+				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) {
 				days = nil
 			}
+			leave(ve.paths) // only for the cold-listing flag: commit 0 is already split from the free set
+			// A round whose schemas were read before a DataFile build failed has already evolved
+			// the table with the deferred day's columns. Harmless: columns are only ever added,
+			// all optional, and the deferred files are registered against them next pass.
 			var n int
 			n, toRemove, removes, rewritten, cloned, anchored = deferDays(days, live, toRemove, rewritten, cloned, anchored, database, measurement)
 			deferredNew += n
@@ -399,7 +404,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		skippedAll = append(skippedAll, skipped...)
 		adds := append(cloned, built...)
 		// An anchored add or a clone exists only beside a removal in its day, and deferDays takes a
-		// day whole, so a non-empty commit always has a removal.
+		// day whole (everything, when any path's day is unreadable), so a non-empty commit always
+		// has a removal.
 		if len(adds)+len(removes) == 0 {
 			// Every day of this commit was deferred: nothing to commit.
 		} else if !canCommit() {

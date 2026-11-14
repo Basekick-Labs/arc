@@ -684,10 +684,10 @@ func (s *StorageWalkSource) FileExists(ctx context.Context, f FileRef) (bool, er
 // partial-match branch publishes a fresh path instead, but restores and
 // edge-sync still write a known path, and only the size tells that
 // content apart from what the Iceberg manifest describes.
-// present=false means the file is gone. Local files are stat'ed directly; a
-// backend that is not an object store (objectLister) but has no local path
-// answers through StatFile. Object stores never get here: their size comes
-// from the listing.
+// present=false means the file is gone. Local files are stat'ed directly;
+// anything else answers through the backend's StatFile. The listing never
+// sends an object store here (its size comes from the listing itself), but
+// FileExists does, for one file whose footer read came back not-found.
 func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string) (size int64, present bool, err error) {
 	if localPath != "" {
 		st, err := os.Stat(localPath)

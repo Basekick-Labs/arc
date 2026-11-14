@@ -275,8 +275,8 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		outcome, err := s.reconcileOneRecovered(mctx, m, key)
 		cancel()
 		if outcome == outcomeBusy {
-			since, seen := s.busySince[key]
-			if !seen {
+			since, started := s.busySince[key]
+			if !started {
 				since = time.Now()
 				s.busySince[key] = since
 			}
@@ -290,10 +290,15 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 				busy++
 				continue
 			}
-			if err == nil {
-				err = errSourcesMoving
-			}
-			err = fmt.Errorf("busy for %s without committing or settling (since %s): %w", time.Since(since).Round(time.Second), since.Format(time.RFC3339), err)
+			// Escalated: still not an error in the export itself, but nothing has landed for this
+			// measurement for too long to keep calling it transient. Counted as failed, and it no
+			// longer brings passes forward.
+			s.logger.Warn().Err(err).
+				Str("database", m.Database).Str("measurement", m.Measurement).
+				Time("busy_since", since).Dur("busy_for", time.Since(since).Round(time.Second)).
+				Msg("Iceberg reconcile: this measurement's files have kept changing under the export without anything committed or settled; counting it as failed")
+			failed++
+			continue
 		} else {
 			delete(s.busySince, key)
 		}
@@ -479,18 +484,19 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		canCommit:   s.canRun,
 		exists:      s.fileExists(),
 	})
+	if res.droppedCold {
+		// A cold file vanished: its cached cold listing is stale until invalidated. Before the
+		// error check: a pass can drop a cold file and then fail a later chunk.
+		if ci, ok := s.source.(coldInvalidator); ok {
+			ci.InvalidateCold(m.Database)
+		}
+	}
 	if err != nil {
 		// Drop the entry: this pass may have committed chunks before failing, and a stale entry's
 		// schemaFiles would make the next pass re-read their footers. A cold entry seeds from the
 		// table instead (tableSeed), which has them.
 		delete(s.state, key)
 		return outcomeUnchanged, err
-	}
-	if res.droppedCold {
-		// A cold file vanished: its cached cold listing is stale until invalidated.
-		if ci, ok := s.source.(coldInvalidator); ok {
-			ci.InvalidateCold(m.Database)
-		}
 	}
 	if res.moved {
 		// Files vanished and were left for the next pass. Not cached: the table is not the listing.
