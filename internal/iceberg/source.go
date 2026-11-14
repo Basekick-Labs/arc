@@ -364,6 +364,11 @@ func (s *StorageWalkSource) FileSchema(ctx context.Context, f FileRef) (ArcSchem
 		return s.coldSchema(ctx, f)
 	}
 	if f.LocalPath != "" {
+		// A local footer read is synchronous and cannot be interrupted, but a chunk whose time
+		// is up must not start new ones (#1686): the remote path checks ctx in its GETs.
+		if err := ctx.Err(); err != nil {
+			return ArcSchema{}, err
+		}
 		return SchemaFromParquet(f.LocalPath)
 	}
 	return SchemaFromBackend(ctx, s.backend, f.Key, f.SizeBytes)

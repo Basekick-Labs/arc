@@ -82,8 +82,26 @@ type Scheduler struct {
 }
 
 // measurementTimeout bounds a single measurement's reconcile so one slow/wedged measurement
-// (e.g. a huge footer scan) can't block the whole pass or graceful shutdown indefinitely.
+// (e.g. a huge footer scan) can't block the whole pass or graceful shutdown indefinitely. It is a
+// bound on PROGRESS, not on success: a measurement with more new files than fit in it registers
+// them a chunk at a time and the next pass continues (#1686, batched.go).
 const measurementTimeout = 2 * time.Minute
+
+// partialRetryInterval is how soon the next pass starts after one that left a measurement
+// partly registered, instead of the full reconcile interval: a first registration of a large
+// measurement otherwise takes interval x passes. Capped at the interval itself.
+func (s *Scheduler) partialRetryInterval() time.Duration {
+	return min(s.interval, max(30*time.Second, s.interval/10))
+}
+
+// reconcileOutcome is what reconcileOne did for one measurement.
+type reconcileOutcome int
+
+const (
+	outcomeUnchanged  reconcileOutcome = iota // fingerprint unchanged, nothing to do
+	outcomeReconciled                         // did work (settled or not)
+	outcomeInProgress                         // registered part of the new files; continues next pass
+)
 
 // FileSetSourceWithSchema is a FileSetSource that can also list the local files of a
 // measurement for schema derivation, and (via FilesAndLocal) return both views from a single
@@ -143,40 +161,48 @@ func (s *Scheduler) Stop() {
 func (s *Scheduler) loop(ctx context.Context) {
 	defer close(s.done)
 	// Run one pass shortly after start so a fresh deployment publishes promptly.
-	s.runPass(ctx)
+	partial := s.runPass(ctx)
 	// A Timer reset AFTER each pass (rather than a Ticker) guarantees a full interval of idle
 	// between passes. With a Ticker, a pass that runs longer than the interval (slow disk, many
 	// files) would queue ticks and cause back-to-back passes with no breathing room — starving
 	// I/O and, in cluster mode, competing with the write path. The reconciler is idempotent, so
 	// a slightly-later next pass is always safe.
 	timer := time.NewTimer(s.interval)
+	if partial {
+		timer.Reset(s.partialRetryInterval())
+	}
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			s.runPass(ctx)
+			partial = s.runPass(ctx)
+		}
+		if partial {
+			timer.Reset(s.partialRetryInterval())
+		} else {
 			timer.Reset(s.interval)
 		}
 	}
 }
 
 // runPass reconciles every measurement once. Gated per-tick so cluster failover/demotion
-// takes effect without a restart (nil gate = always run).
-func (s *Scheduler) runPass(ctx context.Context) {
+// takes effect without a restart (nil gate = always run). It reports whether any measurement
+// was left partly registered, so the loop can come back sooner.
+func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 	if s.gate != nil && !s.gate.CanRun() {
 		if !s.gatedWarnOnce {
 			s.gatedWarnOnce = true
 			s.logger.Warn().Msg("Iceberg reconcile is gated off on this node (not the active compactor). If no node in the cluster holds a compactor role, Iceberg export never runs; assign one to enable it")
 		}
 		s.logger.Debug().Msg("Iceberg reconcile skipped: node is not the active writer")
-		return
+		return false
 	}
 	measurements, err := s.source.Measurements(ctx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Iceberg reconcile: failed to enumerate measurements")
-		return
+		return false
 	}
 	// Bounded like a measurement, and for the same reason: this reads the shared SQLite catalog
 	// (auth, audit and tiering write to it too), and an unbounded call here would hold the whole
@@ -194,11 +220,11 @@ func (s *Scheduler) runPass(ctx context.Context) {
 			Msg("Iceberg reconcile: could not read the catalog to plan dotted-namespace migration; continuing without it. A database whose Iceberg namespace contains a dot may get a second table this pass")
 		blocked = nil
 	}
-	var ok, failed, skipped, awaitingMigration int
+	var ok, failed, skipped, awaitingMigration, inProgress int
 	seen := make(map[string]struct{}, len(measurements))
 	for _, m := range measurements {
 		if ctx.Err() != nil { // shutdown mid-pass
-			return
+			return false
 		}
 		key := m.Database + "\x00" + m.Measurement
 		seen[key] = struct{}{}
@@ -216,10 +242,10 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		// two nodes writing the same tables until this one finished (#939).
 		if s.gate != nil && !s.gate.CanRun() {
 			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
-			return
+			return false
 		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-		changed, err := s.reconcileOneRecovered(mctx, m, key)
+		outcome, err := s.reconcileOneRecovered(mctx, m, key)
 		cancel()
 		switch {
 		case err != nil:
@@ -228,7 +254,11 @@ func (s *Scheduler) runPass(ctx context.Context) {
 				Str("database", m.Database).Str("measurement", m.Measurement).
 				Msg("Iceberg reconcile: measurement failed")
 			failed++
-		case changed:
+		case outcome == outcomeInProgress:
+			// Not a failure: what was registered is committed, and the next pass continues.
+			// The exporter logged the counts.
+			inProgress++
+		case outcome == outcomeReconciled:
 			ok++
 		default:
 			skipped++ // fingerprint unchanged — nothing to do (the cheap common case)
@@ -244,7 +274,11 @@ func (s *Scheduler) runPass(ctx context.Context) {
 	if awaitingMigration > 0 {
 		event = event.Int("awaiting_namespace_migration", awaitingMigration)
 	}
+	if inProgress > 0 {
+		event = event.Int("in_progress", inProgress)
+	}
 	event.Msg("Iceberg reconcile pass complete")
+	return inProgress > 0
 }
 
 // reconcileOneRecovered runs reconcileOne and returns a panic on this
@@ -252,7 +286,7 @@ func (s *Scheduler) runPass(ctx context.Context) {
 // bug fails its pass instead of ending the process (the reconcile loop has no
 // other recover). Footer reads recover their own panics too (schemaFromReader),
 // including on worker goroutines this cannot reach.
-func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, key string) (changed bool, err error) {
+func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, key string) (outcome reconcileOutcome, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// The stack is logged here, where it is; the returned error is
@@ -260,7 +294,7 @@ func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, ke
 			s.logger.Error().Str("database", m.Database).Str("measurement", m.Measurement).
 				Str("panic", fmt.Sprint(r)).Str("stack", string(debug.Stack())).
 				Msg("Iceberg reconcile: recovered a panic")
-			changed, err = false, fmt.Errorf("reconcile panicked: %v", r)
+			outcome, err = outcomeUnchanged, fmt.Errorf("reconcile panicked: %v", r)
 		}
 	}()
 	return s.reconcileOne(ctx, m, key)
@@ -270,12 +304,12 @@ func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, ke
 // skipped because its file set is unchanged since the last successful pass. The fingerprint of
 // the (data-file set + local-file set) lets us skip the expensive per-file footer reads and the
 // no-op diff entirely when nothing changed — the common steady-state case.
-func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string) (changed bool, err error) {
+func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string) (outcome reconcileOutcome, err error) {
 	// One backend listing yields both the data-file URIs and the local paths (Files + LocalFiles
 	// would list the same prefix twice).
 	files, localFiles, err := s.source.FilesAndLocal(ctx, m)
 	if err != nil {
-		return false, err
+		return outcomeUnchanged, err
 	}
 	if len(files) == 0 {
 		// Every data file is gone (retention/compaction/manual delete). We still reach this code
@@ -289,24 +323,24 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		// every tick re-runs the catalog load + commit and re-logs forever.
 		fp := fingerprint(files, localFiles)
 		if prev, cached := s.state[key]; cached && prev.fingerprint == fp {
-			return false, nil
+			return outcomeUnchanged, nil
 		}
 		// Only for a table that already exists: an empty directory that never held data must not
 		// mint a zero-column table (EnsureTable would create one with no fields and no partition
 		// spec). Schema is irrelevant when emptying — the existing table's schema is preserved.
 		exists, err := s.exporter.tableExists(ctx, m.Database, m.Measurement)
 		if err != nil {
-			return false, err
+			return outcomeUnchanged, err
 		}
 		if !exists {
 			// Cache the negative result too: an empty directory with no table has no
 			// catalog state to reconcile, so unchanged passes need no catalog lookup.
 			s.state[key] = measurementState{fingerprint: fp}
-			return false, nil
+			return outcomeUnchanged, nil
 		}
 		settled, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, ArcSchema{}, nil)
 		if err != nil {
-			return false, err
+			return outcomeUnchanged, err
 		}
 		s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
 			Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
@@ -315,23 +349,24 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		// published — see the equivalent guard on the main path below.
 		if !settled {
 			delete(s.state, key)
-			return true, nil
+			return outcomeReconciled, nil
 		}
 		s.state[key] = measurementState{fingerprint: fp}
-		return true, nil
+		return outcomeReconciled, nil
 	}
 	// Fingerprint the file set. Unchanged fingerprint + a cached schema => guaranteed no-op
 	// (same files in the table already), so skip the footer reads and the diff.
 	fp := fingerprint(files, localFiles)
 	prev, cached := s.state[key]
 	if cached && prev.fingerprint == fp {
-		return false, nil
+		return outcomeUnchanged, nil
 	}
 
-	// The set changed (or first sight): derive the union schema, reading only the footers of
-	// files not already accounted for — avoiding an O(N) re-read of every footer every time the
-	// set grows, local or remote. (Removed files can't remove columns: the table schema is a
-	// superset and all fields are optional, so dropping a file never narrows the schema.)
+	// The set changed (or first sight): work out which files' footers are not already accounted
+	// for — avoiding an O(N) re-read of every footer every time the set grows, local or remote.
+	// The exporter reads those, a chunk at a time, as it registers them. (Removed files can't
+	// remove columns: the table schema is a superset and all fields are optional, so dropping a
+	// file never narrows the schema.)
 	//
 	// What is accounted for: with a cache, the files of the last reconcile. Without one (first
 	// sight, a restart), the table's own schema and the files its current snapshot holds at
@@ -341,7 +376,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	if !cached || known == nil {
 		tableSc, tableFiles, ok, err := s.exporter.tableSeed(ctx, m.Database, m.Measurement)
 		if err != nil {
-			return false, err
+			return outcomeUnchanged, err
 		}
 		base, known = ArcSchema{}, nil
 		if ok {
@@ -365,20 +400,31 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			unread = append(unread, f)
 		}
 	}
-	sc := base
-	if len(unread) > 0 {
-		addSc, err := s.unionFileSchemas(ctx, unread)
-		if err != nil {
-			return false, err
-		}
-		if sc, err = MergeSchemas(base, addSc); err != nil {
-			return false, err
-		}
-	}
 
-	settled, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, sc, files)
+	// The unread footers are NOT all read here. The exporter reads them a chunk at a time, only
+	// for the files each commit registers, so a measurement with more new files than fit in one
+	// deadline still commits what it gets through (#1686). A file that is unread but already in
+	// the table at its size (a KeyOf miss) is never read: the table's schema already covers it.
+	res, err := s.exporter.reconcile(ctx, reconcileRequest{
+		database:    m.Database,
+		measurement: m.Measurement,
+		schema:      base,
+		current:     files,
+		unread:      unread,
+		readSchemas: s.unionFileSchemas,
+		canCommit:   s.canRun,
+	})
 	if err != nil {
-		return false, err
+		// Drop the entry: this pass may have committed chunks before failing, and a stale entry's
+		// schemaFiles would make the next pass re-read their footers. A cold entry seeds from the
+		// table instead (tableSeed), which has them.
+		delete(s.state, key)
+		return outcomeUnchanged, err
+	}
+	if res.partial {
+		// Not cached, for the same reason: the next pass seeds from the table and continues.
+		delete(s.state, key)
+		return outcomeInProgress, nil
 	}
 
 	// Cache only when the pass fully settled. The snapshot is committed either way, but
@@ -391,20 +437,27 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// removals made the older snapshots unreadable (#1092). Both need the same retry, so this
 	// does not name either — a message claiming the hint when the expiry failed would send an
 	// operator to the wrong place.
-	if !settled {
+	if !res.settled {
 		delete(s.state, key)
 		s.logger.Warn().
 			Str("database", m.Database).Str("measurement", m.Measurement).
 			Msg("Iceberg reconcile: pass did not fully settle (see the preceding error for which step); will retry next pass")
-		return true, nil
+		return outcomeReconciled, nil
 	}
 
 	schemaSet := make(map[string]struct{}, len(files))
 	for _, f := range files {
 		schemaSet[refSchemaKey(f)] = struct{}{}
 	}
-	s.state[key] = measurementState{fingerprint: fp, schema: sc, schemaFiles: schemaSet}
-	return true, nil
+	// The table's schema, not a union of footers: every listed file is now in the table, so it
+	// covers all of them, and it is exactly what the next pass's EnsureTable compares against.
+	s.state[key] = measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet}
+	return outcomeReconciled, nil
+}
+
+// canRun reports whether this node may still write Iceberg metadata (nil gate = always).
+func (s *Scheduler) canRun() bool {
+	return s.gate == nil || s.gate.CanRun()
 }
 
 // fingerprint hashes the sorted union of the data files (path + size) and the local-file
