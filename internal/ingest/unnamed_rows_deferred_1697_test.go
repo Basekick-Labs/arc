@@ -216,9 +216,10 @@ func TestOverRangeCapFileDeferred_1697(t *testing.T) {
 }
 
 // Coverage on (cluster): a flush whose every file is deferred announces its
-// group once, after the loop, and registers every file with it. Before the
-// fix the group was never announced and the files registered without
-// coverage.
+// group once, after the loop, and registers every file with it. The group is
+// otherwise announced by the first early registration, which such a flush
+// never makes; registering without it would leave the group unannounced and
+// its batches counted lost.
 func TestAllDeferredRegisterWithCoverage_1697(t *testing.T) {
 	w, err := wal.NewWriter(&wal.WriterConfig{WALDir: filepath.Join(t.TempDir(), "wal"), SyncMode: wal.SyncModeAsync, Logger: zerolog.Nop()})
 	require.NoError(t, err)
@@ -339,4 +340,98 @@ func fixtureRows(t *testing.T, f *ambiguousFixture) int64 {
 		require.NoError(t, reader.Close())
 	}
 	return rows
+}
+
+// A deferred file whose rows are never seen replayed (a WAL that accepted an
+// entry and failed to write it; replay under another identity) may be their
+// only copy: after deferredWriteMaxAge it is registered, not dropped, so a
+// cluster's reconciliation sweep never takes it for an orphan.
+func TestUnmetDeferredRegisteredAfterMaxAge_1697(t *testing.T) {
+	store := newMemStore1697(3) // 2 deferred stored, the 3rd fails
+	b := walBuffer1697(t, store)
+	reg := &recordingRegistrar1693{}
+	b.SetFileRegistrar(reg)
+	clock := time.Now()
+	b.ambiguous.now = func() time.Time { return clock }
+
+	writeChunked(t, b, hoursRecord1692(4, 8))
+	err, _ := flushWithin(t, b, 20*time.Second)
+	require.Error(t, err)
+	require.Zero(t, reg.count())
+
+	clock = clock.Add(deferredWriteMaxAge - time.Minute)
+	b.sweepAmbiguousWrites(context.Background())
+	require.Zero(t, reg.count(), "still waiting for replay")
+
+	clock = clock.Add(2 * time.Minute)
+	b.sweepAmbiguousWrites(context.Background())
+	require.Equal(t, 2, reg.count(), "registered as the copy of rows never seen replayed")
+	require.Equal(t, 2, store.count(), "and kept")
+}
+
+// Close registers a deferred file still waiting: the ledger does not outlive
+// the process.
+func TestUnmetDeferredRegisteredAtClose_1697(t *testing.T) {
+	store := newMemStore1697(3)
+	b := walBuffer1697(t, store)
+	reg := &recordingRegistrar1693{}
+	b.SetFileRegistrar(reg)
+
+	writeChunked(t, b, hoursRecord1692(4, 9))
+	err, _ := flushWithin(t, b, 20*time.Second)
+	require.Error(t, err)
+	require.Zero(t, reg.count())
+	_ = b.Close()
+	require.Equal(t, 2, reg.count(), "registered at Close")
+}
+
+// A need past maxDeferredNeedRanges names the parents whole, keeping the
+// ledger linear.
+func TestDeferredNeedCappedToParents_1697(t *testing.T) {
+	// One entry whose rows alternate between two hours: every other row is in
+	// one file, each its own range.
+	n := 2*maxDeferredNeedRanges + 10
+	s := walRowSpansOf([]interface{}{spanBatch(n, []string{tokA}, true)})
+	require.NotNil(t, s)
+	var even []int
+	for p := 0; p < n; p += 2 {
+		even = append(even, p)
+	}
+	nameable, deferrable := s.classifyHour(even, maxRowCheckpointRanges)
+	require.False(t, nameable)
+	require.True(t, deferrable)
+	ids, ok := s.deferredNeed(even)
+	require.True(t, ok)
+	require.Equal(t, []string{tokA}, ids, "past the cap: the parent, whole")
+}
+
+// classifyHour agrees with what rangesIn and deferredNeed would do.
+func TestClassifyHourAgreesWithRangesAndNeed_1697(t *testing.T) {
+	s := walRowSpansOf([]interface{}{
+		spanBatch(3, []string{tokA}, true),
+		spanBatch(2, []string{tokC, tokD}, true),
+		spanBatch(2, nil, false),
+		spanBatch(4, []string{tokB}, true),
+	})
+	require.NotNil(t, s)
+	for _, idx := range [][]int{{0, 1, 2}, {0, 2}, {0, 3}, {3, 4}, {4, 5}, {7, 8, 10}, {0, 7, 9}, {5, 6}} {
+		r := s.rangesIn(idx)
+		wantNameable := rangeRows(r) == len(idx)
+		_, wantDeferrable := s.deferredNeed(idx)
+		nameable, deferrable := s.classifyHour(idx, maxRowCheckpointRanges)
+		require.Equal(t, wantNameable, nameable, "nameable %v", idx)
+		require.Equal(t, !wantNameable && wantDeferrable, deferrable, "deferrable %v", idx)
+	}
+}
+
+// A large in-order need is recorded and met in linear time.
+func TestLedgerLargeOrderedNeedIsLinear_1697(t *testing.T) {
+	var ids []string
+	for i := 0; i < 50000; i++ {
+		ids = append(ids, wal.RecoveryRowIdentity(tokA, 2*i, 2*i+1))
+	}
+	l := newAmbiguousLedger()
+	start := time.Now()
+	require.True(t, l.record("p", 1, ids))
+	require.Less(t, time.Since(start), 2*time.Second)
 }

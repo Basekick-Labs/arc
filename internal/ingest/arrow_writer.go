@@ -5561,7 +5561,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	partial := func(err error) error {
 		// Before the early return: a flush that stored only deferred files
 		// must still hand them over (#1697).
-		b.handOverDeferred(bufferKey, deferredStored)
+		hctx, hcancel := b.fileContext(context.WithoutCancel(ctx))
+		b.handOverDeferred(hctx, bufferKey, spans, deferredStored)
+		hcancel()
 		if storedFiles == 0 {
 			return err
 		}
@@ -5609,18 +5611,15 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	type hourPlan struct {
 		id       int64
 		bucket   *hourBucket
-		ranges   []string // the row checkpoint, rangesIn (early path)
 		deferred bool
-		need     []string // deferred: what replay must store first
 	}
 	plans := make([]hourPlan, 0, len(hourBuckets))
 	for hourID, bucket := range hourBuckets {
 		hp := hourPlan{id: hourID, bucket: bucket}
 		if perHour {
-			hp.ranges = spans.rangesIn(bucket.indices)
-			if rangeRows(hp.ranges) != len(bucket.indices) {
-				hp.need, hp.deferred = spans.deferredNeed(bucket.indices)
-			}
+			// No allocation here: the checkpoint ranges are built per hour
+			// below, a deferred file's need only if the flush fails.
+			_, hp.deferred = spans.classifyHour(bucket.indices, maxRowCheckpointRanges)
 		}
 		plans = append(plans, hp)
 	}
@@ -5668,12 +5667,14 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			parquetSum := sha256.Sum256(parquetData)
 			parquetSumHex := hex.EncodeToString(parquetSum[:])
 
+			var ranges []string // the row checkpoint (early path, #1492)
 			if perHour && !hp.deferred {
+				ranges = spans.rangesIn(bucket.indices)
 				// Only with the row map: the file's own rows are named. Without
 				// it the flush's identities name rows of every hour file, and
 				// adopting one file would skip the others' rows (#1646). Never
 				// for a deferred file (above).
-				b.recordFlushIntent(storagePath, int64(len(parquetData)), hp.ranges)
+				b.recordFlushIntent(storagePath, int64(len(parquetData)), ranges)
 			}
 			if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 				// The write may still land (#1635). With the row map, name this
@@ -5684,13 +5685,13 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 					// would be deleted with the file once the others are
 					// stored again. Empty is never recorded. A deferred file
 					// is named by its need (#1697).
-					switch {
-					case hp.deferred:
-						fw.rows = hp.need
-					case rangeRows(hp.ranges) == len(bucket.indices):
-						fw.rows = hp.ranges
-					default:
-						fw.rows = []string{}
+					fw.rows = []string{}
+					if hp.deferred {
+						if need, ok := spans.deferredNeed(bucket.indices); ok {
+							fw.rows = need
+						}
+					} else if rangeRows(ranges) == len(bucket.indices) {
+						fw.rows = ranges
 					}
 				}
 				return partial(fw)
@@ -5710,11 +5711,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				regCtx, cancelReg := b.fileContext(context.WithoutCancel(flushCtx))
 				b.registerFileInTiering(regCtx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, cov.forFile(group.piecesAt(bucket.indices)))
 				cancelReg()
-				var ranges []string
 				checkpointed := false
 				if perHour {
 					b.syncRegistrations()
-					ranges = hp.ranges
 					b.ambiguous.stored(ranges) // #1635, as in completeFlush
 					checkpointed = b.checkpointRows(ctx, ranges)
 				}
@@ -5747,7 +5746,18 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				pieces:      group.piecesAt(bucket.indices),
 			})
 			if hp.deferred {
-				deferredStored = append(deferredStored, deferredHandOver{path: storagePath, size: int64(len(parquetData)), need: hp.need})
+				size := int64(len(parquetData))
+				deferredStored = append(deferredStored, deferredHandOver{
+					path: storagePath, size: size, indices: bucket.indices,
+					// Registers it as the post-loop pass would, without the
+					// flush's coverage group (long settled by then), if its
+					// rows are not seen replayed (deferredWriteMaxAge, Close)
+					// or the ledger cannot take it.
+					register: func(ctx context.Context) {
+						b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, size, parquetSumHex, nil)
+						b.syncRegistrations()
+					},
+				})
 			}
 
 			b.logger.Info().
