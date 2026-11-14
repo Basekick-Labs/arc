@@ -364,7 +364,7 @@ func (s *StorageWalkSource) FileSchema(ctx context.Context, f FileRef) (ArcSchem
 		return s.coldSchema(ctx, f)
 	}
 	if f.LocalPath != "" {
-		return SchemaFromParquet(f.LocalPath)
+		return SchemaFromParquetContext(ctx, f.LocalPath)
 	}
 	return SchemaFromBackend(ctx, s.backend, f.Key, f.SizeBytes)
 }

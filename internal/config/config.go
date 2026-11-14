@@ -696,6 +696,10 @@ type IcebergConfig struct {
 	// folder (OneLake shortcuts) can read Arc's files. Existing tables keep
 	// the location they were created with, whichever layout is set.
 	Layout string
+	// MeasurementTimeout bounds one complete measurement reconciliation.
+	MeasurementTimeout time.Duration
+	// NamespaceMigrationTimeout bounds the catalog lookup and rekey pass.
+	NamespaceMigrationTimeout time.Duration
 }
 
 // Iceberg export layouts (IcebergConfig.Layout).
@@ -1224,6 +1228,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	icebergMeasurementTimeout, err := parsePositiveDuration(v, "iceberg.measurement_timeout")
+	if err != nil {
+		return nil, err
+	}
+	icebergNamespaceMigrationTimeout, err := parsePositiveDuration(v, "iceberg.namespace_migration_timeout")
+	if err != nil {
+		return nil, err
+	}
 	spokeSyncTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.sync_timeout")
 	if err != nil {
 		return nil, err
@@ -1464,16 +1476,18 @@ func Load() (*Config, error) {
 			DBPath:  v.GetString("retention.db_path"),
 		},
 		Iceberg: IcebergConfig{
-			Enabled:                  v.GetBool("iceberg.enabled"),
-			Warehouse:                v.GetString("iceberg.warehouse"),
-			NamespacePrefix:          v.GetString("iceberg.namespace_prefix"),
-			NamespaceMigrationDryRun: v.GetBool("iceberg.namespace_migration_dry_run"),
-			ReconcileInterval:        v.GetInt("iceberg.reconcile_interval"),
-			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
-			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
-			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
-			ColdRescanInterval:       v.GetInt("iceberg.cold_rescan_interval"),
-			Layout:                   strings.ToLower(strings.TrimSpace(v.GetString("iceberg.layout"))),
+			Enabled:                   v.GetBool("iceberg.enabled"),
+			Warehouse:                 v.GetString("iceberg.warehouse"),
+			NamespacePrefix:           v.GetString("iceberg.namespace_prefix"),
+			NamespaceMigrationDryRun:  v.GetBool("iceberg.namespace_migration_dry_run"),
+			ReconcileInterval:         v.GetInt("iceberg.reconcile_interval"),
+			CatalogDBPath:             v.GetString("iceberg.catalog_db_path"),
+			RetainSnapshots:           v.GetInt("iceberg.retain_snapshots"),
+			OrphanSweepEnabled:        v.GetBool("iceberg.orphan_sweep_enabled"),
+			ColdRescanInterval:        v.GetInt("iceberg.cold_rescan_interval"),
+			Layout:                    strings.ToLower(strings.TrimSpace(v.GetString("iceberg.layout"))),
+			MeasurementTimeout:        icebergMeasurementTimeout,
+			NamespaceMigrationTimeout: icebergNamespaceMigrationTimeout,
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -2609,6 +2623,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
 	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
 	v.SetDefault("iceberg.layout", IcebergLayoutWarehouse)
+	v.SetDefault("iceberg.measurement_timeout", "2m")
+	v.SetDefault("iceberg.namespace_migration_timeout", "2m")
 	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults

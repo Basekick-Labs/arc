@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	icetable "github.com/apache/iceberg-go/table"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 
@@ -67,6 +68,122 @@ func writeArcStyleParquet(t *testing.T, path string, baseTS int64, n int) {
 }
 
 func fileURI(p string) string { return "file://" + p }
+
+// TestReconcile_BatchesResumeAfterFailure proves that a later batch can fail without rolling
+// back earlier commits, and that the next pass registers only the files still missing.
+func TestReconcile_BatchesResumeAfterFailure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(root, "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	exp, err := NewExporter(db, backend, fileURI(filepath.Join(root, "warehouse")), "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp.dataFileBatchSize = 2
+
+	paths := []string{
+		filepath.Join(root, "a.parquet"),
+		filepath.Join(root, "b.parquet"),
+		filepath.Join(root, "c.parquet"),
+		filepath.Join(root, "d.parquet"),
+	}
+	removedPath := filepath.Join(root, "removed.parquet")
+	baseTS := int64(1_700_000_000_000_000)
+	writeArcStyleParquet(t, removedPath, baseTS, 2)
+	writeArcStyleParquet(t, paths[0], baseTS, 2)
+	writeArcStyleParquet(t, paths[1], baseTS, 2)
+	if err := os.WriteFile(paths[2], []byte("not a parquet file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeArcStyleParquet(t, paths[3], baseTS, 2)
+
+	sc, err := SchemaFromParquet(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", sc, []FileRef{refOf(t, removedPath)}); err != nil {
+		t.Fatalf("seed table: %v", err)
+	}
+	refs := make([]FileRef, len(paths))
+	for i, p := range paths {
+		refs[i] = refOf(t, p)
+	}
+	if _, err := exp.ReconcileMeasurementWithHint(ctx, "mydb", "cpu", sc, refs); err == nil {
+		t.Fatal("reconcile with a malformed file in the second batch succeeded")
+	}
+
+	load := func() *icetable.Table {
+		t.Helper()
+		tbl, err := exp.catalog.LoadTable(ctx, exp.tableIdent("mydb", "cpu"))
+		if err != nil {
+			t.Fatalf("load table: %v", err)
+		}
+		return tbl
+	}
+	files, err := exp.tableDataFiles(ctx, load())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("after second-batch failure table has %d files, want the first 2 committed files", len(files))
+	}
+	if _, stillLive := files[fileURI(removedPath)]; stillLive {
+		t.Fatal("file removal was delayed behind the failed footer batch")
+	}
+	if got := len(load().Metadata().Snapshots()); got != 3 {
+		t.Fatalf("after first pass table has %d snapshots, want removal plus first add batch", got)
+	}
+
+	// Simulate a process restart: the new exporter must reconstruct progress from the catalog,
+	// not rely on the old Exporter's in-memory state.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db2, err := sql.Open("sqlite3", filepath.Join(root, "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	exp, err = NewExporter(db2, backend, fileURI(filepath.Join(root, "warehouse")), "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp.dataFileBatchSize = 2
+
+	// Repair the bad file and retry. The first batch must be recognized as already live.
+	writeArcStyleParquet(t, paths[2], baseTS, 2)
+	refs = make([]FileRef, len(paths))
+	for i, p := range paths {
+		refs[i] = refOf(t, p)
+	}
+	settled, err := exp.ReconcileMeasurementWithHint(ctx, "mydb", "cpu", sc, refs)
+	if err != nil {
+		t.Fatalf("resume reconcile: %v", err)
+	}
+	if !settled {
+		t.Fatal("resume reconcile did not settle")
+	}
+	tbl := load()
+	files, err = exp.tableDataFiles(ctx, tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != len(paths) {
+		t.Fatalf("resumed table has %d files, want %d", len(files), len(paths))
+	}
+	if got := len(tbl.Metadata().Snapshots()); got != 4 {
+		t.Fatalf("table has %d snapshots, want seed, removal, and two durable add-batch commits", got)
+	}
+}
 
 // TestReconcile_AddIdempotentSupersede exercises the core reconciler contract end-to-end
 // against a real SQLite catalog + real Parquet fixtures:

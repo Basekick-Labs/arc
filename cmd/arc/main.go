@@ -4728,11 +4728,13 @@ func main() {
 			log.Warn().Msg(icebergNoElectionWarning)
 		}
 		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
-			Exporter: exporter,
-			Source:   icebergSource,
-			Interval: time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second,
-			Gate:     icebergGate,
-			Logger:   logger.Get("iceberg"),
+			Exporter:                  exporter,
+			Source:                    icebergSource,
+			Interval:                  time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second,
+			MeasurementTimeout:        cfg.Iceberg.MeasurementTimeout,
+			NamespaceMigrationTimeout: cfg.Iceberg.NamespaceMigrationTimeout,
+			Gate:                      icebergGate,
+			Logger:                    logger.Get("iceberg"),
 		})
 		// Started after tiering is set up (below), so the first pass already sees the cold tier.
 		icebergStart = icebergScheduler.Start

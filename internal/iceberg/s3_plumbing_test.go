@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -81,6 +82,30 @@ func TestSchemaFromBackend_RefusesWhatIsNotTheListedFile(t *testing.T) {
 	}
 	if _, err := SchemaFromBackend(ctx, b, "mydb/cpu/x.parquet", 4); err == nil {
 		t.Fatal("a 4-byte file gave a schema")
+	}
+}
+
+func TestSchemaFromParquetContextHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := SchemaFromParquetContext(ctx, filepath.Join(t.TempDir(), "does-not-exist.parquet")); err != context.Canceled {
+		t.Fatalf("SchemaFromParquetContext with a canceled context returned %v, want context.Canceled", err)
+	}
+	for _, paths := range [][]string{
+		{filepath.Join(t.TempDir(), "one.parquet")},
+		{filepath.Join(t.TempDir(), "one.parquet"), filepath.Join(t.TempDir(), "two.parquet")},
+	} {
+		if _, err := UnionSchema(ctx, paths); err != context.Canceled {
+			t.Fatalf("UnionSchema(%d paths) with a canceled context returned %v, want context.Canceled", len(paths), err)
+		}
+	}
+
+	reader := contextReaderAtSeeker{ctx: ctx, reader: bytes.NewReader([]byte("parquet"))}
+	if _, err := reader.ReadAt(make([]byte, 1), 0); err != context.Canceled {
+		t.Fatalf("context reader ReadAt returned %v, want context.Canceled", err)
+	}
+	if _, err := reader.Seek(0, 0); err != context.Canceled {
+		t.Fatalf("context reader Seek returned %v, want context.Canceled", err)
 	}
 }
 

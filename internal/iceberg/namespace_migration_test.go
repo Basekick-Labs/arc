@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apache/iceberg-go/table"
@@ -279,12 +280,13 @@ func assertCatalogNamespace(t *testing.T, ctx context.Context, db *sql.DB, want,
 	}
 }
 
-// oneMeasurementSource serves a single measurement whose database is a dotted spoke, which the
-// storage walk cannot produce on its own (it needs a spoke registry to expand namespaces).
+// oneMeasurementSource serves one measurement and counts schema reads for scheduler tests.
 type oneMeasurementSource struct {
 	measurement Measurement
 	files       []FileRef
 	local       []string
+	listCalls   int
+	schemaCalls atomic.Int32
 }
 
 func (s *oneMeasurementSource) Measurements(context.Context) ([]Measurement, error) {
@@ -297,10 +299,98 @@ func (s *oneMeasurementSource) LocalFiles(context.Context, Measurement) ([]strin
 	return s.local, nil
 }
 func (s *oneMeasurementSource) FilesAndLocal(context.Context, Measurement) ([]FileRef, []string, error) {
+	s.listCalls++
 	return s.files, s.local, nil
 }
 func (s *oneMeasurementSource) FileSchema(_ context.Context, f FileRef) (ArcSchema, error) {
+	s.schemaCalls.Add(1)
 	return SchemaFromParquet(strings.TrimPrefix(f.PhysicalPath, "file://"))
+}
+
+// A partial batch failure must retain the already-derived schema without caching the
+// fingerprint, so the next pass resumes the diff without rereading every remaining footer.
+func TestSchedulerRetainsSchemaCacheAcrossPartialBatchFailure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(root, "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	exp, err := NewExporter(db, backend, fileURI(filepath.Join(root, "warehouse")), "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp.dataFileBatchSize = 1
+
+	good := filepath.Join(root, "a.parquet")
+	bad := filepath.Join(root, "b.parquet")
+	writeArcStyleParquet(t, good, 1_700_000_000_000_000, 2)
+	writeArcStyleParquet(t, bad, 1_700_000_000_000_000, 2)
+	measurement := Measurement{Database: "mydb", Measurement: "cpu"}
+	badRef := refOf(t, bad)
+	badRef.SizeBytes++ // simulate a stale listing size: schema read succeeds, DataFile validation fails
+	src := &oneMeasurementSource{
+		measurement: measurement,
+		files:       []FileRef{refOf(t, good), badRef},
+		local:       []string{good, bad},
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Logger: zerolog.Nop()})
+	key := measurementKey(measurement.Database, measurement.Measurement)
+
+	if _, err := sched.reconcileOne(ctx, measurement, key); err == nil {
+		t.Fatal("reconcile with a stale listed file size in the second batch succeeded")
+	}
+	if got := src.schemaCalls.Load(); got != 2 {
+		t.Fatalf("first pass derived %d file schemas, want 2", got)
+	}
+	partial, ok := sched.state[key]
+	if !ok || partial.fingerprint != "" || len(partial.schemaFiles) != 2 {
+		t.Fatalf("partial pass state = %+v, want schema cache without a settled fingerprint", partial)
+	}
+
+	// The same failed batch must reuse the already-derived schema, not reread either footer.
+	if _, err := sched.reconcileOne(ctx, measurement, key); err == nil {
+		t.Fatal("retry with the same stale listed size succeeded")
+	}
+	if got := src.schemaCalls.Load(); got != 2 {
+		t.Fatalf("retry re-derived %d file schemas, want the cached 2", got)
+	}
+}
+
+// A catalog outage during dotted-namespace planning must stop the whole pass: without the
+// catalog rows the scheduler cannot know which measurement would create a duplicate table.
+func TestSchedulerSkipsPassWhenNamespaceCatalogUnavailable(t *testing.T) {
+	root := t.TempDir()
+	db, err := sql.Open("sqlite3", filepath.Join(root, "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp, err := NewExporter(db, backend, localFileURI(root), "arc", 10, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &oneMeasurementSource{measurement: Measurement{Database: "legacy.db", Measurement: "cpu"}}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Logger: zerolog.Nop()})
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sched.runPass(context.Background())
+	if src.listCalls != 0 {
+		t.Fatalf("measurement file listing called %d times after namespace catalog failure, want 0", src.listCalls)
+	}
+	if len(sched.state) != 0 {
+		t.Fatalf("scheduler cached %d measurements after namespace catalog failure, want none", len(sched.state))
+	}
 }
 
 // The scheduler must ACT on the blocked set, not merely receive it.

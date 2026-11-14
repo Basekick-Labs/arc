@@ -35,6 +35,16 @@ import (
 //	BOOL                          -> boolean
 //	DECIMAL128(p,s)               -> decimal(p,s)
 func SchemaFromParquet(localPath string) (ArcSchema, error) {
+	return SchemaFromParquetContext(context.Background(), localPath)
+}
+
+// SchemaFromParquetContext is SchemaFromParquet with cancellation checked at each
+// random-access read made by the Parquet footer parser. Local file reads are
+// otherwise synchronous and would outlive a measurement timeout or shutdown.
+func SchemaFromParquetContext(ctx context.Context, localPath string) (ArcSchema, error) {
+	if err := ctx.Err(); err != nil {
+		return ArcSchema{}, err
+	}
 	f, err := os.Open(localPath)
 	if err != nil {
 		return ArcSchema{}, fmt.Errorf("open parquet %q: %w", localPath, err)
@@ -44,14 +54,15 @@ func SchemaFromParquet(localPath string) (ArcSchema, error) {
 	if err != nil {
 		return ArcSchema{}, fmt.Errorf("stat parquet %q: %w", localPath, err)
 	}
-	n, err := footerLen(f, st.Size(), localPath)
+	reader := contextReaderAtSeeker{ctx: ctx, reader: f}
+	n, err := footerLen(reader, st.Size(), localPath)
 	if err != nil {
 		return ArcSchema{}, err
 	}
 	if err := checkFooterLen(n, localPath); err != nil {
 		return ArcSchema{}, err
 	}
-	return schemaFromReader(f, localPath)
+	return schemaFromReader(reader, localPath)
 }
 
 // footerWindow is how much of a remote file's tail SchemaFromBackend reads
@@ -93,7 +104,11 @@ func SchemaFromBackend(ctx context.Context, backend storage.Backend, key string,
 			return ArcSchema{}, err
 		}
 	}
-	return schemaFromReader(&tailReader{base: off, data: tail, size: size}, key)
+	reader := contextReaderAtSeeker{
+		ctx:    ctx,
+		reader: &tailReader{base: off, data: tail, size: size},
+	}
+	return schemaFromReader(reader, key)
 }
 
 const (
@@ -113,6 +128,28 @@ func readTail(ctx context.Context, backend storage.Backend, key string, size, of
 		return nil, fmt.Errorf("read footer of %q: read %d bytes from offset %d, want %d (the file changed since it was listed)", key, got, off, size-off)
 	}
 	return buf.Bytes(), nil
+}
+
+// contextReaderAtSeeker checks cancellation between local random-access reads.
+// Parquet's footer parser is synchronous, but this bounds how long it can keep
+// doing I/O after a measurement deadline or scheduler shutdown.
+type contextReaderAtSeeker struct {
+	ctx    context.Context
+	reader parquet.ReaderAtSeeker
+}
+
+func (r contextReaderAtSeeker) ReadAt(p []byte, off int64) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.ReadAt(p, off)
+}
+
+func (r contextReaderAtSeeker) Seek(offset int64, whence int) (int64, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Seek(offset, whence)
 }
 
 // tailReader serves reads within a file's tail [base, size) for the Parquet
@@ -251,11 +288,14 @@ const unionSchemaConcurrency = 8
 // ordering and conflict detection are unaffected by scheduling. (The incremental path in the
 // scheduler only passes newly-added files here.)
 func UnionSchema(ctx context.Context, localPaths []string) (ArcSchema, error) {
+	if err := ctx.Err(); err != nil {
+		return ArcSchema{}, err
+	}
 	if len(localPaths) == 0 {
 		return ArcSchema{}, nil
 	}
 	if len(localPaths) == 1 {
-		return SchemaFromParquet(localPaths[0])
+		return SchemaFromParquetContext(ctx, localPaths[0])
 	}
 
 	schemas := make([]ArcSchema, len(localPaths))
@@ -267,7 +307,7 @@ func UnionSchema(ctx context.Context, localPaths []string) (ArcSchema, error) {
 			if err := gctx.Err(); err != nil {
 				return err // cancelled by an earlier failure or by the caller's timeout
 			}
-			sc, err := SchemaFromParquet(p)
+			sc, err := SchemaFromParquetContext(gctx, p)
 			if err != nil {
 				return fmt.Errorf("file %q: %w", p, err)
 			}

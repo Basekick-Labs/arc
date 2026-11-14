@@ -15,13 +15,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// measurementState caches per-measurement work between passes so an unchanged measurement is
-// skipped without re-reading every Parquet footer, and a grown measurement re-reads only the
-// footers of its newly-added local files (incremental schema derivation).
+// measurementState caches per-measurement work between passes. fingerprint is populated only
+// after the whole file set settles; schema/schemaFiles may be retained earlier after a successful
+// schema scan, so a partially committed batch pass does not re-read every remaining footer next tick.
 type measurementState struct {
-	fingerprint string              // hash of the sorted file set + local-file set at last successful reconcile
-	schema      ArcSchema           // schema derived at that reconcile (reused/extended while files persist)
-	schemaFiles map[string]struct{} // schemaKey of every file at that reconcile — to diff for newly-added files
+	fingerprint string              // hash of the sorted file set + local-file set at last fully settled reconcile
+	schema      ArcSchema           // union schema already derived (reused/extended while files persist)
+	schemaFiles map[string]struct{} // schemaKey of every file represented by schema, including uncommitted files
 }
 
 // schemaKey identifies a file for schema derivation: its storage key and size. A different file
@@ -60,14 +60,16 @@ type WriterGate interface {
 // safe to miss or fail a pass — the next pass re-derives the diff from durable state and
 // converges (the reconciler is idempotent).
 type Scheduler struct {
-	exporter *Exporter
-	source   FileSetSourceWithSchema
-	interval time.Duration
-	gate     WriterGate
-	logger   zerolog.Logger
+	exporter                  *Exporter
+	source                    FileSetSourceWithSchema
+	interval                  time.Duration
+	measurementTimeout        time.Duration
+	namespaceMigrationTimeout time.Duration
+	gate                      WriterGate
+	logger                    zerolog.Logger
 
-	// state caches per-measurement fingerprint+schema so unchanged measurements are skipped
-	// without re-reading footers. Accessed only from the single loop() goroutine — no lock.
+	// state caches schema work across partial passes and a fingerprint only after settlement,
+	// so unchanged measurements are skipped without re-reading footers. Single loop() goroutine.
 	state map[string]measurementState
 
 	// gatedWarnOnce fires the first-gated WARN a single time per process
@@ -101,11 +103,13 @@ type FileSetSourceWithSchema interface {
 
 // SchedulerConfig configures the reconcile scheduler.
 type SchedulerConfig struct {
-	Exporter *Exporter
-	Source   FileSetSourceWithSchema
-	Interval time.Duration
-	Gate     WriterGate // nil = always run (OSS)
-	Logger   zerolog.Logger
+	Exporter                  *Exporter
+	Source                    FileSetSourceWithSchema
+	Interval                  time.Duration
+	MeasurementTimeout        time.Duration
+	NamespaceMigrationTimeout time.Duration
+	Gate                      WriterGate // nil = always run (OSS)
+	Logger                    zerolog.Logger
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -113,13 +117,21 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 5 * time.Minute
 	}
+	if cfg.MeasurementTimeout <= 0 {
+		cfg.MeasurementTimeout = measurementTimeout
+	}
+	if cfg.NamespaceMigrationTimeout <= 0 {
+		cfg.NamespaceMigrationTimeout = measurementTimeout
+	}
 	return &Scheduler{
-		exporter: cfg.Exporter,
-		source:   cfg.Source,
-		interval: cfg.Interval,
-		gate:     cfg.Gate,
-		logger:   cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
-		state:    make(map[string]measurementState),
+		exporter:                  cfg.Exporter,
+		source:                    cfg.Source,
+		interval:                  cfg.Interval,
+		measurementTimeout:        cfg.MeasurementTimeout,
+		namespaceMigrationTimeout: cfg.NamespaceMigrationTimeout,
+		gate:                      cfg.Gate,
+		logger:                    cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
+		state:                     make(map[string]measurementState),
 	}
 }
 
@@ -129,7 +141,10 @@ func (s *Scheduler) Start() {
 	s.cancel = cancel
 	s.done = make(chan struct{})
 	go s.loop(ctx)
-	s.logger.Info().Dur("interval", s.interval).Msg("Iceberg reconcile scheduler started")
+	s.logger.Info().Dur("interval", s.interval).
+		Dur("measurement_timeout", s.measurementTimeout).
+		Dur("namespace_migration_timeout", s.namespaceMigrationTimeout).
+		Msg("Iceberg reconcile scheduler started")
 }
 
 // Stop halts the loop and waits for the in-flight pass to finish.
@@ -181,18 +196,15 @@ func (s *Scheduler) runPass(ctx context.Context) {
 	// Bounded like a measurement, and for the same reason: this reads the shared SQLite catalog
 	// (auth, audit and tiering write to it too), and an unbounded call here would hold the whole
 	// pass open until shutdown rather than until the next tick (#1154).
-	nsctx, nscancel := context.WithTimeout(ctx, measurementTimeout)
+	nsctx, nscancel := context.WithTimeout(ctx, s.namespaceMigrationTimeout)
 	blocked, err := s.exporter.MigrateDottedNamespaces(nsctx, measurements)
 	nscancel()
 	if err != nil {
-		// Do NOT return: the only error source is reading the catalog table list, and on a
-		// SQLITE_BUSY against the shared DB that would skip every measurement on the node rather
-		// than the few a migration concerns. An empty blocked set is the safe fallback -- a
-		// legacy dotted table is then reconciled, which at worst creates the duplicate the
-		// migration would have prevented, so the warning names that risk explicitly.
-		s.logger.Warn().Err(err).
-			Msg("Iceberg reconcile: could not read the catalog to plan dotted-namespace migration; continuing without it. A database whose Iceberg namespace contains a dot may get a second table this pass")
-		blocked = nil
+		// Without the catalog rows we cannot know which measurements still have a legacy
+		// dotted namespace. Reconciling any candidate could create a second table beside the
+		// still-readable legacy table, so fail closed for this pass and retry next interval.
+		s.logger.Warn().Err(err).Msg("Iceberg reconcile: could not read the catalog to plan dotted-namespace migration; skipping this pass to avoid creating duplicate tables")
+		return
 	}
 	var ok, failed, skipped, awaitingMigration int
 	seen := make(map[string]struct{}, len(measurements))
@@ -218,7 +230,7 @@ func (s *Scheduler) runPass(ctx context.Context) {
 			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
 			return
 		}
-		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+		mctx, cancel := context.WithTimeout(ctx, s.measurementTimeout)
 		changed, err := s.reconcileOneRecovered(mctx, m, key)
 		cancel()
 		switch {
@@ -376,33 +388,37 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		}
 	}
 
+	schemaSet := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		schemaSet[refSchemaKey(f)] = struct{}{}
+	}
+
 	settled, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, sc, files)
 	if err != nil {
+		// Schema derivation completed, so keep that work even though this batch pass failed.
+		// Do NOT cache the fingerprint: the next pass must diff the table again and resume
+		// from the files already committed. schemaFiles covers the full listed set, including
+		// files not registered yet, so those footers need not be re-read just to derive schema.
+		s.state[key] = measurementState{schema: sc, schemaFiles: schemaSet}
 		return false, err
 	}
 
-	// Cache only when the pass fully settled. The snapshot is committed either way, but
-	// caching an unsettled pass would gate this measurement out of every later one — and if
-	// its file set then goes quiet (the steady state) it would stay unsettled indefinitely.
-	// Leaving the entry uncached costs one repeated reconcile per tick until it succeeds.
+	// Only the fingerprint gate waits for full convergence. A partial batch commit is durable,
+	// but the next pass must still run the diff; the cached schema merely avoids repeating
+	// footer work already completed for the same file keys/sizes.
 	//
 	// Two things can leave a pass unsettled, and the exporter has already logged which:
 	// unpublished reader discovery files, or a snapshot expiry that failed on a pass whose
-	// removals made the older snapshots unreadable (#1092). Both need the same retry, so this
-	// does not name either — a message claiming the hint when the expiry failed would send an
-	// operator to the wrong place.
+	// removals made the older snapshots unreadable (#1092). Neither is allowed to suppress the
+	// next pass.
 	if !settled {
-		delete(s.state, key)
+		s.state[key] = measurementState{schema: sc, schemaFiles: schemaSet}
 		s.logger.Warn().
 			Str("database", m.Database).Str("measurement", m.Measurement).
 			Msg("Iceberg reconcile: pass did not fully settle (see the preceding error for which step); will retry next pass")
 		return true, nil
 	}
 
-	schemaSet := make(map[string]struct{}, len(files))
-	for _, f := range files {
-		schemaSet[refSchemaKey(f)] = struct{}{}
-	}
 	s.state[key] = measurementState{fingerprint: fp, schema: sc, schemaFiles: schemaSet}
 	return true, nil
 }

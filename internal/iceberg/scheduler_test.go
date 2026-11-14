@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	iceberg "github.com/apache/iceberg-go"
@@ -364,6 +365,27 @@ func TestScheduler_EmptyDirNeverCreatesTable(t *testing.T) {
 	}
 }
 
+func TestNewSchedulerTimeoutDefaultsAndOverrides(t *testing.T) {
+	defaults := NewScheduler(SchedulerConfig{Logger: zerolog.Nop()})
+	if defaults.measurementTimeout != 2*time.Minute {
+		t.Errorf("default measurement timeout = %s, want 2m", defaults.measurementTimeout)
+	}
+	if defaults.namespaceMigrationTimeout != 2*time.Minute {
+		t.Errorf("default namespace migration timeout = %s, want 2m", defaults.namespaceMigrationTimeout)
+	}
+	configured := NewScheduler(SchedulerConfig{
+		MeasurementTimeout:        7 * time.Minute,
+		NamespaceMigrationTimeout: 45 * time.Second,
+		Logger:                    zerolog.Nop(),
+	})
+	if configured.measurementTimeout != 7*time.Minute {
+		t.Errorf("configured measurement timeout = %s, want 7m", configured.measurementTimeout)
+	}
+	if configured.namespaceMigrationTimeout != 45*time.Second {
+		t.Errorf("configured namespace migration timeout = %s, want 45s", configured.namespaceMigrationTimeout)
+	}
+}
+
 // TestScheduler_CatalogLookupFailureIsRetryable ensures a catalog outage is a measurement
 // failure, not an empty-table result that gets fingerprint-cached and hidden from later passes.
 func TestScheduler_CatalogLookupFailureIsRetryable(t *testing.T) {
@@ -637,7 +659,7 @@ func TestIsUnderDir(t *testing.T) {
 	}{
 		{"file:///data/wh", true}, // the dir itself
 		{"file:///data/wh/arc_db.db/cpu/metadata/v1.metadata.json", true}, // beneath it
-		{"file:///data/wh/", true},                                        // trailing slash
+		{"file:///data/wh/", true}, // trailing slash
 		// Siblings that share a name prefix must NOT match.
 		{"file:///data/wh-other/arc_db.db/cpu/metadata/v1.metadata.json", false},
 		{"file:///data/wharf/x.json", false},

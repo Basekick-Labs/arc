@@ -564,6 +564,33 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_IcebergTimeouts(t *testing.T) {
+	t.Setenv("ARC_ICEBERG_ENABLED", "true")
+	t.Setenv("ARC_STORAGE_BACKEND", "local")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() defaults: %v", err)
+	}
+	if cfg.Iceberg.MeasurementTimeout != 2*time.Minute {
+		t.Errorf("measurement timeout = %s, want 2m", cfg.Iceberg.MeasurementTimeout)
+	}
+	if cfg.Iceberg.NamespaceMigrationTimeout != 2*time.Minute {
+		t.Errorf("namespace migration timeout = %s, want 2m", cfg.Iceberg.NamespaceMigrationTimeout)
+	}
+	t.Setenv("ARC_ICEBERG_MEASUREMENT_TIMEOUT", "7m")
+	t.Setenv("ARC_ICEBERG_NAMESPACE_MIGRATION_TIMEOUT", "45s")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() overrides: %v", err)
+	}
+	if cfg.Iceberg.MeasurementTimeout != 7*time.Minute {
+		t.Errorf("measurement timeout = %s, want 7m", cfg.Iceberg.MeasurementTimeout)
+	}
+	if cfg.Iceberg.NamespaceMigrationTimeout != 45*time.Second {
+		t.Errorf("namespace migration timeout = %s, want 45s", cfg.Iceberg.NamespaceMigrationTimeout)
+	}
+}
+
 func TestLoad_IcebergNamespaceMigrationDryRun(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("ARC_ICEBERG_ENABLED", "true")

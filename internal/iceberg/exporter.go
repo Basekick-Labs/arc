@@ -121,6 +121,10 @@ type Exporter struct {
 	// package sets it.
 	collapseThreshold int
 
+	// dataFileBatchSize bounds the number of new files registered by one snapshot commit.
+	// It is a field so tests can exercise batching with a handful of fixture files.
+	dataFileBatchSize int
+
 	// orphanSweepEnabled gates sweepOrphanMetadata (iceberg.orphan_sweep_enabled).
 	// orphanGrace is the minimum age an unreachable .avro must reach before the
 	// sweep deletes it. Both are set once at wiring time (ConfigureOrphanSweep)
@@ -197,6 +201,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		orphanSweepEnabled:       true,
 		orphanGrace:              minOrphanGrace,
 		collapseThreshold:        manifestCollapseThreshold,
+		dataFileBatchSize:        dataFileCommitBatchSize,
 		namespaceMigrationDryRun: true,
 		layout:                   layoutWarehouse,
 	}, nil
@@ -635,10 +640,15 @@ func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Ta
 	return updated
 }
 
-// ReconcileMeasurement makes the Iceberg table's data-file set equal `current`: it AddFiles
-// the files present in Arc but absent from the table, and Deletes the files present in the
-// table but absent from Arc. One transaction. Idempotent — if the sets already match, it is a
-// no-op (no new snapshot). This is the core of the reconciler design.
+// dataFileCommitBatchSize caps the number of new files registered by one snapshot.
+// Each successful batch is durable, so a later timeout or restart resumes from the
+// table's actual live-file set instead of rebuilding the entire first registration.
+const dataFileCommitBatchSize = 500
+
+// ReconcileMeasurement makes the Iceberg table's data-file set equal `current`: it adds
+// files present in Arc but absent from the table, and removes files present in the table
+// but absent from Arc. New files are committed in bounded, independently durable batches.
+// Idempotent — if the sets already match, it is a no-op (no new snapshot).
 func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) error {
 	ctx = e.withAWS(ctx)
 	_, err := e.ReconcileMeasurementWithHint(ctx, database, measurement, sc, current)
@@ -730,95 +740,178 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 		return published && hintOK, nil
 	}
 
-	// Metadata-only: files are dropped and added as DataFiles in one commit. (Transaction.Delete
-	// is a ROW-level predicate that rewrites partially-matching files — wrong here; we drop
-	// whole files that Arc already removed from storage.) The removes are the table's own
-	// entries; the adds are built from their footers first, which is also where a file whose
-	// rows straddle a UTC day is found. A rewritten path appears in both lists and is removed
-	// before it is added, inside the same transaction.
-	removes := make([]iceberg.DataFile, 0, len(toRemove))
-	for _, p := range toRemove {
-		removes = append(removes, live[p])
-	}
+	// Metadata-only: files are dropped and added as DataFiles; no Parquet data is rewritten.
+	// (Transaction.Delete is a ROW-level predicate that rewrites partially-matching files —
+	// wrong here; we drop whole files that Arc already removed from storage.) The removes are
+	// the table's own entries; new adds are built from their footers. Rewritten paths are
+	// removed and re-added atomically within their own batch.
 	// A file that moved tiers is the same file under another URI: its DataFile is the table's
 	// own entry with the new path, and the moved object is never read (cold_export.go).
 	keyOf := make(map[string]string, len(current))
 	for _, f := range current {
 		keyOf[f.PhysicalPath] = f.Key
 	}
-	cloned, toBuild, err := cloneFromTable(tbl, live, toAdd, keyOf, want)
-	if err != nil {
-		return false, err
+
+	// Remove files that have genuinely left Arc before doing potentially slow footer reads.
+	// Rewritten paths stay paired with their replacement in the same batch commit, so readers
+	// never observe a rewrite as a remove-only intermediate snapshot.
+	rewriteSet := make(map[string]struct{}, len(rewritten))
+	for _, p := range rewritten {
+		rewriteSet[p] = struct{}{}
 	}
-	adds, skipped, err := e.buildDataFiles(ctx, tbl, toBuild, want)
-	if err != nil {
-		return false, err
+	// A tier move has the same storage key and size under a different URI. Keep its old
+	// entry in place until the replacement URI is committed in the same batch; otherwise
+	// readers would briefly see the file disappear between the remove and clone commits.
+	moveRemoveForAdd := make(map[string]iceberg.DataFile)
+	moveRemovePaths := make(map[string]struct{})
+	for _, p := range toAdd {
+		key := keyOf[p]
+		if key == "" {
+			continue
+		}
+		for oldPath, df := range live {
+			if oldPath != p && strings.HasSuffix(df.FilePath(), "/"+key) && df.FileSizeBytes() == want[p] {
+				moveRemoveForAdd[p] = df
+				moveRemovePaths[oldPath] = struct{}{}
+				break
+			}
+		}
 	}
-	adds = append(cloned, adds...)
-	if len(skipped) > 0 {
+	pureRemoves := make([]iceberg.DataFile, 0, len(toRemove)-len(rewritten))
+	for _, p := range toRemove {
+		_, isRewrite := rewriteSet[p]
+		_, isTierMove := moveRemovePaths[p]
+		if !isRewrite && !isTierMove {
+			pureRemoves = append(pureRemoves, live[p])
+		}
+	}
+
+	committed := tbl
+	expireOK := true
+	commits := 0
+	batchesCommitted := 0
+	registeredFiles := 0
+	if len(pureRemoves) > 0 {
+		collapse := e.shouldCollapse(ctx, committed, len(want), database, measurement)
+		committed, err = e.commitDiff(ctx, committed, pureRemoves, nil, database, measurement, collapse)
+		if err != nil {
+			return false, err
+		}
+		commits++
+		committed, expireOK = e.expireSnapshots(ctx, committed, database, measurement, floorHistory)
+		published := e.writeVersionHint(ctx, committed)
+		hintOK = hintOK && published && !e.hintFailed()
+		if err := e.fencedErr(); err != nil {
+			return false, err
+		}
+		e.pruneOldVersionFiles(ctx, committed)
+	}
+
+	batchSize := e.dataFileBatchSize
+	if batchSize <= 0 {
+		batchSize = dataFileCommitBatchSize
+	}
+	var skippedAll []string
+	for start := 0; start < len(toAdd); start += batchSize {
+		end := min(start+batchSize, len(toAdd))
+		batchPaths := toAdd[start:end]
+
+		cloned, toBuild, err := cloneFromTable(committed, live, batchPaths, keyOf, want)
+		if err != nil {
+			return false, err
+		}
+		adds, skipped, err := e.buildDataFiles(ctx, committed, toBuild, want)
+		if err != nil {
+			// Earlier batches are already committed. The next pass diffs against those durable
+			// snapshots and resumes here instead of repeating their footer reads.
+			return false, err
+		}
+		skippedAll = append(skippedAll, skipped...)
+		adds = append(cloned, adds...)
+
+		batchRemoves := make([]iceberg.DataFile, 0, len(batchPaths))
+		for _, p := range batchPaths {
+			if _, isRewrite := rewriteSet[p]; isRewrite {
+				batchRemoves = append(batchRemoves, live[p])
+			} else if moved := moveRemoveForAdd[p]; moved != nil {
+				batchRemoves = append(batchRemoves, moved)
+			}
+		}
+		if len(adds) == 0 && len(batchRemoves) == 0 {
+			continue // every file in this batch was unpartitionable; nothing to commit
+		}
+
+		// Collapse only with the last data-changing batch, avoiding a full manifest rewrite
+		// after every small commit.
+		collapse := end == len(toAdd) && e.shouldCollapse(ctx, committed, len(want)-len(skippedAll), database, measurement)
+		committed, err = e.commitDiff(ctx, committed, batchRemoves, adds, database, measurement, collapse)
+		if err != nil {
+			return false, err
+		}
+		commits++
+		batchesCommitted++
+		registeredFiles += len(adds)
+		e.logger.Info().
+			Str("database", database).Str("measurement", measurement).
+			Int("batch", batchesCommitted).Int("batch_files", len(adds)).
+			Int("registered_files", registeredFiles).Int("total_new_files", len(toAdd)).
+			Msg("Iceberg: committed data-file batch")
+
+		mode := retainConfigured
+		if len(batchRemoves) > 0 {
+			// A rewritten path still has old bytes' statistics in earlier snapshots. Floor
+			// history after every batch that replaces paths, because a later rewrite batch
+			// can make the snapshot produced by an earlier batch stale again.
+			mode = floorHistory
+		}
+		var batchExpireOK bool
+		committed, batchExpireOK = e.expireSnapshots(ctx, committed, database, measurement, mode)
+		expireOK = expireOK && batchExpireOK
+		published := e.writeVersionHint(ctx, committed)
+		hintOK = hintOK && published && !e.hintFailed()
+		if err := e.fencedErr(); err != nil {
+			return false, err
+		}
+		e.pruneOldVersionFiles(ctx, committed)
+	}
+
+	if len(skippedAll) > 0 {
 		// Some files could not be partitioned (day-straddling data — see day() spec). They are
 		// omitted from the table but logged loudly; the rest of the measurement still exports.
 		e.logger.Error().
 			Str("database", database).Str("measurement", measurement).
-			Int("skipped", len(skipped)).Strs("files", skipped).
+			Int("skipped", len(skippedAll)).Strs("files", skippedAll).
 			Msg("Iceberg: skipped files that could not be partition-mapped (day-straddling time range)")
 	}
-	if len(adds) == 0 && len(removes) == 0 {
-		// Every add was skipped: nothing to commit, so this pass converged like the branch above.
-		published := e.writeVersionHint(ctx, tbl)
+	if commits == 0 {
+		// Every add was skipped and there were no removals. No snapshot changed; publish the
+		// current discovery hint and let the scheduler settle this unchanged file set as before.
+		published := e.writeVersionHint(ctx, committed)
 		if err := e.fencedErr(); err != nil {
 			return false, err
 		}
-		e.sweepOrphanMetadata(ctx, tbl)
+		e.sweepOrphanMetadata(ctx, committed)
 		return published && hintOK, nil
 	}
 
-	// The manifest collapse (#1106) is decided HERE, not inside, for two reasons: it reads the
-	// CURRENT snapshot and the pass cannot be re-driven once the diff has staged, and the live
-	// file set this pass drives the table to — want, less the files it could not partition — is
-	// only known here. A pass whose every survivor is unmappable leaves the table empty after
-	// all and must not collapse; see shouldCollapse for what an all-DELETED merge does.
-	collapse := e.shouldCollapse(ctx, tbl, len(want)-len(skipped), database, measurement)
-	committed, err := e.commitDiff(ctx, tbl, removes, adds, database, measurement, collapse)
-	if err != nil {
-		return false, err
-	}
-	// Expire old snapshots so snapshot history and metadata don't grow unbounded, and floor
-	// history to the current snapshot when this pass removed any path. A removed path is one
-	// Arc already deleted from the primary backend, so every older snapshot names a file that
-	// is gone and time travel to it fails on the read (#1092). Flooring does not lose
-	// readable history: it drops snapshots that were already unreadable.
-	//
-	// toRemove, not toRemove-minus-rewritten, is the trigger. A rewritten path is in both
-	// lists and still present in storage, but with different bytes, so the older snapshots'
-	// record_count and bounds describe content that no longer exists there — the original
-	// #1092 symptom.
-	//
-	// Best-effort for the retention case: a failure doesn't undo the successful reconcile, and
-	// the next pass retries. NOT best-effort for the floor — see the expireOK handling below,
-	// because only a pass that removes something asks to floor, so there may be no next pass.
-	committed, expireOK := e.expireSnapshots(ctx, committed, database, measurement, expireModeFor(len(toRemove)))
-	hintOK = e.writeVersionHint(ctx, committed) && !e.hintFailed()
-	if err := e.fencedErr(); err != nil {
-		return false, err
-	}
-	e.pruneOldVersionFiles(ctx, committed)
-	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
-	// reachability is the one this pass settled on, not one version stale.
+	// The last successful batch is durable even if a later batch times out. Publish/expiry is
+	// performed after each commit so readers discover each committed version and snapshot
+	// retention stays bounded during a long first registration. Sweep once, after the final
+	// version-hint and metadata pruning have settled.
 	e.sweepOrphanMetadata(ctx, committed)
 	e.logger.Info().
 		Str("database", database).Str("measurement", measurement).
 		Int("added", len(toAdd)-len(rewritten)).Int("removed", len(toRemove)-len(rewritten)).
 		Int("reregistered", len(rewritten)).
+		Int("data_commits", commits).
+		Int("batches_committed", batchesCommitted).
+		Int("files_registered", registeredFiles).
 		Bool("hint_published", hintOK).
 		Bool("history_settled", expireOK).
 		Msg("Reconciled Iceberg table")
-	// A failed floor must not be cached as settled. The scheduler keys its skip gate on the
-	// value returned here, and only a pass that REMOVES a path asks to floor — so unlike the
-	// ordinary retention case there is no guarantee of a next pass to retry on: once the file
-	// set goes quiet the measurement is skipped entirely, leaving metadata that names deleted
-	// files. Reporting not-settled keeps the fingerprint uncached so the next tick re-drives
-	// this measurement, exactly as hintOK already does for a failed version hint.
+	// A failed floor must not be cached as settled. Likewise, a hint or retention commit that
+	// failed is retried on the next pass; the durable data batches remain visible and are not
+	// re-registered.
 	return hintOK && expireOK, nil
 }
 
