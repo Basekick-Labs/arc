@@ -2,7 +2,7 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Fix: Iceberg export no longer fails a measurement because compaction deleted a file mid-pass (PR_LINK)
+## Fix: Iceberg export no longer fails a measurement because compaction deleted a file mid-pass ([#1706](https://github.com/Basekick-Labs/arc/pull/1706))
 
 Compaction, a `DELETE`, retention and tier moves delete data files while an Iceberg export pass may be reading them. Two things then failed the measurement, logged at Error and counted as `failed`, until the next pass on the full interval:
 
