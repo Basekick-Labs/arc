@@ -127,6 +127,17 @@ type Exporter struct {
 	// and read-only afterwards, so they need no lock.
 	orphanSweepEnabled bool
 	orphanGrace        time.Duration
+
+	// chunkMax is the most new files one reconcile commit registers (dataFileChunkMax; a field
+	// so tests can chunk a handful of fixture files). commitReserve is the part of the
+	// measurement deadline chunk reads leave for committing and finishing the pass. See batched.go.
+	chunkMax      int
+	commitReserve time.Duration
+	// chunkMu guards chunkSize (a measurement's shrunk chunk size after a chunk that did not fit)
+	// and floorDue (tables whose #1092 history floor failed and is retried by later passes).
+	chunkMu   sync.Mutex
+	chunkSize map[string]int
+	floorDue  map[string]struct{}
 }
 
 // resetHintFailure clears the per-reconcile discovery-file failure flag.
@@ -197,6 +208,10 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		orphanSweepEnabled:       true,
 		orphanGrace:              minOrphanGrace,
 		collapseThreshold:        manifestCollapseThreshold,
+		chunkMax:                 dataFileChunkMax,
+		commitReserve:            defaultCommitReserve,
+		chunkSize:                make(map[string]int),
+		floorDue:                 make(map[string]struct{}),
 		namespaceMigrationDryRun: true,
 		layout:                   layoutWarehouse,
 	}, nil
@@ -637,189 +652,15 @@ func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Ta
 
 // ReconcileMeasurement makes the Iceberg table's data-file set equal `current`: it AddFiles
 // the files present in Arc but absent from the table, and Deletes the files present in the
-// table but absent from Arc. One transaction. Idempotent — if the sets already match, it is a
+// table but absent from Arc. Removals and whatever replaces them commit together; new files
+// with no removal in their day commit in chunks (batched.go, #1686). With no deadline on ctx
+// every chunk runs; with one, a pass that runs out of time returns nil having registered part
+// of the new files, and the next call continues. Idempotent — if the sets already match, it is a
 // no-op (no new snapshot). This is the core of the reconciler design.
 func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) error {
 	ctx = e.withAWS(ctx)
 	_, err := e.ReconcileMeasurementWithHint(ctx, database, measurement, sc, current)
 	return err
-}
-
-// ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
-// SETTLED: the reader discovery files (version-hint.text, v<N>.metadata.json) were
-// published, AND any snapshot-history floor this pass owed actually committed.
-//
-// The scheduler needs this separately from the error. Both steps are best-effort with
-// respect to the committed snapshot, but if either fails the caller must NOT cache the
-// measurement's fingerprint, or a file set that then goes quiet is never revisited: the
-// hint would stay stale forever, and metadata that names deleted data files would stay
-// published (#1092).
-//
-// The return is true when there was nothing to do for either step, which is the ordinary
-// converged case.
-func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) (settled bool, err error) {
-	ctx = e.withAWS(ctx)
-	// EnsureTable publishes the discovery files itself when it creates or evolves
-	// the table, so start from whether those writes succeeded. Otherwise a
-	// creation-time failure would be invisible here and the fingerprint would be
-	// cached over an unpublished hint.
-	e.resetHintFailure()
-	tbl, err := e.EnsureTable(ctx, database, measurement, sc)
-	if err != nil {
-		return false, err
-	}
-	if err := e.fencedErr(); err != nil {
-		return false, err // EnsureTable's create or evolve lost a publish race (adopt.go)
-	}
-	hintOK := !e.hintFailed()
-
-	want := make(map[string]int64, len(current))
-	for _, f := range current {
-		want[f.PhysicalPath] = f.SizeBytes
-	}
-	live, err := e.tableLiveFiles(ctx, tbl)
-	if err != nil {
-		return false, fmt.Errorf("read current iceberg data files: %w", err)
-	}
-	have := make(map[string]int64, len(live))
-	for p, df := range live {
-		have[p] = df.FileSizeBytes()
-	}
-
-	// The diff key is (path, size). A path on both sides with a different size is a file
-	// whose bytes changed without changing its path — for example, a backup restore replacing
-	// an existing object. The manifest entry still describes the old content (record_count,
-	// file_size_in_bytes, column bounds), so external engines keep counting deleted rows and
-	// can mis-plan reads against the shorter file. Such a path is dropped and re-registered
-	// in the same commit.
-	var toAdd, toRemove, rewritten []string
-	for p, size := range want {
-		haveSize, ok := have[p]
-		switch {
-		case !ok:
-			toAdd = append(toAdd, p)
-		case haveSize != size:
-			rewritten = append(rewritten, p)
-			toRemove = append(toRemove, p)
-			toAdd = append(toAdd, p)
-		}
-	}
-	for p := range have {
-		if _, ok := want[p]; !ok {
-			toRemove = append(toRemove, p)
-		}
-	}
-	// Deterministic order (stable snapshots, easier debugging).
-	sort.Strings(toAdd)
-	sort.Strings(toRemove)
-
-	if len(toAdd) == 0 && len(toRemove) == 0 {
-		// Already converged — no new snapshot. Still republish the discovery
-		// files: a previous pass may have committed the snapshot but failed to
-		// write them, and this is the path that pass's retry lands on.
-		//
-		// Sweep here too. A measurement whose file set has stopped changing is
-		// skipped by the scheduler's fingerprint gate before it ever reaches this
-		// function, so for such a table THIS is the pass that reclaims: the first
-		// one after a restart, whose fingerprint cache is cold.
-		published := e.writeVersionHint(ctx, tbl)
-		if err := e.fencedErr(); err != nil {
-			return false, err
-		}
-		e.sweepOrphanMetadata(ctx, tbl)
-		return published && hintOK, nil
-	}
-
-	// Metadata-only: files are dropped and added as DataFiles in one commit. (Transaction.Delete
-	// is a ROW-level predicate that rewrites partially-matching files — wrong here; we drop
-	// whole files that Arc already removed from storage.) The removes are the table's own
-	// entries; the adds are built from their footers first, which is also where a file whose
-	// rows straddle a UTC day is found. A rewritten path appears in both lists and is removed
-	// before it is added, inside the same transaction.
-	removes := make([]iceberg.DataFile, 0, len(toRemove))
-	for _, p := range toRemove {
-		removes = append(removes, live[p])
-	}
-	// A file that moved tiers is the same file under another URI: its DataFile is the table's
-	// own entry with the new path, and the moved object is never read (cold_export.go).
-	keyOf := make(map[string]string, len(current))
-	for _, f := range current {
-		keyOf[f.PhysicalPath] = f.Key
-	}
-	cloned, toBuild, err := cloneFromTable(tbl, live, toAdd, keyOf, want)
-	if err != nil {
-		return false, err
-	}
-	adds, skipped, err := e.buildDataFiles(ctx, tbl, toBuild, want)
-	if err != nil {
-		return false, err
-	}
-	adds = append(cloned, adds...)
-	if len(skipped) > 0 {
-		// Some files could not be partitioned (day-straddling data — see day() spec). They are
-		// omitted from the table but logged loudly; the rest of the measurement still exports.
-		e.logger.Error().
-			Str("database", database).Str("measurement", measurement).
-			Int("skipped", len(skipped)).Strs("files", skipped).
-			Msg("Iceberg: skipped files that could not be partition-mapped (day-straddling time range)")
-	}
-	if len(adds) == 0 && len(removes) == 0 {
-		// Every add was skipped: nothing to commit, so this pass converged like the branch above.
-		published := e.writeVersionHint(ctx, tbl)
-		if err := e.fencedErr(); err != nil {
-			return false, err
-		}
-		e.sweepOrphanMetadata(ctx, tbl)
-		return published && hintOK, nil
-	}
-
-	// The manifest collapse (#1106) is decided HERE, not inside, for two reasons: it reads the
-	// CURRENT snapshot and the pass cannot be re-driven once the diff has staged, and the live
-	// file set this pass drives the table to — want, less the files it could not partition — is
-	// only known here. A pass whose every survivor is unmappable leaves the table empty after
-	// all and must not collapse; see shouldCollapse for what an all-DELETED merge does.
-	collapse := e.shouldCollapse(ctx, tbl, len(want)-len(skipped), database, measurement)
-	committed, err := e.commitDiff(ctx, tbl, removes, adds, database, measurement, collapse)
-	if err != nil {
-		return false, err
-	}
-	// Expire old snapshots so snapshot history and metadata don't grow unbounded, and floor
-	// history to the current snapshot when this pass removed any path. A removed path is one
-	// Arc already deleted from the primary backend, so every older snapshot names a file that
-	// is gone and time travel to it fails on the read (#1092). Flooring does not lose
-	// readable history: it drops snapshots that were already unreadable.
-	//
-	// toRemove, not toRemove-minus-rewritten, is the trigger. A rewritten path is in both
-	// lists and still present in storage, but with different bytes, so the older snapshots'
-	// record_count and bounds describe content that no longer exists there — the original
-	// #1092 symptom.
-	//
-	// Best-effort for the retention case: a failure doesn't undo the successful reconcile, and
-	// the next pass retries. NOT best-effort for the floor — see the expireOK handling below,
-	// because only a pass that removes something asks to floor, so there may be no next pass.
-	committed, expireOK := e.expireSnapshots(ctx, committed, database, measurement, expireModeFor(len(toRemove)))
-	hintOK = e.writeVersionHint(ctx, committed) && !e.hintFailed()
-	if err := e.fencedErr(); err != nil {
-		return false, err
-	}
-	e.pruneOldVersionFiles(ctx, committed)
-	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
-	// reachability is the one this pass settled on, not one version stale.
-	e.sweepOrphanMetadata(ctx, committed)
-	e.logger.Info().
-		Str("database", database).Str("measurement", measurement).
-		Int("added", len(toAdd)-len(rewritten)).Int("removed", len(toRemove)-len(rewritten)).
-		Int("reregistered", len(rewritten)).
-		Bool("hint_published", hintOK).
-		Bool("history_settled", expireOK).
-		Msg("Reconciled Iceberg table")
-	// A failed floor must not be cached as settled. The scheduler keys its skip gate on the
-	// value returned here, and only a pass that REMOVES a path asks to floor — so unlike the
-	// ordinary retention case there is no guarantee of a next pass to retry on: once the file
-	// set goes quiet the measurement is skipped entirely, leaving metadata that names deleted
-	// files. Reporting not-settled keeps the fingerprint uncached so the next tick re-drives
-	// this measurement, exactly as hintOK already does for a failed version hint.
-	return hintOK && expireOK, nil
 }
 
 // expireModeFor maps a pass's removal count onto the expiry mode. Separate so the tests can
@@ -1012,8 +853,8 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 const manifestCollapseThreshold = 12
 
 // shouldCollapse reports whether this pass should also collapse the table's manifest set.
-// liveAfter is the number of data files the pass is driving the table to — len(want) at the call
-// site, not the count it has now.
+// liveAfter is the number of data files the commit is driving the table to — the live count
+// after that commit (batched.go), not the count it has now.
 //
 // It reads the manifest list of the CURRENT snapshot: one local file open (Iceberg export requires
 // storage.backend="local"), uncached and side-effect free. It must be called before the pass
@@ -1287,6 +1128,14 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 // by more than one.
 // Best-effort; never deletes the current version.
 func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table) {
+	e.pruneOldVersionFilesFrom(ctx, tbl, -1)
+}
+
+// pruneOldVersionFilesFrom is pruneOldVersionFiles that also keeps every copy numbered keepFrom
+// or higher (keepFrom < 0: none extra). A pass of several commits passes its first version, so
+// the versions it claimed mid-pass (claimVersion) survive to the next pass instead of being
+// pruned the moment they were written: they are what a stale writer's commits collide with.
+func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.Table, keepFrom int) {
 	if e.backend == nil || e.retain <= 0 {
 		return
 	}
@@ -1335,7 +1184,7 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 	sort.Slice(vs, func(i, j int) bool { return vs[i].n > vs[j].n }) // descending
 	curN, _ := strconv.Atoi(cur)
 	for _, v := range vs[keep:] {
-		if v.n == curN {
+		if v.n == curN || (keepFrom >= 0 && v.n >= keepFrom) {
 			continue
 		}
 		if err := e.backend.Delete(ctx, v.key); err != nil {
@@ -1957,10 +1806,7 @@ func (e *Exporter) tableSeed(ctx context.Context, database, measurement string) 
 	if err != nil {
 		return ArcSchema{}, nil, false, err
 	}
-	for _, f := range tbl.Schema().Fields() {
-		sc.Fields = append(sc.Fields, ArcField{Name: f.Name, Type: f.Type})
-	}
-	return sc, files, true, nil
+	return arcSchemaOf(tbl), files, true, nil
 }
 
 // tableDataFiles returns the LIVE physical data-file paths in the table's current snapshot,

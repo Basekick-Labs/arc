@@ -2,6 +2,25 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Iceberg export registers a large measurement over several passes instead of never ([#1686](https://github.com/Basekick-Labs/arc/issues/1686))
+
+The first export of a measurement with many files (enabling Iceberg on an existing deployment, or recreating a table) read every new file's Parquet footer twice and then committed once, all inside the 2-minute per-measurement limit. A measurement too large for that, or on a slow or distant object store, never committed anything: each pass hit the limit, logged `context deadline exceeded`, and the next pass started from zero.
+
+New files are now committed in chunks of up to 256. Each chunk reads its own footers, adds any new columns to the table, and commits. A pass that runs out of time keeps every chunk it committed, and the next pass continues from what the table holds, including after a restart.
+
+- **Progress is not a failure.** A measurement that is still being registered is counted as `in_progress` in the pass summary, not `failed`. A pass that could not commit any chunk at all is still reported as `failed`, and does not bring the next pass forward. One Info line gives how many new files were registered and how many remain. The next pass starts after 30 seconds (or a tenth of `iceberg.reconcile_interval`, if larger) instead of the full interval.
+- **Newest files first.** Recent data is queryable first while older data is still being registered. While that is in progress, readers see a table with part of the measurement's history.
+- **Slow stores still converge.** When a chunk does not fit in the time left, it commits nothing, and the chunk size for that measurement halves, down to 8 files. The size doubles again after each chunk that finishes in under 15 seconds. The chunk size is kept in memory, so a restart starts again at 256.
+- **What changes together still commits together.** Removals, tier moves, files rewritten in place, and any new file in a UTC day that also loses a file all go in one commit, as before. Compaction (inputs out, output in) therefore never shows readers a day with its rows missing. Only new files with no removal in their day are chunked.
+- **Once per pass:** `version-hint.text`, snapshot expiry (beyond the history floor below), version-file pruning and the orphan sweep run after the pass's commits, not after each chunk. A chunk that adds columns still publishes the discovery files when it changes the schema, as before. In a pass of several commits, each one also writes its `v<N>.metadata.json` copy before the next, so a stale second writer on a shared bucket still collides with a published version and is stopped (#1609); those copies are kept until the next pass.
+- **A node that loses the writer role mid-pass** stops before its next commit, including a schema change, and writes nothing more.
+- **A table is never created before a footer is read.** Its `day(time)` partition comes from the schema of the first chunk, which is read first. If that read fails, no table is created.
+- **History floor retried.** The snapshot-history floor after a removal (#1092) is taken straight after the commit that removed the files, as before. If it fails, later passes now retry it until it succeeds, including passes with nothing to commit. Before, the retry pass took the "already converged" path, which never expired snapshots. The retry is remembered in memory, so it does not survive a restart.
+
+No configuration changes. The 2-minute per-measurement limit is unchanged: it now limits how much one pass does, not whether it can succeed.
+
+Approach and tests build on [#1704](https://github.com/Basekick-Labs/arc/pull/1704) by @kathennn.
+
 ## Fix: with the WAL on, a flush that fails part-way no longer stores some rows twice ([#1697](https://github.com/Basekick-Labs/arc/issues/1697))
 
 With the WAL on, a write whose rows span several hours is flushed as one Parquet file per hour, and each file is registered and its rows checkpointed in the WAL as soon as it is stored (#1492), so a failure later in the flush replays only the hours not yet written. That relies on the WAL's row checkpoint naming every row of the file. Some files hold rows it cannot name:
