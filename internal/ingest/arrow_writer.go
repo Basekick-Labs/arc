@@ -4797,13 +4797,16 @@ func (b *ArrowBuffer) computeNextFlushDeadline() time.Time {
 	maxAge := b.maxBufferAge
 	earliest := now.Add(maxAge) // default when no buffers exist
 
+	// A key whose previous aged write still runs is skipped by the sweep
+	// (#1695); counting it here would make the deadline now and spin
+	// periodicFlush. Its write's end nudges the loop instead. Read once, not
+	// per buffered key under every shard lock: almost always empty (nil). A
+	// key whose write ends after this read is covered by that nudge.
+	inFlight := b.agedInFlightKeys()
 	for _, shard := range b.shards {
 		shard.mu.RLock()
 		for key, startTime := range shard.bufferStartTimes {
-			// A key whose previous aged write still runs is skipped by the
-			// sweep (#1695); counting it here would make the deadline now and
-			// spin periodicFlush. Its write's end nudges the loop instead.
-			if b.agedKeyInFlight(key) {
+			if _, skip := inFlight[key]; skip {
 				continue
 			}
 			if expiry := startTime.Add(maxAge); expiry.Before(earliest) {
@@ -4968,6 +4971,21 @@ func (b *ArrowBuffer) extractAged(shard *bufferShard, shardIdx int, now time.Tim
 		b.agedInFlight[key] = struct{}{}
 		b.agedMu.Unlock()
 		out = append(out, agedFlush{e: e, key: key, database: parts[0], measurement: parts[1]})
+	}
+	return out
+}
+
+// agedInFlightKeys is a copy of the keys with an aged write in flight, nil
+// when there are none.
+func (b *ArrowBuffer) agedInFlightKeys() map[string]struct{} {
+	b.agedMu.Lock()
+	defer b.agedMu.Unlock()
+	if len(b.agedInFlight) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(b.agedInFlight))
+	for k := range b.agedInFlight {
+		out[k] = struct{}{}
 	}
 	return out
 }
