@@ -180,12 +180,16 @@ func (r *rig1686) hint() int {
 	return n
 }
 
-// A hint that lags the table (an earlier pass committed, then failed its hint write) names a
-// version readers still resolve; a converged heal pass keeps it.
-func TestHeal1097_LaggingHintVersionIsKept(t *testing.T) {
+// A hint that lags the table (an earlier pass committed, then failed its hint write): both the
+// version the hint named and the table's version at pass start are kept, even when the pass
+// publishes twice (both heals) so neither is in the retain+1 cushion any more.
+func TestHeal1097_LaggingHintAndLoadedVersionsAreKept(t *testing.T) {
 	r := newHealRig(t, 1)
 	files, sc := r.history(3)
-	top := r.commitDirect(iceberg.Properties{icetable.MetadataPreviousVersionsMaxKey: "5"})
+	top := r.commitDirect(iceberg.Properties{
+		icetable.DefaultNameMappingKey:          "[]",
+		icetable.MetadataPreviousVersionsMaxKey: "5",
+	})
 	lag := top - 1
 	if !slices.Contains(r.vCopies(), lag) {
 		t.Fatalf("setup: v%d not on disk (%v)", lag, r.vCopies())
@@ -197,8 +201,89 @@ func TestHeal1097_LaggingHintVersionIsKept(t *testing.T) {
 	if _, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, files); err != nil {
 		t.Fatal(err)
 	}
-	if got := r.vCopies(); !slices.Contains(got, lag) {
-		t.Fatalf("v<N> copies %v: v%d, which version-hint.text named when the pass started, was pruned", got, lag)
+	got := r.vCopies()
+	if got[len(got)-1] < top+2 {
+		t.Fatalf("v<N> copies %v: expected two heal publishes after v%d", got, top)
+	}
+	for _, v := range []int{lag, top} {
+		if !slices.Contains(got, v) {
+			t.Fatalf("v<N> copies %v: v%d (hint at pass start v%d, table v%d) was pruned", got, v, lag, top)
+		}
+	}
+}
+
+// A zero-commit pass that is not converged (every new file vanished) on a node that lost the
+// writer role publishes and prunes nothing.
+func TestHeal1097_LostWriterZeroCommitPassDoesNotPrune(t *testing.T) {
+	r := newHealRig(t, 10)
+	files, sc := r.history(4)
+	r.exp.retain = 1
+	gone := r.write(0, "gone")
+	removeFile1097(t, gone)
+	before, hintBefore := r.vCopies(), r.hint()
+	res, err := r.exp.reconcile(context.Background(), reconcileRequest{
+		database: "mydb", measurement: "cpu", schema: sc, current: append(files, gone),
+		unread: []FileRef{gone}, readSchemas: readLocal, exists: existsLocal,
+		canCommit: func() bool { return false },
+	})
+	if err != nil || res.commits != 0 {
+		t.Fatalf("result %+v err %v; want no commit, no error", res, err)
+	}
+	if got := r.vCopies(); len(got) != len(before) {
+		t.Fatalf("v<N> copies %v (before %v): a node that lost the writer role pruned or published", got, before)
+	}
+	if h := r.hint(); h != hintBefore {
+		t.Fatalf("version-hint moved %d -> %d on a node that lost the writer role", hintBefore, h)
+	}
+}
+
+func removeFile1097(t *testing.T, f FileRef) {
+	t.Helper()
+	if err := os.Remove(f.LocalPath); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The name-mapping heal is gated on the writer role too.
+func TestHeal1097_LostWriterSkipsTheNameMappingHeal(t *testing.T) {
+	r := newHealRig(t, 3)
+	files, sc := r.history(2)
+	r.commitDirect(iceberg.Properties{icetable.DefaultNameMappingKey: "[]"})
+	before, hintBefore := r.vCopies(), r.hint()
+	if _, err := r.exp.reconcile(context.Background(), reconcileRequest{
+		database: "mydb", measurement: "cpu", schema: sc, current: files,
+		canCommit: func() bool { return false },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, h := r.vCopies(), r.hint(); len(got) != len(before) || h != hintBefore {
+		t.Fatalf("copies %v hint %d (before %v, %d): a node that lost the writer role healed the name mapping", got, h, before, hintBefore)
+	}
+}
+
+// Every version this pass wrote to version-hint.text is kept by its prune: a reader may have
+// resolved any of them (two heals publish before the data commits and the final publish).
+func TestHeal1097_VersionsHintedDuringThePassAreKept(t *testing.T) {
+	r := newHealRig(t, 1)
+	r.exp.chunkMax = 1
+	files, sc := r.history(3)
+	start := r.commitDirect(iceberg.Properties{
+		icetable.DefaultNameMappingKey:          "[]",
+		icetable.MetadataPreviousVersionsMaxKey: "5",
+	})
+	n1, n2 := r.write(1, "n1"), r.write(1, "n2")
+	files = append(files, n1, n2)
+	if _, err := r.exp.reconcile(context.Background(), reconcileRequest{
+		database: "mydb", measurement: "cpu", schema: sc, current: files,
+		unread: []FileRef{n1, n2}, readSchemas: readLocal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := r.vCopies()
+	for _, v := range []int{start + 1, start + 2} { // the two heals' hints
+		if !slices.Contains(got, v) {
+			t.Fatalf("v<N> copies %v: v%d, which version-hint.text named during the pass, was pruned", got, v)
+		}
 	}
 }
 

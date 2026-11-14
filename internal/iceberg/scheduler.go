@@ -407,10 +407,11 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			s.state[key] = measurementState{fingerprint: fp}
 			return outcomeUnchanged, nil
 		}
-		settled, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, ArcSchema{}, nil)
+		res, err := s.exporter.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: s.canRun})
 		if err != nil {
 			return outcomeUnchanged, err
 		}
+		settled := res.settled
 		s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
 			Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
 		// Cache the empty state (nil schema/localFiles) so a permanently-empty
@@ -523,6 +524,11 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// retention properties) that failed (#1098). All need the same retry, so this does not name
 	// one — a message claiming the hint when the expiry failed would send an operator to the
 	// wrong place.
+	if res.writerLost {
+		// Not a failed step: the exporter logged that the writer role moved; nothing to retry here.
+		delete(s.state, key)
+		return outcomeReconciled, nil
+	}
 	if !res.settled {
 		delete(s.state, key)
 		s.logger.Warn().

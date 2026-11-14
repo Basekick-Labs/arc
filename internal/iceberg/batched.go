@@ -96,6 +96,8 @@ type reconcileResult struct {
 	commits int
 	// droppedCold: a file left behind was on the cold tier, whose listing is cached.
 	droppedCold bool
+	// writerLost: the converged branch stopped because this node is no longer the writer.
+	writerLost bool
 }
 
 // ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
@@ -288,7 +290,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		if !canCommit() {
 			e.logger.Info().Str("database", database).Str("measurement", measurement).
 				Msg("Iceberg reconcile: this node stopped being the writer during the pass; published and pruned nothing, the new writer settles the table")
-			return reconcileResult{schema: arcSchemaOf(tbl)}, nil
+			return reconcileResult{schema: arcSchemaOf(tbl), writerLost: true}, nil
 		}
 		tbl, ok, err := e.finishPass(ctx, tbl, tkey, database, measurement, 0, -1)
 		if err != nil {
@@ -539,6 +541,12 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	// A node that lost the writer role mid-pass writes nothing more: no expiry commit, no
 	// discovery files, no prune or sweep. The new writer's pass reconciles from the table.
 	finishedOK := false
+	if stopReason != stopWriterLost && commits == 0 && !canCommit() {
+		// Nothing committed and the writer role is gone (a pass whose files all vanished, whose
+		// days were all deferred, or that ran out of time before a commit): publish and prune
+		// nothing, as on the converged branch (#1097).
+		stopReason = stopWriterLost
+	}
 	if stopReason != stopWriterLost {
 		tbl, finishedOK, err = e.finishPass(ctx, tbl, tkey, database, measurement, commits, passStart)
 		if err != nil {
@@ -641,22 +649,29 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	case commits > 0:
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, retainConfigured)
 	}
-	published := e.writeVersionHint(ctx, tbl) && !e.hintFailed()
+	wrote := e.writeVersionHint(ctx, tbl)
+	published := wrote && !e.hintFailed()
 	if err := e.fencedErr(); err != nil {
 		return tbl, false, err
 	}
-	// Every pass that published, including one with no data commit: a heal or a schema evolution
-	// in EnsureTable publishes its own v<N> copy, and a converged pass used to leave it over the
-	// retain+1 bound until some later pass committed data (#1097). Not after a failed publish:
-	// the hint may still name a version this prune would delete. A zero-commit pass pays one LIST
-	// of the metadata directory for it (the orphan sweep, when on, lists it too).
-	if published {
-		loaded, hint := e.passStartVersions()
-		e.pruneOldVersionFilesFrom(ctx, tbl, passStart, loaded, hint)
+	// Every pass whose final publish landed, including one with no data commit: a heal or a schema
+	// evolution in EnsureTable publishes its own v<N> copy, and a converged pass used to leave it
+	// over the retain+1 bound until some later pass committed data (#1097). Not when that publish
+	// failed: the hint may still name a version this prune would delete (an earlier failed hint
+	// write in the pass does not matter once this one landed). Not when the pass-start hint could
+	// not be read, nor on a node that is no longer the writer: its view is stale, and the new
+	// writer's claimed versions are protected only by that writer's own prune. Every version this
+	// pass wrote to the hint is kept too. A zero-commit pass pays one LIST of the metadata
+	// directory for it (the orphan sweep, when on, lists it too).
+	mayCommit := e.passMayCommit()
+	if protect, ok := e.protectedVersions(); wrote && ok && mayCommit {
+		e.pruneOldVersionFilesFrom(ctx, tbl, passStart, protect...)
 	}
 	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
 	// reachability is the one this pass settled on, not one version stale.
-	e.sweepOrphanMetadata(ctx, tbl)
+	if mayCommit {
+		e.sweepOrphanMetadata(ctx, tbl)
+	}
 	return tbl, published && expireOK, nil
 }
 

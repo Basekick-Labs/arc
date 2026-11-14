@@ -121,6 +121,12 @@ type Exporter struct {
 	// committed (-1: not known). A reader may be resolving either, so the end-of-pass prune never
 	// deletes them (#1097). They differ when an earlier pass committed but failed its hint write.
 	passLoaded, passHint int
+	// passHintUnknown: version-hint.text could not be read at pass start, so the version a
+	// reader may be resolving is unknown and this pass prunes nothing (#1097).
+	passHintUnknown bool
+	// passHints are the versions this pass wrote to version-hint.text (heals, evolutions, the
+	// end-of-pass publish). A reader may have resolved any of them, so none is pruned this pass.
+	passHints []int
 	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
 	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
 	// nil outside a reconcile (always allowed).
@@ -166,7 +172,25 @@ func (e *Exporter) resetHintFailure() {
 	e.fenced = nil
 	e.healFailure = false
 	e.passLoaded, e.passHint = -1, -1
+	e.passHintUnknown = false
+	e.passHints = e.passHints[:0]
 	e.hintFailMu.Unlock()
+}
+
+// notePublishedHint records a version this pass wrote to version-hint.text.
+func (e *Exporter) notePublishedHint(v int) {
+	e.hintFailMu.Lock()
+	e.passHints = append(e.passHints, v)
+	e.hintFailMu.Unlock()
+}
+
+// protectedVersions returns every version this pass's prune must keep (see passLoaded, passHint,
+// passHints), and ok=false when the pass-start hint could not be read (prune nothing).
+func (e *Exporter) protectedVersions() (vs []int, ok bool) {
+	e.hintFailMu.Lock()
+	defer e.hintFailMu.Unlock()
+	vs = append([]int{e.passLoaded, e.passHint}, e.passHints...)
+	return vs, !e.passHintUnknown
 }
 
 // setPassGate installs (or, with nil, removes) the current reconcile's canCommit.
@@ -215,26 +239,18 @@ func (e *Exporter) notePassStart(ctx context.Context, tbl *icetable.Table) {
 	if seen {
 		return
 	}
-	loaded, hint := e.metadataVersion(tbl), -1
+	loaded, hint, unknown := e.metadataVersion(tbl), -1, false
 	if e.backend != nil {
 		if _, dirKey, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation()); ok && dirKey != "" && dirKey != "." {
-			if n, err := e.readHint(ctx, dirKey); err == nil {
-				hint = n
-			}
+			n, err := e.readHint(ctx, dirKey) // -1, nil when there is no hint
+			hint, unknown = n, err != nil
 		}
 	}
 	e.hintFailMu.Lock()
 	if e.passLoaded < 0 {
-		e.passLoaded, e.passHint = loaded, hint
+		e.passLoaded, e.passHint, e.passHintUnknown = loaded, hint, unknown
 	}
 	e.hintFailMu.Unlock()
-}
-
-// passStartVersions returns the versions notePassStart recorded (-1 when unknown).
-func (e *Exporter) passStartVersions() (loaded, hint int) {
-	e.hintFailMu.Lock()
-	defer e.hintFailMu.Unlock()
-	return e.passLoaded, e.passHint
 }
 
 // fencedErr returns the fence refusal recorded since the last reset, if any.
@@ -695,7 +711,7 @@ func (e *Exporter) setNameMappingFromSchema(ctx context.Context, tbl *icetable.T
 func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*icetable.Table, error) {
 	before := tbl.Properties()[icetable.DefaultNameMappingKey]
 	if nm, err := json.Marshal(tbl.Schema().NameMapping()); err == nil && (string(nm) == before || string(nm) == "null") {
-		return tbl, nil // nothing to heal (the null case is setNameMappingFromSchema's warning)
+		return tbl, nil // nothing to heal (an empty "null" mapping is never written; see setNameMappingFromSchema)
 	}
 	if !e.passMayCommit() {
 		return tbl, nil // lost the writer role mid-pass: the new writer heals (#1097)
@@ -1690,6 +1706,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	if okAll {
 		e.markPublished(tbl.Identifier(), metaLoc)
 		e.clearDropMarker(ctx, tbl.Identifier())
+		if n, err := strconv.Atoi(version); err == nil {
+			e.notePublishedHint(n)
+		}
 	}
 	return okAll
 }
