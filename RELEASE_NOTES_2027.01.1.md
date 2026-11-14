@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Iceberg export no longer fails a measurement because compaction deleted a file mid-pass ([#1706](https://github.com/Basekick-Labs/arc/pull/1706))
+
+Compaction, a `DELETE`, retention and tier moves delete data files while an Iceberg export pass may be reading them. Two things then failed the measurement, logged at Error and counted as `failed`, until the next pass on the full interval:
+
+- the listing kept changing under every attempt (`kept changing under the listing … keeping the previous snapshot this pass`);
+- a file listed a moment earlier was gone when its Parquet footer was read (`NoSuchKey`, `no such file`).
+
+Compaction's minimum ages keep it away from files that are still being written. They do not keep it away from the export, and the first export of an existing backlog covers exactly the older days daily compaction picks. Seen in testing against S3 with a daily compaction cycle running during a first registration.
+
+A measurement in that state is now reported as `busy`: a new count in the pass summary, logged at Info, and the next pass comes early, as for `in_progress` (after 30 seconds at the default `iceberg.reconcile_interval`).
+
+- **The listing check is unchanged.** A set listed while files were vanishing is still never exported: the vanished file's rows may be in a file that listing missed. Only how it is reported changed.
+- **A file that disappears after the listing** is confirmed with its own storage backend (the cold tier for a cold file) before anything is decided. A read error on a file that still exists, or any other read error, fails the measurement as before.
+- **New files:** the vanished file's whole UTC day is left for the next pass; the day's other new files are, almost always, inputs of the same compaction about to be deleted too. The rest of the pass registers as usual. These files were not in the table, so readers lose nothing.
+- **A day the pass was also removing files from** (a compaction output, a rewrite, a tier move) is left exactly as the table has it, removals included, and the other days commit. A day is never split, so readers never see a compacted day with rows missing. If any file in that commit has a path outside the `year/month/day` layout, the whole commit waits for the next pass instead.
+- A pass that left anything behind is never cached as settled, so the next pass lists again.
+- **Still visible if it does not clear.** A measurement that stays busy, with nothing committed or settled, for 30 minutes is logged at Warn and counted as `failed`, and no longer brings passes forward. The clock is kept in memory: a restart or writer failover starts it again.
+
+No configuration changes.
+
 ## Fix: Iceberg export registers a large measurement over several passes instead of never ([#1686](https://github.com/Basekick-Labs/arc/issues/1686))
 
 The first export of a measurement with many files (enabling Iceberg on an existing deployment, or recreating a table) read every new file's Parquet footer twice and then committed once, all inside the 2-minute per-measurement limit. A measurement too large for that, or on a slow or distant object store, never committed anything: each pass hit the limit, logged `context deadline exceeded`, and the next pass started from zero.

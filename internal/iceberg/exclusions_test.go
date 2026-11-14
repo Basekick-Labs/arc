@@ -180,8 +180,8 @@ func TestFilesAndLocal_ChurnFailsTheMeasurement(t *testing.T) {
 		n++
 		return nil, nil
 	})
-	if _, _, err := src.FilesAndLocal(ctx, cpu); err == nil || !strings.Contains(err.Error(), "kept changing") {
-		t.Fatalf("err = %v, want the churn error", err)
+	if _, _, err := src.FilesAndLocal(ctx, cpu); err == nil || !strings.Contains(err.Error(), "kept changing") || !errors.Is(err, errSourcesMoving) {
+		t.Fatalf("err = %v, want the churn error, marked as sources moving (reported busy)", err)
 	}
 	if n != vanishRetries {
 		t.Fatalf("listed %d times, want %d", n, vanishRetries)

@@ -347,9 +347,11 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 			return files, local, nil
 		}
 		if attempt == vanishRetries {
+			// Busy, not failed (vanished.go): a writer path is rewriting the measurement. The
+			// guard itself is unchanged; only how the scheduler reports it.
 			return nil, nil, fmt.Errorf(
-				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass",
-				m.Database, m.Measurement, len(vanished), attempt)
+				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass: %w",
+				m.Database, m.Measurement, len(vanished), attempt, errSourcesMoving)
 		}
 		prev = vanished
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("vanished", len(vanished)).
@@ -658,15 +660,34 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	return files, local, vanished, nil
 }
 
+// FileExists reports whether a listed file is still in storage, asked through the backend that
+// holds it: the cold tier for a cold file, this node's disk for a local one, the primary store
+// otherwise. The reconcile asks it after a footer read fails with a not-found (vanished.go), so a
+// file is only ever treated as deleted on its own backend's word.
+func (s *StorageWalkSource) FileExists(ctx context.Context, f FileRef) (bool, error) {
+	if f.Cold {
+		if s.cold == nil {
+			return false, fmt.Errorf("cold file %s listed with no cold tier configured", f.Key)
+		}
+		size, err := s.cold.backend.StatFile(ctx, f.Key)
+		if err != nil {
+			return false, err
+		}
+		return size >= 0, nil
+	}
+	_, present, err := s.statSize(ctx, f.Key, f.LocalPath)
+	return present, err
+}
+
 // statSize returns the file's current byte size, which the reconciler needs
 // for a file rewritten at its own path (#633). Since #1073 the delete API's
 // partial-match branch publishes a fresh path instead, but restores and
 // edge-sync still write a known path, and only the size tells that
 // content apart from what the Iceberg manifest describes.
-// present=false means the file is gone. Local files are stat'ed directly; a
-// backend that is not an object store (objectLister) but has no local path
-// answers through StatFile. Object stores never get here: their size comes
-// from the listing.
+// present=false means the file is gone. Local files are stat'ed directly;
+// anything else answers through the backend's StatFile. The listing never
+// sends an object store here (its size comes from the listing itself), but
+// FileExists does, for one file whose footer read came back not-found.
 func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string) (size int64, present bool, err error) {
 	if localPath != "" {
 		st, err := os.Stat(localPath)

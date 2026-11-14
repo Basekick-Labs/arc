@@ -71,6 +71,9 @@ type reconcileRequest struct {
 	// canCommit is checked immediately before every commit (#939: the writer lease can move
 	// during a long pass). nil means always.
 	canCommit func() bool
+	// exists reports whether a listed file is still in storage, asked through the file's own
+	// backend (vanished.go). nil turns vanished-file handling off: a read error is the pass's.
+	exists func(ctx context.Context, f FileRef) (bool, error)
 }
 
 // reconcileResult reports what one reconcile did.
@@ -85,6 +88,13 @@ type reconcileResult struct {
 	registered, remaining int
 	// schema is the table's schema when the pass ended.
 	schema ArcSchema
+	// moved: source files disappeared during the pass, and new files or whole days were left for
+	// the next pass (vanished.go). Never settled.
+	moved bool
+	// commits is how many data commits the pass made.
+	commits int
+	// droppedCold: a file left behind was on the cold tier, whose listing is cached.
+	droppedCold bool
 }
 
 // ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
@@ -128,6 +138,28 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		return reconcileResult{}, fmt.Errorf("reconcile %s.%s: %d files have no schema and no reader", database, measurement, len(unread))
 	}
 
+	// Files that disappeared during the pass, and every new file left for the next pass with them
+	// (vanished.go).
+	probe := newProbe(req.exists, req.current)
+	refOf := make(map[string]FileRef, len(req.current))
+	for _, f := range req.current {
+		refOf[f.PhysicalPath] = f
+	}
+	var (
+		moved       bool
+		droppedCold bool
+		deferredNew int
+		leftBehind  = make(map[string]struct{})
+	)
+	leave := func(paths []string) {
+		for _, p := range paths {
+			leftBehind[p] = struct{}{}
+			if refOf[p].Cold {
+				droppedCold = true
+			}
+		}
+	}
+
 	// A table that does not exist yet is created from sc, and its day(time) partition spec is
 	// taken from sc's time column (EnsureTable). Never create it from a schema that has read no
 	// footer at all: a table created without its spec cannot get one later, and cloneDataFile
@@ -139,26 +171,51 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			return reconcileResult{}, err
 		}
 		if !exists {
-			first := append([]FileRef(nil), req.unread...)
-			sortNewestFirst(first, func(f FileRef) string { return chunkSortKey(f.Key, f.PhysicalPath) })
-			first = first[:min(e.chunkSizeFor(tkey), len(first))]
-			// Under the chunk budget like any other chunk, and shrunk the same way when it does
-			// not fit: a new table on a store too slow for a full first chunk must converge too.
-			cctx, cancel := e.chunkContext(ctx)
-			add, err := req.readSchemas(cctx, first)
-			expired := errors.Is(cctx.Err(), context.DeadlineExceeded)
-			cancel()
-			if err != nil {
-				if ctx.Err() == nil && expired && errors.Is(err, context.DeadlineExceeded) {
-					e.shrinkChunk(tkey)
+			candidates := append([]FileRef(nil), req.unread...)
+			sortNewestFirst(candidates, func(f FileRef) string { return chunkSortKey(f.Key, f.PhysicalPath) })
+			for round := 1; ; round++ {
+				first := candidates[:min(e.chunkSizeFor(tkey), len(candidates))]
+				if len(first) == 0 {
+					// Every new file vanished before its footer was read: there is nothing to
+					// create the table from, and nothing is created. The next listing has the
+					// files that replaced them.
+					return reconcileResult{moved: true, droppedCold: droppedCold}, nil
 				}
-				return reconcileResult{}, err
-			}
-			if sc, err = MergeSchemas(sc, add); err != nil {
-				return reconcileResult{}, err
-			}
-			for _, f := range first {
-				delete(unread, f.PhysicalPath)
+				// Under the chunk budget like any other chunk, and shrunk the same way when it
+				// does not fit: a new table on a store too slow for a full first chunk must
+				// converge too.
+				cctx, cancel := e.chunkContext(ctx)
+				add, err := req.readSchemas(cctx, first)
+				expired := errors.Is(cctx.Err(), context.DeadlineExceeded)
+				cancel()
+				if err != nil {
+					if ctx.Err() == nil && expired && errors.Is(err, context.DeadlineExceeded) {
+						e.shrinkChunk(tkey)
+						return reconcileResult{}, err
+					}
+					err = explainRead(ctx, err, refPaths(first), probe)
+					var ve *vanishedErr
+					if !errors.As(err, &ve) {
+						return reconcileResult{}, err
+					}
+					// No table yet, so nothing is removed and every file is a free add: leaving
+					// the vanished files' days for the next pass loses no reader anything.
+					moved = true
+					kept, dropped := dropVanished(refPaths(candidates), ve.paths, database, measurement)
+					leave(dropped)
+					if round >= maxVanishRounds {
+						return reconcileResult{moved: true, droppedCold: droppedCold}, nil
+					}
+					candidates = keepRefs(candidates, kept)
+					continue
+				}
+				if sc, err = MergeSchemas(sc, add); err != nil {
+					return reconcileResult{}, err
+				}
+				for _, f := range first {
+					delete(unread, f.PhysicalPath)
+				}
+				break
 			}
 		}
 	}
@@ -243,6 +300,18 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		return reconcileResult{}, err
 	}
 	anchored, free := splitAnchored(toBuild, toRemove, database, measurement)
+	if len(leftBehind) > 0 {
+		// Left behind by the first read of a new table (above): only free adds exist then.
+		kept := free[:0]
+		for _, p := range free {
+			if _, left := leftBehind[p]; left {
+				deferredNew++
+				continue
+			}
+			kept = append(kept, p)
+		}
+		free = kept
+	}
 	sortNewestFirst(free, func(p string) string { return chunkSortKey(keyOf[p], p) })
 	newFiles := len(toAdd) - len(rewritten) - len(cloned)
 
@@ -293,17 +362,53 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	if len(removes) > 0 || len(cloned) > 0 || len(anchored) > 0 {
 		var built []iceberg.DataFile
 		var skipped []string
-		tbl, sc, built, skipped, err = e.prepareChunk(ctx, ctx, tbl, sc, anchored, unread, req.readSchemas, want, canCommit)
+		for round := 1; ; round++ {
+			tbl, sc, built, skipped, err = e.prepareChunk(ctx, ctx, tbl, sc, anchored, unread, req.readSchemas, want, canCommit, probe)
+			var ve *vanishedErr
+			if !errors.As(err, &ve) {
+				break
+			}
+			if fe := e.fencedErr(); fe != nil {
+				return reconcileResult{}, fe
+			}
+			// A file of this commit vanished: defer its whole day — removals, tier moves, new
+			// files — exactly as the table has it, and commit the other days (vanished.go). A day
+			// that cannot be read from a key, or a third round, defers every day of the commit.
+			moved = true
+			days, byDay := daysOfPaths(ve.paths, database, measurement)
+			if !byDay || round >= maxVanishRounds || anyUnknownDay(toRemove, database, measurement) ||
+				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) {
+				days = nil
+			}
+			leave(ve.paths) // only for the cold-listing flag: commit 0 is already split from the free set
+			// A round whose schemas were read before a DataFile build failed has already evolved
+			// the table with the deferred day's columns. Harmless: columns are only ever added,
+			// all optional, and the deferred files are registered against them next pass.
+			var n int
+			n, toRemove, removes, rewritten, cloned, anchored = deferDays(days, live, toRemove, rewritten, cloned, anchored, database, measurement)
+			deferredNew += n
+			if len(removes)+len(cloned)+len(anchored) == 0 {
+				err, built, skipped = nil, nil, nil
+				break
+			}
+		}
 		if errors.Is(err, errWriterLost) {
 			stopReason = stopWriterLost
 			err = nil
 		} else if err != nil {
+			if fe := e.fencedErr(); fe != nil {
+				return reconcileResult{}, fe
+			}
 			return reconcileResult{}, err
 		}
 		skippedAll = append(skippedAll, skipped...)
 		adds := append(cloned, built...)
-		// len(adds)+len(removes) > 0 here: an anchored add or a clone exists only beside a removal.
-		if !canCommit() {
+		// An anchored add or a clone exists only beside a removal in its day, and deferDays takes a
+		// day whole (everything, when any path's day is unreadable), so a non-empty commit always
+		// has a removal.
+		if len(adds)+len(removes) == 0 {
+			// Every day of this commit was deferred: nothing to commit.
+		} else if !canCommit() {
 			stopReason = stopWriterLost
 		} else {
 			if err := commit(removes, adds); err != nil {
@@ -334,6 +439,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	// time left. A chunk that runs out of time commits nothing and ends the pass; the next one
 	// continues with a smaller chunk.
 	var lastDur time.Duration
+	vanishRounds := 0
 	for len(free) > 0 && stopReason == "" {
 		if !e.timeForChunk(ctx, lastDur) {
 			stopReason = "measurement deadline"
@@ -344,13 +450,32 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		start := time.Now()
 		var built []iceberg.DataFile
 		var skipped []string
-		tbl, sc, built, skipped, err = e.prepareChunk(cctx, ctx, tbl, sc, batch, unread, req.readSchemas, want, canCommit)
+		tbl, sc, built, skipped, err = e.prepareChunk(cctx, ctx, tbl, sc, batch, unread, req.readSchemas, want, canCommit, probe)
 		// Read before cancel(), which would set it on every path.
 		chunkExpired := errors.Is(cctx.Err(), context.DeadlineExceeded)
 		cancel()
 		if errors.Is(err, errWriterLost) {
 			stopReason = stopWriterLost
 			break
+		}
+		var ve *vanishedErr
+		if errors.As(err, &ve) {
+			if fe := e.fencedErr(); fe != nil {
+				return reconcileResult{}, fe
+			}
+			// New files only, none in the table: leave the vanished files' days for the next pass
+			// and go on with the rest (vanished.go).
+			moved = true
+			var dropped []string
+			free, dropped = dropVanished(free, ve.paths, database, measurement)
+			leave(dropped)
+			deferredNew += len(dropped)
+			vanishRounds++
+			if vanishRounds >= maxVanishRounds {
+				stopReason = stopSourcesMoving
+				break
+			}
+			continue
 		}
 		if err != nil {
 			if fe := e.fencedErr(); fe != nil {
@@ -407,16 +532,17 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		}
 	}
 	partial := len(free) > 0 && loopErr == nil
-	remaining := len(free)
-	if partial && commits == 0 && stopReason != stopWriterLost {
+	remaining := len(free) + deferredNew
+	if partial && commits == 0 && stopReason != stopWriterLost && !moved {
 		// Nothing landed: no time was left for even one chunk (the listing and the table seed
 		// took the deadline), or the smallest chunk still did not fit. That is not progress, and
 		// reporting it as in_progress would also bring every later pass forward to the short
-		// retry interval. A failure, on the normal interval, with the chunk already shrunk.
+		// retry interval. A failure, on the normal interval, with the chunk already shrunk. (A
+		// pass whose files vanished is busy instead, whatever is left: vanished.go.)
 		loopErr = fmt.Errorf("no time left in this pass to register any of %d new files (%s); the next pass retries with chunks of %d", remaining, stopReason, e.chunkSizeFor(tkey))
 		partial = false
 	}
-	if stopReason != "" && commits == 0 && len(removes)+len(cloned)+len(anchored) > 0 {
+	if stopReason == stopWriterLost && commits == 0 && len(removes)+len(cloned)+len(anchored) > 0 {
 		// The first commit itself was refused (writer role): nothing of this pass landed.
 		partial, remaining = true, newFiles
 	}
@@ -437,11 +563,20 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			Str("stopped", stopReason).
 			Msg("Iceberg: registered part of this measurement's new files; the next pass continues from the table")
 	}
+	if moved {
+		e.logger.Info().
+			Str("database", database).Str("measurement", measurement).
+			Int("registered", registered).Int("left_for_next_pass", deferredNew).
+			Msg("Iceberg: source files disappeared during this pass (a compaction, delete or retention is rewriting this measurement); what they touched is left for the next pass")
+	}
 	res := reconcileResult{
-		partial:    partial,
-		registered: registered,
-		remaining:  remaining,
-		schema:     arcSchemaOf(tbl),
+		partial:     partial,
+		registered:  registered,
+		remaining:   remaining,
+		schema:      arcSchemaOf(tbl),
+		moved:       moved,
+		commits:     commits,
+		droppedCold: droppedCold,
 	}
 	if loopErr != nil {
 		return res, loopErr
@@ -449,7 +584,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	// A failed floor must not be cached as settled. The scheduler keys its skip gate on this
 	// value; reporting not-settled keeps the fingerprint uncached so the next tick re-drives the
 	// measurement, and finishPass retries the owed floor there even if that pass removes nothing.
-	res.settled = !partial && hintOK && finishedOK
+	res.settled = !partial && !moved && hintOK && finishedOK
 	return res, nil
 }
 
@@ -515,7 +650,7 @@ var errWriterLost = errors.New("iceberg: this node is no longer the writer")
 // A schema evolution is a commit, and it publishes the discovery files (evolveSchema), so it is
 // gated like the data commits: errWriterLost when canCommit is false, and the fence is checked
 // straight after it.
-func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetable.Table, sc ArcSchema, paths []string, unread map[string]FileRef, readSchemas func(context.Context, []FileRef) (ArcSchema, error), want map[string]int64, canCommit func() bool) (*icetable.Table, ArcSchema, []iceberg.DataFile, []string, error) {
+func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetable.Table, sc ArcSchema, paths []string, unread map[string]FileRef, readSchemas func(context.Context, []FileRef) (ArcSchema, error), want map[string]int64, canCommit func() bool, probe probeFunc) (*icetable.Table, ArcSchema, []iceberg.DataFile, []string, error) {
 	if len(paths) == 0 {
 		return tbl, sc, nil, nil, nil
 	}
@@ -528,7 +663,9 @@ func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetabl
 	if len(toRead) > 0 {
 		add, err := readSchemas(readCtx, toRead)
 		if err != nil {
-			return tbl, sc, nil, nil, err
+			// Only the two footer reads are explained as vanished files (vanished.go); a schema
+			// conflict, a schema commit or the fence below keep their own errors.
+			return tbl, sc, nil, nil, explainRead(commitCtx, err, refPaths(toRead), probe)
 		}
 		merged, err := MergeSchemas(sc, add)
 		if err != nil {
@@ -551,7 +688,7 @@ func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetabl
 	}
 	built, skipped, err := e.buildDataFiles(readCtx, tbl, paths, want)
 	if err != nil {
-		return tbl, sc, nil, nil, err
+		return tbl, sc, nil, nil, explainRead(commitCtx, err, paths, probe)
 	}
 	return tbl, sc, built, skipped, nil
 }
