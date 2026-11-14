@@ -95,6 +95,21 @@ type ambiguousWrite struct {
 	satisfiedAt time.Time // zero until need is empty
 	checks      int       // looks taken since satisfied
 	parents     int       // len(need) when recorded, for the ledger's bound
+	// A deferred hour file (#1697) is not a failed write: it is stored,
+	// unregistered, and possibly the only copy of its rows (a WAL that
+	// accepted an entry and then failed to write it). If its need is not met
+	// within maxAge, or by Close, register is called instead of letting it
+	// go untracked, which on a cluster would leave it an orphan the
+	// reconciliation sweep can delete. nil for a failed write.
+	register func(context.Context)
+	maxAge   time.Duration // 0: ambiguousWriteMaxAge
+}
+
+// unmetDeferred is a deferred file whose need was not met in time.
+type unmetDeferred struct {
+	path     string
+	size     int64
+	register func(context.Context)
 }
 
 type ambiguousLedger struct {
@@ -165,6 +180,11 @@ func rangeRows(ids []string) int {
 
 // addRange inserts r into sorted disjoint ranges, merging overlaps.
 func addRange(ranges []rowRange, r rowRange) []rowRange {
+	if n := len(ranges); n == 0 || ranges[n-1].end < r.start {
+		// After every range: the usual case, as rangesIn emits them in order
+		// (#1697: a deferred file's need can hold thousands).
+		return append(ranges, r)
+	}
 	out := make([]rowRange, 0, len(ranges)+1)
 	placed := false
 	for _, x := range ranges {
@@ -213,6 +233,16 @@ func subtractRange(ranges []rowRange, r rowRange) []rowRange {
 
 // record adds a failed write. Reports whether it was recorded.
 func (l *ambiguousLedger) record(path string, size int64, ids []string) bool {
+	return l.recordWith(path, size, ids, 0, nil)
+}
+
+// recordDeferred adds a deferred hour file of a part-failed flush (#1697),
+// with what registers it if its need is not met within maxAge.
+func (l *ambiguousLedger) recordDeferred(path string, size int64, ids []string, maxAge time.Duration, register func(context.Context)) bool {
+	return l.recordWith(path, size, ids, maxAge, register)
+}
+
+func (l *ambiguousLedger) recordWith(path string, size int64, ids []string, maxAge time.Duration, register func(context.Context)) bool {
 	if l == nil {
 		return false
 	}
@@ -228,7 +258,7 @@ func (l *ambiguousLedger) record(path string, size int64, ids []string) bool {
 	if len(l.entries) >= maxAmbiguousWrites || l.parents+len(need) > maxAmbiguousParents {
 		return false
 	}
-	e := &ambiguousWrite{path: path, size: size, need: need, recordedAt: l.now(), parents: len(need)}
+	e := &ambiguousWrite{path: path, size: size, need: need, recordedAt: l.now(), parents: len(need), register: register, maxAge: maxAge}
 	l.parents += len(need)
 	l.entries[path] = e
 	for parent := range need {
@@ -320,13 +350,21 @@ type ambiguousCheck struct {
 }
 
 // due returns the looks due now, and drops entries that expired unsatisfied.
-func (l *ambiguousLedger) due() (checks []ambiguousCheck, expired []string) {
+func (l *ambiguousLedger) due() (checks []ambiguousCheck, expired []string, unmet []unmetDeferred) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
 	for _, e := range l.entries {
-		if now.Sub(e.recordedAt) >= ambiguousWriteMaxAge {
-			expired = append(expired, e.path)
+		maxAge := ambiguousWriteMaxAge
+		if e.maxAge > 0 {
+			maxAge = e.maxAge
+		}
+		if e.satisfiedAt.IsZero() && now.Sub(e.recordedAt) >= maxAge || now.Sub(e.recordedAt) >= ambiguousWriteMaxAge {
+			if e.register != nil && e.satisfiedAt.IsZero() {
+				unmet = append(unmet, unmetDeferred{path: e.path, size: e.size, register: e.register})
+			} else {
+				expired = append(expired, e.path)
+			}
 			l.dropLocked(e)
 			continue
 		}
@@ -337,7 +375,7 @@ func (l *ambiguousLedger) due() (checks []ambiguousCheck, expired []string) {
 			checks = append(checks, ambiguousCheck{path: e.path, size: e.size})
 		}
 	}
-	return checks, expired
+	return checks, expired, unmet
 }
 
 // checked advances an entry past one look; drop ends it.
@@ -445,6 +483,74 @@ func (b *ArrowBuffer) noteFailedWrite(err error, need []string, ok bool) {
 	}
 }
 
+// deferredHandOver is a stored hour file a multi-hour flush deferred and then
+// left unregistered when a later hour failed (#1697), with the WAL identities
+// of every row it holds.
+type deferredHandOver struct {
+	path     string
+	size     int64
+	indices  []int                 // its rows: positions of the merged batch
+	register func(context.Context) // registers it, as the post-loop pass would
+}
+
+// deferredWriteMaxAge is how long a deferred file waits for replay to store
+// its rows before it is registered instead (#1697): several WAL recovery
+// passes (wal.recovery_interval_seconds, default 300) and well inside the
+// reconciliation sweep's default 24 h grace, so a file whose rows were never
+// replayed is registered before the sweep could take it for an orphan.
+const deferredWriteMaxAge = time.Hour
+
+// registerUnmetDeferred registers a deferred file whose rows were not seen
+// stored elsewhere, if it is still in storage at its size: it may be their
+// only copy. The cost is a possible duplicate, which is what registering it
+// as stored did before #1697.
+func (b *ArrowBuffer) registerUnmetDeferred(ctx context.Context, u unmetDeferred) {
+	sctx, cancel := context.WithTimeout(ctx, ambiguousStorageTimeout)
+	size, err := b.storage.StatFile(sctx, u.path)
+	cancel()
+	if err != nil && !storage.IsNotFound(err) {
+		b.logger.Error().Err(err).Str("storage_path", u.path).
+			Msg("Could not check a deferred hour file whose rows were not seen replayed; registering it, as it may be their only copy")
+	} else if size != u.size {
+		return // gone, or not this flush's bytes
+	}
+	rctx, cancel := context.WithTimeout(ctx, ambiguousStorageTimeout)
+	u.register(rctx)
+	cancel()
+	metrics.Get().IncIngestAmbiguousWritesAbandoned()
+	b.logger.Warn().Str("storage_path", u.path).
+		Msg("Registered a deferred hour file whose rows were not seen stored by WAL replay: it is kept as their copy; if replay stored them under another identity, they are stored twice")
+}
+
+// handOverDeferred gives a part-failed flush's deferred files to the ledger.
+// Each is unregistered and its rows are replayed into new files; the ledger
+// removes it once those rows are stored elsewhere, the same proof a
+// late-landing failed write needs (#1635). Never removed on less: the WAL may
+// have accepted an entry it then failed to write, and this file would be the
+// only copy. One that is not recorded (full ledger) stays: its rows are
+// stored twice after replay, as before #1697.
+func (b *ArrowBuffer) handOverDeferred(ctx context.Context, bufferKey string, spans *walRowSpans, files []deferredHandOver) {
+	if len(files) == 0 || b.wal == nil || b.ambiguous == nil {
+		return
+	}
+	recorded := 0
+	for _, f := range files {
+		need, ok := spans.deferredNeed(f.indices)
+		if ok && b.ambiguous.recordDeferred(f.path, f.size, need, deferredWriteMaxAge, f.register) {
+			metrics.Get().IncIngestAmbiguousWritesRecorded()
+			recorded++
+			continue
+		}
+		// Not tracked (the tracker is full): register it now, as before
+		// #1697, rather than leave a stored file unregistered.
+		f.register(ctx)
+		b.logger.Warn().Str("buffer_key", bufferKey).Str("storage_path", f.path).
+			Msg("Deferred hour file of a failed flush not tracked for cleanup (the tracker is full): registered instead; its rows are stored twice after WAL replay")
+	}
+	b.logger.Info().Str("buffer_key", bufferKey).Int("files", len(files)).Int("tracked", recorded).
+		Msg("Flush failed after storing deferred hour files: they stay unregistered and are removed once WAL replay has stored their rows")
+}
+
 // ambiguousSweeper removes late-landed copies of failed writes (#1635).
 func (b *ArrowBuffer) ambiguousSweeper() {
 	defer b.wg.Done()
@@ -465,7 +571,10 @@ func (b *ArrowBuffer) ambiguousSweeper() {
 
 // sweepAmbiguousWrites takes the looks that are due.
 func (b *ArrowBuffer) sweepAmbiguousWrites(ctx context.Context) {
-	checks, expired := b.ambiguous.due()
+	checks, expired, unmet := b.ambiguous.due()
+	for _, u := range unmet {
+		b.registerUnmetDeferred(ctx, u)
+	}
 	for _, path := range expired {
 		metrics.Get().IncIngestAmbiguousWritesAbandoned()
 		b.logger.Warn().Str("storage_path", path).
@@ -524,6 +633,25 @@ func (b *ArrowBuffer) closeAmbiguousWrites(budget time.Duration) {
 	if budget > 0 {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(b.ctx), budget)
 		b.sweepAmbiguousWrites(ctx)
+		cancel()
+	}
+	// A deferred file still waiting for its rows is registered now: the
+	// ledger does not outlive the process, and unregistered it would be an
+	// orphan after the restart (#1697).
+	b.ambiguous.mu.Lock()
+	var unmet []unmetDeferred
+	for _, e := range b.ambiguous.entries {
+		if e.register != nil && e.satisfiedAt.IsZero() {
+			unmet = append(unmet, unmetDeferred{path: e.path, size: e.size, register: e.register})
+			b.ambiguous.dropLocked(e)
+		}
+	}
+	b.ambiguous.mu.Unlock()
+	if len(unmet) > 0 {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(b.ctx), ambiguousStorageTimeout)
+		for _, u := range unmet {
+			b.registerUnmetDeferred(ctx, u)
+		}
 		cancel()
 	}
 	b.ambiguous.mu.Lock()

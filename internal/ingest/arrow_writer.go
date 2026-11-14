@@ -5554,8 +5554,16 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	if early {
 		writtenAt = make([]bool, len(times))
 	}
-	var cov *GroupCoverage // announced at the first stored hour
+	var cov *GroupCoverage // announced at the first stored hour, or after the loop
+	// Stored hour files whose registration waits for the last hour (#1697),
+	// with what replay must store before one of them may be removed.
+	var deferredStored []deferredHandOver
 	partial := func(err error) error {
+		// Before the early return: a flush that stored only deferred files
+		// must still hand them over (#1697).
+		hctx, hcancel := b.fileContext(context.WithoutCancel(ctx))
+		b.handOverDeferred(hctx, bufferKey, spans, deferredStored)
+		hcancel()
 		if storedFiles == 0 {
 			return err
 		}
@@ -5584,7 +5592,46 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	written := make([]tieringEntry, 0, len(hourBuckets))
 	flushCtx := ctx // the closure below shadows ctx with the hour file's
 
+	// Which hour files register as they are stored (#1492, #1693) and which
+	// wait for the last hour (#1697). With a WAL, a file registered early
+	// must have every row checkpointed with it: a row it holds that the
+	// checkpoint cannot name is replayed if a later hour fails, into a second
+	// file beside the registered one. Such a file is deferred: stored, not
+	// registered, no row checkpoint and no flush intent (an intent naming
+	// some of its rows would let recovery adopt it, skip those rows and keep
+	// the rest twice, #1646); registered after the last hour, before the
+	// flush's own checkpoint; and, if the flush fails part-way, handed to the
+	// ambiguous-write ledger (#1635), which removes it only once replay has
+	// stored every row it holds. Deferred only when that need can be named:
+	// a file with a row that has no WAL copy is that row's only copy, and a
+	// row whose record carries no tracked token (a content hash, an
+	// identity-less recovery replay) cannot be matched by replay; those files
+	// keep the early path and its at-least-once replay. Deferred hours are
+	// written last, so a failure on an early hour leaves nothing to hand over.
+	type hourPlan struct {
+		id       int64
+		bucket   *hourBucket
+		deferred bool
+	}
+	plans := make([]hourPlan, 0, len(hourBuckets))
 	for hourID, bucket := range hourBuckets {
+		hp := hourPlan{id: hourID, bucket: bucket}
+		if perHour {
+			// No allocation here: the checkpoint ranges are built per hour
+			// below, a deferred file's need only if the flush fails.
+			_, hp.deferred = spans.classifyHour(bucket.indices, maxRowCheckpointRanges)
+		}
+		plans = append(plans, hp)
+	}
+	sort.SliceStable(plans, func(i, j int) bool {
+		if plans[i].deferred != plans[j].deferred {
+			return !plans[i].deferred
+		}
+		return plans[i].id < plans[j].id
+	})
+
+	for _, hp := range plans {
+		hourID, bucket := hp.id, hp.bucket
 		// Stop between hour files once the flush is cancelled (Close() cancels
 		// flushParent when its budget runs out): LocalBackend.Write ignores its
 		// context, so without this the loop would keep storing files whose
@@ -5620,11 +5667,14 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			parquetSum := sha256.Sum256(parquetData)
 			parquetSumHex := hex.EncodeToString(parquetSum[:])
 
-			if perHour {
+			var ranges []string // the row checkpoint (early path, #1492)
+			if perHour && !hp.deferred {
+				ranges = spans.rangesIn(bucket.indices)
 				// Only with the row map: the file's own rows are named. Without
 				// it the flush's identities name rows of every hour file, and
-				// adopting one file would skip the others' rows (#1646).
-				b.recordFlushIntent(storagePath, int64(len(parquetData)), spans.rangesIn(bucket.indices))
+				// adopting one file would skip the others' rows (#1646). Never
+				// for a deferred file (above).
+				b.recordFlushIntent(storagePath, int64(len(parquetData)), ranges)
 			}
 			if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 				// The write may still land (#1635). With the row map, name this
@@ -5633,16 +5683,22 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				if perHour {
 					// Every row of the file named, or none: a row left out
 					// would be deleted with the file once the others are
-					// stored again. Empty is never recorded.
-					if fw.rows = spans.rangesIn(bucket.indices); rangeRows(fw.rows) != len(bucket.indices) {
-						fw.rows = []string{}
+					// stored again. Empty is never recorded. A deferred file
+					// is named by its need (#1697).
+					fw.rows = []string{}
+					if hp.deferred {
+						if need, ok := spans.deferredNeed(bucket.indices); ok {
+							fw.rows = need
+						}
+					} else if rangeRows(ranges) == len(bucket.indices) {
+						fw.rows = ranges
 					}
 				}
 				return partial(fw)
 			}
 			b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
-			if early {
+			if early && !hp.deferred {
 				if cov == nil {
 					cov = groupCoverage(group, len(hourBuckets)) // nil without coverage (always without a WAL)
 				}
@@ -5655,11 +5711,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				regCtx, cancelReg := b.fileContext(context.WithoutCancel(flushCtx))
 				b.registerFileInTiering(regCtx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex, cov.forFile(group.piecesAt(bucket.indices)))
 				cancelReg()
-				var ranges []string
 				checkpointed := false
 				if perHour {
 					b.syncRegistrations()
-					ranges = spans.rangesIn(bucket.indices)
 					b.ambiguous.stored(ranges) // #1635, as in completeFlush
 					checkpointed = b.checkpointRows(ctx, ranges)
 				}
@@ -5691,6 +5745,20 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				records:     splitRecordCount,
 				pieces:      group.piecesAt(bucket.indices),
 			})
+			if hp.deferred {
+				size := int64(len(parquetData))
+				deferredStored = append(deferredStored, deferredHandOver{
+					path: storagePath, size: size, indices: bucket.indices,
+					// Registers it as the post-loop pass would, without the
+					// flush's coverage group (long settled by then), if its
+					// rows are not seen replayed (deferredWriteMaxAge, Close)
+					// or the ledger cannot take it.
+					register: func(ctx context.Context) {
+						b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, size, parquetSumHex, nil)
+						b.syncRegistrations()
+					},
+				})
+			}
 
 			b.logger.Info().
 				Str("buffer_key", bufferKey).
@@ -5698,6 +5766,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				Int64("hour_id", hourID).
 				Int("records", splitRecordCount).
 				Int("size_bytes", len(parquetData)).
+				Bool("deferred", hp.deferred).
 				Msg("Wrote hour partition")
 			return nil
 		}(fileCtx)
@@ -5706,23 +5775,28 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		}
 	}
 
-	// All hours written successfully — now register in tiering and cluster manifest.
-	// (Already done per hour when early: written is then empty.)
+	// All hours written successfully — now register the files that waited:
+	// every file without a WAL row map, and the deferred ones (#1697). The
+	// flush's own sync and checkpoint follow in completeFlush (#1209).
 	totalWritten := storedRows
-	if !early {
-		cov = groupCoverage(group, len(written))
+	if cov == nil {
+		// Exactly once per flush: a group is announced by its first
+		// registration, and a flush whose every file was deferred registers
+		// none until here (#1697). groupCoverage mints a new group each call.
+		cov = groupCoverage(group, len(hourBuckets))
 	}
 	for _, e := range written {
-		fileCtx, cancelFile := b.fileContext(ctx) // #1692: each registration its own bound
-		b.registerFileInTiering(fileCtx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
-		cancelFile()
+		// Its own bound (#1692), and not cancelled with the flush: the file
+		// is stored and its rows are about to be checkpointed (#1698).
+		regCtx, cancelReg := b.fileContext(context.WithoutCancel(flushCtx))
+		b.registerFileInTiering(regCtx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
+		cancelReg()
 		totalWritten += e.records
 	}
 
-	if !early {
-		b.totalRecordsWritten.Add(int64(totalWritten))
-		b.totalFlushes.Add(int64(len(hourBuckets)))
-	}
+	// The early files counted themselves as they were stored.
+	b.totalRecordsWritten.Add(int64(totalWritten - storedRows))
+	b.totalFlushes.Add(int64(len(written)))
 	b.publishBufferMetrics()
 
 	flushDuration := time.Since(startTime)

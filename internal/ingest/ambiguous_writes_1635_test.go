@@ -418,13 +418,13 @@ func TestAmbiguousLedgerNeeds(t *testing.T) {
 		l := newAmbiguousLedger()
 		require.True(t, l.record("f", 1, []string{p, q}))
 		l.stored([]string{p})
-		checks, _ := l.due()
+		checks, _, _ := l.due()
 		require.Empty(t, checks)
 		l.stored([]string{rows(q, 0, 10)}) // a range never meets a whole need
-		checks, _ = l.due()
+		checks, _, _ = l.due()
 		require.Empty(t, checks)
 		l.stored([]string{q})
-		checks, _ = l.due()
+		checks, _, _ = l.due()
 		require.Len(t, checks, 1)
 	})
 
@@ -432,10 +432,10 @@ func TestAmbiguousLedgerNeeds(t *testing.T) {
 		l := newAmbiguousLedger()
 		require.True(t, l.record("f", 1, []string{rows(p, 0, 10), rows(p, 20, 30)}))
 		l.stored([]string{rows(p, 0, 5), rows(p, 25, 30)})
-		checks, _ := l.due()
+		checks, _, _ := l.due()
 		require.Empty(t, checks)
 		l.stored([]string{rows(p, 5, 25)})
-		checks, _ = l.due()
+		checks, _, _ = l.due()
 		require.Len(t, checks, 1)
 	})
 
@@ -443,7 +443,7 @@ func TestAmbiguousLedgerNeeds(t *testing.T) {
 		l := newAmbiguousLedger()
 		require.True(t, l.record("f", 1, []string{rows(p, 3, 7)}))
 		l.stored([]string{p})
-		checks, _ := l.due()
+		checks, _, _ := l.due()
 		require.Len(t, checks, 1)
 	})
 
@@ -454,7 +454,7 @@ func TestAmbiguousLedgerNeeds(t *testing.T) {
 		}
 		require.False(t, l.record("over", 1, []string{p}))
 		l.stored([]string{p})
-		checks, _ := l.due()
+		checks, _, _ := l.due()
 		require.Len(t, checks, maxAmbiguousWrites)
 	})
 }
