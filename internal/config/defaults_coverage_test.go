@@ -18,8 +18,9 @@ import (
 // default and the documented default cannot drift and the key is visible with the rest. The read
 // side is taken from the source: every dotted string literal passed to a method of the viper
 // (v.GetString("…"), v.InConfig("…")) or to a helper that takes it (parsePositiveDuration(v,
-// "…")). Keys built from a prefix are added by prefixedReads: loadEdgeSyncRelay's own fields, and
-// every field readObjectTarget reads (taken from its source) under each relay prefix. The default
+// "…")). Keys built from a prefix are added by prefixedReads: loadEdgeSyncRelay's own fields (per
+// side, checked against its source), and every field readObjectTarget reads (taken from its source
+// and checked against setObjectTargetDefaults) under each relay prefix. The default
 // side is setDefaults itself, run on an empty viper.
 //
 // Out of scope: backup.targets.<name>.* — those defaults are set at load time for the target
@@ -28,22 +29,81 @@ import (
 // relayPrefixes are the prefixes loadEdgeSyncRelay is called with.
 var relayPrefixes = []string{"edge_sync.spoke.relay.", "edge_sync.import.relay."}
 
+// The fields loadEdgeSyncRelay reads itself, per side. Its source is checked against these
+// lists (relayFieldsCovered), so a new field fails the test until it is assigned to a side; a
+// side cannot be derived from the source, so which side reads what is stated here.
+var (
+	spokeRelayFields = []string{"enabled", "interval", "ack_timeout"}
+	hubRelayFields   = []string{"enabled", "interval", "staging_dir"}
+)
+
 // prefixedReads are keys read as prefix+field, which no string literal names whole.
-func prefixedReads(t *testing.T, fset *token.FileSet, files []*ast.File) []string {
+func prefixedReads(t *testing.T, files []*ast.File) []string {
 	t.Helper()
-	out := []string{
-		"edge_sync.spoke.relay.enabled", "edge_sync.spoke.relay.interval", "edge_sync.spoke.relay.ack_timeout",
-		"edge_sync.import.relay.enabled", "edge_sync.import.relay.interval", "edge_sync.import.relay.staging_dir",
+	var out []string
+	for _, f := range spokeRelayFields {
+		out = append(out, "edge_sync.spoke.relay."+f)
 	}
-	fields := funcFieldLiterals(files, "readObjectTarget")
-	if len(fields) < 20 {
-		t.Fatalf("found %d readObjectTarget fields: the scan is not seeing them", len(fields))
+	for _, f := range hubRelayFields {
+		out = append(out, "edge_sync.import.relay."+f)
 	}
+	relayFieldsCovered(t, files)
+	fields := objectTargetFields(t, files)
 	for _, p := range relayPrefixes {
 		for _, f := range fields {
 			out = append(out, p+f)
 		}
 	}
+	return out
+}
+
+// relayFieldsCovered fails when loadEdgeSyncRelay reads a field neither side list names.
+func relayFieldsCovered(t *testing.T, files []*ast.File) {
+	t.Helper()
+	known := map[string]bool{"relay": true} // the target name passed to readObjectTarget, not a key
+	for _, f := range append(append([]string(nil), spokeRelayFields...), hubRelayFields...) {
+		known[f] = true
+	}
+	found := funcFieldLiterals(files, "loadEdgeSyncRelay")
+	if len(found) == 0 {
+		t.Fatal("found no fields in loadEdgeSyncRelay: the scan is not seeing it")
+	}
+	for _, f := range found {
+		if !known[f] {
+			t.Errorf("loadEdgeSyncRelay reads %q, which neither spokeRelayFields nor hubRelayFields lists: add it to the side(s) that read it, with a default", f)
+		}
+	}
+}
+
+// objectTargetFields returns the fields readObjectTarget reads (from its source), and fails
+// unless they are exactly the fields setObjectTargetDefaults defaults.
+func objectTargetFields(t *testing.T, files []*ast.File) []string {
+	t.Helper()
+	read := map[string]bool{}
+	for _, f := range funcFieldLiterals(files, "readObjectTarget") {
+		read[f] = true
+	}
+	v := viper.New()
+	setObjectTargetDefaults(v, "x.")
+	defaulted := map[string]bool{}
+	for _, k := range v.AllKeys() {
+		defaulted[strings.TrimPrefix(k, "x.")] = true
+	}
+	for f := range read {
+		if !defaulted[f] {
+			t.Errorf("readObjectTarget reads %q, which setObjectTargetDefaults does not default", f)
+		}
+	}
+	for f := range defaulted {
+		if !read[f] {
+			t.Errorf("setObjectTargetDefaults defaults %q, which readObjectTarget does not read (or reads outside its own body)", f)
+		}
+	}
+	out := make([]string, 0, len(read))
+	for f := range read {
+		out = append(out, f)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -135,7 +195,7 @@ func readKeys(t *testing.T) map[string]string {
 			return true
 		})
 	}
-	for _, k := range prefixedReads(t, fset, parsed) {
+	for _, k := range prefixedReads(t, parsed) {
 		keys[k] = "prefixedReads"
 	}
 	return keys
