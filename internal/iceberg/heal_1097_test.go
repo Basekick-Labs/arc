@@ -384,3 +384,52 @@ func TestHeal1098_FailedNameMappingHealIsRetried(t *testing.T) {
 		t.Fatal("name mapping not healed by the retry")
 	}
 }
+
+// The writer role lost after the pass's last commit check (between the data commit and
+// finishPass): the pass still publishes what it committed, but prunes and expires nothing.
+func TestHeal1097_WriterLostAfterTheCommitPublishesButDoesNotPrune(t *testing.T) {
+	r := newHealRig(t, 1)
+	files, sc := r.history(4)
+	metaDir := filepath.Join(r.root, "arc_mydb.db", "cpu", "metadata")
+	// A stale copy any prune would delete: older than every version this pass protects.
+	cur := r.hint()
+	data, err := os.ReadFile(filepath.Join(metaDir, "v"+strconv.Itoa(cur)+".metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(metaDir, "v0.metadata.json")
+	if err := os.WriteFile(stale, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The newest committed metadata version (iceberg-go's NNNNN-<uuid>.metadata.json). A count
+	// would not do: delete-after-commit removes an old file with each commit.
+	commitsOnDisk := func() int {
+		entries, _ := os.ReadDir(metaDir)
+		newest := -1
+		for _, e := range entries {
+			name := e.Name()
+			if i := strings.IndexByte(name, '-'); i > 0 && strings.HasSuffix(name, ".metadata.json") {
+				if n, err := strconv.Atoi(name[:i]); err == nil && n > newest {
+					newest = n
+				}
+			}
+		}
+		return newest
+	}
+	baseline := commitsOnDisk()
+	n1 := r.write(1, "n1")
+	res, err := r.exp.reconcile(context.Background(), reconcileRequest{
+		database: "mydb", measurement: "cpu", schema: sc, current: append(files, n1),
+		unread: []FileRef{n1}, readSchemas: readLocal,
+		canCommit: func() bool { return commitsOnDisk() == baseline }, // closes once the data commit lands
+	})
+	if err != nil || res.commits != 1 || res.settled {
+		t.Fatalf("result %+v err %v; want one commit, not settled", res, err)
+	}
+	if h := r.hint(); h <= cur {
+		t.Fatalf("hint %d: the pass did not publish its commit (was %d)", h, cur)
+	}
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("stale v0 copy pruned by a node that lost the writer role: %v", err)
+	}
+}

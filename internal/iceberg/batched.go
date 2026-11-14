@@ -541,13 +541,15 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	// A node that lost the writer role mid-pass writes nothing more: no expiry commit, no
 	// discovery files, no prune or sweep. The new writer's pass reconciles from the table.
 	finishedOK := false
-	if stopReason != stopWriterLost && commits == 0 && !canCommit() {
+	writerGone := stopReason == stopWriterLost
+	if !writerGone && commits == 0 && !canCommit() {
 		// Nothing committed and the writer role is gone (a pass whose files all vanished, whose
 		// days were all deferred, or that ran out of time before a commit): publish and prune
-		// nothing, as on the converged branch (#1097).
-		stopReason = stopWriterLost
+		// nothing, as on the converged branch (#1097). stopReason keeps the reason the loop
+		// stopped for the logs; writerGone is what skips finishPass.
+		writerGone = true
 	}
-	if stopReason != stopWriterLost {
+	if !writerGone {
 		tbl, finishedOK, err = e.finishPass(ctx, tbl, tkey, database, measurement, commits, passStart)
 		if err != nil {
 			return reconcileResult{}, err
@@ -555,7 +557,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	}
 	partial := len(free) > 0 && loopErr == nil
 	remaining := len(free) + deferredNew
-	if partial && commits == 0 && stopReason != stopWriterLost && !moved {
+	if partial && commits == 0 && !writerGone && !moved {
 		// Nothing landed: no time was left for even one chunk (the listing and the table seed
 		// took the deadline), or the smallest chunk still did not fit. That is not progress, and
 		// reporting it as in_progress would also bring every later pass forward to the short
@@ -600,6 +602,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		moved:       moved,
 		commits:     commits,
 		droppedCold: droppedCold,
+		writerLost:  writerGone && !partial && !moved,
 	}
 	if loopErr != nil {
 		return res, loopErr
@@ -640,9 +643,15 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 // ok reports that the discovery files were published and any owed floor landed. (A failed heal
 // also leaves the pass unsettled; the callers read that from healFailed, #1098.)
 func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, database, measurement string, commits, passStart int) (*icetable.Table, bool, error) {
+	// The writer role can be lost after the pass's last commit check. Then the pass still
+	// publishes what it committed (its own commits are the table's head), but makes no expiry
+	// commit and does not prune or sweep: its view is stale, and the new writer's pass does those.
+	mayCommit := e.passMayCommit()
 	floor := e.floorOwed(tkey)
 	expireOK := true
 	switch {
+	case !mayCommit:
+		expireOK = !floor // an owed floor stays owed
 	case floor:
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, floorHistory)
 		e.setFloorOwed(tkey, !expireOK)
@@ -663,8 +672,8 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	// writer's claimed versions are protected only by that writer's own prune. Every version this
 	// pass wrote to the hint is kept too. A zero-commit pass pays one LIST of the metadata
 	// directory for it (the orphan sweep, when on, lists it too).
-	mayCommit := e.passMayCommit()
-	if protect, ok := e.protectedVersions(); wrote && ok && mayCommit {
+	protect, hintKnown := e.protectedVersions()
+	if wrote && hintKnown && mayCommit {
 		e.pruneOldVersionFilesFrom(ctx, tbl, passStart, protect...)
 	}
 	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
@@ -672,7 +681,9 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	if mayCommit {
 		e.sweepOrphanMetadata(ctx, tbl)
 	}
-	return tbl, published && expireOK, nil
+	// Not settled when the pass-start hint could not be read: the prune was skipped, and a settled
+	// pass would be cached and not revisited while the table sits over its copy bound.
+	return tbl, published && expireOK && hintKnown && mayCommit, nil
 }
 
 // errWriterLost is prepareChunk's report that canCommit turned false before a schema commit.

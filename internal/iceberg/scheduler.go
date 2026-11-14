@@ -412,8 +412,10 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			return outcomeUnchanged, err
 		}
 		settled := res.settled
-		s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
-			Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
+		if !res.writerLost && !res.partial {
+			s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
+				Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
+		}
 		// Cache the empty state (nil schema/localFiles) so a permanently-empty
 		// measurement is emptied once, but only once the discovery files are
 		// published — see the equivalent guard on the main path below.
