@@ -95,10 +95,13 @@ func TestAgedSweepWritesConcurrently(t *testing.T) {
 
 	start := time.Now()
 	buf.flushAgedBuffers()
+	// The sweep starts its writes without waiting for them (#1695); wait for
+	// them here, as Close does through b.wg.
+	buf.agedWG.Wait()
 	took := time.Since(start)
 
 	if got := st.writes.Load(); got != measurements {
-		t.Fatalf("sweep returned with %d of %d buffers written; it must not return before its aged data is on storage", got, measurements)
+		t.Fatalf("%d of %d aged buffers written", got, measurements)
 	}
 	if p := st.peak.Load(); p < 2 || p > workers {
 		t.Errorf("peak concurrent writes = %d, want between 2 and flush_workers (%d)", p, workers)
@@ -180,9 +183,9 @@ func (s *closingStorage) WriteReader(ctx context.Context, path string, r io.Read
 	return s.Write(ctx, path, data)
 }
 
-// Close starting mid-sweep stops the sweep after the batch in flight: at most
-// flush_workers writes, not every aged buffer of the shard, so Close's own
-// loop gets the rest within its budget.
+// Close starting mid-sweep stops the sweep once a slot frees: at most
+// flush_workers writes (the sweep's slots), not every aged buffer of the
+// shard, so Close's own loop gets the rest within its budget.
 func TestAgedSweepStopsAfterCurrentBatchWhenCloseBegins(t *testing.T) {
 	const workers, n = 4, 40
 	inner := &latencyStorage{hangingStorageBackend: newHangingStorage(1<<30, 0), latency: 20 * time.Millisecond}
@@ -209,6 +212,7 @@ func TestAgedSweepStopsAfterCurrentBatchWhenCloseBegins(t *testing.T) {
 	shard.mu.Unlock()
 
 	buf.flushAgedBuffers()
+	buf.agedWG.Wait() // writes are detached (#1695)
 	if got := inner.writes.Load(); got < 1 || got > workers {
 		t.Fatalf("sweep wrote %d buffers after Close began, want 1..%d (the batch in flight)", got, workers)
 	}
