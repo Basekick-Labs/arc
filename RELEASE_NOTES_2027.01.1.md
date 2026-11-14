@@ -2,6 +2,19 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Iceberg table repairs are retried, and their metadata copies cleaned up ([#1097](https://github.com/Basekick-Labs/arc/issues/1097), [#1098](https://github.com/Basekick-Labs/arc/issues/1098))
+
+The Iceberg exporter repairs two table properties when they drift: the column name mapping external readers need for columns added later, and the metadata-retention settings after `iceberg.retain_snapshots` changes.
+
+- **A failed repair is now retried on the next pass.** A pass whose repair commit failed could still be recorded as settled, so a measurement whose files had stopped changing was not looked at again until a file changed or Arc restarted, while the log promised "will retry next pass". A failed repair now leaves the pass unsettled, as a failed `version-hint.text` write already does, and the next pass retries it. As for a failed hint write, a repair that keeps failing makes every pass reconcile that measurement again, with a warning each time. The Reconciled log line (on passes that commit data) gains `heal_ok`.
+- **A repair's metadata copy is pruned on the same pass.** Each repair publishes its own `v<N>.metadata.json`. On a pass with no data changes nothing pruned it, so the table sat one copy over `retain_snapshots + 1` until the next pass that changed data. Every pass whose final `version-hint.text` write lands now prunes, keeping `retain_snapshots + 1` copies as before.
+  - A pass never prunes a version a reader may be resolving: the version `version-hint.text` named when the pass started, the table's version then (they differ after an earlier failed hint write), and every version the pass itself wrote to the hint. A pass that publishes several times can therefore leave a few copies over the bound until a later pass prunes again.
+  - Nothing is pruned when the pass's final hint write fails, or when the hint could not be read at the start of the pass; such a pass stays unsettled and is retried. If hint writes keep failing, copies accumulate until they succeed again.
+  - A node that stops being the writer during a pass skips the repairs, and from the moment it notices publishes and prunes nothing; the new writer settles the table. Only a loss between the pass's last check and its end still publishes what the pass committed, without expiring, pruning or sweeping.
+  - Cost: one read of `version-hint.text` per pass that reconciles a table, and one listing of its metadata directory on passes that commit no data.
+
+No configuration changes.
+
 ## Fix: every configuration key Arc reads has a declared default ([#1109](https://github.com/Basekick-Labs/arc/issues/1109))
 
 `storage.s3_prefix` and 15 other keys were read without a default declared next to the rest: the other S3 and Azure primary-storage keys, `tiered_storage.cold.s3_prefix`, `auth.bootstrap_token`, `auth.force_bootstrap` and `iceberg.warehouse`. They now have one. A spoke no longer reads `edge_sync.spoke.relay.staging_dir`, which only the hub uses. Every new default is the value an unset key already had (empty, or `false`), so nothing changes at runtime; this keeps the code and the documented defaults from drifting.

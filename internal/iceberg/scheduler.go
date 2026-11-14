@@ -407,12 +407,15 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			s.state[key] = measurementState{fingerprint: fp}
 			return outcomeUnchanged, nil
 		}
-		settled, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, ArcSchema{}, nil)
+		res, err := s.exporter.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: s.canRun})
 		if err != nil {
 			return outcomeUnchanged, err
 		}
-		s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
-			Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
+		settled := res.settled
+		if !res.writerLost && !res.partial {
+			s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
+				Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
+		}
 		// Cache the empty state (nil schema/localFiles) so a permanently-empty
 		// measurement is emptied once, but only once the discovery files are
 		// published — see the equivalent guard on the main path below.
@@ -517,11 +520,17 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// its file set then goes quiet (the steady state) it would stay unsettled indefinitely.
 	// Leaving the entry uncached costs one repeated reconcile per tick until it succeeds.
 	//
-	// Two things can leave a pass unsettled, and the exporter has already logged which:
-	// unpublished reader discovery files, or a snapshot expiry that failed on a pass whose
-	// removals made the older snapshots unreadable (#1092). Both need the same retry, so this
-	// does not name either — a message claiming the hint when the expiry failed would send an
-	// operator to the wrong place.
+	// Three things can leave a pass unsettled, and the exporter has already logged which:
+	// unpublished reader discovery files, a snapshot expiry that failed on a pass whose
+	// removals made the older snapshots unreadable (#1092), or a heal commit (name mapping,
+	// retention properties) that failed (#1098). All need the same retry, so this does not name
+	// one — a message claiming the hint when the expiry failed would send an operator to the
+	// wrong place.
+	if res.writerLost {
+		// Not a failed step: the exporter logged that the writer role moved; nothing to retry here.
+		delete(s.state, key)
+		return outcomeReconciled, nil
+	}
 	if !res.settled {
 		delete(s.state, key)
 		s.logger.Warn().
