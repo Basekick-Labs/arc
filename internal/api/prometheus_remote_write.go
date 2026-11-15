@@ -49,9 +49,6 @@ var (
 	errRemoteWriteTooManySeries     = errors.New("remote write request exceeds 100,000 time series")
 	errRemoteWriteTooManySamples    = errors.New("remote write request exceeds 1 million samples")
 	errRemoteWriteTooManyLabels     = errors.New("remote write request exceeds 1 million labels")
-
-	errSnappyCorrupt  = errors.New("snappy: corrupt input")
-	errSnappyTooLarge = errors.New("snappy: decoded block is too large")
 )
 
 // WritePrometheusRemoteWrite accepts Prometheus Remote Write 1.0 samples.
@@ -291,7 +288,7 @@ func decodePrometheusRemoteWrite(rawBody []byte) (*remoteWriteRequest, int, erro
 	}
 	decodedLength, err := snappy.DecodedLen(rawBody)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid snappy block: %w", snappyError(err))
+		return nil, 0, fmt.Errorf("invalid snappy block: %w", normalizeSnappyError(err))
 	}
 	if decodedLength > maxRemoteWritePayloadBytes {
 		return nil, 0, errRemoteWriteTooBig
@@ -299,12 +296,14 @@ func decodePrometheusRemoteWrite(rawBody []byte) (*remoteWriteRequest, int, erro
 	if decodedLength > maxSnappyRatio*len(rawBody)+1024 {
 		return nil, 0, fmt.Errorf("invalid snappy block: declares %d bytes from a %d-byte body", decodedLength, len(rawBody))
 	}
-	// Strict: snappy.Decode also accepts S2 extensions (an offset-0 copy
-	// repeats the last offset), which are not Snappy, are not Remote Write
-	// 1.0, and have no ratio bound for maxSnappyRatio to rest on (#1702).
+	// Strict: snappy.Decode is s2's decoder and also accepts S2 extensions
+	// (an offset-0 copy repeats the last offset), which are not Snappy and
+	// not Remote Write 1.0. DecodedLen and maxSnappyRatio bound the
+	// allocation either way; DecodeStrict keeps the accepted bodies to
+	// standard Snappy blocks (#1702).
 	decoded, err := snappy.DecodeStrict(nil, rawBody)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid snappy block: %w", snappyError(err))
+		return nil, 0, fmt.Errorf("invalid snappy block: %w", normalizeSnappyError(err))
 	}
 	request, err := unmarshalRemoteWriteRequest(decoded)
 	if err != nil {
@@ -313,17 +312,17 @@ func decodePrometheusRemoteWrite(rawBody []byte) (*remoteWriteRequest, int, erro
 	return request, len(decoded), nil
 }
 
-// snappyError words a decoder error the way a Snappy sender expects. The
-// klauspost errors are s2's and say "s2:", a format the sender did not use;
-// these are the messages github.com/golang/snappy gave (#1702).
-func snappyError(err error) error {
+func normalizeSnappyError(err error) error {
 	switch {
 	case errors.Is(err, snappy.ErrCorrupt):
-		return errSnappyCorrupt
+		return errors.New("snappy: corrupt input")
 	case errors.Is(err, snappy.ErrTooLarge):
-		return errSnappyTooLarge
+		return errors.New("snappy: decoded block is too large")
+	case errors.Is(err, snappy.ErrUnsupported):
+		return errors.New("snappy: unsupported input")
+	default:
+		return err
 	}
-	return err
 }
 
 func unmarshalRemoteWriteRequest(data []byte) (*remoteWriteRequest, error) {

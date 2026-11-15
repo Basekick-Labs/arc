@@ -6,6 +6,14 @@
 
 Test-only; no product behaviour changes. Five test files (in `internal/cluster`, `internal/wal` and `internal/ingest`) built their msgpack payloads with upstream `github.com/vmihailenco/msgpack/v5`, while Arc itself encodes and decodes with its fork, `github.com/Basekick-Labs/msgpack/v6`. They now use the fork, so the tests encode with the same library Arc decodes with (the payload bytes are equivalent either way). `vmihailenco/msgpack/v5` is no longer a direct dependency; it stays in `go.mod` as an indirect one, pulled in by `iceberg-go` through `uptrace/bun`, which uses it only for fields tagged `bun:",msgpack"`; iceberg-go's catalog models have none, so that copy is linked but never runs. `go mod tidy` also records `google.golang.org/grpc` as the direct dependency it already was (Flight SQL imports it).
 
+## Fix: Prometheus Remote Write reuses Arc's Snappy dependency (#1702)
+
+The Prometheus Remote Write receiver now uses Arc's existing `klauspost/compress/snappy` dependency instead of adding a separate Snappy module. Malformed or truncated bodies get the same `400` and error text (`snappy: corrupt input`) as before.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1711](https://github.com/Basekick-Labs/arc/pull/1711).
+
+The receiver accepts standard Snappy blocks only. A body using an s2 extension, such as the offset-0 copy that no Snappy encoder produces, is refused as corrupt rather than decoded, and so is a length header longer than five bytes, which no encoder writes either. The strict decoder is pure Go: on Atila (amd64) the decode step is 3-10% slower than `golang/snappy` was on typical bodies and about 2x on very repetitive ones, which stays within run-to-run noise for a whole request ([#1712](https://github.com/Basekick-Labs/arc/pull/1712)).
+
 ## Fix: Iceberg table repairs are retried, and their metadata copies cleaned up ([#1097](https://github.com/Basekick-Labs/arc/issues/1097), [#1098](https://github.com/Basekick-Labs/arc/issues/1098))
 
 The Iceberg exporter repairs two table properties when they drift: the column name mapping external readers need for columns added later, and the metadata-retention settings after `iceberg.retain_snapshots` changes.
@@ -3647,12 +3655,6 @@ and Grafana Alloy configuration examples are in the
 [integration guide](docs/integrations/prometheus-remote-write.md).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
-
-The receiver decodes Snappy with `klauspost/compress`, already used across
-Arc, instead of the unmaintained `golang/snappy`. It accepts standard Snappy
-blocks only, not S2 extensions, and refuses a corrupt block with `invalid
-snappy block: snappy: corrupt input` (400)
-([#1702](https://github.com/Basekick-Labs/arc/issues/1702)).
 
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 
