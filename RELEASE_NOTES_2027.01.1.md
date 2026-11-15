@@ -8,7 +8,7 @@ Test-only; no product behaviour changes. Five test files (in `internal/cluster`,
 
 ## Fix: Prometheus Remote Write reuses Arc's Snappy dependency (#1702)
 
-The Prometheus Remote Write receiver now uses Arc's existing `klauspost/compress/snappy` dependency instead of adding a separate Snappy module. It keeps standard block decoding and the existing error text for malformed and truncated payloads.
+The Prometheus Remote Write receiver now uses Arc's existing `klauspost/compress/snappy` dependency instead of adding a separate Snappy module. It decodes the Snappy block format at the same speed as before, and malformed or truncated bodies get the same `400` and error text (`snappy: corrupt input`) as before. The one difference: a body using the s2 format's offset-0 copy, which no Snappy encoder produces, is now decoded rather than refused; its decoded size is still bounded before decoding, and the protobuf parser still validates the result.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1711](https://github.com/Basekick-Labs/arc/pull/1711).
 

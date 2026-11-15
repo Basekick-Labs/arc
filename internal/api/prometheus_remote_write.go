@@ -295,7 +295,7 @@ func decodePrometheusRemoteWrite(rawBody []byte) (*remoteWriteRequest, int, erro
 	if decodedLength > maxSnappyRatio*len(rawBody)+1024 {
 		return nil, 0, fmt.Errorf("invalid snappy block: declares %d bytes from a %d-byte body", decodedLength, len(rawBody))
 	}
-	decoded, err := snappy.DecodeStrict(nil, rawBody)
+	decoded, err := snappy.Decode(nil, rawBody)
 	if err != nil {
 		return nil, 0, fmt.Errorf("invalid snappy block: %w", normalizeSnappyError(err))
 	}
