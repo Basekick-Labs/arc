@@ -2855,16 +2855,12 @@ func setDefaults(v *viper.Viper) {
 // tested in the default build.
 var fipsBuild = fips.BuildTagged
 
-// refuseGCSInFIPSBuild refuses a "gcs" backend at key in the FIPS build, which
-// has no native GCS backend (#1587). Config load is where this has to happen:
-// the factory's own refusal would stop a primary at startup, but would leave a
-// node running without its cold tier, or without the backup API.
 // normalizeBootstrapToken trims surrounding whitespace from auth.bootstrap_token
 // (ARC_AUTH_BOOTSTRAP_TOKEN), which seeds the first admin token and, with
 // auth.force_bootstrap, the recovery token (#1713). A value read from a file
 // usually ends in a newline (`openssl rand ... > f`, a Secret built with
-// --from-file), and an Authorization header cannot carry one, so a token stored
-// with it can never be presented: every request answered 401. Whitespace inside
+// --from-file), and no Authorization or x-api-key header can carry one, so
+// every request presenting a token stored with it answered 401. Whitespace inside
 // the value is kept. Tokens already stored are not touched: this only changes
 // the value Arc hands to the bootstrap.
 //
@@ -2889,10 +2885,14 @@ func normalizeBootstrapToken(auth *AuthConfig) (*LoadWarning, error) {
 	return &LoadWarning{
 		Key:     "auth.bootstrap_token",
 		Value:   "(not shown)",
-		Message: "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) had surrounding whitespace, such as the newline at the end of a file it was read from: it was removed, and the trimmed value is the token clients must present. Tokens already stored are unchanged; a token an earlier release stored with the whitespace cannot be presented, so add the trimmed one with auth.force_bootstrap = true (ARC_AUTH_FORCE_BOOTSTRAP)",
+		Message: "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) had surrounding whitespace, such as the newline at the end of a file it was read from: it was removed, and the trimmed value is the token clients must present. Tokens already stored are unchanged: a token an earlier release stored with the whitespace cannot be sent in a header (see the release notes for #1713 to recover)",
 	}, nil
 }
 
+// refuseGCSInFIPSBuild refuses a "gcs" backend at key in the FIPS build, which
+// has no native GCS backend (#1587). Config load is where this has to happen:
+// the factory's own refusal would stop a primary at startup, but would leave a
+// node running without its cold tier, or without the backup API.
 func refuseGCSInFIPSBuild(key string) error {
 	if !fipsBuild {
 		return nil
