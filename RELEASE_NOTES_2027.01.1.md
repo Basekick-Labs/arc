@@ -2,6 +2,288 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Iceberg table repairs are retried, and their metadata copies cleaned up ([#1097](https://github.com/Basekick-Labs/arc/issues/1097), [#1098](https://github.com/Basekick-Labs/arc/issues/1098))
+
+The Iceberg exporter repairs two table properties when they drift: the column name mapping external readers need for columns added later, and the metadata-retention settings after `iceberg.retain_snapshots` changes.
+
+- **A failed repair is now retried on the next pass.** A pass whose repair commit failed could still be recorded as settled, so a measurement whose files had stopped changing was not looked at again until a file changed or Arc restarted, while the log promised "will retry next pass". A failed repair now leaves the pass unsettled, as a failed `version-hint.text` write already does, and the next pass retries it. As for a failed hint write, a repair that keeps failing makes every pass reconcile that measurement again, with a warning each time. The Reconciled log line (on passes that commit data) gains `heal_ok`.
+- **A repair's metadata copy is pruned on the same pass.** Each repair publishes its own `v<N>.metadata.json`. On a pass with no data changes nothing pruned it, so the table sat one copy over `retain_snapshots + 1` until the next pass that changed data. Every pass whose final `version-hint.text` write lands now prunes, keeping `retain_snapshots + 1` copies as before.
+  - A pass never prunes a version a reader may be resolving: the version `version-hint.text` named when the pass started, the table's version then (they differ after an earlier failed hint write), and every version the pass itself wrote to the hint. A pass that publishes several times can therefore leave a few copies over the bound until a later pass prunes again.
+  - Nothing is pruned when the pass's final hint write fails, or when the hint could not be read at the start of the pass; such a pass stays unsettled and is retried. If hint writes keep failing, copies accumulate until they succeed again.
+  - A node that stops being the writer during a pass skips the repairs, and from the moment it notices publishes and prunes nothing; the new writer settles the table. Only a loss between the pass's last check and its end still publishes what the pass committed, without expiring, pruning or sweeping.
+  - Cost: one read of `version-hint.text` per pass that reconciles a table, and one listing of its metadata directory on passes that commit no data.
+
+No configuration changes.
+
+## Fix: every configuration key Arc reads has a declared default ([#1109](https://github.com/Basekick-Labs/arc/issues/1109))
+
+`storage.s3_prefix` and 15 other keys were read without a default declared next to the rest: the other S3 and Azure primary-storage keys, `tiered_storage.cold.s3_prefix`, `auth.bootstrap_token`, `auth.force_bootstrap` and `iceberg.warehouse`. They now have one. A spoke no longer reads `edge_sync.spoke.relay.staging_dir`, which only the hub uses. Every new default is the value an unset key already had (empty, or `false`), so nothing changes at runtime; this keeps the code and the documented defaults from drifting.
+
+A test now fails when a key read in `internal/config` has no default, including the target fields of the edge-sync relay. Four keys are read on purpose without one, each listed with its reason: `backup.targets` (a map: a default would be a phantom target) and the edge-sync spoke secrets (`edge_sync.spoke.secret`, `shared_secret`, `hub_token`), which are refused in the configuration file and come from `ARC_EDGE_SYNC_SPOKE_SECRET` / `ARC_EDGE_SYNC_HUB_TOKEN`. Per-target backup keys (`backup.targets.<name>.*`) get their defaults when the targets are loaded, as before.
+
+## Fix: Iceberg export no longer fails a measurement because compaction deleted a file mid-pass ([#1706](https://github.com/Basekick-Labs/arc/pull/1706))
+
+Compaction, a `DELETE`, retention and tier moves delete data files while an Iceberg export pass may be reading them. Two things then failed the measurement, logged at Error and counted as `failed`, until the next pass on the full interval:
+
+- the listing kept changing under every attempt (`kept changing under the listing … keeping the previous snapshot this pass`);
+- a file listed a moment earlier was gone when its Parquet footer was read (`NoSuchKey`, `no such file`).
+
+Compaction's minimum ages keep it away from files that are still being written. They do not keep it away from the export, and the first export of an existing backlog covers exactly the older days daily compaction picks. Seen in testing against S3 with a daily compaction cycle running during a first registration.
+
+A measurement in that state is now reported as `busy`: a new count in the pass summary, logged at Info, and the next pass comes early, as for `in_progress` (after 30 seconds at the default `iceberg.reconcile_interval`).
+
+- **The listing check is unchanged.** A set listed while files were vanishing is still never exported: the vanished file's rows may be in a file that listing missed. Only how it is reported changed.
+- **A file that disappears after the listing** is confirmed with its own storage backend (the cold tier for a cold file) before anything is decided. A read error on a file that still exists, or any other read error, fails the measurement as before.
+- **New files:** the vanished file's whole UTC day is left for the next pass; the day's other new files are, almost always, inputs of the same compaction about to be deleted too. The rest of the pass registers as usual. These files were not in the table, so readers lose nothing.
+- **A day the pass was also removing files from** (a compaction output, a rewrite, a tier move) is left exactly as the table has it, removals included, and the other days commit. A day is never split, so readers never see a compacted day with rows missing. If any file in that commit has a path outside the `year/month/day` layout, the whole commit waits for the next pass instead.
+- A pass that left anything behind is never cached as settled, so the next pass lists again.
+- **Still visible if it does not clear.** A measurement that stays busy, with nothing committed or settled, for 30 minutes is logged at Warn and counted as `failed`, and no longer brings passes forward. The clock is kept in memory: a restart or writer failover starts it again.
+
+No configuration changes.
+
+## Fix: Iceberg export registers a large measurement over several passes instead of never ([#1686](https://github.com/Basekick-Labs/arc/issues/1686))
+
+The first export of a measurement with many files (enabling Iceberg on an existing deployment, or recreating a table) read every new file's Parquet footer twice and then committed once, all inside the 2-minute per-measurement limit. A measurement too large for that, or on a slow or distant object store, never committed anything: each pass hit the limit, logged `context deadline exceeded`, and the next pass started from zero.
+
+New files are now committed in chunks of up to 256. Each chunk reads its own footers, adds any new columns to the table, and commits. A pass that runs out of time keeps every chunk it committed, and the next pass continues from what the table holds, including after a restart.
+
+- **Progress is not a failure.** A measurement that is still being registered is counted as `in_progress` in the pass summary, not `failed`. A pass that could not commit any chunk at all is still reported as `failed`, and does not bring the next pass forward. One Info line gives how many new files were registered and how many remain. The next pass starts after 30 seconds (or a tenth of `iceberg.reconcile_interval`, if larger) instead of the full interval.
+- **Newest files first.** Recent data is queryable first while older data is still being registered. While that is in progress, readers see a table with part of the measurement's history.
+- **Slow stores still converge.** When a chunk does not fit in the time left, it commits nothing, and the chunk size for that measurement halves, down to 8 files. The size doubles again after each chunk that finishes in under 15 seconds. The chunk size is kept in memory, so a restart starts again at 256.
+- **What changes together still commits together.** Removals, tier moves, files rewritten in place, and any new file in a UTC day that also loses a file all go in one commit, as before. Compaction (inputs out, output in) therefore never shows readers a day with its rows missing. Only new files with no removal in their day are chunked.
+- **Once per pass:** `version-hint.text`, snapshot expiry (beyond the history floor below), version-file pruning and the orphan sweep run after the pass's commits, not after each chunk. A chunk that adds columns still publishes the discovery files when it changes the schema, as before. In a pass of several commits, each one also writes its `v<N>.metadata.json` copy before the next, so a stale second writer on a shared bucket still collides with a published version and is stopped (#1609); those copies are kept until the next pass.
+- **A node that loses the writer role mid-pass** stops before its next commit, including a schema change, and writes nothing more.
+- **A table is never created before a footer is read.** Its `day(time)` partition comes from the schema of the first chunk, which is read first. If that read fails, no table is created.
+- **History floor retried.** The snapshot-history floor after a removal (#1092) is taken straight after the commit that removed the files, as before. If it fails, later passes now retry it until it succeeds, including passes with nothing to commit. Before, the retry pass took the "already converged" path, which never expired snapshots. The retry is remembered in memory, so it does not survive a restart.
+
+No configuration changes. The 2-minute per-measurement limit is unchanged: it now limits how much one pass does, not whether it can succeed.
+
+Approach and tests build on [#1704](https://github.com/Basekick-Labs/arc/pull/1704) by @kathennn.
+
+## Fix: with the WAL on, a flush that fails part-way no longer stores some rows twice ([#1697](https://github.com/Basekick-Labs/arc/issues/1697))
+
+With the WAL on, a write whose rows span several hours is flushed as one Parquet file per hour, and each file is registered and its rows checkpointed in the WAL as soon as it is stored (#1492), so a failure later in the flush replays only the hours not yet written. That relies on the WAL's row checkpoint naming every row of the file. Some files hold rows it cannot name:
+
+- rows of a chunked payload (one batch stored as several WAL entries);
+- every row of a file whose rows need more than 1,024 row ranges to name. A backfill sent as many small writes, each with rows in the same hours, does this with no special layout, and so does one large write whose rows alternate between hours.
+
+Those files were registered as stored, with their rows left unchecked. If a later hour then failed, WAL replay wrote those rows again into new files: they were stored twice, in storage and in the cluster manifest. In a reproduction with 1,054 two-hour batches and the second hour file failing, 3,162 rows were stored for 2,108 sent.
+
+Such a file is now **deferred**: stored, but registered only after the flush's last hour (before its WAL checkpoint), and written after the files that can be named. If the flush fails part-way, a deferred file is left unregistered and handed to the cleanup that already removes the late-landing copy of a failed write ([#1635](https://github.com/Basekick-Labs/arc/issues/1635)). It is removed only after WAL replay has stored every one of its rows in another file, never before. If that does not happen within an hour (a WAL that accepted an entry and then failed to write it, or replay storing the rows under an identity the cleanup cannot match), or by shutdown, the file is registered instead and kept as the copy of its rows: a possible duplicate, as before, never a loss, and never an unregistered file a cluster's reconciliation sweep could take for an orphan. The same reproduction now stores each row once.
+
+- A file that holds a row with no WAL copy (a replicated entry) is that row's only copy and keeps the previous behaviour: registered as stored, with a possible duplicate after replay. So does a file with rows whose WAL identity replay cannot match (a content hash, or a recovery replay with no identity).
+- On a single node, a deferred file gets no flush intent ([#1646](https://github.com/Basekick-Labs/arc/issues/1646)): an intent naming only some of its rows would let recovery adopt the file and keep its other rows twice.
+- Until replay runs (the next WAL recovery pass), the rows of a deferred file are in storage but not registered: on a cluster, readers that go by the manifest do not see them; on a single node, queries list storage and see them, and briefly see the replayed copy too, until the cleanup removes the deferred file.
+- A cluster with coverage on announces the flush's coverage group even when every file is deferred.
+- If the cleanup's tracker is full, a deferred file is registered at once and logged: its rows are stored twice after replay, as before.
+- What is cleaned up: a deferred file of a flush that **fails** while Arc runs. A crash mid-flush leaves its deferred files unregistered with nothing tracking them (the tracker is in memory): replay after the restart stores their rows again; on a single node, queries then see them twice, as before; on a cluster the leftover file is an unregistered orphan. Rows of a chunked line-protocol (row-format) payload are usually replayed in row ranges, which the cleanup cannot match against the whole entry: those files are registered after the hour, as before.
+
+## Fix: without a WAL, a flush that fails part-way keeps track of the hour files it stored ([#1693](https://github.com/Basekick-Labs/arc/issues/1693))
+
+With the WAL off (the default), a write whose rows span several hours is flushed as one Parquet file per hour. If an upload failed part-way, the hour files already stored stayed in storage but were never registered: they were missing from the tiering metadata and, on a cluster, from the file manifest. The flush was also logged and counted as losing **every** row, stored ones included.
+
+Each hour file is now registered as soon as it is stored, so a failure later in the flush leaves the earlier files tracked:
+- **Tiering:** they reach the tier metadata, and are migrated and covered by tier-aware retention.
+- **Cluster:** they are in the manifest, so readers that go by the manifest see them, and the reconciliation sweep does not treat them as orphans to delete. As for every registration made without a WAL, the registration journal entry is not fsynced, so it survives a process crash but not a power loss.
+
+The failure log now reports `records_stored` and `files_stored`, and `records_without_wal` and `arc_buffer_records_dropped_total` count only the rows in no stored file. Two reproductions:
+- On Amazon S3, a 20,000-row backfill over 2,000 hours was cut off by a shutdown. The old binary stored 204 hour files and counted all 20,000 rows as lost. The fixed one stored 205 files and reported 2,050 rows stored and 17,950 lost.
+- On MinIO, paused part-way through a 3,650-row, 365-hour backfill, 337 files were stored, 280 rows were counted lost, and 3,370 rows were queryable.
+
+With the WAL on, each hour file was already registered and checkpointed as it was stored (#1492). One change applies to both: an hour file whose upload completes just as the shutdown budget runs out still gets its tiering record (bounded by `ingest.flush_timeout_seconds`) instead of failing it on the cancelled flush. The cluster manifest registration takes no deadline and already happened in that case, so only the tiering record changes; what happens if that file's WAL checkpoint is dropped is unchanged (a single node adopts the file through its flush intent, #1646; a cluster node replays its rows, at least once, as before). The count of rows a shutdown leaves for WAL replay is also corrected for a flush that stored only some of its hour files.
+
+## Fix: a long backfill flush no longer holds up age-based flushing, or DELETEs on other databases ([#1695](https://github.com/Basekick-Labs/arc/issues/1695))
+
+Since #1692, a write spanning many hours can legitimately take minutes to flush, one file per hour. Two waits that were implicitly capped at about 30 s now waited for the whole backfill.
+
+- **Age-based flushing.** The periodic sweep writes buffers that have reached `ingest.max_buffer_age_ms`. It used to wait for each batch of those writes, so one backfill held up age-based flushing of every buffer on the node, and low-rate measurements were written late (and, with the WAL off, held in memory longer).
+  - The sweep now starts each write and moves on. It has `ingest.flush_workers` write slots of its own and waits only when all of them are busy.
+  - A measurement whose previous age-based write is still running is not picked up again until that write ends. Its new rows stay buffered, so one slow backfill cannot occupy every slot.
+  - Aged data still never queues behind size-triggered flushes and never takes a writer's slot. Shutdown still waits for every write in progress.
+  - The sweep still stalls once every slot is held by a slow write, as it did before: with `flush_workers = 1`, one backfill is enough; with N workers, N backfills of different measurements running at once.
+- **Flushes before a DELETE or a CQ watermark.** A row-level DELETE (local, cluster, or the peer flush it asks for) and a cluster continuous query's output flush wait for buffered rows of their own database (or measurement) to be written. They used to wait for every flush in progress on the node, and failed after `ingest.flush_timeout_seconds` while any backfill ran on any database. They now wait only for flushes of their own scope, and a wait for one scope no longer blocks a wait for another while it waits for its flushes to finish. A timeout says what it was waiting for: a flush of its scope still in progress, another flush barrier, or flush-queue space.
+  - **What still applies.** The WAL recovery barrier still waits for every flush, so with the WAL on, WAL purging waits for a running backfill to finish. A flush failure on any database during the wait still fails the DELETE. If size-triggered flushes fill every flush worker and the queue, a DELETE's own flushes still queue behind them, and while it waits for queue space it also holds up other scopes' waits. A DELETE on the database being backfilled still fails if the backfill outlasts its budget, and nothing is deleted.
+
+## Fix: a backfill flush is no longer cut off at 30 seconds in total ([#1692](https://github.com/Basekick-Labs/arc/issues/1692))
+
+`ingest.flush_timeout_seconds` (default 30) is documented as the timeout for
+storage writes during a flush, but it bounded the **whole** flush. A write whose
+rows span many hours flushes as one Parquet file per hour, uploaded one after
+another, so a backfill hit the deadline part-way however healthy each upload
+was. Measured on S3 in the same region (~25 ms per file), any single write
+spanning more than about 1,100 hours failed; over a slower link far fewer. With
+the WAL off the rows not yet uploaded were lost after the write had been
+acknowledged; with the WAL on they were kept but replayed only at the next
+restart.
+
+The timeout now applies to **each hour file** of a flush, and covers
+everything done for that file: the Parquet encode, the storage write, the
+field-schema registration (which reads and writes storage), the tiering and
+cluster-manifest registration, and the WAL row checkpoint. A single-hour
+flush, which is every flush in live ingest, still gets one timeout (now
+starting after the in-memory merge and sort). A flush of N hour files can take
+up to N × the timeout and has no cap on N. Cluster replay of a claimed WAL
+range, which had no time limit, now also gets the timeout per hour file.
+
+- One stuck upload is still cut off at the timeout, as before.
+- At shutdown, Arc stops a flush between hour files once its shutdown budget
+  runs out (it already cancelled uploads in progress then); previously a flush
+  on local storage kept writing its remaining files. The hours not yet written
+  stay in the WAL (with the WAL off they are lost, as any unflushed rows are at
+  shutdown).
+- **While a large backfill flushes, other work waits longer than before**, up
+  to the length of the flush instead of ~30 s:
+  - Age-based flushing of **every other buffer on the node**: the age sweep
+    writes its buffers and waits for them, so a backfill flushed by age holds
+    up the next sweep. Size-triggered flushes are not affected. Nothing is
+    lost, but low-rate measurements are written late.
+  - A write request that triggers a schema-change flush, and import and
+    flush-all calls, run until the flush is done.
+  - Calls that wait for in-flight flushes with a budget of one timeout fail
+    safe while a backfill flush runs, on any database: WAL recovery keeps its
+    files and completes on a later pass; a row `DELETE` and a cluster
+    continuous-query run answer an error and change nothing. Retry after the
+    backfill.
+
+  Before this fix the same backfill failed after ~30 s and lost or deferred its
+  rows; follow-up work to keep it from holding up other buffers is tracked in
+  [#1695](https://github.com/Basekick-Labs/arc/issues/1695).
+- The config comment said `0 = no timeout`; a value of 0 or less has always
+  meant 30 s. The comment now says so.
+
+No configuration change. Throughput of live ingest is unchanged: one extra
+context per flush, not per row.
+
+## Fix: `cluster.seeds` written as a TOML array is read ([#1675](https://github.com/Basekick-Labs/arc/issues/1675))
+
+`seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]` in `arc.toml` now gives the node those seeds. Before, Arc read the TOML array as no seeds at all and gave no warning. The node started with `seed_count: 0`, logged `no known peers, aborting election`, and never joined. Only the comma-separated string worked. An array element that contains commas is split into one seed per address.
+
+`backup.target_names` had the same bug and is fixed the same way. A target named only in a TOML array, with its fields set from the environment, was never discovered.
+
+For every other spelling nothing changes. The comma-separated string (`seeds = "a:9100,b:9100"`) and the environment variables (`ARC_CLUSTER_SEEDS`, `ARC_BACKUP_TARGET_NAMES`) read exactly as before, and an environment variable still overrides the file. Every shipped deployment (docker-compose, Kubernetes, Helm) passes seeds through `ARC_CLUSTER_SEEDS`, so none of them was affected. `arc.toml` now documents `cluster.seeds` with both spellings.
+
+**Upgrade note:** a TOML array that was ignored before now takes effect. Seeds listed in a `seeds` array are dialled. Every name in a `target_names` array must be a valid target name and, with backups enabled, a fully configured target, or Arc refuses to start. If an old array was left in `arc.toml` by mistake, remove it before upgrading.
+
+## Fix: backups find the Iceberg metadata of edge-sync spoke databases ([#1202](https://github.com/Basekick-Labs/arc/issues/1202))
+
+Two fixes in how a backup recognises the Iceberg exporter's namespace directories.
+
+- **Unscoped backups, warehouse outside the storage root.** The Iceberg table metadata of an edge-sync spoke whose id contains a dot is now backed up. iceberg-go stores such a namespace under a JSON-encoded directory name (`__iceberg_namespace_v1__:[...].db`), and the backup only walked directories starting with `<prefix>_`. Such a backup carried the catalog rows for those tables but not the metadata they point at. A warehouse under the storage root was not affected, because the data listing covers it. If one of these directory names is too long to store as a backup key, the backup now fails and names it. Before, it left those tables out without saying so. This is the same rule as for any other warehouse file.
+- **Scoped backups.** A backup scoped to an edge-sync spoke now reports the spoke's Iceberg metadata that it leaves out (`iceberg_namespace_files_excluded`, `iceberg_namespaces_excluded`, and the log line that says to take an unscoped backup for the Iceberg tables). Before, it always reported zero. A spoke has one namespace directory per database (`arc_<spoke>.<db>.db`, or the encoded form), and the backup looked for a single `arc_<spoke>.db` that never exists. What a scoped backup copies has not changed: it never copied the warehouse. A directory name that could belong to either of two scoped names (`arc_a.b.db`: spoke `a`'s database `b`, or a name `a.b`) is reported as left out by whichever is in scope. As before, the count is made only when the warehouse is on local storage.
+
+## Fix: an edge-sync `allowed_dirs` path containing a space can be set from the environment ([#1680](https://github.com/Basekick-Labs/arc/issues/1680))
+
+`edge_sync.import.allowed_dirs` and `edge_sync.spoke.bundle.allowed_dirs` now read a string, from `arc.toml` or `ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS` / `ARC_EDGE_SYNC_SPOKE_BUNDLE_ALLOWED_DIRS`, as a **comma-separated** list. Before, a string was split on whitespace, so `"/Volumes/Air Gap"` became two allow-list entries, `/Volumes/Air` and `Gap`. The second resolved against Arc's working directory. Bundles were refused from the directory the operator named, and silently allowed in two nobody named. A comma-separated list (`"/a,/b"`) used to be read as one path; it is now two. TOML arrays read as before. A path that contains a comma needs the array spelling.
+
+Every `allowed_dirs` entry must now be an absolute path. With import or bundle export enabled, Arc refuses to start on a relative entry and names it. A relative entry was resolved against Arc's working directory. The realistic way to end up with one is a separator in the wrong place, such as `"/mnt/a,b"` in the environment, which reads as `/mnt/a` and `b`. A refused bundle path now lists each allowed directory in quotes, so a list that was read differently from how it was written is visible.
+
+**Upgrade note:** a whitespace-separated list in either variable, such as `"/mnt/a /mnt/b"`, is now read as a single path. Arc still starts, but every import or export is refused. Rewrite it as `"/mnt/a,/mnt/b"` or as a TOML array. This form was never documented. A relative `allowed_dirs` entry, also never documented, now stops startup. Make it absolute.
+
+`arc.toml` now documents both spellings of `allowed_dirs`, and the environment form of `ingest.sort_keys` and `ingest.decimal_columns`. Their entries contain commas, so in the environment the entries are separated by whitespace: `ARC_INGEST_SORT_KEYS="cpu:host,region mem:host"`. That behaviour is unchanged, and now pinned by a test. `compaction.exclude_databases` is also unchanged: a comma inside one of its entries is deliberately kept whole, because a spoke ID may contain one.
+## New: a spoke can delete its local copy once the hub has verified it ([#569](https://github.com/Basekick-Labs/arc/issues/569), phase 3a)
+
+With `edge_sync.spoke.delete_after_sync = true`, a spoke reclaims disk space by deleting its own copy of a file after the hub has **verified** that it still holds the file. This is off by default.
+
+- **When a file is deleted.** Verification is a separate request from the one that synced the file, sent on a later pass and at least `edge_sync.spoke.delete_after_sync_delay` after the sync (default `0s`). The hub answers "held" only when it still has the file itself, at the path it received it under, and on a cluster only if the cluster still lists it. Only then is the spoke's copy deleted.
+- **When a file is kept.** The hub may have merged the file into a compacted file (`edge_sync.compact_received_namespaces`, on by default) or removed it on purpose. A removed file is always kept. For a compacted file, see the next section: by default the spoke keeps its copy and asks again a day later. A file the hub has forgotten entirely (its admin forget route) is sent again.
+- **Older hubs.** The spoke first sends the hub an empty test request. If the hub is too old to verify, the spoke deletes nothing, logs a warning, and asks again a day later. It never sends such a hub its list of synced files.
+- **Turning it on for a spoke that has been syncing for a while** verifies, and may delete, every synced file still in the ledger: up to `ledger_retention_days` (90 days by default) of data on the first passes.
+- **A failed verification** never fails the sync pass and deletes nothing. The pass reports why in `verify_error`.
+- **Refused at startup** without `edge_sync.spoke.enabled`, bundle export or the relay ([#1685](https://github.com/Basekick-Labs/arc/issues/1685)), on a cluster node, or, with the network path on, with a `hub_url` that is neither `https://` nor a loopback address. The hub's answer decides which local files are deleted, so it must not be forgeable in transit.
+- **Local queries** on the spoke no longer see data whose files were deleted.
+- **Licence.** The setting itself needs no licence, so manual passes (`POST /api/v1/spoke-sync/run`) delete. Scheduled passes run only with the edge-sync scheduler licence, as before. A pass reports `local_deleted`, `verify_kept`, `verify_requeued` and `verify_unsupported`.
+
+Air-gapped spokes can use it too: see "`delete_after_sync` for air-gapped spokes" ([#1684](https://github.com/Basekick-Labs/arc/issues/1684)).
+
+## New: a spoke can also delete files the hub has compacted, if it opts in ([#1683](https://github.com/Basekick-Labs/arc/issues/1683))
+
+The hub now records where a spoke file's content went when it compacts the file, when it compacts that compacted file again, and when it migrates it to the cold tier. A verification can then confirm that the hub still holds the file it went into. Before, a file the hub had compacted could never be verified, so a spoke never deleted it. Hub compaction of received data is on by default, which made this the common case.
+
+Such files are reported separately, and a spoke deletes them only with `edge_sync.spoke.delete_after_sync_accept_compacted = true` (default `false`). Hub compaction does not keep the spoke's exact bytes:
+
+- It drops rows that are identical in every column.
+- It widens a column that mixes integers and floats to floating point, which loses precision above 2^53.
+- It turns timestamps it cannot parse into NULL.
+
+With the setting on, the spoke's only exact copy goes. Some files have no recorded destination and are always kept: files the hub compacted or moved to the cold tier before this release, and files a row-level `DELETE` rewrote on the hub. If hub retention later deletes the compacted file a spoke file went into, that spoke file is kept too, and the spoke keeps asking about it once a day.
+
+## New: `delete_after_sync` for air-gapped spokes ([#1684](https://github.com/Basekick-Labs/arc/issues/1684))
+
+An air-gapped spoke can now use `edge_sync.spoke.delete_after_sync` with only bundle export enabled (`edge_sync.spoke.bundle.enabled`).
+
+- **How it works.** When the hub imports a bundle, it checks which of its files it still holds, the same check a networked spoke gets. It signs the answer into the acknowledgement it writes onto the drive. When the spoke applies that acknowledgement (`POST /api/v1/spoke-sync/ack`), it deletes its local copies of those files: right away with the default delay of 0, or later, by the check that runs every 15 minutes, with a longer delay. It applies the same rules as networked spokes: `delete_after_sync_delay` and, for files the hub compacted, `delete_after_sync_accept_compacted`. A check every 15 minutes deletes what the delay held back.
+- **Only the bundle that carried the file.** An acknowledgement deletes only files that left on that very bundle and that nothing has superseded since. Replaying an old drive after the hub forgot a file deletes nothing. Neither does an acknowledgement older than a more recent network check.
+- **A time limit on the acknowledgement.** It rides a drive and cannot see what happens on the hub after the import, such as retention or a forget. So it is honoured only up to `edge_sync.spoke.delete_after_sync_ack_max_age` after the bundle was exported, measured on the spoke's own clock. The default is `168h` (7 days); raise it knowingly. It must be longer than `delete_after_sync_delay`. If the hub cannot fit the attestation within the acknowledgement's size limit (very large bundles), it writes the acknowledgement without it.
+- **On a spoke with both the network path and bundles**, a network check that answers after the bundle went out always wins over the acknowledgement.
+- **Older versions.** An acknowledgement from an older hub carries no such attestation and deletes nothing. An older spoke ignores the attestation and applies the acknowledgement as before. The ack response reports `attested` and `local_deleted`.
+
+## New: edge sync through a shared bucket ([#1685](https://github.com/Basekick-Labs/arc/issues/1685))
+
+A spoke and its hub can now exchange data through an object store both can reach (S3, MinIO, Azure Blob, Google Cloud Storage, or a shared directory), for spokes behind NAT, on intermittent links, or on networks that refuse inbound connections to the hub. It is the air-gap bundle protocol carried by a bucket instead of a drive: the same signed bundles, the same verify-before-commit import, the same signed acknowledgement, and `delete_after_sync` works as for air-gapped spokes. Off by default.
+
+- **Spoke** (`edge_sync.spoke.relay.*`): every `interval` (default `5m`) it applies the acknowledgements waiting in the bucket, then exports pending files as a bundle under `<spoke_id>/outbox/<bundle_id>/`. Each file streams from spoke storage straight into the bucket, hashed on the way, so the edge box keeps no second copy. The manifest is written last, and a bundle without one is never imported.
+- **Hub** (`edge_sync.import.relay.*`): every `interval` (default `1m`) it lists the bucket, one listing per spoke, and checks each new bundle cheapest first. A prefix that names no registered, enabled spoke is skipped without downloading anything. Next it fetches the manifest (at most 64 KiB) and skips a bundle addressed to another hub, remembering it. Then it fetches the entry list (at most 64 MiB) and checks the spoke's signature. Only after that does it download exactly the files the spoke signed, each capped at its declared size, into `staging_dir`, import them as a drive import does, and write the acknowledgement to `<spoke_id>/acks/<bundle_id>.json`. Someone with write access to the bucket but not the spoke's secret can make the hub fetch at most a manifest and an entry list per bundle they plant under a registered spoke's prefix, and each of those is refused once. A drive import in progress is detected before any data is downloaded.
+- **Bundle size.** Relay bundles use the drive export's caps, `edge_sync.spoke.bundle.max_files` and `max_bytes` (default 10,000 files and 64 GiB), even with drive export off. A manual pass is bounded by `edge_sync.spoke.bundle.timeout`. The hub's `staging_dir` must have room for one whole bundle.
+- **Bucket layout and keys.** The relay target takes a backup target's keys: `type` (`local`, `s3`, `minio`, `azure`, `azblob`, `gcs`) and the matching `local_path`, `s3_*`, `azure_*` or `gcs_*` keys (GCS authenticates as for `storage.gcs_*`: a key file, else Application Default Credentials; not in the FIPS build). The target's own prefix (`s3_prefix`, `azure_prefix`, `gcs_prefix`) is the relay root, and spoke and hub must name the same bucket and prefix. Arc refuses to start if the relay overlaps primary storage, the cold tier or a backup target, or if the hub's staging directory is inside `storage.local_path`.
+- **Crash between import and acknowledgement.** A hub that imported a bundle but did not write its acknowledgement rebuilds it on the next poll from its own receipts, without downloading the bundle again.
+- **A bundle nobody answers.** After `edge_sync.spoke.relay.ack_timeout` (default `72h`, longer than `interval`), the spoke takes the bundle back, and its files go in the next bundle. A file the hub already holds is answered `already present` then. A bundle whose manifest or whole prefix disappears from the bucket is taken back on the spoke's next pass. A drive bundle in transit is never affected.
+- **A bundle the hub refuses** gets a refusal note in `<spoke_id>/rejected/`, signed with the spoke's secret. That covers a manifest or entry list whose signature does not verify, one that is malformed, one stored under another key than the one it names, or one over `edge_sync.import.max_files`. The spoke marks the bundle's files failed, so they are not sent again, and logs the reason. Requeue them with `POST /api/v1/spoke-sync/ledger/requeue` once the cause is fixed. The spoke ignores a note that does not verify. Anything found wrong after the signature has verified is retried instead and is never a refusal: a data object that is missing, the wrong size or the wrong content, or a hub-side error. If the hub never accepts the bundle, the spoke re-sends the files after `ack_timeout`. A bundle for an unknown or disabled spoke, or addressed to another hub, is left alone with no note: a bucket can be shared by several hubs.
+- **What the acknowledgement does not advance.** An acknowledgement advances only files that left on that bundle and are still waiting for it, so an old acknowledgement replayed into the bucket advances nothing. A file it reports as a conflict is failed, as on the network path. Any other file in the bundle that it does not acknowledge goes back to pending.
+- **Clean-up order.** The spoke deletes its outbox bundle after applying the acknowledgement or refusal; the hub deletes the acknowledgement or note once that bundle is gone. The hub never deletes a spoke's bundle. Credentials can follow that split: the spoke writes and deletes `outbox/` and reads `acks/` and `rejected/`; the hub reads `outbox/` and writes and deletes `acks/` and `rejected/`.
+- **Licence.** Scheduled passes, on both sides, need the edge-sync scheduler licence, checked at startup and on every pass. Manual passes are free: `POST /api/v1/spoke-sync/relay/run` on the spoke and `POST /api/v1/bundle-import/relay/run` on the hub, both admin-only. On a cluster, only the primary writer runs scheduled passes; like the drive import route, the manual routes are not restricted to it.
+- **Either side can run alone.** A spoke can use the relay with or without the network path and drive export, and a hub can poll a bucket without `edge_sync.import.enabled` (the drive route).
+- **Storage.** Azure Blob storage gains a conditional write (`If-None-Match: *`), used for acknowledgements. A store that does not honour the condition on a write gets a plain write: an acknowledgement written twice is harmless.
+
+## Query governance policies are cluster-wide ([#1627](https://github.com/Basekick-Labs/arc/issues/1627))
+
+Once every node runs this version, the cluster adopts the nodes' query governance policies (rate limits, quotas, row and scan-time caps per token). From then on a policy created, changed or deleted on any node applies on every node, and survives a failover. The cluster state is the only copy that is read; each node's own table, on nodes where governance is off too, is kept equal to it as a backup and is never read again.
+
+- **Adoption.**
+  - The cluster takes the union of the nodes' policies, so a policy set on one node now applies on all of them.
+  - Policies whose token no longer exists are dropped, and each one is logged.
+  - A node that is away (restarting) when the cluster adopts the policies is not asked. When it comes back, its own policies that the cluster did not adopt are kept in its `governance_policies_dormant` table and logged with their token IDs, never enforced. That table can also hold policies deleted in the cluster while the node was away, so check before recreating any through the API.
+  - If two nodes define the same token's policy differently, an admin chooses one node's set with `POST /api/v1/cluster/policies/adopt` (`"kind": "governance"`). `GET /api/v1/cluster/policies?kind=governance` lists each node's policies and the hash to name. The other nodes' own governance policies are then no longer enforced; each node keeps them in its `governance_policies_dormant` table.
+  - Adoption waits while a node holds a policy for a token created on that node before it joined the cluster (before v26.06.1), or a token the node cannot report on. The wait names the node and the token: re-issue the token through the cluster, or delete that policy. `GET /api/v1/cluster` shows it under `cluster_policies.kinds.governance`.
+- **After adoption.**
+  - Policies apply to cluster tokens only. A create or delete for any other token answers 404, "not a cluster token"; a change answers 404, no policy.
+  - A policy applies only to the token it was set for: a different token that a node keeps at the same ID gets that node's defaults.
+  - A node that restarts never enforces its own table again. Until its cluster state holds the adopted policies it applies only `governance.default_*`: policy creates, changes, deletes, the list and a policy GET answer 503 (retry), while the usage endpoint answers 200 with `"scope": "node"` and the defaults. It then applies its last Raft snapshot's policies, and the changes made since as it replays them from the leader.
+  - A node that joins after the adoption enforces its own table's policies, as before, until its cluster state has caught up; its table is then replaced by the cluster's, and its own policies that the cluster does not hold as they are go to `governance_policies_dormant`.
+  - Deleting a token deletes its governance policy.
+  - The policy list, get and usage answers carry `"scope": "cluster"` when the cluster's policies are what this node enforces, and `"node"` otherwise (standalone, before adoption, or a node that has not caught up). Nothing else in them changes; a policy with `id` 0 is still the server defaults.
+- **What applies where.** `max_rows_per_query` and `max_scan_duration_sec` apply identically everywhere. Rate limits and quotas are counted per node: a policy of 60 per minute allows 60 per minute on each node that runs queries. `governance.default_*` stays per node, so set it the same on every node; adoption logs a warning naming nodes that differ. A query forwarded to another node is governed once, by the node that runs it.
+- **Rollback.** The governance flag (`cluster_policies.governance_enabled` in `GET /api/v1/cluster`; until then the leader's `governance_blocking_nodes` names the nodes still on an earlier release) turns on by itself once every node runs this release, and stays on, like the other cluster policy flags. After that, any node on an earlier Arc release is refused at join, wiped or not: the cluster can go back to an earlier release only by restoring the whole cluster from a backup taken before the upgrade. Removing a node, wiping its data directory and joining it fresh is for rejoining a node on this same release, for example one run for a while with `cluster.enabled=false`; do that before such a node rejoins: unlike retention, which sorts unadopted rows into its dormant tables at every pass, governance copies a node's own policies to `governance_policies_dormant` only the first time its table becomes the cluster's, so policies created on such a node after that are replaced, not kept, when it rejoins.
+
+Performance: on the query path, once adopted, `Admit` reads the cluster's policies from an immutable in-memory snapshot (one atomic load, one map lookup, one string compare), without the lock it took before. `Admit` also no longer allocates per limit: one allocation per admitted query instead of 13 to 16. Measured on Atila against `main`, 16 alternating runs each: a token with a policy 1.26 µs to 0.74 µs (standalone and cluster-wide alike), a token on the defaults 1.31 µs to 0.78 µs, and `Admit` from every core while file registrations are applied 1.53 µs to 0.84 µs per call, with the apply rate unchanged or better (70.4k to 73.8k per second). Ingest and import run no governance code; the snapshot is rebuilt (one map of the governance policies) only when a cluster policy of any kind changes, a token with a governance policy is rotated or deleted, or a Raft snapshot is restored, never on a file registration.
+
+## Fix: a deleted spoke database stays deleted, and can be re-synced on request ([#1186](https://github.com/Basekick-Labs/arc/issues/1186))
+
+On an edge-sync hub, what happened after `DELETE /api/v1/databases/{spoke}?confirm=true` depended on configuration. With tiering active the spoke never sent the data again. Without it, a re-sync brought back only part of the namespace: the files hub compaction had not merged. Hub retention over a spoke namespace looped: retention deleted the files, the spoke sent them again, and the next pass deleted them again.
+
+The hub now records content it deletes on purpose as **removed**, with the reason (`operator_delete` or `retention`), in every configuration. This covers a confirmed database delete of a spoke namespace and hot and cold retention. The spoke does not send that content again, and neither does an old air-gap bundle.
+
+To get deleted data back from the spoke instead of from a backup, ask for it explicitly:
+
+```
+POST /api/v1/sync-spokes/{spoke_id}/forget
+{"database": "<the spoke's database>"}
+```
+
+This is admin-only. The hub forgets the removed receipts under that database, and the spoke sends those files again the next time it asks about them. A spoke with `delete_after_sync` asks at its next verification, which can be up to a day later for a file it already recorded as kept. A file the spoke already deleted cannot be sent again. Otherwise it asks only after its ledger retention (`ledger_retention_days`) prunes the row and discovery finds the file again. Receipts for content the hub still holds, inside a compacted file, are kept. The call is refused with 409 while files remain under `{spoke}/{database}/` in hot or cold storage, because sending the originals back next to those files would duplicate rows. In practice that makes it the recovery from a whole-database delete. After retention it is refused for as long as newer files remain under the database.
+
+On a **cluster** hub this also holds on the node the spoke syncs to ([#1667](https://github.com/Basekick-Labs/arc/issues/1667)). Before that node forgets a receipt whose file is gone, it checks the cluster's replicated file list. A file the cluster no longer lists is treated as removed cluster-wide, so its receipt is recorded as removed (reason `manifest_removed`) and the spoke does not send the file again. That includes the rare file the cluster dropped from its list because the object was lost (manifest repair, the reconciliation sweep). The admin forget route gets such a file sent again. A file the cluster still lists is a local copy that went missing, and the spoke sends it again, as before. If the node cannot catch up with the cluster within 5 s, the spoke's sync attempt fails and it retries later. A cluster run without Raft (`cluster.raft_data_dir` empty) has no such list, and behaves as a single node. The same applies to the row-level `DELETE` fix below.
+
+## Fix: a row-level DELETE on a spoke database no longer brings the deleted rows back ([#1666](https://github.com/Basekick-Labs/arc/issues/1666))
+
+On an edge-sync hub, `DELETE` with a `WHERE` clause on a spoke's data either rewrites a file without the matching rows, under a new name, or removes the file when every row matches. Neither updated the sync receipt for the original file. At the next reconcile the hub saw that file gone, and the spoke sent the original again: the deleted rows came back, and after a rewrite the surviving rows were stored twice.
+
+The hub now updates the receipt before it changes the file:
+
+- For a rewrite, the original is recorded as merged into the new file.
+- For a full removal, it is recorded as removed (reason `row_delete`).
+
+Either way the spoke does not send the original again. This also covers cold-tier files whose rows all match. If the receipt cannot be updated, the file is left unchanged and listed under `failed_files`.
+
 ## Upgrade note: with the WAL on, a write is acknowledged only once it is durable ([#1499](https://github.com/Basekick-Labs/arc/issues/1499))
 
 `wal.ack_mode` now defaults to `"auto"`, which is `"durable"` on every node
@@ -73,6 +355,475 @@ What changes with the WAL on:
   `oss-local`, `oss-s3`, `oss-traefik` and `enterprise-shared`, and
   `deploy/kubernetes*`) take the new default; `enterprise-local` leaves the
   WAL off.
+
+## Fix: S3 batch-delete errors name the key Arc knows ([#1111](https://github.com/Basekick-Labs/arc/issues/1111))
+
+With an S3 object prefix configured, a failed object in a batch delete (compaction cleanup, a database delete, backup deletion and restore, the reconciliation sweep) was reported under the prefixed object name, a name that appears in no manifest, listing or other log line. The `key` log field and the error now carry the key Arc uses, as Azure and GCS already did. The request sent to S3 is unchanged.
+
+## Fix: a long query no longer costs the buffer flush and WAL close at shutdown ([#1644](https://github.com/Basekick-Labs/arc/issues/1644))
+
+At shutdown the HTTP server waited for in-flight requests for the whole
+`server.shutdown_timeout`, and nothing ended a running query. One query that
+outlived the budget, or an Arrow stream to a slow client, used all of it. Arc
+then skipped everything left: the ingest buffer flush, the WAL close and the
+database close. With the WAL off, the rows acknowledged since the last flush
+were lost. With it on, they were replayed at the next start, and the process
+exited 1. In a cluster the 10 s ready drain ran first and left even less.
+
+Shutdown now keeps a share of the budget for the buffer flush, the WAL and the
+database: 60% of `server.shutdown_timeout`, half for the buffer flush as
+before and a tenth for what closes after it. The HTTP drain, the Flight SQL
+drain, the cluster ready drain and the scheduler stops share the rest:
+
+- the HTTP drain gives in-flight requests a grace, then cancels the queries
+  still running, and then closes the connections still open, such as a stream
+  to a client that stopped reading;
+- the cluster ready drain takes at most half of what is left, so the HTTP
+  drain keeps a grace of its own. At the default 30 s that is 6 s rather than
+  10 s, so a load balancer that polls `/ready` every 10 s may still route a
+  request or two to the closing node. Set `server.shutdown_timeout` to 50 s or
+  more to keep the full 10 s;
+- a hook that runs past its share no longer skips the components. The hooks
+  after it still run, on an expired context.
+
+At the default 30 s, a request has about 8 s to finish once shutdown starts on
+a standalone node, and about 3.5 s in a cluster, where a 6 s ready drain comes
+first. It used to have the whole 30 s, with the flush and WAL close as the
+price. A client whose query is cancelled at shutdown gets a 503 ("Server
+shutting down"). Admin writes (tokens, RBAC, cluster policies) are not
+cancelled. The HTTP drain fails the shutdown (exit 1) only when a request
+waits on neither its query nor its connection. Below a
+`server.shutdown_timeout` of 2 s the drain's last stages can still run into
+the share kept for the WAL close.
+
+## New: configurable bounds for migrations, manual edge syncs and bundle transfers ([#1112](https://github.com/Basekick-Labs/arc/issues/1112))
+
+Four long-running operations had a hardcoded time limit. Each now has a setting. The defaults are the old values, so nothing changes unless you set one.
+
+| Setting | Bounds | Default |
+|---|---|---|
+| `tiered_storage.migration_timeout` | one migration cycle, scheduled or `POST /api/v1/tiering/migrate` | `2h` |
+| `edge_sync.spoke.sync_timeout` | one manual sync pass, `POST /api/v1/spoke-sync/run` | `2h` |
+| `edge_sync.spoke.bundle.timeout` | one air-gap export, `POST /api/v1/spoke-sync/export` | `2h` |
+| `edge_sync.import.timeout` | one air-gap import on the hub, `POST /api/v1/bundle-import` | `4h` |
+
+Each takes a Go duration (`45m`, `6h`). A value that does not parse, or that is zero or negative, stops Arc at startup with an error that names the setting and the value. All four are checked even when the feature is off, as `backup.operation_timeout` is.
+
+- Raise `migration_timeout` for a first cold-tier migration of a large dataset. Lower it to make a stuck migration give up and alert sooner.
+- The scan at the start of each migration cycle runs inside the cycle's limit. A `migration_timeout` shorter than `tiered_storage.scan_timeout` therefore cuts that scan short too. Arc logs a warning at startup when you configure that.
+- Closing the HTTP connection does not stop a manual sync, export or import. Only these settings, or shutting the server down, do.
+
+## Fix: forwarded requests no longer read freed request state ([#1629](https://github.com/Basekick-Labs/arc/issues/1629))
+
+On a compactor, a reader or a standby writer, a forward that was cancelled or
+timed out, or whose peer answered before reading the whole body (a 413, for
+example), could leave a background read of the original request's recycled
+context, or of its body buffer. The race detector reported it, and in
+principle the peer could receive bytes of a later request. Forwards now run
+on a context of their own, which ends at server shutdown, at the forward's
+timeout, or when the query is cancelled or its client leaves, as before. A
+body larger than 4KB is not copied: it is released when the forward returns.
+`TestForwardedQueryIsListedAndCancellable` is no longer flaky.
+
+## Ingest: buffers that reach `max_buffer_age_ms` are flushed in parallel ([#1632](https://github.com/Basekick-Labs/arc/issues/1632))
+
+Since #1618 every local flush syncs its file and directory to disk. The periodic flush of aged buffers wrote them one at a time, so with many low-rate measurements a single sweep paid for every sync back to back. Buffers then waited several sweep periods past `max_buffer_age_ms`, and files grew larger than intended.
+
+The sweep now writes aged buffers in batches of up to `ingest.flush_workers`, in parallel, and does not hold the shard lock while it writes. Storage can therefore see up to twice `flush_workers` writes at once: the worker pool's plus the sweep's. It does not use the flush queue, so aged data never waits behind size-triggered flushes and never takes a queue slot from a writer. Measured on macOS (APFS, full sync) with 1,000 measurements at one row per second: about 84 aged flushes per second against 23 before, and the backlog clears within about 2 s of the load stopping instead of about 11 s. Gains depend on how well the disk overlaps syncs.
+
+Nothing else changes: what is flushed, when a buffer counts as aged, and how a flush interacts with the WAL and with shutdown. When shutdown begins during a sweep, the sweep finishes the batch it is writing and leaves the rest to shutdown's own flush. A shutdown therefore waits for at most one batch, as it waited for at most one write before.
+
+## Fix: a crash right after a flush no longer stores its rows twice ([#1646](https://github.com/Basekick-Labs/arc/issues/1646))
+
+With the WAL on, a flush stores its Parquet file and then writes the WAL
+checkpoint that stops recovery from replaying those rows. A crash between the
+two (a kill, an OOM kill, a power loss) left the file in storage with its WAL
+entries unchecked, so the restart replayed them into a second file. Every row
+of that flush was stored twice. On a tagged measurement, compaction removes
+the second copy; on a tagless one it stays. In crash tests with
+frequent flushes, about one SIGKILL in five did this. No acknowledged row was
+lost.
+
+Before storing a file, a flush now writes a small record into the WAL. It
+names the file, its size, and the WAL entries the file holds. At recovery, when
+an entry has no checkpoint but such a record names it, and the file is in
+storage at that size, Arc does not replay the entry. It writes the missing
+checkpoint and keeps the file as the stored copy, re-registering its field
+schema from the file's footer and, with tiering, its tiering metadata. Arc treats the file as all or nothing: if any
+of its entries was already checkpointed, it replays the rest, as before.
+
+The record costs almost nothing. It forces no disk sync of its own (the
+flush's checkpoint, written after it, syncs it). A flush waits at most 100 ms
+for room in the WAL queue to write it. Under durable acknowledgements at
+100 ms flushes, every flush wrote its record and ingest throughput was
+unchanged. A record that never reaches disk only means the replay there
+always was. Arc skips the record when it finds no room in the queue in time,
+or when it would be over 1 MiB.
+
+Not in a cluster: there a stored file also needs its manifest registration,
+which the crash may have cut short. A cluster node writes no records and
+replays, as before.
+
+Old binaries read these records as checkpoints that match nothing, so
+downgrading is safe.
+
+New counters:
+
+- `arc_wal_flush_intents_written_total`
+- `arc_wal_flush_intents_dropped_total`
+- `arc_wal_flush_intents_adopted_total`
+
+## Fix: a damaged WAL entry no longer holds back replay of newer WAL files ([#1634](https://github.com/Basekick-Labs/arc/issues/1634))
+
+When one WAL entry was damaged (a checksum mismatch, for example from bit rot
+or a torn sector), recovery kept that file and stopped there. Every newer WAL
+file stayed unreplayed until the damaged file was quarantined after three
+failed passes: startup plus two periodic passes, about 10 minutes at the
+default `wal.recovery_interval_seconds`. Acknowledged rows from those newer
+files were missing from queries in the meantime, and the WAL directory kept
+growing. Nothing was lost, but the only sign was a field on a log line.
+
+A WAL file whose only problem is damaged entries is now quarantined on the
+first pass, in this order:
+
+1. The entries read intact are replayed.
+2. They are flushed by the same barrier used before a recovered file is
+   deleted.
+3. The file is renamed to `.wal.failed` and kept for inspection.
+
+Recovery then replays the newer files in the same pass. The damaged entries
+cannot be replayed, and neither can any entries the damage made unreadable.
+
+This applies only to checksum mismatches, which are bytes on disk.
+
+Files that fail for any other reason keep the three-pass rule, and recovery
+still stops at them:
+
+- **A replay that fails**, such as a refused buffer or unreachable storage.
+  The cause may be transient, and continuing would charge every newer file
+  with the same failure.
+- **An intact entry this build cannot decode.** A later build may be able
+  to decode it.
+- **Any other damage**: a read error, a length past the limit, or a frame
+  that does not parse. A read error can be transient, and after a broken
+  length field the reader cannot find the next entry.
+- **A file under the cluster registration hold.** It is struck instead, and
+  no newer file of the pass is deleted.
+
+New counter: `arc_wal_damaged_entries_total`, the damaged entries in files
+quarantined on the first pass. `arc_wal_quarantined_files_total` counts these files as
+well.
+
+## Fix: a damaged WAL length field no longer drops the entries after it ([#1641](https://github.com/Basekick-Labs/arc/issues/1641))
+
+Each WAL entry starts with its length. If that field was damaged so it pointed
+past the end of the file, the reader took the entry for a write that was torn
+by a crash and stopped reading the file there. Recovery replayed the entries
+before it and then **deleted the file**. Every later entry in the file was lost
+without an error, a quarantine or a metric. Those entries included
+acknowledged, unflushed rows and the flush checkpoints that keep entries from
+being replayed twice.
+
+The entry's header also stores the checksum of its payload. When only the
+length is damaged, the payload is intact and its checksum matches at exactly
+the true length. Arc now looks for that length when a length points past the
+end of the file or above the entry size limit. It accepts the length only if
+what follows confirms it: the end of the file exactly, or a next entry that
+fits in the file and passes its own checksum. The repaired entry is then read
+like any other. All of the WAL's readers use the same repair, so the replay,
+the checkpoint scan and the identity scan agree on where every entry is.
+
+Arc logs a warning for each file with a repaired entry. New counter:
+`arc_wal_repaired_length_entries_total`.
+
+These cases are still not repaired:
+
+- **The length and the payload (or checksum) of one entry are both
+  damaged,** or the damaged entry is followed directly by a torn write.
+  Nothing confirms a length, so the entry still reads as a torn write.
+- **A length damaged to be longer but still inside the file.** The entry
+  fails its checksum and counts as damaged, so the file is kept or
+  quarantined (see #1634 above), never deleted. Repairing it
+  would make the replay and the checkpoint scan disagree about where entries
+  start, because the checkpoint scan steps over entries by their stated
+  length without reading them. An entry could then be replayed twice.
+- **A length damaged to be shorter than the payload.** The entry fails its
+  checksum, and the reads after it are misaligned.
+- **Each file gets one repair attempt.** A second damaged length in the same
+  file reads as before.
+
+### WAL length-damage test accepts both safe recovery outcomes ([#1670](https://github.com/Basekick-Labs/arc/issues/1670))
+
+The test now accepts either retention of a damaged WAL at its original path or
+intact quarantine. It checks that the bytes are preserved and the checkpointed
+row is not replayed.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1674](https://github.com/Basekick-Labs/arc/pull/1674).
+
+## Tests: two intermittent CI failures fixed ([#1671](https://github.com/Basekick-Labs/arc/issues/1671), [#1672](https://github.com/Basekick-Labs/arc/issues/1672))
+
+Test-only; no product behaviour changes.
+
+- `TestASyncDoesNotAnswerACheckpointWrittenAfterItStarted` could hang
+  `internal/wal` until the 30-minute package timeout. It read its entry count
+  after an append the writer loop may already have counted, then waited for
+  two more that never came, and the failure's cleanup blocked on a sync the
+  test still held. The count is read before the append, held syncs are
+  released before the writer closes, and every wait is bounded.
+- `TestSlowStandbyOnlyLosesItsOwn` reported gaps on the healthy standby on a
+  loaded runner. The server keeps each standby's queue separate; the test's
+  fixed-rate producer let a slowed healthy standby overflow its own queue.
+  The producer now stays within 32 entries of what the healthy standby has
+  stored, so a gap can only come from the stuck one.
+
+## Fix: a compressed MessagePack write over the size limit answers 413 ([#1651](https://github.com/Basekick-Labs/arc/pull/1651))
+
+A gzip or zstd MessagePack body that fits `server.max_payload_size` but
+decompresses past it was answered `400`, the status for a malformed request.
+A client that splits a batch on `413` (the Node-RED node, [node-red-arc#3](https://github.com/Basekick-Labs/node-red-arc/issues/3))
+therefore failed the whole batch instead of splitting it. It now answers `413`,
+as an oversized uncompressed body already did:
+
+```
+413 {"error":"Payload too large: decompressed payload exceeds 4MB limit. Consider batching into smaller requests."}
+```
+
+The message keeps the text the `400` carried (`decompressed payload exceeds
+<limit> limit`); its `Invalid gzip compression:` / `Invalid zstd compression:`
+prefix is gone. Under a limit below 32 MB, a zstd frame whose window is over
+the limit answers `413` too (`the zstd frame's 2MB window exceeds the 1MB
+limit`): `zstd -3`, and Node's `zstdCompressSync`, give a large batch a 2 MB
+window, and a smaller batch gets a smaller one. A corrupt body, and a frame
+whose window is over 32 MB (`--ultra`, `--long`), still answer `400`. `GET /api/v1/write/msgpack/spec` says so. Line
+Protocol and TLE writes are unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir).
+
+## Fix: a flush write that times out but lands no longer duplicates rows after WAL replay ([#1635](https://github.com/Basekick-Labs/arc/issues/1635))
+
+With the WAL on and object storage as the backend, a flush whose upload hit
+`ingest.flush_timeout_seconds` was treated as failed: its rows stayed in the
+WAL and the next recovery pass wrote them to a new file. An object store that
+had already received the upload could still finish it after Arc gave up (a
+stalled S3, a slow network, an overloaded gateway). That left two files with
+the same rows, and queries read both. Acknowledged rows were never lost.
+
+Arc now keeps the key of a failed flush write together with the WAL entries
+whose rows it held. When another flush has stored all of those rows, usually
+the recovery pass's replay, Arc checks the key. If the object is there and is
+the size the failed upload sent, Arc deletes it and logs a warning. It checks
+again 1, 5 and 15 minutes later, because the abandoned upload can land after
+the first check.
+
+Arc deletes the object only when every row in it is provably stored in
+another file. A flush that does not meet this condition is not tracked, and a
+duplicate is still possible, as before:
+
+- The WAL is off.
+- Some of its rows have no WAL copy.
+- It names rows by identities that replay does not carry.
+
+Other limits:
+
+- **Restart.** The list of failed keys is kept in memory. After a restart,
+  the startup replay leaves a copy that already landed in place. On shutdown,
+  Arc logs a warning for each key it is still tracking.
+- **Compaction.** If compaction merges the late copy before Arc deletes it,
+  the duplicate rows become part of the compacted file.
+- **Brief duplicates.** Between the late upload landing and the check, queries
+  see the rows twice.
+
+New counters: `arc_ingest_ambiguous_writes_recorded_total`,
+`arc_ingest_ambiguous_writes_removed_total` and
+`arc_ingest_ambiguous_writes_abandoned_total` (no longer tracked without a
+removal: rows not seen stored again within a day, or an object of another
+size at the key). No new configuration.
+
+## New: Iceberg tables with their metadata beside the data, for OneLake and Microsoft Fabric ([#1676](https://github.com/Basekick-Labs/arc/issues/1676))
+
+`iceberg.layout = "colocated"` creates each new exported table in the
+measurement's own directory: its metadata goes in
+`{database}/{measurement}/metadata/`, and the table's location is the
+measurement directory, so every data file it references is inside the table
+folder. That is what readers that reach a table only through its folder
+need. A Microsoft Fabric OneLake shortcut is one: with the default layout it
+converts the table's metadata, then Fabric fails on the first data file,
+because the data is outside the shortcut. With the colocated layout the same
+files read in place, still zero-copy, and Power BI reports on them through
+Direct Lake.
+
+- The default stays `"warehouse"` (`<warehouse>/<prefix>_<database>.db/<measurement>`).
+- The layout decides where **new** tables are created. An existing table keeps
+  its location, whichever layout is set, so switching either way moves
+  nothing. To move a table to the configured layout: stop Arc on **every**
+  node, delete the table's row from the `iceberg_tables` table of each node's
+  catalog, delete its metadata directory (`<prefix>_<database>.db/<measurement>/`
+  when moving to colocated, `<database>/<measurement>/metadata/` when moving
+  back), and start Arc again. The next pass recreates the table in the
+  configured layout and registers every file again, reading each file's
+  footer once. A node left with a row whose metadata is gone keeps failing
+  that table until its row is deleted.
+- Every node exporting to the same bucket must use the same layout: two nodes
+  with no row and different layouts would each create the table in their own
+  layout's directory.
+- A node with no catalog row for a table adopts it under whichever layout it
+  was created, rather than creating a second one.
+- `colocated` needs local or S3 storage (the backends the export supports)
+  and the warehouse at the storage root (the default); an `iceberg.warehouse`
+  pointing elsewhere is refused at startup.
+- A database `DELETE` leaves a colocated table's metadata to the Iceberg
+  cleanup, which writes the drop markers first and removes it after
+  ([#1611](https://github.com/Basekick-Labs/arc/issues/1611) still holds).
+  On a hub, deleting a spoke namespace also removes its spoke tables' colocated
+  metadata and catalog rows.
+- Metadata restored from a backup of another storage root (another bucket,
+  prefix or path) is not adopted: Arc logs the directory to delete, and the
+  export recreates the table.
+- A measurement's `metadata/` directory is not data: query pruning and the
+  field-schema registry set it aside.
+- **Do not run orphan-file cleanup** (`remove_orphan_files` in Spark or Trino)
+  against a colocated table. Its location holds Arc's data, including files
+  the export has not registered yet, and that cleanup deletes every
+  unreferenced file under the location.
+- **Caveats:**
+  - Files that move to a cold tier leave the table folder, so folder-scoped
+    readers cannot read them (catalog readers can). Arc warns at startup.
+  - On a cluster with node-local storage the metadata exists only on the
+    exporting node. Arc warns at startup.
+  - On object storage, a measurement whose data is all gone but whose table
+    metadata remains is still listed.
+
+## Fix: local storage fsyncs what it writes, so a power loss cannot take acknowledged rows ([#1618](https://github.com/Basekick-Labs/arc/issues/1618))
+
+The local storage backend renamed each written file into place without
+fsyncing it or its directory. With the WAL on, a flush checkpoints the WAL
+as soon as the file is written, and recovery skips checkpointed entries. A
+power loss or kernel crash before the kernel wrote the file back therefore
+lost rows that had been acknowledged as `durable`. A process crash (`kill -9`)
+was never affected, because the page cache survives it. Compaction and the
+DELETE rewrite had the same gap: both remove their source files once the new
+file is written, so a power loss could leave neither.
+
+Every write to local storage now fsyncs the file before it gets its final
+name, and fsyncs the directory after. This covers ingest flushes, compaction
+output, the DELETE rewrite, tiering's cold-to-hot copies, cluster peer
+fetches, backup and restore, and Iceberg metadata. New partition directories
+are synced into their parents. Object storage (S3, Azure, GCS) is unchanged:
+an object is durable once its upload returns.
+
+Behaviour on failure:
+
+- **A failed file fsync fails the write.** Nothing is published. A
+  `.part` staging file is removed rather than resumed, because after a failed
+  fsync its bytes cannot be trusted.
+- **A failed directory fsync after the rename also fails the write**, and
+  the file stays in place: its bytes are already on disk, only its name could
+  be lost. With the WAL on, the flush's rows replay, so they can be read twice
+  until compaction removes the duplicates. A duplicate, never a loss.
+- **The exception is a copy into a new key** (compaction output, tiering and
+  peer copies). The copied file is removed, because the caller still has the
+  source and retries.
+- **Directory fsync refused outright.** Volumes that refuse directory fsync
+  (`EINVAL`, `ENOTSUP` or `ENOSYS`, e.g. some FUSE and CIFS mounts) are
+  accepted, with one warning.
+
+**Cost.** Each flushed file costs two more fsyncs on the flush worker. On
+Linux the cost is unmeasured so far. Measured on an M3 Max, where Go's
+`File.Sync` is `F_FULLFSYNC` (the worst case), with the sustained MessagePack
+bench (`arc.toml`, 12 workers, alternating runs):
+
+| Configuration | Before | After |
+|---|---|---|
+| WAL off | 34.3M rec/s | 34.0M rec/s (noise) |
+| WAL on, `ack_mode = "queued"` | 32.0M rec/s | 32.0M rec/s (noise) |
+| WAL on, `ack_mode = "durable"` | 1.22M rec/s | 0.90M rec/s (−26%) |
+
+The cost scales with files written per second, not rows.
+
+- **Many measurements flushed by age.** Small buffers flushed often pay the
+  most. With 1,000 measurements each receiving one row a second, the aged
+  sweep (every 5 s, one buffer after another) took about 30 s to flush them
+  all on macOS instead of about 2 s. Buffers wait longer and files get larger.
+  Ingest requests were not slowed (p50 about 20 ms either way), and no rows
+  were lost.
+- **Restore and tiering.** Copies of many files (backup restore, tiering
+  cold-to-hot) are slower by two fsyncs per file.
+
+## Fix: a tiering policy needs an existing database; an Iceberg warehouse inside the storage root is not a database ([#1626](https://github.com/Basekick-Labs/arc/issues/1626))
+
+**Behaviour change: `PUT /api/v1/tiering/policies/{database}` now answers
+404 `Database '<name>' not found` for a database that does not exist.** It
+used to store the policy. A database exists by the rule `GET
+/api/v1/databases/{name}` answers with: its marker, a file, a cold-tier row
+or (in a cluster) a manifest entry. If you set policies before the first
+write, create the database first with `POST /api/v1/databases`. The PUT also
+answers:
+
+- **400** `invalid database name "<name>"` for a name that is not a valid
+  storage segment (before: stored);
+- **400** with the name-spelling text for a name that exists in another
+  spelling on a volume that folds case ([#1509](https://github.com/Basekick-Labs/arc/issues/1509));
+- **500** `Failed to check database` when the check itself fails.
+
+`GET`, `DELETE` and `/effective` are unchanged: `DELETE` still removes a
+policy left behind by a deleted database. The check runs on the node that
+answers: on a cluster that keeps data per node, a database that so far holds
+only the marker made by `POST /api/v1/databases` exists only on the writer, so
+set its policy on the writer, or after the first write.
+
+With Iceberg export on, the warehouse's directories in the storage root are
+no longer treated as databases: the namespace directories (`arc_<db>.db`), and
+a warehouse set to a subdirectory of the storage root
+(`iceberg.warehouse=<root>/lv_wh`, on local storage or an S3 prefix).
+`GET /api/v1/databases`, `SHOW DATABASES`, `SHOW TABLES` and
+`GET /api/v1/measurements` leave them out; `GET /api/v1/databases/{name}` and
+its `/measurements` answer 404, `DELETE` answers 403, and
+`POST /api/v1/databases` answers 400 `Database name '<name>' is reserved`. A
+write to a database named after the subdirectory warehouse (line protocol,
+MessagePack, TLE, every `/api/v1/import/*` format, a continuous query's
+database) is refused with 400 `database name "<name>" is reserved for the
+Iceberg warehouse`, so writes cannot land inside a subdirectory warehouse.
+Creating or updating an MQTT subscription whose database or `topic_mapping`
+target is that name is refused the same way; an incoming MQTT message that
+still maps to it is dropped, logged and counted as a failed message. A directory whose name only
+starts with the warehouse's (`lv_wh-other`) is an ordinary database. A
+warehouse nested deeper (`<root>/a/b`) hides measurement `b` of database `a`,
+and `a` stays listed; `DELETE` of database `a` answers 403, because it would
+delete the warehouse with it. Writes to measurement `b` of database `a` are
+**not** refused: they land inside the warehouse directory, are hidden from the
+listings and are not exported, so do not write there (a startup warning names
+that measurement). The export walk applies the same rule, so it no longer walks a
+subdirectory warehouse as a database. Configure Iceberg the same way on every
+node: a node with Iceberg off lists the warehouse and accepts writes to it.
+
+`/api/v1/import/csv` and `/api/v1/import/parquet` now honour their own
+refusals of an invalid database or measurement name and of an RBAC denial:
+they answer the 400 or 403 they wrote, where they used to carry on with an
+empty database name and answer a later 500 or 422.
+
+Cost: one existence check per policy PUT (an admin call); an in-memory name
+comparison per listed directory; one atomic load and string comparison per
+write request (per message for MQTT), never per row.
+
+## Fix: re-running a continuous query with nothing new to process answers 200 ([#1628](https://github.com/Basekick-Labs/arc/issues/1628))
+
+`POST /api/v1/continuous_queries/{id}/execute` answered `400 start_time must be
+before end_time` when the window it derived was empty: a second run within the
+same second, or a run within a minute of a watermark an earlier `end_time` set
+ahead of the clock. The scheduler logged the same case at Error as "Scheduled
+CQ execution failed".
+- Such a run now answers 200 with `records_written: 0`, and `start_time` and
+  `end_time` both at the watermark. Nothing runs: `execution_id` is `""`
+  (no execution history row is written for it), `watermark_status` is absent,
+  and `last_processed_time` is left as it is. In a cluster it proposes no
+  watermark of its own. The scheduler logs it at Debug.
+- A watermark more than a minute ahead of the clock is still refused (the same
+  400, and Error in the scheduler), so a CQ stuck behind clock skew stays
+  visible.
+- An explicit `start_time` not before `end_time`, or an explicit `end_time`
+  before the watermark, is still a 400 with the same text.
+- Python SDK: such a re-run returns a normal result instead of raising
+  `ArcError`.
 
 ## Fix: an MQTT start or restart that cannot connect to the broker answers 502 with the reason ([#1619](https://github.com/Basekick-Labs/arc/issues/1619))
 
@@ -2456,17 +3207,19 @@ on, and a node running an earlier release can no longer join.
 
 Do not roll a node back to an earlier release in place after that. The earlier
 release skips the new cluster log commands and ignores their checks, so its
-view of the cluster manifest silently diverges from the other nodes. To run an
-earlier release on a node, remove the node from the cluster, wipe its data
-directory, and join it fresh. To roll back the whole cluster, restore it from a
-backup taken before the upgrade.
+view of the cluster manifest silently diverges from the other nodes. A node on
+an earlier release is refused at join whether or not its data directory was
+wiped, so the cluster can go back to an earlier release only by restoring the
+whole cluster from a backup taken before the upgrade. Removing a node, wiping
+its data directory and joining it fresh is for a node on this same release.
 
 ## Upgrade note: cluster-wide tiering policies ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
 
 A cluster turns on cluster policies by itself once every node runs this
 release (`cluster_policies.enabled` in `GET /api/v1/cluster`). Like compaction
 commit, the flag stays on, and a node running an earlier release can no longer
-join. Roll back the same way: never one node in place.
+join, wiped or not. Roll back the same way: only by restoring the whole
+cluster from a backup taken before the upgrade, never one node in place.
 
 Right after that, the cluster takes over the tiering policies each node holds
 in its own database. During the takeover a tiering policy write answers `503`
@@ -2809,6 +3562,87 @@ During a rolling upgrade, a node still on an earlier release reads a
 GeoParquet file placed into storage as `GEOMETRY`, as before.
 
 ## New features
+
+### Arrow Flight SQL query endpoint ([#1385](https://github.com/Basekick-Labs/arc/issues/1385))
+
+An optional `[flight_sql]` listener exposes Arc's existing read-only query path
+over Arrow Flight SQL. It uses Arc token authentication and the configured TLS
+certificate, and maps databases and measurements to Flight SQL catalogs and
+tables for ADBC clients. Results stopped at a governance row cap end with a
+`ResourceExhausted` status rather than appearing to be complete.
+
+Flight queries are audited and logged like HTTP queries, with the client's
+address. Metadata calls run one query per database, plus one per measurement
+when schemas are requested, and count against governance limits. Prepared
+statements are not implemented yet, so JDBC-based BI tools cannot run queries;
+the ADBC drivers are the tested clients. See
+`docs/operations/flight-sql.md`.
+
+Both Helm charts can turn it on: `flightSql.enabled` (default `false`),
+`flightSql.port` (default 50051) and `flightSql.servicePort`. When on, the OSS
+chart's Deployment and Service, and the enterprise chart's writers and readers
+with their Services, get a `flight-sql` port (`appProtocol: grpc`); compactors
+are not given the listener. A port that collides with one of Arc's is refused
+when the chart renders.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1419](https://github.com/Basekick-Labs/arc/pull/1419).
+
+### Flight SQL answers SqlInfo ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener answers `GetSqlInfo` with the server name (`Arc`), the
+Arc and Arrow versions, that it is read-only and takes SQL but not Substrait,
+transactions, cancellation, bulk ingestion or DDL, the identifier quote (`"`),
+the metadata search-pattern escape (`\`), the catalog term (`database`), and
+the query grammar it supports: column and table aliases, `GROUP BY`, `UNION`
+and `UNION ALL`, full outer joins, subqueries (correlated too), expressions and
+unrelated columns in `ORDER BY`, and `LIKE ... ESCAPE`. The JDBC driver reads a
+value the server leaves out as `false`, so without these it would report that
+Arc has no `GROUP BY`, `UNION`, joins or subqueries.
+Before, every SqlInfo request failed with `NotFound`: ADBC's `GetInfo` failed
+with it (`adbc_get_info()` in Python), and with the Arrow Flight SQL JDBC driver
+every `DatabaseMetaData` call that reads SqlInfo threw, such as
+`getDatabaseProductName()` and `getIdentifierQuoteString()`. A request that
+includes IDs Arc has no value for, as ADBC's does for the Substrait version
+range, is answered with the rest. Queries through the JDBC driver still need
+prepared statements, which are not implemented yet. See
+`docs/operations/flight-sql.md`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.
+
+### Flight SQL accepts an Arc token in a bearer-token handshake ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener accepts a `Handshake` that carries the Arc token as
+`authorization: Bearer <token>`, and answers it with the same header. The
+Arrow Flight SQL JDBC driver opens the connection that way when given its
+`token` property (`jdbc:arrow-flight-sql://host:50051?token=<token>`, with
+the token's trailing `=` written as `%3D`), and
+every such connection failed with `UNAUTHENTICATED: only Basic Auth
+implemented`: only a Basic handshake, with the token as the password, was
+accepted. An unknown token is refused with `invalid Arc token`, as on any
+other call. Basic handshakes and calls that send the bearer header without a
+handshake (the ADBC drivers) are unchanged. See
+`docs/operations/flight-sql.md`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1658](https://github.com/Basekick-Labs/arc/pull/1658).
+
+### Prometheus Remote Write 1.0 ingestion (#1383)
+
+Arc accepts Prometheus Remote Write 1.0 samples at `/api/v1/write/prometheus`,
+so Prometheus, Grafana Alloy and other remote-write senders can ship metrics to
+Arc. Each metric is a measurement, in the layout arc-opentelemetry-exporter
+writes for OTLP metrics and named the way it names them (characters other than letters, digits and `_` become `_`, so a
+recording rule's `job:up:sum` is `job_up_sum`); labels are tag columns and
+samples a float64 `value` column. Staleness markers are not stored. A series
+Arc cannot store (a label named `value` or `time`, a label name starting with
+`_`, no `__name__`) is dropped and the rest written, answered with a `partial
+write` 400 as for line protocol. The receiver bounds the decoded payload, the
+materialised columns and the label bytes repeated across samples (413), ignores
+metric metadata, and does not store exemplars or native histograms. A Remote
+Write 2.0 request is answered 415. Prometheus
+and Grafana Alloy configuration examples are in the
+[integration guide](docs/integrations/prometheus-remote-write.md).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
 
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 
@@ -3953,6 +4787,81 @@ Now the arcx path streams through the same writer as the DuckDB path:
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1294](https://github.com/Basekick-Labs/arc/pull/1294).
 
+### Fix: a token's `expires_in` must be in the future, and a rename cannot clear its name ([#1623](https://github.com/Basekick-Labs/arc/pull/1623))
+
+`POST /api/v1/auth/tokens` and `PATCH /api/v1/auth/tokens/{id}` accepted a
+zero or negative `expires_in` (`"-24h"`, `"0d"`) and answered success for a
+token that had already expired, so it could not authenticate. A day count too
+large for Go's duration type, positive or negative, overflowed into an
+arbitrary expiry, past or future (`"99999999d"` gave 2246, `"-177004d"`
+2126). Both routes now answer `400`: `"expires_in must be positive"`, or
+`"expires_in is too long: at most 36500d (100 years)..."` for anything over
+100 years, and store nothing. A token that should not expire omits
+`expires_in`, as before. An unreadable `expires_in` on `PATCH` now gets the
+same message as on create, naming the accepted forms.
+
+`PATCH` with `"name": ""` renamed the token to an empty name, which create
+refuses. It now answers `400 "Token name cannot be empty"`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
+
+### Fix: token routes answer `409` for a taken name or a revoked token, and `404` for an unknown ID ([#1625](https://github.com/Basekick-Labs/arc/issues/1625))
+
+`POST /api/v1/auth/tokens` with a name another token already has answered
+`500` and logged an error, and so did `PATCH /api/v1/auth/tokens/{id}` renaming
+a token to such a name. Both now answer `409 "token with name '<name>' already
+exists"` on a standalone node and in a cluster. Before, only a standalone create
+used that text: a standalone rename answered `Failed to update token: UNIQUE
+constraint failed: api_tokens.name`, and in a cluster the message carried the
+`cluster apply failed` wrapping (and, on a follower, the `forward apply: leader
+rejected` prefix). The first token is unchanged.
+
+On a cluster node, `PATCH`, `DELETE`, `POST .../rotate` and `POST .../revoke`
+for an ID with no token answered `200`, because the cluster applies a write to
+an unknown token as a no-op. `rotate` even returned a `new_token` that
+authenticated nothing. They now answer `404 "Token not found"`, as a standalone
+node already did, and propose nothing. A `PATCH` with no fields for an unknown
+ID is now a `404` on both. As with the RBAC routes, a follower that has not yet
+applied a token created elsewhere answers `404` for it for that short moment.
+
+`POST .../rotate` on a revoked token answered `200` with a `new_token` that
+could never authenticate: revocation is permanent and no route re-enables a
+token. It now answers `409`, and the token stays revoked. Create a new token
+instead; a new token has a new ID, so re-attach its governance policies and
+team memberships. Expired tokens can still be rotated, and revoking an already
+revoked token still answers `200`.
+
+In a cluster, a rotate is checked against the node's own copy of the token
+before it is proposed, and again after it has been applied: if the token was
+revoked or deleted on another node just before, the rotate answers `409` or
+`404` instead of a `new_token` that never authenticates. On the node that leads
+the cluster, that second check sees every revoke and delete ordered before the
+rotate. On a follower it does too once cluster policies are enabled, as long as
+the follower's wait to apply the rotate itself does not time out. A follower
+that has not yet applied a revoke or delete made elsewhere, even one already
+acknowledged, can still answer `200` with a `new_token` that never
+authenticates, for a revoke, or for a delete, where it would otherwise answer
+`404`: before cluster policies are enabled, or when that wait times out. The
+revoked or deleted token stays unusable either way.
+
+Duplicate-name and unknown-ID parts contributed by
+[@officialasishkumar](https://github.com/officialasishkumar) in
+[#1622](https://github.com/Basekick-Labs/arc/pull/1622).
+
+### Fix: execution history answers `404` for an unknown continuous query or retention policy ([#1624](https://github.com/Basekick-Labs/arc/pull/1624))
+
+`GET /api/v1/continuous_queries/{id}/executions` and
+`GET /api/v1/retention/{id}/executions` answered `200 {"executions": null}`
+for an ID with no continuous query or policy behind it, so a typo or a deleted
+definition looked like one that had never run. In a cluster, a deleted
+definition's history could still be listed for a moment after the delete,
+until the node's own tables caught up with the cluster. Both routes now answer
+`404 "Continuous query not found"` or `404 "Retention policy not found"`, as
+`GET /{id}` already did, and `503` while the node is not yet able to read the cluster's definitions, as
+`GET /{id}` does. A definition that has not run yet lists `"executions": []`
+instead of `null`.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar).
 ### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
 
 On local storage, `iceberg.warehouse` set to a plain path (for example

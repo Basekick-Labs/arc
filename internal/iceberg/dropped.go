@@ -198,7 +198,7 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 		Msg("Iceberg: forgot this node's catalog row for a table whose database another node dropped; the table is exported again as a new table")
 	// With no row, a table published at the canonical directory since is
 	// adopted before a load creates one.
-	if _, err := e.adoptPublished(ctx, ident, nsKey, measurement); err != nil {
+	if _, err := e.adoptPublished(ctx, ident, nsKey, databaseOfIdent(e.nsPrefix, ident), measurement); err != nil {
 		return true, err
 	}
 	return true, nil

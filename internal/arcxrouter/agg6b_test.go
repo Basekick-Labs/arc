@@ -1,7 +1,6 @@
 // agg-6b companion: the fn(y, x) covariance / correlation / regression family
-// routes ungrouped and under a date_trunc bucket key; a tag key with any of them
-// declines (the hasMoment gate, set in the two-argument arm). Pure tokenizer
-// tests — no engine, no cgo.
+// routes ungrouped and under either key kind (tag keys since C2 — tag_keyed_test.go).
+// Pure tokenizer tests — no engine, no cgo.
 
 package arcxrouter
 
@@ -52,10 +51,6 @@ func TestBinaryMomentsRecognized(t *testing.T) {
 
 func TestBinaryMomentsDecline(t *testing.T) {
 	for _, sql := range []string{
-		// tag-keyed: the measured loss class — gated (plan-adversarial M2)
-		"SELECT host, corr(cpu_user, cpu_idle) FROM cpu GROUP BY host",
-		"SELECT host, regr_slope(y, x), count(*) FROM cpu GROUP BY host",
-		"SELECT date_trunc('hour', time), host, covar_pop(y, x) FROM cpu GROUP BY 1, host",
 		// argument shapes the engine declines
 		"SELECT corr(y) FROM cpu",
 		"SELECT corr(y, x, z) FROM cpu",

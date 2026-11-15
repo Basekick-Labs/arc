@@ -268,6 +268,20 @@ func TestRBACOnlyTokenCanIngest(t *testing.T) {
 		req.Header.Set("x-arc-database", db)
 		return req
 	}
+	rw := func(db string) *http.Request {
+		body := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
+			[]remoteWriteTestLabel{{name: "__name__", value: "cpu"}, {name: "instance", value: "host-01:9100"}},
+			[]remoteWriteTestSample{{value: 1, time: time.Now().UnixMilli()}},
+			false, false,
+		)))
+		req := httptest.NewRequest(http.MethodPost, prometheusRemoteWritePath+"?db="+db, bytes.NewReader(body))
+		for name, value := range remoteWriteTestHeaders() {
+			if name != "x-arc-database" {
+				req.Header.Set(name, value)
+			}
+		}
+		return req
+	}
 	type tc struct {
 		name, token string
 		req         func() *http.Request
@@ -290,6 +304,10 @@ func TestRBACOnlyTokenCanIngest(t *testing.T) {
 		tc{"msgpack granted db", "rbac-only", func() *http.Request { return mp("tenanta") }, true, false},
 		tc{"msgpack other db", "rbac-only", func() *http.Request { return mp("tenantb") }, false, false},
 		tc{"msgpack no grants", "none", func() *http.Request { return mp("tenanta") }, false, true},
+		tc{"remote write granted db", "rbac-only", func() *http.Request { return rw("tenanta") }, true, false},
+		tc{"remote write other db", "rbac-only", func() *http.Request { return rw("tenantb") }, false, false},
+		tc{"remote write no grants", "none", func() *http.Request { return rw("tenanta") }, false, true},
+		tc{"remote write coarse write, team grants none", "coarse-team-no-grant", func() *http.Request { return rw("tenanta") }, false, true},
 	)
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -30,6 +30,42 @@ func TestDatabaseThreadCountDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestFlightSQLDefaults(t *testing.T) {
+	v := viper.New()
+	setDefaults(v)
+	if v.GetBool("flight_sql.enabled") {
+		t.Fatal("flight_sql.enabled default = true, want false")
+	}
+	if got := v.GetInt("flight_sql.port"); got != 50051 {
+		t.Fatalf("flight_sql.port default = %d, want 50051", got)
+	}
+}
+
+func TestValidateFlightSQLConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		flight  FlightSQLConfig
+		server  ServerConfig
+		wantErr bool
+	}{
+		{name: "disabled ignores port", flight: FlightSQLConfig{Port: -1}, server: ServerConfig{Port: 8000}},
+		{name: "valid", flight: FlightSQLConfig{Enabled: true, Port: 50051}, server: ServerConfig{Port: 8000}},
+		{name: "minimum port", flight: FlightSQLConfig{Enabled: true, Port: 1}, server: ServerConfig{Port: 8000}},
+		{name: "maximum port", flight: FlightSQLConfig{Enabled: true, Port: 65535}, server: ServerConfig{Port: 8000}},
+		{name: "zero port", flight: FlightSQLConfig{Enabled: true, Port: 0}, server: ServerConfig{Port: 8000}, wantErr: true},
+		{name: "large port", flight: FlightSQLConfig{Enabled: true, Port: 65536}, server: ServerConfig{Port: 8000}, wantErr: true},
+		{name: "HTTP port conflict", flight: FlightSQLConfig{Enabled: true, Port: 8000}, server: ServerConfig{Port: 8000}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateFlightSQLConfig(tc.flight, tc.server)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateFlightSQLConfig() error = %v, wantErr %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestEffectiveCores_ForwardsToSyscpu pins that config's exported form is the
 // same answer as the package that owns the implementation. The table-driven
 // coverage of the pure form lives in internal/syscpu with the function.
@@ -1023,6 +1059,45 @@ func TestLoad_ClusterSeedsEnvOverride(t *testing.T) {
 		if v != expected[i] {
 			t.Errorf("Cluster.Seeds[%d] = %q, want %q", i, v, expected[i])
 		}
+	}
+}
+
+// TestLoad_ClusterSeedsEverySpelling pins #1675: a TOML array of seeds was read
+// through GetString, which returns "" for an array, so the node started with
+// no seeds and never joined. Every spelling an operator writes must land.
+func TestLoad_ClusterSeedsEverySpelling(t *testing.T) {
+	cases := []struct {
+		name   string
+		stanza string
+		env    string
+		want   []string
+	}{
+		{name: "default", want: nil},
+		{name: "TOML array", stanza: `seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]`, want: []string{"10.0.0.1:9100", "10.0.0.2:9100"}},
+		{name: "TOML comma-separated string", stanza: `seeds = "10.0.0.1:9100, 10.0.0.2:9100"`, want: []string{"10.0.0.1:9100", "10.0.0.2:9100"}},
+		{name: "TOML empty array", stanza: `seeds = []`, want: nil},
+		{name: "array element holding a comma is two seeds", stanza: `seeds = ["10.0.0.1:9100,10.0.0.2:9100", " 10.0.0.3:9100 ", ""]`, want: []string{"10.0.0.1:9100", "10.0.0.2:9100", "10.0.0.3:9100"}},
+		{name: "environment variable", env: "e1:9100,e2:9100", want: []string{"e1:9100", "e2:9100"}},
+		{name: "the environment overrides a file array", stanza: `seeds = ["f1:9100"]`, env: "e1:9100,e2:9100", want: []string{"e1:9100", "e2:9100"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := ""
+			if tc.stanza != "" {
+				body = "[cluster]\n" + tc.stanza + "\n"
+			}
+			writeArcToml(t, body)
+			if tc.env != "" {
+				t.Setenv("ARC_CLUSTER_SEEDS", tc.env)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load(): %v", err)
+			}
+			if !reflect.DeepEqual(cfg.Cluster.Seeds, tc.want) {
+				t.Errorf("Cluster.Seeds = %#v, want %#v", cfg.Cluster.Seeds, tc.want)
+			}
+		})
 	}
 }
 

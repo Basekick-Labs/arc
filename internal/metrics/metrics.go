@@ -232,8 +232,13 @@ type Metrics struct {
 	// dropped (the WAL writer refused or timed out; those rows replay).
 	walRowCheckpointsWritten atomic.Int64
 	walRowCheckpointsDropped atomic.Int64
-	bufferFullRejections     atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
-	walDiskStatErrors        atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
+
+	// #1635: keys of failed flush writes that may land after all.
+	ingestAmbiguousWritesRecorded  atomic.Int64
+	ingestAmbiguousWritesRemoved   atomic.Int64
+	ingestAmbiguousWritesAbandoned atomic.Int64
+	bufferFullRejections           atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
+	walDiskStatErrors              atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -246,11 +251,16 @@ type Metrics struct {
 	reconciliationStorageSweepHeld atomic.Int64
 
 	// Ingest fencing (#1207)
-	ingestFenced          atomic.Int64                           // 1 while this writer refuses writes
-	ingestFencedWrites    [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
-	writesForwarded       [len(WriteForwardResults)]atomic.Int64 // writes forwarded to a writer, by result (#1270)
-	walQuarantinedFiles   atomic.Int64                           // WAL files isolated after repeated recovery failures
-	walQuarantineReleased atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
+	ingestFenced           atomic.Int64                           // 1 while this writer refuses writes
+	ingestFencedWrites     [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
+	writesForwarded        [len(WriteForwardResults)]atomic.Int64 // writes forwarded to a writer, by result (#1270)
+	walQuarantinedFiles    atomic.Int64                           // WAL files isolated after repeated recovery failures
+	walFlushIntentsWritten atomic.Int64                           // #1646
+	walFlushIntentsDropped atomic.Int64                           // #1646
+	walFlushIntentsAdopted atomic.Int64                           // #1646
+	walDamagedEntries      atomic.Int64                           // damaged WAL frames in files quarantined for damage (#1634)
+	walRepairedLengths     atomic.Int64                           // WAL entries read past a damaged length field (#1641)
+	walQuarantineReleased  atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
 	// would replay in full.
@@ -858,8 +868,12 @@ func (m *Metrics) IncWALNotDurableRejections()     { m.walNotDurableRejections.A
 func (m *Metrics) IncWALDurableAckTimeouts()       { m.walDurableAckTimeouts.Add(1) }
 func (m *Metrics) IncWALRowCheckpointsWritten()    { m.walRowCheckpointsWritten.Add(1) }
 func (m *Metrics) IncWALRowCheckpointsDropped()    { m.walRowCheckpointsDropped.Add(1) }
-func (m *Metrics) IncBufferFullRejections()        { m.bufferFullRejections.Add(1) }
-func (m *Metrics) IncWALDiskStatErrors()           { m.walDiskStatErrors.Add(1) }
+
+func (m *Metrics) IncIngestAmbiguousWritesRecorded()  { m.ingestAmbiguousWritesRecorded.Add(1) }
+func (m *Metrics) IncIngestAmbiguousWritesRemoved()   { m.ingestAmbiguousWritesRemoved.Add(1) }
+func (m *Metrics) IncIngestAmbiguousWritesAbandoned() { m.ingestAmbiguousWritesAbandoned.Add(1) }
+func (m *Metrics) IncBufferFullRejections()           { m.bufferFullRejections.Add(1) }
+func (m *Metrics) IncWALDiskStatErrors()              { m.walDiskStatErrors.Add(1) }
 
 // SetReconciliationStorageSweepHeld records whether the last reconciliation
 // run held its orphan-storage sweep (#1214).
@@ -964,6 +978,29 @@ func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 	return time.Since(time.Unix(0, ns)).Seconds()
 }
 func (m *Metrics) IncWALQuarantinedFiles() { m.walQuarantinedFiles.Add(1) }
+
+// Flush intents (#1646).
+func (m *Metrics) IncWALFlushIntentsWritten() { m.walFlushIntentsWritten.Add(1) }
+func (m *Metrics) IncWALFlushIntentsDropped() { m.walFlushIntentsDropped.Add(1) }
+func (m *Metrics) IncWALFlushIntentsAdopted() { m.walFlushIntentsAdopted.Add(1) }
+
+// GetWALFlushIntentsAdopted reads arc_wal_flush_intents_adopted_total.
+func (m *Metrics) GetWALFlushIntentsAdopted() int64 { return m.walFlushIntentsAdopted.Load() }
+
+// AddWALDamagedEntries counts the damaged frames (checksum mismatches) of a
+// WAL file quarantined on the first pass (#1634): entries recovery cannot
+// replay. Files quarantined after three strikes are not counted here.
+func (m *Metrics) AddWALDamagedEntries(n int64) { m.walDamagedEntries.Add(n) }
+
+// GetWALDamagedEntries reads arc_wal_damaged_entries_total.
+func (m *Metrics) GetWALDamagedEntries() int64 { return m.walDamagedEntries.Load() }
+
+// AddWALRepairedLengths counts WAL entries recovery read past a damaged
+// length field, by their checksum (#1641).
+func (m *Metrics) AddWALRepairedLengths(n int64) { m.walRepairedLengths.Add(n) }
+
+// GetWALRepairedLengths reads arc_wal_repaired_length_entries_total.
+func (m *Metrics) GetWALRepairedLengths() int64 { return m.walRepairedLengths.Load() }
 
 // AddWALQuarantineReleased counts pending WAL entries the writer stopped
 // waiting for because recovery quarantined their file (#1225).
@@ -1412,6 +1449,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_durable_ack_timeouts":          m.walDurableAckTimeouts.Load(),
 		"wal_row_checkpoints_written":       m.walRowCheckpointsWritten.Load(),
 		"wal_row_checkpoints_dropped":       m.walRowCheckpointsDropped.Load(),
+		"ingest_ambiguous_writes_recorded":  m.ingestAmbiguousWritesRecorded.Load(),
+		"ingest_ambiguous_writes_removed":   m.ingestAmbiguousWritesRemoved.Load(),
+		"ingest_ambiguous_writes_abandoned": m.ingestAmbiguousWritesAbandoned.Load(),
 		"ingest_buffer_full_rejections":     m.bufferFullRejections.Load(),
 		"wal_disk_stat_errors":              m.walDiskStatErrors.Load(),
 		"file_registrations_pending":        m.fileRegistrationsPending.Load(),
@@ -1421,6 +1461,11 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_fenced":                     m.ingestFenced.Load(),
 		"ingest_fenced_writes":              m.ingestFencedWritesTotal(),
 		"wal_quarantined_files":             m.walQuarantinedFiles.Load(),
+		"wal_flush_intents_written":         m.walFlushIntentsWritten.Load(),
+		"wal_flush_intents_dropped":         m.walFlushIntentsDropped.Load(),
+		"wal_flush_intents_adopted":         m.walFlushIntentsAdopted.Load(),
+		"wal_damaged_entries":               m.walDamagedEntries.Load(),
+		"wal_repaired_length_entries":       m.walRepairedLengths.Load(),
 		"wal_quarantine_released_entries":   m.walQuarantineReleased.Load(),
 		"wal_partial_row_recovery_pending":  m.walPartialRowRecovery.Load(),
 
@@ -2043,6 +2088,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_row_checkpoints_dropped_total Row-range checkpoints the WAL writer refused or timed out on; those rows replay after a crash\n"...)
 	b = append(b, "# TYPE arc_wal_row_checkpoints_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_wal_row_checkpoints_dropped_total", float64(m.walRowCheckpointsDropped.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_recorded_total Flush writes that failed but may still land in storage, tracked so a late copy is removed once WAL replay stores the rows (#1635)\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_recorded_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_recorded_total", float64(m.ingestAmbiguousWritesRecorded.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_removed_total Late-landed copies of failed flush writes removed after their rows were replayed into another file\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_removed_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_removed_total", float64(m.ingestAmbiguousWritesRemoved.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_abandoned_total Failed flush writes no longer tracked without a removal (rows never seen stored again, or a foreign object at the key); a late copy there duplicates rows\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_abandoned_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_abandoned_total", float64(m.ingestAmbiguousWritesAbandoned.Load()))
 	b = append(b, "# HELP arc_ingest_buffer_full_rejections_total Write requests refused because rows waiting to be flushed reached ingest.max_buffered_bytes (bulk imports: 90 percent of it); nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_ingest_buffer_full_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_buffer_full_rejections_total", float64(m.bufferFullRejections.Load()))
@@ -2086,9 +2140,24 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_file_registration_journal_errors_total", float64(m.fileRegistrationJournalErrs.Load()))
 
-	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
+	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures, or at once when their only failure is damaged entries\n"...)
 	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
 	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
+	b = append(b, "# HELP arc_wal_flush_intents_written_total Flush intents appended to the WAL before a file was stored\n"...)
+	b = append(b, "# TYPE arc_wal_flush_intents_written_total counter\n"...)
+	b = appendMetric(b, "arc_wal_flush_intents_written_total", float64(m.walFlushIntentsWritten.Load()))
+	b = append(b, "# HELP arc_wal_flush_intents_dropped_total Flush intents not written (WAL queue full, or too large); a crash before those flushes' checkpoints replays their rows\n"...)
+	b = append(b, "# TYPE arc_wal_flush_intents_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_wal_flush_intents_dropped_total", float64(m.walFlushIntentsDropped.Load()))
+	b = append(b, "# HELP arc_wal_flush_intents_adopted_total Files a flush stored before a crash took its checkpoint, checkpointed at recovery instead of replayed\n"...)
+	b = append(b, "# TYPE arc_wal_flush_intents_adopted_total counter\n"...)
+	b = appendMetric(b, "arc_wal_flush_intents_adopted_total", float64(m.walFlushIntentsAdopted.Load()))
+	b = append(b, "# HELP arc_wal_damaged_entries_total Damaged WAL entries (checksum mismatch) in files recovery quarantined on the first pass; their rows cannot be replayed\n"...)
+	b = append(b, "# TYPE arc_wal_damaged_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_damaged_entries_total", float64(m.walDamagedEntries.Load()))
+	b = append(b, "# HELP arc_wal_repaired_length_entries_total WAL entries recovery read past a damaged length field, found by their checksum and confirmed by the next entry\n"...)
+	b = append(b, "# TYPE arc_wal_repaired_length_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_repaired_length_entries_total", float64(m.walRepairedLengths.Load()))
 
 	b = append(b, "# HELP arc_wal_quarantine_released_entries_total Pending WAL entries the writer stopped waiting for because their file was quarantined\n"...)
 	b = append(b, "# TYPE arc_wal_quarantine_released_entries_total counter\n"...)

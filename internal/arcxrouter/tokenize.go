@@ -357,6 +357,39 @@ func readColumnRef(c *cursor, t token) (string, bool) {
 	return t.orig + "['" + keyT.str + "']", true
 }
 
+// readCountDistinct completes `count(DISTINCT <col>)` after `count(` was consumed,
+// mirroring the engine (arcX cd-1): the `distinct` keyword, ONE column reference
+// — a bare identifier, or `m['k']` when subscript is allowed — and the closing
+// `)`. `count(DISTINCT a, b)`, the row form `count(DISTINCT (a, b))`, `*`,
+// expressions and `ORDER BY` inside the call all fail the `)` or column checks,
+// exactly where the engine declines them. Re-serialized as
+// `count(DISTINCT <col as written>)`: both engines echo the keyword upper-case
+// and the column's spelling in the derived name. Returns ok=false (cursor
+// consumed) on anything else; callers check `peekIdentLower() == "distinct"`
+// first, so a non-DISTINCT `count(` is never consumed here.
+func readCountDistinct(c *cursor, subscript bool) (string, bool) {
+	if !c.ident("distinct") {
+		return "", false
+	}
+	arg, ok := c.next()
+	if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" ||
+		duckdbNonColumnKeywords[arg.lower] || !isBareIdent(arg.orig) {
+		return "", false
+	}
+	ref := arg.orig
+	if subscript {
+		r, rok := readColumnRef(c, arg)
+		if !rok {
+			return "", false
+		}
+		ref = r
+	}
+	if !c.punct(')') {
+		return "", false
+	}
+	return "count(DISTINCT " + ref + ")", true
+}
+
 func (c *cursor) next() (token, bool) {
 	if c.i >= len(c.toks) {
 		return token{}, false
@@ -485,6 +518,13 @@ func orderKeyRef(c *cursor, items []string, orderRef func(token) int, aliases []
 					return -1, false
 				}
 				text = "count(*)"
+			} else if t.lower == "count" && c.peekIdentLower() == "distinct" {
+				// cd-1: an exact integer, so a valid ORDER BY target.
+				txt, dok := readCountDistinct(c, false)
+				if !dok {
+					return -1, false
+				}
+				text = txt
 			} else {
 				a, aok := c.next()
 				if !aok || a.kind != tokIdent || !isBareIdent(a.orig) || !c.punct(')') {
@@ -613,7 +653,9 @@ func matchScalarAgg(toks []token) (fn, col, meas, alias string, ok bool) {
 	// The argument must be a bare column identifier — NOT `*` (count(*) is the
 	// existing CountStar shape) and NOT an expression.
 	arg, ok := c.next()
-	if !ok || arg.kind != tokIdent {
+	// A bare keyword is not a column (`count(DISTINCT)` is a DuckDB parser error;
+	// the engine's footer matcher declines it) — never a footer count of `DISTINCT`.
+	if !ok || arg.kind != tokIdent || duckdbNonColumnKeywords[arg.lower] {
 		return "", "", "", "", false
 	}
 	col = arg.orig
@@ -951,6 +993,13 @@ func matchScanAgg(toks []token) (items, aliases []string, whereText string, meas
 					return fail()
 				}
 				items = append(items, "count(*)")
+			} else if f.lower == "count" && c.peekIdentLower() == "distinct" {
+				// cd-1: `count(DISTINCT <col | m['k']>)`.
+				item, ok := readCountDistinct(c, true)
+				if !ok {
+					return fail()
+				}
+				items = append(items, item)
 			} else if predArgAggFns[f.lower] && predArgFollows(c) {
 				// agg-6b2: a predicate argument (pred_arg.go).
 				text, ok := reserializePredArg(c)
@@ -1070,12 +1119,9 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	fail := func() (groupedMatch, bool) { return groupedMatch{}, false }
 	var items []string
 	var bucketText, tagKey, whereText, meas string
-	// agg-6a: a moment aggregate is served grouped ONLY under a bucket key.
-	// Measured on the production cpu corpus (3.95B rows, through Arc): hourly
-	// bucket + var_samp 6.1 s vs DuckDB 8.9 s (the engine folds bucket RUNS as
-	// two-pass partials); host + stddev 18.3 s vs 6.7 s (interleaved tag keys
-	// pay a per-row Welford chain) — a known loss, not routed (gotcha #5).
-	hasMoment := false
+	// tagGated: an item named in tagGatedFns (or a hidden HAVING one) refuses a tag
+	// key. The table is empty since C2 — kept as the per-name lever (see its doc).
+	tagGated := false
 
 	bucketItem := -1
 	tagItem := -1
@@ -1209,25 +1255,21 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			}
 			items = append(items, bucketText)
 		} else if isCall && quantileAggFns[t.lower] {
-			// agg-7: gated on tag keys like the moments (momentAggFns).
 			item, iok := parseQuantileAggItem(c, t.lower)
 			if !iok {
 				return fail()
 			}
-			hasMoment = true
+			tagGated = tagGated || tagGatedFns[t.lower]
 			items = append(items, item)
 			nAggs++
 		} else if isCall && (twoArgAggFns[t.lower] || binaryMomentFns[t.lower]) {
 			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm), and the
-			// agg-6b fn(y, x) family — which gates tag-keyed shapes like the
-			// moments (agg-6b plan-adversarial M2: the gate lives here too).
+			// agg-6b fn(y, x) family.
 			item, iok := parseTwoArgAggItem(c, t.lower)
 			if !iok {
 				return fail()
 			}
-			if binaryMomentFns[t.lower] {
-				hasMoment = true
-			}
+			tagGated = tagGated || tagGatedFns[t.lower]
 			items = append(items, item)
 			nAggs++
 		} else if isCall {
@@ -1235,9 +1277,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			if !unaryAggFns[t.lower] || t.lower == "mode" {
 				return fail()
 			}
-			if momentAggFns[t.lower] {
-				hasMoment = true
-			}
+			tagGated = tagGated || tagGatedFns[t.lower]
 			c.i++ // consume '('
 			if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
 				c.i++
@@ -1245,9 +1285,17 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 					return fail()
 				}
 				items = append(items, "count(*)")
+			} else if t.lower == "count" && c.peekIdentLower() == "distinct" {
+				// cd-1: `count(DISTINCT <bare col>)` under either key kind. A map
+				// subscript argument is not routed grouped (the other grouped
+				// aggregates take bare columns only).
+				item, iok := readCountDistinct(c, false)
+				if !iok {
+					return fail()
+				}
+				items = append(items, item)
 			} else if predArgAggFns[t.lower] && predArgFollows(c) {
-				// agg-6b2: a predicate argument (pred_arg.go); the tag-key gate
-				// above (hasMoment) still applies — these names are momentAggFns.
+				// agg-6b2: a predicate argument (pred_arg.go).
 				text, tok := reserializePredArg(c)
 				if !tok || !c.punct(')') {
 					return fail()
@@ -1407,12 +1455,11 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		}
 		havingText, havingUnstable = ht, hst.unstable
 		m.havingHidden = len(hst.hidden)
-		hasMoment = hasMoment || hst.hiddenMoment
+		tagGated = tagGated || hst.hiddenTagGated
 	}
-	// res-3b: moved after the HAVING so a hidden moment / order statistic / binary
-	// statistic is gated like a selected one.
-	if hasMoment && tagKey != "" {
-		return fail() // agg-6a: tag-keyed moments are a measured loss (see hasMoment)
+	// res-3b: after the HAVING so a hidden aggregate is gated like a selected one.
+	if tagGated && tagKey != "" {
+		return fail()
 	}
 	if nAggs == 0 && m.havingHidden == 0 {
 		return fail() // a grouped select with no aggregate anywhere (bare DISTINCT)
@@ -1615,31 +1662,17 @@ var quantileAggFns = map[string]bool{
 	"quantile_cont": true, "quantile_disc": true, "quantile": true,
 }
 
-// momentAggFns: the agg-6a subset of unaryAggFns whose grouped form is gated to
-// bucket-keyed shapes (see matchGroupedAgg's hasMoment).
-var momentAggFns = map[string]bool{
-	"var_pop": true, "var_samp": true, "variance": true,
-	"stddev": true, "stddev_samp": true, "stddev_pop": true, "sem": true,
-	// agg-6b': same gate — tag-keyed grouping measured 1.1–1.4× behind DuckDB
-	// (host, fsum 125 vs 111 ms; count_if 84 vs 61; bit_or 63 vs 54), while the
-	// time-bucket form wins (250 vs 360 ms).
-	"fsum": true, "sumkahan": true, "kahan_sum": true, "favg": true,
-	"bit_and": true, "bit_or": true, "bit_xor": true,
-	"bool_and": true, "bool_or": true, "count_if": true, "countif": true,
-	// agg-7: tag-keyed order statistics take the engine's generic hash path (the
-	// dictionary paths are off for value-list states) — gated like the moments.
-	// (Grouped `mode` is refused outright, and the quantile arm sets the gate
-	// itself, so only median/mad are read here.)
-	"median": true, "mad": true,
-	// agg-8: tag-keyed shape statistics are per-row central-moment chains.
-	"skewness": true, "kurtosis": true, "kurtosis_pop": true,
-}
+// tagGatedFns: aggregates whose tag-keyed grouped form is refused (sent to DuckDB),
+// read for select items and hidden HAVING items alike. EMPTY since C2: the agg-6a
+// per-row-chain loss that filled it is gone (measurements: arcX
+// docs/2026-11-13-c2-tag-keyed-families.md). A name goes back in only if its
+// tag-keyed form measures a loss of its own beyond the routed `avg` reference.
+// Grouped `mode` is refused separately (unaryAggFns).
+var tagGatedFns = map[string]bool{}
 
 // binaryMomentFns: the agg-6b two-argument family, `fn(y, x)` over two bare
-// columns (arcX feat/agg6b-binary). Served ungrouped and under a date_trunc
-// bucket key; a tag key with any of them declines (matchGroupedAgg's
-// hasMoment gate — per-row recurrences on interleaved slots are the measured
-// loss class from agg-6a).
+// columns (arcX feat/agg6b-binary). Served ungrouped and grouped under either
+// key kind (tag keys since C2 — see tagGatedFns).
 var binaryMomentFns = map[string]bool{
 	"covar_pop": true, "covar_samp": true, "corr": true, "regr_count": true,
 	"regr_avgx": true, "regr_avgy": true, "regr_slope": true, "regr_intercept": true,

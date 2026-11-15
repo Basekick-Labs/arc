@@ -133,6 +133,9 @@ type CompletionWatcherConfig struct {
 	Storage      storage.Backend
 	BeforeCommit func(output string)
 	OnCommitted  func(inputs []string) error
+	// OnCommittedInto runs right after OnCommitted succeeded, with the job's
+	// output (#1683). Its error retries the finish, as OnCommitted's does.
+	OnCommittedInto func(inputs []string, output string) error
 	// OnFinished runs when an object job's finisher ended it, its input
 	// objects deleted (#1207 d2a2b).
 	OnFinished func()

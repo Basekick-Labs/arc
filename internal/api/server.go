@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -86,6 +87,17 @@ type Server struct {
 	licenseStatus func() license.LicenseHealth
 	// coldMissingObjects supplies the /health "tiering" field (#1551).
 	coldMissingObjects func() *tiering.ColdMissingObjectsStatus
+
+	// onShutdownStart runs first in Shutdown (OnShutdownStart).
+	onShutdownStartMu sync.Mutex
+	onShutdownStart   []func()
+
+	// queryLifetime ends the queries still running once the shutdown grace
+	// is over (QueryLifetime, ShutdownContext); conns tracks the open
+	// connections that shutdown closes after that (#1644).
+	queryLifetime context.Context
+	cancelQueries context.CancelFunc
+	conns         *connTracker
 }
 
 // ServerConfig holds server configuration
@@ -202,7 +214,16 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// Request logging middleware
 	app.Use(requestLogger(logger))
 
+	queryLifetime, cancelQueries := context.WithCancel(context.Background())
+	conns := newConnTracker()
+	// Fiber never sets ConnState, and app.Server() is the server Listen,
+	// ListenTLS and Listener all serve on.
+	app.Server().ConnState = conns.connState
+
 	return &Server{
+		queryLifetime:  queryLifetime,
+		cancelQueries:  cancelQueries,
+		conns:          conns,
 		app:            app,
 		logger:         logger.With().Str("component", "api-server").Logger(),
 		host:           config.Host,
@@ -784,19 +805,20 @@ func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	return tls.NewListener(ln, tlsCfg), nil
 }
 
-// Shutdown gracefully shuts down the server
+// OnShutdownStart registers fn to run when Shutdown starts, before the HTTP
+// server drains: the point at which fasthttp ends its requests' contexts. The
+// cluster router's StopForwards is registered here, so a forward, which does
+// not run on its request's context (#1629), ends when it used to.
+func (s *Server) OnShutdownStart(fn func()) {
+	s.onShutdownStartMu.Lock()
+	s.onShutdownStart = append(s.onShutdownStart, fn)
+	s.onShutdownStartMu.Unlock()
+}
+
+// Shutdown drains the server within timeout: ShutdownContext with that
+// budget.
 func (s *Server) Shutdown(timeout time.Duration) error {
-	s.logger.Info().Msg("Shutting down server gracefully...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := s.app.ShutdownWithContext(ctx); err != nil {
-		return fmt.Errorf("server shutdown failed: %w", err)
-	}
-
-	s.logger.Info().Msg("Server stopped")
-	return nil
+	return s.ShutdownContext(context.Background(), timeout)
 }
 
 // WaitForShutdown blocks until shutdown signal is received

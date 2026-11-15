@@ -822,6 +822,12 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
+	// lifetime is the context read requests run on (SetLifetime); nil
+	// leaves them on Fiber's background context.
+	lifetime context.Context
+	// warehouse names the Iceberg warehouse's directories in the storage
+	// root, which the listings leave out (#1626); nil with Iceberg off.
+	warehouse   WarehouseDirs
 	db          *database.DuckDB
 	storage     storage.Backend
 	pruner      *pruning.PartitionPruner
@@ -1407,6 +1413,19 @@ func (h *QueryHandler) QueryGate503Total() int64 {
 	return h.gate503Total.Load()
 }
 
+// SetWarehouseLayout hides the Iceberg warehouse's directories from SHOW
+// DATABASES, SHOW TABLES and GET /api/v1/measurements (#1626), as
+// DatabasesHandler.SetWarehouseLayout does from the database routes.
+func (h *QueryHandler) SetWarehouseLayout(l WarehouseDirs) { h.warehouse = l }
+
+func (h *QueryHandler) isWarehouseDir(name string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseRootDir(name)
+}
+
+func (h *QueryHandler) isWarehouseMeasurement(db, m string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseMeasurement(db, m)
+}
+
 // SetTieringManager sets the tiering manager for multi-tier query routing.
 // When set, queries will check both hot and cold tiers for data.
 func (h *QueryHandler) SetTieringManager(manager *tiering.Manager) {
@@ -1610,6 +1629,49 @@ func (h *QueryHandler) SetGovernance(manager *governance.Manager, lc *license.Cl
 // SetQueryRegistry sets the query registry for long-running query management.
 func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
+}
+
+// SetLifetime sets the context the read endpoints run their queries on when
+// the request carries none of its own: api.Server.QueryLifetime, which
+// shutdown cancels once its grace is over (#1644). Call before serving.
+// Without it a query ends only at its timeout or its client's disconnect.
+func (h *QueryHandler) SetLifetime(ctx context.Context) {
+	h.lifetime = ctx
+}
+
+// shuttingDown reports whether the handler's lifetime is over: shutdown has
+// cancelled the queries still running (#1644).
+func (h *QueryHandler) shuttingDown() bool {
+	return h.lifetime != nil && h.lifetime.Err() != nil
+}
+
+// endedByShutdown reports whether a cancelled query was ended by shutdown
+// (the handler's lifetime is over) rather than by Cancel() or its client.
+// If so, it closes out queryID in the registry, which nothing else does for
+// a shutdown cancel.
+func (h *QueryHandler) endedByShutdown(queryID string) bool {
+	if !h.shuttingDown() {
+		return false
+	}
+	if h.queryRegistry != nil && queryID != "" {
+		h.queryRegistry.CancelWithReason(queryID, "server shutting down")
+	}
+	return true
+}
+
+// bindQueryLifetime wraps next (the read-auth middleware) so the request's
+// user context is the handler's lifetime. Every query derives its DuckDB
+// context from c.UserContext(), so ending the lifetime ends the query, and
+// the Arrow and MessagePack streams that run after the handler returns. A
+// context already set is kept: the Flight SQL bridge sets its own, which its
+// shutdown cancels.
+func (h *QueryHandler) bindQueryLifetime(next fiber.Handler) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if h.lifetime != nil && c.UserContext() == context.Background() {
+			c.SetUserContext(h.lifetime)
+		}
+		return next(c)
+	}
 }
 
 // OpenCompactions is what the query layer needs from the compactions a read
@@ -2240,7 +2302,11 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// authority comes from RBAC alone (#1559). SetAuthAndRBAC runs before
 	// RegisterRoutes (cmd/arc/main.go), so both managers are already set here:
 	// the checker is captured now, not looked up per request.
-	readAuth := withAnyResourceReadAuth(h.authManager, h.rbacManager)
+	//
+	// Each read also runs on the handler's lifetime (bindQueryLifetime), so
+	// shutdown can end the queries still running when its grace is over
+	// (#1644). The rebuild route is a write and keeps its own context.
+	readAuth := h.bindQueryLifetime(withAnyResourceReadAuth(h.authManager, h.rbacManager))
 	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Same execution pipeline as /api/v1/query, but the response is
 	// streamed as MessagePack instead of JSON — columnar, typed, and
@@ -2609,7 +2675,11 @@ localProcessing:
 				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
 				h.queryRegistry.Complete(queryID, rc)
 			}
-			onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+			onFail = func(msg string) {
+				if !h.endedByShutdown(queryID) {
+					h.queryRegistry.Fail(queryID, msg)
+				}
+			}
 			onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
 		}
 		_, handled := arrowDispatch(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
@@ -2695,9 +2765,19 @@ localProcessing:
 				Timestamp:       timestamp,
 			})
 		}
+		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Query cancelled at shutdown")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Server shutting down",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
 		if h.queryRegistry != nil && queryID != "" {
 			if ctxErr == context.Canceled {
-				// Already marked as cancelled by Cancel() — no-op
+				// Cancelled by Cancel() (DELETE /api/v1/queries/:id or a
+				// client disconnect), which recorded it — no-op.
 			} else {
 				h.queryRegistry.Fail(queryID, "Query execution failed")
 			}
@@ -5394,10 +5474,10 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visibl
 		}
 	}
 
-	// Filter out hidden directories
+	// Filter out hidden directories, and the Iceberg warehouse's (#1626)
 	filtered := make([]string, 0)
 	for _, db := range databases {
-		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") && !h.isWarehouseDir(db) {
 			filtered = append(filtered, db)
 		}
 	}
@@ -5544,10 +5624,13 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		}
 	}
 
-	// Filter out hidden tables
+	// Filter out hidden tables. An Iceberg warehouse directory is not a
+	// database, so it has no tables, as an unknown database has none; a nested
+	// warehouse is not a table of the database it sits in (#1626).
 	filtered := make([]string, 0)
+	warehouseDB := h.isWarehouseDir(database)
 	for _, table := range tables {
-		if !strings.HasPrefix(table, ".") && !strings.HasPrefix(table, "_") {
+		if !warehouseDB && !strings.HasPrefix(table, ".") && !strings.HasPrefix(table, "_") && !h.isWarehouseMeasurement(database, table) {
 			filtered = append(filtered, table)
 		}
 	}
@@ -6100,7 +6183,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	}
 
 	for _, dbEntry := range dbEntries {
-		if !dbEntry.IsDir() || strings.HasPrefix(dbEntry.Name(), ".") || strings.HasPrefix(dbEntry.Name(), "_") {
+		if !dbEntry.IsDir() || strings.HasPrefix(dbEntry.Name(), ".") || strings.HasPrefix(dbEntry.Name(), "_") || h.isWarehouseDir(dbEntry.Name()) {
 			continue
 		}
 
@@ -6126,7 +6209,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 		}
 
 		for _, measurementEntry := range measurementEntries {
-			if !measurementEntry.IsDir() || strings.HasPrefix(measurementEntry.Name(), ".") || strings.HasPrefix(measurementEntry.Name(), "_") {
+			if !measurementEntry.IsDir() || strings.HasPrefix(measurementEntry.Name(), ".") || strings.HasPrefix(measurementEntry.Name(), "_") || h.isWarehouseMeasurement(dbName, measurementEntry.Name()) {
 				continue
 			}
 
@@ -6210,7 +6293,10 @@ func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout 
 	m := metrics.Get()
 	// One decision over every limit: a refused query is counted against none
 	// of them (#1524).
-	result := h.governanceManager.Admit(tokenInfo.ID)
+	// The token's stored-hash fingerprint names it to the cluster's policies
+	// (#1627): a pre-cluster local token sharing a cluster token's ID gets
+	// this node's defaults, not that token's policy.
+	result := h.governanceManager.AdmitToken(tokenInfo.ID, tokenInfo.Fingerprint)
 	if !result.Allowed {
 		c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
 		m.IncQueryErrors()

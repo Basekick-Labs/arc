@@ -494,3 +494,27 @@ false
 true
 {{- end -}}
 {{- end -}}
+
+{{/*
+The Flight SQL container port (flight_sql.port), refused at render time when
+it is not a valid port or collides with the HTTP (8000), coordinator (9100) or
+Raft (9200) port, or when writer/reader extraEnv sets ARC_FLIGHT_SQL_*, which
+would move the listener away from the container and Service ports.
+*/}}
+{{- define "arc-enterprise.flightSqlPort" -}}
+{{- $p := int .Values.flightSql.port -}}
+{{- if or (lt $p 1) (gt $p 65535) -}}
+{{- fail (printf "flightSql.port must be between 1 and 65535 (got %d)" $p) -}}
+{{- end -}}
+{{- if has $p (list 8000 9100 9200) -}}
+{{- fail (printf "flightSql.port %d collides with an Arc port (8000 HTTP, 9100 coordinator, 9200 Raft)" $p) -}}
+{{- end -}}
+{{- range $role := list "writer" "reader" -}}
+{{- range (index $.Values $role).extraEnv -}}
+{{- if hasPrefix "ARC_FLIGHT_SQL_" (toString .name) -}}
+{{- fail (printf "set the Flight SQL listener with flightSql.*, not %s.extraEnv (%s): the container and Service ports follow flightSql.port" $role .name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $p -}}
+{{- end -}}

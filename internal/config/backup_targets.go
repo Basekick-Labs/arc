@@ -180,23 +180,29 @@ func (t BackupTargetConfig) KeyPrefix() (string, error) {
 
 // discoverBackupTargetNames returns the configured target names, sorted.
 //
-// Two sources, unioned, on the cluster.seeds precedent:
+// Two sources, unioned:
 //
 //   - the keys of the backup.targets map in a config file. This is the only
 //     viper map read in this package; everything else, including every FIELD
 //     of a target, is a literal dotted key so that AutomaticEnv resolves it.
 //     The map is read for NAMES alone.
-//   - backup.target_names, comma-separated. A name cannot be discovered from
+//   - backup.target_names, a TOML array or a comma-separated string. A name
+//     cannot be discovered from
 //     a map that does not exist, so a deployment configured entirely from the
 //     environment needs this to say which names to look for. Parsed through
-//     parseStringSlice for the reason recorded there: GetStringSlice does not
-//     split a comma-separated environment value.
+//     parseTargetDatabases, so it accepts a TOML array as well as a
+//     comma-separated string or environment value. It was
+//     parseStringSlice(v.GetString(...)), which reads a TOML array as nothing
+//     (GetString returns "" for it); GetStringSlice is no better, as it does
+//     not split a comma-separated environment value (#1675). Array elements
+//     are not comma-split (unlike cluster.seeds): a comma is not a legal
+//     target-name character, so ["a,b"] is refused below by name, loudly.
 func discoverBackupTargetNames(v *viper.Viper) ([]string, error) {
 	seen := map[string]bool{}
 	for name := range v.GetStringMap("backup.targets") {
 		seen[name] = true
 	}
-	for _, name := range parseStringSlice(v.GetString("backup.target_names")) {
+	for _, name := range parseTargetDatabases(v.Get("backup.target_names")) {
 		seen[name] = true
 	}
 	names := make([]string, 0, len(seen))
@@ -245,6 +251,20 @@ func suggestTargetName(name string) string {
 // BackupTargetConfig.Type).
 func setBackupTargetDefaults(v *viper.Viper, name string) {
 	k := "backup.targets." + name + "."
+	setObjectTargetDefaults(v, k)
+	// A string default rather than an empty []string, so an unset key reads
+	// back as the scalar spelling rather than as an empty array, which is the
+	// shape parseTargetDatabases treats as "nothing routed" without having to
+	// distinguish the two. Required like every other key (the SQLite checklist
+	// rule): without it the key is invisible to an operator reading the
+	// defaults.
+	v.SetDefault(k+"databases", "")
+}
+
+// setObjectTargetDefaults registers the backend fields of a storage target
+// whose keys start with k (ending in "."): a backup target, or an edge sync
+// relay bucket (#1685).
+func setObjectTargetDefaults(v *viper.Viper, k string) {
 	v.SetDefault(k+"type", "")
 	v.SetDefault(k+"local_path", "")
 	v.SetDefault(k+"s3_bucket", "")
@@ -267,13 +287,37 @@ func setBackupTargetDefaults(v *viper.Viper, name string) {
 	v.SetDefault(k+"gcs_prefix", "")
 	v.SetDefault(k+"gcs_credentials_file", "")
 	v.SetDefault(k+"gcs_endpoint", "")
-	// A string default rather than an empty []string, so an unset key reads
-	// back as the scalar spelling rather than as an empty array, which is the
-	// shape parseTargetDatabases treats as "nothing routed" without having to
-	// distinguish the two. Required like every other key (the SQLite checklist
-	// rule): without it the key is invisible to an operator reading the
-	// defaults.
-	v.SetDefault(k+"databases", "")
+}
+
+// readObjectTarget reads the backend fields of a storage target whose keys
+// start with k (ending in "."). Databases is not read: it is backup routing.
+func readObjectTarget(v *viper.Viper, name, k string) BackupTargetConfig {
+	get := func(field string) string { return strings.TrimSpace(v.GetString(k + field)) }
+	return BackupTargetConfig{
+		Name:                    name,
+		Type:                    strings.ToLower(get("type")),
+		LocalPath:               get("local_path"),
+		S3Bucket:                get("s3_bucket"),
+		S3Region:                get("s3_region"),
+		S3Endpoint:              get("s3_endpoint"),
+		S3AccessKey:             v.GetString(k + "s3_access_key"),
+		S3SecretKey:             v.GetString(k + "s3_secret_key"),
+		S3UseSSL:                v.GetBool(k + "s3_use_ssl"),
+		S3PathStyle:             v.GetBool(k + "s3_path_style"),
+		S3Prefix:                get("s3_prefix"),
+		AzureContainer:          get("azure_container"),
+		AzurePrefix:             get("azure_prefix"),
+		AzureConnectionString:   get("azure_connection_string"),
+		AzureAccountName:        get("azure_account_name"),
+		AzureAccountKey:         get("azure_account_key"),
+		AzureSASToken:           get("azure_sas_token"),
+		AzureEndpoint:           get("azure_endpoint"),
+		AzureUseManagedIdentity: v.GetBool(k + "azure_use_managed_identity"),
+		GCSBucket:               get("gcs_bucket"),
+		GCSPrefix:               get("gcs_prefix"),
+		GCSCredentialsFile:      get("gcs_credentials_file"),
+		GCSEndpoint:             get("gcs_endpoint"),
+	}
 }
 
 // parseTargetDatabases reads backup.targets.<name>.databases.
@@ -290,10 +334,9 @@ func setBackupTargetDefaults(v *viper.Viper, name string) {
 //
 // So the array spelling needs a slice accessor and the scalar spellings need a
 // comma split; the env value correctly overrides a file array, so there is no
-// precedence trap. parseStringSlice(v.GetString(k)) — the accessor
-// backup.target_names uses — returns NIL for the TOML array with no error at
-// all, i.e. no routing, silently; that precedent is safe only because a target
-// NAME has a second source (the backup.targets map), and databases has none.
+// precedence trap. parseStringSlice(v.GetString(k)) returns NIL for the TOML
+// array with no error at all, i.e. no routing, silently — the bug cluster.seeds
+// and backup.target_names had until #1675, when both moved to this function.
 //
 // GetStringSlice was the first answer and is WRONG for the scalar spellings:
 // it casts through cast.ToStringSlice, which runs strings.Fields, so it splits
@@ -369,33 +412,9 @@ func loadBackupTargets(v *viper.Viper) (map[string]BackupTargetConfig, error) {
 	for _, name := range names {
 		setBackupTargetDefaults(v, name)
 		k := "backup.targets." + name + "."
-		get := func(field string) string { return strings.TrimSpace(v.GetString(k + field)) }
-		targets[name] = BackupTargetConfig{
-			Name:                    name,
-			Type:                    strings.ToLower(get("type")),
-			LocalPath:               get("local_path"),
-			S3Bucket:                get("s3_bucket"),
-			S3Region:                get("s3_region"),
-			S3Endpoint:              get("s3_endpoint"),
-			S3AccessKey:             v.GetString(k + "s3_access_key"),
-			S3SecretKey:             v.GetString(k + "s3_secret_key"),
-			S3UseSSL:                v.GetBool(k + "s3_use_ssl"),
-			S3PathStyle:             v.GetBool(k + "s3_path_style"),
-			S3Prefix:                get("s3_prefix"),
-			AzureContainer:          get("azure_container"),
-			AzurePrefix:             get("azure_prefix"),
-			AzureConnectionString:   get("azure_connection_string"),
-			AzureAccountName:        get("azure_account_name"),
-			AzureAccountKey:         get("azure_account_key"),
-			AzureSASToken:           get("azure_sas_token"),
-			AzureEndpoint:           get("azure_endpoint"),
-			AzureUseManagedIdentity: v.GetBool(k + "azure_use_managed_identity"),
-			GCSBucket:               get("gcs_bucket"),
-			GCSPrefix:               get("gcs_prefix"),
-			GCSCredentialsFile:      get("gcs_credentials_file"),
-			GCSEndpoint:             get("gcs_endpoint"),
-			Databases:               parseTargetDatabases(v.Get(k + "databases")),
-		}
+		t := readObjectTarget(v, name, k)
+		t.Databases = parseTargetDatabases(v.Get(k + "databases"))
+		targets[name] = t
 	}
 	return targets, nil
 }
@@ -881,4 +900,32 @@ func (c *Config) coldTierDestination() (storage.Destination, error) {
 			Endpoint: cold.GCSEndpoint,
 		},
 	})
+}
+
+// loadEdgeSyncRelay reads edge_sync.spoke.relay.* or edge_sync.import.relay.*
+// (#1685). k ends in ".". Durations are parsed only when the relay is on, so
+// a malformed value on a disabled side does not stop a node that never reads
+// it.
+func loadEdgeSyncRelay(v *viper.Viper, k string, spoke bool) (EdgeSyncRelayConfig, error) {
+	r := EdgeSyncRelayConfig{
+		Enabled: v.GetBool(k + "enabled"),
+		Target:  readObjectTarget(v, "relay", k),
+	}
+	if !spoke {
+		// Hub only: a spoke never stages a bundle, so it has no staging_dir key (#1109).
+		r.StagingDir = strings.TrimSpace(v.GetString(k + "staging_dir"))
+	}
+	if !r.Enabled {
+		return r, nil
+	}
+	var err error
+	if r.Interval, err = parsePositiveDuration(v, k+"interval"); err != nil {
+		return r, err
+	}
+	if spoke {
+		if r.AckTimeout, err = parsePositiveDuration(v, k+"ack_timeout"); err != nil {
+			return r, err
+		}
+	}
+	return r, nil
 }

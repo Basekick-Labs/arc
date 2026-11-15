@@ -72,8 +72,6 @@ func TestGroupedAggMoments(t *testing.T) {
 
 func TestMomentsDecline(t *testing.T) {
 	for _, sql := range []string{
-		// tag-keyed shape statistics stay gated (agg-8)
-		"SELECT host, skewness(v) FROM cpu GROUP BY host",
 		// argument shapes the engine declines
 		"SELECT stddev(DISTINCT v) FROM cpu",
 		"SELECT stddev(v + 1) FROM cpu",
@@ -81,11 +79,6 @@ func TestMomentsDecline(t *testing.T) {
 		"SELECT stddev(v, w) FROM cpu",
 		"SELECT stddev(m['k']) FROM cpu",
 		"SELECT stddev() FROM cpu",
-		// tag-keyed moments: a measured 2.7× loss (18.3 s vs 6.7 s by host) — held
-		"SELECT host, stddev(cpu_user), var_pop(cpu_idle) FROM cpu GROUP BY host",
-		"SELECT host, count(*), stddev(v) FROM cpu GROUP BY host HAVING stddev(v) > 1",
-		"SELECT date_trunc('hour', time), host, stddev(v) FROM cpu GROUP BY 1, host",
-		"SELECT host, sem(v) FROM cpu WHERE v > 1 GROUP BY host ORDER BY host",
 	} {
 		if m, ok := eligibleShape(sql); ok {
 			t.Fatalf("should decline (%s): %s", m.shape, sql)

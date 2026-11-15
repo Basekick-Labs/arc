@@ -14,5 +14,11 @@ spec:
     - name: http
       port: {{ .Values.service.reader.port }}
       targetPort: 8000
+    {{- if .Values.flightSql.enabled }}
+    - name: flight-sql
+      port: {{ int .Values.flightSql.servicePort }}
+      targetPort: flight-sql
+      appProtocol: grpc
+    {{- end }}
   selector:
     {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "reader") | nindent 4 }}

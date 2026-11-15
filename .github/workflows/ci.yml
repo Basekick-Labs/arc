@@ -311,3 +311,6 @@ jobs:
         run: |
           bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
             -f helm/arc-enterprise/values-shared-storage.yaml
+
+      - name: Flight SQL listener in both charts (off by default, ports when on)
+        run: bash scripts/test_helm_flight_sql.sh

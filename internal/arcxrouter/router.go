@@ -625,9 +625,13 @@ func isAggItem(item string) bool {
 	inner := item[open+1 : len(item)-1]
 	fn := item[:open]
 	switch {
-	// `count` also takes a map subscript `m['k']` (map-2); every other unary
+	// `count` also takes a map subscript `m['k']` (map-2) and the cd-1 form
+	// `DISTINCT <col>` (exactly readCountDistinct's emission); every other unary
 	// aggregate (agg-1 set, mean, the agg-6a moments) stays bare.
 	case fn == "count":
+		if col, ok := strings.CutPrefix(inner, "DISTINCT "); ok {
+			return isColumnRef(col)
+		}
 		return isColumnRef(inner)
 	// agg-7: `quantile_*(col, q)` — exactly a bare ident and a fraction.
 	case quantileAggFns[fn]:
@@ -670,6 +674,19 @@ func isOracleUnstableItem(item string) bool {
 	// orders of magnitude across thread counts (plan-adversarial M1).
 	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept(",
 		"fsum(", "sumkahan(", "kahan_sum(", "favg("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPinnedNaNItem: the three bivariate aggregates whose DuckDB answer for ±Inf input
+// depends on its own partitioning (arcX moments-nd M3). arcx pins them to NaN on any
+// non-finite input, so arcx NaN vs a DuckDB ±Inf on these is the known divergence and
+// is filed as `oraclediff:` (WARN), not a mismatch alarm.
+func isPinnedNaNItem(item string) bool {
+	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy("} {
 		if strings.HasPrefix(item, p) {
 			return true
 		}

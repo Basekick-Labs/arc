@@ -39,7 +39,10 @@ type FileSetSource interface {
 type StorageWalkSource struct {
 	backend  storage.Backend
 	resolver *PathResolver
-	nsPrefix string // Iceberg namespace prefix; warehouse dirs "<nsPrefix>_*.db" are excluded
+	// layout names the warehouse's directories in the storage root, which the walk skips. Never
+	// nil: NewStorageWalkSource starts with the namespace-directory rule alone, and
+	// SetWarehouseLayout adds a subdirectory or nested warehouse (#1626).
+	layout *WarehouseLayout
 	// pendingOutputs, when set, names compaction outputs whose sources still
 	// exist; they are excluded from the file set (#638).
 	pendingOutputs func(ctx context.Context, prefix string) (map[string]struct{}, error)
@@ -147,29 +150,26 @@ func NewStorageWalkSource(backend storage.Backend, nsPrefix string, logger zerol
 	return &StorageWalkSource{
 		backend:  backend,
 		resolver: NewPathResolver(backend),
-		nsPrefix: nsPrefix,
+		layout:   NewWarehouseLayout("", "", nsPrefix),
 		logger:   logger,
 	}
 }
 
-// isWarehouseDir reports whether a top-level directory is an Iceberg warehouse namespace
-// directory ("<nsPrefix>_<db>.db") written by the exporter, which must be excluded from the
-// data-file walk. Iceberg's SQL catalog names namespace dirs "<namespace>.db".
+// SetWarehouseLayout makes the walk skip the directories the exporter's warehouse occupies in
+// the storage root, by the rule the database listings apply (#1626): a subdirectory warehouse
+// ("<root>/lv_wh") is not walked as a database, nor a nested one as a measurement. The
+// namespace-directory rule holds either way. Call during wiring, before the scheduler starts.
+func (s *StorageWalkSource) SetWarehouseLayout(l *WarehouseLayout) {
+	if l != nil {
+		s.layout = l
+	}
+}
+
+// isWarehouseDir reports whether a top-level directory belongs to the Iceberg warehouse the
+// exporter writes ("<nsPrefix>_<db>.db" namespace directories, and a subdirectory warehouse once
+// SetWarehouseLayout names it), which must be excluded from the data-file walk.
 func (s *StorageWalkSource) isWarehouseDir(name string) bool {
-	if strings.HasPrefix(name, s.nsPrefix+"_") && strings.HasSuffix(name, ".db") {
-		return true
-	}
-	// iceberg-go v0.7.0 JSON-encodes a namespace whose component contains a dot, and an edge-sync
-	// spoke ID may contain one (#1129), so that directory does not start with "<prefix>_" at all.
-	// Decoding through catalogNamespaceKey's own inverse is deliberate: a second, local copy of
-	// the encoding rule is how the exporter would come to disagree with the catalog about which
-	// directories are its own, and a directory it fails to recognise here is walked back in as a
-	// user database -- the harm the whole namespace scheme exists to prevent (#634).
-	if !strings.HasSuffix(name, ".db") {
-		return false
-	}
-	namespace, ok := decodeCatalogNamespace(strings.TrimSuffix(name, ".db"))
-	return ok && namespaceBelongsToPrefix(namespace, s.nsPrefix)
+	return s.layout.IsWarehouseRootDir(name)
 }
 
 // dirLister is the subset of storage backends that can enumerate immediate subdirectories.
@@ -230,8 +230,8 @@ func (s *StorageWalkSource) measurementsOn(ctx context.Context, dl dirLister) ([
 		}
 		for _, m := range measurements {
 			m = strings.Trim(m, "/")
-			if m == "" {
-				continue
+			if m == "" || s.layout.IsWarehouseMeasurement(db, m) {
+				continue // a nested warehouse ("<root>/db/m/…") is not a measurement
 			}
 			out = append(out, Measurement{Database: db, Measurement: m})
 		}
@@ -347,9 +347,11 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 			return files, local, nil
 		}
 		if attempt == vanishRetries {
+			// Busy, not failed (vanished.go): a writer path is rewriting the measurement. The
+			// guard itself is unchanged; only how the scheduler reports it.
 			return nil, nil, fmt.Errorf(
-				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass",
-				m.Database, m.Measurement, len(vanished), attempt)
+				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass: %w",
+				m.Database, m.Measurement, len(vanished), attempt, errSourcesMoving)
 		}
 		prev = vanished
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("vanished", len(vanished)).
@@ -364,6 +366,11 @@ func (s *StorageWalkSource) FileSchema(ctx context.Context, f FileRef) (ArcSchem
 		return s.coldSchema(ctx, f)
 	}
 	if f.LocalPath != "" {
+		// A local footer read is synchronous and cannot be interrupted, but a chunk whose time
+		// is up must not start new ones (#1686): the remote path checks ctx in its GETs.
+		if err := ctx.Err(); err != nil {
+			return ArcSchema{}, err
+		}
 		return SchemaFromParquet(f.LocalPath)
 	}
 	return SchemaFromBackend(ctx, s.backend, f.Key, f.SizeBytes)
@@ -653,15 +660,34 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	return files, local, vanished, nil
 }
 
+// FileExists reports whether a listed file is still in storage, asked through the backend that
+// holds it: the cold tier for a cold file, this node's disk for a local one, the primary store
+// otherwise. The reconcile asks it after a footer read fails with a not-found (vanished.go), so a
+// file is only ever treated as deleted on its own backend's word.
+func (s *StorageWalkSource) FileExists(ctx context.Context, f FileRef) (bool, error) {
+	if f.Cold {
+		if s.cold == nil {
+			return false, fmt.Errorf("cold file %s listed with no cold tier configured", f.Key)
+		}
+		size, err := s.cold.backend.StatFile(ctx, f.Key)
+		if err != nil {
+			return false, err
+		}
+		return size >= 0, nil
+	}
+	_, present, err := s.statSize(ctx, f.Key, f.LocalPath)
+	return present, err
+}
+
 // statSize returns the file's current byte size, which the reconciler needs
 // for a file rewritten at its own path (#633). Since #1073 the delete API's
 // partial-match branch publishes a fresh path instead, but restores and
 // edge-sync still write a known path, and only the size tells that
 // content apart from what the Iceberg manifest describes.
-// present=false means the file is gone. Local files are stat'ed directly; a
-// backend that is not an object store (objectLister) but has no local path
-// answers through StatFile. Object stores never get here: their size comes
-// from the listing.
+// present=false means the file is gone. Local files are stat'ed directly;
+// anything else answers through the backend's StatFile. The listing never
+// sends an object store here (its size comes from the listing itself), but
+// FileExists does, for one file whose footer read came back not-found.
 func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string) (size int64, present bool, err error) {
 	if localPath != "" {
 		st, err := os.Stat(localPath)

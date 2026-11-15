@@ -76,7 +76,7 @@ func (e *Exporter) publishMetadataCopy(ctx context.Context, vKey string, body []
 // whether it moved the row. A table the warehouse holds no published version of is left alone
 // (EnsureTable creates it). Read errors fail the pass: guessing would risk the fork this exists
 // to prevent.
-func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier, nsKey, measurement string) (bool, error) {
+func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier, nsKey, database, measurement string) (bool, error) {
 	if e.backend == nil {
 		return false, nil
 	}
@@ -87,8 +87,15 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 	if rowExists && !e.warehouseAuthoritative {
 		return false, nil
 	}
-	dirLoc := strings.TrimSuffix(e.warehouse, "/") + "/" + nsKey + ".db/" + measurement + "/metadata"
-	if rowExists {
+	var dirLoc string
+	if !rowExists {
+		// Where a table is published depends on the layout it was created
+		// under (#1676): look in the configured layout's directory, then the
+		// other's.
+		if dirLoc, err = e.noRowMetaDirLoc(ctx, nsKey, database, measurement); err != nil {
+			return false, err
+		}
+	} else {
 		// Not path.Dir: it cleans "file:///x" to "file:/x" and "s3://b/x" to "s3:/b/x".
 		slash := strings.LastIndex(rowLoc, "/")
 		if slash < 0 {
@@ -202,6 +209,9 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 	}
 	if !json.Valid(body) {
 		return false, fmt.Errorf("published Iceberg metadata %s is not valid JSON", vKey)
+	}
+	if err := e.checkAdoptedLocation(database, measurement, dirLoc, body); err != nil {
+		return false, err
 	}
 	newLoc := dirLoc + "/v" + strconv.Itoa(target) + ".metadata.json"
 	if err := e.pointCatalogRow(ctx, nsKey, measurement, rowLoc, rowExists, newLoc); err != nil {

@@ -411,23 +411,43 @@ func TestSlowStandbyOnlyLosesItsOwn(t *testing.T) {
 	dropped := metrics.Get().Snapshot()["origin_stream_dropped"].(int64)
 	big := string(bytes.Repeat([]byte("x"), 64<<10))
 	const n = 600 // ~38 MiB: past the stuck connection's socket buffers and its 8 MiB queue
-	// Keep real concurrent writes within each burst, but let the good standby
-	// drain it before publishing more. A fixed sleep assumes a minimum receiver
-	// throughput that a busy race-enabled runner cannot guarantee. Each 1 MiB
-	// burst fits well below the unchanged 8 MiB per-standby queue; the stuck
-	// standby never drains and must still exhaust its queue across the bursts.
-	const burst = 16
-	for c := uint64(1); c <= n; c++ {
-		hook(p, "db/a", c, big)
-		if c%burst == 0 || c == n {
-			waitFor(t, fmt.Sprintf("the good standby to receive entry %d", c), func() bool {
-				good.mu.Lock()
-				defer good.mu.Unlock()
-				d := good.instances[instanceID{"primary", p.instance}]
-				return d != nil && d.keys["db/a"] != nil && d.keys["db/a"].last == c
-			})
+	// The producer is paced by the good standby's progress, never by the
+	// clock: at most lag entries (~2 MiB) ahead of what it has stored, far
+	// under its 8 MiB queue, so it cannot overflow its own queue however slow
+	// the runner is. A fixed rate let a good standby slowed by a loaded -race
+	// runner overflow its own queue, which read as a gap caused by the stuck
+	// one (#1672). Any gap now is the stuck standby's doing. The trade: this
+	// test proves the good standby LOSES nothing; a stuck standby that only
+	// slowed the good one's sender would pass unless it stalled it past the
+	// deadline below.
+	const lag = 32
+	goodLast := func() uint64 {
+		good.mu.Lock()
+		defer good.mu.Unlock()
+		d := good.instances[instanceID{"primary", p.instance}]
+		if d == nil || d.keys["db/a"] == nil {
+			return 0
+		}
+		return d.keys["db/a"].last
+	}
+	// Entries not sent to the good standby leave it short (a run of lag or
+	// more stalls the producer) or with a gap: both report the gaps.
+	waitGood := func(want uint64) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); goodLast() < want; time.Sleep(2 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the good standby stopped at %d, want %d of %d, with gaps %v because another standby is slow",
+					goodLast(), want, n, keyGaps(good, "primary", p.instance, "db/a"))
+			}
 		}
 	}
+	for c := uint64(1); c <= n; c++ {
+		if c > lag {
+			waitGood(c - lag)
+		}
+		hook(p, "db/a", c, big)
+	}
+	waitGood(n)
 	if g := keyGaps(good, "primary", p.instance, "db/a"); len(g) != 0 {
 		t.Fatalf("the good standby has gaps %v because another standby is slow", g)
 	}

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -249,6 +250,14 @@ const (
 	// CommandColdMarkReset: an admin clearing the seed (and a backend
 	// conflict) so the next cold listing seeds again.
 	CommandColdMarkReset
+	// Query governance policies (#1627), see governance_policies.go.
+	// CommandEnableGovernancePolicies turns their flag on once every node
+	// supports them; CommandSetGovernancePolicy creates or replaces a
+	// token's policy and CommandDeleteGovernancePolicy removes it, once
+	// seeded.
+	CommandEnableGovernancePolicies
+	CommandSetGovernancePolicy
+	CommandDeleteGovernancePolicy
 )
 
 // Command represents a command to be applied to the FSM.
@@ -884,6 +893,10 @@ type ClusterFSM struct {
 	cqEnabled bool
 	cqs       map[int64]*CQEntry
 	cqSeq     int64
+	// Governance policies (#1627) by token ID, see governance_policies.go.
+	governanceEnabled  bool
+	governancePolicies map[int64]*GovernancePolicyEntry
+	governanceSeq      int64
 	// policyAdoptChoice: an admin's pending choice of node, per kind.
 	policyAdoptChoice map[string]*PolicyAdoptChoice
 	// onPoliciesChanged: AddPoliciesChangedCallback.
@@ -984,6 +997,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		retentionSeededIDs:      map[int64]bool{},
 		policyAdoptChoice:       map[string]*PolicyAdoptChoice{},
 		cqs:                     map[int64]*CQEntry{},
+		governancePolicies:      map[int64]*GovernancePolicyEntry{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1393,7 +1407,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandAwaitAdoption:
 		return f.applyAwaitAdoption(cmd.Payload)
 	case CommandEnableRetentionPolicies:
-		return f.applyEnableRetentionPolicies(cmd.Payload)
+		return f.applyEnablePolicyKind(PolicyKindRetention, cmd.Payload)
 	case CommandCreateRetentionPolicy:
 		return f.policiesChangedIfApplied(f.applyCreateRetentionPolicy(cmd.Payload))
 	case CommandUpdateRetentionPolicy:
@@ -1403,7 +1417,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandChoosePolicyAdoption:
 		return f.applyChoosePolicyAdoption(cmd.Payload)
 	case CommandEnableCQPolicies:
-		return f.applyEnableCQPolicies(cmd.Payload)
+		return f.applyEnablePolicyKind(PolicyKindCQ, cmd.Payload)
 	case CommandCreateCQ:
 		return f.policiesChangedIfApplied(f.applyCreateCQ(cmd.Payload))
 	case CommandUpdateCQ:
@@ -1414,6 +1428,12 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		// No mirror signal: a watermark moves at every run, and the mirrors
 		// pick it up on their periodic pass.
 		return f.applySetCQWatermark(cmd.Payload)
+	case CommandEnableGovernancePolicies:
+		return f.applyEnablePolicyKind(PolicyKindGovernance, cmd.Payload)
+	case CommandSetGovernancePolicy:
+		return f.policiesChangedIfApplied(f.applySetGovernancePolicy(cmd.Payload))
+	case CommandDeleteGovernancePolicy:
+		return f.policiesChangedIfApplied(f.applyDeleteGovernancePolicy(cmd.Payload))
 	case CommandEnableColdMark:
 		return f.applyEnableColdMark(cmd.Payload)
 	case CommandColdMarkAdd:
@@ -2498,6 +2518,23 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	return nil
 }
 
+// ErrTokenNameExists matches (errors.Is) the FSM's refusal of a token create
+// or rename to a name another token holds. On the leader the refusal reaches
+// the proposer typed; a follower gets only its text from the leader's
+// forward-apply ack, which internal/cluster's wrapApplyError recognises. #1625.
+var ErrTokenNameExists = errors.New("token name already exists")
+
+// tokenNameExistsError is that refusal. Its text is the one the FSM has always
+// returned, byte for byte: older followers, ensureFirstToken and the recovery
+// token match "already exists" in it, so it must not change.
+type tokenNameExistsError struct{ name string }
+
+func (e *tokenNameExistsError) Error() string {
+	return fmt.Sprintf("token name %q already exists", e.name)
+}
+
+func (e *tokenNameExistsError) Is(target error) bool { return target == ErrTokenNameExists }
+
 // rejectToken centralises FSM-side rejection of a malformed token command.
 // Same shape as rejectManifestPath: log at Error, bump counters, return a
 // wrapped validation error. The security property — entry does NOT land in
@@ -2697,7 +2734,7 @@ func (f *ClusterFSM) applyCreateToken(payload []byte, logIndex uint64) interface
 			Str("name", entry.Name).
 			Uint64("log_index", logIndex).
 			Msg("Duplicate token name create refused")
-		return fmt.Errorf("create token: token name %q already exists", entry.Name)
+		return fmt.Errorf("create token: %w", &tokenNameExistsError{name: entry.Name})
 	}
 	f.tokens[entry.ID] = &entry
 	f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], entry.ID)
@@ -2765,7 +2802,16 @@ func (f *ClusterFSM) applyUpdateToken(payload []byte, logIndex uint64) interface
 		// loop, so a linear scan was a future scaling bottleneck).
 		if otherID, exists := f.tokensByName[p.Name]; exists && otherID != p.ID {
 			f.mu.Unlock()
-			return f.rejectToken("update", p.ID, logIndex, fmt.Errorf("token name %q already exists", p.Name))
+			// A taken name is a client error (409), not a malformed
+			// command: logged at Debug and not counted as a rejected
+			// token, as the create's duplicate-name refusal. Same text as
+			// rejectToken produced. #1625.
+			f.logger.Debug().
+				Str("name", p.Name).
+				Int64("token_id", p.ID).
+				Uint64("log_index", logIndex).
+				Msg("Duplicate token name rename refused")
+			return fmt.Errorf("update token: %w", &tokenNameExistsError{name: p.Name})
 		}
 		// Maintain the name index: drop the old binding, add the new one.
 		delete(f.tokensByName, entry.Name)
@@ -2901,14 +2947,24 @@ func (f *ClusterFSM) applyDeleteToken(payload []byte, logIndex uint64) interface
 		}
 		delete(f.tokenMembershipsByToken, p.ID)
 	}
+	// A governance policy never outlives its token (#1627): the token's ID
+	// is a log index, and a later token can never take it, but a policy
+	// left behind would be listed and mirrored for no one.
+	droppedGovernance := f.dropGovernancePolicyLocked(p.ID)
 
 	callback := f.onTokenDeleted
 	f.mu.Unlock()
+	if droppedGovernance {
+		f.firePoliciesChanged()
+	}
 
 	metrics.Get().IncClusterAuthApplyDelete()
 	logEvt := f.logger.Info().Int64("token_id", p.ID)
 	if cascadedMemberships > 0 {
 		logEvt = logEvt.Int("cascaded_memberships", cascadedMemberships)
+	}
+	if droppedGovernance {
+		logEvt = logEvt.Bool("governance_policy_dropped", true)
 	}
 	logEvt.Msg("Token deleted from cluster auth state")
 	// Serialised with the reconcile against SQLite (#1336).
@@ -2962,8 +3018,15 @@ func (f *ClusterFSM) applyRotateToken(payload []byte, logIndex uint64) interface
 		}
 		f.tokensByPrefix[p.NewPrefix] = append(f.tokensByPrefix[p.NewPrefix], p.ID)
 	}
+	// A token's governance policy is enforced only for the token whose hash
+	// it was set for (#1627): a rotate changes that hash, so the readers of
+	// the governance state rebuild.
+	_, hasGovernance := f.governancePolicies[p.ID]
 	callback := f.onTokenRotated
 	f.mu.Unlock()
+	if hasGovernance {
+		f.firePoliciesChanged()
+	}
 
 	metrics.Get().IncClusterAuthApplyRotate()
 	f.logger.Info().Int64("token_id", p.ID).Uint64("lsn", logIndex).Msg("Token rotated in cluster auth state")
@@ -3448,6 +3511,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], id)
 		f.tokensByName[entry.Name] = id
 	}
+	// A governance policy never outlives its token (#1627), even in a
+	// snapshot that says otherwise: nothing would ever drop it.
+	f.dropOrphanGovernancePoliciesLocked()
 
 	// Phase A.1: install RBAC primary maps + rebuild all secondary
 	// indices from scratch (we never persist them — they're derived).

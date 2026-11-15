@@ -298,7 +298,7 @@ func TestRestoreBehind_NoRowNeverFallsBackBelowTheHint(t *testing.T) {
 		t.Fatal(err)
 	}
 	exp := restoredNode(t, r, db)
-	if _, err := exp.adoptPublished(context.Background(), exp.tableIdent("mydb", "cpu"), "arc_mydb", "cpu"); err == nil {
+	if _, err := exp.adoptPublished(context.Background(), exp.tableIdent("mydb", "cpu"), "arc_mydb", "mydb", "cpu"); err == nil {
 		t.Fatal("adoptPublished with no row and a hint naming a missing version: nil error, want the read failure")
 	}
 	var n int
@@ -350,7 +350,7 @@ func TestRestoreBehind_LeftoverVersionOfAnotherIncarnationIsNotAdopted(t *testin
 	}
 	before := rowLocation(t, db)
 	exp := restoredNode(t, r, db)
-	if _, err := exp.adoptPublished(context.Background(), exp.tableIdent("mydb", "cpu"), "arc_mydb", "cpu"); err != nil {
+	if _, err := exp.adoptPublished(context.Background(), exp.tableIdent("mydb", "cpu"), "arc_mydb", "mydb", "cpu"); err != nil {
 		t.Fatalf("adoptPublished: %v", err)
 	}
 	if got := rowLocation(t, db); got != before {

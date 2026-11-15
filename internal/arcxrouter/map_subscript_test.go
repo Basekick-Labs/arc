@@ -155,13 +155,14 @@ func TestMatchScanAgg_Subscript(t *testing.T) {
 		}
 	}
 	// Declined: a subscript under any other aggregate (the engine's agg-1 matrix
-	// declines Utf8 there), DISTINCT, and the two-arg by-time forms.
+	// declines Utf8 there), any DISTINCT but cd-1's count, and the two-arg by-time
+	// forms.
 	for _, sql := range []string{
 		"SELECT min(m['k']) FROM t WHERE host = 'h'",
 		"SELECT max(m['k']) FROM t",
 		"SELECT sum(m['k']) FROM t",
 		"SELECT avg(m['k']) FROM t",
-		"SELECT count(DISTINCT m['k']) FROM t",
+		"SELECT sum(DISTINCT m['k']) FROM t",
 		"SELECT arg_max(m['k'], time) FROM t",
 		"SELECT arg_max(val, m['k']) FROM t",
 	} {

@@ -3,8 +3,10 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -42,6 +44,7 @@ type Config struct {
 	// relative to the working directory is not it.
 	ConfigFile      string
 	Server          ServerConfig
+	FlightSQL       FlightSQLConfig
 	Database        DatabaseConfig
 	Storage         StorageConfig
 	Iceberg         IcebergConfig
@@ -87,6 +90,11 @@ type ServerConfig struct {
 	TLSEnabled  bool   // Enable HTTPS/TLS
 	TLSCertFile string // Path to TLS certificate file (PEM format)
 	TLSKeyFile  string // Path to TLS private key file (PEM format)
+}
+
+type FlightSQLConfig struct {
+	Enabled bool
+	Port    int
 }
 
 type DatabaseConfig struct {
@@ -171,7 +179,7 @@ type IngestConfig struct {
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
 	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
-	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
+	FlushTimeoutSeconds   int      // Timeout per file of a flush: its storage write, registrations and WAL checkpoint (default: 30s; <= 0 means 30s). Not a cap on the whole flush (#1692).
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
 	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
@@ -387,6 +395,42 @@ type EdgeSyncImportConfig struct {
 	// MaxFiles refuses a manifest declaring more than this, independently of
 	// whatever the exporting spoke was configured with. Zero means 10,000.
 	MaxFiles int64
+
+	// Timeout bounds one POST /api/v1/bundle-import. Parsed from
+	// edge_sync.import.timeout; always positive. Default 4h: every file is
+	// hashed twice (verify, then commit), off removable media (#1112).
+	Timeout time.Duration
+
+	// Relay polls a bucket shared with spokes for bundles (edge sync 3d,
+	// #1685): edge_sync.import.relay.*. Independent of Enabled, which mounts
+	// the drive-import endpoint.
+	Relay EdgeSyncRelayConfig
+}
+
+// Active reports whether this hub takes bundles at all, from a drive or a
+// relay bucket: both need the importer.
+func (c EdgeSyncImportConfig) Active() bool { return c.Enabled || c.Relay.Enabled }
+
+// EdgeSyncRelayConfig configures one side of the relay transport (#1685): a
+// spoke and its hub exchange bundles and acks through an object store both
+// can reach. The target's own prefix (s3_prefix, azure_prefix, gcs_prefix) or local_path
+// is the relay's root; spoke prefixes sit directly under it.
+type EdgeSyncRelayConfig struct {
+	// Enabled turns the relay on for this side.
+	Enabled bool
+	// Interval between scheduled passes (spoke: export and apply acks; hub:
+	// poll). Scheduled passes need the edge sync scheduler licence; a manual
+	// pass (POST .../relay/run) does not. Spoke default 5m, hub 1m.
+	Interval time.Duration
+	// AckTimeout (spoke only): a relay bundle with no ack and no refusal this
+	// long after export is taken back and its files re-sent. Default 72h.
+	AckTimeout time.Duration
+	// StagingDir (hub only): where a bundle is downloaded to be verified and
+	// imported, one at a time. Default ./data/edge_sync_relay_staging.
+	StagingDir string
+	// Target is the bucket: type (local, s3, minio, azure, azblob, gcs) and the
+	// same per-backend keys a backup target takes. Name is "relay".
+	Target BackupTargetConfig
 }
 
 // EdgeSyncSpokeConfig configures the push side of edge sync (#569).
@@ -472,8 +516,43 @@ type EdgeSyncSpokeConfig struct {
 	// visit. 0 disables pruning. Default 90.
 	LedgerRetentionDays int
 
+	// SyncTimeout bounds one manual sync pass (POST /api/v1/spoke-sync/run).
+	// Parsed from edge_sync.spoke.sync_timeout; always positive. Default 2h:
+	// a pass drains whatever backlog exists (#1112). Scheduled passes do not
+	// read it.
+	SyncTimeout time.Duration
+
+	// DeleteAfterSync makes the spoke delete its own copy of a synced file
+	// once the hub proves, in a later verify reconcile, that it still holds
+	// the content (edge sync phase 3a). Off by default: it deletes edge data.
+	// Requires edge_sync.spoke.enabled and an https (or loopback) hub_url,
+	// and is refused on a cluster node.
+	DeleteAfterSync bool
+
+	// DeleteAfterSyncDelay is the minimum time between a file being marked
+	// synced and the verification that may delete it. Default 0s: verified
+	// on the next pass, which is still a separate round trip.
+	DeleteAfterSyncDelay time.Duration
+
+	// DeleteAfterSyncAcceptCompacted lets delete_after_sync also delete files
+	// the hub holds only inside a compacted file or a cold copy (#1683).
+	// Default false: hub compaction drops exact duplicate rows, widens mixed
+	// BIGINT/DOUBLE columns to DOUBLE and turns unparseable times into NULL,
+	// so the spoke's copy is the only exact one.
+	DeleteAfterSyncAcceptCompacted bool
+
+	// DeleteAfterSyncAckMaxAge bounds how old a signed air-gap ack's held
+	// attestation may be, measured on the spoke's clock from the bundle's
+	// export, for delete_after_sync to act on it (#1684). An ack in transit
+	// cannot see hub retention or forget. Default 7 days; positive.
+	DeleteAfterSyncAckMaxAge time.Duration
+
 	// Bundle configures air-gap export.
 	Bundle EdgeSyncBundleConfig
+
+	// Relay sends bundles through a bucket shared with the hub (edge sync
+	// 3d, #1685): edge_sync.spoke.relay.*.
+	Relay EdgeSyncRelayConfig
 }
 
 // EdgeSyncBundleConfig configures air-gap bundle export on a spoke.
@@ -498,7 +577,18 @@ type EdgeSyncBundleConfig struct {
 	// MaxBytes caps one bundle's data. Zero means 64 GiB — roughly a large
 	// removable drive, and a bound on how much a single export can write.
 	MaxBytes int64
+
+	// Timeout bounds one POST /api/v1/spoke-sync/export. Parsed from
+	// edge_sync.spoke.bundle.timeout; always positive. Default 2h (#1112).
+	Timeout time.Duration
 }
+
+// Active reports whether this node acts as a spoke on any transport.
+func (s EdgeSyncSpokeConfig) Active() bool { return s.Enabled || s.Bundle.Enabled || s.Relay.Enabled }
+
+// ExportsBundles reports whether this spoke writes bundles, to a drive or a
+// relay bucket: both need the exporter, and both deliver signed acks.
+func (s EdgeSyncSpokeConfig) ExportsBundles() bool { return s.Bundle.Enabled || s.Relay.Enabled }
 
 type WALConfig struct {
 	Enabled                 bool   // Enable WAL for durability (default: false)
@@ -598,7 +688,21 @@ type IcebergConfig struct {
 	// listing when nothing invalidated it (#939): Arc's own cold changes invalidate it at once,
 	// so this bounds only changes made behind Arc's back.
 	ColdRescanInterval int
+	// Layout decides where the export puts a NEW table's metadata (#1676):
+	// "warehouse" (default) under <warehouse>/<prefix>_<db>.db/<measurement>,
+	// "colocated" in the measurement's own directory,
+	// <storage root>/<db>/<measurement>/metadata, with the table location set
+	// to that directory, so readers that reach data only through the table
+	// folder (OneLake shortcuts) can read Arc's files. Existing tables keep
+	// the location they were created with, whichever layout is set.
+	Layout string
 }
+
+// Iceberg export layouts (IcebergConfig.Layout).
+const (
+	IcebergLayoutWarehouse = "warehouse"
+	IcebergLayoutColocated = "colocated"
+)
 
 type ContinuousQueryConfig struct {
 	Enabled bool   // Enable continuous query management (default: true for CRUD, execution is manual)
@@ -728,6 +832,14 @@ type TieredStorageConfig struct {
 	// hot-row retirement runs only after the whole walk, so a scan that always
 	// truncates never retires a stale row.
 	ScanTimeout time.Duration
+
+	// MigrationTimeout bounds one migration cycle, scheduled or triggered by
+	// POST /api/v1/tiering/migrate. Parsed from
+	// tiered_storage.migration_timeout; always positive. Default 2h (#1112).
+	//
+	// The cycle's pre-migration scan runs inside this budget (see
+	// ScanTimeout), so a value below scan_timeout also shortens that scan.
+	MigrationTimeout time.Duration
 
 	// Cold tier configuration (remote S3/Azure/GCS storage)
 	Cold ColdTierConfig
@@ -1107,6 +1219,40 @@ func Load() (*Config, error) {
 		)
 	}
 
+	// #1112: same shape as backup.operation_timeout and scan_timeout.
+	migrationTimeout, err := parsePositiveDuration(v, "tiered_storage.migration_timeout")
+	if err != nil {
+		return nil, err
+	}
+	spokeSyncTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.sync_timeout")
+	if err != nil {
+		return nil, err
+	}
+	deleteAfterSyncAckMaxAge, err := parsePositiveDuration(v, "edge_sync.spoke.delete_after_sync_ack_max_age")
+	if err != nil {
+		return nil, err
+	}
+	deleteAfterSyncDelay, err := time.ParseDuration(v.GetString("edge_sync.spoke.delete_after_sync_delay"))
+	if err != nil || deleteAfterSyncDelay < 0 {
+		return nil, fmt.Errorf("invalid edge_sync.spoke.delete_after_sync_delay %q: must be a Go duration of 0 or more", v.GetString("edge_sync.spoke.delete_after_sync_delay"))
+	}
+	spokeBundleTimeout, err := parsePositiveDuration(v, "edge_sync.spoke.bundle.timeout")
+	if err != nil {
+		return nil, err
+	}
+	hubImportTimeout, err := parsePositiveDuration(v, "edge_sync.import.timeout")
+	if err != nil {
+		return nil, err
+	}
+	spokeRelay, err := loadEdgeSyncRelay(v, "edge_sync.spoke.relay.", true)
+	if err != nil {
+		return nil, err
+	}
+	hubRelay, err := loadEdgeSyncRelay(v, "edge_sync.import.relay.", false)
+	if err != nil {
+		return nil, err
+	}
+
 	backupOperationTimeout, err := time.ParseDuration(v.GetString("backup.operation_timeout"))
 	if err != nil || backupOperationTimeout <= 0 {
 		return nil, fmt.Errorf(
@@ -1137,6 +1283,10 @@ func Load() (*Config, error) {
 			TLSEnabled:                  v.GetBool("server.tls_enabled"),
 			TLSCertFile:                 v.GetString("server.tls_cert_file"),
 			TLSKeyFile:                  v.GetString("server.tls_key_file"),
+		},
+		FlightSQL: FlightSQLConfig{
+			Enabled: v.GetBool("flight_sql.enabled"),
+			Port:    v.GetInt("flight_sql.port"),
 		},
 		Database: DatabaseConfig{
 			MaxConnections:         v.GetInt("database.max_connections"),
@@ -1226,29 +1376,38 @@ func Load() (*Config, error) {
 			CompactReceivedNamespaces: v.GetBool("edge_sync.compact_received_namespaces"),
 			Import: EdgeSyncImportConfig{
 				Enabled:     v.GetBool("edge_sync.import.enabled"),
-				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
+				AllowedDirs: parseAllowedDirs(v.Get("edge_sync.import.allowed_dirs")),
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
+				Timeout:     hubImportTimeout,
+				Relay:       hubRelay,
 			},
 			Spoke: EdgeSyncSpokeConfig{
-				Enabled:                    v.GetBool("edge_sync.spoke.enabled"),
-				SyncInterval:               v.GetDuration("edge_sync.spoke.sync_interval"),
-				SyncRetryInterval:          v.GetDuration("edge_sync.spoke.sync_retry_interval"),
-				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
-				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
-				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
-				Secret:                     os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
-				HubToken:                   os.Getenv("ARC_EDGE_SYNC_HUB_TOKEN"),
-				MaxAttempts:                v.GetInt("edge_sync.spoke.max_attempts"),
-				MaxConcurrent:              v.GetInt("edge_sync.spoke.max_concurrent"),
-				BatchSize:                  v.GetInt("edge_sync.spoke.batch_size"),
-				LedgerRetentionDays:        v.GetInt("edge_sync.spoke.ledger_retention_days"),
-				DeferCompactionUntilSynced: v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
+				Enabled:                        v.GetBool("edge_sync.spoke.enabled"),
+				SyncInterval:                   v.GetDuration("edge_sync.spoke.sync_interval"),
+				SyncRetryInterval:              v.GetDuration("edge_sync.spoke.sync_retry_interval"),
+				SyncTimeout:                    spokeSyncTimeout,
+				DeleteAfterSync:                v.GetBool("edge_sync.spoke.delete_after_sync"),
+				DeleteAfterSyncDelay:           deleteAfterSyncDelay,
+				DeleteAfterSyncAcceptCompacted: v.GetBool("edge_sync.spoke.delete_after_sync_accept_compacted"),
+				DeleteAfterSyncAckMaxAge:       deleteAfterSyncAckMaxAge,
+				HubURL:                         v.GetString("edge_sync.spoke.hub_url"),
+				SpokeID:                        v.GetString("edge_sync.spoke.spoke_id"),
+				HubID:                          v.GetString("edge_sync.spoke.hub_id"),
+				Secret:                         os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
+				HubToken:                       os.Getenv("ARC_EDGE_SYNC_HUB_TOKEN"),
+				MaxAttempts:                    v.GetInt("edge_sync.spoke.max_attempts"),
+				MaxConcurrent:                  v.GetInt("edge_sync.spoke.max_concurrent"),
+				BatchSize:                      v.GetInt("edge_sync.spoke.batch_size"),
+				LedgerRetentionDays:            v.GetInt("edge_sync.spoke.ledger_retention_days"),
+				DeferCompactionUntilSynced:     v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
 				Bundle: EdgeSyncBundleConfig{
 					Enabled:     v.GetBool("edge_sync.spoke.bundle.enabled"),
-					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
+					AllowedDirs: parseAllowedDirs(v.Get("edge_sync.spoke.bundle.allowed_dirs")),
 					MaxFiles:    v.GetInt("edge_sync.spoke.bundle.max_files"),
 					MaxBytes:    v.GetInt64("edge_sync.spoke.bundle.max_bytes"),
+					Timeout:     spokeBundleTimeout,
 				},
+				Relay: spokeRelay,
 			},
 		},
 		Compaction: CompactionConfig{
@@ -1314,6 +1473,7 @@ func Load() (*Config, error) {
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
 			ColdRescanInterval:       v.GetInt("iceberg.cold_rescan_interval"),
+			Layout:                   strings.ToLower(strings.TrimSpace(v.GetString("iceberg.layout"))),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -1376,7 +1536,7 @@ func Load() (*Config, error) {
 			NodeID:                     v.GetString("cluster.node_id"),
 			Role:                       v.GetString("cluster.role"),
 			ClusterName:                v.GetString("cluster.cluster_name"),
-			Seeds:                      parseStringSlice(v.GetString("cluster.seeds")),
+			Seeds:                      parseSeeds(v.Get("cluster.seeds")),
 			CoordinatorAddr:            v.GetString("cluster.coordinator_addr"),
 			AdvertiseAddr:              v.GetString("cluster.advertise_addr"),
 			HealthCheckInterval:        v.GetInt("cluster.health_check_interval"),
@@ -1453,6 +1613,7 @@ func Load() (*Config, error) {
 			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
 			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
 			ScanTimeout:                   scanTimeout,
+			MigrationTimeout:              migrationTimeout,
 			Cold: ColdTierConfig{
 				Enabled: v.GetBool("tiered_storage.cold.enabled"),
 				// Normalized like storage.backend so cold.Backend == "s3"/"azure"
@@ -1860,6 +2021,18 @@ func Load() (*Config, error) {
 				"to every database on this node; choose a prefix without a dot", cfg.Iceberg.NamespacePrefix)
 		}
 	}
+	// Checked whether or not the export is on, so a typo is caught before
+	// someone turns it on. Whether a colocated layout's warehouse is the
+	// storage root is checked at wiring time, once both are resolved
+	// (cmd/arc), because the default warehouse needs the backend.
+	switch cfg.Iceberg.Layout {
+	case "":
+		cfg.Iceberg.Layout = IcebergLayoutWarehouse // set but empty, as unset
+	case IcebergLayoutWarehouse, IcebergLayoutColocated:
+	default:
+		return nil, fmt.Errorf("iceberg.layout must be %q or %q (got %q)",
+			IcebergLayoutWarehouse, IcebergLayoutColocated, cfg.Iceberg.Layout)
+	}
 
 	// The spoke secret must come from the environment. Refuse rather than
 	// silently prefer it: a config-file secret that is ignored still leaks,
@@ -1879,6 +2052,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("edge_sync.spoke.hub_token must not be set in the configuration file; " +
 			"supply it via the ARC_EDGE_SYNC_HUB_TOKEN environment variable so a write credential " +
 			"is not stored in a file that gets copied, backed up, and committed")
+	}
+
+	if cfg.EdgeSync.Spoke.DeleteAfterSync {
+		if err := checkDeleteAfterSync(cfg); err != nil {
+			return nil, err
+		}
 	}
 
 	if cfg.EdgeSync.Spoke.Enabled {
@@ -1950,6 +2129,9 @@ func Load() (*Config, error) {
 				"edge_sync.import.allowed_dirs: a bundle is read from a raw filesystem path " +
 				"outside the storage root, so the permitted roots must be stated explicitly")
 		}
+		if err := requireAbsoluteAllowedDirs("edge_sync.import.allowed_dirs", cfg.EdgeSync.Import.AllowedDirs); err != nil {
+			return nil, err
+		}
 		if cfg.EdgeSync.HubID == "" {
 			return nil, fmt.Errorf("edge_sync.import.enabled=true requires edge_sync.hub_id: " +
 				"a bundle names the hub it is destined for, and one addressed elsewhere is refused")
@@ -1968,6 +2150,9 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("edge_sync.spoke.bundle.enabled=true requires " +
 				"edge_sync.spoke.bundle.allowed_dirs: a bundle is written to a raw filesystem " +
 				"path outside the storage root, so the permitted roots must be stated explicitly")
+		}
+		if err := requireAbsoluteAllowedDirs("edge_sync.spoke.bundle.allowed_dirs", cfg.EdgeSync.Spoke.Bundle.AllowedDirs); err != nil {
+			return nil, err
 		}
 		// Identity is bound into the bundle MAC, so the hub cannot accept a
 		// bundle that does not name both sides.
@@ -1996,6 +2181,10 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("edge_sync.spoke.bundle.max_bytes must be >= 0 (got %d); 0 means \"use the default\"",
 				cfg.EdgeSync.Spoke.Bundle.MaxBytes)
 		}
+	}
+
+	if err := cfg.validateEdgeSyncRelay(); err != nil {
+		return nil, err
 	}
 
 	// A hub without an ID cannot authenticate anything: hub_id is bound into
@@ -2051,6 +2240,9 @@ func Load() (*Config, error) {
 	if err := checkMaxSQLLength(cfg.Query.MaxSQLLength, cfg.Server.MaxPayloadSize); err != nil {
 		return nil, err
 	}
+	if err := validateFlightSQLConfig(cfg.FlightSQL, cfg.Server); err != nil {
+		return nil, err
+	}
 
 	return cfg, nil
 }
@@ -2088,6 +2280,76 @@ func checkMaxSQLLength(n int, maxPayload int64) error {
 	return nil
 }
 
+func validateFlightSQLConfig(flight FlightSQLConfig, server ServerConfig) error {
+	if !flight.Enabled {
+		return nil
+	}
+	if flight.Port < 1 || flight.Port > 65535 {
+		return fmt.Errorf("flight_sql.port must be between 1 and 65535 (got %d)", flight.Port)
+	}
+	if flight.Port == server.Port {
+		return fmt.Errorf("flight_sql.port must differ from server.port (%d)", server.Port)
+	}
+	return nil
+}
+
+// parsePositiveDuration reads a duration key as a Go duration string and
+// refuses anything that does not parse or is not positive, naming the key and
+// the value. Validated at load whether or not the feature is enabled, as
+// backup.operation_timeout is: the error is printed before the logger exists,
+// so the operator sees the value (#1112).
+func parsePositiveDuration(v *viper.Viper, key string) (time.Duration, error) {
+	d, err := time.ParseDuration(v.GetString(key))
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive Go duration", key, v.GetString(key))
+	}
+	return d, nil
+}
+
+// checkDeleteAfterSync refuses edge_sync.spoke.delete_after_sync where it
+// cannot be safe (phase 3a). It deletes edge data on the hub's word, so:
+//   - the network path, bundle export or the relay must be on: the hub
+//     verifies a file in a reconcile or in a signed bundle acknowledgment;
+//   - not on a cluster node: a delete there would have to go through the Raft
+//     manifest first, which this does not do;
+//   - with the network path on, the hub must be reached over https or on a
+//     loopback host: the verify response is not signed, and a forged "held"
+//     would delete files (a bundle acknowledgment is signed);
+//   - the delay must be shorter than ledger retention, or rows would be
+//     pruned before they could ever be verified.
+func checkDeleteAfterSync(cfg *Config) error {
+	s := cfg.EdgeSync.Spoke
+	if !s.Active() {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync requires edge_sync.spoke.enabled, edge_sync.spoke.bundle.enabled or edge_sync.spoke.relay.enabled: the hub must verify a file, over the network or in a signed bundle acknowledgment, before the spoke deletes it")
+	}
+	if cfg.Cluster.Enabled {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync is not supported on a cluster node (cluster.enabled)")
+	}
+	if s.LedgerRetentionDays > 0 && s.DeleteAfterSyncDelay >= time.Duration(s.LedgerRetentionDays)*24*time.Hour {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.ledger_retention_days (%d days)", s.DeleteAfterSyncDelay, s.LedgerRetentionDays)
+	}
+	if s.ExportsBundles() && s.DeleteAfterSyncDelay >= s.DeleteAfterSyncAckMaxAge {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync_delay (%s) must be shorter than edge_sync.spoke.delete_after_sync_ack_max_age (%s): no acknowledged file could ever be deleted", s.DeleteAfterSyncDelay, s.DeleteAfterSyncAckMaxAge)
+	}
+	if !s.Enabled {
+		// Air-gapped or relay-only: acks are HMAC-signed with the spoke secret, so the
+		// https requirement below (an unsigned network answer) does not apply.
+		return nil
+	}
+	u, err := url.Parse(s.HubURL)
+	if err != nil {
+		return fmt.Errorf("edge_sync.spoke.delete_after_sync: invalid edge_sync.spoke.hub_url: %w", err)
+	}
+	if u.Scheme != "https" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("edge_sync.spoke.delete_after_sync requires an https edge_sync.spoke.hub_url (or a loopback host): the hub's verify answer decides which local files are deleted, and it is not signed")
+		}
+	}
+	return nil
+}
+
 func setDefaults(v *viper.Viper) {
 	// Server defaults.
 	//
@@ -2110,6 +2372,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.tls_enabled", false)
 	v.SetDefault("server.tls_cert_file", "")
 	v.SetDefault("server.tls_key_file", "")
+	v.SetDefault("flight_sql.enabled", false)
+	v.SetDefault("flight_sql.port", 50051)
 
 	// Database defaults - dynamically calculated based on system resources
 	v.SetDefault("database.max_connections", getDefaultMaxConnections())
@@ -2144,10 +2408,22 @@ func setDefaults(v *viper.Viper) {
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")
 	v.SetDefault("storage.local_path", "./data/arc")
+	v.SetDefault("storage.s3_bucket", "") // Must be configured for storage.backend=s3
 	v.SetDefault("storage.s3_region", "us-east-1")
+	v.SetDefault("storage.s3_endpoint", "")   // Empty for AWS; set for MinIO/SeaweedFS
+	v.SetDefault("storage.s3_access_key", "") // Empty = AWS_ACCESS_KEY_ID, then the AWS credential chain
+	v.SetDefault("storage.s3_secret_key", "")
 	v.SetDefault("storage.s3_use_ssl", true)
 	v.SetDefault("storage.s3_path_style", false) // Use virtual-hosted style by default (set true for MinIO)
-	v.SetDefault("storage.azure_prefix", "")     // Container root by default (#1102)
+	v.SetDefault("storage.s3_prefix", "")        // Bucket root by default (#1109)
+	v.SetDefault("storage.azure_connection_string", "")
+	v.SetDefault("storage.azure_account_name", "")
+	v.SetDefault("storage.azure_account_key", "")
+	v.SetDefault("storage.azure_sas_token", "")
+	v.SetDefault("storage.azure_container", "") // Must be configured for storage.backend=azure
+	v.SetDefault("storage.azure_prefix", "")    // Container root by default (#1102)
+	v.SetDefault("storage.azure_endpoint", "")  // Empty = the public endpoint (a connection string carries its own); set for Azurite
+	v.SetDefault("storage.azure_use_managed_identity", false)
 	v.SetDefault("storage.gcs_bucket", "")
 	v.SetDefault("storage.gcs_prefix", "")           // Bucket root by default
 	v.SetDefault("storage.gcs_credentials_file", "") // Empty = Application Default Credentials
@@ -2195,7 +2471,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.shard_count", 32)
 	v.SetDefault("ingest.sort_keys", []string{})     // No custom sort keys by default
 	v.SetDefault("ingest.default_sort_keys", "time") // Default to time-only sorting
-	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
+	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s per file of a flush (#1692)
 	v.SetDefault("ingest.decimal_columns", []string{})
 	v.SetDefault("ingest.default_decimal_columns", "")
 	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
@@ -2211,6 +2487,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("auth.db_path", "./data/arc.db") // Shared SQLite DB (same as Python)
 	v.SetDefault("auth.cache_ttl", 300)           // 5 minutes
 	v.SetDefault("auth.max_cache_size", 1000)     // Max cached tokens
+	v.SetDefault("auth.bootstrap_token", "")      // Empty = generate one on first start
+	v.SetDefault("auth.force_bootstrap", false)
 
 	// Compaction defaults
 	// Edge sync: the hub receive side is OFF by default. Enabling it exposes
@@ -2235,6 +2513,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.enabled", false)
 	v.SetDefault("edge_sync.spoke.sync_interval", "5m")
 	v.SetDefault("edge_sync.spoke.sync_retry_interval", "30s")
+	v.SetDefault("edge_sync.spoke.sync_timeout", "2h") // one manual sync pass
+	v.SetDefault("edge_sync.spoke.delete_after_sync", false)
+	v.SetDefault("edge_sync.spoke.delete_after_sync_delay", "0s")
+	v.SetDefault("edge_sync.spoke.delete_after_sync_accept_compacted", false)
+	v.SetDefault("edge_sync.spoke.delete_after_sync_ack_max_age", "168h")
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")
@@ -2260,11 +2543,22 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.import.enabled", false)
 	v.SetDefault("edge_sync.import.allowed_dirs", []string{})
 	v.SetDefault("edge_sync.import.max_files", 10000)
+	v.SetDefault("edge_sync.import.timeout", "4h") // one bundle import
 
 	v.SetDefault("edge_sync.spoke.bundle.enabled", false)
 	v.SetDefault("edge_sync.spoke.bundle.allowed_dirs", []string{})
 	v.SetDefault("edge_sync.spoke.bundle.max_files", 10000)
 	v.SetDefault("edge_sync.spoke.bundle.max_bytes", int64(64)<<30) // 64 GiB
+	v.SetDefault("edge_sync.spoke.bundle.timeout", "2h")            // one bundle export
+	// Relay transport (#1685). The target keys mirror a backup target's.
+	v.SetDefault("edge_sync.spoke.relay.enabled", false)
+	v.SetDefault("edge_sync.spoke.relay.interval", "5m")
+	v.SetDefault("edge_sync.spoke.relay.ack_timeout", "72h")
+	setObjectTargetDefaults(v, "edge_sync.spoke.relay.")
+	v.SetDefault("edge_sync.import.relay.enabled", false)
+	v.SetDefault("edge_sync.import.relay.interval", "1m")
+	v.SetDefault("edge_sync.import.relay.staging_dir", "./data/edge_sync_relay_staging")
+	setObjectTargetDefaults(v, "edge_sync.import.relay.")
 
 	v.SetDefault("compaction.enabled", true)
 	v.SetDefault("compaction.hourly_schedule", "5 * * * *")        // Every hour at :05
@@ -2328,7 +2622,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.retain_snapshots", 10)
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
 	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
-	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
+	v.SetDefault("iceberg.layout", IcebergLayoutWarehouse)
+	v.SetDefault("iceberg.warehouse", "") // Empty = the storage root, resolved at wire time (needs the backend)
 
 	// Continuous query defaults
 	v.SetDefault("continuous_query.enabled", true)            // Enable CQ management by default
@@ -2487,6 +2782,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)         // 30 days in hot tier before archiving
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
+	v.SetDefault("tiered_storage.migration_timeout", "2h")              // One migration cycle; see TieredStorageConfig.MigrationTimeout
 
 	// Cold tier defaults (S3/Azure/GCS). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.
@@ -2499,6 +2795,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.cold.s3_secret_key", "")      // Must be configured
 	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)       // HTTPS by default
 	v.SetDefault("tiered_storage.cold.s3_path_style", false)   // Virtual-hosted style for AWS
+	v.SetDefault("tiered_storage.cold.s3_prefix", "")          // Bucket root by default (#1109)
 	v.SetDefault("tiered_storage.cold.azure_container", "")    // Must be configured for Azure
 	v.SetDefault("tiered_storage.cold.azure_prefix", "")       // Container root by default (#1102)
 	v.SetDefault("tiered_storage.cold.azure_connection_string", "")
@@ -2630,6 +2927,26 @@ func normalizeExtensionNames(names []string) []string {
 	return out
 }
 
+// parseSeeds reads cluster.seeds in every spelling an operator writes: a TOML
+// array, a comma-separated TOML string, or ARC_CLUSTER_SEEDS (#1675).
+//
+// It was parseStringSlice(v.GetString("cluster.seeds")), and viper's GetString
+// returns "" for a TOML array, so seeds = ["a:9100", "b:9100"] read as no seeds
+// at all, with no warning: the node logged "no known peers, aborting election"
+// and never joined. Only the comma string worked, which is the form every
+// shipped deployment (compose, Kubernetes, Helm) passes through the environment.
+//
+// parseTargetDatabases handles the array and scalar shapes; each element is then
+// comma-split as well, because a comma never belongs in host:port, so
+// seeds = ["a:9100,b:9100"] means two seeds rather than one undialable address.
+func parseSeeds(value any) []string {
+	var out []string
+	for _, item := range parseTargetDatabases(value) {
+		out = append(out, parseStringSlice(item)...)
+	}
+	return out
+}
+
 // parseStringSlice parses a comma-separated string into a slice of strings.
 // This is needed because Viper's GetStringSlice doesn't automatically parse
 // comma-separated values from environment variables.
@@ -2646,6 +2963,43 @@ func parseStringSlice(s string) []string {
 		}
 	}
 	return result
+}
+
+// parseAllowedDirs reads edge_sync.import.allowed_dirs and
+// edge_sync.spoke.bundle.allowed_dirs (#1680): a TOML array keeps each path
+// whole, and a string, from arc.toml or the environment, is split on commas
+// only, never on whitespace.
+//
+// It was v.GetStringSlice, which splits a string on whitespace, so
+// ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS="/Volumes/Air Gap" became two allow-list
+// entries, "/Volumes/Air" and "Gap", and the second was then resolved against
+// the working directory by edgesync.NewDestinationPolicy (resolveDir accepts a
+// missing leaf), silently admitting a directory nobody named while refusing
+// the one they did. A path containing a comma needs the array spelling.
+func parseAllowedDirs(value any) []string {
+	return parseTargetDatabases(value)
+}
+
+// requireAbsoluteAllowedDirs refuses a relative allowed_dirs entry (#1680).
+//
+// edgesync.NewDestinationPolicy resolves an entry with filepath.Abs and accepts
+// a missing leaf, so a relative entry silently means "under whatever directory
+// Arc was started from". No documented configuration uses one, and every way
+// an operator ends up with one by accident is a split in the wrong place: a
+// path with a space under the old whitespace split ("/Volumes/Air Gap" ->
+// "Gap"), or a path with a comma in the string spelling now ("/mnt/a,b" ->
+// "b"). Refusing it turns each of those into a startup error that names the
+// fragment, instead of an allow-list entry nobody wrote.
+func requireAbsoluteAllowedDirs(key string, dirs []string) error {
+	for _, d := range dirs {
+		if !filepath.IsAbs(d) {
+			return fmt.Errorf("%s: %q is not an absolute path; every allowed directory must be "+
+				"absolute (a relative one would resolve against Arc's working directory). "+
+				"In the string or environment spelling a comma separates entries, so a path "+
+				"that contains a comma must be written in the TOML array", key, d)
+		}
+	}
+	return nil
 }
 
 // EffectiveCores reports how many CPUs this process may actually use.

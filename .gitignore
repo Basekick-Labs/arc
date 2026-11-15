@@ -88,3 +88,7 @@ docs/progress/2024-12-05-configurable-payload-size.md
 docs/progress/
 RELEASE_NOTES_2026.01.1.md
 arc.toml
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -405,6 +405,9 @@ type walEntry struct {
 	// flushed. Checkpoint entries also have seq 0 but must NOT set this, or
 	// every file would hold one and none would ever be reclaimable.
 	untrackedData bool
+	// flushIntent marks a flush intent (#1646, intent.go): written without a
+	// sync of its own, and only for the failure log's wording.
+	flushIntent bool
 	// foreignProof marks a CHECKPOINT entry that covers at least one identity
 	// this process did not mint: a row-range identity, or a whole-entry token
 	// from an earlier writer instance. Either can describe entries in a file
@@ -1217,6 +1220,9 @@ func (w *Writer) logWriteFailure(entry walEntry, err error) {
 	msg := "WAL data entry could not be written and is lost from the WAL: its rows reach storage only if the flush of the ingest buffer holding them succeeds; a crash or a failed flush before that loses them"
 	if entry.durable && entry.seq == 0 {
 		msg = "WAL flush checkpoint could not be written: its data is already in storage, but recovery may replay those entries again (a duplicate, not a loss)"
+	}
+	if entry.flushIntent {
+		msg = "WAL flush intent could not be written: a crash before that flush's checkpoint replays its rows (a duplicate, not a loss)"
 	}
 	w.logger.Error().Err(err).
 		Bool("disk_full", isDiskFull(err)).
@@ -2504,7 +2510,9 @@ func (w *Writer) forgetFileLocked(path string) {
 }
 
 // Quarantined tells the writer that recovery moved path to quarantinedAs
-// after repeated replay failures (#1225). If this process wrote it, entries in
+// after repeated replay failures (#1225), or on the first pass when its only
+// failure is checksum-damaged entries, once the recovery barrier has stored
+// its intact ones (#1634). If this process wrote it, entries in
 // it may still be waiting for a flush: recovery can no longer replay them
 // from it, so keeping them pending would hold the purge floor at this file for
 // the life of the process, and no WAL file would be reclaimed again (#676).

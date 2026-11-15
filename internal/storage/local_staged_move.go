@@ -44,7 +44,7 @@ func (b *LocalBackend) Sync(ctx context.Context, key string) error {
 func (b *LocalBackend) syncDirs(dir string) error {
 	root := filepath.Clean(b.basePath)
 	for {
-		if err := syncPath(dir); err != nil {
+		if err := b.syncDir(dir); err != nil {
 			return err
 		}
 		if dir == root || len(dir) <= len(root) {
@@ -86,7 +86,7 @@ func (b *LocalBackend) MoveObject(ctx context.Context, src, dst string) error {
 		return err
 	}
 	if filepath.Dir(srcPath) != filepath.Dir(dstPath) {
-		if err := syncPath(filepath.Dir(srcPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := b.syncDir(filepath.Dir(srcPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -111,6 +111,7 @@ func (b *LocalBackend) RemoveAll(ctx context.Context, key string) error {
 			delete(b.dirCache, d)
 		}
 	}
+	b.dirGen++
 	b.dirMu.Unlock()
 	return nil
 }

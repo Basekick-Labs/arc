@@ -786,7 +786,11 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 			}
 			key := "unknown"
 			if e.Key != nil {
-				key = *e.Key
+				// The service answers with the PREFIXED object name (exactly
+				// what prefixObjectKey sent: plain concatenation). Report the
+				// caller's key, the one every manifest, listing and log line
+				// names (#1111), as Azure and GCS do.
+				key = strings.TrimPrefix(*e.Key, b.prefix)
 			}
 			code := ""
 			if e.Code != nil {

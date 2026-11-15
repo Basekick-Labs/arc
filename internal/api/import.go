@@ -10,6 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -113,7 +114,10 @@ func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 			h.totalErrors.Add(1)
 			return true, respondImportTooLarge(c)
 		}
-		req, err := BuildHTTPRequest(c)
+		// Built only here, once the import is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		req, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to build import request for forwarding")
@@ -122,7 +126,9 @@ func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 			})
 		}
 
-		resp, err := h.router.RouteImport(c.Context(), req)
+		defer release()
+
+		resp, err := h.router.RouteImport(fctx, req)
 		if err == cluster.ErrLocalNodeCanHandle {
 			break
 		}
@@ -205,6 +211,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	if h.arrowBuffer == nil {
@@ -436,6 +446,10 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	if h.arrowBuffer == nil {

@@ -81,6 +81,49 @@ func bareTimeBounds(sqlStr string) (hasStart, hasEnd, ok bool) {
 	return b.start != nil, b.end != nil, true
 }
 
+// icebergMetadataDir is the child a colocated Iceberg table keeps its
+// metadata in, <db>/<measurement>/metadata (#1676).
+const icebergMetadataDir = "metadata"
+
+// holdsParquet reports whether db/meas/metadata holds a Parquet file, or
+// could not be checked: either way it must not be set aside.
+func (p *PartitionPruner) holdsParquet(ctx context.Context, basePath, database, measurement string, isRemote bool) bool {
+	if !isRemote {
+		found := false
+		err := filepath.WalkDir(filepath.Join(basePath, database, measurement, icebergMetadataDir), func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && strings.HasSuffix(d.Name(), ".parquet") {
+				found = true
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		return found || err != nil
+	}
+	lister, ok := p.storage.(storage.ObjectLister)
+	if p.storage == nil || !ok {
+		return true
+	}
+	prefix, ok := p.extractStoragePrefix(basePath+"/"+database+"/"+measurement+"/"+icebergMetadataDir+"/", basePath)
+	if !ok {
+		return true
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	objs, err := lister.ListObjects(listCtx, prefix)
+	cancel()
+	if err != nil {
+		return true
+	}
+	for _, o := range objs {
+		if strings.HasSuffix(o.Path, ".parquet") {
+			return true
+		}
+	}
+	return false
+}
+
 // layoutIsStandard reports whether db/meas exists under basePath with only
 // year directories as children. Cached in globCache for GlobCacheTTL.
 func (p *PartitionPruner) layoutIsStandard(ctx context.Context, basePath, database, measurement string) bool {
@@ -125,15 +168,27 @@ func (p *PartitionPruner) layoutIsStandard(ctx context.Context, basePath, databa
 			children = append(children, e.Name())
 		}
 	}
-	standard := len(children) > 0
+	standard := false
 	for _, c := range children {
 		if c == "" || strings.HasPrefix(c, ".") {
+			continue
+		}
+		if c == icebergMetadataDir {
+			// A colocated Iceberg table's metadata (#1676) is not a
+			// partition, but only a directory with no Parquet in it may be
+			// set aside: `**/*.parquet` would read Parquet under it, so the
+			// empty-range proof must not ignore any it holds.
+			if p.holdsParquet(ctx, basePath, database, measurement, isRemote) {
+				standard = false
+				break
+			}
 			continue
 		}
 		if !yearDirPattern.MatchString(c) {
 			standard = false
 			break
 		}
+		standard = true
 	}
 	if standard {
 		p.globCache.set(cacheKey, []string{"standard"})

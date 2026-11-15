@@ -141,6 +141,15 @@ func executeArrowMsgPackQuery(
 		if cancel != nil {
 			cancel()
 		}
+		if errors.Is(err, context.Canceled) && h.shuttingDown() {
+			// Shutdown cancelled it (#1644); onFail records it as such.
+			if onFail != nil {
+				onFail("server shutting down")
+			}
+			h.logger.Warn().Str("format", "msgpack").Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow MsgPack query cancelled at shutdown")
+			_ = respondError(c, fiber.StatusServiceUnavailable, "Server shutting down", timestamp, start)
+			return -1, true
+		}
 		m.IncQueryErrors()
 		if onFail != nil {
 			onFail(err.Error())

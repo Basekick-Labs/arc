@@ -323,6 +323,9 @@ type recoveryHooks struct {
 	beforeInputDelete func(context.Context, *Manifest) error
 	// afterInputDelete advances completion state after all source removals.
 	afterInputDelete func(context.Context, *Manifest) error
+	// consumedInto runs after onConsumedInputs succeeded, with the output
+	// (#1683). Its error keeps the manifest, as onConsumedInputs's does.
+	consumedInto func(inputs []string, output string) error
 }
 
 func (m *ManifestManager) recoverOrphanedManifestsWithHooks(ctx context.Context, scope recoveryScope, onKeptOutput func(string), onConsumedInputs func([]string) error, hooks recoveryHooks) (recovered int, recoveryErr error) {
@@ -564,6 +567,11 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 			return fmt.Errorf("receipt marking incomplete; keeping manifest for re-fire: %w", err)
 		}
 	}
+	if hooks.consumedInto != nil {
+		if err := hooks.consumedInto(manifest.InputFiles, manifest.OutputPath); err != nil {
+			return fmt.Errorf("receipt holder marking incomplete; keeping manifest for re-fire: %w", err)
+		}
+	}
 
 	// All input files deleted — safe to remove manifest
 	return m.DeleteManifest(ctx, manifestPath)
@@ -688,8 +696,9 @@ func (m *ManifestManager) parkManifestCopy(ctx context.Context, manifestPath, pa
 // which is the only remaining pointer to the partition to inspect.
 //
 // It is parked rather than deleted because the manifest's absence is not
-// proof that nothing happened: LocalBackend never fsyncs, so after a power
-// loss the manifest can be empty while the output rename and some input
+// proof that nothing happened: a manifest written before LocalBackend fsynced
+// its writes (#1618), or by a filesystem that loses a write some other way,
+// can be empty after a power loss while the output rename and some input
 // unlinks that followed it are already journaled. A decodable manifest would
 // repair either state (delete a short output, finish the input deletes); an
 // undecodable one cannot, and the log line plus the parked path are what an

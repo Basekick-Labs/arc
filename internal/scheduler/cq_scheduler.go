@@ -437,6 +437,14 @@ func (s *CQScheduler) executeJob(job *cqJob) {
 			Msg("Scheduled CQ execution failed")
 		return
 	}
+	if resp.Skipped {
+		// No new window since the last run (#1628): nothing to do.
+		s.logger.Debug().
+			Int64("cq_id", job.cqID).
+			Str("cq_name", job.cqName).
+			Msg("Scheduled CQ: no new window")
+		return
+	}
 
 	s.logger.Info().
 		Int64("cq_id", job.cqID).

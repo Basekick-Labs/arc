@@ -601,9 +601,11 @@ func TestRetentionWaitsForTheClusterAfterARestart(t *testing.T) {
 	r.app.Post("/retention", h2.handleCreate)
 	r.app.Put("/retention/:id", h2.handleUpdate)
 	r.app.Delete("/retention/:id", h2.handleDelete)
+	r.app.Get("/retention/:id/executions", h2.handleGetExecutions)
 	for _, c := range []struct{ method, path, body string }{
 		{"GET", "/retention", ""}, {"GET", "/retention/1", ""}, {"POST", "/retention", `{"name":"x","database":"db","retention_days":3}`},
 		{"PUT", "/retention/1", `{"is_active":false}`}, {"DELETE", "/retention/1", ""},
+		{"GET", "/retention/1/executions", ""},
 	} {
 		if code, body := r.do(t, c.method, c.path, c.body); code != fiber.StatusServiceUnavailable {
 			t.Fatalf("%s %s before catching up: %d %v", c.method, c.path, code, body)

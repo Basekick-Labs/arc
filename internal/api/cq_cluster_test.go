@@ -291,7 +291,8 @@ func TestCQWaitsForTheClusterAfterARestart(t *testing.T) {
 	r.app.Get("/cq", h2.handleList)
 	r.app.Post("/cq", h2.handleCreate)
 	r.app.Post("/cq/:id/execute", h2.handleExecute)
-	for _, c := range []struct{ method, path, body string }{{"GET", "/cq", ""}, {"POST", "/cq", cqBody}, {"POST", "/cq/1/execute", "{}"}} {
+	r.app.Get("/cq/:id/executions", h2.handleGetExecutions)
+	for _, c := range []struct{ method, path, body string }{{"GET", "/cq", ""}, {"POST", "/cq", cqBody}, {"POST", "/cq/1/execute", "{}"}, {"GET", "/cq/1/executions", ""}} {
 		if code, body := r.do(t, c.method, c.path, c.body); code != fiber.StatusServiceUnavailable {
 			t.Fatalf("%s %s: %d %v", c.method, c.path, code, body)
 		}

@@ -44,9 +44,12 @@ type RetentionHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// files were removed or rewritten: see SetOnFilesRemoved.
 	onFilesRemoved func()
-	storage        storage.Backend
-	config         *config.RetentionConfig
-	db             *sql.DB // SQLite for policy metadata
+	// onSpokeFilesRemoved marks edge-sync receipts removed before retention
+	// deletes the files (#1186); nil unless this node is an edge-sync hub.
+	onSpokeFilesRemoved func(ctx context.Context, paths []string) error
+	storage             storage.Backend
+	config              *config.RetentionConfig
+	db                  *sql.DB // SQLite for policy metadata
 	// ownsDB records whether this handler opened db itself. When retention
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
@@ -1117,6 +1120,14 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid policy ID"})
 	}
 
+	// An ID with no policy has no history to list: 404, as GET /:id answers,
+	// rather than a 200 with an empty one.
+	if _, err := h.getPolicy(int64(policyID)); errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
+	}
+
 	limit := c.QueryInt("limit", 50)
 
 	rows, err := h.db.Query(`
@@ -1133,7 +1144,8 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	var executions []RetentionExecution
+	// Non-nil, so a policy that has not run yet lists [], not null.
+	executions := []RetentionExecution{}
 	for rows.Next() {
 		var ex RetentionExecution
 		var executionDurationMs sql.NullFloat64
@@ -1437,6 +1449,22 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		var ops []raft.BatchFileOp
 		subPaths := chunk // default: all chunk paths (no coordinator)
 		subRows := eligibleRows[i:end]
+		// Edge-sync receipts first (#1186), before the manifest and storage
+		// removals, as tiering marks before it deletes (#687): unmarked, the
+		// spoke would re-send these files and the next pass would delete them
+		// again. A failure aborts the cycle like a manifest failure; marks
+		// already written over files still present are harmless (reconcile
+		// answers "present" either way) and the next run deletes them.
+		if h.onSpokeFilesRemoved != nil {
+			if err := h.onSpokeFilesRemoved(ctx, chunk); err != nil {
+				h.logger.Error().Err(err).Int("count", len(chunk)).Int("chunk_start", i).
+					Msg("Failed to mark edge-sync receipts removed; aborting retention cycle")
+				if len(deletedFilePaths) > 0 {
+					h.cleanupEmptyDirectories(ctx, deletedFilePaths)
+				}
+				return deletedRows, deletedFiles, skipped, fmt.Errorf("failed to mark edge-sync receipts removed: %w", err)
+			}
+		}
 		if h.coordinator != nil {
 			ops = make([]raft.BatchFileOp, 0, len(chunk))
 			subPaths = make([]string, 0, len(chunk))
@@ -1636,6 +1664,13 @@ func (h *RetentionHandler) removeDirectoryTree(ctx context.Context, remover stor
 // (raft.OutputGoneAccounted, #1207 d2a2b).
 func retentionManifestReason[T int | int64](policyID T) string {
 	return fmt.Sprintf("retention:%d", policyID)
+}
+
+// SetOnSpokeFilesRemoved wires the edge-sync hub's receipt marking into
+// retention (#1186), hot and cold. It runs before files are deleted; paths
+// outside a spoke namespace match no receipt.
+func (h *RetentionHandler) SetOnSpokeFilesRemoved(fn func(ctx context.Context, paths []string) error) {
+	h.onSpokeFilesRemoved = fn
 }
 
 // SetOnFilesRemoved sets the function called after this handler removed or

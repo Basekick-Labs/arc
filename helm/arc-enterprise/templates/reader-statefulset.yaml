@@ -40,11 +40,21 @@ spec:
               containerPort: 9100
             - name: raft
               containerPort: 9200
+            {{- if .Values.flightSql.enabled }}
+            - name: flight-sql
+              containerPort: {{ include "arc-enterprise.flightSqlPort" . }}
+            {{- end }}
           env:
             {{- include "arc-enterprise.commonClusterEnv" . | nindent 12 }}
             {{- include "arc-enterprise.raftEnv" . | nindent 12 }}
             - name: ARC_CLUSTER_ROLE
               value: "reader"
+            {{- if .Values.flightSql.enabled }}
+            - name: ARC_FLIGHT_SQL_ENABLED
+              value: "true"
+            - name: ARC_FLIGHT_SQL_PORT
+              value: {{ include "arc-enterprise.flightSqlPort" . | quote }}
+            {{- end }}
             - name: ARC_CLUSTER_ADVERTISE_ADDR
               value: "$(POD_NAME).{{ include "arc-enterprise.readerHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9100"
             # Readers join the Raft cluster as non-voting members: they

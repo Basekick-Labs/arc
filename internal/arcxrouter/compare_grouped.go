@@ -475,6 +475,12 @@ func (gc *groupedCmp) rowCells(i int, a, d *groupedRow) string {
 				continue
 			}
 			msg := fmt.Sprintf("grouped row %d differs (agg col %d NaN-ness)", i, c)
+			if math.IsNaN(ac.f) && math.IsInf(dc.f, 0) && c < len(cellItems) && isPinnedNaNItem(cellItems[c]) {
+				if gc.oracleDiff == "" {
+					gc.oracleDiff = msg
+				}
+				continue
+			}
 			if gc.deferArg(c, msg) {
 				continue
 			}

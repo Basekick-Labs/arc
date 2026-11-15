@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // TopicMapping keeps the original topic-to-database shorthand while allowing
@@ -232,6 +233,9 @@ func validateTopicRule(filter string, rule TopicMappingRule) error {
 	}
 	if rule.Database != "" && !isValidStorageSegment(rule.Database) {
 		return fmt.Errorf("topic mapping %q targets database %q, which must start with a letter and contain only alphanumeric characters, underscores, or hyphens", filter, rule.Database)
+	}
+	if rule.Database != "" && storage.IsWarehouseRootName(rule.Database) {
+		return fmt.Errorf("topic mapping %q targets database %q, which is reserved for the Iceberg warehouse", filter, rule.Database)
 	}
 	if rule.Measurement != "" && !isValidMeasurementSegment(rule.Measurement) {
 		return fmt.Errorf("topic mapping %q measurement %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens (at most 128 characters)", filter, rule.Measurement)
