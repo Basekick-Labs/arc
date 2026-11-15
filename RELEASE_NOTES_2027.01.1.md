@@ -4764,7 +4764,9 @@ so a client, or a compactor forwarding the query (#1567), never saw
 
 Now the arcx path streams through the same writer as the DuckDB path:
 - The result stops at the cap, `Arc-Rows-Capped` names it, and the query's
-  history entry records it, as on DuckDB.
+  history entry records it, as on DuckDB. An Arrow Flight SQL query that arcx
+  serves now ends with `ResourceExhausted` at the cap, as the Flight SQL
+  documentation already said; before, it returned every row with no error.
 - All three trailers are declared. `Arc-Execution-Time-Ms` is measured from
   the same point as on DuckDB (when the request arrived), and is set on every
   response, including a failed one.
