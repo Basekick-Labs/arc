@@ -2,9 +2,9 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Fix: no hourly-compaction override warning at startup with the default configuration ([#278](https://github.com/Basekick-Labs/arc/issues/278))
+## Fix: no hourly-compaction override warning at startup with the default configuration
 
-The built-in default of `compaction.hourly_min_age_hours` was 0, below the minimum of 1 the hourly tier has enforced since #278, so every start without the key logged `hourly_min_age_hours was < 1; overriding to 1`. The default is now 1. Compaction behaves exactly as before, since 0 was already raised to 1; an explicit value below 1 is still raised to 1 with the same warning.
+The built-in default of `compaction.hourly_min_age_hours` was 0, below the minimum of 1 the hourly tier has enforced since [#278](https://github.com/Basekick-Labs/arc/issues/278), so every start without the key logged `hourly_min_age_hours was < 1; overriding to 1`. The default is now 1. Compaction behaves exactly as before, since 0 was already raised to 1; an explicit value below 1 is still raised to 1 with the same warning.
 
 ## Dependencies: tests build msgpack payloads with the encoder production uses ([#1709](https://github.com/Basekick-Labs/arc/issues/1709))
 
