@@ -2565,7 +2565,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_schedule", "0 3 * * *")         // 3 AM daily
 	v.SetDefault("compaction.hourly_enabled", true)                // Enable hourly tier
 	v.SetDefault("compaction.daily_enabled", true)                 // Enable daily tier
-	v.SetDefault("compaction.hourly_min_age_hours", 0)             // 0 hours min age (compact immediately)
+	v.SetDefault("compaction.hourly_min_age_hours", 1)             // 1 hour min age; NewHourlyTier clamps < 1 to 1 (#278)
 	v.SetDefault("compaction.hourly_min_files", 10)                // 10 files minimum
 	v.SetDefault("compaction.daily_min_age_hours", 24)             // 24 hours min age
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum

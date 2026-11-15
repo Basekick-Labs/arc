@@ -2,6 +2,10 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: no hourly-compaction override warning at startup with the default configuration ([#278](https://github.com/Basekick-Labs/arc/issues/278))
+
+The built-in default of `compaction.hourly_min_age_hours` was 0, below the minimum of 1 the hourly tier has enforced since #278, so every start without the key logged `hourly_min_age_hours was < 1; overriding to 1`. The default is now 1. Compaction behaves exactly as before, since 0 was already raised to 1; an explicit value below 1 is still raised to 1 with the same warning.
+
 ## Dependencies: tests build msgpack payloads with the encoder production uses ([#1709](https://github.com/Basekick-Labs/arc/issues/1709))
 
 Test-only; no product behaviour changes. Five test files (in `internal/cluster`, `internal/wal` and `internal/ingest`) built their msgpack payloads with upstream `github.com/vmihailenco/msgpack/v5`, while Arc itself encodes and decodes with its fork, `github.com/Basekick-Labs/msgpack/v6`. They now use the fork, so the tests encode with the same library Arc decodes with (the payload bytes are equivalent either way). `vmihailenco/msgpack/v5` is no longer a direct dependency; it stays in `go.mod` as an indirect one, pulled in by `iceberg-go` through `uptrace/bun`, which uses it only for fields tagged `bun:",msgpack"`; iceberg-go's catalog models have none, so that copy is linked but never runs. `go mod tidy` also records `google.golang.org/grpc` as the direct dependency it already was (Flight SQL imports it).
