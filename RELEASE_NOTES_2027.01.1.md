@@ -2,6 +2,10 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Dependencies: tests build msgpack payloads with the encoder production uses ([#1709](https://github.com/Basekick-Labs/arc/issues/1709))
+
+Test-only; no product behaviour changes. Five tests (in `internal/cluster`, `internal/wal` and `internal/ingest`) built their msgpack payloads with upstream `github.com/vmihailenco/msgpack/v5`, while Arc itself encodes and decodes with its fork, `github.com/Basekick-Labs/msgpack/v6`. They now use the fork, so they test payloads production actually produces. `vmihailenco/msgpack/v5` is no longer a direct dependency; it stays in `go.mod` as an indirect one, pulled in by `iceberg-go`. `go mod tidy` also records `google.golang.org/grpc` as the direct dependency it already was (Flight SQL imports it).
+
 ## Fix: Iceberg table repairs are retried, and their metadata copies cleaned up ([#1097](https://github.com/Basekick-Labs/arc/issues/1097), [#1098](https://github.com/Basekick-Labs/arc/issues/1098))
 
 The Iceberg exporter repairs two table properties when they drift: the column name mapping external readers need for columns added later, and the metadata-retention settings after `iceberg.retain_snapshots` changes.

@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 func newTimeoutWriter(t *testing.T, bufferSize int, ackTimeout time.Duration) *Writer {
