@@ -15,7 +15,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
-	"github.com/golang/snappy"
+	"github.com/klauspost/compress/snappy"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -604,8 +604,9 @@ func TestPrometheusRemoteWriteSnappyGoldenVectors(t *testing.T) {
 		{name: "hand-built copy4 overlap and long literals", body: handBuilt, decoded: longRequest, status: http.StatusNoContent},
 		{name: "S2 repeat offset", body: s2Repeat, status: http.StatusBadRequest, message: corrupt},
 		// A 6-byte varint header for 0: no encoder writes it (headers are
-		// minimal varints).
-		{name: "overlong length header", body: []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x00}, decoded: []byte{}, status: http.StatusNoContent},
+		// minimal varints). github.com/golang/snappy accepted it; the
+		// klauspost decoder refuses a header longer than 5 bytes.
+		{name: "overlong length header", body: []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x00}, status: http.StatusBadRequest, message: corrupt},
 		{name: "truncated", body: golden[:len(golden)/2], status: http.StatusBadRequest, message: corrupt},
 		{name: "declares more than it holds", body: declaredAbove, status: http.StatusBadRequest, message: corrupt},
 		{name: "declares less than it holds", body: declaredBelow, status: http.StatusBadRequest, message: corrupt},
