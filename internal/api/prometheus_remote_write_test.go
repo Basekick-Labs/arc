@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -508,4 +509,157 @@ func TestPrometheusRemoteWriteAcceptsAHighlyRepetitiveRequest(t *testing.T) {
 	_, decodedSize, err := decodePrometheusRemoteWrite(body)
 	require.NoError(t, err)
 	require.Equal(t, len(request), decodedSize)
+}
+
+// remoteWriteGoldenRequest is the protobuf behind remoteWriteGoldenBody: two
+// node_exporter series of three samples each.
+func remoteWriteGoldenRequest() []byte {
+	var series [][]byte
+	for _, host := range []string{"host-01:9100", "host-02:9100"} {
+		series = append(series, remoteWriteTestSeries(
+			[]remoteWriteTestLabel{{"__name__", "node_cpu_seconds_total"}, {"cpu", "0"}, {"instance", host}, {"job", "node"}, {"mode", "idle"}},
+			[]remoteWriteTestSample{{1234.5, 1_700_000_000_000}, {1235.5, 1_700_000_015_000}, {1236.5, 1_700_000_030_000}},
+			false, false))
+	}
+	return remoteWriteTestRequest(series...)
+}
+
+// remoteWriteGoldenBody is remoteWriteGoldenRequest as github.com/golang/snappy
+// v1.0.0 Encode wrote it (literals, copy1 and copy2 tags): the bytes a sender
+// using the reference encoder puts on the wire, kept as bytes so the test does
+// not depend on whichever encoder the test files import (#1702).
+const remoteWriteGoldenBody = "b802f08b0a99010a220a085f5f6e616d655f5f12166e6f64655f6370755f7365636f6e64735f746f74616c" +
+	"0a080a036370751201300a180a08696e7374616e6365120c686f73742d30313a393130300a0b0a036a6f62" +
+	"12046e6f64650a0c0a046d6f6465120469646c6512100900000000004a93401080d095ffbc3112100900000000" +
+	"004e93401098c596ffbc31121009122452934010b0ba97ffbc31fe9c00059c04323afe9c00529c00"
+
+// snappyTestBlock hand-assembles a Snappy block, so a test reaches the tag
+// forms an encoder may never emit for a small input: the 60-63 literal-length
+// forms, copy4, and copies that overlap their own output.
+type snappyTestBlock []byte
+
+func newSnappyTestBlock(decodedLen int) snappyTestBlock {
+	return binary.AppendUvarint(nil, uint64(decodedLen))
+}
+
+// literal writes lit with the given length form: 0 is the inline form (up to
+// 60 bytes), 60-63 carry the length in 1-4 trailing bytes.
+func (b snappyTestBlock) literal(form int, lit []byte) snappyTestBlock {
+	n := uint32(len(lit) - 1)
+	if form == 0 {
+		b = append(b, byte(n<<2))
+	} else {
+		b = append(b, byte(form<<2))
+		for i := 0; i < form-59; i++ {
+			b = append(b, byte(n>>(8*i)))
+		}
+	}
+	return append(b, lit...)
+}
+
+func (b snappyTestBlock) copy1(offset, length int) snappyTestBlock {
+	return append(b, byte(1|(length-4)<<2|(offset>>8)<<5), byte(offset))
+}
+
+func (b snappyTestBlock) copy2(offset, length int) snappyTestBlock {
+	return append(b, byte(2|(length-1)<<2), byte(offset), byte(offset>>8))
+}
+
+func (b snappyTestBlock) copy4(offset, length int) snappyTestBlock {
+	return append(b, byte(3|(length-1)<<2), byte(offset), byte(offset>>8), byte(offset>>16), byte(offset>>24))
+}
+
+// The receiver decodes exactly the Snappy block format: these vectors pin
+// which bodies it accepts, what each decodes to, and the exact error text, so
+// a decoder change that alters any of it fails here (#1702).
+func TestPrometheusRemoteWriteSnappyGoldenVectors(t *testing.T) {
+	golden, err := hex.DecodeString(remoteWriteGoldenBody)
+	require.NoError(t, err)
+	goldenRequest := remoteWriteGoldenRequest()
+
+	// A request whose instance label is 200 'a's, so copies can overlap.
+	run := strings.Repeat("a", 200)
+	longRequest := remoteWriteTestRequest(remoteWriteTestSeries(
+		[]remoteWriteTestLabel{{"__name__", "up"}, {"instance", run}, {"job", "node"}},
+		[]remoteWriteTestSample{{1, 1_700_000_000_000}, {0, 1_700_000_015_000}},
+		false, false))
+	start := bytes.Index(longRequest, []byte(run))
+	rest := longRequest[start+len(run):]
+	require.Greater(t, len(rest), 40)
+	handBuilt := newSnappyTestBlock(len(longRequest)).
+		literal(61, longRequest[:start+1]). // through the first 'a'
+		copy4(1, 64).                       // offset 1 < length: overlapping
+		copy2(1, 64).
+		copy4(1, 64).
+		copy1(1, 7). // 1+64+64+64+7 = 200
+		literal(0, rest[:10]).
+		literal(60, rest[10:20]).
+		literal(62, rest[20:30]).
+		literal(63, rest[30:])
+
+	// An offset-0 copy after a valid one is S2's "repeat the last offset",
+	// which Snappy does not have. The receiver decodes with s2 (#1711), so
+	// it accepts it: nine 'a's. Through the handler that is a 204 only
+	// because those bytes parse as a skippable unknown protobuf field (12,
+	// fixed64); with other bytes the protobuf stage would refuse the body
+	// under any decoder and the row would tell nothing. Keep the bytes.
+	s2Repeat := []byte{0x09, 0x00, 'a', 0x01, 0x01, 0x01, 0x00}
+	// The same acceptance at the decode stage, independent of the handler:
+	// a strict Snappy decoder refuses this body as corrupt.
+	_, s2Size, err := decodePrometheusRemoteWrite(s2Repeat)
+	require.NoError(t, err)
+	require.Equal(t, 9, s2Size)
+
+	const corrupt = "invalid snappy block: snappy: corrupt input"
+	declaredAbove := append(binary.AppendUvarint(nil, uint64(len(goldenRequest)+5)), golden[2:]...)
+	declaredBelow := append(binary.AppendUvarint(nil, uint64(len(goldenRequest)-5)), golden[2:]...)
+	require.Equal(t, binary.AppendUvarint(nil, uint64(len(goldenRequest))), golden[:2])
+
+	tests := []struct {
+		name    string
+		body    []byte
+		decoded []byte // the request it decodes to, when accepted
+		status  int
+		message string // the exact "error" value, when refused
+	}{
+		{name: "reference encoder", body: golden, decoded: goldenRequest, status: http.StatusNoContent},
+		{name: "hand-built copy4 overlap and long literals", body: handBuilt, decoded: longRequest, status: http.StatusNoContent},
+		{name: "S2 repeat offset", body: s2Repeat, decoded: []byte("aaaaaaaaa"), status: http.StatusNoContent},
+		// A 6-byte varint header for 0: no encoder writes it (headers are
+		// minimal varints). github.com/golang/snappy accepted it; klauspost's
+		// DecodedLen refuses a header longer than 5 bytes.
+		{name: "overlong length header", body: []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x00}, status: http.StatusBadRequest, message: corrupt},
+		{name: "truncated", body: golden[:len(golden)/2], status: http.StatusBadRequest, message: corrupt},
+		{name: "declares more than it holds", body: declaredAbove, status: http.StatusBadRequest, message: corrupt},
+		{name: "declares less than it holds", body: declaredBelow, status: http.StatusBadRequest, message: corrupt},
+		{name: "bad header byte", body: []byte{0xff}, status: http.StatusBadRequest, message: corrupt},
+		{name: "header above 32 bits", body: []byte{0x80, 0x80, 0x80, 0x80, 0x10}, status: http.StatusBadRequest, message: corrupt},
+		{name: "header varint overflow", body: bytes.Repeat([]byte{0xff}, 11), status: http.StatusBadRequest, message: corrupt},
+		{name: "offset-0 first copy", body: []byte{0x05, 0x00, 'a', 0x01, 0x00}, status: http.StatusBadRequest, message: corrupt},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trig := newLPWriteRig(t, nil)
+			status, out := remoteWriteTestPost(t, trig, tt.body, remoteWriteTestHeaders())
+			require.Equal(t, tt.status, status, out)
+			if tt.status != http.StatusNoContent {
+				var response struct {
+					Error string `json:"error"`
+				}
+				require.NoError(t, json.Unmarshal([]byte(out), &response), out)
+				require.Equal(t, tt.message, response.Error)
+				require.Zero(t, trig.buf.BufferedBytes())
+				return
+			}
+			request, decodedSize, err := decodePrometheusRemoteWrite(tt.body)
+			require.NoError(t, err)
+			require.Equal(t, len(tt.decoded), decodedSize)
+			want, err := unmarshalRemoteWriteRequest(tt.decoded)
+			require.NoError(t, err)
+			require.Equal(t, want, request)
+			if len(want.Timeseries) > 0 {
+				require.NotZero(t, trig.buf.BufferedBytes())
+			}
+		})
+	}
 }
