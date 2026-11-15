@@ -31,7 +31,11 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	c *fiber.Ctx,
 	execCtx context.Context,
 	cancel context.CancelFunc,
+	start time.Time,
 	rawSQL, headerDB, convertedSQL string,
+	governanceMaxRows int,
+	onRows func(int64),
+	onDisconnect func(),
 	onComplete func(int),
 	onFail func(string),
 ) (handled bool) {

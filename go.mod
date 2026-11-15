@@ -43,7 +43,6 @@ require (
 	github.com/googleapis/gax-go/v2 v2.24.0
 	github.com/hashicorp/go-msgpack/v2 v2.1.2
 	github.com/spf13/cast v1.6.0
-	github.com/vmihailenco/msgpack/v5 v5.4.1
 	gocloud.dev v0.46.0
 	golang.org/x/sys v0.49.0
 	google.golang.org/api v0.295.0
@@ -145,6 +144,7 @@ require (
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18 // indirect
 	github.com/uptrace/bun/extra/bundebug v1.2.18 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
+	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect

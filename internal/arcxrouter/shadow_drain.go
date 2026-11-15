@@ -35,9 +35,9 @@ var errShadowAssembly = errors.New("arcx shadow: could not assemble the arcx res
 // (5 cols) of live heap. With `shadowSlots` = 2 that is ~1.5 GB of shadow-only live heap
 // at the cap in the DEFAULT router mode. The cap is deliberately kept at 1,000,000: the
 // alternative — lowering it — converts real comparisons into skips, and an abandoned
-// reader holds its engine-side stream workers and decoded batches until a GC finalizer
-// runs (Release is a no-op on the reader), so skipping early does not even reliably
-// save engine resources.
+// reader holds its engine-side stream workers and decoded batches until it is released
+// (runShadow releases it right after the drain), so skipping early saves the
+// comparison, not the engine work already done.
 const ShadowMaxRows = 1_000_000
 
 // skipPrefix marks a comparator result that is a HOST-side failure to produce the
@@ -57,7 +57,7 @@ const skipPrefix = "skip:"
 // ONE arrow.Record (the shadow comparators take a single Record). Each batch is Retained on
 // extraction because the reader auto-releases the previous batch on the next Next() (the
 // arrow-go C-stream reader contract). The caller MUST runtime.KeepAlive(reader) until after
-// this returns — the batches are FFI-backed and free on the reader's GC finalizer. Returns
+// this returns — the batches are FFI-backed — and Release it afterwards. Returns
 // an empty-but-schema'd record for a zero-batch result.
 //
 // `maxRows` bounds the drain: shadow materializes the WHOLE result into one record, and

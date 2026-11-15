@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // uniqueKeyLP is a body in which every point brings a tag key no other point
