@@ -4769,8 +4769,9 @@ Now the arcx path streams through the same writer as the DuckDB path:
   the same point as on DuckDB (when the request arrived), and is set on every
   response, including a failed one.
 - A query whose timeout passes, or that is cancelled, while arcx is still
-  computing the result now answers `504` (or `500` for a cancel) before any
-  body, as on DuckDB. Before, it answered `200` with a body marked truncated.
+  computing the result now answers `504` (or `500` for a cancel, `503
+  "Server shutting down"` when shutdown ended it) before any body, as on
+  DuckDB. Before, it answered `200` with a body marked truncated.
 - A deadline that expires mid-stream counts in `arc_query_timeouts_total`, and
   the stream's error, disconnect and truncation-reason accounting is the
   DuckDB path's.

@@ -192,6 +192,59 @@ func TestArcxArrowExpiredBeforeStreamDeclines(t *testing.T) {
 	}
 }
 
+// A shutdown that cancels the query (#1644) while arcx is still computing is
+// declined like an expired deadline: the DuckDB fallback then answers 503
+// "Server shutting down" before any body and records the entry as cancelled,
+// instead of a 200 with a truncated body.
+func TestArcxArrowShutdownBeforeStreamDeclines(t *testing.T) {
+	h, _, reg := newArcxArrowHandlerRig(t, nil, 30*time.Second)
+	lifetime, endLifetime := context.WithCancel(context.Background())
+	defer endLifetime()
+	h.SetLifetime(lifetime)
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Use(func(c *fiber.Ctx) error {
+		c.Locals("token_info", &auth.TokenInfo{ID: 42, Name: "capped"})
+		return c.Next()
+	})
+	app.Post("/api/v1/query/arrow", h.bindQueryLifetime(h.executeQueryArrow))
+
+	schema, records, alloc := arcxTestRecords(t, 1, 3)
+	defer alloc.AssertSize(t, 0)
+	reader := &releaseCountingReader{simpleRecordReader: newSimpleRecordReader(schema, records)}
+
+	original := arcxArrowDispatch
+	t.Cleanup(func() { arcxArrowDispatch = original })
+	var served bool
+	arcxArrowDispatch = func(
+		h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc,
+		start time.Time, _, _, _ string, governanceMaxRows int,
+		onRows func(int64), onDisconnect func(), onComplete func(int), onFail func(string),
+	) bool {
+		endLifetime() // shutdown's grace ran out while the engine ran
+		<-ctx.Done()
+		served = h.serveArcxArrowIPCResult(
+			c.Context(), ctx, cancel, reader, governanceMaxRows, start,
+			onRows, onDisconnect, onComplete, onFail,
+		)
+		return served
+	}
+
+	resp, body := postArrowQuery(t, app)
+	if served {
+		t.Error("the helper served a stream whose context had already ended")
+	}
+	if resp.StatusCode != fiber.StatusServiceUnavailable || !strings.Contains(string(body), "Server shutting down") {
+		t.Errorf("status = %d body %q, want 503 Server shutting down", resp.StatusCode, body)
+	}
+	if reader.releases != 1 {
+		t.Errorf("reader released %d times, want 1", reader.releases)
+	}
+	history := reg.GetHistory(10)
+	if len(history) != 1 || history[0].Status != queryregistry.StatusCancelled {
+		t.Errorf("history = %+v, want one cancelled entry", history)
+	}
+}
+
 // The helper owns the arcx reader and must release it exactly once on every
 // way the stream ends, including the ones that stop before EOF. The checked
 // allocator additionally proves the batches were freed.
