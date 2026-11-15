@@ -4777,42 +4777,6 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Fix: an Arrow query served by arcx honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
-
-A `POST /api/v1/query/arrow` query that arcx served ignored the token's
-governance `max_rows_per_query` and streamed every row; only the DuckDB path
-stopped at the cap. It also declared only the `Arc-Stream-Truncated` trailer,
-so a client, or a compactor forwarding the query (#1567), never saw
-`Arc-Rows-Capped` or `Arc-Execution-Time-Ms` from it.
-
-Now the arcx path streams through the same writer as the DuckDB path:
-- The result stops at the cap, `Arc-Rows-Capped` names it, and the query's
-  history entry records it, as on DuckDB. An Arrow Flight SQL query that arcx
-  serves now ends with `ResourceExhausted` at the cap, as the Flight SQL
-  documentation already said; before, it returned every row with no error.
-- All three trailers are declared. `Arc-Execution-Time-Ms` is measured from
-  the same point as on DuckDB (when the request arrived), and is set on every
-  response, including a failed one.
-- A query whose timeout passes, or that is cancelled, while arcx is still
-  computing the result now answers `504` (or `500` for a cancel, `503
-  "Server shutting down"` when shutdown ended it) before any body, as on
-  DuckDB. Before, it answered `200` with a body marked truncated.
-- A deadline that expires mid-stream counts in `arc_query_timeouts_total`, and
-  the stream's error, disconnect and truncation-reason accounting is the
-  DuckDB path's.
-- A completed query logs the `Arrow streaming query completed` line, and one
-  slower than `query.slow_query_threshold_ms` logs `Slow query detected` and
-  counts in `arc_slow_queries_total`, as on DuckDB. Neither happened for an
-  arcx-served Arrow query.
-- The arcx reader is released as soon as the response ends. A result stopped
-  early (at the cap, on a cancel or an error) used to keep its last batch of
-  native memory and park arcx's decode workers until a Go garbage collection;
-  the same applied to arcx JSON, msgpack and shadow queries, which now
-  release theirs too.
-
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in
-[#1294](https://github.com/Basekick-Labs/arc/pull/1294).
-
 ### Fix: a token's `expires_in` must be in the future, and a rename cannot clear its name ([#1623](https://github.com/Basekick-Labs/arc/pull/1623))
 
 `POST /api/v1/auth/tokens` and `PATCH /api/v1/auth/tokens/{id}` accepted a
