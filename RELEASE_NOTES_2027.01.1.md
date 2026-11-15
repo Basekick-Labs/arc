@@ -3642,13 +3642,13 @@ Write 2.0 request is answered 415. Prometheus
 and Grafana Alloy configuration examples are in the
 [integration guide](docs/integrations/prometheus-remote-write.md).
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
+
 The receiver decodes Snappy with `klauspost/compress`, already used across
 Arc, instead of the unmaintained `golang/snappy`. It accepts standard Snappy
-blocks only, not S2 extensions, and refuses a malformed block with `invalid
+blocks only, not S2 extensions, and refuses a corrupt block with `invalid
 snappy block: snappy: corrupt input` (400)
 ([#1702](https://github.com/Basekick-Labs/arc/issues/1702)).
-
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
 
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 

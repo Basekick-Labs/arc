@@ -589,6 +589,10 @@ func TestPrometheusRemoteWriteSnappyGoldenVectors(t *testing.T) {
 	s2Repeat := []byte{0x09, 0x00, 'a', 0x01, 0x01, 0x01, 0x00}
 
 	const corrupt = "invalid snappy block: snappy: corrupt input"
+	// The same refusal at the decode stage, independent of the protobuf
+	// coincidence above: an S2 decoder would return nine bytes here.
+	_, _, err = decodePrometheusRemoteWrite(s2Repeat)
+	require.EqualError(t, err, corrupt)
 	declaredAbove := append(binary.AppendUvarint(nil, uint64(len(goldenRequest)+5)), golden[2:]...)
 	declaredBelow := append(binary.AppendUvarint(nil, uint64(len(goldenRequest)-5)), golden[2:]...)
 	require.Equal(t, binary.AppendUvarint(nil, uint64(len(goldenRequest))), golden[:2])
