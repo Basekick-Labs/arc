@@ -7,11 +7,34 @@ configured identically on every node are unaffected.
 ## Why legacy tokens need local cleanup
 
 Legacy tokens exist only in individual nodes' SQLite auth databases. They were
-not migrated into the replicated FSM. The cluster revoke endpoint looks up the
-ID in the FSM: an unknown ID is an idempotent no-op even if the API returns
-success. If a legacy AUTOINCREMENT ID collides with a replicated token ID, the
-same request can revoke the replacement token instead. Never use the replicated
-revoke endpoint to remove a legacy token.
+not migrated into the replicated FSM.
+
+**Before 27.01.1:** the cluster revoke endpoint looks up the ID in the FSM: an
+unknown ID is an idempotent no-op even if the API returns success. If a legacy
+AUTOINCREMENT ID collides with a replicated token ID, the same request can
+revoke the replacement token instead. On those versions, never use the
+replicated revoke endpoint to remove a legacy token; use the offline procedure
+below.
+
+**From 27.01.1** ([#1630](https://github.com/Basekick-Labs/arc/issues/1630)):
+the token endpoints recognise a token the cluster does not manage and change
+it on the node that received the request, and only there. They require that
+node to be named:
+
+```bash
+# On the node that holds it (address the node directly, not a load balancer):
+curl -X POST -H "Authorization: Bearer $ADMIN" \
+  "http://<node>:8000/api/v1/auth/tokens/<id>/revoke?node=<node_id>"
+```
+
+- Without `?node`, the answer is `409` (`node_local_token`) with the node's
+  ID, and nothing changes. `GET /api/v1/auth/tokens` on that node shows the
+  token with `"node_local": true`; check its name there first.
+- A request that reaches a different node than `?node` names answers `409`
+  (`wrong_node`): an ID names a different token on each node.
+- A revoke cannot be undone. Repeat it on every node that holds the token.
+- `DELETE /api/v1/auth/tokens/<id>?node=<node_id>` removes the row from that
+  node; `POST …/rotate?node=<node_id>` gives a value valid on that node only.
 
 ## Which rows the cluster owns (27.01.1 and later)
 
@@ -75,7 +98,10 @@ name with the old one on that node until the old row is removed.
    divergence as described below before proceeding.
 6. Rotate downstream CI secrets, SDKs, dashboards and other consumers to the
    replacement. Verify each consumer against multiple nodes.
-7. Remove the old token **locally on every node that holds it**. Stop the node,
+7. Remove the old token **locally on every node that holds it**. From 27.01.1,
+   revoke or delete it through the API with `?node=<node_id>` on each node, as
+   above, after checking its name in that node's `GET /api/v1/auth/tokens`.
+   On earlier versions, or where identity cannot be established that way: stop the node,
    take a fresh backup, and remove only the positively identified legacy rows
    from its local auth database. (Marked, replicated rows need no manual
    step: the node rebuilds them from replicated FSM state on every restart.)
@@ -104,4 +130,5 @@ the completed migration.
 See [26.06.1 release notes](../RELEASE_NOTES_2026.06.1.md) for replication,
 collision handling and metrics. The source issue is
 [#457](https://github.com/Basekick-Labs/arc/issues/457); its original suggestion
-to revoke legacy tokens through the API does not apply to unmigrated rows.
+to revoke legacy tokens through the API does not apply to unmigrated rows
+before 27.01.1; from 27.01.1 it does, with `?node=<node_id>` on each node ([#1630](https://github.com/Basekick-Labs/arc/issues/1630)).

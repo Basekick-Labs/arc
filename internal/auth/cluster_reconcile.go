@@ -463,7 +463,7 @@ func (r *reconciler) planTokens(tx *sql.Tx) error {
 		if !l.marked {
 			// A row written by a cluster apply before the marker existed:
 			// the same name and the same secret or creation instant.
-			if l.name != e.Name || (l.hash != e.TokenHash && !sameInstant(l.createdAt, e.CreatedAtUnixNano)) {
+			if !tokenRowIsFSMEntry(l.name, l.hash, l.createdAt, e) {
 				r.collision(TableTokens, l.id, e.Name)
 				continue
 			}

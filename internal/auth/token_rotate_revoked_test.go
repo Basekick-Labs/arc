@@ -95,10 +95,7 @@ func TestClusterRotateReReadFailureKeepsTheRotate(t *testing.T) {
 		_ = am.Close()
 	})
 	ctx := context.Background()
-	if _, err := am.CreateToken(ctx, "svc", "", "read", nil); err != nil {
-		t.Fatalf("CreateToken: %v", err)
-	}
-	id := tokenIDByName(t, am, "svc")
+	id := applyClusterToken(t, am, 7, "svc")
 	prop := &fsmLikeTokenProposer{onPropose: func(cmdType uint8) {
 		if cmdType == ProposalCommandRotateToken {
 			// Every later read of the row fails.

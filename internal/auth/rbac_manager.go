@@ -1416,6 +1416,42 @@ func (rm *RBACManager) RemoveTokenFromTeam(ctx context.Context, tokenID, teamID 
 	return nil
 }
 
+// RemoveTokenFromTeamLocal removes a membership of a token the cluster does
+// not manage, from this node's SQLite only (#1630): the cluster state has no
+// such membership, so a proposal would be dropped and the route answered 200
+// with nothing removed. Only an unmarked membership is removed. When the only
+// row for the pair is marked, it is the cluster token's that holds the same
+// ID on this cluster (an ID collision), and the removal is refused.
+func (rm *RBACManager) RemoveTokenFromTeamLocal(ctx context.Context, tokenID, teamID int64) error {
+	result, err := rm.db.ExecContext(ctx, `
+		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ? AND raft_materialised = 0
+	`, tokenID, teamID)
+	if err != nil {
+		return fmt.Errorf("failed to remove token from team: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to remove token from team: %w", err)
+	}
+	if n == 0 {
+		var exists int
+		err := rm.db.QueryRowContext(ctx,
+			`SELECT 1 FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?`, tokenID, teamID).Scan(&exists)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return tagError(ErrNotFound, errors.New("token membership not found"))
+		case err != nil:
+			return fmt.Errorf("failed to look up token membership: %w", err)
+		}
+		return &TokenScopeError{Code: TokenCodeClusterMembership, TokenID: tokenID,
+			Message: fmt.Sprintf("This membership belongs to the cluster token with ID %d, not to the token this node keeps at that ID (an ID collision). Nothing was changed. To remove it from the cluster token, send the request without ?node to a node where token %d is the cluster token.", tokenID, tokenID)}
+	}
+	rm.InvalidateTokenCache(tokenID)
+	rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).
+		Msg("Removed a membership of a token the cluster does not manage, on this node only")
+	return nil
+}
+
 // GetTokenTeams returns all teams a token belongs to
 func (rm *RBACManager) GetTokenTeams(tokenID int64) ([]Team, error) {
 	rows, err := rm.db.Query(`
