@@ -12,13 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 func logicalPayload(t *testing.T, db string, v any) []byte {
