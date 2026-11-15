@@ -54,6 +54,17 @@ if ! grep -q 'must be at least 32 characters' <<<"$out"; then
 fi
 helm template arc-test "$chart" \
   --set-string auth.bootstrapToken.value=01234567890123456789012345678901 > /dev/null
+# Arc trims surrounding whitespace before the length check (#1713), so a
+# 31-character value plus a trailing newline must be refused too.
+printf 'auth:\n  bootstrapToken:\n    value: "0123456789012345678901234567890\\n"\n' > "$tmpdir/ws-token.yaml"
+if out=$(helm template arc-test "$chart" -f "$tmpdir/ws-token.yaml" 2>&1); then
+  echo 'chart rendered a 31-character bootstrap token padded with a newline' >&2
+  exit 1
+fi
+if ! grep -q 'must be at least 32 characters' <<<"$out"; then
+  echo "unexpected render error for a newline-padded short bootstrap token: $out" >&2
+  exit 1
+fi
 
 python3 - "$tmpdir" <<'PY'
 import pathlib
