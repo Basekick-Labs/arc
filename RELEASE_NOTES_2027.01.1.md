@@ -2,6 +2,19 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: the bootstrap admin token is trimmed of surrounding whitespace ([#1713](https://github.com/Basekick-Labs/arc/issues/1713))
+
+`auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`) was stored exactly as given. A value with surrounding whitespace, typically the trailing newline of a file made with `openssl rand ... > token` and loaded into a Kubernetes Secret with `--from-file`, became a token no client could present, because an HTTP `Authorization` header cannot carry the newline: every request got `401`, while the first-boot banner showed a value that looked right.
+
+- Arc now removes leading and trailing whitespace from the value when the configuration is loaded, from the environment or from `arc.toml`. Whitespace inside the value is kept. This covers both the first admin token and the recovery token added with `auth.force_bootstrap`.
+- When trimming changed the value, Arc logs a warning at startup for `auth.bootstrap_token`. The warning never includes the value.
+- With `auth.enabled = true`, a value that is only whitespace now stops Arc at startup with an error, instead of Arc quietly generating a random admin token. With auth disabled the key is not used and nothing changes; enabling auth later turns such a value into that startup error.
+- The 32-character minimum now applies to the trimmed value, so a 31-character token followed by a newline is refused (Arc logs the error and starts with no admin token, as for any short token). The `arc` and `arc-enterprise` Helm charts check the trimmed length too, so they refuse such a `auth.bootstrapToken.value` at render time.
+- Tokens already stored are not changed. If an earlier release stored your bootstrap token with the whitespace, that token still cannot be presented: restart with `ARC_AUTH_FORCE_BOOTSTRAP=true` and the token value to add it as the `arc-recovery` admin token, then remove `ARC_AUTH_FORCE_BOOTSTRAP`. If an `arc-recovery` token already exists from an earlier attempt, it is not replaced: the restart logs `Recovery token already exists` and adds nothing. Delete that token with an admin token if you still have one; otherwise remove the `arc-recovery` row from the `api_tokens` table in the auth database before restarting.
+- During a rolling upgrade of a cluster that has never created its first admin token, a node still on the earlier release can create it with the untrimmed value. Upgrade every node before the first boot, or check that the token works afterwards.
+
+No new configuration keys.
+
 ## Dependencies: tests build msgpack payloads with the encoder production uses ([#1709](https://github.com/Basekick-Labs/arc/issues/1709))
 
 Test-only; no product behaviour changes. Five test files (in `internal/cluster`, `internal/wal` and `internal/ingest`) built their msgpack payloads with upstream `github.com/vmihailenco/msgpack/v5`, while Arc itself encodes and decodes with its fork, `github.com/Basekick-Labs/msgpack/v6`. They now use the fork, so the tests encode with the same library Arc decodes with (the payload bytes are equivalent either way). `vmihailenco/msgpack/v5` is no longer a direct dependency; it stays in `go.mod` as an indirect one, pulled in by `iceberg-go` through `uptrace/bun`, which uses it only for fields tagged `bun:",msgpack"`; iceberg-go's catalog models have none, so that copy is linked but never runs. `go mod tidy` also records `google.golang.org/grpc` as the direct dependency it already was (Flight SQL imports it).

@@ -23,6 +23,20 @@ if ! grep -q 'must be at least 32 characters' <<<"$out"; then
   exit 1
 fi
 
+# Arc trims surrounding whitespace before the length check (#1713), so a
+# 31-character value plus a trailing newline must be refused too.
+ws_values=$(mktemp)
+trap 'rm -f "$ws_values"' EXIT
+printf 'auth:\n  bootstrapToken:\n    value: "0123456789012345678901234567890\\n"\n' > "$ws_values"
+if out=$(render -f "$ws_values" 2>&1); then
+  echo 'chart rendered a 31-character bootstrap token padded with a newline' >&2
+  exit 1
+fi
+if ! grep -q 'must be at least 32 characters' <<<"$out"; then
+  echo "unexpected render error for a newline-padded short bootstrap token: $out" >&2
+  exit 1
+fi
+
 # Exactly 32 is accepted, and the value is not checked when an existing
 # Secret supplies the token.
 render --set-string auth.bootstrapToken.value=01234567890123456789012345678901 > /dev/null

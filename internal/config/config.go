@@ -26,7 +26,7 @@ import (
 // cmd/arc/main.go emits them once, immediately after Load returns.
 type LoadWarning struct {
 	Key     string // the configuration key, as an operator spells it
-	Value   string // the configured value, verbatim
+	Value   string // the configured value, verbatim; a placeholder when the value is a secret (auth.bootstrap_token)
 	Message string // what the hazard is and what to do
 }
 
@@ -1972,6 +1972,14 @@ func Load() (*Config, error) {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 
+	w, err := normalizeBootstrapToken(&cfg.Auth)
+	if err != nil {
+		return nil, err
+	}
+	if w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+
 	// Iceberg export runs on a local or an S3 primary backend (#939). The reconciler walks the
 	// single configured storage backend and publishes through iceberg-go's FileIO, which Arc
 	// links for s3:// only, so Azure and GCS primaries are refused, as is a cold tier on anything
@@ -2851,6 +2859,40 @@ var fipsBuild = fips.BuildTagged
 // has no native GCS backend (#1587). Config load is where this has to happen:
 // the factory's own refusal would stop a primary at startup, but would leave a
 // node running without its cold tier, or without the backup API.
+// normalizeBootstrapToken trims surrounding whitespace from auth.bootstrap_token
+// (ARC_AUTH_BOOTSTRAP_TOKEN), which seeds the first admin token and, with
+// auth.force_bootstrap, the recovery token (#1713). A value read from a file
+// usually ends in a newline (`openssl rand ... > f`, a Secret built with
+// --from-file), and an Authorization header cannot carry one, so a token stored
+// with it can never be presented: every request answered 401. Whitespace inside
+// the value is kept. Tokens already stored are not touched: this only changes
+// the value Arc hands to the bootstrap.
+//
+// The warning never carries the value, not even in LoadWarning.Value, which
+// cmd/arc/main.go logs verbatim. A value that is only whitespace is refused
+// while auth is enabled, rather than silently generating a random admin token
+// the operator never sees in their secret store; with auth disabled the key
+// is never read.
+func normalizeBootstrapToken(auth *AuthConfig) (*LoadWarning, error) {
+	raw := auth.BootstrapToken
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == raw {
+		return nil, nil
+	}
+	auth.BootstrapToken = trimmed
+	if !auth.Enabled {
+		return nil, nil
+	}
+	if trimmed == "" {
+		return nil, fmt.Errorf("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) is set but contains only whitespace: set a token of at least 32 characters, or unset the key to have Arc generate one")
+	}
+	return &LoadWarning{
+		Key:     "auth.bootstrap_token",
+		Value:   "(not shown)",
+		Message: "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) had surrounding whitespace, such as the newline at the end of a file it was read from: it was removed, and the trimmed value is the token clients must present. Tokens already stored are unchanged; a token an earlier release stored with the whitespace cannot be presented, so add the trimmed one with auth.force_bootstrap = true (ARC_AUTH_FORCE_BOOTSTRAP)",
+	}, nil
+}
+
 func refuseGCSInFIPSBuild(key string) error {
 	if !fipsBuild {
 		return nil

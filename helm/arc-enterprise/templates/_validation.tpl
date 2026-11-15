@@ -80,7 +80,7 @@ in. Checked only when the chart creates the Secret from the value.
 */}}
 {{- define "arc-enterprise.validate.bootstrapToken" -}}
 {{- if and (not .Values.auth.bootstrapToken.existingSecret) .Values.auth.bootstrapToken.value -}}
-{{- if lt (len .Values.auth.bootstrapToken.value) 32 -}}
+{{- if lt (len (trim .Values.auth.bootstrapToken.value)) 32 -}}
 {{- fail "auth.bootstrapToken.value must be at least 32 characters long" -}}
 {{- end -}}
 {{- end -}}
