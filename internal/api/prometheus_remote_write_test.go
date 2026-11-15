@@ -14,7 +14,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
-	"github.com/golang/snappy"
+	"github.com/klauspost/compress/snappy"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -175,6 +175,23 @@ func TestPrometheusRemoteWriteAcceptsEmptyNegotiationRequest(t *testing.T) {
 	status, out := remoteWriteTestPost(t, trig, remoteWriteTestBody(nil), remoteWriteTestHeaders())
 	require.Equal(t, http.StatusNoContent, status, out)
 	require.Zero(t, trig.buf.BufferedBytes())
+}
+
+func TestDecodePrometheusRemoteWritePreservesSnappyBlockErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "invalid length prefix", body: []byte{0xff}},
+		{name: "truncated literal", body: []byte{4, 0x0c, 'a'}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := decodePrometheusRemoteWrite(tt.body)
+			require.EqualError(t, err, "invalid snappy block: snappy: corrupt input")
+		})
+	}
 }
 
 func TestPrometheusRemoteWriteRejectsInvalidRequestsWithoutWriting(t *testing.T) {

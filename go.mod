@@ -18,7 +18,6 @@ require (
 	github.com/duckdb/duckdb-go/v2 v2.10506.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/gofiber/fiber/v2 v2.52.13
-	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/raft v1.7.3

@@ -18,7 +18,7 @@ import (
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang/snappy"
+	"github.com/klauspost/compress/snappy"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
 	"google.golang.org/protobuf/encoding/protowire"

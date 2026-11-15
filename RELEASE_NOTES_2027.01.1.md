@@ -6,6 +6,12 @@
 
 Test-only; no product behaviour changes. Five test files (in `internal/cluster`, `internal/wal` and `internal/ingest`) built their msgpack payloads with upstream `github.com/vmihailenco/msgpack/v5`, while Arc itself encodes and decodes with its fork, `github.com/Basekick-Labs/msgpack/v6`. They now use the fork, so the tests encode with the same library Arc decodes with (the payload bytes are equivalent either way). `vmihailenco/msgpack/v5` is no longer a direct dependency; it stays in `go.mod` as an indirect one, pulled in by `iceberg-go` through `uptrace/bun`, which uses it only for fields tagged `bun:",msgpack"`; iceberg-go's catalog models have none, so that copy is linked but never runs. `go mod tidy` also records `google.golang.org/grpc` as the direct dependency it already was (Flight SQL imports it).
 
+## Fix: Prometheus Remote Write reuses Arc's Snappy dependency (#1702)
+
+The Prometheus Remote Write receiver now uses Arc's existing `klauspost/compress/snappy` dependency instead of adding a separate Snappy module. It keeps standard block decoding and the existing error text for malformed and truncated payloads.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1711](https://github.com/Basekick-Labs/arc/pull/1711).
+
 ## Fix: Iceberg table repairs are retried, and their metadata copies cleaned up ([#1097](https://github.com/Basekick-Labs/arc/issues/1097), [#1098](https://github.com/Basekick-Labs/arc/issues/1098))
 
 The Iceberg exporter repairs two table properties when they drift: the column name mapping external readers need for columns added later, and the metadata-retention settings after `iceberg.retain_snapshots` changes.

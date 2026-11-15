@@ -15,7 +15,7 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang/snappy"
+	"github.com/klauspost/compress/snappy"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -287,7 +287,7 @@ func decodePrometheusRemoteWrite(rawBody []byte) (*remoteWriteRequest, int, erro
 	}
 	decodedLength, err := snappy.DecodedLen(rawBody)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid snappy block: %w", err)
+		return nil, 0, fmt.Errorf("invalid snappy block: %w", normalizeSnappyError(err))
 	}
 	if decodedLength > maxRemoteWritePayloadBytes {
 		return nil, 0, errRemoteWriteTooBig
@@ -295,15 +295,28 @@ func decodePrometheusRemoteWrite(rawBody []byte) (*remoteWriteRequest, int, erro
 	if decodedLength > maxSnappyRatio*len(rawBody)+1024 {
 		return nil, 0, fmt.Errorf("invalid snappy block: declares %d bytes from a %d-byte body", decodedLength, len(rawBody))
 	}
-	decoded, err := snappy.Decode(nil, rawBody)
+	decoded, err := snappy.DecodeStrict(nil, rawBody)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid snappy block: %w", err)
+		return nil, 0, fmt.Errorf("invalid snappy block: %w", normalizeSnappyError(err))
 	}
 	request, err := unmarshalRemoteWriteRequest(decoded)
 	if err != nil {
 		return nil, 0, fmt.Errorf("invalid remote write protobuf: %w", err)
 	}
 	return request, len(decoded), nil
+}
+
+func normalizeSnappyError(err error) error {
+	switch {
+	case errors.Is(err, snappy.ErrCorrupt):
+		return errors.New("snappy: corrupt input")
+	case errors.Is(err, snappy.ErrTooLarge):
+		return errors.New("snappy: decoded block is too large")
+	case errors.Is(err, snappy.ErrUnsupported):
+		return errors.New("snappy: unsupported input")
+	default:
+		return err
+	}
 }
 
 func unmarshalRemoteWriteRequest(data []byte) (*remoteWriteRequest, error) {
