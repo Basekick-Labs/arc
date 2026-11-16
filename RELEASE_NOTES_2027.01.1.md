@@ -2,6 +2,20 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: Flight SQL clients can choose a database with the `x-arc-database` header ([#1720](https://github.com/Basekick-Labs/arc/issues/1720))
+
+A Flight SQL statement can now carry the same `x-arc-database` header as the HTTP query API. Unqualified table names then resolve in that database, so `SELECT * FROM cpu` works without writing `"mydb"."cpu"`. Before, the Flight SQL listener ignored the header: an unqualified name resolved in the `default` database, and a query against a measurement that only existed elsewhere quietly returned no rows.
+
+With the ADBC Flight SQL driver, set the connection option `adbc.flight.sql.rpc.call_header.x-arc-database` to the database name. Any client that can send gRPC call headers can do the same.
+
+- **Same rules as HTTP:** the name is validated, and RBAC applies to the resolved table. A query that names any database (`"mydb"."cpu"` or `other.cpu`) is refused while the header is set, even when it names the header's own database. BI tools that write qualified names should leave the header unset.
+- **Which call carries it:** the header can be sent when the query is planned (GetFlightInfo), when its result is fetched (DoGet), or on both. If both carry it, the two values must match. Sending it more than once on one call, or sending an invalid name, is refused with `INVALID_ARGUMENT`.
+- **Catalog calls ignore it:** listing catalogs, tables and table schemas (GetCatalogs, GetDbSchemas, GetTables) is unaffected, so tools that browse every database keep working with the header set.
+- **Nothing else is forwarded:** no other header the client sends reaches the query.
+- **Cut-off results:** a Flight SQL result that Arc cut short now ends with `INTERNAL: Arc query stream was truncated`, instead of a decoding error about the stream's last message.
+
+No new configuration keys.
+
 ## Fix: the arcx build's API tests run to completion ([#1016](https://github.com/Basekick-Labs/arc/issues/1016))
 
 Only affects Arc built with the arcx engine (`-tags=duckdb_arrow,arcx_engine`); no change for servers, which always have a DuckDB engine.

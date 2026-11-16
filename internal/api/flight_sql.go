@@ -65,6 +65,15 @@ const flightSQLPeerHeader = "X-Arc-Flight-Peer"
 // flightSQLInternalKeyHeader authenticates the gRPC side to the bridge.
 const flightSQLInternalKeyHeader = "X-Arc-Flight-Internal-Key"
 
+// flightSQLDatabaseHeader is the one client call header a statement carries
+// across the bridge: the database unqualified table names resolve in, as the
+// HTTP header of the same name. ADBC sets it with the connection option
+// adbc.flight.sql.rpc.call_header.x-arc-database. Nothing else from the
+// client's metadata is forwarded: the peer header is the bridge's proxy
+// header (the audit log's client address), and other x-arc-* headers change
+// what the Arrow route encodes or whether it forwards.
+const flightSQLDatabaseHeader = "x-arc-database"
+
 // Shutdown stages. The shutdown coordinator gives every hook and component
 // one context and skips everything left once it expires, including the
 // ingest buffer and WAL flushes, so this hook keeps its own deadline well
@@ -124,6 +133,9 @@ type flightSQLAuth struct {
 
 type flightStatement struct {
 	SQL string `json:"sql"`
+	// Database is the x-arc-database call header GetFlightInfo saw, so a
+	// client that sends it only there still runs in that database.
+	Database string `json:"database,omitempty"`
 }
 
 type flightQueryResponse struct {
@@ -192,7 +204,8 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 	}
 	queryHandler.RegisterRoutes(bridge)
 
-	transport := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 64}
+	// No gzip on the loopback hop: it only costs CPU on both ends.
+	transport := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 64, DisableCompression: true}
 	service := &flightSQLService{
 		// Set here, not left to the base server: its SqlInfo handlers
 		// assign a nil Alloc on every call, a data race between two calls.
@@ -561,14 +574,36 @@ func (s *flightSQLService) token(ctx context.Context) string {
 	return identity.token
 }
 
-func (s *flightSQLService) GetFlightInfoStatement(_ context.Context, query flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+// flightDatabase returns the statement's x-arc-database call header, "" when
+// it is absent or empty. Sent more than once, or not a valid database name,
+// it is the client's error.
+func flightDatabase(ctx context.Context) (string, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	values := md.Get(flightSQLDatabaseHeader)
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) > 1 {
+		return "", status.Error(codes.InvalidArgument, "the x-arc-database header was sent more than once")
+	}
+	if err := validateHeaderDatabase(values[0]); err != nil {
+		return "", status.Error(codes.InvalidArgument, "invalid x-arc-database header: "+err.Error())
+	}
+	return values[0], nil
+}
+
+func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
 	if len(query.GetTransactionId()) != 0 {
 		return nil, status.Error(codes.Unimplemented, "Flight SQL transactions are not supported")
 	}
 	if err := ValidateSQLRequest(query.GetQuery()); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	handle, err := json.Marshal(flightStatement{SQL: query.GetQuery()})
+	database, err := flightDatabase(ctx)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := json.Marshal(flightStatement{SQL: query.GetQuery(), Database: database})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode statement ticket: %v", err)
 	}
@@ -592,12 +627,27 @@ func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.
 	if err := ValidateSQLRequest(statement.SQL); err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	// The ticket is the client's to send back, so its database is checked
+	// like the header; the route then applies the same checks to both.
+	if err := validateHeaderDatabase(statement.Database); err != nil {
+		return nil, nil, status.Error(codes.InvalidArgument, "invalid database in statement ticket")
+	}
+	database, err := flightDatabase(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch {
+	case database == "":
+		database = statement.Database
+	case statement.Database != "" && database != statement.Database:
+		return nil, nil, status.Error(codes.InvalidArgument, "the x-arc-database header differs from the database the statement was prepared in")
+	}
 
 	path := "/api/v1/query/arrow"
 	if isFlightShowSQL(statement.SQL) {
 		path = "/api/v1/query"
 	}
-	resp, err := s.query(ctx, path, statement.SQL, s.token(ctx))
+	resp, err := s.query(ctx, path, statement.SQL, s.token(ctx), database)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -632,13 +682,20 @@ type flightSQLResponseReader struct {
 }
 
 func (r *flightSQLResponseReader) Err() error {
-	// Decoder errors take precedence over any completion metadata.
-	if err := r.RecordReader.Err(); err != nil {
-		return err
-	}
+	decodeErr := r.RecordReader.Err()
 	r.once.Do(func() {
 		r.completionErr = flightSQLResponseCompletion(r.ctx, r.response)
 	})
+	if decodeErr != nil {
+		// Arc ends a stream it had to cut short with a marker no decoder
+		// reads (poisonArrowStream), then names the cut in a trailer. Report
+		// the cut, not the decoder's complaint about the marker. Any other
+		// decoder error takes precedence over the completion metadata.
+		if r.response.Trailer.Get(arrowStreamTruncatedTrailer) != "" {
+			return status.Error(codes.Internal, "Arc query stream was truncated")
+		}
+		return decodeErr
+	}
 	return r.completionErr
 }
 
@@ -761,7 +818,10 @@ func isFlightShowSQL(sql string) bool {
 	return showDatabasesPattern.MatchString(normalised) || showTablesPattern.MatchString(normalised)
 }
 
-func (s *flightSQLService) query(ctx context.Context, path, sql, token string) (*http.Response, error) {
+// query sends one statement across the bridge. database, when set, becomes
+// the x-arc-database header; the catalog helpers pass "" because their SQL
+// qualifies every table, which the route refuses alongside the header.
+func (s *flightSQLService) query(ctx context.Context, path, sql, token, database string) (*http.Response, error) {
 	body, err := json.Marshal(QueryRequest{SQL: sql})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode query: %v", err)
@@ -783,6 +843,9 @@ func (s *flightSQLService) query(ctx context.Context, path, sql, token string) (
 	req.Header.Set(flightSQLInternalKeyHeader, s.internalKey)
 	if token != "" {
 		req.Header.Set(fiber.HeaderAuthorization, "Bearer "+token)
+	}
+	if database != "" {
+		req.Header.Set(flightSQLDatabaseHeader, database)
 	}
 	// Who is asking, for the query registry, the audit log and forwarding.
 	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
@@ -1151,7 +1214,7 @@ func flightRecordStream(ctx context.Context, schema *arrow.Schema, builder *arra
 }
 
 func (s *flightSQLService) listDatabases(ctx context.Context, token string) ([]string, error) {
-	resp, err := s.query(ctx, "/api/v1/query", "SHOW DATABASES", token)
+	resp, err := s.query(ctx, "/api/v1/query", "SHOW DATABASES", token, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1182,7 +1245,7 @@ func (s *flightSQLService) listMeasurements(ctx context.Context, database, token
 		return nil, status.Error(codes.InvalidArgument, "invalid catalog")
 	}
 	sql := "SHOW TABLES FROM " + quoteFlightIdentifier(database)
-	resp, err := s.query(ctx, "/api/v1/query", sql, token)
+	resp, err := s.query(ctx, "/api/v1/query", sql, token, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1213,7 +1276,7 @@ func (s *flightSQLService) measurementSchema(ctx context.Context, database, meas
 		return nil, status.Error(codes.InvalidArgument, "invalid catalog")
 	}
 	sql := fmt.Sprintf("SELECT * FROM %s.%s LIMIT 0", quoteFlightIdentifier(database), quoteFlightIdentifier(measurement))
-	resp, err := s.query(ctx, "/api/v1/query/arrow", sql, token)
+	resp, err := s.query(ctx, "/api/v1/query/arrow", sql, token, "")
 	if err != nil {
 		return nil, err
 	}

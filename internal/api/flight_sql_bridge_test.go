@@ -60,9 +60,9 @@ func TestFlightSQLBridgeRecoversFromAHandlerPanic(t *testing.T) {
 	s.bridge.Post("/test/ok", func(c *fiber.Ctx) error { return c.SendString("{}") })
 	startBridgeTestServer(t, s)
 
-	_, err := s.service.query(context.Background(), "/test/panic", "SELECT 1", "")
+	_, err := s.service.query(context.Background(), "/test/panic", "SELECT 1", "", "")
 	require.Error(t, err)
-	resp, err := s.service.query(context.Background(), "/test/ok", "SELECT 1", "")
+	resp, err := s.service.query(context.Background(), "/test/ok", "SELECT 1", "", "")
 	require.NoError(t, err, "the bridge must keep serving after a panic")
 	require.NoError(t, resp.Body.Close())
 }
@@ -79,7 +79,7 @@ func TestFlightSQLBridgeStripsTheKeyAndCarriesTheClient(t *testing.T) {
 
 	ctx := peer.NewContext(context.Background(), &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 5555}})
 	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("user-agent", "ADBC Flight SQL Driver"))
-	resp, err := s.service.query(ctx, "/test/echo", "SELECT 1", "")
+	resp, err := s.service.query(ctx, "/test/echo", "SELECT 1", "", "")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	var got map[string]string
@@ -110,7 +110,7 @@ func TestFlightSQLBridgeRunsConfiguredMiddlewareAfterAuth(t *testing.T) {
 	s.bridge.Post("/test/ok", func(c *fiber.Ctx) error { return c.SendString("{}") })
 	startBridgeTestServer(t, s)
 
-	resp, err := s.service.query(context.Background(), "/test/ok", "SELECT 1", token)
+	resp, err := s.service.query(context.Background(), "/test/ok", "SELECT 1", token, "")
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, int32(1), ran.Load())
@@ -119,7 +119,7 @@ func TestFlightSQLBridgeRunsConfiguredMiddlewareAfterAuth(t *testing.T) {
 	// Without the key the bridge refuses before any of it runs.
 	keyless := *s.service
 	keyless.internalKey = "wrong"
-	_, err = keyless.query(context.Background(), "/test/ok", "SELECT 1", token)
+	_, err = keyless.query(context.Background(), "/test/ok", "SELECT 1", token, "")
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
 	require.Equal(t, int32(1), ran.Load())
 }
@@ -176,7 +176,7 @@ func TestFlightSQLShutdownCancelsInFlightBridgeRequests(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() {
-		_, err := s.service.query(context.Background(), "/test/hang", "SELECT 1", "")
+		_, err := s.service.query(context.Background(), "/test/hang", "SELECT 1", "", "")
 		errc <- err
 	}()
 	<-entered
@@ -243,7 +243,7 @@ func TestFlightSQLShutdownReturnsWithinAShortContext(t *testing.T) {
 	conn, err := net.Dial("tcp", s.flightLn.Addr().String())
 	require.NoError(t, err)
 	defer conn.Close()
-	go func() { _, _ = s.service.query(context.Background(), "/test/hang", "SELECT 1", "") }()
+	go func() { _, _ = s.service.query(context.Background(), "/test/hang", "SELECT 1", "", "") }()
 	<-entered
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
@@ -268,7 +268,7 @@ func TestFlightSQLBridgeHandlersRunUnderTheBaseContext(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, s.Start())
-	go func() { _, _ = s.service.query(context.Background(), "/test/ctx", "SELECT 1", "") }()
+	go func() { _, _ = s.service.query(context.Background(), "/test/ctx", "SELECT 1", "", "") }()
 	time.Sleep(100 * time.Millisecond)
 	s.cancelBase()
 	require.ErrorIs(t, <-done, context.Canceled)

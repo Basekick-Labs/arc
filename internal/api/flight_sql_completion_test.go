@@ -68,6 +68,10 @@ func TestFlightSQLCompletionSignals(t *testing.T) {
 		{name: "unexpected body suffix", extra: true, want: codes.Internal},
 		{name: "HTTP read error after IPC", readError: true, want: codes.Internal},
 		{name: "broken IPC overrides cap", cap: "2", broken: true, want: codes.Unknown},
+		// What Arc sends when it cuts a stream short: a marker no decoder
+		// reads, then the truncation trailer. The cut is reported, without its
+		// reason, rather than the decoder's complaint.
+		{name: "cut stream reports truncation", broken: true, truncated: "secret engine path", want: codes.Internal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			record := completionTestRecord(t)
