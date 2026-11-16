@@ -822,8 +822,8 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		totalFilesDeleted += filesDeleted
 		totalSkipped += skipped
 		totalSkipped += discovery.unusable.counts[measurement]
-		h.measurementChanged(false, filesDeleted, policy.Database, measurement)
 		if err != nil {
+			h.measurementChanged(false, filesDeleted, policy.Database, measurement) // partial progress
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
 			// and continuing would produce orphaned manifest entries with no retry path.
@@ -839,7 +839,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(ctx, cold, measurement, cutoffDate, false)
 		totalDeleted += coldRows
 		totalFilesDeleted += coldFiles
-		h.measurementChanged(false, coldFiles, policy.Database, measurement)
+		h.measurementChanged(false, filesDeleted+coldFiles, policy.Database, measurement)
 		if coldErr != nil {
 			if executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
@@ -1040,8 +1040,8 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		totalSkipped += discovery.unusable.counts[measurement]
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
-		h.measurementChanged(req.DryRun, filesDeleted, policy.Database, measurement)
 		if err != nil {
+			h.measurementChanged(req.DryRun, filesDeleted, policy.Database, measurement) // partial progress
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
@@ -1056,7 +1056,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(c.Context(), cold, measurement, cutoffDate, req.DryRun)
 		totalDeleted += coldRows
 		totalFilesDeleted += coldFiles
-		h.measurementChanged(req.DryRun, coldFiles, policy.Database, measurement)
+		h.measurementChanged(req.DryRun, filesDeleted+coldFiles, policy.Database, measurement)
 		if coldErr != nil {
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())

@@ -753,7 +753,8 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 			if derr = deleteReplaced(ctx, h.storage, r.ReplacedBy); derr == nil {
 				h.clearRetired(ctx, r.Path)
 				h.forgetSeen(r)
-				// A standalone export may have published the rewrite.
+				// The export may have published the rewrite (a revert is a
+				// cluster's; served where this node is the exporter).
 				changed = append(changed, r.ReplacedBy)
 			}
 			release()

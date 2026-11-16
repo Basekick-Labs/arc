@@ -19,7 +19,8 @@ func TestIcebergIsToldAboutChangedPaths(t *testing.T) {
 		"databasesHandler.SetOnPathsChanged(notifyIcebergPaths)",
 		"retentionHandler.SetOnPathsChanged(notifyIcebergPaths)",
 		"tieringManager.SetOnPathsChanged(notifyIcebergPaths)",
-		"notifyIcebergPaths([]string{path})",
+		"spokeDeleted.add(path)",
+		"flushSpokeDeleted()",
 		"icebergPathsChanged.Store(&requestPaths)",
 	} {
 		if !strings.Contains(string(src), want) {

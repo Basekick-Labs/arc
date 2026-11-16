@@ -58,6 +58,12 @@ func TestMeasurementsForMapsKeysAtSegmentBoundaries(t *testing.T) {
 	if got := only.measurementsFor([]string{"db/cpu2/2026/11/16/14/f.parquet"}); len(got) != 0 {
 		t.Fatalf("db/cpu2's file mapped to %v, want nothing", got)
 	}
+	// A table reconciled since the last pass (a compaction's request created
+	// it) is reachable too.
+	only.state["db\x00fresh"] = measurementState{}
+	if got := names(only.measurementsFor([]string{"db/fresh/2026/11/16/14/f.parquet"})); got != "db|fresh" {
+		t.Fatalf("state-only measurement: %q, want db|fresh", got)
+	}
 	empty := NewScheduler(SchedulerConfig{Logger: zerolog.Nop()})
 	if got := empty.measurementsFor([]string{"db/cpu/"}); len(got) != 0 {
 		t.Fatalf("before any pass: %v, want nothing (the timer covers it)", got)

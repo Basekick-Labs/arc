@@ -1119,11 +1119,12 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	if h.onFilesRemoved != nil {
 		h.onFilesRemoved()
 	}
-	// A delete that stops short of dropping the catalog leaves the export's
-	// tables naming what it removed; the scheduler maps the database's
-	// directory onto them (#1727). After a full drop the tables are gone and
-	// the prefix maps onto nothing.
-	if h.onPathsChanged != nil {
+	// A delete that stops part-way returns below without dropping the
+	// catalog, leaving the export's tables naming what it removed; the
+	// scheduler maps the database's directory onto them (#1727). A delete
+	// that completes drops the tables below: no request then, as a reconcile
+	// racing that drop could recreate a table it is removing.
+	if len(deleteErrors) > 0 && h.onPathsChanged != nil {
 		h.onPathsChanged([]string{name + "/"})
 	}
 

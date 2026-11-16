@@ -327,13 +327,33 @@ func (s *Scheduler) takePathRequests() []string {
 }
 
 // measurementsFor maps storage keys onto the measurements the last pass
-// listed: a key inside a measurement's directory reaches that measurement
+// listed or that were reconciled since (state): a key inside a measurement's directory reaches that measurement
 // (the longest such, should two nest), and a directory key reaches every
 // measurement under it. Matching is at "/" boundaries, so "db/cpu2/..." is
 // not "db/cpu", nor "wh-other/" "wh". Loop goroutine only.
 func (s *Scheduler) measurementsFor(keys []string) []Measurement {
-	if len(keys) == 0 || len(s.known) == 0 {
+	// The last pass's list, and the tables reconciled since (a compaction's
+	// request can create one between passes).
+	cands := make([]Measurement, 0, len(s.known)+len(s.state))
+	dirs := make([]string, 0, cap(cands))
+	inKnown := make(map[string]bool, len(s.known))
+	for _, m := range s.known {
+		inKnown[m.Database+"\x00"+m.Measurement] = true
+		cands = append(cands, m)
+	}
+	for k := range s.state {
+		if inKnown[k] {
+			continue
+		}
+		if db, meas, ok := strings.Cut(k, "\x00"); ok {
+			cands = append(cands, Measurement{Database: db, Measurement: meas})
+		}
+	}
+	if len(keys) == 0 || len(cands) == 0 {
 		return nil
+	}
+	for _, m := range cands {
+		dirs = append(dirs, m.Database+"/"+m.Measurement+"/")
 	}
 	seen := map[string]bool{}
 	var out []Measurement
@@ -347,8 +367,8 @@ func (s *Scheduler) measurementsFor(keys []string) []Measurement {
 	for _, key := range keys {
 		dir := strings.TrimSuffix(key, "/") + "/"
 		best, bestLen := Measurement{}, 0
-		for _, m := range s.known {
-			mdir := m.Database + "/" + m.Measurement + "/"
+		for i, m := range cands {
+			mdir := dirs[i]
 			switch {
 			case strings.HasPrefix(key, mdir):
 				// The key is in this measurement's directory.

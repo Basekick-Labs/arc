@@ -3768,6 +3768,7 @@ func main() {
 						if f := spokeDeleteInvalidate.Load(); f != nil {
 							(*f)()
 						}
+						flushSpokeDeleted()
 					})
 				spokeLogger.Warn().Dur("delay", cfg.EdgeSync.Spoke.DeleteAfterSyncDelay).
 					Msg("edge_sync.spoke.delete_after_sync is on: local copies of synced files are deleted once the hub verifies it holds them; local queries no longer see that data")
@@ -3844,6 +3845,7 @@ func main() {
 						if f := spokeDeleteInvalidate.Load(); f != nil {
 							(*f)()
 						}
+						flushSpokeDeleted()
 					},
 					Delay:           cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
 					MaxAge:          cfg.EdgeSync.Spoke.DeleteAfterSyncAckMaxAge,
@@ -4750,11 +4752,18 @@ func main() {
 			compactionManager.SetOnMeasurementCompacted(icebergScheduler.RequestReconcile)
 		}
 		// Row DELETE, retention, tiering moves, delete_after_sync and a partial
-		// database delete report the storage paths they changed (#1727). On a
-		// node whose gate keeps export off (a cluster's primary writer, where
-		// those run) the requests are dropped and the timed passes cover them.
+		// database delete report the storage paths they changed (#1727). They
+		// are served only on the node that exports: on a cluster's primary
+		// writer, where those mostly run, the gate drops them and the timed
+		// passes cover them.
+		// Stored when the export starts (icebergStart below): a scheduler that
+		// never starts (no cold tier) would collect requested paths forever.
 		requestPaths := icebergScheduler.RequestReconcilePaths
-		icebergPathsChanged.Store(&requestPaths)
+		startScheduler := icebergStart
+		icebergStart = func() {
+			startScheduler()
+			icebergPathsChanged.Store(&requestPaths)
+		}
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
 			icebergScheduler.Stop()
 			// Close only a handle this block opened. A borrowed one belongs to
@@ -6161,8 +6170,40 @@ func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manag
 				log.Warn().Err(err).Str("path", path).Msg("delete_after_sync: deleted the local file but not its tier row")
 			}
 		}
-		notifyIcebergPaths([]string{path})
+		spokeDeleted.add(path)
 		return nil
+	}
+}
+
+// spokeDeleted collects the paths delete_after_sync removed until its batch
+// ends (flushSpokeDeleted, from the AfterDeletes hooks): one Iceberg request
+// per batch, not per file, which would commit the table once per file.
+var spokeDeleted pathBatch
+
+type pathBatch struct {
+	mu    sync.Mutex
+	paths []string
+}
+
+func (b *pathBatch) add(p string) {
+	b.mu.Lock()
+	b.paths = append(b.paths, p)
+	b.mu.Unlock()
+}
+
+func (b *pathBatch) take() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.paths
+	b.paths = nil
+	return out
+}
+
+// flushSpokeDeleted reports a finished delete_after_sync batch to the
+// Iceberg export (#1727).
+func flushSpokeDeleted() {
+	if paths := spokeDeleted.take(); len(paths) > 0 {
+		notifyIcebergPaths(paths)
 	}
 }
 
