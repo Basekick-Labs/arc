@@ -74,3 +74,40 @@ func (c combinedOpenCompactions) ExcludedForStrict(ctx context.Context, prefix s
 	}
 	return out, nil
 }
+
+// ReplacementExcluder is a StrictExcluder that can also name, in the same
+// answer, the compaction outputs whose inputs it leaves out
+// (compaction.OpenJobs). The Iceberg export keeps exactly those outputs even
+// while their crash-recovery manifests still list inputs on disk: the inputs
+// are left out, so leaving the outputs out too would drop the job's rows from
+// the table (#1722).
+type ReplacementExcluder interface {
+	ExcludedWithOutputsStrict(ctx context.Context, prefix string) (excluded, outputs []string, err error)
+}
+
+// ExcludedWithOutputsStrict unions the members' answers. A member that cannot
+// name outputs contributes only the files it leaves out, which keeps every
+// output of a job it knows out of the export, as before.
+func (c combinedOpenCompactions) ExcludedWithOutputsStrict(ctx context.Context, prefix string) (excluded, outputs []string, err error) {
+	for _, s := range c {
+		if rs, ok := s.(ReplacementExcluder); ok {
+			keys, outs, err := rs.ExcludedWithOutputsStrict(ctx, prefix)
+			if err != nil {
+				return nil, nil, err
+			}
+			excluded = append(excluded, keys...)
+			outputs = append(outputs, outs...)
+			continue
+		}
+		ss, ok := s.(StrictExcluder)
+		if !ok {
+			return nil, nil, fmt.Errorf("%T cannot name the files to leave out strictly", s)
+		}
+		keys, err := ss.ExcludedForStrict(ctx, prefix)
+		if err != nil {
+			return nil, nil, err
+		}
+		excluded = append(excluded, keys...)
+	}
+	return excluded, outputs, nil
+}

@@ -317,6 +317,12 @@ type Manager struct {
 	// Used to invalidate DuckDB and query caches after files are deleted.
 	onCompactionComplete func()
 
+	// onMeasurementCompacted, when set, is told a measurement whose files a
+	// compaction just replaced: the inputs are deleted and the output is in
+	// place (main.go: the Iceberg scheduler's RequestReconcile, #1722).
+	// Guarded by mu, like onCompactionComplete.
+	onMeasurementCompacted func(database, measurement string)
+
 	// syncEligibility, when set, restricts compaction inputs to files the
 	// edge sync ledger reports delivered (issue #610): compacting an
 	// undelivered raw would destroy the only copy of rows the hub never
@@ -663,6 +669,32 @@ func (m *Manager) SetOnCompactionComplete(fn func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onCompactionComplete = fn
+}
+
+// SetOnMeasurementCompacted sets what is told, with the measurement, once a
+// compaction's inputs are deleted and its output is in place: a legacy job
+// whose subprocess reported its sources deleted, or a staged job the cluster
+// finished (MeasurementCompacted, from the completion watcher). Safe to call
+// while jobs run, like SetOnCompactionComplete.
+func (m *Manager) SetOnMeasurementCompacted(fn func(database, measurement string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onMeasurementCompacted = fn
+}
+
+// MeasurementCompacted tells the SetOnMeasurementCompacted observer that a
+// compaction replaced files in database/measurement. The completion watcher
+// calls it for staged jobs.
+func (m *Manager) MeasurementCompacted(database, measurement string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	fn := m.onMeasurementCompacted
+	m.mu.Unlock()
+	if fn != nil {
+		fn(database, measurement)
+	}
 }
 
 // SetSyncEligibility installs the edge sync delivery gate (issue #610).
@@ -1434,6 +1466,13 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// partition as it now is.
 	if activeOutput != "" {
 		m.OpenJobs.finish(activeOutput, jobOver(result))
+	}
+	// The inputs are gone and the output is in place: an export that still
+	// names the inputs should catch up now, not at its next timed pass. A
+	// job whose delete failed leaves this to its recovery; meanwhile the
+	// export already publishes its output in place of its inputs (#1722).
+	if result != nil && result.SourcesDeleted {
+		m.MeasurementCompacted(candidate.Database, candidate.Measurement)
 	}
 
 	// Return error if subprocess failed

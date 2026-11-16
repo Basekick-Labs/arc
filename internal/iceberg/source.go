@@ -113,6 +113,19 @@ type Exclusions interface {
 	ExcludedForStrict(ctx context.Context, prefix string) ([]string, error)
 }
 
+// replacementExclusions is an Exclusions that names, in the same answer, the
+// compaction outputs whose inputs it leaves out (api.ReplacementExcluder over
+// compaction.OpenJobs). Such an output holds every row of the inputs left
+// out, so the export keeps it even while its crash-recovery manifest still
+// lists inputs on disk (#1722). Without it, a pass between a compaction's
+// upload and its deletes left out the output (pendingOutputs, #638) and the
+// inputs (exclusions, #939 A0) alike, and committed the table without the
+// job's rows; with a failed delete or a crash, every pass did until
+// compaction's recovery ran.
+type replacementExclusions interface {
+	ExcludedWithOutputsStrict(ctx context.Context, prefix string) (excluded, outputs []string, err error)
+}
+
 // SetExclusions installs the files Arc's reads leave out (#939 A0). Without
 // it the exporter publishes, during a DELETE rewrite or a compaction, a file
 // next to the one that replaced it, and external readers count its rows twice
@@ -493,11 +506,27 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	// replacement of a key read here is in the listing below. Read after it,
 	// a key whose replacement landed in between would drop that key's rows
 	// from this pass.
-	var leaveOut map[string]struct{}
+	//
+	// replacing is the outputs of the compactions whose inputs are among
+	// them, from the same answer: a pending output in it is kept, because its
+	// inputs are left out. Only the job that leaves the inputs out can say
+	// so; an input left out for another reason (a DELETE rewrote it) does not
+	// make an output a replacement.
+	var leaveOut, replacing map[string]struct{}
 	if s.exclusions != nil {
-		keys, err := s.exclusions.ExcludedForStrict(ctx, prefix)
+		var keys, outputs []string
+		var err error
+		if re, ok := s.exclusions.(replacementExclusions); ok {
+			keys, outputs, err = re.ExcludedWithOutputsStrict(ctx, prefix)
+		} else {
+			keys, err = s.exclusions.ExcludedForStrict(ctx, prefix)
+		}
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("files Arc's reads leave out under %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		replacing = make(map[string]struct{}, len(outputs))
+		for _, o := range outputs {
+			replacing[filepath.ToSlash(o)] = struct{}{}
 		}
 		leaveOut = make(map[string]struct{}, len(keys))
 		for _, k := range keys {
@@ -590,7 +619,7 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 		if !isDataFile(p) {
 			continue
 		}
-		if _, skip := pending[filepath.ToSlash(p)]; skip {
+		if s.pendingSkips(pending, replacing, p) {
 			excluded++
 			continue
 		}
@@ -645,7 +674,7 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	sort.Strings(vanished)
 	if s.cold != nil {
 		skip := func(key string) bool {
-			if _, ok := pending[key]; ok {
+			if s.pendingSkips(pending, replacing, key) {
 				return true
 			}
 			if _, ok := leaveOut[key]; ok {
@@ -658,6 +687,19 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 		}
 	}
 	return files, local, vanished, nil
+}
+
+// pendingSkips reports whether a listed key is a compaction output to leave
+// out of this pass: one whose crash-recovery manifest still lists an input on
+// disk (#638), unless the exclusions read before the listing leave that job's
+// inputs out (replacing), in which case the output is what holds their rows.
+func (s *StorageWalkSource) pendingSkips(pending, replacing map[string]struct{}, key string) bool {
+	key = filepath.ToSlash(key)
+	if _, ok := pending[key]; !ok {
+		return false
+	}
+	_, replaces := replacing[key]
+	return !replaces
 }
 
 // FileExists reports whether a listed file is still in storage, asked through the backend that

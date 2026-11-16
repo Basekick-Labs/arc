@@ -369,6 +369,7 @@ func (w *CompletionWatcher) dropStagedObjectManifest(path string, job StagedJob,
 	if w.cfg.OnFinished != nil {
 		w.cfg.OnFinished()
 	}
+	w.settled(job)
 	w.logger.Info().Str("job_id", job.JobID).Str("output", job.Output.Path).Str("end", why).
 		Msg("Compaction committed")
 }
@@ -487,6 +488,7 @@ func (w *CompletionWatcher) commitStaged(ctx context.Context, path string, job S
 	delete(w.stagedJobs, job.JobID)
 	w.setCommitting(job.JobID, false)
 	w.manifestsApplied.Add(1)
+	w.settled(job)
 	w.logger.Info().Str("job_id", job.JobID).Str("output", job.Output.Path).Int("inputs", len(job.Inputs)).
 		Msg("Compaction committed")
 }
@@ -569,4 +571,16 @@ func (w *CompletionWatcher) SetStagedObservers(before func(output string), commi
 // SetStagedFinished sets OnFinished. Call before Start.
 func (w *CompletionWatcher) SetStagedFinished(finished func()) {
 	w.cfg.OnFinished = finished
+}
+
+// SetStagedSettled sets OnSettled (the manager's MeasurementCompacted).
+func (w *CompletionWatcher) SetStagedSettled(settled func(database, measurement string)) {
+	w.cfg.OnSettled = settled
+}
+
+// settled reports a staged job whose inputs are gone and output in place.
+func (w *CompletionWatcher) settled(job StagedJob) {
+	if w.cfg.OnSettled != nil {
+		w.cfg.OnSettled(job.Output.Database, job.Output.Measurement)
+	}
 }

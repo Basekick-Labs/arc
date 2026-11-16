@@ -1194,8 +1194,9 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	// expiring snapshots' manifest lists, manifests AND the data files they reference,
 	// joining every failure into the error Commit returns.
 	//
-	// That is wrong for Arc twice over. First, files leave an Arc table precisely
-	// BECAUSE Arc already deleted them (compaction, retention, the delete API), so the
+	// That is wrong for Arc twice over. First, files leave an Arc table because Arc
+	// deleted them (compaction, retention, the delete API) or is about to (a
+	// compaction's inputs, left out once its output is in place, #1722), so the
 	// hook reports ENOENT for a commit that actually succeeded — and the list grows
 	// every pass, because each expiring manifest carries entries for every file ever
 	// removed. Second, and worse, postCommit=true hands iceberg-go physical delete
@@ -1241,7 +1242,7 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 			Str("database", database).Str("measurement", measurement).
 			Int("snapshots_before", before).Int("snapshots_after", after).
 			Int("retain_snapshots", e.retain).
-			Msg("Iceberg snapshot history floored to the current snapshot: this pass removed data files from the table, and Arc had already deleted them from storage, so every older snapshot referenced files that are gone. Time travel to them would have failed on the read. Arc does not support Iceberg time travel across compaction, retention or a partial DELETE")
+			Msg("Iceberg snapshot history floored to the current snapshot: this pass removed data files from the table that Arc deleted from storage or is about to (a compaction's inputs), so every older snapshot references files that are gone or going. Time travel to them would have failed on the read. Arc does not support Iceberg time travel across compaction, retention or a partial DELETE")
 	}
 	return expired, true
 }

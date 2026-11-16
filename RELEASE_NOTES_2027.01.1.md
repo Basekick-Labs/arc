@@ -2,6 +2,18 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Iceberg tables stop naming a compaction's deleted files within seconds, not at the next reconcile pass ([#1722](https://github.com/Basekick-Labs/arc/issues/1722))
+
+With Iceberg export on, compaction deletes its source files as soon as its output is written, but the Iceberg table only dropped them at its next reconcile pass. For up to `iceberg.reconcile_interval` (300 s by default) after every compaction, an external engine reading the affected hour or day (Spark, Trino, DuckDB `iceberg_scan`, PyIceberg, OneLake) failed with a missing file. In a local test at the default interval, every read for the 30 seconds watched failed.
+
+- **A finished compaction now asks the Iceberg export to reconcile that measurement right away.** The request is handled by the reconcile loop between measurements of a running pass, or at once when the loop is idle, so it never runs alongside another reconcile of the same table. In the same test, the table switched to the compacted file about 3 seconds after the compaction started, with no failed read.
+- **When it fires:** on a standalone node and for an ordinary compaction, when the compaction's source files are deleted. In a cluster, for a staged compaction on local storage when the cluster commits it, and on an object store when the cluster ends the job. A node that does not run the Iceberg export ignores the request; its exporter's own passes converge as before.
+- **A reconcile pass that runs between a compaction's upload and its deletes no longer drops that job's rows from the table.** Until now such a pass left out both the compacted file (still being committed) and its sources (already replaced), and committed the table without either. After a failed delete or a crash, that lasted until compaction's next recovery. Now the table holds the compacted file in place of the sources.
+
+**Still possible:** a query that an external engine planned from the previous snapshot just before the switch, and that opens a source file after it is deleted, can still fail; retry it. Closing that window needs the sources kept until the table no longer names them, which is a larger change, tracked in [#1725](https://github.com/Basekick-Labs/arc/issues/1725).
+
+No new configuration keys.
+
 ## New: Flight SQL clients can choose a database with the `x-arc-database` header ([#1720](https://github.com/Basekick-Labs/arc/issues/1720))
 
 A Flight SQL statement can now carry the same `x-arc-database` header as the HTTP query API. Unqualified table names then resolve in that database, so `SELECT * FROM cpu` works without writing `"mydb"."cpu"`. Before, the Flight SQL listener ignored the header: an unqualified name resolved in the `default` database, and a query against a measurement that only existed elsewhere quietly returned no rows.

@@ -621,9 +621,12 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 //
 // Expire old snapshots so snapshot history and metadata don't grow unbounded, and floor
 // history to the current snapshot when this pass removed any path. A removed path is one
-// Arc already deleted from the primary backend, so every older snapshot names a file that
-// is gone and time travel to it fails on the read (#1092). Flooring does not lose
-// readable history: it drops snapshots that were already unreadable. A rewritten path is in
+// Arc already deleted from the primary backend, or a compaction's input that is about to be:
+// once the output holding its rows is in place, the input is left out of the table (#1722)
+// and deleted moments later. Either way every older snapshot names a file that is gone or
+// going, and time travel to it fails on the read (#1092). Flooring does not lose lasting
+// history: it drops snapshots that are unreadable now or will be within the compaction. A
+// rewritten path is in
 // the removal list too: it is still present in storage, but with different bytes, so the
 // older snapshots' record_count and bounds describe content that no longer exists there — the
 // original #1092 symptom.
