@@ -68,6 +68,11 @@ type Manager struct {
 	// RequestReconcilePaths, #1727). Guarded by callbackMu.
 	onPathsChanged func(keys []string)
 
+	// onColdRemoved, when set, is told the cold-tier keys this node removed
+	// or found gone (main.go, in a cluster: a Raft notice for the Iceberg
+	// exporter, #1728). Guarded by callbackMu.
+	onColdRemoved func(keys []string)
+
 	// scanRunning serializes ScanTiers across its exported callers: the
 	// startup scan and POST /api/v1/tiering/scan. The endpoint has no
 	// handler deadline and fasthttp does not cancel a request when the
@@ -640,6 +645,27 @@ func (m *Manager) SetOnPathsChanged(fn func(keys []string)) {
 	m.onPathsChanged = fn
 }
 
+// SetOnColdRemoved sets onColdRemoved.
+func (m *Manager) SetOnColdRemoved(fn func(keys []string)) {
+	m.callbackMu.Lock()
+	defer m.callbackMu.Unlock()
+	m.onColdRemoved = fn
+}
+
+// reportColdRemoved tells onColdRemoved which cold objects are gone. Called
+// after the deletes.
+func (m *Manager) reportColdRemoved(paths []string) {
+	if m == nil || len(paths) == 0 {
+		return
+	}
+	m.callbackMu.Lock()
+	fn := m.onColdRemoved
+	m.callbackMu.Unlock()
+	if fn != nil {
+		fn(paths)
+	}
+}
+
 // notifyPathsChanged tells onPathsChanged which hot paths moved.
 func (m *Manager) notifyPathsChanged(paths []string) {
 	if len(paths) == 0 {
@@ -994,14 +1020,17 @@ func (m *Manager) RevertColdRowToHot(ctx context.Context, path string) error {
 	return m.metadata.UpdateTier(ctx, path, TierHot)
 }
 
-// NotifyColdFilesRemoved drops the query caches after retention removed cold
-// objects. A cached read can still name the cold tier's glob, and a glob that
-// now matches nothing turns the whole read into "no files".
-func (m *Manager) NotifyColdFilesRemoved(n int) {
-	if m == nil {
+// NotifyColdFilesRemoved drops the query caches after retention or a DELETE
+// removed cold objects (or retired rows whose object was already gone). A
+// cached read can still name the cold tier's glob, and a glob that now matches
+// nothing turns the whole read into "no files". The keys also go to
+// onColdRemoved (#1728).
+func (m *Manager) NotifyColdFilesRemoved(paths []string) {
+	if m == nil || len(paths) == 0 {
 		return
 	}
-	m.notifyMigrationComplete(n, 0)
+	m.notifyMigrationComplete(len(paths), 0)
+	m.reportColdRemoved(paths)
 }
 
 // GetStatus returns the current tiering status

@@ -79,6 +79,11 @@ type Scheduler struct {
 	// Only the loop() goroutine touches it. A node demoted after having run
 	// does not re-warn; the startup case is the observability gap.
 	gatedWarnOnce bool
+	// wasGated: the gate was closed at the last check (loop goroutine). While
+	// another node exports, this node's cached cold listings miss every
+	// cold-removal notice (the requests are dropped at the gate), so they are
+	// dropped when the gate opens again (#1728).
+	wasGated bool
 
 	// busySince is when each measurement last stopped making progress while busy: the first busy
 	// pass after one that committed or settled. Loop goroutine only, like state.
@@ -99,6 +104,13 @@ type Scheduler struct {
 	// way storage lays it out, which is not always how the export names
 	// measurements (an edge-sync spoke's "{spoke}/{db}" database, #634).
 	requestedPaths map[string]struct{}
+	// requestedHot holds path requests that need no cold re-list (a hot-only
+	// removal on a shared bucket, RequestReconcilePathsLater); merged into a
+	// pass's requests without dropping the cold listing.
+	requestedHot map[string]struct{}
+	// later is the delayed path requests, by delay bucket: one timer per
+	// bucket however many keys arrive (RequestReconcilePathsLater).
+	later [len(laterDelays)]laterBucket
 	// retrying holds the measurements with a later request already
 	// scheduled (requestAfter), so a burst does not start a timer each.
 	retrying map[string]bool
@@ -210,6 +222,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		busySince:      make(map[string]time.Time),
 		requested:      make(map[string]Measurement),
 		requestedPaths: make(map[string]struct{}),
+		requestedHot:   make(map[string]struct{}),
 		retrying:       make(map[string]bool),
 		wake:           make(chan struct{}, 1),
 		lastReconciled: make(map[string]time.Time),
@@ -291,24 +304,149 @@ func (s *Scheduler) RequestReconcilePaths(keys []string) {
 	if s == nil || len(keys) == 0 {
 		return
 	}
-	s.reqMu.Lock()
-	added := false
-	for _, k := range keys {
-		k = strings.TrimLeft(filepath.ToSlash(k), "/")
-		if k == "" {
-			continue
-		}
-		s.requestedPaths[k] = struct{}{}
-		added = true
-	}
-	s.reqMu.Unlock()
-	if !added {
+	norm := normalizeKeys(keys)
+	if len(norm) == 0 {
 		return
 	}
+	s.reqMu.Lock()
+	for _, k := range norm {
+		s.requestedPaths[k] = struct{}{}
+	}
+	s.reqMu.Unlock()
 	select {
 	case s.wake <- struct{}{}:
 	default:
 	}
+}
+
+// laterDelays are when RequestReconcilePathsLater asks: a writer deletes a
+// shared bucket's objects after their manifest delete, one at a time, so the
+// first ask can still list some. Each key waits at least each delay. A
+// reconcile that sees files vanish under it is busy and asks again on its
+// own; a deletion slower than the last delay leaves the object in the table
+// until the timed pass. A variable so tests can shorten it.
+var laterDelays = [3]time.Duration{2 * time.Second, 10 * time.Second, 30 * time.Second}
+
+// laterBucket collects keys for one delay. Guarded by reqMu. Keys that
+// arrive while its timer runs wait in next for a timer of their own, so
+// every key waits at least the bucket's delay.
+type laterBucket struct {
+	keys  map[string]struct{}
+	next  map[string]struct{}
+	armed bool
+}
+
+// RequestReconcilePathsLater asks, like RequestReconcilePaths, for the
+// measurements holding keys, but after each of laterDelays and without
+// dropping the cold listing: for a change this node learns of before it
+// happens in storage (a shared bucket's manifest delete, #1728). Never
+// blocks; keys coalesce per bucket.
+func (s *Scheduler) RequestReconcilePathsLater(keys []string) {
+	if s == nil || len(keys) == 0 {
+		return
+	}
+	norm := normalizeKeys(keys)
+	if len(norm) == 0 {
+		return
+	}
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	for i := range s.later {
+		b := &s.later[i]
+		if b.armed {
+			if b.next == nil {
+				b.next = make(map[string]struct{})
+			}
+			for _, k := range norm {
+				b.next[k] = struct{}{}
+			}
+			continue
+		}
+		if b.keys == nil {
+			b.keys = make(map[string]struct{})
+		}
+		for _, k := range norm {
+			b.keys[k] = struct{}{}
+		}
+		b.armed = true
+		time.AfterFunc(laterDelays[i], func() { s.fireLater(i) })
+	}
+}
+
+// RequestReconcilePathsHot is RequestReconcilePaths for a change that left
+// the hot tier only (a local unlink, a rewrite's original): served at once,
+// without dropping the cold listing, which a hot removal does not change and
+// whose re-list would cost every cold object of the database (#1728).
+func (s *Scheduler) RequestReconcilePathsHot(keys []string) {
+	norm := normalizeKeys(keys)
+	if s == nil || len(norm) == 0 {
+		return
+	}
+	s.reqMu.Lock()
+	for _, k := range norm {
+		s.requestedHot[k] = struct{}{}
+	}
+	s.reqMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// normalizeKeys turns storage keys into the form measurementsFor matches at
+// least cost: slash-separated, no leading "/", a file collapsed to its
+// directory (a batch of files in one hour is one key), deduplicated.
+func normalizeKeys(keys []string) []string {
+	seen := make(map[string]bool, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		k = strings.TrimLeft(filepath.ToSlash(k), "/")
+		if strings.HasSuffix(k, ".parquet") {
+			if i := strings.LastIndexByte(k, '/'); i >= 0 {
+				k = k[:i+1]
+			}
+		}
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return out
+}
+
+// fireLater moves a delay bucket's keys into the hot-only requests.
+func (s *Scheduler) fireLater(i int) {
+	s.reqMu.Lock()
+	b := &s.later[i]
+	for k := range b.keys {
+		s.requestedHot[k] = struct{}{}
+	}
+	clear(b.keys)
+	b.armed = false
+	if len(b.next) > 0 {
+		// Keys that came in while this timer ran get their full delay.
+		b.keys, b.next = b.next, nil
+		b.armed = true
+		time.AfterFunc(laterDelays[i], func() { s.fireLater(i) })
+	}
+	s.reqMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// takeHotPathRequests empties the hot-only path requests.
+func (s *Scheduler) takeHotPathRequests() []string {
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	out := make([]string, 0, len(s.requestedHot))
+	for k := range s.requestedHot {
+		out = append(out, k)
+	}
+	clear(s.requestedHot)
+	return out
 }
 
 // takePathRequests empties the requested paths.
@@ -424,10 +562,11 @@ func (s *Scheduler) takeRequests() []Measurement {
 func (s *Scheduler) serviceRequests(ctx context.Context) {
 	reqs := s.takeRequests()
 	byPath := s.measurementsFor(s.takePathRequests())
-	if len(reqs) == 0 && len(byPath) == 0 {
+	hotOnly := s.measurementsFor(s.takeHotPathRequests())
+	if len(reqs) == 0 && len(byPath) == 0 && len(hotOnly) == 0 {
 		return
 	}
-	if s.gate != nil && !s.gate.CanRun() {
+	if !s.gateOpen() {
 		return // another node exports; its own passes converge
 	}
 	// A path request follows a change Arc made to the files, the cold tier's
@@ -446,8 +585,9 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 	for _, m := range reqs {
 		queued[m.Database+"\x00"+m.Measurement] = true
 	}
-	for _, m := range byPath {
-		if !queued[m.Database+"\x00"+m.Measurement] {
+	for _, m := range append(byPath, hotOnly...) {
+		if k := m.Database + "\x00" + m.Measurement; !queued[k] {
+			queued[k] = true
 			reqs = append(reqs, m)
 		}
 	}
@@ -496,6 +636,23 @@ func (s *Scheduler) noteOutcome(key string, outcome reconcileOutcome) {
 	if outcome != outcomeBusy {
 		delete(s.busySince, key)
 	}
+}
+
+// gateOpen reports whether this node may export now. On the first open check
+// after a closed one it drops every cached cold listing: one kept from an
+// earlier turn as exporter has missed the cold removals since.
+func (s *Scheduler) gateOpen() bool {
+	if s.gate != nil && !s.gate.CanRun() {
+		s.wasGated = true
+		return false
+	}
+	if s.wasGated {
+		s.wasGated = false
+		if ci, ok := s.source.(coldInvalidator); ok {
+			ci.InvalidateCold("")
+		}
+	}
+	return true
 }
 
 // Start launches the reconcile loop in the background. Stop cancels it.
@@ -555,7 +712,7 @@ func (s *Scheduler) loop(ctx context.Context) {
 // takes effect without a restart (nil gate = always run). It reports whether any measurement
 // was left partly registered, so the loop can come back sooner.
 func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
-	if s.gate != nil && !s.gate.CanRun() {
+	if !s.gateOpen() {
 		if !s.gatedWarnOnce {
 			s.gatedWarnOnce = true
 			s.logger.Warn().Msg("Iceberg reconcile is gated off on this node (not the active compactor). If no node in the cluster holds a compactor role, Iceberg export never runs; assign one to enable it")

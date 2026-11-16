@@ -4763,6 +4763,13 @@ func main() {
 		icebergStart = func() {
 			startScheduler()
 			icebergPathsChanged.Store(&requestPaths)
+			// In a cluster the writer's own requests are dropped here at the
+			// gate: the exporter node's coordinator tells it what its listing
+			// lost (local unlinks, shared-bucket manifest deletes by reason,
+			// rewrites landing), #1728.
+			if clusterCoordinator != nil {
+				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater, icebergScheduler.RequestReconcilePaths)
+			}
 		}
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
 			icebergScheduler.Stop()
@@ -4957,6 +4964,10 @@ func main() {
 		if err == nil && registrationOutbox != nil {
 			// A file pending registration is unregistered, not an orphan (#1212).
 			reconciler.SetPendingFilter(registrationOutbox.HoldsRegistration)
+		}
+		if err == nil {
+			// The export may have published an orphan the sweep deletes (#1728).
+			reconciler.SetOnPathsDeleted(notifyIcebergPaths)
 		}
 		if err == nil {
 			// A committed compaction output moving into place here is not an
@@ -5465,6 +5476,13 @@ func main() {
 		// be dropped — same reason compaction invalidates them (#662).
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
 		tieringManager.SetOnPathsChanged(notifyIcebergPaths)
+		// In a cluster, cold removals on this node reach the Iceberg exporter
+		// (another node) as a Raft notice (#1728), gathered into one per
+		// burst and proposed off the caller's path. A failed notice costs
+		// the export iceberg.cold_rescan_interval, as before.
+		if clusterCoordinator != nil {
+			tieringManager.SetOnColdRemoved(clusterCoordinator.NoteIcebergColdRemoved)
+		}
 		// Around every chunk of hot copies a migration releases, and when a
 		// replica records a pulled file's move to cold: a cold listing cached
 		// before the copy, or a hot glob cached before the release, would

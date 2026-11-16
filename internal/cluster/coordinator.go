@@ -243,7 +243,10 @@ type Coordinator struct {
 	// on disk, not just what is still untaken.
 	deletePending   []deleteRequest
 	deletePendingMu sync.Mutex
-	deleteInFlight  atomic.Int64
+	// iceberg holds the Iceberg export's path callbacks (#1728,
+	// iceberg_paths.go).
+	iceberg        icebergNotifier
+	deleteInFlight atomic.Int64
 	// deferred: unlinks of a DELETE rewrite's old file waiting for the
 	// rewrite to arrive (rewrite_unlink.go), under deletePendingMu.
 	deferred deferredUnlinks
@@ -537,6 +540,9 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		c.raftFSM.SetCompactionPauseCallback(func(paused bool, generation uint64) {
 			c.onCompactionPauseChanged(paused, generation)
 		})
+		// Cold-removal notices for the Iceberg export (#1728), on every
+		// topology. Same lock rule: an atomic load and a non-blocking request.
+		c.raftFSM.SetIcebergPathsCallback(c.onIcebergNotice)
 
 		raftCfg := &raft.NodeConfig{
 			NodeID:            nodeID,
@@ -1068,6 +1074,7 @@ func (c *Coordinator) Stop() error {
 		if fsm := raftNode.FSM(); fsm != nil {
 			fsm.SetFileCallbacks(nil, nil)
 			fsm.SetFileContentChangedCallback(nil)
+			fsm.SetIcebergPathsCallback(nil)
 		}
 	}
 
@@ -1260,6 +1267,7 @@ func (c *Coordinator) unlinkBatch(batch []deleteRequest, relisted func(string) (
 		c.unlinkOne(item, relisted)
 		c.deleteDone()
 	}
+	c.flushUnlinked()
 }
 
 // SetTierRecorder wires this node's tier metadata. Safe to call on a running
@@ -1291,6 +1299,15 @@ func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bo
 	c.noteLocalRegistered(path)
 	// A DELETE rewrite landing lets its old file's unlink go ahead.
 	c.wakeDeferredFamily(path)
+	// And lets the export drop the original in favour of it (#1728). Asked
+	// after a short delay, not now: the pulls of one DELETE's rewrites arrive
+	// one by one and would each commit a snapshot, and without local-copy
+	// tracking an original not yet unlinked (its deleteGrace) would still be
+	// listed next to its rewrite. By the delay the original is unlinked or
+	// excluded.
+	if rewriteStamp(path) > 0 {
+		c.icebergLater([]string{path})
+	}
 	r := c.tierRecorderSnapshot()
 	if r == nil {
 		return false
@@ -1391,6 +1408,7 @@ func (c *Coordinator) observeSharedManifestDelete(path, reason string) {
 	if reason == deleteRewriteReason {
 		c.noteLocalDeleted(path, reason)
 	}
+	c.icebergSharedDelete(path, reason)
 	c.logger.Debug().
 		Str("path", path).
 		Str("reason", reason).
@@ -1565,6 +1583,17 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			Str("reason", item.reason).
 			Msg("Phase 4 local delete worker: removed local copy")
 		c.forgetLocal(item.path)
+		// The export can drop it now (#1728). Not for a database delete:
+		// that drop removes the database's tables itself, and a reconcile
+		// racing it could recreate one. A DELETE rewrite's original only
+		// once its rewrite is here: unlinked before (the unlink is not
+		// deferred without compaction commit and the journal), a reconcile
+		// would publish neither file; recordPulledFileInTiering asks when
+		// the rewrite lands.
+		if c.iceberg.now.Load() != nil && item.reason != databaseDeleteReason &&
+			(item.reason != deleteRewriteReason || c.rewriteArrived(c.ctxOrBackground(), item.path)) {
+			c.noteUnlinked(item.path)
+		}
 		switch {
 		case wasLocal && recorder != nil:
 			// Only for a file this node actually held: the tier row for a

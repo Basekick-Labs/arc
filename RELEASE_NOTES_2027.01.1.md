@@ -2,6 +2,35 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: in a cluster, Iceberg tables catch up after a DELETE, retention, tiering or a reconciliation sweep ([#1728](https://github.com/Basekick-Labs/arc/issues/1728))
+
+#1727 made these paths ask the Iceberg export to reconcile, on a single node. In a cluster they run on the primary writer, while the export runs on the node holding the compaction lease, so the writer's requests were dropped. The table named the removed files until the exporter's next timed pass, up to `iceberg.reconcile_interval` (300 s by default). Now the exporter node acts on what it sees itself.
+
+- **Local-storage cluster:** each node keeps its own copies. When the exporter removes its copy of a file the cluster deleted, the export reconciles that measurement right away. Tested on two-node clusters (writer plus compactor/exporter, 300 s interval), reading the exporter's table every ~0.1 s:
+
+| Topology | Change on the writer | Before | After |
+|---|---|---|---|
+| Local storage | Row DELETE | 152 of 169 reads failed | 1 of 172 |
+| Local storage | Retention | 155 of 173 | 0 of 173 |
+| Shared S3 bucket | Retention | 52 of 59 | 3 of 159 |
+| Shared S3 bucket | Row DELETE | 53 of 60 | 1 of 157 |
+| Shared S3 bucket | Whole-file DELETE | 53 of 60 | 3 of 159 |
+| Local hot, S3 cold tier | Cold retention | 56 of 65 | 2 of 202 |
+  - **DELETE rewrites:** the original is reported only once the rewrite that replaces it is on the exporter node. Reporting it earlier could publish a table that briefly lacks the rows the DELETE kept.
+  - **Rewrite arriving:** when that rewrite lands, the export is asked two seconds later. Several rewrites then land in one snapshot rather than one each.
+- **Shared bucket:** the exporter learns of each delete from the cluster manifest, which the writer updates before it removes the object.
+  - **DELETE rewrites:** a rewrite's original is left out of reads from that moment, so the export is asked right away.
+  - **Retention and whole-file DELETE:** each removed file is asked about at least 2, 10 and 30 seconds after its manifest delete. A file the writer takes longer to remove waits for the timed pass.
+  - **Compactions:** these already ask on their own (#1722).
+- **Database deletes never ask, on any topology:** a database delete drops its own tables, and a reconcile racing that drop could recreate one.
+- **Tiering, any cluster:** when the exporter's tier record moves a file out of its hot tier, the export is asked and then reads the cold copy. Files replicated in from other nodes (every ingest batch) do not ask.
+- **Reconciliation sweep:** when the sweep deletes orphan objects the export may have published, it asks the export to reconcile.
+- **Cold tier, any cluster:** when a writer removes cold-tier objects, it tells every node through a small Raft notice naming the measurements. This covers retention, a cold DELETE, and the migrator dropping a cold copy. Removals within a second share one notice. The exporter then drops its cached cold listing for those databases and reconciles them. Before this, its table named the removed cold objects for up to `iceberg.cold_rescan_interval` (3600 s by default) plus a timed pass.
+  - **Rolling upgrades:** the notice carries no cluster state. It is only sent once every node runs a build that understands it. Until then the export sees cold removals when its cached cold listing expires, as before.
+  - **Export moving between nodes:** a node that becomes the exporter again first drops the cold listings it cached during its earlier turn.
+
+No new configuration keys.
+
 ## Fix: Iceberg tables catch up right after a row DELETE, retention or tiering on a single node ([#1727](https://github.com/Basekick-Labs/arc/issues/1727))
 
 The previous fix (#1722) made a finished compaction ask the Iceberg export to reconcile at once. Several other paths remove, move or rewrite data files and did not ask:

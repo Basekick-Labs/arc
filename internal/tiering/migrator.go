@@ -239,6 +239,8 @@ func (m *Migrator) FindCandidatesFiltered(ctx context.Context, fromTier, toTier 
 // cold copy goes and the hot copy is the finisher's to delete.
 func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate) []MigrationCandidate {
 	kept := files[:0:0]
+	var removed []string
+	defer func() { m.manager.reportColdRemoved(removed) }() // once for the chunk
 	for _, c := range files {
 		if !m.manager.heldByCompaction(c.Path) {
 			kept = append(kept, c)
@@ -250,6 +252,8 @@ func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate
 		if dst := m.manager.GetBackendForTier(c.TargetTier); dst != nil {
 			if err := dst.Delete(ctx, c.Path); err != nil && !storage.IsNotFound(err) {
 				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not remove the cold copy of a file a compaction took over")
+			} else {
+				removed = append(removed, c.Path)
 			}
 		}
 		if err := m.manager.metadata.UpdateTier(ctx, c.Path, c.CurrentTier); err != nil {
@@ -273,6 +277,7 @@ func (m *Migrator) dropSupersededCopy(ctx context.Context, cold storage.Backend,
 			Msg("Could not remove the cold copy of a file whose rows a DELETE removed; the next cold sync will record it and those rows will be read again until it is deleted by hand")
 		return
 	}
+	m.manager.reportColdRemoved([]string{path})
 	m.logger.Warn().Str("path", path).Str("why", why).Msg("Removed the cold copy of a file whose rows a DELETE removed")
 }
 
@@ -692,6 +697,8 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		}
 		if err := dstBackend.Delete(ctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
 			m.logger.Warn().Err(err).Str("path", candidate.Path).Msg("Could not remove the cold copy of a file a compaction took over")
+		} else {
+			m.manager.reportColdRemoved([]string{candidate.Path})
 		}
 		return fmt.Errorf("%s: %w", candidate.Path, errHeldByCompaction)
 	}

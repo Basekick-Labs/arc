@@ -425,12 +425,16 @@ type Run struct {
 // Reconciler is the core reconciliation engine. It is independent of the
 // cron scheduler so it can be unit-tested by calling Reconcile directly.
 type Reconciler struct {
-	cfg         Config
-	coord       Coordinator
-	storage     storage.Backend
-	gate        Gate
-	auditLogger *audit.Logger
-	logger      zerolog.Logger
+	// onPathsDeleted, when set, is told the orphan objects a sweep deleted
+	// (main.go: the Iceberg export, which may have published them as
+	// objects the manifest does not know; #1728). Set before Start.
+	onPathsDeleted func(paths []string)
+	cfg            Config
+	coord          Coordinator
+	storage        storage.Backend
+	gate           Gate
+	auditLogger    *audit.Logger
+	logger         zerolog.Logger
 
 	// runState ensures only one Reconcile is in flight at a time. The
 	// scheduler also serializes via its own mutex but Reconcile is
@@ -993,4 +997,14 @@ func (r *Reconciler) emitAudit(eventType string, run *Run, detail map[string]str
 		StatusCode: 200,
 		Detail:     detail,
 	})
+}
+
+// SetOnPathsDeleted sets onPathsDeleted. Call before the scheduler starts.
+func (r *Reconciler) SetOnPathsDeleted(fn func(paths []string)) { r.onPathsDeleted = fn }
+
+// pathsDeleted reports the objects a sweep batch deleted.
+func (r *Reconciler) pathsDeleted(paths []string) {
+	if r.onPathsDeleted != nil && len(paths) > 0 {
+		r.onPathsDeleted(paths)
+	}
 }

@@ -24,12 +24,13 @@ import (
 // fakeDeleteColdTier is tiering as a DELETE of cold files sees it (#1350),
 // over a real local backend standing in for the cold store.
 type fakeDeleteColdTier struct {
-	backend    storage.Backend
-	configured bool
-	rows       []tiering.FileMetadata
-	retired    []string
-	reverted   []string
-	notified   int
+	backend       storage.Backend
+	configured    bool
+	rows          []tiering.FileMetadata
+	retired       []string
+	reverted      []string
+	notified      int
+	notifiedPaths []string
 }
 
 func (f *fakeDeleteColdTier) ColdBackend() storage.Backend { return f.backend }
@@ -47,7 +48,10 @@ func (f *fakeDeleteColdTier) RetireColdRows(_ context.Context, paths []string) (
 	f.retired = append(f.retired, paths...)
 	return len(paths), nil
 }
-func (f *fakeDeleteColdTier) NotifyColdFilesRemoved(n int) { f.notified += n }
+func (f *fakeDeleteColdTier) NotifyColdFilesRemoved(paths []string) {
+	f.notified += len(paths)
+	f.notifiedPaths = append(f.notifiedPaths, paths...)
+}
 func (f *fakeDeleteColdTier) RevertColdRowToHot(_ context.Context, path string) error {
 	f.reverted = append(f.reverted, path)
 	return nil
@@ -162,8 +166,8 @@ func TestDeleteRemovesAColdFileWhoseRowsAllMatch(t *testing.T) {
 	if r.coldExists(coldWhole) {
 		t.Fatal("the cold file whose rows all match is still there")
 	}
-	if r.tier.notified != 1 {
-		t.Fatalf("cold removal notified %d files, want 1 (the Iceberg export and query caches listen, #939)", r.tier.notified)
+	if r.tier.notified != 1 || !slices.Equal(r.tier.notifiedPaths, []string{coldWhole}) {
+		t.Fatalf("cold removal notified %v, want the deleted file (the Iceberg export and query caches listen, #939)", r.tier.notifiedPaths)
 	}
 	if !slices.Equal(r.tier.retired, []string{coldWhole}) {
 		t.Fatalf("retired %v, want its row", r.tier.retired)
@@ -385,6 +389,13 @@ func TestDeleteRetiresColdRowsWhoseObjectIsGone(t *testing.T) {
 	r.delete(`{"database":"db","measurement":"cpu","where":"host = 'h0'","confirm":true}`)
 	if !slices.Equal(r.tier.retired, []string{gone}) || !slices.Equal(r.tier.reverted, []string{back}) {
 		t.Fatalf("retired %v reverted %v, want the gone row retired and the one with a hot copy reverted", r.tier.retired, r.tier.reverted)
+	}
+	// Both objects are gone from cold: both reach a cached cold listing's
+	// owners, a cluster's Iceberg exporter included (#1728).
+	got := slices.Clone(r.tier.notifiedPaths)
+	slices.Sort(got)
+	if want := []string{back, gone}; !slices.Equal(got, want) {
+		t.Fatalf("notified %v, want %v", got, want)
 	}
 }
 
