@@ -110,6 +110,29 @@ reports `supportsOuterJoins()` as `true` but `supportsFullOuterJoins()` as
 A request for IDs Arc has no value for is answered with the ones it has; the
 rest are left out rather than failing the call.
 
+## Choosing a database
+
+As on the HTTP query API, a statement can carry an `x-arc-database` header;
+unqualified table names then resolve in that database. Without it they resolve
+in `default`, so qualify them (`"mydb"."cpu"`). With ADBC, set the header as a
+call header on the connection:
+`adbc.flight.sql.rpc.call_header.x-arc-database` = the database name (see the
+Python example below).
+
+- **Same rules as HTTP:** the name is validated, RBAC checks the resolved
+  table, and while the header is set any database-qualified name is refused,
+  even the header's own database (`"mydb"."cpu"`). Tools that write qualified
+  names, as BI tools do, should leave the header unset.
+- **Which call carries it:** it can be sent on the call that plans the
+  statement (GetFlightInfo), on the call that fetches its result (DoGet), or
+  on both; when both carry it the values must match. Sent twice on one call,
+  or with an invalid name, it is refused with `INVALID_ARGUMENT`.
+- **Calls that ignore it:** catalog, schema, table and SqlInfo calls. Browsing
+  every database works with the header set.
+
+Of the client's other headers, only the `authorization` token and the
+User-Agent reach the query.
+
 ## Logging, audit and shutdown
 
 Flight queries go through the same request logging and, when audit logging is
@@ -142,12 +165,15 @@ from adbc_driver_flightsql import DatabaseOptions, dbapi
 
 connection = dbapi.connect(
     "grpc://localhost:50051",
-    db_kwargs={DatabaseOptions.AUTHORIZATION_HEADER.value:
-               f"Bearer {os.environ['ARC_TOKEN']}"},
+    db_kwargs={
+        DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {os.environ['ARC_TOKEN']}",
+        # Optional: resolve unqualified table names in this database.
+        DatabaseOptions.RPC_CALL_HEADER_PREFIX.value + "x-arc-database": "default",
+    },
 )
 
 with connection.cursor() as cursor:
-    cursor.execute('SELECT * FROM "default"."cpu" LIMIT 10')
+    cursor.execute("SELECT * FROM cpu LIMIT 10")
     print(cursor.fetchall())
 
 connection.close()
