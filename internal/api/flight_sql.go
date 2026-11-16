@@ -68,10 +68,10 @@ const flightSQLInternalKeyHeader = "X-Arc-Flight-Internal-Key"
 // flightSQLDatabaseHeader is the one client call header a statement carries
 // across the bridge: the database unqualified table names resolve in, as the
 // HTTP header of the same name. ADBC sets it with the connection option
-// adbc.flight.sql.rpc.call_header.x-arc-database. Nothing else from the
-// client's metadata is forwarded: the peer header is the bridge's proxy
-// header (the audit log's client address), and other x-arc-* headers change
-// what the Arrow route encodes or whether it forwards.
+// adbc.flight.sql.rpc.call_header.x-arc-database. Of the client's metadata
+// only this, the bearer token and the User-Agent cross; the peer header is
+// the bridge's proxy header (the audit log's client address), and the other
+// x-arc-* headers change what the Arrow route encodes or whether it forwards.
 const flightSQLDatabaseHeader = "x-arc-database"
 
 // Shutdown stages. The shutdown coordinator gives every hook and component

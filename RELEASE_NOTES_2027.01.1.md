@@ -9,9 +9,10 @@ A Flight SQL statement can now carry the same `x-arc-database` header as the HTT
 With the ADBC Flight SQL driver, set the connection option `adbc.flight.sql.rpc.call_header.x-arc-database` to the database name. Any client that can send gRPC call headers can do the same.
 
 - **Same rules as HTTP:** the name is validated, and RBAC applies to the resolved table. A query that names any database (`"mydb"."cpu"` or `other.cpu`) is refused while the header is set, even when it names the header's own database. BI tools that write qualified names should leave the header unset.
-- **Which call carries it:** the header can be sent when the query is planned (GetFlightInfo), when its result is fetched (DoGet), or on both. If both carry it, the two values must match. Sending it more than once on one call, or sending an invalid name, is refused with `INVALID_ARGUMENT`.
-- **Catalog calls ignore it:** listing catalogs, tables and table schemas (GetCatalogs, GetDbSchemas, GetTables) is unaffected, so tools that browse every database keep working with the header set.
-- **Nothing else is forwarded:** no other header the client sends reaches the query.
+- **Which call carries it:** the header can be sent when the query is planned (GetFlightInfo), when its result is fetched (DoGet), or on both. If both carry it, the two values must match. On those calls, sending it more than once or sending an invalid name is refused with `INVALID_ARGUMENT`.
+- **Catalog calls ignore it:** listing catalogs, tables and table schemas (GetCatalogs, GetDbSchemas, GetTables) and SqlInfo are unaffected, so tools that browse every database keep working with the header set.
+- **No other `x-arc-*` header is forwarded:** of the client's headers, only `x-arc-database`, the bearer token and the User-Agent reach the query, as before apart from the new header.
+- **Documentation:** `docs/operations/flight-sql.md` covers the header and shows the ADBC option.
 - **Cut-off results:** a Flight SQL result that Arc cut short now ends with `INTERNAL: Arc query stream was truncated`, instead of a decoding error about the stream's last message.
 
 No new configuration keys.

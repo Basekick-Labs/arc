@@ -34,7 +34,7 @@ import (
 
 // newDatabaseHeaderFlightServer runs the real query handler behind Flight SQL
 // with one measurement, sample.cpu, and returns an authenticated client.
-func newDatabaseHeaderFlightServer(t *testing.T) (*flightsql.Client, context.Context) {
+func newDatabaseHeaderFlightServer(t *testing.T, rbac RBACChecker) (*flightsql.Client, context.Context) {
 	t.Helper()
 	logger := zerolog.Nop()
 	storageRoot := t.TempDir()
@@ -64,7 +64,7 @@ func newDatabaseHeaderFlightServer(t *testing.T) (*flightsql.Client, context.Con
 	require.NoError(t, err)
 
 	queryHandler := NewQueryHandler(duck, backend, logger, 0, 0)
-	queryHandler.SetAuthAndRBAC(authManager, nil)
+	queryHandler.SetAuthAndRBAC(authManager, rbac)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := ln.Addr().(*net.TCPAddr).Port
@@ -115,7 +115,7 @@ func rowsOf(t *testing.T, client *flightsql.Client, executeCtx, doGetCtx context
 }
 
 func TestFlightSQLDatabaseHeader(t *testing.T) {
-	client, ctx := newDatabaseHeaderFlightServer(t)
+	client, ctx := newDatabaseHeaderFlightServer(t, nil)
 
 	t.Run("unqualified table names resolve in the header's database", func(t *testing.T) {
 		rows, err := rowsOf(t, client, withDatabase(ctx, "sample"), withDatabase(ctx, "sample"), "SELECT value FROM cpu")
@@ -181,6 +181,25 @@ func TestFlightSQLDatabaseHeader(t *testing.T) {
 		}
 		require.NoError(t, reader.Err())
 		require.True(t, found, "cpu not listed")
+	})
+}
+
+// RBAC on a Flight statement is checked against the database the header
+// resolves an unqualified name in, as on HTTP: a token without that database
+// is refused even though the SQL names no database.
+func TestFlightSQLDatabaseHeaderIsCheckedByRBAC(t *testing.T) {
+	// The token may read default only: were the header dropped, the bare name
+	// would resolve to default.cpu and pass.
+	t.Run("token without the header's database", func(t *testing.T) {
+		client, ctx := newDatabaseHeaderFlightServer(t, &mockRBACChecker{enabled: true, allowedDBs: map[string]bool{"default": true}, deniedReason: "no read permission"})
+		_, err := rowsOf(t, client, withDatabase(ctx, "sample"), withDatabase(ctx, "sample"), "SELECT value FROM cpu")
+		require.Equal(t, codes.PermissionDenied, status.Code(err), "%v", err)
+	})
+	t.Run("token with the header's database", func(t *testing.T) {
+		client, ctx := newDatabaseHeaderFlightServer(t, &mockRBACChecker{enabled: true, allowedDBs: map[string]bool{"sample": true}, deniedReason: "no read permission"})
+		rows, err := rowsOf(t, client, withDatabase(ctx, "sample"), withDatabase(ctx, "sample"), "SELECT value FROM cpu")
+		require.NoError(t, err)
+		require.EqualValues(t, 1, rows)
 	})
 }
 

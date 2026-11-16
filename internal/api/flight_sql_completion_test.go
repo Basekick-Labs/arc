@@ -3,6 +3,7 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -58,6 +60,7 @@ func TestFlightSQLCompletionSignals(t *testing.T) {
 	for _, tc := range []struct {
 		name, cap, truncated     string
 		extra, broken, readError bool
+		poisoned                 bool
 		want                     codes.Code
 	}{
 		{name: "uncapped", want: codes.OK},
@@ -71,7 +74,7 @@ func TestFlightSQLCompletionSignals(t *testing.T) {
 		// What Arc sends when it cuts a stream short: a marker no decoder
 		// reads, then the truncation trailer. The cut is reported, without its
 		// reason, rather than the decoder's complaint.
-		{name: "cut stream reports truncation", broken: true, truncated: "secret engine path", want: codes.Internal},
+		{name: "cut stream reports truncation", poisoned: true, truncated: "secret engine path", want: codes.Internal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			record := completionTestRecord(t)
@@ -85,7 +88,12 @@ func TestFlightSQLCompletionSignals(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if tc.broken {
+				if tc.poisoned {
+					// The bytes Arc itself writes when it cuts a stream.
+					bw := bufio.NewWriter(&payload)
+					poisonArrowStream(bw, zerolog.Nop())
+					_ = bw.Flush()
+				} else if tc.broken {
 					// Start an IPC continuation message but omit its declared metadata.
 					_, _ = payload.Write([]byte{255, 255, 255, 255, 127, 0, 0, 0})
 				} else if err := writer.Close(); err != nil {
