@@ -769,10 +769,15 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) []tierEvent {
 	// after-read too.
 	mayChange := make(map[tierEventKey]bool, 4)
 	var retries []tierEvent
+	// Paths an unlink or missing event wrote for: files that left this
+	// node's hot tier (a migration, a removal), for the Iceberg export
+	// (#1728). Never a pulled file: in steady state that is every ingest
+	// batch, and the export has nothing to drop for it.
+	var moved []string
 
 	for start := 0; start < len(batch); start += tierEventChunk {
 		end := min(start+tierEventChunk, len(batch))
-		if unapplied := m.applyTierEventChunk(batch[start:end], touched, before, mayChange, &retries); unapplied > 0 {
+		if unapplied := m.applyTierEventChunk(batch[start:end], touched, before, mayChange, &retries, &moved); unapplied > 0 {
 			// The chunk ran out of its deadline: the SQLite handle is stalled,
 			// the cold tier is, or the shutdown drain budget is spent. Each
 			// remaining chunk would burn a full deadline against the same
@@ -803,6 +808,8 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) []tierEvent {
 	for k := range touched {
 		m.metadata.invalidateTierCache(k.database, k.measurement)
 	}
+	// After the tier cache: the export reads which tier a file is on.
+	m.notifyPathsChanged(moved)
 
 	// The query layer's pruned-path and SQL-transform caches hold WHICH tiers
 	// a measurement reads from — the thing a completed migration changes,
@@ -872,7 +879,7 @@ func sameTierSet(a, b map[Tier]bool) bool {
 // and then writes sequentially, so the single SQLite connection never waits on
 // the network. Returns how many of the chunk's events went unapplied because
 // the deadline ran out; zero means the chunk completed.
-func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool, retries *[]tierEvent) int {
+func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool, retries *[]tierEvent, moved *[]string) int {
 	budget := tierEventDrainTimeout
 	if m.draining.Load() {
 		// What is left of the whole drain's budget, not a fresh one per
@@ -950,6 +957,9 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 			// path-derived pair with the row's own.
 			k := tierEventKey{info.Database, info.Measurement}
 			touched[k] = struct{}{}
+			if ev.kind != tierEventPulled {
+				*moved = append(*moved, ev.path)
+			}
 			if prev, ok := before[k]; ev.kind != tierEventPulled || !ok || !prev.ok || !prev.tiers[TierHot] {
 				mayChange[k] = true
 			}

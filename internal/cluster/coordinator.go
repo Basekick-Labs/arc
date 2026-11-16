@@ -243,7 +243,10 @@ type Coordinator struct {
 	// on disk, not just what is still untaken.
 	deletePending   []deleteRequest
 	deletePendingMu sync.Mutex
-	deleteInFlight  atomic.Int64
+	// iceberg holds the Iceberg export's path callbacks (#1728,
+	// iceberg_paths.go).
+	iceberg        icebergNotifier
+	deleteInFlight atomic.Int64
 	// deferred: unlinks of a DELETE rewrite's old file waiting for the
 	// rewrite to arrive (rewrite_unlink.go), under deletePendingMu.
 	deferred deferredUnlinks
@@ -1260,6 +1263,7 @@ func (c *Coordinator) unlinkBatch(batch []deleteRequest, relisted func(string) (
 		c.unlinkOne(item, relisted)
 		c.deleteDone()
 	}
+	c.flushUnlinked()
 }
 
 // SetTierRecorder wires this node's tier metadata. Safe to call on a running
@@ -1291,6 +1295,12 @@ func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bo
 	c.noteLocalRegistered(path)
 	// A DELETE rewrite landing lets its old file's unlink go ahead.
 	c.wakeDeferredFamily(path)
+	// And lets the export drop the original in favour of it (#1728): asked
+	// after the wake, so an original still on disk has left the deferred set
+	// and is excluded from the listing.
+	if rewriteStamp(path) > 0 {
+		c.icebergNow([]string{path})
+	}
 	r := c.tierRecorderSnapshot()
 	if r == nil {
 		return false
@@ -1391,6 +1401,7 @@ func (c *Coordinator) observeSharedManifestDelete(path, reason string) {
 	if reason == deleteRewriteReason {
 		c.noteLocalDeleted(path, reason)
 	}
+	c.icebergSharedDelete(path, reason)
 	c.logger.Debug().
 		Str("path", path).
 		Str("reason", reason).
@@ -1565,6 +1576,14 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			Str("reason", item.reason).
 			Msg("Phase 4 local delete worker: removed local copy")
 		c.forgetLocal(item.path)
+		// The export can drop it now (#1728). A DELETE rewrite's original
+		// only once its rewrite is here: unlinked before (the unlink is not
+		// deferred without compaction commit and the journal), a reconcile
+		// would publish neither file; recordPulledFileInTiering asks when
+		// the rewrite lands.
+		if item.reason != deleteRewriteReason || c.rewriteArrived(c.ctxOrBackground(), item.path) {
+			c.noteUnlinked(item.path)
+		}
 		switch {
 		case wasLocal && recorder != nil:
 			// Only for a file this node actually held: the tier row for a

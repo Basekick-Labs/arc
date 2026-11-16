@@ -4763,6 +4763,13 @@ func main() {
 		icebergStart = func() {
 			startScheduler()
 			icebergPathsChanged.Store(&requestPaths)
+			// In a cluster the writer's own requests are dropped here at the
+			// gate: the exporter node's coordinator tells it what its listing
+			// lost (local unlinks, shared-bucket manifest deletes by reason,
+			// rewrites landing), #1728.
+			if clusterCoordinator != nil {
+				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePaths, icebergScheduler.RequestReconcilePathsLater)
+			}
 		}
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
 			icebergScheduler.Stop()
@@ -4957,6 +4964,10 @@ func main() {
 		if err == nil && registrationOutbox != nil {
 			// A file pending registration is unregistered, not an orphan (#1212).
 			reconciler.SetPendingFilter(registrationOutbox.HoldsRegistration)
+		}
+		if err == nil {
+			// The export may have published an orphan the sweep deletes (#1728).
+			reconciler.SetOnPathsDeleted(notifyIcebergPaths)
 		}
 		if err == nil {
 			// A committed compaction output moving into place here is not an

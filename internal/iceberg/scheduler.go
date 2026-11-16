@@ -99,6 +99,13 @@ type Scheduler struct {
 	// way storage lays it out, which is not always how the export names
 	// measurements (an edge-sync spoke's "{spoke}/{db}" database, #634).
 	requestedPaths map[string]struct{}
+	// requestedHot holds path requests that need no cold re-list (a hot-only
+	// removal on a shared bucket, RequestReconcilePathsLater); merged into a
+	// pass's requests without dropping the cold listing.
+	requestedHot map[string]struct{}
+	// later is the delayed path requests, by delay bucket: one timer per
+	// bucket however many keys arrive (RequestReconcilePathsLater).
+	later [len(laterDelays)]laterBucket
 	// retrying holds the measurements with a later request already
 	// scheduled (requestAfter), so a burst does not start a timer each.
 	retrying map[string]bool
@@ -210,6 +217,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		busySince:      make(map[string]time.Time),
 		requested:      make(map[string]Measurement),
 		requestedPaths: make(map[string]struct{}),
+		requestedHot:   make(map[string]struct{}),
 		retrying:       make(map[string]bool),
 		wake:           make(chan struct{}, 1),
 		lastReconciled: make(map[string]time.Time),
@@ -309,6 +317,76 @@ func (s *Scheduler) RequestReconcilePaths(keys []string) {
 	case s.wake <- struct{}{}:
 	default:
 	}
+}
+
+// laterDelays are when RequestReconcilePathsLater asks: a writer deletes a
+// shared bucket's objects after their manifest delete, one at a time, so the
+// first ask can still list some. A reconcile that sees files vanish under it
+// is busy and asks again on its own; these only make sure one runs after the
+// deletes. A variable so tests can shorten it.
+var laterDelays = [3]time.Duration{2 * time.Second, 10 * time.Second, 30 * time.Second}
+
+// laterBucket collects keys for one delay. Guarded by reqMu.
+type laterBucket struct {
+	keys  map[string]struct{}
+	armed bool
+}
+
+// RequestReconcilePathsLater asks, like RequestReconcilePaths, for the
+// measurements holding keys, but after each of laterDelays and without
+// dropping the cold listing: for a change this node learns of before it
+// happens in storage (a shared bucket's manifest delete, #1728). Never
+// blocks; keys coalesce per bucket.
+func (s *Scheduler) RequestReconcilePathsLater(keys []string) {
+	if s == nil || len(keys) == 0 {
+		return
+	}
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	for i := range s.later {
+		b := &s.later[i]
+		if b.keys == nil {
+			b.keys = make(map[string]struct{})
+		}
+		for _, k := range keys {
+			if k = strings.TrimLeft(filepath.ToSlash(k), "/"); k != "" {
+				b.keys[k] = struct{}{}
+			}
+		}
+		if !b.armed && len(b.keys) > 0 {
+			b.armed = true
+			i := i
+			time.AfterFunc(laterDelays[i], func() { s.fireLater(i) })
+		}
+	}
+}
+
+// fireLater moves a delay bucket's keys into the hot-only requests.
+func (s *Scheduler) fireLater(i int) {
+	s.reqMu.Lock()
+	b := &s.later[i]
+	for k := range b.keys {
+		s.requestedHot[k] = struct{}{}
+	}
+	clear(b.keys)
+	b.armed = false
+	s.reqMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// takeHotPathRequests empties the hot-only path requests.
+func (s *Scheduler) takeHotPathRequests() []string {
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	out := make([]string, 0, len(s.requestedHot))
+	for k := range s.requestedHot {
+		out = append(out, k)
+	}
+	clear(s.requestedHot)
+	return out
 }
 
 // takePathRequests empties the requested paths.
@@ -424,7 +502,8 @@ func (s *Scheduler) takeRequests() []Measurement {
 func (s *Scheduler) serviceRequests(ctx context.Context) {
 	reqs := s.takeRequests()
 	byPath := s.measurementsFor(s.takePathRequests())
-	if len(reqs) == 0 && len(byPath) == 0 {
+	hotOnly := s.measurementsFor(s.takeHotPathRequests())
+	if len(reqs) == 0 && len(byPath) == 0 && len(hotOnly) == 0 {
 		return
 	}
 	if s.gate != nil && !s.gate.CanRun() {
@@ -446,8 +525,9 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 	for _, m := range reqs {
 		queued[m.Database+"\x00"+m.Measurement] = true
 	}
-	for _, m := range byPath {
-		if !queued[m.Database+"\x00"+m.Measurement] {
+	for _, m := range append(byPath, hotOnly...) {
+		if k := m.Database + "\x00" + m.Measurement; !queued[k] {
+			queued[k] = true
 			reqs = append(reqs, m)
 		}
 	}
