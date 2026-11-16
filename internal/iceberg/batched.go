@@ -623,7 +623,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 // history to the current snapshot when this pass removed any path. A removed path is one
 // Arc already deleted from the primary backend, or a compaction's input that is about to be:
 // once the output holding its rows is in place, the input is left out of the table (#1722)
-// and deleted moments later. Either way every older snapshot names a file that is gone or
+// and deleted right after, or by compaction's recovery if that delete failed. Either way every older snapshot names a file that is gone or
 // going, and time travel to it fails on the read (#1092). Flooring does not lose lasting
 // history: it drops snapshots that are unreadable now or will be within the compaction. A
 // rewritten path is in

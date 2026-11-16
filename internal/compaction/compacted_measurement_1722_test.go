@@ -14,16 +14,20 @@ type settledRecorder struct{ got []string }
 
 func (r *settledRecorder) record(db, m string) { r.got = append(r.got, db+"/"+m) }
 
-// A legacy job: reported when the subprocess says its sources are deleted,
-// not when the delete failed (recovery deletes them later).
-func TestLegacyJobReportsItsMeasurementOnceSourcesAreDeleted(t *testing.T) {
+// A legacy job: reported once its output is in place, also when its delete
+// failed part-way (the export then publishes the output in place of every
+// input, the deleted ones included); not when the job failed or wrote
+// nothing.
+func TestLegacyJobReportsItsMeasurementOnceItsOutputIsInPlace(t *testing.T) {
+	const out = "db/cpu/2026/10/13/10/cpu_compacted.parquet"
 	for _, tc := range []struct {
 		name string
 		res  *SubprocessJobResult
 		want int
 	}{
-		{"sources deleted", &SubprocessJobResult{Success: true, FilesCompacted: 2, SourcesDeleted: true}, 1},
-		{"delete failed", &SubprocessJobResult{Success: true, FilesCompacted: 2}, 0},
+		{"sources deleted", &SubprocessJobResult{Success: true, FilesCompacted: 2, OutputFile: out, SourcesDeleted: true}, 1},
+		{"delete failed part-way", &SubprocessJobResult{Success: true, FilesCompacted: 2, OutputFile: out}, 1},
+		{"nothing written", &SubprocessJobResult{Success: true}, 0},
 		{"job failed", &SubprocessJobResult{Success: false, Error: "boom"}, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

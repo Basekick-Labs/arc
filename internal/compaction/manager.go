@@ -1467,11 +1467,12 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	if activeOutput != "" {
 		m.OpenJobs.finish(activeOutput, jobOver(result))
 	}
-	// The inputs are gone and the output is in place: an export that still
-	// names the inputs should catch up now, not at its next timed pass. A
-	// job whose delete failed leaves this to its recovery; meanwhile the
-	// export already publishes its output in place of its inputs (#1722).
-	if result != nil && result.SourcesDeleted {
+	// The output is in place: an export that still names the inputs should
+	// catch up now, not at its next timed pass (#1722). That holds whether
+	// or not every input was deleted. After a delete that failed part-way,
+	// the job stays open (OpenJobs, its manifest) and the export publishes
+	// the output in place of all its inputs, the deleted ones included.
+	if jobSucceeded && result.OutputFile != "" {
 		m.MeasurementCompacted(candidate.Database, candidate.Measurement)
 	}
 

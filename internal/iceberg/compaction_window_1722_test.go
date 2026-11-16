@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,6 +100,7 @@ type exportRig struct {
 
 func newExportRig(t *testing.T, interval time.Duration) *exportRig {
 	t.Helper()
+	withSpacing(t, 0)
 	root := t.TempDir()
 	be, err := storage.NewLocalBackend(root, zerolog.Nop())
 	if err != nil {
@@ -118,11 +120,13 @@ func newExportRig(t *testing.T, interval time.Duration) *exportRig {
 		sched: NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Interval: interval, Logger: zerolog.Nop()})}
 }
 
+// live reads the table's current data files without writing: EnsureTable can
+// commit heals, which would make the test a second writer next to the loop.
 func (r *exportRig) live(t *testing.T) []string {
 	t.Helper()
-	lt, err := r.exp.EnsureTable(context.Background(), "mydb", "cpu", ArcSchema{})
+	lt, err := r.exp.catalog.LoadTable(context.Background(), r.exp.tableIdent("mydb", "cpu"))
 	if err != nil {
-		t.Fatal(err)
+		return nil // not created yet
 	}
 	have, err := r.exp.tableDataFiles(context.Background(), lt)
 	if err != nil {
@@ -280,5 +284,106 @@ func TestScheduler_ServesARequestBetweenMeasurementsOfAPass(t *testing.T) {
 	r.sched.runPass(ctx)
 	if got := strings.Join(src.order, ","); got != "aaa,cpu,aaa,zzz" {
 		t.Fatalf("listing order %s, want aaa,cpu,aaa,zzz (the request served before zzz)", got)
+	}
+}
+
+func withSpacing(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := requestMinSpacing
+	requestMinSpacing = d
+	t.Cleanup(func() { requestMinSpacing = old })
+}
+
+// A request inside requestMinSpacing of the table's last change waits out the
+// rest of it instead of reconciling back to back, then is served.
+func TestScheduler_RequestsAreSpacedPerMeasurement(t *testing.T) {
+	ctx := context.Background()
+	r := newExportRig(t, time.Hour)
+	withSpacing(t, 300*time.Millisecond)
+	r.exp.retain = 1 // spaced only where a quick second reconcile could prune a resolved version
+	r.write(t, winIn1, 20)
+	r.sched.runPass(ctx)
+	r.write(t, winIn2, 30)
+	r.sched.RequestReconcile("mydb", "cpu")
+	r.sched.serviceRequests(ctx)
+	if got := r.live(t); strings.Join(got, ",") != "cpu_in1.parquet" {
+		t.Fatalf("inside the spacing: live = %v, want unchanged", got)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		r.sched.serviceRequests(ctx)
+		if got := r.live(t); strings.Join(got, ",") == "cpu_in1.parquet,cpu_in2.parquet" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("the deferred request was never served: live = %v", r.live(t))
+}
+
+// A served request ends a busy stretch, as a non-busy pass does: a busy clock
+// left running would escalate a measurement that is committing.
+func TestScheduler_RequestEndsABusyStretch(t *testing.T) {
+	ctx := context.Background()
+	r := newExportRig(t, time.Hour)
+	r.write(t, winIn1, 20)
+	r.sched.runPass(ctx)
+	r.write(t, winIn2, 30)
+	r.sched.busySince["mydb\x00cpu"] = time.Now().Add(-29 * time.Minute)
+	r.sched.RequestReconcile("mydb", "cpu")
+	r.sched.serviceRequests(ctx)
+	if _, running := r.sched.busySince["mydb\x00cpu"]; running {
+		t.Fatal("busy clock still running after a request committed")
+	}
+}
+
+// passCountingSource counts timed passes (each starts with Measurements).
+type passCountingSource struct {
+	*StorageWalkSource
+	mu     sync.Mutex
+	passes int
+}
+
+func (c *passCountingSource) Measurements(ctx context.Context) ([]Measurement, error) {
+	c.mu.Lock()
+	c.passes++
+	c.mu.Unlock()
+	return c.StorageWalkSource.Measurements(ctx)
+}
+
+// Requests never push the timed pass back: under a steady stream of them the
+// passes still run on their interval.
+func TestScheduler_RequestsDoNotStarveTheTimedPass(t *testing.T) {
+	r := newExportRig(t, 300*time.Millisecond)
+	r.write(t, winIn1, 20)
+	src := &passCountingSource{StorageWalkSource: r.src}
+	r.sched.source = src
+	r.sched.Start()
+	t.Cleanup(r.sched.Stop)
+	end := time.Now().Add(2 * time.Second)
+	for time.Now().Before(end) {
+		r.sched.RequestReconcile("mydb", "cpu")
+		time.Sleep(20 * time.Millisecond)
+	}
+	src.mu.Lock()
+	defer src.mu.Unlock()
+	if src.passes < 4 {
+		t.Fatalf("%d timed passes in 2 s at a 300 ms interval under a stream of requests, want at least 4", src.passes)
+	}
+}
+
+// At the default retain the spacing does not apply: the kept versions outlast
+// a burst, and a later job's deleted inputs leave the table at once.
+func TestScheduler_RequestsAreNotSpacedAtTheDefaultRetain(t *testing.T) {
+	ctx := context.Background()
+	r := newExportRig(t, time.Hour)
+	withSpacing(t, time.Hour)
+	r.exp.retain = 10
+	r.write(t, winIn1, 20)
+	r.sched.runPass(ctx)
+	r.write(t, winIn2, 30)
+	r.sched.RequestReconcile("mydb", "cpu")
+	r.sched.serviceRequests(ctx)
+	if got := r.live(t); strings.Join(got, ",") != "cpu_in1.parquet,cpu_in2.parquet" {
+		t.Fatalf("retain 10: live = %v, want the request served at once", got)
 	}
 }

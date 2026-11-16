@@ -1309,7 +1309,11 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	// If a commit lands in that window, keeping exactly `retain` can delete the
 	// version the reader just resolved — sharpest at retain=1, where every
 	// commit would invalidate the immediately-preceding version. The extra file
-	// is a few KB and bounds the window to one full reconcile interval.
+	// is a few KB. It holds the window open for as long as one reconcile of
+	// the table to the next: a reconcile interval between timed passes; when
+	// compactions ask for reconciles, at retain 1 or 2 at least
+	// requestMinSpacing, and at larger retain the extra kept versions
+	// (requestSpacing, scheduler.go).
 	keep := e.retain + 1
 	if len(vs) <= keep {
 		return
