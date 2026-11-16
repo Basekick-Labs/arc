@@ -619,6 +619,12 @@ func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query fli
 	}, nil
 }
 
+// flightSQLBenchDirect is set only by flight_sql_bench.go, which builds with
+// the flightbench tag and never into a release: a benchmark arm that serves a
+// statement from DuckDB in-process, without the bridge (scripts/flightbench).
+// It returns handled=false unless the caller asked for it.
+var flightSQLBenchDirect func(ctx context.Context, s *flightSQLService, sql, database string) (schema *arrow.Schema, stream <-chan flight.StreamChunk, handled bool, err error)
+
 func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	var statement flightStatement
 	if err := json.Unmarshal(ticket.GetStatementHandle(), &statement); err != nil {
@@ -641,6 +647,11 @@ func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.
 		database = statement.Database
 	case statement.Database != "" && database != statement.Database:
 		return nil, nil, status.Error(codes.InvalidArgument, "the x-arc-database header differs from the database the statement was prepared in")
+	}
+	if flightSQLBenchDirect != nil {
+		if schema, stream, handled, err := flightSQLBenchDirect(ctx, s, statement.SQL, database); handled {
+			return schema, stream, err
+		}
 	}
 
 	path := "/api/v1/query/arrow"
