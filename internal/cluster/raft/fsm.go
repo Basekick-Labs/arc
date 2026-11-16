@@ -258,6 +258,10 @@ const (
 	CommandEnableGovernancePolicies
 	CommandSetGovernancePolicy
 	CommandDeleteGovernancePolicy
+	// CommandIcebergPathsChanged: the primary writer naming directories whose
+	// cold objects it removed, for the Iceberg export (#1728). No state; see
+	// iceberg_notice.go.
+	CommandIcebergPathsChanged
 )
 
 // Command represents a command to be applied to the FSM.
@@ -919,6 +923,7 @@ type ClusterFSM struct {
 	onFileRegistered     func(*FileEntry)
 	onFileContentChanged func(*FileEntry)
 	onFileDeleted        func(path string, reason string)
+	onIcebergPaths       func(keys []string)
 	// Auth-state callbacks: invoked from every node's apply path so the
 	// node's local AuthManager can materialise the change into its
 	// SQLite cache (and invalidate the in-memory verify-token cache).
@@ -1434,6 +1439,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.policiesChangedIfApplied(f.applySetGovernancePolicy(cmd.Payload))
 	case CommandDeleteGovernancePolicy:
 		return f.policiesChangedIfApplied(f.applyDeleteGovernancePolicy(cmd.Payload))
+	case CommandIcebergPathsChanged:
+		return f.applyIcebergPathsChanged(cmd.Payload)
 	case CommandEnableColdMark:
 		return f.applyEnableColdMark(cmd.Payload)
 	case CommandColdMarkAdd:

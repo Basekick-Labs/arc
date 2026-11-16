@@ -540,6 +540,9 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		c.raftFSM.SetCompactionPauseCallback(func(paused bool, generation uint64) {
 			c.onCompactionPauseChanged(paused, generation)
 		})
+		// Cold-removal notices for the Iceberg export (#1728), on every
+		// topology. Same lock rule: an atomic load and a non-blocking request.
+		c.raftFSM.SetIcebergPathsCallback(c.onIcebergNotice)
 
 		raftCfg := &raft.NodeConfig{
 			NodeID:            nodeID,
@@ -1071,6 +1074,7 @@ func (c *Coordinator) Stop() error {
 		if fsm := raftNode.FSM(); fsm != nil {
 			fsm.SetFileCallbacks(nil, nil)
 			fsm.SetFileContentChangedCallback(nil)
+			fsm.SetIcebergPathsCallback(nil)
 		}
 	}
 

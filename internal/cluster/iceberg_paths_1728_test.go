@@ -9,15 +9,22 @@ import (
 // #1728: what the exporter node's coordinator tells the Iceberg export.
 
 type pathRecorder struct {
-	mu        sync.Mutex
-	now, late []string
+	mu              sync.Mutex
+	now, late, cold []string
 }
 
 func (p *pathRecorder) wire(c *Coordinator) {
 	c.SetIcebergPathCallbacks(
 		func(k []string) { p.mu.Lock(); p.now = append(p.now, k...); p.mu.Unlock() },
 		func(k []string) { p.mu.Lock(); p.late = append(p.late, k...); p.mu.Unlock() },
+		func(k []string) { p.mu.Lock(); p.cold = append(p.cold, k...); p.mu.Unlock() },
 	)
+}
+
+func (p *pathRecorder) gotCold() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return strings.Join(p.cold, ",")
 }
 
 func (p *pathRecorder) got() (string, string) {

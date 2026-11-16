@@ -22,12 +22,13 @@ import (
 // fakeColdTier is the tiering side of cold retention (#168) over a real local
 // backend standing in for the cold store.
 type fakeColdTier struct {
-	backend  storage.Backend // nil: cold storage not usable on this node
-	rows     []tiering.FileMetadata
-	listErr  error
-	retired  []string
-	reverted []string
-	notified int
+	backend       storage.Backend // nil: cold storage not usable on this node
+	rows          []tiering.FileMetadata
+	listErr       error
+	retired       []string
+	reverted      []string
+	notified      int
+	notifiedPaths []string
 }
 
 func (f *fakeColdTier) ColdBackend() storage.Backend { return f.backend }
@@ -51,7 +52,10 @@ func (f *fakeColdTier) RevertColdRowToHot(_ context.Context, path string) error 
 	f.reverted = append(f.reverted, path)
 	return nil
 }
-func (f *fakeColdTier) NotifyColdFilesRemoved(n int) { f.notified += n }
+func (f *fakeColdTier) NotifyColdFilesRemoved(paths []string) {
+	f.notified += len(paths)
+	f.notifiedPaths = append(f.notifiedPaths, paths...)
+}
 
 type coldRetentionRig struct {
 	h       *RetentionHandler

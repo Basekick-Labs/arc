@@ -44,6 +44,10 @@ type coldRetention struct {
 	staleReverted int // the file is in hot storage; the row now says hot
 
 	removed int // objects deleted or rows changed: the query caches must go
+	// removedPaths are the cold keys gone (deleted, already missing, or
+	// reverted to hot): reported once per run, for the query caches and, in
+	// a cluster, the Iceberg exporter's cold listing (#1728).
+	removedPaths []string
 }
 
 const coldRetentionSampleCap = 32
@@ -157,6 +161,7 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 				} else {
 					c.staleReverted++
 					c.removed++
+					c.removedPaths = append(c.removedPaths, f.Path) // gone from cold
 				}
 			default:
 				retire = append(retire, f.Path)
@@ -237,6 +242,7 @@ func (h *RetentionHandler) finishColdMeasurement(ctx context.Context, c *coldRet
 		c.staleRetired += len(missing)
 	}
 	c.removed += len(deleted) + len(missing)
+	c.removedPaths = append(c.removedPaths, paths...)
 }
 
 // notifyColdRemoved drops the query caches once, at the end of a run that
@@ -244,8 +250,8 @@ func (h *RetentionHandler) finishColdMeasurement(ctx context.Context, c *coldRet
 // a cold glob that now matches nothing. Once per run rather than per
 // measurement, because it drops every measurement's cached transforms.
 func (h *RetentionHandler) notifyColdRemoved(c *coldRetention) {
-	if c.removed > 0 && h.coldTier != nil {
-		h.coldTier.NotifyColdFilesRemoved(c.removed)
+	if len(c.removedPaths) > 0 && h.coldTier != nil {
+		h.coldTier.NotifyColdFilesRemoved(c.removedPaths)
 	}
 }
 

@@ -51,7 +51,7 @@ type deleteColdTier interface {
 	RevertColdRowToHot(ctx context.Context, path string) error
 	// NotifyColdFilesRemoved tells tiering's listeners (query caches, the Iceberg export's
 	// cold listing, #939) that cold objects are gone.
-	NotifyColdFilesRemoved(n int)
+	NotifyColdFilesRemoved(paths []string)
 }
 
 // coldRemovalGuard is implemented by *tiering.Manager: a run that deletes
@@ -487,8 +487,11 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 				Msg("Failed to retire cold tier rows; the next DELETE or retention run retires them")
 		}
 	}
-	if len(c.deleted) > 0 {
-		h.coldTier.NotifyColdFilesRemoved(len(c.deleted))
+	// The deleted objects and the retired rows' (already gone): a cached
+	// cold listing, here or on a cluster's Iceberg exporter, can still name
+	// either (#1728).
+	if gone := append(append([]string(nil), c.deleted...), retiredMissing(retire, c.deleted)...); len(gone) > 0 {
+		h.coldTier.NotifyColdFilesRemoved(gone)
 	}
 }
 
@@ -575,3 +578,19 @@ func (c *coldPass) applyCold(resp *DeleteResponse, dryRun bool) bool {
 }
 
 var _ deleteColdTier = (*tiering.Manager)(nil)
+
+// retiredMissing is retire without the keys in deleted: the rows retired
+// because their object was already gone.
+func retiredMissing(retire, deleted []string) []string {
+	skip := make(map[string]bool, len(deleted))
+	for _, p := range deleted {
+		skip[p] = true
+	}
+	var out []string
+	for _, p := range retire {
+		if !skip[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}

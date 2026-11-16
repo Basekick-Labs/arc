@@ -99,3 +99,28 @@ func TestRequestReconcilePathsHotServesNowWithoutCold(t *testing.T) {
 		t.Fatalf("events %s, want a listing without cold invalidation", got)
 	}
 }
+
+// A node regaining the export drops the cold listings it cached during its
+// earlier turn: the cold-removal notices of the time were dropped at its gate.
+func TestGateReopeningDropsColdListings(t *testing.T) {
+	r := newExportRig(t, time.Hour)
+	src := &coldRecorder{StorageWalkSource: r.src}
+	r.sched.source = src
+	gate := &flagGate{on: true}
+	r.sched.gate = gate
+	if !r.sched.gateOpen() || len(src.events) != 0 {
+		t.Fatalf("an open gate dropped listings: %v", src.events)
+	}
+	gate.on = false
+	if r.sched.gateOpen() {
+		t.Fatal("closed gate reported open")
+	}
+	gate.on = true
+	if !r.sched.gateOpen() || strings.Join(src.events, ",") != "invalidate " {
+		t.Fatalf("reopened: events %v, want every cold listing dropped once", src.events)
+	}
+	r.sched.gateOpen()
+	if len(src.events) != 1 {
+		t.Fatalf("dropped again while it stayed open: %v", src.events)
+	}
+}

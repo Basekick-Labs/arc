@@ -24,12 +24,13 @@ import (
 // fakeDeleteColdTier is tiering as a DELETE of cold files sees it (#1350),
 // over a real local backend standing in for the cold store.
 type fakeDeleteColdTier struct {
-	backend    storage.Backend
-	configured bool
-	rows       []tiering.FileMetadata
-	retired    []string
-	reverted   []string
-	notified   int
+	backend       storage.Backend
+	configured    bool
+	rows          []tiering.FileMetadata
+	retired       []string
+	reverted      []string
+	notified      int
+	notifiedPaths []string
 }
 
 func (f *fakeDeleteColdTier) ColdBackend() storage.Backend { return f.backend }
@@ -47,7 +48,10 @@ func (f *fakeDeleteColdTier) RetireColdRows(_ context.Context, paths []string) (
 	f.retired = append(f.retired, paths...)
 	return len(paths), nil
 }
-func (f *fakeDeleteColdTier) NotifyColdFilesRemoved(n int) { f.notified += n }
+func (f *fakeDeleteColdTier) NotifyColdFilesRemoved(paths []string) {
+	f.notified += len(paths)
+	f.notifiedPaths = append(f.notifiedPaths, paths...)
+}
 func (f *fakeDeleteColdTier) RevertColdRowToHot(_ context.Context, path string) error {
 	f.reverted = append(f.reverted, path)
 	return nil

@@ -377,7 +377,7 @@ type coldRetentionTier interface {
 	GetColdFilesForRetention(ctx context.Context, database string, cutoff time.Time) ([]tiering.FileMetadata, error)
 	RetireColdRows(ctx context.Context, paths []string) (int, error)
 	RevertColdRowToHot(ctx context.Context, path string) error
-	NotifyColdFilesRemoved(n int)
+	NotifyColdFilesRemoved(paths []string)
 }
 
 // SetTieringManager makes retention apply its policies to the cold tier too.

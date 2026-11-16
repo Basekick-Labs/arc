@@ -1,11 +1,15 @@
 package cluster
 
 import (
+	"context"
+	"encoding/json"
 	"path"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
 
 // Iceberg export notifications from the cluster side (#1728).
@@ -23,8 +27,12 @@ import (
 //   - Shared bucket: a manifest delete, by reason, now or after a delay
 //     (the writer deletes the object after the manifest).
 //   - Tiering: the replicated tier-event drain's unlinked/missing events.
-//   - A database delete never asks, on any topology: it drops the database's
-//     tables itself, and a reconcile racing that drop could recreate one.
+//   - Cold tier: the primary writer proposes a Raft notice after it removed
+//     cold objects (ProposeIcebergColdRemoved); every node hands the
+//     directories to its export, which drops its cached cold listing first.
+//   - A database delete never asks, on any topology: a reconcile racing the
+//     drop could recreate a table. (The drop runs on the writer and drops the
+//     writer's catalog only; the exporter's tables are #1731.)
 //
 // Each reaches the scheduler's RequestReconcilePaths through icebergPaths,
 // which main.go wires; unset (Iceberg off) it costs nothing, and on a node
@@ -35,6 +43,9 @@ import (
 type icebergNotifier struct {
 	now   atomic.Pointer[func(keys []string)]
 	later atomic.Pointer[func(keys []string)] // delayed, no cold re-list
+	cold  atomic.Pointer[func(keys []string)] // drops the cold listing first
+
+	blockersLogged atomic.Bool
 
 	mu       sync.Mutex
 	unlinked []string
@@ -46,17 +57,93 @@ type icebergNotifier struct {
 const unlinkReportBatch = 1000
 
 // SetIcebergPathCallbacks wires the Iceberg export's requests: now for a
-// change already visible to this node's listing, later for a shared-bucket
-// manifest delete whose object the writer removes after the manifest (main.go:
-// the scheduler's RequestReconcilePaths and RequestReconcilePathsLater). Safe
-// to call on a running coordinator.
-func (c *Coordinator) SetIcebergPathCallbacks(now, later func(keys []string)) {
+// hot change already visible to this node's listing, later for a
+// shared-bucket manifest delete whose object the writer removes after the
+// manifest, cold for an applied cold-removal notice (main.go: the
+// scheduler's RequestReconcilePathsHot, RequestReconcilePathsLater and
+// RequestReconcilePaths). Safe to call on a running coordinator.
+func (c *Coordinator) SetIcebergPathCallbacks(now, later, cold func(keys []string)) {
 	if now != nil {
 		c.iceberg.now.Store(&now)
 	}
 	if later != nil {
 		c.iceberg.later.Store(&later)
 	}
+	if cold != nil {
+		c.iceberg.cold.Store(&cold)
+	}
+}
+
+// onIcebergNotice is the FSM's observer of applied cold-removal notices. Runs
+// on the apply path: an atomic load and a non-blocking request.
+func (c *Coordinator) onIcebergNotice(keys []string) {
+	if fn := c.iceberg.cold.Load(); fn != nil && len(keys) > 0 {
+		(*fn)(keys)
+	}
+}
+
+// measurementDirOf cuts a cold object key to its measurement directory: the
+// export maps per measurement and drops cold listings per database, so the
+// hour directories would only multiply the notice's keys. A partitioned key
+// ends in {year}/{month}/{day}/{hour}/{file} (on a hub, under
+// "{spoke}/{db}/{m}/"); anything shorter keeps its own directory.
+func measurementDirOf(key string) string {
+	key = strings.TrimLeft(key, "/")
+	segs := strings.Split(key, "/")
+	if len(segs) >= 7 {
+		return strings.Join(segs[:len(segs)-5], "/") + "/"
+	}
+	if d := path.Dir(key); d != "." {
+		return d + "/"
+	}
+	return ""
+}
+
+// ProposeIcebergColdRemoved tells every node's Iceberg export that these cold
+// objects are gone (#1728). Called on the primary writer after the deletes,
+// from a goroutine: errors are returned for the caller to log, never to fail
+// the removal. Does nothing without Raft, and until every node and Raft
+// server advertises CapabilityIcebergNotice.
+func (c *Coordinator) ProposeIcebergColdRemoved(ctx context.Context, paths []string) error {
+	if c == nil || c.raftNode == nil || len(paths) == 0 {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	if _, blockers := capabilityCandidates(fsm.GetAllNodes(), c.raftNode.ConfigurationServerIDs, raft.CapabilityIcebergNotice); len(blockers) > 0 {
+		if c.iceberg.blockersLogged.CompareAndSwap(false, true) {
+			c.logger.Info().Strs("nodes", blockers).
+				Msg("Iceberg cold-removal notices are off until every node runs a build that applies them; the export catches cold removals at its timed pass meanwhile")
+		}
+		return nil
+	}
+	seen := map[string]bool{}
+	var keys []string
+	for _, p := range paths {
+		if k := measurementDirOf(p); k != "" && !seen[k] && raft.ValidIcebergNoticeKey(k) {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for len(keys) > 0 {
+		n, bytes := 0, 0
+		for n < len(keys) && n < raft.MaxIcebergNoticeKeys && bytes+len(keys[n]) <= raft.MaxIcebergNoticeKeyBytes {
+			bytes += len(keys[n])
+			n++
+		}
+		raw, err := json.Marshal(raft.IcebergPathsChangedPayload{Keys: keys[:n]})
+		if err != nil {
+			return err
+		}
+		if err := c.applyOrForward(ctx, &raft.Command{Type: raft.CommandIcebergPathsChanged, Payload: raw}); err != nil {
+			return err
+		}
+		keys = keys[n:]
+	}
+	return nil
 }
 
 // dirsOf collapses storage keys to their parent directories, the form the

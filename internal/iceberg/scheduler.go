@@ -79,6 +79,11 @@ type Scheduler struct {
 	// Only the loop() goroutine touches it. A node demoted after having run
 	// does not re-warn; the startup case is the observability gap.
 	gatedWarnOnce bool
+	// wasGated: the gate was closed at the last check (loop goroutine). While
+	// another node exports, this node's cached cold listings miss every
+	// cold-removal notice (the requests are dropped at the gate), so they are
+	// dropped when the gate opens again (#1728).
+	wasGated bool
 
 	// busySince is when each measurement last stopped making progress while busy: the first busy
 	// pass after one that committed or settled. Loop goroutine only, like state.
@@ -561,7 +566,7 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 	if len(reqs) == 0 && len(byPath) == 0 && len(hotOnly) == 0 {
 		return
 	}
-	if s.gate != nil && !s.gate.CanRun() {
+	if !s.gateOpen() {
 		return // another node exports; its own passes converge
 	}
 	// A path request follows a change Arc made to the files, the cold tier's
@@ -633,6 +638,23 @@ func (s *Scheduler) noteOutcome(key string, outcome reconcileOutcome) {
 	}
 }
 
+// gateOpen reports whether this node may export now. On the first open check
+// after a closed one it drops every cached cold listing: one kept from an
+// earlier turn as exporter has missed the cold removals since.
+func (s *Scheduler) gateOpen() bool {
+	if s.gate != nil && !s.gate.CanRun() {
+		s.wasGated = true
+		return false
+	}
+	if s.wasGated {
+		s.wasGated = false
+		if ci, ok := s.source.(coldInvalidator); ok {
+			ci.InvalidateCold("")
+		}
+	}
+	return true
+}
+
 // Start launches the reconcile loop in the background. Stop cancels it.
 func (s *Scheduler) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -690,7 +712,7 @@ func (s *Scheduler) loop(ctx context.Context) {
 // takes effect without a restart (nil gate = always run). It reports whether any measurement
 // was left partly registered, so the loop can come back sooner.
 func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
-	if s.gate != nil && !s.gate.CanRun() {
+	if !s.gateOpen() {
 		if !s.gatedWarnOnce {
 			s.gatedWarnOnce = true
 			s.logger.Warn().Msg("Iceberg reconcile is gated off on this node (not the active compactor). If no node in the cluster holds a compactor role, Iceberg export never runs; assign one to enable it")

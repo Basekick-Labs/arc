@@ -4768,7 +4768,7 @@ func main() {
 			// lost (local unlinks, shared-bucket manifest deletes by reason,
 			// rewrites landing), #1728.
 			if clusterCoordinator != nil {
-				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater)
+				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater, icebergScheduler.RequestReconcilePaths)
 			}
 		}
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
@@ -5476,6 +5476,22 @@ func main() {
 		// be dropped — same reason compaction invalidates them (#662).
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
 		tieringManager.SetOnPathsChanged(notifyIcebergPaths)
+		// In a cluster, cold removals on this node reach the Iceberg exporter
+		// (another node) as a Raft notice (#1728). Off the caller's path: a
+		// failed notice costs only the export's timed pass.
+		if clusterCoordinator != nil {
+			tieringManager.SetOnColdRemoved(func(keys []string) {
+				keys = append([]string(nil), keys...)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					if err := clusterCoordinator.ProposeIcebergColdRemoved(ctx, keys); err != nil {
+						log.Warn().Err(err).Int("objects", len(keys)).
+							Msg("Could not tell the Iceberg exporter about removed cold objects; its timed pass drops them")
+					}
+				}()
+			})
+		}
 		// Around every chunk of hot copies a migration releases, and when a
 		// replica records a pulled file's move to cold: a cold listing cached
 		// before the copy, or a hot glob cached before the release, would

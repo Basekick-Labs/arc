@@ -716,6 +716,11 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandColdMarkSeed ||
 		cmd.Type == clusterraft.CommandColdMarkReset
 	isColdMarkAck := cmd.Type == clusterraft.CommandColdMarkAck || cmd.Type == clusterraft.CommandColdMarkAlive
+	// An Iceberg cold-removal notice (#1728): proposed by the primary writer
+	// after it removed cold objects; it need not be the leader in
+	// local-storage mode. No state; the worst a forged one does is ask an
+	// export to reconcile measurements it knows. Ingest roles only.
+	isIcebergNotice := cmd.Type == clusterraft.CommandIcebergPathsChanged
 	if isColdMarkAck {
 		// Ack and Alive have the same node_id field.
 		var p clusterraft.ColdMarkAckPayload
@@ -732,7 +737,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			return
 		}
 	}
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck {
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck && !isIcebergNotice {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -740,7 +745,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
-	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) || (isCompaction && !caps.CanIngest && !caps.CanCompact) {
+	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) || (isCompaction && !caps.CanIngest && !caps.CanCompact) || (isIcebergNotice && !caps.CanIngest) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
