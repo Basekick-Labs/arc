@@ -1121,14 +1121,14 @@ func (am *AuthManager) HasPermission(info *TokenInfo, permission string) bool {
 // ListTokens returns all tokens (without revealing hashes)
 func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 	rows, err := am.db.Query(`
-		SELECT id, name, description, permissions, created_at, last_used_at, expires_at, enabled, raft_materialised
+		SELECT id, name, description, permissions, created_at, last_used_at, expires_at, enabled, raft_materialised, token_hash
 		FROM api_tokens
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	clustered, nodeID := am.clusterNode()
+	labeler := am.newTokenLabeler()
 
 	var tokens []TokenInfo
 	for rows.Next() {
@@ -1142,9 +1142,10 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			expiresAt   sql.NullTime
 			enabled     bool
 			marked      sql.NullInt64
+			hash        string
 		)
 
-		if err := rows.Scan(&id, &name, &description, &permissions, &createdAt, &lastUsedAt, &expiresAt, &enabled, &marked); err != nil {
+		if err := rows.Scan(&id, &name, &description, &permissions, &createdAt, &lastUsedAt, &expiresAt, &enabled, &marked, &hash); err != nil {
 			return nil, err
 		}
 
@@ -1155,11 +1156,8 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			Permissions: []string{}, // empty by default for RBAC-only tokens
 			CreatedAt:   createdAt,
 			Enabled:     enabled,
-			NodeLocal:   clustered && marked.Int64 != 1,
 		}
-		if info.NodeLocal {
-			info.NodeID = nodeID
-		}
+		labeler.label(&info, &tokenWriteRow{id: id, name: name, hash: hash, createdAt: createdAt, enabled: enabled, marked: marked.Int64 == 1})
 		if permissions.Valid && permissions.String != "" {
 			info.Permissions = strings.Split(permissions.String, ",")
 		}
@@ -1335,7 +1333,7 @@ func (am *AuthManager) UpdateTokenScoped(ctx context.Context, id int64, name, de
 		case classNodeLocal:
 			return am.updateNodeLocalToken(p, t, name, description, permissions, expiresAt)
 		case classNotInClusterState, classHistoryMismatch:
-			return TokenWriteResult{}, t.revokeOrDeleteOnly()
+			return TokenWriteResult{}, t.localOnlyRefusal()
 		}
 		var changed []string
 		payload := struct {
@@ -1559,6 +1557,9 @@ func (am *AuthManager) RevokeTokenScoped(ctx context.Context, id int64, opts Tok
 		if err != nil {
 			return TokenWriteResult{}, err
 		}
+		if t.class == classHistoryMismatch {
+			return TokenWriteResult{}, t.localOnlyRefusal()
+		}
 		if t.class != classCluster {
 			return am.localTokenWrite(t, "revoke", "UPDATE api_tokens SET enabled = 0 WHERE id = ? AND raft_materialised = ?")
 		}
@@ -1618,7 +1619,7 @@ func (am *AuthManager) RotateTokenScoped(ctx context.Context, id int64, opts Tok
 			return "", TokenWriteResult{}, err
 		}
 		if t.class == classNotInClusterState || t.class == classHistoryMismatch {
-			return "", TokenWriteResult{}, t.revokeOrDeleteOnly()
+			return "", TokenWriteResult{}, t.localOnlyRefusal()
 		}
 		if !t.row.enabled {
 			return "", TokenWriteResult{}, errTokenRevoked()

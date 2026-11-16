@@ -75,6 +75,8 @@ const (
 	TokenCodeChanged           = "token_changed"        // the row changed between the check and the write
 	TokenCodeNameHeldByCluster = "name_held_by_cluster" // a node-local rename to a cluster token's name
 	TokenCodeRevokeOrDelete    = "revoke_or_delete_only"
+	TokenCodeDeleteOnly        = "delete_only"        // a cluster row from another Raft history: only a delete is safe
+	TokenCodeNodeIDUnknown     = "node_id_unknown"    // ?node given, but this node cannot tell its own ID
 	TokenCodeClusterMembership = "cluster_membership" // the membership belongs to the cluster token at this ID
 )
 
@@ -156,11 +158,13 @@ func tokenRowIsFSMEntry(name, hash string, createdAt any, e ClusterTokenEntry) b
 }
 
 // markedRowIsFSMEntry tells whether a marked row is the cluster token at its
-// ID. The creation instant is the cluster's own and never changes; name and
-// hash both equal covers a row whose instant failed to round-trip. Either
-// holds while a rename or rotate is between the FSM map and the callback.
+// ID. The creation instant is the cluster's own and never changes: an apply
+// writes it, and the boot reconcile repairs it on a row it rewrites. The same
+// secret also identifies the token, which covers a row whose instant an older
+// reconcile left behind while a rename is between the FSM map and the
+// callback. A rotate in that window keeps the instant.
 func markedRowIsFSMEntry(r *tokenWriteRow, e ClusterTokenEntry) bool {
-	return sameInstant(r.createdAt, e.CreatedAtUnixNano) || (r.name == e.Name && r.hash == e.TokenHash)
+	return sameInstant(r.createdAt, e.CreatedAtUnixNano) || r.hash == e.TokenHash
 }
 
 // checkNodeParam refuses a request addressed to another node, before anything
@@ -170,12 +174,22 @@ func checkNodeParam(view ClusterTokenView, opts TokenWriteOptions) error {
 	if opts.NodeSet && opts.Node == "" {
 		return &TokenScopeError{Code: TokenCodeInvalidNode, Message: "The node parameter is empty. Pass ?node=<node_id> of the node that holds the token, or omit it for a cluster token."}
 	}
-	if view == nil || !opts.NodeSet {
+	if !opts.NodeSet {
 		return nil
 	}
-	if local := view.LocalNodeID(); local != "" && opts.Node != local {
+	// Fail closed: without its own ID this node cannot tell that the request
+	// was meant for it, and on another node the ID names another token.
+	local := ""
+	if view != nil {
+		local = view.LocalNodeID()
+	}
+	if local == "" {
+		return &TokenScopeError{Code: TokenCodeNodeIDUnknown,
+			Message: "This node cannot tell its own node ID yet, so it cannot confirm that ?node names it. Nothing was changed; retry shortly."}
+	}
+	if opts.Node != local {
 		return &TokenScopeError{Code: TokenCodeWrongNode, NodeID: local,
-			Message: fmt.Sprintf("This request reached node %s, not node %s. Nothing was changed. Send it to node %s directly.", local, opts.Node, opts.Node)}
+			Message: fmt.Sprintf("This request reached node %s, not node %q. Nothing was changed. Send it to that node directly.", local, opts.Node)}
 	}
 	return nil
 }
@@ -202,26 +216,15 @@ func (am *AuthManager) classifyTokenWrite(p RaftProposer, id int64) (*tokenWrite
 		return nil, errTokenNotFound()
 	}
 	t.row = *row
-	if view == nil {
-		if row.marked {
-			t.class = classCluster
-		} else {
-			t.class = classNodeLocal
-		}
-		return t, nil
-	}
-	e, inFSM := view.ClusterToken(id)
-	switch {
-	case row.marked && inFSM && markedRowIsFSMEntry(row, e):
-		t.class = classCluster
-	case row.marked && inFSM:
-		t.class = classHistoryMismatch
-	case row.marked && uint64(id) > applied:
+	class, adopt, caughtUp := rowClass(view, applied, row)
+	if !caughtUp {
 		return nil, &TokenScopeError{Code: TokenCodeNotCaughtUp, TokenID: id, NodeID: t.nodeID,
 			Message: "This node has not caught up with the cluster state yet. Nothing was changed; retry shortly."}
-	case row.marked:
-		t.class = classNotInClusterState
-	case inFSM && tokenRowIsFSMEntry(row.name, row.hash, row.createdAt, e):
+	}
+	t.class = class
+	if adopt {
+		// The adoption is the reconcile's own rule and is kept even when the
+		// request is then refused (a cluster token named with ?node).
 		res, err := am.db.Exec(`UPDATE api_tokens SET raft_materialised = 1 WHERE id = ? AND raft_materialised = 0`, id)
 		if err != nil {
 			return nil, fmt.Errorf("adopt cluster token %d: %w", id, err)
@@ -231,11 +234,41 @@ func (am *AuthManager) classifyTokenWrite(p RaftProposer, id int64) (*tokenWrite
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Adopted this node's copy of a cluster token before writing it")
 		t.row.marked = true
-		t.class = classCluster
-	default:
-		t.class = classNodeLocal
 	}
 	return t, nil
+}
+
+// rowClass classifies this node's row against the cluster state, writing
+// nothing. adopt reports an unmarked row that is the cluster token at its ID
+// (an apply wrote it before the marker existed). caughtUp is false for a
+// marked row the state lacks above the applied index: the node may simply not
+// have applied it yet. Without the view, the marker alone decides.
+func rowClass(view ClusterTokenView, applied uint64, row *tokenWriteRow) (class tokenClass, adopt, caughtUp bool) {
+	if view == nil {
+		if row.marked {
+			return classCluster, false, true
+		}
+		return classNodeLocal, false, true
+	}
+	e, inFSM := view.ClusterToken(row.id)
+	switch {
+	case row.marked && inFSM && markedRowIsFSMEntry(row, e):
+		return classCluster, false, true
+	case row.marked && inFSM:
+		return classHistoryMismatch, false, true
+	case row.marked && uint64(row.id) > applied:
+		return classNotInClusterState, false, false
+	case row.marked:
+		return classNotInClusterState, false, true
+	case inFSM && tokenRowIsFSMEntry(row.name, row.hash, row.createdAt, e):
+		return classCluster, true, true
+	default:
+		// Residual: an unmarked row above the applied index that a create
+		// still to be replayed will name. Only a row an apply wrote and the
+		// backfill missed can be one; ApplyCreateToken then adopts it with
+		// whatever enabled this node gave it, never wider (#1630 review).
+		return classNodeLocal, false, true
+	}
 }
 
 // resolveTokenWrite classifies a token write on a cluster node and applies
@@ -281,7 +314,7 @@ func (t *tokenWriteTarget) nodeLocalRefusal() error {
 		e.Message = fmt.Sprintf("Token %d (%q) on %s is no longer in the cluster state (deleted while this node was away, or refused by a snapshot); it still authenticates on this node only. Nothing was changed. To revoke or delete it on this node, repeat the request against this node with ?node=%s.", t.row.id, t.row.name, on, param)
 	case classHistoryMismatch:
 		e.Code = TokenCodeHistoryMismatch
-		e.Message = fmt.Sprintf("Token %d (%q) on %s is not the token the cluster state holds at this ID: this node's auth database comes from another cluster history. It authenticates on this node only. Nothing was changed. To revoke or delete it on this node, repeat the request against this node with ?node=%s.", t.row.id, t.row.name, on, param)
+		e.Message = fmt.Sprintf("Token %d (%q) on %s is not the token the cluster state holds at this ID: this node's auth database comes from another cluster history. It authenticates on this node only. Nothing was changed. To remove it from this node, repeat the delete against this node with ?node=%s.", t.row.id, t.row.name, on, param)
 	default:
 		e.Code = TokenCodeNodeLocal
 		e.Message = fmt.Sprintf("Token %d (%q) exists only in the database of %s; the cluster does not manage it (a token created before v26.06.1, or while this node ran without its cluster). Nothing was changed. To change it on this node only, repeat the request against this node with ?node=%s. If the same token exists on other nodes, do the same on each of them.", t.row.id, t.row.name, on, param)
@@ -289,10 +322,18 @@ func (t *tokenWriteTarget) nodeLocalRefusal() error {
 	return e
 }
 
-// revokeOrDeleteOnly refuses a rotate or update of a cluster row the cluster
-// state does not hold: the reconcile would undo it.
-func (t *tokenWriteTarget) revokeOrDeleteOnly() error {
+// localOnlyRefusal refuses a write the reconcile would undo or turn against
+// the cluster token. A row the cluster state no longer holds can be revoked
+// or deleted (the reconcile keeps or deletes it, and never re-enables it). A
+// row from another history can only be deleted: the reconcile rewrites a
+// marked row to the token the state holds at its ID, so a revoke would end as
+// that cluster token, disabled on this node for good (#1630 review).
+func (t *tokenWriteTarget) localOnlyRefusal() error {
 	on, _ := nodeLabel(t.nodeID)
+	if t.class == classHistoryMismatch {
+		return &TokenScopeError{Code: TokenCodeDeleteOnly, TokenID: t.row.id, NodeID: t.nodeID,
+			Message: fmt.Sprintf("Token %d (%q) on %s comes from another cluster history; the cluster state holds a different token at this ID. It can only be deleted on this node; after the next restart this node then holds the cluster's token at this ID.", t.row.id, t.row.name, on)}
+	}
 	return &TokenScopeError{Code: TokenCodeRevokeOrDelete, TokenID: t.row.id, NodeID: t.nodeID,
 		Message: fmt.Sprintf("Token %d (%q) on %s is a cluster token the cluster state does not hold; it can only be revoked or deleted on this node.", t.row.id, t.row.name, on)}
 }
@@ -368,11 +409,21 @@ func (am *AuthManager) ResolveTokenMembershipWrite(id int64, opts TokenWriteOpti
 	}
 	if !remove {
 		on, _ := nodeLabel(t.nodeID)
-		return TokenWriteResult{}, &TokenScopeError{Code: TokenCodeNodeLocal, TokenID: id, NodeID: t.nodeID,
-			Message: fmt.Sprintf("Token %d (%q) exists only in the database of %s; the cluster does not manage it, so it cannot join a cluster team. Create a cluster token (POST /api/v1/auth/tokens) and add that one.", id, t.row.name, on)}
+		e := &TokenScopeError{Code: TokenCodeNodeLocal, TokenID: id, NodeID: t.nodeID}
+		switch t.class {
+		case classNotInClusterState:
+			e.Code = TokenCodeNotInClusterState
+			e.Message = fmt.Sprintf("Token %d (%q) on %s is no longer in the cluster state, so it cannot join a cluster team. Create a cluster token (POST /api/v1/auth/tokens) and add that one.", id, t.row.name, on)
+		case classHistoryMismatch:
+			e.Code = TokenCodeHistoryMismatch
+			e.Message = fmt.Sprintf("Token %d (%q) on %s is not the token the cluster state holds at this ID (another cluster history), so it cannot join a cluster team. Create a cluster token (POST /api/v1/auth/tokens) and add that one.", id, t.row.name, on)
+		default:
+			e.Message = fmt.Sprintf("Token %d (%q) exists only in the database of %s; the cluster does not manage it, so it cannot join a cluster team. Create a cluster token (POST /api/v1/auth/tokens) and add that one.", id, t.row.name, on)
+		}
+		return TokenWriteResult{}, e
 	}
 	if t.class != classNodeLocal {
-		return TokenWriteResult{}, t.revokeOrDeleteOnly()
+		return TokenWriteResult{}, t.localOnlyRefusal()
 	}
 	if !opts.NodeSet {
 		return TokenWriteResult{}, t.nodeLocalRefusal()
@@ -381,34 +432,63 @@ func (am *AuthManager) ResolveTokenMembershipWrite(id int64, opts TokenWriteOpti
 }
 
 // clusterNode reports whether this node writes tokens through the cluster,
-// and its node ID when the proposer knows it.
-func (am *AuthManager) clusterNode() (bool, string) {
+// with the cluster state's read side and this node's ID when the proposer
+// has them.
+func (am *AuthManager) clusterNode() (bool, ClusterTokenView, string) {
 	p := am.getProposer()
 	if p == nil {
-		return false, ""
+		return false, nil, ""
 	}
 	if view, ok := p.(ClusterTokenView); ok {
-		return true, view.LocalNodeID()
+		return true, view, view.LocalNodeID()
 	}
-	return true, ""
+	return true, nil, ""
+}
+
+// tokenLabeler marks the rows a token write would treat as not the cluster's,
+// by the same classification (rowClass), so the list and the get agree with
+// the 409 a write answers. A marked row this node has not caught up on is
+// not marked.
+type tokenLabeler struct {
+	clustered bool
+	view      ClusterTokenView
+	nodeID    string
+	applied   uint64
+}
+
+func (am *AuthManager) newTokenLabeler() tokenLabeler {
+	clustered, view, nodeID := am.clusterNode()
+	l := tokenLabeler{clustered: clustered, view: view, nodeID: nodeID}
+	if view != nil {
+		l.applied = view.AppliedDone()
+	}
+	return l
+}
+
+func (l tokenLabeler) label(info *TokenInfo, row *tokenWriteRow) {
+	if !l.clustered {
+		return
+	}
+	class, _, caughtUp := rowClass(l.view, l.applied, row)
+	if class != classCluster && caughtUp {
+		info.NodeLocal, info.NodeID = true, l.nodeID
+	}
 }
 
 // MarkNodeLocal sets info.NodeLocal and info.NodeID for the admin get on a
-// cluster node, by the row's marker as ListTokens does. A no-op standalone or
-// when the marker cannot be read.
+// cluster node, as ListTokens does. A no-op standalone or when the row cannot
+// be read: it is a diagnostic and never fails the get.
 func (am *AuthManager) MarkNodeLocal(info *TokenInfo) {
 	if info == nil {
 		return
 	}
-	clustered, nodeID := am.clusterNode()
-	if !clustered {
+	l := am.newTokenLabeler()
+	if !l.clustered {
 		return
 	}
-	var marked sql.NullInt64
-	if err := am.db.QueryRow(`SELECT raft_materialised FROM api_tokens WHERE id = ?`, info.ID).Scan(&marked); err != nil {
+	row, err := am.getTokenRowForWrite(info.ID)
+	if err != nil || row == nil {
 		return
 	}
-	if marked.Int64 != 1 {
-		info.NodeLocal, info.NodeID = true, nodeID
-	}
+	l.label(info, row)
 }

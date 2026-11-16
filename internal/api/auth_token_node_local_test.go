@@ -53,7 +53,9 @@ func TestClusterRevokeOfNodeLocalTokenTakesEffect(t *testing.T) {
 	if am.VerifyToken(secret) == nil {
 		t.Fatal("the token does not authenticate before the revoke")
 	}
-	am.SetRaftProposer(&droppingTokenProposer{})
+	// A cluster node with an empty cluster state, as the production
+	// proposer reads it; on main the revoke is proposed and dropped.
+	am.SetRaftProposer(&viewTokenProposer{tokens: map[int64]auth.ClusterTokenEntry{}})
 
 	path := fmt.Sprintf("/tokens/%d/revoke", id)
 	status, body := doTokenJSON(t, app, "POST", path, "")
@@ -183,5 +185,35 @@ func TestStandaloneTokenRoutesIgnoreNode(t *testing.T) {
 	}
 	if _, body := doTokenJSON(t, app, "GET", fmt.Sprintf("/tokens/%d", id), ""); body["token"].(map[string]any)["node_local"] != nil {
 		t.Errorf("standalone get marks node_local: %v", body)
+	}
+}
+
+// noIDProposer is a cluster node that cannot tell its own ID yet.
+type noIDProposer struct{ *viewTokenProposer }
+
+func (noIDProposer) LocalNodeID() string { return "" }
+
+// A ?node write on a node without its ID: 503 with Retry-After, nothing done.
+func TestNodeParamWithoutLocalIDIs503(t *testing.T) {
+	app, am := setupTokenStatusTest(t)
+	secret, err := am.CreateToken(context.Background(), "legacy", "", "read", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := tokenIDNamed(t, am, "legacy")
+	am.SetRaftProposer(noIDProposer{&viewTokenProposer{tokens: map[int64]auth.ClusterTokenEntry{}}})
+	req := httptest.NewRequest("POST", fmt.Sprintf("/tokens/%d/revoke?node=n2", id), nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" || body["code"] != "node_id_unknown" {
+		t.Errorf("got %d Retry-After=%q %v, want 503 node_id_unknown", resp.StatusCode, resp.Header.Get("Retry-After"), body)
+	}
+	if am.VerifyToken(secret) == nil {
+		t.Error("a refused revoke changed the token")
 	}
 }

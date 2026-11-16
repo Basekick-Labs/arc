@@ -470,11 +470,14 @@ func (r *reconciler) planTokens(tx *sql.Tx) error {
 			r.tx1 = append(r.tx1, reconcileOp{table: TableTokens, kind: "adopted",
 				query: `UPDATE api_tokens SET raft_materialised = 1 WHERE id = ?`, args: []any{l.id}})
 		}
+		// created_at too: the token-write classification identifies a
+		// marked row by the cluster's creation instant (#1630).
 		if l.hash != e.TokenHash || l.prefix != e.TokenPrefix || l.description.String != e.Description ||
-			l.perms.String != e.Permissions || !sameInstant(l.expiresAt, e.ExpiresAtUnixNano) {
+			l.perms.String != e.Permissions || !sameInstant(l.expiresAt, e.ExpiresAtUnixNano) ||
+			!sameInstant(l.createdAt, e.CreatedAtUnixNano) {
 			r.tx1 = append(r.tx1, reconcileOp{table: TableTokens, kind: "updated",
-				query: `UPDATE api_tokens SET token_hash = ?, token_prefix = ?, description = ?, permissions = ?, expires_at = ? WHERE id = ?`,
-				args:  []any{e.TokenHash, e.TokenPrefix, e.Description, e.Permissions, nullableNano(e.ExpiresAtUnixNano), l.id}})
+				query: `UPDATE api_tokens SET token_hash = ?, token_prefix = ?, description = ?, permissions = ?, expires_at = ?, created_at = ? WHERE id = ?`,
+				args:  []any{e.TokenHash, e.TokenPrefix, e.Description, e.Permissions, nullableNano(e.ExpiresAtUnixNano), utcNano(e.CreatedAtUnixNano), l.id}})
 		}
 		r.planEnabled(TableTokens, "api_tokens", l.id, l.name, e.Enabled, l.enabled, false)
 		if l.name != e.Name {

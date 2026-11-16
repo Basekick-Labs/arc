@@ -31,7 +31,7 @@ func tokenScopeErrorResponse(c *fiber.Ctx, err error) (bool, error) {
 	}
 	status := fiber.StatusConflict
 	switch se.Code {
-	case auth.TokenCodeNotCaughtUp:
+	case auth.TokenCodeNotCaughtUp, auth.TokenCodeNodeIDUnknown:
 		status = fiber.StatusServiceUnavailable
 		c.Set(fiber.HeaderRetryAfter, "5")
 	case auth.TokenCodeInvalidNode:

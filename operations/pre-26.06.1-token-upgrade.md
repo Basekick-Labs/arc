@@ -29,7 +29,9 @@ curl -X POST -H "Authorization: Bearer $ADMIN" \
 
 - Without `?node`, the answer is `409` (`node_local_token`) with the node's
   ID, and nothing changes. `GET /api/v1/auth/tokens` on that node shows the
-  token with `"node_local": true`; check its name there first.
+  token with `"node_local": true`; check its name there first. A row
+  that came from another cluster history (`history_mismatch`) can only be
+  deleted, not revoked.
 - A request that reaches a different node than `?node` names answers `409`
   (`wrong_node`): an ID names a different token on each node.
 - A revoke cannot be undone. Repeat it on every node that holds the token.

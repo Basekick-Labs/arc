@@ -334,8 +334,19 @@ func TestMarkedRowFromAnotherHistory(t *testing.T) {
 
 	_, err := am.RevokeTokenScoped(ctx, id, TokenWriteOptions{})
 	requireScopeCode(t, "revoke", err, TokenCodeHistoryMismatch)
+	// Only a delete: the reconcile rewrites a marked row to the token the
+	// state holds at its ID, so a revoke would end as that cluster token,
+	// disabled on this node for good.
+	_, err = am.RevokeTokenScoped(ctx, id, here)
+	requireScopeCode(t, "revoke with node", err, TokenCodeDeleteOnly)
+	if r, _ := readToken(t, am, id); !r.enabled {
+		t.Fatal("the refused revoke disabled the row")
+	}
 	_, _, err = am.RotateTokenScoped(ctx, id, here)
-	requireScopeCode(t, "rotate", err, TokenCodeRevokeOrDelete)
+	requireScopeCode(t, "rotate", err, TokenCodeDeleteOnly)
+	desc := "x"
+	_, err = am.UpdateTokenScoped(ctx, id, nil, &desc, nil, nil, here)
+	requireScopeCode(t, "update", err, TokenCodeDeleteOnly)
 	if _, err := am.DeleteTokenScoped(ctx, id, here); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -355,11 +366,11 @@ func TestNodeLocalFallbackWithoutView(t *testing.T) {
 
 	_, err := am.RevokeTokenScoped(ctx, id, TokenWriteOptions{})
 	requireScopeCode(t, "revoke without node", err, TokenCodeNodeLocal)
-	if _, err := am.RevokeTokenScoped(ctx, id, TokenWriteOptions{Node: "anything", NodeSet: true}); err != nil {
-		t.Fatalf("revoke: %v", err)
-	}
-	if am.VerifyToken(secret) != nil {
-		t.Error("still authenticates")
+	// Without its own ID the node cannot confirm ?node names it: fail closed.
+	_, err = am.RevokeTokenScoped(ctx, id, TokenWriteOptions{Node: "anything", NodeSet: true})
+	requireScopeCode(t, "revoke with node", err, TokenCodeNodeIDUnknown)
+	if am.VerifyToken(secret) == nil {
+		t.Error("a refused revoke changed the token")
 	}
 	if err := am.RevokeToken(ctx, clusterID); err != nil {
 		t.Fatalf("cluster revoke: %v", err)
@@ -468,26 +479,117 @@ func TestListMarksNodeLocalTokens(t *testing.T) {
 	am := newTokenWriteTestManager(t)
 	legacyID, _ := legacyToken(t, am, "legacy")
 	clusterID := applyClusterToken(t, am, 500, "svc")
-	am.SetRaftProposer(newViewProposer())
+	goneID := applyClusterToken(t, am, 600, "gone")      // the state no longer holds it
+	otherID := applyClusterToken(t, am, 700, "old-hist") // another history
+	futureID := applyClusterToken(t, am, 2000, "future") // above the applied index
+	prop := newViewProposer()
+	prop.tokens[clusterID] = ClusterTokenEntry{ID: clusterID, Name: "svc", TokenHash: "$2a$10$svcfakebcrypthash", CreatedAtUnixNano: 1_700_000_000_000_000_000 + clusterID}
+	prop.tokens[otherID] = ClusterTokenEntry{ID: otherID, Name: "new-hist", TokenHash: "other", CreatedAtUnixNano: 5}
+	am.SetRaftProposer(prop)
 	tokens, err := am.ListTokens()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The label follows the write classification, not the marker alone.
+	want := map[int64]bool{legacyID: true, clusterID: false, goneID: true, otherID: true, futureID: false}
 	for _, tk := range tokens {
-		switch tk.ID {
-		case legacyID:
-			if !tk.NodeLocal || tk.NodeID != "n2" {
-				t.Errorf("legacy token: %+v, want node_local on n2", tk)
-			}
-		case clusterID:
-			if tk.NodeLocal || tk.NodeID != "" {
-				t.Errorf("cluster token marked node-local: %+v", tk)
-			}
+		w, ok := want[tk.ID]
+		if !ok {
+			continue
+		}
+		if tk.NodeLocal != w || (w && tk.NodeID != "n2") || (!w && tk.NodeID != "") {
+			t.Errorf("token %d (%s): node_local %v node_id %q, want %v", tk.ID, tk.Name, tk.NodeLocal, tk.NodeID, w)
+		}
+		info, _ := am.GetTokenByID(tk.ID)
+		am.MarkNodeLocal(info)
+		if info.NodeLocal != w {
+			t.Errorf("get of token %d: node_local %v, want %v", tk.ID, info.NodeLocal, w)
 		}
 	}
 	info, _ := am.GetTokenByID(legacyID)
 	am.MarkNodeLocal(info)
 	if !info.NodeLocal || info.NodeID != "n2" {
 		t.Errorf("MarkNodeLocal: %+v", info)
+	}
+}
+
+// The rotate and update guards: an apply adopts the row between the check
+// and the write, and the node-local write changes nothing.
+func TestNodeLocalRotateUpdateRowChangedUnderneath(t *testing.T) {
+	for _, op := range []string{"rotate", "update"} {
+		t.Run(op, func(t *testing.T) {
+			am := newTokenWriteTestManager(t)
+			id, secret := legacyToken(t, am, "legacy")
+			prop := newViewProposer()
+			prop.onLookup = func() {
+				if _, err := am.db.Exec(`UPDATE api_tokens SET raft_materialised = 1 WHERE id = ?`, id); err != nil {
+					t.Errorf("adopt: %v", err)
+				}
+			}
+			am.SetRaftProposer(prop)
+			ctx := context.Background()
+			var err error
+			if op == "rotate" {
+				_, _, err = am.RotateTokenScoped(ctx, id, here)
+			} else {
+				desc := "changed"
+				_, err = am.UpdateTokenScoped(ctx, id, nil, &desc, nil, nil, here)
+			}
+			requireScopeCode(t, op+" of a row adopted underneath", err, TokenCodeChanged)
+			if am.VerifyToken(secret) == nil {
+				t.Error("the old secret no longer authenticates")
+			}
+			if info, _ := am.GetTokenByID(id); info == nil || info.Description != "" {
+				t.Errorf("the refused write changed the row: %+v", info)
+			}
+		})
+	}
+}
+
+// A cluster row whose creation instant an older reconcile left behind, while
+// a rename is between the FSM map and the callback: the same secret still
+// identifies it as the cluster token, so a plain revoke is proposed.
+func TestMarkedRowWithStaleInstantIsTheClusterToken(t *testing.T) {
+	am := newTokenWriteTestManager(t)
+	id := applyClusterToken(t, am, 300, "svc")
+	mustExec(t, am, `UPDATE api_tokens SET created_at = '2020-01-01 00:00:00' WHERE id = ?`, id)
+	prop := newViewProposer()
+	prop.tokens[id] = ClusterTokenEntry{ID: id, Name: "svc-renamed", TokenHash: "$2a$10$svcfakebcrypthash", CreatedAtUnixNano: 1_700_000_000_000_000_000 + id}
+	am.SetRaftProposer(prop)
+	if _, err := am.RevokeTokenScoped(context.Background(), id, TokenWriteOptions{}); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if got := prop.proposals(); len(got) != 1 {
+		t.Errorf("proposals = %v, want the cluster revoke", got)
+	}
+}
+
+// Team adds of a cluster row the state does not hold name the real reason.
+func TestMembershipAddNamesTheClass(t *testing.T) {
+	am := newTokenWriteTestManager(t)
+	goneID := applyClusterToken(t, am, 600, "gone")
+	otherID := applyClusterToken(t, am, 700, "old-hist")
+	prop := newViewProposer()
+	prop.tokens[otherID] = ClusterTokenEntry{ID: otherID, Name: "new-hist", TokenHash: "other", CreatedAtUnixNano: 5}
+	am.SetRaftProposer(prop)
+	_, err := am.ResolveTokenMembershipWrite(goneID, TokenWriteOptions{}, false)
+	requireScopeCode(t, "add a row the state lacks", err, TokenCodeNotInClusterState)
+	_, err = am.ResolveTokenMembershipWrite(otherID, TokenWriteOptions{}, false)
+	requireScopeCode(t, "add a row from another history", err, TokenCodeHistoryMismatch)
+	_, err = am.ResolveTokenMembershipWrite(otherID, here, true)
+	requireScopeCode(t, "remove from a row from another history", err, TokenCodeDeleteOnly)
+}
+
+// A node that cannot tell its own ID refuses every ?node write.
+func TestNodeParamFailsClosedWithoutLocalID(t *testing.T) {
+	am := newTokenWriteTestManager(t)
+	id, secret := legacyToken(t, am, "legacy")
+	prop := newViewProposer()
+	prop.nodeID = ""
+	am.SetRaftProposer(prop)
+	_, err := am.RevokeTokenScoped(context.Background(), id, here)
+	requireScopeCode(t, "revoke", err, TokenCodeNodeIDUnknown)
+	if am.VerifyToken(secret) == nil {
+		t.Error("a refused revoke changed the token")
 	}
 }
