@@ -63,6 +63,11 @@ type Manager struct {
 	// delete the files. Guarded by callbackMu.
 	onHotFilesRemoved func(paths []string) error
 
+	// onPathsChanged, when set, is told the hot paths a migration batch moved
+	// to the cold tier (main.go: the Iceberg scheduler's
+	// RequestReconcilePaths, #1727). Guarded by callbackMu.
+	onPathsChanged func(keys []string)
+
 	// scanRunning serializes ScanTiers across its exported callers: the
 	// startup scan and POST /api/v1/tiering/scan. The endpoint has no
 	// handler deadline and fasthttp does not cancel a request when the
@@ -626,6 +631,26 @@ func (m *Manager) MigrationGate() (gated bool, role string) {
 		return false, ""
 	}
 	return !m.clusterGate.IsPrimaryWriter(), m.clusterGate.Role()
+}
+
+// SetOnPathsChanged sets onPathsChanged.
+func (m *Manager) SetOnPathsChanged(fn func(keys []string)) {
+	m.callbackMu.Lock()
+	defer m.callbackMu.Unlock()
+	m.onPathsChanged = fn
+}
+
+// notifyPathsChanged tells onPathsChanged which hot paths moved.
+func (m *Manager) notifyPathsChanged(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	m.callbackMu.Lock()
+	fn := m.onPathsChanged
+	m.callbackMu.Unlock()
+	if fn != nil {
+		fn(paths)
+	}
 }
 
 // notifyMigrationComplete fires the registered callback when a cycle changed

@@ -3768,6 +3768,7 @@ func main() {
 						if f := spokeDeleteInvalidate.Load(); f != nil {
 							(*f)()
 						}
+						flushSpokeDeleted()
 					})
 				spokeLogger.Warn().Dur("delay", cfg.EdgeSync.Spoke.DeleteAfterSyncDelay).
 					Msg("edge_sync.spoke.delete_after_sync is on: local copies of synced files are deleted once the hub verifies it holds them; local queries no longer see that data")
@@ -3844,6 +3845,7 @@ func main() {
 						if f := spokeDeleteInvalidate.Load(); f != nil {
 							(*f)()
 						}
+						flushSpokeDeleted()
 					},
 					Delay:           cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
 					MaxAge:          cfg.EdgeSync.Spoke.DeleteAfterSyncAckMaxAge,
@@ -4444,6 +4446,7 @@ func main() {
 	// via os.CreateTemp.
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
 	deleteHandler.SetOnFilesRemoved(invalidateQueryCaches)
+	deleteHandler.SetOnPathsChanged(notifyIcebergPaths)
 	if hubRowDeleteMarker != nil {
 		// #1666: a rewrite keeps the surviving rows (compacted); a file whose
 		// rows all match is removed. Both nil off a hub.
@@ -4493,6 +4496,7 @@ func main() {
 	}
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
 	databasesHandler.SetOnFilesRemoved(invalidateQueryCaches)
+	databasesHandler.SetOnPathsChanged(notifyIcebergPaths)
 	databasesHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
 	if registrationOutbox != nil {
 		databasesHandler.SetPendingRegistrations(registrationOutbox)
@@ -4534,6 +4538,7 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
 		retentionHandler.SetOnFilesRemoved(invalidateQueryCaches)
+		retentionHandler.SetOnPathsChanged(notifyIcebergPaths)
 		if hubRemovalMarker != nil {
 			retentionHandler.SetOnSpokeFilesRemoved(hubRemovalMarker)
 		}
@@ -4745,6 +4750,19 @@ func main() {
 		// are dropped.
 		if compactionManager != nil {
 			compactionManager.SetOnMeasurementCompacted(icebergScheduler.RequestReconcile)
+		}
+		// Row DELETE, retention, tiering moves, delete_after_sync and a partial
+		// database delete report the storage paths they changed (#1727). They
+		// are served only on the node that exports: on a cluster's primary
+		// writer, where those mostly run, the gate drops them and the timed
+		// passes cover them.
+		// Stored when the export starts (icebergStart below): a scheduler that
+		// never starts (no cold tier) would collect requested paths forever.
+		requestPaths := icebergScheduler.RequestReconcilePaths
+		startScheduler := icebergStart
+		icebergStart = func() {
+			startScheduler()
+			icebergPathsChanged.Store(&requestPaths)
 		}
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
 			icebergScheduler.Stop()
@@ -5446,6 +5464,7 @@ func main() {
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
+		tieringManager.SetOnPathsChanged(notifyIcebergPaths)
 		// Around every chunk of hot copies a migration releases, and when a
 		// replica records a pulled file's move to cold: a cold listing cached
 		// before the copy, or a hot glob cached before the release, would
@@ -6097,6 +6116,21 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	return db, true, nil
 }
 
+// icebergPathsChanged is the Iceberg scheduler's RequestReconcilePaths once
+// Iceberg export is set up (#1727). The paths that remove, move or rewrite
+// data files are wired before the scheduler exists, so they report through
+// notifyIcebergPaths, which does nothing while it is unset (Iceberg off).
+var icebergPathsChanged atomic.Pointer[func(keys []string)]
+
+// notifyIcebergPaths tells the Iceberg export which storage keys or prefixes
+// just changed, so the tables naming them are reconciled now rather than at
+// the next timed pass.
+func notifyIcebergPaths(keys []string) {
+	if fn := icebergPathsChanged.Load(); fn != nil {
+		(*fn)(keys)
+	}
+}
+
 // spokeLocalDeleter deletes a spoke's own copy of a synced file the hub proved
 // it holds (edge sync phase 3a, delete_after_sync). A file already gone is
 // success; a file whose size differs from the ledger's is kept; spoke tiering's
@@ -6136,7 +6170,40 @@ func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manag
 				log.Warn().Err(err).Str("path", path).Msg("delete_after_sync: deleted the local file but not its tier row")
 			}
 		}
+		spokeDeleted.add(path)
 		return nil
+	}
+}
+
+// spokeDeleted collects the paths delete_after_sync removed until its batch
+// ends (flushSpokeDeleted, from the AfterDeletes hooks): one Iceberg request
+// per batch, not per file, which would commit the table once per file.
+var spokeDeleted pathBatch
+
+type pathBatch struct {
+	mu    sync.Mutex
+	paths []string
+}
+
+func (b *pathBatch) add(p string) {
+	b.mu.Lock()
+	b.paths = append(b.paths, p)
+	b.mu.Unlock()
+}
+
+func (b *pathBatch) take() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.paths
+	b.paths = nil
+	return out
+}
+
+// flushSpokeDeleted reports a finished delete_after_sync batch to the
+// Iceberg export (#1727).
+func flushSpokeDeleted() {
+	if paths := spokeDeleted.take(); len(paths) > 0 {
+		notifyIcebergPaths(paths)
 	}
 }
 

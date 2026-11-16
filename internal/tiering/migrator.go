@@ -383,6 +383,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	migrated, failed := 0, 0
+	var moved []string // hot paths migrated, for the export (#1727)
 	var stop atomic.Bool
 	flippedCh := make(chan MigrationCandidate, len(candidates))
 	releaseErr := make(chan error, 1)
@@ -448,6 +449,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 			}
 			mu.Lock()
 			migrated++
+			moved = append(moved, c.Path)
 			mu.Unlock()
 			flippedCh <- c
 		}(candidate)
@@ -461,6 +463,9 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 	if err != nil {
 		failed++
 	}
+	// The hot copies are released by now: the export can name the cold ones
+	// (#1727).
+	m.manager.notifyPathsChanged(moved)
 	return migrated, failed, err
 }
 

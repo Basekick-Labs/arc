@@ -44,6 +44,9 @@ type RetentionHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// files were removed or rewritten: see SetOnFilesRemoved.
 	onFilesRemoved func()
+	// onPathsChanged, when set, is told the storage prefixes a run changed
+	// (SetOnPathsChanged).
+	onPathsChanged func(keys []string)
 	// onSpokeFilesRemoved marks edge-sync receipts removed before retention
 	// deletes the files (#1186); nil unless this node is an edge-sync hub.
 	onSpokeFilesRemoved func(ctx context.Context, paths []string) error
@@ -820,6 +823,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		totalSkipped += skipped
 		totalSkipped += discovery.unusable.counts[measurement]
 		if err != nil {
+			h.measurementChanged(false, filesDeleted, policy.Database, measurement) // partial progress
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
 			// and continuing would produce orphaned manifest entries with no retry path.
@@ -835,6 +839,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(ctx, cold, measurement, cutoffDate, false)
 		totalDeleted += coldRows
 		totalFilesDeleted += coldFiles
+		h.measurementChanged(false, filesDeleted+coldFiles, policy.Database, measurement)
 		if coldErr != nil {
 			if executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
@@ -1036,6 +1041,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
 		if err != nil {
+			h.measurementChanged(req.DryRun, filesDeleted, policy.Database, measurement) // partial progress
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
@@ -1050,6 +1056,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(c.Context(), cold, measurement, cutoffDate, req.DryRun)
 		totalDeleted += coldRows
 		totalFilesDeleted += coldFiles
+		h.measurementChanged(req.DryRun, filesDeleted+coldFiles, policy.Database, measurement)
 		if coldErr != nil {
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
@@ -1679,6 +1686,24 @@ func (h *RetentionHandler) SetOnSpokeFilesRemoved(fn func(ctx context.Context, p
 // answers with a retryable 503 (classifyNoFiles) until the cache is cleared.
 func (h *RetentionHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
+}
+
+// SetOnPathsChanged sets the function told which storage prefixes a retention
+// run changed (main.go: the Iceberg scheduler's RequestReconcilePaths, #1727).
+func (h *RetentionHandler) SetOnPathsChanged(fn func(keys []string)) {
+	h.onPathsChanged = fn
+}
+
+// measurementChanged reports a measurement whose files the run removed, right
+// after its own deletes rather than at the end of the run, which can be long
+// with serial object-store deletes. Reported as the measurement's directory:
+// the scheduler maps it onto the tables it knows (on a hub, a spoke's data is
+// "{spoke}/{db}/..."). Not for a dry run or a measurement nothing left.
+func (h *RetentionHandler) measurementChanged(dryRun bool, files int, database, measurement string) {
+	if dryRun || files <= 0 || h.onPathsChanged == nil || database == "" || measurement == "" {
+		return
+	}
+	h.onPathsChanged([]string{database + "/" + measurement + "/"})
 }
 
 // clearCachesAfterRun clears DuckDB's cache_httpfs cache (ClearHTTPCache) and,

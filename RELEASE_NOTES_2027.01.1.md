@@ -2,6 +2,28 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Iceberg tables catch up right after a row DELETE, retention or tiering on a single node ([#1727](https://github.com/Basekick-Labs/arc/issues/1727))
+
+The previous fix (#1722) made a finished compaction ask the Iceberg export to reconcile at once. Several other paths remove, move or rewrite data files and did not ask:
+
+- a row DELETE, rewrites and whole-file deletes alike (hot and cold tier);
+- the background drain of files earlier DELETEs replaced;
+- retention (hot and cold tier);
+- tiering moves from hot to cold;
+- `delete_after_sync` on an edge-sync spoke;
+- a database delete that stops part-way.
+
+After any of them, the table kept naming the old files until the next reconcile pass, up to `iceberg.reconcile_interval` (300 s by default), and external reads of the affected data failed with a missing file. In a local test at the default interval, a row DELETE and a retention run each made about 90% of reads fail for the 20 seconds watched; with this change, one read failed in each.
+
+- **What changed:** each of these paths now reports the storage paths it changed. The Iceberg export reconciles the measurements holding them right away, and drops its cached cold-tier listing first so a cold removal is seen.
+- **How paths map to tables:** only onto tables the export already has. On an edge-sync hub, a DELETE or a retention run on a spoke's data reaches that spoke's existing tables and never creates a new one.
+- **Single node.** A request is served only on the node that runs the export. In a cluster these paths mostly run on the primary writer, while the export runs on the node holding the compaction lease. There the request is dropped and the timed passes still converge, as before. Cluster coverage is tracked in [#1728](https://github.com/Basekick-Labs/arc/issues/1728).
+- **Database deletes:** only a database delete that stops part-way asks; a completed one drops the database's Iceberg tables itself.
+- **Not covered here:** tiering's crash-recovery orphan cleanup and cold re-syncs still wait for the timed pass.
+- **When it lands:** a request waits for any reconcile already in progress to finish; one measurement's reconcile is capped at 2 minutes.
+
+No new configuration keys.
+
 ## Fix: Iceberg tables stop naming a compaction's deleted files within seconds, not at the next reconcile pass ([#1722](https://github.com/Basekick-Labs/arc/issues/1722))
 
 With Iceberg export on, compaction deletes its source files as soon as its output is written, but the Iceberg table only dropped them at its next reconcile pass. For up to `iceberg.reconcile_interval` (300 s by default) after every compaction, an external engine reading the affected hour or day (Spark, Trino, DuckDB `iceberg_scan`, PyIceberg, OneLake) failed with a missing file. In a local test at the default interval, reading the table every 20 ms, every read from the compaction to the end of the 25-second watch failed (203 of 222).

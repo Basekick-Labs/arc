@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -92,6 +93,12 @@ type Scheduler struct {
 	// per-pass version claims assume one reconcile at a time.
 	reqMu     sync.Mutex
 	requested map[string]Measurement
+	// requestedPaths holds storage keys or directory prefixes another Arc
+	// path removed, moved or rewrote (RequestReconcilePaths, #1727). The loop
+	// maps them onto measurements the last pass listed: callers name data the
+	// way storage lays it out, which is not always how the export names
+	// measurements (an edge-sync spoke's "{spoke}/{db}" database, #634).
+	requestedPaths map[string]struct{}
 	// retrying holds the measurements with a later request already
 	// scheduled (requestAfter), so a burst does not start a timer each.
 	retrying map[string]bool
@@ -102,6 +109,9 @@ type Scheduler struct {
 	// lastBlocked is the last pass's measurements awaiting a namespace
 	// migration; a requested one is left to the pass. Loop goroutine only.
 	lastBlocked map[string]struct{}
+	// known is the measurements the last pass listed, the only ones a path
+	// request can reach. Loop goroutine only.
+	known []Measurement
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -199,6 +209,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		state:          make(map[string]measurementState),
 		busySince:      make(map[string]time.Time),
 		requested:      make(map[string]Measurement),
+		requestedPaths: make(map[string]struct{}),
 		retrying:       make(map[string]bool),
 		wake:           make(chan struct{}, 1),
 		lastReconciled: make(map[string]time.Time),
@@ -265,6 +276,123 @@ func (s *Scheduler) RequestReconcile(database, measurement string) {
 	}
 }
 
+// RequestReconcilePaths asks for the measurements holding the given storage
+// keys (a file such as "db/cpu/2026/11/16/14/f.parquet") or directory
+// prefixes ("db/", "db/cpu/") to be reconciled soon: a row DELETE, retention,
+// a tiering move or another Arc path just removed, moved or rewrote them
+// (#1727). Like RequestReconcile it never blocks and coalesces. The keys are
+// mapped onto the measurements the last pass listed, at segment boundaries,
+// on the loop goroutine; a key under no known measurement is dropped and the
+// timed passes cover it. A caller never names a measurement itself: storage
+// names an edge-sync spoke's data "{spoke}/{db}/{measurement}", and a request
+// for the wrong (database, measurement) split would export a new table over
+// the wrong prefix.
+func (s *Scheduler) RequestReconcilePaths(keys []string) {
+	if s == nil || len(keys) == 0 {
+		return
+	}
+	s.reqMu.Lock()
+	added := false
+	for _, k := range keys {
+		k = strings.TrimLeft(filepath.ToSlash(k), "/")
+		if k == "" {
+			continue
+		}
+		s.requestedPaths[k] = struct{}{}
+		added = true
+	}
+	s.reqMu.Unlock()
+	if !added {
+		return
+	}
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// takePathRequests empties the requested paths.
+func (s *Scheduler) takePathRequests() []string {
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	if len(s.requestedPaths) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s.requestedPaths))
+	for k := range s.requestedPaths {
+		out = append(out, k)
+	}
+	clear(s.requestedPaths)
+	return out
+}
+
+// measurementsFor maps storage keys onto the measurements the last pass
+// listed or that were reconciled since (state): a key inside a measurement's directory reaches that measurement
+// (the longest such, should two nest), and a directory key reaches every
+// measurement under it. Matching is at "/" boundaries, so "db/cpu2/..." is
+// not "db/cpu", nor "wh-other/" "wh". Loop goroutine only.
+func (s *Scheduler) measurementsFor(keys []string) []Measurement {
+	// The last pass's list, and the tables reconciled since (a compaction's
+	// request can create one between passes).
+	cands := make([]Measurement, 0, len(s.known)+len(s.state))
+	dirs := make([]string, 0, cap(cands))
+	inKnown := make(map[string]bool, len(s.known))
+	for _, m := range s.known {
+		inKnown[m.Database+"\x00"+m.Measurement] = true
+		cands = append(cands, m)
+	}
+	for k := range s.state {
+		if inKnown[k] {
+			continue
+		}
+		if db, meas, ok := strings.Cut(k, "\x00"); ok {
+			cands = append(cands, Measurement{Database: db, Measurement: meas})
+		}
+	}
+	if len(keys) == 0 || len(cands) == 0 {
+		return nil
+	}
+	for _, m := range cands {
+		dirs = append(dirs, m.Database+"/"+m.Measurement+"/")
+	}
+	seen := map[string]bool{}
+	var out []Measurement
+	add := func(m Measurement) {
+		k := m.Database + "\x00" + m.Measurement
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, m)
+		}
+	}
+	for _, key := range keys {
+		dir := strings.TrimSuffix(key, "/") + "/"
+		best, bestLen := Measurement{}, 0
+		for i, m := range cands {
+			mdir := dirs[i]
+			switch {
+			case strings.HasPrefix(key, mdir):
+				// The key is in this measurement's directory.
+				if len(mdir) > bestLen {
+					best, bestLen = m, len(mdir)
+				}
+			case strings.HasPrefix(mdir, dir):
+				// The key is a directory holding this measurement.
+				add(m)
+			}
+		}
+		if bestLen > 0 {
+			add(best)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Database != out[j].Database {
+			return out[i].Database < out[j].Database
+		}
+		return out[i].Measurement < out[j].Measurement
+	})
+	return out
+}
+
 // takeRequests empties the requested set.
 func (s *Scheduler) takeRequests() []Measurement {
 	s.reqMu.Lock()
@@ -295,11 +423,33 @@ func (s *Scheduler) takeRequests() []Measurement {
 // reconcile's own commit fence (canCommit) covers a lease lost meanwhile.
 func (s *Scheduler) serviceRequests(ctx context.Context) {
 	reqs := s.takeRequests()
-	if len(reqs) == 0 {
+	byPath := s.measurementsFor(s.takePathRequests())
+	if len(reqs) == 0 && len(byPath) == 0 {
 		return
 	}
 	if s.gate != nil && !s.gate.CanRun() {
 		return // another node exports; its own passes converge
+	}
+	// A path request follows a change Arc made to the files, the cold tier's
+	// included (cold retention, a cold DELETE, a tiering move): the cached
+	// cold listing must not hide it from this reconcile.
+	if ci, ok := s.source.(coldInvalidator); ok {
+		dbs := map[string]bool{}
+		for _, m := range byPath {
+			if !dbs[m.Database] {
+				dbs[m.Database] = true
+				ci.InvalidateCold(m.Database)
+			}
+		}
+	}
+	queued := make(map[string]bool, len(reqs))
+	for _, m := range reqs {
+		queued[m.Database+"\x00"+m.Measurement] = true
+	}
+	for _, m := range byPath {
+		if !queued[m.Database+"\x00"+m.Measurement] {
+			reqs = append(reqs, m)
+		}
 	}
 	for _, m := range reqs {
 		if ctx.Err() != nil {
@@ -324,7 +474,7 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 			event = s.logger.Warn().Err(err)
 		}
 		event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
-			Msg("Iceberg reconcile after compaction")
+			Msg("Iceberg reconcile on request (a compaction, DELETE, retention or tiering change)")
 		switch outcome {
 		case outcomeInProgress:
 			s.requestAfter(m, key, s.partialRetryInterval())
@@ -415,6 +565,9 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		return false
 	}
 	measurements, err := s.source.Measurements(ctx)
+	if err == nil {
+		s.known = measurements
+	}
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Iceberg reconcile: failed to enumerate measurements")
 		return false
