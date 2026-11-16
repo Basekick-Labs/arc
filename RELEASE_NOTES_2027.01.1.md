@@ -2,23 +2,28 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Fix: arcx serve answers a file removed mid-query the way the DuckDB path does ([#1357](https://github.com/Basekick-Labs/arc/issues/1357))
+## Fix: under arcx serve, a scan whose file is removed mid-query gets the retryable 503 ([#1357](https://github.com/Basekick-Labs/arc/issues/1357))
 
 Applies only to Arc built with the arcx engine and run with `ARC_ROUTER=serve`. Stock builds and the default `shadow` mode are unchanged.
 
-A scan that arcx serves reads its Parquet files as the result streams. If compaction, retention or a `DELETE` removed one of those files while the scan was still running, the client got arcx's raw error, which names the absolute storage path. The status depended on the format:
+A scan without `ORDER BY` that arcx serves reads its Parquet files as the result streams. If compaction, retention or a `DELETE` removed one of those files while the scan was still running, the client got arcx's raw error, which names the absolute storage path. The status depended on the format:
 
 - **msgpack:** `500`.
 - **JSON and Arrow:** a `200`. The result was already marked as cut off (`"truncated": true` in JSON, the `Arc-Stream-Truncated` trailer in Arrow IPC).
 
 Now:
 
-- **msgpack** answers `503` with `Retry-After: 1` and the message the DuckDB path gives when a file it planned is gone: "data read by this query was removed while it ran (retention, compaction or a delete); retry the query". The retry lists the files again.
+- **msgpack** answers `503` with `Retry-After: 1` and the message DuckDB gives when a file it planned is already gone by the time it starts reading: "data read by this query was removed while it ran (retention, compaction or a delete); retry the query". The retry lists the files again.
 - **JSON and Arrow** cannot change the status once the result has started, so they stay a `200` marked as cut off. The reason (`truncation_reason` in JSON, the trailer in Arrow) is now that message, not the path.
-- The server log has a warning with the removed file's path and arcx's own error. These cases are now logged as warnings instead of errors.
-- **Aggregate shapes** fail before any result is sent. They already fell back to DuckDB, which answers the `503`. That fallback is now logged as a warning instead of `engine ERROR`.
+- The server logs warnings with the removed file's path and arcx's own error. These cases are now logged as warnings instead of errors.
+- **Aggregate shapes and `ORDER BY` scans** do all their reading before any result is sent. As before, a removed file there sends the query back to DuckDB, which lists the files again and answers it; that fallback is now logged as a warning instead of `engine ERROR`.
 
-**How Arc decides:** a stream error counts as a removed file only when its text names one of the query's planned files and that file no longer exists. Any other arcx error keeps its earlier answer. If the msgpack drain hits the query deadline, the answer is now `504 Query timed out`, as on the DuckDB path, instead of a `500`.
+**How Arc decides:** a stream error counts as a removed file only when its text names one of the query's planned files and that file no longer exists. The planned path is matched both as configured and with symlinks resolved. Any other arcx error keeps its earlier answer.
+
+**Other changes to the arcx msgpack drain:**
+
+- If the drain hits the query deadline, the answer is now `504 Query timed out`, as on the DuckDB path, instead of a `500`.
+- Every failed drain now counts in the query-error metric, which the `500` case did not before.
 
 No new configuration keys.
 

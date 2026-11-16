@@ -1188,17 +1188,19 @@ func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, plan engin
 // logged once here with the path and the engine's own text: the error the
 // api writes to the client and to its own log line carries neither.
 func (h Deps) vanishChecked(r array.RecordReader, d Decision, plan enginePlan) array.RecordReader {
+	shape, logger := d.Shape, h.Logger // the closure lives as long as the stream
 	return wrapVanishCheck(r, plan.basePath, plan.entries, func(path string, cause error) {
-		h.Logger.Warn().Err(cause).Str("shape", d.Shape).Str("path", path).
+		logger.Warn().Err(cause).Str("shape", shape).Str("path", path).
 			Msg("arcx serve: a file the query was reading was removed while it ran (compaction, retention or a delete); the client is told to retry")
 	})
 }
 
 // logRemovedBeforeRead handles an engine error from QueryStream that a removed
-// plan file explains (aggregate shapes execute inside QueryStream, so this is
-// where their removed file shows up). It logs at Warn rather than as an
-// engine ERROR and reports true; the caller falls back to DuckDB, which plans
-// afresh and answers that condition itself.
+// plan file explains (aggregate shapes and ORDER BY scans execute inside
+// QueryStream, so this is where their removed file shows up). It logs at Warn
+// rather than as an engine ERROR and reports true; the caller falls back to
+// DuckDB, which lists the files again and answers the query (or its own 503 if
+// it races another removal).
 func (h Deps) logRemovedBeforeRead(d Decision, plan enginePlan, err error) bool {
 	path, ok := vanishedPlanFile(err, plan.basePath, plan.entries)
 	if !ok {

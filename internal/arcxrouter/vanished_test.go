@@ -133,6 +133,25 @@ func TestVanishCheckReader(t *testing.T) {
 		}
 	})
 
+	t.Run("a storage root behind a symlink matches arcx's canonical path", func(t *testing.T) {
+		real := planDir(t, "a.parquet") // b removed
+		link := filepath.Join(t.TempDir(), "arc")
+		if err := os.Symlink(real, link); err != nil {
+			t.Skip("symlinks unavailable:", err)
+		}
+		canon, err := filepath.EvalSymlinks(real)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// arcx canonicalises before opening, so its error names the target.
+		inner := arcxOpenErr(canon + "/db/m/b.parquet")
+		var fv *FileVanishedError
+		r := wrapVanishCheck(newErroringReader(t, inner), link, entries, nil)
+		if err := r.Err(); !errors.As(err, &fv) || fv.Path != link+"/db/m/b.parquet" {
+			t.Fatalf("Err = %v, want *FileVanishedError for the planned path", err)
+		}
+	})
+
 	t.Run("a dangling symlink is still there: an error, not a retry", func(t *testing.T) {
 		base := planDir(t)
 		link := base + "/db/m/a.parquet"
@@ -148,36 +167,66 @@ func TestVanishCheckReader(t *testing.T) {
 }
 
 // The router files carry the arcx_engine tag and default CI never compiles
-// them, so the wiring is pinned at source level: both serve entries must hand
-// out the checked reader, and a QueryStream failure must be offered to the
-// removed-file check before it is logged as an engine ERROR.
+// them, so the wiring is pinned at source level: runServe must hand
+// ServeStream the checked reader, RunArrow must return it (r reassigned from
+// vanishChecked), and both must offer a QueryStream failure to the
+// removed-file check before logging an engine ERROR.
 func TestServePathsCheckForRemovedFiles(t *testing.T) {
 	file, err := parser.ParseFile(gotoken.NewFileSet(), "router.go", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls := map[string]map[string]bool{}
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
+	isCallTo := func(e ast.Expr, name string) bool {
+		call, ok := e.(*ast.CallExpr)
 		if !ok {
-			continue
+			return false
 		}
-		seen := map[string]bool{}
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			if call, ok := n.(*ast.CallExpr); ok {
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-					seen[sel.Sel.Name] = true
-				}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == name
+	}
+	funcs := map[string]*ast.FuncDecl{}
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			funcs[fn.Name.Name] = fn
+		}
+	}
+	found := func(fn string, match func(ast.Node) bool) bool {
+		hit := false
+		ast.Inspect(funcs[fn].Body, func(n ast.Node) bool {
+			if n != nil && match(n) {
+				hit = true
 			}
-			return true
+			return !hit
 		})
-		calls[fn.Name.Name] = seen
+		return hit
 	}
 	for _, fn := range []string{"runServe", "RunArrow"} {
-		for _, want := range []string{"vanishChecked", "logRemovedBeforeRead"} {
-			if !calls[fn][want] {
-				t.Errorf("%s does not call %s", fn, want)
-			}
+		if funcs[fn] == nil {
+			t.Fatalf("%s not found", fn)
 		}
+		if !found(fn, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				return isCallTo(call, "logRemovedBeforeRead")
+			}
+			return false
+		}) {
+			t.Errorf("%s does not offer a QueryStream error to logRemovedBeforeRead", fn)
+		}
+	}
+	if !found("runServe", func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		return ok && isCallTo(call, "ServeStream") && len(call.Args) == 3 && isCallTo(call.Args[1], "vanishChecked")
+	}) {
+		t.Error("runServe does not pass ServeStream the vanishChecked reader")
+	}
+	if !found("RunArrow", func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return false
+		}
+		id, ok := as.Lhs[0].(*ast.Ident)
+		return ok && id.Name == "r" && isCallTo(as.Rhs[0], "vanishChecked")
+	}) {
+		t.Error("RunArrow does not return the vanishChecked reader (r = h.vanishChecked(...))")
 	}
 }

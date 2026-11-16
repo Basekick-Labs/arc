@@ -118,9 +118,9 @@ func QueryStream(sql string, ctx Context) (array.RecordReader, error) {
 	// The C ctx + SQL are freed as soon as this returns: borrow_ctx copies every field
 	// to owned Rust Strings, and export_stream exports an owned ('static) reader, so
 	// nothing the stream reads later points into the C ctx or CString. That reader is
-	// lazy for a scan: it opens and decodes files as the stream is read, so a file
-	// removed after this returns fails a later Next (#1357). Aggregate shapes do their
-	// work before returning, so theirs fails here.
+	// lazy for a scan without ORDER BY: it opens and decodes files as the stream is
+	// read, so a file removed after this returns fails a later Next (#1357). Aggregate
+	// shapes and ORDER BY scans do their work before returning, so theirs fails here.
 	defer freeCtx()
 
 	var cStream C.struct_ArrowArrayStream

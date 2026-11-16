@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -45,6 +46,13 @@ func (e *FileVanishedError) VanishedPath() string { return e.Path }
 // format is not a contract, and on a busy measurement some planned file is
 // often gone by the time a long scan fails for an unrelated reason.
 //
+// arcx canonicalises every path it is given before opening it, so with a
+// storage root reached through a symlink (/srv/arc -> /mnt/disk1/arc) its
+// error names the resolved path. Both spellings are matched; the base is
+// resolved only here, on the error path. (A root configured in a different
+// letter case on a case-insensitive volume is not matched, and keeps the
+// engine's error.)
+//
 // Lstat, not Stat: a dangling symlink in the plan is still there, so its
 // error stays an error instead of a 503 every retry would repeat.
 func vanishedPlanFile(err error, basePath string, entries []string) (string, bool) {
@@ -52,9 +60,13 @@ func vanishedPlanFile(err error, basePath string, entries []string) (string, boo
 		return "", false
 	}
 	text := err.Error()
+	canonBase := basePath
+	if resolved, rerr := filepath.EvalSymlinks(basePath); rerr == nil {
+		canonBase = resolved
+	}
 	for _, e := range entries {
 		p := basePath + "/" + e
-		if !strings.Contains(text, p) {
+		if !strings.Contains(text, p) && (canonBase == basePath || !strings.Contains(text, canonBase+"/"+e)) {
 			continue
 		}
 		if _, serr := os.Lstat(p); errors.Is(serr, fs.ErrNotExist) {
