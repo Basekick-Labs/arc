@@ -2,6 +2,17 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: the arcx build's API tests run to completion ([#1016](https://github.com/Basekick-Labs/arc/issues/1016))
+
+Only affects Arc built with the arcx engine (`-tags=duckdb_arrow,arcx_engine`); no change for servers, which always have a DuckDB engine.
+
+`go test -tags=duckdb_arrow,arcx_engine ./internal/api/` stopped with a nil-pointer panic in the tests that build a query handler without DuckDB: the arcx hook asked that missing engine for its directory allowlist. The governance row-cap test crashed the run, and an RBAC end-to-end test passed on a hidden `500` because its recover middleware caught the same panic. Now:
+
+- the arcx hooks leave a handler without DuckDB to its normal path, as the stock build does;
+- `AllowedDirectories` on a nil engine returns no list instead of panicking. arcx denies every path when given no list, so that answer can never widen what arcx can read.
+
+No new configuration keys.
+
 ## Fix: under arcx serve, a scan whose file is removed mid-query gets the retryable 503 ([#1357](https://github.com/Basekick-Labs/arc/issues/1357))
 
 Applies only to Arc built with the arcx engine and run with `ARC_ROUTER=serve`. Stock builds and the default `shadow` mode are unchanged.
