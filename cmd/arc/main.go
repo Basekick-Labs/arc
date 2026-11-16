@@ -4768,7 +4768,7 @@ func main() {
 			// lost (local unlinks, shared-bucket manifest deletes by reason,
 			// rewrites landing), #1728.
 			if clusterCoordinator != nil {
-				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePaths, icebergScheduler.RequestReconcilePathsLater)
+				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater)
 			}
 		}
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {

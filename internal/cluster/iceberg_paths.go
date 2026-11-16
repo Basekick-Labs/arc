@@ -23,6 +23,8 @@ import (
 //   - Shared bucket: a manifest delete, by reason, now or after a delay
 //     (the writer deletes the object after the manifest).
 //   - Tiering: the replicated tier-event drain's unlinked/missing events.
+//   - A database delete never asks, on any topology: it drops the database's
+//     tables itself, and a reconcile racing that drop could recreate one.
 //
 // Each reaches the scheduler's RequestReconcilePaths through icebergPaths,
 // which main.go wires; unset (Iceberg off) it costs nothing, and on a node
@@ -131,3 +133,8 @@ func (c *Coordinator) icebergSharedDelete(p, reason string) {
 		c.icebergLater([]string{p})
 	}
 }
+
+// databaseDeleteReason is the manifest reason of a database delete (the api
+// package's databaseDeleteManifestReason; the packages do not import each
+// other).
+const databaseDeleteReason = "database:delete"

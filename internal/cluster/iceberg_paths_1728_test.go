@@ -63,8 +63,10 @@ func TestLocalUnlinkReportsToTheExport(t *testing.T) {
 		}
 		r.write(r.rw, r.rwBody)
 		r.c.recordPulledFileInTiering(r.rw, int64(len(r.rwBody)))
-		if now, _ := rec.got(); now != stHour {
-			t.Fatalf("rewrite landed: reported %q, want %q", now, stHour)
+		// Asked after a delay: rewrites arrive one by one, and the original
+		// may still be in its grace before the unlink.
+		if now, late := rec.got(); now != "" || late != stHour {
+			t.Fatalf("rewrite landed: now %q later %q, want later %q", now, late, stHour)
 		}
 	})
 	t.Run("rewrite original after its rewrite (deferred)", func(t *testing.T) {
@@ -75,8 +77,22 @@ func TestLocalUnlinkReportsToTheExport(t *testing.T) {
 		r.write(r.rw, r.rwBody)
 		r.c.recordPulledFileInTiering(r.rw, int64(len(r.rwBody)))
 		r.c.unlinkBatch([]deleteRequest{{path: r.old, reason: deleteRewriteReason}}, nil)
-		if now, _ := rec.got(); now != stHour+","+stHour {
-			t.Fatalf("reported %q, want the directory at the pull and at the unlink", now)
+		if now, late := rec.got(); now != stHour || late != stHour {
+			t.Fatalf("now %q later %q, want the unlink now and the pull later", now, late)
+		}
+	})
+	t.Run("database delete", func(t *testing.T) {
+		// The drop removes the database's tables itself; a reconcile racing
+		// it could recreate one.
+		r := newRewriteUnlinkRig(t)
+		rec := &pathRecorder{}
+		rec.wire(r.c)
+		r.c.unlinkBatch([]deleteRequest{{path: r.old, reason: databaseDeleteReason}}, nil)
+		if r.exists(r.old) {
+			t.Fatal("not unlinked")
+		}
+		if now, late := rec.got(); now != "" || late != "" {
+			t.Fatalf("a database delete asked: now %q later %q", now, late)
 		}
 	})
 	t.Run("nothing wired", func(t *testing.T) {

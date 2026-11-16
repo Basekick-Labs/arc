@@ -957,7 +957,10 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 			// path-derived pair with the row's own.
 			k := tierEventKey{info.Database, info.Measurement}
 			touched[k] = struct{}{}
-			if ev.kind != tierEventPulled {
+			// Not a pulled file, and not a database delete (that drop
+			// removes the database's tables itself; a reconcile racing it
+			// could recreate one).
+			if ev.kind != tierEventPulled && ev.reason != "database:delete" {
 				*moved = append(*moved, ev.path)
 			}
 			if prev, ok := before[k]; ev.kind != tierEventPulled || !ok || !prev.ok || !prev.tiers[TierHot] {

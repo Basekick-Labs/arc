@@ -48,3 +48,18 @@ func TestTierDrainReportsUnlinkedNotPulled(t *testing.T) {
 	defer mu.Unlock()
 	t.Fatalf("reported %v, want the unlinked path once", got)
 }
+
+// A database delete's unlink is not reported: the drop removes the
+// database's tables itself, and a reconcile racing it could recreate one.
+func TestTierDrainSkipsDatabaseDeletes(t *testing.T) {
+	const p = "db/cpu/2026/05/01/10/cpu_pulled.parquet"
+	m, _ := withHotRow(t, newMockBackend("s3"), true, p)
+	var got []string
+	m.SetOnPathsChanged(func(keys []string) { got = append(got, keys...) })
+	m.RecordUnlinkedFile(p, "database:delete", 9)
+	waitTierEvents(t, m, 2)
+	time.Sleep(50 * time.Millisecond)
+	if len(got) != 0 {
+		t.Fatalf("a database delete was reported: %v", got)
+	}
+}

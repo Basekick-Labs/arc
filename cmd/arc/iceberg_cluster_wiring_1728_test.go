@@ -14,7 +14,7 @@ func TestIcebergIsToldAboutClusterRemovals(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePaths, icebergScheduler.RequestReconcilePathsLater)",
+		"clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater)",
 		"reconciler.SetOnPathsDeleted(notifyIcebergPaths)",
 	} {
 		if !strings.Contains(string(src), want) {

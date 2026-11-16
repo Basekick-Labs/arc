@@ -299,20 +299,15 @@ func (s *Scheduler) RequestReconcilePaths(keys []string) {
 	if s == nil || len(keys) == 0 {
 		return
 	}
-	s.reqMu.Lock()
-	added := false
-	for _, k := range keys {
-		k = strings.TrimLeft(filepath.ToSlash(k), "/")
-		if k == "" {
-			continue
-		}
-		s.requestedPaths[k] = struct{}{}
-		added = true
-	}
-	s.reqMu.Unlock()
-	if !added {
+	norm := normalizeKeys(keys)
+	if len(norm) == 0 {
 		return
 	}
+	s.reqMu.Lock()
+	for _, k := range norm {
+		s.requestedPaths[k] = struct{}{}
+	}
+	s.reqMu.Unlock()
 	select {
 	case s.wake <- struct{}{}:
 	default:
@@ -321,14 +316,18 @@ func (s *Scheduler) RequestReconcilePaths(keys []string) {
 
 // laterDelays are when RequestReconcilePathsLater asks: a writer deletes a
 // shared bucket's objects after their manifest delete, one at a time, so the
-// first ask can still list some. A reconcile that sees files vanish under it
-// is busy and asks again on its own; these only make sure one runs after the
-// deletes. A variable so tests can shorten it.
+// first ask can still list some. Each key waits at least each delay. A
+// reconcile that sees files vanish under it is busy and asks again on its
+// own; a deletion slower than the last delay leaves the object in the table
+// until the timed pass. A variable so tests can shorten it.
 var laterDelays = [3]time.Duration{2 * time.Second, 10 * time.Second, 30 * time.Second}
 
-// laterBucket collects keys for one delay. Guarded by reqMu.
+// laterBucket collects keys for one delay. Guarded by reqMu. Keys that
+// arrive while its timer runs wait in next for a timer of their own, so
+// every key waits at least the bucket's delay.
 type laterBucket struct {
 	keys  map[string]struct{}
+	next  map[string]struct{}
 	armed bool
 }
 
@@ -341,24 +340,74 @@ func (s *Scheduler) RequestReconcilePathsLater(keys []string) {
 	if s == nil || len(keys) == 0 {
 		return
 	}
+	norm := normalizeKeys(keys)
+	if len(norm) == 0 {
+		return
+	}
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
 	for i := range s.later {
 		b := &s.later[i]
+		if b.armed {
+			if b.next == nil {
+				b.next = make(map[string]struct{})
+			}
+			for _, k := range norm {
+				b.next[k] = struct{}{}
+			}
+			continue
+		}
 		if b.keys == nil {
 			b.keys = make(map[string]struct{})
 		}
-		for _, k := range keys {
-			if k = strings.TrimLeft(filepath.ToSlash(k), "/"); k != "" {
-				b.keys[k] = struct{}{}
+		for _, k := range norm {
+			b.keys[k] = struct{}{}
+		}
+		b.armed = true
+		time.AfterFunc(laterDelays[i], func() { s.fireLater(i) })
+	}
+}
+
+// RequestReconcilePathsHot is RequestReconcilePaths for a change that left
+// the hot tier only (a local unlink, a rewrite's original): served at once,
+// without dropping the cold listing, which a hot removal does not change and
+// whose re-list would cost every cold object of the database (#1728).
+func (s *Scheduler) RequestReconcilePathsHot(keys []string) {
+	norm := normalizeKeys(keys)
+	if s == nil || len(norm) == 0 {
+		return
+	}
+	s.reqMu.Lock()
+	for _, k := range norm {
+		s.requestedHot[k] = struct{}{}
+	}
+	s.reqMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// normalizeKeys turns storage keys into the form measurementsFor matches at
+// least cost: slash-separated, no leading "/", a file collapsed to its
+// directory (a batch of files in one hour is one key), deduplicated.
+func normalizeKeys(keys []string) []string {
+	seen := make(map[string]bool, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		k = strings.TrimLeft(filepath.ToSlash(k), "/")
+		if strings.HasSuffix(k, ".parquet") {
+			if i := strings.LastIndexByte(k, '/'); i >= 0 {
+				k = k[:i+1]
 			}
 		}
-		if !b.armed && len(b.keys) > 0 {
-			b.armed = true
-			i := i
-			time.AfterFunc(laterDelays[i], func() { s.fireLater(i) })
+		if k == "" || seen[k] {
+			continue
 		}
+		seen[k] = true
+		out = append(out, k)
 	}
+	return out
 }
 
 // fireLater moves a delay bucket's keys into the hot-only requests.
@@ -370,6 +419,12 @@ func (s *Scheduler) fireLater(i int) {
 	}
 	clear(b.keys)
 	b.armed = false
+	if len(b.next) > 0 {
+		// Keys that came in while this timer ran get their full delay.
+		b.keys, b.next = b.next, nil
+		b.armed = true
+		time.AfterFunc(laterDelays[i], func() { s.fireLater(i) })
+	}
 	s.reqMu.Unlock()
 	select {
 	case s.wake <- struct{}{}:
