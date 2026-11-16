@@ -6,7 +6,7 @@
 
 #1727 made these paths ask the Iceberg export to reconcile, on a single node. In a cluster they run on the primary writer, while the export runs on the node holding the compaction lease, so the writer's requests were dropped. The table named the removed files until the exporter's next timed pass, up to `iceberg.reconcile_interval` (300 s by default). Now the exporter node acts on what it sees itself.
 
-- **Local-storage cluster:** each node keeps its own copies. When the exporter removes its copy of a file the cluster deleted, the export reconciles that measurement right away. In a local test (writer plus compactor/exporter, 300 s interval), a row DELETE on the writer went from 152 of 169 failed reads of the exporter's table to RESULT_LOCAL_DELETE.
+- **Local-storage cluster:** each node keeps its own copies. When the exporter removes its copy of a file the cluster deleted, the export reconciles that measurement right away. In a local test (writer plus compactor/exporter, 300 s interval, the exporter's table read every ~0.1 s for 25 s), a row DELETE on the writer went from 152 of 169 failed reads to 1, and a retention run from 155 of 173 to none.
   - **DELETE rewrites:** the original is reported only once the rewrite that replaces it is on the exporter node. Reporting it earlier could publish a table that briefly lacks the rows the DELETE kept.
   - **Rewrite arriving:** when that rewrite lands, the export is asked two seconds later. Several rewrites then land in one snapshot rather than one each.
 - **Shared bucket:** the exporter learns of each delete from the cluster manifest, which the writer updates before it removes the object.
