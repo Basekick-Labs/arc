@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: arcx serve answers a file removed mid-query the way the DuckDB path does ([#1357](https://github.com/Basekick-Labs/arc/issues/1357))
+
+Applies only to Arc built with the arcx engine and run with `ARC_ROUTER=serve`. Stock builds and the default `shadow` mode are unchanged.
+
+A scan that arcx serves reads its Parquet files as the result streams. If compaction, retention or a `DELETE` removed one of those files while the scan was still running, the client got arcx's raw error, which names the absolute storage path. The status depended on the format:
+
+- **msgpack:** `500`.
+- **JSON and Arrow:** a `200`. The result was already marked as cut off (`"truncated": true` in JSON, the `Arc-Stream-Truncated` trailer in Arrow IPC).
+
+Now:
+
+- **msgpack** answers `503` with `Retry-After: 1` and the message the DuckDB path gives when a file it planned is gone: "data read by this query was removed while it ran (retention, compaction or a delete); retry the query". The retry lists the files again.
+- **JSON and Arrow** cannot change the status once the result has started, so they stay a `200` marked as cut off. The reason (`truncation_reason` in JSON, the trailer in Arrow) is now that message, not the path.
+- The server log has a warning with the removed file's path and arcx's own error. These cases are now logged as warnings instead of errors.
+- **Aggregate shapes** fail before any result is sent. They already fell back to DuckDB, which answers the `503`. That fallback is now logged as a warning instead of `engine ERROR`.
+
+**How Arc decides:** a stream error counts as a removed file only when its text names one of the query's planned files and that file no longer exists. Any other arcx error keeps its earlier answer. If the msgpack drain hits the query deadline, the answer is now `504 Query timed out`, as on the DuckDB path, instead of a `500`.
+
+No new configuration keys.
+
 ## Fix: the bootstrap admin token is trimmed of surrounding whitespace ([#1713](https://github.com/Basekick-Labs/arc/issues/1713))
 
 `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`) was stored exactly as given. A value with surrounding whitespace, typically the trailing newline of a file made with `openssl rand ... > token` and loaded into a Kubernetes Secret with `--from-file`, became a token no `Authorization` or `x-api-key` header can carry: every request got `401`, while the first-boot banner showed a value that looked right.
