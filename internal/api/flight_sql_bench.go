@@ -5,10 +5,12 @@ package api
 // Benchmark arm for scripts/flightbench, compiled only with the flightbench
 // tag. Never part of a release build: it serves a statement straight from
 // DuckDB, skipping the bridge and with it RBAC, governance, the query
-// registry, forwarding, arcx and the audit log. Its only purpose is to
-// measure what the bridge costs: the difference between this arm and an
-// ordinary Flight SQL query is the most any change to the bridge can save.
-// The gRPC listener's own authentication still applies.
+// registry, forwarding, arcx, the audit log, request logging and the query
+// timeout. The gRPC listener still checks that the token is valid, but not
+// what it may read: in a bench build any valid token reads every database
+// through this arm. Its only purpose is to bound what the bridge costs:
+// flight minus this arm is the most a change to the bridge could save, and
+// more than one that keeps the bridge's checks can (see scripts/flightbench).
 
 import (
 	"context"
