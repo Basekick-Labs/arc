@@ -60,6 +60,12 @@ func (h *QueryHandler) tryArcxRouter(
 	if mode == arcxrouter.ModeOff {
 		return false
 	}
+	// arcx takes its sandbox allowlist and its shadow oracle from DuckDB. Every
+	// server wires one; a handler built without it (tests) keeps the caller's
+	// own path, as the stock build does (#1016).
+	if h.db == nil {
+		return false
+	}
 	deps := arcxrouter.Deps{
 		Storage:      h.storage,
 		Pruner:       h.pruner,
@@ -112,6 +118,12 @@ func (h *QueryHandler) tryArcxRouterArrow(
 ) (handled bool) {
 	mode := arcxMode()
 	if mode == arcxrouter.ModeOff {
+		return false
+	}
+	// arcx takes its sandbox allowlist and its shadow oracle from DuckDB. Every
+	// server wires one; a handler built without it (tests) keeps the caller's
+	// own path, as the stock build does (#1016).
+	if h.db == nil {
 		return false
 	}
 	deps := arcxrouter.Deps{
