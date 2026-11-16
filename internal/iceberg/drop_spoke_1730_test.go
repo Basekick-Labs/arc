@@ -201,6 +201,7 @@ func TestDropSpokeLeavesSiblingSpokes(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	r := newDropRig(t, root, localFileURI(root), nil)
+	r.exp.SetForgetDroppedRows(true)
 	r.export(t, "edge/x", "cpu")
 	r.export(t, "edge.x/y", "mem")
 	r.export(t, "edge1/z", "disk")
@@ -212,6 +213,9 @@ func TestDropSpokeLeavesSiblingSpokes(t *testing.T) {
 	rows := r.rows(t)
 	if strings.Join(rows, ",") != "arc_edge.x|cpu,arc_edge1.z|disk" {
 		t.Fatalf("after dropping edge.x: %v", rows)
+	}
+	if ok, _ := r.backend.Exists(ctx, droppedMarkerKey("arc_edge.x", "cpu")); ok {
+		t.Fatal("dropping edge.x marked spoke edge's table x.cpu as dropped")
 	}
 	if !dirExists(filepath.Join(root, "arc_edge.x.db")) || dirExists(filepath.Join(root, edgeX+".db")) {
 		t.Fatalf("dropping edge.x: edge's dir kept=%v, edge.x's dir removed=%v",
@@ -299,10 +303,13 @@ func TestDropSpokeWithALegacyDottedNamespace(t *testing.T) {
 			if left, _ := r.backend.List(ctx, legacy+".db/"); len(left) != 0 {
 				t.Fatalf("legacy warehouse objects left: %v", left)
 			}
-			for _, nsk := range []string{encoded, legacy} {
-				if ok, err := r.backend.Exists(ctx, droppedMarkerKey(nsk, measurement)); err != nil || !ok {
-					t.Fatalf("drop marker under %q = (%v, %v), want written", nsk, ok, err)
-				}
+			// Under the key readers build (tableIdent), not the legacy one,
+			// which nothing reads or clears.
+			if ok, err := r.backend.Exists(ctx, droppedMarkerKey(encoded, measurement)); err != nil || !ok {
+				t.Fatalf("drop marker = (%v, %v), want written", ok, err)
+			}
+			if ok, _ := r.backend.Exists(ctx, droppedMarkerKey(legacy, measurement)); ok {
+				t.Fatal("a marker under the legacy key, which no reader looks up, was written")
 			}
 		})
 	}
@@ -322,5 +329,62 @@ func TestDropSpokeDropsAnEmptySubNamespace(t *testing.T) {
 	}
 	if ok, _ := r.exp.catalog.CheckNamespaceExists(ctx, icetable.Identifier{"arc_spoke01", "mydb"}); ok {
 		t.Fatal("the empty spoke namespace survived")
+	}
+}
+
+// Markers come before any delete: a drop whose marker write fails deletes
+// nothing (no catalog row, no metadata), and its re-run converges. Moving the
+// spoke markers after the deletes fails this (#1730 review).
+func TestDropSpokeWritesMarkersBeforeDeleting(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	r := newDropRig(t, root, localFileURI(root), nil)
+	r.exp.SetForgetDroppedRows(true)
+	r.export(t, "spoke01/mydb", "cpu")
+	meta := filepath.Join(root, "arc_spoke01.mydb.db", "cpu", "metadata")
+	blocker := filepath.Join(root, droppedMarkerRoot)
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.exp.DropDatabase(ctx, "spoke01"); err == nil {
+		t.Fatal("DropDatabase succeeded although its marker write failed")
+	}
+	if !dirExists(meta) || len(r.rows(t)) != 1 {
+		t.Fatalf("the failed drop deleted something: metadata kept=%v rows=%v", dirExists(meta), r.rows(t))
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.exp.DropDatabase(ctx, "spoke01"); err != nil {
+		t.Fatalf("re-run: %v", err)
+	}
+	if dirExists(meta) || len(r.rows(t)) != 0 {
+		t.Fatal("the re-run did not converge")
+	}
+}
+
+// With the warehouse at the storage root, a spoke whose ID is shaped like a
+// warehouse directory ("arc_s.x.db", or "arc_d.db" for database d) keeps its
+// data when s, or d, is dropped: only Iceberg metadata keys are deleted.
+func TestDropNeverDeletesDataUnderAWarehouseShapedName(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	r := newDropRig(t, root, localFileURI(root), nil)
+	data := []string{
+		filepath.Join(root, "arc_s.x.db", "db", "cpu", "2023", "11", "14", "22", "a.parquet"),
+		filepath.Join(root, "arc_d.db", "db", "cpu", "2023", "11", "14", "22", "b.parquet"),
+	}
+	for _, f := range data {
+		writeArcStyleParquet(t, f, 1_700_000_000_000_000, 2)
+	}
+	for _, db := range []string{"s", "d"} {
+		if err := r.exp.DropDatabase(ctx, db); err != nil {
+			t.Fatalf("drop %s: %v", db, err)
+		}
+	}
+	for _, f := range data {
+		if !dirExists(f) {
+			t.Fatalf("a drop deleted another spoke's data: %s", f)
+		}
 	}
 }

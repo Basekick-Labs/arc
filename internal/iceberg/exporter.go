@@ -2065,6 +2065,10 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 			if keys, err = e.backend.List(ctx, relDir+"/"); err != nil {
 				return fmt.Errorf("list warehouse metadata: %w", err)
 			}
+			// Only Iceberg metadata: with the warehouse at the storage root,
+			// a spoke ID can equal this directory's name, and its data must
+			// never go with the catalog (#1730 review).
+			keys = warehouseMetadataKeys(relDir, keys)
 		}
 	}
 
@@ -2094,16 +2098,11 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		stamp := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
 		for _, sub := range subs {
 			for table := range sub.tables {
-				for nsk := range sub.markerKeys {
-					if err := e.backend.Write(ctx, droppedMarkerKey(nsk, table), stamp); err != nil {
-						return fmt.Errorf("write the Iceberg drop marker for %s.%s: %w", nsk, table, err)
-					}
+				if err := e.backend.Write(ctx, droppedMarkerKey(sub.markerKey, table), stamp); err != nil {
+					return fmt.Errorf("write the Iceberg drop marker for %s.%s: %w", sub.markerKey, table, err)
 				}
 			}
 		}
-	}
-	if e.forgetDroppedRows && e.backend != nil {
-		stamp := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
 		tables := map[string]struct{}{}
 		for _, ident := range localTables {
 			tables[ident[len(ident)-1]] = struct{}{}
@@ -2247,7 +2246,7 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 				}
 				continue
 			}
-			if err := e.deleteWarehouseDir(ctx, dir, dkeys); err != nil && firstErr == nil {
+			if err := e.deleteWarehouseDir(ctx, dir, warehouseMetadataKeys(dir, dkeys)); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

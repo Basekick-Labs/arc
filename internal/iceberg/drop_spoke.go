@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 
 	icecatalog "github.com/apache/iceberg-go/catalog"
@@ -33,6 +34,16 @@ import (
 //   - migrated: the catalog row moved to the current key, the warehouse
 //     directory stayed at the plain name (the migration moves no files).
 //
+// Drop markers go under the current key only: every reader (recoverDeadRow,
+// dropInProgress, clearDropMarker) builds it from tableIdent, and an
+// unmigrated row is never loaded under it.
+//
+// With the warehouse at the storage root, the listing also returns the data
+// directories of every spoke and database, and a spoke ID may be shaped like
+// a warehouse directory name. Only Iceberg metadata keys,
+// <dir>/<table>/metadata/<file> and never a Parquet file, are claimed or
+// deleted, so a drop can never take another spoke's data.
+//
 // Matching is on the whole namespace, never a prefix of a component: spoke
 // "edge.x" must not claim spoke "edge"'s database "x", whose plain key is the
 // same string "<prefix>_edge.x". NamespaceDirOwnedBy deliberately over-claims
@@ -44,7 +55,7 @@ type spokeSub struct {
 	catalogTables []icetable.Identifier // their tables
 	dirs          map[string]bool       // warehouse namespace directories (storage keys, no trailing "/")
 	tables        map[string]bool       // table names, catalog and warehouse, for drop markers
-	markerKeys    map[string]bool       // namespace keys a reader may look its markers up by
+	markerKey     string                // the namespace key readers look markers up by
 }
 
 // spokeSubNamespaces finds the databases of spoke database (a hub's top-level
@@ -58,10 +69,8 @@ func (e *Exporter) spokeSubNamespaces(ctx context.Context, database string) (map
 	sub := func(db string) *spokeSub {
 		s := subs[db]
 		if s == nil {
-			s = &spokeSub{dirs: map[string]bool{}, tables: map[string]bool{}, markerKeys: map[string]bool{}}
-			current := catalogNamespaceKey(icetable.Identifier{prefix, db})
-			s.markerKeys[current] = true
-			s.markerKeys[prefix+"."+db] = true // an unmigrated row's key
+			s = &spokeSub{dirs: map[string]bool{}, tables: map[string]bool{},
+				markerKey: catalogNamespaceKey(icetable.Identifier{prefix, db})}
 			subs[db] = s
 		}
 		return s
@@ -69,7 +78,7 @@ func (e *Exporter) spokeSubNamespaces(ctx context.Context, database string) (map
 
 	// This node's catalog.
 	namespaces, err := e.catalog.ListNamespaces(ctx, nil)
-	if err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) {
+	if err != nil {
 		return nil, fmt.Errorf("list Iceberg namespaces for drop: %w", err)
 	}
 	for _, ns := range namespaces {
@@ -122,21 +131,54 @@ func (e *Exporter) spokeSubNamespaces(ctx context.Context, database string) (map
 		if rel != "" {
 			dir = rel + "/" + name
 		}
-		s := sub(db)
-		s.dirs[dir] = true
 		keys, err := e.backend.List(ctx, dir+"/")
 		if err != nil {
 			return nil, fmt.Errorf("list warehouse metadata: %w", err)
 		}
+		tables := map[string]bool{}
 		for _, k := range keys {
-			if rest, ok := strings.CutPrefix(k, dir+"/"); ok {
-				if table, _, ok := strings.Cut(rest, "/"); ok && table != "" {
-					s.tables[table] = true
-				}
+			if table, ok := warehouseMetadataTable(dir, k); ok {
+				tables[table] = true
 			}
+		}
+		if len(tables) == 0 {
+			continue // nothing of a table here: not claimed
+		}
+		s := sub(db)
+		s.dirs[dir] = true
+		for table := range tables {
+			s.tables[table] = true
 		}
 	}
 	return subs, nil
+}
+
+// warehouseMetadataTable reports the table of an Iceberg metadata key in a
+// warehouse namespace directory: exactly <dir>/<table>/metadata/<file>, the
+// file not a Parquet file. Anything else is not the exporter's to delete.
+func warehouseMetadataTable(dir, key string) (string, bool) {
+	rest, ok := strings.CutPrefix(key, dir+"/")
+	if !ok {
+		return "", false
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) != 3 || parts[0] == "" || parts[1] != "metadata" || parts[2] == "" ||
+		strings.EqualFold(path.Ext(parts[2]), ".parquet") {
+		return "", false
+	}
+	return parts[0], true
+}
+
+// warehouseMetadataKeys keeps the keys of dir that warehouseMetadataTable
+// accepts: what DropDatabase may delete from a warehouse namespace directory.
+func warehouseMetadataKeys(dir string, keys []string) []string {
+	out := keys[:0:0]
+	for _, k := range keys {
+		if _, ok := warehouseMetadataTable(dir, k); ok {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // spokeDatabaseOf reports the spoke database a catalog namespace holds, if it

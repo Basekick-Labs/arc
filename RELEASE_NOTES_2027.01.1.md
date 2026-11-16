@@ -11,7 +11,7 @@ On a hub, `DELETE /api/v1/databases/{spoke}` removed the spoke's data but left i
   - **The warehouse:** its directories are listed too, so a shared-bucket node that never exported the spoke also drops them.
   - **Spoke IDs with a dot:** tables written before #1129 are found too, whether or not the namespace migration has run.
 - **What is never touched:** another spoke's tables, even when a dotted spoke ID makes the names look alike (`edge` and `edge.x`).
-- **Unchanged:** the colocated layout already handled spokes. A warehouse outside the storage root can only have its catalog rows dropped, as before.
+- **Limits:** the colocated layout already handled spokes. With a warehouse outside the storage root, Arc cannot reach the metadata files; it now drops the spoke databases' catalog rows and leaves the files. Only Iceberg metadata files are deleted, never another spoke's data, even if its name looks like a warehouse directory.
 
 No new configuration keys.
 
