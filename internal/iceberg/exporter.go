@@ -2015,9 +2015,11 @@ func isAlreadyExists(err error) bool {
 // deletes the warehouse objects even when this node never exported the
 // database, which is the usual case for the primary writer (#1611).
 //
-// Spoke-namespace pseudo-databases contain a path separator and are refused:
-// their namespace naming does not follow this mapping, and their lifecycle is
-// owned by edge-sync.
+// On an edge-sync hub, database may be a whole spoke (DELETE /databases/{spoke}):
+// its databases are the namespaces {<prefix>_<spoke>, <db>}, which are dropped
+// with it, catalog rows, markers and warehouse directories alike (#1730; see
+// spokeSubNamespaces). A single spoke database ("{spoke}/{db}") is refused: the
+// API never sends one, and its namespace naming does not follow this mapping.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
@@ -2078,9 +2080,28 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
+	// A whole spoke's databases (#1730): found before anything is deleted, so
+	// their markers go out with the rest.
+	subs, err := e.spokeSubNamespaces(ctx, database)
+	if err != nil {
+		return err
+	}
+
 	// Drop markers first (dropped.go): a drop that fails after this point,
 	// re-run, lists what is left and writes them again; one that wrote none
 	// deleted nothing yet.
+	if e.forgetDroppedRows && e.backend != nil {
+		stamp := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
+		for _, sub := range subs {
+			for table := range sub.tables {
+				for nsk := range sub.markerKeys {
+					if err := e.backend.Write(ctx, droppedMarkerKey(nsk, table), stamp); err != nil {
+						return fmt.Errorf("write the Iceberg drop marker for %s.%s: %w", nsk, table, err)
+					}
+				}
+			}
+		}
+	}
 	if e.forgetDroppedRows && e.backend != nil {
 		stamp := []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
 		tables := map[string]struct{}{}
@@ -2152,6 +2173,22 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		_ = e.catalog.DropNamespace(ctx, ns2)
 	}
 
+	// A whole spoke's databases in the warehouse layout (#1730): their
+	// catalog rows, then their warehouse directories below.
+	for _, sub := range subs {
+		for _, ident := range sub.catalogTables {
+			if err := e.catalog.DropTable(ctx, ident); err != nil && !errors.Is(err, icecatalog.ErrNoSuchTable) &&
+				!errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
+				firstErr = fmt.Errorf("drop table %v: %w", ident, err)
+			}
+		}
+		for _, ns2 := range sub.namespaces {
+			if err := e.catalog.DropNamespace(ctx, ns2); err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
+				firstErr = fmt.Errorf("drop namespace %v: %w", ns2, err)
+			}
+		}
+	}
+
 	// List again: a reconcile pass that loaded a table before the catalog
 	// drop can still have committed into its directory since the first
 	// listing, and that residue would keep the database listed.
@@ -2195,26 +2232,51 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	// Remove the namespace directory's objects via the backend so local and
 	// object-store warehouses behave alike.
 	if relDir != "" {
-		dirs := map[string]bool{relDir: true}
-		for _, key := range keys {
-			if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
+		if err := e.deleteWarehouseDir(ctx, relDir, keys); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for _, sub := range subs {
+		for dir := range sub.dirs {
+			// Listed again now: a reconcile that loaded the table before the
+			// catalog drop may have committed into it since.
+			dkeys, err := e.backend.List(ctx, dir+"/")
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("list warehouse metadata: %w", err)
+				}
+				continue
 			}
-			for d := path.Dir(key); len(d) > len(relDir); d = path.Dir(d) {
-				dirs[d] = true
+			if err := e.deleteWarehouseDir(ctx, dir, dkeys); err != nil && firstErr == nil {
+				firstErr = err
 			}
 		}
-		// RemoveDirectory is non-recursive, so sweep the now-empty
-		// directory tree deepest-first (object stores no-op here).
-		if remover, ok := e.backend.(storage.DirectoryRemover); ok {
-			ordered := make([]string, 0, len(dirs))
-			for d := range dirs {
-				ordered = append(ordered, d)
-			}
-			sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
-			for _, d := range ordered {
-				_ = remover.RemoveDirectory(ctx, d)
-			}
+	}
+	return firstErr
+}
+
+// deleteWarehouseDir deletes a namespace directory's objects, then sweeps the
+// emptied directory tree deepest-first (RemoveDirectory is non-recursive;
+// object stores no-op). The first delete error is returned; the rest go on.
+func (e *Exporter) deleteWarehouseDir(ctx context.Context, relDir string, keys []string) error {
+	var firstErr error
+	dirs := map[string]bool{relDir: true}
+	for _, key := range keys {
+		if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
+		}
+		for d := path.Dir(key); len(d) > len(relDir); d = path.Dir(d) {
+			dirs[d] = true
+		}
+	}
+	if remover, ok := e.backend.(storage.DirectoryRemover); ok {
+		ordered := make([]string, 0, len(dirs))
+		for d := range dirs {
+			ordered = append(ordered, d)
+		}
+		sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+		for _, d := range ordered {
+			_ = remover.RemoveDirectory(ctx, d)
 		}
 	}
 	return firstErr
