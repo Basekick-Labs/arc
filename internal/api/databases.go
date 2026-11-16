@@ -28,6 +28,9 @@ type DatabasesHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// a database's files were removed: see SetOnFilesRemoved.
 	onFilesRemoved func()
+	// onPathsChanged, when set, is told the storage prefixes a database delete
+	// changed (SetOnPathsChanged).
+	onPathsChanged func(keys []string)
 	// onSpokeNamespaceRemoved marks an edge-sync spoke's receipts removed
 	// before its namespace is deleted (#1186); nil unless this node is an
 	// edge-sync hub. See SetOnSpokeNamespaceRemoved.
@@ -1116,6 +1119,13 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	if h.onFilesRemoved != nil {
 		h.onFilesRemoved()
 	}
+	// A delete that stops short of dropping the catalog leaves the export's
+	// tables naming what it removed; the scheduler maps the database's
+	// directory onto them (#1727). After a full drop the tables are gone and
+	// the prefix maps onto nothing.
+	if h.onPathsChanged != nil {
+		h.onPathsChanged([]string{name + "/"})
+	}
 
 	if len(deleteErrors) > 0 {
 		h.logger.Error().
@@ -1907,4 +1917,11 @@ func reclaimStagedPartials(ctx context.Context, backend storage.Backend, prefix 
 // files: the query caches hold pruned partition lists naming them.
 func (h *DatabasesHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
+}
+
+// SetOnPathsChanged sets the function told which storage prefixes a database
+// delete changed (main.go: the Iceberg scheduler's RequestReconcilePaths,
+// #1727).
+func (h *DatabasesHandler) SetOnPathsChanged(fn func(keys []string)) {
+	h.onPathsChanged = fn
 }

@@ -170,6 +170,9 @@ type DeleteHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// files were removed or rewritten: see SetOnFilesRemoved.
 	onFilesRemoved func()
+	// onPathsChanged, when set, is told the storage prefixes a DELETE changed
+	// (SetOnPathsChanged).
+	onPathsChanged func(keys []string)
 	// receiptRemoved and receiptRewritten mark edge-sync receipts before a
 	// DELETE changes a spoke file (#1666); nil unless this node is a hub.
 	// See SetReceiptMarkers.
@@ -602,7 +605,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			// hold the only rows that matched) is still removed.
 			h.rewriteMu.Lock()
 			if h.removeLeftovers(ctx, req.Database, req.Measurement) > 0 {
-				h.filesRemoved()
+				h.filesRemovedIn(req.Database, req.Measurement)
 			}
 			h.rewriteMu.Unlock()
 		}
@@ -787,7 +790,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				// corresponding manifest record.
 				if errors.Is(err, errManifestFailure) {
 					h.db.ClearHTTPCache()
-					h.filesRemoved()
+					h.filesRemovedIn(req.Database, req.Measurement)
 					freeOSMemoryThrottled()
 					return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 						Success:         false,
@@ -828,7 +831,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 		incomplete := func(why string) error {
 			h.db.ClearHTTPCache()
-			h.filesRemoved()
+			h.filesRemovedIn(req.Database, req.Measurement)
 			freeOSMemoryThrottled()
 			return respondDeleteUnavailable(c, DeleteResponse{
 				Error:            "Delete incomplete: " + why + "; the rows of the other files are deleted; retry to finish",
@@ -861,7 +864,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				failedPath = bindErr.path
 			}
 			h.db.ClearHTTPCache()
-			h.filesRemoved()
+			h.filesRemovedIn(req.Database, req.Measurement)
 			freeOSMemoryThrottled()
 			return c.Status(fiber.StatusMultiStatus).JSON(DeleteResponse{
 				Success:          false,
@@ -888,7 +891,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// Clear cache_httpfs and release memory back to the OS. DuckDB's Parquet metadata
 	// cache cannot be emptied (#1372); entries for removed files leave under memory_limit.
 	h.db.ClearHTTPCache()
-	h.filesRemoved()
+	h.filesRemovedIn(req.Database, req.Measurement)
 	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -1999,8 +2002,22 @@ func (h *DeleteHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
 }
 
-func (h *DeleteHandler) filesRemoved() {
+// SetOnPathsChanged sets the function told which storage prefixes a DELETE
+// changed (main.go: the Iceberg scheduler's RequestReconcilePaths, #1727).
+func (h *DeleteHandler) SetOnPathsChanged(fn func(keys []string)) {
+	h.onPathsChanged = fn
+}
+
+// filesRemovedIn reports a DELETE on database/measurement that removed or
+// rewrote files: the caches are cleared, and the measurement's directory is
+// reported as a storage prefix, not as names. On a hub a spoke's data lives
+// under "{spoke}/{db}/", which the export names differently from the
+// request; the scheduler maps the prefix onto the tables it knows.
+func (h *DeleteHandler) filesRemovedIn(database, measurement string) {
 	if h.onFilesRemoved != nil {
 		h.onFilesRemoved()
+	}
+	if h.onPathsChanged != nil && database != "" && measurement != "" {
+		h.onPathsChanged([]string{database + "/" + measurement + "/"})
 	}
 }
