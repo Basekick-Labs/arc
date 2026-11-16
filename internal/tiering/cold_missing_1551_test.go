@@ -291,3 +291,19 @@ func TestColdMissingObjects_DropTakenOverIsBracketed(t *testing.T) {
 		t.Fatalf("removals during the delete %v, after %d: want [1] and 0", during, m.coldRemovals.Load())
 	}
 }
+
+// A chunk's cold-copy drops are reported once, not per file (#1728: each
+// report is a Raft notice in a cluster).
+func TestDropTakenOverReportsTheChunkOnce(t *testing.T) {
+	m, hot, cold, cleanup := setupIntegrationTest(t, true)
+	t.Cleanup(cleanup)
+	m.manifest = &ownedManifest{fakeManifest: &fakeManifest{hot: hot, entries: map[string]int64{}}, ownedFrom: 1}
+	cold.seedRaw(missA, []byte("x"))
+	cold.seedRaw(missB, []byte("x"))
+	var calls [][]string
+	m.SetOnColdRemoved(func(k []string) { calls = append(calls, k) })
+	m.migrator.dropTakenOver(context.Background(), []MigrationCandidate{candidateFor(missA), candidateFor(missB)})
+	if len(calls) != 1 || len(calls[0]) != 2 {
+		t.Fatalf("reports %v, want one naming both", calls)
+	}
+}

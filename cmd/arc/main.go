@@ -5477,20 +5477,11 @@ func main() {
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
 		tieringManager.SetOnPathsChanged(notifyIcebergPaths)
 		// In a cluster, cold removals on this node reach the Iceberg exporter
-		// (another node) as a Raft notice (#1728). Off the caller's path: a
-		// failed notice costs only the export's timed pass.
+		// (another node) as a Raft notice (#1728), gathered into one per
+		// burst and proposed off the caller's path. A failed notice costs
+		// the export iceberg.cold_rescan_interval, as before.
 		if clusterCoordinator != nil {
-			tieringManager.SetOnColdRemoved(func(keys []string) {
-				keys = append([]string(nil), keys...)
-				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					defer cancel()
-					if err := clusterCoordinator.ProposeIcebergColdRemoved(ctx, keys); err != nil {
-						log.Warn().Err(err).Int("objects", len(keys)).
-							Msg("Could not tell the Iceberg exporter about removed cold objects; its timed pass drops them")
-					}
-				}()
-			})
+			tieringManager.SetOnColdRemoved(clusterCoordinator.NoteIcebergColdRemoved)
 		}
 		// Around every chunk of hot copies a migration releases, and when a
 		// replica records a pulled file's move to cold: a cold listing cached

@@ -460,6 +460,7 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 	// retention checks at the moment it acts (#1350 review H1). A migration
 	// may have copied the object since the listing; its row must stay. Then
 	// pointed back at a hot copy that still exists, or retired.
+	var reverted []string
 	for _, p := range c.missingRows {
 		if ctx.Err() != nil {
 			break
@@ -475,6 +476,8 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 		case hotSize >= 0:
 			if err := h.coldTier.RevertColdRowToHot(context.WithoutCancel(ctx), p); err != nil {
 				h.logger.Warn().Err(err).Str("file", p).Msg("Could not point a cold row whose object is gone back at its hot copy")
+			} else {
+				reverted = append(reverted, p)
 			}
 		default:
 			retire = append(retire, p)
@@ -487,10 +490,11 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 				Msg("Failed to retire cold tier rows; the next DELETE or retention run retires them")
 		}
 	}
-	// The deleted objects and the retired rows' (already gone): a cached
-	// cold listing, here or on a cluster's Iceberg exporter, can still name
-	// either (#1728).
-	if gone := append(append([]string(nil), c.deleted...), retiredMissing(retire, c.deleted)...); len(gone) > 0 {
+	// Every cold object now gone: deleted, already missing (retired), or
+	// missing under a row pointed back at hot. A cached cold listing, here
+	// or on a cluster's Iceberg exporter, can still name any of them (#1728).
+	// retire holds the deleted ones too.
+	if gone := append(append([]string(nil), retire...), reverted...); len(gone) > 0 {
 		h.coldTier.NotifyColdFilesRemoved(gone)
 	}
 }
@@ -578,19 +582,3 @@ func (c *coldPass) applyCold(resp *DeleteResponse, dryRun bool) bool {
 }
 
 var _ deleteColdTier = (*tiering.Manager)(nil)
-
-// retiredMissing is retire without the keys in deleted: the rows retired
-// because their object was already gone.
-func retiredMissing(retire, deleted []string) []string {
-	skip := make(map[string]bool, len(deleted))
-	for _, p := range deleted {
-		skip[p] = true
-	}
-	var out []string
-	for _, p := range retire {
-		if !skip[p] {
-			out = append(out, p)
-		}
-	}
-	return out
-}

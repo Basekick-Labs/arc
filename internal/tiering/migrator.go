@@ -239,6 +239,8 @@ func (m *Migrator) FindCandidatesFiltered(ctx context.Context, fromTier, toTier 
 // cold copy goes and the hot copy is the finisher's to delete.
 func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate) []MigrationCandidate {
 	kept := files[:0:0]
+	var removed []string
+	defer func() { m.manager.reportColdRemoved(removed) }() // once for the chunk
 	for _, c := range files {
 		if !m.manager.heldByCompaction(c.Path) {
 			kept = append(kept, c)
@@ -251,7 +253,7 @@ func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate
 			if err := dst.Delete(ctx, c.Path); err != nil && !storage.IsNotFound(err) {
 				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not remove the cold copy of a file a compaction took over")
 			} else {
-				m.manager.reportColdRemoved([]string{c.Path})
+				removed = append(removed, c.Path)
 			}
 		}
 		if err := m.manager.metadata.UpdateTier(ctx, c.Path, c.CurrentTier); err != nil {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
@@ -27,8 +28,8 @@ import (
 //   - Shared bucket: a manifest delete, by reason, now or after a delay
 //     (the writer deletes the object after the manifest).
 //   - Tiering: the replicated tier-event drain's unlinked/missing events.
-//   - Cold tier: the primary writer proposes a Raft notice after it removed
-//     cold objects (ProposeIcebergColdRemoved); every node hands the
+//   - Cold tier: a writer proposes a Raft notice after it removed cold
+//     objects (NoteIcebergColdRemoved); every node hands the measurement
 //     directories to its export, which drops its cached cold listing first.
 //   - A database delete never asks, on any topology: a reconcile racing the
 //     drop could recreate a table. (The drop runs on the writer and drops the
@@ -46,6 +47,11 @@ type icebergNotifier struct {
 	cold  atomic.Pointer[func(keys []string)] // drops the cold listing first
 
 	blockersLogged atomic.Bool
+
+	// Cold-removal keys waiting for the next notice (NoteIcebergColdRemoved).
+	coldMu      sync.Mutex
+	coldPending map[string]bool
+	coldArmed   bool
 
 	mu       sync.Mutex
 	unlinked []string
@@ -84,14 +90,18 @@ func (c *Coordinator) onIcebergNotice(keys []string) {
 
 // measurementDirOf cuts a cold object key to its measurement directory: the
 // export maps per measurement and drops cold listings per database, so the
-// hour directories would only multiply the notice's keys. A partitioned key
-// ends in {year}/{month}/{day}/{hour}/{file} (on a hub, under
-// "{spoke}/{db}/{m}/"); anything shorter keeps its own directory.
+// day or hour directories would only multiply the notice's keys. A
+// partitioned key is {db}/{m}/{yyyy}/{mm}/... (hourly and daily files alike;
+// on a hub "{spoke}/{db}/{m}/..."): cut before the first year/month pair
+// after the database and measurement. A key without one keeps its own
+// directory.
 func measurementDirOf(key string) string {
 	key = strings.TrimLeft(key, "/")
 	segs := strings.Split(key, "/")
-	if len(segs) >= 7 {
-		return strings.Join(segs[:len(segs)-5], "/") + "/"
+	for i := 2; i+2 < len(segs); i++ {
+		if isDigits(segs[i], 4) && isDigits(segs[i+1], 2) {
+			return strings.Join(segs[:i], "/") + "/"
+		}
 	}
 	if d := path.Dir(key); d != "." {
 		return d + "/"
@@ -99,11 +109,76 @@ func measurementDirOf(key string) string {
 	return ""
 }
 
+func isDigits(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// coldNoticeDelay gathers cold removals into one notice: the migrator reports
+// per file, and a retention run per run. A variable so tests can shorten it.
+var coldNoticeDelay = time.Second
+
+// coldNoticeTimeout bounds one notice's proposals.
+const coldNoticeTimeout = 10 * time.Second
+
+// NoteIcebergColdRemoved queues cold objects this node removed for the next
+// notice, proposed coldNoticeDelay after the first: one Raft entry for a
+// burst, never one per file. Never blocks or fails the caller; a failed
+// notice is logged, and the export then sees the removal when its cached
+// cold listing expires (iceberg.cold_rescan_interval).
+func (c *Coordinator) NoteIcebergColdRemoved(paths []string) {
+	if c == nil || c.raftNode == nil {
+		return
+	}
+	n := &c.iceberg
+	n.coldMu.Lock()
+	defer n.coldMu.Unlock()
+	if n.coldPending == nil {
+		n.coldPending = make(map[string]bool)
+	}
+	for _, p := range paths {
+		if k := measurementDirOf(p); k != "" {
+			n.coldPending[k] = true
+		}
+	}
+	if !n.coldArmed && len(n.coldPending) > 0 {
+		n.coldArmed = true
+		time.AfterFunc(coldNoticeDelay, c.flushColdNotice)
+	}
+}
+
+func (c *Coordinator) flushColdNotice() {
+	n := &c.iceberg
+	n.coldMu.Lock()
+	keys := make([]string, 0, len(n.coldPending))
+	for k := range n.coldPending {
+		keys = append(keys, k)
+	}
+	clear(n.coldPending)
+	n.coldArmed = false
+	n.coldMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), coldNoticeTimeout)
+	defer cancel()
+	if err := c.ProposeIcebergColdRemoved(ctx, keys); err != nil {
+		c.logger.Warn().Err(err).Int("measurements", len(keys)).
+			Msg("Could not tell the Iceberg exporter about removed cold objects; it sees them when its cached cold listing expires (iceberg.cold_rescan_interval)")
+	}
+}
+
 // ProposeIcebergColdRemoved tells every node's Iceberg export that these cold
-// objects are gone (#1728). Called on the primary writer after the deletes,
-// from a goroutine: errors are returned for the caller to log, never to fail
-// the removal. Does nothing without Raft, and until every node and Raft
-// server advertises CapabilityIcebergNotice.
+// objects are gone (#1728). Proposed on a writer after the deletes, off the
+// removal's path (flushColdNotice): errors are for the caller to log, never
+// to fail the removal. Does nothing without Raft, and until every node and
+// Raft server advertises CapabilityIcebergNotice. A writer cannot tell
+// whether any node exports, so a cluster without Iceberg still gets one
+// small entry per burst.
 func (c *Coordinator) ProposeIcebergColdRemoved(ctx context.Context, paths []string) error {
 	if c == nil || c.raftNode == nil || len(paths) == 0 {
 		return nil
@@ -113,9 +188,12 @@ func (c *Coordinator) ProposeIcebergColdRemoved(ctx context.Context, paths []str
 		return nil
 	}
 	if _, blockers := capabilityCandidates(fsm.GetAllNodes(), c.raftNode.ConfigurationServerIDs, raft.CapabilityIcebergNotice); len(blockers) > 0 {
-		if c.iceberg.blockersLogged.CompareAndSwap(false, true) {
+		// "raft configuration unavailable" is a transient blocker, not an
+		// older build: not worth the once-only log.
+		if !(len(blockers) == 1 && blockers[0] == "raft configuration unavailable") &&
+			c.iceberg.blockersLogged.CompareAndSwap(false, true) {
 			c.logger.Info().Strs("nodes", blockers).
-				Msg("Iceberg cold-removal notices are off until every node runs a build that applies them; the export catches cold removals at its timed pass meanwhile")
+				Msg("Iceberg cold-removal notices are off until every node runs a build that applies them; meanwhile the export sees cold removals when its cached cold listing expires (iceberg.cold_rescan_interval)")
 		}
 		return nil
 	}

@@ -201,6 +201,12 @@ func TestColdRetentionRetiresRowsOfMissingObjectsWithoutAborting(t *testing.T) {
 	if res.ColdFilesSkipped != 0 {
 		t.Errorf("cold_files_skipped = %d, want 0: a missing object is cleaned up, not skipped", res.ColdFilesSkipped)
 	}
+	// The missing object is reported with the deleted one (#1728).
+	got := slices.Clone(r.tier.notifiedPaths)
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"testdb/aaa/2020/01/01/00/gone.parquet", "testdb/bbb/2020/01/01/00/expired.parquet"}) {
+		t.Errorf("notified %v, want both", got)
+	}
 }
 
 // A stale cold row over a live hot copy points back at the hot file instead of
@@ -219,6 +225,9 @@ func TestColdRetentionRevertsAStaleRowOverAHotCopy(t *testing.T) {
 	}
 	if !slices.Equal(r.tier.reverted, []string{key}) || slices.Contains(r.tier.retired, key) {
 		t.Errorf("reverted = %v, retired = %v; want the row reverted to hot, not retired", r.tier.reverted, r.tier.retired)
+	}
+	if !slices.Equal(r.tier.notifiedPaths, []string{key}) {
+		t.Errorf("notified %v, want the reverted key: its cold object is gone (#1728)", r.tier.notifiedPaths)
 	}
 }
 

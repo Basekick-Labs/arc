@@ -16,8 +16,8 @@
 - **Database deletes never ask, on any topology:** a database delete drops its own tables, and a reconcile racing that drop could recreate one.
 - **Tiering, any cluster:** when the exporter's tier record moves a file out of its hot tier, the export is asked and then reads the cold copy. Files replicated in from other nodes (every ingest batch) do not ask.
 - **Reconciliation sweep:** when the sweep deletes orphan objects the export may have published, it asks the export to reconcile.
-- **Cold tier, any cluster:** when the primary writer removes cold-tier objects, it tells every node through a small Raft notice naming the measurements. This covers retention, a cold DELETE, and the migrator dropping a cold copy. The exporter then drops its cached cold listing for those databases and reconciles them. Before this, its table named the removed cold objects for up to `iceberg.cold_rescan_interval` (3600 s by default) plus a timed pass.
-  - **Rolling upgrades:** the notice carries no cluster state. It is only sent once every node runs a build that understands it; until then the timed pass covers it, as before.
+- **Cold tier, any cluster:** when a writer removes cold-tier objects, it tells every node through a small Raft notice naming the measurements. This covers retention, a cold DELETE, and the migrator dropping a cold copy. Removals within a second share one notice. The exporter then drops its cached cold listing for those databases and reconciles them. Before this, its table named the removed cold objects for up to `iceberg.cold_rescan_interval` (3600 s by default) plus a timed pass.
+  - **Rolling upgrades:** the notice carries no cluster state. It is only sent once every node runs a build that understands it. Until then the export sees cold removals when its cached cold listing expires, as before.
   - **Export moving between nodes:** a node that becomes the exporter again first drops the cold listings it cached during its earlier turn.
 
 No new configuration keys.

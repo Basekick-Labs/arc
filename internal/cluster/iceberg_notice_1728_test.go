@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,14 @@ func TestMeasurementDirOf(t *testing.T) {
 		"/db/cpu/2026/11/16/14/a.parquet":      "db/cpu/",
 		"db/cpu/a.parquet":                     "db/cpu/",
 		"a.parquet":                            "",
+		// Daily files, the common cold shape: one key per measurement.
+		"db/cpu/2026/11/16/cpu_daily.parquet":       "db/cpu/",
+		"spoke/db/cpu/2026/11/16/cpu_daily.parquet": "spoke/db/cpu/",
+		// A measurement named like a year is not cut.
+		"db/2026/2026/11/16/14/a.parquet": "db/2026/",
+		// Already a measurement directory.
+		"db/cpu/":       "db/cpu/",
+		"spoke/db/cpu/": "spoke/db/cpu/",
 	} {
 		if got := measurementDirOf(in); got != want {
 			t.Errorf("measurementDirOf(%q) = %q, want %q", in, got, want)
@@ -52,6 +61,31 @@ func TestColdRemovalNoticeReachesTheExport(t *testing.T) {
 	waitFSM(t, func() bool { return rec.gotCold() == "db/cpu/,db/mem/" })
 	if now, late := rec.got(); now != "" || late != "" {
 		t.Fatalf("a cold notice went to the hot callbacks: now %q later %q", now, late)
+	}
+}
+
+// A burst of removals is one notice, proposed after the delay.
+func TestColdRemovalsShareOneNotice(t *testing.T) {
+	old := coldNoticeDelay
+	coldNoticeDelay = 150 * time.Millisecond
+	t.Cleanup(func() { coldNoticeDelay = old })
+	c, rec := noticeRig(t, []string{raft.CapabilityIcebergNotice})
+	var mu sync.Mutex
+	applied := 0
+	c.raftNode.FSM().SetIcebergPathsCallback(func(k []string) { mu.Lock(); applied++; mu.Unlock(); c.onIcebergNotice(k) })
+	c.NoteIcebergColdRemoved([]string{"db/cpu/2026/11/16/14/a.parquet"})
+	time.Sleep(50 * time.Millisecond) // inside the delay
+	if rec.gotCold() != "" {
+		t.Fatal("proposed before the delay")
+	}
+	c.NoteIcebergColdRemoved([]string{"db/cpu/2026/11/16/15/b.parquet", "db/mem/2026/11/16/cpu_daily.parquet"})
+	waitFSM(t, func() bool { return rec.gotCold() != "" })
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	n := applied
+	mu.Unlock()
+	if got := rec.gotCold(); got != "db/cpu/,db/mem/" || n != 1 {
+		t.Fatalf("notices %d, keys %q; want one notice naming both measurements", n, got)
 	}
 }
 
@@ -77,6 +111,11 @@ func TestForwardApply_IcebergNotice(t *testing.T) {
 	}
 	if ack := forwardOnce(t, c, "reader-1", cmd); ack.Status == "ok" {
 		t.Fatalf("accepted from a reader: %+v", ack)
+	}
+	// Refused at the forward, before the log.
+	bad, _ := json.Marshal(raft.IcebergPathsChangedPayload{Keys: []string{"../etc/"}})
+	if ack := forwardOnce(t, c, "writer-2", &raft.Command{Type: raft.CommandIcebergPathsChanged, Payload: bad}); ack.Status == "ok" {
+		t.Fatalf("an invalid notice was accepted: %+v", ack)
 	}
 }
 

@@ -9,8 +9,9 @@ import (
 
 // Iceberg path notices (#1728).
 //
-// A cluster's primary writer removes cold-tier objects (retention, a cold
-// DELETE, the migrator dropping a cold copy). The Iceberg export runs on
+// A cluster's writer removes cold-tier objects (retention and a cold DELETE
+// on the primary writer; the migrator dropping a cold copy on any writer
+// that runs tiering). The Iceberg export runs on
 // another node, lists the cold tier itself and caches that listing, and
 // nothing else tells it: tier rows are node-local. The writer therefore
 // proposes CommandIcebergPathsChanged after the objects are gone, naming

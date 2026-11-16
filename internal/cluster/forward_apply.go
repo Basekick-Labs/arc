@@ -716,11 +716,20 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandColdMarkSeed ||
 		cmd.Type == clusterraft.CommandColdMarkReset
 	isColdMarkAck := cmd.Type == clusterraft.CommandColdMarkAck || cmd.Type == clusterraft.CommandColdMarkAlive
-	// An Iceberg cold-removal notice (#1728): proposed by the primary writer
-	// after it removed cold objects; it need not be the leader in
-	// local-storage mode. No state; the worst a forged one does is ask an
-	// export to reconcile measurements it knows. Ingest roles only.
+	// An Iceberg cold-removal notice (#1728): proposed by a writer after it
+	// removed cold objects (any writer running tiering; it need not be the
+	// leader). No state; the worst a forged one does is ask an export to
+	// reconcile measurements it knows. Ingest roles only, and validated here
+	// so an invalid one never reaches the log.
 	isIcebergNotice := cmd.Type == clusterraft.CommandIcebergPathsChanged
+	if isIcebergNotice {
+		var p clusterraft.IcebergPathsChangedPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil || clusterraft.ValidateIcebergPathsChanged(p) != nil {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: invalid Iceberg notice")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "invalid iceberg notice")
+			return
+		}
+	}
 	if isColdMarkAck {
 		// Ack and Alive have the same node_id field.
 		var p clusterraft.ColdMarkAckPayload
@@ -750,7 +759,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Str("role", string(peerNode.Role)).
-			Msg("ForwardApply rejected: node role not authorized for manifest mutations")
+			Msg("ForwardApply rejected: node role not authorized for this command")
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "unauthorized role")
 		return
 	}
