@@ -6,7 +6,7 @@
 
 Only affects Arc built with the arcx engine (`-tags=duckdb_arrow,arcx_engine`); no change for servers, which always have a DuckDB engine.
 
-`go test -tags=duckdb_arrow,arcx_engine ./internal/api/` stopped with a nil-pointer panic in the tests that build a query handler without DuckDB (the governance row-cap ones). The arcx hook asked that missing engine for its directory allowlist. Now:
+`go test -tags=duckdb_arrow,arcx_engine ./internal/api/` stopped with a nil-pointer panic in the tests that build a query handler without DuckDB: the arcx hook asked that missing engine for its directory allowlist. The governance row-cap test crashed the run, and an RBAC end-to-end test passed on a hidden `500` because its recover middleware caught the same panic. Now:
 
 - the arcx hooks leave a handler without DuckDB to its normal path, as the stock build does;
 - `AllowedDirectories` on a nil engine returns no list instead of panicking. arcx denies every path when given no list, so that answer can never widen what arcx can read.

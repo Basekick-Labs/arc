@@ -62,6 +62,16 @@ func TestArcxHooksReturnWithoutDuckDB(t *testing.T) {
 		}
 		if guard < 0 || deps < 0 || guard > deps {
 			t.Errorf("%s: no `if h.db == nil { return false }` before deps is built (guard %d, deps %d)", name, guard, deps)
+			continue
+		}
+		// Nothing before the guard may touch h.db (a method on a nil engine).
+		for _, stmt := range fn.Body.List[:guard] {
+			ast.Inspect(stmt, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "db" {
+					t.Errorf("%s: h.db is used before the nil guard", name)
+				}
+				return true
+			})
 		}
 	}
 }
