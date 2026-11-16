@@ -178,7 +178,7 @@ func (a *OpenJobs) Open(prefix string) bool {
 // a read must leave out so it sees each open job's rows once: the inputs of
 // every job whose output is in storage. Empty in the common case.
 func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
-	out, _ := a.excludedFor(ctx, prefix, false)
+	out, _, _ := a.excludedFor(ctx, prefix, false)
 	return out
 }
 
@@ -186,12 +186,21 @@ func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
 // Iceberg export): an output it cannot stat, or a manifest it cannot read,
 // is an error instead of a read as main does.
 func (a *OpenJobs) ExcludedForStrict(ctx context.Context, prefix string) ([]string, error) {
+	out, _, err := a.excludedFor(ctx, prefix, true)
+	return out, err
+}
+
+// ExcludedWithOutputsStrict is ExcludedForStrict that also names the outputs
+// whose inputs it leaves out: for each of them the output holds every row of
+// the inputs left out, so an export that leaves those inputs out must keep
+// the output, whatever its crash-recovery manifest says (#1722).
+func (a *OpenJobs) ExcludedWithOutputsStrict(ctx context.Context, prefix string) (excluded, outputs []string, err error) {
 	return a.excludedFor(ctx, prefix, true)
 }
 
-func (a *OpenJobs) excludedFor(ctx context.Context, prefix string, strict bool) ([]string, error) {
+func (a *OpenJobs) excludedFor(ctx context.Context, prefix string, strict bool) (excluded, outputs []string, err error) {
 	if a == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	a.mu.Lock()
 	var jobs []*openJob
@@ -201,11 +210,11 @@ func (a *OpenJobs) excludedFor(ctx context.Context, prefix string, strict bool) 
 		}
 	}
 	a.mu.Unlock()
-	var out []string
+	var out, outs []string
 	for _, j := range jobs {
 		size, err := a.backend.StatFile(ctx, j.output)
 		if err != nil && strict {
-			return nil, fmt.Errorf("stat compaction output %s: %w", j.output, err)
+			return nil, nil, fmt.Errorf("stat compaction output %s: %w", j.output, err)
 		}
 		if err != nil || size < 0 {
 			// Absent (or unknown): read as main does; see the type comment.
@@ -222,11 +231,14 @@ func (a *OpenJobs) excludedFor(ctx context.Context, prefix string, strict bool) 
 		}
 		in, err := a.inputsOf(ctx, j)
 		if err != nil && strict {
-			return nil, err
+			return nil, nil, err
 		}
-		out = append(out, in...)
+		if len(in) > 0 {
+			out = append(out, in...)
+			outs = append(outs, j.output)
+		}
 	}
-	return out, nil
+	return out, outs, nil
 }
 
 // inputsOf is the job's input list from its manifest, read once. A manifest

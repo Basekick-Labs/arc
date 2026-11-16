@@ -139,6 +139,11 @@ type CompletionWatcherConfig struct {
 	// OnFinished runs when an object job's finisher ended it, its input
 	// objects deleted (#1207 d2a2b).
 	OnFinished func()
+	// OnSettled, when set, is told the database and measurement of a staged
+	// job once its inputs are removed and its output is in place here: a
+	// local job at its commit, an object job when its finisher ended it
+	// (#1722: the Iceberg export catches up then).
+	OnSettled func(database, measurement string)
 
 	// Logger receives structured log output. Defaults to Nop if zero.
 	Logger zerolog.Logger

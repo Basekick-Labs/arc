@@ -2369,6 +2369,7 @@ func main() {
 								watcher.SetStagedObservers(compactionManager.BeforeStagedCommit, compactionManager.FinishStaged)
 								watcher.SetStagedIntoObserver(compactionManager.FinishStagedInto)
 								watcher.SetStagedFinished(compactionManager.StagedFinished)
+								watcher.SetStagedSettled(compactionManager.MeasurementCompacted)
 								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
 									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
 							}
@@ -4737,6 +4738,14 @@ func main() {
 		// Started after tiering is set up (below), so the first pass already sees the cold tier.
 		icebergStart = icebergScheduler.Start
 		icebergExporter, icebergWalk = exporter, icebergSource
+		// A finished compaction asks for its measurement now: the table drops
+		// the deleted inputs within a pass instead of up to
+		// iceberg.reconcile_interval later (#1722). Requests before the loop
+		// starts wait for its first pass; on a node the gate keeps off they
+		// are dropped.
+		if compactionManager != nil {
+			compactionManager.SetOnMeasurementCompacted(icebergScheduler.RequestReconcile)
+		}
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
 			icebergScheduler.Stop()
 			// Close only a handle this block opened. A borrowed one belongs to

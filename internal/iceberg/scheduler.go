@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -82,6 +83,26 @@ type Scheduler struct {
 	// pass after one that committed or settled. Loop goroutine only, like state.
 	busySince map[string]time.Time
 
+	// requested holds the measurements whose files a compaction just replaced
+	// (RequestReconcile), coalesced, until the loop goroutine reconciles
+	// them: at idle, and between measurements of a running pass. Without it
+	// the table kept naming the deleted inputs until the next timed pass,
+	// up to the reconcile interval of failed external reads (#1722). The
+	// loop, not the caller, runs them: state, busySince and the exporter's
+	// per-pass version claims assume one reconcile at a time.
+	reqMu     sync.Mutex
+	requested map[string]Measurement
+	// retrying holds the measurements with a later request already
+	// scheduled (requestAfter), so a burst does not start a timer each.
+	retrying map[string]bool
+	wake     chan struct{}
+	// lastReconciled is when each measurement's table last changed, by a
+	// pass or a request. Loop goroutine only.
+	lastReconciled map[string]time.Time
+	// lastBlocked is the last pass's measurements awaiting a namespace
+	// migration; a requested one is left to the pass. Loop goroutine only.
+	lastBlocked map[string]struct{}
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -108,6 +129,20 @@ const (
 	outcomeInProgress                         // registered part of the new files; continues next pass
 	outcomeBusy                               // source files changed under the pass; nothing committed (vanished.go)
 )
+
+func (o reconcileOutcome) String() string {
+	switch o {
+	case outcomeUnchanged:
+		return "unchanged"
+	case outcomeReconciled:
+		return "reconciled"
+	case outcomeInProgress:
+		return "in_progress"
+	case outcomeBusy:
+		return "busy"
+	}
+	return "unknown"
+}
 
 // busyEscalateAfter is how long a measurement may go on being busy — source files changing
 // under every pass, nothing committed and nothing settled — before it is reported as failed. A
@@ -156,13 +191,160 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		cfg.Interval = 5 * time.Minute
 	}
 	return &Scheduler{
-		exporter:  cfg.Exporter,
-		source:    cfg.Source,
-		interval:  cfg.Interval,
-		gate:      cfg.Gate,
-		logger:    cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
-		state:     make(map[string]measurementState),
-		busySince: make(map[string]time.Time),
+		exporter:       cfg.Exporter,
+		source:         cfg.Source,
+		interval:       cfg.Interval,
+		gate:           cfg.Gate,
+		logger:         cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
+		state:          make(map[string]measurementState),
+		busySince:      make(map[string]time.Time),
+		requested:      make(map[string]Measurement),
+		retrying:       make(map[string]bool),
+		wake:           make(chan struct{}, 1),
+		lastReconciled: make(map[string]time.Time),
+	}
+}
+
+// requestMinSpacing is the least time between two reconciles of one table
+// that a request can cause. Each reconcile that removes files publishes
+// about two versions, and the exporter keeps retain+1 v<N> files for a
+// reader that resolved version-hint.text and has not opened its version
+// yet: back-to-back reconciles of a busy compaction cycle (one request per
+// job) would prune that version from under it at retain_snapshots=1. A
+// request inside the spacing waits out the rest of it. Short, because it is
+// also how long a later job's deleted inputs can stay in the table: it only
+// has to outlast a reader's hint-to-open step, not a query. Applied only at
+// retain_snapshots 1 and 2 (requestSpacing): at the default 10 the 11 kept
+// versions outlast any burst of compactions, and at 0 nothing is pruned.
+var requestMinSpacing = 2 * time.Second // a variable so tests can shorten it
+
+// spacedRetain is the largest retain_snapshots a request is spaced at.
+const spacedRetain = 2
+
+// requestSpacing is requestMinSpacing where back-to-back reconciles could
+// prune a version a reader just resolved, and none elsewhere.
+func (s *Scheduler) requestSpacing() time.Duration {
+	if s.exporter == nil || s.exporter.retain < 1 || s.exporter.retain > spacedRetain {
+		return 0
+	}
+	return requestMinSpacing
+}
+
+// requestAfter asks for m again after d, once per measurement at a time.
+func (s *Scheduler) requestAfter(m Measurement, key string, d time.Duration) {
+	s.reqMu.Lock()
+	if s.retrying[key] {
+		s.reqMu.Unlock()
+		return
+	}
+	s.retrying[key] = true
+	s.reqMu.Unlock()
+	time.AfterFunc(d, func() {
+		s.reqMu.Lock()
+		delete(s.retrying, key)
+		s.reqMu.Unlock()
+		s.RequestReconcile(m.Database, m.Measurement)
+	})
+}
+
+// RequestReconcile asks for one measurement to be reconciled soon, outside the
+// timer: a compaction has just replaced files in it. Safe from any goroutine
+// and never blocks; repeated requests before the loop gets to them coalesce. A
+// node that may not export (the gate) drops them, and the timed passes still
+// converge on their own.
+func (s *Scheduler) RequestReconcile(database, measurement string) {
+	if s == nil || database == "" || measurement == "" {
+		return
+	}
+	s.reqMu.Lock()
+	s.requested[database+"\x00"+measurement] = Measurement{Database: database, Measurement: measurement}
+	s.reqMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// takeRequests empties the requested set.
+func (s *Scheduler) takeRequests() []Measurement {
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	if len(s.requested) == 0 {
+		return nil
+	}
+	out := make([]Measurement, 0, len(s.requested))
+	for _, m := range s.requested {
+		out = append(out, m)
+	}
+	clear(s.requested)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Database != out[j].Database {
+			return out[i].Database < out[j].Database
+		}
+		return out[i].Measurement < out[j].Measurement
+	})
+	return out
+}
+
+// serviceRequests reconciles the requested measurements now, on the loop
+// goroutine. A measurement reconciled less than requestSpacing ago, or
+// left busy or partly registered, is asked for again later rather than
+// bringing the whole next pass forward. Busy here does not start a
+// measurement's busy clock (escalation stays the timed passes' call), and an
+// escalated one is left to them. The gate is checked once per batch; the
+// reconcile's own commit fence (canCommit) covers a lease lost meanwhile.
+func (s *Scheduler) serviceRequests(ctx context.Context) {
+	reqs := s.takeRequests()
+	if len(reqs) == 0 {
+		return
+	}
+	if s.gate != nil && !s.gate.CanRun() {
+		return // another node exports; its own passes converge
+	}
+	for _, m := range reqs {
+		if ctx.Err() != nil {
+			return
+		}
+		key := m.Database + "\x00" + m.Measurement
+		if _, blocked := s.lastBlocked[key]; blocked {
+			continue // awaiting a namespace migration: the pass handles it
+		}
+		if spacing := s.requestSpacing(); spacing > 0 {
+			if since := time.Since(s.lastReconciled[key]); since < spacing {
+				s.requestAfter(m, key, spacing-since)
+				continue
+			}
+		}
+		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+		outcome, err := s.reconcileOneRecovered(mctx, m, key)
+		cancel()
+		s.noteOutcome(key, outcome)
+		event := s.logger.Debug()
+		if err != nil && outcome != outcomeBusy {
+			event = s.logger.Warn().Err(err)
+		}
+		event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
+			Msg("Iceberg reconcile after compaction")
+		switch outcome {
+		case outcomeInProgress:
+			s.requestAfter(m, key, s.partialRetryInterval())
+		case outcomeBusy:
+			if since, started := s.busySince[key]; started && time.Since(since) >= busyEscalateAfter {
+				continue // escalated by the passes: they own it now
+			}
+			s.requestAfter(m, key, s.partialRetryInterval())
+		}
+	}
+}
+
+// noteOutcome records what a reconcile of key did: when the table last
+// changed (requestSpacing), and the end of a busy stretch.
+func (s *Scheduler) noteOutcome(key string, outcome reconcileOutcome) {
+	if outcome == outcomeReconciled || outcome == outcomeInProgress {
+		s.lastReconciled[key] = time.Now()
+	}
+	if outcome != outcomeBusy {
+		delete(s.busySince, key)
 	}
 }
 
@@ -192,23 +374,30 @@ func (s *Scheduler) loop(ctx context.Context) {
 	// files) would queue ticks and cause back-to-back passes with no breathing room — starving
 	// I/O and, in cluster mode, competing with the write path. The reconciler is idempotent, so
 	// a slightly-later next pass is always safe.
-	timer := time.NewTimer(s.interval)
+	next := s.interval
 	if partial {
-		timer.Reset(s.partialRetryInterval())
+		next = s.partialRetryInterval()
 	}
+	timer := time.NewTimer(next)
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-s.wake:
+			// A request between passes: serve it now. The timer is not
+			// touched, so the next timed pass keeps its time however many
+			// requests come in.
+			s.serviceRequests(ctx)
+			continue
 		case <-timer.C:
 			partial = s.runPass(ctx)
 		}
+		next = s.interval
 		if partial {
-			timer.Reset(s.partialRetryInterval())
-		} else {
-			timer.Reset(s.interval)
+			next = s.partialRetryInterval()
 		}
+		timer.Reset(next)
 	}
 }
 
@@ -246,12 +435,16 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			Msg("Iceberg reconcile: could not read the catalog to plan dotted-namespace migration; continuing without it. A database whose Iceberg namespace contains a dot may get a second table this pass")
 		blocked = nil
 	}
+	s.lastBlocked = blocked
 	var ok, failed, skipped, awaitingMigration, inProgress, busy int
 	seen := make(map[string]struct{}, len(measurements))
 	for _, m := range measurements {
 		if ctx.Err() != nil { // shutdown mid-pass
 			return false
 		}
+		// A compaction that finished while this pass runs is served before the
+		// next measurement, not after the whole pass (#1722).
+		s.serviceRequests(ctx)
 		key := m.Database + "\x00" + m.Measurement
 		seen[key] = struct{}{}
 		if _, blocked := blocked[key]; blocked {
@@ -274,6 +467,9 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
 		outcome, err := s.reconcileOneRecovered(mctx, m, key)
 		cancel()
+		if outcome == outcomeReconciled || outcome == outcomeInProgress {
+			s.lastReconciled[key] = time.Now()
+		}
 		if outcome == outcomeBusy {
 			since, started := s.busySince[key]
 			if !started {
@@ -328,6 +524,11 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 	for k := range s.busySince {
 		if _, ok := seen[k]; !ok {
 			delete(s.busySince, k)
+		}
+	}
+	for k := range s.lastReconciled {
+		if _, ok := seen[k]; !ok {
+			delete(s.lastReconciled, k)
 		}
 	}
 	event := s.logger.Info().Int("reconciled", ok).Int("unchanged", skipped).Int("failed", failed)
