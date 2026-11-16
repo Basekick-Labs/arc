@@ -27,13 +27,13 @@ const flightBenchDirectHeader = "x-arc-bench-direct"
 
 func init() { flightSQLBenchDirect = flightBenchDirect }
 
-func flightBenchDirect(ctx context.Context, s *flightSQLService, sql string) (*arrow.Schema, <-chan flight.StreamChunk, bool, error) {
+func flightBenchDirect(ctx context.Context, s *flightSQLService, sql, database string) (*arrow.Schema, <-chan flight.StreamChunk, bool, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	if v := md.Get(flightBenchDirectHeader); len(v) != 1 || v[0] != "1" {
 		return nil, nil, false, nil
 	}
 	h := s.queryHandler
-	converted, _, _, err := h.getTransformedSQLWithRefs(ctx, sql, "")
+	converted, _, _, err := h.getTransformedSQLWithRefs(ctx, sql, database)
 	if err != nil {
 		return nil, nil, true, status.Error(codes.InvalidArgument, err.Error())
 	}
