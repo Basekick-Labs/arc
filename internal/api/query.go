@@ -174,7 +174,9 @@ func isClientError(err error) bool {
 // streamErrEvent picks the right zerolog level for a stream-truncation
 // error: Warn for client-side events, Error for server-side failures.
 func (h *QueryHandler) streamErrEvent(err error) *zerolog.Event {
-	if isClientError(err) {
+	// A file removed while the engine read it is the data changing under the
+	// query, not a server fault; the router has already logged its path (#1357).
+	if _, vanished := vanishedEnginePath(err); vanished || isClientError(err) {
 		return h.logger.Warn()
 	}
 	return h.logger.Error()

@@ -218,11 +218,9 @@ func (h *QueryHandler) serveArcxResult(
 			}
 			releaseArrowStreamResourcesFunc(reader, nil, cancel, h.logger)
 			runtime.KeepAlive(reader)
-			if onFail != nil {
-				onFail(derr.Error())
-			}
-			h.logger.Error().Err(derr).Msg("arcx serve: msgpack drain error before headers; 500")
-			_ = respondError(c, fiber.StatusInternalServerError, derr.Error(), timestamp, start)
+			// Nothing is on the wire yet, so a removed plan file can still
+			// be the retryable 503 (#1357).
+			_ = h.respondArcxMsgPackDrainError(c, derr, timestamp, start, onFail)
 			return true // we produced the (error) response
 		}
 		c.Set(fiber.HeaderContentType, msgpackContentType)
