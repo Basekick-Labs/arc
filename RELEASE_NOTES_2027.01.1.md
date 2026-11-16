@@ -2,6 +2,19 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: deleting a spoke on an edge-sync hub drops its Iceberg tables ([#1730](https://github.com/Basekick-Labs/arc/issues/1730))
+
+On a hub, `DELETE /api/v1/databases/{spoke}` removed the spoke's data but left its Iceberg tables in place. This affected the default warehouse layout. Each table's catalog row and warehouse metadata (`arc_<spoke>.<db>.db/`) survived, still naming the deleted data files. Iceberg readers listing the namespace failed on them. In a local test with one spoke database of two tables, both catalog rows and 14 metadata files remained; now none do.
+
+- **What is dropped now:** every database the spoke synced, wherever it is found.
+  - **This node's catalog:** the spoke's databases it has rows for.
+  - **The warehouse:** its directories are listed too, so a shared-bucket node that never exported the spoke also drops them.
+  - **Spoke IDs with a dot:** tables written before #1129 are found too, whether or not the namespace migration has run.
+- **What is never touched:** another spoke's tables, even when a dotted spoke ID makes the names look alike (`edge` and `edge.x`).
+- **Limits:** the colocated layout already handled spokes. With a warehouse outside the storage root, Arc cannot reach the metadata files; it now drops the spoke databases' catalog rows and leaves the files. Only Iceberg metadata files are deleted, never another spoke's data, even if its name looks like a warehouse directory.
+
+No new configuration keys.
+
 ## Fix: in a cluster, Iceberg tables catch up after a DELETE, retention, tiering or a reconciliation sweep ([#1728](https://github.com/Basekick-Labs/arc/issues/1728))
 
 #1727 made these paths ask the Iceberg export to reconcile, on a single node. In a cluster they run on the primary writer, while the export runs on the node holding the compaction lease, so the writer's requests were dropped. The table named the removed files until the exporter's next timed pass, up to `iceberg.reconcile_interval` (300 s by default). Now the exporter node acts on what it sees itself.
