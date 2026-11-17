@@ -7,7 +7,7 @@
 When a measurement's column has different types in different files, or a new file disagrees with the table, Iceberg cannot hold both and the export fails that measurement on every pass. The log line said `column "..." has conflicting types`: Arc masks quoted text in every logged error, so the column name was masked too. Found on real data whose source schema changed over the years (#1690).
 
 - **Now the failure log carries fields:** `column`, `type_first` and `type_then`, `conflict_with` (`files` when two files disagree, `table` when new files disagree with the table), and `file_first` / `file_then`, the storage keys of a file holding each type, where known.
-- **The error text is unchanged and still masked.** The fields are identifiers and storage keys, which Arc already logs as plain fields. A column name is cut to 256 bytes, and invalid UTF-8 is quoted, as everywhere else Arc logs one.
+- **The error text is still masked.** One wording changes: a new file that disagrees with the table used to be reported as "conflicting types across files". It now reads "type mismatch: Iceberg table has … new Parquet files have …", the wording Arc already used for the same conflict found elsewhere. The fields are identifiers and storage keys, which Arc already logs as plain fields. A column name is cut to 256 bytes, and invalid UTF-8 is quoted, as everywhere else Arc logs one.
 - **Behaviour is unchanged:** the measurement still fails until its files agree.
 
 No new configuration keys.

@@ -621,16 +621,15 @@ func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc Arc
 			missing = append(missing, f)
 			continue
 		}
-		// A column already in the table must keep its type. Neither of the schema-derivation
-		// paths can catch this: UnionSchema only compares the CURRENT pass's files against each
-		// other, and MergeSchemas compares against the in-memory cache, which is empty after a
-		// restart or an empty-out. So a measurement whose column changes type across those
-		// boundaries (e.g. `value` was long, all old files age out, Arc restarts, new files
-		// arrive with value as double) would derive a self-consistent schema, find the column
-		// "present", skip it, and register type-incompatible files into the table. Fail the
+		// A column already in the table must keep its type. The reconcile merges new files'
+		// schemas with the table's (prepareChunk, seeded by tableSeed) and usually catches a
+		// change there; this is the backstop for a schema derived without the table's (e.g. a
+		// column the base lacks after a failover or an outside writer), which would otherwise
+		// find the column "present", skip it, and register type-incompatible files. Fail the
 		// measurement instead — the table stays readable and the next pass retries.
 		if !existing.Type.Equals(f.Type) {
-			return nil, &SchemaConflictError{Column: f.Name, First: existing.Type.String(), Then: f.Type.String(), With: conflictWithTable}
+			return nil, &SchemaConflictError{Column: f.Name, First: existing.Type.String(), Then: f.Type.String(),
+				With: conflictWithTable, File: sc.sources[f.Name]}
 		}
 	}
 	if len(missing) == 0 {

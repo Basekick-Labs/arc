@@ -17,7 +17,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/colname"
 )
 
 // measurementState caches per-measurement work between passes so an unchanged measurement is
@@ -1147,7 +1147,7 @@ func logSchemaConflict(ev *zerolog.Event, err error) *zerolog.Event {
 	if !errors.As(err, &c) {
 		return ev
 	}
-	ev = ev.Str("column", ingest.QuoteColumnName(c.Column)).Str("type_first", c.First).Str("type_then", c.Then).Str("conflict_with", c.With)
+	ev = ev.Str("column", colname.Quote(c.Column)).Str("type_first", c.First).Str("type_then", c.Then).Str("conflict_with", c.With)
 	if c.FirstFile != "" {
 		ev = ev.Str("file_first", c.FirstFile)
 	}

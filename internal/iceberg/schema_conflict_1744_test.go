@@ -220,6 +220,26 @@ func TestSchedulerLogsATableConflictWithTheNewFile(t *testing.T) {
 	if _, ok := found["file_first"]; ok {
 		t.Fatalf("file_first = %v: the table side has no file", found["file_first"])
 	}
+	// The wording for a table-side conflict (the sanitizer masks the name, not the words).
+	if e, _ := found["error"].(string); !strings.Contains(e, "type mismatch: Iceberg table has") {
+		t.Fatalf("error = %q, want the table-conflict wording", e)
+	}
+
+	// The per-request path (a compaction's or a DELETE's reconcile) logs the same fields.
+	buf.Reset()
+	clear(s.lastReconciled)
+	s.RequestReconcile("mydb", "cpu")
+	s.serviceRequests(context.Background())
+	var onRequest map[string]any
+	for _, line := range strings.Split(buf.String(), "\n") {
+		var ev map[string]any
+		if json.Unmarshal([]byte(line), &ev) == nil && strings.HasPrefix(fmt.Sprint(ev["message"]), "Iceberg reconcile on request") {
+			onRequest = ev
+		}
+	}
+	if onRequest == nil || onRequest["column"] != "value" || onRequest["conflict_with"] != "table" {
+		t.Fatalf("on-request event = %v; log:\n%s", onRequest, buf.String())
+	}
 }
 
 // A column name is bounded and quoted like every logged column name.
