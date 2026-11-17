@@ -142,6 +142,33 @@ func TestDatabasesHandler_DeleteClearsStateDirectoryResidue1425(t *testing.T) {
 	}
 }
 
+// An edge-sync hub keeps a spoke's databases one level deeper:
+// _compaction_state/<tier>/<spoke>/<db>/. Deleting the spoke removes the empty
+// ones bottom-up and keeps one that still holds a manifest.
+func TestDatabasesHandler_DeleteClearsSpokeStateDirectories1425(t *testing.T) {
+	_, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+	for _, dir := range []string{
+		"_compaction_state/hourly/spoke1/db_a",
+		"_compaction_state/hourly/spoke1/db_b",
+		"_compaction_state/hourly/spoke10/db_a",
+	} {
+		if err := os.MkdirAll(filepath.Join(tmpDir, filepath.FromSlash(dir)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := filepath.Join(tmpDir, "_compaction_state", "hourly", "spoke1", "db_b", "job.json")
+	if err := os.WriteFile(live, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deleteDatabaseRequest(t, app, "spoke1", fiber.StatusNotFound)
+
+	mustBeGone(t, tmpDir, "_compaction_state/hourly/spoke1/db_a")
+	mustExist(t, tmpDir, "_compaction_state/hourly/spoke1/db_b/job.json")
+	mustExist(t, tmpDir, "_compaction_state/hourly/spoke10/db_a")
+}
+
 // TestRemoveDatabaseStateDirectoriesRecreateRace runs the removal against
 // writers recreating the same database's anchor and manifest through a second
 // backend instance, the way the compaction subprocess holds its own (with its

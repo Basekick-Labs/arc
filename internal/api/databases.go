@@ -1896,15 +1896,16 @@ func removeEmptyDirectoryTree(ctx context.Context, lister storage.DirectoryListe
 // fieldschema.Registry.DeleteDatabase) and _compaction_state/<tier>/<db>/ (its
 // compaction manifests, deleted as each job commits). Each path is the
 // database's own segment joined under the root, never a prefix match, so a
-// database "db" never touches "db2". The tier listing is one level deep, the
-// manifest layout's. Like removeEmptyDirectories: local storage only, a
-// directory that holds anything stays (any manifest left in it, in flight or
-// parked .quarantined, or an anchor a concurrent ingest just wrote).
-// LocalBackend.Write recreates a directory removed under it, retrying once;
-// two concurrent DELETEs of the same database can remove it twice inside that
-// window and fail the write, which the next anchor flush or compaction cycle
-// repeats. The
-// tier directories and the roots, which other databases share, stay.
+// database "db" never touches "db2". The tiers are listed one level deep; a
+// database's directory under a tier can hold nested ones (an edge-sync
+// spoke's databases), removed bottom-up when empty. Like
+// removeEmptyDirectories: local storage only, a directory that holds anything
+// stays (any manifest left in it, in flight or parked .quarantined, or an
+// anchor a concurrent ingest just wrote). LocalBackend.Write recreates a
+// directory removed under it, retrying once; two concurrent DELETEs of the
+// same database can remove it twice inside that window and fail the write,
+// which the next anchor flush or compaction cycle repeats. The tier
+// directories and the roots, which other databases share, stay.
 func removeDatabaseStateDirectories(ctx context.Context, backend storage.Backend, name string, logger zerolog.Logger) {
 	// Checked first so an object store, which has no directories to remove,
 	// is not sent a listing request on every delete.

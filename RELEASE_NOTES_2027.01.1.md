@@ -5924,8 +5924,9 @@ go: any manifest left in one (a compaction in flight, or one parked
 `.quarantined`) keeps its directory, and the shared tier directories stay.
 Repeating the delete of a database removed by an earlier version clears them
 too. On a cluster with per-node local storage this covers the node that serves
-the delete; compaction manifests live on the compactor, where their empty
-directories are not removed ([PR_PLACEHOLDER]).
+the delete; empty compaction-state directories on another node, such as a
+separate compactor, are not removed (follow-up to
+[#1425](https://github.com/Basekick-Labs/arc/issues/1425)).
 
 ### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
 
