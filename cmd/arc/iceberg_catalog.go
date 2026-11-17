@@ -17,18 +17,20 @@ const icebergCatalogNotHere = "this node does not hold the Iceberg export: with 
 	"has the table metadata; point the engine's catalog URI at that node"
 
 // icebergCatalogServable decides, per request, whether this node can answer
-// the Iceberg REST catalog (#1690). Standalone, or a cluster whose warehouse
-// every node sees (a shared bucket, or shared_storage_mode), always can. On a
-// node-local-storage cluster only the exporting node holds the metadata; the
-// others answer 503 rather than an empty catalog. The gate is asked per
-// request because the compactor role moves without a restart; a nil gate
-// (no gating) always runs, as the export itself does.
-func icebergCatalogServable(hasCoordinator, sharedWarehouse bool, gate iceberg.WriterGate) func() (bool, string) {
-	if !hasCoordinator || sharedWarehouse {
+// the Iceberg REST catalog (#1690). A warehouse every node sees (a shared
+// bucket, or shared_storage_mode) can be served anywhere, and a node with no
+// export gate exports itself. Otherwise only the node the export's gate lets
+// run holds the metadata, and the others answer 503 rather than an empty
+// catalog. That is keyed on the gate, not on the coordinator: cluster.enabled
+// without one (no clustering licence, or a coordinator that failed to start)
+// still gates the export on the static compactor role. The gate is asked per
+// request because the role moves without a restart.
+func icebergCatalogServable(sharedWarehouse bool, gate iceberg.WriterGate) func() (bool, string) {
+	if sharedWarehouse || gate == nil {
 		return nil
 	}
 	return func() (bool, string) {
-		if gate == nil || gate.CanRun() {
+		if gate.CanRun() {
 			return true, ""
 		}
 		return false, icebergCatalogNotHere

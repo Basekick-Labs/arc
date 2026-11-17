@@ -6,22 +6,24 @@ type fakeIcebergGate struct{ run bool }
 
 func (g *fakeIcebergGate) CanRun() bool { return g.run }
 
-// #1690: only a node-local-storage cluster gates the catalog, per request,
-// on the export's own gate; a nil gate always serves, as the export runs.
+// #1690: the catalog is gated, per request, on the export's own gate unless
+// every node sees the warehouse. Keyed on the gate, not the coordinator:
+// cluster.enabled without a coordinator still gates the export on the
+// static compactor role.
 func TestIcebergCatalogServable(t *testing.T) {
 	gate := &fakeIcebergGate{}
-	if icebergCatalogServable(false, false, gate) != nil {
-		t.Fatal("standalone gated the catalog")
+	if icebergCatalogServable(false, nil) != nil {
+		t.Fatal("no gate (standalone): the catalog was gated")
 	}
-	if icebergCatalogServable(true, true, gate) != nil {
-		t.Fatal("a shared-warehouse cluster gated the catalog")
+	if icebergCatalogServable(true, gate) != nil {
+		t.Fatal("a shared warehouse gated the catalog")
 	}
-	if f := icebergCatalogServable(true, false, nil); f == nil {
-		t.Fatal("node-local cluster: no check")
-	} else if ok, _ := f(); !ok {
-		t.Fatal("a nil gate refused")
+	// Node-local storage with a gate: a cluster, or cluster.enabled with no
+	// coordinator (compaction gate on the static role).
+	f := icebergCatalogServable(false, gate)
+	if f == nil {
+		t.Fatal("node-local storage with a gate: no check")
 	}
-	f := icebergCatalogServable(true, false, gate)
 	if ok, why := f(); ok || why == "" {
 		t.Fatalf("closed gate: ok=%v why=%q", ok, why)
 	}

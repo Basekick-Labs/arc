@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/basekick-labs/arc/internal/iceberg"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -43,6 +45,13 @@ const IcebergCatalogBasePath = "/iceberg"
 // are never cached, so a new publish is visible on the next load; a listing
 // learns of a new table within this. Snowflake's catalog sync defaults to 30 s.
 const icebergListingTTL = 30 * time.Second
+
+// icebergCacheSweepAt is the cache size at which expired entries are swept.
+const icebergCacheSweepAt = 256
+
+// icebergNamespaceScanParallel bounds how many databases the namespace
+// listing checks at once.
+const icebergNamespaceScanParallel = 8
 
 // icebergRequestTimeout bounds one request's storage reads.
 const icebergRequestTimeout = 30 * time.Second
@@ -239,16 +248,16 @@ func (h *IcebergCatalogHandler) canReadTable(c *fiber.Ctx, database, measurement
 
 var errIcebergPermissionStore = errors.New("permission store unavailable")
 
-// pathSegment returns a route parameter as an owned string. A segment with
-// any escape is refused: Arc's namespaces are one component and its names
-// never need one, so an escape can only be a multi-level namespace (%1F) or
-// an attempt to smuggle a separator.
+// pathSegment returns a route parameter decoded, as an owned string. Clients
+// escape a space, '#' or '?' in a name, so the segment is decoded once; the
+// decoded name then goes through SafeCatalogName, which refuses a separator,
+// a control character (a multi-level namespace's %1F) and a second '%'.
 func pathSegment(c *fiber.Ctx, name string) (string, bool) {
-	v := strings.Clone(c.Params(name))
-	if v == "" || strings.Contains(v, "%") {
+	v, err := url.PathUnescape(c.Params(name))
+	if err != nil || v == "" {
 		return "", false
 	}
-	return v, true
+	return strings.Clone(v), true
 }
 
 // databaseOf maps a namespace segment to the database it serves.
@@ -281,9 +290,22 @@ func (h *IcebergCatalogHandler) cachedList(key string, compute func(ctx context.
 		if err != nil {
 			return nil, err
 		}
-		h.mu.Lock()
-		h.cache[key] = icebergCachedList{names: names, at: h.now()}
-		h.mu.Unlock()
+		// An empty listing is not cached: keys come from caller-supplied
+		// namespaces, and caching every name a caller tries would grow
+		// without bound. Expired entries are swept as the map grows.
+		if len(names) > 0 {
+			h.mu.Lock()
+			now := h.now()
+			if len(h.cache) >= icebergCacheSweepAt {
+				for k, e := range h.cache {
+					if now.Sub(e.at) >= h.ttl {
+						delete(h.cache, k)
+					}
+				}
+			}
+			h.cache[key] = icebergCachedList{names: names, at: now}
+			h.mu.Unlock()
+		}
 		return names, nil
 	})
 	if err != nil {
@@ -311,16 +333,25 @@ func (h *IcebergCatalogHandler) databases() ([]string, error) {
 				return nil, err
 			}
 		}
-		out := make([]string, 0, len(candidates))
-		for _, db := range candidates {
+		has := make([]bool, len(candidates))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(icebergNamespaceScanParallel)
+		for i, db := range candidates {
 			if _, isSpoke := spokes[db]; isSpoke {
 				continue
 			}
-			one, err := h.src.PublishedTables(ctx, db, 1)
-			if err != nil {
-				return nil, err
-			}
-			if len(one) > 0 {
+			g.Go(func() error {
+				one, err := h.src.PublishedTables(gctx, db, 1)
+				has[i] = len(one) > 0
+				return err
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+		out := make([]string, 0, len(candidates))
+		for i, db := range candidates {
+			if has[i] {
 				out = append(out, db)
 			}
 		}
@@ -328,12 +359,15 @@ func (h *IcebergCatalogHandler) databases() ([]string, error) {
 	})
 }
 
+// storageUnavailable answers 503 for a failure. The detail goes to the log
+// only: it can name other databases (a listing reads every database before
+// any per-caller filter) and, on local storage, absolute paths.
 func (h *IcebergCatalogHandler) storageUnavailable(c *fiber.Ctx, err error, what string) error {
 	if errors.Is(err, errIcebergPermissionStore) {
 		return icebergUnavailable(c, "Permission store unavailable; retry later")
 	}
 	h.logger.Warn().Err(err).Str("path", c.Path()).Msg("Iceberg catalog could not read " + what)
-	return icebergUnavailable(c, "Arc could not read "+what+": "+err.Error())
+	return icebergUnavailable(c, "Arc could not read "+what+" right now; retry later (the Arc log has the cause)")
 }
 
 func (h *IcebergCatalogHandler) handleConfig(c *fiber.Ctx) error {

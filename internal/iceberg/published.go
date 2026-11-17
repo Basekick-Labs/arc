@@ -16,10 +16,22 @@ package iceberg
 // Nothing here writes. The exporter's own lookups (TableExists, adoptPublished,
 // EnsureTable) move catalog rows, so the catalog must never call them.
 //
+// Only a version version-hint.text names is served, never a newer v<N>
+// without one: that is what directory readers see, and the hint is gone first
+// or last in every DROP (a colocated DROP deletes it first), so "no hint" is
+// either a table not yet published or one being dropped.
+//
 // Every read failure is returned as an error, never as "not there": an
 // external catalog that lists a table on one poll and not the next can drop it
 // on its side (a Snowflake catalog-linked database), so absence is reported
 // only when it is confirmed.
+//
+// A table being dropped is not always detectable. A database DELETE removes
+// the data files before the table metadata, and, without drop markers
+// (standalone), the metadata in between still names them: the table is served
+// until its hint is deleted, and reads of it fail meanwhile, as they do for
+// directory readers. Where markers are written (a shared bucket with a
+// coordinator) a marked table is refused instead.
 
 import (
 	"context"
@@ -63,10 +75,10 @@ func (e *Exporter) PublishedAddressable() bool {
 
 // SafeCatalogName reports whether a database or measurement name can name a
 // published table in the catalog: one path segment that cannot climb out of
-// its directory or be read as an escape. It is the one filter for listing and
-// loading, so a listed table can always be loaded. It is deliberately looser
-// than the ingest name rules: the export walk exports whatever directory names
-// storage holds.
+// its directory. A '%' is refused so a decoded URL segment cannot carry a
+// second escape. It is deliberately looser than the ingest name rules: the
+// export walk exports whatever directory names storage holds, and a client
+// escapes the rest (a space, '#', '?') in the URL, which the catalog decodes.
 func SafeCatalogName(name string) bool {
 	if name == "" || name == "." || name == ".." || len(name) > 255 {
 		return false
@@ -92,12 +104,34 @@ type publishedDir struct {
 	colocated bool
 }
 
+// servedLayout is the warehouse layout, resolved once.
+func (e *Exporter) servedLayout() *WarehouseLayout {
+	e.servedLayoutOnce.Do(func() { e.servedLayoutVal = e.WarehouseLayout() })
+	return e.servedLayoutVal
+}
+
+// servedDatabase reports whether a name can be a database of the catalog: a
+// safe segment that is not one of the warehouse's own directories. Without
+// the second half a warehouse namespace directory ("arc_mydb.db") would be
+// addressable as a database whose "colocated" tables are the warehouse
+// tables, checked against the permissions of the wrong name.
+func (e *Exporter) servedDatabase(database string) bool {
+	return SafeCatalogName(database) && !e.servedLayout().IsWarehouseRootDir(database)
+}
+
+// servedTable is servedDatabase for a table: neither name unsafe, and the
+// measurement not the directory a nested warehouse occupies.
+func (e *Exporter) servedTable(database, measurement string) bool {
+	return e.servedDatabase(database) && SafeCatalogName(measurement) &&
+		!e.servedLayout().IsWarehouseMeasurement(database, measurement)
+}
+
 // publishedDirs returns the two standard metadata directories of a table, the
 // configured layout's first: the same order noRowMetaDirLoc adopts in, so a
 // table created under the other layout is still found. A directory the
 // backend cannot address is left out.
 func (e *Exporter) publishedDirs(database, measurement string) (nsKey string, dirs []publishedDir, err error) {
-	if !SafeCatalogName(database) || !SafeCatalogName(measurement) {
+	if !e.servedTable(database, measurement) {
 		return "", nil, nil
 	}
 	ns, err := namespaceIdentifier(e.nsPrefix, database)
@@ -145,46 +179,34 @@ func (e *Exporter) dropMarked(ctx context.Context, nsKey, measurement string) (b
 	return set, nil
 }
 
-// publishedVersion returns the version a directory publishes: the hint's, or,
-// with no hint, the newest v<N> unless the table carries a drop marker (a
-// DROP deletes the v<N> files before the hint, so mid-drop the newest one
-// left is arbitrary). -1 means nothing is published there.
-func (e *Exporter) publishedVersion(ctx context.Context, nsKey, measurement string, d publishedDir) (int, error) {
-	n, err := e.readHint(ctx, d.key)
-	if err != nil || n >= 0 {
-		return n, err
-	}
-	newest, err := e.newestPublished(ctx, d.key)
-	if err != nil || newest < 0 {
-		return newest, err
-	}
-	marked, err := e.dropMarked(ctx, nsKey, measurement)
-	if err != nil {
-		return -1, err
-	}
-	if marked {
-		return -1, nil
-	}
-	return newest, nil
-}
-
-// LoadPublished returns the current published version of a table. found is
-// false only when neither standard directory publishes anything. A state that
-// cannot be served safely (a hint naming a missing version, a current
-// snapshot whose manifest list is gone, metadata naming another location) is
-// an error, never "not found".
+// LoadPublished returns the current published version of a table: the
+// v<N>.metadata.json version-hint.text names. found is false only when
+// neither standard directory has a hint. A state that cannot be served safely
+// (a drop marker, a hint naming a missing version, a current snapshot whose
+// manifest list is gone, metadata naming another location) is an error,
+// never "not found".
 func (e *Exporter) LoadPublished(ctx context.Context, database, measurement string) (PublishedTable, bool, error) {
 	nsKey, dirs, err := e.publishedDirs(database, measurement)
 	if err != nil {
 		return PublishedTable{}, false, err
 	}
 	for _, d := range dirs {
-		n, err := e.publishedVersion(ctx, nsKey, measurement, d)
+		n, err := e.readHint(ctx, d.key)
 		if err != nil {
 			return PublishedTable{}, false, err
 		}
 		if n < 0 {
 			continue
+		}
+		// A marked table is being dropped (or a drop failed part way): its
+		// data files may already be gone. Read after the hint, so a dropped
+		// table whose metadata is gone is plainly not found.
+		marked, err := e.dropMarked(ctx, nsKey, measurement)
+		if err != nil {
+			return PublishedTable{}, false, err
+		}
+		if marked {
+			return PublishedTable{}, false, fmt.Errorf("Iceberg table %s.%s carries a drop marker: its database is being dropped", nsKey, measurement)
 		}
 		name := "v" + strconv.Itoa(n) + ".metadata.json"
 		body, err := e.backend.Read(ctx, path.Join(d.key, name))
@@ -281,14 +303,13 @@ func (e *Exporter) warehouseRelDir() (string, bool) {
 // PublishedTables' question. Edge-sync spoke namespaces (two components) are
 // not served.
 func (e *Exporter) PublishedDatabases(ctx context.Context) ([]string, error) {
-	layout := e.WarehouseLayout()
 	seen := map[string]struct{}{}
 	root, err := e.listDirs(ctx, "")
 	if err != nil {
 		return nil, err
 	}
 	for _, d := range root {
-		if layout.IsWarehouseRootDir(d) || !SafeCatalogName(d) {
+		if !e.servedDatabase(d) {
 			continue
 		}
 		seen[d] = struct{}{}
@@ -332,7 +353,7 @@ func (e *Exporter) databaseOfNamespaceDir(dir string) (string, bool) {
 		key = parts[0]
 	}
 	db, ok := strings.CutPrefix(key, e.nsPrefix+"_")
-	if !ok || !SafeCatalogName(db) {
+	if !ok || !e.servedDatabase(db) {
 		return "", false
 	}
 	return db, true
@@ -343,18 +364,17 @@ func (e *Exporter) databaseOfNamespaceDir(dir string) (string, bool) {
 // only one). Every read error is returned.
 func (e *Exporter) PublishedTables(ctx context.Context, database string, limit int) ([]string, error) {
 	ns, err := namespaceIdentifier(e.nsPrefix, database)
-	if !SafeCatalogName(database) || err != nil {
+	if !e.servedDatabase(database) || err != nil {
 		return nil, nil
 	}
 	nsKey := catalogNamespaceKey(ns)
-	layout := e.WarehouseLayout()
 	candidates := map[string]struct{}{}
 	hot, err := e.listDirs(ctx, database+"/")
 	if err != nil {
 		return nil, err
 	}
 	for _, m := range hot {
-		if SafeCatalogName(m) && !layout.IsWarehouseMeasurement(database, m) {
+		if e.servedTable(database, m) {
 			candidates[m] = struct{}{}
 		}
 	}
@@ -365,7 +385,7 @@ func (e *Exporter) PublishedTables(ctx context.Context, database string, limit i
 			return nil, err
 		}
 		for _, m := range tables {
-			if SafeCatalogName(m) {
+			if e.servedTable(database, m) {
 				candidates[m] = struct{}{}
 			}
 		}
@@ -386,7 +406,7 @@ func (e *Exporter) PublishedTables(ctx context.Context, database string, limit i
 		for i, m := range batch {
 			go func() {
 				defer func() { done <- struct{}{} }()
-				published[i], errs[i] = e.isPublished(ctx, nsKey, database, m)
+				published[i], errs[i] = e.isPublished(ctx, database, m)
 			}()
 		}
 		for range batch {
@@ -407,19 +427,21 @@ func (e *Exporter) PublishedTables(ctx context.Context, database string, limit i
 	return out, nil
 }
 
-// isPublished reports whether either standard directory of a table publishes
-// a version, by the rule LoadPublished serves.
-func (e *Exporter) isPublished(ctx context.Context, nsKey, database, measurement string) (bool, error) {
+// isPublished reports whether either standard directory of a table has a
+// version-hint.text. Existence only: whether that version can be served is
+// LoadPublished's question, so one damaged table (an unreadable hint, a
+// marker) is a 503 on its own load and does not fail every listing.
+func (e *Exporter) isPublished(ctx context.Context, database, measurement string) (bool, error) {
 	_, dirs, err := e.publishedDirs(database, measurement)
 	if err != nil {
 		return false, err
 	}
 	for _, d := range dirs {
-		n, err := e.publishedVersion(ctx, nsKey, measurement, d)
+		ok, err := e.backend.Exists(ctx, path.Join(d.key, "version-hint.text"))
 		if err != nil {
-			return false, err
+			return false, fmt.Errorf("check the Iceberg version-hint of %s/%s: %w", database, measurement, err)
 		}
-		if n >= 0 {
+		if ok {
 			return true, nil
 		}
 	}

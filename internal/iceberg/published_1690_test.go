@@ -197,39 +197,48 @@ func TestPublishedRefusesUnservableStatesInsteadOfHidingThem(t *testing.T) {
 		}
 	})
 
-	t.Run("no hint serves the newest version", func(t *testing.T) {
+	// Directory readers follow the hint, and a colocated DROP deletes the
+	// hint first: a newer v<N> without one is not served.
+	t.Run("no hint is not published", func(t *testing.T) {
 		r, dir := setup(t)
-		hint := hintOf(t, dir)
 		if err := os.Remove(filepath.Join(dir, "version-hint.text")); err != nil {
-			t.Fatal(err)
-		}
-		pt := mustLoadPublished(t, r.exp, "mydb", "cpu")
-		if !strings.HasSuffix(pt.MetadataLocation, "/v"+hint+".metadata.json") {
-			t.Fatalf("served %s, want v%s", pt.MetadataLocation, hint)
-		}
-	})
-
-	t.Run("no hint and a drop marker is not served", func(t *testing.T) {
-		r, dir := setup(t)
-		r.exp.SetForgetDroppedRows(true)
-		if err := os.Remove(filepath.Join(dir, "version-hint.text")); err != nil {
-			t.Fatal(err)
-		}
-		if err := r.backend.Write(context.Background(), droppedMarkerKey("arc_mydb", "cpu"), []byte("{}")); err != nil {
 			t.Fatal(err)
 		}
 		if _, found, err := r.exp.LoadPublished(context.Background(), "mydb", "cpu"); err != nil || found {
 			t.Fatalf("found=%v err=%v, want not found", found, err)
 		}
+		if tables, err := r.exp.PublishedTables(context.Background(), "mydb", 0); err != nil || len(tables) != 0 {
+			t.Fatalf("PublishedTables = %v, %v; want none", tables, err)
+		}
 	})
 
-	t.Run("unreadable hint is an error in listings too", func(t *testing.T) {
+	// Where markers are written, a marked table is being dropped: refused,
+	// not served, while its metadata is still there.
+	t.Run("a drop marker is refused while the table is published", func(t *testing.T) {
+		r, _ := setup(t)
+		r.exp.SetForgetDroppedRows(true)
+		if err := r.backend.Write(context.Background(), droppedMarkerKey("arc_mydb", "cpu"), []byte("{}")); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := r.exp.LoadPublished(context.Background(), "mydb", "cpu"); err == nil || found {
+			t.Fatalf("found=%v err=%v, want an error", found, err)
+		}
+		// Standalone writes no markers and does not read them.
+		r.exp.SetForgetDroppedRows(false)
+		mustLoadPublished(t, r.exp, "mydb", "cpu")
+	})
+
+	// One damaged table fails its own load, not every listing.
+	t.Run("an unreadable hint fails the load and keeps the listing", func(t *testing.T) {
 		r, dir := setup(t)
 		if err := os.WriteFile(filepath.Join(dir, "version-hint.text"), []byte("garbage"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := r.exp.PublishedTables(context.Background(), "mydb", 0); err == nil {
-			t.Fatal("PublishedTables hid a table whose hint could not be read")
+		if tables, err := r.exp.PublishedTables(context.Background(), "mydb", 0); err != nil || strings.Join(tables, ",") != "cpu" {
+			t.Fatalf("PublishedTables = %v, %v; want [cpu]", tables, err)
+		}
+		if _, found, err := r.exp.LoadPublished(context.Background(), "mydb", "cpu"); err == nil || found {
+			t.Fatalf("found=%v err=%v, want an error", found, err)
 		}
 	})
 }
@@ -321,5 +330,51 @@ func TestPublishedAddressable(t *testing.T) {
 	outside := localFileURI(filepath.Join(t.TempDir(), "elsewhere"))
 	if newPublishedRig(t, root, outside, layoutWarehouse).exp.PublishedAddressable() {
 		t.Fatal("a warehouse outside the storage root reported addressable")
+	}
+}
+
+// #1690 review H1: a warehouse namespace directory is not a database. With
+// the warehouse at the storage root, "arc_mydb.db/cpu" is the warehouse
+// table's own directory, which would otherwise read as a colocated table of
+// a database named "arc_mydb.db" and be checked against that name's grants.
+func TestPublishedRefusesWarehouseDirectoriesAsDatabases(t *testing.T) {
+	for _, layout := range []string{layoutWarehouse, layoutColocated} {
+		t.Run(layout, func(t *testing.T) {
+			root := t.TempDir()
+			writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/cpu_a.parquet"), 1_700_000_000_000_000, 50)
+			newPublishedRig(t, root, "", layoutWarehouse).pass(t)
+			r := newPublishedRig(t, root, "", layout)
+			if _, found, err := r.exp.LoadPublished(context.Background(), "arc_mydb.db", "cpu"); err != nil || found {
+				t.Fatalf("LoadPublished(arc_mydb.db, cpu) = found %v, err %v; want not found", found, err)
+			}
+			if tables, err := r.exp.PublishedTables(context.Background(), "arc_mydb.db", 0); err != nil || len(tables) != 0 {
+				t.Fatalf("PublishedTables(arc_mydb.db) = %v, %v", tables, err)
+			}
+		})
+	}
+	// A subdirectory warehouse's root directory is not a database either.
+	root := t.TempDir()
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/cpu_a.parquet"), 1_700_000_000_000_000, 50)
+	r := newPublishedRig(t, root, localFileURI(filepath.Join(root, "wh")), layoutWarehouse)
+	r.pass(t)
+	if tables, err := r.exp.PublishedTables(context.Background(), "wh", 0); err != nil || len(tables) != 0 {
+		t.Fatalf("PublishedTables(wh) = %v, %v", tables, err)
+	}
+}
+
+// #1690 review H2: a colocated DROP deletes the hint first; from then on the
+// table is gone from the catalog, though v<N> files remain for a moment.
+func TestPublishedColocatedTableWithoutItsHintIsGone(t *testing.T) {
+	root := t.TempDir()
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/cpu_a.parquet"), 1_700_000_000_000_000, 50)
+	r := newPublishedRig(t, root, "", layoutColocated)
+	r.pass(t)
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/23/cpu_b.parquet"), 1_700_000_100_000_000, 5)
+	r.pass(t)
+	if err := os.Remove(filepath.Join(root, "mydb", "cpu", "metadata", "version-hint.text")); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := r.exp.LoadPublished(context.Background(), "mydb", "cpu"); err != nil || found {
+		t.Fatalf("found=%v err=%v, want not found", found, err)
 	}
 }

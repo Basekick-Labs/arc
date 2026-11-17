@@ -229,6 +229,12 @@ func TestIcebergCatalogWithTheRealRESTClient(t *testing.T) {
 	if status != http.StatusNotAcceptable {
 		t.Fatalf("DELETE table: %d %s", status, body)
 	}
+	// The warehouse's own namespace directory is not a database (review H1).
+	for _, p := range []string{"/v1/namespaces/arc_arc_mydb.db/tables/cpu", "/v1/namespaces/arc_arc_mydb.db/tables"} {
+		if status, body := rawCatalogRequest(t, http.MethodGet, uri+p, reader); status != http.StatusNotFound {
+			t.Fatalf("%s: %d %s, want 404", p, status, body)
+		}
+	}
 	if status, _ := rawCatalogRequest(t, http.MethodGet, uri+"/v1/namespaces", ""); status != http.StatusUnauthorized {
 		t.Fatalf("no token: %d, want 401", status)
 	}
@@ -305,16 +311,19 @@ func (f *fakePublished) LoadPublished(_ context.Context, db, m string) (iceberg.
 type fakeRBAC struct {
 	grants      map[string]map[string]bool
 	unavailable bool
+	// failDB and failTable fail only the per-database or per-table
+	// question, so the door still admits the caller.
+	failDB, failTable bool
 }
 
 func (r *fakeRBAC) CheckPermission(req *auth.PermissionCheckRequest) *auth.PermissionCheckResult {
-	if r.unavailable {
+	if r.unavailable || r.failTable {
 		return &auth.PermissionCheckResult{Source: auth.SourceUnavailable}
 	}
 	return &auth.PermissionCheckResult{Allowed: r.grants[req.Database][req.Measurement], Source: "rbac"}
 }
 func (r *fakeRBAC) CanAccessAnythingInErr(_ *auth.TokenInfo, db, _ string) (bool, error) {
-	if r.unavailable {
+	if r.unavailable || r.failDB {
 		return false, errors.New("store down")
 	}
 	return len(r.grants[db]) > 0, nil
@@ -397,6 +406,22 @@ func TestIcebergCatalogRBACFiltersAndHidesWhatTheCallerCannotRead(t *testing.T) 
 	if status, body := catalogGet(t, app, "GET", "/iceberg/v1/namespaces/arc_mydb/tables/cpu", tok); status != 200 || body["metadata-location"] == nil || body["metadata"] == nil {
 		t.Fatalf("load cpu: %d %v", status, body)
 	}
+
+	// The per-database and per-table questions failing on their own (the
+	// door admitted the caller) are 503s too, never a 404 or a shorter list.
+	rbac.failDB = true
+	for _, p := range []string{"/iceberg/v1/namespaces", "/iceberg/v1/namespaces/arc_mydb", "/iceberg/v1/namespaces/arc_mydb/tables"} {
+		if status, body := catalogGet(t, app, "GET", p, tok); status != 503 {
+			t.Fatalf("%s with the per-database check failing: %d %v, want 503", p, status, body)
+		}
+	}
+	rbac.failDB, rbac.failTable = false, true
+	for _, p := range []string{"/iceberg/v1/namespaces/arc_mydb/tables", "/iceberg/v1/namespaces/arc_mydb/tables/cpu"} {
+		if status, body := catalogGet(t, app, "GET", p, tok); status != 503 {
+			t.Fatalf("%s with the per-table check failing: %d %v, want 503", p, status, body)
+		}
+	}
+	rbac.failTable = false
 
 	rbac.unavailable = true
 	for _, p := range []string{"/iceberg/v1/namespaces", "/iceberg/v1/namespaces/arc_mydb/tables", "/iceberg/v1/namespaces/arc_mydb/tables/cpu"} {
@@ -505,5 +530,42 @@ func TestIcebergCatalogNotServableHere(t *testing.T) {
 	errObj, _ := body["error"].(map[string]any)
 	if status != 503 || errObj["message"] != "not the exporter" {
 		t.Fatalf("%d %v, want 503 with the reason", status, body)
+	}
+}
+
+// Clients escape a space, '#' or '?' in a name; the catalog decodes the
+// segment once, so a listed table is loadable. A second escape, a
+// separator or a control character (a multi-level namespace) is not.
+func TestIcebergCatalogDecodesEscapedNames(t *testing.T) {
+	src := &fakePublished{tables: map[string][]string{"my db": {"cpu load", "a#b"}}}
+	app, _, _ := catalogTestApp(t, src, nil)
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{
+		{"/iceberg/v1/namespaces/arc_my%20db/tables/cpu%20load", 200},
+		{"/iceberg/v1/namespaces/arc_my%20db/tables/a%23b", 200},
+		{"/iceberg/v1/namespaces/arc_my%20db/tables", 200},
+		{"/iceberg/v1/namespaces/arc_my%20db/tables/cpu%2520load", 404}, // decodes to "cpu%20load"
+		{"/iceberg/v1/namespaces/arc_my%20db/tables/a%2Fb", 404},
+		{"/iceberg/v1/namespaces/arc_my%20db%1Fx/tables", 404},
+	} {
+		if status, body := catalogGet(t, app, "GET", tc.path, ""); status != tc.status {
+			t.Fatalf("%s: %d %v, want %d", tc.path, status, body, tc.status)
+		}
+	}
+}
+
+// An empty table listing is not cached (the keys are caller-supplied), so
+// a namespace whose first table appears is listed at once.
+func TestIcebergCatalogEmptyListingIsNotCached(t *testing.T) {
+	src := &fakePublished{tables: map[string][]string{}}
+	app, _, _ := catalogTestApp(t, src, nil)
+	if status, _ := catalogGet(t, app, "GET", "/iceberg/v1/namespaces/arc_mydb/tables", ""); status != 404 {
+		t.Fatalf("before: %d, want 404", status)
+	}
+	src.tables["mydb"] = []string{"cpu"}
+	if status, body := catalogGet(t, app, "GET", "/iceberg/v1/namespaces/arc_mydb/tables", ""); status != 200 {
+		t.Fatalf("after the first table: %d %v, want 200", status, body)
 	}
 }
