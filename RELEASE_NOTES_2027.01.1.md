@@ -3888,6 +3888,33 @@ and Grafana Alloy configuration examples are in the
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1418](https://github.com/Basekick-Labs/arc/pull/1418).
 
+Follow-up hardening, in the same release:
+
+- The compressed body, the decoded protobuf and the label bytes repeated
+  across a request's samples follow `server.max_payload_size`, at most 100MB
+  (413 above it, `remote write payload exceeds 10MB limit` on a node set to
+  `10MB`). Before, a small body could decode to 100 MiB whatever the setting.
+- The repeated label bytes count label names as well as values: a name has no
+  length limit, and every sample row repeats it.
+- A request reserves the WAL space its rows actually take, rather than its
+  body size, and one larger than `wal.max_directory_mb` can ever hold is
+  answered 413 instead of a 503 Prometheus would resend forever (reachable
+  only with a small `wal.max_size_mb`: the directory holds at least four WAL
+  files).
+- A label spelled two ways in a metric (`Host` and `host`) drops only the
+  series using the other spelling, not every sample of the metric: the stored
+  column's spelling wins, otherwise the byte-smallest in the request, in any
+  series order.
+- New counters `arc_prometheus_remote_write_requests_total`, `_errors_total`,
+  `_records_total` and `_bytes_total`. Remote write no longer counts in the
+  line-protocol counters or `/api/v1/write/line-protocol/stats`.
+
+### Fix: `server.max_payload_size = 0` falls back to the default (#1383)
+
+A `server.max_payload_size` of `0` could not work: the HTTP server read it as
+its own 4MB default and MessagePack writes refused every body. Arc now logs a
+startup warning and uses the default (`1GB`); any other value is unchanged.
+
 ### Peer replication bandwidth cap ([#397](https://github.com/Basekick-Labs/arc/issues/397))
 
 `cluster.replication_pull_bytes_per_second` caps the inbound bandwidth of a

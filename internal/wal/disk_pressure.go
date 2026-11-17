@@ -313,6 +313,17 @@ func (m *DiskMonitor) Reserve(n int64) bool {
 	}
 }
 
+// MaxReservable is the most a single Reserve can ever admit, 0 when there is
+// no bound: with wal.max_directory_mb set, the directory cap less the active
+// file's header, which is never purged. Free space is not a bound here: it
+// can be freed, so a request over it is pressure and is retried.
+func (m *DiskMonitor) MaxReservable() int64 {
+	if m.cfg.MaxDirectoryBytes <= 0 {
+		return 0
+	}
+	return max(m.cfg.MaxDirectoryBytes-WALFileHeaderSize, 1)
+}
+
 // Release returns n reserved bytes: queued since (now charged as queued),
 // or never written.
 func (m *DiskMonitor) Release(n int64) {

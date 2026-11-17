@@ -652,8 +652,13 @@ func forwardStandby(router *cluster.Router, c *fiber.Ctx, forward func(context.C
 	if err != nil {
 		return true, respondWriteForwardError(c, err)
 	}
+	c.Locals(forwardedResponseLocal, true)
 	return true, CopyResponse(c, resp)
 }
+
+// forwardedResponseLocal marks a request whose answer is a peer's, copied
+// through: the node that wrote it counts it (arc_prometheus_remote_write_*).
+const forwardedResponseLocal = "arc_forwarded_response"
 
 // respondWriteForwardError answers a forwarded write that failed. Not
 // reached: 503 like a fence refusal (nothing was written, retry). Sent but no

@@ -30,6 +30,9 @@ type LoadWarning struct {
 	Message string // what the hazard is and what to do
 }
 
+// DefaultMaxPayloadSize is server.max_payload_size when unset, or set to 0.
+const DefaultMaxPayloadSize = "1GB"
+
 var memoryLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 
 // Config holds all configuration for Arc
@@ -85,7 +88,12 @@ type ServerConfig struct {
 	// credentials were never resolved, #1105). Default false — recycling on
 	// credential expiry is an operator policy; recommended for reader pools.
 	StorageCredentialsFailReady bool
-	MaxPayloadSize              int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
+	// MaxPayloadSize is the largest request body, in bytes (the HTTP body
+	// limit). MessagePack also caps its decompressed body at it, and
+	// Prometheus Remote Write its decoded body and the label bytes its
+	// samples repeat (at most 100MB); line protocol decompresses up to a
+	// fixed 100MB. A configured 0 is replaced by DefaultMaxPayloadSize.
+	MaxPayloadSize int64
 	// TLS Configuration
 	TLSEnabled  bool   // Enable HTTPS/TLS
 	TLSCertFile string // Path to TLS certificate file (PEM format)
@@ -1191,6 +1199,18 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid server.max_payload_size: %w", err)
 	}
+	// 0 cannot work: the HTTP server reads it as its own 4MB default and
+	// MessagePack refuses every body. Kept loadable (a node that starts
+	// today keeps starting), with the default in its place (#1383).
+	var payloadWarning *LoadWarning
+	if maxPayloadSize <= 0 {
+		payloadWarning = &LoadWarning{
+			Key:     "server.max_payload_size",
+			Value:   v.GetString("server.max_payload_size"),
+			Message: "server.max_payload_size is 0 or negative, which would refuse every write body: using the default " + DefaultMaxPayloadSize,
+		}
+		maxPayloadSize, _ = ParseSize(DefaultMaxPayloadSize)
+	}
 
 	// Parse S3 cache size
 	s3CacheSize, err := ParseSize(v.GetString("query.s3_cache_size"))
@@ -1751,6 +1771,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.WAL.MaxDirectoryMB < 0 {
 		return nil, fmt.Errorf("invalid wal.max_directory_mb value: %d (must be >= 0; 0 = no cap)", cfg.WAL.MaxDirectoryMB)
+	}
+	if payloadWarning != nil {
+		cfg.Warnings = append(cfg.Warnings, *payloadWarning)
 	}
 	// The cap must hold the active WAL file, the band the gate clears below
 	// and a file of margin, or the gate could never clear (#676).
@@ -2414,7 +2437,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.idle_timeout", 120)
 	v.SetDefault("server.shutdown_timeout", 30)
 	// Max payload size default - 1GB
-	v.SetDefault("server.max_payload_size", "1GB")
+	v.SetDefault("server.max_payload_size", DefaultMaxPayloadSize)
 	// TLS defaults - disabled by default for backward compatibility
 	v.SetDefault("server.tls_enabled", false)
 	v.SetDefault("server.tls_cert_file", "")

@@ -6668,9 +6668,13 @@ func (b *ArrowBuffer) flushSortKeys(database, measurement string, data map[strin
 			for name := range data {
 				// Two columns that differ only in case: take the smaller
 				// name, so the choice does not depend on map order. Ingest
-				// refuses such twins (#1342), so only data written before
-				// that has them; DuckDB may bind the other one in
-				// compaction, which is harmless for an order.
+				// refuses such twins within a write and against flushed
+				// files (#1342), but not across writes still in the buffer
+				// (two requests each with one spelling, of any format), nor
+				// when the stored spellings are unknown (field-schema
+				// registry off, or no entry for the measurement); data
+				// written before #1342 has them too. DuckDB may bind the
+				// other one in compaction, which is harmless for an order.
 				l := FoldColumnName(name)
 				if prev, ok := lower[l]; !ok || name < prev {
 					lower[l] = name
@@ -7839,4 +7843,20 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 		"flush_queue_depth":    b.queueDepth.Load(),
 		"flush_workers":        b.flushWorkers,
 	}
+}
+
+// WALMaxReservable is the most WAL bytes a request can ever reserve: the
+// installed disk gate's MaxReservable when it has one (wal.DiskMonitor with
+// wal.max_directory_mb set), otherwise 0, meaning no structural bound. A
+// request above it is refused by every Reserve, however long its sender
+// waits, so a handler answers it as too large rather than as pressure.
+func (b *ArrowBuffer) WALMaxReservable() int64 {
+	gp := b.walDiskGate.Load()
+	if gp == nil {
+		return 0
+	}
+	if g, ok := (*gp).(interface{ MaxReservable() int64 }); ok {
+		return g.MaxReservable()
+	}
+	return 0
 }

@@ -3107,6 +3107,8 @@ func main() {
 	if authManager != nil && rbacManager != nil {
 		lineProtocolHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
+	// Bounds the Prometheus Remote Write body and its decoded size (#1383).
+	lineProtocolHandler.SetMaxPayloadSize(server.GetMaxPayloadSize())
 	lineProtocolHandler.RegisterRoutes(server.GetApp())
 
 	// Register the edge-sync hub receive endpoint (#569).

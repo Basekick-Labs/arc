@@ -33,6 +33,7 @@ import (
 
 type lpWriteRig struct {
 	app *fiber.App
+	h   *LineProtocolHandler
 	buf *ingest.ArrowBuffer
 	dir string
 	log *bytes.Buffer
@@ -65,7 +66,7 @@ func newLPWriteRigRBAC(t *testing.T, cfg *config.IngestConfig, rbac RBACChecker)
 		})
 	}
 	h.RegisterRoutes(app)
-	return &lpWriteRig{app: app, buf: buf, dir: dir, log: log}
+	return &lpWriteRig{app: app, h: h, buf: buf, dir: dir, log: log}
 }
 
 func (r *lpWriteRig) post(t *testing.T, body string) (int, string) {

@@ -162,3 +162,84 @@ func BenchmarkPrometheusRemoteWriteVsLP(b *testing.B) {
 		})
 	}
 }
+
+// promBuildBody is a snappy remote-write body of series series with samples
+// samples each: about ten labels per series over 40 metric names, the shape
+// of a Kubernetes scrape.
+func promBuildBody(series, samples int) []byte {
+	var req []byte
+	ts0 := int64(1700000000000)
+	for j := 0; j < series; j++ {
+		metric := j % 40
+		labels := [][2]string{
+			{"__name__", fmt.Sprintf("container_metric_%02d", metric)},
+			{"cluster", "prod-eu-1"},
+			{"container", fmt.Sprintf("app-%d", j%12)},
+			{"instance", fmt.Sprintf("10.0.%d.%d:9100", j%8, j%200)},
+			{"job", "kubernetes-pods"},
+			{"namespace", fmt.Sprintf("team-%d", j%6)},
+			{"node", fmt.Sprintf("node-%02d", j%30)},
+			{"pod", fmt.Sprintf("app-%d-%05d", j%12, j)},
+			{"zone", fmt.Sprintf("eu-west-1%c", 'a'+j%3)},
+		}
+		if metric%2 == 0 {
+			labels = append(labels, [2]string{"code", fmt.Sprintf("%d", 200+j%5)})
+		}
+		if metric%3 == 0 {
+			labels = append(labels, [2]string{"method", "GET"})
+		}
+		sort.Slice(labels, func(a, b int) bool { return labels[a][0] < labels[b][0] })
+		var ts []byte
+		for _, l := range labels {
+			var lb []byte
+			lb = protowire.AppendTag(lb, 1, protowire.BytesType)
+			lb = protowire.AppendString(lb, l[0])
+			lb = protowire.AppendTag(lb, 2, protowire.BytesType)
+			lb = protowire.AppendString(lb, l[1])
+			ts = protowire.AppendTag(ts, 1, protowire.BytesType)
+			ts = protowire.AppendBytes(ts, lb)
+		}
+		for k := 0; k < samples; k++ {
+			var sb []byte
+			sb = protowire.AppendTag(sb, 1, protowire.Fixed64Type)
+			sb = protowire.AppendFixed64(sb, math.Float64bits(float64(j*k)+0.25))
+			sb = protowire.AppendTag(sb, 2, protowire.VarintType)
+			sb = protowire.AppendVarint(sb, uint64(ts0+int64(k)*15000))
+			ts = protowire.AppendTag(ts, 2, protowire.BytesType)
+			ts = protowire.AppendBytes(ts, sb)
+		}
+		req = protowire.AppendTag(req, 1, protowire.BytesType)
+		req = protowire.AppendBytes(req, ts)
+	}
+	return snappy.Encode(nil, req)
+}
+
+// BenchmarkPrometheusRemoteWriteBuild measures remoteWriteBuild alone:
+// decode, records and the name filter, with no buffer behind it (#1383).
+func BenchmarkPrometheusRemoteWriteBuild(b *testing.B) {
+	for _, shape := range []struct{ series, samples int }{{2000, 1}, {2000, 5}} {
+		body := promBuildBody(shape.series, shape.samples)
+		storedNames := map[string]string{}
+		for _, name := range []string{"cluster", "code", "container", "instance", "job", "method", "namespace", "node", "pod", "zone", "value", "time"} {
+			storedNames[ingest.FoldColumnName(name)] = name
+		}
+		for _, k := range []struct {
+			name  string
+			known ingest.KnownColumns
+		}{
+			{"known=nil", nil},
+			{"known=stored", func(string) map[string]string { return storedNames }},
+		} {
+			b.Run(fmt.Sprintf("series=%d/samples=%d/%s", shape.series, shape.samples, k.name), func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(body)))
+				for i := 0; i < b.N; i++ {
+					batch, err := remoteWriteBuild(body, "prod", k.known, maxRemoteWritePayloadBytes)
+					if err != nil || batch.rows != shape.series*shape.samples {
+						b.Fatalf("build: rows %v err %v", batch, err)
+					}
+				}
+			})
+		}
+	}
+}

@@ -123,10 +123,10 @@ func TestPrometheusRemoteWriteDecodesAndMapsSamples(t *testing.T) {
 	request = protowire.AppendTag(request, 3, protowire.BytesType)
 	request = protowire.AppendBytes(request, []byte{0x08, 0x01})
 
-	decoded, decodedSize, err := decodePrometheusRemoteWrite(remoteWriteTestBody(request))
+	decoded, decodedSize, err := decodePrometheusRemoteWrite(remoteWriteTestBody(request), maxRemoteWritePayloadBytes)
 	require.NoError(t, err)
 	require.Equal(t, len(request), decodedSize)
-	records, drops, err := prometheusRemoteWriteRecords(decoded)
+	records, _, drops, err := prometheusRemoteWriteRecords(decoded, "d", nil, maxRemoteWritePayloadBytes)
 	require.NoError(t, err)
 	require.Empty(t, drops)
 	require.Equal(t, []string{"host", "region"}, records["cpu"].TagColumns)
@@ -189,7 +189,7 @@ func TestDecodePrometheusRemoteWritePreservesSnappyBlockErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := decodePrometheusRemoteWrite(tt.body)
+			_, _, err := decodePrometheusRemoteWrite(tt.body, maxRemoteWritePayloadBytes)
 			require.EqualError(t, err, "invalid snappy block: snappy: corrupt input")
 		})
 	}
@@ -244,7 +244,7 @@ func TestPrometheusRemoteWriteRejectsInvalidRequestsWithoutWriting(t *testing.T)
 		{name: "missing user agent", body: valid, headers: map[string]string{fiberHeaderUserAgent: ""}, status: http.StatusBadRequest, message: "User-Agent"},
 		{name: "malformed snappy", body: []byte{0xff}, headers: nil, status: http.StatusBadRequest, message: "snappy"},
 		{name: "malformed protobuf", body: badProto, headers: nil, status: http.StatusBadRequest, message: "protobuf"},
-		{name: "decoded body limit", body: largeDecoded, headers: nil, status: http.StatusRequestEntityTooLarge, message: "100 MiB"},
+		{name: "decoded body limit", body: largeDecoded, headers: nil, status: http.StatusRequestEntityTooLarge, message: "remote write payload exceeds 100MB limit"},
 		{name: "missing metric name", body: noName, headers: nil, status: http.StatusBadRequest, message: "partial write: 1 points dropped"},
 		{name: "duplicate label", body: duplicate, headers: nil, status: http.StatusBadRequest, message: "same label twice"},
 		{name: "timestamp label", body: timeLabel, headers: nil, status: http.StatusBadRequest, message: "time"},
@@ -282,7 +282,7 @@ func TestPrometheusRemoteWriteBoundsMaterialisedColumnCells(t *testing.T) {
 			Samples: []remoteWriteSample{{Value: 1, Timestamp: int64(i)}},
 		})
 	}
-	_, _, err := prometheusRemoteWriteRecords(request)
+	_, _, _, err := prometheusRemoteWriteRecords(request, "d", nil, maxRemoteWritePayloadBytes)
 	require.ErrorIs(t, err, errRemoteWriteTooManyCells)
 	require.True(t, isRemoteWriteTooLarge(err))
 }
@@ -450,9 +450,9 @@ func TestPrometheusRemoteWriteAcceptsTheNamedV1Message(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, status, out)
 }
 
-// A measurement dropped whole (a label differing only in letter case from
-// another of the same series) leaves nothing written: the answer must not say
-// the rest was.
+// A request whose only series is dropped (a label differing only in letter
+// case from another of the same series) leaves nothing written: the answer
+// must not say the rest was.
 func TestPrometheusRemoteWriteAllDroppedSaysNothingWasWritten(t *testing.T) {
 	r := newLPWriteRig(t, nil)
 	body := remoteWriteTestBody(remoteWriteTestRequest(remoteWriteTestSeries(
@@ -478,19 +478,20 @@ func TestPrometheusRemoteWriteBoundsRepeatedLabelBytes(t *testing.T) {
 		Labels:  []remoteWriteLabel{{Name: "__name__", Value: "up"}, {Name: "pod", Value: big}},
 		Samples: samples,
 	}}}
-	_, _, err := prometheusRemoteWriteRecords(request)
-	require.ErrorIs(t, err, errRemoteWriteTooManyLabelBytes)
+	_, _, _, err := prometheusRemoteWriteRecords(request, "d", nil, maxRemoteWritePayloadBytes)
+	require.ErrorAs(t, err, &remoteWriteLimitError{})
+	require.EqualError(t, err, "remote write request repeats more than 100MB of label names and values across its samples")
 	require.True(t, isRemoteWriteTooLarge(err))
 
 	request.Timeseries[0].Samples = samples[:6000] // 6000 x 16 KiB < 100 MiB
-	_, _, err = prometheusRemoteWriteRecords(request)
+	_, _, _, err = prometheusRemoteWriteRecords(request, "d", nil, maxRemoteWritePayloadBytes)
 	require.NoError(t, err)
 }
 
 // A Snappy block declaring far more than its body can hold is refused before
 // the decoder allocates the declared length.
 func TestPrometheusRemoteWriteRefusesAnImpossibleSnappyLength(t *testing.T) {
-	_, _, err := decodePrometheusRemoteWrite(binary.AppendUvarint(nil, 50<<20))
+	_, _, err := decodePrometheusRemoteWrite(binary.AppendUvarint(nil, 50<<20), maxRemoteWritePayloadBytes)
 	require.ErrorContains(t, err, "invalid snappy block: declares")
 	require.False(t, isRemoteWriteTooLarge(err))
 }
@@ -506,7 +507,7 @@ func TestPrometheusRemoteWriteAcceptsAHighlyRepetitiveRequest(t *testing.T) {
 		[]remoteWriteTestLabel{{"__name__", "up"}, {"instance", "host-01:9100"}}, samples, false, false))
 	body := remoteWriteTestBody(request)
 	require.Greater(t, len(request)/len(body), 15, "the request must compress close to Snappy's limit")
-	_, decodedSize, err := decodePrometheusRemoteWrite(body)
+	_, decodedSize, err := decodePrometheusRemoteWrite(body, maxRemoteWritePayloadBytes)
 	require.NoError(t, err)
 	require.Equal(t, len(request), decodedSize)
 }
@@ -606,7 +607,7 @@ func TestPrometheusRemoteWriteSnappyGoldenVectors(t *testing.T) {
 	s2Repeat := []byte{0x09, 0x00, 'a', 0x01, 0x01, 0x01, 0x00}
 	// The same acceptance at the decode stage, independent of the handler:
 	// a strict Snappy decoder refuses this body as corrupt.
-	_, s2Size, err := decodePrometheusRemoteWrite(s2Repeat)
+	_, s2Size, err := decodePrometheusRemoteWrite(s2Repeat, maxRemoteWritePayloadBytes)
 	require.NoError(t, err)
 	require.Equal(t, 9, s2Size)
 
@@ -651,7 +652,7 @@ func TestPrometheusRemoteWriteSnappyGoldenVectors(t *testing.T) {
 				require.Zero(t, trig.buf.BufferedBytes())
 				return
 			}
-			request, decodedSize, err := decodePrometheusRemoteWrite(tt.body)
+			request, decodedSize, err := decodePrometheusRemoteWrite(tt.body, maxRemoteWritePayloadBytes)
 			require.NoError(t, err)
 			require.Equal(t, len(tt.decoded), decodedSize)
 			want, err := unmarshalRemoteWriteRequest(tt.decoded)

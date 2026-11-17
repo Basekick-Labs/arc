@@ -53,6 +53,12 @@ type Metrics struct {
 	lineprotocolRecordsTotal  atomic.Int64
 	lineprotocolBytesTotal    atomic.Int64
 
+	// Prometheus Remote Write specific
+	promRemoteWriteRequestsTotal atomic.Int64
+	promRemoteWriteRecordsTotal  atomic.Int64
+	promRemoteWriteBytesTotal    atomic.Int64
+	promRemoteWriteErrorsTotal   atomic.Int64
+
 	// Query metrics
 	queryRequestsTotal atomic.Int64
 	querySuccessTotal  atomic.Int64
@@ -535,6 +541,13 @@ func (m *Metrics) IncMsgPackBytes(bytes int64)   { m.msgpackBytesTotal.Add(bytes
 func (m *Metrics) IncLineProtocolRequests()           { m.lineprotocolRequestsTotal.Add(1) }
 func (m *Metrics) IncLineProtocolRecords(count int64) { m.lineprotocolRecordsTotal.Add(count) }
 func (m *Metrics) IncLineProtocolBytes(bytes int64)   { m.lineprotocolBytesTotal.Add(bytes) }
+
+// Prometheus Remote Write Metrics. Bytes are decoded (protobuf) bytes; an
+// error is a request answered 400 or above, a partial write included.
+func (m *Metrics) IncPromRemoteWriteRequests()           { m.promRemoteWriteRequestsTotal.Add(1) }
+func (m *Metrics) IncPromRemoteWriteRecords(count int64) { m.promRemoteWriteRecordsTotal.Add(count) }
+func (m *Metrics) IncPromRemoteWriteBytes(bytes int64)   { m.promRemoteWriteBytesTotal.Add(bytes) }
+func (m *Metrics) IncPromRemoteWriteErrors()             { m.promRemoteWriteErrorsTotal.Add(1) }
 
 // Query Metrics
 func (m *Metrics) IncQueryRequests() { m.queryRequestsTotal.Add(1) }
@@ -1319,6 +1332,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"lineprotocol_records_total":  m.lineprotocolRecordsTotal.Load(),
 		"lineprotocol_bytes_total":    m.lineprotocolBytesTotal.Load(),
 
+		// Prometheus Remote Write
+		"prometheus_remote_write_requests_total": m.promRemoteWriteRequestsTotal.Load(),
+		"prometheus_remote_write_records_total":  m.promRemoteWriteRecordsTotal.Load(),
+		"prometheus_remote_write_bytes_total":    m.promRemoteWriteBytesTotal.Load(),
+		"prometheus_remote_write_errors_total":   m.promRemoteWriteErrorsTotal.Load(),
+
 		// Query
 		"query_requests_total":              m.queryRequestsTotal.Load(),
 		"query_success_total":               m.querySuccessTotal.Load(),
@@ -1653,6 +1672,23 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_lineprotocol_records_total Total records via Line Protocol\n"...)
 	b = append(b, "# TYPE arc_lineprotocol_records_total counter\n"...)
 	b = appendMetric(b, "arc_lineprotocol_records_total", float64(m.lineprotocolRecordsTotal.Load()))
+
+	// Prometheus Remote Write metrics
+	b = append(b, "# HELP arc_prometheus_remote_write_requests_total Total Prometheus Remote Write requests\n"...)
+	b = append(b, "# TYPE arc_prometheus_remote_write_requests_total counter\n"...)
+	b = appendMetric(b, "arc_prometheus_remote_write_requests_total", float64(m.promRemoteWriteRequestsTotal.Load()))
+
+	b = append(b, "# HELP arc_prometheus_remote_write_records_total Total samples written via Prometheus Remote Write\n"...)
+	b = append(b, "# TYPE arc_prometheus_remote_write_records_total counter\n"...)
+	b = appendMetric(b, "arc_prometheus_remote_write_records_total", float64(m.promRemoteWriteRecordsTotal.Load()))
+
+	b = append(b, "# HELP arc_prometheus_remote_write_bytes_total Total decoded bytes received via Prometheus Remote Write\n"...)
+	b = append(b, "# TYPE arc_prometheus_remote_write_bytes_total counter\n"...)
+	b = appendMetric(b, "arc_prometheus_remote_write_bytes_total", float64(m.promRemoteWriteBytesTotal.Load()))
+
+	b = append(b, "# HELP arc_prometheus_remote_write_errors_total Prometheus Remote Write requests answered with an error (400 or above, partial writes included)\n"...)
+	b = append(b, "# TYPE arc_prometheus_remote_write_errors_total counter\n"...)
+	b = appendMetric(b, "arc_prometheus_remote_write_errors_total", float64(m.promRemoteWriteErrorsTotal.Load()))
 
 	// Query metrics
 	b = append(b, "# HELP arc_query_requests_total Total query requests\n"...)
