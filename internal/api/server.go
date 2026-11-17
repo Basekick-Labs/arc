@@ -662,6 +662,12 @@ func (s *Server) endpointMetricsHandler(c *fiber.Ctx) error {
 			"records_total":  snapshot["lineprotocol_records_total"],
 			"bytes_total":    snapshot["lineprotocol_bytes_total"],
 		},
+		"prometheus_remote_write": fiber.Map{
+			"requests_total": snapshot["prometheus_remote_write_requests_total"],
+			"records_total":  snapshot["prometheus_remote_write_records_total"],
+			"bytes_total":    snapshot["prometheus_remote_write_bytes_total"],
+			"errors_total":   snapshot["prometheus_remote_write_errors_total"],
+		},
 		"query": fiber.Map{
 			"requests_total": snapshot["query_requests_total"],
 			"success_total":  snapshot["query_success_total"],

@@ -149,6 +149,11 @@ func (c *TimeSeriesCollector) collect() {
 			"lineprotocol_requests_total": m.lineprotocolRequestsTotal.Load(),
 			"lineprotocol_records_total":  m.lineprotocolRecordsTotal.Load(),
 			"lineprotocol_bytes_total":    m.lineprotocolBytesTotal.Load(),
+			// Prometheus Remote Write specific
+			"prometheus_remote_write_requests_total": m.promRemoteWriteRequestsTotal.Load(),
+			"prometheus_remote_write_records_total":  m.promRemoteWriteRecordsTotal.Load(),
+			"prometheus_remote_write_bytes_total":    m.promRemoteWriteBytesTotal.Load(),
+			"prometheus_remote_write_errors_total":   m.promRemoteWriteErrorsTotal.Load(),
 			// Query
 			"query_requests_total": m.queryRequestsTotal.Load(),
 			"query_rows_total":     m.queryRowsTotal.Load(),

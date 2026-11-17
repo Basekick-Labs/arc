@@ -234,7 +234,7 @@ func BenchmarkPrometheusRemoteWriteBuild(b *testing.B) {
 				b.ReportAllocs()
 				b.SetBytes(int64(len(body)))
 				for i := 0; i < b.N; i++ {
-					batch, err := remoteWriteBuild(body, k.known)
+					batch, err := remoteWriteBuild(body, "prod", k.known, maxRemoteWritePayloadBytes)
 					if err != nil || batch.rows != shape.series*shape.samples {
 						b.Fatalf("build: rows %v err %v", batch, err)
 					}

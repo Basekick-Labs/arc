@@ -38,6 +38,12 @@ type LineProtocolHandler struct {
 	// Cluster routing support
 	router *cluster.Router
 
+	// maxPayloadSize is server.max_payload_size; 0 when not set (tests).
+	// Prometheus Remote Write bounds its body, its decoded size and the
+	// label bytes its samples repeat by it, at most
+	// maxRemoteWritePayloadBytes (remoteWritePayloadLimit).
+	maxPayloadSize int64
+
 	// Stats
 	totalRequests     atomic.Int64
 	totalRecords      atomic.Int64
@@ -72,6 +78,12 @@ func NewLineProtocolHandler(buffer *ingest.ArrowBuffer, logger zerolog.Logger) *
 func (h *LineProtocolHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
+}
+
+// SetMaxPayloadSize sets server.max_payload_size, which bounds a Prometheus
+// Remote Write request (see remoteWritePayloadLimit).
+func (h *LineProtocolHandler) SetMaxPayloadSize(n int64) {
+	h.maxPayloadSize = n
 }
 
 // SetRouter sets the cluster router for request forwarding.
@@ -678,7 +690,9 @@ func (h *LineProtocolHandler) writeLPMeasurements(measurements []string, rows, d
 // refusal's "retry" is true. With part written, see respondWriteStopped.
 //
 // protocol names the write in logs. The line-protocol counters move only for
-// lpProtocolName: the remote-write handler counts its errors itself.
+// lpProtocolName, the remote-write records counter only for
+// remoteWriteProtocolName; the remote-write handler counts its requests and
+// errors itself.
 func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, protocol, database string, stop *lpStop, drops []ingest.LPDrop) error {
 	lp := protocol == lpProtocolName
 	if lp {
@@ -690,8 +704,11 @@ func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, protocol, database stri
 			logPointDrops(h.logger, protocol, database, drops)
 		}
 		m := metrics.Get()
-		if lp {
+		switch protocol {
+		case lpProtocolName:
 			m.IncLineProtocolRecords(stop.rowsWritten)
+		case remoteWriteProtocolName:
+			m.IncPromRemoteWriteRecords(stop.rowsWritten)
 		}
 		m.IncIngestRecords(stop.rowsWritten)
 		return respondWriteStopped(c, h.logger, protocol, database, &ingest.WriteStoppedError{
