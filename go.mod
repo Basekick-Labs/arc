@@ -38,6 +38,7 @@ require (
 require (
 	cloud.google.com/go/auth v0.23.2
 	github.com/apache/iceberg-go v0.7.0
+	github.com/aws/aws-sdk-go-v2/service/glue v1.155.1
 	github.com/aws/smithy-go v1.28.1
 	github.com/geoarrow/geoarrow-go v0.0.0-20260403143023-f54751c3e3a1
 	github.com/googleapis/gax-go/v2 v2.24.0

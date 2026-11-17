@@ -399,6 +399,14 @@ s3_cache_ttl_seconds = 3600
 #                                    # /iceberg (uri=http(s)://<arc>/iceberg,
 #                                    # Arc token as bearer) for Snowflake, Trino,
 #                                    # Spark, PyIceberg, DuckDB. Needs enabled.
+#
+# [iceberg.glue]                     # register the tables in AWS Glue (S3 only)
+# enabled = false                    # Athena, EMR, Redshift Spectrum, Snowflake
+#                                    # (CATALOG_SOURCE = GLUE), Glue federation
+# region = ""                        # default: storage.s3_region
+# catalog_id = ""                    # default: the credentials' account
+# sync_interval = 60                 # seconds between retries of failed syncs;
+#                                    # each publish is synced at once
 
 # -----------------------------------------------------------------------------
 # Query Governance (Enterprise)

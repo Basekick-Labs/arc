@@ -89,6 +89,10 @@ type Exporter struct {
 	hintWarnMu sync.Mutex
 	hintWarned map[string]struct{}
 
+	// onPublished, when set, is told of every successful publish (Glue sync,
+	// #1690). Set during wiring, before the scheduler starts.
+	onPublished func(database, measurement string)
+
 	// servedLayoutOnce caches the warehouse layout the published-state reads
 	// (published.go) check names against.
 	servedLayoutOnce sync.Once
@@ -1716,6 +1720,13 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	if okAll {
 		e.markPublished(tbl.Identifier(), metaLoc)
 		e.clearDropMarker(ctx, tbl.Identifier())
+		// Glue sync (#1690): report the publish. The callee must not block.
+		if e.onPublished != nil {
+			ident := tbl.Identifier()
+			if db := databaseOfIdent(e.nsPrefix, ident); db != "" && len(ident) > 0 {
+				e.onPublished(db, ident[len(ident)-1])
+			}
+		}
 		if n, err := strconv.Atoi(version); err == nil {
 			e.notePublishedHint(n)
 		}

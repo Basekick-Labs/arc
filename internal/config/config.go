@@ -701,6 +701,24 @@ type IcebergConfig struct {
 	// that find tables through a catalog (Snowflake ICEBERG_REST, Trino,
 	// Spark, PyIceberg, DuckDB). Needs the export (Enabled).
 	RESTCatalogEnabled bool
+	// Glue registers the published tables in AWS Glue (#1690 option B).
+	Glue IcebergGlueConfig
+}
+
+// IcebergGlueConfig is iceberg.glue.*: one Glue table per published Arc
+// table, pointing at the version the export published, for Athena, EMR,
+// Redshift Spectrum, Snowflake (CATALOG_SOURCE = GLUE) and Glue federation.
+type IcebergGlueConfig struct {
+	Enabled bool
+	// Region of the Glue catalog; empty = storage.s3_region, the bucket's
+	// region (S3 calls fail against any other, so a working deployment has
+	// it right). The resolved region is logged at startup.
+	Region string
+	// CatalogID is the Glue catalog's account ID; empty = the caller's.
+	CatalogID string
+	// SyncInterval (seconds) is how often failed syncs are retried.
+	// Publishes are synced at once regardless.
+	SyncInterval int
 }
 
 // Iceberg export layouts (IcebergConfig.Layout).
@@ -1480,6 +1498,12 @@ func Load() (*Config, error) {
 			ColdRescanInterval:       v.GetInt("iceberg.cold_rescan_interval"),
 			Layout:                   strings.ToLower(strings.TrimSpace(v.GetString("iceberg.layout"))),
 			RESTCatalogEnabled:       v.GetBool("iceberg.rest_catalog_enabled"),
+			Glue: IcebergGlueConfig{
+				Enabled:      v.GetBool("iceberg.glue.enabled"),
+				Region:       strings.TrimSpace(v.GetString("iceberg.glue.region")),
+				CatalogID:    strings.TrimSpace(v.GetString("iceberg.glue.catalog_id")),
+				SyncInterval: v.GetInt("iceberg.glue.sync_interval"),
+			},
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -2034,6 +2058,9 @@ func Load() (*Config, error) {
 				"Iceberg catalog addresses a dotted component through an encoded key, which would apply "+
 				"to every database on this node; choose a prefix without a dot", cfg.Iceberg.NamespacePrefix)
 		}
+	}
+	if err := cfg.checkIcebergGlue(); err != nil {
+		return nil, err
 	}
 	// The catalog serves what the export publishes; without the export it
 	// would be an empty catalog that looks like a working one.
@@ -2644,6 +2671,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
 	v.SetDefault("iceberg.layout", IcebergLayoutWarehouse)
 	v.SetDefault("iceberg.rest_catalog_enabled", false)
+	v.SetDefault("iceberg.glue.enabled", false)
+	v.SetDefault("iceberg.glue.region", "")     // empty = storage.s3_region
+	v.SetDefault("iceberg.glue.catalog_id", "") // empty = the caller's account
+	v.SetDefault("iceberg.glue.sync_interval", 60)
 	v.SetDefault("iceberg.warehouse", "") // Empty = the storage root, resolved at wire time (needs the backend)
 
 	// Continuous query defaults
@@ -3596,6 +3627,34 @@ func checkIcebergWarehouseUnderS3Root(warehouse, bucket, prefix string) error {
 	}
 	if !strings.HasPrefix(strings.TrimSuffix(path, "/")+"/", want) && want != "" {
 		return refuse("a path outside storage.s3_prefix")
+	}
+	return nil
+}
+
+// glueCatalogID is a 12-digit AWS account ID.
+var glueCatalogID = regexp.MustCompile(`^[0-9]{12}$`)
+
+// checkIcebergGlue validates iceberg.glue.* (#1690 option B).
+func (c *Config) checkIcebergGlue() error {
+	g := c.Iceberg.Glue
+	if !g.Enabled {
+		return nil
+	}
+	if !c.Iceberg.Enabled {
+		return fmt.Errorf("iceberg.glue.enabled=true requires iceberg.enabled=true: Glue is given the tables the Iceberg export publishes")
+	}
+	if c.Storage.Backend != "s3" {
+		return fmt.Errorf("iceberg.glue.enabled=true requires storage.backend=\"s3\" (got %q): Glue tables point at S3 locations", c.Storage.Backend)
+	}
+	if ep := strings.ToLower(strings.TrimSpace(c.Storage.S3Endpoint)); ep != "" && !strings.Contains(ep, "amazonaws.com") {
+		return fmt.Errorf("iceberg.glue.enabled=true needs data on AWS S3, but storage.s3_endpoint is %q: AWS engines reading Glue could not read it, "+
+			"and the S3 credentials would not be valid for Glue", c.Storage.S3Endpoint)
+	}
+	if g.CatalogID != "" && !glueCatalogID.MatchString(g.CatalogID) {
+		return fmt.Errorf("iceberg.glue.catalog_id must be a 12-digit AWS account ID (got %q)", g.CatalogID)
+	}
+	if g.SyncInterval < 5 {
+		return fmt.Errorf("iceberg.glue.sync_interval must be >= 5 seconds (got %d)", g.SyncInterval)
 	}
 	return nil
 }

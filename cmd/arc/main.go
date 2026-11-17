@@ -4787,6 +4787,10 @@ func main() {
 			registerIcebergRESTCatalog(server.GetApp(), exporter, authManager, rbacManager, spokeRegistry, storageBackend,
 				icebergCatalogServable(cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend), icebergGate))
 		}
+		// #1690 option B: Glue sync starts and stops with the export.
+		if cfg.Iceberg.Glue.Enabled {
+			icebergStart = wireIcebergGlue(exporter, storageBackend, icebergGate, cfg.Iceberg.Glue, cfg.Iceberg.Layout, shutdownCoordinator, icebergStart)
+		}
 	}
 
 	// Register Continuous Query handler
