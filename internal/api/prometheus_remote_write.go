@@ -112,7 +112,7 @@ localProcessing:
 		return err
 	}
 
-	request, decodedSize, err := decodePrometheusRemoteWrite(c.Request().Body())
+	batch, err := remoteWriteBuild(c.Request().Body(), writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)))
 	if err != nil {
 		status := fiber.StatusBadRequest
 		if isRemoteWriteTooLarge(err) {
@@ -120,42 +120,7 @@ localProcessing:
 		}
 		return c.Status(status).JSON(fiber.Map{"error": err.Error()})
 	}
-
-	// A series Arc cannot store is dropped and the others are written, as
-	// line protocol drops a point (#1342). Prometheus discards a batch
-	// answered 4xx without retrying, so refusing the request for one series
-	// lost every other series sent with it.
-	records, drops, err := prometheusRemoteWriteRecords(request)
-	if err != nil {
-		status := fiber.StatusBadRequest
-		if isRemoteWriteTooLarge(err) {
-			status = fiber.StatusRequestEntityTooLarge
-		}
-		return c.Status(status).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	// In name order: RBAC reads them, and a write that stops part-way says
-	// which were written (#1437).
-	measurements := make([]string, 0, len(records))
-	for measurement := range records {
-		measurements = append(measurements, measurement)
-	}
-	sort.Strings(measurements)
-	names := ingest.NewRecordNameFilter(writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)))
-	kept := measurements[:0]
-	for _, measurement := range measurements {
-		if names.Keep(records[measurement]) {
-			kept = append(kept, measurement)
-		}
-	}
-	measurements = kept
-	drops = append(drops, names.Drops()...)
-	dropped := droppedPoints(drops)
-
-	rows := 0
-	for _, measurement := range measurements {
-		rows += len(records[measurement].Columns["time"])
-	}
+	records, measurements, drops, dropped, rows, decodedSize := batch.records, batch.measurements, batch.drops, batch.dropped, batch.rows, batch.decodedSize
 	if rows == 0 {
 		if dropped > 0 {
 			logPointDrops(h.logger, "Prometheus remote write", database, drops)
@@ -203,6 +168,67 @@ localProcessing:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
 	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// remoteWriteBatch is a decoded request mapped to the records to write.
+type remoteWriteBatch struct {
+	records      map[string]*models.ColumnarRecord
+	measurements []string // kept measurements, in name order
+	drops        []ingest.LPDrop
+	dropped      int // points dropped
+	rows         int // rows to write
+	decodedSize  int
+}
+
+// remoteWriteBuild decodes body and builds its records: every step between
+// the request body and the write admission, so the benchmark measures what
+// the handler runs. known is the measurement's stored spellings, as the
+// token may see them. err is set when the request as a whole is refused:
+// isRemoteWriteTooLarge tells 413 from 400.
+func remoteWriteBuild(body []byte, known ingest.KnownColumns) (*remoteWriteBatch, error) {
+	request, decodedSize, err := decodePrometheusRemoteWrite(body)
+	if err != nil {
+		return nil, err
+	}
+
+	// A series Arc cannot store is dropped and the others are written, as
+	// line protocol drops a point (#1342). Prometheus discards a batch
+	// answered 4xx without retrying, so refusing the request for one series
+	// lost every other series sent with it.
+	records, drops, err := prometheusRemoteWriteRecords(request)
+	if err != nil {
+		return nil, err
+	}
+
+	// In name order: RBAC reads them, and a write that stops part-way says
+	// which were written (#1437).
+	measurements := make([]string, 0, len(records))
+	for measurement := range records {
+		measurements = append(measurements, measurement)
+	}
+	sort.Strings(measurements)
+	names := ingest.NewRecordNameFilter(known)
+	kept := measurements[:0]
+	for _, measurement := range measurements {
+		if names.Keep(records[measurement]) {
+			kept = append(kept, measurement)
+		}
+	}
+	measurements = kept
+	drops = append(drops, names.Drops()...)
+
+	rows := 0
+	for _, measurement := range measurements {
+		rows += len(records[measurement].Columns["time"])
+	}
+	return &remoteWriteBatch{
+		records:      records,
+		measurements: measurements,
+		drops:        drops,
+		dropped:      droppedPoints(drops),
+		rows:         rows,
+		decodedSize:  decodedSize,
+	}, nil
 }
 
 func isRemoteWriteTooLarge(err error) bool {
