@@ -216,7 +216,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 					continue
 				}
 				if sc, err = MergeSchemas(sc, add); err != nil {
-					return reconcileResult{}, err
+					return reconcileResult{}, markConflict(err, conflictWithFiles) // no table yet: files on both sides
 				}
 				for _, f := range first {
 					delete(unread, f.PhysicalPath)
@@ -719,7 +719,7 @@ func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetabl
 		}
 		merged, err := MergeSchemas(sc, add)
 		if err != nil {
-			return tbl, sc, nil, nil, err
+			return tbl, sc, nil, nil, markConflict(err, conflictWithTable) // sc is the table's schema
 		}
 		if !schemaCovers(tbl, merged) && !canCommit() {
 			return tbl, sc, nil, nil, errWriterLost

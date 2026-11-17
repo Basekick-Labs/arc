@@ -416,6 +416,10 @@ func checkNamespaceAddressable(nsPrefix, database string) error {
 // schema (see schema_from_parquet.go). The reconciler passes this to EnsureTable.
 type ArcSchema struct {
 	Fields []ArcField
+	// sources maps a column to the storage key of the first file seen holding it, when the
+	// schema was read from files (unionFileSchemas). It only names files in a schema-conflict
+	// report (#1744); nil when unknown (a schema taken from the table).
+	sources map[string]string
 }
 
 // ArcField is one column: Name + the Arc/Arrow physical type mapped to an Iceberg type.
@@ -626,9 +630,7 @@ func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc Arc
 		// "present", skip it, and register type-incompatible files into the table. Fail the
 		// measurement instead — the table stays readable and the next pass retries.
 		if !existing.Type.Equals(f.Type) {
-			return nil, fmt.Errorf("column %q type mismatch: Iceberg table has %s, new Parquet files have %s "+
-				"(the measurement's column type changed; Iceberg cannot represent both in one column)",
-				f.Name, existing.Type, f.Type)
+			return nil, &SchemaConflictError{Column: f.Name, First: existing.Type.String(), Then: f.Type.String(), With: conflictWithTable}
 		}
 	}
 	if len(missing) == 0 {

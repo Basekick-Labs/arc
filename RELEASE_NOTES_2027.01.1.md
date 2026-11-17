@@ -2,6 +2,16 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: an Iceberg export failing on a column type change names the column ([#1744](https://github.com/Basekick-Labs/arc/issues/1744))
+
+When a measurement's column has different types in different files, or a new file disagrees with the table, Iceberg cannot hold both and the export fails that measurement on every pass. The log line said `column "..." has conflicting types`: Arc masks quoted text in every logged error, so the column name was masked too. Found on real data whose source schema changed over the years (#1690).
+
+- **Now the failure log carries fields:** `column`, `type_first` and `type_then`, `conflict_with` (`files` when two files disagree, `table` when new files disagree with the table), and `file_first` / `file_then`, the storage keys of a file holding each type, where known.
+- **The error text is unchanged and still masked.** The fields are identifiers and storage keys, which Arc already logs as plain fields. A column name is cut to 256 bytes, and invalid UTF-8 is quoted, as everywhere else Arc logs one.
+- **Behaviour is unchanged:** the measurement still fails until its files agree.
+
+No new configuration keys.
+
 ## New: Arc's Iceberg tables in AWS Glue ([#1690](https://github.com/Basekick-Labs/arc/issues/1690))
 
 With `iceberg.glue.enabled = true`, Arc keeps one AWS Glue table for each Iceberg table its export publishes. Each Glue table points at the version Arc just published. Athena, EMR, Redshift Spectrum and Snowflake (`CATALOG_SOURCE = GLUE`) read Arc's tables from Glue, and so do engines that federate Glue. Before, Glue knew nothing about Arc's tables.
