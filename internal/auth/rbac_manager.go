@@ -1934,6 +1934,17 @@ func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permi
 	return ok
 }
 
+// CanAccessAnythingInErr is CanAccessAnythingIn with the store error returned
+// rather than read as a denial. A caller whose answer an outside system
+// caches (the Iceberg REST catalog, #1690: a remote catalog can drop a table
+// that disappears from a listing) must tell "not permitted" from "the grants
+// could not be read", and answer the second with a 503.
+func (rm *RBACManager) CanAccessAnythingInErr(tokenInfo *TokenInfo, database, permission string) (bool, error) {
+	return rm.holdsGrant(tokenInfo, permission, func(pattern string) bool {
+		return matchPattern(pattern, database)
+	})
+}
+
 // HasPermissionAnywhere reports whether the token holds any grant permitting
 // `permission` on at least one measurement of at least one database.
 //

@@ -2,6 +2,23 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: a read-only Iceberg REST catalog for Snowflake, Trino, Spark, PyIceberg and DuckDB ([#1690](https://github.com/Basekick-Labs/arc/issues/1690))
+
+Arc can now serve the tables its Iceberg export publishes through the Iceberg REST catalog protocol. Before, an engine found an Arc table only by its path (`metadata/vN.metadata.json` or `version-hint.text`). Engines that discover tables through a catalog could not list them, and Snowflake read one snapshot until someone ran `ALTER ICEBERG TABLE … REFRESH` by hand. Now an engine points its catalog at `http(s)://<arc>/iceberg` and lists namespaces and tables, and loads the current version of each.
+
+- **Turn it on:** set `iceberg.rest_catalog_enabled = true` (default `false`). It needs `iceberg.enabled = true`, and refuses to start if a local `iceberg.warehouse` is outside the storage root, because no table version is ever published there.
+- **Names:** the same as the export's. A database is the namespace `<prefix>_<database>` (`arc_mydb` by default), and a measurement is a table.
+- **Snowflake:** create a catalog integration with `CATALOG_SOURCE = ICEBERG_REST`, `CATALOG_URI` set to the Arc URL ending in `/iceberg`, and `REST_AUTHENTICATION = (TYPE = BEARER, BEARER_TOKEN = '<Arc token>')`. Read the data through an external volume over the bucket. `AUTO_REFRESH = TRUE` then follows new versions as the export publishes them.
+- **Other engines:** PyIceberg, Spark and Trino use `type=rest`, `uri=<arc>/iceberg` and the Arc token as `token`. DuckDB uses `ATTACH '...' (TYPE iceberg, ENDPOINT '<arc>/iceberg', SECRET ...)` with an iceberg secret holding the token.
+- **What is served:** the version `version-hint.text` names, which is the same file directory readers use. Every node that sees the warehouse gives the same answer. Each load reads storage fresh. Listings are cached for 30 seconds.
+- **Read-only:** Arc is the only writer of its tables. Create, commit, rename and drop are refused with `406 UnsupportedOperationException`, and `/v1/config` does not advertise them.
+- **Auth:** Arc tokens work as bearer tokens. A token sees only the namespaces and tables it can read. A table it cannot read answers 404, the same as a table that does not exist. Arc does not hand out storage credentials: each engine reads storage with its own. Arc's permissions therefore control what the catalog lists, not who can read the bucket.
+- **Failures are not absences:** when storage or the permission store cannot be read, the catalog answers `503`. It never answers with a shorter list, so a remote catalog does not drop tables during an outage. The same applies to a table caught mid-drop: a version-hint naming a missing version, or a current snapshot whose manifest list is gone.
+- **Clusters:** with a shared bucket, every node can answer. With node-local storage, only the node running the export holds the metadata, and the other nodes answer `503` naming why.
+- **Limits:** edge-sync spoke namespaces are not listed, but stay readable by path. There is no credential vending and no OAuth token endpoint. Data files that a compaction deletes stay in the served version until the export's next pass, which the compaction requests right away (#1722).
+
+New configuration key: `iceberg.rest_catalog_enabled` (default `false`).
+
 ## Fix: deleting a spoke on an edge-sync hub drops its Iceberg tables ([#1730](https://github.com/Basekick-Labs/arc/issues/1730))
 
 On a hub, `DELETE /api/v1/databases/{spoke}` removed the spoke's data but left its Iceberg tables in place. This affected the default warehouse layout. Each table's catalog row and warehouse metadata (`arc_<spoke>.<db>.db/`) survived, still naming the deleted data files. Iceberg readers listing the namespace failed on them. In a local test with one spoke database of two tables, both catalog rows and 14 metadata files remained; now none do.

@@ -696,6 +696,11 @@ type IcebergConfig struct {
 	// folder (OneLake shortcuts) can read Arc's files. Existing tables keep
 	// the location they were created with, whichever layout is set.
 	Layout string
+	// RESTCatalogEnabled serves Arc's read-only Iceberg REST catalog at
+	// /iceberg (#1690): the published tables, listed and loaded by engines
+	// that find tables through a catalog (Snowflake ICEBERG_REST, Trino,
+	// Spark, PyIceberg, DuckDB). Needs the export (Enabled).
+	RESTCatalogEnabled bool
 }
 
 // Iceberg export layouts (IcebergConfig.Layout).
@@ -1474,6 +1479,7 @@ func Load() (*Config, error) {
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
 			ColdRescanInterval:       v.GetInt("iceberg.cold_rescan_interval"),
 			Layout:                   strings.ToLower(strings.TrimSpace(v.GetString("iceberg.layout"))),
+			RESTCatalogEnabled:       v.GetBool("iceberg.rest_catalog_enabled"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -2028,6 +2034,12 @@ func Load() (*Config, error) {
 				"Iceberg catalog addresses a dotted component through an encoded key, which would apply "+
 				"to every database on this node; choose a prefix without a dot", cfg.Iceberg.NamespacePrefix)
 		}
+	}
+	// The catalog serves what the export publishes; without the export it
+	// would be an empty catalog that looks like a working one.
+	if cfg.Iceberg.RESTCatalogEnabled && !cfg.Iceberg.Enabled {
+		return nil, fmt.Errorf("iceberg.rest_catalog_enabled=true requires iceberg.enabled=true: " +
+			"the catalog serves the tables the Iceberg export publishes")
 	}
 	// Checked whether or not the export is on, so a typo is caught before
 	// someone turns it on. Whether a colocated layout's warehouse is the
@@ -2631,6 +2643,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
 	v.SetDefault("iceberg.cold_rescan_interval", 3600) // seconds
 	v.SetDefault("iceberg.layout", IcebergLayoutWarehouse)
+	v.SetDefault("iceberg.rest_catalog_enabled", false)
 	v.SetDefault("iceberg.warehouse", "") // Empty = the storage root, resolved at wire time (needs the backend)
 
 	// Continuous query defaults

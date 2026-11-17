@@ -395,6 +395,10 @@ s3_cache_ttl_seconds = 3600
 #                                    # (OneLake shortcuts). Local or S3 storage,
 #                                    # warehouse at the storage root, the same
 #                                    # value on every node.
+# rest_catalog_enabled = false       # serve a read-only Iceberg REST catalog at
+#                                    # /iceberg (uri=http(s)://<arc>/iceberg,
+#                                    # Arc token as bearer) for Snowflake, Trino,
+#                                    # Spark, PyIceberg, DuckDB. Needs enabled.
 
 # -----------------------------------------------------------------------------
 # Query Governance (Enterprise)
