@@ -510,3 +510,19 @@ func TestGlueName(t *testing.T) {
 		t.Fatal("an empty name is valid")
 	}
 }
+
+// path.Dir collapses "s3://" to "s3:/"; the ownership and backwards checks
+// must compare S3 locations as URIs (found on a real S3 run: every update
+// after the first was refused as another writer's).
+func TestGlueURIDirKeepsTheScheme(t *testing.T) {
+	loc := "s3://bucket/prefix/arc_db.db/cpu/metadata/v3.metadata.json"
+	if got := uriDir(loc); got != "s3://bucket/prefix/arc_db.db/cpu/metadata" {
+		t.Fatalf("uriDir = %q", got)
+	}
+	if !sameLocation(uriDir(loc), "s3://bucket/prefix/arc_db.db/cpu/metadata") {
+		t.Fatal("an S3 metadata file is not in its own directory")
+	}
+	if sameLocation(uriDir(loc), "s3://bucket/prefix/arc_db.db/cpu2/metadata") {
+		t.Fatal("matched a sibling directory")
+	}
+}

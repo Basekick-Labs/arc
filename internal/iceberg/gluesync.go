@@ -481,7 +481,7 @@ func (g *GlueSync) arcOwnedLocation(k glueKey, loc string) bool {
 	}
 	_, dirs, _ := g.exp.publishedDirs(k.database, k.measurement)
 	for _, d := range dirs {
-		if sameLocation(path.Dir(loc), d.loc) {
+		if sameLocation(uriDir(loc), d.loc) {
 			return true
 		}
 	}
@@ -493,7 +493,7 @@ func (g *GlueSync) arcOwnedLocation(k glueKey, loc string) bool {
 // exists (a recreated table restarts at v0, so the version alone decides
 // nothing).
 func (g *GlueSync) movesBackwards(ctx context.Context, cur, next string) (bool, error) {
-	if !sameLocation(path.Dir(cur), path.Dir(next)) {
+	if !sameLocation(uriDir(cur), uriDir(next)) {
 		return false, nil
 	}
 	m := vMetadataName.FindStringSubmatch(path.Base(cur))
@@ -862,4 +862,14 @@ func NewGlueClient(backend storage.Backend, region string) (*glue.Client, error)
 		o.BaseEndpoint = nil
 		o.Retryer = retry.NewAdaptiveMode()
 	}), nil
+}
+
+// uriDir is a location URI's parent, cut at its last '/'. Not path.Dir:
+// that cleans the URI as a path and collapses "s3://bucket" into
+// "s3:/bucket", which then compares unequal to every directory location.
+func uriDir(loc string) string {
+	if i := strings.LastIndex(loc, "/"); i >= 0 {
+		return loc[:i]
+	}
+	return ""
 }
