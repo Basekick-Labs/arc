@@ -1,8 +1,10 @@
 package audit
 
 import (
+	pathpkg "path"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/gofiber/fiber/v2"
@@ -15,6 +17,11 @@ import (
 // instead of concatenating on every audited request.
 const compactionPrefix = "/api/v1/compaction"
 
+// maxRecordedField bounds every request-supplied string an event records
+// (path, database, measurement, user agent): the writer stores them as sent,
+// and a client controls their length.
+const maxRecordedField = 256
+
 // excludedPaths are never audited
 var excludedPaths = map[string]bool{
 	"/health":       true,
@@ -22,6 +29,17 @@ var excludedPaths = map[string]bool{
 	"/metrics":      true,
 	"/api/v1/logs":  true,
 	"/api/v1/ready": true,
+	// Public (internal/auth middleware PublicRoutes): authentication does not
+	// run before it, so an event could never name the caller, and clients
+	// poll it. Registered after the audit middleware since #1630.
+	"/api/v1/auth/verify": true,
+}
+
+// isRead reports the methods include_reads governs. HEAD is a GET without a
+// body (Fiber registers it beside every GET) and OPTIONS a CORS preflight;
+// neither changes anything, so both are reads (#1630 review).
+func isRead(method string) bool {
+	return method == fiber.MethodGet || method == fiber.MethodHead || method == fiber.MethodOptions
 }
 
 // DetailLocalsKey is the Fiber locals key used by handlers to supply custom
@@ -33,15 +51,18 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		path := c.Path()
 
-		// Skip excluded paths
-		if excludedPaths[path] {
+		// Skip excluded paths, matched on the cleaned path as the auth
+		// middleware matches public routes, so /api/v1/auth/verify/ is
+		// excluded too.
+		if excludedPaths[pathpkg.Clean(path)] {
 			return c.Next()
 		}
 
-		// Skip GET requests unless includeReads is enabled. Compare the
-		// borrowed string first so a skipped request allocates nothing.
+		// Skip reads (GET, HEAD, OPTIONS) unless includeReads is enabled.
+		// Compare the borrowed string first so a skipped request allocates
+		// nothing.
 		method := c.Method()
-		if !includeReads && method == "GET" {
+		if !includeReads && isRead(method) {
 			return c.Next()
 		}
 
@@ -50,6 +71,12 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 		// The event outlives the request (a background writer serialises it),
 		// so copy each retained string. The path is copied before the handler
 		// runs so a handler that rewrites it does not change the audited one.
+		//
+		// The event is classified on the full path and only the stored copy is
+		// truncated: a route ID may carry leading zeros (strconv.ParseInt
+		// accepts them), so a padded /api/v1/auth/tokens/000…5/rotate cut to
+		// 256 bytes would lose its /rotate and be filed as api.post (#1630
+		// review).
 		method = utils.CopyString(method)
 		path = utils.CopyString(path)
 		start := time.Now()
@@ -59,16 +86,16 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 
 		// Build audit event
 		duration := time.Since(start)
-		statusCode := c.Response().StatusCode()
+		statusCode := responseStatus(c, err)
 
 		event := &AuditEvent{
 			Timestamp:  start.UTC(),
 			EventType:  classifyEvent(method, path, statusCode),
 			Method:     method,
-			Path:       path,
+			Path:       truncate(path, maxRecordedField),
 			StatusCode: statusCode,
 			IPAddress:  utils.CopyString(c.IP()),
-			UserAgent:  utils.CopyString(truncate(c.Get("User-Agent"), 256)),
+			UserAgent:  utils.CopyString(truncate(c.Get("User-Agent"), maxRecordedField)),
 			DurationMs: duration.Milliseconds(),
 		}
 
@@ -88,14 +115,14 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			event.Database = c.Query("db")
 		}
 
-		event.Database = utils.CopyString(event.Database)
+		event.Database = utils.CopyString(truncate(event.Database, maxRecordedField))
 
 		event.Measurement = c.Get("x-arc-measurement")
 		if event.Measurement == "" {
 			event.Measurement = c.Params("measurement")
 		}
 
-		event.Measurement = utils.CopyString(event.Measurement)
+		event.Measurement = utils.CopyString(truncate(event.Measurement, maxRecordedField))
 
 		// Extract handler-supplied audit detail from Fiber locals if present
 		if detail, ok := c.Locals(DetailLocalsKey).(map[string]string); ok && len(detail) > 0 {
@@ -131,7 +158,9 @@ func classifyEvent(method, path string, statusCode int) string {
 		switch method {
 		case "POST":
 			return "rbac." + resource + ".created"
-		case "PUT":
+		case "PUT", "PATCH":
+			// The RBAC routes update with PATCH (internal/api/rbac_routes.go);
+			// PUT is kept for any client that sends it.
 			return "rbac." + resource + ".updated"
 		case "DELETE":
 			return "rbac." + resource + ".deleted"
@@ -244,31 +273,57 @@ func classifyTokenEvent(method, path string) string {
 	return ""
 }
 
-// extractRBACResource extracts the RBAC resource name from a path like /api/v1/rbac/organizations/...
+// rbacResources names the static path segments of the RBAC routes
+// (internal/api/rbac_routes.go) as the resource an event is about.
+var rbacResources = map[string]string{
+	"organizations":           "org",
+	"teams":                   "team",
+	"roles":                   "role",
+	"measurements":            "measurement_permission",
+	"measurement-permissions": "measurement_permission",
+	"memberships":             "membership",
+}
+
+// extractRBACResource names the resource of an RBAC route by the LAST static
+// segment of its path, not the first: POST /organizations/:org_id/teams
+// creates a team and POST /roles/:role_id/measurements a measurement
+// permission (#1630). An ID segment is never a resource name. A path with no
+// known segment is "unknown".
 func extractRBACResource(path string) string {
 	parts := strings.Split(strings.TrimPrefix(path, "/api/v1/rbac/"), "/")
-	if len(parts) > 0 && parts[0] != "" {
-		// Singularize: organizations -> org, teams -> team, roles -> role
-		r := parts[0]
-		switch r {
-		case "organizations":
-			return "org"
-		case "teams":
-			return "team"
-		case "roles":
-			return "role"
-		case "memberships":
-			return "membership"
-		default:
+	for i := len(parts) - 1; i >= 0; i-- {
+		if r, ok := rbacResources[parts[i]]; ok {
 			return r
 		}
 	}
 	return "unknown"
 }
 
+// responseStatus is the status the client receives. A handler that returns an
+// error has not set it yet: the app's error handler does, after this
+// middleware returns. It uses the same check as customErrorHandler
+// (internal/api/server.go): a plain type assertion, so a *fiber.Error wrapped
+// in another error is a 500 there and here. A 404 or 405 from the router
+// arrives the same way.
+func responseStatus(c *fiber.Ctx, err error) int {
+	if err == nil {
+		return c.Response().StatusCode()
+	}
+	if e, ok := err.(*fiber.Error); ok {
+		return e.Code
+	}
+	return fiber.StatusInternalServerError
+}
+
+// truncate cuts s to at most maxLen bytes without splitting a UTF-8
+// sequence.
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen]
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

@@ -97,9 +97,11 @@ func NewClusterHandler(
 }
 
 // captureDeleteFileAuditTarget captures and bounds target file metadata from DELETE
-// query parameters before authentication or confirmation rejections, ensuring that
-// refused attempts (401/403 auth failure, 400 missing confirmation, 409 disabled)
-// still record the target path and reason in the audit trail.
+// query parameters before authorization or confirmation rejections, ensuring that
+// refused attempts (403 from the admin check, 400 missing confirmation, 409
+// disabled) still record the target path and reason in the audit trail. A 401
+// is answered by the auth middleware, which runs before the audit middleware,
+// and is not recorded (#1630).
 func captureDeleteFileAuditTarget(c *fiber.Ctx) error {
 	if c.Method() != fiber.MethodDelete {
 		return c.Next()
