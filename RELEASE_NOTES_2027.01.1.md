@@ -5917,6 +5917,17 @@ What that costs:
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in
 [#1427](https://github.com/Basekick-Labs/arc/pull/1427).
 
+On local storage the delete also removes the empty directories the database's
+own Arc state left beside it: `_schema/<db>/` (its field-schema anchors) and
+`_compaction_state/<tier>/<db>/` (its compaction manifests). Only empty ones
+go: any manifest left in one (a compaction in flight, or one parked
+`.quarantined`) keeps its directory, and the shared tier directories stay.
+Repeating the delete of a database removed by an earlier version clears them
+too. On a cluster with per-node local storage this covers the node that serves
+the delete; empty compaction-state directories on another node, such as a
+separate compactor, are not removed (follow-up to
+[#1425](https://github.com/Basekick-Labs/arc/issues/1425)).
+
 ### Running retention executions remain visible in history ([#1415](https://github.com/Basekick-Labs/arc/issues/1415))
 
 The execution-history endpoint now includes runs whose duration is still

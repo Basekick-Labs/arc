@@ -14,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -886,6 +887,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// delete left on local storage, which keep the database listed (#1425).
 		h.dropIcebergCatalog(ctx, name)
 		removeEmptyDirectories(ctx, h.storage, name, h.logger)
+		removeDatabaseStateDirectories(ctx, h.storage, name, h.logger)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -1114,6 +1116,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// storage (#1425). An object store's prefixes cannot be removed through
 	// the backend; the listings leave out a database with nothing in it.
 	removeEmptyDirectories(ctx, h.storage, name, h.logger)
+	// And the empty directories its anchors and compaction manifests leave
+	// under the reserved roots. After a partial failure the anchors are kept
+	// (above), so their directory is not empty and stays.
+	removeDatabaseStateDirectories(ctx, h.storage, name, h.logger)
 
 	// Cached pruned path lists may name the removed files, partial or not.
 	if h.onFilesRemoved != nil {
@@ -1881,6 +1887,43 @@ func removeEmptyDirectoryTree(ctx context.Context, lister storage.DirectoryListe
 	}
 	if err := remover.RemoveDirectory(ctx, dir); err != nil {
 		logger.Debug().Err(err).Str("dir", dir).Msg("Could not remove directory (may not be empty)")
+	}
+}
+
+// removeDatabaseStateDirectories removes the directories a deleted database
+// leaves under the roots holding Arc's own state, when they hold nothing:
+// _schema/<db>/ (its field-schema anchors, deleted by
+// fieldschema.Registry.DeleteDatabase) and _compaction_state/<tier>/<db>/ (its
+// compaction manifests, deleted as each job commits). Each path is the
+// database's own segment joined under the root, never a prefix match, so a
+// database "db" never touches "db2". The tiers are listed one level deep; a
+// database's directory under a tier can hold nested ones (an edge-sync
+// spoke's databases), removed bottom-up when empty. Like
+// removeEmptyDirectories: local storage only, a directory that holds anything
+// stays (any manifest left in it, in flight or parked .quarantined, or an
+// anchor a concurrent ingest just wrote). LocalBackend.Write recreates a
+// directory removed under it, retrying once; two concurrent DELETEs of the
+// same database can remove it twice inside that window and fail the write,
+// which the next anchor flush or compaction cycle repeats. The tier
+// directories and the roots, which other databases share, stay.
+func removeDatabaseStateDirectories(ctx context.Context, backend storage.Backend, name string, logger zerolog.Logger) {
+	// Checked first so an object store, which has no directories to remove,
+	// is not sent a listing request on every delete.
+	if _, ok := backend.(storage.DirectoryRemover); !ok {
+		return
+	}
+	lister, ok := backend.(storage.DirectoryLister)
+	if !ok {
+		return
+	}
+	removeEmptyDirectories(ctx, backend, strings.TrimSuffix(fieldschema.AnchorPrefixForDatabase(name), "/"), logger)
+	tiers, err := lister.ListDirectories(ctx, compaction.ManifestBasePath+"/")
+	if err != nil {
+		logger.Debug().Err(err).Str("database", name).Msg("Could not list compaction state tiers to remove the database's directories")
+		return
+	}
+	for _, tier := range tiers {
+		removeEmptyDirectories(ctx, backend, compaction.ManifestBasePath+"/"+tier+"/"+name, logger)
 	}
 }
 
