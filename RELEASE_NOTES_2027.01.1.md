@@ -2,6 +2,17 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: on a node-local-storage cluster, deleting a database drops every node's Iceberg tables ([#1731](https://github.com/Basekick-Labs/arc/issues/1731))
+
+On a cluster whose nodes each keep their own disk, every node has its own Iceberg warehouse and catalog. A database `DELETE` runs on the primary writer and dropped only the writer's tables. Every other node that exported the database kept its tables: the node running the export, and any node that ran it before the compactor role moved. Those tables named deleted files. They stayed listed to directory readers, the REST catalog and Glue, and were never removed. In a 3-node test (writer, compactor, reader), the compactor kept 12 metadata files and its catalog row after the `DELETE`. Now it keeps none.
+
+- **How:** after a `DELETE` completes (hot files, cold objects and its own tables), the writer sends a replicated notice. Each node drops its own tables of the database once its local copies of the files are unlinked. That includes nodes that don't currently export. A repeated `DELETE`, which answers 404, sends the notice again.
+- **A recreated database is kept:** a node skips the drop while the cluster again has files under the database. That covers a database recreated right after its delete, and an old notice replayed when a node restarts. In the test, the recreated database was exported again, and a compactor restart left its table alone.
+- **Shared buckets are unchanged:** the writer's drop already covers every node there.
+- **Mixed-version clusters:** the notice is sent only once every node runs a build that applies it. Until then, the writer logs which nodes are behind.
+
+No new configuration keys.
+
 ## Fix: an Iceberg export failing on a column type change names the column ([#1744](https://github.com/Basekick-Labs/arc/issues/1744))
 
 When a measurement's column has different types in different files, or a new file disagrees with the table, Iceberg cannot hold both and the export fails that measurement on every pass. The log line said `column "..." has conflicting types`: Arc masks quoted text in every logged error, so the column name was masked too. Found on real data whose source schema changed over the years (#1690).

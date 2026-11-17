@@ -2155,7 +2155,10 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	// cleanup converges on the next delete attempt.
 	var firstErr error
 	for _, ident := range localTables {
-		if err := e.catalog.DropTable(ctx, ident); err != nil && firstErr == nil {
+		// A concurrent drop of the same database (on a node-local cluster's
+		// writer, the DELETE handler's and the cluster notice's, #1731) may
+		// have removed it since the listing: that is the outcome wanted.
+		if err := e.catalog.DropTable(ctx, ident); err != nil && !errors.Is(err, icecatalog.ErrNoSuchTable) && firstErr == nil {
 			firstErr = fmt.Errorf("drop table %v: %w", ident, err)
 		}
 	}

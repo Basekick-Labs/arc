@@ -31,9 +31,11 @@ import (
 //   - Cold tier: a writer proposes a Raft notice after it removed cold
 //     objects (NoteIcebergColdRemoved); every node hands the measurement
 //     directories to its export, which drops its cached cold listing first.
-//   - A database delete never asks, on any topology: a reconcile racing the
-//     drop could recreate a table. (The drop runs on the writer and drops the
-//     writer's catalog only; the exporter's tables are #1731.)
+//   - A database delete never asks for a reconcile, on any topology: a
+//     reconcile racing the drop could recreate a table. Its drop runs on the
+//     writer, which drops its own tables; with node-local warehouses every
+//     other node drops its own on the writer's database-drop notice (#1731,
+//     below).
 //
 // Each reaches the scheduler's RequestReconcilePaths through icebergPaths,
 // which main.go wires; unset (Iceberg off) it costs nothing, and on a node
@@ -55,6 +57,15 @@ type icebergNotifier struct {
 
 	mu       sync.Mutex
 	unlinked []string
+
+	// Database drops (#1731, below): the database:delete items queued per
+	// database, the drop notices waiting for them, notices applied before
+	// the dropper was wired, and the dropper.
+	dropMu      sync.Mutex
+	dbDeletes   map[string]int
+	dropWaiting map[string]bool
+	dropQueued  map[string]bool
+	dropper     atomic.Pointer[func(database string)]
 }
 
 // unlinkReportBatch flushes the unlink report within a long batch too: a
@@ -303,3 +314,169 @@ func (c *Coordinator) icebergSharedDelete(p, reason string) {
 // package's databaseDeleteManifestReason; the packages do not import each
 // other).
 const databaseDeleteReason = "database:delete"
+
+// Database drops on node-local warehouses (#1731).
+//
+// The writer proposes CommandIcebergDatabaseDropped after a database DELETE
+// completed (ProposeIcebergDatabaseDropped). Raft orders it after every
+// database:delete manifest delete of the database, so when it applies here
+// all of that database's local unlinks are already queued: the node drops its
+// own tables once they are done (the count of queued database:delete items
+// reaches zero), never while its copies are still on disk. A notice applied
+// before the dropper is wired (log replay at restart, a catch-up) waits,
+// bounded, until it is.
+
+// maxQueuedIcebergDrops bounds the notices kept for a dropper not wired yet:
+// one per database, and a node that never wires one (Iceberg off, a shared
+// warehouse) keeps at most this many names.
+const maxQueuedIcebergDrops = 10000
+
+// databaseOfKey is a storage key's first segment: the database, or the spoke
+// on an edge-sync hub (a database DELETE's keys are all under "{name}/").
+func databaseOfKey(p string) string {
+	db, _, _ := strings.Cut(strings.TrimLeft(p, "/"), "/")
+	return db
+}
+
+// noteDatabaseDeleteQueued counts a database:delete item handed to the
+// delete workers. Called under deletePendingMu (enqueueLocalDelete).
+func (c *Coordinator) noteDatabaseDeleteQueued(p string) {
+	db := databaseOfKey(p)
+	if db == "" {
+		return
+	}
+	n := &c.iceberg
+	n.dropMu.Lock()
+	if n.dbDeletes == nil {
+		n.dbDeletes = map[string]int{}
+	}
+	n.dbDeletes[db]++
+	n.dropMu.Unlock()
+}
+
+// noteDatabaseDeleteDone retires a database:delete item, whatever the
+// unlink's outcome, and fires a waiting drop when it was the last.
+func (c *Coordinator) noteDatabaseDeleteDone(p string) {
+	db := databaseOfKey(p)
+	if db == "" {
+		return
+	}
+	n := &c.iceberg
+	n.dropMu.Lock()
+	fire := false
+	if n.dbDeletes[db] > 0 {
+		n.dbDeletes[db]--
+	}
+	if n.dbDeletes[db] == 0 {
+		delete(n.dbDeletes, db)
+		if n.dropWaiting[db] {
+			delete(n.dropWaiting, db)
+			fire = true
+		}
+	}
+	n.dropMu.Unlock()
+	if fire {
+		c.fireIcebergDrop(db)
+	}
+}
+
+// onIcebergDatabaseDropped is the FSM's observer of applied drop notices.
+// Runs on the apply path: map updates and a non-blocking request.
+func (c *Coordinator) onIcebergDatabaseDropped(db string) {
+	n := &c.iceberg
+	n.dropMu.Lock()
+	if n.dbDeletes[db] > 0 {
+		if n.dropWaiting == nil {
+			n.dropWaiting = map[string]bool{}
+		}
+		n.dropWaiting[db] = true
+		n.dropMu.Unlock()
+		return
+	}
+	n.dropMu.Unlock()
+	c.fireIcebergDrop(db)
+}
+
+func (c *Coordinator) fireIcebergDrop(db string) {
+	n := &c.iceberg
+	if fn := n.dropper.Load(); fn != nil {
+		(*fn)(db)
+		return
+	}
+	n.dropMu.Lock()
+	if n.dropQueued == nil {
+		n.dropQueued = map[string]bool{}
+	}
+	if len(n.dropQueued) < maxQueuedIcebergDrops {
+		n.dropQueued[db] = true
+	}
+	n.dropMu.Unlock()
+}
+
+// SetIcebergDatabaseDropper wires the export's database drop (main.go: the
+// scheduler's RequestDropDatabase), only where each node's warehouse is its
+// own. fn must not block. Notices applied before it are handed over now.
+func (c *Coordinator) SetIcebergDatabaseDropper(fn func(database string)) {
+	if fn == nil {
+		return
+	}
+	n := &c.iceberg
+	n.dropMu.Lock()
+	n.dropper.Store(&fn)
+	queued := n.dropQueued
+	n.dropQueued = nil
+	n.dropMu.Unlock()
+	for db := range queued {
+		fn(db)
+	}
+}
+
+// ProposeIcebergDatabaseDropped tells every node that a database DELETE
+// completed (#1731). Proposed by the writer after its own Iceberg drop;
+// errors are for the caller to log, never to fail the DELETE. Does nothing
+// without Raft, or until every node and Raft server advertises
+// CapabilityIcebergDatabaseDropped.
+func (c *Coordinator) ProposeIcebergDatabaseDropped(ctx context.Context, database string) error {
+	if c == nil || c.raftNode == nil {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	p := raft.IcebergDatabaseDroppedPayload{Database: database}
+	if err := raft.ValidateIcebergDatabaseDropped(p); err != nil {
+		return err
+	}
+	if _, blockers := capabilityCandidates(fsm.GetAllNodes(), c.raftNode.ConfigurationServerIDs, raft.CapabilityIcebergDatabaseDropped); len(blockers) > 0 {
+		c.logger.Info().Strs("nodes", blockers).Str("database", database).
+			Msg("Iceberg database-drop notice not sent: not every node runs a build that applies it; those nodes' Iceberg tables of the deleted database stay until they are upgraded and the DELETE is repeated")
+		return nil
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return c.applyOrForward(ctx, &raft.Command{Type: raft.CommandIcebergDatabaseDropped, Payload: raw})
+}
+
+// HasManifestFilesUnder reports whether the manifest registers any file under
+// "{database}/". The export's drop is skipped then (#1731): a replayed old
+// notice of a database recreated since, or a database recreated within
+// moments of its delete, whose tables the reconcile carries forward.
+func (c *Coordinator) HasManifestFilesUnder(database string) bool {
+	if c == nil || c.raftNode == nil || database == "" {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	prefix := database + "/"
+	for _, f := range fsm.GetAllFiles() {
+		if strings.HasPrefix(f.Path, prefix) {
+			return true
+		}
+	}
+	return false
+}

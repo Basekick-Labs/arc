@@ -127,6 +127,14 @@ type Scheduler struct {
 	// request can reach. Loop goroutine only.
 	known []Measurement
 
+	// Database drops (#1731, scheduler_drop.go): requested names (reqMu),
+	// their retry state, the guard, and the databases dropped during the
+	// running pass. Loop goroutine only, except drops.
+	drops     map[string]struct{}
+	dropRetry map[string]dropRetry
+	dropGuard func(database string) bool
+	passDrops map[string]struct{}
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -228,6 +236,8 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		retrying:       make(map[string]bool),
 		wake:           make(chan struct{}, 1),
 		lastReconciled: make(map[string]time.Time),
+		drops:          make(map[string]struct{}),
+		dropRetry:      make(map[string]dropRetry),
 	}
 }
 
@@ -696,7 +706,8 @@ func (s *Scheduler) loop(ctx context.Context) {
 		case <-s.wake:
 			// A request between passes: serve it now. The timer is not
 			// touched, so the next timed pass keeps its time however many
-			// requests come in.
+			// requests come in. Drops first: they run whatever the gate.
+			s.serviceDrops(ctx)
 			s.serviceRequests(ctx)
 			continue
 		case <-timer.C:
@@ -714,6 +725,10 @@ func (s *Scheduler) loop(ctx context.Context) {
 // takes effect without a restart (nil gate = always run). It reports whether any measurement
 // was left partly registered, so the loop can come back sooner.
 func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
+	// A deleted database's tables are dropped on every node, exporting or not
+	// (#1731): this node's warehouse is its own.
+	s.passDrops = nil
+	s.serviceDrops(ctx)
 	if !s.gateOpen() {
 		if !s.gatedWarnOnce {
 			s.gatedWarnOnce = true
@@ -755,8 +770,14 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			return false
 		}
 		// A compaction that finished while this pass runs is served before the
-		// next measurement, not after the whole pass (#1722).
+		// next measurement, not after the whole pass (#1722). A database
+		// dropped meanwhile (#1731) is not reconciled again in this pass: its
+		// measurements were listed before the drop.
+		s.serviceDrops(ctx)
 		s.serviceRequests(ctx)
+		if s.droppedThisPass(m.Database) {
+			continue
+		}
 		key := m.Database + "\x00" + m.Measurement
 		seen[key] = struct{}{}
 		if _, blocked := blocked[key]; blocked {

@@ -543,6 +543,8 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		// Cold-removal notices for the Iceberg export (#1728), on every
 		// topology. Same lock rule: an atomic load and a non-blocking request.
 		c.raftFSM.SetIcebergPathsCallback(c.onIcebergNotice)
+		// Database-drop notices (#1731): map updates and a non-blocking request.
+		c.raftFSM.SetIcebergDatabaseDroppedCallback(c.onIcebergDatabaseDropped)
 
 		raftCfg := &raft.NodeConfig{
 			NodeID:            nodeID,
@@ -1121,6 +1123,9 @@ func (c *Coordinator) Stop() error {
 func (c *Coordinator) enqueueLocalDelete(path, reason string) {
 	c.deletePendingMu.Lock()
 	c.deletePending = append(c.deletePending, deleteRequest{path: path, reason: reason})
+	if reason == databaseDeleteReason {
+		c.noteDatabaseDeleteQueued(path) // #1731: a drop notice waits for these
+	}
 	n := len(c.deletePending)
 	wake := c.deleteWake
 	c.publishDeleteDepthLocked()
@@ -1266,6 +1271,9 @@ func (c *Coordinator) unlinkBatch(batch []deleteRequest, relisted func(string) (
 	for _, item := range batch {
 		c.unlinkOne(item, relisted)
 		c.deleteDone()
+		if item.reason == databaseDeleteReason {
+			c.noteDatabaseDeleteDone(item.path) // whatever the outcome (#1731)
+		}
 	}
 	c.flushUnlinked()
 }
@@ -1584,8 +1592,9 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			Msg("Phase 4 local delete worker: removed local copy")
 		c.forgetLocal(item.path)
 		// The export can drop it now (#1728). Not for a database delete:
-		// that drop removes the database's tables itself, and a reconcile
-		// racing it could recreate one. A DELETE rewrite's original only
+		// that drop removes the database's tables itself (on node-local
+		// warehouses, each node on the writer's notice once these unlinks
+		// are done, #1731), and a reconcile racing it could recreate one. A DELETE rewrite's original only
 		// once its rewrite is here: unlinked before (the unlink is not
 		// deferred without compaction commit and the journal), a reconcile
 		// would publish neither file; recordPulledFileInTiering asks when

@@ -4744,6 +4744,17 @@ func main() {
 			Gate:     icebergGate,
 			Logger:   logger.Get("iceberg"),
 		})
+		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
+		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.
+		// Every node drops its own on the writer's replicated notice, once its delete workers
+		// unlinked the database's files; skipped while the manifest has files under the database
+		// again (a replayed notice, a database recreated at once). Wired here, not at start: a
+		// notice applied meanwhile waits in the scheduler for its loop.
+		if clusterCoordinator != nil && !icebergTopo.barrier {
+			icebergScheduler.SetDropGuard(clusterCoordinator.HasManifestFilesUnder)
+			clusterCoordinator.SetIcebergDatabaseDropper(icebergScheduler.RequestDropDatabase)
+			log.Info().Msg("Iceberg export on node-local storage: this node drops its own Iceberg tables of a database deleted on the cluster")
+		}
 		// Started after tiering is set up (below), so the first pass already sees the cold tier.
 		icebergStart = icebergScheduler.Start
 		icebergExporter, icebergWalk = exporter, icebergSource

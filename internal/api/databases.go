@@ -886,6 +886,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// That residue includes the empty directories an earlier version's
 		// delete left on local storage, which keep the database listed (#1425).
 		h.dropIcebergCatalog(ctx, name)
+		h.noticeIcebergDatabaseDropped(ctx, name)
 		removeEmptyDirectories(ctx, h.storage, name, h.logger)
 		removeDatabaseStateDirectories(ctx, h.storage, name, h.logger)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -1158,6 +1159,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// finishes the job, rather than stranding a catalog entry for a database
 	// whose files are half gone.
 	h.dropIcebergCatalog(ctx, name)
+	h.noticeIcebergDatabaseDropped(ctx, name)
 	// The colocated Iceberg metadata DropDatabase just removed kept its
 	// measurement directories, and so the database, listed (#1676, #1425).
 	if h.icebergDropper != nil {
@@ -1853,6 +1855,28 @@ func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) 
 			Msg("Iceberg catalog cleanup after database drop failed; re-running the DELETE retries it")
 	} else {
 		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
+	}
+}
+
+// icebergDropNotifier is the coordinator's database-drop notice (#1731).
+type icebergDropNotifier interface {
+	ProposeIcebergDatabaseDropped(ctx context.Context, database string) error
+}
+
+// noticeIcebergDatabaseDropped tells every node that the database DELETE
+// completed, so a node with a node-local Iceberg warehouse drops its own
+// tables of it (#1731): this node's drop above covers only its own. Sent
+// whether or not this node exports to Iceberg, and on the 404 re-run too,
+// so repeating a DELETE re-sends it. A failure is logged, never returned:
+// the database is deleted.
+func (h *DatabasesHandler) noticeIcebergDatabaseDropped(ctx context.Context, name string) {
+	n, ok := h.coordinator.(icebergDropNotifier)
+	if !ok || n == nil {
+		return
+	}
+	if err := n.ProposeIcebergDatabaseDropped(ctx, name); err != nil {
+		h.logger.Warn().Err(err).Str("database", name).
+			Msg("Could not tell the cluster's nodes to drop their Iceberg tables of the deleted database; repeating the DELETE (it answers 404) sends it again")
 	}
 }
 

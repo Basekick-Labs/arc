@@ -262,6 +262,10 @@ const (
 	// cold objects it removed, for the Iceberg export (#1728). No state; see
 	// iceberg_notice.go.
 	CommandIcebergPathsChanged
+	// CommandIcebergDatabaseDropped: the primary writer saying a database
+	// DELETE completed, so every node with a node-local Iceberg warehouse
+	// drops its own tables of it (#1731). No state; see iceberg_notice.go.
+	CommandIcebergDatabaseDropped
 )
 
 // Command represents a command to be applied to the FSM.
@@ -924,6 +928,8 @@ type ClusterFSM struct {
 	onFileContentChanged func(*FileEntry)
 	onFileDeleted        func(path string, reason string)
 	onIcebergPaths       func(keys []string)
+	// onIcebergDatabaseDropped observes CommandIcebergDatabaseDropped (#1731).
+	onIcebergDatabaseDropped func(database string)
 	// Auth-state callbacks: invoked from every node's apply path so the
 	// node's local AuthManager can materialise the change into its
 	// SQLite cache (and invalidate the in-memory verify-token cache).
@@ -1451,6 +1457,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.policiesChangedIfApplied(f.applyDeleteGovernancePolicy(cmd.Payload))
 	case CommandIcebergPathsChanged:
 		return f.applyIcebergPathsChanged(cmd.Payload)
+	case CommandIcebergDatabaseDropped:
+		return f.applyIcebergDatabaseDropped(cmd.Payload)
 	case CommandEnableColdMark:
 		return f.applyEnableColdMark(cmd.Payload)
 	case CommandColdMarkAdd:
