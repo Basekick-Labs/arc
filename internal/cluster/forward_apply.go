@@ -721,12 +721,24 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// leader). No state; the worst a forged one does is ask an export to
 	// reconcile measurements it knows. Ingest roles only, and validated here
 	// so an invalid one never reaches the log.
-	isIcebergNotice := cmd.Type == clusterraft.CommandIcebergPathsChanged
-	if isIcebergNotice {
+	isIcebergNotice := cmd.Type == clusterraft.CommandIcebergPathsChanged || cmd.Type == clusterraft.CommandIcebergDatabaseDropped
+	if cmd.Type == clusterraft.CommandIcebergPathsChanged {
 		var p clusterraft.IcebergPathsChangedPayload
 		if err := json.Unmarshal(cmd.Payload, &p); err != nil || clusterraft.ValidateIcebergPathsChanged(p) != nil {
 			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: invalid Iceberg notice")
 			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "invalid iceberg notice")
+			return
+		}
+	}
+	// A database-drop notice (#1731): from the primary writer after a DELETE.
+	// No state; the worst a forged one does is make nodes drop the Iceberg
+	// tables of a database whose manifest is empty (the export skips a drop
+	// while files remain), which the next pass recreates.
+	if cmd.Type == clusterraft.CommandIcebergDatabaseDropped {
+		var p clusterraft.IcebergDatabaseDroppedPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil || clusterraft.ValidateIcebergDatabaseDropped(p) != nil {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: invalid Iceberg database-drop notice")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "invalid iceberg database-drop notice")
 			return
 		}
 	}

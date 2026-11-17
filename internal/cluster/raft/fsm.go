@@ -262,6 +262,10 @@ const (
 	// cold objects it removed, for the Iceberg export (#1728). No state; see
 	// iceberg_notice.go.
 	CommandIcebergPathsChanged
+	// CommandIcebergDatabaseDropped: the primary writer saying a database
+	// DELETE completed, so every node with a node-local Iceberg warehouse
+	// drops its own tables of it (#1731). No state; see iceberg_notice.go.
+	CommandIcebergDatabaseDropped
 )
 
 // Command represents a command to be applied to the FSM.
@@ -924,6 +928,8 @@ type ClusterFSM struct {
 	onFileContentChanged func(*FileEntry)
 	onFileDeleted        func(path string, reason string)
 	onIcebergPaths       func(keys []string)
+	// onIcebergDatabaseDropped observes CommandIcebergDatabaseDropped (#1731).
+	onIcebergDatabaseDropped func(database string)
 	// Auth-state callbacks: invoked from every node's apply path so the
 	// node's local AuthManager can materialise the change into its
 	// SQLite cache (and invalidate the in-memory verify-token cache).
@@ -1451,6 +1457,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.policiesChangedIfApplied(f.applyDeleteGovernancePolicy(cmd.Payload))
 	case CommandIcebergPathsChanged:
 		return f.applyIcebergPathsChanged(cmd.Payload)
+	case CommandIcebergDatabaseDropped:
+		return f.applyIcebergDatabaseDropped(cmd.Payload)
 	case CommandEnableColdMark:
 		return f.applyEnableColdMark(cmd.Payload)
 	case CommandColdMarkAdd:
@@ -3757,6 +3765,21 @@ func (f *ClusterFSM) HasFile(path string) bool {
 	defer f.mu.RUnlock()
 	_, ok := f.files[path]
 	return ok
+}
+
+// HasFileWithPrefix reports whether any manifest path starts with prefix,
+// without copying entries: a walk under the read lock that stops at the first
+// match (#1731's drop guard, rare; a hub's spoke files are indexed under the
+// spoke's own database, so filesByDB cannot answer it).
+func (f *ClusterFSM) HasFileWithPrefix(prefix string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for p := range f.files {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {

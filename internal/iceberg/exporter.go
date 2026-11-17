@@ -2155,7 +2155,10 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	// cleanup converges on the next delete attempt.
 	var firstErr error
 	for _, ident := range localTables {
-		if err := e.catalog.DropTable(ctx, ident); err != nil && firstErr == nil {
+		// A concurrent drop of the same database (on a node-local cluster's
+		// writer, the DELETE handler's and the cluster notice's, #1731) may
+		// have removed it since the listing: that is the outcome wanted.
+		if err := e.catalog.DropTable(ctx, ident); err != nil && !errors.Is(err, icecatalog.ErrNoSuchTable) && firstErr == nil {
 			firstErr = fmt.Errorf("drop table %v: %w", ident, err)
 		}
 	}
@@ -2296,4 +2299,57 @@ func (e *Exporter) deleteWarehouseDir(ctx context.Context, relDir string, keys [
 		}
 	}
 	return firstErr
+}
+
+// CatalogDatabases returns the top-level storage names (a database, or an
+// edge-sync spoke) of every namespace in this node's catalog under this
+// exporter's prefix (#1731's backstop).
+func (e *Exporter) CatalogDatabases(ctx context.Context) ([]string, error) {
+	rows, err := e.db.QueryContext(ctx,
+		`SELECT DISTINCT table_namespace FROM iceberg_tables WHERE catalog_name = ?`, e.catalogName)
+	if err != nil {
+		return nil, fmt.Errorf("list Iceberg catalog namespaces: %w", err)
+	}
+	defer rows.Close()
+	seen := map[string]struct{}{}
+	var out []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		first := key
+		if parts, ok := decodeCatalogNamespace(key); ok && len(parts) > 0 {
+			first = parts[0]
+		} else if i := strings.Index(key, "."); i >= 0 {
+			first = key[:i] // a spoke's dotted key: "<prefix>_<spoke>.<db>"
+		}
+		name, ok := strings.CutPrefix(first, e.nsPrefix+"_")
+		if !ok || name == "" || strings.ContainsAny(name, "/\\") {
+			continue
+		}
+		if _, dup := seen[name]; !dup {
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	return out, rows.Err()
+}
+
+// HasLocalData reports whether this node's storage holds any Parquet data
+// file under "{name}/" (colocated table metadata does not count).
+func (e *Exporter) HasLocalData(ctx context.Context, name string) (bool, error) {
+	keys, err := e.backend.List(ctx, name+"/")
+	if err != nil {
+		if storage.IsNotFound(err) || storage.IsStoreNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, k := range keys {
+		if strings.HasSuffix(k, ".parquet") && !IsColocatedMetadataKey(k) {
+			return true, nil
+		}
+	}
+	return false, nil
 }

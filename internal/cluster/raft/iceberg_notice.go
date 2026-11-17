@@ -105,3 +105,60 @@ func (f *ClusterFSM) applyIcebergPathsChanged(payload []byte) interface{} {
 	}
 	return nil
 }
+
+// Iceberg database-drop notices (#1731).
+//
+// A database DELETE runs on the primary writer, which drops its own Iceberg
+// tables. With node-local storage every node has its own warehouse and
+// catalog, and the node that exports (or exported before a lease move) keeps
+// tables naming the deleted files. After a DELETE completes (hot files, cold
+// objects and its own catalog), the writer proposes
+// CommandIcebergDatabaseDropped; Raft orders it after every manifest delete
+// of the database, and each node drops its own tables once its delete workers
+// have unlinked that database's files. Like CommandIcebergPathsChanged it
+// changes no state: Apply validates and calls the observer.
+
+// CapabilityIcebergDatabaseDropped is advertised by builds that apply
+// CommandIcebergDatabaseDropped.
+const CapabilityIcebergDatabaseDropped = "iceberg_db_dropped_v1"
+
+// IcebergDatabaseDroppedPayload names the deleted database: one path segment
+// (a plain database, or a spoke on an edge-sync hub).
+type IcebergDatabaseDroppedPayload struct {
+	Database string `json:"database"`
+}
+
+// ValidateIcebergDatabaseDropped checks a drop notice the way Apply does: one
+// non-empty segment, no separator, NUL, "." or "..".
+func ValidateIcebergDatabaseDropped(p IcebergDatabaseDroppedPayload) error {
+	d := p.Database
+	if d == "" || len(d) > MaxIcebergNoticeKeyLen || d == "." || d == ".." || strings.ContainsAny(d, "/\\\x00") {
+		return errors.New("iceberg database-drop notice: invalid database name")
+	}
+	return nil
+}
+
+// SetIcebergDatabaseDroppedCallback sets the observer of applied drop
+// notices; nil clears it. It must not block: it runs on the apply path.
+func (f *ClusterFSM) SetIcebergDatabaseDroppedCallback(fn func(database string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onIcebergDatabaseDropped = fn
+}
+
+func (f *ClusterFSM) applyIcebergDatabaseDropped(payload []byte) interface{} {
+	var p IcebergDatabaseDroppedPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal iceberg database-drop notice: %w", err)
+	}
+	if err := ValidateIcebergDatabaseDropped(p); err != nil {
+		return err
+	}
+	f.mu.RLock()
+	fn := f.onIcebergDatabaseDropped
+	f.mu.RUnlock()
+	if fn != nil {
+		fn(p.Database)
+	}
+	return nil
+}
