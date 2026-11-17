@@ -169,6 +169,15 @@ A token created before v26.06.1 lives only in the database of the node that crea
 
 Performance: authentication is unchanged. A token write on a cluster node adds one in-memory lookup in the cluster state; a change to a node-local token is a single SQLite statement instead of a cluster round-trip.
 
+## Security fix: on a cluster, team memberships always follow the token they were granted to ([#1630](https://github.com/Basekick-Labs/arc/issues/1630))
+
+On clusters upgraded from a release before v26.06.1, a team membership could be applied to the wrong token when a token kept from that release shares its ID with a cluster token. Memberships now count only for the token they were granted to, and a node drops a token's cached permissions whenever it changes that token's row.
+
+- Affected: clusters upgraded from before v26.06.1 that still hold tokens from that release. Standalone nodes that never joined a cluster are unaffected.
+- After upgrading, check the teams of tokens marked `"node_local": true` in `GET /api/v1/auth/tokens` with `GET /api/v1/auth/tokens/:id/teams`. On a node whose Raft data was rebuilt, review those tokens' teams by hand.
+
+Performance: one more primary-key join when a token's teams are loaded on a permission-cache miss (at most once per token every 30 s by default): about 4 µs more per load in a local benchmark, same allocations. Cache hits and authentication are unchanged.
+
 ## Dependencies: tests build msgpack payloads with the encoder production uses ([#1709](https://github.com/Basekick-Labs/arc/issues/1709))
 
 Test-only; no product behaviour changes. Five test files (in `internal/cluster`, `internal/wal` and `internal/ingest`) built their msgpack payloads with upstream `github.com/vmihailenco/msgpack/v5`, while Arc itself encodes and decodes with its fork, `github.com/Basekick-Labs/msgpack/v6`. They now use the fork, so the tests encode with the same library Arc decodes with (the payload bytes are equivalent either way). `vmihailenco/msgpack/v5` is no longer a direct dependency; it stays in `go.mod` as an indirect one, pulled in by `iceberg-go` through `uptrace/bun`, which uses it only for fields tagged `bun:",msgpack"`; iceberg-go's catalog models have none, so that copy is linked but never runs. `go mod tidy` also records `google.golang.org/grpc` as the direct dependency it already was (Flight SQL imports it).

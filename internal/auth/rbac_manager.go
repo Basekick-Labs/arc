@@ -1452,13 +1452,24 @@ func (rm *RBACManager) RemoveTokenFromTeamLocal(ctx context.Context, tokenID, te
 	return nil
 }
 
-// GetTokenTeams returns all teams a token belongs to
+// GetTokenTeams returns all teams a token belongs to.
+//
+// A membership the cluster wrote (raft_materialised = 1) counts only for a
+// token row the cluster wrote too. On a cluster node, the token this node
+// keeps at ID X from before v26.06.1 (unmarked) and the cluster's token with
+// the same ID are different tokens, but memberships are keyed by token_id
+// alone, so without this the node's token would inherit every team of the
+// cluster's token (#1630). An unmarked membership counts for any token: it
+// is a grant made on this node to the row this node holds at that ID.
+// Standalone nodes that never joined a cluster have no marked rows, so the
+// condition is always true there.
 func (rm *RBACManager) GetTokenTeams(tokenID int64) ([]Team, error) {
 	rows, err := rm.db.Query(`
 		SELECT t.id, t.organization_id, t.name, t.description, t.created_at, t.updated_at, t.enabled
 		FROM rbac_teams t
 		INNER JOIN rbac_token_memberships m ON t.id = m.team_id
-		WHERE m.token_id = ?
+		INNER JOIN api_tokens tok ON tok.id = m.token_id
+		WHERE m.token_id = ? AND (m.raft_materialised = 0 OR tok.raft_materialised = 1)
 		ORDER BY t.name
 	`, tokenID)
 	if err != nil {
@@ -1473,6 +1484,9 @@ func (rm *RBACManager) GetTokenTeams(tokenID int64) ([]Team, error) {
 			return nil, fmt.Errorf("failed to scan team: %w", err)
 		}
 		teams = append(teams, team)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read token teams: %w", err)
 	}
 	return teams, nil
 }

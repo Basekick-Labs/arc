@@ -170,6 +170,11 @@ type AuthManager struct {
 
 	logger zerolog.Logger
 
+	// tokenRowHook is called with a token ID after this node writes that
+	// token's api_tokens row. RBAC registers its per-token cache here: its
+	// membership query reads the row's raft_materialised (#1630).
+	tokenRowHook atomic.Pointer[func(int64)]
+
 	// proposer is the Raft seam for cluster-wide auth state replication.
 	// When non-nil (Enterprise cluster mode), every write method routes
 	// through here so the change applies on every node via the FSM. When
@@ -1404,6 +1409,7 @@ func (am *AuthManager) UpdateTokenScoped(ctx context.Context, id int64, name, de
 	}
 
 	am.InvalidateCache()
+	am.tokenRowChanged(id)
 	return TokenWriteResult{}, nil
 }
 
@@ -1489,6 +1495,7 @@ func (am *AuthManager) updateNodeLocalToken(p RaftProposer, t *tokenWriteTarget,
 		return TokenWriteResult{}, errTokenNameExists(*name)
 	}
 	am.InvalidateCache()
+	am.tokenRowChanged(t.row.id)
 	am.logLocalWrite(t, "update")
 	return t.result(), nil
 }
@@ -1535,6 +1542,7 @@ func (am *AuthManager) DeleteTokenScoped(ctx context.Context, id int64, opts Tok
 	}
 
 	am.InvalidateCache()
+	am.tokenRowChanged(id)
 	am.logger.Info().Int64("token_id", id).Msg("Deleted API token")
 	return TokenWriteResult{}, nil
 }
@@ -1585,6 +1593,7 @@ func (am *AuthManager) RevokeTokenScoped(ctx context.Context, id int64, opts Tok
 	}
 
 	am.InvalidateCache()
+	am.tokenRowChanged(id)
 	am.logger.Info().Int64("token_id", id).Msg("Revoked API token")
 	return TokenWriteResult{}, nil
 }
@@ -1675,6 +1684,7 @@ func (am *AuthManager) RotateTokenScoped(ctx context.Context, id int64, opts Tok
 	}
 
 	am.InvalidateCache()
+	am.tokenRowChanged(id)
 	am.logger.Info().Int64("token_id", id).Msg("Rotated API token")
 	return token, TokenWriteResult{}, nil
 }
@@ -1703,6 +1713,7 @@ func (am *AuthManager) rotateNodeLocalToken(t *tokenWriteTarget, token, hash, pr
 		return "", TokenWriteResult{}, errTokenChanged(t.row.id, t.nodeID)
 	}
 	am.InvalidateCache()
+	am.tokenRowChanged(t.row.id)
 	am.logLocalWrite(t, "rotate")
 	return token, t.result(), nil
 }
@@ -1990,6 +2001,24 @@ func (am *AuthManager) ForceAddRecoveryToken(ctx context.Context, tokenValue str
 	am.logger.Warn().Msg("Recovery admin token created; existing tokens untouched — use the API to revoke any unwanted tokens after regaining access")
 
 	return token, nil
+}
+
+// SetTokenRowChangedHook registers fn, called with a token ID after this
+// node writes that token's row (an apply, an adoption, or a write through the
+// API). A nil fn removes it. RBAC uses it to drop its cache for that token.
+func (am *AuthManager) SetTokenRowChangedHook(fn func(tokenID int64)) {
+	if fn == nil {
+		am.tokenRowHook.Store(nil)
+		return
+	}
+	am.tokenRowHook.Store(&fn)
+}
+
+// tokenRowChanged calls the hook registered by SetTokenRowChangedHook, if any.
+func (am *AuthManager) tokenRowChanged(id int64) {
+	if fn := am.tokenRowHook.Load(); fn != nil {
+		(*fn)(id)
+	}
 }
 
 // InvalidateCache clears the token cache

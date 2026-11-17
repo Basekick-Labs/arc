@@ -12,7 +12,7 @@ import (
 )
 
 // setupTestRBACManager creates a test RBACManager with a temporary database
-func setupTestRBACManager(t *testing.T) (*RBACManager, *AuthManager, func()) {
+func setupTestRBACManager(t testing.TB) (*RBACManager, *AuthManager, func()) {
 	t.Helper()
 
 	tmpDir, err := os.MkdirTemp("", "arc-rbac-test-*")

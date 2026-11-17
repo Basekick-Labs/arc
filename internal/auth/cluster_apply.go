@@ -147,6 +147,7 @@ func (am *AuthManager) invalidateAndReturn(err error) error {
 // Cache invalidate happens unconditionally so concurrent VerifyToken
 // calls on this node pick up the new row on next check.
 func (am *AuthManager) ApplyCreateToken(entry ClusterTokenEntry) error {
+	defer am.tokenRowChanged(entry.ID) // RBAC's per-token cache reads this row (#1630)
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyCreateToken: id required")
 	}
@@ -225,6 +226,7 @@ func (am *AuthManager) ApplyCreateToken(entry ClusterTokenEntry) error {
 // (ChangedFields gating), so by the time we get here every field on
 // the entry holds the post-update authoritative value.
 func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
+	defer am.tokenRowChanged(entry.ID) // RBAC's per-token cache reads this row (#1630)
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyUpdateToken: id required")
 	}
@@ -271,6 +273,7 @@ func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
 // authenticating against the local stale cache (a security regression).
 // Gemini #451 round-3 review.
 func (am *AuthManager) ApplyRevokeToken(id int64) error {
+	defer am.tokenRowChanged(id) // RBAC's per-token cache reads this row (#1630)
 	if id == 0 {
 		return fmt.Errorf("ApplyRevokeToken: id required")
 	}
@@ -300,6 +303,7 @@ func (am *AuthManager) ApplyRevokeToken(id int64) error {
 // NOT returned as an error — the desired post-state (no row) is the
 // same either way. Gemini #451 round-3 review.
 func (am *AuthManager) ApplyDeleteToken(id int64) error {
+	defer am.tokenRowChanged(id) // RBAC's per-token cache reads this row (#1630)
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteToken: id required")
 	}
@@ -326,6 +330,7 @@ func (am *AuthManager) ApplyDeleteToken(id int64) error {
 // against the OLD plaintext (via the OLD hash that's still in the local
 // cache) until the cache TTL expires. Gemini #451 round-3 review.
 func (am *AuthManager) ApplyRotateToken(id int64, newHash, newPrefix string) error {
+	defer am.tokenRowChanged(id) // RBAC's per-token cache reads this row (#1630)
 	if id == 0 {
 		return fmt.Errorf("ApplyRotateToken: id required")
 	}

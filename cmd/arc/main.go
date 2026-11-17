@@ -2859,6 +2859,9 @@ func main() {
 			MaxCascadeDescendants: cfg.Cluster.RBACMaxCascadeDescendants,
 		})
 		shutdownCoordinator.Register("rbac", rbacManager, shutdown.PriorityAuth)
+		// RBAC's per-token cache reads api_tokens.raft_materialised; drop
+		// it when this node writes a token's row (#1630).
+		authManager.SetTokenRowChangedHook(rbacManager.InvalidateTokenCache)
 		if rbacManager.IsRBACEnabled() {
 			log.Info().Msg("Enterprise RBAC enabled")
 		}
