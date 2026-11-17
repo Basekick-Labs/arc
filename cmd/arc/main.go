@@ -2805,42 +2805,94 @@ func main() {
 	// Register base routes
 	server.RegisterRoutes()
 
+	// Initialize Audit Logging (Enterprise feature - requires valid license).
+	// Built here, before any API route; installed with Use right after the
+	// auth middleware (or, with auth off, before the first route below), so
+	// it sees the caller's identity and wraps every route registered after
+	// it. Until #1630 it was installed after the auth and RBAC routes, which
+	// therefore were never audited. checkAuditCoverage verifies the order at
+	// startup.
+	var auditLogger *audit.Logger
+	var auditMiddleware fiber.Handler
+	// Middleware the Flight SQL bridge runs after auth, as the main app does
+	// (internal/api/flight_sql.go): the audit middleware when audit is on.
+	var flightSQLMiddleware []fiber.Handler
+	if cfg.AuditLog.Enabled {
+		if licenseClient == nil {
+			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
+		} else if !licenseClient.CanUseAuditLogging() {
+			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
+		} else {
+			// Share the auth manager's SQLite handle when there is one. Audit
+			// and auth are enabled independently (this block is gated on the
+			// license, not on cfg.Auth.Enabled), so authManager may be nil —
+			// sharedSQLiteHandle falls back to a dedicated handle we own.
+			auditDB, auditOwnsDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
+			} else {
+				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
+					DB:     auditDB,
+					Config: &cfg.AuditLog,
+					Logger: logger.Get("audit"),
+				})
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
+					if auditOwnsDB {
+						auditDB.Close()
+					}
+				} else {
+					auditLogger.Start()
+					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
+						auditLogger.Stop()
+						// audit.Logger never closes its DB — it may be borrowed.
+						// Close it here only when this block opened it.
+						if auditOwnsDB {
+							return auditDB.Close()
+						}
+						return nil
+					}, shutdown.PriorityCompaction)
+
+					// Installed below, after the auth middleware. The Flight SQL
+					// bridge gets the same middleware (flightSQLMiddleware).
+					auditMiddleware = audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads)
+					flightSQLMiddleware = append(flightSQLMiddleware, auditMiddleware)
+
+					log.Info().
+						Int("retention_days", cfg.AuditLog.RetentionDays).
+						Bool("include_reads", cfg.AuditLog.IncludeReads).
+						Msg("Audit logging enabled")
+				}
+			}
+		}
+	}
+
+	// The paths the auth middleware lets through without a token. The audit
+	// coverage check (below, before the server starts) allows them ahead of
+	// the audit middleware: they are registered before it on purpose.
+	authPublicRoutes, authPublicPrefixes := authPublicPaths()
+
 	// Apply auth middleware if enabled
 	var rbacManager *auth.RBACManager
 	if authManager != nil {
 		middlewareConfig := auth.DefaultMiddlewareConfig()
 		middlewareConfig.AuthManager = authManager
-		// Add public routes that don't need auth
-		// Note: /api/v1/internal/cache/invalidate is public because cluster peers
-		// call it without an auth token after compaction. Access is gated by
-		// HMAC-SHA256 validation in the handler (see handleCacheInvalidate); the
-		// receiver refuses every request when cluster.shared_secret is empty.
-		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/ready/write", "/api/v1/auth/verify", api.CacheInvalidatePath)
-		// /metrics stays public — Prometheus scrapers expect it. It is
-		// already in auth.DefaultMiddlewareConfig().PublicPrefixes, so no
-		// further append is needed here. /debug/pprof is intentionally NOT
-		// here: pprof is no longer mounted on the public Fiber app
-		// (internal/api/server.go). The opt-in localhost pprof listener
-		// runs on a separate port; see startDebugPprofIfEnabled.
-		//
-		// The JSON metrics endpoints (/api/v1/metrics and its sub-paths) are
-		// deliberately public, equivalent to the existing Prometheus /metrics
-		// surface: aggregate operational counters plus Go runtime/GC stats and
-		// host-arch fingerprinting (go_version/os/arch). They expose no queries,
-		// database/measurement names, file paths, or credentials, and monitoring
-		// dashboards poll them without a token. Whitelist them explicitly so
-		// their public status is an auditable decision, not an accident of
-		// registration order (they were previously reachable only because
-		// RegisterRoutes runs before this middleware; see GHSA-m3qr-fvp4-78xj).
-		// /api/v1/logs, by contrast, is NOT public — it is registered with admin
-		// auth below.
-		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/api/v1/metrics")
+		// The public routes and prefixes, and why each is public, are in
+		// authPublicPaths (cmd/arc/audit_coverage.go).
+		middlewareConfig.PublicRoutes = authPublicRoutes
+		middlewareConfig.PublicPrefixes = authPublicPrefixes
 		// A peer forwards a request with a signed identity instead of the
 		// caller's credential (#1305).
 		if clusterCoordinator != nil {
 			middlewareConfig.ForwardIdentity = api.ForwardIdentityVerifier(clusterCoordinator)
 		}
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
+		// Audit next: after auth, so it records the caller; before every
+		// route below, so it sees them (#1630). 401s answered by the auth
+		// middleware itself never reach it.
+		if auditMiddleware != nil {
+			server.GetApp().Use(auditMiddleware)
+		}
 
 		// Register the admin-authenticated logs route AFTER the auth
 		// middleware so it sits later in the Fiber stack and is actually
@@ -3035,65 +3087,12 @@ func main() {
 		// Authentication disabled: register the logs route unguarded so the
 		// endpoint still works for no-auth deployments. (When auth is enabled
 		// it is registered with admin auth inside the block above, after the
-		// middleware — GHSA-m3qr-fvp4-78xj.)
-		server.RegisterLogsRoute(nil)
-	}
-
-	// Initialize Audit Logging (Enterprise feature - requires valid license)
-	// Must be registered before API routes so the middleware captures all requests
-	var auditLogger *audit.Logger
-	// Middleware the Flight SQL bridge runs after auth, as the main app does
-	// (internal/api/flight_sql.go): the audit middleware when audit is on.
-	var flightSQLMiddleware []fiber.Handler
-	if cfg.AuditLog.Enabled {
-		if licenseClient == nil {
-			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
-		} else if !licenseClient.CanUseAuditLogging() {
-			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
-		} else {
-			// Share the auth manager's SQLite handle when there is one. Audit
-			// and auth are enabled independently (this block is gated on the
-			// license, not on cfg.Auth.Enabled), so authManager may be nil —
-			// sharedSQLiteHandle falls back to a dedicated handle we own.
-			auditDB, auditOwnsDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
-			} else {
-				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
-					DB:     auditDB,
-					Config: &cfg.AuditLog,
-					Logger: logger.Get("audit"),
-				})
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
-					if auditOwnsDB {
-						auditDB.Close()
-					}
-				} else {
-					auditLogger.Start()
-					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
-						auditLogger.Stop()
-						// audit.Logger never closes its DB — it may be borrowed.
-						// Close it here only when this block opened it.
-						if auditOwnsDB {
-							return auditDB.Close()
-						}
-						return nil
-					}, shutdown.PriorityCompaction)
-
-					// Register audit middleware BEFORE API routes. The Flight SQL
-					// bridge gets the same middleware (flightSQLMiddleware).
-					auditMiddleware := audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads)
-					server.GetApp().Use(auditMiddleware)
-					flightSQLMiddleware = append(flightSQLMiddleware, auditMiddleware)
-
-					log.Info().
-						Int("retention_days", cfg.AuditLog.RetentionDays).
-						Bool("include_reads", cfg.AuditLog.IncludeReads).
-						Msg("Audit logging enabled")
-				}
-			}
+		// middleware — GHSA-m3qr-fvp4-78xj.) Audit, when on, before it and
+		// every later route (#1630).
+		if auditMiddleware != nil {
+			server.GetApp().Use(auditMiddleware)
 		}
+		server.RegisterLogsRoute(nil)
 	}
 
 	// Register MessagePack handler with Arrow buffer
@@ -5952,6 +5951,12 @@ func main() {
 	// cluster coordinator is up, and all background schedulers are running.
 	// In single-writer deployments this is also the signal to Kubernetes
 	// readiness probes / any LB doing httpchk that the node is healthy.
+	// Every route is registered by now: check that none sits ahead of the
+	// audit middleware (#1630). Logged, never fatal.
+	if auditMiddleware != nil {
+		checkAuditCoverage(server.GetApp(), auditMiddleware, authPublicRoutes, authPublicPrefixes, log.Logger)
+	}
+
 	server.MarkReady()
 
 	// Start server

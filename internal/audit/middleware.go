@@ -1,8 +1,10 @@
 package audit
 
 import (
+	"errors"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/gofiber/fiber/v2"
@@ -14,6 +16,11 @@ import (
 // compaction action. Declared const so prefix+"/" folds at compile time
 // instead of concatenating on every audited request.
 const compactionPrefix = "/api/v1/compaction"
+
+// maxRecordedField bounds every request-supplied string an event records
+// (path, database, measurement, user agent): the writer stores them as sent,
+// and a client controls their length.
+const maxRecordedField = 256
 
 // excludedPaths are never audited
 var excludedPaths = map[string]bool{
@@ -51,7 +58,7 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 		// so copy each retained string. The path is copied before the handler
 		// runs so a handler that rewrites it does not change the audited one.
 		method = utils.CopyString(method)
-		path = utils.CopyString(path)
+		path = utils.CopyString(truncate(path, maxRecordedField))
 		start := time.Now()
 
 		// Execute the handler
@@ -59,7 +66,7 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 
 		// Build audit event
 		duration := time.Since(start)
-		statusCode := c.Response().StatusCode()
+		statusCode := responseStatus(c, err)
 
 		event := &AuditEvent{
 			Timestamp:  start.UTC(),
@@ -68,7 +75,7 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			Path:       path,
 			StatusCode: statusCode,
 			IPAddress:  utils.CopyString(c.IP()),
-			UserAgent:  utils.CopyString(truncate(c.Get("User-Agent"), 256)),
+			UserAgent:  utils.CopyString(truncate(c.Get("User-Agent"), maxRecordedField)),
 			DurationMs: duration.Milliseconds(),
 		}
 
@@ -88,14 +95,14 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			event.Database = c.Query("db")
 		}
 
-		event.Database = utils.CopyString(event.Database)
+		event.Database = utils.CopyString(truncate(event.Database, maxRecordedField))
 
 		event.Measurement = c.Get("x-arc-measurement")
 		if event.Measurement == "" {
 			event.Measurement = c.Params("measurement")
 		}
 
-		event.Measurement = utils.CopyString(event.Measurement)
+		event.Measurement = utils.CopyString(truncate(event.Measurement, maxRecordedField))
 
 		// Extract handler-supplied audit detail from Fiber locals if present
 		if detail, ok := c.Locals(DetailLocalsKey).(map[string]string); ok && len(detail) > 0 {
@@ -131,7 +138,9 @@ func classifyEvent(method, path string, statusCode int) string {
 		switch method {
 		case "POST":
 			return "rbac." + resource + ".created"
-		case "PUT":
+		case "PUT", "PATCH":
+			// The RBAC routes update with PATCH (internal/api/rbac_routes.go);
+			// PUT is kept for any client that sends it.
 			return "rbac." + resource + ".updated"
 		case "DELETE":
 			return "rbac." + resource + ".deleted"
@@ -244,31 +253,57 @@ func classifyTokenEvent(method, path string) string {
 	return ""
 }
 
-// extractRBACResource extracts the RBAC resource name from a path like /api/v1/rbac/organizations/...
+// rbacResources names the static path segments of the RBAC routes
+// (internal/api/rbac_routes.go) as the resource an event is about.
+var rbacResources = map[string]string{
+	"organizations":           "org",
+	"teams":                   "team",
+	"roles":                   "role",
+	"measurements":            "measurement_permission",
+	"measurement-permissions": "measurement_permission",
+	"memberships":             "membership",
+}
+
+// extractRBACResource names the resource of an RBAC route by the LAST static
+// segment of its path, not the first: POST /organizations/:org_id/teams
+// creates a team and POST /roles/:role_id/measurements a measurement
+// permission (#1630). An ID segment is never a resource name. A path with no
+// known segment is "unknown".
 func extractRBACResource(path string) string {
 	parts := strings.Split(strings.TrimPrefix(path, "/api/v1/rbac/"), "/")
-	if len(parts) > 0 && parts[0] != "" {
-		// Singularize: organizations -> org, teams -> team, roles -> role
-		r := parts[0]
-		switch r {
-		case "organizations":
-			return "org"
-		case "teams":
-			return "team"
-		case "roles":
-			return "role"
-		case "memberships":
-			return "membership"
-		default:
+	for i := len(parts) - 1; i >= 0; i-- {
+		if r, ok := rbacResources[parts[i]]; ok {
 			return r
 		}
 	}
 	return "unknown"
 }
 
+// responseStatus is the status the client receives. A handler that returns an
+// error has not set it yet: the app's error handler does, after this
+// middleware returns, with the *fiber.Error code or 500
+// (internal/api/server.go customErrorHandler). A 404 or 405 from the router
+// arrives the same way.
+func responseStatus(c *fiber.Ctx, err error) int {
+	if err == nil {
+		return c.Response().StatusCode()
+	}
+	var fe *fiber.Error
+	if errors.As(err, &fe) {
+		return fe.Code
+	}
+	return fiber.StatusInternalServerError
+}
+
+// truncate cuts s to at most maxLen bytes without splitting a UTF-8
+// sequence.
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen]
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

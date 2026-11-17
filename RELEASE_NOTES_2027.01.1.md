@@ -178,6 +178,26 @@ On clusters upgraded from a release before v26.06.1, a team membership could be 
 
 Performance: one more primary-key join when a token's teams are loaded on a permission-cache miss (at most once per token every 30 s by default): about 4 µs more per load in a local benchmark, same allocations. Cache hits and authentication are unchanged.
 
+## Fix: token, team and role changes are recorded in the audit log ([#1630](https://github.com/Basekick-Labs/arc/issues/1630))
+
+Audit logging (Enterprise) has never recorded a change made through `/api/v1/auth/tokens/*` or `/api/v1/rbac/*`. Those routes were registered ahead of the audit middleware, so the `token.*` and `rbac.*` events in the documentation were never written, on any version since audit logging shipped.
+
+- **Now recorded:** creating, updating, rotating, revoking and deleting a token, adding a token to a team or removing it, and every change to an organization, team, role or measurement permission. The actor is the token name.
+- **Refusals:** a request whose token is valid but not an admin (403) is recorded as `auth.failed`. A request with no token or an invalid one is still refused by authentication **before** the audit log and is **not** recorded; this was true before and is unchanged.
+- **Event names:**
+  - RBAC events are now named after the resource the route changes, not the first segment of its path.
+  - A team created under an organization is `rbac.team.created` (it would have been `rbac.org.created`).
+  - A role created under a team is `rbac.role.created`.
+  - A measurement permission is `rbac.measurement_permission.created` or `.deleted`.
+  - An update, which these routes do with `PATCH`, is `rbac.<resource>.updated` (it would have been `.read`).
+  - Token events use the names in the section above.
+- **With `audit_log.include_reads = true`:** token and RBAC reads are recorded, and so is `GET /api/v1/auth/verify`, as `api.get` with actor `anonymous` (it is a public route: authentication does not run before it, so the event never names the caller). A client that calls verify on every command adds one event per call.
+- **Status recorded:** an event for a request that ended in an error (for example a `404` for an unknown ID, a `405`, or a `500`) now records that status. It used to record `200`.
+- **Recorded fields:** the path, database and measurement in an event are capped at 256 bytes, like the user agent already was.
+- **Startup check:** with audit logging on, Arc checks at startup that every non-public route runs after the audit middleware and that it is installed once. A failure is logged at error level, naming the routes; startup continues.
+- **Not recovered:** changes made before this release were not recorded and cannot be recovered.
+- **Performance:** none on the request path. The audit middleware moved earlier in the same stack; one walk of the route table at startup.
+
 ## Dependencies: tests build msgpack payloads with the encoder production uses ([#1709](https://github.com/Basekick-Labs/arc/issues/1709))
 
 Test-only; no product behaviour changes. Five test files (in `internal/cluster`, `internal/wal` and `internal/ingest`) built their msgpack payloads with upstream `github.com/vmihailenco/msgpack/v5`, while Arc itself encodes and decodes with its fork, `github.com/Basekick-Labs/msgpack/v6`. They now use the fork, so the tests encode with the same library Arc decodes with (the payload bytes are equivalent either way). `vmihailenco/msgpack/v5` is no longer a direct dependency; it stays in `go.mod` as an indirect one, pulled in by `iceberg-go` through `uptrace/bun`, which uses it only for fields tagged `bun:",msgpack"`; iceberg-go's catalog models have none, so that copy is linked but never runs. `go mod tidy` also records `google.golang.org/grpc` as the direct dependency it already was (Flight SQL imports it).
@@ -9315,9 +9335,11 @@ not suppress HEAD, and Arc registers HEAD alongside every GET route — so a
 `HEAD` against a compaction read route was already being recorded as
 `compaction.triggered` and will now be recorded as `compaction.head`. That
 path needs a caller who clears the admin check (the compaction routes are
-admin-only, and a rejected request is already audited as `auth.failed`
-instead), so in practice it means an admin-token monitoring probe, or a
-deployment running with `auth.enabled = false`.
+admin-only, and a request without admin rights is audited as `auth.failed`
+(403) instead; one without a valid token is refused by authentication before
+it reaches the audit log and is not recorded), so in practice it means an
+admin-token monitoring probe, or a deployment running with
+`auth.enabled = false`.
 
 That HEAD requests bypass `include_reads` at all is a separate gap, left
 as-is here: it applies to every audited prefix, not just compaction, so
