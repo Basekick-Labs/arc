@@ -233,6 +233,7 @@ func (am *AuthManager) classifyTokenWrite(p RaftProposer, id int64) (*tokenWrite
 			return nil, errTokenChanged(id, t.nodeID)
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Adopted this node's copy of a cluster token before writing it")
+		am.tokenRowChanged(id)
 		t.row.marked = true
 	}
 	return t, nil
@@ -358,6 +359,7 @@ func (am *AuthManager) localTokenWrite(t *tokenWriteTarget, op, query string) (T
 		return TokenWriteResult{}, am.localWriteMissed(t)
 	}
 	am.InvalidateCache()
+	am.tokenRowChanged(t.row.id)
 	am.logLocalWrite(t, op)
 	return t.result(), nil
 }

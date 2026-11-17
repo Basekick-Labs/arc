@@ -142,6 +142,12 @@ type reconciler struct {
 	// deletes are planned per table, then checked against the breaker.
 	deletes map[string][]reconcileOp
 	marked  map[string]int
+	// clusterTokens holds the token IDs whose row on this node is, or
+	// becomes in this run, the cluster's token: marked rows the FSM holds and
+	// unmarked rows adopted. A membership is adopted only for one of these
+	// (#1630). A token inserted in this run has no local memberships to
+	// adopt (they cascade with its row); its memberships are inserted.
+	clusterTokens map[int64]bool
 }
 
 // ReconcileClusterState rewrites the local auth (and, with IncludeRBAC, RBAC)
@@ -153,12 +159,13 @@ func ReconcileClusterState(ctx context.Context, db *sql.DB, st ClusterAuthState,
 		return nil, fmt.Errorf("reconcile nonce: %w", err)
 	}
 	r := &reconciler{
-		st:      st,
-		log:     logger,
-		report:  &ReconcileReport{Tables: map[string]*ReconcileTableReport{}},
-		nonce:   hex.EncodeToString(nonce),
-		deletes: map[string][]reconcileOp{},
-		marked:  map[string]int{},
+		st:            st,
+		log:           logger,
+		report:        &ReconcileReport{Tables: map[string]*ReconcileTableReport{}},
+		nonce:         hex.EncodeToString(nonce),
+		deletes:       map[string][]reconcileOp{},
+		marked:        map[string]int{},
+		clusterTokens: map[int64]bool{},
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -470,6 +477,9 @@ func (r *reconciler) planTokens(tx *sql.Tx) error {
 			r.tx1 = append(r.tx1, reconcileOp{table: TableTokens, kind: "adopted",
 				query: `UPDATE api_tokens SET raft_materialised = 1 WHERE id = ?`, args: []any{l.id}})
 		}
+		// Recorded when the adoption is planned: it runs in the same tx1 as
+		// the membership plan, so both commit or neither does.
+		r.clusterTokens[l.id] = true
 		// created_at too: the token-write classification identifies a
 		// marked row by the cluster's creation instant (#1630).
 		if l.hash != e.TokenHash || l.prefix != e.TokenPrefix || l.description.String != e.Description ||
@@ -542,6 +552,7 @@ type rbacLocal struct {
 	name    string
 	key     string
 	vals    []string
+	owner   int64 // memberships: the token_id
 }
 
 type rbacWant struct {
@@ -567,6 +578,12 @@ type rbacSpec struct {
 	// adoptByKey: a local row holding the FSM entry's key under another id is
 	// that entry (memberships, whose id nothing references).
 	adoptByKey bool
+	// ownedByClusterToken: an unmarked local row is adopted only when its
+	// owner (rbacLocal.owner, a token ID) is the cluster's token on this
+	// node. On an ID collision the same (token_id, team_id) names the grant
+	// of the token this node keeps from before v26.06.1, which must stay
+	// that token's (#1630).
+	ownedByClusterToken bool
 	// realignByName: an insert blocked by a local row of the same name
 	// replaces that row (#1336 D3; the live ApplyCreateOrganization does the
 	// same, cascading the local row's children).
@@ -690,10 +707,10 @@ func (r *reconciler) rbacSpecs() []rbacSpec {
 				var l rbacLocal
 				var marked, enabled, tok, team int64
 				err := rows.Scan(&l.id, &marked, &enabled, &l.name, &tok, &team, &l.created)
-				l.marked, l.enabled, l.key = marked == 1, true, fmt.Sprintf("%d|%d", tok, team)
+				l.marked, l.enabled, l.key, l.owner = marked == 1, true, fmt.Sprintf("%d|%d", tok, team), tok
 				return l, err
 			},
-			want: members, adoptByKey: true,
+			want: members, adoptByKey: true, ownedByClusterToken: true,
 			insertSQL: `INSERT INTO rbac_token_memberships (id, token_id, team_id, created_at, raft_materialised) VALUES (?, ?, ?, ?, 1)`,
 		},
 	}
@@ -757,6 +774,10 @@ func (r *reconciler) planRBACTable(tx *sql.Tx, spec rbacSpec) error {
 				r.collision(spec.table, l.id, w.key)
 				continue
 			}
+			if spec.ownedByClusterToken && !r.clusterTokens[l.owner] {
+				r.collision(spec.table, l.id, w.key)
+				continue
+			}
 			r.tx1 = append(r.tx1, reconcileOp{table: spec.table, kind: "adopted",
 				query: `UPDATE ` + spec.table + ` SET raft_materialised = 1 WHERE id = ?`, args: []any{l.id}})
 		}
@@ -783,6 +804,12 @@ func (r *reconciler) planRBACTable(tx *sql.Tx, spec rbacSpec) error {
 		}
 		if spec.adoptByKey {
 			if l, ok := localByKey[w.key]; ok {
+				if !l.marked && spec.ownedByClusterToken && !r.clusterTokens[l.owner] {
+					// Neither adopted nor inserted: the pair is the local
+					// token's grant (UNIQUE(token_id, team_id)).
+					r.collision(spec.table, l.id, w.key)
+					continue
+				}
 				if !l.marked {
 					r.tx1 = append(r.tx1, reconcileOp{table: spec.table, kind: "adopted",
 						query: `UPDATE ` + spec.table + ` SET raft_materialised = 1 WHERE id = ?`, args: []any{l.id}})

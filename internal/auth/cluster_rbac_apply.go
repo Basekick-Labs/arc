@@ -697,6 +697,20 @@ func (rm *RBACManager) ApplyAddTokenToTeam(entry ClusterTokenMembershipEntry) er
 	switch {
 	case queryErr == nil:
 		if existingTokenID == entry.TokenID && existingTeamID == entry.TeamID {
+			// Mark it only when the token row is the cluster's: on an ID
+			// collision the pair is the grant of the token this node keeps
+			// from before v26.06.1, and marking it would make it the
+			// cluster token's (#1630).
+			var tokenMarked sql.NullInt64
+			if err := rm.db.QueryRow(`SELECT raft_materialised FROM api_tokens WHERE id = ?`, entry.TokenID).Scan(&tokenMarked); err != nil {
+				return fmt.Errorf("ApplyAddTokenToTeam: read the marker of token %d: %w", entry.TokenID, err)
+			}
+			if tokenMarked.Int64 != 1 {
+				// A deliberate refusal, not a failure: logged here once.
+				rm.logger.Warn().Int64("membership_id", entry.ID).Int64("token_id", entry.TokenID).Int64("team_id", entry.TeamID).
+					Msg("Cluster RBAC apply: this membership belongs to the token this node keeps at that ID, not the cluster's (an ID collision); left in place, unmarked (#1630)")
+				return nil
+			}
 			return rm.markMaterialised("rbac_token_memberships", entry.ID)
 		}
 		return fmt.Errorf("ApplyAddTokenToTeam: id %d already exists locally with different content (cluster<->local divergence)", entry.ID)
@@ -723,14 +737,17 @@ func (rm *RBACManager) ApplyAddTokenToTeam(entry ClusterTokenMembershipEntry) er
 }
 
 // ApplyRemoveTokenFromTeam materialises a RemoveTokenFromTeam apply.
-// Identified by the (token_id, team_id) pair.
+// Identified by the (token_id, team_id) pair, and gated like the id-keyed
+// applies (rbacClusterOwned): once this node has reconciled, an unmarked row
+// for the pair is the grant of the token this node keeps at that ID from
+// before v26.06.1, not the cluster token's, and is left in place (#1630).
 func (rm *RBACManager) ApplyRemoveTokenFromTeam(tokenID, teamID int64) error {
 	if tokenID == 0 || teamID == 0 {
 		return fmt.Errorf("ApplyRemoveTokenFromTeam: token_id and team_id required")
 	}
 	result, err := rm.db.Exec(`
-		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?
-	`, tokenID, teamID)
+		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ? AND `+rbacClusterOwned,
+		tokenID, teamID)
 	if err != nil {
 		return fmt.Errorf("ApplyRemoveTokenFromTeam: %w", err)
 	}
@@ -742,7 +759,7 @@ func (rm *RBACManager) ApplyRemoveTokenFromTeam(tokenID, teamID int64) error {
 		rm.logger.Warn().
 			Int64("token_id", tokenID).
 			Int64("team_id", teamID).
-			Msg("ApplyRemoveTokenFromTeam: no cluster-materialised row — already missing, or a local row the cluster does not own, left in place (#1336)")
+			Msg("ApplyRemoveTokenFromTeam: no cluster-materialised row — already missing, or a local row the cluster does not own, left in place (#1336, #1630)")
 	}
 	rm.InvalidateTokenCache(tokenID)
 	return nil
@@ -768,7 +785,7 @@ func (rm *RBACManager) markMaterialised(table string, id int64) error {
 // written before the marker existed are still unmarked, so until then the
 // applies reach any row at the id, as before #1336. The first reconcile marks
 // every row it can match to the FSM; from then on a local row that merely
-// shares an id is left alone. (Membership removal is keyed by the
-// (token, team) pair, which is the same grant whatever its id, and is not
-// gated at all.)
+// shares an id is left alone. Membership removal is keyed by the
+// (token, team) pair and gated the same way: on an ID collision the pair
+// names the grant of a different token (#1630).
 const rbacClusterOwned = `(raft_materialised = 1 OR NOT EXISTS (SELECT 1 FROM cluster_auth_reconcile_state))`
