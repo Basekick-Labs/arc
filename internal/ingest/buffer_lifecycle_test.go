@@ -52,7 +52,7 @@ func describeLiveBuffers() string {
 	fmt.Fprintf(&b, "%d buffer(s) publishing", len(samplers))
 	for _, g := range samplers {
 		for _, line := range strings.Split(g, "\n") {
-			if strings.Contains(line, "_test.go:") {
+			if strings.Contains(line, "_test.go:") && !strings.Contains(line, "buffer_lifecycle_test.go") {
 				fmt.Fprintf(&b, "; created at %s", strings.TrimSpace(line))
 				break
 			}
@@ -67,12 +67,13 @@ func describeLiveBuffers() string {
 // requireSoleBuffer fails unless the buffer the test just made is the only
 // one publishing into the gauges: another one, left running by an earlier
 // test, overwrites them every second and the test reads its numbers, not
-// this buffer's. Stopping buffers is asynchronous, so it waits briefly.
+// this buffer's. Stopping buffers is asynchronous, and a sampler that has not
+// run yet shows only its launching closure, so it waits for exactly one.
 // Run with GODEBUG=tracebackancestors=10 to see which test made each one.
 func requireSoleBuffer(t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
-	for len(liveSamplers()) > 1 && time.Now().Before(deadline) {
+	for len(liveSamplers()) != 1 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if n := len(liveSamplers()); n != 1 {
