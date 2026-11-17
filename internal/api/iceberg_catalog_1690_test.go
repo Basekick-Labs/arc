@@ -268,12 +268,10 @@ type fakePublished struct {
 	tables  map[string][]string
 	listErr error
 	loadErr error
-	calls   int
 }
 
 func (f *fakePublished) NamespacePrefix() string { return "arc" }
 func (f *fakePublished) PublishedDatabases(context.Context) ([]string, error) {
-	f.calls++
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -285,7 +283,6 @@ func (f *fakePublished) PublishedDatabases(context.Context) ([]string, error) {
 	return out, nil
 }
 func (f *fakePublished) PublishedTables(_ context.Context, db string, limit int) ([]string, error) {
-	f.calls++
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
