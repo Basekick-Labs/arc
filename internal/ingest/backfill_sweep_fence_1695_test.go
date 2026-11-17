@@ -109,7 +109,13 @@ func TestAgedSweepDoesNotWaitForABackfill_1695(t *testing.T) {
 	}
 	require.Eventually(t, func() bool { return st.fast.Load() == 6 }, 5*time.Second, 10*time.Millisecond,
 		"every other aged buffer written while the backfill hangs")
-	require.EqualValues(t, 1, st.blocked.Load())
+	// The sweep hands each aged buffer to its own goroutine and returns, so
+	// the backfill's goroutine may reach storage after every fast write
+	// finished: wait for it rather than assert it already did. It stays at
+	// one: its first write hangs until released.
+	require.Eventually(t, func() bool { return st.blocked.Load() == 1 }, 5*time.Second, 10*time.Millisecond,
+		"the backfill's write reaches storage and hangs")
+	require.EqualValues(t, 6, st.fast.Load())
 
 	close(st.release)
 	b.agedWG.Wait()
