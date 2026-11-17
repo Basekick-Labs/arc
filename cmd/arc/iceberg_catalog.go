@@ -99,11 +99,18 @@ func wireIcebergGlue(exporter *iceberg.Exporter, backend storage.Backend, gate i
 	}
 	log.Info().Str("region", region).Str("catalog_id", catalog).Int("retry_interval_s", gcfg.SyncInterval).
 		Msg("Iceberg tables are registered in AWS Glue (iceberg.glue.enabled): one Glue table per published table, updated on each publish")
+	// Glue, unlike Arc's REST catalog, accepts writes: an engine that drops
+	// or purges a table through it deletes the data files the metadata names,
+	// which are Arc's own in either layout. gc.enabled=false would stop that
+	// in Spark and Java, but iceberg-go then refuses Arc's own snapshot
+	// expiry, so the control is the consumers' S3 permissions.
+	where := "the data files the table's metadata names are Arc's own"
 	if layout == config.IcebergLayoutColocated {
-		log.Warn().Msg("Iceberg Glue sync with iceberg.layout=colocated: each Glue table's location is the measurement's data directory. " +
-			"Give Athena and other Glue consumers read-only S3 access and leave Glue table optimizers off: a DROP TABLE, VACUUM or " +
-			"orphan-file cleanup run through Glue could delete Arc's data files")
+		where += ", and each Glue table's location is the measurement's data directory"
 	}
+	log.Warn().Msg("Iceberg Glue sync: Glue accepts writes, and " + where + ". Give Athena, Spark and every other Glue consumer read-only " +
+		"S3 access to Arc's bucket and leave Glue table optimizers off: a DROP TABLE ... PURGE, VACUUM or orphan-file cleanup run " +
+		"through Glue would delete Arc's data")
 	sc.RegisterHook("iceberg-glue", func(ctx context.Context) error {
 		gs.Stop()
 		return nil

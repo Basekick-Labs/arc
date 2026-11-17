@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,14 @@ type fakeGlue struct {
 	failOn  map[string]error // method -> error, consumed once
 	catalog string
 	skipArc []bool // SkipArchive of each UpdateTable
+	// paginate returns one item per page; noListVersion drops VersionId from
+	// GetTables; nilVersionUpdates counts UpdateTable calls without one.
+	paginate          bool
+	noListVersion     bool
+	nilVersionUpdates int
+	// beforeGetTable runs inside GetTable with the lock held (a concurrent
+	// writer acting between a listing and a read).
+	beforeGetTable func(f *fakeGlue)
 }
 
 func newFakeGlue() *fakeGlue {
@@ -76,9 +85,22 @@ func (f *fakeGlue) GetDatabases(_ context.Context, in *glue.GetDatabasesInput, _
 	if err := f.fail("GetDatabases"); err != nil {
 		return nil, err
 	}
+	names := make([]string, 0, len(f.dbs))
+	for n := range f.dbs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	start := 0
+	if in.NextToken != nil {
+		start, _ = strconv.Atoi(*in.NextToken)
+	}
 	out := &glue.GetDatabasesOutput{}
-	for n, p := range f.dbs {
-		out.DatabaseList = append(out.DatabaseList, gluetypes.Database{Name: aws.String(n), Parameters: p})
+	for i := start; i < len(names); i++ {
+		out.DatabaseList = append(out.DatabaseList, gluetypes.Database{Name: aws.String(names[i]), Parameters: f.dbs[names[i]]})
+		if f.paginate && i+1 < len(names) {
+			out.NextToken = aws.String(strconv.Itoa(i + 1))
+			break
+		}
 	}
 	return out, nil
 }
@@ -88,6 +110,9 @@ func (f *fakeGlue) GetTable(_ context.Context, in *glue.GetTableInput, _ ...func
 	defer f.mu.Unlock()
 	if err := f.fail("GetTable"); err != nil {
 		return nil, err
+	}
+	if f.beforeGetTable != nil {
+		f.beforeGetTable(f)
 	}
 	if t, ok := f.tables[*in.DatabaseName+"\x00"+*in.Name]; ok {
 		c := *t
@@ -102,10 +127,27 @@ func (f *fakeGlue) GetTables(_ context.Context, in *glue.GetTablesInput, _ ...fu
 	if err := f.fail("GetTables"); err != nil {
 		return nil, err
 	}
-	out := &glue.GetTablesOutput{}
-	for k, t := range f.tables {
+	var keys []string
+	for k := range f.tables {
 		if strings.HasPrefix(k, *in.DatabaseName+"\x00") {
-			out.TableList = append(out.TableList, *t)
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	start := 0
+	if in.NextToken != nil {
+		start, _ = strconv.Atoi(*in.NextToken)
+	}
+	out := &glue.GetTablesOutput{}
+	for i := start; i < len(keys); i++ {
+		t := *f.tables[keys[i]]
+		if f.noListVersion {
+			t.VersionId = nil
+		}
+		out.TableList = append(out.TableList, t)
+		if f.paginate && i+1 < len(keys) {
+			out.NextToken = aws.String(strconv.Itoa(i + 1))
+			break
 		}
 	}
 	return out, nil
@@ -143,6 +185,9 @@ func (f *fakeGlue) UpdateTable(_ context.Context, in *glue.UpdateTableInput, _ .
 	cur, ok := f.tables[key]
 	if !ok {
 		return nil, notFound()
+	}
+	if in.VersionId == nil {
+		f.nilVersionUpdates++
 	}
 	if in.VersionId != nil && *in.VersionId != *cur.VersionId {
 		return nil, &gluetypes.ConcurrentModificationException{Message: aws.String("version")}
@@ -524,5 +569,160 @@ func TestGlueURIDirKeepsTheScheme(t *testing.T) {
 	}
 	if sameLocation(uriDir(loc), "s3://bucket/prefix/arc_db.db/cpu2/metadata") {
 		t.Fatal("matched a sibling directory")
+	}
+}
+
+// dropAndStrike drops the database, runs a full pass (first strike) and
+// moves the clock past the gap.
+func dropForGlue(t *testing.T, r *glueRig, now *time.Time) {
+	t.Helper()
+	if err := r.exp.DropDatabase(context.Background(), "mydb"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
+		t.Fatal(err)
+	}
+	r.sync.fullPass(context.Background())
+	*now = now.Add(glueDeleteGap + time.Minute)
+}
+
+func newClockedGlueRig(t *testing.T) (*glueRig, *time.Time) {
+	r := newGlueRig(t)
+	now := time.Now()
+	r.sync.now = func() time.Time { return now }
+	r.pass(t)
+	r.sync.fullPass(context.Background())
+	if r.glue.table("arc_mydb", "cpu") == nil {
+		t.Fatal("not registered")
+	}
+	return r, &now
+}
+
+// Review H1: a table another writer committed to is theirs, deleted or not.
+func TestGlueSyncDoesNotDeleteATableAnotherWriterAdvanced(t *testing.T) {
+	r, now := newClockedGlueRig(t)
+	r.glue.mu.Lock()
+	p := r.glue.tables["arc_mydb\x00cpu"].Parameters
+	p["metadata_location"] = strings.Replace(p["metadata_location"], path.Base(p["metadata_location"]), "00009-abc.metadata.json", 1)
+	r.glue.mu.Unlock()
+	dropForGlue(t, r, now)
+	r.sync.fullPass(context.Background())
+	if r.glue.table("arc_mydb", "cpu") == nil {
+		t.Fatal("deleted a Glue table another writer had committed to")
+	}
+}
+
+// Review H2: a copy of Arc's table under another Glue name, carrying Arc's
+// parameters, is not Arc's; the original is still deleted after a drop.
+func TestGlueSyncDoesNotDeleteACopyOfArcsTable(t *testing.T) {
+	r, now := newClockedGlueRig(t)
+	r.glue.mu.Lock()
+	orig := r.glue.tables["arc_mydb\x00cpu"]
+	cp := *orig
+	cp.Name = aws.String("cpu_snapshot_copy")
+	cp.Parameters = map[string]string{}
+	for k, v := range orig.Parameters {
+		cp.Parameters[k] = v
+	}
+	r.glue.tables["arc_mydb\x00cpu_snapshot_copy"] = &cp
+	r.glue.mu.Unlock()
+	dropForGlue(t, r, now)
+	r.sync.fullPass(context.Background())
+	if r.glue.table("arc_mydb", "cpu_snapshot_copy") == nil {
+		t.Fatal("deleted an operator's copy of Arc's table")
+	}
+	if r.glue.table("arc_mydb", "cpu") != nil {
+		t.Fatal("did not delete Arc's own table after the drop")
+	}
+}
+
+// Review M3: the two strikes must come from consecutive complete passes.
+func TestGlueSyncStrikesResetOnAnIncompletePass(t *testing.T) {
+	r, now := newClockedGlueRig(t)
+	dropForGlue(t, r, now) // first strike, then past the gap
+	r.glue.failOn["GetDatabases"] = errors.New("glue down")
+	r.sync.fullPass(context.Background()) // fails: strikes reset
+	r.sync.fullPass(context.Background()) // a new first strike
+	if r.glue.table("arc_mydb", "cpu") == nil {
+		t.Fatal("deleted on strikes separated by a failed pass")
+	}
+	*now = now.Add(glueDeleteGap + time.Minute)
+	r.sync.fullPass(context.Background())
+	if r.glue.table("arc_mydb", "cpu") != nil {
+		t.Fatal("not deleted after two consecutive complete passes")
+	}
+}
+
+// Review M4: each deletion guard on its own.
+func TestGlueSyncDeletionGuardsHoldAlone(t *testing.T) {
+	t.Run("incomplete Arc listing", func(t *testing.T) {
+		r, now := newClockedGlueRig(t)
+		dropForGlue(t, r, now)
+		r.sync.listArc = func(context.Context) (map[glueKey]struct{}, bool) { return map[glueKey]struct{}{}, false }
+		r.sync.fullPass(context.Background())
+		*now = now.Add(glueDeleteGap + time.Minute)
+		r.sync.fullPass(context.Background())
+		if r.glue.table("arc_mydb", "cpu") == nil {
+			t.Fatal("deleted on an incomplete Arc listing")
+		}
+	})
+	t.Run("listing misses a published table", func(t *testing.T) {
+		r, now := newClockedGlueRig(t)
+		// The table is still published; a listing that misses it must not
+		// delete it, because LoadPublished still finds it.
+		r.sync.listArc = func(context.Context) (map[glueKey]struct{}, bool) { return map[glueKey]struct{}{}, true }
+		r.sync.fullPass(context.Background())
+		*now = now.Add(glueDeleteGap + time.Minute)
+		r.sync.fullPass(context.Background())
+		if r.glue.table("arc_mydb", "cpu") == nil {
+			t.Fatal("deleted a table LoadPublished still finds")
+		}
+	})
+}
+
+// Review M1: a full pass whose listing lacks VersionId still updates under
+// the optimistic lock; and the full pass reads every page.
+func TestGlueSyncFullPassPaginatesAndKeepsTheLock(t *testing.T) {
+	r := newGlueRig(t)
+	writeArcStyleParquet(t, filepath.Join(r.root, "mydb/mem/2023/11/14/22/m.parquet"), 1_700_000_000_000_000, 5)
+	writeArcStyleParquet(t, filepath.Join(r.root, "other/disk/2023/11/14/22/d.parquet"), 1_700_000_000_000_000, 5)
+	r.pass(t)
+	r.sync.fullPass(context.Background())
+	r.glue.paginate, r.glue.noListVersion = true, true
+	r.sync.dropCache()
+	r.publish(t, "cpu_b.parquet", 1_700_000_100_000_000)
+	r.glue.takeWrites()
+	r.sync.dirty = map[glueKey]struct{}{} // only the full pass may sync it
+	r.sync.fullPass(context.Background())
+	if got := r.glue.table("arc_mydb", "cpu").Parameters["metadata_location"]; got != r.published(t) {
+		t.Fatalf("full pass over paginated listings did not update cpu: %s", got)
+	}
+	for _, tb := range [][2]string{{"arc_mydb", "mem"}, {"arc_other", "disk"}} {
+		if r.glue.table(tb[0], tb[1]) == nil {
+			t.Fatalf("%s.%s missing", tb[0], tb[1])
+		}
+	}
+	if r.glue.nilVersionUpdates != 0 {
+		t.Fatalf("%d UpdateTable calls without a VersionId", r.glue.nilVersionUpdates)
+	}
+	if w := r.glue.takeWrites(); len(w) != 1 || w[0] != "update arc_mydb.cpu" {
+		t.Fatalf("writes %v, want only the cpu update", w)
+	}
+}
+
+// Review H1, the re-read: another writer commits between the full pass's
+// listing and the delete. The listing showed Arc's pointer; the delete must
+// not go ahead on it.
+func TestGlueSyncRereadsBeforeDeleting(t *testing.T) {
+	r, now := newClockedGlueRig(t)
+	dropForGlue(t, r, now)
+	r.glue.beforeGetTable = func(f *fakeGlue) {
+		p := f.tables["arc_mydb\x00cpu"].Parameters
+		p["metadata_location"] = strings.Replace(p["metadata_location"], path.Base(p["metadata_location"]), "00009-abc.metadata.json", 1)
+		f.beforeGetTable = nil
+	}
+	r.sync.fullPass(context.Background())
+	if r.glue.table("arc_mydb", "cpu") == nil {
+		t.Fatal("deleted a table another writer committed to after the listing")
 	}
 }

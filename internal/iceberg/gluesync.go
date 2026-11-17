@@ -11,9 +11,10 @@ package iceberg
 //
 //   - Driven by publishes. The exporter reports every successful hint write
 //     (SetOnPublished); the tables are coalesced and synced at once, so Glue
-//     lags a publish by seconds, not by a timer, and never names a version
-//     the prune has had time to delete. A timer retries failures; an hourly
-//     full pass verifies everything and finds deletions.
+//     usually lags a publish by seconds. While Glue is unreachable, or
+//     during a long full pass, it can name a version the prune has since
+//     deleted; readers then fail until the next sync. A timer retries
+//     failures; an hourly full pass verifies everything and finds deletions.
 //   - Arc only moves pointers it set. A Glue table is Arc's when it carries
 //     arc.managed and this warehouse's arc.warehouse; its metadata_location is
 //     Arc's when it equals arc.synced_location and is a v<N>.metadata.json in
@@ -23,11 +24,14 @@ package iceberg
 //     pointer from v<M> to an older v<N> of the same directory while v<M>
 //     exists. Every write re-checks the gate and re-reads the published
 //     version first.
-//   - Deletion is driven from the Glue side, so tables of a dropped database
-//     are found after a restart, and is conservative: a table recorded under
-//     the current namespace prefix, absent from a complete listing and not
-//     found by LoadPublished on two full passes at least glueDeleteGap apart.
-//     DeleteDatabase is never called.
+//   - Deletion is driven from the Glue side, so tables of a dropped table or
+//     database are found after a restart, and is conservative: only a table
+//     Arc owns by every rule above (its pointer included), living under the
+//     Glue name its recorded identity maps to, recorded under the current
+//     namespace prefix, absent from a complete listing and not found by
+//     LoadPublished on two consecutive complete full passes at least
+//     glueDeleteGap apart, and still all of that when re-read right before
+//     the delete. DeleteDatabase is never called.
 //   - UpdateTable sends SkipArchive: Glue's table-version quotas are per
 //     account, and a version per publish would exhaust them.
 //   - Glue failures never block the export: the sync is a separate loop,
@@ -95,7 +99,12 @@ const (
 	// glueParallel bounds Glue calls in flight: Glue quotas are account-wide
 	// and shared with the customer's Athena.
 	glueParallel = 4
-	// glueCallTimeout bounds one table's sync.
+	// glueRefusedMax bounds the refusal memo; past it a refusal is logged on
+	// every pass rather than remembered.
+	glueRefusedMax = 10000
+	// glueCallTimeout bounds one table's sync and every other Glue or
+	// storage call of a pass: the loop is the only one, and a stalled call
+	// must not stop Glue following publishes.
 	glueCallTimeout = 30 * time.Second
 )
 
@@ -137,6 +146,8 @@ type GlueSync struct {
 	absentSince map[glueKey]time.Time
 	// refused records refusals already logged at Error.
 	refused map[string]struct{}
+	// listArc lists the published tables (arcTables); tests replace it.
+	listArc func(ctx context.Context) (map[glueKey]struct{}, bool)
 }
 
 type glueKey struct{ database, measurement string }
@@ -158,6 +169,7 @@ func NewGlueSync(cfg GlueSyncConfig) *GlueSync {
 		absentSince: map[glueKey]time.Time{},
 		refused:     map[string]struct{}{},
 	}
+	g.listArc = g.arcTables
 	if cfg.CatalogID != "" {
 		g.catalogID = aws.String(cfg.CatalogID)
 	}
@@ -323,14 +335,16 @@ func (g *GlueSync) markFailed(k glueKey) {
 	g.mu.Unlock()
 }
 
-// refuseOnce logs a refusal at Error the first time it is seen.
-func (g *GlueSync) refuseOnce(key string, ev func() *zerolog.Event, msg string) {
+// refuseOnce logs a refusal at Error the first time this process sees it.
+func (g *GlueSync) refuseOnce(key string, msg func() string) {
 	g.mu.Lock()
 	_, seen := g.refused[key]
-	g.refused[key] = struct{}{}
+	if !seen && len(g.refused) < glueRefusedMax {
+		g.refused[key] = struct{}{}
+	}
 	g.mu.Unlock()
 	if !seen {
-		ev().Msg(msg)
+		g.logger.Error().Msg(msg())
 	}
 }
 
@@ -371,8 +385,9 @@ func (g *GlueSync) syncTable(ctx context.Context, k glueKey, cur *gluetypes.Tabl
 	}
 	gdb, gtable, ok := g.glueNames(k)
 	if !ok {
-		g.refuseOnce("name\x00"+k.database+"\x00"+k.measurement, g.logger.Error,
-			fmt.Sprintf("Glue sync: %s.%s has no valid Glue name (empty or over %d characters); it is not registered", k.database, k.measurement, glueNameMax))
+		g.refuseOnce("name\x00"+k.database+"\x00"+k.measurement, func() string {
+			return fmt.Sprintf("Glue sync: %s.%s has no valid Glue name (empty or over %d characters); it is not registered", k.database, k.measurement, glueNameMax)
+		})
 		return nil
 	}
 	g.mu.Lock()
@@ -392,12 +407,19 @@ func (g *GlueSync) syncTable(ctx context.Context, k glueKey, cur *gluetypes.Tabl
 			cur = out.Table
 		}
 	}
-	meta, err := icetable.ParseMetadataBytes(pub.Metadata)
-	if err != nil {
-		return fmt.Errorf("parse published metadata of %s.%s: %w", k.database, k.measurement, err)
+	parse := func() (icetable.Metadata, error) {
+		meta, err := icetable.ParseMetadataBytes(pub.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("parse published metadata of %s.%s: %w", k.database, k.measurement, err)
+		}
+		return meta, nil
 	}
 
 	if cur == nil {
+		meta, err := parse()
+		if err != nil {
+			return err
+		}
 		if err := g.ensureDatabase(ctx, gdb); err != nil {
 			return err
 		}
@@ -405,7 +427,7 @@ func (g *GlueSync) syncTable(ctx context.Context, k glueKey, cur *gluetypes.Tabl
 			return nil
 		}
 		in := g.tableInput(gtable, k, meta, pub.MetadataLocation, "", nil)
-		_, err := g.api.CreateTable(ctx, &glue.CreateTableInput{CatalogId: g.catalogID, DatabaseName: aws.String(gdb), TableInput: in})
+		_, err = g.api.CreateTable(ctx, &glue.CreateTableInput{CatalogId: g.catalogID, DatabaseName: aws.String(gdb), TableInput: in})
 		if err != nil {
 			if isGlueAlreadyExists(err) {
 				g.dropCache()
@@ -418,16 +440,19 @@ func (g *GlueSync) syncTable(ctx context.Context, k glueKey, cur *gluetypes.Tabl
 	}
 
 	params := cur.Parameters
-	if params[glueParamManaged] != "true" || normalizeWarehouse(params[glueParamWarehouse]) != g.warehouse {
-		g.refuseOnce("foreign\x00"+gdb+"\x00"+gtable, g.logger.Error,
-			fmt.Sprintf("Glue sync: Glue table %s.%s exists and was not created by this Arc warehouse (%s); Arc leaves it alone and does not register %s.%s. "+
-				"Drop or rename the Glue table to let Arc register it", gdb, gtable, g.warehouse, k.database, k.measurement))
+	if !g.ownsTable(cur) {
+		g.refuseOnce("foreign\x00"+gdb+"\x00"+gtable, func() string {
+			return fmt.Sprintf("Glue sync: Glue table %s.%s exists and was not created by this Arc warehouse (%s); Arc leaves it alone and does not register %s.%s. "+
+				"Drop or rename the Glue table to let Arc register it (after an iceberg.warehouse change, every table Arc created "+
+				"under the old warehouse is in this state)", gdb, gtable, g.warehouse, k.database, k.measurement)
+		})
 		return nil
 	}
 	if params[glueParamDatabase] != k.database || params[glueParamMeasurement] != k.measurement {
-		g.refuseOnce("collide\x00"+gdb+"\x00"+gtable+"\x00"+k.database+"\x00"+k.measurement, g.logger.Error,
-			fmt.Sprintf("Glue sync: %s.%s maps to Glue table %s.%s, which Arc already uses for %s.%s; it is not registered (Glue names are lowercase, with other characters as '_')",
-				k.database, k.measurement, gdb, gtable, params[glueParamDatabase], params[glueParamMeasurement]))
+		g.refuseOnce("collide\x00"+gdb+"\x00"+gtable+"\x00"+k.database+"\x00"+k.measurement, func() string {
+			return fmt.Sprintf("Glue sync: %s.%s maps to Glue table %s.%s, which Arc already uses for %s.%s; it is not registered (Glue names are lowercase, with other characters as '_')",
+				k.database, k.measurement, gdb, gtable, params[glueParamDatabase], params[glueParamMeasurement])
+		})
 		return nil
 	}
 	curLoc := params[glueParamMetadata]
@@ -435,10 +460,11 @@ func (g *GlueSync) syncTable(ctx context.Context, k glueKey, cur *gluetypes.Tabl
 		g.noteSynced(k, curLoc)
 		return nil
 	}
-	if curLoc != params[glueParamSyncedLocation] || !g.arcOwnedLocation(k, curLoc) {
-		g.refuseOnce("advanced\x00"+gdb+"\x00"+gtable+"\x00"+curLoc, g.logger.Error,
-			fmt.Sprintf("Glue sync: Glue table %s.%s names %s, which Arc did not set: another writer committed to it. Arc no longer updates it; "+
-				"Arc is the only writer of its tables, so drop the Glue table to let Arc register it again", gdb, gtable, curLoc))
+	if !g.pointerIsArcs(k, cur) {
+		g.refuseOnce("advanced\x00"+gdb+"\x00"+gtable, func() string {
+			return fmt.Sprintf("Glue sync: Glue table %s.%s names %s, which Arc did not set: another writer committed to it. Arc no longer updates it; "+
+				"Arc is the only writer of its tables, so drop the Glue table to let Arc register it again", gdb, gtable, curLoc)
+		})
 		return nil
 	}
 	if back, err := g.movesBackwards(ctx, curLoc, pub.MetadataLocation); err != nil {
@@ -450,6 +476,25 @@ func (g *GlueSync) syncTable(ctx context.Context, k glueKey, cur *gluetypes.Tabl
 	}
 	if !g.canRun() {
 		return nil
+	}
+	// The listing a full pass read may lack VersionId; never update without
+	// the optimistic lock (iceberg-go refuses the same case).
+	if cur.VersionId == nil {
+		out, err := g.api.GetTable(ctx, &glue.GetTableInput{CatalogId: g.catalogID, DatabaseName: aws.String(gdb), Name: aws.String(gtable)})
+		if err != nil {
+			return fmt.Errorf("get Glue table %s.%s: %w", gdb, gtable, err)
+		}
+		if out.Table == nil || out.Table.VersionId == nil {
+			return fmt.Errorf("Glue table %s.%s has no version id; not updated without one", gdb, gtable)
+		}
+		if out.Table.Parameters[glueParamMetadata] != curLoc {
+			return fmt.Errorf("Glue table %s.%s changed while it was being synced; retried", gdb, gtable)
+		}
+		cur = out.Table
+	}
+	meta, err := parse()
+	if err != nil {
+		return err
 	}
 	in := g.tableInput(gtable, k, meta, pub.MetadataLocation, curLoc, cur)
 	_, err = g.api.UpdateTable(ctx, &glue.UpdateTableInput{
@@ -471,6 +516,19 @@ func (g *GlueSync) noteSynced(k glueKey, loc string) {
 	g.mu.Lock()
 	g.synced[k] = loc
 	g.mu.Unlock()
+}
+
+// ownsTable reports whether a Glue table was created by this warehouse's Arc.
+func (g *GlueSync) ownsTable(t *gluetypes.Table) bool {
+	return t != nil && t.Parameters[glueParamManaged] == "true" && normalizeWarehouse(t.Parameters[glueParamWarehouse]) == g.warehouse
+}
+
+// pointerIsArcs reports whether the table's metadata_location is the one Arc
+// last set: equal to arc.synced_location and a v<N>.metadata.json in one of
+// the table's standard directories. False means another writer committed.
+func (g *GlueSync) pointerIsArcs(k glueKey, t *gluetypes.Table) bool {
+	loc := t.Parameters[glueParamMetadata]
+	return loc != "" && loc == t.Parameters[glueParamSyncedLocation] && g.arcOwnedLocation(k, loc)
 }
 
 // arcOwnedLocation reports whether loc is a v<N>.metadata.json in one of the
@@ -645,14 +703,15 @@ func glueType(t iceberg.Type) string {
 // fullPass syncs every published table from one read of Glue, and deletes
 // the Glue tables of Arc tables confirmed gone.
 func (g *GlueSync) fullPass(ctx context.Context) {
-	arcTables, listingComplete := g.arcTables(ctx)
+	arcTables, listingComplete := g.listArc(ctx)
 	ours, all, err := g.glueTables(ctx)
 	if err != nil {
-		g.logger.Warn().Err(err).Msg("Glue sync could not list Glue's tables; the full pass is retried")
+		g.logger.Warn().Err(err).Msg("Glue sync could not list Glue's tables; the published tables are retried on the timer, deletions wait for the next full pass")
 		g.mu.Lock()
 		for k := range arcTables {
 			g.failed[k] = struct{}{}
 		}
+		g.absentSince = map[glueKey]time.Time{} // strikes must come from consecutive complete passes
 		g.mu.Unlock()
 		return
 	}
@@ -668,6 +727,9 @@ func (g *GlueSync) fullPass(ctx context.Context) {
 	}
 	g.syncAll(ctx, work, known)
 	if !listingComplete {
+		g.mu.Lock()
+		g.absentSince = map[glueKey]time.Time{}
+		g.mu.Unlock()
 		return
 	}
 	g.deleteAbsent(ctx, ours, arcTables)
@@ -677,14 +739,18 @@ func (g *GlueSync) fullPass(ctx context.Context) {
 // could not be listed: deletions then wait for a complete listing.
 func (g *GlueSync) arcTables(ctx context.Context) (map[glueKey]struct{}, bool) {
 	out := map[glueKey]struct{}{}
-	dbs, err := g.exp.PublishedDatabases(ctx)
+	lctx, cancel := context.WithTimeout(ctx, glueCallTimeout)
+	dbs, err := g.exp.PublishedDatabases(lctx)
+	cancel()
 	if err != nil {
 		g.logger.Warn().Err(err).Msg("Glue sync could not list the published databases; no Glue table is deleted this pass")
 		return out, false
 	}
 	complete := true
 	for _, db := range dbs {
-		tables, err := g.exp.PublishedTables(ctx, db, 0)
+		tctx, cancel := context.WithTimeout(ctx, glueCallTimeout)
+		tables, err := g.exp.PublishedTables(tctx, db, 0)
+		cancel()
 		if err != nil {
 			g.logger.Warn().Err(err).Str("database", db).Msg("Glue sync could not list a database's published tables; no Glue table is deleted this pass")
 			complete = false
@@ -705,7 +771,9 @@ func (g *GlueSync) glueTables(ctx context.Context) (ours map[glueKey]glueEntry, 
 	prefix, _ := GlueName(g.exp.nsPrefix + "_")
 	var token *string
 	for {
-		out, err := g.api.GetDatabases(ctx, &glue.GetDatabasesInput{CatalogId: g.catalogID, NextToken: token})
+		pctx, cancel := context.WithTimeout(ctx, glueCallTimeout)
+		out, err := g.api.GetDatabases(pctx, &glue.GetDatabasesInput{CatalogId: g.catalogID, NextToken: token})
+		cancel()
 		if err != nil {
 			return nil, nil, fmt.Errorf("list Glue databases: %w", err)
 		}
@@ -727,12 +795,15 @@ func (g *GlueSync) glueTables(ctx context.Context) (ours map[glueKey]glueEntry, 
 type glueEntry struct {
 	database, table string
 	params          map[string]string
+	tbl             *gluetypes.Table
 }
 
 func (g *GlueSync) glueTablesIn(ctx context.Context, gdb string, ours map[glueKey]glueEntry, all map[string]*gluetypes.Table) error {
 	var token *string
 	for {
-		out, err := g.api.GetTables(ctx, &glue.GetTablesInput{CatalogId: g.catalogID, DatabaseName: aws.String(gdb), NextToken: token})
+		pctx, cancel := context.WithTimeout(ctx, glueCallTimeout)
+		out, err := g.api.GetTables(pctx, &glue.GetTablesInput{CatalogId: g.catalogID, DatabaseName: aws.String(gdb), NextToken: token})
+		cancel()
 		if err != nil {
 			return fmt.Errorf("list Glue tables of %s: %w", gdb, err)
 		}
@@ -743,9 +814,17 @@ func (g *GlueSync) glueTablesIn(ctx context.Context, gdb string, ours map[glueKe
 			}
 			all[gdb+"\x00"+*t.Name] = t
 			p := t.Parameters
-			if p[glueParamManaged] == "true" && normalizeWarehouse(p[glueParamWarehouse]) == g.warehouse && p[glueParamDatabase] != "" && p[glueParamMeasurement] != "" {
-				ours[glueKey{p[glueParamDatabase], p[glueParamMeasurement]}] = glueEntry{database: gdb, table: *t.Name, params: p}
+			if !g.ownsTable(t) || p[glueParamDatabase] == "" || p[glueParamMeasurement] == "" {
+				continue
 			}
+			k := glueKey{p[glueParamDatabase], p[glueParamMeasurement]}
+			// Only the table living under the Glue name its identity maps to
+			// is Arc's: a copy carrying the parameters (Glue "copy table") is
+			// someone else's.
+			if wdb, wt, ok := g.glueNames(k); !ok || wdb != gdb || wt != *t.Name {
+				continue
+			}
+			ours[k] = glueEntry{database: gdb, table: *t.Name, params: p, tbl: t}
 		}
 		if out.NextToken == nil || *out.NextToken == "" {
 			return nil
@@ -766,7 +845,12 @@ func (g *GlueSync) deleteAbsent(ctx context.Context, ours map[glueKey]glueEntry,
 		if e.params[glueParamPrefix] != g.exp.nsPrefix {
 			continue // recorded under another namespace prefix: not this listing's to judge
 		}
-		_, found, err := g.exp.LoadPublished(ctx, k.database, k.measurement)
+		if !g.pointerIsArcs(k, e.tbl) {
+			continue // another writer committed to it: theirs now
+		}
+		lctx, cancel := context.WithTimeout(ctx, glueCallTimeout)
+		_, found, err := g.exp.LoadPublished(lctx, k.database, k.measurement)
+		cancel()
 		if err != nil || found {
 			continue // not confirmed absent
 		}
@@ -780,7 +864,17 @@ func (g *GlueSync) deleteAbsent(ctx context.Context, ours map[glueKey]glueEntry,
 		if !ok || now.Sub(first) < glueDeleteGap || !g.canRun() {
 			continue
 		}
-		_, err = g.api.DeleteTable(ctx, &glue.DeleteTableInput{CatalogId: g.catalogID, DatabaseName: aws.String(e.database), Name: aws.String(e.table)})
+		// Re-read: the listing is a snapshot from before this pass's syncs,
+		// and DeleteTable has no version condition.
+		dctx, cancel := context.WithTimeout(ctx, glueCallTimeout)
+		now, err := g.api.GetTable(dctx, &glue.GetTableInput{CatalogId: g.catalogID, DatabaseName: aws.String(e.database), Name: aws.String(e.table)})
+		if err != nil || now.Table == nil || !g.ownsTable(now.Table) || !g.pointerIsArcs(k, now.Table) ||
+			now.Table.Parameters[glueParamDatabase] != k.database || now.Table.Parameters[glueParamMeasurement] != k.measurement {
+			cancel()
+			continue
+		}
+		_, err = g.api.DeleteTable(dctx, &glue.DeleteTableInput{CatalogId: g.catalogID, DatabaseName: aws.String(e.database), Name: aws.String(e.table)})
+		cancel()
 		if err != nil && !isGlueNotFound(err) {
 			g.logger.Warn().Err(err).Str("glue_table", e.database+"."+e.table).Msg("Glue sync could not delete the Glue table of a dropped Arc table; retried on the next full pass")
 			continue
