@@ -110,3 +110,17 @@ func TestAuditCoveragePublicPrefixBoundary(t *testing.T) {
 		}
 	}
 }
+
+// One matcher: an empty or "/" prefix is ignored by the auth middleware's rule
+// and therefore by the check (it would otherwise make every route public).
+func TestAuditCoverageIgnoresEmptyPublicPrefix(t *testing.T) {
+	for _, prefixes := range [][]string{{""}, {"/"}} {
+		if isPublicPath("/api/v1/auth/tokens", nil, prefixes) {
+			t.Errorf("prefixes %q made a token route public", prefixes)
+		}
+	}
+	app, mw := newCoverageApp(true, 1)
+	if cov := auditCoverageOf(app, mw, nil, []string{""}); len(cov.gaps) == 0 {
+		t.Error("an empty public prefix hid the routes ahead of audit")
+	}
+}

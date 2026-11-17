@@ -183,7 +183,9 @@ Performance: one more primary-key join when a token's teams are loaded on a perm
 Audit logging (Enterprise) has never recorded a change made through `/api/v1/auth/tokens/*` or `/api/v1/rbac/*`. Those routes were registered ahead of the audit middleware, so the `token.*` and `rbac.*` events in the documentation were never written, on any version since audit logging shipped.
 
 - **Now recorded:** creating, updating, rotating, revoking and deleting a token, adding a token to a team or removing it, and every change to an organization, team, role or measurement permission. The actor is the token name.
-- **Refusals:** a request whose token is valid but not an admin (403) is recorded as `auth.failed`. A request with no token or an invalid one is still refused by authentication **before** the audit log and is **not** recorded; this was true before and is unchanged.
+- **Refusals:** a request whose token is valid but lacks the permission (403) is recorded as `auth.failed`, with the token name as actor. A request to an authenticated route with no token or an invalid one is refused by authentication **before** the audit log and is **not** recorded, as before.
+- **Requests without a token that are recorded:** a public route sits ahead of authentication, so a write (POST, PUT, PATCH, DELETE) to one is recorded with actor `anonymous`, as before this release. In practice: `POST /api/v1/internal/cache/invalidate`, the HMAC-signed cache invalidation cluster peers send after a compaction (one row per call, a refused signature included), and a write to a path under `/metrics` or `/api/v1/metrics`, which has no write route and is answered 404 or 405.
+- **Never recorded:** `/health`, `/healthz`, `/metrics`, `/api/v1/ready`, `/api/v1/logs`, and now `/api/v1/auth/verify`, in any method.
 - **Event names:**
   - RBAC events are now named after the resource the route changes, not the first segment of its path.
   - A team created under an organization is `rbac.team.created` (it would have been `rbac.org.created`).
@@ -191,9 +193,9 @@ Audit logging (Enterprise) has never recorded a change made through `/api/v1/aut
   - A measurement permission is `rbac.measurement_permission.created` or `.deleted`.
   - An update, which these routes do with `PATCH`, is `rbac.<resource>.updated` (it would have been `.read`).
   - Token events use the names in the section above.
-- **With `audit_log.include_reads = true`:** token and RBAC reads are recorded, and so is `GET /api/v1/auth/verify`, as `api.get` with actor `anonymous` (it is a public route: authentication does not run before it, so the event never names the caller). A client that calls verify on every command adds one event per call.
+- **Reads:** `audit_log.include_reads` now covers HEAD and OPTIONS as well as GET. Before, HEAD and OPTIONS requests were recorded at the default setting; now none of the three is recorded unless `include_reads = true`, which also records token and RBAC reads. `/api/v1/auth/verify` is not recorded even then: it is public, so an event could never name the caller, and clients poll it.
 - **Status recorded:** an event for a request that ended in an error (for example a `404` for an unknown ID, a `405`, or a `500`) now records that status. It used to record `200`.
-- **Recorded fields:** the path, database and measurement in an event are capped at 256 bytes, like the user agent already was.
+- **Recorded fields:** the stored path, database and measurement are capped at 256 bytes, like the user agent already was. The event type is decided on the full path first, so padding an ID with leading zeros cannot turn a rotate or revoke into an unnamed `api.post`.
 - **Startup check:** with audit logging on, Arc checks at startup that every non-public route runs after the audit middleware and that it is installed once. A failure is logged at error level, naming the routes; startup continues.
 - **Not recovered:** changes made before this release were not recorded and cannot be recovered.
 - **Performance:** none on the request path. The audit middleware moved earlier in the same stack; one walk of the route table at startup.
@@ -9341,11 +9343,11 @@ it reaches the audit log and is not recorded), so in practice it means an
 admin-token monitoring probe, or a deployment running with
 `auth.enabled = false`.
 
-That HEAD requests bypass `include_reads` at all is a separate gap, left
-as-is here: it applies to every audited prefix, not just compaction, so
-closing it belongs in its own change. If a HEAD probe polls a compaction route
-on your deployment, expect one `compaction.head` row per poll at the default
-setting, exactly as you were getting one `compaction.triggered` row before.
+That HEAD requests bypassed `include_reads` at all is closed in this release
+by #1630 (see "token, team and role changes are recorded in the audit log"):
+HEAD and OPTIONS are now reads like GET, so at the default setting a HEAD
+probe of a compaction route is not recorded; with `include_reads = true` it is
+recorded as `compaction.head`.
 
 With `include_reads = true` the seven GET routes change from
 `compaction.triggered` to `compaction.get`. If you have a dashboard or alert

@@ -3,7 +3,6 @@ package main
 import (
 	"reflect"
 	"sort"
-	"strings"
 
 	"github.com/basekick-labs/arc/internal/api"
 	"github.com/basekick-labs/arc/internal/auth"
@@ -63,7 +62,9 @@ type auditCoverage struct {
 // order Fiber runs it (#1630: the auth and RBAC routes sat before the audit
 // middleware for months and were never audited). A route counts as covered
 // when an audit entry comes before it in its method's stack, or when it is
-// public. HEAD is skipped: Fiber adds it for every GET.
+// public. HEAD is skipped: Fiber adds it for every GET. Only routes are
+// checked: a Use middleware ahead of audit that answers a request itself
+// (the auth middleware's 401) is not reported as a gap.
 func auditCoverageOf(app *fiber.App, auditHandler fiber.Handler, publicRoutes, publicPrefixes []string) auditCoverage {
 	var out auditCoverage
 	auditPtr := reflect.ValueOf(auditHandler).Pointer()
@@ -148,6 +149,10 @@ func isUseRoute(r *fiber.Route) (use, ok bool) {
 	return f.Bool(), true
 }
 
+// countHandler counts r's handlers whose code pointer is ptr. A closure's
+// pointer is that of its function literal, so every closure audit.Middleware
+// returns matches; main builds exactly one, so a count above one is a
+// duplicate install.
 func countHandler(r *fiber.Route, ptr uintptr) int {
 	n := 0
 	for _, h := range r.Handlers {
@@ -158,20 +163,8 @@ func countHandler(r *fiber.Route, ptr uintptr) int {
 	return n
 }
 
-// isPublicPath matches a route pattern against the auth middleware's public
-// lists the way the middleware matches a request path: exact routes, and
-// prefixes at a segment boundary.
+// isPublicPath is the auth middleware's own rule (auth.IsPublicPath) applied
+// to a route pattern, so the check and the middleware cannot disagree.
 func isPublicPath(routePath string, routes, prefixes []string) bool {
-	for _, r := range routes {
-		if routePath == r {
-			return true
-		}
-	}
-	for _, p := range prefixes {
-		p = strings.TrimSuffix(p, "/")
-		if routePath == p || strings.HasPrefix(routePath, p+"/") {
-			return true
-		}
-	}
-	return false
+	return auth.IsPublicPath(routePath, routes, prefixes)
 }

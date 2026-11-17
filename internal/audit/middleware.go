@@ -1,7 +1,7 @@
 package audit
 
 import (
-	"errors"
+	pathpkg "path"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -29,6 +29,17 @@ var excludedPaths = map[string]bool{
 	"/metrics":      true,
 	"/api/v1/logs":  true,
 	"/api/v1/ready": true,
+	// Public (internal/auth middleware PublicRoutes): authentication does not
+	// run before it, so an event could never name the caller, and clients
+	// poll it. Registered after the audit middleware since #1630.
+	"/api/v1/auth/verify": true,
+}
+
+// isRead reports the methods include_reads governs. HEAD is a GET without a
+// body (Fiber registers it beside every GET) and OPTIONS a CORS preflight;
+// neither changes anything, so both are reads (#1630 review).
+func isRead(method string) bool {
+	return method == fiber.MethodGet || method == fiber.MethodHead || method == fiber.MethodOptions
 }
 
 // DetailLocalsKey is the Fiber locals key used by handlers to supply custom
@@ -40,15 +51,18 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		path := c.Path()
 
-		// Skip excluded paths
-		if excludedPaths[path] {
+		// Skip excluded paths, matched on the cleaned path as the auth
+		// middleware matches public routes, so /api/v1/auth/verify/ is
+		// excluded too.
+		if excludedPaths[pathpkg.Clean(path)] {
 			return c.Next()
 		}
 
-		// Skip GET requests unless includeReads is enabled. Compare the
-		// borrowed string first so a skipped request allocates nothing.
+		// Skip reads (GET, HEAD, OPTIONS) unless includeReads is enabled.
+		// Compare the borrowed string first so a skipped request allocates
+		// nothing.
 		method := c.Method()
-		if !includeReads && method == "GET" {
+		if !includeReads && isRead(method) {
 			return c.Next()
 		}
 
@@ -57,8 +71,14 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 		// The event outlives the request (a background writer serialises it),
 		// so copy each retained string. The path is copied before the handler
 		// runs so a handler that rewrites it does not change the audited one.
+		//
+		// The event is classified on the full path and only the stored copy is
+		// truncated: a route ID may carry leading zeros (strconv.ParseInt
+		// accepts them), so a padded /api/v1/auth/tokens/000…5/rotate cut to
+		// 256 bytes would lose its /rotate and be filed as api.post (#1630
+		// review).
 		method = utils.CopyString(method)
-		path = utils.CopyString(truncate(path, maxRecordedField))
+		path = utils.CopyString(path)
 		start := time.Now()
 
 		// Execute the handler
@@ -72,7 +92,7 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			Timestamp:  start.UTC(),
 			EventType:  classifyEvent(method, path, statusCode),
 			Method:     method,
-			Path:       path,
+			Path:       truncate(path, maxRecordedField),
 			StatusCode: statusCode,
 			IPAddress:  utils.CopyString(c.IP()),
 			UserAgent:  utils.CopyString(truncate(c.Get("User-Agent"), maxRecordedField)),
@@ -281,16 +301,16 @@ func extractRBACResource(path string) string {
 
 // responseStatus is the status the client receives. A handler that returns an
 // error has not set it yet: the app's error handler does, after this
-// middleware returns, with the *fiber.Error code or 500
-// (internal/api/server.go customErrorHandler). A 404 or 405 from the router
+// middleware returns. It uses the same check as customErrorHandler
+// (internal/api/server.go): a plain type assertion, so a *fiber.Error wrapped
+// in another error is a 500 there and here. A 404 or 405 from the router
 // arrives the same way.
 func responseStatus(c *fiber.Ctx, err error) int {
 	if err == nil {
 		return c.Response().StatusCode()
 	}
-	var fe *fiber.Error
-	if errors.As(err, &fe) {
-		return fe.Code
+	if e, ok := err.(*fiber.Error); ok {
+		return e.Code
 	}
 	return fiber.StatusInternalServerError
 }

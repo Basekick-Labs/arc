@@ -2,6 +2,7 @@ package audit
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -135,5 +136,94 @@ func TestMiddlewareRecordsTheStatusOfAReturnedError(t *testing.T) {
 		if event.StatusCode != tc.want || ctx.Response.StatusCode() != tc.want {
 			t.Errorf("%s %s: recorded %d, client got %d, want %d", tc.method, tc.path, event.StatusCode, ctx.Response.StatusCode(), tc.want)
 		}
+	}
+}
+
+// #1630 review: the event is classified on the full path. A route ID padded
+// with zeros (strconv.ParseInt accepts them) used to push /rotate past the
+// 256-byte cut, filing the rotate as api.post. Only the stored path is cut.
+func TestMiddlewareClassifiesOnTheFullPath(t *testing.T) {
+	logger := &Logger{eventCh: make(chan *AuditEvent, 1)}
+	app := fiber.New()
+	app.Use(Middleware(logger, false))
+	app.Post("/api/v1/auth/tokens/:id/rotate", func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusOK) })
+	app.Post("/api/v1/rbac/organizations/:org_id/teams", func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusCreated) })
+	pad := strings.Repeat("0", 300)
+	for path, want := range map[string]string{
+		"/api/v1/auth/tokens/" + pad + "5/rotate":       "token.rotated",
+		"/api/v1/rbac/organizations/" + pad + "7/teams": "rbac.team.created",
+	} {
+		ctx := &fasthttp.RequestCtx{}
+		ctx.Request.Header.SetMethod(fiber.MethodPost)
+		ctx.Request.SetRequestURI(path)
+		app.Handler()(ctx)
+		event := <-logger.eventCh
+		if event.EventType != want {
+			t.Errorf("%d-byte path: %q, want %q", len(path), event.EventType, want)
+		}
+		if len(event.Path) != maxRecordedField {
+			t.Errorf("stored path %d bytes, want %d", len(event.Path), maxRecordedField)
+		}
+	}
+}
+
+// #1630 review: the public verify route is never recorded (no identity, and
+// polled), and HEAD and OPTIONS are reads like GET: skipped without
+// include_reads.
+func TestMiddlewareSkipsVerifyAndReadMethods(t *testing.T) {
+	ok := func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusOK) }
+	for _, includeReads := range []bool{false, true} {
+		logger := &Logger{eventCh: make(chan *AuditEvent, 4)}
+		app := fiber.New()
+		app.Use(Middleware(logger, includeReads))
+		app.Get("/api/v1/auth/verify", ok)
+		app.Get("/api/v1/compaction/status", ok)
+		app.Options("/api/v1/query", ok)
+		requests := []struct{ method, path string }{
+			{fiber.MethodGet, "/api/v1/auth/verify"},
+			{fiber.MethodHead, "/api/v1/auth/verify"},
+			{fiber.MethodHead, "/api/v1/auth/verify/"},
+		}
+		if !includeReads {
+			requests = append(requests,
+				struct{ method, path string }{fiber.MethodHead, "/api/v1/compaction/status"},
+				struct{ method, path string }{fiber.MethodOptions, "/api/v1/query"})
+		}
+		for _, r := range requests {
+			ctx := &fasthttp.RequestCtx{}
+			ctx.Request.Header.SetMethod(r.method)
+			ctx.Request.SetRequestURI(r.path)
+			app.Handler()(ctx)
+		}
+		select {
+		case event := <-logger.eventCh:
+			t.Errorf("include_reads=%v: unexpected event %s %s %s", includeReads, event.Method, event.Path, event.EventType)
+		default:
+		}
+	}
+}
+
+// The recorded status is the client's: a *fiber.Error wrapped in another
+// error is a 500 to customErrorHandler's plain type assertion, so here too.
+func TestMiddlewareStatusOfAWrappedFiberError(t *testing.T) {
+	logger := &Logger{eventCh: make(chan *AuditEvent, 1)}
+	app := fiber.New(fiber.Config{ErrorHandler: func(c *fiber.Ctx, err error) error {
+		code := fiber.StatusInternalServerError
+		if e, ok := err.(*fiber.Error); ok {
+			code = e.Code
+		}
+		return c.SendStatus(code)
+	}})
+	app.Use(Middleware(logger, false))
+	app.Post("/api/v1/rbac/teams/:id", func(c *fiber.Ctx) error {
+		return fmt.Errorf("lookup: %w", fiber.NewError(fiber.StatusNotFound, "no such team"))
+	})
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod(fiber.MethodPost)
+	ctx.Request.SetRequestURI("/api/v1/rbac/teams/3")
+	app.Handler()(ctx)
+	event := <-logger.eventCh
+	if event.StatusCode != ctx.Response.StatusCode() || event.StatusCode != fiber.StatusInternalServerError {
+		t.Errorf("recorded %d, client got %d, want both 500", event.StatusCode, ctx.Response.StatusCode())
 	}
 }
