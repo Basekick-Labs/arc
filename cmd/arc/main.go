@@ -4783,6 +4783,10 @@ func main() {
 			return nil
 		}, shutdown.PriorityDatabase)
 		log.Info().Str("warehouse", warehouse).Int("interval_s", cfg.Iceberg.ReconcileInterval).Msg("Iceberg export enabled")
+		if cfg.Iceberg.RESTCatalogEnabled {
+			registerIcebergRESTCatalog(server.GetApp(), exporter, authManager, rbacManager, spokeRegistry, storageBackend,
+				icebergCatalogServable(cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend), icebergGate))
+		}
 	}
 
 	// Register Continuous Query handler

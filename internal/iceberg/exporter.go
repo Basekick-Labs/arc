@@ -89,6 +89,11 @@ type Exporter struct {
 	hintWarnMu sync.Mutex
 	hintWarned map[string]struct{}
 
+	// servedLayoutOnce caches the warehouse layout the published-state reads
+	// (published.go) check names against.
+	servedLayoutOnce sync.Once
+	servedLayoutVal  *WarehouseLayout
+
 	// resolveOnce caches the symlink-resolved warehouse and storage-root
 	// URIs for warehouseRelKey (#639 item 5); resolved lazily because the
 	// directories may not exist at construction.
