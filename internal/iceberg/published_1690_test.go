@@ -212,19 +212,15 @@ func TestPublishedRefusesUnservableStatesInsteadOfHidingThem(t *testing.T) {
 		}
 	})
 
-	// Where markers are written, a marked table is being dropped: refused,
-	// not served, while its metadata is still there.
-	t.Run("a drop marker is refused while the table is published", func(t *testing.T) {
+	// A drop marker does not hide a published table: the exporter clears a
+	// marker at most once per process, so one can outlive a recreated
+	// table's publish (see the package comment).
+	t.Run("a stale drop marker does not hide a published table", func(t *testing.T) {
 		r, _ := setup(t)
 		r.exp.SetForgetDroppedRows(true)
 		if err := r.backend.Write(context.Background(), droppedMarkerKey("arc_mydb", "cpu"), []byte("{}")); err != nil {
 			t.Fatal(err)
 		}
-		if _, found, err := r.exp.LoadPublished(context.Background(), "mydb", "cpu"); err == nil || found {
-			t.Fatalf("found=%v err=%v, want an error", found, err)
-		}
-		// Standalone writes no markers and does not read them.
-		r.exp.SetForgetDroppedRows(false)
 		mustLoadPublished(t, r.exp, "mydb", "cpu")
 	})
 
@@ -377,4 +373,31 @@ func TestPublishedColocatedTableWithoutItsHintIsGone(t *testing.T) {
 	if _, found, err := r.exp.LoadPublished(context.Background(), "mydb", "cpu"); err != nil || found {
 		t.Fatalf("found=%v err=%v, want not found", found, err)
 	}
+}
+
+// Shared bucket with a coordinator: the database is dropped and recreated
+// while the same exporter keeps running. The drop marker can survive the
+// recreated table's publish (clearDropMarker runs once per process); the
+// catalog must serve the new table on the exporter and on any other node.
+func TestPublishedServesATableRecreatedAfterADrop(t *testing.T) {
+	root := t.TempDir()
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/cpu_a.parquet"), 1_700_000_000_000_000, 50)
+	r := newPublishedRig(t, root, "", layoutWarehouse)
+	r.exp.SetForgetDroppedRows(true)
+	r.pass(t)
+	if err := r.exp.DropDatabase(context.Background(), "mydb"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "mydb")); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := r.exp.LoadPublished(context.Background(), "mydb", "cpu"); err != nil || found {
+		t.Fatalf("after DROP: found=%v err=%v", found, err)
+	}
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/15/10/cpu_b.parquet"), 1_700_050_000_000_000, 7)
+	r.pass(t)
+	mustLoadPublished(t, r.exp, "mydb", "cpu")
+	other := newPublishedRig(t, root, "", layoutWarehouse)
+	other.exp.SetForgetDroppedRows(true)
+	mustLoadPublished(t, other.exp, "mydb", "cpu")
 }

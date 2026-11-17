@@ -27,11 +27,14 @@ package iceberg
 // only when it is confirmed.
 //
 // A table being dropped is not always detectable. A database DELETE removes
-// the data files before the table metadata, and, without drop markers
-// (standalone), the metadata in between still names them: the table is served
-// until its hint is deleted, and reads of it fail meanwhile, as they do for
-// directory readers. Where markers are written (a shared bucket with a
-// coordinator) a marked table is refused instead.
+// the data files before the table metadata, and the metadata in between still
+// names them: the table is served until its hint is deleted (a colocated DROP
+// deletes it first, the warehouse layout last), and reads of it fail
+// meanwhile, as they do for directory readers. Drop markers are deliberately
+// NOT consulted: the exporter clears a table's marker at most once per
+// process (clearDropMarker), and the DROP runs on another node, so after a
+// drop and recreate a marker can outlive the new table's publish. Refusing
+// on it would hide a live table indefinitely.
 
 import (
 	"context"
@@ -165,26 +168,11 @@ func (e *Exporter) publishedDirs(database, measurement string) (nsKey string, di
 	return nsKey, dirs, nil
 }
 
-// dropMarked reports whether a table carries a drop marker. Unlike
-// dropInProgress, a marker that cannot be read is an error, not "set": the
-// catalog answers 503 rather than hiding the table.
-func (e *Exporter) dropMarked(ctx context.Context, nsKey, measurement string) (bool, error) {
-	if !e.forgetDroppedRows {
-		return false, nil // markers are written only there (dropped.go)
-	}
-	set, err := e.backend.Exists(ctx, droppedMarkerKey(nsKey, measurement))
-	if err != nil {
-		return false, fmt.Errorf("read the drop marker of %s.%s: %w", nsKey, measurement, err)
-	}
-	return set, nil
-}
-
 // LoadPublished returns the current published version of a table: the
 // v<N>.metadata.json version-hint.text names. found is false only when
 // neither standard directory has a hint. A state that cannot be served safely
-// (a drop marker, a hint naming a missing version, a current snapshot whose
-// manifest list is gone, metadata naming another location) is an error,
-// never "not found".
+// (a hint naming a missing version, a current snapshot whose manifest list is
+// gone, metadata naming another location) is an error, never "not found".
 func (e *Exporter) LoadPublished(ctx context.Context, database, measurement string) (PublishedTable, bool, error) {
 	nsKey, dirs, err := e.publishedDirs(database, measurement)
 	if err != nil {
@@ -197,16 +185,6 @@ func (e *Exporter) LoadPublished(ctx context.Context, database, measurement stri
 		}
 		if n < 0 {
 			continue
-		}
-		// A marked table is being dropped (or a drop failed part way): its
-		// data files may already be gone. Read after the hint, so a dropped
-		// table whose metadata is gone is plainly not found.
-		marked, err := e.dropMarked(ctx, nsKey, measurement)
-		if err != nil {
-			return PublishedTable{}, false, err
-		}
-		if marked {
-			return PublishedTable{}, false, fmt.Errorf("Iceberg table %s.%s carries a drop marker: its database is being dropped", nsKey, measurement)
 		}
 		name := "v" + strconv.Itoa(n) + ".metadata.json"
 		body, err := e.backend.Read(ctx, path.Join(d.key, name))
@@ -429,8 +407,8 @@ func (e *Exporter) PublishedTables(ctx context.Context, database string, limit i
 
 // isPublished reports whether either standard directory of a table has a
 // version-hint.text. Existence only: whether that version can be served is
-// LoadPublished's question, so one damaged table (an unreadable hint, a
-// marker) is a 503 on its own load and does not fail every listing.
+// LoadPublished's question, so one damaged table (an unreadable hint) is a
+// 503 on its own load and does not fail every listing.
 func (e *Exporter) isPublished(ctx context.Context, database, measurement string) (bool, error) {
 	_, dirs, err := e.publishedDirs(database, measurement)
 	if err != nil {
