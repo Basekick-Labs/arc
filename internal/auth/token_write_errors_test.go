@@ -118,15 +118,19 @@ func TestTokenWritesOfExistingIDStillSucceed(t *testing.T) {
 	for _, clustered := range []bool{false, true} {
 		t.Run(fmt.Sprintf("clustered=%v", clustered), func(t *testing.T) {
 			am := newTokenWriteTestManager(t)
-			// Created before the proposer is wired, so the row is in local
-			// SQLite as it would be once the FSM applied the create.
-			if _, err := am.CreateToken(context.Background(), "svc", "", "read", nil); err != nil {
-				t.Fatalf("CreateToken: %v", err)
-			}
-			id := tokenIDByName(t, am, "svc")
 			prop := &fsmLikeTokenProposer{}
+			var id int64
 			if clustered {
+				// Written as the FSM's create callback writes it, so the
+				// row is the cluster's (raft_materialised = 1). An unmarked
+				// row is a token the cluster does not manage (#1630).
+				id = applyClusterToken(t, am, 7, "svc")
 				am.SetRaftProposer(prop)
+			} else {
+				if _, err := am.CreateToken(context.Background(), "svc", "", "read", nil); err != nil {
+					t.Fatalf("CreateToken: %v", err)
+				}
+				id = tokenIDByName(t, am, "svc")
 			}
 
 			ctx := context.Background()
@@ -191,10 +195,7 @@ func TestTokenNameConflictIsTagged(t *testing.T) {
 
 	t.Run("clustered", func(t *testing.T) {
 		am := newTokenWriteTestManager(t)
-		if _, err := am.CreateToken(ctx, "b", "", "read", nil); err != nil {
-			t.Fatalf("CreateToken: %v", err)
-		}
-		id := tokenIDByName(t, am, "b")
+		id := applyClusterToken(t, am, 7, "b")
 		prop := &fsmLikeTokenProposer{}
 		am.SetRaftProposer(prop)
 
@@ -232,6 +233,22 @@ func requireNameConflict(t *testing.T, op string, err error, name string) {
 	if want := fmt.Sprintf("token with name '%s' already exists", name); err.Error() != want {
 		t.Errorf("%s with a taken name: message = %q, want %q", op, err.Error(), want)
 	}
+}
+
+// applyClusterToken writes a token row as the FSM's create callback does on
+// this node: cluster-materialised, as every cluster token's row is. Returns
+// its ID.
+func applyClusterToken(t *testing.T, am *AuthManager, id int64, name string) int64 {
+	t.Helper()
+	if err := am.ApplyCreateToken(ClusterTokenEntry{
+		ID: id, Name: name, Permissions: "read",
+		TokenHash:         fmt.Sprintf("$2a$10$%sfakebcrypthash", name),
+		TokenPrefix:       fmt.Sprintf("%sprefix", name),
+		CreatedAtUnixNano: 1_700_000_000_000_000_000 + id, Enabled: true, LSN: uint64(id),
+	}); err != nil {
+		t.Fatalf("ApplyCreateToken(%d, %s): %v", id, name, err)
+	}
+	return id
 }
 
 func tokenIDByName(t *testing.T, am *AuthManager, name string) int64 {

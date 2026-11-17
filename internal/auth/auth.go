@@ -75,6 +75,12 @@ type TokenInfo struct {
 	// (#1305): an ID alone can name a different token on a node that kept a
 	// pre-26.06.1 local row at that ID (cluster_apply.go).
 	Fingerprint string `json:"-"`
+	// NodeLocal marks, in the admin list and get on a cluster node, a token
+	// the cluster does not manage: it exists only in this node's database
+	// (#1630). NodeID is that node. Both are unset everywhere else, including
+	// on every authentication.
+	NodeLocal bool   `json:"node_local,omitempty"`
+	NodeID    string `json:"node_id,omitempty"`
 }
 
 // TokenFingerprint is the hex SHA-256 of a token's stored hash: what
@@ -1115,13 +1121,14 @@ func (am *AuthManager) HasPermission(info *TokenInfo, permission string) bool {
 // ListTokens returns all tokens (without revealing hashes)
 func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 	rows, err := am.db.Query(`
-		SELECT id, name, description, permissions, created_at, last_used_at, expires_at, enabled
+		SELECT id, name, description, permissions, created_at, last_used_at, expires_at, enabled, raft_materialised, token_hash
 		FROM api_tokens
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	labeler := am.newTokenLabeler()
 
 	var tokens []TokenInfo
 	for rows.Next() {
@@ -1134,9 +1141,11 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			lastUsedAt  sql.NullTime
 			expiresAt   sql.NullTime
 			enabled     bool
+			marked      sql.NullInt64
+			hash        string
 		)
 
-		if err := rows.Scan(&id, &name, &description, &permissions, &createdAt, &lastUsedAt, &expiresAt, &enabled); err != nil {
+		if err := rows.Scan(&id, &name, &description, &permissions, &createdAt, &lastUsedAt, &expiresAt, &enabled, &marked, &hash); err != nil {
 			return nil, err
 		}
 
@@ -1148,6 +1157,7 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			CreatedAt:   createdAt,
 			Enabled:     enabled,
 		}
+		labeler.label(&info, &tokenWriteRow{id: id, name: name, hash: hash, createdAt: createdAt, enabled: enabled, marked: marked.Int64 == 1})
 		if permissions.Valid && permissions.String != "" {
 			info.Permissions = strings.Split(permissions.String, ",")
 		}
@@ -1276,10 +1286,11 @@ func errTokenRevoked() error {
 // requireLocalToken returns the local SQLite copy of the token with this ID,
 // or errTokenNotFound when it holds none.
 //
-// The cluster write paths call it before proposing, RotateToken before it
-// generates a value in both modes, and the standalone UpdateToken and
-// RotateToken after a write that changed no row, to tell "not found" from a
-// name conflict or a revoked token. The FSM treats an update,
+// The standalone RotateToken calls it before it generates a value, and the
+// standalone UpdateToken and RotateToken after a write that changed no row,
+// to tell "not found" from a name conflict or a revoked token. The cluster
+// write paths make the same check through classifyTokenWrite (#1630), which
+// also decides whether the cluster manages the row. The FSM treats an update,
 // revoke, rotate or delete of an unknown ID as an idempotent no-op so that log
 // replay after a delete stays clean, so the proposal itself cannot report it:
 // without this check each of those routes answered 200 for an ID that never
@@ -1296,17 +1307,33 @@ func (am *AuthManager) requireLocalToken(id int64) (*TokenInfo, error) {
 	return info, nil
 }
 
-// UpdateToken updates token metadata.
+// UpdateToken updates token metadata. It is UpdateTokenScoped without a
+// ?node= value: on a cluster node, a token the cluster does not manage is
+// refused with a TokenScopeError (#1630).
+func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, description, permissions *string, expiresAt *time.Time) error {
+	_, err := am.UpdateTokenScoped(ctx, id, name, description, permissions, expiresAt, TokenWriteOptions{})
+	return err
+}
+
+// UpdateTokenScoped updates token metadata.
 //
 // The context bounds the cluster-mode Raft proposal wait. In OSS mode
 // it's currently unused (single SQLite UPDATE statement). Gemini #451
-// round-3 review.
-func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, description, permissions *string, expiresAt *time.Time) error {
+// round-3 review. On a cluster node a token the cluster does not manage is
+// updated in this node's SQLite only, when opts names this node (#1630).
+func (am *AuthManager) UpdateTokenScoped(ctx context.Context, id int64, name, description, permissions *string, expiresAt *time.Time, opts TokenWriteOptions) (TokenWriteResult, error) {
 	// Cluster mode: propose via Raft with a ChangedFields list so the FSM
 	// applier knows which fields are "leave alone" vs "set to empty".
-	if am.getProposer() != nil {
-		if _, err := am.requireLocalToken(id); err != nil {
-			return err
+	if p := am.getProposer(); p != nil {
+		t, err := am.resolveTokenWrite(p, id, opts)
+		if err != nil {
+			return TokenWriteResult{}, err
+		}
+		switch t.class {
+		case classNodeLocal:
+			return am.updateNodeLocalToken(p, t, name, description, permissions, expiresAt)
+		case classNotInClusterState, classHistoryMismatch:
+			return TokenWriteResult{}, t.localOnlyRefusal()
 		}
 		var changed []string
 		payload := struct {
@@ -1334,20 +1361,58 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 			changed = append(changed, "expires_at")
 		}
 		if len(changed) == 0 {
-			return nil
+			return t.result(), nil
 		}
 		payload.ChangedFields = changed
 		if err := am.proposeCommand(ctx, ProposalCommandUpdateToken, payload); err != nil {
 			if name != nil && errors.Is(err, ErrNameConflict) {
-				return errTokenNameExists(*name)
+				return TokenWriteResult{}, errTokenNameExists(*name)
 			}
-			return fmt.Errorf("update token: %w", err)
+			return TokenWriteResult{}, fmt.Errorf("update token: %w", err)
 		}
-		return nil
+		return t.result(), nil
 	}
 	_ = ctx
 
 	// Standalone / OSS: direct SQLite.
+	query, args := tokenUpdateSQL(id, name, description, permissions, expiresAt)
+	if query == "" {
+		// Nothing to write, but an unknown ID is still not found.
+		_, err := am.requireLocalToken(id)
+		return TokenWriteResult{}, err
+	}
+
+	result, err := am.db.Exec(query, args...)
+	if err != nil {
+		return TokenWriteResult{}, err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return TokenWriteResult{}, err
+	}
+	if rowsAffected == 0 {
+		if name == nil {
+			return TokenWriteResult{}, errTokenNotFound()
+		}
+		// A rename that changed no row: the ID is unknown or the name is
+		// taken.
+		if _, err := am.requireLocalToken(id); err != nil {
+			return TokenWriteResult{}, err
+		}
+		return TokenWriteResult{}, errTokenNameExists(*name)
+	}
+
+	am.InvalidateCache()
+	return TokenWriteResult{}, nil
+}
+
+// tokenUpdateSQL builds the SQLite UPDATE of a token's metadata, or "" when
+// no field is set. A rename to a name another token holds changes no row,
+// instead of failing with a driver error whose text would have to be
+// matched; one statement, so SQLite's single writer leaves no window between
+// the check and the write (#1625). extraWhere is ANDed into the row match.
+func tokenUpdateSQL(id int64, name, description, permissions *string, expiresAt *time.Time, extraWhere ...string) (string, []interface{}) {
 	var updates []string
 	var args []interface{}
 
@@ -1369,119 +1434,174 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 		// domain in the column.
 		args = append(args, expiresAt.UTC())
 	}
-
 	if len(updates) == 0 {
-		// Nothing to write, but an unknown ID is still not found.
-		_, err := am.requireLocalToken(id)
-		return err
+		return "", nil
 	}
 
 	args = append(args, id)
 	query := fmt.Sprintf("UPDATE api_tokens SET %s WHERE id = ?", strings.Join(updates, ", "))
+	for _, w := range extraWhere {
+		query += " AND " + w
+	}
 	if name != nil {
-		// A rename to a name another token holds changes no row, instead of
-		// failing with a driver error whose text would have to be matched.
-		// One statement, so SQLite's single writer leaves no window between
-		// the check and the write. #1625.
 		query += " AND NOT EXISTS (SELECT 1 FROM api_tokens WHERE name = ? AND id <> ?)"
 		args = append(args, *name, id)
 	}
-
-	result, err := am.db.Exec(query, args...)
-	if err != nil {
-		return err
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		if name == nil {
-			return errTokenNotFound()
-		}
-		// A rename that changed no row: the ID is unknown or the name is
-		// taken.
-		if _, err := am.requireLocalToken(id); err != nil {
-			return err
-		}
-		return errTokenNameExists(*name)
-	}
-
-	am.InvalidateCache()
-	return nil
+	return query, args
 }
 
-// DeleteToken deletes a token by ID. The context bounds the cluster-mode
-// Raft proposal wait. Gemini #451 round-3 review.
+// updateNodeLocalToken is UpdateTokenScoped for a token the cluster does not
+// manage: this node's row only, and only while it is still unmarked. A rename
+// to a name a cluster token holds is refused: the cluster token's row could
+// then never be written on this node (its insert would fail UNIQUE(name)).
+func (am *AuthManager) updateNodeLocalToken(p RaftProposer, t *tokenWriteTarget, name, description, permissions *string, expiresAt *time.Time) (TokenWriteResult, error) {
+	if name != nil && *name != t.row.name {
+		if view, ok := p.(ClusterTokenView); ok {
+			if _, held := view.ClusterTokenIDByName(*name); held {
+				return TokenWriteResult{}, &TokenScopeError{Code: TokenCodeNameHeldByCluster, TokenID: t.row.id, NodeID: t.nodeID,
+					Message: fmt.Sprintf("token with name '%s' already exists in the cluster; a token the cluster does not manage cannot take its name", *name)}
+			}
+		}
+	}
+	query, args := tokenUpdateSQL(t.row.id, name, description, permissions, expiresAt, "raft_materialised = 0")
+	if query == "" {
+		return t.result(), nil
+	}
+	res, err := am.db.Exec(query, args...)
+	if err != nil {
+		return TokenWriteResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return TokenWriteResult{}, err
+	}
+	if n == 0 {
+		row, err := am.getTokenRowForWrite(t.row.id)
+		if err != nil {
+			return TokenWriteResult{}, err
+		}
+		switch {
+		case row == nil:
+			return TokenWriteResult{}, errTokenNotFound()
+		case row.marked || name == nil:
+			return TokenWriteResult{}, errTokenChanged(t.row.id, t.nodeID)
+		}
+		return TokenWriteResult{}, errTokenNameExists(*name)
+	}
+	am.InvalidateCache()
+	am.logLocalWrite(t, "update")
+	return t.result(), nil
+}
+
+// DeleteToken deletes a token by ID. It is DeleteTokenScoped without a
+// ?node= value.
 func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
-	if am.getProposer() != nil {
-		if _, err := am.requireLocalToken(id); err != nil {
-			return err
+	_, err := am.DeleteTokenScoped(ctx, id, TokenWriteOptions{})
+	return err
+}
+
+// DeleteTokenScoped deletes a token by ID. The context bounds the
+// cluster-mode Raft proposal wait. Gemini #451 round-3 review. On a cluster
+// node a token the cluster does not manage is deleted from this node's SQLite
+// only, when opts names this node (#1630).
+func (am *AuthManager) DeleteTokenScoped(ctx context.Context, id int64, opts TokenWriteOptions) (TokenWriteResult, error) {
+	if p := am.getProposer(); p != nil {
+		t, err := am.resolveTokenWrite(p, id, opts)
+		if err != nil {
+			return TokenWriteResult{}, err
+		}
+		if t.class != classCluster {
+			return am.localTokenWrite(t, "delete", "DELETE FROM api_tokens WHERE id = ? AND raft_materialised = ?")
 		}
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
 		if err := am.proposeCommand(ctx, ProposalCommandDeleteToken, payload); err != nil {
-			return fmt.Errorf("delete token: %w", err)
+			return TokenWriteResult{}, fmt.Errorf("delete token: %w", err)
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Deleted API token via Raft")
-		return nil
+		return t.result(), nil
 	}
 	_ = ctx
 
 	result, err := am.db.Exec("DELETE FROM api_tokens WHERE id = ?", id)
 	if err != nil {
-		return err
+		return TokenWriteResult{}, err
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errTokenNotFound()
+		return TokenWriteResult{}, errTokenNotFound()
 	}
 
 	am.InvalidateCache()
 	am.logger.Info().Int64("token_id", id).Msg("Deleted API token")
-	return nil
+	return TokenWriteResult{}, nil
 }
 
-// RevokeToken disables a token. The context bounds the cluster-mode
-// Raft proposal wait. Gemini #451 round-3 review.
+// RevokeToken disables a token. It is RevokeTokenScoped without a ?node=
+// value.
 func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
-	if am.getProposer() != nil {
-		if _, err := am.requireLocalToken(id); err != nil {
-			return err
+	_, err := am.RevokeTokenScoped(ctx, id, TokenWriteOptions{})
+	return err
+}
+
+// RevokeTokenScoped disables a token. The context bounds the cluster-mode
+// Raft proposal wait. Gemini #451 round-3 review. On a cluster node a token
+// the cluster does not manage is disabled in this node's SQLite only, when
+// opts names this node (#1630): it then stops authenticating here on the next
+// request, and keeps working on any other node that holds a copy.
+func (am *AuthManager) RevokeTokenScoped(ctx context.Context, id int64, opts TokenWriteOptions) (TokenWriteResult, error) {
+	if p := am.getProposer(); p != nil {
+		t, err := am.resolveTokenWrite(p, id, opts)
+		if err != nil {
+			return TokenWriteResult{}, err
+		}
+		if t.class == classHistoryMismatch {
+			return TokenWriteResult{}, t.localOnlyRefusal()
+		}
+		if t.class != classCluster {
+			return am.localTokenWrite(t, "revoke", "UPDATE api_tokens SET enabled = 0 WHERE id = ? AND raft_materialised = ?")
 		}
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
 		if err := am.proposeCommand(ctx, ProposalCommandRevokeToken, payload); err != nil {
-			return fmt.Errorf("revoke token: %w", err)
+			return TokenWriteResult{}, fmt.Errorf("revoke token: %w", err)
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Revoked API token via Raft")
-		return nil
+		return t.result(), nil
 	}
 	_ = ctx
 
 	result, err := am.db.Exec("UPDATE api_tokens SET enabled = 0 WHERE id = ?", id)
 	if err != nil {
-		return err
+		return TokenWriteResult{}, err
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errTokenNotFound()
+		return TokenWriteResult{}, errTokenNotFound()
 	}
 
 	am.InvalidateCache()
 	am.logger.Info().Int64("token_id", id).Msg("Revoked API token")
-	return nil
+	return TokenWriteResult{}, nil
 }
 
-// RotateToken generates a new token value while keeping metadata. The
-// context bounds the cluster-mode Raft proposal wait. Gemini #451
-// round-3 review.
+// RotateToken generates a new token value while keeping metadata. It is
+// RotateTokenScoped without a ?node= value.
 func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error) {
+	token, _, err := am.RotateTokenScoped(ctx, id, TokenWriteOptions{})
+	return token, err
+}
+
+// RotateTokenScoped generates a new token value while keeping metadata. The
+// context bounds the cluster-mode Raft proposal wait. Gemini #451
+// round-3 review. On a cluster node a token the cluster does not manage is
+// rotated in this node's SQLite only, when opts names this node (#1630): the
+// new value authenticates on this node only.
+func (am *AuthManager) RotateTokenScoped(ctx context.Context, id int64, opts TokenWriteOptions) (string, TokenWriteResult, error) {
 	// Checked before a value is generated, in both modes: an unknown or
 	// revoked token is refused without the cost of a new secret. In cluster
 	// mode the FSM drops a rotate of an unknown ID and applies a rotate of a
@@ -1490,49 +1610,101 @@ func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error
 	// revoke or delete that this check could not see yet. Standalone, the
 	// UPDATE's own enabled = 1 is the atomic guard and this is the fast
 	// path. #1625.
-	info, err := am.requireLocalToken(id)
-	if err != nil {
-		return "", err
-	}
-	if !info.Enabled {
-		return "", errTokenRevoked()
+	p := am.getProposer()
+	var t *tokenWriteTarget
+	if p != nil {
+		var err error
+		t, err = am.resolveTokenWrite(p, id, opts)
+		if err != nil {
+			return "", TokenWriteResult{}, err
+		}
+		if t.class == classNotInClusterState || t.class == classHistoryMismatch {
+			return "", TokenWriteResult{}, t.localOnlyRefusal()
+		}
+		if !t.row.enabled {
+			return "", TokenWriteResult{}, errTokenRevoked()
+		}
+	} else {
+		info, err := am.requireLocalToken(id)
+		if err != nil {
+			return "", TokenWriteResult{}, err
+		}
+		if !info.Enabled {
+			return "", TokenWriteResult{}, errTokenRevoked()
+		}
 	}
 
 	token, err := generateToken()
 	if err != nil {
-		return "", fmt.Errorf("failed to generate token: %w", err)
+		return "", TokenWriteResult{}, fmt.Errorf("failed to generate token: %w", err)
 	}
 
 	hash, err := am.hashToken(token)
 	if err != nil {
-		return "", fmt.Errorf("failed to hash token: %w", err)
+		return "", TokenWriteResult{}, fmt.Errorf("failed to hash token: %w", err)
 	}
 
 	// Generate new prefix for O(1) lookup optimization
 	prefix := tokenPrefix(token)
 
+	if t != nil && t.class == classNodeLocal {
+		return am.rotateNodeLocalToken(t, token, hash, prefix)
+	}
+
 	// Cluster mode: propose via Raft. The plaintext token is returned to
 	// the caller out of band — only hash + prefix go through the log.
-	if am.getProposer() != nil {
+	if t != nil {
 		payload := struct {
 			ID        int64  `json:"id"`
 			NewHash   string `json:"new_hash"`
 			NewPrefix string `json:"new_prefix"`
 		}{ID: id, NewHash: hash, NewPrefix: prefix}
 		if err := am.proposeCommand(ctx, ProposalCommandRotateToken, payload); err != nil {
-			return "", fmt.Errorf("rotate token: %w", err)
+			return "", TokenWriteResult{}, fmt.Errorf("rotate token: %w", err)
 		}
-		return am.confirmClusterRotate(id, token)
+		value, err := am.confirmClusterRotate(id, token)
+		if err != nil {
+			return "", TokenWriteResult{}, err
+		}
+		return value, t.result(), nil
 	}
 	_ = ctx
 
 	if err := am.writeRotatedToken(id, hash, prefix); err != nil {
-		return "", err
+		return "", TokenWriteResult{}, err
 	}
 
 	am.InvalidateCache()
 	am.logger.Info().Int64("token_id", id).Msg("Rotated API token")
-	return token, nil
+	return token, TokenWriteResult{}, nil
+}
+
+// rotateNodeLocalToken writes a node-local rotate: this node's row only,
+// while it is still unmarked and enabled (the #1625 guard).
+func (am *AuthManager) rotateNodeLocalToken(t *tokenWriteTarget, token, hash, prefix string) (string, TokenWriteResult, error) {
+	res, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ? AND enabled = 1 AND raft_materialised = 0", hash, prefix, t.row.id)
+	if err != nil {
+		return "", TokenWriteResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", TokenWriteResult{}, err
+	}
+	if n == 0 {
+		row, err := am.getTokenRowForWrite(t.row.id)
+		switch {
+		case err != nil:
+			return "", TokenWriteResult{}, err
+		case row == nil:
+			return "", TokenWriteResult{}, errTokenNotFound()
+		case !row.marked && !row.enabled:
+			return "", TokenWriteResult{}, errTokenRevoked()
+		}
+		return "", TokenWriteResult{}, errTokenChanged(t.row.id, t.nodeID)
+	}
+	am.InvalidateCache()
+	am.logLocalWrite(t, "rotate")
+	return token, t.result(), nil
 }
 
 // writeRotatedToken is the standalone rotate's write. enabled = 1 in the same

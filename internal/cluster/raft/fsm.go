@@ -1286,6 +1286,16 @@ func (f *ClusterFSM) GetTokenByID(id int64) *TokenEntry {
 	return &copy
 }
 
+// TokenIDByName returns the ID of the token with this name, through the
+// tokensByName index. #1630: a node-local rename must not take a cluster
+// token's name.
+func (f *ClusterFSM) TokenIDByName(name string) (int64, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	id, ok := f.tokensByName[name]
+	return id, ok
+}
+
 // TokenCount returns the number of tokens currently in the FSM.
 func (f *ClusterFSM) TokenCount() int {
 	f.mu.RLock()

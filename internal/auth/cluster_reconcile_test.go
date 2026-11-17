@@ -379,3 +379,26 @@ func TestReconcileRBAC(t *testing.T) {
 		t.Errorf("errors: %+v", rep.Tables)
 	}
 }
+
+// #1630: the reconcile repairs a marked row's creation instant, which the
+// token-write classification uses to identify the cluster token.
+func TestReconcileRepairsTokenCreatedAt(t *testing.T) {
+	am := openAuthAt(t, filepath.Join(t.TempDir(), "auth.db"))
+	defer am.Close()
+	e := clusterEntry(100, "a", "ha")
+	mustApplyCreate(t, am, e)
+	mustExec(t, am, `UPDATE api_tokens SET created_at = '2020-01-01 00:00:00' WHERE id = 100`)
+	reconcile(t, am, ClusterAuthState{Tokens: []ClusterTokenEntry{e}, AppliedIndex: 1000, Term: 1})
+	var got any
+	if err := am.db.QueryRow(`SELECT created_at FROM api_tokens WHERE id = 100`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !sameInstant(got, e.CreatedAtUnixNano) {
+		t.Errorf("created_at = %v, want the cluster's instant", got)
+	}
+	// A second pass finds nothing to change.
+	rep := reconcile(t, am, ClusterAuthState{Tokens: []ClusterTokenEntry{e}, AppliedIndex: 1000, Term: 1})
+	if n := rep.table(TableTokens).Updated; n != 0 {
+		t.Errorf("second pass updated %d rows, want 0", n)
+	}
+}

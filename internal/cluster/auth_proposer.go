@@ -49,6 +49,58 @@ func (c *Coordinator) GetRaftFSM() *raft.ClusterFSM {
 	return c.raftFSM
 }
 
+// The proposer is also the auth package's read of the cluster's tokens
+// (#1630): a token write decides from it whether the token is the cluster's.
+var _ auth.ClusterTokenView = (*CoordinatorAuthProposer)(nil)
+
+func (p *CoordinatorAuthProposer) fsm() *raft.ClusterFSM {
+	if p == nil || p.coord == nil {
+		return nil
+	}
+	return p.coord.raftFSM
+}
+
+// ClusterToken implements auth.ClusterTokenView.
+func (p *CoordinatorAuthProposer) ClusterToken(id int64) (auth.ClusterTokenEntry, bool) {
+	f := p.fsm()
+	if f == nil {
+		return auth.ClusterTokenEntry{}, false
+	}
+	e := f.GetTokenByID(id)
+	if e == nil {
+		return auth.ClusterTokenEntry{}, false
+	}
+	return ToAuthTokenEntry(e), true
+}
+
+// ClusterTokenIDByName implements auth.ClusterTokenView.
+func (p *CoordinatorAuthProposer) ClusterTokenIDByName(name string) (int64, bool) {
+	f := p.fsm()
+	if f == nil {
+		return 0, false
+	}
+	return f.TokenIDByName(name)
+}
+
+// AppliedDone implements auth.ClusterTokenView: the FSM's own finished-apply
+// index, not raft's AppliedIndex, which counts entries dispatched but not
+// yet applied.
+func (p *CoordinatorAuthProposer) AppliedDone() uint64 {
+	f := p.fsm()
+	if f == nil {
+		return 0
+	}
+	return f.AppliedDone()
+}
+
+// LocalNodeID implements auth.ClusterTokenView.
+func (p *CoordinatorAuthProposer) LocalNodeID() string {
+	if p == nil || p.coord == nil {
+		return ""
+	}
+	return p.coord.LocalNodeID()
+}
+
 // IsLeader implements auth.RaftProposer. Returns false defensively when
 // the proposer or its underlying coordinator/raft node is nil — those
 // paths only happen in OSS / standalone mode where the proposer should

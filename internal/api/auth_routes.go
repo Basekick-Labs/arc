@@ -260,6 +260,7 @@ func (h *AuthHandler) getToken(c *fiber.Ctx) error {
 			"error":   "Token not found",
 		})
 	}
+	h.authManager.MarkNodeLocal(tokenInfo)
 
 	return c.JSON(fiber.Map{
 		"success": true,
@@ -339,8 +340,11 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 		expiresAt = &t
 	}
 
-	err = h.authManager.UpdateToken(c.UserContext(), id, req.Name, req.Description, permissions, expiresAt)
+	res, err := h.authManager.UpdateTokenScoped(c.UserContext(), id, req.Name, req.Description, permissions, expiresAt, tokenWriteOptions(c))
 	if err != nil {
+		if handled, rerr := tokenScopeErrorResponse(c, err); handled {
+			return rerr
+		}
 		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
@@ -362,10 +366,10 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 
 	h.logger.Info().Int64("token_id", id).Msg("Updated API token")
 
-	return c.JSON(fiber.Map{
+	return c.JSON(nodeLocalSuccess(c, fiber.Map{
 		"success": true,
 		"message": "Token updated successfully",
-	})
+	}, res, sameTokenElsewhere))
 }
 
 // deleteToken handles DELETE /api/v1/auth/tokens/:id
@@ -378,8 +382,11 @@ func (h *AuthHandler) deleteToken(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.authManager.DeleteToken(c.UserContext(), id)
+	res, err := h.authManager.DeleteTokenScoped(c.UserContext(), id, tokenWriteOptions(c))
 	if err != nil {
+		if handled, rerr := tokenScopeErrorResponse(c, err); handled {
+			return rerr
+		}
 		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
@@ -395,10 +402,10 @@ func (h *AuthHandler) deleteToken(c *fiber.Ctx) error {
 
 	h.logger.Info().Int64("token_id", id).Msg("Deleted API token")
 
-	return c.JSON(fiber.Map{
+	return c.JSON(nodeLocalSuccess(c, fiber.Map{
 		"success": true,
 		"message": "Token deleted successfully",
-	})
+	}, res, sameTokenElsewhere))
 }
 
 // tokenRevokedRotateMessage is the 409 body of a rotate of a revoked token. A
@@ -416,8 +423,11 @@ func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 		})
 	}
 
-	newToken, err := h.authManager.RotateToken(c.UserContext(), id)
+	newToken, res, err := h.authManager.RotateTokenScoped(c.UserContext(), id, tokenWriteOptions(c))
 	if err != nil {
+		if handled, rerr := tokenScopeErrorResponse(c, err); handled {
+			return rerr
+		}
 		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
@@ -441,11 +451,11 @@ func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 
 	h.logger.Info().Int64("token_id", id).Msg("Rotated API token")
 
-	return c.JSON(fiber.Map{
+	return c.JSON(nodeLocalSuccess(c, fiber.Map{
 		"success":   true,
 		"new_token": newToken,
 		"message":   "Token rotated successfully. Store this new token securely - it cannot be retrieved again.",
-	})
+	}, res, "The new value authenticates on this node only. "+sameTokenElsewhere))
 }
 
 // revokeToken handles POST /api/v1/auth/tokens/:id/revoke
@@ -458,8 +468,11 @@ func (h *AuthHandler) revokeToken(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.authManager.RevokeToken(c.UserContext(), id)
+	res, err := h.authManager.RevokeTokenScoped(c.UserContext(), id, tokenWriteOptions(c))
 	if err != nil {
+		if handled, rerr := tokenScopeErrorResponse(c, err); handled {
+			return rerr
+		}
 		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
@@ -475,10 +488,10 @@ func (h *AuthHandler) revokeToken(c *fiber.Ctx) error {
 
 	h.logger.Info().Int64("token_id", id).Msg("Revoked API token")
 
-	return c.JSON(fiber.Map{
+	return c.JSON(nodeLocalSuccess(c, fiber.Map{
 		"success": true,
 		"message": "Token revoked successfully",
-	})
+	}, res, "It still authenticates on any other node that holds a copy. "+sameTokenElsewhere))
 }
 
 // getCacheStats handles GET /api/v1/auth/cache/stats
@@ -610,6 +623,24 @@ func (h *AuthHandler) addTokenToTeam(c *fiber.Ctx) error {
 		})
 	}
 
+	// A token the cluster does not manage cannot join a cluster team; on an
+	// ID collision the cluster would add the cluster token instead (#1630).
+	if _, err := h.authManager.ResolveTokenMembershipWrite(tokenID, tokenWriteOptions(c), false); err != nil {
+		if handled, rerr := tokenScopeErrorResponse(c, err); handled {
+			return rerr
+		}
+		if errors.Is(err, auth.ErrNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"success": false,
+				"error":   "Token not found",
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Failed to get token: " + err.Error(),
+		})
+	}
+
 	membership, err := h.rbacManager.AddTokenToTeam(c.UserContext(), tokenID, req.TeamID)
 	if err != nil {
 		status := fiber.StatusInternalServerError
@@ -680,8 +711,25 @@ func (h *AuthHandler) removeTokenFromTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.RemoveTokenFromTeam(c.UserContext(), tokenID, teamID)
+	// A token the cluster does not manage has memberships on this node only,
+	// which the cluster cannot remove: they are removed here, under the
+	// ?node= interlock of the token writes (#1630).
+	res, err := h.authManager.ResolveTokenMembershipWrite(tokenID, tokenWriteOptions(c), true)
+	if err == nil {
+		if res.NodeLocal {
+			err = h.rbacManager.RemoveTokenFromTeamLocal(c.UserContext(), tokenID, teamID)
+		} else {
+			err = h.rbacManager.RemoveTokenFromTeam(c.UserContext(), tokenID, teamID)
+		}
+	} else if errors.Is(err, auth.ErrNotFound) {
+		// No token row on this node: the route has always reported the
+		// missing membership, and the cluster path still decides it.
+		res, err = auth.TokenWriteResult{}, h.rbacManager.RemoveTokenFromTeam(c.UserContext(), tokenID, teamID)
+	}
 	if err != nil {
+		if handled, rerr := tokenScopeErrorResponse(c, err); handled {
+			return rerr
+		}
 		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
@@ -694,10 +742,10 @@ func (h *AuthHandler) removeTokenFromTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	return c.JSON(fiber.Map{
+	return c.JSON(nodeLocalSuccess(c, fiber.Map{
 		"success": true,
 		"message": "Token removed from team successfully",
-	})
+	}, res, sameTokenElsewhere))
 }
 
 // getEffectivePermissions handles GET /api/v1/auth/tokens/:id/permissions

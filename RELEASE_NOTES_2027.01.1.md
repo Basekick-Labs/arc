@@ -146,6 +146,28 @@ No new configuration keys.
 - During a rolling upgrade of a cluster that has never created its first admin token, a node still on the earlier release can create it with the untrimmed value. Upgrade every node before the first boot, or check that the token works afterwards.
 
 No new configuration keys.
+## Security fix: on a cluster, revoking a token created before v26.06.1 now takes effect ([#1630](https://github.com/Basekick-Labs/arc/issues/1630))
+
+A token created before v26.06.1 lives only in the database of the node that created it, and so does one created while a node ran without its cluster; the cluster does not manage either. On a cluster, `POST /api/v1/auth/tokens/:id/revoke`, `…/rotate`, `PATCH /api/v1/auth/tokens/:id` and `DELETE /api/v1/auth/tokens/:id` for such a token answered 200 and changed nothing: a revoked token kept working, and a rotate returned a value that never authenticated. If a cluster token had the same ID (old tokens are numbered per node, cluster tokens by the cluster log), the request changed **that** token, on every node.
+
+- These requests now change the token on the node that received them, and only there. They must name that node with `?node=<node_id>`:
+  - without it, the answer is `409` with `"code": "node_local_token"`, the node's ID in `node_id`, and nothing is changed;
+  - with it, the change is made on that node. The response keeps its `message` and adds `"scope": "node"`, `node_id`, the token's `id`, `name` and `fingerprint`, and a `warning`;
+  - a request that reaches another node than the one named answers `409` (`wrong_node`) before looking the token up, so a load balancer cannot apply it to a different token with the same ID; an empty `node=` answers `400` (`invalid_node`);
+  - a cluster token with `?node` answers `409` (`cluster_token`); without it, cluster tokens behave as before, with the same response bodies.
+- If the same old token exists on several nodes (for example a token created with the same value on every node), repeat the request on each of them. A rotated old token's new value authenticates on that node only.
+- A cluster token whose entry this node still holds but the cluster state no longer does (`not_in_cluster_state`) can be revoked or deleted on the node with `?node`; a rotate or update of it answers `409` (`revoke_or_delete_only`).
+- A token row that comes from another cluster history (`history_mismatch`: the cluster state holds a different token at its ID) can only be deleted on the node with `?node`; a revoke, rotate or update answers `409` (`delete_only`). At its next start the node then holds the cluster's token at that ID. A revoke is refused because the node rewrites such a row to the cluster's token at startup and never re-enables a token, so the cluster token would stay disabled on that node.
+- While a node has not yet caught up with the cluster state, such a request answers `503` (`not_caught_up`) with `Retry-After`. A request with `?node` on a node that cannot yet tell its own node ID answers `503` (`node_id_unknown`) with `Retry-After`, and nothing is changed.
+- A rename of such a token to a name a cluster token holds answers `409` (`name_held_by_cluster`). A request that finds the token changed underneath it answers `409` (`token_changed`); retry.
+- `GET /api/v1/auth/tokens` and `GET /api/v1/auth/tokens/:id` on a cluster node show every token a write would treat as not the cluster's (the three cases above) with `"node_local": true` and `node_id`.
+- At startup, a cluster node also brings each cluster token's creation time in its own database back to the cluster's, which the classification above uses to recognise the token.
+- Teams: adding such a token to a team answers `409` (`node_local_token`, or `not_in_cluster_state` / `history_mismatch` for those rows): the cluster does not know the token, and on an ID collision the cluster token would have been added instead. Removing it from a team (`DELETE …/tokens/:id/teams/:team_id?node=<node_id>`) now removes the membership on that node; it answered 200 and removed nothing before. A membership that belongs to the cluster token with the same ID answers `409` (`cluster_membership`).
+- Standalone nodes and OSS are unchanged; `?node` is ignored there.
+- Audit (enterprise): `POST …/revoke` is now recorded as `token.revoked` (it was `token.created`), `PATCH …/tokens/:id` as `token.updated` (was `api.patch`), and adding or removing a team as `token.team_added` / `token.team_removed` (were `token.created` / `token.deleted`). A change on one node records `scope=node`, `node_id`, `token_id` and `token_name` in the event detail; a refusal records its `code`.
+- `operations/pre-26.06.1-token-upgrade.md` describes the API way to remove an old token from each node.
+
+Performance: authentication is unchanged. A token write on a cluster node adds one in-memory lookup in the cluster state; a change to a node-local token is a single SQLite statement instead of a cluster round-trip.
 
 ## Dependencies: tests build msgpack payloads with the encoder production uses ([#1709](https://github.com/Basekick-Labs/arc/issues/1709))
 

@@ -120,14 +120,8 @@ func classifyEvent(method, path string, statusCode int) string {
 
 	// Token management
 	if strings.HasPrefix(path, "/api/v1/auth/tokens") {
-		switch method {
-		case "POST":
-			if strings.HasSuffix(path, "/rotate") {
-				return "token.rotated"
-			}
-			return "token.created"
-		case "DELETE":
-			return "token.deleted"
+		if name := classifyTokenEvent(method, path); name != "" {
+			return name
 		}
 	}
 
@@ -214,6 +208,40 @@ func classifyEvent(method, path string, statusCode int) string {
 
 	// Default
 	return "api." + strings.ToLower(method)
+}
+
+// classifyTokenEvent names a write under /api/v1/auth/tokens, or returns ""
+// for a request that is not one (a read). The shipped names token.created,
+// token.rotated and token.deleted keep their meaning; a revoke and a team
+// addition used to be filed as token.created, a team removal as
+// token.deleted and an update as api.patch (#1630). Matched on segments, with
+// a trailing slash ignored as the router ignores it.
+func classifyTokenEvent(method, path string) string {
+	rest := strings.TrimSuffix(strings.TrimPrefix(path, "/api/v1/auth/tokens"), "/")
+	if rest != "" && !strings.HasPrefix(rest, "/") {
+		return "" // a sibling such as /api/v1/auth/tokensfoo
+	}
+	var seg []string
+	if rest != "" {
+		seg = strings.Split(rest[1:], "/")
+	}
+	switch {
+	case len(seg) == 0 && method == "POST":
+		return "token.created"
+	case len(seg) == 1 && method == "DELETE":
+		return "token.deleted"
+	case len(seg) == 1 && method == "PATCH":
+		return "token.updated"
+	case len(seg) == 2 && method == "POST" && seg[1] == "rotate":
+		return "token.rotated"
+	case len(seg) == 2 && method == "POST" && seg[1] == "revoke":
+		return "token.revoked"
+	case len(seg) == 2 && method == "POST" && seg[1] == "teams":
+		return "token.team_added"
+	case len(seg) == 3 && method == "DELETE" && seg[1] == "teams":
+		return "token.team_removed"
+	}
+	return ""
 }
 
 // extractRBACResource extracts the RBAC resource name from a path like /api/v1/rbac/organizations/...
