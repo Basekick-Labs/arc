@@ -16,6 +16,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/basekick-labs/arc/internal/colname"
 )
 
 // measurementState caches per-measurement work between passes so an unchanged measurement is
@@ -611,7 +613,7 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 		s.noteOutcome(key, outcome)
 		event := s.logger.Debug()
 		if err != nil && outcome != outcomeBusy {
-			event = s.logger.Warn().Err(err)
+			event = logSchemaConflict(s.logger.Warn().Err(err), err)
 		}
 		event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
 			Msg("Iceberg reconcile on request (a compaction, DELETE, retention or tiering change)")
@@ -811,7 +813,7 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		switch {
 		case err != nil:
 			// Log and continue — one bad measurement must not block the rest; next pass retries.
-			s.logger.Error().Err(err).
+			logSchemaConflict(s.logger.Error().Err(err), err).
 				Str("database", m.Database).Str("measurement", m.Measurement).
 				Msg("Iceberg reconcile: measurement failed")
 			failed++
@@ -1114,11 +1116,43 @@ func (s *Scheduler) unionFileSchemas(ctx context.Context, files []FileRef) (ArcS
 		return ArcSchema{}, err
 	}
 	var out ArcSchema
-	for _, sc := range schemas {
+	for i, sc := range schemas {
+		// Each column remembers the file it came from, so a conflict, here or when the caller
+		// merges this schema with the table's, names the files (#1744).
+		sc.sources = make(map[string]string, len(sc.Fields))
+		for _, f := range sc.Fields {
+			sc.sources[f.Name] = fileRefKey(files[i])
+		}
 		var err error
 		if out, err = MergeSchemas(out, sc); err != nil {
-			return ArcSchema{}, err
+			return ArcSchema{}, markConflict(err, conflictWithFiles)
 		}
 	}
 	return out, nil
+}
+
+// fileRefKey is the storage key of a file, or its physical path when the source has none.
+func fileRefKey(f FileRef) string {
+	if f.Key != "" {
+		return f.Key
+	}
+	return f.PhysicalPath
+}
+
+// logSchemaConflict adds a SchemaConflictError's fields to a log event (#1744). The error text
+// is sanitized like every logged error, which masks the quoted column name; these structured
+// fields carry it, the two types and the files, so the operator can tell what to fix.
+func logSchemaConflict(ev *zerolog.Event, err error) *zerolog.Event {
+	var c *SchemaConflictError
+	if !errors.As(err, &c) {
+		return ev
+	}
+	ev = ev.Str("column", colname.Quote(c.Column)).Str("type_first", c.First).Str("type_then", c.Then).Str("conflict_with", c.With)
+	if c.FirstFile != "" {
+		ev = ev.Str("file_first", c.FirstFile)
+	}
+	if c.File != "" {
+		ev = ev.Str("file_then", c.File)
+	}
+	return ev
 }
