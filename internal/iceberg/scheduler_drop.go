@@ -1,26 +1,35 @@
 package iceberg
 
-// Database drops requested by the cluster (#1731).
+// Database drops on node-local warehouses (#1731).
 //
 // With node-local storage every node has its own Iceberg warehouse and
 // catalog. A database DELETE runs on the primary writer and drops only the
 // writer's tables; the node that exports, and any node that exported before
-// a lease move, keeps tables naming the deleted files. The writer then
-// proposes a replicated database-drop notice, and each node's coordinator
-// asks its scheduler to drop the database once its delete workers have
-// unlinked the database's files (cluster.SetIcebergDatabaseDropper).
+// a lease move, keeps tables naming the deleted files. Two mechanisms remove
+// them, both wired only on such clusters (cmd/arc):
 //
-// The drop runs on the loop goroutine, so it never overlaps a reconcile, and
+//   - The writer's replicated notice: each node's coordinator asks for the
+//     drop once its delete workers have unlinked the database's files
+//     (RequestDropDatabase).
+//   - A backstop for a node that missed the notice (offline through the
+//     DELETE, caught up by snapshot, restarted before its drop ran): every
+//     dropBackstopEvery, each database in this node's catalog that the
+//     cluster has no files under and this node holds no data file of is
+//     dropped. A database emptied by retention loses its (empty) table the
+//     same way; new data recreates it.
+//
+// Drops run on the loop goroutine, so a drop never overlaps a reconcile, and
 // regardless of the gate: a node that does not export is exactly the one
-// whose stale tables nothing else removes. It is skipped while the cluster's
-// manifest still holds files under the database (SetDropGuard): a Raft log
-// replayed at restart can re-apply an old notice of a database recreated
-// since, and a database recreated within moments of its delete still has its
-// table, which the reconcile carries forward. A failed drop is retried with a
-// growing delay.
+// whose stale tables nothing else removes. A drop is skipped while the
+// cluster's manifest has files under the database (SetDropGuard, read after
+// a Raft barrier): an old notice replayed at restart after the database was
+// recreated, or a database recreated moments after its delete; the exporting
+// node reconciles that table. A failed drop is retried with a growing delay.
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 )
@@ -32,14 +41,18 @@ type dropRetry struct {
 }
 
 const (
-	dropMaxAttempts = 10
-	dropRetryBase   = 5 * time.Second
-	dropRetryMax    = 10 * time.Minute
+	dropMaxAttempts   = 10
+	dropRetryBase     = 5 * time.Second
+	dropRetryMax      = 10 * time.Minute
+	dropBackstopEvery = 10 * time.Minute
 )
 
-// SetDropGuard sets the predicate that skips a requested drop: the cluster
-// manifest still registers files under the database. Call during wiring.
-func (s *Scheduler) SetDropGuard(f func(database string) bool) { s.dropGuard = f }
+// SetDropGuard sets the predicate that skips a drop: the cluster manifest
+// still registers files under the database. An error counts as a failed
+// attempt. Setting it also enables the backstop. Call during wiring.
+func (s *Scheduler) SetDropGuard(f func(ctx context.Context, database string) (bool, error)) {
+	s.dropGuard = f
+}
 
 // RequestDropDatabase asks for this node's Iceberg tables of a deleted
 // database to be dropped. Safe from any goroutine and never blocks; requests
@@ -66,16 +79,54 @@ func (s *Scheduler) droppedThisPass(database string) bool {
 	if _, ok := s.passDrops[database]; ok {
 		return true
 	}
-	spoke, _, found := strings.Cut(database, "/")
-	if found {
+	if spoke, _, found := strings.Cut(database, "/"); found {
 		_, ok := s.passDrops[spoke]
 		return ok
 	}
 	return false
 }
 
+// backstopDrops requests a drop for each database in this node's catalog that
+// the cluster has no files under and this node holds no data file of. Loop
+// goroutine only; at most every dropBackstopEvery.
+func (s *Scheduler) backstopDrops(ctx context.Context) {
+	if s.dropGuard == nil || s.exporter == nil || time.Now().Before(s.backstopDue) {
+		return
+	}
+	s.backstopDue = time.Now().Add(dropBackstopEvery)
+	dbs, err := s.exporter.CatalogDatabases(ctx)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("Iceberg: could not list this node's catalog for tables of deleted databases; retried later")
+		return
+	}
+	for _, db := range dbs {
+		if ctx.Err() != nil {
+			return
+		}
+		gctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+		has, err := s.dropGuard(gctx, db)
+		cancel()
+		if err != nil || has {
+			continue
+		}
+		lctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+		local, err := s.exporter.HasLocalData(lctx, db)
+		cancel()
+		if err != nil || local {
+			continue
+		}
+		s.logger.Info().Str("database", db).
+			Msg("Iceberg: this node holds tables of a database the cluster has no files under; dropping them")
+		s.RequestDropDatabase(db)
+	}
+}
+
 // serviceDrops runs the requested drops that are due. Loop goroutine only.
 func (s *Scheduler) serviceDrops(ctx context.Context) {
+	if s.exporter == nil {
+		return
+	}
+	s.backstopDrops(ctx)
 	s.reqMu.Lock()
 	if len(s.drops) == 0 {
 		s.reqMu.Unlock()
@@ -94,44 +145,33 @@ func (s *Scheduler) serviceDrops(ctx context.Context) {
 	}
 	s.reqMu.Unlock()
 
-	for _, db := range due {
+	for i, db := range due {
 		if ctx.Err() != nil {
-			s.requeueDrop(db)
+			for _, rest := range due[i:] {
+				s.requeueDrop(rest)
+			}
 			return
 		}
-		if s.dropGuard != nil && s.dropGuard(db) {
-			delete(s.dropRetry, db)
-			s.logger.Info().Str("database", db).
-				Msg("Iceberg: not dropping the tables of a deleted database: the cluster has files under it again (recreated, or an old notice replayed); the export keeps its tables current")
-			continue
-		}
-		dctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-		err := s.exporter.DropDatabase(dctx, db)
-		cancel()
-		if err != nil {
-			r := s.dropRetry[db]
-			r.attempts++
-			if r.attempts >= dropMaxAttempts {
+		var err error
+		if s.dropGuard != nil {
+			gctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+			var has bool
+			has, err = s.dropGuard(gctx, db)
+			cancel()
+			if err == nil && has {
 				delete(s.dropRetry, db)
-				s.logger.Error().Err(err).Str("database", db).Int("attempts", r.attempts).
-					Msg("Iceberg: could not drop this node's tables of a deleted database; giving up. Repeating the database DELETE (it answers 404) sends the drop again")
+				s.logger.Info().Str("database", db).
+					Msg("Iceberg: not dropping the tables of a deleted database: the cluster has files under it again (recreated, or an old notice replayed); the exporting node reconciles them")
 				continue
 			}
-			delay := dropRetryBase << (r.attempts - 1)
-			if delay > dropRetryMax {
-				delay = dropRetryMax
-			}
-			r.next = time.Now().Add(delay)
-			s.dropRetry[db] = r
-			s.logger.Warn().Err(err).Str("database", db).Int("attempt", r.attempts).Dur("retry_in", delay).
-				Msg("Iceberg: could not drop this node's tables of a deleted database; retrying")
-			s.requeueDrop(db)
-			time.AfterFunc(delay, func() {
-				select {
-				case s.wake <- struct{}{}:
-				default:
-				}
-			})
+		}
+		if err == nil {
+			dctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+			err = s.dropRecovered(dctx, db)
+			cancel()
+		}
+		if err != nil {
+			s.dropFailed(db, err)
 			continue
 		}
 		delete(s.dropRetry, db)
@@ -143,6 +183,45 @@ func (s *Scheduler) serviceDrops(ctx context.Context) {
 		s.logger.Info().Str("database", db).
 			Msg("Iceberg: dropped this node's tables of a database deleted on the cluster")
 	}
+}
+
+// dropRecovered is DropDatabase with a panic turned into an error: the
+// trigger is replicated, so a panic would otherwise take every node down.
+func (s *Scheduler) dropRecovered(ctx context.Context, db string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error().Str("database", db).Str("panic", fmt.Sprint(r)).Str("stack", string(debug.Stack())).
+				Msg("Iceberg: recovered a panic while dropping a deleted database's tables")
+			err = fmt.Errorf("drop panicked: %v", r)
+		}
+	}()
+	return s.exporter.DropDatabase(ctx, db)
+}
+
+func (s *Scheduler) dropFailed(db string, err error) {
+	r := s.dropRetry[db]
+	r.attempts++
+	if r.attempts >= dropMaxAttempts {
+		delete(s.dropRetry, db)
+		s.logger.Error().Err(err).Str("database", db).Int("attempts", r.attempts).
+			Msg("Iceberg: could not drop this node's tables of a deleted database; giving up until the periodic check finds them again")
+		return
+	}
+	delay := dropRetryBase << (r.attempts - 1)
+	if delay > dropRetryMax {
+		delay = dropRetryMax
+	}
+	r.next = time.Now().Add(delay)
+	s.dropRetry[db] = r
+	s.logger.Warn().Err(err).Str("database", db).Int("attempt", r.attempts).Dur("retry_in", delay).
+		Msg("Iceberg: could not drop this node's tables of a deleted database; retrying")
+	s.requeueDrop(db)
+	time.AfterFunc(delay, func() {
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	})
 }
 
 func (s *Scheduler) requeueDrop(db string) {

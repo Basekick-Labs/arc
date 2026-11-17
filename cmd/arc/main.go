@@ -4614,7 +4614,8 @@ func main() {
 			log.Info().Msg("Iceberg export creates new tables in each measurement's directory (iceberg.layout=colocated); existing tables keep their location")
 			if clusterCoordinator != nil && !cluster.IsSharedObjectStore(storageBackend) {
 				log.Warn().Msg("Iceberg export with iceberg.layout=colocated on a cluster with node-local storage: table metadata " +
-					"is written only on the exporting node, and is not removed there by another node's database DELETE")
+					"is written only on the exporting node; another node's database DELETE removes it there once every node runs a build " +
+					"that applies the database-drop notice (#1731), and the emptied directories stay")
 			}
 		}
 		exporter.ConfigureNamespaceMigrationDryRun(cfg.Iceberg.NamespaceMigrationDryRun)
@@ -4751,7 +4752,7 @@ func main() {
 		// again (a replayed notice, a database recreated at once). Wired here, not at start: a
 		// notice applied meanwhile waits in the scheduler for its loop.
 		if clusterCoordinator != nil && !icebergTopo.barrier {
-			icebergScheduler.SetDropGuard(clusterCoordinator.HasManifestFilesUnder)
+			icebergScheduler.SetDropGuard(clusterCoordinator.IcebergDatabaseHasFiles)
 			clusterCoordinator.SetIcebergDatabaseDropper(icebergScheduler.RequestDropDatabase)
 			log.Info().Msg("Iceberg export on node-local storage: this node drops its own Iceberg tables of a database deleted on the cluster")
 		}

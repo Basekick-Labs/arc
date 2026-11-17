@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path"
 	"sort"
 	"strings"
@@ -65,6 +66,7 @@ type icebergNotifier struct {
 	dbDeletes   map[string]int
 	dropWaiting map[string]bool
 	dropQueued  map[string]bool
+	dropCapped  atomic.Bool
 	dropper     atomic.Pointer[func(database string)]
 }
 
@@ -322,7 +324,9 @@ const databaseDeleteReason = "database:delete"
 // database:delete manifest delete of the database, so when it applies here
 // all of that database's local unlinks are already queued: the node drops its
 // own tables once they are done (the count of queued database:delete items
-// reaches zero), never while its copies are still on disk. A notice applied
+// reaches zero). Without replication (cluster.replication_enabled=false) no
+// local unlinks are queued and the drop runs at once; such a node holds only
+// the copies it wrote itself, and the export may pick those up again. A notice applied
 // before the dropper is wired (log replay at restart, a catch-up) waits,
 // bounded, until it is.
 
@@ -399,16 +403,23 @@ func (c *Coordinator) onIcebergDatabaseDropped(db string) {
 
 func (c *Coordinator) fireIcebergDrop(db string) {
 	n := &c.iceberg
+	// Loaded under dropMu, which SetIcebergDatabaseDropper holds while it
+	// stores the dropper and drains the queue: a notice that sees no dropper
+	// queues before the drain, never after it.
+	n.dropMu.Lock()
 	if fn := n.dropper.Load(); fn != nil {
+		n.dropMu.Unlock()
 		(*fn)(db)
 		return
 	}
-	n.dropMu.Lock()
 	if n.dropQueued == nil {
 		n.dropQueued = map[string]bool{}
 	}
 	if len(n.dropQueued) < maxQueuedIcebergDrops {
 		n.dropQueued[db] = true
+	} else if n.dropCapped.CompareAndSwap(false, true) {
+		c.logger.Warn().Int("queued", maxQueuedIcebergDrops).
+			Msg("Iceberg database-drop notices are queued for an export that is not wired yet, and the queue is full; later ones are dropped (each node also drops tables of databases with no files on its own, periodically)")
 	}
 	n.dropMu.Unlock()
 }
@@ -449,8 +460,11 @@ func (c *Coordinator) ProposeIcebergDatabaseDropped(ctx context.Context, databas
 		return err
 	}
 	if _, blockers := capabilityCandidates(fsm.GetAllNodes(), c.raftNode.ConfigurationServerIDs, raft.CapabilityIcebergDatabaseDropped); len(blockers) > 0 {
+		if len(blockers) == 1 && blockers[0] == "raft configuration unavailable" {
+			return errors.New("raft configuration unavailable")
+		}
 		c.logger.Info().Strs("nodes", blockers).Str("database", database).
-			Msg("Iceberg database-drop notice not sent: not every node runs a build that applies it; those nodes' Iceberg tables of the deleted database stay until they are upgraded and the DELETE is repeated")
+			Msg("Iceberg database-drop notice not sent: not every node runs a build that applies it; nodes that do drop such tables on their own periodically")
 		return nil
 	}
 	raw, err := json.Marshal(p)
@@ -460,23 +474,22 @@ func (c *Coordinator) ProposeIcebergDatabaseDropped(ctx context.Context, databas
 	return c.applyOrForward(ctx, &raft.Command{Type: raft.CommandIcebergDatabaseDropped, Payload: raw})
 }
 
-// HasManifestFilesUnder reports whether the manifest registers any file under
-// "{database}/". The export's drop is skipped then (#1731): a replayed old
-// notice of a database recreated since, or a database recreated within
-// moments of its delete, whose tables the reconcile carries forward.
-func (c *Coordinator) HasManifestFilesUnder(database string) bool {
+// IcebergDatabaseHasFiles reports whether the manifest registers any file
+// under "{database}/", read after a Raft barrier so a node still replaying its
+// log answers from the committed state, not a midway one. The export's drop
+// is skipped while it does (#1731): a replayed old notice of a database
+// recreated since, or a database recreated moments after its delete. An
+// error means it could not be told: the caller retries.
+func (c *Coordinator) IcebergDatabaseHasFiles(ctx context.Context, database string) (bool, error) {
 	if c == nil || c.raftNode == nil || database == "" {
-		return false
+		return false, errors.New("raft not available")
+	}
+	if err := c.SyncManifest(ctx); err != nil {
+		return false, err
 	}
 	fsm := c.raftNode.FSM()
 	if fsm == nil {
-		return false
+		return false, errors.New("raft FSM not available")
 	}
-	prefix := database + "/"
-	for _, f := range fsm.GetAllFiles() {
-		if strings.HasPrefix(f.Path, prefix) {
-			return true
-		}
-	}
-	return false
+	return fsm.HasFileWithPrefix(database + "/"), nil
 }

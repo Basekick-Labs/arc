@@ -7,9 +7,11 @@ package iceberg
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -55,7 +57,7 @@ func TestRequestedDropRunsOnANodeThatDoesNotExport(t *testing.T) {
 
 func TestRequestedDropSkippedWhileTheClusterHasFiles(t *testing.T) {
 	r, s, _ := newDropRig1731(t)
-	s.SetDropGuard(func(db string) bool { return db == "mydb" })
+	s.SetDropGuard(func(_ context.Context, db string) (bool, error) { return db == "mydb", nil })
 	s.RequestDropDatabase("mydb")
 	s.serviceDrops(context.Background())
 	if r.catalogLoc(t, "arc_mydb", "cpu") == "" {
@@ -98,5 +100,81 @@ func TestRequestDropDatabaseRefusesNamespacedNames(t *testing.T) {
 	}
 	if len(s.drops) != 0 {
 		t.Fatalf("drops = %v", s.drops)
+	}
+}
+
+// The backstop drops the tables of a database that has no files in the
+// cluster and none on this node (a missed notice), and keeps the others.
+func TestBackstopDropsTablesOfDatabasesWithNoFiles(t *testing.T) {
+	r, s, gate := newDropRig1731(t)
+	gate.open = false
+	writeArcStyleParquet(t, filepath.Join(r.root, "keep/cpu/2023/11/14/22/k.parquet"), 1_700_000_000_000_000, 5)
+	gate.open = true
+	s.runPass(context.Background())
+	if r.catalogLoc(t, "arc_keep", "cpu") == "" {
+		t.Fatal("keep not exported")
+	}
+	gate.open = false
+	// mydb is gone from the cluster and from this node; keep is gone from the
+	// cluster's manifest but this node still holds its data (not yet
+	// unlinked): only mydb is dropped.
+	if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
+		t.Fatal(err)
+	}
+	s.SetDropGuard(func(context.Context, string) (bool, error) { return false, nil })
+	s.runPass(context.Background())
+	if r.catalogLoc(t, "arc_mydb", "cpu") != "" {
+		t.Fatal("the backstop left a table of a database with no files")
+	}
+	if r.catalogLoc(t, "arc_keep", "cpu") == "" {
+		t.Fatal("the backstop dropped a table whose data is still on this node")
+	}
+	// Not again before dropBackstopEvery.
+	if !time.Now().Before(s.backstopDue) {
+		t.Fatal("backstop not rate-limited")
+	}
+}
+
+func TestDropRetriedWhenTheGuardCannotTell(t *testing.T) {
+	r, s, _ := newDropRig1731(t)
+	s.SetDropGuard(func(context.Context, string) (bool, error) { return false, errors.New("raft barrier failed") })
+	s.backstopDue = time.Now().Add(time.Hour) // the backstop is not under test
+	s.RequestDropDatabase("mydb")
+	s.serviceDrops(context.Background())
+	if r.catalogLoc(t, "arc_mydb", "cpu") == "" {
+		t.Fatal("dropped although the guard could not tell")
+	}
+	if rr, ok := s.dropRetry["mydb"]; !ok || rr.attempts != 1 {
+		t.Fatalf("retry state = %+v", s.dropRetry["mydb"])
+	}
+	if _, queued := s.drops["mydb"]; !queued {
+		t.Fatal("the drop was not kept for retry")
+	}
+}
+
+// requestOnList asks for a drop while the pass lists measurements, after the
+// pass-start drops ran: the drop happens between measurements, and the pass
+// must not reconcile the dropped database again.
+type requestOnList struct {
+	FileSetSourceWithSchema
+	s  *Scheduler
+	db string
+}
+
+func (r *requestOnList) Measurements(ctx context.Context) ([]Measurement, error) {
+	ms, err := r.FileSetSourceWithSchema.Measurements(ctx)
+	r.s.RequestDropDatabase(r.db)
+	return ms, err
+}
+
+func TestDropMidPassSkipsTheDatabase(t *testing.T) {
+	r, s, _ := newDropRig1731(t)
+	s.source = &requestOnList{FileSetSourceWithSchema: s.source, s: s, db: "mydb"}
+	s.backstopDue = time.Now().Add(time.Hour)
+	// mydb's files are still on disk: without the skip, the pass would
+	// reconcile it right after the drop and recreate the table.
+	s.runPass(context.Background())
+	if r.catalogLoc(t, "arc_mydb", "cpu") != "" {
+		t.Fatal("a database dropped mid-pass was reconciled again in the same pass")
 	}
 }

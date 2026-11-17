@@ -1,9 +1,13 @@
 package cluster
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"testing"
+
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/cluster/filereplication"
 )
@@ -86,5 +90,34 @@ func TestIcebergDatabaseDropCountRetiredInUnlinkBatch(t *testing.T) {
 	}
 	if databaseOfKey("/spoke/db/m/x.parquet") != "spoke" || databaseOfKey("") != "" {
 		t.Fatal("databaseOfKey")
+	}
+}
+
+// Through the real path: enqueueLocalDelete counts the item, the worker's
+// batch unlinks it, and the drop fires only after the file is gone.
+func TestIcebergDatabaseDropFiresAfterTheUnlink(t *testing.T) {
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	path := "a/cpu/2026/01/01/00/x.parquet"
+	if err := backend.Write(ctx, path, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	c := &Coordinator{storage: backend}
+	var sawFile []bool
+	c.SetIcebergDatabaseDropper(func(db string) {
+		n, _ := backend.StatFile(ctx, path)
+		sawFile = append(sawFile, n >= 0)
+	})
+	c.enqueueLocalDelete(path, databaseDeleteReason)
+	c.onIcebergDatabaseDropped("a")
+	if len(sawFile) != 0 {
+		t.Fatal("fired before the unlink was taken")
+	}
+	c.unlinkBatch(c.takePendingDeletes(), nil)
+	if len(sawFile) != 1 || sawFile[0] {
+		t.Fatalf("fired %d times, file present at fire = %v; want once, after the unlink", len(sawFile), sawFile)
 	}
 }

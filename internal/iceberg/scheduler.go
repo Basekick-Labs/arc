@@ -130,10 +130,11 @@ type Scheduler struct {
 	// Database drops (#1731, scheduler_drop.go): requested names (reqMu),
 	// their retry state, the guard, and the databases dropped during the
 	// running pass. Loop goroutine only, except drops.
-	drops     map[string]struct{}
-	dropRetry map[string]dropRetry
-	dropGuard func(database string) bool
-	passDrops map[string]struct{}
+	drops       map[string]struct{}
+	dropRetry   map[string]dropRetry
+	dropGuard   func(ctx context.Context, database string) (bool, error)
+	passDrops   map[string]struct{}
+	backstopDue time.Time
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -771,8 +772,9 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		}
 		// A compaction that finished while this pass runs is served before the
 		// next measurement, not after the whole pass (#1722). A database
-		// dropped meanwhile (#1731) is not reconciled again in this pass: its
-		// measurements were listed before the drop.
+		// dropped in this pass (#1731) is not reconciled again in it: a drop
+		// between measurements happened after the listing, and one at pass
+		// start leaves nothing to list.
 		s.serviceDrops(ctx)
 		s.serviceRequests(ctx)
 		if s.droppedThisPass(m.Database) {

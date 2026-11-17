@@ -3767,6 +3767,21 @@ func (f *ClusterFSM) HasFile(path string) bool {
 	return ok
 }
 
+// HasFileWithPrefix reports whether any manifest path starts with prefix,
+// without copying entries: a walk under the read lock that stops at the first
+// match (#1731's drop guard, rare; a hub's spoke files are indexed under the
+// spoke's own database, so filesByDB cannot answer it).
+func (f *ClusterFSM) HasFileWithPrefix(prefix string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for p := range f.files {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
