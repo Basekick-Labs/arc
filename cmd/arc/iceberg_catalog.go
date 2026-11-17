@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"time"
+
 	"github.com/basekick-labs/arc/internal/api"
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/edgesync"
 	"github.com/basekick-labs/arc/internal/iceberg"
 	"github.com/basekick-labs/arc/internal/logger"
+	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog/log"
@@ -65,4 +70,55 @@ func registerIcebergRESTCatalog(app *fiber.App, exporter *iceberg.Exporter, auth
 	h.RegisterRoutes(app)
 	log.Info().Str("path", api.IcebergCatalogBasePath).Bool("auth", authManager != nil).Bool("rbac", rbacManager != nil).
 		Msg("Iceberg REST catalog enabled (read-only): clients use uri=<arc base URL>" + api.IcebergCatalogBasePath)
+}
+
+// wireIcebergGlue builds the Glue sync (#1690 option B) and returns the
+// export's start function extended to start it: the sync runs only where and
+// when the export runs, on the export's own gate (nil: standalone, always).
+// The exporter reports each publish to it; the shutdown hook cancels
+// in-flight Glue calls.
+func wireIcebergGlue(exporter *iceberg.Exporter, backend storage.Backend, gate iceberg.WriterGate, gcfg config.IcebergGlueConfig,
+	layout string, sc *shutdown.Coordinator, start func()) func() {
+	region := iceberg.GlueRegion(backend, gcfg.Region)
+	client, err := iceberg.NewGlueClient(backend, region)
+	if err != nil {
+		log.Fatal().Err(err).Msg("iceberg.glue.enabled=true: cannot build the Glue client")
+	}
+	gs := iceberg.NewGlueSync(iceberg.GlueSyncConfig{
+		Exporter:  exporter,
+		API:       client,
+		CatalogID: gcfg.CatalogID,
+		Interval:  time.Duration(gcfg.SyncInterval) * time.Second,
+		Gate:      gate,
+		Logger:    logger.Get("iceberg"),
+	})
+	exporter.SetOnPublished(gs.Notify)
+	catalog := gcfg.CatalogID
+	if catalog == "" {
+		catalog = "(the credentials' account)"
+	}
+	log.Info().Str("region", region).Str("catalog_id", catalog).Int("retry_interval_s", gcfg.SyncInterval).
+		Msg("Iceberg tables are registered in AWS Glue (iceberg.glue.enabled): one Glue table per published table, updated on each publish")
+	// Glue, unlike Arc's REST catalog, accepts writes: an engine that drops
+	// or purges a table through it deletes the data files the metadata names,
+	// which are Arc's own in either layout. gc.enabled=false would stop that
+	// in Spark and Java, but iceberg-go then refuses Arc's own snapshot
+	// expiry, so the control is the consumers' S3 permissions.
+	where := "the data files the table's metadata names are Arc's own"
+	if layout == config.IcebergLayoutColocated {
+		where += ", and each Glue table's location is the measurement's data directory"
+	}
+	log.Warn().Msg("Iceberg Glue sync: Glue accepts writes, and " + where + ". Give Athena, Spark and every other Glue consumer read-only " +
+		"S3 access to Arc's bucket and leave Glue table optimizers off: a DROP TABLE ... PURGE, VACUUM or orphan-file cleanup run " +
+		"through Glue would delete Arc's data")
+	sc.RegisterHook("iceberg-glue", func(ctx context.Context) error {
+		gs.Stop()
+		return nil
+	}, shutdown.PriorityDatabase)
+	return func() {
+		if start != nil {
+			start()
+		}
+		gs.Start()
+	}
 }

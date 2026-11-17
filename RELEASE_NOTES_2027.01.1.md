@@ -2,6 +2,23 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: Arc's Iceberg tables in AWS Glue ([#1690](https://github.com/Basekick-Labs/arc/issues/1690))
+
+With `iceberg.glue.enabled = true`, Arc keeps one AWS Glue table for each Iceberg table its export publishes. Each Glue table points at the version Arc just published. Athena, EMR, Redshift Spectrum and Snowflake (`CATALOG_SOURCE = GLUE`) read Arc's tables from Glue, and so do engines that federate Glue. Before, Glue knew nothing about Arc's tables.
+
+- **Turn it on:** set `iceberg.glue.enabled = true`. It needs `iceberg.enabled = true` and data on AWS S3; Arc refuses to start with another S3-compatible endpoint.
+- **Names:** the Glue database is the Iceberg namespace (`arc_<database>`) and the Glue table is the measurement, lowercased, with any character other than `a-z`, `0-9` and `_` turned into `_`. Two Arc names that map to one Glue name: the first registered keeps it, and Arc logs an error for the other.
+- **Freshness:** each publish is pushed to Glue at once. In a test on AWS, Glue named the new version within 2 seconds of Arc publishing it. Athena read it right away, and Snowflake about a minute later. Failures are retried every `iceberg.glue.sync_interval` seconds (default 60). Every hour, and whenever a node takes over the export, Arc checks every table against Glue.
+- **A pointer, not a copy:** Arc keeps writing its own metadata. Glue stores where the current version is. Updates do not archive a Glue table version, so Glue's version quota is not consumed.
+- **Arc only changes what it created:** Glue tables carry `arc.managed` and the warehouse they belong to. Arc never modifies or deletes a table it did not create, one created for another warehouse, a copy of one of its tables under another name, or one another writer has committed to. Each refusal is logged as an error once per process.
+- **Removal:** when an Arc table or database is dropped, its Glue table is deleted. The table must be found missing on two consecutive complete checks at least 10 minutes apart, and the Glue table is read again just before the delete. That deletes Glue metadata only, never data. Glue databases are never deleted.
+- **Credentials and region:** Glue uses the S3 storage credentials, in `iceberg.glue.region` or else `storage.s3_region`. Set `iceberg.glue.catalog_id` for a catalog in another account. The credentials need `glue:GetDatabase`, `CreateDatabase`, `GetDatabases`, `GetTable`, `GetTables`, `CreateTable`, `UpdateTable` and `DeleteTable`. Lake Formation grants are yours to set.
+- **Clusters:** only the node running the export updates Glue. Give Glue permissions to every node that can take over the export.
+- **Read-only consumers:** unlike Arc's REST catalog, Glue accepts writes. A `DROP TABLE … PURGE`, a `VACUUM` or an orphan-file cleanup run through Glue deletes the data files the table's metadata names, and those are Arc's own files in either layout. Give Athena, Spark and every other Glue consumer read-only S3 access to Arc's bucket, and leave Glue's table optimizers off. Arc logs a warning at startup.
+- **One prefix per deployment:** two Arc deployments that share a Glue catalog and region need different `iceberg.namespace_prefix` values; otherwise their tables collide. Changing `iceberg.warehouse` leaves the Glue tables Arc created under the old warehouse in place. Arc refuses to touch them and logs how to clear them.
+
+New configuration keys: `iceberg.glue.enabled` (default `false`), `iceberg.glue.region` (default: `storage.s3_region`), `iceberg.glue.catalog_id` (default: the credentials' account), `iceberg.glue.sync_interval` (default `60`).
+
 ## New: a read-only Iceberg REST catalog for Snowflake, Trino, Spark, PyIceberg and DuckDB ([#1690](https://github.com/Basekick-Labs/arc/issues/1690))
 
 Arc can now serve the tables its Iceberg export publishes through the Iceberg REST catalog protocol. Before, an engine found an Arc table only by its path (`metadata/vN.metadata.json` or `version-hint.text`). Engines that discover tables through a catalog could not list them, and Snowflake read one snapshot until someone ran `ALTER ICEBERG TABLE … REFRESH` by hand. Now an engine points its catalog at `http(s)://<arc>/iceberg` and lists namespaces and tables, and loads the current version of each.
