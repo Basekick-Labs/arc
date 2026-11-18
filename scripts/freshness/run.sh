@@ -22,44 +22,51 @@
 set -euo pipefail
 
 run="${1:-}"; shift || true
-case "$run" in r1|r1s|r2|r6|r6f|r7) ;; *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "$run" in r1|r1s|r2|r6|r6f|r7) ;; *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
 arc_bin="${ARC_BIN:-$repo/arc}"
 port="${PORT:-18758}"
 [ -x "$arc_bin" ] || { echo "no Arc binary at $arc_bin (set ARC_BIN)" >&2; exit 1; }
 arc_bin="$(cd "$(dirname "$arc_bin")" && pwd)/$(basename "$arc_bin")"
-if lsof -ti "tcp:$port" >/dev/null 2>&1; then echo "port $port is in use (set PORT)" >&2; exit 1; fi
+if lsof -ti "tcp:$port" -sTCP:LISTEN >/dev/null 2>&1; then echo "port $port is in use (set PORT)" >&2; exit 1; fi
 # Arc also reads /etc/arc/arc.toml; the temp HOME below takes care of ~/.arc.
 [ -e /etc/arc/arc.toml ] && echo "warning: /etc/arc/arc.toml exists and Arc will read it" >&2
 
-harness="$(mktemp -d)/freshness"
-(cd "$repo" && go build -o "$harness" ./scripts/freshness)
-
+build="$(mktemp -d)"
 dir="$(mktemp -d)"
+harness="$build/freshness"
 token="$(openssl rand -hex 24)"
+arc_pid=""
 stop() {
-  pids="$(lsof -ti "tcp:$port" 2>/dev/null || true)"
-  [ -n "$pids" ] && kill $pids 2>/dev/null || true
-  for _ in $(seq 1 50); do lsof -ti "tcp:$port" >/dev/null 2>&1 || break; sleep 0.1; done
+  # Only the Arc this script started: by its PID, never by who holds the port.
+  if [ -n "$arc_pid" ] && kill -0 "$arc_pid" 2>/dev/null; then
+    kill "$arc_pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do kill -0 "$arc_pid" 2>/dev/null || break; sleep 0.1; done
+  fi
   if [ "${KEEP:-0}" = 1 ]; then echo "kept $dir" >&2; else rm -rf "$dir"; fi
-  rm -rf "$(dirname "$harness")"
+  rm -rf "$build"
 }
 trap stop EXIT
+(cd "$repo" && go build -o "$harness" ./scripts/freshness)
 
 # Only what is set here and the ARC_* the caller exported reaches Arc. Never
 # start it from the repository root: the arc.toml there sets a 100 ms buffer age.
+# The keys this script owns come last, so an exported ARC_SERVER_PORT or
+# ARC_STORAGE_LOCAL_PATH cannot point the run at another server or at real data.
 env_run=()
 case "$run" in r2) env_run+=("ARC_INGEST_MAX_BUFFER_AGE_MS=${ARC_INGEST_MAX_BUFFER_AGE_MS:-100}") ;; esac
 compaction=false; [ "${COMPACTION:-0}" = 1 ] && compaction=true
 passthrough=()
 while IFS= read -r kv; do passthrough+=("$kv"); done < <(env | grep '^ARC_' | grep -v -e '^ARC_BIN=' -e '^ARC_TOKEN=' || true)
 
-(cd "$dir" && exec env -i PATH="$PATH" HOME="$dir" \
-  ARC_SERVER_PORT="$port" ARC_STORAGE_LOCAL_PATH="$dir/data/arc" ARC_AUTH_DB_PATH="$dir/data/arc.db" \
-  ARC_AUTH_BOOTSTRAP_TOKEN="$token" ARC_TELEMETRY_ENABLED=false ARC_LOG_LEVEL=warn \
-  ARC_COMPACTION_ENABLED="$compaction" ${passthrough[@]+"${passthrough[@]}"} ${env_run[@]+"${env_run[@]}"} \
+(cd "$dir" && exec env -i PATH="$PATH" \
+  ARC_TELEMETRY_ENABLED=false ARC_LOG_LEVEL=warn \
+  ${passthrough[@]+"${passthrough[@]}"} ${env_run[@]+"${env_run[@]}"} \
+  HOME="$dir" ARC_SERVER_PORT="$port" ARC_STORAGE_LOCAL_PATH="$dir/data/arc" ARC_AUTH_DB_PATH="$dir/data/arc.db" \
+  ARC_AUTH_BOOTSTRAP_TOKEN="$token" ARC_COMPACTION_ENABLED="$compaction" \
   "$arc_bin" >"$dir/arc.log" 2>&1) &
+arc_pid=$!
 
 up=0
 for _ in $(seq 1 120); do

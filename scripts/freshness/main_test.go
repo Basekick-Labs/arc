@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,23 +138,33 @@ arc_ingest_publish_delay_max_seconds 9.5
 	}
 }
 
-// fakeArc is a stand-in for Arc: writes go to a buffer that becomes visible
-// to queries when flush is called.
+// fakeArc is a stand-in for Arc: writes go to a per-measurement buffer that
+// becomes visible to queries when flush is called.
 type fakeArc struct {
 	mu       sync.Mutex
-	buffered []int64
-	visible  []int64
+	buffered map[string][]int64
+	visible  map[string][]int64
 	queries  []string
+	events   []string // "write <measurement> <marker>", "flush", "query <measurement>"
 	flushes  int
+}
+
+func newFakeArc() *fakeArc {
+	return &fakeArc{buffered: map[string][]int64{}, visible: map[string][]int64{}}
 }
 
 func (f *fakeArc) flushNow() {
 	f.mu.Lock()
-	f.visible = append(f.visible, f.buffered...)
-	f.buffered = nil
+	for m, rows := range f.buffered {
+		f.visible[m] = append(f.visible[m], rows...)
+	}
+	f.buffered = map[string][]int64{}
 	f.flushes++
+	f.events = append(f.events, "flush")
 	f.mu.Unlock()
 }
+
+var fromTable = regexp.MustCompile(`FROM \S+\.(\S+)`)
 
 func (f *fakeArc) handler(t *testing.T) http.Handler {
 	mux := http.NewServeMux()
@@ -164,19 +176,21 @@ func (f *fakeArc) handler(t *testing.T) http.Handler {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
-			var m int64
 			fields := strings.Fields(line)
 			if len(fields) != 3 {
 				t.Errorf("bad line %q", line)
 				continue
 			}
+			meas, _, _ := strings.Cut(fields[0], ",")
+			var m int64
 			for _, kv := range strings.Split(fields[1], ",") {
 				if v, ok := strings.CutPrefix(kv, "marker="); ok {
-					_ = json.Unmarshal([]byte(strings.TrimSuffix(v, "i")), &m)
+					m, _ = strconv.ParseInt(strings.TrimSuffix(v, "i"), 10, 64)
 				}
 			}
 			if m > 0 {
-				f.buffered = append(f.buffered, m)
+				f.buffered[meas] = append(f.buffered[meas], m)
+				f.events = append(f.events, fmt.Sprintf("write %s %d", meas, m))
 			}
 		}
 		f.mu.Unlock()
@@ -186,11 +200,12 @@ func (f *fakeArc) handler(t *testing.T) http.Handler {
 		f.flushNow()
 		_, _ = w.Write([]byte(`{"status":"success"}`))
 	})
-	snapshot := func(sql string) []int64 {
+	snapshot := func(meas, sql string) []int64 {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.queries = append(f.queries, sql)
-		return append([]int64(nil), f.visible...)
+		f.events = append(f.events, "query "+meas)
+		return append([]int64(nil), f.visible[meas]...)
 	}
 	rows := func(w http.ResponseWriter, markers []int64, cols []string) {
 		data := make([][]any, len(markers))
@@ -199,10 +214,13 @@ func (f *fakeArc) handler(t *testing.T) http.Handler {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "columns": cols, "data": data})
 	}
-	sqlOf := func(r *http.Request) string {
+	sqlOf := func(r *http.Request) (meas, sql string) {
 		var req struct{ SQL string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		return req.SQL
+		if m := fromTable.FindStringSubmatch(req.SQL); m != nil {
+			meas = m[1]
+		}
+		return meas, req.SQL
 	}
 	mux.HandleFunc("POST /api/v1/query", func(w http.ResponseWriter, r *http.Request) {
 		markers := snapshot(sqlOf(r))
@@ -215,11 +233,14 @@ func (f *fakeArc) handler(t *testing.T) http.Handler {
 	})
 	mux.HandleFunc("GET /api/v1/query/{measurement}", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		if q.Get("limit") == "" || q.Get("order_by") != "time ASC" || q.Get("database") == "" {
-			http.Error(w, "the endpoint's defaults (100 rows, newest first) would truncate the probe", http.StatusBadRequest)
+		// Arc's own rules: at most 1,000,000 rows; and without these the
+		// endpoint's defaults (100 rows, newest first) would truncate the probe.
+		limit, err := strconv.Atoi(q.Get("limit"))
+		if err != nil || limit < 1 || limit > 1000000 || q.Get("order_by") != "time ASC" || q.Get("database") == "" {
+			http.Error(w, `{"success":false,"error":"Invalid limit: must be a positive integer up to 1000000"}`, http.StatusBadRequest)
 			return
 		}
-		rows(w, snapshot(q.Get("where")), []string{"time", "marker"})
+		rows(w, snapshot(r.PathValue("measurement"), q.Get("where")), []string{"time", "marker"})
 	})
 	mux.HandleFunc("POST /api/v1/query/msgpack", func(w http.ResponseWriter, r *http.Request) {
 		markers := snapshot(sqlOf(r))
@@ -250,7 +271,8 @@ func (f *fakeArc) handler(t *testing.T) http.Handler {
 
 // Every endpoint's response is decoded to the same list of markers.
 func TestProbesDecodeEveryEndpoint(t *testing.T) {
-	f := &fakeArc{visible: []int64{3, 1, 2}}
+	f := newFakeArc()
+	f.visible["m"] = []int64{3, 1, 2}
 	srv := httptest.NewServer(f.handler(t))
 	defer srv.Close()
 	cl := &client{base: srv.URL, token: "tok", http: srv.Client()}
@@ -278,10 +300,7 @@ func TestProbesDecodeEveryEndpoint(t *testing.T) {
 		t.Errorf("probe SQL =\n%s\nwant\n%s", f.queries[0], want)
 	}
 	// A measurement with no file yet answers with no columns: no rows, no error.
-	f.mu.Lock()
-	f.visible = nil
-	f.mu.Unlock()
-	if got, err := cl.queryMarkers(context.Background(), "SELECT 1"); err != nil || len(got) != 0 {
+	if got, err := cl.queryMarkers(context.Background(), "SELECT marker FROM db.nothing_yet"); err != nil || len(got) != 0 {
 		t.Errorf("empty result: %v, %v", got, err)
 	}
 }
@@ -289,7 +308,7 @@ func TestProbesDecodeEveryEndpoint(t *testing.T) {
 // End to end against the stand-in: rows become visible only when it flushes,
 // so the lag is at least the time to the next flush, and every row is seen.
 func TestSteadyAgainstAStandIn(t *testing.T) {
-	f := &fakeArc{}
+	f := newFakeArc()
 	srv := httptest.NewServer(f.handler(t))
 	defer srv.Close()
 	stop := make(chan struct{})
@@ -349,26 +368,69 @@ func TestSteadyAgainstAStandIn(t *testing.T) {
 	}
 }
 
-// The late mode writes the late row only after the query that finds its hour
-// empty, and polls both a repeated and a never-seen SQL text.
+// The late mode, per trial: the query that finds the late row's hour empty
+// runs after the seed row is visible and before the late row is written, and
+// both a repeated and a never-sent SQL text are polled afterwards.
 func TestLateAgainstAStandIn(t *testing.T) {
-	f := &fakeArc{}
+	midHour := time.Date(2026, 11, 18, 10, 30, 0, 0, time.UTC)
+	hourClock = func() time.Time { return midHour }
+	t.Cleanup(func() { hourClock = time.Now })
+
+	f := newFakeArc()
 	srv := httptest.NewServer(f.handler(t))
 	defer srv.Close()
+	out := t.TempDir() + "/late.json"
 	var buf bytes.Buffer
 	err := lateCmd(context.Background(), []string{
-		"-http", srv.URL, "-token", "tok", "-trials", "2", "-delays", "0s", "-poll", "1ms", "-timeout", "10s",
+		"-http", srv.URL, "-token", "tok", "-trials", "2", "-delays", "0s", "-poll", "1ms", "-timeout", "10s", "-out", out,
 	}, &buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), "not visible within 10s: 0 of 2 trials") {
-		t.Errorf("report:\n%s", buf.String())
+	var rep lateReport
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Trials) != 2 || rep.Missed != 0 || rep.Discarded != 0 || rep.SameSQL.N != 2 || rep.Unique.N != 2 {
+		t.Fatalf("report = %+v\n%s", rep, buf.String())
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.flushes != 4 {
-		t.Errorf("%d flushes for 2 trials, want 4 (seed and late row each)", f.flushes)
+	for _, tr := range rep.Trials {
+		if tr.SameSQLS < 0 || tr.UniqueSQLS < 0 {
+			t.Errorf("trial %+v did not see the late row", tr)
+		}
+		// write seed, flush, query (sees the seed, finds the other hour
+		// empty), write late row, flush, queries.
+		var order []string
+		for _, e := range f.events {
+			switch {
+			case e == "flush":
+				order = append(order, e)
+			case strings.HasSuffix(e, " "+tr.Measurement) || strings.Contains(e, " "+tr.Measurement+" "):
+				if n := len(order); n == 0 || order[n-1] != e {
+					order = append(order, e)
+				}
+			}
+		}
+		want := []string{
+			"write " + tr.Measurement + " 1", "flush", "query " + tr.Measurement,
+			"write " + tr.Measurement + " 2", "flush", "query " + tr.Measurement,
+		}
+		var got []string
+		for _, e := range order {
+			// Other trials' flushes are in the list too; keep this trial's steps.
+			if len(got) < len(want) && e == want[len(got)] {
+				got = append(got, e)
+			}
+		}
+		if len(got) != len(want) {
+			t.Errorf("trial on %s ran %v, want the steps %v in order", tr.Measurement, order, want)
+		}
 	}
 	var unique int
 	for _, q := range f.queries {
@@ -377,10 +439,54 @@ func TestLateAgainstAStandIn(t *testing.T) {
 		}
 	}
 	if unique < 2 {
-		t.Errorf("%d never-seen SQL texts sent, want one per trial at least", unique)
+		t.Errorf("%d never-sent SQL texts, want one per trial at least", unique)
 	}
 	if err := lateCmd(context.Background(), []string{"-http", srv.URL, "-token", "tok", "-offset", "-10m"}, io.Discard); err == nil {
 		t.Error("an offset inside the current hour was accepted")
+	}
+}
+
+// A trial started in the first minutes of an hour, or one that crossed into
+// the next hour, says nothing about the caches and is left out of the numbers.
+func TestLateDiscardsTrialsThatCannotShowTheCache(t *testing.T) {
+	t.Cleanup(func() { hourClock = time.Now })
+	f := newFakeArc()
+	srv := httptest.NewServer(f.handler(t))
+	defer srv.Close()
+	run := func() lateReport {
+		out := t.TempDir() + "/late.json"
+		if err := lateCmd(context.Background(), []string{
+			"-http", srv.URL, "-token", "tok", "-trials", "1", "-delays", "0s", "-poll", "1ms", "-timeout", "10s", "-out", out,
+		}, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		var rep lateReport
+		data, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &rep); err != nil {
+			t.Fatal(err)
+		}
+		return rep
+	}
+
+	hourClock = func() time.Time { return time.Date(2026, 11, 18, 10, 4, 59, 0, time.UTC) }
+	if rep := run(); rep.Discarded != 1 || rep.SameSQL.N != 0 || !strings.Contains(rep.Trials[0].Discard, "into the hour") {
+		t.Errorf("a trial started 4m59s into the hour: %+v", rep)
+	}
+
+	// The hour changes between the trial's first reading and its last.
+	var calls int
+	hourClock = func() time.Time {
+		calls++
+		if calls <= 2 {
+			return time.Date(2026, 11, 18, 10, 59, 59, 0, time.UTC)
+		}
+		return time.Date(2026, 11, 18, 11, 0, 1, 0, time.UTC)
+	}
+	if rep := run(); rep.Discarded != 1 || !strings.Contains(rep.Trials[0].Discard, "rolled over") {
+		t.Errorf("a trial that crossed an hour boundary: %+v", rep)
 	}
 }
 
@@ -391,4 +497,25 @@ func mustOpen(t *testing.T, path string) io.Reader {
 		t.Fatal(err)
 	}
 	return bytes.NewReader(data)
+}
+
+// A run whose rows never show up, or whose probes all fail, is an error and
+// not a report of zero lag.
+func TestSteadyFailsWhenNothingCouldBeTimed(t *testing.T) {
+	f := newFakeArc() // never flushes: nothing becomes visible
+	srv := httptest.NewServer(f.handler(t))
+	defer srv.Close()
+	args := []string{"-http", srv.URL, "-token", "tok", "-rate", "100", "-duration", "100ms", "-poll", "1ms", "-timeout", "200ms"}
+	if err := steadyCmd(context.Background(), args, io.Discard); err == nil || !strings.Contains(err.Error(), "did not show up") {
+		t.Errorf("rows that never became visible: err = %v", err)
+	}
+	// A wrong token: every write and every probe is refused.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", http.StatusUnauthorized) })
+	srv2 := httptest.NewServer(mux)
+	defer srv2.Close()
+	args[1] = srv2.URL
+	if err := steadyCmd(context.Background(), args, io.Discard); err == nil || !strings.Contains(err.Error(), "every probe failed") {
+		t.Errorf("every probe refused: err = %v", err)
+	}
 }

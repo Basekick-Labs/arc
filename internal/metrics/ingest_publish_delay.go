@@ -36,9 +36,11 @@ type ingestPublishDelay struct {
 }
 
 // ObserveIngestPublishDelay records, for one Parquet file an ingest flush
-// published, how long the oldest row of its buffer waited: from the buffer
-// being created to the file being in this node's storage. A negative value (a
-// wall-clock step; the start is a wall-clock time) counts as zero.
+// published, how long the oldest row of the flushed buffer waited: from the
+// buffer being created to the file being in this node's storage. The caller
+// (ingest.observePublishDelay) says which files are observed and when. A
+// negative value (a wall-clock step; the start is a wall-clock time) counts
+// as zero.
 //
 // It only adds to atomics: it cannot fail or block, so the flush that calls
 // it behaves the same with or without it.
@@ -48,8 +50,9 @@ func (m *Metrics) ObserveIngestPublishDelay(d time.Duration) {
 	}
 	h := &m.ingestPublishDelay
 	// First bound >= the value: Prometheus "le" buckets include their bound.
-	h.buckets[sort.SearchFloat64s(ingestPublishDelayBounds[:], d.Seconds())].Add(1)
+	// Sum before bucket: a reader that sees the count sees its sum.
 	h.sumNS.Add(int64(d))
+	h.buckets[sort.SearchFloat64s(ingestPublishDelayBounds[:], d.Seconds())].Add(1)
 	for {
 		cur := h.maxNS.Load()
 		if int64(d) <= cur || h.maxNS.CompareAndSwap(cur, int64(d)) {

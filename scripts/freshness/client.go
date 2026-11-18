@@ -16,6 +16,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 )
 
+// measurementLimit is the largest limit /api/v1/query/:measurement accepts.
+const measurementLimit = "1000000"
+
 type client struct {
 	base  string
 	token string
@@ -91,7 +94,9 @@ func newProbe(endpoint, database, measurement, run string, from, to time.Time) (
 		q.Set("database", database)
 		// The endpoint defaults to 100 rows, newest first: without these it
 		// would silently stop returning the oldest outstanding markers.
-		q.Set("limit", "10000000")
+		// 1,000,000 is the most it accepts; a run with more marker rows than
+		// that needs another endpoint.
+		q.Set("limit", measurementLimit)
 		q.Set("order_by", "time ASC")
 		q.Set("where", where)
 		return measurementProbe{path: "/api/v1/query/" + url.PathEscape(measurement) + "?" + q.Encode(), where: where}, nil

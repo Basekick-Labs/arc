@@ -235,3 +235,108 @@ func TestPublishDelaySkipsABatchWithNoBufferStart(t *testing.T) {
 		t.Errorf("%d observations for a zero start, want 0", got)
 	}
 }
+
+// With a WAL, an hour file whose rows the WAL can name is registered as soon
+// as it is stored, and observed there.
+func TestPublishDelayObservedPerHourFileWithAWAL(t *testing.T) {
+	now := inHour(t)
+	b, _ := newCoverageBuffer(t, 1000000, nil)
+	rec := coverageRecordFrom("cpu",
+		[]interface{}{now.UnixMicro(), now.Add(-3 * time.Hour).UnixMicro()}, []interface{}{1.0, 2.0})
+	if err := b.WriteColumnarRecord(context.Background(), "db", rec); err != nil {
+		t.Fatal(err)
+	}
+	backdateBuffer(t, b, "db/cpu", time.Hour)
+	count, sum := publishDelayCount(), publishDelaySum()
+	if err := b.FlushAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := publishDelayCount() - count; got != 2 {
+		t.Fatalf("%d observations for two hour files, want 2", got)
+	}
+	if got := publishDelaySum() - sum; got < 7200 || got > 7320 {
+		t.Errorf("observed %.1f s in total for two files of a buffer started 1 h ago, want about 7200", got)
+	}
+}
+
+// Hour files that wait for the rest of their flush (deferred, #1697) are
+// observed once each, when the flush registers them after its last hour: not
+// at their write as well, and not at all when a later hour fails and the
+// flush registers none of them.
+func TestPublishDelayObservedForDeferredHourFilesWhenRegistered(t *testing.T) {
+	t.Run("every hour stored", func(t *testing.T) {
+		store := newMemStore1697(0)
+		b := walBuffer1697(t, store)
+		reg := &recordingRegistrar1693{}
+		b.SetFileRegistrar(reg)
+		writeChunked(t, b, hoursRecord1692(4, 2))
+		count := publishDelayCount()
+		if err, _ := flushWithin(t, b, 20*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if reg.count() != 4 {
+			t.Fatalf("%d files registered, want 4 deferred files", reg.count())
+		}
+		if got := publishDelayCount() - count; got != 4 {
+			t.Errorf("%d observations for four deferred hour files, want 4 (one each, at registration)", got)
+		}
+	})
+	t.Run("a later hour fails", func(t *testing.T) {
+		store := newMemStore1697(4) // hours 1-3 stored, the 4th fails
+		b := walBuffer1697(t, store)
+		reg := &recordingRegistrar1693{}
+		b.SetFileRegistrar(reg)
+		writeChunked(t, b, hoursRecord1692(6, 1))
+		count := publishDelayCount()
+		if err, _ := flushWithin(t, b, 20*time.Second); err == nil {
+			t.Fatal("the flush succeeded; the 4th write was meant to fail")
+		}
+		if store.count() != 3 || reg.count() != 0 {
+			t.Fatalf("%d files stored and %d registered, want 3 and 0", store.count(), reg.count())
+		}
+		if got := publishDelayCount() - count; got != 0 {
+			t.Errorf("%d observations for stored files the flush did not register, want 0", got)
+		}
+	})
+}
+
+// A flush split by coverage writes one file per class; each is a file of the
+// same buffer and carries its start, on the synchronous path and on the
+// size-triggered one.
+func TestPublishDelayObservedForEachCoverageClass(t *testing.T) {
+	for name, tc := range map[string]struct {
+		maxBufferSize int
+		flush         func(*ArrowBuffer) error
+	}{
+		"synchronous":    {1000000, func(b *ArrowBuffer) error { return b.FlushAll(context.Background()) }},
+		"size-triggered": {3, func(b *ArrowBuffer) error { return b.FlushAllAndWait(context.Background()) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reg := &coverageRegistrar{}
+			b, _ := newCoverageBuffer(t, tc.maxBufferSize, reg)
+			b.SetClaimedBatch(func(_ uint64, _ string, cseq uint64) bool { return cseq == 2 })
+			ctx := context.Background()
+			count, sum := publishDelayCount(), publishDelaySum()
+			for i := 0; i < 3; i++ {
+				if i == 2 {
+					backdateBuffer(t, b, "db/cpu", time.Hour) // before the write that fills the buffer
+				}
+				if err := b.WriteColumnarRecord(ctx, "db", coverageRecord("cpu", float64(i))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tc.flush(b); err != nil {
+				t.Fatal(err)
+			}
+			if files := len(reg.snapshot()); files != 2 {
+				t.Fatalf("%d files, want the flush split in 2", files)
+			}
+			if got := publishDelayCount() - count; got != 2 {
+				t.Fatalf("%d observations for two files, want 2", got)
+			}
+			if got := publishDelaySum() - sum; got < 7200 || got > 7320 {
+				t.Errorf("observed %.1f s in total for two files of a buffer started 1 h ago, want about 7200: a class lost the buffer's start", got)
+			}
+		})
+	}
+}

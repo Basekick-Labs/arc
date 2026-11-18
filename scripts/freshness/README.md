@@ -48,7 +48,8 @@ Not scripted, same harness:
   (SeaweedFS locally).
 - **A cluster:** start it yourself and point `steady` at a reader. The lag then includes
   replication; the server-side metric below does not.
-- **Another endpoint:** `-endpoint msgpack|arrow|measurement`.
+- **Another endpoint:** `-endpoint msgpack|arrow|measurement`. The `measurement` endpoint
+  returns at most 1,000,000 rows, so keep `rate × duration` under that.
 - **A range that spans hour partitions:** `-lookback 3h`. A range inside the current hour and
   one that spans hours are pruned differently.
 
@@ -62,8 +63,8 @@ server  files_flushed=3  publish_delay: files=3 mean=5020ms max_since_start=5036
 
 - **lag** is an upper bound: the row became visible some time between the last probe that
   missed it and the first that returned it. The second line is the other end of that bracket.
-  The gap between the two is the resolution: the `-poll` pause plus one probe round trip
-  (printed as `probes ... round trip ms`).
+  The gap between the two is the resolution: the `-poll` pause plus two probe round trips
+  (one is printed as `probes ... round trip ms`).
 - Rows arrive evenly while a buffer fills, so with the age trigger the lag is spread between
   zero and the buffer age. The **max** is the number to compare with a target.
 - **server** is Arc's own `arc_ingest_publish_delay_seconds` over the same period, one
@@ -79,8 +80,15 @@ server  files_flushed=3  publish_delay: files=3 mean=5020ms max_since_start=5036
 first query that returned the row, for two queries: the same SQL text as the query that found
 the hour empty, and a text never sent before. The second leaves out the caches keyed by the
 query text, so a large first number with a small second one points at those caches, and two
-large numbers point at the listing cache. A trial that crossed an hour boundary is marked and
-should be discarded: the caches are keyed by the current hour.
+large numbers point at the listing cache.
+
+Two kinds of trial are marked `discard` and left out of the summary, because they say nothing
+about the caches: one that crossed an hour boundary (the caches are keyed by the current hour),
+and one started in the first 5 minutes of an hour (Arc then treats the previous hour as still
+filling and caches no plan that includes it). Compaction is off in `run.sh` for the same
+reason: when a compaction finishes it clears the query caches.
+
+`steady` exits non-zero when rows did not show up within `-timeout` or when every probe failed.
 
 ## What it does not measure
 

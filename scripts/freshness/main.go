@@ -151,7 +151,7 @@ func steadyCmd(ctx context.Context, args []string, w io.Writer) error {
 	rate := fs.Float64("rate", 20, "write requests per second, one marker row each")
 	batch := fs.Int("batch", 0, "extra filler rows in each write request (to reach ingest.max_buffer_size and take the size-triggered flush)")
 	duration := fs.Duration("duration", 60*time.Second, "how long to write")
-	lookback := fs.Duration("lookback", time.Minute, "the probe's time range starts this long before the run; over an hour makes it span hour partitions, a different pruning path from a range inside the current hour")
+	lookback := fs.Duration("lookback", time.Minute, "the probe's time range starts this long before the run; over an hour makes it span hour partitions, which Arc plans (and caches) differently from a range inside the current hour")
 	offset := fs.Duration("time-offset", 0, "stamp rows this far from now (negative: late data)")
 	endpoint := fs.String("endpoint", "json", "query endpoint to probe: json, msgpack, arrow, measurement")
 	prequery := fs.Bool("prequery", false, "run each probe query once before the first write")
@@ -159,14 +159,17 @@ func steadyCmd(ctx context.Context, args []string, w io.Writer) error {
 	if c.token == "" {
 		return fmt.Errorf("-token is required")
 	}
-	if *rate <= 0 || *nMeas < 1 || *probeSample < 1 || *batch < 0 || c.poll < 0 {
-		return fmt.Errorf("-rate must be > 0, -measurements and -probe-sample >= 1, -batch and -poll >= 0")
+	if *rate <= 0 || *nMeas < 1 || *probeSample < 1 || *batch < 0 || c.poll < 0 || *lookback < 0 {
+		return fmt.Errorf("-rate must be > 0, -measurements and -probe-sample >= 1, -batch, -poll and -lookback >= 0")
 	}
 	cl := c.client()
 	run := fmt.Sprintf("r%x", time.Now().UnixNano())
 	start := time.Now()
-	// One fixed range for the whole run, so the SQL text never changes: the
-	// probe then goes through the same query caches a dashboard panel does.
+	// One fixed range for the whole run, so the SQL text never changes, as a
+	// dashboard panel's does not between refreshes. Whether Arc caches the
+	// plan depends on the range: one that starts in the current hour (the
+	// default lookback) is re-listed on every query, one that spans hour
+	// partitions (-lookback over an hour) is the cached shape.
 	rangeFrom := start.Add(*offset).Add(-*lookback)
 	rangeTo := start.Add(*offset).Add(*duration).Add(c.timeout).Add(time.Minute)
 
@@ -301,7 +304,17 @@ writing:
 		rep.Server = &d
 	}
 	printSteady(w, rep)
-	return writeReport(c.out, rep)
+	if err := writeReport(c.out, rep); err != nil {
+		return err
+	}
+	// A run that could not time its rows is a failed run, not a fast one.
+	switch {
+	case rep.Probes > 0 && rep.ProbeErrors == rep.Probes:
+		return fmt.Errorf("every probe failed: %s", rep.FirstProbeErr)
+	case rep.NeverVisible > 0:
+		return fmt.Errorf("%d of %d rows did not show up within %s", rep.NeverVisible, rep.Tracked, c.timeout)
+	}
+	return nil
 }
 
 func printSteady(w io.Writer, r steadyReport) {
@@ -390,7 +403,9 @@ type lateTrial struct {
 	// query that returned the row. -1: not within the timeout.
 	SameSQLS   float64 `json:"same_sql_s"`
 	UniqueSQLS float64 `json:"unique_sql_s"`
-	HourRolled bool    `json:"hour_rolled"`
+	// Discard is why the trial says nothing about the caches, when it does not.
+	Discard     string `json:"discard,omitempty"`
+	QueryErrors int    `json:"query_errors"`
 }
 
 type lateReport struct {
@@ -401,6 +416,8 @@ type lateReport struct {
 	SameSQL quantiles   `json:"same_sql_ms"`
 	Unique  quantiles   `json:"unique_sql_ms"`
 	Missed  int         `json:"trials_not_visible_within_timeout"`
+	// Discarded trials are listed and left out of the numbers above.
+	Discarded int `json:"trials_discarded"`
 }
 
 func lateCmd(ctx context.Context, args []string, w io.Writer) error {
@@ -436,8 +453,16 @@ func lateCmd(ctx context.Context, args []string, w io.Writer) error {
 			return fmt.Errorf("trial %d: %w", i, err)
 		}
 		rep.Trials = append(rep.Trials, tr)
+		note := ""
+		if tr.Discard != "" {
+			note = "  (discard: " + tr.Discard + ")"
+		}
 		fmt.Fprintf(w, "trial %d  offset=%s wait=%.0fs  same_sql=%s  unique_sql=%s%s\n", i, *offset, tr.DelayS,
-			secs(tr.SameSQLS), secs(tr.UniqueSQLS), map[bool]string{true: "  (hour rolled over during the trial: discard)", false: ""}[tr.HourRolled])
+			secs(tr.SameSQLS), secs(tr.UniqueSQLS), note)
+		if tr.Discard != "" {
+			rep.Discarded++
+			continue
+		}
 		if tr.SameSQLS < 0 || tr.UniqueSQLS < 0 {
 			rep.Missed++
 		}
@@ -452,7 +477,7 @@ func lateCmd(ctx context.Context, args []string, w io.Writer) error {
 	fmt.Fprintf(w, "late    flush returned -> first query that returned the row, ms\n")
 	fmt.Fprintf(w, "        same SQL text as the query that found the hour empty   %s\n", rep.SameSQL)
 	fmt.Fprintf(w, "        SQL text never sent before                             %s\n", rep.Unique)
-	fmt.Fprintf(w, "        not visible within %s: %d of %d trials\n", c.timeout, rep.Missed, len(rep.Trials))
+	fmt.Fprintf(w, "        not visible within %s: %d of %d trials; discarded: %d\n", c.timeout, rep.Missed, len(rep.Trials)-rep.Discarded, rep.Discarded)
 	return writeReport(c.out, rep)
 }
 
@@ -476,7 +501,14 @@ func secs(s float64) string {
 func lateTrialRun(ctx context.Context, cl *client, c common, measurement, run string, offset, wait time.Duration) (lateTrial, error) {
 	tr := lateTrial{Measurement: measurement, OffsetS: offset.Seconds(), DelayS: wait.Seconds(), SameSQLS: -1, UniqueSQLS: -1}
 	now := time.Now()
-	hour := now.UTC().Truncate(time.Hour)
+	hour := hourClock().UTC().Truncate(time.Hour)
+	// For its first minutes an hour keeps the previous one "live" (liveGrace,
+	// internal/pruning/live_hours.go): a query that finds a live hour empty is
+	// not cached at all, so there is nothing for the late row to hide behind.
+	// The trial's range always includes the previous hour.
+	if sinceHour := hourClock().UTC().Sub(hour); sinceHour < liveGrace {
+		tr.Discard = fmt.Sprintf("started %s into the hour, inside the %s in which Arc caches no plan that includes the previous hour", sinceHour.Round(time.Second), liveGrace)
+	}
 	from, to := now.Add(-time.Hour), now.Add(time.Hour)
 	if offset < 0 {
 		from = now.Add(offset).Add(-time.Hour)
@@ -522,22 +554,20 @@ func lateTrialRun(ctx context.Context, cl *client, c common, measurement, run st
 	published := time.Now()
 	deadline := published.Add(c.timeout)
 	for n := 0; (tr.SameSQLS < 0 || tr.UniqueSQLS < 0) && time.Now().Before(deadline) && ctx.Err() == nil; n++ {
+		// A failed query is counted and the trial goes on: it says nothing
+		// about what was visible.
 		if tr.SameSQLS < 0 {
-			got, err := cl.queryMarkers(ctx, sql)
-			if err != nil {
-				return tr, err
-			}
-			if contains(got, 2) {
+			if got, err := cl.queryMarkers(ctx, sql); err != nil {
+				tr.QueryErrors++
+			} else if contains(got, 2) {
 				tr.SameSQLS = time.Since(published).Seconds()
 			}
 		}
 		if tr.UniqueSQLS < 0 {
 			// A predicate that changes the text and nothing else.
-			got, err := cl.queryMarkers(ctx, fmt.Sprintf("%s AND marker <> -%d", sql, n+1))
-			if err != nil {
-				return tr, err
-			}
-			if contains(got, 2) {
+			if got, err := cl.queryMarkers(ctx, fmt.Sprintf("%s AND marker <> -%d", sql, n+1)); err != nil {
+				tr.QueryErrors++
+			} else if contains(got, 2) {
 				tr.UniqueSQLS = time.Since(published).Seconds()
 			}
 		}
@@ -547,9 +577,18 @@ func lateTrialRun(ctx context.Context, cl *client, c common, measurement, run st
 	}
 	// The caches are keyed by the current hour, so a trial that crossed an
 	// hour boundary measured the rollover, not the cache.
-	tr.HourRolled = !time.Now().UTC().Truncate(time.Hour).Equal(hour)
+	if tr.Discard == "" && !hourClock().UTC().Truncate(time.Hour).Equal(hour) {
+		tr.Discard = "the hour rolled over during the trial"
+	}
 	return tr, ctx.Err()
 }
+
+// liveGrace mirrors internal/pruning's: how long the previous hour stays
+// "live" after an hour starts.
+const liveGrace = 5 * time.Minute
+
+// hourClock is the clock the discard rules read; a test replaces it.
+var hourClock = time.Now
 
 func contains(xs []int64, x int64) bool {
 	for _, v := range xs {
