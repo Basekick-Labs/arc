@@ -99,6 +99,7 @@ type Metrics struct {
 	bufferFlushesTotal    atomic.Int64
 	bufferErrorsTotal     atomic.Int64
 	bufferFlushFailures   atomic.Int64
+	ingestPublishDelay    ingestPublishDelay // arc_ingest_publish_delay_seconds (ingest_publish_delay.go)
 	bufferQueueDepth      atomic.Int64
 	bufferRecordsQueued   atomic.Int64
 	bufferRecordsInflight atomic.Int64
@@ -1355,19 +1356,22 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_client_disconnects_sql_json_total":   m.queryDisconnectsSQLJSON.Load(),
 
 		// Buffer
-		"buffer_records_buffered":         m.bufferRecordsBuffered.Load(),
-		"buffer_bytes_buffered":           m.bufferBytesBuffered.Load(),
-		"buffer_oldest_unflushed_seconds": float64(m.bufferOldestAgeNS.Load()) / float64(time.Second),
-		"buffer_memory_limit_bytes":       m.bufferMemoryLimit.Load(),
-		"buffer_memory_pressure":          m.bufferMemoryPressure.Load(),
-		"buffer_records_written":          m.bufferRecordsWritten.Load(),
-		"buffer_records_dropped_total":    m.bufferRecordsDropped.Load(),
-		"buffer_flushes_total":            m.bufferFlushesTotal.Load(),
-		"buffer_errors_total":             m.bufferErrorsTotal.Load(),
-		"buffer_flush_failures_total":     m.bufferFlushFailures.Load(),
-		"buffer_queue_depth":              m.bufferQueueDepth.Load(),
-		"buffer_records_queued":           m.bufferRecordsQueued.Load(),
-		"buffer_records_inflight":         m.bufferRecordsInflight.Load(),
+		"buffer_records_buffered":          m.bufferRecordsBuffered.Load(),
+		"buffer_bytes_buffered":            m.bufferBytesBuffered.Load(),
+		"buffer_oldest_unflushed_seconds":  float64(m.bufferOldestAgeNS.Load()) / float64(time.Second),
+		"buffer_memory_limit_bytes":        m.bufferMemoryLimit.Load(),
+		"buffer_memory_pressure":           m.bufferMemoryPressure.Load(),
+		"buffer_records_written":           m.bufferRecordsWritten.Load(),
+		"buffer_records_dropped_total":     m.bufferRecordsDropped.Load(),
+		"buffer_flushes_total":             m.bufferFlushesTotal.Load(),
+		"buffer_errors_total":              m.bufferErrorsTotal.Load(),
+		"buffer_flush_failures_total":      m.bufferFlushFailures.Load(),
+		"ingest_publish_delay_count":       m.ingestPublishDelayCount(),
+		"ingest_publish_delay_sum_seconds": time.Duration(m.ingestPublishDelay.sumNS.Load()).Seconds(),
+		"ingest_publish_delay_max_seconds": time.Duration(m.ingestPublishDelay.maxNS.Load()).Seconds(),
+		"buffer_queue_depth":               m.bufferQueueDepth.Load(),
+		"buffer_records_queued":            m.bufferRecordsQueued.Load(),
+		"buffer_records_inflight":          m.bufferRecordsInflight.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -1771,6 +1775,8 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_flush_failures_total Total buffer flush failures\n"...)
 	b = append(b, "# TYPE arc_buffer_flush_failures_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_flush_failures_total", float64(m.bufferFlushFailures.Load()))
+
+	b = m.appendIngestPublishDelay(b)
 
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)

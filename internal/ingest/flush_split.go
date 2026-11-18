@@ -3,6 +3,7 @@ package ingest
 import (
 	"fmt"
 	"sync/atomic"
+	"time"
 )
 
 // Flush split (#1207 S4b1c2b).
@@ -56,6 +57,9 @@ type flushPart struct {
 	walHashes []string
 	group     *flushGroup
 	rows      int
+	// bufferedAt is the split buffer's start time, set by the synchronous
+	// caller (publish_delay.go); the asynchronous one passes it alongside.
+	bufferedAt time.Time
 }
 
 type flushClass struct {

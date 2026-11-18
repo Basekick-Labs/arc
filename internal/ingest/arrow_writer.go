@@ -1149,6 +1149,11 @@ type TypedColumnBatch struct {
 	// when it completes (its walHashes), set by the flush caller. A
 	// single-hour file's flush intent names them (#1646, flush_intent.go).
 	flushIDs []string
+	// bufferedAt is when the buffer this merged batch was flushed from was
+	// created: the arrival of its oldest row. Set by the flush caller next to
+	// flushIDs; zero for a batch that never sat in a buffer (claimed replay).
+	// Read only to observe arc_ingest_publish_delay_seconds.
+	bufferedAt time.Time
 }
 
 type bufferShard struct {
@@ -1210,6 +1215,7 @@ type flushTask struct {
 	group          *flushGroup // coverage of the flush, nil when coverage is off
 	estimatedBytes int64
 	trackingID     uint64
+	bufferedAt     time.Time // the buffer's start time (publish_delay.go)
 }
 
 // WALWriter interface for Write-Ahead Log support
@@ -1783,7 +1789,7 @@ func (b *ArrowBuffer) finishFlushTask(task flushTask) {
 func (b *ArrowBuffer) flushTrackedTask(ctx context.Context, task flushTask) error {
 	defer b.finishFlushTask(task)
 	defer b.releaseFlushTask(task)
-	return b.flushRecordsAsync(ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes, task.group)
+	return b.flushRecordsAsync(ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes, task.group, task.bufferedAt)
 }
 
 func (b *ArrowBuffer) publishBufferMemoryMetrics() {
@@ -2980,6 +2986,7 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		walHashes:      collectWALHashes(shard.buffers[bufferKey]),
 		estimatedBytes: estimateBufferedBatchesBytes(shard.buffers[bufferKey]),
 		trackingID:     b.trackFlush(shard.bufferStartTimes[bufferKey]),
+		bufferedAt:     shard.bufferStartTimes[bufferKey],
 	}
 	task.group = b.newFlushGroup(bufferKey, task.records, task.walHashes)
 	queuedRecords := int64(task.recordCount)
@@ -5159,7 +5166,7 @@ func (b *ArrowBuffer) logFlushFailure(err error, bufferKey string, recordCount, 
 // itself, and it has to know WHICH tasks failed in order to count only those as
 // WAL-only. markFlushFailure alone cannot say — hasFlushFailure is a
 // process-wide latch with no per-task attribution.
-func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string, group *flushGroup) error {
+func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string, group *flushGroup, bufferedAt time.Time) error {
 	if parts := b.splitForCoverage(bufferKey, records); parts != nil {
 		// Each class is its own group and file set (flush_split.go); the
 		// group built for the whole buffer is never announced.
@@ -5168,7 +5175,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		}
 		var first error
 		for _, p := range parts {
-			if err := b.flushRecordsAsync(ctx, bufferKey, database, measurement, p.records, p.rows, p.walHashes, p.group); err != nil && first == nil {
+			if err := b.flushRecordsAsync(ctx, bufferKey, database, measurement, p.records, p.rows, p.walHashes, p.group, bufferedAt); err != nil && first == nil {
 				first = err
 			}
 		}
@@ -5200,6 +5207,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 
 	// Flush with data timestamp partitioning
 	merged.flushIDs = walHashes // #1646
+	merged.bufferedAt = bufferedAt
 	if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
 		need, named := walNeedParts(needParts)
 		b.noteFailedWrite(err, need, named)
@@ -5463,6 +5471,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			// The write may still land (#1635): name the key for noteFailedWrite.
 			return &failedStorageWrite{err: fmt.Errorf("failed to write to storage: %w", err), path: storagePath, size: int64(len(parquetData))}
 		}
+		observePublishDelay(merged.bufferedAt)
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
 		// Register file in tiering metadata for query routing
@@ -5699,6 +5708,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
 			if early && !hp.deferred {
+				observePublishDelay(merged.bufferedAt)
 				if cov == nil {
 					cov = groupCoverage(group, len(hourBuckets)) // nil without coverage (always without a WAL)
 				}
@@ -5789,6 +5799,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Its own bound (#1692), and not cancelled with the flush: the file
 		// is stored and its rows are about to be checkpointed (#1698).
 		regCtx, cancelReg := b.fileContext(context.WithoutCancel(flushCtx))
+		// Observed here and not at its write: a file that waited is only
+		// kept once every hour of the flush is stored (publish_delay.go).
+		observePublishDelay(merged.bufferedAt)
 		b.registerFileInTiering(regCtx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
 		cancelReg()
 		totalWritten += e.records
@@ -5822,6 +5835,7 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 	merged.flushIDs = p.walHashes // #1646
+	merged.bufferedAt = p.bufferedAt
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, p.rows, time.Now().UTC(), p.group); err != nil {
 		need, named := walNeedOf(p.records)
 		b.noteFailedWrite(err, need, named)
@@ -5861,6 +5875,7 @@ type extractedFlush struct {
 	trackingID     uint64
 	estimatedBytes int64
 	taskID         uint64
+	bufferedAt     time.Time // the buffer's start time (publish_delay.go)
 }
 
 // extractBufferLocked removes bufferKey's batches from the shard and registers
@@ -5895,6 +5910,7 @@ func (b *ArrowBuffer) extractBufferLocked(shard *bufferShard, bufferKey string) 
 		group:          b.newFlushGroup(bufferKey, batches, walHashes),
 		trackingID:     b.trackFlush(shard.bufferStartTimes[bufferKey]),
 		estimatedBytes: estimateBufferedBatchesBytes(batches),
+		bufferedAt:     shard.bufferStartTimes[bufferKey],
 	}
 
 	// Extract records to flush (hold lock for minimal time)
@@ -5935,6 +5951,7 @@ func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, buf
 		// Each class is its own group and file set (flush_split.go).
 		var first error
 		for _, p := range parts {
+			p.bufferedAt = e.bufferedAt
 			if err := b.flushPartSync(ctx, bufferKey, database, measurement, p); err != nil && first == nil {
 				first = err
 			}
@@ -5956,6 +5973,7 @@ func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, buf
 	// Flush with data timestamp partitioning
 	startTime := time.Now().UTC()
 	merged.flushIDs = walHashes // #1646
+	merged.bufferedAt = e.bufferedAt
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
 		need, named := walNeedOf(recordsToFlush)
 		b.noteFailedWrite(err, need, named)

@@ -251,7 +251,7 @@ func TestAsyncFlushWritesAnOversizedColumnAsRowGroups(t *testing.T) {
 	delete(shard.bufferStartTimes, "db/m")
 	delete(shard.bufferSchemas, "db/m")
 	shard.mu.Unlock()
-	require.NoError(t, r.buf.flushRecordsAsync(context.Background(), "db/m", "db", "m", records, count, collectWALHashes(records), nil))
+	require.NoError(t, r.buf.flushRecordsAsync(context.Background(), "db/m", "db", "m", records, count, collectWALHashes(records), nil, time.Time{}))
 
 	groups, hosts := flushedRowGroups(t, r)
 	requireChunkTestRows(t, base, groups, hosts)
@@ -278,7 +278,7 @@ func TestChunkedFlushKeepsOneCoveredFile(t *testing.T) {
 		})
 	}
 	group := b.newFlushGroup("db/cpu", records, nil)
-	require.NoError(t, b.flushRecordsAsync(context.Background(), "db/cpu", "db", "cpu", records, len(chunkTestHosts), nil, group))
+	require.NoError(t, b.flushRecordsAsync(context.Background(), "db/cpu", "db", "cpu", records, len(chunkTestHosts), nil, group, time.Time{}))
 
 	files := reg.snapshot()
 	require.Len(t, files, 1)
