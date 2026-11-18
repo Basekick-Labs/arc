@@ -10,7 +10,7 @@ Arc had no number for how long a row waits between being written and being reada
 - `arc_ingest_publish_delay_max_seconds` (gauge): the largest observation since the process started.
 - The `/metrics` JSON form carries `ingest_publish_delay_count`, `ingest_publish_delay_sum_seconds` and `ingest_publish_delay_max_seconds`.
 
-With `ingest.max_buffer_age_ms` at its default of 5000, expect observations just over 5 s for measurements written to slowly, and less for ones that reach `ingest.max_buffer_size` first.
+With `ingest.max_buffer_age_ms` at its default of 5000, expect observations of about 5 s for measurements written to slowly, and less for ones that reach `ingest.max_buffer_size` first. With many measurements it can be more: in one local run writing to 500 measurements, the mean was 5.5 s and the largest 9.6 s.
 
 Notes:
 
