@@ -2,6 +2,23 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: late data no longer rewrites an old day's daily file ([#1775](https://github.com/Basekick-Labs/arc/issues/1775))
+
+When `compaction.daily_min_files` or more hour-level files (default 12) landed in a day that already had a daily file, daily compaction rewrote the whole day to fold them in: the job read the existing daily file and wrote it out again with the new rows. The cost followed the size of the day, not the size of the late data, and it repeated each time enough late files built up. One deployment rewrote 339 GB across 373 days to fold in 18 GB.
+
+A day older than `compaction.daily_skip_file_age_check_days` (default 7) that already has a daily file is no longer rewritten:
+
+- Its hour-level files compact into **one more daily file** beside the existing one, the same way #1774 below handles a day with fewer files. Any number of them, from one up.
+- **It waits until the day is quiet:** until its newest file was written more than `compaction.daily_min_age_hours` ago (default 24). A backfill still writing into an old day is compacted once it stops, not once per cycle. A day with no daily file yet is compacted as before, without waiting.
+- `GET /api/v1/compaction/candidates` shows these days as `"settled": true`, and their `file_count` no longer includes the daily file.
+- A day younger than `daily_skip_file_age_check_days` is unchanged: its daily file is still rewritten together with the late files.
+
+What to expect:
+
+- **Duplicate rows are merged only for days younger than `daily_skip_file_age_check_days`.** Compaction removes exact duplicate rows within one job only (ingest with tags, and continuous-query output). Rewriting the daily file used to merge a late row with an identical row already in it; for an older day both are now kept. This affects re-running a continuous query over windows older than that, and a merge-mode restore of a backup taken before an old day was compacted. Within that age, both still collapse as before. Raise `daily_skip_file_age_check_days` to keep the old behaviour for longer.
+- **More daily files per day.** Each fold adds a daily file and nothing merges daily files with each other. Because a day must be quiet for `daily_min_age_hours` first, folds come one per quiet period, not one per late file.
+- **A day remembered as too wide to compact gets one more try.** If an old day was skipped because rewriting its daily file ran out of memory, its smaller job without the daily file runs once. If that also fails, it is remembered again.
+
 ## New: ingest files are appended to their Iceberg table without re-reading it, and the export interval can go down to 5 s ([#1751](https://github.com/Basekick-Labs/arc/issues/1751))
 
 Since #1750 an ingest flush asks for an export of its table. Each of those exports was a full pass of the measurement: list its files, read every manifest of the table, commit, expire snapshots, prune and sweep. That work grows with the table, and the published versions were kept by count, which tied how often ingest could export to `retain_snapshots`. Both change here.
@@ -65,6 +82,7 @@ Notes:
   An export on S3 is a few dozen requests made one after another, so it takes about half a second in the bucket's region and seconds from far away, and the tables queue behind each other. The interval you set is reached while `tables written at once × one export` fits in it: about ten tables at 5 s, and somewhere between 60 and 100 at the default 60 s, in the bucket's region. Past that the tables wait for each other and the interval no longer sets the lag. The timed pass before #1750 exported tables the same way, one after another; it was not measured on S3. With one new file the append took about 40% less than the pass in the bucket's region and about 20% less from far away (one run each); with many new files per export it reads each one in turn and cost the same as the pass. No 200-table run reached a steady state, so read their lag as "minutes", not as a figure. By these runs each further file in an export costs about 24 ms in the bucket's region (525 ms with one file, 954 ms with about 19), so a node exports at most about 40 files a second there, and the 200-table load (about 22 files a second) used about half of that: the estimate for its steady state is a cycle of about 3.5 minutes. Above about 40 files a second the queue would not be bounded. These are estimates from two runs, not measurements. Serving tables in parallel is [#1778](https://github.com/Basekick-Labs/arc/issues/1778).
 - In those S3 runs no append fell back, row counts matched storage and no file was in a table twice; on a table left quiet the published versions went from 26 to 11 within two minutes (the age rule reads S3's own timestamps).
 
+
 ## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
 
 Daily compaction needed `compaction.daily_min_files` hour-level files in a day (default 12), and tiering moves only daily files to cold. A measurement that writes a few points a day ends up with one or two hour-level files per day, so those days never compacted and stayed on the hot tier for good. Lowering `daily_min_files` did not help: a day with a single file failed with `batch size 1 below minimum 2`, and a day that already had a daily file had it rewritten together with its stragglers.
@@ -82,7 +100,7 @@ What to expect:
 - **A one-time backlog on upgrade.** Every settled day with fewer than `daily_min_files` hour-level files compacts once, one job each. These are not necessarily small: a measurement written during business hours, or by a batch load, can have up to 11 full-size hourly files per day that were never compacted into a daily file. On a store with many such days the backlog takes several daily cycles, 500 jobs each; the regular days still run first.
 - **They reach cold after the later of** the database's hot age (`tiered_storage.default_hot_max_age_days` or its own policy) and `daily_skip_file_age_check_days`.
 - **To turn it off,** raise `daily_skip_file_age_check_days`: no day younger than that is settled. The only other effect is that days up to that age keep their file-age check, which is harmless. Setting it to `0` does not turn it off: `0` means the default, 7 days.
-- **If you lowered `daily_min_files` to work around this,** set it back to 12. Below 12, a day with a daily file and that many stragglers is still compacted the old way, rewriting its daily file.
+- **If you lowered `daily_min_files` to work around this,** set it back to 12. A settled day no longer needs it, and on a day younger than `daily_skip_file_age_check_days` a low value still rewrites the day's daily file whenever that many stragglers arrive (#1775 above covers older days).
 - **Duplicates are not merged across daily files.** Compaction removes duplicate rows only within one job, so a straggler that repeats a row of the day's existing daily file keeps it. Before this fix that row was never compacted at all.
 - **File names, not file times, say when a file was written.** Files that keep the name they had elsewhere (received from an edge-sync spoke, restored from a backup) can count as settled as soon as they land.
 

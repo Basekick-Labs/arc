@@ -351,7 +351,11 @@ func (t *BaseTier) ShouldCompactByFileSuffix(
 		return true
 	}
 
-	// Case 2: Has compacted files, but many new uncompacted files accumulated
+	// Case 2: Has compacted files, but many new uncompacted files accumulated.
+	// The job rewrites the compacted files with the new ones. The daily tier
+	// keeps this only for days younger than daily_skip_file_age_check_days;
+	// an older day folds its stragglers into an additional daily file
+	// instead (DailyTier.foldsSeparately, #1775).
 	if len(compactedFiles) > 0 && len(uncompactedFiles) >= t.MinFiles {
 		t.Logger.Debug().
 			Int("compacted", len(compactedFiles)).

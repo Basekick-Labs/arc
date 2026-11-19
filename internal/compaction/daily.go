@@ -120,6 +120,16 @@ func (t *DailyTier) FindCandidatesFromListing(database, measurement string, obje
 				Msg("Found settled sparse day for daily compaction")
 			continue
 		}
+		if t.foldsSeparately(partition) {
+			// An old day that has a daily file folds its stragglers into
+			// another one once it is quiet (settledCandidate); until then it
+			// waits, rather than rewriting the daily file (#1775).
+			t.Logger.Debug().
+				Str("database", database).
+				Str("partition", partition.PartitionPath).
+				Msg("Old day with a daily file still receiving files; waiting until it is quiet")
+			continue
+		}
 		if t.ShouldCompact(partition.Files, partition.PartitionTime) {
 			partition.Tier = t.GetTierName()
 			partition.FileCount = len(partition.Files)
@@ -157,10 +167,12 @@ func (t *DailyTier) IsCompactedFile(filename string) bool {
 	return isDailyOutput(filename)
 }
 
-// settledCandidate returns the candidate for a settled day that ShouldCompact
-// leaves alone because it has fewer hour-level files than MinFiles (#1774).
-// Tiering moves only daily files to cold, so without this a sparse
-// measurement's days stay hot for good.
+// settledCandidate returns the candidate for a settled day that either has
+// fewer hour-level files than MinFiles, which ShouldCompact leaves alone
+// (#1774: tiering moves only daily files to cold, so without this a sparse
+// measurement's days stay hot for good), or already has a daily file, which
+// ShouldCompact would rewrite to fold the stragglers in (#1775: one
+// deployment rewrote 339 GB to fold 18 GB).
 //
 // A day is settled when it is older than SkipFileAgeCheckDays (the age past
 // which backfill is assumed complete) AND its newest file is older than the
@@ -170,10 +182,12 @@ func (t *DailyTier) IsCompactedFile(filename string) bool {
 //
 // The candidate holds only the hour-level files, never a daily file the day
 // already has: the output is one more daily file next to it, not a rewrite
-// of it (rewriting it is what made lowering daily_min_files cost hundreds of
-// GB on a store with many such days).
+// of it. The cost is that compaction, which removes duplicate rows only
+// within one job, no longer merges a straggler row with an identical row of
+// the existing daily file. A day younger than SkipFileAgeCheckDays keeps the
+// rewrite, and with it that merge, where re-runs and corrections land.
 func (t *DailyTier) settledCandidate(partition Candidate, cutoffTime time.Time) (Candidate, bool) {
-	if time.Since(partition.PartitionTime) <= time.Duration(t.SkipFileAgeCheckDays*24)*time.Hour {
+	if !t.pastBackfill(partition) {
 		return Candidate{}, false
 	}
 	var hourLevel []string
@@ -182,11 +196,12 @@ func (t *DailyTier) settledCandidate(partition Candidate, cutoffTime time.Time) 
 			hourLevel = append(hourLevel, f)
 		}
 	}
-	// MinFiles or more is ShouldCompact's case, and keeps its behaviour,
-	// except a lone hour-level file under daily_min_files = 1: as a regular
-	// candidate it would be refused by the two-file floor (or, next to a
-	// daily file, rewrite it), so a settled day takes it here.
-	if len(hourLevel) == 0 || (len(hourLevel) >= t.MinFiles && len(hourLevel) >= MinFilesPerBatch) {
+	// A day without a daily file and MinFiles or more hour-level files is
+	// ShouldCompact's first case, and keeps its behaviour, except a lone
+	// hour-level file under daily_min_files = 1: as a regular candidate the
+	// two-file floor would refuse it, so a settled day takes it here.
+	if len(hourLevel) == 0 ||
+		(!hasDailyOutput(partition.Files) && len(hourLevel) >= t.MinFiles && len(hourLevel) >= MinFilesPerBatch) {
 		return Candidate{}, false
 	}
 	newest := extractNewestFileTime(partition.Files)
@@ -198,6 +213,32 @@ func (t *DailyTier) settledCandidate(partition Candidate, cutoffTime time.Time) 
 	partition.Tier = t.GetTierName()
 	partition.Settled = true
 	return partition, true
+}
+
+// pastBackfill reports whether a day is older than SkipFileAgeCheckDays, the
+// age past which its backfill is assumed complete.
+func (t *DailyTier) pastBackfill(partition Candidate) bool {
+	return time.Since(partition.PartitionTime) > time.Duration(t.SkipFileAgeCheckDays*24)*time.Hour
+}
+
+// foldsSeparately reports whether a day's stragglers may only be folded into
+// an additional daily file, never by rewriting the one it has: the day is
+// past its backfill and already has a daily file (#1775). settledCandidate
+// folds them once the day is quiet; until then the day has no candidate.
+// groupDayPartitions applies no file-age check to such a day, so without
+// this a backfill still landing in it would be compacted every cycle.
+func (t *DailyTier) foldsSeparately(partition Candidate) bool {
+	return t.pastBackfill(partition) && hasDailyOutput(partition.Files)
+}
+
+// hasDailyOutput reports whether any of files is a daily compaction output.
+func hasDailyOutput(files []string) bool {
+	for _, f := range files {
+		if isDailyOutput(f) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetStats returns tier statistics

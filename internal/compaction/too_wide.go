@@ -168,15 +168,34 @@ func newTooWideMemo(dir string, logger zerolog.Logger) *tooWideMemo {
 
 // skip reports whether a candidate is memoized: enough strikes under the same
 // settings, and no file the memo has not seen except the tier's own outputs.
+//
+// An entry that recorded one of the tier's own outputs the candidate no longer
+// holds is forgotten instead: the job that failed read that file and this one
+// does not, so it may fit. That is a day that failed while its daily file was
+// rewritten and now folds its stragglers without it (#1775), or one whose
+// daily file has moved to cold. A failure of the smaller job records a fresh
+// entry without the file, so this happens once.
 func (m *tooWideMemo) skip(tier Tier, partition string, files []string, settings string) bool {
 	if m == nil {
 		return false
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	e, ok := m.entries[tooWideKey(tier.GetTierName(), partition)]
+	key := tooWideKey(tier.GetTierName(), partition)
+	e, ok := m.entries[key]
 	if !ok || !e.Skips(settings, time.Now()) {
 		return false
+	}
+	held := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		held[f] = struct{}{}
+	}
+	for _, f := range e.Files {
+		if _, ok := held[f]; !ok && tier.IsCompactedFile(f) {
+			delete(m.entries, key)
+			m.saveLocked()
+			return false
+		}
 	}
 	known := make(map[string]struct{}, len(e.Files))
 	for _, f := range e.Files {
