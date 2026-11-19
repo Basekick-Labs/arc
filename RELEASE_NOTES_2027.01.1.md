@@ -34,7 +34,7 @@ On the running binary, 200 measurements written for 4 minutes, standalone, local
 | 5 s | on | 1.0 s | 223 MB |
 | 5 s | off | 1.0 s | 252 MB |
 
-- **The interval is what shortens the lag.** At 5 s a file is in its table about a second after it is written with 200 tables being written at once (one goroutine serves them all, so they queue), and 54 ms after with 10. At a given interval the append path does not change the lag.
+- **The interval is what shortens the lag** (on local disk; for object storage see the notes below). At 5 s a file is in its table about a second after it is written with 200 tables being written at once (one goroutine serves them all, so they queue), and 54 ms after with 10. At a given interval the append path does not change the lag.
 - **The append path is what keeps an export cheap as a table grows** (the table above). In these runs the tables held about 48 files each and a full pass was already cheap, so on and off look the same. One pair of runs with ten tables that grew to about 1,300 files, and about 28 new files per export, averaged 57 ms per export as an append and 70 ms as a pass; it was a single run of each on a machine also serving the test's queries, so read it as "no worse", not as a measured gain.
 - **A short interval costs metadata.** Every export writes a new table version, about 40 KB of metadata in these runs: about eight times as much at 5 s as at 60 s. (In this load each table got a new file about every 9 s, so 5 s and 10 s made nearly the same number of exports and wrote nearly the same amount; they differ in lag.)
 - **What stays on disk is bounded.** In a 75-minute run (20 tables, 5 s interval, `min_version_age = 120`, a full pass every 30 s; 9,778 appends, none fell back) the published versions held at 18–23 per table and iceberg-go's own metadata files at 25 per table throughout. Manifest files grew by about 15 per table per minute for the first hour and then levelled off at about 920 per table, once the orphan sweep began removing the ones older than an hour. At the end the 20 tables held 125 MB of Iceberg metadata, about 6 MB each, and an export took the same time as at the start (35 ms on average).
@@ -49,7 +49,21 @@ Notes:
 - **Manifests:** each append adds one. Once there are four small ones the append merges them, up to about 4,000 files per manifest; a larger manifest is never rewritten by an append.
 - **A file ingest deletes after storing it** (the late-landed copy of a failed flush) now asks for an export of its table, so it leaves the table at once and not at the next timed pass.
 - **Also run on the binary:** S3 as primary storage (SeaweedFS in a container: appends, row counts equal, an export about 49 ms as an append and 63 ms as a pass); `iceberg.warehouse` in a subdirectory of the storage root and outside it; a three-node cluster on shared storage, where the append path is off: the compactor exported on its timer, no node appended, and published versions held at 11 per table across a restart of all three nodes.
-- **Not run:** S3 over a wide-area network, or a cluster with node-local storage.
+- **A three-node cluster with node-local storage** (EC2, writer, reader and compactor, each on its own disk): the compactor exported the replicated files on its timer, no node appended or took an ingest request, row counts matched and no file was in a table twice, and published versions held at 11 per table across a restart of all three nodes (1,238 files).
+- **On object storage the export is slower, and one goroutine serves every table.** Against AWS S3, standalone, 3-minute writes, `ingest_export_interval = 5` unless said otherwise:
+
+  | Where Arc ran | Tables written | Append | One export | Average export lag |
+  |---|---|---|---|---|
+  | EC2 in the bucket's region | 10 | on | 525 ms | 1.0 s |
+  | EC2 in the bucket's region | 10 | off | 846 ms | 2.9 s |
+  | EC2 in the bucket's region | 200 | on | about 1 s | 61 s and still growing when the run ended |
+  | EC2 in the bucket's region, interval 60 s (default), 5 minutes | 200 | on | 954 ms | 116 s |
+  | The same, append off | 200 | off | 915 ms | 107 s |
+  | 77 ms from the bucket | 10 | on | 2.5 s | 15 s |
+  | 77 ms from the bucket | 10 | off | 3.1 s | 17.5 s |
+
+  An export on S3 is a few dozen requests made one after another, so it takes about half a second in the bucket's region and seconds from far away, and the tables queue behind each other. The interval you set is reached while `tables written at once × one export` fits in it: about ten tables at 5 s, and somewhere between 60 and 100 at the default 60 s, in the bucket's region. Past that the lag is roughly that product, whatever the interval, as it was before this change. The append path roughly halves an export of one new file; with many new files per export it reads each one in turn and costs the same as the pass. The 200-table runs had not reached a steady state, so read their lag as "minutes", not as a figure. Serving tables in parallel is [#1778](https://github.com/Basekick-Labs/arc/issues/1778).
+- In those S3 runs no append fell back, row counts matched storage and no file was in a table twice; on a table left quiet the published versions went from 26 to 11 within two minutes (the age rule reads S3's own timestamps).
 
 ## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
 
