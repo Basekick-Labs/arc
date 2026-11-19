@@ -2,6 +2,30 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Improvement: an Iceberg export on object storage makes fewer requests ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
+
+On S3 an export is a chain of requests made one after another, and the runs for #1751 showed that this, not CPU, is what an export costs there: about half a second per table in the bucket's region. A trace of those requests showed several that were not needed.
+
+- **A new data file is read once.** Its footer was fetched for the schema, and then iceberg-go fetched the file again to register it: a GET of the whole object, whose body it dropped, and two more reads of the footer. The export now hands iceberg-go the bytes it already has. No request asks for a whole data file any more.
+- **No HEAD per file reported by ingest**, on object storage. The size the flush wrote is used, and the footer read checks it against the stored object: a file that is gone is left out of the append as before, and one whose stored length differs makes that export a full pass. Local files are still stat'ed.
+- **`version-hint.text` is read once per export**, not twice, and **the count of small manifests is carried from one append to the next** in place of a read of the manifest list at every append. The carried count is an estimate: a table can hold a few more small manifests than before between two full passes.
+
+Requests and time for one export, measured through a proxy in front of an S3 server that records each request and holds it for 30 ms (`TestMeasure_S3RequestsPerExport`; a table of 49 files, the exporter set up as a production node):
+
+| Export | Requests before | After | Time before | After |
+|---|---|---|---|---|
+| Append, 1 new file | 17 | 11 | 657 ms | 442 ms |
+| Append, 19 new files | 112 | 34 | 1,800 ms | 717 ms |
+| Full pass, 1 new file | 24 | 20 | 929 ms | 798 ms |
+| Full pass, 19 new files | 98 | 40 | 1,259 ms | 884 ms |
+
+Of the 11 requests left in an append, five are writes that must follow one another, and three are reads of the table's `metadata.json` (the load, iceberg-go's check before the commit, and the copy published as `v<N>.metadata.json`).
+
+- **Not measured on AWS.** The numbers above are from a local S3 server with a delay added per request, chosen to be close to what #1751 measured in a bucket's region (about 32 ms a request). Azure and GCS take the same code path and were not run.
+- **Tables are still exported one at a time.** This makes each export cheaper; it does not let several tables export at once, which is what many tables at a short `ingest_export_interval` need on object storage. That remains open in #1778.
+- No change on local storage, and no new configuration. On the running binary (S3 API, 10 tables at a 5 s interval): 120 appends, none fell back, row counts matched storage and no file was in a table twice; an export averaged 41 ms against 57 ms before, with no network in between.
+- The footers held for one export are bounded at 64 MiB (about a thousand new files); past that, the remaining files of that export are read by iceberg-go as before.
+
 ## Fix: late data no longer rewrites an old day's daily file ([#1775](https://github.com/Basekick-Labs/arc/issues/1775))
 
 When `compaction.daily_min_files` or more hour-level files (default 12) landed in a day that already had a daily file, daily compaction rewrote the whole day to fold them in: the job read the existing daily file and wrote it out again with the new rows. The cost followed the size of the day, not the size of the late data, and it repeated each time enough late files built up. One deployment rewrote 339 GB across 373 days to fold in 18 GB.
