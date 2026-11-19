@@ -101,6 +101,7 @@ type Metrics struct {
 	bufferFlushFailures   atomic.Int64
 	ingestPublishDelay    ingestPublishDelay // arc_ingest_publish_delay_seconds (ingest_publish_delay.go)
 	icebergExport         icebergExport      // arc_iceberg_export_* (iceberg_export.go)
+	flightSQLPrepare      flightSQLPrepare   // arc_flight_sql_prepare_* (flight_sql_prepare.go)
 	bufferQueueDepth      atomic.Int64
 	bufferRecordsQueued   atomic.Int64
 	bufferRecordsInflight atomic.Int64
@@ -1746,6 +1747,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathArrowIPC, float64(m.queryDisconnectsArrowIPC.Load()))
 	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathArrowJSON, float64(m.queryDisconnectsArrowJSON.Load()))
 	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathSQLJSON, float64(m.queryDisconnectsSQLJSON.Load()))
+	b = m.appendFlightSQLPrepare(b)
 
 	// Buffer metrics
 	b = append(b, "# HELP arc_buffer_records_buffered Records currently buffered\n"...)

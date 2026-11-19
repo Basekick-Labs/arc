@@ -203,6 +203,7 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 		}
 	}
 	queryHandler.RegisterRoutes(bridge)
+	queryHandler.registerFlightSQLSchemaRoute(bridge)
 
 	// No gzip on the loopback hop: it only costs CPU on both ends.
 	transport := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 64, DisableCompression: true}
@@ -592,6 +593,24 @@ func flightDatabase(ctx context.Context) (string, error) {
 	return values[0], nil
 }
 
+// flightStatementDatabase is the database a statement planned in stored (a
+// ticket's or a prepared statement handle's, "" for none) runs in: the call's
+// x-arc-database header when only it is set, stored otherwise. Both set, they
+// must match.
+func flightStatementDatabase(ctx context.Context, stored string) (string, error) {
+	database, err := flightDatabase(ctx)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case database == "":
+		return stored, nil
+	case stored != "" && database != stored:
+		return "", status.Error(codes.InvalidArgument, "the x-arc-database header differs from the database the statement was prepared in")
+	}
+	return database, nil
+}
+
 func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
 	if len(query.GetTransactionId()) != 0 {
 		return nil, status.Error(codes.Unimplemented, "Flight SQL transactions are not supported")
@@ -603,7 +622,12 @@ func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query fli
 	if err != nil {
 		return nil, err
 	}
-	handle, err := json.Marshal(flightStatement{SQL: query.GetQuery(), Database: database})
+	return flightStatementInfo(desc, query.GetQuery(), database)
+}
+
+// flightStatementInfo answers a statement ticket for sql, to run in database.
+func flightStatementInfo(desc *flight.FlightDescriptor, sql, database string) (*flight.FlightInfo, error) {
+	handle, err := json.Marshal(flightStatement{SQL: sql, Database: database})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode statement ticket: %v", err)
 	}
@@ -638,15 +662,9 @@ func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.
 	if err := validateHeaderDatabase(statement.Database); err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, "invalid database in statement ticket")
 	}
-	database, err := flightDatabase(ctx)
+	database, err := flightStatementDatabase(ctx, statement.Database)
 	if err != nil {
 		return nil, nil, err
-	}
-	switch {
-	case database == "":
-		database = statement.Database
-	case statement.Database != "" && database != statement.Database:
-		return nil, nil, status.Error(codes.InvalidArgument, "the x-arc-database header differs from the database the statement was prepared in")
 	}
 	if flightSQLBenchDirect != nil {
 		if schema, stream, handled, err := flightSQLBenchDirect(ctx, s, statement.SQL, database); handled {
@@ -772,22 +790,31 @@ func (s *flightSQLService) showResponse(ctx context.Context, resp *http.Response
 }
 
 func showRecordBuilder(columns []string) (*array.RecordBuilder, error) {
+	schema, err := flightShowSchema(columns)
+	if err != nil {
+		return nil, err
+	}
+	return array.NewRecordBuilder(memory.DefaultAllocator, schema), nil
+}
+
+// flightShowSchema is the Flight schema of a SHOW result with these columns.
+func flightShowSchema(columns []string) (*arrow.Schema, error) {
 	switch strings.Join(columns, ",") {
 	case "database":
-		return array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{{Name: "database", Type: arrow.BinaryTypes.String}}, nil)), nil
+		return arrow.NewSchema([]arrow.Field{{Name: "database", Type: arrow.BinaryTypes.String}}, nil), nil
 	case "database,tier":
-		return array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{
+		return arrow.NewSchema([]arrow.Field{
 			{Name: "database", Type: arrow.BinaryTypes.String},
 			{Name: "tier", Type: arrow.BinaryTypes.String},
-		}, nil)), nil
+		}, nil), nil
 	case "database,table_name,storage_path,file_count,total_size_mb":
-		return array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{
+		return arrow.NewSchema([]arrow.Field{
 			{Name: "database", Type: arrow.BinaryTypes.String},
 			{Name: "table_name", Type: arrow.BinaryTypes.String},
 			{Name: "storage_path", Type: arrow.BinaryTypes.String},
 			{Name: "file_count", Type: arrow.PrimitiveTypes.Int64},
 			{Name: "total_size_mb", Type: arrow.PrimitiveTypes.Float64},
-		}, nil)), nil
+		}, nil), nil
 	default:
 		return nil, fmt.Errorf("unsupported SHOW result columns: %s", strings.Join(columns, ","))
 	}
@@ -925,6 +952,8 @@ func flightCodeForHTTP(code int) codes.Code {
 		return codes.NotFound
 	case http.StatusTooManyRequests:
 		return codes.ResourceExhausted
+	case http.StatusNotImplemented:
+		return codes.Unimplemented
 	case http.StatusServiceUnavailable:
 		return codes.Unavailable
 	case http.StatusGatewayTimeout:

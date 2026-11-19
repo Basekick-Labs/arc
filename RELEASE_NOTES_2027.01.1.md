@@ -84,6 +84,23 @@ Notes:
   An export on S3 is a few dozen requests made one after another, so it takes about half a second in the bucket's region and seconds from far away, and the tables queue behind each other. The interval you set is reached while `tables written at once × one export` fits in it: about ten tables at 5 s, and somewhere between 60 and 100 at the default 60 s, in the bucket's region. Past that the tables wait for each other and the interval no longer sets the lag. The timed pass before #1750 exported tables the same way, one after another; it was not measured on S3. With one new file the append took about 40% less than the pass in the bucket's region and about 20% less from far away (one run each); with many new files per export it reads each one in turn and cost the same as the pass. No 200-table run reached a steady state, so read their lag as "minutes", not as a figure. By these runs each further file in an export costs about 24 ms in the bucket's region (525 ms with one file, 954 ms with about 19), so a node exports at most about 40 files a second there, and the 200-table load (about 22 files a second) used about half of that: the estimate for its steady state is a cycle of about 3.5 minutes. Above about 40 files a second the queue would not be bounded. These are estimates from two runs, not measurements. Serving tables in parallel is [#1778](https://github.com/Basekick-Labs/arc/issues/1778).
 - In those S3 runs no append fell back, row counts matched storage and no file was in a table twice; on a table left quiet the published versions went from 26 to 11 within two minutes (the age rule reads S3's own timestamps).
 
+<<<<<<< HEAD
+||||||| parent of f9bd5e0c (feat(flight-sql): prepared statements without parameters, for JDBC and Tableau (#1645))
+=======
+## New: Flight SQL prepared statements, so the JDBC driver and Tableau can run queries ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener now takes prepared statements without parameters. The Arrow Flight SQL JDBC driver, which Tableau, DBeaver and DataGrip use, prepares every query, even a plain `Statement.executeQuery`, so until now it could connect and browse tables but every query failed with `UNIMPLEMENTED`. With JDBC 19.0.0, `executeQuery` and `PreparedStatement` now return results. The ADBC drivers, which prepare before each execute when the server allows it, now take the prepared path too.
+
+- **A prepare binds the statement, it does not run it.** DuckDB resolves the statement's tables and columns, which lists the files and reads their Parquet footers but scans no data, and the result schema comes from that. It is the schema the execute streams, with Arc's decimal handling. The execute then runs as an unprepared statement does.
+- **One query per execute.** The prepare is not counted as a query: it does not appear in `/api/v1/queries`, the query metrics or the slow-query log, and it does not spend governance rate limits or quotas. But it is refused with `RESOURCE_EXHAUSTED` when the token's next query would be. It runs the query's checks: SQL validation, RBAC on every table (no schema for a table the token cannot read), and the query or governance timeout.
+- **Each prepare costs one bind**, one per `executeQuery` with JDBC. At most a quarter of `database.max_connections` binds run at once (at least one); more wait for a slot. New metrics: `arc_flight_sql_prepare_binds_total{result}` and `arc_flight_sql_prepare_bind_duration_seconds`. A bind slower than `query.slow_query_threshold_ms` is logged as a warning. With audit logging on, a prepare is an `api.post` event with the detail `{"operation": "flight_sql.prepare"}`, not a `data.query`.
+- **No server state.** The handle carries the SQL and the `x-arc-database` header the prepare saw, so closing a statement frees nothing.
+- **`UNIMPLEMENTED`, so ADBC runs the statement unprepared:** a `PIVOT`, a result column Arc cannot describe without running the query (a struct with unnamed fields, such as `(1, 2)`), and any prepare on a node that does not run queries.
+- **`INVALID_ARGUMENT`:** parameters (`?`), and a statement that does not bind. A query on a measurement with no data yet has a result without columns, which JDBC 19.0.0 reads as an update; that execute is refused with a message that says so.
+- **Documentation:** `docs/operations/flight-sql.md` has a prepared-statements section.
+
+No new configuration keys.
+>>>>>>> f9bd5e0c (feat(flight-sql): prepared statements without parameters, for JDBC and Tableau (#1645))
 
 ## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
 
@@ -4021,8 +4038,8 @@ tables for ADBC clients. Results stopped at a governance row cap end with a
 Flight queries are audited and logged like HTTP queries, with the client's
 address. Metadata calls run one query per database, plus one per measurement
 when schemas are requested, and count against governance limits. Prepared
-statements are not implemented yet, so JDBC-based BI tools cannot run queries;
-the ADBC drivers are the tested clients. See
+statements without parameters are supported (see the entry above), so the
+JDBC driver and the BI tools built on it can run queries. See
 `docs/operations/flight-sql.md`.
 
 Both Helm charts can turn it on: `flightSql.enabled` (default `false`),
@@ -4050,8 +4067,8 @@ with it (`adbc_get_info()` in Python), and with the Arrow Flight SQL JDBC driver
 every `DatabaseMetaData` call that reads SqlInfo threw, such as
 `getDatabaseProductName()` and `getIdentifierQuoteString()`. A request that
 includes IDs Arc has no value for, as ADBC's does for the Substrait version
-range, is answered with the rest. Queries through the JDBC driver still need
-prepared statements, which are not implemented yet. See
+range, is answered with the rest. Queries through the JDBC driver need
+prepared statements, which are in this release too (see the entry above). See
 `docs/operations/flight-sql.md`.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.
