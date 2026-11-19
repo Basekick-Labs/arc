@@ -227,9 +227,12 @@ func (s *Scheduler) otherRequestsQueued() bool {
 // noteIngestCovered records what a reconcile of key which started at
 // startedAt means for the ingest files reported for it.
 //
-// A reconcile that changed the table restarts the spacing from its end, for
-// a request already queued as much as for the next one: it may have
-// published a version.
+// A reconcile that committed to the table (changed) restarts the spacing
+// from its end, for a request already queued as much as for the next one: it
+// published a version, or tried to. One that committed nothing does not: the
+// pass that follows appends (scheduler_append.go) always runs and usually
+// finds the table as it should be, and restarting the spacing for it would
+// hold the table's next flush back by up to a whole interval.
 //
 // A reconcile that SETTLED covers the files reported before it started: they
 // are in a published table version now (or already were), so they no longer
@@ -242,14 +245,14 @@ func (s *Scheduler) otherRequestsQueued() bool {
 // start (it was reported no earlier), and its request stays queued.
 //
 // Loop goroutine only (it reads s.state).
-func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome reconcileOutcome, err error) {
+func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome reconcileOutcome, changed bool, err error) {
 	if s.ingestInterval <= 0 {
 		return
 	}
 	_, settled := s.state[key]
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
-	if outcome == outcomeReconciled {
+	if changed {
 		next := time.Now().Add(s.ingestInterval)
 		if next.After(s.ingestNext[key]) {
 			s.ingestNext[key] = next

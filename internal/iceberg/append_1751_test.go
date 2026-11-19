@@ -806,3 +806,35 @@ func TestHardenLocalMetadataPerms_LooksAtEachEntryOnce(t *testing.T) {
 		t.Errorf("a name that came back is %v, want 0600", got)
 	}
 }
+
+// The pass that follows appends always runs, and usually finds nothing to
+// commit. It must not restart the table's export spacing: the table's next
+// flush would then wait up to a whole interval for a pass that published
+// nothing. A pass that does commit still restarts it.
+func TestAppend_APassThatCommitsNothingDoesNotDelayTheNextExport(t *testing.T) {
+	r := newAppendRig(t)
+	r.settled()
+	r.report(r.newFile())
+	r.serve()
+	const interval = time.Minute
+	r.sched.ingestInterval = interval
+	key := "mydb\x00cpu"
+	due := func() time.Duration {
+		r.sched.reqMu.Lock()
+		defer r.sched.reqMu.Unlock()
+		return time.Until(r.sched.ingestNext[key])
+	}
+	if _, err := r.pass(); err != nil { // after an append: runs, commits nothing
+		t.Fatal(err)
+	}
+	if got := due(); got > time.Second {
+		t.Fatalf("the next ingest export is held back %v by a pass that committed nothing", got)
+	}
+	r.newFile() // not reported: the pass finds and commits it
+	if _, err := r.pass(); err != nil {
+		t.Fatal(err)
+	}
+	if got := due(); got < interval/2 {
+		t.Errorf("after a pass that committed, the next ingest export is due in %v, want about %v", got, interval)
+	}
+}

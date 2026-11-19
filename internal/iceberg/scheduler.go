@@ -137,6 +137,9 @@ type Scheduler struct {
 	appendOK       map[string]bool
 	recentAdds     map[string]map[string]time.Time
 	appendFallback map[string]string
+	// passCommits is how many data commits the reconcile pass in progress (or
+	// the last one) made: reconcileOne sets it, reconcileOneRecovered reads it.
+	passCommits int
 	// appendsSince counts each table's appends since its last settled pass.
 	appendsSince map[string]int
 	// lastReconciled is when each measurement's table last changed, by a
@@ -957,8 +960,9 @@ func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, ke
 	startedAt := time.Now()
 	defer func() {
 		s.notePassEnded(key, startedAt, outcome, err)
-		s.noteIngestCovered(key, startedAt, outcome, err)
+		s.noteIngestCovered(key, startedAt, outcome, s.passCommits > 0, err)
 	}()
+	s.passCommits = 0
 	defer func() {
 		if r := recover(); r != nil {
 			// The stack is logged here, where it is; the returned error is
@@ -1018,6 +1022,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			return outcomeUnchanged, nil
 		}
 		res, err := s.exporter.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: s.canRun})
+		s.passCommits = res.commits
 		if err != nil {
 			return outcomeUnchanged, err
 		}
@@ -1097,6 +1102,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		canCommit:   s.canRun,
 		exists:      s.fileExists(),
 	})
+	s.passCommits = res.commits // before the error check: a pass can commit chunks and then fail
 	if res.droppedCold {
 		// A cold file vanished: its cached cold listing is stale until invalidated. Before the
 		// error check: a pass can drop a cold file and then fail a later chunk.

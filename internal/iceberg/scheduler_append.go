@@ -285,7 +285,7 @@ func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string)
 	if reason == "" {
 		if len(keys) == 0 {
 			// Everything reported is in the table already.
-			s.noteIngestCovered(key, takenAt, outcomeUnchanged, nil)
+			s.noteIngestCovered(key, takenAt, outcomeUnchanged, false, nil)
 			return outcomeUnchanged, nil
 		}
 		var added int
@@ -295,7 +295,7 @@ func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string)
 			if added > 0 {
 				outcome = outcomeReconciled
 			}
-			s.noteIngestCovered(key, takenAt, outcome, nil)
+			s.noteIngestCovered(key, takenAt, outcome, added > 0, nil)
 			return outcome, nil
 		}
 	}
