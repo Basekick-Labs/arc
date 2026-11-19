@@ -136,7 +136,8 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	current := tbl.Schema()
 	for _, f := range add.Fields {
 		// A new column, or one of another type: the pass evolves the table or
-		// reports the conflict, with the file named.
+		// reports the conflict, with the file named. (buildDataFiles would
+		// refuse such a file too; this says why.)
 		if existing, ok := current.FindFieldByName(f.Name); !ok || !existing.Type.Equals(f.Type) {
 			return res, errNeedsFullPass
 		}

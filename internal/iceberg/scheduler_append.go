@@ -256,9 +256,8 @@ func (s *Scheduler) appendable(key string, p pendingFiles, now time.Time) (keys 
 // exportIngest serves a due ingest request for the table: an append of the
 // files reported for it when that is possible, a reconcile pass otherwise.
 func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string) (reconcileOutcome, error) {
-	if !s.appendEnabled {
-		return s.reconcileOneRecovered(ctx, m, key)
-	}
+	// With the append path off no table is ever marked as taking appends
+	// (notePassEnded), so every request is the pass.
 	resolver, canResolve := s.source.(appendResolver)
 	_, settled := s.state[key]
 	if !canResolve || !settled || !s.appendOK[key] {
