@@ -100,6 +100,7 @@ type Metrics struct {
 	bufferErrorsTotal     atomic.Int64
 	bufferFlushFailures   atomic.Int64
 	ingestPublishDelay    ingestPublishDelay // arc_ingest_publish_delay_seconds (ingest_publish_delay.go)
+	icebergExport         icebergExport      // arc_iceberg_export_* (iceberg_export.go)
 	bufferQueueDepth      atomic.Int64
 	bufferRecordsQueued   atomic.Int64
 	bufferRecordsInflight atomic.Int64
@@ -1369,6 +1370,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_publish_delay_count":       m.ingestPublishDelayCount(),
 		"ingest_publish_delay_sum_seconds": time.Duration(m.ingestPublishDelay.sumNS.Load()).Seconds(),
 		"ingest_publish_delay_max_seconds": time.Duration(m.ingestPublishDelay.maxNS.Load()).Seconds(),
+		"iceberg_export_lag_count":         m.icebergExportLagCount(),
+		"iceberg_export_lag_sum_seconds":   time.Duration(m.icebergExport.sumNS.Load()).Seconds(),
+		"iceberg_export_pending_seconds":   m.icebergExportPending(time.Now()).Seconds(),
+		"iceberg_export_backlog_files":     m.icebergExport.backlog.Load(),
 		"buffer_queue_depth":               m.bufferQueueDepth.Load(),
 		"buffer_records_queued":            m.bufferRecordsQueued.Load(),
 		"buffer_records_inflight":          m.bufferRecordsInflight.Load(),
@@ -1777,6 +1782,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetric(b, "arc_buffer_flush_failures_total", float64(m.bufferFlushFailures.Load()))
 
 	b = m.appendIngestPublishDelay(b)
+	b = m.appendIcebergExport(b)
 
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)

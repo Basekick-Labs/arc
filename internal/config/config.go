@@ -209,6 +209,12 @@ type IngestConfig struct {
 	MaxBufferedBytesAuto bool
 }
 
+// icebergMinVersionSpanSeconds is the least time the published versions of
+// an Iceberg table must span when ingest triggers exports
+// (iceberg.ingest_export_interval x (iceberg.retain_snapshots+1)): longer
+// than the slowest reader takes between resolving a version and opening it.
+const icebergMinVersionSpanSeconds = 120
+
 // minMaxBufferedBytes is the smallest explicit ingest.max_buffered_bytes: a
 // limit below one ordinary request refuses every write once anything is
 // buffered.
@@ -684,8 +690,13 @@ type IcebergConfig struct {
 	NamespacePrefix          string // Iceberg namespace prefix; tables land in "<prefix>_<database>" (default "arc")
 	NamespaceMigrationDryRun bool   // Preview migration of legacy dotted namespaces; false applies it
 	ReconcileInterval        int    // Seconds between reconcile passes (default 300)
-	CatalogDBPath            string // SQLite catalog path; defaults to the shared auth DB
-	RetainSnapshots          int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
+	// IngestExportInterval is the least time, in seconds, between two
+	// exports of one table that ingest flushes cause (#1750). A flushed file
+	// is exported after at most this long instead of at the next timed pass.
+	// 0 turns the ingest trigger off (timed passes only). Default 60.
+	IngestExportInterval int
+	CatalogDBPath        string // SQLite catalog path; defaults to the shared auth DB
+	RetainSnapshots      int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
 	// OrphanSweepEnabled gates the metadata orphan sweep (#835): deleting the manifest
 	// lists and manifests under a table's metadata directory that no metadata.json still
 	// on disk can reach. Default true. It is the only deleter in the exporter whose work
@@ -1512,6 +1523,7 @@ func Load() (*Config, error) {
 			NamespacePrefix:          v.GetString("iceberg.namespace_prefix"),
 			NamespaceMigrationDryRun: v.GetBool("iceberg.namespace_migration_dry_run"),
 			ReconcileInterval:        v.GetInt("iceberg.reconcile_interval"),
+			IngestExportInterval:     v.GetInt("iceberg.ingest_export_interval"),
 			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
@@ -2054,6 +2066,24 @@ func Load() (*Config, error) {
 		if cfg.Iceberg.ReconcileInterval < 1 {
 			return nil, fmt.Errorf("iceberg.reconcile_interval must be >= 1 (got %d): "+
 				"it is the interval between reconcile passes, and values below 1 would not define a valid schedule", cfg.Iceberg.ReconcileInterval)
+		}
+		if cfg.Iceberg.IngestExportInterval < 0 {
+			return nil, fmt.Errorf("iceberg.ingest_export_interval must be >= 0 (got %d): it is the least time, in seconds, "+
+				"between two exports of a table that ingest causes; 0 turns that trigger off", cfg.Iceberg.IngestExportInterval)
+		}
+		// Each export publishes a table version, and only retain_snapshots+1
+		// published versions are kept. A reader resolves a version and opens
+		// it later (Snowflake about 80 s after a publish; a failed Glue update
+		// is retried after iceberg.glue.sync_interval), so the versions kept
+		// must span longer than that or the reader finds its version deleted.
+		// (retain_snapshots < 1 is refused by its own check below.)
+		if n := cfg.Iceberg.IngestExportInterval; n > 0 && cfg.Iceberg.RetainSnapshots >= 1 &&
+			n*(cfg.Iceberg.RetainSnapshots+1) < icebergMinVersionSpanSeconds {
+			return nil, fmt.Errorf("iceberg.ingest_export_interval (%d s) times iceberg.retain_snapshots+1 (%d) is %d s, under %d s: "+
+				"ingest would publish table versions faster than readers that resolved one can open it before it is deleted. "+
+				"Raise ingest_export_interval to at least %d, raise retain_snapshots, or set ingest_export_interval to 0",
+				n, cfg.Iceberg.RetainSnapshots+1, n*(cfg.Iceberg.RetainSnapshots+1), icebergMinVersionSpanSeconds,
+				(icebergMinVersionSpanSeconds+cfg.Iceberg.RetainSnapshots)/(cfg.Iceberg.RetainSnapshots+1))
 		}
 		// Reject rather than silently treat as "keep every snapshot forever": an
 		// operator setting 0 almost certainly means "keep no history", and the
@@ -2688,6 +2718,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.namespace_prefix", "arc")
 	v.SetDefault("iceberg.namespace_migration_dry_run", true)
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
+	v.SetDefault("iceberg.ingest_export_interval", 60)       // seconds; 0 = export on the timer only (#1750)
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)

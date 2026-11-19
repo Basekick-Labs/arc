@@ -121,6 +121,7 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 
 func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconcileResult, error) {
 	ctx = e.withAWS(ctx)
+	e.passLag = 0 // the largest export lag this pass publishes (export_lag.go)
 	database, measurement := req.database, req.measurement
 	tkey := database + "\x00" + measurement
 	canCommit := req.canCommit
@@ -448,6 +449,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 					registered++
 				}
 			}
+			// built, not adds: a tier move's clone is a file the table already had.
+			e.noteExported(tbl.Identifier(), built, rewrote)
 		}
 	}
 
@@ -523,6 +526,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 				break
 			}
 			registered += len(built)
+			e.noteExported(tbl.Identifier(), built, nil)
 		}
 		free = free[len(batch):]
 		lastDur = time.Since(start)
@@ -579,6 +583,9 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			Bool("hint_published", hintOK).
 			Bool("history_settled", finishedOK).
 			Bool("heal_ok", !e.healFailed()).
+			// How long the oldest ingest file this pass published had waited
+			// since it was written; 0 when it published none (#1750).
+			Dur("oldest_ingest_file_lag", e.passLag).
 			Msg("Reconciled Iceberg table")
 	}
 	if partial {

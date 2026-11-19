@@ -117,6 +117,15 @@ type Scheduler struct {
 	// scheduled (requestAfter), so a burst does not start a timer each.
 	retrying map[string]bool
 	wake     chan struct{}
+	// Ingest-triggered export (scheduler_ingest.go, #1750), all under reqMu:
+	// ingestDue is the requests waiting and when each may run, ingestNext
+	// the earliest next attempt per table, ingestPending when a file was
+	// first reported for a table no reconcile has covered since.
+	// ingestInterval is the spacing; 0 turns the trigger off.
+	ingestInterval time.Duration
+	ingestDue      map[string]ingestRequest
+	ingestNext     map[string]time.Time
+	ingestPending  map[string]time.Time
 	// lastReconciled is when each measurement's table last changed, by a
 	// pass or a request. Loop goroutine only.
 	lastReconciled map[string]time.Time
@@ -216,6 +225,10 @@ type SchedulerConfig struct {
 	Interval time.Duration
 	Gate     WriterGate // nil = always run (OSS)
 	Logger   zerolog.Logger
+	// IngestInterval is the least time between two reconciles of one table
+	// that ingest flushes cause (iceberg.ingest_export_interval). Zero or
+	// less: RequestIngestReconcile does nothing.
+	IngestInterval time.Duration
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -236,6 +249,10 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		requestedHot:   make(map[string]struct{}),
 		retrying:       make(map[string]bool),
 		wake:           make(chan struct{}, 1),
+		ingestInterval: cfg.IngestInterval,
+		ingestDue:      make(map[string]ingestRequest),
+		ingestNext:     make(map[string]time.Time),
+		ingestPending:  make(map[string]time.Time),
 		lastReconciled: make(map[string]time.Time),
 		drops:          make(map[string]struct{}),
 		dropRetry:      make(map[string]dropRetry),
@@ -700,7 +717,12 @@ func (s *Scheduler) loop(ctx context.Context) {
 	}
 	timer := time.NewTimer(next)
 	defer timer.Stop()
+	// One timer for every waiting ingest request (scheduler_ingest.go): armed
+	// at the top of each turn to the earliest one due.
+	ingestTimer := time.NewTimer(time.Hour)
+	defer ingestTimer.Stop()
 	for {
+		s.armIngestTimer(ingestTimer)
 		select {
 		case <-ctx.Done():
 			return
@@ -708,8 +730,13 @@ func (s *Scheduler) loop(ctx context.Context) {
 			// A request between passes: serve it now. The timer is not
 			// touched, so the next timed pass keeps its time however many
 			// requests come in. Drops first: they run whatever the gate.
+			// Ingest requests last, and only the ones already due.
 			s.serviceDrops(ctx)
 			s.serviceRequests(ctx)
+			s.serviceIngest(ctx, ingestBatch)
+			continue
+		case <-ingestTimer.C:
+			s.serviceIngest(ctx, ingestBatch)
 			continue
 		case <-timer.C:
 			partial = s.runPass(ctx)
@@ -777,6 +804,9 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		// start leaves nothing to list.
 		s.serviceDrops(ctx)
 		s.serviceRequests(ctx)
+		// One ingest request at most, so a backlog of them cannot hold the
+		// pass (scheduler_ingest.go).
+		s.serviceIngest(ctx, 1)
 		if s.droppedThisPass(m.Database) {
 			continue
 		}
@@ -887,6 +917,11 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 // other recover). Footer reads recover their own panics too (schemaFromReader),
 // including on worker goroutines this cannot reach.
 func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, key string) (outcome reconcileOutcome, err error) {
+	// Deferred first, so it runs last and sees what a recovered panic turned
+	// the result into: whichever kind of reconcile this is, one that went
+	// through covers the ingest files reported before it started (#1750).
+	startedAt := time.Now()
+	defer func() { s.noteIngestCovered(key, startedAt, outcome, err) }()
 	defer func() {
 		if r := recover(); r != nil {
 			// The stack is logged here, where it is; the returned error is

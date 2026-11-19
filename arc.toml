@@ -386,6 +386,10 @@ s3_cache_ttl_seconds = 3600
 # namespace_prefix = "arc"
 # namespace_migration_dry_run = true
 # reconcile_interval = 300
+# ingest_export_interval = 60        # seconds: a flushed file is exported after at
+#                                    # most this long, not at the next timed pass.
+#                                    # 0 = timed passes only. Times
+#                                    # (retain_snapshots + 1) it must be >= 120.
 # catalog_db_path = "./data/arc.db"   # the shared auth database
 # retain_snapshots = 10
 # orphan_sweep_enabled = true
