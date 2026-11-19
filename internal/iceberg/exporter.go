@@ -1772,7 +1772,10 @@ func (e *Exporter) reachableManifestNames(ctx context.Context, tbl *icetable.Tab
 //
 // Returns true when there was nothing to do (no backend) or everything was written.
 func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bool {
-	exportReadsFrom(ctx).dropHints() // about to change
+	// The hint is about to change. Nothing reads a recorded hint after a
+	// publish today (notePassStart takes it right after the adopt check that
+	// recorded it); this keeps that true for a caller added later.
+	exportReadsFrom(ctx).dropHints()
 	if e.backend == nil {
 		// No discovery files to write: the catalog commit is the publish.
 		e.drainExportLag(tbl.Identifier())

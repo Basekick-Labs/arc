@@ -77,15 +77,6 @@ func (e *Exporter) publishMetadataCopy(ctx context.Context, vKey string, body []
 // (EnsureTable creates it). Read errors fail the pass: guessing would risk the fork this exists
 // to prevent.
 func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier, nsKey, database, measurement string) (bool, error) {
-	moved, err := e.adoptPublishedRow(ctx, ident, nsKey, database, measurement)
-	if moved || err != nil {
-		// The hint this read is no longer what the table's next load starts from.
-		exportReadsFrom(ctx).dropHints()
-	}
-	return moved, err
-}
-
-func (e *Exporter) adoptPublishedRow(ctx context.Context, ident icetable.Identifier, nsKey, database, measurement string) (bool, error) {
 	if e.backend == nil {
 		return false, nil
 	}
@@ -122,7 +113,9 @@ func (e *Exporter) adoptPublishedRow(ctx context.Context, ident icetable.Identif
 	if err != nil {
 		return false, err
 	}
-	// notePassStart wants the same file a moment later (#1778).
+	// notePassStart wants the same file a moment later (#1778). Adopting a
+	// version moves the catalog row and leaves the hint as it was read; a
+	// publish, which does change it, drops this (writeVersionHint).
 	exportReadsFrom(ctx).putHint(dirKey, hintN)
 	rowN := -1
 	if rowExists {
