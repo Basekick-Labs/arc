@@ -278,7 +278,8 @@ func (e *Exporter) healFailed() bool {
 }
 
 // notePassStart records, the first time this reconcile loads the table, its version and the
-// version version-hint.text names (one GET; -1 when there is none or it cannot be read).
+// version version-hint.text names (-1 when there is none or it cannot be read): the adopt
+// check's read of it when this export just made one (export_reads.go), else one GET.
 func (e *Exporter) notePassStart(ctx context.Context, tbl *icetable.Table) {
 	e.hintFailMu.Lock()
 	seen := e.passLoaded >= 0
@@ -979,6 +980,10 @@ func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transactio
 // AddFiles used to compute, with the same table schema, spec and properties. want gives each path's size
 // from the listing; a footer that disagrees (the file was replaced since it was listed) fails
 // the pass rather than register stats for bytes that are no longer there.
+// A file whose tail this export already read (export_reads.go) is built from that tail, whose
+// read checked the stored length against the same size; for such a file the check here compares
+// the size with itself, and a replacement between that read and this build is seen by the next
+// pass's listing.
 //
 // A file whose day() partition cannot be inferred (its rows straddle a UTC day) is returned in
 // skipped instead of failing the pass, so one such file does not wedge the measurement. Any

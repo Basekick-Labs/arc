@@ -3,12 +3,16 @@ package iceberg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	iceio "github.com/apache/iceberg-go/io"
+	"github.com/rs/zerolog"
 )
 
 // #1778: what one export keeps of its reads.
@@ -245,5 +249,76 @@ func TestAppend_PresentFileSchemasLeavesOutAFileThatIsGone(t *testing.T) {
 	}
 	if len(sc.Fields) == 0 {
 		t.Error("no schema for the file that is there")
+	}
+}
+
+// A local file is stat'ed whatever size the flush reported: the report is
+// only trusted where asking costs a request.
+func TestAppend_ALocalFileIsStatedWhateverSizeWasReported(t *testing.T) {
+	r := newAppendRig(t)
+	first := r.settled()
+	f := r.newFile()
+	before := r.listings()
+	r.sched.RequestIngestAppend("mydb", "cpu", appendDir+f, 999) // not its size
+	r.serve()
+	if r.listings() != before {
+		t.Fatal("a wrong reported size made a local append fall back: the reported size was used in place of the stat")
+	}
+	r.wantOnce(first, f)
+	// And one that is gone is left out by that stat.
+	gone := r.newFile()
+	if err := os.Remove(filepath.Join(r.root, filepath.FromSlash(appendDir), gone)); err != nil {
+		t.Fatal(err)
+	}
+	r.sched.RequestIngestAppend("mydb", "cpu", appendDir+gone, 999)
+	r.serve()
+	if r.listings() != before {
+		t.Fatal("a reported file that is gone made a local append fall back")
+	}
+	r.wantOnce(first, f)
+}
+
+// The hint a pass starts from is the one the file holds, not the newer
+// version the adopt check may go on to take: #1097's prune keeps the version
+// a reader that followed the hint is opening.
+func TestExportReads_ThePassStartsFromTheHintAsWritten(t *testing.T) {
+	r := newAppendRig(t)
+	r.exp.SetWarehouseAuthoritative(true)
+	r.settled()
+	for i := 0; i < 2; i++ {
+		f := r.newFile()
+		r.report(f)
+		r.serve()
+	}
+	hintKey := "arc_mydb.db/cpu/metadata/version-hint.text"
+	raw, err := r.be.Read(context.Background(), hintKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var newest int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(raw)), "%d", &newest); err != nil || newest < 2 {
+		t.Fatalf("hint %q, err %v", raw, err)
+	}
+	// A writer that published v<newest> and stopped before the hint.
+	if err := r.be.Write(context.Background(), hintKey, []byte(strconv.Itoa(newest-1))); err != nil {
+		t.Fatal(err)
+	}
+	// Another process: nothing is known to be published here, so the adopt
+	// check lists the versions and takes the newest of this lineage.
+	exp2, err := NewExporter(r.exp.db, r.be, "file://"+r.root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp2.SetWarehouseAuthoritative(true)
+	ctx := withExportReads(context.Background())
+	exp2.resetHintFailure()
+	if _, err := exp2.EnsureTable(ctx, "mydb", "cpu", ArcSchema{}); err != nil {
+		t.Fatal(err)
+	}
+	exp2.hintFailMu.Lock()
+	got, unknown := exp2.passHint, exp2.passHintUnknown
+	exp2.hintFailMu.Unlock()
+	if unknown || got != newest-1 {
+		t.Fatalf("the pass started from hint %d (unknown=%v), the file says %d", got, unknown, newest-1)
 	}
 }

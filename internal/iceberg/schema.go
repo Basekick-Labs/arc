@@ -74,14 +74,6 @@ func SchemaFromBackend(ctx context.Context, backend storage.Backend, key string,
 // read: the footer and trailer, checked to end at size. The export hands it
 // to iceberg-go so the file is not fetched again (export_reads.go, #1778).
 func schemaAndTailFromBackend(ctx context.Context, backend storage.Backend, key string, size int64) (ArcSchema, fileTail, error) {
-	sc, tail, err := schemaAndTail(ctx, backend, key, size)
-	if err != nil {
-		return ArcSchema{}, fileTail{}, err
-	}
-	return sc, tail, nil
-}
-
-func schemaAndTail(ctx context.Context, backend storage.Backend, key string, size int64) (ArcSchema, fileTail, error) {
 	if size < parquetTrailerLen+int64(len(parquetMagic)) {
 		return ArcSchema{}, fileTail{}, fmt.Errorf("parquet %q: %d bytes is too small for a Parquet file", key, size)
 	}

@@ -62,12 +62,18 @@ func appendMergeOn() iceberg.Properties {
 // have with the new one.
 //
 // The count is read from the current snapshot's manifest list the first time
-// (any failure means no merge), and kept from one append to the next after
-// that: between two appends of a table nothing else commits to it, since a
-// reconcile pass forgets the count (reconcile) and so does an append that
+// (any failure means no merge), and carried from one append to the next after
+// that: a reconcile pass forgets it (reconcile) and so does an append that
 // did not finish (appendFiles). On object storage that read was one request
 // of every append, and iceberg-go reads the same list again to commit
 // (#1778).
+//
+// Carried, it is an estimate. It counts the manifest each append adds as
+// small and a merge's result as one small manifest, and iceberg-go, which
+// packs by size and applies the minimum itself, can decline a staged merge.
+// The estimate only moves when a merge is tried: a few more small manifests
+// can stand than with a count read every time, until the table's next pass,
+// which comes after appendMaxBetweenPasses appends at the latest.
 func (e *Exporter) appendMergeDue(ctx context.Context, tkey string, tbl *icetable.Table) (merge bool, small int) {
 	if n, ok := e.appendSmall[tkey]; ok {
 		return n+1 >= appendMergeMinCount, n + 1
@@ -181,7 +187,8 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	start := time.Now()
 	txn := tbl.NewTransaction()
 	merge, small := e.appendMergeDue(ctx, tkey, tbl)
-	// Not known again until this append has finished.
+	// Not known again until this append has finished (a panic past this point
+	// skips the deferred delete's err check).
 	delete(e.appendSmall, tkey)
 	if merge {
 		if err := txn.SetProperties(appendMergeOn()); err != nil {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"path"
 	"runtime/debug"
 	"strings"
@@ -363,7 +362,8 @@ func (s *Scheduler) appendRecovered(ctx context.Context, resolver appendResolver
 	}
 	// The footers, read here and not in appendFiles so that a file that has
 	// left storage since it was reported is left out, as the stat in
-	// AppendRefs leaves one out on local storage (#1778).
+	// AppendRefs leaves one out on local storage (#1778). When the append
+	// then cannot run, the pass that follows reads them again.
 	refs, sc, err := s.presentFileSchemas(ctx, refs)
 	if err != nil {
 		return 0, err.Error()
@@ -423,7 +423,7 @@ func (s *Scheduler) presentFileSchemas(ctx context.Context, files []FileRef) ([]
 			}
 			sc, err := s.source.FileSchema(gctx, f)
 			if err != nil {
-				if storage.IsNotFound(err) || errors.Is(err, fs.ErrNotExist) {
+				if storage.IsNotFound(err) {
 					gone[i] = true
 					return nil
 				}

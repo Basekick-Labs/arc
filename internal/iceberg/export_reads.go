@@ -2,8 +2,6 @@ package iceberg
 
 import (
 	"context"
-	"errors"
-	"io"
 	"io/fs"
 	"sync"
 	"time"
@@ -19,9 +17,9 @@ import (
 //
 // It lives for one export of one table: the scheduler puts it on the context
 // of a reconcile pass or an append (withExportReads) and nothing outlives
-// that call. Every export therefore still reads the table's metadata, hint
-// and manifests from the store, which is how it learns a table was removed
-// or republished under it.
+// that call. Every export therefore still reads the table's metadata and
+// hint from the store, which is how it learns a table was removed or
+// republished under it.
 type exportReads struct {
 	mu sync.Mutex
 	// tails are the footers of new data files, by physical path, as read
@@ -33,10 +31,12 @@ type exportReads struct {
 	hints map[string]int
 }
 
-// exportReadsMaxTailBytes bounds the footers held at once. A footer is a few
-// KiB; a pass registering a backlog holds them only between the schema read
-// and the commit of the same chunk. Past the bound a tail is not kept and
-// iceberg-go reads the file itself.
+// exportReadsMaxTailBytes bounds the tails held at once. What is held per
+// file is what the schema read fetched: the last footerWindow bytes (64 KiB),
+// or the whole footer when it is longer, so the bound is about a thousand
+// files. A pass holds a file's tail from its schema read until the chunk that
+// registers it, and a tail never used until the pass ends. Past the bound a
+// tail is not kept and iceberg-go reads that file from the store itself.
 const exportReadsMaxTailBytes = 64 << 20
 
 // fileTail is the end of a data file: data is its bytes [base, size).
@@ -179,9 +179,6 @@ func (f *tailFile) ReadAt(p []byte, off int64) (int, error) {
 func (f *tailFile) Read(p []byte) (int, error) {
 	n, err := f.ReadAt(p, f.rd.pos)
 	f.rd.pos += int64(n)
-	if n > 0 && errors.Is(err, io.EOF) && n == len(p) {
-		err = nil
-	}
 	return n, err
 }
 
