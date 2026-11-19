@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path"
 	"runtime/debug"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
+	"golang.org/x/sync/errgroup"
 )
 
 // The scheduler's side of the append path (#1751; the commit is append.go).
@@ -73,8 +75,9 @@ const (
 
 // pendingFile is one file an ingest flush reported and no export has covered.
 type pendingFile struct {
-	key string // storage key
-	at  time.Time
+	key  string // storage key
+	size int64  // bytes the flush wrote; 0 when the reporter did not say
+	at   time.Time
 }
 
 // pendingFiles is a table's reported files; overflow means some were not
@@ -91,7 +94,7 @@ type pendingFiles struct {
 // request comes due the reported files are appended to the table; without the
 // append path (iceberg.ingest_append_enabled off) it is RequestIngestReconcile.
 // It never blocks and is safe on a nil scheduler.
-func (s *Scheduler) RequestIngestAppend(database, measurement, storageKey string) {
+func (s *Scheduler) RequestIngestAppend(database, measurement, storageKey string, sizeBytes int64) {
 	if s == nil || s.ingestInterval <= 0 || database == "" || measurement == "" {
 		return
 	}
@@ -106,7 +109,7 @@ func (s *Scheduler) RequestIngestAppend(database, measurement, storageKey string
 		if len(p.files) >= appendMaxPending {
 			p.overflow, p.overflowAt = true, now
 		} else {
-			p.files = append(p.files, pendingFile{key: storageKey, at: now})
+			p.files = append(p.files, pendingFile{key: storageKey, size: sizeBytes, at: now})
 		}
 		s.appendPending[key] = p
 	}
@@ -288,8 +291,12 @@ func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string)
 			s.noteIngestCovered(key, takenAt, outcomeUnchanged, false, nil)
 			return outcomeUnchanged, nil
 		}
+		sizes := make(map[string]int64, len(pending.files))
+		for _, f := range pending.files {
+			sizes[f.key] = f.size
+		}
 		var added int
-		added, reason = s.appendRecovered(ctx, resolver, m, key, keys)
+		added, reason = s.appendRecovered(ctx, resolver, m, key, keys, sizes)
 		if reason == "" {
 			outcome := outcomeUnchanged
 			if added > 0 {
@@ -330,13 +337,13 @@ func (s *Scheduler) markAppended(key string) {
 
 // appendResolver is the source's per-file resolution (StorageWalkSource.AppendRefs).
 type appendResolver interface {
-	AppendRefs(ctx context.Context, m Measurement, keys []string) ([]FileRef, bool, error)
+	AppendRefs(ctx context.Context, m Measurement, keys []string, sizes map[string]int64) ([]FileRef, bool, error)
 }
 
 // appendRecovered appends the files and returns how many it added, or the
 // reason a reconcile pass is needed. A panic is a reason too, as in
 // reconcileOneRecovered.
-func (s *Scheduler) appendRecovered(ctx context.Context, resolver appendResolver, m Measurement, key string, keys []string) (added int, reason string) {
+func (s *Scheduler) appendRecovered(ctx context.Context, resolver appendResolver, m Measurement, key string, keys []string, sizes map[string]int64) (added int, reason string) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error().Str("database", m.Database).Str("measurement", m.Measurement).
@@ -345,17 +352,27 @@ func (s *Scheduler) appendRecovered(ctx context.Context, resolver appendResolver
 			added, reason = 0, fmt.Sprintf("the append panicked: %v", r)
 		}
 	}()
-	refs, ok, err := resolver.AppendRefs(ctx, m, keys)
+	// What this export reads of the new files is read once (export_reads.go).
+	ctx = withExportReads(ctx)
+	refs, ok, err := resolver.AppendRefs(ctx, m, keys, sizes)
 	if err != nil {
 		return 0, err.Error()
 	}
 	if !ok {
 		return 0, "this storage layout has no per-file check"
 	}
+	// The footers, read here and not in appendFiles so that a file that has
+	// left storage since it was reported is left out, as the stat in
+	// AppendRefs leaves one out on local storage (#1778).
+	refs, sc, err := s.presentFileSchemas(ctx, refs)
+	if err != nil {
+		return 0, err.Error()
+	}
 	if len(refs) == 0 {
 		return 0, "" // gone or left out since they were reported: nothing to add
 	}
-	res, err := s.exporter.appendFiles(ctx, m.Database, m.Measurement, refs, s.unionFileSchemas, s.canRun)
+	readSchemas := func(context.Context, []FileRef) (ArcSchema, error) { return sc, nil }
+	res, err := s.exporter.appendFiles(ctx, m.Database, m.Measurement, refs, readSchemas, s.canRun)
 	if err != nil {
 		if errors.Is(err, errNeedsFullPass) {
 			return 0, "the table does not exist or lacks a column of the new files"
@@ -389,4 +406,51 @@ func (s *Scheduler) appendRecovered(ctx context.Context, resolver appendResolver
 		metrics.Get().AddIcebergIngestAppend(len(res.added))
 	}
 	return len(res.added), ""
+}
+
+// presentFileSchemas reads the schemas of reported files, as
+// unionFileSchemas does, leaving out the files the store no longer has. It
+// returns the files left and their merged schema.
+func (s *Scheduler) presentFileSchemas(ctx context.Context, files []FileRef) ([]FileRef, ArcSchema, error) {
+	schemas := make([]ArcSchema, len(files))
+	gone := make([]bool, len(files))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(unionSchemaConcurrency)
+	for i, f := range files {
+		g.Go(func() error {
+			if err := gctx.Err(); err != nil {
+				return err
+			}
+			sc, err := s.source.FileSchema(gctx, f)
+			if err != nil {
+				if storage.IsNotFound(err) || errors.Is(err, fs.ErrNotExist) {
+					gone[i] = true
+					return nil
+				}
+				return fmt.Errorf("file %q: %w", f.PhysicalPath, err)
+			}
+			schemas[i] = sc
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, ArcSchema{}, err
+	}
+	present := make([]FileRef, 0, len(files))
+	var out ArcSchema
+	for i, sc := range schemas {
+		if gone[i] {
+			continue
+		}
+		present = append(present, files[i])
+		sc.sources = make(map[string]string, len(sc.Fields))
+		for _, f := range sc.Fields {
+			sc.sources[f.Name] = fileRefKey(files[i])
+		}
+		var err error
+		if out, err = MergeSchemas(out, sc); err != nil {
+			return nil, ArcSchema{}, markConflict(err, conflictWithFiles)
+		}
+	}
+	return present, out, nil
 }

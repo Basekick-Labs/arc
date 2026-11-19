@@ -66,8 +66,24 @@ var footerWindow int64 = 64 << 10
 // is the file's size from the listing; a tail that does not match it (the
 // file was replaced or truncated since) is an error, not a guess.
 func SchemaFromBackend(ctx context.Context, backend storage.Backend, key string, size int64) (ArcSchema, error) {
+	sc, _, err := schemaAndTailFromBackend(ctx, backend, key, size)
+	return sc, err
+}
+
+// schemaAndTailFromBackend is SchemaFromBackend, also returning the tail it
+// read: the footer and trailer, checked to end at size. The export hands it
+// to iceberg-go so the file is not fetched again (export_reads.go, #1778).
+func schemaAndTailFromBackend(ctx context.Context, backend storage.Backend, key string, size int64) (ArcSchema, fileTail, error) {
+	sc, tail, err := schemaAndTail(ctx, backend, key, size)
+	if err != nil {
+		return ArcSchema{}, fileTail{}, err
+	}
+	return sc, tail, nil
+}
+
+func schemaAndTail(ctx context.Context, backend storage.Backend, key string, size int64) (ArcSchema, fileTail, error) {
 	if size < parquetTrailerLen+int64(len(parquetMagic)) {
-		return ArcSchema{}, fmt.Errorf("parquet %q: %d bytes is too small for a Parquet file", key, size)
+		return ArcSchema{}, fileTail{}, fmt.Errorf("parquet %q: %d bytes is too small for a Parquet file", key, size)
 	}
 	off := size - footerWindow
 	if off < 0 {
@@ -75,26 +91,30 @@ func SchemaFromBackend(ctx context.Context, backend storage.Backend, key string,
 	}
 	tail, err := readTail(ctx, backend, key, size, off)
 	if err != nil {
-		return ArcSchema{}, err
+		return ArcSchema{}, fileTail{}, err
 	}
 	trailer := tail[len(tail)-parquetTrailerLen:]
 	if string(trailer[4:]) != parquetMagic {
-		return ArcSchema{}, fmt.Errorf("parquet %q: no Parquet magic at the end of the file", key)
+		return ArcSchema{}, fileTail{}, fmt.Errorf("parquet %q: no Parquet magic at the end of the file", key)
 	}
 	need := int64(binary.LittleEndian.Uint32(trailer[:4])) + parquetTrailerLen
 	if err := checkFooterLen(need-parquetTrailerLen, key); err != nil {
-		return ArcSchema{}, err
+		return ArcSchema{}, fileTail{}, err
 	}
 	if need > size-int64(len(parquetMagic)) {
-		return ArcSchema{}, fmt.Errorf("parquet %q: footer length %d does not fit a %d-byte file", key, need-parquetTrailerLen, size)
+		return ArcSchema{}, fileTail{}, fmt.Errorf("parquet %q: footer length %d does not fit a %d-byte file", key, need-parquetTrailerLen, size)
 	}
 	if need > int64(len(tail)) {
 		off = size - need
 		if tail, err = readTail(ctx, backend, key, size, off); err != nil {
-			return ArcSchema{}, err
+			return ArcSchema{}, fileTail{}, err
 		}
 	}
-	return schemaFromReader(&tailReader{base: off, data: tail, size: size}, key)
+	sc, err := schemaFromReader(&tailReader{base: off, data: tail, size: size}, key)
+	if err != nil {
+		return ArcSchema{}, fileTail{}, err
+	}
+	return sc, fileTail{base: off, size: size, data: tail}, nil
 }
 
 const (
