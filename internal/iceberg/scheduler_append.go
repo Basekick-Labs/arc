@@ -443,10 +443,8 @@ func (s *Scheduler) presentFileSchemas(ctx context.Context, files []FileRef) ([]
 			continue
 		}
 		present = append(present, files[i])
-		sc.sources = make(map[string]string, len(sc.Fields))
-		for _, f := range sc.Fields {
-			sc.sources[f.Name] = fileRefKey(files[i])
-		}
+		// No column sources, unlike unionFileSchemas: a conflict here makes
+		// the export a pass, and the pass is what names the files (#1744).
 		var err error
 		if out, err = MergeSchemas(out, sc); err != nil {
 			return nil, ArcSchema{}, markConflict(err, conflictWithFiles)

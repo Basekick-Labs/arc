@@ -10,7 +10,7 @@ On S3 an export is a chain of requests made one after another, and the runs for 
 - **No HEAD per file reported by ingest**, on object storage. The size the flush wrote is used, and the footer read checks it against the stored object: a file that is gone is left out of the append as before, and one whose stored length differs makes that export a full pass. Local files are still stat'ed.
 - **`version-hint.text` is read once per export**, not twice, and **the count of small manifests is carried from one append to the next** in place of a read of the manifest list at every append. The carried count is an estimate: a table can hold a few more small manifests than before between two full passes.
 
-Requests and time for one export, measured through a proxy in front of an S3 server that records each request and holds it for 30 ms (`TestMeasure_S3RequestsPerExport`; a table of 49 files, the exporter set up as a production node):
+Requests for one export, counted through a proxy in front of an S3 server (`TestMeasure_S3RequestsPerExport`; a table of 49 files, the exporter set up as a production node). The counts are exact and tests pin them. The times are one run each with the proxy holding every request for 30 ms, to show what the counts are worth with a network in between; they are not AWS figures:
 
 | Export | Requests before | After | Time before | After |
 |---|---|---|---|---|
@@ -21,9 +21,9 @@ Requests and time for one export, measured through a proxy in front of an S3 ser
 
 Of the 11 requests left in an append, five are writes that must follow one another, and three are reads of the table's `metadata.json` (the load, iceberg-go's check before the commit, and the copy published as `v<N>.metadata.json`).
 
-- **Not measured on AWS.** The numbers above are from a local S3 server with a delay added per request, chosen to be close to what #1751 measured in a bucket's region (about 32 ms a request). Azure and GCS take the same code path and were not run.
+- **Not measured on AWS.** With the proxy an append of one file took 657 ms before this change, where #1751 measured 525 ms on AWS in the bucket's region, so the proxy is somewhat slower than that link; expect the ratio to carry over, not the milliseconds. Azure and GCS take the same code path and were not run.
 - **Tables are still exported one at a time.** This makes each export cheaper; it does not let several tables export at once, which is what many tables at a short `ingest_export_interval` need on object storage. That remains open in #1778.
-- No change on local storage, and no new configuration. On the running binary (S3 API, 10 tables at a 5 s interval): 120 appends, none fell back, row counts matched storage and no file was in a table twice; an export averaged 41 ms against 57 ms before, with no network in between.
+- No change on local storage, and no new configuration. On the running binary (S3 API, 10 tables at a 5 s interval): 120 appends, none fell back, row counts matched storage and no file was in a table twice; an export averaged 41 ms against 57 ms on the previous build, in one run of each with no network in between and no repeat to show the spread.
 - The footers held for one export are bounded at 64 MiB (about a thousand new files); past that, the remaining files of that export are read by iceberg-go as before.
 
 ## Fix: late data no longer rewrites an old day's daily file ([#1775](https://github.com/Basekick-Labs/arc/issues/1775))

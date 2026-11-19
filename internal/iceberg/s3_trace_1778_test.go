@@ -218,6 +218,7 @@ func TestMeasure_S3RequestsPerExport(t *testing.T) {
 		IngestInterval: time.Millisecond, IngestAppend: true})
 	sched.started = time.Now().Add(-time.Second)
 	seq := 0
+	files := seed + 1 // in the table once the setup below has run
 	newFiles := func(n int) []string {
 		keys := make([]string, n)
 		for i := range keys {
@@ -249,6 +250,12 @@ func TestMeasure_S3RequestsPerExport(t *testing.T) {
 		}
 		took := time.Since(start)
 		setDelay(0)
+		// A file left out (rows across a UTC day, say) would make the trace
+		// that of an export that committed nothing.
+		files += n
+		if got := len(liveFiles(t, exp)); got != files {
+			t.Fatalf("%s: %d files in the table, want %d", label, got, files)
+		}
 		reqs, peak := tr.take()
 		t.Logf("%-28s %4d requests, %7.0f ms at +%d ms each, most at once %d\n    %s", label, len(reqs), float64(took.Microseconds())/1000, delayMS, peak, summarize(reqs))
 		if os.Getenv("ARC_TEST_S3_TRACE_ORDER") != "" {
