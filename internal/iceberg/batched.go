@@ -671,8 +671,14 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	case floor:
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, floorHistory)
 		e.setFloorOwed(tkey, !expireOK)
-	case commits > 0:
+	case commits > 0 || e.expiryOwed(tkey):
+		// Also on a pass that committed nothing, after appends (append.go):
+		// they add snapshots and expire none, and the pass that follows them
+		// finds every appended file in the table already.
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, retainConfigured)
+		if expireOK {
+			e.setExpiryOwed(tkey, false)
+		}
 	}
 	wrote := e.writeVersionHint(ctx, tbl)
 	published := wrote && !e.hintFailed()
@@ -990,4 +996,27 @@ func (e *Exporter) setFloorOwed(tkey string, owed bool) {
 	} else {
 		delete(e.floorDue, tkey)
 	}
+}
+
+// expiryOwed reports that appends have added snapshots to the table since a
+// pass last expired any (append.go). Per process, like floorOwed: after a
+// restart the table's first ingest export is a pass, which commits and so
+// expires.
+func (e *Exporter) expiryOwed(tkey string) bool {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	return e.expireOwed[tkey]
+}
+
+func (e *Exporter) setExpiryOwed(tkey string, owed bool) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	if !owed {
+		delete(e.expireOwed, tkey)
+		return
+	}
+	if e.expireOwed == nil {
+		e.expireOwed = make(map[string]bool)
+	}
+	e.expireOwed[tkey] = true
 }

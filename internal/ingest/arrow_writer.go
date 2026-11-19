@@ -1314,6 +1314,9 @@ type ArrowBuffer struct {
 	// onFilePublished is told about each file a flush stores (#1757,
 	// flush_split.go).
 	onFilePublished atomic.Pointer[[]FilePublishedFunc]
+	// onFileRegistered and onFileRemoved: see flush_split.go (#1751).
+	onFileRegistered atomic.Pointer[FileRegisteredFunc]
+	onFileRemoved    atomic.Pointer[FileRemovedFunc]
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]
@@ -2327,6 +2330,9 @@ func (b *ArrowBuffer) SetFileRegistrar(fr FileRegistrar) {
 // in-memory buffer immediately before the backend write. Peers validate downloaded bytes
 // against this checksum.
 func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64, sha256Hex string, cov *GroupCoverage) {
+	// The file is stored and kept from here on (#1751). First, so the report
+	// does not wait for the tiering and manifest writes below.
+	b.fileRegistered(database, measurement, storagePath, sizeBytes)
 	// Register in local tiering metadata (hot/cold tracking)
 	metadata := b.tierRecorder
 	if metadata == nil && b.tieringManager != nil {

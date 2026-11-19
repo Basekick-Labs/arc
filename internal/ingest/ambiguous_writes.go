@@ -617,6 +617,9 @@ func (b *ArrowBuffer) checkAmbiguousWrite(ctx context.Context, c ambiguousCheck)
 		return
 	}
 	metrics.Get().IncIngestAmbiguousWritesRemoved()
+	if database, measurement, _, ok := partitionOfPath(c.path); ok {
+		b.fileRemoved(database, measurement) // a listing may have seen it (#1751)
+	}
 	b.logger.Warn().Str("storage_path", c.path).Int64("size_bytes", size).
 		Msg("Removed a file a failed flush wrote after all: its rows were replayed from the WAL into another file, and keeping both would store them twice")
 	b.ambiguous.checked(c.path, false)

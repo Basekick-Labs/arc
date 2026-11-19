@@ -65,24 +65,8 @@ func (s *Scheduler) RequestIngestReconcile(database, measurement string) {
 	if s == nil || s.ingestInterval <= 0 || database == "" || measurement == "" {
 		return
 	}
-	key := database + "\x00" + measurement
-	now := time.Now()
 	s.reqMu.Lock()
-	if reports, waiting := s.ingestPending[key]; waiting {
-		reports.last = now
-		s.ingestPending[key] = reports
-	} else {
-		s.ingestPending[key] = ingestReports{first: now, last: now}
-		s.publishIngestPendingLocked()
-	}
-	_, queued := s.ingestDue[key]
-	if !queued {
-		due := now
-		if next := s.ingestNext[key]; next.After(due) {
-			due = next
-		}
-		s.ingestDue[key] = ingestRequest{m: Measurement{Database: database, Measurement: measurement}, due: due}
-	}
+	queued := s.requestIngestLocked(database, measurement, time.Now())
 	s.reqMu.Unlock()
 	if queued {
 		return // the loop already knows when it is due
@@ -91,6 +75,28 @@ func (s *Scheduler) RequestIngestReconcile(database, measurement string) {
 	case s.wake <- struct{}{}:
 	default:
 	}
+}
+
+// requestIngestLocked records a report for the table at now and queues its
+// request; it returns whether one was queued already. reqMu is held.
+func (s *Scheduler) requestIngestLocked(database, measurement string, now time.Time) (queued bool) {
+	key := database + "\x00" + measurement
+	if reports, waiting := s.ingestPending[key]; waiting {
+		reports.last = now
+		s.ingestPending[key] = reports
+	} else {
+		s.ingestPending[key] = ingestReports{first: now, last: now}
+		s.publishIngestPendingLocked()
+	}
+	_, queued = s.ingestDue[key]
+	if !queued {
+		due := now
+		if next := s.ingestNext[key]; next.After(due) {
+			due = next
+		}
+		s.ingestDue[key] = ingestRequest{m: Measurement{Database: database, Measurement: measurement}, due: due}
+	}
+	return queued
 }
 
 // publishIngestPendingLocked sets the pending gauge from the oldest report.
@@ -191,6 +197,7 @@ func (s *Scheduler) requeueIngest(m Measurement, key string) {
 func (s *Scheduler) dropIngest() {
 	s.reqMu.Lock()
 	clear(s.ingestDue)
+	clear(s.appendPending) // another node exports them (scheduler_append.go)
 	if len(s.ingestPending) > 0 {
 		clear(s.ingestPending)
 		s.publishIngestPendingLocked()
@@ -202,6 +209,7 @@ func (s *Scheduler) dropIngest() {
 func (s *Scheduler) forgetIngest(key string) {
 	s.reqMu.Lock()
 	delete(s.ingestDue, key)
+	delete(s.appendPending, key)
 	if _, waiting := s.ingestPending[key]; waiting {
 		delete(s.ingestPending, key)
 		s.publishIngestPendingLocked()
@@ -302,7 +310,7 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 			continue
 		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-		outcome, err := s.reconcileOneRecovered(mctx, m, key)
+		outcome, err := s.exportIngest(mctx, m, key)
 		cancel()
 		s.noteOutcome(key, outcome)
 		event := s.logger.Debug()

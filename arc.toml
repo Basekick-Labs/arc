@@ -393,8 +393,14 @@ s3_cache_ttl_seconds = 3600
 # reconcile_interval = 300
 # ingest_export_interval = 60        # seconds: a flushed file is exported after at
 #                                    # most this long, not at the next timed pass.
-#                                    # 0 = timed passes only. Times
-#                                    # retain_snapshots it must be >= 120.
+#                                    # 0 = timed passes only; otherwise >= 5.
+# ingest_append_enabled = true       # those exports add only the new files, without
+#                                    # listing the measurement. false = a full pass
+#                                    # of the measurement each time.
+# min_version_age = 300              # seconds a published table version stays on
+#                                    # disk after the next one is published, so a
+#                                    # reader that resolved it can still open it.
+#                                    # >= 120, and >= glue.sync_interval + 60 with Glue.
 # catalog_db_path = "./data/arc.db"   # the shared auth database
 # retain_snapshots = 10
 # orphan_sweep_enabled = true

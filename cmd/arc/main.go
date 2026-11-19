@@ -4613,6 +4613,11 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
 		}
+		// How long a published table version outlives the next one, and how
+		// often ingest publishes one (#1751). Set on every node: it only ever
+		// keeps more.
+		exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,
+			icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil))
 		// #1676: where new tables are created. Colocated needs the warehouse
 		// to be the storage root, which only the resolved values can tell.
 		if err := exporter.SetLayout(cfg.Iceberg.Layout); err != nil {
@@ -4755,6 +4760,9 @@ func main() {
 			// 0 leaves RequestIngestReconcile and its bookkeeping off (#1750),
 			// as on a cluster node, where nothing reports ingest files yet.
 			IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),
+			// An ingest request adds only the files ingest reported, without
+			// listing the measurement (#1751).
+			IngestAppend: cfg.Iceberg.IngestAppendEnabled,
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.
@@ -4803,9 +4811,24 @@ func main() {
 			// reach the exporting node (a file registered in a shared bucket,
 			// a pulled file landing) are #1756.
 			if icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) > 0 {
-				arrowBuffer.AddOnFilePublished(func(database, measurement string, _ time.Time) {
-					icebergScheduler.RequestIngestReconcile(database, measurement)
-				})
+				if cfg.Iceberg.IngestAppendEnabled {
+					// The append path (#1751): each file the flush registers
+					// is named to the export, which adds just those. Reported
+					// at registration and not at the write: a request served
+					// between the two would find no file and list the whole
+					// measurement.
+					arrowBuffer.SetOnFileRegistered(func(database, measurement, storagePath string, _ int64) {
+						icebergScheduler.RequestIngestAppend(database, measurement, storagePath)
+					})
+				} else {
+					arrowBuffer.AddOnFilePublished(func(database, measurement string, _ time.Time) {
+						icebergScheduler.RequestIngestReconcile(database, measurement)
+					})
+				}
+				// A file ingest deletes after storing it (the late-landed copy
+				// of a failed flush) may be in the table already: take it out
+				// now, not at the next timed pass.
+				arrowBuffer.SetOnFileRemoved(icebergScheduler.RequestReconcile)
 			}
 			// In a cluster the writer's own requests are dropped here at the
 			// gate: the exporter node's coordinator tells it what its listing

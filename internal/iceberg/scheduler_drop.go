@@ -258,6 +258,29 @@ func (s *Scheduler) forgetDatabase(db string) {
 			delete(s.lastBlocked, k)
 		}
 	}
+	// The append path too (#1751): a dropped table must not take an append
+	// (there is nothing to append to), and its files are gone.
+	var appendKeys []string
+	s.reqMu.Lock()
+	for k := range s.appendPending {
+		if match(k) {
+			appendKeys = append(appendKeys, k)
+		}
+	}
+	s.reqMu.Unlock()
+	for k := range s.appendOK {
+		if match(k) {
+			appendKeys = append(appendKeys, k)
+		}
+	}
+	for k := range s.recentAdds {
+		if match(k) {
+			appendKeys = append(appendKeys, k)
+		}
+	}
+	for _, k := range appendKeys {
+		s.forgetAppend(k)
+	}
 	if ci, ok := s.source.(coldInvalidator); ok {
 		ci.InvalidateCold(db)
 	}

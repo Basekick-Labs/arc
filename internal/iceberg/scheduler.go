@@ -126,6 +126,17 @@ type Scheduler struct {
 	ingestDue      map[string]ingestRequest
 	ingestNext     map[string]time.Time
 	ingestPending  map[string]ingestReports
+	// The append path (scheduler_append.go, #1751). appendPending is the
+	// files ingest reported per table (under reqMu). The rest is the loop
+	// goroutine's: appendOK the tables whose last reconcile pass settled,
+	// recentAdds the recent files in each table or seen by a pass,
+	// appendFallback the last reason a table's append ran a pass instead.
+	appendEnabled  bool
+	started        time.Time
+	appendPending  map[string]pendingFiles
+	appendOK       map[string]bool
+	recentAdds     map[string]map[string]time.Time
+	appendFallback map[string]string
 	// lastReconciled is when each measurement's table last changed, by a
 	// pass or a request. Loop goroutine only.
 	lastReconciled map[string]time.Time
@@ -229,6 +240,10 @@ type SchedulerConfig struct {
 	// that ingest flushes cause (iceberg.ingest_export_interval). Zero or
 	// less: RequestIngestReconcile does nothing.
 	IngestInterval time.Duration
+	// IngestAppend lets an ingest request add only the reported files
+	// (iceberg.ingest_append_enabled). Off: every ingest request is a
+	// reconcile pass of the measurement.
+	IngestAppend bool
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -253,6 +268,12 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		ingestDue:      make(map[string]ingestRequest),
 		ingestNext:     make(map[string]time.Time),
 		ingestPending:  make(map[string]ingestReports),
+		appendEnabled:  cfg.IngestAppend,
+		started:        time.Now(),
+		appendPending:  make(map[string]pendingFiles),
+		appendOK:       make(map[string]bool),
+		recentAdds:     make(map[string]map[string]time.Time),
+		appendFallback: make(map[string]string),
 		lastReconciled: make(map[string]time.Time),
 		drops:          make(map[string]struct{}),
 		dropRetry:      make(map[string]dropRetry),
@@ -891,6 +912,16 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			delete(s.busySince, k)
 		}
 	}
+	for k := range s.appendOK {
+		if _, ok := seen[k]; !ok {
+			s.forgetAppend(k)
+		}
+	}
+	for k := range s.recentAdds {
+		if _, ok := seen[k]; !ok {
+			s.forgetAppend(k)
+		}
+	}
 	for k := range s.lastReconciled {
 		if _, ok := seen[k]; !ok {
 			delete(s.lastReconciled, k)
@@ -921,7 +952,10 @@ func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, ke
 	// the result into: whichever kind of reconcile this is, one that went
 	// through covers the ingest files reported before it started (#1750).
 	startedAt := time.Now()
-	defer func() { s.noteIngestCovered(key, startedAt, outcome, err) }()
+	defer func() {
+		s.notePassEnded(key, startedAt, outcome, err)
+		s.noteIngestCovered(key, startedAt, outcome, err)
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			// The stack is logged here, where it is; the returned error is
@@ -951,6 +985,8 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		}
 		return outcomeUnchanged, err
 	}
+	// What this pass has seen is not offered to an append again (#1751).
+	s.noteListed(key, files)
 	if len(files) == 0 {
 		// Every data file is gone (retention/compaction/manual delete). We still reach this code
 		// because Arc's Delete only os.Remove()s the file — the {db}/{measurement}/… directory
