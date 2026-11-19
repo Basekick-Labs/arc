@@ -28,14 +28,16 @@ type recordingSource struct {
 	mu     sync.Mutex
 	listed []string
 	fail   map[string]bool
+	slow   time.Duration // how long a failing listing takes
 }
 
 func (r *recordingSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
 	r.mu.Lock()
 	r.listed = append(r.listed, m.Measurement)
-	fail := r.fail[m.Measurement]
+	fail, slow := r.fail[m.Measurement], r.slow
 	r.mu.Unlock()
 	if fail {
+		time.Sleep(slow)
 		return nil, nil, errors.New("injected listing failure")
 	}
 	return r.StorageWalkSource.FilesAndLocal(ctx, m)
@@ -484,4 +486,54 @@ func TestExportLagForgetsADroppedDatabase(t *testing.T) {
 	if len(r.exp.lag.pending) != 0 {
 		t.Errorf("pending = %v after forgetting the last table", r.exp.lag.pending)
 	}
+}
+
+// An attempt that fails after longer than the interval is retried one
+// interval after it ENDED, not the moment it ends: a table that keeps failing
+// slowly must not be reconciled back to back.
+func TestScheduler_ASlowFailingIngestReconcileIsNotRetriedAtOnce(t *testing.T) {
+	const interval = 100 * time.Millisecond
+	ctx := context.Background()
+	r, src := newIngestRig(t, interval)
+	src.fail["cpu"] = true
+	src.slow = 3 * interval
+	r.writeIn(t, "cpu", ingestName("cpu", time.Now()))
+	r.sched.RequestIngestReconcile("mydb", "cpu")
+	r.sched.serviceIngest(ctx, ingestBatch) // the batch that would otherwise retry it up to ingestBatch times
+	if got := src.order(); got != "cpu" {
+		t.Fatalf("listed %q in one turn, want one attempt: the retry was due as soon as the slow attempt ended", got)
+	}
+	if due, ok := r.sched.nextIngestDue(); !ok || time.Until(due) <= interval/2 || time.Until(due) > interval {
+		t.Errorf("the retry is due in %v (queued=%v), want about one interval after the attempt ended", time.Until(due), ok)
+	}
+}
+
+// A table the timed passes have escalated as busy for too long is not
+// retried by ingest requests either.
+func TestScheduler_AnEscalatedBusyTableIsLeftToThePasses(t *testing.T) {
+	ctx := context.Background()
+	r, _ := newIngestRig(t, 50*time.Millisecond)
+	busy := &busySource{StorageWalkSource: r.src}
+	r.sched.source = busy
+	r.writeIn(t, "cpu", ingestName("cpu", time.Now()))
+
+	r.sched.RequestIngestReconcile("mydb", "cpu")
+	r.sched.serviceIngest(ctx, ingestBatch)
+	if _, queued := r.sched.nextIngestDue(); !queued {
+		t.Fatal("a busy table was not requeued")
+	}
+	// Busy since longer than the escalation: the passes own it.
+	r.sched.busySince["mydb\x00cpu"] = time.Now().Add(-busyEscalateAfter - time.Minute)
+	time.Sleep(70 * time.Millisecond)
+	r.sched.serviceIngest(ctx, ingestBatch)
+	if _, queued := r.sched.nextIngestDue(); queued {
+		t.Error("an escalated busy table was requeued by an ingest request")
+	}
+}
+
+// busySource reports the listing as never holding still.
+type busySource struct{ *StorageWalkSource }
+
+func (busySource) FilesAndLocal(context.Context, Measurement) ([]FileRef, []string, error) {
+	return nil, nil, errSourcesMoving
 }

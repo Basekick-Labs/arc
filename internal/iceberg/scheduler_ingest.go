@@ -168,10 +168,18 @@ func (s *Scheduler) takeDueIngest(now time.Time) (Measurement, string, bool) {
 	return pick.m, key, true
 }
 
-// requeueIngest asks again, at the table's next allowed attempt, for a table
-// whose ingest-served reconcile did not settle.
+// requeueIngest asks again for a table whose ingest-served reconcile did not
+// settle, one interval after that attempt ENDED. The stamp takeDueIngest set
+// counts from its start, and an attempt can outlast the interval (a slow
+// listing, a commit that times out): from the start, the retry would be due
+// the moment the attempt ended, and a table that keeps failing slowly would
+// be retried back to back.
 func (s *Scheduler) requeueIngest(m Measurement, key string) {
+	next := time.Now().Add(s.ingestInterval)
 	s.reqMu.Lock()
+	if next.After(s.ingestNext[key]) {
+		s.ingestNext[key] = next
+	}
 	if _, queued := s.ingestDue[key]; !queued {
 		s.ingestDue[key] = ingestRequest{m: m, due: s.ingestNext[key]}
 	}
@@ -286,9 +294,16 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 		}
 		event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
 			Msg("Iceberg reconcile on request (an ingest flush)")
-		// Anything short of a settled reconcile comes back at the table's
-		// next allowed attempt, whether or not another flush asks: a failure,
-		// a busy table, files left behind, a publish that did not land.
+		// Anything short of a settled reconcile comes back one interval
+		// later, whether or not another flush asks: a failure, a busy table,
+		// files left behind, a publish that did not land. Except a table the
+		// timed passes have escalated as busy for too long: they own it now,
+		// as for the other kinds of request (serviceRequests).
+		if outcome == outcomeBusy {
+			if since, started := s.busySince[key]; started && time.Since(since) >= busyEscalateAfter {
+				continue
+			}
+		}
 		if _, settled := s.state[key]; err != nil || !settled || outcome == outcomeInProgress || outcome == outcomeBusy {
 			s.requeueIngest(m, key)
 		}
