@@ -15,6 +15,10 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// noAgeFlushMS is a max_buffer_age_ms longer than any test backdates a buffer
+// by (backdateBuffer checks), so the age sweep never takes a backdated buffer.
+const noAgeFlushMS = 24 * 60 * 60 * 1000
+
 func publishDelayCount() int64 {
 	return metrics.Get().Snapshot()["ingest_publish_delay_count"].(int64)
 }
@@ -65,7 +69,7 @@ func newPublishDelayBuffer(t *testing.T, maxBufferSize int) (*ArrowBuffer, *publ
 		t.Fatal(err)
 	}
 	backend := &publishDelayBackend{LocalBackend: local}
-	b := NewArrowBuffer(&config.IngestConfig{MaxBufferSize: maxBufferSize, MaxBufferAgeMS: 600000, Compression: "snappy",
+	b := NewArrowBuffer(&config.IngestConfig{MaxBufferSize: maxBufferSize, MaxBufferAgeMS: noAgeFlushMS, Compression: "snappy",
 		FlushWorkers: 1, FlushQueueSize: 4, ShardCount: 1, DataPageVersion: "2.0", FlushTimeoutSeconds: 10}, backend, zerolog.Nop())
 	t.Cleanup(func() { b.Close() })
 	rec := &publishDelayRecorder{}
@@ -96,6 +100,11 @@ func backdateBuffer(t *testing.T, b *ArrowBuffer, key string, by time.Duration) 
 	defer shard.mu.Unlock()
 	if _, ok := shard.bufferStartTimes[key]; !ok {
 		t.Fatalf("no buffer for %s", key)
+	}
+	// A buffer older than max_buffer_age_ms belongs to the age sweep, which
+	// runs on its own goroutine and would flush it under the test.
+	if by >= b.maxBufferAge {
+		t.Fatalf("backdating by %s reaches the buffer's max age (%s): the age sweep would flush it", by, b.maxBufferAge)
 	}
 	shard.bufferStartTimes[key] = time.Now().UTC().Add(-by)
 }
